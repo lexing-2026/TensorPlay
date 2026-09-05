@@ -1,28 +1,26 @@
 name: nightly
 
-# versioning without the daily cron: versions follow the
-# X.Y.0.dev<UTC date>[+cuXXX|+cpu] rule computed by
-# tools/generate_tensorplay_version.py, wheels land on the rolling "nightly"
-# GitHub Release, and indexes are published under whl/nightly/<variant>/ on
-# the pypi-pages branch. Only the latest published version is retained.
+# Nightly preview wheels are built on a daily schedule from the default
+# branch head, following the X.Y.0.dev<UTC date>[+cuXXX|+cpu] version rule
+# computed by tools/generate_tensorplay_version.py. Wheels land on the
+# rolling "nightly" GitHub Release, and the wheel-index workflow
+# republishes the whl/nightly/<variant>/ indexes on pypi-pages from
+# release events. Only the newest dev version per variant is retained.
 #
-# Two publish sources:
-#   - build-from-source: builds the wheel matrix from the current ref with an
-#     injected TENSORPLAY_BUILD_VERSION (defaults to today's dev version).
-#   - upload-wheels: publishes locally built wheels that were uploaded
-#     beforehand as an Actions artifact named "wheels".
+# workflow_dispatch stays available for manual retries of a failed matrix
+# leg or off-schedule builds; the version/build_number/filters inputs
+# shape such runs. Every run drops matrix legs whose wheel for the
+# computed version is already on the nightly release, so retries only
+# build the missing wheels (dispatch with build_number > 1 to rebuild a
+# published wheel on purpose).
 
 on:
+  schedule:
+    # 02:30 UTC daily, ahead of the index rescan window and off the
+    # quarter-hour runner rush.
+    - cron: '30 2 * * *'
   workflow_dispatch:
     inputs:
-      source:
-        required: false
-        type: choice
-        description: Where the wheels come from
-        options:
-          - build-from-source
-          - upload-wheels
-        default: build-from-source
       version:
         required: false
         type: string
@@ -36,8 +34,7 @@ on:
         default: "1"
         description: >-
           Values greater than 1 append .post<N> to the version, allowing a
-          same-day republish. Ignored by upload-wheels (the version is read
-          from the uploaded wheel filenames).
+          same-day republish.
       cpu_platforms:
         required: false
         type: string
@@ -45,15 +42,13 @@ on:
         description: >-
           Space-separated CPU platform names from .github/wheel-platforms.json
           to build, for example "linux-x86_64 macos-arm64". Empty means all.
-          Only used by build-from-source.
       cuda_variants:
         required: false
         type: string
         default: ""
         description: >-
           Space-separated CUDA variants from .github/cuda-variants.json to
-          build, for example "cu124 cu126". Empty means all. Only used by
-          build-from-source.
+          build, for example "cu124 cu126". Empty means all.
 
 permissions: read-all
 
@@ -64,11 +59,12 @@ concurrency:
 jobs:
   define-wheel-matrix:
     name: define-wheel-matrix
-    if: ${{ inputs.source == 'build-from-source' }}
+    needs:
+      - prepare
     runs-on: ubuntu-latest
     outputs:
-      cpu: ${{ steps.read-matrix.outputs.cpu }}
-      cuda: ${{ steps.read-matrix.outputs.cuda }}
+      cpu: ${{ steps.skip-published.outputs.cpu }}
+      cuda: ${{ steps.skip-published.outputs.cuda }}
       variants: ${{ steps.read-matrix.outputs.variants }}
     steps:
       - uses: actions/checkout@v4
@@ -80,6 +76,7 @@ jobs:
         env:
           CPU_PLATFORMS: ${{ inputs.cpu_platforms }}
           CUDA_VARIANTS: ${{ inputs.cuda_variants }}
+          NIGHTLY_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
           # Turn the space-separated filters into JSON arrays; an empty array
@@ -136,32 +133,80 @@ jobs:
           echo "cuda=$cuda_matrix" >> "$GITHUB_OUTPUT"
           echo "variants=$active_variants" >> "$GITHUB_OUTPUT"
 
+      - id: skip-published
+        name: Drop matrix legs whose wheel is already on the nightly release
+        env:
+          NIGHTLY_VERSION: ${{ needs.prepare.outputs.version }}
+          CPU_MATRIX: ${{ steps.read-matrix.outputs.cpu }}
+          CUDA_MATRIX: ${{ steps.read-matrix.outputs.cuda }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # A re-dispatch (retry after a partial failure) must not rebuild
+          # legs whose wheel for this exact version is already published:
+          # every existing asset is matched by name and its matrix leg is
+          # dropped, so only the missing wheels get built. Re-releasing the
+          # same wheel on purpose: dispatch with build_number > 1, which
+          # changes the version and defeats the skip.
+          existing="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/nightly" --jq '.assets[].name' 2>/dev/null || true)"
+          printf '%s' "$existing" > "$RUNNER_TEMP/nightly-assets.txt"
+          python .github/scripts/filter_published_wheels.py \
+            --version "$NIGHTLY_VERSION" \
+            --cpu-matrix "$CPU_MATRIX" \
+            --cuda-matrix "$CUDA_MATRIX" \
+            --existing "$RUNNER_TEMP/nightly-assets.txt" \
+            >> "$GITHUB_OUTPUT"
+
+
   prepare:
     name: prepare-nightly-version
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.version-build.outputs.version || steps.version-upload.outputs.version }}
-      build_number: ${{ steps.version-build.outputs.build_number || steps.version-upload.outputs.build_number }}
+      version: ${{ steps.version-build.outputs.version }}
+      build_number: ${{ steps.version-build.outputs.build_number }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: false
           show-progress: false
+          # The schedule guard needs the run's head SHA for the comparison.
+          fetch-depth: 0
+      - id: scheduled-unchanged
+        name: Skip the scheduled run when main has not moved
+        if: ${{ github.event_name == 'schedule' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The trunk runs already publish each smoke-tested main push to the
+          # nightly channel, so the scheduled run only fills gaps. When no
+          # commit has landed on main since the last fully green nightly,
+          # there is nothing new to fill: every wheel for this date is on the
+          # release and the matrix would come back empty anyway.
+          last="$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow nightly \
+            --status success \
+            --limit 1 \
+            --json headSha \
+            --jq '.[0].headSha // ""')"
+          if [[ -n "$last" && "$last" == "${{ github.sha }}" ]]; then
+            echo "main is at ${last#0}, already published by the last green nightly; skipping"
+            echo "unchanged=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "unchanged=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/setup-python@v5
+        if: ${{ steps.scheduled-unchanged.outputs.unchanged != 'true' }}
         with:
           python-version: "3.11"
       - name: Install packaging
         shell: bash
         run: python -m pip install --disable-pip-version-check --quiet packaging
-      - name: Download the wheels artifact
-        if: ${{ inputs.source == 'upload-wheels' }}
-        uses: actions/download-artifact@v4
-        with:
-          name: wheels
-          path: wheels
-      - name: Compute the nightly version from source
-        if: ${{ inputs.source != 'upload-wheels' }}
+      - name: Compute the nightly version
         id: version-build
+        if: ${{ steps.scheduled-unchanged.outputs.unchanged != 'true' }}
         shell: bash
         env:
           INPUT_VERSION: ${{ inputs.version }}
@@ -176,47 +221,6 @@ jobs:
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "build_number=${INPUT_BUILD_NUMBER}" >> "$GITHUB_OUTPUT"
           echo "Nightly base version: ${version} (build number ${INPUT_BUILD_NUMBER})"
-      - name: Read the version from the uploaded wheels
-        if: ${{ inputs.source == 'upload-wheels' }}
-        id: version-upload
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY' >> "$GITHUB_OUTPUT"
-          import os
-          import zipfile
-          from email.parser import Parser
-          from pathlib import Path
-
-          from packaging.utils import parse_wheel_filename
-
-          artifact_dir = Path("wheels")
-          wheels = sorted(artifact_dir.glob("*.whl")) if artifact_dir.is_dir() else []
-          if not wheels:
-              raise SystemExit(
-                  "No wheels found: upload the locally built .whl files as an "
-                  "Actions artifact named 'wheels' before dispatching"
-              )
-          versions = set()
-          for wheel in wheels:
-              _name, version, _build, _tags = parse_wheel_filename(wheel.name)
-              with zipfile.ZipFile(wheel) as archive:
-                  metadata_files = [n for n in archive.namelist() if n.endswith(".dist-info/METADATA")]
-                  if metadata_files:
-                      metadata = Parser().parsestr(archive.read(metadata_files[0]).decode("utf-8"))
-                      if metadata["Version"] != str(version):
-                          raise SystemExit(
-                              f"{wheel.name}: filename version {version} != METADATA version {metadata['Version']}"
-                          )
-              # Variant local labels (+cu124/+cpu/none) legitimately differ per
-              # wheel; the base version must be shared across the batch.
-              versions.add(str(version).partition("+")[0])
-          if len(versions) != 1:
-              raise SystemExit(f"All uploaded wheels must share one base version, got {sorted(versions)}")
-          version = versions.pop()
-          print(f"version={version}")
-          print("build_number=1")
-          PY
 
   create-nightly-release:
     name: create-nightly-release
@@ -243,11 +247,13 @@ jobs:
 
   cpu-build:
     name: ${{ matrix.build_name }}-build-test
-    if: ${{ inputs.source == 'build-from-source' }}
     needs:
       - define-wheel-matrix
       - prepare
       - create-nightly-release
+    # An unchanged main (schedule guard) yields an empty version: every
+    # wheel for today was already published by the trunk runs.
+    if: needs.prepare.outputs.version != ''
     strategy:
       fail-fast: false
       matrix:
@@ -266,11 +272,13 @@ jobs:
 
   cuda-build:
     name: ${{ matrix.build_name }}-build-test
-    if: ${{ inputs.source == 'build-from-source' }}
     needs:
       - define-wheel-matrix
       - prepare
       - create-nightly-release
+    # An unchanged main (schedule guard) yields an empty version: every
+    # wheel for today was already published by the trunk runs.
+    if: needs.prepare.outputs.version != ''
     strategy:
       fail-fast: false
       matrix:
@@ -288,60 +296,3 @@ jobs:
       build_version: ${{ needs.prepare.outputs.version }}
       build_number: ${{ needs.prepare.outputs.build_number }}
       upload_release: true
-
-  upload-local-wheels:
-    name: upload-local-wheels
-    if: ${{ inputs.source == 'upload-wheels' }}
-    needs:
-      - prepare
-      - create-nightly-release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download the wheels artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: wheels
-          path: dist
-      - name: Upload wheels to the nightly release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          wheels=(dist/*.whl)
-          if (("${#wheels[@]}" == 0)); then
-            echo "The wheels artifact contains no .whl files" >&2
-            exit 1
-          fi
-          printf 'Uploading:\n%s\n' "${wheels[@]}"
-          gh release upload nightly "${wheels[@]}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --clobber
-
-  publish-nightly-indexes:
-    name: publish-nightly-indexes
-    # Runs even when some matrix legs failed (partial nightlies are published,
-    # inside aborts if no wheel of the new version made it to the release.
-    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
-    needs:
-      - define-wheel-matrix
-      - prepare
-      - cpu-build
-      - cuda-build
-      - upload-local-wheels
-    uses: ./.github/workflows/_cuda-upload.yml
-    permissions:
-      contents: write
-    with:
-      build_environment: nightly
-      channel: nightly
-      release_tag: nightly
-      prune_keep_version: ${{ needs.prepare.outputs.version }}
-      cuda_variants_json: >-
-        ${{ inputs.source == 'build-from-source'
-            && needs.define-wheel-matrix.outputs.variants
-            || '[{"variant":"cu124","toolkit":"12.4.1"},{"variant":"cu126","toolkit":"12.6.3"},{"variant":"cu130","toolkit":"13.0.2"}]' }}
-      pages_branch: pypi-pages
