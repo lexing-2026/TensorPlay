@@ -95,6 +95,23 @@ inline void bitwise_check_cuda(const Tensor& t, const char* name) {
     TP_THROW(TypeError, name, ": only integral and boolean types are supported");
 }
 
+template <typename T, bool kLeft>
+__device__ __forceinline__ T bitwise_shift_value(T value, T shift) {
+    using S = typename std::make_signed<T>::type;
+    using U = typename std::make_unsigned<T>::type;
+    constexpr U kBits = static_cast<U>(sizeof(T) * 8);
+    const bool invalid = static_cast<S>(shift) < 0 || static_cast<U>(shift) >= kBits;
+    if constexpr (kLeft) {
+        if (invalid) return T(0);
+        return static_cast<T>(static_cast<U>(value) << static_cast<U>(shift));
+    }
+    if (invalid) {
+        if constexpr (std::is_signed_v<T>) return value < 0 ? T(-1) : T(0);
+        return T(0);
+    }
+    return static_cast<T>(value >> static_cast<U>(shift));
+}
+
 template <typename Pred>
 Tensor bitwise_binary_cuda(const Tensor& a_in, const Tensor& b_in, Pred pred, const char* name) {
     bitwise_check_cuda(a_in, name);
@@ -216,14 +233,8 @@ Tensor bitwise_shift_tensor_cuda_impl(const Tensor& a_in, const Tensor& b_in, co
     auto stream = getCurrentCUDAStream().stream();
 #define TP_SHIFT_BIN(ctype, name_) \
     case DType::name_: { \
-        constexpr bool kShiftLeft = kLeft; \
-        auto op = [kShiftLeft] __device__ (ctype x, ctype y) -> ctype { \
-            using U = typename std::make_unsigned<ctype>::type; \
-            constexpr int64_t kBits = static_cast<int64_t>(sizeof(ctype) * 8); \
-            U xu = static_cast<U>(x); \
-            U sh = static_cast<U>(static_cast<uint64_t>(y) % static_cast<uint64_t>(kBits)); \
-            U r = kShiftLeft ? static_cast<U>(xu << sh) : static_cast<U>(xu >> sh); \
-            return static_cast<ctype>(r); \
+        auto op = [] __device__ (ctype x, ctype y) -> ctype { \
+            return bitwise_shift_value<ctype, kLeft>(x, y); \
         }; \
         ew_binary_kernel<ctype><<<grid, block, 0, stream>>>( \
             n, ac.data_ptr<ctype>(), bc.data_ptr<ctype>(), out.data_ptr<ctype>(), op); \
@@ -241,12 +252,7 @@ Tensor bitwise_shift_tensor_cuda_impl(const Tensor& a_in, const Tensor& b_in, co
 template <bool kLeft>
 Tensor bitwise_shift_scalar_cuda_impl(const Tensor& a_in, Scalar other, const char* name) {
     bitwise_check_cuda(a_in, name);
-    int64_t bits = a_in.itemsize() * 8;
-    int64_t shift = other.to<int64_t>();
-    if (shift < 0 || shift >= bits) {
-        TP_THROW(RuntimeError, name, ": shift amount ", shift,
-                 " must be in [0, ", bits, ")");
-    }
+    const int64_t shift = other.to<int64_t>();
     Tensor sc = a_in.contiguous();
     Tensor out = Tensor::empty(shape_of(a_in), a_in.dtype(), a_in.device());
     int64_t n = out.numel();
@@ -256,14 +262,12 @@ Tensor bitwise_shift_scalar_cuda_impl(const Tensor& a_in, Scalar other, const ch
     auto stream = getCurrentCUDAStream().stream();
 #define TP_SHIFT_SCALAR(ctype, name_) \
     case DType::name_: { \
-        using U = typename std::make_unsigned<ctype>::type; \
-        U sh = static_cast<U>(shift % bits); \
-        auto op = [sh] __device__ (U x, U) -> ctype { \
-            U r = kLeft ? static_cast<U>(x << sh) : static_cast<U>(x >> sh); \
-            return static_cast<ctype>(r); \
+        const ctype sh = static_cast<ctype>(shift); \
+        auto op = [] __device__ (ctype x, ctype y) -> ctype { \
+            return bitwise_shift_value<ctype, kLeft>(x, y); \
         }; \
-        ew_binary_kernel<ctype><<<grid, block, 0, stream>>>( \
-            n, sc.data_ptr<ctype>(), sc.data_ptr<ctype>(), out.data_ptr<ctype>(), op); \
+        bitwise_binary_scalar_kernel<ctype><<<grid, block, 0, stream>>>( \
+            n, sc.data_ptr<ctype>(), sh, out.data_ptr<ctype>(), op); \
         break; \
     }
     switch (a_in.dtype()) {

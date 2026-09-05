@@ -58,6 +58,23 @@ inline void bitwise_check_cpu(const Tensor& t, const char* name) {
     TP_THROW(TypeError, name, ": only integral and boolean types are supported");
 }
 
+template <typename T, bool kLeft>
+inline T bitwise_shift_value(T value, T shift) {
+    using S = typename std::make_signed<T>::type;
+    using U = typename std::make_unsigned<T>::type;
+    constexpr U kBits = static_cast<U>(sizeof(T) * 8);
+    const bool invalid = static_cast<S>(shift) < 0 || static_cast<U>(shift) >= kBits;
+    if constexpr (kLeft) {
+        if (invalid) return T(0);
+        return static_cast<T>(static_cast<U>(value) << static_cast<U>(shift));
+    }
+    if (invalid) {
+        if constexpr (std::is_signed_v<T>) return value < 0 ? T(-1) : T(0);
+        return T(0);
+    }
+    return static_cast<T>(value >> static_cast<U>(shift));
+}
+
 template <typename Pred>
 Tensor bitwise_binary_cpu(const Tensor& a_in, const Tensor& b_in, Pred pred, const char* name) {
     bitwise_check_cpu(a_in, name);
@@ -137,28 +154,22 @@ Tensor bitwise_scalar_cpu(const Tensor& self_in, Scalar other, Pred pred, const 
     return out;
 }
 
-template <typename Pred>
-Tensor bitwise_shift_scalar_cpu(const Tensor& self_in, Scalar other, Pred pred, const char* name) {
+template <bool kLeft>
+Tensor bitwise_shift_scalar_cpu(const Tensor& self_in, Scalar other, const char* name) {
     bitwise_check_cpu(self_in, name);
-    int64_t bits = self_in.itemsize() * 8;
-    int64_t shift = other.to<int64_t>();
-    if (shift < 0 || shift >= bits) {
-        TP_THROW(RuntimeError, name, ": shift amount ", shift,
-                 " must be in [0, ", bits, ")");
-    }
+    const int64_t shift = other.to<int64_t>();
     Tensor sc = self_in.contiguous();
     Tensor out = Tensor::empty(static_cast<std::vector<int64_t>>(self_in.shape()),
                                self_in.dtype(), self_in.device());
     int64_t n = out.numel();
 #define TP_SHIFT_SCALAR_CASE(ctype, name_) \
     case DType::name_: { \
-        using U = typename std::make_unsigned<ctype>::type; \
         const ctype* sp = sc.data_ptr<ctype>(); \
-        U sh = static_cast<U>(shift % bits); \
+        const ctype sh = static_cast<ctype>(shift); \
         ctype* dp = out.data_ptr<ctype>(); \
         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
             for (int64_t i = begin; i < end; ++i) \
-                dp[i] = pred(static_cast<U>(sp[i]), sh); \
+                dp[i] = bitwise_shift_value<ctype, kLeft>(sp[i], sh); \
         }); \
         break; \
     }
@@ -203,7 +214,6 @@ Tensor bitwise_not_cpu(const Tensor& self) {
 
 template <bool kLeft>
 Tensor bitwise_shift_tensor_cpu(const Tensor& a_in, const Tensor& b_in, const char* name) {
-    // bit width; shifting through the unsigned domain keeps << defined.
     bitwise_check_cpu(a_in, name);
     bitwise_check_cpu(b_in, name);
     std::vector<int64_t> out_shape = broadcast_shapes(
@@ -220,18 +230,12 @@ Tensor bitwise_shift_tensor_cpu(const Tensor& a_in, const Tensor& b_in, const ch
     int64_t n = out.numel();
 #define TP_SHIFT_BIN_CASE(ctype, name_) \
     case DType::name_: { \
-        using U = typename std::make_unsigned<ctype>::type; \
-        constexpr int64_t kBits = static_cast<int64_t>(sizeof(ctype) * 8); \
         const ctype* ap = ac.data_ptr<ctype>(); \
         const ctype* bp = bc.data_ptr<ctype>(); \
         ctype* dp = out.data_ptr<ctype>(); \
         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
             for (int64_t i = begin; i < end; ++i) { \
-                U x = static_cast<U>(ap[i]); \
-                U sh = static_cast<U>(static_cast<uint64_t>(bp[i]) % \
-                                      static_cast<uint64_t>(kBits)); \
-                U r = kLeft ? static_cast<U>(x << sh) : static_cast<U>(x >> sh); \
-                dp[i] = static_cast<ctype>(r); \
+                dp[i] = bitwise_shift_value<ctype, kLeft>(ap[i], bp[i]); \
             } \
         }); \
         break; \
@@ -277,14 +281,10 @@ Tensor bitwise_rshift_tensor_cpu(const Tensor& a, const Tensor& b) {
     return bitwise_shift_tensor_cpu<false>(a, b, "bitwise_right_shift");
 }
 Tensor bitwise_lshift_scalar_cpu(const Tensor& a, Scalar b) {
-    return bitwise_shift_scalar_cpu(a, b,
-        [](auto x, auto sh) { return static_cast<decltype(x)>(x << sh); },
-        "bitwise_left_shift");
+    return bitwise_shift_scalar_cpu<true>(a, b, "bitwise_left_shift");
 }
 Tensor bitwise_rshift_scalar_cpu(const Tensor& a, Scalar b) {
-    return bitwise_shift_scalar_cpu(a, b,
-        [](auto x, auto sh) { return static_cast<decltype(x)>(x >> sh); },
-        "bitwise_right_shift");
+    return bitwise_shift_scalar_cpu<false>(a, b, "bitwise_right_shift");
 }
 
 // Scalar-first variants: materialize the scalar as a 0-dim tensor in the
