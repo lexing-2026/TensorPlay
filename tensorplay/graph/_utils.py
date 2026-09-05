@@ -297,7 +297,13 @@ def _format_target(target: Any) -> str:
         return target
     if callable(target) and name:
         module = getattr(target, "__module__", "") or ""
-        if module and module != "builtins":
+        if module == "builtins":
+            return str(name)
+        # The private accelerator module is presented under its public
+        # facade so user-facing renderings share one spelling.
+        if module == "_operator":
+            module = "operator"
+        if module:
             return f"{module}.{name}"
         return str(name)
     if name:
