@@ -790,6 +790,8 @@ std::tuple<Tensor, Tensor> interop_nanmedian_dim_values_cuda(
     return {values, indices};
 }
 
+}  // namespace
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, ReduceKernels) {
     m.impl("amax", amax_cuda2);
     m.impl("amin", amin_cuda2);
