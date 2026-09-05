@@ -303,6 +303,7 @@ Tensor flip_cpu(const Tensor& self, const std::vector<int64_t>& dims) {
 #define TP_FLIP_W(ctype, name_) \
     case DType::name_: reinterpret_cast<ctype*>(out.data_ptr())[outo] = reinterpret_cast<const ctype*>(sc.data_ptr())[srco]; break;
                 TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_FLIP_W)
+                TENSORPLAY_FORALL_QINT_TYPES(TP_FLIP_W)
 #undef TP_FLIP_W
                 default: break;
             }
