@@ -1169,74 +1169,48 @@ Tensor sparse_mm_cuda(const Tensor& self, const Tensor& dense) {
         TP_THROW(TypeError,
                  "sparse_mm(): operands must share the sparse tensor's dtype");
     }
-
-#define TP_SPARSE_MM_CASE(ctype, name)                                        \
-    case DType::name: {                                                       \
-        using scalar_t = ctype;                                               \
-        Tensor dense_contiguous =                                             \
-            dense.is_contiguous() ? dense : dense.contiguous();               \
-        Tensor out =                                                          \
-            Tensor::zeros({self.size(0), dense.size(1)}, self.dtype(),        \
-                          self.device());                                     \
-        const int64_t cols = dense.size(1);                                   \
-        const cudaStream_t mm_stream = getCurrentCUDAStream().stream();       \
-        if (self.is_sparse_csr()) {                                           \
-            Tensor crow = self._crow_indices().contiguous();                  \
-            Tensor col = self._col_indices().contiguous();                    \
-            Tensor values = self._values().contiguous();                      \
-            const int64_t total = self.size(0) * cols;                        \
-            if (total > 0) {                                                  \
-                const int blocks =                                            \
-                    static_cast<int>((total + threads - 1) / threads);        \
-                sparse_csr_mm_kernel<scalar_t><<<blocks, threads, 0,          \
-                                                 mm_stream>>>(                \
-                    total, cols, crow.data_ptr<int64_t>(),                    \
-                    col.data_ptr<int64_t>(),                                  \
-                    values.data_ptr<scalar_t>(),                              \
-                    dense_contiguous.data_ptr<scalar_t>(),                    \
-                    out.data_ptr<scalar_t>());                                \
-            }                                                                 \
-        } else {                                                              \
-            Tensor canonical =                                                \
-                self.is_coalesced() ? self : self.coalesce();                 \
-            Tensor indices = canonical._indices().contiguous();               \
-            Tensor values = canonical._values().contiguous();                 \
-            if (values.dim() != 1) {                                          \
-                TP_THROW(RuntimeError,                                        \
-                         "sparse_mm(): hybrid COO tensors are not supported");\
-            }                                                                 \
-            const int64_t nnz = indices.size(1);                              \
-            const int64_t total = nnz * cols;                                 \
-            if (total > 0) {                                                  \
-                const int blocks =                                            \
-                    static_cast<int>((total + threads - 1) / threads);        \
-                sparse_coo_mm_kernel<scalar_t><<<blocks, threads, 0,          \
-                                                 mm_stream>>>(                \
-                    total, cols, indices.data_ptr<int64_t>(),                 \
-                    indices.data_ptr<int64_t>() + nnz,                        \
-                    values.data_ptr<scalar_t>(),                              \
-                    dense_contiguous.data_ptr<scalar_t>(),                    \
-                    out.data_ptr<scalar_t>());                                \
-            }                                                                 \
-        }                                                                     \
-        checkCuda(cudaGetLastError(), "CUDA sparse_mm kernel");               \
-        return out;                                                           \
-    }
-
     constexpr int threads = 128;
-    switch (self.dtype()) {
-        TP_SPARSE_MM_CASE(float, Float32)
-        TP_SPARSE_MM_CASE(double, Float64)
-        default:
-            break;
+    Tensor source = self;
+    if (self.is_sparse_csr()) {
+        if (self.sparse_dim() != 2 || self._values().dim() != 1) {
+            TP_THROW(RuntimeError,
+                     "sparse_mm(): hybrid CSR tensors are not supported");
+        }
+    } else {
+        if (self.sparse_dim() != 2) {
+            TP_THROW(RuntimeError,
+                     "sparse_mm(): hybrid COO tensors are not supported");
+        }
+        Tensor canonical = self.is_coalesced() ? self : self.coalesce();
+        if (canonical._values().dim() != 1) {
+            TP_THROW(RuntimeError,
+                     "sparse_mm(): hybrid COO tensors are not supported");
+        }
+        source = coo_to_csr_native(canonical);
     }
-#undef TP_SPARSE_MM_CASE
 
-    // Non-float dtypes fall back to CPU staging.
-    Tensor host_self = self.to(Device(DeviceType::CPU));
-    Tensor host_dense = dense.to(Device(DeviceType::CPU));
-    Tensor result_host = cpu::sparse_mm_cpu(host_self, host_dense);
-    return result_host.to(self.device());
+    Tensor crow = source._crow_indices().contiguous();
+    Tensor col = source._col_indices().contiguous();
+    Tensor values = source._values().contiguous();
+    Tensor dense_contiguous = dense.is_contiguous() ? dense : dense.contiguous();
+    Tensor out = Tensor::zeros({self.size(0), dense.size(1)}, self.dtype(),
+                               self.device());
+    const int64_t cols = dense.size(1);
+    const int64_t total = self.size(0) * cols;
+    if (total > 0) {
+        const cudaStream_t mm_stream = getCurrentCUDAStream().stream();
+        const int blocks = static_cast<int>((total + threads - 1) / threads);
+        dispatch_coalesce_dtype(self.dtype(), [&](auto tag) {
+            using scalar_t = typename decltype(tag)::type;
+            sparse_csr_mm_kernel<scalar_t><<<blocks, threads, 0, mm_stream>>>(
+                total, cols, crow.data_ptr<int64_t>(), col.data_ptr<int64_t>(),
+                values.data_ptr<scalar_t>(),
+                dense_contiguous.data_ptr<scalar_t>(),
+                out.data_ptr<scalar_t>());
+        });
+        checkCuda(cudaGetLastError(), "CUDA sparse_mm kernel");
+    }
+    return out;
 }
 
 Tensor sparse_sum_cuda(const Tensor& self,
