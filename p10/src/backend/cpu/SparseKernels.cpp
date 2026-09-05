@@ -543,6 +543,10 @@ Tensor sparse_mm_cpu(const Tensor& self, const Tensor& dense) {
     if (self.dim() != 2 || dense.dim() != 2) {
         TP_THROW(RuntimeError, "sparse_mm(): both operands must be 2-D");
     }
+    if (self.device() != dense.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "sparse_mm(): operands must be on the same device");
+    }
     const int64_t inner = self.size(1);
     if (dense.size(0) != inner) {
         TP_THROW(RuntimeError,
@@ -697,6 +701,10 @@ Tensor sparse_add_cpu_impl(const Tensor& self, const Tensor& other) {
     if (self.dtype() != other.dtype()) {
         TP_THROW(TypeError, "sparse.add(): operands must share one dtype");
     }
+    if (self.device() != other.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "sparse.add(): operands must share one device");
+    }
     Tensor a = self.is_coalesced() ? self : self.coalesce();
     Tensor b = other.is_coalesced() ? other : other.coalesce();
     const auto a_value_shape = a._values().shape();
@@ -740,6 +748,10 @@ Tensor sparse_mul_cpu(const Tensor& self, const Tensor& other) {
     }
     if (self.dtype() != other.dtype()) {
         TP_THROW(TypeError, "sparse.mul(): operands must share one dtype");
+    }
+    if (self.device() != other.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "sparse.mul(): operands must share one device");
     }
     Tensor a = self.is_coalesced() ? self : self.coalesce();
     Tensor b = other.is_coalesced() ? other : other.coalesce();
@@ -843,6 +855,10 @@ Tensor spdiags_cpu(const Tensor& diagonals, const Tensor& offsets,
     Tensor diags2d = diagonals.dim() == 1 ? diagonals.unsqueeze(0) : diagonals;
     if (diags2d.dim() != 2) {
         TP_THROW(ValueError, "spdiags(): diagonals must be a vector or matrix");
+    }
+    if (diags2d.device() != offsets.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "spdiags(): diagonals and offsets must share one device");
     }
     Tensor offs = offsets.dim() == 0 ? offsets.unsqueeze(0) : offsets;
     if (offs.dim() != 1 || offs.dtype() != DType::Int64) {
