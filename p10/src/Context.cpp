@@ -66,6 +66,17 @@ void Context::setAllowTF32CuBLAS(bool b) {
                                 : Float32MatmulPrecision::HIGHEST);
 }
 
+void Context::setSDPPriorityOrder(const std::vector<int64_t>& order) {
+    if (order.size() != static_cast<size_t>(num_sdp_backends)) {
+        TP_THROW(RuntimeError,
+                 "setSDPPriority order expected ", num_sdp_backends,
+                 " unique backends specified in priority order.");
+    }
+    for (size_t i = 0; i < order.size(); ++i) {
+        sdp_priority_order_[i] = static_cast<SDPBackend>(order[i]);
+    }
+}
+
 // The device-override slots live translation-unit local: thread-storage
 // objects cannot carry a dll interface on Windows, so callers go through
 // the exported Context accessors instead of touching the variables here.

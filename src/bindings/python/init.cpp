@@ -2,6 +2,7 @@
 #include "PyNewRef.h"
 #include "tensorplay/ops/Config.h"
 #include "tensorplay/ops/TensorCPythonGenerated.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 #include "CPythonBridge.h"
 #include "Context.h"
 #include "OneDNNContext.h"
@@ -384,6 +385,110 @@ PYBIND11_MODULE(_C, m) {
 #endif
     });
 
+    // --------------------------------------------------------------------
+    // Scaled dot product attention utilities
+    // --------------------------------------------------------------------
+    struct SdpParams {
+        Tensor query;
+        Tensor key;
+        Tensor value;
+        std::optional<Tensor> attn_mask;
+        double dropout;
+        bool is_causal;
+        bool enable_gqa;
+    };
+
+    py::class_<SdpParams>(m, "_SDPAParams")
+        .def(py::init([](const Tensor& query,
+                         const Tensor& key,
+                         const Tensor& value,
+                         std::optional<Tensor> attn_mask,
+                         double dropout,
+                         bool is_causal,
+                         bool enable_gqa) {
+            return SdpParams{
+                query, key, value, std::move(attn_mask),
+                dropout, is_causal, enable_gqa};
+        }),
+             "query"_a, "key"_a, "value"_a, "attn_mask"_a, "dropout"_a,
+             "is_causal"_a, "enable_gqa"_a)
+        .def_readonly("query", &SdpParams::query)
+        .def_readonly("key", &SdpParams::key)
+        .def_readonly("value", &SdpParams::value)
+        .def_readonly("attn_mask", &SdpParams::attn_mask)
+        .def_readonly("dropout", &SdpParams::dropout)
+        .def_readonly("is_causal", &SdpParams::is_causal)
+        .def_readonly("enable_gqa", &SdpParams::enable_gqa);
+
+    py::enum_<tensorplay::SDPBackend>(
+        m,
+        "_SDPBackend",
+        "An enum-like class that contains the different backends for scaled dot product attention.\n\n... warning:: This class is in beta and subject to change.\n\n"
+        "This backend class is designed to be used with the sdpa_kernel context manager."
+        "See :func: tensorplay.nn.attention.sdpa_kernel for more details.")
+        .value("ERROR", tensorplay::SDPBackend::error)
+        .value("MATH", tensorplay::SDPBackend::math)
+        .value("FLASH_ATTENTION", tensorplay::SDPBackend::flash_attention)
+        .value("EFFICIENT_ATTENTION", tensorplay::SDPBackend::efficient_attention)
+        .value("CUDNN_ATTENTION", tensorplay::SDPBackend::cudnn_attention)
+        .value("OVERRIDEABLE", tensorplay::SDPBackend::overrideable);
+
+    m.def(
+        "_can_use_flash_attention",
+        [](const SdpParams& params, bool debug) {
+            if (!tensorplay::globalContext().userEnabledFlashSDP()) {
+                return false;
+            }
+            try {
+                const int64_t choice = tensorplay::tpx::ops::_fused_sdp_choice(
+                    params.query,
+                    params.key,
+                    params.value,
+                    params.attn_mask,
+                    params.dropout,
+                    params.is_causal,
+                    std::nullopt,
+                    params.enable_gqa);
+                return static_cast<int64_t>(tensorplay::SDPBackend::flash_attention) == choice
+                    && !params.enable_gqa;
+            } catch (const tensorplay::Exception&) {
+                if (debug) {
+                    TP_WARN(
+                        "flash attention can't be run on these inputs; the "
+                        "backend selector rejected them");
+                }
+                return false;
+            }
+        },
+        "params"_a, "debug"_a = false);
+    m.def(
+        "_can_use_mem_efficient_attention",
+        [](const SdpParams& params, bool debug) {
+            (void)params;
+            if (debug) {
+                TP_WARN(
+                    "Efficient attention can't be used because: no "
+                    "memory-efficient kernel is available in this build");
+            }
+            return false;
+        },
+        "params"_a, "debug"_a = false);
+    m.def(
+        "_can_use_cudnn_attention",
+        [](const SdpParams& params, bool debug) {
+            (void)params;
+            if (debug) {
+                TP_WARN(
+                    "cuDNN attention can't be used because: no cuDNN "
+                    "attention kernel is available in this build");
+            }
+            return false;
+        },
+        "params"_a, "debug"_a = false);
+    m.def("_is_ck_sdpa_available", []() {
+        return false;
+    });
+
     // Config
     m.def("_show_config", &tensorplay::show_config);
     m.def("_cxx_flags", &tensorplay::_cxx_flags);
@@ -521,6 +626,78 @@ PYBIND11_MODULE(_C, m) {
     m.def("_set_cudnn_benchmark", [](bool enabled) {
         tensorplay::globalContext().setCudnnBenchmark(enabled);
     }, "enabled"_a);
+
+    // --------------------------------------------------------------------
+    // Scaled dot product attention utilities
+    // --------------------------------------------------------------------
+    m.def("_get_flash_sdp_enabled", []() {
+        return tensorplay::globalContext().userEnabledFlashSDP();
+    });
+    m.def("_set_sdp_use_flash", [](bool enabled) {
+        tensorplay::globalContext().setSDPUseFlash(enabled);
+    }, "enabled"_a);
+    m.def("_get_fa3_sdp_enabled", []() {
+        return tensorplay::globalContext().userEnabledFA3SDP();
+    });
+    m.def("_set_sdp_use_fa3", [](bool enabled) {
+        tensorplay::globalContext().setSDPUseFA3(enabled);
+    }, "enabled"_a);
+    m.def("_get_fa4_sdp_enabled", []() {
+        return tensorplay::globalContext().userEnabledFA4SDP();
+    });
+    m.def("_set_sdp_use_fa4", [](bool enabled) {
+        tensorplay::globalContext().setSDPUseFA4(enabled);
+    }, "enabled"_a);
+    m.def("_get_mem_efficient_sdp_enabled", []() {
+        return tensorplay::globalContext().userEnabledMemEfficientSDP();
+    });
+    m.def("_set_sdp_use_mem_efficient", [](bool enabled) {
+        tensorplay::globalContext().setSDPUseMemEfficient(enabled);
+    }, "enabled"_a);
+    m.def("_get_math_sdp_enabled", []() {
+        return tensorplay::globalContext().userEnabledMathSDP();
+    });
+    m.def("_set_sdp_use_math", [](bool enabled) {
+        tensorplay::globalContext().setSDPUseMath(enabled);
+    }, "enabled"_a);
+    m.def("_get_cudnn_sdp_enabled", []() {
+        return tensorplay::globalContext().userEnabledCuDNNSDP();
+    });
+    m.def("_set_sdp_use_cudnn", [](bool enabled) {
+        tensorplay::globalContext().setSDPUseCuDNN(enabled);
+    }, "enabled"_a);
+    m.def("_get_overrideable_sdp_enabled", []() {
+        return tensorplay::globalContext().userEnabledOverrideableSDP();
+    });
+    m.def("_set_sdp_use_overrideable", [](bool enabled) {
+        tensorplay::globalContext().setSDPUseOverrideable(enabled);
+    }, "enabled"_a);
+    m.def("_get_math_sdp_allow_fp16_bf16_reduction", []() {
+        return tensorplay::globalContext().allowFP16BF16ReductionMathSDP();
+    });
+    m.def("_set_math_sdp_allow_fp16_bf16_reduction", [](bool enabled) {
+        tensorplay::globalContext().setAllowFP16BF16ReductionMathSDP(enabled);
+    }, "enabled"_a);
+    m.def("_get_sdp_priority_order", []() {
+        auto order = tensorplay::globalContext().sdpPriorityOrder();
+        py::list out;
+        for (auto backend : order) {
+            out.append(static_cast<int64_t>(backend));
+        }
+        return out;
+    });
+    m.def("_set_sdp_priority_order", [](const std::vector<int64_t>& order) {
+        tensorplay::globalContext().setSDPPriorityOrder(order);
+    }, "order"_a);
+    m.def("_set_sm_carveout_experimental", [](std::optional<int32_t> val) {
+        tensorplay::globalContext().setSMCarveout(val);
+    }, "val"_a);
+    m.def("_get_sm_carveout_experimental", []() {
+        return tensorplay::globalContext().smCarveout();
+    });
+    m.def("_is_flash_attention_available", []() {
+        return true;
+    });
 
     m.def("set_printoptions", &tensorplay::set_printoptions, 
           "Set print options", 

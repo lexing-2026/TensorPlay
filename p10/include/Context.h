@@ -2,12 +2,13 @@
 
 // process-wide behavior: default dtype/device for factory functions,
 // deterministic-algorithms flags, and float32 matmul precision.
-//
 
 #include "Macros.h"
 #include "Device.h"
 #include "DType.h"
+#include "SDPBackend.h"
 
+#include <array>
 #include <optional>
 #include <string>
 #include <vector>
@@ -100,6 +101,50 @@ public:
     bool userEnabledNNPACK() const { return enabled_nnpack_; }
     void setUserEnabledNNPACK(bool e) { enabled_nnpack_ = e; }
 
+    // -- Scaled dot product attention backend controls -------------------
+    // Every fused kernel family owns an enable switch; the priority order
+    // ranks the backends when the caller lets the library route.  Both are
+    // consumed by the Python ``sdpa_kernel`` context manager and the
+    // ``can_use_*`` eligibility gates.
+    void setSDPUseFlash(bool e) { enabled_flash_sdp_ = e; }
+    bool userEnabledFlashSDP() const { return enabled_flash_sdp_; }
+
+    void setSDPUseFA3(bool e) { enabled_fa3_sdp_ = e; }
+    bool userEnabledFA3SDP() const { return enabled_fa3_sdp_; }
+
+    void setSDPUseFA4(bool e) { enabled_fa4_sdp_ = e; }
+    bool userEnabledFA4SDP() const { return enabled_fa4_sdp_; }
+
+    void setSDPUseMemEfficient(bool e) { enabled_mem_efficient_sdp_ = e; }
+    bool userEnabledMemEfficientSDP() const { return enabled_mem_efficient_sdp_; }
+
+    void setSDPUseMath(bool e) { enabled_math_sdp_ = e; }
+    bool userEnabledMathSDP() const { return enabled_math_sdp_; }
+
+    void setSDPUseCuDNN(bool e) { enabled_cudnn_sdp_ = e; }
+    bool userEnabledCuDNNSDP() const { return enabled_cudnn_sdp_; }
+
+    void setSDPUseOverrideable(bool e) { enabled_overrideable_sdp_ = e; }
+    bool userEnabledOverrideableSDP() const { return enabled_overrideable_sdp_; }
+
+    void setAllowFP16BF16ReductionMathSDP(bool e) {
+        allow_fp16_bf16_reduction_math_sdp_ = e;
+    }
+    bool allowFP16BF16ReductionMathSDP() const {
+        return allow_fp16_bf16_reduction_math_sdp_;
+    }
+
+    // Every backend must appear exactly once; entries are validated by the
+    // setter, and the routing loop reads them back in user-supplied order.
+    void setSDPPriorityOrder(const std::vector<int64_t>& order);
+    std::array<SDPBackend, num_sdp_backends> sdpPriorityOrder() const {
+        return sdp_priority_order_;
+    }
+
+    // Optional SM carve-out hint forwarded to registered flash kernels.
+    void setSMCarveout(std::optional<int32_t> val) { sm_carveout_ = val; }
+    std::optional<int32_t> smCarveout() const { return sm_carveout_; }
+
 private:
     Context(const Context&) = delete;
     Context& operator=(const Context&) = delete;
@@ -114,6 +159,22 @@ private:
     bool cudnn_benchmark_ = false;
     bool enabled_mkldnn_ = true;
     bool enabled_nnpack_ = true;
+
+    bool enabled_flash_sdp_ = true;
+    bool enabled_fa3_sdp_ = false;
+    bool enabled_fa4_sdp_ = false;
+    bool enabled_mem_efficient_sdp_ = true;
+    bool enabled_math_sdp_ = true;
+    bool enabled_cudnn_sdp_ = true;
+    bool enabled_overrideable_sdp_ = true;
+    bool allow_fp16_bf16_reduction_math_sdp_ = false;
+    std::array<SDPBackend, num_sdp_backends> sdp_priority_order_ = {
+        SDPBackend::flash_attention,
+        SDPBackend::efficient_attention,
+        SDPBackend::math,
+        SDPBackend::cudnn_attention,
+        SDPBackend::overrideable};
+    std::optional<int32_t> sm_carveout_ = std::nullopt;
 };
 
 P10_API Context& globalContext();
