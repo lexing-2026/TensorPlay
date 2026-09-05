@@ -156,11 +156,21 @@ struct MatmulAccumType {
 template <> struct MatmulAccumType<int8_t> { using type = uint32_t; };
 template <> struct MatmulAccumType<int16_t> { using type = uint32_t; };
 template <> struct MatmulAccumType<int32_t> { using type = uint64_t; };
+#if defined(__SIZEOF_INT128__)
 template <> struct MatmulAccumType<int64_t> { using type = unsigned __int128; };
+#else
+// MSVC on x86-64 has no __int128; the two's-complement wrap of uint64_t
+// still yields the low 64 bits the integer matmul keeps.
+template <> struct MatmulAccumType<int64_t> { using type = uint64_t; };
+#endif
 template <> struct MatmulAccumType<uint8_t> { using type = uint32_t; };
 template <> struct MatmulAccumType<uint16_t> { using type = uint32_t; };
 template <> struct MatmulAccumType<uint32_t> { using type = uint64_t; };
+#if defined(__SIZEOF_INT128__)
 template <> struct MatmulAccumType<uint64_t> { using type = unsigned __int128; };
+#else
+template <> struct MatmulAccumType<uint64_t> { using type = uint64_t; };
+#endif
 template <> struct MatmulAccumType<Half> { using type = float; };
 template <> struct MatmulAccumType<BFloat16> { using type = float; };
 template <> struct MatmulAccumType<std::complex<Half>> { using type = std::complex<float>; };
