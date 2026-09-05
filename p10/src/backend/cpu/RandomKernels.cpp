@@ -384,6 +384,9 @@ Tensor bernoulli_p_kernel(const Tensor& self, double p,
 }
 
 Tensor normal_kernel(const Tensor& mean, const Tensor& std) {
+    if (mean.device() != std.device()) {
+        TP_THROW(DeviceMismatchError, "normal: mean and std must be on the same device");
+    }
     if (mean.dtype() != std.dtype()) {
         TP_THROW(RuntimeError, "normal: mean and std must have the same dtype");
     }
