@@ -111,7 +111,129 @@ bool same_tensor(const Tensor& lhs, const Tensor& rhs) {
                        static_cast<size_t>(a.numel()) * a.itemsize()) == 0;
 }
 
+void check_float_input(const Tensor& tensor) {
+    if (tensor.dtype() != DType::Float32) {
+        TP_THROW(TypeError, "quantize(): expected a Float32 tensor, got ",
+                 toString(tensor.dtype()));
+    }
+}
+
+void prepare_dequantize_out(Tensor& out, const Tensor& tensor) {
+    out.resize_(static_cast<std::vector<int64_t>>(tensor.shape()));
+    if (out.device() != tensor.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "dequantize_out(): output and input must be on the same device");
+    }
+    if (out.dtype() != DType::Float32 || !out.is_contiguous()) {
+        TP_THROW(TypeError,
+                 "dequantize_out(): output must be a contiguous Float32 tensor");
+    }
+}
+
+template <typename Dequantize>
+Tensor& dequantize_out_from(Tensor& out, const Tensor& tensor,
+                            Dequantize&& dequantize) {
+    prepare_dequantize_out(out, tensor);
+    out.copy_(dequantize());
+    return out;
+}
+
 } // namespace
+
+Tensor UnknownQuantizer::quantize(const Tensor&) {
+    TP_THROW(RuntimeError, "cannot quantize with UnknownQuantizer");
+}
+
+Tensor UnknownQuantizer::dequantize(const Tensor&) {
+    TP_THROW(RuntimeError, "cannot dequantize with UnknownQuantizer");
+}
+
+Tensor& UnknownQuantizer::dequantize_out(Tensor&, const Tensor&) {
+    TP_THROW(RuntimeError, "cannot dequantize_out with UnknownQuantizer");
+}
+
+Tensor PerTensorAffineQuantizer::quantize(const Tensor& tensor) {
+    check_float_input(tensor);
+    switch (scalar_type()) {
+        case DType::QInt8:
+            return Tensor::quantize_per_tensor(tensor, scale_, zero_point_);
+        case DType::QUInt8:
+            return Tensor::quantize_per_tensor_quint8(
+                tensor, scale_, zero_point_);
+        case DType::QInt32:
+            return Tensor::quantize_per_tensor_qint32(
+                tensor, scale_, zero_point_);
+        default:
+            TP_THROW(TypeError, "quantize(): unsupported quantized dtype ",
+                     toString(scalar_type()));
+    }
+}
+
+Tensor PerTensorAffineQuantizer::dequantize(const Tensor& tensor) {
+    switch (scalar_type()) {
+        case DType::QInt8:
+            return Tensor::dequantize_per_tensor(tensor, scale_, zero_point_);
+        case DType::QUInt8:
+            return Tensor::dequantize_per_tensor_quint8(
+                tensor, scale_, zero_point_);
+        case DType::QInt32:
+            return Tensor::dequantize_per_tensor_qint32(
+                tensor, scale_, zero_point_);
+        default:
+            TP_THROW(TypeError, "dequantize(): unsupported quantized dtype ",
+                     toString(scalar_type()));
+    }
+}
+
+Tensor& PerTensorAffineQuantizer::dequantize_out(Tensor& out,
+                                                  const Tensor& tensor) {
+    return dequantize_out_from(out, tensor, [&] { return dequantize(tensor); });
+}
+
+Tensor PerChannelAffineQuantizer::quantize(const Tensor& tensor) {
+    check_float_input(tensor);
+    if (scalar_type() != DType::QInt8) {
+        TP_THROW(TypeError,
+                 "quantize(): per-channel quantization supports QInt8");
+    }
+    return Tensor::quantize_per_channel(tensor, scales_, zero_points_, axis_);
+}
+
+Tensor PerChannelAffineQuantizer::dequantize(const Tensor& tensor) {
+    if (scalar_type() != DType::QInt8) {
+        TP_THROW(TypeError,
+                 "dequantize(): per-channel quantization supports QInt8");
+    }
+    return Tensor::dequantize_per_channel(tensor, scales_, zero_points_, axis_);
+}
+
+Tensor& PerChannelAffineQuantizer::dequantize_out(Tensor& out,
+                                                   const Tensor& tensor) {
+    return dequantize_out_from(out, tensor, [&] { return dequantize(tensor); });
+}
+
+Tensor PerChannelAffineFloatQParamsQuantizer::quantize(const Tensor& tensor) {
+    check_float_input(tensor);
+    if (scalar_type() != DType::QInt8) {
+        TP_THROW(TypeError,
+                 "quantize(): per-channel quantization supports QInt8");
+    }
+    return Tensor::quantize_per_channel(tensor, scales_, zero_points_, axis_);
+}
+
+Tensor PerChannelAffineFloatQParamsQuantizer::dequantize(
+    const Tensor& tensor) {
+    if (scalar_type() != DType::QInt8) {
+        TP_THROW(TypeError,
+                 "dequantize(): per-channel quantization supports QInt8");
+    }
+    return Tensor::dequantize_per_channel(tensor, scales_, zero_points_, axis_);
+}
+
+Tensor& PerChannelAffineFloatQParamsQuantizer::dequantize_out(
+    Tensor& out, const Tensor& tensor) {
+    return dequantize_out_from(out, tensor, [&] { return dequantize(tensor); });
+}
 
 bool PerTensorAffineQuantizer::equalTo(const QuantizerPtr& other) const {
     if (!other || other->qscheme() != kPerTensorAffine) return false;
@@ -229,9 +351,11 @@ Tensor make_qtensor(const Tensor& codes, QuantizerPtr quantizer, DType dtype) {
     TP_CHECK(codes.dtype() == underlying_storage_type(dtype),
              "make_qtensor(): code storage dtype must match the quantized "
              "dtype's underlying integer type");
-    if (isPerChannelQScheme(quantizer->qscheme()) &&
-        (quantizer->scales().device() != codes.device() ||
-         quantizer->zero_points().device() != codes.device())) {
+    const auto* per_channel_quantizer =
+        dynamic_cast<const PerChannelAffineQuantizer*>(quantizer.get());
+    if (per_channel_quantizer != nullptr &&
+        (per_channel_quantizer->scales().device() != codes.device() ||
+         per_channel_quantizer->zero_points().device() != codes.device())) {
         TP_CHECK(false,
                  "make_qtensor(): per-channel qparams must be on the code tensor device");
     }

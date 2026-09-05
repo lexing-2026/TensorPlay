@@ -4,6 +4,7 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
+#include "Quantizer.h"
 #include "Scalar.h"
 #include "TypePromotion.h"
 #include "CompositeCommon.h"
@@ -1693,18 +1694,7 @@ Tensor quantize_per_tensor_tq_native(const Tensor& self, const Tensor& scale,
                                      const Tensor& zero_point, DType dtype) {
     const double sc = scale.item().toDouble();
     const int64_t zp = zero_point.item().to<int64_t>();
-    switch (dtype) {
-        case DType::QUInt8:
-            return ops::quantize_per_tensor_quint8(self, sc, zp);
-        case DType::QInt32:
-            return ops::quantize_per_tensor_qint32(self, sc, zp);
-        case DType::QInt8:
-            return ops::quantize_per_tensor(self, sc, zp);
-        default:
-            TP_THROW(TypeError,
-                     std::string("quantize_per_tensor(): unsupported quantized dtype ") +
-                         toString(dtype));
-    }
+    return make_per_tensor_affine_quantizer(sc, zp, dtype)->quantize(self);
 }
 
 std::vector<Tensor> quantize_per_tensor_tensors_native(const std::vector<Tensor>& tensors,
