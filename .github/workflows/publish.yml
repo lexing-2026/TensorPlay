@@ -34,7 +34,7 @@ jobs:
       release_tag: ${{ steps.read-matrix.outputs.release_tag }}
       stable_tag: ${{ steps.read-matrix.outputs.stable_tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: false
           show-progress: false
@@ -96,7 +96,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: false
           show-progress: false

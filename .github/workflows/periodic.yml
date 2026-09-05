@@ -24,7 +24,7 @@ jobs:
       cpu: ${{ steps.read-matrix.outputs.cpu }}
       cuda: ${{ steps.read-matrix.outputs.cuda }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: false
           show-progress: false
