@@ -27,6 +27,16 @@ void check_cufft(cufftResult error, const char* what) {
     }
 }
 
+// rocFFT historically double-freed handles returned by its planner, so
+// eviction on the AMD backend drops the entry without destroying it.
+void destroy_plan(cufftHandle handle) {
+#if defined(USE_ROCM)
+    (void)handle;
+#else
+    cufftDestroy(handle);
+#endif
+}
+
 }  // namespace
 
 cufftHandle PlanLRUCache::lookup(const PlanSpec& spec) {
@@ -52,7 +62,7 @@ cufftHandle PlanLRUCache::lookup(const PlanSpec& spec) {
         auto last = usage_.end();
         --last;
         map_.erase(last->first);
-        cufftDestroy(last->second);
+        destroy_plan(last->second);
         usage_.pop_back();
     }
 
@@ -87,7 +97,7 @@ cufftHandle PlanLRUCache::lookup(const PlanSpec& spec) {
 void PlanLRUCache::clear() {
     std::lock_guard<std::mutex> lock(mutex);
     for (auto& entry : usage_) {
-        cufftDestroy(entry.second);
+        destroy_plan(entry.second);
     }
     map_.clear();
     usage_.clear();
@@ -127,7 +137,7 @@ void PlanLRUCache::resize(int64_t new_size) {
     // Destroy outside the cache mutex: cufftDestroy can block on in-flight
     // work and must not serialize other cache operations.
     for (cufftHandle handle : evicted) {
-        cufftDestroy(handle);
+        destroy_plan(handle);
     }
 }
 
