@@ -2,6 +2,7 @@
 // any registered sibling in ways the mechanical matcher rejects, but whose
 // semantics are a plain forward to an already-registered kernel.
 #include "Tensor.h"
+#include "SparseKernels.h"
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "Quantizer.h"
@@ -1060,11 +1061,16 @@ std::tuple<Tensor, Tensor, Tensor> lstm_data_native(const Tensor& data,
 
 // ---- sparse / misc ------------------------------------------------------------
 Tensor to_sparse_sparse_dim_native(const Tensor& self, int64_t sparse_dim) {
-    if (sparse_dim != self.dim()) {
-        TP_THROW(NotImplementedError,
-                 "to_sparse with sparse_dim smaller than the tensor rank is not supported");
+    if (self.device().is_cpu()) {
+        return cpu::to_sparse_coo_cpu_sparse_dim(self, sparse_dim);
     }
-    return ops::to_sparse(self);
+#ifdef USE_CUDA
+    if (self.device().is_cuda()) {
+        return cuda::to_sparse_coo_cuda_sparse_dim(self, sparse_dim);
+    }
+#endif
+    TP_THROW(NotImplementedError,
+             "to_sparse(): sparse_dim conversion is not implemented for this device");
 }
 
 Tensor _to_sparse_sparse_dim_native(const Tensor& self, int64_t sparse_dim) {
