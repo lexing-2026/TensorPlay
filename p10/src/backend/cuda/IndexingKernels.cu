@@ -161,11 +161,13 @@ __global__ void scan_outer_kernel(IndexT n_outer, IndexT d_size, IndexT inner,
 
 template <typename T>
 using scan_accum_t = std::conditional_t<
-    (std::is_same_v<T, bool> || sizeof(T) < sizeof(int32_t)), int32_t, T>;
+    (std::is_same_v<T, Half> || std::is_same_v<T, BFloat16>), float,
+    std::conditional_t<
+        (std::is_same_v<T, bool> || sizeof(T) < sizeof(int32_t)), int32_t, T>>;
 
 template <typename T, typename AccT, typename Op>
 __device__ __forceinline__ AccT scan_combine(const Op& op, AccT lhs, AccT rhs) {
-    return static_cast<AccT>(op(static_cast<T>(lhs), static_cast<T>(rhs)));
+    return static_cast<AccT>(op(lhs, rhs));
 }
 
 template <typename T, typename Op, int kThreadsX, int kThreadsY>
@@ -272,11 +274,21 @@ void launch_short_rows_scan(int64_t n_rows, int64_t row_size,
 
 template <typename T, bool Product>
 struct scan_arithmetic_op {
-    __host__ __device__ T operator()(T lhs, T rhs) const {
+    template <typename AccT>
+    __host__ __device__ AccT operator()(AccT lhs, AccT rhs) const {
+        if constexpr (std::is_same_v<T, Half> || std::is_same_v<T, BFloat16>) {
+            if constexpr (Product) {
+                return static_cast<AccT>(lhs * rhs);
+            } else {
+                return static_cast<AccT>(lhs + rhs);
+            }
+        }
+        const T left = static_cast<T>(lhs);
+        const T right = static_cast<T>(rhs);
         if constexpr (Product) {
-            return static_cast<T>(lhs * rhs);
+            return static_cast<AccT>(static_cast<T>(left * right));
         } else {
-            return static_cast<T>(lhs + rhs);
+            return static_cast<AccT>(static_cast<T>(left + right));
         }
     }
 };
@@ -580,10 +592,10 @@ __global__ void scan_register_block_kernel(int64_t n_rows, int64_t d_size,
 
 // Stable running log-sum-exp:
 // m = max(x, acc); acc = m + log1p(exp(-|x - acc|)).
-template <typename T>
+template <typename T, typename AccT>
 __global__ void logcumsumexp_scan_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
                                          const T* in, T* out) {
-    using acc_t = T;
+    using acc_t = AccT;
     constexpr acc_t neg_inf = -std::numeric_limits<acc_t>::infinity();
     int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
@@ -1518,9 +1530,14 @@ Tensor cumsum_cuda(const Tensor& self, int64_t dim, std::optional<DType> dtype) 
         TP_CS_CASE(int16_t, Int16)
         TP_CS_CASE(int32_t, Int32)
         TP_CS_CASE(int64_t, Int64)
+        TP_CS_CASE(uint16_t, UInt16)
+        TP_CS_CASE(uint32_t, UInt32)
+        TP_CS_CASE(uint64_t, UInt64)
         TP_CS_CASE(bool, Bool)
         TP_CS_CASE(float, Float32)
         TP_CS_CASE(double, Float64)
+        TP_CS_CASE(Half, Float16)
+        TP_CS_CASE(BFloat16, BFloat16)
         default: TP_THROW(TypeError, "cumsum: unsupported dtype");
     }
 #undef TP_CS_CASE
@@ -1544,9 +1561,14 @@ Tensor cumprod_cuda(const Tensor& self, int64_t dim, std::optional<DType> dtype)
         TP_CP_CASE(int16_t, Int16)
         TP_CP_CASE(int32_t, Int32)
         TP_CP_CASE(int64_t, Int64)
+        TP_CP_CASE(uint16_t, UInt16)
+        TP_CP_CASE(uint32_t, UInt32)
+        TP_CP_CASE(uint64_t, UInt64)
         TP_CP_CASE(bool, Bool)
         TP_CP_CASE(float, Float32)
         TP_CP_CASE(double, Float64)
+        TP_CP_CASE(Half, Float16)
+        TP_CP_CASE(BFloat16, BFloat16)
         default: TP_THROW(TypeError, "cumprod: unsupported dtype");
     }
 #undef TP_CP_CASE
@@ -1567,11 +1589,17 @@ Tensor logcumsumexp_cuda(const Tensor& self, int64_t dim, std::optional<DType> d
     int64_t slices = outer * inner;
     auto stream = getCurrentCUDAStream().stream();
     if (out_dtype == DType::Float32) {
-        logcumsumexp_scan_kernel<float><<<(slices + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        logcumsumexp_scan_kernel<float, float><<<(slices + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
             slices, d_size, inner, src.data_ptr<float>(), result.data_ptr<float>());
     } else if (out_dtype == DType::Float64) {
-        logcumsumexp_scan_kernel<double><<<(slices + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        logcumsumexp_scan_kernel<double, double><<<(slices + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
             slices, d_size, inner, src.data_ptr<double>(), result.data_ptr<double>());
+    } else if (out_dtype == DType::Float16) {
+        logcumsumexp_scan_kernel<Half, float><<<(slices + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+            slices, d_size, inner, src.data_ptr<Half>(), result.data_ptr<Half>());
+    } else if (out_dtype == DType::BFloat16) {
+        logcumsumexp_scan_kernel<BFloat16, float><<<(slices + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+            slices, d_size, inner, src.data_ptr<BFloat16>(), result.data_ptr<BFloat16>());
     } else {
         TP_THROW(TypeError, "logcumsumexp: unsupported dtype");
     }
@@ -2963,7 +2991,7 @@ std::tuple<Tensor, Tensor, Tensor> unique_dim_consecutive_cuda(
 // ---------------------------------------------------------------------------
 
 namespace {
-template <typename T>
+template <typename T, typename AccT>
 __global__ void cumsum_backward_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
                                        const T* in, T* out) {
     int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -2972,10 +3000,10 @@ __global__ void cumsum_backward_kernel(int64_t n_slices, int64_t d_size, int64_t
         int64_t o = si / inner, in2 = si % inner;
         const T* sp = in + o * d_size * inner + in2;
         T* dp = out + o * d_size * inner + in2;
-        T acc = static_cast<T>(0);
+        AccT acc = static_cast<AccT>(0);
         for (int64_t j = d_size - 1; j >= 0; --j) {
-            acc = static_cast<T>(acc + sp[j * inner]);
-            dp[j * inner] = acc;
+            acc += static_cast<AccT>(sp[j * inner]);
+            dp[j * inner] = static_cast<T>(acc);
         }
     }
 }
@@ -2992,19 +3020,24 @@ Tensor cumsum_backward_cuda(const Tensor& grad, int64_t dim) {
     outer_inner(static_cast<std::vector<int64_t>>(g.shape()), dim, outer, inner);
     int64_t slices = outer * inner;
     auto stream = getCurrentCUDAStream().stream();
-#define TP_CSB_CASE(ctype, name) \
+#define TP_CSB_CASE(ctype, acc_type, name) \
     case DType::name: \
-        cumsum_backward_kernel<ctype><<<(slices + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+        cumsum_backward_kernel<ctype, acc_type><<<(slices + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
             slices, d_size, inner, g.data_ptr<ctype>(), result.data_ptr<ctype>()); \
         break;
     switch (g.dtype()) {
-        TP_CSB_CASE(uint8_t, UInt8)
-        TP_CSB_CASE(int8_t, Int8)
-        TP_CSB_CASE(int16_t, Int16)
-        TP_CSB_CASE(int32_t, Int32)
-        TP_CSB_CASE(int64_t, Int64)
-        TP_CSB_CASE(float, Float32)
-        TP_CSB_CASE(double, Float64)
+        TP_CSB_CASE(uint8_t, uint8_t, UInt8)
+        TP_CSB_CASE(int8_t, int8_t, Int8)
+        TP_CSB_CASE(int16_t, int16_t, Int16)
+        TP_CSB_CASE(int32_t, int32_t, Int32)
+        TP_CSB_CASE(int64_t, int64_t, Int64)
+        TP_CSB_CASE(uint16_t, uint16_t, UInt16)
+        TP_CSB_CASE(uint32_t, uint32_t, UInt32)
+        TP_CSB_CASE(uint64_t, uint64_t, UInt64)
+        TP_CSB_CASE(float, float, Float32)
+        TP_CSB_CASE(double, double, Float64)
+        TP_CSB_CASE(Half, float, Float16)
+        TP_CSB_CASE(BFloat16, float, BFloat16)
         default: TP_THROW(TypeError, "cumsum_backward: unsupported dtype");
     }
 #undef TP_CSB_CASE

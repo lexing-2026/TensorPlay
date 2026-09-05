@@ -224,9 +224,14 @@ Tensor cumsum_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
         TP_CUMSUM_INT(int16_t, Int16)
         TP_CUMSUM_INT(int32_t, Int32)
         TP_CUMSUM_INT(int64_t, Int64)
+        TP_CUMSUM_INT(uint16_t, UInt16)
+        TP_CUMSUM_INT(uint32_t, UInt32)
+        TP_CUMSUM_INT(uint64_t, UInt64)
         TP_CUMSUM_INT(bool, Bool)
         TP_CUMSUM_FLOAT(float, double, Float32)
         TP_CUMSUM_FLOAT(double, double, Float64)
+        TP_CUMSUM_FLOAT(Half, float, Float16)
+        TP_CUMSUM_FLOAT(BFloat16, float, BFloat16)
         default: TP_THROW(TypeError, "cumsum: unsupported dtype");
     }
 #undef TP_CUMSUM_FLOAT
@@ -262,8 +267,14 @@ Tensor cumprod_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) 
         TP_CUMPROD_INT(int16_t, Int16)
         TP_CUMPROD_INT(int32_t, Int32)
         TP_CUMPROD_INT(int64_t, Int64)
+        TP_CUMPROD_INT(uint16_t, UInt16)
+        TP_CUMPROD_INT(uint32_t, UInt32)
+        TP_CUMPROD_INT(uint64_t, UInt64)
+        TP_CUMPROD_INT(bool, Bool)
         TP_CUMPROD_FLOAT(float, double, Float32)
         TP_CUMPROD_FLOAT(double, double, Float64)
+        TP_CUMPROD_FLOAT(Half, float, Float16)
+        TP_CUMPROD_FLOAT(BFloat16, float, BFloat16)
         default: TP_THROW(TypeError, "cumprod: unsupported dtype");
     }
 #undef TP_CUMPROD_FLOAT
@@ -308,6 +319,8 @@ Tensor logcumsumexp_cpu(const Tensor& self, int64_t dim, std::optional<DType> dt
     switch (out_dtype) {
         TP_LCSE_CASE(float, float, Float32)
         TP_LCSE_CASE(double, double, Float64)
+        TP_LCSE_CASE(Half, float, Float16)
+        TP_LCSE_CASE(BFloat16, float, BFloat16)
         default: TP_THROW(TypeError, "logcumsumexp: unsupported dtype");
     }
 #undef TP_LCSE_CASE
@@ -1339,8 +1352,13 @@ Tensor cumsum_backward_cpu(const Tensor& grad, int64_t dim) {
         TP_CSB_CASE(int16_t, int16_t, Int16)
         TP_CSB_CASE(int32_t, int32_t, Int32)
         TP_CSB_CASE(int64_t, int64_t, Int64)
+        TP_CSB_CASE(uint16_t, uint16_t, UInt16)
+        TP_CSB_CASE(uint32_t, uint32_t, UInt32)
+        TP_CSB_CASE(uint64_t, uint64_t, UInt64)
         TP_CSB_CASE(float, double, Float32)
         TP_CSB_CASE(double, double, Float64)
+        TP_CSB_CASE(Half, float, Float16)
+        TP_CSB_CASE(BFloat16, float, BFloat16)
         default: TP_THROW(TypeError, "cumsum_backward: unsupported dtype");
     }
 #undef TP_CSB_CASE
