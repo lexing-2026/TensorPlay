@@ -17,7 +17,17 @@
 //                         of the layout, which is why this is not an empty
 //                         followed by a permute;
 //   _safe_softmax         softmax that answers 0 instead of NaN on rows that
-//                         are masked out entirely (every entry -inf).
+//                         are masked out entirely (every entry -inf);
+//   _logcumsumexp(+out)   the internal spelling of the log-domain cumulative
+//                         sum;
+//   _pdist_forward,       the internal spellings of the pairwise and
+//   _cdist_forward        cross distance forwards;
+//   _euclidean_dist       the squared-norm expansion
+//                         ||a - b||^2 = ||a||^2 - 2 a.b + ||b||^2 folded into
+//                         one matmul, clamped at zero before the root so
+//                         cancellation cannot produce a negative radicand;
+//   polygamma_, igamma_,  the in-place spellings of their functional forms.
+//   igammac_
 
 #include "CompositeCommon.h"
 #include "Tensor.h"
@@ -126,6 +136,64 @@ Tensor _safe_softmax_native(const Tensor& self, int64_t dim,
     return ops::where(masked_rows, Scalar(0.0), out);
 }
 
+Tensor _logcumsumexp_native(const Tensor& self, int64_t dim) {
+    return ops::logcumsumexp(self, dim, std::nullopt);
+}
+
+Tensor& _logcumsumexp_out_native(const Tensor& self, int64_t dim, Tensor& out) {
+    const Tensor value = ops::logcumsumexp(self, dim, std::nullopt);
+    if (!out.defined()) {
+        out = value;
+        return out;
+    }
+    const auto target = static_cast<std::vector<int64_t>>(value.shape());
+    if (static_cast<std::vector<int64_t>>(out.shape()) != target) {
+        out.resize_(target);
+    }
+    out.copy_(value);
+    return out;
+}
+
+Tensor _pdist_forward_native(const Tensor& self, double p) {
+    return ops::pdist(self, p);
+}
+
+Tensor _cdist_forward_native(const Tensor& x1, const Tensor& x2, double p,
+                             std::optional<int64_t> compute_mode) {
+    return ops::cdist(x1, x2, p, compute_mode);
+}
+
+// One matmul carries all three terms of ||a - b||^2: the rows of the left
+// operand hold (-2a, ||a||^2, 1) and those of the right hold (b, 1, ||b||^2),
+// so their inner product is exactly the expanded square.  Rounding can push a
+// vanishing distance slightly below zero, hence the clamp before the root.
+Tensor _euclidean_dist_native(const Tensor& x1, const Tensor& x2) {
+    const Tensor x1_norm = ops::sum(ops::mul(x1, x1), {-1}, true);
+    const Tensor x2_norm = ops::sum(ops::mul(x2, x2), {-1}, true);
+    const Tensor x1_pad = ops::ones_like(x1_norm);
+    const Tensor x2_pad = ops::ones_like(x2_norm);
+    const Tensor left = ops::cat({ops::mul(x1, Scalar(-2.0)), x1_norm, x1_pad}, -1);
+    const Tensor right = ops::cat({x2, x2_pad, x2_norm}, -1);
+    const Tensor squared =
+        ops::matmul(left, ops::transpose(right, -2, -1));
+    return ops::sqrt(ops::clamp(squared, Scalar(0.0), std::nullopt));
+}
+
+Tensor& polygamma__native(Tensor& self, int64_t n) {
+    self.copy_(ops::polygamma(n, self));
+    return self;
+}
+
+Tensor& igamma__native(Tensor& self, const Tensor& other) {
+    self.copy_(ops::igamma(self, other));
+    return self;
+}
+
+Tensor& igammac__native(Tensor& self, const Tensor& other) {
+    self.copy_(ops::igammac(self, other));
+    return self;
+}
+
 }  // namespace composite
 
 TENSORPLAY_LIBRARY_IMPL(Composite, ShapeMiscComposite) {
@@ -137,6 +205,14 @@ TENSORPLAY_LIBRARY_IMPL(Composite, ShapeMiscComposite) {
     m.impl("_reshape_copy", composite::_reshape_copy_native);
     m.impl("empty_permuted", composite::empty_permuted_native);
     m.impl("_safe_softmax", composite::_safe_softmax_native);
+    m.impl("_logcumsumexp", composite::_logcumsumexp_native);
+    m.impl("_logcumsumexp.out", composite::_logcumsumexp_out_native);
+    m.impl("_pdist_forward", composite::_pdist_forward_native);
+    m.impl("_cdist_forward", composite::_cdist_forward_native);
+    m.impl("_euclidean_dist", composite::_euclidean_dist_native);
+    m.impl("polygamma_", composite::polygamma__native);
+    m.impl("igamma_", composite::igamma__native);
+    m.impl("igammac_", composite::igammac__native);
 }
 
 }  // namespace tensorplay
