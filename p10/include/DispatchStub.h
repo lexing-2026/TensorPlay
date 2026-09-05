@@ -205,7 +205,7 @@ private:
 #define DEFINE_DISPATCH(name) struct name##_DECLARE_DISPATCH_type name
 
 #define REGISTER_ARCH_DISPATCH(name, arch, fn) \
-  template <> name##_DECLARE_DISPATCH_type::FnPtr P10_API CPUDispatchStub<name##_DECLARE_DISPATCH_type::FnPtr, struct name##_DECLARE_DISPATCH_type>::arch = fn;
+  template <> name##_DECLARE_DISPATCH_type::FnPtr CPUDispatchStub<name##_DECLARE_DISPATCH_type::FnPtr, struct name##_DECLARE_DISPATCH_type>::arch = fn;
 
 #ifdef HAVE_AVX512_CPU_DEFINITION
 #define REGISTER_AVX512_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, AVX512, fn)
