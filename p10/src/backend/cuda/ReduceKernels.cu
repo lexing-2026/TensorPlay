@@ -14,11 +14,18 @@
 #include <cmath>
 #include <limits>
 #include <cstring>
+#include <tuple>
 #include <utility>
 #include <type_traits>
 
 namespace tensorplay {
 namespace cuda {
+
+extern std::tuple<Tensor, Tensor> sort_cuda(const Tensor& self, int64_t dim,
+                                            bool descending);
+extern std::tuple<Tensor, Tensor> topk_kernel_cuda(
+    const Tensor& self, int64_t k, int64_t dim, bool largest, bool sorted,
+    int64_t impl);
 
 #define CUDA_CHECK(condition) \
   do { \
@@ -490,102 +497,255 @@ std::tuple<Tensor, Tensor> std_mean_cuda(const Tensor& self, std::vector<int64_t
     return {std::get<0>(vm).sqrt(), std::get<1>(vm)};
 }
 
-Tensor nanmedian_cuda(const Tensor& self) {
-    // Host-staged reference implementation (rare op).
-    Tensor host = self.to(DType::Float64).contiguous().to(Device(DeviceType::CPU));
-    std::vector<double> vals;
-    const double* pp = host.data_ptr<double>();
-    for (int64_t i = 0; i < host.numel(); ++i)
-        if (!(pp[i] != pp[i])) vals.push_back(pp[i]);
-    DType out_dt = isFloatingType(self.dtype()) ? self.dtype() : DType::Int64;
-    double med = 0;
-    if (!vals.empty()) {
-        std::sort(vals.begin(), vals.end());
-        med = vals[(vals.size() - 1) / 2];
+template <typename T>
+__device__ inline bool reduce_value_is_nan(T value) {
+    if constexpr (std::is_same<T, float>::value ||
+                  std::is_same<T, double>::value) {
+        return ::isnan(value);
+    } else if constexpr (std::is_same<T, Half>::value ||
+                         std::is_same<T, BFloat16>::value) {
+        return ::isnan(static_cast<float>(value));
+    } else {
+        return false;
     }
-    return Tensor::zeros({}, out_dt, self.device()).fill_(Scalar(med));
+}
+
+template <typename T>
+__device__ inline T reduce_empty_value() {
+    if constexpr (std::is_same<T, float>::value ||
+                  std::is_same<T, double>::value) {
+        return static_cast<T>(std::numeric_limits<double>::quiet_NaN());
+    } else if constexpr (std::is_same<T, Half>::value ||
+                         std::is_same<T, BFloat16>::value) {
+        return T(static_cast<float>(std::numeric_limits<float>::quiet_NaN()));
+    } else {
+        return std::numeric_limits<T>::lowest();
+    }
+}
+
+template <typename T>
+__global__ void nanmedian_flat_kernel(int64_t n, const T* sorted, T* result) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    int64_t valid = n;
+    while (valid > 0 && reduce_value_is_nan(sorted[valid - 1])) --valid;
+    result[0] = valid == 0 ? reduce_empty_value<T>()
+                           : sorted[(valid - 1) / 2];
+}
+
+template <typename T>
+__global__ void nanmedian_dim_kernel(int64_t n_slices, int64_t d_size,
+                                     int64_t inner, const T* sorted,
+                                     const int64_t* sorted_indices, T* values,
+                                     int64_t* indices) {
+    int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; si < n_slices; si += stride) {
+        int64_t outer_index = si / inner;
+        int64_t inner_index = si % inner;
+        const T* source = sorted + outer_index * d_size * inner + inner_index;
+        const int64_t* source_indices =
+            sorted_indices + outer_index * d_size * inner + inner_index;
+        int64_t valid = d_size;
+        while (valid > 0 &&
+               reduce_value_is_nan(source[(valid - 1) * inner])) {
+            --valid;
+        }
+        if (valid == 0) {
+            values[si] = reduce_empty_value<T>();
+            indices[si] = 0;
+            continue;
+        }
+        const int64_t median_position = (valid - 1) / 2;
+        values[si] = source[median_position * inner];
+        indices[si] = source_indices[median_position * inner];
+    }
+}
+
+template <typename T>
+__device__ inline bool mode_value_equal(T lhs, T rhs) {
+    return !(lhs < rhs) && !(rhs < lhs);
+}
+
+template <typename T>
+__global__ void mode_from_sorted_kernel(int64_t n_slices, int64_t d_size,
+                                         int64_t inner, const T* sorted,
+                                         const int64_t* sorted_indices,
+                                         T* values, int64_t* indices) {
+    int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; si < n_slices; si += stride) {
+        int64_t outer_index = si / inner;
+        int64_t inner_index = si % inner;
+        const T* source = sorted + outer_index * d_size * inner + inner_index;
+        const int64_t* source_indices =
+            sorted_indices + outer_index * d_size * inner + inner_index;
+        T best_value = source[0];
+        int64_t best_count = 0;
+        int64_t best_index = source_indices[0];
+        int64_t run_count = 0;
+        int64_t run_index = source_indices[0];
+        for (int64_t j = 0; j < d_size; ++j) {
+            const T value = source[j * inner];
+            const int64_t original_index = source_indices[j * inner];
+            if (j > 0 && mode_value_equal(value, source[(j - 1) * inner])) {
+                ++run_count;
+                if (original_index < run_index) run_index = original_index;
+            } else {
+                run_count = 1;
+                run_index = original_index;
+            }
+            if (run_count > best_count) {
+                best_count = run_count;
+                best_value = value;
+                best_index = run_index;
+            }
+        }
+        values[si] = best_value;
+        indices[si] = best_index;
+    }
+}
+
+Tensor nanmedian_cuda(const Tensor& self) {
+    DType out_dt = isFloatingType(self.dtype()) ? self.dtype() : DType::Int64;
+    DType work_dt = out_dt;
+    if (isFloat8Type(work_dt)) work_dt = DType::Float32;
+    if (self.numel() == 0) {
+        Tensor result = Tensor::zeros({}, out_dt, self.device());
+        if (isFloatingType(out_dt)) {
+            return result.fill_(Scalar(std::numeric_limits<double>::quiet_NaN()));
+        }
+        return result.fill_(Scalar(std::numeric_limits<int64_t>::lowest()));
+    }
+    Tensor input = self.to(work_dt).contiguous().reshape({self.numel()});
+    Tensor sorted = std::get<0>(sort_cuda(input, 0, false));
+    Tensor result = Tensor::empty({}, work_dt, self.device());
+    auto stream = getCurrentCUDAStream().stream();
+#define TP_NANMEDIAN_FLAT_CASE(ctype, name_) \
+    case DType::name_: \
+        nanmedian_flat_kernel<ctype><<<1, 1, 0, stream>>>( \
+            input.numel(), sorted.data_ptr<ctype>(), result.data_ptr<ctype>()); \
+        break;
+    switch (work_dt) {
+        TP_NANMEDIAN_FLAT_CASE(int64_t, Int64)
+        TP_NANMEDIAN_FLAT_CASE(float, Float32)
+        TP_NANMEDIAN_FLAT_CASE(double, Float64)
+        TP_NANMEDIAN_FLAT_CASE(Half, Float16)
+        TP_NANMEDIAN_FLAT_CASE(BFloat16, BFloat16)
+        default: TP_THROW(TypeError, "nanmedian: unsupported dtype");
+    }
+#undef TP_NANMEDIAN_FLAT_CASE
+    CUDA_CHECK(cudaGetLastError());
+    return work_dt == out_dt ? result : result.to(out_dt);
+}
+
+std::tuple<Tensor, Tensor> nanmedian_dim_cuda(const Tensor& self, int64_t dim,
+                                              bool keepdim) {
+    const int64_t nd = self.dim();
+    TP_CHECK(nd > 0,
+             "nanmedian(): expects a tensor with at least one dimension");
+    dim = wrap_dim(dim, nd);
+    TP_CHECK(isFloatingType(self.dtype()),
+             "nanmedian(): only floating point dtypes are supported");
+    TP_CHECK(self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16 ||
+                 self.dtype() == DType::Float32 || self.dtype() == DType::Float64,
+             "nanmedian(): unsupported dtype ", toString(self.dtype()));
+    Tensor input = self.contiguous();
+    const int64_t d_size = input.size(dim);
+    TP_CHECK(d_size > 0, "nanmedian(): Expected reduction dim ", dim,
+             " to have non-zero size");
+    int64_t outer = 1;
+    int64_t inner = 1;
+    outer_inner(shape_of(input), dim, outer, inner);
+    std::vector<int64_t> out_shape = shape_of(input);
+    out_shape[dim] = keepdim ? 1 : 0;
+    if (!keepdim) out_shape.erase(out_shape.begin() + dim);
+    Tensor values = Tensor::empty(out_shape, input.dtype(), input.device());
+    Tensor indices = Tensor::empty(out_shape, DType::Int64, input.device());
+    const int64_t slices = outer * inner;
+    if (slices == 0) return {values, indices};
+    auto sorted_result = sort_cuda(input, dim, false);
+    Tensor sorted = std::get<0>(sorted_result);
+    Tensor sorted_indices = std::get<1>(sorted_result);
+    auto stream = getCurrentCUDAStream().stream();
+#define TP_NANMEDIAN_DIM_CASE(ctype, name_) \
+    case DType::name_: \
+        nanmedian_dim_kernel<ctype><<<make_grid(slices), kThreads, 0, stream>>>( \
+            slices, d_size, inner, sorted.data_ptr<ctype>(), \
+            sorted_indices.data_ptr<int64_t>(), values.data_ptr<ctype>(), \
+            indices.data_ptr<int64_t>()); \
+        break;
+    switch (input.dtype()) {
+        TP_NANMEDIAN_DIM_CASE(Half, Float16)
+        TP_NANMEDIAN_DIM_CASE(BFloat16, BFloat16)
+        TP_NANMEDIAN_DIM_CASE(float, Float32)
+        TP_NANMEDIAN_DIM_CASE(double, Float64)
+        default: TP_THROW(TypeError, "nanmedian: unsupported dtype");
+    }
+#undef TP_NANMEDIAN_DIM_CASE
+    CUDA_CHECK(cudaGetLastError());
+    return {values, indices};
 }
 
 std::tuple<Tensor, Tensor> mode_cuda(const Tensor& self, int64_t dim, bool keepdim) {
-    // Host-staged reference implementation (rare op).
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
-    Tensor hv = self.contiguous().to(Device(DeviceType::CPU));
-    Tensor hi = Tensor::zeros(shape_of(hv), DType::Int64, Device(DeviceType::CPU));
-    int64_t d_size = hv.size(dim);
+    Tensor input = self.contiguous();
+    int64_t d_size = input.size(dim);
+    TP_CHECK(d_size > 0,
+             "mode: expected reduction dimension to have non-zero size");
     int64_t outer = 1, inner = 1;
-    outer_inner(shape_of(hv), dim, outer, inner);
-#define TP_MODEH(ctype, name_) \
-    case DType::name_: { \
-        const ctype* sp = hv.data_ptr<ctype>(); \
-        ctype* vp = hv.data_ptr<ctype>(); \
-        int64_t* ip = hi.data_ptr<int64_t>(); \
-        for (int64_t si = 0; si < outer * inner; ++si) { \
-            int64_t o = si / inner, in2 = si % inner; \
-            std::vector<std::pair<ctype, int64_t>> buf(d_size); \
-            for (int64_t j = 0; j < d_size; ++j) buf[j] = {sp[(o*d_size+j)*inner+in2], j}; \
-            std::sort(buf.begin(), buf.end(), [](const std::pair<ctype,int64_t>& a2, \
-                                                 const std::pair<ctype,int64_t>& b2){ \
-                if (!(a2.first<b2.first) && !(b2.first<a2.first)) return a2.second<b2.second; \
-                return a2.first<b2.first; }); \
-            ctype bv = buf[0].first; int64_t bc = 0, bi2 = buf[0].second, run = 0; \
-            for (int64_t j = 0; j < d_size; ++j) { \
-                bool same = j > 0 && !(buf[j].first<buf[j-1].first) && !(buf[j-1].first<buf[j].first); \
-                run = same ? run + 1 : 1; \
-                if (run > bc) { bc = run; bv = buf[j].first; bi2 = buf[j].second; } } \
-            vp[si] = bv; ip[si] = bi2; \
-        } \
-        break; }
-    switch (hv.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_MODEH)
-        default: TP_THROW(TypeError, "mode: unsupported dtype");
-    }
-#undef TP_MODEH
-    std::vector<int64_t> out_shape = shape_of(hv);
+    outer_inner(shape_of(input), dim, outer, inner);
+    std::vector<int64_t> out_shape = shape_of(input);
     out_shape[dim] = keepdim ? 1 : 0;
     if (!keepdim) out_shape.erase(out_shape.begin() + dim);
-    return {hv.reshape(out_shape).to(self.device()),
-            hi.reshape(out_shape).to(self.device())};
+    Tensor values = Tensor::empty(out_shape, input.dtype(), input.device());
+    Tensor indices = Tensor::empty(out_shape, DType::Int64, input.device());
+    const int64_t slices = outer * inner;
+    if (slices == 0) return {values, indices};
+    auto sorted_result = sort_cuda(input, dim, false);
+    Tensor sorted = std::get<0>(sorted_result);
+    Tensor sorted_indices = std::get<1>(sorted_result);
+    auto stream = getCurrentCUDAStream().stream();
+#define TP_MODE_DEVICE_CASE(ctype, name_) \
+    case DType::name_: \
+        mode_from_sorted_kernel<ctype><<<make_grid(slices), kThreads, 0, stream>>>( \
+            slices, d_size, inner, sorted.data_ptr<ctype>(), \
+            sorted_indices.data_ptr<int64_t>(), values.data_ptr<ctype>(), \
+            indices.data_ptr<int64_t>()); \
+        break;
+    switch (input.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_MODE_DEVICE_CASE)
+        default: TP_THROW(TypeError, "mode: unsupported dtype");
+    }
+#undef TP_MODE_DEVICE_CASE
+    CUDA_CHECK(cudaGetLastError());
+    return {values, indices};
 }
 
 std::tuple<Tensor, Tensor> kthvalue_cuda(const Tensor& self, int64_t k, int64_t dim,
                                          bool keepdim) {
-    // Host-staged reference implementation (rare op).
-    int64_t nd = self.dim();
+    Tensor input = self.contiguous();
+    int64_t nd = input.dim();
     dim = wrap_dim(dim, nd);
-    int64_t d_size = self.size(dim);
+    int64_t d_size = input.size(dim);
     if (k < 1 || k > d_size)
         TP_THROW(RuntimeError, "kthvalue(): selected number k out of range for dim ", dim);
-    Tensor host = self.contiguous().to(Device(DeviceType::CPU));
-    Tensor vals = Tensor::empty(shape_of(host), host.dtype(), Device(DeviceType::CPU));
-    Tensor idxs = Tensor::empty(shape_of(host), DType::Int64, Device(DeviceType::CPU));
-    int64_t outer = 1, inner = 1;
-    outer_inner(shape_of(host), dim, outer, inner);
-#define TP_KTHH(ctype, name_) \
-    case DType::name_: { \
-        const ctype* sp = host.data_ptr<ctype>(); \
-        ctype* vp = vals.data_ptr<ctype>(); \
-        int64_t* ip = idxs.data_ptr<int64_t>(); \
-        for (int64_t si = 0; si < outer * inner; ++si) { \
-            int64_t o = si/inner, in2 = si%inner; \
-            std::vector<std::pair<ctype, int64_t>> buf(d_size); \
-            for (int64_t j = 0; j < d_size; ++j) buf[j] = {sp[(o*d_size+j)*inner+in2], j}; \
-            std::stable_sort(buf.begin(), buf.end(), [](const std::pair<ctype,int64_t>& a2, \
-                                                        const std::pair<ctype,int64_t>& b2){ \
-                return a2.first<b2.first; }); \
-            vp[si] = buf[k-1].first; ip[si] = buf[k-1].second; \
-        } \
-        break; }
-    switch (host.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_KTHH)
-        default: TP_THROW(TypeError, "kthvalue: unsupported dtype");
+    Tensor selected_values;
+    Tensor selected_indices;
+    if (input.dtype() == DType::Bool) {
+        std::tie(selected_values, selected_indices) =
+            sort_cuda(input, dim, false);
+    } else {
+        std::tie(selected_values, selected_indices) =
+            topk_kernel_cuda(input, k, dim, false, true, 0);
     }
-#undef TP_KTHH
-    std::vector<int64_t> out_shape = shape_of(host);
-    out_shape[dim] = keepdim ? 1 : 0;
-    if (!keepdim) out_shape.erase(out_shape.begin() + dim);
-    return {vals.reshape(out_shape).to(self.device()),
-            idxs.reshape(out_shape).to(self.device())};
+    Tensor values = selected_values.select(dim, k - 1);
+    Tensor indices = selected_indices.select(dim, k - 1);
+    if (keepdim) {
+        values = values.unsqueeze(dim);
+        indices = indices.unsqueeze(dim);
+    }
+    return {values, indices};
 }
 
 Tensor renorm_cuda(const Tensor& self, Scalar p, int64_t dim, Scalar maxnorm) {
@@ -623,6 +783,13 @@ std::tuple<Tensor, Tensor> interop_kthvalue_values_cuda(const Tensor& self, int6
 
 }
 
+std::tuple<Tensor, Tensor> interop_nanmedian_dim_values_cuda(
+    const Tensor& self, int64_t dim, bool keepdim, Tensor& values,
+    Tensor& indices) {
+    std::tie(values, indices) = nanmedian_dim_cuda(self, dim, keepdim);
+    return {values, indices};
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, ReduceKernels) {
     m.impl("amax", amax_cuda2);
     m.impl("amin", amin_cuda2);
@@ -632,6 +799,8 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, ReduceKernels) {
     m.impl("logsumexp", logsumexp_cuda2);
     m.impl("nansum", nansum_cuda2);
     m.impl("nanmedian", nanmedian_cuda);
+    m.impl("nanmedian.dim", nanmedian_dim_cuda);
+    m.impl("nanmedian.dim_values", interop_nanmedian_dim_values_cuda);
     m.impl("count_nonzero", count_nonzero_cuda2);
     m.impl("count_nonzero.dim_IntList", count_nonzero_cuda2);
     m.impl("cummax", cummax_cuda);
