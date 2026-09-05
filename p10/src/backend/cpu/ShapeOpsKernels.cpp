@@ -12,6 +12,7 @@
 #include <complex>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -45,6 +46,24 @@ inline void outer_inner(const std::vector<int64_t>& shape, int64_t dim,
     outer = 1; inner = 1;
     for (int64_t i = 0; i < dim; ++i) outer *= shape[i];
     for (int64_t i = dim + 1; i < static_cast<int64_t>(shape.size()); ++i) inner *= shape[i];
+}
+
+inline int64_t checked_pixel_factor(int64_t factor, const char* op) {
+    if (factor <= 0) {
+        TP_THROW(RuntimeError, op, " expects a positive factor, but got ", factor);
+    }
+    if (factor > std::numeric_limits<int64_t>::max() / factor) {
+        TP_THROW(ValueError, op, ": factor is too large");
+    }
+    return factor * factor;
+}
+
+inline int64_t checked_pixel_extent(int64_t extent, int64_t factor,
+                                    const char* op) {
+    if (extent > std::numeric_limits<int64_t>::max() / factor) {
+        TP_THROW(ValueError, op, ": output dimension is too large");
+    }
+    return extent * factor;
 }
 
 Tensor empty_transform_output(const Tensor& self) {
@@ -552,16 +571,30 @@ Tensor block_diag_cpu(const std::vector<Tensor>& tensors) {
 }
 
 Tensor pixel_shuffle_cpu(const Tensor& self, int64_t upscale_factor) {
-    // pixel_shuffle: (N, C*r^2, H, W) -> (N, C, H*r, W*r)
-    if (self.dim() != 4) TP_THROW(RuntimeError, "pixel_shuffle expects 4D input");
-    int64_t N = self.size(0);
-    int64_t C = self.size(1) / (upscale_factor * upscale_factor);
-    int64_t H = self.size(2), W = self.size(3);
-    if (C * upscale_factor * upscale_factor != self.size(1))
+    if (self.dim() < 3) {
+        TP_THROW(RuntimeError, "pixel_shuffle expects input to have at least 3 dimensions, but got input with ",
+                 self.dim(), " dimension(s)");
+    }
+    const int64_t factor_squared = checked_pixel_factor(upscale_factor, "pixel_shuffle");
+    const int64_t input_channels = self.size(-3);
+    if (input_channels % factor_squared != 0)
         TP_THROW(RuntimeError, "pixel_shuffle: channel dim must be divisible by r^2");
-    Tensor out = Tensor::empty({N, C, H * upscale_factor, W * upscale_factor}, self.dtype(), self.device());
+    const int64_t output_height =
+        checked_pixel_extent(self.size(-2), upscale_factor, "pixel_shuffle");
+    const int64_t output_width =
+        checked_pixel_extent(self.size(-1), upscale_factor, "pixel_shuffle");
+    std::vector<int64_t> output_shape =
+        static_cast<std::vector<int64_t>>(self.shape());
+    output_shape.resize(output_shape.size() - 3);
+    output_shape.push_back(input_channels / factor_squared);
+    output_shape.push_back(output_height);
+    output_shape.push_back(output_width);
+    Tensor out = Tensor::empty(output_shape, self.dtype(), self.device());
+    if (out.numel() == 0) return out;
     Tensor sc = self.contiguous();
     int64_t r = upscale_factor;
+    int64_t C = input_channels / factor_squared;
+    int64_t H = self.size(-2), W = self.size(-1);
     int64_t n = self.numel();
     auto wk = [&](int64_t b, int64_t e) {
         for (int64_t li = b; li < e; ++li) {
@@ -574,7 +607,7 @@ Tensor pixel_shuffle_cpu(const Tensor& self, int64_t upscale_factor) {
             int64_t src = (((bn * (C * r * r) + c * r * r + ih * r + iw) * H + (h / r)) * W + (w / r));
             switch (self.dtype()) {
 #define TP_PS_W(ctype, name_) case DType::name_: reinterpret_cast<ctype*>(out.data_ptr())[li] = reinterpret_cast<const ctype*>(sc.data_ptr())[src]; break;
-                TENSORPLAY_FORALL_SCALAR_TYPES(TP_PS_W)
+                TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_PS_W)
 #undef TP_PS_W
                 default: break;
             }
@@ -585,14 +618,27 @@ Tensor pixel_shuffle_cpu(const Tensor& self, int64_t upscale_factor) {
 }
 
 Tensor pixel_unshuffle_cpu(const Tensor& self, int64_t downscale_factor) {
-    if (self.dim() != 4) TP_THROW(RuntimeError, "pixel_unshuffle expects 4D input");
+    if (self.dim() < 3) {
+        TP_THROW(RuntimeError, "pixel_unshuffle expects input to have at least 3 dimensions, but got input with ",
+                 self.dim(), " dimension(s)");
+    }
+    const int64_t factor_squared =
+        checked_pixel_factor(downscale_factor, "pixel_unshuffle");
     int64_t r = downscale_factor;
-    int64_t N = self.size(0);
-    int64_t C = self.size(1);
-    int64_t H = self.size(2) / r, W = self.size(3) / r;
-    if (H * r != self.size(2) || W * r != self.size(3))
+    int64_t C = self.size(-3);
+    int64_t H = self.size(-2) / r, W = self.size(-1) / r;
+    if (H * r != self.size(-2) || W * r != self.size(-1))
         TP_THROW(RuntimeError, "pixel_unshuffle: spatial dims must be divisible by r");
-    Tensor out = Tensor::empty({N, C * r * r, H, W}, self.dtype(), self.device());
+    if (C > std::numeric_limits<int64_t>::max() / factor_squared)
+        TP_THROW(ValueError, "pixel_unshuffle: output channel dimension is too large");
+    std::vector<int64_t> output_shape =
+        static_cast<std::vector<int64_t>>(self.shape());
+    output_shape.resize(output_shape.size() - 3);
+    output_shape.push_back(C * factor_squared);
+    output_shape.push_back(H);
+    output_shape.push_back(W);
+    Tensor out = Tensor::empty(output_shape, self.dtype(), self.device());
+    if (out.numel() == 0) return out;
     Tensor sc = self.contiguous();
     int64_t n = out.numel();
     auto wk = [&](int64_t b, int64_t e) {
@@ -608,7 +654,7 @@ Tensor pixel_unshuffle_cpu(const Tensor& self, int64_t downscale_factor) {
             int64_t src = ((((bn * C + c) * (H * r) + h * r + ih) * (W * r)) + w * r + iw);
             switch (self.dtype()) {
 #define TP_PU_W(ctype, name_) case DType::name_: reinterpret_cast<ctype*>(out.data_ptr())[li] = reinterpret_cast<const ctype*>(sc.data_ptr())[src]; break;
-                TENSORPLAY_FORALL_SCALAR_TYPES(TP_PU_W)
+                TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_PU_W)
 #undef TP_PU_W
                 default: break;
             }
@@ -619,20 +665,23 @@ Tensor pixel_unshuffle_cpu(const Tensor& self, int64_t downscale_factor) {
 }
 
 Tensor channel_shuffle_cpu(const Tensor& self, int64_t groups) {
-    // ChannelShuffle: view(N, g, C/g, ...) -> transpose(1,2). Channel dim is
-    // dim 1 for >=2D input, dim 0 for 1-D input.
-    if (self.dim() < 1) TP_THROW(RuntimeError, "channel_shuffle expects >= 1D input");
-    int64_t cdim = self.dim() >= 2 ? 1 : 0;
-    int64_t C = self.size(cdim);
+    if (self.dim() <= 2) {
+        TP_THROW(RuntimeError, "channel_shuffle expects input with more than 2 dimensions");
+    }
+    if (groups <= 0) {
+        TP_THROW(RuntimeError, "channel_shuffle: groups must be positive, but got ", groups);
+    }
+    int64_t C = self.size(1);
     int64_t outer = 1;   // product of dims before cdim
-    for (int64_t i = 0; i < cdim; ++i) outer *= self.size(i);
+    for (int64_t i = 0; i < 1; ++i) outer *= self.size(i);
     int64_t inner = 1;   // product of dims after cdim
-    for (int64_t i = cdim + 1; i < self.dim(); ++i) inner *= self.size(i);
+    for (int64_t i = 2; i < self.dim(); ++i) inner *= self.size(i);
     if (C % groups) TP_THROW(RuntimeError, "channel_shuffle: channel dim not divisible by groups");
     int64_t cg = C / groups;
     Tensor sc = self.contiguous();
     Tensor out = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
     int64_t n = self.numel();
+    if (n == 0) return out;
     auto wk = [&](int64_t b, int64_t e) {
         for (int64_t li = b; li < e; ++li) {
             // li layout: (outer * C + c) * inner + tail
@@ -645,7 +694,7 @@ Tensor channel_shuffle_cpu(const Tensor& self, int64_t groups) {
             int64_t src = ((o * C) + src_c) * inner + tail;
             switch (self.dtype()) {
 #define TP_CS_W(ctype, name_) case DType::name_: reinterpret_cast<ctype*>(out.data_ptr())[li] = reinterpret_cast<const ctype*>(sc.data_ptr())[src]; break;
-                TENSORPLAY_FORALL_SCALAR_TYPES(TP_CS_W)
+                TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_CS_W)
 #undef TP_CS_W
                 default: break;
             }
