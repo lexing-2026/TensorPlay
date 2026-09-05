@@ -371,6 +371,10 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
         add_library(p10_kernel_default_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
         set_target_properties(p10_kernel_default_${KERNEL_NAME} PROPERTIES
             POSITION_INDEPENDENT_CODE ON)
+        if(MSVC)
+            # Large template-heavy TUs exceed the default COFF section cap.
+            target_compile_options(p10_kernel_default_${KERNEL_NAME} PRIVATE /bigobj)
+        endif()
         # (add_compile_definitions), so every tier sees the same DispatchStub
         # layout; only CPU_CAPABILITY differs per copy.
         target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
@@ -395,6 +399,9 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
         add_library(p10_kernel_avx2_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
         set_target_properties(p10_kernel_avx2_${KERNEL_NAME} PROPERTIES
             POSITION_INDEPENDENT_CODE ON)
+        if(MSVC)
+            target_compile_options(p10_kernel_avx2_${KERNEL_NAME} PRIVATE /bigobj)
+        endif()
         target_compile_definitions(p10_kernel_avx2_${KERNEL_NAME} PRIVATE
             P10_EXPORTS CPU_CAPABILITY_AVX2 CPU_CAPABILITY=AVX2 HAVE_AVX2_CPU_DEFINITION)
         if(TP_CXX_AVX512_FOUND)
@@ -417,6 +424,9 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
             add_library(p10_kernel_avx512_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
             set_target_properties(p10_kernel_avx512_${KERNEL_NAME} PROPERTIES
                 POSITION_INDEPENDENT_CODE ON)
+            if(MSVC)
+                target_compile_options(p10_kernel_avx512_${KERNEL_NAME} PRIVATE /bigobj)
+            endif()
             target_compile_definitions(p10_kernel_avx512_${KERNEL_NAME} PRIVATE
                 P10_EXPORTS CPU_CAPABILITY_AVX512 CPU_CAPABILITY=AVX512 HAVE_AVX512_CPU_DEFINITION HAVE_AVX2_CPU_DEFINITION)
             # Same flag set as Codegen.cmake's AVX512 capability entry.
@@ -448,6 +458,9 @@ else()
         add_library(p10_kernel_default_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
         set_target_properties(p10_kernel_default_${KERNEL_NAME} PROPERTIES
             POSITION_INDEPENDENT_CODE ON)
+        if(MSVC)
+            target_compile_options(p10_kernel_default_${KERNEL_NAME} PRIVATE /bigobj)
+        endif()
         target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
             P10_EXPORTS CPU_CAPABILITY_DEFAULT CPU_CAPABILITY=DEFAULT)
         if(KERNEL_NAME STREQUAL "ComplexKernels")
