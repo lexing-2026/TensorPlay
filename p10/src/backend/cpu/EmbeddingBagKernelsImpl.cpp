@@ -4,6 +4,7 @@
 #include "Exception.h"
 #include "Half.h"
 #include "Parallel.h"
+#include "Macros.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -39,9 +40,16 @@ constexpr int64_t kMaxPrefetchLines = 16;
 inline void prefetch_row(const void* row, int64_t bytes) {
     const char* p = static_cast<const char*>(row);
     const int64_t lines = std::min<int64_t>((bytes + 63) / 64, kMaxPrefetchLines);
+#if defined(__GNUC__) || defined(__clang__)
     for (int64_t line = 0; line < lines; ++line) {
         __builtin_prefetch(p + line * 64, 0, 3);
     }
+#else
+    // The prefetch is a pure latency hint; the accumulation path is correct
+    // without it, so compilers without the builtin just walk the addresses.
+    (void)p;
+    (void)lines;
+#endif
 }
 
 // Bags are independent, so each worker owns a disjoint slice of output rows.
@@ -68,9 +76,9 @@ int64_t bag_grain(int64_t num_bags, int64_t num_indices, int64_t row_size) {
 // ---------------------------------------------------------------------------
 
 // Pass one.  Returns the number of entries that are not padding.
-inline int64_t scan_bag(const int64_t* __restrict__ idx, int64_t s, int64_t e,
+inline int64_t scan_bag(const int64_t* TP_RESTRICT idx, int64_t s, int64_t e,
                         int64_t num_rows, int64_t padding_idx, int64_t bag,
-                        int64_t* __restrict__ offset2bag) {
+                        int64_t* TP_RESTRICT offset2bag) {
     int64_t count = 0;
     for (int64_t i = s; i < e; ++i) {
         const int64_t r = idx[i];
@@ -92,12 +100,12 @@ inline int64_t scan_bag(const int64_t* __restrict__ idx, int64_t s, int64_t e,
 // into a load-add-store with a loop-carried dependency through store-to-load
 // forwarding, which caps throughput well below what the gather itself allows.
 template <typename T, typename AccT, int64_t W, bool FULL>
-inline void accumulate_tile(const T* __restrict__ w, int64_t D,
-                            const int64_t* __restrict__ idx, int64_t s, int64_t e,
-                            const T* __restrict__ psw, int64_t padding_idx,
+inline void accumulate_tile(const T* TP_RESTRICT w, int64_t D,
+                            const int64_t* TP_RESTRICT idx, int64_t s, int64_t e,
+                            const T* TP_RESTRICT psw, int64_t padding_idx,
                             int64_t d0, int64_t width, AccT out_scale,
                             bool prefetch, int64_t numel, int64_t row_bytes,
-                            T* __restrict__ out_row) {
+                            T* TP_RESTRICT out_row) {
     // A full tile carries a compile-time trip count, which is what lets the
     // accumulators stay in registers; the ragged tail takes the runtime bound.
     const int64_t n = FULL ? W : width;
@@ -110,7 +118,7 @@ inline void accumulate_tile(const T* __restrict__ w, int64_t D,
         }
         const int64_t r = idx[i];
         if (r == padding_idx) continue;
-        const T* __restrict__ w_row = w + r * D + d0;
+        const T* TP_RESTRICT w_row = w + r * D + d0;
         if (psw != nullptr) {
             const AccT scale = static_cast<AccT>(psw[i]);
             if constexpr (FULL) {
@@ -144,14 +152,14 @@ template <typename T, int64_t kTile>
 void bag_forward_add_tiled(const BagForwardArgs& a) {
     using acc_t = typename BagAcc<T>::type;
 
-    const T* __restrict__ w = static_cast<const T*>(a.weight);
-    const T* __restrict__ psw = static_cast<const T*>(a.per_sample_weights);
-    T* __restrict__ out = static_cast<T*>(a.output);
-    const int64_t* __restrict__ idx = a.indices;
-    const int64_t* __restrict__ starts = a.starts;
-    const int64_t* __restrict__ ends = a.ends;
-    int64_t* __restrict__ offset2bag = a.offset2bag;
-    int64_t* __restrict__ bag_size = a.bag_size;
+    const T* TP_RESTRICT w = static_cast<const T*>(a.weight);
+    const T* TP_RESTRICT psw = static_cast<const T*>(a.per_sample_weights);
+    T* TP_RESTRICT out = static_cast<T*>(a.output);
+    const int64_t* TP_RESTRICT idx = a.indices;
+    const int64_t* TP_RESTRICT starts = a.starts;
+    const int64_t* TP_RESTRICT ends = a.ends;
+    int64_t* TP_RESTRICT offset2bag = a.offset2bag;
+    int64_t* TP_RESTRICT bag_size = a.bag_size;
     const int64_t D = a.embedding_dim;
     const int64_t num_rows = a.num_rows;
     const int64_t numel = a.num_indices;
@@ -171,7 +179,7 @@ void bag_forward_add_tiled(const BagForwardArgs& a) {
             const acc_t out_scale = (mean && count > 0)
                 ? static_cast<acc_t>(1) / static_cast<acc_t>(count)
                 : static_cast<acc_t>(1);
-            T* __restrict__ out_row = out + b * D;
+            T* TP_RESTRICT out_row = out + b * D;
 
             // The first slice warms the whole row, so later slices of the same
             // bag already find it in cache.
@@ -219,14 +227,14 @@ template <typename T, typename ArgT>
 void bag_forward_max(const BagForwardArgs& a) {
     using acc_t = typename BagAcc<T>::type;
 
-    const T* __restrict__ w = static_cast<const T*>(a.weight);
-    T* __restrict__ out = static_cast<T*>(a.output);
-    const int64_t* __restrict__ idx = a.indices;
-    const int64_t* __restrict__ starts = a.starts;
-    const int64_t* __restrict__ ends = a.ends;
-    int64_t* __restrict__ offset2bag = a.offset2bag;
-    int64_t* __restrict__ bag_size = a.bag_size;
-    int64_t* __restrict__ max_indices = a.max_indices;
+    const T* TP_RESTRICT w = static_cast<const T*>(a.weight);
+    T* TP_RESTRICT out = static_cast<T*>(a.output);
+    const int64_t* TP_RESTRICT idx = a.indices;
+    const int64_t* TP_RESTRICT starts = a.starts;
+    const int64_t* TP_RESTRICT ends = a.ends;
+    int64_t* TP_RESTRICT offset2bag = a.offset2bag;
+    int64_t* TP_RESTRICT bag_size = a.bag_size;
+    int64_t* TP_RESTRICT max_indices = a.max_indices;
     const int64_t D = a.embedding_dim;
     const int64_t num_rows = a.num_rows;
     const int64_t numel = a.num_indices;
@@ -237,8 +245,8 @@ void bag_forward_max(const BagForwardArgs& a) {
                  [&](int64_t begin, int64_t end_bag) {
         std::vector<acc_t> acc(static_cast<size_t>(D));
         std::vector<ArgT> arg(static_cast<size_t>(D));
-        acc_t* __restrict__ accum = acc.data();
-        ArgT* __restrict__ winner = arg.data();
+        acc_t* TP_RESTRICT accum = acc.data();
+        ArgT* TP_RESTRICT winner = arg.data();
 
         for (int64_t b = begin; b < end_bag; ++b) {
             const int64_t s = starts[b];
@@ -247,8 +255,8 @@ void bag_forward_max(const BagForwardArgs& a) {
                 scan_bag(idx, s, e, num_rows, padding_idx, b, offset2bag);
             bag_size[b] = count;
 
-            T* __restrict__ out_row = out + b * D;
-            int64_t* __restrict__ arg_row = max_indices + b * D;
+            T* TP_RESTRICT out_row = out + b * D;
+            int64_t* TP_RESTRICT arg_row = max_indices + b * D;
             if (count == 0) {
                 for (int64_t d = 0; d < D; ++d) {
                     out_row[d] = static_cast<T>(0);
@@ -264,7 +272,7 @@ void bag_forward_max(const BagForwardArgs& a) {
                 }
                 const int64_t r = idx[i];
                 if (r == padding_idx) continue;
-                const T* __restrict__ w_row = w + r * D;
+                const T* TP_RESTRICT w_row = w + r * D;
                 const ArgT row = static_cast<ArgT>(r);
                 if (!seeded) {
                     // Seeding from the first contributing row keeps the result
@@ -340,7 +348,7 @@ void bag_dense_backward_sum_mean(const BagDenseBackwardArgs& a) {
 
     parallel_for(0, num_segments, grain, [&](int64_t begin, int64_t end) {
         std::vector<acc_t> acc(static_cast<size_t>(D));
-        acc_t* __restrict__ accum = acc.data();
+        acc_t* TP_RESTRICT accum = acc.data();
         for (int64_t seg = begin; seg < end; ++seg) {
             const int64_t lo = a.segment_starts[seg];
             const int64_t hi = a.segment_starts[seg + 1];
@@ -366,14 +374,14 @@ void bag_dense_backward_sum_mean(const BagDenseBackwardArgs& a) {
                     const int64_t count = a.bag_size[bag];
                     if (count > 0) scale /= static_cast<acc_t>(count);
                 }
-                const T* __restrict__ g_row = g + bag * D;
+                const T* TP_RESTRICT g_row = g + bag * D;
                 for (int64_t d = 0; d < D; ++d) {
                     accum[d] += static_cast<acc_t>(g_row[d]) * scale;
                 }
                 touched = true;
             }
             if (!touched) continue;
-            T* __restrict__ gw_row = gw + row * D;
+            T* TP_RESTRICT gw_row = gw + row * D;
             for (int64_t d = 0; d < D; ++d) {
                 gw_row[d] = static_cast<T>(static_cast<acc_t>(gw_row[d]) + accum[d]);
             }
@@ -460,8 +468,8 @@ void bag_psw_backward_typed(const BagPerSampleWeightsArgs& a) {
                 TP_THROW(IndexError,
                          "embedding_bag_backward: index out of range in the embedding table");
             }
-            const T* __restrict__ g_row = g + bag * D;
-            const T* __restrict__ w_row = w + row * D;
+            const T* TP_RESTRICT g_row = g + bag * D;
+            const T* TP_RESTRICT w_row = w + row * D;
             acc_t dot = 0;
             for (int64_t d = 0; d < D; ++d) {
                 dot += static_cast<acc_t>(g_row[d]) * static_cast<acc_t>(w_row[d]);
