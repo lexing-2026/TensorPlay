@@ -1074,7 +1074,7 @@ Tensor& cauchy_kernel(Tensor& self, double median, double sigma) {
 
 Tensor& exponential_kernel(Tensor& self, double lambd) {
     auto& gen = default_generator();
-    TP_THROW_IF(lambd <= 0.0, RuntimeError, "exponential_ expects lambda > 0.0, but found lambda=", lambd);
+    TP_THROW_IF(!(lambd > 0.0), RuntimeError, "exponential_ expects lambda > 0.0, but found lambda=", lambd);
     if (self.numel() == 0) return self;
     check_writable_inplace(self);
     exponential_distribution<double> dist(lambd);
@@ -1106,7 +1106,7 @@ Tensor& geometric_kernel(Tensor& self, double p) {
 
 Tensor& log_normal_kernel(Tensor& self, double mean, double std) {
     auto& gen = default_generator();
-    TP_THROW_IF(std <= 0.0, RuntimeError, "log_normal_ expects std > 0.0, but found std=", std);
+    TP_THROW_IF(!(std > 0.0), RuntimeError, "log_normal_ expects std > 0.0, but found std=", std);
     if (self.numel() == 0) return self;
     check_writable_inplace(self);
     lognormal_distribution<double> dist(mean, std);
@@ -1123,7 +1123,7 @@ Tensor& log_normal_kernel(Tensor& self, double mean, double std) {
 Tensor& normal_inplace_kernel(Tensor& self, double mean, double std,
                               std::optional<Generator> generator) {
     Generator& gen = generator.has_value() ? *generator : default_generator();
-    TP_THROW_IF(std < 0.0, RuntimeError, "normal expects std >= 0.0, but found std ", std);
+    TP_THROW_IF(!(std >= 0.0), RuntimeError, "normal expects std >= 0.0, but found std ", std);
     if (self.numel() == 0) return self;
     check_writable_inplace(self);
     const int64_t size = self.numel();

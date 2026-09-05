@@ -387,6 +387,9 @@ Tensor& uniform_kernel_cuda(Tensor& self, double from, double to,
 
 Tensor& normal_kernel_cuda(Tensor& self, double mean, double std,
                            std::optional<Generator> generator) {
+    if (!(std >= 0.0)) {
+        TP_THROW(RuntimeError, "normal expects std >= 0.0, but found std ", std);
+    }
     if (self.numel() == 0) return self;
     if (!self.is_contiguous()) {
         return fill_via_contiguous(self, [&](Tensor& t) {
@@ -394,9 +397,6 @@ Tensor& normal_kernel_cuda(Tensor& self, double mean, double std,
         });
     }
     int64_t n = self.numel();
-    if (std < 0.0) {
-        TP_THROW(RuntimeError, "normal expects std >= 0.0, but found std ", std);
-    }
     if (self.dtype() == DType::Float32) {
         float* data = self.data_ptr<float>();
         const float mu = static_cast<float>(mean);
@@ -446,6 +446,10 @@ Tensor& normal_kernel_cuda(Tensor& self, double mean, double std,
 // (0, 1]; log(1) is 0 and the exponential distribution excludes 0, so values
 // within epsilon/2 of 1 clamp their log to -epsilon/2.
 Tensor& exponential_kernel_cuda(Tensor& self, double lambd) {
+    if (!(lambd > 0.0)) {
+        TP_THROW(RuntimeError,
+                 "exponential_ expects lambda > 0.0, but found lambda=", lambd);
+    }
     if (self.numel() == 0) return self;
     if (!self.is_contiguous()) {
         return fill_via_contiguous(self, [&](Tensor& t) {
@@ -551,14 +555,15 @@ Tensor& geometric_kernel_cuda(Tensor& self, double p) {
 }
 
 Tensor& log_normal_kernel_cuda(Tensor& self, double mean, double std) {
+    if (!(std > 0.0)) {
+        TP_THROW(RuntimeError,
+                 "log_normal_ expects std > 0.0, but found std=", std);
+    }
     if (self.numel() == 0) return self;
     if (!self.is_contiguous()) {
         return fill_via_contiguous(self, [&](Tensor& t) { return log_normal_kernel_cuda(t, mean, std); });
     }
     int64_t n = self.numel();
-    if (std <= 0.0) {
-        TP_THROW(RuntimeError, "log_normal_ expects std > 0.0, but found std=", std);
-    }
     if (self.dtype() == DType::Float32) {
         float* data = self.data_ptr<float>();
         const float mu = static_cast<float>(mean);
