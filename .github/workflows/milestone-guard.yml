@@ -18,7 +18,7 @@ jobs:
     name: assign-milestone
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # pull_request_target checks out the base ref by default; we only
           # read version.txt from it, never code from the PR head.

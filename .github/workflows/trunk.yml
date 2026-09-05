@@ -31,7 +31,7 @@ jobs:
       run_cuda: ${{ steps.lanes.outputs.run_cuda }}
       nightly_version: ${{ steps.nightly-version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: false
           show-progress: false
