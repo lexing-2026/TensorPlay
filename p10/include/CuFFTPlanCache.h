@@ -9,6 +9,14 @@
 
 #include "Macros.h"
 
+// The plan handle is a typedef of a scalar type in both supported FFT
+// libraries, so it cannot be forward declared; include the real header.
+#if defined(USE_ROCM)
+#include <hipfft/hipfft.h>
+#else
+#include <cufft.h>
+#endif
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -17,8 +25,6 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
-
-struct cufftHandle;
 
 namespace tensorplay {
 namespace cuda {
