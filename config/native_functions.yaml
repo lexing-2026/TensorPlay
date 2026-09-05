@@ -2643,6 +2643,7 @@
   variants: function, method
   dispatch:
     CPU: logical_and_cpu
+    CUDA: logical_and_cuda
 
 # Native cross-product entry points.
 # live in p10/src/backend/cpu/Cross.cpp and p10/src/backend/cuda/Cross.cu.
