@@ -136,7 +136,7 @@ dev = [
     "ninja",
     "pybind11",
     "PyYAML",
-    "packaging>=24.2",
+    "packaging>=26.3",
     "build",
     "pytest",
     # Rerun flaky tests locally: pytest --reruns 2 (see CONTRIBUTING.md).
