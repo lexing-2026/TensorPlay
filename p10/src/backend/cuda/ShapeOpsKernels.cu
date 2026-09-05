@@ -82,6 +82,22 @@ inline int64_t checked_pixel_extent(int64_t extent, int64_t factor,
     return extent * factor;
 }
 
+inline int64_t checked_diagonal_magnitude(int64_t offset, const char* op) {
+    if (offset == std::numeric_limits<int64_t>::min()) {
+        TP_THROW(ValueError, op, ": diagonal offset is too small");
+    }
+    return offset < 0 ? -offset : offset;
+}
+
+inline int64_t checked_diagonal_extent(int64_t base, int64_t offset,
+                                       const char* op) {
+    const int64_t magnitude = checked_diagonal_magnitude(offset, op);
+    if (base > std::numeric_limits<int64_t>::max() - magnitude) {
+        TP_THROW(ValueError, op, ": diagonal output dimension is too large");
+    }
+    return base + magnitude;
+}
+
 inline std::vector<int64_t> shape_of(const Tensor& t) {
     return static_cast<std::vector<int64_t>>(t.shape());
 }
@@ -273,7 +289,7 @@ Tensor diag_cuda(const Tensor& self, int64_t diagonal) {
     Tensor sc = self.contiguous();
     if (nd == 1) {
         int64_t n = sc.size(0);
-        int64_t size = n + std::abs(diagonal);
+        int64_t size = checked_diagonal_extent(n, diagonal, "diag");
         Tensor out = Tensor::zeros({size, size}, sc.dtype(), sc.device());
         auto stream = getCurrentCUDAStream().stream();
         dim3 grid = make_grid(std::max<int64_t>(n, 1)), block(kThreads);
@@ -292,14 +308,17 @@ Tensor diag_cuda(const Tensor& self, int64_t diagonal) {
     }
     if (nd == 2) {
         int64_t rows = sc.size(0), cols = sc.size(1);
+        const int64_t offset_abs = checked_diagonal_magnitude(diagonal, "diag");
+        const int64_t row_start = diagonal < 0 ? offset_abs : 0;
+        const int64_t col_start = diagonal > 0 ? offset_abs : 0;
+        const int64_t diagonal_size =
+            row_start >= rows || col_start >= cols
+                ? 0
+                : std::min(rows - row_start, cols - col_start);
         std::vector<int64_t> idx;
-        if (diagonal >= 0) {
-            for (int64_t i = 0; i + diagonal < cols && i < rows; ++i)
-                idx.push_back(i * cols + i + diagonal);
-        } else {
-            for (int64_t i = 0; i - diagonal < rows && i < cols; ++i)
-                idx.push_back((i - diagonal) * cols + i);
-        }
+        idx.reserve(static_cast<size_t>(diagonal_size));
+        for (int64_t i = 0; i < diagonal_size; ++i)
+            idx.push_back((row_start + i) * cols + col_start + i);
         Tensor out = Tensor::empty({static_cast<int64_t>(idx.size())}, sc.dtype(), sc.device());
         if (!idx.empty()) {
             Tensor d_idx = pack_i64(idx, sc.device());
@@ -329,7 +348,8 @@ Tensor diag_embed_cuda(const Tensor& self, int64_t offset, int64_t dim1_, int64_
     int64_t dim1 = wrap_dim(dim1_, nDims);
     int64_t dim2 = wrap_dim(dim2_, nDims);
     if (dim1 == dim2) TP_THROW(RuntimeError, "diagonal dimensions cannot be identical");
-    int64_t new_dim_len = std::abs(offset) + self.size(-1);
+    int64_t new_dim_len =
+        checked_diagonal_extent(self.size(-1), offset, "diag_embed");
     std::vector<int64_t> sizes = shape_of(self);
     sizes.pop_back();
     sizes.insert(sizes.begin() + std::min(dim1, dim2), new_dim_len);
