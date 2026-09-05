@@ -2467,35 +2467,44 @@ Tensor take_cuda(const Tensor& self, const Tensor& index) {
 // masked_scatter (source values are consumed in mask order).
 // ---------------------------------------------------------------------------
 
+template <typename T>
+__global__ void masked_scatter_kernel(int64_t n, const bool* mask,
+                                      const int64_t* source_offsets,
+                                      int64_t source_size, const T* source,
+                                      T* result) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; i < n; i += stride) {
+        if (mask[i] && source_offsets[i] < source_size) {
+            result[i] = source[source_offsets[i]];
+        }
+    }
+}
+
 Tensor masked_scatter_cuda(const Tensor& self, const Tensor& mask, const Tensor& source) {
-    Tensor m_full = mask.to(DType::Bool).expand(
+    Tensor m_full = mask.to(DType::Bool).to(self.device()).expand(
         static_cast<std::vector<int64_t>>(self.shape())).contiguous();
     Tensor src = source.contiguous().to(self.device());
     Tensor result = detail::contiguous_clone(self);
-    // Deterministic source order requires a sequential walk; done on the host
-    // side against a staged copy (rare op, correctness first).
-    Tensor m_host = m_full.to(Device(DeviceType::CPU));
-    Tensor src_host = src.to(Device(DeviceType::CPU));
-    Tensor res_host = result.to(Device(DeviceType::CPU));
-    int64_t n = res_host.numel();
-    const bool* mp = m_host.data_ptr<bool>();
-    int64_t src_n = src_host.numel();
-    int64_t src_i = 0;
+    int64_t n = result.numel();
+    if (n == 0) return result;
+    Tensor mask_int = m_full.reshape({n}).to(DType::Int64);
+    Tensor source_offsets = mask_int.cumsum(0).sub(mask_int);
+    int64_t src_n = src.numel();
+    auto stream = getCurrentCUDAStream().stream();
 #define TP_MS_CASE(ctype, name) \
-    case DType::name: { \
-        const ctype* sp = src_host.data_ptr<ctype>(); \
-        ctype* d = res_host.data_ptr<ctype>(); \
-        for (int64_t i = 0; i < n && src_i < src_n; ++i) { \
-            if (mp[i]) d[i] = sp[src_i++]; \
-        } \
-        break; \
-    }
-    switch (res_host.dtype()) {
+    case DType::name: \
+        masked_scatter_kernel<ctype><<< \
+            (n + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+            n, m_full.data_ptr<bool>(), source_offsets.data_ptr<int64_t>(), \
+            src_n, src.data_ptr<ctype>(), result.data_ptr<ctype>()); \
+        break;
+    switch (result.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_MS_CASE)
         default: TP_THROW(TypeError, "masked_scatter: unsupported dtype");
     }
 #undef TP_MS_CASE
-    result.copy_(res_host);
+    CUDA_CHECK(cudaGetLastError());
     return result;
 }
 
