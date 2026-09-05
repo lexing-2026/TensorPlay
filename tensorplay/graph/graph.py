@@ -192,7 +192,13 @@ def _qualified_name(value: Any) -> str:
     if name is None:
         name = type(value).__qualname__
     module = getattr(value, "__module__", None)
-    return f"{module}.{name}" if module and module != "builtins" else str(name)
+    if module == "builtins":
+        return str(name)
+    # Present the private accelerator module under its public facade so
+    # code generation imports and references a single spelling.
+    if module == "_operator":
+        module = "operator"
+    return f"{module}.{name}" if module else str(name)
 
 
 def _type_repr(value: Any) -> str:

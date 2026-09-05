@@ -209,8 +209,8 @@ if HAS_PYDOT:
             return ret.replace("{", r"\{").replace("}", r"\}")
 
         # shorten path to avoid drawing long boxes
-        # for full path = '/home/weif/pytensorplay/test.py'
-        # return short path = 'pytensorplay/test.py'
+        # for full path = '/home/mega/workspace/experiment/test.py'
+        # return short path = 'experiment/test.py'
         def _shorten_file_name(
             self,
             full_file_name: str,
