@@ -4,6 +4,7 @@
 #include "Utils.h"
 #include "Exception.h"
 #include "Parallel.h"
+#include "Quantizer.h"
 #include "TypePromotion.h"
 
 #include <algorithm>
@@ -44,6 +45,18 @@ inline void outer_inner(const std::vector<int64_t>& shape, int64_t dim,
     outer = 1; inner = 1;
     for (int64_t i = 0; i < dim; ++i) outer *= shape[i];
     for (int64_t i = dim + 1; i < static_cast<int64_t>(shape.size()); ++i) inner *= shape[i];
+}
+
+Tensor empty_transform_output(const Tensor& self) {
+    const auto shape = static_cast<std::vector<int64_t>>(self.shape());
+    if (!isQuantizedType(self.dtype())) {
+        return Tensor::empty(shape, self.dtype(), self.device());
+    }
+    quantized::require_quantized(self, "roll");
+    Tensor codes = Tensor::empty(shape, underlying_storage_type(self.dtype()),
+                                 self.device());
+    return quantized::make_qtensor(codes, quantized::quantizer_of(self),
+                                   self.dtype());
 }
 
 
@@ -344,13 +357,12 @@ Tensor roll_cpu(const Tensor& self, const std::vector<int64_t>& shifts, const st
     }
     const int64_t dim = wrap_dim(dims[0], nd);
     const int64_t size = self.size(dim);
-    int64_t start = (size - shifts[0]) % size;
-    // Behavior of % is different in C++ vs Python for negative numbers.
-    if (start < 0) start += size;
+    const int64_t shift = ((shifts[0] % size) + size) % size;
+    const int64_t start = (size - shift) % size;
     // Equivalent to cat({narrow(dim, start, size-start), narrow(dim, 0, start)}):
     // destination coord c along dim reads source coord (c + start) % size.
     Tensor sc = self.contiguous();
-    Tensor out = Tensor::empty(static_cast<std::vector<int64_t>>(sc.shape()), sc.dtype(), sc.device());
+    Tensor out = empty_transform_output(sc);
     int64_t n = sc.numel();
     auto worker = [&](int64_t b, int64_t e) {
         for (int64_t li = b; li < e; ++li) {
@@ -364,7 +376,8 @@ Tensor roll_cpu(const Tensor& self, const std::vector<int64_t>& shifts, const st
             }
             switch (sc.dtype()) {
 #define TP_ROLL_W(ctype, name_) case DType::name_: reinterpret_cast<ctype*>(out.data_ptr())[li] = reinterpret_cast<const ctype*>(sc.data_ptr())[src]; break;
-                TENSORPLAY_FORALL_SCALAR_TYPES(TP_ROLL_W)
+                TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_ROLL_W)
+                TENSORPLAY_FORALL_QINT_TYPES(TP_ROLL_W)
 #undef TP_ROLL_W
                 default: break;
             }
