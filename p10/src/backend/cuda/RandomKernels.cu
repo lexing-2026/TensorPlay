@@ -1727,9 +1727,17 @@ Tensor bernoulli_p_kernel_cuda(const Tensor& self, double p,
 
 } // anonymous namespace
 
-// (tensor-tensor): ret = empty(infer_size(mean.sizes(), std.sizes()));
-// ret.normal_(0, 1); ret.mul_(std).add_(mean);
 Tensor normal_broadcast_kernel_cuda(const Tensor& mean, const Tensor& std) {
+    if (mean.device() != std.device()) {
+        TP_THROW(DeviceMismatchError, "normal: mean and std must be on the same device");
+    }
+    if (mean.dtype() != std.dtype()) {
+        TP_THROW(RuntimeError, "normal: mean and std must have the same dtype");
+    }
+    if (std.numel() > 0 && !std.ge(Scalar(0)).all().item<bool>()) {
+        TP_THROW(RuntimeError, "normal: standard deviation must be non-negative");
+    }
+
     std::vector<int64_t> shape = broadcast_shapes(
         static_cast<std::vector<int64_t>>(mean.shape()),
         static_cast<std::vector<int64_t>>(std.shape()));
