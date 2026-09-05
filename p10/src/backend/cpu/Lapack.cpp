@@ -80,7 +80,7 @@ static LibHandle open_lib(const char* path) {
 static void* sym(LibHandle h, const char* n) { return dlsym(h, n); }
 #endif
 
-void* resolve_one(void* handle, const char* base) {
+void* resolve_one(LibHandle handle, const char* base) {
     char buf[128];
     const char* patterns[] = {"scipy_%s_64_", "%s_64_", "%s_", "scipy_%s64_"};
     for (const char* pattern : patterns) {
@@ -90,7 +90,7 @@ void* resolve_one(void* handle, const char* base) {
     return nullptr;
 }
 
-bool resolve_all(void* handle) {
+bool resolve_all(LibHandle handle) {
     struct Pair { F& slot; const char* name; };
     const Pair pairs[] = {
         {g_sgetrf, "sgetrf"}, {g_dgetrf, "dgetrf"},
@@ -142,7 +142,7 @@ bool resolve_all(void* handle) {
     return true;
 }
 
-void* find_library() {
+LibHandle find_library() {
 #ifdef _WIN32
     if (const char* env = std::getenv("TP_LAPACK_LIB")) {
         if (LibHandle h = open_lib(env)) return h;
@@ -233,7 +233,7 @@ std::once_flag g_once;
 bool g_ok = false;
 
 void init_once() {
-    void* handle = find_library();
+    auto handle = find_library();
     if (!handle) return;
     g_ok = resolve_all(handle);
 }
