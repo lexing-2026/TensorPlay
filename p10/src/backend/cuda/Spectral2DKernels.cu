@@ -1,6 +1,7 @@
 #include "Spectral2DKernels.h"
 
 #include "CUDARuntime.h"
+#include "CuFFTPlanCache.h"
 #include "Dispatcher.h"
 #include "Exception.h"
 
@@ -10,8 +11,6 @@
 #include <cmath>
 #include <climits>
 #include <cstdint>
-#include <map>
-#include <mutex>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -263,20 +262,9 @@ Tensor resize_fft_support(const Tensor& input, int64_t first_dim,
     return finish_fft_layout(std::move(resized), inverse);
 }
 
-struct PlanKey {
-    int type;
-    int height;
-    int width;
-    int batch;
-
-    bool operator<(const PlanKey& other) const {
-        if (type != other.type) return type < other.type;
-        if (height != other.height) return height < other.height;
-        if (width != other.width) return width < other.width;
-        return batch < other.batch;
-    }
-};
-
+// Batched 2D plans go through the shared per-device LRU plan cache
+// (CuFFTPlanCache.cpp). Each row of the batch is one 2D transform: the
+// embedded layouts stride by row so consecutive rows land distance apart.
 cufftHandle acquire_plan(cufftType type, int64_t height, int64_t width,
                          int64_t batch, int64_t input_width, int64_t output_width) {
     const int64_t input_distance = height * input_width;
@@ -284,29 +272,18 @@ cufftHandle acquire_plan(cufftType type, int64_t height, int64_t width,
     TP_CHECK(height <= INT_MAX && width <= INT_MAX && batch <= INT_MAX &&
                  input_distance <= INT_MAX && output_distance <= INT_MAX,
              "FFT dimensions exceed cuFFT limits");
-    static std::mutex mutex;
-    static std::map<PlanKey, cufftHandle> plans;
-    const PlanKey key{static_cast<int>(type), static_cast<int>(height),
-                      static_cast<int>(width), static_cast<int>(batch)};
-    std::lock_guard<std::mutex> lock(mutex);
-    auto found = plans.find(key);
-    if (found != plans.end()) {
-        TP_SPECTRAL2D_CUFFT_CHECK(cufftSetStream(found->second,
-                                                  getCurrentCUDAStream().stream()));
-        return found->second;
-    }
-
-    int dimensions[2] = {static_cast<int>(height), static_cast<int>(width)};
-    int input_embed[2] = {static_cast<int>(height), static_cast<int>(input_width)};
-    int output_embed[2] = {static_cast<int>(height), static_cast<int>(output_width)};
-    cufftHandle plan;
-    TP_SPECTRAL2D_CUFFT_CHECK(cufftPlanMany(
-        &plan, 2, dimensions, input_embed, 1, static_cast<int>(input_distance),
-        output_embed, 1, static_cast<int>(output_distance), type,
-        static_cast<int>(batch)));
-    TP_SPECTRAL2D_CUFFT_CHECK(cufftSetStream(plan, getCurrentCUDAStream().stream()));
-    plans.emplace(key, plan);
-    return plan;
+    cufft::PlanSpec spec;
+    spec.rank = 2;
+    spec.type = static_cast<int>(type);
+    spec.n = {height, width};
+    spec.inembed = {height, static_cast<int64_t>(input_width)};
+    spec.onembed = {height, static_cast<int64_t>(output_width)};
+    spec.istride = 1;
+    spec.idist = input_distance;
+    spec.ostride = 1;
+    spec.odist = output_distance;
+    spec.batch = batch;
+    return cufft::acquire_plan(spec, currentDevice());
 }
 
 template <typename C, typename S>

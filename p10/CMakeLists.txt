@@ -163,6 +163,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/CUDAGenerator.cpp
         src/backend/cuda/CUDARuntime.cpp
         src/backend/cuda/CUDAGraph.cpp
+        src/backend/cuda/CuFFTPlanCache.cpp
         src/backend/cuda/CUDAGraphKernels.cu
         src/backend/cuda/CUDARuntimeKernels.cu
         src/backend/cuda/ArithmeticKernels.cu

@@ -1,15 +1,15 @@
 // CUDA spectral kernels for the audio stack — cuFFT backend.
 //
-// batched cuFFT plans execute the transforms; CUFFT_CHECK is adapted from
-// the vendored CuFFTUtils.h. Transforms along an interior dim gather lines
-// into a packed (lines, n) buffer, run a batched cufftPlan1d, and scatter
-// back — semantically identical to the CPU pocketfft path in
-// native/SpectralOpsUtils.h).
+// Transforms along an interior dim gather lines into a packed (lines, n)
+// buffer, run a batched cuFFT plan, and scatter back; the numerical
+// contract (normalization, onesided output layout) follows the CPU
+// spectral implementation in this repository.
 
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "CUDARuntime.h"
+#include "CuFFTPlanCache.h"
 
 #include <cuda_runtime.h>
 #include <cufft.h>
@@ -18,8 +18,6 @@
 #include <cmath>
 #include <algorithm>
 #include <string>
-#include <mutex>
-#include <map>
 
 namespace tensorplay {
 namespace cuda {
@@ -112,27 +110,23 @@ inline fft_norm_mode norm_from_string(const std::string& norm, bool forward) {
 inline int64_t infer_onesided(int64_t real_size) { return real_size / 2 + 1; }
 
 // ---------------------------------------------------------------------------
+// batched cuFFT plans over contiguous lines, via the shared per-device LRU
+// plan cache (CuFFTPlanCache.cpp)
 // ---------------------------------------------------------------------------
+
 cufftHandle acquire_plan(cufftType type, int64_t n, int64_t batch) {
-    struct Key {
-        int type; long long n; long long b;
-        bool operator<(const Key& o) const {
-            if (type != o.type) return type < o.type;
-            if (n != o.n) return n < o.n;
-            return b < o.b;
-        }
-    };
-    static std::mutex mu;
-    static std::map<Key, cufftHandle> cache;
-    const Key key{(int)type, n, batch};
-    std::lock_guard<std::mutex> lock(mu);
-    auto it = cache.find(key);
-    if (it != cache.end()) return it->second;
-    cufftHandle plan;
-    CUFFT_CHECK(cufftPlan1d(&plan, (int)n, type, (int)batch));
-    CUFFT_CHECK(cufftSetStream(plan, getCurrentCUDAStream().stream()));
-    cache.emplace(key, plan);
-    return plan;
+    cufft::PlanSpec spec;
+    spec.rank = 1;
+    spec.type = static_cast<int>(type);
+    spec.n[0] = n;
+    spec.inembed[0] = 0;
+    spec.onembed[0] = 0;
+    spec.istride = 1;
+    spec.idist = n;
+    spec.ostride = 1;
+    spec.odist = n;
+    spec.batch = batch;
+    return cufft::acquire_plan(spec, currentDevice());
 }
 
 }  // namespace
@@ -142,15 +136,16 @@ namespace {
 // Because every spectral input is made contiguous first and the transform
 // dim is moved last via permute+contiguous (dispatcher ops), packed buffers
 // are plain (lines, n) with lines = numel / len.
-struct LineInfo {
-    int64_t lines;
-    int64_t len;
-};
 
 template <bool IsDouble>
 struct CudaTypes {
     using R = std::conditional_t<IsDouble, double, float>;
     using C = std::conditional_t<IsDouble, cufftDoubleComplex, cufftComplex>;
+};
+
+struct LineInfo {
+    int64_t lines;
+    int64_t len;
 };
 
 LineInfo last_dim_lines(const std::vector<int64_t>& sizes) {
