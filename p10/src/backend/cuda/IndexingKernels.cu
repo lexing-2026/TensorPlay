@@ -695,12 +695,6 @@ inline constexpr bool scatter_add_supported_v =
     std::is_same_v<T, Half> || std::is_same_v<T, BFloat16> ||
     std::is_same_v<T, bool>;
 
-__device__ __forceinline__ int64_t atomic_add_rel_return(int64_t* addr) {
-    // Local overloads handle scalar widths without native atomicAdd support.
-    return static_cast<int64_t>(::atomicAdd(reinterpret_cast<unsigned long long*>(addr),
-                                            static_cast<unsigned long long>(1)));
-}
-
 // Scatter and scatter-add use elementwise indexed writes. Add mode uses
 // atomic accumulation and is intentionally unordered for colliding indices.
 template <typename T, bool Add>
@@ -825,25 +819,24 @@ __global__ void index_put_kernel(int64_t n, T* d, const int64_t* ip, const T* vp
     }
 }
 
-// Nonzero uses a count pass followed by a coordinate-writing pass. Matches
-// claim output slots atomically during the second pass.
+// Nonzero uses a device flag pass, an inclusive prefix pass, and an ordered
+// coordinate-writing pass.
 template <typename T>
-__global__ void nonzero_count_kernel(int64_t n, const T* x, int64_t* counter) {
+__global__ void nonzero_mark_kernel(int64_t n, const T* x, int64_t* flags) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) {
-        if (static_cast<bool>(x[i])) atomic_add_rel(counter, static_cast<int64_t>(1));
-    }
+    for (; i < n; i += stride) flags[i] = static_cast<bool>(x[i]) ? 1 : 0;
 }
 
 template <typename T>
 __global__ void nonzero_fill_kernel(int64_t n, int64_t ndim, const T* x,
-                                    const int64_t* sizes, int64_t* counter, int64_t* out) {
+                                    const int64_t* sizes, const int64_t* positions,
+                                    int64_t* out) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += stride) {
         if (!static_cast<bool>(x[i])) continue;
-        int64_t slot = atomic_add_rel_return(counter);
+        const int64_t slot = positions[i] - 1;
         int64_t rem = i;
         for (int64_t d2 = ndim - 1; d2 >= 0; --d2) {
             out[slot * ndim + d2] = rem % sizes[d2];
@@ -2153,7 +2146,7 @@ Tensor& index_put__cuda(Tensor& self, const std::vector<Tensor>& indices,
 }
 
 // ---------------------------------------------------------------------------
-// nonzero (count pass followed by an atomic slot-claiming pass).
+// nonzero (device flag/prefix pass followed by an ordered coordinate pass).
 // ---------------------------------------------------------------------------
 
 Tensor nonzero_cuda(const Tensor& self) {
@@ -2164,12 +2157,12 @@ Tensor nonzero_cuda(const Tensor& self) {
     if (n == 0) {
         return Tensor::zeros({0, nd}, DType::Int64, self.device());
     }
-    Tensor counter = Tensor::zeros({1}, DType::Int64, self.device());
+    Tensor flags = Tensor::empty({n}, DType::Int64, self.device());
     auto stream = getCurrentCUDAStream().stream();
 #define TP_NZC_CASE(ctype, name) \
     case DType::name: \
-        nonzero_count_kernel<ctype><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            n, self_c.data_ptr<ctype>(), counter.data_ptr<int64_t>()); \
+        nonzero_mark_kernel<ctype><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+            n, self_c.data_ptr<ctype>(), flags.data_ptr<int64_t>()); \
         break;
     switch (self_c.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_NZC_CASE)
@@ -2177,15 +2170,14 @@ Tensor nonzero_cuda(const Tensor& self) {
     }
 #undef TP_NZC_CASE
     CUDA_CHECK(cudaGetLastError());
+    Tensor positions = flags.cumsum(0);
     int64_t count_host = 0;
-    CUDA_CHECK(cudaMemcpy(&count_host, counter.data_ptr<int64_t>(), sizeof(int64_t),
+    CUDA_CHECK(cudaMemcpy(&count_host,
+                          positions.data_ptr<int64_t>() + n - 1,
+                          sizeof(int64_t),
                           cudaMemcpyDeviceToHost));
     Tensor result = Tensor::zeros({count_host, nd}, DType::Int64, self.device());
     if (count_host == 0) return result;
-    // The fill pass reuses counter as a slot allocator, so rewind it to zero
-    // (the count pass left the match total in it).
-    CUDA_CHECK(cudaMemsetAsync(counter.data_ptr<int64_t>(), 0, sizeof(int64_t),
-                               stream));
     // sizes live on the host; stage them on-device for the fill kernel
     std::vector<int64_t> h_sizes(static_cast<std::vector<int64_t>>(self_c.shape()));
     Tensor sizes_d = Tensor::empty({nd}, DType::Int64, self.device());
@@ -2195,7 +2187,7 @@ Tensor nonzero_cuda(const Tensor& self) {
     case DType::name: \
         nonzero_fill_kernel<ctype><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
             n, nd, self_c.data_ptr<ctype>(), sizes_d.data_ptr<int64_t>(), \
-            counter.data_ptr<int64_t>(), result.data_ptr<int64_t>()); \
+            positions.data_ptr<int64_t>(), result.data_ptr<int64_t>()); \
         break;
     switch (self_c.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_NZF_CASE)
