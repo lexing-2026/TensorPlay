@@ -27,6 +27,10 @@ def _set_enabled(state: bool) -> None:
 
 def _validate_coo(indices, values, size) -> None:
     """Raises ``RuntimeError`` unless ``(indices, values, size)`` form a COO tensor."""
+    if indices.dtype not in (tensorplay.int32, tensorplay.int64):
+        raise RuntimeError("`indices` must have int32 or int64 dtype")
+    if indices.device != values.device:
+        raise RuntimeError("`indices` and `values` must be on the same device")
     if indices.dim() != 2:
         raise RuntimeError(
             f"`indices` must be 2-D (sparse_dim x nnz), got {indices.dim()}-D"
@@ -40,6 +44,8 @@ def _validate_coo(indices, values, size) -> None:
             f"{int(values.shape[0])} != {nnz}"
         )
     dense_dim = values.dim() - 1
+    if any(int(value) < 0 for value in size):
+        raise RuntimeError("`size` entries must be non-negative")
     if len(size) != sparse_dim + dense_dim:
         raise RuntimeError(
             f"`len(size) == sparse_dim + dense_dim` is not satisfied: "
@@ -66,6 +72,23 @@ def _validate_coo(indices, values, size) -> None:
 
 def _validate_csr(crow_indices, col_indices, values, size) -> None:
     """Raises ``RuntimeError`` unless the compressed buffers form a CSR tensor."""
+    if len(size) != 2:
+        raise RuntimeError("`size` must contain exactly two dimensions")
+    if any(int(value) < 0 for value in size):
+        raise RuntimeError("`size` entries must be non-negative")
+    if crow_indices.dtype not in (tensorplay.int32, tensorplay.int64):
+        raise RuntimeError("`crow_indices` must have int32 or int64 dtype")
+    if col_indices.dtype not in (tensorplay.int32, tensorplay.int64):
+        raise RuntimeError("`col_indices` must have int32 or int64 dtype")
+    if (
+        crow_indices.device != col_indices.device
+        or crow_indices.device != values.device
+    ):
+        raise RuntimeError(
+            "`crow_indices`, `col_indices`, and `values` must share one device"
+        )
+    if values.dim() != 1:
+        raise RuntimeError("CSR values must be one-dimensional")
     if crow_indices.dim() != 1:
         raise RuntimeError(
             f"`crow_indices` must be 1-D, got {crow_indices.dim()}-D"
