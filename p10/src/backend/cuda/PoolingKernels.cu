@@ -21,6 +21,10 @@
 namespace tensorplay {
 namespace cuda {
 
+template <typename T> struct PoolMath { using type = T; };
+template <> struct PoolMath<tensorplay::Half> { using type = float; };
+template <> struct PoolMath<tensorplay::BFloat16> { using type = float; };
+
 namespace {
     std::vector<int64_t> expand_param_if_needed(const std::vector<int64_t>& list, int64_t n, int64_t default_val) {
         if (list.empty()) return std::vector<int64_t>(n, default_val);
@@ -60,11 +64,17 @@ namespace {
         return result.as_strided(
             shape, {c * h * w, 1, w * c, c});
     }
+
+    bool is_adaptive_pool_cuda_dtype(DType dtype) {
+        return dtype == DType::Float32 || dtype == DType::Float64 ||
+               dtype == DType::Float16 || dtype == DType::BFloat16;
+    }
 }
 
+template <typename T, typename M>
 __global__ void adaptive_avg_pool2d_forward_kernel(
-    const float* input,
-    float* output,
+    const T* input,
+    T* output,
     int64_t N,
     int64_t C,
     int64_t H_in,
@@ -85,19 +95,21 @@ __global__ void adaptive_avg_pool2d_forward_kernel(
     int64_t w_start = (w * W_in) / W_out;
     int64_t w_end = ((w + 1) * W_in + W_out - 1) / W_out;
 
-    float sum = 0.0f;
+    M sum = M(0);
     for (int64_t ih = h_start; ih < h_end; ++ih) {
         for (int64_t iw = w_start; iw < w_end; ++iw) {
             int64_t input_index = ((n * C + c) * H_in + ih) * W_in + iw;
-            sum += input[input_index];
+            sum += static_cast<M>(input[input_index]);
         }
     }
-    output[output_index] = sum / static_cast<float>((h_end - h_start) * (w_end - w_start));
+    output[output_index] = static_cast<T>(
+        sum / static_cast<M>((h_end - h_start) * (w_end - w_start)));
 }
 
+template <typename T, typename M>
 __global__ void adaptive_avg_pool2d_backward_kernel(
-    const float* grad_output,
-    float* grad_input,
+    const T* grad_output,
+    T* grad_input,
     int64_t N,
     int64_t C,
     int64_t H_in,
@@ -113,7 +125,7 @@ __global__ void adaptive_avg_pool2d_backward_kernel(
     int64_t c = (input_index / (W_in * H_in)) % C;
     int64_t n = input_index / (W_in * H_in * C);
 
-    float value = 0.0f;
+    M value = M(0);
     for (int64_t h = 0; h < H_out; ++h) {
         int64_t h_start = (h * H_in) / H_out;
         int64_t h_end = ((h + 1) * H_in + H_out - 1) / H_out;
@@ -123,17 +135,21 @@ __global__ void adaptive_avg_pool2d_backward_kernel(
             int64_t w_end = ((w + 1) * W_in + W_out - 1) / W_out;
             if (iw < w_start || iw >= w_end) continue;
             int64_t output_index = ((n * C + c) * H_out + h) * W_out + w;
-            float area = static_cast<float>((h_end - h_start) * (w_end - w_start));
-            value += grad_output[output_index] / area;
+            M area = static_cast<M>((h_end - h_start) * (w_end - w_start));
+            value += static_cast<M>(grad_output[output_index]) / area;
         }
     }
-    grad_input[input_index] = value;
+    grad_input[input_index] = static_cast<T>(value);
 }
 
 Tensor adaptive_avg_pool2d_cuda(const Tensor& input, const std::vector<int64_t>& output_size) {
+    if (input.dim() == 3) {
+        return adaptive_avg_pool2d_cuda(input.unsqueeze(0), output_size).squeeze(0);
+    }
     if (input.dim() != 4) TP_THROW(RuntimeError, "adaptive_avg_pool2d: Expected 4D input");
-    if (input.dtype() != DType::Float32) {
-        TP_THROW(NotImplementedError, "adaptive_avg_pool2d CUDA only supports Float32");
+    if (!is_adaptive_pool_cuda_dtype(input.dtype())) {
+        TP_THROW(NotImplementedError,
+                 "adaptive_avg_pool2d CUDA supports Float32/Float64/Float16/BFloat16 only");
     }
     auto [H_out, W_out] = get_pair(output_size);
     if (H_out <= 0 || W_out <= 0) TP_THROW(RuntimeError, "adaptive_avg_pool2d: Invalid output size");
@@ -144,20 +160,52 @@ Tensor adaptive_avg_pool2d_cuda(const Tensor& input, const std::vector<int64_t>&
     if (elements == 0) return output;
     int threads = 256;
     int blocks = static_cast<int>((elements + threads - 1) / threads);
-    adaptive_avg_pool2d_forward_kernel<<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-        input_contig.data_ptr<float>(), output.data_ptr<float>(),
-        input.size(0), input.size(1), input.size(2), input.size(3), H_out, W_out);
+    switch (input.dtype()) {
+        case DType::Float32:
+            adaptive_avg_pool2d_forward_kernel<float, float>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    input_contig.data_ptr<float>(), output.data_ptr<float>(),
+                    input.size(0), input.size(1), input.size(2), input.size(3), H_out, W_out);
+            break;
+        case DType::Float64:
+            adaptive_avg_pool2d_forward_kernel<double, double>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    input_contig.data_ptr<double>(), output.data_ptr<double>(),
+                    input.size(0), input.size(1), input.size(2), input.size(3), H_out, W_out);
+            break;
+        case DType::Float16:
+            adaptive_avg_pool2d_forward_kernel<tensorplay::Half, float>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    input_contig.data_ptr<tensorplay::Half>(), output.data_ptr<tensorplay::Half>(),
+                    input.size(0), input.size(1), input.size(2), input.size(3), H_out, W_out);
+            break;
+        case DType::BFloat16:
+            adaptive_avg_pool2d_forward_kernel<tensorplay::BFloat16, float>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    input_contig.data_ptr<tensorplay::BFloat16>(),
+                    output.data_ptr<tensorplay::BFloat16>(), input.size(0), input.size(1),
+                    input.size(2), input.size(3), H_out, W_out);
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "adaptive_avg_pool2d CUDA supports Float32/Float64/Float16/BFloat16 only");
+    }
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) TP_THROW(RuntimeError, std::string("adaptive_avg_pool2d CUDA: ") + cudaGetErrorString(error));
     return output;
 }
 
 Tensor adaptive_avg_pool2d_backward_cuda(const Tensor& grad_output, const Tensor& input) {
+    if (input.dim() == 3 && grad_output.dim() == 3) {
+        return adaptive_avg_pool2d_backward_cuda(
+                   grad_output.unsqueeze(0), input.unsqueeze(0)).squeeze(0);
+    }
     if (input.dim() != 4 || grad_output.dim() != 4) {
         TP_THROW(RuntimeError, "adaptive_avg_pool2d_backward: Expected 4D input and grad_output");
     }
-    if (input.dtype() != DType::Float32 || grad_output.dtype() != DType::Float32) {
-        TP_THROW(NotImplementedError, "adaptive_avg_pool2d_backward CUDA only supports Float32");
+    if (!is_adaptive_pool_cuda_dtype(input.dtype()) || input.dtype() != grad_output.dtype()) {
+        TP_THROW(NotImplementedError,
+                 "adaptive_avg_pool2d_backward CUDA supports Float32/Float64/Float16/BFloat16 only");
     }
     Tensor input_contig = input.is_contiguous() ? input : input.contiguous();
     Tensor grad_output_contig = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
@@ -166,10 +214,39 @@ Tensor adaptive_avg_pool2d_backward_cuda(const Tensor& grad_output, const Tensor
     if (elements == 0) return grad_input;
     int threads = 256;
     int blocks = static_cast<int>((elements + threads - 1) / threads);
-    adaptive_avg_pool2d_backward_kernel<<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-        grad_output_contig.data_ptr<float>(), grad_input.data_ptr<float>(),
-        input.size(0), input.size(1), input.size(2), input.size(3),
-        grad_output.size(2), grad_output.size(3));
+    switch (input.dtype()) {
+        case DType::Float32:
+            adaptive_avg_pool2d_backward_kernel<float, float>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    grad_output_contig.data_ptr<float>(), grad_input.data_ptr<float>(),
+                    input.size(0), input.size(1), input.size(2), input.size(3),
+                    grad_output.size(2), grad_output.size(3));
+            break;
+        case DType::Float64:
+            adaptive_avg_pool2d_backward_kernel<double, double>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    grad_output_contig.data_ptr<double>(), grad_input.data_ptr<double>(),
+                    input.size(0), input.size(1), input.size(2), input.size(3),
+                    grad_output.size(2), grad_output.size(3));
+            break;
+        case DType::Float16:
+            adaptive_avg_pool2d_backward_kernel<tensorplay::Half, float>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    grad_output_contig.data_ptr<tensorplay::Half>(),
+                    grad_input.data_ptr<tensorplay::Half>(), input.size(0), input.size(1),
+                    input.size(2), input.size(3), grad_output.size(2), grad_output.size(3));
+            break;
+        case DType::BFloat16:
+            adaptive_avg_pool2d_backward_kernel<tensorplay::BFloat16, float>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    grad_output_contig.data_ptr<tensorplay::BFloat16>(),
+                    grad_input.data_ptr<tensorplay::BFloat16>(), input.size(0), input.size(1),
+                    input.size(2), input.size(3), grad_output.size(2), grad_output.size(3));
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "adaptive_avg_pool2d_backward CUDA supports Float32/Float64/Float16/BFloat16 only");
+    }
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) TP_THROW(RuntimeError, std::string("adaptive_avg_pool2d_backward CUDA: ") + cudaGetErrorString(error));
     return grad_input;
@@ -177,9 +254,10 @@ Tensor adaptive_avg_pool2d_backward_cuda(const Tensor& grad_output, const Tensor
 
 // thread per output element in tp's pooling-kernel style. Window bounds come
 // from AdaptivePooling.h start_index/end_index (floor start, ceil end); NaN
+template <typename T, typename M>
 __global__ void adaptive_max_pool2d_forward_kernel(
-    const float* input,
-    float* output,
+    const T* input,
+    T* output,
     int64_t N,
     int64_t C,
     int64_t H_in,
@@ -200,23 +278,24 @@ __global__ void adaptive_max_pool2d_forward_kernel(
     int64_t w_start = (w * W_in) / W_out;
     int64_t w_end = 1 + (((w + 1) * W_in) - 1) / W_out;
 
-    const float* plane = input + (n * C + c) * H_in * W_in;
-    float max_val = -__int_as_float(0x7f800000);
+    const T* plane = input + (n * C + c) * H_in * W_in;
+    M max_val = -std::numeric_limits<M>::infinity();
     for (int64_t ih = h_start; ih < h_end; ++ih) {
         for (int64_t iw = w_start; iw < w_end; ++iw) {
-            float val = plane[ih * W_in + iw];
+            M val = static_cast<M>(plane[ih * W_in + iw]);
             if ((val > max_val) || isnan(val)) max_val = val;
         }
     }
-    output[output_index] = max_val;
+    output[output_index] = static_cast<T>(max_val);
 }
 
 // window argmax (the dispatcher op returns values only) and scatter
 // grad_output atomically, since windows overlap.
+template <typename T, typename M>
 __global__ void adaptive_max_pool2d_backward_kernel(
-    const float* grad_output,
-    const float* input,
-    float* grad_input,
+    const T* grad_output,
+    const T* input,
+    T* grad_input,
     int64_t N,
     int64_t C,
     int64_t H_in,
@@ -237,13 +316,13 @@ __global__ void adaptive_max_pool2d_backward_kernel(
     int64_t w_start = (w * W_in) / W_out;
     int64_t w_end = 1 + (((w + 1) * W_in) - 1) / W_out;
 
-    const float* plane = input + (n * C + c) * H_in * W_in;
-    float max_val = -__int_as_float(0x7f800000);
+    const T* plane = input + (n * C + c) * H_in * W_in;
+    M max_val = -std::numeric_limits<M>::infinity();
     int64_t max_idx = h_start * W_in + w_start;
     for (int64_t ih = h_start; ih < h_end; ++ih) {
         for (int64_t iw = w_start; iw < w_end; ++iw) {
             int64_t idx = ih * W_in + iw;
-            float val = plane[idx];
+            M val = static_cast<M>(plane[idx]);
             if ((val > max_val) || isnan(val)) {
                 max_val = val;
                 max_idx = idx;
@@ -251,13 +330,14 @@ __global__ void adaptive_max_pool2d_backward_kernel(
         }
     }
     gpuAtomicAdd(grad_input + (n * C + c) * H_in * W_in + max_idx,
-              grad_output[output_index]);
+                 grad_output[output_index]);
 }
 
 // with_indices variants: the forward also records the plane-linear argmax so
+template <typename T, typename M>
 __global__ void adaptive_max_pool2d_with_indices_forward_kernel(
-    const float* input,
-    float* output,
+    const T* input,
+    T* output,
     int64_t* indices,
     int64_t N,
     int64_t C,
@@ -279,27 +359,28 @@ __global__ void adaptive_max_pool2d_with_indices_forward_kernel(
     int64_t w_start = (w * W_in) / W_out;
     int64_t w_end = 1 + (((w + 1) * W_in) - 1) / W_out;
 
-    const float* plane = input + (n * C + c) * H_in * W_in;
-    float max_val = -__int_as_float(0x7f800000);
+    const T* plane = input + (n * C + c) * H_in * W_in;
+    M max_val = -std::numeric_limits<M>::infinity();
     int64_t max_idx = h_start * W_in + w_start;
     for (int64_t ih = h_start; ih < h_end; ++ih) {
         for (int64_t iw = w_start; iw < w_end; ++iw) {
             int64_t idx = ih * W_in + iw;
-            float val = plane[idx];
+            M val = static_cast<M>(plane[idx]);
             if ((val > max_val) || isnan(val)) {
                 max_val = val;
                 max_idx = idx;
             }
         }
     }
-    output[output_index] = max_val;
+    output[output_index] = static_cast<T>(max_val);
     indices[output_index] = max_idx;
 }
 
+template <typename T>
 __global__ void adaptive_max_pool2d_with_indices_backward_kernel(
-    const float* grad_output,
+    const T* grad_output,
     const int64_t* indices,
-    float* grad_input,
+    T* grad_input,
     int64_t N,
     int64_t C,
     int64_t H_in,
@@ -319,9 +400,13 @@ __global__ void adaptive_max_pool2d_with_indices_backward_kernel(
 }
 
 Tensor adaptive_max_pool2d_cuda(const Tensor& input, const std::vector<int64_t>& output_size) {
+    if (input.dim() == 3) {
+        return adaptive_max_pool2d_cuda(input.unsqueeze(0), output_size).squeeze(0);
+    }
     if (input.dim() != 4) TP_THROW(RuntimeError, "adaptive_max_pool2d: Expected 4D input");
-    if (input.dtype() != DType::Float32) {
-        TP_THROW(NotImplementedError, "adaptive_max_pool2d CUDA only supports Float32");
+    if (!is_adaptive_pool_cuda_dtype(input.dtype())) {
+        TP_THROW(NotImplementedError,
+                 "adaptive_max_pool2d CUDA supports Float32/Float64/Float16/BFloat16 only");
     }
     auto [H_out, W_out] = get_pair(output_size);
     if (H_out <= 0 || W_out <= 0) TP_THROW(RuntimeError, "adaptive_max_pool2d: Invalid output size");
@@ -332,20 +417,52 @@ Tensor adaptive_max_pool2d_cuda(const Tensor& input, const std::vector<int64_t>&
     if (elements == 0) return output;
     int threads = 256;
     int blocks = static_cast<int>((elements + threads - 1) / threads);
-    adaptive_max_pool2d_forward_kernel<<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-        input_contig.data_ptr<float>(), output.data_ptr<float>(),
-        input.size(0), input.size(1), input.size(2), input.size(3), H_out, W_out);
+    switch (input.dtype()) {
+        case DType::Float32:
+            adaptive_max_pool2d_forward_kernel<float, float>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    input_contig.data_ptr<float>(), output.data_ptr<float>(),
+                    input.size(0), input.size(1), input.size(2), input.size(3), H_out, W_out);
+            break;
+        case DType::Float64:
+            adaptive_max_pool2d_forward_kernel<double, double>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    input_contig.data_ptr<double>(), output.data_ptr<double>(),
+                    input.size(0), input.size(1), input.size(2), input.size(3), H_out, W_out);
+            break;
+        case DType::Float16:
+            adaptive_max_pool2d_forward_kernel<tensorplay::Half, float>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    input_contig.data_ptr<tensorplay::Half>(), output.data_ptr<tensorplay::Half>(),
+                    input.size(0), input.size(1), input.size(2), input.size(3), H_out, W_out);
+            break;
+        case DType::BFloat16:
+            adaptive_max_pool2d_forward_kernel<tensorplay::BFloat16, float>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    input_contig.data_ptr<tensorplay::BFloat16>(),
+                    output.data_ptr<tensorplay::BFloat16>(), input.size(0), input.size(1),
+                    input.size(2), input.size(3), H_out, W_out);
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "adaptive_max_pool2d CUDA supports Float32/Float64/Float16/BFloat16 only");
+    }
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) TP_THROW(RuntimeError, std::string("adaptive_max_pool2d CUDA: ") + cudaGetErrorString(error));
     return output;
 }
 
 Tensor adaptive_max_pool2d_backward_cuda(const Tensor& grad_output, const Tensor& input) {
+    if (input.dim() == 3 && grad_output.dim() == 3) {
+        return adaptive_max_pool2d_backward_cuda(
+                   grad_output.unsqueeze(0), input.unsqueeze(0)).squeeze(0);
+    }
     if (input.dim() != 4 || grad_output.dim() != 4) {
         TP_THROW(RuntimeError, "adaptive_max_pool2d_backward: Expected 4D input and grad_output");
     }
-    if (input.dtype() != DType::Float32 || grad_output.dtype() != DType::Float32) {
-        TP_THROW(NotImplementedError, "adaptive_max_pool2d_backward CUDA only supports Float32");
+    if (!is_adaptive_pool_cuda_dtype(input.dtype()) || input.dtype() != grad_output.dtype()) {
+        TP_THROW(NotImplementedError,
+                 "adaptive_max_pool2d_backward CUDA supports Float32/Float64/Float16/BFloat16 only");
     }
     Tensor input_contig = input.is_contiguous() ? input : input.contiguous();
     Tensor grad_output_contig = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
@@ -354,20 +471,55 @@ Tensor adaptive_max_pool2d_backward_cuda(const Tensor& grad_output, const Tensor
     if (elements == 0 || input_contig.numel() == 0) return grad_input;
     int threads = 256;
     int blocks = static_cast<int>((elements + threads - 1) / threads);
-    adaptive_max_pool2d_backward_kernel<<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-        grad_output_contig.data_ptr<float>(), input_contig.data_ptr<float>(),
-        grad_input.data_ptr<float>(),
-        input.size(0), input.size(1), input.size(2), input.size(3),
-        grad_output.size(2), grad_output.size(3));
+    switch (input.dtype()) {
+        case DType::Float32:
+            adaptive_max_pool2d_backward_kernel<float, float>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    grad_output_contig.data_ptr<float>(), input_contig.data_ptr<float>(),
+                    grad_input.data_ptr<float>(), input.size(0), input.size(1), input.size(2),
+                    input.size(3), grad_output.size(2), grad_output.size(3));
+            break;
+        case DType::Float64:
+            adaptive_max_pool2d_backward_kernel<double, double>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    grad_output_contig.data_ptr<double>(), input_contig.data_ptr<double>(),
+                    grad_input.data_ptr<double>(), input.size(0), input.size(1), input.size(2),
+                    input.size(3), grad_output.size(2), grad_output.size(3));
+            break;
+        case DType::Float16:
+            adaptive_max_pool2d_backward_kernel<tensorplay::Half, float>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    grad_output_contig.data_ptr<tensorplay::Half>(),
+                    input_contig.data_ptr<tensorplay::Half>(), grad_input.data_ptr<tensorplay::Half>(),
+                    input.size(0), input.size(1), input.size(2), input.size(3),
+                    grad_output.size(2), grad_output.size(3));
+            break;
+        case DType::BFloat16:
+            adaptive_max_pool2d_backward_kernel<tensorplay::BFloat16, float>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    grad_output_contig.data_ptr<tensorplay::BFloat16>(),
+                    input_contig.data_ptr<tensorplay::BFloat16>(),
+                    grad_input.data_ptr<tensorplay::BFloat16>(), input.size(0), input.size(1),
+                    input.size(2), input.size(3), grad_output.size(2), grad_output.size(3));
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "adaptive_max_pool2d_backward CUDA supports Float32/Float64/Float16/BFloat16 only");
+    }
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) TP_THROW(RuntimeError, std::string("adaptive_max_pool2d_backward CUDA: ") + cudaGetErrorString(error));
     return grad_input;
 }
 
 std::tuple<Tensor, Tensor> adaptive_max_pool2d_with_indices_cuda(const Tensor& input, const std::vector<int64_t>& output_size) {
+    if (input.dim() == 3) {
+        auto result = adaptive_max_pool2d_with_indices_cuda(input.unsqueeze(0), output_size);
+        return std::make_tuple(std::get<0>(result).squeeze(0), std::get<1>(result).squeeze(0));
+    }
     if (input.dim() != 4) TP_THROW(RuntimeError, "adaptive_max_pool2d_with_indices: Expected 4D input");
-    if (input.dtype() != DType::Float32) {
-        TP_THROW(NotImplementedError, "adaptive_max_pool2d_with_indices CUDA only supports Float32");
+    if (!is_adaptive_pool_cuda_dtype(input.dtype())) {
+        TP_THROW(NotImplementedError,
+                 "adaptive_max_pool2d_with_indices CUDA supports Float32/Float64/Float16/BFloat16 only");
     }
     auto [H_out, W_out] = get_pair(output_size);
     if (H_out <= 0 || W_out <= 0) TP_THROW(RuntimeError, "adaptive_max_pool2d_with_indices: Invalid output size");
@@ -379,9 +531,39 @@ std::tuple<Tensor, Tensor> adaptive_max_pool2d_with_indices_cuda(const Tensor& i
     if (elements == 0) return std::make_tuple(output, indices);
     int threads = 256;
     int blocks = static_cast<int>((elements + threads - 1) / threads);
-    adaptive_max_pool2d_with_indices_forward_kernel<<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-        input_contig.data_ptr<float>(), output.data_ptr<float>(), indices.data_ptr<int64_t>(),
-        input.size(0), input.size(1), input.size(2), input.size(3), H_out, W_out);
+    switch (input.dtype()) {
+        case DType::Float32:
+            adaptive_max_pool2d_with_indices_forward_kernel<float, float>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    input_contig.data_ptr<float>(), output.data_ptr<float>(),
+                    indices.data_ptr<int64_t>(), input.size(0), input.size(1), input.size(2),
+                    input.size(3), H_out, W_out);
+            break;
+        case DType::Float64:
+            adaptive_max_pool2d_with_indices_forward_kernel<double, double>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    input_contig.data_ptr<double>(), output.data_ptr<double>(),
+                    indices.data_ptr<int64_t>(), input.size(0), input.size(1), input.size(2),
+                    input.size(3), H_out, W_out);
+            break;
+        case DType::Float16:
+            adaptive_max_pool2d_with_indices_forward_kernel<tensorplay::Half, float>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    input_contig.data_ptr<tensorplay::Half>(), output.data_ptr<tensorplay::Half>(),
+                    indices.data_ptr<int64_t>(), input.size(0), input.size(1), input.size(2),
+                    input.size(3), H_out, W_out);
+            break;
+        case DType::BFloat16:
+            adaptive_max_pool2d_with_indices_forward_kernel<tensorplay::BFloat16, float>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    input_contig.data_ptr<tensorplay::BFloat16>(),
+                    output.data_ptr<tensorplay::BFloat16>(), indices.data_ptr<int64_t>(),
+                    input.size(0), input.size(1), input.size(2), input.size(3), H_out, W_out);
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "adaptive_max_pool2d_with_indices CUDA supports Float32/Float64/Float16/BFloat16 only");
+    }
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) TP_THROW(RuntimeError, std::string("adaptive_max_pool2d_with_indices CUDA: ") + cudaGetErrorString(error));
     return std::make_tuple(output, indices);
@@ -390,11 +572,17 @@ std::tuple<Tensor, Tensor> adaptive_max_pool2d_with_indices_cuda(const Tensor& i
 Tensor adaptive_max_pool2d_with_indices_backward_cuda(const Tensor& grad_output, const Tensor& input,
                                                       const std::vector<int64_t>& output_size, const Tensor& indices) {
     (void)output_size;
+    if (input.dim() == 3 && grad_output.dim() == 3 && indices.dim() == 3) {
+        return adaptive_max_pool2d_with_indices_backward_cuda(
+                   grad_output.unsqueeze(0), input.unsqueeze(0), output_size,
+                   indices.unsqueeze(0)).squeeze(0);
+    }
     if (input.dim() != 4 || grad_output.dim() != 4) {
         TP_THROW(RuntimeError, "adaptive_max_pool2d_with_indices_backward: Expected 4D input and grad_output");
     }
-    if (input.dtype() != DType::Float32 || grad_output.dtype() != DType::Float32) {
-        TP_THROW(NotImplementedError, "adaptive_max_pool2d_with_indices_backward CUDA only supports Float32");
+    if (!is_adaptive_pool_cuda_dtype(input.dtype()) || input.dtype() != grad_output.dtype()) {
+        TP_THROW(NotImplementedError,
+                 "adaptive_max_pool2d_with_indices_backward CUDA supports Float32/Float64/Float16/BFloat16 only");
     }
     Tensor grad_output_contig = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor indices_contig = indices.is_contiguous() ? indices : indices.contiguous();
@@ -403,10 +591,41 @@ Tensor adaptive_max_pool2d_with_indices_backward_cuda(const Tensor& grad_output,
     if (elements == 0 || input.numel() == 0) return grad_input;
     int threads = 256;
     int blocks = static_cast<int>((elements + threads - 1) / threads);
-    adaptive_max_pool2d_with_indices_backward_kernel<<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-        grad_output_contig.data_ptr<float>(), indices_contig.data_ptr<int64_t>(), grad_input.data_ptr<float>(),
-        input.size(0), input.size(1), input.size(2), input.size(3),
-        grad_output.size(2), grad_output.size(3));
+    switch (input.dtype()) {
+        case DType::Float32:
+            adaptive_max_pool2d_with_indices_backward_kernel<float>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    grad_output_contig.data_ptr<float>(), indices_contig.data_ptr<int64_t>(),
+                    grad_input.data_ptr<float>(), input.size(0), input.size(1), input.size(2),
+                    input.size(3), grad_output.size(2), grad_output.size(3));
+            break;
+        case DType::Float64:
+            adaptive_max_pool2d_with_indices_backward_kernel<double>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    grad_output_contig.data_ptr<double>(), indices_contig.data_ptr<int64_t>(),
+                    grad_input.data_ptr<double>(), input.size(0), input.size(1), input.size(2),
+                    input.size(3), grad_output.size(2), grad_output.size(3));
+            break;
+        case DType::Float16:
+            adaptive_max_pool2d_with_indices_backward_kernel<tensorplay::Half>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    grad_output_contig.data_ptr<tensorplay::Half>(),
+                    indices_contig.data_ptr<int64_t>(), grad_input.data_ptr<tensorplay::Half>(),
+                    input.size(0), input.size(1), input.size(2), input.size(3),
+                    grad_output.size(2), grad_output.size(3));
+            break;
+        case DType::BFloat16:
+            adaptive_max_pool2d_with_indices_backward_kernel<tensorplay::BFloat16>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    grad_output_contig.data_ptr<tensorplay::BFloat16>(),
+                    indices_contig.data_ptr<int64_t>(), grad_input.data_ptr<tensorplay::BFloat16>(),
+                    input.size(0), input.size(1), input.size(2), input.size(3),
+                    grad_output.size(2), grad_output.size(3));
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "adaptive_max_pool2d_with_indices_backward CUDA supports Float32/Float64/Float16/BFloat16 only");
+    }
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) TP_THROW(RuntimeError, std::string("adaptive_max_pool2d_with_indices_backward CUDA: ") + cudaGetErrorString(error));
     return grad_input;
@@ -618,10 +837,6 @@ Tensor avg_pool2d_backward_cuda(const Tensor& grad_output, const Tensor& input, 
 // plain CUDA kernels: one thread per output element, grid-stride, atomicAdd
 // scatter in the backwards.  Half/BFloat16 compute in float (opmath).
 // ---------------------------------------------------------------------------
-
-template <typename T> struct PoolMath { using type = T; };
-template <> struct PoolMath<tensorplay::Half> { using type = float; };
-template <> struct PoolMath<tensorplay::BFloat16> { using type = float; };
 
 inline int64_t pool_grid_blocks(int64_t n, int threads) {
     int64_t blocks = (n + threads - 1) / threads;
