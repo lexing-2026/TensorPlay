@@ -36,6 +36,14 @@ inline int64_t diagonal_add_checked(int64_t lhs, int64_t rhs) {
     return lhs + rhs;
 }
 
+inline int64_t checked_shape_add(int64_t lhs, int64_t rhs, const char* op) {
+    if (lhs < 0 || rhs < 0 ||
+        lhs > std::numeric_limits<int64_t>::max() - rhs) {
+        TP_THROW(ValueError, op, ": output size is too large");
+    }
+    return lhs + rhs;
+}
+
 Tensor view_as_real_cuda(const Tensor& self) {
     if (!self.defined()) {
         TP_THROW(RuntimeError, "view_as_real: input must be defined");
@@ -348,6 +356,11 @@ Tensor cat_kernel_cuda(const std::vector<Tensor>& tensors, int64_t dim) {
     if (tensors.empty()) {
         TP_THROW(ValueError, "cat(): expected a non-empty list of Tensors");
     }
+    for (const auto& t : tensors) {
+        if (t.device() != tensors[0].device()) {
+            TP_THROW(DeviceMismatchError, "cat(): all tensors must be on the same device");
+        }
+    }
 
     DType out_dtype = tensors[0].dtype();
     for (size_t i = 1; i < tensors.size(); ++i) {
@@ -368,9 +381,6 @@ Tensor cat_kernel_cuda(const std::vector<Tensor>& tensors, int64_t dim) {
         int64_t size_at_dim = 0;
         for (size_t i = 0; i < tensors.size(); ++i) {
             const Tensor& t = tensors[i];
-            if (t.device() != tensors[0].device()) {
-                TP_THROW(DeviceMismatchError, "cat(): all tensors must be on the same device");
-            }
             if (join_detail::should_skip(t)) continue;
             if (t.dim() != first.dim()) {
                 TP_THROW(RuntimeError, "Tensors must have same number of dimensions: got ",
@@ -384,7 +394,7 @@ Tensor cat_kernel_cuda(const std::vector<Tensor>& tensors, int64_t dim) {
                              t.size(d), " for tensor number ", i, " in the list.");
                 }
             }
-            size_at_dim += t.size(dim);
+            size_at_dim = checked_shape_add(size_at_dim, t.size(dim), "cat");
         }
         out_shape = static_cast<std::vector<int64_t>>(first.shape());
         out_shape[dim] = size_at_dim;
@@ -399,7 +409,7 @@ Tensor cat_kernel_cuda(const std::vector<Tensor>& tensors, int64_t dim) {
         if (size > 0) {
             Tensor out_slice = out.slice(dim, offset, offset + size);
             out_slice.copy_(t, /*non_blocking=*/true);
-            offset += size;
+            offset = checked_shape_add(offset, size, "cat");
         }
     }
     return out;
@@ -420,10 +430,14 @@ std::vector<Tensor> split_kernel_cuda(const Tensor& self, int64_t split_size, in
                  "but got dimension size of ", dim_size);
     }
     int64_t num_splits = 1;
+    int64_t last_split_size = 0;
     if (split_size != 0) {
-        num_splits = std::max<int64_t>((dim_size + split_size - 1) / split_size, 1);
+        const int64_t quotient = dim_size / split_size;
+        const int64_t remainder = dim_size % split_size;
+        num_splits = std::max<int64_t>(quotient + (remainder != 0 ? 1 : 0), 1);
+        last_split_size =
+            (dim_size != 0 && remainder == 0) ? split_size : remainder;
     }
-    const int64_t last_split_size = split_size - (split_size * num_splits - dim_size);
     std::vector<Tensor> result;
     result.reserve(num_splits);
     for (int64_t i = 0; i < num_splits; ++i) {
@@ -450,6 +464,12 @@ std::vector<Tensor> split_sizes_kernel_cuda(const Tensor& self,
             TP_THROW(RuntimeError, "split_with_sizes expects split_sizes have only non-negative "
                      "entries, but got split_sizes=", join_detail::fmt_sizes(split_sizes));
         }
+        if (length > dim_size - start_idx) {
+            TP_THROW(RuntimeError,
+                     "split_with_sizes expects split_sizes to sum exactly to ",
+                     dim_size, " (input tensor's size at dimension ", dim,
+                     ")");
+        }
         result.push_back(self.slice(dim, start_idx, start_idx + length));
         start_idx += length;
     }
@@ -471,7 +491,8 @@ std::vector<Tensor> chunk_kernel_cuda(const Tensor& self, int64_t chunks, int64_
     }
     dim = join_detail::wrap_dim(dim, self.dim());
     const int64_t dim_size = self.size(dim);
-    const int64_t split_size = (dim_size + chunks - 1) / chunks;
+    const int64_t split_size =
+        dim_size / chunks + (dim_size % chunks != 0 ? 1 : 0);
     if (split_size == 0 && dim_size == 0) {
         std::vector<int64_t> sizes(static_cast<size_t>(chunks), 0);
         sizes[static_cast<size_t>(chunks - 1)] = split_size - (split_size * chunks - dim_size);
