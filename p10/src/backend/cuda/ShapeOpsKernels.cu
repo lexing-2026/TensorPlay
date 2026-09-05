@@ -5,6 +5,7 @@
 #include "Exception.h"
 #include "Utils.h"
 #include "TypePromotion.h"
+#include "Quantizer.h"
 #include "CUDARuntime.h"
 
 #include <cuda_runtime.h>
@@ -66,6 +67,18 @@ inline void outer_inner(const std::vector<int64_t>& shape, int64_t dim,
 
 inline std::vector<int64_t> shape_of(const Tensor& t) {
     return static_cast<std::vector<int64_t>>(t.shape());
+}
+
+Tensor empty_transform_output(const Tensor& self) {
+    const auto shape = shape_of(self);
+    if (!isQuantizedType(self.dtype())) {
+        return Tensor::empty(shape, self.dtype(), self.device());
+    }
+    quantized::require_quantized(self, "roll");
+    Tensor codes = Tensor::empty(shape, underlying_storage_type(self.dtype()),
+                                 self.device());
+    return quantized::make_qtensor(codes, quantized::quantizer_of(self),
+                                   self.dtype());
 }
 
 Tensor pack_i64(const std::vector<int64_t>& v, const Device& dev) {
@@ -545,7 +558,7 @@ Tensor roll_cuda(const Tensor& self, const std::vector<int64_t>& shifts, const s
     std::vector<int64_t> sh(nd, 0);
     sh[dim] = ((shifts[0] % size) + size) % size;
     Tensor sc = self.contiguous();
-    Tensor out = Tensor::empty(shape_of(sc), sc.dtype(), sc.device());
+    Tensor out = empty_transform_output(sc);
     int64_t n = sc.numel();
     Tensor d_sizes = pack_i64(shape_of(sc), sc.device());
     Tensor d_sh = pack_i64(sh, sc.device());
@@ -558,7 +571,8 @@ Tensor roll_cuda(const Tensor& self, const std::vector<int64_t>& shifts, const s
             d_sizes.data_ptr<int64_t>(), d_sh.data_ptr<int64_t>()); \
         break;
     switch (sc.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_RL2)
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_RL2)
+        TENSORPLAY_FORALL_QINT_TYPES(TP_RL2)
         default: TP_THROW(TypeError, "roll: unsupported dtype");
     }
 #undef TP_RL2
