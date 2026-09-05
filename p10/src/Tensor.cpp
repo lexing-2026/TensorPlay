@@ -286,6 +286,7 @@ bool Tensor::is_coalesced() const {
 
 int64_t Tensor::sparse_dim() const {
     if (!is_sparse()) return 0;
+    if (is_sparse_csr()) return 2;
     return _indices().dim() == 0 ? 0 : _indices().size(0);
 }
 
