@@ -552,11 +552,17 @@ Tensor onesided_weights(const Tensor& x, int64_t d) {
     const int64_t n = x.size(d);
     Tensor segs = x.narrow(d, 1, n - 1).sub(x.narrow(d, 0, n - 1));
     if (n == 2) {
-        return segs.mul(0.5);
+        Tensor half = segs.mul(0.5);
+        return Tensor::cat({half, half}, d);
     }
     Tensor inner = segs.narrow(d, 0, n - 2).add(segs.narrow(d, 1, n - 2));
     return Tensor::cat({segs.narrow(d, 0, 1), inner,
                         segs.narrow(d, n - 2, 1)}, d).mul(0.5);
+}
+
+Tensor segment_widths(const Tensor& x, int64_t d) {
+    const int64_t n = x.size(d);
+    return x.narrow(d, 1, n - 1).sub(x.narrow(d, 0, n - 1));
 }
 
 } // anonymous namespace
@@ -566,7 +572,7 @@ Tensor trapezoid_cuda(const Tensor& y, const std::optional<Tensor>& x_opt, Scala
     const Tensor x = x_opt.value_or(Tensor());
     const int64_t d = trapz_dim(dim, y.dim());
     const int64_t n = y.size(d);
-    if (n < 2) TP_THROW(RuntimeError, "trapezoid(): requires at least 2 points");
+    if (n < 2) return y.narrow(d, 0, 0).sum(std::vector<int64_t>{d}, false);
     Tensor avg = y.narrow(d, 0, n - 1).add(y.narrow(d, 1, n - 1)).mul(0.5);
     if (x.defined()) {
         bool was_1d = x.dim() == 1;
@@ -591,8 +597,7 @@ Tensor cumulative_trapezoid_cuda(const Tensor& y, const std::optional<Tensor>& x
     const Tensor x = x_opt.value_or(Tensor());
     const int64_t d = trapz_dim(dim, y.dim());
     const int64_t n = y.size(d);
-    if (n < 2) TP_THROW(RuntimeError,
-                        "cumulative_trapezoid(): requires at least 2 points");
+    if (n < 2) return y.narrow(d, 0, 0);
     Tensor avg = y.narrow(d, 0, n - 1).add(y.narrow(d, 1, n - 1)).mul(0.5);
     if (x.defined()) {
         bool was_1d = x.dim() == 1;
@@ -630,11 +635,17 @@ Tensor trapezoid_backward_cuda(const Tensor& grad, const std::optional<Tensor>& 
     const int64_t ndim = static_cast<int64_t>(ysizes.size());
     const int64_t d = trapz_dim(dim, ndim);
     const int64_t n = ysizes[d];
-    Tensor w1d = x.defined() ? onesided_weights(x.reshape(
-                                   std::vector<int64_t>{x.numel()}), 0)
-                             : uniform_weights(n, dx, grad);
-    if (n == 1) return Tensor::zeros(ysizes, grad.dtype(), grad.device());
-    return apply_sum_weights(grad, d, w1d.to(grad.dtype()));
+    if (n < 2) return Tensor::zeros(ysizes, grad.dtype(), grad.device());
+    if (!x.defined()) {
+        return apply_sum_weights(grad, d,
+                                 uniform_weights(n, dx, grad).to(grad.dtype()));
+    }
+    if (x.dim() == 1) {
+        return apply_sum_weights(
+            grad, d, onesided_weights(x, 0).to(grad.dtype()));
+    }
+    Tensor weights = onesided_weights(x, d).to(grad.dtype());
+    return grad.unsqueeze(d).mul(weights);
 }
 
 Tensor cumulative_trapezoid_backward_cuda(const Tensor& grad,
@@ -645,19 +656,27 @@ Tensor cumulative_trapezoid_backward_cuda(const Tensor& grad,
     const double dx = dx_s.toDouble();
     const int64_t d = wrap_dim_local(dim, grad.dim());
     const int64_t m = grad.size(d);
+    if (m == 0) {
+        auto output_shape = static_cast<std::vector<int64_t>>(grad.shape());
+        output_shape[d] = x.defined() && x.dim() != 1
+            ? x.size(d)
+            : (x.defined() ? x.numel() : 1);
+        return Tensor::zeros(output_shape, grad.dtype(), grad.device());
+    }
     const std::vector<int64_t> dv{d};
     Tensor acc = Tensor::flip(Tensor::flip(grad, dv).cumsum(d), dv);
 
     Tensor seg_w;
     if (x.defined()) {
-        seg_w = onesided_weights(x.reshape(std::vector<int64_t>{x.numel()}),
-                                 0).to(grad.dtype());
+        seg_w = segment_widths(x, x.dim() == 1 ? 0 : d).to(grad.dtype());
     } else {
         seg_w = Tensor::full({m}, dx, grad.dtype(), grad.device());
     }
     std::vector<int64_t> wview(grad.dim(), 1);
     wview[d] = m;
-    Tensor ws = acc.mul(seg_w.reshape(wview));
+    Tensor ws = x.defined() && x.dim() != 1
+        ? acc.mul(seg_w)
+        : acc.mul(seg_w.reshape(wview));
     auto tail_shape = static_cast<std::vector<int64_t>>(ws.shape());
     tail_shape[d] = 1;
     Tensor zero_tail = Tensor::zeros(tail_shape, grad.dtype(), grad.device());

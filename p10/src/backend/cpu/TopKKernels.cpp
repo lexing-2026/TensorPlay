@@ -53,7 +53,7 @@ inline void select_topk(std::vector<std::pair<T, int64_t>>& queue,
   } else {
     std::nth_element(queue.begin(), queue.begin() + k - 1, queue.end(), compare);
     if (sorted) {
-      std::sort(queue.begin(), queue.begin() + k - 1, compare);
+      std::sort(queue.begin(), queue.begin() + k, compare);
     }
   }
 }
