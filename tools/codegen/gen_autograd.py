@@ -467,6 +467,10 @@ class OpDerivatives:
     members: list[tuple[str, str]]      # saved state: (member name, C++ type)
     used_input_names: set[str] = field(default_factory=set)
     used_output_names: set[str] = field(default_factory=set)
+    # All forward outputs are marked non-differentiable: the autograd wrapper
+    # still registers (so the dispatch chain resolves) but builds no backward
+    # node and leaves the outputs detached.
+    non_differentiable_output: bool = False
 
 
 # Backwards that cannot be written in the formula DSL because they map over a
@@ -576,6 +580,20 @@ def load_derivatives(path: str, native_by_opname: dict[str, NativeFunction]) \
                 raw[decl.name] = item[decl.name]
         if raw:
             out[op] = compute_op_derivatives(native, raw)
+        elif item.get("output_differentiability") == [False]:
+            # Non-differentiable output: register the autograd wrapper so the
+            # dispatch chain resolves above the backend key, but emit no
+            # backward node and keep the outputs detached.
+            out[op] = OpDerivatives(
+                func=native,
+                node_name=autograd_node_name(native.func_name),
+                formulas={},
+                grad_slots=native.tensor_args,
+                members=[],
+                used_input_names=set(),
+                used_output_names=set(),
+                non_differentiable_output=True,
+            )
 
     # Manual (hand-written) backwards: register their saved-state layout so
     # wrapper generation treats them uniformly.
