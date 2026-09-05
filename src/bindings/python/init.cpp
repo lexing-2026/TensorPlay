@@ -8,6 +8,9 @@
 #include "OneDNNContext.h"
 #include "Profiler.h"
 #include "Graph.h"
+#ifdef USE_CUDA
+#include "CuFFTPlanCache.h"
+#endif
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -626,6 +629,75 @@ PYBIND11_MODULE(_C, m) {
     m.def("_set_cudnn_benchmark", [](bool enabled) {
         tensorplay::globalContext().setCudnnBenchmark(enabled);
     }, "enabled"_a);
+
+    // --------------------------------------------------------------------
+    // GPU BLAS / linalg backend preference and cuFFT plan cache controls
+    // --------------------------------------------------------------------
+    py::enum_<tensorplay::BlasBackend>(m, "_BlasBackend",
+        "Selects the BLAS library that executes GPU matrix products.")
+        .value("Default", tensorplay::BlasBackend::Default)
+        .value("Cublas", tensorplay::BlasBackend::Cublas)
+        .value("Cublaslt", tensorplay::BlasBackend::Cublaslt);
+
+    py::enum_<tensorplay::LinalgBackend>(m, "_LinalgBackend",
+        "Selects the library that executes GPU dense factorizations.")
+        .value("Default", tensorplay::LinalgBackend::Default)
+        .value("Cusolver", tensorplay::LinalgBackend::Cusolver)
+        .value("Magma", tensorplay::LinalgBackend::Magma);
+
+    m.def("_get_linalg_preferred_backend", []() {
+        return tensorplay::globalContext().linalgPreferredBackend();
+    });
+    m.def("_set_linalg_preferred_backend",
+          [](tensorplay::LinalgBackend backend) {
+              tensorplay::globalContext().setLinalgPreferredBackend(backend);
+          }, "backend"_a);
+    m.def("_get_blas_preferred_backend", []() {
+        return tensorplay::globalContext().blasPreferredBackend();
+    });
+    m.def("_set_blas_preferred_backend",
+          [](tensorplay::BlasBackend backend) {
+              tensorplay::globalContext().setBlasPreferredBackend(backend);
+          }, "backend"_a);
+#ifdef USE_CUDA
+    m.def("_cufft_get_plan_cache_max_size",
+          [](int64_t device_index) {
+              return tensorplay::cuda::cufft::get_plan_cache_max_size(device_index);
+          }, "device_index"_a);
+    m.def("_cufft_set_plan_cache_max_size",
+          [](int64_t device_index, int64_t max_size) {
+              tensorplay::cuda::cufft::set_plan_cache_max_size(device_index, max_size);
+          }, "device_index"_a, "max_size"_a);
+    m.def("_cufft_get_plan_cache_size",
+          [](int64_t device_index) {
+              return tensorplay::cuda::cufft::get_plan_cache_size(device_index);
+          }, "device_index"_a);
+    m.def("_cufft_clear_plan_cache",
+          [](int64_t device_index) {
+              tensorplay::cuda::cufft::clear_plan_cache(device_index);
+          }, "device_index"_a);
+#else
+    m.def("_cufft_get_plan_cache_max_size",
+          [](int64_t device_index) {
+              (void)device_index;
+              throw std::runtime_error("cuFFT plan cache requires CUDA");
+          }, "device_index"_a);
+    m.def("_cufft_set_plan_cache_max_size",
+          [](int64_t device_index, int64_t max_size) {
+              (void)device_index; (void)max_size;
+              throw std::runtime_error("cuFFT plan cache requires CUDA");
+          }, "device_index"_a, "max_size"_a);
+    m.def("_cufft_get_plan_cache_size",
+          [](int64_t device_index) {
+              (void)device_index;
+              throw std::runtime_error("cuFFT plan cache requires CUDA");
+          }, "device_index"_a);
+    m.def("_cufft_clear_plan_cache",
+          [](int64_t device_index) {
+              (void)device_index;
+              throw std::runtime_error("cuFFT plan cache requires CUDA");
+          }, "device_index"_a);
+#endif
 
     // --------------------------------------------------------------------
     // Scaled dot product attention utilities
