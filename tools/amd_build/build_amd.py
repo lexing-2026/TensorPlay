@@ -28,6 +28,10 @@ INCLUDE_FIXES = {
     "#include <cudnn_frontend.h>": '#include "tp_amd_compat/cudnn_frontend_disabled.h"',
     "#include <cusolverDn.h>": "#include <hipsolver/hipsolver.h>",
     "#include <tensorpipe/tensorpipe_hip.h>": "#include <tensorpipe/tensorpipe_cuda.h>",
+    # The HIP staging copies the loops header to hip/HIPLoops.cuh; the
+    # hipifier drops this include when file ordering puts the target
+    # after the includer, so the mapping is pinned here.
+    '#include "CUDALoops.cuh"': '#include "HIPLoops.cuh"',
 }
 
 # Symbols the mapping table lacks for the solver compatibility layer.

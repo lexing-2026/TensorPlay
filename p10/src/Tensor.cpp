@@ -44,39 +44,6 @@ QuantizerPtr quantizer_on_device(const QuantizerPtr& quantizer,
 
 } // namespace
 
-// Helper for DType output
-std::ostream& operator<<(std::ostream& os, DType dt) {
-    switch (dt) {
-        case DType::UInt8: os << "uint8"; break;
-        case DType::Int8: os << "int8"; break;
-        case DType::Int16: os << "int16"; break;
-        case DType::Float32: os << "float32"; break;
-        case DType::Float64: os << "float64"; break;
-        case DType::Int32: os << "int32"; break;
-        case DType::Int64: os << "int64"; break;
-        case DType::UInt16: os << "uint16"; break;
-        case DType::UInt32: os << "uint32"; break;
-        case DType::UInt64: os << "uint64"; break;
-        case DType::Float16: os << "float16"; break;
-        case DType::BFloat16: os << "bfloat16"; break;
-        case DType::ComplexHalf: os << "complex32"; break;
-        case DType::ComplexFloat: os << "complex64"; break;
-        case DType::ComplexDouble: os << "complex128"; break;
-        case DType::BComplex32: os << "bcomplex32"; break;
-        case DType::Bool: os << "bool"; break;
-        case DType::Float8_e4m3fn: os << "float8_e4m3fn"; break;
-        case DType::Float8_e5m2: os << "float8_e5m2"; break;
-        case DType::Float8_e4m3fnuz: os << "float8_e4m3fnuz"; break;
-        case DType::Float8_e5m2fnuz: os << "float8_e5m2fnuz"; break;
-        case DType::Float8_e8m0fnu: os << "float8_e8m0fnu"; break;
-        case DType::QInt8: os << "qint8"; break;
-        case DType::QUInt8: os << "quint8"; break;
-        case DType::QInt32: os << "qint32"; break;
-        default: os << "dtype(" << static_cast<int>(dt) << ")"; break;
-    }
-    return os;
-}
-
 // Helper for Device output
 std::ostream& operator<<(std::ostream& os, const Device& d) {
     os << (d.type() == DeviceType::CPU ? "cpu" : "cuda");

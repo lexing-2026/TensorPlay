@@ -97,7 +97,9 @@ inline T uniform_int_full_range(V val) {
 }
 
 template <typename T, typename V>
-inline std::enable_if_t<!std::is_floating_point_v<T>, T> uniform_int(V val) {
+inline std::enable_if_t<!std::is_floating_point_v<T> &&
+                        !std::is_same_v<T, Half> &&
+                        !std::is_same_v<T, BFloat16>, T> uniform_int(V val) {
     if constexpr (std::is_same_v<T, bool>) {
         return static_cast<bool>(val & 1);
     } else if constexpr (std::is_same_v<T, int64_t>) {
