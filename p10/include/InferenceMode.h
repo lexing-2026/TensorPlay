@@ -6,15 +6,15 @@
 namespace tensorplay {
 
 // Thread-local inference-mode switch used by tensor creation and dispatch.
+// Like GradMode, the TLS slot lives in the library so the exported surface
+// stays free of thread-storage objects.
 class P10_API InferenceMode {
 public:
-    static bool is_enabled() { return enabled_; }
-    static void set_enabled(bool enabled) { enabled_ = enabled; }
+    static bool is_enabled();
+    static void set_enabled(bool enabled);
 
 private:
-    // True thread-local storage, same rationale as GradMode: inference mode
-    // in one thread must not leak into engine workers or other user threads.
-    static thread_local bool enabled_;
+    InferenceMode() = delete;
 };
 
 // RAII helper for C++ call sites.

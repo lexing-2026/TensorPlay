@@ -30,3 +30,11 @@
 #else
 #define TP_RESTRICT __restrict__
 #endif
+
+// Force-inline hint: only GNU-style compilers accept the always_inline
+// attribute; MSVC relies on its own inliner without extra decoration.
+#if defined(_MSC_VER) && !defined(__clang__)
+#define TP_ALWAYS_INLINE inline
+#else
+#define TP_ALWAYS_INLINE inline __attribute__((always_inline))
+#endif
