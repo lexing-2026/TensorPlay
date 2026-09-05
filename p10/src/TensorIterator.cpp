@@ -3,6 +3,7 @@
 #include "Tensor.h"
 #include "ErrorReporting.h"
 #include "TypePromotion.h"
+#include "TypeProperties.h"
 #include "Utils.h"
 #include "irange.h"
 #include <algorithm>
@@ -183,19 +184,18 @@ void TensorIteratorBase::reorder_dimensions() {
 // Computes a common dtype using type promotion
 // See the [Common Dtype Computation] note
 ScalarType TensorIteratorBase::compute_common_dtype() {
-  ScalarType result = ScalarType::Undefined;
+  native::ResultTypeState state = {};
   for (const auto& op : operands_) {
     if (op.is_output) {
       continue;
     }
-    if (result == ScalarType::Undefined) {
-      result = op.target_dtype;
-    } else {
-      result = promoteTypes(result, op.target_dtype);
-    }
+
+    state = native::update_result_type_state(op.tensor(), state);
   }
-  common_dtype_ = result;
+
+  common_dtype_ = native::result_type(state);
   TP_CHECK(common_dtype_ != ScalarType::Undefined, "undefined common dtype");
+
   return common_dtype_;
 }
 
@@ -382,6 +382,11 @@ void TensorIteratorBase::compute_types(const TensorIteratorConfig& config) {
   //   - checks that the common dtype can safely cast to each output, if requested
   //   - creates temporaries for CPU operations, if needed and requested
   common_device_ = common_device;
+  // A non-CPU kernel may consume at most one CPU scalar operand, and only
+  // when the kernel opts in through allow_cpu_scalars; the scalar is then
+  // folded by the kernel itself instead of being materialized on device.
+  int max_cpu_scalars_on_non_cpu = config.allow_cpu_scalars_ ? 1 : 0;
+  int current_cpu_scalars_on_non_cpu = 0;
   for (auto& op : operands_) {
     bool is_type_defined = op.is_type_defined();
     bool is_device_defined = op.is_device_defined();
@@ -404,8 +409,15 @@ void TensorIteratorBase::compute_types(const TensorIteratorConfig& config) {
 
     // Checks all tensors are on the same device, if requested
     if (config.check_all_same_device_) {
-      Device op_device = op.device.value_or(Device(DeviceType::CPU));
-      if (!(op_device == common_device)) {
+      // Handles CPU scalars on CUDA kernels that support them
+      if (!common_device.is_cpu() &&
+          config.allow_cpu_scalars_ && !op.is_output && op.tensor().dim() == 0 &&
+          op.tensor().device().is_cpu()) {
+        TP_CHECK(current_cpu_scalars_on_non_cpu < max_cpu_scalars_on_non_cpu,
+                 "Trying to pass too many CPU scalars to non-CPU kernel!");
+        ++current_cpu_scalars_on_non_cpu;
+      } else if (!(op.device == common_device)) {
+        Device op_device = op.device.value_or(Device(DeviceType::CPU));
         TP_THROW(DeviceMismatchError,
             "Expected all tensors to be on the same device, but found ",
             op_device.toString(), " on an operand while the common device is ",

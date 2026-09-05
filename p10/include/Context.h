@@ -27,6 +27,15 @@ public:
     // floating point dtypes are accepted as the default dtype.
     void setDefaultDType(DType dtype);
     DType defaultDType() const { return default_dtype_; }
+    // The complex dtype paired with the default dtype: ComplexHalf/Float/
+    // Double for a Half/Float/Double default, ComplexFloat otherwise.
+    DType defaultComplexDType() const {
+        switch (default_dtype_) {
+            case DType::Float16: return DType::ComplexHalf;
+            case DType::Float64: return DType::ComplexDouble;
+            default: return DType::ComplexFloat;
+        }
+    }
 
     // -- Default device --------------------------------------------------
     // Thread-local so that set_default_device() in one thread does not
