@@ -47,6 +47,7 @@ set(P10_SOURCES
     src/backend/cpu/FactoryKernels.cpp
     src/backend/cpu/LinearAlgebraKernels.cpp
     src/backend/cpu/LinalgKernels.cpp
+    src/backend/cpu/LuUnpack.cpp
     src/backend/cpu/Lapack.cpp
     src/backend/cpu/PointwiseKernels.cpp
     src/backend/cpu/PoolingKernels.cpp
@@ -196,6 +197,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/UpsampleKernels.cu
         src/backend/cuda/LinearAlgebraKernels.cu
         src/backend/cuda/LinalgKernels.cu
+        src/backend/cuda/LuUnpack.cu
         src/backend/cuda/LinalgSVD.cu
         src/backend/cuda/LinalgLDL.cu
         src/backend/cuda/CudaBlasGemm.cpp
@@ -464,6 +466,154 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
     if(TP_CXX_AVX512_FOUND)
         list(APPEND P10_SOURCES ${TP_CPU_KERNEL_AVX512_OBJS})
     endif()
+elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(powerpc|ppc)64")
+    # PowerPC: one DEFAULT copy plus one VSX copy. VSX is a baseline feature
+    # of the supported ISA generations, so the VSX tier has no runtime gate
+    # beyond the compiler probe below; the DEFAULT copy keeps builds working
+    # for toolchains without the vector tier. The arch macro is set on every
+    # tier copy so the DispatchStub layout stays identical across TUs.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/Modules/FindVSX.cmake)
+    foreach(KERNEL_SRC ${TP_CPU_KERNEL_SRCS})
+        get_filename_component(KERNEL_NAME ${KERNEL_SRC} NAME_WE)
+        add_library(p10_kernel_default_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
+        set_target_properties(p10_kernel_default_${KERNEL_NAME} PROPERTIES
+            POSITION_INDEPENDENT_CODE ON)
+        target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
+            P10_EXPORTS CPU_CAPABILITY_DEFAULT CPU_CAPABILITY=DEFAULT
+            HAVE_VSX_CPU_DEFINITION)
+        target_include_directories(p10_kernel_default_${KERNEL_NAME} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
+        target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
+            ${BLAS_COMPILE_DEFS})
+        if(KERNEL_NAME STREQUAL "ComplexKernels")
+            target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
+                TP_COMPLEX_KERNELS_DEFINE_DISPATCH)
+        endif()
+        add_dependencies(p10_kernel_default_${KERNEL_NAME} generate_code)
+        list(APPEND TP_CPU_KERNEL_DEFAULT_OBJS $<TARGET_OBJECTS:p10_kernel_default_${KERNEL_NAME}>)
+        if(TP_CXX_VSX_FOUND)
+            add_library(p10_kernel_vsx_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
+            set_target_properties(p10_kernel_vsx_${KERNEL_NAME} PROPERTIES
+                POSITION_INDEPENDENT_CODE ON)
+            target_compile_definitions(p10_kernel_vsx_${KERNEL_NAME} PRIVATE
+                P10_EXPORTS CPU_CAPABILITY_VSX CPU_CAPABILITY=VSX HAVE_VSX_CPU_DEFINITION)
+            target_compile_options(p10_kernel_vsx_${KERNEL_NAME} PRIVATE ${TP_CXX_VSX_FLAGS})
+            if(KERNEL_NAME STREQUAL "ComplexKernels")
+                target_compile_definitions(p10_kernel_vsx_${KERNEL_NAME} PRIVATE
+                    TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)
+            endif()
+            target_include_directories(p10_kernel_vsx_${KERNEL_NAME} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
+            target_compile_definitions(p10_kernel_vsx_${KERNEL_NAME} PRIVATE
+                ${BLAS_COMPILE_DEFS})
+            add_dependencies(p10_kernel_vsx_${KERNEL_NAME} generate_code)
+            list(APPEND TP_CPU_KERNEL_VSX_OBJS $<TARGET_OBJECTS:p10_kernel_vsx_${KERNEL_NAME}>)
+        endif()
+    endforeach()
+    list(APPEND P10_SOURCES ${TP_CPU_KERNEL_DEFAULT_OBJS})
+    if(TP_CXX_VSX_FOUND)
+        list(APPEND P10_SOURCES ${TP_CPU_KERNEL_VSX_OBJS})
+    endif()
+elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "s390x|S390")
+    # s390x: one DEFAULT copy plus one ZVECTOR copy (the vector extension).
+    # At runtime the ZVECTOR tier requires the VXE facility, probed via
+    # AT_HWCAP by the dispatch layer. The arch macro is set on every tier
+    # copy so the DispatchStub layout stays identical across TUs.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/Modules/FindZVECTOR.cmake)
+    foreach(KERNEL_SRC ${TP_CPU_KERNEL_SRCS})
+        get_filename_component(KERNEL_NAME ${KERNEL_SRC} NAME_WE)
+        add_library(p10_kernel_default_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
+        set_target_properties(p10_kernel_default_${KERNEL_NAME} PROPERTIES
+            POSITION_INDEPENDENT_CODE ON)
+        target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
+            P10_EXPORTS CPU_CAPABILITY_DEFAULT CPU_CAPABILITY=DEFAULT
+            HAVE_ZVECTOR_CPU_DEFINITION)
+        target_include_directories(p10_kernel_default_${KERNEL_NAME} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
+        target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
+            ${BLAS_COMPILE_DEFS})
+        if(KERNEL_NAME STREQUAL "ComplexKernels")
+            target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
+                TP_COMPLEX_KERNELS_DEFINE_DISPATCH)
+        endif()
+        add_dependencies(p10_kernel_default_${KERNEL_NAME} generate_code)
+        list(APPEND TP_CPU_KERNEL_DEFAULT_OBJS $<TARGET_OBJECTS:p10_kernel_default_${KERNEL_NAME}>)
+        if(TP_CXX_ZVECTOR_FOUND)
+            add_library(p10_kernel_zvector_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
+            set_target_properties(p10_kernel_zvector_${KERNEL_NAME} PROPERTIES
+                POSITION_INDEPENDENT_CODE ON)
+            target_compile_definitions(p10_kernel_zvector_${KERNEL_NAME} PRIVATE
+                P10_EXPORTS CPU_CAPABILITY_ZVECTOR CPU_CAPABILITY=ZVECTOR HAVE_ZVECTOR_CPU_DEFINITION)
+            target_compile_options(p10_kernel_zvector_${KERNEL_NAME} PRIVATE ${TP_CXX_ZVECTOR_FLAGS})
+            if(KERNEL_NAME STREQUAL "ComplexKernels")
+                target_compile_definitions(p10_kernel_zvector_${KERNEL_NAME} PRIVATE
+                    TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)
+            endif()
+            target_include_directories(p10_kernel_zvector_${KERNEL_NAME} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
+            target_compile_definitions(p10_kernel_zvector_${KERNEL_NAME} PRIVATE
+                ${BLAS_COMPILE_DEFS})
+            add_dependencies(p10_kernel_zvector_${KERNEL_NAME} generate_code)
+            list(APPEND TP_CPU_KERNEL_ZVECTOR_OBJS $<TARGET_OBJECTS:p10_kernel_zvector_${KERNEL_NAME}>)
+        endif()
+    endforeach()
+    list(APPEND P10_SOURCES ${TP_CPU_KERNEL_DEFAULT_OBJS})
+    if(TP_CXX_ZVECTOR_FOUND)
+        list(APPEND P10_SOURCES ${TP_CPU_KERNEL_ZVECTOR_OBJS})
+    endif()
+elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
+    # aarch64: one DEFAULT copy plus SVE256/SVE128 copies compiled against
+    # fixed vector lengths. The runtime tier is selected from the SVE vector
+    # length reported by the kernel; bf16 support is required by the SVE
+    # kernels and gates both compile-time probe and runtime selection. The
+    # arch macro is set on every tier copy so the DispatchStub layout stays
+    # identical across TUs.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/Modules/FindARM.cmake)
+    foreach(KERNEL_SRC ${TP_CPU_KERNEL_SRCS})
+        get_filename_component(KERNEL_NAME ${KERNEL_SRC} NAME_WE)
+        add_library(p10_kernel_default_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
+        set_target_properties(p10_kernel_default_${KERNEL_NAME} PROPERTIES
+            POSITION_INDEPENDENT_CODE ON)
+        target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
+            P10_EXPORTS CPU_CAPABILITY_DEFAULT CPU_CAPABILITY=DEFAULT
+            HAVE_SVE_CPU_DEFINITION)
+        target_include_directories(p10_kernel_default_${KERNEL_NAME} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
+        target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
+            ${BLAS_COMPILE_DEFS})
+        if(KERNEL_NAME STREQUAL "ComplexKernels")
+            target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
+                TP_COMPLEX_KERNELS_DEFINE_DISPATCH)
+        endif()
+        add_dependencies(p10_kernel_default_${KERNEL_NAME} generate_code)
+        list(APPEND TP_CPU_KERNEL_DEFAULT_OBJS $<TARGET_OBJECTS:p10_kernel_default_${KERNEL_NAME}>)
+        if(TP_CXX_SVE256_FOUND)
+            foreach(SVE_VL 256 128)
+                add_library(p10_kernel_sve${SVE_VL}_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
+                set_target_properties(p10_kernel_sve${SVE_VL}_${KERNEL_NAME} PROPERTIES
+                    POSITION_INDEPENDENT_CODE ON)
+                target_compile_definitions(p10_kernel_sve${SVE_VL}_${KERNEL_NAME} PRIVATE
+                    P10_EXPORTS CPU_CAPABILITY_SVE${SVE_VL} CPU_CAPABILITY=SVE${SVE_VL}
+                    HAVE_SVE_CPU_DEFINITION)
+                target_compile_options(p10_kernel_sve${SVE_VL}_${KERNEL_NAME} PRIVATE
+                    ${TP_CXX_SVE${SVE_VL}_FLAGS})
+                if(KERNEL_NAME STREQUAL "ComplexKernels")
+                    target_compile_definitions(p10_kernel_sve${SVE_VL}_${KERNEL_NAME} PRIVATE
+                        TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)
+                endif()
+                target_include_directories(p10_kernel_sve${SVE_VL}_${KERNEL_NAME} PRIVATE
+                    ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
+                target_compile_definitions(p10_kernel_sve${SVE_VL}_${KERNEL_NAME} PRIVATE
+                    ${BLAS_COMPILE_DEFS})
+                add_dependencies(p10_kernel_sve${SVE_VL}_${KERNEL_NAME} generate_code)
+                list(APPEND TP_CPU_KERNEL_SVE${SVE_VL}_OBJS $<TARGET_OBJECTS:p10_kernel_sve${SVE_VL}_${KERNEL_NAME}>)
+            endforeach()
+        endif()
+    endforeach()
+    list(APPEND P10_SOURCES ${TP_CPU_KERNEL_DEFAULT_OBJS})
+    if(TP_CXX_SVE256_FOUND)
+        list(APPEND P10_SOURCES ${TP_CPU_KERNEL_SVE256_OBJS} ${TP_CPU_KERNEL_SVE128_OBJS})
+    endif()
 else()
     # Targets without the x86 ISA tiers still need one copy of each kernel, or
     # the DispatchStub DEFAULT slots stay empty and the ops report a missing
@@ -505,6 +655,12 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
     if(TP_CXX_AVX512_FOUND)
         target_compile_definitions(p10 PUBLIC HAVE_AVX512_CPU_DEFINITION)
     endif()
+elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(powerpc|ppc)64" AND TP_CXX_VSX_FOUND)
+    target_compile_definitions(p10 PUBLIC HAVE_VSX_CPU_DEFINITION)
+elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "s390x|S390" AND TP_CXX_ZVECTOR_FOUND)
+    target_compile_definitions(p10 PUBLIC HAVE_ZVECTOR_CPU_DEFINITION)
+elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64" AND TP_CXX_SVE256_FOUND)
+    target_compile_definitions(p10 PUBLIC HAVE_SVE_CPU_DEFINITION)
 endif()
 if(USE_CUDA)
     # The native aligned flash path consumes only the standalone CUTE/CUTLASS

@@ -7,6 +7,7 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "Exception.h"
 #include "cpu/vec/intrinsics.h"
 
 namespace tensorplay {
@@ -14,6 +15,43 @@ namespace cpu {
 
 static CPUCapability compute_cpu_capability() {
   if (const char* envar = std::getenv("TP_CPU_CAPABILITY")) {
+#ifdef HAVE_VSX_CPU_DEFINITION
+    if (std::strcmp(envar, "vsx") == 0) {
+      return CPUCapability::VSX;
+    }
+#elif defined(HAVE_ZVECTOR_CPU_DEFINITION)
+    if (std::strcmp(envar, "zvector") == 0) {
+      return CPUCapability::ZVECTOR;
+    }
+#elif defined(HAVE_SVE_CPU_DEFINITION)
+    int sve_vl = tp_cpu_sve_vector_length_bits();
+    if (sve_vl > 0) {
+      if (std::strcmp(envar, "sve256") == 0) {
+        if (sve_vl == 256) {
+          return CPUCapability::SVE256;
+        }
+        TP_WARN("SVE256 capability not available on hardware. Falling back to DEFAULT");
+        return CPUCapability::DEFAULT;
+      }
+      if (std::strcmp(envar, "sve128") == 0) {
+        if (sve_vl == 128) {
+          return CPUCapability::SVE128;
+        }
+        TP_WARN("SVE128 capability not available on hardware. Falling back to DEFAULT");
+        return CPUCapability::DEFAULT;
+      }
+      if (std::strcmp(envar, "sve") == 0) {
+        if (sve_vl == 256) {
+          return CPUCapability::SVE256;
+        }
+        if (sve_vl == 128) {
+          return CPUCapability::SVE128;
+        }
+        TP_WARN("SVE capability not available on hardware. Falling back to DEFAULT");
+        return CPUCapability::DEFAULT;
+      }
+    }
+#else
 #ifdef HAVE_AVX512_CPU_DEFINITION
     if (std::strcmp(envar, "avx512") == 0) {
       return CPUCapability::AVX512;
@@ -24,10 +62,31 @@ static CPUCapability compute_cpu_capability() {
       return CPUCapability::AVX2;
     }
 #endif
+#endif
     if (std::strcmp(envar, "default") == 0) {
       return CPUCapability::DEFAULT;
     }
+    TP_WARN("ignoring invalid value for TP_CPU_CAPABILITY: ", envar);
   }
+
+#ifdef HAVE_ZVECTOR_CPU_DEFINITION
+  // vxe is needed for fp32 vector instructions
+  if (tp_cpu_supports_zvector()) {
+    return CPUCapability::ZVECTOR;
+  }
+#endif
+
+#if defined(__linux__) && defined(HAVE_SVE_CPU_DEFINITION)
+  if (tp_cpu_has_arm_sve_bf16()) {
+    int sve_vl = tp_cpu_sve_vector_length_bits();
+    if (sve_vl == 256) {
+      return CPUCapability::SVE256;
+    }
+    if (sve_vl == 128) {
+      return CPUCapability::SVE128;
+    }
+  }
+#endif
 
 #ifdef HAVE_AVX512_CPU_DEFINITION
   // GCC supports some AVX512 intrinsics such as _mm512_set_epi16 only in
@@ -44,7 +103,14 @@ static CPUCapability compute_cpu_capability() {
   }
 #endif
 
+#ifdef HAVE_VSX_CPU_DEFINITION
+  // Every PowerPC target this library supports executes the VSX vector
+  // facilities, and the compiler gates the tier on -mvsx alone; there is no
+  // further runtime probe to run, so the capability is unconditional.
+  return CPUCapability::VSX;
+#else
   return CPUCapability::DEFAULT;
+#endif
 }
 
 CPUCapability get_cpu_capability() {
@@ -61,6 +127,16 @@ DispatchResult CPUDispatchStubImpl::try_get_call_ptr(
 #ifdef HAVE_AVX2_CPU_DEFINITION
   , void *AVX2
 #endif
+#ifdef HAVE_VSX_CPU_DEFINITION
+  , void *VSX
+#endif
+#ifdef HAVE_ZVECTOR_CPU_DEFINITION
+  , void *ZVECTOR
+#endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+  , void *SVE128
+  , void *SVE256
+#endif
 ) {
   switch (device_type) {
     case DeviceType::CPU: {
@@ -75,6 +151,16 @@ DispatchResult CPUDispatchStubImpl::try_get_call_ptr(
 #endif
 #ifdef HAVE_AVX2_CPU_DEFINITION
           , AVX2
+#endif
+#ifdef HAVE_VSX_CPU_DEFINITION
+          , VSX
+#endif
+#ifdef HAVE_ZVECTOR_CPU_DEFINITION
+          , ZVECTOR
+#endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+          , SVE128
+          , SVE256
 #endif
         );
         if (!std::holds_alternative<ErrorType>(result)) {
@@ -98,6 +184,16 @@ void* CPUDispatchStubImpl::get_call_ptr(
 #ifdef HAVE_AVX2_CPU_DEFINITION
   , void *AVX2
 #endif
+#ifdef HAVE_VSX_CPU_DEFINITION
+  , void *VSX
+#endif
+#ifdef HAVE_ZVECTOR_CPU_DEFINITION
+  , void *ZVECTOR
+#endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+  , void *SVE128
+  , void *SVE256
+#endif
 ) {
   auto result = try_get_call_ptr(
       device_type,
@@ -109,6 +205,20 @@ void* CPUDispatchStubImpl::get_call_ptr(
 #ifdef HAVE_AVX2_CPU_DEFINITION
       ,
       AVX2
+#endif
+#ifdef HAVE_VSX_CPU_DEFINITION
+      ,
+      VSX
+#endif
+#ifdef HAVE_ZVECTOR_CPU_DEFINITION
+      ,
+      ZVECTOR
+#endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+      ,
+      SVE128
+      ,
+      SVE256
 #endif
   );
   if (std::holds_alternative<ErrorType>(result)) {
@@ -133,6 +243,16 @@ DispatchResult CPUDispatchStubImpl::try_choose_cpu_impl(
 #ifdef HAVE_AVX2_CPU_DEFINITION
     , void *AVX2
 #endif
+#ifdef HAVE_VSX_CPU_DEFINITION
+    , void *VSX
+#endif
+#ifdef HAVE_ZVECTOR_CPU_DEFINITION
+    , void *ZVECTOR
+#endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+    , void *SVE128
+    , void *SVE256
+#endif
   ){
 
   auto capability = static_cast<int>(get_cpu_capability());
@@ -155,6 +275,30 @@ DispatchResult CPUDispatchStubImpl::try_choose_cpu_impl(
     return AVX2 != nullptr ? DispatchResult(AVX2) : ErrorType::MissingDeviceKernel;
   }
 #endif
+#ifdef HAVE_VSX_CPU_DEFINITION
+  if (capability >= static_cast<int>(CPUCapability::VSX)) {
+    return VSX != nullptr ? DispatchResult(VSX) : ErrorType::MissingDeviceKernel;
+  }
+#endif
+#ifdef HAVE_ZVECTOR_CPU_DEFINITION
+  if (capability >= static_cast<int>(CPUCapability::ZVECTOR)) {
+    return ZVECTOR != nullptr ? DispatchResult(ZVECTOR) : ErrorType::MissingDeviceKernel;
+  }
+#endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+  if (capability == static_cast<int>(CPUCapability::SVE128)) {
+    if (__builtin_expect(!SVE128, 0)) {
+      return DEFAULT != nullptr ? DispatchResult(DEFAULT) : ErrorType::MissingDeviceKernel;
+    }
+    return DispatchResult(SVE128);
+  }
+  if (capability == static_cast<int>(CPUCapability::SVE256)) {
+    if (__builtin_expect(!SVE256, 0)) {
+      return DEFAULT != nullptr ? DispatchResult(DEFAULT) : ErrorType::MissingDeviceKernel;
+    }
+    return DispatchResult(SVE256);
+  }
+#endif
   return DEFAULT != nullptr ? DispatchResult(DEFAULT) : ErrorType::MissingDeviceKernel;
 }
 
@@ -165,6 +309,16 @@ void* CPUDispatchStubImpl::choose_cpu_impl(
 #endif
 #ifdef HAVE_AVX2_CPU_DEFINITION
   , void *AVX2
+#endif
+#ifdef HAVE_VSX_CPU_DEFINITION
+  , void *VSX
+#endif
+#ifdef HAVE_ZVECTOR_CPU_DEFINITION
+  , void *ZVECTOR
+#endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+  , void *SVE128
+  , void *SVE256
 #endif
 ) {
   auto capability = static_cast<int>(get_cpu_capability());
@@ -191,6 +345,42 @@ void* CPUDispatchStubImpl::choose_cpu_impl(
       throw std::runtime_error("DispatchStub: missing AVX2 kernel");
     }
     return AVX2;
+  }
+#endif
+#ifdef HAVE_VSX_CPU_DEFINITION
+  if (capability >= static_cast<int>(CPUCapability::VSX)) {
+    if (VSX == nullptr) {
+      throw std::runtime_error("DispatchStub: missing VSX kernel");
+    }
+    return VSX;
+  }
+#endif
+#ifdef HAVE_ZVECTOR_CPU_DEFINITION
+  if (capability >= static_cast<int>(CPUCapability::ZVECTOR)) {
+    if (ZVECTOR == nullptr) {
+      throw std::runtime_error("DispatchStub: missing ZVECTOR kernel");
+    }
+    return ZVECTOR;
+  }
+#endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+  if (capability == static_cast<int>(CPUCapability::SVE128)) {
+    if (SVE128 == nullptr) {
+      if (DEFAULT == nullptr) {
+        throw std::runtime_error("DispatchStub: missing default kernel");
+      }
+      return DEFAULT;
+    }
+    return SVE128;
+  }
+  if (capability == static_cast<int>(CPUCapability::SVE256)) {
+    if (SVE256 == nullptr) {
+      if (DEFAULT == nullptr) {
+        throw std::runtime_error("DispatchStub: missing default kernel");
+      }
+      return DEFAULT;
+    }
+    return SVE256;
   }
 #endif
   if (DEFAULT == nullptr) {
