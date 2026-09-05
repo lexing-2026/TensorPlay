@@ -3,6 +3,6 @@ cmake<4.0
 ninja
 pybind11
 PyYAML
-packaging>=24.2
+packaging>=26.3
 build
 pytest
