@@ -10,7 +10,7 @@ namespace tensorplay {
 // routes a mixed-device op by the first tensor argument, so reflected scalar
 // ops pass the tensor operand's device here).
 inline Tensor scalar_to_tensor(const Scalar& s, Device device = Device(DeviceType::CPU)) {
-  return Tensor::full({}, s, s.type(), device);
+  return Tensor::full({}, s, s.dtype(), device);
 }
 
 namespace native {

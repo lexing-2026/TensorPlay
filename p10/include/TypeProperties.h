@@ -93,7 +93,7 @@ inline ResultTypeState update_result_type_state(const Tensor& tensor,
 inline ResultTypeState update_result_type_state(const Scalar& scalar,
                                                 const ResultTypeState& in_state) {
     ResultTypeState new_state = in_state;
-    ScalarType current = scalar.type();
+    ScalarType current = scalar.dtype();
     if (isComplexType(current)) {
         current = globalContext().defaultComplexDType();
     } else if (isFloatingType(current)) {
