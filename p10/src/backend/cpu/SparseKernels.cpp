@@ -152,7 +152,7 @@ Tensor coalesce_sparse_cpu(const Tensor& self) {
 }
 
 Tensor sparse_mask_cpu(const Tensor& dense, const Tensor& mask) {
-    if (!mask.is_sparse()) TP_THROW(RuntimeError, "sparse_mask(): mask must be sparse COO");
+    if (!mask.is_sparse()) TP_THROW(RuntimeError, "sparse_mask(): mask must be sparse");
     if (dense.device() != mask.device()) {
         TP_THROW(DeviceMismatchError,
                  "sparse_mask(): dense and mask must be on the same device");
@@ -161,13 +161,14 @@ Tensor sparse_mask_cpu(const Tensor& dense, const Tensor& mask) {
         TP_THROW(RuntimeError,
                  "sparse_mask(): operands have incompatible sizes; self and mask must have the same shape");
     }
-    // it does not coalesce an uncoalesced mask or change its duplicate/order
+    Tensor coo_mask = mask.is_sparse_csr() ? to_sparse_coo_cpu(mask) : mask;
+    // It does not coalesce an uncoalesced mask or change its duplicate/order
     // semantics.  SparseAdam passes a coalesced gradient when it needs the
     // canonical form explicitly.
-    Tensor indices = mask._indices().contiguous();
-    const int64_t sparse_dim = mask.sparse_dim();
+    Tensor indices = coo_mask._indices().contiguous();
+    const int64_t sparse_dim = coo_mask.sparse_dim();
     const int64_t nnz = indices.size(1);
-    const std::vector<int64_t> dense_shape = dense_shape_for(mask);
+    const std::vector<int64_t> dense_shape = dense_shape_for(coo_mask);
     const int64_t dense_numel = product(dense_shape);
     Tensor dense_contiguous = dense.is_contiguous() ? dense : dense.contiguous();
 
@@ -204,7 +205,7 @@ Tensor sparse_mask_cpu(const Tensor& dense, const Tensor& mask) {
 
     return Tensor::make_sparse_coo_tensor(
         indices, values, static_cast<std::vector<int64_t>>(mask.shape()),
-        mask.is_coalesced());
+        coo_mask.is_coalesced());
 }
 
 Tensor& add_sparse_to_dense_cpu(Tensor& dense, const Tensor& sparse, Scalar alpha) {

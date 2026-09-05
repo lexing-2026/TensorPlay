@@ -680,7 +680,7 @@ Tensor coalesce_sparse_cuda(const Tensor& self) {
 
 Tensor sparse_mask_cuda(const Tensor& dense, const Tensor& mask) {
     if (!mask.is_sparse()) {
-        TP_THROW(RuntimeError, "sparse_mask(): mask must be sparse COO");
+        TP_THROW(RuntimeError, "sparse_mask(): mask must be sparse");
     }
     if (dense.device() != mask.device()) {
         TP_THROW(DeviceMismatchError,
@@ -690,9 +690,9 @@ Tensor sparse_mask_cuda(const Tensor& dense, const Tensor& mask) {
         TP_THROW(RuntimeError,
                  "sparse_mask(): operands have incompatible sizes; self and mask must have the same shape");
     }
-    // Preserve the mask's COO ordering and duplicate entries.  This is the
-    // callers that explicitly request it.
-    Tensor canonical_mask = mask;
+    // Preserve a COO mask's ordering and duplicate entries.  Compressed masks
+    // are expanded once so the gather kernel has one coordinate representation.
+    Tensor canonical_mask = mask.is_sparse_csr() ? to_sparse_coo_cuda(mask) : mask;
     Tensor dense_contiguous = dense.is_contiguous() ? dense : dense.contiguous();
     Tensor indices = canonical_mask._indices().contiguous();
     const int64_t nnz = indices.size(1);
@@ -710,7 +710,7 @@ Tensor sparse_mask_cuda(const Tensor& dense, const Tensor& mask) {
     if (output_numel == 0) {
         return Tensor::make_sparse_coo_tensor(
             indices, values, static_cast<std::vector<int64_t>>(mask.shape()),
-            mask.is_coalesced());
+            canonical_mask.is_coalesced());
     }
 
     SparseGatherInfo info = make_gather_info(dense_contiguous, canonical_mask);
@@ -725,7 +725,7 @@ Tensor sparse_mask_cuda(const Tensor& dense, const Tensor& mask) {
     checkCuda(cudaGetLastError(), "CUDA sparse_mask gather kernel");
     return Tensor::make_sparse_coo_tensor(
         indices, values, static_cast<std::vector<int64_t>>(mask.shape()),
-        mask.is_coalesced());
+        canonical_mask.is_coalesced());
 }
 
 Tensor& add_sparse_to_dense_cuda(Tensor& dense, const Tensor& sparse, Scalar alpha) {
