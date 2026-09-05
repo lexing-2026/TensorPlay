@@ -287,7 +287,7 @@ jobs:
 
       - name: Upload CPU performance logs
         if: ${{ always() && inputs.run_cpu_benchmarks && inputs.cuda == 'cpu' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.build_name }}-performance
           path: benchmark-results/
