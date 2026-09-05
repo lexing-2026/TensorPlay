@@ -120,6 +120,7 @@ set(P10_SOURCES
     src/backend/composite/Histogram.cpp
     src/backend/composite/Integration.cpp
     src/backend/composite/Itertools.cpp
+    src/backend/composite/AffineGrid.cpp
     src/backend/composite/Linear.cpp
     src/backend/composite/LinearAlgebra.cpp
     src/backend/composite/Pointwise.cpp
@@ -373,14 +374,14 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
         # (add_compile_definitions), so every tier sees the same DispatchStub
         # layout; only CPU_CAPABILITY differs per copy.
         target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
-            CPU_CAPABILITY_DEFAULT CPU_CAPABILITY=DEFAULT
+            P10_EXPORTS CPU_CAPABILITY_DEFAULT CPU_CAPABILITY=DEFAULT
             HAVE_AVX2_CPU_DEFINITION)
         if(TP_CXX_AVX512_FOUND)
             target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
                 HAVE_AVX512_CPU_DEFINITION)
         endif()
         target_include_directories(p10_kernel_default_${KERNEL_NAME} PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR})
+            ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
         target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
             ${BLAS_COMPILE_DEFS})
         # ComplexKernels owns the DispatchStub definitions.  Only its DEFAULT
@@ -395,7 +396,7 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
         set_target_properties(p10_kernel_avx2_${KERNEL_NAME} PROPERTIES
             POSITION_INDEPENDENT_CODE ON)
         target_compile_definitions(p10_kernel_avx2_${KERNEL_NAME} PRIVATE
-            CPU_CAPABILITY_AVX2 CPU_CAPABILITY=AVX2 HAVE_AVX2_CPU_DEFINITION)
+            P10_EXPORTS CPU_CAPABILITY_AVX2 CPU_CAPABILITY=AVX2 HAVE_AVX2_CPU_DEFINITION)
         if(TP_CXX_AVX512_FOUND)
             target_compile_definitions(p10_kernel_avx2_${KERNEL_NAME} PRIVATE
                 HAVE_AVX512_CPU_DEFINITION)
@@ -406,7 +407,7 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
                 TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)
         endif()
         target_include_directories(p10_kernel_avx2_${KERNEL_NAME} PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR})
+            ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
         target_compile_definitions(p10_kernel_avx2_${KERNEL_NAME} PRIVATE
             ${BLAS_COMPILE_DEFS})
         add_dependencies(p10_kernel_avx2_${KERNEL_NAME} generate_code)
@@ -417,7 +418,7 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
             set_target_properties(p10_kernel_avx512_${KERNEL_NAME} PROPERTIES
                 POSITION_INDEPENDENT_CODE ON)
             target_compile_definitions(p10_kernel_avx512_${KERNEL_NAME} PRIVATE
-                CPU_CAPABILITY_AVX512 CPU_CAPABILITY=AVX512 HAVE_AVX512_CPU_DEFINITION HAVE_AVX2_CPU_DEFINITION)
+                P10_EXPORTS CPU_CAPABILITY_AVX512 CPU_CAPABILITY=AVX512 HAVE_AVX512_CPU_DEFINITION HAVE_AVX2_CPU_DEFINITION)
             # Same flag set as Codegen.cmake's AVX512 capability entry.
             target_compile_options(p10_kernel_avx512_${KERNEL_NAME} PRIVATE
                 -mavx512f -mavx512bw -mavx512vl -mavx512dq -mfma)
@@ -426,7 +427,7 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
                     TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)
             endif()
             target_include_directories(p10_kernel_avx512_${KERNEL_NAME} PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR})
+                ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
             target_compile_definitions(p10_kernel_avx512_${KERNEL_NAME} PRIVATE
                 ${BLAS_COMPILE_DEFS})
             add_dependencies(p10_kernel_avx512_${KERNEL_NAME} generate_code)
@@ -448,13 +449,13 @@ else()
         set_target_properties(p10_kernel_default_${KERNEL_NAME} PROPERTIES
             POSITION_INDEPENDENT_CODE ON)
         target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
-            CPU_CAPABILITY_DEFAULT CPU_CAPABILITY=DEFAULT)
+            P10_EXPORTS CPU_CAPABILITY_DEFAULT CPU_CAPABILITY=DEFAULT)
         if(KERNEL_NAME STREQUAL "ComplexKernels")
             target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
                 TP_COMPLEX_KERNELS_DEFINE_DISPATCH)
         endif()
         target_include_directories(p10_kernel_default_${KERNEL_NAME} PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR})
+            ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
         target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
             ${BLAS_COMPILE_DEFS})
         add_dependencies(p10_kernel_default_${KERNEL_NAME} generate_code)
