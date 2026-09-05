@@ -11,6 +11,7 @@
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "Parallel.h"
+#include "Quantizer.h"
 #include "ShapeAlignKernels.h"
 #include "tensorplay/ops/TensorRedispatchGenerated.h"
 
@@ -206,6 +207,18 @@ void check_repeat_numel(const std::vector<int64_t>& target) {
         }
         total *= extent;
     }
+}
+
+Tensor make_repeat_output(const Tensor& self,
+                          const std::vector<int64_t>& target) {
+    if (!isQuantizedType(self.dtype())) {
+        return Tensor::empty(target, self.dtype(), self.device());
+    }
+    quantized::require_quantized(self, "repeat");
+    Tensor codes = Tensor::empty(target, underlying_storage_type(self.dtype()),
+                                 self.device());
+    return quantized::make_qtensor(codes, quantized::quantizer_of(self),
+                                   self.dtype());
 }
 
 void check_repeat_args(const Tensor& self, const std::vector<int64_t>& repeats,
@@ -660,7 +673,7 @@ Tensor tpsa_repeat_cpu(const Tensor& self, const std::vector<int64_t>& repeats) 
     bool zero = false;
     check_repeat_args(self, repeats, padded, padded_strides, target, zero);
 
-    Tensor out = Tensor::empty(target, self.dtype(), self.device());
+    Tensor out = make_repeat_output(self, target);
     const int64_t total = out.numel();
     if (zero || total == 0) return out;
 
@@ -686,6 +699,7 @@ Tensor tpsa_repeat_cpu(const Tensor& self, const std::vector<int64_t>& repeats) 
         }
         switch (self.dtype()) {
             TENSORPLAY_FORALL_SCALAR_TYPES(TP_REPEAT_CASE)
+            TENSORPLAY_FORALL_QINT_TYPES(TP_REPEAT_CASE)
             default: TP_THROW(TypeError, "repeat: unsupported dtype");
         }
 #undef TP_REPEAT_CASE
