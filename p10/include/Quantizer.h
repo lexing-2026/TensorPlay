@@ -68,6 +68,9 @@ public:
 
     virtual QScheme qscheme() const = 0;
     DType scalar_type() const { return scalar_type_; }
+    virtual Tensor quantize(const Tensor& tensor) = 0;
+    virtual Tensor dequantize(const Tensor& tensor) = 0;
+    virtual Tensor& dequantize_out(Tensor& out, const Tensor& tensor) = 0;
     virtual bool equalTo(const QuantizerPtr& other) const = 0;
 
     virtual double scale() const { return 1.0; }
@@ -84,6 +87,9 @@ class P10_API UnknownQuantizer final : public Quantizer {
 public:
     explicit UnknownQuantizer(DType scalar_type) : Quantizer(scalar_type) {}
 
+    Tensor quantize(const Tensor& tensor) override;
+    Tensor dequantize(const Tensor& tensor) override;
+    Tensor& dequantize_out(Tensor& out, const Tensor& tensor) override;
     QScheme qscheme() const override {
         TP_THROW(RuntimeError, "an unknown quantizer has no quantization scheme");
     }
@@ -117,6 +123,9 @@ public:
           scale_(scale),
           zero_point_(zero_point) {}
 
+    Tensor quantize(const Tensor& tensor) override;
+    Tensor dequantize(const Tensor& tensor) override;
+    Tensor& dequantize_out(Tensor& out, const Tensor& tensor) override;
     QScheme qscheme() const override { return kPerTensorAffine; }
     double scale() const override { return scale_; }
     int64_t zero_point() const override { return zero_point_; }
@@ -136,6 +145,9 @@ public:
           zero_points_(std::move(zero_points)),
           axis_(axis) {}
 
+    Tensor quantize(const Tensor& tensor) override;
+    Tensor dequantize(const Tensor& tensor) override;
+    Tensor& dequantize_out(Tensor& out, const Tensor& tensor) override;
     QScheme qscheme() const override { return kPerChannelAffine; }
     Tensor scales() const override { return scales_; }
     Tensor zero_points() const override { return zero_points_; }
@@ -156,6 +168,9 @@ public:
         : PerChannelAffineQuantizer(scalar_type, std::move(scales),
                                     std::move(zero_points), axis) {}
 
+    Tensor quantize(const Tensor& tensor) override;
+    Tensor dequantize(const Tensor& tensor) override;
+    Tensor& dequantize_out(Tensor& out, const Tensor& tensor) override;
     QScheme qscheme() const override { return kPerChannelAffineFloatQParams; }
     bool equalTo(const QuantizerPtr& other) const override;
 };

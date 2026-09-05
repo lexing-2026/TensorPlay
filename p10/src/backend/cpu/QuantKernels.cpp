@@ -1779,30 +1779,10 @@ Tensor int_repr_cpu(const Tensor& self) {
 }
 
 Tensor dequantize_self_cpu(const Tensor& self) {
-    // Non-quantized tensors pass through unchanged.
     if (!quantized::is_quantized(self)) {
         return self;
     }
-    const auto q = quantized::quantizer_of(self);
-    if (isPerChannelQScheme(q->qscheme())) {
-        return dequantize_per_channel_cpu(self, q->scales(),
-                                          q->zero_points(), q->axis());
-    }
-    switch (self.dtype()) {
-        case DType::QInt8:
-            return dequantize_per_tensor_cpu(self, q->scale(),
-                                             q->zero_point());
-        case DType::QUInt8:
-            return dequantize_per_tensor_quint8_cpu(self, q->scale(),
-                                                    q->zero_point());
-        case DType::QInt32:
-            return dequantize_per_tensor_qint32_cpu(self, q->scale(),
-                                                    q->zero_point());
-        default:
-            TP_THROW(TypeError,
-                     std::string("dequantize(): unsupported quantized dtype ") +
-                         toString(self.dtype()));
-    }
+    return quantized::quantizer_of(self)->dequantize(self);
 }
 
 namespace {
