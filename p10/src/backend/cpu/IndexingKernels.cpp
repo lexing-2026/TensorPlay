@@ -325,6 +325,83 @@ Tensor cumsum_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
     return result;
 }
 
+namespace {
+
+template <typename index_t>
+Tensor repeat_interleave_indices_cpu_impl(
+        const Tensor& repeats, std::optional<int64_t> output_size) {
+    Tensor rep = repeats.contiguous();
+    const int64_t size = rep.numel();
+    if (size == 0) {
+        return Tensor::empty({0}, repeats.dtype(), repeats.device());
+    }
+
+    const index_t* repeat_ptr = rep.data_ptr<index_t>();
+    if (!output_size.has_value()) {
+        for (int64_t i = 0; i < size; ++i) {
+            if (repeat_ptr[i] < 0) {
+                TP_THROW(RuntimeError, "repeats can not be negative");
+            }
+        }
+    }
+
+    Tensor cumsum = cumsum_cpu(rep, 0, DType::Int64);
+    const int64_t* cumsum_ptr = cumsum.data_ptr<int64_t>();
+    const int64_t required_size = cumsum_ptr[size - 1];
+    const int64_t result_size = output_size.value_or(required_size);
+    if (result_size != required_size) {
+        TP_THROW(RuntimeError, "allocated size does not match required size");
+    }
+
+    Tensor result = Tensor::empty(
+        {result_size}, repeats.dtype(), repeats.device());
+    index_t* result_ptr = result.data_ptr<index_t>();
+    parallel_for(0, size, 1, [&](int64_t begin, int64_t end_index) {
+        for (int64_t i = begin; i < end_index; ++i) {
+            const int64_t end = cumsum_ptr[i];
+            const int64_t count = static_cast<int64_t>(repeat_ptr[i]);
+            const int64_t start = end - count;
+            if (count < 0 || start < 0 || end > result_size) {
+                TP_THROW(RuntimeError, "repeats can not be negative");
+            }
+            for (int64_t j = start; j < end; ++j) {
+                result_ptr[j] = static_cast<index_t>(i);
+            }
+        }
+    });
+    return result;
+}
+
+} // anonymous namespace
+
+Tensor repeat_interleave_indices_cpu(
+        const Tensor& repeats, std::optional<int64_t> output_size) {
+    if (repeats.dim() != 1) {
+        TP_THROW(RuntimeError,
+                 "repeat_interleave only accepts a 1D vector as repeats");
+    }
+    switch (repeats.dtype()) {
+        case DType::UInt8:
+            return repeat_interleave_indices_cpu_impl<uint8_t>(
+                repeats, output_size);
+        case DType::Int8:
+            return repeat_interleave_indices_cpu_impl<int8_t>(
+                repeats, output_size);
+        case DType::Int16:
+            return repeat_interleave_indices_cpu_impl<int16_t>(
+                repeats, output_size);
+        case DType::Int32:
+            return repeat_interleave_indices_cpu_impl<int32_t>(
+                repeats, output_size);
+        case DType::Int64:
+            return repeat_interleave_indices_cpu_impl<int64_t>(
+                repeats, output_size);
+        default:
+            TP_THROW(RuntimeError,
+                     "repeats must have an integer index dtype");
+    }
+}
+
 Tensor cumprod_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
     int64_t nd = self.dim();
     if (nd == 0) TP_THROW(RuntimeError, "cumprod: dimension not supported for scalar tensors");
@@ -1751,6 +1828,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, IndexingKernels) {
     m.impl("cumsum_backward", cumsum_backward_cpu);
     m.impl("cumprod", cumprod_cpu);
     m.impl("logcumsumexp", logcumsumexp_cpu);
+    m.impl("repeat_interleave.Tensor", repeat_interleave_indices_cpu);
     m.impl("gather", gather_cpu);
     m.impl("scatter_add", scatter_add_cpu);
     m.impl("scatter_reduce", scatter_reduce_cpu);
