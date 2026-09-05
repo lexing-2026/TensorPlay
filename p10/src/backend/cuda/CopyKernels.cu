@@ -249,9 +249,9 @@ __global__ void transpose_tiled_vec4_kernel(
             #pragma unroll
             for (int c = 0; c < 4; ++c) {
                 const int64_t r = r_base + tx * 4 + j;
-                const int64_t c = c_base + ty * 4 + c;
-                if (r < rows && c < cols)
-                    dst[r * cols + c] = tile[ty * 4 + c][tx * 4 + j];
+                const int64_t col = c_base + ty * 4 + c;
+                if (r < rows && col < cols)
+                    dst[r * cols + col] = tile[ty * 4 + c][tx * 4 + j];
             }
         }
     }
