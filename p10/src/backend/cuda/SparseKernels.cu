@@ -7,7 +7,6 @@
 #include <climits>
 #include <complex>
 #include <type_traits>
-#include <unordered_set>
 #include <utility>
 
 namespace tensorplay {
@@ -1752,6 +1751,40 @@ __global__ void spdiags_fill_kernel(
     }
 }
 
+__global__ void spdiags_count_kernel(int64_t n_diag, int64_t rows,
+                                     int64_t cols, int64_t length,
+                                     const int64_t* offsets, int64_t* counts) {
+    const int64_t diagonal =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (diagonal >= n_diag) return;
+    const int64_t offset = offsets[diagonal];
+    const int64_t available = offset <= 0
+        ? ((offset + rows) < length ? offset + rows : length)
+        : ((cols < length ? cols : length) - offset);
+    counts[diagonal] = available > 0 ? available : 0;
+}
+
+__global__ void spdiags_starts_kernel(int64_t n_diag, const int64_t* counts,
+                                      const int64_t* cumulative,
+                                      int64_t* starts) {
+    const int64_t diagonal =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (diagonal < n_diag) {
+        starts[diagonal] = cumulative[diagonal] - counts[diagonal];
+    }
+}
+
+__global__ void spdiags_duplicate_kernel(int64_t n_offsets,
+                                         const int64_t* sorted_offsets,
+                                         int32_t* duplicate) {
+    const int64_t index =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index > 0 && index < n_offsets &&
+        sorted_offsets[index] == sorted_offsets[index - 1]) {
+        atomicExch(duplicate, 1);
+    }
+}
+
 Tensor spdiags_cuda(const Tensor& diagonals, const Tensor& offsets,
                     std::vector<int64_t> shape,
                     std::optional<int64_t> layout) {
@@ -1767,6 +1800,10 @@ Tensor spdiags_cuda(const Tensor& diagonals, const Tensor& offsets,
     if (diags2d.dim() != 2) {
         TP_THROW(ValueError, "spdiags(): diagonals must be a vector or matrix");
     }
+    if (diags2d.device() != offsets.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "spdiags(): diagonals and offsets must share one device");
+    }
     Tensor offs = offsets.dim() == 0 ? offsets.unsqueeze(0) : offsets;
     if (offs.dim() != 1 || offs.dtype() != DType::Int64) {
         TP_THROW(TypeError, "spdiags(): offset tensor must be 1-D int64");
@@ -1780,28 +1817,85 @@ Tensor spdiags_cuda(const Tensor& diagonals, const Tensor& offsets,
                      std::to_string(n_diag) + ")");
     }
 
-    // Offsets and the derived per-diagonal slots are tiny; compute them on
-    // the host and upload.
-    Tensor offs_host_t = offs.to(Device(DeviceType::CPU)).contiguous();
-    const int64_t* off_data = offs_host_t.data_ptr<int64_t>();
-    std::vector<int64_t> off_host(off_data, off_data + n_diag);
-    std::unordered_set<int64_t> unique_offs(off_host.begin(), off_host.end());
-    if (unique_offs.size() != static_cast<size_t>(n_diag)) {
-        TP_THROW(ValueError, "spdiags(): offset tensor contains duplicate values");
-    }
     const int64_t m_size = shape[0];
     const int64_t n_size = shape[1];
     const int64_t length = diags2d.size(1);
-    std::vector<int64_t> counts(static_cast<size_t>(n_diag), 0);
-    std::vector<int64_t> starts(static_cast<size_t>(n_diag), 0);
+
+    Tensor offs_c = offs.contiguous();
+    const cudaStream_t stream = getCurrentCUDAStream().stream();
+    if (n_diag > 1) {
+        Tensor sorted_offsets = Tensor::empty(
+            {n_diag}, DType::Int64, offsets.device());
+        size_t sort_bytes = 0;
+        checkCuda(cub::DeviceRadixSort::SortKeys(
+                      nullptr, sort_bytes, offs_c.data_ptr<int64_t>(),
+                      sorted_offsets.data_ptr<int64_t>(),
+                      static_cast<int>(n_diag), 0, sizeof(int64_t) * 8,
+                      stream),
+                  "CUB spdiags offset sort size query");
+        Tensor sort_temporary = Tensor::empty(
+            {static_cast<int64_t>(sort_bytes == 0 ? 1 : sort_bytes)},
+            DType::UInt8, offsets.device());
+        checkCuda(cub::DeviceRadixSort::SortKeys(
+                      sort_temporary.data_ptr(), sort_bytes,
+                      offs_c.data_ptr<int64_t>(), sorted_offsets.data_ptr<int64_t>(),
+                      static_cast<int>(n_diag), 0, sizeof(int64_t) * 8,
+                      stream),
+                  "CUB spdiags offset sort");
+        Tensor duplicate = Tensor::zeros({1}, DType::Int32, offsets.device());
+        spdiags_duplicate_kernel<<<coalesce_blocks(n_diag), kCoalesceThreads,
+                                   0, stream>>>(
+            n_diag, sorted_offsets.data_ptr<int64_t>(),
+            duplicate.data_ptr<int32_t>());
+        checkCuda(cudaGetLastError(), "CUDA spdiags duplicate check");
+        int32_t duplicate_host = 0;
+        checkCuda(cudaMemcpyAsync(&duplicate_host, duplicate.data_ptr<int32_t>(),
+                                  sizeof(int32_t), cudaMemcpyDeviceToHost,
+                                  stream),
+                  "CUDA spdiags duplicate readback");
+        checkCuda(cudaStreamSynchronize(stream), "CUDA spdiags metadata sync");
+        if (duplicate_host != 0) {
+            TP_THROW(ValueError, "spdiags(): offset tensor contains duplicate values");
+        }
+    }
+
+    Tensor counts_d = Tensor::empty({n_diag}, DType::Int64, offsets.device());
+    Tensor starts_d = Tensor::empty({n_diag}, DType::Int64, offsets.device());
+    Tensor cumulative_d = Tensor::empty(
+        {n_diag}, DType::Int64, offsets.device());
     int64_t total_nnz = 0;
-    for (int64_t j = 0; j < n_diag; ++j) {
-        const int64_t d = off_host[static_cast<size_t>(j)];
-        const int64_t count = d <= 0 ? std::min(d + m_size, length)
-                                     : std::min(n_size, length) - d;
-        counts[static_cast<size_t>(j)] = std::max<int64_t>(count, 0);
-        starts[static_cast<size_t>(j)] = total_nnz;
-        total_nnz += counts[static_cast<size_t>(j)];
+    if (n_diag > 0) {
+        spdiags_count_kernel<<<coalesce_blocks(n_diag), kCoalesceThreads, 0,
+                               stream>>>(
+            n_diag, m_size, n_size, length, offs_c.data_ptr<int64_t>(),
+            counts_d.data_ptr<int64_t>());
+        checkCuda(cudaGetLastError(), "CUDA spdiags count kernel");
+        size_t scan_bytes = 0;
+        checkCuda(cub::DeviceScan::InclusiveSum(
+                      nullptr, scan_bytes, counts_d.data_ptr<int64_t>(),
+                      cumulative_d.data_ptr<int64_t>(),
+                      static_cast<int>(n_diag), stream),
+                  "CUB spdiags count scan size query");
+        Tensor scan_temporary = Tensor::empty(
+            {static_cast<int64_t>(scan_bytes == 0 ? 1 : scan_bytes)},
+            DType::UInt8, offsets.device());
+        checkCuda(cub::DeviceScan::InclusiveSum(
+                      scan_temporary.data_ptr(), scan_bytes,
+                      counts_d.data_ptr<int64_t>(),
+                      cumulative_d.data_ptr<int64_t>(),
+                      static_cast<int>(n_diag), stream),
+                  "CUB spdiags count scan");
+        spdiags_starts_kernel<<<coalesce_blocks(n_diag), kCoalesceThreads, 0,
+                                stream>>>(
+            n_diag, counts_d.data_ptr<int64_t>(),
+            cumulative_d.data_ptr<int64_t>(), starts_d.data_ptr<int64_t>());
+        checkCuda(cudaGetLastError(), "CUDA spdiags starts kernel");
+        checkCuda(cudaMemcpyAsync(
+                      &total_nnz,
+                      cumulative_d.data_ptr<int64_t>() + (n_diag - 1),
+                      sizeof(int64_t), cudaMemcpyDeviceToHost, stream),
+                  "CUDA spdiags nnz readback");
+        checkCuda(cudaStreamSynchronize(stream), "CUDA spdiags metadata sync");
     }
 
     Tensor diags_c = diags2d.contiguous();
@@ -1809,27 +1903,12 @@ Tensor spdiags_cuda(const Tensor& diagonals, const Tensor& offsets,
                                    offsets.device());
     Tensor values = Tensor::empty({total_nnz}, diags_c.dtype(),
                                   diags_c.device());
-    auto meta_upload = [&total_nnz, &offsets](
-                           const std::vector<int64_t>& host,
-                           Tensor& device_tensor) {
-        device_tensor = Tensor::zeros(
-            {static_cast<int64_t>(host.size())}, DType::Int64, offsets.device());
-        checkCuda(cudaMemcpy(device_tensor.data_ptr<int64_t>(), host.data(),
-                             host.size() * sizeof(int64_t),
-                             cudaMemcpyHostToDevice),
-                  "spdiags meta upload");
-    };
-    Tensor offs_d, starts_d, counts_d;
-    meta_upload(off_host, offs_d);
-    meta_upload(starts, starts_d);
-    meta_upload(counts, counts_d);
-
     if (total_nnz > 0 && n_diag > 0) {
         const size_t elem = diags_c.itemsize();
         const cudaStream_t fill_stream = getCurrentCUDAStream().stream();
         spdiags_fill_kernel<<<n_diag, 128, 0, fill_stream>>>(
             reinterpret_cast<const unsigned char*>(diags_c.data_ptr()),
-            length, offs_d.data_ptr<int64_t>(), starts_d.data_ptr<int64_t>(),
+            length, offs_c.data_ptr<int64_t>(), starts_d.data_ptr<int64_t>(),
             counts_d.data_ptr<int64_t>(), static_cast<int64_t>(elem),
             reinterpret_cast<unsigned char*>(indices.data_ptr<int64_t>()),
             reinterpret_cast<unsigned char*>(indices.data_ptr<int64_t>()) +
