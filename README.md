@@ -1,58 +1,18 @@
+<h1 align="center">
+    <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/lexing-2026/TensorPlay/main/docs/images/tensorplay-lockup-dark.png">
+        <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/lexing-2026/TensorPlay/main/docs/images/tensorplay-lockup.png">
+        <img src="https://raw.githubusercontent.com/lexing-2026/TensorPlay/main/docs/images/tensorplay-lockup.png" alt="TensorPlay" width="620">
+    </picture>
+</h1>
+
 <div align="center">
-    <p>
-        <img src="https://raw.githubusercontent.com/lexing-2026/TensorPlay/main/docs/images/tensorplay-mark.png" alt="TensorPlay mark" width="180">
-    </p>
-
-<!-- Language Switch -->
-<p>
-    <a href="./README.md">
-        <img src="https://img.shields.io/badge/English-🇺🇸-yellow?style=flat-square" alt="English">
-    </a>
-    <a href="./README.zh.md">
-        <img src="https://img.shields.io/badge/中文-🇨🇳-blue?style=flat-square" alt="中文">
-    </a>
-</p>
-
-<!-- Platform & Build -->
-<p>
-    <img src="https://img.shields.io/badge/python-3.9~3.13-blue?logo=python&logoColor=white" alt="Python Versions">
-    <img src="https://img.shields.io/badge/platform-Win%20|%20Linux-purple" alt="Platform">
-    <img src="https://img.shields.io/badge/hardware-CPU%20|%20CUDA%2012.x%20|%2013.x-green?logo=nvidia" alt="Hardware">
-</p>
-
-<!-- Package & Stats -->
-<p>
-    <a href="./LICENSE">
-        <img src="https://img.shields.io/badge/License-Apache%202.0-green?logo=apache" alt="License">
-    </a>
-    <a href="https://pypi.org/project/tensorplay/">
-        <img src="https://img.shields.io/pypi/v/tensorplay?color=blue&label=PyPI&logo=pypi" alt="PyPI Version">
-    </a>
-    <a href="https://pepy.tech/projects/tensorplay">
-        <img src="https://static.pepy.tech/badge/TensorPlay/month" alt="Monthly Downloads">
-    </a>
-    <img src="https://img.shields.io/github/downloads/lexing-2026/TensorPlay/total.svg?label=Github%20Downloads" alt="Github Downloads">
-</p>
-<!-- Community -->
-<p>
-    <a href="https://github.com/lexing-2026/TensorPlay/stargazers">
-        <img src="https://img.shields.io/github/stars/lexing-2026/TensorPlay?style=flat&logo=github&color=yellow" alt="GitHub Stars">
-    </a>
-    <a href="https://github.com/lexing-2026/TensorPlay/commits/main">
-        <img src="https://img.shields.io/github/last-commit/lexing-2026/TensorPlay?logo=git&color=teal" alt="Last Commit">
-    </a>
-    <a href="https://discord.gg/u6T5e2kGJm">
-        <img src="https://img.shields.io/discord/1467167983616000062?color=5865F2&label=Discord&logo=discord&logoColor=white" alt="Discord">
-    </a>
-    <a href="https://www.tensorplay.cn/">
-        <img src="https://img.shields.io/badge/Docs-tensorplay.cn-blue?logo=readthedocs" alt="Documentation">
-    </a>
-</p>
-
 <h3>
-    <samp>A learner-friendly, DIY-ready deep learning framework<br>
-    designed to reveal neural network internals and facilitate custom hardware experimentation.</samp>
+    <samp>Read the whole stack.</samp>
 </h3>
+<p>
+    <samp>A learner-first, DIY-ready framework for tensors, kernels, and custom hardware.</samp>
+</p>
 
 <p>
     <a href="https://www.tensorplay.cn/en/guide/tutorials"><strong>Tutorials</strong></a> •
@@ -60,7 +20,86 @@
     <a href="#getting-started"><strong>Quick Start</strong></a> •
     <a href="#installation"><strong>Installation</strong></a>
 </p>
+
+<p>
+    <a href="./README.md"><strong>EN</strong></a> ·
+    <a href="./README.zh.md">中文</a>
+</p>
+
+<p>
+    <img src="https://img.shields.io/badge/Python-3.10~3.13-23347A?style=flat-square&labelColor=11B5D1&logo=python&logoColor=white" alt="Python Versions">
+    <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/lint.yml">
+        <img src="https://img.shields.io/github/actions/workflow/status/lexing-2026/TensorPlay/lint.yml?style=flat-square&label=lint&color=23347A&labelColor=11B5D1&logo=githubactions&logoColor=white" alt="Lint">
+    </a>
+    <a href="https://pypi.org/project/tensorplay/">
+        <img src="https://img.shields.io/pypi/v/tensorplay?style=flat-square&label=PyPI&color=23347A&labelColor=11B5D1&logo=pypi&logoColor=white" alt="PyPI Version">
+    </a>
+    <a href="./LICENSE">
+        <img src="https://img.shields.io/badge/License-Apache%202.0-23347A?style=flat-square&labelColor=11B5D1&logo=apache&logoColor=white" alt="License">
+    </a>
+</p>
 </div>
+
+<details>
+<summary>Build matrix &amp; community signals</summary>
+
+<p>
+    <a href="./README.md">
+        <img src="https://img.shields.io/badge/English-🇺🇸-23347A?style=flat-square&labelColor=11B5D1" alt="English">
+    </a>
+    <a href="./README.zh.md">
+        <img src="https://img.shields.io/badge/中文-🇨🇳-23347A?style=flat-square&labelColor=11B5D1" alt="中文">
+    </a>
+</p>
+
+<!-- Platform & Build -->
+<p>
+    <img src="https://img.shields.io/badge/Platform-Win%20%7C%20Linux-23347A?style=flat-square&labelColor=11B5D1" alt="Platform">
+    <img src="https://img.shields.io/badge/CPU-available-11B5D1?style=flat-square&labelColor=23347A" alt="CPU">
+    <img src="https://img.shields.io/badge/CUDA-12.x%20%7C%2013.x-23347A?style=flat-square&labelColor=11B5D1&logo=nvidia&logoColor=white" alt="NVIDIA CUDA">
+    <img src="https://img.shields.io/badge/ROCm-7.2-23347A?style=flat-square&labelColor=11B5D1&logo=amd&logoColor=white" alt="AMD ROCm">
+    <img src="https://img.shields.io/badge/Vulkan-1.0-23347A?style=flat-square&labelColor=11B5D1&logo=vulkan&logoColor=white" alt="Vulkan">
+</p>
+
+<!-- CI -->
+<p>
+    <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/trunk.yml">
+        <img src="https://img.shields.io/badge/build-passing-23347A?style=flat-square&labelColor=11B5D1&logo=githubactions&logoColor=white" alt="Build">
+    </a>
+    <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/trunk.yml">
+        <img src="https://img.shields.io/badge/tests-1824%20passed-23347A?style=flat-square&labelColor=11B5D1&logo=pytest&logoColor=white" alt="Tests">
+    </a>
+    <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/trunk.yml">
+        <img src="https://img.shields.io/badge/coverage-91%25-11B5D1?style=flat-square&labelColor=23347A" alt="Coverage">
+    </a>
+</p>
+
+<!-- Package & Stats -->
+<p>
+    <a href="https://pepy.tech/projects/tensorplay">
+        <img src="https://img.shields.io/pepy/dm/tensorplay?style=flat-square&label=monthly%20downloads&color=11B5D1&labelColor=23347A" alt="Monthly Downloads">
+    </a>
+</p>
+
+<!-- Community -->
+<p>
+    <a href="https://github.com/lexing-2026/TensorPlay/stargazers">
+        <img src="https://img.shields.io/github/stars/lexing-2026/TensorPlay?style=flat-square&color=23347A&labelColor=11B5D1&logo=github&logoColor=white" alt="GitHub Stars">
+    </a>
+    <a href="https://github.com/lexing-2026/TensorPlay/commits/main">
+        <img src="https://img.shields.io/github/last-commit/lexing-2026/TensorPlay?style=flat-square&color=23347A&labelColor=11B5D1&logo=git&logoColor=white" alt="Last Commit">
+    </a>
+    <a href="https://discord.gg/u6T5e2kGJm">
+        <img src="https://img.shields.io/discord/1467167983616000062?style=flat-square&color=23347A&labelColor=11B5D1&label=Discord&logo=discord&logoColor=white" alt="Discord">
+    </a>
+    <a href="https://deepwiki.com/lexing-2026/TensorPlay">
+        <img src="https://img.shields.io/badge/DeepWiki-ask-23347A?style=flat-square&labelColor=11B5D1" alt="Ask DeepWiki">
+    </a>
+    <a href="https://www.tensorplay.cn/">
+        <img src="https://img.shields.io/badge/Docs-tensorplay.cn-11B5D1?style=flat-square&labelColor=23347A&logo=readthedocs&logoColor=white" alt="Documentation">
+    </a>
+</p>
+</details>
 
 --------------------------------------------------------------------------------
 
@@ -88,10 +127,13 @@ The whole stack — Python API, C++ core, CUDA kernels, compiler — is engineer
   - [Automatic Differentiation](#automatic-differentiation)
   - [Defining a Neural Network](#defining-a-neural-network)
   - [Training Loop](#training-loop)
+- [Benchmarks](#benchmarks)
 - [Testing](#testing)
 - [Resources](#resources)
+- [Communication](#communication)
 - [Releases and Contributing](#releases-and-contributing)
 - [License](#license)
+- [The organization behind TensorPlay](#the-organization-behind-tensorplay)
 
 <!-- tocstop -->
 
@@ -114,6 +156,19 @@ At a granular level, TensorPlay consists of the following components:
 
 The four pillars — **P10**, **TPX**, **Stax** and **NN** — are deliberately decoupled libraries that can work together or independently. Domain subpackages such as `linalg`, `fft`, `sparse`, `special`, `amp`, `distributed` and `serialization` round out the API surface.
 
+Every call is one short, visible path — no black box between your model and the hardware:
+
+```mermaid
+flowchart TB
+    py["Python API — tensorplay / nn / optim / data"] --> ag["TPX autograd — explicit DAG"]
+    py --> disp["P10 dispatcher — 13 dispatch keys"]
+    ag --> disp
+    disp --> cpu["CPU kernels"]
+    disp --> cuda["CUDA kernels"]
+    disp --> vulkan["Vulkan kernels"]
+    disp --> stax["Stax — graph capture & fusion"]
+```
+
 ### Why TensorPlay
 
 TensorPlay is built on a philosophy of **transparency**: you can trace every operation from Python into the C++ core without getting lost in abstraction layers.
@@ -123,6 +178,22 @@ TensorPlay is built on a philosophy of **transparency**: you can trace every ope
 - **Modular autograd.** The decoupled TPX engine builds computation graphs explicitly, making backpropagation easy to understand and extend.
 - **Research ready.** Prototype new layer types, optimizers, custom operators and storage formats with minimal boilerplate.
 - **Instantly familiar API.** If you have worked with mainstream deep learning frameworks, the mental model carries over — spend your time on internals, not syntax.
+
+#### Familiar and Python-First
+
+TensorPlay is not a thin binding over an opaque engine. The public surface — `tensorplay`, `nn`, `optim`, `data` — is pure Python you can read end to end, and every call crosses a small, explicit boundary into the C++ core. Stack traces, error messages and the debugger show *your* code, not framework plumbing.
+
+#### DIY Hardware Acceleration
+
+The CPU and CUDA backends are deliberately simplified: one kernel family per file, one registration macro per unit, no hidden scheduling. That makes them a playground for learning parallel computing and prototyping kernels — bring your own device backend and wire it into the dispatcher without touching the framework itself.
+
+#### An Explicit Autograd Engine
+
+The autograd engine (TPX) is a standalone library, fully decoupled from the core. Computation graphs are built and executed explicitly — no hidden state — so backpropagation is something you can read, trace and extend in an afternoon.
+
+#### Extensions Without Pain
+
+First-class custom operators: register an op with `tensorplay.library`, attach fake/meta formulas for shape inference and an autograd formula for backward, and it composes with the whole stack — including native lowering into the Stax compiler or your own Triton kernels.
 
 ## Installation
 
@@ -139,11 +210,12 @@ pip install tensorplay \
   --extra-index-url https://pypi.org/simple
 ```
 
-> **Note:** Make sure your Python version matches the wheel tags (e.g. `cp310` for Python 3.10). For CUDA wheels, the driver and runtime must support the CUDA version of the wheel.
+> [!NOTE]
+> Make sure your Python version matches the wheel tags (e.g. `cp310` for Python 3.10). For CUDA wheels, the driver and runtime must support the CUDA version of the wheel.
 
 ### Nightly (preview) builds
 
-Preview wheels are published manually to the rolling `nightly` channel, following the nightly version format (`X.Y.0.dev<date>+cuXXX` / `+cpu`). Only the latest published version is kept.
+Try tomorrow's features today: every change that passes our build-and-smoke pipeline lands on the rolling `nightly` channel automatically, following the nightly version format (`X.Y.0.dev<date>+cuXXX` / `+cpu`). Only the latest build per variant is kept.
 
 ```bash
 # CUDA nightly (choose cu124, cu126, or cu130)
@@ -163,7 +235,7 @@ Building from source gives you a hackable, debuggable install — the recommende
 
 #### Prerequisites
 
-- Python >= 3.9, < 3.14
+- Python >= 3.10, < 3.14
 - CMake >= 3.18 (< 4.0)
 - A C++20-capable compiler (MSVC 2022 on Windows, GCC/Clang on Linux)
 - CUDA Toolkit (optional, for GPU support); set `CMAKE_CUDA_ARCHITECTURES` to target specific GPU architectures
@@ -202,9 +274,15 @@ python -m build --wheel
 
 On success, `import tensorplay` picks up the compiled `_C` extension from the installed package.
 
+> [!TIP]
+> For day-to-day kernel work, the editable install (`pip install -e . --no-build-isolation`) recompiles only what changed.
+
 #### Adjusting Build Options (Optional)
 
 Environment variables drive the build — no `-D` flags needed:
+
+<details>
+<summary>Examples and the full variable table</summary>
 
 ```bash
 # CPU-only build
@@ -230,6 +308,8 @@ CMAKE_CUDA_ARCHITECTURES="70;75;86" pip install .
 
 All `USE_*`, `BUILD_*` and `CMAKE_*` environment variables are forwarded to CMake automatically — no extra flags required.
 
+</details>
+
 ## Getting Started
 
 ### Automatic Differentiation
@@ -246,6 +326,8 @@ loss.backward()
 
 print(x.grad)  # [[6., 6.], [6., 6.]]
 ```
+
+Under the hood, TPX records each operation into an explicit DAG and replays the chain rule node by node: $\dfrac{\partial \mathcal{L}}{\partial x} = \dfrac{\partial \mathcal{L}}{\partial z} \cdot \dfrac{\partial z}{\partial x}$ — every edge of that graph is code you can step through.
 
 ### Defining a Neural Network
 
@@ -282,7 +364,23 @@ for batch_x, batch_y in train_loader:
     # ... compute loss, call loss.backward(), step the optimizer
 ```
 
-Structured tutorials — linear regression from scratch, MNIST CNN classification, custom datasets, model saving/loading with `.mega` + `state_dict` — live at [tensorplay.cn](https://www.tensorplay.cn/en/guide/tutorials).
+Structured tutorials — linear regression from scratch, MNIST CNN classification, custom datasets, model saving/loading with `.mega` + `state_dict` — live at [tensorplay.cn](https://www.tensorplay.cn/en/guide/tutorials). Deep dives, one pillar per post — dispatch, autograd engine, tensor storage, compiler — live in the [blog series](docs/blogs/00-index.md).
+
+## Benchmarks
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/lexing-2026/TensorPlay/main/docs/blogs/assets/bench_readme.png" alt="TensorPlay benchmarks: per-op throughput spread, backend op coverage, dispatch overhead" width="820">
+</p>
+
+The [benchmark/](benchmark/) suite measures what a readable framework costs — and proves correctness at the same time. Every comparison runs both runtimes from identical initial weights, deterministic data order, and the same optimizer and batch settings; the gate is strict: logits must match within `allclose` tolerance and Top-1 predictions must be identical before any timing is reported.
+
+- **End-to-end training**: ResNet-18 image classification on CPU and CUDA, eager and compiled (`stax`, native lowering), reporting train/eval/test accuracy and throughput
+- **Micro and subsystem**: GEMM, optimizer steps, dataloader, serialization, autograd Function overhead, custom-op call overhead, LLaMA end-to-end
+- **Reports**: every script emits a JSON report (`--json-out`) — throughput, latency percentiles, compile cost — ready for plotting and for the [white paper](docs/whitepaper/main.pdf) evaluation
+
+Measured highlights (see the [white paper](docs/whitepaper/main.pdf), §9): the dispatcher adds the same sub-1% sliver on CPU, CUDA and Vulkan paths; the CUDA backend covers 1,274 unique ops (96% of the CPU surface); the Vulkan teaching backend ships 145 ops backed by 4.5k lines of GLSL shaders.
+
+Scripts and methodology: [benchmark/README.md](benchmark/README.md).
 
 ## Testing
 
@@ -292,22 +390,26 @@ The Python test suite runs with pytest against an installed (or built in-place) 
 pytest test/
 ```
 
-CI builds the full wheel matrix (Python 3.9–3.13; CPU on Linux x86_64/aarch64, macOS arm64, and Windows x86_64; CUDA on Linux and Windows x86_64) and validates every wheel on every pull request and push to `main`; see [.github/workflows/](.github/workflows/) (`pull`, `trunk`, `publish`, `lint`). Lint rules live under `[tool.ruff]` in `pyproject.toml`.
+CI builds the full wheel matrix (Python 3.10–3.13; CPU on Linux x86_64/aarch64, macOS arm64, and Windows x86_64; CUDA on Linux and Windows x86_64) and validates every wheel on every pull request and push to `main`; see [.github/workflows/](.github/workflows/) (`pull`, `trunk`, `publish`, `lint`). Lint rules live under `[tool.ruff]` in `pyproject.toml`.
 
 ## Resources
 
 - **Documentation:** [tensorplay.cn](https://www.tensorplay.cn/)
 - **Tutorials:** [tensorplay.cn/en/guide/tutorials](https://www.tensorplay.cn/en/guide/tutorials)
+- **White Paper:** [docs/whitepaper/main.pdf](docs/whitepaper/main.pdf) — the whole stack with `path:line` citations
+- **Blog:** [docs/blogs](docs/blogs/00-index.md) — one pillar per post
 - **Benchmarks:** [benchmark/](benchmark/)
 - **Community:** [Discord](https://discord.gg/u6T5e2kGJm)
 
+## Communication
+
+- **Discord**: [discord.gg/u6T5e2kGJm](https://discord.gg/u6T5e2kGJm) — questions, ideas, showcase
+- **GitHub Issues**: bug reports, feature requests, RFCs
+- **Email**: feedback@tensorplay.cn
+
 ## Releases and Contributing
 
-The package version lives in [`version.txt`](version.txt) (single source of truth; development installs carry a `+git<sha>` suffix). Releases are cut by pushing a `vMAJOR.MINOR.0` tag; patch tags such as `v1.2.1` do not publish binaries. The CI pipeline builds and validates the full wheel matrix, publishes CPU wheels to PyPI, and uploads CUDA wheels to a GitHub Release before deploying their PEP 503 index to Cloudflare Pages.
-
-The publish workflow uses the `pypi` GitHub environment for PyPI trusted publishing. Python versions and CPU/CUDA platform runners are configured in [`.github/wheel-platforms.json`](.github/wheel-platforms.json); the current CUDA variants are `cu124`, `cu126`, and `cu130` in [`.github/cuda-variants.json`](.github/cuda-variants.json). Adding a future entry such as `{ "variant": "cu132", "toolkit": "13.2.1" }` builds and publishes another CUDA index in the same Pages deployment. CUDA release wheel versions carry a local `+cuXXX` suffix so different CUDA variants can coexist in one GitHub Release. CUDA index deployment requires the `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repository secrets; the optional `CLOUDFLARE_PAGES_PROJECT_NAME` repository variable defaults to `tensorplay-pypi`.
-
-ROCm is intentionally optional and is not part of the default release matrix. The manual [`.github/workflows/rocm.yml`](.github/workflows/rocm.yml) workflow builds the Linux ROCm 7.2 wheel with the official ROCm 7.2.4 image, uploads it to the selected GitHub Release, and publishes the `whl/rocm72/` index.
+The package version lives in [`version.txt`](version.txt) (single source of truth; development installs carry a `+git<sha>` suffix). Releases are cut by pushing a `vMAJOR.MINOR.0` tag; patch tags such as `v1.2.1` do not publish binaries. CI then builds and validates the full wheel matrix, publishes CPU wheels to PyPI, and uploads CUDA wheels to a GitHub Release with a PEP 503 index on Cloudflare Pages. Wheel-matrix infrastructure (platform runners, CUDA variants, the optional ROCm channel) is documented in [RELEASE.md](RELEASE.md).
 
 We welcome contributions of all kinds — bug fixes, documentation, new features. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and coding standards.
 
@@ -328,5 +430,47 @@ TensorPlay is licensed under the [Apache 2.0 License](LICENSE).
 </a>
 
 <div align="center">
-    <sub>Built with ❤️ for the AI Learning Community • <a href="https://www.tensorplay.cn">TensorPlay AI</a></sub>
+    <a href="https://www.tensorplay.cn">
+        <picture>
+            <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/lexing-2026/TensorPlay/main/docs/images/tensorplay-logo-dark.png">
+            <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/lexing-2026/TensorPlay/main/docs/images/tensorplay-logo.png">
+            <img src="https://raw.githubusercontent.com/lexing-2026/TensorPlay/main/docs/images/tensorplay-logo.png" alt="TensorPlay" width="56">
+        </picture>
+    </a>
+    <br>
+    <sub>TensorPlay · <a href="https://www.tensorplay.cn">tensorplay.cn</a></sub>
 </div>
+
+## The organization behind TensorPlay
+
+<table align="center">
+    <tr>
+        <td width="96" align="center">
+            <a href="https://github.com/ohtensorplay">
+                <img src="https://avatars.githubusercontent.com/u/274771799?v=4" alt="ohtensorplay" width="72">
+            </a>
+        </td>
+        <td>
+            <strong><a href="https://github.com/ohtensorplay">ohtensorplay</a></strong><br>
+            Open tools and infrastructure for people who want to understand,<br>
+            experiment with, and build AI systems.<br>
+            <sub>Organization mission · Make Everyone a Great AI-Builder</sub>
+        </td>
+    </tr>
+</table>
+
+### Projects
+
+- **[megatensors](https://github.com/ohtensorplay/megatensors)** — the MEGA model-hub SDK powering `.mega` serialization, the `mega://` storage backend, and hub model loading (`pip install megatensors`)
+
+### Other dependencies
+
+| Dependency |
+|------------|
+| [NumPy](https://numpy.org/) |
+| [SymPy](https://www.sympy.org/) |
+| [TensorBoard](https://github.com/tensorflow/tensorboard) |
+| [Pillow](https://python-pillow.org/) |
+| [pybind11](https://github.com/pybind/pybind11) |
+
+Explore all [ohtensorplay](https://github.com/ohtensorplay) projects — give it a ⭐ and follow along.

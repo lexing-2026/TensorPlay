@@ -299,6 +299,22 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NIGHTLY_NOTES: |
+            Fresh preview builds of TensorPlay, published automatically as new features land. Expect the newest capabilities — and occasional rough edges.
+
+            Install (pick your accelerator):
+
+                pip install --pre tensorplay \
+                  --index-url https://download.tensorplay.cn/whl/nightly/cu130/ \
+                  --extra-index-url https://pypi.org/simple
+
+                pip install --pre tensorplay \
+                  --index-url https://download.tensorplay.cn/whl/nightly/cpu/ \
+                  --extra-index-url https://pypi.org/simple
+
+            Only the most recent build of each variant is kept here; prefer the stable releases for production work.
         run: |
           set -euo pipefail
           if [[ "${{ inputs.build_version }}" != "" ]]; then
@@ -310,7 +326,7 @@ jobs:
                 --repo "$GITHUB_REPOSITORY" \
                 --prerelease \
                 --title "TensorPlay nightly" \
-                --notes "Rolling preview channel. Each main-branch push publishes the wheels it just smoke-tested; the scheduled run only fills gaps. Install indexes live under /whl/nightly/<variant>/ on the Pages site."
+                --notes "$NIGHTLY_NOTES"
             fi
           else
             release="$GITHUB_REF_NAME"
