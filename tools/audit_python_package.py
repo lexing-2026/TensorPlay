@@ -4,9 +4,25 @@ from __future__ import annotations
 
 import argparse
 import ast
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+
+
+_LEGACY_MODULE_FILES = (
+    "fft.py",
+    "sparse.py",
+    "special.py",
+    "linalg.py",
+    "export.py",
+    "distributed/distributed_c10d.py",
+    "nn/modules/fold.py",
+)
+_LEGACY_MODULE_REFERENCES = (
+    "tensorplay.distributed.distributed_c10d",
+    "tensorplay.nn.modules.fold",
+)
 
 
 @dataclass(frozen=True)
@@ -123,6 +139,32 @@ def _check_collisions(root: Path) -> list[Issue]:
     return issues
 
 
+def _check_legacy_paths(root: Path) -> list[Issue]:
+    issues: list[Issue] = []
+    for relative in _LEGACY_MODULE_FILES:
+        path = root / relative
+        if path.exists():
+            issues.append(Issue(path, "legacy module path is still present"))
+
+    repository_root = root.parent
+    text_roots = [root, repository_root / "docs" / "source"]
+    for text_root in text_roots:
+        if not text_root.is_dir():
+            continue
+        paths = text_root.rglob("*.py") if text_root == root else text_root.rglob("*")
+        for path in paths:
+            if not path.is_file():
+                continue
+            try:
+                contents = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            for reference in _LEGACY_MODULE_REFERENCES:
+                if re.search(rf"(?<![\w.]){re.escape(reference)}(?![\w.])", contents):
+                    issues.append(Issue(path, f"legacy module reference is still present: {reference}"))
+    return issues
+
+
 def _check_all_exports(root: Path) -> list[Issue]:
     issues: list[Issue] = []
     for path in sorted(root.rglob("__init__.py")):
@@ -146,7 +188,11 @@ def audit_package(root: str | Path = "tensorplay") -> list[Issue]:
     package_root = Path(root)
     if not package_root.is_dir():
         return [Issue(package_root, "package directory does not exist")]
-    return _check_collisions(package_root) + _check_all_exports(package_root)
+    return (
+        _check_collisions(package_root)
+        + _check_all_exports(package_root)
+        + _check_legacy_paths(package_root)
+    )
 
 
 def main() -> int:
