@@ -22,6 +22,9 @@ namespace {
 
 // transformed rejection for lambda >= 10, multiplication (Knuth) otherwise.
 int64_t sample_poisson(double lambda, Generator* generator) {
+    if (!(lambda >= 0.0)) {
+        TP_THROW(RuntimeError, "invalid Poisson rate, expected rate to be non-negative");
+    }
     uniform_real_distribution<double> standard_uniform(0.0, 1.0);
     if (lambda >= 10) {
         // transformed rejection method, (Hoermann, 1993)

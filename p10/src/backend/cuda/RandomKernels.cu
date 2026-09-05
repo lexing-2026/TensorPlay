@@ -838,6 +838,9 @@ Tensor poisson_kernel_cuda(const Tensor& self) {
     int64_t n = self.numel();
     if (n == 0) return t;
     const Tensor input = self.is_contiguous() ? self : self.contiguous();
+    if (!input.ge(Scalar(0)).all().item<bool>()) {
+        TP_THROW(RuntimeError, "invalid Poisson rate, expected rate to be non-negative");
+    }
     const int threads = 256;
     const int blocks = static_cast<int>((n + threads - 1) / threads);
     // Each thread runs curand_poisson which consumes lambda-dependent counters;
