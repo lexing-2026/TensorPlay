@@ -635,6 +635,24 @@ __global__ void gather_kernel(int64_t n, int64_t idx_dim_size, int64_t idx_inner
 __device__ __forceinline__ void atomic_add_rel(int64_t* addr, int64_t v) {
     gpuAtomicAdd(addr, v);
 }
+__device__ __forceinline__ void atomic_add_rel(uint8_t* addr, uint8_t v) {
+    gpuAtomicAdd(addr, v);
+}
+__device__ __forceinline__ void atomic_add_rel(int8_t* addr, int8_t v) {
+    gpuAtomicAdd(addr, v);
+}
+__device__ __forceinline__ void atomic_add_rel(int16_t* addr, int16_t v) {
+    gpuAtomicAdd(addr, v);
+}
+__device__ __forceinline__ void atomic_add_rel(uint16_t* addr, uint16_t v) {
+    gpuAtomicAdd(addr, v);
+}
+__device__ __forceinline__ void atomic_add_rel(uint32_t* addr, uint32_t v) {
+    gpuAtomicAdd(addr, v);
+}
+__device__ __forceinline__ void atomic_add_rel(uint64_t* addr, uint64_t v) {
+    gpuAtomicAdd(addr, v);
+}
 __device__ __forceinline__ void atomic_add_rel(int32_t* addr, int32_t v) { gpuAtomicAdd(addr, v); }
 __device__ __forceinline__ void atomic_add_rel(float* addr, float v) { gpuAtomicAdd(addr, v); }
 __device__ __forceinline__ void atomic_add_rel(double* addr, double v) { gpuAtomicAdd(addr, v); }
@@ -651,6 +669,25 @@ __device__ __forceinline__ void atomic_add_rel(tensorplay::complex<T>* addr,
     atomic_add_rel(reinterpret_cast<T*>(addr), v.real());
     atomic_add_rel(reinterpret_cast<T*>(addr) + 1, v.imag());
 }
+
+template <typename T>
+__device__ __forceinline__ void indexed_atomic_add(T* addr, T v) {
+    if constexpr (std::is_same_v<T, bool>) {
+        gpuAtomicAdd(addr, v);
+    } else {
+        atomic_add_rel(addr, v);
+    }
+}
+
+template <typename T>
+inline constexpr bool scatter_add_supported_v =
+    std::is_same_v<T, uint8_t> || std::is_same_v<T, int8_t> ||
+    std::is_same_v<T, int16_t> || std::is_same_v<T, int32_t> ||
+    std::is_same_v<T, int64_t> || std::is_same_v<T, uint16_t> ||
+    std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t> ||
+    std::is_same_v<T, float> || std::is_same_v<T, double> ||
+    std::is_same_v<T, Half> || std::is_same_v<T, BFloat16> ||
+    std::is_same_v<T, bool>;
 
 __device__ __forceinline__ int64_t atomic_add_rel_return(int64_t* addr) {
     // Local overloads handle scalar widths without native atomicAdd support.
@@ -677,9 +714,8 @@ __global__ void scatter_kernel(int64_t total_idx, int64_t idx_dim_size, int64_t 
         if (idx < 0) idx += self_dim_size;
         int64_t dst = (outer_off * self_dim_size + idx) * self_inner + t;
         if constexpr (Add) {
-            if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double> ||
-                          std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>) {
-                atomic_add_rel(&d[dst], vp[flat]);
+            if constexpr (scatter_add_supported_v<T>) {
+                indexed_atomic_add(&d[dst], vp[flat]);
             }
         }
         else d[dst] = vp[flat];
@@ -694,10 +730,7 @@ __global__ void index_add_kernel(int64_t total, int64_t inner, int64_t row,
     int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; t < total; t += stride) {
-        if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double> ||
-                      std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t> ||
-                      std::is_same_v<T, Half> || std::is_same_v<T, BFloat16> ||
-                      std::is_same_v<T, bool> ||
+        if constexpr (scatter_add_supported_v<T> ||
                       std::is_same_v<T, tensorplay::complex<float>> ||
                       std::is_same_v<T, tensorplay::complex<double>> ||
                       std::is_same_v<T, tensorplay::complex<Half>> ||
@@ -706,7 +739,7 @@ __global__ void index_add_kernel(int64_t total, int64_t inner, int64_t row,
             int64_t c = t % inner;
             int64_t iv = ip[k];
             if (iv < 0) iv += row;
-            atomic_add_rel(&d[iv * inner + c], sp[t]);
+            indexed_atomic_add(&d[iv * inner + c], sp[t]);
         }
     }
 }
@@ -778,9 +811,8 @@ __global__ void index_put_kernel(int64_t n, T* d, const int64_t* ip, const T* vp
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += stride) {
         if constexpr (Accumulate) {
-            if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double> ||
-                          std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>) {
-                atomic_add_rel(&d[ip[i]], vp[i]);
+            if constexpr (scatter_add_supported_v<T>) {
+                indexed_atomic_add(&d[ip[i]], vp[i]);
             }
         }
         else d[ip[i]] = vp[i];
@@ -1705,16 +1737,17 @@ Tensor scatter_base_cuda(const Tensor& self, int64_t dim, const Tensor& index,
     int64_t self_dim_size = self.size(dim);
     if (total_idx == 0) return result;
     auto stream = getCurrentCUDAStream().stream();
-    // atomicAdd supports float/double/int32/int64(via ull); other dtypes fall
-    // accelerates.
     if (Add) {
         switch (self.dtype()) {
-            case DType::Float32: case DType::Float64:
+            case DType::UInt8: case DType::Int8: case DType::Int16:
             case DType::Int32: case DType::Int64:
+            case DType::UInt16: case DType::UInt32: case DType::UInt64:
+            case DType::Float32: case DType::Float64:
+            case DType::Float16: case DType::BFloat16: case DType::Bool:
                 break;
             default:
                 TP_THROW(NotImplementedError,
-                         "scatter_add on CUDA supports Float32/Float64/Int32/Int64 only");
+                         "scatter_add on CUDA does not support this dtype");
         }
     }
 #define TP_SC_CASE(ctype, name) \
@@ -1802,33 +1835,20 @@ static Tensor& scatter_base_inplace_cuda(Tensor& self, int64_t dim, const Tensor
         break; \
     }
     if (add) {
-        // atomic_add_rel covers Float32/Float64/Int32/Int64 natively; other
-        // dtypes reject here instead of silently mis-accumulating.
+#define TP_SC_INPLACE_ADD_CASE(ctype, name) \
+        case DType::name: { \
+            scatter_kernel<ctype, true><<<(total_idx + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+                total_idx, idx_dim_size, idx_inner, self_dim_size, inner, \
+                result.data_ptr<ctype>(), idx_c.data_ptr<int64_t>(), src_b.data_ptr<ctype>()); \
+            break; \
+        }
         switch (self.dtype()) {
-            case DType::Float32:
-                scatter_kernel<float, true><<<(total_idx + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                    total_idx, idx_dim_size, idx_inner, self_dim_size, inner, result.data_ptr<float>(),
-                    idx_c.data_ptr<int64_t>(), src_b.data_ptr<float>());
-                break;
-            case DType::Float64:
-                scatter_kernel<double, true><<<(total_idx + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                    total_idx, idx_dim_size, idx_inner, self_dim_size, inner, result.data_ptr<double>(),
-                    idx_c.data_ptr<int64_t>(), src_b.data_ptr<double>());
-                break;
-            case DType::Int32:
-                scatter_kernel<int32_t, true><<<(total_idx + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                    total_idx, idx_dim_size, idx_inner, self_dim_size, inner, result.data_ptr<int32_t>(),
-                    idx_c.data_ptr<int64_t>(), src_b.data_ptr<int32_t>());
-                break;
-            case DType::Int64:
-                scatter_kernel<int64_t, true><<<(total_idx + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                    total_idx, idx_dim_size, idx_inner, self_dim_size, inner, result.data_ptr<int64_t>(),
-                    idx_c.data_ptr<int64_t>(), src_b.data_ptr<int64_t>());
-                break;
+            TENSORPLAY_FORALL_SCALAR_TYPES(TP_SC_INPLACE_ADD_CASE)
             default:
                 TP_THROW(NotImplementedError,
-                         "scatter_add_ on CUDA supports Float32/Float64/Int32/Int64 only");
+                         "scatter_add_ on CUDA does not support this dtype");
         }
+#undef TP_SC_INPLACE_ADD_CASE
     } else {
         switch (self.dtype()) {
             TENSORPLAY_FORALL_SCALAR_TYPES(TP_SC_INPLACE_ASSIGN_CASE)
@@ -1921,42 +1941,14 @@ Tensor index_add_cuda(const Tensor& self, int64_t dim, const Tensor& index, cons
     }
     int64_t total = n_idx * inner;
     auto stream = getCurrentCUDAStream().stream();
+#define TP_IADD_CASE(ctype, name) \
+        case DType::name: \
+            index_add_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+                total, inner, row, result.data_ptr<ctype>(), idx.data_ptr<int64_t>(), \
+                source_c.data_ptr<ctype>()); \
+            break; \
     switch (self.dtype()) {
-        case DType::Float32:
-            index_add_kernel<float><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                total, inner, row, result.data_ptr<float>(), idx.data_ptr<int64_t>(),
-                source_c.data_ptr<float>());
-            break;
-        case DType::Float64:
-            index_add_kernel<double><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                total, inner, row, result.data_ptr<double>(), idx.data_ptr<int64_t>(),
-                source_c.data_ptr<double>());
-            break;
-        case DType::Int32:
-            index_add_kernel<int32_t><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                total, inner, row, result.data_ptr<int32_t>(), idx.data_ptr<int64_t>(),
-                source_c.data_ptr<int32_t>());
-            break;
-        case DType::Int64:
-            index_add_kernel<int64_t><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                total, inner, row, result.data_ptr<int64_t>(), idx.data_ptr<int64_t>(),
-                source_c.data_ptr<int64_t>());
-            break;
-        case DType::Float16:
-            index_add_kernel<Half><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                total, inner, row, result.data_ptr<Half>(), idx.data_ptr<int64_t>(),
-                source_c.data_ptr<Half>());
-            break;
-        case DType::BFloat16:
-            index_add_kernel<BFloat16><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                total, inner, row, result.data_ptr<BFloat16>(), idx.data_ptr<int64_t>(),
-                source_c.data_ptr<BFloat16>());
-            break;
-        case DType::Bool:
-            index_add_kernel<bool><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                total, inner, row, result.data_ptr<bool>(), idx.data_ptr<int64_t>(),
-                source_c.data_ptr<bool>());
-            break;
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_IADD_CASE)
         case DType::ComplexFloat:
             index_add_kernel<tensorplay::complex<float>><<<
                 (total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
@@ -1992,6 +1984,7 @@ Tensor index_add_cuda(const Tensor& self, int64_t dim, const Tensor& index, cons
         default:
             TP_THROW(NotImplementedError, "index_add on CUDA does not support this dtype");
     }
+#undef TP_IADD_CASE
     CUDA_CHECK(cudaGetLastError());
     return result;
 }
@@ -2113,25 +2106,16 @@ Tensor index_put_impl_cuda(Tensor& result, const std::vector<Tensor>& indices,
     }
     auto stream = getCurrentCUDAStream().stream();
     if (accumulate) {
+#define TP_IP_ACC_CASE(ctype, name) \
+            case DType::name: \
+                index_put_kernel<ctype, true><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+                    n, result.data_ptr<ctype>(), flat_idx.data_ptr<int64_t>(), vals.data_ptr<ctype>()); \
+                break; \
         switch (result.dtype()) {
-            case DType::Float32:
-                index_put_kernel<float, true><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                    n, result.data_ptr<float>(), flat_idx.data_ptr<int64_t>(), vals.data_ptr<float>());
-                break;
-            case DType::Float64:
-                index_put_kernel<double, true><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                    n, result.data_ptr<double>(), flat_idx.data_ptr<int64_t>(), vals.data_ptr<double>());
-                break;
-            case DType::Int32:
-                index_put_kernel<int32_t, true><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                    n, result.data_ptr<int32_t>(), flat_idx.data_ptr<int64_t>(), vals.data_ptr<int32_t>());
-                break;
-            case DType::Int64:
-                index_put_kernel<int64_t, true><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                    n, result.data_ptr<int64_t>(), flat_idx.data_ptr<int64_t>(), vals.data_ptr<int64_t>());
-                break;
+            TENSORPLAY_FORALL_SCALAR_TYPES(TP_IP_ACC_CASE)
+#undef TP_IP_ACC_CASE
             default:
-                TP_THROW(NotImplementedError, "index_put accumulate=True on CUDA supports Float32/Float64/Int32/Int64 only");
+                TP_THROW(NotImplementedError, "index_put accumulate=True on CUDA does not support this dtype");
         }
     } else {
 #define TP_IP_CASE(ctype, name) \
