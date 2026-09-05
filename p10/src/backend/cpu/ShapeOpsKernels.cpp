@@ -15,6 +15,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -78,32 +79,52 @@ Tensor empty_transform_output(const Tensor& self) {
                                    self.dtype());
 }
 
+template <typename T>
+void trace_cpu_typed(const Tensor& self, Tensor& result) {
+    const T* data = self.data_ptr<T>();
+    const int64_t diagonal_size = std::min(self.size(0), self.size(1));
+    const int64_t diagonal_stride = self.stride(0) + self.stride(1);
+    if constexpr (std::is_integral_v<T>) {
+        using AccT = std::conditional_t<std::is_unsigned_v<T>, uint64_t, int64_t>;
+        AccT sum = 0;
+        for (int64_t i = 0; i < diagonal_size; ++i)
+            sum += static_cast<AccT>(data[i * diagonal_stride]);
+        *result.data_ptr<int64_t>() = static_cast<int64_t>(sum);
+    } else if constexpr (std::is_same_v<T, Half> || std::is_same_v<T, BFloat16>) {
+        float sum = 0.0f;
+        for (int64_t i = 0; i < diagonal_size; ++i)
+            sum += static_cast<float>(data[i * diagonal_stride]);
+        *result.data_ptr<T>() = static_cast<T>(sum);
+    } else {
+        T sum{};
+        for (int64_t i = 0; i < diagonal_size; ++i)
+            sum += data[i * diagonal_stride];
+        *result.data_ptr<T>() = sum;
+    }
+}
+
 
 // ===========================================================================
 // Shape ops
 // ===========================================================================
 
 Tensor trace_cpu(const Tensor& self) {
-    // trace: sum of the diagonal of the last 2 dims.
-    if (self.dim() < 2) TP_THROW(RuntimeError, "trace: input must have at least 2 dimensions");
-    int64_t rows = self.size(-2), cols = self.size(-1);
-    int64_t d = std::min(rows, cols);
-    int64_t batch = self.numel() / (rows * cols);
-    Tensor sc64 = self.to(DType::Float64).contiguous();
-    const Size sc64_shape = sc64.shape();
-    std::vector<int64_t> out_shape(sc64_shape.begin(), sc64_shape.end() - 2);
-    Tensor out = Tensor::zeros(out_shape, DType::Float64, self.device());
-    double* dp = out.data_ptr<double>();
-    const double* sp = sc64.data_ptr<double>();
-    parallel_for(0, batch, GRAIN_SIZE, [&](int64_t b, int64_t e) {
-        for (int64_t bi = b; bi < e; ++bi) {
-            double s = 0;
-            for (int64_t i = 0; i < d; ++i) s += sp[bi * rows * cols + i * cols + i];
-            dp[bi] = s;
-        }
-    });
-    DType out_dt = self.dtype();
-    return out.to(out_dt).reshape(out_shape);
+    if (self.dim() != 2) {
+        TP_THROW(RuntimeError, "trace: expected a matrix, but got tensor with dim ", self.dim());
+    }
+    const DType out_dtype =
+        isIntegralType(self.dtype(), true) ? DType::Int64 : self.dtype();
+    Tensor result = Tensor::empty({}, out_dtype, self.device());
+#define TP_TRACE_CASE(ctype, name_) \
+    case DType::name_: \
+        trace_cpu_typed<ctype>(self, result); \
+        break;
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_TRACE_CASE)
+        default: TP_THROW(TypeError, "trace: unsupported dtype");
+    }
+#undef TP_TRACE_CASE
+    return result;
 }
 
 Tensor diag_cpu(const Tensor& self, int64_t diagonal) {
