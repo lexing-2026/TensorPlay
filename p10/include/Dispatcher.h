@@ -4,7 +4,9 @@
 #include <atomic>
 #include <cstddef>
 #include <memory>
+#if defined(__GLIBC__)
 #include <execinfo.h>
+#endif
 #include <mutex>
 #include <string>
 #include <type_traits>
@@ -150,9 +152,11 @@ public:
             if (getenv("TP_TRACE_KERNEL_MISS") != nullptr) {
                 fprintf(stderr, "[kernel-miss] op=%s key=%d\n",
                         handle.name(), static_cast<int>(key));
+#if defined(__GLIBC__)
                 void* bt[32];
                 int n = backtrace(bt, 32);
                 backtrace_symbols_fd(bt, n, 2);
+#endif
             }
             TP_THROW(NotImplementedError, "Kernel not found for op: " +
                 std::string(handle.name()) + " on backend: " + toString(key));
