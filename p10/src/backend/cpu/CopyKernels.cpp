@@ -6,6 +6,7 @@
 #include "Utils.h"
 #include "SparseKernels.h"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <numeric>
 #include <type_traits>
@@ -530,7 +531,119 @@ inline int64_t embedding_grain_indices(int64_t row_size) {
 // single-threaded accumulation to the sorted-segment parallel path.
 constexpr int64_t kEmbeddingSortedBackwardElements = 1 << 18;
 
+template <typename T>
+void embedding_renorm_rows(
+        Tensor& weight, const Tensor& indices, double max_norm,
+        double norm_type) {
+    const Tensor indices_contiguous = indices.contiguous();
+    const int64_t rows = weight.size(0);
+    const int64_t columns = weight.size(1);
+    const int64_t row_stride = weight.stride(0);
+    const int64_t column_stride = weight.stride(1);
+    T* const data = weight.data_ptr<T>();
+    std::vector<uint8_t> seen(static_cast<size_t>(rows), 0);
+    std::vector<int64_t> selected_rows;
+    selected_rows.reserve(static_cast<size_t>(indices.numel()));
+
+    auto renorm_row = [&](int64_t row) {
+        if (seen[static_cast<size_t>(row)] != 0) return;
+        seen[static_cast<size_t>(row)] = 1;
+        T* const row_data = data + row * row_stride;
+
+        double norm = 0.0;
+        if (std::isinf(norm_type)) {
+            for (int64_t column = 0; column < columns; ++column) {
+                norm = std::max(
+                    norm,
+                    std::abs(static_cast<double>(row_data[column * column_stride])));
+            }
+        } else {
+            double sum = 0.0;
+            for (int64_t column = 0; column < columns; ++column) {
+                const double value = static_cast<double>(
+                    row_data[column * column_stride]);
+                sum += std::pow(std::abs(value), norm_type);
+            }
+            norm = std::pow(sum, 1.0 / norm_type);
+        }
+
+        if (norm > max_norm) {
+            const double scale = max_norm / norm;
+            for (int64_t column = 0; column < columns; ++column) {
+                const int64_t offset = column * column_stride;
+                row_data[offset] = static_cast<T>(
+                    static_cast<double>(row_data[offset]) * scale);
+            }
+        }
+    };
+
+    if (indices.dtype() == DType::Int64) {
+        const int64_t* const index_data = indices_contiguous.data_ptr<int64_t>();
+        for (int64_t i = 0; i < indices.numel(); ++i) {
+            int64_t row = index_data[i];
+            if (row < 0 || row >= rows) {
+                TP_THROW(IndexError, "embedding_renorm_: index out of range");
+            }
+            selected_rows.push_back(row);
+        }
+    } else {
+        const int32_t* const index_data = indices_contiguous.data_ptr<int32_t>();
+        for (int64_t i = 0; i < indices.numel(); ++i) {
+            int64_t row = static_cast<int64_t>(index_data[i]);
+            if (row < 0 || row >= rows) {
+                TP_THROW(IndexError, "embedding_renorm_: index out of range");
+            }
+            selected_rows.push_back(row);
+        }
+    }
+    for (const int64_t row : selected_rows) renorm_row(row);
+}
+
 } // namespace
+
+Tensor& embedding_renorm_cpu(
+        Tensor& weight, const Tensor& indices, double max_norm,
+        double norm_type) {
+    if (weight.device().type() != DeviceType::CPU ||
+        indices.device().type() != DeviceType::CPU) {
+        TP_THROW(RuntimeError, "embedding_renorm_: CPU tensors are required");
+    }
+    if (weight.device() != indices.device()) {
+        TP_THROW(RuntimeError,
+                 "embedding_renorm_: weight and indices must be on the same device");
+    }
+    if (weight.dim() != 2) {
+        TP_THROW(RuntimeError, "embedding_renorm_: weight must be 2-D");
+    }
+    if (indices.dtype() != DType::Int64 && indices.dtype() != DType::Int32) {
+        TP_THROW(TypeError, "embedding_renorm_: indices must be Int64 or Int32");
+    }
+    if (!(max_norm > 0.0)) {
+        TP_THROW(ValueError, "embedding_renorm_: max_norm must be positive");
+    }
+    if (!(norm_type > 0.0)) {
+        TP_THROW(ValueError, "embedding_renorm_: norm_type must be positive");
+    }
+
+    switch (weight.dtype()) {
+#define RENORM_CASE(ctype, name) \
+        case DType::name: \
+            embedding_renorm_rows<ctype>(weight, indices, max_norm, norm_type); \
+            return weight;
+        RENORM_CASE(float, Float32)
+        RENORM_CASE(double, Float64)
+        RENORM_CASE(Half, Float16)
+        RENORM_CASE(BFloat16, BFloat16)
+        RENORM_CASE(Float8_e4m3fn, Float8_e4m3fn)
+        RENORM_CASE(Float8_e5m2, Float8_e5m2)
+        RENORM_CASE(Float8_e4m3fnuz, Float8_e4m3fnuz)
+        RENORM_CASE(Float8_e5m2fnuz, Float8_e5m2fnuz)
+        RENORM_CASE(Float8_e8m0fnu, Float8_e8m0fnu)
+#undef RENORM_CASE
+        default:
+            TP_THROW(TypeError, "embedding_renorm_: weight must have a floating dtype");
+    }
+}
 
 Tensor embedding_cpu(const Tensor& weight, const Tensor& indices, int64_t padding_idx, bool scale_grad_by_freq, bool sparse) {
     (void)padding_idx;
@@ -821,6 +934,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, CopyKernels) {
     m.impl("sparse_mul", sparse_mul_cpu);
     m.impl("spdiags", spdiags_cpu);
     m.impl("embedding", embedding_cpu);
+    m.impl("embedding_renorm_", embedding_renorm_cpu);
     m.impl("embedding_dense_backward", embedding_dense_backward_cpu);
     m.impl("embedding_sparse_backward", embedding_sparse_backward_cpu);
     m.impl("embedding_backward", embedding_backward_cpu);

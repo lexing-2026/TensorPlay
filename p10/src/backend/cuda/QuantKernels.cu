@@ -6,9 +6,9 @@
 #include "Utils.h"
 
 #include <cuda_runtime.h>
+#include <cmath>
+#include <limits>
 #include <optional>
-#include <vector>
-#include <cuda_runtime.h>
 #include <vector>
 
 namespace tensorplay {
@@ -74,6 +74,23 @@ __global__ void quantize_per_channel_kernel(
     output[i] = static_cast<int8_t>(clamped);
 }
 
+__global__ void quantize_per_channel_float_qparams_kernel(
+    int64_t numel,
+    const float* input,
+    int8_t* output,
+    int64_t stride_on_axis,
+    int64_t channels,
+    const float* scales,
+    const float* zero_points) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= numel) return;
+    const int64_t c = (i / stride_on_axis) % channels;
+    const float q = nearbyintf(input[i] * (1.0f / scales[c]) +
+                               zero_points[c]);
+    const float clamped = fminf(127.0f, fmaxf(-128.0f, q));
+    output[i] = static_cast<int8_t>(clamped);
+}
+
 __global__ void dequantize_per_channel_kernel(
     int64_t numel,
     const int8_t* input,
@@ -89,9 +106,23 @@ __global__ void dequantize_per_channel_kernel(
                  static_cast<float>(zero_points[c])) * scales[c];
 }
 
+__global__ void dequantize_per_channel_float_qparams_kernel(
+    int64_t numel,
+    const int8_t* input,
+    float* output,
+    int64_t stride_on_axis,
+    int64_t channels,
+    const float* scales,
+    const float* zero_points) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= numel) return;
+    const int64_t c = (i / stride_on_axis) % channels;
+    output[i] = (static_cast<float>(input[i]) - zero_points[c]) * scales[c];
+}
+
 void check_qparams(double scale, int64_t zero_point, int64_t quant_min,
                    int64_t quant_max) {
-    if (!(scale > 0.0)) {
+    if (!std::isfinite(scale) || !(scale > 0.0)) {
         TP_THROW(ValueError, "quantize(): scale must be positive");
     }
     if (quant_min >= quant_max) {
@@ -99,6 +130,14 @@ void check_qparams(double scale, int64_t zero_point, int64_t quant_min,
     }
     if (zero_point < quant_min || zero_point > quant_max) {
         TP_THROW(ValueError, "quantize(): zero_point out of the quantized range");
+    }
+}
+
+void check_storage_range(int64_t quant_min, int64_t quant_max,
+                         int64_t storage_min, int64_t storage_max) {
+    if (quant_min < storage_min || quant_max > storage_max) {
+        TP_THROW(ValueError,
+                 "quantize(): quantization range does not fit the output storage");
     }
 }
 
@@ -110,8 +149,7 @@ struct QuantInputs {
 };
 
 QuantInputs prepare_quantize(const Tensor& self, int64_t axis = 0) {
-    if (self.dtype() != DType::Float32 && self.dtype() != DType::Float16 &&
-        self.dtype() != DType::BFloat16 && self.dtype() != DType::Float64) {
+    if (!isFloatingType(self.dtype())) {
         TP_THROW(TypeError, "quantize(): expected a floating point tensor");
     }
     QuantInputs out{};
@@ -129,12 +167,13 @@ Tensor quantize_per_tensor_cuda(const Tensor& self, double scale,
                                 int64_t zero_point, int64_t quant_min,
                                 int64_t quant_max) {
     check_qparams(scale, zero_point, quant_min, quant_max);
+    check_storage_range(quant_min, quant_max, -128, 127);
     QuantInputs prepared = prepare_quantize(self);
     Tensor out = Tensor::empty(self.shape(), DType::QInt8, self.device());
     const int64_t numel = prepared.input.numel();
     if (numel == 0) {
         out.impl()->set_quantizer(
-            std::make_shared<PerTensorAffineQuantizer>(scale, zero_point));
+            make_per_tensor_affine_quantizer(scale, zero_point, DType::QInt8));
         return out;
     }
     const cudaStream_t stream = getCurrentCUDAStream().stream();
@@ -146,7 +185,7 @@ Tensor quantize_per_tensor_cuda(const Tensor& self, double scale,
         quant_min, quant_max);
     checkCuda(cudaGetLastError(), "CUDA quantize_per_tensor kernel");
     out.impl()->set_quantizer(
-        std::make_shared<PerTensorAffineQuantizer>(scale, zero_point));
+        make_per_tensor_affine_quantizer(scale, zero_point, DType::QInt8));
     return out;
 }
 
@@ -155,9 +194,7 @@ Tensor dequantize_per_tensor_cuda(const Tensor& self, double scale,
     if (self.dtype() != DType::QInt8) {
         TP_THROW(TypeError, "dequantize(): expected a QInt8 tensor");
     }
-    if (!(scale > 0.0)) {
-        TP_THROW(ValueError, "dequantize(): scale must be positive");
-    }
+    make_per_tensor_affine_quantizer(scale, zero_point, DType::QInt8);
     Tensor input = self.contiguous();
     Tensor out = Tensor::empty(self.shape(), DType::Float32, self.device());
     const int64_t numel = input.numel();
@@ -186,23 +223,35 @@ Tensor quantize_per_channel_cuda(const Tensor& self, const Tensor& scales,
         TP_THROW(ValueError,
                  "quantize(): scales size must match the quantized dimension");
     }
+    if (scales.device() != self.device() ||
+        zero_points.device() != self.device()) {
+        TP_THROW(RuntimeError,
+                 "quantize(): scales and zero_points must be on the input device");
+    }
+    QuantizerPtr quantizer = make_per_channel_affine_quantizer(
+        scales, zero_points, axis, DType::QInt8);
     QuantInputs prepared = prepare_quantize(self, axis);
     Tensor scales_f32 = scales.to(DType::Float32).contiguous();
-    Tensor zps_i64 = zero_points.to(DType::Int64).contiguous();
     Tensor out = Tensor::empty(self.shape(), DType::QInt8, self.device());
-    out.impl()->set_quantizer(
-        std::make_shared<PerChannelAffineQuantizer>(
-            scales.to(DType::Float64).contiguous(),
-            zps_i64, axis));
+    out.impl()->set_quantizer(quantizer);
     const int64_t numel = prepared.input.numel();
     if (numel == 0) return out;
     const cudaStream_t stream = getCurrentCUDAStream().stream();
     const int threads = 128;
     const int blocks = static_cast<int>((numel + threads - 1) / threads);
-    quantize_per_channel_kernel<<<blocks, threads, 0, stream>>>(
-        numel, prepared.input.data_ptr<float>(), out.data_ptr<int8_t>(),
-        prepared.stride_on_axis, scales.size(0),
-        scales_f32.data_ptr<float>(), zps_i64.data_ptr<int64_t>());
+    if (isFloatingType(zero_points.dtype())) {
+        Tensor zps_f32 = zero_points.to(DType::Float32).contiguous();
+        quantize_per_channel_float_qparams_kernel<<<blocks, threads, 0, stream>>>(
+            numel, prepared.input.data_ptr<float>(), out.data_ptr<int8_t>(),
+            prepared.stride_on_axis, scales.size(0),
+            scales_f32.data_ptr<float>(), zps_f32.data_ptr<float>());
+    } else {
+        Tensor zps_i64 = zero_points.to(DType::Int64).contiguous();
+        quantize_per_channel_kernel<<<blocks, threads, 0, stream>>>(
+            numel, prepared.input.data_ptr<float>(), out.data_ptr<int8_t>(),
+            prepared.stride_on_axis, scales.size(0),
+            scales_f32.data_ptr<float>(), zps_i64.data_ptr<int64_t>());
+    }
     checkCuda(cudaGetLastError(), "CUDA quantize_per_channel kernel");
     return out;
 }
@@ -224,9 +273,15 @@ Tensor dequantize_per_channel_cuda(const Tensor& self, const Tensor& scales,
         TP_THROW(ValueError,
                  "dequantize(): scales size must match the quantized dimension");
     }
+    if (scales.device() != self.device() ||
+        zero_points.device() != self.device()) {
+        TP_THROW(RuntimeError,
+                 "dequantize(): scales and zero_points must be on the input device");
+    }
+    QuantizerPtr quantizer = make_per_channel_affine_quantizer(
+        scales, zero_points, axis, DType::QInt8);
     Tensor input = self.contiguous();
     Tensor scales_f32 = scales.to(DType::Float32).contiguous();
-    Tensor zps_i64 = zero_points.to(DType::Int64).contiguous();
     Tensor out = Tensor::empty(self.shape(), DType::Float32, self.device());
 
     int64_t stride_on_axis = 1;
@@ -237,11 +292,21 @@ Tensor dequantize_per_channel_cuda(const Tensor& self, const Tensor& scales,
     const cudaStream_t stream = getCurrentCUDAStream().stream();
     const int threads = 128;
     const int blocks = static_cast<int>((numel + threads - 1) / threads);
-    dequantize_per_channel_kernel<<<blocks, threads, 0, stream>>>(
-        numel, input.data_ptr<int8_t>(), out.data_ptr<float>(),
-        stride_on_axis, scales.size(0),
-        scales_f32.data_ptr<float>(), zps_i64.data_ptr<int64_t>());
+    if (isFloatingType(zero_points.dtype())) {
+        Tensor zps_f32 = zero_points.to(DType::Float32).contiguous();
+        dequantize_per_channel_float_qparams_kernel<<<blocks, threads, 0, stream>>>(
+            numel, input.data_ptr<int8_t>(), out.data_ptr<float>(),
+            stride_on_axis, scales.size(0), scales_f32.data_ptr<float>(),
+            zps_f32.data_ptr<float>());
+    } else {
+        Tensor zps_i64 = zero_points.to(DType::Int64).contiguous();
+        dequantize_per_channel_kernel<<<blocks, threads, 0, stream>>>(
+            numel, input.data_ptr<int8_t>(), out.data_ptr<float>(),
+            stride_on_axis, scales.size(0), scales_f32.data_ptr<float>(),
+            zps_i64.data_ptr<int64_t>());
+    }
     checkCuda(cudaGetLastError(), "CUDA dequantize_per_channel kernel");
+    (void)quantizer;
     return out;
 }
 
@@ -457,8 +522,8 @@ Tensor quantized_binary_cuda_impl(
         static_cast<float>(1.0 / out_scale),
         static_cast<float>(out_zero_point), op);
     checkCuda(cudaGetLastError(), "CUDA quantized binary kernel");
-    out.impl()->set_quantizer(
-        std::make_shared<PerTensorAffineQuantizer>(out_scale, out_zero_point));
+    out.impl()->set_quantizer(make_per_tensor_affine_quantizer(
+        out_scale, out_zero_point, DType::QInt8));
     return out;
 }
 
@@ -558,8 +623,8 @@ Tensor quantized_clamp_cuda(
         min.has_value() ? static_cast<float>(min->toDouble()) : 0.0f,
         max.has_value() ? static_cast<float>(max->toDouble()) : 0.0f);
     checkCuda(cudaGetLastError(), "CUDA quantized_clamp kernel");
-    out.impl()->set_quantizer(
-        std::make_shared<PerTensorAffineQuantizer>(out_scale, out_zero_point));
+    out.impl()->set_quantizer(make_per_tensor_affine_quantizer(
+        out_scale, out_zero_point, DType::QInt8));
     return out;
 }
 
@@ -614,8 +679,8 @@ Tensor quantized_conv2d_cuda(
         static_cast<float>(1.0 / out_scale),
         static_cast<float>(out_zero_point));
     checkCuda(cudaGetLastError(), "CUDA quantized_conv2d requantize kernel");
-    out.impl()->set_quantizer(
-        std::make_shared<PerTensorAffineQuantizer>(out_scale, out_zero_point));
+    out.impl()->set_quantizer(make_per_tensor_affine_quantizer(
+        out_scale, out_zero_point, DType::QInt8));
     return out;
 }
 
@@ -682,23 +747,17 @@ __global__ void dequantize_int32_kernel(
 Tensor quantize_per_tensor_quint8_cuda(const Tensor& self, double scale,
                                         int64_t zero_point, int64_t quant_min,
                                         int64_t quant_max) {
-    if (!(scale > 0.0)) {
-        TP_THROW(ValueError, "quantize(): scale must be positive");
-    }
-    if (quant_min >= quant_max) {
-        TP_THROW(ValueError, "quantize(): quant_min must be < quant_max");
-    }
-    if (zero_point < quant_min || zero_point > quant_max) {
-        TP_THROW(ValueError, "quantize(): zero_point out of the quantized range");
-    }
-    Tensor input = self;
-    if (input.dtype() != DType::Float32) {
-        input = input.to(DType::Float32);
-    }
-    const Tensor ic = input.is_contiguous() ? input : input.contiguous();
+    check_qparams(scale, zero_point, quant_min, quant_max);
+    check_storage_range(quant_min, quant_max, 0, 255);
+    const Tensor ic = prepare_quantize(self).input;
     Tensor codes = Tensor::empty(self.shape(), DType::Int64, self.device());
     Tensor out = Tensor::empty(self.shape(), DType::QUInt8, self.device());
     const int64_t numel = self.numel();
+    if (numel == 0) {
+        out.impl()->set_quantizer(
+            make_per_tensor_affine_quantizer(scale, zero_point, DType::QUInt8));
+        return out;
+    }
     const int threads = 256;
     const int blocks = static_cast<int>((numel + threads - 1) / threads);
     quantize_codes_kernel<<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
@@ -710,7 +769,7 @@ Tensor quantize_per_tensor_quint8_cuda(const Tensor& self, double scale,
         numel, codes.data_ptr<int64_t>(), out.data_ptr<uint8_t>());
     checkCuda(cudaGetLastError(), "CUDA cast_codes_to_bytes kernel");
     out.impl()->set_quantizer(
-        std::make_shared<PerTensorAffineQuantizer>(scale, zero_point));
+        make_per_tensor_affine_quantizer(scale, zero_point, DType::QUInt8));
     return out;
 }
 
@@ -719,12 +778,11 @@ Tensor dequantize_per_tensor_quint8_cuda(const Tensor& self, double scale,
     if (self.dtype() != DType::QUInt8) {
         TP_THROW(TypeError, "dequantize(): expected a QUInt8 tensor");
     }
-    if (!(scale > 0.0)) {
-        TP_THROW(ValueError, "dequantize(): scale must be positive");
-    }
+    make_per_tensor_affine_quantizer(scale, zero_point, DType::QUInt8);
     const Tensor ic = self.is_contiguous() ? self : self.contiguous();
     Tensor out = Tensor::empty(self.shape(), DType::Float32, self.device());
     const int64_t numel = self.numel();
+    if (numel == 0) return out;
     const int threads = 256;
     const int blocks = static_cast<int>((numel + threads - 1) / threads);
     dequantize_uint8_kernel<<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
@@ -736,17 +794,17 @@ Tensor dequantize_per_tensor_quint8_cuda(const Tensor& self, double scale,
 
 Tensor quantize_per_tensor_qint32_cuda(const Tensor& self, double scale,
                                         int64_t zero_point) {
-    if (!(scale > 0.0)) {
-        TP_THROW(ValueError, "quantize(): scale must be positive");
-    }
-    Tensor input = self;
-    if (input.dtype() != DType::Float32) {
-        input = input.to(DType::Float32);
-    }
-    const Tensor ic = input.is_contiguous() ? input : input.contiguous();
+    check_qparams(scale, zero_point, std::numeric_limits<int32_t>::min(),
+                  std::numeric_limits<int32_t>::max());
+    const Tensor ic = prepare_quantize(self).input;
     Tensor codes = Tensor::empty(self.shape(), DType::Int64, self.device());
     Tensor out = Tensor::empty(self.shape(), DType::QInt32, self.device());
     const int64_t numel = self.numel();
+    if (numel == 0) {
+        out.impl()->set_quantizer(
+            make_per_tensor_affine_quantizer(scale, zero_point, DType::QInt32));
+        return out;
+    }
     const int threads = 256;
     const int blocks = static_cast<int>((numel + threads - 1) / threads);
     quantize_codes_kernel<<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
@@ -758,7 +816,7 @@ Tensor quantize_per_tensor_qint32_cuda(const Tensor& self, double scale,
         numel, codes.data_ptr<int64_t>(), out.data_ptr<int32_t>());
     checkCuda(cudaGetLastError(), "CUDA cast_codes_to_int32 kernel");
     out.impl()->set_quantizer(
-        std::make_shared<PerTensorAffineQuantizer>(scale, zero_point));
+        make_per_tensor_affine_quantizer(scale, zero_point, DType::QInt32));
     return out;
 }
 
@@ -767,12 +825,11 @@ Tensor dequantize_per_tensor_qint32_cuda(const Tensor& self, double scale,
     if (self.dtype() != DType::QInt32) {
         TP_THROW(TypeError, "dequantize(): expected a QInt32 tensor");
     }
-    if (!(scale > 0.0)) {
-        TP_THROW(ValueError, "dequantize(): scale must be positive");
-    }
+    make_per_tensor_affine_quantizer(scale, zero_point, DType::QInt32);
     const Tensor ic = self.is_contiguous() ? self : self.contiguous();
     Tensor out = Tensor::empty(self.shape(), DType::Float32, self.device());
     const int64_t numel = self.numel();
+    if (numel == 0) return out;
     const int threads = 256;
     const int blocks = static_cast<int>((numel + threads - 1) / threads);
     dequantize_int32_kernel<<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
@@ -1861,7 +1918,7 @@ Tensor quantize_per_tensor_dynamic_cuda(const Tensor& self, DType dtype,
     }
     checkCuda(cudaGetLastError(), "CUDA quantize_per_tensor_dynamic kernel");
     out.impl()->set_quantizer(
-        std::make_shared<PerTensorAffineQuantizer>(qp.scale, qp.zero_point));
+        make_per_tensor_affine_quantizer(qp.scale, qp.zero_point, dtype));
     return out;
 }
 
@@ -1925,7 +1982,7 @@ Tensor dequantize_self_cuda(const Tensor& self) {
         return self;
     }
     const auto q = quantized::quantizer_of(self);
-    if (q->qscheme() == QScheme::PerChannelAffine) {
+    if (isPerChannelQScheme(q->qscheme())) {
         return dequantize_per_channel_cuda(self, q->scales(),
                                            q->zero_points(), q->axis());
     }
@@ -1975,8 +2032,8 @@ Tensor _make_per_tensor_quantized_tensor_cuda(const Tensor& self, double scale,
     const DType qdt = quantized_dtype_of_codes_cuda(
         self, "_make_per_tensor_quantized_tensor");
     return quantized::make_qtensor(
-        self.clone(),
-        std::make_shared<PerTensorAffineQuantizer>(scale, zero_point), qdt);
+        self.clone(), make_per_tensor_affine_quantizer(scale, zero_point, qdt),
+        qdt);
 }
 
 Tensor _make_per_channel_quantized_tensor_cuda(const Tensor& self,
@@ -2011,8 +2068,7 @@ Tensor _make_per_channel_quantized_tensor_cuda(const Tensor& self,
         self, "_make_per_channel_quantized_tensor");
     return quantized::make_qtensor(
         self.clone(),
-        std::make_shared<PerChannelAffineQuantizer>(
-            sc, zero_point.to(DType::Int64).contiguous(), axis), qdt);
+        make_per_channel_affine_quantizer(scale, zero_point, axis, qdt), qdt);
 }
 
 std::tuple<Tensor, Tensor> _fused_moving_avg_obs_fq_helper_cuda(

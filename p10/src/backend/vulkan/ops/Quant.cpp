@@ -235,7 +235,7 @@ Tensor quantize_per_tensor_kernel(
   Tensor out_codes = convert(v_output);
   return quantized::make_qtensor(
       out_codes,
-      std::make_shared<PerTensorAffineQuantizer>(scale, zero_point),
+      make_per_tensor_affine_quantizer(scale, zero_point, DType::QInt8),
       DType::QInt8);
 }
 
@@ -401,7 +401,8 @@ Tensor quantized_binary_kernel_impl(
   Tensor out_codes = convert(v_output);
   return quantized::make_qtensor(
       out_codes,
-      std::make_shared<PerTensorAffineQuantizer>(out_scale, out_zero_point),
+      make_per_tensor_affine_quantizer(out_scale, out_zero_point,
+                                       DType::QInt8),
       DType::QInt8);
 }
 
@@ -501,7 +502,8 @@ Tensor quantized_clamp_kernel(
   Tensor out_codes = convert(v_output);
   return quantized::make_qtensor(
       out_codes,
-      std::make_shared<PerTensorAffineQuantizer>(out_scale, out_zero_point),
+      make_per_tensor_affine_quantizer(out_scale, out_zero_point,
+                                       DType::QInt8),
       DType::QInt8);
 }
 
@@ -852,7 +854,8 @@ Tensor quantized_conv2d_kernel(
   Tensor out_codes = convert(v_output);
   return quantized::make_qtensor(
       out_codes,
-      std::make_shared<PerTensorAffineQuantizer>(out_scale, out_zero_point),
+      make_per_tensor_affine_quantizer(out_scale, out_zero_point,
+                                       DType::QInt8),
       DType::QInt8);
 }
 
@@ -909,7 +912,7 @@ Tensor quantize_per_tensor_quint8_kernel(
   Tensor out_codes = convert(v_output);
   return quantized::make_qtensor(
       out_codes,
-      std::make_shared<PerTensorAffineQuantizer>(scale, zero_point),
+      make_per_tensor_affine_quantizer(scale, zero_point, DType::QUInt8),
       DType::QUInt8);
 }
 
@@ -1003,7 +1006,7 @@ Tensor quantize_per_tensor_qint32_kernel(
   Tensor out_codes = convert(v_output);
   return quantized::make_qtensor(
       out_codes,
-      std::make_shared<PerTensorAffineQuantizer>(scale, zero_point),
+      make_per_tensor_affine_quantizer(scale, zero_point, DType::QInt32),
       DType::QInt32);
 }
 
@@ -1202,7 +1205,8 @@ Tensor record_qconv_op(
   Tensor out_codes = convert(v_output);
   return quantized::make_qtensor(
       out_codes,
-      std::make_shared<PerTensorAffineQuantizer>(out_scale, out_zero_point),
+      make_per_tensor_affine_quantizer(out_scale, out_zero_point,
+                                       DType::QUInt8),
       DType::QUInt8);
 }
 

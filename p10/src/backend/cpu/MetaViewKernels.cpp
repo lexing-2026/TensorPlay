@@ -222,6 +222,9 @@ Scalar item_cpu(const Tensor& self) {
         case DType::BFloat16: return Scalar(static_cast<float>(*impl->data<BFloat16>()));
         case DType::Float8_e4m3fn: return Scalar(static_cast<float>(*impl->data<Float8_e4m3fn>()));
         case DType::Float8_e5m2: return Scalar(static_cast<float>(*impl->data<Float8_e5m2>()));
+        case DType::Float8_e4m3fnuz: return Scalar(static_cast<float>(*impl->data<Float8_e4m3fnuz>()));
+        case DType::Float8_e5m2fnuz: return Scalar(static_cast<float>(*impl->data<Float8_e5m2fnuz>()));
+        case DType::Float8_e8m0fnu: return Scalar(static_cast<float>(*impl->data<Float8_e8m0fnu>()));
         case DType::Int8: return Scalar(static_cast<int64_t>(*impl->data<int8_t>()));
         case DType::Int16: return Scalar(static_cast<int64_t>(*impl->data<int16_t>()));
         case DType::Int32: return Scalar(static_cast<int64_t>(*impl->data<int32_t>()));

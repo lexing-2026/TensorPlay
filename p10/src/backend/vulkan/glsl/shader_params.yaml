@@ -623,6 +623,48 @@ dequantize_per_tensor:
   shader_variants:
     - NAME: dequantize_per_tensor
 
+reduce_extremum:
+  parameter_names_with_default_values:
+    OPERATOR: max(X, Y)
+    COLLAPSE: max(max(V.x, V.y), max(V.z, V.w))
+    NEUTRAL: -3.402823466e38
+    FORMAT: rgba32f
+  generate_variant_forall:
+    FORMAT:
+      - VALUE: rgba32f
+        SUFFIX: ""
+      - VALUE: rgba16f
+        SUFFIX: _f16
+  shader_variants:
+    - NAME: reduce_max
+      OPERATOR: max(X, Y)
+      COLLAPSE: max(max(V.x, V.y), max(V.z, V.w))
+      NEUTRAL: -3.402823466e38
+    - NAME: reduce_min
+      OPERATOR: min(X, Y)
+      COLLAPSE: min(min(V.x, V.y), min(V.z, V.w))
+      NEUTRAL: 3.402823466e38
+    - NAME: reduce_prod
+      OPERATOR: X * Y
+      COLLAPSE: V.x * V.y * V.z * V.w
+      NEUTRAL: 1.0
+
+reduce_argextremum:
+  parameter_names_with_default_values:
+    GREATER: 1
+    FORMAT: rgba32f
+  generate_variant_forall:
+    FORMAT:
+      - VALUE: rgba32f
+        SUFFIX: ""
+      - VALUE: rgba16f
+        SUFFIX: _f16
+  shader_variants:
+    - NAME: reduce_argmax
+      GREATER: 1
+    - NAME: reduce_argmin
+      GREATER: 0
+
 quantized_binary_op:
   parameter_names_with_default_values:
     OPERATOR: X + Y

@@ -378,6 +378,18 @@ Scalar item_cuda(const Tensor& self) {
             Float8_e5m2 v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
             return Scalar(static_cast<float>(v));
         }
+        case DType::Float8_e4m3fnuz: {
+            Float8_e4m3fnuz v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(static_cast<float>(v));
+        }
+        case DType::Float8_e5m2fnuz: {
+            Float8_e5m2fnuz v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(static_cast<float>(v));
+        }
+        case DType::Float8_e8m0fnu: {
+            Float8_e8m0fnu v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(static_cast<float>(v));
+        }
         case DType::Int8: {
             int8_t v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
             return Scalar(static_cast<int64_t>(v));

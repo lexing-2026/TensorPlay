@@ -278,12 +278,21 @@ class QScheme(IntEnum):
 
     PER_TENSOR_AFFINE = 0
     PER_CHANNEL_AFFINE = 1
-    per_tensor_affine = 0
-    per_channel_affine = 1
+    PER_TENSOR_SYMMETRIC = 2
+    PER_CHANNEL_SYMMETRIC = 3
+    PER_CHANNEL_AFFINE_FLOAT_QPARAMS = 4
+    per_tensor_affine = PER_TENSOR_AFFINE
+    per_channel_affine = PER_CHANNEL_AFFINE
+    per_tensor_symmetric = PER_TENSOR_SYMMETRIC
+    per_channel_symmetric = PER_CHANNEL_SYMMETRIC
+    per_channel_affine_float_qparams = PER_CHANNEL_AFFINE_FLOAT_QPARAMS
 
 
 per_tensor_affine = QScheme.PER_TENSOR_AFFINE
 per_channel_affine = QScheme.PER_CHANNEL_AFFINE
+per_tensor_symmetric = QScheme.PER_TENSOR_SYMMETRIC
+per_channel_symmetric = QScheme.PER_CHANNEL_SYMMETRIC
+per_channel_affine_float_qparams = QScheme.PER_CHANNEL_AFFINE_FLOAT_QPARAMS
 
 
 class Layout(IntEnum):
@@ -318,6 +327,7 @@ __all__ = [
     "uint8", "int8", "int16", "uint16", "uint32", "uint64", "int32", "int64",
     "float16", "bfloat16", "float32", "float64", "complex32", "complex64", "complex128", "bcomplex32", "bool",
     "qint8", "quint8", "qint32", "QScheme", "per_tensor_affine", "per_channel_affine",
+    "per_tensor_symmetric", "per_channel_symmetric", "per_channel_affine_float_qparams",
     "half", "float", "double", "short", "int", "long", "cfloat", "cdouble", "chalf",
     "save", "load", "inspect_checkpoint", "as_tensor",
     "no_grad", "enable_grad", "set_grad_enabled", "is_grad_enabled",

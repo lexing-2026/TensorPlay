@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "benchmark": "cpu-train-step",
+  "threads": 2,
+  "measurements": [
+    {
+      "name": "qkv-proj",
+      "category": "training",
+      "batch_tokens": 512,
+      "in_features": 4096,
+      "out_features": 4096,
+      "forward_seconds": 0.08036556800652761,
+      "step_seconds": 0.2808993139915401
+    },
+    {
+      "name": "mlp-up",
+      "category": "training",
+      "batch_tokens": 512,
+      "in_features": 4096,
+      "out_features": 11008,
+      "forward_seconds": 0.21713474900752772,
+      "step_seconds": 0.7829317459982121
+    },
+    {
+      "name": "mlp-down",
+      "category": "training",
+      "batch_tokens": 512,
+      "in_features": 11008,
+      "out_features": 4096,
+      "forward_seconds": 0.22552354700746946,
+      "step_seconds": 0.9071622019982897
+    },
+    {
+      "name": "small-net",
+      "category": "training",
+      "batch_tokens": 128,
+      "in_features": 1024,
+      "out_features": 1024,
+      "forward_seconds": 0.0017579639970790595,
+      "step_seconds": 0.0052997930033598095
+    },
+    {
+      "name": "decode-1",
+      "category": "training",
+      "batch_tokens": 1,
+      "in_features": 4096,
+      "out_features": 4096,
+      "forward_seconds": 0.0031879979942459613,
+      "step_seconds": 0.02086972699908074
+    }
+  ]
+}

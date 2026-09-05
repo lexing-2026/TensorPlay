@@ -11,7 +11,7 @@ namespace.  The package is split so each family can grow on its own:
   and the chained products.
 * :mod:`~tensorplay.linalg._common` -- result tuples and the dtype guards.
 
-Current scope: real float32/float64.  Complex inputs raise NotImplementedError.
+The dense decomposition paths cover float32/float64/complex64/complex128.
 """
 from ._common import (
     EigResult,

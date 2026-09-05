@@ -22,17 +22,17 @@
     tensorplay.functional.chebyshev_polynomial_v
     tensorplay.functional.chebyshev_polynomial_w
     tensorplay.functional.digamma
-    tensorplay.special.entr
+    tensorplay.functional.entr
     tensorplay.functional.erf
     tensorplay.functional.erfc
-    tensorplay.special.erfcx
+    tensorplay.functional.erfcx
     tensorplay.functional.erfinv
     tensorplay.functional.exp2
-    tensorplay.special.expit
+    tensorplay.special._error.expit
     tensorplay.functional.expm1
     tensorplay.functional.gammainc
     tensorplay.functional.gammaincc
-    tensorplay.special.gammaln
+    tensorplay.special._gamma.gammaln
     tensorplay.functional.hermite_polynomial_h
     tensorplay.functional.hermite_polynomial_he
     tensorplay.functional.i0
@@ -42,20 +42,20 @@
     tensorplay.functional.laguerre_polynomial_l
     tensorplay.functional.legendre_polynomial_p
     tensorplay.functional.log1p
-    tensorplay.special.log_ndtr
-    tensorplay.special.log_softmax
+    tensorplay.functional.log_ndtr
+    tensorplay.special._elementwise.log_softmax
     tensorplay.functional.logit
-    tensorplay.special.logsumexp
-    tensorplay.special.modified_bessel_i0
+    tensorplay.special._elementwise.logsumexp
+    tensorplay.functional.modified_bessel_i0
     tensorplay.functional.modified_bessel_i1
     tensorplay.functional.modified_bessel_k0
     tensorplay.functional.modified_bessel_k1
-    tensorplay.special.multigammaln
-    tensorplay.special.ndtr
-    tensorplay.special.ndtri
-    tensorplay.special.polygamma
-    tensorplay.special.psi
-    tensorplay.special.round
+    tensorplay.special._gamma.multigammaln
+    tensorplay.functional.ndtr
+    tensorplay.functional.ndtri
+    tensorplay.special._gamma.polygamma
+    tensorplay.special._gamma.psi
+    tensorplay.special._elementwise.round
     tensorplay.functional.scaled_modified_bessel_k0
     tensorplay.functional.scaled_modified_bessel_k1
     tensorplay.functional.shifted_chebyshev_polynomial_t
@@ -63,10 +63,10 @@
     tensorplay.functional.shifted_chebyshev_polynomial_v
     tensorplay.functional.shifted_chebyshev_polynomial_w
     tensorplay.functional.sinc
-    tensorplay.special.softmax
+    tensorplay.special._elementwise.softmax
     tensorplay.functional.spherical_bessel_j0
-    tensorplay.special.xlog1py
-    tensorplay.special.xlogy
+    tensorplay.functional.xlog1py
+    tensorplay.functional.xlogy
     tensorplay.functional.zeta
 ```
 

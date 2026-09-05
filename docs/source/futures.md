@@ -13,5 +13,7 @@
     :nosignatures:
 
     tensorplay.futures.Future
+    tensorplay.futures.collect_all
+    tensorplay.futures.wait_all
 ```
 

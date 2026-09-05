@@ -1,124 +1,187 @@
 #pragma once
 
+#include "Exception.h"
 #include "Macros.h"
 #include "Tensor.h"
 
+#include <cstdint>
 #include <memory>
-#include <vector>
+#include <string>
+#include <utility>
 
 namespace tensorplay {
 
-// Quantization schemes carried by a quantized tensor's quantizer.
-// Per-tensor affine stores one (scale, zero_point) pair; per-channel affine
-// stores a 1-D scale/zero-point vector indexed along `axis`.
-enum class QScheme : int8_t {
-    PerTensorAffine = 0,
-    PerChannelAffine = 1,
+enum class QScheme : uint8_t {
+    PER_TENSOR_AFFINE = 0,
+    PER_CHANNEL_AFFINE = 1,
+    PER_TENSOR_SYMMETRIC = 2,
+    PER_CHANNEL_SYMMETRIC = 3,
+    PER_CHANNEL_AFFINE_FLOAT_QPARAMS = 4,
+    COMPILE_TIME_NUM_QSCHEMES = 5,
 };
 
-inline const char* toString(QScheme scheme) {
+constexpr QScheme kPerTensorAffine = QScheme::PER_TENSOR_AFFINE;
+constexpr QScheme kPerChannelAffine = QScheme::PER_CHANNEL_AFFINE;
+constexpr QScheme kPerTensorSymmetric = QScheme::PER_TENSOR_SYMMETRIC;
+constexpr QScheme kPerChannelSymmetric = QScheme::PER_CHANNEL_SYMMETRIC;
+constexpr QScheme kPerChannelAffineFloatQParams =
+    QScheme::PER_CHANNEL_AFFINE_FLOAT_QPARAMS;
+constexpr int COMPILE_TIME_NUM_QSCHEMES =
+    static_cast<int>(QScheme::COMPILE_TIME_NUM_QSCHEMES);
+
+inline std::string toString(QScheme scheme) {
     switch (scheme) {
-        case QScheme::PerTensorAffine:
+        case kPerTensorAffine:
             return "per_tensor_affine";
-        case QScheme::PerChannelAffine:
+        case kPerChannelAffine:
             return "per_channel_affine";
+        case kPerTensorSymmetric:
+            return "per_tensor_symmetric";
+        case kPerChannelSymmetric:
+            return "per_channel_symmetric";
+        case kPerChannelAffineFloatQParams:
+            return "per_channel_affine_float_qparams";
+        default:
+            TP_THROW(ValueError, "unrecognized quantization scheme: ",
+                     static_cast<int>(scheme));
     }
-    return "unknown_scheme";
 }
 
-// Quantizer: the affine parameter set attached to a quantized tensor.  The
-// real-domain mapping is real = scale * (code - zero_point); per-channel
-// variants index the mapping along one tensor axis.  Quantizers are
-// immutable once attached and shared (not copied) between tensor views.
+inline bool isPerTensorQScheme(QScheme scheme) {
+    return scheme == kPerTensorAffine || scheme == kPerTensorSymmetric;
+}
+
+inline bool isPerChannelQScheme(QScheme scheme) {
+    return scheme == kPerChannelAffine ||
+           scheme == kPerChannelSymmetric ||
+           scheme == kPerChannelAffineFloatQParams;
+}
+
+class Quantizer;
+using QuantizerPtr = std::shared_ptr<Quantizer>;
+using ConstQuantizerPtr = std::shared_ptr<const Quantizer>;
+
 class P10_API Quantizer {
 public:
-    explicit Quantizer(QScheme scheme) : scheme_(scheme) {}
+    explicit Quantizer(DType scalar_type) : scalar_type_(scalar_type) {}
     virtual ~Quantizer() = default;
 
-    QScheme qscheme() const { return scheme_; }
+    virtual QScheme qscheme() const = 0;
+    DType scalar_type() const { return scalar_type_; }
+    virtual bool equalTo(const QuantizerPtr& other) const = 0;
 
-    // Per-tensor parameters; per-channel quantizers aggregate to a single
-    // pair only when their scales/zero_points are uniform, so the defaults
-    // below are only meaningful for the per-tensor scheme.
     virtual double scale() const { return 1.0; }
     virtual int64_t zero_point() const { return 0; }
-
-    // Per-channel parameters; empty tensors for the per-tensor scheme.
     virtual Tensor scales() const { return Tensor(); }
     virtual Tensor zero_points() const { return Tensor(); }
     virtual int64_t axis() const { return -1; }
 
 private:
-    QScheme scheme_;
+    const DType scalar_type_;
 };
 
-class P10_API PerTensorAffineQuantizer final : public Quantizer {
+class P10_API UnknownQuantizer final : public Quantizer {
 public:
-    PerTensorAffineQuantizer(double scale, int64_t zero_point)
-        : Quantizer(QScheme::PerTensorAffine),
+    explicit UnknownQuantizer(DType scalar_type) : Quantizer(scalar_type) {}
+
+    QScheme qscheme() const override {
+        TP_THROW(RuntimeError, "an unknown quantizer has no quantization scheme");
+    }
+
+    bool equalTo(const QuantizerPtr&) const override {
+        TP_THROW(RuntimeError, "an unknown quantizer cannot be compared");
+    }
+};
+
+class P10_API UniformQuantizer : public Quantizer {
+public:
+    explicit UniformQuantizer(DType scalar_type) : Quantizer(scalar_type) {}
+};
+
+class P10_API NonUniformQuantizer : public Quantizer {
+public:
+    explicit NonUniformQuantizer(DType scalar_type) : Quantizer(scalar_type) {}
+};
+
+class P10_API AffineQuantizer : public UniformQuantizer {
+public:
+    explicit AffineQuantizer(DType scalar_type)
+        : UniformQuantizer(scalar_type) {}
+};
+
+class P10_API PerTensorAffineQuantizer final : public AffineQuantizer {
+public:
+    PerTensorAffineQuantizer(DType scalar_type, double scale,
+                             int64_t zero_point)
+        : AffineQuantizer(scalar_type),
           scale_(scale),
           zero_point_(zero_point) {}
 
+    QScheme qscheme() const override { return kPerTensorAffine; }
     double scale() const override { return scale_; }
     int64_t zero_point() const override { return zero_point_; }
+    bool equalTo(const QuantizerPtr& other) const override;
 
 private:
-    double scale_;
-    int64_t zero_point_;
+    const double scale_;
+    const int64_t zero_point_;
 };
 
-class P10_API PerChannelAffineQuantizer final : public Quantizer {
+class P10_API PerChannelAffineQuantizer : public AffineQuantizer {
 public:
-    PerChannelAffineQuantizer(Tensor scales, Tensor zero_points, int64_t axis)
-        : Quantizer(QScheme::PerChannelAffine),
+    PerChannelAffineQuantizer(DType scalar_type, Tensor scales,
+                              Tensor zero_points, int64_t axis)
+        : AffineQuantizer(scalar_type),
           scales_(std::move(scales)),
           zero_points_(std::move(zero_points)),
           axis_(axis) {}
 
+    QScheme qscheme() const override { return kPerChannelAffine; }
     Tensor scales() const override { return scales_; }
     Tensor zero_points() const override { return zero_points_; }
     int64_t axis() const override { return axis_; }
+    bool equalTo(const QuantizerPtr& other) const override;
 
-private:
+protected:
     Tensor scales_;
     Tensor zero_points_;
-    int64_t axis_;
+    const int64_t axis_;
 };
 
-// Storage code type a quantized dtype maps onto.
-ScalarType underlying_storage_type(DType dtype);
+class P10_API PerChannelAffineFloatQParamsQuantizer final
+    : public PerChannelAffineQuantizer {
+public:
+    PerChannelAffineFloatQParamsQuantizer(DType scalar_type, Tensor scales,
+                                           Tensor zero_points, int64_t axis)
+        : PerChannelAffineQuantizer(scalar_type, std::move(scales),
+                                    std::move(zero_points), axis) {}
 
-// DType used for a quantized tensor under `scheme`: per-channel tensors are
-// Int8 storage, matching how the quantize kernels emit codes.
-DType quantized_dtype_for_scheme(QScheme scheme);
+    QScheme qscheme() const override { return kPerChannelAffineFloatQParams; }
+    bool equalTo(const QuantizerPtr& other) const override;
+};
+
+P10_API QuantizerPtr make_per_tensor_affine_quantizer(
+    double scale, int64_t zero_point, DType scalar_type);
+P10_API QuantizerPtr make_per_channel_affine_quantizer(
+    const Tensor& scales, const Tensor& zero_points, int64_t axis,
+    DType scalar_type);
+P10_API QuantizerPtr make_unknown_quantizer(DType scalar_type);
+
+P10_API ScalarType underlying_storage_type(DType dtype);
+P10_API DType quantized_dtype_for_scheme(QScheme scheme);
 
 namespace quantized {
 
-// True when the tensor carries a quantizer.
 P10_API bool is_quantized(const Tensor& t);
-
-// Returns the attached quantizer or nullptr.
-P10_API std::shared_ptr<Quantizer> quantizer_of(const Tensor& t);
-
-// Requires a quantized tensor carrying a quantizer; throws otherwise.
+P10_API QuantizerPtr quantizer_of(const Tensor& t);
 P10_API void require_quantized(const Tensor& t, const char* op);
 
-// Wraps `codes` (an Int8/UInt8/Int32 tensor) as a quantized tensor of
-// dtype `dtype` carrying `quantizer`.  The storage is shared, not copied:
-// codes are reinterpreted as the quantized dtype's storage.
-P10_API Tensor make_qtensor(const Tensor& codes,
-                            std::shared_ptr<Quantizer> quantizer,
+P10_API Tensor make_qtensor(const Tensor& codes, QuantizerPtr quantizer,
                             DType dtype);
-
-// Detaches the quantizer, returning a plain integer tensor over the same
-// storage and shape (the "integer representation" view).
 P10_API Tensor strip_quantizer(const Tensor& t);
 
-// Per-tensor qparams; throws for tensors without a per-tensor quantizer.
 P10_API double q_scale(const Tensor& t);
 P10_API int64_t q_zero_point(const Tensor& t);
-
-// Per-channel qparams; throws for tensors without a per-channel quantizer.
 P10_API Tensor q_per_channel_scales(const Tensor& t);
 P10_API Tensor q_per_channel_zero_points(const Tensor& t);
 P10_API int64_t q_per_channel_axis(const Tensor& t);

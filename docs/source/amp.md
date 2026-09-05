@@ -26,6 +26,5 @@
     :nosignatures:
 
     tensorplay.amp.grad_scaler.GradScaler
-    tensorplay.amp.is_autocast_available
 ```
 

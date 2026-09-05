@@ -13,16 +13,20 @@
     :nosignatures:
 
     tensorplay.is_tensor
+    tensorplay.is_storage
     tensorplay.functional.is_complex
-    tensorplay._composite_funcs.is_conj
-    tensorplay._composite_funcs.is_neg
-    tensorplay._composite_funcs.is_nonzero
-    tensorplay._composite_funcs.is_same_size
+    tensorplay.functional.is_conj
+    tensorplay.functional.is_floating_point
+    tensorplay.functional.is_inference
+    tensorplay.functional.is_neg
+    tensorplay.functional.is_nonzero
+    tensorplay.functional.is_same_size
+    tensorplay.functional.is_signed
     tensorplay.set_default_dtype
     tensorplay.get_default_dtype
     tensorplay.set_default_device
     tensorplay.get_default_device
-    tensorplay._composite_funcs.numel
+    tensorplay.functional.numel
     tensorplay.set_printoptions
 ```
 
@@ -35,25 +39,40 @@
 
     tensorplay.tensor
     tensorplay.functional.sparse_coo_tensor
+    tensorplay.functional.sparse_csr_tensor
+    tensorplay.functional.sparse_csc_tensor
+    tensorplay.functional.sparse_bsr_tensor
+    tensorplay.functional.sparse_bsc_tensor
+    tensorplay.asarray
     tensorplay.as_tensor
+    tensorplay.functional.as_strided
+    tensorplay.functional.from_file
+    tensorplay.from_numpy
     tensorplay.from_dlpack
-    tensorplay.functional.zeros
+    tensorplay.frombuffer
+    tensorplay.zeros
     tensorplay.functional.zeros_like
-    tensorplay.functional.ones
+    tensorplay.ones
     tensorplay.functional.ones_like
     tensorplay.functional.arange
+    tensorplay.functional.range
     tensorplay.functional.linspace
     tensorplay.functional.logspace
     tensorplay.functional.eye
-    tensorplay.functional.empty
+    tensorplay.empty
     tensorplay.functional.empty_like
-    tensorplay.functional.full
+    tensorplay.functional.empty_permuted
+    tensorplay.functional.empty_quantized
+    tensorplay.functional.empty_strided
+    tensorplay.full
     tensorplay.functional.full_like
     tensorplay.functional.quantize_per_tensor
+    tensorplay.functional.quantize_per_tensor_dynamic
     tensorplay.functional.quantize_per_channel
+    tensorplay.functional.dequantize
     tensorplay.functional.complex
     tensorplay.functional.polar
-    tensorplay._composite_funcs.scalar_tensor
+    tensorplay.functional.scalar_tensor
     tensorplay.functional.heaviside
 ```
 
@@ -64,20 +83,26 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay._composite_funcs.adjoint
-    tensorplay._composite_funcs.alias_copy
+    tensorplay.functional.adjoint
+    tensorplay.functional.alias_copy
     tensorplay.functional.argwhere
+    tensorplay.functional.as_strided_copy
+    tensorplay.functional.as_strided_scatter
     tensorplay.functional.cat
-    tensorplay._composite_funcs.concat
-    tensorplay._composite_funcs.concatenate
+    tensorplay.functional.ccol_indices_copy
+    tensorplay.functional.col_indices_copy
+    tensorplay.functional.concat
+    tensorplay.functional.concatenate
     tensorplay.functional.conj
     tensorplay.functional.chunk
-    tensorplay._composite_funcs.detach
-    tensorplay._composite_funcs.diagonal_copy
+    tensorplay.functional.crow_indices_copy
+    tensorplay.functional.detach
+    tensorplay.functional.detach_copy
+    tensorplay.functional.diagonal_copy
     tensorplay.functional.dsplit
     tensorplay.functional.column_stack
     tensorplay.functional.dstack
-    tensorplay._composite_funcs.expand_copy
+    tensorplay.functional.expand_copy
     tensorplay.functional.fill
     tensorplay.functional.gather
     tensorplay.functional.hsplit
@@ -85,49 +110,60 @@
     tensorplay.functional.index_add
     tensorplay.functional.index_copy
     tensorplay.functional.index_put_
+    tensorplay.functional.index_reduce
     tensorplay.functional.index_select
+    tensorplay.functional.indices_copy
     tensorplay.functional.masked_fill
     tensorplay.functional.masked_select
     tensorplay.functional.movedim
     tensorplay.functional.moveaxis
     tensorplay.functional.narrow
-    tensorplay._composite_funcs.narrow_copy
+    tensorplay.functional.narrow_copy
     tensorplay.functional.nonzero
+    tensorplay.functional.nonzero_static
     tensorplay.functional.permute
-    tensorplay._composite_funcs.permute_copy
-    tensorplay._composite_funcs.put
+    tensorplay.functional.permute_copy
+    tensorplay.functional.put
     tensorplay.functional.reshape
+    tensorplay.functional.row_indices_copy
     tensorplay.functional.row_stack
     tensorplay.functional.select
-    tensorplay._composite_funcs.select_copy
+    tensorplay.functional.select_copy
     tensorplay.functional.scatter
     tensorplay.functional.diagonal_scatter
     tensorplay.functional.select_scatter
-    tensorplay._composite_funcs.slice_copy
+    tensorplay.functional.slice_copy
+    tensorplay.functional.slice_inverse
     tensorplay.functional.slice_scatter
     tensorplay.functional.scatter_add
+    tensorplay.functional.scatter_reduce
+    tensorplay.functional.segment_reduce
     tensorplay.functional.split
-    tensorplay._composite_funcs.split_copy
+    tensorplay.functional.split_copy
+    tensorplay.functional.split_with_sizes_copy
     tensorplay.functional.squeeze
-    tensorplay._composite_funcs.squeeze_copy
+    tensorplay.functional.squeeze_copy
     tensorplay.functional.stack
     tensorplay.functional.swapaxes
     tensorplay.functional.swapdims
     tensorplay.functional.t
-    tensorplay._composite_funcs.t_copy
+    tensorplay.functional.t_copy
     tensorplay.functional.take
     tensorplay.functional.take_along_dim
     tensorplay.functional.tensor_split
     tensorplay.functional.tile
     tensorplay.functional.transpose
-    tensorplay._composite_funcs.transpose_copy
+    tensorplay.functional.transpose_copy
     tensorplay.functional.unbind
-    tensorplay._composite_funcs.unbind_copy
-    tensorplay._composite_funcs.unfold_copy
+    tensorplay.functional.unbind_copy
+    tensorplay.functional.unfold_copy
     tensorplay._shape_funcs.unravel_index
     tensorplay.functional.unsqueeze
-    tensorplay._composite_funcs.unsqueeze_copy
-    tensorplay._composite_funcs.view_copy
+    tensorplay.functional.unsqueeze_copy
+    tensorplay.functional.values_copy
+    tensorplay.functional.view_as_complex_copy
+    tensorplay.functional.view_as_real_copy
+    tensorplay.functional.view_copy
     tensorplay.functional.vsplit
     tensorplay.functional.vstack
     tensorplay.functional.where
@@ -159,11 +195,11 @@
     tensorplay.functional.multinomial
     tensorplay.functional.normal
     tensorplay.functional.poisson
-    tensorplay.functional.rand
+    tensorplay.rand
     tensorplay.functional.rand_like
     tensorplay.functional.randint
     tensorplay.functional.randint_like
-    tensorplay.functional.randn
+    tensorplay.randn
     tensorplay.functional.randn_like
     tensorplay.functional.randperm
 ```
@@ -175,8 +211,9 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay.serialization.save
-    tensorplay.serialization.load
+    tensorplay.serialization.api.save
+    tensorplay.serialization.api.load
+    tensorplay.serialization.api.default_restore_location
 ```
 
 ## Parallelism
@@ -213,31 +250,37 @@
 
     tensorplay.functional.abs
     tensorplay.functional.abs_
-    tensorplay._composite_funcs.absolute
+    tensorplay.functional.absolute
     tensorplay.functional.acos
-    tensorplay._composite_funcs.acos_
-    tensorplay._composite_funcs.arccos
+    tensorplay.functional.acos_
+    tensorplay.functional.arccos
+    tensorplay.functional.arccos_
     tensorplay.functional.acosh
-    tensorplay._composite_funcs.acosh_
-    tensorplay._composite_funcs.arccosh
+    tensorplay.functional.acosh_
+    tensorplay.functional.arccosh
+    tensorplay.functional.arccosh_
     tensorplay.functional.add
     tensorplay.functional.addcdiv
     tensorplay.functional.addcmul
     tensorplay.functional.angle
     tensorplay.functional.asin
-    tensorplay._composite_funcs.asin_
-    tensorplay._composite_funcs.arcsin
+    tensorplay.functional.asin_
+    tensorplay.functional.arcsin
+    tensorplay.functional.arcsin_
     tensorplay.functional.asinh
-    tensorplay._composite_funcs.asinh_
-    tensorplay._composite_funcs.arcsinh
+    tensorplay.functional.asinh_
+    tensorplay.functional.arcsinh
+    tensorplay.functional.arcsinh_
     tensorplay.functional.atan
-    tensorplay._composite_funcs.atan_
-    tensorplay._composite_funcs.arctan
+    tensorplay.functional.atan_
+    tensorplay.functional.arctan
+    tensorplay.functional.arctan_
     tensorplay.functional.atanh
-    tensorplay._composite_funcs.atanh_
-    tensorplay._composite_funcs.arctanh
+    tensorplay.functional.atanh_
+    tensorplay.functional.arctanh
+    tensorplay.functional.arctanh_
     tensorplay.functional.atan2
-    tensorplay._composite_funcs.arctan2
+    tensorplay.functional.arctan2
     tensorplay.functional.bitwise_not
     tensorplay.functional.bitwise_and
     tensorplay.functional.bitwise_or
@@ -245,36 +288,63 @@
     tensorplay.functional.bitwise_left_shift
     tensorplay.functional.bitwise_right_shift
     tensorplay.functional.ceil
+    tensorplay.functional.ceil_
     tensorplay.functional.clamp
     tensorplay.functional.clamp_
+    tensorplay.functional.clamp_max_
+    tensorplay.functional.clamp_min_
     tensorplay.functional.clip
-    tensorplay._composite_funcs.copysign
+    tensorplay.functional.clip_
+    tensorplay.functional.conj_physical
+    tensorplay.functional.conj_physical_
+    tensorplay.functional.copysign
     tensorplay.functional.cos
+    tensorplay.functional.cos_
     tensorplay.functional.cosh
+    tensorplay.functional.cosh_
     tensorplay.functional.deg2rad
+    tensorplay.functional.deg2rad_
     tensorplay.functional.div
-    tensorplay._composite_funcs.divide
+    tensorplay.functional.divide
     tensorplay.functional.digamma
     tensorplay.functional.erf
+    tensorplay.functional.erf_
     tensorplay.functional.erfc
+    tensorplay.functional.erfc_
     tensorplay.functional.erfinv
     tensorplay.functional.exp
+    tensorplay.functional.exp_
     tensorplay.functional.exp2
+    tensorplay.functional.exp2_
     tensorplay.functional.expm1
+    tensorplay.functional.expm1_
+    tensorplay.functional.fake_quantize_per_channel_affine
+    tensorplay.functional.fake_quantize_per_tensor_affine
     tensorplay.functional.fill_
     tensorplay.functional.fix
+    tensorplay.functional.fix_
+    tensorplay.functional.float_power
     tensorplay.functional.floor
-    tensorplay._composite_funcs.floor_divide
-    tensorplay._composite_funcs.fmod
+    tensorplay.functional.floor_
+    tensorplay.functional.floor_divide
+    tensorplay.functional.fmod
     tensorplay.functional.frac
-    tensorplay._composite_funcs.gradient
+    tensorplay.functional.frac_
+    tensorplay.functional.frexp
+    tensorplay.gradient
     tensorplay.functional.imag
+    tensorplay.functional.ldexp
+    tensorplay.functional.ldexp_
     tensorplay.functional.lerp
     tensorplay.functional.lgamma
     tensorplay.functional.log
+    tensorplay.functional.log_
     tensorplay.functional.log10
+    tensorplay.functional.log10_
     tensorplay.functional.log1p
+    tensorplay.functional.log1p_
     tensorplay.functional.log2
+    tensorplay.functional.log2_
     tensorplay.functional.logaddexp
     tensorplay.functional.logaddexp2
     tensorplay.functional.logical_and
@@ -282,42 +352,65 @@
     tensorplay.functional.logical_or
     tensorplay.functional.logical_xor
     tensorplay.functional.logit
+    tensorplay.functional.logit_
     tensorplay.functional.hypot
     tensorplay.functional.i0
+    tensorplay.functional.i0_
+    tensorplay.functional.igamma
+    tensorplay.functional.igammac
     tensorplay.functional.mul
-    tensorplay._composite_funcs.multiply
+    tensorplay.functional.multiply
+    tensorplay.functional.mvlgamma
     tensorplay.functional.nan_to_num
+    tensorplay.functional.nan_to_num_
     tensorplay.functional.neg
     tensorplay.functional.neg_
     tensorplay.functional.negative
+    tensorplay.functional.negative_
     tensorplay.functional.nextafter
     tensorplay.functional.polygamma
     tensorplay.functional.positive
     tensorplay.functional.pow
+    tensorplay.functional.quantized_batch_norm
+    tensorplay.functional.quantized_max_pool1d
+    tensorplay.functional.quantized_max_pool2d
     tensorplay.functional.rad2deg
+    tensorplay.functional.rad2deg_
     tensorplay.functional.real
     tensorplay.functional.reciprocal
-    tensorplay._composite_funcs.remainder
+    tensorplay.functional.reciprocal_
+    tensorplay.functional.remainder
     tensorplay.functional.round
+    tensorplay.functional.round_
     tensorplay.functional.rsqrt
     tensorplay.functional.rsqrt_
     tensorplay.functional.sigmoid
+    tensorplay.functional.sigmoid_
     tensorplay.functional.sign
     tensorplay.functional.sgn
     tensorplay.functional.signbit
     tensorplay.functional.sin
+    tensorplay.functional.sin_
     tensorplay.functional.sinc
+    tensorplay.functional.sinc_
     tensorplay.functional.sinh
+    tensorplay.functional.sinh_
     tensorplay.functional.softmax
     tensorplay.functional.sqrt
     tensorplay.functional.sqrt_
     tensorplay.functional.square
+    tensorplay.functional.square_
     tensorplay.functional.sub
-    tensorplay._composite_funcs.subtract
+    tensorplay.functional.subtract
     tensorplay.functional.tan
+    tensorplay.functional.tan_
     tensorplay.functional.tanh
-    tensorplay._composite_funcs.true_divide
+    tensorplay.functional.tanh_
+    tensorplay.functional.true_divide
     tensorplay.functional.trunc
+    tensorplay.functional.trunc_
+    tensorplay.functional.xlogy
+    tensorplay.functional.xlogy_
     tensorplay.functional.zero_
 ```
 
@@ -335,8 +428,8 @@
     tensorplay.functional.aminmax
     tensorplay.functional.all
     tensorplay.functional.any
-    tensorplay.functional.max
-    tensorplay.functional.min
+    tensorplay.max
+    tensorplay.min
     tensorplay.functional.dist
     tensorplay.functional.logsumexp
     tensorplay.functional.mean
@@ -345,6 +438,8 @@
     tensorplay.functional.nanmedian
     tensorplay.functional.mode
     tensorplay.functional.norm
+    tensorplay.functional.norm_except_dim
+    tensorplay.functional.nuclear_norm
     tensorplay.functional.nansum
     tensorplay.functional.prod
     tensorplay._composite_funcs.quantile
@@ -353,10 +448,11 @@
     tensorplay.functional.std_mean
     tensorplay.functional.sum
     tensorplay.functional.unique
-    tensorplay._composite_funcs.unique_consecutive
+    tensorplay.functional.unique_consecutive
     tensorplay.functional.var
     tensorplay.functional.var_mean
     tensorplay.functional.count_nonzero
+    tensorplay.functional.hash_tensor
 ```
 
 ### Comparison Ops
@@ -376,7 +472,7 @@
     tensorplay.functional.greater
     tensorplay.functional.isclose
     tensorplay.functional.isfinite
-    tensorplay._composite_funcs.isin
+    tensorplay.functional.isin
     tensorplay.functional.isinf
     tensorplay.functional.isposinf
     tensorplay.functional.isneginf
@@ -389,6 +485,8 @@
     tensorplay.functional.less
     tensorplay.functional.maximum
     tensorplay.functional.minimum
+    tensorplay.functional.fmax
+    tensorplay.functional.fmin
     tensorplay.functional.ne
     tensorplay.functional.not_equal
     tensorplay.functional.sort
@@ -409,7 +507,7 @@
     tensorplay.functional.blackman_window
     tensorplay.functional.hamming_window
     tensorplay.functional.hann_window
-    tensorplay._composite_funcs.kaiser_window
+    tensorplay.functional.kaiser_window
 ```
 
 ### Other Operations
@@ -419,94 +517,182 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay._composite_funcs.adaptive_avg_pool1d
-    tensorplay._composite_funcs.adaptive_max_pool1d
+    tensorplay.functional.adaptive_avg_pool1d
+    tensorplay.functional.adaptive_max_pool1d
+    tensorplay.functional.affine_grid_generator
+    tensorplay.functional.alpha_dropout
+    tensorplay.functional.alpha_dropout_
+    tensorplay.functional.as_strided_
     tensorplay.functional.atleast_1d
     tensorplay.functional.atleast_2d
     tensorplay.functional.atleast_3d
-    tensorplay._composite_funcs.avg_pool1d
+    tensorplay.functional.avg_pool1d
+    tensorplay.functional.batch_norm_backward_elemt
+    tensorplay.functional.batch_norm_backward_reduce
+    tensorplay.functional.batch_norm_elemt
+    tensorplay.functional.batch_norm_gather_stats
+    tensorplay.functional.batch_norm_gather_stats_with_counts
+    tensorplay.functional.batch_norm_stats
+    tensorplay.functional.batch_norm_update_stats
+    tensorplay.functional.bilinear
     tensorplay.functional.bincount
-    tensorplay.functional.block_diag
-    tensorplay.functional.broadcast_tensors
+    tensorplay.functional.binomial
+    tensorplay._shape_funcs.block_diag
+    tensorplay._shape_funcs.broadcast_tensors
     tensorplay.functional.broadcast_to
     tensorplay._shape_funcs.broadcast_shapes
     tensorplay.functional.bucketize
-    tensorplay._composite_funcs.cartesian_prod
+    tensorplay.functional.cartesian_prod
+    tensorplay.functional.cdist
+    tensorplay.functional.celu_
     tensorplay.functional.channel_shuffle
+    tensorplay.functional.choose_qparams_optimized
     tensorplay.functional.clone
-    tensorplay._composite_funcs.combinations
+    tensorplay.functional.combinations
     tensorplay.functional.conv1d
     tensorplay.functional.conv3d
+    tensorplay.functional.conv_tbc
     tensorplay.functional.conv_transpose1d
     tensorplay.functional.conv_transpose2d
     tensorplay.functional.conv_transpose3d
-    tensorplay._composite_funcs.corrcoef
+    tensorplay.functional.convolution
+    tensorplay.functional.corrcoef
     tensorplay.functional.cosine_embedding_loss
-    tensorplay._composite_funcs.cosine_similarity
-    tensorplay._composite_funcs.cov
+    tensorplay.functional.cosine_similarity
+    tensorplay.functional.cov
+    tensorplay.functional.cross
+    tensorplay.functional.ctc_loss
+    tensorplay.functional.cudnn_affine_grid_generator
+    tensorplay.functional.cudnn_batch_norm
+    tensorplay.functional.cudnn_convolution
+    tensorplay.functional.cudnn_convolution_add_relu
+    tensorplay.functional.cudnn_convolution_relu
+    tensorplay.functional.cudnn_convolution_transpose
+    tensorplay.functional.cudnn_grid_sampler
+    tensorplay.functional.cudnn_is_acceptable
     tensorplay.functional.cummax
     tensorplay.functional.cummin
     tensorplay.functional.cumprod
     tensorplay.functional.cumsum
+    tensorplay.functional.detach_
     tensorplay.functional.diag
     tensorplay.functional.diag_embed
-    tensorplay._composite_funcs.diagflat
+    tensorplay.functional.diagflat
     tensorplay.functional.diagonal
     tensorplay.functional.diff
-    tensorplay.functional.einsum
+    tensorplay.functional.dropout_
+    tensorplay._einsum.einsum
     tensorplay.functional.embedding
+    tensorplay.functional.embedding_renorm_
+    tensorplay.functional.fbgemm_linear_fp16_weight
+    tensorplay.functional.fbgemm_linear_fp16_weight_fp32_activation
+    tensorplay.functional.fbgemm_linear_int8_weight
+    tensorplay.functional.fbgemm_linear_int8_weight_fp32_activation
+    tensorplay.functional.fbgemm_linear_quantize_weight
+    tensorplay.functional.fbgemm_pack_gemm_matrix_fp16
+    tensorplay.functional.fbgemm_pack_quantized_matrix
+    tensorplay.functional.feature_alpha_dropout
+    tensorplay.functional.feature_alpha_dropout_
+    tensorplay.functional.feature_dropout
+    tensorplay.functional.feature_dropout_
     tensorplay.functional.flatten
     tensorplay.functional.flip
+    tensorplay.functional.fliplr
+    tensorplay.functional.flipud
+    tensorplay.functional.fused_moving_avg_obs_fake_quant
     tensorplay.functional.gcd
+    tensorplay.functional.gcd_
+    tensorplay.functional.grid_sampler_2d
+    tensorplay.functional.grid_sampler_3d
     tensorplay.functional.group_norm
     tensorplay.functional.gru
+    tensorplay.functional.gru_cell
     tensorplay.functional.hardshrink
     tensorplay.functional.hinge_embedding_loss
-    tensorplay._composite_funcs.histc
+    tensorplay.functional.histc
     tensorplay._composite_funcs.histogram
+    tensorplay.functional.histogramdd
     tensorplay.functional.instance_norm
+    tensorplay.functional.int_repr
     tensorplay.functional.kl_div
-    tensorplay._composite_funcs.kron
+    tensorplay.functional.kron
     tensorplay.functional.lcm
+    tensorplay.functional.lcm_
     tensorplay.functional.logcumsumexp
     tensorplay.functional.lstm
-    tensorplay._composite_funcs.lstm_cell
+    tensorplay.functional.lstm_cell
     tensorplay.functional.margin_ranking_loss
-    tensorplay._composite_funcs.max_pool1d
+    tensorplay.functional.max_pool1d
+    tensorplay.functional.max_pool3d
     tensorplay.functional.meshgrid
+    tensorplay.functional.miopen_batch_norm
+    tensorplay.functional.miopen_convolution
+    tensorplay.functional.miopen_convolution_add_relu
+    tensorplay.functional.miopen_convolution_relu
+    tensorplay.functional.miopen_convolution_transpose
+    tensorplay.functional.miopen_ctc_loss
+    tensorplay.functional.miopen_depthwise_convolution
+    tensorplay.functional.miopen_rnn
+    tensorplay.functional.mkldnn_adaptive_avg_pool2d
+    tensorplay.functional.mkldnn_convolution
+    tensorplay.functional.mkldnn_linear_backward_weights
+    tensorplay.functional.mkldnn_max_pool2d
+    tensorplay.functional.mkldnn_max_pool3d
+    tensorplay.functional.mkldnn_rnn_layer
+    tensorplay.functional.native_batch_norm
+    tensorplay.functional.native_channel_shuffle
+    tensorplay.functional.native_group_norm
+    tensorplay.functional.native_layer_norm
+    tensorplay.functional.native_norm
     tensorplay.functional.pairwise_distance
     tensorplay.functional.pdist
     tensorplay.functional.pixel_unshuffle
     tensorplay.functional.poisson_nll_loss
     tensorplay.functional.prelu
+    tensorplay.functional.q_per_channel_axis
+    tensorplay.functional.q_per_channel_scales
+    tensorplay.functional.q_per_channel_zero_points
+    tensorplay.functional.q_scale
+    tensorplay.functional.q_zero_point
+    tensorplay.functional.quantized_gru_cell
+    tensorplay.functional.quantized_lstm_cell
+    tensorplay.functional.quantized_max_pool3d
+    tensorplay.functional.quantized_rnn_relu_cell
+    tensorplay.functional.quantized_rnn_tanh_cell
     tensorplay.functional.ravel
     tensorplay.functional.relu_
     tensorplay.functional.renorm
-    tensorplay._composite_funcs.repeat_interleave
-    tensorplay._composite_funcs.rms_norm
+    tensorplay.functional.repeat_interleave
+    tensorplay.functional.resize_as_
+    tensorplay.functional.resize_as_sparse_
+    tensorplay.functional.rms_norm
     tensorplay.functional.rnn_relu
-    tensorplay._composite_funcs.rnn_relu_cell
+    tensorplay.functional.rnn_relu_cell
     tensorplay.functional.rnn_tanh
-    tensorplay._composite_funcs.rnn_tanh_cell
+    tensorplay.functional.rnn_tanh_cell
     tensorplay.functional.roll
     tensorplay.functional.rot90
-    tensorplay._composite_funcs.rsub
+    tensorplay.functional.rrelu
+    tensorplay.functional.rrelu_
+    tensorplay.functional.rsub
     tensorplay.functional.searchsorted
     tensorplay.functional.selu
+    tensorplay.functional.selu_
     tensorplay._shape_funcs.tensordot
     tensorplay.functional.threshold
+    tensorplay.functional.threshold_
     tensorplay.functional.trace
     tensorplay.functional.tril
-    tensorplay._composite_funcs.tril_indices
+    tensorplay.functional.tril_indices
     tensorplay.functional.triu
-    tensorplay._composite_funcs.triu_indices
+    tensorplay.functional.triu_indices
     tensorplay.functional.triplet_margin_loss
     tensorplay.functional.unflatten
-    tensorplay._composite_funcs.vander
+    tensorplay.functional.vander
     tensorplay.functional.view_as_real
     tensorplay.functional.view_as_complex
-    tensorplay._composite_funcs.resolve_conj
-    tensorplay._composite_funcs.resolve_neg
+    tensorplay.functional.resolve_conj
+    tensorplay.functional.resolve_neg
 ```
 
 ### BLAS and LAPACK Operations
@@ -519,24 +705,36 @@
     tensorplay.functional.addbmm
     tensorplay.functional.addmm
     tensorplay.functional.addmv
+    tensorplay.functional.addmv_
     tensorplay.functional.addr
     tensorplay.functional.baddbmm
     tensorplay.functional.bmm
-    tensorplay._composite_funcs.chain_matmul
+    tensorplay.functional.chain_matmul
     tensorplay.functional.cholesky_inverse
     tensorplay.functional.cholesky_solve
     tensorplay.functional.dot
-    tensorplay._composite_funcs.ger
+    tensorplay.functional.geqrf
+    tensorplay.functional.ger
     tensorplay.functional.inner
+    tensorplay.functional.inverse
+    tensorplay.functional.det
+    tensorplay.functional.logdet
+    tensorplay.functional.slogdet
+    tensorplay.functional.lu_solve
+    tensorplay.functional.lu_unpack
     tensorplay.functional.matmul
-    tensorplay._composite_funcs.matrix_power
+    tensorplay.functional.matrix_power
+    tensorplay.functional.matrix_exp
     tensorplay.functional.mm
     tensorplay.functional.mv
+    tensorplay.functional.orgqr
+    tensorplay.functional.ormqr
     tensorplay.functional.outer
+    tensorplay.functional.pinverse
     tensorplay.functional.svd
-    tensorplay._composite_funcs.trapz
-    tensorplay._composite_funcs.trapezoid
-    tensorplay._composite_funcs.cumulative_trapezoid
+    tensorplay.functional.trapz
+    tensorplay.functional.trapezoid
+    tensorplay.functional.cumulative_trapezoid
     tensorplay.functional.triangular_solve
     tensorplay.functional.vdot
 ```
@@ -554,12 +752,14 @@
     tensorplay.amp.autocast_mode.get_autocast_cpu_dtype
     tensorplay.get_autocast_dtype
     tensorplay.amp.autocast_mode.get_autocast_gpu_dtype
-    tensorplay._composite_funcs.get_device
+    tensorplay.functional.get_device
     tensorplay.is_autocast_cache_enabled
     tensorplay.is_autocast_enabled
-    tensorplay._composite_funcs.result_type
-    tensorplay._composite_funcs.can_cast
-    tensorplay._composite_funcs.promote_types
+    tensorplay.functional.is_distributed
+    tensorplay.functional.is_vulkan_available
+    tensorplay.functional.result_type
+    tensorplay.functional.can_cast
+    tensorplay.functional.promote_types
     tensorplay.set_autocast_cache_enabled
     tensorplay.set_autocast_dtype
     tensorplay.set_autocast_enabled
@@ -573,6 +773,28 @@
     tensorplay.typename
 ```
 
+## Symbolic Numbers
+
+```{eval-rst}
+.. autosummary::
+    :toctree: generated
+    :nosignatures:
+
+    tensorplay.SymInt
+    tensorplay.SymFloat
+    tensorplay.SymBool
+    tensorplay.functional.sym_constrain_range
+    tensorplay.functional.sym_constrain_range_for_size
+    tensorplay.sym_float
+    tensorplay.sym_int
+    tensorplay.sym_max
+    tensorplay.sym_min
+    tensorplay.sym_not
+    tensorplay.sym_ite
+    tensorplay.sym_sqrt
+    tensorplay.sym_sum
+```
+
 ## Optimizations
 
 ```{eval-rst}
@@ -581,6 +803,16 @@
     :nosignatures:
 
     tensorplay._stax.api.compile
+```
+
+## Operator Tags
+
+```{eval-rst}
+.. autosummary::
+    :toctree: generated
+    :nosignatures:
+
+    tensorplay.serialization.StorageType
 ```
 
 ## TensorPlay-specific additions
@@ -595,24 +827,42 @@
 
     DType
     Device
+    DeviceMismatchError
     DeviceType
+    DispatchKey
+    FileCheck
+    Future
     GradScaler
     Layout
     MemoryFormat
+    Node
+    QScheme
     Scalar
     Size
     Tensor
+    UntypedStorage
+    absolute_
     adaptive_avg_pool2d
     adaptive_avg_pool3d
     adaptive_max_pool2d
+    adaptive_max_pool2d_with_indices
+    adaptive_max_pool3d
     add_
     add_relu
+    addbmm_
     addcdiv_
     addcmul_
+    addmm_
+    addr_
     airy_ai
+    alias
+    arctan2_
+    atan2_
+    audio_to_tensor
     autocast
     avg_pool2d
     avg_pool3d
+    baddbmm_
     batch_norm
     bernoulli_
     bessel_j0
@@ -621,7 +871,14 @@
     bessel_y1
     binary_cross_entropy
     binary_cross_entropy_with_logits
+    bitwise_and_
+    bitwise_left_shift_
+    bitwise_not_
+    bitwise_or_
+    bitwise_right_shift_
+    bitwise_xor_
     cauchy_
+    ccol_indices
     celu
     chebyshev_polynomial_t
     chebyshev_polynomial_u
@@ -631,7 +888,9 @@
     circular_pad_nd
     clamp_max
     clamp_min
+    coalesce
     col2im
+    col_indices
     constant_pad_nd
     contiguous
     conv1d_grad_bias
@@ -645,6 +904,7 @@
     conv3d_grad_bias
     conv3d_grad_input
     conv3d_grad_weight
+    conv_depthwise3d
     conv_transpose1d_grad_bias
     conv_transpose1d_grad_input
     conv_transpose1d_grad_weight
@@ -654,22 +914,71 @@
     conv_transpose3d_grad_bias
     conv_transpose3d_grad_input
     conv_transpose3d_grad_weight
+    convolution_backward_overrideable
+    convolution_overrideable
+    copy
     copy_
+    copy_sparse_to_sparse_
+    copysign_
+    cross_entropy_loss
+    crow_indices
+    cumprod_
+    cumsum_
     custom_bwd
     custom_fwd
+    data
+    dense_dim
     dequantize_per_channel
     dequantize_per_tensor
+    dequantize_per_tensor_qint32
+    dequantize_per_tensor_quint8
     device
+    digamma_
+    dim
     div_
+    divide_
+    dropout
     dtype
     elu
+    elu_
+    embedding_bag
+    entr
+    eq_
+    erfcx
+    erfinv_
     expand
     expand_as
     exponential_
+    fake_quantize_per_channel_affine_cachemask
+    fake_quantize_per_tensor_affine_cachemask
     fft_fft
+    fft_fft2
+    fft_fftfreq
+    fft_fftn
+    fft_fftshift
+    fft_hfft
+    fft_hfft2
+    fft_hfftn
     fft_ifft
+    fft_ifft2
+    fft_ifftn
+    fft_ifftshift
+    fft_ihfft
+    fft_ihfft2
+    fft_ihfftn
     fft_irfft
+    fft_irfft2
+    fft_irfftn
     fft_rfft
+    fft_rfft2
+    fft_rfftfreq
+    fft_rfftn
+    fill_diagonal_
+    finfo
+    flatten_dense_tensors
+    float_power_
+    floor_divide_
+    fmod_
     fork_rng
     forward_add
     forward_cos
@@ -686,46 +995,113 @@
     forward_sqrt
     forward_sub
     forward_tanh
+    fractional_max_pool2d
+    fractional_max_pool3d
+    frobenius_norm
     fused_mul_add
+    fused_rope
+    fused_swiglu
     gammainc
     gammaincc
+    ge_
     gelu
+    gelu_
     geometric_
     get_parallel_info
     get_thread_num
     glu
+    glu_backward_jvp
+    glu_jvp
+    greater_
+    greater_equal_
+    grid_sampler
+    grouped_mm
+    gt_
     hardsigmoid
+    hardsigmoid_
     hardswish
+    hardswish_
     hardtanh
+    hardtanh_
+    heaviside_
     hermite_polynomial_h
     hermite_polynomial_he
+    hspmm
     huber_loss
+    hypot_
     i0e
     i1
     i1e
+    igamma_
+    igammac_
+    iinfo
     im2col
     in_parallel_region
+    index
+    index_add_
+    index_copy_
     index_fill
     index_fill_
     index_put
+    index_reduce_
+    indices
     inner_backward_other
     inner_backward_self
     inspect_checkpoint
+    is_autocast_available
+    is_coalesced
+    is_contiguous
+    is_leaf
+    is_pinned
+    is_quantized
+    is_set_to
     item
     l1_loss
     laguerre_polynomial_l
     layer_norm
+    le_
     leaky_relu
+    leaky_relu_
     legendre_polynomial_p
     lerp_
+    less_
+    less_equal_
+    lgamma_
+    lift
+    lift_fresh
+    lift_fresh_copy
+    linear
+    log_ndtr
     log_normal_
+    log_sigmoid
+    log_sigmoid_forward
     log_softmax
+    logical_and_
+    logical_not_
+    logical_or_
+    logical_xor_
+    lt_
+    mH
+    mT
     masked_fill_
     masked_scatter
+    masked_scatter_
     matmul_backward_other
     matmul_backward_self
+    matrix_H
+    max_pool1d_with_indices
     max_pool2d
+    max_pool2d_with_indices
+    max_pool3d_with_indices
+    max_unpool2d
+    max_unpool3d
     mish
+    mish_
+    mkldnn_linear
+    mkldnn_linear_backward_input
+    mkldnn_reorder_conv2d_weight
+    mkldnn_reorder_conv3d_weight
+    modified_bessel_i0
     modified_bessel_i1
     modified_bessel_k0
     modified_bessel_k1
@@ -733,61 +1109,226 @@
     mul_
     multi_margin_loss
     multilabel_margin_loss
+    multilabel_margin_loss_forward
     multilabel_soft_margin_loss
+    multiply_
+    mvlgamma_
+    native_alpha_dropout
     native_dropout
+    native_feature_dropout
+    ndtr
+    ndtri
+    ne_
+    nested_to_padded_tensor
+    new_empty
+    new_empty_strided
+    new_full
+    new_ones
+    new_zeros
+    nextafter_
     nll_loss
+    nll_loss2d
+    nll_loss2d_forward
+    nll_loss_forward
+    nll_loss_nd
+    nonzero_numpy
     normal_
+    normal_functional
+    not_equal_
+    numpy_T
     one_hot
+    output_nr
+    pad
+    pad_sequence
+    pin_memory
     pixel_shuffle
+    polygamma_
+    pow_
+    put_
+    qscheme
+    quantize_per_tensor_qint32
+    quantize_per_tensor_quint8
+    quantized_add
+    quantized_clamp
+    quantized_conv2d
+    quantized_conv2d_prepack
+    quantized_conv2d_run
+    quantized_conv2d_unpack
+    quantized_div
     quantized_linear
+    quantized_mul
+    quantized_sub
     random_
+    reflection_pad1d
+    reflection_pad2d
+    reflection_pad3d
     reflection_pad_nd
     relu
     relu6
+    relu6_
+    remainder_
+    renorm_
     repeat
+    replication_pad1d
+    replication_pad2d
+    replication_pad3d
     replication_pad_nd
+    requires_grad_
+    reshape_as
     resize_
+    retain_grad
+    retains_grad
+    rotary_embedding
+    row_indices
+    rrelu_with_noise
+    rrelu_with_noise_
     sample
     scaled_dot_product_attention
     scaled_modified_bessel_k0
     scaled_modified_bessel_k1
     scatter_
     scatter_add_
+    scatter_reduce_
+    set_
+    set_data
+    sgn_
     shifted_chebyshev_polynomial_t
     shifted_chebyshev_polynomial_u
     shifted_chebyshev_polynomial_v
     shifted_chebyshev_polynomial_w
+    sign_
     silu
+    silu_
+    silu_and_mul
+    silu_mul
+    size
     slice
+    slow_conv3d
+    slow_conv3d_forward
+    slow_conv_dilated2d
+    slow_conv_dilated3d
+    slow_conv_transpose2d
+    slow_conv_transpose3d
+    smm
     smooth_l1_loss
     soft_margin_loss
     softplus
     softshrink
     sparse_add
+    sparse_compressed_tensor
+    sparse_dim
+    sparse_mask
     sparse_mm
     sparse_mul
+    sparse_resize_
+    sparse_resize_and_clear_
+    sparse_sampled_addmm
     sparse_sum
     spdiags
+    special_airy_ai
+    special_bessel_j0
+    special_bessel_j1
+    special_bessel_y0
+    special_bessel_y1
+    special_chebyshev_polynomial_t
+    special_chebyshev_polynomial_u
+    special_chebyshev_polynomial_v
+    special_chebyshev_polynomial_w
+    special_digamma
+    special_entr
+    special_erf
+    special_erfc
+    special_erfcx
+    special_erfinv
+    special_exp2
+    special_expit
+    special_expm1
+    special_gammainc
+    special_gammaincc
+    special_gammaln
+    special_hermite_polynomial_h
+    special_hermite_polynomial_he
+    special_i0
+    special_i0e
+    special_i1
+    special_i1e
+    special_laguerre_polynomial_l
+    special_legendre_polynomial_p
+    special_log1p
+    special_log_ndtr
+    special_log_softmax
+    special_logit
+    special_logsumexp
+    special_modified_bessel_i0
+    special_modified_bessel_i1
+    special_modified_bessel_k0
+    special_modified_bessel_k1
+    special_multigammaln
+    special_ndtr
+    special_ndtri
+    special_polygamma
+    special_psi
+    special_round
+    special_scaled_modified_bessel_k0
+    special_scaled_modified_bessel_k1
+    special_shifted_chebyshev_polynomial_t
+    special_shifted_chebyshev_polynomial_u
+    special_shifted_chebyshev_polynomial_v
+    special_shifted_chebyshev_polynomial_w
+    special_sinc
+    special_softmax
+    special_spherical_bessel_j0
+    special_xlog1py
+    special_xlogy
+    special_zeta
     spherical_bessel_j0
     split_with_sizes
+    squeeze_
+    sspaddmm
+    storage_offset
+    stride
     sub_
+    subtract_
+    sum_to_size
+    swapaxes_
+    swapdims_
+    sym_is_contiguous
+    sym_numel
+    sym_size
+    sym_storage_offset
+    sym_stride
+    t_
+    thnn_conv2d
+    to
     to_dense
+    to_mkldnn
+    to_padded_tensor
     to_sparse
+    to_sparse_bsc
+    to_sparse_bsr
+    to_sparse_csc
     to_sparse_csr
-    tp_binary_cross_entropy
     tp_cosine_embedding_loss
     tp_hinge_embedding_loss
-    tp_huber_loss
     tp_kl_div
     tp_l1_loss
     tp_margin_ranking_loss
     tp_poisson_nll_loss
-    tp_smooth_l1_loss
     tp_soft_margin_loss
+    transpose_
+    tril_
+    triu_
+    true_divide_
+    type_as
+    unflatten_dense_tensors
     unfold
     uniform_
+    unique_dim
+    unique_dim_consecutive
     unsafe_chunk
     unsafe_split
+    unsafe_split_with_sizes
+    unsqueeze_
     upsample_bicubic2d
     upsample_bilinear2d
     upsample_linear1d
@@ -795,7 +1336,12 @@
     upsample_nearest2d
     upsample_nearest3d
     upsample_trilinear3d
+    values
     view
+    view_as
+    vision_to_tensor
+    xlog1py
+    xlog1py_
     zeta
 ```
 

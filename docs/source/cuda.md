@@ -95,7 +95,6 @@
     tensorplay.cuda.graphs.graph
     tensorplay.cuda.graphs.make_graphed_callables
     tensorplay.cuda.graphs.export_dot
-    tensorplay.cuda.graphs.export_graph_data
 ```
 
 ## Graph Kernel Annotations (prototype)
@@ -190,11 +189,9 @@
     is_gds_available
     list_gpu_processes
     max_memory_allocated
-    max_memory_cached
     max_memory_reserved
     mem_get_info
     memory_allocated
-    memory_cached
     memory_reserved
     memory_snapshot
     memory_stats
@@ -202,8 +199,6 @@
     memory_summary
     reset_accumulated_host_memory_stats
     reset_accumulated_memory_stats
-    reset_max_memory_allocated
-    reset_max_memory_cached
     reset_peak_host_memory_stats
     reset_peak_memory_stats
     set_per_process_memory_fraction

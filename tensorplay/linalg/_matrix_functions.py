@@ -64,7 +64,13 @@ def matmul(input, other):
 
 def vander(x, N=None):
     """vander(x, N=None) -> Tensor"""
-    N = x.shape[-1] if N is None else int(N)
+    if x.dim() != 1:
+        raise ValueError(f"linalg.vander: x must be 1-dimensional, got {x.dim()}D")
+    N = x.numel() if N is None else int(N)
+    if N < 0:
+        raise ValueError(f"linalg.vander: N must be non-negative, got {N}")
+    if N == 0:
+        return tensorplay.empty([x.numel(), 0], dtype=x.dtype, device=x.device)
     cols = [x.pow(N - 1 - j) for j in range(N)]
     return tensorplay.stack(cols, dim=-1)
 
@@ -82,11 +88,14 @@ def matrix_exp(A):
     approximant's accuracy threshold, then the result is squared back.
     """
     check_floating(A, "matrix_exp")
+    if A.dim() < 2 or A.shape[-1] != A.shape[-2]:
+        raise ValueError("linalg.matrix_exp: input must contain square matrices")
     n = A.shape[-1]
     batch = list(A.shape[:-2])
     dtype = A.dtype
-    eye = tensorplay.zeros(batch + [n, n], dtype=dtype)
-    eye += tensorplay.eye(n, dtype=dtype)
+    eye = tensorplay.eye(n, dtype=dtype, device=A.device)
+    if batch:
+        eye = eye.expand(batch + [n, n]).contiguous()
     theta13 = 5.371920351148152
     b = [64764752532480000., 32382376266240000., 7771770303897600.,
          1187353796428800., 129060195264000., 10559470521600.,
@@ -121,12 +130,16 @@ def matrix_sqrth(A):
     (converges for matrices with no eigenvalues on the closed negative real axis).
     """
     check_floating(A, "matrix_sqrth")
+    if A.dim() < 2 or A.shape[-1] != A.shape[-2]:
+        raise ValueError("linalg.matrix_sqrth: input must contain square matrices")
     n = A.shape[-1]
     batch = list(A.shape[:-2])
     dtype = A.dtype
-    eye = tensorplay.eye(n, dtype=dtype)
+    eye = tensorplay.eye(n, dtype=dtype, device=A.device)
     Y = A
-    Z = eye.expand(batch + [n, n]).contiguous() * 1.0
+    if batch:
+        eye = eye.expand(batch + [n, n]).contiguous()
+    Z = eye * 1.0
     eps = 1e-12
     for _ in range(100):
         Y_next = 0.5 * (Y + inv(Z))
@@ -145,7 +158,7 @@ def matrix_power(A, n):
         raise RuntimeError("linalg.matrix_power: A must be batches of square matrices")
     n = int(n)
     if n == 0:
-        eye = tensorplay.eye(A.shape[-1], dtype=A.dtype)
+        eye = tensorplay.eye(A.shape[-1], dtype=A.dtype, device=A.device)
         return eye.expand(A.shape).contiguous()
     invert = n < 0
     if invert:
