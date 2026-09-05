@@ -1,5 +1,6 @@
 """Result types and shared dtype guards for the linear algebra namespace."""
 from collections import namedtuple
+import operator
 
 import tensorplay
 
@@ -45,3 +46,12 @@ def eps_of(dtype):
     """Machine epsilon used by the rank/pseudo-inverse cutoffs."""
     return 1.1920929e-07 if dtype in (tensorplay.float32, tensorplay.complex64) \
         else 2.220446049250313e-16
+
+
+def as_index(value, name):
+    """Converts an integer-like argument without truncating non-integers."""
+    try:
+        return operator.index(value)
+    except TypeError as exc:
+        raise TypeError(
+            f"{name} must be an integer, got {type(value).__name__}") from exc

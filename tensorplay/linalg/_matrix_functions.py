@@ -1,11 +1,13 @@
 """Matrix-valued functions and the products built on top of them."""
+import operator
+
 import tensorplay
 from tensorplay._C import (
     linalg_cross,
     linalg_diagonal as diagonal,
 )
 
-from ._common import check_floating
+from ._common import as_index, check_floating
 from ._solve import inv, solve
 
 __all__ = [
@@ -34,10 +36,18 @@ def vecdot(x, y, *, dim=-1):
     Dot product along `dim` with the first argument conjugated for complex
     inputs.
     """
+    dim_value = as_index(dim, "linalg.vecdot dim")
+    x_dim = dim_value + x.dim() if dim_value < 0 else dim_value
+    y_dim = dim_value + y.dim() if dim_value < 0 else dim_value
+    if not 0 <= x_dim < x.dim() or not 0 <= y_dim < y.dim():
+        raise IndexError("linalg.vecdot: dimension out of range")
+    if x.shape[x_dim] != y.shape[y_dim]:
+        raise RuntimeError(
+            "linalg.vecdot: vector dimensions must have the same length")
     from tensorplay import functional as _F
     if x.dtype.is_complex:
         x = _F.conj_physical(x)
-    return (x * y).sum(dim=dim)
+    return (x * y).sum(dim=dim_value)
 
 
 def vdot(self, other):
@@ -66,7 +76,7 @@ def vander(x, N=None):
     """vander(x, N=None) -> Tensor"""
     if x.dim() != 1:
         raise ValueError(f"linalg.vander: x must be 1-dimensional, got {x.dim()}D")
-    N = x.numel() if N is None else int(N)
+    N = x.numel() if N is None else as_index(N, "linalg.vander N")
     if N < 0:
         raise ValueError(f"linalg.vander: N must be non-negative, got {N}")
     if N == 0:
@@ -91,6 +101,8 @@ def matrix_exp(A):
     if A.dim() < 2 or A.shape[-1] != A.shape[-2]:
         raise ValueError("linalg.matrix_exp: input must contain square matrices")
     n = A.shape[-1]
+    if n == 0:
+        return A.clone()
     batch = list(A.shape[:-2])
     dtype = A.dtype
     eye = tensorplay.eye(n, dtype=dtype, device=A.device)
@@ -133,6 +145,8 @@ def matrix_sqrth(A):
     if A.dim() < 2 or A.shape[-1] != A.shape[-2]:
         raise ValueError("linalg.matrix_sqrth: input must contain square matrices")
     n = A.shape[-1]
+    if n == 0:
+        return A.clone()
     batch = list(A.shape[:-2])
     dtype = A.dtype
     eye = tensorplay.eye(n, dtype=dtype, device=A.device)
@@ -156,7 +170,7 @@ def matrix_power(A, n):
     check_floating(A, "matrix_power")
     if A.dim() < 2 or A.shape[-1] != A.shape[-2]:
         raise RuntimeError("linalg.matrix_power: A must be batches of square matrices")
-    n = int(n)
+    n = as_index(n, "linalg.matrix_power exponent")
     if n == 0:
         eye = tensorplay.eye(A.shape[-1], dtype=A.dtype, device=A.device)
         return eye.expand(A.shape).contiguous()
@@ -181,26 +195,58 @@ def multi_dot(tensors):
     Chained matrix product evaluated in the parenthesization that minimizes
     the scalar multiplication count (matrix-chain dynamic program).
     """
+    tensors = list(tensors)
     if len(tensors) < 2:
         raise RuntimeError("linalg.multi_dot: expected at least two tensors")
-    shapes = [list(t.shape) for t in tensors]
-    n = len(shapes)
-    dims = [shapes[0][-2]] + [shapes[i][-1] for i in range(n)]
-    m = [[0] * n for _ in range(n)]
+    n = len(tensors)
+    shapes = [tuple(t.shape) for t in tensors]
+    for index, shape in enumerate(shapes):
+        if len(shape) not in (1, 2):
+            raise ValueError(
+                f"linalg.multi_dot: tensor {index} must be 1D or 2D, got {len(shape)}D"
+            )
+        if len(shape) == 1 and index not in (0, n - 1):
+            raise ValueError(
+                "linalg.multi_dot: only the first or last tensor may be 1D"
+            )
+
+    left = [1 if len(shape) == 1 else shape[-2]
+            for index, shape in enumerate(shapes)]
+    right = [1 if len(shape) == 1 and index == n - 1 else shape[-1]
+             for index, shape in enumerate(shapes)]
+    for index in range(n - 1):
+        if right[index] != left[index + 1]:
+            raise ValueError(
+                f"linalg.multi_dot: shapes {shapes[index]} and "
+                f"{shapes[index + 1]} are incompatible"
+            )
+
+    dimensions = [left[0]] + right
+    costs = [[0] * n for _ in range(n)]
     split = [[0] * n for _ in range(n)]
-    for length in range(2, n):
-        for i in range(1, n - length + 1):
-            j = i + length - 1
-            m[i][j] = float("inf")
-            for k in range(i, j):
-                cost = m[i][k] + m[k + 1][j] + dims[i - 1] * dims[k] * dims[j]
-                if cost < m[i][j]:
-                    m[i][j] = cost
-                    split[i][j] = k
+    for length in range(2, n + 1):
+        for start in range(n - length + 1):
+            end = start + length - 1
+            best = float("inf")
+            best_split = start
+            for middle in range(start, end):
+                cost = (
+                    costs[start][middle]
+                    + costs[middle + 1][end]
+                    + dimensions[start]
+                    * dimensions[middle + 1]
+                    * dimensions[end + 1]
+                )
+                if cost < best:
+                    best = cost
+                    best_split = middle
+            costs[start][end] = best
+            split[start][end] = best_split
 
-    def build(i, j):
-        if i == j:
-            return tensors[i - 1]
-        return build(i, split[i][j]) @ build(split[i][j] + 1, j)
+    def build(start, end):
+        if start == end:
+            return tensors[start]
+        middle = split[start][end]
+        return build(start, middle) @ build(middle + 1, end)
 
-    return build(1, n - 1)
+    return build(0, n - 1)

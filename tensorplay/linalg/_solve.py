@@ -1,4 +1,6 @@
 """Inverses, linear solves and least squares."""
+import operator
+
 import tensorplay
 from tensorplay import _C
 from tensorplay._C import (
@@ -8,7 +10,7 @@ from tensorplay._C import (
     linalg_solve_triangular as solve_triangular,
 )
 
-from ._common import LstsqResult, SlogdetResult, check_floating, eps_of
+from ._common import LstsqResult, SlogdetResult, as_index, check_floating, eps_of
 from ._decompositions import eigh, svd
 
 __all__ = [
@@ -109,8 +111,12 @@ def tensorinv(A, ind=2):
     Inverse of ``A`` seen as a square matrix over the split at ``ind``: the
     product of the leading ``ind`` dimensions must equal that of the rest.
     """
-    if ind <= 0:
-        raise RuntimeError("linalg.tensorinv: ind must be > 0")
+    ind = as_index(ind, "linalg.tensorinv ind")
+    if A.dim() < 2:
+        raise RuntimeError("linalg.tensorinv: input must have at least 2 dimensions")
+    if ind <= 0 or ind >= A.dim():
+        raise RuntimeError(
+            f"linalg.tensorinv: ind must be in [1, {A.dim() - 1}], got {ind}")
     shape = list(A.shape)
     prod_front = 1
     for d in shape[:ind]:
@@ -134,7 +140,14 @@ def tensorsolve(A, B, dims=None):
     that should be moved to the trailing side before the flattening step.
     """
     if dims is not None:
-        moved_dims = [int(dims)] if isinstance(dims, int) else [int(d) for d in dims]
+        try:
+            moved_dims = [operator.index(dims)]
+        except TypeError:
+            try:
+                moved_dims = [operator.index(d) for d in dims]
+            except TypeError as exc:
+                raise TypeError(
+                    "linalg.tensorsolve: dims must contain integers") from exc
         ndim = A.dim()
         normalized = []
         for d in moved_dims:
@@ -155,6 +168,11 @@ def tensorsolve(A, B, dims=None):
         raise RuntimeError(
             f"linalg.tensorsolve: B with shape {tuple(B.shape)} has more "
             f"dimensions than A with shape {tuple(A.shape)}")
+
+    if tuple(A.shape[:rank_b]) != tuple(B.shape):
+        raise RuntimeError(
+            f"linalg.tensorsolve: B with shape {tuple(B.shape)} must match "
+            f"the leading dimensions of A {tuple(A.shape[:rank_b])}")
 
     q_shape = list(A.shape[rank_b:])
     q_size = 1
