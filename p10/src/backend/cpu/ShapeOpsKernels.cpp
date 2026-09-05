@@ -106,7 +106,7 @@ Tensor diag_cpu(const Tensor& self, int64_t diagonal) {
         } \
         break; \
     }
-            TENSORPLAY_FORALL_SCALAR_TYPES(TP_DIAG_FILL)
+            TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_DIAG_FILL)
 #undef TP_DIAG_FILL
             default: TP_THROW(TypeError, "diag: unsupported dtype");
         }
@@ -129,7 +129,7 @@ Tensor diag_cpu(const Tensor& self, int64_t diagonal) {
         for (size_t k = 0; k < idx.size(); ++k) d[k] = s[idx[k]]; \
         break; \
     }
-            TENSORPLAY_FORALL_SCALAR_TYPES(TP_DIAG_EX)
+            TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_DIAG_EX)
 #undef TP_DIAG_EX
             default: TP_THROW(TypeError, "diag: unsupported dtype");
         }
@@ -185,7 +185,7 @@ Tensor diag_embed_cpu(const Tensor& self, int64_t offset, int64_t dim1_, int64_t
             switch (self.dtype()) {
 #define TP_DE_WRITE(ctype, name_) \
     case DType::name_: reinterpret_cast<ctype*>(result.data_ptr())[lin] = reinterpret_cast<const ctype*>(sc.data_ptr())[li]; break;
-                TENSORPLAY_FORALL_SCALAR_TYPES(TP_DE_WRITE)
+                TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_DE_WRITE)
 #undef TP_DE_WRITE
                 default: break;
             }

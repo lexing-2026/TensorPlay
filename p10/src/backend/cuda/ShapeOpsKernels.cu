@@ -306,7 +306,7 @@ Tensor diag_cuda(const Tensor& self, int64_t diagonal) {
             n, size, diagonal, sc.data_ptr<ctype>(), out.data_ptr<ctype>()); \
         break;
         switch (sc.dtype()) {
-            TENSORPLAY_FORALL_SCALAR_TYPES(TP_DGS)
+            TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_DGS)
             default: TP_THROW(TypeError, "diag: unsupported dtype");
         }
 #undef TP_DGS
@@ -335,7 +335,7 @@ Tensor diag_cuda(const Tensor& self, int64_t diagonal) {
             d_idx.data_ptr<int64_t>(), out.data_ptr<ctype>()); \
         break;
             switch (sc.dtype()) {
-                TENSORPLAY_FORALL_SCALAR_TYPES(TP_DGE)
+                TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_DGE)
                 default: TP_THROW(TypeError, "diag: unsupported dtype");
             }
 #undef TP_DGE
@@ -388,7 +388,7 @@ Tensor diag_embed_cuda(const Tensor& self, int64_t offset, int64_t dim1_, int64_
         } \
         break; }
     switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_DEW)
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_DEW)
         default: TP_THROW(TypeError, "diag_embed: unsupported dtype");
     }
 #undef TP_DEW
