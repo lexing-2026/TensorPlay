@@ -1797,29 +1797,61 @@ Tensor& bernoulli_scalar_inplace_kernel_cuda(
     return self;
 }
 
-Tensor randperm_kernel_cuda(int64_t n, DType dtype, Device device) {
-    if (dtype != DType::Int64 && dtype != DType::Int32) {
-        TP_THROW(NotImplementedError, "randperm() only supports Int64/Int32 on CUDA");
+void check_randperm_size(int64_t n, DType dtype) {
+    if (n < 0) {
+        TP_THROW(RuntimeError, "randperm(): n must be non-negative, got ", n);
     }
+    uint64_t max_index;
+    switch (dtype) {
+        case DType::UInt8: max_index = std::numeric_limits<uint8_t>::max(); break;
+        case DType::Int8: max_index = std::numeric_limits<int8_t>::max(); break;
+        case DType::Int16: max_index = std::numeric_limits<int16_t>::max(); break;
+        case DType::Int32: max_index = std::numeric_limits<int32_t>::max(); break;
+        case DType::UInt16: max_index = std::numeric_limits<uint16_t>::max(); break;
+        case DType::UInt32: max_index = std::numeric_limits<uint32_t>::max(); break;
+        case DType::Float16: max_index = uint64_t{1} << 11; break;
+        case DType::BFloat16: max_index = uint64_t{1} << 8; break;
+        case DType::Float32: max_index = uint64_t{1} << 24; break;
+        case DType::Float64: max_index = uint64_t{1} << 53; break;
+        case DType::Bool: max_index = 1; break;
+        case DType::Int64:
+        case DType::UInt64:
+            return;
+        default:
+            TP_THROW(NotImplementedError,
+                     "randperm() does not support this output dtype");
+    }
+    if (static_cast<uint64_t>(n) > max_index + 1) {
+        TP_THROW(RuntimeError,
+                 "randperm(): n is too large for the requested output dtype");
+    }
+}
+
+Tensor randperm_kernel_cuda(int64_t n, DType dtype, Device device) {
+    check_randperm_size(n, dtype);
     Tensor idx(std::vector<int64_t>{n}, DType::Int64, device);
     if (n == 0) {
-        if (dtype == DType::Int32) {
-            Tensor out = Tensor::empty({n}, DType::Int32, device);
-            return out;
-        }
+        if (dtype != DType::Int64) return Tensor::empty({n}, dtype, device);
         return idx;
     }
-    // Distinct-with-probability-1 fp32 keys; ties are astronomically unlikely.
-    Tensor keys = Tensor::empty({n}, DType::Float32, device);
-    float* data = keys.data_ptr<float>();
-    distribution_nullary_kernel<float, float4, 4>(
+    Tensor keys = Tensor::empty({n}, DType::Int64, device);
+    int64_t* data = keys.data_ptr<int64_t>();
+    distribution_nullary_kernel<int64_t, ulonglong2, 2>(
         data, n,
-        [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
-        [] __device__ (float val) { return val; });
+        [] __device__ (curandStatePhilox4_32_10_t* state) {
+            ulonglong2 random;
+            uint4 words = curand4(state);
+            random.x = (static_cast<uint64_t>(words.x) << 32) | words.y;
+            random.y = (static_cast<uint64_t>(words.z) << 32) | words.w;
+            return random;
+        },
+        [] __device__ (uint64_t value) {
+            return static_cast<int64_t>(value);
+        });
     extern Tensor argsort_cuda(const Tensor& self, int64_t dim, bool descending);
     idx = argsort_cuda(keys, 0, false);
     if (dtype == DType::Int64) return idx;
-    Tensor out = Tensor::empty({n}, DType::Int32, device);
+    Tensor out = Tensor::empty({n}, dtype, device);
     out.copy_(idx);
     return out;
 }
