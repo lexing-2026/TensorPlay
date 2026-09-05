@@ -5,6 +5,8 @@
 #include <thrust/iterator/counting_iterator.h>
 #include <cuda_runtime.h>
 #include <climits>
+#include <complex>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 
@@ -96,6 +98,38 @@ __global__ void sparse_mask_gather_kernel(
     values[linear] = dense[source_offset];
 }
 
+__global__ void sparse_mask_gather_bytes_kernel(
+    int64_t output_numel,
+    int64_t dense_numel,
+    int64_t itemsize,
+    const int64_t* indices,
+    int64_t nnz,
+    const uint8_t* dense,
+    uint8_t* values,
+    SparseGatherInfo info) {
+    const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (linear >= output_numel) return;
+
+    const int64_t entry = linear / dense_numel;
+    const int64_t inner = linear % dense_numel;
+    int64_t source_offset = 0;
+    for (int d = 0; d < info.sparse_dim; ++d) {
+        source_offset += indices[d * nnz + entry] * info.strides[d];
+    }
+    int64_t remainder = inner;
+    for (int d = info.dense_dim - 1; d >= 0; --d) {
+        const int64_t dim_size = info.shape[info.sparse_dim + d];
+        const int64_t coordinate = dim_size == 0 ? 0 : remainder % dim_size;
+        remainder = dim_size == 0 ? 0 : remainder / dim_size;
+        source_offset += coordinate * info.strides[info.sparse_dim + d];
+    }
+    const uint8_t* source = dense + source_offset * itemsize;
+    uint8_t* destination = values + linear * itemsize;
+    for (int64_t byte = 0; byte < itemsize; ++byte) {
+        destination[byte] = source[byte];
+    }
+}
+
 template <typename scalar_t>
 __global__ void sparse_add_kernel(
     int64_t update_numel,
@@ -123,6 +157,54 @@ __global__ void sparse_add_kernel(
         destination_offset += coordinate * info.strides[info.sparse_dim + d];
     }
     dense[destination_offset] += alpha * values[linear];
+}
+
+template <typename real_t>
+struct CudaComplexPair {
+    real_t real;
+    real_t imag;
+};
+
+template <typename real_t>
+__global__ void sparse_add_complex_kernel(
+    int64_t update_numel,
+    const int64_t* indices,
+    int64_t nnz,
+    int64_t dense_numel,
+    CudaComplexPair<real_t>* dense,
+    const CudaComplexPair<real_t>* values,
+    CudaComplexPair<real_t> alpha,
+    SparseGatherInfo info) {
+    const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (linear >= update_numel) return;
+    const int64_t entry = linear / dense_numel;
+    const int64_t inner = linear % dense_numel;
+
+    int64_t destination_offset = 0;
+    for (int d = 0; d < info.sparse_dim; ++d) {
+        destination_offset += indices[d * nnz + entry] * info.strides[d];
+    }
+    int64_t remainder = inner;
+    for (int d = info.dense_dim - 1; d >= 0; --d) {
+        const int64_t dim_size = info.shape[info.sparse_dim + d];
+        const int64_t coordinate = dim_size == 0 ? 0 : remainder % dim_size;
+        remainder = dim_size == 0 ? 0 : remainder / dim_size;
+        destination_offset += coordinate * info.strides[info.sparse_dim + d];
+    }
+
+    using compute_t = std::conditional_t<std::is_same_v<real_t, double>, double, float>;
+    const CudaComplexPair<real_t> value = values[linear];
+    CudaComplexPair<real_t>& destination = dense[destination_offset];
+    const compute_t value_real = static_cast<compute_t>(value.real);
+    const compute_t value_imag = static_cast<compute_t>(value.imag);
+    const compute_t alpha_real = static_cast<compute_t>(alpha.real);
+    const compute_t alpha_imag = static_cast<compute_t>(alpha.imag);
+    destination.real = static_cast<real_t>(
+        static_cast<compute_t>(destination.real) +
+        alpha_real * value_real - alpha_imag * value_imag);
+    destination.imag = static_cast<real_t>(
+        static_cast<compute_t>(destination.imag) +
+        alpha_real * value_imag + alpha_imag * value_real);
 }
 
 SparseGatherInfo make_gather_info(const Tensor& dense, const Tensor& mask) {
@@ -627,35 +709,12 @@ Tensor sparse_mask_cuda(const Tensor& dense, const Tensor& mask) {
     SparseGatherInfo info = make_gather_info(dense_contiguous, canonical_mask);
     const int threads = 256;
     const int blocks = static_cast<int>((output_numel + threads - 1) / threads);
-#define TP_SPARSE_GATHER_CASE(ctype, name) \
-    case DType::name: \
-        sparse_mask_gather_kernel<ctype><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>( \
-            output_numel, indices.data_ptr<int64_t>(), nnz, dense_numel, \
-            dense_contiguous.data_ptr<ctype>(), values.data_ptr<ctype>(), info); \
-        break;
-    switch (dense.dtype()) {
-        TP_SPARSE_GATHER_CASE(uint8_t, UInt8)
-        TP_SPARSE_GATHER_CASE(int8_t, Int8)
-        TP_SPARSE_GATHER_CASE(int16_t, Int16)
-        TP_SPARSE_GATHER_CASE(int32_t, Int32)
-        TP_SPARSE_GATHER_CASE(int64_t, Int64)
-        TP_SPARSE_GATHER_CASE(uint16_t, UInt16)
-        TP_SPARSE_GATHER_CASE(uint32_t, UInt32)
-        TP_SPARSE_GATHER_CASE(uint64_t, UInt64)
-        TP_SPARSE_GATHER_CASE(float, Float32)
-        TP_SPARSE_GATHER_CASE(double, Float64)
-        TP_SPARSE_GATHER_CASE(tensorplay::Half, Float16)
-        TP_SPARSE_GATHER_CASE(tensorplay::BFloat16, BFloat16)
-        TP_SPARSE_GATHER_CASE(bool, Bool)
-        default: {
-            // std::complex is a host-only project type in CUDA translation
-            // units.  Preserve exact values through the ordinary copy path.
-            Tensor host = dense.to(Device(DeviceType::CPU));
-            Tensor host_mask = canonical_mask.to(Device(DeviceType::CPU));
-            return cpu::sparse_mask_cpu(host, host_mask).to(dense.device());
-        }
-    }
-#undef TP_SPARSE_GATHER_CASE
+    sparse_mask_gather_bytes_kernel<<<blocks, threads, 0,
+                                      getCurrentCUDAStream().stream()>>>(
+        output_numel, dense_numel, static_cast<int64_t>(dense.itemsize()),
+        indices.data_ptr<int64_t>(), nnz,
+        reinterpret_cast<const uint8_t*>(dense_contiguous.data_ptr()),
+        reinterpret_cast<uint8_t*>(values.data_ptr()), info);
     checkCuda(cudaGetLastError(), "CUDA sparse_mask gather kernel");
     return Tensor::make_sparse_coo_tensor(
         indices, values, static_cast<std::vector<int64_t>>(mask.shape()),
@@ -669,15 +728,6 @@ Tensor& add_sparse_to_dense_cuda(Tensor& dense, const Tensor& sparse, Scalar alp
     if (dense.shape() != sparse.shape()) {
         TP_THROW(RuntimeError, "add_: sparse COO operands must have identical sizes");
     }
-    if (dense.dtype() == DType::ComplexHalf || dense.dtype() == DType::ComplexFloat ||
-        dense.dtype() == DType::ComplexDouble || dense.dtype() == DType::BComplex32) {
-        Tensor host_dense = dense.to(Device(DeviceType::CPU));
-        Tensor host_sparse = sparse.to(Device(DeviceType::CPU));
-        cpu::add_sparse_to_dense_cpu(host_dense, host_sparse, alpha);
-        dense.copy_(host_dense);
-        return dense;
-    }
-
     Tensor canonical = sparse.is_coalesced() ? sparse : sparse.coalesce();
     Tensor indices = canonical._indices().contiguous();
     Tensor values = canonical._values();
@@ -698,6 +748,58 @@ Tensor& add_sparse_to_dense_cuda(Tensor& dense, const Tensor& sparse, Scalar alp
     SparseGatherInfo info = make_gather_info(dense, canonical);
     const int threads = 256;
     const int blocks = static_cast<int>((update_numel + threads - 1) / threads);
+    const cudaStream_t add_stream = getCurrentCUDAStream().stream();
+    if (dense.dtype() == DType::ComplexHalf ||
+        dense.dtype() == DType::ComplexFloat ||
+        dense.dtype() == DType::ComplexDouble ||
+        dense.dtype() == DType::BComplex32) {
+        const auto alpha_value = alpha.to<std::complex<double>>();
+        if (dense.dtype() == DType::ComplexHalf) {
+            const CudaComplexPair<tensorplay::Half> alpha_pair{
+                tensorplay::Half(static_cast<float>(alpha_value.real())),
+                tensorplay::Half(static_cast<float>(alpha_value.imag()))};
+            sparse_add_complex_kernel<tensorplay::Half><<<
+                blocks, threads, 0, add_stream>>>(
+                update_numel, indices.data_ptr<int64_t>(), nnz, dense_numel,
+                reinterpret_cast<CudaComplexPair<tensorplay::Half>*>(
+                    dense.data_ptr()),
+                reinterpret_cast<const CudaComplexPair<tensorplay::Half>*>(
+                    values.data_ptr()),
+                alpha_pair, info);
+        } else if (dense.dtype() == DType::ComplexFloat) {
+            const CudaComplexPair<float> alpha_pair{
+                static_cast<float>(alpha_value.real()),
+                static_cast<float>(alpha_value.imag())};
+            sparse_add_complex_kernel<float><<<blocks, threads, 0, add_stream>>>(
+                update_numel, indices.data_ptr<int64_t>(), nnz, dense_numel,
+                reinterpret_cast<CudaComplexPair<float>*>(dense.data_ptr()),
+                reinterpret_cast<const CudaComplexPair<float>*>(values.data_ptr()),
+                alpha_pair, info);
+        } else if (dense.dtype() == DType::ComplexDouble) {
+            const CudaComplexPair<double> alpha_pair{
+                alpha_value.real(), alpha_value.imag()};
+            sparse_add_complex_kernel<double><<<blocks, threads, 0, add_stream>>>(
+                update_numel, indices.data_ptr<int64_t>(), nnz, dense_numel,
+                reinterpret_cast<CudaComplexPair<double>*>(dense.data_ptr()),
+                reinterpret_cast<const CudaComplexPair<double>*>(values.data_ptr()),
+                alpha_pair, info);
+        } else {
+            const CudaComplexPair<tensorplay::BFloat16> alpha_pair{
+                tensorplay::BFloat16(static_cast<float>(alpha_value.real())),
+                tensorplay::BFloat16(static_cast<float>(alpha_value.imag()))};
+            sparse_add_complex_kernel<tensorplay::BFloat16><<<
+                blocks, threads, 0, add_stream>>>(
+                update_numel, indices.data_ptr<int64_t>(), nnz, dense_numel,
+                reinterpret_cast<CudaComplexPair<tensorplay::BFloat16>*>(
+                    dense.data_ptr()),
+                reinterpret_cast<const CudaComplexPair<tensorplay::BFloat16>*>(
+                    values.data_ptr()),
+                alpha_pair, info);
+        }
+        checkCuda(cudaGetLastError(), "CUDA sparse complex add kernel");
+        dense.unsafeGetTensorImpl()->bump_version();
+        return dense;
+    }
 #define TP_SPARSE_ADD_CASE(ctype, name) \
     case DType::name: \
         sparse_add_kernel<ctype><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>( \
@@ -980,6 +1082,36 @@ __global__ void sparse_csr_mm_kernel(
     out[linear] = accumulator;
 }
 
+template <typename real_t>
+__global__ void sparse_csr_mm_complex_kernel(
+    int64_t total,
+    int64_t cols,
+    const int64_t* crow,
+    const int64_t* col,
+    const CudaComplexPair<real_t>* values,
+    const CudaComplexPair<real_t>* dense,
+    CudaComplexPair<real_t>* out) {
+    const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (linear >= total) return;
+    const int64_t row = linear / cols;
+    const int64_t column = linear % cols;
+    using compute_t = std::conditional_t<std::is_same_v<real_t, double>, double, float>;
+    compute_t real = 0;
+    compute_t imag = 0;
+    for (int64_t index = crow[row]; index < crow[row + 1]; ++index) {
+        const CudaComplexPair<real_t> left = values[index];
+        const CudaComplexPair<real_t> right = dense[col[index] * cols + column];
+        const compute_t left_real = static_cast<compute_t>(left.real);
+        const compute_t left_imag = static_cast<compute_t>(left.imag);
+        const compute_t right_real = static_cast<compute_t>(right.real);
+        const compute_t right_imag = static_cast<compute_t>(right.imag);
+        real += left_real * right_real - left_imag * right_imag;
+        imag += left_real * right_imag + left_imag * right_real;
+    }
+    out[linear].real = static_cast<real_t>(real);
+    out[linear].imag = static_cast<real_t>(imag);
+}
+
 template <typename scalar_t>
 __global__ void sparse_sum_reduce_kernel(
     int64_t numel,
@@ -1202,11 +1334,24 @@ Tensor sparse_mm_cuda(const Tensor& self, const Tensor& dense) {
         const int blocks = static_cast<int>((total + threads - 1) / threads);
         dispatch_coalesce_dtype(self.dtype(), [&](auto tag) {
             using scalar_t = typename decltype(tag)::type;
-            sparse_csr_mm_kernel<scalar_t><<<blocks, threads, 0, mm_stream>>>(
-                total, cols, crow.data_ptr<int64_t>(), col.data_ptr<int64_t>(),
-                values.data_ptr<scalar_t>(),
-                dense_contiguous.data_ptr<scalar_t>(),
-                out.data_ptr<scalar_t>());
+            if constexpr (is_complex_type_v<scalar_t>) {
+                using real_t = typename is_complex_type<scalar_t>::value_type;
+                sparse_csr_mm_complex_kernel<real_t><<<blocks, threads, 0,
+                                                       mm_stream>>>(
+                    total, cols, crow.data_ptr<int64_t>(),
+                    col.data_ptr<int64_t>(),
+                    reinterpret_cast<const CudaComplexPair<real_t>*>(
+                        values.data_ptr()),
+                    reinterpret_cast<const CudaComplexPair<real_t>*>(
+                        dense_contiguous.data_ptr()),
+                    reinterpret_cast<CudaComplexPair<real_t>*>(out.data_ptr()));
+            } else {
+                sparse_csr_mm_kernel<scalar_t><<<blocks, threads, 0, mm_stream>>>(
+                    total, cols, crow.data_ptr<int64_t>(), col.data_ptr<int64_t>(),
+                    values.data_ptr<scalar_t>(),
+                    dense_contiguous.data_ptr<scalar_t>(),
+                    out.data_ptr<scalar_t>());
+            }
         });
         checkCuda(cudaGetLastError(), "CUDA sparse_mm kernel");
     }
