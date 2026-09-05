@@ -51,18 +51,6 @@ namespace {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-// A per-slice parameter (one value per slice along `dim`, possibly with
-// extra size-1 axes) reshaped into a broadcastable keepdim form.
-Tensor expand_slice_param(const Tensor& p, const Tensor& like, int64_t dim) {
-    const int64_t nd = like.dim();
-    dim = (dim % nd + nd) % nd;
-    int64_t count = 1;
-    for (const auto s : p.shape()) count *= s;
-    std::vector<int64_t> sizes(static_cast<size_t>(nd), 1);
-    sizes[dim] = count;
-    return p.reshape(sizes);
-}
-
 // Channel statistics for batch normalization: mean/variance over every
 // dimension except the channel axis, collapsed to one value per channel.
 std::tuple<Tensor, Tensor> batch_norm_channel_stats(const Tensor& input) {
@@ -1240,49 +1228,6 @@ Tensor& interop__convert_indices_from_csr_to_coo_out_cuda(
 }
 
 // ---------------------------------------------------------------------------
-// _weight_norm_interface: w = v / ||v|| * g per slice.  The second output is
-// the slice norm saved for the backward pass.
-// ---------------------------------------------------------------------------
-
-std::tuple<Tensor, Tensor> interop__weight_norm_interface_cuda(
-        const Tensor& v, const Tensor& g, int64_t dim) {
-    Tensor norm = ops::norm(v, {dim}, 2.0, true);
-    Tensor g_kd = expand_slice_param(g, v, dim);
-    Tensor w = ops::mul(v, ops::div(g_kd, norm));
-    return std::make_tuple(w, norm);
-}
-
-std::tuple<Tensor, Tensor> interop__weight_norm_interface_backward_cuda(
-        const Tensor& grad_w, const Tensor& saved_v, const Tensor& saved_g,
-        const Tensor& saved_norms, int64_t dim) {
-    // With vhat = v / norm: dw/dv = g (I - vhat vhat^T) / norm and
-    // dw/dg = vhat, both per slice; gradients over broadcast axes are summed.
-    const int64_t nd = saved_v.dim();
-    dim = (dim % nd + nd) % nd;
-    Tensor norm = expand_slice_param(saved_norms, saved_v, dim);
-    Tensor g = expand_slice_param(saved_g, saved_v, dim);
-    Tensor vhat = ops::div(saved_v, norm);
-    Tensor proj = ops::mul(grad_w, g);
-    Tensor grad_v = ops::div(ops::sub(proj, ops::mul(vhat,
-                                                     ops::sum(ops::mul(proj, vhat),
-                                                              {dim}, true))),
-                             norm);
-    // grad wrt g: project the incoming gradient onto vhat, then reduce every
-    // axis except the slice axis so the result matches g's own shape.
-    Tensor grad_g;
-    {
-        std::vector<int64_t> reduce_dims;
-        for (int64_t d = 0; d < nd; ++d) {
-            if (d != dim) reduce_dims.push_back(d);
-        }
-        grad_g = ops::sum(ops::mul(grad_w, vhat), reduce_dims, true);
-        grad_g = grad_g.reshape(
-            static_cast<std::vector<int64_t>>(saved_g.shape()));
-    }
-    return std::make_tuple(grad_v, grad_g);
-}
-
-// ---------------------------------------------------------------------------
 // _thnn_fused_gru_cell: gate arithmetic for the fused GRU cell.  Gates run
 // along the last dimension in [reset, update, candidate] order.
 //
@@ -1569,10 +1514,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, InteropAliasKernels) {
     m.impl("_convert_indices_from_coo_to_csr.out", interop__convert_indices_from_coo_to_csr_out_cuda);
     m.impl("_convert_indices_from_csr_to_coo", interop__convert_indices_from_csr_to_coo_cuda);
     m.impl("_convert_indices_from_csr_to_coo.out", interop__convert_indices_from_csr_to_coo_out_cuda);
-
-    // weight norm
-    m.impl("_weight_norm_interface", interop__weight_norm_interface_cuda);
-    m.impl("_weight_norm_interface_backward", interop__weight_norm_interface_backward_cuda);
 
     // fused rnn cells
     m.impl("_thnn_fused_gru_cell", interop__thnn_fused_gru_cell_cuda);

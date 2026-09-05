@@ -130,6 +130,9 @@ set(P10_SOURCES
     src/backend/composite/AffineGrid.cpp
     src/backend/composite/Linear.cpp
     src/backend/composite/LinearAlgebra.cpp
+    src/backend/composite/MatrixExp.cpp
+    src/backend/composite/ShapeMisc.cpp
+    src/backend/composite/WeightNorm.cpp
     src/backend/composite/Pointwise.cpp
     src/backend/composite/Reduction.cpp
     src/backend/composite/RNN.cpp

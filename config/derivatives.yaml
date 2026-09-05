@@ -624,6 +624,12 @@
 - name: hardsigmoid(Tensor self) -> Tensor
   self: hardsigmoid_backward(grad, self)
 
+- name: matrix_exp(Tensor self) -> Tensor
+  self: matrix_exp_backward(self, grad)
+
+- name: linalg_matrix_exp(Tensor self) -> Tensor
+  self: matrix_exp_backward(self, grad)
+
 - name: prelu(Tensor self, Tensor weight) -> Tensor
   self: std::get<0>(prelu_backward(grad, self, weight))
   weight: std::get<1>(prelu_backward(grad, self, weight))
