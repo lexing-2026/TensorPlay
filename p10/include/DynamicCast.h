@@ -20,7 +20,9 @@
 #include <complex>
 #include <type_traits>
 
-#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
+// The whole translation unit mixes host and device code, so these helpers
+// must be callable from either side in every compilation pass.
 #define TP_DYNAMIC_CAST_HOST_DEVICE __host__ __device__
 #define TP_DYNAMIC_CAST_ERROR(msg) assert(false && (msg));
 #else

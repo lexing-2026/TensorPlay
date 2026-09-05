@@ -661,14 +661,12 @@ inline void launch_vectorized_kernel(int64_t N, const func_t& f,
     int64_t grid = (N + tws * static_cast<int64_t>(kLoopNumThreads) - 1) /
                    (tws * static_cast<int64_t>(kLoopNumThreads));
     hipStream_t stream = getCurrentCUDAStream().stream();
-    int vec_size = memory::can_vectorize_up_to<func_t>(data);
+    // vec_size must divide the per-thread workload exactly (the vectorized
+    // policy slices each thread's slots into whole vectors), so cap the
+    // alignment-derived width at the fixed thread work size.
+    int vec_size =
+        std::min(memory::can_vectorize_up_to<func_t>(data), tws);
     switch (vec_size) {
-        case 8:
-            vectorized_elementwise_kernel<8, func_t, array_t>
-                <<<static_cast<unsigned>(grid), kLoopNumThreads, 0, stream>>>(
-                    static_cast<int>(N), f, data);
-            loop_launch_check("vectorized_elementwise_kernel<8>");
-            break;
         case 4:
             vectorized_elementwise_kernel<4, func_t, array_t>
                 <<<static_cast<unsigned>(grid), kLoopNumThreads, 0, stream>>>(
@@ -1096,16 +1094,18 @@ void gpu_kernel_impl(TensorIteratorBase& iter, const func_t& f) {
         }
         auto offset_calc = make_offset_calculator<traits::arity + 1>(iter);
         // The specialized bodies invoke the functor with two operands, so
-        // only true binary functors qualify; scalar-folded unary wrappers
-        // (and any other arity) keep the generic dynamic-cast kernel.
-        if (traits::arity == 2 &&
-            detail::check_binary_rt_types_for_specialization(iter)) {
-            detail_for_loop<detail::type_specialized_broadcast_kernel_launcher,
-                            0,
-                            static_cast<int>(
-                                detail::rt_binary_specializations.size())>::
-                apply(numel, f, data, dtypes, offset_calc);
-            return;
+        // the arity test is compile-time: scalar-folded unary wrappers (and
+        // any other arity) never instantiate this branch and keep the
+        // generic dynamic-cast kernel below.
+        if constexpr (traits::arity == 2) {
+            if (detail::check_binary_rt_types_for_specialization(iter)) {
+                detail_for_loop<detail::type_specialized_broadcast_kernel_launcher,
+                                0,
+                                static_cast<int>(
+                                    detail::rt_binary_specializations.size())>::
+                    apply(numel, f, data, dtypes, offset_calc);
+                return;
+            }
         }
         constexpr int grp_sz = 128;
         launch_legacy_kernel_manual_unroll<grp_sz, 4>(

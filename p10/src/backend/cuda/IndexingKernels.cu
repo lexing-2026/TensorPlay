@@ -663,6 +663,12 @@ __device__ __forceinline__ void atomic_add_rel(BFloat16* addr, BFloat16 v) {
     gpuAtomicAdd(addr, v);
 }
 
+// Boolean accumulation is logical OR, realized through the byte CAS loop in
+// the integer-family atomic.
+__device__ __forceinline__ void atomic_add_rel(bool* addr, bool v) {
+    gpuAtomicAdd(addr, v);
+}
+
 template <typename T>
 __device__ __forceinline__ void atomic_add_rel(tensorplay::complex<T>* addr,
                                                tensorplay::complex<T> v) {
