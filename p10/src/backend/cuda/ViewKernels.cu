@@ -12,6 +12,30 @@ namespace cuda {
 
 namespace {
 
+inline bool diagonal_mul_overflow(int64_t lhs, int64_t rhs) {
+    if (lhs == 0 || rhs == 0) return false;
+    if ((lhs == std::numeric_limits<int64_t>::min() && rhs == -1) ||
+        (rhs == std::numeric_limits<int64_t>::min() && lhs == -1)) {
+        return true;
+    }
+    if (lhs > 0) {
+        return rhs > 0
+            ? lhs > std::numeric_limits<int64_t>::max() / rhs
+            : rhs < std::numeric_limits<int64_t>::min() / lhs;
+    }
+    return rhs > 0
+        ? lhs < std::numeric_limits<int64_t>::min() / rhs
+        : lhs < std::numeric_limits<int64_t>::max() / rhs;
+}
+
+inline int64_t diagonal_add_checked(int64_t lhs, int64_t rhs) {
+    if ((rhs > 0 && lhs > std::numeric_limits<int64_t>::max() - rhs) ||
+        (rhs < 0 && lhs < std::numeric_limits<int64_t>::min() - rhs)) {
+        TP_THROW(ValueError, "diagonal storage offset overflow");
+    }
+    return lhs + rhs;
+}
+
 Tensor view_as_real_cuda(const Tensor& self) {
     if (!self.defined()) {
         TP_THROW(RuntimeError, "view_as_real: input must be defined");
@@ -174,8 +198,7 @@ Tensor view_kernel_cuda(const Tensor& self, const std::vector<int64_t>& shape) {
 }
 
 Tensor transpose_kernel_cuda(const Tensor& self, int64_t dim0, int64_t dim1) {
-    // TensorShape.cpp transpose: maybe_wrap_dim both dims (wrap_scalar=true
-    // makes transpose(0, 0) a no-op on 0-d tensors), then swap sizes/strides.
+    // Normalize both dimensions, then exchange sizes and strides.
     const int64_t ndim = self.dim();
     dim0 = join_detail::wrap_dim_scalar(dim0, ndim);
     dim1 = join_detail::wrap_dim_scalar(dim1, ndim);
@@ -199,7 +222,7 @@ Tensor t_kernel_cuda(const Tensor& self) {
 }
 
 Tensor permute_kernel_cuda(const Tensor& self, const std::vector<int64_t>& dims) {
-    // TensorShape.cpp _permute_size_stride_estimation.
+    // Construct the requested permutation from normalized dimensions.
     const int64_t ndim = self.dim();
     if (dims.size() != static_cast<size_t>(ndim)) {
         TP_THROW(RuntimeError,
@@ -234,9 +257,8 @@ Tensor squeeze_kernel_cuda(const Tensor& self) {
 }
 
 Tensor squeeze_dim_kernel_cuda(const Tensor& self, int64_t dim) {
-    // TensorShape.cpp squeeze(dim): maybe_wrap_dim (wrap_scalar=true makes
-    // squeeze(0) a no-op on 0-d tensors); non-singleton dims return an
-    // equivalent view.
+    // Rank-0 accepts the scalar dimension range; a non-singleton dimension is
+    // returned as an equivalent view.
     const int64_t ndim = self.dim();
     dim = join_detail::wrap_dim_scalar(dim, ndim);
     if (ndim == 0 || self.size(dim) != 1) {
@@ -255,9 +277,8 @@ Tensor squeeze_dim_kernel_cuda(const Tensor& self, int64_t dim) {
 }
 
 Tensor squeeze_dims_kernel_cuda(const Tensor& self, const std::vector<int64_t>& dims) {
-    // TensorShape.cpp squeeze(dims): dim_list_to_bitset (WrapDimUtilsMulti.h)
-    // wraps with wrap_scalar=true and rejects duplicates, then squeezes every
-    // listed size-1 dim.
+    // Normalize the dimension list and reject duplicates before removing
+    // listed singleton axes.
     const int64_t ndim = self.dim();
     std::vector<bool> seen(ndim > 0 ? ndim : 1, false);
     std::vector<bool> mask(ndim, false);
@@ -284,8 +305,8 @@ Tensor squeeze_dims_kernel_cuda(const Tensor& self, const std::vector<int64_t>& 
 }
 
 Tensor unsqueeze_kernel_cuda(const Tensor& self, int64_t dim) {
-    // TensorShape.cpp unsqueeze + inferUnsqueezeGeometry: the inserted dim
-    // stride is size(dim)*stride(dim) (1 when appended at the end).
+    // The inserted dimension uses the product stride of the following
+    // geometry (or one when appended at the end).
     const int64_t ndim = self.dim();
     dim = join_detail::wrap_dim(dim, ndim + 1);
 
@@ -518,9 +539,6 @@ Tensor squeeze_backward_kernel_cuda(const Tensor& grad, const Tensor& self) {
 
 // Pure metadata op: identical to the CPU kernel, safe on any device.
 Tensor diagonal_kernel_cuda(const Tensor& self, int64_t offset, int64_t dim1, int64_t dim2) {
-    // TensorShape.cpp diagonal: wrap first (so 0/1-d inputs raise the
-    // maybe_wrap_dim IndexError), then reject identical dims reporting the
-    // original arguments.
     const int64_t ndim = self.dim();
     const int64_t dim1_ = dim1, dim2_ = dim2;
     dim1 = join_detail::wrap_dim_scalar(dim1, ndim);
@@ -549,20 +567,33 @@ Tensor diagonal_kernel_cuda(const Tensor& self, int64_t offset, int64_t dim1, in
     int64_t diag_size;
     int64_t new_offset = static_cast<int64_t>(self.unsafeGetTensorImpl()->storage_offset());
     if (offset >= 0) {
-        diag_size = std::max<int64_t>(std::min(size1, size2 - offset), 0);
+        diag_size = offset < size2 ? std::min(size1, size2 - offset) : 0;
+    } else if (offset == std::numeric_limits<int64_t>::min()) {
+        diag_size = 0;
     } else {
-        diag_size = std::max<int64_t>(std::min(size1 + offset, size2), 0);
+        const int64_t offset_abs = -offset;
+        diag_size = offset_abs < size1 ? std::min(size1 - offset_abs, size2) : 0;
     }
-    // NumPy allows offsets "off the end"; don't set a ridiculous storage
-    // offset when the diagonal is empty.
+    // Out-of-range offsets keep an empty view at the original storage offset.
     if (diag_size != 0) {
         if (offset >= 0) {
-            new_offset += offset * stride2;
+            if (diagonal_mul_overflow(offset, stride2)) {
+                TP_THROW(ValueError, "diagonal storage offset overflow");
+            }
+            new_offset = diagonal_add_checked(new_offset, offset * stride2);
         } else {
-            new_offset -= offset * stride1;
+            const int64_t offset_abs = -offset;
+            if (diagonal_mul_overflow(offset_abs, stride1)) {
+                TP_THROW(ValueError, "diagonal storage offset overflow");
+            }
+            new_offset = diagonal_add_checked(new_offset, offset_abs * stride1);
         }
     }
     sizes.push_back(diag_size);
+    if ((stride2 > 0 && stride1 > std::numeric_limits<int64_t>::max() - stride2) ||
+        (stride2 < 0 && stride1 < std::numeric_limits<int64_t>::min() - stride2)) {
+        TP_THROW(ValueError, "diagonal stride overflow");
+    }
     strides.push_back(stride1 + stride2);
     return self.as_strided(sizes, strides, new_offset);
 }
@@ -580,7 +611,7 @@ Tensor diagonal_backward_kernel_cuda(const Tensor& grad, const std::vector<int64
 
 Tensor movedim_kernel_cuda(const Tensor& self, const std::vector<int64_t>& source,
                            const std::vector<int64_t>& destination) {
-    // TensorShape.cpp movedim.
+    // Normalize source and destination axes before constructing the moved view.
     const int64_t ndim = self.dim();
     if (source.size() != destination.size()) {
         TP_THROW(RuntimeError, "movedim: Invalid source or destination dims: source (",

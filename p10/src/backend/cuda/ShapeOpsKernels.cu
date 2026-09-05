@@ -343,7 +343,6 @@ Tensor diag_cuda(const Tensor& self, int64_t diagonal) {
 }
 
 Tensor diag_embed_cuda(const Tensor& self, int64_t offset, int64_t dim1_, int64_t dim2_) {
-    // Host-assisted implementation for this infrequently used shape transform.
     int64_t nDims = self.dim() + 1;
     int64_t dim1 = wrap_dim(dim1_, nDims);
     int64_t dim2 = wrap_dim(dim2_, nDims);
@@ -354,41 +353,9 @@ Tensor diag_embed_cuda(const Tensor& self, int64_t offset, int64_t dim1_, int64_
     sizes.pop_back();
     sizes.insert(sizes.begin() + std::min(dim1, dim2), new_dim_len);
     sizes.insert(sizes.begin() + std::max(dim1, dim2), new_dim_len);
-    Tensor rc = Tensor::zeros(sizes, self.dtype(), Device(DeviceType::CPU));
-    Tensor sc = self.contiguous().to(Device(DeviceType::CPU));
-    int64_t mid = std::max(dim1, dim2);
-    int64_t lowdim = std::min(dim1, dim2);
-    int64_t n = self.numel();
-#define TP_DEW(ctype, name_) \
-    case DType::name_: { \
-        const ctype* s2 = sc.data_ptr<ctype>(); \
-        ctype* d2 = rc.data_ptr<ctype>(); \
-        for (int64_t li = 0; li < n; ++li) { \
-            int64_t rem = li; \
-            std::vector<int64_t> sc3(self.dim(), 0); \
-            for (int64_t d3 = static_cast<int64_t>(self.dim()) - 1; d3 >= 0; --d3) { \
-                sc3[d3] = rem % self.size(d3); rem /= self.size(d3); } \
-            int64_t t = sc3.back(); \
-            int64_t i = offset >= 0 ? t : t - offset; \
-            int64_t j = offset >= 0 ? t + offset : t; \
-            std::vector<int64_t> rc2(sizes.size(), 0); \
-            int64_t sk = 0; \
-            for (int64_t d3 = 0; d3 < static_cast<int64_t>(sizes.size()); ++d3) { \
-                if (d3 == lowdim) rc2[d3] = i; \
-                else if (d3 == mid) rc2[d3] = j; \
-                else rc2[d3] = sc3[sk++]; } \
-            int64_t lin = 0; \
-            for (int64_t d3 = 0; d3 < static_cast<int64_t>(sizes.size()); ++d3) \
-                lin = lin * sizes[d3] + rc2[d3]; \
-            d2[lin] = s2[li]; \
-        } \
-        break; }
-    switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_DEW)
-        default: TP_THROW(TypeError, "diag_embed: unsupported dtype");
-    }
-#undef TP_DEW
-    return rc.to(self.device());
+    Tensor result = Tensor::zeros(sizes, self.dtype(), self.device());
+    result.diagonal(offset, dim1, dim2).copy_(self);
+    return result;
 }
 
 Tensor narrow_cuda(const Tensor& self, int64_t dim, int64_t start, int64_t length) {
