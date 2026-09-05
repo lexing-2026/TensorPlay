@@ -132,67 +132,7 @@ Tensor view_cpu(const Tensor& self, const std::vector<int64_t>& shape) {
 // Same-size dtypes keep shape/strides; otherwise only the last dimension may
 // change and the storage offset is rescaled between element units.
 Tensor view_dtype_cpu(const Tensor& self, DType dtype) {
-    if (!self.defined()) {
-        TP_THROW(RuntimeError, "Tensor not defined");
-    }
-    std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
-    const DType self_dtype = impl->dtype();
-    if (dtype == self_dtype) {
-        Tensor out(impl->storage(), impl->sizes().vec(), impl->strides().vec(),
-                   dtype, impl->storage_offset());
-        out.unsafeGetTensorImpl()->share_version_counter(*impl);
-        return out;
-    }
-
-    const std::vector<int64_t> self_sizes = impl->sizes().vec();
-    const std::vector<int64_t> self_strides = impl->strides().vec();
-    const size_t src_esize = elementSize(self_dtype);
-    const size_t dst_esize = elementSize(dtype);
-
-    if (self_strides.empty()) {
-        TP_THROW(RuntimeError,
-                 "view(): cannot reinterpret a 0-dim tensor to a dtype of a different element size");
-    }
-    if (self_strides.back() != 1 && src_esize != dst_esize) {
-        TP_THROW(RuntimeError,
-                 "view(): view(dtype) requires the last dimension to be contiguous when "
-                 "element sizes differ");
-    }
-
-    std::vector<int64_t> new_sizes = self_sizes;
-    std::vector<int64_t> new_strides = self_strides;
-    size_t new_offset = impl->storage_offset();
-
-    if (dst_esize < src_esize) {
-        const int64_t ratio = static_cast<int64_t>(src_esize / dst_esize);
-        new_sizes.back() *= ratio;
-        for (size_t i = 0; i + 1 < new_strides.size(); ++i) new_strides[i] *= ratio;
-        new_offset = impl->storage_offset() * static_cast<size_t>(ratio);
-    } else if (dst_esize > src_esize) {
-        const int64_t ratio = static_cast<int64_t>(dst_esize / src_esize);
-        if (new_sizes.back() % ratio != 0) {
-            TP_THROW(RuntimeError,
-                     "view(): the last dimension must be divisible by the element size ratio");
-        }
-        for (size_t i = 0; i + 1 < new_strides.size(); ++i) {
-            if (new_strides[i] % ratio != 0) {
-                TP_THROW(RuntimeError,
-                         "view(): strides must be divisible by the element size ratio");
-            }
-            new_strides[i] /= ratio;
-        }
-        new_sizes.back() /= ratio;
-        if ((impl->storage_offset() * static_cast<int64_t>(src_esize)) %
-                static_cast<int64_t>(dst_esize) != 0) {
-            TP_THROW(RuntimeError,
-                     "view(): storage offset is not aligned to the target element size");
-        }
-        new_offset = impl->storage_offset() / static_cast<size_t>(ratio);
-    }
-
-    Tensor out(impl->storage(), new_sizes, new_strides, dtype, new_offset);
-    out.unsafeGetTensorImpl()->share_version_counter(*impl);
-    return out;
+    return self.view_dtype(dtype);
 }
 
 // -----------------------------------------------------------------------------
