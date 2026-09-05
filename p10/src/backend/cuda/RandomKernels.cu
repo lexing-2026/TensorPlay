@@ -606,14 +606,15 @@ Tensor& log_normal_kernel_cuda(Tensor& self, double mean, double std) {
 }
 
 Tensor& cauchy_kernel_cuda(Tensor& self, double median, double sigma) {
+    if (!(sigma > 0.0)) {
+        TP_THROW(RuntimeError,
+                 "cauchy_ expects sigma > 0.0, but found sigma=", sigma);
+    }
     if (self.numel() == 0) return self;
     if (!self.is_contiguous()) {
         return fill_via_contiguous(self, [&](Tensor& t) { return cauchy_kernel_cuda(t, median, sigma); });
     }
     int64_t n = self.numel();
-    if (sigma <= 0.0) {
-        TP_THROW(RuntimeError, "cauchy_ expects sigma > 0.0, but found sigma=", sigma);
-    }
     constexpr double kPi = 3.14159265358979323846;
     if (self.dtype() == DType::Float32) {
         float* data = self.data_ptr<float>();

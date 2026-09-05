@@ -1058,7 +1058,7 @@ Tensor& bernoulli_inplace_kernel(Tensor& self) {
 
 Tensor& cauchy_kernel(Tensor& self, double median, double sigma) {
     auto& gen = default_generator();
-    TP_THROW_IF(sigma <= 0.0, RuntimeError, "cauchy_ expects sigma > 0.0, but found sigma=", sigma);
+    TP_THROW_IF(!(sigma > 0.0), RuntimeError, "cauchy_ expects sigma > 0.0, but found sigma=", sigma);
     if (self.numel() == 0) return self;
     check_writable_inplace(self);
     cauchy_distribution<double> dist(median, sigma);
