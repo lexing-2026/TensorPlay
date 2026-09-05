@@ -515,6 +515,10 @@ Tensor sparse_mm_cpu(const Tensor& self, const Tensor& dense) {
     Tensor out = Tensor::zeros({rows, cols}, self.dtype(), self.device());
 
     if (self.is_sparse_csr()) {
+        if (self.sparse_dim() != 2 || self._values().dim() != 1) {
+            TP_THROW(RuntimeError,
+                     "sparse_mm(): hybrid CSR tensors are not supported");
+        }
         Tensor crow = self._crow_indices().contiguous();
         Tensor col = self._col_indices().contiguous();
         Tensor values = self._values().contiguous();
