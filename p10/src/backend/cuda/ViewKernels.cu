@@ -49,7 +49,7 @@ Tensor view_as_real_cuda(const Tensor& self) {
     std::vector<int64_t> sizes = static_cast<std::vector<int64_t>>(self.shape());
     std::vector<int64_t> strides = self.strides();
     for (auto& stride : strides) {
-        if (stride > std::numeric_limits<int64_t>::max() / 2) {
+        if (diagonal_mul_overflow(stride, 2)) {
             TP_THROW(RuntimeError, "view_as_real: stride overflow");
         }
         stride *= 2;
@@ -88,7 +88,7 @@ Tensor view_as_complex_cuda(const Tensor& self) {
                 "view_as_complex: last dimension must have stride 1");
     }
     for (int64_t dim = 0; dim + 1 < self.dim(); ++dim) {
-        if ((self.stride(dim) & 1) != 0) {
+        if (self.size(dim) != 1 && (self.stride(dim) & 1) != 0) {
             TP_THROW(RuntimeError,
                     "view_as_complex: strides of all dimensions except the last "
                     "must be divisible by 2");
