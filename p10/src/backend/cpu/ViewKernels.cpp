@@ -161,7 +161,7 @@ int64_t wrap_dim_scalar(int64_t dim, int64_t ndim) {
     return wrap_dim(dim, ndim == 0 ? 1 : ndim);
 }
 
-// TensorShape.h cat_should_skip_tensor: size-[0] 1-d tensors are skipped for
+// Size-[0] 1-d tensors are skipped for
 // wrap-dim / shape-check purposes (backwards compatibility).
 bool should_skip(const Tensor& t) {
     return t.numel() == 0 && t.dim() == 1;
@@ -292,8 +292,13 @@ Tensor unsqueeze_kernel(const Tensor& self, int64_t dim) {
     std::vector<int64_t> new_sizes = static_cast<std::vector<int64_t>>(self.shape());
     std::vector<int64_t> new_strides = self.strides();
 
-    const int64_t new_stride =
-        (dim == ndim) ? 1 : self.size(dim) * self.stride(dim);
+    int64_t new_stride = 1;
+    if (dim != ndim) {
+        if (diagonal_mul_overflow(self.size(dim), self.stride(dim))) {
+            TP_THROW(ValueError, "unsqueeze: stride overflow");
+        }
+        new_stride = self.size(dim) * self.stride(dim);
+    }
     new_sizes.insert(new_sizes.begin() + dim, 1);
     new_strides.insert(new_strides.begin() + dim, new_stride);
 
