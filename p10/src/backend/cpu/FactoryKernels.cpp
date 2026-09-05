@@ -257,28 +257,43 @@ Tensor empty_kernel(const std::vector<int64_t>& size, DType dtype, Device device
 Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device) {
     if (m < 0) m = n;
     Tensor t = Tensor::zeros({n, m}, dtype, device);
-    int64_t min_dim = std::min(n, m);
-    if (dtype == DType::Float32) {
-        float* data = t.data_ptr<float>();
-        for(int64_t i=0; i<min_dim; ++i) {
-            data[i*m + i] = 1.0f;
-        }
-    } else if (dtype == DType::Float64) {
-        double* data = t.data_ptr<double>();
-        for(int64_t i=0; i<min_dim; ++i) {
-            data[i*m + i] = 1.0;
-        }
-    } else if (dtype == DType::Int64) {
-        int64_t* data = t.data_ptr<int64_t>();
-        for(int64_t i=0; i<min_dim; ++i) {
-            data[i*m + i] = 1;
-        }
-    } else if (dtype == DType::Int32) {
-        int32_t* data = t.data_ptr<int32_t>();
-        for(int64_t i=0; i<min_dim; ++i) {
-            data[i*m + i] = 1;
-        }
+    const int64_t min_dim = std::min(n, m);
+    if (min_dim == 0) return t;
+#define TP_EYE_CASE(ctype, name)                                    \
+    case DType::name: {                                             \
+        ctype* data = t.data_ptr<ctype>();                          \
+        for (int64_t i = 0; i < min_dim; ++i) data[i * m + i] = ctype(1); \
+        break;                                                      \
     }
+    switch (dtype) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_EYE_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(TP_EYE_CASE)
+        case DType::ComplexFloat: {
+            auto* data = t.data_ptr<std::complex<float>>();
+            for (int64_t i = 0; i < min_dim; ++i) data[i * m + i] = {1.0f, 0.0f};
+            break;
+        }
+        case DType::ComplexDouble: {
+            auto* data = t.data_ptr<std::complex<double>>();
+            for (int64_t i = 0; i < min_dim; ++i) data[i * m + i] = {1.0, 0.0};
+            break;
+        }
+        case DType::ComplexHalf: {
+            auto* data = t.data_ptr<std::complex<Half>>();
+            for (int64_t i = 0; i < min_dim; ++i)
+                data[i * m + i] = {Half(1.0f), Half(0.0f)};
+            break;
+        }
+        case DType::BComplex32: {
+            auto* data = t.data_ptr<std::complex<BFloat16>>();
+            for (int64_t i = 0; i < min_dim; ++i)
+                data[i * m + i] = {BFloat16(1.0f), BFloat16(0.0f)};
+            break;
+        }
+        default:
+            TP_THROW(TypeError, "eye: unsupported dtype");
+    }
+#undef TP_EYE_CASE
     return t;
 }
 
