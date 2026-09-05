@@ -324,22 +324,119 @@ __global__ void arange_fill_impl(int64_t n, double start, double step, T* out) {
 }
 
 template <typename T>
-__global__ void linspace_fill_impl(int64_t n, double start, double step, T* out) {
+__global__ void linspace_fill_impl(
+    int64_t n, double start, double end, double step, T* out) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < n) {
-        // steps == 1 collapses to `start` on the host; here step is pre-divided.
-        out[i] = static_cast<T>(start + static_cast<double>(i) * step);
+    if (i >= n) return;
+    if (n == 1) {
+        out[i] = static_cast<T>(start);
+        return;
     }
+    const int64_t halfway = n / 2;
+    const double value = i < halfway
+        ? start + static_cast<double>(i) * step
+        : end - static_cast<double>(n - i - 1) * step;
+    out[i] = static_cast<T>(value);
 }
 
 template <typename T>
-__global__ void logspace_fill_impl(int64_t n, double start, double step,
-                                   double base, T* out) {
+__global__ void logspace_fill_impl(int64_t n, double start, double end,
+                                   double step, double base, T* out) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < n) {
-        double val = start + static_cast<double>(i) * step;
-        out[i] = static_cast<T>(std::pow(base, val));
+    if (i >= n) return;
+    if (n == 1) {
+        out[i] = static_cast<T>(std::pow(base, start));
+        return;
     }
+    const int64_t halfway = n / 2;
+    const double exponent = i < halfway
+        ? start + static_cast<double>(i) * step
+        : end - static_cast<double>(n - i - 1) * step;
+    out[i] = static_cast<T>(std::pow(base, exponent));
+}
+
+template <typename compute_t, typename store_t>
+__global__ void linspace_fill_complex_impl(
+    int64_t n, compute_t start, compute_t end, compute_t step, store_t* out) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (n == 1) {
+        out[i] = store_t(start);
+        return;
+    }
+    using value_t = typename compute_t::value_type;
+    const int64_t halfway = n / 2;
+    const int64_t distance = i < halfway ? i : n - i - 1;
+    const compute_t value = i < halfway
+        ? start + step * static_cast<value_t>(distance)
+        : end - step * static_cast<value_t>(distance);
+    out[i] = store_t(value);
+}
+
+template <typename compute_t, typename store_t>
+__global__ void logspace_fill_complex_impl(
+    int64_t n, compute_t start, compute_t end, compute_t step,
+    compute_t base, store_t* out) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (n == 1) {
+        out[i] = store_t(tensorplay::pow(base, start));
+        return;
+    }
+    using value_t = typename compute_t::value_type;
+    const int64_t halfway = n / 2;
+    const int64_t distance = i < halfway ? i : n - i - 1;
+    const compute_t exponent = i < halfway
+        ? start + step * static_cast<value_t>(distance)
+        : end - step * static_cast<value_t>(distance);
+    out[i] = store_t(tensorplay::pow(base, exponent));
+}
+
+template <typename compute_t, typename store_t, typename host_t>
+void launch_linspace_complex(
+    int64_t steps, const Scalar& start, const Scalar& end, Tensor& output) {
+    using value_t = typename compute_t::value_type;
+    const host_t start_host = start.to<host_t>();
+    const host_t end_host = end.to<host_t>();
+    const compute_t start_value(
+        static_cast<value_t>(start_host.real()),
+        static_cast<value_t>(start_host.imag()));
+    const compute_t end_value(
+        static_cast<value_t>(end_host.real()),
+        static_cast<value_t>(end_host.imag()));
+    const compute_t step =
+        (end_value - start_value) / static_cast<value_t>(steps - 1);
+    const int threads = 256;
+    const int blocks = static_cast<int>((steps + threads - 1) / threads);
+    linspace_fill_complex_impl<compute_t, store_t>
+        <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+            steps, start_value, end_value, step,
+            static_cast<store_t*>(output.data_ptr()));
+}
+
+template <typename compute_t, typename store_t, typename host_t>
+void launch_logspace_complex(
+    int64_t steps, const Scalar& start, const Scalar& end, double base,
+    Tensor& output) {
+    using value_t = typename compute_t::value_type;
+    const host_t start_host = start.to<host_t>();
+    const host_t end_host = end.to<host_t>();
+    const compute_t start_value(
+        static_cast<value_t>(start_host.real()),
+        static_cast<value_t>(start_host.imag()));
+    const compute_t end_value(
+        static_cast<value_t>(end_host.real()),
+        static_cast<value_t>(end_host.imag()));
+    const compute_t step =
+        (end_value - start_value) / static_cast<value_t>(steps - 1);
+    const compute_t base_value(
+        static_cast<value_t>(base), static_cast<value_t>(0));
+    const int threads = 256;
+    const int blocks = static_cast<int>((steps + threads - 1) / threads);
+    logspace_fill_complex_impl<compute_t, store_t>
+        <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+            steps, start_value, end_value, step, base_value,
+            static_cast<store_t*>(output.data_ptr()));
 }
 
 static int64_t arange_length(Scalar start, Scalar end, Scalar step) {
@@ -435,33 +532,84 @@ Tensor arange_end_cuda(Scalar end, DType dtype, std::optional<Device> device) {
     return arange_start_step_cuda(Scalar(0), end, Scalar(1), dtype, device);
 }
 
+static bool is_sequence_factory_dtype(DType dtype) {
+    return isIntegralType(dtype) || dtype == DType::Float16 ||
+           dtype == DType::Float32 || dtype == DType::Float64 ||
+           dtype == DType::BFloat16 || isComplexType(dtype);
+}
+
 Tensor linspace_cuda(Scalar start, Scalar end, int64_t steps,
                      DType dtype, std::optional<Device> device) {
     Device dev = resolve_factory_device(device);
     if (steps < 0) TP_THROW(RuntimeError, "number of steps must be non-negative");
+    if (!is_sequence_factory_dtype(dtype)) {
+        TP_THROW(NotImplementedError,
+                 "linspace CUDA does not support dtype '" + std::string(toString(dtype)) + "'");
+    }
 
     Tensor t({steps}, dtype, dev);
     if (steps == 0) return t;
 
-    double s = start.toDouble();
-    double e = end.toDouble();
-    double step = (steps == 1) ? 0.0 : (e - s) / (steps - 1);
+    if (isComplexType(dtype)) {
+        switch (dtype) {
+            case DType::ComplexHalf:
+                launch_linspace_complex<
+                    tensorplay::complex<float>, tensorplay::complex<Half>,
+                    std::complex<float>>(steps, start, end, t);
+                break;
+            case DType::ComplexFloat:
+                launch_linspace_complex<
+                    tensorplay::complex<float>, tensorplay::complex<float>,
+                    std::complex<float>>(steps, start, end, t);
+                break;
+            case DType::ComplexDouble:
+                launch_linspace_complex<
+                    tensorplay::complex<double>, tensorplay::complex<double>,
+                    std::complex<double>>(steps, start, end, t);
+                break;
+            case DType::BComplex32:
+                launch_linspace_complex<
+                    tensorplay::complex<float>, tensorplay::complex<BFloat16>,
+                    std::complex<float>>(steps, start, end, t);
+                break;
+            default:
+                TP_THROW(NotImplementedError,
+                         "linspace CUDA does not support dtype '" +
+                         std::string(toString(dtype)) + "'");
+        }
+    } else {
+        const double s = start.toDouble();
+        const double e = end.toDouble();
+        const double step = (steps == 1) ? 0.0 : (e - s) / (steps - 1);
+        const int threads = 256;
+        const int blocks = static_cast<int>((steps + threads - 1) / threads);
 
-    int threads = 256;
-    int blocks = static_cast<int>((steps + threads - 1) / threads);
-
-    #define LINSPACE_CASE(ctype, name) \
-    case DType::name: \
-        linspace_fill_impl<ctype><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>( \
-            steps, s, step, t.data_ptr<ctype>()); \
+#define LINSPACE_CASE(ctype, name)                                           \
+    case DType::name:                                                         \
+        linspace_fill_impl<ctype>                                             \
+            <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(       \
+                steps, s, e, step, t.data_ptr<ctype>());                     \
         break;
-    switch (dtype) {
-        LINSPACE_CASE(float, Float32)
-        LINSPACE_CASE(double, Float64)
-        default:
-            TP_THROW(NotImplementedError, "linspace: only Float32/Float64 supported on CUDA");
+        switch (dtype) {
+            LINSPACE_CASE(uint8_t, UInt8)
+            LINSPACE_CASE(int8_t, Int8)
+            LINSPACE_CASE(int16_t, Int16)
+            LINSPACE_CASE(int32_t, Int32)
+            LINSPACE_CASE(int64_t, Int64)
+            LINSPACE_CASE(uint16_t, UInt16)
+            LINSPACE_CASE(uint32_t, UInt32)
+            LINSPACE_CASE(uint64_t, UInt64)
+            LINSPACE_CASE(float, Float32)
+            LINSPACE_CASE(double, Float64)
+            LINSPACE_CASE(tensorplay::Half, Float16)
+            LINSPACE_CASE(tensorplay::BFloat16, BFloat16)
+            default:
+                TP_THROW(NotImplementedError,
+                         "linspace CUDA does not support dtype '" +
+                         std::string(toString(dtype)) + "'");
+        }
+#undef LINSPACE_CASE
     }
-    #undef LINSPACE_CASE
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -474,29 +622,74 @@ Tensor logspace_cuda(Scalar start, Scalar end, int64_t steps, double base,
                      DType dtype, std::optional<Device> device) {
     Device dev = resolve_factory_device(device);
     if (steps < 0) TP_THROW(RuntimeError, "number of steps must be non-negative");
+    if (!is_sequence_factory_dtype(dtype)) {
+        TP_THROW(NotImplementedError,
+                 "logspace CUDA does not support dtype '" + std::string(toString(dtype)) + "'");
+    }
 
     Tensor t({steps}, dtype, dev);
     if (steps == 0) return t;
 
-    double s = start.toDouble();
-    double e = end.toDouble();
-    double step = (steps == 1) ? 0.0 : (e - s) / (steps - 1);
+    if (isComplexType(dtype)) {
+        switch (dtype) {
+            case DType::ComplexHalf:
+                launch_logspace_complex<
+                    tensorplay::complex<float>, tensorplay::complex<Half>,
+                    std::complex<float>>(steps, start, end, base, t);
+                break;
+            case DType::ComplexFloat:
+                launch_logspace_complex<
+                    tensorplay::complex<float>, tensorplay::complex<float>,
+                    std::complex<float>>(steps, start, end, base, t);
+                break;
+            case DType::ComplexDouble:
+                launch_logspace_complex<
+                    tensorplay::complex<double>, tensorplay::complex<double>,
+                    std::complex<double>>(steps, start, end, base, t);
+                break;
+            case DType::BComplex32:
+                launch_logspace_complex<
+                    tensorplay::complex<float>, tensorplay::complex<BFloat16>,
+                    std::complex<float>>(steps, start, end, base, t);
+                break;
+            default:
+                TP_THROW(NotImplementedError,
+                         "logspace CUDA does not support dtype '" +
+                         std::string(toString(dtype)) + "'");
+        }
+    } else {
+        const double s = start.toDouble();
+        const double e = end.toDouble();
+        const double step = (steps == 1) ? 0.0 : (e - s) / (steps - 1);
+        const int threads = 256;
+        const int blocks = static_cast<int>((steps + threads - 1) / threads);
 
-    int threads = 256;
-    int blocks = static_cast<int>((steps + threads - 1) / threads);
-
-    #define LOGSPACE_CASE(ctype, name) \
-    case DType::name: \
-        logspace_fill_impl<ctype><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>( \
-            steps, s, step, base, t.data_ptr<ctype>()); \
+#define LOGSPACE_CASE(ctype, name)                                           \
+    case DType::name:                                                         \
+        logspace_fill_impl<ctype>                                             \
+            <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(       \
+                steps, s, e, step, base, t.data_ptr<ctype>());               \
         break;
-    switch (dtype) {
-        LOGSPACE_CASE(float, Float32)
-        LOGSPACE_CASE(double, Float64)
-        default:
-            TP_THROW(NotImplementedError, "logspace: only Float32/Float64 supported on CUDA");
+        switch (dtype) {
+            LOGSPACE_CASE(uint8_t, UInt8)
+            LOGSPACE_CASE(int8_t, Int8)
+            LOGSPACE_CASE(int16_t, Int16)
+            LOGSPACE_CASE(int32_t, Int32)
+            LOGSPACE_CASE(int64_t, Int64)
+            LOGSPACE_CASE(uint16_t, UInt16)
+            LOGSPACE_CASE(uint32_t, UInt32)
+            LOGSPACE_CASE(uint64_t, UInt64)
+            LOGSPACE_CASE(float, Float32)
+            LOGSPACE_CASE(double, Float64)
+            LOGSPACE_CASE(tensorplay::Half, Float16)
+            LOGSPACE_CASE(tensorplay::BFloat16, BFloat16)
+            default:
+                TP_THROW(NotImplementedError,
+                         "logspace CUDA does not support dtype '" +
+                         std::string(toString(dtype)) + "'");
+        }
+#undef LOGSPACE_CASE
     }
-    #undef LOGSPACE_CASE
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
