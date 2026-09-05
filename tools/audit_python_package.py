@@ -54,22 +54,49 @@ def _literal_names(node: ast.AST) -> list[str] | None:
     return list(value)
 
 
+class _ModuleNameCollector(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.names.add(node.name)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.names.add(node.name)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.names.add(node.name)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        for target in node.targets:
+            self.names.update(_target_names(target))
+        self.generic_visit(node.value)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.names.update(_target_names(node.target))
+        if node.value is not None:
+            self.generic_visit(node.value)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            if alias.name != "*":
+                self.names.add(alias.asname or alias.name.split(".", 1)[0])
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        for alias in node.names:
+            if alias.name != "*":
+                self.names.add(alias.asname or alias.name)
+        if node.level and node.module:
+            self.names.add(node.module.split(".", 1)[0])
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        return
+
+
 def _module_names(tree: ast.Module) -> set[str]:
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(node.name)
-        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            for target in targets:
-                names.update(_target_names(target))
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            for alias in node.names:
-                if alias.name != "*":
-                    names.add(alias.asname or alias.name.split(".", 1)[0])
-            if isinstance(node, ast.ImportFrom) and node.module:
-                names.add(node.module.rsplit(".", 1)[-1])
-    return names
+    collector = _ModuleNameCollector()
+    collector.visit(tree)
+    return collector.names
 
 
 def _replaces_module_object(tree: ast.Module) -> bool:
