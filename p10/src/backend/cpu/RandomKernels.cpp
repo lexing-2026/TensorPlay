@@ -1161,17 +1161,54 @@ Tensor& normal_inplace_kernel(Tensor& self, double mean, double std,
 }
 
 Tensor& random_kernel(Tensor& self, int64_t low, int64_t high) {
+    auto& gen = default_generator();
+    const bool full_range = (low == 0 && high == 0);
+    if (full_range) {
+        if (self.numel() == 0) return self;
+        check_writable_inplace(self);
+        dispatch_all(self.dtype(), [&](auto tag) {
+            using scalar_t = decltype(tag);
+            if constexpr (std::is_same_v<scalar_t, uint64_t>) {
+                for_each_element<scalar_t>(self, [&](scalar_t& value) {
+                    value = static_cast<scalar_t>(gen.random64());
+                });
+            } else {
+                uint64_t range;
+                if constexpr (std::is_same_v<scalar_t, int64_t>) {
+                    range = uint64_t{1} << 63;
+                } else if constexpr (std::is_same_v<scalar_t, double>) {
+                    range = uint64_t{1} << 53;
+                } else if constexpr (std::is_same_v<scalar_t, float>) {
+                    range = uint64_t{1} << 24;
+                } else if constexpr (std::is_same_v<scalar_t, Half>) {
+                    range = uint64_t{1} << 11;
+                } else if constexpr (std::is_same_v<scalar_t, BFloat16>) {
+                    range = uint64_t{1} << 8;
+                } else if constexpr (std::is_same_v<scalar_t, bool>) {
+                    range = 2;
+                } else {
+                    range = static_cast<uint64_t>(
+                        std::numeric_limits<scalar_t>::max()) + 1;
+                }
+                uniform_int_from_to_distribution<scalar_t> dist(range, 0);
+                for_each_element<scalar_t>(self, [&](scalar_t& value) {
+                    value = dist(&gen);
+                });
+            }
+        });
+        return self;
+    }
     TP_THROW_IF(high <= low, RuntimeError,
                 "random_ expects 'from' to be less than 'to', but got from=",
                 low, " >= to=", high);
-    auto& gen = default_generator();
 
     distribution::check_random_from_to_bounds(low, high, self.dtype());
 
     if (self.numel() == 0) return self;
     check_writable_inplace(self);
 
-    const uint64_t range = static_cast<uint64_t>(high - low);
+    const uint64_t range = static_cast<uint64_t>(high) -
+        static_cast<uint64_t>(low);
     const int64_t base = low;
     dispatch_all(self.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);
