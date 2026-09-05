@@ -299,8 +299,6 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        env:
-          GH_TOKEN: ${{ github.token }}
           NIGHTLY_NOTES: |
             Fresh preview builds of TensorPlay, published automatically as new features land. Expect the newest capabilities — and occasional rough edges.
 
