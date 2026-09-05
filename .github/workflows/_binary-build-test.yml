@@ -42,7 +42,12 @@ on:
         required: false
         type: boolean
         default: false
-        description: Run CPU benchmarks against the installed reference runtime
+        description: Run CPU operator and compiler performance benchmarks
+      cpu_benchmark_suite:
+        required: false
+        type: string
+        default: short
+        description: "CPU benchmark suite size: short, long, or all"
       build_version:
         required: false
         type: string
@@ -215,12 +220,7 @@ jobs:
           print("CUDA wheel import ok:", getattr(tp, "__version__", "ok"))
           PY
 
-      - name: Install CPU performance reference
-        if: ${{ inputs.run_cpu_benchmarks && inputs.cuda == 'cpu' }}
-        shell: bash
-        run: python -m pip install --disable-pip-version-check "torch==2.7.1"
-
-      - name: Run CPU performance benchmarks
+      - name: Run CPU operator, training, and Stax benchmarks
         if: ${{ inputs.run_cpu_benchmarks && inputs.cuda == 'cpu' }}
         shell: bash
         env:
@@ -230,24 +230,51 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p benchmark-results
-          python benchmark/bench_real_cpu.py --dtype f32 --reps 3 --threads 2 \
-            --json-out benchmark-results/cpu-elementwise.json \
-            | tee benchmark-results/cpu-elementwise.log
-          python benchmark/bench_train_fp32_cpu.py --reps 2 --threads 2 \
-            --json-out benchmark-results/cpu-train-step.json \
-            | tee benchmark-results/cpu-train-step.log
+          suite="${{ inputs.cpu_benchmark_suite }}"
+          if [[ "$suite" == "all" ]]; then
+            suite=long
+          fi
+          python benchmark/host_probe.py --threads 2 \
+            --json-out benchmark-results/host-probe.json \
+            | tee benchmark-results/host-probe.log
+          python benchmark/bench_cpu_operator.py --suite "$suite" --dtype f32 \
+            --reps 3 --threads 2 --flops --json-out benchmark-results/cpu-operator.json \
+            | tee benchmark-results/cpu-operator.log
+          python benchmark/bench_cpu_operator.py --suite "$suite" --dtype f64 \
+            --reps 3 --threads 2 --flops --json-out benchmark-results/cpu-operator-f64.json \
+            | tee benchmark-results/cpu-operator-f64.log
+          python benchmark/bench_train_cpu.py --reps 2 --threads 2 \
+            --json-out benchmark-results/cpu-train.json \
+            | tee benchmark-results/cpu-train.log
+          python benchmark/bench_stax_cpu.py --reps 3 --warmup 2 --threads 2 \
+            --json-out benchmark-results/stax-cpu.json \
+            | tee benchmark-results/stax-cpu.log
+          python benchmark/bench_scaling_curves.py --reps 3 --threads 2 \
+            --json-out benchmark-results/scaling.json \
+            | tee benchmark-results/scaling.log
 
       - name: Enforce CPU performance floor
         if: ${{ inputs.run_cpu_benchmarks && inputs.cuda == 'cpu' }}
         shell: bash
         run: |
           set -euo pipefail
-          python benchmark/check_cpu_regression.py \
-            --elementwise-json benchmark-results/cpu-elementwise.json \
-            --train-json benchmark-results/cpu-train-step.json \
-            --elementwise-max-slowdown 0.30 \
-            --min-elementwise-size 4194304 \
+          suite="${{ inputs.cpu_benchmark_suite }}"
+          if [[ "$suite" == "all" ]]; then
+            suite=long
+          fi
+          python benchmark/check_performance_regression.py \
+            --operator-json benchmark-results/cpu-operator.json \
+            --operator-baseline-json "benchmark/baselines/cpu-operator-$suite.json" \
+            --operator-f64-json benchmark-results/cpu-operator-f64.json \
+            --operator-f64-baseline-json "benchmark/baselines/cpu-operator-$suite-f64.json" \
+            --train-json benchmark-results/cpu-train.json \
+            --train-baseline-json benchmark/baselines/cpu-train.json \
+            --stax-json benchmark-results/stax-cpu.json \
+            --stax-baseline-json benchmark/baselines/stax-cpu.json \
+            --operator-max-slowdown 0.30 \
             --train-max-slowdown 0.20 \
+            --stax-max-slowdown 0.25 \
+            --stax-compile-max-slowdown 0.50 \
             --summary-out benchmark-results/cpu-regression-summary.md
 
       - name: Publish CPU performance summary
@@ -276,6 +303,15 @@ jobs:
           set -euo pipefail
           if [[ "${{ inputs.build_version }}" != "" ]]; then
             release="nightly"
+            # The rolling channel may not exist yet on the first publish;
+            # every later upload overwrites same-versioned assets.
+            if ! gh release view "$release" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release create "$release" \
+                --repo "$GITHUB_REPOSITORY" \
+                --prerelease \
+                --title "TensorPlay nightly" \
+                --notes "Rolling preview channel. Each main-branch push publishes the wheels it just smoke-tested; the scheduled run only fills gaps. Install indexes live under /whl/nightly/<variant>/ on the Pages site."
+            fi
           else
             release="$GITHUB_REF_NAME"
           fi

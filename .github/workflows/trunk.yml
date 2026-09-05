@@ -29,6 +29,7 @@ jobs:
       cuda: ${{ steps.read-matrix.outputs.cuda }}
       cuda_trunk: ${{ steps.read-matrix.outputs.cuda_trunk }}
       run_cuda: ${{ steps.lanes.outputs.run_cuda }}
+      nightly_version: ${{ steps.nightly-version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -84,6 +85,21 @@ jobs:
           ' .github/wheel-platforms.json)"
           echo "cpu=$cpu_matrix" >> "$GITHUB_OUTPUT"
           echo "cuda=$cuda_matrix" >> "$GITHUB_OUTPUT"
+      - id: nightly-version
+        if: ${{ github.ref_type == 'branch' && github.ref_name == 'main' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Branch pushes publish the wheels they just built to the rolling
+          # nightly channel, so the smoke-tested artifacts are the nightly
+          # release instead of being discarded. The version rule matches the
+          # dedicated nightly workflow (X.Y.0.dev<UTC date>); same-day pushes
+          # overwrite the same-versioned assets, keeping the channel on the
+          # newest verified main.
+          python3 -m pip install --disable-pip-version-check --quiet packaging
+          version="$(python3 -c 'from tools.generate_tensorplay_version import compute_nightly_version; print(compute_nightly_version())')"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Nightly version: ${version}"
       - id: lanes
         shell: bash
         env:
@@ -125,6 +141,10 @@ jobs:
       build_environment: ${{ format('trunk-{0}-py{1}-cpu', matrix.platform, matrix.python) }}
       runs_on: ${{ matrix.runner }}
       python_version: ${{ matrix.python }}
+      # Main-branch pushes publish their smoke-tested wheels to the rolling
+      # nightly release; tags and release branches publish to their own.
+      build_version: ${{ needs.define-wheel-matrix.outputs.nightly_version }}
+      upload_release: ${{ github.ref_type == 'branch' && github.ref_name == 'main' }}
 
   cuda-build:
     # Plain main pushes build one regression lane per platform (the newest
@@ -148,3 +168,5 @@ jobs:
       python_version: ${{ matrix.python }}
       cuda: ${{ matrix.variant }}
       cuda_toolkit: ${{ matrix.toolkit }}
+      build_version: ${{ needs.define-wheel-matrix.outputs.nightly_version }}
+      upload_release: ${{ github.ref_type == 'branch' && github.ref_name == 'main' }}
