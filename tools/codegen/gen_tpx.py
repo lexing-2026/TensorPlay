@@ -470,7 +470,9 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
             lines.append('    }')
 
         # ---- backward node --------------------------------------------------
-        if has_ag:
+        dv_nd = derivatives.get(f.func_name)
+        _non_diff = dv_nd is not None and dv_nd.non_differentiable_output
+        if has_ag and not _non_diff:
             lines.append('    std::shared_ptr<Node> grad_fn;')
             lines.append('    if (requires_grad) {')
             if f.func_name == 'relu_':
@@ -513,7 +515,7 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
             lines.append(f'    std::tuple<{", ".join(tup_types)}> {result_var};')
             for i, tt in enumerate(tup_types):
                 lines.append(f'    std::get<{i}>({result_var}) = std::get<{i}>(core_result);')
-                if tt == 'Tensor' and has_ag:
+                if tt == 'Tensor' and has_ag and not _non_diff:
                     lines.append(
                         f'    if (requires_grad && std::get<{i}>({result_var}).defined() '
                         f'&& tensorplay::isFloatingOrComplexType(std::get<{i}>({result_var}).dtype())) {{')
@@ -524,7 +526,7 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
         elif kind == 'value':
             if any(a.name == 'requires_grad' for a in f.args):
                 lines.append('    tensorplay::tpx::impl::set_requires_grad(result, requires_grad);')
-            if has_ag:
+            if has_ag and not _non_diff:
                 lines.append('    if (requires_grad) tensorplay::tpx::impl::set_requires_grad(result, true);')
                 lines.append('    if (requires_grad && result.defined()) {')
                 lines.append('        tensorplay::tpx::impl::set_grad_fn(result, grad_fn);')
