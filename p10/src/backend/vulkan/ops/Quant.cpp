@@ -172,7 +172,7 @@ void check_quantized_binary_pair(
 
 } // namespace
 
-Tensor quantize_per_tensor_kernel(
+Tensor quantize_per_tensor_qint8_kernel(
     const Tensor& self,
     double scale,
     int64_t zero_point,
@@ -1055,6 +1055,36 @@ Tensor dequantize_per_tensor_qint32_kernel(
   return convert(v_output);
 }
 
+Tensor quantize_per_tensor_kernel(const Tensor& self, double scale,
+                                  int64_t zero_point, DType dtype) {
+  switch (dtype) {
+    case DType::QInt8:
+      return quantize_per_tensor_qint8_kernel(
+          self, scale, zero_point, -128, 127);
+    case DType::QUInt8:
+      return quantize_per_tensor_quint8_kernel(
+          self, scale, zero_point, 0, 255);
+    case DType::QInt32:
+      return quantize_per_tensor_qint32_kernel(self, scale, zero_point);
+    default:
+      TP_THROW(TypeError, "quantize_per_tensor(): unsupported quantized dtype");
+  }
+}
+
+Tensor dequantize_per_tensor_kernel(const Tensor& self, double scale,
+                                    int64_t zero_point, DType dtype) {
+  switch (dtype) {
+    case DType::QInt8:
+      return dequantize_per_tensor_kernel(self, scale, zero_point);
+    case DType::QUInt8:
+      return dequantize_per_tensor_quint8_kernel(self, scale, zero_point);
+    case DType::QInt32:
+      return dequantize_per_tensor_qint32_kernel(self, scale, zero_point);
+    default:
+      TP_THROW(TypeError, "dequantize(): unsupported quantized dtype");
+  }
+}
+
 namespace {
 
 inline int64_t conv_align_up_4(int64_t v) {
@@ -1357,7 +1387,7 @@ Tensor int_repr_kernel(const Tensor& self) {
 
 Tensor dequantize_self_kernel(const Tensor& self) {
   if (!quantized::is_quantized(self)) {
-    return self;
+    return self.to(DType::Float32);
   }
   return quantized::quantizer_of(self)->dequantize(self);
 }
@@ -1369,8 +1399,6 @@ Tensor dequantize_self_kernel(const Tensor& self) {
 TENSORPLAY_LIBRARY_IMPL(Vulkan, QuantKernels) {
   m.impl("quantize_per_tensor",
          &tensorplay::vulkan::ops::quantize_per_tensor_kernel);
-  m.impl("dequantize_per_tensor",
-         &tensorplay::vulkan::ops::dequantize_per_tensor_kernel);
   m.impl("quantized_add", &tensorplay::vulkan::ops::quantized_add_kernel);
   m.impl("quantized_sub", &tensorplay::vulkan::ops::quantized_sub_kernel);
   m.impl("quantized_mul", &tensorplay::vulkan::ops::quantized_mul_kernel);
@@ -1384,14 +1412,6 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, QuantKernels) {
          &tensorplay::vulkan::ops::quantized_conv2d_kernel);
   m.impl("quantized_conv2d_run",
          &tensorplay::vulkan::ops::quantized_conv2d_run_kernel);
-  m.impl("quantize_per_tensor_quint8",
-         &tensorplay::vulkan::ops::quantize_per_tensor_quint8_kernel);
-  m.impl("dequantize_per_tensor_quint8",
-         &tensorplay::vulkan::ops::dequantize_per_tensor_quint8_kernel);
-  m.impl("quantize_per_tensor_qint32",
-         &tensorplay::vulkan::ops::quantize_per_tensor_qint32_kernel);
-  m.impl("dequantize_per_tensor_qint32",
-         &tensorplay::vulkan::ops::dequantize_per_tensor_qint32_kernel);
   m.impl("q_scale", &tensorplay::vulkan::ops::q_scale_kernel);
   m.impl("q_zero_point", &tensorplay::vulkan::ops::q_zero_point_kernel);
   m.impl("qscheme", &tensorplay::vulkan::ops::qscheme_kernel);

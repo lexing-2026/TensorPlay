@@ -100,8 +100,9 @@ class QuantizedLinear(nn.Module):
         # Kernel operands must live on the weights' device.
         scales_t = scales_t.to(weight.device)
         zero_points_t = zero_points_t.to(weight.device)
-        qweight = _quantize_per_channel(self=weight, scales=scales_t,
-                                        zero_points=zero_points_t, axis=0)
+        qweight = _quantize_per_channel(
+            self=weight, scales=scales_t, zero_points=zero_points_t, axis=0,
+            dtype=tensorplay.qint8)
         bias = None
         if float_module.bias is not None:
             bias = float_module.bias.detach().to(tensorplay.float32)

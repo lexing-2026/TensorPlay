@@ -4474,32 +4474,39 @@
     CUDA: spdiags_cuda
 
 # ---------------------------------------------------------------------------
-# Quantization (affine, Int8 storage).  quantize_* maps floating values to
-# Int8 with round-to-even; dequantize_* inverts the mapping to Float32.
-# Per-channel variants broadcast 1-D scales/zero_points along `axis`.
-- func: quantize_per_tensor(Tensor self, float scale, int zero_point, int quant_min=-128, int quant_max=127) -> Tensor
-  variants: function, method
+# Quantization
+- func: quantize_per_tensor_dynamic(Tensor self, ScalarType dtype, bool reduce_range) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantize_per_tensor_dynamic_cpu
+    CUDA: quantize_per_tensor_dynamic_cuda
+
+- func: quantize_per_tensor(Tensor self, float scale, int zero_point, ScalarType dtype) -> Tensor
+  variants: function
   dispatch:
     CPU: quantize_per_tensor_cpu
     CUDA: quantize_per_tensor_cuda
 
-- func: dequantize_per_tensor(Tensor self, float scale, int zero_point) -> Tensor
-  variants: function, method
-  dispatch:
-    CPU: dequantize_per_tensor_cpu
-    CUDA: dequantize_per_tensor_cuda
+- func: quantize_per_tensor.tensor_qparams(Tensor self, Tensor scale, Tensor zero_point, ScalarType dtype) -> Tensor
+  variants: function
 
-- func: quantize_per_channel(Tensor self, Tensor scales, Tensor zero_points, int axis=0) -> Tensor
-  variants: function, method
+- func: quantize_per_tensor.tensors(Tensor[] tensors, Tensor scales, Tensor zero_points, ScalarType dtype) -> Tensor[]
+  variants: function
+
+- func: quantize_per_channel(Tensor self, Tensor scales, Tensor zero_points, int axis, ScalarType dtype) -> Tensor
+  variants: function
   dispatch:
     CPU: quantize_per_channel_cpu
     CUDA: quantize_per_channel_cuda
 
-- func: dequantize_per_channel(Tensor self, Tensor scales, Tensor zero_points, int axis=0) -> Tensor
+- func: dequantize.self(Tensor self) -> Tensor
   variants: function, method
   dispatch:
-    CPU: dequantize_per_channel_cpu
-    CUDA: dequantize_per_channel_cuda
+    CPU: dequantize_self_cpu
+    CUDA: dequantize_self_cuda
+
+- func: dequantize.tensors(Tensor[] tensors) -> Tensor[]
+  variants: function
 
 # Fused Int8 GEMM with per-channel weight requantization (dynamic-quantized
 # linear output stage): activations [M,K] and weights [N,K] are Int8 with
@@ -4593,38 +4600,6 @@
     CPU: quantized_conv2d_cpu
     CUDA: quantized_conv2d_cuda
     Vulkan: quantized_conv2d
-
-# Unsigned-byte and int32 affine quantization variants.  quint8 stores the
-# clamped code in a UInt8 tensor (zero_point within [0, 255]); qint32 keeps
-# the full accumulator precision in an Int32 tensor.  The rounding and
-# clamping rules match the Int8 quantize/dequantize pair.
-- func: quantize_per_tensor_quint8(Tensor self, float scale, int zero_point, int quant_min=0, int quant_max=255) -> Tensor
-  variants: function
-  dispatch:
-    CPU: quantize_per_tensor_quint8_cpu
-    CUDA: quantize_per_tensor_quint8_cuda
-    Vulkan: quantize_per_tensor_quint8
-
-- func: dequantize_per_tensor_quint8(Tensor self, float scale, int zero_point) -> Tensor
-  variants: function
-  dispatch:
-    CPU: dequantize_per_tensor_quint8_cpu
-    CUDA: dequantize_per_tensor_quint8_cuda
-    Vulkan: dequantize_per_tensor_quint8
-
-- func: quantize_per_tensor_qint32(Tensor self, float scale, int zero_point) -> Tensor
-  variants: function
-  dispatch:
-    CPU: quantize_per_tensor_qint32_cpu
-    CUDA: quantize_per_tensor_qint32_cuda
-    Vulkan: quantize_per_tensor_qint32
-
-- func: dequantize_per_tensor_qint32(Tensor self, float scale, int zero_point) -> Tensor
-  variants: function
-  dispatch:
-    CPU: dequantize_per_tensor_qint32_cpu
-    CUDA: dequantize_per_tensor_qint32_cuda
-    Vulkan: dequantize_per_tensor_qint32
 
 # ---------------------------------------------------------------------------
 # Native forward-mode AD (JVP) kernels: each op evaluates the primal and its
@@ -7359,16 +7334,6 @@
 - func: mkldnn_reorder_conv3d_weight(Tensor self, SymInt[3] padding=0, SymInt[3] stride=1, SymInt[3] dilation=1, SymInt groups=1, SymInt[]? input_size=None) -> Tensor
   variants: function
 - func: to_mkldnn_backward(Tensor grad, Tensor input) -> Tensor
-  variants: function
-- func: quantize_per_tensor_dynamic(Tensor self, ScalarType dtype, bool reduce_range) -> Tensor
-  variants: function
-- func: quantize_per_tensor.tensor_qparams(Tensor self, Tensor scale, Tensor zero_point, ScalarType dtype) -> Tensor
-  variants: function
-- func: quantize_per_tensor.tensors(Tensor[] tensors, Tensor scales, Tensor zero_points, ScalarType dtype) -> Tensor[]
-  variants: function
-- func: dequantize.self(Tensor self) -> Tensor
-  variants: function, method
-- func: dequantize.tensors(Tensor[] tensors) -> Tensor[]
   variants: function
 - func: q_scale(Tensor self) -> float
   variants: function, method

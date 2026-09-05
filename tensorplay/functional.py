@@ -5555,33 +5555,33 @@ def spdiags(diagonals, offsets, shape, layout=None):
         shape = [shape]
     return _C.spdiags(diagonals, offsets, shape, layout)
 
-def quantize_per_tensor(input, scale, zero_point, quant_min=-128, quant_max=127):
+def quantize_per_tensor_dynamic(input, dtype, reduce_range):
     if _capturing():
-        _captured = _capture_call(quantize_per_tensor, (input, scale, zero_point, quant_min, quant_max), {})
+        _captured = _capture_call(quantize_per_tensor_dynamic, (input, dtype, reduce_range), {})
         if _captured is not None:
             return _captured
-    return _C.quantize_per_tensor(input, scale, zero_point, quant_min, quant_max)
+    return _C.quantize_per_tensor_dynamic(input, dtype, reduce_range)
 
-def dequantize_per_tensor(input, scale, zero_point):
+def quantize_per_tensor(input, scale, zero_point, dtype):
     if _capturing():
-        _captured = _capture_call(dequantize_per_tensor, (input, scale, zero_point), {})
+        _captured = _capture_call(quantize_per_tensor, (input, scale, zero_point, dtype), {})
         if _captured is not None:
             return _captured
-    return _C.dequantize_per_tensor(input, scale, zero_point)
+    return _C.quantize_per_tensor(input, scale, zero_point, dtype)
 
-def quantize_per_channel(input, scales, zero_points, axis=0):
+def quantize_per_channel(input, scales, zero_points, axis, dtype):
     if _capturing():
-        _captured = _capture_call(quantize_per_channel, (input, scales, zero_points, axis), {})
+        _captured = _capture_call(quantize_per_channel, (input, scales, zero_points, axis, dtype), {})
         if _captured is not None:
             return _captured
-    return _C.quantize_per_channel(input, scales, zero_points, axis)
+    return _C.quantize_per_channel(input, scales, zero_points, axis, dtype)
 
-def dequantize_per_channel(input, scales, zero_points, axis=0):
+def dequantize(*args):
     if _capturing():
-        _captured = _capture_call(dequantize_per_channel, (input, scales, zero_points, axis), {})
+        _captured = _capture_call(dequantize, (*args,), {})
         if _captured is not None:
             return _captured
-    return _C.dequantize_per_channel(input, scales, zero_points, axis)
+    return _C.dequantize(*args)
 
 def quantized_linear(input, weight, input_scale, input_zero_point, weight_scales, weight_zero_points, bias=None):
     if _capturing():
@@ -5693,34 +5693,6 @@ def quantized_conv2d(input, weight, bias, input_scale, input_zero_point, weight_
     if isinstance(dilation, int) and not isinstance(dilation, bool):
         dilation = [dilation]
     return _C.quantized_conv2d(input, weight, bias, input_scale, input_zero_point, weight_scale, weight_zero_point, out_scale, out_zero_point, stride, padding, dilation, groups)
-
-def quantize_per_tensor_quint8(input, scale, zero_point, quant_min=0, quant_max=255):
-    if _capturing():
-        _captured = _capture_call(quantize_per_tensor_quint8, (input, scale, zero_point, quant_min, quant_max), {})
-        if _captured is not None:
-            return _captured
-    return _C.quantize_per_tensor_quint8(input, scale, zero_point, quant_min, quant_max)
-
-def dequantize_per_tensor_quint8(input, scale, zero_point):
-    if _capturing():
-        _captured = _capture_call(dequantize_per_tensor_quint8, (input, scale, zero_point), {})
-        if _captured is not None:
-            return _captured
-    return _C.dequantize_per_tensor_quint8(input, scale, zero_point)
-
-def quantize_per_tensor_qint32(input, scale, zero_point):
-    if _capturing():
-        _captured = _capture_call(quantize_per_tensor_qint32, (input, scale, zero_point), {})
-        if _captured is not None:
-            return _captured
-    return _C.quantize_per_tensor_qint32(input, scale, zero_point)
-
-def dequantize_per_tensor_qint32(input, scale, zero_point):
-    if _capturing():
-        _captured = _capture_call(dequantize_per_tensor_qint32, (input, scale, zero_point), {})
-        if _captured is not None:
-            return _captured
-    return _C.dequantize_per_tensor_qint32(input, scale, zero_point)
 
 def forward_neg(a, da):
     if _capturing():
@@ -10832,20 +10804,6 @@ def to_mkldnn_backward(grad, input):
         if _captured is not None:
             return _captured
     return _C.to_mkldnn_backward(grad, input)
-
-def quantize_per_tensor_dynamic(input, dtype, reduce_range):
-    if _capturing():
-        _captured = _capture_call(quantize_per_tensor_dynamic, (input, dtype, reduce_range), {})
-        if _captured is not None:
-            return _captured
-    return _C.quantize_per_tensor_dynamic(input, dtype, reduce_range)
-
-def dequantize(*args):
-    if _capturing():
-        _captured = _capture_call(dequantize, (*args,), {})
-        if _captured is not None:
-            return _captured
-    return _C.dequantize(*args)
 
 def q_scale(input):
     if _capturing():

@@ -13,6 +13,7 @@
 #include <limits>
 #include <optional>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace tensorplay {
@@ -125,6 +126,169 @@ void quantize_generic_kernel(const T* input, int64_t* output, int64_t numel,
     }
 }
 
+std::pair<int64_t, int64_t> quantized_bounds(DType dtype) {
+    switch (dtype) {
+        case DType::QInt8:
+            return {-128, 127};
+        case DType::QUInt8:
+            return {0, 255};
+        case DType::QInt32:
+            return {std::numeric_limits<int32_t>::min(),
+                    std::numeric_limits<int32_t>::max()};
+        default:
+            TP_THROW(TypeError,
+                     "per-channel quantization requires a quantized dtype");
+    }
+}
+
+void check_per_channel_inputs(const Tensor& self, const Tensor& scales,
+                              const Tensor& zero_points, int64_t& axis,
+                              const char* op) {
+    if (scales.dim() != 1 || zero_points.shape() != scales.shape()) {
+        TP_THROW(ValueError, op,
+                 ": scales/zero_points must be 1-D with equal sizes");
+    }
+    if (axis < 0) axis += self.dim();
+    if (axis < 0 || axis >= self.dim()) {
+        TP_THROW(ValueError, op, ": axis out of range");
+    }
+    if (scales.size(0) != self.size(axis)) {
+        TP_THROW(ValueError, op,
+                 ": scales size must match the quantized dimension");
+    }
+    if (scales.device() != self.device() ||
+        zero_points.device() != self.device()) {
+        TP_THROW(RuntimeError, op,
+                 ": scales and zero_points must be on the input device");
+    }
+}
+
+template <typename Storage>
+Tensor quantize_per_channel_cpu_impl(const Tensor& self, const Tensor& scales,
+                                     const Tensor& zero_points, int64_t axis,
+                                     DType dtype) {
+    check_per_channel_inputs(self, scales, zero_points, axis, "quantize()");
+    const auto bounds = quantized_bounds(dtype);
+    QuantizerPtr quantizer = make_per_channel_affine_quantizer(
+        scales, zero_points, axis, dtype);
+    Tensor input = promote_to_compute_dtype(self);
+    Tensor out = Tensor::empty(self.shape(), dtype, self.device());
+
+    int64_t stride_on_axis = 1;
+    for (int64_t d = axis + 1; d < input.dim(); ++d) {
+        stride_on_axis *= input.size(d);
+    }
+
+    Tensor sc = scales.to(DType::Float64).contiguous();
+    const double* sc_ptr = sc.data_ptr<double>();
+    const int64_t channels = scales.size(0);
+    const int64_t numel = input.numel();
+    Storage* outp = out.data_ptr<Storage>();
+    if (isFloatingType(zero_points.dtype())) {
+        Tensor zp = zero_points.to(DType::Float32).contiguous();
+        const float* zp_ptr = zp.data_ptr<float>();
+        if (input.dtype() == DType::Float64) {
+            const double* in = input.data_ptr<double>();
+            for (int64_t i = 0; i < numel; ++i) {
+                const int64_t c = channel_of(i, stride_on_axis) % channels;
+                const double rounded = std::nearbyint(
+                    static_cast<float>(in[i]) *
+                        quantize_multiplier(sc_ptr[c]) +
+                    zp_ptr[c]);
+                const double clamped = std::min<double>(
+                    bounds.second, std::max<double>(bounds.first, rounded));
+                outp[i] = static_cast<Storage>(clamped);
+            }
+        } else {
+            const float* in = input.data_ptr<float>();
+            for (int64_t i = 0; i < numel; ++i) {
+                const int64_t c = channel_of(i, stride_on_axis) % channels;
+                const double rounded = std::nearbyint(
+                    in[i] * quantize_multiplier(sc_ptr[c]) + zp_ptr[c]);
+                const double clamped = std::min<double>(
+                    bounds.second, std::max<double>(bounds.first, rounded));
+                outp[i] = static_cast<Storage>(clamped);
+            }
+        }
+    } else {
+        Tensor zp = zero_points.to(DType::Int64).contiguous();
+        const int64_t* zp_ptr = zp.data_ptr<int64_t>();
+        if (input.dtype() == DType::Float64) {
+            const double* in = input.data_ptr<double>();
+            for (int64_t i = 0; i < numel; ++i) {
+                const int64_t c = channel_of(i, stride_on_axis) % channels;
+                const int64_t rounded =
+                    zp_ptr[c] +
+                    grid_position(static_cast<float>(in[i]),
+                                  quantize_multiplier(sc_ptr[c]));
+                outp[i] = static_cast<Storage>(std::min<int64_t>(
+                    bounds.second, std::max<int64_t>(bounds.first, rounded)));
+            }
+        } else {
+            const float* in = input.data_ptr<float>();
+            for (int64_t i = 0; i < numel; ++i) {
+                const int64_t c = channel_of(i, stride_on_axis) % channels;
+                const int64_t rounded =
+                    zp_ptr[c] +
+                    grid_position(in[i], quantize_multiplier(sc_ptr[c]));
+                outp[i] = static_cast<Storage>(std::min<int64_t>(
+                    bounds.second, std::max<int64_t>(bounds.first, rounded)));
+            }
+        }
+    }
+    out.impl()->set_quantizer(std::move(quantizer));
+    return out;
+}
+
+template <typename Storage>
+Tensor dequantize_per_channel_cpu_impl(const Tensor& self,
+                                       const Tensor& scales,
+                                       const Tensor& zero_points, int64_t axis,
+                                       DType dtype) {
+    if (self.dtype() != dtype) {
+        TP_THROW(TypeError, "dequantize(): quantized dtype does not match ",
+                 toString(dtype));
+    }
+    check_per_channel_inputs(self, scales, zero_points, axis, "dequantize()");
+    QuantizerPtr quantizer = make_per_channel_affine_quantizer(
+        scales, zero_points, axis, dtype);
+    Tensor input = self.is_contiguous() ? self : self.contiguous();
+    Tensor out = Tensor::empty(self.shape(), DType::Float32, self.device());
+
+    int64_t stride_on_axis = 1;
+    for (int64_t d = axis + 1; d < input.dim(); ++d) {
+        stride_on_axis *= input.size(d);
+    }
+
+    const int64_t channels = scales.size(0);
+    const int64_t numel = input.numel();
+    const Storage* in = input.data_ptr<Storage>();
+    float* outp = out.data_ptr<float>();
+    if (isFloatingType(zero_points.dtype())) {
+        Tensor sc = scales.to(DType::Float32).contiguous();
+        Tensor zp = zero_points.to(DType::Float32).contiguous();
+        const float* sc_ptr = sc.data_ptr<float>();
+        const float* zp_ptr = zp.data_ptr<float>();
+        for (int64_t i = 0; i < numel; ++i) {
+            const int64_t c = channel_of(i, stride_on_axis) % channels;
+            outp[i] = (static_cast<float>(in[i]) - zp_ptr[c]) * sc_ptr[c];
+        }
+    } else {
+        Tensor sc = scales.to(DType::Float64).contiguous();
+        Tensor zp = zero_points.to(DType::Int64).contiguous();
+        const double* sc_ptr = sc.data_ptr<double>();
+        const int64_t* zp_ptr = zp.data_ptr<int64_t>();
+        for (int64_t i = 0; i < numel; ++i) {
+            const int64_t c = channel_of(i, stride_on_axis) % channels;
+            outp[i] = static_cast<float>(
+                (static_cast<double>(in[i]) -
+                 static_cast<double>(zp_ptr[c])) * sc_ptr[c]);
+        }
+    }
+    (void)quantizer;
+    return out;
+}
+
 } // namespace
 
 Tensor quantize_per_tensor_quint8_cpu(const Tensor& self, double scale,
@@ -221,9 +385,9 @@ Tensor dequantize_per_tensor_qint32_cpu(const Tensor& self, double scale,
     return out;
 }
 
-Tensor quantize_per_tensor_cpu(const Tensor& self, double scale,
-                               int64_t zero_point, int64_t quant_min,
-                               int64_t quant_max) {
+Tensor quantize_per_tensor_qint8_cpu(const Tensor& self, double scale,
+                                     int64_t zero_point, int64_t quant_min,
+                                     int64_t quant_max) {
     check_qparams(scale, zero_point, quant_min, quant_max);
     check_storage_range(quant_min, quant_max, -128, 127);
     Tensor input = promote_to_compute_dtype(self);
@@ -241,8 +405,8 @@ Tensor quantize_per_tensor_cpu(const Tensor& self, double scale,
     return out;
 }
 
-Tensor dequantize_per_tensor_cpu(const Tensor& self, double scale,
-                                 int64_t zero_point) {
+Tensor dequantize_per_tensor_qint8_cpu(const Tensor& self, double scale,
+                                       int64_t zero_point) {
     if (self.dtype() != DType::QInt8) {
         TP_THROW(TypeError, "dequantize(): expected a QInt8 tensor");
     }
@@ -254,145 +418,96 @@ Tensor dequantize_per_tensor_cpu(const Tensor& self, double scale,
     return out;
 }
 
-Tensor quantize_per_channel_cpu(const Tensor& self, const Tensor& scales,
-                                const Tensor& zero_points, int64_t axis) {
-    if (scales.dim() != 1 || zero_points.shape() != scales.shape()) {
-        TP_THROW(ValueError,
-                 "quantize(): scales/zero_points must be 1-D with equal sizes");
+Tensor quantize_per_tensor_dtype_cpu(const Tensor& self, double scale,
+                                     int64_t zero_point, DType dtype) {
+    if (self.dtype() != DType::Float32) {
+        TP_THROW(TypeError, "quantize(): expected a Float32 tensor, got ",
+                 toString(self.dtype()));
     }
-    if (axis < 0) axis += self.dim();
-    if (axis < 0 || axis >= self.dim()) {
-        TP_THROW(ValueError, "quantize(): axis out of range");
+    switch (dtype) {
+        case DType::QInt8:
+            return quantize_per_tensor_qint8_cpu(
+                self, scale, zero_point, -128, 127);
+        case DType::QUInt8:
+            return quantize_per_tensor_quint8_cpu(
+                self, scale, zero_point, 0, 255);
+        case DType::QInt32:
+            return quantize_per_tensor_qint32_cpu(self, scale, zero_point);
+        default:
+            TP_THROW(TypeError, "quantize(): unsupported quantized dtype ",
+                     toString(dtype));
     }
-    if (scales.size(0) != self.size(axis)) {
-        TP_THROW(ValueError,
-                 "quantize(): scales size must match the quantized dimension");
-    }
-    if (scales.device() != self.device() ||
-        zero_points.device() != self.device()) {
-        TP_THROW(RuntimeError,
-                 "quantize(): scales and zero_points must be on the input device");
-    }
-    QuantizerPtr quantizer = make_per_channel_affine_quantizer(
-        scales, zero_points, axis, DType::QInt8);
-    Tensor input = promote_to_compute_dtype(self);
-    Tensor out = Tensor::empty(self.shape(), DType::QInt8, self.device());
-
-    // Contiguous strides let each flat index derive its channel id.
-    int64_t stride_on_axis = 1;
-    for (int64_t d = axis + 1; d < input.dim(); ++d) stride_on_axis *= input.size(d);
-
-    Tensor sc = scales.to(DType::Float64).contiguous();
-    const double* sc_ptr = sc.data_ptr<double>();
-    const int64_t channels = scales.size(0);
-    const int64_t numel = input.numel();
-    int8_t* outp = out.data_ptr<int8_t>();
-    if (isFloatingType(zero_points.dtype())) {
-        Tensor zp = zero_points.to(DType::Float32).contiguous();
-        const float* zp_ptr = zp.data_ptr<float>();
-        if (input.dtype() == DType::Float64) {
-            const double* in = input.data_ptr<double>();
-            for (int64_t i = 0; i < numel; ++i) {
-                const int64_t c = channel_of(i, stride_on_axis) % channels;
-                const float q = std::nearbyint(
-                    static_cast<float>(in[i]) * quantize_multiplier(sc_ptr[c]) +
-                    zp_ptr[c]);
-                outp[i] = static_cast<int8_t>(std::min(127.0f,
-                                                        std::max(-128.0f, q)));
-            }
-        } else {
-            const float* in = input.data_ptr<float>();
-            for (int64_t i = 0; i < numel; ++i) {
-                const int64_t c = channel_of(i, stride_on_axis) % channels;
-                const float q = std::nearbyint(
-                    in[i] * quantize_multiplier(sc_ptr[c]) + zp_ptr[c]);
-                outp[i] = static_cast<int8_t>(std::min(127.0f,
-                                                        std::max(-128.0f, q)));
-            }
-        }
-    } else {
-        Tensor zp = zero_points.to(DType::Int64).contiguous();
-        const int64_t* zp_ptr = zp.data_ptr<int64_t>();
-        if (input.dtype() == DType::Float64) {
-            const double* in = input.data_ptr<double>();
-            for (int64_t i = 0; i < numel; ++i) {
-                const int64_t c = channel_of(i, stride_on_axis) % channels;
-                const int64_t q = zp_ptr[c] +
-                                  grid_position(static_cast<float>(in[i]),
-                                                quantize_multiplier(sc_ptr[c]));
-                outp[i] = static_cast<int8_t>(
-                    std::min<int64_t>(127, std::max<int64_t>(-128, q)));
-            }
-        } else {
-            const float* in = input.data_ptr<float>();
-            for (int64_t i = 0; i < numel; ++i) {
-                const int64_t c = channel_of(i, stride_on_axis) % channels;
-                const int64_t q = zp_ptr[c] +
-                                  grid_position(in[i],
-                                                quantize_multiplier(sc_ptr[c]));
-                outp[i] = static_cast<int8_t>(
-                    std::min<int64_t>(127, std::max<int64_t>(-128, q)));
-            }
-        }
-    }
-    out.impl()->set_quantizer(std::move(quantizer));
-    return out;
 }
 
-Tensor dequantize_per_channel_cpu(const Tensor& self, const Tensor& scales,
-                                  const Tensor& zero_points, int64_t axis) {
-    if (self.dtype() != DType::QInt8) {
-        TP_THROW(TypeError, "dequantize(): expected a QInt8 tensor");
-    }
-    if (scales.dim() != 1 || zero_points.shape() != scales.shape()) {
-        TP_THROW(ValueError,
-                 "dequantize(): scales/zero_points must be 1-D with equal sizes");
-    }
-    if (axis < 0) axis += self.dim();
-    if (axis < 0 || axis >= self.dim()) {
-        TP_THROW(ValueError, "dequantize(): axis out of range");
-    }
-    if (scales.size(0) != self.size(axis)) {
-        TP_THROW(ValueError,
-                 "dequantize(): scales size must match the quantized dimension");
-    }
-    if (scales.device() != self.device() ||
-        zero_points.device() != self.device()) {
-        TP_THROW(RuntimeError,
-                 "dequantize(): scales and zero_points must be on the input device");
-    }
-    QuantizerPtr quantizer = make_per_channel_affine_quantizer(
-        scales, zero_points, axis, DType::QInt8);
-    Tensor input = self.is_contiguous() ? self : self.contiguous();
-    Tensor out = Tensor::empty(self.shape(), DType::Float32, self.device());
+Tensor quantize_per_tensor_cpu(const Tensor& self, double scale,
+                               int64_t zero_point, DType dtype) {
+    return quantize_per_tensor_dtype_cpu(self, scale, zero_point, dtype);
+}
 
-    int64_t stride_on_axis = 1;
-    for (int64_t d = axis + 1; d < input.dim(); ++d) stride_on_axis *= input.size(d);
-
-    Tensor sc = scales.to(DType::Float32).contiguous();
-    const float* sc_ptr = sc.data_ptr<float>();
-    const int64_t channels = scales.size(0);
-    const int64_t numel = input.numel();
-    const int8_t* in = input.data_ptr<int8_t>();
-    float* outp = out.data_ptr<float>();
-    if (isFloatingType(zero_points.dtype())) {
-        Tensor zp = zero_points.to(DType::Float32).contiguous();
-        const float* zp_ptr = zp.data_ptr<float>();
-        for (int64_t i = 0; i < numel; ++i) {
-            const int64_t c = channel_of(i, stride_on_axis) % channels;
-            outp[i] = (static_cast<float>(in[i]) - zp_ptr[c]) * sc_ptr[c];
-        }
-    } else {
-        Tensor zp = zero_points.to(DType::Int64).contiguous();
-        const int64_t* zp_ptr = zp.data_ptr<int64_t>();
-        for (int64_t i = 0; i < numel; ++i) {
-            const int64_t c = channel_of(i, stride_on_axis) % channels;
-            outp[i] = (static_cast<float>(in[i]) -
-                       static_cast<float>(zp_ptr[c])) * sc_ptr[c];
-        }
+Tensor dequantize_per_tensor_dtype_cpu(const Tensor& self, double scale,
+                                       int64_t zero_point, DType dtype) {
+    switch (dtype) {
+        case DType::QInt8:
+            return dequantize_per_tensor_qint8_cpu(self, scale, zero_point);
+        case DType::QUInt8:
+            return dequantize_per_tensor_quint8_cpu(self, scale, zero_point);
+        case DType::QInt32:
+            return dequantize_per_tensor_qint32_cpu(self, scale, zero_point);
+        default:
+            TP_THROW(TypeError, "dequantize(): unsupported quantized dtype ",
+                     toString(dtype));
     }
-    (void)quantizer;
-    return out;
+}
+
+Tensor quantize_per_channel_cpu(const Tensor& self, const Tensor& scales,
+                                const Tensor& zero_points, int64_t axis,
+                                DType dtype) {
+    return quantize_per_channel_dtype_cpu(
+        self, scales, zero_points, axis, dtype);
+}
+
+Tensor quantize_per_channel_dtype_cpu(const Tensor& self,
+                                      const Tensor& scales,
+                                      const Tensor& zero_points, int64_t axis,
+                                      DType dtype) {
+    if (self.dtype() != DType::Float32) {
+        TP_THROW(TypeError, "quantize(): expected a Float32 tensor, got ",
+                 toString(self.dtype()));
+    }
+    switch (dtype) {
+        case DType::QInt8:
+            return quantize_per_channel_cpu_impl<int8_t>(
+                self, scales, zero_points, axis, dtype);
+        case DType::QUInt8:
+            return quantize_per_channel_cpu_impl<uint8_t>(
+                self, scales, zero_points, axis, dtype);
+        case DType::QInt32:
+            return quantize_per_channel_cpu_impl<int32_t>(
+                self, scales, zero_points, axis, dtype);
+        default:
+            TP_THROW(TypeError, "quantize(): unsupported quantized dtype ",
+                     toString(dtype));
+    }
+}
+
+Tensor dequantize_per_channel_dtype_cpu(const Tensor& self,
+                                        const Tensor& scales,
+                                        const Tensor& zero_points, int64_t axis,
+                                        DType dtype) {
+    switch (dtype) {
+        case DType::QInt8:
+            return dequantize_per_channel_cpu_impl<int8_t>(
+                self, scales, zero_points, axis, dtype);
+        case DType::QUInt8:
+            return dequantize_per_channel_cpu_impl<uint8_t>(
+                self, scales, zero_points, axis, dtype);
+        case DType::QInt32:
+            return dequantize_per_channel_cpu_impl<int32_t>(
+                self, scales, zero_points, axis, dtype);
+        default:
+            TP_THROW(TypeError, "dequantize(): unsupported quantized dtype ",
+                     toString(dtype));
+    }
 }
 
 Tensor quantized_linear_cpu(const Tensor& input, const Tensor& weight,
@@ -676,9 +791,9 @@ Tensor quantized_conv2d_cpu(
     }
     // Dequantize both operands, run the float convolution (the bias already
     // lives in the float domain), then requantize into the output qparams.
-    Tensor x = dequantize_per_tensor_cpu(
+    Tensor x = dequantize_per_tensor_qint8_cpu(
         input, input_scale, input_zero_point);
-    Tensor w = dequantize_per_tensor_cpu(
+    Tensor w = dequantize_per_tensor_qint8_cpu(
         weight, weight_scale, weight_zero_point);
     Tensor acc = conv2d_cpu(
         x, w,
@@ -1780,7 +1895,7 @@ Tensor int_repr_cpu(const Tensor& self) {
 
 Tensor dequantize_self_cpu(const Tensor& self) {
     if (!quantized::is_quantized(self)) {
-        return self;
+        return self.to(DType::Float32);
     }
     return quantized::quantizer_of(self)->dequantize(self);
 }
@@ -1856,9 +1971,7 @@ Tensor _make_per_channel_quantized_tensor_cpu(const Tensor& self,
 
 TENSORPLAY_LIBRARY_IMPL(CPU, QuantKernels) {
     m.impl("quantize_per_tensor", quantize_per_tensor_cpu);
-    m.impl("dequantize_per_tensor", dequantize_per_tensor_cpu);
     m.impl("quantize_per_channel", quantize_per_channel_cpu);
-    m.impl("dequantize_per_channel", dequantize_per_channel_cpu);
     m.impl("quantized_linear", quantized_linear_cpu);
     m.impl("quantized_add", quantized_add_cpu);
     m.impl("quantized_sub", quantized_sub_cpu);
@@ -1869,10 +1982,6 @@ TENSORPLAY_LIBRARY_IMPL(CPU, QuantKernels) {
     m.impl("quantized_conv2d", quantized_conv2d_cpu);
     m.impl("quantized_conv2d_prepack", quantized_conv2d_prepack_cpu);
     m.impl("quantized_conv2d_unpack", quantized_conv2d_unpack_cpu);
-    m.impl("quantize_per_tensor_quint8", quantize_per_tensor_quint8_cpu);
-    m.impl("dequantize_per_tensor_quint8", dequantize_per_tensor_quint8_cpu);
-    m.impl("quantize_per_tensor_qint32", quantize_per_tensor_qint32_cpu);
-    m.impl("dequantize_per_tensor_qint32", dequantize_per_tensor_qint32_cpu);
     m.impl("fake_quantize_per_tensor_affine",
            fake_quantize_per_tensor_affine_cpu);
     m.impl("fake_quantize_per_tensor_affine.tensor_qparams",

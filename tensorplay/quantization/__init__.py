@@ -6,14 +6,13 @@ observers, FakeQuantize with a straight-through
 """
 
 from tensorplay._C import (
-    dequantize_per_channel as dequantize_per_channel,
-    dequantize_per_tensor as dequantize_per_tensor,
+    dequantize as dequantize,
     quantize_per_channel as quantize_per_channel,
     quantize_per_tensor as quantize_per_tensor,
+    quantize_per_tensor_dynamic as quantize_per_tensor_dynamic,
 )
 from tensorplay._C import quantized_linear as quantized_linear
 from tensorplay._C import (
-    dequantize as dequantize,
     int_repr as int_repr,
     is_quantized as is_quantized,
     q_per_channel_axis as q_per_channel_axis,
@@ -46,9 +45,8 @@ from .stub import QuantStub as QuantStub
 
 __all__ = [
     "quantize_per_tensor",
-    "dequantize_per_tensor",
     "quantize_per_channel",
-    "dequantize_per_channel",
+    "quantize_per_tensor_dynamic",
     "quantized_linear",
     "dequantize",
     "int_repr",

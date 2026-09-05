@@ -1,17 +1,14 @@
 """FakeQuantize: simulated quantization with a straight-through estimator.
 
-The forward pass maps values through the real affine Int8 grid
-(dequantize(quantize(x))) using the native ``quantize_per_tensor`` /
-``dequantize_per_tensor`` kernels.  The backward pass passes gradients
-through where the input lies inside the representable range and blocks them
+The forward pass maps values through the real affine Int8 grid using the
+native fake-quantization kernels.  The backward pass passes gradients through
+where the input lies inside the representable range and blocks them
 """
 
 import tensorplay
 from tensorplay._C import (
-    dequantize_per_channel as _dequantize_per_channel,
-    dequantize_per_tensor as _dequantize_per_tensor,
-    quantize_per_channel as _quantize_per_channel,
-    quantize_per_tensor as _quantize_per_tensor,
+    fake_quantize_per_channel_affine as _fake_quantize_per_channel_affine,
+    fake_quantize_per_tensor_affine as _fake_quantize_per_tensor_affine,
 )
 from tensorplay.autograd.function import Function
 from tensorplay import nn
@@ -24,9 +21,9 @@ __all__ = ["FakeQuantize", "fake_quantize_per_tensor"]
 class _FakeQuantizeSTE(Function):
     @staticmethod
     def forward(ctx, x, scale, zero_point, quant_min, quant_max):
-        q = _quantize_per_tensor(self=x, scale=scale, zero_point=zero_point,
-                                 quant_min=quant_min, quant_max=quant_max)
-        y = _dequantize_per_tensor(self=q, scale=scale, zero_point=zero_point)
+        y = _fake_quantize_per_tensor_affine(
+            self=x, scale=scale, zero_point=zero_point,
+            quant_min=quant_min, quant_max=quant_max)
         # Real-domain bounds of the representable grid; gradient flows only
         # for inputs inside them (outside, quantization is saturated and a
         # straight-through would invent slope that the true function lacks).
@@ -144,12 +141,13 @@ def fake_quantize_per_channel(x, scales, zero_points, axis=0,
     shape = [1] * x.dim()
     shape[axis] = x.size(axis)
     scales1 = scales.to(tensorplay.float32)
-    zps1 = zero_points.to(tensorplay.int64)
+    zps1 = (zero_points.to(tensorplay.float32)
+            if zero_points.dtype.is_floating_point
+            else zero_points.to(tensorplay.int64))
 
-    q = _quantize_per_channel(self=x, scales=scales1,
-                              zero_points=zps1, axis=axis)
-    y = _dequantize_per_channel(self=q, scales=scales1,
-                                zero_points=zps1, axis=axis)
+    y = _fake_quantize_per_channel_affine(
+        self=x, scale=scales1, zero_point=zps1, axis=axis,
+        quant_min=quant_min, quant_max=quant_max)
     # Broadcast per-channel real-domain bounds for the STE mask.
     lo_b = ((quant_min - zps1.to(scales1.dtype)) * scales1).reshape(shape) \
         .expand(x.shape).contiguous()

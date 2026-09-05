@@ -9,7 +9,7 @@ tensors).
 
 import tensorplay
 from tensorplay._C import (
-    dequantize_per_tensor as _dequantize_per_tensor,
+    _make_per_tensor_quantized_tensor as _make_per_tensor_quantized_tensor,
     quantize_per_tensor as _quantize_per_tensor,
 )
 from tensorplay import nn
@@ -39,7 +39,8 @@ class QuantStub(nn.Module):
             # Inference path: produce a native quantized tensor carrying
             # its affine parameters.
             return _quantize_per_tensor(self=x, scale=scale,
-                                        zero_point=zero_point)
+                                        zero_point=zero_point,
+                                        dtype=tensorplay.qint8)
         return self.fake_quant(x)
 
     def freeze(self):
@@ -62,5 +63,5 @@ class DeQuantStub(nn.Module):
                 "convert float inputs through a QuantStub first")
         scale = 1.0 if self.scale is None else float(self.scale)
         zero_point = 0 if self.zero_point is None else int(self.zero_point)
-        return _dequantize_per_tensor(self=x, scale=scale,
-                                      zero_point=zero_point)
+        q = _make_per_tensor_quantized_tensor(x, scale, zero_point)
+        return q.dequantize()
