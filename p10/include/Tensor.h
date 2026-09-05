@@ -96,6 +96,7 @@ public:
     // Utils
     bool defined() const { return impl_ != nullptr; }
     std::shared_ptr<TensorImpl> impl() const { return impl_; }
+    void swap_impl(Tensor& other) noexcept { impl_.swap(other.impl_); }
     
     // Constructor with Scalar fill value
     Tensor(const std::vector<int64_t>& sizes, Scalar fill_value, const Device& device = Device());
