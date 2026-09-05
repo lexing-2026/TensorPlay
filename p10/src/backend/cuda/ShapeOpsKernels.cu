@@ -109,19 +109,6 @@ Tensor pack_i64(const std::vector<int64_t>& v, const Device& dev) {
 }
 
 
-// Shape-op device kernels
-__global__ void trace_batch_kernel(int64_t batch, int64_t rows, int64_t cols,
-                                   const double* sp, double* dp) {
-    int64_t bi = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; bi < batch; bi += stride) {
-        double s2 = 0;
-        int64_t d = rows < cols ? rows : cols;
-        for (int64_t i = 0; i < d; ++i) s2 += sp[bi * rows * cols + i * cols + i];
-        dp[bi] = s2;
-    }
-}
-
 template <typename T>
 __global__ void index_gather_kernel(int64_t n, const T* src, const int64_t* idx, T* out) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -292,21 +279,10 @@ __global__ void channel_shuffle_map_kernel(int64_t n, int64_t outer, int64_t C, 
 } // anonymous namespace
 
 Tensor trace_cuda(const Tensor& self) {
-    if (self.dim() < 2) TP_THROW(RuntimeError, "trace: input must have at least 2 dimensions");
-    int64_t rows = self.size(-2), cols = self.size(-1);
-    int64_t batch = self.numel() / (rows * cols);
-    std::vector<int64_t> out_shape = shape_of(self);
-    out_shape.resize(out_shape.size() - 2);
-    Tensor out64 = Tensor::zeros({std::max<int64_t>(batch, 1)}, DType::Float64, self.device());
-    if (batch > 0) {
-        Tensor sc = self.contiguous().to(DType::Float64);
-        auto stream = getCurrentCUDAStream().stream();
-        dim3 grid = make_grid(batch), block(kThreads);
-        trace_batch_kernel<<<grid, block, 0, stream>>>(
-            batch, rows, cols, sc.data_ptr<double>(), out64.data_ptr<double>());
-        CUDA_CHECK(cudaGetLastError());
+    if (self.dim() != 2) {
+        TP_THROW(RuntimeError, "trace: expected a matrix, but got tensor with dim ", self.dim());
     }
-    return out64.reshape(out_shape).to(self.dtype());
+    return self.diagonal().sum();
 }
 
 Tensor diag_cuda(const Tensor& self, int64_t diagonal) {
