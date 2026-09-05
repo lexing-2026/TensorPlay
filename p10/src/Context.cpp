@@ -66,17 +66,35 @@ void Context::setAllowTF32CuBLAS(bool b) {
                                 : Float32MatmulPrecision::HIGHEST);
 }
 
+// The device-override slots live translation-unit local: thread-storage
+// objects cannot carry a dll interface on Windows, so callers go through
+// the exported Context accessors instead of touching the variables here.
+namespace {
+thread_local std::optional<Device> tp_default_device;
+thread_local std::vector<std::optional<Device>> tp_device_stack;
+} // namespace
+
+void Context::setDefaultDevice(std::optional<Device> device) {
+    tp_default_device = device;
+}
+
+void Context::clearDefaultDevice() { tp_default_device.reset(); }
+
+std::optional<Device> Context::getDefaultDeviceOverride() const {
+    return tp_default_device;
+}
+
 void Context::pushDefaultDevice(Device device) {
-    device_stack_.push_back(default_device_);
-    default_device_ = device;
+    tp_device_stack.push_back(tp_default_device);
+    tp_default_device = device;
 }
 
 void Context::popDefaultDevice() {
-    if (!device_stack_.empty()) {
-        default_device_ = device_stack_.back();
-        device_stack_.pop_back();
+    if (!tp_device_stack.empty()) {
+        tp_default_device = tp_device_stack.back();
+        tp_device_stack.pop_back();
     } else {
-        default_device_.reset();
+        tp_default_device.reset();
     }
 }
 

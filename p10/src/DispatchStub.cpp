@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 
 #include "cpu/vec/intrinsics.h"
 
