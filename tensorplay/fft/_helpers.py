@@ -67,7 +67,7 @@ def normalize_dims(dim, ndim):
     seen = set()
     out = []
     for d in dims:
-        d = d % ndim if d < 0 else d
+        d = d + ndim if d < 0 else d
         if not 0 <= d < ndim:
             raise ValueError(f"dimension {d} out of range for {ndim}-D input")
         if d in seen:
