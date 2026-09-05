@@ -842,23 +842,35 @@ __global__ void searchsorted_kernel(int64_t n, int64_t seq_len, bool right,
     }
 }
 
-// max-reduce used by bincount to size the histogram on the host.
+// Device range reduction used by bincount to validate inputs and size bins.
 template <typename T>
-__global__ void max_reduce_kernel(int64_t n, const T* x, T* out) {
+__global__ void minmax_reduce_kernel(int64_t n, const T* x, T* min_out,
+                                     T* max_out) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    T local = std::numeric_limits<T>::lowest();
-    for (; i < n; i += stride) local = ::max(local, x[i]);
-    // single-block style: rely on one block when launched with grid=1
-    __shared__ T shm[kThreads];
+    T local_min = std::numeric_limits<T>::max();
+    T local_max = std::numeric_limits<T>::lowest();
+    for (; i < n; i += stride) {
+        local_min = ::min(local_min, x[i]);
+        local_max = ::max(local_max, x[i]);
+    }
+    __shared__ T min_shm[kThreads];
+    __shared__ T max_shm[kThreads];
     int tid = threadIdx.x;
-    shm[tid] = local;
+    min_shm[tid] = local_min;
+    max_shm[tid] = local_max;
     __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) shm[tid] = ::max(shm[tid], shm[tid + s]);
+        if (tid < s) {
+            min_shm[tid] = ::min(min_shm[tid], min_shm[tid + s]);
+            max_shm[tid] = ::max(max_shm[tid], max_shm[tid + s]);
+        }
         __syncthreads();
     }
-    if (tid == 0) out[blockIdx.x] = shm[0];
+    if (tid == 0) {
+        min_out[blockIdx.x] = min_shm[0];
+        max_out[blockIdx.x] = max_shm[0];
+    }
 }
 
 template <typename T>
@@ -2420,7 +2432,7 @@ Tensor bucketize_scalar_cuda(const Scalar& self, const Tensor& boundaries,
 }
 
 // ---------------------------------------------------------------------------
-// bincount (host-sized histogram followed by atomic accumulation).
+// bincount (device range reduction followed by atomic accumulation).
 // ---------------------------------------------------------------------------
 
 Tensor bincount_cuda(const Tensor& self, const std::optional<Tensor>& weights_opt, int64_t minlength) {
@@ -2443,19 +2455,23 @@ Tensor bincount_cuda(const Tensor& self, const std::optional<Tensor>& weights_op
     if (has_weights && (weights.dim() != 1 || weights.size(0) != self.size(0))) {
         TP_THROW(RuntimeError, "weights should be 1-d and have the same length as input");
     }
-    // find max via a one-block reduce (input is 1-D; sync once to read nbins)
-    Tensor max_d = Tensor::zeros({1}, DType::Int64, self.device());
+    // Read only the reduced range metadata before allocating the output.
+    Tensor bounds_d = Tensor::empty({2}, DType::Int64, self.device());
     auto stream = getCurrentCUDAStream().stream();
-    if (n > 0) {
-        max_reduce_kernel<int64_t><<<1, kThreads, 0, stream>>>(
-            n, inp.data_ptr<int64_t>(), max_d.data_ptr<int64_t>());
-        CUDA_CHECK(cudaGetLastError());
-    }
-    int64_t max_v = 0;
-    CUDA_CHECK(cudaMemcpy(&max_v, max_d.data_ptr<int64_t>(), sizeof(int64_t),
-                          cudaMemcpyDeviceToHost));
-    if (max_v < 0) {
+    minmax_reduce_kernel<int64_t><<<1, kThreads, 0, stream>>>(
+        n, inp.data_ptr<int64_t>(), bounds_d.data_ptr<int64_t>(),
+        bounds_d.data_ptr<int64_t>() + 1);
+    CUDA_CHECK(cudaGetLastError());
+    int64_t bounds[2] = {0, 0};
+    CUDA_CHECK(cudaMemcpy(bounds, bounds_d.data_ptr<int64_t>(),
+                          sizeof(bounds), cudaMemcpyDeviceToHost));
+    const int64_t min_v = bounds[0];
+    const int64_t max_v = bounds[1];
+    if (min_v < 0) {
         TP_THROW(RuntimeError, "bincount only supports 1-d non-negative integral inputs.");
+    }
+    if (max_v >= std::numeric_limits<int64_t>::max()) {
+        TP_THROW(RuntimeError, "maximum value of input overflowed");
     }
     int64_t nbins = std::max(max_v + 1, minlength);
     if (has_weights) {
