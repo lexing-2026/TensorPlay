@@ -2296,15 +2296,33 @@ Tensor searchsorted_impl_cuda(const Tensor& seq_f, const Tensor& vals_f, bool ou
     };
 
 #define TP_SS_V(stype) \
+    if (vals.dtype() == DType::UInt8) return run(stype{}, uint8_t{}); \
+    if (vals.dtype() == DType::Int8) return run(stype{}, int8_t{}); \
+    if (vals.dtype() == DType::Int16) return run(stype{}, int16_t{}); \
+    if (vals.dtype() == DType::Int32) return run(stype{}, int32_t{}); \
+    if (vals.dtype() == DType::Int64) return run(stype{}, int64_t{}); \
+    if (vals.dtype() == DType::UInt16) return run(stype{}, uint16_t{}); \
+    if (vals.dtype() == DType::UInt32) return run(stype{}, uint32_t{}); \
+    if (vals.dtype() == DType::UInt64) return run(stype{}, uint64_t{}); \
+    if (vals.dtype() == DType::Float16) return run(stype{}, Half{}); \
+    if (vals.dtype() == DType::BFloat16) return run(stype{}, BFloat16{}); \
+    if (vals.dtype() == DType::Bool) return run(stype{}, bool{}); \
     if (vals.dtype() == DType::Float32) return run(stype{}, float{}); \
-    if (vals.dtype() == DType::Float64) return run(stype{}, double{}); \
-    if (vals.dtype() == DType::Int64)   return run(stype{}, int64_t{}); \
-    if (vals.dtype() == DType::Int32)   return run(stype{}, int32_t{});
+    if (vals.dtype() == DType::Float64) return run(stype{}, double{});
 
-    if (seq.dtype() == DType::Float32) { TP_SS_V(float) }
-    else if (seq.dtype() == DType::Float64) { TP_SS_V(double) }
-    else if (seq.dtype() == DType::Int64) { TP_SS_V(int64_t) }
+    if (seq.dtype() == DType::UInt8) { TP_SS_V(uint8_t) }
+    else if (seq.dtype() == DType::Int8) { TP_SS_V(int8_t) }
+    else if (seq.dtype() == DType::Int16) { TP_SS_V(int16_t) }
     else if (seq.dtype() == DType::Int32) { TP_SS_V(int32_t) }
+    else if (seq.dtype() == DType::Int64) { TP_SS_V(int64_t) }
+    else if (seq.dtype() == DType::UInt16) { TP_SS_V(uint16_t) }
+    else if (seq.dtype() == DType::UInt32) { TP_SS_V(uint32_t) }
+    else if (seq.dtype() == DType::UInt64) { TP_SS_V(uint64_t) }
+    else if (seq.dtype() == DType::Float16) { TP_SS_V(Half) }
+    else if (seq.dtype() == DType::BFloat16) { TP_SS_V(BFloat16) }
+    else if (seq.dtype() == DType::Bool) { TP_SS_V(bool) }
+    else if (seq.dtype() == DType::Float32) { TP_SS_V(float) }
+    else if (seq.dtype() == DType::Float64) { TP_SS_V(double) }
     else {
         Tensor seq_d = seq.to(DType::Float64);
         Tensor vals_d = vals.to(DType::Float64);
