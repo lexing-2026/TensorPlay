@@ -25,9 +25,9 @@ from ._utils import (
     gate_outcome,
     _iter_proxies,
 )
-from .graph import Graph
+from .graph import CodeGen, Graph
 from .graph_module import GraphModule
-from .node import Node
+from .node import Node, has_side_effect, map_arg
 from .proxy import Proxy, gate
 from .symbolic_trace import symbolic_trace, wrap
 from .tracer import NodePathTracer, Tracer
@@ -43,6 +43,7 @@ from .subgraph_rewriter import (
 from .tensor_type import Dyn, TensorType, is_consistent, is_more_precise
 __all__ = [
     "Dyn",
+    "CodeGen",
     "Graph",
     "GraphCaptureError",
     "GraphModule",
@@ -63,10 +64,12 @@ __all__ = [
     "get_graph_node_names",
     "gate",
     "gate_outcome",
+    "has_side_effect",
     "immutable_dict",
     "immutable_list",
     "is_consistent",
     "is_more_precise",
+    "map_arg",
     "replace_pattern",
     "replace_pattern_with_filters",
     "symbolic_trace",
