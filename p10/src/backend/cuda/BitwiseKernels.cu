@@ -113,6 +113,12 @@ Tensor bitwise_binary_cuda(const Tensor& a_in, const Tensor& b_in, Pred pred, co
     dim3 grid, block;
     launch_ew(grid, block, n);
     auto stream = getCurrentCUDAStream().stream();
+    if (dt == DType::Bool) {
+        ew_binary_kernel<bool><<<grid, block, 0, stream>>>(
+            n, ac.data_ptr<bool>(), bc.data_ptr<bool>(), out.data_ptr<bool>(), pred);
+        CUDA_CHECK(cudaGetLastError());
+        return out;
+    }
 #define TP_BIT_BIN(ctype, name_) \
     case DType::name_: \
         ew_binary_kernel<ctype><<<grid, block, 0, stream>>>( \
@@ -137,6 +143,13 @@ Tensor bitwise_scalar_cuda(const Tensor& self_in, Scalar other, Pred pred, const
     dim3 grid, block;
     launch_ew(grid, block, n);
     auto stream = getCurrentCUDAStream().stream();
+    if (self_in.dtype() == DType::Bool) {
+        const bool ov = other.to<bool>();
+        bitwise_binary_scalar_kernel<bool><<<grid, block, 0, stream>>>(
+            n, sc.data_ptr<bool>(), ov, out.data_ptr<bool>(), pred);
+        CUDA_CHECK(cudaGetLastError());
+        return out;
+    }
 #define TP_BIT_SCALAR(ctype, name_) \
     case DType::name_: { \
         ctype ov = static_cast<ctype>(other.to<int64_t>()); \
