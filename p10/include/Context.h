@@ -4,8 +4,10 @@
 // deterministic-algorithms flags, and float32 matmul precision.
 
 #include "Macros.h"
+#include "BlasBackend.h"
 #include "Device.h"
 #include "DType.h"
+#include "LinalgBackend.h"
 #include "SDPBackend.h"
 
 #include <array>
@@ -101,6 +103,18 @@ public:
     bool userEnabledNNPACK() const { return enabled_nnpack_; }
     void setUserEnabledNNPACK(bool e) { enabled_nnpack_ = e; }
 
+    // -- GPU linear algebra / BLAS backend selection ----------------------
+    // The linalg preference routes dense factorizations; "magma" is
+    // rejected because this build ships no MAGMA backend. The blas
+    // preference chooses between the classic cuBLAS API and cuBLASLt for
+    // matrix products; "default" lets each call site apply its own
+    // heuristic.
+    void setLinalgPreferredBackend(LinalgBackend b);
+    LinalgBackend linalgPreferredBackend() const { return linalg_preferred_backend_; }
+
+    void setBlasPreferredBackend(BlasBackend b) { blas_preferred_backend_ = b; }
+    BlasBackend blasPreferredBackend() const { return blas_preferred_backend_; }
+
     // -- Scaled dot product attention backend controls -------------------
     // Every fused kernel family owns an enable switch; the priority order
     // ranks the backends when the caller lets the library route.  Both are
@@ -159,6 +173,8 @@ private:
     bool cudnn_benchmark_ = false;
     bool enabled_mkldnn_ = true;
     bool enabled_nnpack_ = true;
+    LinalgBackend linalg_preferred_backend_ = LinalgBackend::Default;
+    BlasBackend blas_preferred_backend_ = BlasBackend::Default;
 
     bool enabled_flash_sdp_ = true;
     bool enabled_fa3_sdp_ = false;
