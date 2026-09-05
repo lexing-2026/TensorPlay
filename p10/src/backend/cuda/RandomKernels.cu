@@ -667,93 +667,84 @@ Tensor& cauchy_kernel_cuda(Tensor& self, double median, double sigma) {
     return self;
 }
 
-// random_from_to_64_kernel, DistributionTemplates.h:292-336).  Int64 pairs two
-
-__global__ void randint32_fill_impl(int64_t numel, PhiloxCudaState philox_args,
-                                    uint64_t range, int64_t base,
-                                    unsigned int* out_data) {
-    uint64_t seed;
-    uint64_t offset;
-    philox_unpack(philox_args, &seed, &offset);
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    curandStatePhilox4_32_10_t state;
-    curand_init(seed, idx, offset, &state);
-    const int64_t total_threads = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    const int64_t rounded_size =
-        ((numel - 1) / (total_threads * 4) + 1) * total_threads * 4;
-    for (int64_t linear_index = idx; linear_index < rounded_size;
-         linear_index += total_threads * 4) {
-        uint4 rand = curand4(&state);
-        #pragma unroll
-        for (int ii = 0; ii < 4; ii++) {
-            int64_t li = linear_index + total_threads * ii;
-            if (li < numel) {
-                out_data[li] = static_cast<unsigned int>(
-                    ((uint64_t)(&rand.x)[ii]) % range + (uint64_t)base);
-            }
-        }
+template <typename scalar_t>
+void launch_random_range_cuda(scalar_t* data, int64_t n,
+                              uint64_t range, int64_t base) {
+    if (range >= (1ULL << 28)) {
+        distribution_nullary_kernel<scalar_t, ulonglong2, 2>(
+            data, n,
+            [] __device__ (curandStatePhilox4_32_10_t* state) {
+                ulonglong2 random;
+                uint4 words = curand4(state);
+                random.x = (static_cast<uint64_t>(words.x) << 32) | words.y;
+                random.y = (static_cast<uint64_t>(words.z) << 32) | words.w;
+                return random;
+            },
+            [range, base] __device__ (uint64_t value) {
+                return static_cast<scalar_t>(static_cast<int64_t>(
+                    (value % range) + static_cast<uint64_t>(base)));
+            });
+    } else {
+        distribution_nullary_kernel<scalar_t, uint4, 4>(
+            data, n,
+            [] __device__ (curandStatePhilox4_32_10_t* state) {
+                return curand4(state);
+            },
+            [range, base] __device__ (unsigned int value) {
+                return static_cast<scalar_t>(static_cast<int64_t>(
+                    (static_cast<uint64_t>(value) % range) +
+                    static_cast<uint64_t>(base)));
+            });
     }
 }
 
-__global__ void randint64_fill_impl(int64_t numel, PhiloxCudaState philox_args,
-                                    uint64_t range, int64_t base,
-                                    int64_t* out_data) {
-    uint64_t seed;
-    uint64_t offset;
-    philox_unpack(philox_args, &seed, &offset);
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    curandStatePhilox4_32_10_t state;
-    curand_init(seed, idx, offset, &state);
-    const int64_t total_threads = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    const int64_t rounded_size =
-        ((numel - 1) / (total_threads * 2) + 1) * total_threads * 2;
-    for (int64_t linear_index = idx; linear_index < rounded_size;
-         linear_index += total_threads * 2) {
-        uint4 rand = curand4(&state);
-        #pragma unroll
-        for (int ii = 0; ii < 2; ii++) {
-            int64_t li = linear_index + total_threads * ii;
-            if (li < numel) {
-                const unsigned int* words = (&rand.x) + 2 * ii;
-                uint64_t val = ((uint64_t)words[0] << 32) | words[1];
-                out_data[li] = static_cast<int64_t>(val % range + (uint64_t)base);
-            }
+template <typename scalar_t>
+void launch_random_full_range_cuda(scalar_t* data, int64_t n) {
+    if constexpr (std::is_same_v<scalar_t, uint64_t>) {
+        distribution_nullary_kernel<scalar_t, ulonglong2, 2>(
+            data, n,
+            [] __device__ (curandStatePhilox4_32_10_t* state) {
+                ulonglong2 random;
+                uint4 words = curand4(state);
+                random.x = (static_cast<uint64_t>(words.x) << 32) | words.y;
+                random.y = (static_cast<uint64_t>(words.z) << 32) | words.w;
+                return random;
+            },
+            [] __device__ (uint64_t value) {
+                return static_cast<scalar_t>(value);
+            });
+    } else {
+        uint64_t range;
+        if constexpr (std::is_same_v<scalar_t, int64_t>) {
+            range = uint64_t{1} << 63;
+        } else if constexpr (std::is_same_v<scalar_t, double>) {
+            range = uint64_t{1} << 53;
+        } else if constexpr (std::is_same_v<scalar_t, float>) {
+            range = uint64_t{1} << 24;
+        } else if constexpr (std::is_same_v<scalar_t, Half>) {
+            range = uint64_t{1} << 11;
+        } else if constexpr (std::is_same_v<scalar_t, BFloat16>) {
+            range = uint64_t{1} << 8;
+        } else if constexpr (std::is_same_v<scalar_t, bool>) {
+            range = 2;
+        } else {
+            range = static_cast<uint64_t>(std::numeric_limits<scalar_t>::max()) + 1;
         }
+        launch_random_range_cuda(data, n, range, 0);
     }
 }
 
 static void randint_fill_dispatch(Tensor& t, int64_t low, int64_t high) {
     int64_t n = t.numel();
+    distribution::check_random_from_to_bounds(low, high, t.dtype());
     if (n == 0) return;
-    const uint64_t range = static_cast<uint64_t>(high - low);
+    const uint64_t range = static_cast<uint64_t>(high) -
+        static_cast<uint64_t>(low);
     const int64_t base = low;
-
-    auto launch = [&](auto kernel, auto* ptr, uint32_t unroll_factor) {
-        auto policy = calc_execution_policy(n, unroll_factor);
-        const uint64_t counter_offset = std::get<0>(policy);
-        const dim3 grid = std::get<1>(policy);
-        const dim3 block = std::get<2>(policy);
-        auto philox_args = philox_cuda_state(counter_offset);
-        kernel<<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
-            n, philox_args, range, base, ptr);
-        cudaError_t error = cudaGetLastError();
-        if (error != cudaSuccess) {
-            TP_THROW(RuntimeError, std::string("CUDA randint Error: ") +
-                        cudaGetErrorString(error));
-        }
-    };
-
-    switch (t.dtype()) {
-        case DType::Int64:
-            launch(randint64_fill_impl, t.data_ptr<int64_t>(), 2u);
-            break;
-        case DType::Int32:
-            launch(randint32_fill_impl,
-                   reinterpret_cast<unsigned int*>(t.data_ptr<int32_t>()), 4u);
-            break;
-        default:
-            TP_THROW(NotImplementedError, "randint: only Int64/Int32 supported on CUDA");
-    }
+    distribution::dispatch_dtype(t.dtype(), [&](auto tag) {
+        using scalar_t = decltype(tag);
+        launch_random_range_cuda(t.data_ptr<scalar_t>(), n, range, base);
+    });
 }
 
 Tensor randint_kernel_cuda(int64_t low, int64_t high, const std::vector<int64_t>& size,
@@ -776,42 +767,20 @@ Tensor randint_like_kernel_cuda(const Tensor& self, int64_t low, int64_t high,
 }
 
 Tensor& random_kernel_cuda(Tensor& self, int64_t low, int64_t high) {
-    if (self.numel() == 0) return self;
-    if (!self.is_contiguous()) {
-        return fill_via_contiguous(self, [&](Tensor& t) { return random_kernel_cuda(t, low, high); });
-    }
-    int64_t n = self.numel();
     const bool full_range = (low == 0 && high == 0);
     if (!full_range && low >= high) {
         TP_THROW(RuntimeError, "random_ expects 'from' to be less than 'to', but got from=", low, " >= to=", high);
     }
-
-    if (full_range && (self.dtype() == DType::Float32 || self.dtype() == DType::Float64)) {
-        return uniform_kernel_cuda(self, 0.0, 1.0, std::nullopt);
+    if (!self.is_contiguous()) {
+        return fill_via_contiguous(self, [&](Tensor& t) { return random_kernel_cuda(t, low, high); });
     }
+    int64_t n = self.numel();
     if (full_range) {
-        // Full-range ints: uniform_int_full_range casts raw draws; approximate
-        // with the widest from-to interval of the dtype.
-        if (self.dtype() == DType::Int64) {
-            low = 0; high = std::numeric_limits<int64_t>::max();
-        } else if (self.dtype() == DType::Int32) {
-            low = 0; high = std::numeric_limits<int32_t>::max();
-        } else {
-            TP_THROW(NotImplementedError,
-                     "random_() only supports Int64/Int32/Float32/Float64 on CUDA for now");
-        }
-    }
-    if (self.dtype() == DType::Float32) {
-        float* data = self.data_ptr<float>();
-        const uint64_t range = static_cast<uint64_t>(high - low);
-        const int64_t base = low;
-        // Integral-valued floats in [low, high), matching CPU semantics.
-        distribution_nullary_kernel<float, uint4, 4>(
-            data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand4(state); },
-            [range, base] __device__ (unsigned int val) {
-                return static_cast<float>(static_cast<int64_t>(val % range) + base);
-            });
+        if (n == 0) return self;
+        distribution::dispatch_dtype(self.dtype(), [&](auto tag) {
+            using scalar_t = decltype(tag);
+            launch_random_full_range_cuda(self.data_ptr<scalar_t>(), n);
+        });
     } else {
         randint_fill_dispatch(self, low, high);
     }
