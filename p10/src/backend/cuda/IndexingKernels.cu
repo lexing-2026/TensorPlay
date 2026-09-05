@@ -1554,6 +1554,31 @@ Tensor scan_entry(const Tensor& self, int64_t dim, T init_val, Op op) {
     CUDA_CHECK(cudaGetLastError());
     return result;
 }
+
+template <typename ComplexT, bool Product>
+Tensor scan_complex_entry(const Tensor& self, int64_t dim) {
+    Tensor self_c = self.contiguous();
+    Tensor result = Tensor::empty(
+        static_cast<std::vector<int64_t>>(self_c.shape()),
+        self_c.dtype(), self_c.device());
+    const int64_t d_size = self_c.size(dim);
+    if (d_size == 0 || self_c.numel() == 0) return result;
+
+    int64_t outer = 1;
+    int64_t inner = 1;
+    outer_inner(static_cast<std::vector<int64_t>>(self_c.shape()), dim, outer, inner);
+    const int64_t slices = outer * inner;
+    const auto stream = getCurrentCUDAStream().stream();
+    const ComplexT init_value = Product ? ComplexT(1, 0) : ComplexT(0, 0);
+    using Op = scan_arithmetic_op<ComplexT, Product>;
+    scan_kernel<ComplexT, Op>
+        <<<(slices + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+            slices, d_size, inner,
+            static_cast<const ComplexT*>(self_c.data_ptr()),
+            static_cast<ComplexT*>(result.data_ptr()), init_value, Op{});
+    CUDA_CHECK(cudaGetLastError());
+    return result;
+}
 } // anonymous namespace
 
 Tensor cumsum_cuda(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
@@ -1563,6 +1588,17 @@ Tensor cumsum_cuda(const Tensor& self, int64_t dim, std::optional<DType> dtype) 
     DType out_dtype = dtype.value_or(isIntegralType(self.dtype(), true) ? DType::Int64
                                                                          : self.dtype());
     Tensor src = (self.dtype() == out_dtype) ? self : self.to(out_dtype);
+    if (isComplexType(out_dtype)) {
+        const DType compute_dtype =
+            out_dtype == DType::ComplexDouble ? DType::ComplexDouble : DType::ComplexFloat;
+        Tensor compute_src = src.dtype() == compute_dtype ? src : src.to(compute_dtype);
+        if (compute_dtype == DType::ComplexDouble) {
+            return scan_complex_entry<thrust::complex<double>, false>(compute_src, dim)
+                .to(out_dtype);
+        }
+        return scan_complex_entry<thrust::complex<float>, false>(compute_src, dim)
+            .to(out_dtype);
+    }
 #define TP_CS_CASE(ctype, name) \
     case DType::name: \
         return scan_entry<ctype>(src, dim, static_cast<ctype>(0), \
@@ -1594,6 +1630,17 @@ Tensor cumprod_cuda(const Tensor& self, int64_t dim, std::optional<DType> dtype)
     DType out_dtype = dtype.value_or(isIntegralType(self.dtype(), true) ? DType::Int64
                                                                          : self.dtype());
     Tensor src = (self.dtype() == out_dtype) ? self : self.to(out_dtype);
+    if (isComplexType(out_dtype)) {
+        const DType compute_dtype =
+            out_dtype == DType::ComplexDouble ? DType::ComplexDouble : DType::ComplexFloat;
+        Tensor compute_src = src.dtype() == compute_dtype ? src : src.to(compute_dtype);
+        if (compute_dtype == DType::ComplexDouble) {
+            return scan_complex_entry<thrust::complex<double>, true>(compute_src, dim)
+                .to(out_dtype);
+        }
+        return scan_complex_entry<thrust::complex<float>, true>(compute_src, dim)
+            .to(out_dtype);
+    }
 #define TP_CP_CASE(ctype, name) \
     case DType::name: \
         return scan_entry<ctype>(src, dim, static_cast<ctype>(1), \
