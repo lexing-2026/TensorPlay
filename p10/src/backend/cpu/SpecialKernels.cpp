@@ -29,6 +29,8 @@ using tensorplay::special_math::bessel_y0_forward;
 using tensorplay::special_math::bessel_y1_forward;
 using tensorplay::special_math::calc_entr;
 using tensorplay::special_math::calc_erfcx;
+using tensorplay::special_math::calc_digamma;
+using tensorplay::special_math::trigamma;
 using tensorplay::special_math::calc_i0e;
 using tensorplay::special_math::calc_log_ndtr;
 using tensorplay::special_math::calc_ndtr;

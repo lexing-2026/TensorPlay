@@ -580,7 +580,11 @@ struct check_binary_functor_types_for_specialization<
 
 inline bool check_binary_rt_types_for_specialization(
     const TensorIteratorBase& iter) {
+    // The specialized bodies invoke the functor with two converted
+    // operands, so scalar-folded unary wrappers never take this path; they
+    // run through the generic dynamic-cast kernel below.
     if (iter.ninputs() != 2) return false;
+    if (iter.is_cpu_scalar(1) || iter.is_cpu_scalar(2)) return false;
     for (const auto& spec : rt_binary_specializations) {
         if (iter.dtype(0) == spec[0] && iter.input_dtype(0) == spec[1] &&
             iter.input_dtype(1) == spec[2]) {
@@ -1091,7 +1095,11 @@ void gpu_kernel_impl(TensorIteratorBase& iter, const func_t& f) {
             dtypes[i] = iter.dtype(i);
         }
         auto offset_calc = make_offset_calculator<traits::arity + 1>(iter);
-        if (detail::check_binary_rt_types_for_specialization(iter)) {
+        // The specialized bodies invoke the functor with two operands, so
+        // only true binary functors qualify; scalar-folded unary wrappers
+        // (and any other arity) keep the generic dynamic-cast kernel.
+        if (traits::arity == 2 &&
+            detail::check_binary_rt_types_for_specialization(iter)) {
             detail_for_loop<detail::type_specialized_broadcast_kernel_launcher,
                             0,
                             static_cast<int>(
