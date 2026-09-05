@@ -48,6 +48,12 @@ private:
     // can reject views created by shallow_copy_and_detach.
     bool is_view_ = false;
 
+    // True when the tensor was auto-wrapped from a C++/Python number
+    // ('t + 2' wraps 2).  Wrapped numbers participate in the result type
+    // computation only when no plain tensor operand is present, so integer
+    // literals combine with floating tensors instead of demoting them.
+    bool is_wrapped_number_ = false;
+
     // Opaque pointer to OneDNN memory descriptor (std::shared_ptr<dnnl::memory::desc>)
     // std::shared_ptr<void> onednn_md_;
     
@@ -187,6 +193,15 @@ public:
     // View identity: true when this tensor was created by a view op at the
     bool is_view() const { return is_view_; }
     void set_is_view(bool v) { is_view_ = v; }
+
+    // True when this tensor was auto-wrapped from a C++ or Python number.
+    bool is_wrapped_number() const { return is_wrapped_number_; }
+
+    // Marks a tensor as a wrapped number; only meaningful for 0-dim tensors.
+    void set_wrapped_number(bool value) {
+        TP_CHECK(dim() == 0, "wrapped numbers must be 0-dim tensors");
+        is_wrapped_number_ = value;
+    }
 
     // Stride-set equality against `format`'s canonical layout; singleton
     // dimensions are not special-cased here.

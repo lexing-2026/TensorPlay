@@ -3,6 +3,7 @@
 #include "Tensor.h"
 #include "DType.h"
 #include "Device.h"
+#include "DynamicCast.h"
 #include "Exception.h"
 #include "Parallel.h"
 #include "irange.h"
@@ -200,8 +201,38 @@ struct TensorIteratorBase {
   bool is_scalar(int64_t arg) const;
   bool is_cpu_scalar(int64_t arg) const;
 
+  // Reads the scalar element of a zero-stride (size-1 broadcast) operand,
+  // converting it from the operand's runtime dtype to T through the dynamic
+  // casting machinery.  Only valid when is_scalar(arg) holds.
+  template <typename T>
+  T scalar_value(int64_t arg) {
+    const auto& op = operands_[arg];
+    return fetch_and_cast<T>(op.current_dtype, op.data);
+  }
+
+  // Returns the scalar value from the operand's original tensor when the
+  // iterator replaced it (e.g. promoted to common dtype): casting a scalar
+  // input down to a Half common dtype may overflow, so the original storage
+  // dtype stays authoritative for scalar folding.  Falls back to
+  // scalar_value when no original tensor is retained.
+  template <typename T>
+  T original_scalar_value(int64_t arg) {
+    const auto& original_tensor = operands_[arg].original_tensor();
+    if (original_tensor.defined()) {
+      TP_CHECK(original_tensor.dtype() != common_dtype(),
+               "original tensor must have a different dtype than common dtype");
+      return fetch_and_cast<T>(original_tensor.dtype(),
+                               original_tensor.data_ptr());
+    } else {
+      return scalar_value<T>(arg);
+    }
+  }
+
   const Tensor& tensor(int64_t arg) const { return operands_[arg].tensor(); }
   Tensor& tensor(int64_t arg) { return operands_[arg].tensor(); }
+  // The TensorBase layer of the reference design collapses to Tensor here;
+  // the _base spellings are kept so call sites match the upstream shape.
+  const Tensor& tensor_base(int64_t arg) const { return tensor(arg); }
   const Tensor& output(int64_t arg = 0) const {
     TP_CHECK(arg < num_outputs_, "output index out of bounds");
     return tensor(arg);
@@ -218,6 +249,7 @@ struct TensorIteratorBase {
         "input index out of bounds");
     return tensor(num_outputs_ + arg);
   }
+  const Tensor& input_base(int64_t arg = 0) const { return input(arg); }
 
   // Copies from temporary outputs back to the original outputs
   // NOTE: only used on CPU
