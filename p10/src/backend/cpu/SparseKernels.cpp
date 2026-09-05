@@ -330,6 +330,43 @@ Tensor embedding_sparse_backward_cpu(const Tensor& grad,
                                           {num_weights, row_size}, coalesced);
 }
 
+namespace {
+
+Tensor coo_to_csr_cpu(const Tensor& coalesced, int64_t rows);
+
+Tensor csr_to_coo_cpu(const Tensor& self) {
+    if (!self.is_sparse_csr() || self.dim() != 2) {
+        TP_THROW(RuntimeError, "CSR to COO conversion requires a 2-D CSR tensor");
+    }
+    Tensor crow = self._crow_indices().contiguous();
+    Tensor col = self._col_indices().contiguous();
+    Tensor values = self._values().contiguous();
+    if (values.dim() != 1) {
+        TP_THROW(RuntimeError,
+                 "CSR to COO conversion does not support hybrid values");
+    }
+    const int64_t rows = self.size(0);
+    const int64_t nnz = values.size(0);
+    if (crow.size(0) != rows + 1 || col.size(0) != nnz) {
+        TP_THROW(RuntimeError, "CSR index buffers do not match the tensor shape");
+    }
+    Tensor indices = Tensor::empty({2, nnz}, DType::Int64, self.device());
+    int64_t* row_data = indices.data_ptr<int64_t>();
+    int64_t* col_data = row_data + nnz;
+    const int64_t* crow_data = crow.data_ptr<int64_t>();
+    const int64_t* source_col_data = col.data_ptr<int64_t>();
+    for (int64_t row = 0; row < rows; ++row) {
+        for (int64_t entry = crow_data[row]; entry < crow_data[row + 1]; ++entry) {
+            row_data[entry] = row;
+        }
+    }
+    std::copy_n(source_col_data, nnz, col_data);
+    return Tensor::make_sparse_coo_tensor(
+        indices, values, static_cast<std::vector<int64_t>>(self.shape()), false);
+}
+
+} // namespace
+
 Tensor to_dense_sparse_cpu(const Tensor& self) {
     if (!self.is_sparse()) return self;
     if (self.is_sparse_csr()) {
@@ -426,6 +463,7 @@ std::vector<int64_t> nonzero_positions(const Tensor& contiguous_self) {
 } // namespace
 
 Tensor to_sparse_coo_cpu(const Tensor& self) {
+    if (self.is_sparse_csr()) return csr_to_coo_cpu(self).coalesce();
     if (self.is_sparse()) return self.coalesce();
     Tensor contiguous_self = self.contiguous();
     const std::vector<int64_t> sizes =
@@ -459,6 +497,10 @@ Tensor to_sparse_csr_cpu(const Tensor& self) {
         TP_THROW(RuntimeError,
                  "to_sparse_csr(): only 2-D input is supported, got " +
                      std::to_string(self.dim()) + "-D");
+    }
+    if (self.is_sparse_csr()) return self;
+    if (self.is_sparse()) {
+        return coo_to_csr_cpu(self.coalesce(), self.size(0));
     }
     Tensor contiguous_self = self.contiguous();
     const int64_t rows = contiguous_self.size(0);
@@ -580,14 +622,20 @@ Tensor sparse_sum_cpu(const Tensor& self, std::optional<std::vector<int64_t>> di
         *dtype != self.dtype()) {
         input = self.to(*dtype);
     }
-    Tensor canonical = input.is_coalesced() ? input : input.coalesce();
+    const bool reduce_all = !dim.has_value() || dim->empty();
+    Tensor canonical;
+    if (input.is_sparse_csr()) {
+        canonical = reduce_all ? input : csr_to_coo_cpu(input).coalesce();
+    } else {
+        canonical = input.is_coalesced() ? input : input.coalesce();
+    }
     if (canonical._values().dim() != 1) {
         TP_THROW(RuntimeError,
                  "sparse_sum(): hybrid COO tensors are not supported");
     }
 
     // No dims (or an empty list): dense sum over all values.
-    if (!dim.has_value() || dim->empty()) {
+    if (reduce_all) {
         return canonical._values().sum();
     }
 
