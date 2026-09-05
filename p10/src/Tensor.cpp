@@ -346,8 +346,8 @@ Tensor Tensor::sparse_mask(const Tensor& mask) const {
     if (is_sparse()) {
         TP_THROW(RuntimeError, "sparse_mask(): self must be dense");
     }
-    if (!mask.is_sparse() || mask.is_sparse_csr()) {
-        TP_THROW(RuntimeError, "sparse_mask(): mask must be sparse COO");
+    if (!mask.is_sparse()) {
+        TP_THROW(RuntimeError, "sparse_mask(): mask must be sparse");
     }
     if (shape() != mask.shape()) {
         TP_THROW(RuntimeError,
