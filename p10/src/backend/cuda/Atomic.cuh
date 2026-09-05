@@ -205,6 +205,21 @@ inline __device__ void gpuAtomicAdd(int16_t* address, int16_t val) {
       address, val, [](int16_t a, int16_t b) { return a + b; });
 }
 
+inline __device__ void gpuAtomicAdd(uint16_t* address, uint16_t val) {
+  AtomicAddIntegerImpl<uint16_t, sizeof(uint16_t)>()(
+      address, val, [](uint16_t a, uint16_t b) { return a + b; });
+}
+
+inline __device__ void gpuAtomicAdd(uint32_t* address, uint32_t val) {
+  AtomicAddIntegerImpl<uint32_t, sizeof(uint32_t)>()(
+      address, val, [](uint32_t a, uint32_t b) { return a + b; });
+}
+
+inline __device__ void gpuAtomicAdd(uint64_t* address, uint64_t val) {
+  AtomicAddIntegerImpl<uint64_t, sizeof(uint64_t)>()(
+      address, val, [](uint64_t a, uint64_t b) { return a + b; });
+}
+
 inline __device__ int32_t gpuAtomicAdd(int32_t* address, int32_t val) {
   return atomicAdd(address, val);
 }
