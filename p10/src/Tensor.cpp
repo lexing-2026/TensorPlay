@@ -13,6 +13,7 @@ namespace ops = tensorplay::tpx::ops;
 #include <iostream>
 #include <cstring>
 #include <sstream>
+#include <limits>
 
 namespace tensorplay {
 
@@ -40,6 +41,44 @@ QuantizerPtr quantizer_on_device(const QuantizerPtr& quantizer,
             TP_THROW(RuntimeError,
                      "cannot move a tensor with an unsupported quantizer");
     }
+}
+
+bool i64_mul_overflow(int64_t lhs, int64_t rhs) {
+    if (lhs == 0 || rhs == 0) return false;
+    if ((lhs == std::numeric_limits<int64_t>::min() && rhs == -1) ||
+        (rhs == std::numeric_limits<int64_t>::min() && lhs == -1)) {
+        return true;
+    }
+    if (lhs > 0) {
+        return rhs > 0
+            ? lhs > std::numeric_limits<int64_t>::max() / rhs
+            : rhs < std::numeric_limits<int64_t>::min() / lhs;
+    }
+    return rhs > 0
+        ? lhs < std::numeric_limits<int64_t>::min() / rhs
+        : lhs < std::numeric_limits<int64_t>::max() / rhs;
+}
+
+int64_t checked_i64_mul(int64_t lhs, int64_t rhs, const char* op) {
+    if (i64_mul_overflow(lhs, rhs)) {
+        TP_THROW(ValueError, op, ": index arithmetic overflow");
+    }
+    return lhs * rhs;
+}
+
+int64_t checked_i64_add(int64_t lhs, int64_t rhs, const char* op) {
+    if ((rhs > 0 && lhs > std::numeric_limits<int64_t>::max() - rhs) ||
+        (rhs < 0 && lhs < std::numeric_limits<int64_t>::min() - rhs)) {
+        TP_THROW(ValueError, op, ": index arithmetic overflow");
+    }
+    return lhs + rhs;
+}
+
+int64_t storage_offset_i64(size_t offset, const char* op) {
+    if (offset > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+        TP_THROW(ValueError, op, ": storage offset overflow");
+    }
+    return static_cast<int64_t>(offset);
 }
 
 } // namespace
@@ -815,8 +854,11 @@ Tensor Tensor::select(int64_t dim, int64_t index) const {
 
     std::vector<int64_t> new_sizes = static_cast<std::vector<int64_t>>(shape());
     std::vector<int64_t> new_strides = strides();
-    const size_t new_offset = impl_->storage_offset() +
-        static_cast<size_t>(index * new_strides[static_cast<size_t>(dim)]);
+    const int64_t offset_delta = checked_i64_mul(
+        index, new_strides[static_cast<size_t>(dim)], "select");
+    const int64_t new_offset = checked_i64_add(
+        storage_offset_i64(impl_->storage_offset(), "select"),
+        offset_delta, "select");
     new_sizes.erase(new_sizes.begin() + dim);
     new_strides.erase(new_strides.begin() + dim);
     return as_strided(new_sizes, new_strides, static_cast<int64_t>(new_offset));
@@ -842,16 +884,19 @@ Tensor Tensor::slice(int64_t dim, int64_t start, int64_t end, int64_t step) cons
     if (end > size_dim) end = size_dim;
     if (step <= 0) TP_THROW(ValueError, "Step must be positive");
     
-    int64_t new_len = (end - start + step - 1) / step;
-    if (new_len < 0) new_len = 0;
+    const int64_t length = end - start;
+    const int64_t new_len = length == 0 ? 0 : (length - 1) / step + 1;
     
     std::vector<int64_t> new_sizes = static_cast<std::vector<int64_t>>(shape());
     std::vector<int64_t> new_strides = strides();
     
     new_sizes[dim] = new_len;
-    new_strides[dim] *= step;
-    
-    size_t new_offset = impl_->storage_offset() + start * stride(dim);
+    new_strides[dim] = checked_i64_mul(new_strides[dim], step, "slice");
+
+    const int64_t offset_delta = checked_i64_mul(start, stride(dim), "slice");
+    const int64_t new_offset = checked_i64_add(
+        storage_offset_i64(impl_->storage_offset(), "slice"),
+        offset_delta, "slice");
     
     return as_strided(new_sizes, new_strides, new_offset);
 }
