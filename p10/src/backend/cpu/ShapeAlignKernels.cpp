@@ -15,7 +15,9 @@
 #include "tensorplay/ops/TensorRedispatchGenerated.h"
 
 #include <algorithm>
+#include <limits>
 #include <numeric>
+#include <string>
 #include <vector>
 
 namespace tensorplay {
@@ -184,6 +186,28 @@ Tensor tpsa_broadcast_to(const Tensor& self, const std::vector<int64_t>& size) {
 
 namespace {
 
+int64_t checked_repeat_extent(int64_t source, int64_t repeat) {
+    if (repeat < 0) {
+        TP_THROW(RuntimeError, "repeat: repeats must be non-negative");
+    }
+    if (source == 0 || repeat == 0) return 0;
+    if (source > std::numeric_limits<int64_t>::max() / repeat) {
+        TP_THROW(RuntimeError, "repeat: resulting dimension is too large");
+    }
+    return source * repeat;
+}
+
+void check_repeat_numel(const std::vector<int64_t>& target) {
+    int64_t total = 1;
+    for (const int64_t extent : target) {
+        if (extent == 0) return;
+        if (total > std::numeric_limits<int64_t>::max() / extent) {
+            TP_THROW(RuntimeError, "repeat: resulting tensor is too large");
+        }
+        total *= extent;
+    }
+}
+
 void check_repeat_args(const Tensor& self, const std::vector<int64_t>& repeats,
                        std::vector<int64_t>& padded, std::vector<int64_t>& padded_strides,
                        std::vector<int64_t>& target, bool& zero) {
@@ -203,21 +227,9 @@ void check_repeat_args(const Tensor& self, const std::vector<int64_t>& repeats,
     target.resize(out_nd);
     for (int64_t i = 0; i < out_nd; ++i) {
         zero = zero || repeats[i] == 0;
-        target[i] = padded[i] * repeats[i];
+        target[i] = checked_repeat_extent(padded[i], repeats[i]);
     }
-    // Negative repeats surface through the output allocation exactly like
-    for (const int64_t x : target) {
-        if (x < 0) {
-            std::string sizes = "[";
-            for (size_t i = 0; i < target.size(); ++i) {
-                if (i) sizes += ", ";
-                sizes += std::to_string(target[i]);
-            }
-            sizes += "]";
-            TP_THROW(RuntimeError, "Trying to create tensor with negative dimension ",
-                     x, ": ", sizes);
-        }
-    }
+    check_repeat_numel(target);
 }
 
 } // anonymous namespace
