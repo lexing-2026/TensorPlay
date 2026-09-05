@@ -1075,6 +1075,294 @@ def _lower_cpu_fused_pointwise(
     )
 
 
+# Reduction spellings the fused CPU reduction path recognizes.  ``max``/``min``
+# are accepted only in their whole-tensor form: with a dimension they return a
+# value/index pair, which is a different lowering contract.
+_REDUCTION_METHODS = frozenset(
+    {"sum", "mean", "prod", "max", "min", "amax", "amin"}
+)
+_DIMLESS_ONLY_REDUCTIONS = frozenset({"max", "min"})
+_DIM_ONLY_REDUCTIONS = frozenset({"amax", "amin"})
+
+
+def _reduction_dtype_ok(value: Any) -> bool:
+    """Whether a reduction's ``dtype`` argument keeps the float32 contract."""
+
+    if value is None:
+        return True
+    import tensorplay
+
+    if value is tensorplay.float32:
+        return True
+    # The captured call carries the sentinel that means "keep the input
+    # dtype"; the route already pinned float32 inputs.
+    return str(value).rsplit(".", 1)[-1].lower() == "undefined"
+
+
+def _parse_reduction(node: Node, rank: int) -> Any:
+    """Read one reduction node into a :class:`ReduceSpec`, or ``None``.
+
+    Positional and keyword spellings both resolve here: the trailing
+    positional arguments of a reduction are ``dim``, ``keepdim``, ``dtype``
+    in that order.
+    """
+
+    from .codegen.cpp_reduction import ReduceSpec
+
+    if node.op not in {"call_function", "call_method"}:
+        return None
+    name = _target_name(node.target)
+    if name not in _REDUCTION_METHODS:
+        return None
+    args = list(node.args)
+    if not args or not isinstance(args[0], Node):
+        return None
+    rest = args[1:]
+    kwargs = dict(node.kwargs or {})
+    if len(rest) > 3:
+        return None
+    dim: Any = None
+    keepdim: Any = False
+    if len(rest) >= 1:
+        dim = rest[0]
+    if len(rest) >= 2:
+        keepdim = rest[1]
+    if len(rest) >= 3 and not _reduction_dtype_ok(rest[2]):
+        return None
+    if "dim" in kwargs:
+        if dim is not None:
+            return None
+        dim = kwargs.pop("dim")
+    if "keepdim" in kwargs:
+        if len(rest) >= 2:
+            return None
+        keepdim = kwargs.pop("keepdim")
+    if "dtype" in kwargs and not _reduction_dtype_ok(kwargs.pop("dtype")):
+        return None
+    if kwargs:
+        return None
+    if not isinstance(keepdim, bool):
+        return None
+
+    if dim is None:
+        if name in _DIM_ONLY_REDUCTIONS:
+            return None
+        return ReduceSpec(name, tuple(range(rank)), False)
+    if name in _DIMLESS_ONLY_REDUCTIONS:
+        return None
+    if isinstance(dim, bool):
+        return None
+    if isinstance(dim, int):
+        dims: tuple[int, ...] = (int(dim),)
+    elif isinstance(dim, (tuple, list)) and dim and all(
+        isinstance(item, int) and not isinstance(item, bool) for item in dim
+    ):
+        dims = tuple(int(item) for item in dim)
+    else:
+        return None
+    return ReduceSpec(name, dims, keepdim)
+
+
+class _CpuFusedReductionLowering:
+    """Executable wrapper for Stax's fused CPU reduction kernel.
+
+    The kernel owns the whole region: it evaluates the pointwise expression
+    and the reduction in one pass, allocates its own output, and returns the
+    wrapped tensor, so the steady-state call never builds an intermediate.
+    """
+
+    def __init__(
+        self,
+        graph_module: GraphModule,
+        expected_dtype: Any,
+        expected_device: Any,
+        expected_layouts: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...],
+        native_runner: Any,
+        native_direct: int,
+        out_shape: tuple[int, ...],
+        strict_native: bool = False,
+    ) -> None:
+        self.graph_module = graph_module
+        # No interpreter-executable graph backs this region: the compiled
+        # kernel is the only route, and the route check below guarantees the
+        # inputs it was specialized for.
+        self.graph = None
+        self.placeholders = graph_module.graph.placeholders
+        self.attribute_targets: list[str] = []
+        self.constant_values: list[Any] = []
+        self.native_values: dict[Node, Any] = {}
+        self._output_count = 1
+        self._public_output_count = 1
+        self._output_spec = None
+        self._tensorplay_codegen = "stax-fused-cpu-reduce"
+        self._expected_dtype = expected_dtype
+        self._expected_device = expected_device
+        self._expected_layouts = expected_layouts
+        self._out_shape = out_shape
+        self._strict_native = strict_native
+        self._native_runner = native_runner
+        self._native_direct = int(native_direct) if native_direct else 0
+        self._route_fp: tuple[Any, ...] | None = None
+        self._route: str | None = None
+        _attach_fast_call(self, exec_fn=native_runner)
+
+    def _resolve_route(self, inputs: list[Any]) -> str:
+        if not _CpuFusedPointwiseLowering._eligible_inputs(
+            inputs,
+            (),
+            self._expected_dtype,
+            self._expected_device,
+            self._expected_layouts,
+        ):
+            return "fallback"
+        if any(getattr(value, "requires_grad", False) for value in inputs):
+            # Reverse mode over a fused reduction is not part of this
+            # lowering's contract; a grad-carrying call re-lowers.
+            return "fallback"
+        return "native"
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if not kwargs and len(args) == len(self.placeholders):
+            inputs = list(args)
+        else:
+            bound = self.graph_module.signature.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            inputs = [
+                bound.arguments[
+                    node.target if isinstance(node.target, str) else node.name
+                ]
+                for node in self.placeholders
+            ]
+        fp = tuple(
+            _CpuFusedPointwiseLowering._input_route_fingerprint(value)
+            for value in inputs
+        )
+        if fp != self._route_fp:
+            self._route = self._resolve_route(inputs)
+            self._route_fp = fp
+        if self._route == "fallback":
+            raise RuntimeError(
+                "Stax fused CPU reduction received inputs outside its "
+                "compiled specialization"
+            )
+        return self._native_runner(inputs)
+
+
+def _lower_cpu_fused_reduction(
+    graph_module: GraphModule,
+    example_inputs: list[Any],
+    *,
+    strict_native: bool = False,
+    dynamic: bool = False,
+) -> _CpuFusedReductionLowering | None:
+    """Build one fused CPU kernel for a pointwise region ending in a reduction.
+
+    The region's single output must be a reduction whose operand is used
+    nowhere else, so folding it into the reduction loop cannot change what any
+    other node observes.  Everything upstream of the reduction is encoded as
+    the same expression program the pointwise path uses.
+    """
+
+    if dynamic:
+        return None
+    try:
+        import tensorplay
+
+        tensor_type = tensorplay.Tensor
+    except (AttributeError, ImportError):
+        return None
+    if not example_inputs or any(
+        not isinstance(value, tensor_type) for value in example_inputs
+    ):
+        return None
+    first = example_inputs[0]
+    if (
+        not first.device.is_cpu()
+        or first.dtype != tensorplay.float32
+        or not first.is_contiguous()
+    ):
+        return None
+    if any(
+        value.device != first.device or value.dtype != first.dtype
+        for value in example_inputs[1:]
+    ):
+        return None
+    if any(value.requires_grad for value in example_inputs):
+        return None
+
+    input_shapes = tuple(
+        tuple(int(item) for item in value.shape) for value in example_inputs
+    )
+    input_strides = tuple(
+        tuple(int(item) for item in value.stride()) for value in example_inputs
+    )
+    in_shape = _broadcast_shape(input_shapes)
+    if in_shape is None or not in_shape:
+        return None
+
+    output_values = [
+        value
+        for output in graph_module.graph.outputs
+        for value in _nodes(output.args)
+    ]
+    if len(output_values) != 1 or not isinstance(output_values[0], Node):
+        return None
+    reduce_node = output_values[0]
+    spec = _parse_reduction(reduce_node, len(in_shape))
+    if spec is None:
+        return None
+    source = reduce_node.args[0]
+    if not isinstance(source, Node) or len(source.users) != 1:
+        return None
+
+    try:
+        pointwise = _build_pointwise_program(
+            graph_module,
+            skip_node=reduce_node,
+            output_override=source,
+            allow_empty=True,
+            opcodes=_TRITON_OPCODES,
+        )
+    except (TypeError, ValueError, RuntimeError):
+        return None
+    if pointwise is None:
+        return None
+    external_nodes, _program, constants, instructions, output_ref = pointwise
+    if len(external_nodes) != len(example_inputs):
+        return None
+
+    try:
+        from .codegen.cpp_reduction import build_cpu_reduction_kernel
+
+        built = build_cpu_reduction_kernel(
+            instructions,
+            constants,
+            len(external_nodes),
+            output_ref,
+            spec,
+            in_shape=in_shape,
+            device=first.device,
+            input_shapes=input_shapes,
+            input_strides=input_strides,
+        )
+    except Exception:
+        built = None
+    if built is None:
+        return None
+    runner, direct, out_shape = built
+
+    return _CpuFusedReductionLowering(
+        graph_module,
+        first.dtype,
+        first.device,
+        tuple(zip(input_shapes, input_strides)),
+        runner,
+        direct,
+        out_shape,
+        strict_native,
+    )
+
+
 def _build_fused_gradient_graphs(
     input_count: int,
     instructions: list[tuple[str, int, int, int]],
@@ -2969,6 +3257,17 @@ def stax(
         if fused_cpu_graph is not None:
             graph_module._stax_native_graph = fused_cpu_graph.graph
             return fused_cpu_graph
+        # A region whose tail is a reduction folds the whole expression into
+        # the reduction loop: one pass over the input, no intermediate.
+        fused_cpu_reduction = _lower_cpu_fused_reduction(
+            graph_module,
+            example_inputs,
+            strict_native=strict_native,
+            dynamic=bool(dynamic is True),
+        )
+        if fused_cpu_reduction is not None:
+            graph_module._stax_codegen = "stax-fused-cpu-reduce"
+            return fused_cpu_reduction
     if use_native and use_triton:
         # Keep Triton optional and lazy.  Importing tensorplay on a CPU-only
         # machine must not import Triton or its compiler toolchain.

@@ -254,6 +254,8 @@ def _analyze_instructions(
     constants: list[float],
     input_count: int,
     output_ref: int | None = None,
+    *,
+    allow_empty: bool = False,
 ) -> set[int]:
     """Validate the instruction list and return the referenced input set.
 
@@ -263,7 +265,11 @@ def _analyze_instructions(
     appear as an adjacent pair sharing the condition ref.
     """
 
-    if not instructions or input_count <= 0 or input_count > _MAX_INPUTS:
+    if input_count <= 0 or input_count > _MAX_INPUTS:
+        raise _ProgramError("degenerate program")
+    if not instructions and not allow_empty:
+        # A pointwise kernel with no instruction would only copy an input;
+        # reduction kernels legitimately reduce a raw input, so they opt in.
         raise _ProgramError("degenerate program")
     temp_count = len(instructions)
     used: set[int] = set()
@@ -464,6 +470,81 @@ def _emit_body(
         emit_steps(0)
         emit_store(0)
     return "\n".join(lines)
+
+
+def emit_value_program(
+    instructions: list[tuple[str, int, int, int]],
+    constants: list[float],
+    input_count: int,
+    output_ref: int,
+    used_inputs: set[int],
+    *,
+    indent: str,
+    offset: str,
+    count_expr: str,
+    suffix: str,
+    input_modes: tuple[InputMode, ...],
+) -> tuple[list[str], str]:
+    """Emit one vector evaluation of the program and name its result.
+
+    ``offset`` is a C expression for the flat element index addressed by lane
+    0 of this vector; ``count_expr`` is the active lane count (``W`` for a
+    full vector, a runtime ``count`` for a masked tail).  ``suffix``
+    disambiguates the temporaries of independent evaluations that coexist in
+    one scope, which is how the unrolled accumulator groups keep separate
+    dependency chains.  ``splat`` inputs resolve to the hoisted broadcast and
+    are not reloaded.
+
+    Returns the emitted lines and the identifier holding the program result,
+    so a caller can feed it straight into an accumulator combine instead of
+    storing it.
+    """
+
+    lines: list[str] = []
+
+    def name(ref: int) -> str:
+        if ref < input_count:
+            if input_modes[ref][0] == "splat":
+                return f"h{ref}"
+            return f"x{ref}{suffix}"
+        return f"t{ref - input_count}{suffix}"
+
+    for ref in sorted(used_inputs):
+        mode, width = input_modes[ref]
+        if mode == "splat":
+            continue
+        if mode == "colmod":
+            address = f"in{ref} + (({offset}) % {width})"
+        else:
+            address = f"in{ref} + ({offset})"
+        lines.append(f"{indent}V {name(ref)} = V::loadu({address}, {count_expr});")
+
+    pending_where: tuple[int, str] | None = None
+    for op, lhs, rhs, result in instructions:
+        if op == "where":
+            pending_where = (
+                result,
+                _operand_expr(rhs, constants, input_count, name),
+            )
+            continue
+        if op == "where_rest":
+            if pending_where is None:  # pragma: no cover - guarded by analysis
+                raise _ProgramError("where_rest without where")
+            where_result, a_expr = pending_where
+            cond_expr = _operand_expr(lhs, constants, input_count, name)
+            b_expr = _operand_expr(rhs, constants, input_count, name)
+            lines.append(f"{indent}V {name(where_result)} = {a_expr};")
+            lines.append(
+                f"{indent}V {name(result)} = V::blendv("
+                f"{b_expr}, {a_expr}, ({cond_expr} > V(0.0f)));"
+            )
+            pending_where = None
+            continue
+        expr = _expr_for(op, lhs, rhs, constants, input_count, name)
+        lines.append(f"{indent}V {name(result)} = {expr};")
+    if pending_where is not None:  # pragma: no cover - guarded by analysis
+        raise _ProgramError("where without where_rest")
+    return lines, name(output_ref)
 
 
 def render_kernel_source(
@@ -787,6 +868,108 @@ def _kill_switch() -> bool:
     return os.environ.get("TP_STAX_CPU_NATIVE", "") == "0"
 
 
+def compile_translation_unit(
+    source: str,
+    entry: str,
+    *,
+    isa: VecISA,
+    paths: tuple[str, str, str],
+    compiler: str,
+    version_info: str,
+    pinned: bool,
+    bind_tag: str,
+) -> Any:
+    """Build one generated translation unit and return the loaded library.
+
+    The unit is keyed by its own text plus the toolchain fingerprint, written
+    once under the shared kernel cache, and loaded through a process-level
+    handle table so repeated lowerings of the same program reuse one
+    ``dlopen``.  ``pinned`` selects the link set: units that allocate their
+    own output tensor and wrap it for the interpreter additionally need the
+    Python bridge library.  Returns ``None`` when the toolchain, the build,
+    or the load fails -- every caller keeps a working non-generated route.
+    """
+
+    include_dir, generated_include_dir, lib_dir = paths
+    cache = default_cache("stax-cpu-native")
+    key_options = {
+        "tier": isa.name,
+        "flags": " ".join(isa.build_arch_flags()),
+        "ver": version_info[:32],
+        "entry": entry,
+        "bind": bind_tag,
+    }
+    key = cache.cache_key(source, entry, key_options)
+    source_path = cache.path_for(key, "cpp")
+    output_path = cache.path_for(key, "so")
+
+    if not os.path.exists(output_path):
+        try:
+            import sysconfig
+
+            python_include = sysconfig.get_paths()["include"]
+            generated_ops_include = os.path.join(
+                os.path.dirname(generated_include_dir), "generated"
+            )
+            os.makedirs(os.path.dirname(source_path), exist_ok=True)
+            with file_lock(output_path + ".lock"):
+                if not os.path.exists(output_path):
+                    with open(source_path, "w") as fh:
+                        fh.write(source)
+                    include_dirs = [
+                        include_dir,
+                        generated_include_dir,
+                        python_include,
+                    ]
+                    if os.path.isdir(generated_ops_include):
+                        # Tensor.h pulls the generated op declarations when
+                        # the runtime headers are present.
+                        include_dirs.append(generated_ops_include)
+                    options = CppOptions(
+                        compiler=compiler,
+                        definitions=isa.definitions(),
+                        include_dirs=include_dirs,
+                        cflags=[
+                            "-std=c++20",
+                            "-O3",
+                            "-fno-math-errno",
+                            "-fPIC",
+                            "-shared",
+                            *isa.build_arch_flags(),
+                        ],
+                        library_dirs=[lib_dir],
+                        # ``tpx`` must stay on the link line: libp10 carries
+                        # undefined references into the tpx ops namespace,
+                        # and a kernel module that omits it fails to dlopen
+                        # under RTLD_LOCAL (then silently loses the compiled
+                        # route to the interpreter fallback).
+                        libraries=["p10", "tpx", "tp_python"]
+                        if pinned
+                        else ["p10", "tpx"],
+                        ldflags=[f"-Wl,-rpath,{lib_dir}"],
+                    )
+                    builder = CppBuilder(
+                        name=os.path.basename(output_path),
+                        sources=[source_path],
+                        options=options,
+                        output_dir=os.path.dirname(source_path),
+                    )
+                    builder.build()
+        except Exception:
+            if not os.path.exists(output_path):
+                return None
+
+    libs = _LIBS_STATE.setdefault("libs", {})
+    lib = libs.get(output_path)
+    if lib is None:
+        try:
+            lib = ctypes.CDLL(output_path)
+        except Exception:
+            return None
+        libs[output_path] = lib
+    return lib
+
+
 def _digest_entry_key(
     instructions,
     constants,
@@ -913,85 +1096,18 @@ def build_cpu_native_kernel(
     )
     pinned = pinned_shape is not None and out_device_code is not None
 
-    cache = default_cache("stax-cpu-native")
-    key_options = {
-        "tier": isa.name,
-        "flags": " ".join(isa.build_arch_flags()),
-        "ver": version_info[:32],
-        "entry": entry,
-        "bind": "plan-v2" if pinned else "py",
-    }
-    key = cache.cache_key(source, entry, key_options)
-    source_path = cache.path_for(key, "cpp")
-    output_path = cache.path_for(key, "so")
-
-    if not os.path.exists(output_path):
-        try:
-            import sysconfig
-
-            python_include = sysconfig.get_paths()["include"]
-            generated_ops_include = os.path.join(
-                os.path.dirname(generated_include_dir), "generated"
-            )
-            os.makedirs(os.path.dirname(source_path), exist_ok=True)
-            with file_lock(output_path + ".lock"):
-                if not os.path.exists(output_path):
-                    with open(source_path, "w") as fh:
-                        fh.write(source)
-                    include_dirs = [
-                        include_dir,
-                        generated_include_dir,
-                        python_include,
-                    ]
-                    if os.path.isdir(generated_ops_include):
-                        # Tensor.h pulls the generated op declarations when
-                        # the runtime headers are present.
-                        include_dirs.append(generated_ops_include)
-                    options = CppOptions(
-                        compiler=compiler,
-                        definitions=isa.definitions(),
-                        include_dirs=include_dirs,
-                        cflags=[
-                            "-std=c++20",
-                            "-O3",
-                            "-fno-math-errno",
-                            "-fPIC",
-                            "-shared",
-                            *isa.build_arch_flags(),
-                        ],
-                        library_dirs=[lib_dir],
-                        # ``tpx`` must stay on the link line: libp10 carries
-                        # undefined references into the tpx ops namespace,
-                        # and a kernel module that omits it fails to dlopen
-                        # under RTLD_LOCAL (then silently loses the compiled
-                        # route to the interpreter fallback).
-                        libraries=["p10", "tpx", "tp_python"]
-                        if pinned
-                        else ["p10", "tpx"],
-                        ldflags=[f"-Wl,-rpath,{lib_dir}"],
-                    )
-                    builder = CppBuilder(
-                        name=os.path.basename(output_path),
-                        sources=[source_path],
-                        options=options,
-                        output_dir=os.path.dirname(source_path),
-                    )
-                    # Transient toolchain failures (fork/OOM pressure under
-                    # heavy load) get one retry before the region demotes to
-                    # the interpreter path.
-                    builder.build()
-        except Exception:
-            if not os.path.exists(output_path):
-                return None
-
-    libs = _LIBS_STATE.setdefault("libs", {})
-    lib = libs.get(output_path)
+    lib = compile_translation_unit(
+        source,
+        entry,
+        isa=isa,
+        paths=paths,
+        compiler=compiler,
+        version_info=version_info,
+        pinned=pinned,
+        bind_tag="plan-v2" if pinned else "py",
+    )
     if lib is None:
-        try:
-            lib = ctypes.CDLL(output_path)
-        except Exception:
-            return None
-        libs[output_path] = lib
+        return None
     fn = getattr(lib, entry, None)
     if fn is None:
         return None
