@@ -26,6 +26,26 @@ struct OpMathType<BFloat16> {
     using type = float;
 };
 template <>
+struct OpMathType<Float8_e4m3fn> {
+    using type = float;
+};
+template <>
+struct OpMathType<Float8_e5m2> {
+    using type = float;
+};
+template <>
+struct OpMathType<Float8_e4m3fnuz> {
+    using type = float;
+};
+template <>
+struct OpMathType<Float8_e5m2fnuz> {
+    using type = float;
+};
+template <>
+struct OpMathType<Float8_e8m0fnu> {
+    using type = float;
+};
+template <>
 struct OpMathType<std::complex<Half>> {
     using type = std::complex<float>;
 };

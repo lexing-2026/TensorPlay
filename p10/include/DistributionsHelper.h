@@ -10,6 +10,7 @@
 
 #include "BFloat16.h"
 #include "Half.h"
+#include "OpMathType.h"
 
 namespace tensorplay {
 
@@ -34,12 +35,6 @@ struct DistMantissaBits {
 };
 template <> struct DistMantissaBits<Half> { static constexpr int value = 11; };
 template <> struct DistMantissaBits<BFloat16> { static constexpr int value = 8; };
-
-// Computation precision for a storage dtype: Half/BFloat16 sample in float
-template <typename T>
-struct OpMathType { using type = T; };
-template <> struct OpMathType<Half> { using type = float; };
-template <> struct OpMathType<BFloat16> { using type = float; };
 
 template <typename T>
 using opmath_t = typename OpMathType<T>::type;
