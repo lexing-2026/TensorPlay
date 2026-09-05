@@ -12,6 +12,7 @@
 #include <tuple>
 #include <vector>
 #include <algorithm>
+#include <complex>
 #include <numeric>
 #include <cstring>
 #include <limits>
@@ -195,6 +196,30 @@ inline void cum_base(ctype* d, const ctype* s, int64_t d_size, int64_t outer,
     });
 }
 
+template <typename ComplexT, bool Product>
+Tensor complex_scan_cpu(const Tensor& src, int64_t dim) {
+    Tensor result = Tensor::empty(
+        static_cast<std::vector<int64_t>>(src.shape()),
+        src.dtype(), src.device());
+    const int64_t d_size = src.size(dim);
+    if (d_size == 0 || src.numel() == 0) return result;
+    int64_t outer = 1;
+    int64_t inner = 1;
+    outer_inner(static_cast<std::vector<int64_t>>(src.shape()), dim, outer, inner);
+    if constexpr (Product) {
+        cum_base<ComplexT, ComplexT>(
+            result.data_ptr<ComplexT>(), src.data_ptr<ComplexT>(),
+            d_size, outer, inner, ComplexT(1, 0),
+            [](ComplexT a, ComplexT x) { return a * x; });
+    } else {
+        cum_base<ComplexT, ComplexT>(
+            result.data_ptr<ComplexT>(), src.data_ptr<ComplexT>(),
+            d_size, outer, inner, ComplexT(0, 0),
+            [](ComplexT a, ComplexT x) { return a + x; });
+    }
+    return result;
+}
+
 Tensor cumsum_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
     int64_t nd = self.dim();
     if (nd == 0) TP_THROW(RuntimeError, "cumsum: dimension not supported for scalar tensors");
@@ -202,6 +227,17 @@ Tensor cumsum_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
     DType out_dtype = dtype.value_or(isIntegralType(self.dtype(), true) ? DType::Int64
                                                                          : self.dtype());
     Tensor src = (self.dtype() == out_dtype) ? self.contiguous() : self.to(out_dtype).contiguous();
+    if (isComplexType(out_dtype)) {
+        const DType compute_dtype =
+            out_dtype == DType::ComplexDouble ? DType::ComplexDouble : DType::ComplexFloat;
+        Tensor compute_src = src.dtype() == compute_dtype ? src : src.to(compute_dtype);
+        if (compute_dtype == DType::ComplexDouble) {
+            return complex_scan_cpu<std::complex<double>, false>(compute_src, dim)
+                .to(out_dtype);
+        }
+        return complex_scan_cpu<std::complex<float>, false>(compute_src, dim)
+            .to(out_dtype);
+    }
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(src.shape()), out_dtype, src.device());
     int64_t d_size = src.size(dim);
     if (d_size == 0 || src.numel() == 0) return result;
@@ -246,6 +282,17 @@ Tensor cumprod_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) 
     DType out_dtype = dtype.value_or(isIntegralType(self.dtype(), true) ? DType::Int64
                                                                          : self.dtype());
     Tensor src = (self.dtype() == out_dtype) ? self.contiguous() : self.to(out_dtype).contiguous();
+    if (isComplexType(out_dtype)) {
+        const DType compute_dtype =
+            out_dtype == DType::ComplexDouble ? DType::ComplexDouble : DType::ComplexFloat;
+        Tensor compute_src = src.dtype() == compute_dtype ? src : src.to(compute_dtype);
+        if (compute_dtype == DType::ComplexDouble) {
+            return complex_scan_cpu<std::complex<double>, true>(compute_src, dim)
+                .to(out_dtype);
+        }
+        return complex_scan_cpu<std::complex<float>, true>(compute_src, dim)
+            .to(out_dtype);
+    }
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(src.shape()), out_dtype, src.device());
     int64_t d_size = src.size(dim);
     if (d_size == 0 || src.numel() == 0) return result;
