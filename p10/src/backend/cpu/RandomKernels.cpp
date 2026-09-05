@@ -384,24 +384,41 @@ Tensor bernoulli_p_kernel(const Tensor& self, double p,
 }
 
 Tensor normal_kernel(const Tensor& mean, const Tensor& std) {
-    if (mean.shape() != std.shape()) {
-        TP_THROW(RuntimeError, "normal: mean and std must have same size (broadcasting not implemented yet)");
-    }
-    Tensor out(static_cast<std::vector<int64_t>>(mean.shape()), mean.dtype(), mean.device());
-    auto& gen = default_generator();
     if (mean.dtype() != std.dtype()) {
         TP_THROW(RuntimeError, "normal: mean and std must have the same dtype");
     }
 
+    const std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(mean.shape()),
+        static_cast<std::vector<int64_t>>(std.shape()));
+    Tensor out(out_shape, mean.dtype(), mean.device());
+    if (out.numel() == 0) {
+        return out;
+    }
+
+    Tensor mean_broadcast = mean.expand(out_shape).contiguous();
+    Tensor std_broadcast = std.expand(out_shape).contiguous();
+
     dispatch_floating(mean.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);
         scalar_t* out_data = out.data_ptr<scalar_t>();
-        int64_t k = 0;
-        for_each_element_pair<scalar_t>(mean, std, [&](const scalar_t& m, const scalar_t& s) {
-            normal_distribution<double> dist(static_cast<double>(m),
-                                             static_cast<double>(s));
-            out_data[k++] = static_cast<scalar_t>(dist(&gen));
-        });
+        const scalar_t* mean_data = mean_broadcast.data_ptr<scalar_t>();
+        const scalar_t* std_data = std_broadcast.data_ptr<scalar_t>();
+        const int64_t n = out.numel();
+
+        for (int64_t i = 0; i < n; ++i) {
+            const double std_value = static_cast<double>(std_data[i]);
+            if (!(std_value >= 0.0)) {
+                TP_THROW(RuntimeError, "normal: standard deviation must be non-negative");
+            }
+        }
+
+        auto& gen = default_generator();
+        for (int64_t i = 0; i < n; ++i) {
+            normal_distribution<double> dist(static_cast<double>(mean_data[i]),
+                                             static_cast<double>(std_data[i]));
+            out_data[i] = static_cast<scalar_t>(dist(&gen));
+        }
     });
     return out;
 }
