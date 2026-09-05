@@ -490,6 +490,13 @@ Tensor sum_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool 
     }
     Tensor input = self.dtype() == out_dtype ? self : self.to(out_dtype);
     const ReductionSpec spec = make_reduction_spec(input, dim);
+    if (input.dtype() == DType::ComplexHalf || input.dtype() == DType::BComplex32) {
+        Tensor promoted = input.to(DType::ComplexFloat);
+        const ReductionSpec promoted_spec = make_reduction_spec(promoted, dim);
+        Tensor reduced = sum_same_dtype<thrust::complex<float>>(
+            promoted, promoted_spec, keepdim, DType::ComplexFloat);
+        return reduced.to(out_dtype);
+    }
     // Complex accumulates in its own width via the generic ops (+ only).
     if (input.dtype() == DType::ComplexFloat) {
         return sum_same_dtype<thrust::complex<float>>(input, spec, keepdim, out_dtype);
@@ -510,8 +517,7 @@ Tensor mean_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool
     if (out_dtype == DType::Undefined) {
         out_dtype = isFloatingOrComplexType(self.dtype()) ? self.dtype() : DType::Float32;
     }
-    if (self.dtype() == DType::ComplexFloat ||
-        self.dtype() == DType::ComplexDouble) {
+    if (isComplexType(self.dtype())) {
         // mean = sum * (1/n); MeanOps' host-side factor path is real-only.
         Tensor s = sum_dim_kernel(self, dim, keepdim, out_dtype);
         int64_t count = 1;
@@ -523,23 +529,32 @@ Tensor mean_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool
                 count *= self.size(dd);
             }
         }
-        count = std::max<int64_t>(1, count);
+        if (count <= 0) {
+            return Tensor::full(
+                static_cast<std::vector<int64_t>>(s.shape()),
+                Scalar(std::numeric_limits<double>::quiet_NaN()),
+                out_dtype, self.device());
+        }
+        const bool reduced_output =
+            out_dtype == DType::ComplexHalf || out_dtype == DType::BComplex32;
+        Tensor scaled = reduced_output ? s.to(DType::ComplexFloat) : s;
+        if (scaled.numel() == 0) return s;
         auto stream = getCurrentCUDAStream().stream();
-        int64_t n = s.numel();
+        int64_t n = scaled.numel();
         dim3 grid((unsigned)((n + 255) / 256)), block(256);
-        if (out_dtype == DType::ComplexFloat) {
+        if (scaled.dtype() == DType::ComplexFloat) {
             scale_complex_kernel<float><<<grid, block, 0, stream>>>(
-                n, static_cast<const thrust::complex<float>*>(s.data_ptr()),
+                n, static_cast<const thrust::complex<float>*>(scaled.data_ptr()),
                 thrust::complex<float>(static_cast<float>(1.0 / count)),
-                static_cast<thrust::complex<float>*>(s.data_ptr()));
+                static_cast<thrust::complex<float>*>(scaled.data_ptr()));
         } else {
             scale_complex_kernel<double><<<grid, block, 0, stream>>>(
-                n, static_cast<const thrust::complex<double>*>(s.data_ptr()),
+                n, static_cast<const thrust::complex<double>*>(scaled.data_ptr()),
                 thrust::complex<double>(1.0 / static_cast<double>(count)),
-                static_cast<thrust::complex<double>*>(s.data_ptr()));
+                static_cast<thrust::complex<double>*>(scaled.data_ptr()));
         }
         CUDA_CHECK(cudaGetLastError());
-        return s;
+        return reduced_output ? scaled.to(out_dtype) : scaled;
     }
     Tensor input = self.dtype() == out_dtype ? self : self.to(out_dtype);
     const ReductionSpec spec = make_reduction_spec(input, dim);
@@ -605,6 +620,13 @@ Tensor prod_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool
     }
     Tensor input = self.dtype() == out_dtype ? self : self.to(out_dtype);
     const ReductionSpec spec = make_reduction_spec(input, dim);
+    if (input.dtype() == DType::ComplexHalf || input.dtype() == DType::BComplex32) {
+        Tensor promoted = input.to(DType::ComplexFloat);
+        const ReductionSpec promoted_spec = make_reduction_spec(promoted, dim);
+        Tensor reduced = prod_same_dtype<thrust::complex<float>>(
+            promoted, promoted_spec, keepdim, DType::ComplexFloat);
+        return reduced.to(out_dtype);
+    }
     if (input.dtype() == DType::ComplexFloat) {
         return prod_same_dtype<thrust::complex<float>>(input, spec, keepdim, out_dtype);
     }
@@ -998,7 +1020,7 @@ Tensor var_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, int64
         Tensor diff = self - mean;
         Tensor sum_sq = diff.abs().pow(Scalar(2)).sum(dim, keepdim);
         std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(self.shape());
-        int64_t n = 1;
+        int64_t n = dim.empty() ? self.numel() : 1;
         for (int64_t d : dim) {
             if (d < 0) d += shape.size();
             n *= shape[d];
