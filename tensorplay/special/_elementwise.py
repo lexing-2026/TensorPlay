@@ -1,4 +1,6 @@
 """Pointwise transforms and the normalized-exponential reductions."""
+import operator
+
 import tensorplay as tp
 from tensorplay import exp, exp2, expm1, log, log1p, sinc
 
@@ -17,7 +19,19 @@ __all__ = [
 def _normalize_dims(dim, ndim):
     if dim is None:
         return list(range(ndim))
-    dims = [dim] if isinstance(dim, int) else [int(d) for d in dim]
+    if isinstance(dim, bool):
+        raise TypeError("dim must be an integer or a sequence of integers")
+    try:
+        dims = [operator.index(dim)]
+    except TypeError:
+        try:
+            dims = []
+            for value in dim:
+                if isinstance(value, bool):
+                    raise TypeError("dim must contain integers")
+                dims.append(operator.index(value))
+        except TypeError as error:
+            raise TypeError("dim must be an integer or a sequence of integers") from error
     result = []
     for value in dims:
         if ndim <= 0:
