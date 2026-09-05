@@ -82,6 +82,23 @@ inline int64_t checked_diagonal_extent(int64_t base, int64_t offset,
     return base + magnitude;
 }
 
+inline int64_t checked_shape_add(int64_t lhs, int64_t rhs, const char* op) {
+    if (lhs < 0 || rhs < 0 ||
+        lhs > std::numeric_limits<int64_t>::max() - rhs) {
+        TP_THROW(ValueError, op, ": output size is too large");
+    }
+    return lhs + rhs;
+}
+
+inline int64_t checked_stride_scale(int64_t stride, int64_t factor,
+                                    const char* op) {
+    if ((stride > 0 && stride > std::numeric_limits<int64_t>::max() / factor) ||
+        (stride < 0 && stride < std::numeric_limits<int64_t>::min() / factor)) {
+        TP_THROW(ValueError, op, ": stride is too large");
+    }
+    return stride * factor;
+}
+
 Tensor empty_transform_output(const Tensor& self) {
     const auto shape = static_cast<std::vector<int64_t>>(self.shape());
     if (!isQuantizedType(self.dtype())) {
@@ -261,6 +278,12 @@ std::vector<Tensor> split_with_sizes_cpu(const Tensor& self, std::vector<int64_t
                          }
                          return s;
                      }(), "]");
+        }
+        if (len > dim_size - start) {
+            TP_THROW(RuntimeError,
+                     "split_with_sizes expects split_sizes to sum exactly to ",
+                     dim_size, " (input tensor's size at dimension ", dim,
+                     ")");
         }
         outs.push_back(self.slice(dim, start, start + len));
         start += len;
@@ -546,8 +569,8 @@ Tensor block_diag_cpu(const std::vector<Tensor>& tensors) {
         if (nd == 1) b2 = t.expand({1, t.size(0)});
         else if (nd == 0) b2 = t.expand({1, 1});
         blocks2d.push_back(b2);
-        rows += b2.size(0);
-        cols += b2.size(1);
+        rows = checked_shape_add(rows, b2.size(0), "block_diag");
+        cols = checked_shape_add(cols, b2.size(1), "block_diag");
     }
     Tensor out = Tensor::zeros({rows, cols}, out_dtype, device);
     int64_t off0 = 0, off1 = 0;
@@ -555,8 +578,8 @@ Tensor block_diag_cpu(const std::vector<Tensor>& tensors) {
         out.slice(0, off0, off0 + b.size(0))
            .slice(1, off1, off1 + b.size(1))
            .copy_(b);
-        off0 += b.size(0);
-        off1 += b.size(1);
+        off0 = checked_shape_add(off0, b.size(0), "block_diag");
+        off1 = checked_shape_add(off1, b.size(1), "block_diag");
     }
     return out;
 }
@@ -715,7 +738,8 @@ Tensor unfold_cpu(const Tensor& self, int64_t dimension, int64_t size, int64_t s
     // The if handles the self.dim() == 0 case
     if (dimension < nd) {
         sizes[dimension] = (sizes[dimension] - size) / step + 1;
-        strides[dimension] *= step;
+        strides[dimension] = checked_stride_scale(strides[dimension], step,
+                                                  "unfold");
     }
     return self.as_strided(sizes, strides);
 }
