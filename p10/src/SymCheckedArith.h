@@ -45,7 +45,7 @@ namespace sym_arith {
 using tp_wide_t = __int128;
 #endif
 
-int64_t checked_add(int64_t left, int64_t right) {
+inline int64_t checked_add(int64_t left, int64_t right) {
 #if TP_SYM_WIDE_ARITH
     const tp_wide_t result = static_cast<tp_wide_t>(left) + right;
     TP_CHECK_VALUE(result >= std::numeric_limits<int64_t>::min() &&
@@ -66,7 +66,7 @@ int64_t checked_add(int64_t left, int64_t right) {
 #endif
 }
 
-int64_t checked_sub(int64_t left, int64_t right) {
+inline int64_t checked_sub(int64_t left, int64_t right) {
 #if TP_SYM_WIDE_ARITH
     const tp_wide_t result = static_cast<tp_wide_t>(left) - right;
     TP_CHECK_VALUE(result >= std::numeric_limits<int64_t>::min() &&
@@ -92,7 +92,7 @@ int64_t checked_sub(int64_t left, int64_t right) {
 #endif
 }
 
-int64_t checked_mul(int64_t left, int64_t right) {
+inline int64_t checked_mul(int64_t left, int64_t right) {
 #if TP_SYM_WIDE_ARITH
     const tp_wide_t result = static_cast<tp_wide_t>(left) * right;
     TP_CHECK_VALUE(result >= std::numeric_limits<int64_t>::min() &&
@@ -121,7 +121,7 @@ int64_t checked_mul(int64_t left, int64_t right) {
 #endif
 }
 
-int64_t checked_left_shift(int64_t left, int64_t right) {
+inline int64_t checked_left_shift(int64_t left, int64_t right) {
     TP_CHECK_VALUE(right >= 0,
                    "symbolic integer shift count must be non-negative");
     TP_CHECK_VALUE(right < 127,
@@ -158,7 +158,7 @@ int64_t checked_left_shift(int64_t left, int64_t right) {
 #endif
 }
 
-int64_t checked_right_shift(int64_t left, int64_t right) {
+inline int64_t checked_right_shift(int64_t left, int64_t right) {
     TP_CHECK_VALUE(right >= 0,
                    "symbolic integer shift count must be non-negative");
     if (right >= 63) return left < 0 ? -1 : 0;
@@ -169,22 +169,22 @@ int64_t checked_right_shift(int64_t left, int64_t right) {
     return quotient;
 }
 
-int64_t bitwise_and(int64_t left, int64_t right) {
+inline int64_t bitwise_and(int64_t left, int64_t right) {
     return static_cast<int64_t>(static_cast<uint64_t>(left) &
                                 static_cast<uint64_t>(right));
 }
 
-int64_t bitwise_or(int64_t left, int64_t right) {
+inline int64_t bitwise_or(int64_t left, int64_t right) {
     return static_cast<int64_t>(static_cast<uint64_t>(left) |
                                 static_cast<uint64_t>(right));
 }
 
-int64_t bitwise_xor(int64_t left, int64_t right) {
+inline int64_t bitwise_xor(int64_t left, int64_t right) {
     return static_cast<int64_t>(static_cast<uint64_t>(left) ^
                                 static_cast<uint64_t>(right));
 }
 
-int64_t checked_pow(int64_t base, int64_t exponent) {
+inline int64_t checked_pow(int64_t base, int64_t exponent) {
     TP_CHECK_VALUE(exponent >= 0,
                    "symbolic integer exponent must be non-negative");
     int64_t result = 1;
