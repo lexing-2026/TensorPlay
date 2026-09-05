@@ -20,7 +20,7 @@ from tensorplay._C import (
     linalg_lu_factor_ex as lu_factor_ex,
 )
 
-from ._common import EigResult, EighResult, QRResult, SVDResult
+from ._common import EigResult, EighResult, QRResult, SVDResult, check_floating
 
 __all__ = [
     "cholesky",
@@ -54,12 +54,18 @@ def cholesky_ex(A, *, upper=False, check_errors=False):
 
 def eigh(A, UPLO="L"):
     """eigh(A, UPLO='L') -> EighResult(eigenvalues, eigenvectors)"""
+    UPLO = str(UPLO).upper()
+    if UPLO not in ("L", "U"):
+        raise ValueError("linalg.eigh: UPLO must be 'L' or 'U'")
     values, vectors = linalg_eigh(A, UPLO)
     return EighResult(values, vectors)
 
 
 def eigvalsh(A, UPLO="L"):
     """eigvalsh(A, UPLO='L') -> Tensor"""
+    UPLO = str(UPLO).upper()
+    if UPLO not in ("L", "U"):
+        raise ValueError("linalg.eigvalsh: UPLO must be 'L' or 'U'")
     return linalg_eigvalsh(A, UPLO)
 
 
@@ -87,6 +93,11 @@ def svdvals(A, *, driver=None):
 
 def qr(A, mode="reduced"):
     """qr(A, mode='reduced') -> QRResult(Q, R)"""
+    if mode == "R":
+        mode = "r"
+    if mode not in ("reduced", "complete", "r"):
+        raise ValueError(
+            "linalg.qr: mode must be 'reduced', 'complete', or 'r'")
     Q, R = _C.linalg_qr(A, mode)
     if mode in ("r", "R"):
         empty = tensorplay.empty(
@@ -100,6 +111,10 @@ def qr(A, mode="reduced"):
 
 def polar(A):
     """polar(A) -> (Tensor Q, Tensor R) with A = Q R"""
+    check_floating(A, "polar")
+    if A.dim() < 2 or A.shape[-2] < A.shape[-1]:
+        raise ValueError(
+            "linalg.polar: input must have at least as many rows as columns")
     U, S, Vh = svd(A, full_matrices=False)
     Q = U @ Vh
     V = _C.conj_physical(Vh).transpose(-2, -1)
