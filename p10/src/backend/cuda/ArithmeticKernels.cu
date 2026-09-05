@@ -7,12 +7,14 @@
 #include "Allocator.h"
 #include "CUDNNUtils.h"
 #include "Scalar.h"
+#include "TypeProperties.h"
 #include "Utils.h"
 #include "TypePromotion.h"
 #include "GradMode.h"
 #include "CUDABroadcast.cuh"
 #include "CUDAComplex.cuh"
 #include "ElementwiseStrided.cuh"
+#include "CUDALoops.cuh"
 #include <thrust/complex.h>
 
 #include <cuda_runtime.h>
@@ -354,6 +356,97 @@ struct BinaryAddVecOp { template <typename M> __device__ M operator()(M x, M y, 
 struct BinarySubVecOp { template <typename M> __device__ M operator()(M x, M y, M a) const { return x - a * y; } };
 struct BinaryMulVecOp { template <typename M> __device__ M operator()(M x, M y, M) const { return x * y; } };
 struct BinaryDivVecOp { template <typename M> __device__ M operator()(M x, M y, M) const { return x / y; } };
+
+// --- Iterator-driven generic binary path ---
+//
+// The slow lane under the same-shape vectorized and row-segment fast paths:
+// the TensorIterator supplies the coalesced iteration shape and per-operand
+// byte strides, and the launch machinery picks the vectorized, unrolled, or
+// offset-calculated strided schedule.  Functors compute in their own
+// parameter type (float for half-precision storage, matching the accumulate
+// contract of the direct kernels); dynamic casting bridges memory dtypes on
+// load and store.  A CPU scalar operand (0-dim CPU tensor) is folded into
+// the functor at that precision instead of being materialized on device.
+
+template <typename T>
+struct IterAddFunctor {
+    T alpha;
+    __device__ T operator()(T a, T b) const { return a + alpha * b; }
+};
+
+template <typename T>
+struct IterSubFunctor {
+    T alpha;
+    __device__ T operator()(T a, T b) const { return a - alpha * b; }
+};
+
+template <typename T>
+struct IterMulFunctor {
+    // Kept so every binary functor shares one construction form; unused in
+    // the computation.
+    T alpha;
+    __device__ T operator()(T a, T b) const { return a * b; }
+};
+
+template <typename T>
+struct IterDivFunctor {
+    // Kept so every binary functor shares one construction form; unused in
+    // the computation.
+    T alpha;
+    __device__ T operator()(T a, T b) const { return a / b; }
+};
+
+// Computes y = op(x1, x2) over the iterator with the opmath compute type of
+// the output dtype (float for half storage, the dtype itself otherwise).
+// The scalar rides in the functor at compute precision, so CPU scalar
+// operands fold instead of materializing on device.
+template <template <typename> class FunctorT>
+inline void run_binary_iter(TensorIteratorBase& iter, const Scalar& alpha) {
+    switch (iter.dtype(0)) {
+        case DType::Float32:
+            opmath_gpu_kernel_with_scalars<float, float, float>(
+                iter, FunctorT<float>{alpha.to<float>()});
+            break;
+        case DType::Float64:
+            opmath_gpu_kernel_with_scalars<double, double, double>(
+                iter, FunctorT<double>{alpha.to<double>()});
+            break;
+        case DType::Float16:
+        case DType::BFloat16:
+            opmath_gpu_kernel_with_scalars<float, float, float>(
+                iter, FunctorT<float>{alpha.to<float>()});
+            break;
+        case DType::Int32:
+            opmath_gpu_kernel_with_scalars<int, int, int>(
+                iter, FunctorT<int>{alpha.to<int>()});
+            break;
+        case DType::Int64:
+            opmath_gpu_kernel_with_scalars<int64_t, int64_t, int64_t>(
+                iter, FunctorT<int64_t>{alpha.to<int64_t>()});
+            break;
+        default:
+            TP_THROW(NotImplementedError, "CUDA binary kernel: unsupported dtype");
+    }
+}
+
+// The output allocates on the first non-CPU operand device: a CPU scalar
+// operand folds inside the kernel instead of anchoring the result device.
+inline Device common_result_device(const Tensor& a, const Tensor& b) {
+    if (!a.device().is_cpu()) return a.device();
+    if (!b.device().is_cpu()) return b.device();
+    return a.device();
+}
+
+inline Tensor make_binary_iter(const Tensor& out, const Tensor& a,
+                               const Tensor& b) {
+    return TensorIteratorConfig()
+        .allow_cpu_scalars(true)
+        .check_all_same_dtype(false)
+        .add_output(out)
+        .add_input(a)
+        .add_input(b)
+        .build();
+}
 
 template <typename T, int VecSize, typename Op>
 __global__ void binary_same_shape_vectorized_kernel(
@@ -900,64 +993,48 @@ void cudnn_binary_op(const Tensor& a, const Tensor& b, Tensor& c, cudnnOpTensorO
 // ADD
 Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
     std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
-    DType result_dtype = promoteTypes(self.dtype(), other.dtype());
+    DType result_dtype = native::result_type(self, other);
     if (alpha.isFloatingPoint() && !isFloatingType(result_dtype)) {
         result_dtype = promoteTypes(result_dtype, DType::Float32);
     }
-    Tensor result = Tensor::empty(out_shape, result_dtype, self.device());
+    Tensor result = Tensor::empty(out_shape, result_dtype,
+                                  common_result_device(self, other));
     int64_t n = result.numel();
     if (n == 0) return result;
 
-    dim3 grid, block; get_grid_block(n, grid, block);
-
-    Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
-    Tensor b = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
-
-    if (try_binary_vectorized(n, a, b, result, alpha, BinaryAddVecOp{})) {
-        CUDA_CHECK(cudaGetLastError());
-        return result;
+    if (self.device().type() == DeviceType::CUDA &&
+        other.device().type() == DeviceType::CUDA) {
+        Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
+        Tensor b = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
+        if (try_binary_vectorized(n, a, b, result, alpha, BinaryAddVecOp{})) {
+            CUDA_CHECK(cudaGetLastError());
+            return result;
+        }
+        if (try_row_broadcast(n, a, b, result, alpha, BinaryAddVecOp{})) {
+            CUDA_CHECK(cudaGetLastError());
+            return result;
+        }
+        switch (result_dtype) {
+            case DType::ComplexFloat:
+                run_cplx_binary<float>(a, b, result,
+                                       cuda::cplx::AddAlphaOp<float>{s2c<float>(alpha)});
+                return result;
+            case DType::ComplexDouble:
+                run_cplx_binary<double>(a, b, result,
+                                        cuda::cplx::AddAlphaOp<double>{s2c<double>(alpha)});
+                return result;
+            case DType::Bool:
+                try_bool_binary(a, b, result, result_dtype, BoolBinOp::Or, out_shape);
+                return result;
+            default:
+                break;
+        }
     }
-    if (try_row_broadcast(n, a, b, result, alpha, BinaryAddVecOp{})) {
-        CUDA_CHECK(cudaGetLastError());
-        return result;
-    }
 
-    TensorDesc a_desc = make_desc(a, out_shape.size());
-    TensorDesc b_desc = make_desc(b, out_shape.size());
-    TensorDesc y_desc = make_desc(result, out_shape.size());
-    
-    switch (result_dtype) {
-        case DType::Float32:
-            add_broadcast_kernel<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, result.data_ptr<float>(), y_desc, alpha.to<float>());
-            break;
-        case DType::Int32:
-            add_broadcast_kernel<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, result.data_ptr<int>(), y_desc, alpha.to<int>());
-            break;
-        case DType::Int64:
-            add_broadcast_kernel<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, result.data_ptr<int64_t>(), y_desc, alpha.to<int64_t>());
-            break;
-        case DType::Float16:
-            add_broadcast_kernel<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::Half>(), a_desc, b.data_ptr<tensorplay::Half>(), b_desc, result.data_ptr<tensorplay::Half>(), y_desc, alpha.to<float>());
-            break;
-        case DType::BFloat16:
-            add_broadcast_kernel<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::BFloat16>(), a_desc, b.data_ptr<tensorplay::BFloat16>(), b_desc, result.data_ptr<tensorplay::BFloat16>(), y_desc, alpha.to<float>());
-            break;
-        case DType::Float64:
-            add_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, result.data_ptr<double>(), y_desc, alpha.to<double>());
-            break;
-        case DType::ComplexFloat:
-            run_cplx_binary<float>(a, b, result,
-                                   cuda::cplx::AddAlphaOp<float>{s2c<float>(alpha)});
-            break;
-        case DType::ComplexDouble:
-            run_cplx_binary<double>(a, b, result,
-                                    cuda::cplx::AddAlphaOp<double>{s2c<double>(alpha)});
-            break;
-        case DType::Bool:
-            try_bool_binary(a, b, result, result_dtype, BoolBinOp::Or, out_shape);
-            break;
-        default:
-            TP_THROW(NotImplementedError, "CUDA add: unsupported dtype");
+    {
+        TensorIterator iter = make_binary_iter(result, self, other);
+        run_binary_iter<IterAddFunctor>(iter, alpha);
+        CUDA_CHECK(cudaGetLastError());
     }
     return result;
 }
@@ -1089,58 +1166,41 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
     int64_t n = self.numel();
     if (n == 0) return self;
 
-    // For inplace, we cast other to self.dtype()
-    Tensor b = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
+    if (other.device().type() == DeviceType::CUDA) {
+        // For inplace, we cast other to self.dtype()
+        Tensor b = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
 
-    // the out-of-place add); the broadcast machinery below is only needed
-    // when shapes/strides actually differ.
-    if (try_binary_vectorized(n, self, b, self, alpha, BinaryAddVecOp{})) {
-        return self;
+        // the out-of-place add); the broadcast machinery below is only needed
+        // when shapes/strides actually differ.
+        if (try_binary_vectorized(n, self, b, self, alpha, BinaryAddVecOp{})) {
+            return self;
+        }
+        if (try_row_broadcast(n, self, b, self, alpha, BinaryAddVecOp{})) {
+            CUDA_CHECK(cudaGetLastError());
+            return self;
+        }
+        switch (self.dtype()) {
+            case DType::ComplexFloat:
+                run_cplx_binary<float>(self, b, self,
+                                       cuda::cplx::AddAlphaOp<float>{s2c<float>(alpha)});
+                return self;
+            case DType::ComplexDouble:
+                run_cplx_binary<double>(self, b, self,
+                                        cuda::cplx::AddAlphaOp<double>{s2c<double>(alpha)});
+                return self;
+            case DType::Bool:
+                try_bool_binary(self, b, self, self.dtype(), BoolBinOp::Or,
+                                static_cast<std::vector<int64_t>>(self.shape()));
+                return self;
+            default:
+                break;
+        }
     }
-    if (try_row_broadcast(n, self, b, self, alpha, BinaryAddVecOp{})) {
+
+    {
+        TensorIterator iter = make_binary_iter(self, self, other);
+        run_binary_iter<IterAddFunctor>(iter, alpha);
         CUDA_CHECK(cudaGetLastError());
-        return self;
-    }
-
-    dim3 grid, block; get_grid_block(n, grid, block);
-
-    TensorDesc a_desc = make_desc(self, self.dim());
-    TensorDesc b_desc = make_desc(b, self.dim());
-    TensorDesc y_desc = make_desc(self, self.dim());
-    
-    switch (self.dtype()) {
-        case DType::Float32:
-            add_broadcast_kernel<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, self.data_ptr<float>(), y_desc, alpha.to<float>());
-            break;
-        case DType::Int32:
-            add_broadcast_kernel<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, self.data_ptr<int>(), y_desc, alpha.to<int>());
-            break;
-        case DType::Int64:
-            add_broadcast_kernel<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, self.data_ptr<int64_t>(), y_desc, alpha.to<int64_t>());
-            break;
-        case DType::Float16:
-            add_broadcast_kernel<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::Half>(), a_desc, b.data_ptr<tensorplay::Half>(), b_desc, self.data_ptr<tensorplay::Half>(), y_desc, alpha.to<float>());
-            break;
-        case DType::BFloat16:
-            add_broadcast_kernel<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::BFloat16>(), a_desc, b.data_ptr<tensorplay::BFloat16>(), b_desc, self.data_ptr<tensorplay::BFloat16>(), y_desc, alpha.to<float>());
-            break;
-        case DType::Float64:
-            add_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, self.data_ptr<double>(), y_desc, alpha.to<double>());
-            break;
-        case DType::ComplexFloat:
-            run_cplx_binary<float>(self, b, self,
-                                   cuda::cplx::AddAlphaOp<float>{s2c<float>(alpha)});
-            break;
-        case DType::ComplexDouble:
-            run_cplx_binary<double>(self, b, self,
-                                    cuda::cplx::AddAlphaOp<double>{s2c<double>(alpha)});
-            break;
-        case DType::Bool:
-            try_bool_binary(self, b, self, self.dtype(), BoolBinOp::Or,
-                            static_cast<std::vector<int64_t>>(self.shape()));
-            break;
-        default:
-            TP_THROW(NotImplementedError, "CUDA add_: unsupported dtype");
     }
     return self;
 }
@@ -1148,62 +1208,46 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
 // SUB
 Tensor sub_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
     std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
-    DType result_dtype = promoteTypes(self.dtype(), other.dtype());
-    Tensor result = Tensor::empty(out_shape, result_dtype, self.device());
+    DType result_dtype = native::result_type(self, other);
+    Tensor result = Tensor::empty(out_shape, result_dtype,
+                                  common_result_device(self, other));
     int64_t n = result.numel();
     if (n == 0) return result;
 
-    dim3 grid, block; get_grid_block(n, grid, block);
-
-    Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
-    Tensor b = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
-
-    if (try_binary_vectorized(n, a, b, result, alpha, BinarySubVecOp{})) {
-        CUDA_CHECK(cudaGetLastError());
-        return result;
+    if (self.device().type() == DeviceType::CUDA &&
+        other.device().type() == DeviceType::CUDA) {
+        Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
+        Tensor b = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
+        if (try_binary_vectorized(n, a, b, result, alpha, BinarySubVecOp{})) {
+            CUDA_CHECK(cudaGetLastError());
+            return result;
+        }
+        if (try_row_broadcast(n, a, b, result, alpha, BinarySubVecOp{})) {
+            CUDA_CHECK(cudaGetLastError());
+            return result;
+        }
+        switch (result_dtype) {
+            case DType::ComplexFloat:
+                run_cplx_binary<float>(a, b, result,
+                                       cuda::cplx::SubAlphaOp<float>{s2c<float>(alpha)});
+                return result;
+            case DType::ComplexDouble:
+                run_cplx_binary<double>(a, b, result,
+                                        cuda::cplx::SubAlphaOp<double>{s2c<double>(alpha)});
+                return result;
+            case DType::Bool:
+                TP_THROW(RuntimeError,
+                         "Subtraction, the `-` operator, with two bool tensors is "
+                         "not supported. Use the `^` or `logical_xor()` operator instead.");
+            default:
+                break;
+        }
     }
-    if (try_row_broadcast(n, a, b, result, alpha, BinarySubVecOp{})) {
-        CUDA_CHECK(cudaGetLastError());
-        return result;
-    }
 
-    TensorDesc a_desc = make_desc(a, out_shape.size());
-    TensorDesc b_desc = make_desc(b, out_shape.size());
-    TensorDesc y_desc = make_desc(result, out_shape.size());
-    
-    switch (result_dtype) {
-        case DType::Float32:
-            sub_broadcast_kernel<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, result.data_ptr<float>(), y_desc, alpha.to<float>());
-            break;
-        case DType::Int32:
-            sub_broadcast_kernel<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, result.data_ptr<int>(), y_desc, alpha.to<int>());
-            break;
-        case DType::Int64:
-            sub_broadcast_kernel<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, result.data_ptr<int64_t>(), y_desc, alpha.to<int64_t>());
-            break;
-        case DType::Float16:
-            sub_broadcast_kernel<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::Half>(), a_desc, b.data_ptr<tensorplay::Half>(), b_desc, result.data_ptr<tensorplay::Half>(), y_desc, alpha.to<float>());
-            break;
-        case DType::BFloat16:
-            sub_broadcast_kernel<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::BFloat16>(), a_desc, b.data_ptr<tensorplay::BFloat16>(), b_desc, result.data_ptr<tensorplay::BFloat16>(), y_desc, alpha.to<float>());
-            break;
-        case DType::Float64:
-            sub_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, result.data_ptr<double>(), y_desc, alpha.to<double>());
-            break;
-        case DType::ComplexFloat:
-            run_cplx_binary<float>(a, b, result,
-                                   cuda::cplx::SubAlphaOp<float>{s2c<float>(alpha)});
-            break;
-        case DType::ComplexDouble:
-            run_cplx_binary<double>(a, b, result,
-                                    cuda::cplx::SubAlphaOp<double>{s2c<double>(alpha)});
-            break;
-        case DType::Bool:
-            TP_THROW(RuntimeError,
-                     "Subtraction, the `-` operator, with two bool tensors is "
-                     "not supported. Use the `^` or `logical_xor()` operator instead.");
-        default:
-            TP_THROW(NotImplementedError, "CUDA sub: unsupported dtype");
+    {
+        TensorIterator iter = make_binary_iter(result, self, other);
+        run_binary_iter<IterSubFunctor>(iter, alpha);
+        CUDA_CHECK(cudaGetLastError());
     }
     return result;
 }
@@ -1212,55 +1256,37 @@ Tensor& sub_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
     int64_t n = self.numel();
     if (n == 0) return self;
 
-    Tensor b = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
-
-    if (try_binary_vectorized(n, self, b, self, alpha, BinarySubVecOp{})) {
-        return self;
+    if (other.device().type() == DeviceType::CUDA) {
+        Tensor b = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
+        if (try_binary_vectorized(n, self, b, self, alpha, BinarySubVecOp{})) {
+            return self;
+        }
+        if (try_row_broadcast(n, self, b, self, alpha, BinarySubVecOp{})) {
+            CUDA_CHECK(cudaGetLastError());
+            return self;
+        }
+        switch (self.dtype()) {
+            case DType::ComplexFloat:
+                run_cplx_binary<float>(self, b, self,
+                                       cuda::cplx::SubAlphaOp<float>{s2c<float>(alpha)});
+                return self;
+            case DType::ComplexDouble:
+                run_cplx_binary<double>(self, b, self,
+                                        cuda::cplx::SubAlphaOp<double>{s2c<double>(alpha)});
+                return self;
+            case DType::Bool:
+                TP_THROW(RuntimeError,
+                         "Subtraction, the `-` operator, with two bool tensors is "
+                         "not supported. Use the `^` or `logical_xor()` operator instead.");
+            default:
+                break;
+        }
     }
-    if (try_row_broadcast(n, self, b, self, alpha, BinarySubVecOp{})) {
+
+    {
+        TensorIterator iter = make_binary_iter(self, self, other);
+        run_binary_iter<IterSubFunctor>(iter, alpha);
         CUDA_CHECK(cudaGetLastError());
-        return self;
-    }
-
-    dim3 grid, block; get_grid_block(n, grid, block);
-
-    TensorDesc a_desc = make_desc(self, self.dim());
-    TensorDesc b_desc = make_desc(b, self.dim());
-    TensorDesc y_desc = make_desc(self, self.dim());
-    
-    switch (self.dtype()) {
-        case DType::Float32:
-            sub_broadcast_kernel<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, self.data_ptr<float>(), y_desc, alpha.to<float>());
-            break;
-        case DType::Int32:
-            sub_broadcast_kernel<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, self.data_ptr<int>(), y_desc, alpha.to<int>());
-            break;
-        case DType::Int64:
-            sub_broadcast_kernel<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, self.data_ptr<int64_t>(), y_desc, alpha.to<int64_t>());
-            break;
-        case DType::Float16:
-            sub_broadcast_kernel<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::Half>(), a_desc, b.data_ptr<tensorplay::Half>(), b_desc, self.data_ptr<tensorplay::Half>(), y_desc, alpha.to<float>());
-            break;
-        case DType::BFloat16:
-            sub_broadcast_kernel<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::BFloat16>(), a_desc, b.data_ptr<tensorplay::BFloat16>(), b_desc, self.data_ptr<tensorplay::BFloat16>(), y_desc, alpha.to<float>());
-            break;
-        case DType::Float64:
-            sub_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, self.data_ptr<double>(), y_desc, alpha.to<double>());
-            break;
-        case DType::ComplexFloat:
-            run_cplx_binary<float>(self, b, self,
-                                   cuda::cplx::SubAlphaOp<float>{s2c<float>(alpha)});
-            break;
-        case DType::ComplexDouble:
-            run_cplx_binary<double>(self, b, self,
-                                    cuda::cplx::SubAlphaOp<double>{s2c<double>(alpha)});
-            break;
-        case DType::Bool:
-            TP_THROW(RuntimeError,
-                     "Subtraction, the `-` operator, with two bool tensors is "
-                     "not supported. Use the `^` or `logical_xor()` operator instead.");
-        default:
-            TP_THROW(NotImplementedError, "CUDA sub_: unsupported dtype");
     }
     return self;
 }
@@ -1268,59 +1294,43 @@ Tensor& sub_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
 // MUL
 Tensor mul_kernel(const Tensor& self, const Tensor& other) {
     std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
-    DType result_dtype = promoteTypes(self.dtype(), other.dtype());
-    Tensor result = Tensor::empty(out_shape, result_dtype, self.device());
+    DType result_dtype = native::result_type(self, other);
+    Tensor result = Tensor::empty(out_shape, result_dtype,
+                                  common_result_device(self, other));
     int64_t n = result.numel();
     if (n == 0) return result;
 
-    dim3 grid, block; get_grid_block(n, grid, block);
-
-    Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
-    Tensor b = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
-
-    if (try_binary_vectorized(n, a, b, result, Scalar(1), BinaryMulVecOp{})) {
-        CUDA_CHECK(cudaGetLastError());
-        return result;
+    if (self.device().type() == DeviceType::CUDA &&
+        other.device().type() == DeviceType::CUDA) {
+        Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
+        Tensor b = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
+        if (try_binary_vectorized(n, a, b, result, Scalar(1), BinaryMulVecOp{})) {
+            CUDA_CHECK(cudaGetLastError());
+            return result;
+        }
+        if (try_row_broadcast(n, a, b, result, Scalar(1), BinaryMulVecOp{})) {
+            CUDA_CHECK(cudaGetLastError());
+            return result;
+        }
+        switch (result_dtype) {
+            case DType::ComplexFloat:
+                run_cplx_binary<float>(a, b, result, cuda::cplx::MulOp{});
+                return result;
+            case DType::ComplexDouble:
+                run_cplx_binary<double>(a, b, result, cuda::cplx::MulOp{});
+                return result;
+            case DType::Bool:
+                try_bool_binary(a, b, result, result_dtype, BoolBinOp::And, out_shape);
+                return result;
+            default:
+                break;
+        }
     }
-    if (try_row_broadcast(n, a, b, result, Scalar(1), BinaryMulVecOp{})) {
-        CUDA_CHECK(cudaGetLastError());
-        return result;
-    }
 
-    TensorDesc a_desc = make_desc(a, out_shape.size());
-    TensorDesc b_desc = make_desc(b, out_shape.size());
-    TensorDesc y_desc = make_desc(result, out_shape.size());
-    
-    switch (result_dtype) {
-        case DType::Float32:
-            mul_broadcast_kernel<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, result.data_ptr<float>(), y_desc);
-            break;
-        case DType::Int32:
-            mul_broadcast_kernel<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, result.data_ptr<int>(), y_desc);
-            break;
-        case DType::Int64:
-            mul_broadcast_kernel<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, result.data_ptr<int64_t>(), y_desc);
-            break;
-        case DType::Float16:
-            mul_broadcast_kernel<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::Half>(), a_desc, b.data_ptr<tensorplay::Half>(), b_desc, result.data_ptr<tensorplay::Half>(), y_desc);
-            break;
-        case DType::BFloat16:
-            mul_broadcast_kernel<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::BFloat16>(), a_desc, b.data_ptr<tensorplay::BFloat16>(), b_desc, result.data_ptr<tensorplay::BFloat16>(), y_desc);
-            break;
-        case DType::Float64:
-            mul_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, result.data_ptr<double>(), y_desc);
-            break;
-        case DType::ComplexFloat:
-            run_cplx_binary<float>(a, b, result, cuda::cplx::MulOp{});
-            break;
-        case DType::ComplexDouble:
-            run_cplx_binary<double>(a, b, result, cuda::cplx::MulOp{});
-            break;
-        case DType::Bool:
-            try_bool_binary(a, b, result, result_dtype, BoolBinOp::And, out_shape);
-            break;
-        default:
-            TP_THROW(NotImplementedError, "CUDA mul: unsupported dtype");
+    {
+        TensorIterator iter = make_binary_iter(result, self, other);
+        run_binary_iter<IterMulFunctor>(iter, Scalar(1));
+        CUDA_CHECK(cudaGetLastError());
     }
     return result;
 }
@@ -1329,53 +1339,35 @@ Tensor& mul_inplace_kernel(Tensor& self, const Tensor& other) {
     int64_t n = self.numel();
     if (n == 0) return self;
 
-    Tensor b = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
-
-    if (try_binary_vectorized(n, self, b, self, Scalar(1), BinaryMulVecOp{})) {
-        return self;
+    if (other.device().type() == DeviceType::CUDA) {
+        Tensor b = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
+        if (try_binary_vectorized(n, self, b, self, Scalar(1), BinaryMulVecOp{})) {
+            return self;
+        }
+        if (try_row_broadcast(n, self, b, self, Scalar(1), BinaryMulVecOp{})) {
+            CUDA_CHECK(cudaGetLastError());
+            return self;
+        }
+        switch (self.dtype()) {
+            case DType::ComplexFloat:
+                run_cplx_binary<float>(self, b, self, cuda::cplx::MulOp{});
+                return self;
+            case DType::ComplexDouble:
+                run_cplx_binary<double>(self, b, self, cuda::cplx::MulOp{});
+                return self;
+            case DType::Bool:
+                try_bool_binary(self, b, self, self.dtype(), BoolBinOp::And,
+                                static_cast<std::vector<int64_t>>(self.shape()));
+                return self;
+            default:
+                break;
+        }
     }
-    if (try_row_broadcast(n, self, b, self, Scalar(1), BinaryMulVecOp{})) {
+
+    {
+        TensorIterator iter = make_binary_iter(self, self, other);
+        run_binary_iter<IterMulFunctor>(iter, Scalar(1));
         CUDA_CHECK(cudaGetLastError());
-        return self;
-    }
-
-    dim3 grid, block; get_grid_block(n, grid, block);
-
-    TensorDesc a_desc = make_desc(self, self.dim());
-    TensorDesc b_desc = make_desc(b, self.dim());
-    TensorDesc y_desc = make_desc(self, self.dim());
-    
-    switch (self.dtype()) {
-        case DType::Float32:
-            mul_broadcast_kernel<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, self.data_ptr<float>(), y_desc);
-            break;
-        case DType::Int32:
-            mul_broadcast_kernel<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, self.data_ptr<int>(), y_desc);
-            break;
-        case DType::Int64:
-            mul_broadcast_kernel<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, self.data_ptr<int64_t>(), y_desc);
-            break;
-        case DType::Float16:
-            mul_broadcast_kernel<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::Half>(), a_desc, b.data_ptr<tensorplay::Half>(), b_desc, self.data_ptr<tensorplay::Half>(), y_desc);
-            break;
-        case DType::BFloat16:
-            mul_broadcast_kernel<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::BFloat16>(), a_desc, b.data_ptr<tensorplay::BFloat16>(), b_desc, self.data_ptr<tensorplay::BFloat16>(), y_desc);
-            break;
-        case DType::Float64:
-            mul_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, self.data_ptr<double>(), y_desc);
-            break;
-        case DType::ComplexFloat:
-            run_cplx_binary<float>(self, b, self, cuda::cplx::MulOp{});
-            break;
-        case DType::ComplexDouble:
-            run_cplx_binary<double>(self, b, self, cuda::cplx::MulOp{});
-            break;
-        case DType::Bool:
-            try_bool_binary(self, b, self, self.dtype(), BoolBinOp::And,
-                            static_cast<std::vector<int64_t>>(self.shape()));
-            break;
-        default:
-            TP_THROW(NotImplementedError, "CUDA mul_: unsupported dtype");
     }
     return self;
 }
@@ -1422,52 +1414,42 @@ Tensor fused_mul_add_scalar_kernel(const Tensor& self, Scalar other, Scalar adde
 // DIV
 Tensor div_kernel(const Tensor& self, const Tensor& other) {
     std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
-    DType result_dtype = promoteTypes(self.dtype(), other.dtype());
+    DType result_dtype = native::result_type(self, other);
     if (isIntegralType(result_dtype)) result_dtype = DType::Float32; // Div promotes to float
 
-    Tensor result = Tensor::empty(out_shape, result_dtype, self.device());
+    Tensor result = Tensor::empty(out_shape, result_dtype,
+                                  common_result_device(self, other));
     int64_t n = result.numel();
     if (n == 0) return result;
 
-    dim3 grid, block; get_grid_block(n, grid, block);
-
-    Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
-    Tensor b = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
-
-    if (try_binary_vectorized(n, a, b, result, Scalar(1), BinaryDivVecOp{})) {
-        CUDA_CHECK(cudaGetLastError());
-        return result;
+    if (self.device().type() == DeviceType::CUDA &&
+        other.device().type() == DeviceType::CUDA) {
+        Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
+        Tensor b = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
+        if (try_binary_vectorized(n, a, b, result, Scalar(1), BinaryDivVecOp{})) {
+            CUDA_CHECK(cudaGetLastError());
+            return result;
+        }
+        if (try_row_broadcast(n, a, b, result, Scalar(1), BinaryDivVecOp{})) {
+            CUDA_CHECK(cudaGetLastError());
+            return result;
+        }
+        switch (result_dtype) {
+            case DType::ComplexFloat:
+                run_cplx_binary<float>(a, b, result, cuda::cplx::DivOp{});
+                return result;
+            case DType::ComplexDouble:
+                run_cplx_binary<double>(a, b, result, cuda::cplx::DivOp{});
+                return result;
+            default:
+                break;
+        }
     }
-    if (try_row_broadcast(n, a, b, result, Scalar(1), BinaryDivVecOp{})) {
-        CUDA_CHECK(cudaGetLastError());
-        return result;
-    }
 
-    TensorDesc a_desc = make_desc(a, out_shape.size());
-    TensorDesc b_desc = make_desc(b, out_shape.size());
-    TensorDesc y_desc = make_desc(result, out_shape.size());
-    
-    switch (result_dtype) {
-        case DType::Float32:
-            div_broadcast_kernel<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, result.data_ptr<float>(), y_desc);
-            break;
-        case DType::Float16:
-            div_broadcast_kernel<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::Half>(), a_desc, b.data_ptr<tensorplay::Half>(), b_desc, result.data_ptr<tensorplay::Half>(), y_desc);
-            break;
-        case DType::BFloat16:
-            div_broadcast_kernel<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::BFloat16>(), a_desc, b.data_ptr<tensorplay::BFloat16>(), b_desc, result.data_ptr<tensorplay::BFloat16>(), y_desc);
-            break;
-        case DType::Float64:
-            div_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, result.data_ptr<double>(), y_desc);
-            break;
-        case DType::ComplexFloat:
-            run_cplx_binary<float>(a, b, result, cuda::cplx::DivOp{});
-            break;
-        case DType::ComplexDouble:
-            run_cplx_binary<double>(a, b, result, cuda::cplx::DivOp{});
-            break;
-        default:
-            TP_THROW(NotImplementedError, "CUDA div: unsupported dtype");
+    {
+        TensorIterator iter = make_binary_iter(result, self, other);
+        run_binary_iter<IterDivFunctor>(iter, Scalar(1));
+        CUDA_CHECK(cudaGetLastError());
     }
     return result;
 }
@@ -1476,53 +1458,31 @@ Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
     int64_t n = self.numel();
     if (n == 0) return self;
 
-    // Inplace div might change dtype if self is int (e.g. 5/2 = 2 or 2.5?)
-    // "RuntimeError: result type Float can't be cast to the desired output type Long" usually.
-    // For now, let's assume we do standard div and cast back.
-
-    Tensor b = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
-
-    if (try_binary_vectorized(n, self, b, self, Scalar(1), BinaryDivVecOp{})) {
-        return self;
+    if (other.device().type() == DeviceType::CUDA) {
+        Tensor b = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
+        if (try_binary_vectorized(n, self, b, self, Scalar(1), BinaryDivVecOp{})) {
+            return self;
+        }
+        if (try_row_broadcast(n, self, b, self, Scalar(1), BinaryDivVecOp{})) {
+            CUDA_CHECK(cudaGetLastError());
+            return self;
+        }
+        switch (self.dtype()) {
+            case DType::ComplexFloat:
+                run_cplx_binary<float>(self, b, self, cuda::cplx::DivOp{});
+                return self;
+            case DType::ComplexDouble:
+                run_cplx_binary<double>(self, b, self, cuda::cplx::DivOp{});
+                return self;
+            default:
+                break;
+        }
     }
-    if (try_row_broadcast(n, self, b, self, Scalar(1), BinaryDivVecOp{})) {
+
+    {
+        TensorIterator iter = make_binary_iter(self, self, other);
+        run_binary_iter<IterDivFunctor>(iter, Scalar(1));
         CUDA_CHECK(cudaGetLastError());
-        return self;
-    }
-
-    dim3 grid, block; get_grid_block(n, grid, block);
-
-    TensorDesc a_desc = make_desc(self, self.dim());
-    TensorDesc b_desc = make_desc(b, self.dim());
-    TensorDesc y_desc = make_desc(self, self.dim());
-    
-    switch (self.dtype()) {
-        case DType::Float32:
-            div_broadcast_kernel<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, self.data_ptr<float>(), y_desc);
-            break;
-        case DType::Int32:
-            div_broadcast_kernel<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, self.data_ptr<int>(), y_desc);
-            break;
-        case DType::Int64:
-            div_broadcast_kernel<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, self.data_ptr<int64_t>(), y_desc);
-            break;
-        case DType::Float16:
-            div_broadcast_kernel<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::Half>(), a_desc, b.data_ptr<tensorplay::Half>(), b_desc, self.data_ptr<tensorplay::Half>(), y_desc);
-            break;
-        case DType::BFloat16:
-            div_broadcast_kernel<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::BFloat16>(), a_desc, b.data_ptr<tensorplay::BFloat16>(), b_desc, self.data_ptr<tensorplay::BFloat16>(), y_desc);
-            break;
-        case DType::Float64:
-            div_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, self.data_ptr<double>(), y_desc);
-            break;
-        case DType::ComplexFloat:
-            run_cplx_binary<float>(self, b, self, cuda::cplx::DivOp{});
-            break;
-        case DType::ComplexDouble:
-            run_cplx_binary<double>(self, b, self, cuda::cplx::DivOp{});
-            break;
-        default:
-            TP_THROW(NotImplementedError, "CUDA div_: unsupported dtype");
     }
     return self;
 }
