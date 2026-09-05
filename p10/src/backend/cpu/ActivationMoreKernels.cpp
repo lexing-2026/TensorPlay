@@ -7,6 +7,9 @@
 //   - _prelu_kernel: PReLU evaluation with the (pre-shaped) weight
 //     broadcast elementwise over the input; negative positions scale the
 //     input by the weight, positive positions pass through.
+//     _prelu_kernel_backward walks the same broadcast once and emits both
+//     gradients: grad_input = x > 0 ? g : w * g and, per input element,
+//     grad_weight = x > 0 ? 0 : x * g.
 //   - log_sigmoid_forward: computes output = min(x, 0) - log1p(exp(-|x|))
 //     together with buffer = exp(-|x|); the branch split keeps exp() bounded
 //     for large-magnitude inputs of either sign.  log_sigmoid_backward
@@ -27,6 +30,8 @@
 #include "Generator.h"
 #include "DistributionsHelper.h"
 #include "TensorIteratorOps.h"
+#include "OpMathType.h"
+#include "Utils.h"
 
 #include <cmath>
 #include <optional>
@@ -356,6 +361,85 @@ Tensor _prelu_kernel_cpu(const Tensor& self, const Tensor& weight_in) {
     return result;
 }
 
+
+// ---------------------------------------------------------------------------
+// _prelu_kernel_backward
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// One fused pass over the broadcast of (self, weight, grad_output) writing
+// both gradients:
+//     grad_self   = x > 0 ? g : w * g
+//     grad_weight = x > 0 ? 0 : x * g
+// grad_weight keeps the broadcast geometry; folding it onto the weight shape
+// belongs to the caller.  Sub-single-precision inputs evaluate in their math
+// type so the product rounds once.
+template <typename scalar_t>
+void prelu_backward_loop(TensorIterator& iter) {
+    using math_t = typename OpMathType<scalar_t>::type;
+    iter.for_each([](char** data, const int64_t* strides, int64_t n) {
+        char* gi = data[0];
+        char* gw = data[1];
+        const char* xs = data[2];
+        const char* ws = data[3];
+        const char* gs = data[4];
+        for (int64_t i = 0; i < n; ++i) {
+            const math_t x = static_cast<math_t>(
+                *reinterpret_cast<const scalar_t*>(xs + i * strides[2]));
+            const math_t w = static_cast<math_t>(
+                *reinterpret_cast<const scalar_t*>(ws + i * strides[3]));
+            const math_t g = static_cast<math_t>(
+                *reinterpret_cast<const scalar_t*>(gs + i * strides[4]));
+            const bool positive = x > math_t(0);
+            *reinterpret_cast<scalar_t*>(gi + i * strides[0]) =
+                static_cast<scalar_t>(positive ? g : w * g);
+            *reinterpret_cast<scalar_t*>(gw + i * strides[1]) =
+                static_cast<scalar_t>(positive ? math_t(0) : x * g);
+        }
+    });
+}
+
+}  // namespace
+
+std::tuple<Tensor, Tensor> _prelu_kernel_backward_cpu(const Tensor& grad_output,
+                                                      const Tensor& self,
+                                                      const Tensor& weight) {
+    TP_CHECK(self.dtype() == weight.dtype() &&
+                 self.dtype() == grad_output.dtype(),
+             "_prelu_kernel_backward: input, weight and grad_output must share "
+             "one dtype");
+
+    const std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(weight.shape()),
+        static_cast<std::vector<int64_t>>(grad_output.shape()));
+    Tensor grad_self = Tensor::empty(out_shape, self.dtype(), self.device());
+    Tensor grad_weight = Tensor::empty(out_shape, weight.dtype(), weight.device());
+    if (grad_self.numel() == 0) {
+        return {grad_self, grad_weight};
+    }
+
+    TensorIterator iter = TensorIteratorConfig()
+        .resize_outputs(false)
+        .add_output(grad_self)
+        .add_output(grad_weight)
+        .add_const_input(self)
+        .add_const_input(weight)
+        .add_const_input(grad_output)
+        .build();
+
+    switch (self.dtype()) {
+        case DType::Float32: prelu_backward_loop<float>(iter); break;
+        case DType::Float64: prelu_backward_loop<double>(iter); break;
+        case DType::Float16: prelu_backward_loop<Half>(iter); break;
+        case DType::BFloat16: prelu_backward_loop<BFloat16>(iter); break;
+        default:
+            TP_THROW(TypeError, "_prelu_kernel_backward: unsupported dtype");
+    }
+    return {grad_self, grad_weight};
+}
+
 // ---------------------------------------------------------------------------
 // log_sigmoid_forward (+ out) and log_sigmoid_backward (+ out)
 // ---------------------------------------------------------------------------
@@ -479,6 +563,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ActivationMoreOps) {
     m.impl("_log_softmax_backward_data", _log_softmax_backward_data_cpu);
     m.impl("_log_softmax_backward_data.out", _log_softmax_backward_data_out_cpu);
     m.impl("_prelu_kernel", _prelu_kernel_cpu);
+    m.impl("_prelu_kernel_backward", _prelu_kernel_backward_cpu);
     m.impl("log_sigmoid_forward", log_sigmoid_forward_cpu);
     m.impl("log_sigmoid_forward.output", log_sigmoid_forward_out_cpu);
     m.impl("log_sigmoid_backward.grad_input", log_sigmoid_backward_out_cpu);

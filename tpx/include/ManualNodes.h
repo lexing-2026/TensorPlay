@@ -124,6 +124,48 @@ inline Tensor embedding_bag_psw_backward(
 // `expr * alpha` elide the pointwise multiply entirely when the scalar is 1,
 // so beta=alpha=1 backwards (every F.linear/addmm training step) no longer
 // pay a full-tensor mul + allocation per gradient slot.
+// PReLU gradients.  The forward reads one slope per channel; the elementwise
+// backward kernel wants that slope already shaped to broadcast over `self`,
+// and returns the weight gradient per input element.  Folding it back onto
+// the parameter sums every axis except the channel axis (all axes when the
+// slope is shared).
+inline Tensor prelu_broadcast_weight(const Tensor& self, const Tensor& weight) {
+    std::vector<int64_t> shape(static_cast<size_t>(self.dim()), 1);
+    if (self.dim() >= 2) {
+        shape[1] = weight.numel();
+    } else if (self.dim() == 1) {
+        shape[0] = weight.numel();
+    }
+    return ops::reshape(weight, shape);
+}
+
+inline std::tuple<Tensor, Tensor> prelu_backward(const Tensor& grad,
+                                                 const Tensor& self,
+                                                 const Tensor& weight) {
+    if (!grad.defined()) return {Tensor(), Tensor()};
+    auto parts = ops::_prelu_kernel_backward(
+        grad, self, prelu_broadcast_weight(self, weight));
+    const Tensor& per_element = std::get<1>(parts);
+
+    const auto weight_shape = static_cast<std::vector<int64_t>>(weight.shape());
+    Tensor grad_weight;
+    if (weight.numel() == 1 || self.dim() == 0) {
+        grad_weight = ops::sum(per_element);
+    } else {
+        const int64_t channel_dim = self.dim() >= 2 ? 1 : 0;
+        std::vector<int64_t> reduced;
+        for (int64_t d = 0; d < per_element.dim(); ++d) {
+            if (d != channel_dim) reduced.push_back(d);
+        }
+        grad_weight = reduced.empty() ? per_element
+                                      : ops::sum(per_element, reduced);
+    }
+    if (static_cast<std::vector<int64_t>>(grad_weight.shape()) != weight_shape) {
+        grad_weight = ops::reshape(grad_weight, weight_shape);
+    }
+    return {std::get<0>(parts), grad_weight};
+}
+
 inline Tensor maybe_multiply(const Tensor& t, const Scalar& s) {
     if (s.toDouble() == 1.0) return t;
     return t.mul(s);

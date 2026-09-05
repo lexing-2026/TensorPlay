@@ -119,6 +119,7 @@ set(P10_SOURCES
     src/backend/composite/FactoryToolsComposite.cpp
     src/backend/composite/ChanelShuffle.cpp
     src/backend/composite/BaseMetaComposites.cpp
+    src/backend/composite/MetaView.cpp
     src/backend/composite/CompositeViewCopyKernels.cpp
     src/backend/composite/ConvolutionTBC.cpp
     src/backend/composite/Distance.cpp

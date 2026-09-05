@@ -624,6 +624,10 @@
 - name: hardsigmoid(Tensor self) -> Tensor
   self: hardsigmoid_backward(grad, self)
 
+- name: prelu(Tensor self, Tensor weight) -> Tensor
+  self: std::get<0>(prelu_backward(grad, self, weight))
+  weight: std::get<1>(prelu_backward(grad, self, weight))
+
 - name: leaky_relu(Tensor self, Scalar negative_slope=0.01) -> Tensor
   self: leaky_relu_backward(grad, self, negative_slope, false)
 
@@ -1355,3 +1359,41 @@
 
 - name: renorm(Tensor self, Scalar p, int dim, Scalar maxnorm) -> Tensor
   self: renorm_backward(grad, self, p, dim, maxnorm)
+
+# Comparison outputs carry no gradient: the autograd wrapper resolves above
+# the backend keys but records no history and keeps the results detached.
+- name: eq.Scalar(Tensor self, Scalar other) -> Tensor
+  output_differentiability: [False]
+
+- name: eq.Tensor(Tensor self, Tensor other) -> Tensor
+  output_differentiability: [False]
+
+- name: ge.Scalar(Tensor self, Scalar other) -> Tensor
+  output_differentiability: [False]
+
+- name: ge.Tensor(Tensor self, Tensor other) -> Tensor
+  output_differentiability: [False]
+
+- name: gt.Scalar(Tensor self, Scalar other) -> Tensor
+  output_differentiability: [False]
+
+- name: gt.Tensor(Tensor self, Tensor other) -> Tensor
+  output_differentiability: [False]
+
+- name: le.Scalar(Tensor self, Scalar other) -> Tensor
+  output_differentiability: [False]
+
+- name: le.Tensor(Tensor self, Tensor other) -> Tensor
+  output_differentiability: [False]
+
+- name: lt.Scalar(Tensor self, Scalar other) -> Tensor
+  output_differentiability: [False]
+
+- name: lt.Tensor(Tensor self, Tensor other) -> Tensor
+  output_differentiability: [False]
+
+- name: ne.Scalar(Tensor self, Scalar other) -> Tensor
+  output_differentiability: [False]
+
+- name: ne.Tensor(Tensor self, Tensor other) -> Tensor
+  output_differentiability: [False]
