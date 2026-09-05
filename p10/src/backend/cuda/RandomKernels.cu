@@ -1761,6 +1761,12 @@ Tensor& bernoulli_tensor_inplace_kernel_cuda(
     }
 
     Tensor probability = prepare_bernoulli_probabilities(self, probabilities);
+    const Tensor valid_probabilities = Tensor::logical_and(
+        probability.ge(Scalar(0)), probability.le(Scalar(1)));
+    if (!valid_probabilities.all().item<bool>()) {
+        TP_THROW(ValueError,
+                 "bernoulli_ expects probability values in [0, 1]");
+    }
     if (self.dtype() == DType::Float64) {
         launch_bernoulli_tensor_for_output<double>(
             probability, self, std::move(generator));
