@@ -1076,11 +1076,23 @@ Tensor sparse_coo_tensor_indices_native(const Tensor& indices, const Tensor& val
                                         std::optional<Device> device,
                                         std::optional<bool> pin_memory,
                                         std::optional<bool> is_coalesced) {
-    (void)layout; (void)pin_memory;
+    if (layout.has_value() && *layout != 0) {
+        TP_THROW(ValueError, "sparse_coo_tensor: layout must be sparse_coo");
+    }
+    Tensor i = indices;
     Tensor v = values;
-    if (dtype.has_value() && v.dtype() != *dtype) v = v.to(*dtype);
-    if (device.has_value() && v.device() != *device) v = v.to(*device);
-    return ops::sparse_coo_tensor(indices, v, std::optional<std::vector<int64_t>>{},
+    if (device.has_value()) {
+        if (i.device() != *device) i = i.to(*device);
+        if (v.device() != *device) v = v.to(*device);
+    }
+    if (dtype.has_value() && *dtype != DType::Undefined && v.dtype() != *dtype) {
+        v = v.to(*dtype);
+    }
+    if (pin_memory.value_or(false)) {
+        i = i.pin_memory();
+        v = v.pin_memory();
+    }
+    return ops::sparse_coo_tensor(i, v, std::optional<std::vector<int64_t>>{},
                                   is_coalesced.value_or(false));
 }
 
@@ -1091,11 +1103,23 @@ Tensor sparse_coo_tensor_indices_size_native(const Tensor& indices, const Tensor
                                              std::optional<Device> device,
                                              std::optional<bool> pin_memory,
                                              std::optional<bool> is_coalesced) {
-    (void)layout; (void)pin_memory;
+    if (layout.has_value() && *layout != 0) {
+        TP_THROW(ValueError, "sparse_coo_tensor: layout must be sparse_coo");
+    }
+    Tensor i = indices;
     Tensor v = values;
-    if (dtype.has_value() && v.dtype() != *dtype) v = v.to(*dtype);
-    if (device.has_value() && v.device() != *device) v = v.to(*device);
-    return ops::sparse_coo_tensor(indices, v, size, is_coalesced.value_or(false));
+    if (device.has_value()) {
+        if (i.device() != *device) i = i.to(*device);
+        if (v.device() != *device) v = v.to(*device);
+    }
+    if (dtype.has_value() && *dtype != DType::Undefined && v.dtype() != *dtype) {
+        v = v.to(*dtype);
+    }
+    if (pin_memory.value_or(false)) {
+        i = i.pin_memory();
+        v = v.pin_memory();
+    }
+    return ops::sparse_coo_tensor(i, v, size, is_coalesced.value_or(false));
 }
 
 Tensor sparse_coo_tensor_size_native(const std::vector<int64_t>& size,
@@ -1103,8 +1127,191 @@ Tensor sparse_coo_tensor_size_native(const std::vector<int64_t>& size,
                                      std::optional<int64_t> layout,
                                      std::optional<Device> device,
                                      std::optional<bool> pin_memory) {
-    (void)layout;
-    return ops::empty(size, dtype, device, pin_memory.value_or(false));
+    if (layout.has_value() && *layout != 0) {
+        TP_THROW(ValueError, "sparse_coo_tensor: layout must be sparse_coo");
+    }
+    Tensor indices = ops::empty(
+        {static_cast<int64_t>(size.size()), 0}, DType::Int64, device,
+        pin_memory.value_or(false));
+    Tensor values = ops::empty({0}, dtype, device,
+                               pin_memory.value_or(false));
+    return ops::sparse_coo_tensor(indices, values, size, false);
+}
+
+void validate_csr_components(const Tensor& crow_indices,
+                             const Tensor& col_indices,
+                             const Tensor& values,
+                             const std::vector<int64_t>& size) {
+    if (crow_indices.dim() != 1 || col_indices.dim() != 1) {
+        TP_THROW(ValueError, "sparse_csr_tensor: crow/col must be 1-D tensors");
+    }
+    if (values.dim() != 1) {
+        TP_THROW(ValueError, "sparse_csr_tensor: values must be 1-D");
+    }
+    if (crow_indices.dtype() != DType::Int32 &&
+        crow_indices.dtype() != DType::Int64) {
+        TP_THROW(TypeError,
+                 "sparse_csr_tensor: crow_indices must be Int32 or Int64");
+    }
+    if (col_indices.dtype() != DType::Int32 &&
+        col_indices.dtype() != DType::Int64) {
+        TP_THROW(TypeError,
+                 "sparse_csr_tensor: col_indices must be Int32 or Int64");
+    }
+    if (crow_indices.device() != col_indices.device() ||
+        crow_indices.device() != values.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "sparse_csr_tensor: crow/col/values must share one device");
+    }
+    if (size.size() != 2 || size[0] < 0 || size[1] < 0) {
+        TP_THROW(ValueError,
+                 "sparse_csr_tensor: size must contain two non-negative entries");
+    }
+    const int64_t rows = size[0];
+    const int64_t nnz = col_indices.size(0);
+    if (crow_indices.size(0) != rows + 1) {
+        TP_THROW(ValueError,
+                 "sparse_csr_tensor: crow must have rows+1 entries");
+    }
+    if (values.size(0) != nnz) {
+        TP_THROW(ValueError,
+                 "sparse_csr_tensor: col and values must have the same nnz");
+    }
+
+    Tensor crow_host = crow_indices.device().is_cpu()
+        ? crow_indices.contiguous()
+        : crow_indices.to(Device(DeviceType::CPU)).contiguous();
+    Tensor col_host = col_indices.device().is_cpu()
+        ? col_indices.contiguous()
+        : col_indices.to(Device(DeviceType::CPU)).contiguous();
+    Tensor crow64 = crow_host.dtype() == DType::Int64
+        ? crow_host : crow_host.to(DType::Int64);
+    Tensor col64 = col_host.dtype() == DType::Int64
+        ? col_host : col_host.to(DType::Int64);
+    const int64_t* crow = crow64.data_ptr<int64_t>();
+    const int64_t* col = col64.data_ptr<int64_t>();
+    if (crow[0] != 0) {
+        TP_THROW(ValueError, "sparse_csr_tensor: crow must start at zero");
+    }
+    for (int64_t row = 0; row < rows; ++row) {
+        if (crow[row] > crow[row + 1]) {
+            TP_THROW(ValueError,
+                     "sparse_csr_tensor: crow must be non-decreasing");
+        }
+    }
+    if (crow[rows] != nnz) {
+        TP_THROW(ValueError,
+                 "sparse_csr_tensor: crow last entry must equal nnz");
+    }
+    for (int64_t index = 0; index < nnz; ++index) {
+        if (col[index] < 0 || col[index] >= size[1]) {
+            TP_THROW(ValueError,
+                     "sparse_csr_tensor: column index is out of range");
+        }
+    }
+}
+
+std::vector<int64_t> infer_csr_size(const Tensor& crow_indices,
+                                    const Tensor& col_indices) {
+    if (crow_indices.dim() != 1 || col_indices.dim() != 1) {
+        TP_THROW(ValueError, "sparse_csr_tensor: crow/col must be 1-D tensors");
+    }
+    if (crow_indices.size(0) == 0) {
+        TP_THROW(ValueError, "sparse_csr_tensor: crow must not be empty");
+    }
+    if (col_indices.dtype() != DType::Int32 &&
+        col_indices.dtype() != DType::Int64) {
+        TP_THROW(TypeError,
+                 "sparse_csr_tensor: col_indices must be Int32 or Int64");
+    }
+    Tensor col_host = col_indices.device().is_cpu()
+        ? col_indices.contiguous()
+        : col_indices.to(Device(DeviceType::CPU)).contiguous();
+    Tensor col64 = col_host.dtype() == DType::Int64
+        ? col_host : col_host.to(DType::Int64);
+    const int64_t nnz = col64.size(0);
+    int64_t columns = 0;
+    const int64_t* data = col64.data_ptr<int64_t>();
+    for (int64_t index = 0; index < nnz; ++index) {
+        if (data[index] < 0) {
+            TP_THROW(ValueError,
+                     "sparse_csr_tensor: column index must be non-negative");
+        }
+        columns = std::max(columns, data[index] + 1);
+    }
+    return {crow_indices.size(0) - 1, columns};
+}
+
+Tensor build_csr_tensor(const Tensor& crow_indices,
+                        const Tensor& col_indices,
+                        const Tensor& values,
+                        std::optional<std::vector<int64_t>> size,
+                        std::optional<DType> dtype,
+                        std::optional<int64_t> layout,
+                        std::optional<Device> device,
+                        std::optional<bool> pin_memory,
+                        bool validate_inputs) {
+    if (layout.has_value() && *layout != 1) {
+        TP_THROW(ValueError, "sparse_csr_tensor: layout must be sparse_csr");
+    }
+    Tensor target_crow = crow_indices;
+    Tensor target_col = col_indices;
+    Tensor target_values = values;
+    if (device.has_value()) {
+        target_crow = target_crow.to(*device);
+        target_col = target_col.to(*device);
+        target_values = target_values.to(*device);
+    }
+    if (dtype.has_value() && *dtype != DType::Undefined &&
+        target_values.dtype() != *dtype) {
+        target_values = target_values.to(*dtype);
+    }
+    if (pin_memory.value_or(false)) {
+        target_crow = target_crow.pin_memory();
+        target_col = target_col.pin_memory();
+        target_values = target_values.pin_memory();
+    }
+    if (!size.has_value()) {
+        size = infer_csr_size(target_crow, target_col);
+    }
+    if (validate_inputs) {
+        validate_csr_components(target_crow, target_col, target_values, *size);
+    }
+    return Tensor::make_sparse_csr_tensor(
+        target_crow, target_col, target_values, *size);
+}
+
+Tensor sparse_csr_tensor_crow_col_value_native(
+    const Tensor& crow_indices, const Tensor& col_indices, const Tensor& values,
+    std::optional<DType> dtype, std::optional<int64_t> layout,
+    std::optional<Device> device, std::optional<bool> pin_memory) {
+    return build_csr_tensor(crow_indices, col_indices, values, std::nullopt,
+                            dtype, layout, device, pin_memory, true);
+}
+
+Tensor sparse_csr_tensor_crow_col_value_size_native(
+    const Tensor& crow_indices, const Tensor& col_indices, const Tensor& values,
+    const std::vector<int64_t>& size, std::optional<DType> dtype,
+    std::optional<int64_t> layout, std::optional<Device> device,
+    std::optional<bool> pin_memory) {
+    return build_csr_tensor(crow_indices, col_indices, values, size, dtype,
+                            layout, device, pin_memory, true);
+}
+
+Tensor sparse_csr_tensor_unsafe_native(
+    const Tensor& crow_indices, const Tensor& col_indices, const Tensor& values,
+    const std::vector<int64_t>& size, std::optional<DType> dtype,
+    std::optional<int64_t> layout, std::optional<Device> device,
+    std::optional<bool> pin_memory) {
+    return build_csr_tensor(crow_indices, col_indices, values, size, dtype,
+                            layout, device, pin_memory, false);
+}
+
+void validate_sparse_csr_tensor_args_native(
+    const Tensor& crow_indices, const Tensor& col_indices, const Tensor& values,
+    const std::vector<int64_t>& size, std::optional<bool> check_pinning) {
+    (void)check_pinning;
+    validate_csr_components(crow_indices, col_indices, values, size);
 }
 
 Tensor& multinomial_out_native(const Tensor& self, int64_t num_samples, bool replacement,
@@ -1624,6 +1831,12 @@ TENSORPLAY_LIBRARY_IMPL(Composite, VariantHandOps) {
     m.impl("sparse_coo_tensor.indices", sparse_coo_tensor_indices_native);
     m.impl("sparse_coo_tensor.indices_size", sparse_coo_tensor_indices_size_native);
     m.impl("sparse_coo_tensor.size", sparse_coo_tensor_size_native);
+    m.impl("sparse_csr_tensor.crow_col_value", sparse_csr_tensor_crow_col_value_native);
+    m.impl("sparse_csr_tensor.crow_col_value_size",
+           sparse_csr_tensor_crow_col_value_size_native);
+    m.impl("_sparse_csr_tensor_unsafe", sparse_csr_tensor_unsafe_native);
+    m.impl("_validate_sparse_csr_tensor_args",
+           validate_sparse_csr_tensor_args_native);
     m.impl("multinomial.out", multinomial_out_native);
     m.impl("linalg_lu_solve.out", linalg_lu_solve_out_native);
     m.impl("split_with_sizes_copy.out", split_with_sizes_copy_out_native);
