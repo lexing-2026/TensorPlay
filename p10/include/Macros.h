@@ -22,3 +22,11 @@
 
 #define TP_CONCAT_IMPL(x, y) x##y
 #define TP_CONCAT(x, y) TP_CONCAT_IMPL(x, y)
+
+// Restricted-pointer annotation: MSVC spells it __restrict, GCC/Clang
+// spell it __restrict__.
+#if defined(_MSC_VER) && !defined(__clang__)
+#define TP_RESTRICT __restrict
+#else
+#define TP_RESTRICT __restrict__
+#endif

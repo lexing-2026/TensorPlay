@@ -4,6 +4,7 @@
 #include "Exception.h"
 #include "Utils.h"
 #include "Parallel.h"
+#include "Macros.h"
 #include "ReductionKernels.h"
 #include "TensorIterator.h"
 #include "cpu/CascadeSum.h"
@@ -110,7 +111,12 @@ Tensor review_reduce_result(const Tensor& result, int64_t ndim, const std::vecto
       stride.insert(stride.begin() + dim, 0);
     }
   }
-  return Tensor::as_strided(result, shape, stride, std::nullopt);
+  // The generated as_strided takes a mutable view of the source tensor; the
+  // view it returns never aliases the caller's operand, so a shallow copy of
+  // the reference satisfies the signature without touching the underlying
+  // storage.
+  Tensor as_strided_src = result;
+  return Tensor::as_strided(as_strided_src, shape, stride, std::nullopt);
 }
 
 // ops-based accumulator for the complex dtypes (no Vectorized<complex>
@@ -2173,10 +2179,10 @@ Tensor sum_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
                     nthreads, std::vector<float>(cols, 0.f));
                 const int64_t row_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(cols, 1));
                 tensorplay::parallel::parallel_for(0, rows, row_grain, [&](int64_t rb, int64_t re) {
-                    float* __restrict__ acc = partials[tensorplay::parallel::get_thread_num()].data();
-                    const float* __restrict__ rp = in + rb * cols;
+                    float* TP_RESTRICT acc = partials[tensorplay::parallel::get_thread_num()].data();
+                    const float* TP_RESTRICT rp = in + rb * cols;
                     for (int64_t r = rb; r < re; ++r, rp += cols) {
-                        const float* __restrict__ rowp = rp;
+                        const float* TP_RESTRICT rowp = rp;
                         for (int64_t j = 0; j < cols; ++j) acc[j] += rowp[j];
                     }
                 });
@@ -2191,10 +2197,10 @@ Tensor sum_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
                     nthreads, std::vector<double>(cols, 0.0));
                 const int64_t row_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(cols, 1));
                 tensorplay::parallel::parallel_for(0, rows, row_grain, [&](int64_t rb, int64_t re) {
-                    double* __restrict__ acc = partials[tensorplay::parallel::get_thread_num()].data();
-                    const double* __restrict__ rp = in + rb * cols;
+                    double* TP_RESTRICT acc = partials[tensorplay::parallel::get_thread_num()].data();
+                    const double* TP_RESTRICT rp = in + rb * cols;
                     for (int64_t r = rb; r < re; ++r, rp += cols) {
-                        const double* __restrict__ rowp = rp;
+                        const double* TP_RESTRICT rowp = rp;
                         for (int64_t j = 0; j < cols; ++j) acc[j] += rowp[j];
                     }
                 });
