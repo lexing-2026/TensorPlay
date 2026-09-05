@@ -29,13 +29,17 @@ public:
     DType defaultDType() const { return default_dtype_; }
 
     // -- Default device --------------------------------------------------
-    // Thread-local so that set_default_device() in one thread does not leak
-    void setDefaultDevice(std::optional<Device> device) { default_device_ = device; }
-    void clearDefaultDevice() { default_device_.reset(); }
-    std::optional<Device> getDefaultDeviceOverride() const { return default_device_; }
+    // Thread-local so that set_default_device() in one thread does not
+    // leak into other threads. The TLS slots live inside the library:
+    // thread-storage objects cannot carry a dll interface on Windows, so
+    // the exported surface keeps plain accessors.
+    void setDefaultDevice(std::optional<Device> device);
+    void clearDefaultDevice();
+    std::optional<Device> getDefaultDeviceOverride() const;
     // The device factory functions allocate on; "cpu" when no override is set.
     Device defaultDevice() const {
-        if (default_device_.has_value()) return *default_device_;
+        if (getDefaultDeviceOverride().has_value())
+            return *getDefaultDeviceOverride();
         return Device(DeviceType::CPU);
     }
     // Scoped override backing `with tensorplay.device(...):`,
@@ -94,8 +98,6 @@ private:
     friend P10_API Context& globalContext();
 
     DType default_dtype_ = DType::Float32;
-    inline static thread_local std::optional<Device> default_device_;
-    inline static thread_local std::vector<std::optional<Device>> device_stack_;
     bool deterministic_algorithms_ = false;
     bool deterministic_algorithms_warn_only_ = false;
     Float32MatmulPrecision float32_matmul_precision_ = Float32MatmulPrecision::HIGHEST;
