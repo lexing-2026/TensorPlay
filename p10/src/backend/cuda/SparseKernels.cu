@@ -15,6 +15,10 @@ namespace {
 
 constexpr int kMaxSparseDims = 64;
 
+struct SparseBlockLayoutInfo {
+    int64_t shape[kMaxSparseDims];
+};
+
 struct SparseGatherInfo {
     int sparse_dim;
     int dense_dim;
@@ -428,6 +432,46 @@ __global__ void coo_from_positions_kernel(int64_t nnz, int64_t ncols,
     const unsigned char* src = dense_data + p * elem_size;
     unsigned char* dst = values + i * elem_size;
     for (int64_t b = 0; b < elem_size; ++b) dst[b] = src[b];
+}
+
+__global__ void sparse_block_mask_bytes_kernel(
+    int64_t blocks, int64_t block_bytes, const unsigned char* data, bool* mask) {
+    const int64_t block = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (block >= blocks) return;
+    if (block_bytes == 0) {
+        mask[block] = false;
+        return;
+    }
+    const unsigned char* source = data + block * block_bytes;
+    unsigned char accumulator = 0;
+    for (int64_t byte = 0; byte < block_bytes; ++byte) {
+        accumulator |= source[byte];
+    }
+    mask[block] = accumulator != 0;
+}
+
+__global__ void sparse_blocks_from_positions_kernel(
+    int64_t nnz, int64_t sparse_dim, int64_t block_bytes,
+    SparseBlockLayoutInfo layout, const int64_t* positions,
+    const unsigned char* dense_data, int64_t* indices,
+    unsigned char* values) {
+    const int64_t output =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (output >= nnz) return;
+
+    const int64_t block = positions[output];
+    int64_t remainder = block;
+    for (int64_t d = sparse_dim - 1; d >= 0; --d) {
+        const int64_t dim_size = layout.shape[d];
+        indices[d * nnz + output] = remainder % dim_size;
+        remainder /= dim_size;
+    }
+
+    const unsigned char* source = dense_data + block * block_bytes;
+    unsigned char* destination = values + output * block_bytes;
+    for (int64_t byte = 0; byte < block_bytes; ++byte) {
+        destination[byte] = source[byte];
+    }
 }
 
 __global__ void csr_count_rows_kernel(int64_t nnz, const int64_t* row_coords,
@@ -1313,6 +1357,94 @@ Tensor to_sparse_coo_native(const Tensor& self) {
         indices, values, static_cast<std::vector<int64_t>>(self.shape()), true);
 }
 
+Tensor to_sparse_coo_native_sparse_dim(const Tensor& self, int64_t sparse_dim) {
+    const int64_t ndim = self.dim();
+    if (sparse_dim < 0 || sparse_dim > ndim) {
+        TP_THROW(ValueError,
+                 "to_sparse(): sparse_dim must be in [0," +
+                     std::to_string(ndim) + "]");
+    }
+    if (ndim > 0 && sparse_dim == 0) {
+        TP_THROW(ValueError,
+                 "to_sparse(): sparse_dim must be greater than zero for a non-scalar tensor");
+    }
+    if (ndim > kMaxSparseDims) {
+        TP_THROW(RuntimeError, "to_sparse(): tensor rank exceeds CUDA sparse limit");
+    }
+
+    Tensor contiguous_self = self.contiguous();
+    const std::vector<int64_t> sizes =
+        static_cast<std::vector<int64_t>>(contiguous_self.shape());
+    const int64_t outer_numel = product_of(
+        std::vector<int64_t>(sizes.begin(), sizes.begin() + sparse_dim));
+    const int64_t block_numel = product_of(
+        std::vector<int64_t>(sizes.begin() + sparse_dim, sizes.end()));
+    const int64_t nnz_capacity = outer_numel;
+    const int64_t block_bytes =
+        block_numel * static_cast<int64_t>(contiguous_self.itemsize());
+    SparseBlockLayoutInfo layout{};
+    for (int64_t d = 0; d < ndim; ++d) {
+        layout.shape[d] = sizes[static_cast<size_t>(d)];
+    }
+    std::vector<int64_t> values_shape{0};
+    values_shape.insert(values_shape.end(), sizes.begin() + sparse_dim, sizes.end());
+
+    if (outer_numel == 0) {
+        Tensor indices = Tensor::empty({sparse_dim, 0}, DType::Int64, self.device());
+        Tensor values = Tensor::empty(values_shape, contiguous_self.dtype(), self.device());
+        return Tensor::make_sparse_coo_tensor(indices, values, sizes, true);
+    }
+
+    const cudaStream_t stream = getCurrentCUDAStream().stream();
+    Tensor mask = Tensor::empty({outer_numel}, DType::Bool, self.device());
+    sparse_block_mask_bytes_kernel<<<coalesce_blocks(outer_numel), kCoalesceThreads,
+                                    0, stream>>>(
+        outer_numel, block_bytes,
+        reinterpret_cast<const unsigned char*>(contiguous_self.data_ptr()),
+        mask.data_ptr<bool>());
+    checkCuda(cudaGetLastError(), "CUDA sparse block mask kernel");
+
+    thrust::counting_iterator<int64_t> counting(0);
+    Tensor positions = Tensor::empty({nnz_capacity}, DType::Int64, self.device());
+    Tensor count_dev = Tensor::zeros({1}, DType::Int64, self.device());
+    size_t temporary_bytes = 0;
+    checkCuda(cub::DeviceSelect::Flagged(
+                  nullptr, temporary_bytes, counting, mask.data_ptr<bool>(),
+                  positions.data_ptr<int64_t>(), count_dev.data_ptr<int64_t>(),
+                  static_cast<int>(outer_numel), stream),
+              "CUB sparse block select size query");
+    Tensor temporary = Tensor::empty(
+        {static_cast<int64_t>(temporary_bytes == 0 ? 1 : temporary_bytes)},
+        DType::UInt8, self.device());
+    checkCuda(cub::DeviceSelect::Flagged(
+                  temporary.data_ptr(), temporary_bytes, counting,
+                  mask.data_ptr<bool>(), positions.data_ptr<int64_t>(),
+                  count_dev.data_ptr<int64_t>(), static_cast<int>(outer_numel),
+                  stream),
+              "CUB sparse block select");
+
+    int64_t nnz = 0;
+    checkCuda(cudaMemcpyAsync(&nnz, count_dev.data_ptr<int64_t>(),
+                              sizeof(int64_t), cudaMemcpyDeviceToHost, stream),
+              "CUDA sparse block nnz readback");
+    checkCuda(cudaStreamSynchronize(stream), "CUDA sparse block nnz sync");
+
+    Tensor indices = Tensor::empty({sparse_dim, nnz}, DType::Int64, self.device());
+    values_shape[0] = nnz;
+    Tensor values = Tensor::empty(values_shape, contiguous_self.dtype(), self.device());
+    if (nnz > 0) {
+        sparse_blocks_from_positions_kernel<<<coalesce_blocks(nnz), kCoalesceThreads,
+                                              0, stream>>>(
+            nnz, sparse_dim, block_bytes, layout,
+            positions.data_ptr<int64_t>(),
+            reinterpret_cast<const unsigned char*>(contiguous_self.data_ptr()),
+            indices.data_ptr<int64_t>(),
+            reinterpret_cast<unsigned char*>(values.data_ptr()));
+        checkCuda(cudaGetLastError(), "CUDA sparse block gather kernel");
+    }
+    return Tensor::make_sparse_coo_tensor(indices, values, sizes, true);
+}
+
 } // namespace
 
 Tensor to_sparse_coo_cuda(const Tensor& self) {
@@ -1323,6 +1455,24 @@ Tensor to_sparse_coo_cuda(const Tensor& self) {
                  "to_sparse(): a 0-dim tensor cannot be made sparse");
     }
     return to_sparse_coo_native(self);
+}
+
+Tensor to_sparse_coo_cuda_sparse_dim(const Tensor& self, int64_t sparse_dim) {
+    if (self.is_sparse_csr()) {
+        if (sparse_dim != 2) {
+            TP_THROW(ValueError,
+                     "to_sparse(): compressed input requires sparse_dim=2");
+        }
+        return csr_to_coo_cuda(self).coalesce();
+    }
+    if (self.is_sparse()) {
+        if (sparse_dim != self.sparse_dim()) {
+            TP_THROW(ValueError,
+                     "to_sparse(): sparse_dim must match the sparse input");
+        }
+        return self.coalesce();
+    }
+    return to_sparse_coo_native_sparse_dim(self, sparse_dim);
 }
 
 Tensor to_sparse_csr_cuda(const Tensor& self) {
