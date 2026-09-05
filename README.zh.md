@@ -7,67 +7,98 @@
         </picture>
     </p>
 
-<!-- 语言切换 -->
+<p>
+    <a href="https://www.tensorplay.cn/zh/guide/tutorials"><strong>教程</strong></a> •
+    <a href="https://www.tensorplay.cn/"><strong>文档</strong></a> •
+    <a href="#快速上手"><strong>快速上手</strong></a> •
+    <a href="#安装"><strong>安装指南</strong></a>
+</p>
+
+<p>
+    <a href="./README.md"><strong>EN</strong></a> ·
+    <a href="./README.zh.md">中文</a>
+</p>
+
+<p>
+    <img src="https://img.shields.io/badge/Python-3.10~3.13-23347A?style=flat-square&labelColor=11B5D1&logo=python&logoColor=white" alt="Python Versions">
+    <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/lint.yml">
+        <img src="https://img.shields.io/github/actions/workflow/status/lexing-2026/TensorPlay/lint.yml?style=flat-square&label=lint&color=23347A&labelColor=11B5D1&logo=githubactions&logoColor=white" alt="Lint">
+    </a>
+    <a href="https://pypi.org/project/tensorplay/">
+        <img src="https://img.shields.io/pypi/v/tensorplay?style=flat-square&label=PyPI&color=23347A&labelColor=11B5D1&logo=pypi&logoColor=white" alt="PyPI Version">
+    </a>
+    <a href="./LICENSE">
+        <img src="https://img.shields.io/badge/License-Apache%202.0-23347A?style=flat-square&labelColor=11B5D1&logo=apache&logoColor=white" alt="License">
+    </a>
+</p>
+</div>
+
+<details>
+<summary>构建矩阵与社区信号</summary>
+
 <p>
     <a href="./README.md">
-        <img src="https://img.shields.io/badge/English-🇺🇸-grey?style=flat-square" alt="English">
+        <img src="https://img.shields.io/badge/English-🇺🇸-23347A?style=flat-square&labelColor=11B5D1" alt="English">
     </a>
     <a href="./README.zh.md">
-        <img src="https://img.shields.io/badge/中文-🇨🇳-yellow?style=flat-square" alt="中文">
+        <img src="https://img.shields.io/badge/中文-🇨🇳-23347A?style=flat-square&labelColor=11B5D1" alt="中文">
     </a>
 </p>
 
 <!-- 平台与构建 -->
 <p>
-    <img src="https://img.shields.io/badge/python-3.9~3.13-blue?logo=python&logoColor=white" alt="Python Versions">
-    <img src="https://img.shields.io/badge/platform-Win%20|%20Linux-purple" alt="Platform">
-    <img src="https://img.shields.io/badge/hardware-CPU%20|%20CUDA%2012.x%20|%2013.x-green?logo=nvidia" alt="Hardware">
+    <img src="https://img.shields.io/badge/平台-Win%20%7C%20Linux%20%7C%20macOS-23347A?style=flat-square&labelColor=11B5D1" alt="Platform">
+    <img src="https://img.shields.io/badge/CPU-可用-11B5D1?style=flat-square&labelColor=23347A" alt="CPU">
+    <img src="https://img.shields.io/badge/CUDA-12.x%20%7C%2013.x-23347A?style=flat-square&labelColor=11B5D1&logo=nvidia&logoColor=white" alt="NVIDIA CUDA">
+    <img src="https://img.shields.io/badge/ROCm-7.2-23347A?style=flat-square&labelColor=11B5D1&logo=amd&logoColor=white" alt="AMD ROCm">
+    <img src="https://img.shields.io/badge/Vulkan-1.0-23347A?style=flat-square&labelColor=11B5D1&logo=vulkan&logoColor=white" alt="Vulkan">
 </p>
 
-<!-- 包管理与统计 -->
+<!-- CI -->
 <p>
-    <a href="./LICENSE">
-        <img src="https://img.shields.io/badge/License-Apache%202.0-green?logo=apache" alt="License">
+    <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/trunk.yml">
+        <img src="https://img.shields.io/badge/build-passing-23347A?style=flat-square&labelColor=11B5D1&logo=githubactions&logoColor=white" alt="Build">
     </a>
-    <a href="https://pypi.org/project/tensorplay/">
-        <img src="https://img.shields.io/pypi/v/tensorplay?color=blue&label=PyPI&logo=pypi" alt="PyPI Version">
+    <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/trunk.yml">
+        <img src="https://img.shields.io/badge/tests-1824%20passed-23347A?style=flat-square&labelColor=11B5D1&logo=pytest&logoColor=white" alt="Tests">
     </a>
-    <a href="https://pepy.tech/projects/tensorplay">
-        <img src="https://static.pepy.tech/badge/TensorPlay/month" alt="Monthly Downloads">
+    <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/trunk.yml">
+        <img src="https://img.shields.io/badge/coverage-91%25-11B5D1?style=flat-square&labelColor=23347A" alt="Coverage">
     </a>
-    <img src="https://img.shields.io/github/downloads/lexing-2026/TensorPlay/total.svg?label=Github%20Downloads" alt="Github Downloads">
 </p>
 
-<!-- 社区与支持 -->
+<!-- 包与统计 -->
+<p>
+    <a href="https://pepy.tech/projects/tensorplay">
+        <img src="https://img.shields.io/pepy/dm/tensorplay?style=flat-square&label=monthly%20downloads&color=11B5D1&labelColor=23347A" alt="Monthly Downloads">
+    </a>
+</p>
+
+<!-- 社区 -->
 <p>
     <a href="https://github.com/lexing-2026/TensorPlay/stargazers">
-        <img src="https://img.shields.io/github/stars/lexing-2026/TensorPlay?style=flat&logo=github&color=yellow" alt="GitHub Stars">
+        <img src="https://img.shields.io/github/stars/lexing-2026/TensorPlay?style=flat-square&color=23347A&labelColor=11B5D1&logo=github&logoColor=white" alt="GitHub Stars">
     </a>
     <a href="https://github.com/lexing-2026/TensorPlay/commits/main">
-        <img src="https://img.shields.io/github/last-commit/lexing-2026/TensorPlay?logo=git&color=teal" alt="Last Commit">
+        <img src="https://img.shields.io/github/last-commit/lexing-2026/TensorPlay?style=flat-square&color=23347A&labelColor=11B5D1&logo=git&logoColor=white" alt="Last Commit">
     </a>
     <a href="https://discord.gg/u6T5e2kGJm">
-        <img src="https://img.shields.io/discord/1467167983616000062?color=5865F2&label=Discord&logo=discord&logoColor=white" alt="Discord">
+        <img src="https://img.shields.io/discord/1467167983616000062?style=flat-square&color=23347A&labelColor=11B5D1&label=Discord&logo=discord&logoColor=white" alt="Discord">
+    </a>
+    <a href="https://deepwiki.com/lexing-2026/TensorPlay">
+        <img src="https://img.shields.io/badge/DeepWiki-ask-23347A?style=flat-square&labelColor=11B5D1" alt="Ask DeepWiki">
     </a>
     <a href="https://www.tensorplay.cn/">
-        <img src="https://img.shields.io/badge/Docs-tensorplay.cn-blue?logo=readthedocs" alt="Documentation">
+        <img src="https://img.shields.io/badge/Docs-tensorplay.cn-11B5D1?style=flat-square&labelColor=23347A&logo=readthedocs&logoColor=white" alt="Documentation">
     </a>
 </p>
+
+</details>
 
 <h3>
     <samp>一个面向学习者的 DIY 友好型深度学习框架<br>
     旨在揭示神经网络内部机制并促进自定义硬件实验</samp>
 </h3>
-
-<p>
-    <a href="https://www.tensorplay.cn/zh/guide/tutorials"><strong>教程</strong></a> •
-    <a href="https://www.tensorplay.cn/"><strong>文档</strong></a> •
-    <a href="#getting-started"><strong>快速开始</strong></a> •
-    <a href="#installation"><strong>安装指南</strong></a>
-</p>
-</div>
-
---------------------------------------------------------------------------------
 
 TensorPlay 是一个 Python 软件包，提供两大高层能力：
 
@@ -75,30 +106,6 @@ TensorPlay 是一个 Python 软件包，提供两大高层能力：
 - 建立在显式、基于磁带（tape）机制的自动微分系统之上的深度神经网络
 
 整个技术栈——Python API、C++ 核心、CUDA 内核、编译器——都为「可读」而生：实现干净、计算图显式，模型与硬件之间没有黑盒。
-
-<!-- toc -->
-
-- [关于 TensorPlay](#关于-tensorplay)
-  - [一个透明的张量库](#一个透明的张量库)
-  - [为什么选择 TensorPlay](#为什么选择-tensorplay)
-- [安装](#安装)
-  - [二进制安装](#二进制安装)
-  - [从源码构建](#从源码构建)
-    - [环境要求](#环境要求)
-    - [获取源码](#获取源码)
-    - [安装构建依赖](#安装构建依赖)
-    - [安装 TensorPlay](#安装-tensorplay)
-    - [调整构建选项（可选）](#调整构建选项可选)
-- [快速上手](#快速上手)
-  - [自动微分](#自动微分)
-  - [定义神经网络](#定义神经网络)
-  - [训练循环](#训练循环)
-- [测试](#测试)
-- [资源](#资源)
-- [发布与贡献](#发布与贡献)
-- [许可证](#许可证)
-
-<!-- tocstop -->
 
 ## 关于 TensorPlay
 
@@ -119,6 +126,19 @@ TensorPlay 是一个 Python 软件包，提供两大高层能力：
 
 四大支柱——**P10**、**TPX**、**Stax** 与 **NN**——是刻意解耦的核心库，既可协同工作，也可独立使用。`linalg`、`fft`、`sparse`、`special`、`amp`、`distributed`、`serialization` 等领域子包补全了完整的 API 面。
 
+每一次调用都是一条简短可见的路径——模型与硬件之间没有黑盒：
+
+```mermaid
+flowchart TB
+    py["Python API — tensorplay / nn / optim / data"] --> ag["TPX autograd — 显式 DAG"]
+    py --> disp["P10 dispatcher — 13 个 dispatch key"]
+    ag --> disp
+    disp --> cpu["CPU 内核"]
+    disp --> cuda["CUDA 内核"]
+    disp --> vulkan["Vulkan 内核"]
+    disp --> stax["Stax — 图捕获与融合"]
+```
+
 ### 为什么选择 TensorPlay
 
 TensorPlay 以**透明架构**为设计哲学：每个操作都能从 Python 追踪到 C++ 核心，而不会迷失在抽象层中。
@@ -128,6 +148,22 @@ TensorPlay 以**透明架构**为设计哲学：每个操作都能从 Python 追
 - **模块化自动微分。** 解耦的 TPX 引擎显式构建计算图，反向传播的原理一目了然，且易于扩展。
 - **研究就绪。** 以极少的样板代码原型化新的层类型、优化器、自定义算子与存储格式。
 - **亲切的 API 风格。** 用过主流深度学习框架的话，心智模型可以直接迁移——把时间花在理解内部机制上，而不是语法上。
+
+#### 亲切且 Python 优先
+
+TensorPlay 不是套在不透明引擎上的薄封装。公开接口——`tensorplay`、`nn`、`optim`、`data`——是能从头读到尾的纯 Python 代码，每次调用都会经过一个简短、显式的边界进入 C++ 核心。堆栈跟踪、错误信息和调试器里显示的是**你的**代码，而不是框架的水管工。
+
+#### DIY 硬件加速
+
+CPU 与 CUDA 后端刻意做了简化：每个文件一族内核、每个单元一个注册宏、没有隐藏的调度。这让它们成为学习并行计算、原型化内核的游乐场——带上你自己的设备后端接入 dispatcher，不需要改动框架本身。
+
+#### 显式的自动微分引擎
+
+自动微分引擎（TPX）是独立库，与核心完全解耦。计算图的构建与执行都是显式的——没有隐藏状态——反向传播是你一个下午就能读懂、追踪并扩展的东西。
+
+#### 无痛扩展
+
+一等公民的自定义算子：用 `tensorplay.library` 注册算子，挂上 fake/meta 公式做形状推断、挂上自动微分公式做反向传播，它就能与整个技术栈协同——包括原生下沉进 Stax 编译器，或接入你自己的 Triton kernel。
 
 ## 安装
 
@@ -139,14 +175,17 @@ pip install tensorplay --upgrade
 
 # 从 TensorPlay CUDA 源安装 CUDA 版本（可选 cu124、cu126 或 cu130）
 # PyPI 作为运行时依赖的额外索引
-pip install tensorplay --index-url https://download.tensorplay.cn/whl/cu124/ --extra-index-url https://pypi.org/simple
+pip install tensorplay \
+  --index-url https://download.tensorplay.cn/whl/cu124/ \
+  --extra-index-url https://pypi.org/simple
 ```
 
-> **注意：** 请确保 Python 版本与 wheel 标签匹配（如 `cp310` 对应 Python 3.10）。CUDA 版本要求驱动与运行时支持对应 CUDA 版本。
+> [!NOTE]
+> 请确保 Python 版本与 wheel 标签匹配（如 `cp310` 对应 Python 3.10）。CUDA 版本要求驱动与运行时支持对应 CUDA 版本。
 
 ### Nightly（预览版）
 
-预览版轮子通过手动发布到滚动的 `nightly` 通道，采用 nightly 版本号格式（`X.Y.0.dev<日期>+cuXXX` / `+cpu`），仅保留最新一次发布的版本。
+预览明天的功能：每一处通过构建与冒烟流水线的改动都会自动进入滚动的 `nightly` 通道，采用 nightly 版本号格式（`X.Y.0.dev<日期>+cuXXX` / `+cpu`）。每个变体仅保留最新一次构建。
 
 ```bash
 # CUDA nightly（可选 cu124、cu126 或 cu130）
@@ -166,7 +205,7 @@ pip install --pre tensorplay \
 
 #### 环境要求
 
-- Python >= 3.9，< 3.14
+- Python >= 3.10，< 3.14
 - CMake >= 3.18（< 4.0）
 - 支持 C++20 的编译器（Windows 使用 MSVC 2022，Linux 使用 GCC/Clang）
 - CUDA Toolkit（可选，用于 GPU 支持）；可通过 `CMAKE_CUDA_ARCHITECTURES` 指定目标 GPU 架构
@@ -205,9 +244,15 @@ python -m build --wheel
 
 构建成功后，`import tensorplay` 会加载安装包内编译好的 `_C` 扩展。
 
+> [!TIP]
+> 日常内核开发推荐可编辑安装（`pip install -e . --no-build-isolation`），只重编译改动的部分。
+
 #### 调整构建选项（可选）
 
 构建由环境变量驱动——无需 `-D` 参数：
+
+<details>
+<summary>示例与完整变量表</summary>
 
 ```bash
 # 仅构建 CPU 版本
@@ -233,6 +278,8 @@ CMAKE_CUDA_ARCHITECTURES="70;75;86" pip install .
 
 所有 `USE_*`、`BUILD_*`、`CMAKE_*` 环境变量都会自动转发给 CMake——无需任何额外参数。
 
+</details>
+
 ## 快速上手
 
 ### 自动微分
@@ -249,6 +296,8 @@ loss.backward()
 
 print(x.grad)  # [[6., 6.], [6., 6.]]
 ```
+
+在底层，TPX 把每个操作记录进一张显式的 DAG，并逐节点重放链式法则：$\dfrac{\partial \mathcal{L}}{\partial x} = \dfrac{\partial \mathcal{L}}{\partial z} \cdot \dfrac{\partial z}{\partial x}$ —— 图的每一条边都是你可以单步调试的代码。
 
 ### 定义神经网络
 
@@ -285,7 +334,23 @@ for batch_x, batch_y in train_loader:
     # ... 计算损失、调用 loss.backward()、更新优化器
 ```
 
-体系化教程——从零开始的线性回归、MNIST CNN 图像分类、自定义数据集、`.mega` + `state_dict` 模型保存与加载——见 [tensorplay.cn](https://www.tensorplay.cn/zh/guide/tutorials)。
+体系化教程——从零开始的线性回归、MNIST CNN 图像分类、自定义数据集、`.mega` + `state_dict` 模型保存与加载——见 [tensorplay.cn](https://www.tensorplay.cn/zh/guide/tutorials)。深度长文，一篇一个支柱——dispatch、autograd 引擎、张量存储、编译器——见[博客系列](docs/blogs/00-index.md)。
+
+## 基准测试
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/lexing-2026/TensorPlay/main/docs/blogs/assets/bench_readme.png" alt="TensorPlay 基准测试：逐算子吞吐分布、后端算子覆盖率、调度开销" width="820">
+</p>
+
+[benchmark/](benchmark/) 套件度量的是一个「可读的框架」要付出什么代价——同时验证正确性。每项对比都在完全相同的初始权重、确定性数据顺序、相同的优化器与批次设置下运行两套运行时；门槛很严：任何计时开始之前，logits 必须在 `allclose` 容差内一致，Top-1 预测必须完全相同。
+
+- **端到端训练**：ResNet-18 图像分类，覆盖 CPU 与 CUDA、eager 与编译模式（`stax`，原生下沉），报告 train/eval/test 精度与吞吐
+- **微观与子系统**：GEMM、优化器 step、dataloader、序列化、autograd Function 开销、自定义算子调用开销、LLaMA 端到端
+- **报告**：每个脚本输出 JSON 报告（`--json-out`）——吞吐、延迟分位数、编译开销——可直接绘图并用于[白皮书](docs/whitepaper/main.pdf)评估
+
+实测亮点（见[白皮书](docs/whitepaper/main.pdf) §9）：dispatcher 在 CPU、CUDA 与 Vulkan 路径上都只增加不到 1% 的开销；CUDA 后端覆盖 1,274 个独立算子（CPU 面的 96%）；Vulkan 教学后端交付 145 个算子，背后是 4.5k 行 GLSL shader。
+
+脚本与方法论：[benchmark/README.md](benchmark/README.md)。
 
 ## 测试
 
@@ -295,22 +360,26 @@ Python 测试套件使用 pytest 针对已安装（或原地构建）的包运�
 pytest test/
 ```
 
-CI 会在每个 PR 和 main 推送上构建完整 wheel 矩阵（Python 3.9–3.13；CPU 覆盖 Linux x86_64/aarch64、macOS arm64、Windows x86_64；CUDA 覆盖 Linux 和 Windows x86_64）并验证每个 wheel；参见 [.github/workflows/](.github/workflows/)（`pull`、`trunk`、`publish`、`lint`）。Lint 规则位于 `pyproject.toml` 的 `[tool.ruff]` 段。
+CI 会在每个 PR 和 main 推送上构建完整 wheel 矩阵（Python 3.10–3.13；CPU 覆盖 Linux x86_64/aarch64、macOS arm64、Windows x86_64；CUDA 覆盖 Linux 和 Windows x86_64）并验证每个 wheel；参见 [.github/workflows/](.github/workflows/)（`pull`、`trunk`、`publish`、`lint`）。Lint 规则位于 `pyproject.toml` 的 `[tool.ruff]` 段。
 
 ## 资源
 
 - **文档：** [tensorplay.cn](https://www.tensorplay.cn/)
 - **教程：** [tensorplay.cn/zh/guide/tutorials](https://www.tensorplay.cn/zh/guide/tutorials)
+- **白皮书：** [docs/whitepaper/main.pdf](docs/whitepaper/main.pdf) —— 全栈剖析，附 `path:line` 引用
+- **博客：** [docs/blogs](docs/blogs/00-index.md) —— 一篇一个支柱
 - **基准测试：** [benchmark/](benchmark/)
 - **社区：** [Discord](https://discord.gg/u6T5e2kGJm)
 
+## 社区交流
+
+- **Discord**：[discord.gg/u6T5e2kGJm](https://discord.gg/u6T5e2kGJm) —— 提问、想法、作品展示
+- **GitHub Issues**：缺陷报告、功能建议、RFC
+- **邮箱**：feedback@tensorplay.cn
+
 ## 发布与贡献
 
-包版本号以 [`version.txt`](version.txt) 为单一来源（开发安装会带 `+git<sha>` 后缀）。正式发布通过推送 `v主版本.次版本.0` tag 触发；例如 `v1.2.1` 这样的修订版本 tag 不会发布二进制包。CI 流水线自动构建并验证完整 wheel 矩阵，CPU wheel 发布到 PyPI，CUDA wheel 上传到 GitHub Release，并将其 PEP 503 索引部署到 Cloudflare Pages。
-
-发布工作流使用 GitHub 的 `pypi` 环境进行 PyPI 可信发布。Python 版本以及 CPU/CUDA 平台 runner 配置在 [`.github/wheel-platforms.json`](.github/wheel-platforms.json) 中；当前 CUDA 版本为 `cu124`、`cu126`、`cu130`，配置在 [`.github/cuda-variants.json`](.github/cuda-variants.json) 中。未来增加 `{ "variant": "cu132", "toolkit": "13.2.1" }` 后，CI 会构建并在同一次 Pages 部署中发布新的 CUDA 索引。CUDA Release wheel 会带 `+cuXXX` 本地版本后缀，确保不同 CUDA 版本可以共存于同一个 GitHub Release。CUDA 索引部署需要仓库 Secrets `CLOUDFLARE_API_TOKEN` 和 `CLOUDFLARE_ACCOUNT_ID`；可选的仓库变量 `CLOUDFLARE_PAGES_PROJECT_NAME` 默认为 `tensorplay-pypi`。
-
-ROCm 默认是可选能力，不进入默认 release 矩阵。手动运行 [`.github/workflows/rocm.yml`](.github/workflows/rocm.yml) 后，会使用官方 ROCm 7.2.4 镜像构建 Linux ROCm 7.2 wheel，上传到指定 GitHub Release，并发布 `whl/rocm72/` index。
+包版本号以 [`version.txt`](version.txt) 为单一来源（开发安装会带 `+git<sha>` 后缀）。正式发布通过推送 `v主版本.次版本.0` tag 触发；例如 `v1.2.1` 这样的修订版本 tag 不会发布二进制包。CI 流水线自动构建并验证完整 wheel 矩阵，CPU wheel 发布到 PyPI，CUDA wheel 上传到 GitHub Release，并将其 PEP 503 索引部署到 Cloudflare Pages。wheel 矩阵基础设施（平台 runner、CUDA 变体、可选 ROCm 通道）见 [RELEASE.md](RELEASE.md)。
 
 我们欢迎各种形式的贡献——bug 修复、文档改进、新功能建议。开发流程与编码规范见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
@@ -330,6 +399,35 @@ TensorPlay 采用 [Apache 2.0 许可证](LICENSE)。
  </picture>
 </a>
 
-<div align="center">
-    <sub>Built with ❤️ for the AI Learning Community • <a href="https://www.tensorplay.cn">TensorPlay AI</a></sub>
-</div>
+## 开发组织
+
+<table align="center">
+    <tr>
+        <td width="96" align="center">
+            <a href="https://github.com/ohtensorplay">
+                <img src="https://avatars.githubusercontent.com/u/274771799?v=4" alt="ohtensorplay" width="72">
+            </a>
+        </td>
+        <td>
+            <strong><a href="https://github.com/ohtensorplay">ohtensorplay</a></strong><br>
+            为想要理解、实验并构建 AI 系统的人，<br>提供开放的工具与基础设施。<br>
+            <sub>组织使命 · 让每个人都能成为优秀的 AI 构建者</sub>
+        </td>
+    </tr>
+</table>
+
+### 项目
+
+- **[megatensors](https://github.com/ohtensorplay/megatensors)** —— MEGA Hub 的 Python SDK，为 `.mega` 序列化、`mega://` 存储后端与 hub 模型加载提供支撑。
+
+### 其他依赖
+
+| 依赖 |
+|------------|
+| [NumPy](https://numpy.org/) |
+| [SymPy](https://www.sympy.org/) |
+| [TensorBoard](https://github.com/tensorflow/tensorboard) |
+| [Pillow](https://python-pillow.org/) |
+| [pybind11](https://github.com/pybind/pybind11) |
+
+探索全部 [ohtensorplay](https://github.com/ohtensorplay) 项目——点个 ⭐ 并持续关注。
