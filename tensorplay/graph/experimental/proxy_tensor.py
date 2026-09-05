@@ -223,6 +223,11 @@ def track_tensor_tree(
     return value
 
 
+_CURRENT_MAKE_GRAPH_TRACER: contextvars.ContextVar["MakeGraphTracer | None"] = (
+    contextvars.ContextVar("_CURRENT_MAKE_GRAPH_TRACER", default=None)
+)
+
+
 class PythonKeyTracer(Tracer):
     """Tracer used by the functional graph capture entry point."""
 
@@ -316,17 +321,64 @@ def make_graph(
             f"{tracing_mode} tensor materialization requires symbolic shape support"
         )
     dynamic_shapes = _resolve_dynamic_shapes(f, dynamic_shapes)
+    session = MakeGraphTracer(decomposition_table)
 
     @functools.wraps(f)
     def wrapped(*args: Any, **kwargs: Any) -> GraphModule:
-        samples = _bind_sample_inputs(f, args, kwargs)
-        tracer = PythonKeyTracer(decomposition_table=decomposition_table, execute=False)
-        tracer.dynamic_shapes = dynamic_shapes
-        graph_module = dispatch_trace(f, tracer, samples)
-        graph_module.meta["tracing_mode"] = tracing_mode
-        return graph_module
+        token = _CURRENT_MAKE_GRAPH_TRACER.set(session)
+        try:
+            samples = _bind_sample_inputs(f, args, kwargs)
+            tracer = PythonKeyTracer(decomposition_table=decomposition_table, execute=False)
+            tracer.dynamic_shapes = dynamic_shapes
+            graph_module = dispatch_trace(f, tracer, samples)
+            graph_module.meta["tracing_mode"] = tracing_mode
+            return graph_module
+        finally:
+            _CURRENT_MAKE_GRAPH_TRACER.reset(token)
 
     return wrapped
+
+
+class MakeGraphTracer:
+    """Session object behind a ``make_fx`` capture.
+
+    Nested captures re-enter the active session through
+    :func:`reenter_make_fx`, which routes here to materialize a callable into
+    its own standalone subgraph while the outer capture is running.
+    """
+
+    def __init__(
+        self,
+        decomposition_table: Mapping[Any, Callable[..., Any]] | None = None,
+    ) -> None:
+        self.decomposition_table = dict(decomposition_table or {})
+
+    def _trace_fn(
+        self,
+        fn: Any,
+        decomposition_table: Mapping[Any, Callable[..., Any]] | None,
+        args: tuple[Any, ...],
+    ) -> GraphModule:
+        token = _CURRENT_MAKE_GRAPH_TRACER.set(self)
+        try:
+            samples = _bind_sample_inputs(fn, args, {})
+            tracer = PythonKeyTracer(
+                decomposition_table=decomposition_table, execute=False
+            )
+            return dispatch_trace(fn, tracer, samples)
+        finally:
+            _CURRENT_MAKE_GRAPH_TRACER.reset(token)
+
+    def trace_subgraph(self, fn: Any, *args: Any) -> GraphModule:
+        return self._trace_fn(fn, self.decomposition_table, args)
+
+    def trace_subgraph_custom_decomp(
+        self,
+        fn: Any,
+        subgraph_decomp_table: Mapping[Any, Callable[..., Any]] | None,
+        *args: Any,
+    ) -> GraphModule:
+        return self._trace_fn(fn, subgraph_decomp_table, args)
 
 
 class DecompositionInterpreter(Transformer):

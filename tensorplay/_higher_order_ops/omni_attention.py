@@ -20,11 +20,23 @@ from tensorplay._higher_order_ops._hop_base import (
     FakeTensorMode,
     HigherOrderOperator,
     _AutoDispatchBelowAutograd,
+    _ExcludeAutocastGuard,
     disable_functional_mode,
     disable_proxy_modes_tracing,
     is_fake_tensor,
     register_fake,
     suspend_functionalization,
+)
+from tensorplay._higher_order_ops.utils import (
+    UnsupportedAliasMutationException,
+    _has_potential_branch_input_mutation,
+    _maybe_reenter_make_fx,
+    autograd_not_implemented,
+    has_user_subclass,
+    redirect_to_mode,
+    save_values_for_backward,
+    saved_values,
+    validate_subgraph_args_types,
 )
 
 
@@ -52,15 +64,39 @@ def _construct_strides(
 
 
 def _permute_strides(out: Tensor, query_strides: tuple[int, ...]) -> Tensor:
-    """Strides for the output tensor to match the memory layout of the query."""
-    fill_order = sorted(
-        range(len(query_strides)), key=lambda i: query_strides[i], reverse=True
+    """
+    Create a new tensor with the same data and shape as the input,
+    but with strides permuted based on the input tensor's stride order.
+
+    Args:
+        out (Tensor): The output tensor of attention.
+        query_strides (List[int]): The stride order of the input query tensor
+
+    Returns:
+        Tensor: A new tensor with same shape and data as the input,
+        but with strides permuted based on the query tensor's stride order.
+    """
+    fill_order = sorted(range(len(query_strides)), key=lambda i: query_strides[i])
+    if out.storage_offset() != 0:
+        raise AssertionError(
+            f"Only support storage_offset == 0, got {out.storage_offset()}"
+        )
+    out_strides = list(_construct_strides(out.shape, fill_order))
+
+    # Attention kernels require stride[-1]=1 for efficient memory access.
+    # Ensure this by moving last dim to front of fill_order if needed.
+    if out_strides[-1] != 1:
+        last_dim = len(out.shape) - 1
+        fill_order = list(fill_order)
+        fill_order.remove(last_dim)
+        fill_order = [last_dim] + fill_order
+        out_strides = _construct_strides(out.shape, fill_order)
+
+    new_out = tensorplay.empty_strided(
+        out.shape, out_strides, dtype=out.dtype, device=out.device
     )
-    expected_strides = _construct_strides(out.shape, fill_order)
-
-    out = out.as_strided(out.shape, expected_strides)
-
-    return out
+    new_out.copy_(out)
+    return new_out
 
 
 class OmniAttentionHOP(HigherOrderOperator):
@@ -79,6 +115,7 @@ class OmniAttentionHOP(HigherOrderOperator):
         score_mod_other_buffers: tuple = (),
         mask_mod_other_buffers: tuple = (),
     ) -> tuple[Tensor, Tensor, Tensor]:
+        validate_subgraph_args_types(score_mod_other_buffers + mask_mod_other_buffers)
         return super().__call__(
             query,
             key,
@@ -116,6 +153,7 @@ class OmniAttentionBackwardHOP(HigherOrderOperator):
         score_mod_other_buffers: tuple = (),
         mask_mod_other_buffers: tuple = (),
     ) -> tuple[Tensor, Tensor, Tensor, tuple[Tensor | None, ...]]:
+        validate_subgraph_args_types(score_mod_other_buffers + mask_mod_other_buffers)
         return super().__call__(
             query,
             key,
@@ -254,6 +292,94 @@ def math_attention(
     )
 
 
+def _omni_attention_autocast_impl(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    score_mod: Callable,
+    block_mask: tuple,
+    scale: float,
+    kernel_options: dict[str, Any],
+    score_mod_other_buffers: tuple,
+    mask_mod_other_buffers: tuple,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """
+    Forward-only autocast shim: cast Q/K/V to the active autocast dtype, then
+    redispatch with autocast routing excluded so we hit the normal implementation.
+    """
+    from tensorplay.amp.autocast_mode import _cast as _autocast_cast
+
+    device_type = query.device.type
+    autocast_dtype = tensorplay.get_autocast_dtype(device_type)
+
+    query = _autocast_cast(query, device_type, autocast_dtype)
+    key = _autocast_cast(key, device_type, autocast_dtype)
+    value = _autocast_cast(value, device_type, autocast_dtype)
+
+    with _ExcludeAutocastGuard():
+        return omni_attention(
+            query,
+            key,
+            value,
+            score_mod,
+            block_mask,
+            scale,
+            kernel_options,
+            score_mod_other_buffers,
+            mask_mod_other_buffers,
+        )
+
+
+@omni_attention.py_impl("AutocastCUDA")
+def omni_attention_autocast_cuda(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    score_mod: Callable,
+    block_mask: tuple,
+    scale: float,
+    kernel_options: dict[str, Any],
+    score_mod_other_buffers: tuple = (),
+    mask_mod_other_buffers: tuple = (),
+) -> tuple[Tensor, Tensor, Tensor]:
+    return _omni_attention_autocast_impl(
+        query,
+        key,
+        value,
+        score_mod,
+        block_mask,
+        scale,
+        kernel_options,
+        score_mod_other_buffers,
+        mask_mod_other_buffers,
+    )
+
+
+@omni_attention.py_impl("AutocastCPU")
+def omni_attention_autocast_cpu(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    score_mod: Callable,
+    block_mask: tuple,
+    scale: float,
+    kernel_options: dict[str, Any],
+    score_mod_other_buffers: tuple = (),
+    mask_mod_other_buffers: tuple = (),
+) -> tuple[Tensor, Tensor, Tensor]:
+    return _omni_attention_autocast_impl(
+        query,
+        key,
+        value,
+        score_mod,
+        block_mask,
+        scale,
+        kernel_options,
+        score_mod_other_buffers,
+        mask_mod_other_buffers,
+    )
+
+
 @omni_attention.py_impl("CompositeExplicitAutograd")
 def sdpa_dense(
     query: Tensor,
@@ -279,6 +405,225 @@ def sdpa_dense(
     )
     out = _permute_strides(out, query.stride())
     return out, lse, max_scores
+
+
+def trace_omni_attention(
+    proxy_mode: Any,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    score_mod: Callable,
+    block_mask: tuple,
+    scale: float,
+    kernel_options: dict[str, Any],
+    score_mod_other_buffers: tuple = (),
+    mask_mod_other_buffers: tuple = (),
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Traces the omni_attention operator with the given score_mod function and other_buffers.
+
+    Trace SDPA will call make_fx with "fake" example vals and then trace the score_mod function
+    This will produce a GraphModule that will be stored on the root tracer as "sdpa_score". We
+    access this graph module in the compiler to inline the score_mod function to the template.
+    """
+    from contextlib import nullcontext
+
+    from tensorplay._dynamo._trace_wrapped_higher_order_op import TransformGetItemToIndex
+    from tensorplay.graph.experimental.proxy_tensor import (
+        track_tensor_tree,
+        unwrap_proxy,
+    )
+
+    # The mode must not intercept its own implementation body: evaluate the
+    # example output with the capture suspended, then trace the subgraphs.
+    with disable_proxy_modes_tracing():
+        example_out = omni_attention(
+            query,
+            key,
+            value,
+            score_mod,
+            block_mask,
+            scale,
+            kernel_options,
+            score_mod_other_buffers,
+            mask_mod_other_buffers,
+        )
+    example_vals = [query.new_zeros((), requires_grad=query.requires_grad)] + [
+        query.new_zeros((), dtype=tensorplay.int64) for _ in range(4)
+    ]
+    mask_example_vals = [query.new_zeros((), dtype=tensorplay.int64) for _ in range(4)]
+    mask_mod = block_mask[-1]
+    with TransformGetItemToIndex():
+        score_graph = reenter_make_fx(score_mod)(
+            *example_vals, *score_mod_other_buffers
+        )
+        mask_graph = reenter_make_fx(mask_mod)(
+            *mask_example_vals, *mask_mod_other_buffers
+        )
+    block_mask = block_mask[:-1] + (mask_graph,)
+    node_args = (
+        query,
+        key,
+        value,
+        score_graph,
+        block_mask,
+        scale,
+        kernel_options,
+        score_mod_other_buffers,
+        mask_mod_other_buffers,
+    )
+    proxy_args = unwrap_proxy(node_args)
+    set_original_aten_op = nullcontext
+    with set_original_aten_op():
+        out_proxy = proxy_mode.tracer.create_proxy(
+            "call_function", omni_attention, proxy_args, {}
+        )
+    return track_tensor_tree(
+        example_out,
+        out_proxy,
+        constant=None,
+        tracer=proxy_mode.tracer,
+    )
+
+
+@omni_attention.py_impl("ProxyTorchDispatchMode")
+def omni_attention_proxy_torch_dispatch_mode(
+    mode: Any,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    score_mod: Callable,
+    block_mask: tuple,
+    scale: float,
+    kernel_options: dict[str, Any],
+    score_mod_other_buffers: tuple = (),
+    mask_mod_other_buffers: tuple = (),
+) -> tuple[Tensor, Tensor, Tensor]:
+    if mode is None:
+        raise AssertionError("Mode should always be enabled for python fallback key")
+    return trace_omni_attention(
+        mode,
+        query,
+        key,
+        value,
+        score_mod,
+        block_mask,
+        scale,
+        kernel_options,
+        score_mod_other_buffers,
+        mask_mod_other_buffers,
+    )
+
+
+class _IdentityFunctionalizeCtx:
+    """Default functionalization context.
+
+    Tensor wrappers do not exist in this build, so unwrapping and wrapping are
+    identities and redispatch continues at the same operator.
+    """
+
+    mode = None
+
+    def unwrap_tensors(self, x: Any) -> Any:
+        return x
+
+    def wrap_tensors(self, x: Any) -> Any:
+        return x
+
+    def redispatch_to_next(self):
+        import contextlib
+
+        return contextlib.nullcontext()
+
+    def functionalize(self, fn: Callable) -> Callable:
+        return fn
+
+
+@omni_attention.py_functionalize_impl
+def omni_attention_functionalize(
+    ctx: Any,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    score_mod: Callable,
+    block_mask: tuple,
+    scale: float,
+    kernel_options: dict[str, Any],
+    score_mod_other_buffers: tuple = (),
+    mask_mod_other_buffers: tuple = (),
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Defines the functionalization rules for the omni_attention operator.
+
+    Right now we are unwrapping each tensor and then redispatching to the next, however we want to
+    guard against any mutations in the score_mod function, to the other_buffers since those
+    are free variables.
+    """
+    from tensorplay._dynamo._trace_wrapped_higher_order_op import TransformGetItemToIndex
+
+    query_unwrapped = ctx.unwrap_tensors(query)
+    key_unwrapped = ctx.unwrap_tensors(key)
+    value_unwrapped = ctx.unwrap_tensors(value)
+    block_mask_unwrapped = ctx.unwrap_tensors(block_mask)
+    score_mod_other_buffers_unwrapped = ctx.unwrap_tensors(score_mod_other_buffers)
+    mask_mod_other_buffers_unwrapped = ctx.unwrap_tensors(mask_mod_other_buffers)
+
+    # Appease the mypy overlords
+    if not isinstance(query_unwrapped, Tensor):
+        raise AssertionError(
+            f"expected query_unwrapped to be Tensor, got {type(query_unwrapped)}"
+        )
+    if not isinstance(key_unwrapped, Tensor):
+        raise AssertionError(
+            f"expected key_unwrapped to be Tensor, got {type(key_unwrapped)}"
+        )
+    if not isinstance(value_unwrapped, Tensor):
+        raise AssertionError(
+            f"expected value_unwrapped to be Tensor, got {type(value_unwrapped)}"
+        )
+    if not isinstance(block_mask_unwrapped, tuple):
+        raise AssertionError(
+            f"expected block_mask_unwrapped to be tuple, got {type(block_mask_unwrapped)}"
+        )
+    if not isinstance(score_mod_other_buffers_unwrapped, tuple):
+        raise AssertionError(
+            f"expected score_mod_other_buffers_unwrapped to be tuple, got {type(score_mod_other_buffers_unwrapped)}"
+        )
+    if not isinstance(mask_mod_other_buffers_unwrapped, tuple):
+        raise AssertionError(
+            f"expected mask_mod_other_buffers_unwrapped to be tuple, got {type(mask_mod_other_buffers_unwrapped)}"
+        )
+
+    example_vals = (
+        [query_unwrapped.new_zeros(())]
+        + [query_unwrapped.new_zeros((), dtype=tensorplay.int64) for _ in range(4)]
+        + list(score_mod_other_buffers_unwrapped)
+    )
+    with ctx.redispatch_to_next():
+        functional_score_mod = ctx.functionalize(score_mod)
+        pre_dispatch = getattr(ctx, "mode", None) is not None and ctx.mode.pre_dispatch
+        with TransformGetItemToIndex():
+            # TODO: So far only the input mutations are checked
+            # In the other HOPs, also aliases are checked which is
+            # omitted here
+            mutates = _has_potential_branch_input_mutation(
+                score_mod, example_vals, pre_dispatch
+            )
+        # We only care about mutations of existing buffers since we can't replay these.
+        # However, we can just error if anything is detected
+        if mutates:
+            raise UnsupportedAliasMutationException("Mutations detected in score_mod")
+
+        out = omni_attention(
+            query_unwrapped,
+            key_unwrapped,
+            value_unwrapped,
+            functional_score_mod,
+            block_mask_unwrapped,
+            scale,
+            kernel_options,
+            score_mod_other_buffers_unwrapped,
+            mask_mod_other_buffers_unwrapped,
+        )
+    return ctx.wrap_tensors(out)
 
 
 def create_fw_bw_graph(
@@ -398,6 +743,10 @@ class OmniAttentionAutogradOp(tensorplay.autograd.Function):
         *score_mod_other_buffers: tuple[Any, ...],
     ) -> tuple[Tensor, Tensor, Tensor]:
         ctx.set_materialize_grads(False)
+        from tensorplay.graph.traceback import current_meta
+
+        # Capture sparsity_hint from tracing metadata so backward can re-annotate
+        ctx._sparsity_hint = current_meta.get("custom", {}).get("sparsity_hint", 0.0)
         any_buffer_requires_grad = any(
             buffer.requires_grad
             for buffer in mask_mod_other_buffers
@@ -427,16 +776,19 @@ class OmniAttentionAutogradOp(tensorplay.autograd.Function):
             )
         # no grads for you sir
         ctx.mark_non_differentiable(max_scores)
-        ctx.save_for_backward(
-            query,
-            key,
-            value,
-            out,
-            logsumexp,
-            max_scores,
-            *block_mask[:-1],
-            *score_mod_other_buffers,
-            *mask_mod_other_buffers,
+        save_values_for_backward(
+            ctx,
+            (
+                query,
+                key,
+                value,
+                out,
+                logsumexp,
+                max_scores,
+                *block_mask[:-1],
+                *score_mod_other_buffers,
+                *mask_mod_other_buffers,
+            ),
         )
         return out, logsumexp, max_scores
 
@@ -447,6 +799,7 @@ class OmniAttentionAutogradOp(tensorplay.autograd.Function):
         grad_logsumexp: Tensor,
         grad_max_scores: Tensor,
     ) -> tuple[Tensor | None, ...]:
+        fw_args = saved_values(ctx)
         (
             query,
             key,
@@ -471,7 +824,7 @@ class OmniAttentionAutogradOp(tensorplay.autograd.Function):
             Q_BLOCK_SIZE,
             KV_BLOCK_SIZE,
             *other_buffers,
-        ) = ctx.saved_tensors
+        ) = fw_args
         fw_graph = ctx._fw_graph
         joint_graph = ctx._joint_graph
         mask_graph = ctx._mask_graph
@@ -486,45 +839,53 @@ class OmniAttentionAutogradOp(tensorplay.autograd.Function):
         # We have asserted that mask_mod_other_buffers do not require grad,
         # but score_mod_other_buffers can require grad.
         none_grads = [None] * 6
-        (
-            grad_query,
-            grad_key,
-            grad_value,
-            grad_score_mod_captured,
-        ) = omni_attention_backward(
-            query,
-            key,
-            value,
-            out,
-            logsumexp,
-            grad_out,
-            grad_logsumexp,
-            fw_graph,
-            joint_graph,
-            (
-                query_lengths,
-                kv_lengths,
-                kv_num_blocks,
-                kv_indices,
-                full_kv_num_blocks,
-                full_kv_indices,
-                q_num_blocks,
-                q_indices,
-                full_q_num_blocks,
-                full_q_indices,
-                dq_write_order,
-                dq_write_order_full,
-                dq_kv_order,
-                dq_kv_order_spt,
-                Q_BLOCK_SIZE,
-                KV_BLOCK_SIZE,
-                mask_graph,
-            ),
-            scale,
-            kernel_options,
-            score_mod_other_buffers,
-            mask_mod_other_buffers,
+        from tensorplay.graph.traceback import annotate
+
+        _sparsity_ctx = (
+            annotate({"sparsity_hint": ctx._sparsity_hint})
+            if ctx._sparsity_hint > 0
+            else contextlib.nullcontext()
         )
+        with _sparsity_ctx:
+            (
+                grad_query,
+                grad_key,
+                grad_value,
+                grad_score_mod_captured,
+            ) = omni_attention_backward(
+                query,
+                key,
+                value,
+                out,
+                logsumexp,
+                grad_out,
+                grad_logsumexp,
+                fw_graph,
+                joint_graph,
+                (
+                    query_lengths,
+                    kv_lengths,
+                    kv_num_blocks,
+                    kv_indices,
+                    full_kv_num_blocks,
+                    full_kv_indices,
+                    q_num_blocks,
+                    q_indices,
+                    full_q_num_blocks,
+                    full_q_indices,
+                    dq_write_order,
+                    dq_write_order_full,
+                    dq_kv_order,
+                    dq_kv_order_spt,
+                    Q_BLOCK_SIZE,
+                    KV_BLOCK_SIZE,
+                    mask_graph,
+                ),
+                scale,
+                kernel_options,
+                score_mod_other_buffers,
+                mask_mod_other_buffers,
+            )
         return grad_query, grad_key, grad_value, *none_grads, *grad_score_mod_captured
 
 
@@ -582,18 +943,69 @@ def omni_attention_autograd(
     return out, logsumexp, max_scores
 
 
-def _new_captured_grad_buffers(
-    score_mod_other_buffers: tuple,
-    joint_graph: Callable,
-) -> tuple[Tensor | None, ...]:
-    """Allocate one grad buffer per captured tensor buffer.
+def _captured_grad_buffer_mask(
+    joint_graph: Callable, num_captures: int
+) -> tuple[bool, ...]:
+    """Return which score_mod captures need concrete grad buffers.
 
-    The joint graph is evaluated eagerly, so the buffer shapes are read
-    straight from the buffers themselves.
+    A capture can require grad but still be dead in score_mod, for example when
+    the function reads a closed-over tensor but returns the original score. A
+    traced joint graph represents that as a None grad output, and that None
+    must stay a None instead of being copied into a materialized buffer.
+
+    Conversely, this is independent of the saved capture's requires_grad flag:
+    compiled backward may save an intermediate whose grad is needed to propagate
+    to earlier user inputs.
     """
+    from tensorplay.graph_module import GraphModule
+
+    if not isinstance(joint_graph, GraphModule):
+        # The @register_fake path for direct omni_attention_backward HOP calls
+        # can see callable subgraphs before make_fx materializes them. In that
+        # metadata-only phase, no capture is provably dead.
+        return (True,) * num_captures
+
+    output_node = next(node for node in joint_graph.graph.nodes if node.op == "output")
+    score_mod_arg_grads = 5
+    captured_grad_outputs = output_node.args[0][score_mod_arg_grads:]
+    if len(captured_grad_outputs) != num_captures:
+        raise AssertionError(
+            f"Expected {num_captures} captured grad outputs, "
+            f"got {len(captured_grad_outputs)}"
+        )
+    return tuple(grad is not None for grad in captured_grad_outputs)
+
+
+def _empty_like_contiguous(buffer: Tensor) -> Tensor:
+    """Allocate a contiguous-buffer-shaped tensor.
+
+    The lowering returns captured grads as contiguous buffers, so the
+    allocation sites match that layout explicitly.
+    """
+    strides = []
+    acc = 1
+    for size in reversed(tuple(int(s) for s in buffer.shape)):
+        strides.append(acc)
+        acc *= size
+    strides.reverse()
+    return tensorplay.empty_strided(
+        buffer.shape, strides, dtype=buffer.dtype, device=buffer.device
+    )
+
+
+def _new_captured_grad_buffers(
+    score_mod_other_buffers: tuple, joint_graph: Callable
+) -> tuple[Tensor | None, ...]:
+    """Allocate only the captured grad buffers that the joint graph can produce."""
+    needs_grad_buffer = _captured_grad_buffer_mask(
+        joint_graph, len(score_mod_other_buffers)
+    )
+    # The lowering returns captured grads as contiguous buffers, so match that here.
     return tuple(
-        tensorplay.empty_like(buffer) if isinstance(buffer, Tensor) else None
-        for buffer in score_mod_other_buffers
+        _empty_like_contiguous(buffer)
+        if isinstance(buffer, Tensor) and needs_buffer
+        else None
+        for buffer, needs_buffer in zip(score_mod_other_buffers, needs_grad_buffer)
     )
 
 
@@ -619,6 +1031,17 @@ def sdpa_dense_backward(
             f"Backward pass with mixed query, key, and value dtype is not supported, "
             f"got query.dtype={query.dtype}, key.dtype={key.dtype}, "
             f"and value.dtype={value.dtype}"
+        )
+    if joint_graph is None:
+        example_vals = (
+            query.new_zeros((), requires_grad=True),
+            query.new_zeros((), dtype=tensorplay.int64),
+            query.new_zeros((), dtype=tensorplay.int64),
+            query.new_zeros((), dtype=tensorplay.int64),
+            query.new_zeros((), dtype=tensorplay.int64),
+        )
+        _, joint_graph = create_fw_bw_graph(
+            fw_graph, example_vals, score_mod_other_buffers
         )
     from tensorplay._dynamo._trace_wrapped_higher_order_op import (
         TransformGetItemToIndex,
@@ -796,8 +1219,8 @@ def sdpa_dense_backward(
     )
 
 
-@omni_attention_backward.py_impl("Autograd")
-def omni_attention_backward_autograd(
+def trace_omni_attention_backward(
+    proxy_mode: Any,
     query: Tensor,
     key: Tensor,
     value: Tensor,
@@ -813,10 +1236,39 @@ def omni_attention_backward_autograd(
     score_mod_other_buffers: tuple = (),
     mask_mod_other_buffers: tuple = (),
 ) -> tuple[Tensor, Tensor, Tensor, tuple[Tensor | None, ...]]:
-    # The backward runs below autograd: its inputs are already gradients, and
-    # the composite formula records no further history.
-    with tensorplay.no_grad():
-        return sdpa_dense_backward(
+    """We already have the forward graph and joint graph from the forward pass, so we create a proxy attach both graphs"""
+    from contextlib import nullcontext
+
+    from tensorplay._dynamo._trace_wrapped_higher_order_op import TransformGetItemToIndex
+    from tensorplay.graph.experimental.proxy_tensor import (
+        track_tensor_tree,
+        unwrap_proxy,
+    )
+
+    requires_grad = any(
+        x.requires_grad for x in (query, key) if isinstance(x, Tensor)
+    )
+    fw_example_vals = [query.new_zeros((), requires_grad=requires_grad)] + [
+        query.new_zeros((), dtype=tensorplay.int64) for _ in range(4)
+    ]
+    bw_example_vals = fw_example_vals + [query.new_zeros(())]
+    mask_example_vals = [query.new_zeros((), dtype=tensorplay.int64) for _ in range(4)]
+    mask_graph = block_mask[-1]
+    with disable_proxy_modes_tracing():
+        with TransformGetItemToIndex():
+            # There's no active make_fx during the compiled autograd graph's initial capture
+            fw_graph = _maybe_reenter_make_fx(fw_graph)(
+                *fw_example_vals, *score_mod_other_buffers
+            )
+            joint_graph = _maybe_reenter_make_fx(joint_graph)(
+                *bw_example_vals, *score_mod_other_buffers
+            )
+            mask_graph = _maybe_reenter_make_fx(mask_graph)(
+                *mask_example_vals, *mask_mod_other_buffers
+            )
+    block_mask = block_mask[:-1] + (mask_graph,)
+    with disable_proxy_modes_tracing():
+        example_out = omni_attention_backward(
             query,
             key,
             value,
@@ -833,6 +1285,194 @@ def omni_attention_backward_autograd(
             mask_mod_other_buffers,
         )
 
+    node_args = (
+        query,
+        key,
+        value,
+        out,
+        logsumexp,
+        grad_out,
+        grad_logsumexp,
+        fw_graph,
+        joint_graph,
+        block_mask,
+        scale,
+        kernel_options,
+        score_mod_other_buffers,
+        mask_mod_other_buffers,
+    )
+    proxy_args = unwrap_proxy(node_args)
+    set_original_aten_op = nullcontext
+    with set_original_aten_op():
+        out_proxy = proxy_mode.tracer.create_proxy(
+            "call_function",
+            omni_attention_backward,
+            proxy_args,
+            {},
+            name="omni_attention_backward",
+        )
+    return track_tensor_tree(
+        example_out,
+        out_proxy,
+        constant=None,
+        tracer=proxy_mode.tracer,
+    )
+
+
+@omni_attention_backward.py_impl("ProxyTorchDispatchMode")
+def omni_attention_backward_proxy_torch_dispatch_mode(
+    mode: Any,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    out: Tensor,
+    logsumexp: Tensor,
+    grad_out: Tensor,
+    grad_logsumexp: Tensor,
+    fw_graph: Callable,
+    joint_graph: Callable,
+    block_mask: tuple,
+    scale: float,
+    kernel_options: dict[str, Any],
+    score_mod_other_buffers: tuple = (),
+    mask_mod_other_buffers: tuple = (),
+) -> tuple[Tensor, Tensor, Tensor, tuple[Tensor | None, ...]]:
+    if mode is None:
+        raise AssertionError("Mode should always be enabled for python fallback key")
+    return trace_omni_attention_backward(
+        mode,
+        query,
+        key,
+        value,
+        out,
+        logsumexp,
+        grad_out,
+        grad_logsumexp,
+        fw_graph,
+        joint_graph,
+        block_mask,
+        scale,
+        kernel_options,
+        score_mod_other_buffers,
+        mask_mod_other_buffers,
+    )
+
+
+@omni_attention_backward.py_functionalize_impl
+def omni_attention_backward_functionalize(
+    ctx: Any,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    out: Tensor,
+    logsumexp: Tensor,
+    grad_out: Tensor,
+    grad_logsumexp: Tensor,
+    fw_graph: Callable,
+    joint_graph: Callable,
+    block_mask: tuple,
+    scale: float,
+    kernel_options: dict[str, Any],
+    score_mod_other_buffers: tuple = (),
+    mask_mod_other_buffers: tuple = (),
+) -> tuple[Tensor, Tensor, Tensor, tuple[Tensor | None, ...]]:
+    """Defines the functionalization rules for the omni_attention operator.
+
+    Right now we are unwrapping each tensor and then redispatching to the next,
+    since we know that the forward score mod function is assured to be free of mutations
+    to the other_buffers, we skip that mutate check and go straight to redispatching.
+    """
+
+    query_unwrapped = ctx.unwrap_tensors(query)
+    key_unwrapped = ctx.unwrap_tensors(key)
+    value_unwrapped = ctx.unwrap_tensors(value)
+    out_unwrapped = ctx.unwrap_tensors(out)
+    logsumexp_unwrapped = ctx.unwrap_tensors(logsumexp)
+    grad_out_unwrapped = ctx.unwrap_tensors(grad_out)
+    grad_logsumexp_unwrapped = ctx.unwrap_tensors(grad_logsumexp)
+    block_mask_unwrapped = ctx.unwrap_tensors(block_mask)
+    score_mod_other_buffers_unwrapped = ctx.unwrap_tensors(score_mod_other_buffers)
+    mask_mod_other_buffers_unwrapped = ctx.unwrap_tensors(mask_mod_other_buffers)
+
+    # Appease the mypy overlords
+    if not isinstance(query_unwrapped, Tensor):
+        raise AssertionError(
+            f"expected query_unwrapped to be Tensor, got {type(query_unwrapped)}"
+        )
+    if not isinstance(key_unwrapped, Tensor):
+        raise AssertionError(
+            f"expected key_unwrapped to be Tensor, got {type(key_unwrapped)}"
+        )
+    if not isinstance(value_unwrapped, Tensor):
+        raise AssertionError(
+            f"expected value_unwrapped to be Tensor, got {type(value_unwrapped)}"
+        )
+    if not isinstance(out_unwrapped, Tensor):
+        raise AssertionError(
+            f"expected out_unwrapped to be Tensor, got {type(out_unwrapped)}"
+        )
+    if not isinstance(logsumexp_unwrapped, Tensor):
+        raise AssertionError(
+            f"expected logsumexp_unwrapped to be Tensor, got {type(logsumexp_unwrapped)}"
+        )
+    if grad_out_unwrapped is not None and not isinstance(
+        grad_out_unwrapped, Tensor
+    ):
+        raise AssertionError(
+            f"expected grad_out_unwrapped to be Tensor or None, got {type(grad_out_unwrapped)}"
+        )
+    if grad_logsumexp_unwrapped is not None and not isinstance(
+        grad_logsumexp_unwrapped, Tensor
+    ):
+        raise AssertionError(
+            f"expected grad_logsumexp_unwrapped to be Tensor or None, got {type(grad_logsumexp_unwrapped)}"
+        )
+    if not isinstance(block_mask_unwrapped, tuple):
+        raise AssertionError(
+            f"expected block_mask_unwrapped to be tuple, got {type(block_mask_unwrapped)}"
+        )
+    if not isinstance(score_mod_other_buffers_unwrapped, tuple):
+        raise AssertionError(
+            f"expected score_mod_other_buffers_unwrapped to be tuple, got {type(score_mod_other_buffers_unwrapped)}"
+        )
+    if not isinstance(mask_mod_other_buffers_unwrapped, tuple):
+        raise AssertionError(
+            f"expected mask_mod_other_buffers_unwrapped to be tuple, got {type(mask_mod_other_buffers_unwrapped)}"
+        )
+
+    with ctx.redispatch_to_next():
+        functional_fw_graph = ctx.functionalize(fw_graph)
+        functional_joint_graph = ctx.functionalize(joint_graph)
+
+        (
+            grad_query,
+            grad_key,
+            grad_value,
+            grad_score_mod_captured,
+        ) = omni_attention_backward(
+            query_unwrapped,
+            key_unwrapped,
+            value_unwrapped,
+            out_unwrapped,
+            logsumexp_unwrapped,
+            grad_out_unwrapped,
+            grad_logsumexp_unwrapped,
+            functional_fw_graph,
+            functional_joint_graph,
+            block_mask_unwrapped,
+            scale,
+            kernel_options,
+            score_mod_other_buffers_unwrapped,
+            mask_mod_other_buffers_unwrapped,
+        )
+
+    return ctx.wrap_tensors((grad_query, grad_key, grad_value, grad_score_mod_captured))
+
+
+omni_attention_backward.py_autograd_impl(
+    autograd_not_implemented(omni_attention_backward, deferred_error=True)
+)
+
 
 @register_fake(omni_attention)
 def omni_attention_fake_impl(
@@ -846,21 +1486,30 @@ def omni_attention_fake_impl(
     score_mod_other_buffers: tuple = (),
     mask_mod_other_buffers: tuple = (),
 ) -> tuple[Tensor, Tensor, Tensor]:
-    B, Hq, seq_len_q, _ = query.shape
-    seq_len_kv = value.shape[-2]
+    if has_user_subclass(
+        (
+            query,
+            key,
+            value,
+            score_mod,
+            block_mask,
+            scale,
+            kernel_options,
+            score_mod_other_buffers,
+            mask_mod_other_buffers,
+        ),
+        allowed_subclasses=(),
+    ):
+        return NotImplemented
 
-    out = tensorplay.empty(
-        (B, Hq, seq_len_q, value.shape[-1]),
-        dtype=query.dtype,
-        device=query.device,
-    )
-    lse = tensorplay.empty(
-        (B, Hq, seq_len_q), dtype=tensorplay.float32, device=query.device
-    )
-    max_scores = tensorplay.empty(
-        (B, Hq, seq_len_q), dtype=tensorplay.float32, device=query.device
-    )
-    return out, lse, max_scores
+    v_head_dim = value.size(-1)
+    batch_size, num_heads, seq_len_q, _q_head_dim = query.shape
+    logsumexp = query.new_empty(batch_size, num_heads, seq_len_q, dtype=tensorplay.float32)
+    max_scores = query.new_empty(batch_size, num_heads, seq_len_q, dtype=tensorplay.float32)
+    out_shape = (batch_size, num_heads, seq_len_q, v_head_dim)
+    out = query.new_empty(out_shape)
+    out = _permute_strides(out, query.stride())
+    return out, logsumexp, max_scores
 
 
 @register_fake(omni_attention_backward)
@@ -880,6 +1529,24 @@ def omni_attention_backward_fake_impl(
     score_mod_other_buffers: tuple = (),
     mask_mod_other_buffers: tuple = (),
 ) -> tuple[Tensor, Tensor, Tensor, tuple[Tensor | None, ...]]:
+    if has_user_subclass(
+        (
+            query,
+            key,
+            value,
+            out,
+            logsumexp,
+            grad_out,
+            grad_logsumexp,
+            block_mask,
+            scale,
+            kernel_options,
+            score_mod_other_buffers,
+            mask_mod_other_buffers,
+        ),
+        allowed_subclasses=(),
+    ):
+        return NotImplemented
     Bq, _, _, qk_head_dim = query.shape
     Bkv, Hkv, seq_len_kv, v_head_dim = value.shape
 
@@ -896,14 +1563,19 @@ def omni_attention_backward_fake_impl(
     broadcasted_grad_value = value.new_empty((Bq, Hkv, seq_len_kv, v_head_dim))
     broadcasted_grad_value = _permute_strides(broadcasted_grad_value, value.stride())
 
-    if Bkv == 1 and Bq > 1:
+    from tensorplay.graph.experimental.symbolic_shapes import guard_or_false, sym_and
+
+    # This branch chooses fake tensor metadata, including strides. Guarding is
+    # valid for backed symbolic sizes, while unbacked/data-dependent predicates
+    # conservatively fall through to the non-broadcast contract below.
+    if guard_or_false(sym_and(Bkv == 1, Bq > 1)):
         grad_key = tensorplay.sum(broadcasted_grad_key, dim=0, keepdim=True)
         grad_value = tensorplay.sum(broadcasted_grad_value, dim=0, keepdim=True)
     else:
-        if Bq != Bkv:
-            raise RuntimeError(
-                "grad_key/grad_value batch must match key/value batch."
-            )
+        tensorplay._check(
+            Bq == Bkv,
+            "grad_key/grad_value batch must match key/value batch.",
+        )
         grad_key = broadcasted_grad_key
         grad_value = broadcasted_grad_value
 

@@ -168,6 +168,7 @@ from .rewriter import AST_Rewriter, RewritingTracer
 from .schema_type_annotation import AnnotateTypesWithSchema
 from .proxy_tensor import (
     DecompositionInterpreter,
+    MakeGraphTracer,
     PythonKeyTracer,
     decompose,
     dispatch_trace,
@@ -379,6 +380,7 @@ __all__ = [
     "get_proxy_mode",
     "handle_sym_dispatch",
     "make_graph",
+    "MakeGraphTracer",
     "maybe_disable_thunkify",
     "maybe_enable_thunkify",
     "selective_decompose",
