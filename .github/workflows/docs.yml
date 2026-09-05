@@ -78,7 +78,7 @@ jobs:
       contents: write
     steps:
       - name: Download HTML artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: docs-html
           path: docs-html
