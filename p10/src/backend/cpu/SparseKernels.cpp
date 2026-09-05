@@ -461,6 +461,69 @@ std::vector<int64_t> nonzero_positions(const Tensor& contiguous_self) {
     return positions;
 }
 
+Tensor dense_to_sparse_coo_cpu(const Tensor& self, int64_t sparse_dim) {
+    const int64_t ndim = self.dim();
+    if (sparse_dim < 0 || sparse_dim > ndim) {
+        TP_THROW(ValueError,
+                 "to_sparse(): sparse_dim must be in [0," +
+                     std::to_string(ndim) + "]");
+    }
+    if (ndim > 0 && sparse_dim == 0) {
+        TP_THROW(ValueError,
+                 "to_sparse(): sparse_dim must be greater than zero for a non-scalar tensor");
+    }
+
+    Tensor contiguous_self = self.contiguous();
+    const std::vector<int64_t> sizes =
+        static_cast<std::vector<int64_t>>(contiguous_self.shape());
+    const int64_t outer_numel =
+        product(std::vector<int64_t>(sizes.begin(), sizes.begin() + sparse_dim));
+    const int64_t block_numel =
+        product(std::vector<int64_t>(sizes.begin() + sparse_dim, sizes.end()));
+
+    std::vector<int64_t> block_positions;
+    dispatch_dtype(contiguous_self.dtype(), [&](auto tag) {
+        using scalar_t = typename decltype(tag)::type;
+        const scalar_t* data = contiguous_self.data_ptr<scalar_t>();
+        block_positions.reserve(static_cast<size_t>(outer_numel));
+        for (int64_t block = 0; block < outer_numel; ++block) {
+            const scalar_t* block_data = data + block * block_numel;
+            bool nonzero = false;
+            for (int64_t offset = 0; offset < block_numel; ++offset) {
+                if (block_data[offset] != scalar_t(0)) {
+                    nonzero = true;
+                    break;
+                }
+            }
+            if (nonzero) block_positions.push_back(block);
+        }
+    });
+
+    const int64_t nnz = static_cast<int64_t>(block_positions.size());
+    Tensor indices = Tensor::empty({sparse_dim, nnz}, DType::Int64, self.device());
+    std::vector<int64_t> values_shape{nnz};
+    values_shape.insert(values_shape.end(), sizes.begin() + sparse_dim, sizes.end());
+    Tensor values = Tensor::empty(values_shape, contiguous_self.dtype(), self.device());
+    int64_t* index_data = indices.data_ptr<int64_t>();
+
+    dispatch_dtype(contiguous_self.dtype(), [&](auto tag) {
+        using scalar_t = typename decltype(tag)::type;
+        const scalar_t* source = contiguous_self.data_ptr<scalar_t>();
+        scalar_t* destination = values.data_ptr<scalar_t>();
+        for (int64_t n = 0; n < nnz; ++n) {
+            int64_t remainder = block_positions[static_cast<size_t>(n)];
+            for (int64_t d = sparse_dim - 1; d >= 0; --d) {
+                const int64_t dim_size = sizes[static_cast<size_t>(d)];
+                index_data[d * nnz + n] = remainder % dim_size;
+                remainder /= dim_size;
+            }
+            std::copy_n(source + block_positions[static_cast<size_t>(n)] * block_numel,
+                        block_numel, destination + n * block_numel);
+        }
+    });
+    return Tensor::make_sparse_coo_tensor(indices, values, sizes, true);
+}
+
 } // namespace
 
 Tensor to_sparse_coo_cpu(const Tensor& self) {
@@ -491,6 +554,24 @@ Tensor to_sparse_coo_cpu(const Tensor& self) {
         }
     });
     return Tensor::make_sparse_coo_tensor(indices, values, sizes, /*is_coalesced=*/true);
+}
+
+Tensor to_sparse_coo_cpu_sparse_dim(const Tensor& self, int64_t sparse_dim) {
+    if (self.is_sparse_csr()) {
+        if (sparse_dim != 2) {
+            TP_THROW(ValueError,
+                     "to_sparse(): compressed input requires sparse_dim=2");
+        }
+        return csr_to_coo_cpu(self).coalesce();
+    }
+    if (self.is_sparse()) {
+        if (sparse_dim != self.sparse_dim()) {
+            TP_THROW(ValueError,
+                     "to_sparse(): sparse_dim must match the sparse input");
+        }
+        return self.coalesce();
+    }
+    return dense_to_sparse_coo_cpu(self, sparse_dim);
 }
 
 Tensor to_sparse_csr_cpu(const Tensor& self) {

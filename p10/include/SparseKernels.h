@@ -28,6 +28,7 @@ int64_t sparse_nnz_cpu(const Tensor& self);
 // every nonzero coordinate; to_sparse_csr accepts exactly-2-D input and
 // produces the compressed-row form.
 Tensor to_sparse_coo_cpu(const Tensor& self);
+Tensor to_sparse_coo_cpu_sparse_dim(const Tensor& self, int64_t sparse_dim);
 Tensor to_sparse_csr_cpu(const Tensor& self);
 // sparse @ dense for 2-D COO/CSR `self` (SpMM / SpMM-dense).
 Tensor sparse_mm_cpu(const Tensor& self, const Tensor& dense);
@@ -63,6 +64,7 @@ Tensor embedding_sparse_backward_cuda(const Tensor& grad,
 Tensor to_dense_sparse_cuda(const Tensor& self);
 int64_t sparse_nnz_cuda(const Tensor& self);
 Tensor to_sparse_coo_cuda(const Tensor& self);
+Tensor to_sparse_coo_cuda_sparse_dim(const Tensor& self, int64_t sparse_dim);
 Tensor to_sparse_csr_cuda(const Tensor& self);
 Tensor sparse_mm_cuda(const Tensor& self, const Tensor& dense);
 Tensor sparse_sum_cuda(const Tensor& self, std::optional<std::vector<int64_t>> dim,
