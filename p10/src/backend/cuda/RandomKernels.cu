@@ -508,55 +508,45 @@ Tensor& exponential_kernel_cuda(Tensor& self, double lambd) {
 // --- TransformationHelper.h): random_ / randint / geometric_ / -------------
 // --- log_normal_ / cauchy_ / poisson / randperm ----------------------------
 
+template <typename scalar_t>
+void geometric_fill_float_cuda(scalar_t* data, int64_t n, float p) {
+    distribution_nullary_kernel<scalar_t, float4, 4>(
+        data, n,
+        [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+        [p] __device__ (float val) {
+            return static_cast<scalar_t>(::ceilf(::logf(val) / ::log1pf(-p)));
+        });
+}
+
+void geometric_fill_double_cuda(double* data, int64_t n, double p) {
+    distribution_nullary_kernel<double, double2, 2>(
+        data, n,
+        [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
+        [p] __device__ (double val) {
+            return ::ceil(::log(val) / ::log1p(-p));
+        });
+}
+
 Tensor& geometric_kernel_cuda(Tensor& self, double p) {
+    TP_THROW_IF(!(p > 0.0 && p < 1.0), RuntimeError,
+                "geometric_ expects p to be in (0, 1), but got p=", p);
     if (self.numel() == 0) return self;
     if (!self.is_contiguous()) {
-        return fill_via_contiguous(self, [&](Tensor& t) { return geometric_kernel_cuda(t, p); });
+        return fill_via_contiguous(self, [&](Tensor& t) {
+            return geometric_kernel_cuda(t, p);
+        });
     }
-    int64_t n = self.numel();
-    if (!(p > 0.0 && p < 1.0)) {
-        TP_THROW(RuntimeError, "geometric_ expects p to be in (0, 1), but got p=", p);
-    }
-    if (self.dtype() == DType::Float32) {
-        float* data = self.data_ptr<float>();
-        const float pf = static_cast<float>(p);
-        // transformation::geometric: ceil(log(u)/log1p(-p)); curand_uniform
-        // yields (0, 1] so log(val) is finite and <= 0.
-        distribution_nullary_kernel<float, float4, 4>(
-            data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
-            [pf] __device__ (float val) {
-                return ::ceilf(::logf(val) / ::log1pf(-pf));
-            });
-    } else if (self.dtype() == DType::Float64) {
-        double* data = self.data_ptr<double>();
-        distribution_nullary_kernel<double, double2, 2>(
-            data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
-            [p] __device__ (double val) {
-                return ::ceil(::log(val) / ::log1p(-p));
-            });
-    } else if (self.dtype() == DType::Float16) {
-        Half* data = self.data_ptr<Half>();
-        const float pf = static_cast<float>(p);
-        distribution_nullary_kernel<Half, float4, 4>(
-            data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
-            [pf] __device__ (float val) {
-                return static_cast<Half>(::ceilf(::logf(val) / ::log1pf(-pf)));
-            });
-    } else if (self.dtype() == DType::BFloat16) {
-        BFloat16* data = self.data_ptr<BFloat16>();
-        const float pf = static_cast<float>(p);
-        distribution_nullary_kernel<BFloat16, float4, 4>(
-            data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
-            [pf] __device__ (float val) {
-                return static_cast<BFloat16>(::ceilf(::logf(val) / ::log1pf(-pf)));
-            });
-    } else {
-        TP_THROW(NotImplementedError, "geometric_() only supports floating dtypes on CUDA");
-    }
+
+    const int64_t n = self.numel();
+    distribution::dispatch_dtype(self.dtype(), [&](auto tag) {
+        using scalar_t = decltype(tag);
+        if constexpr (std::is_same_v<scalar_t, double>) {
+            geometric_fill_double_cuda(self.data_ptr<double>(), n, p);
+        } else {
+            geometric_fill_float_cuda<scalar_t>(
+                self.data_ptr<scalar_t>(), n, static_cast<float>(p));
+        }
+    });
     return self;
 }
 
