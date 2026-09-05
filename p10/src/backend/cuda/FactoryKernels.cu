@@ -4,6 +4,7 @@
 #include "Exception.h"
 #include "Scalar.h"
 #include "Context.h"
+#include "Complex.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -48,6 +49,22 @@ Tensor& fill_kernel(Tensor& self, Scalar value) {
             std::complex<double> val = value.to<std::complex<double>>();
             fill_kernel_cuda_impl<std::complex<double>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
                 n, self.data_ptr<std::complex<double>>(), val);
+            break;
+        }
+        case DType::ComplexHalf: {
+            const std::complex<float> val = value.to<std::complex<float>>();
+            fill_kernel_cuda_impl<tensorplay::complex<Half>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                n, static_cast<tensorplay::complex<Half>*>(self.data_ptr()),
+                tensorplay::complex<Half>(static_cast<Half>(val.real()),
+                                          static_cast<Half>(val.imag())));
+            break;
+        }
+        case DType::BComplex32: {
+            const std::complex<float> val = value.to<std::complex<float>>();
+            fill_kernel_cuda_impl<tensorplay::complex<BFloat16>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                n, static_cast<tensorplay::complex<BFloat16>*>(self.data_ptr()),
+                tensorplay::complex<BFloat16>(static_cast<BFloat16>(val.real()),
+                                              static_cast<BFloat16>(val.imag())));
             break;
         }
         default: TP_THROW(NotImplementedError, "fill_ not implemented for this dtype on CUDA");
@@ -239,14 +256,27 @@ __global__ void eye_kernel_cuda_impl(int64_t n, int64_t m, T* data) {
     else data[idx] = 0;
 }
 
+// Complex identity: ones on the diagonal carry no imaginary part, so the
+// kernel writes the complex zero/one pair directly.  The interleaved
+// (re, im) layout is identical at every complex width, so one float-pair
+// kernel fills them all.
+__global__ void eye_kernel_complex_impl(int64_t numel, int64_t m, float* data) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= numel) return;
+    const int64_t r = idx / (2 * m);
+    const int64_t c = (idx / 2) % m;
+    const bool imag_slot = (idx & 1) != 0;
+    data[idx] = (!imag_slot && r == c) ? 1.0f : 0.0f;
+}
+
 Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device, bool requires_grad) {
     if (m == -1) m = n;
     Tensor t({n, m}, dtype, device);
-    
+
     int64_t numel = n * m;
     int threads = 256;
     int blocks = (numel + threads - 1) / threads;
-    
+
     if (dtype == DType::Float32) {
         eye_kernel_cuda_impl<float><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(n, m, t.data_ptr<float>());
     } else if (dtype == DType::Float64) {
@@ -255,10 +285,16 @@ Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device, bool require
         eye_kernel_cuda_impl<int64_t><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(n, m, t.data_ptr<int64_t>());
     } else if (dtype == DType::Int32) {
         eye_kernel_cuda_impl<int32_t><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(n, m, t.data_ptr<int32_t>());
+    } else if (dtype == DType::ComplexFloat || dtype == DType::ComplexDouble ||
+               dtype == DType::ComplexHalf || dtype == DType::BComplex32) {
+        const int64_t pair_numel = n * m * 2;
+        const int pair_blocks = static_cast<int>((pair_numel + threads - 1) / threads);
+        eye_kernel_complex_impl<<<pair_blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+            pair_numel, m, static_cast<float*>(t.data_ptr()));
     } else {
         TP_THROW(NotImplementedError, "CUDA eye: only float32/float64/int64/int32 supported");
     }
-    
+
     return t;
 }
 

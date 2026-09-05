@@ -437,8 +437,8 @@ inline Device common_result_device(const Tensor& a, const Tensor& b) {
     return a.device();
 }
 
-inline Tensor make_binary_iter(const Tensor& out, const Tensor& a,
-                               const Tensor& b) {
+inline TensorIterator make_binary_iter(const Tensor& out, const Tensor& a,
+                                       const Tensor& b) {
     return TensorIteratorConfig()
         .allow_cpu_scalars(true)
         .check_all_same_dtype(false)

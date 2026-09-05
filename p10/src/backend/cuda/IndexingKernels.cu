@@ -12,6 +12,8 @@
 #include <cuda_runtime.h>
 #include "GPUPrimitives.cuh"
 #include "SortingRadixSelect.cuh"
+#include "SortUtils.cuh"
+#include "Complex.h"
 
 // Narrow floating-point atomics operate on the containing 32-bit word and
 // replace the selected half with an atomic compare-and-swap. The overloads
@@ -631,6 +633,13 @@ __device__ __forceinline__ void atomic_add_rel(BFloat16* addr, BFloat16 v) {
     gpuAtomicAdd(addr, v);
 }
 
+template <typename T>
+__device__ __forceinline__ void atomic_add_rel(tensorplay::complex<T>* addr,
+                                               tensorplay::complex<T> v) {
+    atomic_add_rel(reinterpret_cast<T*>(addr), v.real());
+    atomic_add_rel(reinterpret_cast<T*>(addr) + 1, v.imag());
+}
+
 __device__ __forceinline__ int64_t atomic_add_rel_return(int64_t* addr) {
     // Local overloads handle scalar widths without native atomicAdd support.
     return static_cast<int64_t>(::atomicAdd(reinterpret_cast<unsigned long long*>(addr),
@@ -674,7 +683,13 @@ __global__ void index_add_kernel(int64_t total, int64_t inner, int64_t row,
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; t < total; t += stride) {
         if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double> ||
-                      std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>) {
+                      std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t> ||
+                      std::is_same_v<T, Half> || std::is_same_v<T, BFloat16> ||
+                      std::is_same_v<T, bool> ||
+                      std::is_same_v<T, tensorplay::complex<float>> ||
+                      std::is_same_v<T, tensorplay::complex<double>> ||
+                      std::is_same_v<T, tensorplay::complex<Half>> ||
+                      std::is_same_v<T, tensorplay::complex<BFloat16>>) {
             int64_t k = t / inner;
             int64_t c = t % inner;
             int64_t iv = ip[k];
@@ -957,6 +972,240 @@ struct SortRadixTraits<BFloat16> : topk_detail::TopKRadixTraits<BFloat16> {
                                       : 0xffffu;
     }
 };
+
+// Encoded-key comparators for the warp merge path: plain less/greater over
+// the radix key, so the ordering matches the radix path exactly.
+struct SortKeyLessOp {
+    template <typename K>
+    __device__ __forceinline__ bool operator()(K a, K b) const { return a < b; }
+};
+struct SortKeyGreaterOp {
+    template <typename K>
+    __device__ __forceinline__ bool operator()(K a, K b) const { return a > b; }
+};
+
+// ---------------------------------------------------------------------------
+// Warp-per-slice merge sort for short slices.  One warp owns one slice and
+// several warps share a block, so short rows run at wave occupancy instead
+// of one full block per row; the collective load/store transpose keeps the
+// global passes coalesced.  Ordering follows the encoded-key semantics of
+// the radix path: keys that compare after every valid value (or NaN) land
+// at the end, and stable ordering preserves the input order of ties.
+// ---------------------------------------------------------------------------
+template <typename T, int SortSize>
+__global__ void sort_warp_merge_kernel(
+    const T* __restrict__ in, T* __restrict__ vals, int64_t* __restrict__ idxs,
+    int64_t slices, int64_t d_size, int64_t inner, bool descending) {
+    using Key = typename SortRadixTraits<T>::key_type;
+    constexpr int kWarpThreads = 32;
+    constexpr int kItemsPerThread = SortSize / kWarpThreads;
+    constexpr int kMaxBlockWarps = 16;
+    using LoadValues = cub::WarpLoad<
+        T, kItemsPerThread, cub::WARP_LOAD_TRANSPOSE>;
+    using Sort = cub::WarpMergeSort<
+        Key, kItemsPerThread, kWarpThreads, int32_t>;
+    using StoreValues = cub::WarpStore<
+        T, kItemsPerThread, cub::WARP_STORE_TRANSPOSE>;
+    using StoreIndices = cub::WarpStore<
+        int64_t, kItemsPerThread, cub::WARP_STORE_TRANSPOSE>;
+    __shared__ union {
+        typename LoadValues::TempStorage load_values;
+        typename Sort::TempStorage sort;
+        typename StoreValues::TempStorage store_values;
+        typename StoreIndices::TempStorage store_indices;
+    } temp_storage[kMaxBlockWarps];
+
+    const int64_t slice = static_cast<int64_t>(blockIdx.x) * blockDim.y +
+        threadIdx.y;
+    if (slice >= slices) return;
+    auto& warp_storage = temp_storage[threadIdx.y];
+    const int64_t outer_index = slice / inner;
+    const int64_t inner_index = slice - outer_index * inner;
+    const int64_t base = outer_index * d_size * inner + inner_index;
+
+    T local_values[kItemsPerThread];
+    Key local_keys[kItemsPerThread];
+    int32_t local_indices[kItemsPerThread];
+    LoadValues(warp_storage.load_values).Load(
+        topk_detail::TopKStridedReadAccessor<T>{in + base, inner},
+        local_values, static_cast<int>(d_size), static_cast<T>(0));
+    __syncwarp();
+    #pragma unroll
+    for (int item = 0; item < kItemsPerThread; ++item) {
+        const int position = threadIdx.x * kItemsPerThread + item;
+        const bool valid = position < d_size;
+        local_indices[item] = valid ? static_cast<int32_t>(position) : -1;
+        local_keys[item] = valid
+            ? SortRadixTraits<T>::encode(local_values[item])
+            : std::numeric_limits<Key>::max();
+    }
+    // The oob default sorts after every valid key under the active
+    // comparator: all-ones sorts last ascending, zero sorts last under the
+    // descending (greater-than) order.  NaN encodes to the all-ones key,
+    // which the radix ordering already places last ascending.
+    const Key oob_key = descending
+        ? static_cast<Key>(0)
+        : std::numeric_limits<Key>::max();
+    if (descending) {
+        Sort(warp_storage.sort).StableSort(
+            local_keys, local_indices, SortKeyGreaterOp{},
+            static_cast<int>(d_size), oob_key);
+    } else {
+        Sort(warp_storage.sort).StableSort(
+            local_keys, local_indices, SortKeyLessOp{},
+            static_cast<int>(d_size), oob_key);
+    }
+    #pragma unroll
+    for (int item = 0; item < kItemsPerThread; ++item) {
+        local_values[item] = SortRadixTraits<T>::deconvert(local_keys[item]);
+    }
+    int64_t out_indices[kItemsPerThread];
+    #pragma unroll
+    for (int item = 0; item < kItemsPerThread; ++item) {
+        out_indices[item] = static_cast<int64_t>(local_indices[item]);
+    }
+    StoreValues(warp_storage.store_values).Store(
+        topk_detail::TopKStridedWriteAccessor<T>{vals + base, inner},
+        local_values, static_cast<int>(d_size));
+    __syncwarp();
+    StoreIndices(warp_storage.store_indices).Store(
+        topk_detail::TopKStridedWriteAccessor<int64_t>{idxs + base, inner},
+        out_indices, static_cast<int>(d_size));
+}
+
+// ---------------------------------------------------------------------------
+// Block-per-slice radix sort.  One block stages one slice through shared
+// memory with cub's collective primitives, so the whole sort costs one
+// coalesced read and one coalesced write with no global scatter passes.
+// Slices may be strided (any sort dimension); slices shorter than the block
+// capacity are padded with keys that always sort to the end, matching the
+// NaN-last ordering of the encoded floating keys.
+// ---------------------------------------------------------------------------
+template <typename T, int BlockThreads, int ItemsPerThread>
+__global__ void sort_block_radix_kernel(
+    const T* __restrict__ in, T* __restrict__ vals, int64_t* __restrict__ idxs,
+    int64_t slices, int64_t d_size, int64_t inner, bool descending) {
+    using Key = typename SortRadixTraits<T>::key_type;
+    using LoadValues = cub::BlockLoad<T, BlockThreads, ItemsPerThread,
+                                      cub::BLOCK_LOAD_TRANSPOSE>;
+    using StoreValues = cub::BlockStore<T, BlockThreads, ItemsPerThread,
+                                        cub::BLOCK_STORE_TRANSPOSE>;
+    using StoreIndices = cub::BlockStore<int64_t, BlockThreads, ItemsPerThread,
+                                         cub::BLOCK_STORE_TRANSPOSE>;
+    using Sort = cub::BlockRadixSort<Key, BlockThreads, ItemsPerThread, int32_t>;
+    __shared__ union {
+        typename LoadValues::TempStorage load_values;
+        typename Sort::TempStorage sort;
+        typename StoreValues::TempStorage store_values;
+        typename StoreIndices::TempStorage store_indices;
+    } temp_storage;
+
+    const int64_t slice = static_cast<int64_t>(blockIdx.x);
+    if (slice >= slices) return;
+    const int64_t outer_index = slice / inner;
+    const int64_t inner_index = slice - outer_index * inner;
+    const int64_t base = outer_index * d_size * inner + inner_index;
+
+    T local_values[ItemsPerThread];
+    int32_t local_indices[ItemsPerThread];
+    Key local_keys[ItemsPerThread];
+
+    // Keys that always sort to the end of the block regardless of direction.
+    const Key end_key = descending ? static_cast<Key>(0)
+                                   : std::numeric_limits<Key>::max();
+    constexpr int capacity = BlockThreads * ItemsPerThread;
+    if (d_size >= capacity) {
+        LoadValues(temp_storage.load_values).Load(
+            topk_detail::TopKStridedReadAccessor<T>{in + base, inner},
+            local_values);
+    } else {
+        LoadValues(temp_storage.load_values).Load(
+            topk_detail::TopKStridedReadAccessor<T>{in + base, inner},
+            local_values, static_cast<int>(d_size), static_cast<T>(0));
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int item = 0; item < ItemsPerThread; ++item) {
+        const int position = threadIdx.x * ItemsPerThread + item;
+        const bool valid = position < d_size;
+        local_indices[item] = valid ? static_cast<int32_t>(position) : -1;
+        local_keys[item] = valid
+            ? SortRadixTraits<T>::encode(local_values[item])
+            : end_key;
+    }
+    if (descending) {
+        Sort(temp_storage.sort).SortDescending(local_keys, local_indices);
+    } else {
+        Sort(temp_storage.sort).Sort(local_keys, local_indices);
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int item = 0; item < ItemsPerThread; ++item) {
+        local_values[item] = SortRadixTraits<T>::deconvert(local_keys[item]);
+    }
+    int64_t out_indices[ItemsPerThread];
+    #pragma unroll
+    for (int item = 0; item < ItemsPerThread; ++item) {
+        out_indices[item] = static_cast<int64_t>(local_indices[item]);
+    }
+    StoreValues(temp_storage.store_values).Store(
+        topk_detail::TopKStridedWriteAccessor<T>{vals + base, inner},
+        local_values, static_cast<int>(d_size));
+    __syncthreads();
+    StoreIndices(temp_storage.store_indices).Store(
+        topk_detail::TopKStridedWriteAccessor<int64_t>{idxs + base, inner},
+        out_indices, static_cast<int>(d_size));
+}
+
+// Fixed block capacity: pick the smallest power-of-two bucket covering the
+// slice length so the sort performs no wasted digit passes.  Short slices
+// run one warp per slice instead: the merge sort amortizes the launch over
+// 16 rows per block, which dominates a block-per-row radix pass there.
+template <typename T>
+void launch_sort_block_radix(
+    const Tensor& self_c, Tensor& values, Tensor& indices,
+    int64_t slices, int64_t d_size, int64_t inner, bool descending) {
+    auto stream = getCurrentCUDAStream().stream();
+    if (d_size <= 128) {
+        dim3 block(32, 16);
+        dim3 grid(static_cast<unsigned>((slices + 15) / 16));
+        sort_warp_merge_kernel<T, 128><<<grid, block, 0, stream>>>(
+            self_c.data_ptr<T>(), values.data_ptr<T>(),
+            indices.data_ptr<int64_t>(), slices, d_size, inner, descending);
+        return;
+    }
+    dim3 grid(static_cast<unsigned>(slices));
+    #define TP_SORT_BLOCK_CASE(CAP, IPT)                                     \
+        if (d_size <= CAP) {                                                 \
+            sort_block_radix_kernel<T, CAP / IPT, IPT>                       \
+                <<<grid, CAP / IPT, 0, stream>>>(                            \
+                    self_c.data_ptr<T>(), values.data_ptr<T>(),              \
+                    indices.data_ptr<int64_t>(), slices, d_size, inner,      \
+                    descending);                                             \
+            return;                                                          \
+        }
+    TP_SORT_BLOCK_CASE(256, 4)
+    TP_SORT_BLOCK_CASE(512, 8)
+    TP_SORT_BLOCK_CASE(1024, 8)
+    TP_SORT_BLOCK_CASE(2048, 8)
+    TP_SORT_BLOCK_CASE(4096, 8)
+    #undef TP_SORT_BLOCK_CASE
+}
+
+void sort_block_radix_entry(const Tensor& self_c, Tensor& values, Tensor& indices,
+                            int64_t slices, int64_t d_size, int64_t inner,
+                            bool descending) {
+    switch (self_c.dtype()) {
+        #define TP_SORT_BLOCK_TYPE(ctype, name)                              \
+        case DType::name:                                                    \
+            launch_sort_block_radix<ctype>(                                  \
+                self_c, values, indices, slices, d_size, inner, descending); \
+            break;
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_SORT_BLOCK_TYPE)
+        #undef TP_SORT_BLOCK_TYPE
+        default: TP_THROW(TypeError, "sort: unsupported dtype");
+    }
+}
 
 template <typename T>
 __global__ void sort_radix_pack_kernel(int64_t n, int64_t d_size, int64_t inner,
@@ -1653,8 +1902,55 @@ Tensor index_add_cuda(const Tensor& self, int64_t dim, const Tensor& index, cons
                 total, inner, row, result.data_ptr<int64_t>(), idx.data_ptr<int64_t>(),
                 source_c.data_ptr<int64_t>());
             break;
+        case DType::Float16:
+            index_add_kernel<Half><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+                total, inner, row, result.data_ptr<Half>(), idx.data_ptr<int64_t>(),
+                source_c.data_ptr<Half>());
+            break;
+        case DType::BFloat16:
+            index_add_kernel<BFloat16><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+                total, inner, row, result.data_ptr<BFloat16>(), idx.data_ptr<int64_t>(),
+                source_c.data_ptr<BFloat16>());
+            break;
+        case DType::Bool:
+            index_add_kernel<bool><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+                total, inner, row, result.data_ptr<bool>(), idx.data_ptr<int64_t>(),
+                source_c.data_ptr<bool>());
+            break;
+        case DType::ComplexFloat:
+            index_add_kernel<tensorplay::complex<float>><<<
+                (total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+                total, inner, row,
+                static_cast<tensorplay::complex<float>*>(result.data_ptr()),
+                idx.data_ptr<int64_t>(),
+                static_cast<const tensorplay::complex<float>*>(source_c.data_ptr()));
+            break;
+        case DType::ComplexDouble:
+            index_add_kernel<tensorplay::complex<double>><<<
+                (total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+                total, inner, row,
+                static_cast<tensorplay::complex<double>*>(result.data_ptr()),
+                idx.data_ptr<int64_t>(),
+                static_cast<const tensorplay::complex<double>*>(source_c.data_ptr()));
+            break;
+        case DType::ComplexHalf:
+            index_add_kernel<tensorplay::complex<Half>><<<
+                (total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+                total, inner, row,
+                static_cast<tensorplay::complex<Half>*>(result.data_ptr()),
+                idx.data_ptr<int64_t>(),
+                static_cast<const tensorplay::complex<Half>*>(source_c.data_ptr()));
+            break;
+        case DType::BComplex32:
+            index_add_kernel<tensorplay::complex<BFloat16>><<<
+                (total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+                total, inner, row,
+                static_cast<tensorplay::complex<BFloat16>*>(result.data_ptr()),
+                idx.data_ptr<int64_t>(),
+                static_cast<const tensorplay::complex<BFloat16>*>(source_c.data_ptr()));
+            break;
         default:
-            TP_THROW(NotImplementedError, "index_add on CUDA supports Float32/Float64/Int32/Int64 only");
+            TP_THROW(NotImplementedError, "index_add on CUDA does not support this dtype");
     }
     CUDA_CHECK(cudaGetLastError());
     return result;
@@ -2224,6 +2520,49 @@ std::tuple<Tensor, Tensor> sort_cuda(const Tensor& self, int64_t dim, bool desce
     // Complexity is O(n * bytes) versus the heapsort fallback's O(n log n)
     // serialized per-slice walk; the fallback remains for tensors beyond
     // the 32-bit size limit of the device primitives.
+    // Narrow multi-slice shapes go through the block-per-slice radix sort
+    // instead: the slice is staged and ordered entirely in shared memory,
+    // which avoids the global scatter/gather of the segmented device pass.
+    // A sort dimension that is not the innermost one keeps the same kernel
+    // but routes the data through a transposed staging buffer: both the
+    // staging pass and the ordered write-back walk contiguous rows, and the
+    // final layout fix-up is a single strided copy.
+    if (self_c.numel() <= std::numeric_limits<int>::max() &&
+        d_size >= 2 && d_size <= 4096 && slices > 1) {
+        // Sort the innermost staging rows.  The staging tensor is the input
+        // permuted so that the sort dimension is last, giving contiguous
+        // slices; for inner == 1 the input already has that shape.
+        Tensor staged = self_c;
+        Tensor staged_values = values;
+        Tensor staged_indices = indices;
+        std::vector<int64_t> order;
+        if (inner != 1) {
+            order.resize(static_cast<size_t>(nd));
+            for (int64_t d = 0; d < nd; ++d) order[static_cast<size_t>(d)] = d;
+            std::swap(order[static_cast<size_t>(dim)],
+                      order[static_cast<size_t>(nd - 1)]);
+            staged = self_c.permute(order).contiguous();
+            staged_values = Tensor::empty(
+                static_cast<std::vector<int64_t>>(staged.shape()),
+                staged.dtype(), staged.device());
+            staged_indices = Tensor::empty(
+                static_cast<std::vector<int64_t>>(staged.shape()),
+                DType::Int64, staged.device());
+        }
+        sort_block_radix_entry(staged, staged_values, staged_indices,
+                               slices, d_size, 1, descending);
+        if (inner != 1) {
+            // Undo the permutation with one strided copy into the results.
+            std::vector<int64_t> inverse(static_cast<size_t>(nd));
+            for (int64_t d = 0; d < nd; ++d) {
+                inverse[static_cast<size_t>(order[static_cast<size_t>(d)])] = d;
+            }
+            values.copy_(staged_values.permute(inverse));
+            indices.copy_(staged_indices.permute(inverse));
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return {values, indices};
+    }
     if (self_c.numel() <= std::numeric_limits<int>::max()) {
         radix_sort_impl(self_c, values, indices, dim, outer, inner, d_size, slices, descending);
         CUDA_CHECK(cudaGetLastError());
