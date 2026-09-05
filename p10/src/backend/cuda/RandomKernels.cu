@@ -1028,7 +1028,9 @@ __global__ void standard_gamma_fill_impl(
                                      double, float>;
     const acc_t a = static_cast<acc_t>(alpha[idx]);
     const acc_t sample = sample_standard_gamma<scalar_t, acc_t>(&state, a);
-    const acc_t min_value = std::numeric_limits<acc_t>::min();
+    const acc_t min_value = std::is_same<scalar_t, Half>::value
+        ? static_cast<acc_t>(6.103515625e-05f)
+        : std::numeric_limits<acc_t>::min();
     out[idx] = static_cast<scalar_t>(sample < min_value ? min_value : sample);
 }
 
@@ -1157,7 +1159,11 @@ __global__ void binomial_fill_impl(int64_t numel, PhiloxCudaState philox_args,
     if (idx >= numel) return;
     curandStatePhilox4_32_10_t state;
     curand_init(seed, idx, offset, &state);
-    out[idx] = sample_binomial_one(&state, count[idx], prob[idx]);
+    using acc_t = std::conditional_t<std::is_same<scalar_t, double>::value,
+                                     double, float>;
+    out[idx] = static_cast<scalar_t>(sample_binomial_one<acc_t>(
+        &state, static_cast<acc_t>(count[idx]),
+        static_cast<acc_t>(prob[idx])));
 }
 
 // Dirichlet reparameterized gradient through the beta decomposition:
@@ -1325,19 +1331,20 @@ __global__ void dirichlet_grad_impl(int64_t numel, const scalar_t* x,
 
 // Dirichlet sampling: independent standard gammas per category normalized by
 // their row sum.
-template <typename scalar_t>
+template <typename scalar_t, typename acc_t>
 __global__ void dirichlet_normalize_impl(int64_t rows, int64_t cols,
                                         scalar_t* data) {
     const int64_t row =
         static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (row >= rows) return;
-    scalar_t sum = 0;
+    acc_t sum = 0;
     for (int64_t j = 0; j < cols; ++j) {
-        sum += data[row * cols + j];
+        sum += static_cast<acc_t>(data[row * cols + j]);
     }
     if (sum > 0) {
         for (int64_t j = 0; j < cols; ++j) {
-            data[row * cols + j] /= sum;
+            data[row * cols + j] = static_cast<scalar_t>(
+                static_cast<acc_t>(data[row * cols + j]) / sum);
         }
     }
 }
@@ -1391,15 +1398,29 @@ Tensor standard_gamma_kernel_cuda(const Tensor& self,
         launch_standard_gamma_fill<float>(alpha_c, out, std::move(generator));
     } else if (self.dtype() == DType::Float64) {
         launch_standard_gamma_fill<double>(alpha_c, out, std::move(generator));
+    } else if (self.dtype() == DType::Float16) {
+        launch_standard_gamma_fill<Half>(alpha_c, out, std::move(generator));
+    } else if (self.dtype() == DType::BFloat16) {
+        launch_standard_gamma_fill<BFloat16>(alpha_c, out, std::move(generator));
     } else {
-        TP_THROW(NotImplementedError,
-                 "standard_gamma only supports Float32/Float64 on CUDA for now");
+        TP_THROW(NotImplementedError, "standard_gamma only supports floating dtypes on CUDA");
     }
     return out;
 }
 
 Tensor standard_gamma_grad_kernel_cuda(const Tensor& self,
                                        const Tensor& output) {
+    if (self.device() != output.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "standard_gamma_grad: inputs must be on the same device");
+    }
+    if (!isFloatingType(self.dtype())) {
+        TP_THROW(TypeError, "standard_gamma_grad expects a floating dtype");
+    }
+    if (output.dtype() != self.dtype() || output.shape() != self.shape()) {
+        TP_THROW(RuntimeError,
+                 "standard_gamma_grad: input and sample must have matching dtype and shape");
+    }
     Tensor out(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(),
                self.device());
     if (out.numel() == 0) return out;
@@ -1418,9 +1439,19 @@ Tensor standard_gamma_grad_kernel_cuda(const Tensor& self,
             <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
                 numel, alpha_c.data_ptr<double>(), output_c.data_ptr<double>(),
                 out.data_ptr<double>());
+    } else if (self.dtype() == DType::Float16) {
+        standard_gamma_grad_impl<Half>
+            <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                numel, alpha_c.data_ptr<Half>(), output_c.data_ptr<Half>(),
+                out.data_ptr<Half>());
+    } else if (self.dtype() == DType::BFloat16) {
+        standard_gamma_grad_impl<BFloat16>
+            <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                numel, alpha_c.data_ptr<BFloat16>(), output_c.data_ptr<BFloat16>(),
+                out.data_ptr<BFloat16>());
     } else {
         TP_THROW(NotImplementedError,
-                 "standard_gamma_grad only supports Float32/Float64 on CUDA for now");
+                 "standard_gamma_grad only supports floating dtypes on CUDA");
     }
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {
@@ -1432,9 +1463,17 @@ Tensor standard_gamma_grad_kernel_cuda(const Tensor& self,
 
 Tensor binomial_kernel_cuda(const Tensor& count, const Tensor& prob,
                             std::optional<Generator> generator) {
+    if (count.device() != prob.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "binomial: count and prob must be on the same device");
+    }
     if (!isFloatingType(count.dtype()) || !isFloatingType(prob.dtype())) {
         TP_THROW(TypeError,
                  "binomial only supports floating-point dtypes for count and prob");
+    }
+    if (count.dtype() != prob.dtype()) {
+        TP_THROW(RuntimeError, "Found dtype ", toString(prob.dtype()),
+                 " but expected ", toString(count.dtype()));
     }
     const std::vector<int64_t> shape = broadcast_shapes(
         static_cast<std::vector<int64_t>>(count.shape()),
@@ -1467,9 +1506,18 @@ Tensor binomial_kernel_cuda(const Tensor& count, const Tensor& prob,
             <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
                 numel, philox_args, count_c.data_ptr<double>(),
                 prob_c.data_ptr<double>(), out.data_ptr<double>());
+    } else if (count.dtype() == DType::Float16) {
+        binomial_fill_impl<Half>
+            <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                numel, philox_args, count_c.data_ptr<Half>(),
+                prob_c.data_ptr<Half>(), out.data_ptr<Half>());
+    } else if (count.dtype() == DType::BFloat16) {
+        binomial_fill_impl<BFloat16>
+            <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                numel, philox_args, count_c.data_ptr<BFloat16>(),
+                prob_c.data_ptr<BFloat16>(), out.data_ptr<BFloat16>());
     } else {
-        TP_THROW(NotImplementedError,
-                 "binomial only supports Float32/Float64 on CUDA for now");
+        TP_THROW(NotImplementedError, "binomial only supports floating dtypes on CUDA");
     }
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {
@@ -1485,6 +1533,9 @@ Tensor sample_dirichlet_kernel_cuda(const Tensor& self,
     Tensor gamma = standard_gamma_kernel_cuda(self, std::move(generator));
     const int64_t ndim = gamma.dim();
     TP_CHECK(ndim >= 1, "sample_dirichlet expects at least 1 dimension");
+    if (gamma.numel() == 0 || gamma.size(-1) == 0) {
+        return gamma;
+    }
     Tensor flat = gamma.reshape(
         {gamma.numel() / gamma.size(-1), gamma.size(-1)}).contiguous();
     const int64_t rows = flat.size(0);
@@ -1492,16 +1543,24 @@ Tensor sample_dirichlet_kernel_cuda(const Tensor& self,
     const int threads = 256;
     const int blocks = static_cast<int>((rows + threads - 1) / threads);
     if (gamma.dtype() == DType::Float32) {
-        dirichlet_normalize_impl<float>
+        dirichlet_normalize_impl<float, float>
             <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
                 rows, cols, flat.data_ptr<float>());
     } else if (gamma.dtype() == DType::Float64) {
-        dirichlet_normalize_impl<double>
+        dirichlet_normalize_impl<double, double>
             <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
                 rows, cols, flat.data_ptr<double>());
+    } else if (gamma.dtype() == DType::Float16) {
+        dirichlet_normalize_impl<Half, float>
+            <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                rows, cols, flat.data_ptr<Half>());
+    } else if (gamma.dtype() == DType::BFloat16) {
+        dirichlet_normalize_impl<BFloat16, float>
+            <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                rows, cols, flat.data_ptr<BFloat16>());
     } else {
         TP_THROW(NotImplementedError,
-                 "sample_dirichlet only supports Float32/Float64 on CUDA for now");
+                 "sample_dirichlet only supports floating dtypes on CUDA");
     }
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {
