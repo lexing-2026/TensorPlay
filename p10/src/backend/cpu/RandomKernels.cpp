@@ -7,6 +7,7 @@
 #include "Exception.h"
 #include "Utils.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
+#include <SpecialMath.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -559,6 +560,209 @@ scalar_t sample_gamma(scalar_t alpha_in, Generator* gen) {
     }
 }
 
+double standard_gamma_grad_one_cpu(double alpha, double x) {
+    if (x < 0.8) {
+        double numer = 1.0;
+        double denom = alpha;
+        double series1 = numer / denom;
+        double series2 = numer / (denom * denom);
+        for (int i = 1; i <= 5; ++i) {
+            numer *= -x / static_cast<double>(i);
+            denom += 1.0;
+            series1 += numer / denom;
+            series2 += numer / (denom * denom);
+        }
+        const double pow_x_alpha = std::pow(x, alpha);
+        const double gamma_pdf = std::pow(x, alpha - 1.0) * std::exp(-x);
+        const double gamma_cdf = pow_x_alpha * series1;
+        const double gamma_cdf_alpha =
+            (std::log(x) - tensorplay::special_math::calc_digamma(alpha)) *
+                gamma_cdf -
+            pow_x_alpha * series2;
+        const double result = -gamma_cdf_alpha / gamma_pdf;
+        return std::isnan(result) ? 0.0 : result;
+    }
+    if (alpha > 8.0) {
+        if (0.9 * alpha <= x && x <= 1.1 * alpha) {
+            const double numer_1 = 1 + 24 * alpha * (1 + 12 * alpha);
+            const double numer_2 =
+                1440 * (alpha * alpha) + 6 * x * (53 - 120 * x) -
+                65 * x * x / alpha + alpha * (107 + 3600 * x);
+            const double denom = 1244160 * (alpha * alpha) * (alpha * alpha);
+            return numer_1 * numer_2 / denom;
+        }
+        const double denom = std::sqrt(8 * alpha);
+        const double term2 = denom / (alpha - x);
+        const double term3 = std::pow(
+            x - alpha - alpha * std::log(x / alpha), -1.5);
+        const double term23 = (x < alpha) ? term2 - term3 : term2 + term3;
+        const double term1 = std::log(x / alpha) * term23 -
+            std::sqrt(2 / alpha) * (alpha + x) / ((alpha - x) * (alpha - x));
+        const double stirling = 1 + 1 / (12 * alpha) * (1 + 1 / (24 * alpha));
+        const double numer = x * term1;
+        return -stirling * numer / denom;
+    }
+
+    const double u = std::log(x / alpha);
+    const double v = std::log(alpha);
+    static const double coefficients[3][8] = {
+        {0.16009398, -0.094634809, 0.025146376, -0.0030648343,
+         1, 0.32668115, 0.10406089, 0.0014179084},
+        {0.53487893, 0.1298071, 0.065735949, -0.0015649758,
+         0.16639465, 0.020070113, -0.0035938915, -0.00058392623},
+        {0.040121004, -0.0065914022, -0.0026286047, -0.0013441777,
+         0.017050642, -0.0021309326, 0.00085092367, -1.5247877e-07},
+    };
+    double coefficient_v[8];
+    for (int i = 0; i < 8; ++i) {
+        coefficient_v[i] = coefficients[0][i] +
+            u * (coefficients[1][i] + u * coefficients[2][i]);
+    }
+    const double p = coefficient_v[0] +
+        v * (coefficient_v[1] + v * (coefficient_v[2] + v * coefficient_v[3]));
+    const double q = coefficient_v[4] +
+        v * (coefficient_v[5] + v * (coefficient_v[6] + v * coefficient_v[7]));
+    return std::exp(p / q);
+}
+
+double dirichlet_grad_alpha_small_cpu(double x, double alpha, double beta) {
+    const double factor = tensorplay::special_math::calc_digamma(alpha) -
+        tensorplay::special_math::calc_digamma(alpha + beta) - std::log(x);
+    double numer = 1.0;
+    double series = numer / alpha * (factor + 1 / alpha);
+    for (int i = 1; i <= 10; ++i) {
+        const double casted_i = static_cast<double>(i);
+        numer *= (casted_i - beta) * x / casted_i;
+        const double denom = alpha + casted_i;
+        series += numer / denom * (factor + 1 / denom);
+    }
+    const double result = -std::pow(1 - x, 1 - beta) * series;
+    return std::isnan(result) ? 0.0 : result;
+}
+
+double dirichlet_grad_beta_small_cpu(double x, double alpha, double beta) {
+    const double factor = tensorplay::special_math::calc_digamma(alpha + beta) -
+        tensorplay::special_math::calc_digamma(beta);
+    double numer = 1.0;
+    double betas = 1.0;
+    double dbetas = 0.0;
+    double series = factor / alpha;
+    for (int i = 1; i <= 8; ++i) {
+        const double casted_i = static_cast<double>(i);
+        numer *= -x / casted_i;
+        dbetas = dbetas * (beta - casted_i) + betas;
+        betas *= beta - casted_i;
+        series += numer / (alpha + casted_i) * (dbetas + factor * betas);
+    }
+    const double result = -std::pow(1 - x, 1 - beta) * series;
+    return std::isnan(result) ? 0.0 : result;
+}
+
+double dirichlet_grad_alpha_mid_cpu(double x, double alpha, double beta) {
+    const double total = alpha + beta;
+    const double mean = alpha / total;
+    const double deviation = std::sqrt(alpha * beta / (total + 1)) / total;
+    if (mean - 0.1 * deviation <= x && x <= mean + 0.1 * deviation) {
+        const double polynomial =
+            47 * x * (beta * beta) * (beta * beta) + alpha * (
+                (43 + 20 * (16 + 27 * beta) * x) * (beta * beta) * beta + alpha * (
+                    3 * (59 + 180 * beta - 90 * x) * (beta * beta) + alpha * (
+                        (453 + 1620 * beta * (1 - x) - 455 * x) * beta + alpha * (
+                            8 * (1 - x) * (135 * beta - 11)))));
+        const double prefactor_num =
+            (1 + 12 * alpha) * (1 + 12 * beta) / (total * total);
+        const double prefactor_den =
+            12960 * alpha * alpha * alpha * beta * beta * (1 + 12 * total);
+        return prefactor_num / (1 - x) * polynomial / prefactor_den;
+    }
+    const double prefactor = -x / std::sqrt(2 * alpha * beta / total);
+    const double stirling =
+        (1 + 1 / (12 * alpha) + 1 / (288 * alpha * alpha)) *
+        (1 + 1 / (12 * beta) + 1 / (288 * beta * beta)) /
+        (1 + 1 / (12 * total) + 1 / (288 * total * total));
+    const double term1_num =
+        2 * (alpha * alpha) * (x - 1) + alpha * beta * (x - 1) -
+        x * (beta * beta);
+    const double axbx = alpha * (x - 1) + beta * x;
+    const double term1_den =
+        std::sqrt(2 * alpha / beta) * std::pow(total, 1.5) * axbx * axbx;
+    const double term1 = term1_num / term1_den;
+    const double term2 = 0.5 * std::log(alpha / (total * x));
+    const double term3_num = std::sqrt(8 * alpha * beta / total);
+    const double term3_den = beta * x + alpha * (x - 1);
+    const double term3 = term3_num / term3_den;
+    const double term4_base =
+        beta * std::log(beta / (total * (1 - x))) +
+        alpha * std::log(alpha / (total * x));
+    const double term4 = std::pow(term4_base, -1.5);
+    const double term1234 = term1 + term2 * (term3 +
+        (x < mean ? term4 : -term4));
+    return stirling * prefactor * term1234;
+}
+
+double dirichlet_grad_rational_cpu(double x, double alpha, double total) {
+    const double u = std::log(x);
+    const double a = std::log(alpha) - u;
+    const double b = std::log(total) - a;
+    const double pow_u[3] = {1, u, u * u};
+    const double pow_a[3] = {1, a, a * a};
+    static const double coefficients[2][3][3][4] = {
+        {{{1.003668233, -0.01061107488, -0.0657888334, 0.01201642863},
+          {0.6336835991, -0.3557432599, 0.05486251648, -0.001465281033},
+          {-0.03276231906, 0.004474107445, 0.002429354597, -0.0001557569013}},
+         {{0.221950385, -0.3187676331, 0.01799915743, 0.01074823814},
+          {-0.2951249643, 0.06219954479, 0.01535556598, 0.001550077057},
+          {0.02155310298, 0.004170831599, 0.001292462449, 6.976601077e-05}},
+         {{-0.05980841433, 0.008441916499, 0.01085618172, 0.002319392565},
+          {0.02911413504, 0.01400243777, -0.002721828457, 0.000751041181},
+          {0.005900514878, -0.001936558688, -9.495446725e-06, 5.385558597e-05}}},
+        {{{1, -0.02924021934, -0.04438342661, 0.007285809825},
+          {0.6357567472, -0.3473456711, 0.05454656494, -0.002407477521},
+          {-0.03301322327, 0.004845219414, 0.00231480583, -0.0002307248149}},
+         {{0.5925320577, -0.1757678135, 0.01505928619, 0.000564515273},
+          {0.1014815858, -0.06589186703, 0.01272886114, -0.0007316646956},
+          {-0.007258481865, 0.001096195486, 0.0003934994223, -4.12701925e-05}},
+         {{0.06469649321, -0.0236701437, 0.002902096474, -5.896963079e-05},
+          {0.001925008108, -0.002869809258, 0.0008000589141, -6.063713228e-05},
+          {-0.0003477407336, 6.959756487e-05, 1.097287507e-05, -1.650964693e-06}}},
+    };
+    double p = 0.0;
+    double q = 0.0;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            const double ua = pow_u[i] * pow_a[j];
+            p += ua * (coefficients[0][i][j][0] +
+                       b * (coefficients[0][i][j][1] +
+                            b * (coefficients[0][i][j][2] +
+                                 b * coefficients[0][i][j][3])));
+            q += ua * (coefficients[1][i][j][0] +
+                       b * (coefficients[1][i][j][1] +
+                            b * (coefficients[1][i][j][2] +
+                                 b * coefficients[1][i][j][3])));
+        }
+    }
+    const double approximation =
+        x * (tensorplay::special_math::calc_digamma(total) -
+             tensorplay::special_math::calc_digamma(alpha)) /
+        (total - alpha);
+    return p / q * approximation;
+}
+
+double dirichlet_grad_one_cpu(double x, double alpha, double total) {
+    const double beta = total - alpha;
+    const double boundary = total * x * (1 - x);
+    if (x <= 0.5 && boundary < 2.5) {
+        return dirichlet_grad_alpha_small_cpu(x, alpha, beta);
+    }
+    if (x >= 0.5 && boundary < 0.75) {
+        return -dirichlet_grad_beta_small_cpu(1 - x, beta, alpha);
+    }
+    if (alpha > 6 && beta > 6) {
+        return dirichlet_grad_alpha_mid_cpu(x, alpha, beta);
+    }
+    return dirichlet_grad_rational_cpu(x, alpha, total);
+}
+
 Tensor binomial_kernel(const Tensor& count, const Tensor& prob,
                        std::optional<Generator> generator) {
     if (!isFloatingType(count.dtype())) {
@@ -722,6 +926,81 @@ Tensor sample_dirichlet_kernel(const Tensor& self, std::optional<Generator> gene
         write(float{});
     } else {
         write(double{});
+    }
+    return out;
+}
+
+Tensor standard_gamma_grad_kernel(const Tensor& self, const Tensor& output) {
+    if (self.dtype() != DType::Float32 && self.dtype() != DType::Float64) {
+        TP_THROW(TypeError, "standard_gamma_grad expects Float32 or Float64 input");
+    }
+    if (output.dtype() != self.dtype() || output.shape() != self.shape()) {
+        TP_THROW(RuntimeError,
+                 "standard_gamma_grad: input and sample must have matching dtype and shape");
+    }
+
+    Tensor alpha = self.is_contiguous() ? self : self.contiguous();
+    Tensor sample = output.is_contiguous() ? output : output.contiguous();
+    Tensor out(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
+    if (out.numel() == 0) return out;
+
+    if (self.dtype() == DType::Float32) {
+        const float* alpha_data = alpha.data_ptr<float>();
+        const float* sample_data = sample.data_ptr<float>();
+        float* output_data = out.data_ptr<float>();
+        for (int64_t i = 0; i < out.numel(); ++i) {
+            output_data[i] = static_cast<float>(standard_gamma_grad_one_cpu(
+                static_cast<double>(alpha_data[i]),
+                static_cast<double>(sample_data[i])));
+        }
+    } else {
+        const double* alpha_data = alpha.data_ptr<double>();
+        const double* sample_data = sample.data_ptr<double>();
+        double* output_data = out.data_ptr<double>();
+        for (int64_t i = 0; i < out.numel(); ++i) {
+            output_data[i] = standard_gamma_grad_one_cpu(alpha_data[i], sample_data[i]);
+        }
+    }
+    return out;
+}
+
+Tensor dirichlet_grad_kernel(const Tensor& x, const Tensor& alpha,
+                             const Tensor& total) {
+    if (x.dtype() != DType::Float32 && x.dtype() != DType::Float64) {
+        TP_THROW(TypeError, "dirichlet_grad expects Float32 or Float64 input");
+    }
+    if (alpha.dtype() != x.dtype() || total.dtype() != x.dtype() ||
+        alpha.shape() != x.shape() || total.shape() != x.shape()) {
+        TP_THROW(RuntimeError,
+                 "dirichlet_grad: inputs must have matching dtype and shape");
+    }
+
+    Tensor x_contiguous = x.is_contiguous() ? x : x.contiguous();
+    Tensor alpha_contiguous = alpha.is_contiguous() ? alpha : alpha.contiguous();
+    Tensor total_contiguous = total.is_contiguous() ? total : total.contiguous();
+    Tensor out(static_cast<std::vector<int64_t>>(x.shape()), x.dtype(), x.device());
+    if (out.numel() == 0) return out;
+
+    if (x.dtype() == DType::Float32) {
+        const float* x_data = x_contiguous.data_ptr<float>();
+        const float* alpha_data = alpha_contiguous.data_ptr<float>();
+        const float* total_data = total_contiguous.data_ptr<float>();
+        float* output_data = out.data_ptr<float>();
+        for (int64_t i = 0; i < out.numel(); ++i) {
+            output_data[i] = static_cast<float>(dirichlet_grad_one_cpu(
+                static_cast<double>(x_data[i]),
+                static_cast<double>(alpha_data[i]),
+                static_cast<double>(total_data[i])));
+        }
+    } else {
+        const double* x_data = x_contiguous.data_ptr<double>();
+        const double* alpha_data = alpha_contiguous.data_ptr<double>();
+        const double* total_data = total_contiguous.data_ptr<double>();
+        double* output_data = out.data_ptr<double>();
+        for (int64_t i = 0; i < out.numel(); ++i) {
+            output_data[i] = dirichlet_grad_one_cpu(
+                x_data[i], alpha_data[i], total_data[i]);
+        }
     }
     return out;
 }
@@ -954,7 +1233,9 @@ TENSORPLAY_LIBRARY_IMPL(CPU, RandomKernels) {
     m.impl("poisson", poisson_kernel);
     m.impl("binomial", binomial_kernel);
     m.impl("_standard_gamma", standard_gamma_kernel);
+    m.impl("_standard_gamma_grad", standard_gamma_grad_kernel);
     m.impl("_sample_dirichlet", sample_dirichlet_kernel);
+    m.impl("_dirichlet_grad", dirichlet_grad_kernel);
     m.impl("bernoulli_.Tensor", bernoulli_tensor_inplace_kernel);
     m.impl("bernoulli_.float", bernoulli_scalar_inplace_kernel);
     m.impl("cauchy_", cauchy_kernel);
