@@ -5,6 +5,8 @@
 #include "Generator.h"
 #include "Exception.h"
 #include "Utils.h"
+#include "DistributionDispatch.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 #include <algorithm>
@@ -285,54 +287,100 @@ Tensor randn_like_kernel_cuda(const Tensor& self, DType dtype, std::optional<Dev
 
 Tensor& uniform_kernel_cuda(Tensor& self, double from, double to,
                             std::optional<Generator> generator) {
-    if (self.numel() == 0) return self;
+    if (isComplexType(self.dtype())) {
+        Tensor real_view = tpx::ops::view_as_real(self);
+        uniform_kernel_cuda(real_view, from, to, std::move(generator));
+        return self;
+    }
+    if (self.dtype() != DType::Float16 && self.dtype() != DType::BFloat16 &&
+        self.dtype() != DType::Float32 && self.dtype() != DType::Float64) {
+        TP_THROW(NotImplementedError, "uniform_() only supports floating dtypes on CUDA");
+    }
     if (!self.is_contiguous()) {
         return fill_via_contiguous(self, [&](Tensor& t) {
-            return uniform_kernel_cuda(t, from, to, generator);
+            return uniform_kernel_cuda(t, from, to, std::move(generator));
         });
     }
-    int64_t n = self.numel();
-    // Bounds of the [from, to) range against the destination dtype.
-    if (self.dtype() == DType::Float32) {
-        TP_THROW_IF(!(from >= -std::numeric_limits<float>::max() && from <= std::numeric_limits<float>::max()),
-                    RuntimeError, "from is out of bounds for float");
-        TP_THROW_IF(!(to >= -std::numeric_limits<float>::max() && to <= std::numeric_limits<float>::max()),
-                    RuntimeError, "to is out of bounds for float");
-    } else if (self.dtype() == DType::Float64) {
-        TP_THROW_IF(!(from >= -std::numeric_limits<double>::max() && from <= std::numeric_limits<double>::max()),
-                    RuntimeError, "from is out of bounds for double");
-        TP_THROW_IF(!(to >= -std::numeric_limits<double>::max() && to <= std::numeric_limits<double>::max()),
-                    RuntimeError, "to is out of bounds for double");
-    }
+    const double dtype_max = self.dtype() == DType::Float16
+        ? distribution::fp_dtype_max<Half>()
+        : self.dtype() == DType::BFloat16
+            ? distribution::fp_dtype_max<BFloat16>()
+            : self.dtype() == DType::Float32
+                ? distribution::fp_dtype_max<float>()
+                : distribution::fp_dtype_max<double>();
+    const char* dtype_name = distribution::bounds_dtype_name(self.dtype());
+    TP_THROW_IF(!(from >= -dtype_max && from <= dtype_max), RuntimeError,
+                "from is out of bounds for ", dtype_name);
+    TP_THROW_IF(!(to >= -dtype_max && to <= dtype_max), RuntimeError,
+                "to is out of bounds for ", dtype_name);
     TP_THROW_IF(from > to, RuntimeError,
                 "uniform_ expects to return a [from, to) range, but found from=",
                 from, " > to=", to);
-    TP_THROW_IF((to - from) > (self.dtype() == DType::Float32
-                                   ? static_cast<double>(std::numeric_limits<float>::max())
-                                   : std::numeric_limits<double>::max()),
+    TP_THROW_IF((to - from) > dtype_max,
                 RuntimeError,
                 "uniform_ expects to-from <= std::numeric_limits<",
-                self.dtype() == DType::Float32 ? "float" : "double",
+                dtype_name,
                 ">::max(), but found to=", to, " and from=", from,
                 " which result in to-from to exceed the limit");
+    from = std::clamp(from, -dtype_max, dtype_max);
+    to = std::clamp(to, -dtype_max, dtype_max);
+
+    if (self.numel() == 0) return self;
+    int64_t n = self.numel();
     if (self.dtype() == DType::Float32) {
         float* data = self.data_ptr<float>();
         const float lo = static_cast<float>(from);
         const float hi = static_cast<float>(to);
+        const float range = hi - lo;
         distribution_nullary_kernel<float, float4, 4>(
             data, n,
             [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
-            [lo, hi] __device__ (float rand) { return lo + (hi - lo) * rand; },
+            [lo, hi, range] __device__ (float rand) {
+                const float value = static_cast<float>(lo + range * rand);
+                return value == hi ? lo : value;
+            },
             std::move(generator));
     } else if (self.dtype() == DType::Float64) {
         double* data = self.data_ptr<double>();
+        const double range = to - from;
         distribution_nullary_kernel<double, double2, 2>(
             data, n,
             [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
-            [from, to] __device__ (double rand) { return from + (to - from) * rand; },
+            [from, to, range] __device__ (double rand) {
+                const double value = from + range * rand;
+                return value == to ? from : value;
+            },
+            std::move(generator));
+    } else if (self.dtype() == DType::Float16) {
+        Half* data = self.data_ptr<Half>();
+        const Half lo = static_cast<Half>(from);
+        const Half hi = static_cast<Half>(to);
+        const float lo_value = static_cast<float>(lo);
+        const float hi_value = static_cast<float>(hi);
+        const float range = hi_value - lo_value;
+        distribution_nullary_kernel<Half, float4, 4>(
+            data, n,
+            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+            [lo, hi, lo_value, range] __device__ (float rand) {
+                const Half value = static_cast<Half>(lo_value + range * rand);
+                return value == hi ? lo : value;
+            },
             std::move(generator));
     } else {
-        TP_THROW(NotImplementedError, "uniform_() only supports Float32/Float64 on CUDA for now");
+        BFloat16* data = self.data_ptr<BFloat16>();
+        const BFloat16 lo = static_cast<BFloat16>(from);
+        const BFloat16 hi = static_cast<BFloat16>(to);
+        const float lo_value = static_cast<float>(lo);
+        const float hi_value = static_cast<float>(hi);
+        const float range = hi_value - lo_value;
+        distribution_nullary_kernel<BFloat16, float4, 4>(
+            data, n,
+            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+            [lo, hi, lo_value, range] __device__ (float rand) {
+                const BFloat16 value = static_cast<BFloat16>(lo_value + range * rand);
+                return value == hi ? lo : value;
+            },
+            std::move(generator));
     }
     return self;
 }
