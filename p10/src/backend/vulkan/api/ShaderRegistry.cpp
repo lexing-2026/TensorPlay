@@ -35,6 +35,23 @@ const ShaderInfo& ShaderRegistry::get_shader_info(
   return it->second;
 }
 
+// dtype-aware lookup: float payloads resolve to the rgba16f twin when one
+// was generated, and every other dtype keeps the base build.  Callers pass
+// the payload's dtype; the fallback keeps plain-name shaders working for
+// texture formats that only come in one flavor.
+const ShaderInfo& get_shader_info_for_dtype(
+    const char* base_name,
+    DType dtype) {
+  ShaderRegistry& registry = shader_registry();
+  if (dtype == DType::Float16) {
+    const std::string twin = std::string(base_name) + "_f16";
+    if (registry.has_shader(twin)) {
+      return registry.get_shader_info(twin);
+    }
+  }
+  return registry.get_shader_info(base_name);
+}
+
 ShaderRegistry& shader_registry() {
   return get_registry();
 }

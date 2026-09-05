@@ -208,6 +208,25 @@ Tensor clone_kernel(const Tensor& self);
 // Defined in View.cpp; broadcast-expands through zero-stride gathers.
 Tensor expand_kernel(const Tensor& self, const std::vector<int64_t>& size, bool implicit);
 
+// Defined in Shape.cpp; shared by ops that build on slicing and joins.
+Tensor slice_kernel(
+    const Tensor& self,
+    int64_t dim,
+    std::optional<int64_t> start,
+    std::optional<int64_t> end,
+    int64_t step);
+Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim);
+Tensor reshape_kernel(const Tensor& self, const std::vector<int64_t>& shape);
+Tensor permute_kernel(const Tensor& self, const std::vector<int64_t>& dims);
+
+// Defined in Factory.cpp; host-visible fill entry used by selection ops.
+Tensor full_kernel(
+    const std::vector<int64_t>& size,
+    Scalar fill_value,
+    DType dtype,
+    Device device,
+    bool pin_memory);
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay

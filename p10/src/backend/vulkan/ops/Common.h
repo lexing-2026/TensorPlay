@@ -3,17 +3,33 @@
 #ifdef USE_VULKAN
 
 #include "../api/Context.h"
+#include "../api/ShaderRegistry.h"
 #include "../api/Tensor.h"
 #include "../api/Types.h"
 #include "../api/Utils.h"
 
 #include "Tensor.h"
 
+
 namespace tensorplay {
 namespace vulkan {
 namespace ops {
 
 using namespace api::utils;
+
+/*
+ * dtype-aware shader resolution: float payloads dispatch to the storage
+ * format variant matching their texture (rgba16f twins for Float16), and
+ * every other dtype keeps the base build.  Callers pass the payload
+ * tensor instead of hardcoding the shader name.
+ */
+inline const api::ShaderInfo& kernel_for(const char* base_name, DType dtype) {
+  return api::get_shader_info_for_dtype(base_name, dtype);
+}
+
+inline const api::ShaderInfo& kernel_for(const char* base_name, const Tensor& t) {
+  return api::get_shader_info_for_dtype(base_name, t.dtype());
+}
 
 /*
  * The functions below safely return the size of the dimension at the N-th

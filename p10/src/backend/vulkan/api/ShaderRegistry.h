@@ -46,6 +46,13 @@ class ShaderRegistry final {
   const ShaderInfo& get_shader_info(const std::string& shader_name);
 };
 
+// dtype-aware lookup: float shaders exist in per-storage-format variants
+// (the plain rgba32f build plus the rgba16f twin), so callers resolve the
+// shader through the payload dtype instead of hardcoding the base name.
+const ShaderInfo& get_shader_info_for_dtype(
+    const char* base_name,
+    DType dtype);
+
 class ShaderRegisterInit final {
   using InitFn = void();
 

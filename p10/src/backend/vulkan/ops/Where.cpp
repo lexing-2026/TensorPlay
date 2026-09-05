@@ -15,10 +15,18 @@ namespace ops {
 
 namespace {
 
-void validate_float_operand(const Tensor& t, const char* name) {
+/*
+ * Branch payload vocabulary: float planes sample through the float shader,
+ * Int32 planes ride the `where_i32` twin with iimage loads.  Both operands
+ * share one vocabulary, so mixed float/int branches stage the Int32 side to
+ * Float32 on the host first.
+ */
+void validate_operand(const Tensor& t, const char* name) {
   TP_CHECK(
-      t.dtype() == DType::Float32,
-      std::string("Vulkan ") + name + " supports Float32 tensors only");
+      t.dtype() == DType::Float32 || t.dtype() == DType::Float16 ||
+          t.dtype() == DType::Int32,
+      std::string("Vulkan ") + name +
+          " supports Float32, Float16 and Int32 tensors only");
   TP_CHECK(
       t.dim() >= 1 && t.dim() <= 4,
       std::string("Vulkan ") + name + " supports 1d to 4d tensors");
@@ -36,8 +44,8 @@ Tensor where_kernel(
     const Tensor& condition,
     const Tensor& self,
     const Tensor& other) {
-  validate_float_operand(self, "where");
-  validate_float_operand(other, "where");
+  validate_operand(self, "where");
+  validate_operand(other, "where");
   TP_CHECK(
       condition.dtype() == DType::Bool,
       "Vulkan where expects a Bool condition");
@@ -46,12 +54,17 @@ Tensor where_kernel(
       "Vulkan where requires equal-shaped operands (broadcast at the "
       "caller)");
 
+  // One shared element vocabulary for both branches; an Int32 branch pair
+  // keeps word precision, anything mixed casts the int side to Float32.
+  const bool int_branches =
+      self.dtype() == DType::Int32 && other.dtype() == DType::Int32;
+
   api::Context* const context = api::context();
 
   api::vTensor v_cond = convert(condition);
   api::vTensor v_input = convert(self);
   api::vTensor v_other = convert(other);
-  api::vTensor v_output{context, v_input.sizes(), DType::Float32};
+  api::vTensor v_output{context, v_input.sizes(), self.dtype()};
 
   const struct WhereBlock block{
       make_whcn_ivec4(v_output.sizes()),
@@ -63,7 +76,8 @@ Tensor where_kernel(
   api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(
-      VK_KERNEL(where), pipeline_barrier, v_output.extents(),
+      int_branches ? VK_KERNEL(where_i32) : VK_KERNEL(where),
+      pipeline_barrier, v_output.extents(),
       adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
       v_output.image(
           pipeline_barrier,
@@ -77,13 +91,14 @@ Tensor where_kernel(
   return convert(v_output);
 }
 
-// Scalar variants fold into full tensors and reuse the tensor form.
+// Scalar variants fold into full tensors and reuse the tensor form.  The
+// folded tensor takes the branch dtype so the pair stays in one vocabulary.
 Tensor where_scalar_self_kernel(
     const Tensor& condition, Scalar self, const Tensor& other) {
   Tensor folded = full_kernel(
       static_cast<std::vector<int64_t>>(other.shape()),
       self,
-      DType::Float32,
+      other.dtype(),
       other.device(),
       false);
   return where_kernel(condition, folded, other);
@@ -94,7 +109,7 @@ Tensor where_scalar_other_kernel(
   Tensor folded = full_kernel(
       static_cast<std::vector<int64_t>>(self.shape()),
       other,
-      DType::Float32,
+      self.dtype(),
       self.device(),
       false);
   return where_kernel(condition, self, folded);

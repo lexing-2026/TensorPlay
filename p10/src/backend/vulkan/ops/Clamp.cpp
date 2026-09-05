@@ -17,9 +17,11 @@ Tensor clamp(
     const Tensor& self_arg,
     const std::optional<Scalar>& min_arg,
     const std::optional<Scalar>& max_arg) {
+  const bool is_int = self_arg.dtype() == DType::Int32;
   TP_CHECK(
-      self_arg.dtype() == DType::Float32,
-      "Vulkan clamp supports Float32 tensors only");
+      is_int || self_arg.dtype() == DType::Float32 ||
+          self_arg.dtype() == DType::Float16,
+      "Vulkan clamp supports Float32, Float16 and Int32 tensors only");
   api::Context* const context = api::context();
 
   api::vTensor v_self = convert(self_arg);
@@ -40,12 +42,27 @@ Tensor clamp(
        max_arg ? max_arg->to<float>() : std::numeric_limits<float>::infinity()},
   };
 
-  api::UniformParamsBuffer params(context, block);
+  const struct BlockI final {
+    ivec4 extents;
+    // clamp range in int words
+    ivec2 clamp;
+  } blocki{
+      make_whcn_ivec4(v_output.sizes()),
+      {min_arg ? static_cast<int32_t>(min_arg->to<int64_t>())
+               : std::numeric_limits<int32_t>::min(),
+       max_arg ? static_cast<int32_t>(max_arg->to<int64_t>())
+               : std::numeric_limits<int32_t>::max()},
+  };
+
+  api::UniformParamsBuffer params(
+      context,
+      is_int ? api::UniformParamsBuffer(context, blocki)
+             : api::UniformParamsBuffer(context, block));
   api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(
       // shader descriptor
-      VK_KERNEL(clamp),
+      is_int ? kernel_for("clamp_i32", self_arg) : kernel_for("clamp", self_arg),
       // pipeline barrier
       pipeline_barrier,
       // global work group size
@@ -70,9 +87,11 @@ Tensor& clamp_(
     Tensor& self_arg,
     const std::optional<Scalar>& min_arg,
     const std::optional<Scalar>& max_arg) {
+  const bool is_int = self_arg.dtype() == DType::Int32;
   TP_CHECK(
-      self_arg.dtype() == DType::Float32,
-      "Vulkan clamp_ supports Float32 tensors only");
+      is_int || self_arg.dtype() == DType::Float32 ||
+          self_arg.dtype() == DType::Float16,
+      "Vulkan clamp_ supports Float32, Float16 and Int32 tensors only");
   api::Context* const context = api::context();
 
   api::vTensor v_self = convert(self_arg);
@@ -87,12 +106,28 @@ Tensor& clamp_(
        max_arg ? max_arg->to<float>() : std::numeric_limits<float>::infinity()},
   };
 
-  api::UniformParamsBuffer params(context, block);
+  const struct BlockI final {
+    ivec4 extents;
+    // clamp range in int words
+    ivec2 clamp;
+  } blocki{
+      make_whcn_ivec4(v_self.sizes()),
+      {min_arg ? static_cast<int32_t>(min_arg->to<int64_t>())
+               : std::numeric_limits<int32_t>::min(),
+       max_arg ? static_cast<int32_t>(max_arg->to<int64_t>())
+               : std::numeric_limits<int32_t>::max()},
+  };
+
+  api::UniformParamsBuffer params(
+      context,
+      is_int ? api::UniformParamsBuffer(context, blocki)
+             : api::UniformParamsBuffer(context, block));
   api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(
       // shader descriptor
-      VK_KERNEL(clampinplace),
+      is_int ? kernel_for("clamp_i32inplace", self_arg)
+             : kernel_for("clampinplace", self_arg),
       // pipeline barrier
       pipeline_barrier,
       // global work group size
