@@ -252,47 +252,59 @@ __global__ void eye_kernel_cuda_impl(int64_t n, int64_t m, T* data) {
     int64_t r = idx / m;
     int64_t c = idx % m;
     
-    if (r == c) data[idx] = 1;
-    else data[idx] = 0;
-}
-
-// Complex identity: ones on the diagonal carry no imaginary part, so the
-// kernel writes the complex zero/one pair directly.  The interleaved
-// (re, im) layout is identical at every complex width, so one float-pair
-// kernel fills them all.
-__global__ void eye_kernel_complex_impl(int64_t numel, int64_t m, float* data) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= numel) return;
-    const int64_t r = idx / (2 * m);
-    const int64_t c = (idx / 2) % m;
-    const bool imag_slot = (idx & 1) != 0;
-    data[idx] = (!imag_slot && r == c) ? 1.0f : 0.0f;
+    data[idx] = r == c ? T(1) : T(0);
 }
 
 Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device, bool requires_grad) {
+    if (n < 0) TP_THROW(RuntimeError, "n must be greater or equal to 0, got ", n);
+    if (m < 0 && m != -1) {
+        TP_THROW(RuntimeError, "m must be greater or equal to 0, got ", m);
+    }
     if (m == -1) m = n;
     Tensor t({n, m}, dtype, device);
 
     int64_t numel = n * m;
+    if (numel == 0) return t;
     int threads = 256;
     int blocks = (numel + threads - 1) / threads;
 
-    if (dtype == DType::Float32) {
-        eye_kernel_cuda_impl<float><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(n, m, t.data_ptr<float>());
-    } else if (dtype == DType::Float64) {
-        eye_kernel_cuda_impl<double><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(n, m, t.data_ptr<double>());
-    } else if (dtype == DType::Int64) {
-        eye_kernel_cuda_impl<int64_t><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(n, m, t.data_ptr<int64_t>());
-    } else if (dtype == DType::Int32) {
-        eye_kernel_cuda_impl<int32_t><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(n, m, t.data_ptr<int32_t>());
-    } else if (dtype == DType::ComplexFloat || dtype == DType::ComplexDouble ||
-               dtype == DType::ComplexHalf || dtype == DType::BComplex32) {
-        const int64_t pair_numel = n * m * 2;
-        const int pair_blocks = static_cast<int>((pair_numel + threads - 1) / threads);
-        eye_kernel_complex_impl<<<pair_blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-            pair_numel, m, static_cast<float*>(t.data_ptr()));
-    } else {
-        TP_THROW(NotImplementedError, "CUDA eye: only float32/float64/int64/int32 supported");
+#define EYE_CUDA_CASE(ctype, name)                                          \
+    case DType::name:                                                        \
+        eye_kernel_cuda_impl<ctype><<<blocks, threads, 0,                       \
+                                      getCurrentCUDAStream().stream()>>>(n, m, \
+                                                                          t.data_ptr<ctype>()); \
+        break;
+    switch (dtype) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(EYE_CUDA_CASE)
+        case DType::ComplexFloat:
+            eye_kernel_cuda_impl<std::complex<float>>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    n, m, t.data_ptr<std::complex<float>>());
+            break;
+        case DType::ComplexDouble:
+            eye_kernel_cuda_impl<std::complex<double>>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    n, m, t.data_ptr<std::complex<double>>());
+            break;
+        case DType::ComplexHalf:
+            eye_kernel_cuda_impl<tensorplay::complex<Half>>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    n, m, static_cast<tensorplay::complex<Half>*>(t.data_ptr()));
+            break;
+        case DType::BComplex32:
+            eye_kernel_cuda_impl<tensorplay::complex<BFloat16>>
+                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    n, m, static_cast<tensorplay::complex<BFloat16>*>(t.data_ptr()));
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "CUDA eye does not support dtype '" + std::string(toString(dtype)) + "'");
+    }
+#undef EYE_CUDA_CASE
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        TP_THROW(RuntimeError, std::string("CUDA eye Error: ") + cudaGetErrorString(err));
     }
 
     return t;
