@@ -9,9 +9,15 @@
 #include <utility>
 #include <variant>
 
+#include "SymCheckedArith.h"
+
 namespace tensorplay {
 
 namespace {
+int64_t checked_add(int64_t, int64_t);
+int64_t checked_sub(int64_t, int64_t);
+int64_t checked_mul(int64_t, int64_t);
+int64_t checked_left_shift(int64_t, int64_t);
 
 enum class ExprOp : uint8_t {
     Symbol,
@@ -182,6 +188,26 @@ std::optional<double> hinted_value<double>(const SymNode& node) {
     }
 }
 
+int64_t checked_add(int64_t left, int64_t right) {
+    try { return sym_arith::checked_add(left, right); }
+    catch (const SymArithError& e) { TP_THROW(RuntimeError, e.message); }
+}
+
+int64_t checked_sub(int64_t left, int64_t right) {
+    try { return sym_arith::checked_sub(left, right); }
+    catch (const SymArithError& e) { TP_THROW(RuntimeError, e.message); }
+}
+
+int64_t checked_mul(int64_t left, int64_t right) {
+    try { return sym_arith::checked_mul(left, right); }
+    catch (const SymArithError& e) { TP_THROW(RuntimeError, e.message); }
+}
+
+int64_t checked_left_shift(int64_t left, int64_t right) {
+    try { return sym_arith::checked_left_shift(left, right); }
+    catch (const SymArithError& e) { TP_THROW(RuntimeError, e.message); }
+}
+
 int64_t floor_divide(int64_t left, int64_t right) {
     TP_CHECK_VALUE(right != 0, "symbolic integer division by zero");
     TP_CHECK_VALUE(!(left == std::numeric_limits<int64_t>::min() && right == -1),
@@ -194,29 +220,8 @@ int64_t floor_divide(int64_t left, int64_t right) {
     return quotient;
 }
 
-int64_t checked_add(int64_t left, int64_t right) {
-    const __int128 result = static_cast<__int128>(left) + right;
-    TP_CHECK_VALUE(result >= std::numeric_limits<int64_t>::min() &&
-                       result <= std::numeric_limits<int64_t>::max(),
-                   "symbolic integer addition overflow");
-    return static_cast<int64_t>(result);
-}
 
-int64_t checked_sub(int64_t left, int64_t right) {
-    const __int128 result = static_cast<__int128>(left) - right;
-    TP_CHECK_VALUE(result >= std::numeric_limits<int64_t>::min() &&
-                       result <= std::numeric_limits<int64_t>::max(),
-                   "symbolic integer subtraction overflow");
-    return static_cast<int64_t>(result);
-}
 
-int64_t checked_mul(int64_t left, int64_t right) {
-    const __int128 result = static_cast<__int128>(left) * right;
-    TP_CHECK_VALUE(result >= std::numeric_limits<int64_t>::min() &&
-                       result <= std::numeric_limits<int64_t>::max(),
-                   "symbolic integer multiplication overflow");
-    return static_cast<int64_t>(result);
-}
 
 int64_t checked_neg(int64_t value) {
     TP_CHECK_VALUE(value != std::numeric_limits<int64_t>::min(),
@@ -254,17 +259,6 @@ int64_t bits_to_int(uint64_t value) {
     return result;
 }
 
-int64_t checked_left_shift(int64_t left, int64_t right) {
-    TP_CHECK_VALUE(right >= 0, "symbolic integer shift count must be non-negative");
-    TP_CHECK_VALUE(right < 127, "symbolic integer shift count is too large");
-    const __int128 multiplier = static_cast<__int128>(1) << right;
-    const __int128 result = static_cast<__int128>(left) * multiplier;
-    TP_CHECK_VALUE(
-        result >= std::numeric_limits<int64_t>::min() &&
-            result <= std::numeric_limits<int64_t>::max(),
-        "symbolic integer left shift overflow");
-    return static_cast<int64_t>(result);
-}
 
 int64_t checked_right_shift(int64_t left, int64_t right) {
     TP_CHECK_VALUE(right >= 0, "symbolic integer shift count must be non-negative");
