@@ -65,6 +65,24 @@ inline void outer_inner(const std::vector<int64_t>& shape, int64_t dim,
     for (int64_t i = dim + 1; i < static_cast<int64_t>(shape.size()); ++i) inner *= shape[i];
 }
 
+inline int64_t checked_pixel_factor(int64_t factor, const char* op) {
+    if (factor <= 0) {
+        TP_THROW(RuntimeError, op, " expects a positive factor, but got ", factor);
+    }
+    if (factor > std::numeric_limits<int64_t>::max() / factor) {
+        TP_THROW(ValueError, op, ": factor is too large");
+    }
+    return factor * factor;
+}
+
+inline int64_t checked_pixel_extent(int64_t extent, int64_t factor,
+                                    const char* op) {
+    if (extent > std::numeric_limits<int64_t>::max() / factor) {
+        TP_THROW(ValueError, op, ": output dimension is too large");
+    }
+    return extent * factor;
+}
+
 inline std::vector<int64_t> shape_of(const Tensor& t) {
     return static_cast<std::vector<int64_t>>(t.shape());
 }
@@ -702,15 +720,28 @@ Tensor block_diag_cuda(const std::vector<Tensor>& tensors) {
 }
 
 Tensor pixel_shuffle_cuda(const Tensor& self, int64_t upscale_factor) {
-    // PixelShuffle.cpp:23 semantics: (N, C*r^2, H, W) -> (N, C, H*r, W*r)
-    if (self.dim() != 4) TP_THROW(RuntimeError, "pixel_shuffle expects 4D input");
-    int64_t r = upscale_factor;
-    int64_t N = self.size(0);
-    int64_t C = self.size(1) / (r * r);
-    int64_t H = self.size(2), W = self.size(3);
-    if (C * r * r != self.size(1))
+    if (self.dim() < 3) {
+        TP_THROW(RuntimeError, "pixel_shuffle expects input to have at least 3 dimensions, but got input with ",
+                 self.dim(), " dimension(s)");
+    }
+    const int64_t factor_squared = checked_pixel_factor(upscale_factor, "pixel_shuffle");
+    const int64_t input_channels = self.size(-3);
+    if (input_channels % factor_squared != 0)
         TP_THROW(RuntimeError, "pixel_shuffle: channel dim must be divisible by r^2");
-    Tensor out = Tensor::empty({N, C, H * r, W * r}, self.dtype(), self.device());
+    const int64_t output_height =
+        checked_pixel_extent(self.size(-2), upscale_factor, "pixel_shuffle");
+    const int64_t output_width =
+        checked_pixel_extent(self.size(-1), upscale_factor, "pixel_shuffle");
+    std::vector<int64_t> output_shape = shape_of(self);
+    output_shape.resize(output_shape.size() - 3);
+    output_shape.push_back(input_channels / factor_squared);
+    output_shape.push_back(output_height);
+    output_shape.push_back(output_width);
+    int64_t r = upscale_factor;
+    int64_t C = input_channels / factor_squared;
+    int64_t H = self.size(-2), W = self.size(-1);
+    Tensor out = Tensor::empty(output_shape, self.dtype(), self.device());
+    if (out.numel() == 0) return out;
     Tensor sc = self.contiguous();
     int64_t n = out.numel();
     auto stream = getCurrentCUDAStream().stream();
@@ -721,7 +752,7 @@ Tensor pixel_shuffle_cuda(const Tensor& self, int64_t upscale_factor) {
             n, C, H, W, r, sc.data_ptr<ctype>(), out.data_ptr<ctype>()); \
         break;
     switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_PS)
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_PS)
         default: TP_THROW(TypeError, "pixel_shuffle: unsupported dtype");
     }
 #undef TP_PS
@@ -730,14 +761,26 @@ Tensor pixel_shuffle_cuda(const Tensor& self, int64_t upscale_factor) {
 }
 
 Tensor pixel_unshuffle_cuda(const Tensor& self, int64_t downscale_factor) {
-    if (self.dim() != 4) TP_THROW(RuntimeError, "pixel_unshuffle expects 4D input");
+    if (self.dim() < 3) {
+        TP_THROW(RuntimeError, "pixel_unshuffle expects input to have at least 3 dimensions, but got input with ",
+                 self.dim(), " dimension(s)");
+    }
+    const int64_t factor_squared =
+        checked_pixel_factor(downscale_factor, "pixel_unshuffle");
     int64_t r = downscale_factor;
-    int64_t N = self.size(0);
-    int64_t C = self.size(1);
-    int64_t H = self.size(2) / r, W = self.size(3) / r;
-    if (H * r != self.size(2) || W * r != self.size(3))
+    int64_t C = self.size(-3);
+    int64_t H = self.size(-2) / r, W = self.size(-1) / r;
+    if (H * r != self.size(-2) || W * r != self.size(-1))
         TP_THROW(RuntimeError, "pixel_unshuffle: spatial dims must be divisible by r");
-    Tensor out = Tensor::empty({N, C * r * r, H, W}, self.dtype(), self.device());
+    if (C > std::numeric_limits<int64_t>::max() / factor_squared)
+        TP_THROW(ValueError, "pixel_unshuffle: output channel dimension is too large");
+    std::vector<int64_t> output_shape = shape_of(self);
+    output_shape.resize(output_shape.size() - 3);
+    output_shape.push_back(C * factor_squared);
+    output_shape.push_back(H);
+    output_shape.push_back(W);
+    Tensor out = Tensor::empty(output_shape, self.dtype(), self.device());
+    if (out.numel() == 0) return out;
     Tensor sc = self.contiguous();
     int64_t n = out.numel();
     auto stream = getCurrentCUDAStream().stream();
@@ -748,7 +791,7 @@ Tensor pixel_unshuffle_cuda(const Tensor& self, int64_t downscale_factor) {
             n, C, H, W, r, sc.data_ptr<ctype>(), out.data_ptr<ctype>()); \
         break;
     switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_PU)
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_PU)
         default: TP_THROW(TypeError, "pixel_unshuffle: unsupported dtype");
     }
 #undef TP_PU
@@ -757,20 +800,23 @@ Tensor pixel_unshuffle_cuda(const Tensor& self, int64_t downscale_factor) {
 }
 
 Tensor channel_shuffle_cuda(const Tensor& self, int64_t groups) {
-    // ChannelShuffle: view(N, g, C/g, ...) -> transpose(1,2). Channel dim is
-    // dim 1 for >=2D input, dim 0 for 1-D input.
-    if (self.dim() < 1) TP_THROW(RuntimeError, "channel_shuffle expects >= 1D input");
-    int64_t cdim = self.dim() >= 2 ? 1 : 0;
-    int64_t C = self.size(cdim);
+    if (self.dim() <= 2) {
+        TP_THROW(RuntimeError, "channel_shuffle expects input with more than 2 dimensions");
+    }
+    if (groups <= 0) {
+        TP_THROW(RuntimeError, "channel_shuffle: groups must be positive, but got ", groups);
+    }
+    int64_t C = self.size(1);
     int64_t outer = 1;
-    for (int64_t i = 0; i < cdim; ++i) outer *= self.size(i);
+    for (int64_t i = 0; i < 1; ++i) outer *= self.size(i);
     int64_t inner = 1;
-    for (int64_t i = cdim + 1; i < self.dim(); ++i) inner *= self.size(i);
+    for (int64_t i = 2; i < self.dim(); ++i) inner *= self.size(i);
     if (C % groups) TP_THROW(RuntimeError, "channel_shuffle: channel dim not divisible by groups");
     int64_t cg = C / groups;
     Tensor sc = self.contiguous();
     Tensor out = Tensor::empty(shape_of(self), self.dtype(), self.device());
     int64_t n = self.numel();
+    if (n == 0) return out;
     auto stream = getCurrentCUDAStream().stream();
     dim3 grid = make_grid(n), block(kThreads);
 #define TP_CS(ctype, name_) \
@@ -779,7 +825,7 @@ Tensor channel_shuffle_cuda(const Tensor& self, int64_t groups) {
             n, outer, C, inner, cg, sc.data_ptr<ctype>(), out.data_ptr<ctype>()); \
         break;
     switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_CS)
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_CS)
         default: TP_THROW(TypeError, "channel_shuffle: unsupported dtype");
     }
 #undef TP_CS
