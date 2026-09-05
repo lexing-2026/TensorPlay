@@ -2627,9 +2627,18 @@ __global__ void unique_emit_kernel(int64_t n, const T* __restrict__ sorted,
                                    int64_t* __restrict__ starts) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n || !flags[i]) return;
-    const int64_t g = gid_inclusive[i] - 1;  // inclusive cumsum is 1-based
+    const int64_t g = gid_inclusive[i] - 1;
     values[g] = sorted[i];
-    starts[g] = i;   // segment length = next start (or n) - i, resolved on host
+    if (starts != nullptr) starts[g] = i;
+}
+
+__global__ void unique_counts_kernel(int64_t num_groups, int64_t n,
+                                     const int64_t* __restrict__ starts,
+                                     int64_t* __restrict__ counts) {
+    int64_t g = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (g >= num_groups) return;
+    const int64_t end = (g + 1 < num_groups) ? starts[g + 1] : n;
+    counts[g] = end - starts[g];
 }
 
 } // namespace
@@ -2669,11 +2678,12 @@ std::tuple<Tensor, Tensor, Tensor> unique_cuda(const Tensor& self, bool sorted,
         UNIQUE_FLAGS_CASE(int16_t, Int16)
         UNIQUE_FLAGS_CASE(int8_t, Int8)
         UNIQUE_FLAGS_CASE(uint8_t, UInt8)
-        case DType::Bool:
-            unique_flags_kernel<bool><<<blocks, threads>>>(
-                n, reinterpret_cast<const bool*>(sorted_vals.data_ptr<bool>()),
-                flags.data_ptr<int64_t>());
-            break;
+        UNIQUE_FLAGS_CASE(uint16_t, UInt16)
+        UNIQUE_FLAGS_CASE(uint32_t, UInt32)
+        UNIQUE_FLAGS_CASE(uint64_t, UInt64)
+        UNIQUE_FLAGS_CASE(Half, Float16)
+        UNIQUE_FLAGS_CASE(BFloat16, BFloat16)
+        UNIQUE_FLAGS_CASE(bool, Bool)
         default:
             TP_THROW(NotImplementedError, "unique: unsupported dtype on CUDA");
     }
@@ -2691,46 +2701,48 @@ std::tuple<Tensor, Tensor, Tensor> unique_cuda(const Tensor& self, bool sorted,
             n, order.data_ptr<int64_t>(), gid.data_ptr<int64_t>(),
             inverse.data_ptr<int64_t>());
     }
+    Tensor starts;
+    int64_t* starts_ptr = nullptr;
     if (return_counts) {
         counts = Tensor::zeros({num_groups}, DType::Int64, self.device());
-        // counts[g] via a small host pass over boundaries would need a sync;
-        // do it with an atomic-free scatter of segment lengths on device:
-        Tensor starts = Tensor::full({num_groups}, int64_t(-1), DType::Int64,
-                                     self.device());
-        // emit values + record start positions
-        #define UNIQUE_EMIT_CASE(ctype, name)                                  \
+        starts = Tensor::full({num_groups}, int64_t(-1), DType::Int64,
+                              self.device());
+        starts_ptr = starts.data_ptr<int64_t>();
+    }
+
+    #define UNIQUE_EMIT_CASE(ctype, name)                                      \
         case DType::name:                                                      \
             unique_emit_kernel<ctype><<<blocks, threads>>>(                     \
                 n, sorted_vals.data_ptr<ctype>(), flags.data_ptr<int64_t>(),   \
                 gid.data_ptr<int64_t>(), values.data_ptr<ctype>(),             \
-                starts.data_ptr<int64_t>());                                    \
+                starts_ptr);                                                     \
             break;
-        switch (self.dtype()) {
-            UNIQUE_EMIT_CASE(float, Float32)
-            UNIQUE_EMIT_CASE(double, Float64)
-            UNIQUE_EMIT_CASE(int64_t, Int64)
-            UNIQUE_EMIT_CASE(int32_t, Int32)
-            UNIQUE_EMIT_CASE(int16_t, Int16)
-            UNIQUE_EMIT_CASE(int8_t, Int8)
-            UNIQUE_EMIT_CASE(uint8_t, UInt8)
-            default:
-                TP_THROW(NotImplementedError, "unique: unsupported dtype on CUDA");
-        }
-        #undef UNIQUE_EMIT_CASE
-        // counts[g] = next_start - start; resolved on host over the small
-        // starts buffer (num_groups entries).
-        std::vector<int64_t> h(num_groups);
-        std::memcpy(h.data(), starts.to(Device(DeviceType::CPU)).data_ptr<int64_t>(),
-                    static_cast<size_t>(num_groups) * sizeof(int64_t));
-        std::vector<int64_t> hc(num_groups);
-        for (int64_t g = 0; g < num_groups; ++g) {
-            const int64_t e = (g + 1 < num_groups) ? h[g + 1] : n;
-            hc[g] = e - h[g];
-        }
-        // NB: counts lives on the device -- materialize on CPU via the tensor
-        // factory, then move (H2D); a raw memcpy into device memory segfaults
-        // on discrete GPUs, and tensor() itself is CPU-only in this tree.
-        counts = Tensor::tensor(hc, DType::Int64).to(self.device());
+    switch (self.dtype()) {
+        UNIQUE_EMIT_CASE(float, Float32)
+        UNIQUE_EMIT_CASE(double, Float64)
+        UNIQUE_EMIT_CASE(int64_t, Int64)
+        UNIQUE_EMIT_CASE(int32_t, Int32)
+        UNIQUE_EMIT_CASE(int16_t, Int16)
+        UNIQUE_EMIT_CASE(int8_t, Int8)
+        UNIQUE_EMIT_CASE(uint8_t, UInt8)
+        UNIQUE_EMIT_CASE(uint16_t, UInt16)
+        UNIQUE_EMIT_CASE(uint32_t, UInt32)
+        UNIQUE_EMIT_CASE(uint64_t, UInt64)
+        UNIQUE_EMIT_CASE(Half, Float16)
+        UNIQUE_EMIT_CASE(BFloat16, BFloat16)
+        UNIQUE_EMIT_CASE(bool, Bool)
+        default:
+            TP_THROW(NotImplementedError, "unique: unsupported dtype on CUDA");
+    }
+    #undef UNIQUE_EMIT_CASE
+    CUDA_CHECK(cudaGetLastError());
+
+    if (return_counts) {
+        const int count_blocks =
+            static_cast<int>((num_groups + threads - 1) / threads);
+        unique_counts_kernel<<<count_blocks, threads>>>(
+            num_groups, n, starts_ptr, counts.data_ptr<int64_t>());
+        CUDA_CHECK(cudaGetLastError());
     }
     return std::make_tuple(values, inverse, counts);
 }
@@ -2869,11 +2881,12 @@ std::tuple<Tensor, Tensor, Tensor> unique_dim_cuda_impl(const Tensor& self,
         UNIQUE_ROW_CASE(int16_t, Int16)
         UNIQUE_ROW_CASE(int8_t, Int8)
         UNIQUE_ROW_CASE(uint8_t, UInt8)
-        case DType::Bool:
-            unique_row_equal_kernel<bool><<<blocks, threads, 0, stream>>>(
-                n, row_len, rows_sorted.data_ptr<bool>(),
-                order.data_ptr<int64_t>(), flags.data_ptr<int64_t>());
-            break;
+        UNIQUE_ROW_CASE(uint16_t, UInt16)
+        UNIQUE_ROW_CASE(uint32_t, UInt32)
+        UNIQUE_ROW_CASE(uint64_t, UInt64)
+        UNIQUE_ROW_CASE(Half, Float16)
+        UNIQUE_ROW_CASE(BFloat16, BFloat16)
+        UNIQUE_ROW_CASE(bool, Bool)
         default:
             TP_THROW(NotImplementedError,
                      "unique_dim: unsupported dtype on CUDA");
@@ -2903,12 +2916,12 @@ std::tuple<Tensor, Tensor, Tensor> unique_dim_cuda_impl(const Tensor& self,
         UNIQUE_ROW_EMIT_CASE(int16_t, Int16)
         UNIQUE_ROW_EMIT_CASE(int8_t, Int8)
         UNIQUE_ROW_EMIT_CASE(uint8_t, UInt8)
-        case DType::Bool:
-            unique_row_emit_kernel<bool><<<blocks, threads, 0, stream>>>(
-                n, row_len, rows_sorted.data_ptr<bool>(),
-                order.data_ptr<int64_t>(), gid.data_ptr<int64_t>(),
-                kept_rows.data_ptr<bool>(), inverse.data_ptr<int64_t>());
-            break;
+        UNIQUE_ROW_EMIT_CASE(uint16_t, UInt16)
+        UNIQUE_ROW_EMIT_CASE(uint32_t, UInt32)
+        UNIQUE_ROW_EMIT_CASE(uint64_t, UInt64)
+        UNIQUE_ROW_EMIT_CASE(Half, Float16)
+        UNIQUE_ROW_EMIT_CASE(BFloat16, BFloat16)
+        UNIQUE_ROW_EMIT_CASE(bool, Bool)
         default:
             TP_THROW(NotImplementedError,
                      "unique_dim: unsupported dtype on CUDA");
