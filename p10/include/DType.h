@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <complex>
+#include <limits>
+#include <ostream>
 #include <type_traits>
 
 #include "BFloat16.h"
@@ -377,6 +379,10 @@ inline const char* toString(ScalarType type) {
             return "UNKNOWN_SCALAR";
     }
 #undef TENSORPLAY_DTYPE_NAME
+}
+
+inline std::ostream& operator<<(std::ostream& stream, ScalarType scalar_type) {
+    return stream << toString(scalar_type);
 }
 
 inline size_t elementSize(ScalarType type) {
