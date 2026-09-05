@@ -16,6 +16,34 @@ namespace ops = tensorplay::tpx::ops;
 
 namespace tensorplay {
 
+namespace {
+
+QuantizerPtr quantizer_on_device(const QuantizerPtr& quantizer,
+                                 const Device& device) {
+    if (!quantizer) return nullptr;
+    switch (quantizer->qscheme()) {
+        case kPerTensorAffine:
+            return make_per_tensor_affine_quantizer(
+                quantizer->scale(), quantizer->zero_point(),
+                quantizer->scalar_type());
+        case kPerChannelAffine:
+        case kPerChannelAffineFloatQParams: {
+            Tensor scales = quantizer->scales();
+            Tensor zero_points = quantizer->zero_points();
+            if (scales.device() != device) scales = scales.to(device);
+            if (zero_points.device() != device) zero_points = zero_points.to(device);
+            return make_per_channel_affine_quantizer(
+                scales, zero_points, quantizer->axis(),
+                quantizer->scalar_type());
+        }
+        default:
+            TP_THROW(RuntimeError,
+                     "cannot move a tensor with an unsupported quantizer");
+    }
+}
+
+} // namespace
+
 // Helper for DType output
 std::ostream& operator<<(std::ostream& os, DType dt) {
     switch (dt) {
@@ -36,6 +64,11 @@ std::ostream& operator<<(std::ostream& os, DType dt) {
         case DType::ComplexDouble: os << "complex128"; break;
         case DType::BComplex32: os << "bcomplex32"; break;
         case DType::Bool: os << "bool"; break;
+        case DType::Float8_e4m3fn: os << "float8_e4m3fn"; break;
+        case DType::Float8_e5m2: os << "float8_e5m2"; break;
+        case DType::Float8_e4m3fnuz: os << "float8_e4m3fnuz"; break;
+        case DType::Float8_e5m2fnuz: os << "float8_e5m2fnuz"; break;
+        case DType::Float8_e8m0fnu: os << "float8_e8m0fnu"; break;
         case DType::QInt8: os << "qint8"; break;
         case DType::QUInt8: os << "quint8"; break;
         case DType::QInt32: os << "qint32"; break;
@@ -390,6 +423,9 @@ Scalar Tensor::item() const {
         case DType::BFloat16: return Scalar(static_cast<float>(*data_ptr<BFloat16>()));
         case DType::Float8_e4m3fn: return Scalar(static_cast<float>(*data_ptr<Float8_e4m3fn>()));
         case DType::Float8_e5m2: return Scalar(static_cast<float>(*data_ptr<Float8_e5m2>()));
+        case DType::Float8_e4m3fnuz: return Scalar(static_cast<float>(*data_ptr<Float8_e4m3fnuz>()));
+        case DType::Float8_e5m2fnuz: return Scalar(static_cast<float>(*data_ptr<Float8_e5m2fnuz>()));
+        case DType::Float8_e8m0fnu: return Scalar(static_cast<float>(*data_ptr<Float8_e8m0fnu>()));
         case DType::Int8: return Scalar(static_cast<int64_t>(*data_ptr<int8_t>()));
         case DType::Int16: return Scalar(static_cast<int64_t>(*data_ptr<int16_t>()));
         case DType::Int32: return Scalar(static_cast<int64_t>(*data_ptr<int32_t>()));
@@ -582,6 +618,21 @@ std::string Tensor::toString() const {
         case DType::Float64:
             print_data_recursive(ss, tensor_to_print.data_ptr<double>(), current_sizes, current_strides, 0, 7, options, summarizing);
             break;
+        case DType::Float8_e4m3fn:
+            print_data_recursive(ss, tensor_to_print.data_ptr<Float8_e4m3fn>(), current_sizes, current_strides, 0, 7, options, summarizing);
+            break;
+        case DType::Float8_e5m2:
+            print_data_recursive(ss, tensor_to_print.data_ptr<Float8_e5m2>(), current_sizes, current_strides, 0, 7, options, summarizing);
+            break;
+        case DType::Float8_e4m3fnuz:
+            print_data_recursive(ss, tensor_to_print.data_ptr<Float8_e4m3fnuz>(), current_sizes, current_strides, 0, 7, options, summarizing);
+            break;
+        case DType::Float8_e5m2fnuz:
+            print_data_recursive(ss, tensor_to_print.data_ptr<Float8_e5m2fnuz>(), current_sizes, current_strides, 0, 7, options, summarizing);
+            break;
+        case DType::Float8_e8m0fnu:
+            print_data_recursive(ss, tensor_to_print.data_ptr<Float8_e8m0fnu>(), current_sizes, current_strides, 0, 7, options, summarizing);
+            break;
         case DType::Int32:
             print_data_recursive(ss, tensor_to_print.data_ptr<int32_t>(), current_sizes, current_strides, 0, 7, options, summarizing);
             break;
@@ -614,7 +665,7 @@ std::string Tensor::toString() const {
     if (impl_->has_quantizer()) {
         const auto q = impl_->quantizer();
         ss << ", quantization_scheme=tensorplay." << tensorplay::toString(q->qscheme());
-        if (q->qscheme() == QScheme::PerTensorAffine) {
+        if (isPerTensorQScheme(q->qscheme())) {
             ss << ", scale=" << q->scale()
                << ", zero_point=" << q->zero_point();
         } else {
@@ -1045,7 +1096,8 @@ Tensor Tensor::to(Device device, bool non_blocking, bool copy) const {
         impl_->sizes(), dtype(), device, /*pin_memory=*/false);
     t.copy_(*this, non_blocking);
     if (impl_->has_quantizer()) {
-        t.unsafeGetTensorImpl()->set_quantizer(impl_->quantizer());
+        t.unsafeGetTensorImpl()->set_quantizer(
+            quantizer_on_device(impl_->quantizer(), device));
     }
     return t;
 }

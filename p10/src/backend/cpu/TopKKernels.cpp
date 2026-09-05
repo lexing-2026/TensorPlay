@@ -173,6 +173,9 @@ std::tuple<Tensor, Tensor> topk_kernel_cpu(const Tensor& self, int64_t k, int64_
     case DType::BComplex32:
     case DType::Float8_e4m3fn:
     case DType::Float8_e5m2:
+    case DType::Float8_e4m3fnuz:
+    case DType::Float8_e5m2fnuz:
+    case DType::Float8_e8m0fnu:
     case DType::Undefined:
     case DType::NumOptions:
       TP_THROW(NotImplementedError, "topk: unsupported dtype");

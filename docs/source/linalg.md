@@ -12,14 +12,14 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay.linalg.norm
-    tensorplay.linalg.vector_norm
-    tensorplay.linalg.matrix_norm
+    tensorplay.linalg._norms.norm
+    tensorplay.linalg._norms.vector_norm
+    tensorplay.linalg._norms.matrix_norm
     tensorplay.diagonal
-    tensorplay.linalg.det
-    tensorplay.linalg.slogdet
-    tensorplay.linalg.cond
-    tensorplay.linalg.matrix_rank
+    tensorplay.linalg._solve.det
+    tensorplay.linalg._solve.slogdet
+    tensorplay.linalg._norms.cond
+    tensorplay.linalg._norms.matrix_rank
 ```
 
 ## Decompositions
@@ -29,17 +29,17 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay.linalg.cholesky
-    tensorplay.linalg.qr
-    tensorplay.linalg.polar
+    tensorplay.linalg._decompositions.cholesky
+    tensorplay.linalg._decompositions.qr
+    tensorplay.linalg._decompositions.polar
     tensorplay.linalg.lu
     tensorplay.linalg.lu_factor
-    tensorplay.linalg.eig
-    tensorplay.linalg.eigvals
-    tensorplay.linalg.eigh
-    tensorplay.linalg.eigvalsh
-    tensorplay.linalg.svd
-    tensorplay.linalg.svdvals
+    tensorplay.linalg._decompositions.eig
+    tensorplay.linalg._decompositions.eigvals
+    tensorplay.linalg._decompositions.eigh
+    tensorplay.linalg._decompositions.eigvalsh
+    tensorplay.linalg._decompositions.svd
+    tensorplay.linalg._decompositions.svdvals
 ```
 
 ## Solvers
@@ -49,10 +49,10 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay.linalg.solve
+    tensorplay.linalg._solve.solve
     tensorplay.linalg.solve_triangular
-    tensorplay.linalg.lu_solve
-    tensorplay.linalg.lstsq
+    tensorplay.lu_solve
+    tensorplay.linalg._solve.lstsq
 ```
 
 ## Inverses
@@ -62,8 +62,8 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay.linalg.inv
-    tensorplay.linalg.pinv
+    tensorplay.linalg._solve.inv
+    tensorplay.linalg._solve.pinv
 ```
 
 ## Matrix Functions
@@ -73,9 +73,9 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay.linalg.matrix_exp
-    tensorplay.linalg.matrix_sqrth
-    tensorplay.linalg.matrix_power
+    tensorplay.linalg._matrix_functions.matrix_exp
+    tensorplay.linalg._matrix_functions.matrix_sqrth
+    tensorplay.linalg._matrix_functions.matrix_power
 ```
 
 ## Matrix Products
@@ -85,10 +85,10 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay.linalg.cross
-    tensorplay.linalg.matmul
-    tensorplay.linalg.vecdot
-    tensorplay.linalg.multi_dot
+    tensorplay.linalg._matrix_functions.cross
+    tensorplay.linalg._matrix_functions.matmul
+    tensorplay.linalg._matrix_functions.vecdot
+    tensorplay.linalg._matrix_functions.multi_dot
     tensorplay.linalg.householder_product
 ```
 
@@ -99,8 +99,8 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay.linalg.tensorinv
-    tensorplay.linalg.tensorsolve
+    tensorplay.linalg._solve.tensorinv
+    tensorplay.linalg._solve.tensorsolve
 ```
 
 ## Misc
@@ -110,7 +110,7 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay.linalg.vander
+    tensorplay.linalg._matrix_functions.vander
 ```
 
 ## Experimental Functions
@@ -120,9 +120,9 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay.linalg.cholesky_ex
-    tensorplay.linalg.inv_ex
-    tensorplay.linalg.solve_ex
+    tensorplay.linalg._decompositions.cholesky_ex
+    tensorplay.linalg._solve.inv_ex
+    tensorplay.linalg._solve.solve_ex
     tensorplay.linalg.lu_factor_ex
     tensorplay.linalg.ldl_factor
     tensorplay.linalg.ldl_factor_ex

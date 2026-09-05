@@ -303,7 +303,7 @@ def embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.0, sca
             run_check=False,
         )
     if max_norm is not None:
-        raise NotImplementedError('embedding: max_norm is not supported')
+        _no_grad_embedding_renorm_(weight, input, max_norm, norm_type)
     if padding_idx is None:
         padding_idx = -1
     else:
@@ -682,7 +682,7 @@ def instance_norm(input, running_mean=None, running_var=None, weight=None, bias=
 
 def pad(input, pad, mode='constant', value=0):
     r"""Pads tensor.  ``pad`` values are described starting from the last
-    Non-constant modes support the last 3 dimensions of a 3D/4D/5D input
+    dimension and may cover any suffix of the input dimensions.
     """
     captured = _capture_call(globals()["pad"], (input, pad, mode, value), {})
     if captured is not None:
@@ -690,19 +690,13 @@ def pad(input, pad, mode='constant', value=0):
     if mode == 'constant':
         return _C.constant_pad_nd(input, list(pad), value)
     ndim = input.dim()
-    if ndim == 3:
-        if len(pad) != 2:
-            raise ValueError("3D tensors expect 2 values for padding")
-    elif ndim == 4:
-        if len(pad) != 4:
-            raise ValueError("4D tensors expect 4 values for padding")
-    elif ndim == 5:
-        if len(pad) != 6:
-            raise ValueError("5D tensors expect 6 values for padding")
-    else:
-        raise NotImplementedError("Only 3D, 4D, 5D padding with non-constant "
-                                  "padding are supported for now")
     pad = list(pad)
+    if len(pad) % 2 != 0:
+        raise ValueError(f"padding length must be even, got {len(pad)}")
+    if len(pad) > 2 * ndim:
+        raise ValueError(
+            f"padding length {len(pad)} exceeds the {ndim}-D input"
+        )
     if mode == 'reflect':
         return _C.reflection_pad_nd(input, pad)
     if mode == 'replicate':
@@ -1097,16 +1091,34 @@ def interpolate(
         raise ValueError("only one of size or scale_factor should be defined")
 
     ndim = input.dim()
+    if ndim < 3:
+        raise ValueError(f"interpolate expects at least 3D input, got {ndim}D")
+    spatial = ndim - 2
     # mode branches can operate on a concrete size.
     if size is None and scale_factor is not None:
-        spatial = ndim - 2
         if isinstance(scale_factor, (int, float)):
             scale_list = [scale_factor] * spatial
         else:
             scale_list = list(scale_factor)
+            if len(scale_list) != spatial:
+                raise ValueError(
+                    f"scale_factor must have {spatial} values, got {len(scale_list)}"
+                )
         import math
+        if any(float(s) <= 0 for s in scale_list):
+            raise ValueError("scale_factor values must be positive")
         size = [int(math.floor(float(input.size(2 + i)) * s))
                 for i, s in enumerate(scale_list)]
+    elif isinstance(size, int):
+        size = [size] * spatial
+    else:
+        size = list(size)
+        if len(size) != spatial:
+            raise ValueError(
+                f"size must have {spatial} values, got {len(size)}"
+            )
+    if any(int(s) <= 0 for s in size):
+        raise ValueError(f"interpolate output sizes must be positive, got {size}")
     if mode in ('nearest', 'nearest-exact'):
         if align_corners is not None:
             raise ValueError("align_corners option can only be set with interpolating modes")
@@ -1115,24 +1127,18 @@ def interpolate(
         if mode == 'nearest-exact':
             import tensorplay.functional as _functional
             if ndim == 3:
-                size_ = [size] * 1 if isinstance(size, int) else list(size)
-                return _functional._upsample_nearest_exact1d(input, size_, None)
+                return _functional._upsample_nearest_exact1d(input, size, None)
             elif ndim == 4:
-                size_ = [size] * 2 if isinstance(size, int) else list(size)
-                return _functional._upsample_nearest_exact2d(input, size_, None)
+                return _functional._upsample_nearest_exact2d(input, size, None)
             elif ndim == 5:
-                size_ = [size] * 3 if isinstance(size, int) else list(size)
-                return _functional._upsample_nearest_exact3d(input, size_, None)
+                return _functional._upsample_nearest_exact3d(input, size, None)
             raise ValueError(f"Expected 3D, 4D or 5D input, got {ndim}D")
         if ndim == 3:
-            size_ = [size] * 1 if isinstance(size, int) else list(size)
-            return tensorplay.upsample_nearest1d(input, size_)
+            return tensorplay.upsample_nearest1d(input, size)
         elif ndim == 4:
-            size_ = [size] * 2 if isinstance(size, int) else list(size)
-            return tensorplay.upsample_nearest2d(input, size_)
+            return tensorplay.upsample_nearest2d(input, size)
         elif ndim == 5:
-            size_ = [size] * 3 if isinstance(size, int) else list(size)
-            return tensorplay.upsample_nearest3d(input, size_)
+            return tensorplay.upsample_nearest3d(input, size)
         raise ValueError(f"Expected 3D, 4D or 5D input, got {ndim}D")
 
     if align_corners is None:
@@ -1141,38 +1147,52 @@ def interpolate(
     import math
     if scale_factor is not None:
         if isinstance(scale_factor, (int, float)):
-            spatial = ndim - 2
             scale_factor = [scale_factor] * spatial
+        elif len(scale_factor) != spatial:
+            raise ValueError(
+                f"scale_factor must have {spatial} values, got {len(scale_factor)}"
+            )
+        if any(float(f) <= 0 for f in scale_factor):
+            raise ValueError("scale_factor values must be positive")
         if recompute_scale_factor:
             size = [int(math.floor(float(input.shape[2 + i]) * f)) for i, f in enumerate(scale_factor)]
+
+    if mode == 'area':
+        if align_corners is not None:
+            raise ValueError("align_corners option cannot be set for area interpolation")
+        if ndim == 3:
+            return adaptive_avg_pool1d(input, size[0])
+        if ndim == 4:
+            return adaptive_avg_pool2d(input, size)
+        if ndim == 5:
+            return adaptive_avg_pool3d(input, size)
+        raise ValueError(f"Expected 3D, 4D or 5D input, got {ndim}D")
 
     if mode == 'linear':
         if ndim != 3:
             raise ValueError("linear interpolation expects 3D input")
         if antialias:
             raise NotImplementedError("interpolate: antialias is not supported with mode='linear'")
-        return tensorplay.upsample_linear1d(input, list(size), align_corners)
+        return tensorplay.upsample_linear1d(input, size, align_corners)
     elif mode == 'bilinear':
         if ndim != 4:
             raise ValueError("bilinear interpolation expects 4D input")
         if antialias:
-            size_ = [size] * 2 if isinstance(size, int) else list(size)
-            return _C._upsample_bilinear2d_aa(input, size_, align_corners, None)
-        return tensorplay.upsample_bilinear2d(input, list(size), align_corners)
+            return _C._upsample_bilinear2d_aa(input, size, align_corners, None)
+        return tensorplay.upsample_bilinear2d(input, size, align_corners)
     elif mode == 'bicubic':
         if ndim != 4:
             raise ValueError("bicubic interpolation expects 4D input")
         if antialias:
-            size_ = [size] * 2 if isinstance(size, int) else list(size)
-            return _C._upsample_bicubic2d_aa(input, size_, align_corners, None)
-        return tensorplay.upsample_bicubic2d(input, list(size), align_corners)
+            return _C._upsample_bicubic2d_aa(input, size, align_corners, None)
+        return tensorplay.upsample_bicubic2d(input, size, align_corners)
     elif mode == 'trilinear':
         if ndim != 5:
             raise ValueError("trilinear interpolation expects 5D input")
         if antialias:
             raise NotImplementedError("interpolate: antialias is not supported with mode='trilinear'")
-        return tensorplay.upsample_trilinear3d(input, list(size), align_corners)
-    raise NotImplementedError(f"interpolate: mode '{mode}' is not supported")
+        return tensorplay.upsample_trilinear3d(input, size, align_corners)
+    raise ValueError(f"interpolate: mode '{mode}' is not supported")
 
 
 def multi_head_attention_forward(
@@ -1268,7 +1288,21 @@ def multi_head_attention_forward(
         target_type=query.dtype,
     )
 
-    if is_causal and attn_mask is None:
+    if is_causal and attn_mask is None and need_weights:
+        causal_rows = tensorplay.arange(
+            tgt_len, dtype=DType.int64, device=query.device).view(tgt_len, 1)
+        causal_columns = tensorplay.arange(
+            src_len, dtype=DType.int64, device=query.device).view(1, src_len)
+        causal_fill = tensorplay.full(
+            [tgt_len, src_len], float("-inf"), dtype=query.dtype,
+            device=query.device)
+        causal_mask = causal_rows < causal_columns
+        attn_mask = tensorplay.where(
+            causal_mask, causal_fill,
+            tensorplay.zeros([tgt_len, src_len], dtype=query.dtype,
+                             device=query.device))
+        is_causal = False
+    elif is_causal and attn_mask is None:
         raise RuntimeError(
             "Need attn_mask if specifying the is_causal hint. "
             "You may use the Transformer module method "
@@ -1421,9 +1455,6 @@ def multi_head_attention_forward(
     if need_weights:
         E = q.shape[2]
         q_scaled = q * math.sqrt(1.0 / float(E))
-
-        if is_causal and attn_mask is None:
-            raise AssertionError("FIXME: is_causal not implemented for need_weights")
 
         if attn_mask is not None:
             attn_output_weights = tensorplay.baddbmm(
@@ -3161,22 +3192,9 @@ def pdist(input: Tensor, p: float = 2.0) -> Tensor:
 
 
 def _no_grad_embedding_renorm_(weight: Tensor, input, max_norm: float, norm_type: float) -> Tensor:
-    """Renorm referenced embedding rows in-place under no_grad (port of
-"""
+    """Renormalize referenced embedding rows in-place without recording gradients."""
     with tensorplay.no_grad():
-        if input.numel() == 0 or weight.numel() == 0:
-            return weight
-        idx = input.to(DType.int64).reshape(-1)
-        e = weight.size(0)
-        # referenced-row mask via index_add histogram
-        ref = tensorplay.index_add(
-            tensorplay.zeros([e], dtype=DType.float32, device=weight.device),
-            0, idx, tensorplay.ones(idx.numel(), dtype=DType.float32, device=weight.device),
-        )
-        norms = _C.norm(weight.contiguous(), [1], float(norm_type), False)  # (E,)
-        bad = tensorplay.logical_and(ref > 0, norms > max_norm)
-        scale = tensorplay.where(bad, max_norm / (norms + 1e-7), tensorplay.ones_like(norms))
-        weight.mul_(scale.view(-1, 1))
+        _C.embedding_renorm_(weight, input, float(max_norm), float(norm_type))
     return weight
 
 
@@ -3426,10 +3444,8 @@ def linear_cross_entropy(
                          reduction=reduction, label_smoothing=label_smoothing)
 
 
-def grouped_mm(*args, **kwargs):
-    raise NotImplementedError(
-        "grouped_mm requires native grouped GEMM kernels, which are not yet "
-        "available in this build.")
+def grouped_mm(input, mat2, offs):
+    return _C.grouped_mm(input, mat2, offs)
 
 
 def scaled_grouped_mm(*args, **kwargs):

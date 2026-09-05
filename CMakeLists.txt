@@ -79,7 +79,8 @@ if(USE_CUDA)
         enable_language(CUDA)
         set(CMAKE_CUDA_STANDARD 20)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-        # Sources genuinely require C++20 even for nvcc (Float8.h uses
+        # Sources genuinely require C++20 even for nvcc (the split float8
+        # headers use
         # requires-clauses).  cmake 3.25's NVIDIA module predates nvcc's
         # -std=c++20 and defines no CUDA20 options, so provide them here;
         # newer cmakes already do this natively and the guards below simply

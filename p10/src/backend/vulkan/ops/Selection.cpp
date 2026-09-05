@@ -4,6 +4,7 @@
 #include "Common.h"
 #include "Convert.h"
 #include "Factory.h"
+#include "Shape.h"
 #include "Utils.h"
 
 #include <algorithm>

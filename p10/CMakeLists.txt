@@ -79,7 +79,12 @@ set(P10_SOURCES
     src/backend/cpu/TopKKernels.cpp
     src/backend/cpu/TransformersKernels.cpp
     src/backend/cpu/IndexingKernels.cpp
-    src/backend/cpu/TierOpsKernels.cpp
+    src/backend/cpu/ReduceKernels.cpp
+    src/backend/cpu/ShapeOpsKernels.cpp
+    src/backend/cpu/TensorAdvancedIndexingKernels.cpp
+    src/backend/cpu/SortingKernels.cpp
+    src/backend/cpu/TensorCompareKernels.cpp
+    src/backend/cpu/OpsKernels.cpp
     src/backend/cpu/BitwiseKernels.cpp
     src/backend/cpu/Blas.cpp
     src/backend/cpu/BatchLinearAlgebra.cpp
@@ -216,9 +221,13 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/AttentionKernels.cu
         src/backend/cuda/IndexingKernels.cu
         src/backend/cuda/InteropAliasKernels.cu
-        src/backend/cuda/TierOpsKernels.cu
+        src/backend/cuda/ShapeOpsKernels.cu
+        src/backend/cuda/TensorAdvancedIndexingKernels.cu
+        src/backend/cuda/SortingKernels.cu
+        src/backend/cuda/TensorCompareKernels.cu
+        src/backend/cuda/OpsKernels.cu
         src/backend/cuda/BitwiseKernels.cu
-        src/backend/cuda/TierOpsReduceKernels.cu
+        src/backend/cuda/ReduceKernels.cu
         src/backend/cuda/RNNKernels.cu
         src/backend/cuda/Blas.cu
         src/backend/cuda/BatchLinearAlgebra.cu

@@ -738,12 +738,9 @@ Tensor empty_affine_quantized_kernel(const std::vector<int64_t>& size,
                  "_empty_affine_quantized(): dtype must be a quantized "
                  "dtype, got ", toString(dt));
     }
-    if (!(scale > 0.0)) {
-        TP_THROW(ValueError, "affine quantized empty tensor requires a positive scale, got ", scale);
-    }
     Tensor out = empty_raw(size, dt, device, pin_memory.value_or(false), memory_format);
     out.impl()->set_quantizer(
-        std::make_shared<PerTensorAffineQuantizer>(scale, zero_point));
+        make_per_tensor_affine_quantizer(scale, zero_point, dt));
     return out;
 }
 
@@ -770,15 +767,22 @@ Tensor empty_per_channel_affine_quantized_kernel(
     if (scales.numel() != zero_points.numel()) {
         TP_THROW(ValueError, "scales and zero_points must have the same number of elements");
     }
-    if (static_cast<int64_t>(size.size()) > 0 &&
-        (axis < 0 || axis >= static_cast<int64_t>(size.size()))) {
+    if (axis < 0) axis += static_cast<int64_t>(size.size());
+    if (axis < 0 || axis >= static_cast<int64_t>(size.size())) {
         TP_THROW(ValueError, "axis must be between 0 and number of dimensions, got ", axis);
+    }
+    if (scales.size(0) != size[static_cast<size_t>(axis)]) {
+        TP_THROW(ValueError,
+                 "per-channel quantized empty tensor requires one qparam per channel");
+    }
+    const Device target = device.value_or(Device(DeviceType::CPU));
+    if (scales.device() != target || zero_points.device() != target) {
+        TP_THROW(RuntimeError,
+                 "per-channel quantization parameters must be on the output device");
     }
     Tensor out = empty_raw(size, dt, device, pin_memory.value_or(false), memory_format);
     out.impl()->set_quantizer(
-        std::make_shared<PerChannelAffineQuantizer>(
-            scales.to(DType::Float64).contiguous(),
-            zero_points.to(DType::Int64).contiguous(), axis));
+        make_per_channel_affine_quantizer(scales, zero_points, axis, dt));
     return out;
 }
 
@@ -789,12 +793,33 @@ Tensor empty_quantized_kernel(const std::vector<int64_t>& size, const Tensor& qt
                               std::optional<bool> pin_memory,
                               std::optional<int64_t> memory_format) {
     require_strided_layout("empty_quantized", layout);
+    quantized::require_quantized(qtensor, "empty_quantized");
     const DType dt = resolve_dtype_or_default(dtype, qtensor.dtype());
+    if (dt != qtensor.dtype()) {
+        TP_THROW(RuntimeError,
+                 "empty_quantized(): dtype must match the source quantized tensor");
+    }
     Tensor out = empty_raw(size, dt, device, pin_memory.value_or(false), memory_format);
-    // Inherit the quantizer so the result stays usable in quantized ops
-    // with the source tensor's affine parameters.
-    if (qtensor.impl() && qtensor.impl()->has_quantizer()) {
-        out.impl()->set_quantizer(qtensor.impl()->quantizer());
+    const QuantizerPtr source_quantizer = quantized::quantizer_of(qtensor);
+    switch (source_quantizer->qscheme()) {
+        case kPerTensorAffine:
+            out.impl()->set_quantizer(make_per_tensor_affine_quantizer(
+                source_quantizer->scale(), source_quantizer->zero_point(), dt));
+            break;
+        case kPerChannelAffine:
+        case kPerChannelAffineFloatQParams: {
+            const Device target = device.value_or(qtensor.device());
+            Tensor scales = source_quantizer->scales();
+            Tensor zero_points = source_quantizer->zero_points();
+            if (scales.device() != target) scales = scales.to(target);
+            if (zero_points.device() != target) zero_points = zero_points.to(target);
+            out.impl()->set_quantizer(make_per_channel_affine_quantizer(
+                scales, zero_points, source_quantizer->axis(), dt));
+            break;
+        }
+        default:
+            TP_THROW(ValueError,
+                     "empty_quantized(): unsupported quantization scheme");
     }
     return out;
 }

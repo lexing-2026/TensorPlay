@@ -1,0 +1,110 @@
+name: operator_benchmark
+
+on:
+  push:
+    tags:
+      - "ciflow/op-benchmark/*"
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: CPU operator benchmark suite size
+        required: false
+        type: choice
+        options:
+          - short
+          - long
+          - all
+        default: short
+  schedule:
+    - cron: "0 7 * * 0"
+  pull_request:
+    paths:
+      - "benchmark/**"
+      - ".github/workflows/operator_benchmark.yml"
+permissions: read-all
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-operator-benchmark:
+    name: cpu-operator-benchmark
+    # This dedicated workflow mirrors PyTorch's operator benchmark trigger.
+    # pull.yml still runs the same gate for source changes, because a
+    # protected required check cannot be path-filtered safely.
+    permissions:
+      contents: write
+    uses: ./.github/workflows/_binary-build-test.yml
+    with:
+      build_name: tensorplay-cpu-operator
+      build_environment: cpu-operator-benchmark
+      runs_on: ubuntu-22.04
+      python_version: "3.12"
+      run_cpu_benchmarks: true
+      cpu_benchmark_suite: ${{ inputs.test_mode || 'short' }}
+      upload_release: false
+
+  publish-bench-data:
+    name: publish-bench-data
+    # Publishes the merged benchmark snapshot to the bench-data branch so the
+    # website benchmark page can fetch it directly. Scheduled, tagged, and
+    # manually dispatched runs publish; pull requests never do.
+    needs: cpu-operator-benchmark
+    if: ${{ github.event_name != 'pull_request' && always() && needs.cpu-operator-benchmark.result == 'success' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Download benchmark artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tensorplay-cpu-operator-performance
+          path: benchmark-results
+
+      - name: Merge benchmark snapshot
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          TP_BENCH_ARCH: cpu
+        run: |
+          set -euo pipefail
+          # Clone the existing branch snapshot so arches published by other
+          # runs (cuda / hip / vk) survive this update.
+          git clone --depth 1 --branch bench-data \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            bench-data-clone || true
+          previous=""
+          if [[ -f bench-data-clone/latest.json ]]; then
+            previous="bench-data-clone/latest.json"
+          fi
+          python3 tools/publish_bench_data.py benchmark-results latest.json \
+            --arch "$TP_BENCH_ARCH" --merge "$previous" \
+            --baselines-dir benchmark/baselines \
+            --host-probe benchmark-results/host-probe.json
+
+      - name: Push to bench-data branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # Keep exactly one orphan commit on the branch so history never grows.
+          git init -q bench-data-worktree
+          cd bench-data-worktree
+          git config user.name "TensorPlay CI"
+          git config user.email "actions@users.noreply.github.com"
+          git checkout --orphan bench-data
+          cp ../latest.json .
+          git add latest.json
+          git commit -m "bench data snapshot ${GITHUB_SHA::7} (${GITHUB_EVENT_NAME})"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin bench-data

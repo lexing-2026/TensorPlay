@@ -12,24 +12,24 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay.fft.fft
-    tensorplay.fft.ifft
-    tensorplay.fft.fft2
-    tensorplay.fft.ifft2
-    tensorplay.fft.fftn
-    tensorplay.fft.ifftn
-    tensorplay.fft.rfft
-    tensorplay.fft.irfft
-    tensorplay.fft.rfft2
-    tensorplay.fft.irfft2
-    tensorplay.fft.rfftn
-    tensorplay.fft.irfftn
-    tensorplay.fft.hfft
-    tensorplay.fft.ihfft
-    tensorplay.fft.hfft2
-    tensorplay.fft.ihfft2
-    tensorplay.fft.hfftn
-    tensorplay.fft.ihfftn
+    tensorplay.fft._transforms.fft
+    tensorplay.fft._transforms.ifft
+    tensorplay.fft._transforms.fft2
+    tensorplay.fft._transforms.ifft2
+    tensorplay.fft._transforms.fftn
+    tensorplay.fft._transforms.ifftn
+    tensorplay.fft._transforms.rfft
+    tensorplay.fft._transforms.irfft
+    tensorplay.fft._transforms.rfft2
+    tensorplay.fft._transforms.irfft2
+    tensorplay.fft._transforms.rfftn
+    tensorplay.fft._transforms.irfftn
+    tensorplay.fft._transforms.hfft
+    tensorplay.fft._transforms.ihfft
+    tensorplay.fft._transforms.hfft2
+    tensorplay.fft._transforms.ihfft2
+    tensorplay.fft._transforms.hfftn
+    tensorplay.fft._transforms.ihfftn
 ```
 
 ## Helper Functions
@@ -39,9 +39,9 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay.fft.fftfreq
-    tensorplay.fft.rfftfreq
-    tensorplay.fft.fftshift
-    tensorplay.fft.ifftshift
+    tensorplay.fft._frequency.fftfreq
+    tensorplay.fft._frequency.rfftfreq
+    tensorplay.fft._frequency.fftshift
+    tensorplay.fft._frequency.ifftshift
 ```
 

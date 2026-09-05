@@ -9,7 +9,7 @@ from tensorplay._C import (
 )
 
 from ._common import LstsqResult, SlogdetResult, check_floating, eps_of
-from ._decompositions import svd
+from ._decompositions import eigh, svd
 
 __all__ = [
     "det",
@@ -72,14 +72,35 @@ def pinv(A, *, atol=None, rtol=None, hermitian=False):
     or below ``atol + rtol * sigma_max`` treated as zero.
     """
     check_floating(A, "pinv")
-    U, S, Vh = svd(A, full_matrices=False)
+    if A.dim() < 2:
+        raise ValueError("linalg.pinv: input must contain matrices")
+    if hermitian and A.shape[-1] != A.shape[-2]:
+        raise ValueError("linalg.pinv: hermitian input must be square")
     eps = eps_of(A.dtype)
     max_mn = max(A.shape[-2], A.shape[-1])
     atol_val = 0.0 if atol is None else float(atol)
     rtol_val = (eps * max_mn) if rtol is None else float(rtol)
+    if hermitian:
+        eig = eigh(A)
+        values = eig.eigenvalues
+        vectors = eig.eigenvectors
+        magnitude = values.abs()
+        cutoff = atol_val + rtol_val * magnitude.max(dim=-1, keepdim=True).values
+        keep = magnitude > cutoff
+        safe_values = tensorplay.where(
+            keep, values, tensorplay.ones_like(values)
+        )
+        inverse_values = tensorplay.where(
+            keep, 1.0 / safe_values, tensorplay.zeros_like(values)
+        )
+        vectors_h = _C.conj_physical(vectors).transpose(-2, -1)
+        return (vectors * inverse_values.unsqueeze(-2)) @ vectors_h
+    U, S, Vh = svd(A, full_matrices=False)
     cutoff = atol_val + rtol_val * S.max(dim=-1, keepdim=True).values
     S_inv = tensorplay.where(S > cutoff, 1.0 / S.clamp_min(1e-300), 0.0)
-    return Vh.transpose(-2, -1) @ (S_inv.unsqueeze(-1) * U.transpose(-2, -1))
+    V = _C.conj_physical(Vh).transpose(-2, -1)
+    Uh = _C.conj_physical(U).transpose(-2, -1)
+    return V @ (S_inv.unsqueeze(-1) * Uh)
 
 
 def tensorinv(A, ind=2):
@@ -108,24 +129,42 @@ def tensorinv(A, ind=2):
 def tensorsolve(A, B, dims=None):
     """tensorsolve(A, B, dims=None) -> Tensor
 
-    Solves A X = B where A and B are (tuples of) matrices interpreted as a
-    single square system over the trailing dimensions.
+    Solves the tensor equation ``A X = B`` after flattening the contracted
+    dimensions into a square matrix.  ``dims`` identifies dimensions of ``A``
+    that should be moved to the trailing side before the flattening step.
     """
     if dims is not None:
-        raise NotImplementedError(
-            "linalg.tensorsolve: the dims argument is not implemented yet")
-    shape_x = list(A.shape)
-    front = shape_x[-1]
-    tail = 1
-    for d in shape_x[:-1]:
-        tail *= d
-    prod_b = 1
-    for d in B.shape:
-        prod_b *= d
-    if front * front != tail or prod_b != tail:
+        moved_dims = [int(dims)] if isinstance(dims, int) else [int(d) for d in dims]
+        ndim = A.dim()
+        normalized = []
+        for d in moved_dims:
+            d = d + ndim if d < 0 else d
+            if d < 0 or d >= ndim:
+                raise IndexError(
+                    f"linalg.tensorsolve: dimension {d} out of range for "
+                    f"a {ndim}-D tensor")
+            if d in normalized:
+                raise ValueError(
+                    "linalg.tensorsolve: dims must not contain duplicates")
+            normalized.append(d)
+        order = [d for d in range(ndim) if d not in normalized]
+        A = A.permute(order + normalized)
+
+    rank_b = B.dim()
+    if rank_b > A.dim():
         raise RuntimeError(
-            f"linalg.tensorsolve: input tensor A of shape {tuple(shape_x)} cannot "
-            f"be reshaped into a ({tail}, {tail}) square system matching B of "
-            f"shape {tuple(B.shape)}")
-    sol = solve(A.reshape(tail, front), B.reshape(prod_b).unsqueeze(-1))
-    return sol.squeeze(-1).reshape(shape_x[:-1])
+            f"linalg.tensorsolve: B with shape {tuple(B.shape)} has more "
+            f"dimensions than A with shape {tuple(A.shape)}")
+
+    q_shape = list(A.shape[rank_b:])
+    q_size = 1
+    for size in q_shape:
+        q_size *= size
+    if q_size <= 0 or A.numel() != q_size * q_size or B.numel() != q_size:
+        raise RuntimeError(
+            f"linalg.tensorsolve: A with shape {tuple(A.shape)} and B with "
+            f"shape {tuple(B.shape)} do not form a square tensor equation")
+
+    matrix = A.reshape(q_size, q_size)
+    rhs = B.reshape(q_size)
+    return solve(matrix, rhs).reshape(q_shape)

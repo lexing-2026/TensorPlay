@@ -1,6 +1,6 @@
 //
-// (2.15.0a0) via p10/include/SpecialMath.h; the wrappers follow the house
-// float_math_kernel / binary_float_kernel pattern from TierOpsKernels.cpp.
+// (2.15.0a0) via p10/include/SpecialMath.h; the wrappers use the common
+// float_math_kernel / binary_float_kernel helper pattern.
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Scalar.h"

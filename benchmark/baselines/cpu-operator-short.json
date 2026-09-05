@@ -1,0 +1,1978 @@
+{
+  "schema_version": 1,
+  "benchmark": "cpu-operator",
+  "suite": "short",
+  "dtype": "f32",
+  "threads": 2,
+  "measurements": [
+    {
+      "name": "add[8x16x32]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 1.9430008251219988e-06
+    },
+    {
+      "name": "sub[8x16x32]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 2.635002601891756e-06
+    },
+    {
+      "name": "mul[8x16x32]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 1.6429985407739878e-06
+    },
+    {
+      "name": "div[8x16x32]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 4.699002602137625e-06
+    },
+    {
+      "name": "maximum[8x16x32]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 5.770998541265726e-06
+    },
+    {
+      "name": "minimum[8x16x32]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 3.106004442088306e-06
+    },
+    {
+      "name": "add-scalar[8x16x32]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 3.8769940147176385e-06
+    },
+    {
+      "name": "mul-scalar[8x16x32]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 5.289999535307288e-06
+    },
+    {
+      "name": "add-broadcast[32x1x64+1x16x64]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          32,
+          1,
+          64
+        ],
+        [
+          1,
+          16,
+          64
+        ]
+      ],
+      "seconds": 9.868002962321043e-06
+    },
+    {
+      "name": "mul-broadcast[32x1x64*1x16x64]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          32,
+          1,
+          64
+        ],
+        [
+          1,
+          16,
+          64
+        ]
+      ],
+      "seconds": 1.15020084194839e-05
+    },
+    {
+      "name": "addcmul-broadcast[32x1x64]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          32,
+          1,
+          64
+        ],
+        [
+          1,
+          16,
+          64
+        ],
+        [
+          32,
+          16,
+          64
+        ]
+      ],
+      "seconds": 2.8313006623648107e-05
+    },
+    {
+      "name": "addcdiv-broadcast[32x1x64]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          32,
+          1,
+          64
+        ],
+        [
+          1,
+          16,
+          64
+        ],
+        [
+          32,
+          16,
+          64
+        ]
+      ],
+      "seconds": 1.7772996216081083e-05
+    },
+    {
+      "name": "eq[8x16x32]",
+      "category": "comparison",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 2.4439941626042128e-06
+    },
+    {
+      "name": "ne[8x16x32]",
+      "category": "comparison",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 2.644999767653644e-06
+    },
+    {
+      "name": "lt[8x16x32]",
+      "category": "comparison",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 2.625005436129868e-06
+    },
+    {
+      "name": "le[8x16x32]",
+      "category": "comparison",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 3.3859978429973125e-06
+    },
+    {
+      "name": "gt[8x16x32]",
+      "category": "comparison",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 3.918001311831176e-06
+    },
+    {
+      "name": "ge[8x16x32]",
+      "category": "comparison",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 3.7569989217445254e-06
+    },
+    {
+      "name": "logical-and[8x16x32]",
+      "category": "comparison",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 1.8940045265480876e-06
+    },
+    {
+      "name": "logical-or[8x16x32]",
+      "category": "comparison",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 3.1059898901730776e-06
+    },
+    {
+      "name": "logical-xor[8x16x32]",
+      "category": "comparison",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 1.7029960872605443e-06
+    },
+    {
+      "name": "fmod[256k]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          262144
+        ],
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0008610380027676001
+    },
+    {
+      "name": "remainder[256k]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          262144
+        ],
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.000913997006136924
+    },
+    {
+      "name": "abs[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 1.5209006960503757e-05
+    },
+    {
+      "name": "acos[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00011801200162153691
+    },
+    {
+      "name": "acosh[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00023620401043444872
+    },
+    {
+      "name": "asin[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00011910399189218879
+    },
+    {
+      "name": "asinh[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00029584599542431533
+    },
+    {
+      "name": "atan[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00022571400040760636
+    },
+    {
+      "name": "atanh[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00017969799228012562
+    },
+    {
+      "name": "ceil[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 2.187099016737193e-05
+    },
+    {
+      "name": "cos[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 4.5235006837174296e-05
+    },
+    {
+      "name": "cosh[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00018126099894288927
+    },
+    {
+      "name": "erf[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00016967899864539504
+    },
+    {
+      "name": "erfc[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00039288900734391063
+    },
+    {
+      "name": "exp[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 5.989198689348996e-05
+    },
+    {
+      "name": "expm1[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0001396120060235262
+    },
+    {
+      "name": "floor[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 2.2783002350479364e-05
+    },
+    {
+      "name": "frac[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 2.8704002033919096e-05
+    },
+    {
+      "name": "log[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 7.776600250508636e-05
+    },
+    {
+      "name": "log10[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 8.045099093578756e-05
+    },
+    {
+      "name": "log1p[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00012549500388558954
+    },
+    {
+      "name": "log2[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 8.207399514503777e-05
+    },
+    {
+      "name": "neg[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 1.5129000530578196e-05
+    },
+    {
+      "name": "reciprocal[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 2.5628003641031682e-05
+    },
+    {
+      "name": "round[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 1.6560996300540864e-05
+    },
+    {
+      "name": "rsqrt[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 4.016500315628946e-05
+    },
+    {
+      "name": "sign[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 6.673501047771424e-05
+    },
+    {
+      "name": "sin[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 5.347000842448324e-05
+    },
+    {
+      "name": "sinh[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.000227797994739376
+    },
+    {
+      "name": "sqrt[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 2.3755012080073357e-05
+    },
+    {
+      "name": "square[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 1.679199340287596e-05
+    },
+    {
+      "name": "tan[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00012284099648240954
+    },
+    {
+      "name": "tanh[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0001944149989867583
+    },
+    {
+      "name": "trunc[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 2.0629013306461275e-05
+    },
+    {
+      "name": "sum[1M]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1048576
+        ]
+      ],
+      "seconds": 3.2149997423402965e-05
+    },
+    {
+      "name": "mean[1M]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1048576
+        ]
+      ],
+      "seconds": 4.179800453130156e-05
+    },
+    {
+      "name": "max[1M]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1048576
+        ]
+      ],
+      "seconds": 2.366400440223515e-05
+    },
+    {
+      "name": "min[1M]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1048576
+        ]
+      ],
+      "seconds": 5.2197996410541236e-05
+    },
+    {
+      "name": "prod[1M]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1048576
+        ]
+      ],
+      "seconds": 3.131899575237185e-05
+    },
+    {
+      "name": "norm[1M]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1048576
+        ]
+      ],
+      "seconds": 3.806099994108081e-05
+    },
+    {
+      "name": "median[1M]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1048576
+        ]
+      ],
+      "seconds": 0.00922957899456378
+    },
+    {
+      "name": "sum-dim0[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 9.179199696518481e-05
+    },
+    {
+      "name": "sum-dim1[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 2.9235001420602202e-05
+    },
+    {
+      "name": "mean-dim0[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.00010024799848906696
+    },
+    {
+      "name": "mean-dim1[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 3.6829005694016814e-05
+    },
+    {
+      "name": "max-dim1[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 8.127299952320755e-05
+    },
+    {
+      "name": "min-dim1[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 8.728400280233473e-05
+    },
+    {
+      "name": "norm-dim1[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.000886344991158694
+    },
+    {
+      "name": "argmax-dim1[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.00039983099850360304
+    },
+    {
+      "name": "argmin-dim1[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.0003668389981612563
+    },
+    {
+      "name": "cumsum-dim1[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.00044642800639849156
+    },
+    {
+      "name": "all[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 2.925997250713408e-06
+    },
+    {
+      "name": "any[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 2.7550122467800975e-06
+    },
+    {
+      "name": "all-dim1[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 9.458002750761807e-06
+    },
+    {
+      "name": "any-dim1[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 9.847994078882039e-06
+    },
+    {
+      "name": "mm[128x256x128]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          128,
+          256
+        ],
+        [
+          256,
+          128
+        ]
+      ],
+      "seconds": 4.222900315653533e-05
+    },
+    {
+      "name": "matmul[128x256x128]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          128,
+          256
+        ],
+        [
+          256,
+          128
+        ]
+      ],
+      "seconds": 5.3481009672395885e-05
+    },
+    {
+      "name": "mm[256x256x256]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          256,
+          256
+        ],
+        [
+          256,
+          256
+        ]
+      ],
+      "seconds": 0.00014960099360905588
+    },
+    {
+      "name": "matmul[256x256x256]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          256,
+          256
+        ],
+        [
+          256,
+          256
+        ]
+      ],
+      "seconds": 0.0001380100002279505
+    },
+    {
+      "name": "mv[1024x1024]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ],
+        [
+          1024
+        ]
+      ],
+      "seconds": 5.520299600902945e-05
+    },
+    {
+      "name": "dot[1M]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          1048576
+        ],
+        [
+          1048576
+        ]
+      ],
+      "seconds": 0.0003901029995176941
+    },
+    {
+      "name": "inner[4096x128]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          4096,
+          128
+        ],
+        [
+          4096,
+          128
+        ]
+      ],
+      "seconds": 0.020758869999554008
+    },
+    {
+      "name": "outer[4096]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          4096
+        ],
+        [
+          4096
+        ]
+      ],
+      "seconds": 0.004814615997020155
+    },
+    {
+      "name": "addmm[256]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          256,
+          256
+        ],
+        [
+          256,
+          256
+        ],
+        [
+          256,
+          256
+        ]
+      ],
+      "seconds": 0.00017666100757196546
+    },
+    {
+      "name": "bmm[16x64x64]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          16,
+          64,
+          64
+        ],
+        [
+          16,
+          64,
+          64
+        ]
+      ],
+      "seconds": 8.946799789555371e-05
+    },
+    {
+      "name": "baddbmm[16x64x64]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          16,
+          64,
+          64
+        ],
+        [
+          16,
+          64,
+          64
+        ],
+        [
+          16,
+          64,
+          64
+        ]
+      ],
+      "seconds": 4.848100070375949e-05
+    },
+    {
+      "name": "addbmm[16x64x64]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          64,
+          64
+        ],
+        [
+          16,
+          64,
+          64
+        ],
+        [
+          16,
+          64,
+          64
+        ]
+      ],
+      "seconds": 7.653399370610714e-05
+    },
+    {
+      "name": "linear[64x256x512]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          64,
+          256
+        ],
+        [
+          512,
+          256
+        ],
+        [
+          512
+        ]
+      ],
+      "seconds": 0.00010397599544376135
+    },
+    {
+      "name": "einsum-bmm[16x64x64]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          16,
+          64,
+          64
+        ],
+        [
+          16,
+          64,
+          64
+        ]
+      ],
+      "seconds": 9.057999704964459e-05
+    },
+    {
+      "name": "relu[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 2.1410000044852495e-05
+    },
+    {
+      "name": "relu6[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 2.1489991922862828e-05
+    },
+    {
+      "name": "gelu[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 3.144900256302208e-05
+    },
+    {
+      "name": "gelu-tanh[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00025553000159561634
+    },
+    {
+      "name": "silu[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 5.433199112303555e-05
+    },
+    {
+      "name": "hardswish[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 1.5989993698894978e-05
+    },
+    {
+      "name": "hardsigmoid[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 2.7862988645210862e-05
+    },
+    {
+      "name": "leaky-relu[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 2.7542002499103546e-05
+    },
+    {
+      "name": "elu[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00026038898795377463
+    },
+    {
+      "name": "celu[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0009933260007528588
+    },
+    {
+      "name": "selu[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.001006410995614715
+    },
+    {
+      "name": "mish[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0005270300025586039
+    },
+    {
+      "name": "softplus[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0002907559974119067
+    },
+    {
+      "name": "softsign[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 4.513500607572496e-05
+    },
+    {
+      "name": "tanhshrink[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00024587199732195586
+    },
+    {
+      "name": "hardtanh[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 3.5846998798660934e-05
+    },
+    {
+      "name": "softmax[1024x1024]",
+      "category": "normalization",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.00046981300693005323
+    },
+    {
+      "name": "log-softmax[1024x1024]",
+      "category": "normalization",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.000322425999911502
+    },
+    {
+      "name": "softmax[256x256x256]",
+      "category": "normalization",
+      "input_shapes": [
+        [
+          256,
+          256,
+          256
+        ]
+      ],
+      "seconds": 0.005842997008585371
+    },
+    {
+      "name": "layer-norm[1024x1024]",
+      "category": "normalization",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ],
+        [
+          1024
+        ],
+        [
+          1024
+        ]
+      ],
+      "seconds": 0.00011400399671401829
+    },
+    {
+      "name": "group-norm[8x64x28x28]",
+      "category": "normalization",
+      "input_shapes": [
+        [
+          8,
+          64,
+          28,
+          28
+        ],
+        [
+          64
+        ],
+        [
+          64
+        ]
+      ],
+      "seconds": 6.623500667046756e-05
+    },
+    {
+      "name": "batch-norm[8x64x28x28]",
+      "category": "normalization",
+      "input_shapes": [
+        [
+          8,
+          64,
+          28,
+          28
+        ],
+        [
+          64
+        ],
+        [
+          64
+        ],
+        [
+          64
+        ],
+        [
+          64
+        ]
+      ],
+      "seconds": 3.9103004382923245e-05
+    },
+    {
+      "name": "instance-norm[8x64x28x28]",
+      "category": "normalization",
+      "input_shapes": [
+        [
+          8,
+          64,
+          28,
+          28
+        ],
+        [
+          64
+        ],
+        [
+          64
+        ]
+      ],
+      "seconds": 8.588100899942219e-05
+    },
+    {
+      "name": "normalize[1024x1024]",
+      "category": "normalization",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.0011167079937877133
+    },
+    {
+      "name": "conv1d-3[8x16x128]",
+      "category": "convolution",
+      "input_shapes": [
+        [
+          8,
+          16,
+          128
+        ],
+        [
+          32,
+          16,
+          3
+        ]
+      ],
+      "seconds": 5.016400245949626e-05
+    },
+    {
+      "name": "conv2d-3x3[8x64x56x56]",
+      "category": "convolution",
+      "input_shapes": [
+        [
+          8,
+          64,
+          56,
+          56
+        ],
+        [
+          128,
+          64,
+          3,
+          3
+        ]
+      ],
+      "seconds": 0.018088611992425285
+    },
+    {
+      "name": "conv2d-1x1[8x64x56x56]",
+      "category": "convolution",
+      "input_shapes": [
+        [
+          8,
+          64,
+          56,
+          56
+        ],
+        [
+          128,
+          64,
+          1,
+          1
+        ]
+      ],
+      "seconds": 0.004372804993181489
+    },
+    {
+      "name": "conv2d-7x7[2x3x224x224]",
+      "category": "convolution",
+      "input_shapes": [
+        [
+          2,
+          3,
+          224,
+          224
+        ],
+        [
+          64,
+          3,
+          7,
+          7
+        ]
+      ],
+      "seconds": 0.0028980750066693872
+    },
+    {
+      "name": "conv2d-relu[8x64x56x56]",
+      "category": "convolution",
+      "input_shapes": [
+        [
+          8,
+          64,
+          56,
+          56
+        ],
+        [
+          128,
+          64,
+          3,
+          3
+        ]
+      ],
+      "seconds": 0.01896607999515254
+    },
+    {
+      "name": "avg-pool1d[8x16x128]",
+      "category": "pool",
+      "input_shapes": [
+        [
+          8,
+          16,
+          128
+        ]
+      ],
+      "seconds": 5.719700129702687e-05
+    },
+    {
+      "name": "max-pool1d[8x16x128]",
+      "category": "pool",
+      "input_shapes": [
+        [
+          8,
+          16,
+          128
+        ]
+      ],
+      "seconds": 9.747399599291384e-05
+    },
+    {
+      "name": "avg-pool2d[8x64x56x56]",
+      "category": "pool",
+      "input_shapes": [
+        [
+          8,
+          64,
+          56,
+          56
+        ]
+      ],
+      "seconds": 0.001313378001214005
+    },
+    {
+      "name": "max-pool2d[8x64x56x56]",
+      "category": "pool",
+      "input_shapes": [
+        [
+          8,
+          64,
+          56,
+          56
+        ]
+      ],
+      "seconds": 0.003896476002410054
+    },
+    {
+      "name": "adaptive-avg-pool2d[8x64x56x56]",
+      "category": "pool",
+      "input_shapes": [
+        [
+          8,
+          64,
+          56,
+          56
+        ]
+      ],
+      "seconds": 0.00034103098732884973
+    },
+    {
+      "name": "adaptive-max-pool2d[8x64x56x56]",
+      "category": "pool",
+      "input_shapes": [
+        [
+          8,
+          64,
+          56,
+          56
+        ]
+      ],
+      "seconds": 0.001364859999739565
+    },
+    {
+      "name": "interpolate-nearest[8x64x56x56]",
+      "category": "pool",
+      "input_shapes": [
+        [
+          8,
+          64,
+          56,
+          56
+        ]
+      ],
+      "seconds": 0.0005268999957479537
+    },
+    {
+      "name": "channel-shuffle[8x64x56x56]",
+      "category": "pool",
+      "input_shapes": [
+        [
+          8,
+          64,
+          56,
+          56
+        ]
+      ],
+      "seconds": 0.0003217939956812188
+    },
+    {
+      "name": "embedding[1024x4096x128]",
+      "category": "indexing",
+      "input_shapes": [
+        [
+          4096,
+          128
+        ],
+        [
+          1024
+        ]
+      ],
+      "seconds": 1.1550990166142583e-05
+    },
+    {
+      "name": "embedding-bag[32x8x128]",
+      "category": "indexing",
+      "input_shapes": [
+        [
+          4096,
+          128
+        ],
+        [
+          256
+        ],
+        [
+          32
+        ]
+      ],
+      "seconds": 1.0250005288980901e-05
+    },
+    {
+      "name": "index-select[1024x512]",
+      "category": "indexing",
+      "input_shapes": [
+        [
+          4096,
+          512
+        ],
+        [
+          1024
+        ]
+      ],
+      "seconds": 3.846301115117967e-05
+    },
+    {
+      "name": "gather-dim0[1024x512]",
+      "category": "indexing",
+      "input_shapes": [
+        [
+          4096,
+          512
+        ],
+        [
+          1024,
+          512
+        ]
+      ],
+      "seconds": 0.0022440360044129193
+    },
+    {
+      "name": "gather-dim1[4096x128]",
+      "category": "indexing",
+      "input_shapes": [
+        [
+          4096,
+          512
+        ],
+        [
+          4096,
+          128
+        ]
+      ],
+      "seconds": 0.0012019179994240403
+    },
+    {
+      "name": "cat-dim0[2x32x64x28x28]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          32,
+          64,
+          28,
+          28
+        ]
+      ],
+      "seconds": 0.001240661003976129
+    },
+    {
+      "name": "cat-dim1[32x128x28x28]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          32,
+          64,
+          28,
+          28
+        ]
+      ],
+      "seconds": 0.0005981739959679544
+    },
+    {
+      "name": "stack-dim0[2x32x64x28x28]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          32,
+          64,
+          28,
+          28
+        ]
+      ],
+      "seconds": 0.0013331939990166575
+    },
+    {
+      "name": "transpose-copy[1024x1024]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.0026799740007845685
+    },
+    {
+      "name": "permute-copy[32x28x28x64]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          32,
+          64,
+          28,
+          28
+        ]
+      ],
+      "seconds": 0.0010522469965508208
+    },
+    {
+      "name": "movedim-copy[32x28x28x64]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          32,
+          64,
+          28,
+          28
+        ]
+      ],
+      "seconds": 0.0011712999985320494
+    },
+    {
+      "name": "reshape[1024x1024]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 1.1520023690536618e-06
+    },
+    {
+      "name": "split[1024x1024]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 3.857989213429391e-06
+    },
+    {
+      "name": "chunk[1024x1024]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 4.689005436375737e-06
+    },
+    {
+      "name": "diagonal[1024x1024]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 1.5230034478008747e-06
+    },
+    {
+      "name": "diag[4096]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          4096
+        ]
+      ],
+      "seconds": 0.0013778689899481833
+    },
+    {
+      "name": "unbind[32x64x28x28]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          32,
+          64,
+          28,
+          28
+        ]
+      ],
+      "seconds": 1.812398841138929e-05
+    },
+    {
+      "name": "broadcast-to[64x1024]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          1,
+          1024
+        ]
+      ],
+      "seconds": 1.934007741510868e-06
+    },
+    {
+      "name": "repeat[64x1024]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          1,
+          1024
+        ]
+      ],
+      "seconds": 0.00022055399313103408
+    },
+    {
+      "name": "where[256k]",
+      "category": "misc",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00011029800225514919
+    },
+    {
+      "name": "masked-select[256k]",
+      "category": "misc",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.001000129006570205
+    },
+    {
+      "name": "clamp[256k]",
+      "category": "misc",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 1.3214987120591104e-05
+    },
+    {
+      "name": "pow2[256k]",
+      "category": "misc",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 1.3215001672506332e-05
+    },
+    {
+      "name": "dropout[256k]",
+      "category": "misc",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.001784082007361576
+    },
+    {
+      "name": "arange[1M]",
+      "category": "misc",
+      "input_shapes": [
+        [
+          1
+        ]
+      ],
+      "seconds": 0.0009175140003208071
+    },
+    {
+      "name": "topk8[1024x1024]",
+      "category": "sorting",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.0011353430018061772
+    },
+    {
+      "name": "sort[1024x1024]",
+      "category": "sorting",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.02628157500294037
+    },
+    {
+      "name": "argsort[1024x1024]",
+      "category": "sorting",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.026290239999070764
+    }
+  ]
+}

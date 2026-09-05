@@ -26,12 +26,24 @@ __all__ = [
 
 def norm_mode(norm):
     """Maps the optional ``norm`` argument onto the kernel-level tag."""
-    return "backward" if norm is None else norm
+    value = "backward" if norm is None else norm
+    if value not in ("backward", "forward", "ortho"):
+        raise ValueError(
+            "norm must be None, 'backward', 'forward', or 'ortho'"
+        )
+    return value
 
 
 def transform_size(n):
     """Maps an optional signal length onto the kernel sentinel for "unset"."""
-    return -1 if n is None else int(n)
+    if n is None:
+        return -1
+    value = int(n)
+    if value == -1:
+        return value
+    if value <= 0:
+        raise ValueError(f"transform size must be positive, got {value}")
+    return value
 
 
 def conj(input):
@@ -44,6 +56,8 @@ def conj(input):
 
 def normalize_dims(dim, ndim):
     """Resolves negative axes and rejects duplicates/out-of-range entries."""
+    if ndim <= 0:
+        raise ValueError(f"a transformed dimension requires a non-empty input, got {ndim}-D")
     if isinstance(dim, int):
         dims = [dim]
     else:
@@ -66,28 +80,49 @@ def normalize_dims(dim, ndim):
 def default_dims(input, s):
     """Trailing axes used when ``dim`` is omitted: as many as ``s`` requests."""
     ndim = input.dim()
-    k = len(s) if s is not None else ndim
+    if s is None:
+        k = ndim
+    elif isinstance(s, int):
+        k = 1
+    else:
+        k = len(s)
+    if k <= 0:
+        raise ValueError("at least one transformed dimension must be specified")
+    if k > ndim:
+        raise ValueError(
+            f"requested {k} transformed dimensions for a {ndim}-D input"
+        )
     return list(range(ndim - k, ndim))
 
 
 def transform_sizes(s, k):
     """Normalizes an optional sequence of transform sizes to a per-dim list."""
+    if k <= 0:
+        raise ValueError("at least one transformed dimension must be specified")
     if s is None:
         return [None] * k
     if isinstance(s, int):
-        return [int(s)] + [None] * (k - 1)
-    sizes = [int(v) for v in s]
+        if k != 1:
+            raise ValueError(
+                f"a scalar transform size requires exactly one dimension, got {k}"
+            )
+        sizes = [int(s)]
+    else:
+        sizes = [int(v) for v in s]
     if len(sizes) != k:
         raise ValueError(
             f"s ({list(sizes)}) must have the same length as dim ({k})"
         )
+    for size in sizes:
+        if size != -1 and size <= 0:
+            raise ValueError(f"transform size must be positive, got {size}")
     return sizes
 
 
 def split_last_dim(input, s, dim):
     """Splits ``(dim, s)`` into the leading complex-to-complex axes plus the
     single axis that carries the one-sided (half-spectrum) transform."""
-    dims = normalize_dims(list(dim), input.dim())
+    dims = normalize_dims(dim, input.dim())
     sizes = transform_sizes(s, len(dims))
     return dims[:-1], dims[-1], sizes[:-1], sizes[-1]
 

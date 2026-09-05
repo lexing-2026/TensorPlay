@@ -7,8 +7,6 @@ so autograd flows through composition wherever the underlying ops are
 ``test/test_composite_funcs.py``.
 
 Deliberate narrows (documented per function):
-- ``matrix_power`` negative exponents raise (needs inverse wiring);
-- ``unique_consecutive`` supports the flattened form only (dim=None);
 - conjugation-bit queries report physical layout (tp has no conj bit);
 - ``cartesian_prod`` accepts 1-D inputs.
 """
@@ -196,9 +194,11 @@ def arctan2(input, other):
 
 
 def concat(tensors, dim=0, *, out=None):
+    result = tensorplay.cat(tensors=list(tensors), dim=dim)
     if out is not None:
-        raise NotImplementedError("concat(out=) is not supported")
-    return tensorplay.cat(tensors=list(tensors), dim=dim)
+        out.copy_(result)
+        return out
+    return result
 
 
 def concatenate(tensors, dim=0, *, out=None):
@@ -249,18 +249,14 @@ def chain_matmul(*matrices):
 
 def matrix_power(input, n):
     n = int(n)
-    if n < 0:
-        raise NotImplementedError(
-            "matrix_power(): negative exponents require inverse kernel wiring"
-        )
     if input.dim() != 2:
         raise RuntimeError("matrix_power(): expected a 2-D square matrix")
     if input.size(0) != input.size(1):
         raise RuntimeError("matrix_power(): expected a square matrix")
     result = tensorplay.eye(input.size(0), dtype=input.dtype,
                             device=input.device)
-    base = input
-    e = n
+    base = tensorplay.linalg.inv(input) if n < 0 else input
+    e = -n if n < 0 else n
     while e > 0:
         if e & 1:
             result = result.mm(base)
@@ -526,9 +522,52 @@ def isin(elements, test_elements, *, assume_unique=False, invert=False):
 def unique_consecutive(input, return_inverse=False, return_counts=False,
                        dim=None):
     if dim is not None:
-        raise NotImplementedError(
-            "unique_consecutive(): only dim=None is supported"
-        )
+        dim = _norm_dim(dim, input.dim())
+        moved = tensorplay.movedim(input, dim, 0)
+        n = moved.size(0)
+        if n == 0:
+            output = tensorplay.empty(
+                list(input.shape()), dtype=input.dtype, device=input.device)
+            empty_index = tensorplay.empty(
+                [0], dtype=DType.int64, device=input.device)
+            if return_inverse and return_counts:
+                return output, empty_index, empty_index
+            if return_inverse:
+                return output, empty_index
+            if return_counts:
+                return output, empty_index
+            return output
+
+        flat = moved.reshape([n, -1])
+        if n == 1:
+            change = tensorplay.ones(
+                [1], dtype=DType.bool, device=input.device)
+        else:
+            adjacent = flat.narrow(0, 1, n - 1).ne(
+                flat.narrow(0, 0, n - 1))
+            change = tensorplay.cat(
+                [tensorplay.ones([1], dtype=DType.bool, device=input.device),
+                 tensorplay.any(adjacent, dim=1)],
+                dim=0,
+            )
+        kept = tensorplay.nonzero(change).reshape([-1])
+        num_runs = kept.numel()
+        output = flat.index_select(0, kept).reshape(
+            [num_runs] + list(moved.shape[1:]))
+        output = tensorplay.movedim(output, 0, dim)
+        inverse = change.to(DType.int64).cumsum(0).sub(1)
+        counts = tensorplay.zeros(
+            [num_runs], dtype=DType.int64, device=input.device)
+        counts = counts.scatter_add(
+            0, inverse,
+            tensorplay.ones([n], dtype=DType.int64, device=input.device))
+        if return_inverse and return_counts:
+            return output, inverse, counts
+        if return_inverse:
+            return output, inverse
+        if return_counts:
+            return output, counts
+        return output
     v = input.reshape([-1])
     n = v.numel()
     if n == 0:

@@ -89,7 +89,11 @@ def qr(A, mode="reduced"):
     """qr(A, mode='reduced') -> QRResult(Q, R)"""
     Q, R = _C.linalg_qr(A, mode)
     if mode in ("r", "R"):
-        empty = tensorplay.empty(list(A.shape[:-2]) + [A.shape[-2], 0], dtype=A.dtype)
+        empty = tensorplay.empty(
+            list(A.shape[:-2]) + [A.shape[-2], 0],
+            dtype=A.dtype,
+            device=A.device,
+        )
         return QRResult(empty, R)
     return QRResult(Q, R)
 
@@ -98,5 +102,6 @@ def polar(A):
     """polar(A) -> (Tensor Q, Tensor R) with A = Q R"""
     U, S, Vh = svd(A, full_matrices=False)
     Q = U @ Vh
-    R = Vh.transpose(-2, -1) @ (S.unsqueeze(-1) * Vh)
+    V = _C.conj_physical(Vh).transpose(-2, -1)
+    R = V @ (S.unsqueeze(-1) * Vh)
     return Q, R

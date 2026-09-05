@@ -304,14 +304,25 @@ Tensor interop_repeat_interleave_Tensor_cuda(
 }
 
 // ---------------------------------------------------------------------------
-// embedding_renorm_: renormalize rows whose L2 norm exceeds max_norm.
+// Renormalize referenced rows whose selected norm exceeds max_norm.
 // ---------------------------------------------------------------------------
 
 Tensor& interop_embedding_renorm__cuda(Tensor& weight, const Tensor& indices,
                                        double max_norm, double norm_type) {
-    const int64_t d = weight.dim() - 1;
+    TP_CHECK(weight.dim() == 2,
+             "embedding_renorm_: weight must be 2-D");
+    TP_CHECK(indices.dtype() == DType::Int64 || indices.dtype() == DType::Int32,
+             "embedding_renorm_: indices must be Int64 or Int32");
+    TP_CHECK(weight.device() == indices.device(),
+             "embedding_renorm_: weight and indices must be on the same device");
+    TP_CHECK(max_norm > 0.0,
+             "embedding_renorm_: max_norm must be positive");
+    TP_CHECK(norm_type > 0.0,
+             "embedding_renorm_: norm_type must be positive");
+
+    const int64_t d = 1;
     Tensor norms = ops::norm(weight, {d}, norm_type, true);
-    Tensor idx_flat = indices.reshape({-1});
+    Tensor idx_flat = indices.reshape({-1}).to(DType::Int64);
     Tensor row_norms = ops::index_select(norms, 0, idx_flat);
     Tensor scale = ops::reciprocal(ops::add(row_norms, Scalar(1e-7)))
                       .mul(Scalar(max_norm))

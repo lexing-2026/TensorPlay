@@ -43,6 +43,7 @@
     tensorplay.nn.functional.lp_pool3d
     tensorplay.nn.functional.adaptive_max_pool1d
     tensorplay.nn.functional.adaptive_max_pool2d
+    tensorplay.nn.functional.adaptive_max_pool3d
     tensorplay.nn.functional.adaptive_avg_pool1d
     tensorplay.nn.functional.adaptive_avg_pool2d
     tensorplay.nn.functional.adaptive_avg_pool3d
@@ -68,16 +69,22 @@
     :nosignatures:
 
     tensorplay.nn.functional.threshold
+    tensorplay.threshold_
     tensorplay.nn.functional.relu
+    tensorplay.relu_
     tensorplay.nn.functional.hardtanh
+    tensorplay.hardtanh_
     tensorplay.nn.functional.hardswish
     tensorplay.nn.functional.relu6
     tensorplay.nn.functional.elu
+    tensorplay.elu_
     tensorplay.nn.functional.selu
     tensorplay.nn.functional.celu
     tensorplay.nn.functional.leaky_relu
+    tensorplay.leaky_relu_
     tensorplay.nn.functional.prelu
     tensorplay.nn.functional.rrelu
+    tensorplay.nn.functional.rrelu_
     tensorplay.nn.functional.glu
     tensorplay.nn.functional.gelu
     tensorplay.nn.functional.logsigmoid
@@ -196,9 +203,6 @@
     tensorplay.nn.functional.pixel_unshuffle
     tensorplay.nn.functional.pad
     tensorplay.nn.functional.interpolate
-    tensorplay.nn.functional.upsample
-    tensorplay.nn.functional.upsample_nearest
-    tensorplay.nn.functional.upsample_bilinear
     tensorplay.nn.functional.grid_sample
     tensorplay.nn.functional.affine_grid
 ```
@@ -232,15 +236,24 @@
     adaptive_max_pool1d_with_indices
     adaptive_max_pool2d_with_indices
     adaptive_max_pool3d_with_indices
+    celu_
     channel_shuffle
     conv_tbc
+    dropout_
+    feature_dropout
+    feature_dropout_
     flatten
     fractional_max_pool2d_with_indices
     fractional_max_pool3d_with_indices
+    gru_cell
+    lstm_cell
     max_pool1d_with_indices
     max_pool2d_with_indices
     max_pool3d_with_indices
     multi_head_attention_forward
     native_channel_shuffle
+    rnn_relu_cell
+    rnn_tanh_cell
+    selu_
 ```
 

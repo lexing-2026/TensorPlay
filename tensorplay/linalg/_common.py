@@ -29,12 +29,19 @@ class LinAlgError(RuntimeError):
 
 def check_floating(A, name):
     """Rejects dtypes the decomposition kernels do not cover."""
-    if A.dtype not in (tensorplay.float32, tensorplay.float64):
+    if A.dtype not in (
+        tensorplay.float32,
+        tensorplay.float64,
+        tensorplay.complex64,
+        tensorplay.complex128,
+    ):
         raise NotImplementedError(
-            f"linalg.{name}: only float32/float64 tensors are implemented; "
+            f"linalg.{name}: only float32/float64/complex64/complex128 tensors "
+            "are implemented; "
             f"got {A.dtype}")
 
 
 def eps_of(dtype):
     """Machine epsilon used by the rank/pseudo-inverse cutoffs."""
-    return 1.1920929e-07 if dtype == tensorplay.float32 else 2.220446049250313e-16
+    return 1.1920929e-07 if dtype in (tensorplay.float32, tensorplay.complex64) \
+        else 2.220446049250313e-16

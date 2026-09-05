@@ -20,7 +20,6 @@
     tensorplay.nn.modules.container.ParameterDict
     tensorplay.nn.modules.module.register_module_forward_pre_hook
     tensorplay.nn.modules.module.register_module_forward_hook
-    tensorplay.nn.modules.module.register_module_backward_hook
     tensorplay.nn.modules.module.register_module_full_backward_pre_hook
     tensorplay.nn.modules.module.register_module_full_backward_hook
     tensorplay.nn.modules.module.register_module_buffer_registration_hook
@@ -125,6 +124,7 @@
     tensorplay.nn.modules.activation.RReLU
     tensorplay.nn.modules.activation.SELU
     tensorplay.nn.modules.activation.CELU
+    tensorplay.nn.modules.activation.GELU
     tensorplay.nn.modules.activation.Sigmoid
     tensorplay.nn.modules.activation.SiLU
     tensorplay.nn.modules.activation.Mish
@@ -296,8 +296,6 @@
     tensorplay.nn.modules.pixelshuffle.PixelShuffle
     tensorplay.nn.modules.pixelshuffle.PixelUnshuffle
     tensorplay.nn.modules.upsampling.Upsample
-    tensorplay.nn.modules.upsampling.UpsamplingNearest2d
-    tensorplay.nn.modules.upsampling.UpsamplingBilinear2d
 ```
 
 ## Shuffle Layers
@@ -328,6 +326,7 @@
     :toctree: generated
     :nosignatures:
 
+    tensorplay.nn.utils.stateless.functional_call
     tensorplay.nn.utils.rnn.PackedSequence
     tensorplay.nn.utils.rnn.pack_padded_sequence
     tensorplay.nn.utils.rnn.pad_packed_sequence

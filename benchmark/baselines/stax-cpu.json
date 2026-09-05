@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "benchmark": "stax-cpu",
+  "backend": "stax",
+  "threads": 2,
+  "measurements": [
+    {
+      "name": "mm-bias",
+      "category": "compile",
+      "batch": 64,
+      "features": 256,
+      "hidden": 512,
+      "eager_seconds": 8.848599100019783e-05,
+      "compiled_seconds": 0.00011105799057986587,
+      "compile_seconds": 0.005629364008200355,
+      "first_pass_seconds": 0.0034474759886506945,
+      "speedup": 0.7967548353629207,
+      "codegens": [
+        "stax-native"
+      ]
+    },
+    {
+      "name": "mm-bias-relu",
+      "category": "compile",
+      "batch": 128,
+      "features": 512,
+      "hidden": 1024,
+      "eager_seconds": 0.0005792279989691451,
+      "compiled_seconds": 0.0006697580101899803,
+      "compile_seconds": 0.00011257099686190486,
+      "first_pass_seconds": 0.008176650997484103,
+      "speedup": 0.8648317603619913,
+      "codegens": [
+        "stax-native"
+      ]
+    },
+    {
+      "name": "mm-bias-sigmoid",
+      "category": "compile",
+      "batch": 128,
+      "features": 512,
+      "hidden": 1024,
+      "eager_seconds": 0.0008321829955093563,
+      "compiled_seconds": 0.0009331129986094311,
+      "compile_seconds": 0.00014138499682303518,
+      "first_pass_seconds": 0.008924605004722252,
+      "speedup": 0.8918351761785706,
+      "codegens": [
+        "stax-native"
+      ]
+    },
+    {
+      "name": "mm-bias-sin",
+      "category": "compile",
+      "batch": 64,
+      "features": 1024,
+      "hidden": 1024,
+      "eager_seconds": 0.0006479470030171797,
+      "compiled_seconds": 0.0007493080047424883,
+      "compile_seconds": 0.00010290401405654848,
+      "first_pass_seconds": 0.006925341003807262,
+      "speedup": 0.8647271868393519,
+      "codegens": [
+        "stax-native"
+      ]
+    },
+    {
+      "name": "mm-bias-tanh",
+      "category": "compile",
+      "batch": 64,
+      "features": 1024,
+      "hidden": 1024,
+      "eager_seconds": 0.0009949890081770718,
+      "compiled_seconds": 0.0009172529971692711,
+      "compile_seconds": 0.00012173899449408054,
+      "first_pass_seconds": 0.0083304089930607,
+      "speedup": 1.0847487130025208,
+      "codegens": [
+        "stax-native"
+      ]
+    },
+    {
+      "name": "mm-bias-pointwise",
+      "category": "compile",
+      "batch": 32,
+      "features": 1024,
+      "hidden": 2048,
+      "eager_seconds": 0.001090509002096951,
+      "compiled_seconds": 0.0008084389992291108,
+      "compile_seconds": 0.0001360360038233921,
+      "first_pass_seconds": 0.027483882993692532,
+      "speedup": 1.348906971505344,
+      "codegens": [
+        "stax-native"
+      ]
+    },
+    {
+      "name": "mm-bias-chain",
+      "category": "compile",
+      "batch": 64,
+      "features": 256,
+      "hidden": 512,
+      "eager_seconds": 0.00013306000619195402,
+      "compiled_seconds": 0.00012998499732930213,
+      "compile_seconds": 0.00013893100549466908,
+      "first_pass_seconds": 0.00402295398816932,
+      "speedup": 1.023656644426908,
+      "codegens": [
+        "stax-native"
+      ]
+    },
+    {
+      "name": "two-linear-relu",
+      "category": "compile",
+      "batch": 64,
+      "features": 256,
+      "hidden": 256,
+      "eager_seconds": 0.00014676499995402992,
+      "compiled_seconds": 0.00011456500214990228,
+      "compile_seconds": 0.00014331900456454605,
+      "first_pass_seconds": 0.005238559999270365,
+      "speedup": 1.281063127481075,
+      "codegens": [
+        "stax-native"
+      ]
+    },
+    {
+      "name": "transpose-mm",
+      "category": "compile",
+      "batch": 256,
+      "features": 64,
+      "hidden": 512,
+      "eager_seconds": 9.563998901285231e-05,
+      "compiled_seconds": 0.00010235200170427561,
+      "compile_seconds": 0.0001051880099112168,
+      "first_pass_seconds": 0.002507812008843757,
+      "speedup": 0.9344222625873382,
+      "codegens": [
+        "stax-native"
+      ]
+    },
+    {
+      "name": "mm-reduce",
+      "category": "compile",
+      "batch": 128,
+      "features": 512,
+      "hidden": 1024,
+      "eager_seconds": 0.00077985500684008,
+      "compiled_seconds": 0.0006175799935590476,
+      "compile_seconds": 0.00016568100545555353,
+      "first_pass_seconds": 0.005801788996905088,
+      "speedup": 1.262759504798494,
+      "codegens": [
+        "stax-native"
+      ]
+    }
+  ]
+}
