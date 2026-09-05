@@ -809,6 +809,9 @@ __global__ void poisson_fill_impl(int64_t numel, PhiloxCudaState philox_args,
 }
 
 Tensor poisson_kernel_cuda(const Tensor& self) {
+    if (!isFloatingType(self.dtype())) {
+        TP_THROW(NotImplementedError, "poisson() only supports floating dtypes on CUDA");
+    }
     Tensor t(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
     int64_t n = self.numel();
     if (n == 0) return t;
@@ -1372,13 +1375,17 @@ void launch_standard_gamma_fill(const Tensor& alpha, Tensor& out,
 
 Tensor standard_gamma_kernel_cuda(const Tensor& self,
                                   std::optional<Generator> generator) {
-    Tensor out(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(),
-               self.device());
-    if (out.numel() == 0) return out;
     if (!isFloatingType(self.dtype())) {
         TP_THROW(TypeError, "standard_gamma expects a floating dtype");
     }
+    Tensor out(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(),
+               self.device());
+    if (out.numel() == 0) return out;
     Tensor alpha_c = self.is_contiguous() ? self : self.contiguous();
+    if (!alpha_c.ge(Scalar(0)).all().item<bool>()) {
+        TP_THROW(ValueError,
+                 "standard_gamma: concentration values must be non-negative");
+    }
     if (self.dtype() == DType::Float32) {
         launch_standard_gamma_fill<float>(alpha_c, out, std::move(generator));
     } else if (self.dtype() == DType::Float64) {
@@ -1557,6 +1564,18 @@ Tensor sample_dirichlet_kernel_cuda(const Tensor& self,
 
 Tensor dirichlet_grad_kernel_cuda(const Tensor& x, const Tensor& alpha,
                                   const Tensor& total) {
+    if (x.device() != alpha.device() || x.device() != total.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "dirichlet_grad: inputs must be on the same device");
+    }
+    if (x.dtype() != DType::Float32 && x.dtype() != DType::Float64) {
+        TP_THROW(TypeError, "dirichlet_grad expects Float32 or Float64 input");
+    }
+    if (alpha.dtype() != x.dtype() || total.dtype() != x.dtype() ||
+        alpha.shape() != x.shape() || total.shape() != x.shape()) {
+        TP_THROW(RuntimeError,
+                 "dirichlet_grad: inputs must have matching dtype and shape");
+    }
     Tensor out(static_cast<std::vector<int64_t>>(x.shape()), x.dtype(),
                x.device());
     if (out.numel() == 0) return out;
