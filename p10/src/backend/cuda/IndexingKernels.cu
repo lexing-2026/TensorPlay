@@ -3201,7 +3201,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, IndexingKernels) {
 // indexed slices are reset to the operation identity before accumulation;
 // untouched slices retain their original values. Mean divides by full-rank
 // counts, replacing zero counts with one before division.
-// Floating-point dtypes only: the atomic primitives cover Float32/Float64.
 // scatter_reduce_backward / index_reduce_backward.
 // ---------------------------------------------------------------------------
 
@@ -3229,15 +3228,115 @@ inline T sr_identity_cuda(SrReduceCuda op) {
         case SrReduceCuda::Mean: return static_cast<T>(0);
         case SrReduceCuda::Prod: return static_cast<T>(1);
         case SrReduceCuda::AMin:
-            return std::numeric_limits<T>::has_infinity
-                       ? std::numeric_limits<T>::infinity()
-                       : std::numeric_limits<T>::max();
+            if constexpr (std::is_same_v<T, Half> || std::is_same_v<T, BFloat16>) {
+                return static_cast<T>(std::numeric_limits<float>::infinity());
+            } else {
+                return std::numeric_limits<T>::has_infinity
+                           ? std::numeric_limits<T>::infinity()
+                           : std::numeric_limits<T>::max();
+            }
         case SrReduceCuda::AMax:
-            return std::numeric_limits<T>::has_infinity
-                       ? -std::numeric_limits<T>::infinity()
-                       : std::numeric_limits<T>::lowest();
+            if constexpr (std::is_same_v<T, Half> || std::is_same_v<T, BFloat16>) {
+                return static_cast<T>(-std::numeric_limits<float>::infinity());
+            } else {
+                return std::numeric_limits<T>::has_infinity
+                           ? -std::numeric_limits<T>::infinity()
+                           : std::numeric_limits<T>::lowest();
+            }
     }
     return static_cast<T>(0);  // unreachable
+}
+
+template <typename T>
+__device__ __forceinline__ void sr_atomic_reduce(T* addr, T value,
+                                                  SrReduceCuda op) {
+    switch (op) {
+        case SrReduceCuda::Sum:
+        case SrReduceCuda::Mean:
+            gpuAtomicAdd(addr, value);
+            break;
+        case SrReduceCuda::Prod:
+            gpuAtomicMul(addr, value);
+            break;
+        case SrReduceCuda::AMin:
+            gpuAtomicMin(addr, value);
+            break;
+        case SrReduceCuda::AMax:
+            gpuAtomicMax(addr, value);
+            break;
+    }
+}
+
+template <typename T>
+__device__ __forceinline__ T sr_mean_divide_value(T value, int64_t count) {
+    if (count == 0 || std::is_same_v<T, bool>) return value;
+    if constexpr (std::is_integral_v<T>) {
+        const T divisor = static_cast<T>(count);
+        T quotient = static_cast<T>(value / divisor);
+        if constexpr (std::is_signed_v<T>) {
+            const T remainder = static_cast<T>(value - quotient * divisor);
+            if (remainder != static_cast<T>(0) && remainder < static_cast<T>(0)) {
+                quotient = static_cast<T>(quotient - static_cast<T>(1));
+            }
+        }
+        return quotient;
+    } else if constexpr (std::is_same_v<T, Half> || std::is_same_v<T, BFloat16>) {
+        return static_cast<T>(static_cast<float>(value) /
+                              static_cast<float>(count));
+    } else {
+        return static_cast<T>(value / static_cast<T>(count));
+    }
+}
+
+template <typename T>
+__global__ void sr_mean_divide_kernel(int64_t n, T* data,
+                                      const int64_t* counts) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; i < n; i += stride) {
+        data[i] = sr_mean_divide_value(data[i], counts[i]);
+    }
+}
+
+template <bool AllowNegative>
+__global__ void sr_validate_indices_kernel(int64_t n, const int64_t* indices,
+                                            int64_t size, int32_t* invalid,
+                                            int64_t* bad_value) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; i < n; i += stride) {
+        const int64_t value = indices[i];
+        const bool out = AllowNegative
+            ? (value < -size || value >= size)
+            : (value < 0 || value >= size);
+        if (out && atomicCAS(invalid, 0, 1) == 0) {
+            *bad_value = value;
+        }
+    }
+}
+
+template <bool AllowNegative>
+std::optional<int64_t> sr_validate_indices_cuda(const Tensor& indices,
+                                                int64_t size) {
+    const int64_t n = indices.numel();
+    if (n == 0) return std::nullopt;
+    Tensor invalid = Tensor::zeros({1}, DType::Int32, indices.device());
+    Tensor bad_value = Tensor::zeros({1}, DType::Int64, indices.device());
+    auto stream = getCurrentCUDAStream().stream();
+    sr_validate_indices_kernel<AllowNegative>
+        <<<static_cast<uint32_t>((n + kThreads - 1) / kThreads), kThreads,
+           0, stream>>>(n, indices.data_ptr<int64_t>(), size,
+                        invalid.data_ptr<int32_t>(),
+                        bad_value.data_ptr<int64_t>());
+    CUDA_CHECK(cudaGetLastError());
+    int32_t invalid_host = 0;
+    CUDA_CHECK(cudaMemcpy(&invalid_host, invalid.data_ptr<int32_t>(),
+                          sizeof(invalid_host), cudaMemcpyDeviceToHost));
+    if (invalid_host == 0) return std::nullopt;
+    int64_t bad_host = 0;
+    CUDA_CHECK(cudaMemcpy(&bad_host, bad_value.data_ptr<int64_t>(),
+                          sizeof(bad_host), cudaMemcpyDeviceToHost));
+    return bad_host;
 }
 
 template <typename T>
@@ -3275,23 +3374,9 @@ __global__ void sr_accum_kernel(int64_t total_idx, int64_t idx_dim_size,
     if (idx < 0) idx += self_dim_size;
     const int64_t dst = (oo * self_dim_size + idx) * self_inner + j;
     const T v = vp[flat];
-    switch (op) {
-        case SrReduceCuda::Sum:
-            gpuAtomicAdd(&d[dst], v);
-            break;
-        case SrReduceCuda::Prod:
-            gpuAtomicMul(&d[dst], v);
-            break;
-        case SrReduceCuda::AMin:
-            gpuAtomicMin(&d[dst], v);
-            break;
-        case SrReduceCuda::AMax:
-            gpuAtomicMax(&d[dst], v);
-            break;
-        case SrReduceCuda::Mean:
-            gpuAtomicAdd(&d[dst], v);
-            gpuAtomicAdd(&cp[dst], static_cast<int64_t>(1));
-            break;
+    sr_atomic_reduce(&d[dst], v, op);
+    if (op == SrReduceCuda::Mean) {
+        gpuAtomicAdd(&cp[dst], static_cast<int64_t>(1));
     }
 }
 
@@ -3329,23 +3414,9 @@ __global__ void sr_accum_rows_kernel(int64_t total, int64_t K,
         int64_t t = rem - j * self_inner;
         const int64_t dst = (oo * self_dim_size + ip[j]) * self_inner + t;
         const T v = vp[w];
-        switch (op) {
-            case SrReduceCuda::Sum:
-                gpuAtomicAdd(&d[dst], v);
-                break;
-            case SrReduceCuda::Prod:
-                gpuAtomicMul(&d[dst], v);
-                break;
-            case SrReduceCuda::AMin:
-                gpuAtomicMin(&d[dst], v);
-                break;
-            case SrReduceCuda::AMax:
-                gpuAtomicMax(&d[dst], v);
-                break;
-            case SrReduceCuda::Mean:
-                gpuAtomicAdd(&d[dst], v);
-                gpuAtomicAdd(&cp[dst], static_cast<int64_t>(1));
-                break;
+        sr_atomic_reduce(&d[dst], v, op);
+        if (op == SrReduceCuda::Mean) {
+            gpuAtomicAdd(&cp[dst], static_cast<int64_t>(1));
         }
     }
 }
@@ -3378,14 +3449,9 @@ Tensor sr_forward_cuda_impl(const Tensor& self, int64_t dim,
         TP_THROW(IndexError,
                  "index must have the same number of dimensions as self");
     }
-    switch (self.dtype()) {
-        case DType::Float32:
-        case DType::Float64:
-            break;
-        default:
-            TP_THROW(NotImplementedError,
-                     "scatter_reduce/index_reduce on CUDA supports "
-                     "floating point dtypes only");
+    if (index.device() != self.device() || src_in.device() != self.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "scatter_reduce: self, index, and src must be on the same device");
     }
     Tensor idx_c = (index.dtype() == DType::Int64)
                        ? index.contiguous()
@@ -3418,17 +3484,10 @@ Tensor sr_forward_cuda_impl(const Tensor& self, int64_t dim,
     const int64_t total_idx = idx_c.numel();
     const int64_t self_dim_size = self.size(dim);
 
-    {
-        const int64_t* ip0 = idx_c.data_ptr<int64_t>();
-        for (int64_t i = 0; i < total_idx; ++i) {
-            // ("index -1 is out of bounds for dimension D with size N").
-            const int64_t v = ip0[i];
-            if (v < 0 || v >= self_dim_size) {
-                TP_THROW(IndexError, "index ", v,
-                         " is out of bounds for dimension ", dim,
-                         " with size ", self_dim_size);
-            }
-        }
+    if (auto bad_index = sr_validate_indices_cuda<false>(idx_c, self_dim_size)) {
+        TP_THROW(IndexError, "index ", *bad_index,
+                 " is out of bounds for dimension ", dim,
+                 " with size ", self_dim_size);
     }
 
     Tensor result = detail::contiguous_clone(self);
@@ -3444,6 +3503,9 @@ Tensor sr_forward_cuda_impl(const Tensor& self, int64_t dim,
     auto stream = getCurrentCUDAStream().stream();
     const int64_t blocks =
         total_idx > 0 ? (total_idx + kThreads - 1) / kThreads : 1;
+    const int64_t result_numel = result.numel();
+    const int64_t result_blocks =
+        result_numel > 0 ? (result_numel + kThreads - 1) / kThreads : 1;
 
 #define TP_SR_CUDA_CASE(ctype, name)                                            \
     case DType::name: {                                                         \
@@ -3462,23 +3524,22 @@ Tensor sr_forward_cuda_impl(const Tensor& self, int64_t dim,
                     total_idx, idx_dim_size, idx_inner, self_dim_size,           \
                     self_inner, dp, ip, vp, cp, static_cast<int>(op));            \
         }                                                                       \
+        if (op == SrReduceCuda::Mean && result_numel > 0) {                       \
+            sr_mean_divide_kernel<ctype>                                         \
+                <<<static_cast<uint32_t>(result_blocks), kThreads, 0, stream>>>(  \
+                    result_numel, dp, cp);                                       \
+        }                                                                       \
         break;                                                                   \
     }
 
     switch (self.dtype()) {
-        TP_SR_CUDA_CASE(float, Float32)
-        TP_SR_CUDA_CASE(double, Float64)
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_SR_CUDA_CASE)
         default:
             TP_THROW(TypeError, "scatter_reduce: unsupported dtype");
     }
 #undef TP_SR_CUDA_CASE
     CUDA_CHECK(cudaGetLastError());
 
-    if (op == SrReduceCuda::Mean) {
-        // Avoid division by zero for slices with no selected entries.
-        count = count.masked_fill(count.eq(0), 1);
-        result = result.div(count.to(result.dtype()));
-    }
     return result;
 }
 
@@ -3530,6 +3591,10 @@ Tensor ir_forward_cuda_impl(const Tensor& self, int64_t dim,
                  "index_reduce(): Index is supposed to be a vector, but got dim: ",
                  index.dim());
     }
+    if (index.device() != self.device() || source_in.device() != self.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "index_reduce: self, index, and source must be on the same device");
+    }
     for (int64_t i = 0; i < nd; ++i) {
         if (i == dim) continue;
         if (source_in.size(i) != self.size(i)) {
@@ -3537,14 +3602,6 @@ Tensor ir_forward_cuda_impl(const Tensor& self, int64_t dim,
                      "index_reduce(): Expected source and self to have the "
                      "same size at dimension ", i);
         }
-    }
-    switch (self.dtype()) {
-        case DType::Float32:
-        case DType::Float64:
-            break;
-        default:
-            TP_THROW(NotImplementedError,
-                     "index_reduce on CUDA supports floating point dtypes only");
     }
     Tensor idx_c = (index.dtype() == DType::Int64)
                        ? index.contiguous()
@@ -3559,15 +3616,13 @@ Tensor ir_forward_cuda_impl(const Tensor& self, int64_t dim,
                  ") should be equal to source.size(dim): (", src_c.size(dim),
                  "),");
     }
-    const int64_t* ip = idx_c.data_ptr<int64_t>();
     const int64_t self_dim_size = self.size(dim);
-    for (int64_t j = 0; j < K; ++j) {
-        if (ip[j] < 0 || ip[j] >= self_dim_size) {
-            TP_THROW(IndexError, "index ", ip[j],
-                     " is out of bounds for dimension ", dim,
-                     " with size ", self_dim_size);
-        }
+    if (auto bad_index = sr_validate_indices_cuda<false>(idx_c, self_dim_size)) {
+        TP_THROW(IndexError, "index ", *bad_index,
+                 " is out of bounds for dimension ", dim,
+                 " with size ", self_dim_size);
     }
+    const int64_t* ip = idx_c.data_ptr<int64_t>();
     const SrReduceCuda op = parse_sr_reduce_cuda(reduce);
     int64_t outer = 1;
     for (int64_t i = 0; i < dim; ++i) outer *= self.size(i);
@@ -3588,6 +3643,9 @@ Tensor ir_forward_cuda_impl(const Tensor& self, int64_t dim,
     const int64_t total = outer * K * self_inner;
     const int64_t blocks =
         total > 0 ? (total + kThreads - 1) / kThreads : 1;
+    const int64_t result_numel = result.numel();
+    const int64_t result_blocks =
+        result_numel > 0 ? (result_numel + kThreads - 1) / kThreads : 1;
 
 #define TP_IR_CUDA_CASE(ctype, name)                                           \
     case DType::name: {                                                         \
@@ -3605,23 +3663,22 @@ Tensor ir_forward_cuda_impl(const Tensor& self, int64_t dim,
                     total, K, self_dim_size, self_inner, dp, ip, sp, cp,          \
                     static_cast<int>(op));                                        \
         }                                                                       \
+        if (reduce == "mean" && result_numel > 0) {                               \
+            sr_mean_divide_kernel<ctype>                                         \
+                <<<static_cast<uint32_t>(result_blocks), kThreads, 0, stream>>>(  \
+                    result_numel, dp, cp);                                       \
+        }                                                                       \
         break;                                                                   \
     }
 
     switch (self.dtype()) {
-        TP_IR_CUDA_CASE(float, Float32)
-        TP_IR_CUDA_CASE(double, Float64)
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_IR_CUDA_CASE)
         default:
             TP_THROW(TypeError, "index_reduce: unsupported dtype");
     }
 #undef TP_IR_CUDA_CASE
     CUDA_CHECK(cudaGetLastError());
 
-    if (reduce == "mean") {
-        // Avoid division by zero for slices with no selected entries.
-        count = count.masked_fill(count.eq(0), 1);
-        result = result.div(count.to(result.dtype()));
-    }
     return result;
 }
 
