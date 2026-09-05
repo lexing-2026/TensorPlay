@@ -93,6 +93,7 @@ set(P10_SOURCES
     src/backend/cpu/FactoryToolsKernels.cpp
     src/backend/cpu/ActivationMoreKernels.cpp
     src/backend/cpu/SpectralKernels.cpp
+    src/backend/cpu/SpectralInteropKernels.cpp
     src/backend/cpu/Spectral2DKernels.cpp
     src/backend/cpu/InplaceCompletionKernels.cpp
     src/backend/cpu/SymScalarKernels.cpp
@@ -478,6 +479,10 @@ endif()
 add_library(p10 ${P10_SOURCES})
 # Enable UNITY_BUILD for faster compilation
 set_target_properties(p10 PROPERTIES UNITY_BUILD OFF)
+if(MSVC)
+    # Template-heavy kernel TUs exceed the default COFF section cap.
+    target_compile_options(p10 PRIVATE /bigobj)
+endif()
 if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
     # Tell DispatchStub (and every TU) that AVX2 kernel copies exist, so the
     # AVX2 dispatch slots are registered and selected at runtime.
