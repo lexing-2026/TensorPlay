@@ -276,26 +276,37 @@ Tensor& interop_nonzero_static_out_cuda(const Tensor& self, int64_t size,
 }
 
 // ---------------------------------------------------------------------------
-// repeat_interleave.Tensor: the self-less overload returns the flat index
-// list [0 x r0, 1 x r1, ...] built from a reverse cumsum + searchsorted.
+// repeat_interleave.Tensor returns the flat source-index list
+// [0 x r0, 1 x r1, ...] from cumulative repeat boundaries.
 // ---------------------------------------------------------------------------
 
 Tensor repeat_interleave_tensor_cuda(const Tensor& repeats,
                                      std::optional<int64_t> output_size) {
     TP_CHECK(repeats.dim() == 1,
              "repeat_interleave: repeats must be 1-dimensional");
-    Tensor rep = repeats.to(DType::Int64).contiguous();
-    if (output_size.has_value() && *output_size < 0) output_size.reset();
-    int64_t total = output_size.value_or(
-        static_cast<int64_t>(ops::sum(rep).item().to<int64_t>()));
-    Tensor ends = ops::cumsum(rep, 0);
-    Tensor starts = ops::sub(ends, rep);
+    TP_CHECK(repeats.dtype() == DType::Int32 ||
+                 repeats.dtype() == DType::Int64,
+             "repeats must have Int32 or Int64 dtype");
+    if (repeats.numel() == 0) {
+        return Tensor::empty({0}, repeats.dtype(), repeats.device());
+    }
+
+    Tensor rep = repeats.contiguous();
+    Tensor ends = ops::cumsum(rep, 0, DType::Int64);
+    const int64_t required_size =
+        ends.select(0, ends.size(0) - 1).item<int64_t>();
+    const int64_t total = output_size.value_or(required_size);
+    TP_CHECK(total == required_size,
+             "allocated size does not match required size");
+    TP_CHECK(rep.ge(Scalar(0)).all().item<bool>(),
+             "repeats can not be negative");
+
     Tensor ar = ops::arange(Scalar(int64_t(0)), Scalar(total),
                             Scalar(int64_t(1)), DType::Int64, repeats.device());
-    // index i lands in bucket b where starts[b] <= i < ends[b].
-    Tensor idx = ops::sub(ops::searchsorted(ends, ar, false, true),
-                          Scalar(int64_t(1)));
-    return ops::clamp(idx, Scalar(int64_t(0)), rep.numel() - 1);
+    Tensor indices = ops::searchsorted(ends, ar, false, true);
+    return repeats.dtype() == DType::Int32
+        ? indices.to(DType::Int32)
+        : indices;
 }
 
 Tensor interop_repeat_interleave_Tensor_cuda(
