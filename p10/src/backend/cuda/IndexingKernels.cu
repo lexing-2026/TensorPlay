@@ -613,6 +613,65 @@ __global__ void logcumsumexp_scan_kernel(int64_t n_slices, int64_t d_size, int64
     }
 }
 
+template <typename T>
+__device__ __forceinline__ tensorplay::complex<T> logcumsumexp_complex_pair(
+        const tensorplay::complex<T>& x, const tensorplay::complex<T>& y) {
+    const T nan = std::numeric_limits<T>::quiet_NaN();
+    if (::isnan(x.real()) || ::isnan(x.imag()) ||
+        ::isnan(y.real()) || ::isnan(y.imag())) {
+        return tensorplay::complex<T>(nan, nan);
+    }
+    const tensorplay::complex<T> min = x.real() < y.real() ? x : y;
+    const tensorplay::complex<T> max = x.real() >= y.real() ? x : y;
+    const T min_real = min.real();
+    const T max_real = max.real();
+    if (!::isfinite(min_real) && min_real == max_real) {
+        if (min_real < 0) return min;
+        return tensorplay::log1p(tensorplay::exp(min) + tensorplay::exp(max) - T(1));
+    }
+    return tensorplay::log1p(tensorplay::exp(min - max)) + max;
+}
+
+template <typename T>
+__global__ void logcumsumexp_complex_scan_kernel(
+        int64_t n_slices, int64_t d_size, int64_t inner,
+        const tensorplay::complex<T>* in, tensorplay::complex<T>* out) {
+    const T neg_inf = -std::numeric_limits<T>::infinity();
+    int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; si < n_slices; si += stride) {
+        int64_t o = si / inner, in2 = si % inner;
+        const tensorplay::complex<T>* sp = in + o * d_size * inner + in2;
+        tensorplay::complex<T>* dp = out + o * d_size * inner + in2;
+        tensorplay::complex<T> acc(neg_inf, T(0));
+        for (int64_t j = 0; j < d_size; ++j) {
+            acc = logcumsumexp_complex_pair(acc, sp[j * inner]);
+            dp[j * inner] = acc;
+        }
+    }
+}
+
+template <typename T>
+Tensor complex_logcumsumexp_cuda(const Tensor& src, int64_t dim) {
+    Tensor result = Tensor::empty(
+        static_cast<std::vector<int64_t>>(src.shape()),
+        src.dtype(), src.device());
+    const int64_t d_size = src.size(dim);
+    if (d_size == 0 || src.numel() == 0) return result;
+    int64_t outer = 1;
+    int64_t inner = 1;
+    outer_inner(static_cast<std::vector<int64_t>>(src.shape()), dim, outer, inner);
+    const int64_t slices = outer * inner;
+    auto stream = getCurrentCUDAStream().stream();
+    logcumsumexp_complex_scan_kernel<T><<<(slices + kThreads - 1) / kThreads,
+                                           kThreads, 0, stream>>>(
+        slices, d_size, inner,
+        static_cast<const tensorplay::complex<T>*>(src.data_ptr()),
+        static_cast<tensorplay::complex<T>*>(result.data_ptr()));
+    CUDA_CHECK(cudaGetLastError());
+    return result;
+}
+
 // Gather with separate result and source trailing extents.
 template <typename T>
 __global__ void gather_kernel(int64_t n, int64_t idx_dim_size, int64_t idx_inner,
@@ -1671,6 +1730,15 @@ Tensor logcumsumexp_cuda(const Tensor& self, int64_t dim, std::optional<DType> d
     dim = wrap_dim(dim, nd);
     DType out_dtype = dtype.value_or(self.dtype());
     Tensor src = (self.dtype() == out_dtype) ? self.contiguous() : self.to(out_dtype).contiguous();
+    if (isComplexType(out_dtype)) {
+        const DType compute_dtype =
+            out_dtype == DType::ComplexDouble ? DType::ComplexDouble : DType::ComplexFloat;
+        Tensor compute_src = src.dtype() == compute_dtype ? src : src.to(compute_dtype);
+        if (compute_dtype == DType::ComplexDouble) {
+            return complex_logcumsumexp_cuda<double>(compute_src, dim).to(out_dtype);
+        }
+        return complex_logcumsumexp_cuda<float>(compute_src, dim).to(out_dtype);
+    }
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(src.shape()), out_dtype, src.device());
     int64_t d_size = src.size(dim);
     if (d_size == 0 || src.numel() == 0) return result;

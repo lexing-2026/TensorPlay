@@ -8,11 +8,13 @@
 #include "BFloat16.h"
 #include "Parallel.h"
 #include "Bucketization.h"
+#include "cpu/ComplexUnary.h"
 
 #include <tuple>
 #include <vector>
 #include <algorithm>
 #include <complex>
+#include <cmath>
 #include <numeric>
 #include <cstring>
 #include <limits>
@@ -220,6 +222,54 @@ Tensor complex_scan_cpu(const Tensor& src, int64_t dim) {
     return result;
 }
 
+template <typename T>
+inline std::complex<T> logcumsumexp_complex_pair(
+        const std::complex<T>& x, const std::complex<T>& y) {
+    const T nan = std::numeric_limits<T>::quiet_NaN();
+    if (std::isnan(x.real()) || std::isnan(x.imag()) ||
+        std::isnan(y.real()) || std::isnan(y.imag())) {
+        return {nan, nan};
+    }
+    const std::complex<T> min = x.real() < y.real() ? x : y;
+    const std::complex<T> max = x.real() >= y.real() ? x : y;
+    const T min_real = min.real();
+    const T max_real = max.real();
+    if (!std::isfinite(min_real) && min_real == max_real) {
+        if (min_real < 0) return min;
+        return std::log(std::exp(min) + std::exp(max));
+    }
+    return cx_log1p(std::exp(min - max)) + max;
+}
+
+template <typename ComplexT>
+Tensor complex_logcumsumexp_cpu(const Tensor& src, int64_t dim) {
+    Tensor result = Tensor::empty(
+        static_cast<std::vector<int64_t>>(src.shape()),
+        src.dtype(), src.device());
+    const int64_t d_size = src.size(dim);
+    if (d_size == 0 || src.numel() == 0) return result;
+    int64_t outer = 1;
+    int64_t inner = 1;
+    outer_inner(static_cast<std::vector<int64_t>>(src.shape()), dim, outer, inner);
+    using value_t = typename ComplexT::value_type;
+    const ComplexT init(-std::numeric_limits<value_t>::infinity(), value_t(0));
+    const int64_t slice_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(d_size, 1));
+    parallel_for(0, outer * inner, slice_grain, [&](int64_t b, int64_t e) {
+        for (int64_t si = b; si < e; ++si) {
+            const int64_t o = si / inner;
+            const int64_t in2 = si % inner;
+            const ComplexT* sp = src.data_ptr<ComplexT>() + o * d_size * inner + in2;
+            ComplexT* dp = result.data_ptr<ComplexT>() + o * d_size * inner + in2;
+            ComplexT acc = init;
+            for (int64_t j = 0; j < d_size; ++j) {
+                acc = logcumsumexp_complex_pair(acc, sp[j * inner]);
+                dp[j * inner] = acc;
+            }
+        }
+    });
+    return result;
+}
+
 Tensor cumsum_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
     int64_t nd = self.dim();
     if (nd == 0) TP_THROW(RuntimeError, "cumsum: dimension not supported for scalar tensors");
@@ -337,6 +387,17 @@ Tensor logcumsumexp_cpu(const Tensor& self, int64_t dim, std::optional<DType> dt
     dim = wrap_dim(dim, nd);
     DType out_dtype = dtype.value_or(self.dtype());
     Tensor src = (self.dtype() == out_dtype) ? self.contiguous() : self.to(out_dtype).contiguous();
+    if (isComplexType(out_dtype)) {
+        const DType compute_dtype =
+            out_dtype == DType::ComplexDouble ? DType::ComplexDouble : DType::ComplexFloat;
+        Tensor compute_src = src.dtype() == compute_dtype ? src : src.to(compute_dtype);
+        if (compute_dtype == DType::ComplexDouble) {
+            return complex_logcumsumexp_cpu<std::complex<double>>(compute_src, dim)
+                .to(out_dtype);
+        }
+        return complex_logcumsumexp_cpu<std::complex<float>>(compute_src, dim)
+            .to(out_dtype);
+    }
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(src.shape()), out_dtype, src.device());
     int64_t d_size = src.size(dim);
     if (d_size == 0 || src.numel() == 0) return result;
