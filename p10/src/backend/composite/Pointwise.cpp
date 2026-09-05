@@ -166,18 +166,17 @@ Tensor igammac_native(const Tensor& a, const Tensor& x) {
                             x.to(Device(DeviceType::CPU))).to(a.device());
 }
 
-// tensor-repeats 形式：逐元素重复次数由 repeats 给出。由 repeats 的前缀和
-// 直接构造逐位源索引（repeat_interleave_common 语义），再 index_select 收集。
+// Tensor repeats specify one repetition count per selected input element.
+// The backend builds the flat source-index list used by index_select.
 Tensor repeat_interleave_tensor_native(const Tensor& self, const Tensor& repeats,
                                        std::optional<int64_t> dim_opt,
                                        std::optional<int64_t> output_size) {
     Tensor input = self;
     int64_t dim = 0;
     if (!dim_opt.has_value()) {
-        input = input.reshape({static_cast<int64_t>(input.numel())});
+        input = input.flatten();
     } else {
-        dim = dim_opt.value();
-        if (dim < 0) dim += input.dim();
+        dim = wrap_dim(dim_opt.value(), input.dim());
     }
     if (input.dim() == 0) {
         TP_THROW(RuntimeError,
@@ -196,69 +195,35 @@ Tensor repeat_interleave_tensor_native(const Tensor& self, const Tensor& repeats
     } else {
         TP_THROW(RuntimeError, "repeats must be 0-dim or 1-dim tensor");
     }
-    rep = rep.contiguous().to(DType::Int64);
-    if (rep.numel() == 0) {
-        return ops::index_select(input, dim, rep);
-    }
-    Tensor cumsum = rep.cumsum(0);
-    const int64_t last = cumsum.size(0) - 1;
-    const int64_t total = output_size.has_value()
-        ? *output_size : cumsum.select(0, last).item<int64_t>();
-    if (total != cumsum.select(0, last).item<int64_t>()) {
-        TP_THROW(RuntimeError,
-                 "allocated size does not match required size");
-    }
-    Tensor index = ops::zeros({total}, DType::Int64);
-    const int64_t* rep_ptr = rep.data_ptr<int64_t>();
-    const int64_t* cum_ptr = cumsum.data_ptr<int64_t>();
-    int64_t* idx_ptr = index.data_ptr<int64_t>();
-    for (int64_t i = 0; i < d_size; ++i) {
-        const int64_t end = cum_ptr[i];
-        const int64_t size = rep_ptr[i];
-        const int64_t start = end - size;
-        if (size < 0 || start < 0 || end > total) {
-            TP_THROW(RuntimeError, "repeats can not be negative");
-        }
-        for (int64_t j = start; j < end; ++j) {
-            idx_ptr[j] = i;
-        }
+    Tensor index = ops::repeat_interleave(rep, output_size);
+    if (index.dtype() != DType::Int32 && index.dtype() != DType::Int64) {
+        index = index.to(DType::Int64);
     }
     return ops::index_select(input, dim, index);
 }
 
-// Scalar-repeats form: when dim is absent, self is flattened first and each
-// element is then repeated along dim.  The uniform repetition count makes the source
-// index array trivial to construct.
+// Scalar repeats add a repetition axis, expand it, materialize the values,
+// then merge that axis back into the selected input dimension.
 Tensor repeat_interleave_int_native(const Tensor& self, int64_t repeats,
                                     std::optional<int64_t> dim_opt,
                                     std::optional<int64_t> output_size) {
-    Tensor input = self;
-    int64_t dim = 0;
-    if (!dim_opt.has_value()) {
-        input = input.reshape({static_cast<int64_t>(input.numel())});
-    } else {
-        dim = wrap_dim(dim_opt.value(), input.dim());
-    }
-    if (input.dim() == 0) {
-        TP_THROW(RuntimeError,
-                 "repeat_interleave(): dimension required for scalar repeats");
-    }
+    Tensor input = dim_opt.has_value() ? self : self.flatten();
+    const int64_t dim = wrap_dim(dim_opt.value_or(0), self.dim());
     if (repeats < 0) {
         TP_THROW(RuntimeError, "repeats can not be negative");
     }
-    const int64_t d_size = input.size(dim);
-    const int64_t total = d_size * repeats;
-    if (output_size.has_value() && *output_size != total) {
+
+    input = input.unsqueeze(dim + 1);
+    std::vector<int64_t> expand_shape =
+        static_cast<std::vector<int64_t>>(input.shape());
+    expand_shape[dim + 1] = repeats;
+    input = input.expand(expand_shape);
+
+    const int64_t calculated_size = repeats * expand_shape[dim];
+    if (output_size.has_value() && *output_size != calculated_size) {
         TP_THROW(RuntimeError, "allocated size does not match required size");
     }
-    Tensor index = ops::zeros({total}, DType::Int64);
-    int64_t* idx_ptr = index.data_ptr<int64_t>();
-    for (int64_t i = 0; i < d_size; ++i) {
-        for (int64_t j = i * repeats; j < (i + 1) * repeats; ++j) {
-            idx_ptr[j] = i;
-        }
-    }
-    return ops::index_select(input, dim, index);
+    return input.clone(kContiguous).flatten(dim, dim + 1);
 }
 
 TENSORPLAY_LIBRARY_IMPL(Composite, PointwiseComposite) {
