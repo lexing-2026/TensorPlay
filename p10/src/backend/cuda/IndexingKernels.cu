@@ -2060,7 +2060,7 @@ Tensor index_add_cuda(const Tensor& self, int64_t dim, const Tensor& index, cons
             index_add_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
                 total, inner, row, result.data_ptr<ctype>(), idx.data_ptr<int64_t>(), \
                 source_c.data_ptr<ctype>()); \
-            break; \
+            break;
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_IADD_CASE)
         case DType::ComplexFloat:
