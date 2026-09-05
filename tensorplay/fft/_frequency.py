@@ -1,4 +1,6 @@
 """Frequency-grid construction and spectrum re-ordering helpers."""
+import operator
+
 from tensorplay import arange, cat
 from tensorplay._C import DType
 
@@ -32,7 +34,10 @@ def fftfreq(n, d=1.0, *, dtype=DType.float32, device=None, out=None):
         d (float, optional): sample spacing. Default: 1.0
         dtype / device: forwarded to the factory ops. Default: float32/CPU
     """
-    n = int(n)
+    try:
+        n = operator.index(n)
+    except TypeError as exc:
+        raise TypeError(f"n must be an integer, got {type(n).__name__}") from exc
     if n <= 0:
         raise ValueError(f"n must be positive, got {n}")
     if d == 0:
@@ -45,7 +50,10 @@ def fftfreq(n, d=1.0, *, dtype=DType.float32, device=None, out=None):
 
 def rfftfreq(n, d=1.0, *, dtype=DType.float32, device=None, out=None):
     """Sample frequencies for :func:`rfft`/one-sided transforms: ``[0..n//2] / (n*d)``."""
-    n = int(n)
+    try:
+        n = operator.index(n)
+    except TypeError as exc:
+        raise TypeError(f"n must be an integer, got {type(n).__name__}") from exc
     if n <= 0:
         raise ValueError(f"n must be positive, got {n}")
     if d == 0:

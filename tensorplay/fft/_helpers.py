@@ -4,6 +4,8 @@ Holds the axis / transform-size / normalization bookkeeping that every
 transform family needs, so the 1-D, n-D and Hermitian drivers in
 :mod:`tensorplay.fft._transforms` only carry their own math.
 """
+import operator
+
 from tensorplay import (
     cat,
     fft_fft as _c2c_fwd,
@@ -24,6 +26,14 @@ __all__ = [
 ]
 
 
+def _as_index(value, name):
+    try:
+        return operator.index(value)
+    except TypeError as exc:
+        raise TypeError(
+            f"{name} must be an integer, got {type(value).__name__}") from exc
+
+
 def norm_mode(norm):
     """Maps the optional ``norm`` argument onto the kernel-level tag."""
     value = "backward" if norm is None else norm
@@ -38,7 +48,7 @@ def transform_size(n):
     """Maps an optional signal length onto the kernel sentinel for "unset"."""
     if n is None:
         return -1
-    value = int(n)
+    value = _as_index(n, "transform size")
     if value == -1:
         return value
     if value <= 0:
@@ -58,10 +68,14 @@ def normalize_dims(dim, ndim):
     """Resolves negative axes and rejects duplicates/out-of-range entries."""
     if ndim <= 0:
         raise ValueError(f"a transformed dimension requires a non-empty input, got {ndim}-D")
-    if isinstance(dim, int):
-        dims = [dim]
-    else:
-        dims = [int(d) for d in dim]
+    try:
+        dims = [_as_index(dim, "dimension")]
+    except TypeError:
+        try:
+            dims = [_as_index(d, "dimension") for d in dim]
+        except TypeError as exc:
+            raise TypeError(
+                "dimension must be an integer or a sequence of integers") from exc
     if len(dims) == 0:
         raise ValueError("at least one transformed dimension must be specified")
     seen = set()
@@ -82,10 +96,12 @@ def default_dims(input, s):
     ndim = input.dim()
     if s is None:
         k = ndim
-    elif isinstance(s, int):
-        k = 1
     else:
-        k = len(s)
+        try:
+            _as_index(s, "transform size")
+            k = 1
+        except TypeError:
+            k = len(s)
     if k <= 0:
         raise ValueError("at least one transformed dimension must be specified")
     if k > ndim:
@@ -101,14 +117,18 @@ def transform_sizes(s, k):
         raise ValueError("at least one transformed dimension must be specified")
     if s is None:
         return [None] * k
-    if isinstance(s, int):
+    try:
+        scalar_size = _as_index(s, "transform size")
+    except TypeError:
+        scalar_size = None
+    if scalar_size is not None:
         if k != 1:
             raise ValueError(
                 f"a scalar transform size requires exactly one dimension, got {k}"
             )
-        sizes = [int(s)]
+        sizes = [scalar_size]
     else:
-        sizes = [int(v) for v in s]
+        sizes = [_as_index(v, "transform size") for v in s]
     if len(sizes) != k:
         raise ValueError(
             f"s ({list(sizes)}) must have the same length as dim ({k})"

@@ -65,6 +65,16 @@ def _copy_to_out(result, out):
     return result
 
 
+def _one_dim(input, n, dim, op, name, norm):
+    if input.dim() < 1:
+        raise ValueError(f"{name} expects an input with at least one dimension")
+    dims = normalize_dims(dim, input.dim())
+    if len(dims) != 1:
+        raise ValueError(f"{name} expects exactly one transform dimension")
+    axis = dims[0]
+    return op(input, transform_size(n), axis, norm_mode(norm))
+
+
 # ---------------------------------------------------------------------------
 # 1-D transforms
 # ---------------------------------------------------------------------------
@@ -79,25 +89,25 @@ def fft(input, n=None, dim=-1, norm=None, *, out=None):
         norm (str, optional): ``"backward"``, ``"forward"`` or ``"ortho"``.
             Default: ``None`` (= ``"backward"``)
     """
-    result = _c2c_fwd(input, transform_size(n), dim, norm_mode(norm))
+    result = _one_dim(input, n, dim, _c2c_fwd, "fft", norm)
     return _copy_to_out(result, out)
 
 
 def ifft(input, n=None, dim=-1, norm=None, *, out=None):
     """Computes the one-dimensional inverse discrete Fourier transform."""
-    result = _c2c_inv(input, transform_size(n), dim, norm_mode(norm))
+    result = _one_dim(input, n, dim, _c2c_inv, "ifft", norm)
     return _copy_to_out(result, out)
 
 
 def rfft(input, n=None, dim=-1, norm=None, *, out=None):
     """Computes the one-dimensional FFT of real input, one-sided output."""
-    result = _r2c(input, transform_size(n), dim, norm_mode(norm))
+    result = _one_dim(input, n, dim, _r2c, "rfft", norm)
     return _copy_to_out(result, out)
 
 
 def irfft(input, n=None, dim=-1, norm=None, *, out=None):
     """Computes the inverse of :func:`rfft`; :attr:`n` is the output length."""
-    result = _c2r(input, transform_size(n), dim, norm_mode(norm))
+    result = _one_dim(input, n, dim, _c2r, "irfft", norm)
     return _copy_to_out(result, out)
 
 
@@ -107,7 +117,7 @@ def hfft(input, n=None, dim=-1, norm=None, *, out=None):
     Equivalent to :func:`irfft` applied to ``input.conj()``; :attr:`n` is the
     output length (default ``2 * (input.size(dim) - 1)``).
     """
-    result = _c2r(conj(input), transform_size(n), dim, norm_mode(norm))
+    result = _one_dim(conj(input), n, dim, _c2r, "hfft", norm)
     return _copy_to_out(result, out)
 
 
@@ -117,7 +127,7 @@ def ihfft(input, n=None, dim=-1, norm=None, *, out=None):
     Equivalent to :func:`rfft` applied to ``input.conj()``; :attr:`n`
     zero-pads/truncates the real input along :attr:`dim`.
     """
-    result = _r2c(conj(input), transform_size(n), dim, norm_mode(norm))
+    result = _one_dim(conj(input), n, dim, _r2c, "ihfft", norm)
     return _copy_to_out(result, out)
 
 
