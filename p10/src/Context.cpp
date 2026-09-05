@@ -36,6 +36,15 @@ bool isFloatingPoint(DType dtype) {
     }
 }
 
+void Context::setLinalgPreferredBackend(LinalgBackend b) {
+    if (b == LinalgBackend::Magma) {
+        TP_THROW(NotImplementedError,
+                 "Cannot set preferred linalg backend to MAGMA: no MAGMA "
+                 "backend is available in this build");
+    }
+    linalg_preferred_backend_ = b;
+}
+
 void Context::setDefaultDType(DType dtype) {
     if (!isFloatingPoint(dtype)) {
         TP_THROW(TypeError, "invalid dtype object: only floating-point types are supported as the default type");

@@ -9,8 +9,8 @@
 #include "CUDAContext.h"
 #include "CUDAGraph.h"
 #include "CUDARuntime.h"
-#include "Exception.h"
 #include "Context.h"
+#include "Exception.h"
 #include "LinearAlgebraNames.h"
 
 #include <cublas_v2.h>
@@ -380,6 +380,14 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
 #else
     const bool prefer_classic_precision = false;
 #endif
+    // User-pinned backend selection.  "cublas" routes plain GEMMs through
+    // the classic API even where the heuristic would pick Lt; "cublaslt"
+    // sends half/bfloat16 products through the Lt plan path instead of the
+    // classic fast path.  A pinned choice never overrides two limits: the
+    // bias epilogue always stays on Lt (the classic API has no epilogue),
+    // and complex dtypes always stay on the classic API (Lt's complex
+    // algorithm set is not uniformly available across CUDA versions).
+    const BlasBackend pinned_blas = globalContext().blasPreferredBackend();
     // The custom half-precision GEMV kernels cover the memory-bound skinny
     // shapes (single vector or a small activation batch against a large
     // output axis), where the BLAS tile kernels run far below the copy
@@ -387,12 +395,14 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
     // output, matching this function's accumulate contract.  With a bias the
     // epilogue path below stays in charge.
     if (!has_bias && (dtype == DType::Float16 || dtype == DType::BFloat16) &&
+        pinned_blas != BlasBackend::Cublaslt &&
         try_half_gemv(self_contig, other_transposed ? other : other_contig,
                       result, alpha, beta, other_transposed)) {
         return;
     }
-    if (!has_bias && (dtype == DType::Float16 || dtype == DType::BFloat16 ||
-                      prefer_classic_precision)) {
+    if (!has_bias && pinned_blas != BlasBackend::Cublaslt &&
+        (dtype == DType::Float16 || dtype == DType::BFloat16 ||
+         prefer_classic_precision)) {
         const cudaDataType_t cuda_type = to_cublas_type(dtype);
         const cublasComputeType_t compute_type = to_compute_type(dtype);
         void* alpha_ptr = to_scalar_ptr(alpha, dtype, 0);
