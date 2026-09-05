@@ -33,9 +33,12 @@ jobs:
           set -euo pipefail
 
           meta="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
-            --json author,isBot,title,body,files)"
+            --json author,title,body,files)"
           author="$(jq -r '.author.login' <<< "$meta")"
-          is_bot="$(jq -r '.isBot' <<< "$meta")"
+          # gh dropped the isBot field; the author's account type comes from
+          # the user endpoint (type is "Bot" for app identities).
+          is_bot="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
+            --jq '.user.type == "Bot"')"
           title="$(jq -r '.title' <<< "$meta")"
           body="$(jq -r '.body // ""' <<< "$meta")"
 
