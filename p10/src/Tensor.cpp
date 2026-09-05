@@ -795,6 +795,11 @@ Tensor Tensor::view_dtype(DType dtype) const {
                  "view(): view(dtype) requires the last dimension to be contiguous when "
                  "element sizes differ");
     }
+    if ((src_esize > dst_esize && src_esize % dst_esize != 0) ||
+        (dst_esize > src_esize && dst_esize % src_esize != 0)) {
+        TP_THROW(RuntimeError,
+                 "view(): element sizes must have an integral ratio");
+    }
 
     std::vector<int64_t> new_sizes = self_sizes;
     std::vector<int64_t> new_strides = self_strides;
@@ -804,9 +809,12 @@ Tensor Tensor::view_dtype(DType dtype) const {
 
     if (dst_esize < src_esize) {
         const int64_t ratio = static_cast<int64_t>(src_esize / dst_esize);
-        new_sizes.back() *= ratio;
-        for (size_t i = 0; i + 1 < new_strides.size(); ++i) new_strides[i] *= ratio;
-        new_offset = impl_->storage_offset() * static_cast<size_t>(ratio);
+        new_sizes.back() = checked_i64_mul(new_sizes.back(), ratio, "view");
+        for (size_t i = 0; i + 1 < new_strides.size(); ++i) {
+            new_strides[i] = checked_i64_mul(new_strides[i], ratio, "view");
+        }
+        new_offset = static_cast<size_t>(checked_i64_mul(
+            storage_offset_i64(impl_->storage_offset(), "view"), ratio, "view"));
     } else if (dst_esize > src_esize) {
         const int64_t ratio = static_cast<int64_t>(dst_esize / src_esize);
         if (new_sizes.back() % ratio != 0) {
@@ -821,12 +829,13 @@ Tensor Tensor::view_dtype(DType dtype) const {
             new_strides[i] /= ratio;
         }
         new_sizes.back() /= ratio;
-        if ((impl_->storage_offset() * static_cast<int64_t>(src_esize)) %
-                static_cast<int64_t>(dst_esize) != 0) {
+        const int64_t old_offset =
+            storage_offset_i64(impl_->storage_offset(), "view");
+        if (old_offset % ratio != 0) {
             TP_THROW(RuntimeError,
                      "view(): storage offset is not aligned to the target element size");
         }
-        new_offset = impl_->storage_offset() / static_cast<size_t>(ratio);
+        new_offset = static_cast<size_t>(old_offset / ratio);
     }
 
     Tensor out = Tensor(impl_->storage(), new_sizes, new_strides, dtype, new_offset);
