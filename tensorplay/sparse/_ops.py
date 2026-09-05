@@ -98,7 +98,7 @@ def _grouped_softmax(input, dim, dtype, log):
 
     ndim = input.dim()
     sparse_dim = input.sparse_dim()
-    dim = dim % ndim if dim < 0 else dim
+    dim = dim + ndim if dim < 0 else dim
     if not 0 <= dim < ndim:
         raise IndexError(f"dimension {dim} out of range for {ndim}-D input")
 
