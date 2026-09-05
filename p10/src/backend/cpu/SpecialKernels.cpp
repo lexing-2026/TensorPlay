@@ -88,6 +88,10 @@ Tensor float_math_kernel(const Tensor& self, F f, const char* name) {
 
 template <typename F>  // F: (double,double) -> double
 Tensor binary_float_kernel(const Tensor& a_in, const Tensor& b_in, F f, const char* name) {
+    if (a_in.device() != b_in.device()) {
+        TP_THROW(DeviceMismatchError, name,
+                 ": inputs must be on the same device");
+    }
     std::vector<int64_t> out_shape = broadcast_shapes(
         static_cast<std::vector<int64_t>>(a_in.shape()),
         static_cast<std::vector<int64_t>>(b_in.shape()));
