@@ -365,8 +365,31 @@ Tensor& normal_kernel_cuda(Tensor& self, double mean, double std,
             [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal2_double(state); },
             [mean, std] __device__ (double rand) { return mean + std * rand; },
             std::move(generator));
+    } else if (self.dtype() == DType::Float16) {
+        Half* data = self.data_ptr<Half>();
+        const float mu = static_cast<float>(mean);
+        const float sigma = static_cast<float>(std);
+        distribution_nullary_kernel<Half, float4, 4>(
+            data, n,
+            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
+            [mu, sigma] __device__ (float rand) {
+                return static_cast<Half>(mu + sigma * rand);
+            },
+            std::move(generator));
+    } else if (self.dtype() == DType::BFloat16) {
+        BFloat16* data = self.data_ptr<BFloat16>();
+        const float mu = static_cast<float>(mean);
+        const float sigma = static_cast<float>(std);
+        distribution_nullary_kernel<BFloat16, float4, 4>(
+            data, n,
+            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
+            [mu, sigma] __device__ (float rand) {
+                return static_cast<BFloat16>(mu + sigma * rand);
+            },
+            std::move(generator));
     } else {
-        TP_THROW(NotImplementedError, "normal_() only supports Float32/Float64 on CUDA for now");
+        TP_THROW(NotImplementedError,
+                 "normal_() only supports floating dtypes on CUDA");
     }
     return self;
 }
