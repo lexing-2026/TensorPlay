@@ -199,7 +199,6 @@ Tensor diag_cpu(const Tensor& self, int64_t diagonal) {
 }
 
 Tensor diag_embed_cpu(const Tensor& self, int64_t offset, int64_t dim1_, int64_t dim2_) {
-    // diag_embed: new dims filled with the input's diagonal values.
     int64_t nDims = self.dim() + 1;
     int64_t dim1 = wrap_dim(dim1_, nDims);
     int64_t dim2 = wrap_dim(dim2_, nDims);
@@ -212,47 +211,7 @@ Tensor diag_embed_cpu(const Tensor& self, int64_t offset, int64_t dim1_, int64_t
     sizes.insert(sizes.begin() + std::min(dim1, dim2), new_dim_len);
     sizes.insert(sizes.begin() + std::max(dim1, dim2), new_dim_len);
     Tensor result = Tensor::zeros(sizes, self.dtype(), self.device());
-    int64_t n = self.numel();
-    int64_t last = self.size(-1);
-    Tensor sc = self.contiguous();
-    int64_t rows = new_dim_len, cols = new_dim_len;
-    int64_t mid = std::max(dim1, dim2);
-    int64_t lowdim = std::min(dim1, dim2);
-    // iterate self elements: coords (..., t); place at (i=t or t-offset, j=t+offset or t)
-    parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
-        std::vector<int64_t> cs(sizes.size(), 0);
-        for (int64_t li = b; li < e; ++li) {
-            // decode self linear index against self sizes (= sizes minus inserted dims)
-            int64_t rem = li;
-            std::vector<int64_t> self_coords(self.dim(), 0);
-            for (int64_t d2 = static_cast<int64_t>(self.dim()) - 1; d2 >= 0; --d2) {
-                self_coords[d2] = rem % self.size(d2);
-                rem /= self.size(d2);
-            }
-            int64_t t = self_coords.back();
-            int64_t i = offset >= 0 ? t : t - offset;
-            int64_t j = offset >= 0 ? t + offset : t;
-            // build result coords: insert i at lowdim, j at highdim among remaining
-            std::vector<int64_t> rc(sizes.size(), 0);
-            int64_t sk = 0;
-            for (int64_t d2 = 0; d2 < static_cast<int64_t>(sizes.size()); ++d2) {
-                if (d2 == lowdim) { rc[d2] = i; }
-                else if (d2 == mid) { rc[d2] = j; }
-                else { rc[d2] = (sk < static_cast<int64_t>(self_coords.size()) - 1) ? self_coords[sk] : 0; ++sk; }
-            }
-            int64_t lin = 0;
-            for (int64_t d2 = 0; d2 < static_cast<int64_t>(sizes.size()); ++d2)
-                lin = lin * sizes[d2] + rc[d2];
-            switch (self.dtype()) {
-#define TP_DE_WRITE(ctype, name_) \
-    case DType::name_: reinterpret_cast<ctype*>(result.data_ptr())[lin] = reinterpret_cast<const ctype*>(sc.data_ptr())[li]; break;
-                TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_DE_WRITE)
-#undef TP_DE_WRITE
-                default: break;
-            }
-            (void)rows; (void)cols;
-        }
-    });
+    result.diagonal(offset, dim1, dim2).copy_(self);
     return result;
 }
 
