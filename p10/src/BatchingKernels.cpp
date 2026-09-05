@@ -85,33 +85,67 @@ std::vector<int64_t> logical_shape(const Operand& operand) {
     return physical;
 }
 
-std::pair<Tensor, Tensor> aligned_values(const Operand& left,
-                                         const Operand& right,
-                                         int64_t& level) {
-    const Operand* mapped = left.bdim.has_value() ? &left : &right;
-    if (!mapped->bdim.has_value()) {
-        TP_THROW(RuntimeError, "binary batch rule received no mapped operand");
+// Unwrap an operand only when it is batched at `level`; tensors batched at
+// other levels keep their wrapper, so their public shape hides their own
+// batch dim and the underlying operator re-dispatches through their level.
+Operand operand_at_level(const Tensor& input, int64_t level) {
+    if (!input.is_batched() || input.batch_level() != level) {
+        return {input, std::nullopt, -1};
     }
-    level = mapped->level;
-    const Layer& layer = layer_for(level);
-    const int64_t batch_size = layer.batch_size;
-    Tensor left_value;
-    Tensor right_value;
-    if (left.bdim.has_value()) {
-        left_value = move_to_front(left.value, *left.bdim);
+    auto unwrapped = unwrap_at_level(input, level);
+    if (!std::get<1>(unwrapped).has_value()) {
+        TP_THROW(RuntimeError, "failed to unwrap a batch tensor");
     }
-    if (right.bdim.has_value()) {
-        right_value = move_to_front(right.value, *right.bdim);
+    return {std::get<0>(unwrapped), std::get<1>(unwrapped), level};
+}
+
+// Move the batch dim to the front and insert 1-sized dims right after it so
+// the batch-dim-free rank reaches `logical_rank`.  Only operands mapped at
+// the current level are padded; rank alignment from the right then lets the
+// underlying operator broadcast the batch dim against everything else.
+Tensor pad_to_logical_rank(const Tensor& value, int64_t bdim,
+                           int64_t logical_rank) {
+    Tensor front = move_to_front(value, bdim);
+    const int64_t logical = front.dim() - 1;
+    if (logical >= logical_rank) {
+        return front;
     }
-    if (!left.bdim.has_value()) {
-        left_value = expand_unbatched(
-            left.value, batch_size,
-            logical_shape(right));
+    std::vector<int64_t> shape;
+    shape.reserve(static_cast<size_t>(logical_rank + 1));
+    shape.push_back(front.size(0));
+    for (int64_t i = logical; i < logical_rank; ++i) {
+        shape.push_back(1);
     }
-    if (!right.bdim.has_value()) {
-        right_value = expand_unbatched(
-            right.value, batch_size,
-            logical_shape(left));
+    for (int64_t d = 1; d < front.dim(); ++d) {
+        shape.push_back(front.size(static_cast<size_t>(d)));
+    }
+    return front.view(shape);
+}
+
+// Broadcast two operands at the current level: mapped batch dims move to the
+// front, mapped operands are padded with 1s so both logical ranks match, and
+// the underlying operator performs the elementwise broadcast.  Operands
+// without a batch dim at this level — plain tensors, or tensors batched at
+// outer levels whose public shape already hides their own batch dim — pass
+// through unchanged so the operator re-dispatches through their level.
+std::pair<Tensor, Tensor> broadcast_values(const Operand& left,
+                                           const Operand& right) {
+    const int64_t left_rank = static_cast<int64_t>(left.value.dim()) -
+        (left.bdim.has_value() ? 1 : 0);
+    const int64_t right_rank = static_cast<int64_t>(right.value.dim()) -
+        (right.bdim.has_value() ? 1 : 0);
+    const int64_t max_rank = std::max(left_rank, right_rank);
+    Tensor left_value = left.bdim.has_value()
+        ? pad_to_logical_rank(left.value, *left.bdim, max_rank)
+        : left.value;
+    Tensor right_value = right.bdim.has_value()
+        ? pad_to_logical_rank(right.value, *right.bdim, max_rank)
+        : right.value;
+    if (left.bdim.has_value() && right.bdim.has_value() &&
+        left_value.size(0) != right_value.size(0)) {
+        TP_THROW(RuntimeError,
+                 "operands mapped at the same level disagree on batch size: ",
+                 left_value.size(0), " vs ", right_value.size(0));
     }
     return {std::move(left_value), std::move(right_value)};
 }
@@ -316,10 +350,21 @@ Tensor unary_impl(const Tensor& input, Function&& call) {
 template <typename Function>
 Tensor binary_impl(const Tensor& left, const Tensor& right,
                    Function&& call) {
-    Operand left_operand = unwrap_operand(left);
-    Operand right_operand = unwrap_operand(right);
-    int64_t level = -1;
-    auto values = aligned_values(left_operand, right_operand, level);
+    // Each invocation peels only the innermost mapped level; operands batched
+    // at outer levels keep their wrapper and re-dispatch through call_next,
+    // which routes them to their own level's batch rule.  The result therefore
+    // can itself still be batched at an outer level when this level's tag is
+    // attached on top of it.
+    const int64_t left_level = left.defined() && left.is_batched()
+        ? left.batch_level() : -1;
+    const int64_t right_level = right.defined() && right.is_batched()
+        ? right.batch_level() : -1;
+    const int64_t level = std::max(left_level, right_level);
+    if (level < 0) {
+        TP_THROW(RuntimeError, "binary batch rule received no mapped operand");
+    }
+    auto values = broadcast_values(operand_at_level(left, level),
+                                   operand_at_level(right, level));
     Tensor result = call(values.first, values.second);
     return make_batched(result, 0, level);
 }
@@ -790,44 +835,112 @@ Tensor stack(const std::vector<Tensor>& inputs, int64_t dim) {
     return make_batched(result, 0, aligned.second);
 }
 
+// Shared shape machinery for matmul-like rules.  Each operand unwraps only
+// at the innermost mapped level; operands batched at outer levels keep their
+// wrapper so their public shape hides their own batch dim and the matmul call
+// re-dispatches through their level.  Mapped batch dims move to the front and
+// the underlying matmul broadcasts mismatched batch extents.
+std::pair<Tensor, Tensor> matmul_values(const Tensor& left, const Tensor& right,
+                                        const Operand& a, const Operand& b) {
+    Tensor a_value = a.bdim.has_value() ? move_to_front(a.value, *a.bdim)
+                                        : left;
+    Tensor b_value = b.bdim.has_value() ? move_to_front(b.value, *b.bdim)
+                                        : right;
+    return {std::move(a_value), std::move(b_value)};
+}
+
 Tensor mm(const Tensor& left, const Tensor& right) {
-    Operand a = unwrap_operand(left);
-    Operand b = unwrap_operand(right);
-    int64_t level = -1;
-    auto values = aligned_values(a, b, level);
+    const int64_t level = std::max(
+        left.defined() && left.is_batched() ? left.batch_level() : -1,
+        right.defined() && right.is_batched() ? right.batch_level() : -1);
+    if (level < 0) {
+        TP_THROW(RuntimeError, "mm batch rule received no mapped operand");
+    }
+    Operand a = operand_at_level(left, level);
+    Operand b = operand_at_level(right, level);
+    const int64_t left_rank =
+        static_cast<int64_t>(a.value.dim()) - (a.bdim.has_value() ? 1 : 0);
+    const int64_t right_rank =
+        static_cast<int64_t>(b.value.dim()) - (b.bdim.has_value() ? 1 : 0);
+    if (left_rank != 2 || right_rank != 2) {
+        TP_THROW(RuntimeError,
+                 "Shape mismatch: Got incorrect dims for mm(a, b). a has dim ",
+                 left_rank, " and b has dim ", right_rank,
+                 " but expected them to have dim 2 and dim 2");
+    }
+    auto values = matmul_values(left, right, a, b);
     Tensor result = call_next<Tensor, const Tensor&, const Tensor&>(
-        "bmm", values.first, values.first, values.second);
+        "matmul", values.first, values.first, values.second);
     return make_batched(result, 0, level);
 }
 
 Tensor matmul(const Tensor& left, const Tensor& right) {
-    Operand a = unwrap_operand(left);
-    Operand b = unwrap_operand(right);
-    int64_t level = -1;
-    auto values = aligned_values(a, b, level);
-    const int64_t left_ndim = logical_shape(a).size();
-    const int64_t right_ndim = logical_shape(b).size();
-    if (left_ndim == 1 && right_ndim == 1) {
-        Tensor product = call_next<Tensor, const Tensor&, const Tensor&>(
-            "mul.Tensor", values.first, values.first, values.second);
-        Tensor reduced = call_next<Tensor, const Tensor&, const std::vector<int64_t>&,
-                                   bool, DType>(
-            "sum.dim_IntList", product, product,
-            std::vector<int64_t>{1}, false, DType::Undefined);
-        return make_batched(reduced, 0, level);
+    const int64_t level = std::max(
+        left.defined() && left.is_batched() ? left.batch_level() : -1,
+        right.defined() && right.is_batched() ? right.batch_level() : -1);
+    if (level < 0) {
+        TP_THROW(RuntimeError,
+                 "matmul batch rule received no mapped operand");
     }
+    Operand a = operand_at_level(left, level);
+    Operand b = operand_at_level(right, level);
+    const int64_t left_ndim =
+        static_cast<int64_t>(a.value.dim()) - (a.bdim.has_value() ? 1 : 0);
+    const int64_t right_ndim =
+        static_cast<int64_t>(b.value.dim()) - (b.bdim.has_value() ? 1 : 0);
+    if (left_ndim == 1 && right_ndim == 1) {
+        // Vector-vector product: mapped operands pair up through their batch
+        // dims; an unmapped operand contracts against the transposed other.
+        auto values = matmul_values(left, right, a, b);
+        Tensor result;
+        if (a.bdim.has_value() && b.bdim.has_value()) {
+            Tensor a_col = call_next<Tensor, const Tensor&, int64_t>(
+                "unsqueeze", values.first, values.first, -2);
+            Tensor b_row = call_next<Tensor, const Tensor&, int64_t>(
+                "unsqueeze", values.second, values.second, -1);
+            Tensor product = call_next<Tensor, const Tensor&, const Tensor&>(
+                "matmul", a_col, a_col, b_row);
+            Tensor first = call_next<Tensor, const Tensor&, int64_t>(
+                "squeeze.dim", product, product, -1);
+            result = call_next<Tensor, const Tensor&, int64_t>(
+                "squeeze.dim", first, first, -1);
+        } else {
+            Tensor b_transposed = call_next<Tensor, const Tensor&, int64_t,
+                                            int64_t>(
+                "transpose", values.second, values.second, 0, 1);
+            result = call_next<Tensor, const Tensor&, const Tensor&>(
+                "matmul", values.first, values.first, b_transposed);
+        }
+        return make_batched(result, 0, level);
+    }
+    auto values = matmul_values(left, right, a, b);
     Tensor result = call_next<Tensor, const Tensor&, const Tensor&>(
         "matmul", values.first, values.first, values.second);
     return make_batched(result, 0, level);
 }
 
 Tensor bmm(const Tensor& left, const Tensor& right) {
-    Operand a = unwrap_operand(left);
-    Operand b = unwrap_operand(right);
-    int64_t level = -1;
-    auto values = aligned_values(a, b, level);
+    const int64_t level = std::max(
+        left.defined() && left.is_batched() ? left.batch_level() : -1,
+        right.defined() && right.is_batched() ? right.batch_level() : -1);
+    if (level < 0) {
+        TP_THROW(RuntimeError, "bmm batch rule received no mapped operand");
+    }
+    Operand a = operand_at_level(left, level);
+    Operand b = operand_at_level(right, level);
+    const int64_t left_rank =
+        static_cast<int64_t>(a.value.dim()) - (a.bdim.has_value() ? 1 : 0);
+    const int64_t right_rank =
+        static_cast<int64_t>(b.value.dim()) - (b.bdim.has_value() ? 1 : 0);
+    if (left_rank != 3 || right_rank != 3) {
+        TP_THROW(RuntimeError,
+                 "Shape mismatch: Got incorrect dims for bmm(a, b). "
+                 "a has dim ", left_rank, " and b has dim ", right_rank,
+                 " but expected them to have dim 3 and dim 3");
+    }
+    auto values = matmul_values(left, right, a, b);
     Tensor result = call_next<Tensor, const Tensor&, const Tensor&>(
-        "bmm", values.first, values.first, values.second);
+        "matmul", values.first, values.first, values.second);
     return make_batched(result, 0, level);
 }
 
@@ -932,6 +1045,7 @@ namespace {
 
 using namespace tensorplay;
 using namespace tensorplay::transform::batch;
+using tensorplay::transform::make_batched;
 
 #define TP_BATCH_UNARY(NAME, OP) \
     Tensor NAME(const Tensor& input) { return unary(OP, input); }
@@ -1132,6 +1246,319 @@ Tensor batch_randn_like(const Tensor& input, DType dtype,
     return randn_like(input, dtype, device);
 }
 
+// ---------------------------------------------------------------------------
+// Comparison predicates.
+// ---------------------------------------------------------------------------
+
+#define TP_BATCH_PREDICATE_TENSOR(NAME, OP) \
+    Tensor NAME(const Tensor& left, const Tensor& right) { return binary(OP, left, right); }
+#define TP_BATCH_PREDICATE_SCALAR(NAME, OP) \
+    Tensor NAME(const Tensor& input, Scalar value) { return scalar(OP, input, value); }
+
+TP_BATCH_PREDICATE_TENSOR(batch_eq_tensor, "eq.Tensor")
+TP_BATCH_PREDICATE_TENSOR(batch_ne_tensor, "ne.Tensor")
+TP_BATCH_PREDICATE_TENSOR(batch_lt_tensor, "lt.Tensor")
+TP_BATCH_PREDICATE_TENSOR(batch_le_tensor, "le.Tensor")
+TP_BATCH_PREDICATE_TENSOR(batch_gt_tensor, "gt.Tensor")
+TP_BATCH_PREDICATE_TENSOR(batch_ge_tensor, "ge.Tensor")
+TP_BATCH_PREDICATE_SCALAR(batch_eq_scalar, "eq.Scalar")
+TP_BATCH_PREDICATE_SCALAR(batch_ne_scalar, "ne.Scalar")
+TP_BATCH_PREDICATE_SCALAR(batch_lt_scalar, "lt.Scalar")
+TP_BATCH_PREDICATE_SCALAR(batch_le_scalar, "le.Scalar")
+TP_BATCH_PREDICATE_SCALAR(batch_gt_scalar, "gt.Scalar")
+TP_BATCH_PREDICATE_SCALAR(batch_ge_scalar, "ge.Scalar")
+
+// ---------------------------------------------------------------------------
+// where: every overload maps the tensor operands onto the batch dimension.
+// ---------------------------------------------------------------------------
+
+Tensor batch_where_self(const Tensor& condition, const Tensor& self,
+                        const Tensor& other) {
+    auto aligned = align_tensor_list({condition, self, other});
+    Tensor result = call_next<Tensor, const Tensor&, const Tensor&, const Tensor&>(
+        "where.self", aligned.first[0], aligned.first[0], aligned.first[1],
+        aligned.first[2]);
+    return make_batched(result, 0, aligned.second);
+}
+
+Tensor batch_where_scalar_self(const Tensor& condition, Scalar self,
+                               const Tensor& other) {
+    auto aligned = align_tensor_list({condition, other});
+    Tensor result = call_next<Tensor, const Tensor&, Scalar, const Tensor&>(
+        "where.ScalarSelf", aligned.first[0], aligned.first[0], self,
+        aligned.first[1]);
+    return make_batched(result, 0, aligned.second);
+}
+
+Tensor batch_where_scalar_other(const Tensor& condition, const Tensor& self,
+                                Scalar other) {
+    auto aligned = align_tensor_list({condition, self});
+    Tensor result = call_next<Tensor, const Tensor&, const Tensor&, Scalar>(
+        "where.ScalarOther", aligned.first[0], aligned.first[0],
+        aligned.first[1], other);
+    return make_batched(result, 0, aligned.second);
+}
+
+Tensor batch_where_scalar(const Tensor& condition, Scalar self, Scalar other) {
+    return unary_impl(condition, [&](const Tensor& value) {
+        return call_next<Tensor, const Tensor&, Scalar, Scalar>(
+            "where.Scalar", value, value, self, other);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Elementwise and reduction rules.  Dim-taking ops shift the public dim past
+// the batch dimension and keep (or re-locate) the batch dimension on the
+// output, mirroring the shape rules of sum_dim above.
+// ---------------------------------------------------------------------------
+
+Tensor batch_clamp(const Tensor& input, std::optional<Scalar> min,
+                   std::optional<Scalar> max) {
+    return unary_impl(input, [&](const Tensor& value) {
+        return call_next<Tensor, const Tensor&, std::optional<Scalar>,
+                         std::optional<Scalar>>("clamp", value, value, min, max);
+    });
+}
+
+Tensor batch_cumsum(const Tensor& input, int64_t dim,
+                    std::optional<DType> dtype) {
+    Operand operand = unwrap_operand(input);
+    const int64_t public_dim = normalize_dim(dim, input.dim());
+    const int64_t actual =
+        public_dim < *operand.bdim ? public_dim : public_dim + 1;
+    Tensor result = call_next<Tensor, const Tensor&, int64_t, std::optional<DType>>(
+        "cumsum", operand.value, operand.value, actual, dtype);
+    return make_batched(result, *operand.bdim, operand.level);
+}
+
+Tensor batch_logsumexp(const Tensor& input, int64_t dim, bool keepdim) {
+    Operand operand = unwrap_operand(input);
+    const int64_t public_dim = normalize_dim(dim, input.dim());
+    const int64_t actual =
+        public_dim < *operand.bdim ? public_dim : public_dim + 1;
+    Tensor result = call_next<Tensor, const Tensor&, int64_t, bool>(
+        "logsumexp", operand.value, operand.value, actual, keepdim);
+    const int64_t result_bdim =
+        keepdim ? *operand.bdim
+                : (actual < *operand.bdim ? *operand.bdim - 1 : *operand.bdim);
+    return make_batched(result, result_bdim, operand.level);
+}
+
+Tensor batch_all_dim(const Tensor& input, int64_t dim, bool keepdim) {
+    Operand operand = unwrap_operand(input);
+    const int64_t public_dim = normalize_dim(dim, input.dim());
+    const int64_t actual =
+        public_dim < *operand.bdim ? public_dim : public_dim + 1;
+    Tensor result = call_next<Tensor, const Tensor&, int64_t, bool>(
+        "all.dim", operand.value, operand.value, actual, keepdim);
+    const int64_t result_bdim =
+        keepdim ? *operand.bdim
+                : (actual < *operand.bdim ? *operand.bdim - 1 : *operand.bdim);
+    return make_batched(result, result_bdim, operand.level);
+}
+
+std::tuple<Tensor, Tensor> batch_max_dim(const Tensor& input, int64_t dim,
+                                         bool keepdim) {
+    Operand operand = unwrap_operand(input);
+    const int64_t public_dim = normalize_dim(dim, input.dim());
+    const int64_t actual =
+        public_dim < *operand.bdim ? public_dim : public_dim + 1;
+    auto result =
+        call_next<std::tuple<Tensor, Tensor>, const Tensor&, int64_t, bool>(
+            "max.dim", operand.value, operand.value, actual, keepdim);
+    const int64_t result_bdim =
+        keepdim ? *operand.bdim
+                : (actual < *operand.bdim ? *operand.bdim - 1 : *operand.bdim);
+    return std::make_tuple(
+        make_batched(std::get<0>(result), result_bdim, operand.level),
+        make_batched(std::get<1>(result), result_bdim, operand.level));
+}
+
+Tensor batch_argsort(const Tensor& input, int64_t dim, bool descending) {
+    Operand operand = unwrap_operand(input);
+    const int64_t public_dim = normalize_dim(dim, input.dim());
+    const int64_t actual =
+        public_dim < *operand.bdim ? public_dim : public_dim + 1;
+    Tensor result = call_next<Tensor, const Tensor&, int64_t, bool>(
+        "argsort", operand.value, operand.value, actual, descending);
+    return make_batched(result, *operand.bdim, operand.level);
+}
+
+Tensor batch_argsort_stable(const Tensor& input, bool stable, int64_t dim,
+                            bool descending) {
+    Operand operand = unwrap_operand(input);
+    const int64_t public_dim = normalize_dim(dim, input.dim());
+    const int64_t actual =
+        public_dim < *operand.bdim ? public_dim : public_dim + 1;
+    Tensor result = call_next<Tensor, const Tensor&, bool, int64_t, bool>(
+        "argsort.stable", operand.value, operand.value, stable, actual,
+        descending);
+    return make_batched(result, *operand.bdim, operand.level);
+}
+
+Tensor batch_gather(const Tensor& input, int64_t dim, const Tensor& index) {
+    if (index.is_batched()) {
+        TP_THROW(NotImplementedError,
+                 "gather with a mapped index requires an index batch rule");
+    }
+    Operand operand = unwrap_operand(input);
+    const int64_t public_dim = normalize_dim(dim, input.dim());
+    const int64_t actual =
+        public_dim < *operand.bdim ? public_dim : public_dim + 1;
+    Tensor result = call_next<Tensor, const Tensor&, int64_t, const Tensor&>(
+        "gather", operand.value, operand.value, actual, index);
+    return make_batched(result, *operand.bdim, operand.level);
+}
+
+Tensor batch_repeat_interleave_self_int(const Tensor& input, int64_t repeats,
+                                        std::optional<int64_t> dim,
+                                        std::optional<int64_t> output_size) {
+    if (!dim.has_value()) {
+        TP_THROW(NotImplementedError,
+                 "repeat_interleave without dim requires a flatten batch rule");
+    }
+    Operand operand = unwrap_operand(input);
+    const int64_t public_dim = normalize_dim(*dim, input.dim());
+    const int64_t actual =
+        public_dim < *operand.bdim ? public_dim : public_dim + 1;
+    Tensor result =
+        call_next<Tensor, const Tensor&, int64_t, std::optional<int64_t>,
+                  std::optional<int64_t>>(
+            "repeat_interleave.self_int", operand.value, operand.value,
+            repeats, actual, output_size);
+    return make_batched(result, *operand.bdim, operand.level);
+}
+
+Tensor batch_to_dtype(const Tensor& input, DType dtype, bool non_blocking,
+                      bool copy, std::optional<int64_t> memory_format) {
+    return unary_impl(input, [&](const Tensor& value) {
+        return call_next<Tensor, const Tensor&, DType, bool, bool,
+                         std::optional<int64_t>>(
+            "to.dtype", value, value, dtype, non_blocking, copy, memory_format);
+    });
+}
+
+Tensor batch_tril(const Tensor& input, int64_t diagonal) {
+    return unary_impl(input, [&](const Tensor& value) {
+        return call_next<Tensor, const Tensor&, int64_t>(
+            "tril", value, value, diagonal);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Factory-with-like-input rules: new_zeros/new_ones take the logical shape
+// from the caller and gain a fresh batch dimension.
+// ---------------------------------------------------------------------------
+
+Tensor batch_new_like(const char* factory, const Tensor& self,
+                      const std::vector<int64_t>& size,
+                      std::optional<DType> dtype,
+                      std::optional<int64_t> layout,
+                      std::optional<Device> device,
+                      std::optional<bool> pin_memory) {
+    (void)layout;
+    Operand operand = unwrap_operand(self);
+    const DType out_dtype =
+        dtype.has_value() && *dtype != DType::Undefined ? *dtype : self.dtype();
+    const Device out_device = device.has_value() ? *device : self.device();
+    Tensor result =
+        call_device<Tensor, const std::vector<int64_t>&, std::optional<DType>,
+                    std::optional<Device>, bool>(
+            factory, out_device, size, out_dtype, out_device,
+            pin_memory.value_or(false));
+    if (!operand.bdim.has_value()) {
+        return result;
+    }
+    return make_batched(result, 0, operand.level);
+}
+
+Tensor batch_new_zeros(const Tensor& self, const std::vector<int64_t>& size,
+                       std::optional<DType> dtype, std::optional<int64_t> layout,
+                       std::optional<Device> device,
+                       std::optional<bool> pin_memory) {
+    return batch_new_like("zeros", self, size, dtype, layout, device,
+                          pin_memory);
+}
+
+Tensor batch_new_ones(const Tensor& self, const std::vector<int64_t>& size,
+                      std::optional<DType> dtype, std::optional<int64_t> layout,
+                      std::optional<Device> device,
+                      std::optional<bool> pin_memory) {
+    return batch_new_like("ones", self, size, dtype, layout, device,
+                          pin_memory);
+}
+
+// ---------------------------------------------------------------------------
+// Advanced indexing: align the indexed tensor with every present index
+// tensor (and the assigned values for index_put_) so each batch element
+// gathers with its own indices.
+// ---------------------------------------------------------------------------
+
+std::vector<Tensor> index_present_tensors(
+    const std::vector<std::optional<Tensor>>& indices) {
+    std::vector<Tensor> present;
+    present.reserve(indices.size());
+    for (const auto& index : indices) {
+        if (index.has_value()) present.push_back(*index);
+    }
+    return present;
+}
+
+std::vector<std::optional<Tensor>> index_aligned_slots(
+    const std::vector<std::optional<Tensor>>& indices,
+    const std::vector<Tensor>& aligned, size_t aligned_count) {
+    // `aligned` holds the aligned form of every present index in order; walk
+    // the original slots and reinsert them positionally.
+    std::vector<std::optional<Tensor>> slots;
+    slots.reserve(indices.size());
+    size_t next = 0;
+    for (const auto& index : indices) {
+        if (index.has_value() && next < aligned_count) {
+            slots.push_back(aligned[next]);
+            ++next;
+        } else {
+            slots.push_back(std::nullopt);
+        }
+    }
+    return slots;
+}
+
+Tensor batch_index(const Tensor& self,
+                   const std::vector<std::optional<Tensor>>& indices) {
+    std::vector<Tensor> operands;
+    operands.push_back(self);
+    for (const Tensor& index : index_present_tensors(indices)) {
+        operands.push_back(index);
+    }
+    auto aligned = align_tensor_list(operands);
+    std::vector<std::optional<Tensor>> aligned_indices = index_aligned_slots(
+        indices, aligned.first, aligned.first.size());
+    Tensor result = call_next<Tensor, const Tensor&,
+                              const std::vector<std::optional<Tensor>>&>(
+        "index.Tensor", aligned.first[0], aligned.first[0], aligned_indices);
+    return make_batched(result, 0, aligned.second);
+}
+
+Tensor batch_index_put_(Tensor self,
+                        const std::vector<std::optional<Tensor>>& indices,
+                        const Tensor& values, bool accumulate) {
+    std::vector<Tensor> operands;
+    operands.push_back(self);
+    for (const Tensor& index : index_present_tensors(indices)) {
+        operands.push_back(index);
+    }
+    operands.push_back(values);
+    auto aligned = align_tensor_list(operands);
+    std::vector<std::optional<Tensor>> aligned_indices = index_aligned_slots(
+        indices, aligned.first, aligned.first.size());
+    Tensor result = call_next<Tensor, Tensor&,
+                              const std::vector<std::optional<Tensor>>&,
+                              const Tensor&, bool>(
+        "index_put_", aligned.first[0], aligned.first[0], aligned_indices,
+        aligned.first.back(), accumulate);
+    return make_batched(result, 0, aligned.second);
+}
+
 void register_batch_rules(tensorplay::Library& library) {
     library.impl("neg", &batch_neg);
     library.impl("negative", &batch_negative);
@@ -1216,6 +1643,37 @@ void register_batch_rules(tensorplay::Library& library) {
     library.impl("rand_like", &batch_rand_like);
     library.impl("randint_like", &batch_randint_like);
     library.impl("randn_like", &batch_randn_like);
+    library.impl("eq.Tensor", &batch_eq_tensor);
+    library.impl("ne.Tensor", &batch_ne_tensor);
+    library.impl("lt.Tensor", &batch_lt_tensor);
+    library.impl("le.Tensor", &batch_le_tensor);
+    library.impl("gt.Tensor", &batch_gt_tensor);
+    library.impl("ge.Tensor", &batch_ge_tensor);
+    library.impl("eq.Scalar", &batch_eq_scalar);
+    library.impl("ne.Scalar", &batch_ne_scalar);
+    library.impl("lt.Scalar", &batch_lt_scalar);
+    library.impl("le.Scalar", &batch_le_scalar);
+    library.impl("gt.Scalar", &batch_gt_scalar);
+    library.impl("ge.Scalar", &batch_ge_scalar);
+    library.impl("where.self", &batch_where_self);
+    library.impl("where.ScalarSelf", &batch_where_scalar_self);
+    library.impl("where.ScalarOther", &batch_where_scalar_other);
+    library.impl("where.Scalar", &batch_where_scalar);
+    library.impl("clamp", &batch_clamp);
+    library.impl("cumsum", &batch_cumsum);
+    library.impl("logsumexp", &batch_logsumexp);
+    library.impl("all.dim", &batch_all_dim);
+    library.impl("max.dim", &batch_max_dim);
+    library.impl("argsort", &batch_argsort);
+    library.impl("argsort.stable", &batch_argsort_stable);
+    library.impl("gather", &batch_gather);
+    library.impl("repeat_interleave.self_int", &batch_repeat_interleave_self_int);
+    library.impl("to.dtype", &batch_to_dtype);
+    library.impl("tril", &batch_tril);
+    library.impl("new_zeros", &batch_new_zeros);
+    library.impl("new_ones", &batch_new_ones);
+    library.impl("index.Tensor", &batch_index);
+    library.impl("index_put_", &batch_index_put_);
 }
 
 } // namespace

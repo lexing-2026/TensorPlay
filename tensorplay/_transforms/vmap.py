@@ -196,7 +196,6 @@ def _unwrap_batched(
 ) -> Any:
     """Remove one native level and place its dimension at the public index."""
 
-    del batch_size
     _check_out_dims_is_int_or_int_pytree(out_dims, func)
     flat_outputs, output_spec = tree_flatten(outputs)
     flat_out_dims = _flat_output_dims(outputs, out_dims, output_spec)
@@ -219,12 +218,21 @@ def _unwrap_batched(
 
         unwrapped, batch_dim = tensorplay._C._transform_unwrap(output, level)
         if batch_dim is None:
-            if out_dim is not None:
+            if out_dim is None:
+                rebuilt.append(unwrapped)
+                continue
+            # The output carries no tag for the current layer: it is a
+            # per-sample constant, so re-materialize the batch dimension by
+            # unit-expansion at the requested position.
+            target_dim = out_dim if out_dim >= 0 else out_dim + unwrapped.dim() + 1
+            if target_dim < 0 or target_dim > unwrapped.dim():
                 raise ValueError(
-                    f"vmap({_get_name(func)}, ...): output did not carry the "
-                    "current mapped dimension"
+                    f"vmap({_get_name(func)}, ...): out_dim={out_dim} is out of range "
+                    f"for an unbatched output with {unwrapped.dim()} dimensions"
                 )
-            rebuilt.append(unwrapped)
+            shape = list(unwrapped.shape)
+            shape.insert(target_dim, batch_size)
+            rebuilt.append(unwrapped.unsqueeze(target_dim).expand(shape))
             continue
         if out_dim is None:
             raise ValueError(
