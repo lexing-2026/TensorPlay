@@ -4,14 +4,18 @@ import runpy
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-audit_package = runpy.run_path(
-    str(ROOT / "tools" / "audit_python_package.py")
-)["audit_package"]
+_audit_namespace = runpy.run_path(str(ROOT / "tools" / "audit_python_package.py"))
+audit_package = _audit_namespace["audit_package"]
+module_names = _audit_namespace["_module_names"]
 
 
 class TestPythonPackage(unittest.TestCase):
     def test_package_layout_and_exports(self):
         self.assertEqual(audit_package(ROOT / "tensorplay"), [])
+
+    def test_exports_do_not_use_function_locals(self):
+        tree = ast.parse("def build():\n    hidden = 1\n")
+        self.assertNotIn("hidden", module_names(tree))
 
     def test_future_controls_have_public_functions(self):
         path = ROOT / "tensorplay" / "__future__.py"
