@@ -1,5 +1,6 @@
 #include "StaxPointwise.h"
 #include "Parallel.h"
+#include "Macros.h"
 #include "cpu/vec/vec.h"
 
 #include <algorithm>
@@ -72,7 +73,7 @@ void prepare_program(
 }
 
 template <typename Vec>
-__attribute__((always_inline)) inline void eval_program_cached(
+TP_ALWAYS_INLINE void eval_program_cached(
     const Vec* input_values,
     const StaxPointwiseInstruction* instructions,
     const Vec* constant_values,
