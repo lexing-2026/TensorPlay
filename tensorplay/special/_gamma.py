@@ -1,5 +1,6 @@
 """Gamma-family functions: log-gamma, poly-gamma and the incomplete gammas."""
 import math
+import operator
 
 from tensorplay import digamma, gammainc, gammaincc, lgamma, zeta
 
@@ -27,18 +28,29 @@ def psi(input):
     return digamma(input)
 
 
+def _as_integer(value, name):
+    if hasattr(value, "item"):
+        value = value.item()
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be an integer")
+    try:
+        return operator.index(value)
+    except TypeError as error:
+        raise TypeError(f"{name} must be an integer") from error
+
+
 def polygamma(n, input):
     r"""Polygamma of order :attr:`n`: :math:`\psi^{(n)}(x)` (native kernel)."""
     from tensorplay import polygamma as _native
-    order = int(n.item()) if hasattr(n, "item") else int(n)
+    order = _as_integer(n, "n")
     return _native(order, input)
 
 
 def multigammaln(input, p):
-    """Multivariate log-gamma with dimension :attr:`p` (p >= 2)."""
-    p = int(p)
-    if p < 2:
-        raise ValueError(f"p must be >= 2, got {p}")
+    """Multivariate log-gamma with dimension :attr:`p` (p >= 1)."""
+    p = _as_integer(p, "p")
+    if p < 1:
+        raise ValueError(f"p must be >= 1, got {p}")
     res = lgamma(input)
     j = 1.0
     for _ in range(1, p):

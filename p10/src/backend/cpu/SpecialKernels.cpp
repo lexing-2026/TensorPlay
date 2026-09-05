@@ -289,6 +289,18 @@ Tensor gammaincc_cpu(const Tensor& a, const Tensor& x) {
     }, "gammaincc");
 }
 Tensor polygamma_cpu(int64_t n, const Tensor& x) {
+    if (n < 0) {
+        TP_THROW(RuntimeError, "polygamma(n, x) does not support negative n");
+    }
+    if (n > std::numeric_limits<int>::max()) {
+        TP_THROW(RuntimeError, "polygamma order is too large: ", n);
+    }
+    if (n == 0) {
+        return float_math_kernel(x, [](double v) { return calc_digamma(v); }, "polygamma");
+    }
+    if (n == 1) {
+        return float_math_kernel(x, [](double v) { return trigamma(v); }, "polygamma");
+    }
     return float_math_kernel(x, [n](double v) {
         return calc_polygamma(v, static_cast<int>(n));
     }, "polygamma");

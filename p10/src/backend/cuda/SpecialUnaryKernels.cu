@@ -3,6 +3,7 @@
 #include <SpecialMath.h>
 
 #include <cstdint>
+#include <limits>
 
 namespace tensorplay::cuda {
 namespace {
@@ -111,11 +112,71 @@ struct EntrFn {
     template <typename T>
     __device__ T operator()(T x) const { return calc_entr(x); }
 };
+
+__device__ inline double polygamma_digamma(double x) {
+    if (x == 0.0) {
+        return ::copysign(std::numeric_limits<double>::infinity(), -x);
+    }
+    if (x < 0.0) {
+        if (x == ::trunc(x)) {
+            return ::nan("");
+        }
+        double integer_part = 0.0;
+        const double fraction = ::modf(x, &integer_part);
+        return polygamma_digamma(1.0 - x) -
+            (M_PI / ::tan(M_PI * fraction));
+    }
+    double result = 0.0;
+    while (x < 10.0) {
+        result -= 1.0 / x;
+        x += 1.0;
+    }
+    if (x == 10.0) {
+        return result + 2.25175258906672110764;
+    }
+    const double inverse = 1.0 / x;
+    const double inverse_square = inverse * inverse;
+    result += ::log(x) - 0.5 * inverse - inverse_square * (
+        1.0 / 12.0 - inverse_square * (
+            1.0 / 120.0 - inverse_square * (
+                1.0 / 252.0 - inverse_square * (
+                    1.0 / 240.0 - inverse_square / 132.0))));
+    return result;
+}
+
+__device__ inline double polygamma_trigamma(double x) {
+    double sign = 1.0;
+    double result = 0.0;
+    if (x < 0.5) {
+        sign = -1.0;
+        const double sine = ::sin(M_PI * x);
+        result -= (M_PI * M_PI) / (sine * sine);
+        x = 1.0 - x;
+    }
+    for (int i = 0; i < 6; ++i) {
+        result += 1.0 / (x * x);
+        x += 1.0;
+    }
+    const double inverse_square = 1.0 / (x * x);
+    result += (1.0 + 0.5 / x + inverse_square * (
+        1.0 / 6.0 - inverse_square * (
+            1.0 / 30.0 - inverse_square / 42.0))) / x;
+    return sign * result;
+}
+
 struct PolygammaFn {
     int n;
 
     template <typename T>
-    __device__ T operator()(T x) const { return calc_polygamma(x, n); }
+    __device__ T operator()(T x) const {
+        if (n == 0) {
+            return static_cast<T>(polygamma_digamma(static_cast<double>(x)));
+        }
+        if (n == 1) {
+            return static_cast<T>(polygamma_trigamma(static_cast<double>(x)));
+        }
+        return calc_polygamma(x, n);
+    }
 };
 
 template <typename T>
@@ -191,6 +252,12 @@ Tensor entr_cuda(const Tensor& self) {
     return typed_math_cuda(self, EntrFn{});
 }
 Tensor polygamma_cuda(int64_t n, const Tensor& self) {
+    if (n < 0) {
+        TP_THROW(RuntimeError, "polygamma(n, x) does not support negative n");
+    }
+    if (n > std::numeric_limits<int>::max()) {
+        TP_THROW(RuntimeError, "polygamma order is too large: ", n);
+    }
     return typed_math_cuda(self, PolygammaFn{static_cast<int>(n)});
 }
 
