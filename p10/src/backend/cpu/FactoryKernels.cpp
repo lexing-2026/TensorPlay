@@ -467,33 +467,59 @@ Tensor randint_kernel(int64_t low, int64_t high, const std::vector<int64_t>& siz
     return t;
 }
 
-Tensor randperm_kernel(int64_t n, DType dtype, Device device) {
-    Tensor t({n}, dtype, device);
-    if (dtype == DType::Int64 || dtype == DType::Int32) {
-        // one 32-bit draw modulo the remaining tail per position.
-        auto& gen = default_generator();
-        if (dtype == DType::Int64) {
-            int64_t* data = t.data_ptr<int64_t>();
-            for (int64_t i = 0; i < n; ++i) data[i] = i;
-            for (int64_t i = 0; i < n - 1; i++) {
-                int64_t z = static_cast<int64_t>(gen.random() % static_cast<uint32_t>(n - i));
-                int64_t sav = data[i];
-                data[i] = data[z + i];
-                data[z + i] = sav;
-            }
-        } else {
-            int32_t* data = t.data_ptr<int32_t>();
-            for (int64_t i = 0; i < n; ++i) data[i] = static_cast<int32_t>(i);
-            for (int64_t i = 0; i < n - 1; i++) {
-                int64_t z = static_cast<int64_t>(gen.random() % static_cast<uint32_t>(n - i));
-                int32_t sav = data[i];
-                data[i] = data[z + i];
-                data[z + i] = sav;
-            }
-        }
-    } else {
-        TP_THROW(NotImplementedError, "randperm() only supports Int64/Int32");
+void check_randperm_size(int64_t n, DType dtype) {
+    if (n < 0) {
+        TP_THROW(RuntimeError, "randperm(): n must be non-negative, got ", n);
     }
+    uint64_t max_index;
+    switch (dtype) {
+        case DType::UInt8: max_index = std::numeric_limits<uint8_t>::max(); break;
+        case DType::Int8: max_index = std::numeric_limits<int8_t>::max(); break;
+        case DType::Int16: max_index = std::numeric_limits<int16_t>::max(); break;
+        case DType::Int32: max_index = std::numeric_limits<int32_t>::max(); break;
+        case DType::UInt16: max_index = std::numeric_limits<uint16_t>::max(); break;
+        case DType::UInt32: max_index = std::numeric_limits<uint32_t>::max(); break;
+        case DType::Float16: max_index = uint64_t{1} << 11; break;
+        case DType::BFloat16: max_index = uint64_t{1} << 8; break;
+        case DType::Float32: max_index = uint64_t{1} << 24; break;
+        case DType::Float64: max_index = uint64_t{1} << 53; break;
+        case DType::Bool: max_index = 1; break;
+        case DType::Int64:
+        case DType::UInt64:
+            return;
+        default:
+            TP_THROW(NotImplementedError,
+                     "randperm() does not support this output dtype");
+    }
+    if (static_cast<uint64_t>(n) > max_index + 1) {
+        TP_THROW(RuntimeError,
+                 "randperm(): n is too large for the requested output dtype");
+    }
+}
+
+Tensor randperm_kernel(int64_t n, DType dtype, Device device) {
+    check_randperm_size(n, dtype);
+    Tensor t({n}, dtype, device);
+    if (n == 0) return t;
+
+    auto& gen = default_generator();
+    distribution::dispatch_dtype(dtype, [&](auto tag) {
+        using scalar_t = decltype(tag);
+        scalar_t* data = t.data_ptr<scalar_t>();
+        for (int64_t i = 0; i < n; ++i) {
+            data[i] = static_cast<scalar_t>(i);
+        }
+        for (int64_t i = 0; i < n - 1; ++i) {
+            const uint64_t tail = static_cast<uint64_t>(n - i);
+            const uint64_t draw = tail >= (1ULL << 32)
+                ? gen.random64()
+                : static_cast<uint64_t>(gen.random());
+            const int64_t z = static_cast<int64_t>(draw % tail);
+            scalar_t save = data[i];
+            data[i] = data[z + i];
+            data[z + i] = save;
+        }
+    });
     return t;
 }
 
