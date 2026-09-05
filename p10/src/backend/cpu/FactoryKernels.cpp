@@ -450,7 +450,8 @@ Tensor randint_kernel(int64_t low, int64_t high, const std::vector<int64_t>& siz
 
     Tensor t(size, dtype, device);
     auto& gen = default_generator();
-    const uint64_t range = static_cast<uint64_t>(high - low);
+    const uint64_t range = static_cast<uint64_t>(high) -
+        static_cast<uint64_t>(low);
     const int64_t base = low;
 
     distribution::check_random_from_to_bounds(low, high, dtype);
