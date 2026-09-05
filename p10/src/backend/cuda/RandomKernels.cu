@@ -536,8 +536,26 @@ Tensor& geometric_kernel_cuda(Tensor& self, double p) {
             [p] __device__ (double val) {
                 return ::ceil(::log(val) / ::log1p(-p));
             });
+    } else if (self.dtype() == DType::Float16) {
+        Half* data = self.data_ptr<Half>();
+        const float pf = static_cast<float>(p);
+        distribution_nullary_kernel<Half, float4, 4>(
+            data, n,
+            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+            [pf] __device__ (float val) {
+                return static_cast<Half>(::ceilf(::logf(val) / ::log1pf(-pf)));
+            });
+    } else if (self.dtype() == DType::BFloat16) {
+        BFloat16* data = self.data_ptr<BFloat16>();
+        const float pf = static_cast<float>(p);
+        distribution_nullary_kernel<BFloat16, float4, 4>(
+            data, n,
+            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+            [pf] __device__ (float val) {
+                return static_cast<BFloat16>(::ceilf(::logf(val) / ::log1pf(-pf)));
+            });
     } else {
-        TP_THROW(NotImplementedError, "geometric_() only supports Float32/Float64 on CUDA for now");
+        TP_THROW(NotImplementedError, "geometric_() only supports floating dtypes on CUDA");
     }
     return self;
 }
@@ -566,8 +584,28 @@ Tensor& log_normal_kernel_cuda(Tensor& self, double mean, double std) {
             data, n,
             [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal2_double(state); },
             [mean, std] __device__ (double rand) { return ::exp(mean + std * rand); });
+    } else if (self.dtype() == DType::Float16) {
+        Half* data = self.data_ptr<Half>();
+        const float mu = static_cast<float>(mean);
+        const float sigma = static_cast<float>(std);
+        distribution_nullary_kernel<Half, float4, 4>(
+            data, n,
+            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
+            [mu, sigma] __device__ (float rand) {
+                return static_cast<Half>(::expf(mu + sigma * rand));
+            });
+    } else if (self.dtype() == DType::BFloat16) {
+        BFloat16* data = self.data_ptr<BFloat16>();
+        const float mu = static_cast<float>(mean);
+        const float sigma = static_cast<float>(std);
+        distribution_nullary_kernel<BFloat16, float4, 4>(
+            data, n,
+            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
+            [mu, sigma] __device__ (float rand) {
+                return static_cast<BFloat16>(::expf(mu + sigma * rand));
+            });
     } else {
-        TP_THROW(NotImplementedError, "log_normal_() only supports Float32/Float64 on CUDA for now");
+        TP_THROW(NotImplementedError, "log_normal_() only supports floating dtypes on CUDA");
     }
     return self;
 }
@@ -605,8 +643,36 @@ Tensor& cauchy_kernel_cuda(Tensor& self, double median, double sigma) {
             [median, sigma] __device__ (double val) {
                 return median + sigma * ::tan(kPi * (val - 0.5));
             });
+    } else if (self.dtype() == DType::Float16) {
+        Half* data = self.data_ptr<Half>();
+        const float med = static_cast<float>(median);
+        const float sig = static_cast<float>(sigma);
+        constexpr float kEps = std::numeric_limits<float>::epsilon();
+        distribution_nullary_kernel<Half, float4, 4>(
+            data, n,
+            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+            [med, sig] __device__ (float val) {
+                val = val > 1.f - kEps ? 1.f - kEps : val;
+                val = val < kEps ? kEps : val;
+                return static_cast<Half>(med + sig * ::tanf(
+                    3.14159265358979323846f * (val - 0.5f)));
+            });
+    } else if (self.dtype() == DType::BFloat16) {
+        BFloat16* data = self.data_ptr<BFloat16>();
+        const float med = static_cast<float>(median);
+        const float sig = static_cast<float>(sigma);
+        constexpr float kEps = std::numeric_limits<float>::epsilon();
+        distribution_nullary_kernel<BFloat16, float4, 4>(
+            data, n,
+            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+            [med, sig] __device__ (float val) {
+                val = val > 1.f - kEps ? 1.f - kEps : val;
+                val = val < kEps ? kEps : val;
+                return static_cast<BFloat16>(med + sig * ::tanf(
+                    3.14159265358979323846f * (val - 0.5f)));
+            });
     } else {
-        TP_THROW(NotImplementedError, "cauchy_() only supports Float32/Float64 on CUDA for now");
+        TP_THROW(NotImplementedError, "cauchy_() only supports floating dtypes on CUDA");
     }
     return self;
 }
