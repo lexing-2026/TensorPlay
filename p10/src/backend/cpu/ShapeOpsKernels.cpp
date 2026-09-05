@@ -11,7 +11,6 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
-#include <cstring>
 #include <limits>
 #include <optional>
 #include <string>
@@ -469,58 +468,48 @@ Tensor rot90_cpu(const Tensor& self, int64_t k, const std::vector<int64_t>& dims
 }
 
 std::vector<Tensor> meshgrid_cpu(const std::vector<Tensor>& tensors, const std::string& indexing) {
-    // along dim j; common promoted dtype; "xy" swaps the first two axes.
     size_t k = tensors.size();
-    if (k == 0) return {};
+    if (k == 0) {
+        TP_THROW(RuntimeError, "meshgrid expects a non-empty TensorList");
+    }
     if (indexing != "ij" && indexing != "xy") {
         TP_THROW(RuntimeError, "meshgrid: indexing must be 'ij' or 'xy', got " + indexing);
     }
-    std::vector<Tensor> flat;
-    flat.reserve(k);
-    for (auto& t : tensors) {
-        if (t.dim() > 1) {
-            TP_THROW(RuntimeError, "meshgrid: expected 0-D or 1-D tensors");
+    const Device& device = tensors[0].device();
+    for (size_t i = 0; i < k; ++i) {
+        const Tensor& t = tensors[i];
+        if (!(t.device() == device)) {
+            TP_THROW(RuntimeError, "meshgrid expects all tensors to have the same device");
         }
-        flat.push_back(t.contiguous());
+        if (t.dim() > 1) {
+            TP_THROW(RuntimeError,
+                     "meshgrid: expected 0-D or 1-D tensors");
+        }
     }
-    DType common = flat[0].dtype();
-    for (size_t j = 1; j < k; ++j) {
-        common = promoteTypes(common, flat[j].dtype());
+    for (size_t i = 1; i < k; ++i) {
+        if (tensors[i].dtype() != tensors[0].dtype()) {
+            TP_THROW(RuntimeError, "meshgrid expects all tensors to have the same dtype");
+        }
     }
-    for (auto& t : flat) {
-        if (t.dtype() != common) t = t.to(common);
-    }
-    // working order: "xy" builds with the first two inputs swapped
-    std::vector<Tensor> order = flat;
+    std::vector<Tensor> order(tensors.begin(), tensors.end());
     if (indexing == "xy" && k >= 2) {
         std::swap(order[0], order[1]);
     }
     std::vector<int64_t> sizes;
     sizes.reserve(k);
-    for (auto& t : order) sizes.push_back(t.dim() == 1 ? t.size(0) : 1);
-    const size_t esz = elementSize(static_cast<ScalarType>(common));
-    std::vector<Tensor> outs;
-    outs.reserve(k);
-    for (size_t j = 0; j < k; ++j) {
-        int64_t nj = sizes[j];
-        int64_t outer = 1;
-        for (size_t d = 0; d < j; ++d) outer *= sizes[d];
-        int64_t inner = 1;
-        for (size_t d = j + 1; d < k; ++d) inner *= sizes[d];
-        Tensor g = Tensor::empty(sizes, common, tensors[0].device());
-        const char* src = reinterpret_cast<const char*>(order[j].data_ptr());
-        char* dst = reinterpret_cast<char*>(g.data_ptr());
-        for (int64_t o = 0; o < outer; ++o) {
-            for (int64_t r = 0; r < nj; ++r) {
-                char* drow = dst + ((o * nj + r) * inner) * esz;
-                for (int64_t v = 0; v < inner; ++v) {
-                    std::memcpy(drow + v * esz, src + r * esz, esz);
-                }
-            }
-        }
-        outs.push_back(g);
+    for (const Tensor& t : order) sizes.push_back(t.numel());
+    std::vector<Tensor> grids;
+    grids.reserve(k);
+    std::vector<int64_t> view_shape(k, 1);
+    for (size_t i = 0; i < k; ++i) {
+        view_shape[i] = sizes[i];
+        grids.push_back(order[i].view(view_shape).expand(sizes));
+        view_shape[i] = 1;
     }
-    return outs;
+    if (indexing == "xy" && k >= 2) {
+        std::swap(grids[0], grids[1]);
+    }
+    return grids;
 }
 
 std::vector<Tensor> broadcast_tensors_cpu(const std::vector<Tensor>& tensors) {

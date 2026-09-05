@@ -14,7 +14,6 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
-#include <cstring>
 #include <limits>
 #include <optional>
 #include <string>
@@ -205,22 +204,6 @@ __global__ void broadcast_map_kernel(int64_t n, int64_t nd, const T* src, T* dst
 
 namespace {
 
-__global__ void meshgrid_coord_kernel(int64_t total, size_t k, size_t j,
-                                      const int64_t* sizes, int64_t* out) {
-    int64_t li = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; li < total; li += stride) {
-        int64_t r2 = li;
-        int64_t coord = 0;
-        for (size_t d2 = k; d2-- > 0;) {
-            coord = r2 % sizes[d2];
-            r2 /= sizes[d2];
-            if (d2 == j) break;
-        }
-        out[li] = coord;
-    }
-}
-
 template <typename T>
 __global__ void pixel_shuffle_map_kernel(int64_t n, int64_t C, int64_t H, int64_t W,
                                          int64_t r, const T* src, T* dst) {
@@ -341,8 +324,7 @@ Tensor diag_cuda(const Tensor& self, int64_t diagonal) {
 }
 
 Tensor diag_embed_cuda(const Tensor& self, int64_t offset, int64_t dim1_, int64_t dim2_) {
-    // Host-staged reference implementation for this infrequently used shape
-    // transform.
+    // Host-assisted implementation for this infrequently used shape transform.
     int64_t nDims = self.dim() + 1;
     int64_t dim1 = wrap_dim(dim1_, nDims);
     int64_t dim2 = wrap_dim(dim2_, nDims);
@@ -473,8 +455,7 @@ std::vector<Tensor> tensor_split_cuda(const Tensor& self, int64_t sections, int6
 }
 
 Tensor flip_cuda(const Tensor& self, const std::vector<int64_t>& dims) {
-    // TensorTransformations.cpp:36 flip: dim_list_to_bitset (WrapDimUtilsMulti.h)
-    // wraps with wrap_scalar=true and rejects duplicate dims.
+    // Normalize dimensions with scalar wrapping and reject duplicates.
     int64_t nd = self.dim();
     std::vector<bool> seen(nd > 0 ? nd : 1, false);
     std::vector<int64_t> h_flips(nd, 0);
@@ -517,7 +498,8 @@ Tensor flip_cuda(const Tensor& self, const std::vector<int64_t>& dims) {
 }
 
 Tensor roll_cuda(const Tensor& self, const std::vector<int64_t>& shifts, const std::vector<int64_t>& dims) {
-    // TensorTransformations.cpp:110 roll + TensorTransformations.h roll_common.
+    // A single dimension uses the direct device mapping; multiple dimensions
+    // are applied one at a time.
     if (dims.size() != 1 || shifts.size() != 1) {
         if (shifts.empty()) TP_THROW(RuntimeError, "`shifts` required");
         if (dims.empty() && shifts.size() == 1) {
@@ -575,7 +557,7 @@ Tensor roll_cuda(const Tensor& self, const std::vector<int64_t>& shifts, const s
 }
 
 Tensor rot90_cuda(const Tensor& self, int64_t k, const std::vector<int64_t>& dims) {
-    // TensorTransformations.cpp:127 rot90.
+    // Rotate by quarter turns in the plane selected by dims.
     const int64_t total_dims = self.dim();
     const int64_t total_rot_dims = static_cast<int64_t>(dims.size());
     if (total_rot_dims != 2) {
@@ -616,28 +598,48 @@ Tensor rot90_cuda(const Tensor& self, int64_t k, const std::vector<int64_t>& dim
 }
 
 std::vector<Tensor> meshgrid_cuda(const std::vector<Tensor>& tensors, const std::string& indexing) {
-    // ij-indexing semantics.
     size_t k = tensors.size();
-    if (k == 0) return {};
+    if (k == 0) {
+        TP_THROW(RuntimeError, "meshgrid expects a non-empty TensorList");
+    }
+    if (indexing != "ij" && indexing != "xy") {
+        TP_THROW(RuntimeError, "meshgrid: indexing must be 'ij' or 'xy', got " + indexing);
+    }
+    const Device& device = tensors[0].device();
+    for (size_t i = 0; i < k; ++i) {
+        const Tensor& t = tensors[i];
+        if (!(t.device() == device)) {
+            TP_THROW(RuntimeError, "meshgrid expects all tensors to have the same device");
+        }
+        if (t.dim() > 1) {
+            TP_THROW(RuntimeError,
+                     "meshgrid: expected 0-D or 1-D tensors");
+        }
+    }
+    for (size_t i = 1; i < k; ++i) {
+        if (tensors[i].dtype() != tensors[0].dtype()) {
+            TP_THROW(RuntimeError, "meshgrid expects all tensors to have the same dtype");
+        }
+    }
+    std::vector<Tensor> order(tensors.begin(), tensors.end());
+    if (indexing == "xy" && k >= 2) {
+        std::swap(order[0], order[1]);
+    }
     std::vector<int64_t> sizes;
     sizes.reserve(k);
-    for (auto& t : tensors) sizes.push_back(static_cast<int64_t>(t.numel()));
-    int64_t total = 1;
-    for (int64_t s2 : sizes) total *= s2;
-    Tensor d_sizes = pack_i64(sizes, tensors[0].device());
-    std::vector<Tensor> outs;
-    auto stream = getCurrentCUDAStream().stream();
-    for (size_t j = 0; j < k; ++j) {
-        Tensor g = Tensor::empty(sizes, DType::Int64, tensors[0].device());
-        if (total > 0) {
-            dim3 grid = make_grid(total), block(kThreads);
-            meshgrid_coord_kernel<<<grid, block, 0, stream>>>(
-                total, k, j, d_sizes.data_ptr<int64_t>(), g.data_ptr<int64_t>());
-            CUDA_CHECK(cudaGetLastError());
-        }
-        outs.push_back(g);
+    for (const Tensor& t : order) sizes.push_back(t.numel());
+    std::vector<Tensor> grids;
+    grids.reserve(k);
+    std::vector<int64_t> view_shape(k, 1);
+    for (size_t i = 0; i < k; ++i) {
+        view_shape[i] = sizes[i];
+        grids.push_back(order[i].view(view_shape).expand(sizes));
+        view_shape[i] = 1;
     }
-    return outs;
+    if (indexing == "xy" && k >= 2) {
+        std::swap(grids[0], grids[1]);
+    }
+    return grids;
 }
 
 std::vector<Tensor> broadcast_tensors_cuda(const std::vector<Tensor>& tensors) {
