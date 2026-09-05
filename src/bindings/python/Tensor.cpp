@@ -12,6 +12,7 @@
 #include "AccumulateGrad.h" // lazy grad_accumulator creation
 #include "Utils.h" // broadcast shape validation for indexed assignment
 #include "TypePromotion.h" // complex weak-scalar reflected-op dtype rules
+#include "ScalarOps.h" // wrapped_scalar_tensor for reflected Python scalars
 #include <mutex>
 #include <pybind11/functional.h>
 #include <algorithm>
@@ -3059,21 +3060,24 @@ void init_tensor(py::module_& m) {
         .def("__radd__", [](const Tensor& t, int64_t s) { return t.add(Scalar(s)); })
         .def("__rmul__", [](const Tensor& t, int64_t s) { return t.mul(Scalar(s)); })
         .def("__radd__", [](const Tensor& t, double s) { return t.add(Scalar(s)); })
+        // Reflected sub/div need the scalar in the left operand slot, so the
+        // scalar materializes as a wrapped 0-dim tensor on the tensor's
+        // device with its own natural dtype and rides the ordinary kernel:
+        // the wrapped-number marker keeps it out of the result dtype unless
+        // no tensor operand exists, and the CUDA kernels fold a CPU scalar
+        // into the functor instead of materializing it on device.
+        .def("__rsub__", [](const Tensor& t, int64_t s) {
+            Tensor s_t = tensorplay::native::wrapped_scalar_tensor(Scalar(s), t.device());
+            return s_t.sub(t);
+        })
         .def("__rsub__", [](const Tensor& t, double s) {
-            Tensor s_t = Tensor::full({}, Scalar(s), t.dtype(), t.device());
+            Tensor s_t = tensorplay::native::wrapped_scalar_tensor(Scalar(s), t.device());
             return s_t.sub(t);
         })
         .def("__rmul__", [](const Tensor& t, double s) { return t.mul(Scalar(s)); })
         .def("__radd__", [](const Tensor& t, std::complex<double> s) { return t.add(Scalar(s)); })
-        // Weak-scalar rule for the reflected operand's storage width:
-        // complex tensor keeps its dtype; float32 -> complex64,
-        // float64 -> complex128; integral -> complex64.
         .def("__rsub__", [](const Tensor& t, std::complex<double> s) {
-            DType sdt = isComplexType(t.dtype())
-                ? t.dtype()
-                : (isFloatingType(t.dtype()) ? promoteTypes(toComplexType(t.dtype()), DType::ComplexFloat)
-                                             : DType::ComplexFloat);
-            Tensor s_t = Tensor::full({}, Scalar(s), sdt, t.device());
+            Tensor s_t = tensorplay::native::wrapped_scalar_tensor(Scalar(s), t.device());
             return s_t.sub(t);
         })
         .def("__rmul__", [](const Tensor& t, std::complex<double> s) { return t.mul(Scalar(s)); })
@@ -3082,15 +3086,11 @@ void init_tensor(py::module_& m) {
         // convertible to complex<double>; otherwise every `1.0 / real_tensor`
         // silently promoted to complex (broke linalg.pinv et al).
         .def("__rtruediv__", [](const Tensor& t, double s) {
-            Tensor s_t = Tensor::full({}, Scalar(s), t.dtype(), t.device());
+            Tensor s_t = tensorplay::native::wrapped_scalar_tensor(Scalar(s), t.device());
             return s_t.div(t);
         })
         .def("__rtruediv__", [](const Tensor& t, std::complex<double> s) {
-            DType sdt = isComplexType(t.dtype())
-                ? t.dtype()
-                : (isFloatingType(t.dtype()) ? promoteTypes(toComplexType(t.dtype()), DType::ComplexFloat)
-                                             : DType::ComplexFloat);
-            Tensor s_t = Tensor::full({}, Scalar(s), sdt, t.device());
+            Tensor s_t = tensorplay::native::wrapped_scalar_tensor(Scalar(s), t.device());
             return s_t.div(t);
         })
         .def("__iadd__", [](Tensor& self, const Tensor& other) {
@@ -3148,7 +3148,7 @@ void init_tensor(py::module_& m) {
                                                                                                                 .def("__pow__", [](const Tensor& self, Scalar exponent) { return self.pow(exponent); }, "exponent"_a)
         .def("__pow__", [](const Tensor& self, const Tensor& exponent) { return self.pow(exponent); }, "exponent"_a)
         .def("__rpow__", [](const Tensor& self, Scalar base) {
-            Tensor base_t = Tensor::full({}, base, self.dtype(), self.device());
+            Tensor base_t = tensorplay::native::wrapped_scalar_tensor(base, self.device());
             return base_t.pow(self);
         })        // DLPack
         .def("__dlpack__", [](py::object self_obj, std::optional<int64_t> stream) {
