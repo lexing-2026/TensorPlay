@@ -25,7 +25,7 @@ class TestQuantizedDTypeSurface(unittest.TestCase):
 class TestQuantizerMetadata(unittest.TestCase):
     def test_per_tensor_roundtrip(self):
         x = tp.tensor([-1.0, 0.0, 1.0, 2.0])
-        q = tp.quantize_per_tensor(x, 0.1, 10)
+        q = tp.quantize_per_tensor(x, 0.1, 10, tp.qint8)
         self.assertEqual(q.dtype, tp.qint8)
         self.assertTrue(q.is_quantized())
         self.assertAlmostEqual(q.q_scale(), 0.1)
@@ -38,7 +38,7 @@ class TestQuantizerMetadata(unittest.TestCase):
     def test_per_channel_metadata(self):
         x = tp.tensor([[-1.0, 1.0], [2.0, -2.0]])
         q = tp.quantize_per_channel(x, tp.tensor([0.1, 0.2]),
-                                    tp.tensor([0, 10]), 0)
+                                    tp.tensor([0, 10]), 0, tp.qint8)
         self.assertTrue(q.is_quantized())
         self.assertEqual(q.qscheme(), 1)
         self.assertAlmostEqual(float(q.q_per_channel_scales()[0]), 0.1)
@@ -48,16 +48,16 @@ class TestQuantizerMetadata(unittest.TestCase):
         self.assertTrue(float((back - x).abs().max().item()) < 0.21)
 
     def test_qschemes_mismatch_errors(self):
-        q = tp.quantize_per_tensor(tp.tensor([1.0]), 0.1, 0)
+        q = tp.quantize_per_tensor(tp.tensor([1.0]), 0.1, 0, tp.qint8)
         with self.assertRaises(RuntimeError):
             q.q_per_channel_scales()
         qc = tp.quantize_per_channel(tp.tensor([[1.0]]), tp.tensor([0.1]),
-                                     tp.tensor([0]), 0)
+                                     tp.tensor([0]), 0, tp.qint8)
         with self.assertRaises(RuntimeError):
             qc.q_scale()
 
     def test_int_repr(self):
-        q = tp.quantize_per_tensor(tp.tensor([0.0, 1.0]), 0.1, 5)
+        q = tp.quantize_per_tensor(tp.tensor([0.0, 1.0]), 0.1, 5, tp.qint8)
         codes = q.int_repr()
         self.assertEqual(codes.dtype, tp.int8)
         self.assertFalse(codes.is_quantized())
@@ -76,14 +76,14 @@ class TestQuantizerMetadata(unittest.TestCase):
 
 class TestQuantizerPropagation(unittest.TestCase):
     def test_clone_and_views(self):
-        q = tp.quantize_per_tensor(tp.tensor([1.5, -2.0]), 0.5, 0)
+        q = tp.quantize_per_tensor(tp.tensor([1.5, -2.0]), 0.5, 0, tp.qint8)
         self.assertTrue(q.clone().is_quantized())
         v = q.unsqueeze(0).squeeze(0).transpose(0, 0)
         self.assertTrue(v.is_quantized())
         self.assertEqual(v.q_zero_point(), q.q_zero_point())
 
     def test_to_plain_storage(self):
-        q = tp.quantize_per_tensor(tp.tensor([1.5]), 0.5, 0)
+        q = tp.quantize_per_tensor(tp.tensor([1.5]), 0.5, 0, tp.qint8)
         raw = q.to(tp.int8)
         self.assertFalse(raw.is_quantized())
         self.assertEqual(raw.dtype, tp.int8)
@@ -97,15 +97,15 @@ class TestQuantizerPropagation(unittest.TestCase):
     def test_dequantize_passthrough(self):
         x = tp.tensor([1.0, 2.0])
         self.assertEqual(tp.dequantize(x).dtype, tp.float32)
-        q = tp.quantize_per_tensor(x, 0.5, 0)
+        q = tp.quantize_per_tensor(x, 0.5, 0, tp.qint8)
         back = tp.dequantize(q)
         self.assertTrue(float((back - x).abs().max().item()) < 0.26)
 
 
 class TestQuantizedCompute(unittest.TestCase):
     def test_quantized_add(self):
-        a = tp.quantize_per_tensor(tp.tensor([1.0]), 0.1, 0)
-        b = tp.quantize_per_tensor(tp.tensor([2.0]), 0.1, 0)
+        a = tp.quantize_per_tensor(tp.tensor([1.0]), 0.1, 0, tp.qint8)
+        b = tp.quantize_per_tensor(tp.tensor([2.0]), 0.1, 0, tp.qint8)
         s = tp.quantized_add(a, b, 0.1, 0, 0.1, 0, 0.1, 0)
         self.assertEqual(s.dtype, tp.qint8)
         self.assertTrue(s.is_quantized())
@@ -113,7 +113,7 @@ class TestQuantizedCompute(unittest.TestCase):
 
     def test_quantized_max_pool2d(self):
         q = tp.quantize_per_tensor(
-            tp.arange(16.0).reshape(1, 4, 4), 0.5, 0)
+            tp.arange(16.0).reshape(1, 4, 4), 0.5, 0, tp.qint8)
         p = tp.quantized_max_pool2d(q, 2)
         self.assertTrue(p.is_quantized())
         self.assertAlmostEqual(p.q_scale(), 0.5)

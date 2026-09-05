@@ -9,19 +9,23 @@
 namespace tensorplay {
 namespace cpu {
 
-// Affine quantization on Int8: q = clamp(round(x / scale) + zp, qmin, qmax).
-// Floating inputs are promoted to Float32/Float64 paths internally; outputs
-// are Int8 with the input's shape.  dequantize_* take the Int8 tensor back
-// to Float32: x = (q - zp) * scale.
+// Affine quantization dispatches on the requested quantized dtype.  Quantized
+// tensors retain their input shape and dequantize to Float32.
 Tensor quantize_per_tensor_cpu(const Tensor& self, double scale,
-                                int64_t zero_point, int64_t quant_min,
-                                int64_t quant_max);
-Tensor dequantize_per_tensor_cpu(const Tensor& self, double scale,
-                                  int64_t zero_point);
+                                int64_t zero_point, DType dtype);
+Tensor quantize_per_tensor_dtype_cpu(const Tensor& self, double scale,
+                                      int64_t zero_point, DType dtype);
+Tensor dequantize_per_tensor_dtype_cpu(const Tensor& self, double scale,
+                                        int64_t zero_point, DType dtype);
 Tensor quantize_per_channel_cpu(const Tensor& self, const Tensor& scales,
-                                  const Tensor& zero_points, int64_t axis);
-Tensor dequantize_per_channel_cpu(const Tensor& self, const Tensor& scales,
-                                   const Tensor& zero_points, int64_t axis);
+                                const Tensor& zero_points, int64_t axis,
+                                DType dtype);
+Tensor quantize_per_channel_dtype_cpu(const Tensor& self, const Tensor& scales,
+                                      const Tensor& zero_points, int64_t axis,
+                                      DType dtype);
+Tensor dequantize_per_channel_dtype_cpu(
+    const Tensor& self, const Tensor& scales, const Tensor& zero_points,
+    int64_t axis, DType dtype);
 // Fused Int8 GEMM: out[m,n] = x_scale * w_scale[n] * Σ_k (x_q[m,k]-x_zp) *
 // (w_q[n,k]-w_zp[n]) + bias[n] -> Float32 [M,N].
 Tensor quantized_linear_cpu(const Tensor& input, const Tensor& weight,
@@ -71,20 +75,6 @@ Tensor quantized_conv2d_cpu(
     int64_t weight_zero_point, double out_scale, int64_t out_zero_point,
     const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
     const std::vector<int64_t>& dilation, int64_t groups);
-
-// Unsigned-byte variant: codes clamp into [quant_min, quant_max] (default
-// [0, 255]) and store into a UInt8 tensor.
-Tensor quantize_per_tensor_quint8_cpu(const Tensor& self, double scale,
-                                       int64_t zero_point, int64_t quant_min,
-                                       int64_t quant_max);
-Tensor dequantize_per_tensor_quint8_cpu(const Tensor& self, double scale,
-                                         int64_t zero_point);
-
-// Full-precision accumulator variant: codes store into an Int32 tensor.
-Tensor quantize_per_tensor_qint32_cpu(const Tensor& self, double scale,
-                                       int64_t zero_point);
-Tensor dequantize_per_tensor_qint32_cpu(const Tensor& self, double scale,
-                                         int64_t zero_point);
 
 // Fake quantization family.  The forward maps values through the affine
 // grid (round-half-even on x * inv_scale) and back; the cachemask variants
@@ -183,6 +173,11 @@ Tensor _make_per_channel_quantized_tensor_cpu(const Tensor& self,
 namespace vulkan {
 namespace ops {
 
+Tensor quantize_per_tensor_kernel(const Tensor& self, double scale,
+                                  int64_t zero_point, DType dtype);
+Tensor dequantize_per_tensor_kernel(const Tensor& self, double scale,
+                                    int64_t zero_point, DType dtype);
+
 // Runs a pre-packed quantized convolution on the Vulkan compute path; the
 // packing layout and shader selection follow the quantized convolution
 // family (sliding window / depthwise / 2x2 pointwise / transposed).
@@ -210,14 +205,20 @@ Tensor quantized_conv2d_run_kernel(
 namespace cuda {
 
 Tensor quantize_per_tensor_cuda(const Tensor& self, double scale,
-                                 int64_t zero_point, int64_t quant_min,
-                                 int64_t quant_max);
-Tensor dequantize_per_tensor_cuda(const Tensor& self, double scale,
-                                   int64_t zero_point);
+                                int64_t zero_point, DType dtype);
+Tensor quantize_per_tensor_dtype_cuda(const Tensor& self, double scale,
+                                      int64_t zero_point, DType dtype);
+Tensor dequantize_per_tensor_dtype_cuda(const Tensor& self, double scale,
+                                        int64_t zero_point, DType dtype);
 Tensor quantize_per_channel_cuda(const Tensor& self, const Tensor& scales,
-                                  const Tensor& zero_points, int64_t axis);
-Tensor dequantize_per_channel_cuda(const Tensor& self, const Tensor& scales,
-                                    const Tensor& zero_points, int64_t axis);
+                                 const Tensor& zero_points, int64_t axis,
+                                 DType dtype);
+Tensor quantize_per_channel_dtype_cuda(
+    const Tensor& self, const Tensor& scales, const Tensor& zero_points,
+    int64_t axis, DType dtype);
+Tensor dequantize_per_channel_dtype_cuda(
+    const Tensor& self, const Tensor& scales, const Tensor& zero_points,
+    int64_t axis, DType dtype);
 Tensor quantized_linear_cuda(const Tensor& input, const Tensor& weight,
                               double input_scale, int64_t input_zero_point,
                               const Tensor& weight_scales,
@@ -256,16 +257,6 @@ Tensor quantized_conv2d_cuda(
     int64_t weight_zero_point, double out_scale, int64_t out_zero_point,
     const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
     const std::vector<int64_t>& dilation, int64_t groups);
-
-Tensor quantize_per_tensor_quint8_cuda(const Tensor& self, double scale,
-                                        int64_t zero_point, int64_t quant_min,
-                                        int64_t quant_max);
-Tensor dequantize_per_tensor_quint8_cuda(const Tensor& self, double scale,
-                                          int64_t zero_point);
-Tensor quantize_per_tensor_qint32_cuda(const Tensor& self, double scale,
-                                        int64_t zero_point);
-Tensor dequantize_per_tensor_qint32_cuda(const Tensor& self, double scale,
-                                          int64_t zero_point);
 
 std::tuple<Tensor, Tensor> fake_quantize_per_tensor_affine_cachemask_cuda(
     const Tensor& self, double scale, int64_t zero_point, int64_t quant_min,

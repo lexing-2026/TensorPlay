@@ -177,7 +177,8 @@ class TestStubsAndQuantizedLinear(unittest.TestCase):
 
         from tensorplay.quantization import quantize_per_tensor
         scale, zp = 0.05, 12
-        qx = quantize_per_tensor(self=x_float, scale=scale, zero_point=zp)
+        qx = quantize_per_tensor(self=x_float, scale=scale, zero_point=zp,
+                                 dtype=tp.qint8)
 
         qlin = QuantizedLinear.from_float(linear, scale, zp)
         out = qlin(qx)

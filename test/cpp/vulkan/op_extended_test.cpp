@@ -437,7 +437,7 @@ TEST_F(VulkanExtendedOpTest, QuantizedArithmeticBroadcasts) {
 
 TEST_F(VulkanExtendedOpTest, QuantizedMaxPool2dMatchesCpu) {
   Tensor x = tpx_ops::arange(16., DType::Float32).reshape({1, 1, 4, 4});
-  Tensor q_cpu = tpx_ops::quantize_per_tensor(x, 0.1, 10);
+  Tensor q_cpu = tpx_ops::quantize_per_tensor(x, 0.1, 10, DType::QInt8);
   Tensor q = vk(q_cpu);
 
   vulkan_test::expect_allclose(
@@ -930,18 +930,18 @@ TEST_F(VulkanExtendedOpTest, QuantizedQuint8Roundtrip) {
   const double scale = 0.1;
   const int64_t zp = 25;
 
-  Tensor q_cpu = tpx_ops::quantize_per_tensor_quint8(x, scale, zp);
+  Tensor q_cpu = tpx_ops::quantize_per_tensor(
+      x, scale, zp, DType::QUInt8);
   TP_CHECK(q_cpu.dtype() == DType::QUInt8, "quint8 codes must be QUInt8");
   Tensor q = vk(q_cpu);
 
   vulkan_test::expect_allclose(
-      tpx_ops::dequantize_per_tensor_quint8(q, scale, zp)
+      tpx_ops::dequantize(q)
           .to(Device(DeviceType::CPU)),
-      tpx_ops::dequantize_per_tensor_quint8(q_cpu, scale, zp));
+      tpx_ops::dequantize(q_cpu));
 
   // Round-trip error stays within one quantization step.
-  Tensor back =
-      tpx_ops::dequantize_per_tensor_quint8(q_cpu, scale, zp);
+  Tensor back = tpx_ops::dequantize(q_cpu);
   vulkan_test::expect_allclose(back, x, 1e-5, scale);
 }
 
@@ -950,18 +950,18 @@ TEST_F(VulkanExtendedOpTest, QuantizedQint32Roundtrip) {
   const double scale = 1e-6;
   const int64_t zp = 100;
 
-  Tensor q_cpu = tpx_ops::quantize_per_tensor_qint32(x, scale, zp);
+  Tensor q_cpu = tpx_ops::quantize_per_tensor(
+      x, scale, zp, DType::QInt32);
   TP_CHECK(q_cpu.dtype() == DType::QInt32, "qint32 codes must be QInt32");
   Tensor q = vk(q_cpu);
 
   vulkan_test::expect_allclose(
-      tpx_ops::dequantize_per_tensor_qint32(q, scale, zp)
+      tpx_ops::dequantize(q)
           .to(Device(DeviceType::CPU)),
-      tpx_ops::dequantize_per_tensor_qint32(q_cpu, scale, zp));
+      tpx_ops::dequantize(q_cpu));
 
   // The wider code makes the round trip far tighter than one Int8 step.
-  Tensor back =
-      tpx_ops::dequantize_per_tensor_qint32(q_cpu, scale, zp);
+  Tensor back = tpx_ops::dequantize(q_cpu);
   vulkan_test::expect_allclose(back, x, 1e-5, 1e-5);
 }
 
@@ -1198,14 +1198,14 @@ TEST_F(VulkanExtendedOpTest, QuantizeRoundtrip) {
   const double scale = 1.0;
   const int64_t zp = 0;
 
-  Tensor q = tpx_ops::quantize_per_tensor(vk(x), scale, zp);
+  Tensor q = tpx_ops::quantize_per_tensor(
+      vk(x), scale, zp, DType::QInt8);
   ASSERT_EQ(q.dtype(), DType::QInt8);
 
-  Tensor back = tpx_ops::dequantize_per_tensor(q, scale, zp)
-                    .to(Device(DeviceType::CPU));
+  Tensor back = tpx_ops::dequantize(q).to(Device(DeviceType::CPU));
   vulkan_test::expect_allclose(
-      back, tpx_ops::dequantize_per_tensor(
-                tpx_ops::quantize_per_tensor(x, scale, zp), scale, zp));
+      back, tpx_ops::dequantize(tpx_ops::quantize_per_tensor(
+                x, scale, zp, DType::QInt8)));
 }
 
 TEST_F(VulkanExtendedOpTest, SumAndMeanWholeTensor) {
@@ -1440,12 +1440,14 @@ TEST_F(VulkanExtendedOpTest, QuantizedMetadataProbes) {
   const double scale = 0.5;
   const int64_t zp = 3;
 
-  Tensor q = tpx_ops::quantize_per_tensor(vk(x), scale, zp);
+  Tensor q = tpx_ops::quantize_per_tensor(
+      vk(x), scale, zp, DType::QInt8);
   EXPECT_EQ(tpx_ops::q_scale(q), scale);
   EXPECT_EQ(tpx_ops::q_zero_point(q), zp);
 
   Tensor dq = tpx_ops::dequantize(q).to(Device(DeviceType::CPU));
-  Tensor ref = tpx_ops::dequantize(tpx_ops::quantize_per_tensor(x, scale, zp));
+  Tensor ref = tpx_ops::dequantize(tpx_ops::quantize_per_tensor(
+      x, scale, zp, DType::QInt8));
   vulkan_test::expect_allclose(dq, ref);
 }
 

@@ -1,5 +1,6 @@
 #include "Quantizer.h"
 #include "Exception.h"
+#include "QuantKernels.h"
 
 #include <cmath>
 #include <cstring>
@@ -138,6 +139,86 @@ Tensor& dequantize_out_from(Tensor& out, const Tensor& tensor,
     return out;
 }
 
+Tensor quantize_per_tensor_with_dtype(const Tensor& tensor, double scale,
+                                      int64_t zero_point, DType dtype) {
+    if (tensor.device().is_cpu()) {
+        return cpu::quantize_per_tensor_dtype_cpu(
+            tensor, scale, zero_point, dtype);
+    }
+#ifdef USE_CUDA
+    if (tensor.device().is_cuda()) {
+        return cuda::quantize_per_tensor_dtype_cuda(
+            tensor, scale, zero_point, dtype);
+    }
+#endif
+#ifdef USE_VULKAN
+    if (tensor.device().is_vulkan()) {
+        return vulkan::ops::quantize_per_tensor_kernel(
+            tensor, scale, zero_point, dtype);
+    }
+#endif
+    TP_THROW(NotImplementedError,
+             "per-tensor quantization is not implemented for this device");
+}
+
+Tensor dequantize_per_tensor_with_dtype(const Tensor& tensor, double scale,
+                                        int64_t zero_point, DType dtype) {
+    if (tensor.device().is_cpu()) {
+        return cpu::dequantize_per_tensor_dtype_cpu(
+            tensor, scale, zero_point, dtype);
+    }
+#ifdef USE_CUDA
+    if (tensor.device().is_cuda()) {
+        return cuda::dequantize_per_tensor_dtype_cuda(
+            tensor, scale, zero_point, dtype);
+    }
+#endif
+#ifdef USE_VULKAN
+    if (tensor.device().is_vulkan()) {
+        return vulkan::ops::dequantize_per_tensor_kernel(
+            tensor, scale, zero_point, dtype);
+    }
+#endif
+    TP_THROW(NotImplementedError,
+             "per-tensor dequantization is not implemented for this device");
+}
+
+Tensor quantize_per_channel_with_dtype(const Tensor& tensor,
+                                       const Tensor& scales,
+                                       const Tensor& zero_points, int64_t axis,
+                                       DType dtype) {
+    if (tensor.device().is_cpu()) {
+        return cpu::quantize_per_channel_dtype_cpu(
+            tensor, scales, zero_points, axis, dtype);
+    }
+#ifdef USE_CUDA
+    if (tensor.device().is_cuda()) {
+        return cuda::quantize_per_channel_dtype_cuda(
+            tensor, scales, zero_points, axis, dtype);
+    }
+#endif
+    TP_THROW(NotImplementedError,
+             "per-channel quantization is not implemented for this device");
+}
+
+Tensor dequantize_per_channel_with_dtype(const Tensor& tensor,
+                                         const Tensor& scales,
+                                         const Tensor& zero_points,
+                                         int64_t axis, DType dtype) {
+    if (tensor.device().is_cpu()) {
+        return cpu::dequantize_per_channel_dtype_cpu(
+            tensor, scales, zero_points, axis, dtype);
+    }
+#ifdef USE_CUDA
+    if (tensor.device().is_cuda()) {
+        return cuda::dequantize_per_channel_dtype_cuda(
+            tensor, scales, zero_points, axis, dtype);
+    }
+#endif
+    TP_THROW(NotImplementedError,
+             "per-channel dequantization is not implemented for this device");
+}
+
 } // namespace
 
 Tensor UnknownQuantizer::quantize(const Tensor&) {
@@ -154,35 +235,13 @@ Tensor& UnknownQuantizer::dequantize_out(Tensor&, const Tensor&) {
 
 Tensor PerTensorAffineQuantizer::quantize(const Tensor& tensor) {
     check_float_input(tensor);
-    switch (scalar_type()) {
-        case DType::QInt8:
-            return Tensor::quantize_per_tensor(tensor, scale_, zero_point_);
-        case DType::QUInt8:
-            return Tensor::quantize_per_tensor_quint8(
-                tensor, scale_, zero_point_);
-        case DType::QInt32:
-            return Tensor::quantize_per_tensor_qint32(
-                tensor, scale_, zero_point_);
-        default:
-            TP_THROW(TypeError, "quantize(): unsupported quantized dtype ",
-                     toString(scalar_type()));
-    }
+    return quantize_per_tensor_with_dtype(
+        tensor, scale_, zero_point_, scalar_type());
 }
 
 Tensor PerTensorAffineQuantizer::dequantize(const Tensor& tensor) {
-    switch (scalar_type()) {
-        case DType::QInt8:
-            return Tensor::dequantize_per_tensor(tensor, scale_, zero_point_);
-        case DType::QUInt8:
-            return Tensor::dequantize_per_tensor_quint8(
-                tensor, scale_, zero_point_);
-        case DType::QInt32:
-            return Tensor::dequantize_per_tensor_qint32(
-                tensor, scale_, zero_point_);
-        default:
-            TP_THROW(TypeError, "dequantize(): unsupported quantized dtype ",
-                     toString(scalar_type()));
-    }
+    return dequantize_per_tensor_with_dtype(
+        tensor, scale_, zero_point_, scalar_type());
 }
 
 Tensor& PerTensorAffineQuantizer::dequantize_out(Tensor& out,
@@ -192,19 +251,13 @@ Tensor& PerTensorAffineQuantizer::dequantize_out(Tensor& out,
 
 Tensor PerChannelAffineQuantizer::quantize(const Tensor& tensor) {
     check_float_input(tensor);
-    if (scalar_type() != DType::QInt8) {
-        TP_THROW(TypeError,
-                 "quantize(): per-channel quantization supports QInt8");
-    }
-    return Tensor::quantize_per_channel(tensor, scales_, zero_points_, axis_);
+    return quantize_per_channel_with_dtype(
+        tensor, scales_, zero_points_, axis_, scalar_type());
 }
 
 Tensor PerChannelAffineQuantizer::dequantize(const Tensor& tensor) {
-    if (scalar_type() != DType::QInt8) {
-        TP_THROW(TypeError,
-                 "dequantize(): per-channel quantization supports QInt8");
-    }
-    return Tensor::dequantize_per_channel(tensor, scales_, zero_points_, axis_);
+    return dequantize_per_channel_with_dtype(
+        tensor, scales_, zero_points_, axis_, scalar_type());
 }
 
 Tensor& PerChannelAffineQuantizer::dequantize_out(Tensor& out,
@@ -214,20 +267,14 @@ Tensor& PerChannelAffineQuantizer::dequantize_out(Tensor& out,
 
 Tensor PerChannelAffineFloatQParamsQuantizer::quantize(const Tensor& tensor) {
     check_float_input(tensor);
-    if (scalar_type() != DType::QInt8) {
-        TP_THROW(TypeError,
-                 "quantize(): per-channel quantization supports QInt8");
-    }
-    return Tensor::quantize_per_channel(tensor, scales_, zero_points_, axis_);
+    return quantize_per_channel_with_dtype(
+        tensor, scales_, zero_points_, axis_, scalar_type());
 }
 
 Tensor PerChannelAffineFloatQParamsQuantizer::dequantize(
     const Tensor& tensor) {
-    if (scalar_type() != DType::QInt8) {
-        TP_THROW(TypeError,
-                 "dequantize(): per-channel quantization supports QInt8");
-    }
-    return Tensor::dequantize_per_channel(tensor, scales_, zero_points_, axis_);
+    return dequantize_per_channel_with_dtype(
+        tensor, scales_, zero_points_, axis_, scalar_type());
 }
 
 Tensor& PerChannelAffineFloatQParamsQuantizer::dequantize_out(
