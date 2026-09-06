@@ -7,9 +7,14 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <utility>
 
 namespace tensorplay {
 namespace cpu {
+
+extern std::pair<Tensor, Tensor> mean_var_over_dims(
+    const Tensor& self, std::vector<int64_t> dims, int64_t correction,
+    bool keepdim);
 
 DEFINE_DISPATCH(sum_stub);
 DEFINE_DISPATCH(sum_dim_stub);
@@ -170,58 +175,11 @@ Tensor argmin_kernel(const Tensor& self, std::optional<int64_t> dim, bool keepdi
 }
 
 Tensor var_kernel(const Tensor& self, int64_t correction) {
-    if (self.numel() == 0) return Tensor::empty({}, DType::Float32, self.device()).fill_(Scalar(std::numeric_limits<float>::quiet_NaN()));
-    if (isComplexType(self.dtype())) {
-        // complex variance = E|z - mean|^2 == var(re) + var(imag), and the
-        // result dtype is the real counterpart.
-        Tensor diff = self - self.mean();
-        Tensor sum_sq = diff.abs().pow(Scalar(2)).sum();
-        int64_t n = self.numel();
-        double div_val = std::max<double>(0.0, static_cast<double>(n - correction));
-        return sum_sq / Scalar(div_val);
-    }
-    Tensor mean = self.mean();
-    Tensor diff = self - mean;
-    Tensor sq_diff = diff * diff;
-    Tensor sum_sq = sq_diff.sum();
-    int64_t n = self.numel();
-    double div_val = std::max<double>(0.0, static_cast<double>(n - correction));
-    Tensor result = (sum_sq / Scalar(div_val)).to(self.dtype());
-    return result;
+    return mean_var_over_dims(self, {}, correction, false).first;
 }
 
 Tensor var_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, int64_t correction, bool keepdim) {
-    if (self.numel() == 0) return Tensor::empty(compute_reduction_shape(self, dim, keepdim), DType::Float32, self.device()).fill_(Scalar(std::numeric_limits<float>::quiet_NaN()));
-    if (isComplexType(self.dtype())) {
-        // Complex: E|z - mean|^2 over the reduced dims (real-typed result).
-        std::vector<int64_t> dims = dim;
-        Tensor mean = self.mean(dims, true);
-        Tensor diff = self - mean;
-        std::vector<int64_t> dims_sum = dim;
-        Tensor sum_sq = diff.abs().pow(Scalar(2)).sum(dims_sum, keepdim);
-        std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(self.shape());
-        int64_t n = 1;
-        for (int64_t d : dim) {
-            if (d < 0) d += shape.size();
-            n *= shape[d];
-        }
-        double div = std::max<double>(0.0, static_cast<double>(n - correction));
-        return sum_sq / Scalar(div);
-    }
-    std::vector<int64_t> dims = dim;
-    Tensor mean = self.mean(dims, true);
-    std::vector<int64_t> dims_sum = dim;
-    Tensor diff = self - mean;
-    Tensor sq_diff = diff * diff;
-    Tensor sum_sq = sq_diff.sum(dims_sum, keepdim);
-    int64_t n = 1;
-    std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(self.shape());
-    for (int64_t d : dim) {
-        if (d < 0) d += shape.size();
-        n *= shape[d];
-    }
-    double div = std::max<double>(0.0, static_cast<double>(n - correction));
-    return (sum_sq / Scalar(div)).to(self.dtype());
+    return mean_var_over_dims(self, dim, correction, keepdim).first;
 }
 
 Tensor std_kernel(const Tensor& self, int64_t correction) {

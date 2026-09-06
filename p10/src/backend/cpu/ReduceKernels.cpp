@@ -178,14 +178,14 @@ Tensor reduce_dims_impl(const Tensor& self, std::vector<int64_t> dims_in,
 
 std::pair<Tensor, Tensor> mean_var_over_dims(const Tensor& self,
                                              std::vector<int64_t> dims_in,
-                                             bool unbiased, bool keepdim) {
+                                             int64_t correction, bool keepdim) {
     if (isComplexType(self.dtype())) {
         const Tensor real = ops::real(self);
         const Tensor imag = ops::imag(self);
         const auto real_stats =
-            mean_var_over_dims(real, dims_in, unbiased, keepdim);
+            mean_var_over_dims(real, dims_in, correction, keepdim);
         const auto imag_stats =
-            mean_var_over_dims(imag, dims_in, unbiased, keepdim);
+            mean_var_over_dims(imag, dims_in, correction, keepdim);
         return {ops::add(real_stats.first, imag_stats.first),
                 ops::complex(real_stats.second, imag_stats.second)};
     }
@@ -236,8 +236,6 @@ std::pair<Tensor, Tensor> mean_var_over_dims(const Tensor& self,
     }
     int64_t n_red = 1;
     for (const int64_t dim : red_dims) n_red *= self.size(dim);
-    const double correction = unbiased ? 1.0 : 0.0;
-
     auto compute = [&](auto* sp, auto* mp, auto* vp) {
         using output_t = std::remove_cv_t<std::remove_pointer_t<decltype(mp)>>;
         parallel_for(0, out_numel, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
@@ -549,14 +547,16 @@ std::tuple<Tensor, Tensor> cummin_cpu(const Tensor& self, int64_t dim) {
 std::tuple<Tensor, Tensor> std_mean_cpu(const Tensor& self,
                                         std::vector<int64_t> dim,
                                         bool unbiased, bool keepdim) {
-    auto vr_mean = mean_var_over_dims(self, std::move(dim), unbiased, keepdim);
+    auto vr_mean = mean_var_over_dims(
+        self, std::move(dim), unbiased ? int64_t(1) : int64_t(0), keepdim);
     return {vr_mean.first.sqrt(), vr_mean.second};
 }
 
 std::tuple<Tensor, Tensor> var_mean_cpu(const Tensor& self,
                                         std::vector<int64_t> dim,
                                         bool unbiased, bool keepdim) {
-    return mean_var_over_dims(self, std::move(dim), unbiased, keepdim);
+    return mean_var_over_dims(
+        self, std::move(dim), unbiased ? int64_t(1) : int64_t(0), keepdim);
 }
 
 Tensor nanmedian_cpu(const Tensor& self) {
