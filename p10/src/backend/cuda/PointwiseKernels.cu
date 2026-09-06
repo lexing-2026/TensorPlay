@@ -1654,35 +1654,48 @@ Tensor pow_scalar_tensor_kernel_cuda(Scalar base, const Tensor& exponent) {
 Tensor atan2_kernel_cuda(const Tensor& self, const Tensor& other) { return binary_float_op_kernel_v2(self, other, Atan2Functor()); }
 
 // --- Lerp ---
-template <typename T>
-__global__ void lerp_tensor_kernel_cuda_impl(int64_t n, const T* start, const T* end, const T* weight, T* output) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        T w = weight[i];
-        output[i] = (std::abs(w) < T(0.5))
-            ? start[i] + w * (end[i] - start[i])
-            : end[i] - (end[i] - start[i]) * (static_cast<T>(1) - w);
+template <typename math_t>
+__device__ bool lerp_weight_small(math_t value) {
+    if constexpr (std::is_same_v<math_t, float>) {
+        return ::fabsf(value) < 0.5f;
+    } else {
+        return ::fabs(value) < 0.5;
     }
 }
 
-// numerically-stable calculation and casts only once on store.  Keep that
-// contract for TensorPlay's reduced floating types as well; doing the
-// recurrence through separate mul/add TensorIterator launches rounds twice
-// and is observable in optimizer moment buffers.
-template <typename T>
-__global__ void lerp_tensor_reduced_kernel_cuda_impl(
-        int64_t n, const T* start, const T* end, const T* weight, T* output) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) {
-        const float s = static_cast<float>(start[i]);
-        const float e = static_cast<float>(end[i]);
-        const float w = static_cast<float>(weight[i]);
-        const float value = (fabsf(w) < 0.5f)
+template <typename scalar_t, typename math_t>
+void lerp_tensor_loop(TensorIterator& iter) {
+    gpu_kernel(iter, [] __device__(scalar_t start, scalar_t finish,
+                                   scalar_t weight) -> scalar_t {
+        const math_t s = static_cast<math_t>(start);
+        const math_t e = static_cast<math_t>(finish);
+        const math_t w = static_cast<math_t>(weight);
+        const math_t value = lerp_weight_small(w)
             ? s + w * (e - s)
-            : e - (e - s) * (1.0f - w);
-        output[i] = static_cast<T>(value);
-    }
+            : e - (e - s) * (static_cast<math_t>(1) - w);
+        return static_cast<scalar_t>(value);
+    });
+}
+
+template <typename math_t>
+__device__ bool complex_lerp_weight_small(const math_t& value) {
+    const auto real = value.real();
+    const auto imag = value.imag();
+    return real * real + imag * imag < 0.25;
+}
+
+template <typename scalar_t, typename math_t>
+void complex_lerp_tensor_loop(TensorIterator& iter) {
+    gpu_kernel(iter, [] __device__(scalar_t start, scalar_t finish,
+                                   scalar_t weight) -> scalar_t {
+        const math_t s = static_cast<math_t>(start);
+        const math_t e = static_cast<math_t>(finish);
+        const math_t w = static_cast<math_t>(weight);
+        const math_t value = complex_lerp_weight_small(w)
+            ? s + w * (e - s)
+            : e - (e - s) * (math_t(1) - w);
+        return static_cast<scalar_t>(value);
+    });
 }
 
 Tensor lerp_scalar_kernel_cuda(const Tensor& self, const Tensor& end, Scalar weight) {
@@ -1746,37 +1759,50 @@ Tensor lerp_scalar_kernel_cuda(const Tensor& self, const Tensor& end, Scalar wei
 }
 
 Tensor lerp_tensor_kernel_cuda(const Tensor& self, const Tensor& end, const Tensor& weight) {
-    if (self.shape() != end.shape() || self.shape() != weight.shape()) TP_THROW(RuntimeError, "CUDA lerp: broadcasting not supported");
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
-    int64_t n = self.numel();
-    dim3 block(256);
-    dim3 grid((n + 255) / 256);
+    std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(end.shape()),
+        static_cast<std::vector<int64_t>>(weight.shape()));
+    DType common_dtype = promoteTypes(self.dtype(), end.dtype());
+    common_dtype = promoteTypes(common_dtype, weight.dtype());
+    if (isIntegralType(common_dtype)) common_dtype = DType::Float32;
+    Tensor s = self.dtype() == common_dtype ? self : self.to(common_dtype);
+    Tensor e = end.dtype() == common_dtype ? end : end.to(common_dtype);
+    Tensor w = weight.dtype() == common_dtype ? weight : weight.to(common_dtype);
+    Tensor result = Tensor::empty(out_shape, common_dtype, self.device());
+    if (result.numel() == 0) return result;
 
-    Tensor self_c = self.contiguous();
-    Tensor end_c = end.contiguous();
-    Tensor weight_c = weight.contiguous();
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(result)
+        .add_const_input(s)
+        .add_const_input(e)
+        .add_const_input(w)
+        .build();
 
-    #define LERPT_CASE(ctype, name) \
-    case DType::name: { \
-        lerp_tensor_kernel_cuda_impl<ctype><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self_c.data_ptr<ctype>(), end_c.data_ptr<ctype>(), weight_c.data_ptr<ctype>(), result.data_ptr<ctype>()); \
-        break; \
-    }
-    switch (self.dtype()) {
-        LERPT_CASE(float, Float32)
-        LERPT_CASE(double, Float64)
-        case DType::Float16:
-            lerp_tensor_reduced_kernel_cuda_impl<Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
-                n, self_c.data_ptr<Half>(), end_c.data_ptr<Half>(),
-                weight_c.data_ptr<Half>(), result.data_ptr<Half>());
+    switch (common_dtype) {
+        case DType::Float32: lerp_tensor_loop<float, float>(iter); break;
+        case DType::Float64: lerp_tensor_loop<double, double>(iter); break;
+        case DType::Float16: lerp_tensor_loop<Half, float>(iter); break;
+        case DType::BFloat16: lerp_tensor_loop<BFloat16, float>(iter); break;
+        case DType::ComplexHalf:
+            complex_lerp_tensor_loop<tensorplay::complex<Half>,
+                                     tensorplay::complex<float>>(iter);
             break;
-        case DType::BFloat16:
-            lerp_tensor_reduced_kernel_cuda_impl<BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
-                n, self_c.data_ptr<BFloat16>(), end_c.data_ptr<BFloat16>(),
-                weight_c.data_ptr<BFloat16>(), result.data_ptr<BFloat16>());
+        case DType::ComplexFloat:
+            complex_lerp_tensor_loop<tensorplay::complex<float>,
+                                     tensorplay::complex<float>>(iter);
+            break;
+        case DType::ComplexDouble:
+            complex_lerp_tensor_loop<tensorplay::complex<double>,
+                                     tensorplay::complex<double>>(iter);
+            break;
+        case DType::BComplex32:
+            complex_lerp_tensor_loop<tensorplay::complex<BFloat16>,
+                                     tensorplay::complex<float>>(iter);
             break;
         default: TP_THROW(NotImplementedError, "CUDA lerp: unsupported dtype");
     }
-    #undef LERPT_CASE
     return result;
 }
 
