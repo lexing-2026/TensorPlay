@@ -10,6 +10,8 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 namespace tensorplay::cuda {
@@ -526,6 +528,168 @@ Tensor& write_linalg_norm_output(const Tensor& result, Tensor& out) {
     return out;
 }
 
+bool linalg_decomposition_dtype(DType dtype) {
+    return dtype == DType::Float32 || dtype == DType::Float64 ||
+           dtype == DType::ComplexFloat || dtype == DType::ComplexDouble;
+}
+
+void check_matrix_decomposition_input(const Tensor& input, bool hermitian,
+                                      const char* name) {
+    if (!linalg_decomposition_dtype(input.dtype()) || input.dim() < 2) {
+        TP_THROW(TypeError,
+                 name, " expects a tensor with at least 2 dimensions of a supported dtype");
+    }
+    if (hermitian && input.size(-2) != input.size(-1)) {
+        TP_THROW(RuntimeError,
+                 name, " hermitian input must be square");
+    }
+}
+
+void check_tolerance(const Tensor& input, const Tensor& tolerance,
+                     const char* name) {
+    if (tolerance.device() != input.device()) {
+        TP_THROW(DeviceMismatchError, name,
+                 " tolerance must be on the input device");
+    }
+    if (isComplexType(tolerance.dtype())) {
+        TP_THROW(TypeError, name,
+                 " tolerance must not be complex");
+    }
+}
+
+double linalg_epsilon(DType dtype) {
+    switch (toRealValueType(dtype)) {
+        case DType::Float64:
+            return std::numeric_limits<double>::epsilon();
+        case DType::Float16:
+            return 0.0009765625;
+        case DType::BFloat16:
+            return 0.0078125;
+        default:
+            return std::numeric_limits<float>::epsilon();
+    }
+}
+
+std::pair<Tensor, Tensor> linalg_tolerances(
+    const Tensor& input, const std::optional<Tensor>& atol_opt,
+    const std::optional<Tensor>& rtol_opt) {
+    Tensor atol = atol_opt.has_value()
+        ? *atol_opt
+        : Tensor::zeros({}, DType::Float64, input.device());
+    check_tolerance(input, atol, "linalg tolerance");
+    Tensor rtol;
+    if (rtol_opt.has_value()) {
+        rtol = *rtol_opt;
+        check_tolerance(input, rtol, "linalg tolerance");
+    } else {
+        const double default_value =
+            linalg_epsilon(input.dtype()) *
+            static_cast<double>(std::max(input.size(-1), input.size(-2)));
+        Tensor default_rtol = Tensor::full(
+            {}, Scalar(default_value), DType::Float64, input.device());
+        if (atol_opt.has_value()) {
+            rtol = ops::where(
+                ops::gt(atol, Scalar(0)),
+                Tensor::zeros({}, DType::Float64, input.device()), default_rtol);
+        } else {
+            rtol = default_rtol;
+        }
+    }
+    return {atol, rtol};
+}
+
+std::vector<int64_t> matrix_batch_shape(const Tensor& input) {
+    std::vector<int64_t> shape =
+        static_cast<std::vector<int64_t>>(input.shape());
+    shape.resize(shape.size() - 2);
+    return shape;
+}
+
+Tensor linalg_pinv_impl(const Tensor& input, const Tensor& atol,
+                        const Tensor& rtol, bool hermitian) {
+    check_matrix_decomposition_input(input, hermitian, "linalg.pinv");
+    if (input.numel() == 0) {
+        std::vector<int64_t> shape =
+            static_cast<std::vector<int64_t>>(input.shape());
+        std::swap(shape[shape.size() - 2], shape[shape.size() - 1]);
+        return Tensor::zeros(shape, input.dtype(), input.device());
+    }
+
+    if (hermitian) {
+        auto decomposition = ops::linalg_eigh(input, "L");
+        Tensor values = std::get<0>(decomposition);
+        Tensor vectors = std::get<1>(decomposition);
+        Tensor magnitude = ops::abs(values);
+        Tensor max_value = ops::amax(magnitude, {-1}, true);
+        Tensor tolerance = ops::max(
+            ops::unsqueeze(atol, -1),
+            ops::mul(ops::unsqueeze(rtol, -1), max_value));
+        Tensor keep = ops::gt(magnitude, tolerance);
+        Tensor safe_values = ops::where(
+            keep, values, ops::ones_like(values));
+        Tensor inverse_values = ops::where(
+            keep, ops::reciprocal(safe_values), ops::zeros_like(values));
+        return ops::matmul(
+            ops::mul(vectors, ops::unsqueeze(inverse_values, -2)),
+            ops::mH(vectors));
+    }
+
+    auto decomposition = ops::linalg_svd(input, false, std::nullopt);
+    Tensor u = std::get<0>(decomposition);
+    Tensor singular_values = std::get<1>(decomposition);
+    Tensor vh = std::get<2>(decomposition);
+    Tensor max_value = std::get<0>(ops::max(singular_values, -1, true));
+    Tensor tolerance = ops::max(
+        ops::unsqueeze(atol, -1),
+        ops::mul(ops::unsqueeze(rtol, -1), max_value));
+    Tensor keep = ops::gt(singular_values, tolerance);
+    Tensor safe_values = ops::where(
+        keep, singular_values, ops::ones_like(singular_values));
+    Tensor inverse_values = ops::where(
+        keep, ops::reciprocal(safe_values), ops::zeros_like(singular_values));
+    Tensor scaled_u_h = ops::mul(
+        ops::unsqueeze(inverse_values, -1), ops::mH(u));
+    return ops::matmul(ops::mH(vh), scaled_u_h);
+}
+
+Tensor linalg_matrix_rank_impl(const Tensor& input, const Tensor& atol,
+                               const Tensor& rtol, bool hermitian) {
+    check_matrix_decomposition_input(input, hermitian, "linalg.matrix_rank");
+    if (input.numel() == 0) {
+        return Tensor::zeros(matrix_batch_shape(input), DType::Int64,
+                             input.device());
+    }
+
+    Tensor values = hermitian
+        ? ops::linalg_eigvalsh(input, "L")
+        : ops::linalg_svdvals(input, std::nullopt);
+    if (hermitian) values = ops::abs(values);
+    Tensor max_value = ops::amax(values, {-1}, true);
+    Tensor tolerance = ops::max(
+        ops::unsqueeze(atol, -1),
+        ops::mul(ops::unsqueeze(rtol, -1), max_value));
+    Tensor selected = ops::gt(values, tolerance);
+    return ops::sum(selected, {-1}, false, DType::Int64);
+}
+
+Tensor& write_linalg_rank_output(const Tensor& result, Tensor& out) {
+    if (!out.defined()) {
+        out = result;
+        return out;
+    }
+    if (out.dtype() != result.dtype()) {
+        TP_THROW(TypeError,
+                 "linalg.matrix_rank output dtype must match result dtype");
+    }
+    if (out.device() != result.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "linalg.matrix_rank output device must match result device");
+    }
+    out.resize_(static_cast<std::vector<int64_t>>(result.shape()));
+    out.copy_(result);
+    return out;
+}
+
 }  // namespace
 
 Tensor ger_native_cuda(const Tensor& self, const Tensor& vec2) {
@@ -708,6 +872,165 @@ Tensor& linalg_norm_string_native_cuda_out(
         linalg_norm_string_impl(self, ord, dims, keepdim, dtype), out);
 }
 
+Tensor linalg_pinv_native_cuda(
+    const Tensor& input, const std::optional<Tensor>& atol,
+    const std::optional<Tensor>& rtol, bool hermitian) {
+    auto tolerances = linalg_tolerances(input, atol, rtol);
+    return linalg_pinv_impl(input, tolerances.first, tolerances.second,
+                            hermitian);
+}
+
+Tensor& linalg_pinv_native_cuda_atol_rtol_tensor_out(
+    const Tensor& input, const std::optional<Tensor>& atol,
+    const std::optional<Tensor>& rtol, bool hermitian, Tensor& out) {
+    auto tolerances = linalg_tolerances(input, atol, rtol);
+    return write_linalg_norm_output(
+        linalg_pinv_impl(input, tolerances.first, tolerances.second,
+                         hermitian), out);
+}
+
+Tensor linalg_pinv_native_cuda_float(
+    const Tensor& input, std::optional<double> atol,
+    std::optional<double> rtol, bool hermitian) {
+    std::optional<Tensor> atol_tensor;
+    std::optional<Tensor> rtol_tensor;
+    if (atol.has_value()) {
+        atol_tensor = Tensor::full({}, Scalar(*atol), DType::Float64,
+                                   input.device());
+    }
+    if (rtol.has_value()) {
+        rtol_tensor = Tensor::full({}, Scalar(*rtol), DType::Float64,
+                                   input.device());
+    }
+    return linalg_pinv_native_cuda(input, atol_tensor, rtol_tensor, hermitian);
+}
+
+Tensor& linalg_pinv_native_cuda_float_out(
+    const Tensor& input, std::optional<double> atol,
+    std::optional<double> rtol, bool hermitian, Tensor& out) {
+    std::optional<Tensor> atol_tensor;
+    std::optional<Tensor> rtol_tensor;
+    if (atol.has_value()) {
+        atol_tensor = Tensor::full({}, Scalar(*atol), DType::Float64,
+                                   input.device());
+    }
+    if (rtol.has_value()) {
+        rtol_tensor = Tensor::full({}, Scalar(*rtol), DType::Float64,
+                                   input.device());
+    }
+    return linalg_pinv_native_cuda_atol_rtol_tensor_out(
+        input, atol_tensor, rtol_tensor, hermitian, out);
+}
+
+Tensor linalg_pinv_native_cuda_rcond(
+    const Tensor& input, double rcond, bool hermitian) {
+    Tensor rtol = Tensor::full({}, Scalar(rcond), DType::Float64,
+                               input.device());
+    return linalg_pinv_impl(
+        input, Tensor::zeros({}, DType::Float64, input.device()), rtol,
+        hermitian);
+}
+
+Tensor linalg_pinv_native_cuda_rcond_tensor(
+    const Tensor& input, const Tensor& rcond, bool hermitian) {
+    check_tolerance(input, rcond, "linalg.pinv");
+    return linalg_pinv_impl(
+        input, Tensor::zeros({}, DType::Float64, input.device()), rcond,
+        hermitian);
+}
+
+Tensor& linalg_pinv_native_cuda_rcond_out(
+    const Tensor& input, double rcond, bool hermitian, Tensor& out) {
+    return write_linalg_norm_output(
+        linalg_pinv_native_cuda_rcond(input, rcond, hermitian), out);
+}
+
+Tensor& linalg_pinv_native_cuda_rcond_tensor_out(
+    const Tensor& input, const Tensor& rcond, bool hermitian, Tensor& out) {
+    return write_linalg_norm_output(
+        linalg_pinv_native_cuda_rcond_tensor(input, rcond, hermitian), out);
+}
+
+Tensor linalg_matrix_rank_native_cuda(
+    const Tensor& input, const std::optional<Tensor>& atol,
+    const std::optional<Tensor>& rtol, bool hermitian) {
+    auto tolerances = linalg_tolerances(input, atol, rtol);
+    return linalg_matrix_rank_impl(input, tolerances.first, tolerances.second,
+                                   hermitian);
+}
+
+Tensor& linalg_matrix_rank_native_cuda_atol_rtol_tensor_out(
+    const Tensor& input, const std::optional<Tensor>& atol,
+    const std::optional<Tensor>& rtol, bool hermitian, Tensor& out) {
+    auto tolerances = linalg_tolerances(input, atol, rtol);
+    return write_linalg_rank_output(
+        linalg_matrix_rank_impl(input, tolerances.first, tolerances.second,
+                                hermitian), out);
+}
+
+Tensor linalg_matrix_rank_native_cuda_float(
+    const Tensor& input, std::optional<double> atol,
+    std::optional<double> rtol, bool hermitian) {
+    std::optional<Tensor> atol_tensor;
+    std::optional<Tensor> rtol_tensor;
+    if (atol.has_value()) {
+        atol_tensor = Tensor::full({}, Scalar(*atol), DType::Float64,
+                                   input.device());
+    }
+    if (rtol.has_value()) {
+        rtol_tensor = Tensor::full({}, Scalar(*rtol), DType::Float64,
+                                   input.device());
+    }
+    return linalg_matrix_rank_native_cuda(input, atol_tensor, rtol_tensor,
+                                          hermitian);
+}
+
+Tensor& linalg_matrix_rank_native_cuda_float_out(
+    const Tensor& input, std::optional<double> atol,
+    std::optional<double> rtol, bool hermitian, Tensor& out) {
+    std::optional<Tensor> atol_tensor;
+    std::optional<Tensor> rtol_tensor;
+    if (atol.has_value()) {
+        atol_tensor = Tensor::full({}, Scalar(*atol), DType::Float64,
+                                   input.device());
+    }
+    if (rtol.has_value()) {
+        rtol_tensor = Tensor::full({}, Scalar(*rtol), DType::Float64,
+                                   input.device());
+    }
+    return linalg_matrix_rank_native_cuda_atol_rtol_tensor_out(
+        input, atol_tensor, rtol_tensor, hermitian, out);
+}
+
+Tensor linalg_matrix_rank_native_cuda_tol(
+    const Tensor& input, double tol, bool hermitian) {
+    Tensor tolerance = Tensor::full({}, Scalar(tol), DType::Float64,
+                                    input.device());
+    return linalg_matrix_rank_impl(
+        input, tolerance, Tensor::zeros({}, DType::Float64, input.device()),
+        hermitian);
+}
+
+Tensor& linalg_matrix_rank_native_cuda_tol_out(
+    const Tensor& input, double tol, bool hermitian, Tensor& out) {
+    return write_linalg_rank_output(
+        linalg_matrix_rank_native_cuda_tol(input, tol, hermitian), out);
+}
+
+Tensor linalg_matrix_rank_native_cuda_tol_tensor(
+    const Tensor& input, const Tensor& tol, bool hermitian) {
+    check_tolerance(input, tol, "linalg.matrix_rank");
+    return linalg_matrix_rank_impl(
+        input, tol, Tensor::zeros({}, DType::Float64, input.device()),
+        hermitian);
+}
+
+Tensor& linalg_matrix_rank_native_cuda_tol_tensor_out(
+    const Tensor& input, const Tensor& tol, bool hermitian, Tensor& out) {
+    return write_linalg_rank_output(
+        linalg_matrix_rank_native_cuda_tol_tensor(input, tol, hermitian), out);
+}
+
 Tensor matrix_power_native_cuda(const Tensor& self, int64_t n) {
     if (self.dim() < 2 || self.size(-2) != self.size(-1)) {
         TP_THROW(RuntimeError, "matrix_power(): expected a square matrix");
@@ -782,6 +1105,30 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, NativeLinearAlgebra) {
     m.impl("linalg_norm.out", linalg_norm_native_cuda_out);
     m.impl("linalg_norm.ord_str", linalg_norm_string_native_cuda);
     m.impl("linalg_norm.ord_str_out", linalg_norm_string_native_cuda_out);
+    m.impl("linalg_pinv.atol_rtol_tensor", linalg_pinv_native_cuda);
+    m.impl("linalg_pinv.atol_rtol_tensor_out",
+           linalg_pinv_native_cuda_atol_rtol_tensor_out);
+    m.impl("linalg_pinv.atol_rtol_float", linalg_pinv_native_cuda_float);
+    m.impl("linalg_pinv.atol_rtol_float_out",
+           linalg_pinv_native_cuda_float_out);
+    m.impl("linalg_pinv", linalg_pinv_native_cuda_rcond);
+    m.impl("linalg_pinv.rcond_tensor", linalg_pinv_native_cuda_rcond_tensor);
+    m.impl("linalg_pinv.out", linalg_pinv_native_cuda_rcond_out);
+    m.impl("linalg_pinv.out_rcond_tensor",
+           linalg_pinv_native_cuda_rcond_tensor_out);
+    m.impl("linalg_matrix_rank.atol_rtol_tensor", linalg_matrix_rank_native_cuda);
+    m.impl("linalg_matrix_rank.atol_rtol_tensor_out",
+           linalg_matrix_rank_native_cuda_atol_rtol_tensor_out);
+    m.impl("linalg_matrix_rank.atol_rtol_float",
+           linalg_matrix_rank_native_cuda_float);
+    m.impl("linalg_matrix_rank.atol_rtol_float_out",
+           linalg_matrix_rank_native_cuda_float_out);
+    m.impl("linalg_matrix_rank", linalg_matrix_rank_native_cuda_tol);
+    m.impl("linalg_matrix_rank.out", linalg_matrix_rank_native_cuda_tol_out);
+    m.impl("linalg_matrix_rank.tol_tensor",
+           linalg_matrix_rank_native_cuda_tol_tensor);
+    m.impl("linalg_matrix_rank.out_tol_tensor",
+           linalg_matrix_rank_native_cuda_tol_tensor_out);
     m.impl("matrix_power", matrix_power_native_cuda);
     m.impl("matrix_power.out", matrix_power_native_cuda_out);
     m.impl("linalg_matrix_power", matrix_power_native_cuda);
