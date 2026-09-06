@@ -54,6 +54,16 @@ inline int64_t wrap_dim(int64_t dim, int64_t ndim) {
     return dim < 0 ? dim + ndim : dim;
 }
 
+inline int64_t wrap_scan_dim(int64_t dim, int64_t ndim) {
+    if (ndim == 0) {
+        if (dim == -1 || dim == 0) return 0;
+        TP_THROW(IndexError,
+                 "Dimension out of range for a scalar tensor (expected -1 or 0, but got ",
+                 dim, ")");
+    }
+    return wrap_dim(dim, ndim);
+}
+
 inline void outer_inner(const std::vector<int64_t>& shape, int64_t dim,
                         int64_t& outer, int64_t& inner) {
     outer = 1; inner = 1;
@@ -191,9 +201,14 @@ __global__ void cummaxmin_scan_kernel(int64_t n_slices, int64_t d_size, int64_t 
         vp[0] = best;
         ip[0] = 0;
         for (int64_t j = 1; j < d_size; ++j) {
-            double cur = static_cast<double>(s2p[j * inner]);
+            const T current = s2p[j * inner];
+            double cur = static_cast<double>(current);
             double b = static_cast<double>(best);
-            if ((is_max && cur > b) || (!is_max && cur < b)) { best = s2p[j * inner]; bi = j; }
+            if (cur != cur || (b == b &&
+                ((is_max && cur >= b) || (!is_max && cur <= b)))) {
+                best = current;
+                bi = j;
+            }
             vp[j * inner] = best;
             ip[j * inner] = bi;
         }
@@ -397,10 +412,15 @@ Tensor count_nonzero_cuda2(const Tensor& self, const std::vector<int64_t>& dim) 
 
 std::tuple<Tensor, Tensor> cummax_cuda(const Tensor& self, int64_t dim) {
     int64_t nd = self.dim();
-    dim = wrap_dim(dim, nd);
+    dim = wrap_scan_dim(dim, nd);
     Tensor sc = self.contiguous();
     Tensor vals = Tensor::empty(shape_of(sc), sc.dtype(), sc.device());
     Tensor idxs = Tensor::empty(shape_of(sc), DType::Int64, sc.device());
+    if (nd == 0) {
+        vals.copy_(sc);
+        idxs.fill_(Scalar(0));
+        return {vals, idxs};
+    }
     int64_t d_size = sc.size(dim);
     int64_t outer = 1, inner = 1;
     outer_inner(shape_of(sc), dim, outer, inner);
@@ -425,10 +445,15 @@ std::tuple<Tensor, Tensor> cummax_cuda(const Tensor& self, int64_t dim) {
 }
 std::tuple<Tensor, Tensor> cummin_cuda(const Tensor& self, int64_t dim) {
     int64_t nd = self.dim();
-    dim = wrap_dim(dim, nd);
+    dim = wrap_scan_dim(dim, nd);
     Tensor sc = self.contiguous();
     Tensor vals = Tensor::empty(shape_of(sc), sc.dtype(), sc.device());
     Tensor idxs = Tensor::empty(shape_of(sc), DType::Int64, sc.device());
+    if (nd == 0) {
+        vals.copy_(sc);
+        idxs.fill_(Scalar(0));
+        return {vals, idxs};
+    }
     int64_t d_size = sc.size(dim);
     int64_t outer = 1, inner = 1;
     outer_inner(shape_of(sc), dim, outer, inner);
