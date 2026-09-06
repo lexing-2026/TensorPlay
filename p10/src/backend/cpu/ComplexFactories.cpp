@@ -6,12 +6,12 @@
 // loop bodies stay scalar over contiguous buffers.
 
 #include "Tensor.h"
+#include "Complex.h"
 #include "TypePromotion.h"
 #include "Utils.h"
 #include "Exception.h"
 
 #include <vector>
-#include <complex>
 
 namespace tensorplay {
 namespace cpu {
@@ -54,26 +54,26 @@ Tensor real_cpu(const Tensor& self) {
     int64_t n = self.numel();
     switch (self.dtype()) {
         case DType::ComplexHalf: {
-            const std::complex<Half>* sp = sc.data_ptr<std::complex<Half>>();
+            const tensorplay::complex<Half>* sp = sc.data_ptr<tensorplay::complex<Half>>();
             Half* dp = out.data_ptr<Half>();
             for (int64_t i = 0; i < n; ++i) dp[i] = sp[i].real();
             break;
         }
         case DType::ComplexFloat: {
-            const std::complex<float>* sp = sc.data_ptr<std::complex<float>>();
+            const tensorplay::complex<float>* sp = sc.data_ptr<tensorplay::complex<float>>();
             float* dp = out.data_ptr<float>();
             for (int64_t i = 0; i < n; ++i) dp[i] = sp[i].real();
             break;
         }
         case DType::ComplexDouble: {
-            const std::complex<double>* sp = sc.data_ptr<std::complex<double>>();
+            const tensorplay::complex<double>* sp = sc.data_ptr<tensorplay::complex<double>>();
             double* dp = out.data_ptr<double>();
             for (int64_t i = 0; i < n; ++i) dp[i] = sp[i].real();
             break;
         }
         case DType::BComplex32: {
-            const std::complex<BFloat16>* sp =
-                sc.data_ptr<std::complex<BFloat16>>();
+            const tensorplay::complex<BFloat16>* sp =
+                sc.data_ptr<tensorplay::complex<BFloat16>>();
             BFloat16* dp = out.data_ptr<BFloat16>();
             for (int64_t i = 0; i < n; ++i) dp[i] = sp[i].real();
             break;
@@ -92,26 +92,26 @@ Tensor imag_cpu(const Tensor& self) {
     int64_t n = self.numel();
     switch (self.dtype()) {
         case DType::ComplexHalf: {
-            const std::complex<Half>* sp = sc.data_ptr<std::complex<Half>>();
+            const tensorplay::complex<Half>* sp = sc.data_ptr<tensorplay::complex<Half>>();
             Half* dp = out.data_ptr<Half>();
             for (int64_t i = 0; i < n; ++i) dp[i] = sp[i].imag();
             break;
         }
         case DType::ComplexFloat: {
-            const std::complex<float>* sp = sc.data_ptr<std::complex<float>>();
+            const tensorplay::complex<float>* sp = sc.data_ptr<tensorplay::complex<float>>();
             float* dp = out.data_ptr<float>();
             for (int64_t i = 0; i < n; ++i) dp[i] = sp[i].imag();
             break;
         }
         case DType::ComplexDouble: {
-            const std::complex<double>* sp = sc.data_ptr<std::complex<double>>();
+            const tensorplay::complex<double>* sp = sc.data_ptr<tensorplay::complex<double>>();
             double* dp = out.data_ptr<double>();
             for (int64_t i = 0; i < n; ++i) dp[i] = sp[i].imag();
             break;
         }
         case DType::BComplex32: {
-            const std::complex<BFloat16>* sp =
-                sc.data_ptr<std::complex<BFloat16>>();
+            const tensorplay::complex<BFloat16>* sp =
+                sc.data_ptr<tensorplay::complex<BFloat16>>();
             BFloat16* dp = out.data_ptr<BFloat16>();
             for (int64_t i = 0; i < n; ++i) dp[i] = sp[i].imag();
             break;
@@ -133,29 +133,29 @@ Tensor conj_cpu(const Tensor& self) {
     int64_t n = out.numel();
     switch (self.dtype()) {
         case DType::ComplexHalf: {
-            std::complex<Half>* dp = out.data_ptr<std::complex<Half>>();
+            tensorplay::complex<Half>* dp = out.data_ptr<tensorplay::complex<Half>>();
             for (int64_t i = 0; i < n; ++i)
-                dp[i] = std::complex<Half>(
+                dp[i] = tensorplay::complex<Half>(
                     dp[i].real(), static_cast<Half>(-static_cast<float>(dp[i].imag())));
             break;
         }
         case DType::ComplexFloat: {
-            std::complex<float>* dp = out.data_ptr<std::complex<float>>();
+            tensorplay::complex<float>* dp = out.data_ptr<tensorplay::complex<float>>();
             for (int64_t i = 0; i < n; ++i)
-                dp[i] = std::complex<float>(dp[i].real(), -dp[i].imag());
+                dp[i] = tensorplay::complex<float>(dp[i].real(), -dp[i].imag());
             break;
         }
         case DType::ComplexDouble: {
-            std::complex<double>* dp = out.data_ptr<std::complex<double>>();
+            tensorplay::complex<double>* dp = out.data_ptr<tensorplay::complex<double>>();
             for (int64_t i = 0; i < n; ++i)
-                dp[i] = std::complex<double>(dp[i].real(), -dp[i].imag());
+                dp[i] = tensorplay::complex<double>(dp[i].real(), -dp[i].imag());
             break;
         }
         case DType::BComplex32: {
-            std::complex<BFloat16>* dp =
-                out.data_ptr<std::complex<BFloat16>>();
+            tensorplay::complex<BFloat16>* dp =
+                out.data_ptr<tensorplay::complex<BFloat16>>();
             for (int64_t i = 0; i < n; ++i)
-                dp[i] = std::complex<BFloat16>(
+                dp[i] = tensorplay::complex<BFloat16>(
                     dp[i].real(),
                     static_cast<BFloat16>(-static_cast<float>(dp[i].imag())));
             break;
@@ -184,34 +184,34 @@ Tensor complex_cpu(const Tensor& real, const Tensor& imag) {
         case DType::Float16: {
             const Half* rp = rc.data_ptr<Half>();
             const Half* ip = ic.data_ptr<Half>();
-            std::complex<Half>* dp = out.data_ptr<std::complex<Half>>();
+            tensorplay::complex<Half>* dp = out.data_ptr<tensorplay::complex<Half>>();
             for (int64_t i = 0; i < n; ++i)
-                dp[i] = std::complex<Half>(rp[i], ip[i]);
+                dp[i] = tensorplay::complex<Half>(rp[i], ip[i]);
             break;
         }
         case DType::Float32: {
             const float* rp = rc.data_ptr<float>();
             const float* ip = ic.data_ptr<float>();
-            std::complex<float>* dp = out.data_ptr<std::complex<float>>();
+            tensorplay::complex<float>* dp = out.data_ptr<tensorplay::complex<float>>();
             for (int64_t i = 0; i < n; ++i)
-                dp[i] = std::complex<float>(rp[i], ip[i]);
+                dp[i] = tensorplay::complex<float>(rp[i], ip[i]);
             break;
         }
         case DType::Float64: {
             const double* rp = rc.data_ptr<double>();
             const double* ip = ic.data_ptr<double>();
-            std::complex<double>* dp = out.data_ptr<std::complex<double>>();
+            tensorplay::complex<double>* dp = out.data_ptr<tensorplay::complex<double>>();
             for (int64_t i = 0; i < n; ++i)
-                dp[i] = std::complex<double>(rp[i], ip[i]);
+                dp[i] = tensorplay::complex<double>(rp[i], ip[i]);
             break;
         }
         case DType::BFloat16: {
             const BFloat16* rp = rc.data_ptr<BFloat16>();
             const BFloat16* ip = ic.data_ptr<BFloat16>();
-            std::complex<BFloat16>* dp =
-                out.data_ptr<std::complex<BFloat16>>();
+            tensorplay::complex<BFloat16>* dp =
+                out.data_ptr<tensorplay::complex<BFloat16>>();
             for (int64_t i = 0; i < n; ++i)
-                dp[i] = std::complex<BFloat16>(rp[i], ip[i]);
+                dp[i] = tensorplay::complex<BFloat16>(rp[i], ip[i]);
             break;
         }
         default:
@@ -232,39 +232,41 @@ Tensor polar_cpu(const Tensor& abs_, const Tensor& angle_) {
         case DType::Float16: {
             const Half* ap = a.data_ptr<Half>();
             const Half* tp = th.data_ptr<Half>();
-            std::complex<Half>* dp = out.data_ptr<std::complex<Half>>();
+            tensorplay::complex<Half>* dp = out.data_ptr<tensorplay::complex<Half>>();
             for (int64_t i = 0; i < n; ++i) {
-                const std::complex<float> v = std::polar(
+                const tensorplay::complex<float> v = tensorplay::polar(
                     static_cast<float>(ap[i]), static_cast<float>(tp[i]));
-                dp[i] = std::complex<Half>(v.real(), v.imag());
+                dp[i] = tensorplay::complex<Half>(static_cast<Half>(v.real()),
+                                                  static_cast<Half>(v.imag()));
             }
             break;
         }
         case DType::Float32: {
             const float* ap = a.data_ptr<float>();
             const float* tp = th.data_ptr<float>();
-            std::complex<float>* dp = out.data_ptr<std::complex<float>>();
+            tensorplay::complex<float>* dp = out.data_ptr<tensorplay::complex<float>>();
             for (int64_t i = 0; i < n; ++i)
-                dp[i] = std::polar(ap[i], tp[i]);
+                dp[i] = tensorplay::polar(ap[i], tp[i]);
             break;
         }
         case DType::Float64: {
             const double* ap = a.data_ptr<double>();
             const double* tp = th.data_ptr<double>();
-            std::complex<double>* dp = out.data_ptr<std::complex<double>>();
+            tensorplay::complex<double>* dp = out.data_ptr<tensorplay::complex<double>>();
             for (int64_t i = 0; i < n; ++i)
-                dp[i] = std::polar(ap[i], tp[i]);
+                dp[i] = tensorplay::polar(ap[i], tp[i]);
             break;
         }
         case DType::BFloat16: {
             const BFloat16* ap = a.data_ptr<BFloat16>();
             const BFloat16* tp = th.data_ptr<BFloat16>();
-            std::complex<BFloat16>* dp =
-                out.data_ptr<std::complex<BFloat16>>();
+            tensorplay::complex<BFloat16>* dp =
+                out.data_ptr<tensorplay::complex<BFloat16>>();
             for (int64_t i = 0; i < n; ++i) {
-                const std::complex<float> v = std::polar(
+                const tensorplay::complex<float> v = tensorplay::polar(
                     static_cast<float>(ap[i]), static_cast<float>(tp[i]));
-                dp[i] = std::complex<BFloat16>(v.real(), v.imag());
+                dp[i] = tensorplay::complex<BFloat16>(static_cast<BFloat16>(v.real()),
+                                                      static_cast<BFloat16>(v.imag()));
             }
             break;
         }
