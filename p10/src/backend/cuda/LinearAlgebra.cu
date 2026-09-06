@@ -107,6 +107,93 @@ Tensor linalg_multi_dot_impl(const std::vector<Tensor>& tensors) {
     return ops::view(multiply(0, count - 1), output_shape);
 }
 
+int64_t shape_product(const std::vector<int64_t>& shape) {
+    int64_t product = 1;
+    for (int64_t size : shape) product *= size;
+    return product;
+}
+
+Tensor linalg_tensorinv_impl(const Tensor& self, int64_t ind) {
+    if (ind <= 0) {
+        TP_THROW(RuntimeError,
+                 "linalg.tensorinv(): ind must be a positive integer");
+    }
+    if (ind > self.dim()) {
+        TP_THROW(RuntimeError,
+                 "linalg.tensorinv(): ind must not exceed the tensor rank");
+    }
+
+    const std::vector<int64_t> shape =
+        static_cast<std::vector<int64_t>>(self.shape());
+    const auto split = shape.begin() + ind;
+    const std::vector<int64_t> front(shape.begin(), split);
+    const std::vector<int64_t> tail(split, shape.end());
+    const int64_t front_product = shape_product(front);
+    const int64_t tail_product = shape_product(tail);
+    if (front_product != tail_product) {
+        TP_THROW(RuntimeError,
+                 "linalg.tensorinv(): products of dimensions must match");
+    }
+
+    std::vector<int64_t> result_shape = tail;
+    result_shape.insert(result_shape.end(), front.begin(), front.end());
+    Tensor matrix = ops::reshape(self, {tail_product, front_product});
+    return ops::reshape(ops::linalg_inv(matrix), result_shape);
+}
+
+Tensor linalg_tensorsolve_impl(
+    const Tensor& self, const Tensor& other,
+    const std::optional<std::vector<int64_t>>& dims) {
+    Tensor working = self;
+    if (dims.has_value()) {
+        const int64_t ndim = self.dim();
+        std::vector<int64_t> normalized;
+        normalized.reserve(dims->size());
+        std::vector<bool> selected(static_cast<size_t>(ndim), false);
+        for (int64_t dim : *dims) {
+            if (dim < 0) dim += ndim;
+            if (dim < 0 || dim >= ndim) {
+                TP_THROW(IndexError,
+                         "linalg.tensorsolve(): dimension is out of range");
+            }
+            if (selected[static_cast<size_t>(dim)]) {
+                TP_THROW(ValueError,
+                         "linalg.tensorsolve(): dimensions must be unique");
+            }
+            selected[static_cast<size_t>(dim)] = true;
+            normalized.push_back(dim);
+        }
+        std::vector<int64_t> destination;
+        destination.reserve(normalized.size());
+        const int64_t first_destination =
+            ndim - static_cast<int64_t>(normalized.size());
+        for (size_t i = 0; i < normalized.size(); ++i) {
+            destination.push_back(first_destination + static_cast<int64_t>(i));
+        }
+        working = ops::movedim(working, normalized, destination);
+    }
+
+    if (other.dim() > working.dim()) {
+        TP_THROW(RuntimeError,
+                 "linalg.tensorsolve(): right-hand side rank is too large");
+    }
+    const std::vector<int64_t> working_shape =
+        static_cast<std::vector<int64_t>>(working.shape());
+    const auto split = working_shape.begin() + other.dim();
+    const std::vector<int64_t> result_shape(split, working_shape.end());
+    const int64_t result_product = shape_product(result_shape);
+    const int64_t other_product =
+        shape_product(static_cast<std::vector<int64_t>>(other.shape()));
+    if (result_product != other_product) {
+        TP_THROW(RuntimeError,
+                 "linalg.tensorsolve(): flattened dimensions must match");
+    }
+
+    Tensor matrix = ops::reshape(working, {result_product, result_product});
+    Tensor rhs = ops::reshape(other, {other_product});
+    return ops::reshape(ops::linalg_solve(matrix, rhs), result_shape);
+}
+
 }  // namespace
 
 Tensor ger_native_cuda(const Tensor& self, const Tensor& vec2) {
@@ -150,6 +237,61 @@ Tensor& linalg_multi_dot_native_cuda_out(const std::vector<Tensor>& tensors,
     if (out.device() != result.device()) {
         TP_THROW(DeviceMismatchError,
                  "linalg.multi_dot(): output device must match input device");
+    }
+    out.resize_(static_cast<std::vector<int64_t>>(result.shape()));
+    out.copy_(result);
+    return out;
+}
+
+Tensor linalg_tensorinv_native_cuda(const Tensor& self, int64_t ind) {
+    return linalg_tensorinv_impl(self, ind);
+}
+
+Tensor& linalg_tensorinv_native_cuda_out(const Tensor& self, int64_t ind,
+                                         Tensor& out) {
+    if (out.defined()) {
+        if (out.dtype() != self.dtype()) {
+            TP_THROW(TypeError,
+                     "linalg.tensorinv(): output dtype must match input dtype");
+        }
+        if (out.device() != self.device()) {
+            TP_THROW(DeviceMismatchError,
+                     "linalg.tensorinv(): output device must match input device");
+        }
+    }
+    Tensor result = linalg_tensorinv_impl(self, ind);
+    if (!out.defined()) {
+        out = result;
+        return out;
+    }
+    out.resize_(static_cast<std::vector<int64_t>>(result.shape()));
+    out.copy_(result);
+    return out;
+}
+
+Tensor linalg_tensorsolve_native_cuda(
+    const Tensor& self, const Tensor& other,
+    std::optional<std::vector<int64_t>> dims) {
+    return linalg_tensorsolve_impl(self, other, dims);
+}
+
+Tensor& linalg_tensorsolve_native_cuda_out(
+    const Tensor& self, const Tensor& other,
+    std::optional<std::vector<int64_t>> dims, Tensor& out) {
+    if (out.defined()) {
+        if (out.dtype() != self.dtype()) {
+            TP_THROW(TypeError,
+                     "linalg.tensorsolve(): output dtype must match input dtype");
+        }
+        if (out.device() != self.device()) {
+            TP_THROW(DeviceMismatchError,
+                     "linalg.tensorsolve(): output device must match input device");
+        }
+    }
+    Tensor result = linalg_tensorsolve_impl(self, other, dims);
+    if (!out.defined()) {
+        out = result;
+        return out;
     }
     out.resize_(static_cast<std::vector<int64_t>>(result.shape()));
     out.copy_(result);
@@ -214,6 +356,10 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, NativeLinearAlgebra) {
     m.impl("kron", kron_native_cuda);
     m.impl("linalg_multi_dot", linalg_multi_dot_native_cuda);
     m.impl("linalg_multi_dot.out", linalg_multi_dot_native_cuda_out);
+    m.impl("linalg_tensorinv", linalg_tensorinv_native_cuda);
+    m.impl("linalg_tensorinv.out", linalg_tensorinv_native_cuda_out);
+    m.impl("linalg_tensorsolve", linalg_tensorsolve_native_cuda);
+    m.impl("linalg_tensorsolve.out", linalg_tensorsolve_native_cuda_out);
     m.impl("matrix_power", matrix_power_native_cuda);
     m.impl("matrix_power.out", matrix_power_native_cuda_out);
     m.impl("linalg_matrix_power", matrix_power_native_cuda);
