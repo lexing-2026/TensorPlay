@@ -1,18 +1,17 @@
 #pragma once
 
-// Vectorized<std::complex<float>/<double>> for the ZVECTOR tier: a pair of
-// the inner real vectors, mirroring how the reference layer wraps the real
-// vector type. The interleaved (re, im) layout matches std::complex
-// storage, so load/store pass straight through. Complex multiply, conj and
-// abs run on vector arithmetic; the transcendental set stays on the scalar
-// <cmath> complex reference.
+// Vectorized<complex<float>/<double>> for the ZVECTOR tier: a pair of the
+// inner real vectors wrapping the real vector type. The interleaved (re, im)
+// layout permits direct load/store. Complex multiplication, conjugation and
+// magnitude run on vector arithmetic; transcendental functions use the
+// native scalar complex layer.
 
+#include "Complex.h"
 #include "cpu/vec/vec256/zarch/zarch_helpers.h"
 #include "cpu/vec/vec256/zarch/float_zarch.h"
 #include "cpu/vec/vec256/zarch/double_zarch.h"
 
 #include <cmath>
-#include <complex>
 #include <cstring>
 #include <stdexcept>
 
@@ -89,12 +88,12 @@ inline zf64 zrsign_mask_f64() {
 } // namespace zcomplex
 
 template <>
-class Vectorized<std::complex<float>> {
+class Vectorized<complex<float>> {
  private:
   Vectorized<float> _vec;
 
  public:
-  using value_type = std::complex<float>;
+  using value_type = complex<float>;
   using vinner_type = Vectorized<float>;
   using size_type = int;
   static constexpr size_type kSize = 4;
@@ -237,7 +236,7 @@ class Vectorized<std::complex<float>> {
   }
 
   Vectorized<value_type> log() const {
-    return map(std::log);
+    return map(tensorplay::log);
   }
   Vectorized<value_type> angle() const {
     Vectorized<value_type> ret;
@@ -251,16 +250,16 @@ class Vectorized<std::complex<float>> {
   }
 
   Vectorized<value_type> sin() const {
-    return map(std::sin);
+    return map(tensorplay::sin);
   }
   Vectorized<value_type> sinh() const {
-    return map(std::sinh);
+    return map(tensorplay::sinh);
   }
   Vectorized<value_type> cos() const {
-    return map(std::cos);
+    return map(tensorplay::cos);
   }
   Vectorized<value_type> cosh() const {
-    return map(std::cosh);
+    return map(tensorplay::cosh);
   }
   Vectorized<value_type> ceil() const {
     return Vectorized<value_type>(vinner_type(
@@ -278,17 +277,17 @@ class Vectorized<std::complex<float>> {
         vec_roundc(_vec.vec0()), vec_roundc(_vec.vec1())));
   }
   Vectorized<value_type> tan() const {
-    return map(std::tan);
+    return map(tensorplay::tan);
   }
   Vectorized<value_type> tanh() const {
-    return map(std::tanh);
+    return map(tensorplay::tanh);
   }
   Vectorized<value_type> trunc() const {
     return Vectorized<value_type>(vinner_type(
         vec_trunc(_vec.vec0()), vec_trunc(_vec.vec1())));
   }
   Vectorized<value_type> sqrt() const {
-    return map(std::sqrt);
+    return map(tensorplay::sqrt);
   }
   Vectorized<value_type> reciprocal() const {
     // 1/(a + bi) = (a - bi) / |a + bi|^2
@@ -305,7 +304,7 @@ class Vectorized<std::complex<float>> {
     store(x_tmp);
     exp.store(y_tmp);
     for (const auto i : tensorplay::irange(size())) {
-      x_tmp[i] = std::pow(x_tmp[i], y_tmp[i]);
+      x_tmp[i] = tensorplay::pow(x_tmp[i], y_tmp[i]);
     }
     return loadu(x_tmp);
   }
@@ -319,7 +318,7 @@ class Vectorized<std::complex<float>> {
     return ln * Vectorized<value_type>(ihalf);
   }
   Vectorized<value_type> atanh() const {
-    return map(std::atanh);
+    return map(tensorplay::atanh);
   }
   Vectorized<value_type> acos() const {
     static const vinner_type pi2{
@@ -356,11 +355,11 @@ class Vectorized<std::complex<float>> {
                     zcomplex::zswap(ln._vec.vec1()))).conj();
   }
   Vectorized<value_type> exp() const {
-    return map(std::exp);
+    return map(tensorplay::exp);
   }
   Vectorized<value_type> expm1() const {
     return map([](const value_type& z) {
-      return std::exp(z) - value_type(1, 0);
+      return tensorplay::exp(z) - value_type(1, 0);
     });
   }
 
@@ -469,67 +468,67 @@ class Vectorized<std::complex<float>> {
 
 
 template <>
-Vectorized<std::complex<float>> inline maximum(
-    const Vectorized<std::complex<float>>& a,
-    const Vectorized<std::complex<float>>& b) {
+Vectorized<complex<float>> inline maximum(
+    const Vectorized<complex<float>>& a,
+    const Vectorized<complex<float>>& b) {
   auto abs_a = a.abs_2_();
   auto abs_b = b.abs_2_();
-  return Vectorized<std::complex<float>>::elwise_blendv(
+  return Vectorized<complex<float>>::elwise_blendv(
       a, b, abs_a.elwise_lt_mask(abs_b));
 }
 
 template <>
-Vectorized<std::complex<float>> inline minimum(
-    const Vectorized<std::complex<float>>& a,
-    const Vectorized<std::complex<float>>& b) {
+Vectorized<complex<float>> inline minimum(
+    const Vectorized<complex<float>>& a,
+    const Vectorized<complex<float>>& b) {
   auto abs_a = a.abs_2_();
   auto abs_b = b.abs_2_();
-  return Vectorized<std::complex<float>>::elwise_blendv(
+  return Vectorized<complex<float>>::elwise_blendv(
       a, b, abs_a.elwise_gt_mask(abs_b));
 }
 
 template <>
-Vectorized<std::complex<float>> inline operator+(
-    const Vectorized<std::complex<float>>& a,
-    const Vectorized<std::complex<float>>& b) {
-  return Vectorized<std::complex<float>>(a.vec() + b.vec());
+Vectorized<complex<float>> inline operator+(
+    const Vectorized<complex<float>>& a,
+    const Vectorized<complex<float>>& b) {
+  return Vectorized<complex<float>>(a.vec() + b.vec());
 }
 
 template <>
-Vectorized<std::complex<float>> inline operator-(
-    const Vectorized<std::complex<float>>& a,
-    const Vectorized<std::complex<float>>& b) {
-  return Vectorized<std::complex<float>>(a.vec() - b.vec());
+Vectorized<complex<float>> inline operator-(
+    const Vectorized<complex<float>>& a,
+    const Vectorized<complex<float>>& b) {
+  return Vectorized<complex<float>>(a.vec() - b.vec());
 }
 
 template <>
-Vectorized<std::complex<float>> inline operator&(
-    const Vectorized<std::complex<float>>& a,
-    const Vectorized<std::complex<float>>& b) {
-  return Vectorized<std::complex<float>>(a.vec() & b.vec());
+Vectorized<complex<float>> inline operator&(
+    const Vectorized<complex<float>>& a,
+    const Vectorized<complex<float>>& b) {
+  return Vectorized<complex<float>>(a.vec() & b.vec());
 }
 
 template <>
-Vectorized<std::complex<float>> inline operator|(
-    const Vectorized<std::complex<float>>& a,
-    const Vectorized<std::complex<float>>& b) {
-  return Vectorized<std::complex<float>>(a.vec() | b.vec());
+Vectorized<complex<float>> inline operator|(
+    const Vectorized<complex<float>>& a,
+    const Vectorized<complex<float>>& b) {
+  return Vectorized<complex<float>>(a.vec() | b.vec());
 }
 
 template <>
-Vectorized<std::complex<float>> inline operator^(
-    const Vectorized<std::complex<float>>& a,
-    const Vectorized<std::complex<float>>& b) {
-  return Vectorized<std::complex<float>>(a.vec() ^ b.vec());
+Vectorized<complex<float>> inline operator^(
+    const Vectorized<complex<float>>& a,
+    const Vectorized<complex<float>>& b) {
+  return Vectorized<complex<float>>(a.vec() ^ b.vec());
 }
 
 template <>
-class Vectorized<std::complex<double>> {
+class Vectorized<complex<double>> {
  private:
   Vectorized<double> _vec;
 
  public:
-  using value_type = std::complex<double>;
+  using value_type = complex<double>;
   using vinner_type = Vectorized<double>;
   using size_type = int;
   static constexpr size_type kSize = 2;
@@ -669,7 +668,7 @@ class Vectorized<std::complex<double>> {
   }
 
   Vectorized<value_type> log() const {
-    return map(std::log);
+    return map(tensorplay::log);
   }
   Vectorized<value_type> angle() const {
     Vectorized<value_type> ret;
@@ -683,16 +682,16 @@ class Vectorized<std::complex<double>> {
   }
 
   Vectorized<value_type> sin() const {
-    return map(std::sin);
+    return map(tensorplay::sin);
   }
   Vectorized<value_type> sinh() const {
-    return map(std::sinh);
+    return map(tensorplay::sinh);
   }
   Vectorized<value_type> cos() const {
-    return map(std::cos);
+    return map(tensorplay::cos);
   }
   Vectorized<value_type> cosh() const {
-    return map(std::cosh);
+    return map(tensorplay::cosh);
   }
   Vectorized<value_type> ceil() const {
     return Vectorized<value_type>(vinner_type(
@@ -710,17 +709,17 @@ class Vectorized<std::complex<double>> {
         vec_roundc(_vec.vec0()), vec_roundc(_vec.vec1())));
   }
   Vectorized<value_type> tan() const {
-    return map(std::tan);
+    return map(tensorplay::tan);
   }
   Vectorized<value_type> tanh() const {
-    return map(std::tanh);
+    return map(tensorplay::tanh);
   }
   Vectorized<value_type> trunc() const {
     return Vectorized<value_type>(vinner_type(
         vec_trunc(_vec.vec0()), vec_trunc(_vec.vec1())));
   }
   Vectorized<value_type> sqrt() const {
-    return map(std::sqrt);
+    return map(tensorplay::sqrt);
   }
   Vectorized<value_type> reciprocal() const {
     vinner_type c_d = conj()._vec;
@@ -736,7 +735,7 @@ class Vectorized<std::complex<double>> {
     store(x_tmp);
     exp.store(y_tmp);
     for (const auto i : tensorplay::irange(size())) {
-      x_tmp[i] = std::pow(x_tmp[i], y_tmp[i]);
+      x_tmp[i] = tensorplay::pow(x_tmp[i], y_tmp[i]);
     }
     return loadu(x_tmp);
   }
@@ -749,7 +748,7 @@ class Vectorized<std::complex<double>> {
     return ln * Vectorized<value_type>(ihalf);
   }
   Vectorized<value_type> atanh() const {
-    return map(std::atanh);
+    return map(tensorplay::atanh);
   }
   Vectorized<value_type> acos() const {
     static const vinner_type pi2{
@@ -781,11 +780,11 @@ class Vectorized<std::complex<double>> {
                     zcomplex::zswap(ln._vec.vec1()))).conj();
   }
   Vectorized<value_type> exp() const {
-    return map(std::exp);
+    return map(tensorplay::exp);
   }
   Vectorized<value_type> expm1() const {
     return map([](const value_type& z) {
-      return std::exp(z) - value_type(1, 0);
+      return tensorplay::exp(z) - value_type(1, 0);
     });
   }
 
@@ -881,58 +880,58 @@ class Vectorized<std::complex<double>> {
 };
 
 template <>
-Vectorized<std::complex<double>> inline maximum(
-    const Vectorized<std::complex<double>>& a,
-    const Vectorized<std::complex<double>>& b) {
+Vectorized<complex<double>> inline maximum(
+    const Vectorized<complex<double>>& a,
+    const Vectorized<complex<double>>& b) {
   auto abs_a = a.abs_2_();
   auto abs_b = b.abs_2_();
-  return Vectorized<std::complex<double>>::elwise_blendv(
+  return Vectorized<complex<double>>::elwise_blendv(
       a, b, abs_a.elwise_lt_mask(abs_b));
 }
 
 template <>
-Vectorized<std::complex<double>> inline minimum(
-    const Vectorized<std::complex<double>>& a,
-    const Vectorized<std::complex<double>>& b) {
+Vectorized<complex<double>> inline minimum(
+    const Vectorized<complex<double>>& a,
+    const Vectorized<complex<double>>& b) {
   auto abs_a = a.abs_2_();
   auto abs_b = b.abs_2_();
-  return Vectorized<std::complex<double>>::elwise_blendv(
+  return Vectorized<complex<double>>::elwise_blendv(
       a, b, abs_a.elwise_gt_mask(abs_b));
 }
 
 template <>
-Vectorized<std::complex<double>> inline operator+(
-    const Vectorized<std::complex<double>>& a,
-    const Vectorized<std::complex<double>>& b) {
-  return Vectorized<std::complex<double>>(a.vec() + b.vec());
+Vectorized<complex<double>> inline operator+(
+    const Vectorized<complex<double>>& a,
+    const Vectorized<complex<double>>& b) {
+  return Vectorized<complex<double>>(a.vec() + b.vec());
 }
 
 template <>
-Vectorized<std::complex<double>> inline operator-(
-    const Vectorized<std::complex<double>>& a,
-    const Vectorized<std::complex<double>>& b) {
-  return Vectorized<std::complex<double>>(a.vec() - b.vec());
+Vectorized<complex<double>> inline operator-(
+    const Vectorized<complex<double>>& a,
+    const Vectorized<complex<double>>& b) {
+  return Vectorized<complex<double>>(a.vec() - b.vec());
 }
 
 template <>
-Vectorized<std::complex<double>> inline operator&(
-    const Vectorized<std::complex<double>>& a,
-    const Vectorized<std::complex<double>>& b) {
-  return Vectorized<std::complex<double>>(a.vec() & b.vec());
+Vectorized<complex<double>> inline operator&(
+    const Vectorized<complex<double>>& a,
+    const Vectorized<complex<double>>& b) {
+  return Vectorized<complex<double>>(a.vec() & b.vec());
 }
 
 template <>
-Vectorized<std::complex<double>> inline operator|(
-    const Vectorized<std::complex<double>>& a,
-    const Vectorized<std::complex<double>>& b) {
-  return Vectorized<std::complex<double>>(a.vec() | b.vec());
+Vectorized<complex<double>> inline operator|(
+    const Vectorized<complex<double>>& a,
+    const Vectorized<complex<double>>& b) {
+  return Vectorized<complex<double>>(a.vec() | b.vec());
 }
 
 template <>
-Vectorized<std::complex<double>> inline operator^(
-    const Vectorized<std::complex<double>>& a,
-    const Vectorized<std::complex<double>>& b) {
-  return Vectorized<std::complex<double>>(a.vec() ^ b.vec());
+Vectorized<complex<double>> inline operator^(
+    const Vectorized<complex<double>>& a,
+    const Vectorized<complex<double>>& b) {
+  return Vectorized<complex<double>>(a.vec() ^ b.vec());
 }
 
 
