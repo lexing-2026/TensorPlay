@@ -2609,11 +2609,9 @@ Tensor searchsorted_impl_cuda(const Tensor& seq_f, const Tensor& vals_f, bool ou
     case DType::name: return run(ctype{});
     switch (vals.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_SS_CASE)
-        default: {
-        Tensor seq_d = seq.to(DType::Float64);
-        Tensor vals_d = vals.to(DType::Float64);
-        return searchsorted_impl_cuda(seq_d, vals_d, out_int32, right);
-        }
+        default:
+            TP_THROW(TypeError, "searchsorted: unsupported dtype ",
+                    toString(vals.dtype()));
     }
 #undef TP_SS_CASE
     return result;
