@@ -47,7 +47,7 @@ inline double calc_digamma(double x) {
     // the computation of pi * x is a source of error (when |x| > 1).
     double q, r;
     r = std::modf(x, &q);
-    return calc_digamma(1 - x) - kPi() / tan(kPi() * r);
+    return calc_digamma(1 - x) - kPi() / std::tan(kPi() * r);
   }
 
   // Push x to be >= 10
@@ -76,7 +76,7 @@ inline double calc_digamma(double x) {
     double z = 1.0 / (x * x);
     y = z * polevl(z, A, 6);
   }
-  return result + log(x) - (0.5 / x) - y;
+  return result + std::log(x) - (0.5 / x) - y;
 }
 
 template <typename T>
