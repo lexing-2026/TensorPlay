@@ -413,3 +413,50 @@ def test_generated_kernels_are_keyed_on_the_runtime_library(tmp_path, monkeypatc
     empty = cpp_codegen._runtime_fingerprint(str(tmp_path / "absent"))
     cpp_codegen._RUNTIME_FINGERPRINTS.clear()
     assert cpp_codegen._runtime_fingerprint(str(tmp_path / "absent")) == empty
+
+
+def test_native_linear_probes_the_runtime_before_emitting_it():
+    """The lowering and the runtime library are built separately.
+
+    A tree can hold one newer than the other, so the fused node is only
+    emitted once the loaded runtime has been shown to run it; otherwise the
+    transpose-product-add form carries the region.
+    """
+    from tensorplay._stax import stax as stax_mod
+
+    stax_mod._NATIVE_OP_SUPPORT.pop("linear", None)
+    first = stax_mod._native_runs_linear()
+    assert isinstance(first, bool)
+    # Probed once: the answer is memoized rather than re-executed per region.
+    stax_mod._NATIVE_OP_SUPPORT["linear"] = not first
+    assert stax_mod._native_runs_linear() is (not first)
+    stax_mod._NATIVE_OP_SUPPORT["linear"] = first
+
+
+def test_compiled_linear_matches_the_uncompiled_one():
+    import tensorplay.nn as nn
+
+    tensorplay.manual_seed(0)
+    model = nn.Linear(24, 40).eval()
+    x = tensorplay.randn(6, 24)
+    compiled = tensorplay.compile(model, backend="stax")
+    with tensorplay.no_grad():
+        got = compiled(x)
+        np.testing.assert_allclose(
+            got.numpy(), model(x).numpy(), rtol=1e-6, atol=1e-6
+        )
+    lowering = next(iter(compiled._tensorplay_cache.values()))
+    assert lowering._tensorplay_codegen == "stax-native"
+
+
+def test_compiled_linear_without_bias_matches():
+    import tensorplay.nn as nn
+
+    tensorplay.manual_seed(1)
+    model = nn.Linear(16, 16, bias=False).eval()
+    x = tensorplay.randn(5, 3, 16)
+    compiled = tensorplay.compile(model, backend="stax")
+    with tensorplay.no_grad():
+        np.testing.assert_allclose(
+            compiled(x).numpy(), model(x).numpy(), rtol=1e-6, atol=1e-6
+        )

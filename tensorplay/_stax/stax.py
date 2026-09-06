@@ -2726,6 +2726,40 @@ def _fold_eval_conv_batch_norm(
     return folded
 
 
+_NATIVE_OP_SUPPORT: dict[str, bool] = {}
+
+
+def _native_runs_linear() -> bool:
+    """Whether the loaded runtime can execute a fused ``linear`` node.
+
+    The lowering and the runtime library are built separately, and a tree can
+    hold one newer than the other, so a node this module knows how to emit is
+    not necessarily one the runtime knows how to run.  Probed once per
+    process with a one-node graph; a runtime that cannot run it keeps the
+    transpose-product-add form, which every runtime can.
+    """
+
+    known = _NATIVE_OP_SUPPORT.get("linear")
+    if known is not None:
+        return known
+    supported = False
+    try:
+        import tensorplay
+
+        native = tensorplay._C._stax
+        graph = native.Graph()
+        node = graph.create_node("linear", "probe")
+        node.add_input(graph.add_input())
+        node.add_input(graph.add_input())
+        graph.register_output(node.add_output())
+        graph.execute([tensorplay.zeros((1, 1)), tensorplay.zeros((1, 1))])
+        supported = True
+    except Exception:  # noqa: BLE001 - any failure means "emit the long form"
+        supported = False
+    _NATIVE_OP_SUPPORT["linear"] = supported
+    return supported
+
+
 def _lower_native(
     graph_module: GraphModule,
     example_inputs: list[Any],
@@ -3303,6 +3337,19 @@ def _lower_native(
                 if value_node is not None
             ):
                 return None
+
+            # One node, not a transpose plus a product plus an addition: the
+            # bias belongs in the product's epilogue, and adding it back
+            # separately costs a whole pass over the output.
+            if _native_runs_linear():
+                fused = graph.create_node("linear", node.name)
+                fused.add_input(values[input_node])
+                fused.add_input(values[weight_node])
+                if bias_node is not None:
+                    fused.add_input(values[bias_node])
+                values[node] = fused.add_output()
+                layout_values[node] = False
+                continue
 
             transpose = graph.create_node("t", f"{node.name}_weight_t")
             transpose.add_input(values[weight_node])

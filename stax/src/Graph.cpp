@@ -410,6 +410,20 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                 throw std::runtime_error("Stax mm expects two tensor inputs");
             }
             result = tpx::ops::mm(value(node.inputs[0]), value(node.inputs[1]));
+        } else if (node.op_type == "linear") {
+            // One node rather than a transpose, a product and an addition:
+            // the bias belongs in the product's epilogue, and splitting it
+            // out costs a full pass over the output to add it back.
+            if (node.inputs.size() != 2 && node.inputs.size() != 3) {
+                throw std::runtime_error(
+                    "Stax linear expects an input, a weight and an optional bias");
+            }
+            std::optional<Tensor> bias;
+            if (node.inputs.size() == 3) {
+                bias = value(node.inputs[2]);
+            }
+            result = tpx::ops::linear(
+                value(node.inputs[0]), value(node.inputs[1]), bias);
         } else if (node.op_type == "t") {
             if (node.inputs.size() != 1) {
                 throw std::runtime_error("Stax t expects one tensor input");
