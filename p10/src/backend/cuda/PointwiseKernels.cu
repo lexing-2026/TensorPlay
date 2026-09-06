@@ -719,9 +719,8 @@ struct RreluWithNoiseFunctor {
     }
 };
 struct RreluWithNoiseTrainBackwardFunctor {
-    // noise=1 for positive elements; this kernel masks with self instead).
-    template<typename T> __device__ T operator()(T dy, T x, T r) const {
-        return x <= static_cast<T>(0) ? dy * r : dy;
+    template<typename T> __device__ T operator()(T dy, T noise) const {
+        return dy * noise;
     }
 };
 struct RreluWithNoiseEvalBackwardFunctor {
@@ -731,13 +730,6 @@ struct RreluWithNoiseEvalBackwardFunctor {
         return x >= static_cast<T>(0) ? dy : dy * static_cast<T>(slope_);
     }
 };
-
-template <typename T, typename Func>
-__global__ void ternary_kernel_cuda_impl(int64_t n, const T* a, const T* b, const T* c, T* out, Func func) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) out[i] = func(a[i], b[i], c[i]);
-}
 
 // Forward declaration: first call sites (rrelu_with_noise) precede the
 // definition below, and nvcc's two-phase lookup needs the template declared.
@@ -806,33 +798,13 @@ std::tuple<Tensor, Tensor> log_sigmoid_forward_out_cuda(const Tensor& self,
     return std::make_tuple(output, buffer);
 }
 Tensor rrelu_with_noise_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, const Tensor& noise, Scalar lower, Scalar upper, bool training, bool self_is_result) {
-    // (masked by self here, see functor note); eval -> leaky_relu_backward
-    // with slope (lower + upper) / 2.
+    // Training uses the saved per-element noise; evaluation uses the mean
+    // slope (lower + upper) / 2.
     if (training) {
-        if (grad_output.shape() != self.shape() || grad_output.shape() != noise.shape())
+        if (grad_output.shape() != noise.shape())
             TP_THROW(RuntimeError, "rrelu_with_noise_backward: shape mismatch");
-        DType dt = grad_output.dtype();
-        if (dt != DType::Float32 && dt != DType::Float64)
-            TP_THROW(TypeError, "rrelu_with_noise_backward CUDA supports Float32/Float64 only");
-        Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(grad_output.shape()), dt, grad_output.device());
-        const int64_t n = grad_output.numel();
-        if (n == 0) return result;
-        const Tensor gc = grad_output.contiguous();
-        const Tensor sc = self.contiguous();
-        const Tensor nc = noise.contiguous();
-        dim3 block(256);
-        dim3 grid((unsigned)((n + 255) / 256));
-        if (dt == DType::Float32) {
-            ternary_kernel_cuda_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
-                n, gc.data_ptr<float>(), sc.data_ptr<float>(), nc.data_ptr<float>(),
-                result.data_ptr<float>(), RreluWithNoiseTrainBackwardFunctor());
-        } else {
-            ternary_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
-                n, gc.data_ptr<double>(), sc.data_ptr<double>(), nc.data_ptr<double>(),
-                result.data_ptr<double>(), RreluWithNoiseTrainBackwardFunctor());
-        }
-        CUDA_CHECK(cudaGetLastError());
-        return result;
+        return binary_float_op_kernel_v2(
+            grad_output, noise, RreluWithNoiseTrainBackwardFunctor());
     }
     (void)self_is_result; // result >= 0 iff self >= 0 for a positive slope.
     const double slope = (lower.toDouble() + upper.toDouble()) / 2.0;
