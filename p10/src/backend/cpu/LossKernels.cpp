@@ -360,22 +360,22 @@ Tensor huber_loss_backward_cpu(const Tensor& grad_output, const Tensor& input,
 
 Tensor kl_div_kernel(const Tensor& input, const Tensor& target,
                      int64_t reduction, bool log_target) {
-    Tensor nz = target.ne(0).to(input.dtype());
     Tensor loss;
     if (!log_target) {
+        Tensor nz = target.ne(0).to(input.dtype());
         loss = (xlogy_shim(target, target) - target * input) * nz;
     } else {
         Tensor t = target.exp();
-        loss = (t * (target - input)) * nz;
+        loss = t * (target - input);
     }
     return loss_reduce(loss, reduction);
 }
 
 Tensor kl_div_backward_kernel(const Tensor& grad_output, const Tensor& input,
                               const Tensor& target, int64_t reduction, bool log_target) {
-    Tensor nz = target.ne(0).to(input.dtype());
     Tensor g;
     if (!log_target) {
+        Tensor nz = target.ne(0).to(input.dtype());
         g = (-target * nz) * grad_output;   // d/dinput of -target*input
     } else {
         g = -(target.exp()) * grad_output;
@@ -516,9 +516,9 @@ Tensor poisson_nll_loss_kernel(const Tensor& input, const Tensor& target,
     }
     if (full) {
         // Stirling approximation term: t*log(t) - t + 0.5*log(2*pi*t), for t>0
-        Tensor pos = target.gt(0).to(input.dtype());
-        Tensor t_safe = target + (1.0 - pos);   // avoid log(0)
-        Tensor stirling = (xlogy_shim(target, t_safe) - t_safe +
+        Tensor pos = target.gt(1).to(input.dtype());
+        Tensor t_safe = Tensor::where(pos, target, Tensor::ones_like(target));
+        Tensor stirling = (xlogy_shim(target, t_safe) - target +
                            (t_safe * (2.0 * M_PI)).log() * 0.5) * pos;
         loss = loss + stirling;
     }
