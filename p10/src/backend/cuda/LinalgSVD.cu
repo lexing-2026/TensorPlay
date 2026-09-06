@@ -5,12 +5,12 @@
 #include "CUDAContext.h"
 #include "Exception.h"
 #include "LinearAlgebraNames.h"
+#include "Complex.h"
 
 #include <cublas_v2.h>
 #include <cusolverDn.h>
 
 #include <algorithm>
-#include <complex>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -106,10 +106,10 @@ void dispatch_svd_dtype(DType dtype, Fn&& fn) {
             fn(static_cast<double*>(nullptr));
             return;
         case DType::ComplexFloat:
-            fn(static_cast<std::complex<float>*>(nullptr));
+            fn(static_cast<tensorplay::complex<float>*>(nullptr));
             return;
         case DType::ComplexDouble:
-            fn(static_cast<std::complex<double>*>(nullptr));
+            fn(static_cast<tensorplay::complex<double>*>(nullptr));
             return;
         default:
             TP_THROW(NotImplementedError,
@@ -283,7 +283,7 @@ struct SvdCusolverTraits<double> {
 };
 
 template <>
-struct SvdCusolverTraits<std::complex<float>> {
+struct SvdCusolverTraits<tensorplay::complex<float>> {
     using value_t = float;
 
     static cusolverStatus_t gesvd_buffer_size(cusolverDnHandle_t handle,
@@ -292,9 +292,9 @@ struct SvdCusolverTraits<std::complex<float>> {
     }
     static cusolverStatus_t gesvd(
             cusolverDnHandle_t handle, signed char jobu, signed char jobvt,
-            int m, int n, std::complex<float>* a, int lda, float* s,
-            std::complex<float>* u, int ldu, std::complex<float>* vt, int ldvt,
-            std::complex<float>* work, int lwork, float* rwork, int* info) {
+            int m, int n, tensorplay::complex<float>* a, int lda, float* s,
+            tensorplay::complex<float>* u, int ldu, tensorplay::complex<float>* vt, int ldvt,
+            tensorplay::complex<float>* work, int lwork, float* rwork, int* info) {
         return cusolverDnCgesvd(
                 handle, jobu, jobvt, m, n, reinterpret_cast<cuComplex*>(a), lda,
                 s, reinterpret_cast<cuComplex*>(u), ldu,
@@ -303,8 +303,8 @@ struct SvdCusolverTraits<std::complex<float>> {
     }
     static cusolverStatus_t gesvdj_buffer_size(
             cusolverDnHandle_t handle, cusolverEigMode_t jobz, int econ,
-            int m, int n, std::complex<float>* a, int lda, float* s,
-            std::complex<float>* u, int ldu, std::complex<float>* v, int ldv,
+            int m, int n, tensorplay::complex<float>* a, int lda, float* s,
+            tensorplay::complex<float>* u, int ldu, tensorplay::complex<float>* v, int ldv,
             int* lwork, gesvdjInfo_t params) {
         return cusolverDnCgesvdj_bufferSize(
                 handle, jobz, econ, m, n, reinterpret_cast<cuComplex*>(a), lda,
@@ -313,9 +313,9 @@ struct SvdCusolverTraits<std::complex<float>> {
     }
     static cusolverStatus_t gesvdj(
             cusolverDnHandle_t handle, cusolverEigMode_t jobz, int econ,
-            int m, int n, std::complex<float>* a, int lda, float* s,
-            std::complex<float>* u, int ldu, std::complex<float>* v, int ldv,
-            std::complex<float>* work, int lwork, int* info,
+            int m, int n, tensorplay::complex<float>* a, int lda, float* s,
+            tensorplay::complex<float>* u, int ldu, tensorplay::complex<float>* v, int ldv,
+            tensorplay::complex<float>* work, int lwork, int* info,
             gesvdjInfo_t params) {
         return cusolverDnCgesvdj(
                 handle, jobz, econ, m, n, reinterpret_cast<cuComplex*>(a), lda,
@@ -325,8 +325,8 @@ struct SvdCusolverTraits<std::complex<float>> {
     }
     static cusolverStatus_t gesvdj_batched_buffer_size(
             cusolverDnHandle_t handle, cusolverEigMode_t jobz, int m, int n,
-            std::complex<float>* a, int lda, float* s, std::complex<float>* u,
-            int ldu, std::complex<float>* v, int ldv, int* lwork,
+            tensorplay::complex<float>* a, int lda, float* s, tensorplay::complex<float>* u,
+            int ldu, tensorplay::complex<float>* v, int ldv, int* lwork,
             gesvdjInfo_t params, int batch) {
         return cusolverDnCgesvdjBatched_bufferSize(
                 handle, jobz, m, n, reinterpret_cast<cuComplex*>(a), lda, s,
@@ -335,9 +335,9 @@ struct SvdCusolverTraits<std::complex<float>> {
     }
     static cusolverStatus_t gesvdj_batched(
             cusolverDnHandle_t handle, cusolverEigMode_t jobz, int m, int n,
-            std::complex<float>* a, int lda, float* s, std::complex<float>* u,
-            int ldu, std::complex<float>* v, int ldv,
-            std::complex<float>* work, int lwork, int* info,
+            tensorplay::complex<float>* a, int lda, float* s, tensorplay::complex<float>* u,
+            int ldu, tensorplay::complex<float>* v, int ldv,
+            tensorplay::complex<float>* work, int lwork, int* info,
             gesvdjInfo_t params, int batch) {
         return cusolverDnCgesvdjBatched(
                 handle, jobz, m, n, reinterpret_cast<cuComplex*>(a), lda, s,
@@ -347,9 +347,9 @@ struct SvdCusolverTraits<std::complex<float>> {
     }
     static cusolverStatus_t gesvda_buffer_size(
             cusolverDnHandle_t handle, cusolverEigMode_t jobz, int rank, int m,
-            int n, std::complex<float>* a, int lda, long long stride_a,
-            float* s, long long stride_s, std::complex<float>* u, int ldu,
-            long long stride_u, std::complex<float>* v, int ldv,
+            int n, tensorplay::complex<float>* a, int lda, long long stride_a,
+            float* s, long long stride_s, tensorplay::complex<float>* u, int ldu,
+            long long stride_u, tensorplay::complex<float>* v, int ldv,
             long long stride_v, int* lwork, int batch) {
         return cusolverDnCgesvdaStridedBatched_bufferSize(
                 handle, jobz, rank, m, n, reinterpret_cast<cuComplex*>(a), lda,
@@ -359,10 +359,10 @@ struct SvdCusolverTraits<std::complex<float>> {
     }
     static cusolverStatus_t gesvda(
             cusolverDnHandle_t handle, cusolverEigMode_t jobz, int rank, int m,
-            int n, std::complex<float>* a, int lda, long long stride_a,
-            float* s, long long stride_s, std::complex<float>* u, int ldu,
-            long long stride_u, std::complex<float>* v, int ldv,
-            long long stride_v, std::complex<float>* work, int lwork,
+            int n, tensorplay::complex<float>* a, int lda, long long stride_a,
+            float* s, long long stride_s, tensorplay::complex<float>* u, int ldu,
+            long long stride_u, tensorplay::complex<float>* v, int ldv,
+            long long stride_v, tensorplay::complex<float>* work, int lwork,
             int* info, double* residual, int batch) {
         return cusolverDnCgesvdaStridedBatched(
                 handle, jobz, rank, m, n, reinterpret_cast<cuComplex*>(a), lda,
@@ -374,7 +374,7 @@ struct SvdCusolverTraits<std::complex<float>> {
 };
 
 template <>
-struct SvdCusolverTraits<std::complex<double>> {
+struct SvdCusolverTraits<tensorplay::complex<double>> {
     using value_t = double;
 
     static cusolverStatus_t gesvd_buffer_size(cusolverDnHandle_t handle,
@@ -383,9 +383,9 @@ struct SvdCusolverTraits<std::complex<double>> {
     }
     static cusolverStatus_t gesvd(
             cusolverDnHandle_t handle, signed char jobu, signed char jobvt,
-            int m, int n, std::complex<double>* a, int lda, double* s,
-            std::complex<double>* u, int ldu, std::complex<double>* vt,
-            int ldvt, std::complex<double>* work, int lwork, double* rwork,
+            int m, int n, tensorplay::complex<double>* a, int lda, double* s,
+            tensorplay::complex<double>* u, int ldu, tensorplay::complex<double>* vt,
+            int ldvt, tensorplay::complex<double>* work, int lwork, double* rwork,
             int* info) {
         return cusolverDnZgesvd(
                 handle, jobu, jobvt, m, n,
@@ -396,8 +396,8 @@ struct SvdCusolverTraits<std::complex<double>> {
     }
     static cusolverStatus_t gesvdj_buffer_size(
             cusolverDnHandle_t handle, cusolverEigMode_t jobz, int econ,
-            int m, int n, std::complex<double>* a, int lda, double* s,
-            std::complex<double>* u, int ldu, std::complex<double>* v, int ldv,
+            int m, int n, tensorplay::complex<double>* a, int lda, double* s,
+            tensorplay::complex<double>* u, int ldu, tensorplay::complex<double>* v, int ldv,
             int* lwork, gesvdjInfo_t params) {
         return cusolverDnZgesvdj_bufferSize(
                 handle, jobz, econ, m, n,
@@ -407,9 +407,9 @@ struct SvdCusolverTraits<std::complex<double>> {
     }
     static cusolverStatus_t gesvdj(
             cusolverDnHandle_t handle, cusolverEigMode_t jobz, int econ,
-            int m, int n, std::complex<double>* a, int lda, double* s,
-            std::complex<double>* u, int ldu, std::complex<double>* v, int ldv,
-            std::complex<double>* work, int lwork, int* info,
+            int m, int n, tensorplay::complex<double>* a, int lda, double* s,
+            tensorplay::complex<double>* u, int ldu, tensorplay::complex<double>* v, int ldv,
+            tensorplay::complex<double>* work, int lwork, int* info,
             gesvdjInfo_t params) {
         return cusolverDnZgesvdj(
                 handle, jobz, econ, m, n,
@@ -420,8 +420,8 @@ struct SvdCusolverTraits<std::complex<double>> {
     }
     static cusolverStatus_t gesvdj_batched_buffer_size(
             cusolverDnHandle_t handle, cusolverEigMode_t jobz, int m, int n,
-            std::complex<double>* a, int lda, double* s,
-            std::complex<double>* u, int ldu, std::complex<double>* v, int ldv,
+            tensorplay::complex<double>* a, int lda, double* s,
+            tensorplay::complex<double>* u, int ldu, tensorplay::complex<double>* v, int ldv,
             int* lwork, gesvdjInfo_t params, int batch) {
         return cusolverDnZgesvdjBatched_bufferSize(
                 handle, jobz, m, n,
@@ -432,9 +432,9 @@ struct SvdCusolverTraits<std::complex<double>> {
     }
     static cusolverStatus_t gesvdj_batched(
             cusolverDnHandle_t handle, cusolverEigMode_t jobz, int m, int n,
-            std::complex<double>* a, int lda, double* s,
-            std::complex<double>* u, int ldu, std::complex<double>* v, int ldv,
-            std::complex<double>* work, int lwork, int* info,
+            tensorplay::complex<double>* a, int lda, double* s,
+            tensorplay::complex<double>* u, int ldu, tensorplay::complex<double>* v, int ldv,
+            tensorplay::complex<double>* work, int lwork, int* info,
             gesvdjInfo_t params, int batch) {
         return cusolverDnZgesvdjBatched(
                 handle, jobz, m, n,
@@ -446,9 +446,9 @@ struct SvdCusolverTraits<std::complex<double>> {
     }
     static cusolverStatus_t gesvda_buffer_size(
             cusolverDnHandle_t handle, cusolverEigMode_t jobz, int rank, int m,
-            int n, std::complex<double>* a, int lda, long long stride_a,
-            double* s, long long stride_s, std::complex<double>* u, int ldu,
-            long long stride_u, std::complex<double>* v, int ldv,
+            int n, tensorplay::complex<double>* a, int lda, long long stride_a,
+            double* s, long long stride_s, tensorplay::complex<double>* u, int ldu,
+            long long stride_u, tensorplay::complex<double>* v, int ldv,
             long long stride_v, int* lwork, int batch) {
         return cusolverDnZgesvdaStridedBatched_bufferSize(
                 handle, jobz, rank, m, n,
@@ -459,10 +459,10 @@ struct SvdCusolverTraits<std::complex<double>> {
     }
     static cusolverStatus_t gesvda(
             cusolverDnHandle_t handle, cusolverEigMode_t jobz, int rank, int m,
-            int n, std::complex<double>* a, int lda, long long stride_a,
-            double* s, long long stride_s, std::complex<double>* u, int ldu,
-            long long stride_u, std::complex<double>* v, int ldv,
-            long long stride_v, std::complex<double>* work, int lwork,
+            int n, tensorplay::complex<double>* a, int lda, long long stride_a,
+            double* s, long long stride_s, tensorplay::complex<double>* u, int ldu,
+            long long stride_u, tensorplay::complex<double>* v, int ldv,
+            long long stride_v, tensorplay::complex<double>* work, int lwork,
             int* info, double* residual, int batch) {
         return cusolverDnZgesvdaStridedBatched(
                 handle, jobz, rank, m, n,
