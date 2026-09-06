@@ -364,6 +364,9 @@ Tensor logsumexp_cpu(const Tensor& self, int64_t dim, bool keepdim) {
 
 Tensor nansum_cpu(const Tensor& self, const std::vector<int64_t>& dim_in,
                   bool keepdim) {
+    if (isComplexType(self.dtype())) {
+        TP_THROW(RuntimeError, "nansum on CPU does not support complex inputs");
+    }
     const DType out_dt = isFloatingType(self.dtype()) ? self.dtype() : DType::Int64;
     std::vector<int64_t> dim = dim_in;
     if (dim.empty()) {
@@ -800,9 +803,24 @@ Tensor renorm_cpu(const Tensor& self, Scalar p, int64_t dim, Scalar maxnorm) {
 Tensor nanmean_cpu(const Tensor& self, std::optional<int64_t> dim_opt,
                   bool keepdim, std::optional<DType> dtype) {
     DType acc_dt = dtype.value_or(DType::Undefined);
+    if (!isFloatingType(self.dtype()) && !isComplexType(self.dtype())) {
+        TP_THROW(TypeError,
+                 "nanmean(): expected input to have floating point or complex dtype but got ",
+                 toString(self.dtype()));
+    }
+    if (acc_dt != DType::Undefined && !isFloatingType(acc_dt) &&
+        !isComplexType(acc_dt)) {
+        TP_THROW(TypeError,
+                 "nanmean(): could not infer output dtype. Optional dtype must be either a floating point or complex dtype. Got: ",
+                 toString(acc_dt));
+    }
     Tensor x = self;
-    if (!isFloatingType(x.dtype()) && !isComplexType(x.dtype())) {
-        x = x.to(acc_dt != DType::Undefined ? acc_dt : DType::Float32);
+    const bool complex_output_from_real =
+        acc_dt != DType::Undefined && isComplexType(acc_dt) &&
+        !isComplexType(x.dtype());
+    if (acc_dt != DType::Undefined && x.dtype() != acc_dt &&
+        !complex_output_from_real) {
+        x = x.to(acc_dt);
     } else if (isReducedFloatingType(x.dtype()) && acc_dt == DType::Undefined) {
         x = x.to(DType::Float32);
     }
