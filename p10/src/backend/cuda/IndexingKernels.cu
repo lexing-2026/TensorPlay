@@ -839,10 +839,10 @@ __global__ void scatter_kernel(int64_t total_idx, int64_t idx_dim_size, int64_t 
     }
 }
 
-template <typename T>
+template <typename T, typename IndexT>
 __global__ void index_add_kernel(int64_t total, int64_t inner, int64_t row,
                                  int64_t n_idx,
-                                 T* d, const int64_t* ip, const T* sp) {
+                                 T* d, const IndexT* ip, const T* sp) {
     // One thread per (source position, inner column): adds sv into the
     // selected destination slice.
     int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -862,6 +862,32 @@ __global__ void index_add_kernel(int64_t total, int64_t inner, int64_t row,
             indexed_atomic_add(&d[(o * row + iv) * inner + c], sp[t]);
         }
     }
+}
+
+template <typename IndexT>
+void launch_index_add_for_index(
+        int64_t total, int64_t inner, int64_t row, int64_t n_idx,
+        const Tensor& result, const Tensor& index, const Tensor& source,
+        cudaStream_t stream) {
+#define TP_IADD_CASE(ctype, name) \
+    case DType::name: \
+        index_add_kernel<ctype, IndexT><<< \
+            (total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+            total, inner, row, n_idx, \
+            static_cast<ctype*>(result.data_ptr()), \
+            index.data_ptr<IndexT>(), \
+            static_cast<const ctype*>(source.data_ptr())); \
+        break;
+    switch (result.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_IADD_CASE)
+        TP_IADD_CASE(tensorplay::complex<Half>, ComplexHalf)
+        TP_IADD_CASE(tensorplay::complex<float>, ComplexFloat)
+        TP_IADD_CASE(tensorplay::complex<double>, ComplexDouble)
+        TP_IADD_CASE(tensorplay::complex<BFloat16>, BComplex32)
+        default:
+            TP_THROW(NotImplementedError, "index_add on CUDA does not support this dtype");
+    }
+#undef TP_IADD_CASE
 }
 
 // Index-select row gather.
@@ -2208,7 +2234,8 @@ Tensor index_select_cuda(const Tensor& self, int64_t dim, const Tensor& index) {
 Tensor index_add_cuda(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
-    Tensor idx = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
+    Tensor idx = (index.dtype() == DType::Int64 || index.dtype() == DType::Int32)
+        ? index.contiguous() : index.to(DType::Int64).contiguous();
     Tensor result = ::tensorplay::detail::contiguous_clone(self);
     int64_t n_idx = idx.numel();
     if (n_idx == 0) return result;
@@ -2224,50 +2251,13 @@ Tensor index_add_cuda(const Tensor& self, int64_t dim, const Tensor& index, cons
     }
     int64_t total = outer * n_idx * inner;
     auto stream = getCurrentCUDAStream().stream();
-#define TP_IADD_CASE(ctype, name) \
-        case DType::name: \
-            index_add_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-                total, inner, row, n_idx, result.data_ptr<ctype>(), idx.data_ptr<int64_t>(), \
-                source_c.data_ptr<ctype>()); \
-            break;
-    switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_IADD_CASE)
-        case DType::ComplexFloat:
-            index_add_kernel<tensorplay::complex<float>><<<
-                (total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                total, inner, row, n_idx,
-                static_cast<tensorplay::complex<float>*>(result.data_ptr()),
-                idx.data_ptr<int64_t>(),
-                static_cast<const tensorplay::complex<float>*>(source_c.data_ptr()));
-            break;
-        case DType::ComplexDouble:
-            index_add_kernel<tensorplay::complex<double>><<<
-                (total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                total, inner, row, n_idx,
-                static_cast<tensorplay::complex<double>*>(result.data_ptr()),
-                idx.data_ptr<int64_t>(),
-                static_cast<const tensorplay::complex<double>*>(source_c.data_ptr()));
-            break;
-        case DType::ComplexHalf:
-            index_add_kernel<tensorplay::complex<Half>><<<
-                (total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                total, inner, row, n_idx,
-                static_cast<tensorplay::complex<Half>*>(result.data_ptr()),
-                idx.data_ptr<int64_t>(),
-                static_cast<const tensorplay::complex<Half>*>(source_c.data_ptr()));
-            break;
-        case DType::BComplex32:
-            index_add_kernel<tensorplay::complex<BFloat16>><<<
-                (total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                total, inner, row, n_idx,
-                static_cast<tensorplay::complex<BFloat16>*>(result.data_ptr()),
-                idx.data_ptr<int64_t>(),
-                static_cast<const tensorplay::complex<BFloat16>*>(source_c.data_ptr()));
-            break;
-        default:
-            TP_THROW(NotImplementedError, "index_add on CUDA does not support this dtype");
+    if (idx.dtype() == DType::Int32) {
+        launch_index_add_for_index<int32_t>(
+            total, inner, row, n_idx, result, idx, source_c, stream);
+    } else {
+        launch_index_add_for_index<int64_t>(
+            total, inner, row, n_idx, result, idx, source_c, stream);
     }
-#undef TP_IADD_CASE
     CUDA_CHECK(cudaGetLastError());
     return result;
 }
