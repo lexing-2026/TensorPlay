@@ -485,7 +485,7 @@ __device__ __forceinline__ void adam_math(
     }
     const M old_exp_avg = exp_avg;
     const M lerp_weight = M(1) - beta1;
-    if (fabs(lerp_weight) < M(0.5)) {
+    if (std::abs(lerp_weight) < M(0.5)) {
         exp_avg = old_exp_avg + lerp_weight *
             (update_grad - old_exp_avg);
     } else {
@@ -500,7 +500,7 @@ __device__ __forceinline__ void adam_math(
             ? second_moment : *max_exp_avg_sq;
         *max_exp_avg_sq = second_moment;
     }
-    const M denom = sqrt(second_moment) / correction2_sqrt + eps;
+    const M denom = std::sqrt(second_moment) / correction2_sqrt + eps;
     param -= step_size * exp_avg / denom;
 }
 
@@ -537,7 +537,7 @@ __device__ __forceinline__ void adam_exact_math(
     }
 
     const math_t old_exp_avg = static_cast<math_t>(exp_avg);
-    if (fabs(lerp_weight) < math_t(0.5)) {
+    if (std::abs(lerp_weight) < math_t(0.5)) {
         exp_avg = static_cast<scalar_t>(
             old_exp_avg + lerp_weight * (update_grad - old_exp_avg));
     } else {
@@ -551,8 +551,8 @@ __device__ __forceinline__ void adam_exact_math(
         static_cast<math_t>(exp_avg_sq) * beta2);
     const math_t old_second = static_cast<math_t>(exp_avg_sq);
     const math_t second = beta2_weight == math_t(1)
-        ? fma(update_grad, update_grad, old_second)
-        : fma(beta2_weight, update_grad * update_grad, old_second);
+        ? std::fma(update_grad, update_grad, old_second)
+        : std::fma(beta2_weight, update_grad * update_grad, old_second);
     exp_avg_sq = static_cast<scalar_t>(second);
 
     scalar_t second_t = exp_avg_sq;
@@ -566,7 +566,7 @@ __device__ __forceinline__ void adam_exact_math(
     // The remaining unary/binary foreach calls each materialize a low-
     // precision temporary before the final addcdiv.
     const scalar_t sqrt_t = static_cast<scalar_t>(
-        sqrt(static_cast<math_t>(second_t)));
+        std::sqrt(static_cast<math_t>(second_t)));
     const scalar_t divided_t = static_cast<scalar_t>(
         static_cast<math_t>(sqrt_t) / correction2_sqrt);
     const scalar_t denom_t = static_cast<scalar_t>(
@@ -575,7 +575,7 @@ __device__ __forceinline__ void adam_exact_math(
         static_cast<math_t>(denom_t);
     const math_t updated_param = step_size == math_t(1)
         ? param_value + quotient
-        : fma(step_size, quotient, param_value);
+        : std::fma(step_size, quotient, param_value);
     param = static_cast<scalar_t>(updated_param);
 }
 
@@ -607,8 +607,8 @@ __global__ __launch_bounds__(kBlockSize) void adam_kernel(
         const auto* step_ptr = static_cast<const float*>(
             metadata.step_metadata.state_steps[tensor_index]);
         const math_t step = static_cast<math_t>(*step_ptr);
-        const math_t correction1 = math_t(1) - pow(beta1, step);
-        correction2_sqrt = sqrt(math_t(1) - pow(beta2, step));
+        const math_t correction1 = math_t(1) - ::pow(beta1, step);
+        correction2_sqrt = std::sqrt(math_t(1) - ::pow(beta2, step));
         step_size = lr / correction1;
     } else {
         step_size = static_cast<math_t>(
@@ -861,7 +861,7 @@ __global__ __launch_bounds__(kBlockSize) void adagrad_kernel(
                 }
                 values[2][lane] += grad * grad;
                 values[0][lane] -= clr * grad /
-                    (sqrt(values[2][lane]) + eps);
+                    (std::sqrt(values[2][lane]) + eps);
             }
             for (int depth = 0; depth < 3; ++depth) {
                 if (depth == 1 && grad_scale == nullptr) continue;
@@ -889,7 +889,7 @@ __global__ __launch_bounds__(kBlockSize) void adagrad_kernel(
                 }
                 values[2][lane] += grad * grad;
                 values[0][lane] -= clr * grad /
-                    (sqrt(values[2][lane]) + eps);
+                    (std::sqrt(values[2][lane]) + eps);
             }
             store_args<3>(outputs, values, i_start, kChunkSize, n,
                           grad_scale != nullptr);
@@ -927,7 +927,7 @@ __device__ __forceinline__ void rmsprop_math(
             average = square_avg - mean * mean;
         }
 
-        math_t update = g / (sqrt(average) + eps);
+        math_t update = g / (std::sqrt(average) + eps);
         if constexpr (HasMomentum) {
             constexpr int kMomentumIndex = Centered ? 4 : 3;
             math_t buffer = momentum *
@@ -1046,8 +1046,8 @@ struct AdadeltaBody {
         const M one_minus_rho = M(1) - rho;
         M square = rho * values[2][lane] + one_minus_rho * g * g;
         values[2][lane] = square;
-        const M std = sqrt(square + eps);
-        M delta = sqrt(values[3][lane] + eps) / std * g;
+        const M std = std::sqrt(square + eps);
+        M delta = std::sqrt(values[3][lane] + eps) / std * g;
         values[3][lane] = rho * values[3][lane] +
             one_minus_rho * delta * delta;
         values[0][lane] = p - lr * delta;
@@ -1078,7 +1078,7 @@ struct AdagradHostBody {
         if (weight_decay != M(0)) g += weight_decay * p;
         values[2][lane] += g * g;
         values[0][lane] = p - corrected_lr * g /
-            (sqrt(values[2][lane]) + eps);
+            (std::sqrt(values[2][lane]) + eps);
     }
 };
 
@@ -1146,7 +1146,7 @@ __global__ __launch_bounds__(kBlockSize) void adagrad_host_kernel(
                 }
                 values[2][lane] += grad * grad;
                 values[0][lane] -= corrected_lr * grad /
-                    (sqrt(values[2][lane]) + eps);
+                    (std::sqrt(values[2][lane]) + eps);
             }
             for (int depth = 0; depth < 3; depth += 2) {
 #pragma unroll
@@ -1171,7 +1171,7 @@ __global__ __launch_bounds__(kBlockSize) void adagrad_host_kernel(
                 }
                 values[2][lane] += grad * grad;
                 values[0][lane] -= corrected_lr * grad /
-                    (sqrt(values[2][lane]) + eps);
+                    (std::sqrt(values[2][lane]) + eps);
             }
             store_args<3>(outputs, values, i_start, kChunkSize, n, false);
         }
@@ -1189,7 +1189,7 @@ struct AdamaxBody {
             const Metadata& metadata, int tensor_index) {
         step = static_cast<M>(
             metadata.step_metadata.host.step_sizes[tensor_index]);
-        step_size = -lr / (M(1) - pow(beta1, step));
+        step_size = -lr / (M(1) - ::pow(beta1, step));
     }
     __device__ __forceinline__ bool should_load(int) const { return true; }
     __device__ __forceinline__ bool should_store(int depth) const {
@@ -1202,8 +1202,8 @@ struct AdamaxBody {
         if (weight_decay != M(0)) g += weight_decay * p;
         values[2][lane] = values[2][lane] +
             (M(1) - beta1) * (g - values[2][lane]);
-        values[3][lane] = fmax(beta2 * values[3][lane],
-                                fabs(g) + eps);
+        values[3][lane] = ::fmax(beta2 * values[3][lane],
+                                std::abs(g) + eps);
         values[0][lane] = p + step_size * values[2][lane] /
             values[3][lane];
     }
@@ -1262,7 +1262,7 @@ struct RpropBody {
         M sign = product > M(0) ? etaplus :
             (product < M(0) ? etaminus : M(1));
         M step_size = values[3][lane] * sign;
-        step_size = fmin(step_size_max, fmax(step_size_min, step_size));
+        step_size = ::fmin(step_size_max, ::fmax(step_size_min, step_size));
         values[3][lane] = step_size;
         if (sign == etaminus) g = M(0);
         const M grad_sign = g > M(0) ? M(1) :
@@ -1286,15 +1286,15 @@ struct NadamBody {
             metadata.step_metadata.host.step_sizes[tensor_index]);
         mu_product = static_cast<M>(
             metadata.step_metadata.host.correction2_sqrts[tensor_index]);
-        mu = beta1 * (M(1) - M(0.5) * pow(M(0.96),
+        mu = beta1 * (M(1) - M(0.5) * ::pow(M(0.96),
                                           step * momentum_decay));
-        mu_next = beta1 * (M(1) - M(0.5) * pow(M(0.96),
+        mu_next = beta1 * (M(1) - M(0.5) * ::pow(M(0.96),
                                                (step + M(1)) * momentum_decay));
         grad_coefficient = -lr * (M(1) - mu) /
             (M(1) - mu_product);
         expavg_coefficient = -lr * mu_next /
             (M(1) - mu_product * mu_next);
-        correction2_sqrt = sqrt(M(1) - pow(beta2, step));
+        correction2_sqrt = std::sqrt(M(1) - ::pow(beta2, step));
     }
     __device__ __forceinline__ bool should_load(int) const { return true; }
     __device__ __forceinline__ bool should_store(int depth) const {
@@ -1312,7 +1312,7 @@ struct NadamBody {
             (M(1) - beta1) * (g - values[2][lane]);
         values[3][lane] = beta2 * values[3][lane] +
             (M(1) - beta2) * g * g;
-        const M denom = sqrt(values[3][lane]) / correction2_sqrt + eps;
+        const M denom = std::sqrt(values[3][lane]) / correction2_sqrt + eps;
         values[0][lane] = p +
             (grad_coefficient * g + expavg_coefficient * values[2][lane]) /
             denom;
@@ -1330,16 +1330,16 @@ struct RadamBody {
             const Metadata& metadata, int tensor_index) {
         step = static_cast<M>(
             metadata.step_metadata.host.step_sizes[tensor_index]);
-        const M bc1 = M(1) - pow(beta1, step);
-        const M bc2 = M(1) - pow(beta2, step);
+        const M bc1 = M(1) - ::pow(beta1, step);
+        const M bc2 = M(1) - ::pow(beta2, step);
         const M rho_inf = M(2) / (M(1) - beta2) - M(1);
-        const M rho_t = rho_inf - M(2) * step * pow(beta2, step) / bc2;
+        const M rho_t = rho_inf - M(2) * step * ::pow(beta2, step) / bc2;
         unrectified_coefficient = -lr / bc1;
         rectified_coefficient = M(0);
         if (rho_t > M(5)) {
-            const M rect = sqrt((rho_t - M(4)) * (rho_t - M(2)) * rho_inf /
+            const M rect = std::sqrt((rho_t - M(4)) * (rho_t - M(2)) * rho_inf /
                 ((rho_inf - M(4)) * (rho_inf - M(2)) * rho_t));
-            rectified_coefficient = -lr * sqrt(bc2) * rect / bc1;
+            rectified_coefficient = -lr * std::sqrt(bc2) * rect / bc1;
         }
     }
     __device__ __forceinline__ bool should_load(int) const { return true; }
@@ -1360,7 +1360,7 @@ struct RadamBody {
             (M(1) - beta2) * g * g;
         if (rectified_coefficient != M(0)) {
             values[0][lane] = p + rectified_coefficient * values[2][lane] /
-                (sqrt(values[3][lane]) + eps);
+                (std::sqrt(values[3][lane]) + eps);
         } else {
             // RAdam is deliberately unrectified during the short warm-up:
             // this branch uses the bias-corrected first moment directly and
@@ -1488,7 +1488,7 @@ __global__ __launch_bounds__(kBlockSize) void adafactor_vector_stats_kernel(
     const int64_t n = remaining < kChunkSize ? remaining : kChunkSize;
     if (n <= 0) return;
 
-    const math_t beta2_weight = pow(
+    const math_t beta2_weight = ::pow(
         static_cast<math_t>(metadata.step_metadata.host.step_sizes[slot]),
         static_cast<math_t>(beta2_decay_value));
     const math_t old_weight = math_t(1) - beta2_weight;
@@ -1511,7 +1511,7 @@ __global__ __launch_bounds__(kBlockSize) void adafactor_vector_stats_kernel(
         const math_t next_variance = old_weight * old_variance +
             beta2_weight * g * g;
         variance[i] = static_cast<scalar_t>(next_variance);
-        const math_t update = g / sqrt(fmax(next_variance, eps1_sq));
+        const math_t update = g / std::sqrt(::fmax(next_variance, eps1_sq));
         param_sum += p * p;
         update_sum += update * update;
     }
@@ -1550,19 +1550,19 @@ __global__ __launch_bounds__(kBlockSize) void adafactor_vector_apply_kernel(
     if (n <= 0) return;
 
     const math_t lr = static_cast<math_t>(lr_value);
-    const math_t beta2_weight = pow(
+    const math_t beta2_weight = ::pow(
         static_cast<math_t>(metadata.step_metadata.host.step_sizes[slot]),
         static_cast<math_t>(beta2_decay_value));
     const math_t eps1 = static_cast<math_t>(eps1_value);
     const math_t eps1_sq = eps1 * eps1;
-    const math_t rho = fmin(lr, math_t(1) / sqrt(
+    const math_t rho = ::fmin(lr, math_t(1) / std::sqrt(
         static_cast<math_t>(metadata.step_metadata.host.step_sizes[slot])));
-    const math_t rms_param = sqrt(stats[2 * global_index] /
+    const math_t rms_param = std::sqrt(stats[2 * global_index] /
         static_cast<math_t>(total_n));
-    const math_t alpha = fmax(static_cast<math_t>(eps2_value), rms_param) * rho;
-    const math_t rms_update = sqrt(stats[2 * global_index + 1] /
+    const math_t alpha = ::fmax(static_cast<math_t>(eps2_value), rms_param) * rho;
+    const math_t rms_update = std::sqrt(stats[2 * global_index + 1] /
         static_cast<math_t>(total_n));
-    const math_t clip = fmax(math_t(1), rms_update /
+    const math_t clip = ::fmax(math_t(1), rms_update /
         static_cast<math_t>(d_value));
     const math_t update_scale = alpha / clip;
     const math_t param_scale = math_t(1) - lr *
@@ -1578,7 +1578,7 @@ __global__ __launch_bounds__(kBlockSize) void adafactor_vector_apply_kernel(
         math_t g = static_cast<math_t>(grad[i]);
         if (maximize) g = -g;
         const math_t v = static_cast<math_t>(variance[i]);
-        const math_t update = g / sqrt(fmax(v, eps1_sq));
+        const math_t update = g / std::sqrt(::fmax(v, eps1_sq));
         math_t p = static_cast<math_t>(param[i]);
         if (weight_decay_value != 0.0) p *= param_scale;
         param[i] = static_cast<scalar_t>(p - update_scale * update);
@@ -1682,8 +1682,8 @@ __global__ __launch_bounds__(kBlockSize) void adafactor_factored_stats_kernel(
         const math_t g0 = static_cast<math_t>(grad[i]);
         const math_t g = maximize ? -g0 : g0;
         const math_t v = static_cast<math_t>(row_var[row]) *
-            static_cast<math_t>(col_var[col]) / fmax(row_mean, eps1);
-        const math_t update = g / sqrt(fmax(v, eps1_sq));
+            static_cast<math_t>(col_var[col]) / ::fmax(row_mean, eps1);
+        const math_t update = g / std::sqrt(::fmax(v, eps1_sq));
         const math_t p = static_cast<math_t>(param[i]);
         param_sum += p * p;
         update_sum += update * update;
@@ -1725,13 +1725,13 @@ __global__ __launch_bounds__(kBlockSize) void adafactor_factored_apply_kernel(
     const math_t lr = static_cast<math_t>(lr_value);
     const math_t step = static_cast<math_t>(
         metadata.step_metadata.host.step_sizes[slot]);
-    const math_t rho = fmin(lr, math_t(1) / sqrt(step));
-    const math_t rms_param = sqrt(stats[3 * global_index] /
+    const math_t rho = ::fmin(lr, math_t(1) / std::sqrt(step));
+    const math_t rms_param = std::sqrt(stats[3 * global_index] /
         static_cast<math_t>(total_n));
-    const math_t alpha = fmax(static_cast<math_t>(eps2_value), rms_param) * rho;
-    const math_t rms_update = sqrt(stats[3 * global_index + 1] /
+    const math_t alpha = ::fmax(static_cast<math_t>(eps2_value), rms_param) * rho;
+    const math_t rms_update = std::sqrt(stats[3 * global_index + 1] /
         static_cast<math_t>(total_n));
-    const math_t clip = fmax(math_t(1), rms_update /
+    const math_t clip = ::fmax(math_t(1), rms_update /
         static_cast<math_t>(d_value));
     const math_t scale = alpha / clip;
     const math_t eps1 = static_cast<math_t>(eps1_value);
@@ -1755,8 +1755,8 @@ __global__ __launch_bounds__(kBlockSize) void adafactor_factored_apply_kernel(
         const math_t g0 = static_cast<math_t>(grad[i]);
         const math_t g = maximize ? -g0 : g0;
         const math_t v = static_cast<math_t>(row_var[row]) *
-            static_cast<math_t>(col_var[col]) / fmax(row_mean, eps1);
-        const math_t update = g / sqrt(fmax(v, eps1_sq));
+            static_cast<math_t>(col_var[col]) / ::fmax(row_mean, eps1);
+        const math_t update = g / std::sqrt(::fmax(v, eps1_sq));
         math_t p = static_cast<math_t>(param[i]);
         if (weight_decay_value != 0.0) p *= param_scale;
         param[i] = static_cast<scalar_t>(p - scale * update);
@@ -1866,9 +1866,9 @@ __global__ __launch_bounds__(kBlockSize) void asgd_update_scalars_kernel(
     const math_t lambd = static_cast<math_t>(lambd_value);
     const math_t t0 = static_cast<math_t>(t0_value);
     const math_t alpha = static_cast<math_t>(alpha_value);
-    const math_t eta = lr / pow(math_t(1) + lambd * lr *
+    const math_t eta = lr / ::pow(math_t(1) + lambd * lr *
         static_cast<math_t>(step), alpha);
-    const math_t mu = math_t(1) / fmax(math_t(1),
+    const math_t mu = math_t(1) / ::fmax(math_t(1),
         static_cast<math_t>(step) - t0);
     *static_cast<scalar_t*>(const_cast<void*>(
         metadata.addresses[4][tensor_index])) = static_cast<scalar_t>(eta);
