@@ -11,9 +11,9 @@
 
 #include "TensorIterator.h"
 #include "CUDARuntime.h"
+#include "Complex.h"
 
 #include <cuda_runtime.h>
-#include <thrust/complex.h>
 
 #include <algorithm>
 #include <array>
@@ -159,19 +159,20 @@ __device__ __forceinline__ T reduce_warp_shuffle_down(
     return __shfl_down_sync(mask, value, offset);
 }
 
-// thrust::complex has no intrinsic __shfl_down_sync overload; shuffle the
-__device__ __forceinline__ thrust::complex<float> reduce_warp_shuffle_down(
-        thrust::complex<float> value, unsigned long long mask, int offset) {
+// Complex values have no intrinsic __shfl_down_sync overload; shuffle their
+// components independently.
+__device__ __forceinline__ tensorplay::complex<float> reduce_warp_shuffle_down(
+        tensorplay::complex<float> value, unsigned long long mask, int offset) {
     float re = __shfl_down_sync(mask, value.real(), offset);
     float im = __shfl_down_sync(mask, value.imag(), offset);
-    return thrust::complex<float>(re, im);
+    return tensorplay::complex<float>(re, im);
 }
 
-__device__ __forceinline__ thrust::complex<double> reduce_warp_shuffle_down(
-        thrust::complex<double> value, unsigned long long mask, int offset) {
+__device__ __forceinline__ tensorplay::complex<double> reduce_warp_shuffle_down(
+        tensorplay::complex<double> value, unsigned long long mask, int offset) {
     double re = __shfl_down_sync(mask, value.real(), offset);
     double im = __shfl_down_sync(mask, value.imag(), offset);
-    return thrust::complex<double>(re, im);
+    return tensorplay::complex<double>(re, im);
 }
 
 template <typename T, int N>
