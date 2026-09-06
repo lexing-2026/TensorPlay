@@ -696,7 +696,9 @@ inline void launch_vectorized_kernel(int64_t N, const func_t& f,
             loop_launch_check("vectorized_elementwise_kernel<2>");
             break;
         case 1: {
-            auto input_calc = TrivialOffsetCalculator<2>();
+            constexpr int input_arity =
+                tensorplay::function_traits<func_t>::arity;
+            auto input_calc = TrivialOffsetCalculator<input_arity>();
             auto output_calc = TrivialOffsetCalculator<1>();
             auto loader = memory::LoadWithoutCast();
             auto storer = memory::StoreWithoutCast();
@@ -1475,6 +1477,11 @@ void gpu_kernel_multiple_outputs_impl(TensorIteratorBase& iter,
 
 template <typename func_t>
 void gpu_kernel_multiple_outputs(TensorIteratorBase& iter, const func_t& f) {
+    for (int arg = 0; arg < iter.ntensors(); arg++) {
+        TP_CHECK(iter.device(arg).type() == DeviceType::CUDA,
+                 "expected a CUDA device for argument ", arg);
+    }
+
     if (iter.numel() == 0) {
         return;
     }
