@@ -14,6 +14,7 @@
 #include "TypePromotion.h"
 #include "CUDARuntime.h"
 #include "CUDALoops.cuh"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <cuda_runtime.h>
 
@@ -27,6 +28,8 @@
 
 namespace tensorplay {
 namespace cuda {
+
+namespace ops = tensorplay::tpx::ops;
 
 #define CUDA_CHECK(condition) \
   do { \
@@ -48,25 +51,11 @@ inline std::vector<int64_t> shape_of(const Tensor& t) {
     return static_cast<std::vector<int64_t>>(t.shape());
 }
 
-__global__ void atomic_sum_kernel(int64_t n, const double* in, double* total) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) atomicAdd(total, in[i]);
-}
-
 Tensor mean_from_elems(const Tensor& elems, int64_t n, DType dt, const Device& dev) {
-    Tensor total = Tensor::zeros({1}, DType::Float64, dev);
-    if (n > 0) {
-        auto stream = getCurrentCUDAStream().stream();
-        atomic_sum_kernel<<<loss_grid(n), kThreads, 0, stream>>>(
-            n, elems.data_ptr<double>(), total.data_ptr<double>());
-        CUDA_CHECK(cudaGetLastError());
-    }
-    double h = 0;
-    CUDA_CHECK(cudaMemcpy(&h, total.data_ptr<double>(), sizeof(double),
-                          cudaMemcpyDeviceToHost));
-    return Tensor::full({}, Scalar(n ? h / n : 0.0),
-                        dt == DType::Float64 ? DType::Float64 : DType::Float32, dev);
+    const DType out_dtype = dt == DType::Float64 ? DType::Float64 : DType::Float32;
+    if (n == 0) return Tensor::full({}, Scalar(0), out_dtype, dev);
+    Tensor result = elems.mean();
+    return result.dtype() == out_dtype ? result : result.to(out_dtype);
 }
 
 std::pair<Tensor, Tensor> pair_f64_dev(const Tensor& a, const Tensor& b) {
@@ -104,26 +93,6 @@ Tensor tp_scale_grad(const Tensor& grad, int64_t reduction, int64_t numel) {
 
 __host__ __device__ inline double dsp(double y) {
     return ::fmax(y, 0.0) + ::log1p(::exp(-::fabs(y)));
-}
-
-__global__ void bce_with_logits_elem_kernel(int64_t n, const double* x, const double* t,
-                                            const double* w, const double* pw,
-                                            bool has_w, bool has_pw, double* o) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += st) {
-        double wi = has_w ? w[i] : 1.0;
-        double pi = has_pw ? pw[i] : 1.0;
-        o[i] = wi * (pi * t[i] * dsp(-x[i]) + (1.0 - t[i]) * dsp(x[i]));
-    }
-}
-
-__global__ void margin_rank_elem_kernel(int64_t n, const double* a, const double* b,
-                                        const double* g, double margin, double* o) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += st)
-        o[i] = ::fmax(0.0, margin - g[i] * (a[i] - b[i]));
 }
 
 // ---------------------------------------------------------------------------
@@ -240,11 +209,20 @@ Tensor binary_cross_entropy_with_logits_cuda(const Tensor& self, const Tensor& t
     Tensor elems = Tensor::empty(shape_of(pr.first), DType::Float64, self.device());
     int64_t n = elems.numel();
     if (n) {
-        auto stream = getCurrentCUDAStream().stream();
-        bce_with_logits_elem_kernel<<<loss_grid(n), kThreads, 0, stream>>>(
-            n, pr.first.data_ptr<double>(), pr.second.data_ptr<double>(),
-            w.data_ptr<double>(), pw.data_ptr<double>(), has_w, has_pw,
-            elems.data_ptr<double>());
+        TensorIterator iter = TensorIteratorConfig()
+            .check_all_same_dtype(true)
+            .add_output(elems)
+            .add_const_input(pr.first)
+            .add_const_input(pr.second)
+            .add_const_input(w)
+            .add_const_input(pw)
+            .build();
+        gpu_kernel(iter, [has_w, has_pw] __host__ __device__(
+            double x, double t, double wv, double pwv) -> double {
+            const double wi = has_w ? wv : 1.0;
+            const double pi = has_pw ? pwv : 1.0;
+            return wi * (pi * t * dsp(-x) + (1.0 - t) * dsp(x));
+        });
         CUDA_CHECK(cudaGetLastError());
     }
     return mean_from_elems(elems, n, self.dtype(), self.device());
@@ -277,10 +255,18 @@ Tensor margin_ranking_loss_cuda(const Tensor& input1, const Tensor& input2,
     Tensor elems = Tensor::empty(shape_of(pr.first), DType::Float64, input1.device());
     int64_t n = elems.numel();
     if (n) {
-        auto stream = getCurrentCUDAStream().stream();
-        margin_rank_elem_kernel<<<loss_grid(n), kThreads, 0, stream>>>(
-            n, pr.first.data_ptr<double>(), pr.second.data_ptr<double>(),
-            tg.data_ptr<double>(), margin.toDouble(), elems.data_ptr<double>());
+        const double margin_value = margin.toDouble();
+        TensorIterator iter = TensorIteratorConfig()
+            .check_all_same_dtype(true)
+            .add_output(elems)
+            .add_const_input(pr.first)
+            .add_const_input(pr.second)
+            .add_const_input(tg)
+            .build();
+        gpu_kernel(iter, [margin_value] __host__ __device__(
+            double a, double b, double target_value) -> double {
+            return ::fmax(0.0, margin_value - target_value * (a - b));
+        });
         CUDA_CHECK(cudaGetLastError());
     }
     return mean_from_elems(elems, n, input1.dtype(), input1.device());
