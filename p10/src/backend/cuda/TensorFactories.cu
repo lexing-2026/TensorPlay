@@ -32,8 +32,13 @@ Tensor vander_native_cuda(const Tensor& x, std::optional<int64_t> N,
     return increasing ? result : ops::flip(result, {1});
 }
 
+Tensor linalg_vander_native_cuda(const Tensor& x, std::optional<int64_t> N) {
+    return vander_native_cuda(x, N, true);
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, NativeTensorFactories) {
     m.impl("vander", vander_native_cuda);
+    m.impl("linalg_vander", linalg_vander_native_cuda);
 }
 
 } // namespace tensorplay::cuda
