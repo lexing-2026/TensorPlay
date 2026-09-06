@@ -22,13 +22,13 @@ __global__ void forward_unary_kernel(
     T v, d;
     switch (static_cast<UKind>(kind)) {
         case UKind::Neg:     v = -x; d = -g; break;
-        case UKind::Exp:     v = exp(x); d = v * g; break;
-        case UKind::Log:     v = log(x); d = g / x; break;
-        case UKind::Sin:     v = sin(x); d = cos(x) * g; break;
-        case UKind::Cos:     v = cos(x); d = -sin(x) * g; break;
-        case UKind::Sqrt:    v = sqrt(x); d = g / (T(2) * v); break;
-        case UKind::Tanh:    v = tanh(x); d = (T(1) - v * v) * g; break;
-        case UKind::Sigmoid: v = T(1) / (T(1) + exp(-x)); d = v * (T(1) - v) * g; break;
+        case UKind::Exp:     v = ::exp(x); d = v * g; break;
+        case UKind::Log:     v = ::log(x); d = g / x; break;
+        case UKind::Sin:     v = ::sin(x); d = ::cos(x) * g; break;
+        case UKind::Cos:     v = ::cos(x); d = -::sin(x) * g; break;
+        case UKind::Sqrt:    v = ::sqrt(x); d = g / (T(2) * v); break;
+        case UKind::Tanh:    v = ::tanh(x); d = (T(1) - v * v) * g; break;
+        case UKind::Sigmoid: v = T(1) / (T(1) + ::exp(-x)); d = v * (T(1) - v) * g; break;
         case UKind::Relu:    v = x > T(0) ? x : T(0); d = x > T(0) ? g : T(0); break;
         default:             v = x; d = g; break;
     }
