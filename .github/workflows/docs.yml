@@ -69,7 +69,7 @@ jobs:
           gh release download nightly \
             --repo "$GITHUB_REPOSITORY" \
             --pattern 'tensorplay-*+cpu-cp312-cp312-linux_x86_64.whl' \
-            --output dist-docs
+            --dir dist-docs
           python -m pip install dist-docs/*.whl numpy PyYAML typing-extensions
 
       - name: Install TensorPlay wheel (release)
@@ -86,7 +86,7 @@ jobs:
             if gh release download "$RELEASE_TAG" \
                  --repo "$GITHUB_REPOSITORY" \
                  --pattern 'tensorplay-*+cpu-cp312-cp312-linux_x86_64.whl' \
-                 --output tensorplay-docs.whl; then
+                 --dir dist-docs; then
               break
             fi
             if [[ "$attempt" == 10 ]]; then
