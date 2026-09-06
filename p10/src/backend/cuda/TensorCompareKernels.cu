@@ -4,6 +4,7 @@
 #include "Utils.h"
 #include "Exception.h"
 #include "CUDARuntime.h"
+#include "Complex.h"
 #include "CUDALoops.cuh"
 
 #include <cuda_runtime.h>
@@ -16,6 +17,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace tensorplay {
@@ -108,30 +110,111 @@ void assert_async_cuda(const Tensor& self) {
     assert_async_msg_cuda(self, std::string());
 }
 
+template <typename T>
+__device__ inline bool isclose_real_value(T lhs, T rhs, double rtol,
+                                          double atol, bool equal_nan) {
+    using math_t = std::conditional_t<std::is_same_v<T, double>, double, float>;
+    const bool equal = lhs == rhs;
+    const math_t lhs_math = static_cast<math_t>(lhs);
+    const math_t rhs_math = static_cast<math_t>(rhs);
+    bool close = equal;
+    if (equal_nan && lhs_math != lhs_math && rhs_math != rhs_math) {
+        close = true;
+    }
+    if (!close && (rtol != 0.0 || atol != 0.0)) {
+        const math_t actual = ::fabs(lhs_math - rhs_math);
+        const math_t allowed = static_cast<math_t>(atol) +
+            static_cast<math_t>(rtol) * ::fabs(rhs_math);
+        close = ::isfinite(actual) && actual <= allowed;
+    }
+    return close;
+}
+
+template <typename T>
+void isclose_real_loop(TensorIterator& iter, double rtol, double atol,
+                       bool equal_nan) {
+    gpu_kernel(iter, [=] __device__(T lhs, T rhs) -> bool {
+        return isclose_real_value(lhs, rhs, rtol, atol, equal_nan);
+    });
+}
+
+template <typename ComplexT, typename RealT>
+__device__ inline bool isclose_complex_value(
+        ComplexT lhs, ComplexT rhs, double rtol, double atol, bool equal_nan) {
+    const bool equal = lhs == rhs;
+    const RealT lhs_real = static_cast<RealT>(lhs.real());
+    const RealT lhs_imag = static_cast<RealT>(lhs.imag());
+    const RealT rhs_real = static_cast<RealT>(rhs.real());
+    const RealT rhs_imag = static_cast<RealT>(rhs.imag());
+    const bool lhs_nan = lhs_real != lhs_real || lhs_imag != lhs_imag;
+    const bool rhs_nan = rhs_real != rhs_real || rhs_imag != rhs_imag;
+    bool close = equal || (equal_nan && lhs_nan && rhs_nan);
+    if (!close && (rtol != 0.0 || atol != 0.0)) {
+        const RealT actual = ::hypot(lhs_real - rhs_real, lhs_imag - rhs_imag);
+        const RealT allowed = static_cast<RealT>(atol) +
+            static_cast<RealT>(rtol) * ::hypot(rhs_real, rhs_imag);
+        close = ::isfinite(actual) && actual <= allowed;
+    }
+    return close;
+}
+
+template <typename ComplexT, typename RealT>
+void isclose_complex_loop(TensorIterator& iter, double rtol, double atol,
+                          bool equal_nan) {
+    gpu_kernel(iter, [=] __device__(ComplexT lhs, ComplexT rhs) -> bool {
+        return isclose_complex_value<ComplexT, RealT>(
+            lhs, rhs, rtol, atol, equal_nan);
+    });
+}
 
 } // namespace
 
 Tensor isclose_cuda(const Tensor& self, const Tensor& other, double rtol, double atol, bool equal_nan) {
+    if (self.dtype() != other.dtype()) {
+        TP_THROW(RuntimeError, toString(self.dtype()), " did not match ",
+                 toString(other.dtype()));
+    }
+    TP_THROW_IF(rtol < 0, RuntimeError,
+                "rtol must be greater than or equal to zero, but got ", rtol);
+    TP_THROW_IF(atol < 0, RuntimeError,
+                "atol must be greater than or equal to zero, but got ", atol);
     std::vector<int64_t> out_shape = broadcast_shapes(shape_of(self), shape_of(other));
-    Tensor a = self.to(DType::Float64);
-    Tensor b = other.to(DType::Float64);
     Tensor out = Tensor::empty(out_shape, DType::Bool, self.device());
     if (out.numel() == 0) return out;
     TensorIterator iter = TensorIteratorConfig()
         .check_all_same_dtype(false)
         .add_output(out)
-        .add_input(a)
-        .add_input(b)
+        .add_const_input(self)
+        .add_const_input(other)
         .build();
-    gpu_kernel(iter, [=] __device__(double x, double y) -> bool {
-        if (x != x || y != y) {
-            return equal_nan && x != x && y != y;
-        }
-        if (::isinf(x) || ::isinf(y)) {
-            return x == y;
-        }
-        return ::fabs(x - y) <= atol + rtol * ::fabs(y);
-    });
+    switch (self.dtype()) {
+#define TP_ISCLOSE_REAL_CASE(ctype, name) \
+        case DType::name: \
+            isclose_real_loop<ctype>(iter, rtol, atol, equal_nan); \
+            break;
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_ISCLOSE_REAL_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(TP_ISCLOSE_REAL_CASE)
+#undef TP_ISCLOSE_REAL_CASE
+        case DType::ComplexHalf:
+            isclose_complex_loop<tensorplay::complex<Half>, float>(
+                iter, rtol, atol, equal_nan);
+            break;
+        case DType::ComplexFloat:
+            isclose_complex_loop<tensorplay::complex<float>, float>(
+                iter, rtol, atol, equal_nan);
+            break;
+        case DType::ComplexDouble:
+            isclose_complex_loop<tensorplay::complex<double>, double>(
+                iter, rtol, atol, equal_nan);
+            break;
+        case DType::BComplex32:
+            isclose_complex_loop<tensorplay::complex<BFloat16>, float>(
+                iter, rtol, atol, equal_nan);
+            break;
+        default:
+            TP_THROW(TypeError, "isclose: unsupported dtype ",
+                     toString(self.dtype()));
+    }
     return out;
 }
 
