@@ -1447,6 +1447,14 @@ std::tuple<Tensor, Tensor> linalg_polar_kernel(const Tensor& A) {
     return {U.contiguous(), H.contiguous()};
 }
 
+std::tuple<Tensor, Tensor> linalg_polar_out_kernel(const Tensor& A, Tensor& U,
+                                                   Tensor& H) {
+    auto result = linalg_polar_kernel(A);
+    U.copy_(std::get<0>(result));
+    H.copy_(std::get<1>(result));
+    return {U, H};
+}
+
 // ------------------------------------------------------------- geqrf/orgqr --
 
 template <typename scalar_t>
@@ -2110,6 +2118,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, LinalgKernels) {
     m.impl("linalg_svdvals", linalg_svdvals_kernel);
     m.impl("linalg_lstsq", linalg_lstsq_kernel);
     m.impl("linalg_polar", linalg_polar_kernel);
+    m.impl("linalg_polar.out", linalg_polar_out_kernel);
     m.impl("linalg_qr", linalg_qr_kernel);
     m.impl("linalg_householder_product", linalg_householder_product_kernel);
     m.impl("linalg_ldl_factor", linalg_ldl_factor_kernel);
