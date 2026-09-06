@@ -753,7 +753,11 @@ inline constexpr bool scatter_add_supported_v =
     std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t> ||
     std::is_same_v<T, float> || std::is_same_v<T, double> ||
     std::is_same_v<T, Half> || std::is_same_v<T, BFloat16> ||
-    std::is_same_v<T, bool>;
+    std::is_same_v<T, bool> ||
+    std::is_same_v<T, tensorplay::complex<float>> ||
+    std::is_same_v<T, tensorplay::complex<double>> ||
+    std::is_same_v<T, tensorplay::complex<Half>> ||
+    std::is_same_v<T, tensorplay::complex<BFloat16>>;
 
 // Scatter and scatter-add use elementwise indexed writes. Add mode uses
 // atomic accumulation and is intentionally unordered for colliding indices.
@@ -1959,6 +1963,8 @@ Tensor scatter_base_cuda(const Tensor& self, int64_t dim, const Tensor& index,
             case DType::UInt16: case DType::UInt32: case DType::UInt64:
             case DType::Float32: case DType::Float64:
             case DType::Float16: case DType::BFloat16: case DType::Bool:
+            case DType::ComplexHalf: case DType::ComplexFloat:
+            case DType::ComplexDouble: case DType::BComplex32:
                 break;
             default:
                 TP_THROW(NotImplementedError,
@@ -1969,10 +1975,16 @@ Tensor scatter_base_cuda(const Tensor& self, int64_t dim, const Tensor& index,
     case DType::name: \
         scatter_kernel<ctype, Add><<<(total_idx * inner + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
             total_idx, idx_dim_size, idx_inner, self_dim_size, inner, \
-            result.data_ptr<ctype>(), idx_c.data_ptr<int64_t>(), src_b.data_ptr<ctype>()); \
+            static_cast<ctype*>(result.data_ptr()), idx_c.data_ptr<int64_t>(), \
+            static_cast<const ctype*>(src_b.data_ptr())); \
         break;
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_SC_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(TP_SC_CASE)
+        TP_SC_CASE(tensorplay::complex<Half>, ComplexHalf)
+        TP_SC_CASE(tensorplay::complex<float>, ComplexFloat)
+        TP_SC_CASE(tensorplay::complex<double>, ComplexDouble)
+        TP_SC_CASE(tensorplay::complex<BFloat16>, BComplex32)
         default: TP_THROW(TypeError, "scatter: unsupported dtype");
     }
 #undef TP_SC_CASE
@@ -2046,7 +2058,8 @@ static Tensor& scatter_base_inplace_cuda(Tensor& self, int64_t dim, const Tensor
     case DType::name: { \
         scatter_kernel<ctype, false><<<(total_idx * inner + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
             total_idx, idx_dim_size, idx_inner, self_dim_size, inner, \
-            result.data_ptr<ctype>(), idx_c.data_ptr<int64_t>(), src_b.data_ptr<ctype>()); \
+            static_cast<ctype*>(result.data_ptr()), idx_c.data_ptr<int64_t>(), \
+            static_cast<const ctype*>(src_b.data_ptr())); \
         break; \
     }
     if (add) {
@@ -2054,11 +2067,16 @@ static Tensor& scatter_base_inplace_cuda(Tensor& self, int64_t dim, const Tensor
         case DType::name: { \
             scatter_kernel<ctype, true><<<(total_idx + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
                 total_idx, idx_dim_size, idx_inner, self_dim_size, inner, \
-                result.data_ptr<ctype>(), idx_c.data_ptr<int64_t>(), src_b.data_ptr<ctype>()); \
+                static_cast<ctype*>(result.data_ptr()), idx_c.data_ptr<int64_t>(), \
+                static_cast<const ctype*>(src_b.data_ptr())); \
             break; \
         }
         switch (self.dtype()) {
             TENSORPLAY_FORALL_SCALAR_TYPES(TP_SC_INPLACE_ADD_CASE)
+            TP_SC_INPLACE_ADD_CASE(tensorplay::complex<Half>, ComplexHalf)
+            TP_SC_INPLACE_ADD_CASE(tensorplay::complex<float>, ComplexFloat)
+            TP_SC_INPLACE_ADD_CASE(tensorplay::complex<double>, ComplexDouble)
+            TP_SC_INPLACE_ADD_CASE(tensorplay::complex<BFloat16>, BComplex32)
             default:
                 TP_THROW(NotImplementedError,
                          "scatter_add_ on CUDA does not support this dtype");
@@ -2067,6 +2085,11 @@ static Tensor& scatter_base_inplace_cuda(Tensor& self, int64_t dim, const Tensor
     } else {
         switch (self.dtype()) {
             TENSORPLAY_FORALL_SCALAR_TYPES(TP_SC_INPLACE_ASSIGN_CASE)
+            TENSORPLAY_FORALL_FP8_TYPES(TP_SC_INPLACE_ASSIGN_CASE)
+            TP_SC_INPLACE_ASSIGN_CASE(tensorplay::complex<Half>, ComplexHalf)
+            TP_SC_INPLACE_ASSIGN_CASE(tensorplay::complex<float>, ComplexFloat)
+            TP_SC_INPLACE_ASSIGN_CASE(tensorplay::complex<double>, ComplexDouble)
+            TP_SC_INPLACE_ASSIGN_CASE(tensorplay::complex<BFloat16>, BComplex32)
             default: TP_THROW(TypeError, "scatter_: unsupported dtype");
         }
     }
