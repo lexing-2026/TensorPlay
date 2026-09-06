@@ -1,5 +1,3 @@
-// dropped (p10 uses std::complex and has no atomic complex users). The
-// algorithm bodies are kept verbatim.
 #pragma once
 
 #include "BFloat16.h"
