@@ -11,6 +11,7 @@
 #include "cpu/ComplexUnary.h"
 #include "cpu/VecComplex.h"
 #include "cpu/ActivationUnaryKernels.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 #include <iostream>
 #include <cmath>
 #include <algorithm>
@@ -45,6 +46,8 @@ DEFINE_DISPATCH(silu_f64_stub);
 namespace tensorplay {
 namespace cpu {
 using namespace tensorplay::parallel;
+
+namespace ops = tensorplay::tpx::ops;
 
 // --- Unary Kernels ---
 
@@ -2176,11 +2179,15 @@ Tensor pow_tensor_tensor_kernel(const Tensor& self, const Tensor& exponent) {
 // Scalar-base power: a base of 1 short-circuits to ones, anything else
 // wraps the scalar as a 0-dim tensor and reuses the Tensor_Tensor kernel.
 Tensor pow_scalar_tensor_kernel(Scalar base, const Tensor& exponent) {
+    const DType result_dtype = ops::result_type(base, exponent);
     if (!base.isComplex() && base.toDouble() == 1.0) {
-        return Tensor::ones(exponent.shape(), exponent.dtype(), exponent.device());
+        return Tensor::ones(static_cast<std::vector<int64_t>>(exponent.shape()),
+                            result_dtype, exponent.device());
     }
-    Tensor base_t = Tensor::full({}, base, exponent.dtype(), exponent.device());
-    return pow_tensor_tensor_kernel(base_t, exponent);
+    Tensor base_t = Tensor::full({}, base, result_dtype, exponent.device());
+    Tensor exponent_cast = exponent.dtype() == result_dtype
+        ? exponent : exponent.to(result_dtype);
+    return pow_tensor_tensor_kernel(base_t, exponent_cast);
 }
 
 // Lerp implementations using composition
