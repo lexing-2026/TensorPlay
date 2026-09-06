@@ -1,11 +1,11 @@
 #include "SparseKernels.h"
 #include "CUDARuntime.h"
+#include "Complex.h"
 
 #include "GPUPrimitives.cuh"
 #include <thrust/iterator/counting_iterator.h>
 #include <cuda_runtime.h>
 #include <climits>
-#include <complex>
 #include <type_traits>
 #include <utility>
 
@@ -804,7 +804,7 @@ Tensor& add_sparse_to_dense_cuda(Tensor& dense, const Tensor& sparse, Scalar alp
         dense.dtype() == DType::ComplexFloat ||
         dense.dtype() == DType::ComplexDouble ||
         dense.dtype() == DType::BComplex32) {
-        const auto alpha_value = alpha.to<std::complex<double>>();
+        const auto alpha_value = alpha.to<tensorplay::complex<double>>();
         if (dense.dtype() == DType::ComplexHalf) {
             const CudaComplexPair<tensorplay::Half> alpha_pair{
                 tensorplay::Half(static_cast<float>(alpha_value.real())),
