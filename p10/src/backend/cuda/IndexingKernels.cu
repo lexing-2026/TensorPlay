@@ -814,10 +814,10 @@ inline constexpr bool scatter_add_supported_v =
 
 // Scatter and scatter-add use elementwise indexed writes. Add mode uses
 // atomic accumulation and is intentionally unordered for colliding indices.
-template <typename T, bool Add>
+template <typename T, bool Add, typename IndexT>
 __global__ void scatter_kernel(int64_t total_idx, int64_t idx_dim_size, int64_t idx_inner,
                                int64_t self_dim_size, int64_t self_inner,
-                               T* d, const int64_t* ip, const T* vp) {
+                               T* d, const IndexT* ip, const T* vp) {
     // One thread handles one indexed element. Colliding additions serialize
     // through atomics.
     int64_t flat = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -837,6 +837,31 @@ __global__ void scatter_kernel(int64_t total_idx, int64_t idx_dim_size, int64_t 
         }
         else d[dst] = vp[flat];
     }
+}
+
+template <typename IndexT, bool Add>
+void launch_scatter_for_index(
+        int64_t total_idx, int64_t idx_dim_size, int64_t idx_inner,
+        int64_t self_dim_size, int64_t self_inner, Tensor& result,
+        const Tensor& index, const Tensor& source, cudaStream_t stream) {
+#define TP_SC_CASE(ctype, name) \
+    case DType::name: \
+        scatter_kernel<ctype, Add, IndexT><<< \
+            (total_idx + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+            total_idx, idx_dim_size, idx_inner, self_dim_size, self_inner, \
+            static_cast<ctype*>(result.data_ptr()), index.data_ptr<IndexT>(), \
+            static_cast<const ctype*>(source.data_ptr())); \
+        break;
+    switch (result.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_SC_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(TP_SC_CASE)
+        TP_SC_CASE(tensorplay::complex<Half>, ComplexHalf)
+        TP_SC_CASE(tensorplay::complex<float>, ComplexFloat)
+        TP_SC_CASE(tensorplay::complex<double>, ComplexDouble)
+        TP_SC_CASE(tensorplay::complex<BFloat16>, BComplex32)
+        default: TP_THROW(TypeError, "scatter: unsupported dtype");
+    }
+#undef TP_SC_CASE
 }
 
 template <typename T, typename IndexT>
@@ -2009,7 +2034,8 @@ Tensor scatter_base_cuda(const Tensor& self, int64_t dim, const Tensor& index,
     if (index.dim() != nd) {
         TP_THROW(IndexError, "Index must have same number of dimensions as output tensor");
     }
-    Tensor idx_c = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
+    Tensor idx_c = (index.dtype() == DType::Int64 || index.dtype() == DType::Int32)
+        ? index.contiguous() : index.to(DType::Int64).contiguous();
     std::vector<int64_t> idx_shape(static_cast<std::vector<int64_t>>(idx_c.shape()));
     Tensor src_b;
     if (src.numel() == 1) {
@@ -2052,23 +2078,15 @@ Tensor scatter_base_cuda(const Tensor& self, int64_t dim, const Tensor& index,
                          "scatter_add on CUDA does not support this dtype");
         }
     }
-#define TP_SC_CASE(ctype, name) \
-    case DType::name: \
-        scatter_kernel<ctype, Add><<<(total_idx + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            total_idx, idx_dim_size, idx_inner, self_dim_size, inner, \
-            static_cast<ctype*>(result.data_ptr()), idx_c.data_ptr<int64_t>(), \
-            static_cast<const ctype*>(src_b.data_ptr())); \
-        break;
-    switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_SC_CASE)
-        TENSORPLAY_FORALL_FP8_TYPES(TP_SC_CASE)
-        TP_SC_CASE(tensorplay::complex<Half>, ComplexHalf)
-        TP_SC_CASE(tensorplay::complex<float>, ComplexFloat)
-        TP_SC_CASE(tensorplay::complex<double>, ComplexDouble)
-        TP_SC_CASE(tensorplay::complex<BFloat16>, BComplex32)
-        default: TP_THROW(TypeError, "scatter: unsupported dtype");
+    if (idx_c.dtype() == DType::Int32) {
+        launch_scatter_for_index<int32_t, Add>(
+            total_idx, idx_dim_size, idx_inner, self_dim_size, inner,
+            result, idx_c, src_b, stream);
+    } else {
+        launch_scatter_for_index<int64_t, Add>(
+            total_idx, idx_dim_size, idx_inner, self_dim_size, inner,
+            result, idx_c, src_b, stream);
     }
-#undef TP_SC_CASE
     CUDA_CHECK(cudaGetLastError());
     return result;
 }
@@ -2109,7 +2127,8 @@ static Tensor& scatter_base_inplace_cuda(Tensor& self, int64_t dim, const Tensor
     if (index.dim() != nd) {
         TP_THROW(IndexError, "Index must have same number of dimensions as output tensor");
     }
-    Tensor idx_c = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
+    Tensor idx_c = (index.dtype() == DType::Int64 || index.dtype() == DType::Int32)
+        ? index.contiguous() : index.to(DType::Int64).contiguous();
     std::vector<int64_t> idx_shape(static_cast<std::vector<int64_t>>(idx_c.shape()));
     Tensor src_b;
     if (src.numel() == 1) {
@@ -2135,46 +2154,40 @@ static Tensor& scatter_base_inplace_cuda(Tensor& self, int64_t dim, const Tensor
     int64_t self_dim_size = self.size(dim);
     if (total_idx == 0) return result;
     auto stream = getCurrentCUDAStream().stream();
-#define TP_SC_INPLACE_ASSIGN_CASE(ctype, name) \
-    case DType::name: { \
-        scatter_kernel<ctype, false><<<(total_idx + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            total_idx, idx_dim_size, idx_inner, self_dim_size, inner, \
-            static_cast<ctype*>(result.data_ptr()), idx_c.data_ptr<int64_t>(), \
-            static_cast<const ctype*>(src_b.data_ptr())); \
-        break; \
-    }
     if (add) {
-#define TP_SC_INPLACE_ADD_CASE(ctype, name) \
-        case DType::name: { \
-            scatter_kernel<ctype, true><<<(total_idx + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-                total_idx, idx_dim_size, idx_inner, self_dim_size, inner, \
-                static_cast<ctype*>(result.data_ptr()), idx_c.data_ptr<int64_t>(), \
-                static_cast<const ctype*>(src_b.data_ptr())); \
-            break; \
-        }
         switch (self.dtype()) {
-            TENSORPLAY_FORALL_SCALAR_TYPES(TP_SC_INPLACE_ADD_CASE)
-            TP_SC_INPLACE_ADD_CASE(tensorplay::complex<Half>, ComplexHalf)
-            TP_SC_INPLACE_ADD_CASE(tensorplay::complex<float>, ComplexFloat)
-            TP_SC_INPLACE_ADD_CASE(tensorplay::complex<double>, ComplexDouble)
-            TP_SC_INPLACE_ADD_CASE(tensorplay::complex<BFloat16>, BComplex32)
+            case DType::UInt8: case DType::Int8: case DType::Int16:
+            case DType::Int32: case DType::Int64:
+            case DType::UInt16: case DType::UInt32: case DType::UInt64:
+            case DType::Float32: case DType::Float64:
+            case DType::Float16: case DType::BFloat16: case DType::Bool:
+            case DType::ComplexHalf: case DType::ComplexFloat:
+            case DType::ComplexDouble: case DType::BComplex32:
+                break;
             default:
                 TP_THROW(NotImplementedError,
                          "scatter_add_ on CUDA does not support this dtype");
         }
-#undef TP_SC_INPLACE_ADD_CASE
+        if (idx_c.dtype() == DType::Int32) {
+            launch_scatter_for_index<int32_t, true>(
+                total_idx, idx_dim_size, idx_inner, self_dim_size, inner,
+                result, idx_c, src_b, stream);
+        } else {
+            launch_scatter_for_index<int64_t, true>(
+                total_idx, idx_dim_size, idx_inner, self_dim_size, inner,
+                result, idx_c, src_b, stream);
+        }
     } else {
-        switch (self.dtype()) {
-            TENSORPLAY_FORALL_SCALAR_TYPES(TP_SC_INPLACE_ASSIGN_CASE)
-            TENSORPLAY_FORALL_FP8_TYPES(TP_SC_INPLACE_ASSIGN_CASE)
-            TP_SC_INPLACE_ASSIGN_CASE(tensorplay::complex<Half>, ComplexHalf)
-            TP_SC_INPLACE_ASSIGN_CASE(tensorplay::complex<float>, ComplexFloat)
-            TP_SC_INPLACE_ASSIGN_CASE(tensorplay::complex<double>, ComplexDouble)
-            TP_SC_INPLACE_ASSIGN_CASE(tensorplay::complex<BFloat16>, BComplex32)
-            default: TP_THROW(TypeError, "scatter_: unsupported dtype");
+        if (idx_c.dtype() == DType::Int32) {
+            launch_scatter_for_index<int32_t, false>(
+                total_idx, idx_dim_size, idx_inner, self_dim_size, inner,
+                result, idx_c, src_b, stream);
+        } else {
+            launch_scatter_for_index<int64_t, false>(
+                total_idx, idx_dim_size, idx_inner, self_dim_size, inner,
+                result, idx_c, src_b, stream);
         }
     }
-#undef TP_SC_INPLACE_ASSIGN_CASE
     CUDA_CHECK(cudaGetLastError());
     return result;
 }
