@@ -1414,8 +1414,9 @@ Tensor& multinomial_out_native(const Tensor& self, int64_t num_samples, bool rep
 
 Tensor& linalg_lu_solve_out_native(const Tensor& LU, const Tensor& pivots, const Tensor& B,
                                    bool left, bool adjoint, Tensor& out) {
-    out = ops::linalg_lu_solve(LU, pivots, B, left, adjoint);
-    return out;
+    return write_exact_out("linalg_lu_solve",
+                           ops::linalg_lu_solve(LU, pivots, B, left, adjoint),
+                           out);
 }
 
 void split_with_sizes_copy_out_native(const Tensor& self,
