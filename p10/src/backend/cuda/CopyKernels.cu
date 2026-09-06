@@ -257,6 +257,171 @@ __global__ void transpose_tiled_vec4_kernel(
     }
 }
 
+// Vectorized two-byte transpose: same 64x64 schedule as the float packet
+// tile, with each thread moving a 4x4 element sub-tile in 8-byte packets
+// (four 16-bit values), so a warp stripe spans 128 contiguous bytes on both
+// the read and the write pass instead of the 64 bytes the scalar tile
+// produces.  One 16-bit slot of padding per shared row separates consecutive
+// packet rows onto distinct banks.
+constexpr int kTransHalfTile = 64;
+
+__global__ void transpose_tiled_vec2_halfpack_kernel(
+    uint16_t* __restrict__ dst, const uint16_t* __restrict__ src,
+    int64_t rows, int64_t cols) {
+    __shared__ uint16_t tile[kTransHalfTile][kTransHalfTile + 2];
+
+    const int64_t r_base = static_cast<int64_t>(blockIdx.x) * kTransHalfTile;
+    const int64_t c_base = static_cast<int64_t>(blockIdx.y) * kTransHalfTile;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    // Full 4x4 sub-tiles take the packet path; sub-tiles that straddle the
+    // matrix edge fall back to guarded scalar moves so no element is
+    // skipped.  Packet starts stay 8-byte aligned whenever both extents are
+    // multiples of four (gated by the host launcher).
+    const bool full = (r_base + tx * 4 + 4 <= rows) && (c_base + ty * 4 + 4 <= cols);
+    const bool any = (r_base + tx * 4 < rows) && (c_base + ty * 4 < cols);
+
+    uint16_t v[4][4];
+    if (full) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint2 pack = *reinterpret_cast<const uint2*>(
+                src + (r_base + tx * 4) + (c_base + ty * 4 + i) * rows);
+            v[i][0] = static_cast<uint16_t>(pack.x & 0xffffu);
+            v[i][1] = static_cast<uint16_t>(pack.x >> 16);
+            v[i][2] = static_cast<uint16_t>(pack.y & 0xffffu);
+            v[i][3] = static_cast<uint16_t>(pack.y >> 16);
+        }
+    } else if (any) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int64_t c = c_base + ty * 4 + i;
+                const int64_t r = r_base + tx * 4 + j;
+                v[i][j] = (r < rows && c < cols) ? src[r + c * rows] : 0;
+            }
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            tile[ty * 4 + i][tx * 4 + j] = v[i][j];
+    }
+    __syncthreads();
+
+    // Write phase: the lane mapping swaps axes, so each lane stores one
+    // 4-wide packet of one destination row at unit stride along cols.
+    const bool full_w = (r_base + tx * 4 + 4 <= rows) && (c_base + ty * 4 + 4 <= cols);
+    const bool any_w = (r_base + tx * 4 < rows) && (c_base + ty * 4 < cols);
+    if (full_w) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            uint2 out;
+            out.x = static_cast<uint32_t>(tile[ty * 4 + 0][tx * 4 + j]) |
+                    (static_cast<uint32_t>(tile[ty * 4 + 1][tx * 4 + j]) << 16);
+            out.y = static_cast<uint32_t>(tile[ty * 4 + 2][tx * 4 + j]) |
+                    (static_cast<uint32_t>(tile[ty * 4 + 3][tx * 4 + j]) << 16);
+            *reinterpret_cast<uint2*>(
+                dst + (r_base + tx * 4 + j) * cols + (c_base + ty * 4)) = out;
+        }
+    } else if (any_w) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const int64_t r = r_base + tx * 4 + j;
+                const int64_t col = c_base + ty * 4 + c;
+                if (r < rows && col < cols)
+                    dst[r * cols + col] = tile[ty * 4 + c][tx * 4 + j];
+            }
+        }
+    }
+}
+
+// Batched float transpose: batch independent [rows, cols] matrices, each the
+// transpose view of a row-major [cols, rows] plane with contiguous batches.
+// The 64x64 packet schedule is identical to the 2-D kernel; blockIdx.z picks
+// the plane, so the per-plane work stays coalesced while the batch dimension
+// adds grid-level parallelism for free.
+__global__ void transpose_tiled_vec4_batched_kernel(
+    float* __restrict__ dst, const float* __restrict__ src,
+    int64_t rows, int64_t cols, int64_t batch) {
+    __shared__ float tile[kTransVecTile][kTransVecTile + 1];
+
+    const int64_t plane = blockIdx.z;
+    const int64_t r_base = static_cast<int64_t>(blockIdx.x) * kTransVecTile;
+    const int64_t c_base = static_cast<int64_t>(blockIdx.y) * kTransVecTile;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    // Per-plane source base: plane is contiguous (rows * cols elements);
+    // dst planes come from the contiguous [batch, cols, rows] result.
+    const float* src_p = src + plane * rows * cols;
+    float* dst_p = dst + plane * rows * cols;
+
+    const bool full = (r_base + tx * 4 + 4 <= rows) && (c_base + ty * 4 + 4 <= cols);
+    const bool any = (r_base + tx * 4 < rows) && (c_base + ty * 4 < cols);
+
+    float v[4][4];
+    if (full) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float4 pack = *reinterpret_cast<const float4*>(
+                src_p + (r_base + tx * 4) + (c_base + ty * 4 + i) * rows);
+            v[i][0] = pack.x;
+            v[i][1] = pack.y;
+            v[i][2] = pack.z;
+            v[i][3] = pack.w;
+        }
+    } else if (any) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int64_t c = c_base + ty * 4 + i;
+                const int64_t r = r_base + tx * 4 + j;
+                v[i][j] = (r < rows && c < cols) ? src_p[r + c * rows] : 0.0f;
+            }
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            tile[ty * 4 + i][tx * 4 + j] = v[i][j];
+    }
+    __syncthreads();
+
+    const bool full_w = (r_base + tx * 4 + 4 <= rows) && (c_base + ty * 4 + 4 <= cols);
+    const bool any_w = (r_base + tx * 4 < rows) && (c_base + ty * 4 < cols);
+    if (full_w) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float4 out;
+            out.x = tile[ty * 4 + 0][tx * 4 + j];
+            out.y = tile[ty * 4 + 1][tx * 4 + j];
+            out.z = tile[ty * 4 + 2][tx * 4 + j];
+            out.w = tile[ty * 4 + 3][tx * 4 + j];
+            *reinterpret_cast<float4*>(
+                dst_p + (r_base + tx * 4 + j) * cols + (c_base + ty * 4)) = out;
+        }
+    } else if (any_w) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const int64_t r = r_base + tx * 4 + j;
+                const int64_t col = c_base + ty * 4 + c;
+                if (r < rows && col < cols)
+                    dst_p[r * cols + col] = tile[ty * 4 + c][tx * 4 + j];
+            }
+        }
+    }
+}
+
 // dst is a [rows, cols] column-major view of a [cols, rows] row-major
 // source: the two storages agree element for element, so the copy
 // degenerates to memcpy.
@@ -298,6 +463,55 @@ bool transpose_layout_is_tiled_copy_vec(const Tensor& self, const Tensor& src) {
     const int64_t cols = self.size(1);
     if (rows < 256 || cols < 256) return false;
     if (rows % 4 != 0 || cols % 4 != 0) return false;
+    if ((reinterpret_cast<uintptr_t>(self.data_ptr()) |
+         reinterpret_cast<uintptr_t>(src.data_ptr())) & 15u)
+        return false;
+    return true;
+}
+
+// Same layout contract as the float packet tile, for the two-byte element
+// types (fp16 / bf16 storages share the 16-bit bit pattern): 8-byte packet
+// alignment requires both extents to be multiples of four and both base
+// pointers 8-byte aligned.
+bool transpose_layout_is_tiled_copy_vec2_half(const Tensor& self,
+                                              const Tensor& src) {
+    if (self.dim() != 2 || src.dim() != 2 || self.dtype() != src.dtype())
+        return false;
+    if (src.itemsize() != 2) return false;
+    if (!self.is_contiguous()) return false;
+    if (self.size(0) != src.size(0) || self.size(1) != src.size(1))
+        return false;
+    if (src.stride(0) != 1 || src.stride(1) != self.size(0)) return false;
+    const int64_t rows = self.size(0);
+    const int64_t cols = self.size(1);
+    if (rows < 256 || cols < 256) return false;
+    if (rows % 4 != 0 || cols % 4 != 0) return false;
+    if ((reinterpret_cast<uintptr_t>(self.data_ptr()) |
+         reinterpret_cast<uintptr_t>(src.data_ptr())) & 7u)
+        return false;
+    return true;
+}
+
+// Batched plane transposes: dst is a contiguous [batch, rows, cols] float32
+// tensor; src is a [batch, rows, cols] view whose planes are each the
+// transpose of a row-major [cols, rows] matrix with unit batch stride.
+// This is exactly the permute(0, 2, 1) view of a contiguous batch, the most
+// common rank-3 layout change.
+bool transpose_layout_is_tiled_copy_vec3(const Tensor& self, const Tensor& src) {
+    if (self.dim() != 3 || src.dim() != 3 ||
+        self.dtype() != DType::Float32)
+        return false;
+    if (!self.is_contiguous()) return false;
+    if (self.size(0) != src.size(0) || self.size(1) != src.size(1) ||
+        self.size(2) != src.size(2))
+        return false;
+    const int64_t batch = self.size(0);
+    const int64_t rows = self.size(1);
+    const int64_t cols = self.size(2);
+    if (batch == 0 || rows < 256 || cols < 256) return false;
+    if (rows % 4 != 0 || cols % 4 != 0) return false;
+    if (src.stride(0) != rows * cols) return false;
+    if (src.stride(1) != 1 || src.stride(2) != rows) return false;
     if ((reinterpret_cast<uintptr_t>(self.data_ptr()) |
          reinterpret_cast<uintptr_t>(src.data_ptr())) & 15u)
         return false;
@@ -381,6 +595,32 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
             static_cast<float*>(self.data_ptr()),
             static_cast<const float*>(src.data_ptr()), rows, cols);
         checkCuda(cudaGetLastError(), "CUDA vectorized tiled transpose copy");
+        return self;
+    }
+    if (src_cuda && transpose_layout_is_tiled_copy_vec3(self, src)) {
+        const int64_t batch = self.size(0);
+        const int64_t rows = self.size(1);
+        const int64_t cols = self.size(2);
+        dim3 block(kTransVecTile / 4, kTransVecTile / 4, 1);
+        dim3 grid(static_cast<unsigned>((rows + kTransVecTile - 1) / kTransVecTile),
+                  static_cast<unsigned>((cols + kTransVecTile - 1) / kTransVecTile),
+                  static_cast<unsigned>(batch));
+        transpose_tiled_vec4_batched_kernel<<<grid, block, 0, stream.stream()>>>(
+            static_cast<float*>(self.data_ptr()),
+            static_cast<const float*>(src.data_ptr()), rows, cols, batch);
+        checkCuda(cudaGetLastError(), "CUDA batched vectorized tiled transpose copy");
+        return self;
+    }
+    if (src_cuda && transpose_layout_is_tiled_copy_vec2_half(self, src)) {
+        const int64_t rows = self.size(0);
+        const int64_t cols = self.size(1);
+        dim3 block(kTransHalfTile / 4, kTransHalfTile / 4);
+        dim3 grid(static_cast<unsigned>((rows + kTransHalfTile - 1) / kTransHalfTile),
+                  static_cast<unsigned>((cols + kTransHalfTile - 1) / kTransHalfTile));
+        transpose_tiled_vec2_halfpack_kernel<<<grid, block, 0, stream.stream()>>>(
+            static_cast<uint16_t*>(self.data_ptr()),
+            static_cast<const uint16_t*>(src.data_ptr()), rows, cols);
+        checkCuda(cudaGetLastError(), "CUDA vectorized two-byte tiled transpose copy");
         return self;
     }
     if (src_cuda && transpose_layout_is_tiled_copy(self, src)) {
