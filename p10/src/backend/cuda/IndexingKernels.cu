@@ -3217,7 +3217,7 @@ __global__ void unique_row_emit_kernel(int64_t n, int64_t row_len,
         const T* src = rows + i * row_len;
         T* dst = out + g * row_len;
         for (int64_t c = 0; c < row_len; ++c) dst[c] = src[c];
-        inverse[row] = g;
+        if (inverse != nullptr) inverse[row] = g;
     }
 }
 
@@ -3320,14 +3320,17 @@ std::tuple<Tensor, Tensor, Tensor> unique_dim_cuda_impl(const Tensor& self,
 
     Tensor kept_rows = Tensor::empty({num_groups, row_len}, self.dtype(),
                                      self.device());
-    Tensor inverse = Tensor::empty({n}, DType::Int64, self.device());
+    Tensor inverse = return_inverse
+                         ? Tensor::empty({n}, DType::Int64, self.device())
+                         : Tensor();
+    int64_t* inverse_ptr = return_inverse ? inverse.data_ptr<int64_t>() : nullptr;
 
 #define UNIQUE_ROW_EMIT_CASE(ctype, name)                                     \
     case DType::name:                                                          \
         unique_row_emit_kernel<ctype><<<blocks, threads, 0, stream>>>(         \
             n, row_len, rows_sorted.data_ptr<ctype>(),                         \
             order.data_ptr<int64_t>(), gid.data_ptr<int64_t>(),                \
-            kept_rows.data_ptr<ctype>(), inverse.data_ptr<int64_t>());         \
+            kept_rows.data_ptr<ctype>(), inverse_ptr);                           \
         break;
     switch (self.dtype()) {
         UNIQUE_ROW_EMIT_CASE(float, Float32)
