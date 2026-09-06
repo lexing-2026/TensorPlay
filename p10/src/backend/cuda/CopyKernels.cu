@@ -15,18 +15,18 @@ namespace cuda {
 
 // rank through broadcasted batch dimensions, so the strided clone path must
 // not impose the old eight-dimension limit.
-static constexpr int MAX_DIMS = 64;
+static constexpr int kCopyMaxDims = 64;
 
 struct TensorInfo {
-    int64_t sizes[MAX_DIMS];
-    int64_t strides[MAX_DIMS];
+    int64_t sizes[kCopyMaxDims];
+    int64_t strides[kCopyMaxDims];
     int ndim;
 };
 
 TensorInfo get_tensor_info(const Tensor& t) {
     TensorInfo info;
     info.ndim = t.dim();
-    if (info.ndim > MAX_DIMS) {
+    if (info.ndim > kCopyMaxDims) {
          TP_THROW(RuntimeError, "Tensor dimension exceeds MAX_DIMS (64) for CUDA copy");
     }
     for (int i = 0; i < info.ndim; ++i) {
