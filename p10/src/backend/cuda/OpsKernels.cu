@@ -79,13 +79,6 @@ inline std::vector<int64_t> shape_of(const Tensor& t) {
 // Generic elementwise device kernels
 // ---------------------------------------------------------------------------
 
-template <typename T, typename Op>
-__global__ void ew_binary_kernel(int64_t n, const T* a, const T* b, T* out, Op op) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) out[i] = op(a[i], b[i]);
-}
-
 template <typename T, typename Pred>
 __global__ void ew_bool_binary_kernel(int64_t n, const T* a, const T* b, bool* out, Pred pred) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -145,18 +138,21 @@ template <typename Op>
 Tensor binary_same_cuda(const Tensor& a_in, const Tensor& b_in, Op op, const char* name) {
     std::vector<int64_t> out_shape = broadcast_shapes(shape_of(a_in), shape_of(b_in));
     DType dt = promoteTypes(a_in.dtype(), b_in.dtype());
-    Tensor ac = a_in.to(dt).expand(out_shape).contiguous();
-    Tensor bc = b_in.to(dt).expand(out_shape).contiguous();
+    Tensor ac = a_in.to(dt).expand(out_shape);
+    Tensor bc = b_in.to(dt).expand(out_shape);
     Tensor out = Tensor::empty(out_shape, dt, a_in.device());
-    int64_t n = out.numel();
-    if (n == 0) return out;
-    dim3 grid, block;
-    launch_ew(grid, block, n);
-    auto stream = getCurrentCUDAStream().stream();
+    if (out.numel() == 0) return out;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(out)
+        .add_const_input(ac)
+        .add_const_input(bc)
+        .build();
 #define TP_BIN(ctype, name_) \
     case DType::name_: \
-        ew_binary_kernel<ctype><<<grid, block, 0, stream>>>( \
-            n, ac.data_ptr<ctype>(), bc.data_ptr<ctype>(), out.data_ptr<ctype>(), op); \
+        gpu_kernel(iter, [op] __device__(ctype lhs, ctype rhs) -> ctype { \
+            return op(lhs, rhs); \
+        }); \
         break;
     switch (dt) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_BIN)
