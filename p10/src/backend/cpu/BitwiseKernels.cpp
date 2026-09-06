@@ -25,6 +25,7 @@
 #include "Exception.h"
 #include "Parallel.h"
 #include "TypePromotion.h"
+#include "cpu/vec/vec.h"
 
 #include <cstdint>
 #include <type_traits>
@@ -75,6 +76,63 @@ inline T bitwise_shift_value(T value, T shift) {
     return static_cast<T>(value >> static_cast<U>(shift));
 }
 
+template <typename T, typename ScalarOp, typename VectorOp>
+inline void parallel_binary_vectorized(
+        const T* lhs, const T* rhs, T* output, int64_t n,
+        ScalarOp scalar_op, VectorOp vector_op) {
+    using Vec = tensorplay::vec::Vectorized<T>;
+    constexpr int64_t width = Vec::size();
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        int64_t index = begin;
+        const int64_t vector_end = begin + ((end - begin) / width) * width;
+        for (; index < vector_end; index += width) {
+            vector_op(Vec::loadu(lhs + index), Vec::loadu(rhs + index))
+                .store(output + index);
+        }
+        for (; index < end; ++index) {
+            output[index] = scalar_op(lhs[index], rhs[index]);
+        }
+    });
+}
+
+template <typename T, typename ScalarOp, typename VectorOp>
+inline void parallel_scalar_vectorized(
+        const T* input, T scalar, T* output, int64_t n,
+        ScalarOp scalar_op, VectorOp vector_op) {
+    using Vec = tensorplay::vec::Vectorized<T>;
+    constexpr int64_t width = Vec::size();
+    const Vec vector_scalar(scalar);
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        int64_t index = begin;
+        const int64_t vector_end = begin + ((end - begin) / width) * width;
+        for (; index < vector_end; index += width) {
+            vector_op(Vec::loadu(input + index), vector_scalar)
+                .store(output + index);
+        }
+        for (; index < end; ++index) {
+            output[index] = scalar_op(input[index], scalar);
+        }
+    });
+}
+
+template <typename T, typename ScalarOp, typename VectorOp>
+inline void parallel_unary_vectorized(
+        const T* input, T* output, int64_t n,
+        ScalarOp scalar_op, VectorOp vector_op) {
+    using Vec = tensorplay::vec::Vectorized<T>;
+    constexpr int64_t width = Vec::size();
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        int64_t index = begin;
+        const int64_t vector_end = begin + ((end - begin) / width) * width;
+        for (; index < vector_end; index += width) {
+            vector_op(Vec::loadu(input + index)).store(output + index);
+        }
+        for (; index < end; ++index) {
+            output[index] = scalar_op(input[index]);
+        }
+    });
+}
+
 template <typename Pred>
 Tensor bitwise_binary_cpu(const Tensor& a_in, const Tensor& b_in, Pred pred, const char* name) {
     bitwise_check_cpu(a_in, name);
@@ -106,9 +164,9 @@ Tensor bitwise_binary_cpu(const Tensor& a_in, const Tensor& b_in, Pred pred, con
         const ctype* ap = ac.data_ptr<ctype>(); \
         const ctype* bp = bc.data_ptr<ctype>(); \
         ctype* dp = out.data_ptr<ctype>(); \
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
-            for (int64_t i = begin; i < end; ++i) dp[i] = pred(ap[i], bp[i]); \
-        }); \
+        parallel_binary_vectorized<ctype>(ap, bp, dp, n, pred,                 \
+            [pred](tensorplay::vec::Vectorized<ctype> a,                     \
+                   tensorplay::vec::Vectorized<ctype> b) { return pred(a, b); }); \
         break; \
     }
     switch (dt) {
@@ -141,9 +199,9 @@ Tensor bitwise_scalar_cpu(const Tensor& self_in, Scalar other, Pred pred, const 
         const ctype* sp = sc.data_ptr<ctype>(); \
         ctype ov = static_cast<ctype>(other.to<int64_t>()); \
         ctype* dp = out.data_ptr<ctype>(); \
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
-            for (int64_t i = begin; i < end; ++i) dp[i] = pred(sp[i], ov); \
-        }); \
+        parallel_scalar_vectorized<ctype>(sp, ov, dp, n, pred,                \
+            [pred](tensorplay::vec::Vectorized<ctype> a,                     \
+                   tensorplay::vec::Vectorized<ctype> b) { return pred(a, b); }); \
         break; \
     }
     switch (self_in.dtype()) {
@@ -167,10 +225,15 @@ Tensor bitwise_shift_scalar_cpu(const Tensor& self_in, Scalar other, const char*
         const ctype* sp = sc.data_ptr<ctype>(); \
         const ctype sh = static_cast<ctype>(shift); \
         ctype* dp = out.data_ptr<ctype>(); \
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
-            for (int64_t i = begin; i < end; ++i) \
-                dp[i] = bitwise_shift_value<ctype, kLeft>(sp[i], sh); \
-        }); \
+        parallel_scalar_vectorized<ctype>(sp, sh, dp, n,                    \
+            [](ctype value, ctype shift_value) {                            \
+                return bitwise_shift_value<ctype, kLeft>(value, shift_value); \
+            },                                                               \
+            [](tensorplay::vec::Vectorized<ctype> value,                    \
+               tensorplay::vec::Vectorized<ctype> shift_value) {             \
+                if constexpr (kLeft) return value << shift_value;            \
+                return value >> shift_value;                                  \
+            });                                                               \
         break; \
     }
     switch (self_in.dtype()) {
@@ -199,9 +262,9 @@ Tensor bitwise_not_cpu(const Tensor& self) {
     case DType::name_: { \
         const ctype* sp = sc.data_ptr<ctype>(); \
         ctype* dp = out.data_ptr<ctype>(); \
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
-            for (int64_t i = begin; i < end; ++i) dp[i] = static_cast<ctype>(~sp[i]); \
-        }); \
+        parallel_unary_vectorized<ctype>(sp, dp, n,                        \
+            [](ctype value) { return static_cast<ctype>(~value); },         \
+            [](tensorplay::vec::Vectorized<ctype> value) { return ~value; }); \
         break; \
     }
     switch (self.dtype()) {
@@ -233,11 +296,15 @@ Tensor bitwise_shift_tensor_cpu(const Tensor& a_in, const Tensor& b_in, const ch
         const ctype* ap = ac.data_ptr<ctype>(); \
         const ctype* bp = bc.data_ptr<ctype>(); \
         ctype* dp = out.data_ptr<ctype>(); \
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
-            for (int64_t i = begin; i < end; ++i) { \
-                dp[i] = bitwise_shift_value<ctype, kLeft>(ap[i], bp[i]); \
-            } \
-        }); \
+        parallel_binary_vectorized<ctype>(ap, bp, dp, n,                    \
+            [](ctype value, ctype shift_value) {                            \
+                return bitwise_shift_value<ctype, kLeft>(value, shift_value); \
+            },                                                               \
+            [](tensorplay::vec::Vectorized<ctype> value,                    \
+               tensorplay::vec::Vectorized<ctype> shift_value) {             \
+                if constexpr (kLeft) return value << shift_value;            \
+                return value >> shift_value;                                  \
+            });                                                               \
         break; \
     }
     switch (dt) {
