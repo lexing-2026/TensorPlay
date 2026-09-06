@@ -8,6 +8,7 @@
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "Scalar.h"
+#include "Complex.h"
 #include "pocketfft_hdronly.h"
 
 #include <vector>
@@ -21,6 +22,16 @@ namespace tensorplay {
 namespace cpu {
 
 namespace {
+
+template <typename T>
+const std::complex<T>* pocketfft_complex_input(const void* data) {
+    return reinterpret_cast<const std::complex<T>*>(data);
+}
+
+template <typename T>
+std::complex<T>* pocketfft_complex_output(void* data) {
+    return reinterpret_cast<std::complex<T>*>(data);
+}
 
 constexpr double kPiD = 3.141592653589793238463;
 
@@ -137,7 +148,7 @@ Tensor resize_input_dim(const Tensor& contig, int64_t dim, int64_t want) {
 template <typename T>
 Tensor core_c2c(const Tensor& contig, int64_t dim, int64_t out_len,
                 fft_norm_mode mode, bool forward) {
-    using C = std::complex<T>;
+    using C = complex<T>;
     Tensor src = resize_input_dim(contig, dim, out_len);
     std::vector<int64_t> sizes = sizes_of(src);
     std::vector<int64_t> out_sizes = sizes;
@@ -151,14 +162,15 @@ Tensor core_c2c(const Tensor& contig, int64_t dim, int64_t out_len,
     pocketfft::shape_t axes{size_t(dim)};
     const T fct = norm_factor<T>(mode, out_len);
     pocketfft::c2c<T>(pshape, sin_, sout, axes, forward,
-                      static_cast<const C*>(src.data_ptr()),
-                      static_cast<C*>(out.data_ptr()), fct, /*nthreads=*/1);
+                      pocketfft_complex_input<T>(src.data_ptr()),
+                      pocketfft_complex_output<T>(out.data_ptr()), fct,
+                      /*nthreads=*/1);
     return out;
 }
 
 template <typename T>
 Tensor core_r2c(const Tensor& contig, int64_t dim, fft_norm_mode mode, bool onesided) {
-    using C = std::complex<T>;
+    using C = complex<T>;
     std::vector<int64_t> sizes = sizes_of(contig);
     const int64_t N = sizes[dim];
     const int64_t out_len = onesided ? infer_ft_real_to_complex_onesided_size(N) : N;
@@ -174,7 +186,7 @@ Tensor core_r2c(const Tensor& contig, int64_t dim, fft_norm_mode mode, bool ones
     if (onesided) {
         pocketfft::r2c<T>(pshape, sin_, sout, size_t(dim), /*forward=*/true,
                           static_cast<const T*>(contig.data_ptr()),
-                          static_cast<C*>(out.data_ptr()), fct, 1);
+                          pocketfft_complex_output<T>(out.data_ptr()), fct, 1);
     } else {
         // twosided real transform: promote to complex and run c2c
         std::vector<int64_t> csizes = sizes;
@@ -184,8 +196,8 @@ Tensor core_r2c(const Tensor& contig, int64_t dim, fft_norm_mode mode, bool ones
         const int64_t total = contig.numel();
         for (int64_t i = 0; i < total; ++i) cp[i] = C(rp[i], T(0));
         pocketfft::c2c<T>(pshape, sin_, contig_byte_strides(out_sizes, sizeof(C)),
-                          axes, true, static_cast<const C*>(csrc.data_ptr()),
-                          static_cast<C*>(out.data_ptr()), fct, 1);
+                          axes, true, pocketfft_complex_input<T>(csrc.data_ptr()),
+                          pocketfft_complex_output<T>(out.data_ptr()), fct, 1);
     }
     return out;
 }
@@ -193,7 +205,7 @@ Tensor core_r2c(const Tensor& contig, int64_t dim, fft_norm_mode mode, bool ones
 // _fft_c2r analogue: input holds n/2+1 Hermitian bins, output length out_len.
 template <typename T>
 Tensor core_c2r(const Tensor& contig, int64_t dim, int64_t out_len, fft_norm_mode mode) {
-    using C = std::complex<T>;
+    using C = complex<T>;
     std::vector<int64_t> isizes = sizes_of(contig);
     const int64_t bins_needed = out_len / 2 + 1;
     Tensor src = isizes[dim] == bins_needed
@@ -210,7 +222,7 @@ Tensor core_c2r(const Tensor& contig, int64_t dim, int64_t out_len, fft_norm_mod
     pocketfft::shape_t axes{size_t(dim)};
     const T fct = norm_factor<T>(mode, out_len);
     pocketfft::c2r<T>(pshape_out, sin_, sout, size_t(dim), /*forward=*/false,
-                      static_cast<const C*>(src.data_ptr()),
+                      pocketfft_complex_input<T>(src.data_ptr()),
                       static_cast<T*>(out.data_ptr()), fct, 1);
     return out;
 }
@@ -222,7 +234,7 @@ namespace {
 // with a zero imaginary part (SpectralOps.cpp fft_r2c "fft"/"ifft" entry).
 template <typename T>
 Tensor materialize_real_as_complex(const Tensor& x) {
-    using C = std::complex<T>;
+    using C = complex<T>;
     Tensor out(sizes_of(x), complex_of_real(x.dtype()));
     const T* src = static_cast<const T*>(x.data_ptr());
     C* dst = static_cast<C*>(out.data_ptr());
@@ -305,7 +317,7 @@ namespace {
 // real part, so fft/ifft on a real primal yields a real gradient.
 template <typename T>
 Tensor extract_real_part(const Tensor& z) {
-    using C = std::complex<T>;
+    using C = complex<T>;
     Tensor out(sizes_of(z), real_of_complex(z.dtype()));
     Tensor zc = z.contiguous();
     const C* src = static_cast<const C*>(zc.data_ptr());
@@ -576,7 +588,7 @@ template <typename T>
 Tensor stft_impl(const Tensor& work, int64_t n_fft, int64_t hop, int64_t win,
                  const std::optional<Tensor>& window, bool normalized, bool onesided,
                  bool return_complex, bool was_1d) {
-    using C = std::complex<T>;
+    using C = complex<T>;
     std::vector<int64_t> wsizes = sizes_of(work);  // (batch, plen)
     const int64_t batch = wsizes[0];
     const int64_t plen = wsizes[1];
@@ -610,7 +622,7 @@ Tensor stft_impl(const Tensor& work, int64_t n_fft, int64_t hop, int64_t win,
         if (onesided) {
             pocketfft::r2c<T>(pshape, sin_, sout, 1, true,
                               static_cast<const T*>(frames.data_ptr()),
-                              static_cast<C*>(spec.data_ptr()), fct, 1);
+                              pocketfft_complex_output<T>(spec.data_ptr()), fct, 1);
         } else {
             // promote frames to complex then c2c
             Tensor cframes(std::vector<int64_t>{batch * n_frames, n_fft}, complex_of_real(work.dtype()));
@@ -619,8 +631,8 @@ Tensor stft_impl(const Tensor& work, int64_t n_fft, int64_t hop, int64_t win,
             for (int64_t i = 0; i < frames.numel(); ++i) cp[i] = C(rp[i], T(0));
             pocketfft::c2c<T>(pshape, contig_byte_strides({batch * n_frames, n_fft}, sizeof(C)),
                               sout, {1}, true,
-                              static_cast<const C*>(cframes.data_ptr()),
-                              static_cast<C*>(spec.data_ptr()), fct, 1);
+                              pocketfft_complex_input<T>(cframes.data_ptr()),
+                              pocketfft_complex_output<T>(spec.data_ptr()), fct, 1);
         }
     }
 
@@ -699,7 +711,7 @@ template <typename T>
 Tensor istft_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t win,
                   const std::optional<Tensor>& window, bool center, bool normalized,
                   bool onesided, std::optional<int64_t> length) {
-    using C = std::complex<T>;
+    using C = complex<T>;
     const auto mode = normalized ? fft_norm_mode::by_root_n : fft_norm_mode::by_n;
     std::vector<int64_t> isizes = sizes_of(input);
     // this is 2D (freq, frames) -> (len,) or 3D (batch, freq, frames) -> (B, len).
@@ -758,7 +770,7 @@ Tensor istft_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t win,
         auto sin_ = contig_byte_strides({batch * frames, bins}, sizeof(C));
         auto sout = contig_byte_strides({batch * frames, n_fft}, sizeof(T));
         pocketfft::c2r<T>(pshape_out, sin_, sout, 1, /*forward=*/false,
-                          static_cast<const C*>(cols.data_ptr()),
+                          pocketfft_complex_input<T>(cols.data_ptr()),
                           static_cast<T*>(time_frames.data_ptr()),
                           norm_factor<T>(mode, n_fft), 1);
     }
@@ -808,7 +820,7 @@ template <typename T>
 Tensor stft_backward_impl(const Tensor& grad_output, const Tensor& self, int64_t n_fft,
                           int64_t hop, int64_t win_length, const std::optional<Tensor>& window,
                           bool center, bool normalized, bool onesided, const std::string& pad_mode) {
-    using C = std::complex<T>;
+    using C = complex<T>;
     const auto mode = normalized ? fft_norm_mode::by_root_n : fft_norm_mode::none;
     const int64_t n_freq = onesided ? infer_ft_real_to_complex_onesided_size(n_fft) : n_fft;
 
@@ -848,8 +860,8 @@ Tensor stft_backward_impl(const Tensor& grad_output, const Tensor& self, int64_t
         auto pshape = pocketfft::shape_t{size_t(batch * frames), size_t(n_fft)};
         auto strides = contig_byte_strides({batch * frames, n_fft}, sizeof(C));
         pocketfft::c2c<T>(pshape, strides, strides, {1}, /*forward=*/false,
-                          static_cast<const C*>(full.data_ptr()),
-                          static_cast<C*>(ctime.data_ptr()), s_fwd, 1);
+                          pocketfft_complex_input<T>(full.data_ptr()),
+                          pocketfft_complex_output<T>(ctime.data_ptr()), s_fwd, 1);
     }
     Tensor time_frames({batch * frames, n_fft}, self.dtype());
     {
