@@ -6,9 +6,12 @@
 #include "DistributionDispatch.h"
 #include "Scalar.h"
 #include "Exception.h"
+#include "Parallel.h"
 #include "Context.h"
+#include "cpu/vec/vec.h"
 #include <vector>
 #include <cmath>
+#include <type_traits>
 #include <algorithm>
 #include <cstring>
 
@@ -226,8 +229,7 @@ Tensor arange_start_step_kernel(Scalar start, Scalar end, Scalar step, DType dty
                      "\"arange\" not implemented for '" + std::string(toString(dtype)) + "'");
 #define ARANGE_CASE(ctype, name) \
         case DType::name: { \
-            ctype* data = t.data_ptr<ctype>(); \
-            for (int64_t i = 0; i < len; ++i) data[i] = static_cast<ctype>(s_d + i * st_d); \
+            arange_fill<ctype>(t.data_ptr<ctype>(), len, s_d, st_d); \
             break; \
         }
         ARANGE_CASE(uint8_t, UInt8)
@@ -282,13 +284,15 @@ Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device) {
         case DType::ComplexHalf: {
             auto* data = t.data_ptr<tensorplay::complex<Half>>();
             for (int64_t i = 0; i < min_dim; ++i)
-                data[i * m + i] = {Half(1.0f), Half(0.0f)};
+                data[i * m + i] =
+                    tensorplay::complex<Half>(Half(1.0f), Half(0.0f));
             break;
         }
         case DType::BComplex32: {
             auto* data = t.data_ptr<tensorplay::complex<BFloat16>>();
             for (int64_t i = 0; i < min_dim; ++i)
-                data[i * m + i] = {BFloat16(1.0f), BFloat16(0.0f)};
+                data[i * m + i] =
+                    tensorplay::complex<BFloat16>(BFloat16(1.0f), BFloat16(0.0f));
             break;
         }
         default:
@@ -298,37 +302,177 @@ Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device) {
     return t;
 }
 
+// Both sequence factories walk in from whichever endpoint is nearer: the first
+// half accumulates forward from `start` and the second half backward from
+// `end`, which pins both endpoints exactly and halves the error a single
+// forward accumulation would reach at the far end.
+//
+// The step is carried in a wider domain than the element type: an integral
+// output spans a range its own type may not represent, and a reduced-width
+// float would round the increment away long before the end of the sequence.
+namespace {
+
+template <typename T>
+void arange_fill(T* data, int64_t steps, double start, double step) {
+    using Vec = tensorplay::vec::Vectorized<T>;
+    constexpr int64_t width = Vec::size();
+    parallel::parallel_for(0, steps, parallel::GRAIN_SIZE,
+        [&](int64_t begin, int64_t last) {
+            int64_t index = begin;
+            const int64_t vector_end = begin +
+                ((last - begin) / width) * width;
+            for (; index < vector_end; index += width) {
+                const T base = static_cast<T>(
+                    start + static_cast<double>(index) * step);
+                Vec::arange(base, step).store(data + index);
+            }
+            for (; index < last; ++index) {
+                data[index] = static_cast<T>(
+                    start + static_cast<double>(index) * step);
+            }
+        });
+}
+
+// The endpoints are first narrowed to the element type, so an integral
+// sequence starts and ends where that type actually lands, and only then
+// widened for the accumulation.  An integral element type steps through
+// double, since its own range cannot express the increment.
+template <typename T>
+struct SequenceStepType {
+    using type = std::conditional_t<std::is_integral_v<T>, double, T>;
+};
+
+template <typename T>
+void linspace_fill(T* data, Scalar start, Scalar end, int64_t steps) {
+    using step_t = typename SequenceStepType<T>::type;
+    const T s = start.to<T>();
+    const T e = end.to<T>();
+    const step_t step =
+        static_cast<step_t>((static_cast<step_t>(e) - static_cast<step_t>(s)) /
+                            (steps - 1));
+    const int64_t halfway = steps / 2;
+    parallel::parallel_for(0, steps, parallel::GRAIN_SIZE, [&](int64_t begin, int64_t last) {
+        for (int64_t i = begin; i < last; ++i) {
+            data[i] = i < halfway ? static_cast<T>(s + step * i)
+                                  : static_cast<T>(e - step * (steps - i - 1));
+        }
+    });
+}
+
+template <typename T>
+void logspace_fill(T* data, Scalar start, Scalar end, int64_t steps,
+                   double base) {
+    const T s = start.to<T>();
+    const T e = end.to<T>();
+    const double step =
+        static_cast<double>(e - s) / static_cast<double>(steps - 1);
+    const int64_t halfway = steps / 2;
+    parallel::parallel_for(0, steps, parallel::GRAIN_SIZE, [&](int64_t begin, int64_t last) {
+        for (int64_t i = begin; i < last; ++i) {
+            const double exponent = i < halfway ? s + step * i
+                                                : e - step * (steps - i - 1);
+            data[i] = static_cast<T>(std::pow(base, exponent));
+        }
+    });
+}
+
+// Complex sequences step through a complex domain of at least single
+// precision; the reduced-width element types store the rounded result.
+template <typename compute_t, typename store_t>
+void linspace_fill_complex(store_t* data, Scalar start, Scalar end,
+                           int64_t steps) {
+    using value_t = typename compute_t::value_type;
+    const auto start_host = start.to<tensorplay::complex<double>>();
+    const auto end_host = end.to<tensorplay::complex<double>>();
+    const compute_t s(static_cast<value_t>(start_host.real()),
+                      static_cast<value_t>(start_host.imag()));
+    const compute_t e(static_cast<value_t>(end_host.real()),
+                      static_cast<value_t>(end_host.imag()));
+    const compute_t step = (e - s) / static_cast<value_t>(steps - 1);
+    const int64_t halfway = steps / 2;
+    for (int64_t i = 0; i < steps; ++i) {
+        const int64_t distance = i < halfway ? i : steps - i - 1;
+        const compute_t value =
+            i < halfway ? s + step * static_cast<value_t>(distance)
+                        : e - step * static_cast<value_t>(distance);
+        data[i] = store_t(value);
+    }
+}
+
+template <typename compute_t, typename store_t>
+void logspace_fill_complex(store_t* data, Scalar start, Scalar end,
+                           int64_t steps, double base) {
+    using value_t = typename compute_t::value_type;
+    const auto start_host = start.to<tensorplay::complex<double>>();
+    const auto end_host = end.to<tensorplay::complex<double>>();
+    const compute_t s(static_cast<value_t>(start_host.real()),
+                      static_cast<value_t>(start_host.imag()));
+    const compute_t e(static_cast<value_t>(end_host.real()),
+                      static_cast<value_t>(end_host.imag()));
+    const compute_t base_value(static_cast<value_t>(base), value_t(0));
+    const compute_t step = (e - s) / static_cast<value_t>(steps - 1);
+    const int64_t halfway = steps / 2;
+    for (int64_t i = 0; i < steps; ++i) {
+        const int64_t distance = i < halfway ? i : steps - i - 1;
+        const compute_t exponent =
+            i < halfway ? s + step * static_cast<value_t>(distance)
+                        : e - step * static_cast<value_t>(distance);
+        data[i] = store_t(tensorplay::pow(base_value, exponent));
+    }
+}
+
+}  // namespace
+
 Tensor linspace_kernel(Scalar start, Scalar end, int64_t steps, DType dtype, Device device) {
     if (steps < 0) TP_THROW(RuntimeError, "number of steps must be non-negative");
     Tensor t({steps}, dtype, device);
     if (steps == 0) return t;
-    
-    double s = start.toDouble();
-    double e = end.toDouble();
-    
-    if (dtype == DType::Float32) {
-        float* data = t.data_ptr<float>();
-        if (steps == 1) {
-            data[0] = static_cast<float>(s);
-        } else {
-            double step = (e - s) / (steps - 1);
-            for(int64_t i=0; i<steps; ++i) {
-                data[i] = static_cast<float>(s + i * step);
-            }
-        }
-    } else if (dtype == DType::Float64) {
-        double* data = t.data_ptr<double>();
-        if (steps == 1) {
-            data[0] = s;
-        } else {
-            double step = (e - s) / (steps - 1);
-            for(int64_t i=0; i<steps; ++i) {
-                data[i] = s + i * step;
-            }
-        }
-    } else {
-         TP_THROW(NotImplementedError, "linspace only supports Float32/Float64");
+    // A single step is the start value itself; the increment is undefined.
+    if (steps == 1) return fill_kernel(t, start);
+
+#define TP_LINSPACE_CASE(ctype, name)                                        \
+    case DType::name:                                                        \
+        linspace_fill<ctype>(t.data_ptr<ctype>(), start, end, steps);        \
+        break;
+    switch (dtype) {
+        TP_LINSPACE_CASE(uint8_t, UInt8)
+        TP_LINSPACE_CASE(int8_t, Int8)
+        TP_LINSPACE_CASE(int16_t, Int16)
+        TP_LINSPACE_CASE(int32_t, Int32)
+        TP_LINSPACE_CASE(int64_t, Int64)
+        TP_LINSPACE_CASE(uint16_t, UInt16)
+        TP_LINSPACE_CASE(uint32_t, UInt32)
+        TP_LINSPACE_CASE(uint64_t, UInt64)
+        TP_LINSPACE_CASE(float, Float32)
+        TP_LINSPACE_CASE(double, Float64)
+        TP_LINSPACE_CASE(Half, Float16)
+        TP_LINSPACE_CASE(BFloat16, BFloat16)
+        case DType::ComplexHalf:
+            linspace_fill_complex<tensorplay::complex<float>,
+                                  tensorplay::complex<Half>>(
+                t.data_ptr<tensorplay::complex<Half>>(), start, end, steps);
+            break;
+        case DType::ComplexFloat:
+            linspace_fill_complex<tensorplay::complex<float>,
+                                  tensorplay::complex<float>>(
+                t.data_ptr<tensorplay::complex<float>>(), start, end, steps);
+            break;
+        case DType::ComplexDouble:
+            linspace_fill_complex<tensorplay::complex<double>,
+                                  tensorplay::complex<double>>(
+                t.data_ptr<tensorplay::complex<double>>(), start, end, steps);
+            break;
+        case DType::BComplex32:
+            linspace_fill_complex<tensorplay::complex<float>,
+                                  tensorplay::complex<BFloat16>>(
+                t.data_ptr<tensorplay::complex<BFloat16>>(), start, end, steps);
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "linspace does not support dtype '" +
+                     std::string(toString(dtype)) + "'");
     }
+#undef TP_LINSPACE_CASE
     return t;
 }
 
@@ -336,35 +480,57 @@ Tensor logspace_kernel(Scalar start, Scalar end, int64_t steps, double base, DTy
     if (steps < 0) TP_THROW(RuntimeError, "number of steps must be non-negative");
     Tensor t({steps}, dtype, device);
     if (steps == 0) return t;
-    
-    double s = start.toDouble();
-    double e = end.toDouble();
-    
-    if (dtype == DType::Float32) {
-        float* data = t.data_ptr<float>();
-        if (steps == 1) {
-            data[0] = static_cast<float>(std::pow(base, s));
-        } else {
-            double step = (e - s) / (steps - 1);
-            for(int64_t i=0; i<steps; ++i) {
-                double val = s + i * step;
-                data[i] = static_cast<float>(std::pow(base, val));
-            }
-        }
-    } else if (dtype == DType::Float64) {
-        double* data = t.data_ptr<double>();
-        if (steps == 1) {
-            data[0] = std::pow(base, s);
-        } else {
-            double step = (e - s) / (steps - 1);
-            for(int64_t i=0; i<steps; ++i) {
-                double val = s + i * step;
-                data[i] = std::pow(base, val);
-            }
-        }
-    } else {
-         TP_THROW(NotImplementedError, "logspace only supports Float32/Float64");
+    if (steps == 1) {
+        return isComplexType(dtype)
+            ? fill_kernel(t, Scalar(tensorplay::pow(
+                  tensorplay::complex<double>(base, 0.0),
+                  start.to<tensorplay::complex<double>>())))
+            : fill_kernel(t, Scalar(std::pow(base, start.toDouble())));
     }
+
+#define TP_LOGSPACE_CASE(ctype, name)                                        \
+    case DType::name:                                                        \
+        logspace_fill<ctype>(t.data_ptr<ctype>(), start, end, steps, base);  \
+        break;
+    switch (dtype) {
+        TP_LOGSPACE_CASE(uint8_t, UInt8)
+        TP_LOGSPACE_CASE(int8_t, Int8)
+        TP_LOGSPACE_CASE(int16_t, Int16)
+        TP_LOGSPACE_CASE(int32_t, Int32)
+        TP_LOGSPACE_CASE(int64_t, Int64)
+        TP_LOGSPACE_CASE(uint16_t, UInt16)
+        TP_LOGSPACE_CASE(uint32_t, UInt32)
+        TP_LOGSPACE_CASE(uint64_t, UInt64)
+        TP_LOGSPACE_CASE(float, Float32)
+        TP_LOGSPACE_CASE(double, Float64)
+        TP_LOGSPACE_CASE(Half, Float16)
+        TP_LOGSPACE_CASE(BFloat16, BFloat16)
+        case DType::ComplexHalf:
+            logspace_fill_complex<tensorplay::complex<float>,
+                                  tensorplay::complex<Half>>(
+                t.data_ptr<tensorplay::complex<Half>>(), start, end, steps, base);
+            break;
+        case DType::ComplexFloat:
+            logspace_fill_complex<tensorplay::complex<float>,
+                                  tensorplay::complex<float>>(
+                t.data_ptr<tensorplay::complex<float>>(), start, end, steps, base);
+            break;
+        case DType::ComplexDouble:
+            logspace_fill_complex<tensorplay::complex<double>,
+                                  tensorplay::complex<double>>(
+                t.data_ptr<tensorplay::complex<double>>(), start, end, steps, base);
+            break;
+        case DType::BComplex32:
+            logspace_fill_complex<tensorplay::complex<float>,
+                                  tensorplay::complex<BFloat16>>(
+                t.data_ptr<tensorplay::complex<BFloat16>>(), start, end, steps, base);
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "logspace does not support dtype '" +
+                     std::string(toString(dtype)) + "'");
+    }
+#undef TP_LOGSPACE_CASE
     return t;
 }
 
