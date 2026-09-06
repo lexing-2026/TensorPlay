@@ -230,8 +230,8 @@ std::tuple<Tensor, Tensor> median_dim_values_native(const Tensor& self, int64_t 
                                                      bool keepdim, Tensor& values,
                                                      Tensor& indices) {
     auto r = median_dim_native(self, dim, keepdim);
-    values = std::get<0>(r);
-    indices = std::get<1>(r);
+    write_sort_out("median", std::get<0>(r), values);
+    write_sort_out("median", std::get<1>(r), indices);
     return {values, indices};
 }
 
