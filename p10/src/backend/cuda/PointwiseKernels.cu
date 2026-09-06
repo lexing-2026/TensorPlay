@@ -1295,26 +1295,6 @@ Tensor fmin_cuda(const Tensor& self, const Tensor& other) {
     return fmaxfmin_cuda_impl<false>(self, other);
 }
 
-// ldexp: x * 2^y with the power of two applied in the element dtype so the
-// result is exact whenever y fits the exponent range.
-template <typename T>
-__global__ void ldexp_broadcast_kernel_cuda_impl(
-    int64_t n, const T* self, TensorDesc self_desc,
-    const T* other, TensorDesc other_desc,
-    T* output, TensorDesc output_desc) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        const T x = self[get_offset(i, self_desc, output_desc)];
-        const T e = other[get_offset(i, other_desc, output_desc)];
-        if constexpr (std::is_integral_v<T>) {
-            output[i] = e >= static_cast<T>(8 * static_cast<int>(sizeof(T)))
-                ? T(0) : static_cast<T>(x * (T(1) << e));
-        } else {
-            output[i] = static_cast<T>(static_cast<double>(x) * ::exp2(static_cast<double>(e)));
-        }
-    }
-}
-
 Tensor ldexp_cuda(const Tensor& self, const Tensor& other) {
     std::vector<int64_t> out_shape = broadcast_shapes(
         static_cast<std::vector<int64_t>>(self.shape()),
@@ -1323,19 +1303,26 @@ Tensor ldexp_cuda(const Tensor& self, const Tensor& other) {
     Tensor result = Tensor::empty(out_shape, common_dtype, self.device());
     const int64_t n = result.numel();
     if (n == 0) return result;
-    dim3 block(256);
-    dim3 grid((n + 255) / 256);
-    Tensor a = self.dtype() == common_dtype ? self.contiguous() : self.to(common_dtype).contiguous();
-    Tensor b = other.dtype() == common_dtype ? other.contiguous() : other.to(common_dtype).contiguous();
-    TensorDesc a_desc = make_desc(a, out_shape.size());
-    TensorDesc b_desc = make_desc(b, out_shape.size());
-    TensorDesc result_desc = make_desc(result, out_shape.size());
+    Tensor a = self.dtype() == common_dtype ? self : self.to(common_dtype);
+    Tensor b = other.dtype() == common_dtype ? other : other.to(common_dtype);
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(result)
+        .add_const_input(a)
+        .add_const_input(b)
+        .build();
 
     #define LDEXP_CASE(ctype, name) \
         case DType::name: \
-            ldexp_broadcast_kernel_cuda_impl<ctype><<<grid, block, 0, getCurrentCUDAStream().stream()>>>( \
-                n, a.data_ptr<ctype>(), a_desc, b.data_ptr<ctype>(), b_desc, \
-                result.data_ptr<ctype>(), result_desc); \
+            gpu_kernel(iter, [] __device__(ctype x, ctype exponent) -> ctype { \
+                if constexpr (std::is_integral_v<ctype>) { \
+                    return exponent >= static_cast<ctype>(8 * static_cast<int>(sizeof(ctype))) \
+                        ? ctype(0) : static_cast<ctype>(x * (ctype(1) << exponent)); \
+                } else { \
+                    return static_cast<ctype>(static_cast<double>(x) * \
+                                              ::exp2(static_cast<double>(exponent))); \
+                } \
+            }); \
             break;
     switch (common_dtype) {
         TENSORPLAY_FORALL_SCALAR_TYPES(LDEXP_CASE)
