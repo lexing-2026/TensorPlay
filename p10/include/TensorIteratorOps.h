@@ -4,6 +4,7 @@
 #pragma once
 
 #include "TensorIterator.h"
+#include "Complex.h"
 
 namespace tensorplay {
 namespace cpu {
@@ -49,7 +50,7 @@ inline void ti_apply_binary(Tensor& out, const Tensor& a, const Tensor& b,
 }
 
 /// Complex-capable flavor of ti_apply_binary for pure arithmetic functors
-/// (+, -, *, /, std::pow): dispatch additionally covers the four complex
+/// (+, -, *, /, pow): dispatch additionally covers the four complex
 /// dtypes.  Call sites whose functor relies on operator< / fmod / casts to
 /// real types (clamp, gcd, remainder, ...) must stay on ti_apply_binary --
 template <typename Op>
@@ -84,7 +85,7 @@ inline void ti_apply_arith(Tensor& out, const Tensor& a, const Tensor& b,
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_TI_CASE)
 #undef TP_TI_CASE
         // Full-width complexes dispatch like any scalar type.
-#define TP_TI_CX_STD(ctype, name)                                          \
+#define TP_TI_CX(ctype, name)                                          \
         case DType::name: {                                                \
             iter.for_each([&op](char** data, const int64_t* strides,       \
                                 int64_t n) {                               \
@@ -108,12 +109,12 @@ inline void ti_apply_arith(Tensor& out, const Tensor& a, const Tensor& b,
             });                                                            \
             break;                                                         \
         }
-        TP_TI_CX_STD(std::complex<float>, ComplexFloat)
-        TP_TI_CX_STD(std::complex<double>, ComplexDouble)
-#undef TP_TI_CX_STD
+        TP_TI_CX(complex<float>, ComplexFloat)
+        TP_TI_CX(complex<double>, ComplexDouble)
+#undef TP_TI_CX
 #define TP_TI_CX_RED_CASE(halftype, name)                                  \
         case DType::name: {                                                \
-            using cxh_t = std::complex<halftype>;                          \
+            using cxh_t = complex<halftype>;                          \
             iter.for_each([&op](char** data, const int64_t* strides,       \
                                 int64_t n) {                               \
                 char* r = data[0];                                         \
@@ -123,11 +124,11 @@ inline void ti_apply_arith(Tensor& out, const Tensor& a, const Tensor& b,
                 for (int64_t i = 0; i < n; ++i) {                          \
                     const cxh_t& xi = *reinterpret_cast<const cxh_t*>(x + i * strides[1]); \
                     const cxh_t& yi = *reinterpret_cast<const cxh_t*>(y + i * strides[2]); \
-                    std::complex<float> xo(static_cast<float>(xi.real()),   \
+                    complex<float> xo(static_cast<float>(xi.real()),   \
                                            static_cast<float>(xi.imag()));  \
-                    std::complex<float> yo(static_cast<float>(yi.real()),   \
+                    complex<float> yo(static_cast<float>(yi.real()),   \
                                            static_cast<float>(yi.imag()));  \
-                    std::complex<float> ro = op(xo, yo);                    \
+                    complex<float> ro = op(xo, yo);                    \
                     *reinterpret_cast<cxh_t*>(r + i * strides[0]) = cxh_t(  \
                         static_cast<halftype>(ro.real()),                   \
                         static_cast<halftype>(ro.imag()));                  \
@@ -145,7 +146,7 @@ inline void ti_apply_arith(Tensor& out, const Tensor& a, const Tensor& b,
 
 /// defines over complex tensors (component-wise), so they get their own
 /// applier instead of teaching the ordering-only ti_apply_compare about
-/// complex dtypes (std::complex has no operator<).
+/// complex dtypes (complex has no operator<).
 template <typename Op>
 inline void ti_apply_equality(Tensor& out, const Tensor& a, const Tensor& b,
                               DType common, Op op) {
@@ -175,7 +176,11 @@ inline void ti_apply_equality(Tensor& out, const Tensor& a, const Tensor& b,
             });                                                            \
             break;                                                         \
         }
-        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_TI_EQ)
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_TI_EQ)
+        TP_TI_EQ(complex<Half>, ComplexHalf)
+        TP_TI_EQ(complex<float>, ComplexFloat)
+        TP_TI_EQ(complex<double>, ComplexDouble)
+        TP_TI_EQ(complex<BFloat16>, BComplex32)
 #undef TP_TI_EQ
         default:
             TP_THROW(TypeError, "ti_apply_equality: unsupported dtype");
