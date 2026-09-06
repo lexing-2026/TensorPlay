@@ -1618,13 +1618,11 @@ Tensor xlogy_scalar_self_native(const Scalar& self, const Tensor& other) {
 }
 
 Tensor& xlogy_out_scalar_other_native(const Tensor& self, const Scalar& other, Tensor& out) {
-    out = xlogy_scalar_other_native(self, other);
-    return out;
+    return write_reduction_out("xlogy", xlogy_scalar_other_native(self, other), out);
 }
 
 Tensor& xlogy_out_scalar_self_native(const Scalar& self, const Tensor& other, Tensor& out) {
-    out = xlogy_scalar_self_native(self, other);
-    return out;
+    return write_reduction_out("xlogy", xlogy_scalar_self_native(self, other), out);
 }
 
 Tensor& xlogy__scalar_other_native(Tensor& self, const Scalar& other) {
