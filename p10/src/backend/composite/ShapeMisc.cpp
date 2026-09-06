@@ -58,6 +58,13 @@ Tensor& _stack_out_native(const std::vector<Tensor>& tensors, int64_t dim,
         out = value;
         return out;
     }
+    if (out.dtype() != value.dtype()) {
+        TP_THROW(TypeError, "_stack: output dtype must match result dtype");
+    }
+    if (out.device() != value.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "_stack: output device must match input device");
+    }
     const auto target = static_cast<std::vector<int64_t>>(value.shape());
     if (static_cast<std::vector<int64_t>>(out.shape()) != target) {
         out.resize_(target);
