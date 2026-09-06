@@ -69,8 +69,8 @@ jobs:
           gh release download nightly \
             --repo "$GITHUB_REPOSITORY" \
             --pattern 'tensorplay-*+cpu-cp312-cp312-linux_x86_64.whl' \
-            --output tensorplay-docs.whl
-          python -m pip install tensorplay-docs.whl numpy PyYAML typing-extensions
+            --output dist-docs
+          python -m pip install dist-docs/*.whl numpy PyYAML typing-extensions
 
       - name: Install TensorPlay wheel (release)
         if: ${{ inputs.tag != '' || github.event.release.tag_name != '' }}
@@ -96,7 +96,7 @@ jobs:
             echo "Wheel not uploaded yet (attempt $attempt); retrying in 60s"
             sleep 60
           done
-          python -m pip install tensorplay-docs.whl numpy PyYAML typing-extensions
+          python -m pip install dist-docs/*.whl numpy PyYAML typing-extensions
 
       - name: Install docs requirements
         run: python -m pip install -r docs/requirements.txt
