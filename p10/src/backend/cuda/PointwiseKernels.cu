@@ -1295,6 +1295,20 @@ Tensor fmin_cuda(const Tensor& self, const Tensor& other) {
     return fmaxfmin_cuda_impl<false>(self, other);
 }
 
+template <typename T>
+static inline __device__ std::enable_if_t<std::is_integral_v<T>, T>
+ldexp_element(T x, T exponent) {
+    return exponent >= static_cast<T>(8 * static_cast<int>(sizeof(T)))
+        ? T(0) : static_cast<T>(x * (T(1) << exponent));
+}
+
+template <typename T>
+static inline __device__ std::enable_if_t<!std::is_integral_v<T>, T>
+ldexp_element(T x, T exponent) {
+    return static_cast<T>(static_cast<double>(x) *
+                          ::exp2(static_cast<double>(exponent)));
+}
+
 Tensor ldexp_cuda(const Tensor& self, const Tensor& other) {
     std::vector<int64_t> out_shape = broadcast_shapes(
         static_cast<std::vector<int64_t>>(self.shape()),
@@ -1315,13 +1329,7 @@ Tensor ldexp_cuda(const Tensor& self, const Tensor& other) {
     #define LDEXP_CASE(ctype, name) \
         case DType::name: \
             gpu_kernel(iter, [] __device__(ctype x, ctype exponent) -> ctype { \
-                if constexpr (std::is_integral_v<ctype>) { \
-                    return exponent >= static_cast<ctype>(8 * static_cast<int>(sizeof(ctype))) \
-                        ? ctype(0) : static_cast<ctype>(x * (ctype(1) << exponent)); \
-                } else { \
-                    return static_cast<ctype>(static_cast<double>(x) * \
-                                              ::exp2(static_cast<double>(exponent))); \
-                } \
+                return ldexp_element(x, exponent); \
             }); \
             break;
     switch (common_dtype) {
