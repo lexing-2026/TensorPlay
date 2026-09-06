@@ -3,6 +3,7 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
+#include "TypePromotion.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <algorithm>
