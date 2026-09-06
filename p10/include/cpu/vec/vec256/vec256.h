@@ -11,6 +11,7 @@
 #include "cpu/vec/vec256/vec256_int.h"
 #include "cpu/vec/vec256/vec256_bfloat16.h"
 #include "cpu/vec/vec256/vec256_half.h"
+#include "cpu/vec/vec256/vec256_qint.h"
 #include "cpu/vec/vec_n.h"
 #include "cpu/vec/vec_convert.h"
 #include "cpu/vec/vec256/vec256_convert.h"
