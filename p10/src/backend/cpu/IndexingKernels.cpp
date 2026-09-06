@@ -37,6 +37,16 @@ inline int64_t wrap_dim(int64_t dim, int64_t ndim) {
     return dim;
 }
 
+inline int64_t wrap_scan_dim(int64_t dim, int64_t ndim) {
+    if (ndim == 0) {
+        if (dim == -1 || dim == 0) return 0;
+        TP_THROW(IndexError,
+                 "Dimension out of range for a scalar tensor (expected -1 or 0, but got ",
+                 dim, ")");
+    }
+    return wrap_dim(dim, ndim);
+}
+
 inline void outer_inner(const std::vector<int64_t>& shape, int64_t dim,
                         int64_t& outer, int64_t& inner) {
     outer = 1; inner = 1;
@@ -272,11 +282,15 @@ Tensor complex_logcumsumexp_cpu(const Tensor& src, int64_t dim) {
 
 Tensor cumsum_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
     int64_t nd = self.dim();
-    if (nd == 0) TP_THROW(RuntimeError, "cumsum: dimension not supported for scalar tensors");
-    dim = wrap_dim(dim, nd);
+    dim = wrap_scan_dim(dim, nd);
     DType out_dtype = dtype.value_or(isIntegralType(self.dtype(), true) ? DType::Int64
                                                                          : self.dtype());
     Tensor src = (self.dtype() == out_dtype) ? self.contiguous() : self.to(out_dtype).contiguous();
+    if (nd == 0) {
+        Tensor result = Tensor::empty({}, out_dtype, src.device());
+        result.copy_(src);
+        return result;
+    }
     if (isComplexType(out_dtype)) {
         const DType compute_dtype =
             out_dtype == DType::ComplexDouble ? DType::ComplexDouble : DType::ComplexFloat;
@@ -404,11 +418,15 @@ Tensor repeat_interleave_indices_cpu(
 
 Tensor cumprod_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
     int64_t nd = self.dim();
-    if (nd == 0) TP_THROW(RuntimeError, "cumprod: dimension not supported for scalar tensors");
-    dim = wrap_dim(dim, nd);
+    dim = wrap_scan_dim(dim, nd);
     DType out_dtype = dtype.value_or(isIntegralType(self.dtype(), true) ? DType::Int64
                                                                          : self.dtype());
     Tensor src = (self.dtype() == out_dtype) ? self.contiguous() : self.to(out_dtype).contiguous();
+    if (nd == 0) {
+        Tensor result = Tensor::empty({}, out_dtype, src.device());
+        result.copy_(src);
+        return result;
+    }
     if (isComplexType(out_dtype)) {
         const DType compute_dtype =
             out_dtype == DType::ComplexDouble ? DType::ComplexDouble : DType::ComplexFloat;
@@ -460,11 +478,15 @@ Tensor logcumsumexp_cpu(const Tensor& self, int64_t dim, std::optional<DType> dt
     // Stable recurrence: m = max(x, acc), then
     // result = m + log1p(exp(-|x - acc|)).
     int64_t nd = self.dim();
-    if (nd == 0) TP_THROW(RuntimeError, "logcumsumexp: dimension not supported for scalar tensors");
-    dim = wrap_dim(dim, nd);
+    dim = wrap_scan_dim(dim, nd);
     DType out_dtype = dtype.value_or(self.dtype());
     Tensor src = (self.dtype() == out_dtype) ? self.contiguous() : self.to(out_dtype).contiguous();
     if (isComplexType(out_dtype)) {
+        if (nd == 0) {
+            Tensor result = Tensor::empty({}, out_dtype, src.device());
+            result.copy_(src);
+            return result;
+        }
         const DType compute_dtype =
             out_dtype == DType::ComplexDouble ? DType::ComplexDouble : DType::ComplexFloat;
         Tensor compute_src = src.dtype() == compute_dtype ? src : src.to(compute_dtype);
@@ -476,6 +498,18 @@ Tensor logcumsumexp_cpu(const Tensor& self, int64_t dim, std::optional<DType> dt
             .to(out_dtype);
     }
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(src.shape()), out_dtype, src.device());
+    if (nd == 0) {
+        switch (out_dtype) {
+            case DType::Float32:
+            case DType::Float64:
+            case DType::Float16:
+            case DType::BFloat16:
+                result.copy_(src);
+                return result;
+            default:
+                TP_THROW(TypeError, "logcumsumexp: unsupported dtype");
+        }
+    }
     int64_t d_size = src.size(dim);
     if (d_size == 0 || src.numel() == 0) return result;
     int64_t outer = 1, inner = 1;
@@ -1520,9 +1554,13 @@ Tensor masked_scatter_cpu(const Tensor& self, const Tensor& mask, const Tensor& 
 
 Tensor cumsum_backward_cpu(const Tensor& grad, int64_t dim) {
     int64_t nd = grad.dim();
-    dim = wrap_dim(dim, nd);
+    dim = wrap_scan_dim(dim, nd);
     Tensor g = grad.contiguous();
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(g.shape()), g.dtype(), g.device());
+    if (nd == 0) {
+        result.copy_(g);
+        return result;
+    }
     int64_t d_size = g.size(dim);
     if (d_size == 0 || g.numel() == 0) return result;
     int64_t outer = 1, inner = 1;
