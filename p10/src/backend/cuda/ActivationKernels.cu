@@ -4,6 +4,7 @@
 #include "CUDAContext.h"
 #include "Exception.h"
 #include "CUDAComplex.cuh"
+#include "CUDALoops.cuh"
 #include "CUDNNUtils.h"
 #include <cudnn.h>
 #include <thrust/complex.h>
@@ -60,99 +61,71 @@ Tensor cudnn_activation(const Tensor& self_in, cudnnActivationMode_t mode, doubl
     return result;
 }
 
-// Native implementation for Silu if cuDNN Swish fails or is unavailable
-template <typename T>
-__global__ void silu_kernel_n(int64_t n, const T* input, T* output) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        T x = input[i];
-        output[i] = x / (1.0 + exp(-x));
-    }
-}
-
-// Half/bfloat16 do not have a native device exp implementation in the
-// mixed-precision behavior by evaluating the sigmoid in FP32 and rounding only
-// the final result back to the input dtype.
-template <typename T>
-__global__ void silu_kernel_n_fp32(int64_t n, const T* input, T* output) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        float x = static_cast<float>(input[i]);
-        float y = x / (1.0f + expf(-x));
-        output[i] = static_cast<T>(y);
-    }
-}
-
-template <typename T>
-__global__ void relu_kernel_n(int64_t n, const T* input, T* output);
-
 Tensor silu_kernel_cuda_native(const Tensor& self) {
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
-    int64_t n = self.numel();
-    if (n == 0) return result;
-    
-    dim3 block(256);
-    dim3 grid((n + 255) / 256);
-    
-    // Keep FP32/FP64 native, and use FP32 intermediates for reduced precision.
-    if (self.dtype() == DType::Float32) {
-        silu_kernel_n<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<float>(), result.data_ptr<float>());
-    } else if (self.dtype() == DType::Float64) {
-        silu_kernel_n<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), result.data_ptr<double>());
-    } else if (self.dtype() == DType::Float16) {
-        Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
-        silu_kernel_n_fp32<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
-            n, self_contig.data_ptr<tensorplay::Half>(), result.data_ptr<tensorplay::Half>());
-    } else if (self.dtype() == DType::BFloat16) {
-        Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
-        silu_kernel_n_fp32<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
-            n, self_contig.data_ptr<tensorplay::BFloat16>(), result.data_ptr<tensorplay::BFloat16>());
-    } else {
-        TP_THROW(NotImplementedError, "silu: only float/double/fp16/bf16 supported");
-    }
-    
-    // CUDA_CHECK is defined in this file or Macros? 
-    // It is defined in this file.
-    cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) {
-       TP_THROW(RuntimeError, std::string("CUDA Error: ") + cudaGetErrorString(error));
+    if (self.numel() == 0) return result;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(result)
+        .add_input(self)
+        .build();
+    switch (self.dtype()) {
+        case DType::Float32:
+            gpu_kernel(iter, [] __device__ (float value) -> float {
+                return value / (1.0f + ::expf(-value));
+            });
+            break;
+        case DType::Float64:
+            gpu_kernel(iter, [] __device__ (double value) -> double {
+                return value / (1.0 + ::exp(-value));
+            });
+            break;
+        case DType::Float16:
+            gpu_kernel(iter, [] __device__ (Half value) -> Half {
+                const float value_acc = static_cast<float>(value);
+                return static_cast<Half>(
+                    value_acc / (1.0f + ::expf(-value_acc)));
+            });
+            break;
+        case DType::BFloat16:
+            gpu_kernel(iter, [] __device__ (BFloat16 value) -> BFloat16 {
+                const float value_acc = static_cast<float>(value);
+                return static_cast<BFloat16>(
+                    value_acc / (1.0f + ::expf(-value_acc)));
+            });
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "silu: only float/double/fp16/bf16 supported");
     }
     return result;
 }
 
 Tensor relu_kernel_cudnn(const Tensor& self) {
-    // cuDNN activation is broken on this stack (v9 + Pascal: EXECUTION_FAILED);
-    // use the native kernel for every dtype (fp16/bf16/integral keep dtype).
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
     if (self.numel() == 0) return result;
-    dim3 block(256);
-    dim3 grid((self.numel() + 255) / 256);
-    Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
-    int64_t n = self.numel();
-    auto stream = getCurrentCUDAStream().stream();
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(result)
+        .add_input(self)
+        .build();
+#define TP_RELU_CASE(ctype, name_) \
+    case DType::name_: \
+        gpu_kernel(iter, [] __device__ (ctype value) -> ctype { \
+            return value > ctype(0) ? value : ctype(0); \
+        }); \
+        break;
     switch (self.dtype()) {
-        case DType::Float32:
-            relu_kernel_n<float><<<grid, block, 0, stream>>>(n, self_contig.data_ptr<float>(), result.data_ptr<float>());
-            break;
-        case DType::Float64:
-            relu_kernel_n<double><<<grid, block, 0, stream>>>(n, self_contig.data_ptr<double>(), result.data_ptr<double>());
-            break;
-        case DType::Float16:
-            relu_kernel_n<tensorplay::Half><<<grid, block, 0, stream>>>(n, self_contig.data_ptr<tensorplay::Half>(), result.data_ptr<tensorplay::Half>());
-            break;
-        case DType::BFloat16:
-            relu_kernel_n<tensorplay::BFloat16><<<grid, block, 0, stream>>>(n, self_contig.data_ptr<tensorplay::BFloat16>(), result.data_ptr<tensorplay::BFloat16>());
-            break;
-        case DType::Int32:
-            relu_kernel_n<int32_t><<<grid, block, 0, stream>>>(n, self_contig.data_ptr<int32_t>(), result.data_ptr<int32_t>());
-            break;
-        case DType::Int64:
-            relu_kernel_n<int64_t><<<grid, block, 0, stream>>>(n, self_contig.data_ptr<int64_t>(), result.data_ptr<int64_t>());
-            break;
+        TP_RELU_CASE(float, Float32)
+        TP_RELU_CASE(double, Float64)
+        TP_RELU_CASE(Half, Float16)
+        TP_RELU_CASE(BFloat16, BFloat16)
+        TP_RELU_CASE(int32_t, Int32)
+        TP_RELU_CASE(int64_t, Int64)
         default:
             TP_THROW(NotImplementedError, "relu: unsupported dtype");
     }
-    checkCuda(cudaGetLastError(), "relu kernel launch");
+#undef TP_RELU_CASE
     return result;
 }
 
@@ -190,43 +163,6 @@ Tensor& cudnn_activation_inplace(Tensor& self_in, cudnnActivationMode_t mode, do
 Tensor& relu_inplace_kernel_cudnn(Tensor& self) {
     cudnn_activation_inplace(self, CUDNN_ACTIVATION_RELU);
     return self;
-}
-
-// Native elementwise sigmoid/tanh.  cuDNN activation is avoided here: it is
-// slower than a flat kernel for elementwise work and CUDNN v9 + Pascal shows
-// CUDNN_STATUS_EXECUTION_FAILED_CUDART on every shape (see remote P4).
-template <typename T>
-__global__ void sigmoid_kernel_n(int64_t n, const T* input, T* output) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        T x = input[i];
-        output[i] = T(1) / (T(1) + exp(-x));
-    }
-}
-
-template <typename T>
-__global__ void tanh_kernel_n(int64_t n, const T* input, T* output) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        output[i] = tanh(input[i]);
-    }
-}
-
-template <typename T>
-__global__ void sigmoid_kernel_n_fp32(int64_t n, const T* input, T* output) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        float x = static_cast<float>(input[i]);
-        output[i] = static_cast<T>(1.0f / (1.0f + expf(-x)));
-    }
-}
-
-template <typename T>
-__global__ void tanh_kernel_n_fp32(int64_t n, const T* input, T* output) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        output[i] = static_cast<T>(tanhf(static_cast<float>(input[i])));
-    }
 }
 
 namespace {
@@ -278,53 +214,68 @@ static Tensor native_activation_dispatch(const Tensor& self, bool is_sigmoid) {
         checkCuda(cudaGetLastError(), "native activation complex kernel");
         return result;
     }
-    Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
                                   self.dtype(), self.device());
-    int64_t n = self.numel();
-    if (n == 0) return result;
-    dim3 block(256);
-    dim3 grid((n + 255) / 256);
-    auto stream = getCurrentCUDAStream().stream();
-
-    #define TP_NATIVE_ACT_CASE(ctype, name)                                  \
-    case DType::name:                                                        \
-        if (is_sigmoid)                                                      \
-            sigmoid_kernel_n<ctype><<<grid, block, 0, stream>>>(             \
-                n, self_contig.data_ptr<ctype>(), result.data_ptr<ctype>()); \
-        else                                                                 \
-            tanh_kernel_n<ctype><<<grid, block, 0, stream>>>(                \
-                n, self_contig.data_ptr<ctype>(), result.data_ptr<ctype>()); \
-        break;
+    if (self.numel() == 0) return result;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(result)
+        .add_input(self)
+        .build();
     switch (self.dtype()) {
-        TP_NATIVE_ACT_CASE(float, Float32)
-        TP_NATIVE_ACT_CASE(double, Float64)
+        case DType::Float32:
+            if (is_sigmoid) {
+                gpu_kernel(iter, [] __device__ (float value) -> float {
+                    return 1.0f / (1.0f + ::expf(-value));
+                });
+            } else {
+                gpu_kernel(iter, [] __device__ (float value) -> float {
+                    return ::tanhf(value);
+                });
+            }
+            break;
+        case DType::Float64:
+            if (is_sigmoid) {
+                gpu_kernel(iter, [] __device__ (double value) -> double {
+                    return 1.0 / (1.0 + ::exp(-value));
+                });
+            } else {
+                gpu_kernel(iter, [] __device__ (double value) -> double {
+                    return ::tanh(value);
+                });
+            }
+            break;
         case DType::Float16:
-            if (is_sigmoid)
-                sigmoid_kernel_n_fp32<tensorplay::Half><<<grid, block, 0, stream>>>(
-                    n, self_contig.data_ptr<tensorplay::Half>(),
-                    result.data_ptr<tensorplay::Half>());
-            else
-                tanh_kernel_n_fp32<tensorplay::Half><<<grid, block, 0, stream>>>(
-                    n, self_contig.data_ptr<tensorplay::Half>(),
-                    result.data_ptr<tensorplay::Half>());
+            if (is_sigmoid) {
+                gpu_kernel(iter, [] __device__ (Half value) -> Half {
+                    const float value_acc = static_cast<float>(value);
+                    return static_cast<Half>(
+                        1.0f / (1.0f + ::expf(-value_acc)));
+                });
+            } else {
+                gpu_kernel(iter, [] __device__ (Half value) -> Half {
+                    return static_cast<Half>(::tanhf(static_cast<float>(value)));
+                });
+            }
             break;
         case DType::BFloat16:
-            if (is_sigmoid)
-                sigmoid_kernel_n_fp32<tensorplay::BFloat16><<<grid, block, 0, stream>>>(
-                    n, self_contig.data_ptr<tensorplay::BFloat16>(),
-                    result.data_ptr<tensorplay::BFloat16>());
-            else
-                tanh_kernel_n_fp32<tensorplay::BFloat16><<<grid, block, 0, stream>>>(
-                    n, self_contig.data_ptr<tensorplay::BFloat16>(),
-                    result.data_ptr<tensorplay::BFloat16>());
+            if (is_sigmoid) {
+                gpu_kernel(iter, [] __device__ (BFloat16 value) -> BFloat16 {
+                    const float value_acc = static_cast<float>(value);
+                    return static_cast<BFloat16>(
+                        1.0f / (1.0f + ::expf(-value_acc)));
+                });
+            } else {
+                gpu_kernel(iter, [] __device__ (BFloat16 value) -> BFloat16 {
+                    return static_cast<BFloat16>(
+                        ::tanhf(static_cast<float>(value)));
+                });
+            }
             break;
         default:
             TP_THROW(NotImplementedError,
                      "activation: only float/double/fp16/bf16 supported");
     }
-    #undef TP_NATIVE_ACT_CASE
-    checkCuda(cudaGetLastError(), "native sigmoid/tanh kernel launch");
     return result;
 }
 
@@ -398,17 +349,6 @@ Tensor log_softmax_kernel_cudnn(const Tensor& self, int64_t dim, DType dtype) {
 // --- Backward Kernels ---
 
 #endif  // USE_CUDNN
-
-// --- Native kernels (no DNN dependency) ---
-
-template <typename T>
-__global__ void relu_kernel_n(int64_t n, const T* input, T* output) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        T x = input[i];
-        output[i] = x > T(0) ? x : T(0);
-    }
-}
 
 template <typename T>
 __global__ void threshold_backward_kernel_impl(int64_t n, const T* grad_output, const T* output, T threshold, T* grad_input) {
