@@ -113,42 +113,65 @@ Tensor real_cuda(const Tensor& self) {
     // real precision.
     if (!is_cplx(self.dtype())) return self;
     DType rt = toRealValueType(self.dtype());
-    Tensor sc = self.contiguous();
-    Tensor out = Tensor::empty(shape_of(sc), rt, self.device());
-    int64_t n = sc.numel();
-    if (n == 0) return out;
-    auto stream = getCurrentCUDAStream();
-    dim3 grid = make_grid(n), block(kThreads);
+    Tensor out = Tensor::empty(shape_of(self), rt, self.device());
+    if (out.numel() == 0) return out;
     switch (self.dtype()) {
         case DType::ComplexHalf:
+        {
+            Tensor sc = self.contiguous();
+            const int64_t n = sc.numel();
+            auto stream = getCurrentCUDAStream();
+            dim3 grid = make_grid(n), block(kThreads);
             cplx_real_kernel<tensorplay::complex<Half>, Half>
                 <<<grid, block, 0, stream.stream()>>>(
                     n,
                     static_cast<const tensorplay::complex<Half>*>(sc.data_ptr()),
                     out.data_ptr<Half>());
+            CUDA_CHECK(cudaGetLastError());
             break;
+        }
         case DType::ComplexFloat:
-            cplx_real_kernel<std::complex<float>, float>
-                <<<grid, block, 0, stream.stream()>>>(
-                    n, sc.data_ptr<std::complex<float>>(), out.data_ptr<float>());
+        {
+            TensorIterator iter = TensorIteratorConfig()
+                .check_all_same_dtype(false)
+                .add_output(out)
+                .add_input(self)
+                .build();
+            gpu_kernel(iter, [] __device__ (std::complex<float> value) -> float {
+                return value.real();
+            });
             break;
+        }
         case DType::ComplexDouble:
-            cplx_real_kernel<std::complex<double>, double>
-                <<<grid, block, 0, stream.stream()>>>(
-                    n, sc.data_ptr<std::complex<double>>(), out.data_ptr<double>());
+        {
+            TensorIterator iter = TensorIteratorConfig()
+                .check_all_same_dtype(false)
+                .add_output(out)
+                .add_input(self)
+                .build();
+            gpu_kernel(iter, [] __device__ (std::complex<double> value) -> double {
+                return value.real();
+            });
             break;
+        }
         case DType::BComplex32:
+        {
+            Tensor sc = self.contiguous();
+            const int64_t n = sc.numel();
+            auto stream = getCurrentCUDAStream();
+            dim3 grid = make_grid(n), block(kThreads);
             cplx_real_kernel<tensorplay::complex<BFloat16>, BFloat16>
                 <<<grid, block, 0, stream.stream()>>>(
                     n,
                     static_cast<const tensorplay::complex<BFloat16>*>(
                         sc.data_ptr()),
                     out.data_ptr<BFloat16>());
+            CUDA_CHECK(cudaGetLastError());
             break;
+        }
         default:
             TP_THROW(NotImplementedError, "real does not support this dtype");
     }
-    CUDA_CHECK(cudaGetLastError());
     return out;
 }
 
@@ -157,47 +180,93 @@ Tensor imag_cuda(const Tensor& self) {
         return Tensor::zeros(shape_of(self), self.dtype(), self.device());
     }
     DType rt = toRealValueType(self.dtype());
-    Tensor sc = self.contiguous();
-    Tensor out = Tensor::empty(shape_of(sc), rt, self.device());
-    int64_t n = sc.numel();
-    if (n == 0) return out;
-    auto stream = getCurrentCUDAStream();
-    dim3 grid = make_grid(n), block(kThreads);
+    Tensor out = Tensor::empty(shape_of(self), rt, self.device());
+    if (out.numel() == 0) return out;
     switch (self.dtype()) {
         case DType::ComplexHalf:
+        {
+            Tensor sc = self.contiguous();
+            const int64_t n = sc.numel();
+            auto stream = getCurrentCUDAStream();
+            dim3 grid = make_grid(n), block(kThreads);
             cplx_imag_kernel<tensorplay::complex<Half>, Half>
                 <<<grid, block, 0, stream.stream()>>>(
                     n,
                     static_cast<const tensorplay::complex<Half>*>(sc.data_ptr()),
                     out.data_ptr<Half>());
+            CUDA_CHECK(cudaGetLastError());
             break;
+        }
         case DType::ComplexFloat:
-            cplx_imag_kernel<std::complex<float>, float>
-                <<<grid, block, 0, stream.stream()>>>(
-                    n, sc.data_ptr<std::complex<float>>(), out.data_ptr<float>());
+        {
+            TensorIterator iter = TensorIteratorConfig()
+                .check_all_same_dtype(false)
+                .add_output(out)
+                .add_input(self)
+                .build();
+            gpu_kernel(iter, [] __device__ (std::complex<float> value) -> float {
+                return value.imag();
+            });
             break;
+        }
         case DType::ComplexDouble:
-            cplx_imag_kernel<std::complex<double>, double>
-                <<<grid, block, 0, stream.stream()>>>(
-                    n, sc.data_ptr<std::complex<double>>(), out.data_ptr<double>());
+        {
+            TensorIterator iter = TensorIteratorConfig()
+                .check_all_same_dtype(false)
+                .add_output(out)
+                .add_input(self)
+                .build();
+            gpu_kernel(iter, [] __device__ (std::complex<double> value) -> double {
+                return value.imag();
+            });
             break;
+        }
         case DType::BComplex32:
+        {
+            Tensor sc = self.contiguous();
+            const int64_t n = sc.numel();
+            auto stream = getCurrentCUDAStream();
+            dim3 grid = make_grid(n), block(kThreads);
             cplx_imag_kernel<tensorplay::complex<BFloat16>, BFloat16>
                 <<<grid, block, 0, stream.stream()>>>(
                     n,
                     static_cast<const tensorplay::complex<BFloat16>*>(
                         sc.data_ptr()),
                     out.data_ptr<BFloat16>());
+            CUDA_CHECK(cudaGetLastError());
             break;
+        }
         default:
             TP_THROW(NotImplementedError, "imag does not support this dtype");
     }
-    CUDA_CHECK(cudaGetLastError());
     return out;
 }
 
 Tensor conj_cuda(const Tensor& self) {
     if (!is_cplx(self.dtype())) return self.clone();
+    if (self.dtype() == DType::ComplexFloat ||
+        self.dtype() == DType::ComplexDouble) {
+        Tensor out = Tensor::empty(shape_of(self), self.dtype(), self.device());
+        TensorIterator iter = TensorIteratorConfig()
+            .check_all_same_dtype(true)
+            .add_output(out)
+            .add_input(self)
+            .build();
+        if (self.dtype() == DType::ComplexFloat) {
+            gpu_kernel(
+                iter, [] __device__ (std::complex<float> value)
+                    -> std::complex<float> {
+                    return std::complex<float>(value.real(), -value.imag());
+                });
+        } else {
+            gpu_kernel(
+                iter, [] __device__ (std::complex<double> value)
+                    -> std::complex<double> {
+                    return std::complex<double>(value.real(), -value.imag());
+                });
+        }
+        return out;
+    }
     Tensor out = detail::contiguous_clone(self);
     int64_t n = out.numel();
     if (n == 0) return out;
@@ -209,16 +278,6 @@ Tensor conj_cuda(const Tensor& self) {
                 <<<grid, block, 0, stream.stream()>>>(
                     n,
                     static_cast<tensorplay::complex<Half>*>(out.data_ptr()));
-            break;
-        case DType::ComplexFloat:
-            cplx_conj_kernel<std::complex<float>>
-                <<<grid, block, 0, stream.stream()>>>(
-                    n, out.data_ptr<std::complex<float>>());
-            break;
-        case DType::ComplexDouble:
-            cplx_conj_kernel<std::complex<double>>
-                <<<grid, block, 0, stream.stream()>>>(
-                    n, out.data_ptr<std::complex<double>>());
             break;
         case DType::BComplex32:
             cplx_conj_kernel<tensorplay::complex<BFloat16>>
