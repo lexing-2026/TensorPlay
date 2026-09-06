@@ -202,6 +202,10 @@ jobs:
       - name: Smoke test (CPU import plus tiny op)
         if: ${{ inputs.cuda == 'cpu' }}
         shell: bash
+        # Run outside the checkout: the source tree carries the CMake-generated
+        # version.py and the _C shared object, so a repo-root import would
+        # shadow the wheel and hide packaging regressions.
+        working-directory: ${{ runner.temp }}
         run: |
           python - <<'PY'
           import tensorplay as tp
@@ -214,6 +218,7 @@ jobs:
       - name: Smoke test (CUDA import only)
         if: ${{ inputs.cuda != 'cpu' }}
         shell: bash
+        working-directory: ${{ runner.temp }}
         run: |
           python - <<'PY'
           import tensorplay as tp
