@@ -779,16 +779,14 @@ Tensor& nll_loss_out_native(const Tensor& self, const Tensor& target,
                             const std::optional<Tensor>& weight, int64_t reduction,
                             int64_t ignore_index, Tensor& out) {
     auto r = ops::nll_loss(self, target, weight, reduction, ignore_index);
-    out = std::get<0>(r);
-    return out;
+    return write_exact_out("nll_loss", std::get<0>(r), out);
 }
 
 Tensor& nll_loss2d_out_native(const Tensor& self, const Tensor& target,
                               const std::optional<Tensor>& weight, int64_t reduction,
                               int64_t ignore_index, Tensor& out) {
     auto r = ops::nll_loss2d(self, target, weight, reduction, ignore_index);
-    out = std::get<0>(r);
-    return out;
+    return write_exact_out("nll_loss2d", std::get<0>(r), out);
 }
 
 // ---- rnn dispatcher overloads ----------------------------------------------------
