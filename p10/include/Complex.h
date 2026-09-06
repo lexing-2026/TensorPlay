@@ -7,8 +7,13 @@
 
 #include <complex>
 
+// The device runtime and the thrust complex type are only reachable when a
+// device compiler is driving the translation unit; every use of them below
+// carries the same guard, so a host-only pass needs neither header.
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #include <cuda_runtime.h>
 #include <thrust/complex.h>
+#endif
 
 #include <cmath>
 #include <limits>
@@ -17,8 +22,15 @@
 #include "Half.h"
 #include "BFloat16.h"
 
+// Half.h and BFloat16.h drop their own spelling at the end of the header, so
+// this one has to stand on its own -- and stay empty unless a device compiler
+// is driving the translation unit.
 #ifndef TP_HOST_DEVICE
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define TP_HOST_DEVICE __host__ __device__
+#else
+#define TP_HOST_DEVICE
+#endif
 #endif
 
 namespace tensorplay {
@@ -30,7 +42,7 @@ namespace tensorplay {
 //
 // [Note on Constructors]
 //
-// The APIs of constructors are mostly copied from the C++ standard.
+// The constructor forms follow the corresponding standard-library forms.
 //
 // There are three types of constructors:
 // - initializing from real and imag:
@@ -604,27 +616,38 @@ constexpr tensorplay::complex<T> conj(const tensorplay::complex<T>& z) {
 
 namespace tensorplay_complex_math {
 
+// The math layer forwards to the complex library of whichever toolchain is
+// driving the pass: a device compiler supplies thrust, a host-only pass the
+// standard library.  Both provide the same function set over the same
+// interleaved layout, and the cast operators on tensorplay::complex convert
+// to either one.
+#if defined(__CUDACC__) || defined(__HIPCC__)
+namespace tp_cplx = thrust;
+#else
+namespace tp_cplx = std;
+#endif
+
 // Exponential functions
 
 template <typename T>
 TP_HOST_DEVICE inline tensorplay::complex<T> exp(
     const tensorplay::complex<T>& x) {
   return static_cast<tensorplay::complex<T>>(
-      thrust::exp(static_cast<thrust::complex<T>>(x)));
+      tp_cplx::exp(static_cast<tp_cplx::complex<T>>(x)));
 }
 
 template <typename T>
 TP_HOST_DEVICE inline tensorplay::complex<T> log(
     const tensorplay::complex<T>& x) {
   return static_cast<tensorplay::complex<T>>(
-      thrust::log(static_cast<thrust::complex<T>>(x)));
+      tp_cplx::log(static_cast<tp_cplx::complex<T>>(x)));
 }
 
 template <typename T>
 TP_HOST_DEVICE inline tensorplay::complex<T> log10(
     const tensorplay::complex<T>& x) {
   return static_cast<tensorplay::complex<T>>(
-      thrust::log10(static_cast<thrust::complex<T>>(x)));
+      tp_cplx::log10(static_cast<tp_cplx::complex<T>>(x)));
 }
 
 template <typename T>
@@ -640,15 +663,15 @@ template <typename T>
 TP_HOST_DEVICE inline tensorplay::complex<T> sqrt(
     const tensorplay::complex<T>& x) {
   return static_cast<tensorplay::complex<T>>(
-      thrust::sqrt(static_cast<thrust::complex<T>>(x)));
+      tp_cplx::sqrt(static_cast<tp_cplx::complex<T>>(x)));
 }
 
 template <typename T>
 TP_HOST_DEVICE inline tensorplay::complex<T> pow(
     const tensorplay::complex<T>& x,
     const tensorplay::complex<T>& y) {
-  return static_cast<tensorplay::complex<T>>(thrust::pow(
-      static_cast<thrust::complex<T>>(x), static_cast<thrust::complex<T>>(y)));
+  return static_cast<tensorplay::complex<T>>(tp_cplx::pow(
+      static_cast<tp_cplx::complex<T>>(x), static_cast<tp_cplx::complex<T>>(y)));
 }
 
 // Regression in ROCm 7.2: the thrust pow path loses single-rounding on the
@@ -658,9 +681,9 @@ namespace detail {
 // FMA-aware complex multiplication for float precision on AMD GPUs.
 // This prevents SLP vectorizer from breaking FMA formation, which causes
 // numerical precision loss in complex arithmetic.
-TP_HOST_DEVICE inline thrust::complex<float> complex_mul_fma(
-    thrust::complex<float> a,
-    thrust::complex<float> b) {
+TP_HOST_DEVICE inline tp_cplx::complex<float> complex_mul_fma(
+    tp_cplx::complex<float> a,
+    tp_cplx::complex<float> b) {
   // Complex multiplication: (a.r + a.i*i) * (b.r + b.i*i)
   // = (a.r*b.r - a.i*b.i) + (a.r*b.i + a.i*b.r)*i
   // Using __builtin_fmaf ensures FMA at source level:
@@ -668,7 +691,7 @@ TP_HOST_DEVICE inline thrust::complex<float> complex_mul_fma(
   // imag: a.i*b.r + a.r*b.i = FMA(a.r, b.i, a.i*b.r)
   float real_part = __builtin_fmaf(a.real(), b.real(), -(a.imag() * b.imag()));
   float imag_part = __builtin_fmaf(a.real(), b.imag(), a.imag() * b.real());
-  return thrust::complex<float>(real_part, imag_part);
+  return tp_cplx::complex<float>(real_part, imag_part);
 }
 } // namespace detail
 
@@ -676,10 +699,10 @@ template <>
 TP_HOST_DEVICE inline tensorplay::complex<float> pow(
     const tensorplay::complex<float>& x,
     const tensorplay::complex<float>& y) {
-  auto log_x = thrust::log(static_cast<thrust::complex<float>>(x));
+  auto log_x = tp_cplx::log(static_cast<tp_cplx::complex<float>>(x));
   auto y_log_x =
-      detail::complex_mul_fma(static_cast<thrust::complex<float>>(y), log_x);
-  return static_cast<tensorplay::complex<float>>(thrust::exp(y_log_x));
+      detail::complex_mul_fma(static_cast<tp_cplx::complex<float>>(y), log_x);
+  return static_cast<tensorplay::complex<float>>(tp_cplx::exp(y_log_x));
 }
 #endif
 
@@ -688,7 +711,7 @@ TP_HOST_DEVICE inline tensorplay::complex<T> pow(
     const tensorplay::complex<T>& x,
     const T& y) {
   return static_cast<tensorplay::complex<T>>(
-      thrust::pow(static_cast<thrust::complex<T>>(x), y));
+      tp_cplx::pow(static_cast<tp_cplx::complex<T>>(x), y));
 }
 
 template <typename T>
@@ -696,15 +719,15 @@ TP_HOST_DEVICE inline tensorplay::complex<T> pow(
     const T& x,
     const tensorplay::complex<T>& y) {
   return static_cast<tensorplay::complex<T>>(
-      thrust::pow(x, static_cast<thrust::complex<T>>(y)));
+      tp_cplx::pow(x, static_cast<tp_cplx::complex<T>>(y)));
 }
 
 template <typename T, typename U>
 TP_HOST_DEVICE inline tensorplay::complex<decltype(T() * U())> pow(
     const tensorplay::complex<T>& x,
     const tensorplay::complex<U>& y) {
-  return static_cast<tensorplay::complex<T>>(thrust::pow(
-      static_cast<thrust::complex<T>>(x), static_cast<thrust::complex<T>>(y)));
+  return static_cast<tensorplay::complex<T>>(tp_cplx::pow(
+      static_cast<tp_cplx::complex<T>>(x), static_cast<tp_cplx::complex<T>>(y)));
 }
 
 template <typename T, typename U>
@@ -712,7 +735,7 @@ TP_HOST_DEVICE inline tensorplay::complex<decltype(T() * U())> pow(
     const tensorplay::complex<T>& x,
     const U& y) {
   return static_cast<tensorplay::complex<T>>(
-      thrust::pow(static_cast<thrust::complex<T>>(x), y));
+      tp_cplx::pow(static_cast<tp_cplx::complex<T>>(x), y));
 }
 
 template <typename T, typename U>
@@ -720,7 +743,7 @@ TP_HOST_DEVICE inline tensorplay::complex<decltype(T() * U())> pow(
     const T& x,
     const tensorplay::complex<U>& y) {
   return static_cast<tensorplay::complex<T>>(
-      thrust::pow(x, static_cast<thrust::complex<T>>(y)));
+      tp_cplx::pow(x, static_cast<tp_cplx::complex<T>>(y)));
 }
 
 // Trigonometric functions
@@ -729,42 +752,42 @@ template <typename T>
 TP_HOST_DEVICE inline tensorplay::complex<T> sin(
     const tensorplay::complex<T>& x) {
   return static_cast<tensorplay::complex<T>>(
-      thrust::sin(static_cast<thrust::complex<T>>(x)));
+      tp_cplx::sin(static_cast<tp_cplx::complex<T>>(x)));
 }
 
 template <typename T>
 TP_HOST_DEVICE inline tensorplay::complex<T> cos(
     const tensorplay::complex<T>& x) {
   return static_cast<tensorplay::complex<T>>(
-      thrust::cos(static_cast<thrust::complex<T>>(x)));
+      tp_cplx::cos(static_cast<tp_cplx::complex<T>>(x)));
 }
 
 template <typename T>
 TP_HOST_DEVICE inline tensorplay::complex<T> tan(
     const tensorplay::complex<T>& x) {
   return static_cast<tensorplay::complex<T>>(
-      thrust::tan(static_cast<thrust::complex<T>>(x)));
+      tp_cplx::tan(static_cast<tp_cplx::complex<T>>(x)));
 }
 
 template <typename T>
 TP_HOST_DEVICE inline tensorplay::complex<T> asin(
     const tensorplay::complex<T>& x) {
   return static_cast<tensorplay::complex<T>>(
-      thrust::asin(static_cast<thrust::complex<T>>(x)));
+      tp_cplx::asin(static_cast<tp_cplx::complex<T>>(x)));
 }
 
 template <typename T>
 TP_HOST_DEVICE inline tensorplay::complex<T> acos(
     const tensorplay::complex<T>& x) {
   return static_cast<tensorplay::complex<T>>(
-      thrust::acos(static_cast<thrust::complex<T>>(x)));
+      tp_cplx::acos(static_cast<tp_cplx::complex<T>>(x)));
 }
 
 template <typename T>
 TP_HOST_DEVICE inline tensorplay::complex<T> atan(
     const tensorplay::complex<T>& x) {
   return static_cast<tensorplay::complex<T>>(
-      thrust::atan(static_cast<thrust::complex<T>>(x)));
+      tp_cplx::atan(static_cast<tp_cplx::complex<T>>(x)));
 }
 
 // Hyperbolic functions
@@ -773,42 +796,42 @@ template <typename T>
 TP_HOST_DEVICE inline tensorplay::complex<T> sinh(
     const tensorplay::complex<T>& x) {
   return static_cast<tensorplay::complex<T>>(
-      thrust::sinh(static_cast<thrust::complex<T>>(x)));
+      tp_cplx::sinh(static_cast<tp_cplx::complex<T>>(x)));
 }
 
 template <typename T>
 TP_HOST_DEVICE inline tensorplay::complex<T> cosh(
     const tensorplay::complex<T>& x) {
   return static_cast<tensorplay::complex<T>>(
-      thrust::cosh(static_cast<thrust::complex<T>>(x)));
+      tp_cplx::cosh(static_cast<tp_cplx::complex<T>>(x)));
 }
 
 template <typename T>
 TP_HOST_DEVICE inline tensorplay::complex<T> tanh(
     const tensorplay::complex<T>& x) {
   return static_cast<tensorplay::complex<T>>(
-      thrust::tanh(static_cast<thrust::complex<T>>(x)));
+      tp_cplx::tanh(static_cast<tp_cplx::complex<T>>(x)));
 }
 
 template <typename T>
 TP_HOST_DEVICE inline tensorplay::complex<T> asinh(
     const tensorplay::complex<T>& x) {
   return static_cast<tensorplay::complex<T>>(
-      thrust::asinh(static_cast<thrust::complex<T>>(x)));
+      tp_cplx::asinh(static_cast<tp_cplx::complex<T>>(x)));
 }
 
 template <typename T>
 TP_HOST_DEVICE inline tensorplay::complex<T> acosh(
     const tensorplay::complex<T>& x) {
   return static_cast<tensorplay::complex<T>>(
-      thrust::acosh(static_cast<thrust::complex<T>>(x)));
+      tp_cplx::acosh(static_cast<tp_cplx::complex<T>>(x)));
 }
 
 template <typename T>
 TP_HOST_DEVICE inline tensorplay::complex<T> atanh(
     const tensorplay::complex<T>& x) {
   return static_cast<tensorplay::complex<T>>(
-      thrust::atanh(static_cast<thrust::complex<T>>(x)));
+      tp_cplx::atanh(static_cast<tp_cplx::complex<T>>(x)));
 }
 
 template <typename T>
@@ -898,6 +921,27 @@ using tensorplay_complex_math::sinh;
 using tensorplay_complex_math::sqrt;
 using tensorplay_complex_math::tan;
 using tensorplay_complex_math::tanh;
+
+// Host kernels carry their complex payloads as std::complex; the power answers
+// for that spelling too, so those call sites need no conversion of their own.
+// It stays inside this namespace rather than the math layer, which is
+// re-exported into std where it would collide with std::pow.
+template <typename T>
+TP_HOST_DEVICE inline std::complex<T> pow(
+    const std::complex<T>& x,
+    const std::complex<T>& y) {
+  return static_cast<std::complex<T>>(
+      tensorplay_complex_math::pow(static_cast<tensorplay::complex<T>>(x),
+                                   static_cast<tensorplay::complex<T>>(y)));
+}
+
+template <typename T>
+TP_HOST_DEVICE inline std::complex<T> pow(
+    const std::complex<T>& x,
+    const T& y) {
+  return static_cast<std::complex<T>>(
+      tensorplay_complex_math::pow(static_cast<tensorplay::complex<T>>(x), y));
+}
 
 } // namespace tensorplay
 
