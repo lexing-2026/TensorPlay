@@ -215,6 +215,7 @@ TENSORPLAY_LIBRARY_IMPL(Composite, ShapeMiscComposite) {
     m.impl("_stack", composite::_stack_native);
     m.impl("_stack.out", composite::_stack_out_native);
     m.impl("nonzero_numpy", composite::nonzero_numpy_native);
+    m.impl("where", composite::nonzero_numpy_native);
     m.impl("type_as", composite::type_as_native);
     m.impl("_unsafe_view", composite::_unsafe_view_native);
     m.impl("_reshape_copy", composite::_reshape_copy_native);
