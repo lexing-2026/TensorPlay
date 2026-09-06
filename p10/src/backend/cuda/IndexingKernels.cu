@@ -3567,22 +3567,43 @@ Tensor sr_forward_cuda_impl(const Tensor& self, int64_t dim,
         TP_THROW(DeviceMismatchError,
                  "scatter_reduce: self, index, and src must be on the same device");
     }
+    if (index.numel() == 0) return detail::contiguous_clone(self);
     Tensor idx_c = (index.dtype() == DType::Int64)
                        ? index.contiguous()
                        : index.to(DType::Int64).contiguous();
     std::vector<int64_t> idx_shape(
         static_cast<std::vector<int64_t>>(idx_c.shape()));
     Tensor src_b;
-    {
-        std::vector<int64_t> bshape = broadcast_shapes(
-            static_cast<std::vector<int64_t>>(src_in.shape()), idx_shape);
-        if (bshape != idx_shape) {
+    if (src_in.dim() == 0) {
+        if (nd != 1 || idx_c.size(0) != 1) {
             TP_THROW(RuntimeError,
-                     "src/source shape must broadcast to the index shape");
+                     "src/source shape must match the index shape");
         }
         src_b = src_in.expand(idx_shape).contiguous();
+    } else {
+        if (src_in.dim() != nd) {
+            TP_THROW(IndexError,
+                     "src/source must have the same number of dimensions as index");
+        }
+        for (int64_t i = 0; i < nd; ++i) {
+            if (i != dim && idx_c.size(i) > self.size(i)) {
+                TP_THROW(RuntimeError,
+                         "index shape must not exceed self shape outside the reduced dimension");
+            }
+            if (idx_c.size(i) > src_in.size(i)) {
+                TP_THROW(RuntimeError,
+                         "index shape must not exceed source shape");
+            }
+        }
+        Tensor src_view = src_in;
+        for (int64_t i = 0; i < nd; ++i) {
+            if (src_view.size(i) > idx_shape[static_cast<size_t>(i)]) {
+                src_view = src_view.narrow(
+                    i, 0, idx_shape[static_cast<size_t>(i)]);
+            }
+        }
+        src_b = src_view.contiguous();
     }
-    if (src_b.dtype() != self.dtype()) src_b = src_b.to(self.dtype());
 
     const int64_t idx_inner = [&] {
         int64_t v = 1;
@@ -3700,13 +3721,12 @@ Tensor ir_forward_cuda_impl(const Tensor& self, int64_t dim,
         TP_THROW(IndexError,
                  "index_reduce(): Index is supposed to be a vector");
     }
-    if (index.dim() != 1) {
+    if (index.dim() > 1) {
         TP_THROW(IndexError,
                  "index_reduce(): Index is supposed to be a vector, but got dim: ",
                  index.dim());
     }
-    if (index.numel() != 0 && index.dtype() != DType::Int32 &&
-        index.dtype() != DType::Int64) {
+    if (index.dtype() != DType::Int32 && index.dtype() != DType::Int64) {
         TP_THROW(TypeError,
                  "index_reduce(): Expected dtype int32/int64 for index");
     }
