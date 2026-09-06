@@ -737,15 +737,17 @@ Tensor _convolution_deprecated_native(const Tensor& input, const Tensor& weight,
 Tensor& adaptive_max_pool2d_backward_gi_native(const Tensor& grad_output, const Tensor& self,
                                                const Tensor& indices, Tensor& grad_input) {
     (void)indices;
-    grad_input = ops::adaptive_max_pool2d_backward(grad_output, self);
-    return grad_input;
+    return write_exact_out("adaptive_max_pool2d_backward",
+                           ops::adaptive_max_pool2d_backward(grad_output, self),
+                           grad_input);
 }
 
 Tensor& adaptive_max_pool3d_backward_gi_native(const Tensor& grad_output, const Tensor& self,
                                                const Tensor& indices, Tensor& grad_input) {
     (void)indices;
-    grad_input = ops::adaptive_max_pool3d_backward(grad_output, self);
-    return grad_input;
+    return write_exact_out("adaptive_max_pool3d_backward",
+                           ops::adaptive_max_pool3d_backward(grad_output, self),
+                           grad_input);
 }
 
 Tensor& max_pool2d_with_indices_backward_gi_native(const Tensor& grad_output,
