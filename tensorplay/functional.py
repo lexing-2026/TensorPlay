@@ -10365,50 +10365,65 @@ def _sparse_compressed_tensor_with_dims(nnz, dense_dim, size, blocksize, index_d
             dtype = DType.undefined
     return _C._sparse_compressed_tensor_with_dims(nnz, dense_dim, size, blocksize, index_dtype, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory)
 
-def sparse_compressed_tensor(compressed_indices, plain_indices, values, size, dtype=None, layout=None, device=None, pin_memory=False):
+def sparse_compressed_tensor(compressed_indices, plain_indices, values, size=None, *, dtype=None, layout=None, device=None, pin_memory=False):
     if _capturing():
-        _captured = _capture_call(sparse_compressed_tensor, (compressed_indices, plain_indices, values, size, dtype, layout, device, pin_memory), {})
+        _captured = _capture_call(sparse_compressed_tensor, (compressed_indices, plain_indices, values, size), {'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
     if isinstance(size, int) and not isinstance(size, bool):
         size = [size]
-    return _C.sparse_compressed_tensor(compressed_indices, plain_indices, values, size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
+    _device = _ensure_device(device)
+    if size is None:
+        return _C.sparse_compressed_tensor(compressed_indices, plain_indices, values, dtype=dtype, layout=layout, device=_device, pin_memory=pin_memory)
+    return _C.sparse_compressed_tensor(compressed_indices, plain_indices, values, size, dtype=dtype, layout=layout, device=_device, pin_memory=pin_memory)
 
-def sparse_csr_tensor(crow_indices, col_indices, values, size, dtype=None, layout=None, device=None, pin_memory=False):
+def sparse_csr_tensor(crow_indices, col_indices, values, size=None, *, dtype=None, layout=None, device=None, pin_memory=False):
     if _capturing():
-        _captured = _capture_call(sparse_csr_tensor, (crow_indices, col_indices, values, size, dtype, layout, device, pin_memory), {})
+        _captured = _capture_call(sparse_csr_tensor, (crow_indices, col_indices, values, size), {'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
     if isinstance(size, int) and not isinstance(size, bool):
         size = [size]
-    return _C.sparse_csr_tensor(crow_indices, col_indices, values, size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
+    _device = _ensure_device(device)
+    if size is None:
+        return _C.sparse_csr_tensor(crow_indices, col_indices, values, dtype=dtype, layout=layout, device=_device, pin_memory=pin_memory)
+    return _C.sparse_csr_tensor(crow_indices, col_indices, values, size, dtype=dtype, layout=layout, device=_device, pin_memory=pin_memory)
 
-def sparse_csc_tensor(ccol_indices, row_indices, values, size, dtype=None, layout=None, device=None, pin_memory=False):
+def sparse_csc_tensor(ccol_indices, row_indices, values, size=None, *, dtype=None, layout=None, device=None, pin_memory=False):
     if _capturing():
-        _captured = _capture_call(sparse_csc_tensor, (ccol_indices, row_indices, values, size, dtype, layout, device, pin_memory), {})
+        _captured = _capture_call(sparse_csc_tensor, (ccol_indices, row_indices, values, size), {'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
     if isinstance(size, int) and not isinstance(size, bool):
         size = [size]
-    return _C.sparse_csc_tensor(ccol_indices, row_indices, values, size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
+    _device = _ensure_device(device)
+    if size is None:
+        return _C.sparse_csc_tensor(ccol_indices, row_indices, values, dtype=dtype, layout=layout, device=_device, pin_memory=pin_memory)
+    return _C.sparse_csc_tensor(ccol_indices, row_indices, values, size, dtype=dtype, layout=layout, device=_device, pin_memory=pin_memory)
 
-def sparse_bsr_tensor(crow_indices, col_indices, values, size, dtype=None, layout=None, device=None, pin_memory=False):
+def sparse_bsr_tensor(crow_indices, col_indices, values, size=None, *, dtype=None, layout=None, device=None, pin_memory=False):
     if _capturing():
-        _captured = _capture_call(sparse_bsr_tensor, (crow_indices, col_indices, values, size, dtype, layout, device, pin_memory), {})
+        _captured = _capture_call(sparse_bsr_tensor, (crow_indices, col_indices, values, size), {'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
     if isinstance(size, int) and not isinstance(size, bool):
         size = [size]
-    return _C.sparse_bsr_tensor(crow_indices, col_indices, values, size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
+    _device = _ensure_device(device)
+    if size is None:
+        return _C.sparse_bsr_tensor(crow_indices, col_indices, values, dtype=dtype, layout=layout, device=_device, pin_memory=pin_memory)
+    return _C.sparse_bsr_tensor(crow_indices, col_indices, values, size, dtype=dtype, layout=layout, device=_device, pin_memory=pin_memory)
 
-def sparse_bsc_tensor(ccol_indices, row_indices, values, size, dtype=None, layout=None, device=None, pin_memory=False):
+def sparse_bsc_tensor(ccol_indices, row_indices, values, size=None, *, dtype=None, layout=None, device=None, pin_memory=False):
     if _capturing():
-        _captured = _capture_call(sparse_bsc_tensor, (ccol_indices, row_indices, values, size, dtype, layout, device, pin_memory), {})
+        _captured = _capture_call(sparse_bsc_tensor, (ccol_indices, row_indices, values, size), {'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
     if isinstance(size, int) and not isinstance(size, bool):
         size = [size]
-    return _C.sparse_bsc_tensor(ccol_indices, row_indices, values, size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
+    _device = _ensure_device(device)
+    if size is None:
+        return _C.sparse_bsc_tensor(ccol_indices, row_indices, values, dtype=dtype, layout=layout, device=_device, pin_memory=pin_memory)
+    return _C.sparse_bsc_tensor(ccol_indices, row_indices, values, size, dtype=dtype, layout=layout, device=_device, pin_memory=pin_memory)
 
 def _sparse_compressed_tensor_unsafe(compressed_indices, plain_indices, values, size, dtype=None, layout=None, device=None, pin_memory=None):
     if _capturing():

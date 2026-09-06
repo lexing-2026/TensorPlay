@@ -963,6 +963,7 @@ inline void set_item(
 
 } // namespace indexing
 
+#ifndef TENSORPLAY_INDEXING_SKIP_TENSOR_MEMBERS
 //
 // Member definitions for the indexing surface declared on Tensor.  Kept
 // out of Tensor.h so the core header does not pull the generated op
@@ -1031,5 +1032,6 @@ inline Tensor& Tensor::index_put_(
     const Scalar& v) {
   return index_put_(std::vector<indexing::TensorIndex>(indices), v);
 }
+#endif // TENSORPLAY_INDEXING_SKIP_TENSOR_MEMBERS
 
 } // namespace tensorplay

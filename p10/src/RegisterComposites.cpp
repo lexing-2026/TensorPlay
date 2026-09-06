@@ -17,7 +17,8 @@ namespace tensorplay {
 namespace {
 
 int64_t layout_of(const Tensor& tensor) {
-    if (!tensor.is_sparse()) return 2;
+    // Keep dense separate from all five sparse layout tags (0..4).
+    if (!tensor.is_sparse()) return 5;
     return tensor.unsafeGetTensorImpl()->sparse_layout();
 }
 

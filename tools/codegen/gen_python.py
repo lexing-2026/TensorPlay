@@ -499,9 +499,8 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
 
         # Compressed sparse constructors have two call shapes in the native
         # schema: an explicit-size overload and an overload that infers the
-        # logical shape from the buffers.  Expose both behind the same Python
-        # signature, matching torch.sparse_*_tensor(..., size=None), instead
-        # of letting the generated wrapper make `size` mandatory.
+        # logical shape from the buffers.  Expose both behind one Python
+        # signature with an optional size, rather than making `size` mandatory.
         compressed_ctor_names = {
             'sparse_compressed_tensor': ('compressed_indices', 'plain_indices'),
             'sparse_csr_tensor': ('crow_indices', 'col_indices'),
@@ -520,6 +519,8 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                 f"        _captured = _capture_call({name}, ({first}, {second}, values, size), {{'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory}})",
                 '        if _captured is not None:',
                 '            return _captured',
+                '    if isinstance(size, int) and not isinstance(size, bool):',
+                '        size = [size]',
                 '    _device = _ensure_device(device)',
                 '    if size is None:',
                 f'        return _C.{name}({first}, {second}, values, dtype=dtype, layout=layout, device=_device, pin_memory=pin_memory)',

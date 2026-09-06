@@ -787,7 +787,7 @@ Tensor randn_generator_stub(const std::vector<int64_t>& size,
                             std::optional<int64_t> layout,
                             std::optional<Device> device,
                             std::optional<bool> pin_memory) {
-    if (layout.has_value() && *layout != 2) {
+    if (layout.has_value() && *layout != 5) {
         TP_THROW(NotImplementedError,
                  "randn is only implemented for strided (dense) layout tensors");
     }

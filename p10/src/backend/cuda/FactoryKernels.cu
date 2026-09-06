@@ -654,7 +654,7 @@ Tensor empty_memory_format_stub(const std::vector<int64_t>& size,
                                 std::optional<bool> pin_memory,
                                 std::optional<int64_t> memory_format) {
     (void)memory_format;
-    if (layout.has_value() && *layout != 2) {
+    if (layout.has_value() && *layout != 5) {
         TP_THROW(NotImplementedError,
                  "empty is only implemented for strided (dense) layout tensors");
     }

@@ -54,10 +54,10 @@ Tensor allocate_cpu_tensor(const std::vector<int64_t>& size, DType dtype, bool p
 
 namespace {
 
-// Layout encoding: 2 == strided (dense); sparse COO/CSR are not supported by
+// Layout encoding: 5 == strided (dense); sparse layouts are not supported by
 // the dense factories below.
 void require_strided_layout(const char* op_name, const std::optional<int64_t>& layout) {
-    if (layout.has_value() && *layout != 2) {
+    if (layout.has_value() && *layout != 5) {
         TP_THROW(NotImplementedError, std::string(op_name) +
                  " is only implemented for strided (dense) layout tensors");
     }
