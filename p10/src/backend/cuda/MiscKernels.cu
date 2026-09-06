@@ -297,14 +297,31 @@ __global__ void native_dropout_backward_kernel_vec8(int64_t nvec, float scale,
 // copyAllocationBytes, so no explicit memcpy or stream handling is needed.
 Tensor& resize__cuda(Tensor& self, const std::vector<int64_t>& size) {
     auto* impl = self.unsafeGetTensorImpl().get();
-    int64_t new_numel = 1;
+    if (static_cast<std::vector<int64_t>>(impl->sizes()) == size) {
+        return self;
+    }
+
+    bool has_zero = false;
     for (int64_t s : size) {
         if (s < 0) {
             TP_THROW(ValueError, "resize_: negative sizes are not allowed");
         }
-        new_numel *= s;
+        has_zero = has_zero || s == 0;
     }
-    const size_t new_bytes = static_cast<size_t>(new_numel) * impl->itemsize();
+    size_t new_numel = has_zero ? 0 : 1;
+    for (int64_t s : size) {
+        if (new_numel != 0 &&
+            static_cast<size_t>(s) >
+                std::numeric_limits<size_t>::max() / new_numel) {
+            TP_THROW(RuntimeError, "resize_: requested size is too large");
+        }
+        new_numel *= static_cast<size_t>(s);
+    }
+    if (impl->itemsize() != 0 &&
+        new_numel > std::numeric_limits<size_t>::max() / impl->itemsize()) {
+        TP_THROW(RuntimeError, "resize_: requested storage is too large");
+    }
+    const size_t new_bytes = new_numel * impl->itemsize();
     if (!impl->has_storage()) {
         if (new_bytes > 0) {
             impl->set_storage(
