@@ -2602,6 +2602,7 @@
   variants: function
   dispatch:
     CPU: count_nonzero_cpu
+    CUDA: count_nonzero_cuda2
 
 - func: log10(Tensor self) -> Tensor
   variants: function, method
@@ -5423,6 +5424,8 @@
 # Unique.cpp semantics reproduced over bucketize/bincount/compare primitives).
 - func: histc(Tensor self, int bins=100, Scalar min=0, Scalar max=0) -> Tensor
   variants: function, method
+  dispatch:
+    CUDA: interop_histc_cuda
 
 - func: isin.Tensor_Tensor(Tensor elements, Tensor test_elements, *, bool assume_unique=False, bool invert=False) -> Tensor
   variants: function
@@ -5435,6 +5438,8 @@
 
 - func: unique_consecutive(Tensor self, bool return_inverse=False, bool return_counts=False, int? dim=None) -> (Tensor output, Tensor inverse_indices, Tensor counts)
   variants: function
+  dispatch:
+    CUDA: interop_unique_consecutive_cuda
 
 # TypeProperties.cpp).
 - func: scalar_tensor(Scalar s, *, ScalarType? dtype=None, Device? device=None, bool pin_memory=False) -> Tensor
@@ -6073,6 +6078,9 @@
   variants: function
 - func: count_nonzero.dim_IntList(Tensor self, int[] dim) -> Tensor
   variants: function, method
+  dispatch:
+    CPU: count_nonzero_cpu
+    CUDA: count_nonzero_cuda2
 - func: cudnn_affine_grid_generator(Tensor theta, int N, int C, int H, int W) -> Tensor grid
   variants: function
 - func: cudnn_affine_grid_generator_backward(Tensor grad, int N, int C, int H, int W) -> Tensor grad_theta
@@ -7886,6 +7894,8 @@
   variants: method, function
 - func: histc.out(Tensor self, int bins=100, Scalar min=0, Scalar max=0, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
+  dispatch:
+    CUDA: interop_histc_out_cuda
 - func: histogram.bins_tensor_out(Tensor self, Tensor bins, *, Tensor? weight=None, bool density=False, Tensor(a!) hist, Tensor(b!) bin_edges) -> (Tensor(a!) hist, Tensor(b!) bin_edges)
   variants: function
 - func: histogram.bin_ct_out(Tensor self, int bins=100, *, float[]? range=None, Tensor? weight=None, bool density=False, Tensor(a!) hist, Tensor(b!) bin_edges) -> (Tensor(a!) hist, Tensor(b!) bin_edges)
