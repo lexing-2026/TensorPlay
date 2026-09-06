@@ -1457,34 +1457,33 @@ Tensor clamp_kernel_cuda(const Tensor& self, std::optional<Scalar> min, std::opt
     return result;
 }
 
-// Clamp Backward
-template <typename T>
-__global__ void clamp_backward_kernel_cuda_impl(int64_t n, const T* grad, const T* input, T* output, T min_val, T max_val, bool has_min, bool has_max) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        T val = input[i];
-        if ((has_min && val < min_val) || (has_max && val > max_val)) {
-            output[i] = 0;
-        } else {
-            output[i] = grad[i];
-        }
-    }
-}
-
 Tensor clamp_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max) {
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(grad_output.shape()), grad_output.dtype(), grad_output.device());
     int64_t n = grad_output.numel();
     if (n == 0) return result;
-    dim3 block(256);
-    dim3 grid((n + 255) / 256);
-    Tensor self_contig = self.contiguous();
-    Tensor grad_contig = grad_output.contiguous();
-    
+
+    TensorIterator iter = TensorIteratorConfig()
+        .set_check_mem_overlap(false)
+        .check_all_same_dtype(true)
+        .resize_outputs(false)
+        .add_output(result)
+        .add_const_input(self)
+        .add_const_input(grad_output)
+        .build();
+    const bool has_min = min.has_value();
+    const bool has_max = max.has_value();
+
     #define CLAMP_BW_CASE(ctype, name) \
     case DType::name: { \
         ctype min_val = min.has_value() ? min->to<ctype>() : ctype(0); \
         ctype max_val = max.has_value() ? max->to<ctype>() : ctype(0); \
-        clamp_backward_kernel_cuda_impl<ctype><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, grad_contig.data_ptr<ctype>(), self_contig.data_ptr<ctype>(), result.data_ptr<ctype>(), min_val, max_val, min.has_value(), max.has_value()); \
+        gpu_kernel(iter, [=] __device__(ctype input_value, ctype grad_value) -> ctype { \
+            if ((has_min && input_value < min_val) || \
+                (has_max && input_value > max_val)) { \
+                return ctype(0); \
+            } \
+            return grad_value; \
+        }); \
         break; \
     }
     switch (self.dtype()) {
@@ -1492,7 +1491,6 @@ Tensor clamp_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self,
         default: TP_THROW(TypeError, "CUDA clamp_backward: Unsupported dtype");
     }
     #undef CLAMP_BW_CASE
-    CUDA_CHECK(cudaGetLastError());
     return result;
 }
 
