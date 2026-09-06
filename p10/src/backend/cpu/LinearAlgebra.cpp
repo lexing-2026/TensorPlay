@@ -690,6 +690,112 @@ Tensor& write_linalg_rank_output(const Tensor& result, Tensor& out) {
     return out;
 }
 
+Tensor linalg_cond_inverse(const Tensor& input) {
+    auto inverse_result = ops::linalg_inv_ex(input, false);
+    Tensor inverse = std::get<0>(inverse_result);
+    Tensor info = std::get<1>(inverse_result);
+    Tensor invalid = ops::gt(
+        ops::unsqueeze(ops::unsqueeze(info, -1), -1), Scalar(0));
+    Tensor infinity = Tensor::full(
+        {}, Scalar(std::numeric_limits<double>::infinity()), input.dtype(),
+        input.device());
+    return ops::where(invalid, infinity, inverse);
+}
+
+Tensor linalg_cond_impl(const Tensor& self,
+                        const std::optional<Scalar>& ord) {
+    check_matrix_decomposition_input(self, false, "linalg.cond");
+    const Scalar order = ord.value_or(Scalar(2));
+    if (order.isComplex()) {
+        TP_THROW(TypeError,
+                 "linalg.cond order must be real");
+    }
+    const double value = order.toDouble();
+    const double absolute = std::abs(value);
+    if (absolute != 1.0 && absolute != 2.0 && !std::isinf(absolute)) {
+        TP_THROW(ValueError,
+                 "linalg.cond order is not supported");
+    }
+    const DType result_dtype = toRealValueType(self.dtype());
+    if (self.numel() == 0) {
+        return Tensor::zeros(matrix_batch_shape(self), result_dtype,
+                             self.device());
+    }
+    if (absolute == 2.0) {
+        Tensor singular_values = ops::linalg_svdvals(self, std::nullopt);
+        Tensor maximum = ops::narrow(singular_values, -1, 0, 1);
+        Tensor minimum = ops::narrow(singular_values, -1, -1, 1);
+        Tensor result = value < 0.0
+            ? ops::div(minimum, maximum)
+            : ops::div(maximum, minimum);
+        return ops::squeeze(result, -1);
+    }
+    if (self.size(-2) != self.size(-1)) {
+        TP_THROW(RuntimeError,
+                 "linalg.cond requires square matrices for this order");
+    }
+    Tensor inverse = linalg_cond_inverse(self);
+    Tensor self_norm = linalg_matrix_norm_impl(
+        self, order, {-2, -1}, false, std::nullopt);
+    Tensor inverse_norm = linalg_matrix_norm_impl(
+        inverse, order, {-2, -1}, false, std::nullopt);
+    return ops::nan_to_num(
+        ops::mul(self_norm, inverse_norm),
+        Scalar(std::numeric_limits<double>::infinity()),
+        std::optional<Scalar>(Scalar(std::numeric_limits<double>::infinity())),
+        std::optional<Scalar>(Scalar(-std::numeric_limits<double>::infinity())));
+}
+
+Tensor linalg_cond_string_impl(const Tensor& self, const std::string& ord) {
+    check_matrix_decomposition_input(self, false, "linalg.cond");
+    if (ord != "fro" && ord != "nuc") {
+        TP_THROW(ValueError,
+                 "linalg.cond order is not supported");
+    }
+    if (self.size(-2) != self.size(-1)) {
+        TP_THROW(RuntimeError,
+                 "linalg.cond requires square matrices for this order");
+    }
+    const DType result_dtype = toRealValueType(self.dtype());
+    if (self.numel() == 0) {
+        return Tensor::zeros(matrix_batch_shape(self), result_dtype,
+                             self.device());
+    }
+    if (ord == "nuc") {
+        Tensor singular_values = ops::linalg_svdvals(self, std::nullopt);
+        Tensor first = ops::sum(singular_values, {-1}, false, result_dtype);
+        Tensor second = ops::sum(
+            ops::reciprocal(singular_values), {-1}, false, result_dtype);
+        return ops::mul(first, second);
+    }
+    Tensor inverse = linalg_cond_inverse(self);
+    Tensor self_norm = linalg_matrix_norm_string_impl(
+        self, ord, {-2, -1}, false, std::nullopt);
+    Tensor inverse_norm = linalg_matrix_norm_string_impl(
+        inverse, ord, {-2, -1}, false, std::nullopt);
+    return ops::nan_to_num(
+        ops::mul(self_norm, inverse_norm),
+        Scalar(std::numeric_limits<double>::infinity()),
+        std::optional<Scalar>(Scalar(std::numeric_limits<double>::infinity())),
+        std::optional<Scalar>(Scalar(-std::numeric_limits<double>::infinity())));
+}
+
+Tensor linalg_matrix_sqrth_impl(const Tensor& self) {
+    check_matrix_decomposition_input(self, false, "linalg.matrix_sqrth");
+    if (self.size(-2) != self.size(-1)) {
+        TP_THROW(RuntimeError,
+                 "linalg.matrix_sqrth expects square matrices");
+    }
+    if (self.size(-1) == 0) return ops::clone(self, 0);
+    auto decomposition = ops::linalg_eigh(self, "L");
+    Tensor values = std::get<0>(decomposition);
+    Tensor vectors = std::get<1>(decomposition);
+    Tensor roots = ops::sqrt(ops::clamp_min(values, Scalar(0)));
+    Tensor result = ops::matmul(
+        ops::mul(vectors, ops::unsqueeze(roots, -2)), ops::mH(vectors));
+    return ops::mul(ops::add(result, ops::mH(result)), Scalar(0.5));
+}
+
 }  // namespace
 
 Tensor ger_native_cpu(const Tensor& self, const Tensor& vec2) {
@@ -1032,6 +1138,29 @@ Tensor& linalg_matrix_rank_native_cpu_tol_tensor_out(
         linalg_matrix_rank_native_cpu_tol_tensor(input, tol, hermitian), out);
 }
 
+Tensor linalg_cond_native_cpu(const Tensor& self,
+                              std::optional<Scalar> ord) {
+    return linalg_cond_impl(self, ord);
+}
+
+Tensor& linalg_cond_native_cpu_out(const Tensor& self,
+                                   std::optional<Scalar> ord, Tensor& out) {
+    return write_linalg_norm_output(linalg_cond_impl(self, ord), out);
+}
+
+Tensor linalg_cond_string_native_cpu(const Tensor& self, std::string ord) {
+    return linalg_cond_string_impl(self, ord);
+}
+
+Tensor& linalg_cond_string_native_cpu_out(const Tensor& self, std::string ord,
+                                          Tensor& out) {
+    return write_linalg_norm_output(linalg_cond_string_impl(self, ord), out);
+}
+
+Tensor linalg_matrix_sqrth_native_cpu(const Tensor& self) {
+    return linalg_matrix_sqrth_impl(self);
+}
+
 Tensor matrix_power_native_cpu(const Tensor& self, int64_t n) {
     if (self.dim() < 2 || self.size(-2) != self.size(-1)) {
         TP_THROW(RuntimeError, "matrix_power(): expected a square matrix");
@@ -1130,6 +1259,11 @@ TENSORPLAY_LIBRARY_IMPL(CPU, NativeLinearAlgebra) {
            linalg_matrix_rank_native_cpu_tol_tensor);
     m.impl("linalg_matrix_rank.out_tol_tensor",
            linalg_matrix_rank_native_cpu_tol_tensor_out);
+    m.impl("linalg_cond", linalg_cond_native_cpu);
+    m.impl("linalg_cond.out", linalg_cond_native_cpu_out);
+    m.impl("linalg_cond.p_str", linalg_cond_string_native_cpu);
+    m.impl("linalg_cond.p_str_out", linalg_cond_string_native_cpu_out);
+    m.impl("linalg_matrix_sqrth", linalg_matrix_sqrth_native_cpu);
     m.impl("matrix_power", matrix_power_native_cpu);
     m.impl("matrix_power.out", matrix_power_native_cpu_out);
     m.impl("linalg_matrix_power", matrix_power_native_cpu);
