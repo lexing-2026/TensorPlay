@@ -1644,29 +1644,33 @@ Tensor float_power_tensor_scalar_native(const Tensor& self, const Scalar& expone
 Tensor& fft_fft2_out_native(const Tensor& self, const std::optional<std::vector<int64_t>>& s,
                             const std::vector<int64_t>& dim,
                             const std::optional<std::string>& norm, Tensor& out) {
-    out = ops::fft_fft2(self, s, dim, norm.value_or("backward"));
-    return out;
+    return write_exact_out("fft_fft2", ops::fft_fft2(self, s, dim,
+                                                      norm.value_or("backward")),
+                           out);
 }
 
 Tensor& fft_ifft2_out_native(const Tensor& self, const std::optional<std::vector<int64_t>>& s,
                              const std::vector<int64_t>& dim,
                              const std::optional<std::string>& norm, Tensor& out) {
-    out = ops::fft_ifft2(self, s, dim, norm.value_or("backward"));
-    return out;
+    return write_exact_out("fft_ifft2", ops::fft_ifft2(self, s, dim,
+                                                       norm.value_or("backward")),
+                           out);
 }
 
 Tensor& fft_rfft2_out_native(const Tensor& self, const std::optional<std::vector<int64_t>>& s,
                              const std::vector<int64_t>& dim,
                              const std::optional<std::string>& norm, Tensor& out) {
-    out = ops::fft_rfft2(self, s, dim, norm.value_or("backward"));
-    return out;
+    return write_exact_out("fft_rfft2", ops::fft_rfft2(self, s, dim,
+                                                       norm.value_or("backward")),
+                           out);
 }
 
 Tensor& fft_irfft2_out_native(const Tensor& self, const std::optional<std::vector<int64_t>>& s,
                               const std::vector<int64_t>& dim,
                               const std::optional<std::string>& norm, Tensor& out) {
-    out = ops::fft_irfft2(self, s, dim, norm.value_or("backward"));
-    return out;
+    return write_exact_out("fft_irfft2", ops::fft_irfft2(self, s, dim,
+                                                        norm.value_or("backward")),
+                           out);
 }
 
 // ---- upsample vec overloads -------------------------------------------------
