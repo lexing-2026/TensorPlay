@@ -3,6 +3,7 @@
 // cloneBatchedColumnMajor.
 
 #include "Tensor.h"
+#include "Complex.h"
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "Parallel.h"
@@ -14,7 +15,6 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
-#include <complex>
 #include <cstring>
 #include <limits>
 #include <numeric>
@@ -55,10 +55,19 @@ struct LinalgScalarTraits {
 };
 
 template <typename T>
-struct LinalgScalarTraits<std::complex<T>> {
+struct LinalgScalarTraits<complex<T>> {
     using value_type = T;
     static constexpr bool is_complex = true;
 };
+
+template <typename T>
+auto linalg_abs(const T& value) {
+    if constexpr (LinalgScalarTraits<T>::is_complex) {
+        return tensorplay::abs(value);
+    } else {
+        return std::abs(value);
+    }
+}
 
 template <class Kernel>
 decltype(auto) run_linalg(DType dt, Kernel&& k) {
@@ -68,9 +77,9 @@ decltype(auto) run_linalg(DType dt, Kernel&& k) {
         case DType::Float64:
             return k(static_cast<double*>(nullptr));
         case DType::ComplexFloat:
-            return k(static_cast<std::complex<float>*>(nullptr));
+            return k(static_cast<complex<float>*>(nullptr));
         case DType::ComplexDouble:
-            return k(static_cast<std::complex<double>*>(nullptr));
+            return k(static_cast<complex<double>*>(nullptr));
         default:
             TP_THROW(NotImplementedError,
                      "unsupported dtype ", pretty_dtype_name(dt),
@@ -78,16 +87,16 @@ decltype(auto) run_linalg(DType dt, Kernel&& k) {
     }
 }
 
-// Complex-only dispatch: kernels that wrap Lapack's xGEEV-style complex
+// Complex-only dispatch: kernels that wrap complex eigensolver routines
 // routines carry no real-typed instantiation, so every switch arm must map
-// onto a std::complex element type for the template to type-check.
+// onto a native complex element type for the template to type-check.
 template <class Kernel>
 decltype(auto) run_linalg_complex(DType dt, Kernel&& k) {
     switch (dt) {
         case DType::ComplexFloat:
-            return k(static_cast<std::complex<float>*>(nullptr));
+            return k(static_cast<complex<float>*>(nullptr));
         case DType::ComplexDouble:
-            return k(static_cast<std::complex<double>*>(nullptr));
+            return k(static_cast<complex<double>*>(nullptr));
         default:
             TP_THROW(NotImplementedError,
                      "unsupported dtype ", pretty_dtype_name(dt),
@@ -117,7 +126,7 @@ int64_t lapack_getrf(int64_t m, int64_t n, T* a, int64_t lda, int64_t* ipiv) {
         return lapack_sgetrf(m, n, a, lda, ipiv);
     } else if constexpr (std::is_same_v<T, double>) {
         return lapack_dgetrf(m, n, a, lda, ipiv);
-    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+    } else if constexpr (std::is_same_v<T, complex<float>>) {
         return lapack_cgetrf(m, n, a, lda, ipiv);
     } else {
         return lapack_zgetrf(m, n, a, lda, ipiv);
@@ -131,7 +140,7 @@ int64_t lapack_getrs(char trans, int64_t n, int64_t nrhs, const T* a,
         return lapack_sgetrs(trans, n, nrhs, a, lda, ipiv, b, ldb);
     } else if constexpr (std::is_same_v<T, double>) {
         return lapack_dgetrs(trans, n, nrhs, a, lda, ipiv, b, ldb);
-    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+    } else if constexpr (std::is_same_v<T, complex<float>>) {
         return lapack_cgetrs(trans, n, nrhs, a, lda, ipiv, b, ldb);
     } else {
         return lapack_zgetrs(trans, n, nrhs, a, lda, ipiv, b, ldb);
@@ -144,7 +153,7 @@ int64_t lapack_potrf(char uplo, int64_t n, T* a, int64_t lda) {
         return lapack_spotrf(uplo, n, a, lda);
     } else if constexpr (std::is_same_v<T, double>) {
         return lapack_dpotrf(uplo, n, a, lda);
-    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+    } else if constexpr (std::is_same_v<T, complex<float>>) {
         return lapack_cpotrf(uplo, n, a, lda);
     } else {
         return lapack_zpotrf(uplo, n, a, lda);
@@ -167,13 +176,13 @@ int64_t lapack_trtrs(char side, char uplo, char transa, char diag, int64_t n,
         lapack_dtrsm(order, side_code, uplo_code, trans_code, diag_code, n, nrhs,
                      1.0, a, lda, b, ldb);
         return 0;
-    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
-        const std::complex<float> alpha(1.0f, 0.0f);
+    } else if constexpr (std::is_same_v<T, complex<float>>) {
+        const complex<float> alpha(1.0f, 0.0f);
         lapack_ctrsm(order, side_code, uplo_code, trans_code, diag_code, n, nrhs,
                      &alpha, a, lda, b, ldb);
         return 0;
     } else {
-        const std::complex<double> alpha(1.0, 0.0);
+        const complex<double> alpha(1.0, 0.0);
         lapack_ztrsm(order, side_code, uplo_code, trans_code, diag_code, n, nrhs,
                      &alpha, a, lda, b, ldb);
         return 0;
@@ -187,7 +196,7 @@ int64_t lapack_geqrf(int64_t m, int64_t n, T* a, int64_t lda, T* tau,
         return lapack_sgeqrf(m, n, a, lda, tau, work, lwork);
     } else if constexpr (std::is_same_v<T, double>) {
         return lapack_dgeqrf(m, n, a, lda, tau, work, lwork);
-    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+    } else if constexpr (std::is_same_v<T, complex<float>>) {
         return lapack_cgeqrf(m, n, a, lda, tau, work, lwork);
     } else {
         return lapack_zgeqrf(m, n, a, lda, tau, work, lwork);
@@ -201,7 +210,7 @@ int64_t lapack_orgqr(int64_t m, int64_t n, int64_t k, T* a, int64_t lda,
         return lapack_sorgqr(m, n, k, a, lda, tau, work, lwork);
     } else if constexpr (std::is_same_v<T, double>) {
         return lapack_dorgqr(m, n, k, a, lda, tau, work, lwork);
-    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+    } else if constexpr (std::is_same_v<T, complex<float>>) {
         return lapack_cungqr(m, n, k, a, lda, tau, work, lwork);
     } else {
         return lapack_zungqr(m, n, k, a, lda, tau, work, lwork);
@@ -215,7 +224,7 @@ int64_t lapack_gels(char trans, int64_t m, int64_t n, int64_t nrhs, T* a,
         return lapack_sgels(trans, m, n, nrhs, a, lda, b, ldb, work, lwork);
     } else if constexpr (std::is_same_v<T, double>) {
         return lapack_dgels(trans, m, n, nrhs, a, lda, b, ldb, work, lwork);
-    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+    } else if constexpr (std::is_same_v<T, complex<float>>) {
         return lapack_cgels(trans, m, n, nrhs, a, lda, b, ldb, work, lwork);
     } else {
         return lapack_zgels(trans, m, n, nrhs, a, lda, b, ldb, work, lwork);
@@ -237,7 +246,7 @@ int64_t lapack_gelsy(int64_t m, int64_t n, int64_t nrhs, T* a, int64_t lda,
     } else if constexpr (std::is_same_v<T, double>) {
         return lapack_dgelsy(m, n, nrhs, a, lda, b, ldb, jpvt, rcond, rank,
                              work, lwork);
-    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+    } else if constexpr (std::is_same_v<T, complex<float>>) {
         return lapack_cgelsy(m, n, nrhs, a, lda, b, ldb, jpvt, rcond, rank,
                              work, lwork, rwork);
     } else {
@@ -261,7 +270,7 @@ int64_t lapack_gelsd(int64_t m, int64_t n, int64_t nrhs, T* a, int64_t lda,
     } else if constexpr (std::is_same_v<T, double>) {
         return lapack_dgelsd(m, n, nrhs, a, lda, b, ldb, s, rcond, rank, work,
                              lwork, iwork);
-    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+    } else if constexpr (std::is_same_v<T, complex<float>>) {
         return lapack_cgelsd(m, n, nrhs, a, lda, b, ldb, s, rcond, rank, work,
                              lwork, rwork, iwork);
     } else {
@@ -284,7 +293,7 @@ int64_t lapack_gelss(int64_t m, int64_t n, int64_t nrhs, T* a, int64_t lda,
     } else if constexpr (std::is_same_v<T, double>) {
         return lapack_dgelss(m, n, nrhs, a, lda, b, ldb, s, rcond, rank, work,
                              lwork);
-    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+    } else if constexpr (std::is_same_v<T, complex<float>>) {
         return lapack_cgelss(m, n, nrhs, a, lda, b, ldb, s, rcond, rank, work,
                              lwork, rwork);
     } else {
@@ -323,7 +332,7 @@ int64_t lapack_ldl_factor(char uplo, bool hermitian, int64_t n, T* a,
         return lapack_ssytrf(uplo, n, a, lda, ipiv, work, lwork);
     } else if constexpr (std::is_same_v<T, double>) {
         return lapack_dsytrf(uplo, n, a, lda, ipiv, work, lwork);
-    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+    } else if constexpr (std::is_same_v<T, complex<float>>) {
         return hermitian ? lapack_chetrf(uplo, n, a, lda, ipiv, work, lwork)
                          : lapack_csytrf(uplo, n, a, lda, ipiv, work, lwork);
     } else {
@@ -340,7 +349,7 @@ int64_t lapack_ldl_solve(char uplo, bool hermitian, int64_t n, int64_t nrhs,
         return lapack_ssytrs(uplo, n, nrhs, a, lda, ipiv, b, ldb);
     } else if constexpr (std::is_same_v<T, double>) {
         return lapack_dsytrs(uplo, n, nrhs, a, lda, ipiv, b, ldb);
-    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+    } else if constexpr (std::is_same_v<T, complex<float>>) {
         return hermitian ? lapack_chetrs(uplo, n, nrhs, a, lda, ipiv, b, ldb)
                          : lapack_csytrs(uplo, n, nrhs, a, lda, ipiv, b, ldb);
     } else {
@@ -541,19 +550,19 @@ void pack_complex_outputs(bool is_float_input, const Tensor& wr, const Tensor& w
                           const Tensor& rvectors, Tensor& values, Tensor& eigvecs,
                           bool compute_eigenvectors) {
     if (is_float_input) {
-        auto* v = values.data_ptr<std::complex<float>>();
+        auto* v = values.data_ptr<complex<float>>();
         const auto* r = wr.data_ptr<float>();
         const auto* im = wi.data_ptr<float>();
-        for (int64_t i = 0; i < wr.numel(); ++i) v[i] = std::complex<float>(r[i], im[i]);
+        for (int64_t i = 0; i < wr.numel(); ++i) v[i] = complex<float>(r[i], im[i]);
         if (compute_eigenvectors)
-            make_complex_eigenvectors<float, std::complex<float>>(eigvecs, values, rvectors);
+            make_complex_eigenvectors<float, complex<float>>(eigvecs, values, rvectors);
     } else {
-        auto* v = values.data_ptr<std::complex<double>>();
+        auto* v = values.data_ptr<complex<double>>();
         const auto* r = wr.data_ptr<double>();
         const auto* im = wi.data_ptr<double>();
-        for (int64_t i = 0; i < wr.numel(); ++i) v[i] = std::complex<double>(r[i], im[i]);
+        for (int64_t i = 0; i < wr.numel(); ++i) v[i] = complex<double>(r[i], im[i]);
         if (compute_eigenvectors)
-            make_complex_eigenvectors<double, std::complex<double>>(eigvecs, values, rvectors);
+            make_complex_eigenvectors<double, complex<double>>(eigvecs, values, rvectors);
     }
 }
 
@@ -689,8 +698,8 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_slogdet_internal_kernel(
             bool singular = false;
             for (int64_t i = 0; i < n; ++i) {
                 const T d = lu[b * ms + i * n + i];
-                if (std::abs(d) == R(0)) { singular = true; break; }
-                logdet += std::log(std::abs(d));
+                if (linalg_abs(d) == R(0)) { singular = true; break; }
+                logdet += std::log(linalg_abs(d));
                 det *= d;
             }
             const int64_t perm_sign = lu_perm_sign(&piv[b * n], n);
@@ -700,7 +709,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_slogdet_internal_kernel(
             } else {
                 det *= T(perm_sign);
                 if constexpr (LinalgScalarTraits<T>::is_complex) {
-                    s_out[b] = det / static_cast<R>(std::abs(det));
+                    s_out[b] = det / static_cast<R>(linalg_abs(det));
                 } else {
                     s_out[b] = det < T(0) ? T(-1) : T(1);
                 }
@@ -1099,7 +1108,7 @@ void apply_syevd(const Tensor& vectors, const Tensor& values, const Tensor& info
     } else if constexpr (std::is_same_v<scalar_t, double>) {
         lapack_dsyevd(jobz, uplo, n, vectors_data, lda, values_data,
                       work.data(), lwork, iwork.data(), liwork);
-    } else if constexpr (std::is_same_v<scalar_t, std::complex<float>>) {
+    } else if constexpr (std::is_same_v<scalar_t, complex<float>>) {
         lapack_cheevd(jobz, uplo, n, vectors_data, lda, values_data, work.data(),
                       lwork, rwork.data(), lrwork, iwork.data(), liwork);
     } else {
@@ -1127,7 +1136,7 @@ void apply_syevd(const Tensor& vectors, const Tensor& values, const Tensor& info
         } else if constexpr (std::is_same_v<scalar_t, double>) {
             err = lapack_dsyevd(jobz, uplo, n, v, lda, w, work.data(), lwork,
                                 iwork.data(), liwork);
-        } else if constexpr (std::is_same_v<scalar_t, std::complex<float>>) {
+        } else if constexpr (std::is_same_v<scalar_t, complex<float>>) {
             err = lapack_cheevd(jobz, uplo, n, v, lda, w, work.data(), lwork,
                                 rwork.data(), lrwork, iwork.data(), liwork);
         } else {
@@ -1262,7 +1271,7 @@ void apply_geev_complex(const Tensor& input, const Tensor& values,
     std::vector<scalar_t> work(1);
     std::vector<value_t> rwork(static_cast<size_t>(std::max<int64_t>(1, 2 * n)));
     int64_t lwork = -1;
-    if constexpr (std::is_same_v<scalar_t, std::complex<float>>) {
+    if constexpr (std::is_same_v<scalar_t, complex<float>>) {
         lapack_cgeev(jobvl, jobvr, n, a_data, lda, w_data, nullptr, 1, v_data,
                      ldvr, work.data(), lwork, rwork.data());
     } else {
@@ -1278,7 +1287,7 @@ void apply_geev_complex(const Tensor& input, const Tensor& values,
         scalar_t* w = &w_data[i * n];
         scalar_t* v = compute_eigenvectors ? &v_data[i * matrix_stride] : nullptr;
         int64_t err;
-        if constexpr (std::is_same_v<scalar_t, std::complex<float>>) {
+        if constexpr (std::is_same_v<scalar_t, complex<float>>) {
             err = lapack_cgeev(jobvl, jobvr, n, a, lda, w, nullptr, 1, v, ldvr,
                                work.data(), lwork, rwork.data());
         } else {
@@ -1436,7 +1445,7 @@ void apply_svd(const Tensor& A, bool full_matrices, bool compute_uv,
     } else if constexpr (is_double) {
         lapack_dgesdd(jobz, m, n, a_data, lda, s_data, u_data, ldu, vh_data, ldvh,
                       work.data(), lwork, iwork.data());
-    } else if constexpr (std::is_same_v<scalar_t, std::complex<float>>) {
+    } else if constexpr (std::is_same_v<scalar_t, complex<float>>) {
         lapack_cgesdd(jobz, m, n, a_data, lda, s_data, u_data, ldu, vh_data, ldvh,
                       work.data(), lwork, rwork_data, iwork.data());
     } else {
@@ -1464,7 +1473,7 @@ void apply_svd(const Tensor& A, bool full_matrices, bool compute_uv,
                                 compute_uv ? &u_data[i * u_stride] : nullptr, ldu,
                                 compute_uv ? &vh_data[i * vh_stride] : nullptr, ldvh,
                                 work.data(), lwork, iwork.data());
-        } else if constexpr (std::is_same_v<scalar_t, std::complex<float>>) {
+        } else if constexpr (std::is_same_v<scalar_t, complex<float>>) {
             err = lapack_cgesdd(jobz, m, n, &a_data[i * a_stride], lda,
                                 &s_data[i * s_stride],
                                 compute_uv ? &u_data[i * u_stride] : nullptr, ldu,
@@ -1989,7 +1998,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_lstsq_kernel(
                     for (int64_t row = n; row < m; ++row) {
                         const T x = src[i * ldb * nrhs + col * ldb + row];
                         if constexpr (LinalgScalarTraits<T>::is_complex) {
-                            value += static_cast<R>(std::norm(x));
+                            value += static_cast<R>(tensorplay::norm(x));
                         } else {
                             value += x * x;
                         }
