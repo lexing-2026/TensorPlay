@@ -29,6 +29,7 @@ jobs:
       cuda: ${{ steps.read-matrix.outputs.cuda }}
       cuda_trunk: ${{ steps.read-matrix.outputs.cuda_trunk }}
       run_cuda: ${{ steps.lanes.outputs.run_cuda }}
+      build_skip: ${{ steps.build-skip.outputs.skip }}
       nightly_version: ${{ steps.nightly-version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
@@ -123,9 +124,33 @@ jobs:
           fi
           echo "run_cuda=$run_cuda" >> "$GITHUB_OUTPUT"
 
+      - id: build-skip
+        if: ${{ github.event_name == 'push' && github.ref_type == 'branch' && github.ref_name == 'main' }}
+        shell: bash
+        env:
+          GH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          # CI/docs-only pushes cannot change wheel contents, so the whole
+          # build matrix is skipped; the next code-bearing push publishes
+          # fresh same-day nightly wheels and the scheduled nightly run
+          # fills any gaps. Tags, release branches and manual dispatches
+          # always build because their wheels get published.
+          skip=false
+          if git rev-parse --verify -q "$GH_BEFORE^{commit}" >/dev/null; then
+            if [[ -z "$(git diff --name-only "$GH_BEFORE"...HEAD \
+                    | grep -vE '^\.github/|^docs/|\.md$|^LICENSE|^\.gitignore' || true)" ]]; then
+              echo "CI/docs-only push; skipping the build matrix"
+              skip=true
+            fi
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
   cpu-build:
     name: ${{ matrix.build_name }}-build-test
     needs: define-wheel-matrix
+    # CI/docs-only pushes publish no new wheel; skip the build matrix.
+    if: needs.define-wheel-matrix.outputs.build_skip != 'true'
     permissions:
       # The called workflow's build-test job needs contents: write to
       # upload wheels to a GitHub Release on tag builds; the job-level grant
@@ -151,7 +176,7 @@ jobs:
     # toolkit); tags and release branches expand to every configured
     # variant, where the wheels are actually published. Pure frontend,
     # docs, or test-only pushes skip these lanes entirely.
-    if: needs.define-wheel-matrix.outputs.run_cuda == 'true'
+    if: needs.define-wheel-matrix.outputs.build_skip != 'true' && needs.define-wheel-matrix.outputs.run_cuda == 'true'
     name: ${{ matrix.build_name }}-build-test
     needs: define-wheel-matrix
     permissions:
