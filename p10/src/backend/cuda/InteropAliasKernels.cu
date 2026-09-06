@@ -51,6 +51,35 @@ namespace {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
+void histc_expand_constant_range(DType dtype, double& lo, double& hi) {
+    switch (dtype) {
+        case DType::Float64:
+            lo = std::min(
+                std::nexttoward(lo, std::numeric_limits<double>::lowest()),
+                lo - 1.0);
+            hi = std::max(
+                std::nexttoward(hi, std::numeric_limits<double>::max()),
+                hi + 1.0);
+            break;
+        case DType::Float32:
+            lo = std::min(
+                static_cast<double>(std::nexttoward(
+                    static_cast<float>(lo),
+                    std::numeric_limits<float>::lowest())),
+                lo - 1.0);
+            hi = std::max(
+                static_cast<double>(std::nexttoward(
+                    static_cast<float>(hi),
+                    std::numeric_limits<float>::max())),
+                hi + 1.0);
+            break;
+        default:
+            lo -= 1.0;
+            hi += 1.0;
+            break;
+    }
+}
+
 // Channel statistics for batch normalization: mean/variance over every
 // dimension except the channel axis, collapsed to one value per channel.
 std::tuple<Tensor, Tensor> batch_norm_channel_stats(const Tensor& input) {
@@ -116,8 +145,8 @@ Tensor interop_histc_cuda(const Tensor& self, int64_t bins, Scalar min, Scalar m
         hi = std::get<1>(extrema).item().toDouble();
     }
     if (lo == hi) {
-        lo = std::min(std::nextafter(lo, -std::numeric_limits<double>::infinity()), lo - 1.0);
-        hi = std::max(std::nextafter(hi, std::numeric_limits<double>::infinity()), hi + 1.0);
+        histc_expand_constant_range(self.dtype(), lo, hi);
+        histc_expand_constant_range(self.dtype(), lo, hi);
     }
     if (!std::isfinite(lo) || !std::isfinite(hi)) {
         TP_THROW(RuntimeError, "histc: range of [", lo, ", ", hi,
