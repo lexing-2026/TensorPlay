@@ -157,6 +157,9 @@ public:
         }
         if (selected == DispatchKey::DynamicLayerBackMode) {
             transform::DynamicLayerBackGuard guard;
+            if (guard.at_base()) {
+                (transform::check_no_batched_argument(args), ...);
+            }
             return call(handle, key, std::forward<Args>(args)...);
         }
         key = selected;

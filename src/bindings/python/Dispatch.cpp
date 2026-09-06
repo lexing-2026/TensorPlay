@@ -30,6 +30,9 @@ const tensorplay::DispatchKey kDumpKeys[] = {
     tensorplay::DispatchKey::VmapCUDA,
     tensorplay::DispatchKey::VmapVulkan,
     tensorplay::DispatchKey::Composite,
+    tensorplay::DispatchKey::VmapMode,
+    tensorplay::DispatchKey::DynamicLayerFrontMode,
+    tensorplay::DispatchKey::DynamicLayerBackMode,
 };
 
 tensorplay::DispatchKey parse_key_or_throw(const std::string& name) {
@@ -48,6 +51,9 @@ tensorplay::DispatchKey parse_key_or_throw(const std::string& name) {
             {"VmapCUDA", tensorplay::DispatchKey::VmapCUDA},
             {"VmapVulkan", tensorplay::DispatchKey::VmapVulkan},
             {"Composite", tensorplay::DispatchKey::Composite},
+            {"VmapMode", tensorplay::DispatchKey::VmapMode},
+            {"DynamicLayerFrontMode", tensorplay::DispatchKey::DynamicLayerFrontMode},
+            {"DynamicLayerBackMode", tensorplay::DispatchKey::DynamicLayerBackMode},
         };
     auto it = kByName.find(name);
     if (it == kByName.end()) {
@@ -139,6 +145,9 @@ void init_dispatch(py::module_& m) {
         .value("VmapCUDA", tensorplay::DispatchKey::VmapCUDA)
         .value("VmapVulkan", tensorplay::DispatchKey::VmapVulkan)
         .value("Composite", tensorplay::DispatchKey::Composite)
+        .value("VmapMode", tensorplay::DispatchKey::VmapMode)
+        .value("DynamicLayerFrontMode", tensorplay::DispatchKey::DynamicLayerFrontMode)
+        .value("DynamicLayerBackMode", tensorplay::DispatchKey::DynamicLayerBackMode)
         .export_values();
 
     m.def("_dispatch_key_name", [](tensorplay::DispatchKey key) {

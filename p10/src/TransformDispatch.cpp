@@ -82,6 +82,19 @@ DynamicLayerBackGuard::~DynamicLayerBackGuard() {
     impl::force_tls_local_dispatch_key_set(saved_keys_);
 }
 
+bool DynamicLayerBackGuard::at_base() const {
+    return layers.empty();
+}
+
+void check_no_batched_argument(const Tensor& tensor) {
+    TP_CHECK(!tensor.defined() || !tensor.is_batched(),
+             "a batch wrapper reached the base interpreter without being unwrapped");
+}
+
+void check_no_batched_argument(const std::optional<Tensor>& tensor) {
+    if (tensor.has_value()) check_no_batched_argument(*tensor);
+}
+
 DisableTransformsGuard::DisableTransformsGuard()
     : saved_keys_(impl::tls_local_dispatch_key_set()) {
     ++disabled_depth;

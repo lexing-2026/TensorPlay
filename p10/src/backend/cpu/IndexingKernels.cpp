@@ -1005,8 +1005,8 @@ Tensor& index_fill_tensor__cpu(Tensor& self, int64_t dim, const Tensor& index, c
 // ---------------------------------------------------------------------------
 // index_put / index_put_
 //
-// _index_put_impl_ (linearized indices; accumulate=True adds instead of
-// assigning).
+// Native advanced indexing preserves destination strides and broadcasts
+// values over the indexed result shape.
 // ---------------------------------------------------------------------------
 
 

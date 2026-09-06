@@ -1369,13 +1369,8 @@ static void assign_native_index_plan(Tensor& self, const NativeIndexPlan& plan,
 
     Tensor index = Tensor::tensor(plan.linear_indices, DType::Int64);
     if (!self.device().is_cpu()) index = index.to(self.device());
-    // A single index tensor is deliberately used here: index_put_'s backend
-    // interprets one index as a linear offset, which is exactly what the
-    // planner produced.  Cloning rhs makes overlapping assignments (e.g.
-    // The backend's linear writer is contiguous-only, however.  Stage through
-    // a contiguous clone for a transposed/sliced destination, then copy the
-    // logical result back through TensorIterator so the view's strides are
-    // honored.
+    // The planner's offsets address the flattened logical destination.
+    // A non-contiguous destination is copied back through its original strides.
     Tensor target = self.is_contiguous() ? self : self.contiguous();
     Tensor flat_target = target.view({-1});
     tensorplay::tpx::ops::index_put_(
