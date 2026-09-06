@@ -2781,13 +2781,14 @@ __global__ void unique_counts_kernel(int64_t num_groups, int64_t n,
 std::tuple<Tensor, Tensor, Tensor> unique_cuda(const Tensor& self, bool sorted,
                                                bool return_inverse,
                                                bool return_counts) {
-    TP_CHECK(self.dim() <= 1 || self.numel() == self.size(-1),
-             "unique: only 1D tensors are supported");
     Tensor flat = self.contiguous().reshape({self.numel()});
     const int64_t n = flat.numel();
 
     Tensor values = Tensor::empty({0}, self.dtype(), self.device());
-    Tensor inverse = return_inverse ? Tensor::empty({0}, DType::Int64, self.device())
+    Tensor inverse = return_inverse
+                         ? Tensor::empty(
+                               static_cast<std::vector<int64_t>>(self.shape()),
+                               DType::Int64, self.device())
                                     : Tensor();
     Tensor counts = return_counts ? Tensor::empty({0}, DType::Int64, self.device())
                                   : Tensor();
