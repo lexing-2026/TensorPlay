@@ -8,7 +8,9 @@ body:
       value: |
         Performance reports need measured numbers with hardware, shapes and
         methodology (e.g. "min-of-200, RTX 4090 D"), the same convention used
-        in CHANGELOG.md. Reports without numbers will be closed.
+        in CHANGELOG.md. Reports without numbers will be closed. A [contribution
+        guide](https://github.com/lexing-2026/TensorPlay/blob/main/docs/README.md)
+        for benchmark methodology is available.
   - type: textarea
     id: version
     attributes:
@@ -51,6 +53,24 @@ body:
     id: repro
     attributes:
       label: Reproduction / benchmark script
+      description: Self-contained and runnable on the hardware above.
       render: python
     validations:
       required: true
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before submitting
+      options:
+        - label: Numbers come from a fresh process with proper warmup (not a cold first run)
+          required: true
+        - label: I re-measured the good version on the same machine and settings
+          required: true
+        - label: The report contains no secrets or personal information
+          required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+    validations:
+      required: false

@@ -7,6 +7,10 @@ body:
     attributes:
       value: |
         Thanks for taking the time to fill out this bug report!
+
+        Before submitting, please [search existing issues](https://github.com/lexing-2026/TensorPlay/issues?q=is%3Aissue+is%3Aopen+label%3Abug)
+        to avoid duplicates. Security vulnerabilities must be reported
+        privately via [GitHub Security Advisories](https://github.com/lexing-2026/TensorPlay/security), not here.
   - type: textarea
     id: version
     attributes:
@@ -50,6 +54,24 @@ body:
       placeholder: "3.11"
     validations:
       required: true
+  - type: dropdown
+    id: regression
+    attributes:
+      label: Did this work in a previous version?
+      description: If yes, add the working version below — regressions are prioritized.
+      options:
+        - "Yes (specify version in the context below)"
+        - "No (first time using it)"
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: working-version
+    attributes:
+      label: Last known working version (regressions only)
+      placeholder: "1.0.0.dev20260901"
+    validations:
+      required: false
   - type: input
     id: cuda
     attributes:
@@ -61,7 +83,7 @@ body:
     id: repro
     attributes:
       label: Minimal reproduction
-      description: A self-contained script we can run to reproduce the issue.
+      description: A self-contained script we can run to reproduce the issue. Trim it to the smallest code that still fails — scripts that crash on the first line slow everyone down.
       render: python
     validations:
       required: true
@@ -78,6 +100,17 @@ body:
       description: Include the full traceback or wrong-result details.
     validations:
       required: true
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched for existing issues and could not find this bug
+          required: true
+        - label: The reproduction above is self-contained and runs without edits
+          required: true
+        - label: The report contains no secrets or personal information
+          required: true
   - type: textarea
     id: context
     attributes:
