@@ -727,21 +727,35 @@ std::tuple<Tensor, Tensor> kthvalue_cpu(const Tensor& self, int64_t k,
     return {values, indices};
 }
 
+template <typename scalar_t>
+int64_t count_nonzero_flat_cpu_impl(const Tensor& self) {
+    Tensor input = self.contiguous();
+    const scalar_t* input_data = input.data_ptr<scalar_t>();
+    std::vector<int64_t> thread_counts(
+        static_cast<size_t>(get_num_threads()), 0);
+    parallel_for(0, input.numel(), GRAIN_SIZE,
+                 [&](int64_t begin, int64_t end) {
+        int64_t local_count = 0;
+        for (int64_t i = begin; i < end; ++i) {
+            local_count += static_cast<bool>(input_data[i]) ? 1 : 0;
+        }
+        thread_counts[static_cast<size_t>(get_thread_num())] += local_count;
+    });
+    int64_t count = 0;
+    for (const int64_t thread_count : thread_counts) count += thread_count;
+    return count;
+}
+
 Tensor count_nonzero_cpu(const Tensor& self, const std::vector<int64_t>& dim) {
     if (dim.empty()) {
         int64_t count = 0;
-        Tensor sc = self.contiguous();
-        for (int64_t i = 0; i < sc.numel(); ++i) {
-            bool nonzero = false;
-            switch (sc.dtype()) {
 #define TP_COUNT_CASE(ctype, name_) \
-    case DType::name_: nonzero = static_cast<bool>(sc.data_ptr<ctype>()[i]); break;
-                TENSORPLAY_FORALL_SCALAR_TYPES(TP_COUNT_CASE)
-#undef TP_COUNT_CASE
-                default: break;
-            }
-            if (nonzero) ++count;
+    case DType::name_: count = count_nonzero_flat_cpu_impl<ctype>(self); break;
+        switch (self.dtype()) {
+            TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_COUNT_CASE)
+            default: TP_THROW(TypeError, "count_nonzero: unsupported dtype");
         }
+#undef TP_COUNT_CASE
         return Tensor::zeros({}, DType::Int64, self.device()).fill_(Scalar(count));
     }
     return reduce_dims_impl<double>(
