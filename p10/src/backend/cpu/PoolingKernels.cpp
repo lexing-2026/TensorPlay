@@ -32,6 +32,26 @@ static std::pair<int64_t, int64_t> get_pair(const std::vector<int64_t>& list, in
     return {list[0], list[1]};
 }
 
+static Tensor& write_pooling_out(const char* op, const Tensor& value, Tensor& out) {
+    if (!out.defined()) {
+        out = value;
+        return out;
+    }
+    if (out.dtype() != value.dtype()) {
+        TP_THROW(TypeError, op, ": output dtype must match result dtype");
+    }
+    if (out.device() != value.device()) {
+        TP_THROW(DeviceMismatchError,
+                 op, ": output device must match input device");
+    }
+    const auto target = static_cast<std::vector<int64_t>>(value.shape());
+    if (static_cast<std::vector<int64_t>>(out.shape()) != target) {
+        out.resize_(target);
+    }
+    out.copy_(value);
+    return out;
+}
+
 static std::pair<int64_t, int64_t> get_pair_from_kernel(const std::vector<int64_t>& list, const std::vector<int64_t>& kernel) {
     if (list.empty()) return get_pair(kernel);
     return get_pair(list);
@@ -757,6 +777,15 @@ std::tuple<Tensor, Tensor> adaptive_max_pool2d_with_indices_cpu(const Tensor& in
     return std::make_tuple(out, indices);
 }
 
+std::tuple<Tensor, Tensor> adaptive_max_pool2d_out_cpu(
+        const Tensor& input, const std::vector<int64_t>& output_size,
+        Tensor& out, Tensor& indices) {
+    auto values = adaptive_max_pool2d_with_indices_cpu(input, output_size);
+    write_pooling_out("adaptive_max_pool2d", std::get<0>(values), out);
+    write_pooling_out("adaptive_max_pool2d", std::get<1>(values), indices);
+    return {out, indices};
+}
+
 Tensor adaptive_max_pool2d_with_indices_backward_cpu(const Tensor& grad_output, const Tensor& input,
                                                      const std::vector<int64_t>& output_size, const Tensor& indices) {
     (void)output_size;
@@ -1404,10 +1433,17 @@ Tensor max_pool3d_with_indices_backward_cpu(
     return grad_input;
 }
 
-// average pool; indices are linear offsets into the (D, H, W) volume.
-Tensor adaptive_max_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& output_size) {
-    if (input.dim() == 4)
-        return adaptive_max_pool3d_cpu(input.unsqueeze(0), output_size).squeeze(0);
+// Indices are linear offsets into the (D, H, W) volume.
+Tensor adaptive_max_pool3d_impl(const Tensor& input,
+                                const std::vector<int64_t>& output_size,
+                                Tensor* indices_out) {
+    if (input.dim() == 4) {
+        Tensor indices;
+        Tensor out = adaptive_max_pool3d_impl(
+            input.unsqueeze(0), output_size, indices_out ? &indices : nullptr);
+        if (indices_out) *indices_out = indices.squeeze(0);
+        return out.squeeze(0);
+    }
     if (input.dim() != 5) TP_THROW(RuntimeError, "adaptive_max_pool3d: Expected 5D input");
     const Tensor input_c = input.contiguous();
     const int64_t N = input_c.size(0), C = input_c.size(1);
@@ -1416,8 +1452,14 @@ Tensor adaptive_max_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& 
     if (oD <= 0 || oH <= 0 || oW <= 0)
         TP_THROW(RuntimeError, "adaptive_max_pool3d: Invalid output size");
     Tensor out = Tensor::empty({N, C, oD, oH, oW}, input.dtype(), input.device());
+    Tensor indices;
+    if (indices_out) {
+        indices = Tensor::empty({N, C, oD, oH, oW}, DType::Int64, input.device());
+        *indices_out = indices;
+    }
     TP_DISPATCH_ALL_TYPES(input.dtype(), "adaptive_max_pool3d", [&]() {
         scalar_t* op = out.data_ptr<scalar_t>();
+        int64_t* idxp = indices_out ? indices.data_ptr<int64_t>() : nullptr;
         const scalar_t* ip = input_c.data_ptr<scalar_t>();
         const int64_t in_plane = D * H * W;
         const int64_t out_plane = oD * oH * oW;
@@ -1435,15 +1477,22 @@ Tensor adaptive_max_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& 
                             const int64_t ws = w * W / oW;
                             const int64_t we = 1 + (((w + 1) * W) - 1) / oW;
                             scalar_t max_val = -std::numeric_limits<scalar_t>::infinity();
+                            int64_t max_idx = -1;
                             for (int64_t z = ds; z < de; ++z)
                             for (int64_t y = hs; y < he; ++y) {
-                                const scalar_t* row = vol + (z * H + y) * W;
+                                const int64_t row_off = (z * H + y) * W;
+                                const scalar_t* row = vol + row_off;
                                 for (int64_t x = ws; x < we; ++x) {
                                     const scalar_t val = row[x];
-                                    if ((val > max_val) || std::isnan(val)) max_val = val;
+                                    if ((val > max_val) || std::isnan(val)) {
+                                        max_val = val;
+                                        if (indices_out) max_idx = row_off + x;
+                                    }
                                 }
                             }
-                            out_base[(d * oH + h) * oW + w] = max_val;
+                            const int64_t out_idx = (d * oH + h) * oW + w;
+                            out_base[out_idx] = max_val;
+                            if (indices_out) idxp[nc * out_plane + out_idx] = max_idx;
                         }
                     }
                 }
@@ -1451,6 +1500,27 @@ Tensor adaptive_max_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& 
         });
     });
     return out;
+}
+
+std::tuple<Tensor, Tensor> adaptive_max_pool3d_with_indices_cpu(
+        const Tensor& input, const std::vector<int64_t>& output_size) {
+    Tensor indices;
+    Tensor out = adaptive_max_pool3d_impl(input, output_size, &indices);
+    return {out, indices};
+}
+
+Tensor adaptive_max_pool3d_cpu(const Tensor& input,
+                               const std::vector<int64_t>& output_size) {
+    return adaptive_max_pool3d_impl(input, output_size, nullptr);
+}
+
+std::tuple<Tensor, Tensor> adaptive_max_pool3d_out_cpu(
+        const Tensor& input, const std::vector<int64_t>& output_size,
+        Tensor& out, Tensor& indices) {
+    auto values = adaptive_max_pool3d_with_indices_cpu(input, output_size);
+    write_pooling_out("adaptive_max_pool3d", std::get<0>(values), out);
+    write_pooling_out("adaptive_max_pool3d", std::get<1>(values), indices);
+    return {out, indices};
 }
 
 Tensor adaptive_max_pool3d_backward_cpu(const Tensor& grad_output, const Tensor& input) {
@@ -1524,6 +1594,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PoolingKernels) {
     m.impl("adaptive_max_pool2d_backward", adaptive_max_pool2d_backward_cpu);
     m.impl("adaptive_max_pool2d_with_indices", adaptive_max_pool2d_with_indices_cpu);
     m.impl("adaptive_max_pool2d_with_indices_backward", adaptive_max_pool2d_with_indices_backward_cpu);
+    m.impl("adaptive_max_pool2d.out", adaptive_max_pool2d_out_cpu);
     m.impl("max_pool2d_with_indices", max_pool2d_with_indices_cpu);
     m.impl("max_pool2d_with_indices_backward", max_pool2d_with_indices_backward_cpu);
     m.impl("max_pool3d_backward", max_pool3d_backward_cpu);
@@ -1531,6 +1602,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PoolingKernels) {
     m.impl("max_pool3d_with_indices_backward", max_pool3d_with_indices_backward_cpu);
     m.impl("adaptive_max_pool3d", adaptive_max_pool3d_cpu);
     m.impl("adaptive_max_pool3d_backward", adaptive_max_pool3d_backward_cpu);
+    m.impl("adaptive_max_pool3d.out", adaptive_max_pool3d_out_cpu);
 }
 
 } // namespace cpu
