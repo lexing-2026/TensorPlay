@@ -1887,7 +1887,7 @@ Tensor scatter_base_cuda(const Tensor& self, int64_t dim, const Tensor& index,
     if (src_b.dtype() != self.dtype()) {
         src_b = src_b.to(self.dtype());
     }
-    Tensor result = detail::contiguous_clone(self);
+    Tensor result = ::tensorplay::detail::contiguous_clone(self);
     int64_t idx_outer = 1;
     for (int64_t i = 0; i < dim; ++i) idx_outer *= idx_c.size(i);
     int64_t idx_inner = 1;
@@ -2088,7 +2088,7 @@ Tensor index_add_cuda(const Tensor& self, int64_t dim, const Tensor& index, cons
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
     Tensor idx = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
-    Tensor result = detail::contiguous_clone(self);
+    Tensor result = ::tensorplay::detail::contiguous_clone(self);
     int64_t n_idx = idx.numel();
     if (n_idx == 0) return result;
     int64_t row = self.size(dim);
@@ -2159,7 +2159,7 @@ Tensor index_copy_cuda(const Tensor& self, int64_t dim, const Tensor& index, con
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
     Tensor idx = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
-    Tensor result = detail::contiguous_clone(self);
+    Tensor result = ::tensorplay::detail::contiguous_clone(self);
     int64_t n_idx = idx.numel();
     if (n_idx == 0) return result;
     int64_t row = self.size(dim);
@@ -2199,7 +2199,7 @@ Tensor index_fill_scalar_cuda(const Tensor& self, int64_t dim, const Tensor& ind
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
     Tensor idx = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
-    Tensor result = detail::contiguous_clone(self);
+    Tensor result = ::tensorplay::detail::contiguous_clone(self);
     int64_t n_idx = idx.numel();
     if (n_idx == 0) return result;
     int64_t row = self.size(dim);
@@ -2298,7 +2298,7 @@ Tensor index_put_impl_cuda(Tensor& result, const std::vector<Tensor>& indices,
 
 Tensor index_put_cuda(const Tensor& self, const std::vector<Tensor>& indices,
                       const Tensor& values, bool accumulate) {
-    Tensor result = detail::contiguous_clone(self);
+    Tensor result = ::tensorplay::detail::contiguous_clone(self);
     return index_put_impl_cuda(result, indices, values, accumulate);
 }
 
@@ -2686,7 +2686,7 @@ Tensor masked_scatter_cuda(const Tensor& self, const Tensor& mask, const Tensor&
     Tensor m_full = mask.to(DType::Bool).expand(
         static_cast<std::vector<int64_t>>(self.shape())).contiguous();
     Tensor src = source.contiguous();
-    Tensor result = detail::contiguous_clone(self);
+    Tensor result = ::tensorplay::detail::contiguous_clone(self);
     int64_t n = result.numel();
     if (n == 0) return result;
     Tensor mask_int = m_full.reshape({n}).to(DType::Int64);
@@ -3618,7 +3618,7 @@ Tensor sr_forward_cuda_impl(const Tensor& self, int64_t dim,
         TP_THROW(DeviceMismatchError,
                  "scatter_reduce: self, index, and src must be on the same device");
     }
-    if (index.numel() == 0) return detail::contiguous_clone(self);
+    if (index.numel() == 0) return ::tensorplay::detail::contiguous_clone(self);
     Tensor idx_c = (index.dtype() == DType::Int64)
                        ? index.contiguous()
                        : index.to(DType::Int64).contiguous();
@@ -3676,7 +3676,7 @@ Tensor sr_forward_cuda_impl(const Tensor& self, int64_t dim,
                  " with size ", self_dim_size);
     }
 
-    Tensor result = detail::contiguous_clone(self);
+    Tensor result = ::tensorplay::detail::contiguous_clone(self);
     Tensor count;
     int64_t* cp = nullptr;
     if (op == SrReduceCuda::Mean) {
@@ -3823,7 +3823,7 @@ Tensor ir_forward_cuda_impl(const Tensor& self, int64_t dim,
     int64_t self_inner = 1;
     for (int64_t i = dim + 1; i < nd; ++i) self_inner *= self.size(i);
 
-    Tensor result = detail::contiguous_clone(self);
+    Tensor result = ::tensorplay::detail::contiguous_clone(self);
     Tensor count;
     int64_t* cp = nullptr;
     if (reduce == "mean") {
