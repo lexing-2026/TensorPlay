@@ -1662,16 +1662,6 @@ Tensor atan2_kernel_cuda(const Tensor& self, const Tensor& other) { return binar
 
 // --- Lerp ---
 template <typename T>
-__global__ void lerp_scalar_kernel_cuda_impl(int64_t n, const T* start, const T* end, T* output, T weight) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        output[i] = (std::abs(weight) < T(0.5))
-            ? start[i] + weight * (end[i] - start[i])
-            : end[i] - (end[i] - start[i]) * (static_cast<T>(1) - weight);
-    }
-}
-
-template <typename T>
 __global__ void lerp_tensor_kernel_cuda_impl(int64_t n, const T* start, const T* end, const T* weight, T* output) {
     int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -1686,21 +1676,6 @@ __global__ void lerp_tensor_kernel_cuda_impl(int64_t n, const T* start, const T*
 // contract for TensorPlay's reduced floating types as well; doing the
 // recurrence through separate mul/add TensorIterator launches rounds twice
 // and is observable in optimizer moment buffers.
-template <typename T>
-__global__ void lerp_scalar_reduced_kernel_cuda_impl(
-        int64_t n, const T* start, const T* end, T* output, float weight) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) {
-        const float s = static_cast<float>(start[i]);
-        const float e = static_cast<float>(end[i]);
-        const float value = (fabsf(weight) < 0.5f)
-            ? s + weight * (e - s)
-            : e - (e - s) * (1.0f - weight);
-        output[i] = static_cast<T>(value);
-    }
-}
-
 template <typename T>
 __global__ void lerp_tensor_reduced_kernel_cuda_impl(
         int64_t n, const T* start, const T* end, const T* weight, T* output) {
@@ -1720,34 +1695,60 @@ __global__ void lerp_tensor_reduced_kernel_cuda_impl(
 Tensor lerp_scalar_kernel_cuda(const Tensor& self, const Tensor& end, Scalar weight) {
     if (self.shape() != end.shape()) TP_THROW(RuntimeError, "CUDA lerp: broadcasting not supported");
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
-    int64_t n = self.numel();
-    dim3 block(256);
-    dim3 grid((n + 255) / 256);
+    if (self.numel() == 0) return result;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(result)
+        .add_const_input(self)
+        .add_const_input(end)
+        .build();
 
-    Tensor self_c = self.contiguous();
-    Tensor end_c = end.contiguous();
-
-    #define LERP_CASE(ctype, name) \
-    case DType::name: { \
-        lerp_scalar_kernel_cuda_impl<ctype><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self_c.data_ptr<ctype>(), end_c.data_ptr<ctype>(), result.data_ptr<ctype>(), weight.to<ctype>()); \
-        break; \
-    }
     switch (self.dtype()) {
-        LERP_CASE(float, Float32)
-        LERP_CASE(double, Float64)
-        case DType::Float16:
-            lerp_scalar_reduced_kernel_cuda_impl<Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
-                n, self_c.data_ptr<Half>(), end_c.data_ptr<Half>(),
-                result.data_ptr<Half>(), weight.to<float>());
+        case DType::Float32: {
+            const float weight_value = weight.to<float>();
+            gpu_kernel(iter, [weight_value] __device__(float start, float finish) -> float {
+                return (fabsf(weight_value) < 0.5f)
+                    ? start + weight_value * (finish - start)
+                    : finish - (finish - start) * (1.0f - weight_value);
+            });
             break;
-        case DType::BFloat16:
-            lerp_scalar_reduced_kernel_cuda_impl<BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
-                n, self_c.data_ptr<BFloat16>(), end_c.data_ptr<BFloat16>(),
-                result.data_ptr<BFloat16>(), weight.to<float>());
+        }
+        case DType::Float64: {
+            const double weight_value = weight.to<double>();
+            gpu_kernel(iter, [weight_value] __device__(double start, double finish) -> double {
+                return (fabs(weight_value) < 0.5)
+                    ? start + weight_value * (finish - start)
+                    : finish - (finish - start) * (1.0 - weight_value);
+            });
             break;
+        }
+        case DType::Float16: {
+            const float weight_value = weight.to<float>();
+            gpu_kernel(iter, [weight_value] __device__(Half start, Half finish) -> Half {
+                const float s = static_cast<float>(start);
+                const float e = static_cast<float>(finish);
+                const float value = (fabsf(weight_value) < 0.5f)
+                    ? s + weight_value * (e - s)
+                    : e - (e - s) * (1.0f - weight_value);
+                return static_cast<Half>(value);
+            });
+            break;
+        }
+        case DType::BFloat16: {
+            const float weight_value = weight.to<float>();
+            gpu_kernel(iter, [weight_value] __device__(BFloat16 start,
+                                                        BFloat16 finish) -> BFloat16 {
+                const float s = static_cast<float>(start);
+                const float e = static_cast<float>(finish);
+                const float value = (fabsf(weight_value) < 0.5f)
+                    ? s + weight_value * (e - s)
+                    : e - (e - s) * (1.0f - weight_value);
+                return static_cast<BFloat16>(value);
+            });
+            break;
+        }
         default: TP_THROW(NotImplementedError, "CUDA lerp: unsupported dtype");
     }
-    #undef LERP_CASE
     return result;
 }
 
