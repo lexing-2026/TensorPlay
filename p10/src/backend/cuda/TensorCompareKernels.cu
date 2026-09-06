@@ -6,7 +6,10 @@
 #include "CUDARuntime.h"
 
 #include <cuda_runtime.h>
+#include <thrust/complex.h>
 
+#include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <complex>
 #include <cstdint>
@@ -37,6 +40,79 @@ inline std::vector<int64_t> shape_of(const Tensor& t) {
 void launch_ew(dim3& grid, dim3& block, int64_t n) {
     block = dim3(kThreads);
     grid = dim3(static_cast<unsigned>((n + kThreads - 1) / kThreads));
+}
+
+constexpr size_t kAssertMessageCapacity = 256;
+
+struct AssertMessage {
+    char text[kAssertMessageCapacity];
+};
+
+template <typename T>
+__global__ void assert_async_kernel_impl(const T* input, AssertMessage message) {
+    if (input[0] == static_cast<T>(0)) {
+        printf("%s\n", message.text);
+        assert(false);
+    }
+}
+
+template <typename T>
+__global__ void assert_async_complex_kernel_impl(
+        const thrust::complex<T>* input, AssertMessage message) {
+    if (input[0] == thrust::complex<T>(0, 0)) {
+        printf("%s\n", message.text);
+        assert(false);
+    }
+}
+
+AssertMessage make_assert_message(const std::string& assert_msg) {
+    if (assert_msg.size() >= kAssertMessageCapacity - 1) {
+        TP_THROW(ValueError, "assert_async: message is too long");
+    }
+    AssertMessage message{};
+    std::copy_n(assert_msg.data(), assert_msg.size(), message.text);
+    return message;
+}
+
+void assert_async_msg_cuda(const Tensor& self, std::string assert_msg) {
+    const int64_t n = self.numel();
+    if (n == 0) {
+        TP_THROW(RuntimeError,
+                 "Boolean value of Tensor with no values is ambiguous");
+    }
+    if (n > 1) {
+        TP_THROW(RuntimeError,
+                 "Boolean value of Tensor with more than one value is ambiguous");
+    }
+
+    const AssertMessage message = make_assert_message(assert_msg);
+    const auto stream = getCurrentCUDAStream().stream();
+#define TP_ASSERT_CASE(ctype, name_) \
+    case DType::name_: \
+        assert_async_kernel_impl<ctype><<<1, 1, 0, stream>>>( \
+            self.data_ptr<ctype>(), message); \
+        break;
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_ASSERT_CASE)
+        case DType::ComplexFloat:
+            assert_async_complex_kernel_impl<float><<<1, 1, 0, stream>>>(
+                reinterpret_cast<const thrust::complex<float>*>(
+                    self.data_ptr<std::complex<float>>()), message);
+            break;
+        case DType::ComplexDouble:
+            assert_async_complex_kernel_impl<double><<<1, 1, 0, stream>>>(
+                reinterpret_cast<const thrust::complex<double>*>(
+                    self.data_ptr<std::complex<double>>()), message);
+            break;
+        default:
+            TP_THROW(TypeError, "assert_async: unsupported dtype");
+    }
+#undef TP_ASSERT_CASE
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void assert_async_cuda(const Tensor& self) {
+    assert_async_msg_cuda(self, std::string());
 }
 
 
@@ -125,6 +201,8 @@ Tensor isreal_cuda(const Tensor& self) {
 
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, TensorCompareKernels) {
+    m.impl("_assert_async", assert_async_cuda);
+    m.impl("_assert_async.msg", assert_async_msg_cuda);
     m.impl("isclose", isclose_cuda);
     m.impl("isreal", isreal_cuda);
 }
