@@ -115,9 +115,10 @@ def test_block_is_the_power_of_two_above_the_extent():
 
 
 def test_wide_rows_keep_their_existing_route():
-    fusion = _plan(softmax, (4, 1 << 15))
-    assert fusion is not None
-    assert not row.supported(fusion)
+    # A row that fills the tile budget still compiles; one wider than it
+    # would only spill, so it keeps whatever route it had.
+    assert row.supported(_plan(softmax, (4, 8192)))
+    assert not row.supported(_plan(softmax, (4, 1 << 14)))
 
 
 # ---------------------------------------------------------------------------

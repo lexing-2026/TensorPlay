@@ -29,10 +29,11 @@ from typing import Any, Callable, Optional
 
 from .cpp_rowfusion import _ROW_BINARY, _ROW_UNARY, RowFusion
 
-# A row wider than this keeps its existing route: the whole row is resident
-# while the stages run, and past this width that costs more register file
-# than the kernel it saves is worth.
-_MAX_ROW = 16384
+# Values one program holds at once.  The row is resident while the stages
+# run, so this is the register budget: a narrow row shares the tile with its
+# neighbours, and a row wider than the whole budget keeps its existing route
+# rather than compiling to a kernel that would spill.
+_TILE_BUDGET = 8192
 
 
 def _triton_module():
@@ -127,7 +128,7 @@ def supported(fusion: RowFusion) -> bool:
 
     if fusion.reduce_extent <= 0 or fusion.rows <= 0:
         return False
-    if fusion.reduce_extent > _MAX_ROW:
+    if fusion.reduce_extent > _TILE_BUDGET:
         return False
     if any(step.op not in _REDUCE_FOLD for step in fusion.steps if step.kind == "reduce"):
         return False
@@ -251,10 +252,10 @@ def _tile_configs(block: int) -> list[tuple[int, int]]:
     """
 
     rows_per_program = [
-        count for count in (1, 2, 4, 8, 16) if count * block <= 8192
+        count for count in (1, 2, 4, 8, 16) if count * block <= _TILE_BUDGET
     ] or [1]
     configs: list[tuple[int, int]] = []
-    for count in rows_per_program[:3]:
+    for count in rows_per_program[:4]:
         # One warp per 256 values of the tile is the shape that keeps every
         # lane busy without splitting the reduction tree too finely; the
         # wider neighbour covers the cases where it does not.  Six candidates
