@@ -874,7 +874,12 @@ __global__ void index_put_kernel(int64_t n, T* d, const int64_t* ip, const T* vp
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += stride) {
         if constexpr (Accumulate) {
-            if constexpr (scatter_add_supported_v<T>) {
+            if constexpr (
+                scatter_add_supported_v<T> ||
+                std::is_same_v<T, tensorplay::complex<float>> ||
+                std::is_same_v<T, tensorplay::complex<double>> ||
+                std::is_same_v<T, tensorplay::complex<Half>> ||
+                std::is_same_v<T, tensorplay::complex<BFloat16>>) {
                 indexed_atomic_add(&d[ip[i]], vp[i]);
             }
         }
@@ -2337,10 +2342,16 @@ Tensor index_put_impl_cuda(Tensor& result, const std::vector<Tensor>& indices,
 #define TP_IP_ACC_CASE(ctype, name) \
             case DType::name: \
                 index_put_kernel<ctype, true><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-                    n, result.data_ptr<ctype>(), flat_idx.data_ptr<int64_t>(), vals.data_ptr<ctype>()); \
+                    n, static_cast<ctype*>(result.data_ptr()), \
+                    flat_idx.data_ptr<int64_t>(), \
+                    static_cast<const ctype*>(vals.data_ptr())); \
                 break;
         switch (result.dtype()) {
             TENSORPLAY_FORALL_SCALAR_TYPES(TP_IP_ACC_CASE)
+            TP_IP_ACC_CASE(tensorplay::complex<Half>, ComplexHalf)
+            TP_IP_ACC_CASE(tensorplay::complex<float>, ComplexFloat)
+            TP_IP_ACC_CASE(tensorplay::complex<double>, ComplexDouble)
+            TP_IP_ACC_CASE(tensorplay::complex<BFloat16>, BComplex32)
 #undef TP_IP_ACC_CASE
             default:
                 TP_THROW(NotImplementedError, "index_put accumulate=True on CUDA does not support this dtype");
@@ -2349,10 +2360,17 @@ Tensor index_put_impl_cuda(Tensor& result, const std::vector<Tensor>& indices,
 #define TP_IP_CASE(ctype, name) \
         case DType::name: \
             index_put_kernel<ctype, false><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-                n, result.data_ptr<ctype>(), flat_idx.data_ptr<int64_t>(), vals.data_ptr<ctype>()); \
+                n, static_cast<ctype*>(result.data_ptr()), \
+                flat_idx.data_ptr<int64_t>(), \
+                static_cast<const ctype*>(vals.data_ptr())); \
             break;
         switch (result.dtype()) {
             TENSORPLAY_FORALL_SCALAR_TYPES(TP_IP_CASE)
+            TENSORPLAY_FORALL_FP8_TYPES(TP_IP_CASE)
+            TP_IP_CASE(tensorplay::complex<Half>, ComplexHalf)
+            TP_IP_CASE(tensorplay::complex<float>, ComplexFloat)
+            TP_IP_CASE(tensorplay::complex<double>, ComplexDouble)
+            TP_IP_CASE(tensorplay::complex<BFloat16>, BComplex32)
             default: TP_THROW(TypeError, "index_put: unsupported dtype");
         }
 #undef TP_IP_CASE
