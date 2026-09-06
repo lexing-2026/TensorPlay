@@ -7,6 +7,7 @@
 #include "TypePromotion.h"
 #include "Quantizer.h"
 #include "CUDARuntime.h"
+#include "CUDALoops.cuh"
 
 #include <cuda_runtime.h>
 
@@ -200,20 +201,6 @@ __global__ void flip_dim_kernel(int64_t n, int64_t size, int64_t stride,
     for (; li < n; li += grid_stride) {
         const int64_t dim_index = (li / stride) % size;
         const int64_t src_index = li + (size - 1 - 2 * dim_index) * stride;
-        dst[li] = src[src_index];
-    }
-}
-
-template <typename T>
-__global__ void roll_dim_kernel(int64_t n, int64_t size, int64_t stride,
-                                int64_t shift, const T* src, T* dst) {
-    int64_t li = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t grid_stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; li < n; li += grid_stride) {
-        const int64_t dim_index = (li / stride) % size;
-        const int64_t src_index = dim_index >= shift
-            ? li - shift * stride
-            : li + (size - shift) * stride;
         dst[li] = src[src_index];
     }
 }
@@ -571,15 +558,19 @@ Tensor roll_cuda(const Tensor& self, const std::vector<int64_t>& shifts, const s
     const int64_t shift = ((shifts[0] % size) + size) % size;
     Tensor sc = self.contiguous();
     Tensor out = empty_transform_output(sc);
-    int64_t n = sc.numel();
-    auto stream = getCurrentCUDAStream().stream();
-    dim3 grid = make_grid(n), block(kThreads);
+    const int64_t stride = sc.stride(dim);
 #define TP_RL2(ctype, name_) \
-    case DType::name_: \
-        roll_dim_kernel<ctype><<<grid, block, 0, stream>>>( \
-            n, size, sc.stride(dim), shift, sc.data_ptr<ctype>(), \
-            out.data_ptr<ctype>()); \
-        break;
+    case DType::name_: { \
+        const ctype* source = sc.data_ptr<ctype>(); \
+        gpu_kernel_with_index(out, [=] GPU_LAMBDA(int64_t linear_index) -> ctype { \
+            const int64_t dim_index = (linear_index / stride) % size; \
+            const int64_t source_index = dim_index >= shift \
+                ? linear_index - shift * stride \
+                : linear_index + (size - shift) * stride; \
+            return source[source_index]; \
+        }); \
+        break; \
+    }
     switch (sc.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_RL2)
         TENSORPLAY_FORALL_QINT_TYPES(TP_RL2)
