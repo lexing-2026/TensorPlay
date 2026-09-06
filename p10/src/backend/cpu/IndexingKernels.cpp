@@ -1106,15 +1106,28 @@ Tensor nonzero_cpu(const Tensor& self) {
 
 namespace {
 
+template <typename T>
+inline bool sort_is_nan(T value) {
+    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>) {
+        return std::isnan(value);
+    } else if constexpr (std::is_same_v<T, Half> ||
+                         std::is_same_v<T, BFloat16>) {
+        return std::isnan(static_cast<float>(value));
+    } else {
+        return false;
+    }
+}
+
 template <typename ctype>
 struct SortPairLess {
     bool descending;
     explicit SortPairLess(bool desc) : descending(desc) {}
     // returns true when pair a must come before pair b
     bool operator()(const std::pair<ctype, int64_t>& a, const std::pair<ctype, int64_t>& b) const {
-        constexpr bool is_float = std::is_floating_point_v<ctype>;
-        if constexpr (is_float) {
-            const bool na = std::isnan(a.first), nb = std::isnan(b.first);
+        if constexpr (std::is_floating_point_v<ctype> ||
+                      std::is_same_v<ctype, Half> ||
+                      std::is_same_v<ctype, BFloat16>) {
+            const bool na = sort_is_nan(a.first), nb = sort_is_nan(b.first);
             if (na != nb) return descending ? na : nb;  // NaN sinks in ascending
             if (na) return a.second < b.second;         // stable among NaNs
         }
@@ -1144,12 +1157,23 @@ std::tuple<Tensor, Tensor> sort_cpu(const Tensor& self, int64_t dim, bool descen
         const SortPairLess<ctype> less(descending); \
         const int64_t slice_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(d_size, 1)); \
         parallel_for(0, outer * inner, slice_grain, [&](int64_t b, int64_t e) { \
-            std::vector<std::pair<ctype, int64_t>> buf(static_cast<size_t>(d_size)); \
+            using pair_t = std::pair<ctype, int64_t>; \
+            constexpr int64_t kMaxCachedElems = 1 << 12; \
+            static thread_local std::vector<pair_t> cached_buf; \
+            std::vector<pair_t> transient_buf; \
+            pair_t* buf = nullptr; \
+            if (d_size <= kMaxCachedElems) { \
+                if (static_cast<int64_t>(cached_buf.size()) < d_size) cached_buf.resize(static_cast<size_t>(d_size)); \
+                buf = cached_buf.data(); \
+            } else { \
+                transient_buf.resize(static_cast<size_t>(d_size)); \
+                buf = transient_buf.data(); \
+            } \
             for (int64_t si = b; si < e; ++si) { \
                 int64_t o = si / inner, in2 = si % inner; \
                 const ctype* base = s + o * d_size * inner + in2; \
                 for (int64_t j = 0; j < d_size; ++j) buf[j] = {base[j * inner], j}; \
-                std::sort(buf.begin(), buf.end(), less); \
+                std::sort(buf, buf + d_size, less); \
                 ctype* vbase = vp + o * d_size * inner + in2; \
                 int64_t* ibase = ip + o * d_size * inner + in2; \
                 for (int64_t j = 0; j < d_size; ++j) { vbase[j * inner] = buf[j].first; ibase[j * inner] = buf[j].second; } \
