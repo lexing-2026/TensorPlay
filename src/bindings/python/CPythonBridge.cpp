@@ -1385,10 +1385,33 @@ namespace {
 // carries an attribute capsule whose destructor runs when the wrapper dies and
 // erases the entry.  The map stores borrowed pointers only (the owning
 // reference is the object's own); all access happens under the GIL.
+//
+// A wrapper can outlive the impl it was cached under: assigning a different
+// tensor into a live wrapper (out= kernels that rebind their destination do
+// exactly this) releases the old impl while the capsule, and therefore the
+// cache entry, stays keyed on its address.  The allocator is free to hand
+// that address to the next impl, so every hit is re-checked against the
+// wrapper's current value before it is handed back.
 std::unordered_map<const void*, PyObject*> g_wrap_cache;
 
 void wrap_cache_capsule_destructor(PyObject* caps) {
     g_wrap_cache.erase(PyCapsule_GetPointer(caps, nullptr));
+}
+
+// True when `wrapper` is a plain tensor wrapper whose current value still
+// points at `impl`.  A wrapper that has since been rebound reports false and
+// its stale cache entry is dropped.
+bool wrapper_still_holds(PyObject* wrapper, const void* impl) {
+    if (wrapper == nullptr || g_tensor_type == nullptr ||
+        !PyObject_TypeCheck(wrapper, g_tensor_type)) {
+        return false;
+    }
+    auto* inst = reinterpret_cast<py::detail::instance*>(wrapper);
+    if (!inst->simple_layout || inst->simple_value_holder[0] == nullptr) {
+        return false;
+    }
+    const auto* held = static_cast<const Tensor*>(inst->simple_value_holder[0]);
+    return held->unsafeGetTensorImpl().get() == impl;
 }
 
 constexpr char kWrapCacheAttr[] = "__tp_impl_capsule__";
@@ -1399,8 +1422,11 @@ PyObject* tpx_py_wrap(const Tensor& t) {
     const void* impl = t.unsafeGetTensorImpl().get();
     auto it = g_wrap_cache.find(impl);
     if (it != g_wrap_cache.end()) {
-        Py_INCREF(it->second);
-        return it->second;
+        if (wrapper_still_holds(it->second, impl)) {
+            Py_INCREF(it->second);
+            return it->second;
+        }
+        g_wrap_cache.erase(it);
     }
     PyObject* wrapped = py::cast(t).release().ptr();
     if (wrapped == nullptr) return nullptr;

@@ -377,3 +377,119 @@ def test_lu_unpack_batched():
     lu, pivots = tp.linalg.lu_factor(a)
     P, L, U = tp.lu_unpack(lu, pivots)
     _allclose(tp.matmul(P, tp.matmul(L, U)), tp.reshape(a, [-1]).tolist(), tol=1e-4)
+
+
+# ------------------------------------------------------------- out= variants
+
+
+def test_comparison_out_variants_write_into_the_buffer():
+    a = tp.tensor([1.0, 2.0, 3.0])
+    b = tp.tensor([2.0, 2.0, 2.0])
+    out = tp.zeros(3, dtype=tp.bool)
+    ptr = out.data_ptr()
+
+    assert tp._C.eq(a, b, out=out) is out
+    assert out.tolist() == [False, True, False]
+    assert out.data_ptr() == ptr
+
+    assert tp._C.lt(a, 2.0, out=out).tolist() == [True, False, False]
+    assert tp._C.ge(a, b, out=out).tolist() == [False, True, True]
+
+
+def test_arithmetic_out_variants():
+    a = tp.tensor([1.0, 2.0, 3.0])
+    b = tp.tensor([2.0, 2.0, 2.0])
+    out = tp.zeros(3)
+
+    assert tp._C.mul(a, b, out=out).tolist() == [2.0, 4.0, 6.0]
+    assert tp._C.sub(a, b, out=out).tolist() == [-1.0, 0.0, 1.0]
+    assert tp._C.div(a, b, out=out).tolist() == [0.5, 1.0, 1.5]
+    assert tp._C.div(a, b, rounding_mode="floor", out=out).tolist() == [0.0, 1.0, 1.0]
+    assert tp._C.pow(a, b, out=out).tolist() == [1.0, 4.0, 9.0]
+    assert tp._C.pow(2.0, a, out=out).tolist() == [2.0, 4.0, 8.0]
+    assert tp._C.fmod(a, b, out=out).tolist() == [1.0, 0.0, 1.0]
+    assert tp._C.remainder(a, 2.0, out=out).tolist() == [1.0, 0.0, 1.0]
+
+
+def test_out_variant_result_is_visible_through_an_alias():
+    a = tp.tensor([1.0, 2.0, 3.0])
+    b = tp.tensor([2.0, 2.0, 2.0])
+    out = tp.zeros(3)
+    view = out[0:3]
+
+    tp._C.mul(a, b, out=out)
+
+    assert view.tolist() == [2.0, 4.0, 6.0]
+
+
+def test_where_and_isin_out_variants():
+    a = tp.tensor([1.0, 2.0, 3.0])
+    b = tp.tensor([2.0, 2.0, 2.0])
+    out = tp.zeros(3)
+    mask = tp.tensor([True, False, True])
+    assert tp._C.where(mask, a, b, out=out).tolist() == [1.0, 2.0, 3.0]
+
+    flags = tp.zeros(3, dtype=tp.bool)
+    assert tp._C.isin(a, b, out=flags).tolist() == [False, True, False]
+
+
+def test_multi_output_out_variants_do_not_crash():
+    # every kernel that answers several out= destinations used to return a
+    # tuple of references, which the dispatch entry read back as a tuple of
+    # values
+    sign = tp.zeros(())
+    logabsdet = tp.zeros(())
+    got_sign, got_log = tp._C.slogdet(tp.eye(2), sign=sign, logabsdet=logabsdet)
+    assert got_sign.item() == 1.0
+    assert got_log.item() == 0.0
+
+    q = tp.zeros(2, 2)
+    r = tp.zeros(2, 2)
+    shapes = [t.shape for t in tp._C.linalg_qr(tp.eye(2), Q=q, R=r)]
+    assert shapes == [(2, 2), (2, 2)]
+
+    mantissa = tp.zeros(3)
+    exponent = tp.zeros(3, dtype=tp.int32)
+    parts = tp._C.frexp(tp.tensor([1.0, 2.0, 3.0]),
+                        mantissa=mantissa, exponent=exponent)
+    assert [t.shape for t in parts] == [(3,), (3,)]
+
+
+def test_lu_unpack_out_variant():
+    a = tp.tensor([[4.0, 3.0], [6.0, 3.0]])
+    lu, pivots = tp.linalg.lu_factor(a)
+    P = tp.zeros(2, 2)
+    L = tp.zeros(2, 2)
+    U = tp.zeros(2, 2)
+    tp._C.lu_unpack(lu, pivots, P=P, L=L, U=U)
+    _allclose(tp.matmul(P, tp.matmul(L, U)), tp.reshape(a, [-1]).tolist(), tol=1e-4)
+
+
+def test_alias_copy_spellings_own_their_storage():
+    x = tp.zeros(2, dtype=tp.complex64)
+    real = tp._C.view_as_real_copy(x)
+    assert real.shape == (2, 2)
+    assert real.data_ptr() != x.data_ptr()
+
+    y = tp.zeros(2, 2)
+    complexed = tp._C.view_as_complex_copy(y)
+    assert complexed.shape == (2,)
+    assert complexed.data_ptr() != y.data_ptr()
+
+
+def test_index_fill_int_spellings():
+    a = tp.tensor([1.0, 2.0, 3.0])
+    assert a.index_fill(0, tp.tensor([0]), 9.0).tolist() == [9.0, 2.0, 3.0]
+
+
+def test_scatter_reduce_inplace_two():
+    out = tp.zeros(3)
+    result = out.scatter_reduce_(0, tp.zeros(3, dtype=tp.int64), tp.ones(3),
+                                 reduce="sum")
+    assert result is out
+    assert out.tolist() == [3.0, 0.0, 0.0]
+
+
+def test_linalg_matmul_spelling():
+    assert tp._C.linalg_matmul(tp.eye(2), tp.eye(2)).tolist() == [[1.0, 0.0],
+                                                                  [0.0, 1.0]]

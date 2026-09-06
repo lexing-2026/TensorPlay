@@ -1261,9 +1261,17 @@ Tensor prelu_forward_common(const Tensor& self, const Tensor& slope,
 
 }  // anonymous namespace
 
+// The public overload accepts either spelling of the slope: a scalar or a
+// plain per-channel vector, or a weight the caller has already shaped to
+// broadcast over the input.  Both name the same channel axis, so they answer
+// the same values.
 Tensor prelu_cuda(const Tensor& self, const Tensor& weight) {
-    TP_CHECK(weight.dim() <= 1,
-             "prelu: expected weight to be a scalar or 1-D tensor");
+    if (weight.dim() > 1) {
+        PReluGeometry geometry;
+        const Tensor slope =
+            prelu_prepare_broadcast_weight(self, weight, &geometry);
+        return prelu_forward_common(self, slope, geometry);
+    }
     const Tensor slope = weight.dtype() == self.dtype()
                              ? weight.contiguous()
                              : weight.to(self.dtype()).contiguous();
