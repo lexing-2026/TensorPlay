@@ -16,7 +16,6 @@
 #include <cstdint>
 #include <limits>
 #include <string>
-#include <type_traits>
 #include <vector>
 
 namespace tensorplay {
@@ -110,38 +109,6 @@ void assert_async_cuda(const Tensor& self) {
 }
 
 
-template <typename T, typename Pred>
-__global__ void ew_bool_unary_kernel(int64_t n, const T* a, bool* out, Pred pred) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) out[i] = pred(a[i]);
-}
-
-
-template <typename Pred>
-Tensor bool_unary_cuda(const Tensor& self, Pred pred, const char* name) {
-    Tensor sc = self.contiguous();
-    Tensor out = Tensor::empty(shape_of(self), DType::Bool, self.device());
-    int64_t n = self.numel();
-    if (n == 0) return out;
-    dim3 grid, block;
-    launch_ew(grid, block, n);
-    auto stream = getCurrentCUDAStream().stream();
-#define TP_BU(ctype, name_) \
-    case DType::name_: \
-        ew_bool_unary_kernel<ctype><<<grid, block, 0, stream>>>( \
-            n, sc.data_ptr<ctype>(), out.data_ptr<bool>(), pred); \
-        break;
-    switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_BU)
-        default: TP_THROW(TypeError, name, ": unsupported dtype");
-    }
-#undef TP_BU
-    CUDA_CHECK(cudaGetLastError());
-    return out;
-}
-
-
 } // namespace
 
 Tensor isclose_cuda(const Tensor& self, const Tensor& other, double rtol, double atol, bool equal_nan) {
@@ -173,12 +140,28 @@ Tensor isreal_cuda(const Tensor& self) {
     if (!isComplexType(self.dtype())) {
         return Tensor::ones(shape_of(self), DType::Bool, self.device());
     }
-    return bool_unary_cuda(self, [] __device__ (auto x) -> bool {
-        using T = decltype(x);
-        if constexpr (std::is_same_v<T, std::complex<float>>) return x.imag() == 0.0f;
-        else if constexpr (std::is_same_v<T, std::complex<double>>) return x.imag() == 0.0;
-        else return true;
-    }, "isreal");
+    Tensor out = Tensor::empty(shape_of(self), DType::Bool, self.device());
+    if (out.numel() == 0) return out;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(false)
+        .add_output(out)
+        .add_input(self)
+        .build();
+    switch (self.dtype()) {
+        case DType::ComplexFloat:
+            gpu_kernel(iter, [] __device__ (std::complex<float> value) -> bool {
+                return value.imag() == 0.0f;
+            });
+            break;
+        case DType::ComplexDouble:
+            gpu_kernel(iter, [] __device__ (std::complex<double> value) -> bool {
+                return value.imag() == 0.0;
+            });
+            break;
+        default:
+            TP_THROW(TypeError, "isreal: unsupported dtype");
+    }
+    return out;
 }
 
 
