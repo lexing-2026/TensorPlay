@@ -874,7 +874,7 @@ std::tuple<Tensor, Tensor> kthvalue_cuda(const Tensor& self, int64_t k, int64_t 
         TP_KTHVALUE_SELECT_CASE(double, Float64)
 #undef TP_KTHVALUE_SELECT_CASE
         default:
-            TP_THROW(TypeError, "kthvalue: unsupported dtype");
+            TP_THROW(NotImplementedError, "kthvalue: unsupported dtype");
     }
     CUDA_CHECK(cudaGetLastError());
     return {values_out, indices_out};
