@@ -1,6 +1,6 @@
 #include <iostream>
 #include "Tensor.h"
-#include <thrust/complex.h>
+#include "Complex.h"
 #include "Dispatcher.h"
 #include "CUDARuntime.h"
 #include "CUDAContext.h"
@@ -37,9 +37,9 @@ namespace cuda {
 // Mean over complex dtypes: scale the accumulated sum by 1/count in place
 // (grid-stride; src and dst may alias).
 template <typename T>
-__global__ void scale_complex_kernel(int64_t n, const thrust::complex<T>* src,
-                                     thrust::complex<T> scale,
-                                     thrust::complex<T>* dst) {
+__global__ void scale_complex_kernel(
+        int64_t n, const tensorplay::complex<T>* src,
+        tensorplay::complex<T> scale, tensorplay::complex<T>* dst) {
     int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x;
     if (i < n) dst[i] = src[i] * scale;
 }
@@ -493,16 +493,16 @@ Tensor sum_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool 
     if (input.dtype() == DType::ComplexHalf || input.dtype() == DType::BComplex32) {
         Tensor promoted = input.to(DType::ComplexFloat);
         const ReductionSpec promoted_spec = make_reduction_spec(promoted, dim);
-        Tensor reduced = sum_same_dtype<thrust::complex<float>>(
+        Tensor reduced = sum_same_dtype<tensorplay::complex<float>>(
             promoted, promoted_spec, keepdim, DType::ComplexFloat);
         return reduced.to(out_dtype);
     }
     // Complex accumulates in its own width via the generic ops (+ only).
     if (input.dtype() == DType::ComplexFloat) {
-        return sum_same_dtype<thrust::complex<float>>(input, spec, keepdim, out_dtype);
+        return sum_same_dtype<tensorplay::complex<float>>(input, spec, keepdim, out_dtype);
     }
     if (input.dtype() == DType::ComplexDouble) {
-        return sum_same_dtype<thrust::complex<double>>(input, spec, keepdim, out_dtype);
+        return sum_same_dtype<tensorplay::complex<double>>(input, spec, keepdim, out_dtype);
     }
     TP_DISPATCH_REDUCTION(sum_same_dtype, input.dtype(), input, spec, keepdim, out_dtype);
 }
@@ -544,14 +544,14 @@ Tensor mean_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool
         dim3 grid((unsigned)((n + 255) / 256)), block(256);
         if (scaled.dtype() == DType::ComplexFloat) {
             scale_complex_kernel<float><<<grid, block, 0, stream>>>(
-                n, static_cast<const thrust::complex<float>*>(scaled.data_ptr()),
-                thrust::complex<float>(static_cast<float>(1.0 / count)),
-                static_cast<thrust::complex<float>*>(scaled.data_ptr()));
+                n, static_cast<const tensorplay::complex<float>*>(scaled.data_ptr()),
+                tensorplay::complex<float>(static_cast<float>(1.0 / count)),
+                static_cast<tensorplay::complex<float>*>(scaled.data_ptr()));
         } else {
             scale_complex_kernel<double><<<grid, block, 0, stream>>>(
-                n, static_cast<const thrust::complex<double>*>(scaled.data_ptr()),
-                thrust::complex<double>(1.0 / static_cast<double>(count)),
-                static_cast<thrust::complex<double>*>(scaled.data_ptr()));
+                n, static_cast<const tensorplay::complex<double>*>(scaled.data_ptr()),
+                tensorplay::complex<double>(1.0 / static_cast<double>(count)),
+                static_cast<tensorplay::complex<double>*>(scaled.data_ptr()));
         }
         CUDA_CHECK(cudaGetLastError());
         return reduced_output ? scaled.to(out_dtype) : scaled;
@@ -623,15 +623,15 @@ Tensor prod_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool
     if (input.dtype() == DType::ComplexHalf || input.dtype() == DType::BComplex32) {
         Tensor promoted = input.to(DType::ComplexFloat);
         const ReductionSpec promoted_spec = make_reduction_spec(promoted, dim);
-        Tensor reduced = prod_same_dtype<thrust::complex<float>>(
+        Tensor reduced = prod_same_dtype<tensorplay::complex<float>>(
             promoted, promoted_spec, keepdim, DType::ComplexFloat);
         return reduced.to(out_dtype);
     }
     if (input.dtype() == DType::ComplexFloat) {
-        return prod_same_dtype<thrust::complex<float>>(input, spec, keepdim, out_dtype);
+        return prod_same_dtype<tensorplay::complex<float>>(input, spec, keepdim, out_dtype);
     }
     if (input.dtype() == DType::ComplexDouble) {
-        return prod_same_dtype<thrust::complex<double>>(input, spec, keepdim, out_dtype);
+        return prod_same_dtype<tensorplay::complex<double>>(input, spec, keepdim, out_dtype);
     }
     TP_DISPATCH_REDUCTION(prod_same_dtype, input.dtype(), input, spec, keepdim, out_dtype);
 }
