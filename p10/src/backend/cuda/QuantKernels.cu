@@ -178,6 +178,61 @@ QuantInputs prepare_quantize(const Tensor& self, int64_t axis = 0) {
 
 } // namespace
 
+Tensor empty_quantized_cuda(const std::vector<int64_t>& size,
+                            const Tensor& qtensor,
+                            std::optional<DType> dtype,
+                            std::optional<int64_t> layout,
+                            std::optional<Device> device,
+                            std::optional<bool> pin_memory,
+                            std::optional<int64_t> memory_format) {
+    if (layout.has_value() && *layout != 2) {
+        TP_THROW(NotImplementedError,
+                 "empty_quantized is only implemented for strided layout tensors");
+    }
+    if (pin_memory.value_or(false)) {
+        TP_THROW(RuntimeError, "pin_memory is only valid for CPU tensors");
+    }
+    quantized::require_quantized(qtensor, "empty_quantized");
+    const DType dt = (dtype.has_value() && *dtype != DType::Undefined)
+        ? *dtype : qtensor.dtype();
+    if (dt != qtensor.dtype()) {
+        TP_THROW(RuntimeError,
+                 "empty_quantized(): dtype must match the source quantized tensor");
+    }
+
+    const Device target = device.value_or(qtensor.device());
+    Tensor codes(size, underlying_storage_type(dt), target);
+    const MemoryFormat format = static_cast<MemoryFormat>(
+        memory_format.value_or(static_cast<int64_t>(MemoryFormat::Contiguous)));
+    if (format == MemoryFormat::ChannelsLast ||
+        format == MemoryFormat::ChannelsLast3d) {
+        codes = codes.as_strided(size, get_channels_last_strides(size), 0);
+    }
+
+    const QuantizerPtr source_quantizer = quantized::quantizer_of(qtensor);
+    QuantizerPtr output_quantizer;
+    switch (source_quantizer->qscheme()) {
+        case kPerTensorAffine:
+            output_quantizer = make_per_tensor_affine_quantizer(
+                source_quantizer->scale(), source_quantizer->zero_point(), dt);
+            break;
+        case kPerChannelAffine:
+        case kPerChannelAffineFloatQParams: {
+            Tensor scales = source_quantizer->scales();
+            Tensor zero_points = source_quantizer->zero_points();
+            if (scales.device() != target) scales = scales.to(target);
+            if (zero_points.device() != target) zero_points = zero_points.to(target);
+            output_quantizer = make_per_channel_affine_quantizer(
+                scales, zero_points, source_quantizer->axis(), dt);
+            break;
+        }
+        default:
+            TP_THROW(ValueError,
+                     "empty_quantized(): unsupported quantization scheme");
+    }
+    return quantized::make_qtensor(codes, std::move(output_quantizer), dt);
+}
+
 Tensor quantize_per_tensor_qint8_cuda(const Tensor& self, double scale,
                                       int64_t zero_point, int64_t quant_min,
                                       int64_t quant_max) {
@@ -2302,6 +2357,7 @@ Tensor fused_moving_avg_obs_fake_quant_cuda(
 }
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, QuantKernels) {
+    m.impl("empty_quantized", empty_quantized_cuda);
     m.impl("quantize_per_tensor", quantize_per_tensor_cuda);
     m.impl("quantize_per_channel", quantize_per_channel_cuda);
     m.impl("quantized_linear", quantized_linear_cuda);
