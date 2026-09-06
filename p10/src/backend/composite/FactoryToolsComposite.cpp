@@ -233,6 +233,48 @@ Tensor logspace_scalar_impl(const Scalar& start, const Scalar& end, int64_t step
     return ops::logspace(start, end, steps, base, result);
 }
 
+DType infer_arange_dtype(const Scalar& start, const Scalar& end,
+                         const Scalar& step,
+                         const std::optional<DType>& dtype) {
+    if (dtype.has_value() && *dtype != DType::Undefined) {
+        return *dtype;
+    }
+    const bool all_integral =
+        start.isIntegral(true) && end.isIntegral(true) && step.isIntegral(true);
+    return all_integral ? DType::Int64 : globalContext().defaultDType();
+}
+
+Tensor arange_options_impl(const Scalar& start, const Scalar& end,
+                           const Scalar& step,
+                           const std::optional<DType>& dtype,
+                           const std::optional<int64_t>& layout,
+                           const std::optional<Device>& device,
+                           const std::optional<bool>& pin_memory) {
+    require_strided_layout("arange", layout);
+    const DType dt = infer_arange_dtype(start, end, step, dtype);
+    Tensor result = ops::empty({0}, dt, device, pin_memory.value_or(false), false);
+    return ops::arange(start, end, step, result);
+}
+
+Tensor eye_options_impl(int64_t n, int64_t m,
+                        const std::optional<DType>& dtype,
+                        const std::optional<int64_t>& layout,
+                        const std::optional<Device>& device,
+                        const std::optional<bool>& pin_memory) {
+    if (n < 0) {
+        TP_THROW(RuntimeError, "n must be greater or equal to 0, got ", n);
+    }
+    if (m < 0) {
+        TP_THROW(RuntimeError, "m must be greater or equal to 0, got ", m);
+    }
+    require_strided_layout("eye", layout);
+    const DType dt = (dtype.has_value() && *dtype != DType::Undefined)
+                         ? *dtype
+                         : globalContext().defaultDType();
+    Tensor result = ops::empty({0}, dt, device, pin_memory.value_or(false), false);
+    return ops::eye(n, m, result);
+}
+
 // ---------------------------------------------------------------------------
 // new_* factories
 // ---------------------------------------------------------------------------
@@ -318,6 +360,30 @@ Tensor hamming_window_periodic_alpha_beta_native(int64_t window_length, bool per
                                layout, device, pin_memory);
 }
 
+Tensor arange_start_native(Scalar start, Scalar end, std::optional<DType> dtype,
+                           std::optional<int64_t> layout,
+                           std::optional<Device> device,
+                           std::optional<bool> pin_memory) {
+    return arange_options_impl(start, end, Scalar(static_cast<int64_t>(1)),
+                               dtype, layout, device, pin_memory);
+}
+
+Tensor arange_start_step_native(Scalar start, Scalar end, Scalar step,
+                                std::optional<DType> dtype,
+                                std::optional<int64_t> layout,
+                                std::optional<Device> device,
+                                std::optional<bool> pin_memory) {
+    return arange_options_impl(start, end, step, dtype, layout, device,
+                               pin_memory);
+}
+
+Tensor eye_m_native(int64_t n, int64_t m, std::optional<DType> dtype,
+                    std::optional<int64_t> layout,
+                    std::optional<Device> device,
+                    std::optional<bool> pin_memory) {
+    return eye_options_impl(n, m, dtype, layout, device, pin_memory);
+}
+
 // ---------------------------------------------------------------------------
 // linspace / logspace (registered impls)
 // ---------------------------------------------------------------------------
@@ -365,6 +431,37 @@ Tensor linspace_scalar_tensor_native(Scalar start, const Tensor& end, int64_t st
                                 pin_memory);
 }
 
+Tensor& linspace_tensor_tensor_out_native(const Tensor& start, const Tensor& end,
+                                          int64_t steps, Tensor& out) {
+    if (!(start.dim() == 0 && end.dim() == 0)) {
+        TP_THROW(RuntimeError,
+                 "linspace only supports 0-dimensional start and end tensors, "
+                 "but got start with ", start.dim(), " dimension(s) and end with ",
+                 end.dim(), " dimension(s).");
+    }
+    return ops::linspace(start.item(), end.item(), steps, out);
+}
+
+Tensor& linspace_tensor_scalar_out_native(const Tensor& start, Scalar end,
+                                          int64_t steps, Tensor& out) {
+    if (start.dim() != 0) {
+        TP_THROW(RuntimeError,
+                 "linspace only supports 0-dimensional start and end tensors, "
+                 "but got start with ", start.dim(), " dimension(s).");
+    }
+    return ops::linspace(start.item(), end, steps, out);
+}
+
+Tensor& linspace_scalar_tensor_out_native(Scalar start, const Tensor& end,
+                                          int64_t steps, Tensor& out) {
+    if (end.dim() != 0) {
+        TP_THROW(RuntimeError,
+                 "linspace only supports 0-dimensional start and end tensors, "
+                 "but got end with ", end.dim(), " dimension(s).");
+    }
+    return ops::linspace(start, end.item(), steps, out);
+}
+
 Tensor logspace_tensor_tensor_native(const Tensor& start, const Tensor& end,
                                      int64_t steps, double base,
                                      std::optional<DType> dtype,
@@ -407,6 +504,37 @@ Tensor logspace_scalar_tensor_native(Scalar start, const Tensor& end, int64_t st
     }
     return logspace_scalar_impl(start, end.item(), steps, base, dtype, layout, device,
                                 pin_memory);
+}
+
+Tensor& logspace_tensor_tensor_out_native(const Tensor& start, const Tensor& end,
+                                          int64_t steps, double base, Tensor& out) {
+    if (!(start.dim() == 0 && end.dim() == 0)) {
+        TP_THROW(RuntimeError,
+                 "logspace only supports 0-dimensional start and end tensors, "
+                 "but got start with ", start.dim(), " dimension(s) and end with ",
+                 end.dim(), " dimension(s).");
+    }
+    return ops::logspace(start.item(), end.item(), steps, base, out);
+}
+
+Tensor& logspace_tensor_scalar_out_native(const Tensor& start, Scalar end,
+                                          int64_t steps, double base, Tensor& out) {
+    if (start.dim() != 0) {
+        TP_THROW(RuntimeError,
+                 "logspace only supports 0-dimensional start and end tensors, "
+                 "but got start with ", start.dim(), " dimension(s).");
+    }
+    return ops::logspace(start.item(), end, steps, base, out);
+}
+
+Tensor& logspace_scalar_tensor_out_native(Scalar start, const Tensor& end,
+                                          int64_t steps, double base, Tensor& out) {
+    if (end.dim() != 0) {
+        TP_THROW(RuntimeError,
+                 "logspace only supports 0-dimensional start and end tensors, "
+                 "but got end with ", end.dim(), " dimension(s).");
+    }
+    return ops::logspace(start, end.item(), steps, base, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -737,12 +865,21 @@ TENSORPLAY_LIBRARY_IMPL(Composite, FactoryToolsComposite) {
     m.impl("hamming_window.periodic_alpha", hamming_window_periodic_alpha_native);
     m.impl("hamming_window.periodic_alpha_beta",
            hamming_window_periodic_alpha_beta_native);
+    m.impl("arange.start", arange_start_native);
+    m.impl("arange.start_step", arange_start_step_native);
+    m.impl("eye.m", eye_m_native);
     m.impl("linspace.Tensor_Tensor", linspace_tensor_tensor_native);
     m.impl("linspace.Tensor_Scalar", linspace_tensor_scalar_native);
     m.impl("linspace.Scalar_Tensor", linspace_scalar_tensor_native);
+    m.impl("linspace.Tensor_Tensor_out", linspace_tensor_tensor_out_native);
+    m.impl("linspace.Tensor_Scalar_out", linspace_tensor_scalar_out_native);
+    m.impl("linspace.Scalar_Tensor_out", linspace_scalar_tensor_out_native);
     m.impl("logspace.Tensor_Tensor", logspace_tensor_tensor_native);
     m.impl("logspace.Tensor_Scalar", logspace_tensor_scalar_native);
     m.impl("logspace.Scalar_Tensor", logspace_scalar_tensor_native);
+    m.impl("logspace.Tensor_Tensor_out", logspace_tensor_tensor_out_native);
+    m.impl("logspace.Tensor_Scalar_out", logspace_tensor_scalar_out_native);
+    m.impl("logspace.Scalar_Tensor_out", logspace_scalar_tensor_out_native);
     m.impl("ones.out", ones_out_native);
     m.impl("zeros.out", zeros_out_native);
     m.impl("full.out", full_out_native);
