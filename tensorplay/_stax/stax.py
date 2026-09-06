@@ -536,9 +536,10 @@ class _CpuFusedPointwiseLowering(_NativeLowering):
             # Broadcast/strided specializations pin each input's exact
             # (shape, strides): the generated addressing was proven for
             # that layout, so any deviation must re-lower.
+            # The expected device is captured from the region's own sample
+            # inputs, so comparing against it is what pins the device.
             return bool(inputs) and all(
                 isinstance(value, tensor_type)
-                and value.device.is_cpu()
                 and value.dtype == expected_dtype
                 and value.device == expected_device
                 and tuple(int(item) for item in value.shape) == layout[0]
@@ -547,7 +548,6 @@ class _CpuFusedPointwiseLowering(_NativeLowering):
             )
         return bool(inputs) and all(
             isinstance(value, tensor_type)
-            and value.device.is_cpu()
             and value.dtype == expected_dtype
             and value.device == expected_device
             and tuple(int(item) for item in value.shape) == expected_shape
@@ -1414,6 +1414,8 @@ def _plan_row_fusion(
     graph_module: GraphModule,
     in_shape: tuple[int, ...],
     input_shapes: tuple[tuple[int, ...], ...],
+    *,
+    stage: bool = True,
 ) -> Any:
     """Split a region into row stages, or return ``None``.
 
@@ -1540,7 +1542,7 @@ def _plan_row_fusion(
     else:
         output_deps = set()
     stages: dict[Node, int] = {}
-    for index, source in enumerate(reduce_sources):
+    for index, source in enumerate(reduce_sources) if stage else ():
         if source.op == "placeholder" or source in stages:
             continue
         reused = output_deps | (later[index] if index < len(later) else set())
@@ -1722,23 +1724,18 @@ def _copy_region_graph(graph: Any) -> Any:
     return clone
 
 
-def _lower_cpu_row_fusion(
+def _row_fusion_plan(
     graph_module: GraphModule,
     example_inputs: list[Any],
-    *,
-    strict_native: bool = False,
-    dynamic: bool = False,
+    on_device: str,
 ) -> Any:
-    """Build one CPU kernel for a region with reductions in the middle.
+    """Guard a region and plan it as row stages; ``None`` when it is not one.
 
-    The reduction results feed elementwise work over the same axis they were
-    reduced along, so the region cannot be expressed as a pointwise program
-    or as a pointwise program ending in a reduction.  Staging it per row keeps
-    every intermediate in cache instead of writing it out and reading it back.
+    The plan itself carries no device: the same stages compile to a CPU loop
+    nest or to one CUDA program per row, so both lowerings share this front
+    end and differ only in the generator they hand the plan to.
     """
 
-    if dynamic:
-        return None
     try:
         import tensorplay
 
@@ -1750,11 +1747,8 @@ def _lower_cpu_row_fusion(
     ):
         return None
     first = example_inputs[0]
-    if (
-        not first.device.is_cpu()
-        or first.dtype != tensorplay.float32
-        or not first.is_contiguous()
-    ):
+    on = first.device.is_cuda() if on_device == "cuda" else first.device.is_cpu()
+    if not on or first.dtype != tensorplay.float32 or not first.is_contiguous():
         return None
     if any(
         value.device != first.device
@@ -1776,15 +1770,116 @@ def _lower_cpu_row_fusion(
     if in_shape is None or not in_shape:
         return None
 
-    fusion = _plan_row_fusion(graph_module, in_shape, input_shapes)
+    # Keeping a value alive across a reduction is a win where the buffer
+    # sits in cache and a loss where it sits in a register file: one device
+    # stages, the other recomputes.
+    stage = on_device != "cuda"
+    module = graph_module
+    fusion = _plan_row_fusion(module, in_shape, input_shapes, stage=stage)
     if fusion is None:
-        planned = _expand_row_normalizations(graph_module)
-        if planned is None:
+        expanded = _expand_row_normalizations(graph_module)
+        if expanded is None:
             return None
-        fusion = _plan_row_fusion(planned, in_shape, input_shapes)
+        fusion = _plan_row_fusion(
+            expanded, in_shape, input_shapes, stage=stage
+        )
         if fusion is None:
             return None
-        graph_module = planned
+        module = expanded
+    return module, fusion, input_shapes, input_strides, first
+
+
+class _CudaRowFusionLowering(_CpuFusedReductionLowering):
+    """Executable wrapper for a row-staged CUDA kernel.
+
+    One program per output row, the row resident for the whole region: the
+    inputs are read once no matter how many reductions the region contains.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._tensorplay_codegen = "stax-fused-cuda-rowfuse"
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return super().__call__(*args, **kwargs)
+        except RuntimeError as error:
+            if "fused CPU reduction" in str(error):
+                raise RuntimeError(
+                    "Stax row-staged CUDA kernel received inputs outside its "
+                    "compiled specialization"
+                ) from None
+            raise
+
+
+def _lower_cuda_row_fusion(
+    graph_module: GraphModule,
+    example_inputs: list[Any],
+    *,
+    strict_native: bool = False,
+    dynamic: bool = False,
+) -> Any:
+    """Build one CUDA kernel for a region with reductions in the middle.
+
+    Splitting such a region at every reduction gives one kernel per stage,
+    each streaming the input again and writing an intermediate the next one
+    reads back.  Keeping the row resident across the stages removes all of
+    that traffic and leaves one launch.
+    """
+
+    if dynamic:
+        return None
+    planned = _row_fusion_plan(graph_module, example_inputs, "cuda")
+    if planned is None:
+        return None
+    module, fusion, input_shapes, input_strides, first = planned
+
+    try:
+        from .codegen.triton_rowfusion import build_cuda_row_fusion_kernel
+
+        launch = build_cuda_row_fusion_kernel(
+            fusion,
+            input_shapes=input_shapes,
+            input_strides=input_strides,
+        )
+    except Exception:
+        launch = None
+    if launch is None:
+        return None
+
+    return _CudaRowFusionLowering(
+        module,
+        first.dtype,
+        first.device,
+        tuple(zip(input_shapes, input_strides)),
+        launch,
+        0,
+        fusion.out_shape,
+        strict_native,
+    )
+
+
+def _lower_cpu_row_fusion(
+    graph_module: GraphModule,
+    example_inputs: list[Any],
+    *,
+    strict_native: bool = False,
+    dynamic: bool = False,
+) -> Any:
+    """Build one CPU kernel for a region with reductions in the middle.
+
+    The reduction results feed elementwise work over the same axis they were
+    reduced along, so the region cannot be expressed as a pointwise program
+    or as a pointwise program ending in a reduction.  Staging it per row keeps
+    every intermediate in cache instead of writing it out and reading it back.
+    """
+
+    if dynamic:
+        return None
+    planned = _row_fusion_plan(graph_module, example_inputs, "cpu")
+    if planned is None:
+        return None
+    module, fusion, input_shapes, input_strides, first = planned
 
     try:
         from .codegen.cpp_rowfusion import build_cpu_row_fusion_kernel
@@ -1802,7 +1897,7 @@ def _lower_cpu_row_fusion(
     runner, direct = built
 
     return _CpuRowFusionLowering(
-        graph_module,
+        module,
         first.dtype,
         first.device,
         tuple(zip(input_shapes, input_strides)),
@@ -4236,6 +4331,19 @@ def stax(
             is_cuda = first.device.is_cuda()
         except (AttributeError, IndexError):
             is_cuda = False
+        if is_cuda and use_fusion:
+            # A region whose reductions sit in the middle keeps its row
+            # resident across every stage; splitting it at each reduction
+            # would stream the input once per stage instead.
+            row_fused_cuda = _lower_cuda_row_fusion(
+                graph_module,
+                example_inputs,
+                strict_native=strict_native,
+                dynamic=bool(dynamic is True),
+            )
+            if row_fused_cuda is not None:
+                graph_module._stax_codegen = "stax-fused-cuda-rowfuse"
+                return row_fused_cuda
         if is_cuda:
             from .codegen.triton import (
                 compile_graph_module as compile_triton_graph,
