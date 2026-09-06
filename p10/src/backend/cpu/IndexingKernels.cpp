@@ -1473,6 +1473,14 @@ Tensor take_cpu(const Tensor& self, const Tensor& index) {
 // ---------------------------------------------------------------------------
 
 Tensor masked_scatter_cpu(const Tensor& self, const Tensor& mask, const Tensor& source) {
+    if (source.dtype() != self.dtype()) {
+        TP_THROW(TypeError,
+                 "masked_scatter: self and source must have the same dtype");
+    }
+    if (mask.device() != self.device() || source.device() != self.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "masked_scatter: self, mask, and source must be on the same device");
+    }
     Tensor m_full = mask.to(DType::Bool).expand(static_cast<std::vector<int64_t>>(self.shape())).contiguous();
     Tensor src = source.contiguous();
     Tensor result = detail::contiguous_clone(self);
@@ -1480,6 +1488,12 @@ Tensor masked_scatter_cpu(const Tensor& self, const Tensor& mask, const Tensor& 
     const bool* mp = m_full.data_ptr<bool>();
     int64_t src_i = 0;
     int64_t src_n = src.numel();
+    int64_t selected = 0;
+    for (int64_t i = 0; i < n; ++i) selected += mp[i] ? 1 : 0;
+    if (selected > src_n) {
+        TP_THROW(RuntimeError,
+                 "masked_scatter: source has fewer elements than the mask selects");
+    }
 #define TP_MS_CASE(ctype, name) \
     case DType::name: { \
         const ctype* sp = src.data_ptr<ctype>(); \
