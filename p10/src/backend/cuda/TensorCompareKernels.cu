@@ -8,12 +8,9 @@
 #include "CUDALoops.cuh"
 
 #include <cuda_runtime.h>
-#include <thrust/complex.h>
-
 #include <algorithm>
 #include <cassert>
 #include <cmath>
-#include <complex>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -53,8 +50,9 @@ __global__ void assert_async_kernel_impl(const T* input, AssertMessage message) 
 
 template <typename T>
 __global__ void assert_async_complex_kernel_impl(
-        const thrust::complex<T>* input, AssertMessage message) {
-    if (input[0] == thrust::complex<T>(0, 0)) {
+        const tensorplay::complex<T>* input, AssertMessage message) {
+    if (static_cast<float>(input[0].real()) == 0.0f &&
+        static_cast<float>(input[0].imag()) == 0.0f) {
         printf("%s\n", message.text);
         assert(false);
     }
@@ -89,15 +87,21 @@ void assert_async_msg_cuda(const Tensor& self, std::string assert_msg) {
         break;
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_ASSERT_CASE)
+        case DType::ComplexHalf:
+            assert_async_complex_kernel_impl<Half><<<1, 1, 0, stream>>>(
+                self.data_ptr<tensorplay::complex<Half>>(), message);
+            break;
         case DType::ComplexFloat:
             assert_async_complex_kernel_impl<float><<<1, 1, 0, stream>>>(
-                reinterpret_cast<const thrust::complex<float>*>(
-                    self.data_ptr<std::complex<float>>()), message);
+                self.data_ptr<tensorplay::complex<float>>(), message);
             break;
         case DType::ComplexDouble:
             assert_async_complex_kernel_impl<double><<<1, 1, 0, stream>>>(
-                reinterpret_cast<const thrust::complex<double>*>(
-                    self.data_ptr<std::complex<double>>()), message);
+                self.data_ptr<tensorplay::complex<double>>(), message);
+            break;
+        case DType::BComplex32:
+            assert_async_complex_kernel_impl<BFloat16><<<1, 1, 0, stream>>>(
+                self.data_ptr<tensorplay::complex<BFloat16>>(), message);
             break;
         default:
             TP_THROW(TypeError, "assert_async: unsupported dtype");
@@ -231,14 +235,24 @@ Tensor isreal_cuda(const Tensor& self) {
         .add_input(self)
         .build();
     switch (self.dtype()) {
+        case DType::ComplexHalf:
+            gpu_kernel(iter, [] __device__ (tensorplay::complex<Half> value) -> bool {
+                return static_cast<float>(value.imag()) == 0.0f;
+            });
+            break;
         case DType::ComplexFloat:
-            gpu_kernel(iter, [] __device__ (std::complex<float> value) -> bool {
+            gpu_kernel(iter, [] __device__ (tensorplay::complex<float> value) -> bool {
                 return value.imag() == 0.0f;
             });
             break;
         case DType::ComplexDouble:
-            gpu_kernel(iter, [] __device__ (std::complex<double> value) -> bool {
+            gpu_kernel(iter, [] __device__ (tensorplay::complex<double> value) -> bool {
                 return value.imag() == 0.0;
+            });
+            break;
+        case DType::BComplex32:
+            gpu_kernel(iter, [] __device__ (tensorplay::complex<BFloat16> value) -> bool {
+                return static_cast<float>(value.imag()) == 0.0f;
             });
             break;
         default:
