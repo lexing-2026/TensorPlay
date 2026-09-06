@@ -596,10 +596,15 @@ std::tuple<Tensor, Tensor> nanmedian_dim_cpu(const Tensor& self, int64_t dim,
                     ip[oi] = 0; \
                     continue; \
                 } \
-                std::sort(buf.begin(), buf.begin() + valid, \
-                          [](auto& a, auto& b) { return a.first < b.first; }); \
-                vp[oi] = buf[static_cast<size_t>((valid - 1) / 2)].first; \
-                ip[oi] = buf[static_cast<size_t>((valid - 1) / 2)].second; \
+                const int64_t middle = (valid - 1) / 2; \
+                std::nth_element(buf.begin(), buf.begin() + middle, \
+                                 buf.begin() + valid, \
+                                 [](const auto& a, const auto& b) { \
+                    if (a.first != b.first) return a.first < b.first; \
+                    return a.second < b.second; \
+                }); \
+                vp[oi] = buf[static_cast<size_t>(middle)].first; \
+                ip[oi] = buf[static_cast<size_t>(middle)].second; \
             } \
         }); \
         break; \
@@ -778,6 +783,15 @@ std::tuple<Tensor, Tensor> kthvalue_cpu(const Tensor& self, int64_t k,
 }
 
 template <typename scalar_t>
+inline bool count_nonzero_value(const scalar_t& value) {
+    if constexpr (is_complex_type_v<scalar_t>) {
+        return value.real() != 0 || value.imag() != 0;
+    } else {
+        return static_cast<bool>(value);
+    }
+}
+
+template <typename scalar_t>
 int64_t count_nonzero_flat_cpu_impl(const Tensor& self) {
     Tensor input = self.contiguous();
     const scalar_t* input_data = input.data_ptr<scalar_t>();
@@ -787,7 +801,7 @@ int64_t count_nonzero_flat_cpu_impl(const Tensor& self) {
                  [&](int64_t begin, int64_t end) {
         int64_t local_count = 0;
         for (int64_t i = begin; i < end; ++i) {
-            local_count += static_cast<bool>(input_data[i]) ? 1 : 0;
+            local_count += count_nonzero_value(input_data[i]) ? 1 : 0;
         }
         thread_counts[static_cast<size_t>(get_thread_num())] += local_count;
     });
