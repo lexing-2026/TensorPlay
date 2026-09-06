@@ -13,7 +13,6 @@
 #include "GradMode.h"
 #include "CUDABroadcast.cuh"
 #include "CUDAComplex.cuh"
-#include "ElementwiseStrided.cuh"
 #include "CUDALoops.cuh"
 #include <thrust/complex.h>
 
@@ -278,74 +277,6 @@ __global__ void fused_mul_add_scalar_kernel_cuda_impl(int64_t n,
     if (i < n) y[i] = a[i] * b + c;
 }
 
-// Tensor-Scalar Kernels
-template <typename T>
-__global__ void add_scalar_kernel_cuda_impl(int64_t n, const T* a, typename BinaryOpMath<T>::type b, T* y, typename BinaryOpMath<T>::type alpha) {
-    using M = typename BinaryOpMath<T>::type;
-    TP_CUDA_GRIDSTRIDE(i) {
-        y[i] = static_cast<T>(static_cast<M>(a[i]) + alpha * static_cast<M>(b));
-    }
-}
-
-template <typename T>
-__global__ void sub_scalar_kernel_cuda_impl(int64_t n, const T* a, typename BinaryOpMath<T>::type b, T* y, typename BinaryOpMath<T>::type alpha) {
-    using M = typename BinaryOpMath<T>::type;
-    TP_CUDA_GRIDSTRIDE(i) {
-        y[i] = static_cast<T>(static_cast<M>(a[i]) - alpha * static_cast<M>(b));
-    }
-}
-
-template <typename T>
-__global__ void mul_scalar_kernel_cuda_impl(int64_t n, const T* a, typename BinaryOpMath<T>::type b, T* y) {
-    using M = typename BinaryOpMath<T>::type;
-    TP_CUDA_GRIDSTRIDE(i) {
-        y[i] = static_cast<T>(static_cast<M>(a[i]) * static_cast<M>(b));
-    }
-}
-
-template <typename T>
-__global__ void div_scalar_kernel_cuda_impl(int64_t n, const T* a, typename BinaryOpMath<T>::type b, T* y) {
-    using M = typename BinaryOpMath<T>::type;
-    TP_CUDA_GRIDSTRIDE(i) {
-        y[i] = static_cast<T>(static_cast<M>(a[i]) / static_cast<M>(b));
-    }
-}
-
-// In-place Tensor-Scalar helpers for dense non-contiguous layouts.  Each
-// wraps the math in a small functor and hands it to the iterator-driven
-// strided kernel; a false return means the caller's contiguous fast path
-// applies (contiguous input or uncoalescable rank).  The math type M matches
-// BinaryOpMath<T>::type of the launching dtype so integer arithmetic and
-// half-precision promotion behave exactly as in the contiguous kernels.
-template <typename M>
-struct StridedAddScalar {
-    M b, alpha;
-    template <typename T> __device__ T operator()(T x) const {
-        return static_cast<T>(static_cast<M>(x) + alpha * b);
-    }
-};
-template <typename M>
-struct StridedSubScalar {
-    M b, alpha;
-    template <typename T> __device__ T operator()(T x) const {
-        return static_cast<T>(static_cast<M>(x) - alpha * b);
-    }
-};
-template <typename M>
-struct StridedMulScalar {
-    M b;
-    template <typename T> __device__ T operator()(T x) const {
-        return static_cast<T>(static_cast<M>(x) * b);
-    }
-};
-template <typename M>
-struct StridedDivScalar {
-    M b;
-    template <typename T> __device__ T operator()(T x) const {
-        return static_cast<T>(static_cast<M>(x) / b);
-    }
-};
-
 // --- Vectorized same-shape fast path ---
 // (get_offset == identity), so the general broadcast machinery is skipped in
 
@@ -445,6 +376,18 @@ inline TensorIterator make_binary_iter(const Tensor& out, const Tensor& a,
         .add_output(out)
         .add_input(a)
         .add_input(b)
+        .build();
+}
+
+inline TensorIterator make_scalar_iter(const Tensor& out, const Tensor& input,
+                                       const Scalar& value) {
+    Tensor scalar_tensor({}, value, Device(DeviceType::CPU));
+    return TensorIteratorConfig()
+        .allow_cpu_scalars(true)
+        .check_all_same_dtype(false)
+        .add_output(out)
+        .add_input(input)
+        .add_input(scalar_tensor)
         .build();
 }
 
@@ -1491,335 +1434,215 @@ Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
 Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
     DType result_dtype = cuda::cplx::scalar_result_dtype(
         self.dtype(), other, &alpha);
-    
+
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
-    int64_t n = self.numel();
-    if (n == 0) return result;
-    dim3 grid, block; get_grid_block(n, grid, block);
-    
-    Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
-    Tensor a = (self.dtype() == result_dtype) ? self_contig : self_contig.to(result_dtype);
-    
+    if (self.numel() == 0) return result;
+
+    Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
+    if (result_dtype == DType::ComplexFloat || result_dtype == DType::ComplexDouble) {
+        Tensor a_contig = a.is_contiguous() ? a : a.contiguous();
+        if (result_dtype == DType::ComplexFloat) {
+            run_cplx_add_scalar<float>(a_contig, other, alpha, result);
+        } else {
+            run_cplx_add_scalar<double>(a_contig, other, alpha, result);
+        }
+        return result;
+    }
+
     switch (result_dtype) {
         case DType::Float32:
-            add_scalar_kernel_cuda_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<float>(), other.to<float>(), result.data_ptr<float>(), alpha.to<float>());
-            break;
-        case DType::Int32:
-            add_scalar_kernel_cuda_impl<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int>(), other.to<int>(), result.data_ptr<int>(), alpha.to<int>());
-            break;
-        case DType::Int64:
-            add_scalar_kernel_cuda_impl<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int64_t>(), other.to<int64_t>(), result.data_ptr<int64_t>(), alpha.to<int64_t>());
-            break;
-        case DType::Float16:
-            add_scalar_kernel_cuda_impl<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::Half>(), other.to<float>(), result.data_ptr<tensorplay::Half>(), alpha.to<float>());
-            break;
-        case DType::BFloat16:
-            add_scalar_kernel_cuda_impl<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::BFloat16>(), other.to<float>(), result.data_ptr<tensorplay::BFloat16>(), alpha.to<float>());
-            break;
         case DType::Float64:
-            add_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), other.to<double>(), result.data_ptr<double>(), alpha.to<double>());
-            break;
-        case DType::ComplexFloat:
-            run_cplx_add_scalar<float>(a, other, alpha, result);
-            break;
-        case DType::ComplexDouble:
-            run_cplx_add_scalar<double>(a, other, alpha, result);
+        case DType::Float16:
+        case DType::BFloat16:
+        case DType::Int32:
+        case DType::Int64:
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA add_scalar: unsupported dtype");
     }
+    TensorIterator iter = make_scalar_iter(result, a, other);
+    run_binary_iter<IterAddFunctor>(iter, alpha);
+    CUDA_CHECK(cudaGetLastError());
     return result;
 }
 
 Tensor& add_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
-    int64_t n = self.numel();
-    if (n == 0) return self;
-    dim3 grid, block; get_grid_block(n, grid, block);
-    
-    if (!self.is_contiguous()) {
-        switch (self.dtype()) {
-            case DType::Float32:
-                if (launch_unary_inplace_strided<float>(self, StridedAddScalar<float>{other.to<float>(), alpha.to<float>()})) return self;
-                break;
-            case DType::Int32:
-                if (launch_unary_inplace_strided<int>(self, StridedAddScalar<int>{other.to<int>(), alpha.to<int>()})) return self;
-                break;
-            case DType::Int64:
-                if (launch_unary_inplace_strided<int64_t>(self, StridedAddScalar<int64_t>{other.to<int64_t>(), alpha.to<int64_t>()})) return self;
-                break;
-            case DType::Float16:
-                if (launch_unary_inplace_strided<tensorplay::Half>(self, StridedAddScalar<float>{other.to<float>(), alpha.to<float>()})) return self;
-                break;
-            case DType::BFloat16:
-                if (launch_unary_inplace_strided<tensorplay::BFloat16>(self, StridedAddScalar<float>{other.to<float>(), alpha.to<float>()})) return self;
-                break;
-            case DType::Float64:
-                if (launch_unary_inplace_strided<double>(self, StridedAddScalar<double>{other.to<double>(), alpha.to<double>()})) return self;
-                break;
-            case DType::ComplexFloat:
-            case DType::ComplexDouble: {
-                Tensor tmp = self.contiguous();
-                if (self.dtype() == DType::ComplexFloat) run_cplx_add_scalar<float>(tmp, other, alpha, tmp);
-                else run_cplx_add_scalar<double>(tmp, other, alpha, tmp);
-                self.copy_(tmp);
-                return self;
+    if (self.numel() == 0) return self;
+
+    if (self.dtype() == DType::ComplexFloat || self.dtype() == DType::ComplexDouble) {
+        if (!self.is_contiguous()) {
+            Tensor tmp = self.contiguous();
+            if (self.dtype() == DType::ComplexFloat) {
+                run_cplx_add_scalar<float>(tmp, other, alpha, tmp);
+            } else {
+                run_cplx_add_scalar<double>(tmp, other, alpha, tmp);
             }
-            default:
-                break;
+            self.copy_(tmp);
+        } else if (self.dtype() == DType::ComplexFloat) {
+            run_cplx_add_scalar<float>(self, other, alpha, self);
+        } else {
+            run_cplx_add_scalar<double>(self, other, alpha, self);
         }
+        return self;
     }
-    
+
     switch (self.dtype()) {
         case DType::Float32:
-            add_scalar_kernel_cuda_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<float>(), other.to<float>(), self.data_ptr<float>(), alpha.to<float>());
-            break;
-        case DType::Int32:
-            add_scalar_kernel_cuda_impl<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int>(), other.to<int>(), self.data_ptr<int>(), alpha.to<int>());
-            break;
-        case DType::Int64:
-            add_scalar_kernel_cuda_impl<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int64_t>(), other.to<int64_t>(), self.data_ptr<int64_t>(), alpha.to<int64_t>());
-            break;
-        case DType::Float16:
-            add_scalar_kernel_cuda_impl<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::Half>(), other.to<float>(), self.data_ptr<tensorplay::Half>(), alpha.to<float>());
-            break;
-        case DType::BFloat16:
-            add_scalar_kernel_cuda_impl<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::BFloat16>(), other.to<float>(), self.data_ptr<tensorplay::BFloat16>(), alpha.to<float>());
-            break;
         case DType::Float64:
-            add_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), other.to<double>(), self.data_ptr<double>(), alpha.to<double>());
-            break;
-        case DType::ComplexFloat:
-            run_cplx_add_scalar<float>(self, other, alpha, self);
-            break;
-        case DType::ComplexDouble:
-            run_cplx_add_scalar<double>(self, other, alpha, self);
+        case DType::Float16:
+        case DType::BFloat16:
+        case DType::Int32:
+        case DType::Int64:
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA add_scalar_: unsupported dtype");
     }
+    TensorIterator iter = make_scalar_iter(self, self, other);
+    run_binary_iter<IterAddFunctor>(iter, alpha);
+    CUDA_CHECK(cudaGetLastError());
     return self;
 }
 
 Tensor sub_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
     DType result_dtype = cuda::cplx::scalar_result_dtype(
         self.dtype(), other, &alpha);
-    
+
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
-    int64_t n = self.numel();
-    if (n == 0) return result;
-    dim3 grid, block; get_grid_block(n, grid, block);
-    
-    Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
-    Tensor a = (self.dtype() == result_dtype) ? self_contig : self_contig.to(result_dtype);
-    
+    if (self.numel() == 0) return result;
+
+    Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
+    if (result_dtype == DType::ComplexFloat || result_dtype == DType::ComplexDouble) {
+        Tensor a_contig = a.is_contiguous() ? a : a.contiguous();
+        if (result_dtype == DType::ComplexFloat) {
+            run_cplx_sub_scalar<float>(a_contig, other, alpha, result);
+        } else {
+            run_cplx_sub_scalar<double>(a_contig, other, alpha, result);
+        }
+        return result;
+    }
+
     switch (result_dtype) {
         case DType::Float32:
-            sub_scalar_kernel_cuda_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<float>(), other.to<float>(), result.data_ptr<float>(), alpha.to<float>());
-            break;
-        case DType::Int32:
-            sub_scalar_kernel_cuda_impl<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int>(), other.to<int>(), result.data_ptr<int>(), alpha.to<int>());
-            break;
-        case DType::Int64:
-            sub_scalar_kernel_cuda_impl<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int64_t>(), other.to<int64_t>(), result.data_ptr<int64_t>(), alpha.to<int64_t>());
-            break;
-        case DType::Float16:
-            sub_scalar_kernel_cuda_impl<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::Half>(), other.to<float>(), result.data_ptr<tensorplay::Half>(), alpha.to<float>());
-            break;
-        case DType::BFloat16:
-            sub_scalar_kernel_cuda_impl<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::BFloat16>(), other.to<float>(), result.data_ptr<tensorplay::BFloat16>(), alpha.to<float>());
-            break;
         case DType::Float64:
-            sub_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), other.to<double>(), result.data_ptr<double>(), alpha.to<double>());
-            break;
-        case DType::ComplexFloat:
-            run_cplx_sub_scalar<float>(a, other, alpha, result);
-            break;
-        case DType::ComplexDouble:
-            run_cplx_sub_scalar<double>(a, other, alpha, result);
+        case DType::Float16:
+        case DType::BFloat16:
+        case DType::Int32:
+        case DType::Int64:
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA sub_scalar: unsupported dtype");
     }
+    TensorIterator iter = make_scalar_iter(result, a, other);
+    run_binary_iter<IterSubFunctor>(iter, alpha);
+    CUDA_CHECK(cudaGetLastError());
     return result;
 }
 
 Tensor& sub_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
-    int64_t n = self.numel();
-    if (n == 0) return self;
-    dim3 grid, block; get_grid_block(n, grid, block);
-    
-    if (!self.is_contiguous()) {
-        switch (self.dtype()) {
-            case DType::Float32:
-                if (launch_unary_inplace_strided<float>(self, StridedSubScalar<float>{other.to<float>(), alpha.to<float>()})) return self;
-                break;
-            case DType::Int32:
-                if (launch_unary_inplace_strided<int>(self, StridedSubScalar<int>{other.to<int>(), alpha.to<int>()})) return self;
-                break;
-            case DType::Int64:
-                if (launch_unary_inplace_strided<int64_t>(self, StridedSubScalar<int64_t>{other.to<int64_t>(), alpha.to<int64_t>()})) return self;
-                break;
-            case DType::Float16:
-                if (launch_unary_inplace_strided<tensorplay::Half>(self, StridedSubScalar<float>{other.to<float>(), alpha.to<float>()})) return self;
-                break;
-            case DType::BFloat16:
-                if (launch_unary_inplace_strided<tensorplay::BFloat16>(self, StridedSubScalar<float>{other.to<float>(), alpha.to<float>()})) return self;
-                break;
-            case DType::Float64:
-                if (launch_unary_inplace_strided<double>(self, StridedSubScalar<double>{other.to<double>(), alpha.to<double>()})) return self;
-                break;
-            case DType::ComplexFloat:
-            case DType::ComplexDouble: {
-                Tensor tmp = self.contiguous();
-                if (self.dtype() == DType::ComplexFloat) run_cplx_sub_scalar<float>(tmp, other, alpha, tmp);
-                else run_cplx_sub_scalar<double>(tmp, other, alpha, tmp);
-                self.copy_(tmp);
-                return self;
+    if (self.numel() == 0) return self;
+
+    if (self.dtype() == DType::ComplexFloat || self.dtype() == DType::ComplexDouble) {
+        if (!self.is_contiguous()) {
+            Tensor tmp = self.contiguous();
+            if (self.dtype() == DType::ComplexFloat) {
+                run_cplx_sub_scalar<float>(tmp, other, alpha, tmp);
+            } else {
+                run_cplx_sub_scalar<double>(tmp, other, alpha, tmp);
             }
-            default:
-                break;
+            self.copy_(tmp);
+        } else if (self.dtype() == DType::ComplexFloat) {
+            run_cplx_sub_scalar<float>(self, other, alpha, self);
+        } else {
+            run_cplx_sub_scalar<double>(self, other, alpha, self);
         }
+        return self;
     }
-    
+
     switch (self.dtype()) {
         case DType::Float32:
-            sub_scalar_kernel_cuda_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<float>(), other.to<float>(), self.data_ptr<float>(), alpha.to<float>());
-            break;
-        case DType::Int32:
-            sub_scalar_kernel_cuda_impl<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int>(), other.to<int>(), self.data_ptr<int>(), alpha.to<int>());
-            break;
-        case DType::Int64:
-            sub_scalar_kernel_cuda_impl<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int64_t>(), other.to<int64_t>(), self.data_ptr<int64_t>(), alpha.to<int64_t>());
-            break;
-        case DType::Float16:
-            sub_scalar_kernel_cuda_impl<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::Half>(), other.to<float>(), self.data_ptr<tensorplay::Half>(), alpha.to<float>());
-            break;
-        case DType::BFloat16:
-            sub_scalar_kernel_cuda_impl<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::BFloat16>(), other.to<float>(), self.data_ptr<tensorplay::BFloat16>(), alpha.to<float>());
-            break;
         case DType::Float64:
-            sub_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), other.to<double>(), self.data_ptr<double>(), alpha.to<double>());
-            break;
-        case DType::ComplexFloat:
-            run_cplx_sub_scalar<float>(self, other, alpha, self);
-            break;
-        case DType::ComplexDouble:
-            run_cplx_sub_scalar<double>(self, other, alpha, self);
+        case DType::Float16:
+        case DType::BFloat16:
+        case DType::Int32:
+        case DType::Int64:
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA sub_scalar_: unsupported dtype");
     }
+    TensorIterator iter = make_scalar_iter(self, self, other);
+    run_binary_iter<IterSubFunctor>(iter, alpha);
+    CUDA_CHECK(cudaGetLastError());
     return self;
 }
 
 Tensor mul_scalar_kernel(const Tensor& self, Scalar other) {
     DType result_dtype = cuda::cplx::scalar_result_dtype(self.dtype(), other);
-    
+
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
-    int64_t n = self.numel();
-    if (n == 0) return result;
-    dim3 grid, block; get_grid_block(n, grid, block);
-    
-    Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
-    Tensor a = (self.dtype() == result_dtype) ? self_contig : self_contig.to(result_dtype);
-    
+    if (self.numel() == 0) return result;
+
+    Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
+    if (result_dtype == DType::ComplexFloat || result_dtype == DType::ComplexDouble) {
+        Tensor a_contig = a.is_contiguous() ? a : a.contiguous();
+        if (result_dtype == DType::ComplexFloat) {
+            run_cplx_mul_scalar<float>(a_contig, other, result);
+        } else {
+            run_cplx_mul_scalar<double>(a_contig, other, result);
+        }
+        return result;
+    }
+
     switch (result_dtype) {
         case DType::Float32:
-            mul_scalar_kernel_cuda_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<float>(), other.to<float>(), result.data_ptr<float>());
-            break;
-        case DType::Int32:
-            mul_scalar_kernel_cuda_impl<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int>(), other.to<int>(), result.data_ptr<int>());
-            break;
-        case DType::Int64:
-            mul_scalar_kernel_cuda_impl<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int64_t>(), other.to<int64_t>(), result.data_ptr<int64_t>());
-            break;
-        case DType::Float16:
-            mul_scalar_kernel_cuda_impl<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::Half>(), other.to<float>(), result.data_ptr<tensorplay::Half>());
-            break;
-        case DType::BFloat16:
-            mul_scalar_kernel_cuda_impl<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::BFloat16>(), other.to<float>(), result.data_ptr<tensorplay::BFloat16>());
-            break;
         case DType::Float64:
-            mul_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), other.to<double>(), result.data_ptr<double>());
-            break;
-        case DType::ComplexFloat:
-            run_cplx_mul_scalar<float>(a, other, result);
-            break;
-        case DType::ComplexDouble:
-            run_cplx_mul_scalar<double>(a, other, result);
+        case DType::Float16:
+        case DType::BFloat16:
+        case DType::Int32:
+        case DType::Int64:
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA mul_scalar: unsupported dtype");
     }
+    TensorIterator iter = make_scalar_iter(result, a, other);
+    run_binary_iter<IterMulFunctor>(iter, Scalar(1));
+    CUDA_CHECK(cudaGetLastError());
     return result;
 }
 
 Tensor& mul_scalar_inplace_kernel(Tensor& self, Scalar other) {
-    int64_t n = self.numel();
-    if (n == 0) return self;
-    dim3 grid, block; get_grid_block(n, grid, block);
-    
-    if (!self.is_contiguous()) {
-        switch (self.dtype()) {
-            case DType::Float32:
-                if (launch_unary_inplace_strided<float>(self, StridedMulScalar<float>{other.to<float>()})) return self;
-                break;
-            case DType::Int32:
-                if (launch_unary_inplace_strided<int>(self, StridedMulScalar<int>{other.to<int>()})) return self;
-                break;
-            case DType::Int64:
-                if (launch_unary_inplace_strided<int64_t>(self, StridedMulScalar<int64_t>{other.to<int64_t>()})) return self;
-                break;
-            case DType::Float16:
-                if (launch_unary_inplace_strided<tensorplay::Half>(self, StridedMulScalar<float>{other.to<float>()})) return self;
-                break;
-            case DType::BFloat16:
-                if (launch_unary_inplace_strided<tensorplay::BFloat16>(self, StridedMulScalar<float>{other.to<float>()})) return self;
-                break;
-            case DType::Float64:
-                if (launch_unary_inplace_strided<double>(self, StridedMulScalar<double>{other.to<double>()})) return self;
-                break;
-            case DType::ComplexFloat:
-            case DType::ComplexDouble: {
-                Tensor tmp = self.contiguous();
-                if (self.dtype() == DType::ComplexFloat) run_cplx_mul_scalar<float>(tmp, other, tmp);
-                else run_cplx_mul_scalar<double>(tmp, other, tmp);
-                self.copy_(tmp);
-                return self;
+    if (self.numel() == 0) return self;
+
+    if (self.dtype() == DType::ComplexFloat || self.dtype() == DType::ComplexDouble) {
+        if (!self.is_contiguous()) {
+            Tensor tmp = self.contiguous();
+            if (self.dtype() == DType::ComplexFloat) {
+                run_cplx_mul_scalar<float>(tmp, other, tmp);
+            } else {
+                run_cplx_mul_scalar<double>(tmp, other, tmp);
             }
-            default:
-                break;
+            self.copy_(tmp);
+        } else if (self.dtype() == DType::ComplexFloat) {
+            run_cplx_mul_scalar<float>(self, other, self);
+        } else {
+            run_cplx_mul_scalar<double>(self, other, self);
         }
+        return self;
     }
-    
+
     switch (self.dtype()) {
         case DType::Float32:
-            mul_scalar_kernel_cuda_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<float>(), other.to<float>(), self.data_ptr<float>());
-            break;
-        case DType::Int32:
-            mul_scalar_kernel_cuda_impl<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int>(), other.to<int>(), self.data_ptr<int>());
-            break;
-        case DType::Int64:
-            mul_scalar_kernel_cuda_impl<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int64_t>(), other.to<int64_t>(), self.data_ptr<int64_t>());
-            break;
-        case DType::Float16:
-            mul_scalar_kernel_cuda_impl<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::Half>(), other.to<float>(), self.data_ptr<tensorplay::Half>());
-            break;
-        case DType::BFloat16:
-            mul_scalar_kernel_cuda_impl<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::BFloat16>(), other.to<float>(), self.data_ptr<tensorplay::BFloat16>());
-            break;
         case DType::Float64:
-            mul_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), other.to<double>(), self.data_ptr<double>());
-            break;
-        case DType::ComplexFloat:
-            run_cplx_mul_scalar<float>(self, other, self);
-            break;
-        case DType::ComplexDouble:
-            run_cplx_mul_scalar<double>(self, other, self);
+        case DType::Float16:
+        case DType::BFloat16:
+        case DType::Int32:
+        case DType::Int64:
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA mul_scalar_: unsupported dtype");
     }
+    TensorIterator iter = make_scalar_iter(self, self, other);
+    run_binary_iter<IterMulFunctor>(iter, Scalar(1));
+    CUDA_CHECK(cudaGetLastError());
     return self;
 }
 
@@ -1831,111 +1654,72 @@ Tensor div_scalar_kernel(const Tensor& self, Scalar other) {
     } else if (!isComplexType(result_dtype) && other.isComplex()) {
         result_dtype = promoteTypes(toComplexType(result_dtype), other.dtype());
     }
-    
+
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
-    int64_t n = self.numel();
-    if (n == 0) return result;
-    dim3 grid, block; get_grid_block(n, grid, block);
-    
-    Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
-    Tensor a = (self.dtype() == result_dtype) ? self_contig : self_contig.to(result_dtype);
-    
+    if (self.numel() == 0) return result;
+
+    Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
+    if (result_dtype == DType::ComplexFloat || result_dtype == DType::ComplexDouble) {
+        Tensor a_contig = a.is_contiguous() ? a : a.contiguous();
+        if (result_dtype == DType::ComplexFloat) {
+            run_cplx_div_scalar<float>(a_contig, other, result);
+        } else {
+            run_cplx_div_scalar<double>(a_contig, other, result);
+        }
+        return result;
+    }
+
     switch (result_dtype) {
         case DType::Float32:
-            div_scalar_kernel_cuda_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<float>(), other.to<float>(), result.data_ptr<float>());
-            break;
-        case DType::Float16:
-            div_scalar_kernel_cuda_impl<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::Half>(), other.to<float>(), result.data_ptr<tensorplay::Half>());
-            break;
-        case DType::BFloat16:
-            div_scalar_kernel_cuda_impl<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::BFloat16>(), other.to<float>(), result.data_ptr<tensorplay::BFloat16>());
-            break;
         case DType::Float64:
-            div_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), other.to<double>(), result.data_ptr<double>());
-            break;
-        case DType::ComplexFloat:
-            run_cplx_div_scalar<float>(a, other, result);
-            break;
-        case DType::ComplexDouble:
-            run_cplx_div_scalar<double>(a, other, result);
+        case DType::Float16:
+        case DType::BFloat16:
+        case DType::Int32:
+        case DType::Int64:
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA div_scalar: unsupported dtype");
     }
+    TensorIterator iter = make_scalar_iter(result, a, other);
+    run_binary_iter<IterDivFunctor>(iter, Scalar(1));
+    CUDA_CHECK(cudaGetLastError());
     return result;
 }
 
 Tensor& div_scalar_inplace_kernel(Tensor& self, Scalar other) {
-    int64_t n = self.numel();
-    if (n == 0) return self;
-    dim3 grid, block; get_grid_block(n, grid, block);
-    
-    if (!self.is_contiguous()) {
-        switch (self.dtype()) {
-            case DType::Float32:
-                if (launch_unary_inplace_strided<float>(self, StridedDivScalar<float>{other.to<float>()})) return self;
-                break;
-            case DType::Int32:
-                if (launch_unary_inplace_strided<int>(self, StridedDivScalar<int>{other.to<int>()})) return self;
-                break;
-            case DType::Int64:
-                if (launch_unary_inplace_strided<int64_t>(self, StridedDivScalar<int64_t>{other.to<int64_t>()})) return self;
-                break;
-            case DType::Float16:
-                if (launch_unary_inplace_strided<tensorplay::Half>(self, StridedDivScalar<float>{other.to<float>()})) return self;
-                break;
-            case DType::BFloat16:
-                if (launch_unary_inplace_strided<tensorplay::BFloat16>(self, StridedDivScalar<float>{other.to<float>()})) return self;
-                break;
-            case DType::Float64:
-                if (launch_unary_inplace_strided<double>(self, StridedDivScalar<double>{other.to<double>()})) return self;
-                break;
-            case DType::ComplexFloat:
-            case DType::ComplexDouble: {
-                Tensor tmp = self.contiguous();
-                if (self.dtype() == DType::ComplexFloat) run_cplx_div_scalar<float>(tmp, other, tmp);
-                else run_cplx_div_scalar<double>(tmp, other, tmp);
-                self.copy_(tmp);
-                return self;
+    if (self.numel() == 0) return self;
+
+    if (self.dtype() == DType::ComplexFloat || self.dtype() == DType::ComplexDouble) {
+        if (!self.is_contiguous()) {
+            Tensor tmp = self.contiguous();
+            if (self.dtype() == DType::ComplexFloat) {
+                run_cplx_div_scalar<float>(tmp, other, tmp);
+            } else {
+                run_cplx_div_scalar<double>(tmp, other, tmp);
             }
-            default:
-                break;
+            self.copy_(tmp);
+        } else if (self.dtype() == DType::ComplexFloat) {
+            run_cplx_div_scalar<float>(self, other, self);
+        } else {
+            run_cplx_div_scalar<double>(self, other, self);
         }
+        return self;
     }
-    
-    // Inplace division on integer tensor?
-    // Unless floor_divide.
-    // Here we implement standard C++ division which for int is floor/trunc.
-    // If float, it's float div.
-    
+
     switch (self.dtype()) {
         case DType::Float32:
-            div_scalar_kernel_cuda_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<float>(), other.to<float>(), self.data_ptr<float>());
-            break;
-        case DType::Int32:
-            div_scalar_kernel_cuda_impl<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int>(), other.to<int>(), self.data_ptr<int>());
-            break;
-        case DType::Int64:
-            div_scalar_kernel_cuda_impl<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int64_t>(), other.to<int64_t>(), self.data_ptr<int64_t>());
-            break;
-        case DType::Float16:
-            div_scalar_kernel_cuda_impl<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::Half>(), other.to<float>(), self.data_ptr<tensorplay::Half>());
-            break;
-        case DType::BFloat16:
-            div_scalar_kernel_cuda_impl<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::BFloat16>(), other.to<float>(), self.data_ptr<tensorplay::BFloat16>());
-            break;
         case DType::Float64:
-            div_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), other.to<double>(), self.data_ptr<double>());
-            break;
-        case DType::ComplexFloat:
-            run_cplx_div_scalar<float>(self, other, self);
-            break;
-        case DType::ComplexDouble:
-            run_cplx_div_scalar<double>(self, other, self);
+        case DType::Float16:
+        case DType::BFloat16:
+        case DType::Int32:
+        case DType::Int64:
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA div_scalar_: unsupported dtype");
     }
+    TensorIterator iter = make_scalar_iter(self, self, other);
+    run_binary_iter<IterDivFunctor>(iter, Scalar(1));
+    CUDA_CHECK(cudaGetLastError());
     return self;
 }
 
