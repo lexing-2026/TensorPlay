@@ -200,6 +200,49 @@ Tensor& out_wrap_histc_out(const Tensor& self, int64_t bins, Scalar min, Scalar 
     return out;
 }
 
+std::tuple<Tensor, Tensor> out_wrap_histogram_bins_tensor_out(
+        const Tensor& self, const Tensor& bins,
+        const std::optional<Tensor>& weight, bool density, Tensor& hist,
+        Tensor& bin_edges) {
+    if (hist.dtype() != self.dtype() || bin_edges.dtype() != self.dtype()) {
+        TP_THROW(TypeError,
+                 "histogram(): output tensors must have the same dtype as the input");
+    }
+    if (hist.device() != self.device() || bin_edges.device() != self.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "histogram(): output tensors must be on the same device as the input");
+    }
+    auto result = ops::histogram(self, bins, weight, density);
+    hist.resize_(static_cast<std::vector<int64_t>>(std::get<0>(result).shape()));
+    hist.copy_(std::get<0>(result));
+    bin_edges.resize_(
+        static_cast<std::vector<int64_t>>(std::get<1>(result).shape()));
+    bin_edges.copy_(std::get<1>(result));
+    return {hist, bin_edges};
+}
+
+std::tuple<Tensor, Tensor> out_wrap_histogram_bin_ct_out(
+        const Tensor& self, int64_t bins,
+        std::optional<std::vector<double>> range,
+        const std::optional<Tensor>& weight, bool density, Tensor& hist,
+        Tensor& bin_edges) {
+    if (hist.dtype() != self.dtype() || bin_edges.dtype() != self.dtype()) {
+        TP_THROW(TypeError,
+                 "histogram(): output tensors must have the same dtype as the input");
+    }
+    if (hist.device() != self.device() || bin_edges.device() != self.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "histogram(): output tensors must be on the same device as the input");
+    }
+    auto result = ops::histogram(self, bins, std::move(range), weight, density);
+    hist.resize_(static_cast<std::vector<int64_t>>(std::get<0>(result).shape()));
+    hist.copy_(std::get<0>(result));
+    bin_edges.resize_(
+        static_cast<std::vector<int64_t>>(std::get<1>(result).shape()));
+    bin_edges.copy_(std::get<1>(result));
+    return {hist, bin_edges};
+}
+
 Tensor& out_wrap_huber_loss_backward_out(const Tensor& grad_output, const Tensor& self, const Tensor& target, int64_t reduction, double delta, Tensor& grad_input) {
     grad_input = ops::huber_loss_backward(grad_output, self, target, reduction, delta);
     return grad_input;
@@ -738,6 +781,8 @@ TENSORPLAY_LIBRARY_IMPL(Composite, VariantWiringoutvariants) {
     m.impl("gather.out", composite::out_wrap_gather_out);
     m.impl("hardtanh_backward.grad_input", composite::out_wrap_hardtanh_backward_grad_input);
     m.impl("histc.out", composite::out_wrap_histc_out);
+    m.impl("histogram.bins_tensor_out", composite::out_wrap_histogram_bins_tensor_out);
+    m.impl("histogram.bin_ct_out", composite::out_wrap_histogram_bin_ct_out);
     m.impl("huber_loss_backward.out", composite::out_wrap_huber_loss_backward_out);
     m.impl("im2col.out", composite::out_wrap_im2col_out);
     m.impl("index_add.out", composite::out_wrap_index_add_out);
