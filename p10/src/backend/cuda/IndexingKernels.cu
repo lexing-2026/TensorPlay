@@ -1733,9 +1733,19 @@ Tensor scan_entry(const Tensor& self, int64_t dim, T init_val, Op op) {
     }
     if (inner == 1 && d_size >= 512) {
         const int64_t blocks = std::min<int64_t>(outer, 4096);
-        constexpr int kWarpThreads = 32;
-        scan_row_kernel<T, Op><<<static_cast<unsigned>(blocks), kWarpThreads, 0, stream>>>(
-            outer, d_size, self_c.data_ptr<T>(), result.data_ptr<T>(), init_val, op);
+        if constexpr (std::is_same_v<T, tensorplay::complex<float>> ||
+                      std::is_same_v<T, tensorplay::complex<double>>) {
+            constexpr int kScanBlockThreads = 512;
+            scan_single_row_block_kernel<T, Op, kScanBlockThreads><<<
+                static_cast<unsigned>(blocks), kScanBlockThreads,
+                static_cast<size_t>(2) * kScanBlockThreads * sizeof(scan_accum_t<T>),
+                stream>>>(outer, d_size, self_c.data_ptr<T>(), result.data_ptr<T>(),
+                          init_val, op);
+        } else {
+            constexpr int kWarpThreads = 32;
+            scan_row_kernel<T, Op><<<static_cast<unsigned>(blocks), kWarpThreads, 0, stream>>>(
+                outer, d_size, self_c.data_ptr<T>(), result.data_ptr<T>(), init_val, op);
+        }
     } else if (inner > 1) {
         const int threads = static_cast<int>(std::min<int64_t>(inner, 512));
         const int64_t blocks_x = std::min<int64_t>(outer, 65535);
