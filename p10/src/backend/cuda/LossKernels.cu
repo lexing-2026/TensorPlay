@@ -13,6 +13,7 @@
 #include "Utils.h"
 #include "TypePromotion.h"
 #include "CUDARuntime.h"
+#include "CUDALoops.cuh"
 
 #include <cuda_runtime.h>
 
@@ -101,19 +102,6 @@ Tensor tp_scale_grad(const Tensor& grad, int64_t reduction, int64_t numel) {
 // elementwise kernels (one thread per pair element)
 // ---------------------------------------------------------------------------
 
-__global__ void l1_elem_kernel(int64_t n, const double* a, const double* b, double* o) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += st) o[i] = ::fabs(a[i] - b[i]);
-}
-
-__global__ void kl_div_elem_kernel(int64_t n, const double* x, const double* t, double* o) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += st)
-        o[i] = t[i] > 0 ? t[i] * (::log(t[i]) - x[i]) : 0.0;
-}
-
 __device__ inline double dsp(double y) {
     return ::fmax(y, 0.0) + ::log1p(::exp(-::fabs(y)));
 }
@@ -130,39 +118,12 @@ __global__ void bce_with_logits_elem_kernel(int64_t n, const double* x, const do
     }
 }
 
-__global__ void hinge_emb_elem_kernel(int64_t n, const double* x, const double* t,
-                                      double margin, double* o) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += st)
-        o[i] = (t[i] == 1.0) ? x[i] : ::fmax(0.0, margin - x[i]);
-}
-
 __global__ void margin_rank_elem_kernel(int64_t n, const double* a, const double* b,
                                         const double* g, double margin, double* o) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += st)
         o[i] = ::fmax(0.0, margin - g[i] * (a[i] - b[i]));
-}
-
-__global__ void soft_margin_elem_kernel(int64_t n, const double* x, const double* t,
-                                        double* o) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += st) o[i] = dsp(-t[i] * x[i]);
-}
-
-__global__ void poisson_elem_kernel(int64_t n, const double* x, const double* z,
-                                    bool log_input, bool full, double eps, double* o) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += st) {
-        double l2 = log_input ? (::exp(x[i]) - z[i] * x[i])
-                              : (x[i] - z[i] * ::log(::exp(x[i]) + eps));
-        if (full && z[i] > 0) l2 += z[i] * ::log(z[i]) - ::lgamma(z[i] + 1.0);
-        o[i] = l2;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -231,10 +192,15 @@ Tensor l1_loss_cuda(const Tensor& input, const Tensor& target) {
     Tensor elems = Tensor::empty(shape_of(pr.first), DType::Float64, input.device());
     int64_t n = elems.numel();
     if (n) {
-        auto stream = getCurrentCUDAStream().stream();
-        l1_elem_kernel<<<loss_grid(n), kThreads, 0, stream>>>(
-            n, pr.first.data_ptr<double>(), pr.second.data_ptr<double>(),
-            elems.data_ptr<double>());
+        TensorIterator iter = TensorIteratorConfig()
+            .check_all_same_dtype(true)
+            .add_output(elems)
+            .add_const_input(pr.first)
+            .add_const_input(pr.second)
+            .build();
+        gpu_kernel(iter, [] __device__(double a, double b) -> double {
+            return ::fabs(a - b);
+        });
         CUDA_CHECK(cudaGetLastError());
     }
     return mean_from_elems(elems, n, input.dtype(), input.device());
@@ -245,10 +211,15 @@ Tensor kl_div_cuda(const Tensor& input, const Tensor& target) {
     Tensor elems = Tensor::empty(shape_of(pr.first), DType::Float64, input.device());
     int64_t n = elems.numel();
     if (n) {
-        auto stream = getCurrentCUDAStream().stream();
-        kl_div_elem_kernel<<<loss_grid(n), kThreads, 0, stream>>>(
-            n, pr.first.data_ptr<double>(), pr.second.data_ptr<double>(),
-            elems.data_ptr<double>());
+        TensorIterator iter = TensorIteratorConfig()
+            .check_all_same_dtype(true)
+            .add_output(elems)
+            .add_const_input(pr.first)
+            .add_const_input(pr.second)
+            .build();
+        gpu_kernel(iter, [] __device__(double x, double t) -> double {
+            return t > 0 ? t * (::log(t) - x) : 0.0;
+        });
         CUDA_CHECK(cudaGetLastError());
     }
     return mean_from_elems(elems, n, input.dtype(), input.device());
@@ -284,10 +255,16 @@ Tensor hinge_embedding_loss_cuda(const Tensor& input, const Tensor& target, Scal
     Tensor elems = Tensor::empty(shape_of(pr.first), DType::Float64, input.device());
     int64_t n = elems.numel();
     if (n) {
-        auto stream = getCurrentCUDAStream().stream();
-        hinge_emb_elem_kernel<<<loss_grid(n), kThreads, 0, stream>>>(
-            n, pr.first.data_ptr<double>(), pr.second.data_ptr<double>(), margin.toDouble(),
-            elems.data_ptr<double>());
+        const double margin_value = margin.toDouble();
+        TensorIterator iter = TensorIteratorConfig()
+            .check_all_same_dtype(true)
+            .add_output(elems)
+            .add_const_input(pr.first)
+            .add_const_input(pr.second)
+            .build();
+        gpu_kernel(iter, [margin_value] __device__(double x, double t) -> double {
+            return (t == 1.0) ? x : ::fmax(0.0, margin_value - x);
+        });
         CUDA_CHECK(cudaGetLastError());
     }
     return mean_from_elems(elems, n, input.dtype(), input.device());
@@ -314,10 +291,15 @@ Tensor soft_margin_loss_cuda(const Tensor& input, const Tensor& target) {
     Tensor elems = Tensor::empty(shape_of(pr.first), DType::Float64, input.device());
     int64_t n = elems.numel();
     if (n) {
-        auto stream = getCurrentCUDAStream().stream();
-        soft_margin_elem_kernel<<<loss_grid(n), kThreads, 0, stream>>>(
-            n, pr.first.data_ptr<double>(), pr.second.data_ptr<double>(),
-            elems.data_ptr<double>());
+        TensorIterator iter = TensorIteratorConfig()
+            .check_all_same_dtype(true)
+            .add_output(elems)
+            .add_const_input(pr.first)
+            .add_const_input(pr.second)
+            .build();
+        gpu_kernel(iter, [] __device__(double x, double t) -> double {
+            return dsp(-t * x);
+        });
         CUDA_CHECK(cudaGetLastError());
     }
     return mean_from_elems(elems, n, input.dtype(), input.device());
@@ -329,10 +311,18 @@ Tensor poisson_nll_loss_cuda(const Tensor& input, const Tensor& target, bool log
     Tensor elems = Tensor::empty(shape_of(pr.first), DType::Float64, input.device());
     int64_t n = elems.numel();
     if (n) {
-        auto stream = getCurrentCUDAStream().stream();
-        poisson_elem_kernel<<<loss_grid(n), kThreads, 0, stream>>>(
-            n, pr.first.data_ptr<double>(), pr.second.data_ptr<double>(),
-            log_input, full, eps, elems.data_ptr<double>());
+        TensorIterator iter = TensorIteratorConfig()
+            .check_all_same_dtype(true)
+            .add_output(elems)
+            .add_const_input(pr.first)
+            .add_const_input(pr.second)
+            .build();
+        gpu_kernel(iter, [log_input, full, eps] __device__(double x, double z) -> double {
+            double l2 = log_input ? (::exp(x) - z * x)
+                                  : (x - z * ::log(::exp(x) + eps));
+            if (full && z > 0) l2 += z * ::log(z) - ::lgamma(z + 1.0);
+            return l2;
+        });
         CUDA_CHECK(cudaGetLastError());
     }
     return mean_from_elems(elems, n, input.dtype(), input.device());
