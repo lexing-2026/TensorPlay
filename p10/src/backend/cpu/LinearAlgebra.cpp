@@ -6,6 +6,7 @@
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -194,6 +195,337 @@ Tensor linalg_tensorsolve_impl(
     return ops::reshape(ops::linalg_solve(matrix, rhs), result_shape);
 }
 
+std::vector<int64_t> normalize_norm_dims(
+    const std::vector<int64_t>& dims, int64_t ndim) {
+    std::vector<int64_t> normalized;
+    normalized.reserve(dims.size());
+    std::vector<bool> seen(static_cast<size_t>(ndim), false);
+    for (int64_t dim : dims) {
+        if (dim < 0) dim += ndim;
+        if (dim < 0 || dim >= ndim) {
+            TP_THROW(IndexError,
+                     "linalg norm dimension is out of range");
+        }
+        if (seen[static_cast<size_t>(dim)]) {
+            TP_THROW(ValueError,
+                     "linalg norm dimensions must be unique");
+        }
+        seen[static_cast<size_t>(dim)] = true;
+        normalized.push_back(dim);
+    }
+    return normalized;
+}
+
+DType validate_norm_dtype(const Tensor& self,
+                          const std::optional<DType>& dtype) {
+    if (!isFloatingOrComplexType(self.dtype())) {
+        TP_THROW(TypeError,
+                 "linalg norm expects a floating or complex input");
+    }
+    if (!dtype.has_value()) return toRealValueType(self.dtype());
+    if (!isFloatingOrComplexType(*dtype)) {
+        TP_THROW(TypeError,
+                 "linalg norm dtype must be floating or complex");
+    }
+    if (isComplexType(self.dtype()) != isComplexType(*dtype)) {
+        TP_THROW(TypeError,
+                 "linalg norm dtype must preserve the input value kind");
+    }
+    if (promoteTypes(self.dtype(), *dtype) != *dtype) {
+        TP_THROW(TypeError,
+                 "linalg norm dtype must not narrow the input");
+    }
+    return toRealValueType(*dtype);
+}
+
+Tensor cast_norm_input(const Tensor& self, const std::optional<DType>& dtype,
+                       DType* result_dtype) {
+    *result_dtype = validate_norm_dtype(self, dtype);
+    if (dtype.has_value() && self.dtype() != *dtype) return self.to(*dtype);
+    return self;
+}
+
+std::vector<int64_t> all_dimensions(int64_t ndim) {
+    std::vector<int64_t> dims;
+    dims.reserve(static_cast<size_t>(ndim));
+    for (int64_t dim = 0; dim < ndim; ++dim) dims.push_back(dim);
+    return dims;
+}
+
+std::vector<int64_t> matrix_norm_output_shape(
+    const Tensor& self, const std::vector<int64_t>& dims, bool keepdim) {
+    std::vector<int64_t> shape =
+        static_cast<std::vector<int64_t>>(self.shape());
+    if (keepdim) {
+        shape[static_cast<size_t>(dims[0])] = 1;
+        shape[static_cast<size_t>(dims[1])] = 1;
+    } else {
+        std::vector<int64_t> descending = dims;
+        std::sort(descending.rbegin(), descending.rend());
+        for (int64_t dim : descending) {
+            shape.erase(shape.begin() + dim);
+        }
+    }
+    return shape;
+}
+
+std::vector<int64_t> move_matrix_dims_to_end(
+    int64_t first, int64_t second, int64_t ndim) {
+    std::vector<int64_t> permutation;
+    permutation.reserve(static_cast<size_t>(ndim));
+    for (int64_t dim = 0; dim < ndim; ++dim) {
+        if (dim != first && dim != second) permutation.push_back(dim);
+    }
+    permutation.push_back(first);
+    permutation.push_back(second);
+    return permutation;
+}
+
+std::vector<int64_t> inverse_permutation(
+    const std::vector<int64_t>& permutation) {
+    std::vector<int64_t> inverse(permutation.size());
+    for (size_t i = 0; i < permutation.size(); ++i) {
+        inverse[static_cast<size_t>(permutation[i])] = static_cast<int64_t>(i);
+    }
+    return inverse;
+}
+
+Tensor reduce_singular_values(const Tensor& self,
+                              const std::vector<int64_t>& dims,
+                              bool keepdim, bool minimum, DType dtype) {
+    const std::vector<int64_t> permutation =
+        move_matrix_dims_to_end(dims[0], dims[1], self.dim());
+    const std::vector<int64_t> inverse = inverse_permutation(permutation);
+    Tensor values = ops::linalg_svdvals(
+        ops::permute(self, permutation), std::optional<std::string>());
+    Tensor result = minimum
+        ? ops::amin(values, {-1}, keepdim)
+        : ops::amax(values, {-1}, keepdim);
+    if (keepdim) result = ops::permute(ops::unsqueeze(result, -1), inverse);
+    if (result.dtype() != dtype) result = result.to(dtype);
+    return result;
+}
+
+Tensor linalg_vector_norm_impl(
+    const Tensor& self, const Scalar& ord,
+    const std::optional<std::vector<int64_t>>& dims, bool keepdim,
+    const std::optional<DType>& dtype) {
+    if (ord.isComplex()) {
+        TP_THROW(TypeError,
+                 "linalg.vector_norm order must be real");
+    }
+    DType result_dtype = DType::Undefined;
+    Tensor working = cast_norm_input(self, dtype, &result_dtype);
+    Tensor result;
+    if (!dims.has_value() || dims->empty()) {
+        if (keepdim) {
+            result = ops::norm(working, std::optional<Scalar>(ord),
+                               all_dimensions(working.dim()), true);
+        } else {
+            result = ops::norm(working, ord.toDouble());
+        }
+    } else {
+        const std::vector<int64_t> normalized =
+            normalize_norm_dims(*dims, working.dim());
+        result = ops::norm(working, std::optional<Scalar>(ord), normalized,
+                           keepdim);
+    }
+    if (result.dtype() != result_dtype) result = result.to(result_dtype);
+    return result;
+}
+
+Tensor linalg_powsum_impl(
+    const Tensor& self, const Scalar& ord,
+    const std::optional<std::vector<int64_t>>& dims, bool keepdim,
+    const std::optional<DType>& dtype) {
+    if (ord.isComplex()) {
+        TP_THROW(TypeError,
+                 "linalg power sum order must be real");
+    }
+    DType compute_dtype = dtype.value_or(
+        isIntegralType(self.dtype(), true) ? DType::Float32 : self.dtype());
+    Tensor working = self;
+    if (working.dtype() != compute_dtype) working = working.to(compute_dtype);
+    const DType result_dtype = toRealValueType(compute_dtype);
+    Tensor powers = ops::pow(ops::abs(working), ord);
+    Tensor result;
+    if (!dims.has_value() || dims->empty()) {
+        if (keepdim) {
+            result = ops::sum(powers, all_dimensions(working.dim()), true,
+                              result_dtype);
+        } else {
+            result = ops::sum(powers, result_dtype);
+        }
+    } else {
+        const std::vector<int64_t> normalized =
+            normalize_norm_dims(*dims, working.dim());
+        result = ops::sum(powers, normalized, keepdim, result_dtype);
+    }
+    if (result.dtype() != result_dtype) result = result.to(result_dtype);
+    return result;
+}
+
+Tensor linalg_matrix_norm_impl(
+    const Tensor& self, const Scalar& ord,
+    const std::vector<int64_t>& dims, bool keepdim,
+    const std::optional<DType>& dtype) {
+    if (ord.isComplex()) {
+        TP_THROW(TypeError,
+                 "linalg.matrix_norm order must be real");
+    }
+    if (self.dim() < 2) {
+        TP_THROW(RuntimeError,
+                 "linalg.matrix_norm expects a tensor with at least 2 dimensions");
+    }
+    if (dims.size() != 2) {
+        TP_THROW(ValueError,
+                 "linalg.matrix_norm dimensions must contain two entries");
+    }
+    const std::vector<int64_t> normalized =
+        normalize_norm_dims(dims, self.dim());
+    if (normalized[0] == normalized[1]) {
+        TP_THROW(ValueError,
+                 "linalg.matrix_norm dimensions must be different");
+    }
+    const double value = ord.toDouble();
+    const double absolute = std::abs(value);
+    if (absolute != 1.0 && absolute != 2.0 && !std::isinf(absolute)) {
+        TP_THROW(ValueError,
+                 "linalg.matrix_norm order is not supported");
+    }
+
+    DType result_dtype = DType::Undefined;
+    Tensor working = cast_norm_input(self, dtype, &result_dtype);
+    if ((working.size(normalized[0]) == 0 ||
+         working.size(normalized[1]) == 0) && value > 0.0) {
+        return Tensor::zeros(
+            matrix_norm_output_shape(working, normalized, keepdim),
+            result_dtype, working.device());
+    }
+    if (absolute == 2.0) {
+        return reduce_singular_values(working, normalized, keepdim,
+                                      value < 0.0, result_dtype);
+    }
+
+    int64_t first = normalized[0];
+    int64_t second = normalized[1];
+    if (std::isinf(absolute)) std::swap(first, second);
+    Tensor values = ops::sum(ops::abs(working), {first}, keepdim,
+                             result_dtype);
+    if (!keepdim && second > first) --second;
+    Tensor result = value > 0.0
+        ? ops::amax(values, {second}, keepdim)
+        : ops::amin(values, {second}, keepdim);
+    if (result.dtype() != result_dtype) result = result.to(result_dtype);
+    return result;
+}
+
+Tensor linalg_matrix_norm_string_impl(
+    const Tensor& self, const std::string& ord,
+    const std::vector<int64_t>& dims, bool keepdim,
+    const std::optional<DType>& dtype) {
+    if (ord != "fro" && ord != "nuc") {
+        TP_THROW(ValueError,
+                 "linalg.matrix_norm order is not supported");
+    }
+    if (self.dim() < 2) {
+        TP_THROW(RuntimeError,
+                 "linalg.matrix_norm expects a tensor with at least 2 dimensions");
+    }
+    if (dims.size() != 2) {
+        TP_THROW(ValueError,
+                 "linalg.matrix_norm dimensions must contain two entries");
+    }
+    const std::vector<int64_t> normalized =
+        normalize_norm_dims(dims, self.dim());
+    if (normalized[0] == normalized[1]) {
+        TP_THROW(ValueError,
+                 "linalg.matrix_norm dimensions must be different");
+    }
+    DType result_dtype = DType::Undefined;
+    Tensor working = cast_norm_input(self, dtype, &result_dtype);
+    if (working.size(normalized[0]) == 0 || working.size(normalized[1]) == 0) {
+        return Tensor::zeros(
+            matrix_norm_output_shape(working, normalized, keepdim),
+            result_dtype, working.device());
+    }
+    if (ord == "fro") {
+        return linalg_vector_norm_impl(
+            working, Scalar(2), std::optional<std::vector<int64_t>>(normalized),
+            keepdim, std::nullopt);
+    }
+    const std::vector<int64_t> permutation =
+        move_matrix_dims_to_end(normalized[0], normalized[1], working.dim());
+    const std::vector<int64_t> inverse = inverse_permutation(permutation);
+    Tensor values = ops::linalg_svdvals(
+        ops::permute(working, permutation), std::optional<std::string>());
+    Tensor result = ops::sum(values, {-1}, keepdim, result_dtype);
+    if (keepdim) result = ops::permute(ops::unsqueeze(result, -1), inverse);
+    if (result.dtype() != result_dtype) result = result.to(result_dtype);
+    return result;
+}
+
+Tensor linalg_norm_impl(
+    const Tensor& self, const std::optional<Scalar>& ord,
+    const std::optional<std::vector<int64_t>>& dims, bool keepdim,
+    const std::optional<DType>& dtype) {
+    if (dims.has_value() && dims->size() != 1 && dims->size() != 2) {
+        TP_THROW(ValueError,
+                 "linalg.norm dimensions must contain one or two entries");
+    }
+    if (!dims.has_value() && ord.has_value() &&
+        self.dim() != 1 && self.dim() != 2) {
+        TP_THROW(ValueError,
+                 "linalg.norm requires a 1-D or 2-D input when order is set");
+    }
+    if (ord.has_value() &&
+        ((dims.has_value() && dims->size() == 2) ||
+         (!dims.has_value() && self.dim() == 2))) {
+        const std::vector<int64_t> matrix_dims =
+            dims.has_value() ? *dims : std::vector<int64_t>{0, 1};
+        return linalg_matrix_norm_impl(
+            self, *ord, matrix_dims, keepdim, dtype);
+    }
+    return linalg_vector_norm_impl(
+        self, ord.value_or(Scalar(2)), dims, keepdim, dtype);
+}
+
+Tensor linalg_norm_string_impl(
+    const Tensor& self, const std::string& ord,
+    const std::optional<std::vector<int64_t>>& dims, bool keepdim,
+    const std::optional<DType>& dtype) {
+    if (dims.has_value() && dims->size() != 1 && dims->size() != 2) {
+        TP_THROW(ValueError,
+                 "linalg.norm dimensions must contain one or two entries");
+    }
+    if (!dims.has_value() && self.dim() != 1 && self.dim() != 2) {
+        TP_THROW(ValueError,
+                 "linalg.norm requires a 1-D or 2-D input for string order");
+    }
+    const std::vector<int64_t> matrix_dims =
+        dims.has_value() ? *dims : std::vector<int64_t>{0, 1};
+    return linalg_matrix_norm_string_impl(
+        self, ord, matrix_dims, keepdim, dtype);
+}
+
+Tensor& write_linalg_norm_output(const Tensor& result, Tensor& out) {
+    if (!out.defined()) {
+        out = result;
+        return out;
+    }
+    if (out.dtype() != result.dtype()) {
+        TP_THROW(TypeError,
+                 "linalg norm output dtype must match result dtype");
+    }
+    if (out.device() != result.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "linalg norm output device must match result device");
+    }
+    out.resize_(static_cast<std::vector<int64_t>>(result.shape()));
+    out.copy_(result);
+    return out;
+}
+
 }  // namespace
 
 Tensor ger_native_cpu(const Tensor& self, const Tensor& vec2) {
@@ -299,6 +631,84 @@ Tensor& linalg_tensorsolve_native_cpu_out(
     return out;
 }
 
+Tensor linalg_vector_norm_native_cpu(
+    const Tensor& self, Scalar ord,
+    std::optional<std::vector<int64_t>> dims, bool keepdim,
+    std::optional<DType> dtype) {
+    return linalg_vector_norm_impl(self, ord, dims, keepdim, dtype);
+}
+
+Tensor& linalg_vector_norm_native_cpu_out(
+    const Tensor& self, Scalar ord,
+    std::optional<std::vector<int64_t>> dims, bool keepdim,
+    std::optional<DType> dtype, Tensor& out) {
+    return write_linalg_norm_output(
+        linalg_vector_norm_impl(self, ord, dims, keepdim, dtype), out);
+}
+
+Tensor linalg_powsum_native_cpu(
+    const Tensor& self, Scalar ord,
+    std::optional<std::vector<int64_t>> dims, bool keepdim,
+    std::optional<DType> dtype) {
+    return linalg_powsum_impl(self, ord, dims, keepdim, dtype);
+}
+
+Tensor linalg_matrix_norm_native_cpu(
+    const Tensor& self, Scalar ord, const std::vector<int64_t>& dims,
+    bool keepdim, std::optional<DType> dtype) {
+    return linalg_matrix_norm_impl(self, ord, dims, keepdim, dtype);
+}
+
+Tensor& linalg_matrix_norm_native_cpu_out(
+    const Tensor& self, Scalar ord, const std::vector<int64_t>& dims,
+    bool keepdim, std::optional<DType> dtype, Tensor& out) {
+    return write_linalg_norm_output(
+        linalg_matrix_norm_impl(self, ord, dims, keepdim, dtype), out);
+}
+
+Tensor linalg_matrix_norm_string_native_cpu(
+    const Tensor& self, std::string ord, const std::vector<int64_t>& dims,
+    bool keepdim, std::optional<DType> dtype) {
+    return linalg_matrix_norm_string_impl(self, ord, dims, keepdim, dtype);
+}
+
+Tensor& linalg_matrix_norm_string_native_cpu_out(
+    const Tensor& self, std::string ord, const std::vector<int64_t>& dims,
+    bool keepdim, std::optional<DType> dtype, Tensor& out) {
+    return write_linalg_norm_output(
+        linalg_matrix_norm_string_impl(self, ord, dims, keepdim, dtype), out);
+}
+
+Tensor linalg_norm_native_cpu(
+    const Tensor& self, std::optional<Scalar> ord,
+    std::optional<std::vector<int64_t>> dims, bool keepdim,
+    std::optional<DType> dtype) {
+    return linalg_norm_impl(self, ord, dims, keepdim, dtype);
+}
+
+Tensor& linalg_norm_native_cpu_out(
+    const Tensor& self, std::optional<Scalar> ord,
+    std::optional<std::vector<int64_t>> dims, bool keepdim,
+    std::optional<DType> dtype, Tensor& out) {
+    return write_linalg_norm_output(
+        linalg_norm_impl(self, ord, dims, keepdim, dtype), out);
+}
+
+Tensor linalg_norm_string_native_cpu(
+    const Tensor& self, std::string ord,
+    std::optional<std::vector<int64_t>> dims, bool keepdim,
+    std::optional<DType> dtype) {
+    return linalg_norm_string_impl(self, ord, dims, keepdim, dtype);
+}
+
+Tensor& linalg_norm_string_native_cpu_out(
+    const Tensor& self, std::string ord,
+    std::optional<std::vector<int64_t>> dims, bool keepdim,
+    std::optional<DType> dtype, Tensor& out) {
+    return write_linalg_norm_output(
+        linalg_norm_string_impl(self, ord, dims, keepdim, dtype), out);
+}
+
 Tensor matrix_power_native_cpu(const Tensor& self, int64_t n) {
     if (self.dim() < 2 || self.size(-2) != self.size(-1)) {
         TP_THROW(RuntimeError, "matrix_power(): expected a square matrix");
@@ -361,6 +771,18 @@ TENSORPLAY_LIBRARY_IMPL(CPU, NativeLinearAlgebra) {
     m.impl("linalg_tensorinv.out", linalg_tensorinv_native_cpu_out);
     m.impl("linalg_tensorsolve", linalg_tensorsolve_native_cpu);
     m.impl("linalg_tensorsolve.out", linalg_tensorsolve_native_cpu_out);
+    m.impl("linalg_vector_norm", linalg_vector_norm_native_cpu);
+    m.impl("linalg_vector_norm.out", linalg_vector_norm_native_cpu_out);
+    m.impl("linalg__powsum", linalg_powsum_native_cpu);
+    m.impl("linalg_matrix_norm", linalg_matrix_norm_native_cpu);
+    m.impl("linalg_matrix_norm.out", linalg_matrix_norm_native_cpu_out);
+    m.impl("linalg_matrix_norm.str_ord", linalg_matrix_norm_string_native_cpu);
+    m.impl("linalg_matrix_norm.str_ord_out",
+           linalg_matrix_norm_string_native_cpu_out);
+    m.impl("linalg_norm", linalg_norm_native_cpu);
+    m.impl("linalg_norm.out", linalg_norm_native_cpu_out);
+    m.impl("linalg_norm.ord_str", linalg_norm_string_native_cpu);
+    m.impl("linalg_norm.ord_str_out", linalg_norm_string_native_cpu_out);
     m.impl("matrix_power", matrix_power_native_cpu);
     m.impl("matrix_power.out", matrix_power_native_cpu_out);
     m.impl("linalg_matrix_power", matrix_power_native_cpu);
