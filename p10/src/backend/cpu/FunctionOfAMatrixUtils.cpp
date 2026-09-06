@@ -3,8 +3,8 @@
 #include "DType.h"
 #include "TensorIterator.h"
 #include "Exception.h"
+#include "Complex.h"
 
-#include <complex>
 #include <type_traits>
 #include <vector>
 
@@ -18,7 +18,7 @@ struct linear_combination_coefficient_type {
 };
 
 template <typename T>
-struct linear_combination_coefficient_type<std::complex<T>> {
+struct linear_combination_coefficient_type<tensorplay::complex<T>> {
     using type = T;
 };
 
@@ -38,7 +38,13 @@ void compute_linear_combination_kernel(
             const scalar_t* input = input_ptr;
             const coefficient_t* coefficient = coefficient_ptr;
             for (int64_t j = 0; j < summations; ++j) {
-                *output += input[j * input_stride] * coefficient[j * coefficient_stride];
+                if constexpr (tensorplay::is_complex_type_v<scalar_t>) {
+                    const scalar_t coefficient_value(
+                        coefficient[j * coefficient_stride], coefficient_t(0));
+                    *output += input[j * input_stride] * coefficient_value;
+                } else {
+                    *output += input[j * input_stride] * coefficient[j * coefficient_stride];
+                }
             }
             output_ptr = reinterpret_cast<scalar_t*>(
                 reinterpret_cast<char*>(output_ptr) + strides[0]);
@@ -61,7 +67,23 @@ void compute_linear_combination_dispatch(
             iter, input_stride, coefficient_stride, summations); \
         break;
     switch (iter.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_LINEAR_COMBINATION_CASE)
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_LINEAR_COMBINATION_CASE)
+        case DType::ComplexHalf:
+            compute_linear_combination_kernel<tensorplay::complex<Half>>(
+                iter, input_stride, coefficient_stride, summations);
+            break;
+        case DType::ComplexFloat:
+            compute_linear_combination_kernel<tensorplay::complex<float>>(
+                iter, input_stride, coefficient_stride, summations);
+            break;
+        case DType::ComplexDouble:
+            compute_linear_combination_kernel<tensorplay::complex<double>>(
+                iter, input_stride, coefficient_stride, summations);
+            break;
+        case DType::BComplex32:
+            compute_linear_combination_kernel<tensorplay::complex<BFloat16>>(
+                iter, input_stride, coefficient_stride, summations);
+            break;
         default:
             TP_THROW(TypeError, "_compute_linear_combination: unsupported dtype");
     }
