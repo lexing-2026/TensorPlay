@@ -1407,8 +1407,9 @@ void validate_sparse_csr_tensor_args_native(
 Tensor& multinomial_out_native(const Tensor& self, int64_t num_samples, bool replacement,
                                std::optional<Generator> generator, Tensor& out) {
     (void)generator;
-    out = ops::multinomial(self, num_samples, replacement);
-    return out;
+    return write_exact_out("multinomial",
+                           ops::multinomial(self, num_samples, replacement),
+                           out);
 }
 
 Tensor& linalg_lu_solve_out_native(const Tensor& LU, const Tensor& pivots, const Tensor& B,
