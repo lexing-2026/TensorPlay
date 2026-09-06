@@ -434,6 +434,8 @@ TP_HOST_DEVICE complex<T> polar(const T& r, const T& theta = T()) {
 // kernels and with serialized buffers.
 template <>
 struct alignas(4) complex<Half> {
+  using value_type = Half;
+
   Half real_;
   Half imag_;
 
@@ -484,6 +486,8 @@ struct alignas(4) complex<Half> {
 
 template <>
 struct alignas(4) complex<BFloat16> {
+  using value_type = BFloat16;
+
   BFloat16 real_;
   BFloat16 imag_;
 
