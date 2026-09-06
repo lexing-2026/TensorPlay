@@ -1085,7 +1085,7 @@ Tensor nonzero_cpu_impl(const Tensor& self) {
     parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
         int64_t count = 0;
         for (int64_t i = begin; i < end; ++i) {
-            count += static_cast<bool>(input_data[i]) ? 1 : 0;
+            count += (input_data[i] != scalar_t(0)) ? 1 : 0;
         }
         chunk_offsets[static_cast<size_t>(begin / chunk_size + 1)] = count;
     });
@@ -1110,7 +1110,7 @@ Tensor nonzero_cpu_impl(const Tensor& self) {
             remaining /= sizes[static_cast<size_t>(d)];
         }
         for (int64_t i = begin; i < end; ++i) {
-            if (static_cast<bool>(input_data[i])) {
+            if (input_data[i] != scalar_t(0)) {
                 int64_t* row = result_data + output_index * nd;
                 for (int64_t d = 0; d < nd; ++d) {
                     row[d] = coordinates[static_cast<size_t>(d)];
