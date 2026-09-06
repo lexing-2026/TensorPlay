@@ -9,6 +9,7 @@
 #include "OneDNNContext.h"
 #include "GradMode.h"
 #include "LinearAlgebraNames.h"
+#include "Complex.h"
 #include <vector>
 #include <cmath>
 #include <memory>
@@ -62,7 +63,6 @@ static MklAmdKernelWorkaround g_mkl_amd_workaround;
 #endif
 #include <algorithm>
 #include <cstring>
-#include <complex>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -173,19 +173,19 @@ template <> struct MatmulAccumType<uint64_t> { using type = uint64_t; };
 #endif
 template <> struct MatmulAccumType<Half> { using type = float; };
 template <> struct MatmulAccumType<BFloat16> { using type = float; };
-template <> struct MatmulAccumType<std::complex<Half>> { using type = std::complex<float>; };
-template <> struct MatmulAccumType<std::complex<BFloat16>> { using type = std::complex<float>; };
+template <> struct MatmulAccumType<complex<Half>> { using type = complex<float>; };
+template <> struct MatmulAccumType<complex<BFloat16>> { using type = complex<float>; };
 
 template <typename T>
 typename MatmulAccumType<T>::type matmul_to_accum(const T& value) {
     return static_cast<typename MatmulAccumType<T>::type>(value);
 }
 
-inline std::complex<float> matmul_to_accum(const std::complex<Half>& value) {
+inline complex<float> matmul_to_accum(const complex<Half>& value) {
     return {static_cast<float>(value.real()), static_cast<float>(value.imag())};
 }
 
-inline std::complex<float> matmul_to_accum(const std::complex<BFloat16>& value) {
+inline complex<float> matmul_to_accum(const complex<BFloat16>& value) {
     return {static_cast<float>(value.real()), static_cast<float>(value.imag())};
 }
 
@@ -228,28 +228,28 @@ void gemm_strided_dispatch(
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(MATMUL_CASE)
         case DType::ComplexHalf:
-            gemm_strided<std::complex<Half>>(
-                M, N, K, self.data_ptr<std::complex<Half>>(), self.stride(0), self.stride(1),
-                other.data_ptr<std::complex<Half>>(), other.stride(0), other.stride(1),
-                result.data_ptr<std::complex<Half>>(), result.stride(0), result.stride(1));
+            gemm_strided<complex<Half>>(
+                M, N, K, self.data_ptr<complex<Half>>(), self.stride(0), self.stride(1),
+                other.data_ptr<complex<Half>>(), other.stride(0), other.stride(1),
+                result.data_ptr<complex<Half>>(), result.stride(0), result.stride(1));
             return;
         case DType::ComplexFloat:
-            gemm_strided<std::complex<float>>(
-                M, N, K, self.data_ptr<std::complex<float>>(), self.stride(0), self.stride(1),
-                other.data_ptr<std::complex<float>>(), other.stride(0), other.stride(1),
-                result.data_ptr<std::complex<float>>(), result.stride(0), result.stride(1));
+            gemm_strided<complex<float>>(
+                M, N, K, self.data_ptr<complex<float>>(), self.stride(0), self.stride(1),
+                other.data_ptr<complex<float>>(), other.stride(0), other.stride(1),
+                result.data_ptr<complex<float>>(), result.stride(0), result.stride(1));
             return;
         case DType::ComplexDouble:
-            gemm_strided<std::complex<double>>(
-                M, N, K, self.data_ptr<std::complex<double>>(), self.stride(0), self.stride(1),
-                other.data_ptr<std::complex<double>>(), other.stride(0), other.stride(1),
-                result.data_ptr<std::complex<double>>(), result.stride(0), result.stride(1));
+            gemm_strided<complex<double>>(
+                M, N, K, self.data_ptr<complex<double>>(), self.stride(0), self.stride(1),
+                other.data_ptr<complex<double>>(), other.stride(0), other.stride(1),
+                result.data_ptr<complex<double>>(), result.stride(0), result.stride(1));
             return;
         case DType::BComplex32:
-            gemm_strided<std::complex<BFloat16>>(
-                M, N, K, self.data_ptr<std::complex<BFloat16>>(), self.stride(0), self.stride(1),
-                other.data_ptr<std::complex<BFloat16>>(), other.stride(0), other.stride(1),
-                result.data_ptr<std::complex<BFloat16>>(), result.stride(0), result.stride(1));
+            gemm_strided<complex<BFloat16>>(
+                M, N, K, self.data_ptr<complex<BFloat16>>(), self.stride(0), self.stride(1),
+                other.data_ptr<complex<BFloat16>>(), other.stride(0), other.stride(1),
+                result.data_ptr<complex<BFloat16>>(), result.stride(0), result.stride(1));
             return;
         default:
             TP_THROW(NotImplementedError, "matmul: unsupported dtype on CPU");
@@ -1309,10 +1309,11 @@ template <typename Component>
 Tensor conjugate_contiguous_cpu(const Tensor& input) {
     Tensor result = Tensor::empty(
         static_cast<std::vector<int64_t>>(input.shape()), input.dtype(), input.device());
-    const auto* src = input.data_ptr<std::complex<Component>>();
-    auto* dst = result.data_ptr<std::complex<Component>>();
+    const auto* src = input.data_ptr<complex<Component>>();
+    auto* dst = result.data_ptr<complex<Component>>();
     parallel_for(0, input.numel(), GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-        for (int64_t i = begin; i < end; ++i) dst[i] = std::conj(src[i]);
+        for (int64_t i = begin; i < end; ++i)
+            dst[i] = complex<Component>(src[i].real(), -src[i].imag());
     });
     return result;
 }
@@ -1381,24 +1382,24 @@ Tensor sum_to_shape_cpu(const Tensor& input, const std::vector<int64_t>& target_
     switch (input.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(SUM_TO_CASE)
         case DType::ComplexHalf:
-            sum_to_shape_recursive<std::complex<Half>>(
-                input.data_ptr<std::complex<Half>>(), source_shape, input.strides(),
-                result.data_ptr<std::complex<Half>>(), target_shape, result.strides(), 0, 0, 0);
+            sum_to_shape_recursive<complex<Half>>(
+                input.data_ptr<complex<Half>>(), source_shape, input.strides(),
+                result.data_ptr<complex<Half>>(), target_shape, result.strides(), 0, 0, 0);
             return result;
         case DType::ComplexFloat:
-            sum_to_shape_recursive<std::complex<float>>(
-                input.data_ptr<std::complex<float>>(), source_shape, input.strides(),
-                result.data_ptr<std::complex<float>>(), target_shape, result.strides(), 0, 0, 0);
+            sum_to_shape_recursive<complex<float>>(
+                input.data_ptr<complex<float>>(), source_shape, input.strides(),
+                result.data_ptr<complex<float>>(), target_shape, result.strides(), 0, 0, 0);
             return result;
         case DType::ComplexDouble:
-            sum_to_shape_recursive<std::complex<double>>(
-                input.data_ptr<std::complex<double>>(), source_shape, input.strides(),
-                result.data_ptr<std::complex<double>>(), target_shape, result.strides(), 0, 0, 0);
+            sum_to_shape_recursive<complex<double>>(
+                input.data_ptr<complex<double>>(), source_shape, input.strides(),
+                result.data_ptr<complex<double>>(), target_shape, result.strides(), 0, 0, 0);
             return result;
         case DType::BComplex32:
-            sum_to_shape_recursive<std::complex<BFloat16>>(
-                input.data_ptr<std::complex<BFloat16>>(), source_shape, input.strides(),
-                result.data_ptr<std::complex<BFloat16>>(), target_shape, result.strides(), 0, 0, 0);
+            sum_to_shape_recursive<complex<BFloat16>>(
+                input.data_ptr<complex<BFloat16>>(), source_shape, input.strides(),
+                result.data_ptr<complex<BFloat16>>(), target_shape, result.strides(), 0, 0, 0);
             return result;
         default:
             TP_THROW(NotImplementedError, "matmul backward: unsupported dtype");
@@ -1856,17 +1857,17 @@ Tensor dot_kernel(const Tensor& self, const Tensor& other) {
             // Complex dot does not conjugate (that is vdot).
             switch (self.dtype()) {
                 case DType::ComplexHalf: {
-                    using c = std::complex<Half>;
+                    using c = complex<Half>;
                     const c* a = self.data_ptr<c>();
                     const c* b = other.data_ptr<c>();
-                    std::complex<float> out{};
+                    complex<float> out{};
                     for (int64_t i = 0; i < n; ++i)
                         out += matmul_to_accum(a[i]) * matmul_to_accum(b[i]);
                     result.data_ptr<c>()[0] = static_cast<c>(out);
                     return result;
                 }
                 case DType::ComplexFloat: {
-                    using c = std::complex<float>;
+                    using c = complex<float>;
                     const c* a = self.data_ptr<c>();
                     const c* b = other.data_ptr<c>();
                     c out{};
@@ -1875,7 +1876,7 @@ Tensor dot_kernel(const Tensor& self, const Tensor& other) {
                     return result;
                 }
                 case DType::ComplexDouble: {
-                    using c = std::complex<double>;
+                    using c = complex<double>;
                     const c* a = self.data_ptr<c>();
                     const c* b = other.data_ptr<c>();
                     c out{};
@@ -1884,10 +1885,10 @@ Tensor dot_kernel(const Tensor& self, const Tensor& other) {
                     return result;
                 }
                 default: {
-                    using c = std::complex<BFloat16>;
+                    using c = complex<BFloat16>;
                     const c* a = self.data_ptr<c>();
                     const c* b = other.data_ptr<c>();
-                    std::complex<float> out{};
+                    complex<float> out{};
                     for (int64_t i = 0; i < n; ++i)
                         out += matmul_to_accum(a[i]) * matmul_to_accum(b[i]);
                     result.data_ptr<c>()[0] = static_cast<c>(out);
