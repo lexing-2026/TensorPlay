@@ -459,54 +459,46 @@ Tensor silu_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self) 
 // ---------------------------------------------------------------------------
 
 template<typename Functor>
-__global__ void launch_activation_backward_reduced_float(int64_t n,
-    const Half* dy, const Half* x, Half* out, Functor f) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = static_cast<Half>(f(static_cast<float>(dy[i]), static_cast<float>(x[i])));
-}
-template<typename Functor>
-__global__ void launch_activation_backward_reduced_float(int64_t n,
-    const BFloat16* dy, const BFloat16* x, BFloat16* out, Functor f) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = static_cast<BFloat16>(f(static_cast<float>(dy[i]), static_cast<float>(x[i])));
-}
-
-template<typename Functor>
 Tensor activation_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, Functor functor) {
     if (grad_output.shape() != self.shape()) TP_THROW(RuntimeError, "CUDA activation backward: shape mismatch");
     DType out_dtype = grad_output.dtype();
     if (!isFloatingType(out_dtype)) TP_THROW(TypeError, "CUDA activation backward: expected floating point dtype");
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(grad_output.shape()), out_dtype, grad_output.device());
-    int64_t n = grad_output.numel();
-    if (n == 0) return result;
-    dim3 block(256);
-    dim3 grid((n + 255) / 256);
-    Tensor grad_contig = grad_output.contiguous();
-    Tensor self_contig = self.contiguous();
+    if (grad_output.numel() == 0) return result;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(result)
+        .add_input(grad_output)
+        .add_input(self)
+        .build();
 
-    #define ACT_BWD_REDUCED_CASE(ctype, name) \
-    case DType::name: { \
-        launch_activation_backward_reduced_float<<<grid, block, 0, getCurrentCUDAStream().stream()>>>( \
-            n, grad_contig.data_ptr<ctype>(), self_contig.data_ptr<ctype>(), result.data_ptr<ctype>(), functor); \
-        break; \
-    }
     switch (out_dtype) {
-        ACT_BWD_REDUCED_CASE(Half, Float16)
-        ACT_BWD_REDUCED_CASE(BFloat16, BFloat16)
-        case DType::Float32: {
-            launch_binary<float>(n, grad_contig.data_ptr<float>(), self_contig.data_ptr<float>(),
-                                 result.data_ptr<float>(), functor);
+        case DType::Float16:
+            gpu_kernel(iter, [functor] __device__(Half dy, Half x) -> Half {
+                return static_cast<Half>(functor(static_cast<float>(dy),
+                                                 static_cast<float>(x)));
+            });
             break;
-        }
-        case DType::Float64: {
-            launch_binary<double>(n, grad_contig.data_ptr<double>(), self_contig.data_ptr<double>(),
-                                  result.data_ptr<double>(), functor);
+        case DType::BFloat16:
+            gpu_kernel(iter, [functor] __device__(BFloat16 dy,
+                                                  BFloat16 x) -> BFloat16 {
+                return static_cast<BFloat16>(functor(static_cast<float>(dy),
+                                                     static_cast<float>(x)));
+            });
             break;
-        }
-        default: TP_THROW(TypeError, "CUDA activation backward: Unsupported dtype");
+        case DType::Float32:
+            gpu_kernel(iter, [functor] __device__(float dy, float x) -> float {
+                return functor(dy, x);
+            });
+            break;
+        case DType::Float64:
+            gpu_kernel(iter, [functor] __device__(double dy, double x) -> double {
+                return functor(dy, x);
+            });
+            break;
+        default:
+            TP_THROW(TypeError, "CUDA activation backward: Unsupported dtype");
     }
-    #undef ACT_BWD_REDUCED_CASE
-    CUDA_CHECK(cudaGetLastError());
     return result;
 }
 
