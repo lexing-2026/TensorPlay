@@ -1,6 +1,6 @@
 // Composite kernel: histc.
-// assignment via bucketize, counting via bincount.  Boundary semantics match
-// bin closed on the right, NaNs and out-of-range values skipped.
+// Linear bin mapping with bincount accumulation.  Boundary semantics keep the
+// rightmost bin closed, while NaNs and out-of-range values are skipped.
 
 #include "Tensor.h"
 #include "Dispatcher.h"
@@ -80,14 +80,13 @@ Tensor histc_native(const Tensor& self, int64_t bins, const Scalar& min,
     }
 
     const Tensor flat = ops::reshape(self, {-1});
-    const Tensor x64 = flat.to(DType::Float64);
-    const Tensor edges = ops::linspace(Scalar(lo), Scalar(hi), bins + 1,
-                                       DType::Float64, self.device());
-    // right=true: number of edges <= x; subtract one for the bin index.
-    Tensor idx = ops::sub(ops::bucketize(x64, edges, false, true), Scalar(int64_t(1)));
+    const Tensor in_range = ops::logical_and(ops::ge(flat, Scalar(lo)),
+                                             ops::le(flat, Scalar(hi)));
+    const Tensor safe = Tensor::where(in_range, flat, Tensor::zeros_like(flat));
+    Tensor idx = ops::div(
+        ops::mul(ops::sub(safe, Scalar(lo)), Scalar(bins)),
+        Scalar(hi - lo)).to(DType::Int64);
     idx = ops::clamp(idx, Scalar(int64_t(0)), Scalar(bins - 1));
-    const Tensor in_range = ops::logical_and(ops::ge(x64, Scalar(lo)),
-                                             ops::le(x64, Scalar(hi)));
     const Tensor counted = ops::masked_select(idx, in_range);
     const Tensor counts = ops::bincount(counted, std::nullopt, bins);
     return counts.to(self.dtype());
