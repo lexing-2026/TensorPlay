@@ -83,74 +83,75 @@ Tensor reduce_dims_impl(const Tensor& self, std::vector<int64_t> dims_in,
 
     std::vector<int64_t> red_dims;
     std::vector<int64_t> red_strides;
+    std::vector<int64_t> nonred_sizes;
+    std::vector<int64_t> nonred_strides;
     for (int64_t i = 0; i < nd; ++i) {
         if (reduced[static_cast<size_t>(i)]) {
             red_dims.push_back(i);
             red_strides.push_back(strides[static_cast<size_t>(i)]);
+        } else {
+            nonred_sizes.push_back(self.size(i));
+            nonred_strides.push_back(strides[static_cast<size_t>(i)]);
         }
+    }
+    std::vector<int64_t> nonred_output_strides(nonred_sizes.size(), 1);
+    for (int64_t i = static_cast<int64_t>(nonred_sizes.size()) - 2; i >= 0; --i) {
+        nonred_output_strides[static_cast<size_t>(i)] =
+            nonred_output_strides[static_cast<size_t>(i + 1)] *
+            nonred_sizes[static_cast<size_t>(i + 1)];
     }
     int64_t total_red = 1;
     for (const int64_t dim : red_dims) total_red *= self.size(dim);
 
-    parallel_for(0, out_numel, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-        std::vector<int64_t> coords(red_dims.size(), 0);
-        for (int64_t oi = begin; oi < end; ++oi) {
-            int64_t base = 0;
-            int64_t rest = oi;
-            std::vector<int64_t> out_coords;
-            for (int64_t i = 0; i < nd; ++i) {
-                if (!reduced[static_cast<size_t>(i)])
-                    out_coords.push_back(self.size(i));
-            }
-            std::vector<int64_t> coord(out_coords.size(), 0);
-            for (int64_t i = static_cast<int64_t>(out_coords.size()) - 1;
-                 i >= 0; --i) {
-                coord[static_cast<size_t>(i)] = rest % out_coords[static_cast<size_t>(i)];
-                rest /= out_coords[static_cast<size_t>(i)];
-            }
-            int64_t coord_index = 0;
-            for (int64_t i = 0; i < nd; ++i) {
-                if (reduced[static_cast<size_t>(i)]) continue;
-                base += coord[static_cast<size_t>(coord_index++)] *
-                        strides[static_cast<size_t>(i)];
-            }
+#define TP_REDUCE_RUN_OUTPUT(output_ctype, output_name) \
+    case DType::output_name: { \
+        output_ctype* output_ptr = out.data_ptr<output_ctype>(); \
+        parallel_for(0, out_numel, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
+            std::vector<int64_t> coords(red_dims.size(), 0); \
+            for (int64_t oi = begin; oi < end; ++oi) { \
+                int64_t base = 0; \
+                int64_t rest = oi; \
+                for (size_t i = 0; i < nonred_sizes.size(); ++i) { \
+                    const int64_t coord = rest / nonred_output_strides[i]; \
+                    rest %= nonred_output_strides[i]; \
+                    base += coord * nonred_strides[i]; \
+                } \
+                AccT acc = init; \
+                std::fill(coords.begin(), coords.end(), 0); \
+                for (int64_t c = 0; c < total_red; ++c) { \
+                    int64_t offset = base; \
+                    for (size_t r = 0; r < red_dims.size(); ++r) \
+                        offset += coords[r] * red_strides[r]; \
+                    acc = step(acc, static_cast<double>(input_ptr[offset])); \
+                    for (int64_t r = static_cast<int64_t>(red_dims.size()) - 1; \
+                         r >= 0; --r) { \
+                        if (++coords[static_cast<size_t>(r)] < \
+                            self.size(red_dims[static_cast<size_t>(r)])) \
+                            break; \
+                        coords[static_cast<size_t>(r)] = 0; \
+                    } \
+                } \
+                output_ptr[oi] = static_cast<output_ctype>(done(acc)); \
+            } \
+        }); \
+        break; \
+    }
 
-            AccT acc = init;
-            std::fill(coords.begin(), coords.end(), 0);
-            for (int64_t c = 0; c < total_red; ++c) {
-                int64_t offset = base;
-                for (size_t r = 0; r < red_dims.size(); ++r)
-                    offset += coords[r] * red_strides[r];
-                switch (sc.dtype()) {
-#define TP_REDUCE_STEP(ctype, name_) \
-    case DType::name_: \
-        acc = step(acc, static_cast<double>(sc.data_ptr<ctype>()[offset])); \
-        break;
-                    TENSORPLAY_FORALL_SCALAR_TYPES(TP_REDUCE_STEP)
-#undef TP_REDUCE_STEP
-                    default: TP_THROW(TypeError, "reduce: unsupported dtype");
-                }
-                for (int64_t r = static_cast<int64_t>(red_dims.size()) - 1;
-                     r >= 0; --r) {
-                    if (++coords[static_cast<size_t>(r)] <
-                        self.size(red_dims[static_cast<size_t>(r)]))
-                        break;
-                    coords[static_cast<size_t>(r)] = 0;
-                }
-            }
-
-            const double value = done(acc);
-            switch (out_dtype) {
-#define TP_REDUCE_DONE(ctype, name_) \
-    case DType::name_: \
-        out.data_ptr<ctype>()[oi] = static_cast<ctype>(value); \
-        break;
-                TENSORPLAY_FORALL_SCALAR_TYPES(TP_REDUCE_DONE)
-#undef TP_REDUCE_DONE
-                default: TP_THROW(TypeError, "reduce: unsupported output dtype");
-            }
-        }
-    });
+#define TP_REDUCE_RUN_INPUT(input_ctype, input_name) \
+    case DType::input_name: { \
+        const input_ctype* input_ptr = sc.data_ptr<input_ctype>(); \
+        switch (out_dtype) { \
+            TENSORPLAY_FORALL_SCALAR_TYPES(TP_REDUCE_RUN_OUTPUT) \
+            default: TP_THROW(TypeError, "reduce: unsupported output dtype"); \
+        } \
+        break; \
+    }
+    switch (sc.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_REDUCE_RUN_INPUT)
+        default: TP_THROW(TypeError, "reduce: unsupported dtype");
+    }
+#undef TP_REDUCE_RUN_INPUT
+#undef TP_REDUCE_RUN_OUTPUT
     return out;
 }
 
