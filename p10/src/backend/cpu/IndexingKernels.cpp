@@ -1064,34 +1064,79 @@ Tensor& index_put__cpu(Tensor& self, const std::vector<Tensor>& indices,
 // coordinates in row-major order.
 // ---------------------------------------------------------------------------
 
-Tensor nonzero_cpu(const Tensor& self) {
-    Tensor self_c = self.contiguous();
-    int64_t nd = self.dim();
-    int64_t n = self_c.numel();
-    auto is_true = [&](int64_t i) -> bool {
-        switch (self_c.dtype()) {
-#define TP_NZ_PEEK(ctype, name) case DType::name: return static_cast<bool>(self_c.data_ptr<ctype>()[i]);
-            TENSORPLAY_FORALL_SCALAR_TYPES(TP_NZ_PEEK)
-            default: return false;
-        }
-#undef TP_NZ_PEEK
-    };
-    int64_t count = 0;
-    for (int64_t i = 0; i < n; ++i) if (is_true(i)) ++count;
-    Tensor result = Tensor::zeros({count, nd}, DType::Int64, self.device());
-    if (count == 0) return result;
-    int64_t* rp = result.data_ptr<int64_t>();
-    int64_t filled = 0;
-    for (int64_t i = 0; i < n; ++i) {
-        if (!is_true(i)) continue;
-        int64_t rem = i;
-        for (int64_t d2 = nd - 1; d2 >= 0; --d2) {
-            rp[filled * nd + d2] = (nd > 0) ? rem % self.size(d2) : 0;
-            rem /= self.size(d2);
-        }
-        ++filled;
+template <typename scalar_t>
+Tensor nonzero_cpu_impl(const Tensor& self) {
+    Tensor input = self.contiguous();
+    const int64_t nd = self.dim();
+    const int64_t n = input.numel();
+    if (n == 0) {
+        return Tensor::empty({0, nd}, DType::Int64, self.device());
     }
+
+    const int64_t thread_count = get_num_threads();
+    const bool use_parallel = n > GRAIN_SIZE && thread_count > 1 &&
+        !in_parallel_region();
+    const int64_t chunk_size = use_parallel
+        ? std::max<int64_t>(GRAIN_SIZE, (n + thread_count - 1) / thread_count)
+        : n;
+    const int64_t chunk_count = (n + chunk_size - 1) / chunk_size;
+    std::vector<int64_t> chunk_offsets(static_cast<size_t>(chunk_count + 1), 0);
+    const scalar_t* input_data = input.data_ptr<scalar_t>();
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        int64_t count = 0;
+        for (int64_t i = begin; i < end; ++i) {
+            count += static_cast<bool>(input_data[i]) ? 1 : 0;
+        }
+        chunk_offsets[static_cast<size_t>(begin / chunk_size + 1)] = count;
+    });
+    for (int64_t i = 1; i <= chunk_count; ++i) {
+        chunk_offsets[static_cast<size_t>(i)] +=
+            chunk_offsets[static_cast<size_t>(i - 1)];
+    }
+
+    const int64_t count = chunk_offsets.back();
+    Tensor result = Tensor::empty({count, nd}, DType::Int64, self.device());
+    if (count == 0) return result;
+    int64_t* result_data = result.data_ptr<int64_t>();
+    const std::vector<int64_t> sizes =
+        static_cast<std::vector<int64_t>>(input.shape());
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        int64_t output_index =
+            chunk_offsets[static_cast<size_t>(begin / chunk_size)];
+        std::vector<int64_t> coordinates(static_cast<size_t>(nd), 0);
+        int64_t remaining = begin;
+        for (int64_t d = nd - 1; d >= 0; --d) {
+            coordinates[static_cast<size_t>(d)] = remaining % sizes[static_cast<size_t>(d)];
+            remaining /= sizes[static_cast<size_t>(d)];
+        }
+        for (int64_t i = begin; i < end; ++i) {
+            if (static_cast<bool>(input_data[i])) {
+                int64_t* row = result_data + output_index * nd;
+                for (int64_t d = 0; d < nd; ++d) {
+                    row[d] = coordinates[static_cast<size_t>(d)];
+                }
+                ++output_index;
+            }
+            for (int64_t d = nd - 1; d >= 0; --d) {
+                if (++coordinates[static_cast<size_t>(d)] <
+                    sizes[static_cast<size_t>(d)]) {
+                    break;
+                }
+                coordinates[static_cast<size_t>(d)] = 0;
+            }
+        }
+    });
     return result;
+}
+
+Tensor nonzero_cpu(const Tensor& self) {
+#define TP_NZ_CASE(ctype, name) \
+    case DType::name: return nonzero_cpu_impl<ctype>(self);
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_NZ_CASE)
+        default: TP_THROW(TypeError, "nonzero: unsupported dtype");
+    }
+#undef TP_NZ_CASE
 }
 
 // ---------------------------------------------------------------------------
