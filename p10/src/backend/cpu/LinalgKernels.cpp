@@ -63,7 +63,7 @@ struct LinalgScalarTraits<complex<T>> {
 template <typename T>
 auto linalg_abs(const T& value) {
     if constexpr (LinalgScalarTraits<T>::is_complex) {
-        return tensorplay::abs(value);
+        return std::abs(value);
     } else {
         return std::abs(value);
     }
@@ -1998,7 +1998,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_lstsq_kernel(
                     for (int64_t row = n; row < m; ++row) {
                         const T x = src[i * ldb * nrhs + col * ldb + row];
                         if constexpr (LinalgScalarTraits<T>::is_complex) {
-                            value += static_cast<R>(tensorplay::norm(x));
+                            value += static_cast<R>(std::norm(x));
                         } else {
                             value += x * x;
                         }
