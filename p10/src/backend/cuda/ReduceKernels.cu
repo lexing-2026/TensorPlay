@@ -25,9 +25,6 @@ namespace cuda {
 
 extern std::tuple<Tensor, Tensor> sort_cuda(const Tensor& self, int64_t dim,
                                             bool descending);
-extern std::tuple<Tensor, Tensor> topk_kernel_cuda(
-    const Tensor& self, int64_t k, int64_t dim, bool largest, bool sorted,
-    int64_t impl);
 extern Tensor mean_dim_kernel(const Tensor& self,
                               const std::vector<int64_t>& dim,
                               bool keepdim, DType dtype);
@@ -605,6 +602,43 @@ __global__ void nanmedian_select_dim_kernel(
 }
 
 template <typename T>
+__global__ void kthvalue_select_kernel(
+        int64_t n_slices, int64_t d_size, int64_t inner, int64_t k,
+        const T* input, T* values, int64_t* indices) {
+    const int64_t si = static_cast<int64_t>(blockIdx.x);
+    if (si >= n_slices) return;
+    __shared__ uint64_t radix_smem[32];
+    __shared__ unsigned long long selected_index;
+    if (threadIdx.x == 0) {
+        selected_index = static_cast<unsigned long long>(d_size);
+    }
+    __syncthreads();
+
+    const int64_t outer_index = si / inner;
+    const int64_t inner_index = si % inner;
+    const T* slice_input = input + outer_index * d_size * inner + inner_index;
+    T selected = static_cast<T>(0);
+    topk_detail::topk_radix_select<T, uint64_t>(
+        slice_input, static_cast<uint64_t>(k), false,
+        static_cast<uint64_t>(d_size), static_cast<uint64_t>(inner),
+        radix_smem, &selected);
+    for (uint64_t i = static_cast<uint64_t>(threadIdx.x);
+         i < static_cast<uint64_t>(d_size);
+         i += static_cast<uint64_t>(blockDim.x)) {
+        const T value = slice_input[i * inner];
+        if (value == selected ||
+            (reduce_value_is_nan(value) && reduce_value_is_nan(selected))) {
+            atomicMin(&selected_index, static_cast<unsigned long long>(i));
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        values[si] = selected;
+        indices[si] = static_cast<int64_t>(selected_index);
+    }
+}
+
+template <typename T>
 __device__ inline bool mode_value_equal(T lhs, T rhs) {
     return !(lhs < rhs) && !(rhs < lhs);
 }
@@ -799,22 +833,51 @@ std::tuple<Tensor, Tensor> kthvalue_cuda(const Tensor& self, int64_t k, int64_t 
     Tensor values_out = Tensor::empty(out_shape, input.dtype(), input.device());
     Tensor indices_out = Tensor::empty(out_shape, DType::Int64, input.device());
     if (input.numel() == 0) return {values_out, indices_out};
-    Tensor selected_values;
-    Tensor selected_indices;
     if (input.dtype() == DType::Bool) {
+        Tensor selected_values;
+        Tensor selected_indices;
         std::tie(selected_values, selected_indices) =
             sort_cuda(input, dim, false);
-    } else {
-        std::tie(selected_values, selected_indices) =
-            topk_kernel_cuda(input, k, dim, false, true, 0);
+        Tensor values = selected_values.select(dim, k - 1);
+        Tensor indices = selected_indices.select(dim, k - 1);
+        if (keepdim) {
+            values = values.unsqueeze(dim);
+            indices = indices.unsqueeze(dim);
+        }
+        return {values, indices};
     }
-    Tensor values = selected_values.select(dim, k - 1);
-    Tensor indices = selected_indices.select(dim, k - 1);
-    if (keepdim) {
-        values = values.unsqueeze(dim);
-        indices = indices.unsqueeze(dim);
+
+    int64_t outer = 1;
+    int64_t inner = 1;
+    outer_inner(shape_of(input), dim, outer, inner);
+    const int64_t slices = outer * inner;
+    auto stream = getCurrentCUDAStream().stream();
+#define TP_KTHVALUE_SELECT_CASE(ctype, name_) \
+    case DType::name_: \
+        kthvalue_select_kernel<ctype><<< \
+            dim3(static_cast<unsigned>(slices)), selection_threads(d_size), 0, stream>>>( \
+            slices, d_size, inner, k, input.data_ptr<ctype>(), \
+            values_out.data_ptr<ctype>(), indices_out.data_ptr<int64_t>()); \
+        break;
+    switch (input.dtype()) {
+        TP_KTHVALUE_SELECT_CASE(uint8_t, UInt8)
+        TP_KTHVALUE_SELECT_CASE(int8_t, Int8)
+        TP_KTHVALUE_SELECT_CASE(int16_t, Int16)
+        TP_KTHVALUE_SELECT_CASE(int32_t, Int32)
+        TP_KTHVALUE_SELECT_CASE(int64_t, Int64)
+        TP_KTHVALUE_SELECT_CASE(uint16_t, UInt16)
+        TP_KTHVALUE_SELECT_CASE(uint32_t, UInt32)
+        TP_KTHVALUE_SELECT_CASE(uint64_t, UInt64)
+        TP_KTHVALUE_SELECT_CASE(Half, Float16)
+        TP_KTHVALUE_SELECT_CASE(BFloat16, BFloat16)
+        TP_KTHVALUE_SELECT_CASE(float, Float32)
+        TP_KTHVALUE_SELECT_CASE(double, Float64)
+#undef TP_KTHVALUE_SELECT_CASE
+        default:
+            TP_THROW(TypeError, "kthvalue: unsupported dtype");
     }
-    return {values, indices};
+    CUDA_CHECK(cudaGetLastError());
+    return {values_out, indices_out};
 }
 
 Tensor renorm_cuda(const Tensor& self, Scalar p, int64_t dim, Scalar maxnorm) {
