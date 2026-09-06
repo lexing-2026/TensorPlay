@@ -257,17 +257,6 @@ Tensor full_kernel(const std::vector<int64_t>& size, Scalar fill_value, DType dt
     return t;
 }
 
-template <typename T>
-__global__ void eye_kernel_cuda_impl(int64_t n, int64_t m, T* data) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n * m) return;
-    
-    int64_t r = idx / m;
-    int64_t c = idx % m;
-    
-    data[idx] = r == c ? T(1) : T(0);
-}
-
 Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device, bool requires_grad) {
     if (n < 0) TP_THROW(RuntimeError, "n must be greater or equal to 0, got ", n);
     if (m < 0 && m != -1) {
@@ -278,47 +267,61 @@ Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device, bool require
 
     int64_t numel = n * m;
     if (numel == 0) return t;
-    int threads = 256;
-    int blocks = (numel + threads - 1) / threads;
-
-#define EYE_CUDA_CASE(ctype, name)                                          \
-    case DType::name:                                                        \
-        eye_kernel_cuda_impl<ctype><<<blocks, threads, 0,                       \
-                                      getCurrentCUDAStream().stream()>>>(n, m, \
-                                                                          t.data_ptr<ctype>()); \
-        break;
+#define EYE_CUDA_CASE(ctype, name)                                           \
+    case DType::name: {                                                       \
+        gpu_kernel_with_index(t, [m] GPU_LAMBDA(int64_t index) -> ctype {     \
+            const int64_t row = index / m;                                    \
+            return row == index % m ? ctype(1) : ctype(0);                    \
+        });                                                                   \
+        break;                                                                  \
+    }
     switch (dtype) {
         TENSORPLAY_FORALL_SCALAR_TYPES(EYE_CUDA_CASE)
-        case DType::ComplexFloat:
-            eye_kernel_cuda_impl<tensorplay::complex<float>>
-                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-                    n, m, static_cast<tensorplay::complex<float>*>(t.data_ptr()));
+        case DType::ComplexFloat: {
+            gpu_kernel_with_index(t, [m] GPU_LAMBDA(int64_t index)
+                -> tensorplay::complex<float> {
+                const int64_t row = index / m;
+                return row == index % m
+                    ? tensorplay::complex<float>(1)
+                    : tensorplay::complex<float>(0);
+            });
             break;
-        case DType::ComplexDouble:
-            eye_kernel_cuda_impl<tensorplay::complex<double>>
-                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-                    n, m, static_cast<tensorplay::complex<double>*>(t.data_ptr()));
+        }
+        case DType::ComplexDouble: {
+            gpu_kernel_with_index(t, [m] GPU_LAMBDA(int64_t index)
+                -> tensorplay::complex<double> {
+                const int64_t row = index / m;
+                return row == index % m
+                    ? tensorplay::complex<double>(1)
+                    : tensorplay::complex<double>(0);
+            });
             break;
-        case DType::ComplexHalf:
-            eye_kernel_cuda_impl<tensorplay::complex<Half>>
-                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-                    n, m, static_cast<tensorplay::complex<Half>*>(t.data_ptr()));
+        }
+        case DType::ComplexHalf: {
+            gpu_kernel_with_index(t, [m] GPU_LAMBDA(int64_t index)
+                -> tensorplay::complex<Half> {
+                const int64_t row = index / m;
+                return row == index % m
+                    ? tensorplay::complex<Half>(1)
+                    : tensorplay::complex<Half>(0);
+            });
             break;
-        case DType::BComplex32:
-            eye_kernel_cuda_impl<tensorplay::complex<BFloat16>>
-                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-                    n, m, static_cast<tensorplay::complex<BFloat16>*>(t.data_ptr()));
+        }
+        case DType::BComplex32: {
+            gpu_kernel_with_index(t, [m] GPU_LAMBDA(int64_t index)
+                -> tensorplay::complex<BFloat16> {
+                const int64_t row = index / m;
+                return row == index % m
+                    ? tensorplay::complex<BFloat16>(1)
+                    : tensorplay::complex<BFloat16>(0);
+            });
             break;
+        }
         default:
             TP_THROW(NotImplementedError,
                      "CUDA eye does not support dtype '" + std::string(toString(dtype)) + "'");
     }
 #undef EYE_CUDA_CASE
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        TP_THROW(RuntimeError, std::string("CUDA eye Error: ") + cudaGetErrorString(err));
-    }
 
     return t;
 }
@@ -524,22 +527,25 @@ Tensor linspace_cuda(Scalar start, Scalar end, int64_t steps,
                          std::string(toString(dtype)) + "'");
         }
     } else {
-        const double s = start.toDouble();
-        const double e = end.toDouble();
-        const double step = (steps == 1) ? 0.0 : (e - s) / (steps - 1);
         const int64_t halfway = steps / 2;
 
+// The endpoints narrow to the element type before the increment is formed, so
+// an integral sequence starts and ends where that type actually lands.
 #define LINSPACE_CASE(ctype, name)                                           \
-    case DType::name:                                                         \
-        gpu_kernel_with_index(t, [s, e, step, steps, halfway]                 \
+    case DType::name: {                                                       \
+        const double cs = static_cast<double>(start.to<ctype>());             \
+        const double ce = static_cast<double>(end.to<ctype>());               \
+        const double cstep = (steps == 1) ? 0.0 : (ce - cs) / (steps - 1);    \
+        gpu_kernel_with_index(t, [cs, ce, cstep, steps, halfway]              \
             GPU_LAMBDA(int64_t index) -> ctype {                              \
-                if (steps == 1) return static_cast<ctype>(s);                \
+                if (steps == 1) return static_cast<ctype>(cs);               \
                 const double value = index < halfway                          \
-                    ? s + static_cast<double>(index) * step                   \
-                    : e - static_cast<double>(steps - index - 1) * step;      \
+                    ? cs + static_cast<double>(index) * cstep                 \
+                    : ce - static_cast<double>(steps - index - 1) * cstep;    \
                 return static_cast<ctype>(value);                             \
             });                                                               \
-        break;
+        break;                                                                \
+    }
         switch (dtype) {
             LINSPACE_CASE(uint8_t, UInt8)
             LINSPACE_CASE(int8_t, Int8)
@@ -603,24 +609,27 @@ Tensor logspace_cuda(Scalar start, Scalar end, int64_t steps, double base,
                          std::string(toString(dtype)) + "'");
         }
     } else {
-        const double s = start.toDouble();
-        const double e = end.toDouble();
-        const double step = (steps == 1) ? 0.0 : (e - s) / (steps - 1);
         const int64_t halfway = steps / 2;
 
+// Same narrowing as linspace: the exponents walk between the endpoints the
+// element type actually represents.
 #define LOGSPACE_CASE(ctype, name)                                           \
-    case DType::name:                                                         \
-        gpu_kernel_with_index(t, [s, e, step, base, steps, halfway]            \
+    case DType::name: {                                                       \
+        const double cs = static_cast<double>(start.to<ctype>());             \
+        const double ce = static_cast<double>(end.to<ctype>());               \
+        const double cstep = (steps == 1) ? 0.0 : (ce - cs) / (steps - 1);    \
+        gpu_kernel_with_index(t, [cs, ce, cstep, base, steps, halfway]        \
             GPU_LAMBDA(int64_t index) -> ctype {                              \
                 if (steps == 1) {                                             \
-                    return static_cast<ctype>(std::pow(base, s));              \
+                    return static_cast<ctype>(std::pow(base, cs));             \
                 }                                                               \
                 const double exponent = index < halfway                       \
-                    ? s + static_cast<double>(index) * step                   \
-                    : e - static_cast<double>(steps - index - 1) * step;      \
+                    ? cs + static_cast<double>(index) * cstep                 \
+                    : ce - static_cast<double>(steps - index - 1) * cstep;    \
                 return static_cast<ctype>(std::pow(base, exponent));           \
             });                                                               \
-        break;
+        break;                                                                \
+    }
         switch (dtype) {
             LOGSPACE_CASE(uint8_t, UInt8)
             LOGSPACE_CASE(int8_t, Int8)
