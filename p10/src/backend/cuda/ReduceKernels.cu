@@ -546,9 +546,9 @@ __global__ void nanmedian_select_flat_kernel(
 }
 
 template <typename T>
-__global__ void nanmedian_select_dim_kernel(
+__global__ void median_select_dim_kernel(
         int64_t n_slices, int64_t d_size, int64_t inner, const T* input,
-        T* values, int64_t* indices) {
+        T* values, int64_t* indices, bool ignore_nan) {
     const int64_t si = static_cast<int64_t>(blockIdx.x);
     if (si >= n_slices) return;
     __shared__ uint64_t radix_smem[32];
@@ -573,14 +573,16 @@ __global__ void nanmedian_select_dim_kernel(
     __syncthreads();
 
     const uint64_t valid = static_cast<uint64_t>(d_size) - nan_count;
-    if (valid == 0) {
+    if (ignore_nan && valid == 0) {
         if (threadIdx.x == 0) {
             values[si] = reduce_empty_value<T>();
             indices[si] = 0;
         }
         return;
     }
-    const uint64_t k = (valid - 1) / 2 + 1;
+    const uint64_t k = !ignore_nan && nan_count != 0
+        ? static_cast<uint64_t>(d_size)
+        : (valid - 1) / 2 + 1;
     T median = static_cast<T>(0);
     topk_detail::topk_radix_select<T, uint64_t>(
         slice_input, k, false, static_cast<uint64_t>(d_size),
@@ -923,10 +925,10 @@ std::tuple<Tensor, Tensor> nanmedian_dim_cuda(const Tensor& self, int64_t dim,
     auto stream = getCurrentCUDAStream().stream();
 #define TP_NANMEDIAN_DIM_CASE(ctype, name_) \
     case DType::name_: \
-        nanmedian_select_dim_kernel<ctype><<< \
+        median_select_dim_kernel<ctype><<< \
             dim3(static_cast<unsigned>(slices)), selection_threads(d_size), 0, stream>>>( \
             slices, d_size, inner, input.data_ptr<ctype>(), values.data_ptr<ctype>(), \
-            indices.data_ptr<int64_t>()); \
+            indices.data_ptr<int64_t>(), true); \
         break;
     switch (input.dtype()) {
         TP_NANMEDIAN_DIM_CASE(Half, Float16)
@@ -1085,6 +1087,59 @@ std::tuple<Tensor, Tensor> kthvalue_cuda(const Tensor& self, int64_t k, int64_t 
     return {values_out, indices_out};
 }
 
+std::tuple<Tensor, Tensor> median_dim_cuda(const Tensor& self, int64_t dim,
+                                           bool keepdim) {
+    Tensor input = self.contiguous();
+    const int64_t nd = input.dim();
+    if (nd == 0) return kthvalue_cuda(input, 1, dim, keepdim);
+    dim = wrap_dim(dim, nd);
+    const int64_t d_size = input.size(dim);
+    const int64_t k = (d_size + 1) / 2;
+    const bool selection_supported =
+        isIntegralType(input.dtype()) ||
+        input.dtype() == DType::Float16 || input.dtype() == DType::BFloat16 ||
+        input.dtype() == DType::Float32 || input.dtype() == DType::Float64;
+    if (!selection_supported) return kthvalue_cuda(input, k, dim, keepdim);
+
+    std::vector<int64_t> out_shape = shape_of(input);
+    out_shape[dim] = keepdim ? 1 : 0;
+    if (!keepdim) out_shape.erase(out_shape.begin() + dim);
+    Tensor values = Tensor::empty(out_shape, input.dtype(), input.device());
+    Tensor indices = Tensor::empty(out_shape, DType::Int64, input.device());
+    if (input.numel() == 0) return {values, indices};
+
+    int64_t outer = 1;
+    int64_t inner = 1;
+    outer_inner(shape_of(input), dim, outer, inner);
+    const int64_t slices = outer * inner;
+    auto stream = getCurrentCUDAStream().stream();
+#define TP_MEDIAN_DIM_CASE(ctype, name_) \
+    case DType::name_: \
+        median_select_dim_kernel<ctype><<< \
+            dim3(static_cast<unsigned>(slices)), selection_threads(d_size), 0, stream>>>( \
+            slices, d_size, inner, input.data_ptr<ctype>(), values.data_ptr<ctype>(), \
+            indices.data_ptr<int64_t>(), false); \
+        break;
+    switch (input.dtype()) {
+        TP_MEDIAN_DIM_CASE(uint8_t, UInt8)
+        TP_MEDIAN_DIM_CASE(int8_t, Int8)
+        TP_MEDIAN_DIM_CASE(int16_t, Int16)
+        TP_MEDIAN_DIM_CASE(int32_t, Int32)
+        TP_MEDIAN_DIM_CASE(int64_t, Int64)
+        TP_MEDIAN_DIM_CASE(uint16_t, UInt16)
+        TP_MEDIAN_DIM_CASE(uint32_t, UInt32)
+        TP_MEDIAN_DIM_CASE(uint64_t, UInt64)
+        TP_MEDIAN_DIM_CASE(Half, Float16)
+        TP_MEDIAN_DIM_CASE(BFloat16, BFloat16)
+        TP_MEDIAN_DIM_CASE(float, Float32)
+        TP_MEDIAN_DIM_CASE(double, Float64)
+        default: return kthvalue_cuda(input, k, dim, keepdim);
+    }
+#undef TP_MEDIAN_DIM_CASE
+    CUDA_CHECK(cudaGetLastError());
+    return {values, indices};
+}
+
 Tensor renorm_cuda(const Tensor& self, Scalar p, int64_t dim, Scalar maxnorm) {
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
@@ -1118,6 +1173,13 @@ std::tuple<Tensor, Tensor> interop_kthvalue_values_cuda(const Tensor& self, int6
         std::tie(values, indices) = kthvalue_cuda(self, k, dim, keepdim);
         return {values, indices};
 
+}
+
+std::tuple<Tensor, Tensor> interop_median_dim_values_cuda(
+    const Tensor& self, int64_t dim, bool keepdim, Tensor& values,
+    Tensor& indices) {
+    std::tie(values, indices) = median_dim_cuda(self, dim, keepdim);
+    return {values, indices};
 }
 
 std::tuple<Tensor, Tensor> interop_nanmedian_dim_values_cuda(
@@ -1159,6 +1221,8 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, ReduceKernels) {
     m.impl("mode", mode_cuda);
     m.impl("kthvalue", kthvalue_cuda);
     m.impl("kthvalue.values", interop_kthvalue_values_cuda);
+    m.impl("median.dim", median_dim_cuda);
+    m.impl("median.dim_values", interop_median_dim_values_cuda);
     m.impl("renorm", renorm_cuda);
 }
 
