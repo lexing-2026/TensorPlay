@@ -679,11 +679,14 @@ std::tuple<Tensor, Tensor> linalg_slogdet_kernel(const Tensor& A) {
 
 // Core: solve op(A) X = B given LU/ipiv of A.  B is overwritten in place and
 // must be column-major with ldb = B.size(-2).  Uses the same solve core without
-// broadcasting (broadcasting resolved by callers).
+// broadcasting (broadcasting resolved by callers).  Both operands are indexed
+// by an explicit element offset, so a batched call must advance the
+// factorization alongside the right-hand side.
 template <typename scalar_t>
-void getrs_inplace(char trans, const Tensor& LU, const int32_t* pivots,
-                   int64_t pivots_stride, Tensor& B, int64_t b_offset) {
-    auto* lu = LU.data_ptr<scalar_t>();
+void getrs_inplace(char trans, const Tensor& LU, int64_t lu_offset,
+                   const int32_t* pivots, int64_t pivots_stride, Tensor& B,
+                   int64_t b_offset) {
+    auto* lu = LU.data_ptr<scalar_t>() + lu_offset;
     auto* b = B.data_ptr<scalar_t>() + b_offset;
     const int64_t n = LU.size(-2);
     const int64_t nrhs = B.size(-1);
@@ -739,8 +742,8 @@ std::tuple<Tensor, Tensor> linalg_solve_ex_kernel(
             const auto* inf = info.data_ptr<int32_t>();
             for (int64_t i = 0; i < bs; ++i) {
                 if (inf[i] != 0) continue;  // singular: skip, report below
-                getrs_inplace<T>('N', LU_work, &piv[i * piv_stride], pivots.size(-1),
-                                 B_work, i * b_ms);
+                getrs_inplace<T>('N', LU_work, i * lu_ms, &piv[i * piv_stride],
+                                 pivots.size(-1), B_work, i * b_ms);
             }
         });
         Tensor result = B_work.contiguous();
@@ -975,8 +978,8 @@ Tensor linalg_lu_solve_kernel(const Tensor& LU, const Tensor& pivots,
         const int64_t lu_ms = matrix_stride_of(LU_work);
         const int64_t rhs_ms = matrix_stride_of(work_cm);
         for (int64_t i = 0; i < bs; ++i) {
-            getrs_inplace<T>(trans, LU_work, &piv[i * piv_stride], pivots.size(-1),
-                             work_cm, i * rhs_ms);
+            getrs_inplace<T>(trans, LU_work, i * lu_ms, &piv[i * piv_stride],
+                             pivots.size(-1), work_cm, i * rhs_ms);
         }
     });
     if (rhs_transposed) {

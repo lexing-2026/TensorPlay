@@ -2654,6 +2654,26 @@ void init_tensor(py::module_& m) {
         .def("to", [](const Tensor& self, Device device, DType dtype, bool non_blocking, bool copy) {
             return tensorplay::tpx::to(self, device, dtype, non_blocking, copy);
         }, "device"_a, "dtype"_a, "non_blocking"_a = false, "copy"_a = false)
+        // Full keyword form: layout/device/pin_memory/memory_format select
+        // the target metadata; unspecified fields keep their current value.
+        .def("to", [](const Tensor& self,
+                      std::optional<DType> dtype,
+                      std::optional<int64_t> layout,
+                      std::optional<Device> device,
+                      std::optional<bool> pin_memory,
+                      bool non_blocking,
+                      bool copy,
+                      std::optional<int64_t> memory_format) {
+            // The keyword form with layout/pin_memory/memory_format only
+            // exists as a generated operator; the hand-written tpx::to
+            // overloads cover the positional dtype/device spellings.
+            return tensorplay::tpx::ops::to(self, dtype, layout, device,
+                                            pin_memory, non_blocking, copy,
+                                            memory_format);
+        }, "dtype"_a = std::nullopt, "layout"_a = std::nullopt,
+           "device"_a = std::nullopt, "pin_memory"_a = std::nullopt,
+           "non_blocking"_a = false, "copy"_a = false,
+           "memory_format"_a = std::nullopt)
 
         .def("__array__", [](py::object self_obj, py::object dtype, bool copy) {
             // to .numpy() so both share one conversion path (grad/device/
@@ -3425,7 +3445,7 @@ void init_tensor(py::module_& m) {
         }, "cls"_a)
 
         // Named-tensor names are not tracked by this build; the accessor
-        // reports the unnamed state, mirroring an unnamed tensor upstream.
+        // always reports the unnamed state.
         .def_property_readonly("name", [](const Tensor&) -> py::object {
             return py::none();
         })

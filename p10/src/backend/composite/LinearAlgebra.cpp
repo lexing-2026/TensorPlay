@@ -120,6 +120,36 @@ Tensor logdet_native(const Tensor& self) {
                       logabsdet);
 }
 
+// out= form of the LU unpacking: each destination keeps the caller's buffer,
+// resized only when the produced factor does not already fit.
+namespace {
+
+Tensor& adopt_out(Tensor& out, const Tensor& value) {
+    if (!out.defined()) {
+        out = value;
+        return out;
+    }
+    const auto target = static_cast<std::vector<int64_t>>(value.shape());
+    if (static_cast<std::vector<int64_t>>(out.shape()) != target) {
+        out.resize_(target);
+    }
+    out.copy_(value);
+    return out;
+}
+
+}  // namespace
+
+std::tuple<Tensor&, Tensor&, Tensor&> lu_unpack_out_native(
+        const Tensor& LU_data, const Tensor& LU_pivots, bool unpack_data,
+        bool unpack_pivots, Tensor& P, Tensor& L, Tensor& U) {
+    auto unpacked =
+        ops::lu_unpack(LU_data, LU_pivots, unpack_data, unpack_pivots);
+    adopt_out(P, std::get<0>(unpacked));
+    adopt_out(L, std::get<1>(unpacked));
+    adopt_out(U, std::get<2>(unpacked));
+    return {P, L, U};
+}
+
 TENSORPLAY_LIBRARY_IMPL(Composite, LinearAlgebraComposite) {
     m.impl("chain_matmul", chain_matmul_native);
     m.impl("det", det_native);
@@ -127,6 +157,7 @@ TENSORPLAY_LIBRARY_IMPL(Composite, LinearAlgebraComposite) {
     m.impl("logdet", logdet_native);
     m.impl("_linalg_det", _linalg_det_native);
     m.impl("_linalg_slogdet", _linalg_slogdet_native);
+    m.impl("lu_unpack.out", lu_unpack_out_native);
 }
 
 } // namespace composite
