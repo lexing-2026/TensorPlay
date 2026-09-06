@@ -3,11 +3,17 @@ description: Suggest a new feature or improvement.
 title: "[FEAT] "
 labels: ["enhancement", "needs triage"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Before opening a request, check the [documentation](https://www.tensorplay.cn)
+        and [open feature requests](https://github.com/lexing-2026/TensorPlay/issues?q=is%3Aissue+is%3Aopen+label%3Aenhancement)
+        — well-motivated requests with a clear use case are picked up much faster.
   - type: textarea
     id: problem
     attributes:
       label: Problem or motivation
-      description: What problem does this solve, or what does it enable?
+      description: What are you trying to do, and what blocks you today? A concrete use case beats a wishlist item.
     validations:
       required: true
   - type: textarea
@@ -21,16 +27,35 @@ body:
         ```
     validations:
       required: true
+  - type: input
+    id: parity
+    attributes:
+      label: Equivalent established-framework API (if any)
+      description: A link to that API's docs helps reviewers judge scope and naming.
+      placeholder: "https://pytorch.org/docs/stable/generated/torch.nn.functional.silu.html"
+    validations:
+      required: false
   - type: textarea
     id: alternatives
     attributes:
       label: Alternatives considered
+      description: Workarounds you have tried, and why they are not enough.
     validations:
       required: false
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: Would you like to help implement it?
+      options:
+        - "Yes, I plan to submit a PR"
+        - "Yes, but I would need guidance"
+        - No, requesting it for maintainers/contributors
+    validations:
+      required: true
   - type: textarea
     id: context
     attributes:
       label: Additional context
-      description: Links to torch/numpy equivalents, papers, or related issues.
+      description: Papers, blog posts or related issues.
     validations:
       required: false

@@ -249,8 +249,13 @@ jobs:
             Only the most recent build of each variant is kept here; prefer the stable releases for production work.
         run: |
           set -euo pipefail
+          # Keep the rolling channel's notes in sync with this file; gh release
+          # edit is idempotent when the body already matches.
           if gh release view nightly --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release nightly already exists"
+            gh release edit nightly \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "TensorPlay nightly" \
+              --notes "$NOTES"
           else
             gh release create nightly \
               --repo "$GITHUB_REPOSITORY" \
