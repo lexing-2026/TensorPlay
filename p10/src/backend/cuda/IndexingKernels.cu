@@ -14,6 +14,7 @@
 #include "SortingRadixSelect.cuh"
 #include "SortUtils.cuh"
 #include "Complex.h"
+#include "CUDALoops.cuh"
 
 // Narrow floating-point atomics operate on the containing 32-bit word and
 // replace the selected half with an atomic compare-and-swap. The overloads
@@ -95,17 +96,6 @@ inline void outer_inner(const std::vector<int64_t>& shape, int64_t dim,
     outer = 1; inner = 1;
     for (int64_t i = 0; i < dim; ++i) outer *= shape[i];
     for (int64_t i = dim + 1; i < static_cast<int64_t>(shape.size()); ++i) inner *= shape[i];
-}
-
-// ---------------------------------------------------------------------------
-// Elementwise broadcast and mask application.
-// ---------------------------------------------------------------------------
-template <typename T>
-__global__ void masked_fill_kernel(int64_t n, const T* self, const bool* mask,
-                                   T value, T* out) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) out[i] = mask[i] ? value : self[i];
 }
 
 // Keep-predicate for lower and upper triangular masks.
@@ -1448,6 +1438,26 @@ void radix_sort_impl(const Tensor& self_c, Tensor& values, Tensor& indices,
 // masked_fill / masked_fill_
 // ---------------------------------------------------------------------------
 
+template <typename T>
+inline void run_masked_fill_iter(TensorIteratorBase& iter, T value) {
+    gpu_kernel(iter, [value] __device__(T self_value, bool mask_value) -> T {
+        return mask_value ? value : self_value;
+    });
+}
+
+inline void dispatch_masked_fill_iter(TensorIteratorBase& iter,
+                                      DType dtype, const Scalar& value) {
+#define TP_MF_ITER_CASE(ctype, name) \
+    case DType::name: \
+        run_masked_fill_iter<ctype>(iter, value.to<ctype>()); \
+        break;
+    switch (dtype) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_MF_ITER_CASE)
+        default: TP_THROW(TypeError, "masked_fill: unsupported dtype");
+    }
+#undef TP_MF_ITER_CASE
+}
+
 Tensor masked_fill_cuda(const Tensor& self, const Tensor& mask, Scalar value) {
     // Broadcast the mask and source once, then apply the replacement in one pass.
     if (mask.dtype() != DType::Bool) {
@@ -1456,31 +1466,31 @@ Tensor masked_fill_cuda(const Tensor& self, const Tensor& mask, Scalar value) {
     std::vector<int64_t> out_shape = broadcast_shapes(
         static_cast<std::vector<int64_t>>(self.shape()),
         static_cast<std::vector<int64_t>>(mask.shape()));
-    Tensor self_b = self.expand(out_shape).contiguous();
-    Tensor mask_b = mask.expand(out_shape).contiguous();
-    Tensor result = self_b.clone();
-    int64_t n = result.numel();
-    if (n == 0) return result;
-    auto stream = getCurrentCUDAStream().stream();
-#define TP_MF_CASE(ctype, name) \
-    case DType::name: { \
-        ctype v = value.to<ctype>(); \
-        masked_fill_kernel<ctype><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            n, self_b.data_ptr<ctype>(), mask_b.data_ptr<bool>(), v, result.data_ptr<ctype>()); \
-        break; \
-    }
-    switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_MF_CASE)
-        default: TP_THROW(TypeError, "masked_fill: unsupported dtype");
-    }
-#undef TP_MF_CASE
-    CUDA_CHECK(cudaGetLastError());
+    Tensor result = Tensor::empty(out_shape, self.dtype(), self.device());
+    TensorIterator iter = TensorIteratorConfig()
+        .resize_outputs(false)
+        .check_all_same_dtype(false)
+        .add_output(result)
+        .add_const_input(self)
+        .add_const_input(mask)
+        .build();
+    dispatch_masked_fill_iter(iter, self.dtype(), value);
     return result;
 }
 
 Tensor& masked_fill__cuda(Tensor& self, const Tensor& mask, Scalar value) {
-    Tensor r = masked_fill_cuda(self, mask, value);
-    self.copy_(r);
+    if (mask.dtype() != DType::Bool) {
+        TP_THROW(TypeError, "masked_fill only supports boolean masks");
+    }
+    TensorIterator iter = TensorIteratorConfig()
+        .set_check_mem_overlap(false)
+        .resize_outputs(false)
+        .check_all_same_dtype(false)
+        .add_output(self)
+        .add_const_input(self)
+        .add_const_input(mask)
+        .build();
+    dispatch_masked_fill_iter(iter, self.dtype(), value);
     return self;
 }
 
