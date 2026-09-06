@@ -199,6 +199,11 @@ void check_infos(const Tensor& infos_dev, std::string_view api_name, bool is_mat
     }
 }
 
+void linalg_check_errors_kernel(const Tensor& infos, std::string api_name,
+                                bool is_matrix) {
+    check_infos(infos, api_name, is_matrix);
+}
+
 // ------------------------------------------------- cusolver entry traits ---
 
 template <typename scalar_t>
@@ -471,7 +476,8 @@ void host_det_slogdet(const Tensor& LU_h, const Tensor& piv_h, Tensor& det_out,
     }
 }
 
-Tensor linalg_det_kernel_cuda(const Tensor& A) {
+std::tuple<Tensor, Tensor, Tensor> linalg_det_internal_kernel_cuda(
+        const Tensor& A) {
     square_check_inputs(A, "linalg.det");
     const Tensor src = A.is_contiguous() ? A.transpose(-2, -1) : A;
     auto [LU, pivots, info] = lu_factor_ex_cuda_impl(src, false);
@@ -483,10 +489,24 @@ Tensor linalg_det_kernel_cuda(const Tensor& A) {
         using T = std::remove_pointer_t<decltype(tag)>;
         host_det_slogdet<T>(LU_h, piv_h, out, nullptr, nullptr);
     });
-    return out;
+    return {out, LU, pivots};
 }
 
-std::tuple<Tensor, Tensor> linalg_slogdet_kernel_cuda(const Tensor& A) {
+Tensor linalg_det_kernel_cuda(const Tensor& A) {
+    return std::get<0>(linalg_det_internal_kernel_cuda(A));
+}
+
+std::tuple<Tensor, Tensor, Tensor> linalg_det_internal_out_kernel_cuda(
+        const Tensor& A, Tensor& result, Tensor& LU, Tensor& pivots) {
+    auto values = linalg_det_internal_kernel_cuda(A);
+    write_linalg_output("linalg.det", std::get<0>(values), result);
+    write_linalg_output("linalg.det", std::get<1>(values), LU);
+    write_linalg_output("linalg.det", std::get<2>(values), pivots);
+    return {result, LU, pivots};
+}
+
+std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_slogdet_internal_kernel_cuda(
+        const Tensor& A) {
     square_check_inputs(A, "linalg.slogdet");
     const Tensor src = A.is_contiguous() ? A.transpose(-2, -1) : A;
     auto [LU, pivots, info] = lu_factor_ex_cuda_impl(src, false);
@@ -500,7 +520,24 @@ std::tuple<Tensor, Tensor> linalg_slogdet_kernel_cuda(const Tensor& A) {
         Tensor dummy;  // unused in slogdet mode
         host_det_slogdet<T>(LU_h, piv_h, dummy, &sign, &logabsdet);
     });
-    return {sign, logabsdet};
+    return {sign, logabsdet, LU, pivots};
+}
+
+std::tuple<Tensor, Tensor> linalg_slogdet_kernel_cuda(const Tensor& A) {
+    auto values = linalg_slogdet_internal_kernel_cuda(A);
+    return {std::get<0>(values), std::get<1>(values)};
+}
+
+std::tuple<Tensor, Tensor, Tensor, Tensor>
+linalg_slogdet_internal_out_kernel_cuda(
+        const Tensor& A, Tensor& sign, Tensor& logabsdet, Tensor& LU,
+        Tensor& pivots) {
+    auto values = linalg_slogdet_internal_kernel_cuda(A);
+    write_linalg_output("linalg.slogdet", std::get<0>(values), sign);
+    write_linalg_output("linalg.slogdet", std::get<1>(values), logabsdet);
+    write_linalg_output("linalg.slogdet", std::get<2>(values), LU);
+    write_linalg_output("linalg.slogdet", std::get<3>(values), pivots);
+    return {sign, logabsdet, LU, pivots};
 }
 
 // ------------------------------------------------------- getrs-based solve --
@@ -531,19 +568,34 @@ void apply_getrs(const Tensor& LU_cm, const Tensor& pivots, Tensor& B_cm,
     }
 }
 
-std::tuple<Tensor, Tensor> linalg_solve_ex_kernel_cuda(const Tensor& A,
-                                                       const Tensor& B,
-                                                       bool left, bool check_errors) {
-    const char* api = "linalg.solve";
+std::tuple<Tensor, Tensor, Tensor, Tensor>
+linalg_solve_ex_internal_kernel_cuda(const Tensor& A, const Tensor& B,
+                                     bool left, bool check_errors) {
+    const char* api = "linalg.solve_ex";
     check_is_matrix(A, api, "A");
-    check_is_matrix(B, api, "B");
-    if (!(left ? A.size(-2) == B.size(-2) : A.size(-1) == B.size(-1))) {
+    bool vector_case = B.dim() == 1;
+    if (!vector_case && A.dim() - 1 == B.dim()) {
+        vector_case = true;
+        for (int64_t i = 0; i < A.dim() - 1; ++i) {
+            if (A.size(i) != B.size(i)) {
+                vector_case = false;
+                break;
+            }
+        }
+    }
+    Tensor B_2d = vector_case ? B.unsqueeze(-1) : B;
+    check_is_matrix(B_2d, api, "B");
+    if (!left && vector_case) {
+        TP_THROW(RuntimeError,
+                 "linalg.solve: Vector right-hand sides are not supported when left is false");
+    }
+    if (!(left ? A.size(-2) == B_2d.size(-2) : A.size(-1) == B_2d.size(-1))) {
         TP_THROW(RuntimeError, api, ": Incompatible shapes of A and B for the equation ",
                  left ? "AX = B" : "XA = B",
                  " (", A.size(-2), "x", A.size(-1), " and ",
-                 B.size(-2), "x", B.size(-1), ")");
+                 B_2d.size(-2), "x", B_2d.size(-1), ")");
     }
-    const auto batch = broadcast_batch(A, B);
+    const auto batch = broadcast_batch(A, B_2d);
     Tensor LU_work = clone_batched_column_major(expand_to_batch(A, batch));
     const int64_t n = A.size(-1);
     Tensor pivots = Tensor::zeros(cat_batch(batch_shape_of(LU_work), {n}),
@@ -553,12 +605,11 @@ std::tuple<Tensor, Tensor> linalg_solve_ex_kernel_cuda(const Tensor& A,
         using T = std::remove_pointer_t<decltype(tag)>;
         apply_getrf<T>(LU_work, pivots, info);
     });
-    check_infos(info, api, false);
 
     Tensor result;
     if (left) {
         // op(A) = A or conj-transposed A; real dtypes: adjoint handled via 'T'.
-        Tensor B_cm = clone_batched_column_major(expand_to_batch(B, batch));
+        Tensor B_cm = clone_batched_column_major(expand_to_batch(B_2d, batch));
         run_real(A.dtype(), [&](auto tag) {
             using T = std::remove_pointer_t<decltype(tag)>;
             apply_getrs<T>(LU_work, pivots, B_cm, CUBLAS_OP_N);
@@ -567,21 +618,41 @@ std::tuple<Tensor, Tensor> linalg_solve_ex_kernel_cuda(const Tensor& A,
     } else {
         // X A = B <=> A^T X^T = B^T: solve against the transposed RHS.
         Tensor BT_cm =
-            clone_batched_column_major(expand_to_batch(B, batch).transpose(-2, -1));
+            clone_batched_column_major(expand_to_batch(B_2d, batch).transpose(-2, -1));
         run_real(A.dtype(), [&](auto tag) {
             using T = std::remove_pointer_t<decltype(tag)>;
             apply_getrs<T>(LU_work, pivots, BT_cm, CUBLAS_OP_T);
         });
         result = BT_cm.contiguous().transpose(-2, -1).contiguous();
     }
-    if (check_errors) {
-        // getrs reports only argument errors; singularity surfaced by getrf.
-    }
-    return {result, info};
+    if (vector_case) result = result.squeeze(-1);
+    if (check_errors) check_infos(info, api, A.dim() == 2 && B.dim() == 2);
+    return {result, LU_work.contiguous(), pivots.contiguous(), info.contiguous()};
+}
+
+std::tuple<Tensor, Tensor> linalg_solve_ex_kernel_cuda(const Tensor& A,
+                                                       const Tensor& B,
+                                                       bool left, bool check_errors) {
+    auto values = linalg_solve_ex_internal_kernel_cuda(A, B, left, check_errors);
+    return {std::get<0>(values), std::get<3>(values)};
+}
+
+std::tuple<Tensor, Tensor, Tensor, Tensor>
+linalg_solve_ex_internal_out_kernel_cuda(
+        const Tensor& A, const Tensor& B, bool left, bool check_errors,
+        Tensor& result, Tensor& LU, Tensor& pivots, Tensor& info) {
+    auto values = linalg_solve_ex_internal_kernel_cuda(A, B, left, check_errors);
+    write_linalg_output("linalg.solve_ex", std::get<0>(values), result);
+    write_linalg_output("linalg.solve_ex", std::get<1>(values), LU);
+    write_linalg_output("linalg.solve_ex", std::get<2>(values), pivots);
+    write_linalg_output("linalg.solve_ex", std::get<3>(values), info);
+    return {result, LU, pivots, info};
 }
 
 Tensor linalg_solve_kernel_cuda(const Tensor& A, const Tensor& B, bool left) {
-    return std::get<0>(linalg_solve_ex_kernel_cuda(A, B, left, false));
+    auto values = linalg_solve_ex_kernel_cuda(A, B, left, false);
+    check_infos(std::get<1>(values), "linalg.solve", A.dim() == 2);
+    return std::get<0>(values);
 }
 
 std::tuple<Tensor, Tensor> linalg_inv_ex_kernel_cuda(const Tensor& A,
@@ -1372,13 +1443,20 @@ Tensor linalg_diagonal_kernel_cuda(const Tensor& A, int64_t offset, int64_t dim1
 }  // namespace
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, LinalgKernels) {
+    m.impl("_linalg_check_errors", linalg_check_errors_kernel);
     m.impl("linalg_cholesky", linalg_cholesky_kernel_cuda);
     m.impl("linalg_cholesky_ex", linalg_cholesky_ex_kernel_cuda);
     m.impl("linalg_inv", linalg_inv_kernel_cuda);
     m.impl("linalg_inv_ex", linalg_inv_ex_kernel_cuda);
+    m.impl("_linalg_det", linalg_det_internal_kernel_cuda);
+    m.impl("_linalg_det.result", linalg_det_internal_out_kernel_cuda);
     m.impl("linalg_det", linalg_det_kernel_cuda);
+    m.impl("_linalg_slogdet", linalg_slogdet_internal_kernel_cuda);
+    m.impl("_linalg_slogdet.sign", linalg_slogdet_internal_out_kernel_cuda);
     m.impl("linalg_slogdet", linalg_slogdet_kernel_cuda);
     m.impl("linalg_solve", linalg_solve_kernel_cuda);
+    m.impl("_linalg_solve_ex", linalg_solve_ex_internal_kernel_cuda);
+    m.impl("_linalg_solve_ex.result", linalg_solve_ex_internal_out_kernel_cuda);
     m.impl("linalg_solve_ex", linalg_solve_ex_kernel_cuda);
     m.impl("linalg_lu_factor", linalg_lu_factor_kernel_cuda);
     m.impl("linalg_lu_factor_ex", linalg_lu_factor_ex_kernel_cuda);
