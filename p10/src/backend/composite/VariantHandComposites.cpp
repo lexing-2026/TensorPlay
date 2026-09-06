@@ -1779,10 +1779,12 @@ Tensor _upsample_nearest_exact3d_vec_native(const Tensor& input,
 // ---- misc forwards ------------------------------------------------------------
 Tensor& logit_backward_gi_native(const Tensor& grad_output, const Tensor& self,
                                  std::optional<double> eps, Tensor& grad_input) {
-    grad_input = ops::logit_backward(grad_output, self,
-                                     eps.has_value() ? std::optional<Scalar>(Scalar(*eps))
-                                                     : std::nullopt);
-    return grad_input;
+    return write_reduction_out(
+        "logit_backward",
+        ops::logit_backward(grad_output, self,
+                            eps.has_value() ? std::optional<Scalar>(Scalar(*eps))
+                                            : std::nullopt),
+        grad_input);
 }
 
 Tensor quantize_per_tensor_tq_native(const Tensor& self, const Tensor& scale,
