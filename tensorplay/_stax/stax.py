@@ -1813,6 +1813,496 @@ def _lower_cpu_row_fusion(
     )
 
 
+# ---------------------------------------------------------------------------
+# Mixed regions: generated kernels between operators that run as they are
+
+
+def _traced_value(graph_module: GraphModule, node: Node) -> Any:
+    """The tensor a node carried when the region was captured, or ``None``."""
+
+    if node.op == "get_attr":
+        try:
+            return graph_module._get_attr(node.target)
+        except (AttributeError, KeyError, RuntimeError):
+            return None
+    return node.meta.get("val")
+
+
+def _tensor_layout(value: Any) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+    try:
+        shape = tuple(int(item) for item in value.shape)
+        stride = tuple(int(item) for item in value.stride())
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return shape, stride
+
+
+def _segment_externals(nodes: tuple[Node, ...]) -> list[Node]:
+    """Values a segment reads from outside itself, in first-use order."""
+
+    inside = set(nodes)
+    externals: list[Node] = []
+    seen: set[Node] = set()
+    for node in nodes:
+        operands = list(_nodes(node.args)) + list(_nodes(node.kwargs or {}))
+        for operand in operands:
+            if operand in inside or operand in seen:
+                continue
+            seen.add(operand)
+            externals.append(operand)
+    return externals
+
+
+def _build_segment_kernel(
+    graph_module: GraphModule,
+    segment: Any,
+    device: Any,
+) -> tuple[list[Node], Any] | None:
+    """Compile one fusible segment; return its inputs and callable runner."""
+
+    externals = _segment_externals(segment.nodes)
+    if not externals or len(externals) > 16:
+        return None
+    layouts = []
+    for node in externals:
+        layout = _tensor_layout(_traced_value(graph_module, node))
+        if layout is None:
+            return None
+        layouts.append(layout)
+    input_shapes = tuple(shape for shape, _stride in layouts)
+    input_strides = tuple(stride for _shape, stride in layouts)
+    refs = {node: index for index, node in enumerate(externals)}
+
+    reduce_node = segment.tail if segment.kind == "pw+red" else None
+    body = [node for node in segment.nodes if node is not reduce_node]
+    source = segment.producer if reduce_node is not None else segment.nodes[-1]
+    if source is None:
+        return None
+    try:
+        program = _build_pointwise_program(
+            graph_module,
+            output_override=source,
+            allow_empty=reduce_node is not None,
+            opcodes=_TRITON_OPCODES,
+            nodes=body,
+            extra_refs=refs,
+            input_slots=len(externals),
+        )
+    except (TypeError, ValueError, RuntimeError):
+        return None
+    if program is None:
+        return None
+    _external, _encoded, constants, instructions, output_ref = program
+
+    if reduce_node is None:
+        layout = _tensor_layout(_traced_value(graph_module, source))
+        if layout is None:
+            return None
+        out_shape = layout[0]
+        try:
+            from .codegen.cpp import build_cpu_native_kernel
+
+            built = build_cpu_native_kernel(
+                instructions,
+                constants,
+                len(externals),
+                output_ref,
+                shape=out_shape,
+                device=device,
+                input_shapes=input_shapes,
+                input_strides=input_strides,
+            )
+        except Exception:
+            return None
+        if built is None:
+            return None
+        runner = built[0] if isinstance(built, tuple) else built
+        return externals, runner
+
+    layout = _tensor_layout(_traced_value(graph_module, source))
+    if layout is None:
+        return None
+    try:
+        from .codegen.cpp_reduction import build_cpu_reduction_kernel
+
+        built = build_cpu_reduction_kernel(
+            instructions,
+            constants,
+            len(externals),
+            output_ref,
+            segment.reduction,
+            in_shape=layout[0],
+            device=device,
+            input_shapes=input_shapes,
+            input_strides=input_strides,
+        )
+    except Exception:
+        return None
+    if built is None:
+        return None
+    return externals, built[0]
+
+
+def _kernel_step(runner: Any, sources: tuple[int, ...]):
+    """Close over one generated kernel and the slots holding its inputs."""
+
+    def run(values: list[Any]) -> Any:
+        return runner([values[slot] for slot in sources])
+
+    return run
+
+
+class _CpuSegmentedLowering:
+    """Runs a mixed region: generated kernels between untouched operators.
+
+    A region that mixes fusible work with operators the generators do not
+    cover used to lose the compiled route entirely.  Here the fusible runs
+    become one kernel each and the rest of the region runs exactly as it
+    was captured, so a pointwise chain between two matrix products costs a
+    single pass over its data instead of one pass per operator.
+    """
+
+    def __init__(
+        self,
+        graph_module: GraphModule,
+        steps: list[tuple],
+        slot_count: int,
+        constants: dict[int, Any],
+        output_slot: int,
+        expected_dtype: Any,
+        expected_device: Any,
+        expected_layouts: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...],
+        strict_native: bool = False,
+    ) -> None:
+        self.graph_module = graph_module
+        self.graph = None
+        self.placeholders = graph_module.graph.placeholders
+        self.attribute_targets: list[str] = []
+        self.constant_values: list[Any] = []
+        self.native_values: dict[Node, Any] = {}
+        self._output_count = 1
+        self._public_output_count = 1
+        self._output_spec = None
+        self._tensorplay_codegen = "stax-fused-cpu-segments"
+        self._steps = steps
+        self._template: list[Any] = [None] * slot_count
+        for slot, value in constants.items():
+            self._template[slot] = value
+        self._output_slot = output_slot
+        self._expected_dtype = expected_dtype
+        self._expected_device = expected_device
+        self._expected_layouts = expected_layouts
+        self._strict_native = strict_native
+        self._route_fp: tuple[Any, ...] | None = None
+        self._route: str | None = None
+        _attach_fast_call(self, exec_fn=self._execute)
+
+    def _execute(self, inputs: list[Any]) -> Any:
+        # The captured constants never move, so the value table starts as a
+        # copy of a template that already holds them.
+        values = self._template.copy()
+        values[: len(inputs)] = inputs
+        for step, target, release in self._steps:
+            values[target] = step(values)
+            # Dropping an intermediate as soon as its last reader has run
+            # hands the buffer straight back to the allocator, so the next
+            # operator writes into memory that is still warm.
+            for slot in release:
+                values[slot] = None
+        return values[self._output_slot]
+
+    def _resolve_route(self, inputs: list[Any]) -> str:
+        if not _CpuFusedPointwiseLowering._eligible_inputs(
+            inputs,
+            (),
+            self._expected_dtype,
+            self._expected_device,
+            self._expected_layouts,
+        ):
+            return "fallback"
+        if any(getattr(value, "requires_grad", False) for value in inputs):
+            return "fallback"
+        return "native"
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if not kwargs and len(args) == len(self.placeholders):
+            inputs = list(args)
+        else:
+            bound = self.graph_module.signature.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            inputs = [
+                bound.arguments[
+                    node.target if isinstance(node.target, str) else node.name
+                ]
+                for node in self.placeholders
+            ]
+        fp = tuple(
+            _CpuFusedPointwiseLowering._input_route_fingerprint(value)
+            for value in inputs
+        )
+        if fp != self._route_fp:
+            self._route = self._resolve_route(inputs)
+            self._route_fp = fp
+        if self._route == "fallback":
+            raise RuntimeError(
+                "Stax segmented CPU region received inputs outside its "
+                "compiled specialization"
+            )
+        return self._execute(inputs)
+
+
+def _lower_cpu_segmented(
+    graph_module: GraphModule,
+    example_inputs: list[Any],
+    *,
+    strict_native: bool = False,
+    dynamic: bool = False,
+) -> _CpuSegmentedLowering | None:
+    """Compile the fusible runs of a region the whole-region paths declined.
+
+    The scheduler partitions the region; every pointwise run and every run
+    ending in a reduction becomes one generated kernel, and each remaining
+    operator stays a single call between them.  A store-time epilogue is the
+    one schedule this path cannot wire yet, and a region containing one keeps
+    its existing route rather than losing the fusion the epilogue expresses.
+    """
+
+    if dynamic:
+        return None
+    try:
+        import tensorplay
+
+        tensor_type = tensorplay.Tensor
+    except (AttributeError, ImportError):
+        return None
+    if not example_inputs or any(
+        not isinstance(value, tensor_type) for value in example_inputs
+    ):
+        return None
+    first = example_inputs[0]
+    if not first.device.is_cpu() or first.dtype != tensorplay.float32:
+        return None
+    if any(
+        value.device != first.device or value.dtype != first.dtype
+        for value in example_inputs[1:]
+    ):
+        return None
+    if any(value.requires_grad for value in example_inputs):
+        return None
+    if len(example_inputs) != len(graph_module.graph.placeholders):
+        return None
+
+    output_values = [
+        value
+        for output in graph_module.graph.outputs
+        for value in _nodes(output.args)
+    ]
+    if len(output_values) != 1 or not isinstance(output_values[0], Node):
+        return None
+    final = output_values[0]
+
+    def is_pointwise(node: Node) -> bool:
+        if node.op not in {"call_function", "call_method"}:
+            return False
+        return _target_name(node.target) in _CPU_FUSED_OPS
+
+    def classify_reduction(node: Node) -> Any:
+        if node.op not in {"call_function", "call_method"}:
+            return None
+        if not node.args or not isinstance(node.args[0], Node):
+            return None
+        layout = _tensor_layout(_traced_value(graph_module, node.args[0]))
+        if layout is None:
+            return None
+        return _parse_reduction(node, len(layout[0]))
+
+    from .scheduler import segment_graph
+
+    segments = segment_graph(
+        graph_module,
+        is_pointwise=is_pointwise,
+        classify_reduction=classify_reduction,
+    )
+    if segments is None:
+        return None
+    if any(segment.epilogue for segment in segments):
+        return None
+    compiled_kinds = {"pw", "pw+red"}
+    if not any(segment.kind in compiled_kinds for segment in segments):
+        return None
+    if not any(segment.kind == "extern" for segment in segments):
+        # A region that is fusible end to end belongs to the whole-region
+        # paths; reaching here means they declined it for another reason.
+        return None
+
+    slots: dict[Node, int] = {
+        node: index for index, node in enumerate(graph_module.graph.placeholders)
+    }
+    constants: dict[int, Any] = {}
+    steps: list[tuple] = []
+    next_slot = len(slots)
+
+    def slot_for(node: Node) -> int | None:
+        if node in slots:
+            return slots[node]
+        if node.op != "get_attr":
+            return None
+        value = _traced_value(graph_module, node)
+        if not isinstance(value, tensor_type):
+            return None
+        nonlocal next_slot
+        slots[node] = next_slot
+        constants[next_slot] = value
+        next_slot += 1
+        return slots[node]
+
+    def extern_step(node: Node):
+        """Close over one operator's call, resolving its operands by slot.
+
+        The plan is built once: an argument is either a slot to read or a
+        value to pass through, so the steady-state call walks a flat list
+        instead of rebuilding the captured argument structure.
+        """
+
+        target = node.target
+        op = node.op
+        kwargs_template = dict(node.kwargs or {})
+        table = slots
+        simple = all(
+            not isinstance(item, (list, tuple, dict, slice))
+            for item in (*node.args, *kwargs_template.values())
+        )
+        if not simple:
+            from ..graph import map_arg
+
+            def run_general(values: list[Any]) -> Any:
+                resolve = lambda item: values[table[item]]  # noqa: E731
+                args = map_arg(node.args, resolve)
+                kwargs = map_arg(kwargs_template, resolve)
+                if op == "call_function":
+                    return target(*args, **kwargs)
+                return getattr(args[0], target)(*args[1:], **kwargs)
+
+            return run_general
+
+        plan = tuple(
+            (table[item], None) if isinstance(item, Node) else (-1, item)
+            for item in node.args
+        )
+        keys = tuple(kwargs_template)
+        key_plan = tuple(
+            (table[item], None) if isinstance(item, Node) else (-1, item)
+            for item in kwargs_template.values()
+        )
+
+        if not keys and op == "call_function":
+
+            def run_positional(values: list[Any]) -> Any:
+                return target(
+                    *[
+                        values[slot] if value is None else value
+                        for slot, value in plan
+                    ]
+                )
+
+            return run_positional
+
+        def run(values: list[Any]) -> Any:
+            args = [values[slot] if value is None else value for slot, value in plan]
+            kwargs = {
+                key: (values[slot] if value is None else value)
+                for key, (slot, value) in zip(keys, key_plan)
+            }
+            if op == "call_function":
+                return target(*args, **kwargs)
+            return getattr(args[0], target)(*args[1:], **kwargs)
+
+        return run
+
+    for segment in segments:
+        if segment.kind == "extern":
+            node = segment.nodes[0]
+            if node.op == "get_attr":
+                if slot_for(node) is None:
+                    return None
+                continue
+            if node.op not in {"call_function", "call_method"}:
+                return None
+            for operand in list(_nodes(node.args)) + list(
+                _nodes(node.kwargs or {})
+            ):
+                if slot_for(operand) is None:
+                    return None
+            sources = tuple(
+                slots[operand]
+                for operand in list(_nodes(node.args))
+                + list(_nodes(node.kwargs or {}))
+            )
+            slots[node] = next_slot
+            next_slot += 1
+            steps.append((extern_step(node), slots[node], sources))
+            continue
+        built = _build_segment_kernel(graph_module, segment, first.device)
+        if built is None:
+            return None
+        externals, runner = built
+        sources = []
+        for node in externals:
+            source = slot_for(node)
+            if source is None:
+                return None
+            sources.append(source)
+        export = segment.export_node
+        if export is None:
+            return None
+        slots[export] = next_slot
+        next_slot += 1
+        steps.append(
+            (_kernel_step(runner, tuple(sources)), slots[export], tuple(sources))
+        )
+
+    if final not in slots:
+        return None
+
+    # Liveness: a value is dropped right after the step that reads it last,
+    # so long regions do not hold every intermediate alive to the end.
+    last_use: dict[int, int] = {}
+    for index, (_step, _target, sources) in enumerate(steps):
+        for slot in sources:
+            last_use[slot] = index
+    output_slot = slots[final]
+    plan = [
+        (
+            step,
+            target,
+            tuple(
+                slot
+                for slot, index in last_use.items()
+                if index == position and slot != output_slot
+            ),
+        )
+        for position, (step, target, _sources) in enumerate(steps)
+    ]
+
+    input_shapes = tuple(
+        tuple(int(item) for item in value.shape) for value in example_inputs
+    )
+    input_strides = tuple(
+        tuple(int(item) for item in value.stride()) for value in example_inputs
+    )
+    return _CpuSegmentedLowering(
+        graph_module,
+        plan,
+        next_slot,
+        constants,
+        output_slot,
+        first.dtype,
+        first.device,
+        tuple(zip(input_shapes, input_strides)),
+        strict_native,
+    )
+
+
 def _build_fused_gradient_graphs(
     input_count: int,
     instructions: list[tuple[str, int, int, int]],
@@ -3773,6 +4263,19 @@ def stax(
     if native_graph is not None:
         graph_module._stax_native_graph = native_graph.graph
         return native_graph
+    if use_native and use_fusion:
+        # Nothing claimed the region whole.  Its fusible runs are still worth
+        # compiling: each becomes one kernel, and the operators between them
+        # run as captured instead of the region losing every compiled route.
+        segmented = _lower_cpu_segmented(
+            graph_module,
+            example_inputs,
+            strict_native=strict_native,
+            dynamic=bool(dynamic is True),
+        )
+        if segmented is not None:
+            graph_module._stax_codegen = "stax-fused-cpu-segments"
+            return segmented
     if strict_native:
         raise RuntimeError(
             "strict_native Stax lowering failed: captured graph has no native executable"
