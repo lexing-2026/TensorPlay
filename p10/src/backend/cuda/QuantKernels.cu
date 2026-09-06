@@ -178,6 +178,81 @@ QuantInputs prepare_quantize(const Tensor& self, int64_t axis = 0) {
 
 } // namespace
 
+Tensor empty_quantized_codes(const std::vector<int64_t>& size, DType dtype,
+                             const Device& device,
+                             std::optional<int64_t> memory_format) {
+    Tensor codes(size, underlying_storage_type(dtype), device);
+    const MemoryFormat format = static_cast<MemoryFormat>(
+        memory_format.value_or(static_cast<int64_t>(MemoryFormat::Contiguous)));
+    if (format == MemoryFormat::ChannelsLast ||
+        format == MemoryFormat::ChannelsLast3d) {
+        return codes.as_strided(size, get_channels_last_strides(size), 0);
+    }
+    return codes;
+}
+
+Tensor empty_affine_quantized_cuda(const std::vector<int64_t>& size,
+                                   std::optional<DType> dtype,
+                                   std::optional<int64_t> layout,
+                                   std::optional<Device> device,
+                                   std::optional<bool> pin_memory,
+                                   double scale, int64_t zero_point,
+                                   std::optional<int64_t> memory_format) {
+    if (layout.has_value() && *layout != 2) {
+        TP_THROW(NotImplementedError,
+                 "_empty_affine_quantized is only implemented for strided layout tensors");
+    }
+    if (pin_memory.value_or(false)) {
+        TP_THROW(RuntimeError, "pin_memory is only valid for CPU tensors");
+    }
+    if (!dtype.has_value() || *dtype == DType::Undefined) {
+        TP_THROW(RuntimeError, "Must provide data type for Tensor creation functions.");
+    }
+    const DType dt = *dtype;
+    if (!isQuantizedType(dt)) {
+        TP_THROW(TypeError,
+                 "_empty_affine_quantized(): dtype must be a quantized dtype, got ",
+                 toString(dt));
+    }
+    const Device target = device.value_or(Device(DeviceType::CUDA));
+    Tensor codes = empty_quantized_codes(size, dt, target, memory_format);
+    return quantized::make_qtensor(
+        codes, make_per_tensor_affine_quantizer(scale, zero_point, dt), dt);
+}
+
+Tensor empty_per_channel_affine_quantized_cuda(
+    const std::vector<int64_t>& size, const Tensor& scales,
+    const Tensor& zero_points, int64_t axis, std::optional<DType> dtype,
+    std::optional<int64_t> layout, std::optional<Device> device,
+    std::optional<bool> pin_memory, std::optional<int64_t> memory_format) {
+    if (layout.has_value() && *layout != 2) {
+        TP_THROW(NotImplementedError,
+                 "_empty_per_channel_affine_quantized is only implemented for strided layout tensors");
+    }
+    if (pin_memory.value_or(false)) {
+        TP_THROW(RuntimeError, "pin_memory is only valid for CPU tensors");
+    }
+    if (!dtype.has_value() || *dtype == DType::Undefined) {
+        TP_THROW(RuntimeError, "Must provide data type for Tensor creation functions.");
+    }
+    const DType dt = *dtype;
+    if (!isQuantizedType(dt)) {
+        TP_THROW(TypeError,
+                 "_empty_per_channel_affine_quantized(): dtype must be a quantized dtype, got ",
+                 toString(dt));
+    }
+    const Device target = device.value_or(Device(DeviceType::CUDA));
+    Tensor target_scales = scales.device() == target ? scales : scales.to(target);
+    Tensor target_zero_points =
+        zero_points.device() == target ? zero_points : zero_points.to(target);
+    Tensor codes = empty_quantized_codes(size, dt, target, memory_format);
+    return quantized::make_qtensor(
+        codes,
+        make_per_channel_affine_quantizer(target_scales, target_zero_points,
+                                          axis, dt),
+        dt);
+}
+
 Tensor empty_quantized_cuda(const std::vector<int64_t>& size,
                             const Tensor& qtensor,
                             std::optional<DType> dtype,
@@ -201,13 +276,7 @@ Tensor empty_quantized_cuda(const std::vector<int64_t>& size,
     }
 
     const Device target = device.value_or(qtensor.device());
-    Tensor codes(size, underlying_storage_type(dt), target);
-    const MemoryFormat format = static_cast<MemoryFormat>(
-        memory_format.value_or(static_cast<int64_t>(MemoryFormat::Contiguous)));
-    if (format == MemoryFormat::ChannelsLast ||
-        format == MemoryFormat::ChannelsLast3d) {
-        codes = codes.as_strided(size, get_channels_last_strides(size), 0);
-    }
+    Tensor codes = empty_quantized_codes(size, dt, target, memory_format);
 
     const QuantizerPtr source_quantizer = quantized::quantizer_of(qtensor);
     QuantizerPtr output_quantizer;
@@ -2357,6 +2426,9 @@ Tensor fused_moving_avg_obs_fake_quant_cuda(
 }
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, QuantKernels) {
+    m.impl("_empty_affine_quantized", empty_affine_quantized_cuda);
+    m.impl("_empty_per_channel_affine_quantized",
+           empty_per_channel_affine_quantized_cuda);
     m.impl("empty_quantized", empty_quantized_cuda);
     m.impl("quantize_per_tensor", quantize_per_tensor_cuda);
     m.impl("quantize_per_channel", quantize_per_channel_cuda);
