@@ -245,10 +245,12 @@ Tensor vdot_cuda(const Tensor& a_in, const Tensor& b_in) {
             result.data_ptr<std::complex<float>>()[0] =
                 std::complex<float>(out_c.x, out_c.y);
 #else
-            cuComplex out = cublasCdotc(
+            cuComplex out;
+            CUBLAS_CHECK(cublasCdotc(
                 handle, static_cast<int>(n),
                 static_cast<const cuComplex*>(static_cast<const void*>(a.data_ptr<std::complex<float>>())), 1,
-                static_cast<const cuComplex*>(static_cast<const void*>(bmatch.data_ptr<std::complex<float>>())), 1);
+                static_cast<const cuComplex*>(static_cast<const void*>(bmatch.data_ptr<std::complex<float>>())), 1,
+                &out));
             result.data_ptr<std::complex<float>>()[0] =
                 std::complex<float>(out.x, out.y);
 #endif
@@ -265,10 +267,12 @@ Tensor vdot_cuda(const Tensor& a_in, const Tensor& b_in) {
             result.data_ptr<std::complex<double>>()[0] =
                 std::complex<double>(out_z.x, out_z.y);
 #else
-            cuDoubleComplex out = cublasZdotc(
+            cuDoubleComplex out;
+            CUBLAS_CHECK(cublasZdotc(
                 handle, static_cast<int>(n),
                 static_cast<const cuDoubleComplex*>(static_cast<const void*>(a.data_ptr<std::complex<double>>())), 1,
-                static_cast<const cuDoubleComplex*>(static_cast<const void*>(bmatch.data_ptr<std::complex<double>>())), 1);
+                static_cast<const cuDoubleComplex*>(static_cast<const void*>(bmatch.data_ptr<std::complex<double>>())), 1,
+                &out));
             result.data_ptr<std::complex<double>>()[0] =
                 std::complex<double>(out.x, out.y);
 #endif
