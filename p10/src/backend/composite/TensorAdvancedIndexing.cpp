@@ -109,6 +109,14 @@ Tensor& write_out(Tensor& out, const Tensor& value) {
         out = value;
         return out;
     }
+    if (out.dtype() != value.dtype()) {
+        TP_THROW(TypeError,
+                 "scatter output must have the same dtype as the input");
+    }
+    if (out.device() != value.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "scatter output must be on the same device as the input");
+    }
     const auto target = static_cast<std::vector<int64_t>>(value.shape());
     if (static_cast<std::vector<int64_t>>(out.shape()) != target) {
         out.resize_(target);
