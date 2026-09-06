@@ -9,9 +9,9 @@
 #include "GradMode.h"
 #include "LinearAlgebraNames.h"
 #include "CudaGemm.h"
+#include "Complex.h"
 #include <cublas_v2.h>
 #include <cublasLt.h>
-#include <cuComplex.h>
 #include <cuda_runtime.h>
 #include <mutex>
 #include <unordered_map>
@@ -455,16 +455,15 @@ Tensor transpose_last_two_view_cuda(const Tensor& input) {
     return input.as_strided(sizes, strides);
 }
 
-__global__ void conjugate_complex_float_kernel(
-    int64_t n, const cuFloatComplex* input, cuFloatComplex* output) {
+template <typename T>
+__global__ void conjugate_complex_kernel(
+    int64_t n, const tensorplay::complex<T>* input,
+    tensorplay::complex<T>* output) {
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index < n) output[index] = cuConjf(input[index]);
-}
-
-__global__ void conjugate_complex_double_kernel(
-    int64_t n, const cuDoubleComplex* input, cuDoubleComplex* output) {
-    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index < n) output[index] = cuConj(input[index]);
+    if (index < n) {
+        const auto value = input[index];
+        output[index] = tensorplay::complex<T>(value.real(), -value.imag());
+    }
 }
 
 Tensor adjoint_last_two_cuda(const Tensor& input) {
@@ -481,15 +480,15 @@ Tensor adjoint_last_two_cuda(const Tensor& input) {
     const dim3 block(256);
     const dim3 grid(static_cast<unsigned>((n + 255) / 256));
     if (input.dtype() == DType::ComplexFloat) {
-        conjugate_complex_float_kernel<<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+        conjugate_complex_kernel<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
             n,
-            reinterpret_cast<const cuFloatComplex*>(contiguous.data_ptr<std::complex<float>>()),
-            reinterpret_cast<cuFloatComplex*>(result.data_ptr<std::complex<float>>()));
+            contiguous.data_ptr<tensorplay::complex<float>>(),
+            result.data_ptr<tensorplay::complex<float>>());
     } else {
-        conjugate_complex_double_kernel<<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+        conjugate_complex_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
             n,
-            reinterpret_cast<const cuDoubleComplex*>(contiguous.data_ptr<std::complex<double>>()),
-            reinterpret_cast<cuDoubleComplex*>(result.data_ptr<std::complex<double>>()));
+            contiguous.data_ptr<tensorplay::complex<double>>(),
+            result.data_ptr<tensorplay::complex<double>>());
     }
     checkCuda(cudaGetLastError(), "matmul conjugate transpose kernel launch");
     return result;
@@ -525,34 +524,20 @@ __device__ void decode_matmul_sum_index(
     }
 }
 
-__global__ void sum_complex_float_to_shape_kernel(
+template <typename T>
+__global__ void sum_complex_to_shape_kernel(
     int64_t numel,
-    const cuFloatComplex* source,
-    cuFloatComplex* target,
+    const tensorplay::complex<T>* source,
+    tensorplay::complex<T>* target,
     MatmulSumShapeInfo info) {
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= numel) return;
     int64_t source_offset = 0;
     int64_t target_offset = 0;
     decode_matmul_sum_index(index, info, source_offset, target_offset);
-    const cuFloatComplex value = source[source_offset];
-    atomicAdd(&target[target_offset].x, value.x);
-    atomicAdd(&target[target_offset].y, value.y);
-}
-
-__global__ void sum_complex_double_to_shape_kernel(
-    int64_t numel,
-    const cuDoubleComplex* source,
-    cuDoubleComplex* target,
-    MatmulSumShapeInfo info) {
-    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index >= numel) return;
-    int64_t source_offset = 0;
-    int64_t target_offset = 0;
-    decode_matmul_sum_index(index, info, source_offset, target_offset);
-    const cuDoubleComplex value = source[source_offset];
-    atomicAdd(&target[target_offset].x, value.x);
-    atomicAdd(&target[target_offset].y, value.y);
+    const tensorplay::complex<T> value = source[source_offset];
+    atomicAdd(&target[target_offset].real_, value.real());
+    atomicAdd(&target[target_offset].imag_, value.imag());
 }
 
 Tensor sum_to_shape_complex_cuda(
@@ -596,16 +581,16 @@ Tensor sum_to_shape_complex_cuda(
     const int threads = 256;
     const int blocks = static_cast<int>((input.numel() + threads - 1) / threads);
     if (input.dtype() == DType::ComplexFloat) {
-        sum_complex_float_to_shape_kernel<<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+        sum_complex_to_shape_kernel<float><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
             input.numel(),
-            reinterpret_cast<const cuFloatComplex*>(input.data_ptr<std::complex<float>>()),
-            reinterpret_cast<cuFloatComplex*>(result.data_ptr<std::complex<float>>()),
+            input.data_ptr<tensorplay::complex<float>>(),
+            result.data_ptr<tensorplay::complex<float>>(),
             info);
     } else {
-        sum_complex_double_to_shape_kernel<<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+        sum_complex_to_shape_kernel<double><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
             input.numel(),
-            reinterpret_cast<const cuDoubleComplex*>(input.data_ptr<std::complex<double>>()),
-            reinterpret_cast<cuDoubleComplex*>(result.data_ptr<std::complex<double>>()),
+            input.data_ptr<tensorplay::complex<double>>(),
+            result.data_ptr<tensorplay::complex<double>>(),
             info);
     }
     checkCuda(cudaGetLastError(), "matmul complex sum_to_shape kernel launch");
