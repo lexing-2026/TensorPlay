@@ -9,6 +9,7 @@
 
 #include "Tensor.h"
 #include "CUDARuntime.h"
+#include "CUDALoops.cuh"
 #include "Exception.h"
 #include "Quantizer.h"
 
@@ -21,9 +22,6 @@ namespace tensorplay {
 namespace cuda {
 
 namespace {
-
-constexpr int kThreads = 256;
-constexpr int kMaxBlocks = 4096;
 
 int64_t checked_repeat_extent(int64_t source, int64_t repeat) {
     if (repeat < 0) {
@@ -67,26 +65,6 @@ Tensor make_repeat_output(const Tensor& self,
                      " at ", __FILE__, ":", __LINE__);                               \
         }                                                                            \
     } while (0)
-
-template <typename T>
-__global__ void repeat_gather_kernel(int64_t n, int64_t out_nd,
-                                     const int64_t* __restrict__ tstrides,
-                                     const int64_t* __restrict__ padded,
-                                     const int64_t* __restrict__ pstrides,
-                                     const T* __restrict__ src,
-                                     T* __restrict__ dst) {
-    const int64_t grid_stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
-    for (int64_t f = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         f < n; f += grid_stride) {
-        int64_t rem = f, off = 0;
-        for (int64_t i = 0; i < out_nd; ++i) {
-            const int64_t c = rem / tstrides[i];
-            rem %= tstrides[i];
-            off += (c % padded[i]) * pstrides[i];
-        }
-        dst[f] = src[off];
-    }
-}
 
 } // anonymous namespace
 
@@ -133,16 +111,21 @@ Tensor repeat_cuda(const Tensor& self, const std::vector<int64_t>& repeats) {
     const int64_t* padded_d = tstrides_d + out_nd;
     const int64_t* pstrides_d = padded_d + out_nd;
 
-    const int blocks = static_cast<int>(
-        std::min<int64_t>((total + kThreads - 1) / kThreads, kMaxBlocks));
-    auto stream = getCurrentCUDAStream().stream();
-
 #define TP_REPEAT_CUDA_CASE(ctype, name)                                                \
-    case DType::name:                                                                   \
-        repeat_gather_kernel<ctype><<<blocks, kThreads, 0, stream>>>(                   \
-            total, out_nd, tstrides_d, padded_d, pstrides_d,                            \
-            sc.data_ptr<ctype>(), out.data_ptr<ctype>());                               \
-        break;
+    case DType::name: {                                                                  \
+        const ctype* source = sc.data_ptr<ctype>();                                      \
+        gpu_kernel_with_index(out, [=] GPU_LAMBDA(int64_t flat_index) -> ctype {        \
+            int64_t remainder = flat_index;                                              \
+            int64_t source_offset = 0;                                                   \
+            for (int64_t i = 0; i < out_nd; ++i) {                                       \
+                const int64_t coordinate = remainder / tstrides_d[i];                    \
+                remainder %= tstrides_d[i];                                              \
+                source_offset += (coordinate % padded_d[i]) * pstrides_d[i];              \
+            }                                                                             \
+            return source[source_offset];                                                \
+        });                                                                               \
+        break;                                                                            \
+    }
 
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_REPEAT_CUDA_CASE)
@@ -150,7 +133,6 @@ Tensor repeat_cuda(const Tensor& self, const std::vector<int64_t>& repeats) {
         default: TP_THROW(TypeError, "repeat: unsupported dtype");
     }
 #undef TP_REPEAT_CUDA_CASE
-    CUDA_CHECK(cudaGetLastError());
     return out;
 }
 
