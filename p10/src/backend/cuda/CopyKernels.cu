@@ -709,7 +709,7 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
                                   .build();
 #define TP_COPY_ITER_CASE(ctype, name)                                   \
         case DType::name:                                                \
-            gpu_kernel(iter, [] __device__(ctype v) { return v; });      \
+            gpu_kernel(iter, [] __host__ __device__(ctype v) { return v; });      \
             break;
         switch (self.dtype()) {
             TENSORPLAY_FORALL_SCALAR_TYPES(TP_COPY_ITER_CASE)
@@ -934,21 +934,21 @@ Scalar item_cuda(const Tensor& self) {
         }
         case DType::ComplexHalf: {
             tensorplay::complex<Half> v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
-            return Scalar(std::complex<float>(static_cast<float>(v.real()),
-                                              static_cast<float>(v.imag())));
+            return Scalar(tensorplay::complex<float>(static_cast<float>(v.real()),
+                                                     static_cast<float>(v.imag())));
         }
         case DType::ComplexFloat: {
             tensorplay::complex<float> v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
-            return Scalar(std::complex<float>(v.real(), v.imag()));
+            return Scalar(tensorplay::complex<float>(v.real(), v.imag()));
         }
         case DType::ComplexDouble: {
             tensorplay::complex<double> v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
-            return Scalar(std::complex<double>(v.real(), v.imag()));
+            return Scalar(tensorplay::complex<double>(v.real(), v.imag()));
         }
         case DType::BComplex32: {
             tensorplay::complex<BFloat16> v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
-            return Scalar(std::complex<float>(static_cast<float>(v.real()),
-                                              static_cast<float>(v.imag())));
+            return Scalar(tensorplay::complex<float>(static_cast<float>(v.real()),
+                                                     static_cast<float>(v.imag())));
         }
         default:
             TP_THROW(NotImplementedError, "item() not implemented for this dtype");

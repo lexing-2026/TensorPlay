@@ -224,6 +224,102 @@ Tensor Tensor::make_sparse_csr_tensor(const Tensor& crow,
     return result;
 }
 
+Tensor Tensor::make_sparse_compressed_tensor(
+    const Tensor& crow, const Tensor& col, const Tensor& values,
+    const std::vector<int64_t>& size, int layout,
+    std::array<int64_t, 2> blocksize) {
+    if (!crow.defined() || !col.defined() || !values.defined()) {
+        TP_THROW(ValueError,
+                 "sparse_compressed_tensor: crow/col/values must be defined");
+    }
+    if (crow.device() != col.device() || crow.device() != values.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "sparse_compressed_tensor: crow/col/values must be on the "
+                 "same device");
+    }
+    if (size.size() < 2) {
+        TP_THROW(ValueError,
+                 "sparse_compressed_tensor: compressed layouts need at least "
+                 "2-D sizes");
+    }
+    // Batched inputs keep one leading index entry per batch matrix: the
+    // compressed/plain index tensors are (*batch, units+1) and (*batch, nnz).
+    const int64_t n_batch_dim = size.size() - 2;
+    // The compressed axis enumerates blocks for the blocked layouts and
+    // rows for the unblocked ones.
+    const int64_t compressed_units =
+        (layout == TensorImpl::kSparseBSRLayout ||
+         layout == TensorImpl::kSparseBSCLayout)
+            ? size[0] / blocksize[0]
+            : size[0];
+    if (crow.dim() != n_batch_dim + 1 || col.dim() != n_batch_dim + 1) {
+        TP_THROW(ValueError,
+                 "sparse_compressed_tensor: compressed/plain indices must be "
+                 "(*batch, units+1) and (*batch, nnz)");
+    }
+    if (crow.size(crow.dim() - 1) != compressed_units + 1) {
+        TP_THROW(ValueError,
+                 "sparse_compressed_tensor: compressed indices must have "
+                 "units+1 entries");
+    }
+    // Batched plain indices are (*batch, nnz); compare element counts.
+    if (col.numel() != values.size(0)) {
+        TP_THROW(ValueError,
+                 "sparse_compressed_tensor: plain indices and values must "
+                 "have the same nnz");
+    }
+    if (layout == TensorImpl::kSparseBSRLayout ||
+        layout == TensorImpl::kSparseBSCLayout) {
+        const int64_t block_r = blocksize[0];
+        const int64_t block_c = blocksize[1];
+        if (block_r <= 0 || block_c <= 0) {
+            TP_THROW(ValueError,
+                     "sparse_compressed_tensor: blocked layouts require "
+                     "positive block sizes");
+        }
+        if (size[0] % block_r != 0 || size[1] % block_c != 0) {
+            TP_THROW(ValueError,
+                     "sparse_compressed_tensor: sizes must be divisible by "
+                     "the block sizes");
+        }
+        if (values.dim() < 2 ||
+            values.size(values.dim() - 2) != block_r ||
+            values.size(values.dim() - 1) != block_c) {
+            TP_THROW(ValueError,
+                     "sparse_compressed_tensor: values must end with the two "
+                     "block dimensions");
+        }
+    }
+    Tensor canonical_crow = crow.dtype() == DType::Int64 ? crow : crow.to(DType::Int64);
+    Tensor canonical_col = col.dtype() == DType::Int64 ? col : col.to(DType::Int64);
+
+    // Same rationale as the COO constructor: install logical metadata only.
+    Tensor result(std::make_shared<TensorImpl>(
+        size, values.dtype(), values.device(), /*allocate_storage=*/false));
+    result.unsafeGetTensorImpl()->set_sparse_compressed_state(
+        canonical_crow.unsafeGetTensorImpl(),
+        canonical_col.unsafeGetTensorImpl(),
+        values.unsafeGetTensorImpl(),
+        size, layout, blocksize);
+    return result;
+}
+
+bool Tensor::is_sparse_csc() const {
+    return impl_ && impl_->sparse_layout() == TensorImpl::kSparseCSCLayout;
+}
+bool Tensor::is_sparse_bsr() const {
+    return impl_ && impl_->sparse_layout() == TensorImpl::kSparseBSRLayout;
+}
+bool Tensor::is_sparse_bsc() const {
+    return impl_ && impl_->sparse_layout() == TensorImpl::kSparseBSCLayout;
+}
+bool Tensor::is_sparse_compressed() const {
+    return impl_ && impl_->is_sparse_compressed();
+}
+std::array<int64_t, 2> Tensor::sparse_blocksize() const {
+    return impl_ ? impl_->sparse_blocksize() : std::array<int64_t, 2>{0, 0};
+}
+
 int64_t Tensor::dim() const { return impl_ ? impl_->dim() : 0; }
 int64_t Tensor::numel() const { return impl_ ? impl_->numel() : 0; }
 Size Tensor::shape() const { return impl_ ? Size(impl_->sizes()) : Size(); }
@@ -355,15 +451,17 @@ bool Tensor::is_sparse_csr() const {
 }
 
 Tensor Tensor::_crow_indices() const {
-    if (!is_sparse_csr()) {
-        TP_THROW(RuntimeError, "_crow_indices() is only defined for sparse CSR tensors");
+    if (!is_sparse_compressed()) {
+        TP_THROW(RuntimeError,
+                 "_crow_indices() is only defined for sparse compressed tensors");
     }
     return Tensor(impl_->sparse_crow_impl());
 }
 
 Tensor Tensor::_col_indices() const {
-    if (!is_sparse_csr()) {
-        TP_THROW(RuntimeError, "_col_indices() is only defined for sparse CSR tensors");
+    if (!is_sparse_compressed()) {
+        TP_THROW(RuntimeError,
+                 "_col_indices() is only defined for sparse compressed tensors");
     }
     return Tensor(impl_->sparse_col_impl());
 }
@@ -443,16 +541,16 @@ Scalar Tensor::item() const {
         case DType::UInt64: return Scalar(*data_ptr<uint64_t>());
         case DType::Bool: return Scalar(static_cast<bool>(*data_ptr<bool>()));
         case DType::ComplexHalf: {
-            const auto value = *data_ptr<std::complex<Half>>();
-            return Scalar(std::complex<float>(static_cast<float>(value.real()),
-                                              static_cast<float>(value.imag())));
+            const auto value = *data_ptr<complex<Half>>();
+            return Scalar(complex<float>(static_cast<float>(value.real()),
+                                         static_cast<float>(value.imag())));
         }
-        case DType::ComplexFloat: return Scalar(*data_ptr<std::complex<float>>());
-        case DType::ComplexDouble: return Scalar(*data_ptr<std::complex<double>>());
+        case DType::ComplexFloat: return Scalar(*data_ptr<complex<float>>());
+        case DType::ComplexDouble: return Scalar(*data_ptr<complex<double>>());
         case DType::BComplex32: {
-            const auto value = *data_ptr<std::complex<BFloat16>>();
-            return Scalar(std::complex<float>(static_cast<float>(value.real()),
-                                              static_cast<float>(value.imag())));
+            const auto value = *data_ptr<complex<BFloat16>>();
+            return Scalar(complex<float>(static_cast<float>(value.real()),
+                                         static_cast<float>(value.imag())));
         }
         default:
             TP_THROW(NotImplementedError, "item() not implemented for this dtype");
