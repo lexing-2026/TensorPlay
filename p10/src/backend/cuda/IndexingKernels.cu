@@ -3531,6 +3531,15 @@ Tensor sr_forward_cuda_impl(const Tensor& self, int64_t dim,
         TP_THROW(IndexError,
                  "index must have the same number of dimensions as self");
     }
+    if (index.numel() != 0 && index.dtype() != DType::Int32 &&
+        index.dtype() != DType::Int64) {
+        TP_THROW(TypeError,
+                 "scatter_reduce(): Expected dtype int32/int64 for index");
+    }
+    if (src_in.dtype() != self.dtype()) {
+        TP_THROW(TypeError,
+                 "scatter_reduce(): Expected self.dtype to be equal to src.dtype");
+    }
     if (index.device() != self.device() || src_in.device() != self.device()) {
         TP_THROW(DeviceMismatchError,
                  "scatter_reduce: self, index, and src must be on the same device");
@@ -3672,6 +3681,15 @@ Tensor ir_forward_cuda_impl(const Tensor& self, int64_t dim,
         TP_THROW(IndexError,
                  "index_reduce(): Index is supposed to be a vector, but got dim: ",
                  index.dim());
+    }
+    if (index.numel() != 0 && index.dtype() != DType::Int32 &&
+        index.dtype() != DType::Int64) {
+        TP_THROW(TypeError,
+                 "index_reduce(): Expected dtype int32/int64 for index");
+    }
+    if (source_in.dtype() != self.dtype()) {
+        TP_THROW(TypeError,
+                 "index_reduce(): Expected self.dtype to be equal to source.dtype");
     }
     if (index.device() != self.device() || source_in.device() != self.device()) {
         TP_THROW(DeviceMismatchError,
