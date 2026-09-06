@@ -1,10 +1,15 @@
 name: docs
 
-# Documentation CI. PRs that touch docs/** get a Sphinx build preview as an
-# Actions artifact; pushes to main that touch docs/** additionally republish
-# the rendered pages into the website-deploy branch, which Vercel deploys to
-# https://tensorplay.cn (the website's scripts/generate-docs.mjs converts the
-# Sphinx HTML into site content).
+# Documentation CI. Sphinx autodoc imports tensorplay._C, so the docs build
+# needs a compiled wheel — but never the source tree: PRs and main-branch
+# pushes install the ready-made nightly CPU wheel, and a published release
+# installs its own wheel from the release assets. Renders are published by
+# pushing the rendered output to lexing-2026/TensorPlay-website (push = deploy;
+# requires the WEBSITE_DEPLOY_TOKEN secret with push access to that repo).
+#
+# Versioned docs: a v* release additionally freezes its render under
+# content/docs-html/<tag>/ via generate-docs.mjs --version, which the site's
+# version selector reads.
 
 on:
   pull_request:
@@ -14,56 +19,76 @@ on:
     branches: [main]
     paths:
       - "docs/**"
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Build and publish docs for this tag (defaults to latest docs)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}
+  group: ${{ github.workflow }}-${{ github.event.release.tag_name || github.event.pull_request.number || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
   docs-build:
     name: docs-build
-    runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    # Releases publish frozen per-version docs; everything else keeps the
+    # rolling latest tree current. The rolling nightly release is not a
+    # version and is skipped — trunk pushes already publish latest docs.
+    if: ${{ github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.tag || github.event.release.tag_name || github.ref }}
           submodules: false
           show-progress: false
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
-      # Sphinx autodoc imports tensorplay._C, so the extension must be built.
-      # CPU-only keeps the build fast and GPU-free.
-      - name: Install Linux build dependencies
-        shell: bash
+      - name: Install TensorPlay wheel (nightly)
+        if: ${{ inputs.tag == '' && github.event.release.tag_name == '' }}
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --pre tensorplay \
+            --index-url https://download.tensorplay.cn/whl/nightly/cpu/ \
+            --extra-index-url https://pypi.org/simple
+
+      - name: Install TensorPlay wheel (release)
+        if: ${{ inputs.tag != '' || github.event.release.tag_name != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libopenblas-dev 1>/dev/null
-
-      - name: Restore vendored build dependencies
-        shell: bash
-        run: bash .github/scripts/restore-vendored-deps.sh
-
-      # Build exactly like the binary CI (_binary-build-test.yml): the
-      # isolated build of `pip install .` lets CMake's codegen steps fall
-      # back to the system interpreter, which lacks packaging/PyYAML.
-      - name: Build wheel (CPU only)
-        shell: bash
-        env:
-          SKBUILD_CMAKE_DEFINE: USE_CUDA=OFF
-        run: |
-          python -m pip install --upgrade pip build
-          python -m build --wheel
-
-      - name: Install built wheel
-        run: python -m pip install dist/*.whl numpy PyYAML typing-extensions
+          python -m pip install --upgrade pip
+          # publish.yml uploads wheels after creating the release, so the
+          # CPU wheel may land a few minutes after the published event.
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if gh release download "$RELEASE_TAG" \
+                 --repo "$GITHUB_REPOSITORY" \
+                 --pattern 'tensorplay-*+cpu-cp312-cp312-linux_x86_64.whl' \
+                 --output tensorplay-docs.whl; then
+              break
+            fi
+            if [[ "$attempt" == 10 ]]; then
+              echo "No CPU wheel found on release $RELEASE_TAG" >&2
+              exit 1
+            fi
+            echo "Wheel not uploaded yet (attempt $attempt); retrying in 60s"
+            sleep 60
+          done
+          python -m pip install tensorplay-docs.whl numpy PyYAML typing-extensions
 
       - name: Install docs requirements
         run: python -m pip install -r docs/requirements.txt
@@ -77,14 +102,15 @@ jobs:
           name: docs-html
           path: docs/build/html
           if-no-files-found: error
+          retention-days: 3
 
   docs-publish:
     name: docs-publish
     needs: docs-build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # PRs get an artifact preview only; publishes need the website token.
+    if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'release' || inputs.tag != '' }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    timeout-minutes: 15
     steps:
       - name: Download HTML artifact
         uses: actions/download-artifact@v8
@@ -92,38 +118,45 @@ jobs:
           name: docs-html
           path: docs-html
 
-      - name: Checkout website-deploy
+      - name: Checkout website repository
         uses: actions/checkout@v7
         with:
-          ref: website-deploy
+          repository: lexing-2026/TensorPlay-website
+          token: ${{ secrets.WEBSITE_DEPLOY_TOKEN }}
           path: website
 
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          cache: npm
-          cache-dependency-path: website/package-lock.json
 
-      - name: Install website dependencies
-        working-directory: website
-        run: npm ci
-
-      - name: Convert Sphinx HTML into site content
-        working-directory: website
+      - name: Render docs into the website
         env:
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
           TENSORPLAY_DOCS_BUILD: ${{ github.workspace }}/docs-html
-        run: node scripts/generate-docs.mjs
+        run: |
+          set -euo pipefail
+          if [[ -n "$RELEASE_TAG" ]]; then
+            node scripts/generate-docs.mjs --version "$RELEASE_TAG"
+          else
+            node scripts/generate-docs.mjs
+          fi
 
       - name: Commit and push when content changed
         working-directory: website
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A content/docs-html public/docs
+          if [[ -n "$RELEASE_TAG" ]]; then
+            git add -A "content/docs-html/$RELEASE_TAG" "public/docs/$RELEASE_TAG" content/docs-html/versions.json
+          else
+            git add -A content/docs-html public/docs
+          fi
           if git diff --cached --quiet; then
             echo "No documentation changes to publish"
           else
-            git commit -m "chore(docs): publish rendered docs from main@${GITHUB_SHA:0:8}"
+            git commit -m "chore(website): publish ${RELEASE_TAG:-latest} docs from TensorPlay@${GITHUB_SHA:0:8}"
             git push
           fi
