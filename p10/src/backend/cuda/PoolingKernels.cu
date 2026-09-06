@@ -1620,9 +1620,11 @@ Tensor& interop_avg_pool2d_out_cuda(const Tensor& self, const std::vector<int64_
                                 bool count_include_pad,
                                 std::optional<int64_t> divisor_override, Tensor& out) {
         (void)divisor_override;
-        out = avg_pool2d_native_cuda(self, kernel_size, stride, padding,
-                                     ceil_mode, count_include_pad);
-        return out;
+        return write_pooling_out(
+            "avg_pool2d",
+            avg_pool2d_native_cuda(self, kernel_size, stride, padding,
+                                   ceil_mode, count_include_pad),
+            out);
     
 }
 
@@ -1632,38 +1634,42 @@ Tensor& interop_avg_pool2d_backward_grad_input_cuda(const Tensor& grad_output, c
               bool ceil_mode, bool count_include_pad,
               std::optional<int64_t> divisor_override, Tensor& grad_input) {
         (void)divisor_override;
-        grad_input = avg_pool2d_backward_native_cuda(
-            grad_output, input, kernel_size, stride, padding, ceil_mode,
-            count_include_pad);
-        return grad_input;
+        return write_pooling_out(
+            "avg_pool2d_backward",
+            avg_pool2d_backward_native_cuda(
+                grad_output, input, kernel_size, stride, padding, ceil_mode,
+                count_include_pad),
+            grad_input);
     
 }
 
 Tensor& interop_adaptive_avg_pool2d_out_cuda(const Tensor& self, const std::vector<int64_t>& output_size, Tensor& out) {
-        out = adaptive_avg_pool2d_cuda(self, output_size);
-        return out;
+        return write_pooling_out("adaptive_avg_pool2d",
+                                 adaptive_avg_pool2d_cuda(self, output_size), out);
     
 }
 
 Tensor& interop_adaptive_avg_pool2d_backward_grad_input_cuda(const Tensor& grad_output, const Tensor& input, Tensor& grad_input) {
-        grad_input = adaptive_avg_pool2d_backward_cuda(grad_output, input);
-        return grad_input;
+        return write_pooling_out("adaptive_avg_pool2d_backward",
+                                 adaptive_avg_pool2d_backward_cuda(grad_output, input),
+                                 grad_input);
     
 }
 
 Tensor& interop_adaptive_max_pool2d_out_cuda(const Tensor& self, const std::vector<int64_t>& output_size,
               Tensor& out, Tensor& indices) {
-        out = adaptive_max_pool2d_cuda(self, output_size);
-        indices = Tensor();
+        auto result = adaptive_max_pool2d_with_indices_cuda(self, output_size);
+        write_pooling_out("adaptive_max_pool2d", std::get<0>(result), out);
+        write_pooling_out("adaptive_max_pool2d", std::get<1>(result), indices);
         return out;
     
 }
 
 Tensor& interop_adaptive_max_pool2d_backward_grad_input_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& indices,
               Tensor& grad_input) {
-        (void)indices;
         return write_pooling_out("adaptive_max_pool2d_backward",
-                                 adaptive_max_pool2d_backward_cuda(grad_output, input),
+                                 adaptive_max_pool2d_with_indices_backward_cuda(
+                                     grad_output, input, {}, indices),
                                  grad_input);
     
 }
@@ -1689,8 +1695,10 @@ Tensor& interop_max_pool2d_with_indices_out_cuda(const Tensor& self, const std::
               const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
               const std::vector<int64_t>& dilation, bool ceil_mode, Tensor& out,
               Tensor& indices) {
-        std::tie(out, indices) = max_pool2d_with_indices_cuda(
+        auto result = max_pool2d_with_indices_cuda(
             self, kernel_size, stride, padding, dilation, ceil_mode);
+        write_pooling_out("max_pool2d_with_indices", std::get<0>(result), out);
+        write_pooling_out("max_pool2d_with_indices", std::get<1>(result), indices);
         return out;
     
 }
@@ -1700,10 +1708,12 @@ Tensor& interop_max_pool2d_with_indices_backward_grad_input_cuda(const Tensor& g
               const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
               const std::vector<int64_t>& dilation, bool ceil_mode,
               const Tensor& indices, Tensor& grad_input) {
-        grad_input = max_pool2d_with_indices_backward_cuda(
-            grad_output, self, kernel_size, stride, padding, dilation,
-            ceil_mode, indices);
-        return grad_input;
+        return write_pooling_out(
+            "max_pool2d_with_indices_backward",
+            max_pool2d_with_indices_backward_cuda(
+                grad_output, self, kernel_size, stride, padding, dilation,
+                ceil_mode, indices),
+            grad_input);
     
 }
 
@@ -1711,8 +1721,10 @@ Tensor& interop_max_pool3d_with_indices_out_cuda(const Tensor& self, const std::
               const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
               const std::vector<int64_t>& dilation, bool ceil_mode, Tensor& out,
               Tensor& indices) {
-        std::tie(out, indices) = max_pool3d_with_indices_cuda(
+        auto result = max_pool3d_with_indices_cuda(
             self, kernel_size, stride, padding, dilation, ceil_mode);
+        write_pooling_out("max_pool3d_with_indices", std::get<0>(result), out);
+        write_pooling_out("max_pool3d_with_indices", std::get<1>(result), indices);
         return out;
     
 }
@@ -1722,10 +1734,12 @@ Tensor& interop_max_pool3d_with_indices_backward_grad_input_cuda(const Tensor& g
               const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
               const std::vector<int64_t>& dilation, bool ceil_mode,
               const Tensor& indices, Tensor& grad_input) {
-        grad_input = max_pool3d_with_indices_backward_cuda(
-            grad_output, self, kernel_size, stride, padding, dilation,
-            ceil_mode, indices);
-        return grad_input;
+        return write_pooling_out(
+            "max_pool3d_with_indices_backward",
+            max_pool3d_with_indices_backward_cuda(
+                grad_output, self, kernel_size, stride, padding, dilation,
+                ceil_mode, indices),
+            grad_input);
     
 }
 
