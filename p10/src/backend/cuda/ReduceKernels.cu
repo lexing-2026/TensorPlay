@@ -28,6 +28,9 @@ extern std::tuple<Tensor, Tensor> sort_cuda(const Tensor& self, int64_t dim,
 extern Tensor mean_dim_kernel(const Tensor& self,
                               const std::vector<int64_t>& dim,
                               bool keepdim, DType dtype);
+extern Tensor sum_dim_kernel(const Tensor& self,
+                             const std::vector<int64_t>& dim,
+                             bool keepdim, DType dtype);
 extern Tensor var_dim_kernel(const Tensor& self,
                              const std::vector<int64_t>& dim,
                              int64_t correction, bool keepdim);
@@ -397,18 +400,8 @@ Tensor count_nonzero_cuda2(const Tensor& self, const std::vector<int64_t>& dim) 
     Tensor reduce = self.dtype() == DType::Bool
         ? self
         : self.ne(Scalar(0));
-    if (dim.empty()) {
-        if (self.dim() == 0) {
-            return reduce.to(DType::Int64);
-        }
-        std::vector<int64_t> all_dims;
-        all_dims.reserve(static_cast<size_t>(self.dim()));
-        for (int64_t d = 0; d < self.dim(); ++d) {
-            all_dims.push_back(d);
-        }
-        return reduce_iterative(reduce, all_dims, false, 3, DType::Int64);
-    }
-    return reduce_iterative(reduce, dim, false, 3, DType::Int64);
+    if (self.dim() == 0 && dim.empty()) return reduce.to(DType::Int64);
+    return sum_dim_kernel(reduce, dim, false, DType::Int64);
 }
 
 std::tuple<Tensor, Tensor> cummax_cuda(const Tensor& self, int64_t dim) {
