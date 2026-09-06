@@ -309,8 +309,8 @@ std::tuple<Tensor, Tensor> aminmax_out_native(const Tensor& self,
     std::vector<int64_t> dims;
     if (dim.has_value()) dims.push_back(*dim);
     auto r = ops::aminmax(self, dims, keepdim);
-    min = std::get<0>(r);
-    max = std::get<1>(r);
+    write_sort_out("aminmax", std::get<0>(r), min);
+    write_sort_out("aminmax", std::get<1>(r), max);
     return {min, max};
 }
 
