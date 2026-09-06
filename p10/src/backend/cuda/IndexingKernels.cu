@@ -2226,11 +2226,16 @@ Tensor index_copy_cuda(const Tensor& self, int64_t dim, const Tensor& index, con
 #define TP_IC_CASE(ctype, name) \
     case DType::name: \
         index_copy_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            total, inner, row, result.data_ptr<ctype>(), idx.data_ptr<int64_t>(), \
-            source_c.data_ptr<ctype>()); \
+            total, inner, row, static_cast<ctype*>(result.data_ptr()), \
+            idx.data_ptr<int64_t>(), static_cast<const ctype*>(source_c.data_ptr())); \
         break;
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_IC_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(TP_IC_CASE)
+        TP_IC_CASE(tensorplay::complex<Half>, ComplexHalf)
+        TP_IC_CASE(tensorplay::complex<float>, ComplexFloat)
+        TP_IC_CASE(tensorplay::complex<double>, ComplexDouble)
+        TP_IC_CASE(tensorplay::complex<BFloat16>, BComplex32)
         default: TP_THROW(TypeError, "index_copy: unsupported dtype");
     }
 #undef TP_IC_CASE
@@ -2266,11 +2271,17 @@ Tensor index_fill_scalar_cuda(const Tensor& self, int64_t dim, const Tensor& ind
     case DType::name: { \
         ctype v = value.to<ctype>(); \
         index_fill_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            total, inner, row, result.data_ptr<ctype>(), idx.data_ptr<int64_t>(), v); \
+            total, inner, row, static_cast<ctype*>(result.data_ptr()), \
+            idx.data_ptr<int64_t>(), v); \
         break; \
     }
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_IF_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(TP_IF_CASE)
+        TP_IF_CASE(tensorplay::complex<Half>, ComplexHalf)
+        TP_IF_CASE(tensorplay::complex<float>, ComplexFloat)
+        TP_IF_CASE(tensorplay::complex<double>, ComplexDouble)
+        TP_IF_CASE(tensorplay::complex<BFloat16>, BComplex32)
         default: TP_THROW(TypeError, "index_fill: unsupported dtype");
     }
 #undef TP_IF_CASE
