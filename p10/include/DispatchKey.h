@@ -19,39 +19,42 @@ enum class DispatchKey : uint8_t {
     Vulkan = 2,
 
     // Autograd keys related to backends by a fixed offset.
-    AutogradCPU = 3,
-    AutogradCUDA = 4,
-    AutogradVulkan = 5,
+    DynamicLayerBackMode = 3,
+    AutogradCPU = 4,
+    AutogradCUDA = 5,
+    AutogradVulkan = 6,
 
     // Autocast keys related to backends by a fixed offset.  They sit above
     // the autograd keys so casts happen before autograd history recording.
-    AutocastCPU = 6,
-    AutocastCUDA = 7,
-    AutocastVulkan = 8,
+    AutocastCPU = 7,
+    AutocastCUDA = 8,
+    AutocastVulkan = 9,
 
     // Backend-neutral composite key. One registration serves every dense
     // backend until a backend registers its own kernel. Lookups never walk
     // this key from a tensor key set; the dispatcher consults it only when a
     // backend slot is empty.
-    Composite = 12,
+    Composite = 13,
 
     // Per-backend batching keys. These must outrank autograd and backend
     // keys so a transform can unwrap its operands before ordinary kernels
     // and autograd nodes observe them.
-    VmapCPU = 9,
-    VmapCUDA = 10,
-    VmapVulkan = 11,
+    VmapCPU = 10,
+    VmapCUDA = 11,
+    VmapVulkan = 12,
+    VmapMode = 14,
+    DynamicLayerFrontMode = 15,
 
     // One past every real key; the sentinel value must stay above all of
     // them, so it is spelled out rather than derived from the previous
     // entry.
-    EndOfKeys = 13 // Sentinel
+    EndOfKeys = 16 // Sentinel
 };
 
 constexpr size_t kBackendKeyCount = 3;           // CPU, CUDA, Vulkan
-constexpr size_t kAutogradKeyOffset = 3;         // AutogradCPU - CPU
-constexpr size_t kAutocastKeyOffset = 6;         // AutocastCPU - CPU
-constexpr size_t kVmapKeyOffset = 9;             // VmapCPU - CPU
+constexpr size_t kAutogradKeyOffset = 4;         // AutogradCPU - CPU
+constexpr size_t kAutocastKeyOffset = 7;         // AutocastCPU - CPU
+constexpr size_t kVmapKeyOffset = 10;            // VmapCPU - CPU
 
 inline constexpr DispatchKey toAutocastKey(DispatchKey backend) {
     return static_cast<DispatchKey>(static_cast<uint8_t>(backend) + kAutocastKeyOffset);
@@ -115,6 +118,9 @@ inline std::string toString(DispatchKey key) {
         case DispatchKey::VmapCUDA: return "VmapCUDA";
         case DispatchKey::VmapVulkan: return "VmapVulkan";
         case DispatchKey::Composite: return "Composite";
+        case DispatchKey::VmapMode: return "VmapMode";
+        case DispatchKey::DynamicLayerFrontMode: return "DynamicLayerFrontMode";
+        case DispatchKey::DynamicLayerBackMode: return "DynamicLayerBackMode";
         default: return "Unknown";
     }
 }
@@ -145,6 +151,7 @@ public:
 
     DispatchKeySet operator|(DispatchKeySet other) const { return DispatchKeySet(mask_ | other.mask_); }
     DispatchKeySet operator&(DispatchKeySet other) const { return DispatchKeySet(mask_ & other.mask_); }
+    DispatchKeySet operator-(DispatchKeySet other) const { return DispatchKeySet(mask_ & ~other.mask_); }
     DispatchKeySet& operator|=(DispatchKeySet other) { mask_ |= other.mask_; return *this; }
 
     // Highest-priority (numerically largest) key in the set; EndOfKeys if empty.

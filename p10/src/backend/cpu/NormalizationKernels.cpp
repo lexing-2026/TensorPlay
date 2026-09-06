@@ -3,15 +3,62 @@
 #include "Exception.h"
 #include "Parallel.h"
 #include "NormRowHelpers.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 
 namespace tensorplay {
 namespace cpu {
 
+namespace {
+
+DType normalization_stats_dtype(DType input_dtype) {
+    return input_dtype == DType::Float16 || input_dtype == DType::BFloat16
+        ? DType::Float32
+        : input_dtype;
+}
+
+double normalization_stats_read(const Tensor& tensor, int64_t index) {
+    switch (tensor.dtype()) {
+        case DType::Float64:
+            return tensor.data_ptr<double>()[index];
+        case DType::Float32:
+            return static_cast<double>(tensor.data_ptr<float>()[index]);
+        case DType::Float16:
+            return static_cast<double>(tensor.data_ptr<tensorplay::Half>()[index]);
+        case DType::BFloat16:
+            return static_cast<double>(tensor.data_ptr<tensorplay::BFloat16>()[index]);
+        default:
+            TP_THROW(RuntimeError, "normalization: unsupported statistics dtype");
+    }
+}
+
+void normalization_stats_write(Tensor& tensor, int64_t index, double value) {
+    switch (tensor.dtype()) {
+        case DType::Float64:
+            tensor.data_ptr<double>()[index] = value;
+            return;
+        case DType::Float32:
+            tensor.data_ptr<float>()[index] = static_cast<float>(value);
+            return;
+        case DType::Float16:
+            tensor.data_ptr<tensorplay::Half>()[index] =
+                tensorplay::Half(static_cast<float>(value));
+            return;
+        case DType::BFloat16:
+            tensor.data_ptr<tensorplay::BFloat16>()[index] =
+                tensorplay::BFloat16(static_cast<float>(value));
+            return;
+        default:
+            TP_THROW(RuntimeError, "normalization: unsupported statistics dtype");
+    }
+}
+
+}  // namespace
+
 std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cpu(
     const Tensor& grad_output, const Tensor& input,
-    const std::optional<Tensor>& weight_opt,
-    const std::optional<Tensor>& running_mean_opt,
-    const std::optional<Tensor>& running_var_opt,
+    std::optional<Tensor> weight_opt,
+    std::optional<Tensor> running_mean_opt,
+    std::optional<Tensor> running_var_opt,
     bool training, double eps);
 
 }  // namespace cpu
@@ -34,40 +81,82 @@ static void check_dims(const Tensor& input, int64_t expected_dim, const char* na
     }
 }
 
-// Backward for GroupNorm
-std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cpu(const Tensor& grad_output, const Tensor& input,
-                              int64_t num_groups,
-                              const std::optional<Tensor>& weight_opt, const std::optional<Tensor>& bias_opt,
-                              double eps) {
-    // Reusing LayerNorm backward logic or implementing similar logic
-    // GroupNorm(N, C, ...) -> Reshape to (N, G, C/G, ...) -> LayerNorm over (C/G, ...)
-
-    // For simplicity, implementing directly.
+// Backward for GroupNorm.  The native entry point supplies the saved moments;
+// the public helper passes null moments and computes them in this kernel.
+static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cpu_impl(
+        const Tensor& grad_output, const Tensor& input, int64_t num_groups,
+        const std::optional<Tensor>& weight_opt,
+        const std::optional<Tensor>& bias_opt, double eps,
+        const Tensor* mean_opt, const Tensor* rstd_opt,
+        const std::vector<bool>* output_mask) {
     int64_t N = input.size(0);
     int64_t C = input.size(1);
 
-    if (C % num_groups != 0) TP_THROW(RuntimeError, "group_norm_backward: C not divisible by num_groups");
+    if (input.dim() < 2)
+        TP_THROW(RuntimeError, "group_norm_backward requires at least 2 dims");
+    if (num_groups <= 0)
+        TP_THROW(RuntimeError, "group_norm_backward: num_groups must be positive");
+    if (C <= 0 || C % num_groups != 0)
+        TP_THROW(RuntimeError, "group_norm_backward: C must be positive and divisible by num_groups");
 
     int64_t G = num_groups;
     int64_t D = C / G;
 
-    int64_t numel = input.numel();
-    int64_t spatial_size = numel / (N * C);
+    int64_t spatial_size = 1;
+    for (int64_t dim = 2; dim < input.dim(); ++dim)
+        spatial_size *= input.size(dim);
+    if (spatial_size <= 0)
+        TP_THROW(RuntimeError, "group_norm_backward: spatial dimensions must be positive");
     int64_t group_size = D * spatial_size; // Normalization size
 
     if (input.dtype() != DType::Float32) TP_THROW(NotImplementedError, "group_norm_backward only supports Float32");
+    if (grad_output.dtype() != input.dtype())
+        TP_THROW(RuntimeError, "group_norm_backward: grad_output dtype must match input dtype");
+
+    const bool has_weight = weight_opt.has_value() && weight_opt->defined();
+    const bool has_bias = bias_opt.has_value() && bias_opt->defined();
+    const bool want_input = output_mask == nullptr || output_mask->empty() ||
+        (output_mask->size() > 0 && (*output_mask)[0]);
+    const bool want_weight = has_weight &&
+        (output_mask == nullptr || output_mask->size() <= 1 || (*output_mask)[1]);
+    const bool want_bias = output_mask == nullptr
+        ? has_bias
+        : (output_mask->size() > 2 && (*output_mask)[2]);
 
     const Tensor go_c = grad_output.contiguous();
     const Tensor in_c = input.contiguous();
 
-    Tensor grad_input = Tensor::empty_like(input);
+    Tensor grad_input = want_input ? Tensor::empty_like(input) : Tensor();
     Tensor grad_weight;
     Tensor grad_bias;
 
-    if (weight_opt.has_value() && weight_opt->defined()) grad_weight = Tensor::empty_like(*weight_opt);
-    if (bias_opt.has_value() && bias_opt->defined()) grad_bias = Tensor::empty_like(*bias_opt);
+    if (want_weight) grad_weight = Tensor::empty_like(*weight_opt);
+    if (want_bias) {
+        if (has_bias) grad_bias = Tensor::empty_like(*bias_opt);
+        else grad_bias = Tensor::empty({C}, input.dtype(), input.device());
+    }
 
-    float* grad_in_ptr = grad_input.data_ptr<float>();
+    const int64_t rows = N * G;
+    if (N == 0) {
+        if (want_input) grad_input = Tensor::zeros_like(input);
+        if (want_weight) grad_weight = Tensor::zeros_like(*weight_opt);
+        if (want_bias) {
+            if (has_bias) grad_bias = Tensor::zeros_like(*bias_opt);
+            else grad_bias = Tensor::zeros({C}, input.dtype(), input.device());
+        }
+        return std::make_tuple(grad_input, grad_weight, grad_bias);
+    }
+
+    if (mean_opt || rstd_opt) {
+        if (!mean_opt || !rstd_opt || !mean_opt->defined() ||
+            !rstd_opt->defined() || mean_opt->numel() != rows ||
+            rstd_opt->numel() != rows) {
+            TP_THROW(RuntimeError,
+                     "group_norm_backward: saved statistics have an invalid shape");
+        }
+    }
+
+    float* grad_in_ptr = grad_input.defined() ? grad_input.data_ptr<float>() : nullptr;
     const float* grad_out_ptr = go_c.data_ptr<float>();
     const float* in_ptr = in_c.data_ptr<float>();
 
@@ -97,24 +186,31 @@ std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cpu(const Tensor& grad_ou
             const int64_t c_start = g * D;
             const int64_t group_offset = n * C * spatial_size + g * D * spatial_size;
 
-            // 1. Statistics for this group (data is contiguous).
+            // 1. Use the saved moments for native backward; public backward
+            // computes the same moments when no saved tensors are available.
             float mean;
             float inv_std;
+            if (mean_opt) {
+                mean = static_cast<float>(normalization_stats_read(*mean_opt, row));
+                inv_std = static_cast<float>(normalization_stats_read(*rstd_opt, row));
+            } else {
 #if defined(__x86_64__)
-            if (norm_row::avx512_ok() && group_size >= 16) {
-                norm_row::stats_f32_512(in_ptr + group_offset, group_size, feps, &mean, &inv_std);
-            } else
+                if (norm_row::avx512_ok() && group_size >= 16) {
+                    norm_row::stats_f32_512(in_ptr + group_offset, group_size, feps,
+                                            &mean, &inv_std);
+                } else
 #endif
-            {
-                float sum = 0.0f, sq_sum = 0.0f;
-                for (int64_t i = 0; i < group_size; ++i) {
-                    const float val = in_ptr[group_offset + i];
-                    sum += val;
-                    sq_sum += val * val;
+                {
+                    float sum = 0.0f, sq_sum = 0.0f;
+                    for (int64_t i = 0; i < group_size; ++i) {
+                        const float val = in_ptr[group_offset + i];
+                        sum += val;
+                        sq_sum += val * val;
+                    }
+                    mean = sum / group_size;
+                    const float var = (sq_sum / group_size) - mean * mean;
+                    inv_std = 1.0f / std::sqrt(var + feps);
                 }
-                mean = sum / group_size;
-                const float var = (sq_sum / group_size) - mean * mean;
-                inv_std = 1.0f / std::sqrt(var + feps);
             }
 
             // 2. Per-channel reductions: sum(dy), sum(dy * x) fold into the
@@ -148,30 +244,35 @@ std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cpu(const Tensor& grad_ou
             }
 
             // 3. grad_input for the whole group.
-            const float term1 = inv_std / group_size;
-            const float M = static_cast<float>(group_size);
-            for (int64_t d = 0; d < D; ++d) {
-                const int64_t c = c_start + d;
-                const int64_t c_offset = group_offset + d * spatial_size;
-                const float w = (w_ptr) ? w_ptr[c] : 1.0f;
+            if (grad_in_ptr) {
+                const float term1 = inv_std / group_size;
+                const float M = static_cast<float>(group_size);
+                for (int64_t d = 0; d < D; ++d) {
+                    const int64_t c = c_start + d;
+                    const int64_t c_offset = group_offset + d * spatial_size;
+                    const float w = (w_ptr) ? w_ptr[c] : 1.0f;
 #if defined(__x86_64__)
-                if (norm_row::avx512_ok()) {
-                    if (w_ptr) {
-                        norm_row::gn_bwd_plane_f32_512<true>(
-                            in_ptr + c_offset, grad_out_ptr + c_offset, grad_in_ptr + c_offset,
-                            spatial_size, mean, inv_std, w, term1, M, s_dy, s_dy_xhat);
-                    } else {
-                        norm_row::gn_bwd_plane_f32_512<false>(
-                            in_ptr + c_offset, grad_out_ptr + c_offset, grad_in_ptr + c_offset,
-                            spatial_size, mean, inv_std, 1.0f, term1, M, s_dy, s_dy_xhat);
-                    }
-                } else
+                    if (norm_row::avx512_ok()) {
+                        if (w_ptr) {
+                            norm_row::gn_bwd_plane_f32_512<true>(
+                                in_ptr + c_offset, grad_out_ptr + c_offset,
+                                grad_in_ptr + c_offset, spatial_size, mean,
+                                inv_std, w, term1, M, s_dy, s_dy_xhat);
+                        } else {
+                            norm_row::gn_bwd_plane_f32_512<false>(
+                                in_ptr + c_offset, grad_out_ptr + c_offset,
+                                grad_in_ptr + c_offset, spatial_size, mean,
+                                inv_std, 1.0f, term1, M, s_dy, s_dy_xhat);
+                        }
+                    } else
 #endif
-                {
-                    for (int64_t s = 0; s < spatial_size; ++s) {
-                        const float dy = grad_out_ptr[c_offset + s] * w;
-                        const float x_hat = (in_ptr[c_offset + s] - mean) * inv_std;
-                        grad_in_ptr[c_offset + s] = term1 * (M * dy - s_dy - x_hat * s_dy_xhat);
+                    {
+                        for (int64_t s = 0; s < spatial_size; ++s) {
+                            const float dy = grad_out_ptr[c_offset + s] * w;
+                            const float x_hat = (in_ptr[c_offset + s] - mean) * inv_std;
+                            grad_in_ptr[c_offset + s] =
+                                term1 * (M * dy - s_dy - x_hat * s_dy_xhat);
+                        }
                     }
                 }
             }
@@ -198,19 +299,27 @@ std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cpu(const Tensor& grad_ou
         });
     }
 
-    if (!weight_opt.has_value() || !weight_opt->defined()) grad_weight = Tensor();
-    if (!bias_opt.has_value() || !bias_opt->defined()) grad_bias = Tensor();
-
     return std::make_tuple(grad_input, grad_weight, grad_bias);
+}
+
+std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cpu(
+        const Tensor& grad_output, const Tensor& input, int64_t num_groups,
+        std::optional<Tensor> weight_opt, std::optional<Tensor> bias_opt,
+        double eps) {
+    return group_norm_backward_cpu_impl(
+        grad_output, input, num_groups, weight_opt, bias_opt, eps, nullptr,
+        nullptr, nullptr);
 }
 
 // Layer Normalization
 // ============================================================================
 
 
-Tensor layer_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalized_shape, 
-                      const std::optional<Tensor>& weight_opt, const std::optional<Tensor>& bias_opt, 
-                      double eps) {
+static Tensor layer_norm_cpu_impl(
+        const Tensor& input, const std::vector<int64_t>& normalized_shape,
+        const std::optional<Tensor>& weight_opt,
+        const std::optional<Tensor>& bias_opt, double eps,
+        Tensor* mean_out, Tensor* rstd_out) {
     
     // normalized_shape defines the last D dimensions to normalize over.
     // e.g. input (N, C, H, W), normalized_shape (C, H, W) -> normalize over C,H,W (per N)
@@ -231,7 +340,7 @@ Tensor layer_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalize
         inner_size *= normalized_shape[i];
     }
     
-    int64_t outer_size = input.numel() / inner_size;
+    int64_t outer_size = inner_size == 0 ? 0 : input.numel() / inner_size;
     
     Tensor input_c = input.contiguous();
     Tensor out = Tensor::empty(static_cast<std::vector<int64_t>>(input.shape()), input.dtype(), input.device());
@@ -256,6 +365,8 @@ Tensor layer_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalize
                 if (norm_row::avx512_ok() && inner_size >= 16) {
                     float mean, rstd;
                     norm_row::stats_f32_512(row, inner_size, static_cast<float>(eps), &mean, &rstd);
+                    if (mean_out) normalization_stats_write(*mean_out, i, mean);
+                    if (rstd_out) normalization_stats_write(*rstd_out, i, rstd);
                     if (w_ptr && b_ptr) norm_row::apply_f32_512<true, true>(row, orow, inner_size, mean, rstd, w_ptr, b_ptr);
                     else if (w_ptr) norm_row::apply_f32_512<true, false>(row, orow, inner_size, mean, rstd, w_ptr, b_ptr);
                     else if (b_ptr) norm_row::apply_f32_512<false, true>(row, orow, inner_size, mean, rstd, w_ptr, b_ptr);
@@ -273,6 +384,8 @@ Tensor layer_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalize
                 float mean = sum / inner_size;
                 float var = (sq_sum / inner_size) - (mean * mean);
                 float inv_std = 1.0f / std::sqrt(var + (float)eps);
+                if (mean_out) normalization_stats_write(*mean_out, i, mean);
+                if (rstd_out) normalization_stats_write(*rstd_out, i, inv_std);
                 for (int64_t j = 0; j < inner_size; ++j) {
                     float normalized = (row[j] - mean) * inv_std;
                     if (w_ptr) normalized *= w_ptr[j];
@@ -296,6 +409,8 @@ Tensor layer_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalize
                 if (norm_row::avx512_ok() && inner_size >= 8) {
                     double mean, rstd;
                     norm_row::stats_f64_512(row, inner_size, eps, &mean, &rstd);
+                    if (mean_out) normalization_stats_write(*mean_out, i, mean);
+                    if (rstd_out) normalization_stats_write(*rstd_out, i, rstd);
                     if (w_ptr && b_ptr) norm_row::apply_f64_512<true, true>(row, orow, inner_size, mean, rstd, w_ptr, b_ptr);
                     else if (w_ptr) norm_row::apply_f64_512<true, false>(row, orow, inner_size, mean, rstd, w_ptr, b_ptr);
                     else if (b_ptr) norm_row::apply_f64_512<false, true>(row, orow, inner_size, mean, rstd, w_ptr, b_ptr);
@@ -313,6 +428,8 @@ Tensor layer_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalize
                 double mean = sum / inner_size;
                 double var = (sq_sum / inner_size) - (mean * mean);
                 double inv_std = 1.0 / std::sqrt(var + eps);
+                if (mean_out) normalization_stats_write(*mean_out, i, mean);
+                if (rstd_out) normalization_stats_write(*rstd_out, i, inv_std);
                 for (int64_t j = 0; j < inner_size; ++j) {
                     double normalized = (row[j] - mean) * inv_std;
                     if (w_ptr) normalized *= w_ptr[j];
@@ -343,6 +460,8 @@ Tensor layer_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalize
                 float mean = sum / inner_size;
                 float var = (sq_sum / inner_size) - (mean * mean);
                 float inv_std = 1.0f / std::sqrt(var + static_cast<float>(eps));
+                if (mean_out) normalization_stats_write(*mean_out, i, mean);
+                if (rstd_out) normalization_stats_write(*rstd_out, i, inv_std);
 
                 for (int64_t j = 0; j < inner_size; ++j) {
                     float val = static_cast<float>(in_ptr[offset + j]);
@@ -376,6 +495,8 @@ Tensor layer_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalize
                 float mean = sum / inner_size;
                 float var = (sq_sum / inner_size) - (mean * mean);
                 float inv_std = 1.0f / std::sqrt(var + static_cast<float>(eps));
+                if (mean_out) normalization_stats_write(*mean_out, i, mean);
+                if (rstd_out) normalization_stats_write(*rstd_out, i, inv_std);
 
                 for (int64_t j = 0; j < inner_size; ++j) {
                     float val = static_cast<float>(in_ptr[offset + j]);
@@ -397,13 +518,22 @@ Tensor layer_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalize
     return out;
 }
 
+Tensor layer_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalized_shape,
+                      std::optional<Tensor> weight_opt,
+                      std::optional<Tensor> bias_opt, double eps) {
+    return layer_norm_cpu_impl(input, normalized_shape, weight_opt, bias_opt,
+                               eps, nullptr, nullptr);
+}
+
 // ============================================================================
 // Group Normalization
 // ============================================================================
 
-Tensor group_norm_cpu(const Tensor& input, int64_t num_groups, 
-                      const std::optional<Tensor>& weight_opt, const std::optional<Tensor>& bias_opt, 
-                      double eps) {
+static Tensor group_norm_cpu_impl(
+        const Tensor& input, int64_t num_groups,
+        const std::optional<Tensor>& weight_opt,
+        const std::optional<Tensor>& bias_opt, double eps,
+        Tensor* mean_out, Tensor* rstd_out) {
     
     // input: (N, C, *)
     if (input.dim() < 2) TP_THROW(RuntimeError, "group_norm requires at least 2 dims");
@@ -411,10 +541,19 @@ Tensor group_norm_cpu(const Tensor& input, int64_t num_groups,
     int64_t N = input.size(0);
     int64_t C = input.size(1);
     
+    if (num_groups <= 0)
+        TP_THROW(RuntimeError, "group_norm: num_groups must be positive");
+    if (C <= 0)
+        TP_THROW(RuntimeError, "group_norm: num_channels must be positive");
     if (C % num_groups != 0) TP_THROW(RuntimeError, "group_norm: num_channels must be divisible by num_groups");
     
     int64_t channels_per_group = C / num_groups;
-    int64_t spatial_size = input.numel() / (N * C);
+    int64_t spatial_size = 1;
+    for (int64_t dim = 2; dim < input.dim(); ++dim) {
+        spatial_size *= input.size(dim);
+    }
+    if (spatial_size <= 0)
+        TP_THROW(RuntimeError, "group_norm: spatial dimensions must be positive");
     
     // Effectively we reshape (N, G, C/G, *) and normalize over (C/G, *)
     // inner_size = (C/G) * spatial_size
@@ -447,6 +586,10 @@ Tensor group_norm_cpu(const Tensor& input, int64_t num_groups,
                 if (norm_row::avx512_ok() && inner_size >= 16) {
                     norm_row::stats_f32_512(
                         group, inner_size, static_cast<float>(eps), &mean, &inv_std);
+                    if (mean_out) normalization_stats_write(
+                        *mean_out, row, mean);
+                    if (rstd_out) normalization_stats_write(
+                        *rstd_out, row, inv_std);
                     if (w_ptr && b_ptr) {
                         norm_row::apply_group_f32_512<true, true>(
                             group, group_out, channels_per_group, spatial_size,
@@ -477,6 +620,8 @@ Tensor group_norm_cpu(const Tensor& input, int64_t num_groups,
                 mean = sum / inner_size;
                 const float var = (sq_sum / inner_size) - mean * mean;
                 inv_std = 1.0f / std::sqrt(var + static_cast<float>(eps));
+                if (mean_out) normalization_stats_write(*mean_out, row, mean);
+                if (rstd_out) normalization_stats_write(*rstd_out, row, inv_std);
                 for (int64_t c = 0; c < channels_per_group; ++c) {
                     const float w = w_ptr ? w_ptr[c_start + c] : 1.0f;
                     const float b = b_ptr ? b_ptr[c_start + c] : 0.0f;
@@ -494,6 +639,13 @@ Tensor group_norm_cpu(const Tensor& input, int64_t num_groups,
     return out;
 }
 
+Tensor group_norm_cpu(const Tensor& input, int64_t num_groups,
+                      std::optional<Tensor> weight_opt,
+                      std::optional<Tensor> bias_opt, double eps) {
+    return group_norm_cpu_impl(input, num_groups, weight_opt, bias_opt, eps,
+                               nullptr, nullptr);
+}
+
 // ============================================================================
 // Backward for LayerNorm
 // Rows are independent: statistics are recomputed per row, per-row reduction
@@ -506,22 +658,45 @@ static std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu_typed(
         const std::vector<int64_t>& normalized_shape,
         const std::optional<Tensor>& weight_opt,
         const std::optional<Tensor>& bias_opt,
-        double eps) {
+        double eps, const Tensor* mean_opt, const Tensor* rstd_opt,
+        const std::vector<bool>* output_mask) {
 
     int64_t norm_ndim = normalized_shape.size();
     int64_t input_ndim = input.dim();
     int64_t inner_size = 1;
     for (auto s : normalized_shape) inner_size *= s;
-    int64_t outer_size = input.numel() / inner_size;
+    int64_t outer_size = inner_size == 0 ? 0 : input.numel() / inner_size;
 
-    Tensor grad_input = Tensor::empty_like(input);
+    if (mean_opt || rstd_opt) {
+        if (!mean_opt || !rstd_opt || !mean_opt->defined() ||
+            !rstd_opt->defined() || mean_opt->numel() != outer_size ||
+            rstd_opt->numel() != outer_size) {
+            TP_THROW(RuntimeError,
+                     "layer_norm_backward: saved statistics have an invalid shape");
+        }
+    }
+
+    const bool has_weight = weight_opt.has_value() && weight_opt->defined();
+    const bool has_bias = bias_opt.has_value() && bias_opt->defined();
+    const bool want_input = output_mask == nullptr || output_mask->empty() ||
+        (output_mask->size() > 0 && (*output_mask)[0]);
+    const bool want_weight = has_weight &&
+        (output_mask == nullptr || output_mask->size() <= 1 || (*output_mask)[1]);
+    const bool want_bias = output_mask == nullptr
+        ? has_bias
+        : (output_mask->size() > 2 && (*output_mask)[2]);
+
+    Tensor grad_input = want_input ? Tensor::empty_like(input) : Tensor();
     Tensor grad_weight;
     Tensor grad_bias;
 
-    if (weight_opt.has_value() && weight_opt->defined()) grad_weight = Tensor::empty_like(*weight_opt);
-    if (bias_opt.has_value() && bias_opt->defined()) grad_bias = Tensor::empty_like(*bias_opt);
+    if (want_weight) grad_weight = Tensor::empty_like(*weight_opt);
+    if (want_bias) {
+        if (has_bias) grad_bias = Tensor::empty_like(*bias_opt);
+        else grad_bias = Tensor::empty({inner_size}, input.dtype(), input.device());
+    }
 
-    T* grad_in_ptr = grad_input.data_ptr<T>();
+    T* grad_in_ptr = grad_input.defined() ? grad_input.data_ptr<T>() : nullptr;
     const T* grad_out_ptr = grad_output.data_ptr<T>();
     const T* in_ptr = input.data_ptr<T>();
 
@@ -547,8 +722,13 @@ static std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu_typed(
         for (int64_t i = rb; i < re; ++i) {
             int64_t offset = i * inner_size;
 
-            // 1. Recompute statistics for the row.
+            // 1. Native backward consumes the forward moments.  The public
+            // helper computes them here because its spelling has no moments.
             T mean, inv_std;
+            if (mean_opt) {
+                mean = static_cast<T>(normalization_stats_read(*mean_opt, i));
+                inv_std = static_cast<T>(normalization_stats_read(*rstd_opt, i));
+            } else {
 #if defined(__x86_64__)
             if (is_f32 && norm_row::avx512_ok() && inner_size >= 16) {
                 // The branch runs only for T == float; reinterpret the row
@@ -569,6 +749,7 @@ static std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu_typed(
                 mean = sum / inner_size;
                 T var = (sq_sum / inner_size) - (mean * mean);
                 inv_std = T(1) / std::sqrt(var + Teps);
+            }
             }
             (void)Teps;
 
@@ -620,6 +801,7 @@ static std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu_typed(
             }
 
             // 3. grad_input for this row.
+            if (grad_in_ptr) {
             const T term1 = inv_std / inner_size;
             const T M = static_cast<T>(inner_size);
 #if defined(__x86_64__)
@@ -660,6 +842,7 @@ static std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu_typed(
 
                 grad_in_ptr[offset + j] = term1 * (M * dy_eff - s_dy - x_hat * s_dy_x_hat);
             }
+            }
         }
     });
 
@@ -684,9 +867,6 @@ static std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu_typed(
         });
     }
 
-    if (!weight_opt.has_value() || !weight_opt->defined()) grad_weight = Tensor();
-    if (!bias_opt.has_value() || !bias_opt->defined()) grad_bias = Tensor();
-
     return std::make_tuple(grad_input, grad_weight, grad_bias);
 }
 
@@ -695,7 +875,8 @@ static std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu_reduced(
         const std::vector<int64_t>& normalized_shape,
         const std::optional<Tensor>& weight_opt,
         const std::optional<Tensor>& bias_opt,
-        double eps) {
+        double eps, const Tensor* mean_opt, const Tensor* rstd_opt,
+        const std::vector<bool>* output_mask) {
     // Reduced precision: promote to float32, reuse the typed kernel,
     const DType act_dt = input.dtype();
     Tensor in_f = input.to(DType::Float32);
@@ -707,7 +888,8 @@ static std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu_reduced(
     std::optional<Tensor> b_f = has_b
         ? std::optional<Tensor>(bias_opt->to(DType::Float32)) : std::nullopt;
     auto g = layer_norm_backward_cpu_typed<float>(
-        gy_f, in_f, normalized_shape, w_f, b_f, eps);
+        gy_f, in_f, normalized_shape, w_f, b_f, eps, mean_opt, rstd_opt,
+        output_mask);
     return std::make_tuple(
         std::get<0>(g).to(act_dt),
         std::get<1>(g).defined()
@@ -718,25 +900,102 @@ static std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu_reduced(
             : std::get<2>(g));
 }
 
-std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu(const Tensor& grad_output, const Tensor& input, 
-                              const std::vector<int64_t>& normalized_shape, 
-                              const std::optional<Tensor>& weight_opt, const std::optional<Tensor>& bias_opt, 
-                              double eps) {
+std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu(
+                              const Tensor& grad_output, const Tensor& input,
+                              const std::vector<int64_t>& normalized_shape,
+                              std::optional<Tensor> weight_opt,
+                              std::optional<Tensor> bias_opt, double eps) {
     switch (input.dtype()) {
         case DType::Float32:
             return layer_norm_backward_cpu_typed<float>(
-                grad_output, input, normalized_shape, weight_opt, bias_opt, eps);
+                grad_output, input, normalized_shape, weight_opt, bias_opt, eps,
+                nullptr, nullptr);
         case DType::Float64:
             return layer_norm_backward_cpu_typed<double>(
-                grad_output, input, normalized_shape, weight_opt, bias_opt, eps);
+                grad_output, input, normalized_shape, weight_opt, bias_opt, eps,
+                nullptr, nullptr);
         case DType::Float16:
         case DType::BFloat16:
             return layer_norm_backward_cpu_reduced(
-                grad_output, input, normalized_shape, weight_opt, bias_opt, eps);
+                grad_output, input, normalized_shape, weight_opt, bias_opt, eps,
+                nullptr, nullptr);
         default:
             TP_THROW(NotImplementedError,
                      "layer_norm_backward only supports Float32/Float64/Float16/BFloat16");
     }
+}
+
+std::tuple<Tensor, Tensor, Tensor> native_layer_norm_cpu(
+        const Tensor& input, const std::vector<int64_t>& normalized_shape,
+        std::optional<Tensor> weight_opt,
+        std::optional<Tensor> bias_opt, double eps) {
+    int64_t inner_size = 1;
+    if (normalized_shape.empty())
+        TP_THROW(RuntimeError, "native_layer_norm: normalized_shape must not be empty");
+    for (int64_t size : normalized_shape) inner_size *= size;
+    const int64_t outer_size = inner_size == 0 ? 0 : input.numel() / inner_size;
+    const DType stats_dtype = normalization_stats_dtype(input.dtype());
+    Tensor mean = Tensor::empty({outer_size}, stats_dtype, input.device());
+    Tensor rstd = Tensor::empty({outer_size}, stats_dtype, input.device());
+    Tensor out = layer_norm_cpu_impl(input, normalized_shape, weight_opt, bias_opt,
+                                     eps, &mean, &rstd);
+    return std::make_tuple(out, mean, rstd);
+}
+
+std::tuple<Tensor, Tensor, Tensor> native_layer_norm_backward_cpu(
+        const Tensor& grad_output, const Tensor& input,
+        const std::vector<int64_t>& normalized_shape, const Tensor& mean,
+    const Tensor& rstd, std::optional<Tensor> weight_opt,
+        std::optional<Tensor> bias_opt,
+        const std::vector<bool>& output_mask) {
+    switch (input.dtype()) {
+        case DType::Float32:
+            return layer_norm_backward_cpu_typed<float>(
+                grad_output, input, normalized_shape, weight_opt, bias_opt, 0.0,
+                &mean, &rstd, &output_mask);
+        case DType::Float64:
+            return layer_norm_backward_cpu_typed<double>(
+                grad_output, input, normalized_shape, weight_opt, bias_opt, 0.0,
+                &mean, &rstd, &output_mask);
+        case DType::Float16:
+        case DType::BFloat16:
+            return layer_norm_backward_cpu_reduced(
+                grad_output, input, normalized_shape, weight_opt, bias_opt, 0.0,
+                &mean, &rstd, &output_mask);
+        default:
+            TP_THROW(NotImplementedError,
+                     "native_layer_norm_backward only supports Float32/Float64/Float16/BFloat16");
+    }
+}
+
+std::tuple<Tensor, Tensor, Tensor> native_group_norm_cpu(
+        const Tensor& input, std::optional<Tensor> weight_opt,
+        std::optional<Tensor> bias_opt, int64_t N, int64_t C,
+        int64_t HxW, int64_t group, double eps) {
+    TP_CHECK(N == input.size(0) && C == input.size(1),
+             "native_group_norm: supplied dimensions do not match input");
+    TP_CHECK(HxW > 0 && group > 0 && C > 0 && C % group == 0,
+             "native_group_norm: invalid group dimensions");
+    const DType stats_dtype = normalization_stats_dtype(input.dtype());
+    Tensor mean = Tensor::empty({N, group}, stats_dtype, input.device());
+    Tensor rstd = Tensor::empty({N, group}, stats_dtype, input.device());
+    Tensor out = group_norm_cpu_impl(input, group, weight_opt, bias_opt, eps,
+                                     &mean, &rstd);
+    return std::make_tuple(out, mean, rstd);
+}
+
+std::tuple<Tensor, Tensor, Tensor> native_group_norm_backward_cpu(
+        const Tensor& grad_out, const Tensor& input, const Tensor& mean,
+        const Tensor& rstd, std::optional<Tensor> weight_opt,
+        int64_t N, int64_t C, int64_t HxW, int64_t group,
+        const std::vector<bool>& output_mask) {
+    TP_CHECK(N == input.size(0) && C == input.size(1),
+             "native_group_norm_backward: supplied dimensions do not match input");
+    TP_CHECK(HxW > 0 && group > 0 && C > 0 && C % group == 0,
+             "native_group_norm_backward: invalid group dimensions");
+    return group_norm_backward_cpu_impl(
+        grad_out, input, group, weight_opt, std::nullopt, 0.0, &mean, &rstd,
+        &output_mask);
 }
 
 // rms_norm over the trailing normalized_shape dims: y = x * rsqrt(mean(x^2)+eps) * w.
@@ -844,6 +1103,10 @@ TENSORPLAY_LIBRARY_IMPL(CPU, NormalizationKernels) {
 
     m.impl("layer_norm_backward", layer_norm_backward_cpu);
     m.impl("group_norm_backward", group_norm_backward_cpu);
+    m.impl("native_layer_norm", native_layer_norm_cpu);
+    m.impl("native_layer_norm_backward", native_layer_norm_backward_cpu);
+    m.impl("native_group_norm", native_group_norm_cpu);
+    m.impl("native_group_norm_backward", native_group_norm_backward_cpu);
 }
 
 } // namespace cpu

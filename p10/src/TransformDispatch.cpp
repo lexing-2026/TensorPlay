@@ -4,6 +4,25 @@
 
 #include "Exception.h"
 
+namespace tensorplay::impl {
+namespace {
+thread_local LocalDispatchKeySet local_dispatch_keys;
+}
+
+LocalDispatchKeySet tls_local_dispatch_key_set() {
+    return local_dispatch_keys;
+}
+
+void force_tls_local_dispatch_key_set(LocalDispatchKeySet state) {
+    local_dispatch_keys = state;
+}
+
+void tls_set_dispatch_key_included(DispatchKey key, bool included) {
+    if (included) local_dispatch_keys.included.add(key);
+    else local_dispatch_keys.included.remove(key);
+}
+} // namespace tensorplay::impl
+
 namespace tensorplay {
 namespace transform {
 namespace {
@@ -11,6 +30,11 @@ namespace {
 thread_local std::vector<Layer> layers;
 thread_local int64_t next_level = 0;
 thread_local size_t disabled_depth = 0;
+
+void set_front_back_included(bool included) {
+    impl::tls_set_dispatch_key_included(DispatchKey::DynamicLayerFrontMode, included);
+    impl::tls_set_dispatch_key_included(DispatchKey::DynamicLayerBackMode, included);
+}
 
 int64_t normalize_dim(int64_t dim, int64_t ndim) {
     if (dim < 0) dim += ndim;
@@ -22,13 +46,56 @@ int64_t normalize_dim(int64_t dim, int64_t ndim) {
 
 } // namespace
 
-DisableTransformsGuard::DisableTransformsGuard() {
+DynamicLayerFrontGuard::DynamicLayerFrontGuard() {
+    TP_CHECK(!layers.empty(), "dynamic front dispatch requires an active layer");
+    auto& layer = layers.back();
+    TP_CHECK(!layer.saved_dispatch_keys.has_value(),
+             "dynamic layer already has a saved dispatch state");
+    TP_CHECK(layer.kind == Kind::Vmap, "unsupported dynamic interpreter kind");
+    auto state = impl::tls_local_dispatch_key_set();
+    layer.saved_dispatch_keys = state;
+    state.excluded.add(DispatchKey::DynamicLayerFrontMode);
+    for (size_t i = 0; i < kBackendKeyCount; ++i) {
+        state.excluded.add(toAutogradKey(static_cast<DispatchKey>(i)));
+        state.excluded.remove(toVmapKey(static_cast<DispatchKey>(i)));
+    }
+    state.included.add(DispatchKey::VmapMode);
+    impl::force_tls_local_dispatch_key_set(state);
+}
+
+DynamicLayerFrontGuard::~DynamicLayerFrontGuard() {
+    auto& layer = layers.back();
+    impl::force_tls_local_dispatch_key_set(*layer.saved_dispatch_keys);
+    layer.saved_dispatch_keys.reset();
+}
+
+DynamicLayerBackGuard::DynamicLayerBackGuard()
+    : saved_keys_(impl::tls_local_dispatch_key_set()) {
+    TP_CHECK(!layers.empty() && layers.back().saved_dispatch_keys.has_value(),
+             "dynamic back dispatch requires a saved interpreter state");
+    impl::force_tls_local_dispatch_key_set(*layers.back().saved_dispatch_keys);
+    layer_ = pop_layer();
+}
+
+DynamicLayerBackGuard::~DynamicLayerBackGuard() {
+    layers.push_back(std::move(layer_));
+    impl::force_tls_local_dispatch_key_set(saved_keys_);
+}
+
+DisableTransformsGuard::DisableTransformsGuard()
+    : saved_keys_(impl::tls_local_dispatch_key_set()) {
     ++disabled_depth;
+    auto state = saved_keys_;
+    state.excluded.add(DispatchKey::DynamicLayerFrontMode);
+    state.excluded.add(DispatchKey::DynamicLayerBackMode);
+    state.excluded.add(DispatchKey::VmapMode);
+    impl::force_tls_local_dispatch_key_set(state);
 }
 
 DisableTransformsGuard::~DisableTransformsGuard() {
     if (!active_) return;
     if (disabled_depth > 0) --disabled_depth;
+    impl::force_tls_local_dispatch_key_set(saved_keys_);
     active_ = false;
 }
 
@@ -42,6 +109,7 @@ int64_t push_vmap(int64_t batch_size, Randomness randomness) {
     layer.batch_size = batch_size;
     layer.randomness = randomness;
     layers.push_back(layer);
+    if (layers.size() == 1) set_front_back_included(true);
     return layer.level;
 }
 
@@ -51,6 +119,7 @@ Layer pop_layer() {
     }
     Layer layer = layers.back();
     layers.pop_back();
+    if (layers.empty()) set_front_back_included(false);
     return layer;
 }
 
@@ -65,6 +134,7 @@ std::vector<Layer> layer_stack() {
 
 void clear_layers() {
     layers.clear();
+    set_front_back_included(false);
 }
 
 bool are_transforms_active() {
@@ -72,9 +142,6 @@ bool are_transforms_active() {
 }
 
 DispatchKey dispatch_key_for_random(DispatchKey backend) {
-    if (are_transforms_active() && layers.back().kind == Kind::Vmap) {
-        return toVmapKey(backend);
-    }
     return backend;
 }
 
@@ -85,6 +152,8 @@ Tensor make_batched(const Tensor& value, int64_t dim, int64_t level) {
     if (level < 0) {
         TP_THROW(ValueError, "transform level must be non-negative");
     }
+    TP_CHECK(!value.is_batched() || level > value.batch_level(),
+             "batch wrapper levels must increase from inner value to outer wrapper");
     const int64_t public_ndim = value.dim();
     const int64_t bdim = normalize_dim(dim, public_ndim);
     const auto sizes = static_cast<std::vector<int64_t>>(value.shape());

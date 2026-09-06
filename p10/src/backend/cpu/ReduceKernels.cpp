@@ -176,6 +176,10 @@ Tensor reduce_dims_impl(const Tensor& self, std::vector<int64_t> dims_in,
     return out;
 }
 
+}  // namespace
+
+// mean_var_over_dims keeps external linkage: ReductionKernels.cpp reaches it
+// through an extern declaration.
 std::pair<Tensor, Tensor> mean_var_over_dims(const Tensor& self,
                                              std::vector<int64_t> dims_in,
                                              int64_t correction, bool keepdim) {
@@ -236,6 +240,20 @@ std::pair<Tensor, Tensor> mean_var_over_dims(const Tensor& self,
     }
     int64_t n_red = 1;
     for (const int64_t dim : red_dims) n_red *= self.size(dim);
+    // Map each input dim to its output slot: with keepdim the size-1
+    // reduced slots keep their position, without it the surviving dims
+    // pack densely.
+    std::vector<int64_t> out_slot(static_cast<size_t>(nd), -1);
+    {
+        int64_t slot = 0;
+        for (int64_t i = 0; i < nd; ++i) {
+            if (reduced[static_cast<size_t>(i)]) {
+                if (keepdim) out_slot[static_cast<size_t>(i)] = slot++;
+            } else {
+                out_slot[static_cast<size_t>(i)] = slot++;
+            }
+        }
+    }
     auto compute = [&](auto* sp, auto* mp, auto* vp) {
         using output_t = std::remove_cv_t<std::remove_pointer_t<decltype(mp)>>;
         parallel_for(0, out_numel, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
@@ -250,10 +268,10 @@ std::pair<Tensor, Tensor> mean_var_over_dims(const Tensor& self,
                     rest /= out_sizes[static_cast<size_t>(i)];
                 }
                 int64_t base = 0;
-                int64_t out_index = 0;
                 for (int64_t i = 0; i < nd; ++i) {
-                    if (reduced[static_cast<size_t>(i)]) continue;
-                    base += out_coords[static_cast<size_t>(out_index++)] *
+                    const int64_t slot = out_slot[static_cast<size_t>(i)];
+                    if (slot < 0) continue;
+                    base += out_coords[static_cast<size_t>(slot)] *
                             strides[static_cast<size_t>(i)];
                 }
                 if (n_red == 0) {
@@ -954,8 +972,6 @@ Tensor nanmean_cpu(const Tensor& self, std::optional<int64_t> dim_opt,
                 ? acc_dt
                 : (isComplexType(self.dtype()) ? self.dtype() : total.dtype()));
 }
-
-}  // namespace
 
 TENSORPLAY_LIBRARY_IMPL(CPU, ReduceKernels) {
     m.impl("amax", amax_cpu);

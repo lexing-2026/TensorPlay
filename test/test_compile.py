@@ -300,7 +300,11 @@ def test_linear_lowering_keeps_live_parameters_and_autograd():
     # forward graph.
     graph = getattr(lowering, "forward_graph", None) or lowering.graph
 
-    assert [node.op_type for node in graph.nodes] == ["t", "matmul", "add"]
+    # The runtime executes a fused "linear" node when available; otherwise
+    # the lowering falls back to transpose + matmul + add.
+    from tensorplay._stax.stax import _native_runs_linear
+    expected = ["linear"] if _native_runs_linear() else ["t", "matmul", "add"]
+    assert [node.op_type for node in graph.nodes] == expected
     result.sum().backward()
     assert x.grad is not None
     assert module.weight.grad is not None

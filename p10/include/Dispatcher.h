@@ -17,6 +17,7 @@
 #include "Device.h"
 #include "Exception.h"
 #include "Macros.h"
+#include "DynamicLayerDispatch.h"
 
 #include <iostream>
 
@@ -139,6 +140,26 @@ template<typename Return, typename... Args>
 class DispatchStub {
 public:
     static Return call(const OperatorHandle& handle, DispatchKey key, Args... args) {
+        const auto local = impl::tls_local_dispatch_key_set();
+        auto keys = key == DispatchKey::EndOfKeys
+            ? DispatchKeySet() : DispatchKeySet::make(key);
+        const DispatchKey backend = toBackendKey(key);
+        if (is_backend_key(backend)) keys.add(backend);
+        keys = (keys | local.included) - local.excluded;
+        DispatchKey selected = keys.highest_priority_key();
+        if (selected == DispatchKey::DynamicLayerFrontMode) {
+            transform::DynamicLayerFrontGuard guard;
+            return call(handle, key, std::forward<Args>(args)...);
+        }
+        if (selected == DispatchKey::VmapMode && !handle.getKernel(selected)) {
+            keys.remove(DispatchKey::VmapMode);
+            selected = keys.highest_priority_key();
+        }
+        if (selected == DispatchKey::DynamicLayerBackMode) {
+            transform::DynamicLayerBackGuard guard;
+            return call(handle, key, std::forward<Args>(args)...);
+        }
+        key = selected;
         // Choke-point enforcement of the autocast exclusion contract: a
         // disabled Autocast key behaves as if no kernel were registered, no
         // matter which path reached here. Non-autocast keys pay one predicted

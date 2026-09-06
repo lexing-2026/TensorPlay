@@ -851,8 +851,9 @@ inline Tensor& dispatch_index_put_(
     index = index.to(self.device());
   }
   Tensor target = self.is_contiguous() ? self : self.contiguous();
+  Tensor flat_target = target.view({-1});
   tpx::ops::index_put_(
-      target, std::vector<Tensor>{index}, rhs, accumulate);
+      flat_target, std::vector<Tensor>{index}, rhs, accumulate);
   if (!self.is_contiguous()) {
     tpx::ops::copy_(self, target);
   }

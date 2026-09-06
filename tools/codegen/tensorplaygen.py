@@ -34,6 +34,11 @@ from tools.codegen.gen_python_c import (_BRIDGE,  # noqa: E402
 from tools.codegen.model import parse_schema  # noqa: E402
 
 
+def _cpp_sym(f) -> str:
+    """C++-identifier form of an op name: 'ns::op[.overload]' -> 'ns_op'."""
+    return f.cpp_name.replace("::", "_").replace(".", "_")
+
+
 def _stub_template(f):
     from tools.codegen.api_types import stub_arg_type
     parts = [cpp_return_type(f)]
@@ -150,7 +155,8 @@ def generate_binding(funcs, module_name: str) -> str:
         ret_void = ret == "void"
         sig_args = [f"{cpp_arg_type(a.type)} {a.name}" for a in f.args]
         call_args = [a.name for a in f.args]
-        L.append(f"static {ret} {f.cpp_name}_dispatch({', '.join(sig_args)}) {{")
+        sym = _cpp_sym(f)
+        L.append(f"static {ret} {sym}_dispatch({', '.join(sig_args)}) {{")
         dev = _dispatch_expr(f)
         if f.dispatch and dev is None:
             L.append(f'    TP_THROW(RuntimeError, "{f.cpp_name}: no Tensor argument");')
@@ -202,7 +208,7 @@ def generate_binding(funcs, module_name: str) -> str:
                     # int-list literal like std::vector<int64_t>{0,1}: build it
                     inner = expr[expr.find("{") + 1:expr.rfind("}")]
                     items = [s.strip() for s in inner.split(",") if s.strip()]
-                    helper = f"pydflt_{f.cpp_name}_{ai}"
+                    helper = f"pydflt_{sym}_{ai}"
                     prelude.append(f"static PyObject* {helper}() {{")
                     prelude.append(f"    PyObject* v = PyList_New({len(items)});")
                     for j, item in enumerate(items):
@@ -214,7 +220,7 @@ def generate_binding(funcs, module_name: str) -> str:
                 n_pos += 1
             slots.append((sanitize_name(a.name), tpl, dflt, ctype))
         L.extend(prelude)
-        pyname = f.cpp_name
+        pyname = _cpp_sym(f)
         stem = pyname
         k = 0
         while pyname in seen_names:
@@ -263,7 +269,7 @@ def generate_binding(funcs, module_name: str) -> str:
                 decl = "auto&&"
             L.append(f"        {decl} v_{name} = {tpl.format(n=f's_{name}')};")
         call = ", ".join(f"v_{n}" for n, _, _, _ in slots)
-        target = f"tp_custom::{module_name}::{f.cpp_name}_dispatch"
+        target = f"tp_custom::{module_name}::{_cpp_sym(f)}_dispatch"
         kind = f.cpp_return_kind
         # every PyObject-producing step -- argument conversion aside, result
         # wrapping AND error reporting -- must happen with the GIL held.
@@ -309,9 +315,15 @@ def generate_binding(funcs, module_name: str) -> str:
             "}",
             "",
         ]
-        # Expose op schemas as the PyMethodDef docstring.
+        # Expose op schemas as the PyMethodDef docstring.  The Python-level
+        # name is the op name without the module namespace; the C symbol is
+        # sanitized separately.
         doc = f.schema.replace("\\", "\\\\").replace('"', '\\"')
-        table.append(f'    {{"{pyname}", (PyCFunction)(void*){fn}, '
+        py_attr = f.cpp_name
+        prefix = f"{module_name}::"
+        if py_attr.startswith(prefix):
+            py_attr = py_attr[len(prefix):]
+        table.append(f'    {{"{py_attr}", (PyCFunction)(void*){fn}, '
                      f'METH_FASTCALL | METH_KEYWORDS, "{doc}"}},')
 
     L += [

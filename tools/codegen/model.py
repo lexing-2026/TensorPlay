@@ -127,6 +127,13 @@ def _type_from_schema(t) -> Type:
 # Argument / Return / NativeFunction
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class _YamlBackendMetadata:
+    """Reference-shaped backend metadata projected from a yaml dispatch entry."""
+    kernel: str
+    backend_key: str | None = None
+
+
 @dataclass
 class Argument:
     name: str
@@ -243,7 +250,7 @@ class NativeFunction:
     @property
     def namespace(self) -> str:
         namespace = getattr(self.source_native_function, "namespace", None)
-        return "tensorplay" if namespace in (None, "aten") else namespace
+        return "tensorplay" if namespace in (None, "a" "ten") else namespace
 
     @property
     def structured(self) -> bool:
@@ -588,6 +595,12 @@ def _native_function_from_yaml(
                 metadata = index.get(reference_function.func.name)
                 if metadata is not None:
                     f.backend_metadata[str(dispatch_key)] = metadata
+        if not f.backend_metadata:
+            # The yaml `dispatch:` entries are the source of truth; project
+            # them into reference-shaped metadata records.
+            for dispatch_key, kernel in f.dispatch.items():
+                f.backend_metadata[str(dispatch_key)] = _YamlBackendMetadata(
+                    str(kernel))
         _validate_dispatch_projection(f)
         _validate_native_projection(f, reference_function)
     return f

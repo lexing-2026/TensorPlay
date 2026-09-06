@@ -395,13 +395,30 @@ def _unique_keyword_probes(funcs, variant: str):
     return probes
 
 
+def _trailing_tensorlist(f, variant: str) -> bool:
+    """True when the overload's last positional parameter is a tensor list.
+
+    Uses the slot bookkeeping in :func:`_emit_op` so the group-level answer
+    and the per-overload fold agree on which parameter the fold would target.
+    """
+    self_idx = next((i for i, a in enumerate(f.args) if a.name == "self"), None)
+    pos = [a for i, a in enumerate(f.args) if i != self_idx and not a.kwonly]
+    if not pos or not pos[-1].type.is_list:
+        return False
+    return "tensorlist" in _BRIDGE.get(cpp_arg_type(pos[-1].type), "")
+
+
 def _emit_op(out: list[str], f, variant: str, fn: str,
              own_catch: bool = True, dispatch: bool = True,
-             helper_tag: str | None = None) -> None:
+             helper_tag: str | None = None,
+             splat_singleton: bool = True) -> None:
     """Emit one native overload entry point under ``fn``.
 
     own_catch=False (multi-overload group members) leaves argument errors
     uncaught so the group dispatcher can fall through to the next candidate.
+    splat_singleton=False suppresses the lone-positional fold into a trailing
+    tensor list, which a group only permits when no sibling overload could
+    have claimed that argument as a plain tensor.
     """
     prelude: list[str] = []
     slots: list[tuple[str, str, str | None]] = []  # (argname, template, dflt)
@@ -601,13 +618,14 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
             "        }",
         ]
         arg_arr, arg_n = "ap", "an"
-        # A bare Tensor passed to a TensorList splat folds to a singleton,
-        # but only for single-overload bindings.  In a multi-overload group
-        # the fold would misroute a broadcastable Tensor into the list
-        # overload (raising a length mismatch instead of falling through to
-        # the Tensor overload); group members rely on argument-shape errors
-        # to reach later candidates.
-        if (own_catch and
+        # A bare Tensor passed to a TensorList splat folds to a singleton.
+        # In a multi-overload group the fold is only safe when every sibling
+        # takes a tensor list in the same slot: otherwise it would misroute a
+        # broadcastable Tensor into the list overload (raising a length
+        # mismatch instead of falling through to the Tensor overload), and
+        # group members rely on argument-shape errors to reach later
+        # candidates.
+        if (splat_singleton and
                 "tensorlist" in _BRIDGE.get(cpp_arg_type(_pos[-1].type), "")):
             body += [
                 "        if (an == " + str(P) + " && ap[" + str(P - 1) + "] != nullptr &&",
@@ -749,13 +767,17 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
     for (variant, cname), fs in sorted(claimed.items()):
         base = f"pyop_{cname}_{variant}"
         multi = len(fs) > 1
+        # A lone positional may fold into the trailing tensor list only when
+        # no overload in the group would rather have read it as a tensor.
+        fold_singleton = all(_trailing_tensorlist(f, variant) for f in fs)
         docs: list[str] = []
         ovfns: list[str] = []
         for k, f in enumerate(fs):
             ovfn = f"{base}_ov{k}" if multi else base
             _emit_op(out, f, variant, ovfn, own_catch=not multi,
                      dispatch=not multi,
-                     helper_tag=_schema_tag(f, variant, k))
+                     helper_tag=_schema_tag(f, variant, k),
+                     splat_singleton=fold_singleton)
             docs.append(f.schema.replace("\\", "\\\\").replace('"', '\\"'))
             ovfns.append(ovfn)
 

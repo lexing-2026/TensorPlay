@@ -286,32 +286,53 @@ Tensor.expand = _expand
 
 
 def _norm_new_size(size):
+    if not size:
+        return None
     if len(size) == 1 and hasattr(size[0], "__iter__") and \
             not isinstance(size[0], _C.TensorBase):
         return [builtins_int(x) for x in size[0]]
     return [builtins_int(x) for x in size]
 
 
+def _new_size(size, kwargs, name):
+    if "size" in kwargs:
+        if size:
+            raise TypeError(f"{name}() got multiple values for argument 'size'")
+        size = (kwargs.pop("size"),)
+    if kwargs:
+        unexpected = next(iter(kwargs))
+        raise TypeError(
+            f"{name}() got an unexpected keyword argument '{unexpected}'")
+    return _norm_new_size(size)
+
+
 def _flag(out, requires_grad):
     return out.requires_grad_(True) if requires_grad else out
 
 
-def _new_zeros(self, *size, dtype=None, device=None, requires_grad=False):
-    shape = _norm_new_size(size)
-    if shape:
-        out = _C.full(shape, 0.0, dtype=dtype or self.dtype,
-                      device=device or self.device)
+_orig_new_empty = Tensor.new_empty
+_orig_new_zeros = Tensor.new_zeros
+_orig_new_ones = Tensor.new_ones
+
+
+def _new_zeros(self, *size, dtype=None, device=None, requires_grad=False,
+               layout=None, pin_memory=None, **kwargs):
+    shape = _new_size(size, kwargs, "new_zeros")
+    if shape is not None:
+        out = _orig_new_zeros(self, shape, dtype=dtype, layout=layout,
+                              device=device, pin_memory=pin_memory)
     else:
         out = _C.zeros_like(self, dtype=dtype or self.dtype,
                             device=device or self.device)
     return _flag(out, requires_grad)
 
 
-def _new_ones(self, *size, dtype=None, device=None, requires_grad=False):
-    shape = _norm_new_size(size)
-    if shape:
-        out = _C.full(shape, 1.0, dtype=dtype or self.dtype,
-                      device=device or self.device)
+def _new_ones(self, *size, dtype=None, device=None, requires_grad=False,
+              layout=None, pin_memory=None, **kwargs):
+    shape = _new_size(size, kwargs, "new_ones")
+    if shape is not None:
+        out = _orig_new_ones(self, shape, dtype=dtype, layout=layout,
+                             device=device, pin_memory=pin_memory)
     else:
         out = _C.ones_like(self, dtype=dtype or self.dtype,
                            device=device or self.device)
@@ -325,13 +346,14 @@ def _new_full(self, size, fill_value, *, dtype=None, device=None,
     return out.requires_grad_(requires_grad) if requires_grad else out
 
 
-def _new_empty(self, size, *, dtype=None, device=None, requires_grad=False):
+def _new_empty(self, size, *, dtype=None, device=None, requires_grad=False,
+               layout=None, pin_memory=None):
     if isinstance(size, builtins_int):
         size = [size]
-    shape = _norm_new_size(tuple(size))
-    if shape:
-        out = _C.empty(shape, dtype=dtype or self.dtype,
-                       device=device or self.device)
+    shape = _norm_new_size((size,))
+    if shape is not None:
+        out = _orig_new_empty(self, shape, dtype=dtype, layout=layout,
+                              device=device, pin_memory=pin_memory)
     else:
         out = _C.empty_like(self, dtype=dtype or self.dtype,
                             device=device or self.device)

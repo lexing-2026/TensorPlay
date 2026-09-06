@@ -1009,52 +1009,20 @@ Tensor& index_fill_tensor__cpu(Tensor& self, int64_t dim, const Tensor& index, c
 // assigning).
 // ---------------------------------------------------------------------------
 
-Tensor index_put_impl_cpu(Tensor& result, const std::vector<Tensor>& indices,
-                          const Tensor& values, bool accumulate) {
-    if (indices.empty()) TP_THROW(IndexError, "index_put: at least one index tensor required");
-    int64_t numel_self = result.numel();
-    Tensor flat_idx = indices[0].to(DType::Int64).contiguous();
-    for (size_t i = 1; i < indices.size(); ++i) {
-        flat_idx = flat_idx * static_cast<int64_t>(result.size(i)) + indices[i].to(DType::Int64).contiguous();
-    }
-    Tensor vals = values.to(result.dtype()).contiguous();
-    int64_t n = flat_idx.numel();
-    const int64_t* ip = flat_idx.data_ptr<int64_t>();
-    bool scalar_vals = vals.numel() == 1;
-    if (!scalar_vals && vals.numel() != n) {
-        TP_THROW(RuntimeError, "index_put: values must match number of indexed elements");
-    }
-#define TP_IPUT_CASE(ctype, name) \
-    case DType::name: { \
-        ctype* d = result.data_ptr<ctype>(); \
-        const ctype* vp = vals.data_ptr<ctype>(); \
-        for (int64_t i = 0; i < n; ++i) { \
-            int64_t lin = ip[i]; \
-            if (lin < 0) lin += numel_self; \
-            if (lin < 0 || lin >= numel_self) TP_THROW(IndexError, "index_put: index out of range"); \
-            ctype v = scalar_vals ? vp[0] : vp[i]; \
-            if (accumulate) d[lin] += v; else d[lin] = v; \
-        } \
-        break; \
-    }
-    switch (result.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_IPUT_CASE)
-        default: TP_THROW(TypeError, "index_put: unsupported dtype");
-    }
-#undef TP_IPUT_CASE
-    return result;
-}
 
 Tensor index_put_cpu(const Tensor& self, const std::vector<Tensor>& indices,
                      const Tensor& values, bool accumulate) {
-    Tensor result = detail::contiguous_clone(self);
-    return index_put_impl_cpu(result, indices, values, accumulate);
+    extern Tensor& index_put_native_cpu(Tensor&, const std::vector<Tensor>&,
+                                         const Tensor&, bool);
+    Tensor result = self.clone();
+    return index_put_native_cpu(result, indices, values, accumulate);
 }
 
 Tensor& index_put__cpu(Tensor& self, const std::vector<Tensor>& indices,
                        const Tensor& values, bool accumulate) {
-    index_put_impl_cpu(self, indices, values, accumulate);
-    return self;
+    extern Tensor& index_put_native_cpu(Tensor&, const std::vector<Tensor>&,
+                                         const Tensor&, bool);
+    return index_put_native_cpu(self, indices, values, accumulate);
 }
 
 // ---------------------------------------------------------------------------
