@@ -382,3 +382,34 @@ def test_compile_extended_surface_with_grad_stays_supported():
     lowering = next(iter(compiled._tensorplay_cache.values()))
     assert lowering._tensorplay_codegen == "stax-fused-cpu"
     assert lowering._gradient_plan is not None
+
+
+def test_generated_kernels_are_keyed_on_the_runtime_library(tmp_path, monkeypatch):
+    """A generated unit inlines the runtime's vector math through its headers.
+
+    Its own text says nothing about which version that was, so the key has to
+    carry it -- otherwise a kernel built before the library changed is reused
+    afterwards, still holding whatever the headers contained back then.
+    """
+    from tensorplay._stax.codegen import cpp as cpp_codegen
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    library = lib / "libp10.so"
+    library.write_bytes(b"first")
+    cpp_codegen._RUNTIME_FINGERPRINTS.clear()
+    before = cpp_codegen._runtime_fingerprint(str(lib))
+
+    # Taken once per process: a running process cannot have its libraries
+    # swapped under it, so the second call must not re-stat.
+    library.write_bytes(b"second and longer")
+    assert cpp_codegen._runtime_fingerprint(str(lib)) == before
+
+    cpp_codegen._RUNTIME_FINGERPRINTS.clear()
+    assert cpp_codegen._runtime_fingerprint(str(lib)) != before
+
+    # A directory holding no runtime at all still yields a stable key.
+    cpp_codegen._RUNTIME_FINGERPRINTS.clear()
+    empty = cpp_codegen._runtime_fingerprint(str(tmp_path / "absent"))
+    cpp_codegen._RUNTIME_FINGERPRINTS.clear()
+    assert cpp_codegen._runtime_fingerprint(str(tmp_path / "absent")) == empty
