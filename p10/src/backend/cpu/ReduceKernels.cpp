@@ -6,6 +6,7 @@
 #include "Exception.h"
 #include "Parallel.h"
 #include "TypePromotion.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -22,6 +23,8 @@
 namespace tensorplay {
 namespace cpu {
 using namespace tensorplay::parallel;
+
+namespace ops = tensorplay::tpx::ops;
 
 Tensor isnan_cpu(const Tensor& self);
 
@@ -835,47 +838,44 @@ Tensor dist_cpu(const Tensor& self, const Tensor& other, Scalar p) {
 }
 
 Tensor renorm_cpu(const Tensor& self, Scalar p, int64_t dim, Scalar maxnorm) {
-    const int64_t nd = self.dim();
-    dim = wrap_dim(dim, nd);
+    if (p.isComplex()) {
+        TP_THROW(TypeError, "renorm: p must be real-valued");
+    }
     const double pd = p.toDouble();
+    if (!(pd > 0.0)) {
+        TP_THROW(ValueError, "renorm: norm order must be positive");
+    }
+    if (maxnorm.isComplex()) {
+        TP_THROW(TypeError, "renorm: maxnorm must be real-valued");
+    }
     const double max_norm = maxnorm.toDouble();
-    Tensor sc = self.to(DType::Float64).contiguous();
-    Tensor out = Tensor::empty(static_cast<std::vector<int64_t>>(sc.shape()),
-                                DType::Float64, sc.device());
-    const int64_t d_size = sc.size(dim);
-    int64_t outer = 1;
-    int64_t inner = 1;
-    outer_inner(static_cast<std::vector<int64_t>>(sc.shape()), dim, outer, inner);
-    const double* sp = sc.data_ptr<double>();
-    double* dp = out.data_ptr<double>();
-    const int64_t slice_numel = outer * inner;
-    parallel_for(0, d_size, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-        for (int64_t j = begin; j < end; ++j) {
-            double norm = 0.0;
-            if (pd == std::numeric_limits<double>::infinity()) {
-                for (int64_t si = 0; si < slice_numel; ++si) {
-                    const int64_t o = si / inner, in2 = si % inner;
-                    norm = std::max(norm, std::fabs(
-                        sp[(o * d_size + j) * inner + in2]));
-                }
-            } else {
-                double sum = 0.0;
-                for (int64_t si = 0; si < slice_numel; ++si) {
-                    const int64_t o = si / inner, in2 = si % inner;
-                    sum += std::pow(std::fabs(
-                        sp[(o * d_size + j) * inner + in2]), pd);
-                }
-                norm = std::pow(sum, 1.0 / pd);
-            }
-            const double factor = norm > max_norm ? max_norm / norm : 1.0;
-            for (int64_t si = 0; si < slice_numel; ++si) {
-                const int64_t o = si / inner, in2 = si % inner;
-                dp[(o * d_size + j) * inner + in2] =
-                    sp[(o * d_size + j) * inner + in2] * factor;
-            }
-        }
-    });
-    return out.to(self.dtype());
+    if (!(max_norm >= 0.0)) {
+        TP_THROW(ValueError, "renorm: maxnorm must be non-negative");
+    }
+    if (!isFloatingOrComplexType(self.dtype())) {
+        TP_THROW(TypeError, "renorm: input must have a floating or complex dtype");
+    }
+    const int64_t nd = self.dim();
+    if (nd <= 1) {
+        TP_THROW(RuntimeError, "renorm: input must have at least 2 dimensions");
+    }
+    dim = wrap_dim(dim, nd);
+
+    std::vector<int64_t> reduce_dims;
+    reduce_dims.reserve(static_cast<size_t>(nd - 1));
+    for (int64_t axis = 0; axis < nd; ++axis) {
+        if (axis != dim) reduce_dims.push_back(axis);
+    }
+
+    Tensor norms = ops::norm(self, reduce_dims, pd, true);
+    Tensor factors = ops::where(
+        ops::gt(norms, Scalar(max_norm)),
+        ops::div(
+            Tensor::full_like(norms, Scalar(max_norm), norms.dtype(), norms.device()),
+            ops::add(norms, Scalar(1e-7))),
+        Scalar(1.0));
+    Tensor result = ops::mul(self, factors);
+    return result.dtype() == self.dtype() ? result : result.to(self.dtype());
 }
 
 Tensor nanmean_cpu(const Tensor& self, std::optional<int64_t> dim_opt,
