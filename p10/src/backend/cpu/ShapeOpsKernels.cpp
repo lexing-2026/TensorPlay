@@ -11,6 +11,7 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <string>
@@ -338,6 +339,33 @@ Tensor flip_cpu(const Tensor& self, const std::vector<int64_t>& dims) {
             flip_mask[w] = true;
         }
     }
+
+    if (dims.size() == 1 && nd > 0 && self.is_contiguous() &&
+        self.numel() > 0) {
+        const int64_t dim = wrap_dim(dims[0], nd);
+        const int64_t dim_size = self.size(dim);
+        int64_t outer = 1, inner = 1;
+        outer_inner(static_cast<std::vector<int64_t>>(self.shape()), dim,
+                    outer, inner);
+        Tensor out = empty_transform_output(self);
+        const char* src = static_cast<const char*>(self.data_ptr());
+        char* dst = static_cast<char*>(out.data_ptr());
+        const size_t block_bytes =
+            static_cast<size_t>(inner) * self.itemsize();
+        parallel_for(0, outer * dim_size, GRAIN_SIZE,
+                     [&](int64_t begin, int64_t end) {
+            for (int64_t block = begin; block < end; ++block) {
+                const int64_t outer_index = block / dim_size;
+                const int64_t dim_index = block % dim_size;
+                const int64_t source_block =
+                    outer_index * dim_size + dim_size - 1 - dim_index;
+                std::memcpy(dst + block * block_bytes,
+                            src + source_block * block_bytes, block_bytes);
+            }
+        });
+        return out;
+    }
+
     Tensor sc = self.contiguous();
     Tensor out = detail::clone_impl(self);
     const auto out_strides = static_cast<std::vector<int64_t>>(out.strides());
@@ -406,27 +434,25 @@ Tensor roll_cpu(const Tensor& self, const std::vector<int64_t>& shifts, const st
     // destination coord c along dim reads source coord (c + start) % size.
     Tensor sc = self.contiguous();
     Tensor out = empty_transform_output(sc);
-    int64_t n = sc.numel();
-    auto worker = [&](int64_t b, int64_t e) {
-        for (int64_t li = b; li < e; ++li) {
-            int64_t r2 = li, src = 0, mult = 1;
-            for (int64_t d2 = nd - 1; d2 >= 0; --d2) {
-                int64_t c = r2 % sc.size(d2);
-                r2 /= sc.size(d2);
-                int64_t sc3 = d2 == dim ? (c + start) % size : c;
-                src += sc3 * mult;
-                mult *= sc.size(d2);
-            }
-            switch (sc.dtype()) {
-#define TP_ROLL_W(ctype, name_) case DType::name_: reinterpret_cast<ctype*>(out.data_ptr())[li] = reinterpret_cast<const ctype*>(sc.data_ptr())[src]; break;
-                TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_ROLL_W)
-                TENSORPLAY_FORALL_QINT_TYPES(TP_ROLL_W)
-#undef TP_ROLL_W
-                default: break;
-            }
+    int64_t outer = 1, inner = 1;
+    outer_inner(static_cast<std::vector<int64_t>>(sc.shape()), dim, outer,
+                inner);
+    const size_t element_bytes = sc.itemsize();
+    const size_t row_bytes = static_cast<size_t>(size) * inner * element_bytes;
+    const size_t first_bytes = static_cast<size_t>(size - start) * inner *
+        element_bytes;
+    const size_t second_bytes = static_cast<size_t>(start) * inner *
+        element_bytes;
+    const char* src = static_cast<const char*>(sc.data_ptr());
+    char* dst = static_cast<char*>(out.data_ptr());
+    parallel_for(0, outer, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t row = begin; row < end; ++row) {
+            const char* row_src = src + row * row_bytes;
+            char* row_dst = dst + row * row_bytes;
+            std::memcpy(row_dst, row_src + second_bytes, first_bytes);
+            std::memcpy(row_dst + first_bytes, row_src, second_bytes);
         }
-    };
-    parallel_for(0, n, GRAIN_SIZE, worker);
+    });
     return out;
 }
 
