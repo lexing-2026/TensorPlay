@@ -5,13 +5,12 @@
 #include "TypePromotion.h"
 #include "Utils.h"
 #include "CUDARuntime.h"
+#include "Complex.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <cuda_runtime.h>
-#include <thrust/complex.h>
 
 #include <cmath>
-#include <complex>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -71,10 +70,10 @@ __device__ __forceinline__ AccT distance_absdiff(
 
 template <typename Real>
 __device__ __forceinline__ Real distance_absdiff(
-        thrust::complex<Real> lhs, thrust::complex<Real> rhs, Real addend) {
-    const thrust::complex<Real> diff =
-        lhs - rhs + thrust::complex<Real>(addend, Real(0));
-    return thrust::abs(diff);
+        tensorplay::complex<Real> lhs, tensorplay::complex<Real> rhs, Real addend) {
+    const tensorplay::complex<Real> diff =
+        lhs - rhs + tensorplay::complex<Real>(addend, Real(0));
+    return std::abs(diff);
 }
 
 template <typename T>
@@ -263,20 +262,6 @@ __global__ void distance_kernel(
 template <typename T>
 const T* distance_data_ptr(const Tensor& tensor) {
     return tensor.data_ptr<T>();
-}
-
-template <>
-const thrust::complex<float>* distance_data_ptr<thrust::complex<float>>(
-        const Tensor& tensor) {
-    return reinterpret_cast<const thrust::complex<float>*>(
-        tensor.data_ptr<std::complex<float>>());
-}
-
-template <>
-const thrust::complex<double>* distance_data_ptr<thrust::complex<double>>(
-        const Tensor& tensor) {
-    return reinterpret_cast<const thrust::complex<double>*>(
-        tensor.data_ptr<std::complex<double>>());
 }
 
 template <typename InputT, typename AccT, typename OutputT, typename Family>
@@ -576,11 +561,11 @@ Tensor pairwise_distance_cuda(
                 output, lhs, rhs, rows, width, p, eps);
             break;
         case DType::ComplexFloat:
-            pairwise_distance_typed<thrust::complex<float>, float, float>(
+            pairwise_distance_typed<tensorplay::complex<float>, float, float>(
                 output, lhs, rhs, rows, width, p, eps);
             break;
         case DType::ComplexDouble:
-            pairwise_distance_typed<thrust::complex<double>, double, double>(
+            pairwise_distance_typed<tensorplay::complex<double>, double, double>(
                 output, lhs, rhs, rows, width, p, eps);
             break;
         default:
