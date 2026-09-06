@@ -66,6 +66,22 @@ decltype(auto) run_real(DType dt, Kernel&& k) {
     }
 }
 
+void write_linalg_output(const char* op, const Tensor& value, Tensor& out) {
+    if (!out.defined()) {
+        out = value;
+        return;
+    }
+    if (out.dtype() != value.dtype()) {
+        TP_THROW(TypeError, op, ": output dtype must match result dtype");
+    }
+    if (out.device() != value.device()) {
+        TP_THROW(DeviceMismatchError,
+                 op, ": output device must match input device");
+    }
+    out.resize_(static_cast<std::vector<int64_t>>(value.shape()));
+    out.copy_(value);
+}
+
 void check_is_matrix(const Tensor& A, const char* fn, const char* arg = "A") {
     if (A.dim() < 2) {
         TP_THROW(RuntimeError, fn, ": The input tensor ", arg,
@@ -831,6 +847,15 @@ std::tuple<Tensor, Tensor> linalg_qr_kernel_cuda(const Tensor& A,
     });
 }
 
+std::tuple<Tensor, Tensor> linalg_qr_out_kernel_cuda(const Tensor& A,
+                                                     std::string mode,
+                                                     Tensor& Q, Tensor& R) {
+    auto result = linalg_qr_kernel_cuda(A, mode);
+    write_linalg_output("linalg.qr", std::get<0>(result), Q);
+    write_linalg_output("linalg.qr", std::get<1>(result), R);
+    return {Q, R};
+}
+
 std::tuple<Tensor, Tensor> linalg_polar_kernel_cuda(const Tensor& A) {
     check_is_matrix(A, "linalg.polar");
     if (A.size(-2) < A.size(-1)) {
@@ -850,8 +875,8 @@ std::tuple<Tensor, Tensor> linalg_polar_kernel_cuda(const Tensor& A) {
 std::tuple<Tensor, Tensor> linalg_polar_out_kernel_cuda(const Tensor& A,
                                                         Tensor& U, Tensor& H) {
     auto result = linalg_polar_kernel_cuda(A);
-    U.copy_(std::get<0>(result));
-    H.copy_(std::get<1>(result));
+    write_linalg_output("linalg.polar", std::get<0>(result), U);
+    write_linalg_output("linalg.polar", std::get<1>(result), H);
     return {U, H};
 }
 
@@ -877,6 +902,14 @@ Tensor linalg_householder_product_kernel_cuda(const Tensor& input, const Tensor&
         apply_orgqr<T>(result, tau);
     });
     return result.contiguous();
+}
+
+Tensor& linalg_householder_product_out_kernel_cuda(const Tensor& input,
+                                                   const Tensor& tau,
+                                                   Tensor& out) {
+    write_linalg_output("linalg.householder_product",
+                        linalg_householder_product_kernel_cuda(input, tau), out);
+    return out;
 }
 
 // --------------------------------------------------------------- syevj ----
@@ -943,18 +976,41 @@ std::tuple<Tensor, Tensor> eigh_impl_cuda(const Tensor& A, bool upper,
     return {values.contiguous(), vectors.contiguous()};
 }
 
-std::tuple<Tensor, Tensor> linalg_eigh_kernel_cuda(const Tensor& A, std::string UPLO) {
+std::tuple<Tensor, Tensor> linalg_eigh_internal_kernel_cuda(
+        const Tensor& A, std::string UPLO, bool compute_v) {
     if (UPLO != "U" && UPLO != "L") {
         TP_THROW(RuntimeError, "linalg.eigh: UPLO argument must be 'U' or 'L', got ", UPLO);
     }
-    return eigh_impl_cuda(A, UPLO == "U", true);
+    return eigh_impl_cuda(A, UPLO == "U", compute_v);
+}
+
+std::tuple<Tensor, Tensor> linalg_eigh_kernel_cuda(const Tensor& A, std::string UPLO) {
+    return linalg_eigh_internal_kernel_cuda(A, UPLO, true);
 }
 
 Tensor linalg_eigvalsh_kernel_cuda(const Tensor& A, std::string UPLO) {
-    if (UPLO != "U" && UPLO != "L") {
-        TP_THROW(RuntimeError, "linalg.eigvalsh: UPLO argument must be 'U' or 'L', got ", UPLO);
-    }
-    return std::get<0>(eigh_impl_cuda(A, UPLO == "U", false));
+    return std::get<0>(linalg_eigh_internal_kernel_cuda(A, UPLO, false));
+}
+
+std::tuple<Tensor, Tensor> linalg_eigh_internal_out_kernel_cuda(
+        const Tensor& A, std::string UPLO, bool compute_v, Tensor& values,
+        Tensor& vectors) {
+    auto result = linalg_eigh_internal_kernel_cuda(A, UPLO, compute_v);
+    write_linalg_output("linalg.eigh", std::get<0>(result), values);
+    write_linalg_output("linalg.eigh", std::get<1>(result), vectors);
+    return {values, vectors};
+}
+
+std::tuple<Tensor, Tensor> linalg_eigh_eigvals_out_kernel_cuda(
+        const Tensor& A, std::string UPLO, Tensor& values, Tensor& vectors) {
+    return linalg_eigh_internal_out_kernel_cuda(A, UPLO, true, values, vectors);
+}
+
+Tensor& linalg_eigvalsh_out_kernel_cuda(const Tensor& A, std::string UPLO,
+                                        Tensor& out) {
+    auto result = linalg_eigh_internal_kernel_cuda(A, UPLO, false);
+    write_linalg_output("linalg.eigvalsh", std::get<0>(result), out);
+    return out;
 }
 
 // ---------------------------------------------------- triangular solve -----
@@ -1206,6 +1262,20 @@ Tensor linalg_eigvals_kernel_cuda(const Tensor& A) {
     throw_no_magma("linalg.eigvals");
 }
 
+std::tuple<Tensor, Tensor> linalg_eig_out_kernel_cuda(const Tensor& A,
+                                                      Tensor& values,
+                                                      Tensor& vectors) {
+    auto result = linalg_eig_kernel_cuda(A);
+    write_linalg_output("linalg.eig", std::get<0>(result), values);
+    write_linalg_output("linalg.eig", std::get<1>(result), vectors);
+    return {values, vectors};
+}
+
+Tensor& linalg_eigvals_out_kernel_cuda(const Tensor& A, Tensor& values) {
+    write_linalg_output("linalg.eigvals", linalg_eigvals_kernel_cuda(A), values);
+    return values;
+}
+
 // --------------------------------------------------------------- diagonal --
 
 template <typename scalar_t>
@@ -1315,15 +1385,24 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, LinalgKernels) {
     m.impl("linalg_lu", linalg_lu_kernel_cuda);
     m.impl("linalg_lu_solve", linalg_lu_solve_kernel_cuda);
     m.impl("linalg_solve_triangular", linalg_solve_triangular_kernel_cuda);
+    m.impl("_linalg_eigh", linalg_eigh_internal_kernel_cuda);
+    m.impl("_linalg_eigh.eigenvalues", linalg_eigh_internal_out_kernel_cuda);
     m.impl("linalg_eigh", linalg_eigh_kernel_cuda);
+    m.impl("linalg_eigh.eigvals", linalg_eigh_eigvals_out_kernel_cuda);
     m.impl("linalg_eigvalsh", linalg_eigvalsh_kernel_cuda);
+    m.impl("linalg_eigvalsh.out", linalg_eigvalsh_out_kernel_cuda);
     m.impl("linalg_eig", linalg_eig_kernel_cuda);
+    m.impl("linalg_eig.out", linalg_eig_out_kernel_cuda);
     m.impl("linalg_eigvals", linalg_eigvals_kernel_cuda);
+    m.impl("_linalg_eigvals", linalg_eigvals_kernel_cuda);
+    m.impl("linalg_eigvals.out", linalg_eigvals_out_kernel_cuda);
     m.impl("linalg_polar", linalg_polar_kernel_cuda);
     m.impl("linalg_polar.out", linalg_polar_out_kernel_cuda);
     m.impl("linalg_lstsq", linalg_lstsq_kernel_cuda);
     m.impl("linalg_qr", linalg_qr_kernel_cuda);
+    m.impl("linalg_qr.out", linalg_qr_out_kernel_cuda);
     m.impl("linalg_householder_product", linalg_householder_product_kernel_cuda);
+    m.impl("linalg_householder_product.out", linalg_householder_product_out_kernel_cuda);
     m.impl("linalg_diagonal", linalg_diagonal_kernel_cuda);
 }
 

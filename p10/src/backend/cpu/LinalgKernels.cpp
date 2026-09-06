@@ -94,6 +94,22 @@ decltype(auto) run_linalg_complex(DType dt, Kernel&& k) {
     }
 }
 
+void write_linalg_output(const char* op, const Tensor& value, Tensor& out) {
+    if (!out.defined()) {
+        out = value;
+        return;
+    }
+    if (out.dtype() != value.dtype()) {
+        TP_THROW(TypeError, op, ": output dtype must match result dtype");
+    }
+    if (out.device() != value.device()) {
+        TP_THROW(DeviceMismatchError,
+                 op, ": output device must match input device");
+    }
+    out.resize_(static_cast<std::vector<int64_t>>(value.shape()));
+    out.copy_(value);
+}
+
 template <typename T>
 int64_t lapack_getrf(int64_t m, int64_t n, T* a, int64_t lda, int64_t* ipiv) {
     if constexpr (std::is_same_v<T, float>) {
@@ -1080,19 +1096,43 @@ std::tuple<Tensor, Tensor> eigh_impl(const Tensor& A, bool upper, bool compute_e
     return {values.contiguous(), vectors.contiguous()};
 }
 
-// Public entries: schema passes UPLO as a string.
-std::tuple<Tensor, Tensor> linalg_eigh_kernel(const Tensor& A, std::string UPLO) {
+std::tuple<Tensor, Tensor> linalg_eigh_internal_kernel(const Tensor& A,
+                                                       std::string UPLO,
+                                                       bool compute_v) {
     if (UPLO != "U" && UPLO != "L") {
         TP_THROW(RuntimeError, "linalg.eigh: UPLO argument must be 'U' or 'L', got ", UPLO);
     }
-    return eigh_impl(A, UPLO == "U", true);
+    return eigh_impl(A, UPLO == "U", compute_v);
+}
+
+// Public entries: schema passes UPLO as a string.
+std::tuple<Tensor, Tensor> linalg_eigh_kernel(const Tensor& A, std::string UPLO) {
+    return linalg_eigh_internal_kernel(A, UPLO, true);
 }
 
 Tensor linalg_eigvalsh_kernel(const Tensor& A, std::string UPLO) {
-    if (UPLO != "U" && UPLO != "L") {
-        TP_THROW(RuntimeError, "linalg.eigvalsh: UPLO argument must be 'U' or 'L', got ", UPLO);
-    }
-    return std::get<0>(eigh_impl(A, UPLO == "U", false));
+    return std::get<0>(linalg_eigh_internal_kernel(A, UPLO, false));
+}
+
+std::tuple<Tensor, Tensor> linalg_eigh_internal_out_kernel(
+        const Tensor& A, std::string UPLO, bool compute_v, Tensor& values,
+        Tensor& vectors) {
+    auto result = linalg_eigh_internal_kernel(A, UPLO, compute_v);
+    write_linalg_output("linalg.eigh", std::get<0>(result), values);
+    write_linalg_output("linalg.eigh", std::get<1>(result), vectors);
+    return {values, vectors};
+}
+
+std::tuple<Tensor, Tensor> linalg_eigh_eigvals_out_kernel(
+        const Tensor& A, std::string UPLO, Tensor& values, Tensor& vectors) {
+    return linalg_eigh_internal_out_kernel(A, UPLO, true, values, vectors);
+}
+
+Tensor& linalg_eigvalsh_out_kernel(const Tensor& A, std::string UPLO,
+                                   Tensor& out) {
+    auto result = linalg_eigh_internal_kernel(A, UPLO, false);
+    write_linalg_output("linalg.eigvalsh", std::get<0>(result), out);
+    return out;
 }
 
 // ------------------------------------------------------------------- geev --
@@ -1280,6 +1320,20 @@ Tensor linalg_eigvals_kernel(const Tensor& A) {
     return std::get<0>(eig_impl(A, false));
 }
 
+std::tuple<Tensor, Tensor> linalg_eig_out_kernel(const Tensor& A,
+                                                 Tensor& values,
+                                                 Tensor& vectors) {
+    auto result = linalg_eig_kernel(A);
+    write_linalg_output("linalg.eig", std::get<0>(result), values);
+    write_linalg_output("linalg.eig", std::get<1>(result), vectors);
+    return {values, vectors};
+}
+
+Tensor& linalg_eigvals_out_kernel(const Tensor& A, Tensor& values) {
+    write_linalg_output("linalg.eigvals", linalg_eigvals_kernel(A), values);
+    return values;
+}
+
 // ------------------------------------------------------------------- gesdd --
 
 template <typename scalar_t>
@@ -1420,15 +1474,46 @@ void check_cpu_svd_driver(const std::optional<std::string>& driver) {
     }
 }
 
+std::tuple<Tensor, Tensor, Tensor> linalg_svd_internal_kernel(
+        const Tensor& A, bool full_matrices, bool compute_uv,
+        std::optional<std::string> driver) {
+    check_cpu_svd_driver(driver);
+    return svd_impl(A, full_matrices, compute_uv);
+}
+
 std::tuple<Tensor, Tensor, Tensor> linalg_svd_kernel(const Tensor& A, bool full_matrices,
                                                      std::optional<std::string> driver) {
-    check_cpu_svd_driver(driver);
-    return svd_impl(A, full_matrices, true);
+    return linalg_svd_internal_kernel(A, full_matrices, true, driver);
 }
 
 Tensor linalg_svdvals_kernel(const Tensor& A, std::optional<std::string> driver) {
-    check_cpu_svd_driver(driver);
-    return std::get<1>(svd_impl(A, false, false));
+    return std::get<1>(linalg_svd_internal_kernel(A, false, false, driver));
+}
+
+std::tuple<Tensor, Tensor, Tensor> linalg_svd_internal_out_kernel(
+        const Tensor& A, bool full_matrices, bool compute_uv,
+        std::optional<std::string> driver, Tensor& U, Tensor& S, Tensor& Vh) {
+    auto result = linalg_svd_internal_kernel(A, full_matrices, compute_uv,
+                                             driver);
+    write_linalg_output("linalg.svd", std::get<0>(result), U);
+    write_linalg_output("linalg.svd", std::get<1>(result), S);
+    write_linalg_output("linalg.svd", std::get<2>(result), Vh);
+    return {U, S, Vh};
+}
+
+std::tuple<Tensor, Tensor, Tensor> linalg_svd_out_kernel(
+        const Tensor& A, bool full_matrices, std::optional<std::string> driver,
+        Tensor& U, Tensor& S, Tensor& Vh) {
+    return linalg_svd_internal_out_kernel(A, full_matrices, true, driver, U,
+                                          S, Vh);
+}
+
+Tensor& linalg_svdvals_out_kernel(const Tensor& A,
+                                  std::optional<std::string> driver,
+                                  Tensor& out) {
+    auto result = linalg_svd_internal_kernel(A, false, false, driver);
+    write_linalg_output("linalg.svdvals", std::get<1>(result), out);
+    return out;
 }
 
 std::tuple<Tensor, Tensor> linalg_polar_kernel(const Tensor& A) {
@@ -1450,8 +1535,8 @@ std::tuple<Tensor, Tensor> linalg_polar_kernel(const Tensor& A) {
 std::tuple<Tensor, Tensor> linalg_polar_out_kernel(const Tensor& A, Tensor& U,
                                                    Tensor& H) {
     auto result = linalg_polar_kernel(A);
-    U.copy_(std::get<0>(result));
-    H.copy_(std::get<1>(result));
+    write_linalg_output("linalg.polar", std::get<0>(result), U);
+    write_linalg_output("linalg.polar", std::get<1>(result), H);
     return {U, H};
 }
 
@@ -1575,6 +1660,14 @@ std::tuple<Tensor, Tensor> linalg_qr_kernel(const Tensor& A, std::string mode) {
             R.contiguous()};
 }
 
+std::tuple<Tensor, Tensor> linalg_qr_out_kernel(const Tensor& A, std::string mode,
+                                                Tensor& Q, Tensor& R) {
+    auto result = linalg_qr_kernel(A, mode);
+    write_linalg_output("linalg.qr", std::get<0>(result), Q);
+    write_linalg_output("linalg.qr", std::get<1>(result), R);
+    return {Q, R};
+}
+
 Tensor linalg_householder_product_kernel(const Tensor& input, const Tensor& tau) {
     require_lapack("linalg.householder_product");
     check_is_matrix(input, "linalg.householder_product");
@@ -1612,6 +1705,13 @@ Tensor linalg_householder_product_kernel(const Tensor& input, const Tensor& tau)
         apply_orgqr<T>(result, tau_work);
     });
     return result.contiguous();
+}
+
+Tensor& linalg_householder_product_out_kernel(const Tensor& input,
+                                              const Tensor& tau, Tensor& out) {
+    write_linalg_output("linalg.householder_product",
+                        linalg_householder_product_kernel(input, tau), out);
+    return out;
 }
 
 template <typename T>
@@ -2110,17 +2210,30 @@ TENSORPLAY_LIBRARY_IMPL(CPU, LinalgKernels) {
     m.impl("linalg_lu", linalg_lu_kernel);
     m.impl("linalg_lu_solve", linalg_lu_solve_kernel);
     m.impl("linalg_solve_triangular", linalg_solve_triangular_kernel);
+    m.impl("_linalg_eigh", linalg_eigh_internal_kernel);
+    m.impl("_linalg_eigh.eigenvalues", linalg_eigh_internal_out_kernel);
     m.impl("linalg_eigh", linalg_eigh_kernel);
+    m.impl("linalg_eigh.eigvals", linalg_eigh_eigvals_out_kernel);
     m.impl("linalg_eigvalsh", linalg_eigvalsh_kernel);
+    m.impl("linalg_eigvalsh.out", linalg_eigvalsh_out_kernel);
     m.impl("linalg_eig", linalg_eig_kernel);
+    m.impl("linalg_eig.out", linalg_eig_out_kernel);
     m.impl("linalg_eigvals", linalg_eigvals_kernel);
+    m.impl("_linalg_eigvals", linalg_eigvals_kernel);
+    m.impl("linalg_eigvals.out", linalg_eigvals_out_kernel);
+    m.impl("_linalg_svd", linalg_svd_internal_kernel);
+    m.impl("_linalg_svd.U", linalg_svd_internal_out_kernel);
     m.impl("linalg_svd", linalg_svd_kernel);
+    m.impl("linalg_svd.U", linalg_svd_out_kernel);
     m.impl("linalg_svdvals", linalg_svdvals_kernel);
+    m.impl("linalg_svdvals.out", linalg_svdvals_out_kernel);
     m.impl("linalg_lstsq", linalg_lstsq_kernel);
     m.impl("linalg_polar", linalg_polar_kernel);
     m.impl("linalg_polar.out", linalg_polar_out_kernel);
     m.impl("linalg_qr", linalg_qr_kernel);
+    m.impl("linalg_qr.out", linalg_qr_out_kernel);
     m.impl("linalg_householder_product", linalg_householder_product_kernel);
+    m.impl("linalg_householder_product.out", linalg_householder_product_out_kernel);
     m.impl("linalg_ldl_factor", linalg_ldl_factor_kernel);
     m.impl("linalg_ldl_factor_ex", linalg_ldl_factor_ex_kernel);
     m.impl("linalg_ldl_solve", ldl_solve_impl);

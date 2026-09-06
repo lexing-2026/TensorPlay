@@ -80,6 +80,22 @@ void check_is_matrix(const Tensor& input) {
     }
 }
 
+void write_linalg_output(const char* op, const Tensor& value, Tensor& out) {
+    if (!out.defined()) {
+        out = value;
+        return;
+    }
+    if (out.dtype() != value.dtype()) {
+        TP_THROW(TypeError, op, ": output dtype must match result dtype");
+    }
+    if (out.device() != value.device()) {
+        TP_THROW(DeviceMismatchError,
+                 op, ": output device must match input device");
+    }
+    out.resize_(static_cast<std::vector<int64_t>>(value.shape()));
+    out.copy_(value);
+}
+
 template <typename Fn>
 void dispatch_svd_dtype(DType dtype, Fn&& fn) {
     switch (dtype) {
@@ -826,20 +842,57 @@ std::tuple<Tensor, Tensor, Tensor> svd_impl_cuda(
 
 }  // namespace
 
+std::tuple<Tensor, Tensor, Tensor> linalg_svd_internal_kernel_cuda(
+        const Tensor& input, bool full_matrices, bool compute_uv,
+        std::optional<std::string> driver) {
+    return svd_impl_cuda(input, full_matrices, compute_uv, driver);
+}
+
 std::tuple<Tensor, Tensor, Tensor> linalg_svd_kernel_cuda(
         const Tensor& input, bool full_matrices,
         std::optional<std::string> driver) {
-    return svd_impl_cuda(input, full_matrices, true, driver);
+    return linalg_svd_internal_kernel_cuda(input, full_matrices, true, driver);
 }
 
 Tensor linalg_svdvals_kernel_cuda(const Tensor& input,
                                   std::optional<std::string> driver) {
-    return std::get<1>(svd_impl_cuda(input, false, false, driver));
+    return std::get<1>(linalg_svd_internal_kernel_cuda(input, false, false,
+                                                       driver));
+}
+
+std::tuple<Tensor, Tensor, Tensor> linalg_svd_internal_out_kernel_cuda(
+        const Tensor& input, bool full_matrices, bool compute_uv,
+        std::optional<std::string> driver, Tensor& U, Tensor& S, Tensor& Vh) {
+    auto result = linalg_svd_internal_kernel_cuda(input, full_matrices,
+                                                  compute_uv, driver);
+    write_linalg_output("linalg.svd", std::get<0>(result), U);
+    write_linalg_output("linalg.svd", std::get<1>(result), S);
+    write_linalg_output("linalg.svd", std::get<2>(result), Vh);
+    return {U, S, Vh};
+}
+
+std::tuple<Tensor, Tensor, Tensor> linalg_svd_out_kernel_cuda(
+        const Tensor& input, bool full_matrices,
+        std::optional<std::string> driver, Tensor& U, Tensor& S, Tensor& Vh) {
+    return linalg_svd_internal_out_kernel_cuda(input, full_matrices, true,
+                                               driver, U, S, Vh);
+}
+
+Tensor& linalg_svdvals_out_kernel_cuda(const Tensor& input,
+                                       std::optional<std::string> driver,
+                                       Tensor& out) {
+    auto result = linalg_svd_internal_kernel_cuda(input, false, false, driver);
+    write_linalg_output("linalg.svdvals", std::get<1>(result), out);
+    return out;
 }
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, LinalgSVD) {
+    m.impl("_linalg_svd", linalg_svd_internal_kernel_cuda);
+    m.impl("_linalg_svd.U", linalg_svd_internal_out_kernel_cuda);
     m.impl("linalg_svd", linalg_svd_kernel_cuda);
+    m.impl("linalg_svd.U", linalg_svd_out_kernel_cuda);
     m.impl("linalg_svdvals", linalg_svdvals_kernel_cuda);
+    m.impl("linalg_svdvals.out", linalg_svdvals_out_kernel_cuda);
 }
 
 }  // namespace tensorplay::cuda
