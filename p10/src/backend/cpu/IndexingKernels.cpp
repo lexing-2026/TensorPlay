@@ -13,7 +13,6 @@
 #include <tuple>
 #include <vector>
 #include <algorithm>
-#include <complex>
 #include <cmath>
 #include <numeric>
 #include <cstring>
@@ -233,22 +232,22 @@ Tensor complex_scan_cpu(const Tensor& src, int64_t dim) {
 }
 
 template <typename T>
-inline std::complex<T> logcumsumexp_complex_pair(
-        const std::complex<T>& x, const std::complex<T>& y) {
+inline tensorplay::complex<T> logcumsumexp_complex_pair(
+        const tensorplay::complex<T>& x, const tensorplay::complex<T>& y) {
     const T nan = std::numeric_limits<T>::quiet_NaN();
     if (std::isnan(x.real()) || std::isnan(x.imag()) ||
         std::isnan(y.real()) || std::isnan(y.imag())) {
         return {nan, nan};
     }
-    const std::complex<T> min = x.real() < y.real() ? x : y;
-    const std::complex<T> max = x.real() >= y.real() ? x : y;
+    const tensorplay::complex<T> min = x.real() < y.real() ? x : y;
+    const tensorplay::complex<T> max = x.real() >= y.real() ? x : y;
     const T min_real = min.real();
     const T max_real = max.real();
     if (!std::isfinite(min_real) && min_real == max_real) {
         if (min_real < 0) return min;
-        return std::log(std::exp(min) + std::exp(max));
+        return tensorplay::log(tensorplay::exp(min) + tensorplay::exp(max));
     }
-    return cx_log1p(std::exp(min - max)) + max;
+    return cx_log1p(tensorplay::exp(min - max)) + max;
 }
 
 template <typename ComplexT>
@@ -296,10 +295,10 @@ Tensor cumsum_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
             out_dtype == DType::ComplexDouble ? DType::ComplexDouble : DType::ComplexFloat;
         Tensor compute_src = src.dtype() == compute_dtype ? src : src.to(compute_dtype);
         if (compute_dtype == DType::ComplexDouble) {
-            return complex_scan_cpu<std::complex<double>, false>(compute_src, dim)
+            return complex_scan_cpu<tensorplay::complex<double>, false>(compute_src, dim)
                 .to(out_dtype);
         }
-        return complex_scan_cpu<std::complex<float>, false>(compute_src, dim)
+        return complex_scan_cpu<tensorplay::complex<float>, false>(compute_src, dim)
             .to(out_dtype);
     }
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(src.shape()), out_dtype, src.device());
@@ -432,10 +431,10 @@ Tensor cumprod_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) 
             out_dtype == DType::ComplexDouble ? DType::ComplexDouble : DType::ComplexFloat;
         Tensor compute_src = src.dtype() == compute_dtype ? src : src.to(compute_dtype);
         if (compute_dtype == DType::ComplexDouble) {
-            return complex_scan_cpu<std::complex<double>, true>(compute_src, dim)
+            return complex_scan_cpu<tensorplay::complex<double>, true>(compute_src, dim)
                 .to(out_dtype);
         }
-        return complex_scan_cpu<std::complex<float>, true>(compute_src, dim)
+        return complex_scan_cpu<tensorplay::complex<float>, true>(compute_src, dim)
             .to(out_dtype);
     }
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(src.shape()), out_dtype, src.device());
@@ -491,10 +490,10 @@ Tensor logcumsumexp_cpu(const Tensor& self, int64_t dim, std::optional<DType> dt
             out_dtype == DType::ComplexDouble ? DType::ComplexDouble : DType::ComplexFloat;
         Tensor compute_src = src.dtype() == compute_dtype ? src : src.to(compute_dtype);
         if (compute_dtype == DType::ComplexDouble) {
-            return complex_logcumsumexp_cpu<std::complex<double>>(compute_src, dim)
+            return complex_logcumsumexp_cpu<tensorplay::complex<double>>(compute_src, dim)
                 .to(out_dtype);
         }
-        return complex_logcumsumexp_cpu<std::complex<float>>(compute_src, dim)
+        return complex_logcumsumexp_cpu<tensorplay::complex<float>>(compute_src, dim)
             .to(out_dtype);
     }
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(src.shape()), out_dtype, src.device());
