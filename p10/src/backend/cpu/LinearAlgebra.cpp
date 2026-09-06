@@ -77,10 +77,27 @@ Tensor matrix_power_native_cpu(const Tensor& self, int64_t n) {
     return result;
 }
 
+Tensor& matrix_power_native_cpu_out(const Tensor& self, int64_t n, Tensor& out) {
+    if (out.device() != self.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "matrix_power: output must be on the same device as input");
+    }
+    if (out.dtype() != self.dtype()) {
+        TP_THROW(TypeError,
+                 "matrix_power: output dtype must match input dtype");
+    }
+    out.resize_(static_cast<std::vector<int64_t>>(self.shape()));
+    out.copy_(matrix_power_native_cpu(self, n));
+    return out;
+}
+
 TENSORPLAY_LIBRARY_IMPL(CPU, NativeLinearAlgebra) {
     m.impl("ger", ger_native_cpu);
     m.impl("kron", kron_native_cpu);
     m.impl("matrix_power", matrix_power_native_cpu);
+    m.impl("matrix_power.out", matrix_power_native_cpu_out);
+    m.impl("linalg_matrix_power", matrix_power_native_cpu);
+    m.impl("linalg_matrix_power.out", matrix_power_native_cpu_out);
 }
 
 } // namespace tensorplay::cpu
