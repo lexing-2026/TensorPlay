@@ -1759,6 +1759,59 @@ std::tuple<Tensor, Tensor, Tensor> unique_flat_cpu_template(
     return {values, inverse, counts};
 }
 
+template <typename scalar_t>
+std::tuple<Tensor, Tensor, Tensor> unique_consecutive_flat_cpu_template(
+        const Tensor& self, bool return_inverse, bool return_counts) {
+    Tensor input = self.dim() == 0 ? self.reshape({1}).contiguous()
+                                   : self.contiguous();
+    const int64_t numel = input.numel();
+    Tensor values = Tensor::empty({0}, self.dtype(), self.device());
+    Tensor inverse = Tensor::empty({0}, DType::Int64, self.device());
+    Tensor counts = Tensor::empty({0}, DType::Int64, self.device());
+    if (numel == 0) {
+        if (return_inverse) {
+            inverse.resize_(static_cast<std::vector<int64_t>>(self.shape()));
+        }
+        return {values, inverse, counts};
+    }
+
+    values = Tensor::empty({numel}, self.dtype(), self.device());
+    scalar_t* value_data = values.data_ptr<scalar_t>();
+    const scalar_t* input_data = input.data_ptr<scalar_t>();
+    int64_t* inverse_data = nullptr;
+    if (return_inverse) {
+        inverse.resize_(static_cast<std::vector<int64_t>>(self.shape()));
+        inverse_data = inverse.data_ptr<int64_t>();
+    }
+    int64_t* counts_data = nullptr;
+    if (return_counts) {
+        counts.resize_({numel});
+        counts_data = counts.data_ptr<int64_t>();
+    }
+
+    scalar_t last_value = input_data[0];
+    value_data[0] = last_value;
+    int64_t group = 0;
+    int64_t group_start = 0;
+    if (inverse_data) inverse_data[0] = 0;
+    for (int64_t i = 1; i < numel; ++i) {
+        const scalar_t value = input_data[i];
+        if (value != last_value) {
+            if (counts_data) counts_data[group] = i - group_start;
+            ++group;
+            group_start = i;
+            value_data[group] = value;
+            last_value = value;
+        }
+        if (inverse_data) inverse_data[i] = group;
+    }
+    if (counts_data) counts_data[group] = numel - group_start;
+    const int64_t group_count = group + 1;
+    values.resize_({group_count});
+    if (counts_data) counts.resize_({group_count});
+    return {values, inverse, counts};
+}
+
 std::tuple<Tensor, Tensor, Tensor> unique_bool_cpu_template(
         const Tensor& self, bool return_inverse, bool return_counts) {
     Tensor input = self.dim() == 0 ? self.reshape({1}).contiguous()
@@ -1986,6 +2039,25 @@ std::tuple<Tensor, Tensor, Tensor> unique_dim_consecutive_cpu(
                           return_inverse, return_counts);
 }
 
+std::tuple<Tensor, Tensor, Tensor> unique_consecutive_cpu(
+        const Tensor& self, bool return_inverse, bool return_counts,
+        std::optional<int64_t> dim) {
+    if (!dim.has_value() || (dim.value() == 0 && self.dim() == 1)) {
+#define TP_UNIQUE_CONSECUTIVE_CASE(ctype, name)                               \
+        case DType::name:                                                      \
+            return unique_consecutive_flat_cpu_template<ctype>(                \
+                self, return_inverse, return_counts);
+        switch (self.dtype()) {
+            TENSORPLAY_FORALL_SCALAR_TYPES(TP_UNIQUE_CONSECUTIVE_CASE)
+            default: TP_THROW(TypeError, "unique_consecutive: unsupported dtype ",
+                              toString(self.dtype()));
+        }
+#undef TP_UNIQUE_CONSECUTIVE_CASE
+    }
+    return unique_dim_consecutive_cpu(self, dim.value(), return_inverse,
+                                      return_counts);
+}
+
 Tensor scatter_reduce_cpu(const Tensor& self, int64_t dim, const Tensor& index,
                           const Tensor& src, const std::string& reduce,
                           bool include_self);
@@ -2053,6 +2125,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, IndexingKernels) {
     m.impl("_unique2", _unique2_cpu);
     m.impl("unique_dim", unique_dim_cpu);
     m.impl("unique_dim_consecutive", unique_dim_consecutive_cpu);
+    m.impl("unique_consecutive", unique_consecutive_cpu);
     m.impl("sort", sort_cpu);
     m.impl("argsort", argsort_cpu);
     m.impl("searchsorted.Tensor", searchsorted_cpu);
