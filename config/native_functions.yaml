@@ -6310,20 +6310,35 @@
   variants: function
 - func: index.Tensor(Tensor self, Tensor?[] indices) -> Tensor
   variants: function, method
+  dispatch:
+    CPU: index_cpu
+    CUDA: index_cuda
 - func: index.Tensor_out(Tensor self, Tensor?[] indices, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
+  dispatch:
+    Composite: index_out_composite
 - func: _unsafe_index.Tensor(Tensor self, Tensor?[] indices) -> Tensor
   variants: function
+  dispatch:
+    Composite: unsafe_index_composite
 - func: _unsafe_masked_index(Tensor self, Tensor mask, Tensor?[] indices, Scalar fill) -> Tensor
   variants: function
+  dispatch:
+    Composite: unsafe_masked_index_composite
 - func: _unsafe_masked_index_put_accumulate(Tensor self, Tensor mask, Tensor?[] indices, Tensor values) -> Tensor
   variants: function
+  dispatch:
+    Composite: unsafe_masked_index_put_accumulate_composite
 - func: index_copy.out(Tensor self, int dim, Tensor index, Tensor source, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: _unsafe_index_put(Tensor self, Tensor?[] indices, Tensor values, bool accumulate=False) -> Tensor
   variants: function
+  dispatch:
+    Composite: unsafe_index_put_composite
 - func: _index_put_impl_(Tensor(a!) self, Tensor?[] indices, Tensor values, bool accumulate=False, bool unsafe=False) -> Tensor(a!)
   variants: function
+  dispatch:
+    Composite: index_put_impl_composite
 - func: isin.Tensor_Tensor_out(Tensor elements, Tensor test_elements, *, bool assume_unique=False, bool invert=False, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: isin.Tensor_Scalar_out(Tensor elements, Scalar test_element, *, bool assume_unique=False, bool invert=False, Tensor(a!) out) -> Tensor(a!)

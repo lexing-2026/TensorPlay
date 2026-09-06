@@ -10,6 +10,9 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
+#define TENSORPLAY_INDEXING_SKIP_TENSOR_MEMBERS
+#include "TensorIndexing.h"
+#undef TENSORPLAY_INDEXING_SKIP_TENSOR_MEMBERS
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <cstdint>
@@ -182,7 +185,154 @@ Tensor& scatter_value_out_native(const Tensor& self, int64_t dim,
     return write_out(out, ops::scatter(self, dim, index, value));
 }
 
+std::vector<Tensor> materialize_optional_indices(
+    const std::vector<std::optional<Tensor>>& indices) {
+    std::vector<Tensor> materialized;
+    materialized.reserve(indices.size());
+    for (const auto& index : indices) {
+        materialized.emplace_back(index.has_value() ? *index : Tensor());
+    }
+    return materialized;
+}
+
+void check_unsafe_indices(
+    const std::vector<std::optional<Tensor>>& indices,
+    const char* op) {
+    for (const auto& index : indices) {
+        if (!index.has_value()) {
+            continue;
+        }
+        if (index->dtype() != DType::Int64 && index->dtype() != DType::Int32) {
+            TP_THROW(TypeError, op, " found an index with dtype ",
+                     toString(index->dtype()));
+        }
+    }
+}
+
+Tensor& write_index_out(Tensor& out, const Tensor& value) {
+    if (!out.defined()) {
+        out = value;
+        return out;
+    }
+    if (out.dtype() != value.dtype()) {
+        TP_THROW(TypeError,
+                 "index output must have the same dtype as the input");
+    }
+    if (out.device() != value.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "index output must be on the same device as the input");
+    }
+    const auto target = static_cast<std::vector<int64_t>>(value.shape());
+    if (static_cast<std::vector<int64_t>>(out.shape()) != target) {
+        out.resize_(target);
+    }
+    out.copy_(value);
+    return out;
+}
+
+Tensor& index_out_composite(
+    const Tensor& self,
+    const std::vector<std::optional<Tensor>>& indices,
+    Tensor& out) {
+    return write_index_out(out, ops::index(self, indices));
+}
+
+Tensor unsafe_index_composite(
+    const Tensor& self,
+    const std::vector<std::optional<Tensor>>& indices) {
+    check_unsafe_indices(indices, "_unsafe_index");
+    return ops::index(self, indices);
+}
+
+std::vector<std::optional<Tensor>> clamp_unsafe_indices(
+    const Tensor& self,
+    const std::vector<std::optional<Tensor>>& indices,
+    const char* op) {
+    if (indices.size() > static_cast<size_t>(self.dim())) {
+        TP_THROW(IndexError, "too many indices for tensor of dimension ",
+                 self.dim(), " (got ", indices.size(), ")");
+    }
+    std::vector<std::optional<Tensor>> clamped;
+    clamped.reserve(indices.size());
+    for (size_t dim = 0; dim < indices.size(); ++dim) {
+        if (!indices[dim].has_value()) {
+            clamped.emplace_back(std::nullopt);
+            continue;
+        }
+        const Tensor& index = *indices[dim];
+        if (index.dtype() != DType::Int64 && index.dtype() != DType::Int32) {
+            TP_THROW(TypeError, op, " found an index with dtype ",
+                     toString(index.dtype()));
+        }
+        const int64_t size = self.size(static_cast<int64_t>(dim));
+        if (size == 0) {
+            TP_THROW(IndexError, op,
+                     " cannot index a dimension with size zero");
+        }
+        clamped.emplace_back(
+            ops::clamp(index, Scalar(-size), Scalar(size - 1)));
+    }
+    return clamped;
+}
+
+Tensor unsafe_masked_index_composite(
+    const Tensor& self, const Tensor& mask,
+    const std::vector<std::optional<Tensor>>& indices, Scalar fill) {
+    const auto clamped = clamp_unsafe_indices(self, indices,
+                                               "_unsafe_masked_index");
+    if (self.numel() == 0) {
+        return ops::full(static_cast<std::vector<int64_t>>(mask.shape()), fill,
+                         self.dtype(), self.device());
+    }
+    Tensor result = ops::index(self, clamped);
+    return ops::masked_fill(result, ops::logical_not(mask), fill);
+}
+
+Tensor unsafe_masked_index_put_accumulate_composite(
+    const Tensor& self, const Tensor& mask,
+    const std::vector<std::optional<Tensor>>& indices,
+    const Tensor& values) {
+    if (self.numel() == 0) {
+        return ops::clone(self, std::nullopt);
+    }
+    const auto clamped = clamp_unsafe_indices(
+        self, indices, "_unsafe_masked_index_put_accumulate");
+    const Tensor masked_values =
+        ops::masked_fill(values, ops::logical_not(mask), Scalar(0));
+    Tensor result = ops::clone(self, std::nullopt);
+    indexing::dispatch_index_put_(
+        result, materialize_optional_indices(clamped), masked_values,
+        /*accumulate=*/true);
+    return result;
+}
+
+Tensor unsafe_index_put_composite(
+    const Tensor& self,
+    const std::vector<std::optional<Tensor>>& indices,
+    const Tensor& values, bool accumulate) {
+    Tensor result = ops::clone(self, std::nullopt);
+    indexing::dispatch_index_put_(
+        result, materialize_optional_indices(indices), values, accumulate);
+    return result;
+}
+
+Tensor& index_put_impl_composite(
+    Tensor& self, const std::vector<std::optional<Tensor>>& indices,
+    const Tensor& values, bool accumulate, bool unsafe) {
+    (void)unsafe;
+    indexing::dispatch_index_put_(
+        self, materialize_optional_indices(indices), values, accumulate);
+    return self;
+}
+
 TENSORPLAY_LIBRARY_IMPL(Composite, TensorAdvancedIndexingComposite) {
+    m.impl("index.Tensor_out", index_out_composite);
+    m.impl("_unsafe_index.Tensor", unsafe_index_composite);
+    m.impl("_unsafe_masked_index", unsafe_masked_index_composite);
+    m.impl("_unsafe_masked_index_put_accumulate",
+           unsafe_masked_index_put_accumulate_composite);
+    m.impl("_unsafe_index_put", unsafe_index_put_composite);
+    m.impl("_index_put_impl_", index_put_impl_composite);
     m.impl("put", put_native);
     m.impl("nonzero_static", nonzero_static_native);
     m.impl("scatter.reduce", scatter_reduce_variant_native);
