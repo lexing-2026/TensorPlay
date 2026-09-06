@@ -172,3 +172,32 @@ def test_segment_externals_keep_first_use_order():
     )
     externals = stax_mod._segment_externals(body)
     assert [node.name for node in externals] == ["a", "b", "c"]
+
+
+def test_one_unexpressible_run_does_not_cost_the_region_its_kernels():
+    # ``pow`` with a tensor exponent is outside the generated surface, so
+    # that run stays a call while the rest of the region still compiles.
+    tensorplay.manual_seed(9)
+    x = tensorplay.randn(5, 16)
+    w = tensorplay.randn(16, 16)
+    fn = lambda v, m: ((v @ m).erf() * 2.0).reshape(-1).exp()  # noqa: E731
+    compiled = tensorplay.compile(fn, backend="stax")
+    _close(compiled(x, w), fn(x, w))
+    codegen, lowering = _route(compiled)
+    assert codegen == "stax-fused-cpu-segments"
+    # The reshape between the two chains keeps them in separate kernels.
+    assert len(lowering._steps) >= 4
+
+
+def test_intermediates_are_released_after_their_last_reader():
+    tensorplay.manual_seed(10)
+    x = tensorplay.randn(4, 16)
+    w = tensorplay.randn(16, 16)
+    fn = lambda v, m: (((v @ m) * 2.0).erf() @ m).tanh()  # noqa: E731
+    compiled = tensorplay.compile(fn, backend="stax")
+    _close(compiled(x, m := w), fn(x, w))
+    _codegen, lowering = _route(compiled)
+    released = {slot for _step, _target, drops in lowering._steps for slot in drops}
+    assert released
+    # The value the region returns is never dropped.
+    assert lowering._output_slot not in released
