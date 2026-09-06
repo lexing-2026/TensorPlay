@@ -1,4 +1,5 @@
 #include "Tensor.h"
+#include "Complex.h"
 #include "Dispatcher.h"
 #include "Scalar.h"
 #include "TypePromotion.h"
@@ -13,7 +14,6 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
-#include <complex>
 #include <type_traits>
 
 namespace tensorplay {
@@ -84,8 +84,7 @@ static DType result_type_with_scalar(const Tensor& t, const Scalar& s) {
 }
 
 // Helper for comparison ops.
-// kEquality=false: ordering ops (lt/le/gt/ge) -- undefined over complex in
-// (std::complex has no operator<).
+// kEquality=false: ordering ops (lt/le/gt/ge) are undefined over complex.
 template<bool kEquality, typename Op>
 Tensor comparison_kernel_impl(const Tensor& self, const Tensor& other, Op op) {
     std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
@@ -237,15 +236,15 @@ Tensor where_kernel_impl(const Tensor& condition, const Tensor& self,
     switch (common_dtype) {
         TENSORPLAY_FORALL_SCALAR_TYPES(WHERE_CASE)
         case DType::ComplexFloat: {
-            apply_ternary_op_recursive_mixed<std::complex<float>, bool, std::complex<float>>( \
-                result.data_ptr<std::complex<float>>(), result.strides(), condition, condition_strides, \
+            apply_ternary_op_recursive_mixed<tensorplay::complex<float>, bool, tensorplay::complex<float>>( \
+                result.data_ptr<tensorplay::complex<float>>(), result.strides(), condition, condition_strides, \
                 self_casted, self_strides, other_casted, other_strides, \
                 0, 0, 0, 0, 0, out_shape, op); \
             break; \
         }
         case DType::ComplexDouble: {
-            apply_ternary_op_recursive_mixed<std::complex<double>, bool, std::complex<double>>( \
-                result.data_ptr<std::complex<double>>(), result.strides(), condition, condition_strides, \
+            apply_ternary_op_recursive_mixed<tensorplay::complex<double>, bool, tensorplay::complex<double>>( \
+                result.data_ptr<tensorplay::complex<double>>(), result.strides(), condition, condition_strides, \
                 self_casted, self_strides, other_casted, other_strides, \
                 0, 0, 0, 0, 0, out_shape, op); \
             break; \
