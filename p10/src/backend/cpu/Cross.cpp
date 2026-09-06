@@ -2,13 +2,13 @@
 // translation unit and the device implementation in cuda/Cross.cu.
 
 #include "Tensor.h"
+#include "Complex.h"
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "Parallel.h"
 #include "Utils.h"
 
 #include <algorithm>
-#include <complex>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -188,10 +188,10 @@ Tensor cross_impl(const Tensor& input, const Tensor& other, int64_t dim) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_CROSS_REAL_CASE)
 #undef TP_CROSS_REAL_CASE
         case DType::ComplexFloat:
-            cross_dtype<std::complex<float>>(result, a, b, dim);
+            cross_dtype<tensorplay::complex<float>>(result, a, b, dim);
             break;
         case DType::ComplexDouble:
-            cross_dtype<std::complex<double>>(result, a, b, dim);
+            cross_dtype<tensorplay::complex<double>>(result, a, b, dim);
             break;
         case DType::ComplexHalf:
         case DType::BComplex32:
