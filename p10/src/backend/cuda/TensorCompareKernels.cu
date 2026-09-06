@@ -4,6 +4,7 @@
 #include "Utils.h"
 #include "Exception.h"
 #include "CUDARuntime.h"
+#include "CUDALoops.cuh"
 
 #include <cuda_runtime.h>
 #include <thrust/complex.h>
@@ -31,15 +32,8 @@ namespace cuda {
 
 namespace {
 
-constexpr int kThreads = 256;
-
 inline std::vector<int64_t> shape_of(const Tensor& t) {
     return static_cast<std::vector<int64_t>>(t.shape());
-}
-
-void launch_ew(dim3& grid, dim3& block, int64_t n) {
-    block = dim3(kThreads);
-    grid = dim3(static_cast<unsigned>((n + kThreads - 1) / kThreads));
 }
 
 constexpr size_t kAssertMessageCapacity = 256;
@@ -148,41 +142,29 @@ Tensor bool_unary_cuda(const Tensor& self, Pred pred, const char* name) {
 }
 
 
-__global__ void isclose_kernel(int64_t n, const double* ap, const double* bp,
-                               bool* dp, double rtol, double atol, bool equal_nan) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) {
-        double x = ap[i], y = bp[i];
-        bool close;
-        if (x != x || y != y) {
-            close = equal_nan && x != x && y != y;
-        } else if (::isinf(x) || ::isinf(y)) {
-            close = x == y;
-        } else {
-            double tol = atol + rtol * ::fabs(y);
-            close = ::fabs(x - y) <= tol;
-        }
-        dp[i] = close;
-    }
-}
-
 } // namespace
 
 Tensor isclose_cuda(const Tensor& self, const Tensor& other, double rtol, double atol, bool equal_nan) {
     std::vector<int64_t> out_shape = broadcast_shapes(shape_of(self), shape_of(other));
-    Tensor a = self.to(DType::Float64).expand(out_shape).contiguous();
-    Tensor b = other.to(DType::Float64).expand(out_shape).contiguous();
+    Tensor a = self.to(DType::Float64);
+    Tensor b = other.to(DType::Float64);
     Tensor out = Tensor::empty(out_shape, DType::Bool, self.device());
-    int64_t n = out.numel();
-    if (n == 0) return out;
-    dim3 grid, block;
-    launch_ew(grid, block, n);
-    auto stream = getCurrentCUDAStream().stream();
-    isclose_kernel<<<grid, block, 0, stream>>>(
-        n, a.data_ptr<double>(), b.data_ptr<double>(), out.data_ptr<bool>(),
-        rtol, atol, equal_nan);
-    CUDA_CHECK(cudaGetLastError());
+    if (out.numel() == 0) return out;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(false)
+        .add_output(out)
+        .add_input(a)
+        .add_input(b)
+        .build();
+    gpu_kernel(iter, [=] __device__(double x, double y) -> bool {
+        if (x != x || y != y) {
+            return equal_nan && x != x && y != y;
+        }
+        if (::isinf(x) || ::isinf(y)) {
+            return x == y;
+        }
+        return ::fabs(x - y) <= atol + rtol * ::fabs(y);
+    });
     return out;
 }
 
