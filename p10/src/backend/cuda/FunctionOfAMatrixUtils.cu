@@ -8,9 +8,7 @@
 #include "CUDARuntime.h"
 
 #include <cuda_runtime.h>
-#include <thrust/complex.h>
 
-#include <complex>
 #include <vector>
 
 namespace tensorplay {
@@ -23,33 +21,8 @@ struct linear_combination_coefficient_type {
 };
 
 template <typename T>
-struct linear_combination_coefficient_type<std::complex<T>> {
+struct linear_combination_coefficient_type<tensorplay::complex<T>> {
     using type = T;
-};
-
-template <typename T>
-struct linear_combination_device_type {
-    using type = T;
-};
-
-template <>
-struct linear_combination_device_type<std::complex<float>> {
-    using type = thrust::complex<float>;
-};
-
-template <>
-struct linear_combination_device_type<std::complex<double>> {
-    using type = thrust::complex<double>;
-};
-
-template <>
-struct linear_combination_device_type<std::complex<Half>> {
-    using type = tensorplay::complex<Half>;
-};
-
-template <>
-struct linear_combination_device_type<std::complex<BFloat16>> {
-    using type = tensorplay::complex<BFloat16>;
 };
 
 template <typename scalar_t>
@@ -67,7 +40,6 @@ void compute_linear_combination_kernel(
         return;
     }
 
-    using device_t = typename linear_combination_device_type<scalar_t>::type;
     using coefficient_t = typename linear_combination_coefficient_type<scalar_t>::type;
     auto offset_calculator = make_offset_calculator<3>(iter);
     char* output_data = static_cast<char*>(iter.data_ptr(0));
@@ -76,12 +48,18 @@ void compute_linear_combination_kernel(
 
     auto loop = [=] __device__(int index) {
         const auto offsets = offset_calculator.get(static_cast<uint32_t>(index));
-        auto* output = reinterpret_cast<device_t*>(output_data + offsets[0]);
-        const auto* input = reinterpret_cast<const device_t*>(input_data + offsets[1]);
+        auto* output = reinterpret_cast<scalar_t*>(output_data + offsets[0]);
+        const auto* input = reinterpret_cast<const scalar_t*>(input_data + offsets[1]);
         const auto* coefficients = reinterpret_cast<const coefficient_t*>(
             coefficient_data + offsets[2]);
         for (int64_t j = 0; j < summations; ++j) {
-            *output += input[j * input_stride] * coefficients[j * coefficient_stride];
+            if constexpr (tensorplay::is_complex_type_v<scalar_t>) {
+                const scalar_t coefficient_value(
+                    coefficients[j * coefficient_stride], coefficient_t(0));
+                *output += input[j * input_stride] * coefficient_value;
+            } else {
+                *output += input[j * input_stride] * coefficients[j * coefficient_stride];
+            }
         }
     };
 
@@ -100,7 +78,23 @@ void compute_linear_combination_dispatch(
             iter, input_stride, coefficient_stride, summations); \
         break;
     switch (iter.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_LINEAR_COMBINATION_CASE)
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_LINEAR_COMBINATION_CASE)
+        case DType::ComplexHalf:
+            compute_linear_combination_kernel<tensorplay::complex<Half>>(
+                iter, input_stride, coefficient_stride, summations);
+            break;
+        case DType::ComplexFloat:
+            compute_linear_combination_kernel<tensorplay::complex<float>>(
+                iter, input_stride, coefficient_stride, summations);
+            break;
+        case DType::ComplexDouble:
+            compute_linear_combination_kernel<tensorplay::complex<double>>(
+                iter, input_stride, coefficient_stride, summations);
+            break;
+        case DType::BComplex32:
+            compute_linear_combination_kernel<tensorplay::complex<BFloat16>>(
+                iter, input_stride, coefficient_stride, summations);
+            break;
         default:
             TP_THROW(TypeError, "_compute_linear_combination: unsupported dtype");
     }
