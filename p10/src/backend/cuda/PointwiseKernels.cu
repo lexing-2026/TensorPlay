@@ -98,46 +98,46 @@ Tensor abs_kernel_cuda(const Tensor& self) {
     }
     return unary_op_kernel_v2(self, AbsFunctor());
 }
-// neg/square complex paths are defined after complex_math_kernel_cuda and the
-// Cx* functors below (translation-unit ordering; see #undef CX_FUNCTOR).
-// interleaved re/im storage directly.
-__global__ void sign_cplx_f32_kernel(int64_t n, const float* __restrict__ src, float* __restrict__ dst) {
-    const int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x;
-    if (i >= n) return;
-    const float re = src[2 * i], im = src[2 * i + 1];
-    const float m = sqrtf(re * re + im * im);
-    if (m == 0.f) { dst[2 * i] = 0.f; dst[2 * i + 1] = 0.f; }
-    else { dst[2 * i] = re / m; dst[2 * i + 1] = im / m; }
-}
-
-__global__ void sign_cplx_f64_kernel(int64_t n, const double* __restrict__ src, double* __restrict__ dst) {
-    const int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x;
-    if (i >= n) return;
-    const double re = src[2 * i], im = src[2 * i + 1];
-    const double m = sqrt(re * re + im * im);
-    if (m == 0.) { dst[2 * i] = 0.; dst[2 * i + 1] = 0.; }
-    else { dst[2 * i] = re / m; dst[2 * i + 1] = im / m; }
+template <typename complex_t, typename math_t>
+void complex_sign_loop(const Tensor& input, const Tensor& output) {
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(output)
+        .add_const_input(input)
+        .build();
+    gpu_kernel(iter, [] __device__(complex_t value) -> complex_t {
+        const math_t z = static_cast<math_t>(value);
+        const auto real = z.real();
+        const auto imag = z.imag();
+        const auto magnitude = ::sqrt(real * real + imag * imag);
+        if (magnitude == 0) return complex_t(0, 0);
+        return static_cast<complex_t>(z / math_t(magnitude, 0));
+    });
 }
 
 Tensor sign_kernel_cuda(const Tensor& self) {
     if (isComplexType(self.dtype())) {
         Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
-        const int64_t n = self.numel();
-        if (n > 0) {
-            dim3 block(256);
-            dim3 grid((n + 255) / 256);
-            Tensor self_contig = self.contiguous();
-            auto stream = getCurrentCUDAStream().stream();
-            if (self.dtype() == DType::ComplexDouble) {
-                sign_cplx_f64_kernel<<<grid, block, 0, stream>>>(
-                    n, static_cast<const double*>(self_contig.data_ptr()),
-                    static_cast<double*>(result.data_ptr()));
-            } else {
-                sign_cplx_f32_kernel<<<grid, block, 0, stream>>>(
-                    n, static_cast<const float*>(self_contig.data_ptr()),
-                    static_cast<float*>(result.data_ptr()));
-            }
-            CUDA_CHECK(cudaGetLastError());
+        if (self.numel() == 0) return result;
+        switch (self.dtype()) {
+            case DType::ComplexHalf:
+                complex_sign_loop<tensorplay::complex<Half>,
+                                  tensorplay::complex<float>>(self, result);
+                break;
+            case DType::ComplexFloat:
+                complex_sign_loop<tensorplay::complex<float>,
+                                  tensorplay::complex<float>>(self, result);
+                break;
+            case DType::ComplexDouble:
+                complex_sign_loop<tensorplay::complex<double>,
+                                  tensorplay::complex<double>>(self, result);
+                break;
+            case DType::BComplex32:
+                complex_sign_loop<tensorplay::complex<BFloat16>,
+                                  tensorplay::complex<float>>(self, result);
+                break;
+            default:
+                TP_THROW(NotImplementedError, "CUDA sign: unsupported complex dtype");
         }
         return result;
     }
