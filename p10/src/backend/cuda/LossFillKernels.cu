@@ -15,6 +15,7 @@
 #include "Utils.h"
 #include "TypePromotion.h"
 #include "CUDARuntime.h"
+#include "CUDALoops.cuh"
 
 #include <cuda_runtime.h>
 
@@ -93,16 +94,6 @@ std::pair<Tensor, Tensor> pair_f64_dev(const Tensor& a, const Tensor& b) {
 // elementwise loss / gradient kernels
 // ---------------------------------------------------------------------------
 
-__global__ void mse_elem_kernel(int64_t n, const double* x, const double* t,
-                                double* o) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += st) {
-        const double d = x[i] - t[i];
-        o[i] = d * d;
-    }
-}
-
 __global__ void mse_grad_kernel(int64_t n, const double* x, const double* t,
                                 const double* g, double norm, double* o) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -110,18 +101,6 @@ __global__ void mse_grad_kernel(int64_t n, const double* x, const double* t,
     for (; i < n; i += st) {
         const double d = x[i] - t[i];
         o[i] = norm * 2.0 * d * g[i];
-    }
-}
-
-__global__ void smooth_l1_elem_kernel(int64_t n, const double* x, const double* t,
-                                      double beta, double* o) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += st) {
-        const double d = ::fabs(x[i] - t[i]);
-        // quadratic inside beta, linear outside (the two branches agree at
-        // the boundary, so the closed comparison either side is fine)
-        o[i] = d < beta ? 0.5 * d * d / beta : d - 0.5 * beta;
     }
 }
 
@@ -136,16 +115,6 @@ __global__ void smooth_l1_grad_kernel(int64_t n, const double* x, const double* 
         const double local = ad <= beta ? d / beta
                                         : (d > 0.0 ? 1.0 : (d < 0.0 ? -1.0 : 0.0));
         o[i] = norm * local * g[i];
-    }
-}
-
-__global__ void huber_elem_kernel(int64_t n, const double* x, const double* t,
-                                  double delta, double* o) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += st) {
-        const double d = ::fabs(x[i] - t[i]);
-        o[i] = d < delta ? 0.5 * d * d : delta * (d - 0.5 * delta);
     }
 }
 
@@ -334,10 +303,16 @@ Tensor mse_loss_cuda(const Tensor& input, const Tensor& target,
                                   input.device());
     const int64_t n = elems.numel();
     if (n) {
-        mse_elem_kernel<<<loss_grid(n), kThreads, 0,
-                          getCurrentCUDAStream().stream()>>>(
-            n, pr.first.data_ptr<double>(), pr.second.data_ptr<double>(),
-            elems.data_ptr<double>());
+        TensorIterator iter = TensorIteratorConfig()
+            .check_all_same_dtype(true)
+            .add_output(elems)
+            .add_const_input(pr.first)
+            .add_const_input(pr.second)
+            .build();
+        gpu_kernel(iter, [] __device__(double x, double t) -> double {
+            const double d = x - t;
+            return d * d;
+        });
         CUDA_CHECK(cudaGetLastError());
     }
     if (reduction == 0) {
@@ -388,10 +363,16 @@ Tensor smooth_l1_loss_cuda(const Tensor& input, const Tensor& target,
                                   input.device());
     const int64_t n = elems.numel();
     if (n) {
-        smooth_l1_elem_kernel<<<loss_grid(n), kThreads, 0,
-                                getCurrentCUDAStream().stream()>>>(
-            n, pr.first.data_ptr<double>(), pr.second.data_ptr<double>(),
-            beta, elems.data_ptr<double>());
+        TensorIterator iter = TensorIteratorConfig()
+            .check_all_same_dtype(true)
+            .add_output(elems)
+            .add_const_input(pr.first)
+            .add_const_input(pr.second)
+            .build();
+        gpu_kernel(iter, [beta] __device__(double x, double t) -> double {
+            const double d = ::fabs(x - t);
+            return d < beta ? 0.5 * d * d / beta : d - 0.5 * beta;
+        });
         CUDA_CHECK(cudaGetLastError());
     }
     if (reduction == 0) return elems.to(input.dtype());
@@ -439,10 +420,16 @@ Tensor huber_loss_cuda(const Tensor& input, const Tensor& target,
                                   input.device());
     const int64_t n = elems.numel();
     if (n) {
-        huber_elem_kernel<<<loss_grid(n), kThreads, 0,
-                            getCurrentCUDAStream().stream()>>>(
-            n, pr.first.data_ptr<double>(), pr.second.data_ptr<double>(),
-            delta, elems.data_ptr<double>());
+        TensorIterator iter = TensorIteratorConfig()
+            .check_all_same_dtype(true)
+            .add_output(elems)
+            .add_const_input(pr.first)
+            .add_const_input(pr.second)
+            .build();
+        gpu_kernel(iter, [delta] __device__(double x, double t) -> double {
+            const double d = ::fabs(x - t);
+            return d < delta ? 0.5 * d * d : delta * (d - 0.5 * delta);
+        });
         CUDA_CHECK(cudaGetLastError());
     }
     if (reduction == 0) return elems.to(input.dtype());
