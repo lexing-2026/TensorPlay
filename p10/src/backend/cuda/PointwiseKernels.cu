@@ -11,9 +11,11 @@
 #include "CUDABroadcast.cuh"
 #include "ElementwiseStrided.cuh"
 #include "CUDALoops.cuh"
+#include "GPUPrimitives.cuh"
 #include "GradMode.h"
 #include <cuda_runtime.h>
 #include <cmath>
+#include <limits>
 
 namespace tensorplay {
 namespace cuda {
@@ -1886,82 +1888,117 @@ Tensor& rsqrt_inplace_kernel_cuda(Tensor& self) {
 
 // --- Masked Select ---
 template <typename T>
-__global__ void count_mask_kernel(int64_t n, const bool* mask, int64_t* counter) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n && mask[i]) {
-        atomicAdd((unsigned long long*)counter, 1); // Use ULL for 64-bit atomic if supported, or cast to ULL. 
-        // atomicAdd for int64 is supported on CC 6.0+. 
-        // If not, use 32-bit counter or multiple passes. 
-        // Assuming modern GPU.
-    }
-}
-
-// Fallback for atomicAdd(int64_t*) on older devices or if ambiguous
-__device__ void atomicAdd64(int64_t* address, int64_t val) {
-    unsigned long long* address_as_ull = (unsigned long long*)address;
-    unsigned long long old = *address_as_ull, assumed;
-    do {
-        assumed = old;
-        old = atomicCAS(address_as_ull, assumed, assumed + (unsigned long long)val);
-    } while (assumed != old);
-}
-
-template <typename T>
-__global__ void masked_select_kernel(int64_t n, const T* input, const bool* mask, T* output, int64_t* counter) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n && mask[i]) {
-        int64_t idx = atomicAdd((unsigned long long*)counter, 1);
-        output[idx] = input[i];
+__global__ void masked_select_gather_kernel(
+    int64_t n, const T* input, const bool* mask,
+    const int64_t* positions, T* output) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; i < n; i += stride) {
+        if (mask[i]) {
+            output[positions[i] - 1] = input[i];
+        }
     }
 }
 
 Tensor masked_select_kernel_cuda(const Tensor& self, const Tensor& mask) {
-    if (self.shape() != mask.shape()) TP_THROW(RuntimeError, "CUDA masked_select: shapes must match");
-    if (mask.dtype() != DType::Bool) TP_THROW(TypeError, "CUDA masked_select: mask must be bool");
-    
-    int64_t n = self.numel();
+    if (mask.dtype() != DType::Bool) {
+        TP_THROW(TypeError, "CUDA masked_select: mask must be bool");
+    }
+    if (mask.device() != self.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "CUDA masked_select: self and mask must be on the same device");
+    }
+
+    Tensor mask_temp = mask.dim() == 0 ? mask.unsqueeze(0) : mask;
+    Tensor self_temp = self.dim() == 0 ? self.unsqueeze(0) : self;
+    const std::vector<int64_t> select_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self_temp.shape()),
+        static_cast<std::vector<int64_t>>(mask_temp.shape()));
+    Tensor mask_c = mask_temp.expand(select_shape).contiguous();
+    Tensor self_c = self_temp.expand(select_shape).contiguous();
+    const int64_t n = self_c.numel();
     if (n == 0) return Tensor::empty({0}, self.dtype(), self.device());
-    
-    Tensor self_c = self.contiguous();
-    Tensor mask_c = mask.contiguous();
-    
-    // 1. Count elements
-    Tensor counter({1}, DType::Int64, self.device());
-    int64_t* d_counter = counter.data_ptr<int64_t>();
-    auto stream = getCurrentCUDAStream();
-    CUDA_CHECK(cudaMemsetAsync(d_counter, 0, sizeof(int64_t), stream.stream()));
-    
-    dim3 block(256);
-    dim3 grid((n + 255) / 256);
-    
-    // We can't use template for mask type, it's always bool.
-    // But we need template for input type? No, count only needs mask.
-    count_mask_kernel<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, mask_c.data_ptr<bool>(), d_counter); // Template arg unused but required if templated
-    
+    TP_CHECK(n <= static_cast<int64_t>(std::numeric_limits<int>::max()),
+             "CUDA masked_select: input is too large for device scan");
+
+    Tensor mask_flat = mask_c.reshape({n});
+    Tensor flags = Tensor::empty({n}, DType::Int64, self.device());
+    Tensor positions = Tensor::empty({n}, DType::Int64, self.device());
+    TensorIterator flag_iter = TensorIteratorConfig()
+        .resize_outputs(false)
+        .check_all_same_dtype(false)
+        .add_output(flags)
+        .add_const_input(mask_flat)
+        .build();
+    gpu_kernel(flag_iter, [] __device__(bool value) -> int64_t {
+        return value ? int64_t(1) : int64_t(0);
+    });
+
+    const cudaStream_t stream = getCurrentCUDAStream().stream();
+    size_t scan_bytes = 0;
+    CUDA_CHECK(cub::DeviceScan::InclusiveSum(
+        nullptr, scan_bytes, flags.data_ptr<int64_t>(),
+        positions.data_ptr<int64_t>(), static_cast<int>(n), stream));
+    Tensor scan_storage = Tensor::empty(
+        {static_cast<int64_t>(scan_bytes == 0 ? 1 : scan_bytes)},
+        DType::UInt8, self.device());
+    CUDA_CHECK(cub::DeviceScan::InclusiveSum(
+        scan_storage.data_ptr(), scan_bytes, flags.data_ptr<int64_t>(),
+        positions.data_ptr<int64_t>(), static_cast<int>(n), stream));
+
     int64_t count = 0;
-    CUDA_CHECK(cudaMemcpyAsync(&count, d_counter, sizeof(int64_t),
-                               cudaMemcpyDeviceToHost, stream.stream()));
-    stream.synchronize();
-    
-    // 2. Allocate output
+    CUDA_CHECK(cudaMemcpyAsync(
+        &count, positions.data_ptr<int64_t>() + n - 1, sizeof(int64_t),
+        cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
     Tensor result = Tensor::empty({count}, self.dtype(), self.device());
-    
     if (count > 0) {
-        // Reset counter for indexing
-        CUDA_CHECK(cudaMemsetAsync(d_counter, 0, sizeof(int64_t), stream.stream()));
-        
-        #define SEL_CASE(ctype, name) \
+        dim3 block(256);
+        dim3 grid((n + 255) / 256);
+#define SEL_CASE(ctype, name) \
         case DType::name: { \
-            masked_select_kernel<ctype><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self_c.data_ptr<ctype>(), mask_c.data_ptr<bool>(), result.data_ptr<ctype>(), d_counter); \
+            masked_select_gather_kernel<ctype><<<grid, block, 0, stream>>>( \
+                n, self_c.data_ptr<ctype>(), mask_c.data_ptr<bool>(), \
+                positions.data_ptr<int64_t>(), result.data_ptr<ctype>()); \
             break; \
         }
         switch (self.dtype()) {
             TENSORPLAY_FORALL_SCALAR_TYPES(SEL_CASE)
-            default: TP_THROW(TypeError, "CUDA masked_select: Unsupported dtype");
+            TENSORPLAY_FORALL_FP8_TYPES(SEL_CASE)
+            case DType::ComplexHalf:
+                masked_select_gather_kernel<tensorplay::complex<Half>><<<
+                    grid, block, 0, stream>>>(
+                    n, static_cast<const tensorplay::complex<Half>*>(self_c.data_ptr()),
+                    mask_c.data_ptr<bool>(), positions.data_ptr<int64_t>(),
+                    static_cast<tensorplay::complex<Half>*>(result.data_ptr()));
+                break;
+            case DType::ComplexFloat:
+                masked_select_gather_kernel<tensorplay::complex<float>><<<
+                    grid, block, 0, stream>>>(
+                    n, static_cast<const tensorplay::complex<float>*>(self_c.data_ptr()),
+                    mask_c.data_ptr<bool>(), positions.data_ptr<int64_t>(),
+                    static_cast<tensorplay::complex<float>*>(result.data_ptr()));
+                break;
+            case DType::ComplexDouble:
+                masked_select_gather_kernel<tensorplay::complex<double>><<<
+                    grid, block, 0, stream>>>(
+                    n, static_cast<const tensorplay::complex<double>*>(self_c.data_ptr()),
+                    mask_c.data_ptr<bool>(), positions.data_ptr<int64_t>(),
+                    static_cast<tensorplay::complex<double>*>(result.data_ptr()));
+                break;
+            case DType::BComplex32:
+                masked_select_gather_kernel<tensorplay::complex<BFloat16>><<<
+                    grid, block, 0, stream>>>(
+                    n, static_cast<const tensorplay::complex<BFloat16>*>(self_c.data_ptr()),
+                    mask_c.data_ptr<bool>(), positions.data_ptr<int64_t>(),
+                    static_cast<tensorplay::complex<BFloat16>*>(result.data_ptr()));
+                break;
+            default: TP_THROW(TypeError, "CUDA masked_select: unsupported dtype");
         }
-        #undef SEL_CASE
+#undef SEL_CASE
     }
-    
+
     CUDA_CHECK(cudaGetLastError());
     return result;
 }
