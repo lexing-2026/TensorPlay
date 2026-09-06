@@ -22,11 +22,11 @@
 #include "DType.h"
 #include "MemoryFormat.h"
 #include "Quantizer.h"
+#include "Complex.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <algorithm>
 #include <cmath>
-#include <complex>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -309,20 +309,20 @@ void linspace_fill_dispatch(Tensor& r, const Scalar& start, const Scalar& end,
             linspace_fill_real(r.data_ptr<BFloat16>(), start, end, steps);
             break;
         case DType::ComplexHalf:
-            linspace_fill_complex<std::complex<float>, std::complex<Half>>(
-                r.data_ptr<std::complex<Half>>(), start, end, steps);
+            linspace_fill_complex<complex<float>, complex<Half>>(
+                r.data_ptr<complex<Half>>(), start, end, steps);
             break;
         case DType::ComplexFloat:
-            linspace_fill_complex<std::complex<float>, std::complex<float>>(
-                r.data_ptr<std::complex<float>>(), start, end, steps);
+            linspace_fill_complex<complex<float>, complex<float>>(
+                r.data_ptr<complex<float>>(), start, end, steps);
             break;
         case DType::ComplexDouble:
-            linspace_fill_complex<std::complex<double>, std::complex<double>>(
-                r.data_ptr<std::complex<double>>(), start, end, steps);
+            linspace_fill_complex<complex<double>, complex<double>>(
+                r.data_ptr<complex<double>>(), start, end, steps);
             break;
         case DType::BComplex32:
-            linspace_fill_complex<std::complex<float>, std::complex<BFloat16>>(
-                r.data_ptr<std::complex<BFloat16>>(), start, end, steps);
+            linspace_fill_complex<complex<float>, complex<BFloat16>>(
+                r.data_ptr<complex<BFloat16>>(), start, end, steps);
             break;
         default:
             TP_THROW(NotImplementedError,
@@ -380,7 +380,7 @@ void logspace_fill_complex(store_t* data, const Scalar& start, const Scalar& end
         const compute_t v = i < halfway
             ? scalar_start + step * static_cast<compute_t>(static_cast<float>(k))
             : scalar_end - step * static_cast<compute_t>(static_cast<float>(k));
-        data[i] = static_cast<store_t>(std::pow(scalar_base, v));
+        data[i] = static_cast<store_t>(tensorplay::pow(scalar_base, v));
     }
 }
 
@@ -415,20 +415,20 @@ void logspace_fill_dispatch(Tensor& r, const Scalar& start, const Scalar& end,
             logspace_fill_real(r.data_ptr<BFloat16>(), start, end, steps, base);
             break;
         case DType::ComplexHalf:
-            logspace_fill_complex<std::complex<float>, std::complex<Half>>(
-                r.data_ptr<std::complex<Half>>(), start, end, steps, base);
+            logspace_fill_complex<complex<float>, complex<Half>>(
+                r.data_ptr<complex<Half>>(), start, end, steps, base);
             break;
         case DType::ComplexFloat:
-            logspace_fill_complex<std::complex<float>, std::complex<float>>(
-                r.data_ptr<std::complex<float>>(), start, end, steps, base);
+            logspace_fill_complex<complex<float>, complex<float>>(
+                r.data_ptr<complex<float>>(), start, end, steps, base);
             break;
         case DType::ComplexDouble:
-            logspace_fill_complex<std::complex<double>, std::complex<double>>(
-                r.data_ptr<std::complex<double>>(), start, end, steps, base);
+            logspace_fill_complex<complex<double>, complex<double>>(
+                r.data_ptr<complex<double>>(), start, end, steps, base);
             break;
         case DType::BComplex32:
-            logspace_fill_complex<std::complex<float>, std::complex<BFloat16>>(
-                r.data_ptr<std::complex<BFloat16>>(), start, end, steps, base);
+            logspace_fill_complex<complex<float>, complex<BFloat16>>(
+                r.data_ptr<complex<BFloat16>>(), start, end, steps, base);
             break;
         default:
             TP_THROW(NotImplementedError,
@@ -451,7 +451,7 @@ Tensor& logspace_out_scalar_kernel(Scalar start, Scalar end, int64_t steps,
         // nothing to fill
     } else if (steps == 1) {
         if (isComplexType(r.dtype())) {
-            ops::fill_(r, Scalar(std::pow(base, start.to<std::complex<double>>())));
+            ops::fill_(r, Scalar(tensorplay::pow(base, start.to<complex<double>>())));
         } else {
             ops::fill_(r, Scalar(std::pow(base, start.toDouble())));
         }
@@ -567,10 +567,10 @@ Tensor& eye_out_full_kernel(int64_t n, int64_t m, Tensor& result) {
         TP_EYE_FILL_CASE(tensorplay::Half, Float16)
         TP_EYE_FILL_CASE(tensorplay::BFloat16, BFloat16)
         TP_EYE_FILL_CASE(bool, Bool)
-        TP_EYE_FILL_CASE(std::complex<tensorplay::Half>, ComplexHalf)
-        TP_EYE_FILL_CASE(std::complex<float>, ComplexFloat)
-        TP_EYE_FILL_CASE(std::complex<double>, ComplexDouble)
-        TP_EYE_FILL_CASE(std::complex<tensorplay::BFloat16>, BComplex32)
+        TP_EYE_FILL_CASE(complex<tensorplay::Half>, ComplexHalf)
+        TP_EYE_FILL_CASE(complex<float>, ComplexFloat)
+        TP_EYE_FILL_CASE(complex<double>, ComplexDouble)
+        TP_EYE_FILL_CASE(complex<tensorplay::BFloat16>, BComplex32)
         default:
             TP_THROW(NotImplementedError,
                      "\"eye\" not implemented for '", toString(result.dtype()), "'");
@@ -636,22 +636,22 @@ Tensor& complex_out_kernel(const Tensor& real, const Tensor& imag, Tensor& resul
         case DType::Float16: {
             const Half* rp = rc.data_ptr<Half>();
             const Half* ip = ic.data_ptr<Half>();
-            std::complex<Half>* dp = result.data_ptr<std::complex<Half>>();
-            for (int64_t i = 0; i < n; ++i) dp[i] = std::complex<Half>(rp[i], ip[i]);
+            complex<Half>* dp = result.data_ptr<complex<Half>>();
+            for (int64_t i = 0; i < n; ++i) dp[i] = complex<Half>(rp[i], ip[i]);
             break;
         }
         case DType::Float32: {
             const float* rp = rc.data_ptr<float>();
             const float* ip = ic.data_ptr<float>();
-            std::complex<float>* dp = result.data_ptr<std::complex<float>>();
-            for (int64_t i = 0; i < n; ++i) dp[i] = std::complex<float>(rp[i], ip[i]);
+            complex<float>* dp = result.data_ptr<complex<float>>();
+            for (int64_t i = 0; i < n; ++i) dp[i] = complex<float>(rp[i], ip[i]);
             break;
         }
         case DType::Float64: {
             const double* rp = rc.data_ptr<double>();
             const double* ip = ic.data_ptr<double>();
-            std::complex<double>* dp = result.data_ptr<std::complex<double>>();
-            for (int64_t i = 0; i < n; ++i) dp[i] = std::complex<double>(rp[i], ip[i]);
+            complex<double>* dp = result.data_ptr<complex<double>>();
+            for (int64_t i = 0; i < n; ++i) dp[i] = complex<double>(rp[i], ip[i]);
             break;
         }
         default:
@@ -673,26 +673,26 @@ Tensor& polar_out_kernel(const Tensor& abs, const Tensor& angle, Tensor& result)
         case DType::Float16: {
             const Half* ap = ac.data_ptr<Half>();
             const Half* tp = thc.data_ptr<Half>();
-            std::complex<Half>* dp = result.data_ptr<std::complex<Half>>();
+            complex<Half>* dp = result.data_ptr<complex<Half>>();
             for (int64_t i = 0; i < n; ++i) {
-                const std::complex<float> v =
-                    std::polar(static_cast<float>(ap[i]), static_cast<float>(tp[i]));
-                dp[i] = std::complex<Half>(v.real(), v.imag());
+                const complex<float> v =
+                    tensorplay::polar(static_cast<float>(ap[i]), static_cast<float>(tp[i]));
+                dp[i] = complex<Half>(v.real(), v.imag());
             }
             break;
         }
         case DType::Float32: {
             const float* ap = ac.data_ptr<float>();
             const float* tp = thc.data_ptr<float>();
-            std::complex<float>* dp = result.data_ptr<std::complex<float>>();
-            for (int64_t i = 0; i < n; ++i) dp[i] = std::polar(ap[i], tp[i]);
+            complex<float>* dp = result.data_ptr<complex<float>>();
+            for (int64_t i = 0; i < n; ++i) dp[i] = tensorplay::polar(ap[i], tp[i]);
             break;
         }
         case DType::Float64: {
             const double* ap = ac.data_ptr<double>();
             const double* tp = thc.data_ptr<double>();
-            std::complex<double>* dp = result.data_ptr<std::complex<double>>();
-            for (int64_t i = 0; i < n; ++i) dp[i] = std::polar(ap[i], tp[i]);
+            complex<double>* dp = result.data_ptr<complex<double>>();
+            for (int64_t i = 0; i < n; ++i) dp[i] = tensorplay::polar(ap[i], tp[i]);
             break;
         }
         default:
