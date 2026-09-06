@@ -36,8 +36,13 @@ Tensor vander_native_cpu(const Tensor& x, std::optional<int64_t> N,
     return increasing ? result : ops::flip(result, {1});
 }
 
+Tensor linalg_vander_native_cpu(const Tensor& x, std::optional<int64_t> N) {
+    return vander_native_cpu(x, N, true);
+}
+
 TENSORPLAY_LIBRARY_IMPL(CPU, NativeTensorFactories) {
     m.impl("vander", vander_native_cpu);
+    m.impl("linalg_vander", linalg_vander_native_cpu);
 }
 
 } // namespace tensorplay::cpu
