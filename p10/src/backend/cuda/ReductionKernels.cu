@@ -784,7 +784,7 @@ __global__ void norm2_finalize_kernel(
             if constexpr (std::is_same_v<AccT, float>) {
                 output[0] = static_cast<OutputT>(sqrtf(value));
             } else {
-                output[0] = static_cast<OutputT>(sqrt(value));
+                output[0] = static_cast<OutputT>(::sqrt(value));
             }
         }
     }
@@ -826,7 +826,7 @@ __global__ void norm2_single_block_kernel(
             if constexpr (std::is_same_v<AccT, float>) {
                 output[0] = static_cast<OutputT>(sqrtf(value));
             } else {
-                output[0] = static_cast<OutputT>(sqrt(value));
+                output[0] = static_cast<OutputT>(::sqrt(value));
             }
         }
     }
@@ -878,7 +878,7 @@ __global__ void norm2_finalize_scalar_kernel(
         if constexpr (std::is_same_v<AccT, float>) {
             output[0] = static_cast<OutputT>(sqrtf(value));
         } else {
-            output[0] = static_cast<OutputT>(sqrt(value));
+            output[0] = static_cast<OutputT>(::sqrt(value));
         }
     }
 }

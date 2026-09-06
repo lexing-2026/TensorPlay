@@ -340,7 +340,7 @@ struct LNWelford {
 };
 
 __device__ inline float ln_rsqrt(float v) { return rsqrtf(v); }
-__device__ inline double ln_rsqrt(double v) { return 1.0 / sqrt(v); }
+__device__ inline double ln_rsqrt(double v) { return 1.0 / ::sqrt(v); }
 
 template <typename ACC>
 __device__ inline LNWelford<ACC> ln_welford_online(ACC val, const LNWelford<ACC>& curr) {

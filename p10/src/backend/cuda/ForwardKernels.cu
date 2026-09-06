@@ -51,8 +51,8 @@ __global__ void forward_binary_kernel(
         case BKind::Mul: v = x * y; d = gx * y + x * gy; break;
         case BKind::Div: v = x / y; d = (gx - v * gy) / y; break;
         case BKind::Pow:
-            v = pow(x, y);
-            d = v * (gy * log(x) + y * gx / x);
+            v = ::pow(x, y);
+            d = v * (gy * ::log(x) + y * gx / x);
             break;
         default: v = x; d = gx; break;
     }
