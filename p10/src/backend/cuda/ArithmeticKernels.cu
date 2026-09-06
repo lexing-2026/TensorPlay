@@ -14,7 +14,6 @@
 #include "CUDABroadcast.cuh"
 #include "CUDAComplex.cuh"
 #include "CUDALoops.cuh"
-#include <thrust/complex.h>
 
 #include <cuda_runtime.h>
 
@@ -44,7 +43,7 @@ inline typename BinaryOpMath<T>::type scalar_to_opmath(const Scalar& s) {
     return s.to<typename BinaryOpMath<T>::type>();
 }
 
-// --- complex (thrust::complex on interleaved storage) -----------------------
+// --- complex values on interleaved storage ----------------------------------
 // Same-shape contiguous inputs take the flat kernel; everything else goes
 // through the TensorDesc broadcast kernel. `alpha` rides in the functor.
 template <typename T, typename OpF>
@@ -77,11 +76,11 @@ static void run_cplx_binary(const Tensor& a, const Tensor& b, Tensor& y,
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <typename T> inline thrust::complex<T> s2c(const Scalar& s);
-template <> inline thrust::complex<float> s2c<float>(const Scalar& s) {
+template <typename T> inline tensorplay::complex<T> s2c(const Scalar& s);
+template <> inline tensorplay::complex<float> s2c<float>(const Scalar& s) {
     return cuda::cplx::to_c64(s);
 }
-template <> inline thrust::complex<double> s2c<double>(const Scalar& s) {
+template <> inline tensorplay::complex<double> s2c<double>(const Scalar& s) {
     return cuda::cplx::to_c128(s);
 }
 
@@ -92,10 +91,10 @@ static void run_cplx_add_scalar(Tensor& x, const Scalar& other,
         <<<cuda::cplx::default_grid(x.numel()), cuda::cplx::default_block(),
            0, getCurrentCUDAStream().stream()>>>(
             x.numel(),
-            static_cast<const thrust::complex<T>*>(x.data_ptr()),
+            static_cast<const tensorplay::complex<T>*>(x.data_ptr()),
             s2c<T>(other),
             s2c<T>(alpha),
-            static_cast<thrust::complex<T>*>(y.data_ptr()));
+            static_cast<tensorplay::complex<T>*>(y.data_ptr()));
     CUDA_CHECK(cudaGetLastError());
 }
 template <typename T>
@@ -105,10 +104,10 @@ static void run_cplx_sub_scalar(Tensor& x, const Scalar& other,
         <<<cuda::cplx::default_grid(x.numel()), cuda::cplx::default_block(),
            0, getCurrentCUDAStream().stream()>>>(
             x.numel(),
-            static_cast<const thrust::complex<T>*>(x.data_ptr()),
+            static_cast<const tensorplay::complex<T>*>(x.data_ptr()),
             s2c<T>(other),
             s2c<T>(alpha),
-            static_cast<thrust::complex<T>*>(y.data_ptr()));
+            static_cast<tensorplay::complex<T>*>(y.data_ptr()));
     CUDA_CHECK(cudaGetLastError());
 }
 template <typename T>
@@ -117,9 +116,9 @@ static void run_cplx_mul_scalar(Tensor& x, const Scalar& other, Tensor& y) {
         <<<cuda::cplx::default_grid(x.numel()), cuda::cplx::default_block(),
            0, getCurrentCUDAStream().stream()>>>(
             x.numel(),
-            static_cast<const thrust::complex<T>*>(x.data_ptr()),
+            static_cast<const tensorplay::complex<T>*>(x.data_ptr()),
             s2c<T>(other),
-            static_cast<thrust::complex<T>*>(y.data_ptr()));
+            static_cast<tensorplay::complex<T>*>(y.data_ptr()));
     CUDA_CHECK(cudaGetLastError());
 }
 template <typename T>
@@ -128,9 +127,9 @@ static void run_cplx_div_scalar(Tensor& x, const Scalar& other, Tensor& y) {
         <<<cuda::cplx::default_grid(x.numel()), cuda::cplx::default_block(),
            0, getCurrentCUDAStream().stream()>>>(
             x.numel(),
-            static_cast<const thrust::complex<T>*>(x.data_ptr()),
+            static_cast<const tensorplay::complex<T>*>(x.data_ptr()),
             s2c<T>(other),
-            static_cast<thrust::complex<T>*>(y.data_ptr()));
+            static_cast<tensorplay::complex<T>*>(y.data_ptr()));
     CUDA_CHECK(cudaGetLastError());
 }
 

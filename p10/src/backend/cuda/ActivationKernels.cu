@@ -7,7 +7,6 @@
 #include "CUDALoops.cuh"
 #include "CUDNNUtils.h"
 #include <cudnn.h>
-#include <thrust/complex.h>
 #include <type_traits>
 #include <limits>
 
@@ -169,15 +168,17 @@ namespace {
 
 struct ActCxSigmoid {
     template <typename T>
-    __device__ thrust::complex<T> operator()(thrust::complex<T> z) const {
-        return static_cast<T>(1) / (static_cast<T>(1) + thrust::exp(-z));
+    __device__ tensorplay::complex<T> operator()(
+            tensorplay::complex<T> z) const {
+        return static_cast<T>(1) / (static_cast<T>(1) + tensorplay::exp(-z));
     }
 };
 
 struct ActCxTanh {
     template <typename T>
-    __device__ thrust::complex<T> operator()(thrust::complex<T> z) const {
-        return thrust::tanh(z);
+    __device__ tensorplay::complex<T> operator()(
+            tensorplay::complex<T> z) const {
+        return tensorplay::tanh(z);
     }
 };
 
