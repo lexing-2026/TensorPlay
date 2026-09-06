@@ -1056,11 +1056,23 @@ Tensor nanquantile_kernel(const Tensor& self, const Tensor& q,
 // ---------------------------------------------------------------------------
 namespace {
 
+void histogram_check_input(const Tensor& self) {
+    if (self.dtype() != DType::Float16 && self.dtype() != DType::BFloat16 &&
+        self.dtype() != DType::Float32 && self.dtype() != DType::Float64) {
+        TP_THROW(TypeError, "histogram(): input tensor must have a floating-point dtype");
+    }
+}
+
 void histogram_check_weight(const Tensor& self, const std::optional<Tensor>& weight) {
     if (weight && weight->dtype() != self.dtype()) {
         TP_THROW(ValueError,
                  "histogramdd: if weight tensor is provided, input "
                  "tensor and weight tensor should have the same dtype");
+    }
+    if (weight && weight->numel() != self.numel()) {
+        TP_THROW(ValueError,
+                 "histogramdd: if weight tensor is provided, it should have "
+                 "the same number of elements as the input tensor");
     }
 }
 
@@ -1140,11 +1152,17 @@ Tensor histogram_bin_counts(const Tensor& self, const Tensor& edges,
 std::tuple<Tensor, Tensor> histogram_bins_tensor_kernel(
         const Tensor& self, const Tensor& bins,
         const std::optional<Tensor>& weight, bool density) {
+    histogram_check_input(self);
     if (bins.dim() != 1) {
         TP_THROW(ValueError,
                  "histogramdd: bins tensor should have one dimension, "
                  "but got ", bins.dim(), " dimensions in the bins tensor for "
                  "dimension 0");
+    }
+    if (bins.numel() == 0) {
+        TP_THROW(ValueError,
+                 "histogramdd: bins tensor should have at least 1 element, "
+                 "but got 0 elements in the bins tensor for dimension 0");
     }
     if (bins.dtype() != self.dtype()) {
         TP_THROW(ValueError,
@@ -1164,6 +1182,7 @@ std::tuple<Tensor, Tensor> histogram_bin_ct_kernel(
         const Tensor& self, int64_t bins,
         const std::optional<std::vector<double>>& range,
         const std::optional<Tensor>& weight, bool density) {
+    histogram_check_input(self);
     if (bins < 1) {
         TP_THROW(ValueError, "histogram(): bins must be > 0, but got ",
                  bins, " for dimension 0");
