@@ -31,6 +31,8 @@
 
 #include "cpu/vec/intrinsics.h"
 #include "irange.h"
+#include "Half.h"
+#include "BFloat16.h"
 #include "load.h"
 
 #if defined(__GNUC__)
@@ -122,6 +124,16 @@ DEFINE_INT_OF_SIZE(int8_t);
 
 template <typename T>
 using int_same_size_t = typename int_of_size<sizeof(T)>::type;
+
+template <typename T>
+struct is_reduced_floating_point
+    : std::bool_constant<
+          std::is_same_v<T, tensorplay::Half> ||
+          std::is_same_v<T, tensorplay::BFloat16>> {};
+
+template <typename T>
+constexpr bool is_reduced_floating_point_v =
+    is_reduced_floating_point<T>::value;
 
 /**
  * Detect at compile time whether Vectorized has an explicit

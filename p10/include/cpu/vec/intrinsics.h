@@ -10,7 +10,8 @@
 #if !defined(CPU_CAPABILITY_DEFAULT) && \
     !defined(CPU_CAPABILITY_AVX512) && !defined(CPU_CAPABILITY_AVX2) && \
     !defined(CPU_CAPABILITY_VSX) && !defined(CPU_CAPABILITY_ZVECTOR) && \
-    !defined(CPU_CAPABILITY_SVE256) && !defined(CPU_CAPABILITY_SVE128)
+    !defined(CPU_CAPABILITY_SVE256) && !defined(CPU_CAPABILITY_SVE128) && \
+    !defined(CPU_CAPABILITY_RVVM1) && !defined(CPU_CAPABILITY_RVVM2)
 #if defined(__AVX2__)
 #define CPU_CAPABILITY_AVX2
 #elif defined(__VSX__)
@@ -24,6 +25,18 @@
 #define CPU_CAPABILITY_SVE256
 #else
 #define CPU_CAPABILITY_SVE128
+#endif
+#elif defined(__riscv) && defined(__riscv_v_intrinsic)
+// RISC-V vector tier picked by the build system's VLEN probe; the intrinsic
+// suffix version macro guards against pre-1.0 vector toolchains.
+#if defined(__riscv_v_intrinsic) && __riscv_v_intrinsic >= 12000 && \
+    defined(__riscv_v_fixed_vlen) && __riscv_v_fixed_vlen >= 256
+#define CPU_CAPABILITY_RVVM2
+#elif defined(__riscv_v_intrinsic) && __riscv_v_intrinsic >= 12000 && \
+    defined(__riscv_v_fixed_vlen) && __riscv_v_fixed_vlen >= 128
+#define CPU_CAPABILITY_RVVM1
+#else
+#define CPU_CAPABILITY_DEFAULT
 #endif
 #else
 #define CPU_CAPABILITY_DEFAULT
@@ -128,6 +141,31 @@ inline int tp_cpu_sve_vector_length_bits() {
 #else
 inline bool tp_cpu_has_arm_sve_bf16() { return false; }
 inline int tp_cpu_sve_vector_length_bits() { return 0; }
+#endif
+
+// RISC-V vector tiers: the "V" extension is reported through AT_HWCAP
+// (bit 'V' = 18 on riscv64 kernels); the vector register length in bits
+// comes from the CSR vlenb (bytes per vector) read via inline asm,
+// matching the RVVM1 (VLEN=128) / RVVM2 (VLEN=256) tier split.
+#if defined(__riscv) && __riscv_xlen == 64 && defined(__linux__)
+#include <sys/auxv.h>
+#ifndef TP_HWCAP_RISCV_VECTOR
+#define TP_HWCAP_RISCV_VECTOR (1 << 18)
+#endif
+inline bool tp_cpu_has_rvv() {
+  return (getauxval(AT_HWCAP) & TP_HWCAP_RISCV_VECTOR) != 0;
+}
+inline int tp_cpu_rvv_vector_length_bits() {
+  if (!tp_cpu_has_rvv()) {
+    return 0;
+  }
+  uintptr_t vlenb = 0;
+  __asm__ volatile("csrr %0, vlenb" : "=r"(vlenb));
+  return static_cast<int>(vlenb * 8);
+}
+#else
+inline bool tp_cpu_has_rvv() { return false; }
+inline int tp_cpu_rvv_vector_length_bits() { return 0; }
 #endif
 
 // float division by zero); kept for interface compatibility.

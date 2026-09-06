@@ -7,7 +7,8 @@
 // the generic template in vec_base.h.
 
 #if defined(CPU_CAPABILITY_AVX512)
-// Full-width 512-bit layer (float/double; int32/int64 pending).
+// Full-width 512-bit layer (float/double/int + 16-bit float, masks and
+// cross-dtype conversion via the shared 256-bit types).
 #include "cpu/vec/vec512/vec512.h"
 #elif defined(CPU_CAPABILITY_VSX)
 // PowerPC VSX tier: 256-bit emulation over two 128-bit registers.
@@ -48,6 +49,24 @@ template <typename T>
 inline Vectorized<T> convert_to_int(Vectorized<T> x) {
   return x;
 }
+
+template <typename VT>
+struct VecHoldType {
+  using hold_type = typename VT::value_type;
+};
+
+template <>
+struct VecHoldType<Vectorized<tensorplay::BFloat16>> {
+  using hold_type = tensorplay::BFloat16;
+};
+
+template <>
+struct VecHoldType<Vectorized<tensorplay::Half>> {
+  using hold_type = tensorplay::Half;
+};
+
+template <typename VT>
+using vechold_type = typename VecHoldType<VT>::hold_type;
 
 } // namespace tensorplay::vec::inline CPU_CAPABILITY
 } // namespace tensorplay::vec

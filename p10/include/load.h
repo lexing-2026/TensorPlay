@@ -12,4 +12,11 @@ inline T load(const void* ptr) {
   return value;
 }
 
+// Typed-pointer overload so generic elementwise code (e.g. the
+// dtype-conversion loop in vec_base) can pass its iterator directly.
+template <typename T>
+inline T load(const T* ptr) {
+  return load<T>(static_cast<const void*>(ptr));
+}
+
 } // namespace tensorplay
