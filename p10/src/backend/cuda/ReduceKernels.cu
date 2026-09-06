@@ -2,6 +2,7 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Scalar.h"
+#include "Context.h"
 #include "Exception.h"
 #include "Utils.h"
 #include "TypePromotion.h"
@@ -360,11 +361,15 @@ std::tuple<Tensor, Tensor> aminmax_dim_cuda(const Tensor& self, int64_t dim,
     return aminmax_cuda(self, {dim}, keepdim);
 }
 Tensor logsumexp_cuda2(const Tensor& self, int64_t dim, bool keepdim) {
-    if (!isFloatingType(self.dtype()))
+    if (!isFloatingType(self.dtype()) &&
+        !isIntegralType(self.dtype(), true))
         TP_THROW(RuntimeError, "logsumexp(): Expected floating point type");
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
-    Tensor sc = self.contiguous().to(DType::Float64);
+    Tensor sc = self.contiguous();
+    if (isIntegralType(sc.dtype(), true)) {
+        sc = sc.to(globalContext().defaultDType());
+    }
     int64_t d_size = sc.size(dim);
     int64_t outer = 1, inner = 1;
     outer_inner(shape_of(sc), dim, outer, inner);
@@ -374,14 +379,26 @@ Tensor logsumexp_cuda2(const Tensor& self, int64_t dim, bool keepdim) {
         // The kernel handles d_size==0 itself (writes -inf per slice, matching
         auto stream = getCurrentCUDAStream().stream();
         dim3 grid = make_grid(slices), block(kThreads);
-        slice_logsumexp_kernel<double><<<grid, block, 0, stream>>>(
-            slices, d_size, inner, sc.data_ptr<double>(), accs.data_ptr<double>());
+#define TP_LSE_CASE(ctype, name) \
+        case DType::name: \
+            slice_logsumexp_kernel<ctype><<<grid, block, 0, stream>>>( \
+                slices, d_size, inner, sc.data_ptr<ctype>(), \
+                accs.data_ptr<double>()); \
+            break;
+        switch (sc.dtype()) {
+            TENSORPLAY_FORALL_SCALAR_TYPES(TP_LSE_CASE)
+            TENSORPLAY_FORALL_FP8_TYPES(TP_LSE_CASE)
+            default:
+                TP_THROW(TypeError, "logsumexp: unsupported dtype ",
+                         toString(sc.dtype()));
+        }
+#undef TP_LSE_CASE
         CUDA_CHECK(cudaGetLastError());
     }
     std::vector<int64_t> ns = shape_of(sc);
     ns[dim] = keepdim ? 1 : 0;
     if (!keepdim) ns.erase(ns.begin() + dim);
-    DType out_dt = self.dtype() == DType::Float64 ? DType::Float64 : DType::Float32;
+    DType out_dt = sc.dtype();
     return accs.reshape(ns).to(out_dt);
 }
 Tensor nansum_cuda2(const Tensor& self, const std::vector<int64_t>& dim_in, bool keepdim) {
