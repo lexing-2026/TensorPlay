@@ -1,4 +1,5 @@
 #include "Tensor.h"
+#include "Complex.h"
 #include "Dispatcher.h"
 #include "Generator.h"
 #include "DistributionsHelper.h"
@@ -87,23 +88,23 @@ Tensor rand_kernel(const std::vector<int64_t>& size, DType dtype, Device device)
             break;
         }
         case DType::ComplexFloat: {
-            std::complex<float>* data = t.data_ptr<std::complex<float>>();
+            tensorplay::complex<float>* data = t.data_ptr<tensorplay::complex<float>>();
             uniform_real_distribution<float> dist(0.0f, 1.0f);
             const float to_scalar = 1.0f;
             for (int64_t i = 0; i < n; ++i) {
                 float re = static_cast<float>(dist(&gen));
                 float im = static_cast<float>(dist(&gen));
-                data[i] = std::complex<float>(
+                data[i] = tensorplay::complex<float>(
                     re == to_scalar ? 0.0f : re,
                     im == to_scalar ? 0.0f : im);
             }
             break;
         }
         case DType::ComplexDouble: {
-            std::complex<double>* data = t.data_ptr<std::complex<double>>();
+            tensorplay::complex<double>* data = t.data_ptr<tensorplay::complex<double>>();
             uniform_real_distribution<double> dist(0.0, 1.0);
             for (int64_t i = 0; i < n; ++i) {
-                data[i] = std::complex<double>(dist(&gen), dist(&gen));
+                data[i] = tensorplay::complex<double>(dist(&gen), dist(&gen));
             }
             break;
         }
@@ -269,23 +270,23 @@ Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_EYE_CASE)
         TENSORPLAY_FORALL_FP8_TYPES(TP_EYE_CASE)
         case DType::ComplexFloat: {
-            auto* data = t.data_ptr<std::complex<float>>();
+            auto* data = t.data_ptr<tensorplay::complex<float>>();
             for (int64_t i = 0; i < min_dim; ++i) data[i * m + i] = {1.0f, 0.0f};
             break;
         }
         case DType::ComplexDouble: {
-            auto* data = t.data_ptr<std::complex<double>>();
+            auto* data = t.data_ptr<tensorplay::complex<double>>();
             for (int64_t i = 0; i < min_dim; ++i) data[i * m + i] = {1.0, 0.0};
             break;
         }
         case DType::ComplexHalf: {
-            auto* data = t.data_ptr<std::complex<Half>>();
+            auto* data = t.data_ptr<tensorplay::complex<Half>>();
             for (int64_t i = 0; i < min_dim; ++i)
                 data[i * m + i] = {Half(1.0f), Half(0.0f)};
             break;
         }
         case DType::BComplex32: {
-            auto* data = t.data_ptr<std::complex<BFloat16>>();
+            auto* data = t.data_ptr<tensorplay::complex<BFloat16>>();
             for (int64_t i = 0; i < min_dim; ++i)
                 data[i * m + i] = {BFloat16(1.0f), BFloat16(0.0f)};
             break;
@@ -431,23 +432,23 @@ Tensor randn_kernel(const std::vector<int64_t>& size, DType dtype, Device device
         }
         case DType::ComplexFloat:
         case DType::ComplexDouble: {
-            // normal samples view_as_real(self) with std/sqrt(2); with the
-            // standard-normal factory that is N(0, 1/sqrt(2)) per component.
+            // Each component uses a normal distribution scaled by sqrt(2) so
+            // the complex value has unit expected squared magnitude.
             const double comp_std = kComplexComponentStd;
             if (dtype == DType::ComplexFloat) {
-                std::complex<float>* data = t.data_ptr<std::complex<float>>();
+                tensorplay::complex<float>* data = t.data_ptr<tensorplay::complex<float>>();
                 normal_distribution<double> dist(0.0, 1.0);
                 for (int64_t i = 0; i < n; ++i) {
-                    data[i] = std::complex<float>(
+                    data[i] = tensorplay::complex<float>(
                         static_cast<float>(dist(gen) * comp_std),
                         static_cast<float>(dist(gen) * comp_std));
                 }
             } else {
-                std::complex<double>* data = t.data_ptr<std::complex<double>>();
+                tensorplay::complex<double>* data = t.data_ptr<tensorplay::complex<double>>();
                 normal_distribution<double> dist(0.0, 1.0);
                 for (int64_t i = 0; i < n; ++i) {
-                    data[i] = std::complex<double>(dist(gen) * comp_std,
-                                                   dist(gen) * comp_std);
+                    data[i] = tensorplay::complex<double>(dist(gen) * comp_std,
+                                                          dist(gen) * comp_std);
                 }
             }
             break;
