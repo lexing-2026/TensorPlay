@@ -186,7 +186,17 @@ Tensor& out_wrap_hardtanh_backward_grad_input(const Tensor& grad_output, const T
 }
 
 Tensor& out_wrap_histc_out(const Tensor& self, int64_t bins, Scalar min, Scalar max, Tensor& out) {
-    out = ops::histc(self, bins, min, max);
+    if (out.dtype() != self.dtype()) {
+        TP_THROW(TypeError,
+                 "histc(): out tensor must have the same dtype as the input");
+    }
+    if (out.device() != self.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "histc(): out tensor must be on the same device as the input");
+    }
+    Tensor result = ops::histc(self, bins, min, max);
+    out.resize_(static_cast<std::vector<int64_t>>(result.shape()));
+    out.copy_(result);
     return out;
 }
 
