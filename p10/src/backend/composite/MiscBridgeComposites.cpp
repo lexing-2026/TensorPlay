@@ -25,6 +25,20 @@ Tensor wrapped_scalar(const Scalar& s, const Tensor& like) {
     return ops::full({}, s, like.dtype(), like.device());
 }
 
+Tensor& write_broadcast_out(const char* op, Tensor value, Tensor& out) {
+    if (!out.defined()) {
+        out = value;
+        return out;
+    }
+    if (out.device() != value.device()) {
+        TP_THROW(DeviceMismatchError,
+                 op, ": output must be on the same device as the result");
+    }
+    out.resize_(static_cast<std::vector<int64_t>>(value.shape()));
+    out.copy_(value);
+    return out;
+}
+
 } // namespace
 
 // ---- copysign: scalar overloads lift the scalar to a 0-d tensor of the
@@ -47,9 +61,7 @@ Tensor& copysign__tensor(Tensor& self, const Tensor& other) {
 }
 
 Tensor& copysign_tensor_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    Tensor r = ops::copysign(self, other);
-    ops::copy_(out, r);
-    return out;
+    return write_broadcast_out("copysign", ops::copysign(self, other), out);
 }
 
 // ---- clamp/clip with tensor bounds: promote each bound to a tensor and fall
@@ -88,8 +100,7 @@ Tensor& clamp__tensor(Tensor& self, const std::optional<Tensor>& min,
 
 Tensor& clamp_tensor_out(const Tensor& self, const std::optional<Tensor>& min,
                          const std::optional<Tensor>& max, Tensor& out) {
-    ops::copy_(out, clamp_tensor(self, min, max));
-    return out;
+    return write_broadcast_out("clamp", clamp_tensor(self, min, max), out);
 }
 
 Tensor clip_tensor(const Tensor& self, const std::optional<Tensor>& min,
