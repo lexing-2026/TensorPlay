@@ -11,6 +11,8 @@
 #include "cpu/vec/vec512/vec512_double.h"
 #include "cpu/vec/vec512/vec512_int.h"
 #include "cpu/vec/vec512/vec512_bfloat16.h"
+#include "cpu/vec/vec512/vec512_qint.h"
+#include "cpu/vec/vec512/vec512_float8.h"
 #include "cpu/vec/vec_n.h"
 #include "cpu/vec/vec_convert.h"
 #include "cpu/vec/vec_mask.h"

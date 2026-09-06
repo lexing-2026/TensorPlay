@@ -171,6 +171,10 @@ inline TP_HOST_DEVICE BFloat16 operator/(const BFloat16& a, int64_t b) { return 
 inline TP_HOST_DEVICE BFloat16 operator/(int64_t a, const BFloat16& b) { return BFloat16(a) / b; }
 inline TP_HOST_DEVICE bool operator>(const BFloat16& a, int64_t b) { return static_cast<float>(a) > static_cast<float>(b); }
 inline TP_HOST_DEVICE bool operator<(const BFloat16& a, int64_t b) { return static_cast<float>(a) < static_cast<float>(b); }
+inline TP_HOST_DEVICE bool operator==(const BFloat16& a, int64_t b) { return static_cast<float>(a) == static_cast<float>(b); }
+inline TP_HOST_DEVICE bool operator!=(const BFloat16& a, int64_t b) { return static_cast<float>(a) != static_cast<float>(b); }
+inline TP_HOST_DEVICE bool operator<=(const BFloat16& a, int64_t b) { return static_cast<float>(a) <= static_cast<float>(b); }
+inline TP_HOST_DEVICE bool operator>=(const BFloat16& a, int64_t b) { return static_cast<float>(a) >= static_cast<float>(b); }
 
 inline std::ostream& operator<<(std::ostream& out, const BFloat16& value) {
   out << static_cast<float>(value);

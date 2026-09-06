@@ -241,6 +241,10 @@ inline TP_HOST_DEVICE Half operator/(const Half& a, int64_t b) { return a / Half
 inline TP_HOST_DEVICE Half operator/(int64_t a, const Half& b) { return Half(a) / b; }
 inline TP_HOST_DEVICE bool operator>(const Half& a, int64_t b) { return static_cast<float>(a) > static_cast<float>(b); }
 inline TP_HOST_DEVICE bool operator<(const Half& a, int64_t b) { return static_cast<float>(a) < static_cast<float>(b); }
+inline TP_HOST_DEVICE bool operator==(const Half& a, int64_t b) { return static_cast<float>(a) == static_cast<float>(b); }
+inline TP_HOST_DEVICE bool operator!=(const Half& a, int64_t b) { return static_cast<float>(a) != static_cast<float>(b); }
+inline TP_HOST_DEVICE bool operator<=(const Half& a, int64_t b) { return static_cast<float>(a) <= static_cast<float>(b); }
+inline TP_HOST_DEVICE bool operator>=(const Half& a, int64_t b) { return static_cast<float>(a) >= static_cast<float>(b); }
 
 inline std::ostream& operator<<(std::ostream& out, const Half& value) {
   out << static_cast<float>(value);
