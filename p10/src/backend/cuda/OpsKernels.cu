@@ -5,7 +5,6 @@
 // (mode/kthvalue/nanmedian/dist-special-p) are host-staged reference paths.
 #include "Tensor.h"
 #include "CUDAComplex.cuh"
-#include <thrust/complex.h>
 #include "Dispatcher.h"
 #include "Scalar.h"
 #include "Exception.h"
@@ -20,6 +19,7 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <limits>
 #include <cstring>
 #include <tuple>
@@ -79,39 +79,14 @@ inline std::vector<int64_t> shape_of(const Tensor& t) {
 // Generic elementwise device kernels
 // ---------------------------------------------------------------------------
 
-template <typename T, typename Pred>
-__global__ void ew_bool_unary_kernel(int64_t n, const T* a, bool* out, Pred pred) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) out[i] = pred(a[i]);
-}
-
 template <typename T>
 __device__ bool logical_truth_cuda(const T& value) {
     return static_cast<bool>(value);
 }
 
 template <typename T>
-__device__ bool logical_truth_cuda(const thrust::complex<T>& value) {
+__device__ bool logical_truth_cuda(const std::complex<T>& value) {
     return value.real() != T(0) || value.imag() != T(0);
-}
-
-template <typename T, typename Pred>
-__global__ void ew_logical_binary_kernel(int64_t n, const T* a, const T* b,
-                                         bool* out, Pred pred) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) {
-        out[i] = pred(logical_truth_cuda(a[i]), logical_truth_cuda(b[i]));
-    }
-}
-
-template <typename T, typename Pred>
-__global__ void ew_logical_unary_kernel(int64_t n, const T* a, bool* out,
-                                        Pred pred) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) out[i] = pred(logical_truth_cuda(a[i]));
 }
 
 template <typename T, typename F>
@@ -213,32 +188,35 @@ Tensor logical_binary_cuda(const Tensor& a_in, const Tensor& b_in, Pred pred,
                           const char* name) {
     std::vector<int64_t> out_shape = broadcast_shapes(shape_of(a_in), shape_of(b_in));
     DType dt = promoteTypes(a_in.dtype(), b_in.dtype());
-    Tensor ac = a_in.to(dt).expand(out_shape).contiguous();
-    Tensor bc = b_in.to(dt).expand(out_shape).contiguous();
+    Tensor ac = a_in.to(dt).expand(out_shape);
+    Tensor bc = b_in.to(dt).expand(out_shape);
     Tensor out = Tensor::empty(out_shape, DType::Bool, a_in.device());
-    int64_t n = out.numel();
-    if (n == 0) return out;
-    dim3 grid, block;
-    launch_ew(grid, block, n);
-    auto stream = getCurrentCUDAStream().stream();
+    if (out.numel() == 0) return out;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(false)
+        .add_output(out)
+        .add_const_input(ac)
+        .add_const_input(bc)
+        .build();
 #define TP_LOGICAL_BIN(ctype, name_) \
     case DType::name_: \
-        ew_logical_binary_kernel<ctype><<<grid, block, 0, stream>>>( \
-            n, ac.data_ptr<ctype>(), bc.data_ptr<ctype>(), out.data_ptr<bool>(), pred); \
+        gpu_kernel(iter, [pred] __device__(ctype lhs, ctype rhs) -> bool { \
+            return pred(logical_truth_cuda(lhs), logical_truth_cuda(rhs)); \
+        }); \
         break;
     switch (dt) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_LOGICAL_BIN)
         case DType::ComplexFloat:
-            ew_logical_binary_kernel<thrust::complex<float>><<<grid, block, 0, stream>>>(
-                n, static_cast<const thrust::complex<float>*>(ac.data_ptr()),
-                static_cast<const thrust::complex<float>*>(bc.data_ptr()),
-                out.data_ptr<bool>(), pred);
+            gpu_kernel(iter, [pred] __device__(std::complex<float> lhs,
+                                                std::complex<float> rhs) -> bool {
+                return pred(logical_truth_cuda(lhs), logical_truth_cuda(rhs));
+            });
             break;
         case DType::ComplexDouble:
-            ew_logical_binary_kernel<thrust::complex<double>><<<grid, block, 0, stream>>>(
-                n, static_cast<const thrust::complex<double>*>(ac.data_ptr()),
-                static_cast<const thrust::complex<double>*>(bc.data_ptr()),
-                out.data_ptr<bool>(), pred);
+            gpu_kernel(iter, [pred] __device__(std::complex<double> lhs,
+                                                std::complex<double> rhs) -> bool {
+                return pred(logical_truth_cuda(lhs), logical_truth_cuda(rhs));
+            });
             break;
         case DType::ComplexHalf:
         case DType::BComplex32:
@@ -253,29 +231,30 @@ Tensor logical_binary_cuda(const Tensor& a_in, const Tensor& b_in, Pred pred,
 
 template <typename Pred>
 Tensor logical_unary_cuda(const Tensor& self, Pred pred, const char* name) {
-    Tensor sc = self.contiguous();
     Tensor out = Tensor::empty(shape_of(self), DType::Bool, self.device());
-    int64_t n = self.numel();
-    if (n == 0) return out;
-    dim3 grid, block;
-    launch_ew(grid, block, n);
-    auto stream = getCurrentCUDAStream().stream();
+    if (out.numel() == 0) return out;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(false)
+        .add_output(out)
+        .add_const_input(self)
+        .build();
 #define TP_LOGICAL_UNARY(ctype, name_) \
     case DType::name_: \
-        ew_logical_unary_kernel<ctype><<<grid, block, 0, stream>>>( \
-            n, sc.data_ptr<ctype>(), out.data_ptr<bool>(), pred); \
+        gpu_kernel(iter, [pred] __device__(ctype value) -> bool { \
+            return pred(logical_truth_cuda(value)); \
+        }); \
         break;
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_LOGICAL_UNARY)
         case DType::ComplexFloat:
-            ew_logical_unary_kernel<thrust::complex<float>><<<grid, block, 0, stream>>>(
-                n, static_cast<const thrust::complex<float>*>(sc.data_ptr()),
-                out.data_ptr<bool>(), pred);
+            gpu_kernel(iter, [pred] __device__(std::complex<float> value) -> bool {
+                return pred(logical_truth_cuda(value));
+            });
             break;
         case DType::ComplexDouble:
-            ew_logical_unary_kernel<thrust::complex<double>><<<grid, block, 0, stream>>>(
-                n, static_cast<const thrust::complex<double>*>(sc.data_ptr()),
-                out.data_ptr<bool>(), pred);
+            gpu_kernel(iter, [pred] __device__(std::complex<double> value) -> bool {
+                return pred(logical_truth_cuda(value));
+            });
             break;
         case DType::ComplexHalf:
         case DType::BComplex32:
