@@ -713,9 +713,24 @@ Tensor& out_wrap_min_out(const Tensor& self, const Tensor& other, Tensor& out) {
     return out;
 }
 
-Tensor& out_wrap_quantile_out(const Tensor& self, const Tensor& q, std::optional<int64_t> dim, bool keepdim, std::string interpolation, Tensor& out) {
-    out = ops::quantile(self, q, dim, keepdim, interpolation);
+Tensor& write_quantile_out(const Tensor& self, const Tensor& result,
+                           Tensor& out) {
+    if (out.dtype() != self.dtype()) {
+        TP_THROW(TypeError,
+                 "quantile(): out tensor must have the same dtype as the input");
+    }
+    if (out.device() != self.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "quantile(): out tensor must be on the same device as the input");
+    }
+    out.resize_(static_cast<std::vector<int64_t>>(result.shape()));
+    out.copy_(result);
     return out;
+}
+
+Tensor& out_wrap_quantile_out(const Tensor& self, const Tensor& q, std::optional<int64_t> dim, bool keepdim, std::string interpolation, Tensor& out) {
+    return write_quantile_out(
+        self, ops::quantile(self, q, dim, keepdim, interpolation), out);
 }
 
 Tensor& out_wrap_quantile_scalar_out(const Tensor& self, double q, std::optional<int64_t> dim, bool keepdim, std::string interpolation, Tensor& out) {
@@ -724,13 +739,13 @@ Tensor& out_wrap_quantile_scalar_out(const Tensor& self, double q, std::optional
                  "quantile() q must be in the range [0, 1] but got ", q);
     }
     Tensor qv = ops::scalar_tensor(Scalar(q), self.dtype(), self.device());
-    out = ops::quantile(self, qv, dim, keepdim, interpolation);
-    return out;
+    return write_quantile_out(
+        self, ops::quantile(self, qv, dim, keepdim, interpolation), out);
 }
 
 Tensor& out_wrap_nanquantile_out(const Tensor& self, const Tensor& q, std::optional<int64_t> dim, bool keepdim, std::string interpolation, Tensor& out) {
-    out = ops::nanquantile(self, q, dim, keepdim, interpolation);
-    return out;
+    return write_quantile_out(
+        self, ops::nanquantile(self, q, dim, keepdim, interpolation), out);
 }
 
 Tensor& out_wrap_nanquantile_scalar_out(const Tensor& self, double q, std::optional<int64_t> dim, bool keepdim, std::string interpolation, Tensor& out) {
@@ -739,8 +754,8 @@ Tensor& out_wrap_nanquantile_scalar_out(const Tensor& self, double q, std::optio
                  "quantile() q must be in the range [0, 1] but got ", q);
     }
     Tensor qv = ops::scalar_tensor(Scalar(q), self.dtype(), self.device());
-    out = ops::nanquantile(self, qv, dim, keepdim, interpolation);
-    return out;
+    return write_quantile_out(
+        self, ops::nanquantile(self, qv, dim, keepdim, interpolation), out);
 }
 
 Tensor& out_wrap_float_power_Tensor_Tensor_out(const Tensor& self, const Tensor& exponent, Tensor& out) {
