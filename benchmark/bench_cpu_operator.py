@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""PyTorch-style CPU operator benchmark for TensorPlay.
+"""CPU operator benchmark for TensorPlay.
 
-The case inventory follows the operator_benchmark families used by PyTorch,
+The case inventory covers the standard operator benchmark families,
 but the implementation is self-contained and executes TensorPlay only.  A
 case is materialized immediately before it runs, so large cases do not keep a
 second full suite of tensors alive.  Any unsupported operator raises and fails
@@ -121,7 +121,7 @@ def build_cases(dtype, suite):
             return
         cases.append((name, category, _factory(dtype, operation, specs), specs))
 
-    # PyTorch operator_benchmark's binary family: same-shape, broadcast,
+    # Binary family: same-shape, broadcast,
     # scalar, comparison, logical and ternary arithmetic operators.
     binary = _spec("normal", (8, 16, 32), 1)
     binary2 = _spec("normal", (8, 16, 32), 2)
@@ -177,8 +177,8 @@ def build_cases(dtype, suite):
         lambda a, b: F.remainder(a + 2.0, b + 1.5),
         (_spec("normal", (1 << 18,), 11), _spec("positive", (1 << 18,), 12)))
 
-    # Unary family.  Inputs are domain-safe per operator, matching the
-    # domain-aware data generation in PyTorch's unary_test.py.
+    # Unary family.  Inputs are domain-safe per operator, with
+    # domain-aware data generation.
     unary = (
         ("abs", F.abs, "normal"),
         ("acos", F.acos, "bounded"),

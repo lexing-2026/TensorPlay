@@ -77,7 +77,7 @@ std::vector<Tensor> foreach_zero_cuda(const std::vector<Tensor>& self) {
 }
 
 std::vector<Tensor> foreach_clone_cuda(const std::vector<Tensor>& self,
-                                       const std::optional<int64_t>& /*memory_format*/) {
+                                       std::optional<int64_t> /*memory_format*/) {
     std::vector<Tensor> out;
     out.reserve(self.size());
     for (const auto& value : self) out.push_back(value.clone());
@@ -109,7 +109,7 @@ std::vector<Tensor> foreach_mm_cuda(const std::vector<Tensor>& self,
 
 std::vector<Tensor> foreach_norm_cuda(const std::vector<Tensor>& self,
                                       Scalar ord,
-                                      const std::optional<DType>& dtype) {
+                                      std::optional<DType> dtype) {
     std::vector<Tensor> out;
     out.reserve(self.size());
     for (const auto& value : self) {
@@ -121,7 +121,7 @@ std::vector<Tensor> foreach_norm_cuda(const std::vector<Tensor>& self,
 
 std::vector<Tensor> foreach_powsum_cuda(const std::vector<Tensor>& self,
                                         Scalar ord,
-                                        const std::optional<DType>& dtype) {
+                                        std::optional<DType> dtype) {
     std::vector<Tensor> out;
     out.reserve(self.size());
     for (const auto& value : self) {
@@ -358,7 +358,7 @@ void foreach_zero_out_cuda(const std::vector<Tensor>& self, std::vector<Tensor> 
     copy_foreach_out_cuda(foreach_zero_cuda(self), std::move(out), "_foreach_zero.out");
 }
 void foreach_clone_out_cuda(const std::vector<Tensor>& self,
-                            const std::optional<int64_t>& memory_format,
+                            std::optional<int64_t> memory_format,
                             std::vector<Tensor> out) {
     copy_foreach_out_cuda(foreach_clone_cuda(self, memory_format), std::move(out),
                           "_foreach_clone.out");
@@ -370,12 +370,12 @@ void foreach_copy_out_cuda(const std::vector<Tensor>& self,
                           "_foreach_copy.out");
 }
 void foreach_norm_out_cuda(const std::vector<Tensor>& self, Scalar ord,
-                           const std::optional<DType>& dtype, std::vector<Tensor> out) {
+                           std::optional<DType> dtype, std::vector<Tensor> out) {
     copy_foreach_out_cuda(foreach_norm_cuda(self, ord, dtype), std::move(out),
                           "_foreach_norm.Scalar_out");
 }
 void foreach_powsum_out_cuda(const std::vector<Tensor>& self, Scalar ord,
-                             const std::optional<DType>& dtype, std::vector<Tensor> out) {
+                             std::optional<DType> dtype, std::vector<Tensor> out) {
     copy_foreach_out_cuda(foreach_powsum_cuda(self, ord, dtype), std::move(out),
                           "_foreach_powsum.Scalar_out");
 }

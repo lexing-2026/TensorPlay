@@ -9,8 +9,8 @@
 
 namespace tensorplay {
 
-// ArrayRef<int64_t> — a lightweight view over a contiguous run of int64_t,
-// mirroring c10::IntArrayRef. Does not own the data; the underlying buffer
+// ArrayRef<int64_t> — a lightweight view over a contiguous run of int64_t.
+// Does not own the data; the underlying buffer
 // must outlive the reference.
 class P10_API IntArrayRef {
 public:
@@ -48,7 +48,7 @@ public:
         return IntArrayRef(data_ + begin, end - begin);
     }
 
-    /// Explicit materialization into an owned vector (mirrors c10 .vec()).
+    /// Explicit materialization into an owned vector.
     std::vector<int64_t> vec() const {
         return std::vector<int64_t>(data_, data_ + length_);
     }

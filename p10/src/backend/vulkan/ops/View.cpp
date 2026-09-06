@@ -53,9 +53,11 @@ Tensor gather_view(
     const std::vector<int64_t>& out_strides_rowmajor,
     int64_t offset) {
   TP_CHECK(
-      input.dtype() == DType::Float32 || input.dtype() == DType::Int8,
-      "Vulkan view materialization supports Float32 and Int8 tensors only");
-  const bool is_int8 = input.dtype() == DType::Int8;
+      input.dtype() == DType::Float32 || input.dtype() == DType::Int8 ||
+          input.dtype() == DType::Int32 || input.dtype() == DType::Bool,
+      "Vulkan view materialization supports Float32, Int8, Int32 and Bool tensors only");
+  const bool is_int8 = input.dtype() == DType::Int8 || input.dtype() == DType::Bool;
+  const bool is_int32 = input.dtype() == DType::Int32;
 
   api::Context* const context = api::context();
   api::vTensor v_input = convert(input);
@@ -108,7 +110,7 @@ Tensor gather_view(
 
   const api::ShaderInfo shader = is_int8
       ? VK_KERNEL(view_gather_int8)
-      : VK_KERNEL(view_gather);
+      : is_int32 ? VK_KERNEL(view_gather_int32) : VK_KERNEL(view_gather);
 
   context->submit_compute_job(
       shader, pipeline_barrier, v_output.extents(),

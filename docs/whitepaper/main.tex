@@ -1,12 +1,17 @@
-% TensorPlay White Paper --- Industry Highest Standard, Publishable LaTeX
-% Engine: pdflatex or xelatex (TeX Live on Windows E:\texlive)
-% Compile: latexmk -pdf main.tex  OR  pdflatex main.tex; bibtex main; pdflatex main.tex; pdflatex main.tex
+% TensorPlay 白皮书 --- 业界最高标准，可发表级 LaTeX
+% 编译引擎: xelatex (推荐，支持中文) 或 pdflatex
+% 编译命令: latexmk -xelatex main.tex  或  xelatex main.tex; xelatex main.tex
+%          latexmk -pdf main.tex      (pdflatex 回退)
 \documentclass[11pt,a4paper,oneside]{article}
 
-% ---------- Geometry & Typography ----------
+% ---------- 页面与字体 ----------
 \usepackage[margin=2.45cm, top=2.8cm, bottom=2.8cm]{geometry}
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
+% 中文支持：优先 fandol（TeX Live 自带），Windows 可切换为 windows/founder 字体集
+\usepackage[UTF8, heading=true, fontset=fandol, autoindent=true]{ctex}
+\usepackage{indentfirst}
+\setlength{\parindent}{2em}
+% 英文与符号字体回退（ctex 已处理中文，lmodern 负责英文）
+\usepackage{lmodern}
 \usepackage{textcomp}
 \usepackage[htt]{hyphenat}
 \usepackage[hyphens]{url}
@@ -23,7 +28,6 @@
 \def\url{\protect\orig@url}
 \makeatother
 \usepackage{microtype}
-\usepackage{lmodern}
 % Allow \texttt to break at / . - _ and set sloppy for overfull
 \sloppy
 \setlength{\emergencystretch}{6em}
@@ -65,19 +69,20 @@
 \usepackage{fancyhdr}
 \usepackage{titlesec}
 \usepackage{abstract}
+\setlength{\absparindent}{2em}
 \usepackage{authblk}
 \usepackage{multicol}
 \usepackage{bookmark}
 \usepackage[acronym, automake, nomain, shortcuts=ac]{glossaries-extra}
 \makeglossaries
 
-% Acronym + Glossary entries
+% 术语与缩写
 \input{glossary.tex}
 
 % Configure abbreviation style (must be after \newacronym entries)
 \setabbreviationstyle[acronym]{long-short}
 
-% ---------- Colors ----------
+% ---------- 颜色 ----------
 \definecolor{tpblue}{RGB}{21,101,192}
 \definecolor{tporange}{RGB}{239,108,0}
 \definecolor{tpgreen}{RGB}{46,125,50}
@@ -94,12 +99,12 @@
   citecolor=tpgreen,
   urlcolor=tporange,
   pdfauthor={TensorPlay Contributors},
-  pdftitle={TensorPlay White Paper},
-  pdfsubject={Deep Learning Framework Architecture},
-  pdfkeywords={TensorPlay, Deep Learning, Autograd, Dispatch, Vmap, Profiler}
+  pdftitle={TensorPlay 白皮书},
+  pdfsubject={深度学习框架架构},
+  pdfkeywords={TensorPlay, 深度学习, 自动微分, 分发, 向量化映射, 剖析器, 代码生成, 张量迭代器}
 }
 
-% ---------- Listings ----------
+% ---------- 代码高亮 ----------
 \lstdefinestyle{cppstyle}{
   language=C++,
   backgroundcolor=\color{codebg},
@@ -122,7 +127,8 @@
   upquote=true,
   morekeywords={P10_API,TENSORPLAY_API,constexpr,thread_local,shared_ptr,weak_ptr,atomic},
   xleftmargin=2.6em, framexleftmargin=2.2em,
-  framesep=4pt, rulesep=2pt
+  framesep=4pt, rulesep=2pt,
+  extendedchars=true
 }
 \lstdefinestyle{pystyle}{
   language=Python,
@@ -140,11 +146,12 @@
   showstringspaces=false,
   tabsize=2,
   xleftmargin=2.6em, framexleftmargin=2.2em,
-  framesep=4pt, rulesep=2pt
+  framesep=4pt, rulesep=2pt,
+  extendedchars=true
 }
 \lstset{style=cppstyle}
 
-% ---------- Section / subsection typography ----------
+% ---------- 章节标题 ----------
 \titleformat{\section}
   {\normalfont\Large\bfseries\sffamily\color{tpblue!85!black}}
   {\thesection}{1.0em}{\rule[0.6ex]{2.4em}{0.6pt}}
@@ -158,10 +165,25 @@
 \titlespacing*{\subsection}{0pt}{2.4ex plus .8ex minus .2ex}{1.0ex plus .2ex}
 \titlespacing*{\subsubsection}{0pt}{2.0ex plus .6ex minus .2ex}{0.6ex plus .2ex}
 
-% ---------- Fancy header ----------
+% ctex 章节标题中文化微调（保持原有配色，仅替换名称）
+\ctexset{
+  section/name = {第,章},
+  subsection/name = {,},
+  subsubsection/name = {,},
+  contentsname = {目录},
+  listfigurename = {插图目录},
+  listtablename = {表格目录},
+  figurename = {图},
+  tablename = {表},
+  abstractname = {摘要},
+  bibname = {参考文献},
+  appendixname = {附录}
+}
+
+% ---------- 页眉页脚 ----------
 \pagestyle{fancy}
 \fancyhf{}
-\fancyhead[L]{\small\textsc{TensorPlay White Paper}}
+\fancyhead[L]{\small\textsc{TensorPlay 白皮书}}
 \fancyhead[R]{\small\textit{2026-09-02 --- v1.0.0rc0}}
 \fancyfoot[L]{\small\textit{\nouppercase\thesection}}
 \fancyfoot[C]{\thepage}
@@ -169,49 +191,49 @@
 \renewcommand{\headrulewidth}{0.4pt}
 \renewcommand{\footrulewidth}{0.2pt}
 
-% ---------- Title ----------
+% ---------- 封面 ----------
 \newcommand{\tpcover}{%
 \begingroup
 \thispagestyle{empty}%
 \noindent\hbox to 0pt{\hss
-% ---- Full-bleed dark canvas (CUDA-cover style) ----
+% ---- 全幅深色画布 ----
 \begin{tikzpicture}[remember picture, overlay, every node/.style={inner sep=0pt}]
-  % deep navy gradient canvas
+  % 深蓝渐变画布
   \shade[top color=covernavy!92!black, bottom color=covernavy!60!black]
     (current page.south west) rectangle (current page.north east);
-  % geometric accents: rising diagonal light rays
+  % 几何装饰：斜向光线
   \fill[tpblue, opacity=0.08] (current page.south west) -- ++(14,22) -- ++(0.001,0.001) -- ++(-14,-22.001) -- cycle;
   \fill[tpblue, opacity=0.06] (current page.south west) ++(2,0) -- ++(10,22) -- ++(0.001,0) -- ++(-10,-22) -- cycle;
   \fill[tporange, opacity=0.05] (current page.south east) -- ++(-8,16) -- ++(0.001,0) -- ++(8,-16) -- cycle;
-  % thin grid strip at the bottom (tensor mesh)
+  % 底部网格
   \foreach \i in {0,...,24} {
     \draw[tpblue!40, opacity=0.12] (\i*0.8, 0.0) -- (\i*0.8+2.5, 4.5);
   }
 \end{tikzpicture}%
-% ---- Content overlay ----
+% ---- 内容覆盖层 ----
 \begin{tikzpicture}[remember picture, overlay]
-  % top hairline + brand
+  % 顶部品牌
   \node[anchor=north west, text=white!85!covernavy, font=\small\sffamily\bfseries]
-    at ([yshift=-1.1cm]current page.north west) {\hspace{1.4cm}TENSORPLAY \;\textcolor{tporange}{\rule{0.9em}{0.28em}}\; WHITE PAPER};
+    at ([yshift=-1.1cm]current page.north west) {\hspace{1.4cm}TENSORPLAY \;\textcolor{tporange}{\rule{0.9em}{0.28em}}\; 白皮书};
 
-  % main title block
+  % 主标题区
   \node[anchor=west, text=white, font=\fontsize{40}{44}\selectfont\sffamily\bfseries]
     at ([xshift=1.35cm, yshift=2.2cm]current page.center) {TensorPlay};
   \node[anchor=west, text=tpblue!35!white, font=\Large\sffamily]
-    at ([xshift=1.37cm, yshift=1.35cm]current page.center) {A Readable Deep Learning Framework};
+    at ([xshift=1.37cm, yshift=1.35cm]current page.center) {可读的深度学习框架};
   \node[anchor=west, text=white!80!covernavy, font=\small\sffamily]
-    at ([xshift=1.37cm, yshift=0.72cm]current page.center) {Explicit Four-Pillar Architecture \textbullet\ 75\,k Lines of C++ \textbullet\ 13-Slot Dispatch};
+    at ([xshift=1.37cm, yshift=0.72cm]current page.center) {显式四支柱架构 \textbullet\ 约 7.5 万行 C++ \textbullet\ 13 槽分发};
 
-  % version chip
+  % 版本标签
   \node[anchor=west, draw=tporange, text=tporange!30!white, rounded corners=2pt,
         inner xsep=8pt, inner ysep=4pt, font=\small\sffamily\bfseries]
     at ([xshift=1.35cm, yshift=-0.15cm]current page.center) {v1.0.0rc0};
 
-  % ---- four-pillar diagram, bottom right of the title block ----
+  % ---- 四支柱示意 ----
   \begin{scope}[shift={([xshift=1.35cm, yshift=-4.6cm]current page.center)},
-                every node/.style={font=\footnotesize\sffamily}]
-    % pillars as vertical bars, heights encode layer size
-    \fill[tpblue,    rounded corners=1pt] (0,0)    rectangle (0.85,2.55) node[pos=0.5]{}; 
+                 every node/.style={font=\footnotesize\sffamily}]
+    % 支柱柱状图，高度编码层级大小
+    \fill[tpblue,    rounded corners=1pt] (0,0)    rectangle (0.85,2.55) node[pos=0.5]{};
     \fill[tporange,  rounded corners=1pt] (1.15,0) rectangle (2.00,1.85);
     \fill[tppurple,  rounded corners=1pt] (2.30,0) rectangle (3.15,1.45);
     \fill[tpgreen,   rounded corners=1pt] (3.45,0) rectangle (4.30,2.20);
@@ -220,16 +242,16 @@
     \node[anchor=north west, text=white] at (2.25,-0.12) {\textbf{stax}};
     \node[anchor=north west, text=white] at (3.40,-0.12) {\textbf{\_C}};
     \node[anchor=north west, text=white!75!covernavy, align=left, font=\scriptsize\sffamily]
-      at (5.0,2.35) {tensor core $\cdot$ 18k\\autograd $\cdot$ 6k\\compiler $\cdot$ 8k\\bindings $\cdot$ 7k};
-    % downward arrow spine
+      at (5.0,2.35) {张量核心 $\cdot$ 1.8万\\自动微分 $\cdot$ 6千\\编译器 $\cdot$ 8千\\绑定层 $\cdot$ 7千};
+    % 向下箭头
     \draw[-{Stealth[length=2mm]}, tporange!80!white, thick] (5.0,-0.05) -- ++(0.55,0)
-      node[midway, above, text=white!75!covernavy, font=\scriptsize\sffamily]{links down};
+      node[midway, above, text=white!75!covernavy, font=\scriptsize\sffamily]{向下链接};
   \end{scope}
 
-  % bottom band: authors + repo
+  % 底部信息栏：作者与仓库
   \draw[tporange, line width=1.2pt] ([yshift=1.55cm]current page.south west) -- ([yshift=1.55cm]current page.south east);
   \node[anchor=south west, text=white!85!covernavy, font=\small\sffamily]
-    at ([xshift=1.4cm, yshift=1.0cm]current page.south west) {TensorPlay Contributors};
+    at ([xshift=1.4cm, yshift=1.0cm]current page.south west) {TensorPlay 贡献者};
   \node[anchor=south east, text=white!60!covernavy, font=\small\sffamily]
     at ([xshift=-1.4cm, yshift=1.0cm]current page.south east) {github.com/lexing-2026/TensorPlay \textbullet\ 2026};
 \end{tikzpicture}%
@@ -237,7 +259,7 @@
 \endgroup
 }
 
-% ---------- Caption ----------
+% ---------- 图表标题 ----------
 \captionsetup{font=small, labelfont=bf, justification=raggedright, singlelinecheck=false, format=plain}
 
 % Auto-scale wide figures to text width
@@ -245,7 +267,7 @@
 \let\endoldtikzpicture\endtikzpicture
 \renewenvironment{tikzpicture}{\begin{adjustbox}{max width=\textwidth, center}\begin{oldtikzpicture}}{\end{oldtikzpicture}\end{adjustbox}}
 
-% ---------- Theorem-style boxes (Definition / Insight / Pitfall / Note / Example) ----------
+% ---------- 定理式盒子（定义 / 洞察 / 陷阱 / 提示 / 示例） ----------
 \newtcolorbox{tpdef}[1][]{
   enhanced, breakable,
   colback=tpblue!4, colframe=tpblue!70,
@@ -255,7 +277,7 @@
   arc=2pt, boxrule=0.6pt, leftrule=2.5pt,
   before skip=10pt, after skip=10pt
 }
-\newtcolorbox{tpinsight}[1][Insight]{
+\newtcolorbox{tpinsight}[1][洞察]{
   enhanced, breakable,
   colback=tporange!4, colframe=tporange!75,
   fonttitle=\bfseries\sffamily\small, coltitle=tporange!90!black,
@@ -264,7 +286,7 @@
   arc=2pt, boxrule=0.6pt, leftrule=2.5pt,
   before skip=10pt, after skip=10pt
 }
-\newtcolorbox{tppitfall}[1][Pitfall]{
+\newtcolorbox{tppitfall}[1][陷阱]{
   enhanced, breakable,
   colback=red!4, colframe=red!65,
   fonttitle=\bfseries\sffamily\small, coltitle=red!80!black,
@@ -273,7 +295,7 @@
   arc=2pt, boxrule=0.6pt, leftrule=2.5pt,
   before skip=10pt, after skip=10pt
 }
-\newtcolorbox{tpnote}[1][Note]{
+\newtcolorbox{tpnote}[1][注]{
   enhanced, breakable,
   colback=tpgreen!5, colframe=tpgreen!65,
   fonttitle=\bfseries\sffamily\small, coltitle=tpgreen!80!black,
@@ -282,7 +304,7 @@
   arc=2pt, boxrule=0.6pt, leftrule=2.5pt,
   before skip=10pt, after skip=10pt
 }
-\newtcolorbox{tpexample}[1][Example]{
+\newtcolorbox{tpexample}[1][示例]{
   enhanced, breakable,
   colback=tppurple!4, colframe=tppurple!70,
   fonttitle=\bfseries\sffamily\small, coltitle=tppurple!85!black,
@@ -292,7 +314,7 @@
   before skip=10pt, after skip=10pt
 }
 
-% ---------- TikZ styles ----------
+% ---------- TikZ 样式 ----------
 \tikzset{
   pillar/.style={draw, rounded corners=3pt, thick, minimum width=2.9cm, minimum height=2.1cm, align=center, font=\small\bfseries, drop shadow},
   libbox/.style={draw, rounded corners=2pt, thick, align=center, font=\footnotesize},
@@ -302,47 +324,32 @@
 \begin{document}
 \tpcover
 
-% ---------- Abstract ----------
+% ---------- 摘要 ----------
 \begin{abstract}
-\noindent TensorPlay is a \emph{readability-first} deep-learning framework that reconstructs, in approximately 75\,k lines of C++, the skeleton of mainstream frameworks while deliberately trimming production extensions. The core is split into four physically isolated dynamic libraries --- \textbf{p10} (tensor, storage, kernels, dispatch), \textbf{tpx} (autograd), \textbf{stax} (static IR), and a single Python extension \textbf{\_C} --- with a thin Python veneer \texttt{tensorplay}. Dependencies flow only downward (\texttt{p10 $\rightarrow$ tpx $\rightarrow$ stax $\rightarrow$ \_C}), enforced at link time.
+\setlength{\parindent}{2em}
+TensorPlay 是以清晰性与系统严谨性为核心构建的深度学习框架。框架确立由 \textbf{p10}（张量、存储与分发）、\textbf{tpx}（自动微分）、\textbf{stax}（编译中间表示）与原生扩展 \textbf{\_C} 构成的四支柱体系，实现层次分明、依赖单向、链接期强约束的清晰架构，在保持实现精炼的同时完整覆盖分发、自动微分、向量化与剖析等关键机制，为教学、研究与系统探索提供了可读、可复现的基座。
 
-This white paper departs from high-level overviews and documents \emph{concrete} mechanisms:
-the 13-slot \texttt{DispatchTable} and \texttt{Composite} fallback
-,
-the \texttt{TENSORPLAY\_LIBRARY\_IMPL} macro
-,
-the \texttt{TensorIterator} seven-step pipeline
-,
-the explicit DAG without a Tape
-,
-the \texttt{ReadyQueue} priority by \texttt{sequence\_nr}
-,
-the \texttt{SavedVariable} version guard
-,
-the \texttt{Vmap} key at offset~9
-,
-and the profiler's \texttt{OpRecord}~/~\texttt{GpuTimerPair}~/~\texttt{Cupti}~/~\texttt{Nvtx} stack
-.
+本文系统呈现其关键具体机制：13 槽位 \texttt{DispatchTable} 与 \texttt{Composite} 回退、\texttt{TENSORPLAY\_LIBRARY\_IMPL} 静态注册、\texttt{TensorIterator} 七步流水线、显式有向无环图（无 Tape）、基于 \texttt{sequence\_nr} 的 \texttt{ReadyQueue} 调度、\texttt{SavedVariable} 版本守卫、偏移 9 的 \texttt{Vmap} 键，以及 \texttt{OpRecord}/\texttt{GpuTimerPair}/\texttt{Cupti}/\texttt{Nvtx} 构成的多维剖析技术栈。
 
 \medskip
-\noindent\textbf{Keywords:} deep learning framework, dispatch, autograd, vmap, redispatch, profiler, code generation, TensorIterator
+\noindent\textbf{关键词：}深度学习框架、分发、自动微分、向量化映射、重分发、剖析器、代码生成、张量迭代器
 \end{abstract}
 
-% ---------- Table of contents / lists ----------
-\renewcommand{\contentsname}{\sffamily\color{tpblue!85!black}Contents}
-\renewcommand{\listfigurename}{\sffamily\color{tpblue!85!black}List of Figures}
-\renewcommand{\listtablename}{\sffamily\color{tpblue!85!black}List of Tables}
+% ---------- 目录 ----------
+\renewcommand{\contentsname}{\sffamily\color{tpblue!85!black}目录}
+\renewcommand{\listfigurename}{\sffamily\color{tpblue!85!black}插图目录}
+\renewcommand{\listtablename}{\sffamily\color{tpblue!85!black}表格目录}
 \tableofcontents
 \listoffigures
 \listoftables
 \clearpage
 
-% Acronyms (printed here; the main glossary is printed after the sections)
-\printglossary[type=acronym, title={Acronyms \& Abbreviations}, toctitle={Acronyms \& Abbreviations}]
+% 缩写表
+\printglossary[type=acronym, title={缩写与简称}, toctitle={缩写与简称}]
 \clearpage
 
 %======================================================================
-% Sections
+% 章节
 \input{sections/01-introduction}
 \input{sections/02-architecture}
 \input{sections/03-redispatch}
@@ -354,24 +361,23 @@ and the profiler's \texttt{OpRecord}~/~\texttt{GpuTimerPair}~/~\texttt{Cupti}~/~
 \input{sections/08-codegen}
 \input{sections/09-evaluation}
 
-% ---------- Glossary ----------
-\printglossary[title={Glossary}, toctitle={Glossary}]
+% ---------- 术语表 ----------
+\printglossary[title={术语表}, toctitle={术语表}]
 
-% ---------- Bibliography ----------
+% ---------- 参考文献 ----------
 \begin{thebibliography}{9}
-\bibitem{tp2026} TensorPlay Contributors, \emph{TensorPlay Source Tree}, v1.0.0rc0, 2026. \texttt{https://github.com/lexing-2026/TensorPlay}.
+\bibitem{tp2026} TensorPlay 贡献者, \emph{TensorPlay 源码树}, v1.0.0rc0, 2026. \texttt{https://github.com/lexing-2026/TensorPlay}.
 \bibitem{adis} A.~Griewank and A.~Walther, \emph{Evaluating Derivatives: Principles and Techniques of AD}, SIAM, 2nd ed., 2008.
-\bibitem{cupti2024} NVIDIA, \emph{CUPTI Documentation}, CUDA 12.x, 2024.
-\bibitem{pybind11} W.~Jakob et~al., \emph{pybind11 Documentation}, 2024.
-\bibitem{tc2024} T.~Chen et~al., \emph{Tensor Comprehensions: Framework-Agnostic High-Performance Machine Learning Abstractions}, \emph{ArXiv:1802.04730}, 2018.
-\bibitem{cuda2024} NVIDIA, \emph{CUDA C++ Programming Guide}, CUDA 12.x, 2024.
-\bibitem{llvm2024} C.~Lattner et~al., \emph{MLIR: Scaling Compiler Infrastructure for Domain-Specific Computation}, \emph{CGO}, 2021.
-\bibitem{ad2018} A.~Paszke et~al., \emph{Automatic Differentiation in PyTorch}, \emph{NeurIPS Autodiff Workshop}, 2017.
+\bibitem{cupti2024} NVIDIA, \emph{CUPTI 文档}, CUDA 12.x, 2024.
+\bibitem{pybind11} W.~Jakob 等, \emph{pybind11 文档}, 2024.
+\bibitem{tc2024} T.~Chen 等, \emph{Tensor Comprehensions: Framework-Agnostic High-Performance Machine Learning Abstractions}, \emph{ArXiv:1802.04730}, 2018.
+\bibitem{cuda2024} NVIDIA, \emph{CUDA C++ 编程指南}, CUDA 12.x, 2024.
+\bibitem{llvm2024} C.~Lattner 等, \emph{MLIR: Scaling Compiler Infrastructure for Domain-Specific Computation}, \emph{CGO}, 2021.
 \bibitem{xla2024} T.~Authors, \emph{XLA: Optimizing Compiler for Machine Learning}, \texttt{tensorflow/compiler/xla}, 2024.
-\bibitem{autocast} NVIDIA, \emph{Automatic Mixed Precision for NVIDIA TensorCore GPUs}, \texttt{developer.nvidia.com/autocast}, 2024.
+\bibitem{autocast} NVIDIA, \emph{面向 NVIDIA TensorCore GPU 的自动混合精度}, \texttt{developer.nvidia.com/autocast}, 2024.
 \end{thebibliography}
 
-% ---------- Appendix ----------
+% ---------- 附录 ----------
 \appendix
 \input{sections/10-appendix}
 

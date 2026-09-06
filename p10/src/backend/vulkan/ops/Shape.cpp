@@ -28,22 +28,7 @@ namespace {
 Tensor repack_with_sizes(
     const Tensor& self,
     const std::vector<int64_t>& new_sizes) {
-  api::Context* const context = api::context();
-  api::vTensor v_src = convert(self);
-
-  api::vTensor v_dst{context, new_sizes, self.dtype()};
-
-  // The staging buffer is addressed in the packed texture layout, so its
-  // size follows the GPU element count (channels padded to lanes) rather
-  // than the logical count.
-  api::StorageBuffer staging(
-      context, v_src.texture_dtype(),
-      std::max(v_src.gpu_numel(), v_dst.gpu_numel()));
-
-  utils::pack_vtensor_to_staging(v_src, staging.buffer(), VK_NULL_HANDLE);
-  utils::pack_staging_to_vtensor(staging.buffer(), v_dst);
-
-  return convert(v_dst);
+  return reshape_kernel(self, new_sizes);
 }
 
 
@@ -263,8 +248,8 @@ Tensor slice_kernel(
     std::optional<int64_t> end,
     int64_t step) {
   TP_CHECK(
-      self.dtype() == DType::Float32,
-      "Vulkan slice supports Float32 tensors only");
+      self.dtype() == DType::Float32 || self.dtype() == DType::Int32,
+      "Vulkan slice supports Float32 and Int32 tensors only");
   TP_CHECK(
       self.dim() >= 1 && self.dim() <= 4,
       "Vulkan slice supports 1d to 4d tensors");
@@ -320,8 +305,11 @@ Tensor slice_kernel(
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier pipeline_barrier{};
 
+  const api::ShaderInfo shader = self.dtype() == DType::Int32
+      ? VK_KERNEL(slice_int32)
+      : VK_KERNEL(slice);
   context->submit_compute_job(
-      VK_KERNEL(slice), pipeline_barrier, v_output.extents(),
+      shader, pipeline_barrier, v_output.extents(),
       adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
       v_output.image(
           pipeline_barrier,

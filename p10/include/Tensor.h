@@ -187,6 +187,12 @@ public:
     Tensor _crow_indices() const;
     Tensor _col_indices() const;
     bool is_sparse_csr() const;
+    bool is_sparse_csc() const;
+    bool is_sparse_bsr() const;
+    bool is_sparse_bsc() const;
+    bool is_sparse_compressed() const;
+    // {row_block, col_block} for BSR/BSC; {0, 0} otherwise.
+    std::array<int64_t, 2> sparse_blocksize() const;
     Tensor coalesce() const;
     Tensor sparse_mask(const Tensor& mask) const;
 
@@ -204,6 +210,16 @@ public:
                                          const Tensor& col,
                                          const Tensor& values,
                                          const std::vector<int64_t>& size);
+    // Generic compressed-layout constructor (CSR/CSC/BSR/BSC).  `crow` holds
+    // the compressed-axis pointers, `col` the plain-axis coordinates; for the
+    // blocked layouts `values` carries a trailing pair of block dimensions
+    // and `blocksize` records their sizes.
+    static Tensor make_sparse_compressed_tensor(const Tensor& crow,
+                                                const Tensor& col,
+                                                const Tensor& values,
+                                                const std::vector<int64_t>& size,
+                                                int layout,
+                                                std::array<int64_t, 2> blocksize);
     
     // Autograd methods (delegated to the AutogradMeta extension point on
     // TensorImpl; the concrete implementation lives in the tpx library).

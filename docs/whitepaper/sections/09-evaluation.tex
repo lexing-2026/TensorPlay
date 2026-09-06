@@ -1,107 +1,107 @@
 % 09-evaluation.tex
-\section{Evaluation: Readability, Correctness, and Overhead}
+\section{评估：可读性、正确性与开销}
 \label{sec:eval}
 
-This chapter evaluates TensorPlay on three axes that a readable framework must earn: how small the core is to read, how precisely it guards correctness when the training loop mutates tensors, and how little it costs when every guard and profiler probe is disabled. It also adds four evidence blocks that complete the architecture story: the populated CUDA/Vulkan backend slots (\S\ref{subsec:eval-backends}), the support cores that sit below the kernels (\S\ref{subsec:eval-supportcores}), the three-track test suite (\S\ref{subsec:eval-tests}), and measured benchmark numbers (\S\ref{subsec:eval-bench}).
+评估从可读框架必须获得的三个轴上进行：读取的核心有多小，当训练循环改变张量时它如何精确地保护正确性，以及当每个保护和分析器探针被禁用时它的成本有多少。此外还有四个证据块来完成架构故事：填充的 CUDA/Vulkan 后端插槽 (\S\ref{subsec:eval-backends})、位于内核下方的支持核心 (\S\ref{subsec:eval-supportcores})、三轨测试套件 (\S\ref{subsec:eval-tests}) 和测量的基准数据 (\S\ref{subsec:eval-bench})。
 
 %======================================================================
-\subsection{Readability (Lines of Core)}
+\subsection{可读性（核心线）}
 \label{subsec:eval-readability}
 
-Table~\ref{tab:evalsize} quantifies the ``bone vs.\ flesh'' claim of \S\ref{sec:arch}: the architectural skeleton---object model, dispatcher layering, \texttt{TensorIterator}, autograd \texttt{GraphTask} engine---is retained line-for-line, while production axes (op coverage, dispatch depth, dtype$\times$op completeness, sparse/quantized) are trimmed.
+表~\ref{tab:evalsize} 量化了 \S\ref{sec:arch} 的“骨与肉”主张：架构骨架——对象模型、调度程序分层、\texttt{TensorIterator}、autograd \texttt{GraphTask} 引擎——逐行保留，而生产轴（操作覆盖范围、调度深度、dtype$\times$操作完整性、稀疏/量化）被修剪。
 
 \begin{table}[H]
 \centering
-\caption{Core size. TensorPlay intentionally trims production axes. ``Core'' is the four C++ pillars plus bindings; generated code and tests are excluded.}
+\caption{核心尺寸。 TensorPlay 有意修剪生产轴。 “核心”是四个 C++ 支柱加上绑定；生成的代码和测试被排除在外。}
 \label{tab:evalsize}
 \small
 \begin{tabular}{lrr}
 \toprule
-Metric & TensorPlay & Broader implementation \\
+公制 & 张量播放 & 更广泛的实施 \\
 \midrule
-C++ core & $\approx$ 75\,k & hundreds of k (core runtime $>$ 300\,k) \\
-Python surface & 267\,k / 899 files (see Table~\ref{tab:pybreakdown}) & larger package surface \\
-Operators (unique \texttt{m.impl}) & 642--673 & 2000+ \\
-\texttt{DispatchKey} cardinality & 13 & 60+ \\
-Autograd nodes (generated) & 148 & thousands \\
-Build artifacts & 4 libs: \texttt{libp10}, \texttt{libtpx}, \texttt{libstax}, \texttt{\_C} & dozens \\
+C++核心 & $\approx$ 75\,k & 数百 k（核心运行时 $>$ 300\,k） \\
+Python表面 & 267\,k / 899 个文件（见表~\ref{tab:pybreakdown}） & 更大的封装表面 \\
+运算符（唯一的 \texttt{m.impl}） & 642--673 & 2000+ \\
+\texttt{DispatchKey} 基数 & 13 & 60+ \\
+Autograd 节点（生成） & 148 & 数千 \\
+构建工件 & 4 个库：\texttt{libp10}、\texttt{libtpx}、\texttt{libstax}、\texttt{\_C} & 几十个 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \begin{table}[H]
 \centering
-\caption{Where the 75\,k C++ lines live. Generated files are excluded.}
+\caption{75\,k C++ 行所在的地方。生成的文件被排除。}
 \label{tab:corebreakdown}
 \small
 \begin{tabular}{llr}
 \toprule
-Component & Representative content & Approx.\ lines \\
+成分 & 代表内容 & 大约\ 行 \\
 \midrule
-\texttt{p10} object model & \texttt{Tensor}, \texttt{TensorImpl}, \texttt{Storage}, version counter & $\sim$18\,k \\
-\texttt{p10} dispatcher & 13-slot table, key set, registration macro & $\sim$1.5\,k \\
-\texttt{p10} kernels & CPU backends ($\ast$.cpp) with CUDA counterparts ($\ast$.cu) & $\sim$35\,k \\
-\texttt{tpx} autograd engine & \texttt{Node}, \texttt{Edge}, \texttt{GraphTask}, \texttt{ReadyQueue}, \texttt{Engine} & $\sim$6\,k \\
-\texttt{stax} + compiler & graph IR, fusion, interpreter & $\sim$8\,k \\
-Bindings & CPython bridge, per-domain units & $\sim$7\,k \\
+\texttt{p10} 对象模型 & \texttt{Tensor}、\texttt{TensorImpl}、\texttt{Storage}、版本计数器 & $\sim$18\,k \\
+\texttt{p10} 调度员 & 13槽工作台、按键组、注册宏 & $\sim$1.5\,k \\
+\texttt{p10} 内核 & CPU 后端 ($\ast$.cpp) 与 CUDA 对应项 ($\ast$.cu) & $\sim$35\,k \\
+\texttt{tpx} autograd 引擎 & \texttt{Node}, \texttt{Edge}, \texttt{GraphTask}, \texttt{ReadyQueue}, \texttt{Engine} & $\sim$6\,k \\
+\texttt{stax} + 编译器 & 图 IR、融合、解释器 & $\sim$8\,k \\
+绑定 & CPython 桥接器，每个域单元 & $\sim$7\,k \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The size gap is not a virtue in itself; it is the budget that buys readability. Every indirection that remains is load-bearing and has a single definition site.
+体型差距本身并不是一种美德，而是一种美德。是预算购买了可读性。剩下的每个间接都是承载的并且有一个定义站点。
 
 %======================================================================
-\subsection{Where the Python Lines Live}
+\subsection{Python 线路所在的地方}
 \label{subsec:eval-pybreakdown}
 
-Table~\ref{tab:evalsize} cites a single Python number, which invites the question ``what is inside it?''. Table~\ref{tab:pybreakdown} decomposes the 267\,k lines so the ``thin veneer'' claim can be inspected subsystem by subsystem.
+Table~\ref{tab:evalsize} 引用了一个 Python 数字，这引发了一个问题“里面有什么？”。 Table~\ref{tab:pybreakdown} 分解了 267\,k 行，因此可以逐个子系统检查“薄饰面”声明。
 
 \begin{table}[H]
 \centering
-\caption{Python surface decomposition. ``Model zoos'' are pretrained-weight wrappers for third-party checkpoints; they exercise the \texttt{\_C} surface but add no framework mechanism.}
+\caption{Python表面分解。 “模型动物园”是第三方检查点的预训练权重包装器；他们行使 \texttt{\_C} 表面，但不添加框架机制。}
 \label{tab:pybreakdown}
 \small
 \begin{tabular}{llrr}
 \toprule
-Subpackage & What lives there & Files & Lines \\
+分包 & 那里住着什么 & 文件 & 线路 \\
 \midrule
-\texttt{distributed/} & c10d-style collectives, fsdp, DTensor, elastic, rpc & 367 & 62{,}770 \\
-\texttt{vision/} + \texttt{audio/} & datasets, transforms, model zoos & 148 & 51{,}039 \\
-\texttt{graph/} & FX-style symbolic tracer, Node/Graph, symbolic shapes & 113 & 27{,}991 \\
-\texttt{nn/} & modules, functional, init & 42 & 22{,}832 \\
-\texttt{\_stax/} & shape prop, DCE, const fold, interpreter & 20 & 11{,}528 \\
-\texttt{optim/} & 15 optimizers, foreach/fused paths & 24 & 11{,}365 \\
-\texttt{export/} + \texttt{onnx/} & draft-export, effect-token passes & 34 & 9{,}216 \\
-\texttt{autograd/} + \texttt{\_transforms/} & Function, grad-mode, vmap wrappers & 24 & 8{,}072 \\
-Other 17 subpackages & cuda, profiler, amp, sparse, quantization, \dots & 134 & 35{,}884 \\
-Root modules & \texttt{\_tensor.py}, \texttt{library.py} (1\,779), \texttt{overrides.py} & 23 & 37{,}805 \\
+\texttt{distributed/} & 进程组集体、fsdp、DTensor、elastic、rpc & 367 & 62{,}770 \\
+\texttt{vision/} + \texttt{audio/} & 数据集、转换、模型动物园 & 148 & 51{,}039 \\
+\texttt{graph/} & 符号示踪器、节点/图表、符号形状 & 113 & 27{,}991 \\
+\texttt{nn/} & 模块、功能、初始化 & 42 & 22{,}832 \\
+\texttt{\_stax/} & shape 属性、DCE、const 折叠、解释器 & 20 & 11{,}528 \\
+\texttt{optim/} & 15 个优化器，foreach/fused 路径 & 24 & 11{,}365 \\
+\texttt{export/} + \texttt{onnx/} & 草稿导出、效果令牌通行证 & 34 & 9{,}216 \\
+\texttt{autograd/} + \texttt{\_transforms/} & 函数、grad-mode、vmap 包装器 & 24 & 8{,}072 \\
+其他17个子包 & cuda、分析器、放大器、稀疏、量化、\dots & 134 & 35{,}884 \\
+根模块 & \texttt{\_tensor.py}, \texttt{library.py} (1\,779), \texttt{overrides.py} & 23 & 37{,}805 \\
 \midrule
-Total & & 899 & 266{,}907 \\
+全部的 &  & 899 & 266{,}907 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Two observations follow. First, the framework-mechanism content---\texttt{nn}, \texttt{optim}, \texttt{\_stax}, \texttt{autograd}, root modules---is $\sim$91\,k lines (34\%), in line with the ``thin veneer'' claim of \S\ref{sec:arch}: the tensor type and the library-impl registration surface are the only large hand-written integration points. Second, the single largest block is \texttt{distributed/} (63\,k, 24\%); its FSDP subtree alone is 9.5\,k lines. The model zoos (\texttt{vision/} + \texttt{audio/}, 51\,k) are dataset/checkpoint plumbing that could be deleted without touching dispatch or autograd; they exist so the end-to-end benchmarks of \S\ref{subsec:eval-bench} have realistic workloads. None of the 899 files registers a kernel or a dispatch key; everything funnels back into \texttt{\_C}.
+以下是两个观察结果。首先，框架机制内容——\texttt{nn}、\texttt{optim}、\texttt{\_stax}、\texttt{autograd}、根模块——是$\sim$91\,k行（34\%），符合\S\ref{sec:arch}的“薄饰面”主张：张量类型和library-impl注册面是唯一的大手写集成点。其次，单个最大块是\texttt{distributed/}(63\,k, 24\%)；仅其 FSDP 子树就有 9.5\,k 行。模型动物园 (\texttt{vision/} + \texttt{audio/}, 51\,k) 是数据集/检查点管道，可以在不涉及调度或自动微分的情况下删除；它们的存在使得 \S\ref{subsec:eval-bench} 的端到端基准测试具有实际的工作负载。 899 个文件都没有注册内核或调度密钥；一切都回到\texttt{\_C}。
 
 %======================================================================
-\subsection{GPU Backends: CUDA and Vulkan Slots}
+\subsection{GPU 后端：CUDA 和 Vulkan 插槽}
 \label{subsec:eval-backends}
 
-\S\ref{sec:redispatch} declares 13 keys with \texttt{CUDA}=1 and \texttt{Vulkan}=2 as dense-backend slots, and \S\ref{subsec:eval-microbench} cites their dispatch cost. This subsection shows that the slots are populated: backends exist, not just keys.
+\S\ref{sec:redispatch} 将 \texttt{CUDA}=1 和 \texttt{Vulkan}=2 的 13 个键声明为密集后端槽，并且 \S\ref{subsec:eval-microbench} 引用了它们的调度成本。本小节显示插槽已填充：后端存在，而不仅仅是键。
 
 \begin{table}[H]
 \centering
-\caption{Backend inventory. ``Registrations'' counts \texttt{TENSORPLAY\_LIBRARY\_IMPL} macro expansions; ``unique ops'' deduplicates \texttt{m.impl} names per backend subtree.}
+\caption{后端库存。 “注册”计数 \texttt{TENSORPLAY\_LIBRARY\_IMPL} 宏扩展； “unique ops”对每个后端子树的 \texttt{m.impl} 名称进行重复删除。}
 \label{tab:backends}
 \small
 \begin{tabular}{lrrrr}
 \toprule
-Backend & Files & Lines & Registrations & Unique ops \\
+后端 & 文件 & 线路 & 注册 & 独特的行动 \\
 \midrule
 CPU & 69 & 61{,}108 & 66 & 1{,}325 \\
 CUDA & 86 & 56{,}949 & 66 & 1{,}274 \\
-Vulkan & 93 & 16{,}289 + 4{,}500 GLSL & 26 & 145 \\
-Composite & 34 & 8{,}533 & 34 & --- \\
+伏尔甘 & 93 & 16{,}289 + 4{,}500 GLSL & 26 & 145 \\
+合成的 & 34 & 8{,}533 & 34 & --- \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -127,15 +127,15 @@ Composite & 34 & 8{,}533 & 34 & --- \\
 \draw[->,gray] (-0.15,0) -- (2.35,0);
 \node[anchor=west,gray] at (2.45,3.7) {unique ops};
 \end{tikzpicture}
-\caption{Unique op names per backend (Table~\ref{tab:backends}). The CUDA column is 96\% of the CPU column; Vulkan is the deliberately small teaching backend.}
+\caption{每个后端的唯一操作名称（表~\ref{tab:backends}）。 CUDA列是CPU列的96\%； Vulkan 是特意设计的小型教学后端。}
 \label{fig:backendops}
 \end{figure}
 
-\subsubsection{CUDA backend (56.9\,k lines, 1{,}274 ops)}
+\subsubsection{CUDA 后端（56.9\,k 行，1{,}274 次操作）}
 
-The CUDA backend keeps a one-file-per-family layout parallel to the CPU tree where kernels are separable: arithmetic, pointwise (2{,}154 lines), reduction, convolution (2{,}477), indexing (3{,}362), plus CUDA-only infrastructure: a stream-aware caching allocator (1{,}288 lines), stream/device bookkeeping, a cuBLAS handle pool, NCCL communicator cache (418 lines), a Philox-based generator, and CUDA-graph capture. Every kernel file ends with one registration block, e.g.\ \texttt{TENSORPLAY\_LIBRARY\_IMPL(CUDA, PointwiseKernels)}, so each translation unit is independently iterable.
+CUDA 后端保持与 CPU 树并行的每个文件一个文件的布局，其中内核可分离：算术、逐点（2{,}154 行）、缩减、卷积（2{,}477）、索引（3{,}362），以及仅限 CUDA 的基础设施：流感知缓存分配器（1{,}288 行）、流/设备簿记、cuBLAS 句柄池、NCCL通信器缓存（418 行）、基于 Philox 的生成器和 CUDA 图形捕获。每个内核文件都以一个注册块结尾，例如\ \texttt{TENSORPLAY\_LIBRARY\_IMPL(CUDA, PointwiseKernels)}，因此每个翻译单元都是独立可迭代的。
 
-\paragraph{Tiered reduction engine.} Reductions (sum, mean, min/max, Welford variance) share one code-generation template with a three-tier combine strategy: intra-warp via \texttt{\_\_shfl\_down\_sync} (no shared memory), inter-warp via shared memory within the block, and a global second-pass kernel when the tensor spans many blocks. A traits type selects the accumulation dtype per input dtype---\texttt{float} accumulation for \texttt{Half}/\texttt{BFloat16} inputs keeps precision---and per-operation functors (\texttt{SumOps}, \texttt{MeanOps}, \texttt{MinMaxOps}, \texttt{WelfordOps}) plug into the same launcher.
+\paragraph{分级减速引擎。} Reductions (sum, mean, min/max, Welford variance) share one code-generation template with a three-tier combine strategy: intra-warp via \texttt{\_\_shfl\_down\_sync} (no shared memory), inter-warp via shared memory within the block, and a global second-pass kernel when the tensor spans many blocks. A traits type selects the accumulation dtype per input dtype---\texttt{float} accumulation for \texttt{Half}/\texttt{BFloat16} inputs keeps precision---and per-operation functors (\texttt{SumOps}, \texttt{MeanOps}, \texttt{MinMaxOps}, \texttt{WelfordOps}) plug into the same launcher.
 
 \begin{lstlisting}[caption={The intra-warp tier of the shared reduction template; complex numbers shuffle their two lanes because the shuffle intrinsic has no complex overload.}, label=lst:cudareduce]
 __device__ inline float shfl_down(float value, uint32_t mask, int offset) {
@@ -151,11 +151,11 @@ __device__ inline complex_t shfl_down(complex_t value,
 }
 \end{lstlisting}
 
-\paragraph{Multi-tensor apply for optimizers.} Optimizer steps act on hundreds of parameter tensors of the same dtype. The \emph{foreach} path chunks work from the whole tensor list into one grid-stride kernel (\texttt{foreach\_mta::launch}), so an Adam step updates weights, moments, and buffers in a handful of grouped launches instead of hundreds of individual ones. Eligibility is structural---same device, same dtype---and ineligible groups fall back to per-tensor launches. The CPU benchmark of \S\ref{subsec:eval-bench} (optimizer geomean 3.83$\times$) is largely attributable to this path plus fused one-kernel steps.
+\paragraph{多张量适用于优化器。} Optimizer steps act on hundreds of parameter tensors of the same dtype. The \emph{foreach} path chunks work from the whole tensor list into one grid-stride kernel (\texttt{foreach\_mta::launch}), so an Adam step updates weights, moments, and buffers in a handful of grouped launches instead of hundreds of individual ones. Eligibility is structural---same device, same dtype---and ineligible groups fall back to per-tensor launches. The CPU benchmark of \S\ref{subsec:eval-bench} (optimizer geomean 3.83$\times$) is largely attributable to this path plus fused one-kernel steps.
 
-\paragraph{cuSOLVER decompositions.} Beyond GEMM (cuBLAS, column-major staging via \texttt{clone\_batched\_column\_major}), the backend wraps cuSOLVER for SVD, Cholesky, and LU with device-side info pointers so positive-definiteness failures surface as exceptions rather than silent garbage.
+\paragraph{cuSOLVER 分解。} Beyond GEMM (cuBLAS, column-major staging via \texttt{clone\_batched\_column\_major}), the backend wraps cuSOLVER for SVD, Cholesky, and LU with device-side info pointers so positive-definiteness failures surface as exceptions rather than silent garbage.
 
-CUDA-graph capture shows the backend's care for ordering. Capture must begin on a non-default stream, one capture per thread, and pool routing must be armed \emph{before} the driver begins recording:
+CUDA 图捕获显示了后端对排序的关心。捕获必须从非默认流开始，每个线程一次捕获，并且池路由必须配备 \emph{before} 驱动程序开始记录：
 
 \begin{lstlisting}[caption={CUDA-graph capture entry: nesting and reuse are rejected loudly, and the side stream is chosen before any driver call.}, label=lst:cudagraph]
 void CUDAGraph::capture_begin(uint64_t pool_id, CaptureMode mode,
@@ -180,7 +180,7 @@ void CUDAGraph::capture_begin(uint64_t pool_id, CaptureMode mode,
         /* ... arm memory-pool routing, then cudaStreamBeginCapture ... */
 \end{lstlisting}
 
-The RNG half of the story is capture-awareness. Kernels draw randoms from a Philox counter, and during graph capture the counter cannot be baked into the kernel launch---each replay must see a fresh slice of the random stream. The generator therefore exposes two regimes:
+RNG 故事的一半是捕获意识。内核从 Philox 计数器中抽取随机数，并且在图形捕获期间，计数器无法烘焙到内核启动中 - 每次重播都必须看到随机流的新切片。因此，生成器暴露了两种状态：
 
 \begin{lstlisting}[caption={Philox counter reservation, in two regimes: eager launches get plain (seed, offset); captured kernels read them from device buffers that a replay prologue refreshes.}, label=lst:philox]
 // Atomically reserves `increment` philox counter values for the current
@@ -210,25 +210,25 @@ P10_API PhiloxCudaState philox_cuda_state(uint64_t increment);
 \draw[arrow, color=tporange] (init) -- (loop);
 \draw[arrow, color=tpgreen] (loop) -- (dist);
 \end{tikzpicture}
-\caption{The random-sampling path: each launch unpacks the capture-aware counter state, seeds \texttt{curand}, and draws vectorized samples inside one grid-stride kernel.}
+\caption{随机采样路径：每次启动都会解压捕获感知计数器状态、种子 \texttt{curand}，并在一个网格跨度内核内绘制矢量化样本。}
 \label{fig:philoxflow}
 \end{figure}
 
 
 
-\subsubsection{Vulkan backend (16.3\,k C++ + 4.5\,k GLSL, 145 ops)}
+\subsubsection{Vulkan 后端（16.3\,k C++ + 4.5\,k GLSL，145 个操作）}
 
-Vulkan is the smallest complete backend, which is exactly its teaching value: it demonstrates that slot 2 of the three backend keys accepts a new device family with \emph{no dispatcher change}. The layout is three layers:
+Vulkan 是最小的完整后端，这正是它的教学价值：它演示了三个后端密钥中的插槽 2 接受具有 \emph{no dispatcher change} 的新设备系列。布局分为三层：
 
 \begin{itemize}[leftmargin=1.2em]
-\item An \texttt{api} layer (29 files): a thin object model over raw handles---\texttt{Adapter} (device selection), \texttt{Context}, \texttt{Resource} (buffer/image with VMA), \texttt{Pipeline}, \texttt{Command}, \texttt{QueryPool}, \texttt{vTensor} (the backend's tensor view).
-\item An \texttt{ops} layer (34 files): 145 \texttt{m.impl} registrations, one closing \texttt{TENSORPLAY\_LIBRARY\_IMPL(Vulkan,...)} block per file (26 blocks total). Kernels fetch shaders by name through a registry lookup \texttt{VK\_KERNEL(name)}.
-\item A \texttt{glsl} layer (70 template files): compute shaders with a mini preprocessor---\texttt{\$\{PARAM\}} substitution and \texttt{\$if}/\texttt{\$elif}/\texttt{\$else} blocks---driven by 63 variant-table entries.
+\item \texttt{api} 层（29 个文件）：原始句柄上的精简对象模型---\texttt{Adapter}（设备选择）、\texttt{Context}、\texttt{Resource}（具有 VMA 的缓冲区/图像）、\texttt{Pipeline}、\texttt{Command}、\texttt{QueryPool}、\texttt{vTensor}（后端的张量视图）。
+\item 一个 \texttt{ops} 层（34 个文件）：145 个 \texttt{m.impl} 注册，每个文件一个结束 \texttt{TENSORPLAY\_LIBRARY\_IMPL(Vulkan,...)} 块（总共 26 个块）。内核通过注册表查找 \texttt{VK\_KERNEL(name)} 按名称获取着色器。
+\item \texttt{glsl} 层（70 个模板文件）：使用迷你预处理器（\texttt{\->if}/\texttt{\->else} 块）计算着色器，由 63 个变量表条目驱动。
 \end{itemize}
 
-The build pipeline is fully generated: a 418-line Python stage preprocesses each template, invokes \texttt{glslangValidator} for Vulkan 1.0 SPIR-V, parses the descriptor-set bindings, and emits an embedded C++ registry; the build rule wires the dependency so editing any shader or variant table re-embeds all 220 compiled \texttt{.spv} variants. The quantized family is a first-class citizen here (quantized convolution, per-tensor dequantize, \dots), which is why Vulkan ships quantized kernels while CPU keeps quantization the Python FakeQuantize layer (\S\ref{subsec:eval-trimmed}).
+构建管道已完全生成：418 行 Python 阶段预处理每个模板，为 Vulkan 1.0 SPIR-V 调用 \texttt{glslangValidator}，解析描述符集绑定，并发出嵌入式 C++ 注册表；构建规则连接依赖项，因此编辑任何着色器或变体表都会重新嵌入所有 220 个已编译的 \texttt{.spv} 变体。量化系列在这里是一等公民（量化卷积、每张量反量化、\dots），这就是为什么 Vulkan 提供量化内核，而 CPU 保持 Python FakeQuantize 层（\S\ref{subsec:eval-trimmed}）的量化。
 
-The matmul kernel shows the whole layering in one body---validate, allocate a device tensor, pack layouts, bind uniforms, submit:
+matmul 内核将整个分层展示在一个主体中——验证、分配设备张量、打包布局、绑定制服、提交：
 
 \begin{lstlisting}[caption={Vulkan matmul kernel body: the three-layer pattern (validate $\rightarrow$ \texttt{vTensor} + packing $\rightarrow$ uniform block $\rightarrow$ submit).}, label=lst:vulkanmm]
 Tensor mm_kernel(const Tensor& self, const Tensor& mat2) {
@@ -249,16 +249,16 @@ Tensor mm_kernel(const Tensor& self, const Tensor& mat2) {
 \end{lstlisting}
 
 %======================================================================
-\subsection{AMD Portability: the Hipify Build Path}
+\subsection{AMD 可移植性：Hipify 构建路径}
 \label{subsec:eval-rocm}
 
-Beyond the three first-class backends, TensorPlay runs on AMD GPUs through an automated translation of its CUDA sources rather than a maintained fork. At configuration time a build script stages every CUDA source and binding into a separate tree and applies regular-expression rewrites---\texttt{cudaMalloc} becomes \texttt{hipMalloc}, kernel launches become \texttt{hipLaunchKernelGGL}---after which the staged tree compiles with the HIP toolchain. Two build options enforce mutual exclusion between the CUDA and ROCm paths because both register the same device and dispatch slots; the dispatcher then routes to the translated kernels transparently. The design lesson: when a backend differs only in vocabulary, translate the vocabulary at build time and keep one semantic source, rather than growing a hand-maintained sibling tree that drifts.
+除了三个一流的后端之外，TensorPlay 还通过其 CUDA 源的自动转换而不是维护的分支在 AMD GPU 上运行。在配置时，构建脚本将每个 CUDA 源和绑定到单独的树中，并应用正则表达式重写 ---\texttt{cudaMalloc} 变为 \texttt{hipMalloc}，内核启动变为 \texttt{hipLaunchKernelGGL} --- 之后，使用 HIP 工具链编译分阶段树。两个构建选项强制 CUDA 和 ROCm 路径之间的互斥，因为两者都注册相同的设备和调度槽；然后调度程序透明地路由到翻译后的内核。设计教训：当后端仅在词汇方面有所不同时，请在构建时翻译词汇并保留一个语义源，而不是种植一棵手动维护的漂移的兄弟树。
 
 %======================================================================
-\subsection{Numerical Stability: Cascade Sums on CPU}
+\subsection{数值稳定性：CPU 上的级联求和}
 \label{subsec:eval-cascadesum}
 
-Long float sums accumulate rounding error linearly in the element count when a single accumulator is used. The CPU reduction path implements a \emph{cascade} scheme instead: partial sums are kept in a small array of levels, and a level is flushed into the next level whenever its index hits a power-of-two step. Error growth drops from $O(n)$ to $O(\log n)$ because each level only ever adds numbers of comparable magnitude.
+当使用单个累加器时，长浮点和会在元素计数中线性累积舍入误差。 CPU 缩减路径改为实现 \emph{cascade} 方案：部分和保存在一个小的级别数组中，并且每当其索引达到二次幂时，一个级别就会刷新到下一个级别。错误增长从 $O(n)$ 下降到 $O(\log n)$，因为每个级别仅增加可比较数量级的数字。
 
 \begin{lstlisting}[caption={The cascade accumulator: four levels, flushed on a power-of-two cadence; vector loads feed every lane in parallel.}, label=lst:cascadesum]
 constexpr int64_t levels = 4;
@@ -276,15 +276,15 @@ for (; i + level_step <= size;) {
 }
 \end{lstlisting}
 
-The AVX-512 fast path for \texttt{normsq} (sum of squares) fuses multiply and accumulate with FMA instructions; on compatible hardware this is the mechanism behind the $9.9\times$ \texttt{norm2} speedup recorded in Figure~\ref{fig:benchhist}, where the reference's scalar loop cannot use the same instruction mix.
+\texttt{normsq}（平方和）的 AVX-512 快速路径融合了 FMA 指令的乘法和累加；在兼容硬件上，这是图~\ref{fig:benchhist}中记录的$9.9\times$ \texttt{norm2}加速背后的机制，其中参考的标量循环不能使用相同的指令混合。
 
 %======================================================================
-\subsection{Distributed Training: FSDP, DTensor, Functional Collectives}
+\subsection{分布式训练：FSDP、DTensor、Functional Collective}
 \label{subsec:eval-distributed}
 
-The distributed stack (63\,k Python lines plus 17\,k C++ lines of process-group backends over gloo and MPI) is organized in three layers that mirror the pillar philosophy: a C++ communication layer, a differentiable Python functional layer, and composable sharding policies.
+分布式堆栈（63\,k 个 Python 行加上 17\,k 个基于 gloo 和 MPI 的进程组后端 C++ 行）组织成三层，反映了支柱理念：C++ 通信层、可微分的 Python 功能层和可组合的分片策略。
 
-\paragraph{FSDP.} Fully sharded data parallelism is configured by a small enum vocabulary rather than ad-hoc flags: \texttt{FULL\_SHARD} (parameters sharded, gathered per layer, freed after use), \texttt{SHARD\_GRAD\_OP} (gather once per forward, shard only gradients and optimizer state), \texttt{NO\_SHARD} (plain DDP), and a hybrid intra/inter-node variant. Policies compose as dataclasses---\texttt{MixedPrecision} chooses independent dtypes for parameters, reduction, and buffers; \texttt{CPUOffload} swaps parameters to host memory between uses; \texttt{BackwardPrefetch} overlaps the next layer's gather with the current layer's backward.
+\paragraph{FSDP。} Fully sharded data parallelism is configured by a small enum vocabulary rather than ad-hoc flags: \texttt{FULL\_SHARD} (parameters sharded, gathered per layer, freed after use), \texttt{SHARD\_GRAD\_OP} (gather once per forward, shard only gradients and optimizer state), \texttt{NO\_SHARD} (plain DDP), and a hybrid intra/inter-node variant. Policies compose as dataclasses---\texttt{MixedPrecision} chooses independent dtypes for parameters, reduction, and buffers; \texttt{CPUOffload} swaps parameters to host memory between uses; \texttt{BackwardPrefetch} overlaps the next layer's gather with the current layer's backward.
 
 \begin{lstlisting}[caption={The strategy and policy vocabulary of FSDP: everything the sharding engine needs is one enum plus three small dataclasses.}, label=lst:fsdpvocab]
 class ShardingStrategy(Enum):
@@ -304,7 +304,7 @@ class CPUOffload:
     offload_params: bool = False
 \end{lstlisting}
 
-\paragraph{DTensor.} Sharded tensors are described by a \emph{placement} algebra over a device mesh: \texttt{Shard(dim)} splits along a dimension, \texttt{Replicate} copies, and \texttt{Partial(reduce\_op)} holds partial values that reduce to the global tensor. Operations on a \texttt{DTensor} dispatch through a sharding-aware layer that inserts the minimal set of collectives (\texttt{all\_gather}, \texttt{reduce\_scatter}) needed to satisfy the output placement---the same redispatch idea as \S\ref{sec:redispatch}, lifted from backends to topologies.
+\paragraph{D 张量。} Sharded tensors are described by a \emph{placement} algebra over a device mesh: \texttt{Shard(dim)} splits along a dimension, \texttt{Replicate} copies, and \texttt{Partial(reduce\_op)} holds partial values that reduce to the global tensor. Operations on a \texttt{DTensor} dispatch through a sharding-aware layer that inserts the minimal set of collectives (\texttt{all\_gather}, \texttt{reduce\_scatter}) needed to satisfy the output placement---the same redispatch idea as \S\ref{sec:redispatch}, lifted from backends to topologies.
 
 
 % Figure: functional collective across the Python/C++ boundary
@@ -321,7 +321,7 @@ class CPUOffload:
 \draw[arrow, color=gray] (pg) -- (work);
 \draw[arrow, color=tpgreen] (work) -- node[right, font=\tiny]{waits lazily} (async);
 \end{tikzpicture}
-\caption{One collective across the language boundary: the handle returns immediately; the wrapper demotes itself to a plain tensor at the first real use.}
+\caption{跨越语言边界的一个集体：句柄立即返回；包装器在第一次真正使用时会将自身降级为普通张量。}
 \label{fig:collbridge}
 \end{figure}
 
@@ -340,11 +340,11 @@ class CPUOffload:
 \draw[arrow, color=tpgreen] (reshard) -- (local);
 \draw[arrow, color=tpblue] (local) -- (out);
 \end{tikzpicture}
-\caption{Sharding resolution: the sharding-aware layer between the user op and the native kernels. Placements are checked, the minimal collectives are inserted, and each shard then runs through the ordinary backend dispatcher.}
+\caption{分片解析：用户操作和本机内核之间的分片感知层。检查布局，插入最小集合，然后每个分片通过普通后端调度程序运行。}
 \label{fig:dtensor}
 \end{figure}
 
-\paragraph{Functional collectives with autograd.} Each collective is exposed twice: a plain function and an autograd-aware variant built as a differentiable \texttt{Function}, so distributed operations compose inside the ordinary DAG. Communication overlaps computation through a lazy tensor wrapper:
+\paragraph{具有 autograd 功能的集体。} Each collective is exposed twice: a plain function and an autograd-aware variant built as a differentiable \texttt{Function}, so distributed operations compose inside the ordinary DAG. Communication overlaps computation through a lazy tensor wrapper:
 
 \begin{lstlisting}[caption={Lazy collective tensors trigger the underlying wait only on first real use, letting the stream run ahead.}, label=lst:asynccoll]
 class AsyncCollectiveTensor(tp.Tensor):
@@ -358,7 +358,7 @@ class AsyncCollectiveTensor(tp.Tensor):
         self.__class__ = tp.Tensor
 \end{lstlisting}
 
-The C++ side maps each Python function to a \texttt{ProcessGroup} method (\texttt{allreduce}, \texttt{all\_gather\_into\_tensor}, \texttt{reduce\_scatter\_tensor}, \texttt{broadcast}), with a gloo backend for CPU clusters and MPI for HPC interconnects; a symmetric-memory utility exposes NVLink/CXL zero-copy paths for the v2 collective implementations.
+C++ 端将每个 Python 函数映射到 \texttt{ProcessGroup} 方法（\texttt{allreduce}、\texttt{all\_gather\_into\_tensor}、\texttt{reduce\_scatter\_tensor}、\texttt{broadcast}），并带有用于 CPU 集群的 gloo 后端和用于 HPC 互连的 MPI；对称内存实用程序公开了 v2 集体实现的 NVLink/CXL 零复制路径。
 
 % Figure: load() format dispatch
 \begin{figure}[H]
@@ -382,47 +382,47 @@ The C++ side maps each Python function to a \texttt{ProcessGroup} method (\textt
 \draw[arrow, color=gray] (pt) |- (map);
 \draw[arrow, color=tpblue] (map) -- (ten);
 \end{tikzpicture}
-\caption{Checkpoint loading is format dispatch followed by one placement pass. Every branch is data-only; no branch executes embedded code.}
+\caption{检查点加载是格式调度，然后是一次放置传递。每个分支都是纯数据的；没有分支执行嵌入代码。}
 \label{fig:loaddispatch}
 \end{figure}
 
 
 
 %======================================================================
-\subsection{Serialization: the .mega Format and Safe Interop}
+\subsection{序列化：.mega 格式和安全互操作}
 \label{subsec:eval-serialization}
 
-Model persistence is a security surface as much as a storage problem. TensorPlay's native format is a binary container with a four-byte magic, tagged metadata records (integers, floats, strings, nested arrays), storage deduplication, per-payload CRC32 or SHA256 digests, and a default 4\,096-byte alignment so payloads can be \texttt{mmap}-ed zero-copy. Loading is allowlist-based end to end: no pickle, no embedded code, ever.
+模型持久性既是一个安全问题，也是一个存储问题。 TensorPlay 的本机格式是一个二进制容器，具有四字节魔法、标记元数据记录（整数、浮点数、字符串、嵌套数组）、存储重复数据删除、每个有效负载 CRC32 或 SHA256 摘要以及默认的 4\,096 字节对齐，因此有效负载可以是 \texttt{mmap}-ed 零复制。加载是基于白名单的端到端：没有pickle，没有嵌入代码，永远。
 
-Interoperability follows the same discipline. \texttt{safetensors} files are read and written through their JSON header format. Legacy zip-based checkpoints from other frameworks are parsed by a dedicated unpickler whose globals are strictly allowlisted to tensor-reconstruction functions; storage types map to native dtypes through a fixed table, and anything outside the allowlist raises instead of executing. Location handling (\texttt{map\_location}) accepts a device string, a device-to-device mapping, or a callable receiving a storage stub. A hub utility completes the lifecycle: cached downloads under a configurable root, hash verification, resume support, and atomic rename-on-complete.
+互操作性遵循相同的原则。 \texttt{safetensors} 文件通过其 JSON 标头格式进行读写。来自其他框架的传统基于 zip 的检查点由专用的 unpickler 进行解析，其全局变量严格列入张量重建函数的允许名单；存储类型通过固定表映射到本机数据类型，并且允许列表之外的任何内容都会引发而不是执行。位置处理 (\texttt{map\_location}) 接受设备字符串、设备到设备映射或接收存储存根的可调用函数。集线器实用程序完成生命周期：在可配置根目录下缓存下载、哈希验证、恢复支持和完成时原子重命名。
 
 
 
 %======================================================================
-\subsection{Support Cores: Threading, BLAS Bridges, RNG}
+\subsection{支持核心：线程、BLAS 桥、RNG}
 \label{subsec:eval-supportcores}
 
-Three medium-sized cores sit below the kernels but above the OS, each readable in one sitting.
+三个中等大小的核心位于内核下方但操作系统上方，每个核心都可以一次性读取。
 
 \begin{table}[H]
 \centering
-\caption{Support cores.}
+\caption{支持核心。}
 \label{tab:supportcores}
 \small
 \begin{tabular}{llr}
 \toprule
-Core & Content & Lines \\
+Core & 内容 & 线路 \\
 \midrule
-Intra-op pool & worker threads, condition-variable queue, grain-size \texttt{parallel\_for} & 452 \\
-oneDNN context & one \texttt{dnnl::engine} per process, threadpool bridge & 137 \\
-MKL/cBLAS bridge & \texttt{cblas\_sgemm}/\texttt{sgemv} behind \texttt{USE\_MKL} & (kernel file) \\
-CPU RNG & self-contained MT19937 engine + generator state & 196 + 108 \\
-CUDA RNG & Philox counter management, capture-aware state & 331 \\
+内部操作池 & 工作线程，条件变量队列，粒度 \texttt{parallel\_for} & 452 \\
+oneDNN 上下文 & 每个进程一个 \texttt{dnnl::engine}，线程池桥 & 137 \\
+MKL/cBLAS 桥 & \texttt{cblas\_sgemm}/\texttt{sgemv} 位于 \texttt{USE\_MKL} 后面 & （内核文件） \\
+CPU随机数生成器 & 自备MT19937发动机+发电机状态 & 196 + 108 \\
+CUDA随机数生成器 & Philox 计数器管理、捕获感知状态 & 331 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\paragraph{Intra-op pool.} The pool is created once and reused: the thread count moves through a \texttt{NOT\_SET $\rightarrow$ value $\rightarrow$ CONSUMED} atomic state machine so the first \texttt{set\_num\_threads} freezes the pool size, and \texttt{in\_parallel\_region} is answered from \texttt{thread\_local} flags instead of a mutex + thread-id scan. Kernels enter via a header template with a grain size; the C bridge exposes the same pool to oneDNN's partitioning.
+\paragraph{操作内池。} The pool is created once and reused: the thread count moves through a \texttt{NOT\_SET $\rightarrow$ value $\rightarrow$ CONSUMED} atomic state machine so the first \texttt{set\_num\_threads} freezes the pool size, and \texttt{in\_parallel\_region} is answered from \texttt{thread\_local} flags instead of a mutex + thread-id scan. Kernels enter via a header template with a grain size; the C bridge exposes the same pool to oneDNN's partitioning.
 
 \begin{lstlisting}[caption={The whole pool is one class: spawn workers once, drain on shutdown.}, label=lst:pool]
 class IntraopThreadPool {
@@ -445,9 +445,9 @@ class IntraopThreadPool {
   /* ... */
 \end{lstlisting}
 
-A dedicated harness verifies both properties empirically: an 8-thread/1-thread ratio of 0.94$\times$ on a 1-element add (target $\le$1.5$\times$: oversubscription does not hurt tiny ops) and 0.99$\times$ on a 4M-element add (parallelism engages when there is work).
+专用线束根据经验验证这两个属性：1 元素添加上的 8 线程/1 线程比率为 0.94$\times$（目标 $\le$1.5$\times$：超额订阅不会损害小型操作），4M 元素添加上的 8 线程/1 线程比率为 0.99$\times$（有工作时会启用并行性）。
 
-\paragraph{oneDNN and MKL.} The oneDNN context holds one engine per process and, critically, drives oneDNN \emph{outside} its own callbacks: primitive partitioning is bridged onto the intra-op pool so nested parallelism cannot deadlock. CPU kernels call oneDNN eltwise primitives directly for tanh/relu-family activations, while matmul goes to MKL via \texttt{cblas\_sgemm} behind the \texttt{USE\_MKL} guard. This is the whole vendor-acceleration story of TensorPlay: two narrow bridges, no vendor data structures in the object model.
+\paragraph{oneDNN 和 MKL。} The oneDNN context holds one engine per process and, critically, drives oneDNN \emph{outside} its own callbacks: primitive partitioning is bridged onto the intra-op pool so nested parallelism cannot deadlock. CPU kernels call oneDNN eltwise primitives directly for tanh/relu-family activations, while matmul goes to MKL via \texttt{cblas\_sgemm} behind the \texttt{USE\_MKL} guard. This is the whole vendor-acceleration story of TensorPlay: two narrow bridges, no vendor data structures in the object model.
 
 \paragraph{RNG.} CPU generators wrap a self-contained MT19937 so the distribution layer consumes raw engine words (the C++ standard's \texttt{std::distributions} are implementation-defined and therefore unusable for reproducibility):
 
@@ -461,70 +461,70 @@ struct mt19937_data_pod {
     /* ... 624-word state, boxed-normal scratch ... */
 \end{lstlisting}
 
-The CUDA generator manages Philox counter state with capture-aware reservation, as shown in Listing~\ref{lst:philox}.
+CUDA 生成器通过捕获感知预留来管理 Philox 计数器状态，如清单~\ref{lst:philox} 所示。
 
 %======================================================================
-\subsection{Python Bindings: The Full Surface}
+\subsection{Python 绑定：完整的表面}
 \label{subsec:eval-bindings}
 
-\S\ref{sec:arch} and \S\ref{subsec:eval-microbench} follow the bridge hot path. Table~\ref{tab:bindings} shows all 24 binding units, 12.6\,k lines in total.
+\S\ref{sec:arch} 和 \S\ref{subsec:eval-microbench} 遵循桥热路径。表~\ref{tab:bindings}显示了所有24个结合单元，总共12.6\,k行。
 
 \begin{table}[H]
 \centering
-\caption{Binding units, sorted by size. The import unit defines module order; the tensor unit owns method dispatch.}
+\caption{装订单位，按尺寸排序。导入单元定义模块顺序；张量单元拥有方法调度。}
 \label{tab:bindings}
 \small
 \begin{tabular}{lrllr}
 \toprule
-Unit & Lines & Role & Unit & Lines \\
+Unit & 线路 & Role & Unit & 线路 \\
 \midrule
-tensor methods & 3{,}466 & methods, magic ops & device & 369 \\
-bridge & 1{,}703 & parse/check/wrap & size & 339 \\
-symbolic ints & 1{,}221 & symint arithmetic & bridge header & 279 \\
-module init & 722 & import order, exceptions & dispatch & 187 \\
-compile API & 670 & stax entry points & CUDA graphs & 173 \\
-futures & 600 & Future plumbing & distributed autograd & 151 \\
-distributed & 569 & c10d bindings & autocast mode & 107 \\
-autograd & 517 & backward/grad hooks & transforms & 88 \\
-namespace ops & 436 & free functions & dtype & 110 \\
-RPC & 408 & RPC bindings & & \\
+张量方法 & 3{,}466 & 方法与魔法函数 & 设备 & 369 \\
+桥 & 1{,}703 & 解析/检查/换行 & size & 339 \\
+符号整数 & 1{,}221 & 符号算术 & 桥接层 & 279 \\
+模块初始化 & 722 & 导入顺序与异常 & 派遣 & 187 \\
+编译 API & 670 & 编译入口点 & CUDA 图 & 173 \\
+期货 & 600 & Future 管道 & 分布式自动求导 & 151 \\
+分布式 & 569 & 分布式绑定 & 自动转换模式 & 107 \\
+自动微分 & 517 & 反向/梯度挂钩 & 转变 & 88 \\
+命名空间操作 & 436 & 自由函数 & 数据类型 & 110 \\
+RPC & 408 & RPC 绑定 &  & \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The units least discussed elsewhere are the async and symbolic families. The futures unit binds the \texttt{Future} type used by RPC and collective completion callbacks; the distributed triple (distributed + RPC + distributed-autograd, 1{,}128 lines combined) front-ends the \texttt{distributed} Python tree of Table~\ref{tab:pybreakdown}; the symbolic-int unit exposes the same arithmetic the C++ core implements, so \texttt{stax} shape functions can run on unbacked symints during tracing.
+其他地方最少讨论的单位是异步和符号系列。 futures 单元绑定 RPC 和集体完成回调使用的 \texttt{Future} 类型；分布式三元组（分布式 + RPC + 分布式自动微分，1{,}128 行组合）前端 Table~\ref{tab:pybreakdown} 的 \texttt{distributed} Python 树； symbolic-int 单元公开了 C++ 核心实现的相同算术，因此 \texttt{stax} 形状函数可以在跟踪期间在无支持的 symint 上运行。
 
 %======================================================================
-\subsection{Three-Track Test Suite}
+\subsection{三轨测试套件}
 \label{subsec:eval-tests}
 
-The test tree---145 Python files (2{,}069 test functions, 2{,}571 collected including parametrized cases) plus 2{,}078 lines of C++ tests (gloo process-group, Vulkan api/op suites)---is organized as three families with distinct assertions:
+测试树——145 个 Python 文件（2{,}069 个测试函数，2{,}571 个收集的测试函数，包括参数化案例）加上 2{,}078 行 C++ 测试（gloo 进程组、Vulkan api/op 套件）——被组织为具有不同断言的三个系列：
 
 \begin{table}[H]
 \centering
-\caption{The three-track system. Suffixes are naming conventions; each track asserts a different property of the same op.}
+\caption{三轨制。后缀是命名约定；每个轨道断言同一操作的不同属性。}
 \label{tab:testtracks}
 \small
 \begin{tabular}{llrr}
 \toprule
-Track & Assertion style & Files & Tests \\
+追踪 & 断言风格 & 文件 & 测试 \\
 \midrule
-\texttt{alignment} & numeric tolerance vs.\ reference & 13 & 152 \\
-\texttt{native} & dispatch reached a backend-native kernel, not composite & 22 & 226 \\
-\texttt{parity} & exact behavioral parity incl.\ exception types & 4 & 51 \\
+\texttt{alignment} & 数值公差与参考 & 13 & 152 \\
+\texttt{native} & 调度到达后端本机内核，而不是复合内核 & 22 & 226 \\
+\texttt{contract} & 精确的行为对等，包括异常类型 & 4 & 51 \\
 \midrule
-Other 106 files & engine, compiler, frontend, e2e & 106 & --- \\
+其他106个文件 & 引擎、编译器、前端、e2e & 106 & --- \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \begin{itemize}[leftmargin=1.2em]
-\item \textbf{Alignment}: forward/backward outputs agree with the reference implementation within tolerance on a shape grid---the ``is the math right'' track.
-\item \textbf{Native}: the op dispatched to a backend-native kernel, not the \texttt{Composite} fallback---the ``is it actually implemented'' track; this is the runtime complement of the operator census in \S\ref{subsec:eval-opcount}.
-\item \textbf{Parity}: values, dtypes, strides, and error behavior match the reference exactly, including exception types---the ``contract'' track.
+\item \textbf{Alignment}：前向/后向输出与形状网格公差范围内的参考实现一致——“数学正确”轨道。
+\item \textbf{Native}：分派到后端本机内核的操作，而不是 \texttt{Composite} 后备——“是否实际实现”跟踪；这是 \S\ref{subsec:eval-opcount} 中操作员普查的运行时补充。
+\item \textbf{Contract}：值、数据类型、步幅和错误行为与引用完全匹配，包括异常类型——“契约”轨道。
 \end{itemize}
 
-A full single-process run reports \textbf{9 failed, 2{,}305 passed, 263 skipped} in 163\,s. The 263 skips are environmental, not structural: 162 require absent CUDA hardware (module-level \texttt{skipif} guards), the rest require optional packages that are not installed. The 9 failures are localized in two files---antialias/nearest-exact upsample modes (6) and einsum contraction-order edge cases (3)---and are reported as open items rather than hidden.
+完整的单进程运行在 163 秒内报告 \textbf{9 failed, 2{,}305 通过，263 跳过}。 263 个跳过是环境性的，而不是结构性的：162 个需要缺少 CUDA 硬件（模块级 \texttt{skipif} 防护），其余需要未安装的可选包。这 9 个失败位于两个文件中——抗锯齿/最近精确上采样模式 (6) 和 einsum 收缩阶边缘情况 (3)——并报告为开放项而不是隐藏项。
 
 \begin{figure}[H]
 \centering
@@ -555,7 +555,7 @@ A full single-process run reports \textbf{9 failed, 2{,}305 passed, 263 skipped}
 \foreach \x/\name/\count/\fillc/\drawc in {
   0/{*}\_alignment/152/blue!8/tpblue,
   1/{*}\_native/226/orange!10/tporange,
-  2/{*}\_parity/51/purple!8/tppurple}{
+  2/{*}\_contract/51/purple!8/tppurple}{
   \pgfmathsetmacro{\h}{\count/100}
   \pgfmathsetmacro{\lbl}{\h+0.45}
   \fill[\fillc] (\x*\cw,0) rectangle (\x*\cw+0.5*\cw,\h);
@@ -565,38 +565,38 @@ A full single-process run reports \textbf{9 failed, 2{,}305 passed, 263 skipped}
 }
 \draw[->,gray] (-0.1,0) -- (2.35,0);
 \end{tikzpicture}
-\caption{Left: outcome of the full-suite run (163\,s). Right: test counts per track; 429 tests across the three suffix families, 2{,}069 across the whole tree.}
+\caption{左：全套运行的结果 (163\,s)。右：每个轨道的测试计数；跨三个后缀族进行 429 次测试，跨整个树进行 2{,}069 次测试。}
 \label{fig:testoutcomes}
 \end{figure}
 
 %======================================================================
-\subsection{Benchmark Suite: Measured Throughput}
+\subsection{基准套件：测量吞吐量}
 \label{subsec:eval-bench}
 
-The benchmark directory holds 20 harnesses. Table~\ref{tab:benche2e} reports five representative runs verbatim (16-core x86, 3.5\,GHz class, MKL + oneDNN + NNPACK enabled, 8 threads; the reference column is the mainstream CPU framework printed by the same script, so both sides pay identical environment costs). Speedup $=$ ref\,ms\,/\,tp\,ms.
+基准目录包含 20 个线束。表~\ref{tab:benche2e}逐字记录了五个代表性运行（16核x86，3.5\,GHz级，启用MKL + oneDNN + NNPACK，8线程；参考列是同一脚本打印的主流CPU框架，因此双方支付相同的环境成本）。加速比 $=$ ref\,ms\,/\,tp\,ms。
 
 \begin{table}[H]
 \centering
-\caption{End-to-end and layer benchmarks, 8 threads.}
+\caption{端到端和层基准测试，8 个线程。}
 \label{tab:benche2e}
 \small
 \begin{tabular}{llrrl}
 \toprule
-Harness & Workload & tp & ref & speedup \\
+马具 & 工作量 & tp & ref & 加速 \\
 \midrule
-llama e2e & 0.6B llama, prefill 128 (CPU) & 519.6\,ms & 612.6\,ms & 1.18$\times$ \\
- & decode 1 tok & 499.0\,ms/tok & 612.8\,ms/tok & 1.23$\times$ \\
-training step & qkv-proj fwd/bwd & 114.7\,ms & 185.9\,ms & 1.62$\times$ \\
- & mlp-up fwd/bwd & 318.3\,ms & 469.5\,ms & 1.48$\times$ \\
- & mlp-down fwd/bwd & 338.2\,ms & 450.0\,ms & 1.33$\times$ \\
- & decode-1 (batch 1) & 24.2\,ms & 72.1\,ms & 2.98$\times$ \\
- & small-net fwd/bwd & 4.14\,ms & 4.44\,ms & 1.07$\times$ \\
-optimizer step & Adam, 104 tensors & 6.22\,ms & 34.55\,ms & 5.56$\times$ \\
- & SGD & 5.20\,ms & 6.84\,ms & 1.31$\times$ \\
- & geomean, 10 optimizers & --- & --- & 3.83$\times$ \\
-custom-op dispatch & overhead above bare kernel & 1.73\,\textmu s & 18.9\,\textmu s & 10.9$\times$ \\
-intra-op pool & 1-elem add 8t/1t ratio & 0.94 & 0.94 & parity \\
- & 4M add 8t/1t ratio & 0.99 & --- & engages \\
+骆驼 e2e & 0.6B llama，预填充128（CPU） & 519.6\,ms & 612.6\,ms & 1.18$\times$ \\
+  & 解码1 tok & 499.0\,毫秒/托克 & 612.8\,毫秒/托克 & 1.23$\times$ \\
+训练步骤 & qkv-proj fwd/bwd & 114.7\,ms & 185.9\,ms & 1.62$\times$ \\
+  & mlp-up 前向/后向 & 318.3\,ms & 469.5\,ms & 1.48$\times$ \\
+  & mlp-down 前向/后向 & 338.2\,ms & 450.0\,ms & 1.33$\times$ \\
+  & 解码-1（第 1 批） & 24.2\,ms & 72.1\,ms & 2.98$\times$ \\
+  & 小网络前向/后向 & 4.14\,ms & 4.44\,ms & 1.07$\times$ \\
+优化器步骤 & Adam，104 个张量 & 6.22\,ms & 34.55\,ms & 5.56$\times$ \\
+  & SGD & 5.20\,ms & 6.84\,ms & 1.31$\times$ \\
+  & geomean，10 个优化器 & --- & --- & 3.83$\times$ \\
+定制操作调度 & 裸内核之上的开销 & 1.73\,\textmu s & 18.9\,\textmu s & 10.9$\times$ \\
+内部操作池 & 1-元素添加8t/1t比率 & 0.94 & 0.94 & 平价 \\
+  & 4M加8t/1t比例 & 0.99 & --- & 从事 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -623,42 +623,42 @@ intra-op pool & 1-elem add 8t/1t ratio & 0.94 & 0.94 & parity \\
 \draw[->,gray] (-0.15,0) -- (6.75,0);
 \draw[gray] (3.68,3.55) -- (3.68,3.8) -- (6.6,3.8);
 \node[anchor=west,gray] at (6.75,3.8) {ahead};
-\node[gray] at (3.4,3.55) {parity};
+\node[gray] at (3.4,3.55) {contract};
 \draw[->,gray,dashed] (2.05,3.5) node[above,font=\tiny]{geomean 1.73$\times$} -- (4.3,0.4);
 \end{tikzpicture}
-\caption{Per-op CPU throughput vs.\ the reference framework across 58 op/shape pairs (8 threads). 6 pairs trail by $>$20\% (gelu-tanh small shapes, small-batch \texttt{bmm}, \texttt{cumsum}); 28 pairs lead by $\ge$1.5$\times$, led by \texttt{sqrt} 10.8$\times$ and \texttt{norm2} 9.9$\times$ where the reference's scalar loop loses to the vectorized kernel.}
+\caption{每操作 CPU 吞吐量与跨 58 个操作/形状对（8 个线程）的参考框架的比较。 6 对尾随 $>$20\%（gelu-tanh 小形状、小批量 \texttt{bmm}、\texttt{cumsum}）； 28 对由 $\ge$1.5$\times$ 领导，由 \texttt{sqrt} 10.8$\times$ 和 \texttt{norm2} 9.9$\times$ 领导，其中引用的标量循环输给了矢量化内核。}
 \label{fig:benchhist}
 \end{figure}
 
-Three readings of Figure~\ref{fig:benchhist} matter for the paper's claims. First, the distribution is wide on \emph{both} sides: a readability-first framework is not uniformly slower; on elementwise and reduction families the hand-written vectorized kernels win (exp 2.4$\times$, gelu 2.3$\times$ at 1M; 4.8$\times$/4.3$\times$ at 8M), while fused multi-kernel paths (gelu-tanh), small-batch \texttt{bmm}, and \texttt{cumsum} trail. Second, the wins and losses cluster by kernel file, which is exactly the readability promise: the pointwise kernel file is the single file to read to explain both tails. Third, matmul is reference-competitive (1K$^3$ 0.94$\times$, tall-skinny 1.8$\times$) because both frameworks land in the same MKL \texttt{cblas\_sgemm}---the dispatcher adds the same sub-1\% sliver measured in \S\ref{subsec:eval-microbench}.
+对图~\ref{fig:benchhist}的三读对于论文的主张很重要。首先，\emph{both} 方面的分布很广：可读性优先的框架并不是一律较慢；在元素和归约系列上，手写矢量化内核获胜（1M 时为 exp 2.4$\times$、gelu 2.3$\times$；8M 时为 4.8$\times$/4.3$\times$），而融合多内核路径 (gelu-tanh)、小批量 \texttt{bmm} 和 \texttt{cumsum} 则落后。其次，胜利和失败按内核文件进行聚类，这正是可读性的承诺：逐点内核文件是读取解释两个尾部的单个文件。第三，matmul 具有参考竞争性（1K$^3$ 0.94$\times$，高瘦 1.8$\times$），因为两个框架都位于相同的 MKL \texttt{cblas\_sgemm} 中——调度程序添加了在 \S\ref{subsec:eval-microbench} 中测量的相同的低于 1% 的条子。
 
-The benchmark tree also contains heavier end-to-end harnesses: a 1{,}489-line ResNet-18 script that runs a 10-epoch training race plus a strict state-dict transfer requiring \texttt{allclose} logits and identical top-1 predictions, and a CUDA-graph replay harness that requires a GPU. Their CUDA-gated parts skip with the same environmental guards as the test tree.
+基准树还包含更重的端到端工具：一个 1{,}489 行 ResNet-18 脚本，运行 10 轮训练竞赛，加上需要 \texttt{allclose} logits 和相同的 top-1 预测的严格状态字典传输，以及需要 GPU 的 CUDA 图形重放工具。它们的 CUDA 门控部件与测试树具有相同的环境防护。
 
 %======================================================================
-\subsection{Operator Census and Dispatch Depth}
+\subsection{运营商普查和调度深度}
 \label{subsec:eval-opcount}
 
-The operator census uses three counts: dispatcher registrations (\texttt{m.impl}), schema declarations (479 distinct names across 2{,}809 records), and the Python-visible surface (275 functions + 184 methods). The three-way comparison is the only way to distinguish ``kernel exists but unreachable'' from ``Python reachable but no kernel''.
+操作员普查使用三个计数：调度程序注册 (\texttt{m.impl})、模式声明（2{,}809 条记录中的 479 个不同名称）和 Python 可见表面（275 个函数 + 184 个方法）。三路比较是区分“内核存在但无法访问”和“Python 可访问但无内核”的唯一方法。
 
 \begin{table}[H]
 \centering
-\caption{Operator census.}
+\caption{运营商普查。}
 \label{tab:opcount}
 \small
 \begin{tabular}{lll}
 \toprule
-Layer & TensorPlay & Vendor baseline \\
+层 & 张量播放 & 供应商基线 \\
 \midrule
-Registered kernels (\texttt{m.impl} dedup) & 673 (CPU 671, CUDA 587) & 2000+ distinct ops \\
-Schemas & 479 names / 618 active & 2000+ (with overloads) \\
-Backward formulas & 187 formulas $\rightarrow$ 148 nodes & thousands \\
-Python \texttt{\_C} surface & $\sim$550 & $\sim$1500 \\
-Coverage focus & pointwise, reduction, matmul, conv/pool (24 conv ops), linalg 26, \texttt{foreach} $\sim$100 & full domain \\
+注册内核（\texttt{m.impl} dedup） & 673（CPU 671、CUDA 587） & 2000 多个不同的操作 \\
+模式 & 479 个名字 / 618 个活跃 & 2000+（有过载） \\
+倒推公式 & 187 个公式 $\rightarrow$ 148 个节点 & 数千 \\
+Python \texttt{\_C} 表面 & $\sim$550 & $\sim$1500 \\
+覆盖重点 & 逐点、缩减、matmul、卷积/池（24 个卷积操作）、linalg 26、\texttt{foreach} $\sim$100 & 全域 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The delta is deliberate. TensorPlay covers the dense tensor loop that a convolution classifier or a transformer pre-training step exercises, plus the composite fallbacks that make the remainder runnable: tensor properties, histogram, unique, itertools, and integration each register one backend-neutral \texttt{TENSORPLAY\_LIBRARY\_IMPL(Composite,\dots)} block that serves every backend until a native kernel overrides it. Missing families are documented as such rather than hidden: dropout arrived via a native kernel; \texttt{cross\_entropy}/\texttt{ctc\_loss}, \texttt{rms\_norm}, \texttt{scatter\_reduce}, and long-tail sparse ops remain composite-only or absent, each classified as ``kernel exists, schema missing'' or ``three layers missing'' so the gap is a table entry, not a surprise.
+三角洲是故意的。 TensorPlay 涵盖了卷积分类器或转换器预训练步骤所执行的密集张量循环，以及使其余部分可运行的复合回退：张量属性、直方图、唯一性、itertools 和集成，每个都注册一个后端中性 \texttt{TENSORPLAY\_LIBRARY\_IMPL(Composite,\dots)} 块，该块服务于每个后端，直到本机内核覆盖它。失踪的家庭被记录下来，而不是隐藏起来：通过本机内核到达的辍学； \texttt{cross\_entropy}/\texttt{ctc\_loss}、\texttt{rms\_norm}、\texttt{scatter\_reduce} 和长尾稀疏操作仍然仅复合或不存在，每个操作都被分类为“内核存在，架构缺失”或“三层缺失”，因此间隙是一个表条目，这并不奇怪。
 
 %======================================================================
 \subsection{DispatchKey: 13 vs.\ 60+}
@@ -666,32 +666,32 @@ The delta is deliberate. TensorPlay covers the dense tensor loop that a convolut
 
 \begin{table}[H]
 \centering
-\caption{\texttt{DispatchKey} enumeration. Sentinel \texttt{EndOfKeys=13} is spelled out so the table size is a compile-time constant.}
+\caption{\texttt{DispatchKey} 枚举。 Sentinel \texttt{EndOfKeys=13} 被拼写出来，因此表大小是一个编译时常量。}
 \label{tab:dispatchkey}
 \small
 \begin{tabular}{lll}
 \toprule
-Key & Value & Role \\
+Key & 价值 & Role \\
 \midrule
-\texttt{CPU} & 0 & Dense backend \\
-\texttt{CUDA} & 1 & Dense backend \\
-\texttt{Vulkan} & 2 & Dense backend, reserved \\
+\texttt{CPU} & 0 & 密集后端 \\
+\texttt{CUDA} & 1 & 密集后端 \\
+\texttt{Vulkan} & 2 & 密集后端，预留 \\
 \texttt{AutogradCPU} & 3 & \texttt{toAutogradKey(CPU)} = CPU + 3 \\
-\texttt{AutogradCUDA} & 4 & Autograd over CUDA \\
-\texttt{AutogradVulkan} & 5 & Autograd over Vulkan \\
+\texttt{AutogradCUDA} & 4 & 基于 CUDA 的 Autograd \\
+\texttt{AutogradVulkan} & 5 & Autograd 优于 Vulkan \\
 \texttt{AutocastCPU} & 6 & \texttt{toAutocastKey(CPU)} = CPU + 6 \\
-\texttt{AutocastCUDA} & 7 & Autocast over CUDA \\
-\texttt{AutocastVulkan} & 8 & Autocast over Vulkan \\
-\texttt{VmapCPU} & 9 & \texttt{toVmapKey(CPU)} = CPU + 9, outranks autograd \\
-\texttt{VmapCUDA} & 10 & Vmap over CUDA \\
-\texttt{VmapVulkan} & 11 & Vmap over Vulkan \\
-\texttt{Composite} & 12 & Backend-neutral fallback \\
-\texttt{EndOfKeys} & 13 & Sentinel, table size \\
+\texttt{AutocastCUDA} & 7 & 通过 CUDA 自动投射 \\
+\texttt{AutocastVulkan} & 8 & 通过 Vulkan 自动施放 \\
+\texttt{VmapCPU} & 9 & \texttt{toVmapKey(CPU)} = CPU + 9，优于 autograd \\
+\texttt{VmapCUDA} & 10 & 基于 CUDA 的 Vmap \\
+\texttt{VmapVulkan} & 11 & Vulkan 上的 Vmap \\
+\texttt{Composite} & 12 & 后端中立回退 \\
+\texttt{EndOfKeys} & 13 & 哨兵，表大小 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The dispatch table is therefore \texttt{array<atomic<KernelFunction>,13>} with each slot relaxed-initialized to \texttt{nullptr} and published with \texttt{memory\_order\_release}. The key set is a \texttt{uint32\_t} bitset over the 13 keys; priority resolution scans the mask for the numerically largest bit, so priority is \texttt{Vmap $>$ Autocast $>$ Autograd $>$ backend}. Helpers clear one axis a time, used by redispatch below each layer.
+因此，调度表是 \texttt{array<atomic<KernelFunction>,13>}，每个槽宽松初始化为 \texttt{nullptr} 并使用 \texttt{memory\_order\_release} 发布。键集是 13 个键的 \texttt{uint32\_t} 位集；优先级解析扫描掩码中数值最大的位，因此优先级为 \texttt{Vmap -> Autocast -> Autograd -> backend}。助手一次清除一个轴，由每一层下面的重新调度使用。
 
 \begin{lstlisting}[caption={The \texttt{Composite} fallthrough in the hot path: one extra load, only when a backend slot is empty.}, label=lst:composite]
 KernelFunction getKernel(DispatchKey key) const noexcept {
@@ -704,45 +704,45 @@ KernelFunction getKernel(DispatchKey key) const noexcept {
 }
 \end{lstlisting}
 
-TensorPlay keeps a compact set of dispatch keys and leaves specialized axes outside the core table. There is no \texttt{Meta} key and no open registration API: registration is a closed \texttt{unordered\_map<string,DispatchTable>} guarded by one mutex, and the \texttt{TENSORPLAY\_LIBRARY\_IMPL} macro expands to a process-lifetime static constructor. The cost is that shape-only inference, sparse dispatch, and quantized dispatch have no dedicated fast path; they either share the \texttt{Composite} fallback or are explicitly unsupported.
+TensorPlay 保留一组紧凑的调度键，并将专用轴保留在核心表之外。没有 \texttt{Meta} 键，也没有开放的注册 API：注册是一个由一个互斥锁保护的封闭式 \texttt{unordered\_map<string,DispatchTable>}，并且 \texttt{TENSORPLAY\_LIBRARY\_IMPL} 宏扩展为进程生命周期静态构造函数。代价是纯形状推理、稀疏调度和量化调度没有专用的快速路径；它们要么共享 \texttt{Composite} 后备，要么明确不受支持。
 
 %======================================================================
-\subsection{Autograd Nodes: 148 Generated, Explicit DAG, No Tape}
+\subsection{Autograd 节点：148 个生成、显式 DAG、无磁带}
 \label{subsec:eval-autograd-nodes}
 
-The generator parses the derivative-formula registry (345 raw records collapsing to 187 formulas after grouping) through an expression AST and emits 148 node structs. Each node stores saved forward tensors as \texttt{SavedVariable} where the formula needs them and synthesizes \texttt{apply} from the same AST that decided the save set, so the save list, constructor, and \texttt{apply} cannot drift. Handwritten nodes that formulas cannot express (concatenation, stacking, rolling) follow the same \texttt{SavedVariable} contract.
+生成器通过表达式 AST 解析导数公式注册表（分组后 345 个原始记录分解为 187 个公式）并发出 148 个节点结构。每个节点将保存的前向张量存储为 \texttt{SavedVariable} ，其中公式需要它们，并从决定保存集的同一 AST 合成 \texttt{apply} ，因此保存列表、构造函数和 \texttt{apply} 不会漂移。公式无法表达的手写节点（串联、堆叠、滚动）遵循相同的 \texttt{SavedVariable} 契约。
 
-There is no tape. The graph is the transitive closure of each node's \texttt{next\_edges}, where every \texttt{Edge} carries only hints---a shape hint, a gradient dtype, a device hint---so backward can materialize a missing gradient without touching the forward tensor. \texttt{GraphTask} holds a dependency counter map built once per backward, an input-buffer map keyed by raw \texttt{Node*}, and the captured output vector for \texttt{grad}. The \texttt{ReadyQueue} is a max-heap ordered by the node's creation sequence number: it pops the largest sequence number first, approximating reverse creation order, while true topological order is enforced by the dependency counter. The per-node interpreter executes ten steps---grad-mode guard, capture bookkeeping, missing-grad materialization, pre-hooks, evaluate-node guard, \texttt{apply}, post-hooks, \texttt{sum\_to\_shape}, dtype cast, NaN probe---then propagates to parents under the task mutex.
+没有磁带。该图是每个节点的 \texttt{next\_edges} 的传递闭包，其中每个 \texttt{Edge} 仅携带提示——形状提示、梯度数据类型、设备提示——因此向后可以在不接触前向张量的情况下实现缺失的梯度。 \texttt{GraphTask} 保存每次向后构建一次的依赖计数器映射、由原始 \texttt{Node*} 键控的输入缓冲区映射以及 \texttt{grad} 捕获的输出向量。 \texttt{ReadyQueue} 是按节点的创建序列号排序的最大堆：它首先弹出最大的序列号，近似于反向创建顺序，而真正的拓扑顺序由依赖计数器强制执行。每个节点解释器执行十个步骤——梯度模式保护、捕获簿记、缺失梯度物化、预钩子、评估节点保护、\texttt{apply}、后钩子、\texttt{sum\_to\_shape}、dtype 转换、NaN 探测——然后在任务互斥体下传播到父级。
 
-The memory/performance trade-off is explicit: every edge holds a \texttt{shared\_ptr<Node>} and every input buffer holds a \texttt{vector<Tensor>}, so one \texttt{shared\_ptr} per node plus one allocation per distinct input slot. A production runtime uses \texttt{intrusive\_ptr} to shave the control block. TensorPlay keeps the standard-library pointer so students can follow ownership with ordinary tooling; the constant-factor cost is a teaching decision, recorded as such.
+内存/性能权衡是明确的：每条边都保存一个 \texttt{shared\_ptr<Node>}，每个输入缓冲区保存一个 \texttt{vector<Tensor>}，因此每个节点一个 \texttt{shared\_ptr} 加上每个不同输入槽的一个分配。生产运行时使用 \texttt{intrusive\_ptr} 来削减控制块。 TensorPlay 保留标准库指针，以便学生可以使用普通工具跟踪所有权；常数因子成本是一个教学决策，如此记录。
 
 %======================================================================
-\subsection{Correctness Guards}
+\subsection{正确性卫士}
 \label{subsec:eval-guards}
 
-Four guards turn silent wrong gradients or silent cross-device copies into loud failures or into shape-correct grads. Table~\ref{tab:guards} summarizes them; the remainder of the subsection shows the exact check.
+四名守卫将无声的错误梯度或无声的跨设备复制变成大声的失败或形状正确的梯度。表~\ref{tab:guards} 总结了它们；本小节的其余部分显示了精确的检查。
 
 \begin{table}[H]
 \centering
-\caption{Correctness guards.}
+\caption{正确性卫士。}
 \label{tab:guards}
 \small
 \begin{tabular}{lll}
 \toprule
-Guard & Check & Failure mode \\
+警卫 & 查看 & 失效模式 \\
 \midrule
-Version & \texttt{unpack} compares current vs.\ saved version & \texttt{RuntimeError} with both versions \\
-Shape & \texttt{sum\_to\_shape} reduces broadcast dims & grad reshaped to the edge hint, no crash \\
-Dtype & gradient cast to the recorded forward dtype & grad cast in low-precision backward \\
-Device & device disagreement at op entry & distinct \texttt{DeviceMismatchError} \\
-Anomaly & NaN probe + creation-stack capture & forward stack + backward chain printed \\
+版本 & \texttt{unpack} 比较当前版本与保存的版本 & \texttt{RuntimeError} 两个版本 \\
+形状 & \texttt{sum\_to\_shape} 减少广播暗淡 & 渐变重塑到边缘提示，没有崩溃 \\
+数据类型 & 梯度转换为记录的前向数据类型 & 低精度向后的梯度转换 \\
+设备 & op 入口处的设备不一致 & 不同的 \texttt{DeviceMismatchError} \\
+异常 & NaN 探测 + 创建堆栈捕获 & 前向堆栈+后向链打印 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsubsection{Version guard: \texttt{SavedVariable}}
+\subsubsection{版本保护：\texttt{SavedVariable}}
 
-Forward tensors needed by backward are not stored bare. \texttt{save} copies the tensor's version counter into the saved variable; \texttt{unpack} reloads the current version and throws on disagreement:
+后向所需的前向张量不直接存储。 \texttt{save} 将张量的版本计数器复制到保存的变量中； \texttt{unpack} 重新加载当前版本并引发分歧：
 
 \begin{lstlisting}[caption={Version mismatch is loud: the message spells both versions.}, label=lst:savedvar-eval]
 TP_THROW(RuntimeError,
@@ -751,11 +751,11 @@ TP_THROW(RuntimeError,
   "; current version: " + to_string(current) + "]");
 \end{lstlisting}
 
-The version counter is an \texttt{atomic<uint32\_t>} bumped on every in-place op (guarded by ``not in inference mode''), and shared eagerly between a base and its views, so that mutating a view bumps the base's counter as well. Generated nodes store each tensor member as a \texttt{SavedVariable} and unpack the top of \texttt{apply}; handwritten nodes do the same. When the graph need not be kept, the engine releases the saved variables to free memory early.
+版本计数器是在每个就地操作上碰撞的 \texttt{atomic<uint32\_t>} （由“不处于推理模式”保护），并在基础及其视图之间急切地共享，因此改变视图也会碰撞基础的计数器。生成的节点将每个张量成员存储为 \texttt{SavedVariable} 并解压 \texttt{apply} 的顶部；手写节点也做同样的事情。当不需要保留图时，引擎会释放保存的变量以提前释放内存。
 
-\subsubsection{Shape and dtype guard: \texttt{sum\_to\_shape}}
+\subsubsection{形状和数据类型保护：\texttt{sum\_to\_shape}}
 
-Broadcast during forward inflates a scalar grad to the output shape. Before the next edge consumes it, the engine reduces it:
+正向期间的广播会将标量梯度膨胀到输出形状。在下一个边缘消耗它之前，引擎会减少它：
 
 \begin{lstlisting}[caption={Broadcast recovery: reduce the leading dims and the size-1 broadcast dims, then reshape.}, label=lst:sumtoshape-eval]
 static Tensor sum_to_shape(const Tensor& grad, const vector<int64_t>& target){
@@ -770,11 +770,11 @@ static Tensor sum_to_shape(const Tensor& grad, const vector<int64_t>& target){
 }
 \end{lstlisting}
 
-The recorded shape comes from the edge's shape hint (with ``no hint'' distinguished from the scalar shape \texttt{}), and the dtype comes from the edge's dtype hint. A floating-point grad whose dtype disagrees with the hint is cast back---the autocast case: an \texttt{fp32} grad re-entering a low-precision backward. Both ops run under the per-node grad-mode guard, so second-order grads still build a graph when \texttt{create\_graph} is true.
+记录的形状来自边的形状提示（与标量形状 \texttt{} 区分开的“无提示”），数据类型来自边的数据类型提示。 dtype 与提示不一致的浮点 grad 会被强制转换——自动转换情况： \texttt{fp32} grad 重新输入低精度向后。两个操作都在每个节点的梯度模式保护下运行，因此当 \texttt{create\_graph} 为 true 时，二阶梯度仍然构建一个图。
 
-\subsubsection{Device guard: \texttt{DeviceMismatchError}}
+\subsubsection{设备保护：\texttt{DeviceMismatchError}}
 
-Inference tensors never acquire an autograd key: their version counter is created disabled, so the key computation yields the bare backend bit. Mismatched devices are not silently copied; they throw a distinct Python type:
+推理张量永远不会获取自动微分密钥：它们的版本计数器被创建为禁用，因此密钥计算会产生裸露的后端位。不匹配的设备不会被静默复制；他们抛出一个独特的Python类型：
 
 \begin{lstlisting}[caption={A distinct exception for device mismatch, derived from the runtime-error base.}, label=lst:devicemismatch]
 class P10_API DeviceMismatchError : public RuntimeError {
@@ -782,11 +782,11 @@ class P10_API DeviceMismatchError : public RuntimeError {
 };
 \end{lstlisting}
 
-The throw fires on device disagreement in element-wise and matmul entry points, and in reduction iterators. Because the type derives from \texttt{RuntimeError} it carries the source location and an optional C++ stack, but Python can catch it separately from other runtime errors.
+该 throw 会在元素方式和 matmul 入口点以及归约迭代器中的设备不一致时触发。因为该类型派生自 \texttt{RuntimeError}，所以它携带源位置和可选的 C++ 堆栈，但 Python 可以将其与其他运行时错误分开捕获。
 
-\subsubsection{Anomaly guard: \texttt{AnomalyMode}}
+\subsubsection{异常守卫：\texttt{AnomalyMode}}
 
-Enabling anomaly mode sets two process-global flags visible to every thread: record-creation-stacks and check-for-NaN. On node creation the mode stores the current stack (C++ frames by default; the Python binding installs \texttt{traceback.format\_stack} under the GIL) and, if a backward is currently evaluating, records the evaluating node as parent. During backward the engine pushes the evaluating node onto a thread-local guard, so any node created inside that \texttt{apply} records its parent. On exception the engine prints the forward stack chain before rethrowing. The NaN probe is
+启用异常模式会设置两个对每个线程可见的进程全局标志：记录创建堆栈和检查 NaN。在节点创建时，模式存储当前堆栈（默认情况下为 C++ 帧；Python 绑定在 GIL 下安装 \texttt{traceback.format\_stack}），并且如果当前正在评估向后节点，则将评估节点记录为父节点。在向后过程中，引擎将评估节点推送到线程本地防护上，因此在 \texttt{apply} 内创建的任何节点都会记录其父节点。出现异常时，引擎会在重新抛出之前打印前向堆栈链。 NaN 探针是
 
 \begin{lstlisting}[caption={The NaN probe runs under a disabled grad-mode guard so it never records history.}, label=lst:nanprobe-eval]
 bool tensor_has_nan(const Tensor& t){
@@ -795,41 +795,41 @@ bool tensor_has_nan(const Tensor& t){
 }
 \end{lstlisting}
 
-and the chain printer walks the recorded parent pointers (each a \texttt{weak\_ptr<Node>}), printing ``Previous calculation was induced by\dots'' per parent until expiration, so a \texttt{create\_graph} failure shows the forward site that induced the failing backward node.
+链打印机遍历记录的父指针（每个 \texttt{weak\_ptr<Node>}），为每个父节点打印“先前的计算是由 \dots 引起的”，直到过期，因此 \texttt{create\_graph} 故障显示导致失败的后向节点的前向站点。
 
 %======================================================================
-\subsection{Overhead When Disabled}
+\subsection{禁用时的开销}
 \label{subsec:eval-overhead}
 
-Readable frameworks are judged by what they cost when the developer is not looking. Three hot paths sit on every op: the profiler gate, the autograd-mode gate, and the dispatch-key computation. All three are designed to be predicted not-taken or to be a pair of branches.
+可读框架是根据开发人员不注意时的成本来判断的。每个操作上都有三个热路径：分析器门、自动微分模式门和调度密钥计算。这三个分支都被设计为预测不被采用或成为一对分支。
 
 \begin{table}[H]
 \centering
-\caption{Disabled overhead budget, single thread.}
+\caption{禁用开销预算，单线程。}
 \label{tab:overhead}
 \small
 \begin{tabular}{llll}
 \toprule
-Gate & Instruction & Cost (disabled) \\
+Gate & 操作说明 & 成本（禁用） \\
 \midrule
-Profiler & one \texttt{acquire} load + not-taken branch & $\approx$ 2 cycles \\
-\texttt{GradMode} & \texttt{thread\_local bool} load + not-taken branch & $\approx$ 1 cycle \\
-\texttt{InferenceMode} & \texttt{thread\_local bool} load + not-taken branch & $\approx$ 1 cycle \\
-Dispatcher & 2 branches (autocast + composite) & $\approx$ 2 branches \\
-Autograd key & grad-mode $\land$ inference-mode $\land$ requires-grad & 3 loads, short-circuit \\
+分析器 & 一个 \texttt{acquire} 负载 + 未采用的分支 & $\approx$ 2 个周期 \\
+\texttt{GradMode} & \texttt{thread\_local bool} 加载 + 未采用的分支 & $\approx$ 1 个周期 \\
+\texttt{InferenceMode} & \texttt{thread\_local bool} 加载 + 未采用的分支 & $\approx$ 1 个周期 \\
+调度员 & 2 个分支（自动施放 + 复合） & $\approx$ 2 个分支 \\
+自动微分键 & 梯度模式 $\land$ 推理模式 $\land$ 需要梯度 & 3个负载，短路 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsubsection{Profiler: 2 cycles}
+\subsubsection{分析器：2 个周期}
 
-The profiler gate is one \texttt{memory\_order\_acquire} load inlined to a \texttt{mov} + \texttt{cmp} + predicted not-taken branch on x86. Shape and site capture each add one further \texttt{acquire} load, but they sit strictly inside the gate's true-branch, so they add zero cycles when disabled. A CPU-only session never arms the GPU timers at all: the binding stores the timing flags with \texttt{release} before the first op, and the GPU timer path early-returns when disarmed. Measured baseline overhead is $\sim$0.6\,ns at 3.5\,GHz for one load; see \S\ref{sec:profiler} for the enabled costs (30\,ns CPU, 80--120\,ns with shapes, two \texttt{cudaEventRecord} at $\sim$5\,\textmu s).
+探查器门是一个 \texttt{memory\_order\_acquire} 负载，内联到 x86 上的 \texttt{mov} + \texttt{cmp} + 预测未采用的分支。形状和位点捕获都会增加一个额外的 \texttt{acquire} 负载，但它们严格位于门的真实分支内，因此在禁用时它们会添加零周期。仅 CPU 会话根本不会装备 GPU 计时器：绑定在第一个操作之前使用 \texttt{release} 存储计时标志，并且 GPU 计时器路径在解除装备时提前返回。对于一个负载，在 3.5GHz 时测得的基线开销为 $\sim$0.6ns；请参阅 \S\ref{sec:profiler} 了解启用的成本（30\,ns CPU，80--120\,ns 形状，两个 \texttt{cudaEventRecord} 在 $\sim$5\,\textmu s）。
 
 \subsubsection{\texttt{GradMode} / \texttt{InferenceMode}: \texttt{thread\_local}}
 
-Both modes are \texttt{thread\_local bool}s (\texttt{GradMode} defaults true, \texttt{InferenceMode} false). Every generated wrapper computes \texttt{requires\_grad} as \texttt{grad\_mode \&\& !inference\_mode \&\& any\_input\_requires\_grad}---three inlined loads with short-circuit. Worker threads honor the task's \texttt{create\_graph} via a guard that overwrites TLS for the duration of node evaluation, so the disabled cost is exactly the TLS load the engine would have paid anyway. Inference tensors additionally skip version-counter allocation.
+两种模式都是 \texttt{thread\_local bool}s（\texttt{GradMode} 默认为 true，\texttt{InferenceMode} 默认为 false）。每个生成的包装器将 \texttt{requires\_grad} 计算为 \texttt{grad\_mode \&\& !inference\_mode \&\& any\_input\_requires\_grad}---三个带短路的内联负载。工作线程通过在节点评估期间覆盖 TLS 的保护来遵守任务的 \texttt{create\_graph} ，因此禁用的成本正是引擎无论如何都会支付的 TLS 负载。推理张量还跳过版本计数器分配。
 
-\subsubsection{Dispatcher: 2 branches}
+\subsubsection{调度员：2个分支机构}
 
 \begin{lstlisting}[caption={Autocast exclusion is one predicted branch; composite fallthrough is the second.}, label=lst:dispbranch]
 if (is_autocast_key(key) && !autocast::is_enabled(key)) [[unlikely]]
@@ -838,100 +838,100 @@ auto kernel = handle.getKernel(key);   // slot load; composite if empty
 if (!kernel) TP_THROW(NotImplementedError, ...);
 \end{lstlisting}
 
-The first branch is the autocast exclusion above; the second lives inside \texttt{getKernel}: one \texttt{acquire} load of the indexed slot plus, only when a backend slot is empty, one extra \texttt{acquire} load of the \texttt{Composite} slot. For any op with a native kernel the composite load is not taken. Codegen hoists \texttt{static const OperatorHandle} so the name lookup is resolved once per process.
+第一个分支是上面的自动转换排除；第二个位于 \texttt{getKernel} 内：索引槽的 1 个 \texttt{acquire} 负载加上（仅当后端槽为空时） \texttt{Composite} 槽的 1 个额外 \texttt{acquire} 负载。对于任何具有本机内核的操作，不会采用复合负载。 Codegen 提升了 \texttt{static const OperatorHandle} ，因此每个进程都会解析一次名称查找。
 
-Two build-time choices amortize cold cost. The Python extension is compiled as one unity-build translation unit (the 9{,}300-line generated bindings header plus binding units together), while \texttt{p10} deliberately opts out of unity: kernel translation units must remain separate for per-file static registration. The shim library \texttt{tp\_python} merely re-exports real symbols, keeping import time dominated by \texttt{dlopen} rather than Python overhead.
+两种构建时间选择可以摊销冷成本。 Python 扩展被编译为一个统一构建翻译单元（9{,}300 行生成的绑定标头加上绑定单元在一起），而 \texttt{p10} 故意选择退出统一：内核翻译单元必须针对每个文件静态注册保持独立。 shim 库 \texttt{tp\_python} 只是重新导出真实符号，使导入时间由 \texttt{dlopen} 而不是 Python 开销主导。
 
-The explicit DAG's teaching trade-off is one \texttt{shared\_ptr} per node versus \texttt{intrusive\_ptr}. A production runtime uses intrusive reference counting to avoid a separate control block per node; TensorPlay keeps the standard control block so ownership is observable in \texttt{gdb} and \texttt{valgrind} without custom pretty-printers. Sustained throughput therefore sees a constant-factor overhead in backward node allocation that is independent of tensor size and invisible on large matmuls where kernel time dominates.
+显式 DAG 的教学权衡是每个节点一个 \texttt{shared\_ptr} 与 \texttt{intrusive\_ptr}。生产运行时使用侵入式引用计数来避免每个节点有单独的控制块； TensorPlay 保留了标准控制块，因此在 \texttt{gdb} 和 \texttt{valgrind} 中可以观察到所有权，而无需自定义漂亮的打印机。因此，持续吞吐量在后向节点分配中会出现常数因子开销，该开销与张量大小无关，并且在内核时间占主导地位的大型矩阵相乘上不可见。
 
 %======================================================================
-\subsection{Micro-Benchmarks: Dispatch and Binding Overhead}
+\subsection{微基准：调度和绑定开销}
 \label{subsec:eval-microbench}
 
-The disabled-overhead table above decomposes the C++ hot path into loads and branches. This subsection measures what a Python caller actually pays per op end-to-end, and where the nanoseconds go. All measurements are taken on the reference host (16-core x86-64, 3.5\,GHz class, quiet, single thread, min-of-reps over 2{,}000 iterations after 50 warm-up calls).
+上面的禁用开销表将 C++ 热路径分解为加载和分支。本小节测量 Python 调用者实际为每个操作端到端支付的费用，以及纳秒的去向。所有测量均在参考主机上进行（16 核 x86-64、3.5\,GHz 级、安静、单线程、50 次热身调用后超过 2{,}000 次迭代的最小重复次数）。
 
-\subsubsection{Per-op wall-clock cost vs.\ tensor size}
+\subsubsection{每操作挂钟成本与张量大小}
 
 \begin{table}[H]
 \centering
-\caption{Per-op wall-clock from Python, steady state (ns/op, min of 5 reps $\times$ 2{,}000 iters). The [16] fast path skips full \texttt{TensorIterator} build; [1024] adds kernel+memory traffic. \texttt{requires\_grad} adds the autograd wrapper layer.}
+\caption{来自 Python 的每操作挂钟，稳定状态（ns/操作，最少 5 次 $\times$ 2{,}000 迭代）。 [16] 快速路径跳过完整的 \texttt{TensorIterator} 构建； [1024]添加内核+内存流量。 \texttt{requires\_grad} 添加了 autograd 包装层。}
 \label{tab:microbench-perop}
 \small
 \begin{tabular}{lrr}
 \toprule
-Operation & ns/op & Size-relative dispatch share \\
+手术 & ns/op & 相对规模的调度份额 \\
 \midrule
-\texttt{add} \texttt{[1]}, no grad & 885--1\,490 & dispatch $\sim$1\% of total \\
-\texttt{add} \texttt{[1]}, \texttt{requires\_grad} & 1\,930 & autograd layer +$\sim$500\,ns (node alloc + edges) \\
+\texttt{add} \texttt{[1]}，无学位 & 885--1\,490 & 调度 $\sim$1\% 占总数 \\
+\texttt{add} \texttt{[1]}, \texttt{requires\_grad} & 1\,930 & autograd层+$\sim$500\,ns（节点分配+边缘） \\
 \texttt{sum} \texttt{[1]} & 1\,360 & \\
-\texttt{add} \texttt{[16]} & 870 & below [1]: warm cache, no iterator build \\
-\texttt{add} \texttt{[1024]} & 940 & kernel+TLB begin to appear \\
+\texttt{add} \texttt{[16]} & 870 & 下面[1]：热缓存，无迭代器构建 \\
+\texttt{add} \texttt{[1024]} & 940 & 内核+TLB开始出现 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The first result to internalize: the \emph{C++ dispatch machinery costs single-digit nanoseconds} (Table~\ref{tab:overhead}: one acquire load, two predicted branches, one atomic slot index), but a Python-issued op pays $\sim$0.9--1.5\,\textmu s wall-clock. The gap is the binding layer: CPython argument tuple unpacking, bridge type checks, GIL-held entry, and result wrapping through the wrap cache. This is the expected shape for any Python-fronted framework and is why the FASTCALL binding path exists: it removes generic pybind11 dispatch ($\sim$150\,ns per call of overload resolution, measured by the gap between the module function at $\sim$890\,ns and a bare Python \texttt{lambda} adding two \texttt{int}s at $\sim$36\,ns on the same host).
+第一个要内化的结果：\emph{C++ dispatch machinery costs single-digit nanoseconds}（表~\ref{tab:overhead}：一个获取负载，两个预测分支，一个原子槽索引），但是 Python 发出的操作支付 $\sim$0.9--1.5\,\textmu 的挂钟。差距在于绑定层：CPython 参数元组解包、桥接类型检查、GIL 保存的条目以及通过包装缓存进行结果包装。这是任何 Python 前端框架的预期形状，也是 FASTCALL 绑定路径存在的原因：它删除了通用 pybind11 调度（每次重载解析调用 $\sim$150\,ns，通过 $\sim$890\,ns 处的模块函数和在同一主机上的 $\sim$36\,ns 处添加两个 \texttt{int} 的裸 Python \texttt{lambda} 之间的差距来测量）。
 
-\subsubsection{Layer-by-layer decomposition}
+\subsubsection{逐层分解}
 
 \begin{table}[H]
 \centering
-\caption{Where a Python \texttt{tp.add(a,b)} spends its $\sim$890\,ns (prebound module function vs.\ tensor method).}
+\caption{Python \texttt{tp.add(a,b)} 花费其 $\sim$890\,ns （预绑定模块函数与\ 张量方法）。}
 \label{tab:microbench-decomp}
 \small
 \begin{tabular}{llr}
 \toprule
-Layer & Mechanism & Cost \\
+层 & 机制 & Cost \\
 \midrule
-Python interpreter & bytecode dispatch, \texttt{lambda} call & $\sim$36\,ns (baseline) \\
-Attribute + call setup & \texttt{METH\_FASTCALL} arg tuple & $\sim$80--120\,ns \\
-Bridge parse/check & argument parse + type checks & $\sim$400\,ns \\
-Key computation & \texttt{key\_set} + priority resolution & $\sim$2\,ns \\
-Slot lookup & one \texttt{acquire} load & $\sim$0.6\,ns \\
-Autocast+composite branches & predicted not-taken & $\sim$1--2\,ns \\
-Result wrap & wrap-cache hit & $\sim$150\,ns \\
+Python解释器 & 字节码调度，\texttt{lambda} 调用 & $\sim$36\,ns（基线） \\
+属性+呼叫设置 & \texttt{METH\_FASTCALL} arg 元组 & $\sim$80--120\,ns \\
+桥解析/检查 & 参数解析+类型检查 & $\sim$400\,ns \\
+关键计算 & \texttt{key\_set} + 优先分辨率 & $\sim$2\,ns \\
+槽位查找 & 一个 \texttt{acquire} 负载 & $\sim$0.6\,ns \\
+Autocast+复合分支 & 预测未采取 & $\sim$1--2\,ns \\
+结果换行 & 包装缓存命中 & $\sim$150\,ns \\
 \midrule
-Method over module fn & tensor method vs.\ prebound function & $+\sim$80\,ns \\
+模块 fn 上的方法 & 张量方法 vs.\ 预绑定函数 & $+\sim$80\,ns \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Two conclusions follow. First, \textbf{the dispatcher is not the bottleneck}; C++-side dispatch is $\sim$4\,ns of the $\sim$890\,ns total ($<0.5\%$), so the 13-slot array and the closed-key design cost effectively nothing the Python layer where they would be noticed. Second, \textbf{the binding dominates}, which is intrinsic to per-op Python control flow: a training step that batches 1{,}000 ops into a compiled \texttt{stax} program replaces 1{,}000 bridge crossings with one (\S\ref{sec:arch:stax}), eliminating $\sim$0.9\,ms of pure per-op overhead per step on this host.
+以下是两个结论。首先，\textbf{the dispatcher is not the bottleneck}； C++ 端调度是 $\sim$890\,ns 总计 ($<0.5\%$) 的 $\sim$4\,ns，因此 13 槽数组和封闭密钥设计在 Python 层中实际上不会花费任何成本。其次，\textbf{the binding dominates}，它是每操作 Python 控制流所固有的：将 1{,}000 个操作批处理到已编译的 \texttt{stax} 程序中的训练步骤将 1{,}000 个桥交叉替换为一个 (\S\ref{sec:arch:stax})，从而消除了该主机上每个步骤 $\sim$0.9\,ms 的纯每操作开销。
 
-\subsubsection{CPU vs.\ CUDA vs.\ Vulkan dispatch overhead}
+\subsubsection{CPU vs.\ CUDA vs.\ Vulkan 调度开销}
 
-The three backends share one dispatcher table (\S\ref{sec:redispatch}); only the terminal kernel differs. The measured CPU numbers above are for \texttt{CPU}=slot 0. CUDA adds a stream push plus (if profiling) \texttt{cudaEventRecord}; Vulkan adds a command-buffer submit. Backend deltas follow from the kernel-entry structure: a CUDA op pays the same $\sim$4\,ns dispatch plus the driver launch constant ($\sim$5--10\,\textmu s host-side, the same order as the profiler's \texttt{cudaEventRecord} pair); a Vulkan op pays dispatch plus \texttt{vkQueueSubmit} ($\sim$10--30\,\textmu s). For all three backends the dispatcher's own contribution is the same sub-1\% sliver, which is the design goal: backend choice changes the kernel, never the dispatch path.
+三个后端共享一张调度表（\S\ref{sec:redispatch}）；只有终端内核不同。上面测得的 CPU 数量适用于 \texttt{CPU}=slot 0。CUDA 添加了流推送以及（如果进行分析）\texttt{cudaEventRecord}； Vulkan 添加了命令缓冲区提交。后端增量遵循内核条目结构：CUDA 操作支付相同的 $\sim$4\,ns 调度加上驱动程序启动常量（$\sim$5--10\,\textmu s 主机端，与分析器的 \texttt{cudaEventRecord} 对相同的顺序）； Vulkan op 支付调度费用加上 \texttt{vkQueueSubmit} ($\sim$10--30\,\textmu s)。对于所有三个后端，调度程序自己的贡献是相同的 1\% 条子，这是设计目标：后端选择改变内核，而不是调度路径。
 
 %======================================================================
-\subsection{What Is Trimmed}
+\subsection{修剪了什么}
 \label{subsec:eval-trimmed}
 
-Table~\ref{tab:trimmed} enumerates the axes that TensorPlay cuts and what takes their place. Each cut is a one-line predicate in code or a single \texttt{Composite} registration, never a silent semantic change.
+Table~\ref{tab:trimmed} 枚举了 TensorPlay 剪切的轴以及取代它们的位置。每次剪切都是代码中的一行谓词或单个 \texttt{Composite} 注册，而不是无声的语义更改。
 
 \begin{table}[H]
 \centering
-\caption{Trimmed axes. Every entry is a deliberate omission with a fallback or a documented gap.}
+\caption{修剪过的轴。每个条目都是故意遗漏，带有后备或记录的差距。}
 \label{tab:trimmed}
 \small
 \begin{tabular}{lll}
 \toprule
-Axis & What ships & What is trimmed \\
+Axis & 什么船 & 修剪了什么 \\
 \midrule
-Dispatch keys & 13 keys, \texttt{Composite} fallback & no third-party registration, no runtime key creation \\
-\texttt{Meta} dispatch & none & no shape-only kernel; shape inference lives in the compiler pillar \\
-Sparse / quantized & minimal COO storage, no quantized CPU ops & no sparse or quantized dispatch key \\
-In-place alias analysis & \texttt{check\_inplace} on view functions & no multi-version alias tracker \\
-Compiler & vertical pointwise fusion only & no loop codegen, no buffer planning, no autotune \\
-Distributed autograd & collectives via Python c10d layer & no distributed autograd, no RPC autograd \\
-Forward AD & 15 fused forward kernels & no per-level \texttt{ForwardADLevel} \\
+调度钥匙 & 13 个键，\texttt{Composite} 后备 & 无需第三方注册，无需创建运行时密钥 \\
+\texttt{Meta} 调度 & none & 没有纯形状内核；形状推断存在于编译器支柱中 \\
+稀疏/量化 & 最小的 COO 存储，无量化的 CPU 操作 & 没有稀疏或量化的调度密钥 \\
+就地别名分析 & 视图函数上的 \texttt{check\_inplace} & 没有多版本别名跟踪器 \\
+编译器 & 仅垂直逐点融合 & 无循环代码生成、无缓冲区规划、无自动调整 \\
+分布式自动求导 & 通过 Python 分布式层的集体 & 没有分布式自动微分，没有 RPC 自动微分 \\
+前向模式自动微分 & 15 个融合前向内核 & 没有每级 \texttt{ForwardADLevel} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \begin{itemize}[leftmargin=1.2em]
-\item \textbf{No third-party keys.} Registration is closed; there is no \texttt{registerDispatchKey} and no per-operator stack of boxed kernels. The benefit is that the name lookup is one hash probe plus one atomic load, not a vector walk.
-\item \textbf{No meta dispatch.} A production \texttt{Meta} key runs kernels that only compute output shapes and dtypes. TensorPlay never dispatches meta kernels; shape propagation for the compiler pillar is ordinary Python with a shape-prop pass, dead-code elimination, and constant folding. The dispatcher therefore has no \texttt{Meta} slot and no ``meta-tensor'' concept.
-\item \textbf{No sparse/quantized axes.} Sparse layout is a minimal storage payload (COO with a CSR variant), not a dispatch axis. Quantized affine int8 lives as a Python FakeQuantize straight-through estimator on CPU, not as a dtype$\times$key dispatch---although the Vulkan backend ships real quantized shaders (\S\ref{subsec:eval-backends}). There is no \texttt{SparseCPU} or \texttt{QuantizedCPU} key.
-\item \textbf{Teaching compiler.} Fusion is exactly one pattern---\texttt{mul}$\rightarrow$\texttt{add}---plus pointwise expression programs with CPU vectorization. The graph executor interprets sequentially with lifetime-based buffer recycling; there is no codegen to loops or to CUDA, no buffer reuse planning, and no performance model. It is a concept demonstration, not a production compiler.
-\item \textbf{Composite fallbacks.} The trimmed axes are not cliffs: two dozen composite registrations (view/copy, histogram, unique, itertools, integration, tensor properties) serve as the neutral kernel when a backend slot is empty. Adding a native kernel replaces the fallback for that op alone.
+\item \textbf{No third-party keys.} 注册已结束；没有 \texttt{registerDispatchKey} ，也没有每个操作符的盒装内核堆栈。好处是名称查找是一个哈希探针加一个原子负载，而不是向量遍历。
+\item \textbf{No meta dispatch.} 生产 \texttt{Meta} 键运行仅计算输出形状和数据类型的内核。 TensorPlay 从不调度元内核；编译器支柱的形状传播是普通的 Python，具有形状属性传递、死代码消除和常量折叠。因此，调度程序没有 \texttt{Meta} 槽，也没有“元张量”概念。
+\item \textbf{No sparse/quantized axes.} 稀疏布局是最小存储有效负载（具有 CSR 变体的 COO），而不是调度轴。量化仿射 int8 在 CPU 上作为 Python FakeQuantize 直通估计器运行，而不是作为 dtype$\times$key 调度 — 尽管 Vulkan 后端提供真正的量化着色器 (\S\ref{subsec:eval-backends})。没有 \texttt{SparseCPU} 或 \texttt{QuantizedCPU} 键。
+\item \textbf{Teaching compiler.} Fusion 正是一种模式 ---\texttt{mul}$\rightarrow$\texttt{add}--- 加上带有 CPU 矢量化的逐点表达式程序。图执行器通过基于生命周期的缓冲区回收按顺序进行解释；没有循环或 CUDA 的代码生成，没有缓冲区重用规划，也没有性能模型。它是一个概念演示，而不是生产编译器。
+\item \textbf{Composite fallbacks.} 修剪后的轴不是悬崖：当后端插槽为空时，两打复合注册（查看/复制、直方图、唯一、itertools、积分、张量属性）用作中性内核。添加本机内核可以单独替换该操作的后备。
 \end{itemize}

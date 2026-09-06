@@ -2,7 +2,7 @@
 
 // NEON helper layer for the aarch64 128-bit vec tier. Intrinsics come from
 // <arm_neon.h> (pulled in by cpu/vec/intrinsics.h on __aarch64__). The
-// transcendental policy mirrors the desktop defaults: SLEEF's ADVSIMD
+// transcendental policy follows the desktop defaults: SLEEF's ADVSIMD
 // runtime dispatchers on Linux and macOS, scalar <cmath> on Android.
 
 #include "cpu/vec/vec_base.h"

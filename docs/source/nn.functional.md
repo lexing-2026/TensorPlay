@@ -53,6 +53,9 @@
 
 ## Attention Mechanisms
 
+The {mod}`tensorplay.nn.attention.bias` module contains attention_biases that are designed to be used with
+scaled_dot_product_attention.
+
 ```{eval-rst}
 .. autosummary::
     :toctree: generated
@@ -69,19 +72,19 @@
     :nosignatures:
 
     tensorplay.nn.functional.threshold
-    tensorplay.threshold_
+    tensorplay.nn.functional.threshold_
     tensorplay.nn.functional.relu
-    tensorplay.relu_
+    tensorplay.nn.functional.relu_
     tensorplay.nn.functional.hardtanh
-    tensorplay.hardtanh_
+    tensorplay.nn.functional.hardtanh_
     tensorplay.nn.functional.hardswish
     tensorplay.nn.functional.relu6
     tensorplay.nn.functional.elu
-    tensorplay.elu_
+    tensorplay.nn.functional.elu_
     tensorplay.nn.functional.selu
     tensorplay.nn.functional.celu
     tensorplay.nn.functional.leaky_relu
-    tensorplay.leaky_relu_
+    tensorplay.nn.functional.leaky_relu_
     tensorplay.nn.functional.prelu
     tensorplay.nn.functional.rrelu
     tensorplay.nn.functional.rrelu_
@@ -206,8 +209,6 @@
     tensorplay.nn.functional.grid_sample
     tensorplay.nn.functional.affine_grid
 ```
-
-### {hidden}`data_parallel`
 
 ## Low-Precision functions
 

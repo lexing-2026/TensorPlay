@@ -31,6 +31,22 @@
 namespace tensorplay {
 namespace cuda {
 
+// nvcc forbids generic lambdas from carrying the __host__ __device__
+// specifiers.  This wrapper keeps the templated call expression inside an
+// ordinary functor so the dispatchers can still invoke them per element
+// type; the wrapped generic lambda itself carries no specifiers and is
+// instantiated separately on each side.
+template <typename F>
+struct GenericFn {
+    F f;
+    template <typename... Args>
+    __host__ __device__ auto operator()(Args... args) const
+        -> decltype(f(args...)) {
+        return f(args...);
+    }
+};
+
+
 #define CUDA_CHECK(condition) \
   do { \
     cudaError_t error = condition; \
@@ -80,12 +96,12 @@ inline std::vector<int64_t> shape_of(const Tensor& t) {
 // ---------------------------------------------------------------------------
 
 template <typename T>
-__device__ bool logical_truth_cuda(const T& value) {
-    return static_cast<bool>(value);
+__host__ __device__ bool logical_truth_cuda(const T& value) {
+    return static_cast<bool>(value != T(0));
 }
 
 template <typename T>
-__device__ bool logical_truth_cuda(const tensorplay::complex<T>& value) {
+__host__ __device__ bool logical_truth_cuda(const tensorplay::complex<T>& value) {
     return value.real() != T(0) || value.imag() != T(0);
 }
 
@@ -124,7 +140,7 @@ Tensor binary_same_cuda(const Tensor& a_in, const Tensor& b_in, Op op, const cha
         .build();
 #define TP_BIN(ctype, name_) \
     case DType::name_: \
-        gpu_kernel(iter, [op] __device__(ctype lhs, ctype rhs) -> ctype { \
+        gpu_kernel(iter, [op] __host__ __device__(ctype lhs, ctype rhs) -> ctype { \
             return op(lhs, rhs); \
         }); \
         break;
@@ -153,7 +169,7 @@ Tensor binary_bool_cuda(const Tensor& a_in, const Tensor& b_in, Pred pred, const
         .build();
 #define TP_BBIN(ctype, name_) \
     case DType::name_: \
-        gpu_kernel(iter, [pred] __device__(ctype lhs, ctype rhs) -> bool { \
+        gpu_kernel(iter, [pred] __host__ __device__(ctype lhs, ctype rhs) -> bool { \
             return pred(lhs, rhs); \
         }); \
         break;
@@ -177,7 +193,7 @@ Tensor bool_unary_cuda(const Tensor& self, Pred pred, const char* name) {
         .build();
 #define TP_BU(ctype, name_) \
     case DType::name_: \
-        gpu_kernel(iter, [pred] __device__(ctype value) -> bool { \
+        gpu_kernel(iter, [pred] __host__ __device__(ctype value) -> bool { \
             return pred(value); \
         }); \
         break;
@@ -206,20 +222,20 @@ Tensor logical_binary_cuda(const Tensor& a_in, const Tensor& b_in, Pred pred,
         .build();
 #define TP_LOGICAL_BIN(ctype, name_) \
     case DType::name_: \
-        gpu_kernel(iter, [pred] __device__(ctype lhs, ctype rhs) -> bool { \
+        gpu_kernel(iter, [pred] __host__ __device__(ctype lhs, ctype rhs) -> bool { \
             return pred(logical_truth_cuda(lhs), logical_truth_cuda(rhs)); \
         }); \
         break;
     switch (dt) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_LOGICAL_BIN)
         case DType::ComplexFloat:
-            gpu_kernel(iter, [pred] __device__(tensorplay::complex<float> lhs,
+            gpu_kernel(iter, [pred] __host__ __device__(tensorplay::complex<float> lhs,
                                                 tensorplay::complex<float> rhs) -> bool {
                 return pred(logical_truth_cuda(lhs), logical_truth_cuda(rhs));
             });
             break;
         case DType::ComplexDouble:
-            gpu_kernel(iter, [pred] __device__(tensorplay::complex<double> lhs,
+            gpu_kernel(iter, [pred] __host__ __device__(tensorplay::complex<double> lhs,
                                                 tensorplay::complex<double> rhs) -> bool {
                 return pred(logical_truth_cuda(lhs), logical_truth_cuda(rhs));
             });
@@ -246,19 +262,19 @@ Tensor logical_unary_cuda(const Tensor& self, Pred pred, const char* name) {
         .build();
 #define TP_LOGICAL_UNARY(ctype, name_) \
     case DType::name_: \
-        gpu_kernel(iter, [pred] __device__(ctype value) -> bool { \
+        gpu_kernel(iter, [pred] __host__ __device__(ctype value) -> bool { \
             return pred(logical_truth_cuda(value)); \
         }); \
         break;
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_LOGICAL_UNARY)
         case DType::ComplexFloat:
-            gpu_kernel(iter, [pred] __device__(tensorplay::complex<float> value) -> bool {
+            gpu_kernel(iter, [pred] __host__ __device__(tensorplay::complex<float> value) -> bool {
                 return pred(logical_truth_cuda(value));
             });
             break;
         case DType::ComplexDouble:
-            gpu_kernel(iter, [pred] __device__(tensorplay::complex<double> value) -> bool {
+            gpu_kernel(iter, [pred] __host__ __device__(tensorplay::complex<double> value) -> bool {
                 return pred(logical_truth_cuda(value));
             });
             break;
@@ -285,7 +301,7 @@ Tensor dtype_unary_cuda(const Tensor& self, F f, const char* name) {
         .build();
 #define TP_DU(ctype, name_) \
     case DType::name_: \
-        gpu_kernel(iter, [f] __device__(ctype value) -> ctype { \
+        gpu_kernel(iter, [f] __host__ __device__(ctype value) -> ctype { \
             return f(value); \
         }); \
         break;
@@ -314,11 +330,11 @@ Tensor float_math_cuda(const Tensor& self, F f, const char* name) {
             .add_const_input(w)
             .build();
         if (compute_dt == DType::Float64) {
-            gpu_kernel(iter, [f] __device__(double x) -> double {
+            gpu_kernel(iter, [f] __host__ __device__(double x) -> double {
                 return f(x);
             });
         } else {
-            gpu_kernel(iter, [f] __device__(float x) -> float {
+            gpu_kernel(iter, [f] __host__ __device__(float x) -> float {
                 return static_cast<float>(f(static_cast<double>(x)));
             });
         }
@@ -346,11 +362,11 @@ Tensor binary_float_cuda(const Tensor& a_in, const Tensor& b_in, F f, const char
         .add_const_input(bc)
         .build();
     if (compute_dt == DType::Float64) {
-        gpu_kernel(iter, [f] __device__(double x, double y) -> double {
+        gpu_kernel(iter, [f] __host__ __device__(double x, double y) -> double {
             return f(x, y);
         });
     } else {
-        gpu_kernel(iter, [f] __device__(float x, float y) -> float {
+        gpu_kernel(iter, [f] __host__ __device__(float x, float y) -> float {
             return static_cast<float>(f(static_cast<double>(x),
                                         static_cast<double>(y)));
         });
@@ -384,6 +400,8 @@ __global__ void slice_reduce_f64_kernel(int64_t n_slices, int64_t d_size, int64_
 // Arithmetic
 // ===========================================================================
 
+Tensor sub_kernel(const Tensor& self, const Tensor& other, Scalar alpha);
+
 Tensor rsub_scalar_cuda(const Tensor& self, Scalar other, Scalar alpha) {
     DType dt = isFloatingType(other.dtype())
                    ? (isFloatingType(self.dtype()) ? self.dtype() : DType::Float32)
@@ -391,24 +409,12 @@ Tensor rsub_scalar_cuda(const Tensor& self, Scalar other, Scalar alpha) {
     Tensor sc = self.to(dt).contiguous();
     Tensor full = Tensor::full({}, other, dt, self.device())
                       .expand(shape_of(sc)).contiguous();
-    double al = alpha.toDouble();
-    // other - alpha * self: alpha scales the subtrahend, which is self here.
-    return binary_same_cuda(sc, full,
-                            [al] __device__ (auto s, auto o) {
-                                using T = decltype(o);
-                                return static_cast<T>(o - al * s);
-                            },
-                            "rsub");
+    // other - alpha * self, routed through the shared subtract kernel.
+    return sub_kernel(full, sc, alpha);
 }
 
 Tensor rsub_tensor_cuda(const Tensor& self, const Tensor& other, Scalar alpha) {
-    double al = alpha.toDouble();
-    return binary_same_cuda(self, other,
-                            [al] __device__ (auto s, auto o) {
-                                using T = decltype(o);
-                                return static_cast<T>(o - al * s);
-                            },
-                            "rsub");
+    return sub_kernel(other, self, alpha);
 }
 
 Tensor true_divide_tensor_cuda(const Tensor& self, const Tensor& other) {
@@ -418,7 +424,7 @@ Tensor true_divide_tensor_cuda(const Tensor& self, const Tensor& other) {
         return div_kernel(self, other);
     }
     return binary_float_cuda(self, other,
-                             [] __device__ (double x, double y) { return x / y; }, "true_divide");
+                             GenericFn{[](double x, double y) { return x / y; }}, "true_divide");
 }
 Tensor true_divide_scalar_cuda(const Tensor& self, Scalar other) {
     // A Float32 stand-in would widen Half/BFloat16 inputs.
@@ -434,7 +440,7 @@ Tensor divide_scalar_cuda(const Tensor& self, Scalar other) {
 
 Tensor remainder_tensor_cuda(const Tensor& self, const Tensor& other) {
     return binary_same_cuda(self, other,
-                            [] __device__ (auto x, auto y) -> decltype(x) {
+                            GenericFn{[](auto x, auto y) -> decltype(x) {
                                 using T = decltype(x);
                                 T r;
                                 if constexpr (std::is_integral_v<T>)
@@ -443,7 +449,7 @@ Tensor remainder_tensor_cuda(const Tensor& self, const Tensor& other) {
                                     r = static_cast<T>(::fmod(static_cast<double>(x), static_cast<double>(y)));
                                 if (r != T(0) && ((r < static_cast<T>(0)) != (y < static_cast<T>(0)))) r = static_cast<T>(r + y);
                                 return r;
-                            },
+                            }},
                             "remainder");
 }
 Tensor remainder_scalar_cuda(const Tensor& self, Scalar other) {
@@ -458,12 +464,12 @@ Tensor remainder_scalar_tensor_cuda(Scalar self, const Tensor& other) {
 }
 Tensor fmod_tensor_cuda(const Tensor& self, const Tensor& other) {
     return binary_same_cuda(self, other,
-                            [] __device__ (auto x, auto y) -> decltype(x) {
+                            GenericFn{[](auto x, auto y) -> decltype(x) {
                                 if constexpr (std::is_integral_v<decltype(x)>)
                                     return static_cast<decltype(x)>(x % y);
                                 else
                                     return static_cast<decltype(x)>(::fmod(static_cast<double>(x), static_cast<double>(y)));
-                            },
+                            }},
                             "fmod");
 }
 Tensor fmod_scalar_cuda(const Tensor& self, Scalar other) {
@@ -474,14 +480,14 @@ Tensor subtract_tensor_cuda(const Tensor& self, const Tensor& other, Scalar alph
     // alpha == 1 is by far the common call and keeps the unscaled loop.
     if (!alpha.isComplex() && alpha.toDouble() == 1.0) {
         return binary_same_cuda(self, other,
-                                [] __device__ (auto x, auto y) { return x - y; }, "subtract");
+                                GenericFn{[](auto x, auto y) { return x - y; }}, "subtract");
     }
     const double al = alpha.toDouble();
     return binary_same_cuda(self, other,
-                            [al] __device__ (auto x, auto y) {
+                            GenericFn{[al](auto x, auto y) {
                                 using T = decltype(x);
                                 return static_cast<T>(x - y * al);
-                            }, "subtract");
+                            }}, "subtract");
 }
 Tensor subtract_scalar_cuda(const Tensor& self, Scalar other, Scalar alpha) {
     const DType dt = scalar_promote(self.dtype(), other);
@@ -490,15 +496,15 @@ Tensor subtract_scalar_cuda(const Tensor& self, Scalar other, Scalar alpha) {
 }
 Tensor multiply_tensor_cuda(const Tensor& self, const Tensor& other) {
     return binary_same_cuda(self, other,
-                            [] __device__ (auto x, auto y) { return x * y; }, "multiply");
+                            GenericFn{[](auto x, auto y) { return x * y; }}, "multiply");
 }
 Tensor multiply_scalar_cuda(const Tensor& self, Scalar other) {
     double ov = other.toDouble();
     return dtype_unary_cuda(self,
-                            [ov] __device__ (auto x) {
+                            GenericFn{[ov](auto x) {
                                 using T = decltype(x);
                                 return static_cast<T>(static_cast<double>(x) * ov);
-                            },
+                            }},
                             "multiply");
 }
 
@@ -523,7 +529,7 @@ Tensor div_rounded_core(const Tensor& a, const Tensor& b, DivRounding rounding) 
     // Rounded division stays in the input dtype: an integral pair must come
     // back integral, which the float promotion of true division loses.
     const bool floor_mode = (rounding == DivRounding::kFloor);
-    return binary_same_cuda(a, b, [floor_mode] __device__ (auto x, auto y) -> decltype(x) {
+    return binary_same_cuda(a, b, GenericFn{[floor_mode](auto x, auto y) -> decltype(x) {
         using T = decltype(x);
         if constexpr (std::is_integral_v<T>) {
             if (y == T(0)) return T(0);
@@ -543,7 +549,7 @@ Tensor div_rounded_core(const Tensor& a, const Tensor& b, DivRounding rounding) 
             const C q = static_cast<C>(x) / static_cast<C>(y);
             return static_cast<T>(floor_mode ? ::floor(q) : ::trunc(q));
         }
-    }, "div");
+    }}, "div");
 }
 
 Tensor div_rounded_scalar(const Tensor& self, Scalar other, DivRounding rounding) {
@@ -572,7 +578,7 @@ Tensor floor_divide_scalar_cuda(const Tensor& self, Scalar other) {
 
 Tensor negative_cuda(const Tensor& self) {
     return dtype_unary_cuda(self,
-                            [] __device__ (auto x) { return static_cast<decltype(x)>(-x); },
+                            GenericFn{[](auto x) { return static_cast<decltype(x)>(-x); }},
                             "negative");
 }
 Tensor positive_cuda(const Tensor& self) { return self.clone(); }
@@ -582,74 +588,74 @@ Tensor positive_cuda(const Tensor& self) { return self.clone(); }
 // ===========================================================================
 
 Tensor greater_cuda(const Tensor& a, const Tensor& b) {
-    return binary_bool_cuda(a, b, [] __device__ (auto x, auto y) { return x > y; }, "greater");
+    return binary_bool_cuda(a, b, GenericFn{[](auto x, auto y) { return x > y; }}, "greater");
 }
 Tensor greater_equal_cuda(const Tensor& a, const Tensor& b) {
-    return binary_bool_cuda(a, b, [] __device__ (auto x, auto y) { return x >= y; }, "greater_equal");
+    return binary_bool_cuda(a, b, GenericFn{[](auto x, auto y) { return x >= y; }}, "greater_equal");
 }
 Tensor less_cuda(const Tensor& a, const Tensor& b) {
-    return binary_bool_cuda(a, b, [] __device__ (auto x, auto y) { return x < y; }, "less");
+    return binary_bool_cuda(a, b, GenericFn{[](auto x, auto y) { return x < y; }}, "less");
 }
 Tensor less_equal_cuda(const Tensor& a, const Tensor& b) {
-    return binary_bool_cuda(a, b, [] __device__ (auto x, auto y) { return x <= y; }, "less_equal");
+    return binary_bool_cuda(a, b, GenericFn{[](auto x, auto y) { return x <= y; }}, "less_equal");
 }
 Tensor not_equal_cuda(const Tensor& a, const Tensor& b) {
-    return binary_bool_cuda(a, b, [] __device__ (auto x, auto y) { return x != y; }, "not_equal");
+    return binary_bool_cuda(a, b, GenericFn{[](auto x, auto y) { return x != y; }}, "not_equal");
 }
 Tensor signbit_cuda(const Tensor& self) {
-    return bool_unary_cuda(self, [] __device__ (auto x) -> bool {
+    return bool_unary_cuda(self, GenericFn{[](auto x) -> bool {
         return static_cast<double>(x) < 0.0 ||
                (static_cast<double>(x) == 0.0 && 1.0 / static_cast<double>(x) < 0.0);
-    }, "signbit");
+    }}, "signbit");
 }
 Tensor logical_not_cuda(const Tensor& self) {
-    return logical_unary_cuda(self, [] __device__ (bool x) -> bool { return !x; },
+    return logical_unary_cuda(self, GenericFn{[](bool x) -> bool { return !x; }},
                               "logical_not");
 }
 Tensor logical_and_cuda(const Tensor& a, const Tensor& b) {
-    return logical_binary_cuda(a, b, [] __device__ (bool x, bool y) -> bool {
+    return logical_binary_cuda(a, b, GenericFn{[](bool x, bool y) -> bool {
         return x && y;
-    }, "logical_and");
+    }}, "logical_and");
 }
 Tensor logical_or_cuda(const Tensor& a, const Tensor& b) {
-    return logical_binary_cuda(a, b, [] __device__ (bool x, bool y) -> bool {
+    return logical_binary_cuda(a, b, GenericFn{[](bool x, bool y) -> bool {
         return x || y;
-    }, "logical_or");
+    }}, "logical_or");
 }
 Tensor logical_xor_cuda(const Tensor& a, const Tensor& b) {
-    return logical_binary_cuda(a, b, [] __device__ (bool x, bool y) -> bool {
+    return logical_binary_cuda(a, b, GenericFn{[](bool x, bool y) -> bool {
         return x != y;
-    }, "logical_xor");
+    }}, "logical_xor");
 }
 Tensor isfinite_cuda(const Tensor& self) {
-    return bool_unary_cuda(self, [] __device__ (auto x) -> bool {
+    return bool_unary_cuda(self, GenericFn{[](auto x) -> bool {
         double d = static_cast<double>(x);
         return d == d && d != std::numeric_limits<double>::infinity() &&
                d != -std::numeric_limits<double>::infinity();
-    }, "isfinite");
+    }}, "isfinite");
 }
 Tensor isinf_cuda(const Tensor& self) {
-    return bool_unary_cuda(self, [] __device__ (auto x) -> bool {
+    return bool_unary_cuda(self, GenericFn{[](auto x) -> bool {
         double d = static_cast<double>(x);
         return d == std::numeric_limits<double>::infinity() ||
                d == -std::numeric_limits<double>::infinity();
-    }, "isinf");
+    }}, "isinf");
 }
 Tensor isnan_cuda(const Tensor& self) {
-    return bool_unary_cuda(self, [] __device__ (auto x) -> bool {
+    return bool_unary_cuda(self, GenericFn{[](auto x) -> bool {
         double d = static_cast<double>(x);
         return d != d;
-    }, "isnan");
+    }}, "isnan");
 }
 Tensor isneginf_cuda(const Tensor& self) {
-    return bool_unary_cuda(self, [] __device__ (auto x) -> bool {
+    return bool_unary_cuda(self, GenericFn{[](auto x) -> bool {
         return static_cast<double>(x) == -std::numeric_limits<double>::infinity();
-    }, "isneginf");
+    }}, "isneginf");
 }
 Tensor isposinf_cuda(const Tensor& self) {
-    return bool_unary_cuda(self, [] __device__ (auto x) -> bool {
+    return bool_unary_cuda(self, GenericFn{[](auto x) -> bool {
         return static_cast<double>(x) == std::numeric_limits<double>::infinity();
-    }, "isposinf");
+    }}, "isposinf");
 }
 
 // ===========================================================================
@@ -679,62 +685,62 @@ Tensor reciprocal_cuda(const Tensor& self) {
         CUDA_CHECK(cudaGetLastError());
         return result;
     }
-    return float_math_cuda(self, [] __device__ (double x) { return 1.0 / x; }, "reciprocal");
+    return float_math_cuda(self, GenericFn{[](double x) { return 1.0 / x; }}, "reciprocal");
 }
 Tensor sgn_cuda(const Tensor& self) {
     return dtype_unary_cuda(self,
-                            [] __device__ (auto x) -> decltype(x) {
+                            GenericFn{[](auto x) -> decltype(x) {
                                 using T = decltype(x);
                                 double d = static_cast<double>(x);
                                 if (d != d) return static_cast<T>(x);
                                 if (d > 0) return static_cast<T>(1);
                                 if (d < 0) return static_cast<T>(-1);
                                 return static_cast<T>(0);
-                            },
+                            }},
                             "sgn");
 }
 Tensor exp2_cuda(const Tensor& self) {
-    return float_math_cuda(self, [] __device__ (double x) { return ::exp2(x); }, "exp2");
+    return float_math_cuda(self, GenericFn{[](double x) { return ::exp2(x); }}, "exp2");
 }
 Tensor sinc_cuda(const Tensor& self) {
-    return float_math_cuda(self, [] __device__ (double x) {
+    return float_math_cuda(self, GenericFn{[](double x) {
         double px = M_PI * x;
         return ::fabs(px) < 1e-30 ? 1.0 : ::sin(px) / px;
-    }, "sinc");
+    }}, "sinc");
 }
 Tensor deg2rad_cuda(const Tensor& self) {
-    return float_math_cuda(self, [] __device__ (double x) { return x * (M_PI / 180.0); }, "deg2rad");
+    return float_math_cuda(self, GenericFn{[](double x) { return x * (M_PI / 180.0); }}, "deg2rad");
 }
 Tensor rad2deg_cuda(const Tensor& self) {
-    return float_math_cuda(self, [] __device__ (double x) { return x * (180.0 / M_PI); }, "rad2deg");
+    return float_math_cuda(self, GenericFn{[](double x) { return x * (180.0 / M_PI); }}, "rad2deg");
 }
 Tensor fix_cuda(const Tensor& self) {
     return dtype_unary_cuda(self,
-                            [] __device__ (auto x) -> decltype(x) {
+                            GenericFn{[](auto x) -> decltype(x) {
                                 if constexpr (std::is_floating_point_v<decltype(x)>)
                                     return static_cast<decltype(x)>(::trunc(static_cast<double>(x)));
                                 else
                                     return x;
-                            },
+                            }},
                             "fix");
 }
 Tensor erfinv_cuda(const Tensor& self) {
     // CUDA has no native erfinv; use the Cephes calc_erfinv from SpecialMath.h
     // host-only ::erfinv — linking that from device code leaves an undefined
     // symbol in libp10.so.
-    return float_math_cuda(self, [] __device__ (double x) { return tensorplay::special_math::calc_erfinv(x); }, "erfinv");
+    return float_math_cuda(self, GenericFn{[](double x) { return tensorplay::special_math::calc_erfinv(x); }}, "erfinv");
 }
 Tensor logit_cuda(const Tensor& self, std::optional<Scalar> eps) {
     double e = eps.has_value() ? eps->toDouble() : -1.0;
     return float_math_cuda(self,
-                           [e] __device__ (double p) {
+                           GenericFn{[e](double p) {
                                if (e >= 0) p = ::fmin(::fmax(p, e), 1.0 - e);
                                return ::log(p / (1.0 - p));
-                           },
+                           }},
                            "logit");
 }
 Tensor digamma_cuda(const Tensor& self) {
-    return float_math_cuda(self, [] __device__ (double v) {
+    return float_math_cuda(self, GenericFn{[](double v) {
         if (v <= 0 && v == ::floor(v)) return ::nan("");
         double r = 0;
         while (v < 6.0) { r -= 1.0 / v; v += 1.0; }
@@ -742,13 +748,13 @@ Tensor digamma_cuda(const Tensor& self) {
         r += ::log(v) - 0.5 * inv
              - inv2 * (1.0/12.0 - inv2 * (1.0/120.0 - inv2 * (1.0/252.0 - inv2 * (1.0/240.0 - inv2 / 132.0))));
         return r;
-    }, "digamma");
+    }}, "digamma");
 }
 Tensor i0_cuda(const Tensor& self) {
     // Chebyshev expansion, valid over the whole range; see i0_cpu.
-    return float_math_cuda(self, [] __device__ (double v) {
+    return float_math_cuda(self, GenericFn{[](double v) {
         return tensorplay::special_math::modified_bessel_i0_forward(v);
-    }, "i0");
+    }}, "i0");
 }
 Tensor nan_to_num_cuda(const Tensor& self, Scalar nan,
                        std::optional<Scalar> posinf, std::optional<Scalar> neginf) {
@@ -776,7 +782,7 @@ Tensor nan_to_num_cuda(const Tensor& self, Scalar nan,
                 value_t neginf_replacement = neginf.has_value()
                     ? static_cast<value_t>(neginf->toDouble())
                     : std::numeric_limits<value_t>::lowest();
-                gpu_kernel(iter, [=] __device__ (complex_t value) -> complex_t {
+                gpu_kernel(iter, GenericFn{[=](complex_t value) -> complex_t {
                     return complex_t(
                         nan_to_num_replace_cuda(
                             value.real(), nan_replacement, posinf_replacement,
@@ -784,7 +790,7 @@ Tensor nan_to_num_cuda(const Tensor& self, Scalar nan,
                         nan_to_num_replace_cuda(
                             value.imag(), nan_replacement, posinf_replacement,
                             neginf_replacement));
-                });
+                }});
                 break;
             }
             case DType::ComplexDouble: {
@@ -797,7 +803,7 @@ Tensor nan_to_num_cuda(const Tensor& self, Scalar nan,
                 value_t neginf_replacement = neginf.has_value()
                     ? static_cast<value_t>(neginf->toDouble())
                     : std::numeric_limits<value_t>::lowest();
-                gpu_kernel(iter, [=] __device__ (complex_t value) -> complex_t {
+                gpu_kernel(iter, GenericFn{[=](complex_t value) -> complex_t {
                     return complex_t(
                         nan_to_num_replace_cuda(
                             value.real(), nan_replacement, posinf_replacement,
@@ -805,7 +811,7 @@ Tensor nan_to_num_cuda(const Tensor& self, Scalar nan,
                         nan_to_num_replace_cuda(
                             value.imag(), nan_replacement, posinf_replacement,
                             neginf_replacement));
-                });
+                }});
                 break;
             }
             default:
@@ -822,11 +828,11 @@ Tensor nan_to_num_cuda(const Tensor& self, Scalar nan,
             ctype neginf_replacement = neginf.has_value() \
                 ? static_cast<ctype>(neginf->toDouble()) \
                 : std::numeric_limits<ctype>::lowest(); \
-            gpu_kernel(iter, [=] __device__ (ctype value) -> ctype { \
+            gpu_kernel(iter, GenericFn{[=](ctype value) -> ctype { \
                 return nan_to_num_replace_cuda( \
                     value, nan_replacement, posinf_replacement, \
                     neginf_replacement); \
-            }); \
+            }}); \
             break; \
         }
         switch (self.dtype()) {
@@ -843,28 +849,28 @@ Tensor nan_to_num_cuda(const Tensor& self, Scalar nan,
 }
 
 Tensor xlogy_cuda(const Tensor& a, const Tensor& b) {
-    return binary_float_cuda(a, b, [] __device__ (double x, double y) {
+    return binary_float_cuda(a, b, GenericFn{[](double x, double y) {
         return tensorplay::special_math::calc_xlogy(x, y);
-    }, "xlogy");
+    }}, "xlogy");
 }
 Tensor logaddexp_cuda(const Tensor& a, const Tensor& b) {
-    return binary_float_cuda(a, b, [] __device__ (double x, double y) {
+    return binary_float_cuda(a, b, GenericFn{[](double x, double y) {
         double m = ::fmax(x, y);
         if (m == -std::numeric_limits<double>::infinity() || m != m) return m;
         return m + ::log1p(::exp(-::fabs(x - y)));
-    }, "logaddexp");
+    }}, "logaddexp");
 }
 Tensor logaddexp2_cuda(const Tensor& a, const Tensor& b) {
-    return binary_float_cuda(a, b, [] __device__ (double x, double y) {
+    return binary_float_cuda(a, b, GenericFn{[](double x, double y) {
         double m = ::fmax(x, y);
         if (m == -std::numeric_limits<double>::infinity() || m != m) return m;
         return m + ::log1p(::exp2(-::fabs(x - y))) / M_LN2;
-    }, "logaddexp2");
+    }}, "logaddexp2");
 }
 Tensor copysign_cuda(const Tensor& a, const Tensor& b) {
-    return binary_float_cuda(a, b, [] __device__ (double x, double y) {
+    return binary_float_cuda(a, b, GenericFn{[](double x, double y) {
         return ::copysign(x, y);
-    }, "copysign");
+    }}, "copysign");
 }
 Tensor copysign_scalar_cuda(const Tensor& self, Scalar other) {
     // The sign comes from the scalar alone, so the divisor width never
@@ -872,33 +878,33 @@ Tensor copysign_scalar_cuda(const Tensor& self, Scalar other) {
     return copysign_cuda(self, Tensor::full({}, other, DType::Float32, self.device()));
 }
 Tensor hypot_cuda(const Tensor& a, const Tensor& b) {
-    return binary_float_cuda(a, b, [] __device__ (double x, double y) {
+    return binary_float_cuda(a, b, GenericFn{[](double x, double y) {
         return ::hypot(x, y);
-    }, "hypot");
+    }}, "hypot");
 }
 Tensor nextafter_cuda(const Tensor& a, const Tensor& b) {
-    return binary_float_cuda(a, b, [] __device__ (double x, double y) {
+    return binary_float_cuda(a, b, GenericFn{[](double x, double y) {
         return ::nextafter(x, y);
-    }, "nextafter");
+    }}, "nextafter");
 }
 Tensor gcd_cuda(const Tensor& a, const Tensor& b) {
     DType dt = promoteTypes(a.dtype(), b.dtype());
     if (isFloatingType(dt)) TP_THROW(TypeError, "gcd only supports integral tensors");
     return binary_same_cuda(a, b,
-                            [] __device__ (auto x, auto y) -> decltype(x) {
+                            GenericFn{[](auto x, auto y) -> decltype(x) {
                                 using T = decltype(x);
                                 long long ux = static_cast<long long>(x < static_cast<T>(0) ? -x : x);
                                 long long uy = static_cast<long long>(y < static_cast<T>(0) ? -y : y);
                                 while (uy) { long long t = ux % uy; ux = uy; uy = t; }
                                 return static_cast<T>(ux);
-                            },
+                            }},
                             "gcd");
 }
 Tensor lcm_cuda(const Tensor& a, const Tensor& b) {
     DType dt = promoteTypes(a.dtype(), b.dtype());
     if (isFloatingType(dt)) TP_THROW(TypeError, "lcm only supports integral tensors");
     return binary_same_cuda(a, b,
-                            [] __device__ (auto x, auto y) -> decltype(x) {
+                            GenericFn{[](auto x, auto y) -> decltype(x) {
                                 using T = decltype(x);
                                 long long ux = static_cast<long long>(x < static_cast<T>(0) ? -x : x);
                                 long long uy = static_cast<long long>(y < static_cast<T>(0) ? -y : y);
@@ -906,18 +912,18 @@ Tensor lcm_cuda(const Tensor& a, const Tensor& b) {
                                 while (t2) { long long t3 = g % t2; g = t2; t2 = t3; }
                                 if (g == 0) return static_cast<T>(0);
                                 return static_cast<T>(ux / g * uy);
-                            },
+                            }},
                             "lcm");
 }
 Tensor heaviside_cuda(const Tensor& a, const Tensor& values) {
     return binary_same_cuda(a, values,
-                            [] __device__ (auto x, auto v) -> decltype(x) {
+                            GenericFn{[](auto x, auto v) -> decltype(x) {
                                 using T = decltype(x);
                                 double xd = static_cast<double>(x);
                                 if (xd < 0.0) return static_cast<T>(0);
                                 if (xd == 0.0) return static_cast<T>(v);
                                 return static_cast<T>(1);
-                            },
+                            }},
                             "heaviside");
 }
 
@@ -928,39 +934,39 @@ Tensor heaviside_cuda(const Tensor& a, const Tensor& values) {
 Tensor clamp_min_scalar_cuda(const Tensor& self, Scalar min) {
     double lo = min.toDouble();
     return dtype_unary_cuda(self,
-                            [lo] __device__ (auto x) -> decltype(x) {
+                            GenericFn{[lo](auto x) -> decltype(x) {
                                 using T = decltype(x);
                                 return static_cast<double>(x) < lo ? static_cast<T>(lo)
                                                                    : static_cast<T>(x);
-                            },
+                            }},
                             "clamp_min");
 }
 Tensor clamp_max_scalar_cuda(const Tensor& self, Scalar max) {
     double hi = max.toDouble();
     return dtype_unary_cuda(self,
-                            [hi] __device__ (auto x) -> decltype(x) {
+                            GenericFn{[hi](auto x) -> decltype(x) {
                                 using T = decltype(x);
                                 return static_cast<double>(x) > hi ? static_cast<T>(hi)
                                                                    : static_cast<T>(x);
-                            },
+                            }},
                             "clamp_max");
 }
 Tensor clamp_min_tensor_cuda(const Tensor& self, const Tensor& min) {
     return binary_same_cuda(self, min,
-                            [] __device__ (auto x, auto m) -> decltype(x) {
+                            GenericFn{[](auto x, auto m) -> decltype(x) {
                                 using T = decltype(x);
                                 return static_cast<double>(m) > static_cast<double>(x)
                                            ? static_cast<T>(m) : static_cast<T>(x);
-                            },
+                            }},
                             "clamp_min");
 }
 Tensor clamp_max_tensor_cuda(const Tensor& self, const Tensor& max) {
     return binary_same_cuda(self, max,
-                            [] __device__ (auto x, auto m) -> decltype(x) {
+                            GenericFn{[](auto x, auto m) -> decltype(x) {
                                 using T = decltype(x);
                                 return static_cast<double>(m) < static_cast<double>(x)
                                            ? static_cast<T>(m) : static_cast<T>(x);
-                            },
+                            }},
                             "clamp_max");
 }
 Tensor clip_cuda(const Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max) {
@@ -997,48 +1003,48 @@ Tensor selu_cuda(const Tensor& self) {
     constexpr double kAlpha = 1.6732632423543772848170429916717;
     constexpr double kScale = 1.0507009873554804934193349852946;
     return dtype_unary_cuda(self,
-                            [=] __device__ (auto x) -> decltype(x) {
+                            GenericFn{[=](auto x) -> decltype(x) {
                                 using T = decltype(x);
                                 double v = static_cast<double>(x);
                                 return static_cast<T>(v > 0 ? kScale * v
                                                             : kScale * kAlpha * (::exp(v) - 1.0));
-                            },
+                            }},
                             "selu");
 }
 Tensor celu_cuda(const Tensor& self, Scalar alpha) {
     double a = alpha.toDouble();
     return dtype_unary_cuda(self,
-                            [a] __device__ (auto x) -> decltype(x) {
+                            GenericFn{[a](auto x) -> decltype(x) {
                                 using T = decltype(x);
                                 double v = static_cast<double>(x);
                                 return static_cast<T>(v > 0 ? v : a * (::exp(v / a) - 1.0));
-                            },
+                            }},
                             "celu");
 }
 Tensor hardshrink_cuda(const Tensor& self, Scalar lambd) {
     double l = lambd.toDouble();
     // lambd.to<scalar_t>(), so float32 boundary values compare exactly.
     return dtype_unary_cuda(self,
-                            [l] __device__ (auto x) -> decltype(x) {
+                            GenericFn{[l](auto x) -> decltype(x) {
                                 using T = decltype(x);
                                 const double lt = static_cast<double>(static_cast<T>(l));
                                 double v = static_cast<double>(x);
                                 return (v >= -lt && v <= lt) ? static_cast<T>(0) : x;
-                            },
+                            }},
                             "hardshrink");
 }
 Tensor softshrink_cuda(const Tensor& self, Scalar lambd) {
     double l = lambd.toDouble();
     // (a < -l ? a+l : 0)); the v*0 middle branch keeps NaN propagating.
     return dtype_unary_cuda(self,
-                            [l] __device__ (auto x) -> decltype(x) {
+                            GenericFn{[l](auto x) -> decltype(x) {
                                 using T = decltype(x);
                                 const double lt = static_cast<double>(static_cast<T>(l));
                                 double v = static_cast<double>(x);
                                 if (v > lt) return static_cast<T>(v - lt);
                                 if (v < -lt) return static_cast<T>(v + lt);
                                 return static_cast<T>(v * 0.0);
-                            },
+                            }},
                             "softshrink");
 }
 // hard/soft): grad passes through where self is outside the inclusive
@@ -1046,39 +1052,39 @@ Tensor softshrink_cuda(const Tensor& self, Scalar lambd) {
 Tensor hardshrink_backward_cuda(const Tensor& grad_out, const Tensor& self, Scalar lambd) {
     double l = lambd.toDouble();
     return binary_same_cuda(grad_out, self,
-                            [l] __device__ (auto g, auto s) -> decltype(g) {
+                            GenericFn{[l](auto g, auto s) -> decltype(g) {
                                 using T = decltype(g);
                                 const double lt = static_cast<double>(static_cast<T>(l));
                                 double v = static_cast<double>(s);
                                 return (v >= -lt && v <= lt) ? static_cast<T>(0) : g;
-                            },
+                            }},
                             "hardshrink_backward");
 }
 Tensor softshrink_backward_cuda(const Tensor& grad_output, const Tensor& self, Scalar lambd) {
     double l = lambd.toDouble();
     return binary_same_cuda(grad_output, self,
-                            [l] __device__ (auto g, auto s) -> decltype(g) {
+                            GenericFn{[l](auto g, auto s) -> decltype(g) {
                                 using T = decltype(g);
                                 const double lt = static_cast<double>(static_cast<T>(l));
                                 double v = static_cast<double>(s);
                                 return (v >= -lt && v <= lt) ? static_cast<T>(0) : g;
-                            },
+                            }},
                             "softshrink_backward");
 }
 Tensor sigmoid_backward_cuda(const Tensor& grad_output, const Tensor& output) {
     return binary_same_cuda(grad_output, output,
-                            [] __device__ (auto g, auto o) -> decltype(g) {
+                            GenericFn{[](auto g, auto o) -> decltype(g) {
                                 using T = decltype(o);
                                 return g * o * (static_cast<T>(1) - o);
-                            },
+                            }},
                             "sigmoid_backward");
 }
 Tensor tanh_backward_cuda(const Tensor& grad_output, const Tensor& output) {
     return binary_same_cuda(grad_output, output,
-                            [] __device__ (auto g, auto o) -> decltype(g) {
+                            GenericFn{[](auto g, auto o) -> decltype(g) {
                                 using T = decltype(o);
                                 return g * (static_cast<T>(1) - o * o);
-                            },
+                            }},
                             "tanh_backward");
 }
 // eps (eps<0) the gradient is dy/(x(1-x)) inside [0,1] and NaN outside; with
@@ -1087,7 +1093,7 @@ Tensor tanh_backward_cuda(const Tensor& grad_output, const Tensor& output) {
 Tensor logit_backward_cuda(const Tensor& grad_output, const Tensor& self, std::optional<Scalar> eps) {
     double e = eps.has_value() ? eps->toDouble() : -1.0;
     return binary_same_cuda(grad_output, self,
-                            [e] __device__ (auto g, auto s) -> decltype(g) {
+                            GenericFn{[e](auto g, auto s) -> decltype(g) {
                                 using T = decltype(s);
                                 const T zero = static_cast<T>(0);
                                 const T one = static_cast<T>(1);
@@ -1099,17 +1105,17 @@ Tensor logit_backward_cuda(const Tensor& grad_output, const Tensor& self, std::o
                                 const T hi = one - lo;
                                 if (s < lo || s > hi) return zero;
                                 return g / (s * (one - s));
-                            },
+                            }},
                             "logit_backward");
 }
 Tensor threshold_cuda(const Tensor& self, Scalar threshold, Scalar value) {
     double t = threshold.toDouble(), val = value.toDouble();
     return dtype_unary_cuda(self,
-                            [t, val] __device__ (auto x) -> decltype(x) {
+                            GenericFn{[t, val](auto x) -> decltype(x) {
                                 using T = decltype(x);
                                 return static_cast<double>(x) <= t ? static_cast<T>(val)
                                                                    : static_cast<T>(x);
-                            },
+                            }},
                             "threshold");
 }
 namespace {
@@ -1135,7 +1141,7 @@ Tensor prelu_forward_common(const Tensor& self, const Tensor& weight) {
         .build();
 #define TP_PRELU_FWD(ctype, name_)                                             \
     case DType::name_:                                                         \
-        gpu_kernel(iter, [] __device__(ctype input, ctype slope) -> ctype {    \
+        gpu_kernel(iter, [] __host__ __device__(ctype input, ctype slope) -> ctype {    \
             using math_t = typename PReluMath<ctype>::type;                   \
             const math_t x = static_cast<math_t>(input);                      \
             const math_t w = static_cast<math_t>(slope);                      \
@@ -1206,7 +1212,7 @@ std::tuple<Tensor, Tensor> _prelu_kernel_backward_cuda(const Tensor& grad_output
 #define TP_PRELU_BWD(ctype, name_)                                             \
     case DType::name_:                                                         \
         gpu_kernel_multiple_outputs(                                          \
-            iter, [] __device__(ctype input, ctype slope, ctype grad)          \
+            iter, [] __host__ __device__(ctype input, ctype slope, ctype grad)          \
                 -> std::tuple<ctype, ctype> {                                  \
                 using math_t = typename PReluMath<ctype>::type;               \
                 const math_t x = static_cast<math_t>(input);                  \

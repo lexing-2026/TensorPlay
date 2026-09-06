@@ -102,7 +102,7 @@ Tensor tp_scale_grad(const Tensor& grad, int64_t reduction, int64_t numel) {
 // elementwise kernels (one thread per pair element)
 // ---------------------------------------------------------------------------
 
-__device__ inline double dsp(double y) {
+__host__ __device__ inline double dsp(double y) {
     return ::fmax(y, 0.0) + ::log1p(::exp(-::fabs(y)));
 }
 
@@ -198,7 +198,7 @@ Tensor l1_loss_cuda(const Tensor& input, const Tensor& target) {
             .add_const_input(pr.first)
             .add_const_input(pr.second)
             .build();
-        gpu_kernel(iter, [] __device__(double a, double b) -> double {
+        gpu_kernel(iter, [] __host__ __device__(double a, double b) -> double {
             return ::fabs(a - b);
         });
         CUDA_CHECK(cudaGetLastError());
@@ -217,7 +217,7 @@ Tensor kl_div_cuda(const Tensor& input, const Tensor& target) {
             .add_const_input(pr.first)
             .add_const_input(pr.second)
             .build();
-        gpu_kernel(iter, [] __device__(double x, double t) -> double {
+        gpu_kernel(iter, [] __host__ __device__(double x, double t) -> double {
             return t > 0 ? t * (::log(t) - x) : 0.0;
         });
         CUDA_CHECK(cudaGetLastError());
@@ -262,7 +262,7 @@ Tensor hinge_embedding_loss_cuda(const Tensor& input, const Tensor& target, Scal
             .add_const_input(pr.first)
             .add_const_input(pr.second)
             .build();
-        gpu_kernel(iter, [margin_value] __device__(double x, double t) -> double {
+        gpu_kernel(iter, [margin_value] __host__ __device__(double x, double t) -> double {
             return (t == 1.0) ? x : ::fmax(0.0, margin_value - x);
         });
         CUDA_CHECK(cudaGetLastError());
@@ -297,7 +297,7 @@ Tensor soft_margin_loss_cuda(const Tensor& input, const Tensor& target) {
             .add_const_input(pr.first)
             .add_const_input(pr.second)
             .build();
-        gpu_kernel(iter, [] __device__(double x, double t) -> double {
+        gpu_kernel(iter, [] __host__ __device__(double x, double t) -> double {
             return dsp(-t * x);
         });
         CUDA_CHECK(cudaGetLastError());
@@ -317,7 +317,7 @@ Tensor poisson_nll_loss_cuda(const Tensor& input, const Tensor& target, bool log
             .add_const_input(pr.first)
             .add_const_input(pr.second)
             .build();
-        gpu_kernel(iter, [log_input, full, eps] __device__(double x, double z) -> double {
+        gpu_kernel(iter, [log_input, full, eps] __host__ __device__(double x, double z) -> double {
             double l2 = log_input ? (::exp(x) - z * x)
                                   : (x - z * ::log(::exp(x) + eps));
             if (full && z > 0) l2 += z * ::log(z) - ::lgamma(z + 1.0);

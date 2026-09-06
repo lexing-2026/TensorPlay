@@ -54,10 +54,9 @@ Tensor clamp(
                : std::numeric_limits<int32_t>::max()},
   };
 
-  api::UniformParamsBuffer params(
-      context,
+  api::UniformParamsBuffer params =
       is_int ? api::UniformParamsBuffer(context, blocki)
-             : api::UniformParamsBuffer(context, block));
+             : api::UniformParamsBuffer(context, block);
   api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(
@@ -118,10 +117,9 @@ Tensor& clamp_(
                : std::numeric_limits<int32_t>::max()},
   };
 
-  api::UniformParamsBuffer params(
-      context,
+  api::UniformParamsBuffer params =
       is_int ? api::UniformParamsBuffer(context, blocki)
-             : api::UniformParamsBuffer(context, block));
+             : api::UniformParamsBuffer(context, block);
   api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(

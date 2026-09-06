@@ -70,24 +70,24 @@ Tensor silu_kernel_cuda_native(const Tensor& self) {
         .build();
     switch (self.dtype()) {
         case DType::Float32:
-            gpu_kernel(iter, [] __device__ (float value) -> float {
+            gpu_kernel(iter, [] __host__ __device__ (float value) -> float {
                 return value / (1.0f + ::expf(-value));
             });
             break;
         case DType::Float64:
-            gpu_kernel(iter, [] __device__ (double value) -> double {
+            gpu_kernel(iter, [] __host__ __device__ (double value) -> double {
                 return value / (1.0 + ::exp(-value));
             });
             break;
         case DType::Float16:
-            gpu_kernel(iter, [] __device__ (Half value) -> Half {
+            gpu_kernel(iter, [] __host__ __device__ (Half value) -> Half {
                 const float value_acc = static_cast<float>(value);
                 return static_cast<Half>(
                     value_acc / (1.0f + ::expf(-value_acc)));
             });
             break;
         case DType::BFloat16:
-            gpu_kernel(iter, [] __device__ (BFloat16 value) -> BFloat16 {
+            gpu_kernel(iter, [] __host__ __device__ (BFloat16 value) -> BFloat16 {
                 const float value_acc = static_cast<float>(value);
                 return static_cast<BFloat16>(
                     value_acc / (1.0f + ::expf(-value_acc)));
@@ -110,7 +110,7 @@ Tensor relu_kernel_cudnn(const Tensor& self) {
         .build();
 #define TP_RELU_CASE(ctype, name_) \
     case DType::name_: \
-        gpu_kernel(iter, [] __device__ (ctype value) -> ctype { \
+        gpu_kernel(iter, [] __host__ __device__ (ctype value) -> ctype { \
             return value > ctype(0) ? value : ctype(0); \
         }); \
         break;
@@ -226,48 +226,48 @@ static Tensor native_activation_dispatch(const Tensor& self, bool is_sigmoid) {
     switch (self.dtype()) {
         case DType::Float32:
             if (is_sigmoid) {
-                gpu_kernel(iter, [] __device__ (float value) -> float {
+                gpu_kernel(iter, [] __host__ __device__ (float value) -> float {
                     return 1.0f / (1.0f + ::expf(-value));
                 });
             } else {
-                gpu_kernel(iter, [] __device__ (float value) -> float {
+                gpu_kernel(iter, [] __host__ __device__ (float value) -> float {
                     return ::tanhf(value);
                 });
             }
             break;
         case DType::Float64:
             if (is_sigmoid) {
-                gpu_kernel(iter, [] __device__ (double value) -> double {
+                gpu_kernel(iter, [] __host__ __device__ (double value) -> double {
                     return 1.0 / (1.0 + ::exp(-value));
                 });
             } else {
-                gpu_kernel(iter, [] __device__ (double value) -> double {
+                gpu_kernel(iter, [] __host__ __device__ (double value) -> double {
                     return ::tanh(value);
                 });
             }
             break;
         case DType::Float16:
             if (is_sigmoid) {
-                gpu_kernel(iter, [] __device__ (Half value) -> Half {
+                gpu_kernel(iter, [] __host__ __device__ (Half value) -> Half {
                     const float value_acc = static_cast<float>(value);
                     return static_cast<Half>(
                         1.0f / (1.0f + ::expf(-value_acc)));
                 });
             } else {
-                gpu_kernel(iter, [] __device__ (Half value) -> Half {
+                gpu_kernel(iter, [] __host__ __device__ (Half value) -> Half {
                     return static_cast<Half>(::tanhf(static_cast<float>(value)));
                 });
             }
             break;
         case DType::BFloat16:
             if (is_sigmoid) {
-                gpu_kernel(iter, [] __device__ (BFloat16 value) -> BFloat16 {
+                gpu_kernel(iter, [] __host__ __device__ (BFloat16 value) -> BFloat16 {
                     const float value_acc = static_cast<float>(value);
                     return static_cast<BFloat16>(
                         1.0f / (1.0f + ::expf(-value_acc)));
                 });
             } else {
-                gpu_kernel(iter, [] __device__ (BFloat16 value) -> BFloat16 {
+                gpu_kernel(iter, [] __host__ __device__ (BFloat16 value) -> BFloat16 {
                     return static_cast<BFloat16>(
                         ::tanhf(static_cast<float>(value)));
                 });
@@ -353,7 +353,7 @@ Tensor log_softmax_kernel_cudnn(const Tensor& self, int64_t dim, DType dtype) {
 
 template <typename T>
 inline void run_threshold_backward_iter(TensorIteratorBase& iter, T threshold) {
-    gpu_kernel(iter, [threshold] __device__(T output_value, T grad_value) -> T {
+    gpu_kernel(iter, [threshold] __host__ __device__(T output_value, T grad_value) -> T {
         return output_value > threshold ? grad_value : T(0);
     });
 }

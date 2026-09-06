@@ -324,14 +324,14 @@ def dropout(input, p=0.5, training=True, inplace=False):
     if not training or p == 0:
         return input
 
+    if p == 1:
+        result = _C.zeros_like(input)
+        return input.copy_(result) if inplace else result
+
     if inplace:
         # dropout_ mutates self and records the mask for backward).
         mask = (_C.rand(input.shape, device=input.device) > p).to(input.dtype)
         return input.mul_(mask).mul_(1.0 / (1.0 - p))
-
-    if p == 1:
-        # zeroes everything in this case.
-        return _C.zeros_like(input)
 
     out, _mask = _C.native_dropout(input, p)
     return out
@@ -345,6 +345,10 @@ def dropout2d(input, p=0.5, training=True, inplace=False):
     # Input must be at least 2D (N, C, ...)
     if input.dim() < 2:
          raise ValueError("Feature dropout requires at least 2 dimensions")
+
+    if p == 1:
+        result = _C.zeros_like(input)
+        return input.copy_(result) if inplace else result
          
     shape = list(input.shape)
     shape[2:] = [1] * (input.dim() - 2)
@@ -377,8 +381,7 @@ def alpha_dropout(input, p=0.5, training=True, inplace=False):
 
 
 def feature_dropout(input, p=0.5, training=False, inplace=False):
-    r"""Randomly zeroes entire channels (dim 1), port of
-"""
+    r"""Randomly zeroes entire channels (dim 1)."""
     if p < 0 or p > 1:
         raise ValueError("dropout probability has to be between 0 and 1, but got {}".format(p))
     if input.dim() < 2:
@@ -387,6 +390,10 @@ def feature_dropout(input, p=0.5, training=False, inplace=False):
             f"but got {input.dim()}")
     if not training or p == 0 or input.numel() == 0:
         return input
+
+    if p == 1:
+        result = _C.zeros_like(input)
+        return input.copy_(result) if inplace else result
 
     result, _mask = _C.native_feature_dropout(input, p)
     if inplace:
@@ -819,7 +826,7 @@ def cross_entropy(input, target, weight=None, size_average=None, ignore_index=-1
 
     if tuple(target.size()) == tuple(input.size()):
         # Soft targets when input and target shapes are the same
-        # (port of cross_entropy_loss_prob_target, LossNLL.cpp:529).
+        # Handle matching input and target shapes as class probabilities.
         if ignore_index >= 0:
             raise ValueError("ignore_index is not supported for floating point target")
         if label_smoothing > 1.0:
@@ -843,7 +850,7 @@ def cross_entropy(input, target, weight=None, size_average=None, ignore_index=-1
         return total / (input.numel() / n_classes)
 
     if label_smoothing > 0.0:
-        # Port of cross_entropy_loss_label_smoothing (LossNLL.cpp:577).
+        # Blend the class loss with a uniform class distribution.
         if label_smoothing > 1.0:
             raise ValueError(f"label_smoothing must be between 0.0 and 1.0. Got: {label_smoothing}")
         input_ = log_softmax(input, class_dim)
@@ -1094,6 +1101,7 @@ def interpolate(
     if ndim < 3:
         raise ValueError(f"interpolate expects at least 3D input, got {ndim}D")
     spatial = ndim - 2
+    align_corners_provided = align_corners is not None
     # mode branches can operate on a concrete size.
     if size is None and scale_factor is not None:
         if isinstance(scale_factor, (int, float)):
@@ -1158,7 +1166,7 @@ def interpolate(
             size = [int(math.floor(float(input.shape[2 + i]) * f)) for i, f in enumerate(scale_factor)]
 
     if mode == 'area':
-        if align_corners is not None:
+        if align_corners_provided:
             raise ValueError("align_corners option cannot be set for area interpolation")
         if ndim == 3:
             return adaptive_avg_pool1d(input, size[0])
@@ -1240,6 +1248,9 @@ def multi_head_attention_forward(
     # Unbatched inputs carry a temporary batch dim; outputs squeeze it back.
     if query.dim() == 3:
         is_batched = True
+        if key.dim() != 3 or value.dim() != 3:
+            raise AssertionError(
+                "for batched query, key and value must also be 3D")
         if key_padding_mask is not None and key_padding_mask.dim() > 2:
             raise AssertionError(
                 "key_padding_mask must be 1D or 2D for batched input")
@@ -1248,6 +1259,9 @@ def multi_head_attention_forward(
                 f"attn_mask must be 2D or 3D for batched input, got {attn_mask.dim()}D")
     elif query.dim() == 2:
         is_batched = False
+        if key.dim() != 2 or value.dim() != 2:
+            raise AssertionError(
+                "for unbatched query, key and value must also be 2D")
         if key_padding_mask is not None and key_padding_mask.dim() != 1:
             raise AssertionError(
                 "key_padding_mask must be 1D for unbatched input")
@@ -1264,6 +1278,16 @@ def multi_head_attention_forward(
             f"query has to be 2d or 3d, but got {query.dim()}d")
 
     tgt_len, bsz, embed_dim = query.shape
+    if num_heads <= 0:
+        raise AssertionError(f"num_heads must be positive, got {num_heads}")
+    if embed_dim_to_check != embed_dim:
+        raise AssertionError(
+            f"was expecting embedding dimension of {embed_dim_to_check}, "
+            f"but got {embed_dim}")
+    if key.shape[1] != bsz or value.shape[1] != bsz:
+        raise AssertionError(
+            "key and value batch dimensions must match the query batch "
+            f"dimension ({bsz})")
     src_len = key.shape[0]
     head_dim = embed_dim // num_heads
     if head_dim * num_heads != embed_dim:
@@ -1852,6 +1876,10 @@ def dropout1d(
     if not training or p == 0:
         return input
 
+    if p == 1:
+        result = _C.zeros_like(input)
+        return input.copy_(result) if inplace else result
+
     is_batched = inp_dim == 3
     x = input if is_batched else input.unsqueeze(0)
 
@@ -1892,6 +1920,10 @@ def feature_alpha_dropout(
 
     if not training or p == 0 or input.numel() == 0:
         return input
+
+    if p == 1:
+        result = _C.zeros_like(input)
+        return input.copy_(result) if inplace else result
 
     alpha_c = 1.7580993408473766
     a = 1.0 / math.sqrt((alpha_c * alpha_c * p + 1) * (1 - p))
@@ -2829,7 +2861,7 @@ GRID_SAMPLE_PADDING_MODES = ('zeros', 'border', 'reflection')
 
 
 def _linspace_from_neg_one(num_steps, align_corners, dtype, device):
-    """Port of AffineGridGenerator.cpp linspace_from_neg_one."""
+    """Build normalized sampling coordinates for an affine grid."""
     if num_steps <= 1:
         return tensorplay.zeros([num_steps], dtype=dtype, device=device)
     rng = tensorplay.linspace(-1, 1, num_steps, dtype=dtype, device=device)
@@ -2992,7 +3024,7 @@ def _grid_sampler_2d(input, grid, interpolation_mode, padding_mode, align_corner
             out = term if out is None else out + term
         return out
 
-    # bicubic (alpha = -0.75, port of get_cubic_upsample_coefficients)
+    # Bicubic interpolation with Keys parameter alpha = -0.75.
     def _c1(t_, a=-0.75):
         return ((a + 2) * t_ - (a + 3)) * t_ * t_ + 1
 
@@ -3315,10 +3347,12 @@ def scaled_dot_product_attention(
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale=None,
+    enable_gqa: bool = False,
     backend: Optional[str] = None,
 ) -> Tensor:
     r"""scaled_dot_product_attention(query, key, value, attn_mask=None,
-    dropout_p=0.0, is_causal=False, scale=None, backend=None) -> Tensor
+    dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False,
+    backend=None) -> Tensor
 
     Computes scaled dot product attention on query, key and value. Routes to
     reference:
@@ -3334,9 +3368,40 @@ def scaled_dot_product_attention(
             order is governed by :func:`tensorplay.nn.attention.sdpa_kernel`.
     """
     from tensorplay.nn import attention as _sdpa_attention
+    from tensorplay.overrides import has_tensorplay_function
+
+    # Attention-bias subclasses intercept the call through the Python
+    # function-hook protocol before any backend routing happens.
+    if has_tensorplay_function((query, key, value, attn_mask)):
+        from tensorplay.overrides import handle_tensorplay_function
+
+        return handle_tensorplay_function(
+            scaled_dot_product_attention,
+            (query, key, value, attn_mask),
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
 
     if attn_mask is not None and is_causal:
         raise AssertionError("Explicit attn_mask should not be set when is_causal=True")
+    if query.dim() < 2 or key.dim() < 2 or value.dim() < 2:
+        raise ValueError(
+            "scaled_dot_product_attention: query, key and value must be "
+            "at least 2-D")
+    if key.shape[-1] != query.shape[-1] or value.shape[-1] != query.shape[-1]:
+        raise ValueError(
+            "scaled_dot_product_attention: query, key and value must share "
+            "the last dimension")
+    if dropout_p < 0.0 or dropout_p > 1.0:
+        raise ValueError(
+            f"scaled_dot_product_attention: dropout probability must be in "
+            f"[0, 1], got {dropout_p}")
     if backend not in (None, "math", "flash", "mem_efficient"):
         raise ValueError(
             f"scaled_dot_product_attention: unknown backend '{backend}'; "
@@ -3348,9 +3413,9 @@ def scaled_dot_product_attention(
         _sdpa_attention.SDPBackend.FLASH_ATTENTION,
         _sdpa_attention.SDPBackend.EFFICIENT_ATTENTION,
     }
-    params = _sdpa_attention.SDPParams(
+    params = _sdpa_attention.SDPAParams(
         query=query, key=key, value=value, attn_mask=attn_mask,
-        dropout=dropout_p, is_causal=is_causal, need_attn_weights=False,
+        dropout=dropout_p, is_causal=is_causal, enable_gqa=enable_gqa,
     )
 
     if backend is not None:
@@ -3365,15 +3430,32 @@ def scaled_dot_product_attention(
                 f"scaled_dot_product_attention: backend '{backend}' is "
                 f"disabled by the active sdpa_kernel context")
         if backend == "flash":
-            return tensorplay.scaled_dot_product_attention(
-                query, key, value, is_causal=is_causal)
+            plain_case = (
+                scale is None
+                and attn_mask is None
+                and dropout_p == 0.0
+                and not enable_gqa
+            )
+            if plain_case:
+                return tensorplay.scaled_dot_product_attention(
+                    query, key, value, is_causal=is_causal)
+            if allowed != full_set and _sdpa_attention.SDPBackend.MATH not in allowed:
+                raise RuntimeError(
+                    "scaled_dot_product_attention: the requested flash backend "
+                    "does not support the supplied mask, scale, or dropout "
+                    "configuration")
         if backend == "mem_efficient":
             raise NotImplementedError(
                 "scaled_dot_product_attention: the mem_efficient backend requires "
                 "native memory-efficient attention kernels, which are not yet "
                 "available in this build.")
     else:
-        _plain_case = scale is None and attn_mask is None and dropout_p == 0.0
+        _plain_case = (
+            scale is None
+            and attn_mask is None
+            and dropout_p == 0.0
+            and not enable_gqa
+        )
         for candidate in allowed:
             if candidate == _sdpa_attention.SDPBackend.FLASH_ATTENTION:
                 if _plain_case and _sdpa_attention.can_use_flash_attention(params):
@@ -3390,29 +3472,18 @@ def scaled_dot_product_attention(
                 "the active sdpa_kernel context allows none of the "
                 "installed backends for these inputs")
 
-    L, S = query.size(-2), key.size(-2)
-    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
-    attn_weight = query * scale_factor @ key.transpose(-2, -1)
-
-    if is_causal:
-        ri = tensorplay.arange(L, dtype=DType.int64, device=query.device)
-        ci = tensorplay.arange(S, dtype=DType.int64, device=query.device)
-        causal_mask = ri.view(L, 1) < ci.view(1, S)
-        fill = tensorplay.full([], float("-inf"), dtype=query.dtype, device=query.device)
-        attn_weight = tensorplay.where(causal_mask, fill, attn_weight)
-    if attn_mask is not None:
-        if attn_mask.dtype == DType.bool:
-            fill = tensorplay.full([], float("-inf"), dtype=query.dtype, device=query.device)
-            keep = tensorplay.where(attn_mask, attn_weight, fill)
-            attn_weight = keep
-        else:
-            attn_weight = attn_weight + attn_mask.to(query.dtype)
-
-    out = softmax(attn_weight, dim=-1)
-    if dropout_p > 0.0:
-        keep = (_C.rand(out.shape, device=out.device) >= dropout_p).to(out.dtype) / (1.0 - dropout_p)
-        out = out * keep
-    return out @ value
+    out, _ = _C._scaled_dot_product_attention_math(
+        query,
+        key,
+        value,
+        attn_mask,
+        float(dropout_p),
+        bool(is_causal),
+        None,
+        scale=scale,
+        enable_gqa=enable_gqa,
+    )
+    return out
 
 
 def linear_cross_entropy(

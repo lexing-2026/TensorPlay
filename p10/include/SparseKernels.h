@@ -2,6 +2,7 @@
 
 #include "Tensor.h"
 
+#include <array>
 #include <optional>
 #include <unordered_set>
 #include <vector>
@@ -44,6 +45,41 @@ Tensor sparse_sum_cpu(const Tensor& self, std::optional<std::vector<int64_t>> di
 Tensor spdiags_cpu(const Tensor& diagonals, const Tensor& offsets,
                    std::vector<int64_t> shape,
                    std::optional<int64_t> layout);
+// r = beta * t + alpha * (sparse COO @ dense), materialized as a sparse COO
+// over the union of the accumulator's coordinates and every column of each
+// non-empty product row.  smm() routes through this with an empty
+// accumulator.
+Tensor sparse_sspaddmm_cpu(const Tensor& t, const Tensor& sparse,
+                           const Tensor& dense, Scalar beta, Scalar alpha);
+// sparse @ dense -> sparse; per non-empty row the full product row (zero
+// entries included) is emitted.
+Tensor smm_cpu(const Tensor& self, const Tensor& mat2);
+// Dense -> compressed sparse (CSR/CSC/BSR/BSC).  The N-D input decomposes
+// into (*batch, row, col, *dense); blocked layouts tile row/col into blocks
+// and require sizes divisible by the block sizes.  Batched inputs join along
+// the compressed axis and require uniform stored-element counts.
+Tensor to_sparse_compressed_cpu(const Tensor& self, int layout,
+                                std::array<int64_t, 2> blocksize,
+                                std::optional<int64_t> dense_dim_opt,
+                                const char* name);
+// _sparse_sum family: the value-only overloads and the dim/keepdim/dtype
+// overloads (see the reference sparse sum semantics).
+Tensor _sparse_sum_cpu(const Tensor& input);
+Tensor _sparse_sum_dtype_cpu(const Tensor& input, DType dtype);
+Tensor _sparse_sum_dim_cpu(const Tensor& input, std::vector<int64_t> dims_to_sum,
+                           std::optional<DType> dtype);
+Tensor _sparse_sum_dim_dtype_cpu(const Tensor& input,
+                                 std::vector<int64_t> dims_to_sum,
+                                 DType dtype);
+Tensor _sparse_sum_dim_cpu_2(const Tensor& input,
+                             std::vector<int64_t> dims_to_sum);
+Tensor _sparse_sum_backward_cpu(const Tensor& grad, const Tensor& input,
+                                std::vector<int64_t> dims_to_sum);
+// Sparse norm: full reductions only, no keepdim/dtype support.
+Tensor native_norm_cpu(const Tensor& self, Scalar p);
+Tensor native_norm_dim_cpu(const Tensor& self, std::optional<Scalar> p,
+                           std::vector<int64_t> dims, bool keepdim,
+                           std::optional<DType> dtype);
 
 } // namespace cpu
 

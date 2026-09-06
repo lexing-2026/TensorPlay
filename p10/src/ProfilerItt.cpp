@@ -1,5 +1,5 @@
 // Intel ITT (Instrumentation and Tracing Technology) bridge -- runtime-loaded,
-// zero build deps.  Mirrors ProfilerNvtx.cpp for the VTune/Advisor family:
+// zero build deps.  Counterpart of ProfilerNvtx.cpp for the VTune/Advisor family:
 //
 //   * profile(..., emit_itt=True) (or the emit_itt() context manager) makes
 //     every op / user-span / backward-node span emit an ITT task under the

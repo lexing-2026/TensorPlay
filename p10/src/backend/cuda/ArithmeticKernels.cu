@@ -710,15 +710,15 @@ inline bool launch_bool_vec(int64_t n, const Tensor& a, const Tensor& b, Tensor&
     switch (op) {
         case BoolBinOp::Or:
             binary_bool_vectorized_kernel<bool, kVec><<<grid, block, 0, stream>>>(
-                n, pa, pb, py, [] __device__ (bool x, bool v) { return x || v; });
+                n, pa, pb, py, [] __host__ __device__ (bool x, bool v) { return x || v; });
             break;
         case BoolBinOp::Xor:
             binary_bool_vectorized_kernel<bool, kVec><<<grid, block, 0, stream>>>(
-                n, pa, pb, py, [] __device__ (bool x, bool v) { return x != v; });
+                n, pa, pb, py, [] __host__ __device__ (bool x, bool v) { return x != v; });
             break;
         case BoolBinOp::And:
             binary_bool_vectorized_kernel<bool, kVec><<<grid, block, 0, stream>>>(
-                n, pa, pb, py, [] __device__ (bool x, bool v) { return x && v; });
+                n, pa, pb, py, [] __host__ __device__ (bool x, bool v) { return x && v; });
             break;
     }
     return true;

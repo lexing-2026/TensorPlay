@@ -270,14 +270,14 @@ std::tuple<Tensor, Tensor> frexp_cuda(const Tensor& self) {
             .build();
         if (compute_dtype == DType::Float64) {
             gpu_kernel_multiple_outputs(
-                iter, [] __device__ (double value) -> std::tuple<double, int32_t> {
+                iter, [] __host__ __device__ (double value) -> std::tuple<double, int32_t> {
                     int exponent_value = 0;
                     const double mantissa_value = ::frexp(value, &exponent_value);
                     return {mantissa_value, static_cast<int32_t>(exponent_value)};
                 });
         } else {
             gpu_kernel_multiple_outputs(
-                iter, [] __device__ (float value) -> std::tuple<float, int32_t> {
+                iter, [] __host__ __device__ (float value) -> std::tuple<float, int32_t> {
                     int exponent_value = 0;
                     const float mantissa_value = ::frexp(value, &exponent_value);
                     return {mantissa_value, static_cast<int32_t>(exponent_value)};

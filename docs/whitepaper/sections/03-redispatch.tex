@@ -1,23 +1,23 @@
 % 03-redispatch.tex
-\section{Redispatch: Dispatch Keys, Dispatcher, and Registration Macros}
+\section{重分发：分发键、分发器与注册宏}
 \label{sec:redispatch}
 
-Redispatch resolves a tensor's runtime properties into a key, selects the
-highest-priority kernel from a per-operator atomic table, and enforces the
-autocast contract a single choke point. The Python surface exposes the same
-operator through two cooperating layers: a hand-written \texttt{pybind11}
-binding and a generated \texttt{METH\_FASTCALL} function, both funneling
-through \texttt{CPythonBridge} helpers and a shared \texttt{tp\_python}
-library. The design trims heterogeneous key spaces to 13 slots, encodes layering
-as fixed offsets so that priority is arithmetic, uses acquire/release atomics
-instead of locks on the hot path, isolates type erasure to one template, and
-reuses one Python type registration so that returned tensors preserve identity.
+Redispatch 将张量的运行时属性解析为键，选择
+从每个操作员原子表中选择最高优先级内核，并强制执行
+自动转换契约了一个单一的阻塞点。 Python表面暴露了相同的
+通过两个合作层的运算符：手写的 \texttt{pybind11}
+绑定和生成的 \texttt{METH\_FASTCALL} 函数，都是漏斗
+通过 \texttt{CPythonBridge} 助手和共享的 \texttt{tp\_python}
+图书馆。该设计将异构键空间修剪为 13 个插槽，编码分层
+作为固定偏移量，以便优先级是算术，使用获取/释放原子
+将类型擦除隔离到一个模板，而不是锁定热路径，并且
+重用一种 Python 类型注册，以便返回的张量保留身份。
 
-\subsection{DispatchKey: 13 Keys and Fixed Offsets}
+\subsection{DispatchKey：13 个键和固定偏移}
 \label{sec:dispatchkey}
 
- defines 13 live keys plus sentinel;
-numeric order is priority:
+定义了 13 个 live key 加哨兵；
+数字顺序优先：
 
 \begin{lstlisting}[caption={13 keys.}, label=lst:dispatchkey]
 enum class DispatchKey : uint8_t {
@@ -31,11 +31,11 @@ constexpr size_t kBackendKeyCount=3, kAutogradKeyOffset=3,
                  kAutocastKeyOffset=6, kVmapKeyOffset=9;
 \end{lstlisting}
 
-\texttt{Composite}=12 is stored out of logical priority so that
-\texttt{dispatchKeyIndex} is a plain
-\texttt{static\_cast<size\_t>} and \texttt{Composite} never enters the
-\texttt{highest\_priority\_key} scan. Helpers
- are \texttt{constexpr}:
+\texttt{Composite}=12 的存储不符合逻辑优先级，因此
+\texttt{dispatchKeyIndex} 是一个普通的
+\texttt{static\_cast<size\_t>} 和 \texttt{Composite} 永远不会进入
+\texttt{highest\_priority\_key} 扫描。帮手
+ 是 \texttt{constexpr}：
 
 \begin{lstlisting}[caption={arithmetic helpers.}, label=lst:dispatchhelpers]
 inline constexpr DispatchKey toAutogradKey(DispatchKey b){return DispatchKey(uint8_t(b)+kAutogradKeyOffset);}
@@ -50,34 +50,34 @@ inline constexpr DispatchKey toBackendKey(DispatchKey k){
         :is_autocast_key(k)?DispatchKey(uint8_t(k)-6):k;}
 \end{lstlisting}
 
-\texttt{is\_backend\_key} enumerates the three dense keys; \texttt{Composite}
-is false, which gates the fallback in \S\ref{sec:handle}.
-\texttt{computeDispatchKey} maps \texttt{Device}
-to \texttt{Vulkan} via \texttt{is\_cuda}/\texttt{is\_vulkan}.
+\texttt{is\_backend\_key} 枚举三个密集键； \texttt{Composite}
+为 false，它控制 \S\ref{sec:handle} 中的后备。
+\texttt{computeDispatchKey} 地图 \texttt{Device}
+经 \texttt{is\_cuda}/\texttt{is\_vulkan} 至 \texttt{Vulkan}。
 
 \begin{table}[H]
 \centering
-\caption{Key arithmetic. Range tests lower to 1--2 compares.}
+\caption{关键算术。范围测试较低至 1--2 比较。}
 \label{tab:keyoffsets}
 \small
 \begin{tabular}{ccll}
 \toprule
-Offset & Val & Keys & Predicate \\
+抵消 & 瓦尔 & 按键 & 谓词 \\
 \midrule
 $kBackendKeyCount$ & 3 & 0--2 \texttt{Vulkan} & \texttt{is\_backend\_key} \\
 $kAutogradKeyOffset$ & 3 & 3--5 \texttt{Autograd*} & \texttt{is\_autograd\_key} \\
 $kAutocastKeyOffset$ & 6 & 6--8 \texttt{Autocast*} & \texttt{is\_autocast\_key} \\
 $kVmapKeyOffset$ & 9 & 9--11 \texttt{Vmap*} & \texttt{is\_vmap\_key} \\
 --- & 12 & \texttt{Composite} & \texttt{key==Composite} \\
---- & 13 & \texttt{EndOfKeys} & bounds check \\
+--- & 13 & \texttt{EndOfKeys} & 边界检查 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{DispatchKeySet: Bitmask and Priority}
+\subsection{DispatchKeySet：位掩码和优先级}
 \label{sec:keyset}
 
- is a 32-bit bitset; 13 bits live:
+是一个 32 位的位集； 13 位直播：
 
 \begin{lstlisting}[caption={bitmask.}, label=lst:keysetdef]
 class DispatchKeySet{
@@ -95,7 +95,7 @@ private: raw_t mask_=0;
 };
 \end{lstlisting}
 
-Priority is the most-significant set bit, i.e.\ largest numeric \ac{op} key wins:
+优先级是最高有效的设置位，即最大的数字 \ac{op} 键获胜：
 
 \begin{lstlisting}[caption={scan high $\rightarrow$ low.}, label=lst:highestkey]
 constexpr DispatchKey highest_priority_key() const {
@@ -105,24 +105,24 @@ constexpr DispatchKey highest_priority_key() const {
 
 \begin{table}[H]
 \centering
-\caption{Effective priority from \texttt{highest\_priority\_key}. Composite never in set.}
+\caption{来自 \texttt{highest\_priority\_key} 的有效优先级。复合从未在集合中。}
 \label{tab:keypriority}
 \small
 \begin{tabular}{cll}
 \toprule
-Indices & Keys & Removal to redispatch below layer \\
+指数 & 按键 & 删除以重新调度下面的层 \\
 \midrule
-9--11 & \texttt{Vulkan} via \texttt{toVmapKey} & \texttt{remove\_vmap} \\
-6--8 & \texttt{Vulkan} via \texttt{toAutocastKey} & \texttt{remove\_autocast} \\
-3--5 & \texttt{Vulkan} via \texttt{toAutogradKey} & \texttt{remove\_autograd} \\
-0--2 & \texttt{Vulkan} via \texttt{computeDispatchKey} & final compute \\
-12 & \texttt{Composite} & fallback only in \texttt{getKernel} for \texttt{is\_backend\_key} \\
+9--11 & \texttt{Vulkan} 通过 \texttt{toVmapKey} & \texttt{remove\_vmap} \\
+6--8 & \texttt{Vulkan} 通过 \texttt{toAutocastKey} & \texttt{remove\_autocast} \\
+3--5 & \texttt{Vulkan} 通过 \texttt{toAutogradKey} & \texttt{remove\_autograd} \\
+0--2 & \texttt{Vulkan} 通过 \texttt{computeDispatchKey} & 最终计算 \\
+12 & \texttt{Composite} & 仅在 \texttt{getKernel} 中为 \texttt{is\_backend\_key} 进行回退 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
- computes the set on every call; no
-field is stored:
+计算每次调用的集合；不
+字段存储：
 
 \begin{lstlisting}[caption={computed, not stored.}, label=lst:implkeyset]
 DispatchKeySet key_set() const {
@@ -135,25 +135,21 @@ DispatchKeySet key_set() const {
 }
 \end{lstlisting}
 
-\texttt{is\_batched} checks \texttt{transform\_value\_!=nullptr}
-; inference tensors (\texttt{inference\_tensor\_}
-from \texttt{InferenceMode::is\_enabled} at construction,
-) omit the autograd bit. Cost is one device query plus
-two bit ops, cheaper than an atomic load of a stored bitset. Generated redispatch
-helpers at call \texttt{key\_set} once,
-cache the result, and iterate by handling the top key via \texttt{OperatorHandle::getKernel}
-then stripping the layer with \texttt{remove\_autograd} until
-\texttt{highest\_priority\_key==EndOfKeys} or a kernel is found; the loop is
-at most three iterations because only three layers can be present simultaneously.
+\texttt{is\_batched} 检查 \texttt{transform\_value\_!=nullptr}
+;推理张量 (\texttt{inference\_tensor\_}
+来自施工时的 \texttt{InferenceMode::is\_enabled}，
+) 省略自动微分位。成本是一台设备查询加上
+两个位操作，比存储位集的原子加载便宜。生成的重新调度
+帮助者致电 \texttt{key\_set} 一次，
+缓存结果，并通过 \texttt{OperatorHandle::getKernel} 处理顶部键进行迭代
+然后用 \texttt{remove\_autograd} 剥离该层，直到
+\texttt{highest\_priority\_key==EndOfKeys} 或找到内核；循环是
+最多三次迭代，因为只能同时存在三层。
 
-\begin{tppitfall}[Pitfall: The Composite Slot Is Never in the DispatchKeySet]
-The most common misreading of the 13-slot table is assuming \texttt{Composite} (slot~12) participates in priority selection---it does not. \texttt{TensorImpl::key\_set} at only ever adds a backend key plus, optionally, one \texttt{Autocast} or \texttt{Autograd} or \texttt{Vmap} transform key. \texttt{Composite} is consulted exclusively inside \texttt{OperatorHandle::getKernel} when \texttt{is\_backend\_key(key)} is true and the backend slot is \texttt{nullptr}. Consequences when extending the dispatcher: (i) adding a key below 12 does not shift composite arithmetic, but adding a key above 12 does and requires bumping \texttt{EndOfKeys} and \texttt{kDispatchKeyCount}; (ii) \texttt{remove\_*} masks in hard-code the 13-bit layout, so a new \emph{layer} needs a new offset constant like \texttt{kVmapKeyOffset}=9; (iii) a dump tool that iterates a key set will never see \texttt{Composite}---``served by composite'' is only visible via the fallback branch itself.
-\end{tppitfall}
-
-\subsection{DispatchTable and Dispatcher}
+\subsection{调度表和调度程序}
 \label{sec:dispatcher}
 
- stores one fixed table per operator:
+每个操作员存储一张固定表：
 
 \begin{lstlisting}[caption={13 atomics per operator.}, label=lst:dispatchtable]
 using KernelFunction = void*;
@@ -167,9 +163,9 @@ struct P10_API DispatchTable{
 };
 \end{lstlisting}
 
-Indexing is a cast. Store in ctor is relaxed; registration publishes with
-\texttt{release}, lookup consumes with \texttt{acquire} (no lock on hot path).
-The header is 214 lines.
+索引是一个强制转换。 ctor里的商店轻松，注册发布于
+\texttt{release}，查找消耗 \texttt{acquire} （热路径上没有锁定）。
+标题为 214 行。
 
 \begin{lstlisting}[caption={registry map.}, label=lst:registermap]
 class P10_API Dispatcher{
@@ -187,8 +183,8 @@ private:
 };
 \end{lstlisting}
 
- is a Meyer's singleton leaked to avoid
-exit-order destruction:
+是迈耶的单例泄露以避免
+退出顺序销毁：
 
 \begin{lstlisting}[caption={singleton.}, label=lst:singleton]
 Dispatcher& Dispatcher::singleton(){ static Dispatcher* instance=new Dispatcher(); return *instance; }
@@ -199,10 +195,10 @@ void Dispatcher::registerKernel(const std::string& op, DispatchKey k, KernelFunc
   t->kernels[dispatchKeyIndex(k)].store(f,memory_order_release);}
 \end{lstlisting}
 
-\texttt{findHandle} also locks and creates the
-table if absent, returning a non-owning \texttt{OperatorHandle} whose raw
-\texttt{const DispatchTable*} stays stable for the process lifetime.
-\texttt{direct\_kernel}/\texttt{has\_kernel} load under lock without fallback.
+\texttt{findHandle} 还锁定并创建
+表如果不存在，则返回一个非拥有的 \texttt{OperatorHandle} ，其原始
+\texttt{const DispatchTable*} 在进程生命周期内保持稳定。
+\texttt{direct\_kernel}/\texttt{has\_kernel} 在锁定状态下加载，无需回退。
 
 \begin{figure}[H]
 \centering
@@ -215,40 +211,40 @@ table if absent, returning a non-owning \texttt{OperatorHandle} whose raw
 \draw[arrow, color=tporange] (table) -- (kernels);
 \draw[arrow, color=gray, dashed] (table) -- (handle);
 \end{tikzpicture}
-\caption{Ownership: singleton map owns tables; tables own 13 atomics; handles are views via \texttt{findHandle}.}
+\caption{所有权：单例映射拥有表；表拥有 13 个原子；句柄是通过 \texttt{findHandle} 的视图。}
 \label{fig:dispatchermap}
 \end{figure}
 
-Generated redispatch functions cache the handle locally, so the hot path after
-warmup executes two \texttt{acquire} loads and a predicted branch; the cold
-path of adding a new operator pays the \texttt{unordered\_map} rehash and lock.
-Introspection helpers \texttt{direct\_kernel} and \texttt{has\_kernel} exist
-solely for debugging and deliberately avoid the Composite fallback so that dump
-tools can distinguish ``no kernel at this key'' from ``served by Composite''.
-All three helpers lock, because they are off the hot path and must observe a
-consistent snapshot of the map while a concurrent registration may insert a new
+生成的redispatch函数将句柄缓存在本地，因此之后的热路径
+预热执行两个 \texttt{acquire} 加载和一个预测分支；寒冷
+添加新运算符的路径需要支付 \texttt{unordered\_map} 重新哈希和锁定。
+内省助手 \texttt{direct\_kernel} 和 \texttt{has\_kernel} 存在
+仅用于调试并故意避免复合回退，以便转储
+工具可以区分“此键上没有内核”和“由 Composite 提供服务”。
+所有三个助手都锁定，因为他们远离热路径并且必须观察
+地图的一致快照，而并发注册可能会插入新的
 table.
 
 \begin{table}[H]
 \centering
-\caption{Cold vs.\ hot path.}
+\caption{冷路径与热路径。}
 \label{tab:dispatchfields}
 \small
 \begin{tabular}{lll}
 \toprule
-Path & Sync & Operation \\
+Path & Sync & 手术 \\
 \midrule
-\texttt{registerKernel} & \texttt{mutex\_} + \texttt{release} & insert + publish \\
-\texttt{findHandle} & \texttt{mutex\_} (cached by caller) & lookup/create, return handle \\
-\texttt{getKernel} & \texttt{acquire}, no mutex & one load, optional second at 12 \\
+\texttt{registerKernel} & \texttt{mutex\_} + \texttt{release} & 插入+发布 \\
+\texttt{findHandle} & \texttt{mutex\_}（由调用者缓存） & 查找/创建，返回句柄 \\
+\texttt{getKernel} & \texttt{acquire}，无互斥体 & 一次加载，可选第二次加载 12 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{OperatorHandle::getKernel: Composite Fallback}
+\subsection{OperatorHandle::getKernel：复合后备}
 \label{sec:handle}
 
- is the hot load:
+是热负载：
 
 \begin{lstlisting}[caption={backend fallback.}, label=lst:getkernel]
 KernelFunction getKernel(DispatchKey k) const noexcept {
@@ -263,17 +259,17 @@ KernelFunction getKernel(DispatchKey k) const noexcept {
 }
 \end{lstlisting}
 
-Only \texttt{is\_backend\_key} (0--2) consults index~12; autograd/autocast/vmap
-either have a kernel or miss. An explicit backend entry overrides Composite
-without unregistering it, so a generic kernel serves all backends until a
-hardware-specific one appears. Both loads are \texttt{acquire}, pairing with
-the \texttt{release} store in \texttt{registerKernel}.
+仅\texttt{is\_backend\_key}(0--2)查阅索引~12；自动微分/自动转换/vmap
+要么有内核，要么缺失。显式后端条目覆盖 Composite
+无需注销它，因此通用内核为所有后端提供服务，直到
+出现特定于硬件的一个。两个负载都是 \texttt{acquire}，与
+\texttt{release} 商店位于 \texttt{registerKernel}。
 
-\subsection{DispatchStub: Typed Choke Point and Backtrace}
+\subsection{DispatchStub：类型化的阻塞点和回溯}
 \label{sec:stub}
 
- is the sole type-safe boundary;
-generated code never casts at call sites:
+是唯一的类型安全边界；
+生成的代码永远不会在调用站点进行强制转换：
 
 \begin{lstlisting}[caption={autocast guard + miss trace.}, label=lst:stub]
 template<typename R, typename... Args>
@@ -294,30 +290,30 @@ struct DispatchStub{
 };
 \end{lstlisting}
 
-\texttt{autocast::is\_enabled} is forward-declared
-to avoid pulling \texttt{Tensor.h} into every user; the guard is the only
-place that enforces the disabled-autocast $\rightarrow$ miss contract, even if
-upper dispatch already skips it. supplies 32-frame dumps
-to fd~2 when \texttt{TP\_TRACE\_KERNEL\_MISS} is set. The branch is marked
-\texttt{[[unlikely]]} so the predicted path is the non-throwingfall-through,
-adding one compare on autocast keys and none on others after branch prediction.
-The string overload is convenience; hot calls cache the handle in a \texttt{static
-const} local as emitted at (\texttt{static const
-OperatorHandle op = Dispatcher::singleton.findHandle("add")}) so that
-\texttt{findHandle}'s mutex is taken once per process, not per call.
+\texttt{autocast::is\_enabled} 是向前声明的
+避免将 \texttt{Tensor.h} 拉入每个用户；守卫是唯一的
+强制执行禁用自动转换 $\rightarrow$ 未命中合同的地方，即使
+上层调度已经跳过它。提供 32 帧转储
+当设置 \texttt{TP\_TRACE\_KERNEL\_MISS} 时为 fd~2。分支已标记
+\texttt{[[unlikely]]} 所以预测的路径是非投掷的坠落路径，
+在分支预测后添加对自动转换键的比较，而对其他键不添加比较。
+字符串重载很方便；热调用将句柄缓存在 \texttt{static
+const} local 在 (\texttt{static const
+OperatorHandle op = Dispatcher::singleton.findHandle("add")}) 处发出，因此
+\texttt{findHandle} 的互斥量在每个进程中获取一次，而不是在每次调用中获取一次。
 
-\subsection{Registration Macros: TP\_CONCAT and Library Chaining}
+\subsection{注册宏：TP\_CONCAT 和库链接}
 \label{sec:registration}
 
- needs two levels so that a macro argument
-expands before pasting:
+需要两个级别，以便宏参数
+粘贴前展开：
 
 \begin{lstlisting}[caption={two-level concat.}, label=lst:concat]
 #define TP_CONCAT_IMPL(x,y) x##y
 #define TP_CONCAT(x,y) TP_CONCAT_IMPL(x,y)
 \end{lstlisting}
 
-\subsubsection{Deprecated per-op macro}
+\subsubsection{已弃用的每操作宏}
 
 \begin{lstlisting}[caption={one static per (op,key).}, label=lst:regkernel]
 #define TENSORPLAY_REGISTER_KERNEL(OP,KEY,FUNC) \
@@ -326,11 +322,11 @@ expands before pasting:
   } register_##OP##KEY;
 \end{lstlisting}
 
-Stringification \texttt{\#OP} yields the operator name; the function pointer
-is erased to \texttt{void*}. Each use adds a global, inflating \texttt{nm}
-and scattering breakpoints.
+字符串化 \texttt{\#OP} 产生操作符名称；函数指针
+被擦除为 \texttt{void*}。每次使用都会添加一个全局的、膨胀的 \texttt{nm}
+和分散断点。
 
-\subsubsection{Bulk macro}
+\subsubsection{批量宏}
 
 \begin{lstlisting}[caption={one static per (key,NAME) block.}, label=lst:libraryimpl]
 #define TENSORPLAY_LIBRARY_IMPL(KEY, NAME) \
@@ -349,7 +345,7 @@ class Library{public: explicit Library(DispatchKey k): key_(k){}
 private: DispatchKey key_;};
 \end{lstlisting}
 
-Usage groups kernels per file:
+每个文件的使用组内核：
 
 \begin{lstlisting}[caption={Backend grouping.}, label=lst:backenduse]
 TENSORPLAY_LIBRARY_IMPL(CPU, Pointwise){
@@ -357,35 +353,35 @@ TENSORPLAY_LIBRARY_IMPL(CPU, Pointwise){
 }
 \end{lstlisting}
 
-The macro emits a forward decl, a static struct whose ctor builds
-\texttt{Library(CPU)} and calls the init function, a static instance, and the
-function definition the user fills. First registration lazily constructs the
-singleton; order across translation units is irrelevant because no lookup runs
-from static initializers.
+该宏发出一个前向 decl，一个静态结构，其 ctor 构建
+\texttt{Library(CPU)} 并调用 init 函数，一个静态实例，以及
+用户填写的函数定义。第一次注册延迟构造
+单例；翻译单元之间的顺序无关紧要，因为没有查找运行
+来自静态初始化器。
 
 \begin{table}[H]
 \centering
-\caption{Per-op vs.\ bulk ( vs.\ \texttt{203}).}
+\caption{每操作与批量（与\ \texttt{203}）。}
 \label{tab:macros}
 \small
 \begin{tabular}{lll}
 \toprule
- & \texttt{REGISTER\_KERNEL} & \texttt{LIBRARY\_IMPL} \\
+  & \texttt{REGISTER\_KERNEL} & \texttt{LIBRARY\_IMPL} \\
 \midrule
-Statics & $O(\#\text{ops})$ & $O(\#\text{keys}\times\#\text{files})$ \\
-Naming & \texttt{Register\#\#OP\#\#KEY} & \texttt{TP\_CONCAT} 2-level \\
-Breakpoint & many ctors & one \texttt{registerKernel} \\
-Status & deprecated & preferred \\
+静力学 & $O(\#\text{ops})$ & $O(\#\text{keys}\times\#\text{files})$ \\
+命名 & \texttt{Register\#\#OP\#\#KEY} & \texttt{TP\_CONCAT} 2 级 \\
+断点 & 很多演员 & 一个 \texttt{registerKernel} \\
+地位 & 已弃用 & 首选 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{Python/C++ Dual Binding}
+\subsection{Python/C++ 双重绑定}
 \label{sec:dualbinding}
 
- builds \texttt{\_C} with \texttt{UNITY\_BUILD ON}
-(30+ TUs); \texttt{p10} opts out. On non-Windows,
-adds a single shared bridge:
+使用 \texttt{UNITY\_BUILD ON} 构建 \texttt{\_C}
+（30+ TU）； \texttt{p10} 选择退出。在非 Windows 上，
+添加单个共享桥：
 
 \begin{lstlisting}[caption={one shared copy.}, label=lst:tppythontarget]
 if(NOT WIN32)
@@ -394,30 +390,30 @@ if(NOT WIN32)
 endif()
 \end{lstlisting}
 
-The comment at explains: per-extension copies of
-the caster substrate and wrap cache segfault on first returned tensor because
-each copy carries its own \texttt{pybind11::detail::type\_caster} registry and
-its own \texttt{g\_wrap\_cache} map; the first \texttt{tpx\_py\_wrap} from a
-second extension would insert into a different map than the one
-\texttt{tpx\_py\_tensor\_cref} registered from. A single \texttt{tp\_python}
-forces one registry and one cache; user op modules built via
-\texttt{add\_tensorplay\_op} link the same library and are loaded after
-\texttt{\_C} has registered \texttt{TensorBase}, so their unwraps hit the
-direct \texttt{instance} holder path. \texttt{\_C} links \texttt{p10 tpx stax
-tp\_python}; Windows embeds the bridge
-statically because no \texttt{\_\_declspec(dllexport)} annotations exist and the
-DLL boundary would otherwise hide the registry.
+评论解释：每个扩展副本
+第一个返回的张量上的脚轮基底和包装缓存段错误，因为
+每个副本都有自己的 \texttt{pybind11::detail::type\_caster} 注册表，并且
+它自己的 \texttt{g\_wrap\_cache} 地图；第一个 \texttt{tpx\_py\_wrap} 来自
+第二个扩展将插入到与第一个扩展不同的地图中
+\texttt{tpx\_py\_tensor\_cref} 注册自。单个 \texttt{tp\_python}
+强制使用一个注册表和一个缓存；用户操作模块通过构建
+\texttt{add\_tensorplay\_op} 链接相同的库并在之后加载
+\texttt{\_C} 已注册 \texttt{TensorBase}，因此他们的解包击中了
+直接 \texttt{instance} 持有者路径。 \texttt{\_C} 链接 \texttt{p10 tpx stax
+tp\_python}； Windows 嵌入桥
+静态地，因为不存在 \texttt{\_\_declspec(dllexport)} 注释并且
+否则 DLL 边界会隐藏注册表。
 
-\paragraph{pybind11 path.}
-registers \texttt{py::class\_<Tensor>(m,"TensorBase",py::dynamic\_attr)};
- aliases \texttt{Tensor=\_C.TensorBase}.
-\texttt{Ops.cpp} hand-writes \texttt{.def} for custom semantics (factory dtype
-resolution, splats). \texttt{PYBIND11\_MODULE(\_C,m)}
- calls \texttt{init\_dtype} $\rightarrow$ \texttt{init\_ops}
-in order.
+\paragraph{pybind11 路径。}
+寄存器 \texttt{py::class\_<Tensor>(m,"TensorBase",py::dynamic\_attr)}；
+ 别名 \texttt{Tensor=\_C.TensorBase}。
+\texttt{Ops.cpp} 手写 \texttt{.def} 来实现自定义语义（工厂 dtype
+分辨率，splats）。 \texttt{PYBIND11\_MODULE(\_C,m)}
+ 调用 \texttt{init\_dtype} $\rightarrow$ \texttt{init\_ops}
+按顺序。
 
-\paragraph{METH\_FASTCALL path.} \texttt{gen\_python\_c.py}
-emits \texttt{TensorCPythonGenerated.h} with
+\paragraph{METH\_FASTCALL 路径。} \texttt{gen\_python\_c.py}
+发出 \texttt{TensorCPythonGenerated.h} 与
 
 \begin{lstlisting}[caption={generated tables.}, label=lst:gentables]
 inline PyMethodDef generated_functions[]={
@@ -425,7 +421,7 @@ inline PyMethodDef generated_functions[]={
   {nullptr,nullptr,0,nullptr}};
 \end{lstlisting}
 
-Installation is fill-only:
+安装仅填充：
 
 \begin{lstlisting}[caption={never shadows hand-written.}, label=lst:fillonly]
 inline int register_generated_cpython_functions(PyObject* m){
@@ -436,12 +432,12 @@ inline int register_generated_cpython_functions(PyObject* m){
   return 0;}
 \end{lstlisting}
 
- installs it last, behind
-\texttt{getenv("TP\_NO\_FASTCALL")==nullptr}, for both \texttt{m} and
-\texttt{\_VariableFunctions}. When set, the layer is disabled.
+最后安装在后面
+\texttt{getenv("TP\_NO\_FASTCALL")==nullptr}，对于 \texttt{m} 和
+\texttt{\_VariableFunctions}。设置后，该层将被禁用。
 
-\paragraph{Factory trampolines.} installs six
-\texttt{METH\_FASTCALL} trampolines:
+\paragraph{工厂蹦床。} installs six
+\texttt{METH\_FASTCALL} 蹦床：
 
 \begin{lstlisting}[caption={capture-aware trampoline.}, label=lst:factoryhook]
 struct FactoryHook{PyObject *raw,*wrapper,*tensor_type,*scalar_type; bool varargs;};
@@ -454,28 +450,28 @@ PyObject* factory_trampoline(PyObject* self,PyObject* const* a,Py_ssize_t n,PyOb
 }
 \end{lstlisting}
 
-Under \texttt{stax} capture the call goes to the Python wrapper to preserve
-proxy semantics; otherwise it normalizes spellings the strict parser rejects
-and vector-calls the raw fast entry with zero Python frames.
+在 \texttt{stax} 捕获下，调用将转到 Python 包装器以保存
+代理语义；否则它会标准化严格解析器拒绝的拼写
+并用零 Python 帧向量调用原始快速条目。
 
 \begin{table}[H]
 \centering
-\caption{Cooperating layers.}
+\caption{合作层。}
 \label{tab:dualpath}
 \small
 \begin{tabular}{p{3cm}p{5cm}p{5cm}}
 \toprule
- & \texttt{pybind11} & \texttt{METH\_FASTCALL} \\
+  & \texttt{pybind11} & \texttt{METH\_FASTCALL} \\
 \midrule
-Type & \texttt{TensorBase}, \texttt{dynamic\_attr} & reuses same type as descriptors \\
-Custom overloads & hand \texttt{.def} & skipped by \texttt{HasAttr} \\
-Bulk ops & --- & \texttt{generated\_functions[]} via \texttt{gen\_python\_c.py} \\
-Factories & \texttt{functional.py} wrappers & \texttt{FactoryHook} + \texttt{compile\_depth} check \\
+Type & \texttt{TensorBase}, \texttt{dynamic\_attr} & 重用与描述符相同的类型 \\
+自定义重载 & 手 \texttt{.def} & 被 \texttt{HasAttr} 跳过 \\
+批量操作 & --- & \texttt{generated\_functions[]} 通过 \texttt{gen\_python\_c.py} \\
+工厂 & \texttt{functional.py} 包装纸 & \texttt{FactoryHook} + \texttt{compile\_depth} 检查 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Fill-only install means \texttt{nm -D} shows one symbol per operator regardless of how many overloads were generated; adding a new schema adds a \texttt{PyMethodDef} entry but no new shared-library symbol. The bridge itself is header-only for callers: the generated header includes \texttt{CPythonBridge.h} and calls helpers inline, so the optimizer can fold the kind-table check with the parse, and the only remaining call overhead is the indirect \texttt{tpx::ops::add} through the function pointer.
+仅填充安装意味着 \texttt{nm -D} 显示每个运算符一个符号，无论生成了多少个重载；添加新模式会添加 \texttt{PyMethodDef} 条目，但不会添加新的共享库符号。桥本身对于调用者来说只是标头：生成的标头包括 \texttt{CPythonBridge.h} 并内联调用帮助程序，因此优化器可以将类型表检查与解析合并在一起，唯一剩下的调用开销是通过函数指针的间接 \texttt{tpx::ops::add} 。
 
 \begin{figure}[H]
 \centering
@@ -491,17 +487,17 @@ Fill-only install means \texttt{nm -D} shows one symbol per operator regardless 
 \draw[arrow, color=tpgreen] (pb) |- (bridge);
 \draw[arrow, color=tppurple] (fc) |- (bridge);
 \end{tikzpicture}
-\caption{Fill-only funnel: each name has exactly one binding; both paths converge on the bridge.}
+\caption{仅填充漏斗：每个名称只有一个绑定；两条路在桥上交汇。}
 \label{fig:dualfunnel}
 \end{figure}
 
-\subsection{CPythonBridge: Parse, Check, Dispatch, Wrap}
+\subsection{CPythonBridge：解析、检查、分派、包装}
 \label{sec:bridge}
 
- is included by the
-generated header; \texttt{CPythonBridge.cpp} implements the surface.
+包含在
+生成的标头； \texttt{CPythonBridge.cpp} 实现表面。
 
-\subsubsection{Parse}
+\subsubsection{解析}
 
 \begin{lstlisting}[caption={zero-alloc merge.}, label=lst:parseinto]
 void tpx_py_parse_into(PyObject* const* a,Py_ssize_t n,PyObject* kwnames,
@@ -519,13 +515,13 @@ void tpx_py_parse_into(PyObject* const* a,Py_ssize_t n,PyObject* kwnames,
 }
 \end{lstlisting}
 
-\texttt{args[0..n)} are positionals, \texttt{args[n..n+nkw)} are keyword
-values parallel to \texttt{kwnames} (FASTCALL convention). Linear keyword scan
-uses \texttt{PyUnicode\_CompareWithASCIIString} without UTF-8 materialization;
-duplicate/unknown keys throw \texttt{invalid\_argument} so multi-overload
-groups can fall through.
+\texttt{args[0..n)} 是位置，\texttt{args[n..n+nkw)} 是关键字
+与 \texttt{kwnames} 平行的值（FASTCALL 约定）。线性关键词扫描
+使用 \texttt{PyUnicode\_CompareWithASCIIString} 而不使用 UTF-8 实现；
+重复/未知的键抛出 \texttt{invalid\_argument} 所以多重重载
+团体可能会失败。
 
-\subsubsection{Type checking}
+\subsubsection{类型检查}
 
 \begin{lstlisting}[caption={16 kinds + optional.}, label=lst:kindenum]
 enum tpx_py_type_kind: unsigned char {
@@ -534,18 +530,18 @@ enum tpx_py_type_kind: unsigned char {
 constexpr unsigned char TPK_OPTIONAL=0x80;
 \end{lstlisting}
 
- maps each C++ type to a kind byte and emits
-\texttt{static const unsigned char tpx\_kinds[]} per overload; generated code
-calls \texttt{tpx\_py\_check\_types(slots,n,"add",kwlist,kinds,max\_pos)}
-. Mismatches throw with \texttt{op},
-argument name, 1-based position, and \texttt{tp\_name}. The non-throwing
-\texttt{tpx\_py\_obj\_matches\_kind} powers
-the overload fast-probe that picks the unique
-positional-compatible candidate without throwing.
+将每个 C++ 类型映射到一种字节并发出
+每次过载 \texttt{static const unsigned char tpx\_kinds[]}；生成的代码
+调用 \texttt{tpx\_py\_check\_types(slots,n,"add",kwlist,kinds,max\_pos)}
+。与 \texttt{op} 不匹配，
+参数名称、从 1 开始的位置和 \texttt{tp\_name}。不投掷的
+\texttt{tpx\_py\_obj\_matches\_kind} 权力
+过载快速探头，选择独特的
+位置兼容的候选者，无需抛出。
 
-\subsubsection{Subclass and function dispatch}
+\subsubsection{子类和函数调度}
 
-Thread-local state at:
+线程局部状态位于：
 
 \begin{lstlisting}[caption={TLS.}, label=lst:dispatchtls]
 struct PythonDispatchTLS{int function_state=0; int dispatch_layer=0;
@@ -555,17 +551,17 @@ struct PythonDispatchTLS{int function_state=0; int dispatch_layer=0;
 thread_local PythonDispatchTLS g_python_dispatch_tls;
 \end{lstlisting}
 
-Generated preambles call \texttt{try\_function\_mode},
-\texttt{try\_tensor\_function}, \texttt{try\_tensor\_subclass} in order
-. Each builds candidates via
-\texttt{insert\_candidate} (recurse into tuples/lists/dicts, dedup by
-\texttt{PyTypeObject*}, skip builtins), respects skip/disabled flags, and
-vector-calls \texttt{\_\_tensorplay\_dispatch\_\_} /
-\texttt{\_\_tensorplay\_function\_\_} with \texttt{(func,types,args,kwargs)}.
-Return 1 transfers ownership, 0 continues, $-1$ propagates Python exception;
-\texttt{DispatchLayerGuard} plus the active-hook set prevents recursion.
+生成的前导码调用 \texttt{try\_function\_mode}，
+\texttt{try\_tensor\_function}、\texttt{try\_tensor\_subclass} 按顺序
+。每个人都通过以下方式建立候选人
+\texttt{insert\_candidate} （递归到元组/列表/字典，按
+\texttt{PyTypeObject*}，跳过内置函数），尊重跳过/禁用标志，并且
+向量调用 \texttt{\_\_tensorplay\_dispatch\_\_} /
+\texttt{\_\_tensorplay\_function\_\_} 与 \texttt{(func,types,args,kwargs)}。
+Return 1 转移所有权，0 继续，$-1$ 传播 Python 异常；
+\texttt{DispatchLayerGuard} 加上活动挂钩集可防止递归。
 
-\subsubsection{Unpack and wrap}
+\subsubsection{打开包装并包裹}
 
 \begin{lstlisting}[caption={direct holder.}, label=lst:tensorcref]
 const Tensor& tpx_py_tensor_cref(PyObject* o){
@@ -576,11 +572,11 @@ const Tensor& tpx_py_tensor_cref(PyObject* o){
   return tensor_cref_slow(o);}
 \end{lstlisting}
 
-\texttt{g\_tensor\_type} caches \texttt{tensorplay.\_C.TensorBase}
-; the fast path reads the pybind11
-\texttt{instance} holder without a registry lookup, valid while the FASTCALL
-\texttt{args[]} live. \texttt{tpx\_py\_tensor\_mref} is the mutable twin for
-in-place ops. Wrap caches identity keyed by \texttt{TensorImpl*}
+\texttt{g\_tensor\_type} 缓存 \texttt{tensorplay.\_C.TensorBase}
+;快速路径读取 pybind11
+\texttt{instance} 持有者无需进行注册表查找，在 FASTCALL 期间有效
+\texttt{args[]} 直播。 \texttt{tpx\_py\_tensor\_mref} 是可变双胞胎
+就地操作。 Wrap 缓存由 \texttt{TensorImpl*} 键控的身份
 :
 
 \begin{lstlisting}[caption={identity cache.}, label=lst:wrapcache]
@@ -594,12 +590,12 @@ PyObject* tpx_py_wrap(const Tensor& t){
   return w;}
 \end{lstlisting}
 
-The capsule destructor erases the entry on wrapper death (borrowed pointers,
-GIL-protected); null impl skips the capsule. Compute runs under
+胶囊析构函数擦除包装器死亡时的条目（借用的指针，
+GIL 保护）； null impl 跳过胶囊。计算运行在
 \texttt{tpx\_py\_GilRelease} (,
-\texttt{PyEval\_SaveThread}/\texttt{RestoreThread}); wrapping restores the GIL.
+\texttt{PyEval\_SaveThread}/\texttt{RestoreThread});包裹恢复 GIL。
 
-\subsection{Exception Translation}
+\subsection{异常翻译}
 \label{sec:exceptions}
 
 \begin{lstlisting}[caption={hierarchy.}, label=lst:excepth]
@@ -614,7 +610,7 @@ class P10_API DeviceMismatchError: public RuntimeError{using RuntimeError::Runti
 #define TP_THROW(T,...) throw tensorplay::T({__FILE__,__func__,__LINE__},tensorplay::detail::format_msg(__VA_ARGS__))
 \end{lstlisting}
 
- maps to Python:
+映射到Python：
 
 \begin{lstlisting}[caption={map.}, label=lst:translate]
 PyObject* translate_exception(const Exception& e){
@@ -625,10 +621,10 @@ PyObject* translate_exception(const Exception& e){
   return PyExc_RuntimeError;}
 \end{lstlisting}
 
-\texttt{g\_device\_mismatch\_type} is set at via
-\texttt{py::register\_exception<DeviceMismatchError>(m,"DeviceMismatchError",PyExc\_RuntimeError)}.
-The pybind11 translator at appends the C++ stack trace
-only when \texttt{TENSORPLAY\_SHOW\_CPP\_STACKTRACES=1}:
+\texttt{g\_device\_mismatch\_type} 设置为via
+\texttt{py::register\_exception<DeviceMismatchError>(m,"DeviceMismatchError",PyExc\_RuntimeError)}。
+pybind11 翻译器附加了 C++ 堆栈跟踪
+仅当 \texttt{TENSORPLAY\_SHOW\_CPP\_STACKTRACES=1} 时：
 
 \begin{lstlisting}[caption={translator.}, label=lst:pytranslator]
 py::register_exception_translator([](std::exception_ptr p){
@@ -638,18 +634,18 @@ py::register_exception_translator([](std::exception_ptr p){
     PyErr_SetString(translate_exception(e),m.c_str());}});
 \end{lstlisting}
 
-Generated FASTCALL bodies wrap with
+生成的 FASTCALL 主体包含
 \texttt{catch(const std::exception\& e)\{tpx\_py\_set\_error(e); return nullptr;\}}
-, sharing the
-same map so both paths surface identical Python exceptions. The two translators
-are complementary: the pybind11 translator handles exceptions that escape any
-\texttt{.def} call, while each FASTCALL entry owns its own try/catch so that a
-type error during argument unpacking is reported with the operation name and
-argument index before dispatch is attempted, allowing multi-overload groups to
-distinguish argument-shape mismatches (\texttt{invalid\_argument} fallthrough)
-from kernel failures (immediate \texttt{PyErr\_SetString}).
+，分享
+相同的映射，因此两条路径都显示相同的 Python 异常。两位译者
+是互补的：pybind11 翻译器处理逃避任何异常的异常
+\texttt{.def} 调用，而每个 FASTCALL 条目拥有自己的 try/catch，以便
+参数解包期间的类型错误会报告操作名称和
+尝试分派之前的参数索引，允许多重重载组
+区分参数形状不匹配（\texttt{invalid\_argument} 失败）
+来自内核故障（立即 \texttt{PyErr\_SetString}）。
 
-\subsection{End-to-End Flow}
+\subsection{端到端流程}
 \label{sec:e2e}
 
 \begin{figure}[H]
@@ -667,61 +663,53 @@ from kernel failures (immediate \texttt{PyErr\_SetString}).
 \draw[arrow, color=tppurple] (dispatch2) -- (stub2);
 \draw[arrow, color=gray] (stub2) -- (wrap2);
 \end{tikzpicture}
-\caption{End-to-end: arguments $\rightarrow$ bridge $\rightarrow$ GIL-released compute $\rightarrow$ key priority $\rightarrow$ atomic lookup with Composite fallback $\rightarrow$ autocast guard $\rightarrow$ wrap.}
+\caption{端到端：参数 $\rightarrow$ 桥 $\rightarrow$ GIL 发布的计算 $\rightarrow$ 关键优先级 $\rightarrow$ 带有复合回退的原子查找 $\rightarrow$ 自动转换防护 $\rightarrow$ 包装。}
 \label{fig:e2e}
 \end{figure}
 
 \begin{table}[H]
 \centering
-\caption{Hot path for \texttt{tp.add(a,b)} (CPU, no hook).}
+\caption{\texttt{tp.add(a,b)} 的热路径（CPU，无钩子）。}
 \label{tab:e2efiles}
 \small
 \begin{tabular}{lll}
 \toprule
-Phase & File:line & Artifact \\
+阶段 & 文件:行 & 产物 \\
 \midrule
-Codegen & & \texttt{pyop\_add\_function} body \\
-Parse & & \texttt{parse\_into} \texttt{memcpy} + kw scan \\
-Check & & \texttt{tpx\_kinds[]} + \texttt{check\_types} \\
-Unpack & & \texttt{tensor\_cref} direct holder \\
-Key & & \texttt{key\_set} + \texttt{highest\_priority\_key} at \\
-Lookup & & \texttt{getKernel} \texttt{acquire} + Composite 12 \\
-Guard & & \texttt{is\_autocast\_key \&\& !is\_enabled} \\
-Wrap & & \texttt{g\_wrap\_cache} borrowed, capsule erase \\
+代码生成 &  & \texttt{pyop\_add\_function} 主体 \\
+解析 &  & \texttt{parse\_into} \texttt{memcpy} + 关键字扫描 \\
+检查 &  & \texttt{tpx\_kinds[]} + \texttt{check\_types} \\
+解包 &  & \texttt{tensor\_cref} 直接持有者 \\
+键 &  & \texttt{key\_set} + \texttt{highest\_priority\_key} at \\
+查找 &  & \texttt{getKernel} \texttt{acquire} + Composite 12 \\
+守卫 &  & \texttt{is\_autocast\_key \&\& !is\_enabled} \\
+包装 &  & \texttt{g\_wrap\_cache} 借用，胶囊析构 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \begin{tpexample}[Example: Tracing \texttt{tp.add(a,b)} Through All 13 Slots]
-Let \texttt{a} be a CPU float tensor with \texttt{requires\_grad=True} and \texttt{b} a plain CPU float tensor, autocast disabled, no vmap. The bridge unpacks both and calls the generated wrapper for \texttt{add}. \texttt{key\_set} on the output path yields bits \texttt{CPU(0)} $\cup$ \texttt{AutogradCPU(3)} because \texttt{a} requires grad. \texttt{highest\_priority\_key} returns \texttt{AutogradCPU}=3, so \texttt{getKernel(3)} finds the generated autograd wrapper, which records the \texttt{AddBackward} node, then calls \texttt{redispatch\_add} with \texttt{remove\_autograd}. The second iteration sees \texttt{CPU}=0, finds \texttt{add\_cpu} at \texttt{PointwiseKernels.cpp} via \texttt{DispatchStub::call}, and executes the TensorIterator loop. The walk touched exactly two of the thirteen slots; the remaining eleven were never loaded. Inference mode on the same inputs yields a single-bit set \texttt{\{CPU\}} and one iteration.
+令 \texttt{a} 为 CPU 浮点张量，\texttt{requires\_grad=True} 和 \texttt{b} 为普通 CPU 浮点张量，禁用自动转换，无 vmap。桥接器将两者解压并调用为 \texttt{add} 生成的包装器。输出路径上的 \texttt{key\_set} 产生位 \texttt{CPU(0)} $\cup$ \texttt{AutogradCPU(3)} 因为 \texttt{a} 需要梯度。 \texttt{highest\_priority\_key} 返回 \texttt{AutogradCPU}=3，因此 \texttt{getKernel(3)} 找到生成的 autograd 包装器，该包装器记录 \texttt{AddBackward} 节点，然后用 \texttt{remove\_autograd} 调用 \texttt{redispatch\_add}。第二次迭代看到 \texttt{CPU}=0，通过 \texttt{DispatchStub::call} 在 \texttt{PointwiseKernels.cpp} 处找到 \texttt{add\_cpu}，并执行 TensorIterator 循环。步行恰好触及了十三个槽位中的两个；其余十一个从未装载。相同输入上的推理模式会产生一位集 \texttt{\{CPU\}} 和一次迭代。
 \end{tpexample}
-Every table entry is a direct transcription of an enum value or a \texttt{constexpr}, and
-every listing is a verbatim excerpt with at most whitespace folding. The chapter earns its length not by prose inflation but by exposing the five concrete
-artifacts that define redispatch: the offset arithmetic that makes priority a
-cast, the two-branch \texttt{key\_set} that avoids a stored bitset, the 13-
-element atomic array that makes lookup lock-free, the two-level
-\texttt{TP\_CONCAT} that makes bulk registration hygienic, and the single shared
-\texttt{tp\_python} that keeps the caster registry and wrap cache coherent
-across the dual binding.
+每个表条目都是枚举值或 \texttt{constexpr} 的直接转录，并且
+每个列表都是逐字摘录，最多有空格折叠。篇幅不是通过散文的膨胀而是通过揭露五个具体的
+定义重新调度的工件：使优先级成为的偏移算术
+强制转换，避免存储位集的两分支 \texttt{key\_set}，13-
+元素原子数组，使查找无锁，两级
+\texttt{TP\_CONCAT} 使批量注册变得卫生，并且单个共享
+\texttt{tp\_python} 保持施法者注册表和包装缓存一致
+跨越双重绑定。
 
-A final invariant ties the layers together: \texttt{TensorImpl::key\_set} never
-produces \texttt{Composite}, \texttt{OperatorHandle::getKernel} never
-falls back from a non-backend key, \texttt{DispatchStub} never sees a disabled
-autocast key without throwing, \texttt{Library::impl} never stores a null
-function pointer, the FASTCALL layer never shadows a \texttt{pybind11} name,
-\texttt{tpx\_py\_parse\_into} never writes past \texttt{nkws}, the wrap cache
-never holds a dangling pointer because the capsule destructor runs under the
-GIL before the \texttt{TensorImpl} deleter, and \texttt{translate\_exception}
-never returns null because the fallback is \texttt{RuntimeError}. Checking each
-invariant is one search or one \texttt{gdb} breakpoint on the
-line.
+最终的不变量将各层联系在一起：\texttt{TensorImpl::key\_set} never
+不会产生 \texttt{Composite}, \texttt{OperatorHandle::getKernel}
+从非后端键回退，\texttt{DispatchStub} 永远不会看到禁用的
+自动转换键而不抛出， \texttt{Library::impl} 从不存储 null
+函数指针，FASTCALL 层永远不会隐藏 \texttt{pybind11} 名称，
+\texttt{tpx\_py\_parse\_into} 永远不会写入超过 \texttt{nkws}（换行缓存）的内容
+永远不会持有悬空指针，因为胶囊析构函数在
+\texttt{TensorImpl} 删除器之前的 GIL 和 \texttt{translate\_exception}
+永远不会返回 null，因为后备是 \texttt{RuntimeError}。检查每一个
+不变式是一次搜索或 \texttt{gdb} 断点
+线。
 
-\subsection{Design Trade-offs}
-\label{sec:redispatch:tradeoffs}
-
-\textbf{Fixed 13-slot array vs.\ sparse per-op kernel map.} A \texttt{unordered\_map<DispatchKey, Kernel>} per operator would admit unlimited keys at import time. Rejected: the array at makes \texttt{getKernel} a single indexed acquire load with zero allocation and a cache footprint of 13 pointers per op. The cost is that adding a key is a coordinated change (\texttt{DispatchKey.h}, \texttt{kDispatchKeyCount}, and \texttt{EndOfKeys})---deliberate, because key proliferation is exactly what this project refuses (\S\ref{sec:intro:tradeoffs}).
-
-\textbf{Priority by numeric order vs.\ explicit priority table.} An explicit rank table would decouple key values from precedence and admit reordering. Rejected: the identity ``higher numeric key wins'' at lets \texttt{remove\_autograd}/\texttt{remove\_autocast}/\texttt{remove\_vmap} be plain mask clears, and makes the three-layer redispatch loop provably at most three iterations. An explicit table needs a second indirection on every lookup and a consistency invariant between two representations of the same order.
-
-\textbf{Computed key set vs.\ stored bitset.} \texttt{key\_set} could be cached in \texttt{TensorImpl} on device/flag change. Rejected: the computed version at costs one device query plus two bit ops, needs no invalidation protocol, and cannot go stale when a wrapper (\texttt{detach}, views, batched tensors) re-derives identity. Caching would trade a measurable cost for an unmeasurable correctness risk.
 

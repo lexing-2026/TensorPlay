@@ -26,16 +26,16 @@
 // Native aligned flash reference.  This is the standalone CUDA/CUTE kernel
 // source used for the schedule comparison; FLASHATTENTION_DISABLE_DROPOUT
 #if !defined(USE_ROCM) && \
-    __has_include("../../../../third_party/pytorch/third_party/flash-attention/csrc/flash_attn/src/flash.h") && \
-    __has_include("../../../../third_party/pytorch/third_party/cutlass/include/cute/tensor.hpp")
+    __has_include("../../../../third_party/flash-attention/csrc/flash_attn/src/flash.h") && \
+    __has_include("../../../../third_party/cutlass/include/cute/tensor.hpp")
 #define TP_HAS_NATIVE_CUTE_FLASH 1
 #define FLASHATTENTION_DISABLE_DROPOUT
 #define FLASHATTENTION_DISABLE_ALIBI
 #define FLASHATTENTION_DISABLE_LOCAL
 #define FLASHATTENTION_DISABLE_SOFTCAP
 #define FLASH_NAMESPACE tensorplay_native_flash
-#include "../../../../third_party/pytorch/third_party/flash-attention/csrc/flash_attn/src/flash.h"
-#include "../../../../third_party/pytorch/third_party/flash-attention/csrc/flash_attn/src/flash_fwd_kernel.h"
+#include "../../../../third_party/flash-attention/csrc/flash_attn/src/flash.h"
+#include "../../../../third_party/flash-attention/csrc/flash_attn/src/flash_fwd_kernel.h"
 #undef FLASH_NAMESPACE
 #undef FLASHATTENTION_DISABLE_SOFTCAP
 #undef FLASHATTENTION_DISABLE_LOCAL
@@ -1612,11 +1612,14 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
 
   constexpr int kThreads = 256;
 
-  // Default (impl=0) routing: the warp-per-row flash kernel covers every
-  // supported dtype at head_dim <= 128 and avoids the naive kernel's
-  // float32 upcast entirely; the naive row-per-block kernel stays as the
-  // fallback for wider heads.
-  if (impl == 0 && D <= 128) {
+  // Default (impl=0) routing: fp16 with head_dim 128 takes the tensor-core
+  // flash path, which beats the warp-per-row kernel on compact GPUs; every
+  // other supported dtype at head_dim <= 128 keeps the warp-per-row flash
+  // kernel, avoiding the naive kernel's float32 upcast.  The naive
+  // row-per-block kernel stays as the fallback for wider heads.
+  if (impl == 0 && D == 128 && dtype == DType::Float16) {
+    impl = 5;
+  } else if (impl == 0 && D <= 128) {
     impl = 3;
   }
 

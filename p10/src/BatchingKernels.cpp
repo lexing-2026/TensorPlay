@@ -1083,6 +1083,7 @@ TP_BATCH_BINARY(batch_minimum, "minimum")
 TP_BATCH_BINARY(batch_logical_and, "logical_and")
 TP_BATCH_BINARY(batch_logical_or, "logical_or")
 TP_BATCH_BINARY(batch_logical_xor, "logical_xor")
+TP_BATCH_UNARY(batch_logical_not, "logical_not")
 TP_BATCH_BINARY(batch_bitwise_and, "bitwise_and.Tensor")
 TP_BATCH_BINARY(batch_bitwise_or, "bitwise_or.Tensor")
 TP_BATCH_BINARY(batch_bitwise_xor, "bitwise_xor.Tensor")
@@ -1309,7 +1310,7 @@ Tensor batch_where_scalar(const Tensor& condition, Scalar self, Scalar other) {
 // ---------------------------------------------------------------------------
 // Elementwise and reduction rules.  Dim-taking ops shift the public dim past
 // the batch dimension and keep (or re-locate) the batch dimension on the
-// output, mirroring the shape rules of sum_dim above.
+// output, following the shape rules of sum_dim above.
 // ---------------------------------------------------------------------------
 
 Tensor batch_clamp(const Tensor& input, std::optional<Scalar> min,
@@ -1589,6 +1590,7 @@ void register_batch_rules(tensorplay::Library& library) {
     library.impl("logical_and", &batch_logical_and);
     library.impl("logical_or", &batch_logical_or);
     library.impl("logical_xor", &batch_logical_xor);
+    library.impl("logical_not", &batch_logical_not);
     library.impl("bitwise_not", &batch_bitwise_not);
     library.impl("bitwise_and.Tensor", &batch_bitwise_and);
     library.impl("bitwise_or.Tensor", &batch_bitwise_or);

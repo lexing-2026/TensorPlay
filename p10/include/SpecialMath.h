@@ -359,7 +359,7 @@ inline double trigamma(double x)  {
   double result = 0;
   if (x < 0.5) {
     sign = -1;
-    const double sin_pi_x = sin((3.141592653589793115997963468544185161590576171875) * x);
+    const double sin_pi_x = ::sin((3.141592653589793115997963468544185161590576171875) * x);
     result -= ((3.141592653589793115997963468544185161590576171875) * (3.141592653589793115997963468544185161590576171875)) / (sin_pi_x * sin_pi_x);
     x = 1 - x;
   }
@@ -410,13 +410,13 @@ inline double calc_digamma(double x) {
       // If the argument is a negative integer, NaN is returned
       return std::numeric_limits<double>::quiet_NaN();
     }
-    // Extracts the fractional part of x as r, since tan(pi * r) is more numerically
-    // accurate than tan(pi * x). While these operations are mathematically equivalent
-    // since both x and r are in radians and tan() has a periodicity of pi, in practice
+    // Extracts the fractional part of x as r, since ::tan(pi * r) is more numerically
+    // accurate than ::tan(pi * x). While these operations are mathematically equivalent
+    // since both x and r are in radians and ::tan() has a periodicity of pi, in practice
     // the computation of pi * x is a source of error (when |x| > 1).
     double q, r;
     r = std::modf(x, &q);
-    return calc_digamma(1 - x) - (3.141592653589793115997963468544185161590576171875) / tan((3.141592653589793115997963468544185161590576171875) * r);
+    return calc_digamma(1 - x) - (3.141592653589793115997963468544185161590576171875) / ::tan((3.141592653589793115997963468544185161590576171875) * r);
   }
 
   // Push x to be >= 10
@@ -445,7 +445,7 @@ inline double calc_digamma(double x) {
     double z = 1.0 / (x * x);
     y = z * polevl(z, A, 6);
   }
-  return result + log(x) - (0.5 / x) - y;
+  return result + ::log(x) - (0.5 / x) - y;
 }
 
 /*
@@ -468,13 +468,13 @@ inline float calc_digamma(float x) {
     // If the argument is a negative integer, NaN is returned
       return std::numeric_limits<float>::quiet_NaN();
     }
-    // Extracts the fractional part of x as r, since tan(pi * r) is more numerically
-    // accurate than tan(pi * x). While these operations are mathematically equivalent
-    // since both x and r are in radians and tan() has a periodicity of pi, in practice
+    // Extracts the fractional part of x as r, since ::tan(pi * r) is more numerically
+    // accurate than ::tan(pi * x). While these operations are mathematically equivalent
+    // since both x and r are in radians and ::tan() has a periodicity of pi, in practice
     // the computation of pi * x is a source of error (when |x| > 1).
     double q, r;
     r = std::modf(x, &q);
-    float pi_over_tan_pi_x = (float)((3.141592653589793115997963468544185161590576171875) / tan((3.141592653589793115997963468544185161590576171875) * r));
+    float pi_over_tan_pi_x = (float)((3.141592653589793115997963468544185161590576171875) / ::tan((3.141592653589793115997963468544185161590576171875) * r));
     return calc_digamma(1 - x) - pi_over_tan_pi_x;
   }
 
@@ -641,9 +641,9 @@ TP_HOST_DEVICE static scalar_t lanczos_sum_expg_scaled(scalar_t x) {
 
 template <typename scalar_t>
 TP_HOST_DEVICE static scalar_t _igam_helper_fac(scalar_t a, scalar_t x) {
-  // compute x^a * exp(-a) / gamma(a)
-  // corrected from (15) and (16) in [igam2] by replacing exp(x - a) with
-  // exp(a - x).
+  // compute x^a * ::exp(-a) / gamma(a)
+  // corrected from (15) and (16) in [igam2] by replacing ::exp(x - a) with
+  // ::exp(a - x).
 
   scalar_t ax, fac, res, num, numfac;
   constexpr scalar_t MAXLOG = std::is_same_v<scalar_t,double> ?
@@ -1335,10 +1335,10 @@ chbevl(const T x, const T array[], size_t len) {
  */
 template <typename T>
 inline std::tuple<const T*, size_t> chebyshev_coefficients_i0e_A() {
-  /* Chebyshev coefficients for exp(-x) I0(x)
+  /* Chebyshev coefficients for ::exp(-x) I0(x)
    * in the interval [0,8].
    *
-   * lim(x->0){ exp(-x) I0(x) } = 1.
+   * lim(x->0){ ::exp(-x) I0(x) } = 1.
    */
   static const T coeff[] = {
       -4.41534164647933937950E-18, 3.33079451882223809783E-17,
@@ -1361,10 +1361,10 @@ inline std::tuple<const T*, size_t> chebyshev_coefficients_i0e_A() {
 
 template <typename T>
 inline std::tuple<const T*, size_t> chebyshev_coefficients_i0e_B() {
-  /* Chebyshev coefficients for exp(-x) sqrt(x) I0(x)
+  /* Chebyshev coefficients for ::exp(-x) ::sqrt(x) I0(x)
    * in the inverted interval [8,infinity].
    *
-   * lim(x->inf){ exp(-x) sqrt(x) I0(x) } = 1/sqrt(2pi).
+   * lim(x->inf){ ::exp(-x) ::sqrt(x) I0(x) } = 1/::sqrt(2pi).
    */
   static const T coeff[] = {
       -7.23318048787475395456E-18, -4.83050448594418207126E-18,
@@ -1387,10 +1387,10 @@ inline std::tuple<const T*, size_t> chebyshev_coefficients_i0e_B() {
 template <typename T>
 TP_HOST_DEVICE inline typename std::enable_if_t<std::is_same_v<double, T>, std::tuple<const T*, size_t>>
 chebyshev_coefficients_i1e_A() {
-  /* Chebyshev coefficients for exp(-x) I1(x)
+  /* Chebyshev coefficients for ::exp(-x) I1(x)
    * in the interval [0,8].
    *
-   * lim(x->0){ exp(-x) I1(x) / x } = 1/2.
+   * lim(x->0){ ::exp(-x) I1(x) / x } = 1/2.
    */
   static const T coeff[] = {
       2.77791411276104639959E-18, -2.11142121435816608115E-17,
@@ -1414,10 +1414,10 @@ chebyshev_coefficients_i1e_A() {
 template <typename T>
 TP_HOST_DEVICE inline typename std::enable_if_t<std::is_same_v<float, T>, std::tuple<const T*, size_t>>
 chebyshev_coefficients_i1e_A() {
-  /* Chebyshev coefficients for exp(-x) I1(x)
+  /* Chebyshev coefficients for ::exp(-x) I1(x)
    * in the interval [0,8].
    *
-   * lim(x->0){ exp(-x) I1(x) / x } = 1/2.
+   * lim(x->0){ ::exp(-x) I1(x) / x } = 1/2.
    */
   static const T coeff[] = {
       9.38153738649577178388E-9f,
@@ -1443,10 +1443,10 @@ chebyshev_coefficients_i1e_A() {
 template <typename T>
 TP_HOST_DEVICE inline typename std::enable_if_t<std::is_same_v<double, T>, std::tuple<const T*, size_t>>
 chebyshev_coefficients_i1e_B() {
-  /* Chebyshev coefficients for exp(-x) sqrt(x) I1(x)
+  /* Chebyshev coefficients for ::exp(-x) ::sqrt(x) I1(x)
    * in the inverted interval [8,infinity].
    *
-   * lim(x->inf){ exp(-x) sqrt(x) I1(x) } = 1/sqrt(2pi).
+   * lim(x->inf){ ::exp(-x) ::sqrt(x) I1(x) } = 1/::sqrt(2pi).
    */
   static const T coeff[] = {
       7.51729631084210481353E-18,  4.41434832307170791151E-18,
@@ -1469,10 +1469,10 @@ chebyshev_coefficients_i1e_B() {
 template <typename T>
 TP_HOST_DEVICE inline typename std::enable_if_t<std::is_same_v<float, T>, std::tuple<const T*, size_t>>
 chebyshev_coefficients_i1e_B() {
-  /* Chebyshev coefficients for exp(-x) sqrt(x) I1(x)
+  /* Chebyshev coefficients for ::exp(-x) ::sqrt(x) I1(x)
    * in the inverted interval [8,infinity].
    *
-   * lim(x->inf){ exp(-x) sqrt(x) I1(x) } = 1/sqrt(2pi).
+   * lim(x->inf){ ::exp(-x) ::sqrt(x) I1(x) } = 1/::sqrt(2pi).
    */
   static const T coeff[] = {
       -3.83538038596423702205E-9f,
@@ -1573,7 +1573,7 @@ inline tensorplay::Half calc_i1e(tensorplay::Half a) { return calc_i1e(static_ca
 template <typename T>
 inline TP_HOST_DEVICE T calc_ndtri(T y0) {
 
-  /* sqrt(2pi) */
+  /* ::sqrt(2pi) */
   constexpr T s2pi = 2.50662827463100050242E0;
   constexpr T one = 1;
   constexpr T zero = 0;
@@ -1599,8 +1599,8 @@ inline TP_HOST_DEVICE T calc_ndtri(T y0) {
       -1.18331621121330003142E0,
   };
 
-  /* Approximation for interval z = sqrt(-2 log y ) between 2 and 8
-  * i.e., y between exp(-2) = .135 and exp(-32) = 1.27e-14.
+  /* Approximation for interval z = ::sqrt(-2 log y ) between 2 and 8
+  * i.e., y between ::exp(-2) = .135 and ::exp(-32) = 1.27e-14.
   */
   static const T P1[9] = {
       4.05544892305962419923E0,
@@ -1626,8 +1626,8 @@ inline TP_HOST_DEVICE T calc_ndtri(T y0) {
       -9.33259480895457427372E-4,
   };
 
-  /* Approximation for interval z = sqrt(-2 log y ) between 8 and 64
-  * i.e., y between exp(-32) = 1.27e-14 and exp(-2048) = 3.67e-890.
+  /* Approximation for interval z = ::sqrt(-2 log y ) between 8 and 64
+  * i.e., y between ::exp(-32) = 1.27e-14 and ::exp(-2048) = 3.67e-890.
   */
 
   static const T P2[9] = {
@@ -1665,7 +1665,7 @@ inline TP_HOST_DEVICE T calc_ndtri(T y0) {
   }
   bool code = true;
   T y = y0;
-  if (y > one - T{0.13533528323661269189}) { /* 0.135... = exp(-2) */
+  if (y > one - T{0.13533528323661269189}) { /* 0.135... = ::exp(-2) */
     y = one - y;
     code = false;
   }
@@ -1682,7 +1682,7 @@ inline TP_HOST_DEVICE T calc_ndtri(T y0) {
 
   const T z = one / x;
   T x1;
-  if (x < T{8.0}) /* y > exp(-32) = 1.2664165549e-14 */
+  if (x < T{8.0}) /* y > ::exp(-32) = 1.2664165549e-14 */
   {
     x1 = z * polevl(z, P1, 8) / polevl(z, Q1, 8);
   } else {
@@ -1719,7 +1719,7 @@ inline TP_HOST_DEVICE T calc_ndtri(T y0) {
  * WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-/* erfcx(x) = exp(x^2) erfc(x) function, for real x, written by
+/* erfcx(x) = ::exp(x^2) ::erfc(x) function, for real x, written by
    Steven G. Johnson, October 2012.
 
    This function combines a few different ideas.
@@ -1741,7 +1741,7 @@ inline TP_HOST_DEVICE T calc_ndtri(T y0) {
          degree Chebyshev polynomials in each subinterval. This greatly
          improves performance in my tests.
 
-   For x < 0, we use the relationship erfcx(-x) = 2 exp(x^2) - erfc(x),
+   For x < 0, we use the relationship erfcx(-x) = 2 ::exp(x^2) - ::erfc(x),
    with the usual checks for overflow etcetera.
 
    Performance-wise, it seems to be substantially faster than either
@@ -1749,7 +1749,7 @@ inline TP_HOST_DEVICE T calc_ndtri(T y0) {
    or Cody's CALERF function (from netlib.org/specfun), while
    retaining near machine precision in accuracy.  */
 
-/* Given y100=100*y, where y = 4/(4+x) for x >= 0, compute erfc(x).
+/* Given y100=100*y, where y = 4/(4+x) for x >= 0, compute ::erfc(x).
 
    Uses a look-up table of 100 different Chebyshev polynomials
    for y intervals [0,0.01], [0.01,0.02], ...., [0.99,1], generated
@@ -2179,7 +2179,7 @@ calc_erfcx(T x)
 
   if (x >= 0) {
     if (x > 50) { // continued-fraction expansion is faster
-      const T ispi = 0.56418958354775628694807945156; // 1 / sqrt(pi)
+      const T ispi = 0.56418958354775628694807945156; // 1 / ::sqrt(pi)
       if (x > 5e7) { // 1-term expansion, important to avoid overflow
         return ispi / x;
       }
@@ -2194,10 +2194,10 @@ calc_erfcx(T x)
       return std::numeric_limits<T>::infinity();
     }
     else if (x < -6.1) {
-      return 2*exp(x*x);
+      return 2*::exp(x*x);
     }
     else {
-      return 2*exp(x*x) - erfcx_y100(400/(4-x));
+      return 2*::exp(x*x) - erfcx_y100(400/(4-x));
     }
   }
 }
@@ -2221,8 +2221,8 @@ inline TP_HOST_DEVICE T calc_log_ndtr(T x) {
 
 /*
  * Gaussian cumulative distribution function,
- *   Phi(x) = erfc(-x / sqrt(2)) / 2.
- * The equivalent (1 + erf(x/sqrt(2)))/2 cancels the whole left tail away:
+ *   Phi(x) = ::erfc(-x / ::sqrt(2)) / 2.
+ * The equivalent (1 + ::erf(x/::sqrt(2)))/2 cancels the whole left tail away:
  * erf saturates at -1 by x = -8.3, so everything below that would come back
  * as exactly zero.  Through erfc the tail keeps full relative accuracy until
  * the result itself underflows near x = -38; below that log_ndtr is the form
@@ -2235,7 +2235,7 @@ inline TP_HOST_DEVICE T calc_ndtr(T x) {
 }
 
 /*
- * Entropy term -x * log(x) of a single probability element.
+ * Entropy term -x * ::log(x) of a single probability element.
  * Defined as 0 at x == 0 (the limit) and -inf for x < 0, where the term has
  * no real value; NaN propagates.
  */
@@ -2248,7 +2248,7 @@ inline TP_HOST_DEVICE T calc_entr(T x) {
 }
 
 /*
- * x * log(y) with the convention 0 * log(y) = 0 for every finite or infinite
+ * x * ::log(y) with the convention 0 * ::log(y) = 0 for every finite or infinite
  * y. A NaN y still poisons the result, so the zero shortcut is taken only
  * after the NaN test.
  */
@@ -2260,7 +2260,7 @@ inline TP_HOST_DEVICE T calc_xlogy(T x, T y) {
 }
 
 /*
- * x * log1p(y), the same convention as calc_xlogy shifted by one so the
+ * x * ::log1p(y), the same convention as calc_xlogy shifted by one so the
  * singular point sits at y == -1.
  */
 template <typename T>

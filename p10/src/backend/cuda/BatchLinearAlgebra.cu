@@ -91,7 +91,7 @@ Tensor cholesky_inverse_cuda(const Tensor& self, bool upper) {
 
 Tensor cholesky_solve_cuda(const Tensor& self, const Tensor& input2, bool upper) {
     // self = B (..., n, rhs); input2 = factor; solve (L L^T) X = B with two
-    // triangular sweeps, mirroring potrs.
+    // triangular sweeps, as in the classic potrs factorization.
     require_float(self, "cholesky_solve");
     require_float(input2, "cholesky_solve");
     const DType dt = self.dtype();

@@ -67,7 +67,7 @@ void main() {
   } else if (uBlock.axis == 2) {
     // Channel: positions are global channel indices within the batch;
     // padded lanes are skipped.
-    const int n = pos.z / uBlock.in_c_depth;
+    const int n = pos.z / uBlock.out_c_depth;
     const int channels = uBlock.in_sizes.z;
     bool first = true;
     float best = 0.0f;

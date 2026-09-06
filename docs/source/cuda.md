@@ -5,7 +5,6 @@
 
 # tensorplay.cuda
 
-# torch.cuda
 
 ```{eval-rst}
 .. autosummary::

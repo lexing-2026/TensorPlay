@@ -1135,6 +1135,8 @@ if TYPE_CHECKING:
 
 else:
     _lazy_modules = {
+        "_dynamo",
+        "accelerator",
         "audio",
         "export",
         "func",
@@ -1193,6 +1195,18 @@ def _is_device_backend_autoload_enabled() -> builtins.bool:
     """
     # enabled by default
     return os.getenv("TENSORPLAY_DEVICE_BACKEND_AUTOLOAD", "1") == "1"
+
+
+def _check(cond, msg=None):
+    """
+    Assert a condition that may be backed by a symbolic expression.
+
+    Under eager execution a plain check: a false condition raises
+    ``RuntimeError`` carrying ``msg``.  Symbolic backends may turn the check
+    into a deferred assertion instead of an immediate failure.
+    """
+    if not cond:
+        raise RuntimeError(msg if msg is not None else "Expected cond to be true")
 
 
 def _as_tensor_fullprec(t):

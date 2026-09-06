@@ -29,8 +29,9 @@ namespace {
 
 // Bridges oneDNN's primitive partitioning onto TensorPlay's intra-op pool.
 // Synchronous contract (no ASYNCHRONOUS flag): parallel_for() blocks until
-// every submitted chunk finished, mirroring how the pool already serves
-// pointwise kernels -- one shared worker team, no OMP oversubscription.
+// every submitted chunk finished, following the same pattern the pool already
+// uses to serve pointwise kernels -- one shared worker team, no OMP
+// oversubscription.
 //
 // Note: oneDNN must not be driven from inside a callback that is itself
 // running on the intra-op pool (the same single-pool constraint that

@@ -329,43 +329,17 @@ Tensor eye_kernel(
       dtype == DType::Float32 || dtype == DType::Float16 ||
           dtype == DType::Int32,
       "Vulkan eye supports Float32, Float16 and Int32 only");
-  Tensor t = zeros_kernel({n, m}, dtype, resolve_device(device), false);
-  if (t.numel() == 0) {
-    return t;
-  }
+  Tensor t = empty_kernel({n, m}, dtype, resolve_device(device), false);
+  if (t.numel() == 0) return t;
   api::vTensor v = convert(t);
-  TP_CHECK(
-      v.storage_type() == api::StorageType::TEXTURE_3D,
-      "Vulkan eye requires texture storage");
-  Tensor host = utils::create_staging_tensor(v);
-  const int64_t itemsize = host.itemsize();
-  uint8_t* bytes = static_cast<uint8_t*>(host.impl()->storage().data());
-  // {n, m}: N=1, C=n (row), H=1, W=m (column); the diagonal lives one
-  // element per channel lane across the width.
-  for (int64_t i = 0; i < std::min(n, m); ++i) {
-    const int64_t z = i / 4;
-    const int64_t lane = i % 4;
-    const int64_t byte_offset =
-        (((z * 1 + 0) * m + i) * 4 + lane) * itemsize;
-    switch (v.texture_dtype()) {
-      case DType::Float32:
-        *reinterpret_cast<float*>(bytes + byte_offset) = 1.0f;
-        break;
-      case DType::Float16:
-        *reinterpret_cast<tensorplay::Half*>(bytes + byte_offset) =
-            tensorplay::Half(1.0f);
-        break;
-      case DType::Int32:
-        *reinterpret_cast<int32_t*>(bytes + byte_offset) = 1;
-        break;
-      default:
-        TP_THROW(
-            NotImplementedError,
-            "Vulkan eye: unsupported texture dtype");
-    }
-  }
-  utils::upload_host_bytes(
-      v, host.impl()->storage().data(), host.numel() * host.itemsize());
+  api::Context* context = api::context();
+  const char* shader = dtype == DType::Int32 ? "eye_i32" :
+      dtype == DType::Float16 ? "eye_f16" : "eye";
+  api::PipelineBarrier barrier{};
+  context->submit_compute_job(
+      VK_KERNEL_FROM_STR(shader), barrier, v.extents(),
+      adaptive_work_group_size(v.extents()), VK_NULL_HANDLE,
+      v.image(barrier, api::PipelineStage::COMPUTE, api::MemoryAccessType::WRITE));
   return t;
 }
 

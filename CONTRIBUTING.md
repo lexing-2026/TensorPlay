@@ -76,7 +76,7 @@ feat(compiler)!: subject      # breaking change: add '!' and a footer
 - Breaking changes: append `!` before `:` and describe the migration in a
   `BREAKING CHANGE:` footer; also set the `breaking change` label on the PR.
 - Local setup: `pip install pre-commit && pre-commit install --hook-type pre-commit --hook-type commit-msg`.
-- Versions follow pytorch's rules (`version.txt`); `cz bump` is never used.
+- Versions follow semantic rules from `version.txt`; `cz bump` is never used.
   Release notes are drafted with `cz changelog --dry-run` plus the
   `release notes: *` PR buckets (see RELEASE.md).
 
@@ -104,8 +104,7 @@ interface declared in `pyproject.toml`:
 # Install (add -v for verbose output)
 pip install .
 
-# CPU-only build (USE_*/BUILD_*/CMAKE_* env vars are forwarded to CMake,
-# mirroring pytorch's EnvVarForwarding)
+# CPU-only build (USE_*/BUILD_*/CMAKE_* env vars are forwarded to CMake)
 USE_CUDA=OFF pip install .
 
 # Editable install for development

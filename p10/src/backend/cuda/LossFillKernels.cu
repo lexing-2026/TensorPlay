@@ -309,7 +309,7 @@ Tensor mse_loss_cuda(const Tensor& input, const Tensor& target,
             .add_const_input(pr.first)
             .add_const_input(pr.second)
             .build();
-        gpu_kernel(iter, [] __device__(double x, double t) -> double {
+        gpu_kernel(iter, [] __host__ __device__(double x, double t) -> double {
             const double d = x - t;
             return d * d;
         });
@@ -369,7 +369,7 @@ Tensor smooth_l1_loss_cuda(const Tensor& input, const Tensor& target,
             .add_const_input(pr.first)
             .add_const_input(pr.second)
             .build();
-        gpu_kernel(iter, [beta] __device__(double x, double t) -> double {
+        gpu_kernel(iter, [beta] __host__ __device__(double x, double t) -> double {
             const double d = ::fabs(x - t);
             return d < beta ? 0.5 * d * d / beta : d - 0.5 * beta;
         });
@@ -426,7 +426,7 @@ Tensor huber_loss_cuda(const Tensor& input, const Tensor& target,
             .add_const_input(pr.first)
             .add_const_input(pr.second)
             .build();
-        gpu_kernel(iter, [delta] __device__(double x, double t) -> double {
+        gpu_kernel(iter, [delta] __host__ __device__(double x, double t) -> double {
             const double d = ::fabs(x - t);
             return d < delta ? 0.5 * d * d : delta * (d - 0.5 * delta);
         });

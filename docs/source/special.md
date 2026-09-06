@@ -5,6 +5,8 @@
 
 # tensorplay.special
 
+The tensorplay.special module, modeled after SciPy's [special](https://docs.scipy.org/doc/scipy/reference/special.html) module.
+
 ## Functions
 
 ```{eval-rst}

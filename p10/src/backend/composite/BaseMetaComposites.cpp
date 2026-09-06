@@ -159,8 +159,7 @@ namespace {
 
 Tensor compressed_indices_slot(const Tensor& self, const char* name) {
     const auto impl = self.unsafeGetTensorImpl();
-    if (!impl || !impl->is_sparse() ||
-        impl->sparse_layout() != TensorImpl::kSparseCSRLayout) {
+    if (!impl || !impl->is_sparse() || !impl->is_sparse_compressed()) {
         TP_THROW(RuntimeError, name,
                  " expected a tensor with a sparse compressed layout");
     }
@@ -172,8 +171,7 @@ Tensor compressed_indices_slot(const Tensor& self, const char* name) {
 
 Tensor plain_indices_slot(const Tensor& self, const char* name) {
     const auto impl = self.unsafeGetTensorImpl();
-    if (!impl || !impl->is_sparse() ||
-        impl->sparse_layout() != TensorImpl::kSparseCSRLayout) {
+    if (!impl || !impl->is_sparse() || !impl->is_sparse_compressed()) {
         TP_THROW(RuntimeError, name,
                  " expected a tensor with a sparse compressed layout");
     }

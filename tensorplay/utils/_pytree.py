@@ -18,6 +18,7 @@ from typing import Any, Callable, Iterable, Optional, TypeVar, Union
 __all__ = [
     "Context",
     "FlattenFn",
+    "GetAttrKey",
     "LeafSpec",
     "PyTree",
     "SUPPORTED_NODES",
@@ -49,12 +50,26 @@ UnflattenFn = Callable[[Iterable[Any], Context], PyTree]
 
 
 @dataclass(frozen=True)
+class GetAttrKey:
+    """Identifies one attribute of a flattened container object."""
+
+    name: str
+
+    def __str__(self) -> str:
+        return f".{self.name}"
+
+    def get(self, obj: Any) -> Any:
+        return getattr(obj, self.name)
+
+
+@dataclass(frozen=True)
 class NodeDef:
     """How one registered container type is taken apart and put back together."""
 
     type: type[Any]
     flatten_fn: FlattenFn
     unflatten_fn: UnflattenFn
+    serialized_type_name: Optional[str] = None
 
 
 SUPPORTED_NODES: dict[type[Any], NodeDef] = {}
@@ -64,17 +79,20 @@ def register_pytree_node(
     cls: type[Any],
     flatten_fn: FlattenFn,
     unflatten_fn: UnflattenFn,
+    *,
+    serialized_type_name: Optional[str] = None,
 ) -> None:
     """Registers ``cls`` as a container type.
 
     ``flatten_fn`` returns ``(children, context)``; ``unflatten_fn`` takes
     those back and rebuilds an instance.  The context carries whatever the
     children do not -- dict keys, a namedtuple's class, a defaultdict's
-    factory.
+    factory.  ``serialized_type_name`` is the fully qualified name recorded
+    when the tree spec is serialized; it must uniquely identify ``cls``.
     """
     if cls in SUPPORTED_NODES:
         raise ValueError(f"{cls} is already registered as a pytree node type")
-    SUPPORTED_NODES[cls] = NodeDef(cls, flatten_fn, unflatten_fn)
+    SUPPORTED_NODES[cls] = NodeDef(cls, flatten_fn, unflatten_fn, serialized_type_name)
 
 
 def _deregister_pytree_node(cls: type[Any]) -> None:

@@ -161,10 +161,10 @@ def _nested_redistribution_body(rank, world_size, port):
     from tensorplay.distributed.tensor.experimental._context_parallel._attention import (
         _context_parallel_shard,
     )
-    from tensorplay.nn.attention.flex_attention import (
+    from tensorplay.nn.attention.omni_attention import (
         BlockMask,
         create_block_mask,
-        flex_attention,
+        omni_attention,
     )
     from tensorplay.distributed.tensor.placement_types import _StridedShard
 
@@ -250,7 +250,7 @@ def _nested_redistribution_body(rank, world_size, port):
         )[0]
         assert isinstance(local_block_mask, BlockMask)
         assert local_block_mask.shape == (1, 1, 128, 512)
-        output = flex_attention(
+        output = omni_attention(
             tp.randn((1, 1, 128, 4)),
             tp.randn((1, 1, 512, 4)),
             tp.randn((1, 1, 512, 4)),

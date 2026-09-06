@@ -7,7 +7,10 @@
 #include "Tensor.h"
 
 #include <cmath>
+#include <algorithm>
 #include <functional>
+#include <numeric>
+#include <random>
 #include <vector>
 
 namespace {
@@ -1468,7 +1471,7 @@ TEST_F(VulkanExtendedOpTest, ProductReductionsMultiDtype) {
       tpx_ops::prod(xv, {1}, true).to(Device(DeviceType::CPU)),
       tpx_ops::prod(x, {1}, true));
 
-  // Integer payloads stage through the host; the result promotes to Int64.
+  // Integer products accumulate on the device and promote to Int64.
   Tensor xi = tpx_ops::arange(1, 7, DType::Int32).reshape({2, 3});
   Tensor xiv = vk(xi);
   Tensor got = tpx_ops::prod(xiv).to(Device(DeviceType::CPU))
@@ -1476,6 +1479,12 @@ TEST_F(VulkanExtendedOpTest, ProductReductionsMultiDtype) {
   Tensor ref = tpx_ops::prod(xi).to(DType::Float32);
   vulkan_test::expect_allclose(got, ref);
   EXPECT_EQ(got.item().to<double>(), 720.0);
+  Tensor wide = Tensor::tensor(std::vector<int32_t>{-100000, 100000, 3});
+  Tensor wide_result = tpx_ops::prod(vk(wide));
+  EXPECT_TRUE(wide_result.device().is_vulkan());
+  EXPECT_EQ(wide_result.dtype(), DType::Int64);
+  EXPECT_EQ(wide_result.to(Device(DeviceType::CPU)).data_ptr<int64_t>()[0],
+            -30000000000LL);
 }
 
 TEST_F(VulkanExtendedOpTest, BooleanAggregatesMultiDtype) {
@@ -1512,6 +1521,7 @@ TEST_F(VulkanExtendedOpTest, BooleanAggregatesMultiDtype) {
 TEST_F(VulkanExtendedOpTest, CountNonzeroAndIsNan) {
   Tensor x = tpx_ops::arange(1., 13., DType::Float32).reshape({3, 4});
   Tensor xv = vk(x);
+  EXPECT_EQ(tpx_ops::count_nonzero(xv).dtype(), DType::Int64);
 
   Tensor got = tpx_ops::count_nonzero(xv).to(Device(DeviceType::CPU))
                    .to(DType::Float32);
@@ -1599,6 +1609,25 @@ TEST_F(VulkanExtendedOpTest, SelectionOpsMatchCpu) {
   vulkan_test::expect_allclose(
       tpx_ops::median(xv).to(Device(DeviceType::CPU)),
       tpx_ops::median(x));
+
+  // Cross a tile boundary and exercise an interior axis with padded channels.
+  std::vector<float> shuffled(2 * 513 * 3);
+  std::iota(shuffled.begin(), shuffled.end(), 0.0f);
+  std::mt19937 rng(123);
+  std::shuffle(shuffled.begin(), shuffled.end(), rng);
+  Tensor mixed = Tensor::tensor(shuffled).reshape({2, 513, 3});
+  Tensor mixed_v = vk(mixed);
+  for (bool descending : {false, true}) {
+    auto result = tpx_ops::sort(mixed_v, 1, descending);
+    auto expected = tpx_ops::sort(mixed, 1, descending);
+    vulkan_test::expect_allclose(std::get<0>(result), std::get<0>(expected));
+    vulkan_test::expect_allclose(
+        std::get<1>(result).to(Device(DeviceType::CPU)).to(DType::Float32),
+        std::get<1>(expected).to(DType::Float32));
+    auto top = tpx_ops::topk(mixed_v, 3, 1, descending);
+    auto expected_top = tpx_ops::topk(mixed, 3, 1, descending);
+    vulkan_test::expect_allclose(std::get<0>(top), std::get<0>(expected_top));
+  }
 }
 
 TEST_F(VulkanExtendedOpTest, CumprodAndLogsumexpMatchCpu) {
@@ -1618,6 +1647,17 @@ TEST_F(VulkanExtendedOpTest, CumprodAndLogsumexpMatchCpu) {
   vulkan_test::expect_allclose(
       tpx_ops::logsumexp(xv, 0, true).to(Device(DeviceType::CPU)),
       tpx_ops::logsumexp(x, 0, true), 1e-4, 1e-5);
+
+  std::vector<float> packed(2 * 9 * 3 * 5);
+  for (size_t i = 0; i < packed.size(); ++i) {
+    packed[i] = 1.0f + 0.1f * static_cast<float>(int(i % 5) - 2);
+  }
+  Tensor channels = Tensor::tensor(packed).reshape({2, 9, 3, 5});
+  Tensor channels_v = vk(channels);
+  for (int64_t d = 0; d < 4; ++d) {
+    vulkan_test::expect_allclose(
+        tpx_ops::cumprod(channels_v, d), tpx_ops::cumprod(channels, d), 1e-4, 1e-5);
+  }
 }
 
 //
@@ -1655,6 +1695,13 @@ TEST_F(VulkanExtendedOpTest, Int32BinaryTensorArithmetic) {
   vulkan_test::expect_allclose(
       acc.to(Device(DeviceType::CPU)).to(DType::Float32),
       tpx_ops::mul(a, b).to(DType::Float32));
+
+  Tensor signed_a = Tensor::tensor(std::vector<int32_t>{-31, 100001, -21, 0, 100, -7});
+  Tensor signed_b = Tensor::tensor(std::vector<int32_t>{3, -7, 5, 9, -13, 2});
+  Tensor quotient = tpx_ops::div(vk(signed_a), vk(signed_b));
+  EXPECT_TRUE(quotient.device().is_vulkan());
+  EXPECT_EQ(quotient.dtype(), DType::Float32);
+  vulkan_test::expect_allclose(quotient, tpx_ops::div(signed_a, signed_b));
 }
 
 TEST_F(VulkanExtendedOpTest, Int32ScalarArithmetic) {

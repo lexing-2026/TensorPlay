@@ -47,7 +47,7 @@ std::string unary_variant(const char* base, UnaryVocab vocab, const char* name) 
     static const std::string kInplace = "inplace";
     const size_t pos = b.rfind(kInplace);
     if (pos != std::string::npos && pos + kInplace.size() == b.size() &&
-        b.compare(pos - 4, 4, "_i32") != 0) {
+        (pos < 4 || b.compare(pos - 4, 4, "_i32") != 0)) {
       b.insert(pos, "_i32");
     } else if (b.size() < 4 || b.compare(b.size() - 4, 4, "_i32") != 0) {
       b += "_i32";
@@ -373,7 +373,8 @@ Tensor asin_kernel(const Tensor& self) {
 }
 
 Tensor& asin_inplace_kernel(Tensor& self) {
-  return unary_op_typed_inplace(self, "asininplace", "buffer_asininplace", "unary asin");
+  return unary_op_typed_inplace(
+      self, "asininplace", "buffer_asininplace", "unary asin");
 }
 
 Tensor acos_kernel(const Tensor& self) {
@@ -381,7 +382,8 @@ Tensor acos_kernel(const Tensor& self) {
 }
 
 Tensor& acos_inplace_kernel(Tensor& self) {
-  return unary_op_typed_inplace(self, "acosinplace", "buffer_acosinplace", "unary acos");
+  return unary_op_typed_inplace(
+      self, "acosinplace", "buffer_acosinplace", "unary acos");
 }
 
 Tensor atan_kernel(const Tensor& self) {

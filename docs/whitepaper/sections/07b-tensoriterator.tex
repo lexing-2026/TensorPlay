@@ -1,35 +1,35 @@
 % 07b-tensoriterator.tex — TensorIterator and Type Promotion
-\section{TensorIterator: Broadcast, Type Promotion, and Parallel Reduction}
+\section{TensorIterator：广播、类型提升和并行归约}
 \label{sec:tensoriterator}
 
-\subsection{Problem: One-Iteration Abstraction}
+\subsection{问题：一次迭代抽象}
 
-A pointwise \ac{cpu} kernel for \texttt{add} must handle three orthogonal concerns: (i) broadcast, (ii) type promotion, and (iii) non-contiguous strides. Hand-writing four nested loops per kernel would duplicate 80\% of. TensorIterator is the reusable execution template: kernels provide only \texttt{dst[i]=func(src[i])}.
+\texttt{add} 的逐点 \ac{cpu} 内核必须处理三个正交问题：(i) 广播、(ii) 类型提升和 (iii) 非连续跨步。每个内核手写四个嵌套循环将重复 80%。 TensorIterator 是可重用的执行模板：内核仅提供 \texttt{dst[i]=func(src[i])}。
 
-The CPU implementation provides the complete reusable iterator path, while CUDA kernels currently hand-write indexing; unifying the two paths remains future work.
+CPU 实现提供了完整的可重用迭代器路径，而 CUDA 内核目前手写索引；统一这两条道路仍然是未来的工作。
 
 \begin{tpdef}[Definition (TensorIterator)]
-The \emph{TensorIterator} is a reusable execution template for elementwise and reduction kernels. Given operands $(t_1,\dots,t_n)$ and an output $o$, its build pipeline (seven steps, \S\ref{sec:tensoriterator}) computes a common shape $S$, a common dtype $D$, and per-operand strides such that the innermost loop can execute with unit stride on the contiguous path. A kernel then supplies only a scalar functor $\mathrm{dst}[i] = f(\mathrm{src}_1[i],\dots,\mathrm{src}_n[i])$ plus an optional vectorized variant; broadcast, promotion, and stride reordering are all resolved \emph{before} the loop runs, so the hot path contains no per-element branching on those concerns.
+\emph{TensorIterator} 是用于元素和归约内核的可重用执行模板。给定操作数 $(t_1,\dots,t_n)$ 和输出 $o$，其构建管道（七个步骤，\S\ref{sec:tensoriterator}）计算通用形状 $S$、通用数据类型 $D$ 和每个操作数步长，以便最内层循环可以在连续路径上以单位步长执行。然后，内核仅提供标量函子 $\mathrm{dst}[i] = f(\mathrm{src}_1[i],\dots,\mathrm{src}_n[i])$ 以及可选的向量化变体；广播、提升和跨步重新排序均已在循环运行时解决 \emph{before} ，因此热路径不包含针对这些问题的每个元素分支。
 \end{tpdef}
 
 \begin{table}[H]
 \centering
-\caption{TensorIterator vs.\ hand-written loops.}
+\caption{TensorIterator vs.\ 手写循环。}
 \label{tab:ti_vs_hand}
 \small
 \begin{tabular}{lll}
 \toprule
-Concern & Hand-written & TensorIterator \\
+忧虑 & 手写 & 张量迭代器 \\
 \midrule
-Broadcast & 4 loops per kernel & \texttt{compute\_shape} once \\
-Promotion & \texttt{switch(dtype)} per kernel & \texttt{compute\_types} once \\
-Strides & manual pointer arithmetic & \texttt{compute\_strides} + \texttt{reorder} \\
-Parallel & per-kernel \texttt{parallel\_for} & \texttt{for\_each(loop)} \\
+播送 & 每个内核 4 个循环 & \texttt{compute\_shape}一次 \\
+晋升 & 每个内核 \texttt{switch(dtype)} & \texttt{compute\_types}一次 \\
+跨步 & 手动指针算术 & \texttt{compute\_strides} + \texttt{reorder} \\
+平行线 & 每个内核 \texttt{parallel\_for} & \texttt{for\_each(loop)} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{Data Structures}
+\subsection{数据结构}
 
 :
 
@@ -54,7 +54,7 @@ struct TensorIteratorBase{
 };
 \end{lstlisting}
 
- factories:
+工厂：
 
 \begin{lstlisting}[caption={factories.}, label=lst:tifactories]
 static TensorIterator binary_op(Tensor& out, const Tensor& a, const Tensor& b){
@@ -64,9 +64,9 @@ static TensorIterator binary_op(Tensor& out, const Tensor& a, const Tensor& b){
 static TensorIterator reduce_op(Tensor& out, const Tensor& a);
 \end{lstlisting}
 
- is the builder (\texttt{add\_output}, \texttt{add\_input}, \texttt{set\_check\_mem\_overlap}, \texttt{promote\_inputs\_to\_common\_dtype}, \texttt{is\_reduction}, \texttt{resize\_outputs},).
+是构建器（\texttt{add\_output}、\texttt{add\_input}、\texttt{set\_check\_mem\_overlap}、\texttt{promote\_inputs\_to\_common\_dtype}、\texttt{is\_reduction}、\texttt{resize\_outputs}）。
 
-\subsection{Build Pipeline: Seven Steps}
+\subsection{构建管道：七个步骤}
 
 :
 
@@ -94,25 +94,25 @@ void TensorIteratorBase::build(Config& cfg){
 \node[libbox, fill=gray!8, draw=gray, below=0.6cm of c, minimum width=9.5cm, align=center] (fast) {fast path: \texttt{all\_same\_shape \&\& contiguous \&\& !is\_reduction} $\rightarrow$ collapse to 1D};
 \draw[arrow, dashed, color=gray] (a) -- (fast); \draw[arrow, dashed, color=gray] (fast) -- (g);
 \end{tikzpicture}
-\caption{TensorIterator build pipeline. Fast path skips reorder and coalesce for the contiguous case.}
+\caption{TensorIterator 构建管道。快速路径会跳过连续情况的重新排序和合并。}
 \label{fig:tibuild}
 \end{figure}
 
 \begin{enumerate}[leftmargin=1.2em]
-\item \textbf{populate\_operands:} move \texttt{Tensor} into \texttt{OperandInfo}, record \texttt{data} and \texttt{stride\_bytes}.
-\item \textbf{compute\_shape}: broadcast rule \texttt{size==1} broadcasts, else equal; preserves \texttt{0}-size.
-\item \textbf{compute\_types} ( folds \texttt{promoteTypes},): if \texttt{promote\_inputs\_to\_common\_dtype}, creates temporaries via \texttt{op.tensor.to(common\_dtype)}; if \texttt{cast\_common\_dtype\_to\_outputs}, allocates temp output.
-\item \textbf{compute\_strides + reorder\_dimensions:106}: insertion sort dims by stride ascending, reduced dims front; disabled if \texttt{enforce\_linear\_iteration}.
-\item \textbf{coalesce\_dimensions:530}: merges \texttt{shape[n]*stride[n]==stride[n+1]} adjacent dims.
+\item \textbf{populate\_operands:} 将 \texttt{Tensor} 移入 \texttt{OperandInfo}，记录 \texttt{data} 和 \texttt{stride\_bytes}。
+\item \textbf{compute\_shape}：广播规则\texttt{size==1}广播，否则相等；保留 \texttt{0} 大小。
+\item \textbf{compute\_types} ( 折叠 \texttt{promoteTypes},)：如果 \texttt{promote\_inputs\_to\_common\_dtype}，则通过 \texttt{op.tensor.to(common\_dtype)} 创建临时变量；如果 \texttt{cast\_common\_dtype\_to\_outputs}，则分配临时输出。
+\item \textbf{compute\_strides + reorder\_dimensions:106}：插入排序按步幅升序变暗，减少前面的变暗；如果 \texttt{enforce\_linear\_iteration} 则禁用。
+\item \textbf{coalesce\_dimensions:530}：合并 \texttt{shape[n]*stride[n]==stride[n+1]} 相邻的暗淡。
 \item \textbf{allocate\_or\_resize\_outputs}: \texttt{empty(shape, dtype, device)} if \texttt{resize\_outputs}.
-\item \textbf{post:} fill \texttt{op.data = tensor.data\_ptr}.
+\item \textbf{post:} 填充 \texttt{op.data = tensor.data\_ptr}。
 \end{enumerate}
 
- collapses to \texttt{shape[0]=numel} when all operands share shape and are contiguous.
+当所有操作数共享形状且连续时，会折叠为 \texttt{shape[0]=numel}。
 
-\subsection{Type Promotion Lattice}
+\subsection{类型促销格子}
 
- defines a strict lattice:
+定义严格格：
 
 \begin{lstlisting}[caption={lattice (abridged).}, label=lst:promote]
 DType promoteTypes(DType a,DType b){
@@ -130,7 +130,7 @@ DType promoteTypes(DType a,DType b){
 }
 \end{lstlisting}
 
- enumerates 20+ types (\texttt{UInt8}, \texttt{Float32}, \texttt{BFloat16}, \texttt{ComplexDouble}, \texttt{QInt8},...), with \texttt{isComplex} predicates and \texttt{elementSize}. The result is written to \texttt{Edge::grad\_dtype} for backward cast-back.
+枚举 20 多种类型（\texttt{UInt8}、\texttt{Float32}、\texttt{BFloat16}、\texttt{ComplexDouble}、\texttt{QInt8}、...），带有 \texttt{isComplex} 谓词和 \texttt{elementSize}。结果写入 \texttt{Edge::grad\_dtype} 以进行向后投射。
 
 \begin{figure}[H]
 \centering
@@ -144,15 +144,15 @@ DType promoteTypes(DType a,DType b){
 \node[libbox, fill=yellow!12, draw=orange!60!black, below=of i, minimum width=2.2cm] (b) {Bool};
 \draw[arrow] (c) -- (cf); \draw[arrow] (cf) -- (f64); \draw[arrow] (f64) -- (f32); \draw[arrow] (f32) -- (f16); \draw[arrow] (f16) -- (i); \draw[arrow] (i) -- (b);
 \end{tikzpicture}
-\caption{Promotion lattice. \texttt{Float16+BFloat16 $\rightarrow$ Float32} is the special case.}
+\caption{促销格子。 \texttt{Float16+BFloat16 -> Float32} 是特例。}
 \label{fig:promotion}
 \end{figure}
 
-\subsection{Parallel and Reduction}
+\subsection{并行和缩减}
 
- \texttt{for\_each(loop, grain=GRAIN\_SIZE)} dispatches to \texttt{parallel::parallel\_for} (custom thread pool, \texttt{GRAIN\_SIZE=32768}). \texttt{parallel\_reduce} selects \texttt{two\_pass\_reduction} for single-element outputs (per-thread buffer then \texttt{final\_reduce}) vs.\ (\texttt{find\_split\_dim}, \texttt{narrow}, \texttt{foreach}).
+\texttt{for\_each(loop, grain=GRAIN\_SIZE)} 分派到 \texttt{parallel::parallel\_for}（自定义线程池，\texttt{GRAIN\_SIZE=32768}）。 \texttt{parallel\_reduce} 选择 \texttt{two\_pass\_reduction} 作为单元素输出（每个线程缓冲区，然后 \texttt{final\_reduce}） vs.（\texttt{find\_split\_dim}、\texttt{narrow}、\texttt{foreach}）。
 
-\subsection{Kernel Wiring}
+\subsection{内核接线}
 
 :
 
@@ -167,31 +167,25 @@ template<Func> Tensor unary_op_kernel(const Tensor& self, Func func, VOp vec){
 }
 \end{lstlisting}
 
-\ac{cuda} \texttt{PointwiseKernels.cu} currently hand-writes \texttt{blockIdx*blockDim} grid-stride loops without TI — the known repetition left as future work.
+\ac{cuda} \texttt{PointwiseKernels.cu} 目前手写 \texttt{blockIdx*blockDim} 网格步幅循环，没有 TI——已知的重复留给未来的工作。
 
-\subsection{Comparison}
+\subsection{比较}
 
 \begin{table}[H]
 \centering
-\caption{TensorIterator design tradeoffs.}
+\caption{TensorIterator 实现对比。}
 \label{tab:ti_compare}
 \small
 \begin{tabular}{lll}
 \toprule
- & TensorPlay & Broader implementation \\
+  & 张量播放 & 更广泛的实施 \\
 \midrule
-CPU & full TI & full TI \\
-CUDA & hand-written & full TI \\
-MemoryFormat & bool + enum & full propagation \\
-Safety & \texttt{can\_cast}: non-Undefined ok & full safe-cast \\
-Vector & \texttt{vecunary} outside TI & inside TI \\
+CPU & 全TI & 全TI \\
+CUDA & 手写的 & 全TI \\
+内存格式 & 布尔+枚举 & 完全传播 \\
+安全 & \texttt{can\_cast}：非未定义好 & 完全安全施法 \\
+向量 & TI 之外的 \texttt{vecunary} & 德州仪器内部 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{Design Trade-offs}
-\label{sec:ti:tradeoffs}
-
-\textbf{Resolve-before-loop vs.\ per-element branching.} The iterator could check broadcast/promotion inside the inner loop instead of precomputing shapes, types, and reordered strides in the seven-step build. Rejected: per-element branching on concerns that are loop-invariant wastes a compare and a predictable-not-taken slot on every element; resolving up front (\S\ref{sec:tensoriterator}) puts the whole cost in setup, so the hot loop is a bare unit-stride \texttt{dst[i]=func(src[i])} that autovectorizes. The trade: a broadcast \texttt{[3,1,5]+[4,5]} pays $\sim$1\,\textmu s of setup per op call, amortized only over enough elements---which is why very small tensors ($<$16 elements) take a dedicated fast path that skips the full iterator build.
-
-\textbf{TI on CPU only vs.\ both backends.} Extending TI to CUDA (Table~\ref{tab:ti_compare}) would unify the two kernel families. Deferred, not rejected: CUDA TI needs a device-side iterator state layout and different parallelization decisions (grid-stride vs.\ grain 8192), and the hand-written CUDA kernels at \texttt{PointwiseKernels.cu} are correct today. The seam is documented so the unification is a refactor, not a redesign.

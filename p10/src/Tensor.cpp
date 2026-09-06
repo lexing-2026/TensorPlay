@@ -1,6 +1,7 @@
  #include <iomanip>
 #include <type_traits>
 #include "Tensor.h"
+#include "Complex.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 namespace ops = tensorplay::tpx::ops;
 #include "TensorImpl.h"
@@ -540,17 +541,24 @@ Scalar Tensor::item() const {
         case DType::UInt32: return Scalar(static_cast<uint64_t>(*data_ptr<uint32_t>()));
         case DType::UInt64: return Scalar(*data_ptr<uint64_t>());
         case DType::Bool: return Scalar(static_cast<bool>(*data_ptr<bool>()));
+        // Tensor carries a static `complex` factory, which hides the element
+        // type of the same name inside its own members; the qualified spelling
+        // reaches the type.
         case DType::ComplexHalf: {
-            const auto value = *data_ptr<complex<Half>>();
-            return Scalar(complex<float>(static_cast<float>(value.real()),
-                                         static_cast<float>(value.imag())));
+            const auto value = *data_ptr<::tensorplay::complex<Half>>();
+            return Scalar(::tensorplay::complex<float>(
+                static_cast<float>(value.real()),
+                static_cast<float>(value.imag())));
         }
-        case DType::ComplexFloat: return Scalar(*data_ptr<complex<float>>());
-        case DType::ComplexDouble: return Scalar(*data_ptr<complex<double>>());
+        case DType::ComplexFloat:
+            return Scalar(*data_ptr<::tensorplay::complex<float>>());
+        case DType::ComplexDouble:
+            return Scalar(*data_ptr<::tensorplay::complex<double>>());
         case DType::BComplex32: {
-            const auto value = *data_ptr<complex<BFloat16>>();
-            return Scalar(complex<float>(static_cast<float>(value.real()),
-                                         static_cast<float>(value.imag())));
+            const auto value = *data_ptr<::tensorplay::complex<BFloat16>>();
+            return Scalar(::tensorplay::complex<float>(
+                static_cast<float>(value.real()),
+                static_cast<float>(value.imag())));
         }
         default:
             TP_THROW(NotImplementedError, "item() not implemented for this dtype");

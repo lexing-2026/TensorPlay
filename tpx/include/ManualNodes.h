@@ -3,6 +3,7 @@
 #include "Autograd.h"
 #include "SavedVariable.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
+#include <array>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -167,8 +168,13 @@ inline std::tuple<Tensor, Tensor> prelu_backward(const Tensor& grad,
 }
 
 inline Tensor maybe_multiply(const Tensor& t, const Scalar& s) {
-    if (s.toDouble() == 1.0) return t;
-    return t.mul(s);
+    bool is_one = false;
+    if (s.isFloatingPoint()) {
+        is_one = s.toDouble() == 1.0;
+    } else if (s.isIntegral(true)) {
+        is_one = s.to<int64_t>() == 1;
+    }
+    return is_one ? t : t.mul(s);
 }
 
 // Repeat backward helper.
@@ -1065,6 +1071,31 @@ inline Tensor norm_backward(const Tensor& grad, const Tensor& self, double p,
 inline Tensor norm_backward(const Tensor& grad, const Tensor& self,
                             const Scalar& p, const Tensor& norm) {
     return norm_backward(grad, self, p.to<double>(), norm, {}, true);
+}
+
+// Trilinear backward: each operand gradient reruns the contraction with the
+// output gradient substituted for one input and that input's expand/sum
+// roles swapped.  Built from the same dispatcher-level primitives the
+// forward uses, so double backward records through the inner ops.
+inline std::tuple<Tensor, Tensor, Tensor> _trilinear_backward(
+    const Tensor& grad_out, const Tensor& i1, const Tensor& i2,
+    const Tensor& i3, const std::vector<int64_t>& expand1,
+    const std::vector<int64_t>& expand2, const std::vector<int64_t>& expand3,
+    const std::vector<int64_t>& sumdim, std::array<bool, 3> grad_mask) {
+    Tensor grad_i1, grad_i2, grad_i3;
+    if (grad_mask[0]) {
+        grad_i1 = ops::_trilinear(grad_out, i2, i3, sumdim, expand2, expand3,
+                                  expand1, /*unroll_dim=*/1);
+    }
+    if (grad_mask[1]) {
+        grad_i2 = ops::_trilinear(i1, grad_out, i3, expand1, sumdim, expand3,
+                                  expand2, /*unroll_dim=*/1);
+    }
+    if (grad_mask[2]) {
+        grad_i3 = ops::_trilinear(i1, i2, grad_out, expand1, expand2, sumdim,
+                                  expand3, /*unroll_dim=*/1);
+    }
+    return {std::move(grad_i1), std::move(grad_i2), std::move(grad_i3)};
 }
 
 // Product backward with zeros: exclusive normal/reverse

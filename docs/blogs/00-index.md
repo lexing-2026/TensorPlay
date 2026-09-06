@@ -15,7 +15,7 @@
 |---|---|---|---|
 | [01](01-architecture-four-pillars.md) | **总体架构与四支柱解耦** | 为什么要把张量、自动微分、编译器拆成三个独立动态库？ | `p10/CMakeLists.txt:28`、`tpx/CMakeLists.txt:26`、`CMakeLists.txt:938-945`、`tensorplay/__init__.py:1-1197` |
 | [02](02-tensor-storage-impl-view.md) | **张量内存模型：Storage → TensorImpl → Tensor** | 视图如何零拷贝共享存储？版本号如何防“静默算错”？ | `p10/include/StorageImpl.h:13`、`TensorImpl.h:28`、`Tensor.h:80`、`p10/src/Tensor.cpp:645` |
-| [03](03-dispatcher-codegen.md) | **分发器与代码生成：从 yaml 到 C++/Python 的全链路** | 478 条 `native_functions.yaml` 如何一次生成 6 份产物？ | `config/native_functions.yaml:1`、`tools/codegen/gen_api.py:304`、`p10/include/Dispatcher.h:49` |
+| [03](03-dispatcher-codegen.md) | **分发器与代码生成：从 yaml 到 C++/Python 的全链路** | 478 条算子注册表条目如何一次生成 6 份产物？ | `config/native_functions.yaml:1`、`tools/codegen/gen_api.py:304`、`p10/include/Dispatcher.h:49` |
 | [04](04-tensor-iterator-dtype.md) | **TensorIterator 与类型提升：逐元素算子的“执行模板”** | 广播、类型提升、维度重排如何在 1145 行内完成？ | `p10/include/TensorIterator.h:32`、`p10/src/TensorIterator.cpp:1077`、`p10/include/TypePromotion.h:12` |
 | [05](05-autograd-engine.md) | **自动微分引擎：DAG/Engine/SavedVariable** | 为什么没有 `Tape`？`Node` 如何在多设备 ReadyQueue 间调度？ | `tpx/include/Node.h:26`、`tpx/include/Engine.h:23`、`tpx/include/SavedVariable.h:15` |
 | [06](06-compiler-stax-graph.md) | **编译器栈：compiler / _stax / graph 三层捕获与 lowering** | FX 式捕获如何与 C++ 静态 IR 衔接？Pointwise 融合如何生成 C++/Triton？ | `tensorplay/compiler/__init__.py:1`、`tensorplay/_stax/api.py:1`、`tensorplay/graph/tracer.py:1`、`stax/include/Graph.h:47` |

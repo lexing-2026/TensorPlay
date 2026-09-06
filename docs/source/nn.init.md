@@ -5,7 +5,6 @@
 
 # tensorplay.nn.init
 
-# torch.nn.init
 
 ```{eval-rst}
 .. autosummary::

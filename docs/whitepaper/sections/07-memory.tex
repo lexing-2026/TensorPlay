@@ -1,10 +1,10 @@
 % 07-memory.tex
-\section{Memory: DataPtr, Storage, TensorImpl, and Tensor}
+\section{内存：DataPtr、Storage、TensorImpl 和 Tensor}
 \label{sec:memory}
 
-Memory in TensorPlay is a strict three-layer stack: raw allocation (\texttt{DataPtr} plus per-device \texttt{Allocator}), byte container (\texttt{StorageImpl} / \texttt{Storage}), and typed view with shape and dispatch state (\texttt{TensorImpl} / \texttt{Tensor}). Each layer is physically isolated, cited below at \texttt{path:line}, and designed so that the cheapest operation---a view---touches no allocator at all. This section documents the mechanism field by field, constructor by constructor, with line-precise evidence.
+TensorPlay 中的内存是严格的三层堆栈：原始分配（\texttt{DataPtr} 加上每个设备 \texttt{Allocator}）、字节容器（\texttt{StorageImpl} / \texttt{Storage}）以及具有形状和调度状态的类型化视图（\texttt{TensorImpl} / \texttt{Tensor}）。每层都是物理隔离的，在下面的 \texttt{path:line} 中引用，并且设计成最便宜的操作（视图）根本不接触分配器。
 
-\subsection{Three Layers and Ownership}
+\subsection{三层和所有权}
 \label{sec:memlayers}
 
 \begin{figure}[H]
@@ -24,16 +24,16 @@ Memory in TensorPlay is a strict three-layer stack: raw allocation (\texttt{Data
 \draw[dashed, color=gray] (note1) -- (simpl);
 \draw[dashed, color=gray] (note2) -- (timpl);
 \end{tikzpicture}
-\caption{Three layers: \texttt{DataPtr} (raw, move-only) $\rightarrow$ \texttt{StorageImpl/Storage} (bytes, ref-counted) $\rightarrow$ \texttt{TensorImpl/Tensor} (typed, shaped, versioned). Views are zero-copy aliases; clones allocate the bottom layer.}
+\caption{三层：\texttt{DataPtr}（原始，仅移动）$\rightarrow$ \texttt{StorageImpl/Storage}（字节，引用计数）$\rightarrow$ \texttt{TensorImpl/Tensor}（类型化，成形，版本化）。视图是零拷贝别名；克隆分配底层。}
 \label{fig:memlayers}
 \end{figure}
 
-Only \texttt{Tensor} is copyable by users; \texttt{DataPtr} is move-only, \texttt{DataPtr} is move-only and \texttt{StorageImpl} is never exposed by value. \texttt{TensorImpl} is \texttt{shared\_ptr}-managed so that views, sparse components, and batched wrappers can alias it without manual lifetime tracking.
+只有 \texttt{Tensor} 可供用户复制； \texttt{DataPtr} 只能移动，\texttt{DataPtr} 只能移动，而 \texttt{StorageImpl} 永远不会通过值暴露。 \texttt{TensorImpl} 由 \texttt{shared\_ptr} 管理，因此视图、稀疏组件和批处理包装器可以为其别名，而无需手动生命周期跟踪。
 
-\subsection{DataPtr: Move-Only Handle with Erased Deleter and Device}
+\subsection{DataPtr：带有已擦除删除器和设备的仅移动句柄}
 \label{sec:dataptr}
 
- defines \texttt{DataPtr} as a move-only handle over four words:
+将 \texttt{DataPtr} 定义为四个字上的仅移动句柄：
 
 \begin{lstlisting}[caption={move-only handle, 4 words.}, label=lst:dataptrfull]
 class DataPtr {
@@ -65,39 +65,39 @@ class DataPtr {
 };
 \end{lstlisting}
 
-Design points, each verifiable in:
+设计点，每个点都可以在以下方面验证：
 
 \begin{itemize}[leftmargin=1.2em]
-\item \textbf{Erased deleter via \texttt{ctx}.} The alias \texttt{DeleterFnPtr = void(*)(void*)} is a plain function pointer, not \texttt{std::function}. Stateful cleanup is encoded by passing a separate \texttt{ctx\_} to \texttt{deleter\_(ctx\_)}---a context-carrying signature that avoids allocation and capture. The alternative constructor \texttt{DataPtr(void*,DeleterFnPtr,Device)} sets \texttt{ctx\_==data\_} for stateless cases such as \texttt{deleteCPP}.
-\item \textbf{Device travels with the allocation.} The public field \texttt{Device device\_} is initialized to \texttt{Unknown} for the null state and is swapped in alongside the pointers. Every \texttt{get} enforces a debug check in when \texttt{NDEBUG} is absent, warning on \texttt{Unknown} access. Higher layers (\texttt{StorageImpl}, \texttt{TensorImpl}) read \texttt{data\_ptr.device\_} to decide copy paths rather than caching a second copy of the type.
-\item \textbf{Move-only, not copyable.} Both copy operations are \texttt{=delete}, and both move operations swap through a null default. Table~\ref{tab:dataptr} summarizes the deleter choices offered in the header.
+\item \textbf{Erased deleter via ->.} 别名 \texttt{DeleterFnPtr = void(*)(void*)} 是一个普通函数指针，而不是 \texttt{std::function}。有状态清理是通过将单独的 \texttt{ctx\_} 传递到 \texttt{deleter\_(ctx\_)} 来编码的——这是一个避免分配和捕获的上下文承载签名。替代构造函数 \texttt{DataPtr(void*,DeleterFnPtr,Device)} 为无状态情况（例如 \texttt{deleteCPP}）设置 \texttt{ctx\_==data\_}。
+\item \textbf{Device travels with the allocation.} 公共字段 \texttt{Device device\_} 被初始化为 \texttt{Unknown} 以表示空状态，并与指针一起交换。当 \texttt{NDEBUG} 不存在时，每个 \texttt{get} 都会强制进行调试检查，并对 \texttt{Unknown} 访问发出警告。较高层（\texttt{StorageImpl}、\texttt{TensorImpl}）读取 \texttt{data\_ptr.device\_} 来决定复制路径，而不是缓存该类型的第二个副本。
+\item \textbf{Move-only, not copyable.} 两个复制操作都是 \texttt{=delete}，并且两个移动操作都通过空默认值进行交换。表~\ref{tab:dataptr} 总结了标题中提供的删除器选择。
 \end{itemize}
 
 \begin{table}[H]
 \centering
-\caption{ --- deleter varieties and usage. All are \texttt{DeleterFnPtr}; state rides in \texttt{ctx\_}.}
+\caption{---删除器品种及用途。全部都是 \texttt{DeleterFnPtr}；州政府乘坐 \texttt{ctx\_}。}
 \label{tab:dataptr}
 \small
 \begin{tabular}{lll}
 \toprule
-Symbol & Signature / Location & When used \\
+象征 & 签名/地点 & 使用时 \\
 \midrule
-\texttt{deleteNothing} & \texttt{void(void*)} & Borrowing external memory (no ownership) \\
-\texttt{deleteCPP} & \texttt{delete[] char*} & Fallback path in CPU tests \\
-\texttt{CachingAllocator::deleter} & \texttt{void(void*)} & Normal path: \texttt{ctx} is data ptr, header is at \texttt{ptr-64} \\
-\texttt{release} & \texttt{void*} & Caller assumes ownership, drops deleter without calling it \\
+\texttt{deleteNothing} & \texttt{void(void*)} & 借用外部存储器（无所有权） \\
+\texttt{deleteCPP} & \texttt{delete[] char*} & CPU 测试中的后备路径 \\
+\texttt{CachingAllocator::deleter} & \texttt{void(void*)} & 正常路径：\texttt{ctx} 是数据指针，标头位于 \texttt{ptr-64} \\
+\texttt{release} & \texttt{void*} & 调用者取得所有权，在不调用它的情况下删除删除器 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The size implication is immediate: \texttt{sizeof(DataPtr)} is four pointers (three \texttt{void*}/function pointer plus \texttt{Device} with padding), trivially relocatable by \texttt{swap} and safe to return by value from \texttt{Allocator::allocate}.
+大小含义是直接的：\texttt{sizeof(DataPtr)} 是四个指针（三个 \texttt{void*}/函数指针加上 \texttt{Device} 带填充），可以通过 \texttt{swap} 轻松重定位，并且可以安全地从 \texttt{Allocator::allocate} 按值返回。
 
-\subsection{Allocator: Bucketed Caching with 64-Byte Header, \texttt{free\_blocks\_}, and Copy Dispatch}
+\subsection{分配器：带有 64 字节标头、\texttt{free\_blocks\_} 和副本调度的分桶缓存}
 \label{sec:allocator}
 
-\subsubsection{Interface}
+\subsubsection{界面}
 
- is the abstract interface:
+是抽象接口：
 
 \begin{lstlisting}[caption={abstract surface.}, label=lst:allociface]
 class P10_API Allocator {
@@ -115,11 +115,11 @@ P10_API void copyAllocationBytes(void* dst, const Device& dst_dev,
                                  size_t nbytes);
 \end{lstlisting}
 
-\texttt{getCPUAllocator}, \texttt{getAllocator(DeviceType)}, and \texttt{copyAllocationBytes} complete the surface. Device-specific builds expose additional symbols such as \texttt{getPinnedMemoryAllocator} and \texttt{getCUDAAllocator}.
+\texttt{getCPUAllocator}、\texttt{getAllocator(DeviceType)} 和 \texttt{copyAllocationBytes} 完成表面。特定于设备的构建公开了其他符号，例如 \texttt{getPinnedMemoryAllocator} 和 \texttt{getCUDAAllocator}。
 
-\subsubsection{CachingAllocator Internals}
+\subsubsection{缓存分配器内部结构}
 
-The CPU implementation lives entirely in an anonymous namespace in. Its structure:
+CPU实现完全存在于一个匿名命名空间中。其结构：
 
 \begin{lstlisting}[caption={bucketed caching allocator.}, label=lst:cachingalloc]
 class CachingAllocator : public Allocator {
@@ -155,44 +155,40 @@ class CachingAllocator : public Allocator {
 };
 \end{lstlisting}
 
-Concrete details:
+具体细节：
 
 \begin{itemize}[leftmargin=1.2em]
-\item \textbf{64-byte header and alignment.} \texttt{HEADER\_SIZE=64} guarantees that \texttt{data = raw+64} is 64-byte aligned whenever \texttt{raw} is, since 64 divides the alignment. The helper \texttt{alloc\_aligned} uses \texttt{posix\_memalign(\&ptr,64,nbytes)} on POSIX and \texttt{\_aligned\_malloc} on Windows.
-\item \textbf{Bucketing.} The total size \texttt{nbytes+64} is rounded up to the next multiple of 64: \texttt{(total\_size+63) \& \~{}63}. Buckets are keyed by this rounded total (\texttt{free\_blocks\_.find(total\_size)} at), reducing fragmentation while keeping the reuse check O(1). The \texttt{Header::size} field stores the rounded size so \texttt{deleter} can return the block to the correct bucket without recomputing.
-\item \textbf{Free list.} \texttt{free\_blocks\_: unordered\_map<size\_t, vector<void*>>} is a per-bucket stack; \texttt{free} pushes the raw pointer, \texttt{allocate} pops it when present. The map and vectors are guarded by \texttt{mutex\_} on both paths.
-\item \textbf{Deleter path.} \texttt{deleter(void* ptr)} recovers the header via \texttt{ptr-64}, reads \texttt{size}, records the free for the profiler, and re-inserts into the cache rather than calling \texttt{free}. Thus the \texttt{DataPtr} returned by \texttt{allocate} carries \texttt{deleter==CachingAllocator::deleter} and \texttt{ctx==data}, so destruction recycles instead of releasing to the OS.
-\item \textbf{Profiler hook.} Both allocation and free call \texttt{free} with the bucket-rounded user size \texttt{total\_size-64}, keeping the capture's alloc/free bytes consistent.
+\item \textbf{64-byte header and alignment.} \texttt{HEADER\_SIZE=64} 保证每当 \texttt{raw} 时 \texttt{data = raw+64} 都是 64 字节对齐的，因为 64 划分了对齐方式。帮助程序 \texttt{alloc\_aligned} 在 POSIX 上使用 \texttt{posix\_memalign(\&ptr,64,nbytes)}，在 Windows 上使用 \texttt{\_aligned\_malloc}。
+\item \textbf{Bucketing.} 总大小 \texttt{nbytes+64} 向上舍入为 64 的下一个倍数：\texttt{(total\_size+63) \& \~{}63}。存储桶通过此舍入总数 (\texttt{free\_blocks\_.find(total\_size)} at) 进行键控，减少碎片，同时保持重用检查 O(1)。 \texttt{Header::size} 字段存储舍入大小，因此 \texttt{deleter} 可以将块返回到正确的存储桶，而无需重新计算。
+\item \textbf{Free list.} \texttt{free\_blocks\_: unordered\_map<size\_t, vector<void*>>} 是每个桶的堆栈； \texttt{free} 压入原始指针，\texttt{allocate} 在存在时弹出它。地图和向量在两条路径上均由 \texttt{mutex\_} 保护。
+\item \textbf{Deleter path.} \texttt{deleter(void* ptr)} 通过 \texttt{ptr-64} 恢复标头，读取 \texttt{size}，为探查器记录空闲，然后重新插入到缓存中，而不是调用 \texttt{free}。因此 \texttt{allocate} 返回的 \texttt{DataPtr} 带有 \texttt{deleter==CachingAllocator::deleter} 和 \texttt{ctx==data}，因此销毁会回收而不是释放到操作系统。
+\item \textbf{Profiler hook.} 分配和释放都使用桶舍入的用户大小 \texttt{total\_size-64} 调用 \texttt{free}，保持捕获的分配/释放字节一致。
 \end{itemize}
 
 \begin{table}[H]
 \centering
-\caption{\texttt{CachingAllocator} constants and state. All private; singleton via \texttt{instance}.}
+\caption{\texttt{CachingAllocator} 常量和状态。全部私人；通过 \texttt{instance} 单例。}
 \label{tab:cachingconst}
 \small
 \begin{tabular}{lll}
 \toprule
-Member & Definition & Value / Type \\
+成员 & 定义 & 值/类型 \\
 \midrule
-\texttt{HEADER\_SIZE} & & \texttt{64} bytes (both header size and alignment) \\
-\texttt{Header::size} & & Rounded total including header (\texttt{nbytes+64} $\uparrow$ 64) \\
-\texttt{free\_blocks\_} & & \texttt{unordered\_map<size\_t, vector<void*>>}: bucket $\rightarrow$ raw blocks \\
-\texttt{mutex\_} & & Protects the free map on alloc and free \\
-\texttt{alloc\_aligned} & & \texttt{posix\_memalign(64)} / \texttt{\_aligned\_malloc} \\
-\texttt{deleter} & & Recovers header at \texttt{ptr-64}, pushes back to correct bucket \\
+\texttt{HEADER\_SIZE} &  & \texttt{64} 字节（标头大小和对齐方式） \\
+\texttt{Header::size} &  & 包括标题在内的四舍五入总计 (\texttt{nbytes+64} $\uparrow$ 64) \\
+\texttt{free\_blocks\_} &  & \texttt{unordered\_map<size\_t, vector<void*>>}：桶 $\rightarrow$ 原始块 \\
+\texttt{mutex\_} &  & 保护 alloc 和 free 上的免费地图 \\
+\texttt{alloc\_aligned} &  & \texttt{posix\_memalign(64)} / \texttt{\_aligned\_malloc} \\
+\texttt{deleter} &  & 恢复 \texttt{ptr-64} 处的标头，推回正确的存储桶 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsubsection{Global Dispatch: \texttt{getCPUAllocator}, \texttt{getAllocator}, \texttt{copyAllocationBytes}}
+\subsubsection{全球调度：\texttt{getCPUAllocator}、\texttt{getAllocator}、\texttt{copyAllocationBytes}}
 
-\texttt{getCPUAllocator} returns \texttt{CachingAllocator::instance}, a leaked singleton so its destructor never races with late \texttt{DataPtr} destruction. \texttt{getAllocator(DeviceType)} switches on the type and throws \texttt{NotImplementedError} for unbuilt backends, with conditional compilation for \texttt{USE\_CUDA} and \texttt{USE\_VULKAN}.
+\texttt{getCPUAllocator} 返回 \texttt{CachingAllocator::instance}，一个泄漏的单例，因此它的析构函数永远不会与后期 \texttt{DataPtr} 销毁竞争。 \texttt{getAllocator(DeviceType)} 打开类型并为未构建的后端抛出 \texttt{NotImplementedError}，并为 \texttt{USE\_CUDA} 和 \texttt{USE\_VULKAN} 进行条件编译。
 
-\begin{tpnote}[Note: Why a Leaked Singleton, Not a Static Instance]
-\texttt{CachingAllocator::instance} deliberately \emph{leaks}: the singleton is allocated with \texttt{new} and never deleted. A \texttt{static} storage-duration object would have its destructor run at process exit, after which any still-alive \texttt{DataPtr} whose deleter targets the caching allocator would call into a destroyed \texttt{free\_blocks\_} map---undefined behavior in a program that is often shutting down from an interpreter with lingering tensor references. Leaking turns that hazard into a bounded, passive cost (one allocator object plus cached blocks, never returned to the OS) and removes the destructor-ordering problem entirely. The trade-off is explicit: \texttt{valgrind --leak-check=full} will always report the allocator's blocks as ``still reachable,'' never ``lost.''
-\end{tpnote}
-
-\texttt{copyAllocationBytes} is the cross-device \texttt{memcpy} used by \texttt{StorageImpl::set\_nbytes}:
+\texttt{copyAllocationBytes} 是 \texttt{StorageImpl::set\_nbytes} 使用的跨设备 \texttt{memcpy}：
 
 \begin{lstlisting}[caption={copy dispatch.}, label=lst:copybytes]
 void copyAllocationBytes(void* dst, const Device& dst_dev,
@@ -225,14 +221,14 @@ void copyAllocationBytes(void* dst, const Device& dst_dev,
 }
 \end{lstlisting}
 
-The three branches are concrete: CPU--CPU uses \texttt{std::memcpy}, Vulkan host-visible bytes use a dedicated path, and CUDA uses \texttt{cudaMemcpyAsync} on the current stream with stream recording and a host-visible synchronize when either side is CPU. This is the only place where CPU vs.\ accelerator copies diverge; higher layers call it blindly.
+这三个分支是具体的：CPU--CPU 使用 \texttt{std::memcpy}，Vulkan 主机可见字节使用专用路径，CUDA 在当前流上使用 \texttt{cudaMemcpyAsync} 进行流记录，并且当任一侧是 CPU 时进行主机可见同步。这是 CPU 与加速器副本唯一存在分歧的地方；高层盲目调用。
 
-\subsection{StorageImpl: Bytes plus \texttt{resizable}, and \texttt{Storage}: \texttt{shared\_ptr} Wrapper}
+\subsection{StorageImpl：字节加上 \texttt{resizable} 和 \texttt{Storage}：\texttt{shared\_ptr} 包装器}
 \label{sec:storage}
 
-\subsubsection{StorageImpl}
+\subsubsection{存储实现}
 
- is the byte container:
+是字节容器：
 
 \begin{lstlisting}[caption={bytes, allocator, resizable.}, label=lst:storageimplfull]
 struct P10_API StorageImpl {
@@ -265,17 +261,17 @@ struct P10_API StorageImpl {
 };
 \end{lstlisting}
 
-Key semantics:
+关键语义：
 
 \begin{itemize}[leftmargin=1.2em]
-\item \textbf{Four fields, no shape.} \texttt{data\_ptr}, \texttt{nbytes}, \texttt{allocator*}, \texttt{resizable} are the entire state. Interpretation as \texttt{float32} vs.\ \texttt{int64} is the job of \texttt{TensorImpl::dtype\_}, not storage.
-\item \textbf{Three constructors.} Allocate-via-allocator, allocate-on-device, and wrap-existing-\texttt{DataPtr}. The wrapping form defaults to \texttt{resizable=false} because an externally owned deleter cannot be regrown by the allocator. Both allocating constructors guard \texttt{if(allocator)} before calling \texttt{allocator->allocate(nbytes)} / \texttt{allocator->allocate(nbytes,device)}.
-\item \textbf{Growth via \texttt{set\_nbytes}.} \texttt{StorageImpl::set\_nbytes} allocates a fresh \texttt{DataPtr} of the new size on the same device, copies \texttt{min(old,new)} bytes via \texttt{copyAllocationBytes}, and swaps. It throws when \texttt{!resizable || !allocator}. The no-op path \texttt{nbytes==new\_nbytes} returns early without allocation.
+\item \textbf{Four fields, no shape.} \texttt{data\_ptr}、\texttt{nbytes}、\texttt{allocator*}、\texttt{resizable} 是整个状态。解释为 \texttt{float32} 与\ \texttt{int64} 是 \texttt{TensorImpl::dtype\_} 的工作，而不是存储。
+\item \textbf{Three constructors.} 通过分配器分配、在设备上分配和包装现有-\texttt{DataPtr}。包装形式默认为 \texttt{resizable=false} 因为外部拥有的删除器不能由分配器重新生成。两个分配构造函数在调用 \texttt{allocator->allocate(nbytes)} / \texttt{allocator->allocate(nbytes,device)} 之前都会保护 \texttt{if(allocator)}。
+\item \textbf{Growth via ->.} \texttt{StorageImpl::set\_nbytes} 在同一设备上分配新大小的新 \texttt{DataPtr}，通过 \texttt{copyAllocationBytes} 复制 \texttt{min(old,new)} 字节，然后交换。当 \texttt{!resizable || !allocator} 时它会抛出。无操作路径 \texttt{nbytes==new\_nbytes} 提前返回而不进行分配。
 \end{itemize}
 
-\subsubsection{Storage Handle}
+\subsubsection{储物手柄}
 
- is a \texttt{shared\_ptr} wrapper:
+是一个 \texttt{shared\_ptr} 包装器：
 
 \begin{lstlisting}[caption={ref-counted handle.}, label=lst:storagehandle]
 class P10_API Storage {
@@ -308,41 +304,41 @@ class P10_API Storage {
 };
 \end{lstlisting}
 
-Consequences that matter for views and clones:
+对于视图和克隆来说重要的后果：
 
 \begin{itemize}[leftmargin=1.2em]
-\item \textbf{View identity is pointer identity.} \texttt{is\_same} compares \texttt{shared\_ptr} addresses, not byte contents. The Python test \texttt{a.untyped\_storage.data\_ptr==b.untyped\_storage.data\_ptr} for \texttt{b=a.view([3,2])} is true exactly because both \texttt{TensorImpl} objects share the same \texttt{Storage::impl\_}.
-\item \textbf{Default allocator.} Every \texttt{Storage(size\_t, Allocator*)} constructor falls back to \texttt{getCPUAllocator} when passed null, so callers that omit the allocator still respect the bucket cache.
-\item \textbf{Wrap is non-resizable.} \texttt{Storage(DataPtr\&\&,...)} forwards \texttt{resizable=false} to \texttt{StorageImpl}, matching the external-ownership contract of \texttt{DataPtr(DataPtr\&\&)}.
+\item \textbf{View identity is pointer identity.} \texttt{is\_same} 比较 \texttt{shared\_ptr} 地址，而不是字节内容。 \texttt{b=a.view([3,2])} 的 Python 测试 \texttt{a.untyped\_storage.data\_ptr==b.untyped\_storage.data\_ptr} 是正确的，因为两个 \texttt{TensorImpl} 对象共享相同的 \texttt{Storage::impl\_}。
+\item \textbf{Default allocator.} 每个 \texttt{Storage(size\_t, Allocator*)} 构造函数在传递 null 时都会回退到 \texttt{getCPUAllocator}，因此省略分配器的调用者仍然尊重存储桶缓存。
+\item \textbf{Wrap is non-resizable.} \texttt{Storage(DataPtr\&\&,...)} 将 \texttt{resizable=false} 转发给 \texttt{StorageImpl}，匹配 \texttt{DataPtr(DataPtr\&\&)} 的外部所有权合约。
 \end{itemize}
 
-\subsection{TensorImpl: Eight Groups, 386 Lines, One Flat Struct}
+\subsection{TensorImpl：八组、386 行、一个扁平结构}
 \label{sec:tensorimpl}
 
- is a single class with \texttt{Storage}, shape, dtype, device, versioning, layout, autograd, view identity, shared oneDNN state, sparse, vmap, and quantization state. The fields fall into eight logical groups that map directly to member declarations:
+是一个具有 \texttt{Storage}、shape、dtype、设备、版本控制、布局、autograd、视图标识、共享 oneDNN 状态、稀疏、vmap 和量化状态的单个类。这些字段分为八个逻辑组，直接映射到成员声明：
 
 \begin{table}[H]
 \centering
-\caption{ --- eight groups. Order matches declaration; defaults shown where explicit.}
+\caption{---八组。订单与声明相符；明确显示默认值。}
 \label{tab:tensorimplfields}
 \small
 \begin{tabular}{p{2.6cm}p{4.7cm}p{6.2cm}}
 \toprule
-Group & Members (line) & Semantics \\
+团体 & 成员（线） & 语义学 \\
 \midrule
-1. Offset & \texttt{storage\_offset\_:size\_t} & Element offset into \texttt{storage\_} (in elements, not bytes). Scaled by \texttt{itemsize} in. \\
-2. Shape + Strides & \texttt{sizes\_and\_strides\_(SizesAndStrides)} & Logical sizes and strides; inline for rank $\le 5$ (see \S\ref{sec:sizesstrides}). \\
-3. Scalar type + Device & \texttt{dtype\_:DType}, \texttt{device\_:Device} & Element type and placement. \texttt{itemsize} is \texttt{elementSize(dtype\_)}. \\
-4. Version + Inference & \texttt{version\_counter\_:VariableVersion}, \texttt{inference\_tensor\_:bool} & Atomic version aliasable by views; inference flag disables bump. \\
-5. Layout & \texttt{is\_contiguous\_:bool}, \texttt{memory\_format\_:MemoryFormat} & Row-major vs.\ channels-last tag; \texttt{is\_contiguous\_in(format)} at compares strides to canonical. \\
-6. Autograd + View flag & \texttt{autograd\_meta\_:shared\_ptr<AutogradMetaBase>}, \texttt{is\_view\_:bool} & Per-tensor grad state (never copied, see \S\ref{sec:copyctor}); view bit for \texttt{detach\_} checks. \\
-7. Storage layer & \texttt{storage\_:Storage}, \texttt{SharedState \{onednn\_md, onednn\_memory\_cache\}}, \texttt{SparseState \{layout, indices, values, crow, col, sparse\_sizes, coalesced\}} & \texttt{storage\_} is ref-counted bytes; \texttt{SharedState} caches oneDNN descriptors; \texttt{SparseState} holds COO/CSR components. \\
-8. Transform + Quant & \texttt{transform\_value\_:shared\_ptr<TensorImpl>}, \texttt{transform\_batch\_dim\_, transform\_level\_}, \texttt{quantizer\_:shared\_ptr<Quantizer>} & Vmap wrapper (physical vs.\ logical) and affine quantizer (shared, immutable). \\
+1. 偏移量 & \texttt{storage\_offset\_:size\_t} & 元素在 \texttt{storage\_} 中的偏移量（以元素为单位，而不是以字节为单位）。按 \texttt{itemsize} 英寸缩放。 \\
+2. 形状+步幅 & \texttt{sizes\_and\_strides\_(SizesAndStrides)} & 逻辑尺寸和步幅；内联排名 $\le 5$ （请参阅 \S\ref{sec:sizesstrides}）。 \\
+3.标量类型+设备 & \texttt{dtype\_:DType}, \texttt{device\_:Device} & 元素类型和放置。 \texttt{itemsize} 是 \texttt{elementSize(dtype\_)}。 \\
+4.版本+推理 & \texttt{version\_counter\_:VariableVersion}, \texttt{inference\_tensor\_:bool} & 原子版本可通过视图别名；推理标志禁用碰撞。 \\
+5. 布局 & \texttt{is\_contiguous\_:bool}, \texttt{memory\_format\_:MemoryFormat} & 行主 vs.\ 通道最后标签； \texttt{is\_contiguous\_in(format)} at 将步幅与规范进行比较。 \\
+6. Autograd + 查看标志 & \texttt{autograd\_meta\_:shared\_ptr<AutogradMetaBase>}, \texttt{is\_view\_:bool} & 每个张量的梯度状态（从未复制，请参阅 \S\ref{sec:copyctor}）；查看 \texttt{detach\_} 检查位。 \\
+7、存储层 & \texttt{storage\_:Storage}, \texttt{SharedState \{onednn\_md, onednn\_memory\_cache\}}, \texttt{SparseState \{layout, indices, values, crow, col, sparse\_sizes, coalesced\}} & \texttt{storage\_} 是引用计数的字节； \texttt{SharedState} 缓存 oneDNN 描述符； \texttt{SparseState} 拥有 COO/CSR 组件。 \\
+8. 变换+量化 & \texttt{transform\_value\_:shared\_ptr<TensorImpl>}, \texttt{transform\_batch\_dim\_, transform\_level\_}, \texttt{quantizer\_:shared\_ptr<Quantizer>} & Vmap 包装器（物理 vs.\ 逻辑）和仿射量化器（共享、不可变）。 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-A condensed view of the class header:
+类头的浓缩视图：
 
 \begin{lstlisting}[caption={eight groups in one class.}, label=lst:tensorimplfull]
 class P10_API TensorImpl {
@@ -364,19 +360,19 @@ class P10_API TensorImpl {
 };
 \end{lstlisting}
 
-Selected accessors illustrate the layering:
+选定的访问器说明了分层：
 
 \begin{itemize}[leftmargin=1.2em]
-\item \texttt{storage} / \texttt{set\_storage} / \texttt{storage\_offset} expose the \texttt{Storage} handle and the element offset. adds \texttt{storage\_offset\_ * itemsize} to the base byte pointer and, on CUDA, calls \texttt{cuda::recordStream(base\_ptr, device\_)} before returning.
-\item \texttt{sizes\_and\_strides}, \texttt{sizes}, \texttt{strides}, \texttt{dim}, \texttt{numel} forward to \texttt{SizesAndStrides}. computes the dispatch key on the fly, returning the vmap key alone when batched (see \S\ref{sec:vmap}).
-\item \texttt{is\_contiguous}, \texttt{memory\_format}, \texttt{set\_memory\_format}, \texttt{is\_contiguous\_in(format)} maintain the layout tag.
-\item \texttt{share\_version\_counter}, \texttt{bump\_version}, \texttt{reset\_version} connect aliasing to mutation tracking.
+\item \texttt{storage} / \texttt{set\_storage} / \texttt{storage\_offset} 公开 \texttt{Storage} 句柄和元素偏移量。将 \texttt{storage\_offset\_ * itemsize} 添加到基字节指针，并且在 CUDA 上，在返回之前调用 \texttt{cuda::recordStream(base\_ptr, device\_)}。
+\item \texttt{sizes\_and\_strides}、\texttt{sizes}、\texttt{strides}、\texttt{dim}、\texttt{numel} 转发到 \texttt{SizesAndStrides}。动态计算调度键，在批处理时单独返回 vmap 键（请参阅 \S\ref{sec:vmap}）。
+\item \texttt{is\_contiguous}、\texttt{memory\_format}、\texttt{set\_memory\_format}、\texttt{is\_contiguous\_in(format)} 维护布局标签。
+\item \texttt{share\_version\_counter}、\texttt{bump\_version}、\texttt{reset\_version} 将别名连接到突变跟踪。
 \end{itemize}
 
-\subsection{SizesAndStrides: Inline for Rank $\le 5$}
+\subsection{SizesAndStrides：内联排名 $\le 5$}
 \label{sec:sizesstrides}
 
- is the shape container:
+是形状容器：
 
 \begin{lstlisting}[caption={inline up to 5 dims.}, label=lst:sizesstrides]
 class P10_API SizesAndStrides {
@@ -396,7 +392,7 @@ class P10_API SizesAndStrides {
 };
 \end{lstlisting}
 
-Implementation in:
+实施于：
 
 \begin{lstlisting}[caption={extent transition.}, label=lst:setextent]
 void SizesAndStrides::set_extent(size_t new_size){
@@ -407,35 +403,35 @@ void SizesAndStrides::set_extent(size_t new_size){
 }
 \end{lstlisting}
 
-Consequences:
+结果：
 
 \begin{itemize}[leftmargin=1.2em]
-\item Most tensors (rank $\le 5$) never allocate: both sizes and strides live in the two \texttt{[5]} inline arrays. The \texttt{heap\_sizes\_}/\texttt{heap\_strides\_} pair is null in this case, and \texttt{sizes\_data}/\texttt{strides\_data} branch on \texttt{is\_heap}.
-\item Copy and move use \texttt{swap} so that a moved-from heap tensor cleanly transfers ownership of its arrays. The copy constructor copies either the inline arrays or the heap allocations depending on \texttt{is\_heap}.
-\item Contiguous strides are \texttt{compute\_contiguous\_strides}: row-major with \texttt{strides.back=1} and \texttt{strides[i]=strides[i+1]*max(size[i+1],1)}, so shape \texttt{(2,0)} gets \texttt{(1,1)}. View strides use \texttt{compute\_view\_strides} which splits the old shape into contiguous chunks and requires the new shape to tile the same chunks; incompatible views return \texttt{std::nullopt}. Non-overlapping-dense check is used by \texttt{clone\_impl} to decide whether to preserve strides.
+\item 大多数张量（等级 $\le 5$）从不分配：大小和步幅都位于两个 \texttt{[5]} 内联数组中。在这种情况下，\texttt{heap\_sizes\_}/\texttt{heap\_strides\_} 对为空，\texttt{sizes\_data}/\texttt{strides\_data} 在 \texttt{is\_heap} 上分支。
+\item 复制和移动使用 \texttt{swap} ，以便移出的堆张量干净地转移其数组的所有权。复制构造函数根据 \texttt{is\_heap} 复制内联数组或堆分配。
+\item 连续的步长是 \texttt{compute\_contiguous\_strides}：具有 \texttt{strides.back=1} 和 \texttt{strides[i]=strides[i+1]*max(size[i+1],1)} 的行优先，因此形状 \texttt{(2,0)} 得到 \texttt{(1,1)}。视图步幅使用 \texttt{compute\_view\_strides} ，它将旧形状分割成连续的块，并要求新形状平铺相同的块；不兼容的视图返回 \texttt{std::nullopt}。 \texttt{clone\_impl} 使用非重叠密集检查来决定是否保留步幅。
 \end{itemize}
 
 \begin{table}[H]
 \centering
-\caption{\texttt{SizesAndStrides} --- inline vs.\ heap.}
+\caption{\texttt{SizesAndStrides} --- 内联与\ 堆。}
 \label{tab:sizesinline}
 \small
 \begin{tabular}{lll}
 \toprule
-Property & Inline path (rank $\le 5$) & Heap path (rank $>5$) \\
+财产 & 内联路径（等级 $\le 5$） & 堆路径（等级 $>5$） \\
 \midrule
-Storage & \texttt{inline\_sizes\_[5]}, \texttt{inline\_strides\_[5]} & \texttt{heap\_sizes\_}, \texttt{heap\_strides\_} \\
-Allocations on ctor/copy & 0 & 2 $\times$ \texttt{new int64\_t[rank]} \\
-Predicate & \texttt{!is\_heap} & \texttt{is\_heap} \\
-Transition & \texttt{set\_extent} frees heap when shrinking to $\le 5$ & \texttt{set\_extent} allocates heap when growing beyond 5 \\
+贮存 & \texttt{inline\_sizes\_[5]}, \texttt{inline\_strides\_[5]} & \texttt{heap\_sizes\_}, \texttt{heap\_strides\_} \\
+ctor/copy 上的分配 & 0 & 2 $\times$ \texttt{new int64\_t[rank]} \\
+谓词 & \texttt{!is\_heap} & \texttt{is\_heap} \\
+过渡 & \texttt{set\_extent} 在收缩到 $\le 5$ 时释放堆 & \texttt{set\_extent} 在增长超过 5 时分配堆 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{VariableVersion: Eager Atomic Counter, Shared by Views}
+\subsection{VariableVersion：Eager Atomic Counter，由视图共享}
 \label{sec:version}
 
- is the mutation tracker:
+是突变追踪器：
 
 \begin{lstlisting}[caption={eager atomic counter.}, label=lst:varversion]
 struct P10_API VersionCounter {            // :13
@@ -478,12 +474,12 @@ void share_version_counter(const TensorImpl& other){ // :289 alias for views
 }
 \end{lstlisting}
 
-Why eager: the counter is allocated in every \texttt{VariableVersion} default construction, so a view created before any mutation already shares the same \texttt{VersionCounter} object as its base. Lazy allocation would let each alias grow its own counter, silently breaking the \texttt{SavedVariable} guard that compares saved vs.\ current versions during backward. Views call \texttt{share\_version\_counter} at creation time; clones call \texttt{reset\_version} so the fresh storage starts at zero while the source's counter continues to bump.
+为什么急切：计数器在每个 \texttt{VariableVersion} 默认构造中分配，因此在任何突变之前创建的视图已经共享相同的 \texttt{VersionCounter} 对象作为其基础。延迟分配会让每个别名增长自己的计数器，默默地打破向后比较已保存版本与当前版本的 \texttt{SavedVariable} 防护。视图在创建时调用 \texttt{share\_version\_counter} ；克隆调用 \texttt{reset\_version} ，因此新存储从零开始，而源计数器继续增加。
 
-\subsection{Copy Constructor: What Is Shared, What Is Not}
+\subsection{复制构造函数：什么是共享的，什么不是}
 \label{sec:copyctor}
 
- is explicit:
+是明确的：
 
 \begin{lstlisting}[caption={copy ctor sharing.}, label=lst:copyctor-mem]
 TensorImpl::TensorImpl(const TensorImpl& other)
@@ -504,16 +500,16 @@ TensorImpl::TensorImpl(const TensorImpl& other)
 // Note: autograd_meta_ intentionally absent -> copies start without grad history
 \end{lstlisting}
 
-What is shared: \texttt{storage\_} so a copy is an alias until a write triggers copy-on-write in the caller; \texttt{shared\_state\_} so OneDNN descriptors are reused; \texttt{sparse\_state\_} so COO/CSR component tensors are not duplicated; \texttt{transform\_value\_} and \texttt{quantizer\_} (, \texttt{:92}) so batched and quantized views remain consistent. What is not shared: \texttt{autograd\_meta\_} is not mentioned in the initializer list and is therefore default-initialized to \texttt{nullptr}---copies start fresh without grad history, matching the explicit comment in. The same rule applies to \texttt{copy\_metadata\_from} which preserves the destination's \texttt{autograd\_meta\_} while overwriting storage, sizes, and layout.
+共享内容： \texttt{storage\_} 因此副本是别名，直到写入触发调用者中的写入时复制； \texttt{shared\_state\_} 因此 OneDNN 描述符被重用； \texttt{sparse\_state\_} 因此 COO/CSR 分量张量不会重复； \texttt{transform\_value\_} 和 \texttt{quantizer\_} (, \texttt{:92}) 因此批处理和量化视图保持一致。不共享的内容：初始化列表中未提及 \texttt{autograd\_meta\_}，因此默认初始化为 \texttt{nullptr}——副本在没有等级历史记录的情况下重新开始，与中的显式注释相匹配。相同的规则适用于 \texttt{copy\_metadata\_from}，它在覆盖存储、大小和布局时保留目标的 \texttt{autograd\_meta\_}。
 
 \begin{tpinsight}[Insight: Views Share Storage, History Does Not]
-The single most load-bearing omission in the codebase is the missing \texttt{autograd\_meta\_} in the \texttt{TensorImpl} copy constructor. Every other member is shared on copy---storage bytes, version counter, sparse components, batched wrappers---because those describe \emph{what the data is}. History is not shared because it describes \emph{how this particular value was produced}: if \texttt{b = a} (a copy, not a view) silently inherited \texttt{a}'s graph, then calling \texttt{b.backward} would flow gradients into \texttt{a}'s parents as if \texttt{a} itself had been consumed---an invisible correctness bug. The distinction is why \texttt{detach} is implemented as a copy-plus-null rather than a new view type: sharing the \texttt{TensorImpl} would share the very thing it must not.
+代码库中最重要的一个遗漏是 \texttt{TensorImpl} 复制构造函数中缺少 \texttt{autograd\_meta\_}。所有其他成员都在副本上共享——存储字节、版本计数器、稀疏组件、批处理包装器——因为这些描述了 \emph{what the data is}。历史不共享，因为它描述了 \emph{how this particular value was produced}：如果 \texttt{b = a} （副本，而不是视图）默默地继承了 \texttt{a} 的图，那么调用 \texttt{b.backward} 会将梯度流入 \texttt{a} 的父级，就好像 \texttt{a} 本身已被消耗一样——这是一个看不见的正确性错误。区别在于为什么 \texttt{detach} 被实现为复制加空而不是新的视图类型：共享 \texttt{TensorImpl} 会共享它不应该共享的东西。
 \end{tpinsight}
 
-\subsection{Tensor Handle: \texttt{shared\_ptr<TensorImpl>} plus 479 Generated Methods}
+\subsection{张量句柄：\texttt{shared\_ptr<TensorImpl>} 加上 479 个生成的方法}
 \label{sec:tensorhandle}
 
- is the user-visible handle:
+是用户可见的句柄：
 
 \begin{lstlisting}[caption={handle.}, label=lst:tensorhandle]
 class P10_API Tensor {
@@ -532,9 +528,9 @@ class P10_API Tensor {
 };
 \end{lstlisting}
 
-The include at mixes the code-generated surface into the class definition. The file \texttt{TensorGenerated.h} (6523 lines, produced by) declares 479 schemas from (9\,415 lines). Each entry is a member declaration such as \texttt{Tensor add(const Tensor\& other, Scalar alpha=1) const;} or \texttt{static Tensor zeros(...);} that dispatches through \texttt{Dispatcher} and the four-stage redispatch chain (Vmap $\rightarrow$ Autocast $\rightarrow$ Autograd $\rightarrow$ Backend) documented in \S\ref{sec:redispatch}. The hand-written core in stays small (constructors, data accessors, view primitives, sparse helpers) while the generated header supplies the bulk of the operator surface.
+include at 将代码生成的表面混合到类定义中。文件 \texttt{TensorGenerated.h} （6523 行，由生成）声明了来自（9\,415 行）的 479 个模式。每个条目都是一个成员声明，例如 \texttt{Tensor add(const Tensor\& other, Scalar alpha=1) const;} 或 \texttt{static Tensor zeros(...);}，通过 \texttt{Dispatcher} 和 \S\ref{sec:redispatch} 中记录的四阶段重新调度链（Vmap $\rightarrow$ Autocast $\rightarrow$ Autograd $\rightarrow$ Backend）进行调度。手写的核心保持很小（构造函数、数据访问器、视图原语、稀疏助手），而生成的标头提供了大部分操作表面。
 
-The helper namespace \texttt{detail} holds the low-level clone and contiguous primitives shared by the dispatcher:
+辅助命名空间 \texttt{detail} 保存调度程序共享的低级克隆和连续原语：
 
 \begin{lstlisting}[caption={detail clone surface.}, label=lst:detailclone]
 namespace detail {
@@ -544,12 +540,12 @@ P10_API Tensor contiguous_clone(const Tensor& self);                            
 }
 \end{lstlisting}
 
-These are free functions so kernels never re-enter the dispatcher for a plain byte copy; the generated \texttt{Tensor::clone} member simply forwards to \texttt{detail::clone\_impl} via the dispatcher handle.
+这些是自由函数，因此内核永远不会重新进入调度程序以获取纯字节副本；生成的 \texttt{Tensor::clone} 成员只是通过调度程序句柄转发到 \texttt{detail::clone\_impl} 。
 
-\subsection{Views Are Zero-Copy: \texttt{as\_strided} is the Single Choke Point}
+\subsection{视图是零拷贝的：\texttt{as\_strided} 是单一瓶颈}
 \label{sec:views}
 
-Every aliasing operation---\texttt{view}, \texttt{transpose}, \texttt{select}, \texttt{slice}, \texttt{permute}, \texttt{view\_dtype}---funnels through \texttt{Tensor::as\_strided} at:
+每个别名操作---\texttt{view}、\texttt{transpose}、\texttt{select}、\texttt{slice}、\texttt{permute}、\texttt{view\_dtype}---通过\texttt{Tensor::as\_strided}进行传输：
 
 \begin{lstlisting}[caption={\texttt{as\_strided}: reuse storage, share counter.}, label=lst:asstrided]
 Tensor Tensor::as_strided(const std::vector<int64_t>& size,
@@ -571,23 +567,23 @@ Tensor Tensor::as_strided(const std::vector<int64_t>& size,
 }
 \end{lstlisting}
 
-The three post-construction steps are the view contract: reuse the base's \texttt{Storage}, alias the base's \texttt{VersionCounter}, and, if present, carry the \texttt{Quantizer} so the view stays a quantized tensor over the same codes. The \texttt{TensorImpl(Storage,...)} constructor used here sets \texttt{is\_contiguous\_} from the provided strides via \texttt{SizesAndStrides::is\_contiguous}, so \texttt{is\_contiguous} remains correct even for aliased tensors.
+三个构建后步骤是视图契约：重用基础的 \texttt{Storage}，为基础的 \texttt{VersionCounter} 起别名，并且如果存在，则携带 \texttt{Quantizer}，以便视图在相同的代码上保持量化张量。这里使用的 \texttt{TensorImpl(Storage,...)} 构造函数通过 \texttt{SizesAndStrides::is\_contiguous} 根据提供的步长设置 \texttt{is\_contiguous\_}，因此即使对于别名张量，\texttt{is\_contiguous} 也保持正确。
 
-Callers illustrate how thin the wrappers are:
+来电者说明包装纸有多薄：
 
 \begin{itemize}[leftmargin=1.2em]
-\item \texttt{view} infers \texttt{-1} dims via \texttt{SizesAndStrides::infer\_size}, computes compatible strides via \texttt{compute\_view\_strides}, then calls \texttt{as\_strided(inferred,*stride)}.
-\item \texttt{select} drops one dimension, computes \texttt{new\_offset = storage\_offset + index*stride[dim]}, erases that dim from \texttt{new\_strides}, and calls \texttt{as\_strided}.
-\item \texttt{slice} clamps \texttt{step}, computes \texttt{step}, scales the sliced stride by \texttt{step}, advances the offset by \texttt{start*stride[dim]}, and calls \texttt{as\_strided}.
-\item \texttt{view\_dtype} keeps storage and strides when element sizes match; when they differ it rescales \texttt{new\_sizes.back}, the leading strides, and the element offset by the ratio \texttt{dst\_esize}.
+\item \texttt{view} 通过 \texttt{SizesAndStrides::infer\_size} 推断 \texttt{-1} 变暗，通过 \texttt{compute\_view\_strides} 计算兼容的步幅，然后调用 \texttt{as\_strided(inferred,*stride)}。
+\item \texttt{select} 删除一维，计算 \texttt{new\_offset = storage\_offset + index*stride[dim]}，从 \texttt{new\_strides} 中删除该维度，然后调用 \texttt{as\_strided}。
+\item \texttt{slice} 固定 \texttt{step}，计算 \texttt{step}，将切片步长缩放 \texttt{step}，将偏移量提前 \texttt{start*stride[dim]}，然后调用 \texttt{as\_strided}。
+\item 当元素大小匹配时 \texttt{view\_dtype} 保持存储和跨度；当它们不同时，它会重新调整 \texttt{new\_sizes.back}、领先步幅以及按比例 \texttt{dst\_esize} 偏移的元素。
 \end{itemize}
 
-No allocation occurs in any of these paths. The Vulkan early-out is the only branch that materializes: because the Vulkan payload has no strided addressing, the view is lowered to a kernel rather than aliasing storage.
+这些路径中的任何一个都不会发生分配。 Vulkan 提前退出是唯一实现的分支：因为 Vulkan 有效负载没有跨步寻址，所以视图被降低到内核而不是别名存储。
 
-\subsection{Clone and Contiguous: Allocating a Fresh Storage and Resetting the Version}
+\subsection{克隆和连续：分配新存储并重置版本}
 \label{sec:clone}
 
- (\texttt{detail::clone\_impl}) is the allocating counterpart to \texttt{as\_strided}:
+(\texttt{detail::clone\_impl}) 是 \texttt{as\_strided} 的分配对应项：
 
 \begin{lstlisting}[caption={\texttt{clone\_impl}: fresh storage, reset version.}, label=lst:cloneimpl]
 Tensor detail::clone_impl(const Tensor& self, std::optional<MemoryFormat> memory_format){
@@ -623,21 +619,21 @@ Tensor detail::clone_impl(const Tensor& self, std::optional<MemoryFormat> memory
 }
 \end{lstlisting}
 
-Key decisions:
+关键决策：
 
 \begin{itemize}[leftmargin=1.2em]
-\item \textbf{Preserve vs.\ explicit format.} With no/Preserve format the result keeps the input's exact strides when they are non-overlapping and dense (\texttt{SizesAndStrides::is\_non\_overlapping\_and\_dense} at)---so a transposed tensor clones into a transposed tensor---and falls back to row-major otherwise (expanded/overlapping inputs). Explicit \texttt{ChannelsLast}/\texttt{ChannelsLast3d} require rank 4 or 5 and use \texttt{get\_channels\_last\_strides}.
-\item \textbf{Fresh allocation.} \texttt{Storage(size\_t(self.numel)*itemsize, getAllocator(self.device.type), self.device)} allocates exactly the dense byte extent; sparse clones instead build a new sparse tensor from cloned components.
-\item \textbf{Byte copy with fast path.} When both source and destination are row-major CPU tensors the clone uses \texttt{std::memcpy}; otherwise it uses \texttt{copy\_}, which respects channels-last strides and cross-device copies. \texttt{contiguous\_clone} is the unconditional variant that forces \texttt{MemoryFormat::Contiguous}, used internally by kernels that require flat pointer arithmetic.
-\item \textbf{Version reset.} The internal \texttt{copy\_} bumps the destination's counter; the clone is a fresh value and must start at zero, so \texttt{reset\_version} clears it. The source's counter is untouched.
+\item \textbf{Preserve vs.\ explicit format.} 使用 no/Preserve 格式，当输入不重叠且密集时（\texttt{SizesAndStrides::is\_non\_overlapping\_and\_dense} at），结果会保持输入的精确步幅（\texttt{SizesAndStrides::is\_non\_overlapping\_and\_dense} at），因此转置张量会克隆为转置张量，否则会回退到行优先（扩展/重叠输入）。显式 \texttt{ChannelsLast}/\texttt{ChannelsLast3d} 需要等级 4 或 5 并使用 \texttt{get\_channels\_last\_strides}。
+\item \textbf{Fresh allocation.} \texttt{Storage(size\_t(self.numel)*itemsize, getAllocator(self.device.type), self.device)} 准确分配密集字节范围；稀疏克隆而是从克隆组件构建新的稀疏张量。
+\item \textbf{Byte copy with fast path.} 当源和目标都是行主 CPU 张量时，克隆使用 \texttt{std::memcpy}；否则它使用 \texttt{copy\_}，它尊重通道最后一步和跨设备复制。 \texttt{contiguous\_clone} 是强制 \texttt{MemoryFormat::Contiguous} 的无条件变体，由需要平面指针算术的内核内部使用。
+\item \textbf{Version reset.} 内部 \texttt{copy\_} 碰撞目的地计数器；克隆是一个新值，必须从零开始，因此 \texttt{reset\_version} 将其清除。源计数器未受影响。
 \end{itemize}
 
-\texttt{contiguous\_impl} shares the same structure: it returns \texttt{self} unchanged when already contiguous in the requested format, otherwise materializes a new contiguous tensor the canonical strides \texttt{get\_strides\_for(sizes,format)}, copies, and resets the version.
+\texttt{contiguous\_impl} 共享相同的结构：当在请求的格式中已经连续时，它返回 \texttt{self} 不变，否则以规范步长 \texttt{get\_strides\_for(sizes,format)} 实现一个新的连续张量，复制并重置版本。
 
-\subsection{MemoryFormat: Contiguous, ChannelsLast, ChannelsLast3d, and Contiguity Tests}
+\subsection{MemoryFormat：连续、ChannelsLast、ChannelsLast3d 和连续性测试}
 \label{sec:memoryformat}
 
- is the layout enum:
+是布局枚举：
 
 \begin{lstlisting}[caption={four tags, one sentinel.}, label=lst:memformat]
 enum class MemoryFormat : int8_t { Contiguous=0, Preserve=1, ChannelsLast=2, ChannelsLast3d=3 };
@@ -655,9 +651,9 @@ inline std::vector<int64_t> get_strides_for(const std::vector<int64_t>& sizes, M
 }
 \end{lstlisting}
 
-\texttt{Preserve} is a request-level sentinel that is never stored on a live \texttt{TensorImpl}---\texttt{memory\_format} maps it to \texttt{Contiguous}, and \texttt{set\_memory\_format(Preserve)} canonicalizes it to \texttt{Contiguous} before storing. Storage of a blocking format is the job of oneDNN, not the stride tag: the tag simply records which canonical stride set the tensor claims.
+\texttt{Preserve} 是请求级哨兵，永远不会存储在活动的 \texttt{TensorImpl}----\texttt{memory\_format} 上，将其映射到 \texttt{Contiguous}，并在存储之前将其规范化为 \texttt{Contiguous}。阻塞格式的存储是 oneDNN 的工作，而不是步幅标签的工作：标签只是记录哪个规范步幅设置了张量声明。
 
-\texttt{TensorImpl::is\_contiguous\_in} is the predicate that matters for layout-sensitive kernels:
+\texttt{TensorImpl::is\_contiguous\_in} 是对布局敏感的内核很重要的谓词：
 
 \begin{lstlisting}[caption={contiguity-in-format via exact stride compare.}, label=lst:iscontigin]
 bool is_contiguous_in(MemoryFormat format) const {
@@ -672,41 +668,33 @@ bool is_contiguous_in(MemoryFormat format) const {
 }
 \end{lstlisting}
 
-Rank rules are enforced one level up in \texttt{Tensor::is\_contiguous(MemoryFormat)}: plain contiguous is always meaningful, \texttt{ChannelsLast} is only meaningful at rank~4 and \texttt{ChannelsLast3d} at rank~5, and \texttt{Preserve} returns true (it imposes no layout constraint). The mutating path is \texttt{TensorImpl::set\_sizes\_and\_strides}, which recomputes \texttt{is\_contiguous\_} from \texttt{compute\_contiguous\_strides} and promotes \texttt{memory\_format\_} to \texttt{ChannelsLast}/\texttt{ChannelsLast3d} when the provided strides exactly match \texttt{get\_channels\_last\_strides}.
+排名规则在 \texttt{Tensor::is\_contiguous(MemoryFormat)} 中强制执行上一级：普通连续始终有意义，\texttt{ChannelsLast} 仅在排名~4 时有意义，\texttt{ChannelsLast3d} 在排名~5 时有意义，并且 \texttt{Preserve} 返回 true（它不施加布局约束）。变异路径是 \texttt{TensorImpl::set\_sizes\_and\_strides}，当提供的步幅与 \texttt{get\_channels\_last\_strides} 完全匹配时，它会从 \texttt{compute\_contiguous\_strides} 重新计算 \texttt{is\_contiguous\_}，并将 \texttt{memory\_format\_} 提升到 \texttt{ChannelsLast}/\texttt{ChannelsLast3d}。
 
-\subsection{Autograd, Sparse, Vmap, and Quant Extensions on TensorImpl}
+\subsection{TensorImpl 上的 Autograd、Sparse、Vmap 和 Quant 扩展}
 \label{sec:extensions}
 
-The four trailing groups in Table~\ref{tab:tensorimplfields} are extension points that justify the flat struct rather than a deep hierarchy:
+Table~\ref{tab:tensorimplfields} 中的四个尾随组是扩展点，它们证明了平面结构而不是深层层次结构的合理性：
 
 \begin{itemize}[leftmargin=1.2em]
-\item \textbf{Autograd}. \texttt{autograd\_meta\_:shared\_ptr<AutogradMetaBase>} is the per-tensor grad hook; \texttt{set\_autograd\_meta}/\texttt{autograd\_meta}/\texttt{has\_autograd\_meta} expose it, and \texttt{set\_requires\_grad} rejects inference tensors. Critically, every copy operation drops it (see \S\ref{sec:copyctor}), so copies start without history and only \texttt{autograd::make\_variable} re-attaches it.
-\item \textbf{View flag}. \texttt{is\_view\_} marks that the tensor was created by a view op; \texttt{detach\_} consults it to reject mutation of a view. Views created by \texttt{as\_strided} do not set this flag in the base layer---it is set by higher-level view plumbing when a public view is materialized---so the aliasing itself stays in \texttt{as\_strided} while the identity bit is managed separately.
-\item \textbf{OneDNN shared state}. Two opaque \texttt{shared\_ptr<void>} hold a oneDNN memory descriptor and a reordered memory cache; \texttt{has\_onednn\_md} / \texttt{has\_onednn\_memory\_cache} gate their use. Sharing is shallow (pointer copy) so copies of a dense tensor reuse the same descriptor.
-\item \textbf{Sparse}. \texttt{SparseState} stores \texttt{layout} (\texttt{0=COO, 1=CSR}), \texttt{values} for COO and \texttt{values} for CSR, plus \texttt{sparse\_sizes} (logical sizes) and \texttt{coalesced}. Dense storage is cleared when sparse state is installed, so sparse tensors carry no dense blob for their logical shape. Sparse construction in allocates only logical metadata, avoiding a transient dense allocation for large embeddings.
-\item \textbf{Vmap wrapper}. \texttt{transform\_value\_} is the physical tensor (with the batch dim), while \texttt{sizes\_and\_strides\_} is the logical shape (without it); \texttt{transform\_batch\_dim\_}/\texttt{transform\_level\_} record where the batch sits and which nesting level owns the wrapper. \texttt{is\_batched} is exactly \texttt{transform\_value\_!=nullptr}.
-\item \textbf{Quantizer}. \texttt{quantizer\_:shared\_ptr<Quantizer>} is an immutable, shared affine mapping (per-tensor or per-channel scale/zero-point, see). Views and clones both propagate it: views via \texttt{as\_strided}, clones via \texttt{clone\_impl}, staying quantized over the same codes.
+\item \textbf{Autograd}。 \texttt{autograd\_meta\_:shared\_ptr<AutogradMetaBase>} 是每个张量的梯度钩子； \texttt{set\_autograd\_meta}/\texttt{autograd\_meta}/\texttt{has\_autograd\_meta} 公开它，\texttt{set\_requires\_grad} 拒绝推理张量。至关重要的是，每个复制操作都会删除它（请参阅 \S\ref{sec:copyctor}），因此复制开始时没有历史记录，并且只有 \texttt{autograd::make\_variable} 重新附加它。
+\item \textbf{View flag}。 \texttt{is\_view\_} 标记张量是由视图操作创建的； \texttt{detach\_} 参考它来拒绝视图的突变。由 \texttt{as\_strided} 创建的视图不会在基础层中设置此标志——它是在实现公共视图时由更高级别的视图管道设置的——因此别名本身保留在 \texttt{as\_strided} 中，而标识位是单独管理的。
+\item \textbf{OneDNN shared state}。两个不透明的 \texttt{shared\_ptr<void>} 保存一个 oneDNN 内存描述符和一个重新排序的内存缓存； \texttt{has\_onednn\_md} / \texttt{has\_onednn\_memory\_cache} 门他们的使用。共享是浅层的（指针复制），因此密集张量的副本重用相同的描述符。
+\item \textbf{Sparse}。 \texttt{SparseState} 存储 \texttt{layout} (\texttt{0=COO, 1=CSR})、COO 的 \texttt{values} 和 CSR 的 \texttt{values}，以及 \texttt{sparse\_sizes}（逻辑大小）和 \texttt{coalesced}。安装稀疏状态时，密集存储会被清除，因此稀疏张量的逻辑形状不携带密集斑点。稀疏构造仅分配逻辑元数据，避免了大型嵌入的瞬态密集分配。
+\item \textbf{Vmap wrapper}。 \texttt{transform\_value\_} 是物理张量（有批量维度），而 \texttt{sizes\_and\_strides\_} 是逻辑形状（没有批量维度）； \texttt{transform\_batch\_dim\_}/\texttt{transform\_level\_} 记录批次所在的位置以及哪个嵌套级别拥有包装器。 \texttt{is\_batched} 恰好是 \texttt{transform\_value\_!=nullptr}。
+\item \textbf{Quantizer}。 \texttt{quantizer\_:shared\_ptr<Quantizer>} 是一个不可变的、共享的仿射映射（每个张量或每个通道尺度/零点，请参阅）。视图和克隆都传播它：视图通过 \texttt{as\_strided}，克隆通过 \texttt{clone\_impl}，在相同的代码上保持量化。
 \end{itemize}
 
-\subsection{Putting It Together: Allocation, View, and Clone Walkthrough}
+\subsection{放在一起：分配、视图和克隆演练}
 \label{sec:walktogether}
 
-Consider \texttt{a = tensorplay.ones([2,3])} followed by \texttt{b = a.view([3,2])} and \texttt{c = a.clone} on CPU:
+考虑 CPU 上的 \texttt{a = tensorplay.ones([2,3])} 后跟 \texttt{b = a.view([3,2])} 和 \texttt{c = a.clone}：
 
 \begin{enumerate}[leftmargin=1.2em]
-\item \texttt{Tensor(\{2,3\}, Float32)} builds a \texttt{TensorImpl(\{2,3\}, Float32, CPU)} which allocates \texttt{Storage(2*3*4, getAllocator(CPU), CPU)} $\rightarrow$ \texttt{StorageImpl(24, CachingAllocator::instance)} $\rightarrow$ \texttt{CachingAllocator::allocate(24)} rounding to \texttt{(24+64)$\uparrow$64 = 128} total bytes, returning \texttt{DataPtr(ptr+64, deleter, CPU)}. \texttt{SizesAndStrides(\{2,3\})} sets \texttt{inline\_sizes=[2,3]} and \texttt{inline\_strides=[3,1]} via \texttt{compute\_contiguous\_strides}.
-\item \texttt{b = a.view([3,2])} infers \texttt{[3,2]}, computes \texttt{compute\_view\_strides([2,3],[3,1],[3,2]) = [2,1]}, and calls \texttt{as\_strided([3,2],[2,1])} which constructs \texttt{Tensor(a.storage, [3,2], [2,1], Float32, offset=0)} reusing the same \texttt{Storage} handle and aliasing the counter. No allocator call occurs; \texttt{a.storage.is\_same(b.storage)} is true and \texttt{b.data\_ptr==a.data\_ptr + 0*itemsize} holds.
-\item \texttt{c = a.clone} ( with \texttt{Preserve}) finds strides \texttt{[3,1]} non-overlapping dense, allocates a fresh \texttt{Storage(24, CachingAllocator::instance)} on the same device, builds a new \texttt{TensorImpl} at strides \texttt{[3,1]}, and copies 24 bytes via \texttt{memcpy} because both sides are row-major. The destination version is reset to zero while \texttt{a}'s counter is unchanged.
+\item \texttt{Tensor(\{2,3\}, Float32)} 构建一个 \texttt{TensorImpl(\{2,3\}, Float32, CPU)}，它分配 \texttt{Storage(2*3*4, getAllocator(CPU), CPU)} $\rightarrow$ \texttt{StorageImpl(24, CachingAllocator::instance)} $\rightarrow$ \texttt{CachingAllocator::allocate(24)} 舍入到 \texttt{(24+64)->64 = 128} 总字节，返回 \texttt{DataPtr(ptr+64, deleter, CPU)}。 \texttt{SizesAndStrides(\{2,3\})} 通过 \texttt{compute\_contiguous\_strides} 设置 \texttt{inline\_sizes=[2,3]} 和 \texttt{inline\_strides=[3,1]}。
+\item \texttt{b = a.view([3,2])} 推断 \texttt{[3,2]}，计算 \texttt{compute\_view\_strides([2,3],[3,1],[3,2]) = [2,1]}，并调用 \texttt{as\_strided([3,2],[2,1])}，后者构造 \texttt{Tensor(a.storage, [3,2], [2,1], Float32, offset=0)}，重用相同的 \texttt{Storage} 句柄并为计数器设置别名。没有发生分配器调用； \texttt{a.storage.is\_same(b.storage)} 成立，\texttt{b.data\_ptr==a.data\_ptr + 0*itemsize} 成立。
+\item \texttt{c = a.clone}（带有 \texttt{Preserve}）找到步长 \texttt{[3,1]} 非重叠密集，在同一设备上分配新的 \texttt{Storage(24, CachingAllocator::instance)}，在步长 \texttt{[3,1]} 处构建新的 \texttt{TensorImpl}，并通过 \texttt{memcpy} 复制 24 个字节，因为双方都是行优先。目标版本重置为零，而 \texttt{a} 的计数器不变。
 \end{enumerate}
 
-A channels-last example at rank~4 exercises a different stride path: \texttt{x = tensorplay.randn([2,3,4,4])} with \texttt{x.contiguous(MemoryFormat.ChannelsLast)} reaches \texttt{contiguous\_impl} which allocates at \texttt{get\_channels\_last\_strides([2,3,4,4])=[48,1,12,3]} and copies through \texttt{copy\_}, preserving the tag via \texttt{set\_memory\_format(ChannelsLast)} so \texttt{x.is\_contiguous(ChannelsLast)} becomes true and \texttt{is\_contiguous} is false.
+等级~4 的通道最后一个示例采用了不同的步幅路径：\texttt{x = tensorplay.randn([2,3,4,4])} 和 \texttt{x.contiguous(MemoryFormat.ChannelsLast)} 到达 \texttt{contiguous\_impl}，它在 \texttt{get\_channels\_last\_strides([2,3,4,4])=[48,1,12,3]} 处分配并通过 \texttt{copy\_} 进行复制，通过 \texttt{set\_memory\_format(ChannelsLast)} 保留标记，因此 \texttt{x.is\_contiguous(ChannelsLast)} 变为 true，\texttt{is\_contiguous} 为 false。
 
-\subsection{Design Trade-offs}
-\label{sec:mem:tradeoffs}
-
-\textbf{Three layers vs.\ one fat buffer object.} Collapsing \texttt{DataPtr}/\texttt{Storage}/\texttt{TensorImpl} into a single object would remove two indirections per tensor access. Rejected: the three layers exist because they have different ownership semantics---\texttt{DataPtr} is move-only (unique OS responsibility), \texttt{Storage} is ref-counted bytes (aliasing unit), \texttt{TensorImpl} is metadata (identity unit). Views alias the storage layer ( pointer identity), which requires storage to be a separately shareable object. One fat object forces deep copies on every view.
-
-\textbf{Bucketed cache vs.\ \texttt{malloc} direct.} Plain \texttt{malloc}/\texttt{free} per allocation would delete entirely. Rejected on the standard caching-allocator grounds: tensor workloads free and immediately reallocate the same rounded sizes, so the bucket stack at turns most frees into O(1) pushes and most allocations into O(1) pops, while \texttt{posix\_memalign} round-trips cost $\sim$100\,ns plus page faults on reuse. The 64-byte header and bucket rounding waste at most 63 bytes per allocation, bounded and deterministic.
-
-\textbf{Inline \texttt{SizesAndStrides} for rank $\le$ 5 vs.\ always-heap.} Always-heap sizes would simplify the struct to one pointer. Rejected: rank $\le$ 5 covers virtually every real model tensor; the inline array at keeps sizes/strides in the same cache line as the rest of \texttt{TensorImpl} metadata, saving a pointer chase on every shape check in dispatch. The promotion path to heap for rank $>5$ is a single branch, not a separate type.
 

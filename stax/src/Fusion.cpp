@@ -84,8 +84,8 @@ public:
                                 OpNode* mul_node = input->producer;
 
                                 // Preserve scalar operands while removing the
-                                // intermediate mul value.  This mirrors an
-                                // Inductor pointwise fusion group: constants
+                                // intermediate mul value.  This follows the
+                                // pointwise fusion convention: constants
                                 // remain attributes of the fused node.
                                 if (auto it = mul_node->attrs.find("scalar_value");
                                     it != mul_node->attrs.end()) {

@@ -444,13 +444,17 @@ def _emit_redispatch(lines, f, variant, dev_src, helper_name):
     # receiver becomes the explicit `self` parameter here, so every receiver
     # expression must be rewritten the same way as the device source above.
     dispatch_key_expr = _dispatch_key_expr(f, variant, redispatch=True)
-    key_expr = (
-        dispatch_key_expr
-        if f.func_name in _RANDOM_TRANSFORM_OPS
-        else f"toBackendKey({dispatch_key_expr})"
-    )
     if variant == "method" and f.self_arg() is not None:
-        key_expr = key_expr.replace("device()", "self.device()")
+        dispatch_key_expr = dispatch_key_expr.replace("device()", "self.device()")
+    if f.func_name in _RANDOM_TRANSFORM_OPS:
+        key_expr = dispatch_key_expr
+    else:
+        # A wrapped tensor's dispatch key names the active transform level:
+        # route it to the registered batch rule instead of collapsing it to
+        # the backend, which would run the raw kernel on the wrapper.
+        # Unwrapped arguments keep resolving to their backend.
+        lines.append(f"    DispatchKey __tp_arg_key = {dispatch_key_expr};")
+        key_expr = "(is_vmap_key(__tp_arg_key) ? __tp_arg_key : toBackendKey(__tp_arg_key))"
     lines.append(
         f"    DispatchKey dispatch_key = {key_expr};"
     )

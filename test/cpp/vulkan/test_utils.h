@@ -45,6 +45,13 @@ inline void expect_allclose(
   const float* a = a_host.data_ptr<float>();
   const float* e = e_host.data_ptr<float>();
   for (int64_t i = 0; i < e_host.numel(); ++i) {
+    const bool actual_nan = std::isnan(a[i]);
+    const bool expected_nan = std::isnan(e[i]);
+    if (actual_nan || expected_nan) {
+      ASSERT_EQ(actual_nan, expected_nan)
+          << " mismatch at flat index " << i;
+      continue;
+    }
     ASSERT_NEAR(a[i], e[i], atol + rtol * std::fabs(e[i]))
         << " mismatch at flat index " << i;
   }

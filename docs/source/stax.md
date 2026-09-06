@@ -9,7 +9,7 @@ a static graph, applies compiler passes (constant folding, dead code
 elimination, operator decomposition), and lowers the result to the available
 backends.
 
-This module is TensorPlay-specific and has no upstream torch counterpart.
+This module is TensorPlay-specific.
 
 ## Functions
 

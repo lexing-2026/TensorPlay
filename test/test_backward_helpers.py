@@ -21,15 +21,16 @@ class BackwardHelperOps(unittest.TestCase):
             self.assertAlmostEqual(a, b, delta=tol * max(1.0, abs(b)))
 
     def test_trace_backward(self):
-        # d(tr(A))/dA = I; a batched trace applies one identity per batch.
+        # d(tr(A))/dA = I.  trace accepts only 2-D input, matching the
+        # reference contract that rejects non-matrix tensors outright.
         a = tp.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
         tp.trace(a).backward()
         self._check(a.grad, tp.eye(2))
 
         b = tp.tensor([[[1.0, 2.0], [3.0, 4.0]],
                        [[5.0, 6.0], [7.0, 8.0]]], requires_grad=True)
-        tp.trace(b).backward(tp.tensor([1.0, 2.0]))
-        self._check(b.grad, tp.stack([tp.eye(2), 2.0 * tp.eye(2)]))
+        with self.assertRaises(RuntimeError):
+            tp.trace(b)
 
     def test_masked_select_backward(self):
         # Selected entries receive the incoming gradient in order; the rest 0.

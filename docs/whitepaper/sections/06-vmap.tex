@@ -1,15 +1,15 @@
 % 06-vmap.tex
-\section{Vmap: Batched Transforms and Transform Dispatch}
+\section{向量化映射：批量变换与变换分发}
 \label{sec:vmap}
 
 % Coverage: DispatchKey Vmap at offset 9 and priority; PushVmapMode/PopVmapMode level; Vmap->Autocast->Autograd->Backend
 
-Vmap turns a function written for a single sample into a function that runs over a batch without rewriting its body. The public entry point is \texttt{tensorplay.func.vmap} which delegates to \texttt{tensorplay.\_transforms.vmap.vmap\_impl} and ultimately to the native layer in \texttt{p10}: \texttt{push\_vmap} / \texttt{make\_batched} / \texttt{unwrap\_at\_level}. Every operator that participates in vmap has a per-backend batch rule registered under the \texttt{Vmap*} dispatch key, and operators without a rule fail fast in generated code. The dispatch key for vmap outranks all other keys, so \texttt{TransformDispatch} unwraps before \texttt{Autocast} or \texttt{Autograd} ever see the operands. This section documents the mechanism end to end, with line-precise citations.
+Vmap 将为单个样本编写的函数转换为可批量运行的函数，而无需重写其主体。公共入口点是 \texttt{tensorplay.func.vmap}，它委托给 \texttt{tensorplay.\_transforms.vmap.vmap\_impl} 并最终委托给 \texttt{p10} 中的本机层：\texttt{push\_vmap} / \texttt{make\_batched} / \texttt{unwrap\_at\_level}。参与 vmap 的每个运算符都有一个在 \texttt{Vmap*} 调度键下注册的每个后端批处理规则，没有规则的运算符在生成的代码中会快速失败。 vmap 的调度键优先于所有其他键，因此 \texttt{TransformDispatch} 在 \texttt{Autocast} 或 \texttt{Autograd} 看到操作数之前展开。
 
-\subsection{Dispatch Key at Offset 9 and Priority}
+\subsection{偏移量 9 处的调度密钥和优先级}
 \label{sec:vmapkey}
 
- defines 13 keys with fixed numeric values. The vmap family is placed at offset~9:
+定义了 13 个具有固定数值的键。 vmap族被放置在offset~9处：
 
 \begin{lstlisting}[caption={13 keys, Vmap at offset~9.}, label=lst:vmapkeys]
 enum class DispatchKey : uint8_t {
@@ -22,32 +22,32 @@ enum class DispatchKey : uint8_t {
 constexpr size_t kBackendKeyCount=3, kAutogradKeyOffset=3, kAutocastKeyOffset=6, kVmapKeyOffset=9;
 \end{lstlisting}
 
-Helpers \texttt{toVmapKey}, \texttt{is\_vmap\_key}, and \texttt{toBackendKey} are \texttt{constexpr}. \texttt{DispatchKeySet} is a \texttt{uint32\_t} bitmask with \texttt{has} and \texttt{highest\_priority\_key} which scans from the most-significant set bit downward; because vmap occupies 9--11 it always wins over autocast (6--8), autograd (3--5), and backend (0--2). Table~\ref{tab:vmappriority} makes the ordering explicit.
+助手 \texttt{toVmapKey}、\texttt{is\_vmap\_key} 和 \texttt{toBackendKey} 是 \texttt{constexpr}。 \texttt{DispatchKeySet} 是一个 \texttt{uint32\_t} 位掩码，具有 \texttt{has} 和 \texttt{highest\_priority\_key}，从最高有效设置位向下扫描；因为 vmap 占据 9--11，所以它总是胜过 autocast (6--8)、autograd (3--5) 和 backend (0--2)。 Table~\ref{tab:vmappriority} 使排序更加明确。
 
 \begin{table}[H]
 \centering
-\caption{Dispatch priority. \texttt{highest\_priority\_key} is the dispatch decision; vmap is top.}
+\caption{优先派送。 \texttt{highest\_priority\_key} 是调度决策； vmap 是最上面的。}
 \label{tab:vmappriority}
 \small
 \begin{tabular}{clcl}
 \toprule
-Rank & Numeric & Key family & Defined at \\
+Rank & 数字 & 重点家庭 & 定义于 \\
 \midrule
-4 & 9--11 & \texttt{ VmapVulkan} &, \texttt{kVmapKeyOffset=9} \\
-3 & 6--8  & \texttt{ AutocastVulkan} &, \texttt{kAutocastKeyOffset=6} \\
-2 & 3--5  & \texttt{ AutogradVulkan} &, \texttt{kAutogradKeyOffset=3} \\
-1 & 0--2  & \texttt{ Vulkan} (dense backends) & \\
-0 & 12    & \texttt{Composite} (backend-neutral fallback) & \\
+4 & 9--11 & \texttt{ VmapVulkan} & , \texttt{kVmapKeyOffset=9} \\
+3 & 6--8 & \texttt{ AutocastVulkan} & , \texttt{kAutocastKeyOffset=6} \\
+2 & 3--5 & \texttt{ AutogradVulkan} & , \texttt{kAutogradKeyOffset=3} \\
+1 & 0--2 & \texttt{ Vulkan}（密集后端） & \\
+0 & 12 & \texttt{Composite} （后端中立后备） & \\
 \bottomrule
 \end{tabular}
 \end{table}
 
- defines \texttt{is\_vmap\_key} as the half-open interval \texttt{[kVmapKeyOffset, kVmapKeyOffset+kBackendKeyCount)}; \texttt{toVmapKey(backend) = backend + 9} and \texttt{toBackendKey(vmap) = vmap - 9}. \texttt{DispatchKeySet::remove\_vmap} clears exactly those three bits, used when re-dispatching below the vmap layer. The \texttt{DispatchTable} has \texttt{array<atomic<void*>,13>} slots so each vmap key has its own column; \texttt{OperatorHandle::getKernel} consults \texttt{Composite} only for backend keys, never for vmap keys, so a missing vmap kernel is a hard miss rather than a silent fallback.
+将 \texttt{is\_vmap\_key} 定义为半开区间 \texttt{[kVmapKeyOffset, kVmapKeyOffset+kBackendKeyCount)}； \texttt{toVmapKey(backend) = backend + 9} 和 \texttt{toBackendKey(vmap) = vmap - 9}。 \texttt{DispatchKeySet::remove\_vmap} 准确地清除这三个位，在 vmap 层下方重新调度时使用。 \texttt{DispatchTable} 有 \texttt{array<atomic<void*>,13>} 插槽，因此每个 vmap 键都有自己的列； \texttt{OperatorHandle::getKernel} 仅针对后端键咨询 \texttt{Composite}，而不是针对 vmap 键，因此缺少 vmap 内核是一次严重失误，而不是静默回退。
 
-\subsection{TensorImpl Batching State: \texttt{transform\_value\_} Wrapper}
+\subsection{TensorImpl 批处理状态：\texttt{transform\_value\_} 包装器}
 \label{sec:batchstate}
 
-Batching state lives in \texttt{TensorImpl} as three fields, separate from storage, version, and sparse metadata:
+批处理状态作为三个字段存在于 \texttt{TensorImpl} 中，与存储、版本和稀疏元数据分开：
 
 \begin{lstlisting}[caption={batching fields.}, label=lst:batchfields]
 std::shared_ptr<TensorImpl> transform_value_;
@@ -61,7 +61,7 @@ int64_t batch_size() const {
 }
 \end{lstlisting}
 
-The wrapper constructor takes a physical \texttt{shared\_ptr<TensorImpl> value} plus logical \texttt{strides}:
+包装构造函数采用物理 \texttt{shared\_ptr<TensorImpl> value} 加上逻辑 \texttt{strides}：
 
 \begin{lstlisting}[caption={wrapper construction.}, label=lst:wrapperctor]
 TensorImpl::TensorImpl(std::shared_ptr<TensorImpl> transform_value,
@@ -76,9 +76,9 @@ TensorImpl::TensorImpl(std::shared_ptr<TensorImpl> transform_value,
 }
 \end{lstlisting}
 
-The public shape is the logical shape (without the batch dimension); the physical shape lives in \texttt{transform\_value\_}. Views and copies preserve the distinction: \texttt{TensorImpl(const TensorImpl\& other)} copies \texttt{level\_}, while \texttt{share\_version\_counter} is \emph{not} shared for batched wrappers---batching is orthogonal to versioning. The logical \texttt{sizes\_and\_strides\_} is recomputed per result by the batch rule; the physical tensor is never aliased as the public tensor.
+公共形状是逻辑形状（没有批量维度）；物理形状位于 \texttt{transform\_value\_} 中。视图和副本保留了区别：\texttt{TensorImpl(const TensorImpl\& other)} 复制 \texttt{level\_}，而 \texttt{share\_version\_counter} 是批处理包装器共享的 \emph{not}——批处理与版本控制正交。逻辑 \texttt{sizes\_and\_strides\_} 根据批处理规则的结果重新计算；物理张量永远不会被别名为公共张量。
 
-\texttt{TensorImpl::key\_set} computes the dispatch key on the fly and gives vmap priority by early return:
+\texttt{TensorImpl::key\_set} 动态计算调度键并通过提前返回赋予 vmap 优先级：
 
 \begin{lstlisting}[caption={computed key set, vmap first.}, label=lst:keysetvmap]
 DispatchKeySet key_set() const {
@@ -96,31 +96,31 @@ DispatchKeySet key_set() const {
 }
 \end{lstlisting}
 
-When \texttt{is\_batched} the set contains only the \texttt{Vmap*} bit, so \texttt{dispatchKeyForTensorArgs} will select a vmap key if any argument is batched, regardless of how many unbatched arguments are present. Table~\ref{tab:batchfields} summarizes the field semantics.
+当 \texttt{is\_batched} 集合仅包含 \texttt{Vmap*} 位时，因此如果任何参数被批处理，则 \texttt{dispatchKeyForTensorArgs} 将选择 vmap 键，无论存在多少个未批处理的参数。表~\ref{tab:batchfields} 总结了字段语义。
 
 \begin{table}[H]
 \centering
-\caption{\texttt{TensorImpl} batching members. Logical vs.\ physical split.}
+\caption{\texttt{TensorImpl} 批处理成员。逻辑与物理分裂。}
 \label{tab:batchfields}
 \small
 \begin{tabular}{lll}
 \toprule
-Field & Type & Meaning \\
+场地 & Type & 意义 \\
 \midrule
-\texttt{transform\_value\_} & \texttt{shared\_ptr<TensorImpl>} & Physical tensor (with batch dim); \texttt{nullptr} means not batched \\
-\texttt{transform\_batch\_dim\_} & \texttt{int64\_t} & Position of batch dim inside the physical shape; $-1$ when unbatched \\
-\texttt{transform\_level\_} & \texttt{int64\_t} & Which vmap nesting level owns this wrapper; distinguishes nested vmaps \\
-\texttt{sizes\_and\_strides\_} & \texttt{SizesAndStrides} & Logical shape (public, without batch dim) \\
+\texttt{transform\_value\_} & \texttt{shared\_ptr<TensorImpl>} & 物理张量（带有批处理维）； \texttt{nullptr} 表示不分批 \\
+\texttt{transform\_batch\_dim\_} & \texttt{int64\_t} & 批处理维在物理形状内的位置；未批处理时为 $-1$ \\
+\texttt{transform\_level\_} & \texttt{int64\_t} & 哪个 vmap 嵌套级别拥有此包装器；区分嵌套 vmap \\
+\texttt{sizes\_and\_strides\_} & \texttt{SizesAndStrides} & 逻辑形状（公共，无批处理维） \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The thin handle \texttt{Tensor} forwards \texttt{transform\_value} to the impl with a null check, so callers never touch \texttt{TensorImpl} directly.
+瘦句柄 \texttt{Tensor} 通过空检查将 \texttt{transform\_value} 转发到 impl，因此调用者永远不会直接接触 \texttt{TensorImpl}。
 
-\subsection{Transform Stack: Push/Pop and Levels}
+\subsection{变换堆栈：推入/弹出和级别}
 \label{sec:transformstack}
 
-Nested vmaps are disambiguated by a per-thread level stack:
+嵌套 vmap 通过每线程级别堆栈消除歧义：
 
 \begin{lstlisting}[caption={layer stack.}, label=lst:layerstack]
 enum class Randomness : uint8_t { Error=0, Same=1, Different=2 };
@@ -140,7 +140,7 @@ P10_API std::optional<Layer> current_layer();
 P10_API std::vector<Layer> layer_stack();
 \end{lstlisting}
 
-The implementation is a thread-local vector plus a monotonic counter:
+该实现是一个线程局部向量加上一个单调计数器：
 
 \begin{lstlisting}[caption={stack and levels.}, label=lst:pushpop]
 namespace { thread_local std::vector<Layer> layers; thread_local int64_t next_level = 0; }
@@ -157,21 +157,21 @@ Layer pop_layer() {
 }
 \end{lstlisting}
 
-Levels are never reused within a thread: even after \texttt{pop\_layer}, \texttt{next\_level} keeps incrementing. This prevents ABA confusion when a batched tensor outlives its layer (e.g., captured in a closure). \texttt{is\_batched\_at\_level(value, level)} checks both the pointer and the exact level, so an outer vmap's tensor is invisible to an inner vmap's rules.
+级别永远不会在线程内重用：即使在 \texttt{pop\_layer} 之后，\texttt{next\_level} 也会不断递增。当批量张量超过其层的寿命（例如，在闭包中捕获）时，这可以防止 ABA 混淆。 \texttt{is\_batched\_at\_level(value, level)} 检查指针和确切级别，因此外部 vmap 的张量对于内部 vmap 的规则是不可见的。
 
-The Python guard \texttt{vmap\_increment\_nesting} pushes, yields the level, and pops in a \texttt{finally} block that also restores a \texttt{ContextVar} depth counter. The names \texttt{PushVmapMode}/\texttt{PopVmapMode} in the task description map to \texttt{push\_vmap}/\texttt{pop\_layer} in code; the ``Mode'' wording reflects the RAII guard \texttt{vmap\_increment\_nesting} that pushes and pops a mode, while the native symbols are plain functions. The C++ binding exposes \texttt{\_transform\_push\_vmap} / \texttt{\_transform\_pop} / \texttt{\_transform\_current} directly, with string-to-enum parsing for randomness. No Python-level mode flag is needed beyond the C++ stack; the stack itself is the ground truth.
+Python 保护 \texttt{vmap\_increment\_nesting} 压入、产生级别，然后弹出 \texttt{finally} 块，该块还恢复 \texttt{ContextVar} 深度计数器。任务描述中的名称\texttt{PushVmapMode}/\texttt{PopVmapMode}映射到代码中的\texttt{push\_vmap}/\texttt{pop\_layer}； “模式”措辞反映了 RAII 保护 \texttt{vmap\_increment\_nesting} 推送和弹出模式，而本机符号是普通函数。 C++ 绑定直接公开 \texttt{\_transform\_push\_vmap} / \texttt{\_transform\_pop} / \texttt{\_transform\_current} ，并通过字符串到枚举解析实现随机性。除了 C++ 堆栈之外，不需要 Python 级别的模式标志；堆栈本身就是基本事实。
 
-Operational invariants:
+操作不变量：
 \begin{enumerate}[leftmargin=1.2em]
-\item \texttt{push\_vmap} returns a fresh level; \texttt{make\_batched(value, dim, level)} tags the wrapper with that level.
-\item \texttt{unwrap\_at\_level(value, level)} returns \texttt{(physical, bdim)} only when \texttt{value.batch\_level==level}; otherwise it returns \texttt{(value, nullopt)} unchanged.
-\item \texttt{dispatch\_key\_for\_random(backend)} returns \texttt{toVmapKey(backend)} exactly when a vmap layer is on top of the stack, so random factories inside vmap re-dispatch through the vmap key even though they have no tensor argument to carry it.
+\item \texttt{push\_vmap} 返回一个新的级别； \texttt{make\_batched(value, dim, level)} 用该级别标记包装器。
+\item 仅当 \texttt{value.batch\_level==level} 时，\texttt{unwrap\_at\_level(value, level)} 返回 \texttt{(physical, bdim)}；否则返回 \texttt{(value, nullopt)} 不变。
+\item 当 vmap 层位于堆栈顶部时，\texttt{dispatch\_key\_for\_random(backend)} 恰好返回 \texttt{toVmapKey(backend)}，因此 vmap 内的随机工厂会通过 vmap 键重新调度，即使它们没有张量参数来携带它。
 \end{enumerate}
 
-\subsection{TransformDispatch Unwrapping Logic}
+\subsection{TransformDispatch 展开逻辑}
 \label{sec:unwrap}
 
-\texttt{TransformDispatch} provides the primitives that batch rules use to inspect and rebuild batched tensors:
+\texttt{TransformDispatch} 提供批处理规则用于检查和重建批处理张量的原语：
 
 \begin{lstlisting}[caption={make and unwrap.}, label=lst:makeunwrap]
 Tensor make_batched(const Tensor& value, int64_t dim, int64_t level) {
@@ -204,9 +204,9 @@ Tensor move_batch_dim(const Tensor& value, int64_t dim) {
 }
 \end{lstlisting}
 
-\texttt{actual\_dim} maps a public dimension (logical) to a physical dimension by skipping the batch position: \texttt{actual = public $<$ bdim ? public: public+1}. Every batch rule that takes a dim argument (permute, transpose, squeeze, sum, etc.) applies this translation before calling the underlying kernel, and then adjusts the result's \texttt{bdim} to reflect dims inserted or removed before the batch position.
+\texttt{actual\_dim} 通过跳过批位置：\texttt{actual = public -> bdim ? public: public+1} 将公共维度（逻辑）映射到物理维度。每个采用维参数（排列、转置、挤压、求和等）的批处理规则都会在调用底层内核之前应用此转换，然后调整结果的 \texttt{bdim} 以反映在批处理位置之前插入或删除的维。
 
-The unwrapping contract is uniform across \texttt{BatchingKernels.cpp}: each rule calls \texttt{unwrap\_operand} which asserts the operand's level matches an active layer via \texttt{layer\_for(level)}, then dispatches to \texttt{unwrap\_at\_level}. If no operand is batched the current level, the rule throws \texttt{RuntimeError}---the dispatcher should not have routed there. This fail-fast behavior catches codegen mismatches immediately.
+解包合约在 \texttt{BatchingKernels.cpp} 上是统一的：每个规则调用 \texttt{unwrap\_operand} ，它断言操作数的级别通过 \texttt{layer\_for(level)} 与活动层匹配，然后分派到 \texttt{unwrap\_at\_level} 。如果没有操作数批量处理当前级别，则规则抛出 \texttt{RuntimeError}——调度程序不应该路由到那里。这种快速失败行为会立即捕获代码生成不匹配的情况。
 
 \begin{figure}[H]
 \centering
@@ -223,27 +223,27 @@ The unwrapping contract is uniform across \texttt{BatchingKernels.cpp}: each rul
 \node[right=0.6cm of dispatch, align=left, font=\tiny, text=gray] (note) {\texttt{key\_set} returns\\\texttt{VmapCPU} only};
 \draw[dashed, color=gray] (note) -- (dispatch);
 \end{tikzpicture}
-\caption{Vmap execution: push level, wrap inputs, dispatch through Vmap key, unwrap inside batch rule, rewrap result, pop and place output dim.}
+\caption{Vmap 执行：推送级别、包装输入、通过 Vmap 键分派、在批处理规则内解开包装、重新包装结果、弹出并放置输出维。}
 \label{fig:vmapflow}
 \end{figure}
 
-\texttt{unwrap\_all} strips all batch wrappers by looping; it is used by \texttt{debug\_unwrap} and by composites that need the physical tensor for metadata queries. \texttt{move\_batch\_dim} permutes the physical tensor so the batch dim lands the requested public position, used when \texttt{out\_dims != 0}.
+\texttt{unwrap\_all} 通过循环剥离所有批次包装器；它由 \texttt{debug\_unwrap} 和需要物理张量进行元数据查询的复合材料使用。 \texttt{move\_batch\_dim} 排列物理张量，以便批处理维到达所请求的公共位置，在 \texttt{out\_dims != 0} 时使用。
 
-\subsection{BatchingKernels: Per-Op Hand-Written Rules vs.\ Loop Fallback}
+\subsection{BatchingKernels：每操作手写规则与循环回退}
 \label{sec:batchingkernels}
 
-\texttt{BatchingKernels.cpp} is 1229 lines of batch rules, each registered under \texttt{VmapCPU} and \texttt{VmapCUDA}:
+\texttt{BatchingKernels.cpp}是1229行批量规则，分别注册在\texttt{VmapCPU}和\texttt{VmapCUDA}下：
 
 \begin{lstlisting}[caption={dual registration.}, label=lst:batchreg]
 TENSORPLAY_LIBRARY_IMPL(VmapCPU, NativeBatchRulesCPU) { register_batch_rules(m); }
 TENSORPLAY_LIBRARY_IMPL(VmapCUDA, NativeBatchRulesCUDA) { register_batch_rules(m); }
 \end{lstlisting}
 
-\texttt{register\_batch\_rules} binds ~70 ops. The file has no generic per-slice loop fallback; every supported \ac{op} has a hand-written rule that preserves vectorization. Unsupported ops are not silently looped---the generated \texttt{Tensor} method checks \texttt{getKernel(vmap\_key)} and throws \texttt{No native batch rule registered} (--) if absent, which is the correct fail-fast for a teaching framework where implicit loops would hide performance cliffs.
+\texttt{register\_batch\_rules} 绑定约 70 个操作。该文件没有通用的每切片循环回退；每个受支持的 \ac{op} 都有一个保留矢量化的手写规则。不支持的操作不会静默循环——生成的 \texttt{Tensor} 方法检查 \texttt{getKernel(vmap\_key)} 并在不存在的情况下抛出 \texttt{No native batch rule registered} (--)，这对于隐式循环会隐藏性能悬崖的教学框架来说是正确的快速失败。
 
-\subsubsection{Rule templates}
+\subsubsection{规则模板}
 
-Three templates cover most ops:
+三个模板涵盖了大多数操作：
 
 \begin{lstlisting}[caption={unary / binary templates.}, label=lst:templates]
 template <typename Function> Tensor unary_impl(const Tensor& input, Function&& call) {
@@ -267,43 +267,43 @@ Tensor binary(const char* op, const Tensor& left, const Tensor& right) {
 }
 \end{lstlisting}
 
-\texttt{call\_next} re-dispatches below the vmap layer via \texttt{DispatchStub::call} with the backend key derived from the unwrapped tensors, so the underlying CPU/CUDA kernel runs on contiguous physical memory. \texttt{call\_device} is the factory variant that dispatches by explicit \texttt{Device}.
+\texttt{call\_next} 通过 \texttt{DispatchStub::call} 使用从解包张量派生的后端密钥重新调度 vmap 层下方，因此底层 CPU/CUDA 内核在连续的物理内存上运行。 \texttt{call\_device} 是通过显式 \texttt{Device} 调度的工厂变体。
 
-Key helpers:
+关键帮手：
 \begin{itemize}[leftmargin=1.2em]
-\item \texttt{move\_to\_front(value, dim)} permutes batch dim to 0, enabling a single batched kernel to handle any \texttt{bdim}.
-\item \texttt{expand\_unbatched(value, batch\_size, target\_shape)} broadcasts an unbatched operand by \texttt{unsqueeze(0).expand([B,...])} so binary ops need not branch on mixed batched/unbatched in the compute kernel.
-\item \texttt{aligned\_values(left, right, level)} moves batched inputs to front and expands unbatched ones, returning two tensors whose dim~0 is the batch. The result is always wrapped at dim~0.
-\item \texttt{logical\_shape(operand)} erases the batch dim from the physical shape, used to size expansions.
+\item \texttt{move\_to\_front(value, dim)} 将批处理维排列为 0，使单个批处理内核能够处理任何 \texttt{bdim}。
+\item \texttt{expand\_unbatched(value, batch\_size, target\_shape)} 通过 \texttt{unsqueeze(0).expand([B,...])} 广播未批处理的操作数，因此二进制操作不需要在计算内核中的混合批处理/未批处理上分支。
+\item \texttt{aligned\_values(left, right, level)} 将批处理的输入移动到前面并扩展未批处理的输入，返回两个张量，其 dim~0 是批处理。结果始终包裹在 dim~0 处。
+\item \texttt{logical\_shape(operand)} 从物理形状中删除批处理维，用于尺寸扩展。
 \end{itemize}
 
-\subsubsection{Operator families}
+\subsubsection{经营者家庭}
 
-Table~\ref{tab:batchfamilies} groups the registered rules.
+表~\ref{tab:batchfamilies} 对已注册的规则进行分组。
 
 \begin{table}[H]
 \centering
-\caption{Batch rule families in. Each row is a \texttt{library.impl} entry.}
+\caption{批处理规则系列。每行都是一个 \texttt{library.impl} 条目。}
 \label{tab:batchfamilies}
 \small
 \begin{tabular}{lll}
 \toprule
-Family & Examples & Strategy \\
+家庭 & 示例 & 战略 \\
 \midrule
-Pointwise unary & \texttt{neg, abs, exp, log, sin, cos, sqrt, sigmoid, relu} & \texttt{unary\_impl} preserves \texttt{bdim} \\
-Pointwise binary & \texttt{mul.Tensor, div.Tensor, maximum, minimum} & \texttt{binary\_impl} via \texttt{aligned\_values}, result at 0 \\
-Binary with alpha & \texttt{add.Tensor, sub.Tensor} & \texttt{binary\_alpha}, same alignment \\
-Scalar & \texttt{add.Scalar, mul.Scalar, pow.Tensor\_Scalar} & \texttt{scalar}/\texttt{scalar\_alpha}, preserves \texttt{bdim} \\
-Reductions & \texttt{sum, sum.dim\_IntList} & Rewrites dims past \texttt{bdim}, adjusts result \texttt{bdim} \\
-Shape & \texttt{view, permute, transpose, reshape, expand, squeeze, unsqueeze} & Translates public dims to physical, adjusts result \texttt{bdim} \\
-Gather/scatter & \texttt{select, slice, narrow, index\_select, cat, stack} & Shifts gather dim past \texttt{bdim}; \texttt{stack} align then \texttt{call\_next} at \texttt{dim+1} \\
-Linear algebra & \texttt{mm, matmul, bmm, linear} & Align to front, call \texttt{matmul}; \texttt{linear} transposes weight \\
-Random & \texttt{rand, randn, randint, randperm, rand\_like} & \texttt{random\_factory} branches on \texttt{Randomness} (see \S\ref{sec:randomness}) \\
+逐点一元 & \texttt{neg, abs, exp, log, sin, cos, sqrt, sigmoid, relu} & \texttt{unary\_impl} 保留 \texttt{bdim} \\
+逐点二进制 & \texttt{mul.Tensor, div.Tensor, maximum, minimum} & \texttt{binary\_impl} 经 \texttt{aligned\_values}，结果 \texttt{bdim} 置 0 \\
+带标量 alpha 的二元 & \texttt{add.Tensor, sub.Tensor} & \texttt{binary\_alpha}，同样的维度移动 \\
+标量 & \texttt{add.Scalar, mul.Scalar, pow.Tensor\_Scalar} & \texttt{scalar}/\texttt{scalar\_alpha}，保留 \texttt{bdim} \\
+归约 & \texttt{sum, sum.dim\_IntList} & 将 \texttt{bdim} 移到最前后归约，调整结果 \texttt{bdim} \\
+形状 & \texttt{view, permute, transpose, reshape, expand, squeeze, unsqueeze} & 将批处理维转换为物理维，调整结果 \texttt{bdim} \\
+聚集/分散 & \texttt{select, slice, narrow, index\_select, cat, stack} & 移过 \texttt{bdim} 后按维索引； \texttt{stack} 先对齐输入，再在 \texttt{dim+1} 处调用底层实现 \\
+线性代数 & \texttt{mm, matmul, bmm, linear} & 将 \texttt{bdim} 移到最前再调用 \texttt{matmul}； \texttt{linear} 转置权重 \\
+随机 & \texttt{rand, randn, randint, randperm, rand\_like} & \texttt{random\_factory} 在 \texttt{Randomness} 上分支（请参阅 \S\ref{sec:randomness}） \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Concrete dim adjustment appears in every shape rule. For example, \texttt{sum\_dim}:
+具体的维调整出现在每个形状规则中。例如，\texttt{sum\_dim}：
 
 \begin{lstlisting}[caption={sum adjusts batch dim.}, label=lst:sumdim]
 Tensor sum_dim(const Tensor& input, const std::vector<int64_t>& dims, bool keepdim, DType dtype) {
@@ -324,14 +324,14 @@ Tensor sum_dim(const Tensor& input, const std::vector<int64_t>& dims, bool keepd
 }
 \end{lstlisting}
 
-\texttt{permute} builds a physical permutation that interleaves the batch dim at its original position, then calls \texttt{permute} on the physical tensor and rewraps at \texttt{new\_bdim}. \texttt{cat} aligns a list via \texttt{align\_tensor\_list} which moves every batched input's \texttt{bdim} to 0 and expands unbatched ones, then calls \texttt{cat} at \texttt{public\_dim+1} and wraps at 0. \texttt{mm} aligns then calls \texttt{bmm} so a batch of matrix multiplies becomes a single batched kernel rather than a loop.
+\texttt{permute} 构建一个物理排列，将批处理维交错在其原始位置，然后在物理张量上调用 \texttt{permute} 并在 \texttt{new\_bdim} 处重新包装。 \texttt{cat} 通过 \texttt{align\_tensor\_list} 对齐列表，将每个批处理输入的 \texttt{bdim} 移动到 0 并扩展未批处理的输入，然后在 \texttt{public\_dim+1} 处调用 \texttt{cat} 并在 0 处换行。 \texttt{mm} 先对齐再调用 \texttt{bmm}，因此一批矩阵乘法成为单个批处理内核而不是循环。
 
-No rule falls back to a per-slice loop. This is intentional: a loop would be correct but would defeat the purpose of a batched kernel (one launch vs.\ $B$ launches) and would hide missing coverage. When an op lacks a rule, the generated wrapper throws immediately, and the fix is to add a rule to \texttt{BatchingKernels.cpp} following the \texttt{unary}/\texttt{binary} pattern.
+没有规则会退回到每切片循环。这是故意的：循环是正确的，但会破坏批处理内核的目的（一次启动与\ $B$ 启动），并且会隐藏丢失的覆盖范围。当操作缺少规则时，生成的包装器会立即抛出异常，解决方法是按照 \texttt{unary}/\texttt{binary} 模式向 \texttt{BatchingKernels.cpp} 添加规则。
 
-\subsection{Python Surface: \texttt{tensorplay.func.vmap}}
+\subsection{Python 表面：\texttt{tensorplay.func.vmap}}
 \label{sec:pythonsurface}
 
-The Python API is a thin validator over the native stack. is the public \texttt{vmap}:
+Python API 是本机堆栈上的精简验证器。是公共 \texttt{vmap}：
 
 \begin{lstlisting}[caption={public \texttt{vmap} surface.}, label=lst:pyvmapapi, style=pystyle]
 def vmap(func, in_dims=0, out_dims=0, randomness="error", *, chunk_size=None):
@@ -343,7 +343,7 @@ def vmap(func, in_dims=0, out_dims=0, randomness="error", *, chunk_size=None):
     return wrapped
 \end{lstlisting}
 
- validates, flattens the pytree of args, pushes a native layer, wraps inputs, calls the user function, and unwraps outputs:
+验证、展平 args 的 pytree、推送本机层、包装输入、调用用户函数并解开输出：
 
 \begin{lstlisting}[caption={\texttt{vmap\_impl} and nesting.}, label=lst:vmapimpl, style=pystyle]
 def vmap_impl(func, in_dims, out_dims, randomness, chunk_size, *args, **kwargs):
@@ -371,40 +371,40 @@ def vmap_increment_nesting(batch_size, randomness):
         finally: _vmap_depth.reset(token)
 \end{lstlisting}
 
-\texttt{\_process\_batched\_inputs} flattens both \texttt{args} and \texttt{in\_dims} via \texttt{tree\_flatten} / \texttt{\_broadcast\_to\_and\_flatten}, normalizes negative dims, checks that every \texttt{in\_dim != None} corresponds to a \texttt{Tensor}, and verifies all mapped tensors share the same batch size. \texttt{\_create\_batched\_inputs} calls \texttt{tensorplay.\_C.\_transform\_make\_batched(arg, dim, level)} for each mapped leaf, leaving unmapped leaves untouched.
+\texttt{\_process\_batched\_inputs} 通过 \texttt{tree\_flatten} / \texttt{\_broadcast\_to\_and\_flatten} 展平 \texttt{args} 和 \texttt{in\_dims}，标准化负维号，检查每个 \texttt{in\_dim != None} 是否对应于 \texttt{Tensor}，并验证所有映射张量共享相同的批量大小。 \texttt{\_create\_batched\_inputs} 为每个映射的叶子调用 \texttt{tensorplay.\_C.\_transform\_make\_batched(arg, dim, level)} ，而未映射的叶子保持不变。
 
-Output handling follows the input side: it flattens outputs, checks \texttt{out\_dims} compatibility, unwraps each tensor leaf with \texttt{\_transform\_unwrap(output, level)}, and moves the physical batch dim to the requested public position via \texttt{tensorplay.movedim(unwrapped, batch\_dim, target\_dim)}. Non-tensor leaves must have \texttt{out\_dim=None}; otherwise a \texttt{ValueError} is raised.
+输出处理遵循输入侧：它展平输出，检查 \texttt{out\_dims} 兼容性，使用 \texttt{\_transform\_unwrap(output, level)} 解包每个张量叶，并通过 \texttt{tensorplay.movedim(unwrapped, batch\_dim, target\_dim)} 将物理批维移动到请求的公共位置。非张量叶子必须有\texttt{out\_dim=None}；否则会引发 \texttt{ValueError} 。
 
-Three chunking utilities bound peak memory for large batches:
+三个分块实用程序限制大批量的峰值内存：
 \begin{itemize}[leftmargin=1.2em]
-\item \texttt{chunk\_vmap} and \texttt{vmap(..., chunk\_size=N)} split the batch into pieces via \texttt{get\_chunked\_inputs} which uses \texttt{tensor\_split} along the mapped dim, run independent native layers per chunk, and rejoin with \texttt{cat} along \texttt{out\_dim}.
-\item \texttt{restore\_vmap} and \texttt{ unwrap\_batched} expose the same primitives for testing and for \texttt{jvp} which needs to re-enter a sized layer.
+\item \texttt{chunk\_vmap} 和 \texttt{vmap(..., chunk\_size=N)} 通过 \texttt{get\_chunked\_inputs} 将批处理分成多个部分，\texttt{get\_chunked\_inputs} 使用 \texttt{tensor\_split} 沿着映射的维，为每个块运行独立的本机层，并沿着 \texttt{out\_dim} 与 \texttt{cat} 重新连接。
+\item \texttt{restore\_vmap} 和 \texttt{ unwrap\_batched} 公开相同的原语用于测试和 \texttt{jvp} ，需要重新进入调整大小的层。
 \end{itemize}
 
-The C++ binding is six functions: \texttt{\_transform\_push\_vmap}, \texttt{\_transform\_pop}, \texttt{\_transform\_current}, \texttt{\_transform\_make\_batched}, \texttt{\_transform\_unwrap}, and \texttt{\_transform\_unwrap\_all}. Each is a direct forward to \texttt{tensorplay::transform::*} with pybind11 type conversions and no extra bookkeeping.
+C++ 绑定有六个函数：\texttt{\_transform\_push\_vmap}、\texttt{\_transform\_pop}、\texttt{\_transform\_current}、\texttt{\_transform\_make\_batched}、\texttt{\_transform\_unwrap} 和 \texttt{\_transform\_unwrap\_all}。每个都是通过 pybind11 类型转换直接转发到 \texttt{tensorplay::transform::*} ，并且没有额外的簿记。
 
-\subsection{Randomness Handling}
+\subsection{随机性处理}
 \label{sec:randomness}
 
-Random ops inside vmap are ambiguous: should each sample draw independently or should the batch share one draw? TensorPlay requires the caller to choose explicitly via \texttt{randomness}:
+vmap 内的随机操作不明确：每个样本应该独立绘制还是应该批次共享一次绘制？ TensorPlay 要求调用者通过 \texttt{randomness} 显式选择：
 
 \begin{table}[H]
 \centering
-\caption{Randomness modes. Every random factory consults the active layer's \texttt{randomness}.}
+\caption{随机模式。每个随机工厂都会参考活动层的 \texttt{randomness}。}
 \label{tab:randomness}
 \small
 \begin{tabular}{lll}
 \toprule
-Mode & String & Factory behavior in \texttt{BatchingKernels.cpp} \\
+Mode & 细绳 & \texttt{BatchingKernels.cpp} 中的工厂行为 \\
 \midrule
-\texttt{Error} & \texttt{"error"} & \texttt{check\_randomness} throws \\
-\texttt{Same} & \texttt{"same"} & Draw once, \texttt{unsqueeze(0).expand([B,...])} and wrap \\
-\texttt{Different} & \texttt{"different"} & Draw with prepended batch dim \texttt{[B,...shape]} and wrap at 0 \\
+\texttt{Error} & \texttt{"error"} & \texttt{check\_randomness} 抛出 \\
+\texttt{Same} & \texttt{"same"} & 绘制一次，\texttt{unsqueeze(0).expand([B,...])} 并包裹 \\
+\texttt{Different} & \texttt{"different"} & 使用预置的批处理维 \texttt{[B,...shape]} 进行绘制并在 0 处换行 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Factories implement this branching. For shape-based factories:
+工厂实施这种分支。对于基于形状的工厂：
 
 \begin{lstlisting}[caption={random factory.}, label=lst:randfactory]
 Tensor random_factory(const char* op, const std::vector<int64_t>& shape,
@@ -424,18 +424,18 @@ Tensor random_factory(const char* op, const std::vector<int64_t>& shape,
 }
 \end{lstlisting}
 
-\texttt{prepend\_batch\_size} inserts $B$ at dim~0; \texttt{expand\_same\_random} does \texttt{sample.unsqueeze(0).expand([B,...shape])} so every sample shares the same random values but downstream ops still see a proper batch. \texttt{randperm} is special: with \texttt{Different} it loops $B$ times and stacks, because a single \texttt{randperm([B,n])} would not yield $B$ independent permutations.
+\texttt{prepend\_batch\_size} 在 dim~0 处插入 $B$； \texttt{expand\_same\_random} 执行 \texttt{sample.unsqueeze(0).expand([B,...shape])} 因此每个样本共享相同的随机值，但下游操作仍然看到正确的批次。 \texttt{randperm} 很特殊：使用 \texttt{Different} 时，它会循环 $B$ 次并堆栈，因为单个 \texttt{randperm([B,n])} 不会产生 $B$ 独立排列。
 
-For \texttt{rand\_like} variants, the input may itself be batched the active level. With \texttt{Different}, the factory calls the underlying \texttt{rand\_like} on the physical value and rewraps the same \texttt{bdim}; with \texttt{Same}, it selects one slice (\texttt{select.int} at \texttt{bdim}, index 0), draws from that slice, and expands back along \texttt{bdim}. Unbatched inputs under \texttt{Same} share one draw expanded to \texttt{[B,...]}; under \texttt{Different} they create a template \texttt{unsqueeze(0).expand} physical tensor and draw there.
+对于 \texttt{rand\_like} 变体，输入本身可以批量处理活动级别。使用 \texttt{Different}，工厂在物理值上调用底层 \texttt{rand\_like} 并重新包装相同的 \texttt{bdim}；使用 \texttt{Same} 时，它会选择一个切片（\texttt{select.int} 位于 \texttt{bdim}，索引 0），从该切片进行绘制，然后沿 \texttt{bdim} 向后扩展。 \texttt{Same} 下的非批量输入共享一次抽取，扩展到 \texttt{[B,...]}；在 \texttt{Different} 下，他们创建一个模板 \texttt{unsqueeze(0).expand} 物理张量并在那里绘制。
 
-The generated dispatch key for random ops uses \texttt{dispatch\_key\_for\_random(computeDispatchKey(device))} rather than \texttt{dispatchKeyForTensorArgs}, so the vmap key is injected even when no tensor argument carries it. At the Python layer, \texttt{vmap(func, randomness="different")(randn([3]))} therefore routes \texttt{randn} through \texttt{VmapCPU} without any batched input. With the default \texttt{"error"}, any random op inside vmap throws immediately with a message naming the constraint, so silent wrong-batch randomness is impossible.
+为随机操作生成的调度密钥使用 \texttt{dispatch\_key\_for\_random(computeDispatchKey(device))} 而不是 \texttt{dispatchKeyForTensorArgs}，因此即使没有张量参数携带 vmap 键，它也会被注入。因此，在 Python 层，\texttt{vmap(func, randomness="different")(randn([3]))} 通过 \texttt{VmapCPU} 路由 \texttt{randn}，无需任何批量输入。使用默认的 \texttt{"error"} ，vmap 内的任何随机操作都会立即抛出一条命名约束的消息，因此静默错误批次随机性是不可能的。
 
-\subsection{Interaction with Autograd and Redispatch Order}
+\subsection{与 Autograd 和重新调度订单交互}
 \label{sec:autogradinteract}
 
-Vmap's numeric priority is load-bearing for correctness: vmap must see operands before autograd records history. \texttt{TensorImpl::key\_set} returning only \texttt{Vmap*} when batched, and \texttt{highest\_priority\_key} preferring higher numeric keys, together guarantee that \texttt{vmap(grad(f))} and \texttt{grad(vmap(f))} are distinct and both correct.
+Vmap 的数字优先级是正确性的承载：vmap 必须在 autograd 记录历史之前查看操作数。 \texttt{TensorImpl::key\_set} 在批处理时仅返回 \texttt{Vmap*}，而 \texttt{highest\_priority\_key} 更喜欢更高的数字键，共同保证 \texttt{vmap(grad(f))} 和 \texttt{grad(vmap(f))} 是不同的并且都是正确的。
 
-The generated \texttt{Tensor} methods encode the order Vmap $\rightarrow$ Autocast $\rightarrow$ Autograd $\rightarrow$ Backend:
+生成的 \texttt{Tensor} 方法对顺序进行编码 Vmap $\rightarrow$ Autocast $\rightarrow$ Autograd $\rightarrow$ Backend：
 
 \begin{lstlisting}[caption={redispatch order in every Tensor method.}, label=lst:redispatchorder]
 {
@@ -462,28 +462,28 @@ if (GradMode::is_enabled()) {
 return detail::redispatch_add(*this, other);
 \end{lstlisting}
 
-Table~\ref{tab:vmaporder} summarizes the funnel. The final \texttt{detail::redispatch\_*} resolves a backend kernel via \texttt{toBackendKey(dispatchKeyForTensorArgs(...))} after stripping transform and autograd bits, so the physical compute always lands on \texttt{Vulkan}.
+表~\ref{tab:vmaporder} 总结了漏斗。在剥离变换和自动微分位后，最终的 \texttt{detail::redispatch\_*} 通过 \texttt{toBackendKey(dispatchKeyForTensorArgs(...))} 解析后端内核，因此物理计算始终落在 \texttt{Vulkan} 上。
 
 \begin{table}[H]
 \centering
-\caption{Redispatch funnel in generated \texttt{Tensor} methods. Each stage either handles the call or falls through.}
+\caption{生成的 \texttt{Tensor} 方法中的重新调度漏斗。每个阶段要么处理呼叫，要么失败。}
 \label{tab:vmaporder}
 \small
 \begin{tabular}{cll}
 \toprule
-Stage & Key family & Action if kernel present \\
+阶段 & 重点家庭 & 如果内核存在则采取行动 \\
 \midrule
-1 & \texttt{Vmap*} (\texttt{is\_vmap\_key}) & Unwrap, align, call underlying op, rewrap \\
-2 & \texttt{Autocast*} (\texttt{is\_enabled}) & Cast inputs, call next layer (generated autocast wrapper) \\
-3 & \texttt{Autograd*} & Record \texttt{Node} with \texttt{SavedVariable} guards, call backend \\
-4 & \texttt{Vulkan} & Compute \\
+1 & \texttt{Vmap*} (\texttt{is\_vmap\_key}) & 展开、移动维、调用底层操作、重新包装 \\
+2 & \texttt{Autocast*} (\texttt{is\_enabled}) & 投射输入，调用下一层（生成的自动投射包装器） \\
+3 & \texttt{Autograd*} & 用 \texttt{SavedVariable} 守卫记录 \texttt{Node}，调用后端 \\
+4 & \texttt{Vulkan} & 计算 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Because vmap runs first, \texttt{add} inside \texttt{vmap(f)} is dispatched to \texttt{batch\_add} which unwraps to physical tensors, calls \texttt{add} on them (re-entering dispatch the backend key), and rewraps the result. Autograd therefore sees $B$ batched values as a single batched result and records a batched \texttt{Node}; the backward of a batched \texttt{Node} is itself batched, so \texttt{Engine::evaluate\_function} needs no vmap-specific changes. Conversely, \texttt{grad(vmap(f))} runs the grad transform outside vmap: the forward records a graph whose intermediate tensors are batched, and the backward replays with the same batch rules.
+因为 vmap 首先运行，所以 \texttt{vmap(f)} 内的 \texttt{add} 被分派到 \texttt{batch\_add}，后者解包到物理张量，在它们上调用 \texttt{add} （重新输入分派后端键），并重新包装结果。因此，Autograd 将 $B$ 批处理值视为单个批处理结果，并记录批处理 \texttt{Node}；批处理 \texttt{Node} 的向后本身就是批处理的，因此 \texttt{Engine::evaluate\_function} 不需要特定于 vmap 的更改。相反，\texttt{grad(vmap(f))} 在 vmap 之外运行梯度变换：前向记录中间张量被批处理的图，后向以相同的批处理规则重播。
 
-Composites reinforce the ordering:
+复合材料强化了排序：
 
 \begin{lstlisting}[caption={composites reject active transforms.}, label=lst:composites]
 inline bool under_active_transform(const Tensor& t){ return t.unsafeGetTensorImpl() && t.unsafeGetTensorImpl()->is_batched(); }
@@ -499,14 +499,14 @@ Return redispatch_below_transform(const char* op, Args... args){
 }
 \end{lstlisting}
 
-Plain composites call \texttt{reject\_active\_transform} because running a backend kernel on the wrapper would silently corrupt batching. Decomposition-style composites call \texttt{redispatch\_below\_transform} to intentionally route through the vmap layer so inner ops hit their batch rules. Both paths keep the invariant that any op touching a batched tensor must either be a batch rule itself or explicitly opt into re-dispatching through one.
+普通复合材料调用 \texttt{reject\_active\_transform} 因为在包装器上运行后端内核会默默地破坏批处理。分解式复合调用 \texttt{redispatch\_below\_transform} 有意通过 vmap 层进行路由，以便内部操作符合其批处理规则。两条路径都保持不变，即任何接触批处理张量的操作必须要么是批处理规则本身，要么明确选择通过一个批处理规则重新调度。
 
-Nested vmaps compose by stacking levels: the inner \texttt{push\_vmap} allocates a new level, its inputs are double-wrapped (outer wrapper around inner wrapper), and each rule's \texttt{unwrap\_at\_level} only peels the level it owns. The outer batch dim remains untouched while the inner rule executes, then the inner result is rewrapped before returning to the outer layer. No special casing for nesting is needed beyond the level check.
+嵌套 vmap 由堆叠级别组成：内部 \texttt{push\_vmap} 分配一个新级别，其输入是双重包装的（外部包装器围绕内部包装器），并且每个规则的 \texttt{unwrap\_at\_level} 仅剥离其拥有的级别。在执行内部规则时，外部批处理维保持不变，然后在返回到外层之前重新包装内部结果。除了水平检查之外，不需要特殊的嵌套套管。
 
-\subsection{End-to-End Example and Cost Notes}
+\subsection{端到端示例和成本说明}
 \label{sec:vmapcost}
 
-Consider \texttt{f(x)= (x*2).sum} mapped over 4 samples of shape \texttt{[3]}:
+考虑 \texttt{f(x)= (x*2).sum} 映射到形状 \texttt{[3]} 的 4 个样本上：
 
 \begin{lstlisting}[caption={Vmap example: one function, batched execution.}, label=lst:vmapexample, style=pystyle]
 import tensorplay as tp
@@ -516,26 +516,18 @@ assert batched.shape == tp.Size([4])
 # equivalent to: tp.stack([f(tp.randn([3])) for _ in range(4)]) but one kernel launch per op
 \end{lstlisting}
 
-What runs natively:
+本机运行的内容：
 \begin{enumerate}[leftmargin=1.2em]
-\item \texttt{vmap\_impl} validates batch size 4, pushes level $L$ with $B{=}4$, wraps the \texttt{[4,3]} tensor into a batched \texttt{[3]} with \texttt{bdim=0, level=L}.
-\item \texttt{x*2} is \texttt{mul.Scalar} with one batched operand: \texttt{batch\_mul\_scalar} unwraps to physical \texttt{[4,3]}, calls \texttt{mul.Scalar} on it (one kernel), rewraps at 0 $\to$ batched \texttt{[3]} at dim~0.
-\item \texttt{sum} is \texttt{sum.dim\_IntList}: \texttt{batch\_sum} unwraps, calls \texttt{sum} over the non-batch dims on the physical \texttt{[4,3]}, gets \texttt{[4]}, rewraps at 0 $\to$ batched \texttt{[]} (scalar per sample) with logical shape \texttt{[4]} after output \texttt{movedim}.
-\item Pop $L$, move batch dim to \texttt{out\_dims=0} (already there), return \texttt{[4]}.
+\item \texttt{vmap\_impl} 验证批量大小 4，使用 $B{=}4$ 推送级别 $L$，使用 \texttt{bdim=0, level=L} 将 \texttt{[4,3]} 张量包装到批处理的 \texttt{[3]} 中。
+\item \texttt{x*2} 是 \texttt{mul.Scalar}，带有一个批处理操作数：\texttt{batch\_mul\_scalar} 解包到物理 \texttt{[4,3]}，在其上调用 \texttt{mul.Scalar}（一个内核），在 0 $\to$ 批处理 \texttt{[3]} 处重新包装到 dim~0。
+\item \texttt{sum} 是 \texttt{sum.dim\_IntList}：\texttt{batch\_sum} 展开，在物理 \texttt{[4,3]} 上的非批量调暗上调用 \texttt{sum}，获取 \texttt{[4]}，在 0 $\to$ 批处理 \texttt{[]}（每个样本的标量）处重新包装，在输出 \texttt{movedim} 后具有逻辑形状 \texttt{[4]}。
+\item 弹出$L$，将批处理维移动到\texttt{out\_dims=0}（已经在那里），返回\texttt{[4]}。
 \end{enumerate}
 
-Cost: each op pays one \texttt{unwrap\_at\_level} + one \texttt{make\_batched} + one underlying kernel. No per-sample Python loop, no extra allocations beyond the wrapper \texttt{TensorImpl} (a few dozen bytes). For a batch of $B$ samples, $N$ ops launch $N$ kernels rather than $N{\times}B$. Chunked vmap (\texttt{chunk\_size}) trades this back for bounded memory by splitting $B$ into pieces and concatenating results.
+成本：每个操作支付 1 个 \texttt{unwrap\_at\_level} + 1 个 \texttt{make\_batched} + 1 个底层内核。没有每个样本的 Python 循环，没有超出包装器 \texttt{TensorImpl}（几十个字节）的额外分配。对于一批 $B$ 样本，$N$ 操作启动 $N$ 内核而不是 $N{\times}B$。分块 vmap (\texttt{chunk\_size}) 通过将 $B$ 分割成多个片段并连接结果来将其换回有限内存。
 
 \begin{tpinsight}[Insight: One Physical Kernel per Op, Not per Sample]
-The batched-key design converts a \emph{multiplication} into a \emph{constant}: the naive implementation of \texttt{vmap(f)(xs)} with batch size $B$ launches $N{\times}B$ kernels for an $N$-op function; the transform key at offset~9 launches exactly $N$. The trick is that the batched rule \emph{moves the batch dimension into the tensor} before the kernel runs: \texttt{batch\_mul\_scalar} unwraps the logical \texttt{[3]} with \texttt{bdim=0} to the physical \texttt{[4,3]}, so the ordinary \texttt{mul} kernel's own broadcast machinery handles all $B$ samples in one launch. Vmap is thus a \emph{dispatch-layer rewrite}, not a kernel-layer rewrite---which is also why it lives in a library (\texttt{p10}'s transform stack) that never needs to know how any individual kernel is implemented.
+批量密钥设计将 \emph{multiplication} 转换为 \emph{constant}：批量大小为 $B$ 的 \texttt{vmap(f)(xs)} 的简单实现为 $N$-op 函数启动 $N{\times}B$ 内核；偏移量~9 处的变换键恰好启动 $N$。诀窍在于，批处理规则 \emph{moves the batch dimension into the tensor} 在内核运行之前： \texttt{batch\_mul\_scalar} 将逻辑 \texttt{[3]} 与 \texttt{bdim=0} 解包到物理 \texttt{[4,3]}，因此普通 \texttt{mul} 内核自己的广播机制可以在一次启动中处理所有 $B$ 样本。因此，Vmap 是一个 \emph{dispatch-layer rewrite}，而不是内核层重写——这也是它存在于一个库（\texttt{p10} 的转换堆栈）中的原因，该库永远不需要知道任何单个内核是如何实现的。
 \end{tpinsight}
 
-\subsection{Design Trade-offs}
-\label{sec:vmap:tradeoffs}
-
-\textbf{Wrapper \texttt{TensorImpl} vs.\ a batched tensor dtype.} A dedicated ``batched'' tensor kind (new dtype or layout) would make batched state explicit in the type system. Rejected: every kernel and every serialization path would need a branch for the new kind, and interop with third-party code would break the dtype check. The wrapper \texttt{TensorImpl} at (\texttt{transform\_value\_}) is invisible to everything except the dispatch layer that knows to unwrap it.
-
-\textbf{Per-op hand-written batching rules vs.\ a generic fallback only.} Relying solely on the loop fallback (\texttt{BatchingKernels.cpp} default rule) would remove $\sim$60 hand-written rules. Rejected: the fallback re-enters dispatch per sample, reintroducing the $N{\times}B$ kernel count that vmap exists to eliminate. The hand-written rules are each a few lines that mostly reorder a dimension and call the underlying op once (\S\ref{sec:vmap} rule templates).
-
-\textbf{Randomness: same values vs.\ error.} Making batched randomness error out would be the simplest sound semantics. Rejected as too strict: reproducible same-value batching (\texttt{expand\_same\_random} at) and a \texttt{Different} mode that loops $B$ times cover both experimental needs, with the choice explicit in the Python signature (\S\ref{sec:vmap} Randomness Handling). The trade is documented complexity in one family of ops instead of a usability cliff.
 

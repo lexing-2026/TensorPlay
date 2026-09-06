@@ -3,7 +3,6 @@
 #include "Blocks.h"
 #include "Common.h"
 #include "Convert.h"
-#include "Factory.h"
 
 #include <Utils.h>
 
@@ -15,10 +14,12 @@ namespace ops {
 
 namespace {
 
-void validate_float_operand(const Tensor& t, const char* name) {
+void validate_operand(const Tensor& t, const char* name) {
   TP_CHECK(
-      t.dtype() == DType::Float32,
-      std::string("Vulkan ") + name + " supports Float32 tensors only");
+      t.dtype() == DType::Float32 || t.dtype() == DType::Int32 ||
+          t.dtype() == DType::Int8 || t.dtype() == DType::UInt8 ||
+          t.dtype() == DType::Bool,
+      std::string("Vulkan ") + name + " has an unsupported dtype");
   TP_CHECK(
       t.dim() <= 4,
       std::string("Vulkan ") + name + " supports up to 4d tensors");
@@ -30,20 +31,25 @@ struct CompareBlock final {
   int fill;
 };
 
-// Elementwise comparison driver.  Both operands are already shaped (the
-// scalar variants fold into full tensors in the public kernels).
+// Elementwise comparison driver for equal-shaped tensor operands.
 Tensor compare_impl(
     const Tensor& self,
     const Tensor& other,
     const char* kernel_name,
     const char* name) {
-  validate_float_operand(self, name);
-  validate_float_operand(other, name);
+  validate_operand(self, name);
+  validate_operand(other, name);
   TP_CHECK(
       self.shape() == other.shape(),
       std::string("Vulkan ") + name +
           " requires equal-shaped operands (broadcast at the caller)");
 
+  TP_CHECK(self.dtype() == other.dtype(),
+           "Vulkan comparison requires matching operand dtypes");
+  const char* suffix = self.dtype() == DType::Int32 ? "_i32"
+      : self.dtype() == DType::UInt8 ? "_u8"
+      : self.dtype() == DType::Bool || self.dtype() == DType::Int8 ? "_i8" : "";
+  const std::string shader_name = std::string(kernel_name) + suffix;
   api::Context* const context = api::context();
 
   api::vTensor v_input = convert(self);
@@ -60,7 +66,7 @@ Tensor compare_impl(
   api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(
-      VK_KERNEL_FROM_STR(kernel_name), pipeline_barrier, v_output.extents(),
+      VK_KERNEL_FROM_STR(shader_name.c_str()), pipeline_barrier, v_output.extents(),
       adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
       v_output.image(
           pipeline_barrier,
@@ -73,232 +79,75 @@ Tensor compare_impl(
   return convert(v_output);
 }
 
-Tensor fold_scalar(const Tensor& self, Scalar other) {
-  return full_kernel(
-      static_cast<std::vector<int64_t>>(self.shape()),
-      other,
-      DType::Float32,
-      self.device(),
-      false);
-}
-
-//
-// The comparison shaders read float planes only.  Integer and boolean
-// payloads compare on the host over a staged copy: the values stream out,
-// the fold runs per element, and the Bool mask uploads.  The result is
-// device-agnostic in value order and answers the same Bool mask the
-// shaders produce.
-//
-template <typename T, typename Pred>
-Tensor compare_host(const Tensor& self, const Tensor& other, Pred pred) {
-  const Tensor a = self.to(Device(DeviceType::CPU)).contiguous();
-  const Tensor b = other.to(Device(DeviceType::CPU)).contiguous();
-  const int64_t n = a.numel();
-  Tensor out = Tensor::empty(
-      static_cast<std::vector<int64_t>>(a.shape()), DType::Bool,
-      Device(DeviceType::CPU));
-  const T* lhs = static_cast<const T*>(a.impl()->storage().data());
-  const T* rhs = static_cast<const T*>(b.impl()->storage().data());
-  bool* mask = static_cast<bool*>(out.impl()->storage().data());
-  for (int64_t i = 0; i < n; ++i) {
-    mask[i] = pred(lhs[i], rhs[i]);
-  }
-  return out.to(self.device());
-}
-
-const char* validate_compare_pair(const Tensor& self, const Tensor& other) {
-  if (self.dtype() != DType::Float32 || other.dtype() != DType::Float32) {
-    TP_CHECK(
-        self.dtype() == other.dtype(),
-        "Vulkan comparison: mixed non-float operand dtypes require Float32");
-    return self.dtype() == DType::Int32   ? "i"
-           : self.dtype() == DType::Bool  ? "b"
-           : self.dtype() == DType::Int8  ? "c"
-           : self.dtype() == DType::UInt8 ? "C"
-                                          : "";
-  }
-  return nullptr;
+Tensor compare_scalar(const Tensor& self, Scalar other, const char* name) {
+  validate_operand(self, name);
+  const char* suffix = self.dtype() == DType::Float32 ? "" :
+      self.dtype() == DType::UInt8 ? "_u8" : "_i32";
+  const std::string shader = std::string(name) + "_scalar" + suffix;
+  api::Context* context = api::context();
+  api::vTensor input = convert(self);
+  api::vTensor output{context, input.sizes(), DType::Bool};
+  const struct Block final {
+    float value_float;
+    int32_t value_int;
+    uint32_t value_uint;
+    int32_t fill;
+  } block{self.dtype() == DType::Float32 ? other.to<float>() : 0.0f,
+          self.dtype() != DType::Float32 && self.dtype() != DType::UInt8 ?
+              other.to<int32_t>() : 0,
+          self.dtype() == DType::UInt8 ? other.to<uint32_t>() : 0u, 0};
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier barrier{};
+  context->submit_compute_job(
+      VK_KERNEL_FROM_STR(shader.c_str()), barrier, output.extents(),
+      adaptive_work_group_size(output.extents()), VK_NULL_HANDLE,
+      output.image(barrier, api::PipelineStage::COMPUTE, api::MemoryAccessType::WRITE),
+      input.image(barrier, api::PipelineStage::COMPUTE), params.buffer());
+  return convert(output);
 }
 
 } // namespace
 
 Tensor eq_tensor_kernel(const Tensor& self, const Tensor& other) {
-  if (const char* tag = validate_compare_pair(self, other)) {
-    if (tag[0] == 'i') {
-      return compare_host<int32_t>(self, other,
-                                   [](int32_t x, int32_t y) { return x == y; });
-    }
-    if (tag[0] == 'b') {
-      return compare_host<bool>(self, other,
-                                [](bool x, bool y) { return x == y; });
-    }
-    if (tag[0] == 'c') {
-      return compare_host<int8_t>(self, other,
-                                  [](int8_t x, int8_t y) { return x == y; });
-    }
-    if (tag[0] == 'C') {
-      return compare_host<uint8_t>(self, other,
-                                   [](uint8_t x, uint8_t y) { return x == y; });
-    }
-  }
   return compare_impl(self, other, "eq", "eq");
 }
-Tensor ne_tensor_kernel(const Tensor& self, const Tensor& other) {
-  if (const char* tag = validate_compare_pair(self, other)) {
-    if (tag[0] == 'i') {
-      return compare_host<int32_t>(self, other,
-                                   [](int32_t x, int32_t y) { return x != y; });
-    }
-    if (tag[0] == 'b') {
-      return compare_host<bool>(self, other,
-                                [](bool x, bool y) { return x != y; });
-    }
-    if (tag[0] == 'c') {
-      return compare_host<int8_t>(self, other,
-                                  [](int8_t x, int8_t y) { return x != y; });
-    }
-    if (tag[0] == 'C') {
-      return compare_host<uint8_t>(self, other,
-                                   [](uint8_t x, uint8_t y) { return x != y; });
-    }
-  }
-  return compare_impl(self, other, "ne", "ne");
-}
-Tensor lt_tensor_kernel(const Tensor& self, const Tensor& other) {
-  if (const char* tag = validate_compare_pair(self, other)) {
-    if (tag[0] == 'i') {
-      return compare_host<int32_t>(self, other,
-                                   [](int32_t x, int32_t y) { return x < y; });
-    }
-    if (tag[0] == 'c') {
-      return compare_host<int8_t>(self, other,
-                                  [](int8_t x, int8_t y) { return x < y; });
-    }
-    if (tag[0] == 'C') {
-      return compare_host<uint8_t>(self, other,
-                                   [](uint8_t x, uint8_t y) { return x < y; });
-    }
-    if (tag[0] == 'b') {
-      return compare_host<bool>(self, other,
-                                [](bool x, bool y) { return x < y; });
-    }
-  }
-  return compare_impl(self, other, "lt", "lt");
-}
-Tensor le_tensor_kernel(const Tensor& self, const Tensor& other) {
-  if (const char* tag = validate_compare_pair(self, other)) {
-    if (tag[0] == 'i') {
-      return compare_host<int32_t>(self, other,
-                                   [](int32_t x, int32_t y) { return x <= y; });
-    }
-    if (tag[0] == 'c') {
-      return compare_host<int8_t>(self, other,
-                                  [](int8_t x, int8_t y) { return x <= y; });
-    }
-    if (tag[0] == 'C') {
-      return compare_host<uint8_t>(self, other,
-                                   [](uint8_t x, uint8_t y) { return x <= y; });
-    }
-    if (tag[0] == 'b') {
-      return compare_host<bool>(self, other,
-                                [](bool x, bool y) { return x <= y; });
-    }
-  }
-  return compare_impl(self, other, "le", "le");
-}
-Tensor gt_tensor_kernel(const Tensor& self, const Tensor& other) {
-  if (const char* tag = validate_compare_pair(self, other)) {
-    if (tag[0] == 'i') {
-      return compare_host<int32_t>(self, other,
-                                   [](int32_t x, int32_t y) { return x > y; });
-    }
-    if (tag[0] == 'c') {
-      return compare_host<int8_t>(self, other,
-                                  [](int8_t x, int8_t y) { return x > y; });
-    }
-    if (tag[0] == 'C') {
-      return compare_host<uint8_t>(self, other,
-                                   [](uint8_t x, uint8_t y) { return x > y; });
-    }
-    if (tag[0] == 'b') {
-      return compare_host<bool>(self, other,
-                                [](bool x, bool y) { return x > y; });
-    }
-  }
-  return compare_impl(self, other, "gt", "gt");
-}
-Tensor ge_tensor_kernel(const Tensor& self, const Tensor& other) {
-  if (const char* tag = validate_compare_pair(self, other)) {
-    if (tag[0] == 'i') {
-      return compare_host<int32_t>(self, other,
-                                   [](int32_t x, int32_t y) { return x >= y; });
-    }
-    if (tag[0] == 'c') {
-      return compare_host<int8_t>(self, other,
-                                  [](int8_t x, int8_t y) { return x >= y; });
-    }
-    if (tag[0] == 'C') {
-      return compare_host<uint8_t>(self, other,
-                                   [](uint8_t x, uint8_t y) { return x >= y; });
-    }
-    if (tag[0] == 'b') {
-      return compare_host<bool>(self, other,
-                                [](bool x, bool y) { return x >= y; });
-    }
-  }
-  return compare_impl(self, other, "ge", "ge");
+Tensor eq_scalar_kernel(const Tensor& self, Scalar other) {
+  return compare_scalar(self, other, "eq");
 }
 
-// Scalar comparisons follow the weak-scalar rule the CPU kernels apply:
-// the scalar folds into the self dtype (never widening an Int32 tensor to
-// Float32), so the tensor form sees one dtype on both sides.
-Tensor eq_scalar_kernel(const Tensor& self, Scalar other) {
-  if (self.dtype() != DType::Float32) {
-    return eq_tensor_kernel(
-        self, full_kernel({}, other, self.dtype(), self.device(), false)
-                  .expand(static_cast<std::vector<int64_t>>(self.shape())));
-  }
-  return eq_tensor_kernel(self, fold_scalar(self, other));
+Tensor ne_tensor_kernel(const Tensor& self, const Tensor& other) {
+  return compare_impl(self, other, "ne", "ne");
 }
 Tensor ne_scalar_kernel(const Tensor& self, Scalar other) {
-  if (self.dtype() != DType::Float32) {
-    return ne_tensor_kernel(
-        self, full_kernel({}, other, self.dtype(), self.device(), false)
-                  .expand(static_cast<std::vector<int64_t>>(self.shape())));
-  }
-  return ne_tensor_kernel(self, fold_scalar(self, other));
+  return compare_scalar(self, other, "ne");
+}
+
+Tensor lt_tensor_kernel(const Tensor& self, const Tensor& other) {
+  return compare_impl(self, other, "lt", "lt");
 }
 Tensor lt_scalar_kernel(const Tensor& self, Scalar other) {
-  if (self.dtype() != DType::Float32) {
-    return lt_tensor_kernel(
-        self, full_kernel({}, other, self.dtype(), self.device(), false)
-                  .expand(static_cast<std::vector<int64_t>>(self.shape())));
-  }
-  return lt_tensor_kernel(self, fold_scalar(self, other));
+  return compare_scalar(self, other, "lt");
+}
+
+Tensor le_tensor_kernel(const Tensor& self, const Tensor& other) {
+  return compare_impl(self, other, "le", "le");
 }
 Tensor le_scalar_kernel(const Tensor& self, Scalar other) {
-  if (self.dtype() != DType::Float32) {
-    return le_tensor_kernel(
-        self, full_kernel({}, other, self.dtype(), self.device(), false)
-                  .expand(static_cast<std::vector<int64_t>>(self.shape())));
-  }
-  return le_tensor_kernel(self, fold_scalar(self, other));
+  return compare_scalar(self, other, "le");
+}
+
+Tensor gt_tensor_kernel(const Tensor& self, const Tensor& other) {
+  return compare_impl(self, other, "gt", "gt");
 }
 Tensor gt_scalar_kernel(const Tensor& self, Scalar other) {
-  if (self.dtype() != DType::Float32) {
-    return gt_tensor_kernel(
-        self, full_kernel({}, other, self.dtype(), self.device(), false)
-                  .expand(static_cast<std::vector<int64_t>>(self.shape())));
-  }
-  return gt_tensor_kernel(self, fold_scalar(self, other));
+  return compare_scalar(self, other, "gt");
+}
+
+Tensor ge_tensor_kernel(const Tensor& self, const Tensor& other) {
+  return compare_impl(self, other, "ge", "ge");
 }
 Tensor ge_scalar_kernel(const Tensor& self, Scalar other) {
-  if (self.dtype() != DType::Float32) {
-    return ge_tensor_kernel(
-        self, full_kernel({}, other, self.dtype(), self.device(), false)
-                  .expand(static_cast<std::vector<int64_t>>(self.shape())));
-  }
-  return ge_tensor_kernel(self, fold_scalar(self, other));
+  return compare_scalar(self, other, "ge");
 }
 
 } // namespace ops

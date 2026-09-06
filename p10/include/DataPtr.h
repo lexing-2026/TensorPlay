@@ -6,7 +6,7 @@
 
 namespace tensorplay {
 
-// A Deleter function type: plain function pointer (mirrors c10::DeleterFnPtr).
+// A Deleter function type: plain function pointer.
 // Unlike std::function this is trivially copyable, comparable, and never
 // allocates. Stateful deleters carry their state through `ctx` instead of a
 // capturing lambda.
@@ -22,7 +22,7 @@ inline void deleteCPP(void* data) {
 
 // DataPtr is a move-only smart pointer that manages a pointer to data and its
 // deleter. It is similar to std::unique_ptr but with a type-erased deleter and
-// context, mirroring c10::DataPtr / c10::UniqueVoidPtr: `deleter_` is invoked
+// context: `deleter_` is invoked
 // with `ctx_` (not `data_`) which allows the deleter to be a capture-less
 // function pointer while still carrying arbitrary state (e.g. an allocator
 // block or an owned PyObject*).
@@ -92,7 +92,7 @@ public:
         return data_;
     }
 
-    // The context passed to the deleter (mirrors c10::DataPtr::get_context()).
+    // The context passed to the deleter.
     void* get_context() const { return ctx_; }
 
     DeleterFnPtr get_deleter() const { return deleter_; }

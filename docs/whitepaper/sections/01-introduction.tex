@@ -1,229 +1,220 @@
 % 01-introduction.tex
-\section{Introduction}
+\section{引言}
 \label{sec:intro}
 
-TensorPlay is a readability-first implementation of a dense tensor core, in approximately 75\,k lines of C++ (plus generated bindings) and several hundred Python modules under
-. The build produces four shared libraries \texttt{p10}, \texttt{tpx}, \texttt{stax}, \texttt{tp\_python} and one extension \texttt{\_C}
- whose \texttt{OUTPUT\_DIRECTORY} is pinned by to \texttt{TP\_PACKAGE\_DIR=tensorplay}
-. Throughout the paper, every mechanism is cited as \texttt{path:line} so that the text and the source stay one jump apart.
+TensorPlay 是密集张量核心的可读性优先实现，包含 C++ 核心（加上生成的绑定）和数百个 Python 模块
+。该构建生成四个共享库 \texttt{p10}、\texttt{tpx}、\texttt{stax}、\texttt{tp\_python} 和一个扩展 \texttt{\_C}
+ 其 \texttt{OUTPUT\_DIRECTORY} 被固定到 \texttt{TP\_PACKAGE\_DIR=tensorplay}
+。
 
-\subsection{Problem: Readability vs.\ Performance}
+\subsection{问题：可读性与性能}
 \label{sec:intro:problem}
 
-Mainstream frameworks co-locate tensor storage, operator dispatch, automatic differentiation (\ac{ad}), compilation, and distribution in one translation unit. The result is maximal visibility for
-the optimizer: a single \texttt{LTO} step can inline storage access into the kernel loop. The cost is cognitive and incremental-build overhead. Understanding how a tensor is stored
-requires traversing an inheritance chain (\texttt{Tensor} $\rightarrow$ \texttt{Variable} $\rightarrow$ storage) and the associated intrusive reference counting; modifying a CPU kernel
-for \texttt{add} triggers a rebuild of the entire operator aggregation target; implicit header inclusion creates de~facto circular dependencies between core and operator layers
-that static analysis cannot recover without building the graph first.
+主流框架将张量存储、算子调度、自动微分 (\ac{ad})、编译和分发集中在一个翻译单元中。结果是最大可见度
+优化器：单个 \texttt{LTO} 步骤可以将存储访问内联到内核循环中。成本是认知和增量构建开销。了解张量的存储方式
+需要遍历继承链（\texttt{Tensor} $\rightarrow$ \texttt{Variable} $\rightarrow$ 存储）和相关的侵入式引用计数；修改CPU内核
+for \texttt{add} 触发整个算子聚合目标的重建；隐式标头包含在核心层和操作层之间创建了事实上的循环依赖关系
+如果不首先构建图表，静态分析就无法恢复。
 
-TensorPlay inverts the trade-off explicitly. It optimizes for \emph{readability}: a newcomer can understand tensor storage by reading only \texttt{p10}
- without loading any differentiation concept; an optimizer for
-\texttt{add} rebuilds only the tensor library (one build target, one relink); a compiler experiment lives inside \texttt{stax}
-without relinking storage.
-The price is an explicit cross-library boundary per call. Concretely, one \texttt{atomic<void*>} acquire load, one virtual dispatch, and no \ac{lto} whole-program inlining across the four pillars.
-In short, calls must serialize across the boundary, but the gains in readability and incremental build are larger than the cost.
-The project accepts this cost because the target workloads are teaching, correctness inspection, and hardware experimentation---not peak FLOPS on a frozen kernel set.
+TensorPlay 明确地反转了这种权衡。它针对 \emph{readability} 进行了优化：新手可以通过仅读取 \texttt{p10} 来理解张量存储
+ 不加载任何差异化概念；一个优化器
+\texttt{add} 仅重建张量库（一个构建目标，一个重新链接）；编译器实验位于 \texttt{stax} 内部
+无需重新链接存储。
+价格是每次调用的明确跨库边界。具体来说，一个 \texttt{atomic<void*>} 获取负载，一个虚拟调度，并且没有 \ac{lto} 跨四个支柱的整个程序内联。
+简而言之，调用必须跨边界序列化，但可读性和增量构建的收益大于成本。
+该项目接受此成本是因为目标工作负载是教学、正确性检查和硬件实验，而不是冻结内核集上的峰值 FLOPS。
 
-Concretely, the boundary is enforced at link time, not by convention. The base library declares a pure interface (\texttt{requires\_grad}, \texttt{grad}, \texttt{set\_grad}); the tensor implementation holds \texttt{shared\_ptr<AutogradMetaBase> autograd\_meta\_} that is deliberately omitted from the copy constructor, so \texttt{Tensor b=a} shares storage, sizes, strides, device, dtype and version counter but not history. The autograd library supplies the concrete plug (\texttt{grad\_fn\_}, \texttt{grad\_accumulator\_} as \texttt{weak\_ptr<Node>} to avoid cycles, view replay state); one boundary file performs the single \texttt{static\_cast<AutogradMeta*>} handshake. Because no header in the base pillar sees the autograd pillar, adding that include inside the tensor pillar fails with \texttt{undefined reference} the link step.
+具体来说，边界是在链接时强制执行的，而不是按照惯例。基础库声明一个纯接口（\texttt{requires\_grad}、\texttt{grad}、\texttt{set\_grad}）；张量实现保留从复制构造函数中故意省略的 \texttt{shared\_ptr<AutogradMetaBase> autograd\_meta\_} ，因此 \texttt{Tensor b=a} 共享存储、大小、步幅、设备、数据类型和版本计数器，但不共享历史记录。 autograd库提供了具体的插件（\texttt{grad\_fn\_}、\texttt{grad\_accumulator\_}如\texttt{weak\_ptr<Node>}以避免循环，查看重播状态）；一个边界文件执行单次 \texttt{static\_cast<AutogradMeta*>} 握手。由于基础支柱中没有标头可以看到 autograd 支柱，因此在张量支柱内添加 include 会失败，并出现 \texttt{undefined reference} 链接步骤。
 
-Build granularity follows the same axiom. The build script adds the four pillars in dependency order---tensor core, autograd, compiler---and each links downward only. Touching a CPU kernel file dirties exactly \texttt{libp10.so} and the final \texttt{\_C} link; touching the engine file rebuilds \texttt{libtpx.so} plus \texttt{libstax.so} and \texttt{\_C} but not \texttt{libp10.so}. Each library locates its siblings through an \texttt{RPATH} of \texttt{\$ORIGIN} (the extension uses \texttt{\$ORIGIN/../lib}). On Windows the same invariant is preserved by an ordered \texttt{LoadLibraryExW} preload walk.
+构建粒度遵循相同的公理。构建脚本按依赖顺序添加了四个支柱——张量核心、autograd、编译器——并且每个支柱仅向下链接。接触 CPU 内核文件会弄脏 \texttt{libp10.so} 和最后的 \texttt{\_C} 链接；触摸引擎文件会重建 \texttt{libtpx.so} 加 \texttt{libstax.so} 和 \texttt{\_C} 但不会重建 \texttt{libp10.so}。每个库通过 \texttt{RPATH} 或 \texttt{\$ORIGIN/../lib} 来定位其兄弟库。在 Windows 上，通过有序的 \texttt{LoadLibraryExW} 预加载遍历保留了相同的不变量。
 
-\subsection{Contributions}
+\subsection{核心机制导览}
 \label{sec:intro:contributions}
 
-This paper makes four concrete contributions beyond high-level architecture sketches. Each is a mechanism with a working implementation, not a design note.
-Table~\ref{tab:intro:contrib} is the index; \S\ref{sec:intro:c1}--\S\ref{sec:intro:c4} expand each row.
+白皮书的主体是四个核心机制的实现剖析。
+Table~\ref{tab:intro:contrib} 是索引； \S\ref{sec:intro:c1}--\S\ref{sec:intro:c4} 展开每一行。
 
 \begin{table}[H]
 \centering
-\caption{Four concrete contributions. Every entry cites the line that implements the mechanism, not a design note.}
+\caption{四个核心机制。每个条目都引用了实现该机制的行。}
 \label{tab:intro:contrib}
 \small
 \begin{tabular}{p{0.6cm}p{2.6cm}p{4.0cm}p{4.6cm}}
 \toprule
-\# & Mechanism & Primary \texttt{path:line} & Paper section \\
+\# & 机制 & 主要 \texttt{path:line} & 详解章节 \\
 \midrule
-C1 & Four-pillar acyclic graph &, &
-\S\ref{sec:arch} \\
-C2 & 13-slot redispatch + registration &,
-\texttt{CPythonBridge.cpp} & \S\ref{sec:redispatch} \\
-C3 & Explicit DAG without Tape & \texttt{Node.h}, \texttt{Engine.h}, \texttt{SavedVariable.h}, &
-\S\ref{sec:autograd} \\
-C4 & Vmap at offset~9 + profiler stack & \texttt{DispatchKey.h}, \texttt{Profiler.h} &
-\S\ref{sec:vmap}, \S\ref{sec:profiler} \\
+C1 & 四支柱分解（链接期无环） & \texttt{p10/CMakeLists.txt} & \S\ref{sec:arch} \\
+C2 & 13 槽位重调度 + 静态注册 & \texttt{DispatchKey.h}、\texttt{CPythonBridge.cpp} & \S\ref{sec:redispatch} \\
+C3 & 显式 DAG（无磁带）的自动微分 & \texttt{Node.h}、\texttt{Engine.h}、\texttt{SavedVariable.h} & \S\ref{sec:autograd} \\
+C4 & Vmap（offset 9）+ 剖析栈 & \texttt{DispatchKey.h}、\texttt{Profiler.h} & \S\ref{sec:vmap}、\S\ref{sec:profiler} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsubsection{C1: Four-Pillar Decomposition with Link-Time Acyclicity}
-\label{sec:intro:c1}
+\subsubsection{C1：具有链接时间非循环性的四支柱分解}\label{sec:intro:c1}
 
-The framework is partitioned into \texttt{p10} (tensor, storage, 300+ kernels, allocators), \texttt{tpx} (explicit DAG, engine, saved variables), \texttt{stax} (minimal \texttt{Graph} IR with a single \texttt{fused\_mul\_add} pass), and the Python extension \texttt{\_C} plus its single-copy bridge library \texttt{tp\_python}. Table~\ref{tab:intro:pillars} repeats the directory $\rightarrow$ artifact contract.
+该框架分为 \texttt{p10}（张量、存储、300 多个内核、分配器）、\texttt{tpx}（显式 DAG、引擎、保存的变量）、\texttt{stax}（具有单个 \texttt{fused\_mul\_add} 通道的最小 \texttt{Graph} IR）和 Python 扩展 \texttt{\_C} 及其单副本桥库 \texttt{tp\_python}。表~\ref{tab:intro:pillars} 给出目录 $\rightarrow$ 产物合约。
 \begin{table}[H]
 \centering
-\caption{Directory $\rightarrow$ CMake target $\rightarrow$ artifact, with link dependencies (downward only).}
+\caption{目录 $\rightarrow$ CMake 目标 $\rightarrow$ 工件，具有链接依赖项（仅向下）。}
 \label{tab:intro:pillars}
 \small
 \begin{tabular}{p{2.0cm}p{1.4cm}p{3.6cm}p{4.8cm}}
 \toprule
-Directory & Target & Artifact & Link deps \\
+目录 & 目标 & 产物 & 链接依赖 \\
 \midrule
 core & \texttt{p10} & \texttt{libp10.so} & \texttt{Threads}, \texttt{COMPUTE\_LIBS} \\
-autograd & \texttt{tpx} & \texttt{libtpx.so} & \texttt{p10} \\
-compiler & \texttt{stax} & \texttt{libstax.so} & \texttt{p10}, \texttt{tpx} \\
-bridge & \texttt{tp\_python} & \texttt{libtp\_python.so} & \texttt{p10}, \texttt{pybind11} \\
-extension & \texttt{\_C} & \texttt{\_\_init\_\_.so} & \texttt{p10}, \texttt{tpx}, \texttt{stax}, \texttt{tp\_python} \\
+自动微分 & \texttt{tpx} & \texttt{libtpx.so} & \texttt{p10} \\
+编译器 & \texttt{stax} & \texttt{libstax.so} & \texttt{p10}, \texttt{tpx} \\
+桥 & \texttt{tp\_python} & \texttt{libtp\_python.so} & \texttt{p10}, \texttt{pybind11} \\
+扩展 & \texttt{\_C} & \texttt{\_\_init\_\_.so} & \texttt{p10}, \texttt{tpx}, \texttt{stax}, \texttt{tp\_python} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Axiom: $\forall (a,b)\in D$, \texttt{level}(a)$>$\texttt{level}(b) with \texttt{level}(p10)=0, \texttt{level}(tpx)=1, \texttt{level}(stax)=2, \texttt{level}(\_C)=3 and
-\texttt{level}(tp\_python)=3. The enforcements are (i) directory isolation, (ii) \texttt{target\_link\_libraries} edges that point only downward, and (iii) header visibility: no
-\texttt{*.h} includes \texttt{tpx}. The recorded move at records that concrete
-metadata once lived in \texttt{p10} and was vacated to preserve the axiom. The Windows static branch at embeds the pillars into \texttt{\_C.pyd} to
-avoid \texttt{\_\_declspec(dllexport)} on every p10 symbol while keeping visibility identical.
+公理：$\forall (a,b)\in D$、\texttt{level}(a)$>$\texttt{level}(b)，其中 \texttt{level}(p10)=0、\texttt{level}(tpx)=1、\texttt{level}(stax)=2、\texttt{level}(\_C)=3 和
+\texttt{level}(tp\_python)=3。强制措施包括 (i) 目录隔离，(ii) 仅向下指向的 \texttt{target\_link\_libraries} 边缘，以及 (iii) 标头可见性：否
+\texttt{*.h} 包括 \texttt{tpx}。记录的移动记录具体
+元数据曾经存在于 \texttt{p10} 中，并被腾出以保留公理。 Windows 静态分支将支柱嵌入到 \texttt{\_C.pyd} 中
+避免在每个 p10 符号上使用 \texttt{\_\_declspec(dllexport)}，同时保持可见性相同。
 
-\subsubsection{C2: Redispatch and Static Registration}
+\subsubsection{C2：重新调度和静态注册}
 \label{sec:intro:c2}
 
- encodes 13 keys: \texttt{CPU}=0, \texttt{CUDA}=1, \texttt{Vulkan}=2, \texttt{AutogradCPU}=3--5, \texttt{AutocastCPU}=6--8,
-\texttt{VmapCPU}=9--11, \texttt{Composite}=12, \texttt{EndOfKeys}=13. Offsets \texttt{kAutogradKeyOffset}=3, \texttt{kAutocastKeyOffset}=6, \texttt{kVmapKeyOffset}=9
- make priority arithmetic. \texttt{DispatchKeySet} is a \texttt{uint32\_t} bitset whose \texttt{highest\_priority\_key}
-at scans the most-significant set bit so numerically larger keys win; \texttt{TensorImpl::key\_set} at computes the
-set from device and \texttt{inference\_tensor\_} without storing it.
+编码 13 个键：\texttt{CPU}=0、\texttt{CUDA}=1、\texttt{Vulkan}=2、\texttt{AutogradCPU}=3--5、\texttt{AutocastCPU}=6--8、
+\texttt{VmapCPU}=9--11，\texttt{Composite}=12，\texttt{EndOfKeys}=13。偏移量 \texttt{kAutogradKeyOffset}=3、\texttt{kAutocastKeyOffset}=6、\texttt{kVmapKeyOffset}=9
+ 进行优先级算术。 \texttt{DispatchKeySet} 是一个 \texttt{uint32\_t} 位集，其 \texttt{highest\_priority\_key}
+at 扫描最高有效的设置位，因此数字较大的键获胜； \texttt{TensorImpl::key\_set} at 计算
+从设备和 \texttt{inference\_tensor\_} 设置而不存储它。
 
- stores \texttt{array<atomic<KernelFunction>,13>} per operator; \texttt{OperatorHandle::getKernel} at does one
-\texttt{acquire} load and, only for \texttt{is\_backend\_key} (0--2), a second load at \texttt{Composite} index~12. \texttt{DispatchStub::call} is the
-single choke point that enforces the autocast contract \texttt{is\_autocast\_key(k) \&\& !is\_enabled(k) $\rightarrow$ throw} with \texttt{[[unlikely]]} and emits a 32-frame
-\texttt{backtrace} when \texttt{TP\_TRACE\_KERNEL\_MISS} is set. Registration is bulk: \texttt{TENSORPLAY\_LIBRARY\_IMPL(KEY, NAME)} uses two-level
-\texttt{TP\_CONCAT} at to produce hygienic unique statics; \texttt{Library::impl} at chains calls. The deprecated per-op
-\texttt{TENSORPLAY\_REGISTER\_KERNEL} is retained as a legacy registration path.
+每个操作员存储 \texttt{array<atomic<KernelFunction>,13>}； \texttt{OperatorHandle::getKernel} 在做一
+\texttt{acquire} 加载，并且仅适用于 \texttt{is\_backend\_key} (0--2)，在 \texttt{Composite} 索引~12 处进行第二次加载。 \texttt{DispatchStub::call} 是
+强制自动转换合约 \texttt{is\_autocast\_key(k) \&\& !is\_enabled(k) -> throw} 与 \texttt{[[unlikely]]} 的单一阻塞点并发出 32 帧
+当设置 \texttt{TP\_TRACE\_KERNEL\_MISS} 时，为 \texttt{backtrace}。注册是批量的：\texttt{TENSORPLAY\_LIBRARY\_IMPL(KEY, NAME)} 使用两级
+\texttt{TP\_CONCAT} at 产生卫生的独特静力学； \texttt{Library::impl} 在连锁电话中。已弃用的每操作
+\texttt{TENSORPLAY\_REGISTER\_KERNEL} 保留为旧注册路径。
 
-Python binding is dual-path and fill-only. The bridge and the generated module together implement parse (
-\texttt{tpx\_py\_parse\_into} via \texttt{memcpy} + linear keyword scan), check (16 kinds + \texttt{TPK\_OPTIONAL}=0x80), subclass/function hooks
-(via \texttt{PythonDispatchTLS}), unpack (fast \texttt{instance} holder), and wrap (
-\texttt{g\_wrap\_cache} with capsule destructor). The codegen emits \texttt{generated\_functions[]} and
-\texttt{register\_generated\_cpython\_functions} that never shadows a \texttt{pybind11} name (checked by \texttt{PyObject\_HasAttrString}).
-It installs the generated table last behind \texttt{TP\_NO\_FASTCALL}; the bridge keeps a single \texttt{tp\_python} so the caster registry and wrap cache are not duplicated
-per extension.
+Python 绑定是双路径且仅填充的。桥接器和生成的模块一起实现解析（
+\texttt{tpx\_py\_parse\_into} 通过 \texttt{memcpy} + 线性关键字扫描），检查（16 种 + \texttt{TPK\_OPTIONAL}=0x80），子类/函数钩子
+（通过 \texttt{PythonDispatchTLS}），打开包装（快速 \texttt{instance} 支架），并包裹（
+\texttt{g\_wrap\_cache} 带胶囊析构函数）。代码生成器发出 \texttt{generated\_functions[]} 和
+\texttt{register\_generated\_cpython\_functions} 永远不会隐藏 \texttt{pybind11} 名称（由 \texttt{PyObject\_HasAttrString} 检查）。
+它将生成的表安装在 \texttt{TP\_NO\_FASTCALL} 后面；桥保留单个 \texttt{tp\_python} 因此施法者注册表和包装缓存不会重复
+每个扩展。
 
-\subsubsection{C3: Autograd}
+\subsubsection{C3：自动微分}
 \label{sec:intro:c3}
 
-There is no \ac{tape}. Each forward op that requires grad allocates a \texttt{Node} subclass (148 types generated from via into \texttt{AutogradNodesGenerated.h}, or a handwritten node in).
-\texttt{next\_edges: vector<Edge>} at points to parents; \texttt{Edge} at carries a \texttt{weak\_ptr<Node>} plus \texttt{output\_nr}.
-\texttt{output\_nr}. The graph is the transitive closure of those edges. \texttt{Node::sequence\_nr} at \texttt{Node.h} is a global monotonic counter from
-\texttt{get\_and\_increment\_sequence\_nr}, used by the engine to prioritize recomputation order deterministically.
+没有\ac{tape}。每个需要 grad 的前向操作都会分配一个 \texttt{Node} 子类（从 via 生成的 148 种类型到 \texttt{AutogradNodesGenerated.h} 中，或者是手写节点中）。
+\texttt{next\_edges: vector<Edge>} 指向父母； \texttt{Edge} at 带有 \texttt{weak\_ptr<Node>} 加上 \texttt{output\_nr}。
+\texttt{output\_nr}。该图是这些边的传递闭包。 \texttt{Node::sequence\_nr} at \texttt{Node.h} 是一个全局单调计数器
+\texttt{get\_and\_increment\_sequence\_nr}，由引擎用来确定重新计算顺序的优先级。
 
-\texttt{GraphTask.h} holds the task launched by \texttt{backward}: \texttt{dependencies\_} in-degree counts, \texttt{captured\_vars}, and the initiating \texttt{GraphRoot}
-synthesized at \texttt{Engine.cpp} only when \texttt{roots.size!=1}. is the per-node accumulator whose \texttt{accumulate} adds
-incoming grads in topological order. defines \texttt{ReadyQueue} as a thread-safe max-heap by \texttt{sequence\_nr} ( \texttt{return
-fn->sequence\_nr < other.fn->sequence\_nr}); dispatches with device-partitioned queues (\texttt{ready\_queues\_},
-\texttt{queue\_for\_device}, \texttt{execute\_task} at) and a \texttt{local\_queue} for reentrancy so that \texttt{Node} implementations
-that call \texttt{backward} recursively do not deadlock the global worker.
+\texttt{GraphTask.h} 持有由 \texttt{backward} 发起的任务：\texttt{dependencies\_} 度数计数、\texttt{captured\_vars} 和发起的 \texttt{GraphRoot}
+仅当 \texttt{roots.size!=1} 时才在 \texttt{Engine.cpp} 合成。是每个节点累加器，其 \texttt{accumulate} 添加
+按拓扑顺序传入的毕业生。通过 \texttt{sequence\_nr} ( \texttt{return
+fn->sequence\_nr < other.fn->sequence\_nr}) 将 \texttt{ReadyQueue} 定义为线程安全的最大堆；使用设备分区队列进行调度（\texttt{ready\_queues\_}，
+\texttt{queue\_for\_device}、\texttt{execute\_task} at) 和 \texttt{local\_queue} 用于重入，以便 \texttt{Node} 实现
+递归调用 \texttt{backward} 不会使全局工作线程陷入僵局。
 
-Versioning is fail-fast, not silent. \texttt{VariableVersion.h} backs \texttt{TensorImpl::version\_counter\_} at with \texttt{bump}
- on every inplace mutation. \texttt{SavedVariable.h} saves \texttt{saved\_version\_}; the unpack checks \texttt{expected==current} and throws
-rather than producing a numerically wrong gradient, which is the single most valuable readability guard in the engine. additionally stores
-\texttt{grad\_accumulator\_} as \texttt{weak\_ptr<Node>} so leaf accumulators do not form uncollectable cycles.
-
-\begin{tpinsight}[Why no Tape?]
-A Wengert-list tape records every primal operation into one contiguous log and replays it in reverse. TensorPlay instead materializes a \emph{node graph}: each differentiable op allocates its own \texttt{Node} whose \texttt{next\_edges} already point to parents, so the ``replay'' is a topological walk over pointers that already exist. The tape variant would centralize bookkeeping in one object---attractive for a JIT that wants to fuse the whole log---but it forces every op to interact with a global recorder, breaking the pillar axiom (\S\ref{sec:intro:c1}) because \texttt{p10} kernels would need to know about the recorder's memory. The node-graph variant pays one allocation per op instead, which \S\ref{sec:eval} shows is invisible on any workload where kernels dominate, and it keeps the recorder logic entirely inside \texttt{tpx}.
-\end{tpinsight}
+版本控制是快速失败的，而不是沉默的。 \texttt{VariableVersion.h} 以 \texttt{bump} 支持 \texttt{TensorImpl::version\_counter\_}
+ 在每个原地突变上。 \texttt{SavedVariable.h} 保存 \texttt{saved\_version\_}；解包检查 \texttt{expected==current} 并抛出
+而不是产生数字上错误的梯度，这是引擎中最有价值的可读性保护。另外商店
+\texttt{grad\_accumulator\_} 与 \texttt{weak\_ptr<Node>} 相同，因此叶子累加器不会形成无法收集的循环。
 
 \begin{tpdef}[Definition (Link-Time Acyclicity)]
-Let $V$ be the set of build targets and let $D \subseteq V \times V$ be the ``links'' relation induced by the build system's \texttt{target\_link\_libraries} directives. The build is \emph{acyclic} iff there exists a level function $\mathrm{level}:V\rightarrow\mathbb{N}$ with $\forall(a,b)\in D:\ \mathrm{level}(a)>\mathrm{level}(b)$. TensorPlay fixes \texttt{level(p10)=0}, \texttt{level(tpx)=1}, \texttt{level(stax)=2}, \texttt{level(\_C)=3}; the property is enforced by build-target ordering and certified by the vacated-symbol move.
+令 $V$ 为构建目标集，并令 $D \subseteq V \times V$ 为由构建系统的 \texttt{target\_link\_libraries} 指令引发的“链接”关系。如果存在级别函数 $\mathrm{level}:V\rightarrow\mathbb{N}$ 和 $\forall(a,b)\in D:\ \mathrm{level}(a)>\mathrm{level}(b)$，则构建为 \emph{acyclic}。 TensorPlay 修复了 \texttt{level(p10)=0}、\texttt{level(tpx)=1}、\texttt{level(stax)=2}、\texttt{level(\_C)=3}；该属性由构建目标排序强制执行，并由空出符号移动进行认证。
 \end{tpdef}
 
-\subsubsection{C4: Vmap and the Profiler Stack}
+\subsubsection{C4：Vmap 和 Profiler 堆栈}
 \label{sec:intro:c4}
 
-Vmap occupies offset~9 precisely so it outranks autograd and backend. \texttt{DispatchKey::VmapCPU}=9 at with \texttt{kVmapKeyOffset}=9
-; \texttt{toVmapKey} at and \texttt{is\_vmap\_key} are \texttt{constexpr} range tests that lower to one
-compare. \texttt{TransformDispatch} at and the kernel table at implement per-slice fallback versus
-batched kernels; the dispatcher unwraps transform state before the autograd layer observes the tensor, so \texttt{Vmap} and autograd compose without a second dispatch table.
+Vmap 精确地占据了 offset~9，因此它的排名优于 autograd 和 backend。 \texttt{DispatchKey::VmapCPU}=9 且 \texttt{kVmapKeyOffset}=9
+; \texttt{toVmapKey} at 和 \texttt{is\_vmap\_key} 是 \texttt{constexpr} 范围测试，低于 1
+比较。 \texttt{TransformDispatch} at 和内核表 at 实现每片回退与
+分批内核；调度程序在 autograd 层观察张量之前解开变换状态，因此 \texttt{Vmap} 和 autograd 无需第二个调度表即可组合。
 
-The profiler spans \ac{cpu} and \ac{cuda} with one hot-path guard. exports \texttt{g\_active}, \texttt{g\_capture\_shapes}, \texttt{g\_capture\_sites} as
-\texttt{atomic<bool>}; when inactive the cost per op is one acquire load. \texttt{OpRecord} at stamps a slot with \texttt{end\_ns}, \texttt{tid},
-\texttt{kind}, optional \texttt{dtypes} and \texttt{stack\_id}; \texttt{GpuTimerPair} at arms a pooled \texttt{cudaEvent} pair per dispatched
-CUDA op and resolves elapsed \texttt{gpu\_ms} at session stop. \ac{cupti} \texttt{stop} at \texttt{Profiler.h} dlopen \texttt{libcupti} and correlate kernels to
-ops via external correlation ids pushed in \texttt{GpuTimerPair}; \ac{nvtx} \texttt{pop} at and \ac{itt} \texttt{itt\_task\_begin\_name}
- bridge to Nsight and VTune. All collectors degrade gracefully when the native library is absent, and the binding layer at \texttt{profiler.py}
-multiplexes sampling without adding a build dependency.
+该分析器跨越 \ac{cpu} 和 \ac{cuda}，带有一个热路径防护。将 \texttt{g\_active}、\texttt{g\_capture\_shapes}、\texttt{g\_capture\_sites} 导出为
+\texttt{atomic<bool>}；当不活动时，每个操作的成本是一次获取负载。 \texttt{OpRecord} 处用 \texttt{end\_ns}、\texttt{tid} 标记插槽，
+\texttt{kind}，可选 \texttt{dtypes} 和 \texttt{stack\_id}；每派发 \texttt{GpuTimerPair} 武器，汇集 \texttt{cudaEvent} 对
+CUDA 操作并在会话停止时解析已用的 \texttt{gpu\_ms}。 \ac{cupti} \texttt{stop} at \texttt{Profiler.h} dlopen \texttt{libcupti} 并将内核关联到
+通过外部相关 ID 推送到 \texttt{GpuTimerPair} 的操作； \ac{nvtx} \texttt{pop} 于 \ac{itt} \texttt{itt\_task\_begin\_name}
+ 连接 Nsight 和 VTune 的桥梁。当本机库不存在且绑定层位于 \texttt{profiler.py} 时，所有收集器都会正常降级
+多路复用采样而不添加构建依赖项。
 
-\subsection{Scope and Non-goals}
+\subsection{范围和非目标}
 \label{sec:intro:scope}
 
-Table~\ref{tab:intro:scope} documents what is implemented and deliberately leave other axes as \texttt{Composite} fallbacks or as not implemented. Table~\ref{tab:intro:scope} enumerates
-the trimmed axes; every absent row is intentional for the 75\,k-line readability target.
+表~\ref{tab:intro:scope} 记录了已实现的内容，并故意将其他轴保留为 \texttt{Composite} 后备或未实现。表~\ref{tab:intro:scope} 枚举
+修剪后的轴；每个缺失的行都服务于可读性目标。
 
 \begin{table}[H]
 \centering
-\caption{Scope: present versus trimmed. Trimmed means no dispatch key and no dedicated storage; the generic path remains valid via \texttt{Composite}.}
+\caption{范围：已实现与修剪。修剪意味着没有调度键，也没有专用存储；通用路径通过 \texttt{Composite} 保持有效。}
 \label{tab:intro:scope}
 \small
 \begin{tabular}{p{2.8cm}p{4.6cm}p{4.6cm}}
 \toprule
-Axis & Present in & Trimmed (non-goal) and fallback \\
+Axis & 存在于 & 修剪（非目标）和后备 \\
 \midrule
-Dispatch keys & 13 keys at (\texttt{Vulkan} + \texttt{Vmap} + \texttt{Composite}) & No sparse, quantized, meta, mkldnn, xla, lazy
-dispatch keys; quantized kernels exist only as composites \\
-Tensor storage & Dense \texttt{Storage}, \texttt{DataPtr}, \texttt{Allocator}
- & No sparse COO/CSR storage, no quantized per-tensor/per-channel storage, no meta-device allocation; sparse helpers
-are teaching stubs \\
-Autograd & Explicit DAG (, \texttt{GraphTask.h},) with \texttt{SavedVariable} version guard & No
-tape reuse, no boxed alias analysis, no inference-mode fast path beyond \texttt{InferenceMode} at \\
-Compiler & Minimal \texttt{Graph} IR at with vertical \texttt{fused\_mul\_add} & No loop fusion, layout planner, vectorization
-policy, auto-tuning, or persistence beyond in-memory \texttt{Graph::execute} at \\
-Distribution & Single-process collectives via \texttt{tensorpipe} link at & No sharded \texttt{DTensor}, no pipeline parallelism, no heterogeneous device
-mesh \\
-Quantization & \texttt{Quantizer} at placeholder & No quantized dispatch axis, no kernel selection by \texttt{QScheme}; 8-bit kernels are composite
-demos \\
+在 (\texttt{Vulkan} + \texttt{Vmap} + \texttt{Composite}) 处调度键和 13 个键且无稀疏、量化、meta、mkldnn、xla、lazy
+调度键；量化内核仅以复合形式存在 \\
+张量存储和密集 \texttt{Storage}、\texttt{DataPtr}、\texttt{Allocator}
+ &没有稀疏的COO/CSR存储，没有量化的每张量/每通道存储，没有元设备分配；稀疏的助手
+正在教学存根 \\
+Autograd 和显式 DAG (, \texttt{GraphTask.h},) 与 \texttt{SavedVariable} 版本保护 & 否
+磁带重用、无盒装别名分析、没有超出 \texttt{InferenceMode} at \\ 的推理模式快速路径
+编译器和最小 \texttt{Graph} IR，具有垂直 \texttt{fused\_mul\_add} 和无循环融合、布局规划器、矢量化
+策略、自动调整或持久性超出内存中 \texttt{Graph::execute} at \\
+通过 \texttt{tensorpipe} 链接进行分发和单进程集合，无分片 \texttt{DTensor}，无管道并行性，无异构设备
+网格\
+占位符处的量化和 \texttt{Quantizer} 且无量化调度轴，\texttt{QScheme} 不选择内核； 8 位内核是复合的
+演示 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Sparse is the most illustrative trim. declares the API surface, but never defines \texttt{SparseCPU} and
-\texttt{TensorImpl::key\_set} never emits it, so dispatch never queries a sparse slot. A contributor adding sparse would add a key, extend \texttt{kDispatchKeyCount} from 13, and add
-the offset helpers, which is exactly the change the acyclic build is designed to make painful enough to discuss. Meta tensors are absent for the same reason: \texttt{DeviceType::Meta}
-exists as an enum value but never participates in \texttt{computeDispatchKey} at and never acquires a \texttt{RegisterKernel} entry, so \texttt{has\_kernel(...,
-Meta)} remains false by construction. Boxed alias analysis and shape-check elision are absent because the codegen pipeline at and
- deliberately generates straight-line backward formulas without alias metadata; the stax interpreter re-enters \texttt{tpx::ops}
- so correctness of aliasing stays with the eager dispatcher rather than with a compiler pass.
+稀疏是最能说明问题的装饰。声明 API 表面，但从未定义 \texttt{SparseCPU} 和
+\texttt{TensorImpl::key\_set} 从不发出它，因此调度从不查询稀疏槽。添加稀疏的贡献者将添加一个密钥，从 13 扩展 \texttt{kDispatchKeyCount}，并添加
+偏移助手，这正是非循环构建旨在使讨论变得足够痛苦的变化。由于同样的原因，元张量不存在：\texttt{DeviceType::Meta}
+作为枚举值存在，但从不参与 \texttt{computeDispatchKey} at 且从不获取 \texttt{RegisterKernel} 条目，因此 \texttt{has\_kernel(...,
+Meta)} 通过构造仍然为 false。盒装别名分析和形状检查省略不存在，因为代码生成管道位于 和
+ 故意生成没有别名元数据的直线向后公式； stax 解释器重新输入 \texttt{tpx::ops}
+ 因此，别名的正确性取决于急切的调度程序，而不是编译器传递。
 
-The trimmed axes are not undocumented; they are documented as trimmed so that a reader does not search for a sparse dispatch key that does not exist. A future revision that promotes a trimmed axis to a real key must update and.
+修剪后的轴并非没有记录；它们被记录为经过修剪的，以便读者不会搜索不存在的稀疏调度键。将修剪轴提升为真实关键点的未来修订必须进行更新。
 
-\subsection{How to Read This Paper}
+\subsection{如何阅读本文}
 \label{sec:intro:howto}
 
-Figure~\ref{fig:pillars} is the map of the whole white paper; every later figure is a zoom of one arrow in it. The paper supports both a linear reading and a topic-first reading; Table~\ref{tab:intro:guide} is the topic-first index.
+图~\ref{fig:pillars}是整张白皮书的图；后面的每一幅图都是其中一个箭头的放大图。支持线性阅读和主题优先阅读； Table~\ref{tab:intro:guide} 是主题优先索引。
 
 \begin{table}[H]
 \centering
-\caption{Reader's guide. Each row names the chapters and central figure for one learning goal.}
+\caption{读者指南。每一行都命名了一个学习目标的章节和中心人物。}
 \label{tab:intro:guide}
 \small
 \begin{tabular}{p{3.2cm}p{4.2cm}p{4.2cm}}
 \toprule
-Goal & Chapters & Central figure \\
+Goal & 章节 & 中心人物 \\
 \midrule
-Understand the pillars & \S\ref{sec:arch} & Fig.~\ref{fig:pillars} \\
-Follow one op end-to-end & \S\ref{sec:redispatch}, \S\ref{sec:memory} & Figs.~\ref{fig:dispatchermap}, \ref{fig:e2e} \\
-Understand backward & \S\ref{sec:autograd} & Fig.~\ref{fig:usb}, the DAG at \\
-Understand batched AD & \S\ref{sec:vmap} & The vmap offset diagram at \\
-Follow code generation & \S\ref{sec:codegen} & Fig.~\ref{fig:codegen_contract} \\
-Read the cost of choices & \S\ref{sec:eval} & Tables and histograms there \\
+了解支柱 & \S\ref{sec:arch} & 图~\ref{fig:pillars} \\
+端到端地关注一个OP & \S\ref{sec:redispatch}, \S\ref{sec:memory} & 图~\ref{fig:dispatchermap}, \ref{fig:e2e} \\
+向后理解 & \S\ref{sec:autograd} & 图~\ref{fig:usb}，DAG位于 \\
+了解批量广告 & \S\ref{sec:vmap} & vmap偏移图位于 \\
+跟随代码生成 & \S\ref{sec:codegen} & 图~\ref{fig:codegen_contract} \\
+阅读选择的成本 & \S\ref{sec:eval} & 那里有表格和直方图 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-System overview: read \S\ref{sec:arch} and Fig.~\ref{fig:pillars} first; the YAML$\rightarrow$artifact contract underneath it is at via \texttt{main.py}. Dispatch internals live in
-\S\ref{sec:redispatch} (DispatchKey arithmetic, \texttt{array<atomic<void*>,13>}, Composite fallback, \texttt{TP\_CONCAT}) and \S\ref{sec:memory} (TensorIterator seven-step pipeline
-). Autograd is the subject of \S\ref{sec:autograd}: the USB slot at $\rightarrow$
-$\rightarrow$ with cast at \texttt{Autograd.cpp}, the heap \texttt{ReadyQueue} by \texttt{sequence\_nr}, and the
-\texttt{SavedVariable} guard. The compiler pillar is \S\ref{sec:arch:stax} and the stax IR at plus the interpreter; every other Python
-module ultimately re-enters \texttt{\_C}, so symbol renaming and lazy \texttt{\_\_getattr\_\_}
-are the only Python-side complexity with cross-cutting impact.
+系统概述：先阅读\S\ref{sec:arch}和Fig.~\ref{fig:pillars}；它下面的 YAML$\rightarrow$artifact 合约位于 via \texttt{main.py}。调度内部结构住在
+\S\ref{sec:redispatch}（DispatchKey算术，\texttt{array<atomic<void*>,13>}，复合回退，\texttt{TP\_CONCAT}）和\S\ref{sec:memory}（TensorIterator七步管道
+）。 Autograd 是 \S\ref{sec:autograd} 的主题：$\rightarrow$ 处的 USB 插槽
+$\rightarrow$ 在 \texttt{Autograd.cpp} 进行强制转换，堆 \texttt{ReadyQueue} 由 \texttt{sequence\_nr} 进行转换，以及
+\texttt{SavedVariable} 守卫。编译器支柱是 \S\ref{sec:arch:stax} ，stax IR 加上解释器；所有其他Python
+模块最终重新进入 \texttt{\_C}，因此符号重命名和惰性 \texttt{\_\_getattr\_\_}
+是唯一具有跨领域影响的 Python 端复杂性。
 
 \begin{figure}[H]
 \centering
@@ -240,31 +231,17 @@ are the only Python-side complexity with cross-cutting impact.
 \foreach \x in {p10,tpx,stax,c} \draw[arrow, dashed, color=orange!70!black] (\x) -- (py);
 \foreach \x in {p10,tpx,stax,c} \draw[arrow, dashed, color=tpblue!70] (base) -- (\x);
 \end{tikzpicture}
-\caption{Four pillars and dependency direction (acyclic). Downward edges only; any upward include fails at link time. Solid arrows: link dependency; dashed: generation or re-export.}
+\caption{四大支柱和依赖方向（非循环）。仅向下边缘；任何向上包含在链接时都会失败。实线箭头：链接依赖；虚线：生成或重新导出。}
 \label{fig:pillars}
 \end{figure}
 
-\subsection{Conventions}
+\subsection{惯例}
 \label{sec:intro:conventions}
 
-\texttt{path:line} means the file relative to the repository root; is line~49 of that file, and \texttt{path:line--line} is an
-inclusive range. Code listings are verbatim excerpts with at most whitespace folding; the caption gives the exact range. Tables enumerate normative values (key numbers, artifact names, trimmed axes) rather than
-illustrative samples. \texttt{Composite} is a backend-neutral fallback; it never appears in a \texttt{DispatchKeySet} and is consulted only by
-\texttt{OperatorHandle::getKernel} for \texttt{is\_backend\_key}. \texttt{TP\_CONCAT} is a two-level macro so its argument expands before pasting;
-the paper always cites the two-level definition, not a single-level variant.
+\texttt{path:line} 表示相对于存储库根目录的文件及其中的一行，\texttt{path:line--line} 是
+包含范围。代码清单最多包含空格折叠；标题给出了准确的范围。表格列举了规范值（关键数字、工件名称、修剪轴），而不是
+说明性样本。 \texttt{Composite} 是后端中立的后备；它从未出现在 \texttt{DispatchKeySet} 中，并且仅由
+\texttt{OperatorHandle::getKernel} 对应 \texttt{is\_backend\_key}。 \texttt{TP\_CONCAT} 是一个两级宏，因此其参数在粘贴之前展开；
+引用两级定义，而不是单级变体。
 
-\begin{tppitfall}[Pitfall: Searching for a Dispatch Key That Is Never in the Set]
-A reader tracing dispatch logic often searches for \texttt{Composite} inside \texttt{DispatchKeySet} construction and finds nothing---and concludes composite fallback is dead code. It is not: \texttt{Composite} is \emph{never} a member of any key set. It is consulted only as a fallback inside \texttt{OperatorHandle::getKernel} when \texttt{is\_backend\_key(key)} holds and the backend slot is \texttt{nullptr}. The same trap recurs for \texttt{Meta}: the \texttt{DeviceType} enum carries the value, but \texttt{computeDispatchKey} never emits it. When tracing dispatch, always start from the key set the tensor actually carries, not from the key enum.
-\end{tppitfall}
-
-\subsection{Design Trade-offs}
-\label{sec:intro:tradeoffs}
-
-The readability-first stance rejects three alternatives that a production framework would accept.
-
-\textbf{Monolithic single library.} The obvious alternative to four pillars is one \texttt{libtensorplay.so} with unity-build speed and cross-module inlining. It was rejected because every kernel edit would relink the world: the per-library granularity in \S\ref{sec:intro:c1} (touch one CPU kernel, relink only \texttt{libp10.so}) is the primary developer-experience claim of this project, and it structurally requires separate link units. The measured cost of the split---one atomic load and one virtual call per op, quantified in \S\ref{sec:eval}---is a constant $\sim$2\,ns that any real kernel dwarfs.
-
-\textbf{Intrusive reference counting.} Storage and graph nodes could use intrusive pointers to eliminate the control-block allocation and halve cache traffic on \texttt{shared\_ptr} copies. Rejected for observability: intrusive counts cannot be inspected in \texttt{gdb} without pretty-printers, and the ownership question ``who holds this storage?'' is exactly what a teaching codebase must answer with standard tools. \S\ref{sec:eval} shows the constant-factor cost is invisible at kernel scale.
-
-\textbf{Runtime extensibility.} Third-party dispatch keys registered at import time would make the dispatcher a plugin platform. Rejected because it converts the 13-slot array into a sparse map, raising every \texttt{getKernel} from an array index to a hash lookup, and because it moves op registration from reviewable YAML into unreviewable \texttt{\_\_init\_\_} side effects. The closed-key design keeps registration inspectable in one file.
 

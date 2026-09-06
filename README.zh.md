@@ -70,7 +70,7 @@
 <!-- 包与统计 -->
 <p>
     <a href="https://pepy.tech/projects/tensorplay">
-        <img src="https://img.shields.io/pepy/dm/tensorplay?style=flat-square&label=monthly%20downloads&color=11B5D1&labelColor=23347A" alt="Monthly Downloads">
+        <img src="https://img.shields.io/pypi/dm/tensorplay?style=flat-square&label=monthly%20downloads&color=11B5D1&labelColor=23347A" alt="Monthly Downloads">
     </a>
 </p>
 

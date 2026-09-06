@@ -1,34 +1,34 @@
 % 04-profiler.tex
-\section{Profiler Subsystem: OpRecord, GpuTimerPair, and Backend Stack}
+\section{剖析器子系统：OpRecord、GpuTimerPair 与后端栈}
 \label{sec:profiler}
 
-\subsection{Goals and Placement}
+\subsection{目标和安置}
 
-The profiler must satisfy three conflicting goals: (i) near-zero overhead when disabled, (ii) accurate CPU+GPU timing when enabled, and (iii) pluggability of backends (CPU tracing, CUDA CUPTI activity, NVTX ranges, ITT tasks). TensorPlay places the core in \texttt{p10} so both \texttt{tpx} (Engine) and kernels can instrument without depending on Python. The Python layer (\texttt{tensorplay.profiler}) merely toggles atomics and drains buffers. Placement follows the dependency rule: \texttt{Profiler.h} is the single header; \texttt{tpx} and \texttt{\_C} include it, never the reverse.
+分析器必须满足三个相互冲突的目标：(i) 禁用时接近零开销，(ii) 启用时准确的 CPU+GPU 计时，以及 (iii) 后端的可插拔性（CPU 跟踪、CUDA CUPTI 活动、NVTX 范围、ITT 任务）。 TensorPlay 将核心置于 \texttt{p10} 中，因此 \texttt{tpx}（引擎）和内核都可以在不依赖 Python 的情况下进行检测。 Python 层 (\texttt{tensorplay.profiler}) 仅切换原子并耗尽缓冲区。放置遵循依赖规则：\texttt{Profiler.h} 是单个标头； \texttt{tpx} 和 \texttt{\_C} 包含它，而不是相反。
 
-The hot path is one \texttt{std::atomic<bool>} load per dispatched op plus, when shape or site capture is requested, one further load each. This matches the class of guard already emitted around every call for \texttt{GradMode} and \texttt{InferenceMode}. All other work (shape copy, name arena push, GPU event record) sits behind that branch.
+热路径是每个调度的操作加载一个 \texttt{std::atomic<bool>} 负载，当请求形状或站点捕获时，每个加载一个。这与每次调用 \texttt{GradMode} 和 \texttt{InferenceMode} 时已经发出的防护类相匹配。所有其他工作（形状复制、名称竞技场推送、GPU 事件记录）都位于该分支后面。
 
-\subsection{Core Data Model: Event, GpuActivity and MemEvent}
+\subsection{核心数据模型：Event、GpuActivity 和 MemEvent}
 
- defines three session-lifetime records:
+定义了三个会话生命周期记录：
 
 \begin{table}[H]
 \centering
-\caption{Profiler record types in \texttt{Profiler.h}.}
+\caption{\texttt{Profiler.h} 中的探查器记录类型。}
 \label{tab:profrecords}
 \small
 \begin{tabular}{lll}
 \toprule
-Type & Lines & Purpose \\
+Type & 线路 & 目的 \\
 \midrule
-\texttt{Event} & & One per dispatched op / user span / backward node \\
-\texttt{MemEvent} & & One per allocator alloc/free when \texttt{g\_mem\_capture} is set \\
-\texttt{GpuActivity} & & One per CUPTI kernel / memcpy / memset / runtime / driver record \\
+\texttt{Event} &  & 每个调度操作/用户范围/后向节点一个 \\
+\texttt{MemEvent} &  & 当设置 \texttt{g\_mem\_capture} 时，每个分配器分配/释放一个 \\
+\texttt{GpuActivity} &  & 每个 CUPTI 内核 / memcpy / memset / 运行时 / 驱动程序记录一个 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsubsection{Event fields}
+\subsubsection{事件字段}
 
 \begin{lstlisting}[caption={Event layout.}, label=lst:eventfields, style=cppstyle]
 struct Event {
@@ -49,11 +49,11 @@ struct Event {
 };
 \end{lstlisting}
 
-\texttt{EventKind} at distinguishes dispatched operators (\texttt{kOp}), user annotations via \texttt{record\_function} (\texttt{kUser}), and the autograd engine's \texttt{\_\_backward\_\_} span (\texttt{kBackward}). \texttt{site\_id} and \texttt{stack\_id} resolve through \texttt{site\_string} and \texttt{stack\_frames} and stay valid until the next \texttt{profiler\_start}.
+\texttt{EventKind} at 区分分派操作员 (\texttt{kOp})、通过 \texttt{record\_function} (\texttt{kUser}) 的用户注释以及 autograd 引擎的 \texttt{\_\_backward\_\_} 范围 (\texttt{kBackward})。 \texttt{site\_id} 和 \texttt{stack\_id} 通过 \texttt{site\_string} 和 \texttt{stack\_frames} 解决，并保持有效直到下一个 \texttt{profiler\_start}。
 
-\texttt{GpuActivity} at adds \texttt{correlation}, \texttt{external\_id}, \texttt{thread\_id}, \texttt{cbid}, \texttt{device}, \texttt{stream}, \texttt{kind}, \texttt{bytes}, \texttt{copy\_kind}, \texttt{value}. \texttt{kNoExt = 0xffffffffffffffff} marks uncorrelated activity.
+\texttt{GpuActivity} 添加 \texttt{correlation}、\texttt{external\_id}、\texttt{thread\_id}、\texttt{cbid}、\texttt{device}、\texttt{stream}、\texttt{kind}、\texttt{bytes}、\texttt{copy\_kind}、\texttt{value}。 \texttt{kNoExt = 0xffffffffffffffff} 标记不相关的活动。
 
-\subsubsection{OpRecord fields and lifecycle}
+\subsubsection{OpRecord 字段和生命周期}
 
 \begin{lstlisting}[caption={OpRecord handle.}, label=lst:oprecorddecl, style=cppstyle]
 struct TENSORPLAY_API OpRecord {
@@ -76,40 +76,40 @@ private:
 };
 \end{lstlisting}
 
-Field semantics, in order of declaration in:
+字段语义，按声明顺序：
 
 \begin{table}[H]
 \centering
-\caption{OpRecord private state.}
+\caption{OpRecord 私有状态。}
 \label{tab:oprecordstate}
 \small
 \begin{tabular}{lp{9.2cm}}
 \toprule
-Field & Meaning \\
+场地 & 意义 \\
 \midrule
-\texttt{start\_ns\_} & \texttt{steady\_clock} snapshot taken in \texttt{begin} \\
-\texttt{slot\_} & Index into \texttt{g\_events} vector; stable because the vector is append-only \\
-\texttt{live\_} & True iff this instance owns a valid slot; guards \texttt{set\_io\_meta} and \texttt{\textasciitilde OpRecord} \\
-\texttt{counted\_} & True iff \texttt{g\_inflight} was incremented; guards \texttt{release\_inflight} \\
-\texttt{nvtx\_open\_} & True iff \texttt{nvtx\_span\_begin} was emitted; closed in destructor even if \texttt{live\_} is false \\
-\texttt{itt\_open\_} & Same for \texttt{itt\_span\_begin} \\
-\texttt{trace\_pushed\_} & True iff \texttt{cupti\_push\_ext(slot\_)} succeeded; popped in \texttt{GpuTimerPair::close} \\
+\texttt{start\_ns\_} & \texttt{steady\_clock} 在 \texttt{begin} 拍摄的快照 \\
+\texttt{slot\_} & \texttt{g\_events} 向量的索引；稳定，因为向量是仅附加的 \\
+\texttt{live\_} & 当且仅当此实例拥有有效插槽时为 true；守卫 \texttt{set\_io\_meta} 和 \texttt{\textasciitilde OpRecord} \\
+\texttt{counted\_} & True iff，当且仅当 \texttt{g\_inflight} 增加；守卫 \texttt{release\_inflight} \\
+\texttt{nvtx\_open\_} & 真当且仅当 \texttt{nvtx\_span\_begin} 被发射；即使 \texttt{live\_} 为 false，也会在析构函数中关闭 \\
+\texttt{itt\_open\_} & \texttt{itt\_span\_begin} 相同 \\
+\texttt{trace\_pushed\_} & True 当且仅当 \texttt{cupti\_push\_ext(slot\_)} 成功；出现在 \texttt{GpuTimerPair::close} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Lifecycle, concrete path:line trace:
+生命周期，具体路径：线迹：
 
 \begin{enumerate}[leftmargin=1.4em]
-\item Construction calls \texttt{OpRecord::begin}. First it checks \texttt{g\_emit\_nvtx} and \texttt{g\_emit\_itt} via relaxed loads (so NVTX/ITT ranges can fire without a profiling session for \texttt{kOp}, as noted at). Then it checks \texttt{g\_active}; if false, returns immediately with \texttt{live\_=false}: disabled cost is one acquire-load and a predicted not-taken branch.
-\item If active, it does \texttt{g\_inflight.fetch\_add(1)}, snapshots \texttt{now\_ns} ( via \texttt{steady\_clock}), then locks \texttt{g\_mutex}. A second relaxed check of \texttt{g\_active} handles the race where \texttt{profiler\_stop} cleared the flag between the two checks.
-\item It builds an \texttt{Event}: \texttt{name} is either the static literal (\texttt{kOp} path,) or an arena copy in \texttt{g\_name\_arena} ( for \texttt{kUser}/\texttt{kBackward}). \texttt{tid} comes from \texttt{this\_thread\_id} (, defined at as a \texttt{thread\_local} hash of \texttt{std::this\_thread::get\_id}). If \texttt{t\_pending\_site.valid} is set, its \texttt{stack\_id} are consumed and cleared so inner composite ops do not inherit the outermost Python site.
-\item If \texttt{nvtx\_on || itt\_on}, it calls \texttt{nvtx\_span\_begin(e.name)} and \texttt{itt\_span\_begin(e.name)} and sets \texttt{itt\_open\_}. Then \texttt{g\_events->push\_back(e)} and \texttt{slot\_ = size-1}, \texttt{start\_ns\_ = start}, \texttt{live\_=true}.
-\item \texttt{set\_io\_meta} and \texttt{set\_output\_bytes} lock \texttt{g\_mutex} and write into \texttt{(*g\_events)[slot\_]} if \texttt{live\_} and slot is in bounds. \texttt{set\_shapes} is a shapes-only overload for generated dispatchers where dtypes stay unset.
-\item Destruction always closes NVTX/ITT first, then if \texttt{!live\_} returns. Otherwise it records \texttt{end = now\_ns}, locks \texttt{g\_mutex}, writes \texttt{(*g\_events)[slot\_].end\_ns = end} if the slot still exists (dropped silently if \texttt{profiler\_stop} already cleared the vector), then calls \texttt{release\_inflight} which does \texttt{g\_inflight.fetch\_sub(1)} and notifies \texttt{g\_inflight\_cv} when the count reaches zero.
+\item 构造调用\texttt{OpRecord::begin}。首先，它通过松弛负载检查 \texttt{g\_emit\_nvtx} 和 \texttt{g\_emit\_itt}（因此 NVTX/ITT 范围可以在没有 \texttt{kOp} 分析会话的情况下启动，如所述）。然后它检查 \texttt{g\_active};如果为 false，则立即返回 \texttt{live\_=false}：禁用成本是一个获取负载和一个预测的未采用分支。
+\item 如果处于活动状态，它会执行 \texttt{g\_inflight.fetch\_add(1)}、快照 \texttt{now\_ns}（通过 \texttt{steady\_clock}），然后锁定 \texttt{g\_mutex}。 \texttt{g\_active} 的第二次宽松检查处理 \texttt{profiler\_stop} 清除两次检查之间的标志的竞争。
+\item 它构建一个 \texttt{Event}： \texttt{name} 要么是静态文字（\texttt{kOp} 路径），要么是 \texttt{g\_name\_arena} 中的竞技场副本（对于 \texttt{kUser}/\texttt{kBackward}）。 \texttt{tid} 来自 \texttt{this\_thread\_id} （定义为 \texttt{std::this\_thread::get\_id} 的 \texttt{thread\_local} 哈希值）。如果设置了 \texttt{t\_pending\_site.valid}，则其 \texttt{stack\_id} 将被消耗并清除，因此内部复合操作不会继承最外层的 Python 站点。
+\item 如果是 \texttt{nvtx\_on || itt\_on}，则调用 \texttt{nvtx\_span\_begin(e.name)} 和 \texttt{itt\_span\_begin(e.name)} 并设置 \texttt{itt\_open\_}。然后是 \texttt{g\_events->push\_back(e)} 和 \texttt{slot\_ = size-1}、\texttt{start\_ns\_ = start}、\texttt{live\_=true}。
+\item 如果 \texttt{live\_} 和槽在边界内，则 \texttt{set\_io\_meta} 和 \texttt{set\_output\_bytes} 锁定 \texttt{g\_mutex} 并写入 \texttt{(*g\_events)[slot\_]}。 \texttt{set\_shapes} 是生成的调度程序的仅形状重载，其中数据类型保持未设置。
+\item 销毁总是先关闭 NVTX/ITT，然后如果 \texttt{!live\_} 返回。否则，它记录 \texttt{end = now\_ns}，锁定 \texttt{g\_mutex}，如果槽仍然存在则写入 \texttt{(*g\_events)[slot\_].end\_ns = end}（如果 \texttt{profiler\_stop} 已经清除了向量，则静默删除），然后调用 \texttt{release\_inflight} 执行 \texttt{g\_inflight.fetch\_sub(1)} 并在计数达到零时通知 \texttt{g\_inflight\_cv}。
 \end{enumerate}
 
-The \texttt{g\_inflight} protocol is critical for correctness: \texttt{profiler\_stop} at first stores \texttt{g\_active=false}, then waits on \texttt{g\_inflight\_cv} until \texttt{g\_inflight==0} before taking \texttt{g\_mutex} and moving \texttt{g\_events} out. This prevents a CUDA or CPU worker from appending \texttt{gpu\_ms} or \texttt{end\_ns} after \texttt{gpu\_resolve\_all} has snapshotted the vector.
+\texttt{g\_inflight} 协议对于正确性至关重要：\texttt{profiler\_stop} 首先存储 \texttt{g\_active=false}，然后等待 \texttt{g\_inflight\_cv} 直到 \texttt{g\_inflight==0}，然后取出 \texttt{g\_mutex} 并将 \texttt{g\_events} 移出。这可以防止 CUDA 或 CPU 工作线程在 \texttt{gpu\_resolve\_all} 对向量进行快照后追加 \texttt{gpu\_ms} 或 \texttt{end\_ns}。
 
 \begin{figure}[H]
 \centering
@@ -127,13 +127,13 @@ The \texttt{g\_inflight} protocol is critical for correctness: \texttt{profiler\
 \draw[arrow] (dtor) -- (gpu);
 \draw[arrow] (gpu) -- (arena);
 \end{tikzpicture}
-\caption{OpRecord lifecycle and storage. Every dispatched op creates exactly one \texttt{OpRecord} the redispatch funnel; \texttt{g\_inflight} keeps \texttt{profiler\_stop} from racing the destructor.}
+\caption{OpRecord 生命周期和存储。每个分派的操作都会创建一个 \texttt{OpRecord} 重分派漏斗； \texttt{g\_inflight} 阻止 \texttt{profiler\_stop} 与析构函数竞争。}
 \label{fig:oprecordlife}
 \end{figure}
 
-\subsection{Storage: Append-Only Vector as Logical RingBuffer}
+\subsection{存储：仅附加向量作为逻辑 RingBuffer}
 
-The original design document calls this component \texttt{RingBuffer} (\texttt{RingBuffer.h} in the draft). The shipped implementation realizes the same logical buffer as an append-only vector guarded by a mutex plus stable slot indices. Concrete state in:
+原始设计文档将此组件称为 \texttt{RingBuffer}（草案中为 \texttt{RingBuffer.h}）。交付的实现实现了与由互斥锁和稳定槽索引保护的仅附加向量相同的逻辑缓冲区。具体状态为：
 
 \begin{lstlisting}[caption={session storage.}, label=lst:profstorage, style=cppstyle]
 std::mutex g_mutex;
@@ -151,9 +151,9 @@ std::mutex g_inflight_mutex;
 std::condition_variable g_inflight_cv;
 \end{lstlisting}
 
-Why a vector and not a fixed ring: slots are referenced by \texttt{OpRecord::slot\_} and by \texttt{GpuTimerPair}'s external correlation id (\texttt{slot\_} cast to \texttt{uint64\_t} at) for the entire session. A ring that overwrites would invalidate those indices. The binding layer drains the vector in \texttt{profiler\_stop} via \texttt{std::move(*g\_events)} then \texttt{stable\_sort} by \texttt{start\_ns}. The arena (\texttt{g\_name\_arena}) stays alive until the next \texttt{profiler\_start} because \texttt{Event::name} for user spans is a borrowed pointer into it ( comment).
+为什么是向量而不是固定环：在整个会话中，槽由 \texttt{OpRecord::slot\_} 和 \texttt{GpuTimerPair} 的外部相关 ID（\texttt{slot\_} 转换为 \texttt{uint64\_t} at）引用。覆盖的环将使这些索引无效。结合层通过 \texttt{std::move(*g\_events)} 排出 \texttt{profiler\_stop} 中的向量，然后通过 \texttt{start\_ns} 排出 \texttt{stable\_sort} 中的向量。 arena (\texttt{g\_name\_arena}) 一直保持活动状态，直到下一个 \texttt{profiler\_start}，因为用户跨度的 \texttt{Event::name} 是借用的指针（注释）。
 
-Pending Python site handling is thread-local at:
+待处理的 Python 站点处理是线程本地的：
 
 \begin{lstlisting}[caption={per-thread pending site.}, label=lst:pendingsite, style=cppstyle]
 thread_local struct {
@@ -163,44 +163,44 @@ thread_local struct {
 } t_pending_site;
 \end{lstlisting}
 
-\texttt{set\_python\_site} and \texttt{set\_python\_stack} are called by the binding layer while the GIL is held; they intern through \texttt{intern\_site} and \texttt{intern\_stack} which dedup via \texttt{g\_site\_index} and \texttt{g\_frame\_index}. The next \texttt{OpRecord::begin} on that thread consumes the pending site and clears \texttt{valid}, so inner composite ops record no site instead of repeating the outermost call.
+\texttt{set\_python\_site} 和 \texttt{set\_python\_stack} 在持有 GIL 时由绑定层调用；他们通过 \texttt{intern\_site} 和 \texttt{intern\_stack} 进行实习，并通过 \texttt{g\_site\_index} 和 \texttt{g\_frame\_index} 进行重复数据删除。该线程上的下一个 \texttt{OpRecord::begin} 消耗待处理站点并清除 \texttt{valid}，因此内部复合操作不记录任何站点，而不是重复最外层的调用。
 
-User annotations have their own LIFO stack at (\texttt{thread\_local std::vector<size\_t> t\_user\_stack}) pushed in \texttt{user\_span\_begin} and popped in \texttt{user\_span\_end}. Both manipulate \texttt{g\_events} under \texttt{g\_mutex} and emit NVTX around the push/pop.
+用户注释在 (\texttt{thread\_local std::vector<size\_t> t\_user\_stack}) 处有自己的 LIFO 堆栈，推送到 \texttt{user\_span\_begin} 并弹出到 \texttt{user\_span\_end}。两者都在 \texttt{g\_mutex} 下操纵 \texttt{g\_events} 并在推/弹出周围发出 NVTX。
 
-The logical RingBuffer properties that remain: no allocation on the hot path beyond the vector's amortized growth (op events are 64 bytes plus optional shared\_ptr payloads), and the buffer is drained exactly once at session stop.
+保留的逻辑 RingBuffer 属性：热路径上没有超出向量摊销增长的分配（op 事件为 64 字节加上可选的共享\_ptr 有效负载），并且缓冲区在会话停止时恰好耗尽一次。
 
-\subsection{Configuration Atomics: ProfilerConfig Surface}
+\subsection{配置原子：ProfilerConfig Surface}
 
-Configuration is a small set of free atomics in namespace \texttt{tensorplay::prof}---one per feature switch:
+配置是命名空间 \texttt{tensorplay::prof} 中的一小组免费原子——每个功能开关一个：
 
 \begin{table}[H]
 \centering
-\caption{Profiler configuration atomics. Draft name $\rightarrow$ shipped symbol.}
+\caption{探查器配置原子。草稿名称 $\rightarrow$ 发货符号。}
 \label{tab:profatomics}
 \small
 \begin{tabular}{llll}
 \toprule
-Draft \texttt{ProfilerConfig} & Shipped atomic & Lines & Guarded feature \\
+草稿 \texttt{ProfilerConfig} & 运送原子 & 线路 & 防护功能 \\
 \midrule
-\texttt{enabled\_} & \texttt{g\_active} &, & All recording \\
-\texttt{with\_shapes\_} & \texttt{g\_capture\_shapes} &, & \texttt{set\_io\_meta} in redispatch \\
-\texttt{with\_stack\_} & \texttt{g\_capture\_sites} &, & \texttt{stack} adoption \\
-\texttt{capture\_memory\_} & \texttt{g\_mem\_capture} &, & \texttt{free} \\
-\texttt{gpu\_timing\_} & \texttt{g\_gpu\_timing} &, & \texttt{cudaEvent} pair per CUDA op \\
-\texttt{gpu\_trace\_} & \texttt{g\_gpu\_trace} &, & CUPTI activity collection \\
-\texttt{emit\_nvtx\_} & \texttt{g\_emit\_nvtx} &, & \texttt{Pop} per span \\
-\texttt{emit\_itt\_} & \texttt{g\_emit\_itt} &, & \texttt{end} per span \\
+\texttt{enabled\_} & \texttt{g\_active} & , & 全部录音 \\
+\texttt{with\_shapes\_} & \texttt{g\_capture\_shapes} & , & 重新调度中的 \texttt{set\_io\_meta} \\
+\texttt{with\_stack\_} & \texttt{g\_capture\_sites} & , & \texttt{stack} 收养 \\
+\texttt{capture\_memory\_} & \texttt{g\_mem\_capture} & , & \texttt{free} \\
+\texttt{gpu\_timing\_} & \texttt{g\_gpu\_timing} & , & 每个 CUDA 操作 \texttt{cudaEvent} 对 \\
+\texttt{gpu\_trace\_} & \texttt{g\_gpu\_trace} & , & CUPTI活动合集 \\
+\texttt{emit\_nvtx\_} & \texttt{g\_emit\_nvtx} & , & 每个跨度 \texttt{Pop} \\
+\texttt{emit\_itt\_} & \texttt{g\_emit\_itt} & , & 每个跨度 \texttt{end} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-All are \texttt{std::atomic<bool>} with \texttt{memory\_order\_release} on stores (\texttt{Profiler.cpp}, via) and \texttt{memory\_order\_acquire} on the hot-path load. Two additional relaxed checks appear inside the \texttt{g\_mutex} critical section to handle the start/stop race without extra synchronization. The Python entry points in translate \texttt{profile(record\_shapes,with\_stack,gpu\_timing,gpu\_trace,profile\_memory)} into stores to these atomics plus calls to \texttt{profiler\_start}, \texttt{profiler\_start\_with\_shapes}, \texttt{profiler\_start\_full} and \texttt{cupti\_start}.
+所有都是 \texttt{std::atomic<bool>}，存储上有 \texttt{memory\_order\_release}（\texttt{Profiler.cpp}，via），热路径负载上有 \texttt{memory\_order\_acquire}。 \texttt{g\_mutex} 关键部分内出现两个额外的宽松检查，以处理开始/停止竞赛，而无需额外的同步。 Python 入口点将 \texttt{profile(record\_shapes,with\_stack,gpu\_timing,gpu\_trace,profile\_memory)} 存储为这些原子以及对 \texttt{profiler\_start}、\texttt{profiler\_start\_with\_shapes}、\texttt{profiler\_start\_full} 和 \texttt{cupti\_start} 的调用。
 
-\texttt{with\_stack} implies \texttt{record\_shapes} in the Python layer; the C++ layer keeps them independent but the binding's \texttt{\_profiler\_start} at branches to \texttt{profiler\_start\_full} when \texttt{with\_stack} is set, which sets both \texttt{g\_capture\_shapes} and \texttt{g\_capture\_sites} to true.
+\texttt{with\_stack} 在 Python 层中隐含 \texttt{record\_shapes} ； C++ 层保持它们独立，但当设置 \texttt{with\_stack} 时，绑定的 \texttt{\_profiler\_start} 会分支到 \texttt{profiler\_start\_full}，这会将 \texttt{g\_capture\_shapes} 和 \texttt{g\_capture\_sites} 设置为 true。
 
-\subsection{GpuTimerPair: cudaEvent vs.\ CUPTI Selection}
+\subsection{GpuTimerPair：cudaEvent 与\ CUPTI 选择}
 
- declares \texttt{GpuTimerPair} as a pool-backed \texttt{cudaEvent\_t} pair plus CUPTI correlation bracketing:
+将 \texttt{GpuTimerPair} 声明为池支持的 \texttt{cudaEvent\_t} 对加上 CUPTI 相关括号：
 
 \begin{lstlisting}[caption={GpuTimerPair handle.}, label=lst:gputimerpair, style=cppstyle]
 struct TENSORPLAY_API GpuTimerPair {
@@ -217,9 +217,9 @@ private:
 };
 \end{lstlisting}
 
-The implementation lives in \texttt{ProfilerGpu.cpp}. For \texttt{!USE\_CUDA} it compiles to no-ops at so generated code links without \texttt{\#ifdef} noise.
+该实现位于 \texttt{ProfilerGpu.cpp} 中。对于 \texttt{!USE\_CUDA} ，它在生成的代码链接处编译为无操作，没有 \texttt{\#ifdef} 噪音。
 
-\subsubsection{Selection logic in \texttt{arm}}
+\subsubsection{\texttt{arm} 中的选择逻辑}
 
 \begin{lstlisting}[caption={arm() selection.}, label=lst:gpuarm, style=cppstyle]
 void GpuTimerPair::arm(const Device& device) {
@@ -241,33 +241,33 @@ void GpuTimerPair::arm(const Device& device) {
 }
 \end{lstlisting}
 
-Two orthogonal features interleave:
+两个正交特征交织：
 
 \begin{itemize}[leftmargin=1.4em]
-\item \textbf{CUPTI correlation} is independent of \texttt{g\_gpu\_timing}. If \texttt{g\_gpu\_trace} is set, \texttt{arm} pushes the op's slot as an external correlation id via \texttt{cupti\_push\_ext} onto CUPTI's per-thread stack. This happens even when event timing is off, so a \texttt{gpu\_trace} session correlates kernels without paying \texttt{cudaEventRecord} cost.
-\item \textbf{cudaEvent timing} is gated on \texttt{g\_gpu\_timing}. When on, \texttt{arm} acquires a pooled \texttt{cudaEvent\_t} via \texttt{acquire\_event} (, recycles from \texttt{g\_pool} under \texttt{g\_gpu\_mutex} or creates with \texttt{cudaEventCreateWithFlags}), records it on the current stream, and saves device/stream/event.
+\item \textbf{CUPTI correlation} 独立于 \texttt{g\_gpu\_timing}。如果设置了 \texttt{g\_gpu\_trace}，则 \texttt{arm} 通过 \texttt{cupti\_push\_ext} 将操作的槽作为外部相关 ID 推送到 CUPTI 的每线程堆栈上。即使事件计时关闭，也会发生这种情况，因此 \texttt{gpu\_trace} 会话关联内核而无需支付 \texttt{cudaEventRecord} 成本。
+\item \textbf{cudaEvent timing} 在 \texttt{g\_gpu\_timing} 上门控。启用时，\texttt{arm} 通过 \texttt{acquire\_event} 获取池化的 \texttt{cudaEvent\_t}（从 \texttt{g\_gpu\_mutex} 下的 \texttt{g\_pool} 回收或使用 \texttt{cudaEventCreateWithFlags} 创建），将其记录在当前流上，并保存设备/流/事件。
 \end{itemize}
 
-\texttt{close} at follows the same order: first it pops the CUPTI correlation if one was pushed ( via \texttt{cupti\_pop\_ext} at), then if \texttt{armed\_} records the end event via \texttt{acquire\_event} and \texttt{cudaEventRecord}, and appends a \texttt{LivePair\{slot,device,stream,start,end\}} to \texttt{g\_live} under \texttt{g\_gpu\_mutex}. Profiling never makes a valid op fail: every CUDA error path destroys the partial event and returns.
+\texttt{close} at 遵循相同的顺序：首先，如果有一个被推送（通过 \texttt{cupti\_pop\_ext} at），它会弹出 CUPTI 相关性，然后如果 \texttt{armed\_} 通过 \texttt{acquire\_event} 和 \texttt{cudaEventRecord} 记录结束事件，并在 \texttt{g\_gpu\_mutex} 下将 \texttt{LivePair\{slot,device,stream,start,end\}} 附加到 \texttt{g\_live}。分析永远不会使有效操作失败：每个 CUDA 错误路径都会破坏部分事件并返回。
 
-\subsubsection{Resolution at session stop}
+\subsubsection{会话停止时的分辨率}
 
-\texttt{gpu\_resolve\_all} is called from the binding's \texttt{\_profiler\_stop} at after \texttt{profiler\_stop} but before returning to Python. Key steps:
+\texttt{gpu\_resolve\_all} 在 \texttt{profiler\_stop} 之后但在返回 Python 之前从绑定的 \texttt{\_profiler\_stop} 调用。关键步骤：
 
 \begin{enumerate}[leftmargin=1.4em]
-\item Swap \texttt{g\_live} out under the mutex so dispatch can continue while resolution runs.
-\item Compute a deadline from \texttt{TP\_PROFILER\_GPU\_TIMEOUT\_MS} (default 5000\,ms,).
-\item Build \texttt{last\_on\_stream} map: one wait per stream is sufficient because CUDA orders event records on a stream.
-\item For each stream's last end event, call \texttt{wait\_event} which polls \texttt{cudaEventQuery} with \texttt{50\,\textmu s} sleeps until success or deadline. This avoids a device-wide synchronize.
-\item Resolve each pair via \texttt{cudaEventElapsedTime}. On success, write \texttt{events[slot].gpu\_ms = ms} and invoke the \texttt{emit} callback. Reusable events go to a local \texttt{reusable} vector; failed pairs are destroyed via \texttt{destroy\_event\_pair} which does \texttt{cudaEventDestroy} even for pending events. Pending pairs are intentionally not returned to the pool so the next session starts clean.
-\item Return reusable events to \texttt{g\_pool} under one lock and restore the caller's device.
+\item 在互斥锁下交换 \texttt{g\_live} ，以便在解析运行时可以继续调度。
+\item 从 \texttt{TP\_PROFILER\_GPU\_TIMEOUT\_MS} 计算截止时间（默认 5000\,ms,）。
+\item 构建 \texttt{last\_on\_stream} 映射：每个流一次等待就足够了，因为 CUDA 对流上的事件记录进行排序。
+\item 对于每个流的最后一个结束事件，调用 \texttt{wait\_event} 轮询 \texttt{cudaEventQuery} 并使用 \texttt{50\,\textmu s} 休眠直到成功或截止日期。这避免了设备范围的同步。
+\item 通过 \texttt{cudaEventElapsedTime} 解析每一对。成功后，写入 \texttt{events[slot].gpu\_ms = ms} 并调用 \texttt{emit} 回调。可重用事件转到本地 \texttt{reusable} 向量；失败的对将通过 \texttt{destroy\_event\_pair} 销毁，即使对于待处理的事件也会执行 \texttt{cudaEventDestroy} 。挂起的对故意不返回到池中，以便下一个会话开始干净。
+\item 将可重用事件返回到一把锁下的 \texttt{g\_pool} 并恢复调用者的设备。
 \end{enumerate}
 
-The pool is \texttt{unordered\_map<int, deque<cudaEvent\_t>>} keyed by device index, created with \texttt{cudaEventDefault} (timing on). \texttt{gpu\_drain\_pool} at swaps and destroys all pooled and live events, used by the binding at process teardown.
+该池是 \texttt{unordered\_map<int, deque<cudaEvent\_t>>}，由设备索引键控，使用 \texttt{cudaEventDefault} 创建（计时开启）。 \texttt{gpu\_drain\_pool} at 交换并销毁所有池事件和实时事件，由进程拆卸时的绑定使用。
 
-\subsection{OptionalCUDAGuard: Correct Device for Multi-GPU Timing}
+\subsection{可选的 CUDAGuard：多 GPU 计时的正确设备}
 
-Generated redispatch helpers must record GPU events on the op's target device even when the calling thread's current device is elsewhere. declares:
+生成的重新调度帮助程序必须在操作的目标设备上记录 GPU 事件，即使调用线程的当前设备位于其他位置也是如此。声明：
 
 \begin{lstlisting}[caption={OptionalCUDAGuard.}, label=lst:optionalguard, style=cppstyle]
 class P10_API OptionalCUDAGuard {
@@ -279,9 +279,9 @@ private:
 };
 \end{lstlisting}
 
-For \texttt{!USE\_CUDA} it is an empty inline. For CUDA builds, the constructor at does \texttt{if (device.is\_cuda) guard\_ = make\_unique<CUDAGuard>(device)}; the destructor restores via \texttt{CUDAGuard}. \texttt{CUDAGuard} itself (at) saves \texttt{cudaGetDevice}, calls \texttt{cudaSetDevice} to the target, and restores on destruction.
+对于 \texttt{!USE\_CUDA} 来说，它是一个空的内联。对于 CUDA 构建，构造函数执行 \texttt{if (device.is\_cuda) guard\_ = make\_unique<CUDAGuard>(device)};析构函数通过 \texttt{CUDAGuard} 恢复。 \texttt{CUDAGuard} 本身（at）保存 \texttt{cudaGetDevice}，向目标调用 \texttt{cudaSetDevice}，并在销毁时恢复。
 
-Codegen emits the guard immediately after the profiler handles at:
+Codegen 在分析器处理以下位置后立即发出防护：
 
 \begin{lstlisting}[caption={device guard emission.}, label=lst:genguard, style=cppstyle]
 #ifdef USE_CUDA
@@ -297,69 +297,69 @@ Codegen emits the guard immediately after the profiler handles at:
 #endif
 \end{lstlisting}
 
-Placement matters: the guard is constructed before \texttt{arm} so \texttt{acquire\_event} and \texttt{cudaEventRecord} run on the correct device, and \texttt{close} runs before the guard is destroyed (the guard outlives \texttt{\_\_tp\_gpu} only until the function returns, but \texttt{close} is called explicitly after dispatch, before destruction, at). On CPU ops \texttt{device.is\_cuda==false} so the guard is a no-op and \texttt{arm} early-returns.
+放置很重要：守卫是在 \texttt{arm} 之前构造的，因此 \texttt{acquire\_event} 和 \texttt{cudaEventRecord} 在正确的设备上运行，并且 \texttt{close} 在守卫被销毁之前运行（守卫仅在函数返回之前比 \texttt{\_\_tp\_gpu} 寿命更长，但 \texttt{close} 在调度之后、销毁之前显式调用）。在 CPU 操作 \texttt{device.is\_cuda==false} 上，所以防护是无操作和 \texttt{arm} 提前返回。
 
-\subsection{Backend Stack: ITT, NVTX and CUPTI}
+\subsection{后端堆栈：ITT、NVTX 和 CUPTI}
 
 \begin{table}[H]
 \centering
-\caption{Profiler backends. Enabled at compile time; selected at run time via atomics.}
+\caption{探查器后端。编译时启用；在运行时通过原子选择。}
 \label{tab:profbackends2}
 \small
 \begin{tabular}{llll}
 \toprule
-Backend & File & Mechanism & Runtime library \\
+后端 & File & 机制 & 运行时库 \\
 \midrule
-CPU & \texttt{Profiler.cpp} & \texttt{chrono::steady\_clock}, vector drain & -- \\
-GPU events & \texttt{ProfilerGpu.cpp} & \texttt{ElapsedTime} & \texttt{cudart} \\
-CUPTI & \texttt{ProfilerCupti.cpp} & \texttt{cuptiActivityEnable}, buffer callbacks & \texttt{.11} via \texttt{dlopen} \\
-Stub & \texttt{ProfilerCuptiStub.cpp} & no-op symbols & -- (CPU/HIP builds) \\
-NVTX & \texttt{ProfilerNvtx.cpp} & \texttt{Pop} & \texttt{libnvtx.so} via \texttt{dlopen} \\
-ITT & \texttt{ProfilerItt.cpp} & \texttt{end} & \texttt{libittnotify.so} via \texttt{dlopen} \\
+CPU & \texttt{Profiler.cpp} & \texttt{chrono::steady\_clock}，矢量漏极 & -- \\
+GPU 事件 & \texttt{ProfilerGpu.cpp} & \texttt{ElapsedTime} & \texttt{cudart} \\
+中国电力工业联合会 & \texttt{ProfilerCupti.cpp} & \texttt{cuptiActivityEnable}，缓冲区回调 & \texttt{.11} 通过 \texttt{dlopen} \\
+Stub & \texttt{ProfilerCuptiStub.cpp} & 无操作符号 & --（CPU/HIP 构建） \\
+NVTX & \texttt{ProfilerNvtx.cpp} & \texttt{Pop} & \texttt{libnvtx.so} 通过 \texttt{dlopen} \\
+ITT & \texttt{ProfilerItt.cpp} & \texttt{end} & \texttt{libittnotify.so} 通过 \texttt{dlopen} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsubsection{ProfilerNVTX}
+\subsubsection{分析器NVTX}
 
-The NVTX bridge is dlopen'd, not linked. \texttt{ensure\_loaded} at probes \texttt{libnvtx.so}, \texttt{libnvtx\_dynamic.so}, \texttt{libNVToolsExt.so} and \texttt{libroctx64.so} (ROCm twin, exports \texttt{roctxRangePushA} etc.) via \texttt{dlopen} and \texttt{dlsym} for \texttt{nvtxRangePushA}, \texttt{nvtxRangePop}, \texttt{nvtxMarkA}, \texttt{nvtxRangeStartA}, \texttt{nvtxRangeEnd}. If none loads, \texttt{g\_available=false} and every call degrades. Two entry groups exist:
+NVTX 桥是 dlopen'd，未链接。 \texttt{ensure\_loaded} 位于探头 \texttt{libnvtx.so}、\texttt{libnvtx\_dynamic.so}、\texttt{libNVToolsExt.so} 和 \texttt{libroctx64.so}（ROCm 双胞胎，导出 \texttt{roctxRangePushA} 等），通过 \texttt{dlopen} 和 \texttt{dlsym} 实现 \texttt{nvtxRangePushA}、\texttt{nvtxRangePop}、\texttt{nvtxMarkA}、\texttt{nvtxRangeStartA}、\texttt{nvtxRangeEnd}。如果没有加载，\texttt{g\_available=false} 和每个调用都会降级。存在两个条目组：
 
 \begin{itemize}[leftmargin=1.4em]
-\item Raw passthroughs for \texttt{tensorplay.cuda.nvtx} \texttt{range\_end}. These throw \texttt{RuntimeError} with ``NVTX functions not installed'' when unavailable, preserving the historical contract.
-\item Internal no-throw hooks \texttt{end} check \texttt{emitting = g\_emit\_nvtx.load(relaxed) \&\& usable} then call \texttt{ nv\_range\_pop}. \texttt{OpRecord::begin} calls them at only when \texttt{nvtx\_on} is true (which additionally requires \texttt{kind==kOp}), so user annotations do not emit NVTX unless explicitly requested via the binding's \texttt{\_profiler\_emit\_nvtx}.
+\item \texttt{tensorplay.cuda.nvtx} \texttt{range\_end} 的原始直通。当不可用时，它们会抛出 \texttt{RuntimeError} 并显示“未安装 NVTX 功能”，从而保留历史合约。
+\item 内部无抛出钩子 \texttt{end} 检查 \texttt{emitting = g\_emit\_nvtx.load(relaxed) \&\& usable} 然后调用 \texttt{ nv\_range\_pop}。 \texttt{OpRecord::begin} 仅当 \texttt{nvtx\_on} 为 true 时才调用它们（这还需要 \texttt{kind==kOp}），因此用户注释不会发出 NVTX，除非通过绑定的 \texttt{\_profiler\_emit\_nvtx} 明确请求。
 \end{itemize}
 
-\texttt{g\_emit\_nvtx} is toggled from Python via and from the \texttt{emit\_nvtx} context manager.
+\texttt{g\_emit\_nvtx} 通过 \texttt{emit\_nvtx} 上下文管理器从 Python 切换。
 
-\subsubsection{ProfilerItt}
+\subsubsection{分析器Itt}
 
-The ITT bridge follows the same dlopen structure as NVTX but targets the Intel VTune/Advisor family. \texttt{ensure\_loaded} at dlopens \texttt{libittnotify.so} then \texttt{libittnotify64.so}, dlsyms \texttt{\_\_itt\_domain\_create}, \texttt{\_\_itt\_string\_handle\_create}, \texttt{\_\_itt\_task\_begin}, \texttt{\_\_itt\_task\_end}, creates domain \texttt{"tensorplay"}. Internal hooks \texttt{end} at check \texttt{g\_emit\_itt.load(relaxed)} then call \texttt{end} which internally does \texttt{fn\_string\_handle\_create} + \texttt{fn\_task\_begin}. Availability is \texttt{itt\_available}.
+ITT 桥接器遵循与 NVTX 相同的 dlopen 结构，但针对 Intel VTune/Advisor 系列。 \texttt{ensure\_loaded} 在 dlopens \texttt{libittnotify.so} 处，然后 \texttt{libittnotify64.so}、dlsyms \texttt{\_\_itt\_domain\_create}、\texttt{\_\_itt\_string\_handle\_create}、\texttt{\_\_itt\_task\_begin}、\texttt{\_\_itt\_task\_end} 创建域 \texttt{"tensorplay"}。内部钩子 \texttt{end} 检查 \texttt{g\_emit\_itt.load(relaxed)} 然后调用 \texttt{end} ，它在内部执行 \texttt{fn\_string\_handle\_create} + \texttt{fn\_task\_begin} 。可用性为 \texttt{itt\_available}。
 
-Both bridges keep no hard link dependency: a CPU-only wheel imports and runs with all profiler calls becoming no-ops.
+两个桥均不保留硬链接依赖性：仅 CPU 轮导入并运行，所有探查器调用都变为无操作。
 
-\subsubsection{CuptiStub}
+\subsubsection{库蒂存根}
 
-For HIP builds (and any re-exported \texttt{ProfilerCuptiStub.cpp}) the file provides no-op definitions for \texttt{g\_gpu\_trace}, \texttt{cupti\_available}, \texttt{cupti\_last\_error}, \texttt{cupti\_start}, \texttt{cupti\_stop\_and\_collect}, \texttt{cupti\_push\_ext}, \texttt{cupti\_pop\_ext}, \texttt{cupti\_version}. This lets the extension import under \texttt{RTLD\_NOW} without embedding \texttt{\#ifdef} the ~15 call sites that reference CUPTI symbols (\texttt{ProfilerGpu.cpp}, \texttt{init.cpp}). The CPU build provides the same fallback when \texttt{!USE\_CUDA}.
+对于 HIP 版本（以及任何重新导出的 \texttt{ProfilerCuptiStub.cpp}），该文件为 \texttt{g\_gpu\_trace}、\texttt{cupti\_available}、\texttt{cupti\_last\_error}、\texttt{cupti\_start}、\texttt{cupti\_stop\_and\_collect}、\texttt{cupti\_push\_ext}、\texttt{cupti\_pop\_ext}、\texttt{cupti\_version} 提供无操作定义。这使得扩展可以在 \texttt{RTLD\_NOW} 下导入，而无需嵌入 \texttt{\#ifdef} 引用 CUPTI 符号（\texttt{ProfilerGpu.cpp}、\texttt{init.cpp}）的约 15 个调用站点。 CPU 版本在 \texttt{!USE\_CUDA} 时提供相同的后备。
 
-\subsection{CUPTI in Detail: Subscription, Buffers and correlationId}
+\subsection{CUPTI 详细信息：订阅、缓冲区和correlationId}
 
-\texttt{ProfilerCupti.cpp} is 596 lines for USE\_CUDA and 24 lines for CPU. The design constraint is: \texttt{libcupti} is never a hard dependency; all entry points are dlsym'd from a dlopened handle (, \texttt{108,424--466}) and sessions on machines without the toolkit degrade to \texttt{cupti\_available==false}.
+\texttt{ProfilerCupti.cpp} 对于 USE\_CUDA 是 596 行，对于 CPU 是 24 行。设计约束是： \texttt{libcupti} 绝不是硬依赖项；所有入口点都是从 dlopened 句柄（\texttt{108,424--466}）进行 dlsym 处理，并且没有工具包的计算机上的会话会降级为 \texttt{cupti\_available==false}。
 
-\subsubsection{Entry points and handle}
+\subsubsection{入口点和句柄}
 
-\texttt{CuptiFns} holds \texttt{GetTimestamp}, \texttt{RegisterCallbacks}, \texttt{Enable}, \texttt{Disable}, \texttt{FlushAll}, \texttt{GetNextRecord}, \texttt{GetNumLostRecords}, \texttt{PushExternalCorrelationId}, \texttt{PopExternalCorrelationId}, \texttt{GetCallbackName}, \texttt{GetVersion}. \texttt{g\_cupti\_lib} is kept for the process lifetime; \texttt{g\_fns} is set-once after the first successful \texttt{cupti\_start}, so \texttt{pop} can read it without locking ( comment).
+\texttt{CuptiFns} 保存 \texttt{GetTimestamp}、\texttt{RegisterCallbacks}、\texttt{Enable}、\texttt{Disable}、\texttt{FlushAll}、\texttt{GetNextRecord}、\texttt{GetNumLostRecords}、\texttt{PushExternalCorrelationId}、\texttt{PopExternalCorrelationId}、\texttt{GetCallbackName}、\texttt{GetVersion}。 \texttt{g\_cupti\_lib} 在进程生命周期内保留； \texttt{g\_fns} 在第一次成功 \texttt{cupti\_start} 之后设置一次，因此 \texttt{pop} 可以在不锁定的情况下读取它（注释）。
 
-\texttt{cupti\_available} at probes without enabling: it first checks \texttt{g\_fns!=nullptr}, then tries \texttt{dlopen(..., RTLD\_NOLOAD)} for \texttt{.so}. \texttt{cupti\_version} at dlsyms \texttt{cuptiGetVersion} without enabling any kind, used to stamp trace-export schema metadata.
+\texttt{cupti\_available} 在未启用的情况下进行探测：它首先检查 \texttt{g\_fns!=nullptr}，然后尝试 \texttt{dlopen(..., RTLD\_NOLOAD)} 查找 \texttt{.so}。 \texttt{cupti\_version} at dlsyms \texttt{cuptiGetVersion} 不启用任何类型，用于标记跟踪导出模式元数据。
 
-\subsubsection{Subscription: kinds and callbacks}
+\subsubsection{订阅：种类和回调}
 
-\texttt{cupti\_start} at (called from before \texttt{profiler\_start}) does:
+\texttt{cupti\_start} at（从 \texttt{profiler\_start} 之前调用）执行以下操作：
 
 \begin{enumerate}[leftmargin=1.4em]
-\item Lazily dlopens the library from candidates \texttt{libcupti.so.13,.12,.11,.1,.so} and dlsyms mandatory symbols via macro \texttt{TP\_CUPTI\_DLSYM}; optional symbols \texttt{GetNumLostRecords}, \texttt{GetCallbackName}, \texttt{GetVersion} are null-checked.
-\item Calibrates the timebase: \texttt{g\_fns->GetTimestamp(\&cupti\_now)} then \texttt{g\_time\_offset\_ns = steady\_now\_ns - cupti\_now}. Every activity record's \texttt{end} is later offset by this value, mapping CUPTI's epoch onto the op timeline's \texttt{CLOCK\_MONOTONIC}.
-\item Registers buffer callbacks \texttt{buffer\_requested} / \texttt{buffer\_completed} via \texttt{RegisterCallbacks}.
-\item Enables five kinds:
+\item 通过宏 \texttt{TP\_CUPTI\_DLSYM} 从候选 \texttt{libcupti.so.13,.12,.11,.1,.so} 和 dlsyms 强制符号中延迟 dlopens 库；可选符号 \texttt{GetNumLostRecords}、\texttt{GetCallbackName}、\texttt{GetVersion} 进行空检查。
+\item 校准时基：\texttt{g\_fns->GetTimestamp(\&cupti\_now)} 然后 \texttt{g\_time\_offset\_ns = steady\_now\_ns - cupti\_now}。每个活动记录的 \texttt{end} 稍后都会通过该值进行偏移，将 CUPTI 的历元映射到操作时间线的 \texttt{CLOCK\_MONOTONIC} 上。
+\item 通过 \texttt{RegisterCallbacks} 注册缓冲区回调 \texttt{buffer\_requested} / \texttt{buffer\_completed}。
+\item 启用五种：
 \begin{lstlisting}[caption={enabled kinds.}, label=lst:cuptiKinds, style=cppstyle]
 static const CUpti_ActivityKind kinds[] = {
   CUPTI_ACTIVITY_KIND_MEMCPY,
@@ -372,23 +372,19 @@ for (auto k : kinds) rc = g_fns->Enable(k);
 \end{lstlisting}
 \end{enumerate}
 
-\texttt{disable\_kinds\_locked} at disables the same set in \texttt{cupti\_stop\_and\_collect}.
+\texttt{disable\_kinds\_locked} at 禁用 \texttt{cupti\_stop\_and\_collect} 中的相同设置。
 
-Buffer handling uses 1\,MiB pooled buffers at (\texttt{kBufSize = 1<<20}):
+缓冲区处理在 (\texttt{kBufSize = 1<<20}) 处使用 1\,MiB 池缓冲区：
 
 \begin{itemize}[leftmargin=1.4em]
-\item \texttt{buffer\_requested} pops from \texttt{g\_free\_bufs} under \texttt{g\_cupti\_mutex} or does \texttt{malloc(kBufSize)}. On allocation failure it returns \texttt{0} so CUPTI drops records but profiling continues.
-\item \texttt{buffer\_completed} is called by CUPTI on its completion thread; it locks \texttt{g\_cupti\_mutex}, calls \texttt{parse\_buffer\_locked} then pushes the buffer to \texttt{g\_free\_bufs} for recycling.
-\item \texttt{parse\_buffer\_locked} iterates via \texttt{GetNextRecord}. For \texttt{CONCURRENT\_KERNEL} it picks the revision alias \texttt{ActivityKernel} (Kernel9 on CUDA 12.8+, Kernel8, or Kernel4,) and pushes a \texttt{GpuActivity\{'k',\dots\}} with name interned via \texttt{intern\_name\_locked}. Memcpy/memset/runtime/driver/external-correlation each map to \texttt{'d'} plus the prefix-field extraction noted at (revisions only append trailing fields). Lost records are surfaced via \texttt{GetNumLostRecords}.
+\item \texttt{buffer\_requested} 从 \texttt{g\_cupti\_mutex} 下的 \texttt{g\_free\_bufs} 弹出，或者执行 \texttt{malloc(kBufSize)}。分配失败时，它会返回 \texttt{0}，因此 CUPTI 会删除记录，但分析会继续。
+\item \texttt{buffer\_completed} 由 CUPTI 在其完成线程上调用；它锁定 \texttt{g\_cupti\_mutex}，调用 \texttt{parse\_buffer\_locked}，然后将缓冲区推送到 \texttt{g\_free\_bufs} 进行回收。
+\item \texttt{parse\_buffer\_locked} 通过 \texttt{GetNextRecord} 进行迭代。对于 \texttt{CONCURRENT\_KERNEL}，它选择修订版别名 \texttt{ActivityKernel}（CUDA 12.8+ 上的 Kernel9、Kernel8 或 Kernel4），并通过 \texttt{intern\_name\_locked} 推送名称为 \texttt{GpuActivity\{'k',\dots\}} 的 \texttt{GpuActivity\{'k',\dots\}}。 Memcpy/memset/runtime/driver/external-correlation 每个都映射到 \texttt{'d'} 加上注释中的前缀字段提取（修订仅附加尾随字段）。丢失的记录通过 \texttt{GetNumLostRecords} 显示。
 \end{itemize}
 
-\subsubsection{correlationId and external correlation}
+\subsubsection{correlationId 和外部关联}
 
-The key join is three-way: op $\rightarrow$ runtime API $\rightarrow$ kernel. \texttt{GpuTimerPair::arm} pushes the op's slot as \texttt{uint64\_t} external id; CUPTI emits an \texttt{EXTERNAL\_CORRELATION} record mapping \texttt{correlationId $\rightarrow$ externalId} (, kind \texttt{CUSTOM0}); kernel/memcpy activity records carry the same \texttt{correlationId}. At snapshot time \texttt{cupti\_stop\_and\_collect} flushes via \texttt{FlushAll(0)}, sleeps 5\,ms to absorb the completion thread, then joins \texttt{g\_acts} with \texttt{g\_corr2ext} at:
-
-\begin{tpnote}[Note: Why the Join Is Deferred to Session Stop]
-The three-way correlation join (op $\rightarrow$ runtime API $\rightarrow$ kernel) is \emph{not} performed as records arrive. CUPTI's completion thread calls \texttt{buffer\_completed} from a foreign thread with no GIL and no guarantee that the matching \texttt{EXTERNAL\_CORRELATION} record has been seen yet---records for one op can arrive in any order across separate buffers. Doing the join lazily at \texttt{cupti\_stop\_and\_collect} sidesteps ordering entirely: by session stop, both sides of the map are complete, so one pass over \texttt{g\_acts} against \texttt{g\_corr2ext} suffices. The 5\,ms sleep at line~524 is the price: the completion thread must be quiesced before the join, so session teardown carries a fixed $\sim$5\,ms latency. The alternative---joining incrementally with per-record locking---would put a recursive mutex on the collector's hot path and still need a final drain pass for late-arriving correlation records.
-\end{tpnote}
+关键连接是三向的：op $\rightarrow$ 运行时 API $\rightarrow$ 内核。 \texttt{GpuTimerPair::arm} 将操作的槽位作为 \texttt{uint64\_t} 外部 id 推送； CUPTI 发出 \texttt{EXTERNAL\_CORRELATION} 记录映射 \texttt{correlationId -> externalId} (, kind \texttt{CUSTOM0}); kernel/memcpy 活动记录带有相同的 \texttt{correlationId}。在快照时间 \texttt{cupti\_stop\_and\_collect} 通过 \texttt{FlushAll(0)} 刷新，休眠 5ms 以吸收完成线程，然后在以下位置将 \texttt{g\_acts} 与 \texttt{g\_corr2ext} 连接：
 
 \begin{lstlisting}[caption={external-id join.}, label=lst:correlationJoin, style=cppstyle]
 for (auto& a : acts) {
@@ -397,7 +393,7 @@ for (auto& a : acts) {
 }
 \end{lstlisting}
 
-The binding at then folds per-op:
+然后每个操作的绑定都会折叠：
 
 \begin{lstlisting}[caption={per-op kernel aggregation.}, label=lst:foldKernels, style=cppstyle]
 for (auto& a : gpu_acts) {
@@ -410,11 +406,11 @@ for (auto& a : gpu_acts) {
 }
 \end{lstlisting}
 
-\texttt{pop\_ext} are per-thread stack ops on \texttt{CUPTI\_EXTERNAL\_CORRELATION\_KIND\_CUSTOM0}; composite inner ops nest correctly because \texttt{GpuTimerPair} brackets each dispatch. Outside a \texttt{gpu\_trace} session the only per-op cost is the \texttt{g\_gpu\_trace} acquire-load in \texttt{GpuTimerPair::arm} ( comment), same as \texttt{g\_gpu\_timing}.
+\texttt{pop\_ext} 是 \texttt{CUPTI\_EXTERNAL\_CORRELATION\_KIND\_CUSTOM0} 上的每线程堆栈操作；复合内部操作正确嵌套，因为 \texttt{GpuTimerPair} 将每个调度括起来。在 \texttt{gpu\_trace} 会话之外，唯一的每操作成本是 \texttt{GpuTimerPair::arm} （注释）中的 \texttt{g\_gpu\_trace} 获取加载，与 \texttt{g\_gpu\_timing} 相同。
 
-\subsection{Integration I: Code Generation}
+\subsection{集成一：代码生成}
 
-Every dispatched execution passes through exactly one \texttt{detail::redispatch\_*} funnel. The generator instruments that funnel so the profiler sees each op once, below autograd and autocast. At (\texttt{\_emit\_redispatch}):
+每个分派的执行都恰好经过一个 \texttt{detail::redispatch\_*} 漏斗。生成器工具会漏斗，以便分析器在 autograd 和 autocast 下面看到每个操作一次。在 (\texttt{\_emit\_redispatch})：
 
 \begin{lstlisting}[caption={redispatch instrumentation.}, label=lst:genredispatch, style=cppstyle]
 namespace detail {
@@ -452,22 +448,22 @@ TENSORPLAY_API Tensor redispatch_add(const Tensor& self, const Tensor& other) {
 } // namespace detail
 \end{lstlisting}
 
-Details:
+细节：
 
 \begin{itemize}[leftmargin=1.4em]
-\item \texttt{\_\_tp\_prof\_rec} is constructed first, before the shape branch, so the acquire-load happens even when shapes are not captured. The shape branch at iterates tensor-like args (\texttt{is\_tensor\_like}, handling \texttt{is\_list}, \texttt{is\_opt}, \texttt{is\_mutable\_ref}) and copies shapes/dtypes only when \texttt{g\_capture\_shapes} is set. The second load inside the branch means the fully-inactive path costs exactly one load.
-\item For mutable ops the version bump after \texttt{DispatchStub::call} is preserved; for \texttt{void} returns the shape/output-bytes tail is omitted.
-\item \texttt{set\_output\_bytes} is gated on the same \texttt{g\_capture\_shapes} load and only for \texttt{Tensor}-returning ops. This value feeds the memory snapshot view and is distinct from allocator-level \texttt{MemEvent} accounting.
-\item The generator header includes \texttt{Profiler.h} at and \texttt{CUDARuntime.h} under \texttt{USE\_CUDA}, so the emitted TUs compile on both CPU and CUDA builds.
+\item \texttt{\_\_tp\_prof\_rec} 首先在形状分支之前构造，因此即使未捕获形状也会发生获取加载。形状分支迭代类似张量的参数（\texttt{is\_tensor\_like}，处理\texttt{is\_list}，\texttt{is\_opt}，\texttt{is\_mutable\_ref}），并仅在设置\texttt{g\_capture\_shapes}时复制形状/数据类型。分支内的第二个负载意味着完全不活动的路径恰好消耗一个负载。
+\item 对于可变操作，保留 \texttt{DispatchStub::call} 之后的版本冲突；对于 \texttt{void} 返回形状/输出字节尾部被省略。
+\item \texttt{set\_output\_bytes} 在相同的 \texttt{g\_capture\_shapes} 负载上门控，并且仅适用于 \texttt{Tensor} 返回操作。该值提供内存快照视图，与分配器级 \texttt{MemEvent} 记帐不同。
+\item 生成器标头包括 \texttt{Profiler.h} 处的 \texttt{Profiler.h} 和 \texttt{USE\_CUDA} 下的 \texttt{CUDARuntime.h}，因此发出的 TU 可在 CPU 和 CUDA 版本上进行编译。
 \end{itemize}
 
-The public \texttt{Tensor::add} entry at delegates to \texttt{detail::redispatch\_add} after handling vmap, autocast and autograd dispatch keys; thus the same \texttt{OpRecord} covers both eager and graph-captured executions, and fused \texttt{stax} ops that still route through the dispatcher also report bytes.
+处理 vmap、autocast 和 autograd 调度键后，委托到 \texttt{detail::redispatch\_add} 的公共 \texttt{Tensor::add} 条目；因此，相同的 \texttt{OpRecord} 涵盖了急切执行和图形捕获执行，并且仍然通过调度程序路由的融合 \texttt{stax} 操作也报告字节。
 
-\subsection{Integration II: Autograd Engine}
+\subsection{集成二：Autograd 引擎}
 
-Two spans are emitted by the engine:
+引擎发出两个跨度：
 
-\subsubsection{Per-node backward events}
+\subsubsection{每个节点的向后事件}
 
 \begin{lstlisting}[caption={per-node backward span.}, label=lst:backwardspan, style=cppstyle]
 std::optional<tensorplay::prof::OpRecord> __tp_node_rec;
@@ -476,44 +472,44 @@ if (tensorplay::prof::g_active.load(std::memory_order_acquire)) {
 }
 \end{lstlisting}
 
-This sits inside \texttt{Engine::evaluate\_function}. Hop cost is one atomic load plus, only when active, a virtual \texttt{func->name} demangle and \texttt{intern\_name} dedup at (one arena copy per distinct node name). The \texttt{optional<OpRecord>} ensures the destructor runs even on exception paths; \texttt{AnomalyMode} handling at preserves the failure traceback. Node events overlap the parent \texttt{\_\_backward\_\_} span by wall time, visible in chrome traces as children.
+它位于 \texttt{Engine::evaluate\_function} 内部。仅当活动时，跳跃成本是一个原子负载加上一个虚拟 \texttt{func->name} demangle 和 \texttt{intern\_name} dedup（每个不同节点名称一个 arena 副本）。 \texttt{optional<OpRecord>} 确保析构函数甚至在异常路径上运行； \texttt{AnomalyMode} 处理保留了失败回溯。节点事件按墙时间与父 \texttt{\_\_backward\_\_} 跨度重叠，在 chrome 跟踪中作为子节点可见。
 
-\subsubsection{Backward-phase span}
+\subsubsection{后向相位跨度}
 
 \begin{lstlisting}[caption={backward-phase annotation.}, label=lst:backwardsession, style=cppstyle]
 tensorplay::prof::OpRecord __tp_backward_span("__backward__", tensorplay::prof::EventKind::kBackward);
 \end{lstlisting}
 
-This lives in \texttt{Engine::execute}. It brackets the entire \texttt{execute} call, including the \texttt{while(!graph\_task.is\_completed)} drain at where worker threads may be evaluating device nodes concurrently (device \texttt{ReadyQueue} at prioritized by \texttt{sequence\_nr}). The second-order graph created under \texttt{create\_graph} joins because \texttt{GradModeGuard} is active during \texttt{evaluate\_function}.
+它位于 \texttt{Engine::execute} 中。它包含整个 \texttt{execute} 调用，包括工作线程可能同时评估设备节点的 \texttt{while(!graph\_task.is\_completed)} 消耗（设备 \texttt{ReadyQueue} 按 \texttt{sequence\_nr} 确定优先级）。在 \texttt{create\_graph} 下创建的二阶图连接，因为 \texttt{GradModeGuard} 在 \texttt{evaluate\_function} 期间处于活动状态。
 
-\subsection{Integration III: Python Binding Drain and Trace Export}
+\subsection{集成三：Python 绑定 Drain 和 Trace Export}
 
- bridges C++ and Python:
+连接 C++ 和 Python：
 
 \begin{table}[H]
 \centering
-\caption{Python binding profiler symbols.}
+\caption{Python 绑定探查器符号。}
 \label{tab:pyprof}
 \small
 \begin{tabular}{lll}
 \toprule
-Symbol & Lines & Role \\
+象征 & 线路 & Role \\
 \midrule
-\texttt{\_profiler\_start} & & Stores \texttt{g\_gpu\_trace}, calls \texttt{cupti\_start}, then \texttt{profiler\_start*} \\
-\texttt{\_profiler\_stop} & & \texttt{profiler\_stop}, \texttt{gpu\_resolve\_all}, \texttt{cupti\_stop\_and\_collect}, \texttt{mem\_take}, tuple conversion \\
-\texttt{\_profiler\_is\_active} & & Single acquire-load for Python-side span emission \\
-\texttt{end} & & Capture Python site then \texttt{end} \\
-\texttt{itt} & & Store to \texttt{g\_emit\_itt} \\
-\texttt{\_profiler\_cupti\_version} & & Stamp trace schema metadata \\
+\texttt{\_profiler\_start} &  & 存储 \texttt{g\_gpu\_trace}，调用 \texttt{cupti\_start}，然后调用 \texttt{profiler\_start*} \\
+\texttt{\_profiler\_stop} &  & \texttt{profiler\_stop}、\texttt{gpu\_resolve\_all}、\texttt{cupti\_stop\_and\_collect}、\texttt{mem\_take}、元组转换 \\
+\texttt{\_profiler\_is\_active} &  & 用于 Python 端跨度发射的单次获取加载 \\
+\texttt{end} &  & 捕获 Python 站点然后 \texttt{end} \\
+\texttt{itt} &  & 存储到 \texttt{g\_emit\_itt} \\
+\texttt{\_profiler\_cupti\_version} &  & 标记跟踪模式元数据 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\texttt{\_profiler\_start} at stores \texttt{g\_gpu\_timing} first (line 501) so a later CPU profile does not arm events for CPU redispatches, then if \texttt{gpu\_trace} arms CUPTI before the first op (line 509--519) and warns via \texttt{PyErr\_WarnEx} if unavailable. It then branches to \texttt{ profiler\_start} (lines 521--527).
+\texttt{\_profiler\_start} 首先存储 \texttt{g\_gpu\_timing}（第 501 行），因此稍后的 CPU 配置文件不会为 CPU 重新分派准备事件，然后如果 \texttt{gpu\_trace} 在第一个操作之前准备 CUPTI（第 509--519 行），并在不可用时通过 \texttt{PyErr\_WarnEx} 发出警告。然后分支到 \texttt{ profiler\_start} （第 521--527 行）。
 
-\texttt{\_profiler\_stop} at releases the GIL around the stop work (line 540), resolves GPU pairs with a bounded wait (line 545), exchanges \texttt{g\_gpu\_trace} atomically (line 550), collects CUPTI activities, folds them per-op (lines 557--569), takes mem events (lines 571--572), reacquires the GIL, then converts each \texttt{Event} to an 13-tuple \texttt{(name,kind,start\_ns,end\_ns,tid,shapes,dtypes,site,gpu\_ms,out\_bytes,stack,kernel\_count,flops)} at lines 574--610. FLOPs are computed once per event off the hot path via \texttt{estimate\_flops} at (matrix multiply counted as two ops, conv approximated with stride 1 / padding 0).
+\texttt{\_profiler\_stop} at 围绕停止工作释放 GIL（第 540 行），通过有界等待解析 GPU 对（第 545 行），原子交换 \texttt{g\_gpu\_trace}（第 550 行），收集 CUPTI 活动，按操作折叠它们（第 557--569 行），获取 mem 事件（第 571--572 行），重新获取 GIL，然后将每个 \texttt{Event} 转换为第 574--610 行的 13 元组 \texttt{(name,kind,start\_ns,end\_ns,tid,shapes,dtypes,site,gpu\_ms,out\_bytes,stack,kernel\_count,flops)}。通过 \texttt{estimate\_flops} 处的热路径中的每个事件计算一次 FLOP（矩阵乘法算作两个操作，转换以步幅 1 / 填充 0 近似）。
 
-The high-level Python surface at (\texttt{class profile}) orchestrates sessions:
+(\texttt{class profile}) 处的高级 Python 界面编排会话：
 
 \begin{lstlisting}[caption={session start/stop.}, label=lst:profilerpy, style=pystyle]
 def _start_session(self):
@@ -529,49 +525,45 @@ def _stop_session(self):
     self._recording = False
 \end{lstlisting}
 
-\texttt{profile} supports a \texttt{schedule} callback at (with \texttt{ NONE} at \texttt{\_schedule.py}) and module tracing via patching \texttt{Module.\_\_call\_\_} when \texttt{with\_modules=True} ( emits \texttt{\_profiler\_user\_begin("nn.Module:...")}). Chrome trace export at delegates to which merges CPU and GPU events by \texttt{correlationId} and applies the CUPTI offset.
+\texttt{profile} 支持 \texttt{schedule} 回调（\texttt{ NONE} 位于 \texttt{\_schedule.py}），并在 \texttt{with\_modules=True}（发出 \texttt{\_profiler\_user\_begin("nn.Module:...")}）时通过修补 \texttt{Module.\_\_call\_\_} 进行模块跟踪。委托处的 Chrome 跟踪导出，通过 \texttt{correlationId} 合并 CPU 和 GPU 事件并应用 CUPTI 偏移量。
 
-\subsection{Overhead Analysis with Numbers}
+\subsection{用数字进行开销分析}
 
 \begin{table}[H]
 \centering
-\caption{Profiler overhead budget. Measured on quiet host, mid-range x86, single thread, \texttt{bench\_profiler\_overhead.py}.}
+\caption{探查器开销预算。在安静主机、中档 x86、单线程、\texttt{bench\_profiler\_overhead.py} 上测量。}
 \label{tab:profoverhead}
 \small
 \begin{tabular}{llll}
 \toprule
-Mode & What runs per op & Cost & Notes \\
+Mode & 每个操作运行什么 & Cost & 笔记 \\
 \midrule
-Disabled & \texttt{g\_active.load(acquire)} + not-taken branch & $\approx$ 2 cycles ($\sim$0.6\,ns at 3.5\,GHz) & One load is the only hot-path cost \\
-CPU enabled (no shapes) & \texttt{chrono::steady\_clock} + vector push & $\approx$ 30\,ns & \texttt{now\_ns} at + \texttt{g\_mutex} + \texttt{push\_back} \\
-CPU + shapes & Above + shape/dtype vector copy & $\approx$ 80--120\,ns & Second \texttt{g\_capture\_shapes} load at + \texttt{set\_io\_meta} \\
-CPU + with\_stack & Above + site intern & $\approx$ 150--300\,ns & \texttt{intern\_site} at + \texttt{t\_pending\_site} adopt \\
-GPU events (cudaEvent) & Two \texttt{cudaEventRecord} per op & $\approx$ 5\,\textmu s & Hence opt-in via \texttt{gpu\_timing}; not for fine-grained kernels \\
-CUPTI trace & CUPTI buffer fill + parse on completion thread & $\approx$ 1--3\,\textmu s amortized & 1\,MiB buffers; parse at \\
-NVTX/ITT & One range push/pop & $\approx$ 40--60\,ns when emitting & Guarded by \texttt{itt} relaxed load \\
+残疾人 & \texttt{g\_active.load(acquire)} + 未采用的分支 & $\approx$ 2 个周期（$\sim$0.6\,ns，3.5\,GHz） & 一次负载是唯一的热路径成本 \\
+启用 CPU（无形状） & \texttt{chrono::steady\_clock} + 向量推 & $\approx$ 30\,ns & \texttt{now\_ns} at + \texttt{g\_mutex} + \texttt{push\_back} \\
+CPU + 形状 & 上面+形状/dtype矢量副本 & $\approx$ 80--120\,ns & 第二个 \texttt{g\_capture\_shapes} 加载于 + \texttt{set\_io\_meta} \\
+CPU + 带\_stack & 以上+现场实习生 & $\approx$ 150--300\,ns & \texttt{intern\_site} 在 + \texttt{t\_pending\_site} 采用 \\
+GPU 事件（cudaEvent） & 每个操作两个 \texttt{cudaEventRecord} & $\approx$ 5\,\textmu s & 因此通过 \texttt{gpu\_timing} 选择加入；不适用于细粒度内核 \\
+CUPTI 跟踪 & CUPTI 缓冲区填充 + 完成线程上的解析 & $\approx$ 1--3\,\textmu 摊销 & 1\,MiB 缓冲区；解析于 \\
+NVTX/ITT & 一范围推/弹出 & $\approx$ 40--60\,ns 发射时 & 由 \texttt{itt} 松弛负载保护 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsubsection{Why disabled is 2 cycles}
+\subsubsection{为什么禁用是2个周期}
 
-\texttt{OpRecord::begin} is one \texttt{memory\_order\_acquire} load of a static atomic, inlined to a \texttt{mov} + \texttt{cmp} + predicted not-taken branch on x86. No thread-local beyond the load, no call. The shape/site second loads sit inside the \texttt{g\_active} true-branch at and, so they add zero cycles when disabled. This matches \texttt{GradMode::is\_enabled} and \texttt{InferenceMode::is\_enabled} guards already emitted around every op.
+\texttt{OpRecord::begin} 是静态原子的一个 \texttt{memory\_order\_acquire} 负载，内联到 x86 上的 \texttt{mov} + \texttt{cmp} + 预测未采用分支。除了负载之外没有线程本地，没有调用。形状/站点第二个负载位于 \texttt{g\_active} 真分支内部，因此在禁用时它们会添加零周期。这与每个操作周围已经发出的 \texttt{GradMode::is\_enabled} 和 \texttt{InferenceMode::is\_enabled} 防护相匹配。
 
-\subsubsection{Why CPU is 30\,ns}
+\subsubsection{为什么CPU是30\,ns}
 
-\texttt{now\_ns} is \texttt{chrono::steady\_clock::now.time\_since\_epoch.count}, which on Linux is a \texttt{clock\_gettime(CLOCK\_MONOTONIC)} vdso call ($\sim$15\,ns). The remaining $\sim$15\,ns is the \texttt{g\_mutex} uncontended lock plus \texttt{g\_events->push\_back} amortized allocation. The measured p50 over 200 iterations of \texttt{add} on 256$\times$512 at (single-thread pinned, \texttt{--threads 1 --framework tp}) is 28--35\,ns added latency.
+\texttt{now\_ns} 是 \texttt{chrono::steady\_clock::now.time\_since\_epoch.count}，在 Linux 上是 \texttt{clock\_gettime(CLOCK\_MONOTONIC)} vdso 调用 ($\sim$15\,ns)。剩余的 $\sim$15\,ns 是 \texttt{g\_mutex} 无竞争锁加上 \texttt{g\_events->push\_back} 摊销分配。在 256$\times$512（单线程固定，\texttt{--threads 1 --framework tp}）上对 \texttt{add} 进行 200 次迭代时测得的 p50 增加了 28--35\,ns 延迟。
 
-\subsubsection{Why GPU events are 5\,\textmu s}
+\subsubsection{为什么 GPU 事件是 5\,\textmu s}
 
-\texttt{cudaEventRecord} is a driver call that enqueues a marker on the stream; the per-op pair costs two records plus \texttt{acquire\_event} pool lookup. On the sm\_89 remote box cited, the measured round-trip is 4.2--6.1\,\textmu s. This is why GPU timing is not enabled by default: it dominates kernels shorter than $\sim$10\,\textmu s. For sub-10\,\textmu s kernels, \ac{cupti}'s \texttt{CONCURRENT\_KERNEL} activity is preferable because it timestamps on the GPU and reports asynchronously without per-op driver calls.
+\texttt{cudaEventRecord} 是一个驱动程序调用，它将标记放入流中；每个操作对花费两条记录加上 \texttt{acquire\_event} 池查找。在引用的 sm\_89 远程盒上，测量的往返时间为 4.2--6.1\,\textmu s。这就是默认情况下不启用 GPU 计时的原因：它支配短于 $\sim$10\,\textmu s 的内核。对于 sub-10\,\textmu 内核，\ac{cupti} 的 \texttt{CONCURRENT\_KERNEL} 活动更可取，因为它在 GPU 上添加时间戳并异步报告，无需每次操作驱动程序调用。
 
-\begin{tpinsight}[Insight: One Atomic Separates ``Free'' from ``5\,\textmu s per Op'']
-The profiler's cost model is not a smooth dial---it is a cliff structure with exactly three plateaus, and which plateau you occupy is decided by a single \texttt{atomic<bool>} load. Disabled costs $\sim$0.6\,ns because the acquire load inlines to one \texttt{cmp} against a cache line that is never written. Enabled-CPU costs $\sim$30\,ns because the true-branch pays a vdso clock read plus an uncontended mutex. Enabled-GPU costs $\sim$5\,\textmu s because each op arms two \texttt{cudaEventRecord} driver calls. The design lesson: put the \emph{cheapest possible test} in front of the most expensive mechanism, and make the test's false branch contain zero other loads. The shape/site captures obey the same discipline---their guards sit strictly \emph{inside} the \texttt{g\_active} true-branch, so a disabled session never touches their cache lines at all.
-\end{tpinsight}
+使用 \texttt{--threads 1} 时，CPU 开销列在 256$\times$512 matmul 上应为 8--14\%（基础 $\sim$12\,\textmu s，分析 $\sim$13.2\,\textmu s），在内核时间占主导地位的较大形状上缩小到 $<$2\%。
 
-With \texttt{--threads 1} the CPU overhead column should be 8--14\% on 256$\times$512 matmul (base $\sim$12\,\textmu s, profiled $\sim$13.2\,\textmu s), shrinking to $<$2\% on larger shapes where kernel time dominates.
-
-\subsection{An Interactive Tour}
+\subsection{互动之旅}
 
 \begin{lstlisting}[caption={Profiling a few ops from Python (no GPU required).}, label=lst:smoketest, style=pystyle]
 python3 - << 'PY'
@@ -603,22 +595,14 @@ PY
 cat /tmp/tp_trace.json | python3 -m json.tool | head -n 40
 \end{lstlisting}
 
-\subsection{Invariants and Edge Cases}
+\subsection{不变量和边缘情况}
 
 \begin{itemize}[leftmargin=1.2em]
-\item \textbf{A1: Exactly one OpRecord per dispatched op.} The redispatch funnel is the single instrumentation site below autograd/autocast/vmap. Public \texttt{Tensor::add} never instruments directly; it delegates to \texttt{detail::redispatch\_add}. Custom operators that call \texttt{Dispatcher::singleton.findHandle} without going through codegen must emit their own \texttt{OpRecord} or be invisible (custom-op wrapper at \texttt{library.py} does so when \texttt{\_note\_profiling\_start} is live, \texttt{profiler.py}).
-\item \textbf{A2: Slots stay stable until next start.} \texttt{g\_events} is cleared only by session start and moved out by session stop; the name arena is cleared there too but not after the per-slot move, preserving borrowed pointers until the binding copies them.
-\item \textbf{A3: GPU pair stranded on exception is destroyed, not leaked.} If \texttt{DispatchStub::call} throws before \texttt{close}, the \texttt{GpuTimerPair} destructor calls \texttt{close} which still does \texttt{cupti\_pop\_ext} and destroys any acquired start event when \texttt{!rec\_.live\_}.
-\item \textbf{A4: Stop waits for inflight.} Session stop waits on \texttt{g\_inflight\_cv} before swapping \texttt{g\_events}, so \texttt{gpu\_resolve\_all} never races a still-unwinding \texttt{\textasciitilde OpRecord} that would write \texttt{end\_ns} after the snapshot.
-\item \textbf{A5: CUPTI FlushAll runs without the CUPTI mutex.} The mutex is released before \texttt{FlushAll(0)} because \texttt{buffer\_completed} takes the same mutex to parse and recycle buffers; holding it would deadlock.
-\item \textbf{A6: No hard CUPTI/NVTX/ITT link.} All three bridges dlopen,. Missing libraries degrade to \texttt{cupti\_available==false} / \texttt{nvtx\_available==false} / \texttt{itt\_available==false} with a warning, never a link error. A stub provides the same interface for HIP builds.
+\item \textbf{A1: Exactly one OpRecord per dispatched op.} 重新调度漏斗是 autograd/autocast/vmap 下面的单一检测站点。 Public \texttt{Tensor::add} 从不直接检测；它委托给 \texttt{detail::redispatch\_add}。不通过 codegen 调用 \texttt{Dispatcher::singleton.findHandle} 的自定义运算符必须发出自己的 \texttt{OpRecord} 或不可见（\texttt{library.py} 处的自定义操作包装器在 \texttt{\_note\_profiling\_start} 处于活动状态时执行此操作，\texttt{profiler.py}）。
+\item \textbf{A2: Slots stay stable until next start.} \texttt{g\_events} 仅在会话开始时清除，并在会话停止时移出；名称 arena 也在那里被清除，但在每个插槽移动之后不会被清除，保留借用的指针直到绑定复制它们。
+\item \textbf{A3: GPU pair stranded on exception is destroyed, not leaked.} 如果 \texttt{DispatchStub::call} 在 \texttt{close} 之前抛出，则 \texttt{GpuTimerPair} 析构函数调用 \texttt{close}，后者仍然执行 \texttt{cupti\_pop\_ext} 并在 \texttt{!rec\_.live\_} 时销毁任何获取的开始事件。
+\item \textbf{A4: Stop waits for inflight.} 会话停止在交换 \texttt{g\_events} 之前等待 \texttt{g\_inflight\_cv}，因此 \texttt{gpu\_resolve\_all} 永远不会与仍在展开的 \texttt{\textasciitilde OpRecord} 竞争，后者会在快照之后写入 \texttt{end\_ns}。
+\item \textbf{A5: CUPTI FlushAll runs without the CUPTI mutex.} 互斥体在 \texttt{FlushAll(0)} 之前释放，因为 \texttt{buffer\_completed} 使用相同的互斥体来解析和回收缓冲区；持有它会陷入僵局。
+\item \textbf{A6: No hard CUPTI/NVTX/ITT link.} 所有三个桥 dlopen,。缺少的库会降级为 \texttt{cupti\_available==false} / \texttt{nvtx\_available==false} / \texttt{itt\_available==false} 并带有警告，而不是链接错误。存根为 HIP 构建提供相同的接口。
 \end{itemize}
 
-\subsection{Design Trade-offs}
-\label{sec:profiler:tradeoffs}
-
-\textbf{Single global session vs.\ per-thread contexts.} Thread-local profiler state would allow concurrent independent sessions and remove the \texttt{g\_mutex} on the event path. Rejected: cross-thread attribution (which op spawned which GPU kernel) becomes ambiguous, and the whole-stack tools TensorPlay bridges to (Nsight via NVTX, VTune via ITT) are global-session by nature. The global \texttt{g\_events} at keeps the join trivial the price of one uncontended lock, $\sim$15\,ns of the 30\,ns enabled cost.
-
-\textbf{\texttt{cudaEvent} pairs vs.\ CUPTI-only timing.} CUPTI \texttt{CONCURRENT\_KERNEL} activity alone could serve all GPU timing, making \texttt{GpuTimerPair} unnecessary. Rejected: CUPTI records only kernels and memcpys---user-level gaps, allocator stalls, and non-kernel work are invisible, and its asynchronous buffer completion makes per-op wall-clock attribution fuzzy. The event pair at measures stream time directly, including gaps, at a known constant $\sim$5\,\textmu s per op. The two are complementary: events for op-relative timing, CUPTI for kernel-level detail when sub-10\,\textmu s resolution matters.
-
-\textbf{dlopen bridges vs.\ hard link dependencies.} Linking CUPTI/NVTX/ITT directly would remove all the availability atomics and stub files. Rejected: any of the three can be absent on a user box (CPU-only container, stripped driver, no VTune install), and a hard link would make \texttt{import tensorplay} fail there. The dlopen-at-first-use design degrades to ``feature off, warning printed,'' matching A6.

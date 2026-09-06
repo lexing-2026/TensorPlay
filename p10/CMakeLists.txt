@@ -59,6 +59,7 @@ set(P10_SOURCES
     src/backend/cpu/UpsampleKernels.cpp
     src/backend/cpu/MiscKernels.cpp
     src/backend/cpu/SegmentReduce.cpp
+    src/backend/cpu/SparseSoftMax.cpp
     # TensorShape.cpp, LinearAlgebra.cpp, TensorFactories.cpp, Itertools.cpp.
     src/backend/cpu/UnaryOps.cpp
     src/backend/cpu/Pooling.cpp
@@ -129,6 +130,8 @@ set(P10_SOURCES
     src/backend/composite/Dropout.cpp
     src/backend/composite/Histogram.cpp
     src/backend/composite/PadNdComposite.cpp
+    src/backend/composite/ConvSlowComposite.cpp
+    src/backend/composite/LossNLL.cpp
     src/backend/composite/Integration.cpp
     src/backend/composite/Itertools.cpp
     src/backend/composite/AffineGrid.cpp
@@ -769,6 +772,16 @@ if(USE_CUDA)
             break()
         endif()
     endforeach()
+    # Standalone vendoring at third_party/<lib> is preferred; the nested
+    # layout above is only a fallback for older checkouts.
+    if(NOT TP_NATIVE_FLASH_SRC AND
+       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/flash-attention/csrc/flash_attn/src/flash.h" AND
+       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/cutlass/include/cute/tensor.hpp")
+        set(TP_NATIVE_FLASH_SRC
+            "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/flash-attention/csrc/flash_attn/src")
+        set(TP_NATIVE_CUTLASS_INCLUDE
+            "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/cutlass/include")
+    endif()
     if(EXISTS "${TP_NATIVE_FLASH_SRC}/flash.h" AND
        EXISTS "${TP_NATIVE_CUTLASS_INCLUDE}/cute/tensor.hpp")
         target_include_directories(p10 PRIVATE

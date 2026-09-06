@@ -6,7 +6,7 @@
 
 layout(std430) buffer;
 
-layout(set = 0, binding = 0, FORMAT) uniform PRECISION restrict writeonly image3D uOutput;
+layout(set = 0, binding = 0, rgba8i) uniform PRECISION restrict writeonly iimage3D uOutput;
 layout(set = 0, binding = 1) uniform PRECISION sampler3D uInput;
 layout(set = 0, binding = 2) uniform PRECISION restrict Block {
   ivec4 extents;
@@ -30,5 +30,5 @@ void main() {
   }
 
   const vec4 v = texelFetch(uInput, pos, 0);
-  imageStore(uOutput, pos, vec4(notEqual(v, v)));
+  imageStore(uOutput, pos, ivec4(notEqual(v, v)));
 }

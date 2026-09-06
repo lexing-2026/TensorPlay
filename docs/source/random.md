@@ -12,12 +12,12 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay.manual_seed
-    tensorplay.seed
-    tensorplay.initial_seed
-    tensorplay.get_rng_state
-    tensorplay.set_rng_state
+    tensorplay.random.manual_seed
+    tensorplay.random.seed
+    tensorplay.random.initial_seed
+    tensorplay.random.get_rng_state
+    tensorplay.random.set_rng_state
     tensorplay.random.fork_rng
-    tensorplay.default_generator
+    tensorplay.random.default_generator
 ```
 

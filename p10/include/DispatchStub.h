@@ -439,8 +439,8 @@ private:
 
 // Accelerator device registration: each backend TU registers its kernel
 // into the stub's device slot via a static registrar object.  The CUDA
-// registrar doubles for HIP in the ROCm build, mirroring the hipified
-// call sites that keep the CUDA registration macro.
+// registrar doubles for HIP in the ROCm build, reusing the CUDA registration
+// macro for the hipified call sites.
 namespace {
 template <typename DispatchStub>
 struct RegisterCUDADispatch {

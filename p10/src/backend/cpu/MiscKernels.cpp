@@ -10,6 +10,13 @@
 #include "Utils.h"
 #include "Generator.h"
 #include "DistributionsHelper.h"
+#include "TensorIterator.h"
+#include "cpu/Reduce.h"
+#include "ReductionKernels.h"
+#include "Parallel.h"
+#include "OpMathType.h"
+#include <bit>
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -197,6 +204,271 @@ Tensor glu_backward_cpu(const Tensor& grad_output, const Tensor& self, int64_t d
     return Tensor::cat({grad_input_first, grad_input_second}, d);
 }
 
+// ---------------------------------------------------------------------------
+// hash_tensor
+//
+// Content hash of a tensor reduced over the given dimensions.  The only
+// hashing scheme is XOR-sum: values are widened to uint64 (floating values
+// bit-cast through double) and folded with exclusive-or, so the reduction is
+// order-independent and every element participates exactly once.  An empty
+// reduction (numel == 0) hashes to 0.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+enum class HashMode { XorSum = 0 };
+
+template <typename scalar_t>
+struct XorSumOps {
+    inline uint64_t reduce(uint64_t acc, scalar_t data, int64_t /*idx*/) const {
+        if constexpr (std::is_same_v<scalar_t, float> ||
+                      std::is_same_v<scalar_t, double> ||
+                      std::is_same_v<scalar_t, Half> ||
+                      std::is_same_v<scalar_t, BFloat16>) {
+            if constexpr (std::is_same_v<scalar_t, double>) {
+                return acc ^ static_cast<uint64_t>(std::bit_cast<uint64_t>(data));
+            }
+            const double widened = static_cast<double>(data);
+            return acc ^ static_cast<uint64_t>(std::bit_cast<uint64_t>(widened));
+        } else {
+            return acc ^ static_cast<uint64_t>(data);
+        }
+    }
+    inline uint64_t combine(uint64_t a, uint64_t b) const { return a ^ b; }
+    inline uint64_t project(uint64_t a) const { return a; }
+    inline uint64_t translate_idx(uint64_t acc, int64_t) const { return acc; }
+};
+
+// View the reduction result with size-1 stride-0 dims at the reduced
+// positions so the iterator can identify the reduced dims from the output's
+// strides (used when keepdim=false).
+Tensor insert_reduce_strides(const Tensor& result, int64_t ndim,
+                             const std::vector<bool>& mask, bool keepdim) {
+    if (keepdim) return result;
+    std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(result.shape());
+    std::vector<int64_t> stride = static_cast<std::vector<int64_t>>(result.strides());
+    for (int64_t dim = ndim - 1; dim >= 0; --dim) {
+        if (mask[static_cast<size_t>(dim)]) {
+            shape.insert(shape.begin() + dim, 1);
+            stride.insert(stride.begin() + dim, 0);
+        }
+    }
+    Tensor as_strided_src = result;
+    return Tensor::as_strided(as_strided_src, shape, stride, std::nullopt);
+}
+
+#define TP_HASH_CASE(ctype, name) \
+    case DType::name: { \
+        binary_kernel_reduce(iter, XorSumOps<ctype>{}, static_cast<uint64_t>(0)); \
+        break; \
+    }
+
+// The result dtype is fixed at uint64; empty inputs require an explicit
+// reduction dim and every listed dim must have non-zero size.
+void hash_tensor_check(const Tensor& self, const std::vector<int64_t>& dims,
+                       int64_t mode) {
+    if (mode != static_cast<int64_t>(HashMode::XorSum)) {
+        TP_THROW(RuntimeError, "Unknown hash_tensor mode: ", mode);
+    }
+    if (self.numel() == 0) {
+        TP_CHECK(!dims.empty(),
+                 "hash_tensor: Expected reduction dim to be specified for "
+                 "input.numel() == 0. Specify the reduction dim with the "
+                 "'dim' argument.");
+    }
+    for (int64_t d : dims) {
+        if (self.dim() == 0) {
+            TP_CHECK(d == 0 || d == -1,
+                     "hash_tensor: Expected reduction dim -1 or 0 for scalar "
+                     "but got ", d);
+        } else {
+            const int64_t wrapped = d < 0 ? d + self.dim() : d;
+            TP_CHECK(wrapped >= 0 && wrapped < self.dim(),
+                     "hash_tensor: dimension out of range");
+            TP_CHECK(self.size(wrapped) != 0,
+                     "hash_tensor: Expected reduction dim ", d,
+                     " to have non-zero size.");
+        }
+    }
+}
+
+void hash_tensor_into(const Tensor& self, const std::vector<int64_t>& dims,
+                      bool keepdim, int64_t mode, Tensor& result) {
+    hash_tensor_check(self, dims, mode);
+    const int64_t ndim = self.dim();
+    std::vector<bool> mask(static_cast<size_t>(ndim > 0 ? ndim : 1), false);
+    std::vector<int64_t> wrapped_dims;
+    if (dims.empty()) {
+        for (int64_t d = 0; d < ndim; ++d) wrapped_dims.push_back(d);
+    } else {
+        for (int64_t d : dims) {
+            const int64_t w = d < 0 ? d + ndim : d;
+            wrapped_dims.push_back(w);
+        }
+    }
+    for (int64_t d : wrapped_dims) {
+        if (d >= 0 && d < ndim) mask[static_cast<size_t>(d)] = true;
+    }
+
+    if (self.numel() == 0) {
+        result.fill_(Scalar(static_cast<uint64_t>(0)));
+        return;
+    }
+    Tensor viewed = insert_reduce_strides(result, ndim, mask, keepdim);
+    TensorIterator iter = TensorIterator::reduce_op(viewed, self);
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_HASH_CASE)
+        default:
+            TP_THROW(NotImplementedError,
+                     "hash_tensor: unsupported input dtype");
+    }
+}
+
+Tensor hash_tensor_cpu(const Tensor& self, const std::vector<int64_t>& dims,
+                       bool keepdim, int64_t mode) {
+    hash_tensor_check(self, dims, mode);
+    const int64_t ndim = self.dim();
+    std::vector<int64_t> reduce_dims;
+    if (dims.empty()) {
+        for (int64_t d = 0; d < ndim; ++d) reduce_dims.push_back(d);
+    } else {
+        for (int64_t d : dims) {
+            reduce_dims.push_back(d < 0 ? d + ndim : d);
+        }
+    }
+    const std::vector<int64_t> out_shape =
+        compute_reduction_shape(self, reduce_dims, keepdim);
+    Tensor result = Tensor::empty(out_shape, DType::UInt64, self.device());
+    hash_tensor_into(self, dims, keepdim, mode, result);
+    return result;
+}
+
+Tensor& hash_tensor_out_cpu(const Tensor& self, const std::vector<int64_t>& dims,
+                            bool keepdim, int64_t mode, Tensor& result) {
+    if (!result.defined()) {
+        result = hash_tensor_cpu(self, dims, keepdim, mode);
+        return result;
+    }
+    hash_tensor_into(self, dims, keepdim, mode, result);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// _transform_bias_rescale_qkv
+//
+// Fused multi-head-attention preprocessing.  `qkv` is {B, T, 3D} (or nested /
+// padded forms are not accepted here); the three per-head slices get the bias
+// added, and the query slice is additionally scaled by the inverse square
+// root of the per-head dimension.  Output layout is three {B, num_head, T,
+// dim_per_head} tensors (q, k, v).
+// ---------------------------------------------------------------------------
+
+template <typename scalar_t>
+void transform_bias_rescale_qkv_kernel(
+    scalar_t* q_k_v_data,
+    const scalar_t* qkv_data,
+    const scalar_t* qkv_bias_data,
+    int64_t B, int64_t T, int64_t D, int64_t num_head) {
+    const int64_t dim_per_head = D / num_head;
+
+    // qkv      : {B, T, 3, num_head, dim_per_head}
+    // qkv_bias : {3, num_head, dim_per_head}
+    // q_k_v    : {3, B, num_head, T, dim_per_head}
+    const int64_t i_strideB = T * 3 * D;
+    const int64_t i_strideT = 3 * D;
+    const int64_t o_stride = B * num_head * T * dim_per_head;
+
+    // The scale is applied in the accumulate type.
+    using acc_t = typename OpMathType<scalar_t>::type;
+    const acc_t s = acc_t(1) / std::sqrt(static_cast<acc_t>(dim_per_head));
+
+    // Parallel over {B, num_head, T}; the query branch is the only one that
+    // rescales.
+    const int64_t total = B * num_head * T;
+    const int64_t grain = std::max<int64_t>(
+        static_cast<int64_t>(tensorplay::parallel::GRAIN_SIZE) / (3 * dim_per_head),
+        static_cast<int64_t>(1));
+    tensorplay::parallel::parallel_for(0, total, grain,
+        [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            // Recover (b, nh, t) from the linear index; the output index i is
+            // exactly the global per-head position.
+            const int64_t t = i % T;
+            const int64_t nh = (i / T) % num_head;
+            const int64_t b = i / (T * num_head);
+
+            const scalar_t* q_in_ptr = qkv_data + b * i_strideB +
+                t * i_strideT + 0 * D + nh * dim_per_head;
+            const scalar_t* k_in_ptr = qkv_data + b * i_strideB +
+                t * i_strideT + 1 * D + nh * dim_per_head;
+            const scalar_t* v_in_ptr = qkv_data + b * i_strideB +
+                t * i_strideT + 2 * D + nh * dim_per_head;
+
+            const scalar_t* q_bias_ptr = qkv_bias_data + 0 * D + nh * dim_per_head;
+            const scalar_t* k_bias_ptr = qkv_bias_data + 1 * D + nh * dim_per_head;
+            const scalar_t* v_bias_ptr = qkv_bias_data + 2 * D + nh * dim_per_head;
+
+            scalar_t* q_out_ptr = q_k_v_data + 0 * o_stride + i * dim_per_head;
+            scalar_t* k_out_ptr = q_k_v_data + 1 * o_stride + i * dim_per_head;
+            scalar_t* v_out_ptr = q_k_v_data + 2 * o_stride + i * dim_per_head;
+
+            for (int64_t j = 0; j < dim_per_head; ++j) {
+                q_out_ptr[j] = static_cast<scalar_t>(
+                    (static_cast<acc_t>(q_in_ptr[j]) +
+                     static_cast<acc_t>(q_bias_ptr[j])) * s);
+            }
+            for (int64_t j = 0; j < dim_per_head; ++j) {
+                k_out_ptr[j] = k_in_ptr[j] + k_bias_ptr[j];
+            }
+            for (int64_t j = 0; j < dim_per_head; ++j) {
+                v_out_ptr[j] = v_in_ptr[j] + v_bias_ptr[j];
+            }
+        }
+    });
+}
+
+std::tuple<Tensor, Tensor, Tensor> transform_bias_rescale_qkv_cpu(
+    const Tensor& qkv, const Tensor& qkv_bias, int64_t num_head) {
+    const int64_t B = qkv.size(0);
+    const int64_t T = qkv.size(1);
+    const int64_t _3D = qkv.size(2);
+    const int64_t D = _3D / 3;
+    TP_CHECK(D % num_head == 0, "embedding dim must divide num_head");
+    TP_CHECK(_3D % 3 == 0, "third dimension must be a multiple of 3");
+    const int64_t dim_per_head = D / num_head;
+    Tensor q_k_v = Tensor::empty({3, B, num_head, T, dim_per_head},
+                                 qkv.dtype(), qkv.device());
+
+    const Tensor qkv_contig = qkv.contiguous();
+    const Tensor qkv_bias_contig = qkv_bias.contiguous();
+
+#define TP_QKV_CASE(ctype, name) \
+        transform_bias_rescale_qkv_kernel<ctype>( \
+            q_k_v.data_ptr<ctype>(), \
+            qkv_contig.data_ptr<ctype>(), \
+            qkv_bias_contig.data_ptr<ctype>(), \
+            B, T, D, num_head); \
+        break;
+    switch (qkv.dtype()) {
+        case DType::Float32: TP_QKV_CASE(float, Float32)
+        case DType::Float64: TP_QKV_CASE(double, Float64)
+        case DType::Float16: TP_QKV_CASE(Half, Float16)
+        case DType::BFloat16: TP_QKV_CASE(BFloat16, BFloat16)
+        default:
+            TP_THROW(NotImplementedError,
+                     "_transform_bias_rescale_qkv: unsupported dtype");
+    }
+#undef TP_QKV_CASE
+
+    Tensor flat = q_k_v.view({3 * B, num_head, T, dim_per_head});
+    Tensor q = flat.narrow(0, 0, B);
+    Tensor k = flat.narrow(0, B, B);
+    Tensor v = flat.narrow(0, 2 * B, B);
+    return std::make_tuple(q, k, v);
+}
+
+}  // namespace
+
 TENSORPLAY_LIBRARY_IMPL(CPU, MiscKernels) {
     m.impl("diff", diff_cpu);
     m.impl("one_hot", one_hot_cpu);
@@ -221,6 +493,9 @@ TENSORPLAY_LIBRARY_IMPL(CPU, MiscKernels) {
     m.impl("nanquantile", nanquantile_kernel);
     m.impl("histogram.bins_tensor", histogram_bins_tensor_kernel);
     m.impl("histogram.bin_ct", histogram_bin_ct_kernel);
+    m.impl("hash_tensor", hash_tensor_cpu);
+    m.impl("hash_tensor.out", hash_tensor_out_cpu);
+    m.impl("_transform_bias_rescale_qkv", transform_bias_rescale_qkv_cpu);
 }
 
 // resize_ grows the storage in place (preserving the old contents) and then

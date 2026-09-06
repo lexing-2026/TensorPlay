@@ -14,7 +14,7 @@ from typing import Any, Protocol, TypeAlias
 import tensorplay as tp
 from tensorplay import functional as tpF
 from tensorplay.nn import functional as nnF
-from tensorplay.nn.attention.flex_attention import (
+from tensorplay.nn.attention.omni_attention import (
     _DEFAULT_SPARSE_BLOCK_SIZE,
     BlockMask,
     create_block_mask,
@@ -880,7 +880,7 @@ def _create_cp_block_mask(
 
 class _ContextParallel(ParallelStyle):
     class AttentionType(Enum):
-        FLEX = "flex_attention"
+        FLEX = "omni_attention"
         SDPA = "scaled_dot_product_attention"
 
     def __init__(self, seq_dim: int, attention_type: AttentionType) -> None:
@@ -890,7 +890,7 @@ class _ContextParallel(ParallelStyle):
 
     def _apply(self, module: Any, mesh: DeviceMesh) -> Any:
         if self.attention_type == self.AttentionType.FLEX:
-            module.register_forward_pre_hook(partial(self.flex_input_fn, mesh=mesh), with_kwargs=True)
+            module.register_forward_pre_hook(partial(self.omni_input_fn, mesh=mesh), with_kwargs=True)
         elif self.attention_type == self.AttentionType.SDPA:
             module.register_forward_pre_hook(partial(self.sdpa_input_fn, mesh=mesh), with_kwargs=True)
             module.register_forward_hook(partial(self.sdpa_output_fn, mesh=mesh))
@@ -898,7 +898,7 @@ class _ContextParallel(ParallelStyle):
             raise ValueError(f"Unknown attention type: {self.attention_type}")
         return module
 
-    def flex_input_fn(
+    def omni_input_fn(
         self, module: Any, args: Any, kwargs: Any, mesh: DeviceMesh
     ) -> Any:
         del module

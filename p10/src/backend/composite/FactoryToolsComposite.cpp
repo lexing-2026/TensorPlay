@@ -51,7 +51,7 @@ void require_strided_layout(const char* op_name, const std::optional<int64_t>& l
 
 int64_t layout_of(const Tensor& tensor) {
     if (!tensor.is_sparse()) return 2;
-    return tensor.is_sparse_csr() ? 1 : 0;
+    return tensor.unsafeGetTensorImpl()->sparse_layout();
 }
 
 void check_size_nonnegative(const std::vector<int64_t>& size) {

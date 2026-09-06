@@ -643,6 +643,136 @@ Tensor& tensordot_out_kernel(const Tensor& input1, const Tensor& input2,
 
 } // anonymous namespace
 
+// _trilinear computes a trilinear einstein sum with an unrolled dimension:
+// the result is
+//   (i1.unsqueeze(expand1) * i2.unsqueeze(expand2) * i3.unsqueeze(expand3))
+//       .sum(sumdim)
+// with the computation unrolled along `unroll_dim`.  Its main purpose is to
+// unify the computations in bilinear and bilinear_backward.
+Tensor _trilinear_kernel(const Tensor& i1_, const Tensor& i2_, const Tensor& i3_,
+                         const std::vector<int64_t>& expand1_,
+                         const std::vector<int64_t>& expand2_,
+                         const std::vector<int64_t>& expand3_,
+                         const std::vector<int64_t>& sumdim_,
+                         int64_t unroll_dim) {
+    const int64_t total_dim = i1_.dim() + static_cast<int64_t>(expand1_.size());
+    TP_CHECK(unroll_dim >= 0 && unroll_dim < total_dim,
+             "unroll_dim must be in [0,", total_dim - 1, "]");
+    auto to_mask = [](const std::vector<int64_t>& dims, int64_t total) {
+        std::vector<bool> mask(static_cast<size_t>(total), false);
+        for (int64_t d : dims) {
+            TP_CHECK(d >= 0 && d < total,
+                     "dimension list entry out of range");
+            mask[static_cast<size_t>(d)] = true;
+        }
+        return mask;
+    };
+    const std::vector<bool> expand1 = to_mask(expand1_, total_dim);
+    const std::vector<bool> expand2 = to_mask(expand2_, total_dim);
+    const std::vector<bool> expand3 = to_mask(expand3_, total_dim);
+    const std::vector<bool> sumdim = to_mask(sumdim_, total_dim);
+    Tensor i1 = i1_;
+    Tensor i2 = i2_;
+    Tensor i3 = i3_;
+    std::vector<int64_t> output_size;
+    std::vector<int64_t> sum_dims_12, sum_dims_23;
+    output_size.reserve(static_cast<size_t>(total_dim));
+    int64_t unroll_size = -1;
+    for (int64_t i = 0; i < total_dim; ++i) {
+        int64_t s = 0;
+        if (expand1[static_cast<size_t>(i)]) {
+            i1 = i1.unsqueeze(i);
+        } else {
+            s = i1.size(i);
+        }
+        if (expand2[static_cast<size_t>(i)]) {
+            i2 = i2.unsqueeze(i);
+        } else {
+            s = i2.size(i);
+        }
+        if (expand3[static_cast<size_t>(i)]) {
+            i3 = i3.unsqueeze(i);
+            if (sumdim[static_cast<size_t>(i)] && (i != unroll_dim)) {
+                sum_dims_12.push_back(i);
+            }
+        } else {
+            s = i3.size(i);
+            if (sumdim[static_cast<size_t>(i)] && (i != unroll_dim)) {
+                sum_dims_23.push_back(i);
+            }
+        }
+        output_size.push_back(sumdim[static_cast<size_t>(i)] ? 1 : s);
+        if (i == unroll_dim) {
+            unroll_size = s;
+        }
+    }
+    const int64_t slicemul1 = (expand1[static_cast<size_t>(unroll_dim)] ? 0 : 1);
+    const int64_t slicemul2 = (expand2[static_cast<size_t>(unroll_dim)] ? 0 : 1);
+    const int64_t slicemul3 = (expand3[static_cast<size_t>(unroll_dim)] ? 0 : 1);
+
+    Tensor output = ops::zeros(output_size, i1.dtype(), i1.device());
+
+    // If the output has zero elements, at least one operand is empty, and
+    // the unrolled loop would see zero-size slices.
+    if (i1.numel() != 0 && i2.numel() != 0 && i3.numel() != 0) {
+        if (!sumdim[static_cast<size_t>(unroll_dim)]) {
+            for (int64_t k = 0; k < unroll_size; ++k) {
+                Tensor buf = sumproduct_pair(
+                    i1.narrow(unroll_dim, k * slicemul1, 1),
+                    i2.narrow(unroll_dim, k * slicemul2, 1),
+                    sum_dims_12, true);
+                buf = sumproduct_pair(
+                    buf, i3.narrow(unroll_dim, k * slicemul3, 1), sum_dims_23,
+                    true);
+                output.narrow(unroll_dim, k, 1).add_(buf);
+            }
+        } else {
+            for (int64_t k = 0; k < unroll_size; ++k) {
+                Tensor buf = sumproduct_pair(
+                    i1.narrow(unroll_dim, k * slicemul1, 1),
+                    i2.narrow(unroll_dim, k * slicemul2, 1), sum_dims_12, true);
+                buf = sumproduct_pair(
+                    buf, i3.narrow(unroll_dim, k * slicemul3, 1), sum_dims_23,
+                    true);
+                output.add_(buf);
+            }
+        }
+    }
+    std::vector<int64_t> keep;
+    for (int64_t i = 0; i < output.dim(); ++i) {
+        if (!sumdim[static_cast<size_t>(i)]) keep.push_back(output.size(i));
+    }
+    return output.reshape(keep);
+}
+
+// Trilinear backward: each operand gradient reruns the contraction with the
+// output gradient substituted for one input, with the expand/sum roles of
+// that input swapped.
+std::tuple<Tensor, Tensor, Tensor> _trilinear_backward_kernel(
+    const Tensor& grad_out,
+    const Tensor& i1, const Tensor& i2, const Tensor& i3,
+    const std::vector<int64_t>& expand1,
+    const std::vector<int64_t>& expand2,
+    const std::vector<int64_t>& expand3,
+    const std::vector<int64_t>& sumdim,
+    const std::array<bool, 3>& grad_mask) {
+    Tensor grad_i1, grad_i2, grad_i3;
+    if (grad_mask[0]) {
+        grad_i1 = _trilinear_kernel(grad_out, i2, i3, sumdim, expand2, expand3,
+                                    expand1, /*unroll_dim=*/1);
+    }
+    if (grad_mask[1]) {
+        grad_i2 = _trilinear_kernel(i1, grad_out, i3, expand1, sumdim, expand3,
+                                    expand2, /*unroll_dim=*/1);
+    }
+    if (grad_mask[2]) {
+        grad_i3 = _trilinear_kernel(i1, i2, grad_out, expand1, expand2, sumdim,
+                                    expand3, /*unroll_dim=*/1);
+    }
+    return std::make_tuple(std::move(grad_i1), std::move(grad_i2),
+                           std::move(grad_i3));
+}
+
 Tensor einsum_kernel(const std::string& equation,
                      const std::vector<Tensor>& operands,
                      const std::vector<int64_t>& path_arg) {
@@ -993,12 +1123,16 @@ TENSORPLAY_LIBRARY_IMPL(CPU, EinsumKernels) {
     m.impl("einsum", einsum_kernel);
     m.impl("tensordot", tensordot_kernel);
     m.impl("tensordot.out", tensordot_out_kernel);
+    m.impl("_trilinear", _trilinear_kernel);
+    m.impl("_trilinear_backward", _trilinear_backward_kernel);
 }
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, EinsumKernelsCUDA) {
     m.impl("einsum", einsum_kernel);
     m.impl("tensordot", tensordot_kernel);
     m.impl("tensordot.out", tensordot_out_kernel);
+    m.impl("_trilinear", _trilinear_kernel);
+    m.impl("_trilinear_backward", _trilinear_backward_kernel);
 }
 
 } // namespace tpx
