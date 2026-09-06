@@ -34,16 +34,35 @@ namespace ops = tensorplay::tpx::ops;
 
 namespace {
 
+Tensor& write_activation_out(const char* op, Tensor value, Tensor& out) {
+    if (!out.defined()) {
+        out = std::move(value);
+        return out;
+    }
+    if (out.dtype() != value.dtype()) {
+        TP_THROW(TypeError, op, ": output dtype must match input dtype");
+    }
+    if (out.device() != value.device()) {
+        TP_THROW(DeviceMismatchError,
+                 op, ": output device must match input device");
+    }
+    const auto target = static_cast<std::vector<int64_t>>(value.shape());
+    if (static_cast<std::vector<int64_t>>(out.shape()) != target) {
+        out.resize_(target);
+    }
+    out.copy_(value);
+    return out;
+}
+
 // clamp_max(self, max) == clamp(self, min=nullopt, max)
 Tensor& clamp_max_out_native(const Tensor& self, Scalar max, Tensor& out) {
-    out = ops::clamp(self, std::nullopt, max);
-    return out;
+    return write_activation_out("clamp_max", ops::clamp(self, std::nullopt, max),
+                                out);
 }
 
 Tensor& clamp_max_tensor_out_native(const Tensor& self, const Tensor& max,
                                     Tensor& out) {
-    out = ops::clamp_max(self, max);
-    return out;
+    return write_activation_out("clamp_max", ops::clamp_max(self, max), out);
 }
 
 Tensor& clamp_max__tensor_native(Tensor& self, const Tensor& max) {
@@ -54,14 +73,13 @@ Tensor& clamp_max__tensor_native(Tensor& self, const Tensor& max) {
 
 // clamp_min(self, min) == clamp(self, min, max=nullopt)
 Tensor& clamp_min_out_native(const Tensor& self, Scalar min, Tensor& out) {
-    out = ops::clamp(self, min, std::nullopt);
-    return out;
+    return write_activation_out("clamp_min", ops::clamp(self, min, std::nullopt),
+                                out);
 }
 
 Tensor& clamp_min_tensor_out_native(const Tensor& self, const Tensor& min,
                                     Tensor& out) {
-    out = ops::clamp_min(self, min);
-    return out;
+    return write_activation_out("clamp_min", ops::clamp_min(self, min), out);
 }
 
 Tensor& clamp_min__tensor_native(Tensor& self, const Tensor& min) {
@@ -152,18 +170,17 @@ Tensor& threshold_backward_grad_input_native(const Tensor& grad_output,
 }
 
 Tensor& hardsigmoid_out_native(const Tensor& self, Tensor& out) {
-    out = ops::hardsigmoid(self);
-    return out;
+    return write_activation_out("hardsigmoid", ops::hardsigmoid(self), out);
 }
 
 Tensor& hardswish_out_native(const Tensor& self, Tensor& out) {
-    out = ops::hardswish(self);
-    return out;
+    return write_activation_out("hardswish", ops::hardswish(self), out);
 }
 
 Tensor& log_sigmoid_out_native(const Tensor& self, Tensor& out) {
-    out = std::get<0>(ops::log_sigmoid_forward(self));
-    return out;
+    return write_activation_out("log_sigmoid",
+                                std::get<0>(ops::log_sigmoid_forward(self)),
+                                out);
 }
 
 Tensor& logcumsumexp_out_native(const Tensor& self, int64_t dim, Tensor& out) {
