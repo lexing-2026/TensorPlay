@@ -167,8 +167,17 @@ Tensor interop_histc_cuda(const Tensor& self, int64_t bins, Scalar min, Scalar m
 
 Tensor& interop_histc_out_cuda(const Tensor& self, int64_t bins, Scalar min,
                                Scalar max, Tensor& out) {
+    if (out.dtype() != self.dtype()) {
+        TP_THROW(TypeError,
+                 "histc(): out tensor must have the same dtype as the input");
+    }
+    if (out.device() != self.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "histc(): out tensor must be on the same device as the input");
+    }
     Tensor r = interop_histc_cuda(self, bins, min, max);
-    out = r.to(self.dtype());
+    out.resize_(static_cast<std::vector<int64_t>>(r.shape()));
+    out.copy_(r);
     return out;
 }
 
