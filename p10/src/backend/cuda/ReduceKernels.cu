@@ -7,6 +7,7 @@
 #include "Utils.h"
 #include "TypePromotion.h"
 #include "CUDARuntime.h"
+#include "SortingRadixSelect.cuh"
 
 #include <cuda_runtime.h>
 
@@ -48,6 +49,11 @@ constexpr int kThreads = 256;
 
 inline dim3 make_grid(int64_t work) {
     return dim3(static_cast<unsigned>((work + kThreads - 1) / kThreads));
+}
+
+inline int selection_threads(int64_t size) {
+    return static_cast<int>(std::min<int64_t>(
+        ((size + 31) / 32) * 32, 1024));
 }
 
 inline int64_t wrap_dim(int64_t dim, int64_t ndim) {
@@ -514,40 +520,87 @@ __device__ inline T reduce_empty_value() {
 }
 
 template <typename T>
-__global__ void nanmedian_flat_kernel(int64_t n, const T* sorted, T* result) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
-    int64_t valid = n;
-    while (valid > 0 && reduce_value_is_nan(sorted[valid - 1])) --valid;
-    result[0] = valid == 0 ? reduce_empty_value<T>()
-                           : sorted[(valid - 1) / 2];
+__global__ void nanmedian_select_flat_kernel(
+        int64_t n, const T* input, T* result) {
+    __shared__ uint64_t radix_smem[32];
+    __shared__ unsigned long long nan_count;
+    if (threadIdx.x == 0) nan_count = 0;
+    __syncthreads();
+
+    unsigned long long local_nan_count = 0;
+    for (uint64_t i = static_cast<uint64_t>(threadIdx.x);
+         i < static_cast<uint64_t>(n);
+         i += static_cast<uint64_t>(blockDim.x)) {
+        local_nan_count += reduce_value_is_nan(input[i]) ? 1 : 0;
+    }
+    if (local_nan_count != 0) atomicAdd(&nan_count, local_nan_count);
+    __syncthreads();
+
+    const uint64_t valid = static_cast<uint64_t>(n) - nan_count;
+    if (valid == 0) {
+        if (threadIdx.x == 0) result[0] = reduce_empty_value<T>();
+        return;
+    }
+    const uint64_t k = (valid - 1) / 2 + 1;
+    T median = static_cast<T>(0);
+    topk_detail::topk_radix_select<T, uint64_t>(
+        input, k, false, static_cast<uint64_t>(n), 1, radix_smem, &median);
+    if (threadIdx.x == 0) result[0] = median;
 }
 
 template <typename T>
-__global__ void nanmedian_dim_kernel(int64_t n_slices, int64_t d_size,
-                                     int64_t inner, const T* sorted,
-                                     const int64_t* sorted_indices, T* values,
-                                     int64_t* indices) {
-    int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; si < n_slices; si += stride) {
-        int64_t outer_index = si / inner;
-        int64_t inner_index = si % inner;
-        const T* source = sorted + outer_index * d_size * inner + inner_index;
-        const int64_t* source_indices =
-            sorted_indices + outer_index * d_size * inner + inner_index;
-        int64_t valid = d_size;
-        while (valid > 0 &&
-               reduce_value_is_nan(source[(valid - 1) * inner])) {
-            --valid;
-        }
-        if (valid == 0) {
+__global__ void nanmedian_select_dim_kernel(
+        int64_t n_slices, int64_t d_size, int64_t inner, const T* input,
+        T* values, int64_t* indices) {
+    const int64_t si = static_cast<int64_t>(blockIdx.x);
+    if (si >= n_slices) return;
+    __shared__ uint64_t radix_smem[32];
+    __shared__ unsigned long long nan_count;
+    __shared__ unsigned long long selected_index;
+    if (threadIdx.x == 0) {
+        nan_count = 0;
+        selected_index = static_cast<unsigned long long>(d_size);
+    }
+    __syncthreads();
+
+    const int64_t outer_index = si / inner;
+    const int64_t inner_index = si % inner;
+    const T* slice_input = input + outer_index * d_size * inner + inner_index;
+    unsigned long long local_nan_count = 0;
+    for (uint64_t i = static_cast<uint64_t>(threadIdx.x);
+         i < static_cast<uint64_t>(d_size);
+         i += static_cast<uint64_t>(blockDim.x)) {
+        local_nan_count += reduce_value_is_nan(slice_input[i * inner]) ? 1 : 0;
+    }
+    if (local_nan_count != 0) atomicAdd(&nan_count, local_nan_count);
+    __syncthreads();
+
+    const uint64_t valid = static_cast<uint64_t>(d_size) - nan_count;
+    if (valid == 0) {
+        if (threadIdx.x == 0) {
             values[si] = reduce_empty_value<T>();
             indices[si] = 0;
-            continue;
         }
-        const int64_t median_position = (valid - 1) / 2;
-        values[si] = source[median_position * inner];
-        indices[si] = source_indices[median_position * inner];
+        return;
+    }
+    const uint64_t k = (valid - 1) / 2 + 1;
+    T median = static_cast<T>(0);
+    topk_detail::topk_radix_select<T, uint64_t>(
+        slice_input, k, false, static_cast<uint64_t>(d_size),
+        static_cast<uint64_t>(inner), radix_smem, &median);
+    for (uint64_t i = static_cast<uint64_t>(threadIdx.x);
+         i < static_cast<uint64_t>(d_size);
+         i += static_cast<uint64_t>(blockDim.x)) {
+        const T value = slice_input[i * inner];
+        if (value == median ||
+            (reduce_value_is_nan(value) && reduce_value_is_nan(median))) {
+            atomicMin(&selected_index, static_cast<unsigned long long>(i));
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        values[si] = median;
+        indices[si] = static_cast<int64_t>(selected_index);
     }
 }
 
@@ -607,13 +660,12 @@ Tensor nanmedian_cuda(const Tensor& self) {
         return result.fill_(Scalar(std::numeric_limits<int64_t>::lowest()));
     }
     Tensor input = self.to(work_dt).contiguous().reshape({self.numel()});
-    Tensor sorted = std::get<0>(sort_cuda(input, 0, false));
     Tensor result = Tensor::empty({}, work_dt, self.device());
     auto stream = getCurrentCUDAStream().stream();
 #define TP_NANMEDIAN_FLAT_CASE(ctype, name_) \
     case DType::name_: \
-        nanmedian_flat_kernel<ctype><<<1, 1, 0, stream>>>( \
-            input.numel(), sorted.data_ptr<ctype>(), result.data_ptr<ctype>()); \
+        nanmedian_select_flat_kernel<ctype><<<1, selection_threads(input.numel()), 0, stream>>>( \
+            input.numel(), input.data_ptr<ctype>(), result.data_ptr<ctype>()); \
         break;
     switch (work_dt) {
         TP_NANMEDIAN_FLAT_CASE(int64_t, Int64)
@@ -653,15 +705,12 @@ std::tuple<Tensor, Tensor> nanmedian_dim_cuda(const Tensor& self, int64_t dim,
     Tensor indices = Tensor::empty(out_shape, DType::Int64, input.device());
     const int64_t slices = outer * inner;
     if (slices == 0) return {values, indices};
-    auto sorted_result = sort_cuda(input, dim, false);
-    Tensor sorted = std::get<0>(sorted_result);
-    Tensor sorted_indices = std::get<1>(sorted_result);
     auto stream = getCurrentCUDAStream().stream();
 #define TP_NANMEDIAN_DIM_CASE(ctype, name_) \
     case DType::name_: \
-        nanmedian_dim_kernel<ctype><<<make_grid(slices), kThreads, 0, stream>>>( \
-            slices, d_size, inner, sorted.data_ptr<ctype>(), \
-            sorted_indices.data_ptr<int64_t>(), values.data_ptr<ctype>(), \
+        nanmedian_select_dim_kernel<ctype><<< \
+            dim3(static_cast<unsigned>(slices)), selection_threads(d_size), 0, stream>>>( \
+            slices, d_size, inner, input.data_ptr<ctype>(), values.data_ptr<ctype>(), \
             indices.data_ptr<int64_t>()); \
         break;
     switch (input.dtype()) {
