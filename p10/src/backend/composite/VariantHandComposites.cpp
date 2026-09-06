@@ -38,6 +38,14 @@ Tensor scalar_like(const Scalar& s, const Tensor& ref) {
     return ops::scalar_tensor(s, prom, ref.device());
 }
 
+Tensor quantile_scalar_tensor(const Tensor& self, double q) {
+    if (!(q >= 0.0 && q <= 1.0)) {
+        TP_THROW(ValueError,
+                 "quantile() q must be in the range [0, 1] but got ", q);
+    }
+    return ops::scalar_tensor(Scalar(q), self.dtype(), self.device());
+}
+
 } // namespace
 
 // ---- norm family -----------------------------------------------------------
@@ -370,8 +378,15 @@ std::vector<Tensor> gradient_tensorarrayint_native(const Tensor& self,
 
 Tensor quantile_scalar_native(const Tensor& self, double q, std::optional<int64_t> dim,
                               bool keepdim, const std::string& interpolation) {
-    Tensor qv = ops::unsqueeze(ops::scalar_tensor(Scalar(q), DType::Undefined), 0);
+    Tensor qv = quantile_scalar_tensor(self, q);
     return ops::quantile(self, qv, dim, keepdim, interpolation);
+}
+
+Tensor nanquantile_scalar_native(const Tensor& self, double q,
+                                 std::optional<int64_t> dim, bool keepdim,
+                                 const std::string& interpolation) {
+    Tensor qv = quantile_scalar_tensor(self, q);
+    return ops::nanquantile(self, qv, dim, keepdim, interpolation);
 }
 
 // ---- ormqr -----------------------------------------------------------------
@@ -1786,6 +1801,7 @@ TENSORPLAY_LIBRARY_IMPL(Composite, VariantHandOps) {
     m.impl("gradient.scalarrayarray", gradient_scalarrayarray_native);
     m.impl("gradient.tensorarrayint", gradient_tensorarrayint_native);
     m.impl("quantile.scalar", quantile_scalar_native);
+    m.impl("nanquantile.scalar", nanquantile_scalar_native);
     m.impl("ormqr", ormqr_composite);
     m.impl("geqrf", geqrf_composite);
     m.impl("linalg_vdot", linalg_vdot_composite);
