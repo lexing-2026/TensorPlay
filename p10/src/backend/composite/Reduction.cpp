@@ -13,6 +13,13 @@ namespace ops = tensorplay::tpx::ops;
 
 namespace {
 
+void check_logical_out(const Tensor& out) {
+    if (out.dtype() != DType::Bool && out.dtype() != DType::UInt8) {
+        TP_THROW(TypeError,
+                 "logical reduction output must have Bool or UInt8 dtype");
+    }
+}
+
 template <bool IsAll>
 Tensor reduce_dims_default(const Tensor& self,
                            const std::optional<std::vector<int64_t>>& dim,
@@ -55,6 +62,7 @@ Tensor reduce_dims_default(const Tensor& self,
 
 template <bool IsAll>
 Tensor& reduce_out(const Tensor& self, int64_t dim, bool keepdim, Tensor& out) {
+    check_logical_out(out);
     if (self.device() != out.device()) {
         TP_THROW(DeviceMismatchError,
                  "output must be on the same device as input");
@@ -69,6 +77,7 @@ template <bool IsAll>
 Tensor& reduce_dims_out(const Tensor& self,
                         const std::optional<std::vector<int64_t>>& dim,
                         bool keepdim, Tensor& out) {
+    check_logical_out(out);
     if (self.device() != out.device()) {
         TP_THROW(DeviceMismatchError,
                  "output must be on the same device as input");
@@ -116,6 +125,7 @@ Tensor& any_dims_out_default(
 }
 
 Tensor& all_all_out_default(const Tensor& self, Tensor& out) {
+    check_logical_out(out);
     if (self.device() != out.device()) {
         TP_THROW(DeviceMismatchError,
                  "output must be on the same device as input");
@@ -126,6 +136,7 @@ Tensor& all_all_out_default(const Tensor& self, Tensor& out) {
 }
 
 Tensor& any_all_out_default(const Tensor& self, Tensor& out) {
+    check_logical_out(out);
     if (self.device() != out.device()) {
         TP_THROW(DeviceMismatchError,
                  "output must be on the same device as input");
