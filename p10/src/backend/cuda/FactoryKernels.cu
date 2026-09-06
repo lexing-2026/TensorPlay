@@ -15,14 +15,6 @@ namespace tensorplay {
 namespace cuda {
 
 template <typename T>
-__global__ void fill_kernel_cuda_impl(int n, T* data, T value) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        data[i] = value;
-    }
-}
-
-template <typename T>
 struct FillFunctor {
     T value;
 
@@ -38,8 +30,6 @@ Tensor& fill_kernel(Tensor& self, Scalar value) {
     int64_t n = self.numel();
     if (n == 0) return self;
     
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
     TensorIterator iter = TensorIteratorConfig()
         .set_check_mem_overlap(false)
         .check_all_same_dtype(false)
@@ -54,41 +44,11 @@ Tensor& fill_kernel(Tensor& self, Scalar value) {
     }
 
     switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
-        // Complex storage dtypes are not part of the real-type macro.
-        case DType::ComplexFloat: {
-            tensorplay::complex<float> val = value.to<tensorplay::complex<float>>();
-            fill_kernel_cuda_impl<tensorplay::complex<float>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-                n, static_cast<tensorplay::complex<float>*>(self.data_ptr()), val);
-            break;
-        }
-        case DType::ComplexDouble: {
-            tensorplay::complex<double> val = value.to<tensorplay::complex<double>>();
-            fill_kernel_cuda_impl<tensorplay::complex<double>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-                n, static_cast<tensorplay::complex<double>*>(self.data_ptr()), val);
-            break;
-        }
-        case DType::ComplexHalf: {
-            fill_kernel_cuda_impl<tensorplay::complex<Half>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-                n, static_cast<tensorplay::complex<Half>*>(self.data_ptr()),
-                value.to<tensorplay::complex<Half>>());
-            break;
-        }
-        case DType::BComplex32: {
-            fill_kernel_cuda_impl<tensorplay::complex<BFloat16>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-                n, static_cast<tensorplay::complex<BFloat16>*>(self.data_ptr()),
-                value.to<tensorplay::complex<BFloat16>>());
-            break;
-        }
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(OP_CASE)
         default: TP_THROW(NotImplementedError, "fill_ not implemented for this dtype on CUDA");
     }
     #undef OP_CASE
-    
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-         TP_THROW(RuntimeError, std::string("CUDA fill_ Error: ") + cudaGetErrorString(err));
-    }
-    
+
     return self;
 }
 
