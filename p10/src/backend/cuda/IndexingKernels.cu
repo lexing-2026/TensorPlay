@@ -2224,7 +2224,7 @@ Tensor index_put_impl_cuda(Tensor& result, const std::vector<Tensor>& indices,
             case DType::name: \
                 index_put_kernel<ctype, true><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
                     n, result.data_ptr<ctype>(), flat_idx.data_ptr<int64_t>(), vals.data_ptr<ctype>()); \
-                break; \
+                break;
         switch (result.dtype()) {
             TENSORPLAY_FORALL_SCALAR_TYPES(TP_IP_ACC_CASE)
 #undef TP_IP_ACC_CASE
