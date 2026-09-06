@@ -683,6 +683,148 @@ __global__ void mode_bool_kernel(
 }
 
 template <typename T>
+__device__ __forceinline__ bool mode_value_less(T lhs, T rhs) {
+    const bool lhs_nan = reduce_value_is_nan(lhs);
+    const bool rhs_nan = reduce_value_is_nan(rhs);
+    if (lhs_nan != rhs_nan) return !lhs_nan;
+    if (lhs_nan) return false;
+    return lhs < rhs;
+}
+
+template <typename T>
+__device__ __forceinline__ void mode_bitonic_swap(
+        T& lhs, bool& lhs_valid, T& rhs, bool& rhs_valid, bool direction) {
+    const bool should_swap =
+        (mode_value_less(lhs, rhs) && lhs_valid) || !rhs_valid;
+    if (should_swap == direction) {
+        T value = lhs;
+        lhs = rhs;
+        rhs = value;
+        const bool valid = lhs_valid;
+        lhs_valid = rhs_valid;
+        rhs_valid = valid;
+    }
+}
+
+template <typename T, unsigned int Power2Size>
+__device__ inline void mode_bitonic_sort(T* values, bool* valid) {
+    for (unsigned int size = 2; size < Power2Size; size <<= 1) {
+        const bool direction = (threadIdx.x & (size / 2)) != 0;
+        for (unsigned int stride = size / 2; stride > 0; stride >>= 1) {
+            __syncthreads();
+            const unsigned int position =
+                2 * threadIdx.x - (threadIdx.x & (stride - 1));
+            mode_bitonic_swap(
+                values[position], valid[position],
+                values[position + stride], valid[position + stride], direction);
+        }
+    }
+    for (unsigned int stride = Power2Size / 2; stride > 0; stride >>= 1) {
+        __syncthreads();
+        const unsigned int position =
+            2 * threadIdx.x - (threadIdx.x & (stride - 1));
+        mode_bitonic_swap(
+            values[position], valid[position],
+            values[position + stride], valid[position + stride], false);
+    }
+    __syncthreads();
+}
+
+template <typename T, unsigned int Power2Size>
+__global__ void mode_fused_kernel(
+        int64_t n_slices, int64_t d_size, int64_t inner,
+        const T* input, T* values, int64_t* indices) {
+    const int64_t si = static_cast<int64_t>(blockIdx.x);
+    if (si >= n_slices) return;
+    extern __shared__ unsigned char storage[];
+    T* sorted = reinterpret_cast<T*>(storage);
+    bool* valid = reinterpret_cast<bool*>(sorted + Power2Size);
+    const int64_t outer_index = si / inner;
+    const int64_t inner_index = si % inner;
+    const T* slice_input = input + outer_index * d_size * inner + inner_index;
+
+    const unsigned int second = blockDim.x + threadIdx.x;
+    if (threadIdx.x < Power2Size) {
+        valid[threadIdx.x] = threadIdx.x < static_cast<unsigned int>(d_size);
+        sorted[threadIdx.x] = valid[threadIdx.x]
+            ? slice_input[static_cast<int64_t>(threadIdx.x) * inner]
+            : static_cast<T>(0);
+    }
+    if (second < Power2Size) {
+        valid[second] = second < static_cast<unsigned int>(d_size);
+        sorted[second] = valid[second]
+            ? slice_input[static_cast<int64_t>(second) * inner]
+            : static_cast<T>(0);
+    }
+    __syncthreads();
+    mode_bitonic_sort<T, Power2Size>(sorted, valid);
+
+    __shared__ T mode;
+    __shared__ unsigned long long mode_index;
+    if (threadIdx.x == 0) {
+        int best_count = 0;
+        int run_count = 0;
+        unsigned int best_position = 0;
+        for (unsigned int i = 0; i < static_cast<unsigned int>(d_size); ++i) {
+            const bool same = i > 0 &&
+                mode_value_equal(sorted[i], sorted[i - 1]);
+            run_count = same ? run_count + 1 : 1;
+            if (run_count > best_count) {
+                best_count = run_count;
+                best_position = i;
+            }
+        }
+        mode = sorted[best_position];
+        mode_index = static_cast<unsigned long long>(d_size);
+    }
+    __syncthreads();
+    for (uint64_t i = static_cast<uint64_t>(threadIdx.x);
+         i < static_cast<uint64_t>(d_size);
+         i += static_cast<uint64_t>(blockDim.x)) {
+        if (mode_value_equal(slice_input[i * inner], mode)) {
+            atomicMin(&mode_index, static_cast<unsigned long long>(i));
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        values[si] = mode;
+        indices[si] = static_cast<int64_t>(mode_index);
+    }
+}
+
+template <typename T>
+void launch_mode_fused(
+        int64_t n_slices, int64_t d_size, int64_t inner,
+        const Tensor& input, Tensor& values, Tensor& indices) {
+    const int64_t power = d_size <= 32 ? 32 : d_size <= 128 ? 128
+                                      : d_size <= 1024 ? 1024 : 2048;
+    const dim3 grid(static_cast<unsigned>(n_slices));
+    auto stream = getCurrentCUDAStream().stream();
+    switch (power) {
+        case 32:
+            mode_fused_kernel<T, 32><<<grid, 16, sizeof(T) * 32 + sizeof(bool) * 32, stream>>>(
+                n_slices, d_size, inner, input.data_ptr<T>(),
+                values.data_ptr<T>(), indices.data_ptr<int64_t>());
+            break;
+        case 128:
+            mode_fused_kernel<T, 128><<<grid, 64, sizeof(T) * 128 + sizeof(bool) * 128, stream>>>(
+                n_slices, d_size, inner, input.data_ptr<T>(),
+                values.data_ptr<T>(), indices.data_ptr<int64_t>());
+            break;
+        case 1024:
+            mode_fused_kernel<T, 1024><<<grid, 512, sizeof(T) * 1024 + sizeof(bool) * 1024, stream>>>(
+                n_slices, d_size, inner, input.data_ptr<T>(),
+                values.data_ptr<T>(), indices.data_ptr<int64_t>());
+            break;
+        default:
+            mode_fused_kernel<T, 2048><<<grid, 1024, sizeof(T) * 2048 + sizeof(bool) * 2048, stream>>>(
+                n_slices, d_size, inner, input.data_ptr<T>(),
+                values.data_ptr<T>(), indices.data_ptr<int64_t>());
+            break;
+    }
+}
+
+template <typename T>
 __global__ void mode_from_sorted_kernel(int64_t n_slices, int64_t d_size,
                                          int64_t inner, const T* sorted,
                                          const int64_t* sorted_indices,
@@ -830,6 +972,21 @@ std::tuple<Tensor, Tensor> mode_cuda(const Tensor& self, int64_t dim, bool keepd
             dim3(static_cast<unsigned>(slices)), selection_threads(d_size), 0, stream>>>(
             slices, d_size, inner, input.data_ptr<bool>(), values.data_ptr<bool>(),
             indices.data_ptr<int64_t>());
+        CUDA_CHECK(cudaGetLastError());
+        return {values, indices};
+    }
+    if (inner == 1 && d_size >= 2 && d_size <= 2048) {
+        switch (input.dtype()) {
+#define TP_MODE_FUSED_CASE(ctype, name_) \
+            case DType::name_: \
+                launch_mode_fused<ctype>( \
+                    slices, d_size, inner, input, values, indices); \
+                break;
+            TENSORPLAY_FORALL_SCALAR_TYPES(TP_MODE_FUSED_CASE)
+#undef TP_MODE_FUSED_CASE
+            default:
+                TP_THROW(TypeError, "mode: unsupported dtype");
+        }
         CUDA_CHECK(cudaGetLastError());
         return {values, indices};
     }
