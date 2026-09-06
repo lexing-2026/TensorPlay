@@ -9,3 +9,5 @@
 #include "cpu/vec/vec256/vsx/float_vsx.h"
 #include "cpu/vec/vec256/vsx/double_vsx.h"
 #include "cpu/vec/vec256/vsx/int_vsx.h"
+#include "cpu/vec/vec256/vsx/complex_float_vsx.h"
+#include "cpu/vec/vec256/vsx/complex_double_vsx.h"
