@@ -56,6 +56,11 @@ constexpr int loop_block_work_size() {
 
 #define TP_LOOP_LAUNCH_BOUNDS(n) __launch_bounds__(n)
 
+// Lambdas passed to the loop dispatchers must carry both specifiers: a
+// host-side definition with only __device__ would be wrapped by nvcc into
+// an internal closure type whose call operator cannot be introspected.
+#define GPU_LAMBDA __host__ __device__
+
 inline void loop_launch_check(const char* what) {
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -758,6 +763,46 @@ inline void launch_legacy_kernel(int64_t N, const func_t& f) {
         <<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
             static_cast<int>(N), f);
     loop_launch_check("elementwise_kernel");
+}
+
+template <typename index_t, typename func_t>
+TP_LOOP_LAUNCH_BOUNDS(kLoopNumThreads)
+__global__ void index_elementwise_kernel(
+        index_t N, func_t f,
+        typename tensorplay::function_traits<func_t>::result_type* data) {
+    index_t index = static_cast<index_t>(blockIdx.x) *
+                    static_cast<index_t>(kLoopBlockWorkSize) +
+                    static_cast<index_t>(threadIdx.x);
+#pragma unroll
+    for (int i = 0; i < kLoopThreadWorkSize; ++i) {
+        if (index < N) {
+            data[index] = f(index);
+            index += static_cast<index_t>(kLoopNumThreads);
+        }
+    }
+}
+
+template <typename func_t>
+void gpu_kernel_with_index(Tensor& output, const func_t& f) {
+    const int64_t N = output.numel();
+    if (N == 0) {
+        return;
+    }
+
+    using scalar_t = typename tensorplay::function_traits<func_t>::result_type;
+    const int64_t grid =
+        (N + kLoopBlockWorkSize - 1) / kLoopBlockWorkSize;
+    auto stream = getCurrentCUDAStream().stream();
+    if (N <= std::numeric_limits<int32_t>::max()) {
+        index_elementwise_kernel<int, func_t>
+            <<<static_cast<unsigned>(grid), kLoopNumThreads, 0, stream>>>(
+                static_cast<int>(N), f, output.data_ptr<scalar_t>());
+    } else {
+        index_elementwise_kernel<int64_t, func_t>
+            <<<static_cast<unsigned>(grid), kLoopNumThreads, 0, stream>>>(
+                N, f, output.data_ptr<scalar_t>());
+    }
+    loop_launch_check("index_elementwise_kernel");
 }
 
 // Manual unroll: the full-block body issues vt groups of independent loads

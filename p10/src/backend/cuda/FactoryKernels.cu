@@ -328,83 +328,6 @@ Tensor& zero_inplace_kernel(Tensor& self) {
 }
 
 
-template <typename T>
-__global__ void arange_fill_impl(int64_t n, double start, double step, T* out) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < n) {
-        out[i] = static_cast<T>(start + static_cast<double>(i) * step);
-    }
-}
-
-template <typename T>
-__global__ void linspace_fill_impl(
-    int64_t n, double start, double end, double step, T* out) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    if (n == 1) {
-        out[i] = static_cast<T>(start);
-        return;
-    }
-    const int64_t halfway = n / 2;
-    const double value = i < halfway
-        ? start + static_cast<double>(i) * step
-        : end - static_cast<double>(n - i - 1) * step;
-    out[i] = static_cast<T>(value);
-}
-
-template <typename T>
-__global__ void logspace_fill_impl(int64_t n, double start, double end,
-                                   double step, double base, T* out) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    if (n == 1) {
-        out[i] = static_cast<T>(std::pow(base, start));
-        return;
-    }
-    const int64_t halfway = n / 2;
-    const double exponent = i < halfway
-        ? start + static_cast<double>(i) * step
-        : end - static_cast<double>(n - i - 1) * step;
-    out[i] = static_cast<T>(std::pow(base, exponent));
-}
-
-template <typename compute_t, typename store_t>
-__global__ void linspace_fill_complex_impl(
-    int64_t n, compute_t start, compute_t end, compute_t step, store_t* out) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    if (n == 1) {
-        out[i] = store_t(start);
-        return;
-    }
-    using value_t = typename compute_t::value_type;
-    const int64_t halfway = n / 2;
-    const int64_t distance = i < halfway ? i : n - i - 1;
-    const compute_t value = i < halfway
-        ? start + step * static_cast<value_t>(distance)
-        : end - step * static_cast<value_t>(distance);
-    out[i] = store_t(value);
-}
-
-template <typename compute_t, typename store_t>
-__global__ void logspace_fill_complex_impl(
-    int64_t n, compute_t start, compute_t end, compute_t step,
-    compute_t base, store_t* out) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    if (n == 1) {
-        out[i] = store_t(tensorplay::pow(base, start));
-        return;
-    }
-    using value_t = typename compute_t::value_type;
-    const int64_t halfway = n / 2;
-    const int64_t distance = i < halfway ? i : n - i - 1;
-    const compute_t exponent = i < halfway
-        ? start + step * static_cast<value_t>(distance)
-        : end - step * static_cast<value_t>(distance);
-    out[i] = store_t(tensorplay::pow(base, exponent));
-}
-
 template <typename compute_t, typename store_t, typename host_t>
 void launch_linspace_complex(
     int64_t steps, const Scalar& start, const Scalar& end, Tensor& output) {
@@ -417,14 +340,22 @@ void launch_linspace_complex(
     const compute_t end_value(
         static_cast<value_t>(end_host.real()),
         static_cast<value_t>(end_host.imag()));
-    const compute_t step =
-        (end_value - start_value) / static_cast<value_t>(steps - 1);
-    const int threads = 256;
-    const int blocks = static_cast<int>((steps + threads - 1) / threads);
-    linspace_fill_complex_impl<compute_t, store_t>
-        <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-            steps, start_value, end_value, step,
-            static_cast<store_t*>(output.data_ptr()));
+    const compute_t step = steps == 1
+        ? compute_t(value_t(0), value_t(0))
+        : (end_value - start_value) / static_cast<value_t>(steps - 1);
+    const int64_t halfway = steps / 2;
+    gpu_kernel_with_index(output,
+        [start_value, end_value, step, steps, halfway] GPU_LAMBDA(
+            int64_t index) -> store_t {
+            if (steps == 1) {
+                return store_t(start_value);
+            }
+            const int64_t distance = index < halfway ? index : steps - index - 1;
+            const compute_t value = index < halfway
+                ? start_value + step * static_cast<value_t>(distance)
+                : end_value - step * static_cast<value_t>(distance);
+            return store_t(value);
+        });
 }
 
 template <typename compute_t, typename store_t, typename host_t>
@@ -440,16 +371,24 @@ void launch_logspace_complex(
     const compute_t end_value(
         static_cast<value_t>(end_host.real()),
         static_cast<value_t>(end_host.imag()));
-    const compute_t step =
-        (end_value - start_value) / static_cast<value_t>(steps - 1);
+    const compute_t step = steps == 1
+        ? compute_t(value_t(0), value_t(0))
+        : (end_value - start_value) / static_cast<value_t>(steps - 1);
     const compute_t base_value(
         static_cast<value_t>(base), static_cast<value_t>(0));
-    const int threads = 256;
-    const int blocks = static_cast<int>((steps + threads - 1) / threads);
-    logspace_fill_complex_impl<compute_t, store_t>
-        <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-            steps, start_value, end_value, step, base_value,
-            static_cast<store_t*>(output.data_ptr()));
+    const int64_t halfway = steps / 2;
+    gpu_kernel_with_index(output,
+        [start_value, end_value, step, base_value, steps, halfway] GPU_LAMBDA(
+            int64_t index) -> store_t {
+            if (steps == 1) {
+                return store_t(tensorplay::pow(base_value, start_value));
+            }
+            const int64_t distance = index < halfway ? index : steps - index - 1;
+            const compute_t exponent = index < halfway
+                ? start_value + step * static_cast<value_t>(distance)
+                : end_value - step * static_cast<value_t>(distance);
+            return store_t(tensorplay::pow(base_value, exponent));
+        });
 }
 
 static int64_t arange_length(Scalar start, Scalar end, Scalar step) {
@@ -508,15 +447,14 @@ Tensor arange_start_step_cuda(Scalar start, Scalar end, Scalar step,
     Tensor t({len}, dtype, dev);
     if (len == 0) return t;
 
-    double s = start.toDouble();
-    double st = step.toDouble();
-    int threads = 256;
-    int blocks = static_cast<int>((len + threads - 1) / threads);
+    const double s = start.toDouble();
+    const double st = step.toDouble();
 
     #define ARANGE_CASE(ctype, name) \
     case DType::name: \
-        arange_fill_impl<ctype><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>( \
-            len, s, st, t.data_ptr<ctype>()); \
+        gpu_kernel_with_index(t, [s, st] GPU_LAMBDA(int64_t index) -> ctype { \
+            return static_cast<ctype>(s + static_cast<double>(index) * st); \
+        }); \
         break;
     switch (dtype) {
         ARANGE_CASE(float, Float32)
@@ -533,11 +471,6 @@ Tensor arange_start_step_cuda(Scalar start, Scalar end, Scalar step,
                      "\"arange\" not implemented for '" + std::string(toString(dtype)) + "'");
     }
     #undef ARANGE_CASE
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        TP_THROW(RuntimeError, std::string("CUDA arange Error: ") + cudaGetErrorString(err));
-    }
     return t;
 }
 
@@ -594,14 +527,18 @@ Tensor linspace_cuda(Scalar start, Scalar end, int64_t steps,
         const double s = start.toDouble();
         const double e = end.toDouble();
         const double step = (steps == 1) ? 0.0 : (e - s) / (steps - 1);
-        const int threads = 256;
-        const int blocks = static_cast<int>((steps + threads - 1) / threads);
+        const int64_t halfway = steps / 2;
 
 #define LINSPACE_CASE(ctype, name)                                           \
     case DType::name:                                                         \
-        linspace_fill_impl<ctype>                                             \
-            <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(       \
-                steps, s, e, step, t.data_ptr<ctype>());                     \
+        gpu_kernel_with_index(t, [s, e, step, steps, halfway]                 \
+            GPU_LAMBDA(int64_t index) -> ctype {                              \
+                if (steps == 1) return static_cast<ctype>(s);                \
+                const double value = index < halfway                          \
+                    ? s + static_cast<double>(index) * step                   \
+                    : e - static_cast<double>(steps - index - 1) * step;      \
+                return static_cast<ctype>(value);                             \
+            });                                                               \
         break;
         switch (dtype) {
             LINSPACE_CASE(uint8_t, UInt8)
@@ -622,11 +559,6 @@ Tensor linspace_cuda(Scalar start, Scalar end, int64_t steps,
                          std::string(toString(dtype)) + "'");
         }
 #undef LINSPACE_CASE
-    }
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        TP_THROW(RuntimeError, std::string("CUDA linspace Error: ") + cudaGetErrorString(err));
     }
     return t;
 }
@@ -674,14 +606,20 @@ Tensor logspace_cuda(Scalar start, Scalar end, int64_t steps, double base,
         const double s = start.toDouble();
         const double e = end.toDouble();
         const double step = (steps == 1) ? 0.0 : (e - s) / (steps - 1);
-        const int threads = 256;
-        const int blocks = static_cast<int>((steps + threads - 1) / threads);
+        const int64_t halfway = steps / 2;
 
 #define LOGSPACE_CASE(ctype, name)                                           \
     case DType::name:                                                         \
-        logspace_fill_impl<ctype>                                             \
-            <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(       \
-                steps, s, e, step, base, t.data_ptr<ctype>());               \
+        gpu_kernel_with_index(t, [s, e, step, base, steps, halfway]            \
+            GPU_LAMBDA(int64_t index) -> ctype {                              \
+                if (steps == 1) {                                             \
+                    return static_cast<ctype>(std::pow(base, s));              \
+                }                                                               \
+                const double exponent = index < halfway                       \
+                    ? s + static_cast<double>(index) * step                   \
+                    : e - static_cast<double>(steps - index - 1) * step;      \
+                return static_cast<ctype>(std::pow(base, exponent));           \
+            });                                                               \
         break;
         switch (dtype) {
             LOGSPACE_CASE(uint8_t, UInt8)
@@ -702,11 +640,6 @@ Tensor logspace_cuda(Scalar start, Scalar end, int64_t steps, double base,
                          std::string(toString(dtype)) + "'");
         }
 #undef LOGSPACE_CASE
-    }
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        TP_THROW(RuntimeError, std::string("CUDA logspace Error: ") + cudaGetErrorString(err));
     }
     return t;
 }
