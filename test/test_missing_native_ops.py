@@ -511,7 +511,8 @@ def test_add_relu_family():
     assert out.tolist() == [0.0, 0.0, 1.0]
 
     inplace = tp.tensor([1.0, -2.0, 3.0])
-    assert inplace.add_relu_(b) is inplace if hasattr(inplace, "add_relu_") else True
+    assert tp._C._add_relu_(inplace, b) is inplace
+    assert inplace.tolist() == [0.0, 0.0, 1.0]
 
 
 # --------------------------------------------------------------- misc natives
