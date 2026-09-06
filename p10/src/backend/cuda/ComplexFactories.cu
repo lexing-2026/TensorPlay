@@ -83,16 +83,15 @@ template <typename CT, typename RT>
 __global__ void cplx_pack_kernel(int64_t n, const RT* re, const RT* im, CT* dst) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    using scalar_t = typename CT::value_type;
     for (; i < n; i += stride) {
-        dst[i] = CT(static_cast<scalar_t>(re[i]), static_cast<scalar_t>(im[i]));
+        dst[i] = CT(re[i], im[i]);
     }
 }
 template <typename CT, typename RT>
 __global__ void polar_kernel(int64_t n, const RT* ab, const RT* ang, CT* dst) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    using scalar_t = typename CT::value_type;
+    using scalar_t = decltype(CT{}.real());
     for (; i < n; i += stride) {
         const RT radius = ab[i];
         const RT angle = ang[i];
