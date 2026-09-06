@@ -69,6 +69,26 @@ namespace {
         return dtype == DType::Float32 || dtype == DType::Float64 ||
                dtype == DType::Float16 || dtype == DType::BFloat16;
     }
+
+    Tensor& write_pooling_out(const char* op, Tensor value, Tensor& out) {
+        if (!out.defined()) {
+            out = std::move(value);
+            return out;
+        }
+        if (out.dtype() != value.dtype()) {
+            TP_THROW(TypeError, op, ": output dtype must match result dtype");
+        }
+        if (out.device() != value.device()) {
+            TP_THROW(DeviceMismatchError,
+                     op, ": output device must match input device");
+        }
+        const auto target = static_cast<std::vector<int64_t>>(value.shape());
+        if (static_cast<std::vector<int64_t>>(out.shape()) != target) {
+            out.resize_(target);
+        }
+        out.copy_(value);
+        return out;
+    }
 }
 
 template <typename T, typename M>
@@ -1642,8 +1662,9 @@ Tensor& interop_adaptive_max_pool2d_out_cuda(const Tensor& self, const std::vect
 Tensor& interop_adaptive_max_pool2d_backward_grad_input_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& indices,
               Tensor& grad_input) {
         (void)indices;
-        grad_input = adaptive_max_pool2d_backward_cuda(grad_output, input);
-        return grad_input;
+        return write_pooling_out("adaptive_max_pool2d_backward",
+                                 adaptive_max_pool2d_backward_cuda(grad_output, input),
+                                 grad_input);
     
 }
 
@@ -1658,8 +1679,9 @@ Tensor& interop_adaptive_max_pool3d_out_cuda(const Tensor& self, const std::vect
 Tensor& interop_adaptive_max_pool3d_backward_grad_input_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& indices,
               Tensor& grad_input) {
         (void)indices;
-        grad_input = adaptive_max_pool3d_backward_cuda(grad_output, input);
-        return grad_input;
+        return write_pooling_out("adaptive_max_pool3d_backward",
+                                 adaptive_max_pool3d_backward_cuda(grad_output, input),
+                                 grad_input);
     
 }
 
