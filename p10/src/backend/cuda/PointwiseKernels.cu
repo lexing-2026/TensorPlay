@@ -39,37 +39,9 @@ struct NoGradGuard {
     } \
   } while (0)
 
-// grid size is correct and huge tensors don't overflow gridDim.x.
-template <typename T, typename Func>
-__global__ void unary_kernel_cuda_impl(int64_t n, const T* input, T* output, Func func) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) {
-        output[i] = func(input[i]);
-    }
-}
-
-// Use float4/double4 loads when pointers are 16B aligned. Fall back to a
-// scalar loop otherwise.
+// Use aligned vector packs when every operand permits them.
 template <typename T, int VecSize>
 struct alignas(VecSize * sizeof(T)) VecPack { T v[VecSize]; };
-
-template <typename T, int VecSize, typename Func>
-__global__ void unary_vectorized_kernel_cuda_impl(int64_t n, const T* input, T* output, Func func) {
-    int64_t vec_n = n / VecSize;
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < vec_n; i += stride) {
-        VecPack<T, VecSize> in = *reinterpret_cast<const VecPack<T, VecSize>*>(input + i * VecSize);
-        VecPack<T, VecSize> out;
-        #pragma unroll
-        for (int v = 0; v < VecSize; ++v) out.v[v] = func(in.v[v]);
-        *reinterpret_cast<VecPack<T, VecSize>*>(output + i * VecSize) = out;
-    }
-    for (int64_t j = vec_n * VecSize + i; j < n; j += stride) {
-        output[j] = func(input[j]);
-    }
-}
 
 template <typename T, typename Func>
 __global__ void binary_kernel_cuda_impl(int64_t n, const T* a, const T* b, T* output, Func func) {
@@ -98,16 +70,6 @@ __global__ void binary_vectorized_kernel_cuda_impl(int64_t n, const T* a, const 
     }
 }
 
-// (opmath_t). Load -> convert -> op -> convert back, all in one kernel.
-template <typename T, typename Func>
-__global__ void unary_reduced_float_kernel_cuda_impl(int64_t n, const T* input, T* output, Func func) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) {
-        output[i] = static_cast<T>(func(static_cast<float>(input[i])));
-    }
-}
-
 // --- Dispatchers ---
 
 // elementwise_kernel: one thread block per block-work-size chunk of the
@@ -124,18 +86,6 @@ inline void get_elementwise_config(int64_t n, bool vectorized, dim3& grid, dim3&
 inline bool ptr_aligned16(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 0; }
 
 template <typename T, typename Func>
-void launch_unary(int64_t n, const T* in, T* out, Func func) {
-    dim3 grid, block;
-    if ((n % 4 == 0) && ptr_aligned16(in) && ptr_aligned16(out)) {
-        get_elementwise_config(n, true, grid, block);
-        unary_vectorized_kernel_cuda_impl<T, 4><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, in, out, func);
-    } else {
-        get_elementwise_config(n, false, grid, block);
-        unary_kernel_cuda_impl<T><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, in, out, func);
-    }
-}
-
-template <typename T, typename Func>
 void launch_binary(int64_t n, const T* a, const T* b, T* out, Func func) {
     dim3 grid, block;
     if ((n % 4 == 0) && ptr_aligned16(a) && ptr_aligned16(b) && ptr_aligned16(out)) {
@@ -144,38 +94,6 @@ void launch_binary(int64_t n, const T* a, const T* b, T* out, Func func) {
     } else {
         get_elementwise_config(n, false, grid, block);
         binary_kernel_cuda_impl<T><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a, b, out, func);
-    }
-}
-
-// Vectorized variant of unary_reduced_float_kernel_cuda_impl: same
-// load -> convert to float32 -> op -> convert back flow, 4 elements per thread.
-template <typename T, int VecSize, typename Func>
-__global__ void unary_reduced_float_vectorized_kernel_cuda_impl(int64_t n, const T* input, T* output, Func func) {
-    int64_t vec_n = n / VecSize;
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < vec_n; i += stride) {
-        VecPack<T, VecSize> in = *reinterpret_cast<const VecPack<T, VecSize>*>(input + i * VecSize);
-        VecPack<T, VecSize> out;
-#pragma unroll
-        for (int v = 0; v < VecSize; ++v)
-            out.v[v] = static_cast<T>(func(static_cast<float>(in.v[v])));
-        *reinterpret_cast<VecPack<T, VecSize>*>(output + i * VecSize) = out;
-    }
-    for (int64_t j = vec_n * VecSize + i; j < n; j += stride) {
-        output[j] = static_cast<T>(func(static_cast<float>(input[j])));
-    }
-}
-
-template <typename T, typename Func>
-void launch_unary_reduced_float(int64_t n, const T* in, T* out, Func func) {
-    dim3 grid, block;
-    if ((n % 4 == 0) && ptr_aligned16(in) && ptr_aligned16(out)) {
-        get_elementwise_config(n, true, grid, block);
-        unary_reduced_float_vectorized_kernel_cuda_impl<T, 4><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, in, out, func);
-    } else {
-        get_elementwise_config(n, false, grid, block);
-        unary_reduced_float_kernel_cuda_impl<<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, in, out, func);
     }
 }
 
