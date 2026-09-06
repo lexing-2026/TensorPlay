@@ -980,36 +980,6 @@ Tensor frac_kernel_cuda(const Tensor& self) {
 }
 
 // --- Comparison ---
-// generic strided path reuses the TensorDesc broadcast mapping.
-template <typename T, typename Func>
-__global__ void comparison_kernel_cuda_impl(int64_t n, const T* a, const T* b, bool* output, Func func) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) {
-        output[i] = func(a[i], b[i]);
-    }
-}
-
-template <typename T, typename Func>
-__global__ void comparison_broadcast_kernel_cuda_impl(int64_t n,
-                                                      const T* a, TensorDesc a_desc,
-                                                      const T* b, TensorDesc b_desc,
-                                                      bool* output, TensorDesc y_desc, Func func) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) {
-        output[i] = func(a[get_offset(i, a_desc, y_desc)], b[get_offset(i, b_desc, y_desc)]);
-    }
-}
-
-template <typename T, typename Func>
-__global__ void comparison_scalar_kernel_cuda_impl(int64_t n, const T* a, T b, bool* output, Func func) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) {
-        output[i] = func(a[i], b);
-    }
-}
 
 static DType result_type_with_scalar_cuda(const Tensor& t, const Scalar& s) {
     DType td = t.dtype();
