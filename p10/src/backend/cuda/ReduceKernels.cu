@@ -31,6 +31,9 @@ extern Tensor mean_dim_kernel(const Tensor& self,
 extern Tensor sum_dim_kernel(const Tensor& self,
                              const std::vector<int64_t>& dim,
                              bool keepdim, DType dtype);
+extern Tensor nansum_dim_kernel(const Tensor& self,
+                                const std::vector<int64_t>& dim,
+                                bool keepdim, DType dtype);
 extern Tensor var_dim_kernel(const Tensor& self,
                              const std::vector<int64_t>& dim,
                              int64_t correction, bool keepdim);
@@ -1185,12 +1188,7 @@ std::tuple<Tensor, Tensor> interop_nanmedian_dim_values_cuda(
 }  // namespace
 
 Tensor nansum_cuda2(const Tensor& self, const std::vector<int64_t>& dim_in, bool keepdim) {
-    DType out_dt = isFloatingType(self.dtype()) ? self.dtype() : DType::Int64;
-    std::vector<int64_t> dim = dim_in;
-    if (dim.empty()) {
-        for (int64_t i = 0; i < self.dim(); ++i) dim.push_back(i);
-    }
-    return reduce_iterative(self, dim, keepdim, 2, out_dt);
+    return nansum_dim_kernel(self, dim_in, keepdim, DType::Undefined);
 }
 
 

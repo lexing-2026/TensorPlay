@@ -183,6 +183,7 @@ using reduction::AbsMaxOps;
 using reduction::AbsMinOps;
 using reduction::MeanOps;
 using reduction::MinMaxOps;
+using reduction::NanSumOps;
 using reduction::NormOps;
 using reduction::NormOneOps;
 using reduction::NormTwoOps;
@@ -306,6 +307,17 @@ Tensor sum_same_dtype(
     }
     return run_reduction_typed<T, AccT, T>(
         input, spec, keepdim, dtype, SumOps<T, AccT, T>{}, AccT(0));
+}
+
+template <typename T>
+Tensor nansum_same_dtype(
+        const Tensor& input, const ReductionSpec& spec, bool keepdim, DType dtype) {
+    using AccT = same_dtype_acc_t<T>;
+    if (input.numel() == 0) {
+        return Tensor::zeros(reduction_output_shape(input, spec, keepdim), dtype, input.device());
+    }
+    return run_reduction_typed<T, AccT, T>(
+        input, spec, keepdim, dtype, NanSumOps<T, AccT, T>{}, AccT(0));
 }
 
 template <typename T>
@@ -550,6 +562,32 @@ Tensor sum_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool 
 
 Tensor sum_kernel(const Tensor& self, DType dtype) {
     return sum_dim_kernel(self, {}, false, dtype);
+}
+
+Tensor nansum_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim,
+                         bool keepdim, DType dtype) {
+    DType out_dtype = dtype;
+    if (out_dtype == DType::Undefined) {
+        out_dtype = isFloatingOrComplexType(self.dtype()) ? self.dtype() : DType::Int64;
+    }
+    Tensor input = self.dtype() == out_dtype ? self : self.to(out_dtype);
+    const ReductionSpec spec = make_reduction_spec(input, dim);
+    if (input.dtype() == DType::ComplexHalf || input.dtype() == DType::BComplex32) {
+        Tensor promoted = input.to(DType::ComplexFloat);
+        const ReductionSpec promoted_spec = make_reduction_spec(promoted, dim);
+        Tensor reduced = nansum_same_dtype<tensorplay::complex<float>>(
+            promoted, promoted_spec, keepdim, DType::ComplexFloat);
+        return reduced.to(out_dtype);
+    }
+    if (input.dtype() == DType::ComplexFloat) {
+        return nansum_same_dtype<tensorplay::complex<float>>(
+            input, spec, keepdim, out_dtype);
+    }
+    if (input.dtype() == DType::ComplexDouble) {
+        return nansum_same_dtype<tensorplay::complex<double>>(
+            input, spec, keepdim, out_dtype);
+    }
+    TP_DISPATCH_REDUCTION(nansum_same_dtype, input.dtype(), input, spec, keepdim, out_dtype);
 }
 
 // Mean

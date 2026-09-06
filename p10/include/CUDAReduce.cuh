@@ -147,6 +147,16 @@ __device__ __forceinline__ bool reduce_isnan(T value) {
         return ::isnan(value);
     } else if constexpr (std::is_same_v<T, double>) {
         return ::isnan(value);
+    } else if constexpr (std::is_same_v<T, Half> ||
+                         std::is_same_v<T, BFloat16>) {
+        return ::isnan(static_cast<float>(value));
+    } else if constexpr (
+            std::is_same_v<T, tensorplay::complex<Half>> ||
+            std::is_same_v<T, tensorplay::complex<float>> ||
+            std::is_same_v<T, tensorplay::complex<double>> ||
+            std::is_same_v<T, tensorplay::complex<BFloat16>>) {
+        return ::isnan(static_cast<double>(value.real())) ||
+               ::isnan(static_cast<double>(value.imag()));
     } else {
         (void)value;
         return false;
@@ -848,6 +858,15 @@ template <typename ScalarT, typename AccT, typename OutputT>
 struct SumOps {
     __device__ AccT reduce(AccT acc, ScalarT value, int64_t) const {
         return acc + static_cast<AccT>(value);
+    }
+    __device__ AccT combine(AccT a, AccT b) const { return a + b; }
+    __device__ OutputT project(AccT value) const { return static_cast<OutputT>(value); }
+};
+
+template <typename ScalarT, typename AccT, typename OutputT>
+struct NanSumOps {
+    __device__ AccT reduce(AccT acc, ScalarT value, int64_t) const {
+        return reduce_isnan(value) ? acc : acc + static_cast<AccT>(value);
     }
     __device__ AccT combine(AccT a, AccT b) const { return a + b; }
     __device__ OutputT project(AccT value) const { return static_cast<OutputT>(value); }
