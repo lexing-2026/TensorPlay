@@ -9,3 +9,4 @@
 #include "cpu/vec/vec256/zarch/float_zarch.h"
 #include "cpu/vec/vec256/zarch/double_zarch.h"
 #include "cpu/vec/vec256/zarch/int_zarch.h"
+#include "cpu/vec/vec256/zarch/complex_zarch.h"

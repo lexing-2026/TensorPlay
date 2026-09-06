@@ -133,6 +133,7 @@ set(P10_SOURCES
     src/backend/composite/LinearAlgebra.cpp
     src/backend/composite/MatrixExp.cpp
     src/backend/composite/ShapeMisc.cpp
+    src/backend/composite/OutAndAliasVariants.cpp
     src/backend/composite/WeightNorm.cpp
     src/backend/composite/Pointwise.cpp
     src/backend/composite/Reduction.cpp
@@ -378,12 +379,22 @@ set(TP_CPU_KERNEL_SRCS
     src/backend/cpu/StaxPointwiseKernels.cpp
     src/backend/cpu/ComplexKernels.cpp
 )
-if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
-    # (CXX_AVX512_FOUND): only build the tier when the compiler accepts the
-    # ISA flags defined by the capability tables.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
+    # (TP_CXX_AVX512_FOUND): only build the tier when the compiler accepts
+    # the ISA flags defined by the capability tables. MSVC selects ISA
+    # levels with /arch (AVX2 implies the AVX512 baseline when given
+    # /arch:AVX512); GNU-compatible compilers use the explicit -m flag set.
     include(CheckCXXCompilerFlag)
-    check_cxx_compiler_flag("-mavx512f -mavx512bw -mavx512vl -mavx512dq -mfma"
-        TP_CXX_AVX512_FOUND)
+    if(MSVC)
+        check_cxx_compiler_flag("/arch:AVX512" TP_CXX_AVX512_FOUND)
+        set(TP_AVX2_TIER_FLAGS /arch:AVX2)
+        set(TP_AVX512_TIER_FLAGS /arch:AVX512)
+    else()
+        check_cxx_compiler_flag("-mavx512f -mavx512bw -mavx512vl -mavx512dq -mfma"
+            TP_CXX_AVX512_FOUND)
+        set(TP_AVX2_TIER_FLAGS -mavx2 -mfma -mf16c)
+        set(TP_AVX512_TIER_FLAGS -mavx512f -mavx512bw -mavx512vl -mavx512dq -mfma)
+    endif()
     foreach(KERNEL_SRC ${TP_CPU_KERNEL_SRCS})
         get_filename_component(KERNEL_NAME ${KERNEL_SRC} NAME_WE)
         add_library(p10_kernel_default_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
@@ -426,7 +437,7 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
             target_compile_definitions(p10_kernel_avx2_${KERNEL_NAME} PRIVATE
                 HAVE_AVX512_CPU_DEFINITION)
         endif()
-        target_compile_options(p10_kernel_avx2_${KERNEL_NAME} PRIVATE -mavx2 -mfma -mf16c)
+        target_compile_options(p10_kernel_avx2_${KERNEL_NAME} PRIVATE ${TP_AVX2_TIER_FLAGS})
         if(KERNEL_NAME STREQUAL "ComplexKernels")
             target_compile_definitions(p10_kernel_avx2_${KERNEL_NAME} PRIVATE
                 TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)
@@ -447,9 +458,9 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
             endif()
             target_compile_definitions(p10_kernel_avx512_${KERNEL_NAME} PRIVATE
                 P10_EXPORTS CPU_CAPABILITY_AVX512 CPU_CAPABILITY=AVX512 HAVE_AVX512_CPU_DEFINITION HAVE_AVX2_CPU_DEFINITION)
-            # Same flag set as Codegen.cmake's AVX512 capability entry.
+            # Same flag set as the AVX512 capability entry.
             target_compile_options(p10_kernel_avx512_${KERNEL_NAME} PRIVATE
-                -mavx512f -mavx512bw -mavx512vl -mavx512dq -mfma)
+                ${TP_AVX512_TIER_FLAGS})
             if(KERNEL_NAME STREQUAL "ComplexKernels")
                 target_compile_definitions(p10_kernel_avx512_${KERNEL_NAME} PRIVATE
                     TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)
@@ -648,7 +659,7 @@ if(MSVC)
     # Template-heavy kernel TUs exceed the default COFF section cap.
     target_compile_options(p10 PRIVATE /bigobj)
 endif()
-if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
     # Tell DispatchStub (and every TU) that AVX2 kernel copies exist, so the
     # AVX2 dispatch slots are registered and selected at runtime.
     target_compile_definitions(p10 PUBLIC HAVE_AVX2_CPU_DEFINITION)
