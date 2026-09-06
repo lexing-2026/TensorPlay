@@ -10,6 +10,7 @@
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace tensorplay {
@@ -58,8 +59,36 @@ Tensor flipud_native(const Tensor& self) {
 }
 
 Tensor& resize_as__native(Tensor& self, const Tensor& other,
-                          int64_t /*memory_format*/) {
-    ops::resize_(self, static_cast<std::vector<int64_t>>(other.shape()));
+                          std::optional<int64_t> memory_format) {
+    const auto sizes = static_cast<std::vector<int64_t>>(other.shape());
+    ops::resize_(self, sizes);
+    if (!memory_format.has_value()) {
+        return self;
+    }
+
+    auto format = static_cast<MemoryFormat>(*memory_format);
+    if (format == MemoryFormat::Preserve) {
+        format = other.memory_format();
+        if (format != MemoryFormat::ChannelsLast &&
+            format != MemoryFormat::ChannelsLast3d) {
+            format = MemoryFormat::Contiguous;
+        }
+    }
+    if (format != MemoryFormat::Contiguous &&
+        format != MemoryFormat::ChannelsLast &&
+        format != MemoryFormat::ChannelsLast3d) {
+        TP_THROW(ValueError, "resize_as_: invalid memory format");
+    }
+    if (format == MemoryFormat::ChannelsLast && sizes.size() != 4) {
+        TP_THROW(RuntimeError,
+                 "resize_as_: channels-last format requires rank 4");
+    }
+    if (format == MemoryFormat::ChannelsLast3d && sizes.size() != 5) {
+        TP_THROW(RuntimeError,
+                 "resize_as_: channels-last-3d format requires rank 5");
+    }
+    self.unsafeGetTensorImpl()->set_sizes_and_strides(
+        sizes, get_strides_for(sizes, format));
     return self;
 }
 
