@@ -1440,31 +1440,26 @@ Tensor& clamp_tensor_out_cuda(const Tensor& self, const std::optional<Tensor>& m
 }
 
 
-// Clamp
-template <typename T>
-__global__ void clamp_kernel_cuda_impl(int64_t n, const T* input, T* output, T min_val, T max_val, bool has_min, bool has_max) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        T val = input[i];
-        if (has_min && val < min_val) val = min_val;
-        if (has_max && val > max_val) val = max_val;
-        output[i] = val;
-    }
-}
-
 Tensor clamp_kernel_cuda(const Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max) {
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
-    int64_t n = self.numel();
-    if (n == 0) return result;
-    dim3 block(256);
-    dim3 grid((n + 255) / 256);
-    Tensor self_contig = self.contiguous();
-    
+    if (self.numel() == 0) return result;
+    const bool has_min = min.has_value();
+    const bool has_max = max.has_value();
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(result)
+        .add_input(self)
+        .build();
+
     #define CLAMP_CASE(ctype, name) \
     case DType::name: { \
-        ctype min_val = min.has_value() ? min->to<ctype>() : ctype(0); \
-        ctype max_val = max.has_value() ? max->to<ctype>() : ctype(0); \
-        clamp_kernel_cuda_impl<ctype><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self_contig.data_ptr<ctype>(), result.data_ptr<ctype>(), min_val, max_val, min.has_value(), max.has_value()); \
+        const ctype min_val = has_min ? min->to<ctype>() : ctype(0); \
+        const ctype max_val = has_max ? max->to<ctype>() : ctype(0); \
+        gpu_kernel(iter, [=] __device__(ctype value) -> ctype { \
+            if (has_min && value < min_val) value = min_val; \
+            if (has_max && value > max_val) value = max_val; \
+            return value; \
+        }); \
         break; \
     }
     switch (self.dtype()) {
@@ -1472,7 +1467,6 @@ Tensor clamp_kernel_cuda(const Tensor& self, std::optional<Scalar> min, std::opt
         default: TP_THROW(TypeError, "CUDA clamp: Unsupported dtype");
     }
     #undef CLAMP_CASE
-    CUDA_CHECK(cudaGetLastError());
     return result;
 }
 
