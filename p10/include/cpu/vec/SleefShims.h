@@ -18,7 +18,7 @@
 // where the surrounding code already guarantees AVX2/AVX-512 support
 // (capability TUs or target-attributed functions).
 
-#include "cpu/vec/Intrinsics.h"
+#include "cpu/vec/intrinsics.h"
 
 #if defined(_MSC_VER) && defined(_M_X64)
 #define TP_SLEEF_CC __vectorcall
