@@ -6,10 +6,15 @@ import sys
 
 # -- Path setup ------------------------------------------------------------
 
-# Add the repository root so autodoc can import tensorplay.
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-
-import tensorplay  # noqa: E402
+# Prefer a built/installed tensorplay over the in-repo Python sources: the
+# package dir here has no version.py or compiled _C, so importing it directly
+# fails without a source build. Only fall back to the repo root when nothing
+# is installed, e.g. for a plain `make html` after an in-place build.
+try:
+    import tensorplay  # noqa: E402,F401
+except ModuleNotFoundError:
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+    import tensorplay  # noqa: E402,F401
 
 # -- Project information -----------------------------------------------------
 
