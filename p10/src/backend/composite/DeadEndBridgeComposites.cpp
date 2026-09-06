@@ -204,6 +204,26 @@ Tensor replication_pad3d_bridge(const Tensor& self,
 
 namespace {
 
+Tensor& write_softmax_out(const char* op, Tensor value, Tensor& out) {
+    if (!out.defined()) {
+        out = value;
+        return out;
+    }
+    if (out.dtype() != value.dtype()) {
+        TP_THROW(TypeError, op, ": output dtype must match result dtype");
+    }
+    if (out.device() != value.device()) {
+        TP_THROW(DeviceMismatchError,
+                 op, ": output device must match input device");
+    }
+    const auto target = static_cast<std::vector<int64_t>>(value.shape());
+    if (static_cast<std::vector<int64_t>>(out.shape()) != target) {
+        out.resize_(target);
+    }
+    out.copy_(value);
+    return out;
+}
+
 // half_to_float moves the computation (and the output) to Float32; kernels
 // without a native path satisfy it by materializing the fp32 result.
 Tensor softmax_data_bridge(const Tensor& self, int64_t dim,
@@ -254,8 +274,7 @@ Tensor _softmax_bridge(const Tensor& self, int64_t dim, bool half_to_float) {
 
 Tensor& _softmax_bridge_out(const Tensor& self, int64_t dim,
                             bool half_to_float, Tensor& out) {
-    out = _softmax_bridge(self, dim, half_to_float);
-    return out;
+    return write_softmax_out("_softmax", _softmax_bridge(self, dim, half_to_float), out);
 }
 
 Tensor _softmax_backward_data_bridge(const Tensor& grad_output,
@@ -268,8 +287,9 @@ Tensor _softmax_backward_data_bridge(const Tensor& grad_output,
 Tensor& _softmax_backward_data_bridge_out(const Tensor& grad_output,
                                           const Tensor& output, int64_t dim,
                                           DType input_dtype, Tensor& out) {
-    out = _softmax_backward_data_bridge(grad_output, output, dim, input_dtype);
-    return out;
+    return write_softmax_out(
+        "_softmax_backward_data",
+        _softmax_backward_data_bridge(grad_output, output, dim, input_dtype), out);
 }
 
 Tensor _log_softmax_bridge(const Tensor& self, int64_t dim,
@@ -279,8 +299,8 @@ Tensor _log_softmax_bridge(const Tensor& self, int64_t dim,
 
 Tensor& _log_softmax_bridge_out(const Tensor& self, int64_t dim,
                                 bool half_to_float, Tensor& out) {
-    out = _log_softmax_bridge(self, dim, half_to_float);
-    return out;
+    return write_softmax_out("_log_softmax",
+                             _log_softmax_bridge(self, dim, half_to_float), out);
 }
 
 Tensor _log_softmax_backward_data_bridge(const Tensor& grad_output,
@@ -294,9 +314,10 @@ Tensor& _log_softmax_backward_data_bridge_out(const Tensor& grad_output,
                                               const Tensor& output,
                                               int64_t dim, DType input_dtype,
                                               Tensor& out) {
-    out = _log_softmax_backward_data_bridge(grad_output, output, dim,
-                                            input_dtype);
-    return out;
+    return write_softmax_out(
+        "_log_softmax_backward_data",
+        _log_softmax_backward_data_bridge(grad_output, output, dim, input_dtype),
+        out);
 }
 
 // ---------------------------------------------------------------------------
