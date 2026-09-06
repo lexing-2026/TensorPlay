@@ -19,6 +19,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 namespace tensorplay {
@@ -1448,61 +1449,81 @@ Tensor bucketize_scalar_cpu(const Scalar& self, const Tensor& boundaries,
 // accumulation keeps float32 weights in float32 and widens other weights.
 // ---------------------------------------------------------------------------
 
-Tensor bincount_cpu(const Tensor& self, const std::optional<Tensor>& weights_opt, int64_t minlength) {
-    Tensor weights = weights_opt.value_or(Tensor());
+template <typename input_t>
+Tensor bincount_cpu_impl(const Tensor& self, const Tensor& weights,
+                         int64_t minlength) {
     if (minlength < 0) {
         TP_THROW(RuntimeError, "minlength should be >= 0");
     }
-    if (isFloatingType(self.dtype())) {
-        TP_THROW(RuntimeError, "bincount only supports 1-d non-negative integral inputs.");
-    }
-    Tensor inp = self.to(DType::Int64).contiguous();
-    int64_t n = inp.numel();
-    if (self.dim() == 1 && n == 0) {
+    if (self.dim() == 1 && self.numel() == 0) {
         return Tensor::zeros({minlength}, DType::Int64, self.device());
     }
     if (self.dim() != 1) {
         TP_THROW(RuntimeError, "bincount only supports 1-d non-negative integral inputs.");
     }
-    const int64_t* ip = inp.data_ptr<int64_t>();
-    int64_t min_v = std::numeric_limits<int64_t>::max();
-    int64_t max_v = std::numeric_limits<int64_t>::min();
-    for (int64_t i = 0; i < n; ++i) {
+    Tensor inp = self.contiguous();
+    const input_t* ip = inp.data_ptr<input_t>();
+    input_t min_v = std::numeric_limits<input_t>::max();
+    input_t max_v = std::numeric_limits<input_t>::lowest();
+    for (int64_t i = 0; i < inp.numel(); ++i) {
         if (ip[i] < min_v) min_v = ip[i];
         if (ip[i] > max_v) max_v = ip[i];
     }
-    if (min_v < 0) {
-        TP_THROW(RuntimeError, "bincount only supports 1-d non-negative integral inputs.");
+    if constexpr (std::is_signed_v<input_t>) {
+        if (min_v < 0) {
+            TP_THROW(RuntimeError, "bincount only supports 1-d non-negative integral inputs.");
+        }
     }
-    if (max_v >= std::numeric_limits<int64_t>::max()) {
+    const uint64_t max_unsigned = static_cast<uint64_t>(max_v);
+    if (max_unsigned >= static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
         TP_THROW(RuntimeError, "maximum value of input overflowed");
     }
-    int64_t self_size = self.size(0);
-    bool has_weights = weights.defined() && weights.numel() > 0;
+    const int64_t self_size = inp.size(0);
+    const bool has_weights = weights.defined();
     if (has_weights && (weights.dim() != 1 || weights.size(0) != self_size)) {
         TP_THROW(RuntimeError, "weights should be 1-d and have the same length as input");
     }
-    int64_t nbins = std::max(max_v + 1, minlength);
+    const int64_t nbins = std::max(static_cast<int64_t>(max_v) + 1, minlength);
     if (has_weights) {
         if (weights.dtype() == DType::Float32) {
             Tensor w = weights.contiguous();
-            Tensor rf = Tensor::zeros({nbins}, DType::Float32, self.device());
+            Tensor result = Tensor::zeros({nbins}, DType::Float32, self.device());
             const float* wp = w.data_ptr<float>();
-            float* rp = rf.data_ptr<float>();
-            for (int64_t i = 0; i < self_size; ++i) rp[ip[i]] += wp[i];
-            return rf;
+            float* rp = result.data_ptr<float>();
+            for (int64_t i = 0; i < self_size; ++i) {
+                rp[static_cast<int64_t>(ip[i])] += wp[i];
+            }
+            return result;
         }
         Tensor w = weights.to(DType::Float64).contiguous();
-        Tensor rf = Tensor::zeros({nbins}, DType::Float64, self.device());
+        Tensor result = Tensor::zeros({nbins}, DType::Float64, self.device());
         const double* wp = w.data_ptr<double>();
-        double* rp = rf.data_ptr<double>();
-        for (int64_t i = 0; i < self_size; ++i) rp[ip[i]] += wp[i];
-        return rf;
+        double* rp = result.data_ptr<double>();
+        for (int64_t i = 0; i < self_size; ++i) {
+            rp[static_cast<int64_t>(ip[i])] += wp[i];
+        }
+        return result;
     }
     Tensor result = Tensor::zeros({nbins}, DType::Int64, self.device());
     int64_t* rp = result.data_ptr<int64_t>();
-    for (int64_t i = 0; i < self_size; ++i) rp[ip[i]] += 1;
+    for (int64_t i = 0; i < self_size; ++i) {
+        rp[static_cast<int64_t>(ip[i])] += 1;
+    }
     return result;
+}
+
+Tensor bincount_cpu(const Tensor& self, const std::optional<Tensor>& weights_opt, int64_t minlength) {
+    const Tensor weights = weights_opt.value_or(Tensor());
+#define TP_BINCOUNT_CASE(ctype, name) \
+    case DType::name: \
+        return bincount_cpu_impl<ctype>(self, weights, minlength);
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_INT_TYPES(TP_BINCOUNT_CASE)
+        default:
+            TP_THROW(RuntimeError,
+                     "bincount only supports 1-d non-negative integral inputs.");
+    }
+#undef TP_BINCOUNT_CASE
 }
 
 // ---------------------------------------------------------------------------
