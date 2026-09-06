@@ -11,6 +11,7 @@
 #include "Exception.h"
 #include "Scalar.h"
 #include "Utils.h"
+#include "Complex.h"
 
 #include <cublas_v2.h>
 #include <cuComplex.h>
@@ -239,20 +240,20 @@ Tensor vdot_cuda(const Tensor& a_in, const Tensor& b_in) {
             hipComplex out_c;
             CUBLAS_CHECK(hipblasCdotc(
                 handle, static_cast<int>(n),
-                static_cast<const hipComplex*>(static_cast<const void*>(a.data_ptr<std::complex<float>>())), 1,
-                static_cast<const hipComplex*>(static_cast<const void*>(bmatch.data_ptr<std::complex<float>>())), 1,
+                reinterpret_cast<const hipComplex*>(a.data_ptr<tensorplay::complex<float>>()), 1,
+                reinterpret_cast<const hipComplex*>(bmatch.data_ptr<tensorplay::complex<float>>()), 1,
                 &out_c));
-            result.data_ptr<std::complex<float>>()[0] =
-                std::complex<float>(out_c.x, out_c.y);
+            result.data_ptr<tensorplay::complex<float>>()[0] =
+                tensorplay::complex<float>(out_c.x, out_c.y);
 #else
             cuComplex out;
             CUBLAS_CHECK(cublasCdotc(
                 handle, static_cast<int>(n),
-                static_cast<const cuComplex*>(static_cast<const void*>(a.data_ptr<std::complex<float>>())), 1,
-                static_cast<const cuComplex*>(static_cast<const void*>(bmatch.data_ptr<std::complex<float>>())), 1,
+                reinterpret_cast<const cuComplex*>(a.data_ptr<tensorplay::complex<float>>()), 1,
+                reinterpret_cast<const cuComplex*>(bmatch.data_ptr<tensorplay::complex<float>>()), 1,
                 &out));
-            result.data_ptr<std::complex<float>>()[0] =
-                std::complex<float>(out.x, out.y);
+            result.data_ptr<tensorplay::complex<float>>()[0] =
+                tensorplay::complex<float>(out.x, out.y);
 #endif
             return result;
         }
@@ -261,20 +262,20 @@ Tensor vdot_cuda(const Tensor& a_in, const Tensor& b_in) {
             hipDoubleComplex out_z;
             CUBLAS_CHECK(hipblasZdotc(
                 handle, static_cast<int>(n),
-                static_cast<const hipDoubleComplex*>(static_cast<const void*>(a.data_ptr<std::complex<double>>())), 1,
-                static_cast<const hipDoubleComplex*>(static_cast<const void*>(bmatch.data_ptr<std::complex<double>>())), 1,
+                reinterpret_cast<const hipDoubleComplex*>(a.data_ptr<tensorplay::complex<double>>()), 1,
+                reinterpret_cast<const hipDoubleComplex*>(bmatch.data_ptr<tensorplay::complex<double>>()), 1,
                 &out_z));
-            result.data_ptr<std::complex<double>>()[0] =
-                std::complex<double>(out_z.x, out_z.y);
+            result.data_ptr<tensorplay::complex<double>>()[0] =
+                tensorplay::complex<double>(out_z.x, out_z.y);
 #else
             cuDoubleComplex out;
             CUBLAS_CHECK(cublasZdotc(
                 handle, static_cast<int>(n),
-                static_cast<const cuDoubleComplex*>(static_cast<const void*>(a.data_ptr<std::complex<double>>())), 1,
-                static_cast<const cuDoubleComplex*>(static_cast<const void*>(bmatch.data_ptr<std::complex<double>>())), 1,
+                reinterpret_cast<const cuDoubleComplex*>(a.data_ptr<tensorplay::complex<double>>()), 1,
+                reinterpret_cast<const cuDoubleComplex*>(bmatch.data_ptr<tensorplay::complex<double>>()), 1,
                 &out));
-            result.data_ptr<std::complex<double>>()[0] =
-                std::complex<double>(out.x, out.y);
+            result.data_ptr<tensorplay::complex<double>>()[0] =
+                tensorplay::complex<double>(out.x, out.y);
 #endif
             return result;
         }
