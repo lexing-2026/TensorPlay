@@ -15,6 +15,7 @@
 #include "Float8_e5m2fnuz.h"
 #include "Float8_e8m0fnu.h"
 #include "Half.h"
+#include "Complex.h"
 
 #ifdef UInt8
 #undef UInt8
@@ -342,11 +343,11 @@ template <typename T>
 inline constexpr bool is_complex_type_v =
     is_complex_type<std::remove_cv_t<std::remove_reference_t<T>>>::value;
 
-#define TENSORPLAY_FORALL_COMPLEX_TYPES(_)         \
-    _(std::complex<tensorplay::Half>, ComplexHalf) \
-    _(std::complex<float>, ComplexFloat)           \
-    _(std::complex<double>, ComplexDouble)         \
-    _(std::complex<tensorplay::BFloat16>, BComplex32)
+#define TENSORPLAY_FORALL_COMPLEX_TYPES(_)                       \
+    _(tensorplay::complex<tensorplay::Half>, ComplexHalf)        \
+    _(tensorplay::complex<float>, ComplexFloat)                  \
+    _(tensorplay::complex<double>, ComplexDouble)                \
+    _(tensorplay::complex<tensorplay::BFloat16>, BComplex32)
 
 #define TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(_) \
     TENSORPLAY_FORALL_SCALAR_TYPES(_)                  \
