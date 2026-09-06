@@ -12,6 +12,11 @@
 #include "Half.h"
 #include "OpMathType.h"
 
+#if defined(__x86_64__) && defined(__GNUC__) && !defined(__clang__)
+#define TENSORPLAY_X86_AVX2_DISPATCH 1
+#include "avx_mathfun.h"
+#endif
+
 namespace tensorplay {
 
 constexpr double pi_d = 3.14159265358979323846;
@@ -363,13 +368,7 @@ struct NormalFill16 {
     }
 };
 
-#if defined(__x86_64__) && defined(__GNUC__) && !defined(__clang__)
-#define TENSORPLAY_X86_AVX2_DISPATCH 1
-#endif
-
 #ifdef TENSORPLAY_X86_AVX2_DISPATCH
-
-#include "avx_mathfun.h"
 
 namespace detail {
 
