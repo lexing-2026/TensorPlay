@@ -6,6 +6,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <ostream>
 
 #ifdef __CUDACC__
@@ -247,5 +248,67 @@ inline std::ostream& operator<<(std::ostream& out, const Half& value) {
 }
 
 } // namespace tensorplay
+
+namespace std {
+
+template <>
+class numeric_limits<tensorplay::Half> {
+ public:
+  static constexpr bool is_specialized = true;
+  static constexpr bool is_signed = true;
+  static constexpr bool is_integer = false;
+  static constexpr bool is_exact = false;
+  static constexpr bool has_infinity = true;
+  static constexpr bool has_quiet_NaN = true;
+  static constexpr bool has_signaling_NaN = true;
+  static constexpr auto has_denorm = numeric_limits<float>::has_denorm;
+  static constexpr auto has_denorm_loss =
+      numeric_limits<float>::has_denorm_loss;
+  static constexpr auto round_style = numeric_limits<float>::round_style;
+  static constexpr bool is_iec559 = true;
+  static constexpr bool is_bounded = true;
+  static constexpr bool is_modulo = false;
+  static constexpr int digits = 11;
+  static constexpr int digits10 = 3;
+  static constexpr int max_digits10 = 5;
+  static constexpr int radix = 2;
+  static constexpr int min_exponent = -13;
+  static constexpr int min_exponent10 = -4;
+  static constexpr int max_exponent = 16;
+  static constexpr int max_exponent10 = 4;
+  static constexpr auto traps = numeric_limits<float>::traps;
+  static constexpr auto tinyness_before =
+      numeric_limits<float>::tinyness_before;
+
+  static constexpr tensorplay::Half min() {
+    return tensorplay::Half(0x0400, tensorplay::Half::from_bits());
+  }
+  static constexpr tensorplay::Half lowest() {
+    return tensorplay::Half(0xFBFF, tensorplay::Half::from_bits());
+  }
+  static constexpr tensorplay::Half max() {
+    return tensorplay::Half(0x7BFF, tensorplay::Half::from_bits());
+  }
+  static constexpr tensorplay::Half epsilon() {
+    return tensorplay::Half(0x1400, tensorplay::Half::from_bits());
+  }
+  static constexpr tensorplay::Half round_error() {
+    return tensorplay::Half(0x3800, tensorplay::Half::from_bits());
+  }
+  static constexpr tensorplay::Half infinity() {
+    return tensorplay::Half(0x7C00, tensorplay::Half::from_bits());
+  }
+  static constexpr tensorplay::Half quiet_NaN() {
+    return tensorplay::Half(0x7E00, tensorplay::Half::from_bits());
+  }
+  static constexpr tensorplay::Half signaling_NaN() {
+    return tensorplay::Half(0x7D00, tensorplay::Half::from_bits());
+  }
+  static constexpr tensorplay::Half denorm_min() {
+    return tensorplay::Half(0x0001, tensorplay::Half::from_bits());
+  }
+};
+
+} // namespace std
 
 #undef TP_HOST_DEVICE
