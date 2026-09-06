@@ -58,6 +58,7 @@ set(P10_SOURCES
     src/backend/cpu/MarginLossKernels.cpp
     src/backend/cpu/UpsampleKernels.cpp
     src/backend/cpu/MiscKernels.cpp
+    src/backend/cpu/SegmentReduce.cpp
     # TensorShape.cpp, LinearAlgebra.cpp, TensorFactories.cpp, Itertools.cpp.
     src/backend/cpu/UnaryOps.cpp
     src/backend/cpu/Pooling.cpp
@@ -127,6 +128,7 @@ set(P10_SOURCES
     src/backend/composite/Distance.cpp
     src/backend/composite/Dropout.cpp
     src/backend/composite/Histogram.cpp
+    src/backend/composite/PadNdComposite.cpp
     src/backend/composite/Integration.cpp
     src/backend/composite/Itertools.cpp
     src/backend/composite/AffineGrid.cpp
@@ -627,6 +629,80 @@ elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
     if(TP_CXX_SVE256_FOUND)
         list(APPEND P10_SOURCES ${TP_CPU_KERNEL_SVE256_OBJS} ${TP_CPU_KERNEL_SVE128_OBJS})
     endif()
+elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
+    # riscv64: one DEFAULT copy plus RVVM2/RVVM1 copies compiled against
+    # fixed vector lengths.  The runtime tier is selected from the vector
+    # register width reported through vlenb; the "V" extension v1.0
+    # intrinsics gate both the compile-time probe and the runtime selection.
+    # The arch macro is set on every tier copy so the DispatchStub layout
+    # stays identical across TUs.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/Modules/FindRVV.cmake)
+    foreach(KERNEL_SRC ${TP_CPU_KERNEL_SRCS})
+        get_filename_component(KERNEL_NAME ${KERNEL_SRC} NAME_WE)
+        add_library(p10_kernel_default_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
+        set_target_properties(p10_kernel_default_${KERNEL_NAME} PROPERTIES
+            POSITION_INDEPENDENT_CODE ON)
+        target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
+            P10_EXPORTS CPU_CAPABILITY_DEFAULT CPU_CAPABILITY=DEFAULT
+            HAVE_RVV_CPU_DEFINITION)
+        target_include_directories(p10_kernel_default_${KERNEL_NAME} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
+        target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
+            ${BLAS_COMPILE_DEFS})
+        if(KERNEL_NAME STREQUAL "ComplexKernels")
+            target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
+                TP_COMPLEX_KERNELS_DEFINE_DISPATCH)
+        endif()
+        add_dependencies(p10_kernel_default_${KERNEL_NAME} generate_code)
+        list(APPEND TP_CPU_KERNEL_DEFAULT_OBJS $<TARGET_OBJECTS:p10_kernel_default_${KERNEL_NAME}>)
+        if(TP_CXX_RVVM2_FOUND)
+            foreach(RVV_VL 256 128)
+                add_library(p10_kernel_rvvm${RVV_VL}_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
+                set_target_properties(p10_kernel_rvvm${RVV_VL}_${KERNEL_NAME} PROPERTIES
+                    POSITION_INDEPENDENT_CODE ON)
+                target_compile_definitions(p10_kernel_rvvm${RVV_VL}_${KERNEL_NAME} PRIVATE
+                    P10_EXPORTS CPU_CAPABILITY_RVVM${RVV_VL} CPU_CAPABILITY=RVVM${RVV_VL}
+                    HAVE_RVV_CPU_DEFINITION)
+                target_compile_options(p10_kernel_rvvm${RVV_VL}_${KERNEL_NAME} PRIVATE
+                    ${TP_CXX_RVVM${RVV_VL}_FLAGS})
+                if(KERNEL_NAME STREQUAL "ComplexKernels")
+                    target_compile_definitions(p10_kernel_rvvm${RVV_VL}_${KERNEL_NAME} PRIVATE
+                        TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)
+                endif()
+                target_include_directories(p10_kernel_rvvm${RVV_VL}_${KERNEL_NAME} PRIVATE
+                    ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
+                target_compile_definitions(p10_kernel_rvvm${RVV_VL}_${KERNEL_NAME} PRIVATE
+                    ${BLAS_COMPILE_DEFS})
+                add_dependencies(p10_kernel_rvvm${RVV_VL}_${KERNEL_NAME} generate_code)
+                list(APPEND TP_CPU_KERNEL_RVVM${RVV_VL}_OBJS $<TARGET_OBJECTS:p10_kernel_rvvm${RVV_VL}_${KERNEL_NAME}>)
+            endforeach()
+        elseif(TP_CXX_RVVM1_FOUND)
+            add_library(p10_kernel_rvvm128_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
+            set_target_properties(p10_kernel_rvvm128_${KERNEL_NAME} PROPERTIES
+                POSITION_INDEPENDENT_CODE ON)
+            target_compile_definitions(p10_kernel_rvvm128_${KERNEL_NAME} PRIVATE
+                P10_EXPORTS CPU_CAPABILITY_RVVM1 CPU_CAPABILITY=RVVM1
+                HAVE_RVV_CPU_DEFINITION)
+            target_compile_options(p10_kernel_rvvm128_${KERNEL_NAME} PRIVATE
+                ${TP_CXX_RVVM1_FLAGS})
+            if(KERNEL_NAME STREQUAL "ComplexKernels")
+                target_compile_definitions(p10_kernel_rvvm128_${KERNEL_NAME} PRIVATE
+                    TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)
+            endif()
+            target_include_directories(p10_kernel_rvvm128_${KERNEL_NAME} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
+            target_compile_definitions(p10_kernel_rvvm128_${KERNEL_NAME} PRIVATE
+                ${BLAS_COMPILE_DEFS})
+            add_dependencies(p10_kernel_rvvm128_${KERNEL_NAME} generate_code)
+            list(APPEND TP_CPU_KERNEL_RVVM128_OBJS $<TARGET_OBJECTS:p10_kernel_rvvm128_${KERNEL_NAME}>)
+        endif()
+    endforeach()
+    list(APPEND P10_SOURCES ${TP_CPU_KERNEL_DEFAULT_OBJS})
+    if(TP_CXX_RVVM2_FOUND)
+        list(APPEND P10_SOURCES ${TP_CPU_KERNEL_RVVM256_OBJS} ${TP_CPU_KERNEL_RVVM128_OBJS})
+    elseif(TP_CXX_RVVM1_FOUND)
+        list(APPEND P10_SOURCES ${TP_CPU_KERNEL_RVVM128_OBJS})
+    endif()
 else()
     # Targets without the x86 ISA tiers still need one copy of each kernel, or
     # the DispatchStub DEFAULT slots stay empty and the ops report a missing
@@ -674,6 +750,8 @@ elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "s390x|S390" AND TP_CXX_ZVECT
     target_compile_definitions(p10 PUBLIC HAVE_ZVECTOR_CPU_DEFINITION)
 elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64" AND TP_CXX_SVE256_FOUND)
     target_compile_definitions(p10 PUBLIC HAVE_SVE_CPU_DEFINITION)
+elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64" AND (TP_CXX_RVVM1_FOUND OR TP_CXX_RVVM2_FOUND))
+    target_compile_definitions(p10 PUBLIC HAVE_RVV_CPU_DEFINITION)
 endif()
 if(USE_CUDA)
     # The native aligned flash path consumes only the standalone CUTE/CUTLASS

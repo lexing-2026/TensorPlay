@@ -1,13 +1,21 @@
 #pragma once
 
-// float/double/int32/int64 specializations. AVX512 and reduced-precision
-// types can be added later following the same pattern.
+// float/double/int32/int64 specializations plus the reduced-precision
+// (bfloat16/half) layers, the cross-dtype conversion table and the mask
+// wrapper. AVX512 inherits the 256-bit types through vec512.h.
 
 #include "cpu/vec/vec_base.h"
 
 #include "cpu/vec/vec256/vec256_float.h"
 #include "cpu/vec/vec256/vec256_double.h"
 #include "cpu/vec/vec256/vec256_int.h"
+#include "cpu/vec/vec256/vec256_bfloat16.h"
+#include "cpu/vec/vec256/vec256_half.h"
+#include "cpu/vec/vec_n.h"
+#include "cpu/vec/vec_convert.h"
+#include "cpu/vec/vec256/vec256_convert.h"
+#include "cpu/vec/vec_mask.h"
+#include "cpu/vec/vec256/vec256_mask.h"
 
 #include <algorithm>
 #include <cstddef>

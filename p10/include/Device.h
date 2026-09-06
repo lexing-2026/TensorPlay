@@ -12,6 +12,12 @@ namespace tensorplay {
 #define TENSORPLAY_FORALL_DEVICE_TYPES(_) \
     _(CPU)                                \
     _(CUDA)                               \
+    _(HIP)                                \
+    _(MPS)                                \
+    _(MTIA)                               \
+    _(XPU)                                \
+    _(HPU)                                \
+    _(PrivateUse1)                        \
     _(Vulkan)                             \
     _(Unknown)
 

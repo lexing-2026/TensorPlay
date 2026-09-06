@@ -1,13 +1,21 @@
 #pragma once
 
-// specializations.  Reduced-precision types (bf16/qint/float8) and complex
-// live outside this layer in TensorPlay.
+// 512-bit layer: float/double/int32/int64 plus the packed 16-bit float
+// (bfloat16/half) registers, the cross-dtype conversion table and the
+// mask wrapper.  The 256-bit types remain visible for code that holds
+// both widths (e.g. bf16<->fp32 register pairs).
 
 #include "cpu/vec/vec_base.h"
 
 #include "cpu/vec/vec512/vec512_float.h"
 #include "cpu/vec/vec512/vec512_double.h"
 #include "cpu/vec/vec512/vec512_int.h"
+#include "cpu/vec/vec512/vec512_bfloat16.h"
+#include "cpu/vec/vec_n.h"
+#include "cpu/vec/vec_convert.h"
+#include "cpu/vec/vec_mask.h"
+#include "cpu/vec/vec512/vec512_convert.h"
+#include "cpu/vec/vec512/vec512_mask.h"
 
 #include <algorithm>
 #include <cstddef>

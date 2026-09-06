@@ -11,9 +11,15 @@
 // Architecture tiers: on x86 the tiers are AVX2/AVX512; PowerPC builds
 // dispatch to a VSX tier; s390x builds dispatch to a ZVECTOR tier (vector
 // extension, requires the VXE hardware feature); aarch64 builds dispatch to
-// SVE256/SVE128 tiers selected by the SVE vector length. The tier set is
-// selected by the build system via the HAVE_*_CPU_DEFINITION macros, so
-// exactly one architecture family exists in any given binary.
+// SVE256/SVE128 tiers selected by the SVE vector length; riscv64 builds
+// dispatch to RVVM1/RVVM2 tiers selected by the vector register length. The
+// tier set is selected by the build system via the HAVE_*_CPU_DEFINITION
+// macros, so exactly one architecture family exists in any given binary.
+//
+// Supported device types for registration: CPU plus accelerator backends
+// (CUDA, HIP, MPS, MTIA, XPU, HPU and PrivateUse1).  A backend registers
+// its kernel through the matching REGISTER_*_DISPATCH macro; each non-CPU
+// device owns a plain pointer slot resolved on first call.
 //
 // Example:
 //
@@ -53,6 +59,9 @@ enum class CPUCapability {
 #elif defined(HAVE_SVE_CPU_DEFINITION)
   SVE256 = 1,
   SVE128 = 2,
+#elif defined(HAVE_RVV_CPU_DEFINITION)
+  RVVM2 = 1,
+  RVVM1 = 2,
 #else
   AVX2 = 1,
   AVX512 = 2,
@@ -106,6 +115,10 @@ struct P10_API CPUDispatchStubImpl {
       , void *SVE128
       , void *SVE256
 #endif
+#ifdef HAVE_RVV_CPU_DEFINITION
+      , void *RVVM1
+      , void *RVVM2
+#endif
   );
 
   // Analogous to try_get_call_ptr(), but it will return the ErrorType and not
@@ -128,6 +141,10 @@ struct P10_API CPUDispatchStubImpl {
     , void *SVE128
     , void *SVE256
 #endif
+#ifdef HAVE_RVV_CPU_DEFINITION
+    , void *RVVM1
+    , void *RVVM2
+#endif
   );
 
   void* get_call_ptr(
@@ -148,6 +165,10 @@ struct P10_API CPUDispatchStubImpl {
 #ifdef HAVE_SVE_CPU_DEFINITION
       , void *SVE128
       , void *SVE256
+#endif
+#ifdef HAVE_RVV_CPU_DEFINITION
+      , void *RVVM1
+      , void *RVVM2
 #endif
   );
 
@@ -174,6 +195,10 @@ struct P10_API CPUDispatchStubImpl {
     , void *SVE128
     , void *SVE256
 #endif
+#ifdef HAVE_RVV_CPU_DEFINITION
+    , void *RVVM1
+    , void *RVVM2
+#endif
   );
 
   // Fixing dispatch error in Windows debug builds.
@@ -182,6 +207,17 @@ struct P10_API CPUDispatchStubImpl {
   #else
     std::atomic<void*> cpu_dispatch_ptr{nullptr};
   #endif
+  // Accelerator backend slots; each stays null until a backend registers
+  // a kernel via the matching REGISTER_*_DISPATCH macro.
+  void* cuda_dispatch_ptr = nullptr;
+  void* hip_dispatch_ptr = nullptr;
+  void* mps_dispatch_ptr = nullptr;
+  void* mtia_dispatch_ptr = nullptr;
+  void* hpu_dispatch_ptr = nullptr;
+  void* privateuse1_dispatch_ptr = nullptr;
+#if defined(USE_XPU)
+  void* xpu_dispatch_ptr = nullptr;
+#endif
 };
 
 template <typename rT, typename T, typename... Args>
@@ -213,6 +249,10 @@ private:
       , reinterpret_cast<void*>(SVE128)
       , reinterpret_cast<void*>(SVE256)
 #endif
+#ifdef HAVE_RVV_CPU_DEFINITION
+      , reinterpret_cast<void*>(RVVM1)
+      , reinterpret_cast<void*>(RVVM2)
+#endif
       )
     );
   }
@@ -223,6 +263,36 @@ public:
     FnPtr call_ptr = get_call_ptr(device_type);
     return (*call_ptr)(std::forward<ArgTypes>(args)...);
   }
+
+  void set_cuda_dispatch_ptr(FnPtr fn_ptr) {
+    impl.cuda_dispatch_ptr = reinterpret_cast<void*>(fn_ptr);
+  }
+
+  void set_hip_dispatch_ptr(FnPtr fn_ptr) {
+    impl.hip_dispatch_ptr = reinterpret_cast<void*>(fn_ptr);
+  }
+
+  void set_mps_dispatch_ptr(FnPtr fn_ptr) {
+    impl.mps_dispatch_ptr = reinterpret_cast<void*>(fn_ptr);
+  }
+
+  void set_mtia_dispatch_ptr(FnPtr fn_ptr) {
+    impl.mtia_dispatch_ptr = reinterpret_cast<void*>(fn_ptr);
+  }
+
+  void set_hpu_dispatch_ptr(FnPtr fn_ptr) {
+    impl.hpu_dispatch_ptr = reinterpret_cast<void*>(fn_ptr);
+  }
+
+  void set_privateuse1_dispatch_ptr(FnPtr fn_ptr) {
+    impl.privateuse1_dispatch_ptr = reinterpret_cast<void*>(fn_ptr);
+  }
+
+#if defined(USE_XPU)
+  void set_xpu_dispatch_ptr(FnPtr fn_ptr) {
+    impl.xpu_dispatch_ptr = reinterpret_cast<void*>(fn_ptr);
+  }
+#endif
 
   // Returns true if the dispatcher has a kernel registered for this device
   // type.
@@ -244,6 +314,10 @@ public:
 #ifdef HAVE_SVE_CPU_DEFINITION
       , reinterpret_cast<void*>(SVE128)
       , reinterpret_cast<void*>(SVE256)
+#endif
+#ifdef HAVE_RVV_CPU_DEFINITION
+      , reinterpret_cast<void*>(RVVM1)
+      , reinterpret_cast<void*>(RVVM2)
 #endif
       );
     if (std::holds_alternative<ErrorType>(result)){
@@ -268,6 +342,10 @@ public:
 #ifdef HAVE_SVE_CPU_DEFINITION
   static P10_API FnPtr SVE128;
   static P10_API FnPtr SVE256;
+#endif
+#ifdef HAVE_RVV_CPU_DEFINITION
+  static P10_API FnPtr RVVM1;
+  static P10_API FnPtr RVVM2;
 #endif
 private:
   CPUDispatchStubImpl impl;
@@ -321,6 +399,14 @@ private:
 #define REGISTER_SVE256_DISPATCH(name, fn)
 #endif
 
+#ifdef HAVE_RVV_CPU_DEFINITION
+#define REGISTER_RVVM1_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, RVVM1, fn)
+#define REGISTER_RVVM2_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, RVVM2, fn)
+#else
+#define REGISTER_RVVM1_DISPATCH(name, fn)
+#define REGISTER_RVVM2_DISPATCH(name, fn)
+#endif
+
 // Macro to register the same kernel for all CPU arch types. This is useful
 // if a kernel does not benefit from being recompiled across different arch types.
 #define REGISTER_ALL_CPU_DISPATCH(name, fn)                                    \
@@ -330,12 +416,122 @@ private:
   REGISTER_VSX_DISPATCH(name, fn)                                              \
   REGISTER_ZVECTOR_DISPATCH(name, fn)                                          \
   REGISTER_SVE128_DISPATCH(name, fn)                                           \
-  REGISTER_SVE256_DISPATCH(name, fn)
+  REGISTER_SVE256_DISPATCH(name, fn)                                           \
+  REGISTER_RVVM1_DISPATCH(name, fn)                                            \
+  REGISTER_RVVM2_DISPATCH(name, fn)
 
 #define REGISTER_NO_CPU_DISPATCH(name)                                         \
   REGISTER_ALL_CPU_DISPATCH(name, nullptr)
 
 #if defined(CPU_CAPABILITY)
+// REGISTER_DISPATCH now dispatches an AVX512 kernel to nullptr but registers other dispatches.
+// ALSO_REGISTER_AVX512_DISPATCH should be used for ensuring AVX512 dispatch, among others.
+// ALSO_REGISTER_SVE256_DISPATCH should be used for ensuring SVE256 dispatch, among others.
+#ifdef CPU_CAPABILITY_AVX512
+#define REGISTER_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, CPU_CAPABILITY, ((void*)(fn) ? nullptr : nullptr))
+#else
+#define REGISTER_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, CPU_CAPABILITY, fn)
+#endif
+#define ALSO_REGISTER_AVX512_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, CPU_CAPABILITY, fn)
+#define ALSO_REGISTER_SVE128_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, CPU_CAPABILITY, fn)
+#define ALSO_REGISTER_SVE256_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, CPU_CAPABILITY, fn)
+#endif
+
+// Accelerator device registration: each backend TU registers its kernel
+// into the stub's device slot via a static registrar object.  The CUDA
+// registrar doubles for HIP in the ROCm build, mirroring the hipified
+// call sites that keep the CUDA registration macro.
+namespace {
+template <typename DispatchStub>
+struct RegisterCUDADispatch {
+  RegisterCUDADispatch(DispatchStub& stub, typename DispatchStub::FnPtr value) {
+    stub.set_cuda_dispatch_ptr(value);
+  }
+};
+
+template <typename DispatchStub>
+struct RegisterXPUDispatch {
+  RegisterXPUDispatch(DispatchStub& stub, typename DispatchStub::FnPtr value) {
+    stub.set_xpu_dispatch_ptr(value);
+  }
+};
+
+template <typename DispatchStub>
+struct RegisterHPUDispatch {
+  RegisterHPUDispatch(DispatchStub& stub, typename DispatchStub::FnPtr value) {
+    stub.set_hpu_dispatch_ptr(value);
+  }
+};
+
+template <typename DispatchStub>
+struct RegisterMPSDispatch {
+  RegisterMPSDispatch(DispatchStub& stub, typename DispatchStub::FnPtr value) {
+    stub.set_mps_dispatch_ptr(value);
+  }
+};
+
+template <typename DispatchStub>
+struct RegisterHIPDispatch {
+  RegisterHIPDispatch(DispatchStub& stub, typename DispatchStub::FnPtr value) {
+    stub.set_hip_dispatch_ptr(value);
+  }
+};
+
+template <typename DispatchStub>
+struct RegisterMTIADispatch {
+  RegisterMTIADispatch(DispatchStub& stub, typename DispatchStub::FnPtr value) {
+    stub.set_mtia_dispatch_ptr(value);
+  }
+};
+
+template <typename DispatchStub>
+struct RegisterPRIVATEUSE1Dispatch {
+  RegisterPRIVATEUSE1Dispatch(DispatchStub& stub, typename DispatchStub::FnPtr value) {
+    stub.set_privateuse1_dispatch_ptr(value);
+  }
+};
+} // anonymous namespace
+
+#define REGISTER_CUDA_DISPATCH(name, fn)                                      \
+  static RegisterCUDADispatch<struct name##_DECLARE_DISPATCH_type>            \
+      name##__cuda_register(name, fn);
+
+#define REGISTER_HIP_DISPATCH(name, fn)                                       \
+  static RegisterHIPDispatch<struct name##_DECLARE_DISPATCH_type>             \
+      name##__hip_register(name, fn);
+
+#define REGISTER_MPS_DISPATCH(name, fn)                                       \
+  static RegisterMPSDispatch<struct name##_DECLARE_DISPATCH_type>             \
+      name##__mps_register(name, fn);
+
+#define REGISTER_MTIA_DISPATCH(name, fn)                                      \
+  static RegisterMTIADispatch<struct name##_DECLARE_DISPATCH_type>            \
+      name##__mtia_register(name, fn);
+
+#define REGISTER_HPU_DISPATCH(name, fn)                                       \
+  static RegisterHPUDispatch<struct name##_DECLARE_DISPATCH_type>             \
+      name##__hpu_register(name, fn);
+
+#define REGISTER_XPU_DISPATCH(name, fn)                                       \
+  static RegisterXPUDispatch<struct name##_DECLARE_DISPATCH_type>             \
+      name##__xpu_register(name, fn);
+
+#define REGISTER_PRIVATEUSE1_DISPATCH(name, fn)                               \
+  static RegisterPRIVATEUSE1Dispatch<struct name##_DECLARE_DISPATCH_type>     \
+      name##__privateuse1_register(name, fn);
+
+// NB: This macro must be used in an actual 'cu' file; if you try using
+// it from a 'cpp' file it will not work!
+#if defined(__CUDACC__)
+#define REGISTER_DISPATCH(name, fn) REGISTER_CUDA_DISPATCH(name, fn)
+#elif defined(__HIPCC__)
+// The ROCm build hipifies CUDA call sites, so kernel registration keeps
+// going through the CUDA slot there.
+#define REGISTER_DISPATCH(name, fn) REGISTER_CUDA_DISPATCH(name, fn)
+#elif defined(__OBJC__) && defined(USE_MPS)
+// NB: this macro must be used from a 'mm' file in order to dispatch a MPS kernel
+#define REGISTER_DISPATCH(name, fn) REGISTER_MPS_DISPATCH(name, fn)
+#elif defined(CPU_CAPABILITY)
 // REGISTER_DISPATCH now dispatches an AVX512 kernel to nullptr but registers other dispatches.
 // ALSO_REGISTER_AVX512_DISPATCH should be used for ensuring AVX512 dispatch, among others.
 // ALSO_REGISTER_SVE256_DISPATCH should be used for ensuring SVE256 dispatch, among others.
