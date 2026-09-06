@@ -58,11 +58,19 @@ jobs:
 
       - name: Install TensorPlay wheel (nightly)
         if: ${{ inputs.tag == '' && github.event.release.tag_name == '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install --pre tensorplay \
-            --index-url https://download.tensorplay.cn/whl/nightly/cpu/ \
-            --extra-index-url https://pypi.org/simple
+          # Download from the rolling nightly release instead of the wheel
+          # index: the index site only mirrors published release assets, and
+          # the nightly index is not guaranteed to be in sync yet.
+          gh release download nightly \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'tensorplay-*+cpu-cp312-cp312-linux_x86_64.whl' \
+            --output tensorplay-docs.whl
+          python -m pip install tensorplay-docs.whl numpy PyYAML typing-extensions
 
       - name: Install TensorPlay wheel (release)
         if: ${{ inputs.tag != '' || github.event.release.tag_name != '' }}
