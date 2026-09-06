@@ -1217,42 +1217,14 @@ namespace {
 // Minimal size for the contiguous searchsorted kernel to run in parallel.
 constexpr int64_t kSearchSortedGrainSize = 200;
 
-// Reindexes an unsorted boundary tensor through its sorter permutation.
-// Materializing `bd[sorter]` up front keeps the hot loop branch-free and lets
-// the same contiguous kernel serve both paths.
-Tensor searchsorted_apply_sorter(const Tensor& boundaries, const Tensor& sorter) {
-    const std::vector<int64_t> sizes =
-        static_cast<std::vector<int64_t>>(boundaries.shape());
-    Tensor sorted = Tensor::empty(sizes, boundaries.dtype(), boundaries.device());
-    const int64_t n = boundaries.numel();
-    const int64_t inner = boundaries.size(-1);
-    Tensor seq_c = boundaries.contiguous();
-    Tensor sorter_c = sorter.contiguous();
-    const int64_t* sp = sorter_c.data_ptr<int64_t>();
-#define TP_SS_SORT_CASE(ctype, name)                                        \
-    case DType::name: {                                                     \
-        const ctype* src = seq_c.data_ptr<ctype>();                         \
-        ctype* dst = sorted.data_ptr<ctype>();                              \
-        parallel_for(0, n, kSearchSortedGrainSize, [&](int64_t b, int64_t e) { \
-            for (int64_t i = b; i < e; ++i) dst[i] = src[sp[i]];            \
-        });                                                                 \
-        break;                                                              \
-    }
-    switch (seq_c.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_SS_SORT_CASE)
-        default: TP_THROW(TypeError, "searchsorted(): unsupported boundaries dtype ",
-                          toString(seq_c.dtype()));
-    }
-#undef TP_SS_SORT_CASE
-    return sorted;
-}
-
 // The contiguous hot loop.  `boundaries` must be contiguous with the same
-// dtype as `input`; `is_1d_boundaries` selects the shared-table addressing.
+// dtype as `input`; `sorter` is either undefined or a contiguous permutation
+// with the same shape as `boundaries`.
 template <typename input_t, typename output_t>
 void searchsorted_cpu_contiguous(Tensor& result, const Tensor& input,
                                  const Tensor& boundaries, bool right,
-                                 bool is_1d_boundaries) {
+                                 bool is_1d_boundaries,
+                                 const Tensor& sorter) {
     const int64_t numel_in = input.numel();
     const bool is_scalar_input = input.dim() == 0 && numel_in == 1;
     // Innermost dimension size of the input and of the lookup tables.
@@ -1261,38 +1233,49 @@ void searchsorted_cpu_contiguous(Tensor& result, const Tensor& input,
 
     const input_t* data_in = input.data_ptr<input_t>();
     const input_t* data_bd = boundaries.data_ptr<input_t>();
+    const int64_t* data_sorter =
+        sorter.defined() ? sorter.data_ptr<int64_t>() : nullptr;
     output_t* data_out = result.data_ptr<output_t>();
 
     parallel_for(0, numel_in, kSearchSortedGrainSize, [&](int64_t b, int64_t e) {
         for (int64_t i = b; i < e; ++i) {
             // A 1-D boundary table is shared by every query; a row-wise table
             // starts at (query row / input innermost) * table innermost.
-            int64_t start_bd = is_1d_boundaries ? 0 : i / idim_in * idim_bd;
+            const int64_t row_offset =
+                is_1d_boundaries ? 0 : i / idim_in * idim_bd;
+            int64_t start_bd = row_offset;
             int64_t end_bd = start_bd + idim_bd;
             const input_t val = data_in[i];
             if (!right) {
                 // lower bound: first position with bd >= val
                 while (start_bd < end_bd) {
                     const int64_t mid = start_bd + ((end_bd - start_bd) >> 1);
-                    if (!(data_bd[mid] >= val)) start_bd = mid + 1; else end_bd = mid;
+                    const input_t mid_value = data_sorter
+                        ? data_bd[data_sorter[mid] + row_offset]
+                        : data_bd[mid];
+                    if (!(mid_value >= val)) start_bd = mid + 1; else end_bd = mid;
                 }
             } else {
                 // upper bound: first position with bd > val
                 while (start_bd < end_bd) {
                     const int64_t mid = start_bd + ((end_bd - start_bd) >> 1);
-                    if (!(data_bd[mid] > val)) start_bd = mid + 1; else end_bd = mid;
+                    const input_t mid_value = data_sorter
+                        ? data_bd[data_sorter[mid] + row_offset]
+                        : data_bd[mid];
+                    if (!(mid_value > val)) start_bd = mid + 1; else end_bd = mid;
                 }
             }
-            data_out[i] = static_cast<output_t>(start_bd - (is_1d_boundaries ? 0 : i / idim_in * idim_bd));
+            data_out[i] = static_cast<output_t>(start_bd - row_offset);
         }
     });
 }
 
 void searchsorted_dispatch(Tensor& result, const Tensor& input,
-                           const Tensor& boundaries, bool right) {
+                           const Tensor& boundaries, bool right,
+                           const Tensor& sorter) {
 #define TP_SS_RUN(input_t, output_t)                                       \
     searchsorted_cpu_contiguous<input_t, output_t>(                        \
-        result, input, boundaries, right, boundaries.dim() == 1)
+        result, input, boundaries, right, boundaries.dim() == 1, sorter)
 
     if (result.dtype() == DType::Int64) {
         switch (input.dtype()) {
@@ -1357,18 +1340,19 @@ Tensor& searchsorted_out_cpu_impl(const Tensor& sorted_sequence,
     const bool out_is_contiguous = result.is_contiguous();
     if (!out_is_contiguous) out = result.contiguous();
 
-    Tensor trimmed_input, trimmed_boundaries, trimmed_sorter;
-    Tensor sorter_work = sorter;
-    if (sorter_work.defined()) {
-        sorter_work = searchsorted_apply_sorter(sorted_sequence, sorter_work);
+    Tensor trimmed_input, trimmed_boundaries;
+    Tensor sorter_work;
+    if (sorter.defined()) {
+        sorter_work = sorter.contiguous();
     }
-    Tensor seq = sorter_work.defined() ? sorter_work : sorted_sequence;
+    const Tensor& seq = sorted_sequence;
     bucketization::maybe_trim_input_tensors(trimmed_input, trimmed_boundaries,
                                             self, seq);
     const Tensor& final_input = trimmed_input.defined() ? trimmed_input : self;
     const Tensor& final_boundaries =
         trimmed_boundaries.defined() ? trimmed_boundaries : seq;
-    searchsorted_dispatch(out, final_input, final_boundaries, is_right);
+    searchsorted_dispatch(out, final_input, final_boundaries, is_right,
+                          sorter_work);
 
     if (!out_is_contiguous) result.copy_(out);
     return result;
