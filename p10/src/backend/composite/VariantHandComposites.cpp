@@ -46,6 +46,30 @@ Tensor quantile_scalar_tensor(const Tensor& self, double q) {
     return ops::scalar_tensor(Scalar(q), self.dtype(), self.device());
 }
 
+Tensor& write_reduction_out(const char* op, Tensor value, Tensor& out) {
+    if (!out.defined()) {
+        out = std::move(value);
+        return out;
+    }
+    if (out.device() != value.device()) {
+        TP_THROW(DeviceMismatchError,
+                 op, ": output device must match input device");
+    }
+    if (out.dtype() != value.dtype()) {
+        if (!canCast(value.dtype(), out.dtype())) {
+            TP_THROW(TypeError,
+                     op, ": result type cannot be cast to output type");
+        }
+        value = value.to(out.dtype());
+    }
+    const auto target = static_cast<std::vector<int64_t>>(value.shape());
+    if (static_cast<std::vector<int64_t>>(out.shape()) != target) {
+        out.resize_(target);
+    }
+    out.copy_(value);
+    return out;
+}
+
 } // namespace
 
 // ---- norm family -----------------------------------------------------------
@@ -80,15 +104,20 @@ Tensor norm_scalar_opt_dim_dtype_native(const Tensor& self, const std::optional<
 
 Tensor& norm_out_native(const Tensor& self, const std::optional<Scalar>& p,
                         const std::vector<int64_t>& dim, bool keepdim, Tensor& out) {
-    out = ops::norm(self, dim, p.has_value() ? p->toDouble() : 2.0, keepdim);
-    return out;
+    return write_reduction_out(
+        "norm", ops::norm(self, dim, p.has_value() ? p->toDouble() : 2.0,
+                           keepdim),
+        out);
 }
 
 Tensor& norm_dtype_out_native(const Tensor& self, const std::optional<Scalar>& p,
                               const std::vector<int64_t>& dim, bool keepdim, DType dtype,
                               Tensor& out) {
-    out = ops::norm(self, dim, p.has_value() ? p->toDouble() : 2.0, keepdim).to(dtype);
-    return out;
+    return write_reduction_out(
+        "norm", ops::norm(self, dim, p.has_value() ? p->toDouble() : 2.0,
+                           keepdim)
+                    .to(dtype),
+        out);
 }
 
 // ---- reductions ------------------------------------------------------------
@@ -103,8 +132,9 @@ Tensor prod_dim_int_native(const Tensor& self, int64_t dim, bool keepdim,
 
 Tensor& prod_int_out_native(const Tensor& self, int64_t dim, bool keepdim,
                             std::optional<DType> dtype, Tensor& out) {
-    out = prod_dim_int_native(self, dim, keepdim, dtype);
-    return out;
+    return write_reduction_out("prod", prod_dim_int_native(self, dim, keepdim,
+                                                            dtype),
+                               out);
 }
 
 Tensor std_correction_native(const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
@@ -120,15 +150,15 @@ Tensor& std_correction_out_native(const Tensor& self,
                                   const std::optional<std::vector<int64_t>>& dim,
                                   const std::optional<Scalar>& correction, bool keepdim,
                                   Tensor& out) {
-    out = std_correction_native(self, dim, correction, keepdim);
-    return out;
+    return write_reduction_out(
+        "std", std_correction_native(self, dim, correction, keepdim), out);
 }
 
 Tensor& std_out_native(const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
                        bool unbiased, bool keepdim, Tensor& out) {
     const std::optional<Scalar> correction = Scalar(int64_t(unbiased ? 1 : 0));
-    out = std_correction_native(self, dim, correction, keepdim);
-    return out;
+    return write_reduction_out(
+        "std", std_correction_native(self, dim, correction, keepdim), out);
 }
 
 Tensor var_correction_native(const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
@@ -144,15 +174,15 @@ Tensor& var_correction_out_native(const Tensor& self,
                                   const std::optional<std::vector<int64_t>>& dim,
                                   const std::optional<Scalar>& correction, bool keepdim,
                                   Tensor& out) {
-    out = var_correction_native(self, dim, correction, keepdim);
-    return out;
+    return write_reduction_out(
+        "var", var_correction_native(self, dim, correction, keepdim), out);
 }
 
 Tensor& var_out_native(const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
                        bool unbiased, bool keepdim, Tensor& out) {
     const std::optional<Scalar> correction = Scalar(int64_t(unbiased ? 1 : 0));
-    out = var_correction_native(self, dim, correction, keepdim);
-    return out;
+    return write_reduction_out(
+        "var", var_correction_native(self, dim, correction, keepdim), out);
 }
 
 std::tuple<Tensor, Tensor> std_mean_correction_native(
@@ -234,8 +264,7 @@ Tensor& logsumexp_out_native(const Tensor& self, const std::vector<int64_t>& dim
     for (int64_t d : dims) {
         r = ops::logsumexp(r, d, keepdim);
     }
-    out = r;
-    return out;
+    return write_reduction_out("logsumexp", std::move(r), out);
 }
 
 // ---- shape ops --------------------------------------------------------------
