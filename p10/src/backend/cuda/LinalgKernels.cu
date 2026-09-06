@@ -847,6 +847,14 @@ std::tuple<Tensor, Tensor> linalg_polar_kernel_cuda(const Tensor& A) {
     return {U.contiguous(), H.contiguous()};
 }
 
+std::tuple<Tensor, Tensor> linalg_polar_out_kernel_cuda(const Tensor& A,
+                                                        Tensor& U, Tensor& H) {
+    auto result = linalg_polar_kernel_cuda(A);
+    U.copy_(std::get<0>(result));
+    H.copy_(std::get<1>(result));
+    return {U, H};
+}
+
 Tensor linalg_householder_product_kernel_cuda(const Tensor& input, const Tensor& tau) {
     const char* api = "linalg.householder_product";
     check_is_matrix(input, api);
@@ -1312,6 +1320,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, LinalgKernels) {
     m.impl("linalg_eig", linalg_eig_kernel_cuda);
     m.impl("linalg_eigvals", linalg_eigvals_kernel_cuda);
     m.impl("linalg_polar", linalg_polar_kernel_cuda);
+    m.impl("linalg_polar.out", linalg_polar_out_kernel_cuda);
     m.impl("linalg_lstsq", linalg_lstsq_kernel_cuda);
     m.impl("linalg_qr", linalg_qr_kernel_cuda);
     m.impl("linalg_householder_product", linalg_householder_product_kernel_cuda);
