@@ -224,9 +224,14 @@ std::tuple<Tensor, Tensor, Tensor> interop_unique_consecutive_cuda(
         const Tensor& self, bool return_inverse, bool return_counts,
         std::optional<int64_t> dim) {
     Tensor flat = dim.has_value() ? self : self.reshape({-1});
-    return dispatch_cuda<std::tuple<Tensor, Tensor, Tensor>>(
+    auto result = dispatch_cuda<std::tuple<Tensor, Tensor, Tensor>>(
         "unique_dim_consecutive", flat, dim.has_value() ? *dim : int64_t(0),
         return_inverse, return_counts);
+    if (!dim.has_value() && return_inverse) {
+        std::get<1>(result) = std::get<1>(result).reshape(
+            static_cast<std::vector<int64_t>>(self.shape()));
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------
