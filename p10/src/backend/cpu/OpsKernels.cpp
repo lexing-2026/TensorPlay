@@ -8,6 +8,7 @@
 #include "Parallel.h"
 #include "TypePromotion.h"
 #include "SpecialMath.h"
+#include "Complex.h"
 #include "cpu/ComplexUnary.h"
 
 #include <vector>
@@ -15,7 +16,6 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
-#include <complex>
 #include <limits>
 #include <cstring>
 #include <utility>
@@ -162,7 +162,7 @@ inline bool logical_truth_cpu(const T& value) {
 }
 
 template <typename T>
-inline bool logical_truth_cpu(const std::complex<T>& value) {
+inline bool logical_truth_cpu(const complex<T>& value) {
     return static_cast<bool>(value.real()) || static_cast<bool>(value.imag());
 }
 
@@ -201,10 +201,10 @@ Tensor logical_binary_kernel(const Tensor& a_in, const Tensor& b_in, Pred pred,
         }); \
         break; \
     }
-        TP_LOGICAL_BIN_COMPLEX_CASE(std::complex<Half>, ComplexHalf)
-        TP_LOGICAL_BIN_COMPLEX_CASE(std::complex<float>, ComplexFloat)
-        TP_LOGICAL_BIN_COMPLEX_CASE(std::complex<double>, ComplexDouble)
-        TP_LOGICAL_BIN_COMPLEX_CASE(std::complex<BFloat16>, BComplex32)
+        TP_LOGICAL_BIN_COMPLEX_CASE(complex<Half>, ComplexHalf)
+        TP_LOGICAL_BIN_COMPLEX_CASE(complex<float>, ComplexFloat)
+        TP_LOGICAL_BIN_COMPLEX_CASE(complex<double>, ComplexDouble)
+        TP_LOGICAL_BIN_COMPLEX_CASE(complex<BFloat16>, BComplex32)
         default: TP_THROW(TypeError, name, ": unsupported dtype");
     }
 #undef TP_LOGICAL_BIN_COMPLEX_CASE
@@ -240,10 +240,10 @@ Tensor logical_unary_kernel(const Tensor& self, Pred pred, const char* name) {
         }); \
         break; \
     }
-        TP_LOGICAL_UNARY_COMPLEX_CASE(std::complex<Half>, ComplexHalf)
-        TP_LOGICAL_UNARY_COMPLEX_CASE(std::complex<float>, ComplexFloat)
-        TP_LOGICAL_UNARY_COMPLEX_CASE(std::complex<double>, ComplexDouble)
-        TP_LOGICAL_UNARY_COMPLEX_CASE(std::complex<BFloat16>, BComplex32)
+        TP_LOGICAL_UNARY_COMPLEX_CASE(complex<Half>, ComplexHalf)
+        TP_LOGICAL_UNARY_COMPLEX_CASE(complex<float>, ComplexFloat)
+        TP_LOGICAL_UNARY_COMPLEX_CASE(complex<double>, ComplexDouble)
+        TP_LOGICAL_UNARY_COMPLEX_CASE(complex<BFloat16>, BComplex32)
         default: TP_THROW(TypeError, name, ": unsupported dtype");
     }
 #undef TP_LOGICAL_UNARY_COMPLEX_CASE
