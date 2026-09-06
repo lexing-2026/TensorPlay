@@ -116,14 +116,14 @@ Tensor bitwise_binary_cuda(const Tensor& a_in, const Tensor& b_in, Pred pred, co
         .add_input(bc)
         .build();
     if (dt == DType::Bool) {
-        gpu_kernel(iter, [pred] __device__ (bool lhs, bool rhs) -> bool {
+        gpu_kernel(iter, [pred] __host__ __device__ (bool lhs, bool rhs) -> bool {
             return pred(lhs, rhs);
         });
         return out;
     }
 #define TP_BIT_BIN(ctype, name_) \
     case DType::name_: \
-        gpu_kernel(iter, [pred] __device__ (ctype lhs, ctype rhs) -> ctype { \
+        gpu_kernel(iter, [pred] __host__ __device__ (ctype lhs, ctype rhs) -> ctype { \
             return pred(lhs, rhs); \
         }); \
         break;
@@ -150,14 +150,14 @@ Tensor bitwise_scalar_cuda(const Tensor& self_in, Scalar other, Pred pred, const
         .add_input(scalar_tensor)
         .build();
     if (self_in.dtype() == DType::Bool) {
-        gpu_kernel_with_scalars(iter, [pred] __device__ (bool value, bool other_value) -> bool {
+        gpu_kernel_with_scalars(iter, [pred] __host__ __device__ (bool value, bool other_value) -> bool {
             return pred(value, other_value);
         });
         return out;
     }
 #define TP_BIT_SCALAR(ctype, name_) \
     case DType::name_: { \
-        gpu_kernel_with_scalars(iter, [pred] __device__ (ctype value, ctype other_value) -> ctype { \
+        gpu_kernel_with_scalars(iter, [pred] __host__ __device__ (ctype value, ctype other_value) -> ctype { \
             return pred(value, other_value); \
         }); \
         break; \
@@ -180,14 +180,14 @@ Tensor bitwise_not_cuda(const Tensor& self) {
         .add_input(self)
         .build();
     if (self.dtype() == DType::Bool) {
-        gpu_kernel(iter, [] __device__ (bool value) -> bool {
+        gpu_kernel(iter, [] __host__ __device__ (bool value) -> bool {
             return !value;
         });
         return out;
     }
 #define TP_BNOT(ctype, name_) \
     case DType::name_: \
-        gpu_kernel(iter, [] __device__ (ctype value) -> ctype { \
+        gpu_kernel(iter, [] __host__ __device__ (ctype value) -> ctype { \
             return static_cast<ctype>(~value); \
         }); \
         break;
@@ -220,7 +220,7 @@ Tensor bitwise_shift_tensor_cuda_impl(const Tensor& a_in, const Tensor& b_in, co
         .build();
 #define TP_SHIFT_BIN(ctype, name_) \
     case DType::name_: { \
-        gpu_kernel(iter, [] __device__ (ctype value, ctype shift) -> ctype { \
+        gpu_kernel(iter, [] __host__ __device__ (ctype value, ctype shift) -> ctype { \
             return bitwise_shift_value<ctype, kLeft>(value, shift); \
         }); \
         break; \
@@ -249,7 +249,7 @@ Tensor bitwise_shift_scalar_cuda_impl(const Tensor& a_in, Scalar other, const ch
         .build();
 #define TP_SHIFT_SCALAR(ctype, name_) \
     case DType::name_: { \
-        gpu_kernel_with_scalars(iter, [] __device__ (ctype value, ctype shift) -> ctype { \
+        gpu_kernel_with_scalars(iter, [] __host__ __device__ (ctype value, ctype shift) -> ctype { \
             return bitwise_shift_value<ctype, kLeft>(value, shift); \
         }); \
         break; \

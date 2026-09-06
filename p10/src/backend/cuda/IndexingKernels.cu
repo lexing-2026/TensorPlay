@@ -893,8 +893,8 @@ __global__ void index_put_kernel(int64_t n, T* d, const int64_t* ip, const T* vp
 
 template <typename T>
 inline void run_nonzero_mark_iter(TensorIteratorBase& iter) {
-    gpu_kernel(iter, [] __device__(T value) -> int64_t {
-        return static_cast<bool>(value) ? int64_t(1) : int64_t(0);
+    gpu_kernel(iter, [] __host__ __device__(T value) -> int64_t {
+        return static_cast<bool>(value != T(0)) ? int64_t(1) : int64_t(0);
     });
 }
 
@@ -905,7 +905,7 @@ __global__ void nonzero_fill_kernel(int64_t n, int64_t ndim, const T* x,
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += stride) {
-        if (!static_cast<bool>(x[i])) continue;
+        if (!(x[i] != T(0))) continue;
         const int64_t slot = positions[i] - 1;
         int64_t rem = i;
         for (int64_t d2 = ndim - 1; d2 >= 0; --d2) {
@@ -1447,7 +1447,7 @@ void radix_sort_impl(const Tensor& self_c, Tensor& values, Tensor& indices,
 
 template <typename T>
 inline void run_masked_fill_iter(TensorIteratorBase& iter, T value) {
-    gpu_kernel(iter, [value] __device__(T self_value, bool mask_value) -> T {
+    gpu_kernel(iter, [value] __host__ __device__(T self_value, bool mask_value) -> T {
         return mask_value ? value : self_value;
     });
 }
@@ -2817,7 +2817,7 @@ Tensor take_cuda(const Tensor& self, const Tensor& index) {
 template <typename T>
 inline void run_masked_scatter_iter(TensorIteratorBase& iter,
                                     const T* source) {
-    gpu_kernel(iter, [source] __device__(
+    gpu_kernel(iter, [source] __host__ __device__(
         T self_value, bool mask_value, int64_t source_offset) -> T {
         return mask_value ? source[source_offset] : self_value;
     });
@@ -2867,7 +2867,7 @@ Tensor masked_scatter_cuda(const Tensor& self, const Tensor& mask, const Tensor&
         .add_output(flags)
         .add_const_input(mask_flat)
         .build();
-    gpu_kernel(flag_iter, [] __device__(bool value) -> int64_t {
+    gpu_kernel(flag_iter, [] __host__ __device__(bool value) -> int64_t {
         return value ? int64_t(1) : int64_t(0);
     });
 
