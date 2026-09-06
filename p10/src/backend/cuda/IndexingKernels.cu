@@ -20,6 +20,7 @@
 // stay at global scope so qualified scalar types resolve without ambiguity.
 #include "Atomic.cuh"
 
+#include <cassert>
 #include <vector>
 #include <algorithm>
 #include <cstdint>
@@ -2616,10 +2617,28 @@ __global__ void masked_scatter_kernel(int64_t n, const bool* mask,
     }
 }
 
+__global__ void masked_scatter_size_check(
+    const int64_t* source_offsets, const bool* mask, int64_t last,
+    int64_t source_size) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        const int64_t selected =
+            source_offsets[last] + (mask[last] ? int64_t(1) : int64_t(0));
+        assert(selected <= source_size);
+    }
+}
+
 Tensor masked_scatter_cuda(const Tensor& self, const Tensor& mask, const Tensor& source) {
-    Tensor m_full = mask.to(DType::Bool).to(self.device()).expand(
+    if (source.dtype() != self.dtype()) {
+        TP_THROW(TypeError,
+                 "masked_scatter: self and source must have the same dtype");
+    }
+    if (mask.device() != self.device() || source.device() != self.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "masked_scatter: self, mask, and source must be on the same device");
+    }
+    Tensor m_full = mask.to(DType::Bool).expand(
         static_cast<std::vector<int64_t>>(self.shape())).contiguous();
-    Tensor src = source.contiguous().to(self.device());
+    Tensor src = source.contiguous();
     Tensor result = detail::contiguous_clone(self);
     int64_t n = result.numel();
     if (n == 0) return result;
@@ -2627,6 +2646,10 @@ Tensor masked_scatter_cuda(const Tensor& self, const Tensor& mask, const Tensor&
     Tensor source_offsets = mask_int.cumsum(0).sub(mask_int);
     int64_t src_n = src.numel();
     auto stream = getCurrentCUDAStream().stream();
+    masked_scatter_size_check<<<1, 1, 0, stream>>>(
+        source_offsets.data_ptr<int64_t>(), m_full.data_ptr<bool>(), n - 1,
+        src_n);
+    CUDA_CHECK(cudaGetLastError());
 #define TP_MS_CASE(ctype, name) \
     case DType::name: \
         masked_scatter_kernel<ctype><<< \
