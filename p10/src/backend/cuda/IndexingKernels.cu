@@ -591,31 +591,8 @@ __global__ void scan_register_block_kernel(int64_t n_rows, int64_t d_size,
     }
 }
 
-// Stable running log-sum-exp:
-// m = max(x, acc); acc = m + log1p(exp(-|x - acc|)).
-template <typename T, typename AccT>
-__global__ void logcumsumexp_scan_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
-                                         const T* in, T* out) {
-    using acc_t = AccT;
-    constexpr acc_t neg_inf = -std::numeric_limits<acc_t>::infinity();
-    int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; si < n_slices; si += stride) {
-        int64_t o = si / inner, in2 = si % inner;
-        const T* sp = in + o * d_size * inner + in2;
-        T* dp = out + o * d_size * inner + in2;
-        acc_t acc = neg_inf;
-        for (int64_t j = 0; j < d_size; ++j) {
-            acc_t x = static_cast<acc_t>(sp[j * inner]);
-            acc_t m = ::max(x, acc);
-            acc = (m == neg_inf) ? m : (m + ::log1p(::exp(-::fabs(x - acc))));
-            dp[j * inner] = static_cast<T>(acc);
-        }
-    }
-}
-
 template <typename T>
-__device__ __forceinline__ tensorplay::complex<T> logcumsumexp_complex_pair(
+__host__ __device__ __forceinline__ tensorplay::complex<T> logcumsumexp_complex_pair(
         const tensorplay::complex<T>& x, const tensorplay::complex<T>& y) {
     const T nan = std::numeric_limits<T>::quiet_NaN();
     if (::isnan(x.real()) || ::isnan(x.imag()) ||
@@ -634,44 +611,27 @@ __device__ __forceinline__ tensorplay::complex<T> logcumsumexp_complex_pair(
 }
 
 template <typename T>
-__global__ void logcumsumexp_complex_scan_kernel(
-        int64_t n_slices, int64_t d_size, int64_t inner,
-        const tensorplay::complex<T>* in, tensorplay::complex<T>* out) {
-    const T neg_inf = -std::numeric_limits<T>::infinity();
-    int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; si < n_slices; si += stride) {
-        int64_t o = si / inner, in2 = si % inner;
-        const tensorplay::complex<T>* sp = in + o * d_size * inner + in2;
-        tensorplay::complex<T>* dp = out + o * d_size * inner + in2;
-        tensorplay::complex<T> acc(neg_inf, T(0));
-        for (int64_t j = 0; j < d_size; ++j) {
-            acc = logcumsumexp_complex_pair(acc, sp[j * inner]);
-            dp[j * inner] = acc;
+struct logcumsumexp_scan_op {
+    template <typename AccT>
+    __host__ __device__ AccT operator()(AccT lhs, AccT rhs) const {
+        const bool lhs_nan = ::isnan(lhs);
+        const bool rhs_nan = ::isnan(rhs);
+        const AccT min_value = rhs_nan ? rhs : (lhs_nan ? lhs : (lhs < rhs ? lhs : rhs));
+        const AccT max_value = rhs_nan ? rhs : (lhs_nan ? lhs : (lhs > rhs ? lhs : rhs));
+        if (min_value != max_value || ::isfinite(min_value)) {
+            return ::log1p(::exp(min_value - max_value)) + max_value;
         }
+        return lhs;
     }
-}
+};
 
 template <typename T>
-Tensor complex_logcumsumexp_cuda(const Tensor& src, int64_t dim) {
-    Tensor result = Tensor::empty(
-        static_cast<std::vector<int64_t>>(src.shape()),
-        src.dtype(), src.device());
-    const int64_t d_size = src.size(dim);
-    if (d_size == 0 || src.numel() == 0) return result;
-    int64_t outer = 1;
-    int64_t inner = 1;
-    outer_inner(static_cast<std::vector<int64_t>>(src.shape()), dim, outer, inner);
-    const int64_t slices = outer * inner;
-    auto stream = getCurrentCUDAStream().stream();
-    logcumsumexp_complex_scan_kernel<T><<<(slices + kThreads - 1) / kThreads,
-                                           kThreads, 0, stream>>>(
-        slices, d_size, inner,
-        static_cast<const tensorplay::complex<T>*>(src.data_ptr()),
-        static_cast<tensorplay::complex<T>*>(result.data_ptr()));
-    CUDA_CHECK(cudaGetLastError());
-    return result;
-}
+struct logcumsumexp_complex_op {
+    __host__ __device__ tensorplay::complex<T> operator()(
+            tensorplay::complex<T> lhs, tensorplay::complex<T> rhs) const {
+        return logcumsumexp_complex_pair(lhs, rhs);
+    }
+};
 
 // Gather with separate result and source trailing extents.
 template <typename T, typename IndexT>
@@ -1925,56 +1885,52 @@ Tensor logcumsumexp_cuda(const Tensor& self, int64_t dim, std::optional<DType> d
     dim = wrap_scan_dim(dim, nd);
     DType out_dtype = dtype.value_or(self.dtype());
     Tensor src = (self.dtype() == out_dtype) ? self.contiguous() : self.to(out_dtype).contiguous();
-    if (isComplexType(out_dtype)) {
-        if (nd == 0) {
-            Tensor result = Tensor::empty({}, out_dtype, src.device());
-            result.copy_(src);
-            return result;
-        }
-        const DType compute_dtype =
-            out_dtype == DType::ComplexDouble ? DType::ComplexDouble : DType::ComplexFloat;
-        Tensor compute_src = src.dtype() == compute_dtype ? src : src.to(compute_dtype);
-        if (compute_dtype == DType::ComplexDouble) {
-            return complex_logcumsumexp_cuda<double>(compute_src, dim).to(out_dtype);
-        }
-        return complex_logcumsumexp_cuda<float>(compute_src, dim).to(out_dtype);
-    }
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(src.shape()), out_dtype, src.device());
     if (nd == 0) {
+        Tensor result = Tensor::empty({}, out_dtype, src.device());
         switch (out_dtype) {
             case DType::Float32:
             case DType::Float64:
             case DType::Float16:
             case DType::BFloat16:
+            case DType::ComplexFloat:
+            case DType::ComplexDouble:
                 result.copy_(src);
                 return result;
             default:
                 TP_THROW(TypeError, "logcumsumexp: unsupported dtype");
         }
     }
-    int64_t d_size = src.size(dim);
-    if (d_size == 0 || src.numel() == 0) return result;
-    int64_t outer = 1, inner = 1;
-    outer_inner(static_cast<std::vector<int64_t>>(src.shape()), dim, outer, inner);
-    int64_t slices = outer * inner;
-    auto stream = getCurrentCUDAStream().stream();
-    if (out_dtype == DType::Float32) {
-        logcumsumexp_scan_kernel<float, float><<<(slices + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-            slices, d_size, inner, src.data_ptr<float>(), result.data_ptr<float>());
-    } else if (out_dtype == DType::Float64) {
-        logcumsumexp_scan_kernel<double, double><<<(slices + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-            slices, d_size, inner, src.data_ptr<double>(), result.data_ptr<double>());
-    } else if (out_dtype == DType::Float16) {
-        logcumsumexp_scan_kernel<Half, float><<<(slices + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-            slices, d_size, inner, src.data_ptr<Half>(), result.data_ptr<Half>());
-    } else if (out_dtype == DType::BFloat16) {
-        logcumsumexp_scan_kernel<BFloat16, float><<<(slices + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-            slices, d_size, inner, src.data_ptr<BFloat16>(), result.data_ptr<BFloat16>());
-    } else {
-        TP_THROW(TypeError, "logcumsumexp: unsupported dtype");
+    if (isComplexType(out_dtype)) {
+        const DType compute_dtype =
+            out_dtype == DType::ComplexDouble ? DType::ComplexDouble : DType::ComplexFloat;
+        Tensor compute_src = src.dtype() == compute_dtype ? src : src.to(compute_dtype);
+        if (compute_dtype == DType::ComplexDouble) {
+            return scan_entry<tensorplay::complex<double>>(
+                compute_src, dim,
+                tensorplay::complex<double>(-std::numeric_limits<double>::infinity(), 0.0),
+                logcumsumexp_complex_op<double>{}).to(out_dtype);
+        }
+        return scan_entry<tensorplay::complex<float>>(
+            compute_src, dim,
+            tensorplay::complex<float>(-std::numeric_limits<float>::infinity(), 0.0f),
+            logcumsumexp_complex_op<float>{}).to(out_dtype);
     }
-    CUDA_CHECK(cudaGetLastError());
-    return result;
+#define TP_LC_CASE(ctype, name) \
+    case DType::name: \
+        return scan_entry<ctype>( \
+            src, dim, static_cast<ctype>(-std::numeric_limits<float>::infinity()), \
+            logcumsumexp_scan_op<ctype>{});
+    switch (out_dtype) {
+        TP_LC_CASE(float, Float32)
+        case DType::Float64:
+            return scan_entry<double>(
+                src, dim, -std::numeric_limits<double>::infinity(),
+                logcumsumexp_scan_op<double>{});
+        TP_LC_CASE(Half, Float16)
+        TP_LC_CASE(BFloat16, BFloat16)
+        default: TP_THROW(TypeError, "logcumsumexp: unsupported dtype");
+    }
+#undef TP_LC_CASE
 }
 
 // ---------------------------------------------------------------------------
