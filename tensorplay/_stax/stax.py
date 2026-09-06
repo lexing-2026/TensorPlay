@@ -2219,47 +2219,55 @@ def _lower_cpu_segmented(
 
         return run
 
-    for segment in segments:
-        if segment.kind == "extern":
-            node = segment.nodes[0]
-            if node.op == "get_attr":
-                if slot_for(node) is None:
-                    return None
-                continue
-            if node.op not in {"call_function", "call_method"}:
-                return None
-            for operand in list(_nodes(node.args)) + list(
-                _nodes(node.kwargs or {})
-            ):
-                if slot_for(operand) is None:
-                    return None
-            sources = tuple(
-                slots[operand]
-                for operand in list(_nodes(node.args))
-                + list(_nodes(node.kwargs or {}))
-            )
-            slots[node] = next_slot
-            next_slot += 1
-            steps.append((extern_step(node), slots[node], sources))
-            continue
-        built = _build_segment_kernel(graph_module, segment, first.device)
-        if built is None:
-            return None
-        externals, runner = built
-        sources = []
-        for node in externals:
-            source = slot_for(node)
-            if source is None:
-                return None
-            sources.append(source)
-        export = segment.export_node
-        if export is None:
-            return None
-        slots[export] = next_slot
+    def add_extern(node: Node) -> bool:
+        nonlocal next_slot
+        if node.op == "get_attr":
+            return slot_for(node) is not None
+        if node.op not in {"call_function", "call_method"}:
+            return False
+        operands = list(_nodes(node.args)) + list(_nodes(node.kwargs or {}))
+        for operand in operands:
+            if slot_for(operand) is None:
+                return False
+        sources = tuple(slots[operand] for operand in operands)
+        slots[node] = next_slot
         next_slot += 1
-        steps.append(
-            (_kernel_step(runner, tuple(sources)), slots[export], tuple(sources))
-        )
+        steps.append((extern_step(node), slots[node], sources))
+        return True
+
+    compiled_count = 0
+    for segment in segments:
+        if segment.kind != "extern":
+            built = _build_segment_kernel(graph_module, segment, first.device)
+            if built is not None:
+                externals, runner = built
+                sources = []
+                for node in externals:
+                    source = slot_for(node)
+                    if source is None:
+                        return None
+                    sources.append(source)
+                export = segment.export_node
+                if export is None:
+                    return None
+                slots[export] = next_slot
+                next_slot += 1
+                steps.append(
+                    (
+                        _kernel_step(runner, tuple(sources)),
+                        slots[export],
+                        tuple(sources),
+                    )
+                )
+                compiled_count += 1
+                continue
+            # One run the generators cannot express does not cost the region
+            # its other kernels: those operators run individually instead.
+        for node in segment.nodes:
+            if not add_extern(node):
+                return None
+    if compiled_count == 0:
+        return None
 
     if final not in slots:
         return None
