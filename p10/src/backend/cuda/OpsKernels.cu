@@ -1347,9 +1347,20 @@ __global__ void nanmean_zero_mask_kernel(int64_t n, const float* count, float* d
 Tensor nanmean_cuda(const Tensor& self, std::optional<int64_t> dim_opt, bool keepdim,
                     std::optional<DType> dtype) {
     DType acc_dt = dtype.value_or(DType::Undefined);
+    if (!isFloatingType(self.dtype()) && !isComplexType(self.dtype())) {
+        TP_THROW(TypeError,
+                 "nanmean(): expected input to have floating point or complex dtype but got ",
+                 toString(self.dtype()));
+    }
+    if (acc_dt != DType::Undefined && !isFloatingType(acc_dt) &&
+        !isComplexType(acc_dt)) {
+        TP_THROW(TypeError,
+                 "nanmean(): could not infer output dtype. Optional dtype must be either a floating point or complex dtype. Got: ",
+                 toString(acc_dt));
+    }
     Tensor x = self;
-    if (!isFloatingType(x.dtype()) && !isComplexType(x.dtype())) {
-        x = x.to(acc_dt != DType::Undefined ? acc_dt : DType::Float32);
+    if (acc_dt != DType::Undefined && x.dtype() != acc_dt) {
+        x = x.to(acc_dt);
     } else if (isReducedFloatingType(x.dtype()) && acc_dt == DType::Undefined) {
         x = x.to(DType::Float32);
     }
