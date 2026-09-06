@@ -75,7 +75,31 @@ def _owns_method_variant(f: NativeFunction, variant: str) -> bool:
     )
 
 
-def _overload_key(f: NativeFunction, variant: str) -> tuple:
+def _scalar_dim_arg(f: NativeFunction) -> Argument | None:
+    candidates = [
+        a for a in f.args
+        if a.name == "dim" and a.type.is_list
+        and a.type.kind == "int64_t"
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _scalar_dim_overload_arg(f: NativeFunction) -> Argument | None:
+    dim_arg = _scalar_dim_arg(f)
+    if dim_arg is None:
+        return None
+    for a in f.args:
+        if a is dim_arg:
+            break
+        if a.name == "requires_grad":
+            continue
+        if a.default and a.name not in f.cpp_no_default_args:
+            return None
+    return dim_arg
+
+
+def _overload_key(f: NativeFunction, variant: str,
+                  *, scalar_dim: bool = False) -> tuple:
     """Identity of a Tensor member for C++ overloading purposes.
 
     Parameter *types* decide: argument names, default values, constness, and
@@ -83,8 +107,9 @@ def _overload_key(f: NativeFunction, variant: str) -> tuple:
     with identical parameter type lists are a redeclaration conflict even
     when their schema entries differ.
     """
+    scalar_dim_arg = _scalar_dim_arg(f) if scalar_dim else None
     params = tuple(
-        cpp_arg_type(a.type)
+        "int64_t" if a is scalar_dim_arg else cpp_arg_type(a.type)
         for a in f.args
         if a.name != "requires_grad"
         and not (variant == "method" and a.name == "self")
@@ -154,15 +179,19 @@ def plan_members(funcs: list[NativeFunction]) -> dict:
     return plan
 
 
-def _sig_args(f: NativeFunction, variant: str, *, with_defaults: bool) -> list[str]:
+def _sig_args(f: NativeFunction, variant: str, *, with_defaults: bool,
+              scalar_dim: bool = False) -> list[str]:
     out = []
+    scalar_dim_arg = _scalar_dim_arg(f) if scalar_dim else None
     for a in f.args:
         if variant == "method" and a.name == "self":
             continue
         if a.name == "requires_grad":
             continue
-        s = f"{cpp_arg_type(a.type)} {a.name}"
+        arg_type = "int64_t" if a is scalar_dim_arg else cpp_arg_type(a.type)
+        s = f"{arg_type} {a.name}"
         if (with_defaults and not f.is_out and a.default
+                and a is not scalar_dim_arg
                 and a.name not in f.cpp_no_default_args):
             s += f" = {cpp_default(a.type, a.default)}"
         out.append(s)
@@ -170,9 +199,11 @@ def _sig_args(f: NativeFunction, variant: str, *, with_defaults: bool) -> list[s
 
 
 def method_signature(f: NativeFunction, variant: str, *, declaration: bool,
-                     qualified: bool = False) -> str:
+                     qualified: bool = False,
+                     scalar_dim: bool = False) -> str:
     ret = cpp_return_type(f)
-    args = ", ".join(_sig_args(f, variant, with_defaults=declaration))
+    args = ", ".join(_sig_args(
+        f, variant, with_defaults=declaration, scalar_dim=scalar_dim))
     qual = "Tensor::" if qualified else ""
     sig = f"{ret} {qual}{f.cpp_name}({args})"
     if variant == "method" and _is_const_method(f):
@@ -270,6 +301,16 @@ def generate_header(funcs: list[NativeFunction]) -> str:
             prefix = "static " if variant == "function" else ""
             lines.append(prefix + method_signature(f, variant, declaration=True) + ";")
             lines.append("")
+            if _scalar_dim_overload_arg(f) is not None:
+                scalar_key = _overload_key(f, variant, scalar_dim=True)
+                if scalar_key not in seen_decl:
+                    seen_decl.add(scalar_key)
+                    lines.append(
+                        prefix + method_signature(
+                            f, variant, declaration=True, scalar_dim=True
+                        ) + ";"
+                    )
+                    lines.append("")
     return "\n".join(lines)
 
 
@@ -678,6 +719,38 @@ def generate_cpp(funcs: list[NativeFunction], *,
             lines.append(f"    {'return ' + tail + ';' if not ret_void else tail + ';'}")
             lines.append("}")
             lines.append("")
+
+            scalar_dim_arg = _scalar_dim_overload_arg(f)
+            if scalar_dim_arg is not None:
+                scalar_def_key = _overload_key(
+                    f, variant, scalar_dim=True)
+                if scalar_def_key not in seen_def:
+                    seen_def.add(scalar_def_key)
+                    lines.append(method_signature(
+                        f, variant, declaration=False, qualified=True,
+                        scalar_dim=True) + " {")
+                    scalar_call_args = []
+                    for a in f.args:
+                        if a.name == "requires_grad":
+                            continue
+                        if variant == "method" and a.name == "self":
+                            scalar_call_args.append("*this")
+                        elif a is scalar_dim_arg:
+                            scalar_call_args.append("std::vector<int64_t>{dim}")
+                        else:
+                            scalar_call_args.append(
+                                call_arg_expr(f.base_name, a))
+                    scalar_call = ", ".join(scalar_call_args)
+                    qualifier = "Tensor::"
+                    if ret_void:
+                        lines.append(
+                            f"    {qualifier}{f.cpp_name}({scalar_call});")
+                        lines.append("    return;")
+                    else:
+                        lines.append(
+                            f"    return {qualifier}{f.cpp_name}({scalar_call});")
+                    lines.append("}")
+                    lines.append("")
 
     lines.append("} // namespace tensorplay")
     return "\n".join(lines)
