@@ -1115,32 +1115,13 @@ Tensor threshold_cuda(const Tensor& self, Scalar threshold, Scalar value) {
 namespace {
 
 // Arithmetic domain of the PReLU evaluation: single precision stays single
-// precision, half formats widen to float so the slope product rounds once,
-// and the integral element types follow the same double-precision path the
-// host kernels use.
+// precision, while half formats widen to float so the slope product rounds
+// once.
 template <typename T> struct PReluMath { using type = double; };
 template <> struct PReluMath<float> { using type = float; };
 template <> struct PReluMath<double> { using type = double; };
 template <> struct PReluMath<Half> { using type = float; };
 template <> struct PReluMath<BFloat16> { using type = float; };
-
-// One slope per channel: with `inner` the number of elements that follow the
-// channel axis and `C` the channel count, a linear position i reads slope
-// (i / inner) % C.  C == 1 is the shared-slope form and skips the division.
-template <typename scalar_t, typename math_t>
-__global__ void prelu_channel_kernel(int64_t n, int64_t inner, int64_t C,
-                                     const scalar_t* __restrict__ input,
-                                     const scalar_t* __restrict__ weight,
-                                     scalar_t* __restrict__ output) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t step = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += step) {
-        const math_t x = static_cast<math_t>(input[i]);
-        const int64_t c = (C == 1) ? 0 : (i / inner) % C;
-        const math_t w = static_cast<math_t>(weight[c]);
-        output[i] = static_cast<scalar_t>(x > math_t(0) ? x : w * x);
-    }
-}
 
 // Both gradients in one pass:
 //     grad_input  = x > 0 ? g : w * g
@@ -1217,44 +1198,30 @@ Tensor prelu_prepare_broadcast_weight(const Tensor& self, const Tensor& weight,
     return expanded;
 }
 
-// Slope geometry of the public overload, whose weight is a scalar or a plain
-// 1-D vector: the channel axis is dim 1 once the input has a batch dimension
-// and dim 0 otherwise.
-PReluGeometry prelu_vector_geometry(const Tensor& self, const Tensor& weight) {
-    PReluGeometry geometry;
-    const int64_t C = weight.numel();
-    if (C == 1) return geometry;
-    TP_CHECK(self.dim() > 0, "prelu: a per-channel weight needs a shaped input");
-    const int64_t channel_dim = self.dim() >= 2 ? 1 : 0;
-    TP_CHECK(self.size(channel_dim) == C,
-             "prelu: weight numel does not match the input channel count");
-    geometry.C = C;
-    int64_t inner = 1;
-    for (int64_t k = channel_dim + 1; k < self.dim(); ++k) inner *= self.size(k);
-    geometry.inner = inner;
-    return geometry;
-}
+Tensor prelu_forward_common(const Tensor& self, const Tensor& weight) {
+    Tensor output = Tensor::empty(shape_of(self), self.dtype(), self.device());
+    if (output.numel() == 0) return output;
 
-Tensor prelu_forward_common(const Tensor& self, const Tensor& slope,
-                            const PReluGeometry& geometry) {
-    const Tensor input = self.contiguous();
-    Tensor output = Tensor::empty(shape_of(input), self.dtype(), self.device());
-    const int64_t n = input.numel();
-    if (n == 0) return output;
-
-    dim3 grid, block;
-    launch_ew(grid, block, n);
-    auto stream = getCurrentCUDAStream().stream();
-#define TP_PRELU_FWD(ctype, name)                                              \
-    case DType::name:                                                          \
-        prelu_channel_kernel<ctype, typename PReluMath<ctype>::type>           \
-            <<<grid, block, 0, stream>>>(n, geometry.inner, geometry.C,        \
-                                         input.data_ptr<ctype>(),              \
-                                         slope.data_ptr<ctype>(),              \
-                                         output.data_ptr<ctype>());            \
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(output)
+        .add_const_input(self)
+        .add_const_input(weight)
+        .build();
+#define TP_PRELU_FWD(ctype, name_)                                             \
+    case DType::name_:                                                         \
+        gpu_kernel(iter, [] __device__(ctype input, ctype slope) -> ctype {    \
+            using math_t = typename PReluMath<ctype>::type;                   \
+            const math_t x = static_cast<math_t>(input);                      \
+            const math_t w = static_cast<math_t>(slope);                      \
+            return static_cast<ctype>(x > math_t(0) ? x : w * x);              \
+        });                                                                    \
         break;
     switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_PRELU_FWD)
+        TP_PRELU_FWD(float, Float32)
+        TP_PRELU_FWD(double, Float64)
+        TP_PRELU_FWD(Half, Float16)
+        TP_PRELU_FWD(BFloat16, BFloat16)
         default: TP_THROW(TypeError, "prelu: unsupported dtype");
     }
 #undef TP_PRELU_FWD
@@ -1264,29 +1231,29 @@ Tensor prelu_forward_common(const Tensor& self, const Tensor& slope,
 
 }  // anonymous namespace
 
-// The public overload accepts either spelling of the slope: a scalar or a
-// plain per-channel vector, or a weight the caller has already shaped to
-// broadcast over the input.  Both name the same channel axis, so they answer
-// the same values.
 Tensor prelu_cuda(const Tensor& self, const Tensor& weight) {
-    if (weight.dim() > 1) {
-        PReluGeometry geometry;
-        const Tensor slope =
-            prelu_prepare_broadcast_weight(self, weight, &geometry);
-        return prelu_forward_common(self, slope, geometry);
+    TP_CHECK(self.dtype() == weight.dtype(),
+             "prelu: Type promoting not supported");
+    if (weight.numel() != 1) {
+        TP_CHECK(self.dim() > 0, "prelu: non-scalar input is required");
+        const int64_t channel_size = self.dim() > 1 ? self.size(1) : 1;
+        TP_CHECK(channel_size == weight.numel(),
+                 "prelu: weight numel does not match the input channel count");
     }
-    const Tensor slope = weight.dtype() == self.dtype()
-                             ? weight.contiguous()
-                             : weight.to(self.dtype()).contiguous();
-    return prelu_forward_common(self, slope,
-                                prelu_vector_geometry(self, weight));
+    TP_CHECK(weight.dim() <= 1,
+             "prelu: weight must be a scalar or a 1D tensor");
+
+    Tensor shaped_weight = weight;
+    if (self.dim() != weight.dim()) {
+        std::vector<int64_t> weight_shape(self.dim(), 1);
+        if (self.dim() > 1) weight_shape[1] = weight.numel();
+        shaped_weight = weight.reshape(weight_shape);
+    }
+    return prelu_forward_common(self, shaped_weight);
 }
 
 Tensor _prelu_kernel_cuda(const Tensor& self, const Tensor& weight) {
-    PReluGeometry geometry;
-    const Tensor slope =
-        prelu_prepare_broadcast_weight(self, weight, &geometry);
-    return prelu_forward_common(self, slope, geometry);
+    return prelu_forward_common(self, weight);
 }
 
 std::tuple<Tensor, Tensor> _prelu_kernel_backward_cuda(const Tensor& grad_output,
