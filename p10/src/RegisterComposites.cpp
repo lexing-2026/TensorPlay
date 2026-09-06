@@ -18,7 +18,7 @@ namespace {
 
 int64_t layout_of(const Tensor& tensor) {
     if (!tensor.is_sparse()) return 2;
-    return tensor.is_sparse_csr() ? 1 : 0;
+    return tensor.unsafeGetTensorImpl()->sparse_layout();
 }
 
 Tensor pin_if_requested(Tensor value, std::optional<bool> pin_memory) {
@@ -57,8 +57,8 @@ Tensor to_copy_composite(
             TP_THROW(RuntimeError,
                      "to(): sparse tensors only support Preserve memory format");
         }
-        if (self.is_sparse_csr()) {
-            return Tensor::make_sparse_csr_tensor(
+        if (self.is_sparse_compressed()) {
+            return Tensor::make_sparse_compressed_tensor(
                 pin_if_requested(
                     self._crow_indices().to(target_device, non_blocking, true),
                     pin_memory),
@@ -68,7 +68,9 @@ Tensor to_copy_composite(
                 pin_if_requested(
                     self._values().to(target_device, target_dtype, non_blocking, true),
                     pin_memory),
-                static_cast<std::vector<int64_t>>(self.shape()));
+                static_cast<std::vector<int64_t>>(self.shape()),
+                self.unsafeGetTensorImpl()->sparse_layout(),
+                self.sparse_blocksize());
         }
         return Tensor::make_sparse_coo_tensor(
             pin_if_requested(

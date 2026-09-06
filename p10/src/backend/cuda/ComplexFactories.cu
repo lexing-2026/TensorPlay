@@ -47,7 +47,7 @@ void real_loop(const Tensor& input, const Tensor& output) {
         .add_output(output)
         .add_const_input(input)
         .build();
-    gpu_kernel(iter, [] __device__(complex_t value) -> real_t {
+    gpu_kernel(iter, [] __host__ __device__(complex_t value) -> real_t {
         return value.real();
     });
 }
@@ -59,7 +59,7 @@ void imag_loop(const Tensor& input, const Tensor& output) {
         .add_output(output)
         .add_const_input(input)
         .build();
-    gpu_kernel(iter, [] __device__(complex_t value) -> real_t {
+    gpu_kernel(iter, [] __host__ __device__(complex_t value) -> real_t {
         return value.imag();
     });
 }
@@ -71,7 +71,7 @@ void conj_loop(const Tensor& input, const Tensor& output) {
         .add_output(output)
         .add_const_input(input)
         .build();
-    gpu_kernel(iter, [] __device__(complex_t value) -> complex_t {
+    gpu_kernel(iter, [] __host__ __device__(complex_t value) -> complex_t {
         return complex_t(value.real(), -value.imag());
     });
 }
@@ -84,7 +84,7 @@ void complex_loop(const Tensor& real, const Tensor& imag, const Tensor& output) 
         .add_const_input(real)
         .add_const_input(imag)
         .build();
-    gpu_kernel(iter, [] __device__(real_t real_value, real_t imag_value)
+    gpu_kernel(iter, [] __host__ __device__(real_t real_value, real_t imag_value)
         -> complex_t {
         return complex_t(real_value, imag_value);
     });
@@ -98,7 +98,7 @@ void polar_loop(const Tensor& abs, const Tensor& angle, const Tensor& output) {
         .add_const_input(abs)
         .add_const_input(angle)
         .build();
-    gpu_kernel(iter, [] __device__(real_t radius, real_t angle_value)
+    gpu_kernel(iter, [] __host__ __device__(real_t radius, real_t angle_value)
         -> complex_t {
         const math_t r = static_cast<math_t>(radius);
         const math_t a = static_cast<math_t>(angle_value);

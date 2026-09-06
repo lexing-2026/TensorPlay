@@ -40,6 +40,7 @@ multiprocessing
 library
 distributed
 quantization
+notes/index
 _stax
 stax
 vision

@@ -13,10 +13,12 @@
 #include "cpu/Lapack.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <map>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -1334,17 +1336,24 @@ std::vector<int64_t> infer_csr_size(const Tensor& crow_indices,
     return {crow_indices.size(0) - 1, columns};
 }
 
-Tensor build_csr_tensor(const Tensor& crow_indices,
-                        const Tensor& col_indices,
-                        const Tensor& values,
-                        std::optional<std::vector<int64_t>> size,
-                        std::optional<DType> dtype,
-                        std::optional<int64_t> layout,
-                        std::optional<Device> device,
-                        std::optional<bool> pin_memory,
-                        bool validate_inputs) {
-    if (layout.has_value() && *layout != 1) {
-        TP_THROW(ValueError, "sparse_csr_tensor: layout must be sparse_csr");
+Tensor build_compressed_tensor(const Tensor& crow_indices,
+                               const Tensor& col_indices,
+                               const Tensor& values,
+                               std::optional<std::vector<int64_t>> size,
+                               std::optional<DType> dtype,
+                               std::optional<int64_t> layout,
+                               std::optional<Device> device,
+                               std::optional<bool> pin_memory,
+                               bool validate_inputs,
+                               std::array<int64_t, 2> blocksize) {
+    const int resolved_layout = layout.value_or(TensorImpl::kSparseCSRLayout);
+    if (resolved_layout != TensorImpl::kSparseCSRLayout &&
+        resolved_layout != TensorImpl::kSparseCSCLayout &&
+        resolved_layout != TensorImpl::kSparseBSRLayout &&
+        resolved_layout != TensorImpl::kSparseBSCLayout) {
+        TP_THROW(ValueError,
+                 "sparse_compressed_tensor: layout must be one of "
+                 "sparse_csr/sparse_csc/sparse_bsr/sparse_bsc");
     }
     Tensor target_crow = crow_indices;
     Tensor target_col = col_indices;
@@ -1369,8 +1378,80 @@ Tensor build_csr_tensor(const Tensor& crow_indices,
     if (validate_inputs) {
         validate_csr_components(target_crow, target_col, target_values, *size);
     }
-    return Tensor::make_sparse_csr_tensor(
-        target_crow, target_col, target_values, *size);
+    return Tensor::make_sparse_compressed_tensor(
+        target_crow, target_col, target_values, *size, resolved_layout,
+        blocksize);
+}
+
+Tensor build_csr_tensor(const Tensor& crow_indices,
+                        const Tensor& col_indices,
+                        const Tensor& values,
+                        std::optional<std::vector<int64_t>> size,
+                        std::optional<DType> dtype,
+                        std::optional<int64_t> layout,
+                        std::optional<Device> device,
+                        std::optional<bool> pin_memory,
+                        bool validate_inputs) {
+    return build_compressed_tensor(crow_indices, col_indices, values, size,
+                                   dtype, layout, device, pin_memory,
+                                   validate_inputs, {0, 0});
+}
+
+// Dense -> compressed sparse wrappers.  Each public spelling pins the
+// target layout and forwards to the shared conversion kernel.
+Tensor dense_to_sparse_compressed_native(
+    const Tensor& self, int layout,
+    std::array<int64_t, 2> blocksize,
+    std::optional<int64_t> dense_dim, const char* name) {
+    if (self.is_sparse()) {
+        const int self_layout = self.unsafeGetTensorImpl()->sparse_layout();
+        if (self_layout == layout) {
+            return self;
+        }
+        // Cross-layout: go through the dense form and re-compress.
+        return tensorplay::cpu::to_sparse_compressed_cpu(
+            self.to_dense(), layout, blocksize, dense_dim, name);
+    }
+    return tensorplay::cpu::to_sparse_compressed_cpu(self, layout, blocksize, dense_dim,
+                                         name);
+}
+
+Tensor to_sparse_csc_native(const Tensor& self, std::optional<int64_t> dense_dim) {
+    reject_active_transform(self, "to_sparse_csc");
+    return dense_to_sparse_compressed_native(
+        self, TensorImpl::kSparseCSCLayout, {0, 0}, dense_dim, "to_sparse_csc");
+}
+
+Tensor _to_sparse_csc_native(const Tensor& self, std::optional<int64_t> dense_dim) {
+    return to_sparse_csc_native(self, dense_dim);
+}
+
+Tensor to_sparse_bsr_native(const Tensor& self, const std::vector<int64_t>& blocksize,
+                            std::optional<int64_t> dense_dim) {
+    reject_active_transform(self, "to_sparse_bsr");
+    TP_CHECK(blocksize.size() == 2, "to_sparse_bsr: blocksize must have 2 elements");
+    return dense_to_sparse_compressed_native(
+        self, TensorImpl::kSparseBSRLayout,
+        {blocksize[0], blocksize[1]}, dense_dim, "to_sparse_bsr");
+}
+
+Tensor _to_sparse_bsr_native(const Tensor& self, const std::vector<int64_t>& blocksize,
+                             std::optional<int64_t> dense_dim) {
+    return to_sparse_bsr_native(self, blocksize, dense_dim);
+}
+
+Tensor to_sparse_bsc_native(const Tensor& self, const std::vector<int64_t>& blocksize,
+                            std::optional<int64_t> dense_dim) {
+    reject_active_transform(self, "to_sparse_bsc");
+    TP_CHECK(blocksize.size() == 2, "to_sparse_bsc: blocksize must have 2 elements");
+    return dense_to_sparse_compressed_native(
+        self, TensorImpl::kSparseBSCLayout,
+        {blocksize[0], blocksize[1]}, dense_dim, "to_sparse_bsc");
+}
+
+Tensor _to_sparse_bsc_native(const Tensor& self, const std::vector<int64_t>& blocksize,
+                             std::optional<int64_t> dense_dim) {
+    return to_sparse_bsc_native(self, blocksize, dense_dim);
 }
 
 Tensor sparse_csr_tensor_crow_col_value_native(
@@ -1914,6 +1995,12 @@ TENSORPLAY_LIBRARY_IMPL(Composite, VariantHandOps) {
     m.impl("rnn_tanh.data", rnn_tanh_data_native);
     m.impl("lstm.data", lstm_data_native);
 
+    m.impl("to_sparse_csc", to_sparse_csc_native);
+    m.impl("_to_sparse_csc", _to_sparse_csc_native);
+    m.impl("to_sparse_bsr", to_sparse_bsr_native);
+    m.impl("_to_sparse_bsr", _to_sparse_bsr_native);
+    m.impl("to_sparse_bsc", to_sparse_bsc_native);
+    m.impl("_to_sparse_bsc", _to_sparse_bsc_native);
     m.impl("to_sparse.sparse_dim", to_sparse_sparse_dim_native);
     m.impl("_to_sparse.sparse_dim", _to_sparse_sparse_dim_native);
     m.impl("sparse_coo_tensor.indices", sparse_coo_tensor_indices_native);

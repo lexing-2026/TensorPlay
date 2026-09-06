@@ -525,20 +525,21 @@ Tensor.bucketize = bucketize
 
 
 def topk(self, k, dim=None, largest=True, sorted=True):
-    d = self.dim() - 1 if dim is None else builtins_int(dim)
+    ndim = self.dim()
+    if ndim == 0:
+        raise RuntimeError("topk(): expected a tensor with at least one dimension")
+    d = ndim - 1 if dim is None else builtins_int(dim)
     if d < 0:
-        d += self.dim()
-    desc = largest
-    values, indices = _C.sort(self, dim=d, descending=desc)
-    n = self.size(d)
+        d += ndim
+    if d < 0 or d >= ndim:
+        raise IndexError(f"topk(): dimension {dim} out of range for {ndim}-D tensor")
     k = builtins_int(k)
+    n = self.size(d)
     if k < 0 or k > n:
         raise RuntimeError(
             f"selected index k: {k} out of range for dimension {d} "
             f"of size {n}")
-    sl = [slice(None)] * self.dim()
-    sl[d] = slice(0, k)
-    return values[tuple(sl)], indices[tuple(sl)]
+    return _C.topk(self, k, d, bool(largest), bool(sorted), 0)
 
 
 Tensor.topk = topk

@@ -69,9 +69,9 @@ unary_op:
     - NAME: cosh
       OPERATOR: cosh(X)
     - NAME: asin
-      OPERATOR: asin(X)
+      OPERATOR: atan(X, sqrt(1.0f - X * X))
     - NAME: acos
-      OPERATOR: acos(X)
+      OPERATOR: atan(sqrt(1.0f - X * X), X)
     - NAME: atan
       OPERATOR: atan(X)
     - NAME: exp2
@@ -84,6 +84,10 @@ unary_op:
       OPERATOR: log2(X)
     - NAME: log10
       OPERATOR: log2(X) * 0.3010299956639812f
+    - NAME: square
+      OPERATOR: X * X
+    - NAME: reciprocal
+      OPERATOR: 1.0f / X
     - NAME: sqrt_i32
       DTYPE: int
       OPERATOR: ivec4(sqrt(vec4(X)))
@@ -593,7 +597,18 @@ glu:
 
 compare:
   parameter_names_with_default_values:
+    DTYPE: float
     OPERATOR: lessThan(X, Y)
+  generate_variant_forall:
+    DTYPE:
+      - VALUE: float
+        SUFFIX: ""
+      - VALUE: int
+        SUFFIX: _i32
+      - VALUE: int8
+        SUFFIX: _i8
+      - VALUE: uint8
+        SUFFIX: _u8
   shader_variants:
     - NAME: eq
       OPERATOR: equal(X, Y)
@@ -606,6 +621,32 @@ compare:
     - NAME: gt
       OPERATOR: greaterThan(X, Y)
     - NAME: ge
+      OPERATOR: greaterThanEqual(X, Y)
+
+compare_scalar:
+  parameter_names_with_default_values:
+    DTYPE: float
+    OPERATOR: lessThan(X, Y)
+  generate_variant_forall:
+    DTYPE:
+      - VALUE: float
+        SUFFIX: ""
+      - VALUE: int
+        SUFFIX: _i32
+      - VALUE: uint8
+        SUFFIX: _u8
+  shader_variants:
+    - NAME: eq_scalar
+      OPERATOR: equal(X, Y)
+    - NAME: ne_scalar
+      OPERATOR: notEqual(X, Y)
+    - NAME: lt_scalar
+      OPERATOR: lessThan(X, Y)
+    - NAME: le_scalar
+      OPERATOR: lessThanEqual(X, Y)
+    - NAME: gt_scalar
+      OPERATOR: greaterThan(X, Y)
+    - NAME: ge_scalar
       OPERATOR: greaterThanEqual(X, Y)
 
 where:
@@ -953,6 +994,22 @@ reduce_argextremum:
     - NAME: reduce_argmin
       GREATER: 0
 
+reduce_bool:
+  parameter_names_with_default_values:
+    DTYPE: int8
+    OPERATOR: min(X, Y)
+    COLLAPSE: min(min(V.x, V.y), min(V.z, V.w))
+    NEUTRAL: 1
+  shader_variants:
+    - NAME: reduce_all
+      OPERATOR: min(X, Y)
+      COLLAPSE: min(min(V.x, V.y), min(V.z, V.w))
+      NEUTRAL: 1
+    - NAME: reduce_any
+      OPERATOR: max(X, Y)
+      COLLAPSE: max(max(V.x, V.y), max(V.z, V.w))
+      NEUTRAL: 0
+
 quantized_binary_op:
   parameter_names_with_default_values:
     OPERATOR: X + Y
@@ -1041,6 +1098,11 @@ random_fill:
     - NAME: bernoulli_fill
       DIST: 2
 
+bernoulli_tensor_fill:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: bernoulli_tensor_fill
+
 hardshrink_mask:
   parameter_names_with_default_values: {}
   shader_variants:
@@ -1052,3 +1114,26 @@ one_minus:
   shader_variants:
     - NAME: one_minus
       OPERATOR: "1.0f - X"
+
+reduce_int64:
+  parameter_names_with_default_values:
+    DTYPE: int
+    PRODUCT: false
+  shader_variants:
+    - NAME: prod_int64
+      PRODUCT: true
+    - NAME: count_int64_i32
+    - NAME: count_int64_float
+      DTYPE: float
+
+eye:
+  parameter_names_with_default_values:
+    FORMAT: rgba32f
+    DTYPE: float
+  shader_variants:
+    - NAME: eye
+    - NAME: eye_f16
+      FORMAT: rgba16f
+    - NAME: eye_i32
+      FORMAT: rgba32i
+      DTYPE: int

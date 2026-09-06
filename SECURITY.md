@@ -28,5 +28,5 @@ Please include:
 ## Scope
 
 TensorPlay is an educational deep learning framework. Security issues in
-third-party dependencies under `third_party/` (pytorch, tilelang, ...) should
+vendored third-party dependencies under `third_party/` (tilelang, ...) should
 be reported to the respective upstream projects instead.

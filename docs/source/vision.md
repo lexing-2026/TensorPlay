@@ -1,7 +1,7 @@
 # tensorplay.vision
 
-`tensorplay.vision` is the computer-vision toolkit of TensorPlay, mirroring
-the `torchvision` package layout. The listing below is a static overview; the
+`tensorplay.vision` is the computer-vision toolkit of TensorPlay. The listing
+below is a static overview; the
 package requires optional dependencies (Pillow) for some entry points, so this
 page intentionally does not use autodoc.
 

@@ -58,7 +58,7 @@ void complex_abs_loop(const Tensor& input, const Tensor& output) {
         .add_output(output)
         .add_const_input(input)
         .build();
-    gpu_kernel(iter, [] __device__(complex_t value) -> real_t {
+    gpu_kernel(iter, [] __host__ __device__(complex_t value) -> real_t {
         const math_t z = static_cast<math_t>(value);
         const auto real = z.real();
         const auto imag = z.imag();
@@ -73,7 +73,7 @@ void complex_angle_loop(const Tensor& input, const Tensor& output) {
         .add_output(output)
         .add_const_input(input)
         .build();
-    gpu_kernel(iter, [] __device__(complex_t value) -> real_t {
+    gpu_kernel(iter, [] __host__ __device__(complex_t value) -> real_t {
         const math_t z = static_cast<math_t>(value);
         return static_cast<real_t>(::atan2(z.imag(), z.real()));
     });
@@ -92,7 +92,7 @@ Tensor unary_op_kernel_v2(const Tensor& self, Functor functor) {
 
     #define OP_CASE(ctype, name) \
     case DType::name: \
-        gpu_kernel(iter, [functor] __device__(ctype x) -> ctype { \
+        gpu_kernel(iter, [functor] __host__ __device__(ctype x) -> ctype { \
             return functor(x); \
         }); \
         break;
@@ -142,7 +142,7 @@ void complex_sign_loop(const Tensor& input, const Tensor& output) {
         .add_output(output)
         .add_const_input(input)
         .build();
-    gpu_kernel(iter, [] __device__(complex_t value) -> complex_t {
+    gpu_kernel(iter, [] __host__ __device__(complex_t value) -> complex_t {
         const math_t z = static_cast<math_t>(value);
         const auto real = z.real();
         const auto imag = z.imag();
@@ -188,7 +188,7 @@ void complex_math_loop(const Tensor& input, const Tensor& output, Functor functo
         .add_output(output)
         .add_const_input(input)
         .build();
-    gpu_kernel(iter, [functor] __device__(complex_t value) -> complex_t {
+    gpu_kernel(iter, [functor] __host__ __device__(complex_t value) -> complex_t {
         const math_t z = static_cast<math_t>(value);
         return static_cast<complex_t>(functor(z));
     });
@@ -298,22 +298,22 @@ Tensor unary_float_op_kernel_v2(const Tensor& self, Functor functor) {
 
     switch (out_dtype) {
         case DType::Float16:
-            gpu_kernel(iter, [functor] __device__(Half x) -> Half {
+            gpu_kernel(iter, [functor] __host__ __device__(Half x) -> Half {
                 return static_cast<Half>(functor(static_cast<float>(x)));
             });
             break;
         case DType::BFloat16:
-            gpu_kernel(iter, [functor] __device__(BFloat16 x) -> BFloat16 {
+            gpu_kernel(iter, [functor] __host__ __device__(BFloat16 x) -> BFloat16 {
                 return static_cast<BFloat16>(functor(static_cast<float>(x)));
             });
             break;
         case DType::Float32:
-            gpu_kernel(iter, [functor] __device__(float x) -> float {
+            gpu_kernel(iter, [functor] __host__ __device__(float x) -> float {
                 return functor(x);
             });
             break;
         case DType::Float64:
-            gpu_kernel(iter, [functor] __device__(double x) -> double {
+            gpu_kernel(iter, [functor] __host__ __device__(double x) -> double {
                 return functor(x);
             });
             break;
@@ -480,25 +480,25 @@ Tensor activation_backward_kernel_cuda(const Tensor& grad_output, const Tensor& 
 
     switch (out_dtype) {
         case DType::Float16:
-            gpu_kernel(iter, [functor] __device__(Half dy, Half x) -> Half {
+            gpu_kernel(iter, [functor] __host__ __device__(Half dy, Half x) -> Half {
                 return static_cast<Half>(functor(static_cast<float>(dy),
                                                  static_cast<float>(x)));
             });
             break;
         case DType::BFloat16:
-            gpu_kernel(iter, [functor] __device__(BFloat16 dy,
+            gpu_kernel(iter, [functor] __host__ __device__(BFloat16 dy,
                                                   BFloat16 x) -> BFloat16 {
                 return static_cast<BFloat16>(functor(static_cast<float>(dy),
                                                      static_cast<float>(x)));
             });
             break;
         case DType::Float32:
-            gpu_kernel(iter, [functor] __device__(float dy, float x) -> float {
+            gpu_kernel(iter, [functor] __host__ __device__(float dy, float x) -> float {
                 return functor(dy, x);
             });
             break;
         case DType::Float64:
-            gpu_kernel(iter, [functor] __device__(double dy, double x) -> double {
+            gpu_kernel(iter, [functor] __host__ __device__(double dy, double x) -> double {
                 return functor(dy, x);
             });
             break;
@@ -980,7 +980,7 @@ Tensor comparison_op_kernel(const Tensor& self, const Tensor& other, Functor fun
 
     #define COMP_CASE(ctype, name) \
     case DType::name: \
-        gpu_kernel(iter, [functor] __device__(ctype lhs, ctype rhs) -> bool { \
+        gpu_kernel(iter, [functor] __host__ __device__(ctype lhs, ctype rhs) -> bool { \
             return functor(lhs, rhs); \
         }); \
         break;
@@ -1007,7 +1007,7 @@ Tensor comparison_scalar_op_kernel(const Tensor& self, Scalar other, Functor fun
     #define COMP_SCALAR_CASE(ctype, name) \
     case DType::name: { \
         const ctype rhs = other.to<ctype>(); \
-        gpu_kernel(iter, [functor, rhs] __device__(ctype lhs) -> bool { \
+        gpu_kernel(iter, [functor, rhs] __host__ __device__(ctype lhs) -> bool { \
             return functor(lhs, rhs); \
         }); \
         break; \
@@ -1044,7 +1044,7 @@ Tensor complex_comparison_kernel(const Tensor& self, const Tensor& other,
         .add_const_input(a)
         .add_const_input(b)
         .build();
-    gpu_kernel(iter, [functor] __device__(complex_t lhs, complex_t rhs) -> bool {
+    gpu_kernel(iter, [functor] __host__ __device__(complex_t lhs, complex_t rhs) -> bool {
         return functor(static_cast<math_t>(lhs), static_cast<math_t>(rhs));
     });
     return result;
@@ -1122,7 +1122,7 @@ Tensor ge_scalar_kernel_cuda(const Tensor& self, Scalar other) { return comparis
 
 template <typename T>
 void where_loop(TensorIterator& iter) {
-    gpu_kernel(iter, [] __device__(bool condition, T self_value, T other_value) -> T {
+    gpu_kernel(iter, [] __host__ __device__(bool condition, T self_value, T other_value) -> T {
         return condition ? self_value : other_value;
     });
 }
@@ -1232,7 +1232,7 @@ Tensor maximum_minimum_cuda_impl(const Tensor& self, const Tensor& other) {
 
     #define MAXMIN_CASE(ctype, name) \
         case DType::name: \
-            gpu_kernel(iter, [] __device__(ctype lhs, ctype rhs) -> ctype { \
+            gpu_kernel(iter, [] __host__ __device__(ctype lhs, ctype rhs) -> ctype { \
                 return maximum_minimum_elem<Maximum>(lhs, rhs); \
             }); \
             break;
@@ -1313,7 +1313,7 @@ Tensor fmaxfmin_cuda_impl(const Tensor& self, const Tensor& other) {
 
     #define FMAXMIN_CASE(ctype, name) \
         case DType::name: \
-            gpu_kernel(iter, [] __device__(ctype lhs, ctype rhs) -> ctype { \
+            gpu_kernel(iter, [] __host__ __device__(ctype lhs, ctype rhs) -> ctype { \
                 return fmaxfmin_elem<Maximum>(lhs, rhs); \
             }); \
             break;
@@ -1334,14 +1334,14 @@ Tensor fmin_cuda(const Tensor& self, const Tensor& other) {
 }
 
 template <typename T>
-static inline __device__ std::enable_if_t<std::is_integral_v<T>, T>
+static inline __host__ __device__ std::enable_if_t<std::is_integral_v<T>, T>
 ldexp_element(T x, T exponent) {
     return exponent >= static_cast<T>(8 * static_cast<int>(sizeof(T)))
         ? T(0) : static_cast<T>(x * (T(1) << exponent));
 }
 
 template <typename T>
-static inline __device__ std::enable_if_t<!std::is_integral_v<T>, T>
+static inline __host__ __device__ std::enable_if_t<!std::is_integral_v<T>, T>
 ldexp_element(T x, T exponent) {
     return static_cast<T>(static_cast<double>(x) *
                           ::exp2(static_cast<double>(exponent)));
@@ -1366,7 +1366,7 @@ Tensor ldexp_cuda(const Tensor& self, const Tensor& other) {
 
     #define LDEXP_CASE(ctype, name) \
         case DType::name: \
-            gpu_kernel(iter, [] __device__(ctype x, ctype exponent) -> ctype { \
+            gpu_kernel(iter, [] __host__ __device__(ctype x, ctype exponent) -> ctype { \
                 return ldexp_element(x, exponent); \
             }); \
             break;
@@ -1383,7 +1383,7 @@ Tensor ldexp_cuda(const Tensor& self, const Tensor& other) {
 // element. NaNs in the value or either present bound take precedence.
 template <typename T>
 void clamp_tensor_loop(TensorIterator& iter, bool has_min, bool has_max) {
-    gpu_kernel(iter, [has_min, has_max] __device__(T value, T lower, T upper) -> T {
+    gpu_kernel(iter, [has_min, has_max] __host__ __device__(T value, T lower, T upper) -> T {
         T result = has_min && value < lower ? lower : value;
         result = has_max && upper < result ? upper : result;
         if constexpr (std::numeric_limits<T>::has_quiet_NaN) {
@@ -1475,7 +1475,7 @@ Tensor clamp_kernel_cuda(const Tensor& self, std::optional<Scalar> min, std::opt
     case DType::name: { \
         const ctype min_val = has_min ? min->to<ctype>() : ctype(0); \
         const ctype max_val = has_max ? max->to<ctype>() : ctype(0); \
-        gpu_kernel(iter, [=] __device__(ctype value) -> ctype { \
+        gpu_kernel(iter, [=] __host__ __device__(ctype value) -> ctype { \
             if (has_min && value < min_val) value = min_val; \
             if (has_max && value > max_val) value = max_val; \
             return value; \
@@ -1510,7 +1510,7 @@ Tensor clamp_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self,
     case DType::name: { \
         ctype min_val = min.has_value() ? min->to<ctype>() : ctype(0); \
         ctype max_val = max.has_value() ? max->to<ctype>() : ctype(0); \
-        gpu_kernel(iter, [=] __device__(ctype input_value, ctype grad_value) -> ctype { \
+        gpu_kernel(iter, [=] __host__ __device__(ctype input_value, ctype grad_value) -> ctype { \
             if ((has_min && input_value < min_val) || \
                 (has_max && input_value > max_val)) { \
                 return ctype(0); \
@@ -1549,23 +1549,23 @@ Tensor binary_float_op_kernel_v2(const Tensor& self, const Tensor& other, Functo
 
     switch (out_dtype) {
         case DType::Float16:
-            gpu_kernel(iter, [functor] __device__(Half lhs, Half rhs) -> Half {
+            gpu_kernel(iter, [functor] __host__ __device__(Half lhs, Half rhs) -> Half {
                 return functor(lhs, rhs);
             });
             break;
         case DType::BFloat16:
-            gpu_kernel(iter, [functor] __device__(BFloat16 lhs,
+            gpu_kernel(iter, [functor] __host__ __device__(BFloat16 lhs,
                                                   BFloat16 rhs) -> BFloat16 {
                 return functor(lhs, rhs);
             });
             break;
         case DType::Float32:
-            gpu_kernel(iter, [functor] __device__(float lhs, float rhs) -> float {
+            gpu_kernel(iter, [functor] __host__ __device__(float lhs, float rhs) -> float {
                 return functor(lhs, rhs);
             });
             break;
         case DType::Float64:
-            gpu_kernel(iter, [functor] __device__(double lhs, double rhs) -> double {
+            gpu_kernel(iter, [functor] __host__ __device__(double lhs, double rhs) -> double {
                 return functor(lhs, rhs);
             });
             break;
@@ -1619,7 +1619,7 @@ Tensor pow_kernel_cuda(const Tensor& self, const Tensor& other) {
             .build();
         switch (rd) {
             case DType::ComplexHalf:
-                gpu_kernel(iter, [] __device__(
+                gpu_kernel(iter, [] __host__ __device__(
                     tensorplay::complex<Half> base,
                     tensorplay::complex<Half> exponent) {
                     const auto b = static_cast<tensorplay::complex<float>>(base);
@@ -1629,21 +1629,21 @@ Tensor pow_kernel_cuda(const Tensor& self, const Tensor& other) {
                 });
                 break;
             case DType::ComplexFloat:
-                gpu_kernel(iter, [] __device__(
+                gpu_kernel(iter, [] __host__ __device__(
                     tensorplay::complex<float> base,
                     tensorplay::complex<float> exponent) {
                     return tensorplay_complex_math::pow(base, exponent);
                 });
                 break;
             case DType::ComplexDouble:
-                gpu_kernel(iter, [] __device__(
+                gpu_kernel(iter, [] __host__ __device__(
                     tensorplay::complex<double> base,
                     tensorplay::complex<double> exponent) {
                     return tensorplay_complex_math::pow(base, exponent);
                 });
                 break;
             case DType::BComplex32:
-                gpu_kernel(iter, [] __device__(
+                gpu_kernel(iter, [] __host__ __device__(
                     tensorplay::complex<BFloat16> base,
                     tensorplay::complex<BFloat16> exponent) {
                     const auto b = static_cast<tensorplay::complex<float>>(base);
@@ -1713,7 +1713,7 @@ __device__ bool lerp_weight_small(math_t value) {
 
 template <typename scalar_t, typename math_t>
 void lerp_tensor_loop(TensorIterator& iter) {
-    gpu_kernel(iter, [] __device__(scalar_t start, scalar_t finish,
+    gpu_kernel(iter, [] __host__ __device__(scalar_t start, scalar_t finish,
                                    scalar_t weight) -> scalar_t {
         const math_t s = static_cast<math_t>(start);
         const math_t e = static_cast<math_t>(finish);
@@ -1734,7 +1734,7 @@ __device__ bool complex_lerp_weight_small(const math_t& value) {
 
 template <typename scalar_t, typename math_t>
 void complex_lerp_tensor_loop(TensorIterator& iter) {
-    gpu_kernel(iter, [] __device__(scalar_t start, scalar_t finish,
+    gpu_kernel(iter, [] __host__ __device__(scalar_t start, scalar_t finish,
                                    scalar_t weight) -> scalar_t {
         const math_t s = static_cast<math_t>(start);
         const math_t e = static_cast<math_t>(finish);
@@ -1760,7 +1760,7 @@ Tensor lerp_scalar_kernel_cuda(const Tensor& self, const Tensor& end, Scalar wei
     switch (self.dtype()) {
         case DType::Float32: {
             const float weight_value = weight.to<float>();
-            gpu_kernel(iter, [weight_value] __device__(float start, float finish) -> float {
+            gpu_kernel(iter, [weight_value] __host__ __device__(float start, float finish) -> float {
                 return (fabsf(weight_value) < 0.5f)
                     ? start + weight_value * (finish - start)
                     : finish - (finish - start) * (1.0f - weight_value);
@@ -1769,7 +1769,7 @@ Tensor lerp_scalar_kernel_cuda(const Tensor& self, const Tensor& end, Scalar wei
         }
         case DType::Float64: {
             const double weight_value = weight.to<double>();
-            gpu_kernel(iter, [weight_value] __device__(double start, double finish) -> double {
+            gpu_kernel(iter, [weight_value] __host__ __device__(double start, double finish) -> double {
                 return (fabs(weight_value) < 0.5)
                     ? start + weight_value * (finish - start)
                     : finish - (finish - start) * (1.0 - weight_value);
@@ -1778,7 +1778,7 @@ Tensor lerp_scalar_kernel_cuda(const Tensor& self, const Tensor& end, Scalar wei
         }
         case DType::Float16: {
             const float weight_value = weight.to<float>();
-            gpu_kernel(iter, [weight_value] __device__(Half start, Half finish) -> Half {
+            gpu_kernel(iter, [weight_value] __host__ __device__(Half start, Half finish) -> Half {
                 const float s = static_cast<float>(start);
                 const float e = static_cast<float>(finish);
                 const float value = (fabsf(weight_value) < 0.5f)
@@ -1790,7 +1790,7 @@ Tensor lerp_scalar_kernel_cuda(const Tensor& self, const Tensor& end, Scalar wei
         }
         case DType::BFloat16: {
             const float weight_value = weight.to<float>();
-            gpu_kernel(iter, [weight_value] __device__(BFloat16 start,
+            gpu_kernel(iter, [weight_value] __host__ __device__(BFloat16 start,
                                                         BFloat16 finish) -> BFloat16 {
                 const float s = static_cast<float>(start);
                 const float e = static_cast<float>(finish);
@@ -1928,7 +1928,7 @@ Tensor masked_select_kernel_cuda(const Tensor& self, const Tensor& mask) {
         .add_output(flags)
         .add_const_input(mask_flat)
         .build();
-    gpu_kernel(flag_iter, [] __device__(bool value) -> int64_t {
+    gpu_kernel(flag_iter, [] __host__ __device__(bool value) -> int64_t {
         return value ? int64_t(1) : int64_t(0);
     });
 

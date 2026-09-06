@@ -28,67 +28,67 @@ struct XLog1pyFn {
 };
 
 Tensor chebyshev_polynomial_t_cuda(const Tensor& x, const Tensor& n) {
-    return binary_float_cuda(x, n, [] __device__ (double a, double b) {
+    return binary_float_cuda(x, n, [] __host__ __device__ (double a, double b) {
         return chebyshev_polynomial_t_forward(a, b);
     }, "chebyshev_polynomial_t");
 }
 Tensor chebyshev_polynomial_u_cuda(const Tensor& x, const Tensor& n) {
-    return binary_float_cuda(x, n, [] __device__ (double a, double b) {
+    return binary_float_cuda(x, n, [] __host__ __device__ (double a, double b) {
         return chebyshev_polynomial_u_forward(a, b);
     }, "chebyshev_polynomial_u");
 }
 Tensor chebyshev_polynomial_v_cuda(const Tensor& x, const Tensor& n) {
-    return binary_float_cuda(x, n, [] __device__ (double a, double b) {
+    return binary_float_cuda(x, n, [] __host__ __device__ (double a, double b) {
         return chebyshev_polynomial_v_forward(a, b);
     }, "chebyshev_polynomial_v");
 }
 Tensor chebyshev_polynomial_w_cuda(const Tensor& x, const Tensor& n) {
-    return binary_float_cuda(x, n, [] __device__ (double a, double b) {
+    return binary_float_cuda(x, n, [] __host__ __device__ (double a, double b) {
         return chebyshev_polynomial_w_forward(a, b);
     }, "chebyshev_polynomial_w");
 }
 Tensor shifted_chebyshev_polynomial_t_cuda(const Tensor& x, const Tensor& n) {
-    return binary_float_cuda(x, n, [] __device__ (double a, double b) {
+    return binary_float_cuda(x, n, [] __host__ __device__ (double a, double b) {
         return shifted_chebyshev_polynomial_t_forward(a, b);
     }, "shifted_chebyshev_polynomial_t");
 }
 Tensor shifted_chebyshev_polynomial_u_cuda(const Tensor& x, const Tensor& n) {
-    return binary_float_cuda(x, n, [] __device__ (double a, double b) {
+    return binary_float_cuda(x, n, [] __host__ __device__ (double a, double b) {
         return shifted_chebyshev_polynomial_u_forward(a, b);
     }, "shifted_chebyshev_polynomial_u");
 }
 Tensor shifted_chebyshev_polynomial_v_cuda(const Tensor& x, const Tensor& n) {
-    return binary_float_cuda(x, n, [] __device__ (double a, double b) {
+    return binary_float_cuda(x, n, [] __host__ __device__ (double a, double b) {
         return shifted_chebyshev_polynomial_v_forward(a, b);
     }, "shifted_chebyshev_polynomial_v");
 }
 Tensor shifted_chebyshev_polynomial_w_cuda(const Tensor& x, const Tensor& n) {
-    return binary_float_cuda(x, n, [] __device__ (double a, double b) {
+    return binary_float_cuda(x, n, [] __host__ __device__ (double a, double b) {
         return shifted_chebyshev_polynomial_w_forward(a, b);
     }, "shifted_chebyshev_polynomial_w");
 }
 Tensor hermite_polynomial_h_cuda(const Tensor& x, const Tensor& n) {
-    return binary_float_cuda(x, n, [] __device__ (double a, double b) {
+    return binary_float_cuda(x, n, [] __host__ __device__ (double a, double b) {
         return hermite_polynomial_h_forward(a, b);
     }, "hermite_polynomial_h");
 }
 Tensor hermite_polynomial_he_cuda(const Tensor& x, const Tensor& n) {
-    return binary_float_cuda(x, n, [] __device__ (double a, double b) {
+    return binary_float_cuda(x, n, [] __host__ __device__ (double a, double b) {
         return hermite_polynomial_he_forward(a, b);
     }, "hermite_polynomial_he");
 }
 Tensor laguerre_polynomial_l_cuda(const Tensor& x, const Tensor& n) {
-    return binary_float_cuda(x, n, [] __device__ (double a, double b) {
+    return binary_float_cuda(x, n, [] __host__ __device__ (double a, double b) {
         return laguerre_polynomial_l_forward(a, b);
     }, "laguerre_polynomial_l");
 }
 Tensor legendre_polynomial_p_cuda(const Tensor& x, const Tensor& n) {
-    return binary_float_cuda(x, n, [] __device__ (double a, double b) {
+    return binary_float_cuda(x, n, [] __host__ __device__ (double a, double b) {
         return legendre_polynomial_p_forward(a, b);
     }, "legendre_polynomial_p");
 }
 Tensor zeta_cuda(const Tensor& s, const Tensor& q) {
-    return binary_float_cuda(s, q, [] __device__ (double a, double b) {
+    return binary_float_cuda(s, q, [] __host__ __device__ (double a, double b) {
         return zeta(a, b);
     }, "zeta");
 }

@@ -1,18 +1,18 @@
 % 10-appendix.tex
-\section*{Appendix: Notation and Central Listings}
+\section*{附录：符号与核心清单}
 
-\paragraph{Notation.}
-\texttt{path:line} means the file relative to the repository root; is line~49 of that file, and \texttt{path:line--line} is an
-inclusive range. Code listings are verbatim excerpts with at most whitespace folding; the caption gives the context. Tables enumerate normative values (key numbers, artifact names, trimmed axes) rather than
-illustrative samples.
+\paragraph{符号。}
+\texttt{path:line} 表示相对于存储库根目录的文件；是该文件的第 49 行，并且 \texttt{path:line--line} 是
+包含范围。代码清单是逐字摘录，最多包含空格折叠；标题给出了上下文。表格列举了规范值（关键数字、工件名称、修剪轴），而不是
+说明性样本。
 
-\paragraph{Central entities.}
-For a reader who wants the shortest path through the core, the
-central definitions are: the dispatch table (\texttt{array<atomic<KernelFunction>,13>}),
-the key enum, the tensor object model (\texttt{Tensor}/\texttt{TensorImpl}/\texttt{Storage}),
-the autograd graph (\texttt{Node}/\texttt{Edge}/\texttt{GraphTask}/\texttt{InputBuffer}/\texttt{Engine}
-with the \texttt{SavedVariable} guard and the \texttt{VariableVersion} counter),
-the anomaly mode, the grad/inference TLS modes, the profiler's
-\texttt{OpRecord}/\texttt{GpuTimerPair} stack, the vmap keys at offset 9, and
-the two YAML registries behind code generation. Each chapter opens with a figure that
-places its entities on the four-pillar map.
+\paragraph{中央实体。}
+对于想要通过核心的最短路径的读者来说，
+中心定义是：调度表（\texttt{array<atomic<KernelFunction>,13>}），
+键枚举、张量对象模型 (\texttt{Tensor}/\texttt{TensorImpl}/\texttt{Storage})、
+自动梯度图 (\texttt{Node}/\texttt{Edge}/\texttt{GraphTask}/\texttt{InputBuffer}/\texttt{Engine}
+与 \texttt{SavedVariable} 防护和 \texttt{VariableVersion} 计数器），
+异常模式、梯度/推理 TLS 模式、分析器的
+\texttt{OpRecord}/\texttt{GpuTimerPair} 堆栈，偏移量 9 处的 vmap 键，以及
+代码生成背后的两个 YAML 注册表。每一章都以一个图开始
+将其实体放置在四柱地图上。

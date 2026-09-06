@@ -5,7 +5,6 @@
 
 # tensorplay.utils.checkpoint
 
-# torch.utils.checkpoint
 
 ```{eval-rst}
 .. autosummary::

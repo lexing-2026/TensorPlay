@@ -291,36 +291,48 @@ def kron(input, other):
 def vander(x, N=None, increasing=False):
     if x.dim() != 1:
         raise RuntimeError("vander(): expected a 1-D input tensor")
-    n = N if N is not None else x.numel()
+    n = x.numel() if N is None else int(N)
+    if n < 0:
+        raise ValueError("vander(): N must be non-negative")
     exps = tensorplay.arange(n, device=x.device)
     if not increasing:
         exps = tensorplay.flip(exps, dims=[0])
     return x.unsqueeze(1).pow(exps.unsqueeze(0))
 
 
-def tril_indices(row, col, offset=0, *, dtype=DType.int64):
-    dev = "cpu"
-    rr = tensorplay.arange(row, device=dev).unsqueeze(1).repeat([1, col])
-    cc = tensorplay.arange(col, device=dev).unsqueeze(0).repeat([row, 1])
+def tril_indices(row, col, offset=0, *, dtype=DType.int64, device=None,
+                 pin_memory=False):
+    row, col, offset = int(row), int(col), int(offset)
+    if row < 0 or col < 0:
+        raise ValueError("tril_indices(): row and col must be non-negative")
+    rr = tensorplay.arange(row, device=device).unsqueeze(1).repeat([1, col])
+    cc = tensorplay.arange(col, device=device).unsqueeze(0).repeat([row, 1])
     mask = cc.le(rr + offset)
     r_flat = rr.masked_select(mask)
     c_flat = cc.masked_select(mask)
     out = tensorplay.stack([r_flat, c_flat], dim=0)
     if dtype != DType.int64:
         out = out.to(dtype)
+    if pin_memory:
+        out = out.pin_memory()
     return out
 
 
-def triu_indices(row, col, offset=0, *, dtype=DType.int64):
-    dev = "cpu"
-    rr = tensorplay.arange(row, device=dev).unsqueeze(1).repeat([1, col])
-    cc = tensorplay.arange(col, device=dev).unsqueeze(0).repeat([row, 1])
+def triu_indices(row, col, offset=0, *, dtype=DType.int64, device=None,
+                 pin_memory=False):
+    row, col, offset = int(row), int(col), int(offset)
+    if row < 0 or col < 0:
+        raise ValueError("triu_indices(): row and col must be non-negative")
+    rr = tensorplay.arange(row, device=device).unsqueeze(1).repeat([1, col])
+    cc = tensorplay.arange(col, device=device).unsqueeze(0).repeat([row, 1])
     mask = cc.ge(rr + offset)
     r_flat = rr.masked_select(mask)
     c_flat = cc.masked_select(mask)
     out = tensorplay.stack([r_flat, c_flat], dim=0)
     if dtype != DType.int64:
         out = out.to(dtype)
+    if pin_memory:
+        out = out.pin_memory()
     return out
 
 
@@ -354,7 +366,7 @@ def combinations(input, r=2, with_replacement=False):
     if not idx_list:
         return tensorplay.zeros([0] + tail, dtype=input.dtype,
                                 device=input.device)
-    idx = tensorplay.tensor(idx_list, dtype=DType.int64)
+    idx = tensorplay.tensor(idx_list, dtype=DType.int64, device=input.device)
     picked = input.index_select(0, idx.reshape([-1]))
     return picked.reshape([idx.size(0), rr] + tail)
 
@@ -373,9 +385,18 @@ def _float_out_dtype(dt):
 
 def trapezoid(y, x=None, *, dx=None, dim=-1):
     d = _norm_dim(dim, y.dim())
+    n = y.size(d)
+    if n == 0:
+        if x is not None:
+            xs = _as_tensor(x)
+            if xs.dim() == 1 and xs.numel() != 0:
+                raise RuntimeError(
+                    "trapezoid(): there must be one x value for every "
+                    "sample in y along dim"
+                )
+        return y.narrow(d, 0, 0).sum(d)
     if x is None:
         step = dx if dx is not None else 1.0
-        n = y.size(d)
         avg = y.narrow(d, 0, n - 1).add(y.narrow(d, 1, n - 1)).mul(step / 2.0)
     else:
         xs = _as_tensor(x)
@@ -401,9 +422,18 @@ def trapz(y, x=None, *, dx=None, dim=-1):
 
 def cumulative_trapezoid(y, x=None, *, dx=None, dim=-1):
     d = _norm_dim(dim, y.dim())
+    n = y.size(d)
+    if n == 0:
+        if x is not None:
+            xs = _as_tensor(x)
+            if xs.dim() == 1 and xs.numel() != 0:
+                raise RuntimeError(
+                    "cumulative_trapezoid(): there must be one x value for "
+                    "every sample in y along dim"
+                )
+        return y.narrow(d, 0, 0)
     if x is None:
         step = dx if dx is not None else 1.0
-        n = y.size(d)
         avg = y.narrow(d, 0, n - 1).add(y.narrow(d, 1, n - 1)).mul(step / 2.0)
     else:
         xs = _as_tensor(x)
@@ -456,21 +486,25 @@ def nanquantile(input, q, dim=None, keepdim=False, *, interpolation="linear"):
 
 def histc(input, bins=100, min=0, max=0):
     bins = int(bins)
+    if bins <= 0:
+        raise ValueError("histc(): bins must be a positive integer")
     v = input.reshape([-1]).to(DType.float64)
     lo, hi = float(min), float(max)
     if lo == 0 and hi == 0:
         if v.numel() == 0:
-            return tensorplay.zeros([bins], dtype=input.dtype)
+            return tensorplay.zeros(
+                [bins], dtype=input.dtype, device=input.device)
         lo = v.min().item()
         hi = v.max().item()
     if lo > hi:
         raise RuntimeError("histc(): upper bound must be larger than "
                            "lower bound")
     if lo == hi or v.numel() == 0:
-        return tensorplay.zeros([bins], dtype=input.dtype)
+        return tensorplay.zeros([bins], dtype=input.dtype, device=input.device)
     width = (hi - lo) / bins
     in_range = _band(v.ge(lo), v.le(hi))
-    idx = ((v - lo) / width).floor().to(DType.int64).clamp(0, bins - 1)
+    idx = ((v - lo) / width).floor().to(DType.int64) \
+        .clamp(0, bins - 1).masked_select(in_range)
     counts = tensorplay.bincount(idx, minlength=bins).narrow(0, 0, bins)
     return counts.to(input.dtype)
 
@@ -490,7 +524,8 @@ def histogram(input, bins=100, range=None, *, weight=None, density=False):
 def _weighted_bincount(idx, weight, nbins, density, widths):
     if weight is not None:
         w = weight.reshape([-1]).to(DType.float64)
-        acc = tensorplay.zeros([nbins], dtype=DType.float64)
+        acc = tensorplay.zeros(
+            [nbins], dtype=DType.float64, device=idx.device)
         acc = acc.index_put([idx], w, accumulate=True)
     else:
         acc = tensorplay.bincount(idx, minlength=nbins).narrow(0, 0, nbins) \
@@ -506,7 +541,8 @@ def isin(elements, test_elements, *, assume_unique=False, invert=False):
     el = elements.reshape([-1])
     te = test_elements.reshape([-1])
     if te.numel() == 0:
-        out = tensorplay.zeros(el.numel(), dtype=DType.bool)
+        out = tensorplay.zeros(
+            el.numel(), dtype=DType.bool, device=elements.device)
     else:
         ts, _ = tensorplay.sort(te)
         pos = tensorplay.searchsorted(ts, el, right=True)
@@ -527,7 +563,7 @@ def unique_consecutive(input, return_inverse=False, return_counts=False,
         n = moved.size(0)
         if n == 0:
             output = tensorplay.empty(
-                list(input.shape()), dtype=input.dtype, device=input.device)
+                list(input.shape), dtype=input.dtype, device=input.device)
             empty_index = tensorplay.empty(
                 [0], dtype=DType.int64, device=input.device)
             if return_inverse and return_counts:
@@ -571,15 +607,17 @@ def unique_consecutive(input, return_inverse=False, return_counts=False,
     v = input.reshape([-1])
     n = v.numel()
     if n == 0:
-        outs = [tensorplay.zeros([0], dtype=input.dtype)]
+        outs = [tensorplay.zeros([0], dtype=input.dtype, device=input.device)]
         if return_inverse:
-            outs.append(tensorplay.zeros([0], dtype=DType.int64))
+            outs.append(tensorplay.zeros([0], dtype=DType.int64,
+                                         device=input.device))
         if return_counts:
-            outs.append(tensorplay.zeros([0], dtype=DType.int64))
+            outs.append(tensorplay.zeros([0], dtype=DType.int64,
+                                         device=input.device))
         return outs[0] if len(outs) == 1 else tuple(outs)
     ne = v.narrow(0, 1, n - 1).ne(v.narrow(0, 0, n - 1))
     change = tensorplay.cat(
-        [tensorplay.ones([1], dtype=DType.bool), ne])
+        [tensorplay.ones([1], dtype=DType.bool, device=input.device), ne])
     gid = change.to(DType.int64).cumsum(0).sub(1)
     values = v.masked_select(change)
     ngid = int(gid.narrow(0, n - 1, 1).item()) + 1
@@ -587,8 +625,11 @@ def unique_consecutive(input, return_inverse=False, return_counts=False,
     if return_inverse:
         outs.append(gid)
     if return_counts:
-        counts = tensorplay.zeros([ngid], dtype=DType.int64) \
-            .scatter_add(0, gid, tensorplay.ones([n], dtype=DType.int64))
+        counts = tensorplay.zeros(
+            [ngid], dtype=DType.int64, device=input.device) \
+            .scatter_add(
+                0, gid,
+                tensorplay.ones([n], dtype=DType.int64, device=input.device))
         outs.append(counts)
     return outs[0] if len(outs) == 1 else tuple(outs)
 
@@ -600,22 +641,37 @@ def repeat_interleave(input, repeats, dim=None, *, output_size=None):
         axis = 1
     else:
         axis = _norm_dim(dim, input.dim())
-    if isinstance(repeats, tensorplay.Tensor):
-        rep = repeats.to(DType.int64).reshape([-1])
+    if isinstance(repeats, tensorplay.Tensor) or not isinstance(
+            repeats, (int, float, bool)):
+        rep = _as_tensor(repeats).to(DType.int64).to(device=input.device)
+        rep = rep.reshape([-1])
         if rep.numel() == 1 and src.size(axis) != 1:
             rep = tensorplay.full([src.size(axis)], int(rep[0].item()),
-                                  dtype=DType.int64)
+                                  dtype=DType.int64, device=input.device)
     else:
         rep = tensorplay.full([src.size(axis)], int(repeats),
-                              dtype=DType.int64)
+                              dtype=DType.int64, device=input.device)
     if rep.numel() != src.size(axis):
         raise RuntimeError(
             "repeat_interleave(): repeats must have the same length as the "
             "selected dimension"
         )
+    if bool((rep < 0).any()):
+        raise ValueError("repeat_interleave(): repeats must be non-negative")
     ends = rep.cumsum(0)
-    total = int(ends[-1].item())
-    pos = tensorplay.arange(total, dtype=DType.int64)
+    total = 0 if rep.numel() == 0 else int(ends[-1].item())
+    if output_size is not None and int(output_size) != total:
+        raise RuntimeError(
+            "repeat_interleave(): output_size does not match the repeated "
+            f"length ({int(output_size)} != {total})"
+        )
+    if total == 0:
+        output_shape = list(src.shape)
+        output_shape[axis] = 0
+        picked = tensorplay.empty(
+            output_shape, dtype=input.dtype, device=input.device)
+        return picked.reshape([-1]) if dim is None else picked
+    pos = tensorplay.arange(total, dtype=DType.int64, device=input.device)
     seg = tensorplay.searchsorted(ends.contiguous(), pos, right=True) \
         .clamp(0, src.size(axis) - 1)
     moved = src.transpose(0, axis) if axis != 0 else src
@@ -628,13 +684,23 @@ def repeat_interleave(input, repeats, dim=None, *, output_size=None):
 
 
 def kaiser_window(window_length, periodic=True, beta=12.0, *,
-                  dtype=None, layout=None, requires_grad=False):
+                  dtype=None, layout=None, device=None, pin_memory=False,
+                  requires_grad=False):
     n = int(window_length)
     if n < 0:
         raise ValueError("kaiser_window(): window_length must be non-negative")
+    if layout not in (None, tensorplay.strided):
+        raise ValueError("kaiser_window(): only strided layout is supported")
+    if dtype is None:
+        dtype = tensorplay.get_default_dtype()
+    if n <= 1:
+        w = tensorplay.ones([n], dtype=dtype, device=device)
+        if pin_memory:
+            w = w.pin_memory()
+        return w.requires_grad_(True) if requires_grad else w
     denom = n if periodic else n - 1
     if denom > 0:
-        t = tensorplay.arange(n, dtype=DType.float64)
+        t = tensorplay.arange(n, dtype=DType.float64, device=device)
         alpha = denom / 2.0
         x = (t - alpha) / alpha
         arg = (1.0 - x.pow(2)).clamp(min=0.0).sqrt().mul(float(beta))
@@ -646,17 +712,17 @@ def kaiser_window(window_length, periodic=True, beta=12.0, *,
             for k in range(1, 40):
                 term = term.mul(z.mul(z).div(4.0)).div(k * k)
                 out = out.add(term)
-                if float(term.max().item()) < 1e-18:
-                    break
             return out
 
         w = _i0_series(arg).div(_i0_series(
-            tensorplay.full([], float(beta), DType.float64)))
+            tensorplay.full([], float(beta), dtype=DType.float64,
+                            device=device)))
     else:
-        w = tensorplay.ones([max(n, 1)], dtype=DType.float64)
-    if dtype is not None:
-        w = w.to(dtype)
-    return w
+        w = tensorplay.ones([n], dtype=DType.float64, device=device)
+    w = w.to(dtype)
+    if pin_memory:
+        w = w.pin_memory()
+    return w.requires_grad_(True) if requires_grad else w
 
 
 # ---------------------------------------------------------------------------

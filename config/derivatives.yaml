@@ -1403,3 +1403,112 @@
 
 - name: ne.Tensor(Tensor self, Tensor other) -> Tensor
   output_differentiability: [False]
+
+# Logical and bitwise outputs carry no gradient but their autograd wrappers
+# must exist so dispatch under an active transform layer resolves.
+- name: logical_and(Tensor self, Tensor other) -> Tensor
+  output_differentiability: [False]
+
+- name: logical_not(Tensor self) -> Tensor
+  output_differentiability: [False]
+
+- name: logical_or(Tensor self, Tensor other) -> Tensor
+  output_differentiability: [False]
+
+- name: logical_xor(Tensor self, Tensor other) -> Tensor
+  output_differentiability: [False]
+
+- name: bitwise_not(Tensor self) -> Tensor
+  output_differentiability: [False]
+
+- name: bitwise_and.Tensor(Tensor self, Tensor other) -> Tensor
+  output_differentiability: [False]
+
+- name: bitwise_and.Scalar(Tensor self, Scalar other) -> Tensor
+  output_differentiability: [False]
+
+- name: bitwise_or.Tensor(Tensor self, Tensor other) -> Tensor
+  output_differentiability: [False]
+
+- name: bitwise_or.Scalar(Tensor self, Scalar other) -> Tensor
+  output_differentiability: [False]
+
+- name: bitwise_xor.Tensor(Tensor self, Tensor other) -> Tensor
+  output_differentiability: [False]
+
+- name: bitwise_xor.Scalar(Tensor self, Scalar other) -> Tensor
+  output_differentiability: [False]
+
+- name: bitwise_left_shift.Tensor(Tensor self, Tensor other) -> Tensor
+  output_differentiability: [False]
+
+- name: bitwise_left_shift.Tensor_Scalar(Tensor self, Scalar other) -> Tensor
+  output_differentiability: [False]
+
+- name: bitwise_right_shift.Tensor(Tensor self, Tensor other) -> Tensor
+  output_differentiability: [False]
+
+- name: bitwise_right_shift.Tensor_Scalar(Tensor self, Scalar other) -> Tensor
+  output_differentiability: [False]
+
+# ---------------------------------------------------------------------------
+# Slow / THNN convolution spellings: route through the rank-generic
+# convolution backward with unit dilation, groups=1 and (for the transposed
+# form) the transposed flag set.
+- name: thnn_conv2d(Tensor self, Tensor weight, int[2] kernel_size, Tensor? bias=None, int[2] stride=1, int[2] padding=0) -> Tensor
+  self: std::get<0>(convolution_backward(grad, self, weight, std::nullopt, stride, padding, {1, 1}, false, {0, 0}, 1, {true, false, false}))
+  weight: std::get<1>(convolution_backward(grad, self, weight, std::nullopt, stride, padding, {1, 1}, false, {0, 0}, 1, {false, true, false}))
+  bias: std::get<2>(convolution_backward(grad, self, weight, std::nullopt, stride, padding, {1, 1}, false, {0, 0}, 1, {false, false, true}))
+
+- name: _slow_conv2d_forward(Tensor self, Tensor weight, int[2] kernel_size, Tensor? bias, int[2] stride, int[2] padding) -> Tensor
+  self: std::get<0>(convolution_backward(grad, self, weight, std::nullopt, stride, padding, {1, 1}, false, {0, 0}, 1, {true, false, false}))
+  weight: std::get<1>(convolution_backward(grad, self, weight, std::nullopt, stride, padding, {1, 1}, false, {0, 0}, 1, {false, true, false}))
+  bias: std::get<2>(convolution_backward(grad, self, weight, std::nullopt, stride, padding, {1, 1}, false, {0, 0}, 1, {false, false, true}))
+
+- name: slow_conv3d(Tensor self, Tensor weight, int[3] kernel_size, Tensor? bias=None, int[3] stride=1, int[3] padding=0) -> Tensor
+  self: std::get<0>(convolution_backward(grad, self, weight, std::nullopt, stride, padding, {1, 1, 1}, false, {0, 0, 0}, 1, {true, false, false}))
+  weight: std::get<1>(convolution_backward(grad, self, weight, std::nullopt, stride, padding, {1, 1, 1}, false, {0, 0, 0}, 1, {false, true, false}))
+  bias: std::get<2>(convolution_backward(grad, self, weight, std::nullopt, stride, padding, {1, 1, 1}, false, {0, 0, 0}, 1, {false, false, true}))
+
+- name: slow_conv3d_forward(Tensor self, Tensor weight, int[3] kernel_size, Tensor? bias, int[3] stride, int[3] padding) -> Tensor
+  self: std::get<0>(convolution_backward(grad, self, weight, std::nullopt, stride, padding, {1, 1, 1}, false, {0, 0, 0}, 1, {true, false, false}))
+  weight: std::get<1>(convolution_backward(grad, self, weight, std::nullopt, stride, padding, {1, 1, 1}, false, {0, 0, 0}, 1, {false, true, false}))
+  bias: std::get<2>(convolution_backward(grad, self, weight, std::nullopt, stride, padding, {1, 1, 1}, false, {0, 0, 0}, 1, {false, false, true}))
+
+- name: slow_conv_transpose2d(Tensor self, Tensor weight, int[2] kernel_size, Tensor? bias=None, int[2] stride=1, int[2] padding=0, int[2] output_padding=0, int[2] dilation=1) -> Tensor
+  self: std::get<0>(convolution_backward(grad, self, weight, std::nullopt, stride, padding, dilation, true, output_padding, 1, {true, false, false}))
+  weight: std::get<1>(convolution_backward(grad, self, weight, std::nullopt, stride, padding, dilation, true, output_padding, 1, {false, true, false}))
+  bias: std::get<2>(convolution_backward(grad, self, weight, std::nullopt, stride, padding, dilation, true, output_padding, 1, {false, false, true}))
+
+# ---------------------------------------------------------------------------
+# Loss / helpers
+# cross_entropy_loss composes log_softmax + nll through the composite kernel,
+# so differentiation records the inner ops (no explicit backward node).
+
+- name: segment_reduce(Tensor data, str reduce, *, Tensor? lengths=None, Tensor? indices=None, Tensor? offsets=None, int axis=0, bool unsafe=False, Scalar? initial=None) -> Tensor
+  data: _segment_reduce_backward(grad, result, data, reduce, lengths, offsets, axis, initial)
+
+- name: _trilinear(Tensor i1, Tensor i2, Tensor i3, int[] expand1, int[] expand2, int[] expand3, int[] sumdim, int unroll_dim=1) -> Tensor
+  i1: std::get<0>(_trilinear_backward(grad, i1, i2, i3, expand1, expand2, expand3, sumdim, {true, false, false}))
+  i2: std::get<1>(_trilinear_backward(grad, i1, i2, i3, expand1, expand2, expand3, sumdim, {false, true, false}))
+  i3: std::get<2>(_trilinear_backward(grad, i1, i2, i3, expand1, expand2, expand3, sumdim, {false, false, true}))
+
+# ---------------------------------------------------------------------------
+# Sparse ops
+- name: _sparse_softmax(Tensor self, int dim, bool half_to_float) -> Tensor
+  self: _sparse_softmax_backward_data(grad, result, dim, self)
+
+- name: _sparse_log_softmax(Tensor self, int dim, bool half_to_float) -> Tensor
+  self: _sparse_log_softmax_backward_data(grad, result, dim, self)
+
+- name: _sparse_sum(Tensor self) -> Tensor
+  self: grad.sparse_mask(self)
+
+- name: _sparse_sum.dim(Tensor self, int[1] dim) -> Tensor
+  self: _sparse_sum_backward(grad, self, dim)
+
+- name: _spdiags(Tensor diagonals, Tensor offsets, int[] shape, int? layout=None) -> Tensor
+  output_differentiability: [False]
+
+- name: hash_tensor(Tensor self, int[1] dim=[], *, bool keepdim=False, int mode=0) -> Tensor
+  output_differentiability: [False]

@@ -370,18 +370,36 @@ Tensor csr_to_coo_cpu(const Tensor& self) {
 
 Tensor to_dense_sparse_cpu(const Tensor& self) {
     if (!self.is_sparse()) return self;
-    if (self.is_sparse_csr()) {
-        if (self.dim() != 2) {
-            TP_THROW(RuntimeError, "to_dense(): CSR tensors must be 2-D");
+    if (self.is_sparse_compressed()) {
+        if (self.dim() < 2) {
+            TP_THROW(RuntimeError,
+                     "to_dense(): compressed tensors need at least 2-D sizes");
         }
         Tensor crow = self._crow_indices().contiguous();
         Tensor col = self._col_indices().contiguous();
         Tensor values = self._values().contiguous();
-        if (values.dim() != 1) {
-            TP_THROW(RuntimeError,
-                     "to_dense(): hybrid CSR tensors are not supported");
-        }
-        const int64_t rows = crow.size(0) - 1;
+        const int layout = self.unsafeGetTensorImpl()->sparse_layout();
+        const bool row_compressed =
+            layout == TensorImpl::kSparseCSRLayout ||
+            layout == TensorImpl::kSparseBSRLayout;
+        const bool blocked =
+            layout == TensorImpl::kSparseBSRLayout ||
+            layout == TensorImpl::kSparseBSCLayout;
+        const auto bs = self.sparse_blocksize();
+        const int64_t b0 = blocked ? bs[0] : 1;
+        const int64_t b1 = blocked ? bs[1] : 1;
+        const int64_t ndim = self.dim();
+        const int64_t n_batch = ndim - 2;
+        int64_t batch_count = 1;
+        for (int64_t d = 0; d < n_batch; ++d) batch_count *= self.size(d);
+        const int64_t rows = self.size(n_batch);
+        const int64_t cols = self.size(n_batch + 1);
+        const int64_t comp_units = row_compressed ? rows / b0 : cols / b1;
+        // Each batch matrix contributes its own compressed/plain components;
+        // the flat nnz axis of values/plain splits evenly across batches.
+        const int64_t nnz = values.size(0);
+        const int64_t nnz_per_batch = batch_count > 0 ? nnz / batch_count : 0;
+        const int64_t block_numel = b0 * b1;
         Tensor out = Tensor::zeros(self.shape(), self.dtype(), self.device());
         dispatch_dtype(self.dtype(), [&](auto tag) {
             using scalar_t = typename decltype(tag)::type;
@@ -389,9 +407,28 @@ Tensor to_dense_sparse_cpu(const Tensor& self) {
             const int64_t* col_ptr = col.data_ptr<int64_t>();
             const scalar_t* value_ptr = values.data_ptr<scalar_t>();
             scalar_t* out_ptr = out.data_ptr<scalar_t>();
-            for (int64_t i = 0; i < rows; ++i) {
-                for (int64_t t = crow_ptr[i]; t < crow_ptr[i + 1]; ++t) {
-                    out_ptr[i * self.size(1) + col_ptr[t]] = value_ptr[t];
+            const int64_t matrix_numel = rows * cols;
+            for (int64_t k = 0; k < batch_count; ++k) {
+                const int64_t* batch_crow = crow_ptr +
+                    k * (comp_units + 1);
+                const int64_t* batch_col = col_ptr + k * nnz_per_batch;
+                const scalar_t* batch_values = value_ptr +
+                    k * nnz_per_batch * block_numel;
+                scalar_t* batch_out = out_ptr + k * matrix_numel;
+                for (int64_t cu = 0; cu < comp_units; ++cu) {
+                    for (int64_t t = batch_crow[cu]; t < batch_crow[cu + 1]; ++t) {
+                        const int64_t pu = batch_col[t];
+                        for (int64_t i = 0; i < b0; ++i) {
+                            for (int64_t j = 0; j < b1; ++j) {
+                                const int64_t row = row_compressed
+                                    ? cu * b0 + i : pu * b0 + i;
+                                const int64_t coln = row_compressed
+                                    ? pu * b1 + j : cu * b1 + j;
+                                batch_out[row * cols + coln] =
+                                    batch_values[(t * b0 + i) * b1 + j];
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -1010,6 +1047,699 @@ Tensor spdiags_cpu(const Tensor& diagonals, const Tensor& offsets,
         return coo_to_csr_cpu(result.coalesce(), m_size);
     }
     return result;
+}
+
+// sparse @ dense producing a sparse result.  For every row with at least one
+// stored element the product row is emitted in full (zero entries included),
+// so the output preserves the input's row structure; rows without stored
+// elements are dropped.  ``beta`` scales the accumulated input (unused by
+// smm, which passes an empty accumulator) and ``alpha`` scales the product.
+Tensor sparse_sspaddmm_cpu(const Tensor& t, const Tensor& sparse,
+                           const Tensor& dense, Scalar beta, Scalar alpha) {
+    if (!sparse.is_sparse() || sparse.is_sparse_csr()) {
+        TP_THROW(RuntimeError,
+                 "sspaddmm(): expected 'mat1' to be a sparse COO tensor");
+    }
+    if (sparse.sparse_dim() != 2) {
+        TP_THROW(RuntimeError, "sspaddmm(): Argument #2: matrices expected, got ",
+                 sparse.sparse_dim(), "D tensor");
+    }
+    if (sparse.dense_dim() != 0) {
+        TP_THROW(RuntimeError,
+                 "sspaddmm(): Argument #2: scalar values expected, got ",
+                 sparse.dense_dim(), "D values");
+    }
+    if (dense.dim() != 2) {
+        TP_THROW(RuntimeError, "sspaddmm(): Argument #3: matrices expected, got ",
+                 dense.dim(), "D tensor");
+    }
+    TP_CHECK(dense.device() == sparse.device() && dense.device() == t.device(),
+             "sspaddmm(): all operands must be on the same device");
+
+    Tensor canonical = sparse.is_coalesced() ? sparse : sparse.coalesce();
+    const int64_t dim_i = canonical.size(0);
+    const int64_t dim_j = canonical.size(1);
+    const int64_t dim_k = dense.size(1);
+
+    Tensor indices = canonical._indices().contiguous();
+    Tensor values = canonical._values().contiguous();
+    if (indices.dtype() != DType::Int64) {
+        indices = indices.to(DType::Int64);
+    }
+
+    const int64_t nnz = canonical._nnz();
+    // Row boundaries of the coalesced matrix in CSR form.
+    Tensor crow = Tensor::zeros({dim_i + 1}, DType::Int64, sparse.device());
+    int64_t* crow_ptr = crow.data_ptr<int64_t>();
+    const int64_t* index_data = indices.data_ptr<int64_t>();
+    for (int64_t n = 0; n < nnz; ++n) {
+        ++crow_ptr[index_data[n] + 1];
+    }
+    for (int64_t i = 0; i < dim_i; ++i) crow_ptr[i + 1] += crow_ptr[i];
+
+    const int64_t t_nnz = t.is_sparse() ? t._nnz() : 0;
+    const int64_t r_nnz = nnz * dim_k + t_nnz;
+    Tensor newi = Tensor::empty({2, r_nnz}, DType::Int64, sparse.device());
+    Tensor newv = Tensor::zeros({r_nnz}, values.dtype(), sparse.device());
+
+    int64_t* newi_ptr = newi.data_ptr<int64_t>();
+    Tensor dense_c = dense.contiguous();
+
+    // Accumulated input term: beta * t, stored first.  An empty
+    // accumulator (the smm spelling) contributes nothing.
+    int64_t p = 0;
+    if (t_nnz != 0) {
+        TP_CHECK(t.dim() == 2, "sspaddmm(): Argument #1: matrices expected");
+        TP_CHECK(t.size(0) == dim_i && t.size(1) == dim_k,
+                 "sspaddmm(): accumulator shape mismatch");
+        Tensor t_coalesced = t.is_coalesced() ? t : t.coalesce();
+        Tensor t_indices = t_coalesced._indices().contiguous();
+        Tensor t_values = t_coalesced._values().contiguous();
+        if (t_indices.dtype() != DType::Int64) {
+            t_indices = t_indices.to(DType::Int64);
+        }
+        std::copy_n(t_indices.data_ptr<int64_t>(), t_nnz, newi_ptr);
+        std::copy_n(t_indices.data_ptr<int64_t>() + t_nnz, t_nnz,
+                    newi_ptr + r_nnz);
+        const int64_t t_dense_numel = t_coalesced._values().dim() > 1
+            ? 1 : 1;
+        (void)t_dense_numel;
+        dispatch_dtype(values.dtype(), [&](auto tag) {
+            using scalar_t = typename decltype(tag)::type;
+            scalar_t* dst = newv.data_ptr<scalar_t>();
+            const scalar_t* src = t_values.data_ptr<scalar_t>();
+            const scalar_t beta_value = beta.to<scalar_t>();
+            for (int64_t n = 0; n < t_nnz; ++n) dst[n] = beta_value * src[n];
+        });
+        p = t_nnz;
+    }
+
+    // Product term: for each non-empty row, alpha * (values @ dense) row.
+    dispatch_dtype(values.dtype(), [&](auto tag) {
+        using scalar_t = typename decltype(tag)::type;
+        const scalar_t* value_ptr = values.data_ptr<scalar_t>();
+        const scalar_t* dense_ptr = dense_c.data_ptr<scalar_t>();
+        scalar_t* newv_ptr = newv.data_ptr<scalar_t>();
+        const scalar_t alpha_value = alpha.to<scalar_t>();
+        const int64_t dense_stride0 = dense_c.stride(0);
+        const int64_t dense_stride1 = dense_c.stride(1);
+
+        for (int64_t h = 0; h < dim_i; ++h) {
+            const int64_t row_start = crow_ptr[h];
+            const int64_t row_end = crow_ptr[h + 1];
+            if (row_start == row_end) continue;
+            for (int64_t k = 0; k < dim_k; ++k) {
+                newi_ptr[p + k] = h;
+                newi_ptr[r_nnz + p + k] = k;
+            }
+            for (int64_t i = row_start; i < row_end; ++i) {
+                const scalar_t val = value_ptr[i];
+                const int64_t col = index_data[nnz + i];
+                if (col < 0 || col >= dim_j) {
+                    TP_THROW(IndexError,
+                             "index out of bound. sspmm: ", col,
+                             " not between 0 and ", dim_j);
+                }
+                const scalar_t scale = alpha_value * val;
+                const scalar_t* dense_row = dense_ptr + col * dense_stride0;
+                scalar_t* out_row = newv_ptr + p;
+                for (int64_t k = 0; k < dim_k; ++k) {
+                    out_row[k] += scale * dense_row[k * dense_stride1];
+                }
+            }
+            p += dim_k;
+        }
+    });
+
+    return Tensor::make_sparse_coo_tensor(
+        newi.narrow(1, 0, p), newv.narrow(0, 0, p), {dim_i, dim_k}, false);
+}
+
+Tensor smm_cpu(const Tensor& self, const Tensor& mat2) {
+    if (!self.is_sparse()) {
+        TP_THROW(RuntimeError,
+                 "smm(): expected the first argument to be a sparse tensor");
+    }
+    Tensor result = Tensor::empty({0}, self.dtype(), self.device());
+    return sparse_sspaddmm_cpu(result, self, mat2, Scalar(0.0), Scalar(1.0));
+}
+
+// ---------------------------------------------------------------------------
+// Dense -> compressed sparse (CSR/CSC/BSR/BSC)
+//
+// The N-D input decomposes into (*batch, row, col, *dense_dims).  For the
+// blocked layouts the row/col axes are additionally tiled into blocks and a
+// block is stored when any element inside it is nonzero.  Batched inputs are
+// joined along the compressed axis (rows for CSR/BSR, columns for CSC/BSC),
+// which requires every batch to hold the same number of stored units, and
+// the resulting components are unflattened back to the batch shape.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+} // namespace
+
+Tensor to_sparse_compressed_cpu(const Tensor& self, int layout,
+                                std::array<int64_t, 2> blocksize,
+                                std::optional<int64_t> dense_dim_opt,
+                                const char* name) {
+    if (layout != TensorImpl::kSparseCSRLayout &&
+        layout != TensorImpl::kSparseCSCLayout &&
+        layout != TensorImpl::kSparseBSRLayout &&
+        layout != TensorImpl::kSparseBSCLayout) {
+        TP_THROW(ValueError, name, ": invalid compressed layout ", layout);
+    }
+    if (!self.device().is_cpu()) {
+        TP_THROW(NotImplementedError, name,
+                 ": only CPU inputs are supported");
+    }
+    if (self.dim() < 2) {
+        TP_THROW(RuntimeError, name,
+                 ": input must have at least 2 dimensions, got ", self.dim());
+    }
+    const int64_t dense_dim = dense_dim_opt.value_or(0);
+    if (dense_dim < 0 || self.dim() - 2 - dense_dim < 0) {
+        TP_THROW(ValueError, name,
+                 ": dense_dim must satisfy 0 <= dense_dim <= self.dim()-2");
+    }
+    const bool row_compressed =
+        layout == TensorImpl::kSparseCSRLayout ||
+        layout == TensorImpl::kSparseBSRLayout;
+    const bool blocked =
+        layout == TensorImpl::kSparseBSRLayout ||
+        layout == TensorImpl::kSparseBSCLayout;
+    if (blocked) {
+        if (blocksize[0] <= 0 || blocksize[1] <= 0) {
+            TP_THROW(ValueError, name, ": block sizes must be positive");
+        }
+    } else {
+        blocksize = {1, 1};
+    }
+    const int64_t b0 = blocksize[0];
+    const int64_t b1 = blocksize[1];
+
+    // Shape bookkeeping: (*batch, r, c, *dense).
+    const int64_t ndim = self.dim();
+    const int64_t n_batch_dim = ndim - 2 - dense_dim;
+    const int64_t rows = self.size(n_batch_dim);
+    const int64_t cols = self.size(n_batch_dim + 1);
+    if (blocked) {
+        if (rows % b0 != 0 || cols % b1 != 0) {
+            TP_THROW(RuntimeError, name,
+                     ": sizes must be divisible by the block sizes");
+        }
+    }
+    int64_t batch_count = 1;
+    std::vector<int64_t> batch_shape;
+    for (int64_t d = 0; d < n_batch_dim; ++d) {
+        batch_shape.push_back(self.size(d));
+        batch_count *= self.size(d);
+    }
+    if (batch_count == 0) {
+        TP_THROW(RuntimeError, name,
+                 ": Expected product of batch dimensions to be non-zero.");
+    }
+    int64_t dense_count = 1;
+    std::vector<int64_t> dense_shape;
+    for (int64_t d = n_batch_dim + 2; d < ndim; ++d) {
+        dense_shape.push_back(self.size(d));
+        dense_count *= self.size(d);
+    }
+
+    Tensor dense = self.contiguous();
+
+    // Combined-matrix geometry: rows_m x cols_n.  Batches are joined along
+    // the compressed axis so the conversion runs over one matrix.
+    const int64_t rows_m = row_compressed ? batch_count * rows : rows;
+    const int64_t cols_n = row_compressed ? cols : batch_count * cols;
+    // Compressed/plain units (1 per element when unblocked).
+    const int64_t comp_extent = row_compressed ? (blocked ? b0 : 1)
+                                               : (blocked ? b1 : 1);
+    const int64_t plain_extent = row_compressed ? (blocked ? b1 : 1)
+                                                : (blocked ? b0 : 1);
+    const int64_t comp_units = (row_compressed ? rows_m : cols_n) / comp_extent;
+    const int64_t plain_units = (row_compressed ? cols_n : rows_m) / plain_extent;
+
+    std::vector<int64_t> compressed_vec(comp_units + 1, 0);
+    // Plain coordinates and the per-unit value payloads are gathered in the
+    // second pass below; count first, then prefix-sum.
+    auto element_at = [&](int64_t m, int64_t n, int64_t d) -> int64_t {
+        // Map combined-matrix coordinates back to (batch, row, col).
+        int64_t batch, row, col;
+        if (row_compressed) {
+            batch = m / rows;
+            row = m % rows;
+            col = n;
+        } else {
+            batch = n / cols;
+            col = n % cols;
+            row = m;
+        }
+        return (((batch * rows + row) * cols + col) * dense_count) + d;
+    };
+    // Map (compressed unit, plain unit, intra-unit offsets) to combined
+    // matrix coordinates.  The compressed axis enumerates rows for CSR/BSR
+    // and columns for CSC/BSC; the plain axis holds the other coordinate.
+    auto unit_coords = [&](int64_t cu, int64_t pu, int64_t i, int64_t j,
+                           int64_t& m, int64_t& n) {
+        if (row_compressed) {
+            m = cu * comp_extent + i;
+            n = pu * plain_extent + j;
+        } else {
+            n = cu * comp_extent + i;
+            m = pu * plain_extent + j;
+        }
+    };
+    auto any_nonzero = [&](int64_t cu, int64_t pu) {
+        bool found = false;
+        dispatch_dtype(dense.dtype(), [&](auto tag) {
+            using scalar_t = typename decltype(tag)::type;
+            const scalar_t* data = dense.data_ptr<scalar_t>();
+            for (int64_t i = 0; i < comp_extent && !found; ++i) {
+                for (int64_t j = 0; j < plain_extent && !found; ++j) {
+                    int64_t m, n;
+                    unit_coords(cu, pu, i, j, m, n);
+                    for (int64_t d = 0; d < dense_count; ++d) {
+                        if (data[element_at(m, n, d)] != scalar_t(0)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        return found;
+    };
+
+    for (int64_t cu = 0; cu < comp_units; ++cu) {
+        int64_t count = 0;
+        for (int64_t pu = 0; pu < plain_units; ++pu) {
+            if (any_nonzero(cu, pu)) ++count;
+        }
+        compressed_vec[static_cast<size_t>(cu) + 1] = count;
+    }
+    for (int64_t cu = 0; cu < comp_units; ++cu) {
+        compressed_vec[static_cast<size_t>(cu) + 1] +=
+            compressed_vec[static_cast<size_t>(cu)];
+    }
+    const int64_t nnz = compressed_vec[static_cast<size_t>(comp_units)];
+
+    // Every batch must hold the same number of stored units for the
+    // unflattening to be well-defined.
+    {
+        const int64_t units_per_batch = comp_units / batch_count;
+        for (int64_t k = 1; k < batch_count; ++k) {
+            const int64_t prev =
+                compressed_vec[static_cast<size_t>(k * units_per_batch)] -
+                compressed_vec[static_cast<size_t>((k - 1) * units_per_batch)];
+            const int64_t curr =
+                compressed_vec[static_cast<size_t>((k + 1) * units_per_batch)] -
+                compressed_vec[static_cast<size_t>(k * units_per_batch)];
+            if (prev != curr) {
+                TP_THROW(RuntimeError, name,
+                         ": Expect the same number of specified elements per batch.");
+            }
+        }
+    }
+
+    Tensor compressed = Tensor::empty(
+        {comp_units + 1}, DType::Int64, self.device());
+    std::copy_n(compressed_vec.begin(), comp_units + 1,
+                compressed.data_ptr<int64_t>());
+    Tensor plain = Tensor::empty({nnz}, DType::Int64, self.device());
+
+    // Values payload per stored unit: (comp_extent, plain_extent, *dense).
+    std::vector<int64_t> values_shape;
+    values_shape.push_back(nnz);
+    if (blocked) {
+        values_shape.push_back(b0);  // row block extent
+        values_shape.push_back(b1);  // col block extent
+    }
+    values_shape.insert(values_shape.end(), dense_shape.begin(), dense_shape.end());
+    Tensor values = Tensor::empty(values_shape, dense.dtype(), self.device());
+
+    dispatch_dtype(dense.dtype(), [&](auto tag) {
+        using scalar_t = typename decltype(tag)::type;
+        const scalar_t* data = dense.data_ptr<scalar_t>();
+        scalar_t* values_ptr = values.numel() > 0
+            ? values.data_ptr<scalar_t>() : nullptr;
+        int64_t* plain_ptr = plain.numel() > 0
+            ? plain.data_ptr<int64_t>() : nullptr;
+        int64_t slot = 0;
+        for (int64_t cu = 0; cu < comp_units; ++cu) {
+            for (int64_t pu = 0; pu < plain_units; ++pu) {
+                if (!any_nonzero(cu, pu)) continue;
+                if (plain_ptr != nullptr) plain_ptr[slot] = pu;
+                for (int64_t i = 0; i < comp_extent; ++i) {
+                    for (int64_t j = 0; j < plain_extent; ++j) {
+                        int64_t m, n;
+                        unit_coords(cu, pu, i, j, m, n);
+                        // Values layout: the two trailing block dims are
+                        // always (row, col) regardless of which axis is
+                        // compressed.
+                        const int64_t row_off =
+                            m % (blocked ? b0 : 1);
+                        const int64_t col_off =
+                            n % (blocked ? b1 : 1);
+                        for (int64_t d = 0; d < dense_count; ++d) {
+                            if (values_ptr != nullptr) {
+                                values_ptr
+                                    [(slot * b0 + row_off) * b1 * dense_count +
+                                     col_off * dense_count + d] =
+                                        data[element_at(m, n, d)];
+                            }
+                        }
+                    }
+                }
+                ++slot;
+            }
+        }
+    });
+
+    // Unflatten the components back to the batch shape.
+    const int64_t units_per_batch = comp_units / batch_count;
+    Tensor compressed_out, plain_out, values_out;
+    if (batch_count == 1) {
+        compressed_out = compressed;
+        plain_out = plain;
+        values_out = values;
+    } else {
+        std::vector<int64_t> batched_comp_shape = batch_shape;
+        batched_comp_shape.push_back(units_per_batch + 1);
+        compressed_out = Tensor::empty(batched_comp_shape, DType::Int64,
+                                       self.device());
+        int64_t* dst = compressed_out.data_ptr<int64_t>();
+        for (int64_t k = 0; k < batch_count; ++k) {
+            const int64_t base =
+                compressed_vec[static_cast<size_t>(k * units_per_batch)];
+            for (int64_t j = 0; j <= units_per_batch; ++j) {
+                dst[k * (units_per_batch + 1) + j] =
+                    compressed_vec[static_cast<size_t>(
+                        k * units_per_batch + j)] - base;
+            }
+        }
+        std::vector<int64_t> batched_plain_shape = batch_shape;
+        batched_plain_shape.push_back(-1);
+        plain_out = plain.reshape(batched_plain_shape);
+        values_out = values;
+        if (!batch_shape.empty()) {
+            // The first (nnz) axis of the payload splits evenly across the
+            // batch (checked above); resolve the -1 to the concrete extent.
+            std::vector<int64_t> batched_values_shape = batch_shape;
+            const int64_t payload = values.numel() > 0
+                ? values.size(0) / batch_count : 0;
+            batched_values_shape.push_back(payload);
+            for (size_t d = 1; d < values_shape.size(); ++d) {
+                batched_values_shape.push_back(values_shape[d]);
+            }
+            values_out = values.reshape(batched_values_shape);
+        }
+    }
+
+    std::vector<int64_t> out_sizes;
+    for (int64_t d = 0; d < ndim; ++d) out_sizes.push_back(self.size(d));
+    return Tensor::make_sparse_compressed_tensor(
+        compressed_out, plain_out, values_out, out_sizes, layout, blocksize);
+}
+
+// ---------------------------------------------------------------------------
+// _sparse_sum family
+//
+// The plain overloads reduce the values; the dim overloads fold the listed
+// sparse dims away and sum any listed dense dims inside the values payload,
+// using coalesce() to fold the surviving coordinates.
+// ---------------------------------------------------------------------------
+
+Tensor _sparse_sum_cpu(const Tensor& input) {
+    TP_CHECK(input.is_sparse() && !input.is_sparse_compressed(),
+             "_sparse_sum(): expected a sparse COO tensor");
+    return input.coalesce()._values().sum();
+}
+
+Tensor _sparse_sum_dtype_cpu(const Tensor& input, DType dtype) {
+    TP_CHECK(input.is_sparse() && !input.is_sparse_compressed(),
+             "_sparse_sum(): expected a sparse COO tensor");
+    return input.coalesce()._values().sum(dtype);
+}
+
+Tensor _sparse_sum_dim_cpu(const Tensor& input, std::vector<int64_t> dims_to_sum,
+                           std::optional<DType> dtype) {
+    TP_CHECK(input.is_sparse() && !input.is_sparse_compressed(),
+             "_sparse_sum(): expected a sparse COO tensor");
+    Tensor working = input;
+    if (dtype.has_value() && *dtype != DType::Undefined &&
+        *dtype != working.dtype()) {
+        working = working.to(*dtype);
+    }
+    Tensor canonical = working.is_coalesced() ? working : working.coalesce();
+    const int64_t input_dim = canonical.dim();
+    for (auto& d : dims_to_sum) {
+        if (d < 0) d += input_dim;
+        TP_CHECK(d >= 0 && d < input_dim,
+                 "_sparse_sum(): dimension out of range");
+    }
+
+    Tensor indices = canonical._indices();
+    Tensor values = canonical._values();
+    const auto sizes = static_cast<std::vector<int64_t>>(canonical.shape());
+    const int64_t sparse_dim = canonical.sparse_dim();
+
+    std::vector<int64_t> dims_to_keep;
+    std::vector<int64_t> dense_dims_to_sum;
+    int64_t sparse_dims_to_sum_size = 0;
+    {
+        std::vector<bool> summed(static_cast<size_t>(input_dim), false);
+        for (int64_t d : dims_to_sum) summed[static_cast<size_t>(d)] = true;
+        for (int64_t d = 0; d < input_dim; ++d) {
+            if (summed[static_cast<size_t>(d)]) {
+                if (d < sparse_dim) ++sparse_dims_to_sum_size;
+                else dense_dims_to_sum.push_back(d + 1 - sparse_dim);
+            } else if (d < sparse_dim) {
+                dims_to_keep.push_back(d);
+            }
+        }
+    }
+    const bool sum_all_sparse_dim = sparse_dim == sparse_dims_to_sum_size;
+    const bool sum_dense_dim = !dense_dims_to_sum.empty();
+
+    Tensor new_values = sum_dense_dim
+        ? values.sum(dense_dims_to_sum)
+        : values.clone();
+
+    if (sum_all_sparse_dim) {
+        // Reducing every sparse dim yields a dense tensor.
+        return new_values.sum(std::vector<int64_t>{0});
+    }
+
+    Tensor new_indices;
+    if (dims_to_keep.empty()) {
+        // Unreachable when sum_all_sparse_dim is false (some sparse dim
+        // always survives), but keep the guard for a 0-sparse-dim input.
+        new_indices = indices.clone();
+    } else {
+        new_indices = Tensor::empty(
+            {static_cast<int64_t>(dims_to_keep.size()), canonical._nnz()},
+            indices.dtype(), indices.device());
+        for (int64_t i = 0; i < static_cast<int64_t>(dims_to_keep.size()); ++i) {
+            if (dims_to_keep[static_cast<size_t>(i)] < sparse_dim) {
+                new_indices.select(0, i).copy_(
+                    indices.select(0, dims_to_keep[static_cast<size_t>(i)]));
+            } else {
+                break;
+            }
+        }
+    }
+
+    std::vector<int64_t> new_sizes;
+    for (int64_t d : dims_to_keep) new_sizes.push_back(sizes[static_cast<size_t>(d)]);
+    // The kept coordinates are not necessarily unique yet; coalescing folds
+    // the duplicates raised by the dropped dims.
+    return Tensor::make_sparse_coo_tensor(
+        new_indices, new_values, new_sizes, false).coalesce();
+}
+
+Tensor _sparse_sum_dim_dtype_cpu(const Tensor& input,
+                                 std::vector<int64_t> dims_to_sum,
+                                 DType dtype) {
+    return _sparse_sum_dim_cpu(input, std::move(dims_to_sum), dtype);
+}
+
+Tensor _sparse_sum_dim_cpu_2(const Tensor& input,
+                             std::vector<int64_t> dims_to_sum) {
+    return _sparse_sum_dim_cpu(input, std::move(dims_to_sum), std::nullopt);
+}
+
+Tensor _sparse_sum_backward_cpu(const Tensor& grad_, const Tensor& input_,
+                                std::vector<int64_t> dims_to_sum) {
+    TP_CHECK(input_.is_sparse() && !input_.is_sparse_compressed(),
+             "_sparse_sum_backward(): expected a sparse COO tensor");
+    if ((grad_.is_sparse() && grad_._nnz() == 0) || grad_.numel() == 0) {
+        return Tensor::zeros(static_cast<std::vector<int64_t>>(input_.shape()),
+                             grad_.dtype(), grad_.device());
+    }
+
+    Tensor input = input_.is_coalesced() ? input_ : input_.coalesce();
+    const int64_t input_dim = input.dim();
+    for (auto& d : dims_to_sum) {
+        if (d < 0) d += input_dim;
+        TP_CHECK(d >= 0 && d < input_dim,
+                 "_sparse_sum_backward(): dimension out of range");
+    }
+
+    Tensor input_indices = input._indices().contiguous();
+    Tensor input_values = input._values();
+    const auto input_sizes =
+        static_cast<std::vector<int64_t>>(input.shape());
+    const int64_t input_sparse_dim = input.sparse_dim();
+    const int64_t input_dense_dim = input.dense_dim();
+    const int64_t input_nnz = input._nnz();
+
+    std::vector<bool> summed(static_cast<size_t>(input_dim), false);
+    for (int64_t d : dims_to_sum) summed[static_cast<size_t>(d)] = true;
+    int64_t sparse_dims_to_sum_size = 0;
+    std::vector<int64_t> sparse_dims_to_keep;
+    std::vector<int64_t> dense_dims_to_sum;
+    for (int64_t d = 0; d < input_dim; ++d) {
+        if (summed[static_cast<size_t>(d)]) {
+            if (d < input_sparse_dim) ++sparse_dims_to_sum_size;
+            else dense_dims_to_sum.push_back(d + 1 - input_sparse_dim);
+        } else if (d < input_sparse_dim) {
+            sparse_dims_to_keep.push_back(d);
+        }
+    }
+
+    const bool sum_all_sparse_dim = input_sparse_dim == sparse_dims_to_sum_size;
+    const bool sum_dense_dim = !dense_dims_to_sum.empty();
+    const bool sum_sparse_dim = sparse_dims_to_sum_size > 0;
+
+    if (sum_all_sparse_dim) {
+        TP_CHECK(!grad_.is_sparse(),
+                 "_sparse_sum_backward(): expected grad to be dense since all "
+                 "sparse dims are summed");
+        Tensor grad_input_values = grad_;
+        auto expand_size = static_cast<std::vector<int64_t>>(input_values.shape());
+        if (sum_dense_dim) {
+            std::vector<int64_t> dense_expand_size = expand_size;
+            dense_expand_size.erase(dense_expand_size.begin());
+            for (int64_t d : dense_dims_to_sum) {
+                grad_input_values = grad_input_values.unsqueeze(d - 1);
+            }
+            grad_input_values = grad_input_values.expand(dense_expand_size);
+        }
+        grad_input_values = grad_input_values.expand(expand_size).contiguous();
+        return Tensor::make_sparse_coo_tensor(
+            input_indices.clone(), grad_input_values, input_sizes,
+            input.is_coalesced());
+    }
+
+    TP_CHECK(grad_.is_sparse(),
+             "_sparse_sum_backward(): expected grad to be sparse, but got dense");
+    Tensor grad = grad_.is_coalesced() ? grad_ : grad_.coalesce();
+    Tensor grad_indices = grad._indices().contiguous();
+    Tensor grad_values = grad._values().contiguous();
+    const int64_t grad_sparse_dim = grad.sparse_dim();
+    const int64_t grad_nnz = grad._nnz();
+
+    Tensor grad_values_expand = grad_values;
+    if (sum_dense_dim) {
+        auto expand_size =
+            static_cast<std::vector<int64_t>>(input_values.shape());
+        if (sum_sparse_dim) expand_size[0] = grad_values.size(0);
+        for (int64_t d : dense_dims_to_sum) {
+            grad_values_expand = grad_values_expand.unsqueeze(d);
+        }
+        grad_values_expand = grad_values_expand.expand(expand_size).contiguous();
+    }
+
+    Tensor grad_input_values;
+    if (sum_sparse_dim) {
+        // Scatter the gradient back: each input coordinate keeps its own slot
+        // and receives the grad value with the same surviving coordinates
+        // (binary search over the flattened, sorted grad coordinates).
+        grad_input_values = Tensor::zeros(
+            static_cast<std::vector<int64_t>>(input_values.shape()),
+            grad_values.dtype(), grad_values.device());
+
+        // Horner-style linearization of the given coordinate dims; the
+        // coalesced coordinate rows are lexicographically sorted, so the
+        // flattened 1-D codes come out sorted without a re-sort.
+        auto flatten_by_dims = [](const Tensor& idx,
+                                  const std::vector<int64_t>& sizes,
+                                  const std::vector<int64_t>& dims) {
+            const int64_t nnz_count = idx.size(1);
+            Tensor flat = Tensor::zeros({nnz_count}, DType::Int64,
+                                        idx.device());
+            int64_t* flat_ptr = flat.data_ptr<int64_t>();
+            const int64_t* idx_ptr = idx.data_ptr<int64_t>();
+            for (int64_t d : dims) {
+                for (int64_t n = 0; n < nnz_count; ++n) {
+                    flat_ptr[n] = flat_ptr[n] * sizes[static_cast<size_t>(d)] +
+                                  idx_ptr[d * nnz_count + n];
+                }
+            }
+            return flat;
+        };
+
+        std::vector<int64_t> grad_keep;
+        for (int64_t d = 0; d < grad_sparse_dim; ++d) grad_keep.push_back(d);
+        Tensor grad_flat = flatten_by_dims(grad_indices, input_sizes, grad_keep);
+        Tensor input_flat =
+            flatten_by_dims(input_indices, input_sizes, sparse_dims_to_keep);
+        const int64_t* grad_flat_ptr = grad_flat.data_ptr<int64_t>();
+        const int64_t* input_flat_ptr = input_flat.data_ptr<int64_t>();
+        dispatch_dtype(grad_values.dtype(), [&](auto tag) {
+            using scalar_t = typename decltype(tag)::type;
+            scalar_t* dst = grad_input_values.data_ptr<scalar_t>();
+            const scalar_t* src = grad_values_expand.data_ptr<scalar_t>();
+            const int64_t row_numel = grad_input_values.numel() /
+                                      (input_nnz > 0 ? input_nnz : 1);
+            for (int64_t i = 0; i < input_nnz; ++i) {
+                const int64_t input_idx = input_flat_ptr[i];
+                int64_t l = 0, r = grad_nnz - 1;
+                while (l <= r) {
+                    const int64_t m = l + (r - l) / 2;
+                    if (grad_flat_ptr[m] == input_idx) {
+                        std::copy_n(src + m * row_numel, row_numel,
+                                    dst + i * row_numel);
+                        break;
+                    }
+                    if (grad_flat_ptr[m] < input_idx) l = m + 1;
+                    else r = m - 1;
+                }
+            }
+        });
+    } else {
+        grad_input_values = grad_values_expand;
+    }
+    return Tensor::make_sparse_coo_tensor(
+        input_indices.clone(), grad_input_values, input_sizes,
+        input.is_coalesced());
+}
+
+// ---------------------------------------------------------------------------
+// native_norm
+//
+// Norm over a sparse tensor: only full reductions are supported, the input
+// must not be hybrid, and the reduced values carry the dense norm.
+// ---------------------------------------------------------------------------
+
+Tensor native_norm_cpu(const Tensor& self, Scalar p) {
+    return native_norm_dim_cpu(self, p, {}, false, std::nullopt);
+}
+
+Tensor native_norm_dim_cpu(const Tensor& self, std::optional<Scalar> p,
+                           std::vector<int64_t> dims, bool keepdim,
+                           std::optional<DType> dtype) {
+    TP_CHECK(self.is_sparse(), "norm(): expected a sparse tensor");
+    (void)dims;
+    TP_CHECK(dims.empty() ||
+                 static_cast<int64_t>(dims.size()) == self.dim(),
+             "norm(): currently only supports full reductions");
+    TP_CHECK(!keepdim, "norm(): currently does not support keepdim=True");
+    TP_CHECK(!dtype.has_value(), "norm(): currently does not support 'dtype'");
+    Tensor canonical = self.is_coalesced() ? self : self.coalesce();
+    const double p_value = p.has_value() ? p->toDouble() : 2.0;
+    return canonical._values().norm(p_value);
 }
 
 } // namespace cpu

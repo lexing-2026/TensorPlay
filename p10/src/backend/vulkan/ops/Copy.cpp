@@ -4,6 +4,7 @@
 #include "Convert.h"
 #include "Utils.h"
 #include "../api/Context.h"
+#include "../impl/Common.h"
 #include "vulkan/Context.h"
 
 #include <cstring>
@@ -119,6 +120,32 @@ void transfer_cpu_to_vulkan(const Tensor& src, api::vTensor& v_dst) {
 void transfer_vulkan_to_cpu(api::vTensor& v_src, Tensor& dst) {
   api::Context* const context = api::context();
 
+  if (v_src.storage_type() == api::StorageType::BUFFER) {
+    api::StorageBuffer staging(context, v_src.dtype(), v_src.numel());
+    api::VulkanFence fence = context->fences().get_fence();
+    {
+      std::unique_lock<std::mutex> context_lock(context->dispatch_lock());
+      api::PipelineBarrier barrier{};
+      context->submit_copy<api::VulkanBuffer, api::VulkanBuffer>(
+          barrier,
+          v_src.buffer(barrier, api::PipelineStage::TRANSFER,
+                       api::MemoryAccessType::READ),
+          staging.buffer(), {static_cast<uint32_t>(v_src.nbytes()), 0u, 0u},
+          {0u, 0u, 0u}, {0u, 0u, 0u}, fence.get_submit_handle());
+      fence.wait();
+      context->flush();
+    }
+    context->fences().return_fence(fence);
+    Tensor host(v_src.sizes(), v_src.dtype(), Device(DeviceType::CPU));
+    {
+      api::MemoryMap mapping(staging.buffer(), api::MemoryAccessType::READ);
+      mapping.invalidate();
+      std::memcpy(host.impl()->storage().data(), mapping.data<void>(), v_src.nbytes());
+    }
+    dst.copy_(host);
+    return;
+  }
+
   // Temporary tensor to receive copied NC4HW data
   Tensor dst_tmp = utils::create_staging_tensor(v_src);
 
@@ -191,6 +218,29 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
     if (src.device().is_vulkan()) {
       api::Context* const context = api::context();
       api::vTensor v_src = convert(src);
+
+      if (v_src.dtype() != v_self.dtype()) {
+        TP_CHECK(v_src.storage_type() == api::StorageType::TEXTURE_3D &&
+                     v_self.storage_type() == api::StorageType::TEXTURE_3D,
+                 "Vulkan dtype conversion requires texture storage");
+        TP_CHECK(src.shape() == self.shape(),
+                 "Vulkan dtype conversion requires equal shapes");
+        const char* shader = nullptr;
+        if (v_src.dtype() == DType::Int32 && v_self.dtype() == DType::Float32) {
+          shader = "cast_i32_float";
+        } else if (v_src.dtype() == DType::Float32 && v_self.dtype() == DType::Int32) {
+          shader = "cast_float_i32";
+        }
+        TP_CHECK(shader != nullptr, "Unsupported Vulkan dtype conversion");
+        api::PipelineBarrier barrier{};
+        context->submit_compute_job(
+            VK_KERNEL_FROM_STR(shader), barrier, v_self.extents(),
+            adaptive_work_group_size(v_self.extents()), VK_NULL_HANDLE,
+            v_self.image(barrier, api::PipelineStage::COMPUTE,
+                         api::MemoryAccessType::WRITE),
+            v_src.image(barrier, api::PipelineStage::COMPUTE));
+        return self;
+      }
 
       if (v_self.storage_type() == api::StorageType::BUFFER &&
           v_src.storage_type() == api::StorageType::BUFFER) {

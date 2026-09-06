@@ -1,58 +1,58 @@
 % 02-architecture.tex --- Four-Pillar Decomposition (expanded to 10+ pages)
-\section{Four-Pillar Decomposition}
+\section{四支柱分解}
 \label{sec:arch}
 
-The framework is partitioned into four physically isolated shared libraries plus one Python extension, all produced from a single CMake invocation. Isolation is not editorial; it is enforced by directory, target, link edge, and header visibility. A newcomer reads \texttt{p10} to understand tensor storage without learning any differentiation concept; a kernel author rebuilds only \texttt{p10} after touching an arithmetic kernel; a compiler author experiments inside \texttt{stax} without relinking the storage layer. The cost is explicit boundaries and the absence of whole-program inlining, which this project accepts.
+该框架分为四个物理隔离的共享库和一个 Python 扩展，所有这些都由一次 CMake 调用生成。隔离不是社论；它由目录、目标、链接边缘和标头可见性强制执行。新手读\texttt{p10}来理解张量存储，无需学习任何微分概念；内核作者在接触算术内核后仅重建 \texttt{p10} ；编译器作者在 \texttt{stax} 内进行实验，无需重新链接存储层。成本是明确的边界和缺乏整个程序内联，这是该项目所接受的。
 
-\subsection{Directory \texorpdfstring{$\rightarrow$}{->} Artifact Mapping}
+\subsection{目录 \texorpdfstring{->}{->} 工件映射}
 \label{sec:arch:mapping}
 
-Each pillar is a CMake target whose \texttt{OUTPUT\_DIRECTORY} is pinned to a location inside the \texttt{tensorplay} package tree, so an in-tree build is importable without installation and a wheel is importable without \texttt{LD\_LIBRARY\_PATH}. Table~\ref{tab:pillars} is the normative map.
+每个支柱都是一个 CMake 目标，其 \texttt{OUTPUT\_DIRECTORY} 固定到 \texttt{tensorplay} 包树内的某个位置，因此树内构建无需安装即可导入，而轮子无需 \texttt{LD\_LIBRARY\_PATH} 即可导入。表~\ref{tab:pillars}为规范图。
 
 \begin{table}[H]
 \centering
-\caption{Directory to artifact mapping. Each row is a CMake target; \texttt{OUTPUT\_DIRECTORY} is absolute via \texttt{TP\_PACKAGE\_DIR}.}
+\caption{目录到工件的映射。每行都是一个 CMake 目标； \texttt{OUTPUT\_DIRECTORY} 通过 \texttt{TP\_PACKAGE\_DIR} 是绝对的。}
 \label{tab:pillars}
 \small
 \begin{tabular}{p{1.8cm}p{1.6cm}p{2.8cm}p{3.4cm}p{2.6cm}}
 \toprule
-Directory & CMake target & Artifact (\texttt{OUTPUT\_DIRECTORY}) & Link deps & Responsibility \\
+目录 & CMake 目标 & 神器 (\texttt{OUTPUT\_DIRECTORY}) & 链接部门 & 责任 \\
 \midrule
- & \texttt{p10} & \texttt{libp10.so} & \texttt{Threads}, \texttt{COMPUTE\_LIBS} (BLAS/oneDNN), \texttt{CUDA::*} & Tensor, Storage, dispatch table, 300+ kernels, allocators \\
- & \texttt{tpx} & \texttt{libtpx.so} & \texttt{p10} & Explicit DAG, Engine, saved variables, derivative nodes \\
- & \texttt{stax} & \texttt{libstax.so} & \texttt{p10}, \texttt{tpx} & Minimal \texttt{Graph} IR, \texttt{Pass} registry, interpreter \\
- & \texttt{tp\_python} & \texttt{libtp\_python.so} & \texttt{p10}, \texttt{pybind11} & \texttt{CPythonBridge.cpp} single-copy caster substrate \\
- & \texttt{\_C} & \texttt{\_\_init\_\_.so} & \texttt{p10}, \texttt{tpx}, \texttt{stax}, \texttt{tp\_python} & Generated ops, device bindings, profiler, distributed \\
+  & \texttt{p10} & \texttt{libp10.so} & \texttt{Threads}、\texttt{COMPUTE\_LIBS}（BLAS/oneDNN）、\texttt{CUDA::*} & 张量、存储、调度表、300 多个内核、分配器 \\
+  & \texttt{tpx} & \texttt{libtpx.so} & \texttt{p10} & 显式 DAG、引擎、保存变量、衍生节点 \\
+  & \texttt{stax} & \texttt{libstax.so} & \texttt{p10}, \texttt{tpx} & 最小 \texttt{Graph} IR、\texttt{Pass} 注册表、解释器 \\
+  & \texttt{tp\_python} & \texttt{libtp\_python.so} & \texttt{p10}, \texttt{pybind11} & \texttt{CPythonBridge.cpp} 单拷贝脚轮基板 \\
+  & \texttt{\_C} & \texttt{\_\_init\_\_.so} & \texttt{p10}, \texttt{tpx}, \texttt{stax}, \texttt{tp\_python} & 生成的操作、设备绑定、分析器、分布式 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Concretely, \texttt{TP\_PACKAGE\_DIR} defaults to the source tree's \texttt{tensorplay/} directory, and \texttt{TP\_LIB\_DIR} is \texttt{\$\{TP\_PACKAGE\_DIR\}/lib}. Four \texttt{set\_target\_properties} blocks force the extension into \texttt{tensorplay/\_C} with \texttt{OUTPUT\_NAME "\_\_init\_\_"} and force \texttt{p10}, \texttt{tpx}, \texttt{stax}, \texttt{tp\_python} into \texttt{lib}.
+具体来说，\texttt{TP\_PACKAGE\_DIR} 默认为源代码树的 \texttt{tensorplay/} 目录，\texttt{TP\_LIB\_DIR} 为 \texttt{\$\{TP\_PACKAGE\_DIR\}/lib}。四个 \texttt{set\_target\_properties} 块强制将 \texttt{OUTPUT\_NAME "\_\_init\_\_"} 扩展至 \texttt{tensorplay/\_C}，并强制将 \texttt{p10}、\texttt{tpx}、\texttt{stax}、\texttt{tp\_python} 扩展至 \texttt{lib}。
 
-The Python surface comprises hundreds of modules, but only one compiled extension is ever imported. The veneer re-exports more than 550 native symbols discovered by enumerating \texttt{dir(\_C)} and filtering \texttt{\_\_module\_\_} rewriting (\S\ref{sec:veneer}). No Python file adds a new CMake target; every Python module is a thin wrapper whose heavy work re-enters \texttt{\_C}.
+Python 表面包含数百个模块，但只导入一个已编译的扩展。该单板重新导出通过枚举 \texttt{dir(\_C)} 和过滤 \texttt{\_\_module\_\_} 重写 (\S\ref{sec:veneer}) 发现的 550 多个本机符号。没有 Python 文件添加新的 CMake 目标；每个Python模块都是一个薄包装器，其繁重的工作重新进入\texttt{\_C}。
 
 \begin{table}[H]
 \centering
-\caption{Artifact sizes and link visibility. Measured on a Release build with \texttt{USE\_CUDA=ON}, \texttt{USE\_MKL=ON}.}
+\caption{工件大小和链接可见性。在使用 \texttt{USE\_CUDA=ON}、\texttt{USE\_MKL=ON} 的发布版本上测量。}
 \label{tab:artifactsizes}
 \small
 \begin{tabular}{lll}
 \toprule
-Target & Link visibility & Why \\
+目标 & 链接可见性 & Why \\
 \midrule
-\texttt{p10} & \texttt{PUBLIC Threads::Threads}, \texttt{PUBLIC COMPUTE\_LIBS} & Thread pool and BLAS symbols must be visible to \texttt{tpx}, \texttt{stax}, \texttt{\_C} consumers \\
-\texttt{tpx} & \texttt{PRIVATE p10} at line~26 and \texttt{PUBLIC p10} at line~40 & Handwritten nodes need private p10 headers; downstream \texttt{stax} inherits the p10 interface transitively \\
-\texttt{stax} & \texttt{PRIVATE tpx p10} at line~8 and \texttt{PUBLIC p10} at line~17 & The interpreter calls \texttt{tpx::ops} but exposes only p10 tensor types \\
-\texttt{tp\_python} & \texttt{PUBLIC p10 pybind11::pybind11} & The single caster substrate must be shared between \texttt{\_C} and out-of-tree op modules \\
-\texttt{\_C} & \texttt{PRIVATE p10 tpx stax tp\_python tensorpipe} & The extension is the only consumer that links all three pillars together \\
+\texttt{p10} & \texttt{PUBLIC Threads::Threads}, \texttt{PUBLIC COMPUTE\_LIBS} & 线程池和 BLAS 符号必须对 \texttt{tpx}、\texttt{stax}、\texttt{\_C} 使用者可见 \\
+\texttt{tpx} & \texttt{PRIVATE p10} 在第 ~26 行，\texttt{PUBLIC p10} 在第 ~40 行 & 手写节点需要私有p10头；下游 \texttt{stax} 传递继承 p10 接口 \\
+\texttt{stax} & \texttt{PRIVATE tpx p10} 在第 ~8 行，\texttt{PUBLIC p10} 在第 ~17 行 & 解释器调用 \texttt{tpx::ops} 但仅公开 p10 张量类型 \\
+\texttt{tp\_python} & \texttt{PUBLIC p10 pybind11::pybind11} & 单脚轮基板必须在 \texttt{\_C} 和树外操作模块之间共享 \\
+\texttt{\_C} & \texttt{PRIVATE p10 tpx stax tp\_python tensorpipe} & 该扩展是将所有三个支柱连接在一起的唯一消费者 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{Build Order and the Vacated-Source Record}
+\subsection{构建顺序和空源记录}
 \label{sec:arch:buildorder}
 
- declares the order in exactly four lines:
+仅用四行声明顺序：
 
 \begin{lstlisting}[caption={pillar order is load-bearing.}, label=lst:buildorder]
 # Add p10
@@ -63,19 +63,19 @@ add_subdirectory(tpx)          # :941
 add_subdirectory(stax)         # :944
 \end{lstlisting}
 
- links \texttt{p10} privately; re-exports it publicly so consumers that depend on \texttt{tpx} automatically get the p10 interface. links both \texttt{p10} and \texttt{tpx} privately and re-exports \texttt{p10} publicly at line~17. links \texttt{\_C} against \texttt{p10 tpx stax tp\_python}: this is the only place where the three levels meet. Reordering any of these three \texttt{add\_subdirectory} calls or adding a back edge immediately fails with a CMake configure error or an undefined reference at link time, not a silent runtime mis-order.
+私人链接 \texttt{p10} ；公开重新导出它，以便依赖 \texttt{tpx} 的消费者自动获得 p10 接口。私下链接 \texttt{p10} 和 \texttt{tpx} 并在第 17 行公开重新导出 \texttt{p10}。 \texttt{\_C} 与 \texttt{p10 tpx stax tp\_python} 的链接：这是三个级别相交的唯一地方。对这三个 \texttt{add\_subdirectory} 调用中的任何一个重新排序或添加后沿都会立即失败，并出现 CMake 配置错误或链接时未定义的引用，而不是静默运行时错误顺序。
 
-The generate step precedes all of this. At a \texttt{custom\_command} generates ten artifacts under  from \texttt{native\_functions.yaml} and \texttt{derivatives.yaml} via \texttt{main.py}. Every pillar target declares \texttt{add\_dependencies(generate\_code)} (e.g.\,). The generated header is mixed into via \texttt{TensorGenerated.h"}; the generated source is appended to \texttt{P10\_SOURCES} at as \texttt{\$\{GEN\_CPP\}}. Thus a YAML edit rebuilds only the changed generated file plus its dependents.
+生成步骤先于所有这些。在 \texttt{custom\_command} 处，通过 \texttt{main.py} 从 \texttt{native\_functions.yaml} 和 \texttt{derivatives.yaml} 生成十个工件。每个支柱目标都声明 \texttt{add\_dependencies(generate\_code)}（例如\,）。生成的 header 通过 \texttt{TensorGenerated.h"} 混入；生成的源作为 \texttt{\$\{GEN\_CPP\}} 附加到 \texttt{P10\_SOURCES} 处。因此，YAML 编辑仅重建更改后的生成文件及其依赖文件。
 
- retains a single commented line:
+保留单个注释行：
 
 \begin{lstlisting}[caption={The vacated-source comment in the p10 build file: metadata that once violated the axiom was physically moved out, leaving this trail.}, label=lst:audittrail]
     # src/AutogradMetaInterface.cpp (Moved to TPX)
 \end{lstlisting}
 
-This is intentional. An earlier revision implemented the concrete metadata inside \texttt{p10}; the current design keeps \texttt{p10} header-free of \texttt{tpx} so the USB slot at suffices. Leaving the comment in the source list records the decision boundary: grepping the comment proves the file once lived in \texttt{p10} and was deliberately vacated to preserve acyclicity. Deleting it would erase the history of why \texttt{p10} must not include \texttt{tpx}; resurrecting it inside \texttt{p10} would reintroduce a back edge and break the invariant checked by  which must return empty.
+这是故意的。早期版本在 \texttt{p10} 中实现了具体元数据；当前的设计使 \texttt{p10} 头与 \texttt{tpx} 无关，因此 USB 插槽就足够了。将注释留在源列表中会记录决策边界：grep 注释证明该文件曾经存在于 \texttt{p10} 中，并且被故意腾空以保持非循环性。删除它会抹去为什么 \texttt{p10} 不能包含 \texttt{tpx} 的历史记录；在 \texttt{p10} 内复活它会重新引入后沿并破坏必须返回空的检查的不变量。
 
-A related discipline appears. On Windows where \texttt{BUILD\_SHARED\_LIBS} is normally \texttt{ON} for Linux wheels, the block forces \texttt{BUILD\_SHARED\_LIBS OFF}:
+出现了相关学科。在 Windows 上，对于 Linux 轮子，\texttt{BUILD\_SHARED\_LIBS} 通常是 \texttt{ON}，块强制 \texttt{BUILD\_SHARED\_LIBS OFF}：
 
 \begin{lstlisting}[caption={Windows static embedding.}, label=lst:winstatic]
 if(WIN32 AND BUILD_SHARED_LIBS)
@@ -83,12 +83,12 @@ if(WIN32 AND BUILD_SHARED_LIBS)
 endif()
 \end{lstlisting}
 
-Without the switch, each DLL would require \texttt{\_\_declspec(dllexport)} on every p10 symbol crossing the boundary, which the codebase does not carry. Static linking on Windows embeds the three pillars into the single module \texttt{\_C.pyd} and keeps symbol visibility identical to the Linux shared-library layout without annotating every class.
+如果没有这个开关，每个 DLL 都需要在每个跨越边界的 p10 符号上使用 \texttt{\_\_declspec(dllexport)} ，而代码库并不携带该符号。 Windows 上的静态链接将三个支柱嵌入到单个模块 \texttt{\_C.pyd} 中，并保持符号可见性与 Linux 共享库布局相同，而无需注释每个类。
 
-\subsection{Product Layout: RPATH and the Two Preload Paths}
+\subsection{产品布局：RPATH 和两个预加载路径}
 \label{sec:arch:rpath}
 
-After a build, the package tree is the product:
+构建后，包树就是产品：
 
 \begin{lstlisting}[caption={Post-build layout under the package directory.}, label=lst:layout]
 tensorplay/
@@ -106,7 +106,7 @@ tensorplay/
   version.py             # generated at :330
 \end{lstlisting}
 
-The relative RPATH makes the layout relocatable. From:
+相对 RPATH 使布局可重定位。从：
 
 \begin{lstlisting}[caption={RPATH is the loader contract.}, label=lst:rpath]
 if(NOT WIN32)
@@ -125,7 +125,7 @@ if(NOT WIN32)
 endif()
 \end{lstlisting}
 
-\texttt{p10}, \texttt{tpx}, \texttt{stax}, and \texttt{tp\_python} reside together in \texttt{lib}, so \texttt{\$ORIGIN} suffices: each \ac{dso} finds its siblings without an absolute path, and no \ac{rpath} edit is needed when the tree moves. \texttt{\_C} lives one directory deeper in \texttt{\_C}, so it uses \texttt{lib}. Verification is a single command with no Python involved:
+\texttt{p10}、\texttt{tpx}、\texttt{stax} 和 \texttt{tp\_python} 一起驻留在 \texttt{lib} 中，因此 \texttt{\$ORIGIN} 就足够了：每个 \ac{dso} 都可以在没有绝对路径的情况下找到其兄弟姐妹，并且当树移动时不需要 \ac{rpath} 编辑。 \texttt{\_C} 位于 \texttt{\_C} 更深的一个目录中，因此它使用 \texttt{lib}。验证是一个不涉及 Python 的命令：
 
 \begin{lstlisting}[caption={Linux loader verification without importing Python.}, label=lst:readelf]
 readelf -d tensorplay/lib/libp10.so | grep -i rpath      # $ORIGIN
@@ -134,9 +134,9 @@ readelf -d tensorplay/_C/__init__.so | grep -i rpath     # $ORIGIN/../lib
 ldd tensorplay/_C/__init__.so | grep "not found"          # must be empty
 \end{lstlisting}
 
-Failure without this block manifests as \texttt{ImportError: libp10.so: cannot open shared object file} when the wheel is installed into a virtual environment whose \texttt{LD\_LIBRARY\_PATH} is empty, which is precisely the target scenario for a wheel. The comment at documents this as the single reason RPATH exists; Windows ignores RPATH entirely, so the Windows branch is guarded by \texttt{if(NOT WIN32)}.
+当wheel安装到\texttt{LD\_LIBRARY\_PATH}为空的虚拟环境中时，没有此块的失败表现为\texttt{ImportError: libp10.so: cannot open shared object file}，这正是wheel的目标场景。的注释将其记录为 RPATH 存在的唯一原因； Windows 完全忽略 RPATH，因此 Windows 分支由 \texttt{if(NOT WIN32)} 保护。
 
-Windows uses explicit preload instead. defines \texttt{\_load\_dll\_libraries} guarded by \texttt{sys.platform == 'win32'}:
+Windows 使用显式预加载。定义由 \texttt{sys.platform == 'win32'} 保护的 \texttt{\_load\_dll\_libraries}：
 
 \begin{lstlisting}[caption={ordered DLL preload on Windows.}, label=lst:winpreload]
 kernel32 = ctypes.WinDLL("kernel32.dll", use_last_error=True)
@@ -155,9 +155,9 @@ for dll in sorted_mkl + cuda_dlls + core_dlls:
         res = kernel32.LoadLibraryW(dll)
 \end{lstlisting}
 
-\texttt{0x00001100} is \texttt{LOAD\_LIBRARY\_SEARCH\_DEFAULT\_DIRS | LOAD\_LIBRARY\_SEARCH\_DLL\_LOAD\_DIR}, the minimally permissive flag that still searches the package lib directory added earlier via \texttt{os.add\_dll\_directory}. Order is load-bearing: \texttt{mkl\_core} and \texttt{mkl\_sequential} are sorted first inside the MKL group at lines~85--94 because \texttt{mkl\_def} and \texttt{mkl\_avx2} depend on them; CUDA runtime is loaded before \texttt{p10} so that \texttt{CUDA::cudart} symbols required by p10's CUDA kernels are already resolved. The helper \texttt{\_add\_dll\_directory} tries both \texttt{lib} and the legacy  root, plus the interpreter's \texttt{bin}, the base environment, and the user site-packages bin, each guarded by \texttt{os.path.exists} so a missing Conda installation does not error.
+\texttt{0x00001100} 是 \texttt{LOAD\_LIBRARY\_SEARCH\_DEFAULT\_DIRS | LOAD\_LIBRARY\_SEARCH\_DLL\_LOAD\_DIR}，它仍然搜索之前通过 \texttt{os.add\_dll\_directory} 添加的包 lib 目录的最低许可标志。顺序是承载的：\texttt{mkl\_core} 和 \texttt{mkl\_sequential} 在 MKL 组内首先在第 85--94 行排序，因为 \texttt{mkl\_def} 和 \texttt{mkl\_avx2} 依赖于它们； CUDA 运行时在 \texttt{p10} 之前加载，因此 p10 的 CUDA 内核所需的 \texttt{CUDA::cudart} 符号已经解析。帮助程序 \texttt{\_add\_dll\_directory} 尝试 \texttt{lib} 和旧根，加上解释器的 \texttt{bin}、基本环境和用户站点包 bin，每个都由 \texttt{os.path.exists} 保护，因此丢失的 Conda 安装不会出错。
 
-On Linux the counterpart does not eagerly load anything in a CPU-only environment. wraps the extension import:
+在 Linux 上，对应部分不会在仅 CPU 环境中急切地加载任何内容。包装扩展导入：
 
 \begin{lstlisting}[caption={Linux CUDA wheel probing.}, label=lst:linuxpreload]
 try:
@@ -185,32 +185,32 @@ def _preload_cuda_deps(err=None):                                     # :174
         _preload_cuda_lib(lib_folder, lib_name, required=required)   # :193
 \end{lstlisting}
 
-\texttt{\_get\_cuda\_dep\_paths} at line~144 probes \texttt{libcublasLt.so.*} and \texttt{libcudart.so.*} inside every \texttt{sys.path} entry, which is exactly the layout installed by the pip wheels \texttt{nvidia-cublas-cu*} and \texttt{nvidia-cuda-runtime-cu*}. If probing fails it falls back to \texttt{libcublasLt.so.*}, the path used when the toolkit is bundled via. then does \texttt{ctypes.CDLL(candidates[0])}, which loads the SONAME before the extension's \texttt{DT\_NEEDED} is resolved, working around the common case where the user installed CUDA wheels into the environment's \texttt{site-packages} without setting \texttt{LD\_LIBRARY\_PATH}. Only errors mentioning \texttt{libcud}, \texttt{libcublas}, \texttt{libcurand}, or \texttt{libnvrtc} are intercepted; all other \texttt{ImportError} causes are re-raised unchanged.
+\texttt{\_get\_cuda\_dep\_paths} 位于第 144 行，每个 \texttt{sys.path} 条目内的探头 \texttt{libcublasLt.so.*} 和 \texttt{libcudart.so.*}，这正是点轮 \texttt{nvidia-cublas-cu*} 和 \texttt{nvidia-cuda-runtime-cu*} 安装的布局。如果探测失败，它将回退到 \texttt{libcublasLt.so.*}，即捆绑工具包时使用的路径。然后执行 \texttt{ctypes.CDLL(candidates[0])}，它在解析扩展的 \texttt{DT\_NEEDED} 之前加载 SONAME，解决用户将 CUDA 轮安装到环境的 \texttt{site-packages} 而不设置 \texttt{LD\_LIBRARY\_PATH} 的常见情况。仅拦截提及 \texttt{libcud}、\texttt{libcublas}、\texttt{libcurand} 或 \texttt{libnvrtc} 的错误；所有其他 \texttt{ImportError} 原因均按原样重新提出。
 
 \begin{table}[H]
 \centering
-\caption{Loader behavior: Linux RPATH vs.\ Windows preload vs.\ Linux CDLL probe.}
+\caption{加载程序行为：Linux RPATH vs.\ Windows 预加载 vs.\ Linux CDLL 探针。}
 \label{tab:loader}
 \small
 \begin{tabular}{llll}
 \toprule
-Platform & Mechanism & Files & Citation \\
+平台 & 机制 & 文件 & 引文 \\
 \midrule
-Linux (all) & \texttt{INSTALL\_RPATH "\$ORIGIN"} & \texttt{libp10.so} siblings & \\
-Linux (ext) & \texttt{lib"} & \texttt{\_\_init\_\_.so} & \\
-Windows & \texttt{LoadLibraryExW} with \texttt{0x00001100} & \texttt{stax.dll} & \\
-Linux+CUDA wheels & \texttt{ctypes.CDLL} probe of \texttt{lib} & \texttt{libcublasLt.so.*} & \texttt{\_\_init\_\_.py:161,186} \\
-Bundled CUDA & \texttt{CTOOLKIT\_BIN\_DIR} glob + \texttt{install(FILES)} & \texttt{cublasLt64\_*.dll} & \\
+Linux（全部） & \texttt{INSTALL\_RPATH "\$ORIGIN"} & \texttt{libp10.so} 兄弟姐妹 & \\
+Linux（扩展） & \texttt{lib"} & \texttt{\_\_init\_\_.so} & \\
+视窗 & \texttt{LoadLibraryExW} 与 \texttt{0x00001100} & \texttt{stax.dll} & \\
+Linux+CUDA轮子 & \texttt{lib} 的 \texttt{ctypes.CDLL} 探针 & \texttt{libcublasLt.so.*} & \texttt{\_\_init\_\_.py:161,186} \\
+捆绑 CUDA & \texttt{CTOOLKIT\_BIN\_DIR} 全局 + \texttt{install(FILES)} & \texttt{cublasLt64\_*.dll} & \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{Virtual-Interface Decoupling: the USB Slot}
+\subsection{虚拟接口解耦：USB 插槽}
 \label{sec:arch:usb}
 
- cannot include \texttt{tpx} yet must carry the differentiation state for tensors that require grad. The naive alternatives are both rejected: putting concrete fields (\texttt{grad\_fn\_}, \texttt{grad\_}) into \texttt{p10} couples storage to differentiation; letting \texttt{p10} include a \texttt{tpx} header creates a circular dependency that \texttt{cmake --build} cannot topologically sort and that defeats incremental builds. The design instead declares a pure abstract slot in \texttt{p10} and plugs a concrete object from \texttt{tpx} through \texttt{shared\_ptr<AutogradMetaBase>} and a \texttt{static\_cast} handshake.
+不能包含 \texttt{tpx} 但必须携带需要梯度的张量的微分状态。天真的替代方案都被拒绝了：将具体字段（\texttt{grad\_fn\_}，\texttt{grad\_}）放入\texttt{p10}中，将存储与微分结合起来；让 \texttt{p10} 包含 \texttt{tpx} 标头会创建一个循环依赖关系，\texttt{cmake --build} 无法进行拓扑排序，并且会破坏增量构建。相反，该设计在 \texttt{p10} 中声明一个纯抽象槽，并插入从 \texttt{tpx} 到 \texttt{shared\_ptr<AutogradMetaBase>} 的具体对象以及 \texttt{static\_cast} 握手。
 
-At the slot is four operations, each pure virtual:
+该插槽有四个操作，每个操作都是纯虚拟的：
 
 \begin{lstlisting}[caption={the pure interface.}, label=lst:autogradbase2]
 class P10_API AutogradMetaBase {
@@ -225,9 +225,9 @@ public:
 };
 \end{lstlisting}
 
-The header includes only \texttt{Macros.h}; it forwards \texttt{class Tensor} without including \texttt{Tensor.h}, so the compile-time footprint is a single vtable plus six virtual slots (48 bytes on x86-64). No kernel, no engine, no graph concept crosses the boundary here.
+标头仅包含 \texttt{Macros.h}；它转发 \texttt{class Tensor} 而不包括 \texttt{Tensor.h}，因此编译时占用空间是单个 vtable 加上 6 个虚拟槽（x86-64 上为 48 字节）。没有内核、没有引擎、没有图形概念跨越这里的边界。
 
- holds the slot:
+持有插槽：
 
 \begin{lstlisting}[caption={never-copied owner.}, label=lst:implslot]
   // Autograd extension point.
@@ -235,7 +235,7 @@ The header includes only \texttt{Macros.h}; it forwards \texttt{class Tensor} wi
   std::shared_ptr<AutogradMetaBase> autograd_meta_;
 \end{lstlisting}
 
-The copy constructor at deliberately omits this member:
+at 的复制构造函数故意省略了该成员：
 
 \begin{lstlisting}[caption={history is not duplicated.}, label=lst:copyctor]
 TensorImpl::TensorImpl(const TensorImpl& other)
@@ -257,10 +257,10 @@ TensorImpl::TensorImpl(const TensorImpl& other)
       // autograd_meta_ is intentionally absent: default-initialized to nullptr
 \end{lstlisting}
 
-Thus \texttt{Tensor b = a;} shares storage, sizes, strides, device, dtype, sparse state, quantizer, and the version counter alias, but not the graph. The invariant is: shape mutation and storage aliasing propagate; history does not. Move operations are defaulted, and \texttt{copy\_metadata\_from} at preserves the preservation of \texttt{autograd\_meta\_} by omission.
-This matches the ``never copied'' contract at and enables \texttt{auto y = x + 1; y.backward} where \texttt{x} stays a leaf and \texttt{y} becomes its child without aliasing metadata.
+因此 \texttt{Tensor b = a;} 共享存储、大小、步幅、设备、数据类型、稀疏状态、量化器和版本计数器别名，但不共享图。不变量是：形状突变和存储别名传播；历史没有。移动操作是默认的，\texttt{copy\_metadata\_from} at 保留了 \texttt{autograd\_meta\_} 的省略。
+这与“从不复制”合约相匹配，并启用 \texttt{auto y = x + 1; y.backward}，其中 \texttt{x} 保持叶子状态，而 \texttt{y} 成为其子节点，而无需别名元数据。
 
-The concrete plug lives in:
+混凝土塞位于：
 
 \begin{lstlisting}[caption={concrete fields, tpx only.}, label=lst:autogradconcrete]
 class TENSORPLAY_API AutogradMeta : public AutogradMetaBase {
@@ -281,9 +281,9 @@ private:
 };
 \end{lstlisting}
 
-\texttt{grad\_accumulator\_} is \texttt{weak\_ptr<Node>} rather than \texttt{shared\_ptr<Node>} because \texttt{AccumulateGrad} strongly owns its leaf tensor; a strong back edge would form an uncollectable cycle that leaks every leaf that ever participated in a graph. All other members are owned strongly; \texttt{view\_fn\_} plus \texttt{view\_mutex\_} support stale-view replay.
+\texttt{grad\_accumulator\_} 是 \texttt{weak\_ptr<Node>} 而不是 \texttt{shared\_ptr<Node>}，因为 \texttt{AccumulateGrad} 强烈拥有其叶张量；强大的后边缘将形成一个无法收集的循环，该循环会泄漏参与图中的每个叶子。所有其他成员均拥有强大股权； \texttt{view\_fn\_} 加上 \texttt{view\_mutex\_} 支持陈旧视图重播。
 
-The handshake is the two helpers, each a single \texttt{static\_cast} with no \texttt{dynamic\_cast} on the hot path:
+握手是两个助手，每个助手都有一个 \texttt{static\_cast}，热路径上没有 \texttt{dynamic\_cast}：
 
 \begin{lstlisting}[caption={the cast boundary.}, label=lst:handshake]
 AutogradMeta* get_autograd_meta(const Tensor& t) {
@@ -305,19 +305,19 @@ AutogradMeta* get_or_create_autograd_meta(const Tensor& t) {
 }
 \end{lstlisting}
 
-The call at line~17 is safe because the only concrete subclass ever assigned to \texttt{autograd\_meta\_} is \texttt{AutogradMeta}, constructed at line~28 and installed at line~30. No header in \texttt{p10} ever sees \texttt{AutogradMeta.h}, so the build never lists that include path. The static type system plus the shared-library boundary together enforce the invariant.
-A second proof is the failed build when the cast target changes: if \texttt{tpx} were to rename \texttt{AutogradMeta} without updating the cast, the extension \texttt{\_C} would fail to link with \texttt{undefined reference to tensorplay::tpx::AutogradMeta} rather than corrupting a tensor at runtime.
+第 17 行的调用是安全的，因为分配给 \texttt{autograd\_meta\_} 的唯一具体子类是 \texttt{AutogradMeta}，它在第 28 行构造并在第 30 行安装。 \texttt{p10} 中的标头不会看到 \texttt{AutogradMeta.h}，因此构建不会列出包含路径。静态类型系统加上共享库边界共同强制执行不变性。
+第二个证明是当转换目标更改时构建失败：如果 \texttt{tpx} 重命名 \texttt{AutogradMeta} 而不更新转换，则扩展 \texttt{\_C} 将无法与 \texttt{undefined reference to tensorplay::tpx::AutogradMeta} 链接，而不是在运行时损坏张量。
 
-The per-call cost of this design is one indirect virtual call for \texttt{requires\_grad} / \texttt{grad} / \texttt{set\_grad} plus one pointer indirection for \texttt{autograd\_meta\_}. The benefit is that \texttt{p10} rebuilds when a kernel changes no longer trigger a rebuild of \texttt{tpx}, and \texttt{tpx} rebuilds when engine scheduling changes do not trigger a rebuild of \texttt{p10}.
+此设计的每次调用成本是 \texttt{requires\_grad} / \texttt{grad} / \texttt{set\_grad} 的一次间接虚拟调用加上 \texttt{autograd\_meta\_} 的一次指针间接调用。好处是，当内核更改不再触发 \texttt{tpx} 重建时，\texttt{p10} 会重建，而当引擎调度更改不再触发 \texttt{p10} 重建时，\texttt{tpx} 会重建。
 
 \begin{tpdef}[Definition (USB Slot Pattern)]
-A \emph{USB slot} is a virtual interface $I$ declared in a lower-level library $L$, plus an opaque owning pointer of type \texttt{shared\_ptr<I>} embedded in $L$'s state, where the concrete implementation $C{:}I$ lives only in a higher-level library $H$. The pattern is sound iff (i) $L$ never includes any $H$ header; (ii) the pointer is omitted from $L$'s copy constructor (copies start history-free); and (iii) the downcast the $H$ boundary is \texttt{static\_cast}, justified because $C$ is the only class ever installed into the slot. TensorPlay's instance: $I{=}$\texttt{AutogradMetaBase}, $L{=}$\texttt{p10}, $C{=}$\texttt{AutogradMeta}, $H{=}$\texttt{tpx}.
+\emph{USB slot} 是在较低级别库 $L$ 中声明的虚拟接口 $I$，加上嵌入在 $L$ 状态中的 \texttt{shared\_ptr<I>} 类型的不透明拥有指针，其中具体实现 $C{:}I$ 仅存在于较高级别库 $H$ 中。该模式是健全的 iff (i) $L$ 从不包含任何 $H$ 标头； (ii) $L$ 的复制构造函数中省略了指针（复制开始时没有历史记录）； (iii) $H$ 边界向下是 \texttt{static\_cast}，这是合理的，因为 $C$ 是唯一安装到插槽中的类。 TensorPlay 的实例：$I{=}$\texttt{AutogradMetaBase}、$L{=}$\texttt{p10}、$C{=}$\texttt{AutogradMeta}、$H{=}$\texttt{tpx}。
 \end{tpdef}
 
-\subsection{Figure: USB Slot Model Across the Shared-Library Boundary}
+\subsection{图：跨共享库边界的 USB 插槽模型}
 \label{sec:arch:figure}
 
-Figure~\ref{fig:usb} renders the same mechanism as a hardware analogy: the slot is standardized in the lower component, the plug is supplied by the upper one, and the cable is the virtual dispatch. The dashed line is the \texttt{.so} boundary reported by \texttt{ldd}; symbols left of it are in \texttt{libp10.so}, symbols right of it are in \texttt{libtpx.so}. The figure is reproduced locally by \texttt{gen\_01\_slot.py}, but the source of truth is the two headers cited in the caption.
+图~\ref{fig:usb}呈现了与硬件类比相同的机制：插槽在下部组件中标准化，插头由上部组件提供，电缆是虚拟调度。虚线是\texttt{ldd}报告的\texttt{.so}边界；它左边的符号在\texttt{libp10.so}中，它右边的符号在\texttt{libtpx.so}中。该图由 \texttt{gen\_01\_slot.py} 在本地复制，但事实来源是标题中引用的两个标题。
 
 \begin{figure}[H]
 \centering
@@ -333,60 +333,52 @@ Figure~\ref{fig:usb} renders the same mechanism as a hardware analogy: the slot 
 \node[font=\tiny\ttfamily, color=tpblue, below=0.05cm of p10b, anchor=north] {vtable @ AutogradMetaBase.h:13};
 \node[font=\tiny\ttfamily, color=tporange, below=0.05cm of tpxb, anchor=north] {overrides @ AutogradMeta.h:52};
 \end{tikzpicture}
-\caption{USB slot model. \texttt{p10} declares the abstract slot; \texttt{tpx} manufactures the plug; handshake is \texttt{static\_cast} at \texttt{Autograd.cpp}. The copy constructor at omits the slot.}
+\caption{USB 插槽型号。 \texttt{p10} 声明抽象槽； \texttt{tpx} 制造插头；握手时间为 \texttt{static\_cast}，在 \texttt{Autograd.cpp}。 at 的复制构造函数省略了槽。}
 \label{fig:usb}
 \end{figure}
 
-\subsection{Design Axiom: Level Monotonicity}
+\subsection{设计公理：层次单调性}
 \label{sec:arch:axiom}
 
-Let $V$ be the set of build targets and let $D\subseteq V\times V$ be the relation ``$a$ links $b$'' (i.e.\ $a$ has a \texttt{target\_link\_libraries} edge to $b$). Define \texttt{level}: $V\rightarrow \mathbb{N}$ by
+令 $V$ 为构建目标集，并令 $D\subseteq V\times V$ 为关系“$a$ 链接 $b$”（即\ $a$ 与 $b$ 有 \texttt{target\_link\_libraries} 边缘）。定义 \texttt{level}: $V\rightarrow \mathbb{N}$ 通过
 
 \begin{table}[H]
 \centering
-\caption{Levels are total and equal the \texttt{add\_subdirectory} order.}
+\caption{级别为总级别并且等于 \texttt{add\_subdirectory} 顺序。}
 \label{tab:levels}
 \small
 \begin{tabular}{clcl}
 \toprule
-Level & Target & \texttt{add\_subdirectory} line & Header import allowed from higher \\
+等级 & 目标 & \texttt{add\_subdirectory} 线 & 允许从更高层导入标头 \\
 \midrule
-0 & \texttt{p10} & & No lower target exists \\
-1 & \texttt{tpx} & & May include \texttt{*.h} \\
-2 & \texttt{stax} & & May include \texttt{include}, \texttt{include} \\
-3 & \texttt{\_C} / \texttt{tp\_python} &, \texttt{1106} & May include \texttt{p10}, \texttt{tpx}, \texttt{stax} \\
+0 & \texttt{p10} &  & 不存在更低的目标 \\
+1 & \texttt{tpx} &  & 可能包括 \texttt{*.h} \\
+2 & \texttt{stax} &  & 可能包括 \texttt{include}、\texttt{include} \\
+3 & \texttt{\_C} / \texttt{tp\_python} & , \texttt{1106} & 可能包括 \texttt{p10}、\texttt{tpx}、\texttt{stax} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Axiom (level monotonic): $\forall (a,b)\in D,\; \mathrm{level}(a) > \mathrm{level}(b)$.
+公理（水平单调）：$\forall (a,b)\in D,\; \mathrm{level}(a) > \mathrm{level}(b)$。
 
-Equivalently, every edge points strictly downward in the order \texttt{p10=0 < tpx=1 < stax=2 < \_C=3}. Table~\ref{tab:levels} shows that \texttt{D} contains only \texttt{(tpx,p10)}, \texttt{(stax,p10)}, \texttt{(stax,tpx)}, \texttt{(tp\_python,p10)}, \texttt{(\_C,p10)}, \texttt{(\_C,tpx)}, \texttt{(\_C,stax)}, \texttt{(\_C,tp\_python)}, each satisfying the strict inequality. No pair with \texttt{level}(a) $\le$ \texttt{level}(b) is present; in particular \texttt{(p10,tpx)} and \texttt{(p10,stax)} are absent.
+同样，每个边都严格按照 \texttt{p10=0 < tpx=1 < stax=2 < \_C=3} 的顺序向下指向。表~\ref{tab:levels}表明\texttt{D}仅包含\texttt{(tpx,p10)}、\texttt{(stax,p10)}、\texttt{(stax,tpx)}、\texttt{(tp\_python,p10)}、\texttt{(\_C,p10)}、\texttt{(\_C,tpx)}、\texttt{(\_C,stax)}、\texttt{(\_C,tp\_python)}，每个都满足严格的不等式。不存在与 \texttt{level}(a) $\le$ \texttt{level}(b) 的配对；特别是 \texttt{(p10,tpx)} 和 \texttt{(p10,stax)} 不存在。
 
-The enforcement is by the linker, not by convention. Adding \texttt{AutogradMeta.h"} inside any \texttt{Tensor*.h} introduces a reference to \texttt{tensorplay::tpx::AutogradMeta::requires\_grad} whose definition lives in \texttt{libtpx.so}. Because \texttt{p10} does not link \texttt{tpx} (and must not, by the axiom), the link of \texttt{libp10.so} succeeds but the link of any consumer that does link \texttt{p10} alone fails with \texttt{undefined reference to tensorplay::tpx::AutogradMeta}. On Linux this is diagnosed during \texttt{cmake --build}; on Windows it is diagnosed the \texttt{link.exe} step for \texttt{\_C.pyd}. The alternative failure mode for a conventional monolithic framework would be a static-initialization order defect diagnosed only at program startup.
+强制执行是由链接器执行的，而不是按照惯例。在任何 \texttt{Tensor*.h} 中添加 \texttt{AutogradMeta.h"} 会引入对 \texttt{tensorplay::tpx::AutogradMeta::requires\_grad} 的引用，该 \texttt{tensorplay::tpx::AutogradMeta::requires\_grad} 的定义位于 \texttt{libtpx.so} 中。因为 \texttt{p10} 不链接 \texttt{tpx}（根据公理，也不能链接），所以 \texttt{libp10.so} 的链接会成功，但任何单独链接 \texttt{p10} 的使用者的链接都会因 \texttt{undefined reference to tensorplay::tpx::AutogradMeta} 而失败。在 Linux 上，这是在 \texttt{cmake --build} 期间诊断的；在 Windows 上，诊断为 \texttt{\_C.pyd} 的 \texttt{link.exe} 步骤。传统整体框架的替代故障模式是仅在程序启动时诊断的静态初始化顺序缺陷。
 
-The axiom also determines rebuild granularity. Touching \texttt{ActivationKernels.cpp} dirties only \texttt{p10} and the final link of \texttt{\_C}; \texttt{tpx} and \texttt{stax} are not rebuilt because they do not depend on \texttt{p10} sources, only on its installed headers. Touching \texttt{Engine.cpp} rebuilds \texttt{tpx} and relinks \texttt{stax} and \texttt{\_C} but not \texttt{p10}. 
-A corollary concerns \texttt{tp\_python}. At it is a \texttt{SHARED} library \texttt{CPythonBridge.cpp} that links only \texttt{p10} and \texttt{pybind11}. It exists for exactly one reason documented the pybind11 caster substrate and the wrap-identity cache must be registered from a single module boundary. If \texttt{CPythonBridge.cpp} were compiled separately inside \texttt{p10} and inside \texttt{\_C}, each copy would carry its own registry and the first \texttt{Tensor} returned to Python would segfault. The single shared copy at level~3 keeps \texttt{level(tp\_python)=3 > level(p10)=0} and still allows out-of-tree op modules to link the same substrate via \texttt{add\_tensorplay\_op} without recompiling the core.
+该公理还决定了重建粒度。触摸 \texttt{ActivationKernels.cpp} 只会弄脏 \texttt{p10} 和 \texttt{\_C} 的最后一个链接； \texttt{tpx} 和 \texttt{stax} 不会重建，因为它们不依赖于 \texttt{p10} 源，仅依赖于其安装的标头。触摸 \texttt{Engine.cpp} 会重建 \texttt{tpx} 并重新链接 \texttt{stax} 和 \texttt{\_C}，但不会重新链接 \texttt{p10}。 
+一个推论涉及\texttt{tp\_python}。它是一个 \texttt{SHARED} 库 \texttt{CPythonBridge.cpp}，仅链接 \texttt{p10} 和 \texttt{pybind11}。它的存在正是出于一个原因，记录了 pybind11 Caster 基底和包装身份缓存必须从单个模块边界注册。如果 \texttt{CPythonBridge.cpp} 在 \texttt{p10} 和 \texttt{\_C} 中分别编译，则每个副本都将携带自己的注册表，并且返回到 Python 的第一个 \texttt{Tensor} 将出现段错误。第~3级的单个共享副本保留\texttt{level(tp\_python)=3 > level(p10)=0}，并且仍然允许树外操作模块通过\texttt{add\_tensorplay\_op}链接相同的底层，而无需重新编译核心。
 
-\begin{tpnote}[Note: Why a Corollary Library at All?]
-The \texttt{tp\_python} split looks redundant---two shared libraries from the same directory, one thin shim. It exists because of a C-level identity requirement: \texttt{pybind11}'s type caster registry is keyed by the address of the translation unit that first registers the caster. Duplicated registrations across \texttt{p10} and \texttt{\_C} would create two distinct \texttt{Tensor} Python types whose pointers never compare equal, so a tensor that crossed the boundary once would be wrapped anew on every subsequent call. Housing the caster substrate in exactly one shared object at makes pointer identity survive arbitrary call sequences. The cost is one extra \texttt{dlopen} at import time (\S\ref{sec:eval} measures it at $\sim$1\,ms).
-\end{tpnote}
-
-\begin{tpinsight}[Insight: The Axiom Is Enforced by the Linker, Not by Review]
-Every readability project promises ``clean layering''; most deliver it as a convention that erodes under deadline pressure. TensorPlay's axiom survives because violating it produces a \emph{link error}, not a style-comment: an upward \texttt{\#include} inside \texttt{p10} leaves an undefined reference to a symbol that only \texttt{libtpx.so} defines, and the link of the next consumer fails. Convention-based layering degrades silently; linker-based layering degrades loudly. The vacated-source line shows the mechanism working in reverse---metadata that once violated the axiom was physically moved out of \texttt{p10}, leaving a comment as the record.
-\end{tpinsight}
-
-\subsection{Python Veneer: Three Dirty Jobs in 1,197 Lines}
+\subsection{Python Veneer：1,197 行中的三项肮脏工作}
 \label{sec:veneer}
 
-\texttt{\_\_init\_\_.py} is 1,197 lines and, together with \texttt{\_tensor.py}, constitutes the entire Python-level design that the compiled extension cannot express. Every other Python module (\texttt{nn}, \texttt{optim}, \texttt{autograd}, \texttt{functional}, \texttt{distributed}) ultimately re-enters \texttt{\_C}. Three concerns are impossible to implement cleanly in C++ and are therefore concentrated here.
+\texttt{\_\_init\_\_.py} 有 1,197 行，与 \texttt{\_tensor.py} 一起构成了编译后的扩展无法表达的整个 Python 级别的设计。所有其他 Python 模块（\texttt{nn}、\texttt{optim}、\texttt{autograd}、\texttt{functional}、\texttt{distributed}）最终都会重新进入 \texttt{\_C}。三个问题不可能在 C++ 中干净地实现，因此集中在这里。
 
-\subsubsection{Job 1: DLL / Shared-Object Preload (lines 34--205)}
-Described in \S\ref{sec:arch:rpath}, this job handles the divergence between the Linux loader (which respects \texttt{RPATH}) and the Windows loader (which ignores it). On Windows the job is mandatory; on Linux it is an opportunistic repair for CUDA wheels. The code is split at line~34 and line~143 with no overlap, so a reader can inspect one platform without understanding the other. The job is the only place that imports \texttt{ctypes} and \texttt{glob}; no kernel or engine file references either.
+\subsubsection{作业 1：DLL/共享对象预加载（第 34--205 行）}
+如 \S\ref{sec:arch:rpath} 中所述，此作业处理 Linux 加载程序（尊重 \texttt{RPATH}）和 Windows 加载程序（忽略它）之间的差异。在 Windows 上，该工作是强制性的；在 Linux 上，这是对 CUDA 轮子的机会性修复。代码在第 34 行和第 143 行分开，没有重叠，因此读者可以检查一个平台而无需了解另一个平台。该工作是唯一导入 \texttt{ctypes} 和 \texttt{glob} 的地方；也没有内核或引擎文件引用。
 
-\subsubsection{Job 2: Symbol Renaming (\texttt{\_C.add} $\rightarrow$ \texttt{tensorplay.add})}
+\subsubsection{作业 2：符号重命名 (\texttt{\_C.add} $\rightarrow$ \texttt{tensorplay.add})}
 
-The extension exports every operator as \texttt{\_C.add}, \texttt{\_C.relu}, \texttt{\_C.conv2d} at their C++ names. The veneer re-exports them as flat \texttt{tensorplay.*} names and rewrites \texttt{\_\_module\_\_} so tracebacks and \texttt{help(tensorplay.add)} report the public location. The loop is:
+该扩展将每个运算符的 C++ 名称导出为 \texttt{\_C.add}、\texttt{\_C.relu}、\texttt{\_C.conv2d}。胶合板将它们重新导出为平面 \texttt{tensorplay.*} 名称并重写 \texttt{\_\_module\_\_}，以便回溯和 \texttt{help(tensorplay.add)} 报告公共位置。循环是：
 
 \begin{lstlisting}[caption={renaming with builtin fallback.}, label=lst:renaming]
 __attr_name, __obj = "", None
@@ -415,13 +407,13 @@ for __attr_name in dir(_C):
                 globals()[__attr_name] = __obj
 \end{lstlisting}
 
-The \texttt{except} exists because pybind11 functions are \texttt{builtin\_function\_or\_method} descriptors whose \texttt{\_\_module\_\_} attribute is read-only in CPython; the fallback wrapper preserves \texttt{inspect.signature} via \texttt{functools.wraps} while fixing \texttt{\_\_module\_\_} to \texttt{"tensorplay"}. Without this job, users would call \texttt{tensorplay.\_C.add} or see tracebacks mentioning \texttt{tensorplay.\_C} instead of \texttt{tensorplay}.
+\texttt{except} 存在是因为 pybind11 函数是 \texttt{builtin\_function\_or\_method} 描述符，其 \texttt{\_\_module\_\_} 属性在 CPython 中是只读的；后备包装器通过 \texttt{functools.wraps} 保留 \texttt{inspect.signature}，同时将 \texttt{\_\_module\_\_} 固定为 \texttt{"tensorplay"}。如果没有这项工作，用户将调用 \texttt{tensorplay.\_C.add} 或看到回溯提及 \texttt{tensorplay.\_C} 而不是 \texttt{tensorplay}。
 
-The tensor type itself is finished here: defines \texttt{Tensor = \_C.TensorBase} and then attaches methods (\texttt{t}, \texttt{type}, \texttt{cuda}, \texttt{cpu}, \texttt{long}, \texttt{float}, plus hooks, bitwise dunders, \texttt{permute}, \texttt{expand}, \texttt{unique}, \texttt{topk}) onto that alias. The C++ binding at \texttt{Tensor.cpp} uses \texttt{py::dynamic\_attr} on \texttt{TensorBase} so Python subclasses like \texttt{class MyTensor(Tensor)} can attach per-instance attributes while still being recognized by the native caster. The check is \texttt{py::isinstance< Tensor >(obj)} via the shared caster in \texttt{tp\_python}.
+张量类型本身在这里完成：定义 \texttt{Tensor = \_C.TensorBase} ，然后将方法（\texttt{t}、\texttt{type}、\texttt{cuda}、\texttt{cpu}、\texttt{long}、\texttt{float}，加上钩子、按位 dunders、\texttt{permute}、\texttt{expand}、\texttt{unique}、\texttt{topk}）附加到该别名上。 \texttt{Tensor.cpp} 处的 C++ 绑定在 \texttt{TensorBase} 上使用 \texttt{py::dynamic\_attr}，因此像 \texttt{class MyTensor(Tensor)} 这样的 Python 子类可以附加每个实例的属性，同时仍能被本机施法者识别。通过 \texttt{tp\_python} 中的共享施法者进行检查 \texttt{py::isinstance< Tensor >(obj)}。
 
-\subsubsection{Job 3: Lazy Subpackages via \texttt{\_\_getattr\_\_} (lines 1118--1134)}
+\subsubsection{作业 3：通过 \texttt{\_\_getattr\_\_} 进行惰性子包（第 1118--1134 行）}
 
-A direct \texttt{import tensorplay.linalg} at veneer top level would force importing 354 modules on every \texttt{import tensorplay}, adding hundreds of milliseconds on import even for scripts that only use \texttt{tensorplay.tensor([1])}. Instead the veneer registers a lazy set:
+在单板顶层直接使用 \texttt{import tensorplay.linalg} 将强制在每个 \texttt{import tensorplay} 上导入 354 个模块，即使对于仅使用 \texttt{tensorplay.tensor([1])} 的脚本，导入时间也会增加数百毫秒。相反，胶合板注册了一个惰性集：
 
 \begin{lstlisting}[caption={lazy subpackages.}, label=lst:lazy]
 else:
@@ -442,31 +434,31 @@ else:
         raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 \end{lstlisting}
 
-\texttt{\_\_getattr\_\_} is the module-level hook introduced in Python~3.7. It is only invoked for missing attributes, so known names like \texttt{tensorplay.Tensor} or \texttt{tensorplay.add} never enter this path. Under \texttt{TYPE\_CHECKING} (true for static analysis only, false at runtime) the veneer instead imports \texttt{export} and \texttt{func} eagerly at lines~1108--1115 so that pylance and other LSP servers resolve attributes without executing the lazy hook. The accompanying \texttt{TYPE\_CHECKING} import is guarded by \texttt{if TYPE\_CHECKING:} and has no runtime cost.
+\texttt{\_\_getattr\_\_} 是Python~3.7 中引入的模块级钩子。它仅在缺少属性时调用，因此 \texttt{tensorplay.Tensor} 或 \texttt{tensorplay.add} 等已知名称永远不会进入此路径。在 \texttt{TYPE\_CHECKING} 下（仅静态分析为 true，运行时为 false），胶合板改为在第 1108--1115 行急切地导入 \texttt{export} 和 \texttt{func}，以便 pylance 和其他 LSP 服务器解析属性而不执行惰性挂钩。随附的 \texttt{TYPE\_CHECKING} 导入由 \texttt{if TYPE\_CHECKING:} 保护，并且没有运行时成本。
 
 \begin{table}[H]
 \centering
-\caption{The three dirty jobs: location, mechanism, and the single alternative that was rejected.}
+\caption{三项肮脏的工作：地点、机制和被拒绝的单一替代方案。}
 \label{tab:threedirty}
 \small
 \begin{tabular}{p{2.0cm}p{3.2cm}p{3.6cm}p{3.4cm}}
 \toprule
-Job & Lines & Mechanism & Rejected alternative \\
+Job & 线路 & 机制 & 被拒绝的替代方案 \\
 \midrule
-DLL preload & & \texttt{LoadLibraryExW}, \texttt{ctypes.CDLL}, \texttt{add\_dll\_directory} & Windows \texttt{RPATH} (does not exist) \\
-Symbol rename & & \texttt{\_\_module\_\_} rewrite + \texttt{functools.wraps} wrapper & Rename in C++ (breaks \texttt{dir(\_C)} introspection) \\
-Lazy packages & & \texttt{\_lazy\_modules} + \texttt{\_\_getattr\_\_} & Eager \texttt{import linalg} (adds import latency) \\
-Tensor alias & \texttt{Tensor = \_C.TensorBase} & \texttt{py::dynamic\_attr} subclassing & Duplicate Python class (breaks caster identity) \\
+DLL预加载 &  & \texttt{LoadLibraryExW}, \texttt{ctypes.CDLL}, \texttt{add\_dll\_directory} & Windows \texttt{RPATH}（不存在） \\
+符号重命名 &  & \texttt{\_\_module\_\_} 重写 + \texttt{functools.wraps} 包装器 & 在 C++ 中重命名（破坏 \texttt{dir(\_C)} 自省） \\
+懒包 &  & \texttt{\_lazy\_modules} + \texttt{\_\_getattr\_\_} & Eager \texttt{import linalg} （增加导入延迟） \\
+张量别名 & \texttt{Tensor = \_C.TensorBase} & \texttt{py::dynamic\_attr} 子类化 & 重复的 Python 类（破坏施法者身份） \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Together these three jobs are the only Python-side complexity with cross-cutting impact. Everything else in \texttt{\_\_init\_\_.py} is declarative: \texttt{DType} aliases at lines~230--259, \texttt{MemoryFormat} / \texttt{Layout} / \texttt{QScheme} enumerations at lines~264--305, \texttt{max}/\texttt{min}/\texttt{gradient} wrappers at lines~1038--1075, and the \texttt{\_\_all\_\_} extension at lines~336--369 that enumerates 550+ operators with a sorted contract.
+这三个工作加在一起是唯一具有跨领域影响的 Python 端复杂性。 \texttt{\_\_init\_\_.py} 中的其他内容都是声明性的： \texttt{DType} 别名位于第 230--259 行， \texttt{MemoryFormat} / \texttt{Layout} / \texttt{QScheme} 枚举位于第 264--305 行， \texttt{max}/\texttt{min}/\texttt{gradient} 包装器位于第 1038--1075 行，以及 \texttt{\_\_all\_\_} 扩展位于第 336--369 行枚举 550 多个具有排序合约的运算符。
 
-\subsection{Stax: Minimal IR That Is Not a Second Frontend}
+\subsection{Stax：最小 IR，不是第二个前端}
 \label{sec:arch:stax}
 
-\texttt{stax} is 76 lines of CMake at producing \texttt{libstax.so} from \texttt{*.cpp}. Its public surface is two headers: and. The design note is explicit:
+\texttt{stax} 是 CMake 的 76 行，用于从 \texttt{*.cpp} 生成 \texttt{libstax.so}。它的公共表面是两个标头：和。设计说明很明确：
 
 \begin{lstlisting}[caption={not a second frontend.}, label=lst:staxpy]
 """Stax backend namespace.
@@ -478,7 +470,7 @@ and optimizer development.
 from ._stax.stax import stax
 \end{lstlisting}
 
- defines a \texttt{ValueNode} as ``producer plus slot'':
+将 \texttt{ValueNode} 定义为“生产者加槽”：
 
 \begin{lstlisting}[caption={values are slots.}, label=lst:valuenode]
 struct STAX_API ValueNode {
@@ -493,38 +485,30 @@ struct STAX_API ValueNode {
 };
 \end{lstlisting}
 
-\texttt{OpNode} at groups inputs, outputs, owning graph, and attributes through a \texttt{variant<int64\_t, double, string, vector<int64\_t>, vector<double>>} map at line~62. \texttt{Graph} at owns the \texttt{nodes} and \texttt{values} vectors plus the \texttt{inputs} / \texttt{outputs} boundaries, with helpers \texttt{addInput}, \texttt{createNode}, and \texttt{registerOutput} at lines~95--97. The \texttt{IRBuilder} helper at creates named nodes and propagates dtype from the first input.
+\texttt{OpNode} 通过第 62 行的 \texttt{variant<int64\_t, double, string, vector<int64\_t>, vector<double>>} 映射对输入、输出、所属图和属性进行分组。 \texttt{Graph} at 拥有 \texttt{nodes} 和 \texttt{values} 向量以及 \texttt{inputs} / \texttt{outputs} 边界，在第 95--97 行有辅助函数 \texttt{addInput}、\texttt{createNode} 和 \texttt{registerOutput}。 \texttt{IRBuilder} 帮助器创建命名节点并从第一个输入传播 dtype。
 
-Execution is strictly sequential. \texttt{Graph::execute} binds concrete \texttt{Tensor} arguments to \texttt{env[ input->id ]} at line~192, then iterates \texttt{nodes} in creation order. Each node dispatches to \texttt{tpx::ops} (e.g.\ \texttt{add}, \texttt{conv2d}, \texttt{matmul}, \texttt{max\_pool2d}, \texttt{batch\_norm}) via the regular dispatcher, preserving device and differentiation semantics. Intermediate lifetimes are bounded by \texttt{remaining\_uses} at line~198 and \texttt{keep\_alive} at line~199; dead values are cleared via \texttt{env[id]=Tensor} at line~215, allowing the allocator to recycle storage inside a single graph run without retaining every intermediate until the function returns.
+执行是严格顺序的。 \texttt{Graph::execute} 在第 192 行将具体的 \texttt{Tensor} 参数绑定到 \texttt{env[ input->id ]}，然后按创建顺序迭代 \texttt{nodes}。每个节点通过常规调度程序调度到 \texttt{tpx::ops} （例如\ \texttt{add}、\texttt{conv2d}、\texttt{matmul}、\texttt{max\_pool2d}、\texttt{batch\_norm}），保留设备和区分语义。中间生命周期由~198行的\texttt{remaining\_uses}和~199行的\texttt{keep\_alive}界定；死值通过第 215 行的 \texttt{env[id]=Tensor} 清除，允许分配器回收单个图形运行中的存储，而无需保留每个中间值，直到函数返回。
 
- adds the only optimization: a pass infrastructure with a single registered pass that fuses \texttt{mul} followed by \texttt{add} into \texttt{fused\_mul\_add} (a single kernel in \texttt{p10}). The registry is a \texttt{map<string, Creator>}, and \texttt{fuseGraph} at line~73 is retained for compatibility. There is no alias analysis, no layout propagation, no autotuning, no code generation to C++/CUDA/PTX, and no persistence format beyond the in-memory \texttt{Graph}.
+添加了唯一的优化：具有单个注册通道的通道基础结构，将 \texttt{mul} 和 \texttt{add} 融合到 \texttt{fused\_mul\_add} （\texttt{p10} 中的单个内核）。注册表是 \texttt{map<string, Creator>}，为了兼容而保留第 73 行的 \texttt{fuseGraph}。没有别名分析、没有布局传播、没有自动调整、没有 C++/CUDA/PTX 代码生成，也没有内存中 \texttt{Graph} 之外的持久格式。
 
 \begin{table}[H]
 \centering
-\caption{Stax IR: what is present versus deliberately absent. Every absent row is a \texttt{Composite} fallback through \texttt{tpx::ops}.}
+\caption{Stax IR：存在的内容与故意缺席的内容。每个缺失的行都是 \texttt{Composite} 到 \texttt{tpx::ops} 的回退。}
 \label{tab:staxscope}
 \small
 \begin{tabular}{p{3.6cm}p{4.4cm}p{3.8cm}}
 \toprule
-Category & Present in \texttt{stax} & Intentionally absent \\
+类别 & 目前在 \texttt{stax} & 故意缺席 \\
 \midrule
-IR nodes & \texttt{ValueNode} / \texttt{OpNode}, sequential \texttt{execute} & No \texttt{Block}, no \texttt{Function}, no first-class control flow \\
-Ops & \texttt{div}, \texttt{t}, \texttt{relu}, \texttt{max\_pool2d}, \texttt{flatten} & No quantized/sparse/custom dispatch keys \\
-Passes & One vertical pointwise fusion (\texttt{fused\_mul\_add}) & No loop fusion, no layout planner, no vectorization policy \\
-Backend & Re-enters \texttt{tpx::ops} so device/differentiation stay correct & No standalone code generator (\texttt{tensorplay.compile} is the entry) \\
-Custom ops & \texttt{custom\_op} node + \texttt{setCustomOpExecutor} at \texttt{Graph.cpp} & No user-visible IR builder for custom ops (use eager ops) \\
+红外节点 & \texttt{ValueNode} / \texttt{OpNode}，顺序 \texttt{execute} & 没有\texttt{Block}，没有\texttt{Function}，没有一流的控制流 \\
+Ops & \texttt{div}, \texttt{t}, \texttt{relu}, \texttt{max\_pool2d}, \texttt{flatten} & 没有量化/稀疏/自定义调度键 \\
+通行证 & 一次垂直逐点融合 (\texttt{fused\_mul\_add}) & 没有循环融合，没有布局规划器，没有矢量化策略 \\
+后端 & 重新输入 \texttt{tpx::ops} 以便设备/区分保持正确 & 没有独立的代码生成器（\texttt{tensorplay.compile} 是条目） \\
+定制操作 & \texttt{custom\_op} 节点 + \texttt{setCustomOpExecutor} 位于 \texttt{Graph.cpp} & 没有用于自定义操作的用户可见的 IR 构建器（使用 eager ops） \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The intended consumer is not a Python author writing \texttt{stax.Graph} directly but the higher-level entry \texttt{tensorplay.compile(backend="stax")} referenced. A researcher prototyping a new fusion pattern writes against \texttt{Graph} in C++, registers a \texttt{Pass} through \texttt{REGISTER\_STAX\_PASS}, and exercises it through \texttt{tensorplay.\_C.\_stax} without changing the user-facing \texttt{compile} contract.
+目标消费者不是直接编写 \texttt{stax.Graph} 的 Python 作者，而是引用的更高级别条目 \texttt{tensorplay.compile(backend="stax")}。开发新融合模式原型的研究人员用 C++ 编写 \texttt{Graph}，通过 \texttt{REGISTER\_STAX\_PASS} 注册 \texttt{Pass}，并通过 \texttt{tensorplay.\_C.\_stax} 执行它，而无需更改面向用户的 \texttt{compile} 合约。
 
-\subsection{Design Trade-offs}
-\label{sec:arch:tradeoffs}
-
-\textbf{Virtual interface vs.\ union payload.} The USB slot could instead be a \texttt{std::variant} or a raw byte blob inside \texttt{p10} with \texttt{tpx} writing into it. Rejected: a variant forces \texttt{p10} headers to enumerate every future metadata layout, so adding a field recompiles the world, and a byte blob abandons type safety the seam that matters most. The virtual interface at costs one vtable indirection but keeps the two libraries compilably independent---\texttt{p10} rebuilds are never triggered by autograd changes.
-
-\textbf{\texttt{\$ORIGIN} RPATH vs.\ installed loader config.} Absolute RPATHs or \texttt{ldconfig} entries would remove the preload logic in. Rejected: absolute paths break relocatability (the tree must run unmodified from any checkout or a USB stick), and system loader config requires root. \texttt{\$ORIGIN} at makes the tree position-independent the price of the Windows branch needing an explicit ordered \texttt{LoadLibraryExW} walk, documented in \S\ref{sec:arch:rpath}.
-
-\textbf{One Python veneer file (1\,197 lines) vs.\ package layout.} Splitting \texttt{\_\_init\_\_.py} into submodules would shorten the file. Rejected: the three ``dirty jobs'' (preload, symbol rename, lazy subpackages) must execute in a strict order before any subpackage import resolves, and a single module makes that ordering linear and greppable (\S\ref{sec:arch} Job 1--3). The cost is one long file; the benefit is that import-order bugs have a single stack trace through one file.
 

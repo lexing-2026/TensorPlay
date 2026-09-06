@@ -8,7 +8,7 @@
 
 #include "../api/Context.h"
 
-#include <cmath>
+#include <cstdint>
 #include <optional>
 #include <vector>
 
@@ -16,20 +16,63 @@ namespace tensorplay {
 namespace vulkan {
 namespace ops {
 
+using namespace api::utils;
+
 namespace {
 
 //
-// Random fill for Vulkan tensors.  The random stream comes from the host
-// generator: values are drawn with exactly the same formulas the CPU
-// kernels use (24-bit-mantissa uniforms, Box-Muller normals), so a given
-// seed yields the same stream regardless of which backend receives the
-// call.  The payload is then streamed into the GPU texture through the
-// staging pipeline, which handles every supported VkFormat.
+// Random fill for Vulkan tensors.
 //
-// A shader-side Philox path also exists for element-wise draws, but the
-// host stream keeps one canonical generator story for the backend and
-// avoids splitting the seed state between host and device.
+// The draws happen on the device: a counter-based Philox stream derives every
+// element's words from (key, offset, invocation id), so nothing is generated
+// on the host and nothing is uploaded.  One texel carries four elements and
+// one Philox call yields four words, so each channel lane consumes its own
+// word.
 //
+// The host generator stays the single source of entropy: each call draws the
+// Philox key and offset from it, which advances its state exactly as a host
+// fill would.  A seeded run therefore reproduces the same tensors, and two
+// calls in a row never repeat a stream.
+//
+
+struct RandomFillBlock final {
+  uvec3 extents;
+  uint32_t extents_fill;
+  float from;  // uniform lower bound / bernoulli probability
+  float to;    // uniform upper bound / normal mean
+  float std;   // normal standard deviation
+  uint32_t seed_lo;
+  uint32_t seed_hi;
+  uint32_t offset;
+  uint32_t fill;
+};
+
+struct BernoulliTensorBlock final {
+  uvec3 extents;
+  uint32_t extents_fill;
+  uint32_t seed_lo;
+  uint32_t seed_hi;
+  uint32_t offset;
+  uint32_t fill;
+};
+
+struct StreamKey final {
+  uint32_t seed_lo;
+  uint32_t seed_hi;
+  uint32_t offset;
+};
+
+// One key per call, drawn from the host generator so its state advances and a
+// seeded run stays reproducible.
+StreamKey next_stream_key(std::optional<Generator>& generator) {
+  Generator& gen = generator.has_value() ? *generator : default_generator();
+  const uint64_t key = gen.random64();
+  return StreamKey{
+      static_cast<uint32_t>(key & 0xffffffffULL),
+      static_cast<uint32_t>(key >> 32),
+      gen.random(),
+  };
+}
 
 void validate_random_target(const Tensor& t, const char* name) {
   TP_CHECK(
@@ -43,44 +86,37 @@ void validate_random_target(const Tensor& t, const char* name) {
       std::string("Vulkan ") + name + " supports 1d to 4d tensors");
 }
 
-// Reuploads the whole payload after the host wrote fresh values into a
-// staging tensor with the texture-linear layout.
-void upload_payload(api::vTensor& v, Tensor& host_packed) {
-  utils::upload_host_bytes(
-      v,
-      host_packed.impl()->storage().data(),
-      host_packed.numel() * host_packed.itemsize());
-}
+// Shared dispatch for the three nullary distributions; `from`, `to` and `std`
+// carry whichever parameters the selected variant reads.
+void dispatch_random_fill(
+    Tensor& self,
+    const api::ShaderInfo& shader,
+    float from,
+    float to,
+    float std,
+    std::optional<Generator>& generator) {
+  api::Context* const context = api::context();
+  api::vTensor v = convert(self);
+  const StreamKey key = next_stream_key(generator);
 
-//
-// Scatters logical-order values into the texture-linear staging buffer:
-// texture plane (z = batch * ceil(C/4) + channel/4) holds the four channel
-// lanes of one spatial position, mirroring the nchw packing used by the
-// staging copy pipeline.  Padding lanes stay zero and are never read back.
-//
-void pack_logical_into_staging(
-    const api::vTensor& v,
-    const float* logical,
-    Tensor& host) {
-  const int64_t N = get_dim<Dim4D::Batch>(v.sizes());
-  const int64_t C = get_dim<Dim4D::Channel>(v.sizes());
-  const int64_t H = get_dim<Dim4D::Height>(v.sizes());
-  const int64_t W = get_dim<Dim4D::Width>(v.sizes());
-  const int64_t c_depth = (C + 3) / 4;
+  const RandomFillBlock block{
+      v.extents(), 0u, from, to, std,
+      key.seed_lo, key.seed_hi, key.offset, 0u,
+  };
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
 
-  float* data = host.data_ptr<float>();
-  for (int64_t n = 0; n < N; ++n) {
-    for (int64_t c = 0; c < C; ++c) {
-      const int64_t z = n * c_depth + c / 4;
-      const int64_t lane = c % 4;
-      for (int64_t h = 0; h < H; ++h) {
-        for (int64_t w = 0; w < W; ++w) {
-          data[((z * H + h) * W + w) * 4 + lane] =
-              logical[((n * C + c) * H + h) * W + w];
-        }
-      }
-    }
-  }
+  context->submit_compute_job(
+      shader,
+      pipeline_barrier,
+      v.extents(),
+      adaptive_work_group_size(v.extents()),
+      VK_NULL_HANDLE,
+      v.image(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      params.buffer());
 }
 
 } // namespace
@@ -99,26 +135,9 @@ Tensor& uniform_kernel(
   if (self.numel() == 0) {
     return self;
   }
-
-  api::Context* const context = api::context();
-  api::vTensor v = convert(self);
-
-  // Draw the stream on the host in logical order, matching the CPU kernel's
-  // sampling formula element for element, then scatter into the
-  // texture-linear staging layout.
-  Tensor host = utils::create_staging_tensor(v);
-  const int64_t n = self.numel();
-  std::vector<float> logical(static_cast<size_t>(n));
-  Generator& gen = generator.has_value() ? *generator : default_generator();
-  for (int64_t i = 0; i < n; ++i) {
-    const uint32_t r = gen.random();
-    const double x = (r & ((1u << 24) - 1)) * std::ldexp(1.0, -24);
-    logical[static_cast<size_t>(i)] =
-        static_cast<float>(x * (to - from) + from);
-  }
-
-  pack_logical_into_staging(v, logical.data(), host);
-  upload_payload(v, host);
+  dispatch_random_fill(
+      self, VK_KERNEL(uniform_fill), static_cast<float>(from),
+      static_cast<float>(to), 0.0f, generator);
   return self;
 }
 
@@ -135,35 +154,10 @@ Tensor& normal_kernel(
   if (self.numel() == 0) {
     return self;
   }
-
-  api::Context* const context = api::context();
-  api::vTensor v = convert(self);
-
-  Tensor host = utils::create_staging_tensor(v);
-  const int64_t n = self.numel();
-  std::vector<float> logical(static_cast<size_t>(n));
-  float* data = logical.data();
-  Generator& gen = generator.has_value() ? *generator : default_generator();
-
-  // Box-Muller over 24-bit-mantissa uniforms, matching the CPU path's
-  // distribution.  Pairs are consumed sequentially; an odd element count
-  // discards the second draw of the final pair.
-  constexpr double kTwoPi = 6.283185307179586476925286766559;
-  for (int64_t i = 0; i < n; i += 2) {
-    const double u1 = 1.0 - ((gen.random() & ((1u << 24) - 1)) *
-        std::ldexp(1.0, -24)); // (0, 1]
-    const double u2 = (gen.random() & ((1u << 24) - 1)) *
-        std::ldexp(1.0, -24); // [0, 1)
-    const double r = std::sqrt(-2.0 * std::log(u1));
-    const double theta = kTwoPi * u2;
-    data[i] = static_cast<float>(mean + std * r * std::cos(theta));
-    if (i + 1 < n) {
-      data[i + 1] = static_cast<float>(mean + std * r * std::sin(theta));
-    }
-  }
-
-  pack_logical_into_staging(v, data, host);
-  upload_payload(v, host);
+  // The normal variant reads the mean from `to` and the spread from `std`.
+  dispatch_random_fill(
+      self, VK_KERNEL(normal_fill), 0.0f, static_cast<float>(mean),
+      static_cast<float>(std), generator);
   return self;
 }
 
@@ -179,23 +173,10 @@ Tensor& bernoulli_scalar_kernel(
   if (self.numel() == 0) {
     return self;
   }
-
-  api::Context* const context = api::context();
-  api::vTensor v = convert(self);
-
-  Tensor host = utils::create_staging_tensor(v);
-  const int64_t n = self.numel();
-  std::vector<float> logical(static_cast<size_t>(n));
-  float* data = logical.data();
-  Generator& gen = generator.has_value() ? *generator : default_generator();
-  for (int64_t i = 0; i < n; ++i) {
-    const uint32_t r = gen.random();
-    const double u = (r & ((1u << 24) - 1)) * std::ldexp(1.0, -24);
-    data[i] = (u < p) ? 1.0f : 0.0f;
-  }
-
-  pack_logical_into_staging(v, data, host);
-  upload_payload(v, host);
+  // The bernoulli variant reads its probability from `from`.
+  dispatch_random_fill(
+      self, VK_KERNEL(bernoulli_fill), static_cast<float>(p), 0.0f, 0.0f,
+      generator);
   return self;
 }
 
@@ -211,28 +192,38 @@ Tensor& bernoulli_tensor_kernel(
       p.device().is_vulkan(),
       "Vulkan bernoulli_ expects p on the same device");
 
-  // Materialize p on the host once, then sample against it element-wise.
-  const Tensor p_host = p.to(Device(DeviceType::CPU)).contiguous();
-  const float* p_data = p_host.data_ptr<float>();
+  if (self.numel() == 0) {
+    return self;
+  }
+  if (p.numel() == 1 && p.shape() != self.shape()) {
+    // A single probability governs every element; the scalar variant needs no
+    // probability plane.
+    return bernoulli_scalar_kernel(self, p.item().toDouble(), generator);
+  }
 
   api::Context* const context = api::context();
   api::vTensor v = convert(self);
+  api::vTensor v_prob = convert(p);
+  const StreamKey key = next_stream_key(generator);
 
-  Tensor host = utils::create_staging_tensor(v);
-  const int64_t n = self.numel();
-  std::vector<float> logical(static_cast<size_t>(n));
-  float* data = logical.data();
-  Generator& gen = generator.has_value() ? *generator : default_generator();
-  const int64_t p_n = p_host.numel();
+  const BernoulliTensorBlock block{
+      v.extents(), 0u, key.seed_lo, key.seed_hi, key.offset, 0u,
+  };
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
 
-  for (int64_t i = 0; i < n; ++i) {
-    const uint32_t r = gen.random();
-    const double u = (r & ((1u << 24) - 1)) * std::ldexp(1.0, -24);
-    data[i] = (u < p_data[p_n == 1 ? 0 : i]) ? 1.0f : 0.0f;
-  }
-
-  pack_logical_into_staging(v, data, host);
-  upload_payload(v, host);
+  context->submit_compute_job(
+      VK_KERNEL(bernoulli_tensor_fill),
+      pipeline_barrier,
+      v.extents(),
+      adaptive_work_group_size(v.extents()),
+      VK_NULL_HANDLE,
+      v.image(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_prob.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
   return self;
 }
 

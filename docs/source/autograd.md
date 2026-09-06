@@ -5,7 +5,6 @@
 
 # Automatic differentiation package - tensorplay.autograd
 
-# Automatic differentiation package - torch.autograd
 
 ```{eval-rst}
 .. autosummary::

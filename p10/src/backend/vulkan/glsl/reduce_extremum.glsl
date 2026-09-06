@@ -58,7 +58,7 @@ void main() {
     // Channel: pos.z addresses (n * in_c_depth + c4) of the input and
     // (n * out_c_depth + c4) of the output.  All channels of the batch
     // collapse into one value per texel position.
-    const int n = pos.z / uBlock.in_c_depth;
+    const int n = pos.z / uBlock.out_c_depth;
     const vec4 lane_mask = vec4(lessThan(
         ivec4(0, 1, 2, 3), ivec4(uBlock.in_sizes.z)));
     const vec4 first_texel =
@@ -69,7 +69,9 @@ void main() {
          z < (n + 1) * uBlock.in_c_depth; ++z) {
       const vec4 v = mix(
           vec4(NEUTRAL), texelFetch(uInput, ivec3(pos.x, pos.y, z), 0),
-          lane_mask);
+          vec4(lessThan(
+              ivec4(0, 1, 2, 3) + (z - n * uBlock.in_c_depth) * 4,
+              ivec4(uBlock.in_sizes.z))));
       acc = OP(acc, v);
     }
     imageStore(

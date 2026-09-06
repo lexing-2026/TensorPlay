@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <vector>
 #include <memory>
 #include <string>
@@ -71,12 +72,17 @@ private:
     // component tensors are shared handles, so ordinary Tensor copies
     // (shape [sparse_dim, nnz]); CSR (2D only) stores row pointers in
     // `crow` (shape [rows+1]) and column coordinates in `col` (shape [nnz]).
+    // CSC stores column pointers in `crow` and row coordinates in `col`.
+    // BSR/BSC additionally store a 3-D values tensor of blocks and record
+    // the two block sizes in `blocksize`.
     struct SparseState {
-        int layout = 0;  // 0 = SparseCOO, 1 = SparseCSR
+        int layout = 0;  // 0 = SparseCOO, 1 = SparseCSR, 2 = SparseCSC,
+                         // 3 = SparseBSR, 4 = SparseBSC
         std::shared_ptr<TensorImpl> indices;
         std::shared_ptr<TensorImpl> values;
         std::shared_ptr<TensorImpl> crow;
         std::shared_ptr<TensorImpl> col;
+        std::array<int64_t, 2> blocksize = {0, 0};
         std::vector<int64_t> sparse_sizes;
         bool coalesced = false;
     };
@@ -97,6 +103,9 @@ private:
 public:
     static constexpr int kSparseCOOLayout = 0;
     static constexpr int kSparseCSRLayout = 1;
+    static constexpr int kSparseCSCLayout = 2;
+    static constexpr int kSparseBSRLayout = 3;
+    static constexpr int kSparseBSCLayout = 4;
     TensorImpl();
     TensorImpl(const std::vector<int64_t>& sizes, DType dtype, const Device& device = Device());
     // Sparse COO tensors need logical sizes and dtype/device metadata without
@@ -221,6 +230,32 @@ public:
 
     bool is_sparse() const { return sparse_state_ != nullptr; }
     int sparse_layout() const { return sparse_state_ ? sparse_state_->layout : kSparseCOOLayout; }
+    // Any of the compressed layouts (CSR/CSC/BSR/BSC).
+    bool is_sparse_compressed() const {
+        return sparse_state_ && sparse_state_->layout != kSparseCOOLayout;
+    }
+    // Row-compressed (CSR/BSR): the compressed axis enumerates rows.
+    bool is_sparse_row_compressed() const {
+        return sparse_state_ && (sparse_state_->layout == kSparseCSRLayout ||
+                                 sparse_state_->layout == kSparseBSRLayout);
+    }
+    bool is_sparse_csr() const {
+        return sparse_state_ && sparse_state_->layout == kSparseCSRLayout;
+    }
+    bool is_sparse_csc() const {
+        return sparse_state_ && sparse_state_->layout == kSparseCSCLayout;
+    }
+    bool is_sparse_bsr() const {
+        return sparse_state_ && sparse_state_->layout == kSparseBSRLayout;
+    }
+    bool is_sparse_bsc() const {
+        return sparse_state_ && sparse_state_->layout == kSparseBSCLayout;
+    }
+    // Block sizes for BSR/BSC; {0, 0} for the other layouts.
+    std::array<int64_t, 2> sparse_blocksize() const {
+        return sparse_state_ ? sparse_state_->blocksize
+                             : std::array<int64_t, 2>{0, 0};
+    }
     bool is_coalesced() const { return sparse_state_ && sparse_state_->coalesced; }
     std::shared_ptr<TensorImpl> sparse_indices_impl() const {
         return (sparse_state_ && sparse_state_->layout == kSparseCOOLayout)
@@ -229,12 +264,14 @@ public:
     std::shared_ptr<TensorImpl> sparse_values_impl() const {
         return sparse_state_ ? sparse_state_->values : nullptr;
     }
+    // Compressed-axis pointers (crow for CSR/BSR, ccol for CSC/BSC).
     std::shared_ptr<TensorImpl> sparse_crow_impl() const {
-        return (sparse_state_ && sparse_state_->layout == kSparseCSRLayout)
+        return (sparse_state_ && sparse_state_->layout != kSparseCOOLayout)
                    ? sparse_state_->crow : nullptr;
     }
+    // Plain-axis coordinates (col for CSR/BSR, row for CSC/BSC).
     std::shared_ptr<TensorImpl> sparse_col_impl() const {
-        return (sparse_state_ && sparse_state_->layout == kSparseCSRLayout)
+        return (sparse_state_ && sparse_state_->layout != kSparseCOOLayout)
                    ? sparse_state_->col : nullptr;
     }
     const std::vector<int64_t>& sparse_sizes() const {
@@ -262,15 +299,33 @@ public:
                               std::shared_ptr<TensorImpl> col,
                               std::shared_ptr<TensorImpl> values,
                               std::vector<int64_t> dense_sizes) {
+        set_sparse_compressed_state(std::move(crow), std::move(col),
+                                    std::move(values), std::move(dense_sizes),
+                                    kSparseCSRLayout, {0, 0});
+    }
+
+    // Generic compressed-layout constructor (CSR/CSC/BSR/BSC).  `crow`
+    // receives the compressed-axis pointers, `col` the plain-axis
+    // coordinates; `blocksize` is meaningful for the blocked layouts.
+    void set_sparse_compressed_state(std::shared_ptr<TensorImpl> crow,
+                                     std::shared_ptr<TensorImpl> col,
+                                     std::shared_ptr<TensorImpl> values,
+                                     std::vector<int64_t> dense_sizes,
+                                     int layout,
+                                     std::array<int64_t, 2> blocksize) {
         TP_CHECK(crow != nullptr && col != nullptr && values != nullptr,
-                 "set_sparse_csr_state: crow/col/values must be defined");
+                 "set_sparse_compressed_state: crow/col/values must be defined");
+        TP_CHECK(layout == kSparseCSRLayout || layout == kSparseCSCLayout ||
+                     layout == kSparseBSRLayout || layout == kSparseBSCLayout,
+                 "set_sparse_compressed_state: invalid compressed layout");
         sparse_state_ = std::make_shared<SparseState>();
-        sparse_state_->layout = kSparseCSRLayout;
+        sparse_state_->layout = layout;
         sparse_state_->crow = std::move(crow);
         sparse_state_->col = std::move(col);
         sparse_state_->values = std::move(values);
+        sparse_state_->blocksize = blocksize;
         sparse_state_->sparse_sizes = std::move(dense_sizes);
-        sparse_state_->coalesced = true;  // CSR is canonical by construction
+        sparse_state_->coalesced = true;  // compressed layouts are canonical
         is_contiguous_ = false;
         storage_offset_ = 0;
         clear_storage();

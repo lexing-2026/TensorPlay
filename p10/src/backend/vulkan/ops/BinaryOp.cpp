@@ -26,7 +26,7 @@ struct BlockBi final {
   int32_t alpha;
 };
 
-// Element-width classes for the binary dispatch, mirroring the unary one.
+// Element-width classes used by binary dispatch.
 enum class BinaryVocab { kFloat, kInt };
 
 BinaryVocab binary_vocab(const Tensor& t, const char* name) {
@@ -140,11 +140,10 @@ Tensor binary_op_tensor(
       static_cast<int32_t>(alpha.to<int64_t>()),
   };
 
-  api::UniformParamsBuffer params(
-      context,
+  api::UniformParamsBuffer params =
       (vocab == BinaryVocab::kInt)
-          ? api::UniformParamsBuffer(context, blocki)
-          : api::UniformParamsBuffer(context, block));
+      ? api::UniformParamsBuffer(context, blocki)
+      : api::UniformParamsBuffer(context, block);
   api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(
@@ -227,11 +226,10 @@ Tensor& binary_op_tensor_inplace(
       static_cast<int32_t>(alpha.to<int64_t>()),
   };
 
-  api::UniformParamsBuffer params(
-      context,
+  api::UniformParamsBuffer params =
       (vocab == BinaryVocab::kInt)
-          ? api::UniformParamsBuffer(context, blocki)
-          : api::UniformParamsBuffer(context, block));
+      ? api::UniformParamsBuffer(context, blocki)
+      : api::UniformParamsBuffer(context, block);
   api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(
@@ -323,11 +321,10 @@ Tensor binary_op_scalar(
     return convert(v_output);
   }
 
-  api::UniformParamsBuffer params(
-      context,
+  api::UniformParamsBuffer params =
       (vocab == BinaryVocab::kInt)
-          ? api::UniformParamsBuffer(context, blocki)
-          : api::UniformParamsBuffer(context, block));
+      ? api::UniformParamsBuffer(context, blocki)
+      : api::UniformParamsBuffer(context, block);
   api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(
@@ -407,11 +404,10 @@ Tensor& binary_op_scalar_inplace(
       static_cast<int32_t>(other.to<int64_t>() * alpha.to<int64_t>()),
   };
 
-  api::UniformParamsBuffer params(
-      context,
+  api::UniformParamsBuffer params =
       (vocab == BinaryVocab::kInt)
-          ? api::UniformParamsBuffer(context, blocki)
-          : api::UniformParamsBuffer(context, block));
+      ? api::UniformParamsBuffer(context, blocki)
+      : api::UniformParamsBuffer(context, block);
   api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(
@@ -451,6 +447,11 @@ Tensor mul_kernel(const Tensor& self, const Tensor& other) {
 }
 
 Tensor div_kernel(const Tensor& self, const Tensor& other) {
+  if (self.dtype() == DType::Int32) {
+    return binary_op_tensor(
+        "div", "buffer_div", self.to(DType::Float32),
+        other.to(DType::Float32), Scalar(1.0), "div");
+  }
   return binary_op_tensor("div", "buffer_div", self, other, Scalar(1.0), "div");
 }
 
@@ -470,6 +471,11 @@ Tensor mul_scalar_kernel(const Tensor& self, Scalar other) {
 }
 
 Tensor div_scalar_kernel(const Tensor& self, Scalar other) {
+  if (self.dtype() == DType::Int32) {
+    return binary_op_scalar(
+        "mul_scalar", "buffer_mul_scalar", self.to(DType::Float32),
+        Scalar(1.0 / other.toDouble()), Scalar(1.0), "mul");
+  }
   return binary_op_scalar("mul_scalar", "buffer_mul_scalar", self,
                           Scalar(1.0 / other.toDouble()), Scalar(1.0), "mul");
 }
@@ -506,9 +512,8 @@ Tensor& mul_scalar_inplace_kernel(Tensor& self, Scalar other) {
                                   self, other, Scalar(1.0), "mul");
 }
 
-// The subtraction in-place scalar flavor rides the add writer with the
-// negated product: x -= y * alpha runs as x += -(y * alpha), matching the
-// reference decomposition where one shader family covers both directions.
+// The subtraction in-place scalar flavor uses the add writer with the
+// negated product: x -= y * alpha runs as x += -(y * alpha).
 Tensor& sub_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
   return binary_op_scalar_inplace("add_scalarinplace",
                                   "buffer_add_scalarinplace",
@@ -619,21 +624,18 @@ Tensor rsub_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
 }
 
 Tensor true_divide_kernel(const Tensor& self, const Tensor& other) {
-  return binary_op_tensor("div", "buffer_div", self, other, Scalar(1.0),
-                          "true_divide");
+  return div_kernel(self, other);
 }
 
 Tensor true_divide_scalar_kernel(const Tensor& self, Scalar other) {
   TP_CHECK(
       other.toDouble() != 0.0,
       "true_divide.Scalar: can't divide by zero");
-  return binary_op_scalar("mul_scalar", "buffer_mul_scalar", self,
-                          Scalar(1.0 / other.toDouble()), Scalar(1.0), "mul");
+  return div_scalar_kernel(self, other);
 }
 
 Tensor divide_tensor_kernel(const Tensor& self, const Tensor& other) {
-  return binary_op_tensor("div", "buffer_div", self, other, Scalar(1.0),
-                          "divide");
+  return div_kernel(self, other);
 }
 
 Tensor divide_scalar_kernel(const Tensor& self, Scalar other) {

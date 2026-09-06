@@ -568,7 +568,7 @@ void embedding_renorm_rows(
         }
 
         if (norm > max_norm) {
-            const double scale = max_norm / norm;
+            const double scale = max_norm / (norm + 1e-7);
             for (int64_t column = 0; column < columns; ++column) {
                 const int64_t offset = column * column_stride;
                 row_data[offset] = static_cast<T>(
@@ -634,11 +634,6 @@ Tensor& embedding_renorm_cpu(
         RENORM_CASE(double, Float64)
         RENORM_CASE(Half, Float16)
         RENORM_CASE(BFloat16, BFloat16)
-        RENORM_CASE(Float8_e4m3fn, Float8_e4m3fn)
-        RENORM_CASE(Float8_e5m2, Float8_e5m2)
-        RENORM_CASE(Float8_e4m3fnuz, Float8_e4m3fnuz)
-        RENORM_CASE(Float8_e5m2fnuz, Float8_e5m2fnuz)
-        RENORM_CASE(Float8_e8m0fnu, Float8_e8m0fnu)
 #undef RENORM_CASE
         default:
             TP_THROW(TypeError, "embedding_renorm_: weight must have a floating dtype");
@@ -768,8 +763,10 @@ Tensor embedding_dense_backward_cpu(const Tensor& grad_output, const Tensor& ind
 
     dispatch_dtype(grad_output.dtype(), [&](auto tag) {
         using T = typename decltype(tag)::type;
-        if constexpr (std::is_same_v<T, bool>) {
-             TP_THROW(RuntimeError, "embedding_dense_backward: grad_output cannot be Bool");
+        if constexpr (is_float8_v<T>) {
+            TP_THROW(TypeError, "embedding_dense_backward: grad_output dtype is not supported");
+        } else if constexpr (std::is_same_v<T, bool>) {
+            TP_THROW(RuntimeError, "embedding_dense_backward: grad_output cannot be Bool");
         } else {
             const T* grad_data = grad_output_contig.data_ptr<T>();
             T* weight_grad_data = grad_weight.data_ptr<T>();
@@ -929,10 +926,19 @@ TENSORPLAY_LIBRARY_IMPL(CPU, CopyKernels) {
     m.impl("to_sparse_csr", to_sparse_csr_cpu);
     m.impl("_nnz", sparse_nnz_cpu);
     m.impl("sparse_mm", sparse_mm_cpu);
+    m.impl("smm", smm_cpu);
     m.impl("sparse_sum", sparse_sum_cpu);
     m.impl("sparse_add", sparse_add_cpu);
     m.impl("sparse_mul", sparse_mul_cpu);
     m.impl("spdiags", spdiags_cpu);
+    m.impl("_spdiags", spdiags_cpu);
+    m.impl("_sparse_sum", _sparse_sum_cpu);
+    m.impl("_sparse_sum.dtype", _sparse_sum_dtype_cpu);
+    m.impl("_sparse_sum.dim", _sparse_sum_dim_cpu_2);
+    m.impl("_sparse_sum.dim_dtype", _sparse_sum_dim_dtype_cpu);
+    m.impl("_sparse_sum_backward", _sparse_sum_backward_cpu);
+    m.impl("native_norm", native_norm_cpu);
+    m.impl("native_norm.ScalarOpt_dim_dtype", native_norm_dim_cpu);
     m.impl("embedding", embedding_cpu);
     m.impl("embedding_renorm_", embedding_renorm_cpu);
     m.impl("embedding_dense_backward", embedding_dense_backward_cpu);

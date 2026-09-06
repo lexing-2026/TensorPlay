@@ -1,20 +1,20 @@
 % 05-autograd.tex
-\section{Autograd: Explicit DAG, ReadyQueue, and Version Guards}
+\section{自动微分：显式有向无环图、就绪队列与版本守卫}
 \label{sec:autograd}
 
-This chapter documents the autograd engine as code, not as a concept. There is no \ac{tape}: a search for the symbol returns zero. The graph is an explicit \ac{dag} of \texttt{shared\_ptr<Node>} linked through \texttt{Edge}, dependency-counted, and scheduled across ReadyQueues keyed by \texttt{sequence\_nr}. The chapter walks the node, the edge, the task, the input buffer, the ready queue, and the engine, in that order.
+autograd 引擎按代码逐条记录。没有 \ac{tape}：搜索该符号返回零。该图是通过 \texttt{Edge} 链接的 \texttt{shared\_ptr<Node>} 的显式 \ac{dag}，进行依赖项计数，并在由 \texttt{sequence\_nr} 键入的 ReadyQueues 之间进行调度。按顺序介绍节点、边、任务、输入缓冲区、就绪队列和引擎。
 
 %==============================================================================
-\subsection{No Tape, Explicit DAG}
+\subsection{无磁带，显式 DAG}
 \label{subsec:notape}
 
-The engine builds the graph eagerly during forward. Each op's autograd wrapper allocates a \texttt{Node} subclass (148 types generated from via into \texttt{AutogradNodesGenerated.h}) or uses a handwritten node in (e.g.\ \texttt{CatBackward}, \texttt{MeanBackward}, \texttt{AccumulateGrad}). The node's \texttt{next\_edges:\ vector<Edge>} points to its parents. The whole graph is the transitive closure of those edges. Printing or drawing the graph is a walk of \texttt{shared\_ptr<Node>}; device-partitioned scheduling is a map from node to queue without scanning a global tape. creates a synthetic \texttt{GraphRoot} only when \texttt{roots.size!=1}, otherwise the single root is the graph root directly.
+引擎在转发过程中急切地构建图表。每个操作的自动微分包装器分配一个 \texttt{Node} 子类（从 via 生成到 \texttt{AutogradNodesGenerated.h} 的 148 种类型）或使用手写节点（例如\ \texttt{CatBackward}、\texttt{MeanBackward}、\texttt{AccumulateGrad}）。该节点的 \texttt{next\_edges:\ vector<Edge>} 指向其父节点。整个图是这些边的传递闭包。打印或绘制图表需要\texttt{shared\_ptr<Node>}；设备分区调度是从节点到队列的映射，无需扫描全局磁带。仅当 \texttt{roots.size!=1} 时才创建合成 \texttt{GraphRoot}，否则单根直接是图根。
 
 %==============================================================================
-\subsection{Node: Fields and Invariants}
+\subsection{节点：字段和不变量}
 \label{subsec:node}
 
- is the base. Listing~\ref{lst:nodefields} distills the layout; Table~\ref{tab:nodefields} explains each field's role on the hot path.
+是基础。 Listing~\ref{lst:nodefields} 提炼出布局；表~\ref{tab:nodefields} 解释了每个字段在热路径上的作用。
 
 \begin{lstlisting}[caption={output metadata and base.}, label=lst:nodefields]
 struct OutputSlotMeta {                   // 26
@@ -53,43 +53,43 @@ private:
 
 \begin{table}[H]
 \centering
-\caption{\texttt{Node.h} fields. Every field is on the backward critical path except hooks/anomaly which are cold.}
+\caption{\texttt{Node.h} 字段。除了冷的钩子/异常之外，每个字段都处于后向关键路径上。}
 \label{tab:nodefields}
 \small
 \begin{tabular}{lll}
 \toprule
-Field & Line & Purpose \\
+场地 & Line & 目的 \\
 \midrule
-\texttt{next\_edges\_} & 150 & Parents. \texttt{num\_inputs} defaults to \texttt{size}. \\
-\texttt{sequence\_nr\_} & 151+50 & Thread-local monotonic id from. Orders \texttt{ReadyQueue}. \\
-\texttt{topological\_nr\_} & 157+141 & \texttt{max(next.topo)+1} on each \texttt{add\_next\_edge}. Enables \texttt{min\_topo} pruning. \\
-\texttt{materialize\_grads\_} & 152 & If false, undefined grads pass through; if true (default), engine zero-fills via hints. \\
-\texttt{output\_metas\_} & 156 & Per-output slot metadata for \texttt{PyNode} (see \S\ref{subsec:pynode}). Empty for generated nodes. \\
-\texttt{is\_view\_fn\_} & 153 & View wrappers; \texttt{check\_inplace} in \texttt{VariableTypeUtils.h} rejects leaf-view mutation. \\
-\texttt{multi\_output\_view\_} & 154 & \texttt{chunk} views; never in-place mutable, reported via \texttt{forward\_op\_name\_}. \\
-\texttt{post\_hooks\_} & 160 & \texttt{function<void(variable\_list\&\&)>} lists; read during backward while graph is immutable. \\
-\texttt{anomaly\_metadata\_} & 162 & Lazy \texttt{AnomalyMetadata}; captures stack at node creation iff. \\
+\texttt{next\_edges\_} & 150 & 父母。 \texttt{num\_inputs} 默认为 \texttt{size}。 \\
+\texttt{sequence\_nr\_} & 151+50 & 线程本地单调 id 来自。订单 \texttt{ReadyQueue}。 \\
+\texttt{topological\_nr\_} & 157+141 & 每个 \texttt{add\_next\_edge} 上的 \texttt{max(next.topo)+1}。启用 \texttt{min\_topo} 修剪。 \\
+\texttt{materialize\_grads\_} & 152 & 如果为 false，则未定义的等级通过；如果为 true（默认），引擎将通过提示进行零填充。 \\
+\texttt{output\_metas\_} & 156 & \texttt{PyNode} 的每个输出槽元数据（请参阅 \S\ref{subsec:pynode}）。生成的节点为空。 \\
+\texttt{is\_view\_fn\_} & 153 & 查看包装器； \texttt{VariableTypeUtils.h} 中的 \texttt{check\_inplace} 拒绝叶视图突变。 \\
+\texttt{multi\_output\_view\_} & 154 & \texttt{chunk} 视图；从不就地可变，通过 \texttt{forward\_op\_name\_} 报告。 \\
+\texttt{post\_hooks\_} & 160 & \texttt{function<void(variable\_list\&\&)>} 列出；向后读取，而图是不可变的。 \\
+\texttt{anomaly\_metadata\_} & 162 & 懒惰 \texttt{AnomalyMetadata};在节点创建时捕获堆栈。 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Key invariants:
+关键不变量：
 
 \begin{itemize}[leftmargin=1.2em]
-\item \texttt{sequence\_nr\_} is assigned in the constructor from a. It is monotonic per thread, never global, so the max-heap approximates reverse creation order without a global atomic. compares it.
-\item \texttt{topological\_nr\_} is the longest-path distance from leaves. scans \texttt{outputs[].function->topological\_nr}, and both and prune \texttt{topo < min\_topo}. Early ops outside the needed subgraph never enter \texttt{dependencies\_}.
-\item \texttt{output\_metas\_} exists because for custom functions the backward inputs correspond to forward \emph{outputs}, not to \texttt{next\_edges} inputs. in fills one \texttt{OutputSlotMeta} per output tensor (shape/dtype/device\_index/valid). Generated nodes leave it empty and rely on \texttt{Edge} hints.
-\item Hooks are append-only at graph-build time. The engine iterates them during \texttt{evaluate\_function:426,446} while no other thread mutates the node, so no lock is needed around hooks themselves (the graph is logically immutable once \texttt{execute} starts).
-\item \texttt{anomaly\_metadata\_} is allocated lazily in and initialized via which calls \texttt{store\_stack} and, if \texttt{tls\_current\_evaluating\_node} is set, \texttt{assign\_parent}. This chains the creation stack of a backward-created node to its parent.
+\item \texttt{sequence\_nr\_} 在构造函数中从 a 分配。每个线程都是单调的，而不是全局的，因此最大堆近似于没有全局原子的反向创建顺序。比较一下。
+\item \texttt{topological\_nr\_} 是距叶子的最长路径距离。扫描 \texttt{outputs[].function->topological\_nr}，并修剪 \texttt{topo < min\_topo}。所需子图之外的早期操作永远不会进入 \texttt{dependencies\_}。
+\item \texttt{output\_metas\_} 存在是因为对于自定义函数，后向输入对应于前向 \emph{outputs}，而不是 \texttt{next\_edges} 输入。 in 为每个输出张量填充一个 \texttt{OutputSlotMeta} (shape/dtype/device\_index/valid)。生成的节点将其留空并依赖 \texttt{Edge} 提示。
+\item 挂钩仅在图形构建时追加。引擎在 \texttt{evaluate\_function:426,446} 期间迭代它们，而没有其他线程改变节点，因此钩子本身不需要锁定（一旦 \texttt{execute} 启动，图在逻辑上是不可变的）。
+\item \texttt{anomaly\_metadata\_} 被延迟分配并通过调用 \texttt{store\_stack} 进行初始化，如果设置了 \texttt{tls\_current\_evaluating\_node}，则调用 \texttt{assign\_parent}。这会将向后创建的节点的创建堆栈链接到其父节点。
 \end{itemize}
 
-Generated nodes from store \texttt{SavedVariable} members per saved tensor; handwritten nodes in do the same. Each node's destructor need not be virtual for scheduling; \texttt{shared\_from\_this} is required for \texttt{CurrentEvalNodeGuard} to capture the parent in anomaly mode.
+根据保存的张量从存储 \texttt{SavedVariable} 成员生成节点；中的手写节点执行相同操作。每个节点的析构函数不必是虚拟的以进行调度； \texttt{CurrentEvalNodeGuard} 需要 \texttt{shared\_from\_this} 才能在异常模式下捕获父级。
 
 %==============================================================================
-\subsection{Edge: Hints for Materialization}
+\subsection{边缘：物化提示}
 \label{subsec:edge}
 
- carries no tensor, only hints so backward can \texttt{ops::zeros} a missing gradient without touching the forward tensor (Listing~\ref{lst:edge}).
+不携带张量，仅提示向后可以 \texttt{ops::zeros} 丢失梯度而不触及前向张量（列表~\ref{lst:edge}）。
 
 \begin{lstlisting}[caption={hints.}, label=lst:edge]
 struct TENSORPLAY_API Edge{                    //14
@@ -110,28 +110,28 @@ struct TENSORPLAY_API Edge{                    //14
 
 \begin{table}[H]
 \centering
-\caption{Edge hints and their consumers in \texttt{Engine::evaluate\_function}.}
+\caption{边缘提示及其消费者在 \texttt{Engine::evaluate\_function} 中。}
 \label{tab:edgehints}
 \small
 \begin{tabular}{lll}
 \toprule
-Hint & Line & Where consumed \\
+Hint & Line & 消费地点 \\
 \midrule
-\texttt{ has\_shape\_hint} & 21 & Materialize \texttt{ops::zeros(shape,\dots)} and. Distinguishes \texttt{} from no-hint via the bool. \\
-\texttt{grad\_dtype} & 27 & Dtype cast of mismatched grads; skipped if \texttt{InferenceMode::is\_enabled}. \\
-\texttt{device\_type\_hint} & 33 & Materialize device for \texttt{ops::zeros}; type stored separately because CPU DLpack may report. \\
-\texttt{device\_index\_hint} & 34 & Same allocation site; combined into. \\
+\texttt{ has\_shape\_hint} & 21 & 实现 \texttt{ops::zeros(shape,\dots)} 和。通过 bool 区分 \texttt{} 和无提示。 \\
+\texttt{grad\_dtype} & 27 & 不匹配毕业生的 Dtype 演员阵容；如果 \texttt{InferenceMode::is\_enabled} 则跳过。 \\
+\texttt{device\_type\_hint} & 33 & 实现 \texttt{ops::zeros} 的设备；类型单独存储，因为 CPU DLpack 可能会报告。 \\
+\texttt{device\_index\_hint} & 34 & 同一分配地点；合并成. \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Semantics: every time the Python binding or generated wrapper wires a tensor's \texttt{grad\_fn}, it records the forward input's \texttt{device} triple on the outgoing \texttt{Edge} from the consumer's \texttt{Node}. During backward, if \texttt{vars[i]} is undefined and \texttt{func->materialize\_grads==true}, the engine prefers \texttt{output\_metas\_[i]} (custom functions) and falls back to the \texttt{Edge} triple to allocate \texttt{ops::zeros} without crossing into Python.
+语义：每次 Python 绑定或生成的包装器连接张量的 \texttt{grad\_fn} 时，它都会在来自使用者的 \texttt{Node} 的传出 \texttt{Edge} 上记录前向输入的 \texttt{device} 三元组。在向后期间，如果 \texttt{vars[i]} 未定义且 \texttt{func->materialize\_grads==true} ，则引擎更喜欢 \texttt{output\_metas\_[i]} （自定义函数）并回退到 \texttt{Edge} 三元组以分配 \texttt{ops::zeros} ，而无需进入 Python。
 
 %==============================================================================
-\subsection{GraphTask: Per-Backward Shared State}
+\subsection{GraphTask：每个向后共享状态}
 \label{subsec:graphtask}
 
-One \texttt{GraphTask} is created per call. Multiple worker threads may evaluate different nodes of the same task concurrently, so all shared bookkeeping is guarded by \texttt{mutex\_} once execution starts (Listing~\ref{lst:graphtask}, Table~\ref{tab:graphtask}).
+每次调用都会创建一个 \texttt{GraphTask}。多个工作线程可以同时评估同一任务的不同节点，因此一旦执行开始，所有共享簿记都由 \texttt{mutex\_} 保护（Listing~\ref{lst:graphtask}、Table~\ref{tab:graphtask}）。
 
 \begin{lstlisting}[caption={per-backward context.}, label=lst:graphtask]
 struct GraphTask{ //22
@@ -160,45 +160,45 @@ struct GraphTask{ //22
 
 \begin{table}[H]
 \centering
-\caption{\texttt{GraphTask.h} fields; all maps are keyed by raw \texttt{Node*} (stable while \texttt{shared\_ptr} lives elsewhere).}
+\caption{\texttt{GraphTask.h} 字段；所有地图均由原始 \texttt{Node*} 键入（稳定，而 \texttt{shared\_ptr} 位于其他地方）。}
 \label{tab:graphtask}
 \small
 \begin{tabular}{lll}
 \toprule
-Field & Line & Role \\
+场地 & Line & Role \\
 \midrule
-\texttt{keep\_graph\_} & 35 & If false, calls \texttt{func->release\_variables} (clears \texttt{next\_edges\_}). \\
-\texttt{grad\_mode\_} & 36 & \texttt{create\_graph} decision; copied into \texttt{GradModeGuard} on every worker. \\
-\texttt{trace\_id\_} & 40 & Monotonic for \texttt{TP\_ENGINE\_TRACE} filtering of concurrent graphs. \\
-\texttt{not\_ready\_} & 43 & Buffers for nodes whose \texttt{dependencies>0}. Keyed by \texttt{Node*}, value \texttt{InputBuffer} of size \texttt{num\_inputs}. \\
-\texttt{dependencies\_} & 44 & In-degree. Computed once in, decremented under \texttt{mutex\_} in. \\
-\texttt{nodes\_in\_graph\_} & 45 & Deduplication set for BFS. \\
-\texttt{exec\_info\_} & 48 & Filtering for \texttt{grad}: empty means \texttt{backward} executes everything. \\
-\texttt{captured\_vars\_} & 50 & Outputs of \texttt{grad}: filled by the engine from \texttt{InputBuffer} before \texttt{apply}. \\
-\texttt{outstanding\_} & 53 & Shared-state guard, completion wakeup, and task counter. \texttt{outstanding\_tasks\_} counts enqueued-but-not-done. \\
+\texttt{keep\_graph\_} & 35 & 如果为 false，则调用 \texttt{func->release\_variables}（清除 \texttt{next\_edges\_}）。 \\
+\texttt{grad\_mode\_} & 36 & \texttt{create\_graph} 决定；复制到每个工人的 \texttt{GradModeGuard} 中。 \\
+\texttt{trace\_id\_} & 40 & 并发图的 \texttt{TP\_ENGINE\_TRACE} 过滤是单调的。 \\
+\texttt{not\_ready\_} & 43 & 其 \texttt{dependencies>0} 的节点的缓冲区。由 \texttt{Node*} 键控，值 \texttt{InputBuffer}，大小为 \texttt{num\_inputs}。 \\
+\texttt{dependencies\_} & 44 & 入度。计算一次，在 \texttt{mutex\_} in 下递减。 \\
+\texttt{nodes\_in\_graph\_} & 45 & BFS 的重复数据删除集。 \\
+\texttt{exec\_info\_} & 48 & 过滤 \texttt{grad}：空意味着 \texttt{backward} 执行所有内容。 \\
+\texttt{captured\_vars\_} & 50 & \texttt{grad} 的输出：由引擎在 \texttt{apply} 之前从 \texttt{InputBuffer} 填充。 \\
+\texttt{outstanding\_} & 53 & 共享状态保护、完成唤醒和任务计数器。 \texttt{outstanding\_tasks\_} 计数已入队但未完成的数量。 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsubsection{Filtering with \texttt{init\_to\_execute}}
+\subsubsection{使用 \texttt{init\_to\_execute} 进行过滤}
 \label{subsubsec:inittoexec}
 
-For \texttt{backward}, \texttt{exec\_info\_} stays empty and every visited node executes. For \texttt{grad(outputs,inputs)}, calls. That method must mark \emph{only} the subgraph needed to produce the requested inputs.
+对于 \texttt{backward}，\texttt{exec\_info\_} 保持为空并且每个访问的节点都会执行。对于 \texttt{grad(outputs,inputs)}，请致电。该方法必须将 \emph{only} 标记为生成请求的输入所需的子图。
 
-The code at does two passes:
+处的代码执行两次：
 
 \begin{enumerate}[leftmargin=1.2em]
-\item Seed \texttt{exec\_info\_[output\_edge.function].captures\_} with \texttt{(input\_nr, output\_idx)} or \texttt{needed\_=true} when \texttt{accumulate\_grad==true}. pre-sizes the result vector.
-\item Walk from \texttt{graph\_root} using an explicit stack of \texttt{Frame\{Node* fn; size\_t next\_next\_fn\_\}}. iterates \texttt{fn->next\_edges} one edge a time. A \texttt{seen} set plus the \texttt{nodeShouldExecute} lambda (\texttt{257}) propagates \texttt{needed\_} backward: if a child already \texttt{should\_execute}, its parent is marked \texttt{needed\_=true} (\texttt{274}). When unwinding (\texttt{287}), a just-finalized node's \texttt{needed\_} is pushed to its DFS parent (\texttt{289}). The \texttt{min\_topo\_nr} computed at (minimum topo among \texttt{outputs}) prunes the walk: any child with \texttt{topological\_nr < min\_topo} is skipped (\texttt{281}) because it cannot reach the requested outputs.
+\item 当 \texttt{accumulate\_grad==true} 时，种子 \texttt{exec\_info\_[output\_edge.function].captures\_} 与 \texttt{(input\_nr, output\_idx)} 或 \texttt{needed\_=true}。预先确定结果向量的大小。
+\item 使用 \texttt{Frame\{Node* fn; size\_t next\_next\_fn\_\}} 的显式堆栈从 \texttt{graph\_root} 开始遍历。一次迭代 \texttt{fn->next\_edges} 一个边。 \texttt{seen} 集加上 \texttt{nodeShouldExecute} lambda (\texttt{257}) 向后传播 \texttt{needed\_}：如果子级已经 \texttt{should\_execute}，则其父级被标记为 \texttt{needed\_=true} (\texttt{274})。当展开 (\texttt{287}) 时，刚刚完成的节点的 \texttt{needed\_} 被推送到其 DFS 父节点 (\texttt{289})。在（\texttt{outputs} 中的最小拓扑）处计算的 \texttt{min\_topo\_nr} 会修剪步行：任何具有 \texttt{topological\_nr < min\_topo} 的子级都会被跳过（\texttt{281}），因为它无法达到请求的输出。
 \end{enumerate}
 
-The result is that can early-return after copying captures but before \texttt{apply} when \texttt{!fn\_info.needed\_}: that node's outputs are still needed as captured inputs but the node itself need not compute new grads.
+结果是，可以在复制捕获之后但在 \texttt{apply} 之前（当 \texttt{!fn\_info.needed\_} 时）提前返回：该节点的输出仍然需要作为捕获的输入，但节点本身不需要计算新的梯度。
 
 %==============================================================================
-\subsection{InputBuffer: Accumulation and Device Routing}
+\subsection{InputBuffer：累积和设备路由}
 \label{subsec:inputbuffer}
 
- is both an accumulator and a routing hint (Listing~\ref{lst:inputbuffer}).
+既是累加器又是路由提示（Listing~\ref{lst:inputbuffer}）。
 
 \begin{lstlisting}[caption={accumulation.}, label=lst:inputbuffer]
 inline bool can_accumulate_inplace(const Tensor& v){ //16
@@ -231,29 +231,29 @@ struct InputBuffer{ //43
 
 \begin{table}[H]
 \centering
-\caption{\texttt{can\_accumulate\_inplace} triple condition.}
+\caption{\texttt{can\_accumulate\_inplace} 三重条件。}
 \label{tab:inplace}
 \small
 \begin{tabular}{ll}
 \toprule
-Check & Why \\
+查看 & Why \\
 \midrule
-\texttt{is\_contiguous} & \texttt{add\_} on non-contiguous would trigger a copy anyway; out-of-place \texttt{+} is cheaper. \\
-\texttt{unsafeGetTensorImpl.use\_count==2} & The temporary \texttt{shared\_ptr} copy from \texttt{impl} counts as one; \texttt{==2} means the caller holds the last logical reference. \\
-\texttt{storage.use\_count==1} & Ensures no other tensor aliases the same storage (views); mutating would corrupt an alias. \\
+\texttt{is\_contiguous} & 无论如何，非连续的 \texttt{add\_} 都会触发副本；不合适的 \texttt{+} 更便宜。 \\
+\texttt{unsafeGetTensorImpl.use\_count==2} & 来自 \texttt{impl} 的临时 \texttt{shared\_ptr} 副本算作 1； \texttt{==2} 表示调用者保存最后一个逻辑引用。 \\
+\texttt{storage.use\_count==1} & 确保同一存储（视图）没有其他张量别名；变异会破坏别名。 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
- is the sole accumulation entry point used by the engine. The first grad at position \texttt{pos} moves in; the second and later grads go through. Under \texttt{grad\_mode==true} (i.e.\ \texttt{create\_graph}, propagated as \texttt{task.grad\_mode\_} at) accumulation itself builds the second-order graph via \texttt{tpx::ops::add} (which re-enters dispatch and records a new \texttt{Node}). Otherwise the engine tries in-place \texttt{add\_} when \texttt{can\_accumulate\_inplace} holds, else falls back to \texttt{old+var} which allocates.
+是引擎使用的唯一累积入口点。位置 \texttt{pos} 的第一名毕业生搬入；第二届及以后的毕业生通过。在 \texttt{grad\_mode==true}（即\ \texttt{create\_graph}，在 \texttt{task.grad\_mode\_} 处传播）下，累积本身通过 \texttt{tpx::ops::add} 构建二阶图（重新进入调度并记录新的 \texttt{Node}）。否则，当 \texttt{can\_accumulate\_inplace} 成立时，引擎会尝试就地 \texttt{add\_}，否则回退到 \texttt{old+var} 进行分配。
 
- scans for the first CUDA tensor. uses it to pick the target \texttt{ReadyQueue}: \texttt{dev>=0 ? queue\_for\_device(dev): \&cpu\_queue}. Placement is therefore determined by the first defined input's device, not by the node's own device; this matches the observation that the gradient tensor lives on the same device as its forward input.
+扫描第一个 CUDA 张量。用它来选择目标 \texttt{ReadyQueue}: \texttt{dev>=0 ? queue\_for\_device(dev): \&cpu\_queue}。因此，放置是由第一个定义的输入的设备决定的，而不是由节点自己的设备决定的；这与梯度张量与其前向输入位于同一设备上的观察结果相匹配。
 
 %==============================================================================
-\subsection{ReadyQueue: Priority by \texttt{sequence\_nr}}
+\subsection{ReadyQueue：优先级为 \texttt{sequence\_nr}}
 \label{subsec:readyqueue}
 
- implements the scheduler queue (Listing~\ref{lst:readyqueue}).
+实现调度程序队列（清单~\ref{lst:readyqueue}）。
 
 \begin{lstlisting}[caption={priority queue.}, label=lst:readyqueue]
 struct ReadyQueue{ //23
@@ -276,21 +276,21 @@ struct ReadyQueue{ //23
 };
 \end{lstlisting}
 
-The queue is a max-heap by \texttt{sequence\_nr\_} (\ac{dag} execution order; see the definition box below). Since nodes are allocated in forward order, larger \texttt{sequence\_nr} is roughly closer to the outputs, so popping the maximum approximates reverse topological order without computing a topological sort per backward. It is a heuristic, not exact: true topological order is enforced by \texttt{dependencies\_} counting, which prevents execution before parents complete.
+该队列是 \texttt{sequence\_nr\_} 的最大堆（\ac{dag} 执行顺序；请参阅下面的定义框）。由于节点是按正向顺序分配的，较大的 \texttt{sequence\_nr} 大致更接近输出，因此弹出最大值近似于反向拓扑顺序，而无需计算每个反向的拓扑排序。这是一种启发式的，而不是精确的：真正的拓扑顺序是通过 \texttt{dependencies\_} 计数强制执行的，这可以防止在父级完成之前执行。
 
 \begin{tpdef}[Definition (Priority Heap vs.\ Topological Order)]
-Let $G=(N,E)$ be the backward DAG and $\sigma:N\rightarrow\mathbb{N}$ map each node to its \texttt{sequence\_nr} (the forward allocation order). The \texttt{ReadyQueue} pops the pending node with maximal $\sigma$, which equals reverse-forward order. An execution sequence is \emph{valid} iff every node runs after all of its parents (per \texttt{dependencies\_} in-degree counts). The heap achieves validity \emph{without} computing a topological sort: a node enters the heap only after its last parent enqueues it, so any pop order is valid by construction; $\sigma$ merely biases \emph{within} the valid set toward reverse-forward order, improving locality of saved intermediates.
+令 $G=(N,E)$ 为后向 DAG，$\sigma:N\rightarrow\mathbb{N}$ 将每个节点映射到其 \texttt{sequence\_nr} （前向分配顺序）。 \texttt{ReadyQueue} 弹出最大 $\sigma$ 的挂起节点，这等于反向转发顺序。执行顺序为 \emph{valid} ，当且仅当每个节点都在其所有父节点之后运行（按照 \texttt{dependencies\_} 入度计数）。堆实现有效性 \emph{without} 计算拓扑排序：节点仅在其最后一个父节点将其入队后才进入堆，因此任何弹出顺序通过构造都是有效的； $\sigma$ 只是将 \emph{within} 的有效集偏向反向-正向顺序，从而改善了保存的中间体的局部性。
 \end{tpdef}
 
-The ready queue is used in two modes. Device workers call \texttt{pop\_until([]{return false;})} and block forever with a 5\,ms poll. The initiating thread calls \texttt{cpu\_queue.pop\_until([\&graph]\{return graph.is\_completed;\})} so it can exit as soon as its \texttt{GraphTask} finishes, even if the CPU queue is otherwise empty. The 5\,ms avoids lost wakeups (the notifier takes the mutex before \texttt{notify}) and bounds idle latency without busy-spinning. The notifier takes the lock before \texttt{notify\_all} so a notification cannot be lost between \texttt{pop\_until}'s empty check and its wait.
+就绪队列有两种使用模式。设备工作线程调用 \texttt{pop\_until([]{return false;})} 并通过 5\,ms 轮询永远阻塞。发起线程调用 \texttt{cpu\_queue.pop\_until([\&graph]\{return graph.is\_completed;\})}，因此它可以在 \texttt{GraphTask} 完成后立即退出，即使 CPU 队列为空。 5\,ms 可以避免丢失唤醒（通知程序在 \texttt{notify} 之前获取互斥锁）并限制空闲延迟，而无需忙于旋转。通知程序在 \texttt{notify\_all} 之前获取锁，因此在 \texttt{pop\_until} 的空检查和等待之间通知不会丢失。
 
-Pushing increments no counters itself; the caller must have already bumped the outstanding-task count under \texttt{task.mutex\_}. This ordering matters: workers decrement on completion and the initiator blocks on \texttt{outstanding\_tasks\_==0}.
+推入增量不会增加计数器本身；调用者必须已经将未完成任务计数增加到 \texttt{task.mutex\_} 下。这种顺序很重要：工作人员在完成时递减，启动程序在 \texttt{outstanding\_tasks\_==0} 上阻塞。
 
 %==============================================================================
-\subsection{Engine: Queues, Workers, and Cross-Device Routing}
+\subsection{引擎：队列、工作线程和跨设备路由}
 \label{subsec:enginequeues}
 
- owns the queues and worker threads.
+拥有队列和工作线程。
 
 \begin{lstlisting}[caption={engine.}, label=lst:engineh]
 class TENSORPLAY_API Engine{ //85
@@ -329,18 +329,18 @@ void Engine::enqueue_task(GraphTask& task, ReadyQueue::NodeTask&& nt, ReadyQueue
 }
 \end{lstlisting}
 
-Design notes:
+设计注意事项：
 
 \begin{itemize}[leftmargin=1.2em]
-\item leaks the singleton on purpose (\texttt{new Engine} never freed) because queued tasks and workers may outlive static destructors. The Queues themselves are also leaked.
-\item \texttt{ready\_queues\_} maps \texttt{-1} to the CPU queue and non-negative ints to CUDA device indices. Each CUDA device gets exactly one persistent worker spawned on first use. CPU has no worker; the initiator thread drains it.
-\item never exits. It blocks in \texttt{pop\_until} and calls, which catches any exception, records it in \texttt{GraphTask::exception\_} via, and marks completion with.
-\item is \texttt{thread\_local}. When detects \texttt{nested=true}, it routes every task to a stack-local and drains it itself (\texttt{684}). This keeps reentrant backward (a backward inside a backward's \texttt{apply}) deadlock-free: workers busy with the outer graph cannot block the inner one, and the inner graph's tasks never leak to device queues where workers would wait for an outer initiator that is itself blocked.
-\item Build discipline matters: both the root  and the repo root are CMake binary directories pointing \texttt{TP\_PACKAGE\_DIR} at  (see \texttt{CMakeLists.txt} \texttt{TP\_PACKAGE\_DIR}). Concurrent linkers corrupt \texttt{\_C.so}; see \texttt{README.md} compile notes.
+\item 故意泄漏单例（\texttt{new Engine} 从未释放），因为排队的任务和工作人员可能比静态析构函数寿命更长。队列本身也被泄露。
+\item \texttt{ready\_queues\_} 将 \texttt{-1} 映射到 CPU 队列，将非负整数映射到 CUDA 设备索引。每个 CUDA 设备在第一次使用时都会生成一个持久工作线程。 CPU没有worker；启动器线程耗尽它。
+\item 永远不会退出。它在 \texttt{pop\_until} 中阻塞并调用，捕获任何异常，将其记录在 \texttt{GraphTask::exception\_} via 中，并用 标记完成。
+\item 是 \texttt{thread\_local}。当检测到 \texttt{nested=true} 时，它将每个任务路由到本地堆栈并耗尽它本身 (\texttt{684})。这使得可重入向后（向后的 \texttt{apply} 内的向后）无死锁：忙于外部图的工作人员无法阻塞内部图，并且内部图的任务永远不会泄漏到设备队列，工作人员将在设备队列中等待本身被阻塞的外部启动器。
+\item 构建规则很重要：根目录和存储库根目录都是指向 \texttt{TP\_PACKAGE\_DIR} 的 CMake 二进制目录（请参阅 \texttt{CMakeLists.txt} \texttt{TP\_PACKAGE\_DIR}）。并发链接器损坏 \texttt{\_C.so}；请参阅 \texttt{README.md} 编译注释。
 \end{itemize}
 
 %==============================================================================
-\subsection{Building the Dependency Count}
+\subsection{建立依赖计数}
 \label{subsec:dependencies}
 
 \begin{lstlisting}[caption={BFS in-degree.}, label=lst:computedep]
@@ -359,15 +359,15 @@ void Engine::compute_dependencies(Node* root,GraphTask& task,uint64_t min_topo){
 }
 \end{lstlisting}
 
-This is a DFS (vector as stack) over the DAG starting from \texttt{graph\_root}. Each edge contributes one to the child's in-degree stored in. The \texttt{nodes\_in\_graph\_} set ensures each node is expanded once, but the counter still accumulates one per incoming edge (the map is bumped even when the node was already seen). The \texttt{min\_topo} guard (\texttt{201}) skips entire subtrees that were created before the first output of interest; this is critical for \texttt{grad} where only a suffix of the forward matters. Trace level~2 emits per edge when \texttt{TP\_ENGINE\_TRACE=2}.
+这是从 \texttt{graph\_root} 开始的 DAG 上的 DFS（向量作为堆栈）。每条边都为子级存储的入度贡献 1。 \texttt{nodes\_in\_graph\_} 集确保每个节点扩展一次，但计数器仍然为每个传入边累加 1（即使该节点已经被看到，地图也会发生碰撞）。 \texttt{min\_topo} 防护 (\texttt{201}) 会跳过在第一个感兴趣的输出之前创建的整个子树；这对于 \texttt{grad} 至关重要，因为只有前向的后缀才重要。当 \texttt{TP\_ENGINE\_TRACE=2} 时，跟踪级别~2 在每个边缘发出。
 
- is the minimum \texttt{topological\_nr\_} among \texttt{outputs[].function}. If \texttt{outputs} is empty (pure \texttt{backward}), it returns 0 and nothing is pruned.
+是 \texttt{outputs[].function} 中最小的 \texttt{topological\_nr\_}。如果 \texttt{outputs} 为空（纯 \texttt{backward}），则返回 0 并且不会删除任何内容。
 
 %==============================================================================
-\subsection{Orchestrating a Backward: \texttt{Engine::execute}}
+\subsection{编排向后：\texttt{Engine::execute}}
 \label{subsec:execute}
 
-Listing~\ref{lst:execute} is the full orchestration.
+Listing~\ref{lst:execute} 是完整的编排。
 
 \begin{lstlisting}[caption={orchestration.}, label=lst:execute]
 variable_list Engine::execute(const edge_list& roots,const variable_list& inputs, //621
@@ -395,21 +395,21 @@ variable_list Engine::execute(const edge_list& roots,const variable_list& inputs
 Steps:
 
 \begin{enumerate}[leftmargin=1.2em]
-\item Validate \texttt{roots.size==inputs.size} (\texttt{629}) and that \texttt{grad} has non-empty outputs (\texttt{633}).
-\item Create and assign \texttt{trace\_id\_} from an atomic counter.
-\item Build an ephemeral \texttt{GraphRoot} if fan-in (multi-output backward) is needed; it holds the root edges and forwards the seeded gradients to the correct parents.
-\item Compute dependencies (\S\ref{subsec:dependencies}) and, for \texttt{grad}, the \texttt{captures} filter via \texttt{init\_to\_execute}.
-\item Enqueue the root(s). In the single-root fast path, the seed gradient is inserted at \texttt{input\_nr} with explicit \texttt{grad\_mode==create\_graph} so the first \texttt{InputBuffer::add} already knows whether to build second-order history.
-\item Branch on \texttt{nested\_depth\_}. Nested backs use the local queue; the top-level initiator drains the CPU queue itself while CUDA workers drain their device queues. The initiator also calls after the CPU queue drains, because some work may still be on device workers.
+\item 验证 \texttt{roots.size==inputs.size} (\texttt{629}) 以及 \texttt{grad} 具有非空输出 (\texttt{633})。
+\item 从原子计数器创建并分配 \texttt{trace\_id\_}。
+\item 如果需要扇入（向后多输出），则构建一个临时的 \texttt{GraphRoot} ；它保留根边缘并将种子梯度转发给正确的父级。
+\item 计算依赖关系 (\S\ref{subsec:dependencies})，对于 \texttt{grad}，通过 \texttt{init\_to\_execute} 计算 \texttt{captures} 过滤器。
+\item 将根入队。在单根快速路径中，种子梯度通过显式 \texttt{grad\_mode==create\_graph} 插入到 \texttt{input\_nr} 处，因此第一个 \texttt{InputBuffer::add} 已经知道是否构建二阶历史。
+\item 分支在 \texttt{nested\_depth\_} 上。嵌套的backs使用本地队列；顶级启动程序本身会耗尽 CPU 队列，而 CUDA 工作线程会耗尽其设备队列。启动器也会在 CPU 队列耗尽后调用，因为某些工作可能仍在设备工作线程上进行。
 \end{enumerate}
 
- is RAII: \texttt{++depth} on entry, \texttt{--depth} on exit, even via exception, so reentrancy tracking is exception-safe.
+RAII：进入时为 \texttt{++depth}，退出时为 \texttt{--depth}，即使是通过异常也是如此，因此重入跟踪是异常安全的。
 
 %==============================================================================
-\subsection{The Core Loop: \texttt{evaluate\_function} in Ten Steps}
+\subsection{核心循环：\texttt{evaluate\_function} 十个步骤}
 \label{subsec:evaluate}
 
- is the per-node interpreter. Listing~\ref{lst:evaluatehead} shows the prologue and epilogue; the ten steps are indexed below and detailed in subsubsections.
+是每个节点的解释器。 Listing~\ref{lst:evaluatehead} 显示序言和尾声；这十个步骤的索引如下，并在小节中详细介绍。
 
 \begin{lstlisting}[caption={prologue.}, label=lst:evaluatehead]
 void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs, //333
@@ -430,21 +430,21 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
 }
 \end{lstlisting}
 
-\subsubsection{Step~1: \texttt{GradModeGuard}}
+\subsubsection{步骤~1：\texttt{GradModeGuard}}
 \label{subsubsec:gradguard}
 
 \begin{lstlisting}[caption={honour \texttt{create\_graph} on workers.}, label=lst:gradguard]
 struct GradModeGuard{ explicit GradModeGuard(bool e):prev_(GradMode::is_enabled()){ GradMode::set_enabled(e); } ~GradModeGuard(){ GradMode::set_enabled(prev_); } bool prev_; }; //21
 \end{lstlisting}
 
-\texttt{GradMode} lives in \texttt{p10} (, \S\ref{subsec:guards}) as \texttt{thread\_local bool enabled\_=true}. Worker threads inherit whatever TLS the OS gave them, which is unrelated to the task's \texttt{create\_graph}. The guard overwrites the worker's TLS with \texttt{task.grad\_mode\_} for the duration of this node's evaluation, so nested accumulation and profiling see the correct value.
+\texttt{GradMode} 作为 \texttt{thread\_local bool enabled\_=true} 生活在 \texttt{p10} (, \S\ref{subsec:guards}) 中。工作线程继承操作系统赋予它们的任何 TLS，这与任务的 \texttt{create\_graph} 无关。在该节点评估期间，防护程序会使用 \texttt{task.grad\_mode\_} 覆盖工作线程的 TLS，因此嵌套累积和分析会看到正确的值。
 
-\subsubsection{Step~2: \texttt{ExecInfo} Capture and Early Exit}
+\subsubsection{步骤~2：\texttt{ExecInfo} 捕获并提前退出}
 \label{subsubsec:execinfo}
 
-Already shown in Listing~\ref{lst:evaluatehead}:345. For \texttt{grad} the engine copies captured slots directly from the input buffer into \texttt{task.captured\_vars\_} under \texttt{task.mutex\_}, without copying the whole buffer for nodes without captures. If \texttt{!needed\_} the node is done: decrement outstanding and wake the initiator if this was the last task.
+已在清单 ~\ref{lst:evaluatehead}:345 中显示。对于 \texttt{grad}，引擎将捕获的槽直接从输入缓冲区复制到 \texttt{task.mutex\_} 下的 \texttt{task.captured\_vars\_} 中，而不复制没有捕获的节点的整个缓冲区。如果 \texttt{!needed\_} 节点已完成：如果这是最后一个任务，则递减未完成的任务并唤醒发起者。
 
-\subsubsection{Step~3: Materializing Missing Gradients}
+\subsubsection{步骤~3：具体化缺失的梯度}
 \label{subsubsec:materialize}
 
 \begin{lstlisting}[caption={missing grads.}, label=lst:materialize]
@@ -463,18 +463,18 @@ if(func->materialize_grads()){ //392
 }
 \end{lstlisting}
 
-Policy: \texttt{PyNode}-like custom functions record per-output metadata in \texttt{output\_metas\_} via \texttt{attach\_outputs}; generated derivative nodes leave it empty and fall back to the per-input \texttt{Edge} triple. Preference is given to \texttt{output\_metas\_} because custom functions' backward inputs correspond to forward outputs (their \texttt{num\_inputs} equals \texttt{output\_metas\_.size}, see). allocates on the recorded device with the recorded dtype, so missing grads never require a Python crossing.
+策略：类 \texttt{PyNode} 的自定义函数通过 \texttt{attach\_outputs} 在 \texttt{output\_metas\_} 中记录每个输出的元数据；生成的衍生节点将其留空并回退到每个输入 \texttt{Edge} 三元组。优先考虑 \texttt{output\_metas\_}，因为自定义函数的后向输入对应于前向输出（它们的 \texttt{num\_inputs} 等于 \texttt{output\_metas\_.size}，请参阅）。使用记录的 dtype 在记录的设备上分配，因此丢失的 grads 永远不需要 Python 交叉。
 
-\subsubsection{Step~4: Pre-Hooks}
+\subsubsection{步骤~4：预挂钩}
 \label{subsubsec:prehooks}
 
 \begin{lstlisting}[caption={pre-hooks.}, label=lst:prehooks]
 for(auto& hook: func->pre_hooks()) vars=hook(move(vars)); //426
 \end{lstlisting}
 
-Hooks are \texttt{std::function<variable\_list(variable\_list\&\&)>} installed at graph-build time. Python bindings wrap them with \texttt{py::gil\_scoped\_acquire} at so hook execution is GIL-safe even from CUDA workers.
+钩子是在图形构建时安装的 \texttt{std::function<variable\_list(variable\_list\&\&)>} 。 Python 绑定用 \texttt{py::gil\_scoped\_acquire} 包装它们，因此即使对于 CUDA 工作线程来说，钩子执行也是 GIL 安全的。
 
-\subsubsection{Step~5: Apply under \texttt{CurrentEvalNodeGuard}}
+\subsubsection{步骤~5：在\texttt{CurrentEvalNodeGuard}下申请}
 \label{subsubsec:apply}
 
 \begin{lstlisting}[caption={apply.}, label=lst:apply]
@@ -484,23 +484,23 @@ if(AnomalyMode::is_enabled()){ //434
 } else outputs=func->apply(move(vars)); //444
 \end{lstlisting}
 
- pushes \texttt{func} onto \texttt{tls\_current\_evaluating\_node}, so any \texttt{Node} allocated inside this \texttt{apply} (possible under \texttt{create\_graph}) records the current node as its anomaly parent via. On exception with anomaly enabled, the engine prints the forward stack chain before rethrowing.
+将 \texttt{func} 推到 \texttt{tls\_current\_evaluating\_node} 上，因此在此 \texttt{apply} 内分配的任何 \texttt{Node} （可能在 \texttt{create\_graph} 下）将当前节点记录为其异常父节点。在启用异常的异常情况下，引擎会在重新抛出之前打印前向堆栈链。
 
- also emits \texttt{"apply \%s inputs=[...]"} with rendering shape/dtype and, at level~3, up to eight element values.
+还发出具有渲染形状/dtype 的 \texttt{"apply \%s inputs=[...]"} ，并且在级别~3 处最多八个元素值。
 
-\subsubsection{Step~6: Post-Hooks}
+\subsubsection{步骤~6：后钩}
 \label{subsubsec:posthooks}
 
 \begin{lstlisting}[caption={post-hooks.}, label=lst:posthooks]
 for(auto& hook: func->post_hooks()) outputs=hook(outputs, move(outputs)); //447 -- signature (inputs,outputs)->outputs
 \end{lstlisting}
 
-Post-hooks receive both the inputs and the outputs of this node and may rewrite the outputs (e.g.\ grad clipping). The C++ binding exposes a \texttt{(inputs,outputs)->outputs} signature plus GIL acquisition.
+Post-hooks 接收该节点的输入和输出，并可能重写输出（例如\ grad Clipping）。 C++ 绑定公开 \texttt{(inputs,outputs)->outputs} 签名以及 GIL 获取。
 
-\subsubsection{Step~7: Shape Validation and \texttt{sum\_to\_shape}}
+\subsubsection{步骤~7：形状验证和\texttt{sum\_to\_shape}}
 \label{subsubsec:sumto}
 
-Broadcasting during forward inflates a scalar grad to a large shape. Before the next edge consumes the grad, the engine must reduce it to the forward-input shape recorded on that edge. Listing~\ref{lst:sumtoshape} is the routine.
+转发期间的广播将标量梯度膨胀为大形状。在下一个边缘消耗梯度之前，引擎必须将其减少到该边缘上记录的前向输入形状。列出~\ref{lst:sumtoshape} 是例行公事。
 
 \begin{lstlisting}[caption={broadcast recovery.}, label=lst:sumtoshape]
 static Tensor sum_to_shape(const Tensor& grad,const vector<int64_t>& target){ //298
@@ -515,9 +515,9 @@ static Tensor sum_to_shape(const Tensor& grad,const vector<int64_t>& target){ //
 }
 \end{lstlisting}
 
-Called for each \texttt{i < min(outputs.size,edges.size)}, if \texttt{edges[i].has\_shape\_hint} and the grad's sizes mismatch the hint, \texttt{sum\_to\_shape} is invoked. The logic keeps dimensions where \texttt{target==1} but \texttt{grad>1} and sums with \texttt{keepdim=true}, then reshapes away leading broadcast dimensions. Under \texttt{create\_graph}, the \texttt{reshape} calls join the second-order graph because \texttt{GradModeGuard} is still active.
+为每个 \texttt{i < min(outputs.size,edges.size)} 调用，如果 \texttt{edges[i].has\_shape\_hint} 和毕业生的尺寸与提示不匹配，则调用 \texttt{sum\_to\_shape}。该逻辑将维度保留在 \texttt{target==1} 但 \texttt{grad>1} 处，并与 \texttt{keepdim=true} 求和，然后重塑前导广播维度。在 \texttt{create\_graph} 下，\texttt{reshape} 调用连接二阶图，因为 \texttt{GradModeGuard} 仍然处于活动状态。
 
-\subsubsection{Step~8: Dtype Cast}
+\subsubsection{步骤~8：Dtype Cast}
 \label{subsubsec:dtypecast}
 
 \begin{lstlisting}[caption={dtype alignment.}, label=lst:dtypecast]
@@ -526,9 +526,9 @@ if(gdt && isFloatingType(*gdt) && isFloatingType(outputs[i].dtype()) && outputs[
   outputs[i]=tpx::to(outputs[i], *gdt); //501 autocast rebalance: fp32->bf16 etc.
 \end{lstlisting}
 
-Edge dtype hints exist so that an \texttt{fp32} grad produced by an unwrapped promote op re-enters a backward node whose saved tensors are low-precision (the autocast case documented at). Non-floating hints (bool masks, indices) are never grads and are left alone. The \texttt{InferenceMode} guard matches the dispatcher's \texttt{inference\_tensor\_} semantics.
+存在边缘 dtype 提示，以便由未包装的提升操作生成的 \texttt{fp32} grad 重新进入其保存的张量是低精度的向后节点（自动转换情况记录在）。非浮动提示（布尔掩码、索引）永远不会是梯度，并且会被单独保留。 \texttt{InferenceMode} 防护与调度程序的 \texttt{inference\_tensor\_} 语义相匹配。
 
-\subsubsection{Step~9: NaN Probe}
+\subsubsection{步骤~9：NaN 探测}
 \label{subsubsec:nanprobe}
 
 \begin{lstlisting}[caption={NaN probe.}, label=lst:nanprobe]
@@ -538,12 +538,12 @@ bool tensor_has_nan(const Tensor& t){ //139
 }
 \end{lstlisting}
 
-At: if \texttt{AnomalyMode::is\_enabled\&\&should\_check\_nan}, each output is probed under a local \texttt{GradModeGuard(false)} so the probe itself does not record history. On failure the engine throws.
+At：如果 \texttt{AnomalyMode::is\_enabled\&\&should\_check\_nan}，则在本地 \texttt{GradModeGuard(false)} 下探测每个输出，因此探测器本身不记录历史记录。发生故障时，发动机会抛出故障。
 
-\subsubsection{Step~10: Propagation, Accumulation, and Enqueue}
+\subsubsection{步骤~10：传播、累加和入队}
 \label{subsubsec:propagate}
 
-Listing~\ref{lst:propagate} at distributes outputs to parents.
+列出 ~\ref{lst:propagate} 将输出分发给父母。
 
 \begin{lstlisting}[caption={propagation.}, label=lst:propagate]
 auto num=outputs.size(); auto& edges=func->next_edges(); //515
@@ -570,13 +570,13 @@ if(!task.keep_graph_) func->release_variables(); //594 clears next_edges_
 if(task.task_completed()) queue_for_device(-1)->notify(); //598 wakes initiator
 \end{lstlisting}
 
-Under \texttt{task.mutex\_} the engine decrements \texttt{dependencies\_[next]}, stashing the first contribution in \texttt{not\_ready\_[next]} and calling \texttt{InputBuffer::add:554,565} for subsequent ones. When the counter hits zero the buffer is moved into a \texttt{NodeTask} and handed to \texttt{enqueue\_task}, which picks the queue by \texttt{device\_index} (or the local queue for nested graphs). clears \texttt{next\_edges\_} so the DAG is freed eagerly when \texttt{retain\_graph==false} but stays intact when \texttt{create\_graph} or \texttt{retain\_graph} requested it.
+在 \texttt{task.mutex\_} 下，引擎递减 \texttt{dependencies\_[next]}，将第一个贡献存储在 \texttt{not\_ready\_[next]} 中，并为后续贡献调用 \texttt{InputBuffer::add:554,565}。当计数器为零时，缓冲区将移入 \texttt{NodeTask} 并交给 \texttt{enqueue\_task}，后者按 \texttt{device\_index} 选择队列（或嵌套图的本地队列）。清除 \texttt{next\_edges\_}，以便在 \texttt{retain\_graph==false} 时立即释放 DAG，但在 \texttt{create\_graph} 或 \texttt{retain\_graph} 请求时保持完整。
 
 %==============================================================================
-\subsection{SavedVariable and VariableVersion: Mutation Guard}
+\subsection{SavedVariable 和 VariableVersion：突变防护}
 \label{subsec:savedvar}
 
-Backward needs forward tensors. Storing a bare \texttt{Tensor} would silently yield wrong grads if the tensor is mutated in-place between forward and backward. TensorPlay uses a version counter on storage plus a guarded handle (Listings~\ref{lst:savedvar}--\ref{lst:varver}).
+后向需要前向张量。如果张量在向前和向后之间就地变异，则存储裸露的 \texttt{Tensor} 会默默地产生错误的梯度。 TensorPlay 在存储上使用版本计数器以及受保护的句柄（清单~\ref{lst:savedvar}--\ref{lst:varver}）。
 
 \begin{lstlisting}[caption={guarded handle.}, label=lst:savedvar]
 class SavedVariable{ //15
@@ -611,35 +611,31 @@ class VariableVersion{ //24
 
 \begin{table}[H]
 \centering
-\caption{Version lifecycle. Every path:line is a contract, not a suggestion.}
+\caption{版本生命周期。每条路径：线都是合同，而不是建议。}
 \label{tab:verlife}
 \small
 \begin{tabular}{lll}
 \toprule
-Site & Path:Line & Action \\
+Site & 路径：线 & 行动 \\
 \midrule
-\texttt{TensorImpl::version\_counter\_} & & Initialized as \texttt{VariableVersion(!InferenceMode::is\_enabled)}; inference tensors get a disabled counter. \\
-\texttt{TensorImpl::bump\_version} & & \texttt{version\_counter\_.bump} (+ inference-mode guard). \\
-Generated mutating ops & & \texttt{if(!InferenceMode::is\_enabled) \_\_tp\_tensor.impl->bump\_version} for every \texttt{a!} arg. \\
-View creation & & \texttt{result.impl->share\_version\_counter(input.impl)} so view+base share one \texttt{VersionCounter}. \\
-\texttt{SavedVariable::save} & & Snapshots \texttt{tensor.unsafeGetTensorImpl->version}. \\
-\texttt{SavedVariable::unpack} & & Compares current version; throws with both versions in the message if mismatched. \\
- & & \texttt{is\_view\_of\_leaf} checks \texttt{attr\_version} before walking through view nodes. \\
+\texttt{TensorImpl::version\_counter\_} &  & 初始化为\texttt{VariableVersion(!InferenceMode::is\_enabled)}；推理张量得到一个禁用的计数器。 \\
+\texttt{TensorImpl::bump\_version} &  & \texttt{version\_counter\_.bump}（+ 推理模式防护）。 \\
+生成的变异操作 &  & \texttt{if(!InferenceMode::is\_enabled) \_\_tp\_tensor.impl->bump\_version} 对于每个 \texttt{a!} 参数。 \\
+查看创建 &  & \texttt{result.impl->share\_version\_counter(input.impl)} 所以视图+基共享一个 \texttt{VersionCounter}。 \\
+\texttt{SavedVariable::save} &  & 快照\texttt{tensor.unsafeGetTensorImpl->version}。 \\
+\texttt{SavedVariable::unpack} &  & 比较当前版本；如果消息中的两个版本不匹配，则会抛出异常。 \\
+  &  & \texttt{is\_view\_of\_leaf} 在遍历视图节点之前检查 \texttt{attr\_version}。 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Why eagerly allocated: always allocates a \texttt{VersionCounter}. If allocation were lazy, a base that had not yet mutated and a view created before any mutation would each grow their own counter on first bump, and later mutations on one alias would be invisible to the other. Eager allocation plus guarantees all aliases observe the same bump. The counter is atomic so bumps from one alias are visible to readers holding another.
-
-\begin{tppitfall}[Pitfall: ``Lazy Version Counter'' Is Silently Wrong, Not Slow]
-The eager \texttt{VersionCounter} allocation at looks like a gratuitous \texttt{make\_shared} for every tensor, including the vast majority that never join a graph. Tempting ``optimization'': allocate the counter on first \texttt{bump}. That optimization silently breaks view aliasing: \texttt{x} and \texttt{x.view(...)} would each lazily allocate \emph{their own} counter on first mutation, so \texttt{SavedVariable::unpack} at would see \texttt{saved\_version\_==current} even after the alias was mutated in place---producing numerically wrong gradients with no exception. The failure signature is the opposite of the current design's: today a mutated-in-place saved variable \emph{throws} with both version numbers in the message; under lazy allocation it would compute garbage. Correctness guards must fail loud, and loudness must not depend on allocation timing.
-\end{tppitfall}
+为什么急切分配：总是分配 \texttt{VersionCounter}。如果分配是惰性的，则尚未突变的基数和在任何突变之前创建的视图将在第一次碰撞时各自增加自己的计数器，并且一个别名上的后续突变将对另一个别名不可见。热切分配加上保证所有别名观察到相同的凹凸。计数器是原子的，因此持有另一个别名的读者可以看到来自一个别名的碰撞。
 
 %==============================================================================
-\subsection{Anomaly and Mode Guards}
+\subsection{异常和模式防护}
 \label{subsec:guards}
 
- and its companion separate a global switch from a thread-local current node (Listing~\ref{lst:anomaly}).
+及其同伴将全局开关与线程本地当前节点分开（Listing~\ref{lst:anomaly}）。
 
 \begin{lstlisting}[caption={and .}, label=lst:anomaly]
 class AnomalyMode{ //14
@@ -663,16 +659,16 @@ struct CurrentEvalNodeGuard{ //57
 };
 \end{lstlisting}
 
-State machine:
+状态机：
 
 \begin{itemize}[leftmargin=1.2em]
-\item User calls \texttt{tensorplay.autograd.set\_detect\_anomaly(True)} which reaches \texttt{AnomalyMode::set\_enabled(enabled,check\_nan)}. This sets two globals visible to every thread; no TLS, no refcount, so the first thread that enables it pays for all.
-\item On node creation, snapshots the current stack via \texttt{store\_stack:38}. By default that calls \texttt{tensorplay::get\_stacktrace} (C++ frames). The Python binding at installs a capturer that calls \texttt{traceback.format\_stack} under the GIL, so the stored traceback is the Python call site of the forward op, not a C++ backtrace.
-\item During backward, pushes the evaluating node onto \texttt{tls\_current\_evaluating\_node}. Any node created inside that \texttt{apply} (second-order graph) records the pushed node as its \texttt{AnomalyMetadata::parent\_}. On failure the engine walks the chain at \texttt{print\_stack} printing \texttt{"Previous calculation was induced by..."} per parent until the weak pointer expires.
-\item The NaN check ( via \texttt{t.ne(t).any}) is gated on and runs under a local \texttt{GradModeGuard(false)} so the probe never mutates \texttt{GradMode}.
+\item 用户调用 \texttt{tensorplay.autograd.set\_detect\_anomaly(True)} 到达 \texttt{AnomalyMode::set\_enabled(enabled,check\_nan)}。这设置了两个对每个线程可见的全局变量；没有 TLS，没有引用计数，因此第一个启用它的线程将支付所有费用。
+\item 创建节点时，通过 \texttt{store\_stack:38} 快照当前堆栈。默认情况下调用 \texttt{tensorplay::get\_stacktrace} （C++ 框架）。 Python 绑定安装了一个在 GIL 下调用 \texttt{traceback.format\_stack} 的捕获器，因此存储的回溯是前向操作的 Python 调用站点，而不是 C++ 回溯。
+\item 在向后期间，将评估节点推到 \texttt{tls\_current\_evaluating\_node} 上。在该 \texttt{apply}（二阶图）内创建的任何节点都会将推送的节点记录为其 \texttt{AnomalyMetadata::parent\_}。失败时，引擎会在 \texttt{print\_stack} 处遍历链，为每个父项打印 \texttt{"Previous calculation was induced by..."} ，直到弱指针过期。
+\item NaN 检查（通过 \texttt{t.ne(t).any}）被门控并在本地 \texttt{GradModeGuard(false)} 下运行，因此探针永远不会改变 \texttt{GradMode}。
 \end{itemize}
 
-\subsubsection{GradMode and InferenceMode: Thread-Local Switches}
+\subsubsection{GradMode 和 InferenceMode：线程本地开关}
 \label{subsubsec:gradmode}
 
 \begin{lstlisting}[caption={and .}, label=lst:gradmode]
@@ -682,13 +678,13 @@ class InferenceMode{ static bool is_enabled(){ return enabled_; } static void se
 // InferenceMode.cpp:5  thread_local bool InferenceMode::enabled_ = false;
 \end{lstlisting}
 
-Both live in \texttt{p10} deliberately (the Python binding re-exports them as \texttt{ InferenceMode}) so dispatch can consult them without depending on \texttt{tpx}. They are true \texttt{thread\_local}: \texttt{no\_grad} in one thread does not leak into engine workers or other user threads. Inference tensors are born with \texttt{version\_counter\_\{false\}} and \texttt{inference\_tensor\_=true}; omits the Autograd bit for them, and skips dtype casts when \texttt{InferenceMode::is\_enabled}. RAII helpers and restore previous values, including on exceptions.
+两者都故意存在于 \texttt{p10} 中（Python 绑定将它们重新导出为 \texttt{ InferenceMode}），因此调度可以在不依赖 \texttt{tpx} 的情况下查阅它们。它们是真实的 \texttt{thread\_local}: 一个线程中的 \texttt{no\_grad} 不会泄漏到引擎工作线程或其他用户线程中。推理张量天生具有 \texttt{version\_counter\_\{false\}} 和 \texttt{inference\_tensor\_=true}；省略它们的 Autograd 位，并在 \texttt{InferenceMode::is\_enabled} 时跳过 dtype 转换。 RAII 帮助程序并恢复以前的值，包括异常情况。
 
 %==============================================================================
-\subsection{Python Binding: \texttt{PyNode} and the Single-Crossing Hot Path}
+\subsection{Python 绑定：\texttt{PyNode} 和单交叉热路径}
 \label{subsec:pynode}
 
-Custom autograd functions are the escape hatch for user code. The binding is at (Listing~\ref{lst:pynode}).
+自定义 autograd 函数是用户代码的逃生口。绑定位于 (Listing~\ref{lst:pynode})。
 
 \begin{lstlisting}[caption={\texttt{PyNode}.}, label=lst:pynode]
 class PyNode : public tpx::Node{ //24
@@ -716,27 +712,27 @@ class PyNode : public tpx::Node{ //24
 }, "outputs"_a);
 \end{lstlisting}
 
-The binding is more than a trampoline. Three hot-path optimizations cut per-op Python overhead:
+绑定不仅仅是一个蹦床。三个热路径优化减少了每个操作的 Python 开销：
 
 \begin{enumerate}[leftmargin=1.2em]
-\item and batch edge wiring: one crossing builds the \texttt{vector<Edge>} for all tensor args by iterating \texttt{py::isinstance<Tensor>} at and calling per tensor, then \texttt{add\_next\_edge\_list} once. The non-batched Python loop in would pay N pybind crossings otherwise.
-\item is the single-entry fast path. It creates the \texttt{PyNode}, unpacks \texttt{needs\_input\_grad}, wires \texttt{next\_edges} (\texttt{327}), disables GradMode (\texttt{346}), calls \texttt{forward} plus \texttt{setup\_context}, marks outputs with \texttt{set\_grad\_fn} plus \texttt{OutputSlotMeta} (\texttt{368}), and returns \texttt{(output, ctx, needs, executable, node)} all in one GIL hold. Python only builds the backward closure afterwards. This replaces five round-trips with one.
-\item and \texttt{grad} release the GIL before entering \texttt{grad}, because workers need it to re-enter Python for \texttt{PyNode::apply}. Holding it would deadlock.
+\item 和批量边缘连接：一次交叉通过迭代 \texttt{py::isinstance<Tensor>} 并调用每个张量，然后 \texttt{add\_next\_edge\_list} 一次，为所有张量参数构建 \texttt{vector<Edge>} 。否则，非批处理的 Python 循环将付出 N 次 pybind 交叉。
+\item 是单入口快速路径。它创建 \texttt{PyNode}、解压 \texttt{needs\_input\_grad}、连线 \texttt{next\_edges} (\texttt{327})、禁用 GradMode (\texttt{346})、调用 \texttt{forward} 加 \texttt{setup\_context}、用 \texttt{set\_grad\_fn} 加 \texttt{OutputSlotMeta} (\texttt{368}) 标记输出，并返回 \texttt{(output, ctx, needs, executable, node)}，所有这些都在一个 GIL 保持中完成。 Python 之后只构建向后闭包。这将五次往返替换为一次。
+\item \texttt{grad} 在进入 \texttt{grad} 之前释放 GIL，因为工作人员需要它才能重新进入 Python \texttt{PyNode::apply}。坚持下去就会陷入僵局。
 \end{enumerate}
 
- overrides the default \texttt{next\_edges\_.size} when \texttt{output\_metas\_} is non-empty, because for custom functions the backward arity is the forward's outputarity, not its input arity. Hook registration on \texttt{Node} wraps the user hook with a GIL acquire so hooks are safe even when invoked from CUDA workers.
+当 \texttt{output\_metas\_} 非空时覆盖默认的 \texttt{next\_edges\_.size} ，因为对于自定义函数，后向元数是前向的输出元数，而不是其输入元数。 \texttt{Node} 上的钩子注册使用 GIL 获取包装用户钩子，因此即使从 CUDA 工作线程调用钩子也是安全的。
 
 %==============================================================================
-\subsection{Deep Dive: Six Mechanisms Under the Scheduling Story}
+\subsection{深入探讨：调度故事下的六种机制}
 \label{subsec:autograd-deep}
 
-The preceding sections described the engine's data structures and the ten-step interpreter. Six finer mechanisms---each small in code, each load-bearing in practice---complete the picture of how the scheduler stays correct under pruning, leaves, failures, hooks, reentrancy, and observation.
+前面的部分描述了引擎的数据结构和十步解释器。六个更精细的机制——代码中的每一个小，实践中的每一个承载——完成了调度程序如何在修剪、叶子、失败、钩子、重入和观察下保持正确的图景。
 
 %----------------------------------------------------------------------
-\subsubsection{The \texttt{topological\_nr} Pruning Fence}
+\subsubsection{\texttt{topological\_nr} 修剪栅栏}
 \label{subsubsec:topoprune}
 
-Every node carries a second counter besides \texttt{sequence\_nr}: a \texttt{topological\_nr} maintained incrementally at edge insertion time. When a node links to a parent, its counter becomes the parent's counter plus one---if that is larger than its current value:
+除了 \texttt{sequence\_nr} 之外，每个节点还携带第二个计数器：在边缘插入时增量维护的 \texttt{topological\_nr} 。当一个节点链接到父节点时，它的计数器变成父节点的计数器加一——如果它大于它的当前值：
 
 \begin{lstlisting}[caption={Topological number maintenance is two lines at graph-construction time---no pass over the graph is ever needed later.}]
 void update_topological_nr(const Edge& edge) {
@@ -748,12 +744,12 @@ void update_topological_nr(const Edge& edge) {
 }
 \end{lstlisting}
 
-The counter enables the engine's most effective optimization: before counting dependencies, the engine computes the \emph{minimum} topological number among the requested outputs, and both the BFS and the execute-marking walk skip any node whose number is smaller. The invariant that makes this sound: a node with \texttt{topo\_nr} smaller than an output's can, by construction, never lie on a path \emph{to} that output, so the walk does not need to visit it. On a graph where \texttt{backward()} targets only a late output, whole subtrees of early forward ops are pruned before the counters are even built---the fence is what keeps \texttt{grad(outputs=[y])} from paying for \texttt{backward()} over the entire graph.
+计数器使引擎能够进行最有效的优化：在对依赖关系进行计数之前，引擎会计算所请求的输出中的 \emph{minimum} 拓扑编号，并且 BFS 和执行标记遍历都会跳过编号较小的任何节点。发出这种声音的不变量是： \texttt{topo\_nr} 小于输出的节点可以通过构造，永远不会位于输出的路径 \emph{to} 上，因此步行不需要访问它。在 \texttt{backward()} 仅针对后期输出的图表上，早期前向操作的整个子树在计数器构建之前就被修剪——栅栏是阻止 \texttt{grad(outputs=[y])} 在整个图表上为 \texttt{backward()} 付费的原因。
 
-\subsubsection{\texttt{AccumulateGrad}: the Leaf Contract}
+\subsubsection{\texttt{AccumulateGrad}：叶子合约}
 \label{subsubsec:accumulategrad}
 
-Leaf tensors do not receive gradients through the generic propagation path. Each leaf with \texttt{requires\_grad} owns a dedicated \texttt{AccumulateGrad} node whose \texttt{sequence\_nr} is \texttt{UINT64\_MAX}, forcing the priority queue to schedule it as early as its dependencies allow. Its body implements the full leaf contract in one page: device check, shape reconciliation, contiguity, and the final store:
+叶张量不通过通用传播路径接收梯度。每个带有 \texttt{requires\_grad} 的叶子都拥有一个专用的 \texttt{AccumulateGrad} 节点，其 \texttt{sequence\_nr} 是 \texttt{UINT64\_MAX}，强制优先级队列在其依赖项允许的情况下尽早对其进行调度。它的主体在一页中实现了完整的叶契约：设备检查、形状协调、连续性和最终存储：
 
 \begin{lstlisting}[caption={The leaf node's shape reconciliation: the same reduce-then-reshape logic as the engine-wide \texttt{sum\_to\_shape}, specialized for parameters.}]
 explicit AccumulateGrad(const Tensor& t)
@@ -777,12 +773,12 @@ variable_list apply(variable_list&& inputs) override {
 }
 \end{lstlisting}
 
-Three design points are worth reading off. First, the shape fix lives \emph{at the leaf}, not in every producing node: intermediate nodes pass broadcast-inflated shapes along their edges and only the final destination reconciles. Second, the contiguity materialization documents its consumer contract---the \emph{foreach} optimizer kernels and the NumPy bridge both require dense storage, so a transposed gradient is copied once here rather than surprising a consumer later. Third, the metadata side of the store is a weak-reference handshake: the tensor's \texttt{grad\_accumulator} is a \texttt{weak\_ptr<Node>} precisely because the node strongly owns the tensor---a strong edge back would form an uncollectable cycle that leaks every leaf that ever participated in a graph.
+三个设计要点值得一读。首先，形状修复存在于 \emph{at the leaf} 中，而不是在每个生产节点中：中间节点沿其边缘传递广播膨胀的形状，并且只有最终目的地进行协调。其次，连续性物化记录了它的消费者契约——\emph{foreach}优化器内核和NumPy桥都需要密集存储，因此转置梯度在这里复制一次，而不是稍后让消费者感到惊讶。第三，存储的元数据端是弱引用握手：张量的 \texttt{grad\_accumulator} 是 \texttt{weak\_ptr<Node>} ，正是因为节点强烈拥有该张量——强边回将形成一个无法收集的循环，泄漏参与图中的每个叶子。
 
-\subsubsection{Exception Containment and the First-Error Rule}
+\subsubsection{异常遏制和首次错误规则}
 \label{subsubsec:exceptions}
 
-Backward is a concurrent execution over multiple worker threads, so exception handling is a design question, not an afterthought. The rules: (i) each worker catches every exception thrown by a node's \texttt{apply} and records it into the \texttt{GraphTask} with a first-wins policy---the mutex-guarded store keeps the \emph{first} exception pointer and silently drops later ones, because a graph that has already failed does not need three error reports; (ii) the recording worker then decrements the outstanding-task count exactly as a success would, so completion accounting stays correct on the failure path; (iii) the initiating thread, which blocks on the task's condition variable, wakes on completion and rethrows the recorded exception after the graph has fully quiesced. The consequence: one node's shape error never leaves sibling workers spinning, and the user sees a single traceback from a single deterministic place---the initiating thread, after the graph drains.
+向后是多个工作线程上的并发执行，因此异常处理是一个设计问题，而不是事后的想法。规则：（i）每个工作线程捕获节点的 \texttt{apply} 抛出的每个异常，并以先胜策略将其记录到 \texttt{GraphTask} 中——互斥锁保护存储保留 \emph{first} 异常指针并默默地删除后面的异常指针，因为已经失败的图不需要三个错误报告； (ii) 记录工作人员然后精确地减少未完成任务计数，就像成功时一样，因此完成计数在失败路径上保持正确； (iii) 启动线程阻塞任务的条件变量，在完成时唤醒，并在图完全停顿后重新抛出记录的异常。结果是：一个节点的形状错误永远不会让同级工作线程旋转，并且在图耗尽之后，用户会看到来自单个确定性位置（启动线程）的单个回溯。
 
 \begin{lstlisting}[caption={Completion accounting is identical for success and failure; only the initiating thread ever rethrows.}]
 bool task_completed() {
@@ -801,20 +797,20 @@ void record_exception(std::exception_ptr exc) {
 }
 \end{lstlisting}
 
-\subsubsection{Final Callbacks: Post-Backward Hooks Without Racing}
+\subsubsection{最终回调：没有竞赛的后向后钩子}
 \label{subsubsec:finalcallbacks}
 
-Some consumers need code to run \emph{after} the whole graph finishes but \emph{from inside} the backward call---the FSDP backward-completion hooks are the motivating example. A plain ``call my function at the end of \texttt{backward}'' API cannot work in an engine where any worker might be the last to finish. The engine exposes \texttt{queue\_callback}, valid only while a backward is executing on the current thread; the \texttt{GraphTask} stores the callback vector under its own mutex, and the initiator drains the list \emph{by index in a loop} rather than consuming the vector wholesale---because a callback is allowed to queue another callback while the drain is running. Execution order is therefore well-defined (FIFO including callbacks queued during the drain), and the drain runs before the initiating thread returns from \texttt{backward}, so post-backward logic observes fully accumulated leaf gradients without any user-side polling.
+一些消费者需要代码来运行 \emph{after} 整个图完成，但 \emph{from inside} 向后调用——FSDP 向后完成挂钩就是一个激励性的例子。普通的“在 \texttt{backward} 末尾调用我的函数”API 无法在任何工作人员可能最后完成的引擎中工作。引擎公开 \texttt{queue\_callback}，仅在当前线程上执行向后操作时有效； \texttt{GraphTask} 将回调向量存储在其自己的互斥体下，发起者会排出列表 \emph{by index in a loop} 而不是批量消耗向量——因为在排出运行时，允许一个回调对另一个回调进行排队。因此，执行顺序是明确定义的（FIFO 包括在排出期间排队的回调），并且排出在启动线程从 \texttt{backward} 返回之前运行，因此后向逻辑无需任何用户端轮询即可观察到完全累积的叶梯度。
 
-\subsubsection{Reentrant Backward and the Local-Queue Trick}
+\subsubsection{可重入向后和本地队列技巧}
 \label{subsubsec:reentrant}
 
-A node's \texttt{apply} may itself call \texttt{backward}---higher-order differentiation with \texttt{create\_graph}, or a custom function that reduces a loss mid-graph. The engine tracks a \texttt{thread\_local} nesting depth; when it is nonzero, the execute path routes \emph{every} task of the inner graph to a stack-local \texttt{ReadyQueue} that only the current thread drains. The deadlock this prevents is structural: without it, an inner task could land on a device queue whose worker is busy with the outer graph, waiting for a node that can only run after the inner backward returns---a cycle across two queues. With the local queue the inner graph is strictly single-threaded, self-contained, and cannot block on outer-graph workers; nested graphs lose intra-graph parallelism, which is acceptable because reentrant backward is rare and usually small, while the alternative is a deadlock that no scheduling priority can recover.
+节点的 \texttt{apply} 本身可以调用 \texttt{backward}——与 \texttt{create\_graph} 的高阶微分，或减少图中损失的自定义函数。引擎跟踪 \texttt{thread\_local} 嵌套深度；当它非零时，执行路径将内部图的 \emph{every} 任务路由到仅当前线程耗尽的堆栈本地 \texttt{ReadyQueue} 。这样可以防止的死锁是结构性的：如果没有它，内部任务可能会落在设备队列上，而该队列的工作人员正忙于外部图，等待一个只能在内部向后返回后运行的节点——跨两个队列的循环。使用本地队列，内部图是严格单线程的、独立的，并且不能阻塞外部图工作线程；嵌套图会失去图内并行性，这是可以接受的，因为向后重入很少见且通常很小，而替代方案是调度优先级无法恢复的死锁。
 
-\subsubsection{Engine Tracing: Observing the Scheduler}
+\subsubsection{引擎跟踪：观察调度程序}
 \label{subsubsec:enginetrace}
 
-The scheduler's decisions---dependency counts, buffer coalescing, queue routing---are exactly the parts a reader cannot infer from a static diagram. An environment-gated trace facility makes them observable: \texttt{TP\_ENGINE\_TRACE=1} emits lifecycle events, level~2 adds per-node applications with shapes and every delivery decision (counter decrement, buffer hit, enqueue), and level~3 prints truncated gradient \emph{values}. Every line is prefixed with the graph's monotonic id, so nested and concurrent backwards remain separable in the log; nodes are labeled \texttt{name\#sequence\_nr@pointer-suffix}, a label that stays stable for one graph and is greppable across it. The facility compiles to zero cost when the level variable reads zero (one static integer load per event site), so it can ship enabled and be turned on for a misbehaving graph in production without rebuilding.
+调度程序的决策——依赖计数、缓冲区合并、队列路由——正是读者无法从静态图中推断出的部分。环境门控跟踪设施使它们可观察：\texttt{TP\_ENGINE\_TRACE=1} 发出生命周期事件，level~2 添加每个节点应用程序的形状和每个交付决策（计数器递减、缓冲区命中、排队），level~3 打印截断的梯度 \emph{values}。每行都以图形的单调 id 为前缀，因此嵌套和并发向后在日志中保持可分离；节点被标记为 \texttt{name\#sequence\_nr@pointer-suffix}，该标签对于一个图保持稳定并且可在其上进行 grep 操作。当级别变量读取为零（每个事件站点一个静态整数加载）时，该设施编译为零成本，因此它可以在生产中启用并打开以应对生产中行为不当的图表，而无需重建。
 
 \begin{lstlisting}[caption={Trace output is designed to be read: graph id, stable node labels, and the decision being made.}, style=pystyle]
 # TP_ENGINE_TRACE=2 python train.py 2> trace.log
@@ -827,10 +823,10 @@ The scheduler's decisions---dependency counts, buffer coalescing, queue routing-
 
 %----------------------------------------------------------------------
 
-\subsection{Explicit DAG in Two Dimensions}
+\subsection{二维显式 DAG}
 \label{subsec:dagfig}
 
-Figure~\ref{fig:autograddag} shows the graph the engine actually walks. Each node's \texttt{next\_edges\_} are the incoming grad channels; the heap key is the \texttt{sequence\_nr\_}. Device placement is an \texttt{Edge} hint, not a separate schedule.
+图~\ref{fig:autograddag}展示了引擎实际行走的图表。每个节点的\texttt{next\_edges\_}是传入的grad通道；堆键是 \texttt{sequence\_nr\_}。设备放置是一个 \texttt{Edge} 提示，而不是单独的计划。
 
 \begin{figure}[H]
 \centering
@@ -852,67 +848,25 @@ Figure~\ref{fig:autograddag} shows the graph the engine actually walks. Each nod
 \draw[arrow, dashed, color=gray] (n1.east) -- ++(0.55,0) |- (q.east);
 \draw[arrow, dashed, color=gray] (n2.east) -- ++(0.35,0) |- (q.east);
 \end{tikzpicture}
-\caption{Explicit DAG, no Tape. Nodes carry \texttt{ OutputSlotMeta}; edges carry \texttt{ device\_hint}. Engine's \texttt{ReadyQueue} pops the largest \texttt{sequence\_nr} first; \texttt{dependencies\_} gates readiness. Reentrant backward bypasses device queues into a stack-local \texttt{local\_queue} guarded by \texttt{nested\_depth\_}.}
+\caption{显式 DAG，无磁带。节点携带 \texttt{ OutputSlotMeta}；边带有 \texttt{ device\_hint}。引擎的 \texttt{ReadyQueue} 首先弹出最大的 \texttt{sequence\_nr}； \texttt{dependencies\_} 大门准备就绪。可重入向后绕过设备队列进入由 \texttt{nested\_depth\_} 保护的堆栈本地 \texttt{local\_queue}。}
 \label{fig:autograddag}
 \end{figure}
 
 %==============================================================================
-\subsection{Design Tradeoffs}
-\label{subsec:compare}
-
-Table~\ref{tab:compare} summarizes the load-bearing design choices and the deliberate simplifications that preserve correctness guards.
-
-\begin{table}[H]
-\centering
-\caption{Autograd design choices and tradeoffs.}
-\label{tab:compare}
-\small
-\begin{tabular}{lll}
-\toprule
-Axis & TensorPlay & Alternative design \\
-\midrule
-Graph structure & Explicit DAG: of \texttt{Edge}; no Tape & Linear recording with a separate replay structure \\
-Identity & thread-local monotonic; longest-path & Global incremented \texttt{sequence\_nr} plus \texttt{topo} via \texttt{Node::update\_topological\_nr} pattern \\
-DispatchKeys & 13 keys at (3 backends $\times$ \{ Backend,Autograd,Autocast,Vmap\} + Composite) & Larger key spaces with more specialized axes \\
-Dispatcher & \texttt{array<atomic<void*>,13>} + Composite fallback; 214 lines & Boxing, alias handling, and observation layers \\
-Table cost & computed on fly; batched returns early; inference skips Autograd & Stored bitset per \texttt{TensorImpl} plus extra keys for inference batched states \\
-Scheduler & max-heap by \texttt{sequence\_nr:37}, per-device workers, \texttt{local\_queue} for reentrancy & Thread pool plus \texttt{ReadyQueue} with topological priority \\
-Dependencies & BFS in-degree + \texttt{min\_topo} prune at \texttt{201}; & BFS plus \texttt{ThreadLocalState} propagation; per-task \texttt{captured\_vars} equivalent in \texttt{GraphTask} \\
-Filtering & via stack DFS with \texttt{Frame} & Explicit stack traversal with a \texttt{seen} set \\
-Accumulation & triple-condition in-place (\texttt{contiguous}+ \texttt{use\_count==2}+ \texttt{storage==1}) else for second-order & \texttt{InputBuffer} with \texttt{AccumulateGrad} leaf; copy-on-write plus \texttt{defined} short-circuit \\
-Shape recovery & reduce-where-\texttt{target==1} then reshape; called at \texttt{488} & \texttt{sum\_to\_shape} plus \texttt{view\_ops} broadcast handling; many kernels call it directly \\
-Version guard & atomic eager alloc + \texttt{SavedVariable} check at \texttt{20} with both versions in message & \texttt{ SavedVariable} with identical eager-share semantics plus \texttt{impl::bump\_version} \\
-Modes & \texttt{thread\_local true}, \texttt{thread\_local false}, lived in \texttt{p10} & \texttt{c10::GradMode} / \texttt{InferenceMode} in \texttt{c10} with same thread-local semantics \\
-Anomaly & Global +; chain via & \texttt{AnomalyMode} global plus \texttt{thread\_local current\_node}; Python traceback hook injected identically \\
-Python nodes & with \texttt{num\_inputs} over, single-crossing & \texttt{PyNode} / \texttt{CppNode} with identical \texttt{output\_metas} split (custom vs generated) \\
-Compile & Explicit, leak singleton; \texttt{TP\_PACKAGE\_DIR} at \texttt{CMakeLists.txt:TP\_PACKAGE\_DIR} & Lazy singleton with \texttt{atexit}; separate Python extension layout \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-Takeaways:
-
-\begin{itemize}[leftmargin=1.2em]
-\item The data structure is implemented in $\sim$1\,k lines (\texttt{*.h} +). The compactness comes from trimming sparse/quantized/inference key combinations, alias-key remapping, and operator boxing.
-\item Correctness guards are kept one-for-one: the version counter is eager and shared across views (lazy allocation would silently miss alias mutations), \texttt{sum\_to\_shape} and dtype casts run under \texttt{GradModeGuard} so second-order graphs are correct, and anomaly mode chains parents through the same \texttt{tls\_current\_evaluating\_node} mechanism.
-\item Scheduling uses a priority queue gated by in-degree. TensorPlay's max-heap key is the thread-local \texttt{sequence\_nr} and device routing uses per-device queues via \texttt{device\_index}; per-device workers are created on first use.
-\end{itemize}
-
-%==============================================================================
-\subsection{Invariants, Traces, and Local Verification}
+\subsection{不变量、跟踪和本地验证}
 \label{subsec:verify}
 
-Checked invariants the code enforces; violations are either warned or hard-fail:
+检查代码强制执行的不变量；违规行为要么被警告，要么被硬失败：
 
 \begin{itemize}[leftmargin=1.2em]
-\item updates before pushing. Forgetting this would let \texttt{min\_topo} prune incorrectly and drop live dependencies.
-\item requires \texttt{use\_count==2} (temporary impl alias counts as one) and \texttt{storage==1}. Accumulating in-place on a shared storage would alias-corrupt a sibling.
-\item checks \texttt{stop} \emph{after} the heap-empty test but \emph{before} waiting. Reversing the order would sleep one extra poll interval after the graph completes.
-\item must precede the queue push. Workers incrementally decrement and test \texttt{outstanding==0}; pushing without counting would hang the initiator.
-\item throws with both \texttt{saved\_version\_} and current version. The message is the same string users see in both codebases, enabling transferred runbooks.
+\item 推送前更新。忘记这一点会让 \texttt{min\_topo} 错误地修剪并删除实时依赖项。
+\item 需要 \texttt{use\_count==2} （临时 impl 别名算作 1）和 \texttt{storage==1}。在共享存储上就地累积会别名损坏同级。
+\item 检查 \texttt{stop} \emph{after} 堆空测试，但 \emph{before} 等待。颠倒顺序会在图表完成后休眠一个额外的轮询间隔。
+\item 必须先于队列推送。 Worker 逐步递减并测试 \texttt{outstanding==0}；不计数而推动会挂起启动器。
+\item \texttt{saved\_version\_} 和当前版本都会抛出异常。该消息与用户在两个代码库中看到的字符串相同，从而启用传输的 Runbook。
 \end{itemize}
 
-Tracing is free when off (level~0: one static \texttt{bool} check). Enabled via \texttt{3}:
+关闭时跟踪是免费的（level~0：一次静态 \texttt{bool} 检查）。通过 \texttt{3} 启用：
 
 \begin{lstlisting}[caption={Engine tracing (zero cost when off).}, label=lst:trace]
 TP_ENGINE_TRACE=2 python -c "import tensorplay; x=tensorplay.randn([2,3], requires_grad=True); y=(x*2).sum(); y.backward()"
@@ -922,7 +876,7 @@ TP_ENGINE_TRACE=2 python -c "import tensorplay; x=tensorplay.randn([2,3], requir
 # [tp-engine g1] buf  MulBackward#38 -> AccumulateGrad#1@... (waiting on more inputs)
 \end{lstlisting}
 
-Verification snippets (all pass on the cited commit; no Python import required for structural checks):
+验证片段（全部传递引用的提交；结构检查不需要 Python 导入）：
 
 \begin{lstlisting}[caption={Local reproduction of every cited path:line.}, label=lst:verify, style=pystyle]
 grep -n "get_and_increment_sequence_nr\|sequence_nr_\|topological_nr_\|materialize_grads_\|output_metas_\|pre_hooks_\|anomaly_metadata_" tpx/include/Node.h | head -n 25
@@ -960,4 +914,4 @@ print("autograd invariants hold")
 PY
 \end{lstlisting}
 
-The engine's \texttt{ReadyQueue} heuristic plus exact \texttt{dependencies\_} gating jointly guarantee that no node runs before its consumers have all delivered, yet nodes far from the root (large \texttt{sequence\_nr}) run as early as possible, bounding \texttt{not\_ready\_} occupancy. The version guard guarantees no silent wrong grad after an in-place mutation. Global anomaly mode plus \texttt{tls\_current\_evaluating\_node} guarantees that a failure in a backward-created subgraph is attributable to the forward Python call site that induced it. Together these three mechanisms (explicit DAG, versioned storage, global anomaly chain) are the contracts the rest of the framework relies on.
+引擎的 \texttt{ReadyQueue} 启发式加上精确的 \texttt{dependencies\_} 门控共同保证在其消费者全部交付之前没有节点运行，而远离根的节点（大 \texttt{sequence\_nr}）会尽早运行，限制 \texttt{not\_ready\_} 占用。版本防护保证就地突变后不会出现静默错误的等级。全局异常模式加上 \texttt{tls\_current\_evaluating\_node} 保证向后创建的子图中的失败可归因于引发它的前向 Python 调用站点。这三种机制（显式 DAG、版本化存储、全局异常链）共同构成了框架其余部分所依赖的契约。

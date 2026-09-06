@@ -5,6 +5,8 @@
 
 # tensorplay.fft
 
+Discrete Fourier transforms and related functions.
+
 ## Fast Fourier Transforms
 
 ```{eval-rst}

@@ -1,4 +1,4 @@
-# Vulkan backend C++ tests, mirroring the per-backend subdirectory layout of
+# Vulkan backend C++ tests, following the per-backend subdirectory layout of
 # the C++ suite.  Only added when the Vulkan backend is in the build.
 if(USE_VULKAN)
     add_executable(test_vulkan

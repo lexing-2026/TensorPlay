@@ -1,7 +1,7 @@
 # tensorplay.audio
 
-`tensorplay.audio` is the audio I/O and processing toolkit of TensorPlay,
-mirroring the `torchaudio` package layout. The listing below is a static
+`tensorplay.audio` is the audio I/O and processing toolkit of TensorPlay.
+The listing below is a static
 overview; backend availability depends on installed optional dependencies, so
 this page intentionally does not use autodoc.
 

@@ -1,7 +1,7 @@
 # TensorPlay X.Y.0 Release Notes
 
 <!--
-Compile these notes the way pytorch compiles theirs:
+Compile these notes with the following workflow:
 
 1. Bucket: every merged PR between the previous release tag and this one
    carries a "release notes: *" label (applied automatically from paths via
@@ -12,8 +12,7 @@ Compile these notes the way pytorch compiles theirs:
        --json number,title,labels
 
 2. Curate: fold the PR list into the sections below. Every entry links its
-   PR/issue. Backwards-incompatible entries show before/after code, like
-   pytorch's notes do.
+   PR/issue. Backwards-incompatible entries show before/after code.
 
 3. Publish: save this file as docs/release-notes/vX.Y.0.md and commit it
    before pushing the release tag. publish.yml picks it up automatically via
@@ -39,7 +38,7 @@ Compile these notes the way pytorch compiles theirs:
 # Backwards Incompatible Changes
 
 <!-- Group by subsystem. For each change: what changed, why, and a minimal
-before/after code block (pytorch style). -->
+before/after code block. -->
 
 # Deprecations
 
@@ -64,8 +63,7 @@ Kernels / Frontend ... -->
 
 <!-- Known regressions shipped with this release that are already tracked for
 a future fix: link the issue/PR, state the affected workload and the plan
-(fix version or workaround). Write "None." when empty, the way pytorch lists
-its tracked regressions. -->
+(fix version or workaround). Write "None." when empty. -->
 
 # Documentation
 

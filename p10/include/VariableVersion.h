@@ -8,7 +8,7 @@
 namespace tensorplay {
 
 // The actual counter, shared by every tensor that aliases the same memory
-// (base + views), mirroring c10::VersionCounter. Atomic so that bumps from
+// (base + views). Atomic so that bumps from
 // one alias are visible to readers holding another.
 struct P10_API VersionCounter {
     std::atomic<uint32_t> version_{0};
@@ -17,7 +17,7 @@ struct P10_API VersionCounter {
     uint32_t current_version() const noexcept { return version_.load(std::memory_order_relaxed); }
 };
 
-// Handle to a VersionCounter. Mirrors c10::VariableVersion: the counter is
+// Handle to a VersionCounter: the counter is
 // allocated eagerly so that views created before ANY mutation share the same
 // counter object as their base (lazy allocation would let each alias grow its
 // own counter, silently breaking mutation tracking).

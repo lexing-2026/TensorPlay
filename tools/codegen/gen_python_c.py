@@ -601,8 +601,14 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
             "        }",
         ]
         arg_arr, arg_n = "ap", "an"
-        # A bare Tensor passed to a TensorList splat folds to a singleton
-        if "tensorlist" in _BRIDGE.get(cpp_arg_type(_pos[-1].type), ""):
+        # A bare Tensor passed to a TensorList splat folds to a singleton,
+        # but only for single-overload bindings.  In a multi-overload group
+        # the fold would misroute a broadcastable Tensor into the list
+        # overload (raising a length mismatch instead of falling through to
+        # the Tensor overload); group members rely on argument-shape errors
+        # to reach later candidates.
+        if (own_catch and
+                "tensorlist" in _BRIDGE.get(cpp_arg_type(_pos[-1].type), "")):
             body += [
                 "        if (an == " + str(P) + " && ap[" + str(P - 1) + "] != nullptr &&",
                 "            !PyList_Check(ap[" + str(P - 1) + "]) &&",

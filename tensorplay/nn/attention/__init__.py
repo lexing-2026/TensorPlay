@@ -1,231 +1,66 @@
-"""Backend selection controls for scaled dot product attention.
-
-The public entry point is :func:`sdpa_kernel`, a context manager that restricts
-which attention backends :func:`tensorplay.nn.functional.scaled_dot_product_attention`
-may route to while the context is active. Backends are identified by members of
-the :class:`SDPBackend` flag enum.
-"""
+# mypy: allow-untyped-defs
+"""This module contains functions and classes that alter the behavior of tensorplay.nn.functional.scaled_dot_product_attention"""
 
 import contextlib
 from collections.abc import Iterable
-from dataclasses import dataclass
-from enum import IntFlag
-from typing import Optional, Union
+from contextvars import ContextVar
+from typing import Union
 from warnings import warn
 
-import tensorplay
-from tensorplay import Tensor
-
-from .flex_attention import (
-    AuxOutput,
-    AuxRequest,
-    BlockMask,
-    and_masks,
-    create_block_mask,
-    create_mask,
-    flex_attention,
-    noop_mask,
-    or_masks,
+import tensorplay.backends.cuda
+from tensorplay._C import _SDPBackend as SDPBackend
+from tensorplay.backends.cuda import (
+    can_use_efficient_attention,
+    can_use_flash_attention,
+    SDPAParams,
 )
 
-__all__ = [
-    "AuxOutput",
-    "AuxRequest",
-    "BlockMask",
+
+__all__: list[str] = [
     "SDPBackend",
-    "SDPParams",
-    "and_masks",
-    "create_block_mask",
-    "create_mask",
-    "flex_attention",
-    "noop_mask",
-    "or_masks",
     "sdpa_kernel",
     "WARN_FOR_UNFUSED_KERNELS",
-    "_sdpa_kernel_variadic",
-    "_backend_from_string",
-    "_cur_sdpa_kernel_backends",
-    "can_use_flash_attention",
-    "can_use_efficient_attention",
+    "register_flash_attention_impl",
+    "activate_flash_attention_impl",
+    "list_flash_attention_impls",
+    "current_flash_attention_impl",
+    "restore_flash_attention_impl",
 ]
 
 
-class SDPBackend(IntFlag):
-    r"""Backends available to scaled dot product attention.
-
-    - ``ERROR``: backend selection failed.
-    - ``MATH``: composed reference implementation.
-    - ``FLASH_ATTENTION``: fused flash-attention kernel.
-    - ``EFFICIENT_ATTENTION``: memory-efficient fused kernel.
-    - ``CUDNN_ATTENTION``: cuDNN fused kernel.
-    - ``OVERRIDEABLE``: reserved for external overrides.
-    """
-
-    ERROR = -1
-    MATH = 0
-    FLASH_ATTENTION = 1
-    EFFICIENT_ATTENTION = 2
-    CUDNN_ATTENTION = 3
-    OVERRIDEABLE = 4
-
-
-@dataclass
-class SDPParams:
-    """Parameter bundle describing one scaled dot product attention call.
-
-    Passed to the ``can_use_*`` predicates so they can judge kernel
-    eligibility without re-plumbing every argument.
-    """
-
-    query: Tensor
-    key: Tensor
-    value: Tensor
-    attn_mask: Optional[Tensor]
-    dropout: float
-    is_causal: bool
-    need_attn_weights: bool = False
-
-
-# When True, a call that silently falls back to a non-fused path emits a
-# warning describing why each fused backend was rejected.
+# Note: [SDPA warnings]
+# This only affects users of bias subclasses
+# If this is set to True, we will warn the user if they are not using the fused kernels
+# As well, it will raise warnings for all the reasons why the fused kernels can't be run.
+# To set this to True, run
+# tensorplay.nn.attention.WARN_FOR_UNFUSED_KERNELS = True
 WARN_FOR_UNFUSED_KERNELS = False
 
-# Everything is routable until a sdpa_kernel context narrows the set.
-_enabled_backends: set = {
-    SDPBackend.MATH,
-    SDPBackend.FLASH_ATTENTION,
-    SDPBackend.EFFICIENT_ATTENTION,
-}
 
-# Higher entries are tried first when the caller lets the library route.
-_priority_order: list = [
-    SDPBackend.FLASH_ATTENTION,
-    SDPBackend.EFFICIENT_ATTENTION,
-    SDPBackend.MATH,
-]
+r"""An enum-like class that contains the different backends for scaled dot product attention.
+    This backend class is designed to be used with the sdpa_kernel context manager.
 
-_backend_names = {
-    "flash": "FLASH_ATTENTION",
-    "mem_efficient": "EFFICIENT_ATTENTION",
-    "math": "MATH",
-    "cudnn": "CUDNN_ATTENTION",
-    "overrideable": "OVERRIDEABLE",
-}
+    The following Enums are available:
+        - ERROR: An error occurred when trying to determine the backend.
+        - MATH: The math backend for scaled dot product attention.
+        - FLASH_ATTENTION: The flash attention backend for scaled dot product attention.
+        - EFFICIENT_ATTENTION: The efficient attention backend for scaled dot product attention.
+        - CUDNN_ATTENTION: The cuDNN backend for scaled dot product attention.
+        - OVERRIDEABLE: The overridable backend for extension.
 
-_name_to_string_name = {v: k for k, v in _backend_names.items()}
+    See :func:`tensorplay.nn.attention.sdpa_kernel` for more details.
 
-_sdpa_float_dtypes = (
-    tensorplay.DType.float16,
-    tensorplay.DType.bfloat16,
-    tensorplay.DType.float32,
-    tensorplay.DType.float64,
-)
+    .. warning:: This class is in beta and subject to change.
+"""
+SDPBackend.__module__ = __name__
+SDPBackend.__name__ = "SDPBackend"
 
 
-def _backend_from_string(name: str):
-    return getattr(SDPBackend, name)
-
-
-def _cur_sdpa_kernel_backends(with_priority: bool = False):
-    backends = [b for b in _priority_order if b in _enabled_backends]
-    if with_priority:
-        return list(backends)
-    return sorted(backends, key=lambda b: int(b))
-
-
-def _sdpa_kernel(backends: Iterable, set_priority: bool = False) -> None:
-    global _enabled_backends, _priority_order
-    backends = list(backends)
-    _enabled_backends = set(backends)
-    if set_priority:
-        user_priority = [b for b in backends]
-        for b in _priority_order:
-            if b not in user_priority:
-                user_priority.append(b)
-        _priority_order = user_priority
-
-
-@contextlib.contextmanager
-def sdpa_kernel(
-    backends: Union[list, SDPBackend], set_priority: bool = False
-):
-    r"""Restrict the backends usable by scaled dot product attention.
-
-    Args:
-        backends: a single :class:`SDPBackend` or a list of them. With
-            ``set_priority=True`` the list order is interpreted as the
-            routing priority order.
+def _raise_kernel_warnings(params: SDPAParams) -> None:
     """
-    if not isinstance(backends, (list, SDPBackend)):
-        raise AssertionError(
-            f"Backend must be an instance of SDPBackend or a list of "
-            f"SDPBackend instances, got {type(backends).__name__}"
-        )
-    if isinstance(backends, SDPBackend):
-        backends = [backends]
-    backends = list(dict.fromkeys(backends))
-
-    previous_backends = _cur_sdpa_kernel_backends(with_priority=set_priority)
-    try:
-        _sdpa_kernel(backends, set_priority)
-        yield {}
-    finally:
-        _sdpa_kernel(previous_backends, set_priority)
-
-
-@contextlib.contextmanager
-def _sdpa_kernel_variadic(*backends: SDPBackend):
-    with sdpa_kernel(list(backends)):
-        yield
-
-
-def _check_flash_eligibility(params: SDPParams, debug: bool = False):
-    q, k, v = params.query, params.key, params.value
-    if params.attn_mask is not None:
-        return False, "attn_mask is not supported by the fused kernel"
-    if params.dropout != 0.0:
-        return False, "dropout is not supported by the fused kernel"
-    if q.dim() != 4:
-        return False, "query/key/value must be 4D [B, H, T, D]"
-    if k.dim() != 4 or v.dim() != 4:
-        return False, "query/key/value must be 4D [B, H, T, D]"
-    if q.dtype not in _sdpa_float_dtypes:
-        return False, f"unsupported dtype {q.dtype}"
-    if q.dtype != k.dtype or q.dtype != v.dtype:
-        return False, "query/key/value must share one dtype"
-    if q.size(-1) > 128:
-        return False, "head dimension > 128 exceeds the fused kernel limit"
-    if k.shape != v.shape or k.shape[:-1] != q.shape[:-1]:
-        return False, "query/key/value leading shapes must match"
-    if params.need_attn_weights:
-        return False, "attention weights are not produced by the fused kernel"
-    return True, ""
-
-
-def can_use_flash_attention(params: SDPParams, debug: bool = False) -> bool:
-    r"""Whether the fused flash-attention kernel can run this call."""
-    ok, reason = _check_flash_eligibility(params)
-    if not ok and debug and reason:
-        warn(f"Flash attention can't be used because: {reason}", stacklevel=2)
-    return ok
-
-
-def can_use_efficient_attention(params: SDPParams, debug: bool = False) -> bool:
-    r"""Whether a memory-efficient fused kernel can run this call.
-
-    This build ships no memory-efficient kernel, so the answer is always
-    False; the debug flag reports the reason.
+    If WARN_FOR_UNFUSED_KERNELS is set to True, this will raise warnings
+    for all the reasons why the fused kernels can't be run. If using subclasses
     """
-    if debug:
-        warn(
-            "Efficient attention can't be used because: no memory-efficient "
-            "kernel is available in this build",
-            stacklevel=2,
-        )
-    return False
-
-
-def _raise_kernel_warnings(params: SDPParams) -> None:
     if WARN_FOR_UNFUSED_KERNELS:
         if not can_use_efficient_attention(params):
             warn("Efficient attention can't be used because:", stacklevel=2)
@@ -233,3 +68,165 @@ def _raise_kernel_warnings(params: SDPParams) -> None:
         if not can_use_flash_attention(params):
             warn("Flash attention can't be used because:", stacklevel=2)
             can_use_flash_attention(params, True)
+
+
+_backend_names = {
+    "cudnn": "CUDNN_ATTENTION",
+    "flash": "FLASH_ATTENTION",
+    "mem_efficient": "EFFICIENT_ATTENTION",
+    "math": "MATH",
+    "overrideable": "OVERRIDEABLE",
+}
+_sdpa_kernel_uses_priority = ContextVar("sdpa_kernel_uses_priority", default=False)
+
+
+def _is_sdp_priority_order_active() -> bool:
+    """Return whether an enclosing sdpa_kernel context set backend priority."""
+    return _sdpa_kernel_uses_priority.get()
+
+
+def _backend_from_string(name: str):
+    return getattr(SDPBackend, name)
+
+
+def _cur_sdpa_kernel_backends(with_priority: bool = False):
+    backends = []
+    for name, val in _backend_names.items():
+        if getattr(tensorplay._C, f"_get_{name}_sdp_enabled")():
+            backends.append(getattr(SDPBackend, val))
+    if with_priority:
+        curr_priority = tensorplay._C._get_sdp_priority_order()
+        backends = sorted(
+            backends, key=lambda backend: curr_priority.index(int(backend))
+        )
+    return backends
+
+
+def _sdpa_kernel(backends: Iterable, set_priority: bool = False) -> None:
+    for name, val in _backend_names.items():
+        enabled = getattr(SDPBackend, val) in backends
+        getattr(tensorplay._C, f"_set_sdp_use_{name}")(enabled)
+    if set_priority:
+        # backends should be a unique list
+        user_priority = [int(backend) for backend in backends]
+        previous_priority = tensorplay._C._get_sdp_priority_order()
+        for backend in previous_priority:
+            if backend not in user_priority:
+                user_priority.append(int(backend))
+        tensorplay._C._set_sdp_priority_order(user_priority)
+
+
+@contextlib.contextmanager
+def sdpa_kernel(backends: list[SDPBackend] | SDPBackend, set_priority: bool = False):
+    r"""
+    Context manager to select which backend to use for scaled dot product attention.
+
+    .. warning:: This function is beta and subject to change.
+
+    Args:
+        backends (Union[List[SDPBackend], SDPBackend]): A backend or list of backends for scaled dot product attention.
+        set_priority (bool=False): Whether the ordering of the backends is interpreted as their priority order.
+
+    Example:
+
+    .. code-block:: python
+
+        from tensorplay.nn.functional import scaled_dot_product_attention
+        from tensorplay.nn.attention import SDPBackend, sdpa_kernel
+
+        # Only enable flash attention backend
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            scaled_dot_product_attention(...)
+
+        # Enable the Math or Efficient attention backends
+        with sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
+            scaled_dot_product_attention(...)
+
+        # Enable the cuDNN or flash attention backends, and in that order
+        with sdpa_kernel(
+            [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION], set_priority=True
+        ):
+            scaled_dot_product_attention(...)
+
+    This context manager can be used to select which backend to use for scaled dot product attention.
+    Upon exiting the context manager, the previous state of the flags will be restored, enabling all backends.
+    """
+    if not isinstance(backends, (list, SDPBackend)):
+        raise AssertionError(
+            f"Backend must be an instance of SDPBackend or a list of SDPBackend instances, got {type(backends).__name__}"
+        )
+
+    if isinstance(backends, SDPBackend):
+        backends = [backends]
+
+    backends = list(dict.fromkeys(backends))
+
+    previous_backends = _cur_sdpa_kernel_backends(with_priority=set_priority)
+    priority_token = _sdpa_kernel_uses_priority.set(
+        set_priority or _sdpa_kernel_uses_priority.get()
+    )
+    try:
+        _sdpa_kernel(backends, set_priority)
+        yield {}
+    finally:
+        _sdpa_kernel_uses_priority.reset(priority_token)
+        _sdpa_kernel(previous_backends, set_priority)
+
+
+# variadic version of sdpa_kernel for the tracer to use while reconstructing
+@contextlib.contextmanager
+def _sdpa_kernel_variadic(*backends: SDPBackend):
+    with sdpa_kernel(list(backends)):
+        yield
+
+
+def _get_flash_version() -> str:
+    """This returns the closest matching tag for the flash attention backend"""
+    return "2.5.7"
+
+
+from .omni_attention import (
+    AuxOutput,
+    AuxRequest,
+    BlockMask,
+    and_masks,
+    create_block_mask,
+    create_mask,
+    omni_attention,
+    noop_mask,
+    or_masks,
+)
+
+
+__all__ += [
+    "AuxOutput",
+    "AuxRequest",
+    "BlockMask",
+    "and_masks",
+    "create_block_mask",
+    "create_mask",
+    "omni_attention",
+    "noop_mask",
+    "or_masks",
+]
+
+from . import _registry
+
+
+# Re-export registry types and functions for public API
+_FlashAttentionImpl = _registry._FlashAttentionImpl
+_RegisterFn = _registry._RegisterFn
+register_flash_attention_impl = _registry.register_flash_attention_impl
+activate_flash_attention_impl = _registry.activate_flash_attention_impl
+list_flash_attention_impls = _registry.list_flash_attention_impls
+current_flash_attention_impl = _registry.current_flash_attention_impl
+restore_flash_attention_impl = _registry.restore_flash_attention_impl
+
+register_flash_attention_impl.__module__ = __name__
+activate_flash_attention_impl.__module__ = __name__
+list_flash_attention_impls.__module__ = __name__
+current_flash_attention_impl.__module__ = __name__
+restore_flash_attention_impl.__module__ = __name__
+
+# Import built-in implementations to trigger self-registration
+from . import _fa3, _fa4

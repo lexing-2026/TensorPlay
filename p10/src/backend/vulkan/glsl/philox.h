@@ -28,15 +28,17 @@ uvec2 mulhilo(const uint a, const uint b) {
       (mid << 16u) | (ll & 0xffffu));
 }
 
-// One Philox round: two 32x32 multiplies feeding a high/low shuffle.
+// One Philox round: two 32x32 multiplies feeding a high/low shuffle.  The
+// high half of each product carries the diffusion and is what the counter and
+// key words are folded into; the low half passes through to the next lane.
 uvec4 philox_round(uvec4 ctr, const uvec2 key) {
   const uvec2 prod0 = mulhilo(0xD2511F53u, ctr.x);
   const uvec2 prod1 = mulhilo(0xCD9E8D57u, ctr.z);
   return uvec4(
-      prod1.y ^ ctr.y ^ key.x,
-      prod1.x,
-      prod0.y ^ ctr.w ^ key.y,
-      prod0.x);
+      prod1.x ^ ctr.y ^ key.x,
+      prod1.y,
+      prod0.x ^ ctr.w ^ key.y,
+      prod0.y);
 }
 
 // Full 10-round Philox4x32 with the reference Weyl key sequence.

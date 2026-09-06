@@ -87,6 +87,7 @@ __all__ = [
     "export",
     "get_default_backend",
     "is_compiling",
+    "is_dynamo_compiling",
     "is_exporting",
     "isinstance",
     "list_backends",
@@ -110,6 +111,16 @@ def is_compiling() -> bool:
     """Return whether the current Python frame is being captured."""
 
     return _compiling.get() and not _capture_disabled.get()
+
+
+def is_dynamo_compiling() -> bool:
+    """Return whether a graph trace of higher-order ops is in progress.
+
+    Same state as :func:`is_compiling`: the tracer raises the flag for the
+    whole capture, and no other entry point distinguishes a trace of a
+    higher-order operator from any other capture.
+    """
+    return is_compiling()
 
 
 def is_exporting() -> bool:

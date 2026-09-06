@@ -168,27 +168,27 @@ Tensor rand_kernel_cuda(const std::vector<int64_t>& size, DType dtype, Device de
         float* data = t.data_ptr<float>();
         distribution_nullary_kernel<float, float4, 4>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
-            [] __device__ (float rand) { return rand; });
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+            [] __host__ __device__ (float rand) { return rand; });
     } else if (dtype == DType::Float64) {
         double* data = t.data_ptr<double>();
         distribution_nullary_kernel<double, double2, 2>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
-            [] __device__ (double rand) { return rand; });
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
+            [] __host__ __device__ (double rand) { return rand; });
     } else if (dtype == DType::Float16 || dtype == DType::BFloat16) {
         if (dtype == DType::Float16) {
             Half* data = t.data_ptr<Half>();
             distribution_nullary_kernel<Half, float4, 4>(
                 data, n,
-                [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
-                [] __device__ (float rand) { return static_cast<Half>(rand); });
+                [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+                [] __host__ __device__ (float rand) { return static_cast<Half>(rand); });
         } else {
             BFloat16* data = t.data_ptr<BFloat16>();
             distribution_nullary_kernel<BFloat16, float4, 4>(
                 data, n,
-                [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
-                [] __device__ (float rand) { return static_cast<BFloat16>(rand); });
+                [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+                [] __host__ __device__ (float rand) { return static_cast<BFloat16>(rand); });
         }
     } else if (dtype == DType::ComplexFloat || dtype == DType::ComplexDouble) {
         // the interleaved component buffer as a real array.
@@ -197,14 +197,14 @@ Tensor rand_kernel_cuda(const std::vector<int64_t>& size, DType dtype, Device de
             float* raw = static_cast<float*>(t.data_ptr());
             distribution_nullary_kernel<float, float4, 4>(
                 raw, comps,
-                [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
-                [] __device__ (float v) { return v; });
+                [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+                [] __host__ __device__ (float v) { return v; });
         } else {
             double* raw = static_cast<double*>(t.data_ptr());
             distribution_nullary_kernel<double, double2, 2>(
                 raw, comps,
-                [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
-                [] __device__ (double v) { return v; });
+                [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
+                [] __host__ __device__ (double v) { return v; });
         }
     } else {
          TP_THROW(NotImplementedError, "rand() only supports floating dtypes on CUDA for now");
@@ -221,28 +221,28 @@ Tensor randn_kernel_cuda(const std::vector<int64_t>& size, DType dtype, Device d
         float* data = t.data_ptr<float>();
         distribution_nullary_kernel<float, float4, 4>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
-            [] __device__ (float rand) { return rand; }, std::move(generator));
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
+            [] __host__ __device__ (float rand) { return rand; }, std::move(generator));
     } else if (dtype == DType::Float64) {
         double* data = t.data_ptr<double>();
         distribution_nullary_kernel<double, double2, 2>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal2_double(state); },
-            [] __device__ (double rand) { return rand; }, std::move(generator));
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal2_double(state); },
+            [] __host__ __device__ (double rand) { return rand; }, std::move(generator));
     } else if (dtype == DType::Float16 || dtype == DType::BFloat16) {
         if (dtype == DType::Float16) {
             Half* data = t.data_ptr<Half>();
             distribution_nullary_kernel<Half, float4, 4>(
                 data, n,
-                [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
-                [] __device__ (float rand) { return static_cast<Half>(rand); },
+                [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
+                [] __host__ __device__ (float rand) { return static_cast<Half>(rand); },
                 std::move(generator));
         } else {
             BFloat16* data = t.data_ptr<BFloat16>();
             distribution_nullary_kernel<BFloat16, float4, 4>(
                 data, n,
-                [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
-                [] __device__ (float rand) { return static_cast<BFloat16>(rand); },
+                [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
+                [] __host__ __device__ (float rand) { return static_cast<BFloat16>(rand); },
                 std::move(generator));
         }
     } else if (dtype == DType::ComplexFloat || dtype == DType::ComplexDouble) {
@@ -254,15 +254,15 @@ Tensor randn_kernel_cuda(const std::vector<int64_t>& size, DType dtype, Device d
             float* raw = static_cast<float*>(t.data_ptr());
             distribution_nullary_kernel<float, float4, 4>(
                 raw, comps,
-                [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
-                [] __device__ (float v) { return v * kInvSqrt2f; },
+                [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
+                [] __host__ __device__ (float v) { return v * kInvSqrt2f; },
                 std::move(generator));
         } else {
             double* raw = static_cast<double*>(t.data_ptr());
             distribution_nullary_kernel<double, double2, 2>(
                 raw, comps,
-                [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal2_double(state); },
-                [] __device__ (double v) { return v * kInvSqrt2; },
+                [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal2_double(state); },
+                [] __host__ __device__ (double v) { return v * kInvSqrt2; },
                 std::move(generator));
         }
     } else {
@@ -334,8 +334,8 @@ Tensor& uniform_kernel_cuda(Tensor& self, double from, double to,
         const float range = hi - lo;
         distribution_nullary_kernel<float, float4, 4>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
-            [lo, hi, range] __device__ (float rand) {
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+            [lo, hi, range] __host__ __device__ (float rand) {
                 const float value = static_cast<float>(lo + range * rand);
                 return value == hi ? lo : value;
             },
@@ -345,8 +345,8 @@ Tensor& uniform_kernel_cuda(Tensor& self, double from, double to,
         const double range = to - from;
         distribution_nullary_kernel<double, double2, 2>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
-            [from, to, range] __device__ (double rand) {
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
+            [from, to, range] __host__ __device__ (double rand) {
                 const double value = from + range * rand;
                 return value == to ? from : value;
             },
@@ -360,8 +360,8 @@ Tensor& uniform_kernel_cuda(Tensor& self, double from, double to,
         const float range = hi_value - lo_value;
         distribution_nullary_kernel<Half, float4, 4>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
-            [lo, hi, lo_value, range] __device__ (float rand) {
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+            [lo, hi, lo_value, range] __host__ __device__ (float rand) {
                 const Half value = static_cast<Half>(lo_value + range * rand);
                 return value == hi ? lo : value;
             },
@@ -375,8 +375,8 @@ Tensor& uniform_kernel_cuda(Tensor& self, double from, double to,
         const float range = hi_value - lo_value;
         distribution_nullary_kernel<BFloat16, float4, 4>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
-            [lo, hi, lo_value, range] __device__ (float rand) {
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+            [lo, hi, lo_value, range] __host__ __device__ (float rand) {
                 const BFloat16 value = static_cast<BFloat16>(lo_value + range * rand);
                 return value == hi ? lo : value;
             },
@@ -403,15 +403,15 @@ Tensor& normal_kernel_cuda(Tensor& self, double mean, double std,
         const float sigma = static_cast<float>(std);
         distribution_nullary_kernel<float, float4, 4>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
-            [mu, sigma] __device__ (float rand) { return mu + sigma * rand; },
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
+            [mu, sigma] __host__ __device__ (float rand) { return mu + sigma * rand; },
             std::move(generator));
     } else if (self.dtype() == DType::Float64) {
         double* data = self.data_ptr<double>();
         distribution_nullary_kernel<double, double2, 2>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal2_double(state); },
-            [mean, std] __device__ (double rand) { return mean + std * rand; },
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal2_double(state); },
+            [mean, std] __host__ __device__ (double rand) { return mean + std * rand; },
             std::move(generator));
     } else if (self.dtype() == DType::Float16) {
         Half* data = self.data_ptr<Half>();
@@ -419,8 +419,8 @@ Tensor& normal_kernel_cuda(Tensor& self, double mean, double std,
         const float sigma = static_cast<float>(std);
         distribution_nullary_kernel<Half, float4, 4>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
-            [mu, sigma] __device__ (float rand) {
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
+            [mu, sigma] __host__ __device__ (float rand) {
                 return static_cast<Half>(mu + sigma * rand);
             },
             std::move(generator));
@@ -430,8 +430,8 @@ Tensor& normal_kernel_cuda(Tensor& self, double mean, double std,
         const float sigma = static_cast<float>(std);
         distribution_nullary_kernel<BFloat16, float4, 4>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
-            [mu, sigma] __device__ (float rand) {
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
+            [mu, sigma] __host__ __device__ (float rand) {
                 return static_cast<BFloat16>(mu + sigma * rand);
             },
             std::move(generator));
@@ -463,8 +463,8 @@ Tensor& exponential_kernel_cuda(Tensor& self, double lambd) {
         constexpr float kEps = std::numeric_limits<float>::epsilon();
         distribution_nullary_kernel<float, float4, 4>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
-            [lambda] __device__ (float val) {
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+            [lambda] __host__ __device__ (float val) {
                 float log = val >= 1.f - kEps / 2 ? -kEps / 2 : __logf(val);
                 return -1.f / lambda * log;
             });
@@ -474,8 +474,8 @@ Tensor& exponential_kernel_cuda(Tensor& self, double lambd) {
         constexpr double kEps = std::numeric_limits<double>::epsilon();
         distribution_nullary_kernel<double, double2, 2>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
-            [lambda] __device__ (double val) {
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
+            [lambda] __host__ __device__ (double val) {
                 double log = val >= 1. - kEps / 2 ? -kEps / 2 : ::log(val);
                 return -1. / lambda * log;
             });
@@ -486,8 +486,8 @@ Tensor& exponential_kernel_cuda(Tensor& self, double lambd) {
             constexpr float kEps = std::numeric_limits<float>::epsilon();
             distribution_nullary_kernel<Half, float4, 4>(
                 data, n,
-                [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
-                [lambda] __device__ (float val) {
+                [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+                [lambda] __host__ __device__ (float val) {
                     float log = val >= 1.f - kEps / 2 ? -kEps / 2 : __logf(val);
                     return static_cast<Half>(-1.f / lambda * log);
                 });
@@ -497,8 +497,8 @@ Tensor& exponential_kernel_cuda(Tensor& self, double lambd) {
             constexpr float kEps = std::numeric_limits<float>::epsilon();
             distribution_nullary_kernel<BFloat16, float4, 4>(
                 data, n,
-                [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
-                [lambda] __device__ (float val) {
+                [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+                [lambda] __host__ __device__ (float val) {
                     float log = val >= 1.f - kEps / 2 ? -kEps / 2 : __logf(val);
                     return static_cast<BFloat16>(-1.f / lambda * log);
                 });
@@ -516,8 +516,8 @@ template <typename scalar_t>
 void geometric_fill_float_cuda(scalar_t* data, int64_t n, float p) {
     distribution_nullary_kernel<scalar_t, float4, 4>(
         data, n,
-        [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
-        [p] __device__ (float val) {
+        [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+        [p] __host__ __device__ (float val) {
             return static_cast<scalar_t>(::ceilf(::logf(val) / ::log1pf(-p)));
         });
 }
@@ -525,8 +525,8 @@ void geometric_fill_float_cuda(scalar_t* data, int64_t n, float p) {
 void geometric_fill_double_cuda(double* data, int64_t n, double p) {
     distribution_nullary_kernel<double, double2, 2>(
         data, n,
-        [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
-        [p] __device__ (double val) {
+        [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
+        [p] __host__ __device__ (double val) {
             return ::ceil(::log(val) / ::log1p(-p));
         });
 }
@@ -571,22 +571,22 @@ Tensor& log_normal_kernel_cuda(Tensor& self, double mean, double std) {
         // transformation::log_normal: exp(normal_draw).
         distribution_nullary_kernel<float, float4, 4>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
-            [mu, sigma] __device__ (float rand) { return ::expf(mu + sigma * rand); });
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
+            [mu, sigma] __host__ __device__ (float rand) { return ::expf(mu + sigma * rand); });
     } else if (self.dtype() == DType::Float64) {
         double* data = self.data_ptr<double>();
         distribution_nullary_kernel<double, double2, 2>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal2_double(state); },
-            [mean, std] __device__ (double rand) { return ::exp(mean + std * rand); });
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal2_double(state); },
+            [mean, std] __host__ __device__ (double rand) { return ::exp(mean + std * rand); });
     } else if (self.dtype() == DType::Float16) {
         Half* data = self.data_ptr<Half>();
         const float mu = static_cast<float>(mean);
         const float sigma = static_cast<float>(std);
         distribution_nullary_kernel<Half, float4, 4>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
-            [mu, sigma] __device__ (float rand) {
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
+            [mu, sigma] __host__ __device__ (float rand) {
                 return static_cast<Half>(::expf(mu + sigma * rand));
             });
     } else if (self.dtype() == DType::BFloat16) {
@@ -595,8 +595,8 @@ Tensor& log_normal_kernel_cuda(Tensor& self, double mean, double std) {
         const float sigma = static_cast<float>(std);
         distribution_nullary_kernel<BFloat16, float4, 4>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
-            [mu, sigma] __device__ (float rand) {
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
+            [mu, sigma] __host__ __device__ (float rand) {
                 return static_cast<BFloat16>(::expf(mu + sigma * rand));
             });
     } else {
@@ -625,8 +625,8 @@ Tensor& cauchy_kernel_cuda(Tensor& self, double median, double sigma) {
         // [eps, 1-eps] because tanf overflows at the open boundaries.
         distribution_nullary_kernel<float, float4, 4>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
-            [med, sig] __device__ (float val) {
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+            [med, sig] __host__ __device__ (float val) {
                 val = val > 1.f - kEps ? 1.f - kEps : val;
                 val = val < kEps ? kEps : val;
                 return med + sig * ::tanf(static_cast<float>(M_PI) * (val - 0.5f));
@@ -635,8 +635,8 @@ Tensor& cauchy_kernel_cuda(Tensor& self, double median, double sigma) {
         double* data = self.data_ptr<double>();
         distribution_nullary_kernel<double, double2, 2>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
-            [median, sigma] __device__ (double val) {
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
+            [median, sigma] __host__ __device__ (double val) {
                 return median + sigma * ::tan(kPi * (val - 0.5));
             });
     } else if (self.dtype() == DType::Float16) {
@@ -646,8 +646,8 @@ Tensor& cauchy_kernel_cuda(Tensor& self, double median, double sigma) {
         constexpr float kEps = std::numeric_limits<float>::epsilon();
         distribution_nullary_kernel<Half, float4, 4>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
-            [med, sig] __device__ (float val) {
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+            [med, sig] __host__ __device__ (float val) {
                 val = val > 1.f - kEps ? 1.f - kEps : val;
                 val = val < kEps ? kEps : val;
                 return static_cast<Half>(med + sig * ::tanf(
@@ -660,8 +660,8 @@ Tensor& cauchy_kernel_cuda(Tensor& self, double median, double sigma) {
         constexpr float kEps = std::numeric_limits<float>::epsilon();
         distribution_nullary_kernel<BFloat16, float4, 4>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
-            [med, sig] __device__ (float val) {
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+            [med, sig] __host__ __device__ (float val) {
                 val = val > 1.f - kEps ? 1.f - kEps : val;
                 val = val < kEps ? kEps : val;
                 return static_cast<BFloat16>(med + sig * ::tanf(
@@ -679,24 +679,24 @@ void launch_random_range_cuda(scalar_t* data, int64_t n,
     if (range >= (1ULL << 28)) {
         distribution_nullary_kernel<scalar_t, ulonglong2, 2>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) {
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) {
                 ulonglong2 random;
                 uint4 words = curand4(state);
                 random.x = (static_cast<uint64_t>(words.x) << 32) | words.y;
                 random.y = (static_cast<uint64_t>(words.z) << 32) | words.w;
                 return random;
             },
-            [range, base] __device__ (uint64_t value) {
+            [range, base] __host__ __device__ (uint64_t value) {
                 return static_cast<scalar_t>(static_cast<int64_t>(
                     (value % range) + static_cast<uint64_t>(base)));
             });
     } else {
         distribution_nullary_kernel<scalar_t, uint4, 4>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) {
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) {
                 return curand4(state);
             },
-            [range, base] __device__ (unsigned int value) {
+            [range, base] __host__ __device__ (unsigned int value) {
                 return static_cast<scalar_t>(static_cast<int64_t>(
                     (static_cast<uint64_t>(value) % range) +
                     static_cast<uint64_t>(base)));
@@ -709,14 +709,14 @@ void launch_random_full_range_cuda(scalar_t* data, int64_t n) {
     if constexpr (std::is_same_v<scalar_t, uint64_t>) {
         distribution_nullary_kernel<scalar_t, ulonglong2, 2>(
             data, n,
-            [] __device__ (curandStatePhilox4_32_10_t* state) {
+            [] __host__ __device__ (curandStatePhilox4_32_10_t* state) {
                 ulonglong2 random;
                 uint4 words = curand4(state);
                 random.x = (static_cast<uint64_t>(words.x) << 32) | words.y;
                 random.y = (static_cast<uint64_t>(words.z) << 32) | words.w;
                 return random;
             },
-            [] __device__ (uint64_t value) {
+            [] __host__ __device__ (uint64_t value) {
                 return static_cast<scalar_t>(value);
             });
     } else {
@@ -1863,14 +1863,14 @@ Tensor randperm_kernel_cuda(int64_t n, DType dtype, Device device) {
     int64_t* data = keys.data_ptr<int64_t>();
     distribution_nullary_kernel<int64_t, ulonglong2, 2>(
         data, n,
-        [] __device__ (curandStatePhilox4_32_10_t* state) {
+        [] __host__ __device__ (curandStatePhilox4_32_10_t* state) {
             ulonglong2 random;
             uint4 words = curand4(state);
             random.x = (static_cast<uint64_t>(words.x) << 32) | words.y;
             random.y = (static_cast<uint64_t>(words.z) << 32) | words.w;
             return random;
         },
-        [] __device__ (uint64_t value) {
+        [] __host__ __device__ (uint64_t value) {
             return static_cast<int64_t>(value);
         });
     extern Tensor argsort_cuda(const Tensor& self, int64_t dim, bool descending);

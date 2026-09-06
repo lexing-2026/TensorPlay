@@ -596,7 +596,7 @@ std::vector<Tensor> foreach_max_cpu(const std::vector<Tensor>& self) {
 
 std::vector<Tensor> foreach_norm_cpu(const std::vector<Tensor>& self,
                                      Scalar ord,
-                                     const std::optional<DType>& dtype) {
+                                     std::optional<DType> dtype) {
     return map_tensors(self, [&](const Tensor& value) {
         Tensor input = dtype.has_value() ? value.to(*dtype) : value;
         return input.norm(ord.toDouble());
@@ -605,7 +605,7 @@ std::vector<Tensor> foreach_norm_cpu(const std::vector<Tensor>& self,
 
 std::vector<Tensor> foreach_powsum_cpu(const std::vector<Tensor>& self,
                                        Scalar ord,
-                                       const std::optional<DType>& dtype) {
+                                       std::optional<DType> dtype) {
     return map_tensors(self, [&](const Tensor& value) {
         Tensor input = dtype.has_value() ? value.to(*dtype) : value;
         return input.abs().pow(ord).sum();
@@ -614,7 +614,7 @@ std::vector<Tensor> foreach_powsum_cpu(const std::vector<Tensor>& self,
 
 std::vector<Tensor> foreach_clone_cpu(
         const std::vector<Tensor>& self,
-        const std::optional<int64_t>& /*memory_format*/) {
+        std::optional<int64_t> /*memory_format*/) {
     return map_tensors(self, [](const Tensor& value) { return value.clone(); });
 }
 
@@ -1121,7 +1121,7 @@ DEFINE_FOREACH_CLAMP_OUT(minimum)
 #undef DEFINE_FOREACH_CLAMP_OUT
 
 void foreach_clone_out_cpu(const std::vector<Tensor>& self,
-                           const std::optional<int64_t>& memory_format,
+                           std::optional<int64_t> memory_format,
                            std::vector<Tensor> out) {
     copy_foreach_out_cpu(foreach_clone_cpu(self, memory_format), std::move(out),
                          "_foreach_clone.out");
@@ -1136,7 +1136,7 @@ void foreach_max_out_cpu(const std::vector<Tensor>& self, std::vector<Tensor> ou
     copy_foreach_out_cpu(foreach_max_cpu(self), std::move(out), "_foreach_max.out");
 }
 void foreach_norm_out_cpu(const std::vector<Tensor>& self, Scalar ord,
-                          const std::optional<DType>& dtype,
+                          std::optional<DType> dtype,
                           std::vector<Tensor> out) {
     copy_foreach_out_cpu(foreach_norm_cpu(self, ord, dtype), std::move(out),
                          "_foreach_norm.Scalar_out");
@@ -1159,7 +1159,7 @@ void foreach_pow_scalar_list_out_cpu(const std::vector<Tensor>& self,
                          "_foreach_pow.ScalarList_out");
 }
 void foreach_powsum_out_cpu(const std::vector<Tensor>& self, Scalar ord,
-                            const std::optional<DType>& dtype,
+                            std::optional<DType> dtype,
                             std::vector<Tensor> out) {
     copy_foreach_out_cpu(foreach_powsum_cpu(self, ord, dtype), std::move(out),
                          "_foreach_powsum.Scalar_out");

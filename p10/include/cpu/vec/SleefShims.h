@@ -503,7 +503,7 @@ inline __vector double hypot(__vector double a, __vector double b) { return Slee
 #if defined(__aarch64__) && !defined(__ANDROID__) && \
     !(defined(CPU_CAPABILITY_SVE256) || defined(CPU_CAPABILITY_SVE128))
 // aarch64 NEON tier: SLEEF's 2x double / 4x float ADVSIMD runtime
-// dispatchers. Mirrors the desktop default (Linux and macOS; Android keeps
+// dispatchers. Follows the desktop default (Linux and macOS; Android keeps
 // the scalar <cmath> fallback).
 #ifdef __cplusplus
 extern "C" {

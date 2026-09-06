@@ -233,8 +233,7 @@ bool is_coalesced_kernel(const Tensor& self) {
                  "is_coalesced expected sparse coordinate tensor layout");
     }
     std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
-    if (!impl->is_sparse() ||
-        impl->sparse_layout() == TensorImpl::kSparseCSRLayout) {
+    if (!impl->is_sparse() || impl->is_sparse_compressed()) {
         TP_THROW(RuntimeError,
                  "is_coalesced expected sparse coordinate tensor layout");
     }
@@ -249,8 +248,8 @@ int64_t sparse_dim_kernel(const Tensor& self) {
                  " tensor");
     }
     std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
-    if (impl->sparse_layout() == TensorImpl::kSparseCSRLayout) {
-        // Row-compressed layouts span exactly two sparse dimensions
+    if (impl->is_sparse_compressed()) {
+        // Compressed layouts span exactly two sparse dimensions
         // (compressed + plain).
         return 2;
     }
@@ -311,6 +310,10 @@ Tensor crow_indices_kernel(const Tensor& self) {
                  "crow_indices expected sparse row compressed tensor layout");
     }
     std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
+    if (!impl->is_sparse_compressed()) {
+        TP_THROW(RuntimeError,
+                 "crow_indices expected sparse row compressed tensor layout");
+    }
     auto crow = impl->sparse_crow_impl();
     if (!crow) {
         TP_THROW(RuntimeError,
@@ -325,6 +328,10 @@ Tensor col_indices_kernel(const Tensor& self) {
                  "col_indices expected sparse row compressed tensor layout");
     }
     std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
+    if (!impl->is_sparse_compressed()) {
+        TP_THROW(RuntimeError,
+                 "col_indices expected sparse row compressed tensor layout");
+    }
     auto col = impl->sparse_col_impl();
     if (!col) {
         TP_THROW(RuntimeError,

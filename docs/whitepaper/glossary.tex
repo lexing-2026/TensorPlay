@@ -3,91 +3,91 @@
 % Descriptions must use plain text (no fragile commands) --- \path{} etc. are
 % rewritten as literal strings to survive the moving argument.
 
-% --- Acronyms ---
-\newacronym{api}{API}{Application Programming Interface}
-\newacronym{ad}{AD}{Automatic Differentiation}
-\newacronym{cpu}{CPU}{Central Processing Unit}
-\newacronym{cuda}{CUDA}{Compute Unified Device Architecture (NVIDIA)}
-\newacronym{cupti}{CUPTI}{CUDA Profiling Tools Interface}
-\newacronym{dag}{DAG}{Directed Acyclic Graph}
-\newacronym{dlpack}{DLPack}{Deep Learning Pack --- tensor-exchange memory format}
-\newacronym{dso}{DSO}{Dynamic Shared Object}
-\newacronym{itt}{ITT}{Intel Threading Tools --- VTune markers}
-\newacronym{jit}{JIT}{Just-In-Time compilation}
-\newacronym{lto}{LTO}{Link-Time Optimization}
-\newacronym{mkl}{MKL}{Intel Math Kernel Library}
-\newacronym{nvtx}{NVTX}{NVIDIA Tools Extension --- domain/probe markers}
-\newacronym{pgo}{PGO}{Profile-Guided Optimization}
-\newacronym{rpath}{RPATH}{Runtime library search path embedded in ELF}
-\newacronym{so}{SO}{\texttt{.so} shared object on Linux}
-\newacronym{symbolic}{Symbolic AD}{Symbolic-mode automatic differentiation}
-\newacronym{tape}{Tape}{Sequence of recorded operations for backward replay}
-\newacronym{tc}{TC}{Tensor Comprehensions --- polyhedral ML compiler}
-\newacronym{tls}{TLS}{Thread-Local Storage}
-\newacronym{usecase}{Use Case}{A canonical operator pattern (e.g.\ \texttt{BinaryUseCase}, \texttt{UnaryUseCase})}
-\newacronym{vmap}{vmap}{Vectorizing map --- batched apply over a leading axis}
-\newacronym{vulkan}{Vulkan}{Cross-platform GPU compute API (Khronos)}
-\newacronym{xla}{XLA}{Accelerated Linear Algebra --- ML compiler}
-\newacronym[longplural={Linear Algebra Operators}]{op}{Op}{Operator --- single tensor-to-tensor function}
+% --- 缩写 ---
+\newacronym{api}{API}{应用程序编程接口}
+\newacronym{ad}{AD}{自动微分}
+\newacronym{cpu}{CPU}{中央处理单元}
+\newacronym{cuda}{CUDA}{计算统一设备架构 (NVIDIA)}
+\newacronym{cupti}{CUPTI}{CUDA 剖析工具接口}
+\newacronym{dag}{DAG}{有向无环图}
+\newacronym{dlpack}{DLPack}{深度学习打包——张量交换内存格式}
+\newacronym{dso}{DSO}{动态共享对象}
+\newacronym{itt}{ITT}{英特尔线程工具——VTune 标记}
+\newacronym{jit}{JIT}{即时编译}
+\newacronym{lto}{LTO}{链接时优化}
+\newacronym{mkl}{MKL}{英特尔数学内核库}
+\newacronym{nvtx}{NVTX}{NVIDIA 工具扩展——域/探针标记}
+\newacronym{pgo}{PGO}{剖面引导优化}
+\newacronym{rpath}{RPATH}{嵌入 ELF 的运行时库搜索路径}
+\newacronym{so}{SO}{\texttt{.so} Linux 共享对象}
+\newacronym{symbolic}{符号 AD}{符号模式自动微分}
+\newacronym{tape}{Tape}{为反向重放而记录的操作序列}
+\newacronym{tc}{TC}{张量推导——多面体机器学习编译器}
+\newacronym{tls}{TLS}{线程局部存储}
+\newacronym{usecase}{用例}{规范算子模式（如 \texttt{BinaryUseCase}、\texttt{UnaryUseCase}）}
+\newacronym{vmap}{vmap}{向量化映射——沿前导轴批量应用}
+\newacronym{vulkan}{Vulkan}{跨平台 GPU 计算 API (Khronos)}
+\newacronym{xla}{XLA}{加速线性代数——机器学习编译器}
+\newacronym[longplural={Linear Algebra Operators}]{op}{Op}{算子——单张量到张量的函数}
 
-% --- Glossary ---
+% --- 术语表 ---
 \newglossaryentry{dispatchkey}{
   name=\texttt{DispatchKey},
-  description={13-slot enum (\texttt{p10/include/DispatchKey.h:15}) selecting which implementation of an operator runs. Backend (0--2), \texttt{Autocast} (3--5), \texttt{Autograd} (6--8), \texttt{Vmap} (9--11), \texttt{Composite} (12).},
+  description={13 槽枚举（\texttt{p10/include/DispatchKey.h:15}），选择算子的哪一实现运行。后端(0--2)、\texttt{Autocast}(3--5)、\texttt{Autograd}(6--8)、\texttt{Vmap}(9--11)、\texttt{Composite}(12)。},
   sort=DispatchKey
 }
 \newglossaryentry{dispatcher}{
   name=\texttt{Dispatcher},
-  description={Static registry mapping \texttt{OperatorName} to a \texttt{DispatchTable}. The kernel-slot array is \texttt{array<atomic<KernelFunction>,13>} at \texttt{p10/include/Dispatcher.h:49--61}.},
+  description={将 \texttt{OperatorName} 映射到 \texttt{DispatchTable} 的静态注册表。内核槽数组为 \texttt{array<atomic<KernelFunction>,13>}，位于 \texttt{p10/include/Dispatcher.h:49--61}。},
   sort=Dispatcher
 }
 \newglossaryentry{tensoriterator}{
   name=\texttt{TensorIterator},
-  description={Seven-step broadcast/compute pipeline (\texttt{coerce\_inputs}, \texttt{split\_inputs}, \texttt{analyze\_broadcast}, \texttt{compute\_strides}, \texttt{reorder\_dims}, \texttt{coalesce\_dims}, \texttt{allocate\_output}) at \texttt{p10/src/TensorIterator.cpp:1077}.},
+  description={七步广播/计算流水线（\texttt{coerce\_inputs}、\texttt{split\_inputs}、\texttt{analyze\_broadcast}、\texttt{compute\_strides}、\texttt{reorder\_dims}、\texttt{coalesce\_dims}、\texttt{allocate\_output}），位于 \texttt{p10/src/TensorIterator.cpp:1077}。},
   sort=TensorIterator
 }
 \newglossaryentry{sequence_nr}{
   name=\texttt{sequence\_nr},
-  description={Per-thread monotonic counter assigned in \texttt{Node::Node} at \texttt{tpx/include/Node.h:50,109}. Used by \texttt{ReadyQueue} (\texttt{Engine.h:38}) to prioritize recomputation deterministically.},
+  description={每线程单调计数器，在 \texttt{Node::Node}（\texttt{tpx/include/Node.h:50,109}）中赋值。由 \texttt{ReadyQueue}（\texttt{Engine.h:38}）用于确定性地优先重算。},
   sort=SequenceNR
 }
 \newglossaryentry{savedvariable}{
   name=\texttt{SavedVariable},
-  description={Type-erased wrapper that saves a tensor plus its \texttt{version\_counter} snapshot, asserting on unpack that the tensor has not been mutated since forward. Located at \texttt{tpx/include/SavedVariable.h:15,33}.},
+  description={类型擦除包装，保存张量及其 \texttt{version\_counter} 快照，解包时断言张量自前向以来未被原地修改。位于 \texttt{tpx/include/SavedVariable.h:15,33}。},
   sort=SavedVariable
 }
 \newglossaryentry{oprecord}{
   name=\texttt{OpRecord},
-  description={Stack-allocated profiler record stamped on every dispatched op at \texttt{p10/include/Profiler.h:145}. Holds \texttt{begin/end\_ns}, \texttt{tid}, \texttt{kind}, optional \texttt{shapes/dtypes}, \texttt{site\_id/stack\_id}.},
+  description={栈分配的剖析记录，在每个分发算子上打戳，位于 \texttt{p10/include/Profiler.h:145}。持有 \texttt{begin/end\_ns}、\texttt{tid}、\texttt{kind}、可选 \texttt{shapes/dtypes}、\texttt{site\_id/stack\_id}。},
   sort=OpRecord
 }
 \newglossaryentry{gputimer}{
   name=\texttt{GpuTimerPair},
-  description={Pooled \texttt{cudaEvent} pair armed per dispatched CUDA op at \texttt{p10/include/Profiler.h:227}. Resolves \texttt{gpu\_ms} at session stop. Host-side \texttt{begin/end} bookkept on \texttt{OpRecord}.},
+  description={池化的 \texttt{cudaEvent} 对，为每个分发的 CUDA 算子装备，位于 \texttt{p10/include/Profiler.h:227}。在会话结束时解析 \texttt{gpu\_ms}。宿主侧 \texttt{begin/end} 记于 \texttt{OpRecord}。},
   sort=GpuTimerPair
 }
 \newglossaryentry{redispatch}{
-  name=redispatch,
-  description={Scheme whereby an op at key \emph{K} internally calls itself at \emph{K'} (lower-priority). Used by \texttt{Autograd} (calls backend), \texttt{Autocast} (calls default-dtype), \texttt{Vmap} (calls batched kernel).},
+  name=重分发,
+  description={算子在键 \emph{K} 上内部以更低优先级的 \emph{K'} 自调用的方案。被 \texttt{Autograd}（调用后端）、\texttt{Autocast}（调用默认类型）、\texttt{Vmap}（调用批量内核）使用。},
   sort=Redispatch
 }
 \newglossaryentry{composite}{
   name=\texttt{Composite},
-  description={Slot 12 in \texttt{DispatchKey}. Backend-neutral fallback; never in a \texttt{DispatchKeySet}, consulted only by \texttt{OperatorHandle::getKernel} for \texttt{is\_backend\_key}.},
+  description={\texttt{DispatchKey} 的 12 号槽。后端无关回退；永不在 \texttt{DispatchKeySet} 中，仅由 \texttt{OperatorHandle::getKernel} 为 \texttt{is\_backend\_key} 查阅。},
   sort=Composite
 }
 \newglossaryentry{tp_packagedir}{
   name=\texttt{TP\_PACKAGE\_DIR},
-  description={CMake variable pinning \texttt{OUTPUT\_DIRECTORY} of every library to \texttt{\$\{CMAKE\_CURRENT\_SOURCE\_DIR\}/tensorplay}. Set at \texttt{CMakeLists.txt:326,1170}.},
+  description={CMake 变量，将所有库的 \texttt{OUTPUT\_DIRECTORY} 固定到 \texttt{\$\{CMAKE\_CURRENT\_SOURCE\_DIR\}/tensorplay}。设于 \texttt{CMakeLists.txt:326,1170}。},
   sort=TPPackageDir
 }
 \newglossaryentry{usb_slot}{
-  name=USB slot,
-  description={Pure-virtual interface \texttt{AutogradMetaBase} (\texttt{p10/include/AutogradMetaBase.h:13--25}) that lets \texttt{p10} carry differentiation state without including \texttt{tpx}. Concrete plug is \texttt{AutogradMeta} at \texttt{tpx/include/AutogradMeta.h:26--108}.},
+  name=USB 槽,
+  description={纯虚接口 \texttt{AutogradMetaBase}（\texttt{p10/include/AutogradMetaBase.h:13--25}），使 \texttt{p10} 无需包含 \texttt{tpx} 即可携带微分状态。具体插件为 \texttt{AutogradMeta}，位于 \texttt{tpx/include/AutogradMeta.h:26--108}。},
   sort=USBSlot
 }
 \newglossaryentry{linktime_axiom}{
-  name=link-time acyclicity,
-  description={Axiom: for any $(a,b)\in D$, \texttt{level}(a) > \texttt{level}(b), with \texttt{level}(p10)=0, \texttt{level}(tpx)=1, \texttt{level}(stax)=2, \texttt{level}(\_C)=3, enforced by \texttt{add\_subdirectory} order at \texttt{CMakeLists.txt:938--944} and downward-only \texttt{target\_link\_libraries} edges.},
+  name=链接期无环性,
+  description={公理：对任意 $(a,b)\in D$，\texttt{level}(a) > \texttt{level}(b)，其中 \texttt{level}(p10)=0、\texttt{level}(tpx)=1、\texttt{level}(stax)=2、\texttt{level}(\_C)=3，由 \texttt{CMakeLists.txt:938--944} 的 \texttt{add\_subdirectory} 顺序与仅向下的 \texttt{target\_link\_libraries} 边强制。},
   sort=LinkTimeAcyclicity
 }

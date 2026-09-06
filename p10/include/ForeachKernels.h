@@ -181,7 +181,7 @@ std::vector<Tensor> foreach_max_cuda(const std::vector<Tensor>& self);
 std::vector<Tensor> foreach_zero_cuda(const std::vector<Tensor>& self);
 std::vector<Tensor> foreach_clone_cuda(
         const std::vector<Tensor>& self,
-        const std::optional<int64_t>& memory_format);
+        std::optional<int64_t> memory_format);
 std::vector<Tensor> foreach_copy_cuda(
         const std::vector<Tensor>& self, const std::vector<Tensor>& src,
         bool non_blocking);
@@ -189,10 +189,10 @@ std::vector<Tensor> foreach_mm_cuda(
         const std::vector<Tensor>& self, const std::vector<Tensor>& mat2);
 std::vector<Tensor> foreach_norm_cuda(
         const std::vector<Tensor>& self, Scalar ord,
-        const std::optional<DType>& dtype);
+        std::optional<DType> dtype);
 std::vector<Tensor> foreach_powsum_cuda(
         const std::vector<Tensor>& self, Scalar ord,
-        const std::optional<DType>& dtype);
+        std::optional<DType> dtype);
 
 #define TP_DECLARE_FOREACH_UNARY_OUT(NAME)                                    \
 void foreach_##NAME##_out_cuda(                                               \
@@ -327,16 +327,16 @@ void foreach_zero_out_cuda(const std::vector<Tensor>& self,
                            std::vector<Tensor> out);
 void foreach_clone_out_cuda(
         const std::vector<Tensor>& self,
-        const std::optional<int64_t>& memory_format, std::vector<Tensor> out);
+        std::optional<int64_t> memory_format, std::vector<Tensor> out);
 void foreach_copy_out_cuda(
         const std::vector<Tensor>& self, const std::vector<Tensor>& src,
         bool non_blocking, std::vector<Tensor> out);
 void foreach_norm_out_cuda(
         const std::vector<Tensor>& self, Scalar ord,
-        const std::optional<DType>& dtype, std::vector<Tensor> out);
+        std::optional<DType> dtype, std::vector<Tensor> out);
 void foreach_powsum_out_cuda(
         const std::vector<Tensor>& self, Scalar ord,
-        const std::optional<DType>& dtype, std::vector<Tensor> out);
+        std::optional<DType> dtype, std::vector<Tensor> out);
 
 #define TP_DECLARE_MTA_UNARY(NAME)                                            \
 void foreach_##NAME##_mta_inplace_cuda(std::vector<Tensor> self);             \

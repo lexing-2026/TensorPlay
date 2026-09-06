@@ -5,7 +5,6 @@
 
 # tensorplay.futures
 
-# torch.futures
 
 ```{eval-rst}
 .. autosummary::

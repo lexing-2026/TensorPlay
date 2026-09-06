@@ -6,7 +6,7 @@ namespace tensorplay {
 
 class Tensor;
 
-// Opaque extension point carried by TensorImpl, mirroring c10::AutogradMetaBase.
+// Opaque extension point carried by TensorImpl.
 // The concrete autograd implementation (tensorplay::tpx::AutogradMeta) lives in
 // the tpx library and is reachable through this interface, keeping p10 free of
 // any dependency on the autograd layer.

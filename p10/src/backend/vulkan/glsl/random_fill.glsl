@@ -33,6 +33,10 @@ layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
  *   2: bernoulli_(p)              (u < p)
  * Every invocation derives its random words from (seed, offset, id), so the
  * fill is reproducible for a given seed and independent of scheduling.
+ *
+ * One texel carries four independent elements, one per channel lane, and a
+ * single Philox call yields exactly four words -- so each lane consumes its
+ * own word and no two elements of a texel ever share a draw.
  */
 void main() {
   const ivec3 pos = ivec3(gl_GlobalInvocationID);
@@ -52,20 +56,30 @@ void main() {
 
   // clang-format off
   $if DIST == 0:
-    const float u = word_to_uniform(words.x);
-    float value = u * (uBlock.to - uBlock.from) + uBlock.from;
-    // The draw is in [0, 1); after scaling the value can only hit `to`
+    vec4 value = vec4(
+        word_to_uniform(words.x), word_to_uniform(words.y),
+        word_to_uniform(words.z), word_to_uniform(words.w));
+    value = value * (uBlock.to - uBlock.from) + uBlock.from;
+    // The draws are in [0, 1); after scaling a value can only reach `to`
     // through rounding, which snaps back to keep the [from, to) contract.
-    if (value == uBlock.to) {
-      value = uBlock.from;
-    }
-    imageStore(uOutput, pos, vec4(value));
+    value = mix(value, vec4(uBlock.from), equal(value, vec4(uBlock.to)));
+    imageStore(uOutput, pos, value);
   $elif DIST == 1:
-    const vec2 pair = box_muller(
+    // Two uniform pairs give four standard normals; the affine map carries
+    // the requested mean and spread.
+    const vec2 first = box_muller(
         word_to_uniform(words.x), word_to_uniform(words.y));
-    imageStore(uOutput, pos, vec4(uBlock.to + uBlock.std * pair.x));
+    const vec2 second = box_muller(
+        word_to_uniform(words.z), word_to_uniform(words.w));
+    imageStore(
+        uOutput, pos,
+        uBlock.to + uBlock.std * vec4(first.x, first.y, second.x, second.y));
   $else:
-    const float u = word_to_uniform(words.x);
-    imageStore(uOutput, pos, vec4(u < uBlock.from ? 1.0f : 0.0f));
+    const vec4 u = vec4(
+        word_to_uniform(words.x), word_to_uniform(words.y),
+        word_to_uniform(words.z), word_to_uniform(words.w));
+    imageStore(
+        uOutput, pos,
+        mix(vec4(0.0f), vec4(1.0f), lessThan(u, vec4(uBlock.from))));
   // clang-format on
 }

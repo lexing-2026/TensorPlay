@@ -137,7 +137,7 @@ __device__ inline bool isclose_real_value(T lhs, T rhs, double rtol,
 template <typename T>
 void isclose_real_loop(TensorIterator& iter, double rtol, double atol,
                        bool equal_nan) {
-    gpu_kernel(iter, [=] __device__(T lhs, T rhs) -> bool {
+    gpu_kernel(iter, [=] __host__ __device__(T lhs, T rhs) -> bool {
         return isclose_real_value(lhs, rhs, rtol, atol, equal_nan);
     });
 }
@@ -165,7 +165,7 @@ __device__ inline bool isclose_complex_value(
 template <typename ComplexT, typename RealT>
 void isclose_complex_loop(TensorIterator& iter, double rtol, double atol,
                           bool equal_nan) {
-    gpu_kernel(iter, [=] __device__(ComplexT lhs, ComplexT rhs) -> bool {
+    gpu_kernel(iter, [=] __host__ __device__(ComplexT lhs, ComplexT rhs) -> bool {
         return isclose_complex_value<ComplexT, RealT>(
             lhs, rhs, rtol, atol, equal_nan);
     });
@@ -236,22 +236,22 @@ Tensor isreal_cuda(const Tensor& self) {
         .build();
     switch (self.dtype()) {
         case DType::ComplexHalf:
-            gpu_kernel(iter, [] __device__ (tensorplay::complex<Half> value) -> bool {
+            gpu_kernel(iter, [] __host__ __device__ (tensorplay::complex<Half> value) -> bool {
                 return static_cast<float>(value.imag()) == 0.0f;
             });
             break;
         case DType::ComplexFloat:
-            gpu_kernel(iter, [] __device__ (tensorplay::complex<float> value) -> bool {
+            gpu_kernel(iter, [] __host__ __device__ (tensorplay::complex<float> value) -> bool {
                 return value.imag() == 0.0f;
             });
             break;
         case DType::ComplexDouble:
-            gpu_kernel(iter, [] __device__ (tensorplay::complex<double> value) -> bool {
+            gpu_kernel(iter, [] __host__ __device__ (tensorplay::complex<double> value) -> bool {
                 return value.imag() == 0.0;
             });
             break;
         case DType::BComplex32:
-            gpu_kernel(iter, [] __device__ (tensorplay::complex<BFloat16> value) -> bool {
+            gpu_kernel(iter, [] __host__ __device__ (tensorplay::complex<BFloat16> value) -> bool {
                 return static_cast<float>(value.imag()) == 0.0f;
             });
             break;

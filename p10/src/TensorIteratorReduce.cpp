@@ -189,6 +189,10 @@ void TensorIteratorBase::foreach_reduced_elt(
   }
 }
 
+SplitUntil32Bit TensorIteratorBase::with_32bit_indexing() const {
+  return SplitUntil32Bit(*this);
+}
+
 SplitUntil32Bit::iterator::iterator(const TensorIteratorBase& iter) {
   vec.emplace_back(new TensorIterator(iter));
   vec.emplace_back(nullptr); // ++ first pops the last element
