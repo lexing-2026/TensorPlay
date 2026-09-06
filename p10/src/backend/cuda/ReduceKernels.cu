@@ -34,6 +34,12 @@ extern Tensor sum_dim_kernel(const Tensor& self,
 extern Tensor nansum_dim_kernel(const Tensor& self,
                                 const std::vector<int64_t>& dim,
                                 bool keepdim, DType dtype);
+extern Tensor amax_dim_kernel(const Tensor& self,
+                              const std::vector<int64_t>& dim,
+                              bool keepdim);
+extern Tensor amin_dim_kernel(const Tensor& self,
+                              const std::vector<int64_t>& dim,
+                              bool keepdim);
 extern Tensor var_dim_kernel(const Tensor& self,
                              const std::vector<int64_t>& dim,
                              int64_t correction, bool keepdim);
@@ -94,72 +100,6 @@ inline std::vector<int64_t> shape_of(const Tensor& t) {
 // ---------------------------------------------------------------------------
 // Reduction slice kernels (one thread per output slice)
 // ---------------------------------------------------------------------------
-
-template <typename T>
-__global__ void slice_max_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
-                                 const T* in, double* out) {
-    int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; si < n_slices; si += stride) {
-        int64_t o = si / inner, in2 = si % inner;
-        const T* sp = in + o * d_size * inner + in2;
-        double acc = -std::numeric_limits<double>::infinity();
-        for (int64_t j = 0; j < d_size; ++j) {
-            double v = static_cast<double>(sp[j * inner]);
-            acc = (v != v || v > acc) ? v : acc;  // NaN propagates
-        }
-        out[si] = acc;
-    }
-}
-
-template <typename T>
-__global__ void slice_min_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
-                                 const T* in, double* out) {
-    int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; si < n_slices; si += stride) {
-        int64_t o = si / inner, in2 = si % inner;
-        const T* sp = in + o * d_size * inner + in2;
-        double acc = std::numeric_limits<double>::infinity();
-        for (int64_t j = 0; j < d_size; ++j) {
-            double v = static_cast<double>(sp[j * inner]);
-            acc = (v != v || v < acc) ? v : acc;
-        }
-        out[si] = acc;
-    }
-}
-
-template <typename T>
-__global__ void slice_nansum_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
-                                    const T* in, double* out) {
-    int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; si < n_slices; si += stride) {
-        int64_t o = si / inner, in2 = si % inner;
-        const T* sp = in + o * d_size * inner + in2;
-        double acc = 0;
-        for (int64_t j = 0; j < d_size; ++j) {
-            double v = static_cast<double>(sp[j * inner]);
-            if (v == v) acc += v;
-        }
-        out[si] = acc;
-    }
-}
-
-template <typename T>
-__global__ void slice_count_nonzero_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
-                                           const T* in, double* out) {
-    int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; si < n_slices; si += stride) {
-        int64_t o = si / inner, in2 = si % inner;
-        const T* sp = in + o * d_size * inner + in2;
-        int64_t c = 0;
-        for (int64_t j = 0; j < d_size; ++j)
-            if (sp[j * inner] != static_cast<T>(0)) ++c;
-        out[si] = static_cast<double>(c);
-    }
-}
 
 template <typename T>
 __global__ void slice_logsumexp_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
@@ -239,66 +179,6 @@ __global__ void renorm_slice_kernel(int64_t n_slices, int64_t d_size, int64_t in
     }
 }
 
-// Multi-dim iterative reduction driver.
-// which: 0=max, 1=min, 2=nansum, 3=count_nonzero
-Tensor reduce_iterative(const Tensor& self, std::vector<int64_t> dims, bool keepdim,
-                        int which, DType out_dtype_override = DType::Undefined) {
-    Tensor cur = self.contiguous();
-    int64_t nd = cur.dim();
-    std::vector<bool> reduced(nd, false);
-    for (auto& d : dims) reduced[wrap_dim(d, nd)] = true;
-    auto stream = getCurrentCUDAStream().stream();
-    // With keepdim=false each pass erases the reduced axis, so later original
-    // dims shift down; track the current position of original dim `dim`.
-    int64_t shift = 0;
-    for (int64_t dim = 0; dim < nd; ++dim) {
-        if (!reduced[dim]) continue;
-        const int64_t cur_dim = dim - shift;
-        int64_t d_size = cur.size(cur_dim);
-        int64_t outer = 1, inner = 1;
-        outer_inner(shape_of(cur), cur_dim, outer, inner);
-        int64_t slices = outer * inner;
-        Tensor accs = Tensor::zeros({slices}, DType::Float64,
-                                    self.device());
-        if (slices > 0 && d_size > 0) {
-            dim3 grid = make_grid(slices), block(kThreads);
-#define TP_RI(ctype, name_) \
-    case DType::name_: \
-        if (which == 0) \
-            slice_max_kernel<ctype><<<grid, block, 0, stream>>>( \
-                slices, d_size, inner, cur.data_ptr<ctype>(), accs.data_ptr<double>()); \
-        else if (which == 1) \
-            slice_min_kernel<ctype><<<grid, block, 0, stream>>>( \
-                slices, d_size, inner, cur.data_ptr<ctype>(), accs.data_ptr<double>()); \
-        else if (which == 2) \
-            slice_nansum_kernel<ctype><<<grid, block, 0, stream>>>( \
-                slices, d_size, inner, cur.data_ptr<ctype>(), accs.data_ptr<double>()); \
-        else \
-            slice_count_nonzero_kernel<ctype><<<grid, block, 0, stream>>>( \
-                slices, d_size, inner, cur.data_ptr<ctype>(), accs.data_ptr<double>()); \
-        break;
-            switch (cur.dtype()) {
-                TENSORPLAY_FORALL_SCALAR_TYPES(TP_RI)
-                default: TP_THROW(TypeError, "reduce: unsupported dtype");
-            }
-#undef TP_RI
-            CUDA_CHECK(cudaGetLastError());
-        }
-        std::vector<int64_t> ns = shape_of(cur);
-        if (keepdim) {
-            ns[cur_dim] = 1;
-        } else {
-            ns.erase(ns.begin() + cur_dim);
-            ++shift;
-        }
-        cur = accs.reshape(ns);
-    }
-    DType final_dt = out_dtype_override == DType::Undefined ? self.dtype() : out_dtype_override;
-    return cur.to(final_dt);
-}
-
-
-
 // ===========================================================================
 // Reduction entry points
 // ===========================================================================
@@ -322,21 +202,11 @@ static void zero_numel_check_dims(const Tensor& self, const std::vector<int64_t>
 
 Tensor amax_cuda2(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim) {
     if (self.numel() == 0) zero_numel_check_dims(self, dim, "amax()");
-    return reduce_iterative(self, dim.empty()
-                                       ? [&]{ std::vector<int64_t> a;
-                                              for (int64_t i = 0; i < self.dim(); ++i) a.push_back(i);
-                                              return a; }()
-                                       : dim,
-                            keepdim, 0);
+    return amax_dim_kernel(self, dim, keepdim);
 }
 Tensor amin_cuda2(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim) {
     if (self.numel() == 0) zero_numel_check_dims(self, dim, "amin()");
-    return reduce_iterative(self, dim.empty()
-                                       ? [&]{ std::vector<int64_t> a;
-                                              for (int64_t i = 0; i < self.dim(); ++i) a.push_back(i);
-                                              return a; }()
-                                       : dim,
-                            keepdim, 1);
+    return amin_dim_kernel(self, dim, keepdim);
 }
 std::tuple<Tensor, Tensor> aminmax_cuda(const Tensor& self, std::vector<int64_t> dim,
                                         bool keepdim) {
