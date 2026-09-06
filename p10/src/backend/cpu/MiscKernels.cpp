@@ -952,13 +952,11 @@ Tensor quantile_compute(const Tensor& self, const Tensor& q,
         // including the pinned last index below -- yields NaN under either
         // sort placement.  Rows without NaN are untouched (bit-exact path).
         Tensor has_nan = reduced.isnan().any(int64_t(-1), true);
-        if (has_nan.any().item<bool>()) {
-            std::vector<int64_t> in_shape =
-                static_cast<std::vector<int64_t>>(reduced.shape());
-            reduced = reduced.masked_fill(
-                has_nan.expand(in_shape),
-                std::numeric_limits<double>::quiet_NaN());
-        }
+        std::vector<int64_t> in_shape =
+            static_cast<std::vector<int64_t>>(reduced.shape());
+        reduced = reduced.masked_fill(
+            has_nan.expand(in_shape),
+            std::numeric_limits<double>::quiet_NaN());
         const double last_index = static_cast<double>(reduced.size(-1) - 1);
         std::vector<Tensor> tl = Tensor::broadcast_tensors(
             {q.to(DType::Float64).mul(last_index), has_nan});
