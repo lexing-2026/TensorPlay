@@ -1078,7 +1078,7 @@ struct NormTwoOps {
     __device__ AccT combine(AccT a, AccT b) const { return a + b; }
     __device__ OutputT project(AccT value) const {
         if constexpr (std::is_same_v<AccT, float>) return static_cast<OutputT>(sqrtf(value));
-        else return static_cast<OutputT>(sqrt(value));
+        else return static_cast<OutputT>(::sqrt(value));
     }
 };
 
@@ -1119,7 +1119,7 @@ struct WelfordOps {
             if constexpr (std::is_same_v<AccT, float>) {
                 return static_cast<OutputT>(sqrtf(variance));
             } else {
-                return static_cast<OutputT>(sqrt(variance));
+                return static_cast<OutputT>(::sqrt(variance));
             }
         }
         return static_cast<OutputT>(variance);

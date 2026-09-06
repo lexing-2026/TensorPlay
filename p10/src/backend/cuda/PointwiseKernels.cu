@@ -324,42 +324,42 @@ Tensor unary_float_op_kernel_v2(const Tensor& self, Functor functor) {
 }
 
 // float32 tensors never fall into slow double-precision device math.
-struct ExpFunctor { template<typename T> __device__ T operator()(T x) const { return exp(x); } };
-struct Expm1Functor { template<typename T> __device__ T operator()(T x) const { return expm1(x); } };
-struct ErfFunctor { template<typename T> __device__ T operator()(T x) const { return erf(x); } };
-struct ErfcFunctor { template<typename T> __device__ T operator()(T x) const { return erfc(x); } };
-struct LogFunctor { template<typename T> __device__ T operator()(T x) const { return log(x); } };
-struct Log10Functor { template<typename T> __device__ T operator()(T x) const { return log10(x); } };
-struct Log1pFunctor { template<typename T> __device__ T operator()(T x) const { return log1p(x); } };
-struct Log2Functor { template<typename T> __device__ T operator()(T x) const { return log2(x); } };
-struct LgammaFunctor { template<typename T> __device__ T operator()(T x) const { return lgamma(x); } };
-struct SqrtFunctor { template<typename T> __device__ T operator()(T x) const { return sqrt(x); } };
-struct RsqrtFunctor { template<typename T> __device__ T operator()(T x) const { return rsqrt(x); } };
-struct SinFunctor { template<typename T> __device__ T operator()(T x) const { return sin(x); } };
-struct CosFunctor { template<typename T> __device__ T operator()(T x) const { return cos(x); } };
-struct TanhFunctor { template<typename T> __device__ T operator()(T x) const { return tanh(x); } };
+struct ExpFunctor { template<typename T> __device__ T operator()(T x) const { return ::exp(x); } };
+struct Expm1Functor { template<typename T> __device__ T operator()(T x) const { return ::expm1(x); } };
+struct ErfFunctor { template<typename T> __device__ T operator()(T x) const { return ::erf(x); } };
+struct ErfcFunctor { template<typename T> __device__ T operator()(T x) const { return ::erfc(x); } };
+struct LogFunctor { template<typename T> __device__ T operator()(T x) const { return ::log(x); } };
+struct Log10Functor { template<typename T> __device__ T operator()(T x) const { return ::log10(x); } };
+struct Log1pFunctor { template<typename T> __device__ T operator()(T x) const { return ::log1p(x); } };
+struct Log2Functor { template<typename T> __device__ T operator()(T x) const { return ::log2(x); } };
+struct LgammaFunctor { template<typename T> __device__ T operator()(T x) const { return ::lgamma(x); } };
+struct SqrtFunctor { template<typename T> __device__ T operator()(T x) const { return ::sqrt(x); } };
+struct RsqrtFunctor { template<typename T> __device__ T operator()(T x) const { return ::rsqrt(x); } };
+struct SinFunctor { template<typename T> __device__ T operator()(T x) const { return ::sin(x); } };
+struct CosFunctor { template<typename T> __device__ T operator()(T x) const { return ::cos(x); } };
+struct TanhFunctor { template<typename T> __device__ T operator()(T x) const { return ::tanh(x); } };
 struct SigmoidFunctor {
     template<typename T> __device__ T operator()(T x) const {
-        return static_cast<T>(1) / (static_cast<T>(1) + exp(-x));
+        return static_cast<T>(1) / (static_cast<T>(1) + ::exp(-x));
     }
 };
 struct ReluFunctor { template<typename T> __device__ T operator()(T x) const { return x < T(0) ? T(0) : x; } };
 struct GeluFunctor {
     template<typename T> __device__ T operator()(T x) const {
         const T kAlpha = static_cast<T>(0.70710678118654752440);
-        return static_cast<T>(0.5) * x * (static_cast<T>(1) + erf(x * kAlpha));
+        return static_cast<T>(0.5) * x * (static_cast<T>(1) + ::erf(x * kAlpha));
     }
 };
 struct SiluFunctor {
     template<typename T> __device__ T operator()(T x) const {
-        return x / (static_cast<T>(1) + exp(-x));
+        return x / (static_cast<T>(1) + ::exp(-x));
     }
 };
 struct SiluBackwardFunctor {
     template<typename T> __device__ T operator()(T dy, T x) const {
-        // sigmoid = 1 / (1 + exp(-x)); dy * sigmoid * (1 + x * (1 - sigmoid))
+        // sigmoid = 1 / (1 + ::exp(-x)); dy * sigmoid * (1 + x * (1 - sigmoid))
         const T one = static_cast<T>(1);
-        const T s = one / (one + exp(-x));
+        const T s = one / (one + ::exp(-x));
         return dy * s * (one + x * (one - s));
     }
 };
@@ -514,7 +514,7 @@ struct GeluTanhFunctor {
         const T kKappa = static_cast<T>(0.044715);
         T x_cube = x * x * x;
         T inner = kBeta * (x + kKappa * x_cube);
-        return static_cast<T>(0.5) * x * (static_cast<T>(1) + tanh(inner));
+        return static_cast<T>(0.5) * x * (static_cast<T>(1) + ::tanh(inner));
     }
 };
 struct HardtanhFunctor {
@@ -578,9 +578,9 @@ struct EluFunctor {
     EluFunctor(double alpha, double scale, double input_scale)
         : negcoef_(alpha * scale), poscoef_(scale), negiptcoef_(input_scale) {}
     template<typename T> __device__ T operator()(T a) const {
-        //   a < 0 ? expm1(a*input_scale)*negcoef : a*poscoef
+        //   a < 0 ? ::expm1(a*input_scale)*negcoef : a*poscoef
         return a < static_cast<T>(0)
-            ? expm1(a * static_cast<T>(negiptcoef_)) * static_cast<T>(negcoef_)
+            ? ::expm1(a * static_cast<T>(negiptcoef_)) * static_cast<T>(negcoef_)
             : a * static_cast<T>(poscoef_);
     }
 };
@@ -591,26 +591,26 @@ struct EluBackwardFunctor {
         : negcoef_(alpha * scale), poscoef_(scale), negiptcoef_(input_scale), is_result_(is_result) {}
     template<typename T> __device__ T operator()(T dy, T b) const {
         //   is_result: b <= 0 ? dy*negiptcoef*(b+negcoef) : dy*poscoef
-        //   else:      b <= 0 ? dy*negiptcoef*negcoef*exp(b*negiptcoef) : dy*poscoef
+        //   else:      b <= 0 ? dy*negiptcoef*negcoef*::exp(b*negiptcoef) : dy*poscoef
         return b <= static_cast<T>(0)
             ? (is_result_
                   ? dy * static_cast<T>(negiptcoef_) * (b + static_cast<T>(negcoef_))
-                  : dy * static_cast<T>(negiptcoef_) * static_cast<T>(negcoef_) * exp(b * static_cast<T>(negiptcoef_)))
+                  : dy * static_cast<T>(negiptcoef_) * static_cast<T>(negcoef_) * ::exp(b * static_cast<T>(negiptcoef_)))
             : dy * static_cast<T>(poscoef_);
     }
 };
 struct MishFunctor {
     template<typename T> __device__ T operator()(T x) const {
-        T sp = log1p(exp(x));
-        return x * tanh(sp);
+        T sp = ::log1p(::exp(x));
+        return x * ::tanh(sp);
     }
 };
 struct MishBackwardFunctor {
     template<typename T> __device__ T operator()(T dy, T x) const {
-        T sp = log1p(exp(x));
-        T tanh_sp = tanh(sp);
+        T sp = ::log1p(::exp(x));
+        T tanh_sp = ::tanh(sp);
         T sech2 = static_cast<T>(1) - tanh_sp * tanh_sp;
-        T gsp = static_cast<T>(1) / (static_cast<T>(1) + exp(-x));
+        T gsp = static_cast<T>(1) / (static_cast<T>(1) + ::exp(-x));
         return dy * (tanh_sp + x * sech2 * gsp);
     }
 };
@@ -619,25 +619,25 @@ struct SeluFunctor {
         constexpr double lambda_ = 1.0507009873554804934193349852946;
         constexpr double alpha_ = 1.6732632423543772848170429916717;
         return x > static_cast<T>(0) ? static_cast<T>(lambda_) * x
-                                     : static_cast<T>(alpha_ * lambda_) * expm1(x);
+                                     : static_cast<T>(alpha_ * lambda_) * ::expm1(x);
     }
 };
 struct CeluFunctor {
     double alpha_;
     CeluFunctor(double a) : alpha_(a) {}
     template<typename T> __device__ T operator()(T x) const {
-        return x > static_cast<T>(0) ? x : static_cast<T>(alpha_) * expm1(x / static_cast<T>(alpha_));
+        return x > static_cast<T>(0) ? x : static_cast<T>(alpha_) * ::expm1(x / static_cast<T>(alpha_));
     }
 };
 struct SoftplusFunctor {
     double beta_, threshold_;
     SoftplusFunctor(double beta, double threshold) : beta_(beta), threshold_(threshold) {}
     template<typename T> __device__ T operator()(T a) const {
-        //   beta*a > threshold ? a : log1p(exp(beta*a)) / beta
+        //   beta*a > threshold ? a : ::log1p(::exp(beta*a)) / beta
         T beta_in = static_cast<T>(beta_);
         return a * beta_in > static_cast<T>(threshold_)
             ? a
-            : log1p(exp(a * beta_in)) / beta_in;
+            : ::log1p(::exp(a * beta_in)) / beta_in;
     }
 };
 struct SoftplusBackwardFunctor {
@@ -648,18 +648,18 @@ struct SoftplusBackwardFunctor {
         T beta_in = static_cast<T>(beta_);
         return a * beta_in > static_cast<T>(threshold_)
             ? dy
-            : dy / (static_cast<T>(1) + exp(-a * beta_in));
+            : dy / (static_cast<T>(1) + ::exp(-a * beta_in));
     }
 };
 
 struct GeluBackwardNoneFunctor {
     template<typename T> __device__ T operator()(T dy, T x) const {
         //   kAlpha = M_SQRT1_2; kBeta = M_2_SQRTPI*M_SQRT1_2*0.5
-        //   cdf = 0.5*(1+erf(x*kAlpha)); pdf = kBeta*exp(-0.5*x*x)
+        //   cdf = 0.5*(1+::erf(x*kAlpha)); pdf = kBeta*::exp(-0.5*x*x)
         constexpr T kAlpha = static_cast<T>(0.70710678118654752440);
         constexpr T kBeta = static_cast<T>(1.12837916709551257390) * static_cast<T>(0.70710678118654752440) * static_cast<T>(0.5);
-        T cdf = static_cast<T>(0.5) * (static_cast<T>(1) + erf(x * kAlpha));
-        T pdf = kBeta * exp(x * x * static_cast<T>(-0.5));
+        T cdf = static_cast<T>(0.5) * (static_cast<T>(1) + ::erf(x * kAlpha));
+        T pdf = kBeta * ::exp(x * x * static_cast<T>(-0.5));
         return dy * (cdf + x * pdf);
     }
 };
@@ -670,7 +670,7 @@ struct GeluBackwardTanhFunctor {
         T x_sq = x * x;
         T x_cube = x_sq * x;
         T inner = kBeta * (x + kKappa * x_cube);
-        T tanh_inner = tanh(inner);
+        T tanh_inner = ::tanh(inner);
         T left = static_cast<T>(0.5) * x;
         T right = static_cast<T>(1) + tanh_inner;
         T left_derivative = static_cast<T>(0.5) * right;
@@ -733,22 +733,22 @@ Tensor softplus_backward_kernel_cuda(const Tensor& grad_output, const Tensor& se
     return activation_backward_kernel_cuda(grad_output, self, SoftplusBackwardFunctor(beta.toDouble(), threshold.toDouble()));
 }
 
-//   out = min(x, 0) - log1p(exp(-|x|))
+//   out = min(x, 0) - ::log1p(::exp(-|x|))
 struct LogSigmoidFunctor {
     template<typename T> __device__ T operator()(T x) const {
         T z = x < static_cast<T>(0) ? x : static_cast<T>(0);
         T neg_abs = x < static_cast<T>(0) ? x : -x;
-        return z - log1p(exp(neg_abs));
+        return z - ::log1p(::exp(neg_abs));
     }
 };
-// branch-split so exp() never overflows.
+// branch-split so ::exp() never overflows.
 struct LogSigmoidBackwardFunctor {
     template<typename T> __device__ T operator()(T dy, T x) const {
         if (x >= static_cast<T>(0)) {
-            T e = exp(-x);
+            T e = ::exp(-x);
             return dy * (e / (static_cast<T>(1) + e));
         }
-        return dy / (static_cast<T>(1) + exp(x));
+        return dy / (static_cast<T>(1) + ::exp(x));
     }
 };
 Tensor log_sigmoid_kernel_cuda(const Tensor& self) {
@@ -821,17 +821,17 @@ Tensor rrelu_with_noise_out_cuda(const Tensor& self, Tensor& noise, Scalar lower
     return noise;
 }
 // log_sigmoid forward with its saved buffer: log_sigmoid(x) = -softplus(-x);
-// the buffer caches exp(-|x|), the stable remainder of the softplus
+// the buffer caches ::exp(-|x|), the stable remainder of the softplus
 // evaluation the backward reuses elementwise.  Composed from the elementwise
 // kernels in this translation unit and the dispatched add/sub wrappers.
 std::tuple<Tensor, Tensor> log_sigmoid_forward_components_cuda(const Tensor& self) {
     const Scalar one(1.0);
-    Tensor b = exp_kernel_cuda(neg_kernel_cuda(abs_kernel_cuda(self)));  // exp(-|x|)
+    Tensor b = exp_kernel_cuda(neg_kernel_cuda(abs_kernel_cuda(self)));  // ::exp(-|x|)
     Tensor one_plus_b = b + one;
     Tensor log_b = log_kernel_cuda(b);
     Tensor log_one_plus_b = log_kernel_cuda(one_plus_b);
-    Tensor pos_branch = log_b - log_one_plus_b;        // log(b) - log(1+b)
-    Tensor neg_branch = self + log_b;                  // x + log(b), x < 0
+    Tensor pos_branch = log_b - log_one_plus_b;        // ::log(b) - ::log(1+b)
+    Tensor neg_branch = self + log_b;                  // x + ::log(b), x < 0
     Tensor output = ops::where(self.lt(Scalar(0.0)), neg_branch, pos_branch);
     return {output, b};
 }
@@ -875,18 +875,18 @@ Tensor rrelu_with_noise_backward_kernel_cuda(const Tensor& grad_output, const Te
     return binary_float_op_kernel_v2(grad_output, self, RreluWithNoiseEvalBackwardFunctor(slope));
 }
 
-struct AcosFunctor { template<typename T> __device__ T operator()(T x) const { return acos(x); } };
-struct AcoshFunctor { template<typename T> __device__ T operator()(T x) const { return acosh(x); } };
-struct AsinFunctor { template<typename T> __device__ T operator()(T x) const { return asin(x); } };
-struct AsinhFunctor { template<typename T> __device__ T operator()(T x) const { return asinh(x); } };
-struct AtanFunctor { template<typename T> __device__ T operator()(T x) const { return atan(x); } };
-struct AtanhFunctor { template<typename T> __device__ T operator()(T x) const { return atanh(x); } };
-struct CeilFunctor { template<typename T> __device__ T operator()(T x) const { return ceil(x); } };
-struct CoshFunctor { template<typename T> __device__ T operator()(T x) const { return cosh(x); } };
-struct FloorFunctor { template<typename T> __device__ T operator()(T x) const { return floor(x); } };
+struct AcosFunctor { template<typename T> __device__ T operator()(T x) const { return ::acos(x); } };
+struct AcoshFunctor { template<typename T> __device__ T operator()(T x) const { return ::acosh(x); } };
+struct AsinFunctor { template<typename T> __device__ T operator()(T x) const { return ::asin(x); } };
+struct AsinhFunctor { template<typename T> __device__ T operator()(T x) const { return ::asinh(x); } };
+struct AtanFunctor { template<typename T> __device__ T operator()(T x) const { return ::atan(x); } };
+struct AtanhFunctor { template<typename T> __device__ T operator()(T x) const { return ::atanh(x); } };
+struct CeilFunctor { template<typename T> __device__ T operator()(T x) const { return ::ceil(x); } };
+struct CoshFunctor { template<typename T> __device__ T operator()(T x) const { return ::cosh(x); } };
+struct FloorFunctor { template<typename T> __device__ T operator()(T x) const { return ::floor(x); } };
 struct RoundFunctor { template<typename T> __device__ T operator()(T x) const { return rint(x); } }; // rint matches round better in CUDA
-struct SinhFunctor { template<typename T> __device__ T operator()(T x) const { return sinh(x); } };
-struct TanFunctor { template<typename T> __device__ T operator()(T x) const { return tan(x); } };
+struct SinhFunctor { template<typename T> __device__ T operator()(T x) const { return ::sinh(x); } };
+struct TanFunctor { template<typename T> __device__ T operator()(T x) const { return ::tan(x); } };
 struct TruncFunctor {
     template<typename T> __device__ T operator()(T x) const {
         // ::trunc/::truncf are the CUDA device functions; unqualified trunc
@@ -1577,16 +1577,16 @@ Tensor binary_float_op_kernel_v2(const Tensor& self, const Tensor& other, Functo
     return result;
 }
 
-struct PowFunctor { template<typename T> __device__ T operator()(T a, T b) const { return pow(a, b); } };
+struct PowFunctor { template<typename T> __device__ T operator()(T a, T b) const { return ::pow(a, b); } };
 struct PowScalarFunctor {
     double exponent;
     PowScalarFunctor(double e) : exponent(e) {}
-    template<typename T> __device__ T operator()(T x) const { return pow(x, static_cast<T>(exponent)); }
+    template<typename T> __device__ T operator()(T x) const { return ::pow(x, static_cast<T>(exponent)); }
 };
 struct PowBaseFunctor {
     double base;
     template<typename T> __device__ T operator()(T exponent) const {
-        return pow(static_cast<T>(base), exponent);
+        return ::pow(static_cast<T>(base), exponent);
     }
 };
 struct CxPowBase {

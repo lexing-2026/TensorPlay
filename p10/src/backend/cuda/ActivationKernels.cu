@@ -437,7 +437,7 @@ __global__ void fused_silu_mul_kernel(const T* gate, const T* up, T* output,
     if (i >= n) return;
     const Acc x = static_cast<Acc>(gate[i]);
     const Acc y = static_cast<Acc>(up[i]);
-    const Acc sigmoid = Acc(1) / (Acc(1) + exp(-x));
+    const Acc sigmoid = Acc(1) / (Acc(1) + ::exp(-x));
     output[i] = static_cast<T>(x * sigmoid * y);
 }
 
@@ -452,7 +452,7 @@ __global__ void fused_silu_and_mul_kernel(const T* input, T* output,
     const int64_t base = row * (2 * half_width);
     const Acc gate = static_cast<Acc>(input[base + col]);
     const Acc up = static_cast<Acc>(input[base + half_width + col]);
-    const Acc sigmoid = Acc(1) / (Acc(1) + exp(-gate));
+    const Acc sigmoid = Acc(1) / (Acc(1) + ::exp(-gate));
     output[i] = static_cast<T>(gate * sigmoid * up);
 }
 
