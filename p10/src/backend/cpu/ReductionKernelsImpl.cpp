@@ -130,17 +130,97 @@ struct CxSumOps {
     scalar_t translate_idx(scalar_t acc, int64_t) const { return acc; }
 };
 
-// Scalar accumulator used for reduced-precision norm paths. TensorIterator
-// promotes Half/BFloat16 input to float when the output is float, matching
+template <typename scalar_t>
+struct NormAccumulatorType {
+    using value_t = typename scalar_value_type<scalar_t>::type;
+    using type = std::conditional_t<
+        std::is_same_v<value_t, Half> || std::is_same_v<value_t, BFloat16>,
+        float, value_t>;
+};
+
+template <typename scalar_t, typename acc_t>
+inline acc_t norm_abs_value(scalar_t value) {
+    if constexpr (is_complex_type_v<scalar_t>) {
+        return static_cast<acc_t>(std::hypot(
+            static_cast<acc_t>(value.real()), static_cast<acc_t>(value.imag())));
+    } else {
+        const acc_t converted = static_cast<acc_t>(value);
+        return converted < acc_t(0) ? -converted : converted;
+    }
+}
+
+template <typename scalar_t, typename acc_t, typename out_t = acc_t>
+struct NormZeroOps {
+    acc_t reduce(acc_t acc, scalar_t data, int64_t) const {
+        return acc + (data == scalar_t(0) ? acc_t(0) : acc_t(1));
+    }
+    acc_t combine(acc_t a, acc_t b) const { return a + b; }
+    out_t project(acc_t value) const { return static_cast<out_t>(value); }
+    acc_t translate_idx(acc_t acc, int64_t) const { return acc; }
+};
+
+template <typename scalar_t, typename acc_t, typename out_t = acc_t>
+struct NormOneOps {
+    acc_t reduce(acc_t acc, scalar_t data, int64_t) const {
+        return acc + norm_abs_value<scalar_t, acc_t>(data);
+    }
+    acc_t combine(acc_t a, acc_t b) const { return a + b; }
+    out_t project(acc_t value) const { return static_cast<out_t>(value); }
+    acc_t translate_idx(acc_t acc, int64_t) const { return acc; }
+};
+
 template <typename scalar_t, typename acc_t, typename out_t = acc_t>
 struct NormTwoOps {
     acc_t reduce(acc_t acc, scalar_t data, int64_t) const {
-        const acc_t value = static_cast<acc_t>(data);
+        const acc_t value = norm_abs_value<scalar_t, acc_t>(data);
         return acc + value * value;
     }
     acc_t combine(acc_t a, acc_t b) const { return a + b; }
     out_t project(acc_t value) const {
         return static_cast<out_t>(std::sqrt(value));
+    }
+    acc_t translate_idx(acc_t acc, int64_t) const { return acc; }
+};
+
+template <typename scalar_t, typename acc_t, typename out_t = acc_t>
+struct AbsMinOps {
+    acc_t reduce(acc_t acc, scalar_t data, int64_t) const {
+        return combine(acc, norm_abs_value<scalar_t, acc_t>(data));
+    }
+    acc_t combine(acc_t a, acc_t b) const {
+        if (std::isnan(a)) return a;
+        if (std::isnan(b)) return b;
+        return a < b ? a : b;
+    }
+    out_t project(acc_t value) const { return static_cast<out_t>(value); }
+    acc_t translate_idx(acc_t acc, int64_t) const { return acc; }
+};
+
+template <typename scalar_t, typename acc_t, typename out_t = acc_t>
+struct AbsMaxOps {
+    acc_t reduce(acc_t acc, scalar_t data, int64_t) const {
+        return combine(acc, norm_abs_value<scalar_t, acc_t>(data));
+    }
+    acc_t combine(acc_t a, acc_t b) const {
+        if (std::isnan(a)) return a;
+        if (std::isnan(b)) return b;
+        return a > b ? a : b;
+    }
+    out_t project(acc_t value) const { return static_cast<out_t>(value); }
+    acc_t translate_idx(acc_t acc, int64_t) const { return acc; }
+};
+
+template <typename scalar_t, typename acc_t, typename out_t = acc_t>
+struct NormOps {
+    acc_t norm;
+
+    acc_t reduce(acc_t acc, scalar_t data, int64_t) const {
+        return acc + static_cast<acc_t>(std::pow(
+            norm_abs_value<scalar_t, acc_t>(data), norm));
+    }
+    acc_t combine(acc_t a, acc_t b) const { return a + b; }
+    out_t project(acc_t value) const {
+        return static_cast<out_t>(std::pow(value, acc_t(1) / norm));
     }
     acc_t translate_idx(acc_t acc, int64_t) const { return acc; }
 };
@@ -241,61 +321,90 @@ static bool try_normsq_real_avx512(const void* xv, int64_t n, DType dt,
 }  // namespace
 #endif  // __x86_64__
 
+template <typename scalar_t, typename acc_t, typename out_t>
+void run_norm_reduce(TensorIterator& iter, double p) {
+    if (p == 0.0) {
+        binary_kernel_reduce(iter, NormZeroOps<scalar_t, acc_t, out_t>{}, acc_t(0));
+    } else if (p == 1.0) {
+        binary_kernel_reduce(iter, NormOneOps<scalar_t, acc_t, out_t>{}, acc_t(0));
+    } else if (p == 2.0) {
+        binary_kernel_reduce(iter, NormTwoOps<scalar_t, acc_t, out_t>{}, acc_t(0));
+    } else if (p == std::numeric_limits<double>::infinity()) {
+        binary_kernel_reduce(iter, AbsMaxOps<scalar_t, acc_t, out_t>{}, acc_t(0));
+    } else if (p == -std::numeric_limits<double>::infinity()) {
+        binary_kernel_reduce(
+            iter, AbsMinOps<scalar_t, acc_t, out_t>{},
+            std::numeric_limits<acc_t>::infinity());
+    } else {
+        binary_kernel_reduce(
+            iter, NormOps<scalar_t, acc_t, out_t>{static_cast<acc_t>(p)}, acc_t(0));
+    }
+}
+
+template <typename scalar_t>
+Tensor norm_full_typed(const Tensor& self, double p);
+
+template <typename scalar_t>
+Tensor norm_dim_typed(const Tensor& self, const std::vector<int64_t>& dims,
+                     double p, bool keepdim);
+
 Tensor norm_kernel_impl(const Tensor& self, double p) {
-    TP_CHECK(p == 2.0, "norm: only p=2 supported by the native CPU path");
+    const DType out_dtype = toRealValueType(self.dtype());
     if (self.numel() == 0) {
-        return Tensor::zeros({}, self.dtype(), self.device());
+        Tensor out = Tensor::zeros({}, out_dtype, self.device());
+        if (p == -std::numeric_limits<double>::infinity()) {
+            out.fill_(Scalar(std::numeric_limits<double>::infinity()));
+        }
+        return out;
     }
 
 #if defined(__x86_64__)
-    if (self.is_contiguous()) {
+    if (p == 2.0 && self.is_contiguous()) {
         double r = 0.0;
         if (try_normsq_real_avx512(self.data_ptr(), self.numel(), self.dtype(), &r)) {
-            Tensor out = Tensor::empty({}, self.dtype(), self.device());
+            Tensor out = Tensor::empty({}, out_dtype, self.device());
             if (self.dtype() == DType::Float32) out.fill_(Scalar(std::sqrt(static_cast<float>(r))));
             else out.fill_(Scalar(std::sqrt(r)));
             return out;
         }
     }
 #endif
-    if (self.dtype() == DType::Float32) {
-        Tensor out = Tensor::zeros({}, DType::Float32, self.device());
-        TensorIterator iter = TensorIterator::reduce_op(out, self);
-        binary_kernel_reduce(iter, NormTwoOps<float, float>{}, 0.0f);
-        return out;
+
+    #define TP_NORM_FULL_CASE(ctype, dtype_name) \
+        case DType::dtype_name: \
+            return norm_full_typed<ctype>(self, p)
+    switch (self.dtype()) {
+        TP_NORM_FULL_CASE(float, Float32);
+        TP_NORM_FULL_CASE(double, Float64);
+        TP_NORM_FULL_CASE(Half, Float16);
+        TP_NORM_FULL_CASE(BFloat16, BFloat16);
+        TP_NORM_FULL_CASE(complex<Half>, ComplexHalf);
+        TP_NORM_FULL_CASE(complex<float>, ComplexFloat);
+        TP_NORM_FULL_CASE(complex<double>, ComplexDouble);
+        TP_NORM_FULL_CASE(complex<BFloat16>, BComplex32);
+        default:
+            TP_THROW(NotImplementedError, "norm: unsupported dtype on CPU");
     }
-    if (self.dtype() == DType::Float64) {
-        Tensor out = Tensor::zeros({}, DType::Float64, self.device());
-        TensorIterator iter = TensorIterator::reduce_op(out, self);
-        binary_kernel_reduce(iter, NormTwoOps<double, double>{}, 0.0);
-        return out;
-    }
-    if (self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16) {
-        // Keep the input type in the reduction op and accumulate in float.
-        // TensorIterator's reduced-precision path performs the same
-        Tensor out = Tensor::zeros({}, DType::Float32, self.device());
-        TensorIterator iter = TensorIterator::reduce_op(out, self);
-        if (self.dtype() == DType::Float16) {
-            binary_kernel_reduce(iter, NormTwoOps<Half, float>{}, 0.0f);
-        } else {
-            binary_kernel_reduce(iter, NormTwoOps<BFloat16, float>{}, 0.0f);
-        }
-        return out.to(self.dtype());
-    }
-    TP_THROW(NotImplementedError, "norm: unsupported floating dtype on CPU");
+    #undef TP_NORM_FULL_CASE
 }
 
-Tensor norm_dim_kernel_impl(const Tensor& self,
-                            const std::vector<int64_t>& dims,
-                            double p, bool keepdim) {
-    TP_CHECK(p == 2.0, "norm: only p=2 supported by the native CPU path");
-    if (dims.empty()) return norm_kernel_impl(self, p);
+template <typename scalar_t>
+Tensor norm_full_typed(const Tensor& self, double p) {
+    using acc_t = typename NormAccumulatorType<scalar_t>::type;
+    using out_t = typename scalar_value_type<scalar_t>::type;
+    Tensor out = Tensor::zeros({}, toRealValueType(self.dtype()), self.device());
+    TensorIterator iter = TensorIterator::reduce_op(out, self);
+    run_norm_reduce<scalar_t, acc_t, out_t>(iter, p);
+    return out;
+}
 
+template <typename scalar_t>
+Tensor norm_dim_typed(const Tensor& self, const std::vector<int64_t>& dims,
+                     double p, bool keepdim) {
+    using acc_t = typename NormAccumulatorType<scalar_t>::type;
+    using out_t = typename scalar_value_type<scalar_t>::type;
     const std::vector<int64_t> out_shape = compute_reduction_shape(self, dims, keepdim);
-    const bool reduced_precision =
-        self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16;
-    const DType acc_dtype = reduced_precision ? DType::Float32 : self.dtype();
-    Tensor out = Tensor::zeros(out_shape, acc_dtype, self.device());
+    Tensor out = Tensor::zeros(out_shape, toRealValueType(self.dtype()), self.device());
 
     std::vector<bool> mask(self.dim(), false);
     for (int64_t d : dims) {
@@ -306,21 +415,31 @@ Tensor norm_dim_kernel_impl(const Tensor& self,
     }
     Tensor viewed = review_reduce_result(out, self.dim(), mask, keepdim);
     TensorIterator iter = TensorIterator::reduce_op(viewed, self);
+    run_norm_reduce<scalar_t, acc_t, out_t>(iter, p);
+    return out;
+}
 
-    if (self.dtype() == DType::Float32) {
-        binary_kernel_reduce(iter, NormTwoOps<float, float>{}, 0.0f);
-    } else if (self.dtype() == DType::Float64) {
-        binary_kernel_reduce(iter, NormTwoOps<double, double>{}, 0.0);
-    } else if (reduced_precision) {
-        if (self.dtype() == DType::Float16) {
-            binary_kernel_reduce(iter, NormTwoOps<Half, float>{}, 0.0f);
-        } else {
-            binary_kernel_reduce(iter, NormTwoOps<BFloat16, float>{}, 0.0f);
-        }
-    } else {
-        TP_THROW(NotImplementedError, "norm: unsupported floating dtype on CPU");
+Tensor norm_dim_kernel_impl(const Tensor& self,
+                            const std::vector<int64_t>& dims,
+                            double p, bool keepdim) {
+    if (dims.empty()) return norm_kernel_impl(self, p);
+
+    #define TP_NORM_DIM_CASE(ctype, dtype_name) \
+        case DType::dtype_name: \
+            return norm_dim_typed<ctype>(self, dims, p, keepdim)
+    switch (self.dtype()) {
+        TP_NORM_DIM_CASE(float, Float32);
+        TP_NORM_DIM_CASE(double, Float64);
+        TP_NORM_DIM_CASE(Half, Float16);
+        TP_NORM_DIM_CASE(BFloat16, BFloat16);
+        TP_NORM_DIM_CASE(complex<Half>, ComplexHalf);
+        TP_NORM_DIM_CASE(complex<float>, ComplexFloat);
+        TP_NORM_DIM_CASE(complex<double>, ComplexDouble);
+        TP_NORM_DIM_CASE(complex<BFloat16>, BComplex32);
+        default:
+            TP_THROW(NotImplementedError, "norm: unsupported dtype on CPU");
     }
-    return reduced_precision ? out.to(self.dtype()) : out;
+    #undef TP_NORM_DIM_CASE
 }
 
 // --- AVX-512 runtime-dispatched full-reduction sum (real dtypes) -----------
