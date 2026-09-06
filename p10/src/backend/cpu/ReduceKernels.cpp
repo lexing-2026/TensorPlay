@@ -35,6 +35,16 @@ inline int64_t wrap_dim(int64_t dim, int64_t ndim) {
     return dim < 0 ? dim + ndim : dim;
 }
 
+inline int64_t wrap_scan_dim(int64_t dim, int64_t ndim) {
+    if (ndim == 0) {
+        if (dim == -1 || dim == 0) return 0;
+        TP_THROW(IndexError,
+                 "Dimension out of range for a scalar tensor (expected -1 or 0, but got ",
+                 dim, ")");
+    }
+    return wrap_dim(dim, ndim);
+}
+
 inline void outer_inner(const std::vector<int64_t>& shape, int64_t dim,
                         int64_t& outer, int64_t& inner) {
     outer = 1;
@@ -382,13 +392,19 @@ Tensor nansum_cpu(const Tensor& self, const std::vector<int64_t>& dim_in,
 
 std::tuple<Tensor, Tensor> cummax_cpu(const Tensor& self, int64_t dim) {
     const int64_t nd = self.dim();
-    dim = wrap_dim(dim, nd);
+    dim = wrap_scan_dim(dim, nd);
     Tensor sc = self.contiguous();
     Tensor vals = Tensor::empty(static_cast<std::vector<int64_t>>(sc.shape()),
                                 sc.dtype(), sc.device());
     Tensor idxs = Tensor::empty(static_cast<std::vector<int64_t>>(sc.shape()),
                                 DType::Int64, sc.device());
+    if (nd == 0) {
+        vals.copy_(sc);
+        idxs.fill_(Scalar(0));
+        return {vals, idxs};
+    }
     const int64_t d_size = sc.size(dim);
+    if (d_size == 0 || sc.numel() == 0) return {vals, idxs};
     int64_t outer = 1;
     int64_t inner = 1;
     outer_inner(static_cast<std::vector<int64_t>>(sc.shape()), dim, outer, inner);
@@ -407,7 +423,10 @@ std::tuple<Tensor, Tensor> cummax_cpu(const Tensor& self, int64_t dim) {
                 int64_t best_i = 0; \
                 dst[0] = best; out_i[0] = 0; \
                 for (int64_t j = 1; j < d_size; ++j) { \
-                    if (src[j * inner] > best) { best = src[j * inner]; best_i = j; } \
+                    const ctype current = src[j * inner]; \
+                    if (current != current || (best == best && current >= best)) { \
+                        best = current; best_i = j; \
+                    } \
                     dst[j * inner] = best; out_i[j * inner] = best_i; \
                 } \
             } \
@@ -424,13 +443,19 @@ std::tuple<Tensor, Tensor> cummax_cpu(const Tensor& self, int64_t dim) {
 
 std::tuple<Tensor, Tensor> cummin_cpu(const Tensor& self, int64_t dim) {
     const int64_t nd = self.dim();
-    dim = wrap_dim(dim, nd);
+    dim = wrap_scan_dim(dim, nd);
     Tensor sc = self.contiguous();
     Tensor vals = Tensor::empty(static_cast<std::vector<int64_t>>(sc.shape()),
                                 sc.dtype(), sc.device());
     Tensor idxs = Tensor::empty(static_cast<std::vector<int64_t>>(sc.shape()),
                                 DType::Int64, sc.device());
+    if (nd == 0) {
+        vals.copy_(sc);
+        idxs.fill_(Scalar(0));
+        return {vals, idxs};
+    }
     const int64_t d_size = sc.size(dim);
+    if (d_size == 0 || sc.numel() == 0) return {vals, idxs};
     int64_t outer = 1;
     int64_t inner = 1;
     outer_inner(static_cast<std::vector<int64_t>>(sc.shape()), dim, outer, inner);
@@ -449,7 +474,10 @@ std::tuple<Tensor, Tensor> cummin_cpu(const Tensor& self, int64_t dim) {
                 int64_t best_i = 0; \
                 dst[0] = best; out_i[0] = 0; \
                 for (int64_t j = 1; j < d_size; ++j) { \
-                    if (src[j * inner] < best) { best = src[j * inner]; best_i = j; } \
+                    const ctype current = src[j * inner]; \
+                    if (current != current || (best == best && current <= best)) { \
+                        best = current; best_i = j; \
+                    } \
                     dst[j * inner] = best; out_i[j * inner] = best_i; \
                 } \
             } \
