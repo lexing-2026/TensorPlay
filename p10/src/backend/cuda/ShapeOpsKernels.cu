@@ -194,18 +194,6 @@ __global__ void flip_map_kernel(int64_t n, int64_t nd, const T* src, T* dst,
 }
 
 template <typename T>
-__global__ void flip_dim_kernel(int64_t n, int64_t size, int64_t stride,
-                                const T* src, T* dst) {
-    int64_t li = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t grid_stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; li < n; li += grid_stride) {
-        const int64_t dim_index = (li / stride) % size;
-        const int64_t src_index = li + (size - 1 - 2 * dim_index) * stride;
-        dst[li] = src[src_index];
-    }
-}
-
-template <typename T>
 __global__ void broadcast_map_kernel(int64_t n, int64_t nd, const T* src, T* dst,
                                      const int64_t* out_sizes,
                                      const int64_t* in_sizes_padded,
@@ -482,13 +470,17 @@ Tensor flip_cuda(const Tensor& self, const std::vector<int64_t>& dims) {
         const int64_t dim = wrap_dim_scalar(dims[0], nd);
         const int64_t size = sc.size(dim);
         const int64_t stride = sc.stride(dim);
-        auto stream = getCurrentCUDAStream().stream();
-        dim3 grid = make_grid(n), block(kThreads);
 #define TP_FL1(ctype, name_) \
-        case DType::name_: \
-            flip_dim_kernel<ctype><<<grid, block, 0, stream>>>( \
-                n, size, stride, sc.data_ptr<ctype>(), out.data_ptr<ctype>()); \
-            break;
+        case DType::name_: { \
+            const ctype* source = sc.data_ptr<ctype>(); \
+            gpu_kernel_with_index(out, [=] GPU_LAMBDA(int64_t linear_index) -> ctype { \
+                const int64_t dim_index = (linear_index / stride) % size; \
+                const int64_t source_index = \
+                    linear_index + (size - 1 - 2 * dim_index) * stride; \
+                return source[source_index]; \
+            }); \
+            break; \
+        }
         switch (sc.dtype()) {
             TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_FL1)
             TENSORPLAY_FORALL_QINT_TYPES(TP_FL1)
