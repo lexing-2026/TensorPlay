@@ -89,13 +89,6 @@ __device__ bool logical_truth_cuda(const tensorplay::complex<T>& value) {
     return value.real() != T(0) || value.imag() != T(0);
 }
 
-template <typename T, typename F>
-__global__ void ew_unary_kernel(int64_t n, const T* a, T* out, F f) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) out[i] = f(a[i]);
-}
-
 void launch_ew(dim3& grid, dim3& block, int64_t n) {
     block = dim3(kThreads);
     grid = dim3(static_cast<unsigned>((n + kThreads - 1) / kThreads));
@@ -746,18 +739,17 @@ Tensor i0_cuda(const Tensor& self) {
 }
 Tensor nan_to_num_cuda(const Tensor& self, Scalar nan,
                        std::optional<Scalar> posinf, std::optional<Scalar> neginf) {
-    Tensor sc = self.contiguous();
     Tensor out = Tensor::empty(shape_of(self), self.dtype(), self.device());
-    int64_t n = self.numel();
-    if (n == 0) return out;
+    if (out.numel() == 0) return out;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(out)
+        .add_const_input(self)
+        .build();
     double nan_v = nan.toDouble();
     bool has_pos = posinf.has_value(), has_neg = neginf.has_value();
     double pos_v = has_pos ? posinf->toDouble() : std::numeric_limits<double>::infinity();
     double neg_v = has_neg ? neginf->toDouble() : -std::numeric_limits<double>::infinity();
-    auto stream = getCurrentCUDAStream().stream();
-    dim3 grid, block;
-    launch_ew(grid, block, n);
-    // Per-dtype kernel with the replacement rules baked in.
 #define TP_NTN(ctype, name_) \
     case DType::name_: { \
         ctype pv = has_pos ? static_cast<ctype>(pos_v) \
@@ -769,16 +761,14 @@ Tensor nan_to_num_cuda(const Tensor& self, Scalar nan,
                                   ? -std::numeric_limits<ctype>::infinity() \
                                   : std::numeric_limits<ctype>::lowest()); \
         ctype na = static_cast<ctype>(nan_v); \
-        ew_unary_kernel<ctype><<<grid, block, 0, stream>>>( \
-            n, sc.data_ptr<ctype>(), out.data_ptr<ctype>(), \
-            [na, pv, nv] __device__ (ctype v) { \
-                if constexpr (std::is_floating_point_v<ctype>) { \
-                    if (v != v) return na; \
-                    if (v == std::numeric_limits<ctype>::infinity()) return pv; \
-                    if (v == -std::numeric_limits<ctype>::infinity()) return nv; \
-                } \
-                return v; \
-            }); \
+        gpu_kernel(iter, [na, pv, nv] __device__ (ctype v) -> ctype { \
+            if constexpr (std::is_floating_point_v<ctype>) { \
+                if (v != v) return na; \
+                if (v == std::numeric_limits<ctype>::infinity()) return pv; \
+                if (v == -std::numeric_limits<ctype>::infinity()) return nv; \
+            } \
+            return v; \
+        }); \
         break; \
     }
     switch (self.dtype()) {
