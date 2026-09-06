@@ -882,13 +882,11 @@ __global__ void index_put_kernel(int64_t n, T* d, const int64_t* ip, const T* vp
     }
 }
 
-// Nonzero uses a device flag pass, an inclusive prefix pass, and an ordered
-// coordinate-writing pass.
 template <typename T>
-__global__ void nonzero_mark_kernel(int64_t n, const T* x, int64_t* flags) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) flags[i] = static_cast<bool>(x[i]) ? 1 : 0;
+inline void run_nonzero_mark_iter(TensorIteratorBase& iter) {
+    gpu_kernel(iter, [] __device__(T value) -> int64_t {
+        return static_cast<bool>(value) ? int64_t(1) : int64_t(0);
+    });
 }
 
 template <typename T>
@@ -2337,25 +2335,55 @@ Tensor nonzero_cuda(const Tensor& self) {
     if (n == 0) {
         return Tensor::zeros({0, nd}, DType::Int64, self.device());
     }
+    TP_CHECK(n <= static_cast<int64_t>(std::numeric_limits<int>::max()),
+             "nonzero: input is too large for device scan");
     Tensor flags = Tensor::empty({n}, DType::Int64, self.device());
-    auto stream = getCurrentCUDAStream().stream();
+    Tensor self_flat = self_c.reshape({n});
+    TensorIterator flag_iter = TensorIteratorConfig()
+        .resize_outputs(false)
+        .check_all_same_dtype(false)
+        .add_output(flags)
+        .add_const_input(self_flat)
+        .build();
 #define TP_NZC_CASE(ctype, name) \
     case DType::name: \
-        nonzero_mark_kernel<ctype><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            n, self_c.data_ptr<ctype>(), flags.data_ptr<int64_t>()); \
+        run_nonzero_mark_iter<ctype>(flag_iter); \
         break;
     switch (self_c.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_NZC_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(TP_NZC_CASE)
+        case DType::ComplexHalf:
+            run_nonzero_mark_iter<tensorplay::complex<Half>>(flag_iter);
+            break;
+        case DType::ComplexFloat:
+            run_nonzero_mark_iter<tensorplay::complex<float>>(flag_iter);
+            break;
+        case DType::ComplexDouble:
+            run_nonzero_mark_iter<tensorplay::complex<double>>(flag_iter);
+            break;
+        case DType::BComplex32:
+            run_nonzero_mark_iter<tensorplay::complex<BFloat16>>(flag_iter);
+            break;
         default: TP_THROW(TypeError, "nonzero: unsupported dtype");
     }
 #undef TP_NZC_CASE
-    CUDA_CHECK(cudaGetLastError());
-    Tensor positions = flags.cumsum(0);
+    const cudaStream_t stream = getCurrentCUDAStream().stream();
+    Tensor positions = Tensor::empty({n}, DType::Int64, self.device());
+    size_t scan_bytes = 0;
+    CUDA_CHECK(cub::DeviceScan::InclusiveSum(
+        nullptr, scan_bytes, flags.data_ptr<int64_t>(),
+        positions.data_ptr<int64_t>(), static_cast<int>(n), stream));
+    Tensor scan_storage = Tensor::empty(
+        {static_cast<int64_t>(scan_bytes == 0 ? 1 : scan_bytes)},
+        DType::UInt8, self.device());
+    CUDA_CHECK(cub::DeviceScan::InclusiveSum(
+        scan_storage.data_ptr(), scan_bytes, flags.data_ptr<int64_t>(),
+        positions.data_ptr<int64_t>(), static_cast<int>(n), stream));
     int64_t count_host = 0;
-    CUDA_CHECK(cudaMemcpy(&count_host,
-                          positions.data_ptr<int64_t>() + n - 1,
-                          sizeof(int64_t),
-                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpyAsync(
+        &count_host, positions.data_ptr<int64_t>() + n - 1, sizeof(int64_t),
+        cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     Tensor result = Tensor::zeros({count_host, nd}, DType::Int64, self.device());
     if (count_host == 0) return result;
     // sizes live on the host; stage them on-device for the fill kernel
@@ -2371,6 +2399,35 @@ Tensor nonzero_cuda(const Tensor& self) {
         break;
     switch (self_c.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_NZF_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(TP_NZF_CASE)
+        case DType::ComplexHalf:
+            nonzero_fill_kernel<tensorplay::complex<Half>><<<
+                (n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+                n, nd, static_cast<const tensorplay::complex<Half>*>(self_c.data_ptr()),
+                sizes_d.data_ptr<int64_t>(), positions.data_ptr<int64_t>(),
+                result.data_ptr<int64_t>());
+            break;
+        case DType::ComplexFloat:
+            nonzero_fill_kernel<tensorplay::complex<float>><<<
+                (n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+                n, nd, static_cast<const tensorplay::complex<float>*>(self_c.data_ptr()),
+                sizes_d.data_ptr<int64_t>(), positions.data_ptr<int64_t>(),
+                result.data_ptr<int64_t>());
+            break;
+        case DType::ComplexDouble:
+            nonzero_fill_kernel<tensorplay::complex<double>><<<
+                (n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+                n, nd, static_cast<const tensorplay::complex<double>*>(self_c.data_ptr()),
+                sizes_d.data_ptr<int64_t>(), positions.data_ptr<int64_t>(),
+                result.data_ptr<int64_t>());
+            break;
+        case DType::BComplex32:
+            nonzero_fill_kernel<tensorplay::complex<BFloat16>><<<
+                (n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+                n, nd, static_cast<const tensorplay::complex<BFloat16>*>(self_c.data_ptr()),
+                sizes_d.data_ptr<int64_t>(), positions.data_ptr<int64_t>(),
+                result.data_ptr<int64_t>());
+            break;
         default: TP_THROW(TypeError, "nonzero: unsupported dtype");
     }
 #undef TP_NZF_CASE
