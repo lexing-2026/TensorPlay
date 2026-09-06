@@ -184,6 +184,27 @@ Tensor& fill_kernel(Tensor& self, Scalar value) {
 
 #include <iostream>
 
+template <typename T>
+void arange_fill(T* data, int64_t steps, double start, double step) {
+    using Vec = tensorplay::vec::Vectorized<T>;
+    constexpr int64_t width = Vec::size();
+    parallel::parallel_for(0, steps, parallel::GRAIN_SIZE,
+        [&](int64_t begin, int64_t last) {
+            int64_t index = begin;
+            const int64_t vector_end = begin +
+                ((last - begin) / width) * width;
+            for (; index < vector_end; index += width) {
+                const T base = static_cast<T>(
+                    start + static_cast<double>(index) * step);
+                Vec::arange(base, step).store(data + index);
+            }
+            for (; index < last; ++index) {
+                data[index] = static_cast<T>(
+                    start + static_cast<double>(index) * step);
+            }
+        });
+}
+
 Tensor arange_start_step_kernel(Scalar start, Scalar end, Scalar step, DType dtype, Device device) {
     // Better length calculation to avoid precision issues with large integers
     double s_d = start.toDouble();
@@ -311,27 +332,6 @@ Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device) {
 // output spans a range its own type may not represent, and a reduced-width
 // float would round the increment away long before the end of the sequence.
 namespace {
-
-template <typename T>
-void arange_fill(T* data, int64_t steps, double start, double step) {
-    using Vec = tensorplay::vec::Vectorized<T>;
-    constexpr int64_t width = Vec::size();
-    parallel::parallel_for(0, steps, parallel::GRAIN_SIZE,
-        [&](int64_t begin, int64_t last) {
-            int64_t index = begin;
-            const int64_t vector_end = begin +
-                ((last - begin) / width) * width;
-            for (; index < vector_end; index += width) {
-                const T base = static_cast<T>(
-                    start + static_cast<double>(index) * step);
-                Vec::arange(base, step).store(data + index);
-            }
-            for (; index < last; ++index) {
-                data[index] = static_cast<T>(
-                    start + static_cast<double>(index) * step);
-            }
-        });
-}
 
 // The endpoints are first narrowed to the element type, so an integral
 // sequence starts and ends where that type actually lands, and only then
