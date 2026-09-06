@@ -9,19 +9,23 @@
 #include "Utils.h"
 #include "Exception.h"
 #include "Parallel.h"
+#include "TypePromotion.h"
 #include "cpu/vec/vec.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 #include "tensorplay/ops/TensorRedispatchGenerated.h"
 
 #include <algorithm>
 #include <vector>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <type_traits>
 
 namespace tensorplay {
 namespace cpu {
 
 using namespace tensorplay::parallel;
+namespace ops = tensorplay::tpx::ops;
 
 namespace {
 
@@ -137,6 +141,95 @@ Tensor pdist_impl(const Tensor& self, double p) {
     return out;
 }
 
+inline int64_t product_all(const std::vector<int64_t>& shape) {
+    int64_t result = 1;
+    for (const int64_t extent : shape) result *= extent;
+    return result;
+}
+
+template <typename T>
+Tensor cdist_impl(const Tensor& x1, const Tensor& x2, double p,
+                  std::optional<int64_t> compute_mode,
+                  const std::vector<int64_t>& batch_shape,
+                  int64_t rows1, int64_t rows2, int64_t width) {
+    const int64_t batches = product_all(batch_shape);
+    std::vector<int64_t> output_shape = batch_shape;
+    output_shape.push_back(rows1);
+    output_shape.push_back(rows2);
+    const DType work_dtype = std::is_same_v<T, double>
+        ? DType::Float64
+        : DType::Float32;
+    Tensor output = Tensor::empty(output_shape, work_dtype, x1.device());
+    if (batches == 0 || rows1 == 0 || rows2 == 0) return output;
+    if (width == 0) return output.fill_(Scalar(0));
+
+    std::vector<int64_t> lhs_shape = batch_shape;
+    lhs_shape.push_back(rows1);
+    lhs_shape.push_back(width);
+    std::vector<int64_t> rhs_shape = batch_shape;
+    rhs_shape.push_back(rows2);
+    rhs_shape.push_back(width);
+    Tensor lhs = x1.to(work_dtype).expand(lhs_shape).contiguous().reshape(
+        {batches, rows1, width});
+    Tensor rhs = x2.to(work_dtype).expand(rhs_shape).contiguous().reshape(
+        {batches, rows2, width});
+
+    const int64_t mode = compute_mode.value_or(0);
+    if (p == 2.0 &&
+        (mode == 1 || (mode == 0 && (rows1 > 25 || rows2 > 25)))) {
+        Tensor lhs_norm = ops::sum(ops::mul(lhs, lhs), {-1}, true);
+        Tensor rhs_norm = ops::sum(ops::mul(rhs, rhs), {-1}, true);
+        Tensor lhs_augmented = ops::cat(
+            {ops::mul(lhs, Scalar(-2)), lhs_norm, Tensor::ones_like(lhs_norm)},
+            -1);
+        Tensor rhs_augmented = ops::cat(
+            {rhs, Tensor::ones_like(rhs_norm), rhs_norm}, -1);
+        Tensor result = ops::matmul(
+            lhs_augmented, ops::transpose(rhs_augmented, -2, -1));
+        result.clamp_min_(Scalar(0));
+        result.sqrt_();
+        return result.reshape(output_shape);
+    }
+
+    const T* lhs_data = lhs.data_ptr<T>();
+    const T* rhs_data = rhs.data_ptr<T>();
+    T* output_data = output.data_ptr<T>();
+    const int64_t pair_count = batches * rows1 * rows2;
+    const int64_t grain = std::max<int64_t>(1, GRAIN_SIZE / width);
+    parallel_for(0, pair_count, grain, [&](int64_t begin, int64_t end) {
+        for (int64_t linear = begin; linear < end; ++linear) {
+            const int64_t batch_pair = linear % (rows1 * rows2);
+            const int64_t batch = linear / (rows1 * rows2);
+            const int64_t row1 = batch_pair / rows2;
+            const int64_t row2 = batch_pair % rows2;
+            const T* lhs_row = lhs_data + (batch * rows1 + row1) * width;
+            const T* rhs_row = rhs_data + (batch * rows2 + row2) * width;
+            T value;
+            if (p == 0.0) {
+                int64_t count = 0;
+                for (int64_t column = 0; column < width; ++column) {
+                    count += lhs_row[column] != rhs_row[column];
+                }
+                value = static_cast<T>(count);
+            } else if (p == 1.0) {
+                value = pdist_distance<PdistMode::One>(
+                    lhs_row, rhs_row, width, p);
+            } else if (p == 2.0) {
+                value = pdist_distance<PdistMode::Two>(
+                    lhs_row, rhs_row, width, p);
+            } else if (std::isinf(p)) {
+                value = pdist_distance<PdistMode::Infinity>(
+                    lhs_row, rhs_row, width, p);
+            } else {
+                value = pdist_distance<PdistMode::General>(
+                    lhs_row, rhs_row, width, p);
+            }
+            output_data[linear] = value;
+        }
+    });
+    return output;
+}
+
 }  // namespace
 
 Tensor pairwise_distance_cpu(const Tensor& x1, const Tensor& x2, double p, double eps,
@@ -165,7 +258,55 @@ Tensor pdist_cpu(const Tensor& self, double p) {
     return pdist_impl<float>(self, p);
 }
 
+Tensor cdist_cpu(const Tensor& x1, const Tensor& x2, double p,
+                 std::optional<int64_t> compute_mode) {
+    if (x1.dim() < 2) {
+        TP_THROW(RuntimeError,
+                 "cdist only supports at least 2D tensors, X1 got: ",
+                 x1.dim(), "D");
+    }
+    if (x2.dim() < 2) {
+        TP_THROW(RuntimeError,
+                 "cdist only supports at least 2D tensors, X2 got: ",
+                 x2.dim(), "D");
+    }
+    if (x1.size(-1) != x2.size(-1)) {
+        TP_THROW(RuntimeError,
+                 "X1 and X2 must have the same number of columns. X1: ",
+                 x1.size(-1), " X2: ", x2.size(-1));
+    }
+    const DType common = promoteTypes(x1.dtype(), x2.dtype());
+    if (!isFloatingType(common)) {
+        TP_THROW(TypeError, "cdist only supports floating-point dtypes");
+    }
+    if (p < 0.0) {
+        TP_THROW(RuntimeError, "cdist only supports non-negative p values");
+    }
+    const int64_t mode = compute_mode.value_or(0);
+    if (mode < 0 || mode > 2) {
+        TP_THROW(RuntimeError, "possible modes: 0, 1, 2, but was: ", mode);
+    }
+
+    const std::vector<int64_t> shape1 =
+        static_cast<std::vector<int64_t>>(x1.shape());
+    const std::vector<int64_t> shape2 =
+        static_cast<std::vector<int64_t>>(x2.shape());
+    const std::vector<int64_t> batch1(shape1.begin(), shape1.end() - 2);
+    const std::vector<int64_t> batch2(shape2.begin(), shape2.end() - 2);
+    const std::vector<int64_t> batch_shape = broadcast_shapes(batch1, batch2);
+    const int64_t rows1 = x1.size(-2);
+    const int64_t rows2 = x2.size(-2);
+    const int64_t width = x1.size(-1);
+    if (common == DType::Float64) {
+        return cdist_impl<double>(
+            x1, x2, p, compute_mode, batch_shape, rows1, rows2, width);
+    }
+    return cdist_impl<float>(
+        x1, x2, p, compute_mode, batch_shape, rows1, rows2, width);
+}
+
 TENSORPLAY_LIBRARY_IMPL(CPU, Distance) {
+    m.impl("cdist", cdist_cpu);
     m.impl("pairwise_distance", pairwise_distance_cpu);
     m.impl("pdist", pdist_cpu);
 }
