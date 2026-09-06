@@ -429,19 +429,7 @@ TensorPlay is licensed under the [Apache 2.0 License](LICENSE).
  </picture>
 </a>
 
-<div align="center">
-    <a href="https://www.tensorplay.cn">
-        <picture>
-            <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/lexing-2026/TensorPlay/main/docs/images/tensorplay-logo-dark.png">
-            <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/lexing-2026/TensorPlay/main/docs/images/tensorplay-logo.png">
-            <img src="https://raw.githubusercontent.com/lexing-2026/TensorPlay/main/docs/images/tensorplay-logo.png" alt="TensorPlay" width="56">
-        </picture>
-    </a>
-    <br>
-    <sub>TensorPlay · <a href="https://www.tensorplay.cn">tensorplay.cn</a></sub>
-</div>
-
-## The organization behind TensorPlay
+## The Organization: TensorPlay
 
 <table align="center">
     <tr>

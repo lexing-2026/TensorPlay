@@ -1,11 +1,17 @@
 #include "BatchingKernels.h"
 
 #include <algorithm>
+#include <numeric>
 #include <string>
 
 #include "Context.h"
+#include "AdvancedIndex.h"
 #include "Dispatcher.h"
 #include "Exception.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
+#define TENSORPLAY_INDEXING_SKIP_TENSOR_MEMBERS
+#include "TensorIndexing.h"
+#undef TENSORPLAY_INDEXING_SKIP_TENSOR_MEMBERS
 #include "TransformDispatch.h"
 
 namespace tensorplay {
@@ -32,11 +38,12 @@ const Layer& layer_for(int64_t level) {
 }
 
 Operand unwrap_operand(const Tensor& input) {
-    if (!input.is_batched()) {
+    const auto active = current_layer();
+    TP_CHECK(active.has_value(), "batch tensor refers to an inactive transform");
+    if (!input.is_batched() || input.batch_level() != active->level) {
         return {input, std::nullopt, -1};
     }
-    const int64_t level = input.batch_level();
-    layer_for(level);
+    const int64_t level = active->level;
     auto unwrapped = unwrap_at_level(input, level);
     if (!std::get<1>(unwrapped).has_value()) {
         TP_THROW(RuntimeError, "failed to unwrap a batch tensor");
@@ -199,6 +206,22 @@ std::vector<int64_t> prepend_batch_size(const std::vector<int64_t>& shape,
     physical.push_back(batch_size);
     physical.insert(physical.end(), shape.begin(), shape.end());
     return physical;
+}
+
+int64_t strided_storage_size(const std::vector<int64_t>& size,
+                             const std::vector<int64_t>& stride) {
+    TP_CHECK(size.size() == stride.size(),
+             "new_empty_strided(sizes, strides): dimensionality of sizes (",
+             size.size(), ") must match dimensionality of strides (",
+             stride.size(), ")");
+    int64_t storage_size = 1;
+    for (size_t dim = 0; dim < size.size(); ++dim) {
+        if (size[dim] == 0) {
+            return 0;
+        }
+        storage_size += (size[dim] - 1) * stride[dim];
+    }
+    return storage_size;
 }
 
 Tensor expand_same_random(Tensor sample, const Layer& layer) {
@@ -1046,6 +1069,8 @@ namespace {
 using namespace tensorplay;
 using namespace tensorplay::transform::batch;
 using tensorplay::transform::make_batched;
+using tensorplay::transform::Layer;
+using tensorplay::transform::current_layer;
 
 #define TP_BATCH_UNARY(NAME, OP) \
     Tensor NAME(const Tensor& input) { return unary(OP, input); }
@@ -1451,231 +1476,591 @@ Tensor batch_tril(const Tensor& input, int64_t diagonal) {
 // from the caller and gain a fresh batch dimension.
 // ---------------------------------------------------------------------------
 
-Tensor batch_new_like(const char* factory, const Tensor& self,
-                      const std::vector<int64_t>& size,
+template <typename Function>
+Tensor batch_new_like(const Tensor& self, const std::vector<int64_t>& size,
                       std::optional<DType> dtype,
                       std::optional<int64_t> layout,
                       std::optional<Device> device,
-                      std::optional<bool> pin_memory) {
-    (void)layout;
+                      std::optional<bool> pin_memory,
+                      Function&& function) {
     Operand operand = unwrap_operand(self);
-    const DType out_dtype =
-        dtype.has_value() && *dtype != DType::Undefined ? *dtype : self.dtype();
-    const Device out_device = device.has_value() ? *device : self.device();
-    Tensor result =
-        call_device<Tensor, const std::vector<int64_t>&, std::optional<DType>,
-                    std::optional<Device>, bool>(
-            factory, out_device, size, out_dtype, out_device,
-            pin_memory.value_or(false));
-    if (!operand.bdim.has_value()) {
-        return result;
+    std::vector<int64_t> physical_size = size;
+    if (operand.bdim.has_value()) {
+        physical_size = prepend_batch_size(
+            size, operand.value.size(*operand.bdim));
     }
-    return make_batched(result, 0, operand.level);
+    Tensor result = function(operand.value, physical_size, dtype, layout, device,
+                             pin_memory);
+    return operand.bdim.has_value()
+        ? make_batched(result, 0, operand.level) : result;
 }
 
 Tensor batch_new_zeros(const Tensor& self, const std::vector<int64_t>& size,
                        std::optional<DType> dtype, std::optional<int64_t> layout,
                        std::optional<Device> device,
                        std::optional<bool> pin_memory) {
-    return batch_new_like("zeros", self, size, dtype, layout, device,
-                          pin_memory);
+    return batch_new_like(self, size, dtype, layout, device, pin_memory,
+                          [](const Tensor& value,
+                             const std::vector<int64_t>& shape,
+                             std::optional<DType> out_dtype,
+                             std::optional<int64_t> out_layout,
+                             std::optional<Device> out_device,
+                             std::optional<bool> out_pin_memory) {
+                              return tpx::ops::new_zeros(
+                                  value, shape, out_dtype, out_layout,
+                                  out_device, out_pin_memory);
+                          });
 }
 
 Tensor batch_new_ones(const Tensor& self, const std::vector<int64_t>& size,
                       std::optional<DType> dtype, std::optional<int64_t> layout,
                       std::optional<Device> device,
                       std::optional<bool> pin_memory) {
-    return batch_new_like("ones", self, size, dtype, layout, device,
-                          pin_memory);
+    return batch_new_like(self, size, dtype, layout, device, pin_memory,
+                          [](const Tensor& value,
+                             const std::vector<int64_t>& shape,
+                             std::optional<DType> out_dtype,
+                             std::optional<int64_t> out_layout,
+                             std::optional<Device> out_device,
+                             std::optional<bool> out_pin_memory) {
+                              return tpx::ops::new_ones(
+                                  value, shape, out_dtype, out_layout,
+                                  out_device, out_pin_memory);
+                          });
 }
 
-// ---------------------------------------------------------------------------
-// Advanced indexing: align the indexed tensor with every present index
-// tensor (and the assigned values for index_put_) so each batch element
-// gathers with its own indices.
-// ---------------------------------------------------------------------------
+Tensor batch_new_full(const Tensor& self, const std::vector<int64_t>& size,
+                      Scalar fill_value, std::optional<DType> dtype,
+                      std::optional<int64_t> layout,
+                      std::optional<Device> device,
+                      std::optional<bool> pin_memory) {
+    return batch_new_like(self, size, dtype, layout, device, pin_memory,
+                          [fill_value](const Tensor& value,
+                                        const std::vector<int64_t>& shape,
+                                        std::optional<DType> out_dtype,
+                                        std::optional<int64_t> out_layout,
+                                        std::optional<Device> out_device,
+                                        std::optional<bool> out_pin_memory) {
+                              return tpx::ops::new_full(
+                                  value, shape, fill_value, out_dtype,
+                                  out_layout, out_device, out_pin_memory);
+                          });
+}
 
-std::vector<Tensor> index_present_tensors(
-    const std::vector<std::optional<Tensor>>& indices) {
-    std::vector<Tensor> present;
-    present.reserve(indices.size());
-    for (const auto& index : indices) {
-        if (index.has_value()) present.push_back(*index);
+Tensor batch_new_empty(const Tensor& self, const std::vector<int64_t>& size,
+                       std::optional<DType> dtype, std::optional<int64_t> layout,
+                       std::optional<Device> device,
+                       std::optional<bool> pin_memory) {
+    return batch_new_like(self, size, dtype, layout, device, pin_memory,
+                          [](const Tensor& value,
+                             const std::vector<int64_t>& shape,
+                             std::optional<DType> out_dtype,
+                             std::optional<int64_t> out_layout,
+                             std::optional<Device> out_device,
+                             std::optional<bool> out_pin_memory) {
+                              return tpx::ops::new_empty(
+                                  value, shape, out_dtype, out_layout,
+                                  out_device, out_pin_memory);
+                          });
+}
+
+Tensor batch_new_empty_strided(
+    const Tensor& self, const std::vector<int64_t>& size,
+    const std::vector<int64_t>& stride, std::optional<DType> dtype,
+    std::optional<int64_t> layout, std::optional<Device> device,
+    std::optional<bool> pin_memory) {
+    Operand operand = unwrap_operand(self);
+    std::vector<int64_t> physical_size = size;
+    std::vector<int64_t> physical_stride = stride;
+    if (operand.bdim.has_value()) {
+        const int64_t batch_size = operand.value.size(*operand.bdim);
+        const int64_t storage_size = strided_storage_size(size, stride);
+        physical_size = prepend_batch_size(size, batch_size);
+        std::vector<int64_t> batch_shape{batch_size};
+        std::vector<int64_t> batch_strides =
+            SizesAndStrides::compute_contiguous_strides(batch_shape);
+        for (auto& batch_stride : batch_strides) {
+            batch_stride *= storage_size;
+        }
+        physical_stride = std::move(batch_strides);
+        physical_stride.insert(physical_stride.end(), stride.begin(),
+                               stride.end());
     }
-    return present;
+    Tensor result = tpx::ops::new_empty_strided(
+        operand.value, physical_size, physical_stride, dtype, layout, device,
+        pin_memory);
+    return operand.bdim.has_value()
+        ? make_batched(result, 0, operand.level) : result;
 }
 
-std::vector<std::optional<Tensor>> index_aligned_slots(
-    const std::vector<std::optional<Tensor>>& indices,
-    const std::vector<Tensor>& aligned, size_t aligned_count) {
-    // `aligned` holds the aligned form of every present index in order; walk
-    // the original slots and reinsert them positionally.
-    std::vector<std::optional<Tensor>> slots;
-    slots.reserve(indices.size());
-    size_t next = 0;
+bool any_index_bdim(const std::vector<std::optional<int64_t>>& bdims) {
+    for (const auto bdim : bdims) {
+        if (bdim.has_value()) return true;
+    }
+    return false;
+}
+
+bool is_advanced_index(const std::optional<Tensor>& index) {
+    return index.has_value() && index->defined();
+}
+
+int64_t num_leading_index_nones(
+    const std::vector<std::optional<Tensor>>& indices) {
+    int64_t result = 0;
     for (const auto& index : indices) {
-        if (index.has_value() && next < aligned_count) {
-            slots.push_back(aligned[next]);
-            ++next;
+        if (!is_advanced_index(index)) {
+            ++result;
         } else {
-            slots.push_back(std::nullopt);
+            break;
         }
     }
-    return slots;
+    return result;
 }
+
+int64_t max_index_logical_rank(
+    const std::vector<std::optional<Tensor>>& indices,
+    const std::vector<std::optional<int64_t>>& indices_bdims) {
+    TP_CHECK(
+        indices.size() == indices_bdims.size(),
+        "index batch rule received mismatched index metadata");
+    int64_t result = -1;
+    for (size_t i = 0; i < indices.size(); ++i) {
+        if (!is_advanced_index(indices[i])) continue;
+        const int64_t rank = indices[i]->dim() -
+            (indices_bdims[i].has_value() ? 1 : 0);
+        result = std::max(result, rank);
+    }
+    return result;
+}
+
+bool advanced_indices_are_adjacent(
+    const std::vector<std::optional<Tensor>>& indices) {
+    int64_t regions = 0;
+    bool in_region = false;
+    for (const auto& index : indices) {
+        if (!in_region && is_advanced_index(index)) {
+            ++regions;
+            in_region = true;
+        } else if (in_region && !is_advanced_index(index)) {
+            in_region = false;
+        }
+    }
+    return regions <= 1;
+}
+
+Tensor swap_index_regions(const Tensor& tensor, int64_t first_size,
+                          int64_t second_size) {
+    std::vector<int64_t> permutation(static_cast<size_t>(tensor.dim()));
+    std::iota(permutation.begin(), permutation.end(), 0);
+    std::rotate(
+        permutation.begin() + 1,
+        permutation.begin() + 1 + first_size,
+        permutation.begin() + 1 + first_size + second_size);
+    return tensor.permute(permutation);
+}
+
+Tensor ensure_index_batch_dim(const Tensor& tensor, bool has_bdim,
+                              int64_t batch_size) {
+    if (has_bdim) return tensor;
+    std::vector<int64_t> shape;
+    shape.reserve(static_cast<size_t>(tensor.dim() + 1));
+    shape.push_back(batch_size);
+    const auto logical_shape = static_cast<std::vector<int64_t>>(tensor.shape());
+    shape.insert(shape.end(), logical_shape.begin(), logical_shape.end());
+    return tensor.expand(shape);
+}
+
+Tensor maybe_pad_index_rank(const Tensor& tensor, std::optional<int64_t> bdim,
+                            int64_t logical_rank) {
+    if (!bdim.has_value()) return tensor;
+    Tensor front = move_to_front(tensor, *bdim);
+    const int64_t current_rank = front.dim() - 1;
+    if (current_rank >= logical_rank) return front;
+    std::vector<int64_t> shape;
+    shape.reserve(static_cast<size_t>(logical_rank + 1));
+    shape.push_back(front.size(0));
+    for (int64_t i = current_rank; i < logical_rank; ++i) {
+        shape.push_back(1);
+    }
+    for (int64_t d = 1; d < front.dim(); ++d) {
+        shape.push_back(front.size(d));
+    }
+    return front.view(shape);
+}
+
+std::vector<std::optional<Tensor>> batch_indices(
+    const Tensor& options_source,
+    const std::vector<std::optional<Tensor>>& indices,
+    const std::vector<std::optional<int64_t>>& indices_bdims,
+    int64_t batch_size,
+    std::optional<int64_t> self_bdim,
+    std::optional<int64_t> values_bdim = std::nullopt) {
+    TP_CHECK(
+        indices.size() == indices_bdims.size(),
+        "index batch rule received mismatched index metadata");
+    const int64_t max_logical_rank =
+        max_index_logical_rank(indices, indices_bdims);
+    const bool indices_batched = any_index_bdim(indices_bdims);
+    const int64_t max_index_dim = max_logical_rank +
+        ((indices_batched || values_bdim.has_value()) ? 1 : 0);
+
+    std::vector<std::optional<Tensor>> result;
+    result.reserve(indices.size() + 1);
+    for (size_t i = 0; i < indices.size(); ++i) {
+        const auto& index = indices[i];
+        if (is_advanced_index(index) && index->numel() != 0) {
+            if (index->dtype() == DType::Bool && indices_bdims[i].has_value()) {
+                TP_THROW(
+                    RuntimeError,
+                    "vmap: batching an indexing operation with a boolean mask "
+                    "is not supported because its output shape is dynamic");
+            }
+            result.emplace_back(maybe_pad_index_rank(
+                *index, indices_bdims[i], max_logical_rank));
+        } else {
+            result.push_back(index);
+        }
+    }
+
+    if (!indices_batched && self_bdim.has_value()) {
+        result.insert(result.begin(), std::nullopt);
+    } else if (indices_batched &&
+               (self_bdim.has_value() || values_bdim.has_value())) {
+        Tensor arange_index = tpx::ops::arange(
+            Scalar(batch_size), DType::Int64, options_source.device());
+        while (arange_index.dim() < max_index_dim) {
+            arange_index = arange_index.unsqueeze(-1);
+        }
+        result.insert(result.begin(), std::move(arange_index));
+    }
+    return result;
+}
+
 
 Tensor batch_index(const Tensor& self,
                    const std::vector<std::optional<Tensor>>& indices) {
-    std::vector<Tensor> operands;
-    operands.push_back(self);
-    for (const Tensor& index : index_present_tensors(indices)) {
-        operands.push_back(index);
+    const tensorplay::transform::Layer active = current_vmap_layer();
+    const Operand self_operand = operand_at_level(self, active.level);
+    const std::optional<int64_t> self_bdim = self_operand.bdim;
+
+    std::vector<std::optional<Tensor>> index_values;
+    std::vector<std::optional<int64_t>> index_bdims;
+    index_values.reserve(indices.size());
+    index_bdims.reserve(indices.size());
+    for (const auto& maybe_index : indices) {
+        if (!is_advanced_index(maybe_index)) {
+            index_values.push_back(std::nullopt);
+            index_bdims.push_back(std::nullopt);
+            continue;
+        }
+        const Operand index_operand =
+            operand_at_level(*maybe_index, active.level);
+        index_values.push_back(index_operand.value);
+        index_bdims.push_back(index_operand.bdim);
     }
-    auto aligned = align_tensor_list(operands);
-    std::vector<std::optional<Tensor>> aligned_indices = index_aligned_slots(
-        indices, aligned.first, aligned.first.size());
+
+    const bool indices_batched = any_index_bdim(index_bdims);
+    TP_CHECK(
+        self_bdim.has_value() || indices_batched,
+        "index batch rule was called without a batched operand");
+    const bool advanced_adjacent =
+        advanced_indices_are_adjacent(index_values);
+    const int64_t leading_nones = num_leading_index_nones(index_values);
+    const int64_t max_index_dim =
+        max_index_logical_rank(index_values, index_bdims);
+
+    Tensor self_value = self_operand.value;
+    if (self_bdim.has_value()) {
+        self_value = move_to_front(self_value, *self_bdim);
+    }
+    const auto physical_indices = batch_indices(
+        self_value, index_values, index_bdims, active.batch_size,
+        self_bdim);
     Tensor result = call_next<Tensor, const Tensor&,
                               const std::vector<std::optional<Tensor>>&>(
-        "index.Tensor", aligned.first[0], aligned.first[0], aligned_indices);
-    return make_batched(result, 0, aligned.second);
+        "index.Tensor", self_value, self_value, physical_indices);
+
+    if (self_bdim.has_value() && !indices_batched) {
+        return make_batched(
+            result, advanced_adjacent ? 0 : max_index_dim, active.level);
+    }
+    if (!self_bdim.has_value() && indices_batched) {
+        return make_batched(
+            result, advanced_adjacent ? leading_nones : 0, active.level);
+    }
+
+    if (!advanced_adjacent || leading_nones == 0) {
+        return make_batched(result, 0, active.level);
+    }
+    return make_batched(
+        swap_index_regions(result, max_index_dim, leading_nones),
+        0,
+        active.level);
 }
 
-Tensor batch_index_put_(Tensor self,
-                        const std::vector<std::optional<Tensor>>& indices,
-                        const Tensor& values, bool accumulate) {
-    std::vector<Tensor> operands;
-    operands.push_back(self);
-    for (const Tensor& index : index_present_tensors(indices)) {
-        operands.push_back(index);
+Tensor& batch_index_put_(Tensor& self, const std::vector<Tensor>& indices,
+                         const Tensor& values, bool accumulate) {
+    const tensorplay::transform::Layer active = current_vmap_layer();
+    const Operand self_operand = operand_at_level(self, active.level);
+    if (!self_operand.bdim.has_value()) {
+        TP_THROW(
+            RuntimeError,
+            "vmap: in-place index_put_ is not possible because self is not "
+            "batched at the current vmap level");
     }
-    operands.push_back(values);
-    auto aligned = align_tensor_list(operands);
-    std::vector<std::optional<Tensor>> aligned_indices = index_aligned_slots(
-        indices, aligned.first, aligned.first.size());
-    Tensor result = call_next<Tensor, Tensor&,
-                              const std::vector<std::optional<Tensor>>&,
-                              const Tensor&, bool>(
-        "index_put_", aligned.first[0], aligned.first[0], aligned_indices,
-        aligned.first.back(), accumulate);
-    return make_batched(result, 0, aligned.second);
+
+    std::vector<std::optional<Tensor>> index_values;
+    std::vector<std::optional<int64_t>> index_bdims;
+    index_values.reserve(indices.size());
+    index_bdims.reserve(indices.size());
+    for (const auto& index : indices) {
+        if (!index.defined()) {
+            index_values.push_back(std::nullopt);
+            index_bdims.push_back(std::nullopt);
+            continue;
+        }
+        const Operand index_operand = operand_at_level(index, active.level);
+        index_values.push_back(index_operand.value);
+        index_bdims.push_back(index_operand.bdim);
+    }
+    Tensor values_on_device = values;
+    if (values.device() != self.device() && values.numel() == 1 && values.dim() == 0) {
+        values_on_device = values.to(self.device());
+    }
+    const Operand values_operand = operand_at_level(values_on_device, active.level);
+    Tensor self_value = move_to_front(
+        self_operand.value, *self_operand.bdim);
+    Tensor values_value = values_operand.value;
+    if (values_operand.bdim.has_value()) {
+        values_value = move_to_front(values_value, *values_operand.bdim);
+    }
+    self_value = ensure_index_batch_dim(
+        self_value, /*has_bdim=*/true, active.batch_size);
+    values_value = ensure_index_batch_dim(
+        values_value, values_operand.bdim.has_value(), active.batch_size);
+
+    const auto physical_indices = batch_indices(
+        self_value, index_values, index_bdims, active.batch_size,
+        /*self_bdim=*/0, values_operand.bdim);
+    const auto shape = indexing::native::indexed_shape(self_value, physical_indices);
+    if (static_cast<int64_t>(shape.size()) > values_value.dim()) {
+        const auto old_shape = static_cast<std::vector<int64_t>>(values_value.shape());
+        const auto unit_dims = shape.size() - old_shape.size();
+        std::vector<int64_t> new_shape(shape.size(), 1);
+        new_shape[0] = active.batch_size;
+        for (size_t d = 1; d < old_shape.size(); ++d) {
+            new_shape[d + unit_dims] = old_shape[d];
+        }
+        values_value = values_value.view(new_shape);
+    }
+    std::vector<Tensor> redispatch_indices;
+    redispatch_indices.reserve(physical_indices.size());
+    for (const auto& index : physical_indices) {
+        redispatch_indices.emplace_back(index.has_value() ? *index : Tensor());
+    }
+    tpx::ops::index_put_(self_value, redispatch_indices, values_value, accumulate);
+    return self;
+}
+
+void batch_copy_(Tensor& self, const Tensor& src, bool non_blocking) {
+    Operand self_operand = unwrap_operand(self);
+    if (!self_operand.bdim.has_value()) {
+        Operand src_operand = unwrap_operand(src);
+        if (src_operand.bdim.has_value()) {
+            TP_THROW(RuntimeError,
+                     "vmap: inplace arithmetic (copy_) is not possible "
+                     "because there exists a Tensor other than 'self' in the "
+                     "current vmap level");
+        }
+        call_next<void, Tensor&, const Tensor&, bool>(
+            "copy_", self, self, src, non_blocking);
+        return;
+    }
+    auto aligned = broadcast_values(self_operand, unwrap_operand(src));
+    Tensor self_value = aligned.first;
+    call_next<void, Tensor&, const Tensor&, bool>(
+        "copy_", self_value, self_value, aligned.second, non_blocking);
+}
+
+bool participates_at_level(const Tensor& value, int64_t level) {
+    return tensorplay::transform::is_batched_at_level(value, level);
+}
+
+bool participates_at_level(const std::optional<Tensor>& value, int64_t level) {
+    return value.has_value() && participates_at_level(*value, level);
+}
+
+template <typename T>
+bool participates_at_level(const std::vector<T>& values, int64_t level) {
+    if constexpr (std::is_same_v<T, Tensor> ||
+                  std::is_same_v<T, std::optional<Tensor>>) {
+        for (const auto& value : values) {
+            if (participates_at_level(value, level)) return true;
+        }
+    }
+    return false;
+}
+
+template <typename T>
+bool participates_at_level(const T&, int64_t) { return false; }
+
+template <auto Function, bool Random, typename Signature = decltype(Function)>
+struct BatchRulePlumbing;
+
+template <auto Function, bool Random, typename Return, typename... Args>
+struct BatchRulePlumbing<Function, Random, Return (*)(Args...)> {
+    static inline OperatorHandle handle;
+
+    static Return call(Args... args) {
+        auto excluded = DispatchKeySet::make(DispatchKey::VmapCPU) |
+            DispatchKeySet::make(DispatchKey::VmapCUDA) |
+            DispatchKeySet::make(DispatchKey::VmapVulkan);
+        if constexpr (Random) excluded.add(DispatchKey::VmapMode);
+        impl::ExcludeDispatchKeyGuard guard(excluded);
+        const Layer layer = current_vmap_layer();
+        if constexpr (!Random) {
+            if (!(participates_at_level(args, layer.level) || ...)) {
+                return DispatchStub<Return, Args...>::call(
+                    handle, dispatchKeyForTensorArgs(args...),
+                    std::forward<Args>(args)...);
+            }
+        }
+        return Function(std::forward<Args>(args)...);
+    }
+};
+
+template <auto Function, bool Random = false>
+void register_batch_rule(tensorplay::Library& library, const char* name) {
+    using Plumbing = BatchRulePlumbing<Function, Random>;
+    Plumbing::handle = Dispatcher::singleton().findHandle(name);
+    library.impl(name, &Plumbing::call);
+    if constexpr (Random) {
+        Dispatcher::singleton().registerKernel(
+            name, DispatchKey::VmapMode,
+            reinterpret_cast<KernelFunction>(&Plumbing::call));
+    }
 }
 
 void register_batch_rules(tensorplay::Library& library) {
-    library.impl("neg", &batch_neg);
-    library.impl("negative", &batch_negative);
-    library.impl("abs", &batch_abs);
-    library.impl("exp", &batch_exp);
-    library.impl("log", &batch_log);
-    library.impl("sin", &batch_sin);
-    library.impl("cos", &batch_cos);
-    library.impl("sinh", &batch_sinh);
-    library.impl("cosh", &batch_cosh);
-    library.impl("tanh", &batch_tanh);
-    library.impl("sqrt", &batch_sqrt);
-    library.impl("rsqrt", &batch_rsqrt);
-    library.impl("sigmoid", &batch_sigmoid);
-    library.impl("relu", &batch_relu);
-    library.impl("floor", &batch_floor);
-    library.impl("ceil", &batch_ceil);
-    library.impl("round", &batch_round);
-    library.impl("trunc", &batch_trunc);
-    library.impl("erf", &batch_erf);
-    library.impl("erfc", &batch_erfc);
-    library.impl("log1p", &batch_log1p);
-    library.impl("expm1", &batch_expm1);
-    library.impl("mul.Tensor", &batch_mul);
-    library.impl("div.Tensor", &batch_div);
-    library.impl("maximum", &batch_maximum);
-    library.impl("minimum", &batch_minimum);
-    library.impl("logical_and", &batch_logical_and);
-    library.impl("logical_or", &batch_logical_or);
-    library.impl("logical_xor", &batch_logical_xor);
-    library.impl("logical_not", &batch_logical_not);
-    library.impl("bitwise_not", &batch_bitwise_not);
-    library.impl("bitwise_and.Tensor", &batch_bitwise_and);
-    library.impl("bitwise_or.Tensor", &batch_bitwise_or);
-    library.impl("bitwise_xor.Tensor", &batch_bitwise_xor);
-    library.impl("bitwise_left_shift.Tensor", &batch_bitwise_lshift);
-    library.impl("bitwise_right_shift.Tensor", &batch_bitwise_rshift);
-    library.impl("bitwise_and.Scalar", &batch_bitwise_and_scalar);
-    library.impl("bitwise_or.Scalar", &batch_bitwise_or_scalar);
-    library.impl("bitwise_xor.Scalar", &batch_bitwise_xor_scalar);
-    library.impl("bitwise_left_shift.Tensor_Scalar", &batch_bitwise_lshift_scalar);
-    library.impl("bitwise_right_shift.Tensor_Scalar", &batch_bitwise_rshift_scalar);
-    library.impl("bitwise_and.Scalar_Tensor", &batch_bitwise_and_stensor);
-    library.impl("bitwise_or.Scalar_Tensor", &batch_bitwise_or_stensor);
-    library.impl("bitwise_xor.Scalar_Tensor", &batch_bitwise_xor_stensor);
-    library.impl("bitwise_left_shift.Scalar_Tensor", &batch_bitwise_lshift_stensor);
-    library.impl("bitwise_right_shift.Scalar_Tensor", &batch_bitwise_rshift_stensor);
-    library.impl("add.Scalar", &batch_add_scalar);
-    library.impl("sub.Scalar", &batch_sub_scalar);
-    library.impl("mul.Scalar", &batch_mul_scalar);
-    library.impl("div.Scalar", &batch_div_scalar);
-    library.impl("add.Tensor", &batch_add);
-    library.impl("sub.Tensor", &batch_sub);
-    library.impl("pow.Tensor_Scalar", &batch_pow_scalar);
-    library.impl("pow.Tensor_Tensor", &batch_pow_tensor);
-    library.impl("sum", &batch_sum);
-    library.impl("sum.dim_IntList", &batch_sum_dim);
-    library.impl("view", &batch_view);
-    library.impl("permute", &batch_permute);
-    library.impl("transpose", &batch_transpose);
-    library.impl("movedim", &batch_movedim);
-    library.impl("reshape", &batch_reshape);
-    library.impl("expand", &batch_expand);
-    library.impl("squeeze", &batch_squeeze);
-    library.impl("squeeze.dim", &batch_squeeze_dim);
-    library.impl("squeeze.dims", &batch_squeeze_dims);
-    library.impl("unsqueeze", &batch_unsqueeze);
-    library.impl("contiguous", &batch_contiguous);
-    library.impl("select.int", &batch_select);
-    library.impl("slice", &batch_slice);
-    library.impl("narrow", &batch_narrow);
-    library.impl("index_select", &batch_index_select);
-    library.impl("cat", &batch_cat);
-    library.impl("stack", &batch_stack);
-    library.impl("mm", &batch_mm);
-    library.impl("matmul", &batch_matmul);
-    library.impl("bmm", &batch_bmm);
-    library.impl("linear", &batch_linear);
-    library.impl("rand", &batch_rand);
-    library.impl("randn", &batch_randn);
-    library.impl("randint", &batch_randint);
-    library.impl("randperm", &batch_randperm);
-    library.impl("rand_like", &batch_rand_like);
-    library.impl("randint_like", &batch_randint_like);
-    library.impl("randn_like", &batch_randn_like);
-    library.impl("eq.Tensor", &batch_eq_tensor);
-    library.impl("ne.Tensor", &batch_ne_tensor);
-    library.impl("lt.Tensor", &batch_lt_tensor);
-    library.impl("le.Tensor", &batch_le_tensor);
-    library.impl("gt.Tensor", &batch_gt_tensor);
-    library.impl("ge.Tensor", &batch_ge_tensor);
-    library.impl("eq.Scalar", &batch_eq_scalar);
-    library.impl("ne.Scalar", &batch_ne_scalar);
-    library.impl("lt.Scalar", &batch_lt_scalar);
-    library.impl("le.Scalar", &batch_le_scalar);
-    library.impl("gt.Scalar", &batch_gt_scalar);
-    library.impl("ge.Scalar", &batch_ge_scalar);
-    library.impl("where.self", &batch_where_self);
-    library.impl("where.ScalarSelf", &batch_where_scalar_self);
-    library.impl("where.ScalarOther", &batch_where_scalar_other);
-    library.impl("where.Scalar", &batch_where_scalar);
-    library.impl("clamp", &batch_clamp);
-    library.impl("cumsum", &batch_cumsum);
-    library.impl("logsumexp", &batch_logsumexp);
-    library.impl("all.dim", &batch_all_dim);
-    library.impl("max.dim", &batch_max_dim);
-    library.impl("argsort", &batch_argsort);
-    library.impl("argsort.stable", &batch_argsort_stable);
-    library.impl("gather", &batch_gather);
-    library.impl("repeat_interleave.self_int", &batch_repeat_interleave_self_int);
-    library.impl("to.dtype", &batch_to_dtype);
-    library.impl("tril", &batch_tril);
-    library.impl("new_zeros", &batch_new_zeros);
-    library.impl("new_ones", &batch_new_ones);
-    library.impl("index.Tensor", &batch_index);
-    library.impl("index_put_", &batch_index_put_);
+    register_batch_rule<&batch_neg>(library, "neg");
+    register_batch_rule<&batch_negative>(library, "negative");
+    register_batch_rule<&batch_abs>(library, "abs");
+    register_batch_rule<&batch_exp>(library, "exp");
+    register_batch_rule<&batch_log>(library, "log");
+    register_batch_rule<&batch_sin>(library, "sin");
+    register_batch_rule<&batch_cos>(library, "cos");
+    register_batch_rule<&batch_sinh>(library, "sinh");
+    register_batch_rule<&batch_cosh>(library, "cosh");
+    register_batch_rule<&batch_tanh>(library, "tanh");
+    register_batch_rule<&batch_sqrt>(library, "sqrt");
+    register_batch_rule<&batch_rsqrt>(library, "rsqrt");
+    register_batch_rule<&batch_sigmoid>(library, "sigmoid");
+    register_batch_rule<&batch_relu>(library, "relu");
+    register_batch_rule<&batch_floor>(library, "floor");
+    register_batch_rule<&batch_ceil>(library, "ceil");
+    register_batch_rule<&batch_round>(library, "round");
+    register_batch_rule<&batch_trunc>(library, "trunc");
+    register_batch_rule<&batch_erf>(library, "erf");
+    register_batch_rule<&batch_erfc>(library, "erfc");
+    register_batch_rule<&batch_log1p>(library, "log1p");
+    register_batch_rule<&batch_expm1>(library, "expm1");
+    register_batch_rule<&batch_mul>(library, "mul.Tensor");
+    register_batch_rule<&batch_div>(library, "div.Tensor");
+    register_batch_rule<&batch_maximum>(library, "maximum");
+    register_batch_rule<&batch_minimum>(library, "minimum");
+    register_batch_rule<&batch_logical_and>(library, "logical_and");
+    register_batch_rule<&batch_logical_or>(library, "logical_or");
+    register_batch_rule<&batch_logical_xor>(library, "logical_xor");
+    register_batch_rule<&batch_logical_not>(library, "logical_not");
+    register_batch_rule<&batch_bitwise_not>(library, "bitwise_not");
+    register_batch_rule<&batch_bitwise_and>(library, "bitwise_and.Tensor");
+    register_batch_rule<&batch_bitwise_or>(library, "bitwise_or.Tensor");
+    register_batch_rule<&batch_bitwise_xor>(library, "bitwise_xor.Tensor");
+    register_batch_rule<&batch_bitwise_lshift>(library, "bitwise_left_shift.Tensor");
+    register_batch_rule<&batch_bitwise_rshift>(library, "bitwise_right_shift.Tensor");
+    register_batch_rule<&batch_bitwise_and_scalar>(library, "bitwise_and.Scalar");
+    register_batch_rule<&batch_bitwise_or_scalar>(library, "bitwise_or.Scalar");
+    register_batch_rule<&batch_bitwise_xor_scalar>(library, "bitwise_xor.Scalar");
+    register_batch_rule<&batch_bitwise_lshift_scalar>(library, "bitwise_left_shift.Tensor_Scalar");
+    register_batch_rule<&batch_bitwise_rshift_scalar>(library, "bitwise_right_shift.Tensor_Scalar");
+    register_batch_rule<&batch_bitwise_and_stensor>(library, "bitwise_and.Scalar_Tensor");
+    register_batch_rule<&batch_bitwise_or_stensor>(library, "bitwise_or.Scalar_Tensor");
+    register_batch_rule<&batch_bitwise_xor_stensor>(library, "bitwise_xor.Scalar_Tensor");
+    register_batch_rule<&batch_bitwise_lshift_stensor>(library, "bitwise_left_shift.Scalar_Tensor");
+    register_batch_rule<&batch_bitwise_rshift_stensor>(library, "bitwise_right_shift.Scalar_Tensor");
+    register_batch_rule<&batch_add_scalar>(library, "add.Scalar");
+    register_batch_rule<&batch_sub_scalar>(library, "sub.Scalar");
+    register_batch_rule<&batch_mul_scalar>(library, "mul.Scalar");
+    register_batch_rule<&batch_div_scalar>(library, "div.Scalar");
+    register_batch_rule<&batch_add>(library, "add.Tensor");
+    register_batch_rule<&batch_sub>(library, "sub.Tensor");
+    register_batch_rule<&batch_pow_scalar>(library, "pow.Tensor_Scalar");
+    register_batch_rule<&batch_pow_tensor>(library, "pow.Tensor_Tensor");
+    register_batch_rule<&batch_sum>(library, "sum");
+    register_batch_rule<&batch_sum_dim>(library, "sum.dim_IntList");
+    register_batch_rule<&batch_view>(library, "view");
+    register_batch_rule<&batch_permute>(library, "permute");
+    register_batch_rule<&batch_transpose>(library, "transpose");
+    register_batch_rule<&batch_movedim>(library, "movedim");
+    register_batch_rule<&batch_reshape>(library, "reshape");
+    register_batch_rule<&batch_expand>(library, "expand");
+    register_batch_rule<&batch_squeeze>(library, "squeeze");
+    register_batch_rule<&batch_squeeze_dim>(library, "squeeze.dim");
+    register_batch_rule<&batch_squeeze_dims>(library, "squeeze.dims");
+    register_batch_rule<&batch_unsqueeze>(library, "unsqueeze");
+    register_batch_rule<&batch_contiguous>(library, "contiguous");
+    register_batch_rule<&batch_select>(library, "select.int");
+    register_batch_rule<&batch_slice>(library, "slice");
+    register_batch_rule<&batch_narrow>(library, "narrow");
+    register_batch_rule<&batch_index_select>(library, "index_select");
+    register_batch_rule<&batch_cat>(library, "cat");
+    register_batch_rule<&batch_stack>(library, "stack");
+    register_batch_rule<&batch_mm>(library, "mm");
+    register_batch_rule<&batch_matmul>(library, "matmul");
+    register_batch_rule<&batch_bmm>(library, "bmm");
+    register_batch_rule<&batch_linear>(library, "linear");
+    register_batch_rule<&batch_rand, true>(library, "rand");
+    register_batch_rule<&batch_randn, true>(library, "randn");
+    register_batch_rule<&batch_randint, true>(library, "randint");
+    register_batch_rule<&batch_randperm, true>(library, "randperm");
+    register_batch_rule<&batch_rand_like, true>(library, "rand_like");
+    register_batch_rule<&batch_randint_like, true>(library, "randint_like");
+    register_batch_rule<&batch_randn_like, true>(library, "randn_like");
+    register_batch_rule<&batch_eq_tensor>(library, "eq.Tensor");
+    register_batch_rule<&batch_ne_tensor>(library, "ne.Tensor");
+    register_batch_rule<&batch_lt_tensor>(library, "lt.Tensor");
+    register_batch_rule<&batch_le_tensor>(library, "le.Tensor");
+    register_batch_rule<&batch_gt_tensor>(library, "gt.Tensor");
+    register_batch_rule<&batch_ge_tensor>(library, "ge.Tensor");
+    register_batch_rule<&batch_eq_scalar>(library, "eq.Scalar");
+    register_batch_rule<&batch_ne_scalar>(library, "ne.Scalar");
+    register_batch_rule<&batch_lt_scalar>(library, "lt.Scalar");
+    register_batch_rule<&batch_le_scalar>(library, "le.Scalar");
+    register_batch_rule<&batch_gt_scalar>(library, "gt.Scalar");
+    register_batch_rule<&batch_ge_scalar>(library, "ge.Scalar");
+    register_batch_rule<&batch_where_self>(library, "where.self");
+    register_batch_rule<&batch_where_scalar_self>(library, "where.ScalarSelf");
+    register_batch_rule<&batch_where_scalar_other>(library, "where.ScalarOther");
+    register_batch_rule<&batch_where_scalar>(library, "where.Scalar");
+    register_batch_rule<&batch_clamp>(library, "clamp");
+    register_batch_rule<&batch_cumsum>(library, "cumsum");
+    register_batch_rule<&batch_logsumexp>(library, "logsumexp");
+    register_batch_rule<&batch_all_dim>(library, "all.dim");
+    register_batch_rule<&batch_max_dim>(library, "max.dim");
+    register_batch_rule<&batch_argsort>(library, "argsort");
+    register_batch_rule<&batch_argsort_stable>(library, "argsort.stable");
+    register_batch_rule<&batch_gather>(library, "gather");
+    register_batch_rule<&batch_repeat_interleave_self_int>(library, "repeat_interleave.self_int");
+    register_batch_rule<&batch_to_dtype>(library, "to.dtype");
+    register_batch_rule<&batch_tril>(library, "tril");
+    register_batch_rule<&batch_new_zeros>(library, "new_zeros");
+    register_batch_rule<&batch_new_ones>(library, "new_ones");
+    register_batch_rule<&batch_new_full>(library, "new_full");
+    register_batch_rule<&batch_new_empty>(library, "new_empty");
+    register_batch_rule<&batch_new_empty_strided>(library, "new_empty_strided");
+    register_batch_rule<&batch_copy_>(library, "copy_");
+    register_batch_rule<&batch_index>(library, "index.Tensor");
+    register_batch_rule<&batch_index_put_>(library, "index_put_");
 }
 
 } // namespace

@@ -519,11 +519,12 @@ class FunctionSchema:
             pieces.append("*")
         for a in args.flat_kwarg_only:
             pieces.append(str(a.type))
-        for a in args.out:
-            pieces.append(str(a.type))
+        # Grouping-key normalization (reference signature() semantics): the
+        # out argument and mutability annotations are excluded so
+        # functional/inplace/out variants of one op share the same key.
         name = str(self.name) if include_overload_name else str(
             self.name.name)
-        ret = ", ".join(str(r.type) for r in self.returns)
+        ret = ", ".join(_unannotated(r.type) for r in self.returns)
         ret_s = f"({ret})" if len(self.returns) != 1 else ret
         if not self.returns:
             ret_s = "()"
@@ -886,6 +887,15 @@ class NativeFunctionRecord:
 
     def __str__(self) -> str:
         return str(self.func)
+
+
+def _unannotated(t: TypeExpr) -> str:
+    """Type spelling with the mutability annotation stripped."""
+    if t.mutability is None and t.alias is None:
+        return str(t)
+    plain = TypeExpr(t.name, t.is_opt, t.is_list, t.size, None, None,
+                     t.elem_opt)
+    return str(plain)
 
 
 def _split_variants(raw) -> list[str]:

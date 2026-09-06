@@ -31,18 +31,585 @@
 namespace tensorplay {
 namespace cuda {
 
-// nvcc forbids generic lambdas from carrying the __host__ __device__
-// specifiers.  This wrapper keeps the templated call expression inside an
-// ordinary functor so the dispatchers can still invoke them per element
-// type; the wrapped generic lambda itself carries no specifiers and is
-// instantiated separately on each side.
-template <typename F>
-struct GenericFn {
-    F f;
+// nvcc forbids generic lambdas carrying __host__ __device__ and forbids a
+// function-local type appearing in a template argument list, so each
+// templated call expression is hoisted into a file-scope functor below: the
+// lambda body lives in run(), with the captured values stored as members.
+template <typename Derived>
+struct GenFnBase {
     template <typename... Args>
-    __host__ __device__ auto operator()(Args... args) const
-        -> decltype(f(args...)) {
-        return f(args...);
+    __host__ __device__ auto operator()(Args... args) const {
+        return static_cast<const Derived*>(this)->run(args...);
+    }
+};
+
+struct HFn1 : GenFnBase<HFn1> {
+    __host__ __device__ auto run(double x, double y) const {
+ return x / y; 
+    }
+};
+
+struct HFn2 : GenFnBase<HFn2> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x, auto y) const -> decltype(x) {
+                                using T = decltype(x);
+                                T r;
+                                if constexpr (std::is_integral_v<T>)
+                                    r = static_cast<T>(x % y);
+                                else  // Half/BFloat16/float/double via fmod
+                                    r = static_cast<T>(::fmod(static_cast<double>(x), static_cast<double>(y)));
+                                if (r != T(0) && ((r < static_cast<T>(0)) != (y < static_cast<T>(0)))) r = static_cast<T>(r + y);
+                                return r;
+                            
+    }
+};
+
+struct HFn3 : GenFnBase<HFn3> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x, auto y) const -> decltype(x) {
+                                if constexpr (std::is_integral_v<decltype(x)>)
+                                    return static_cast<decltype(x)>(x % y);
+                                else
+                                    return static_cast<decltype(x)>(::fmod(static_cast<double>(x), static_cast<double>(y)));
+                            
+    }
+};
+
+struct HFn4 : GenFnBase<HFn4> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x, auto y) const -> decltype(x) {
+ return x - y; 
+    }
+};
+
+struct HFn5 : GenFnBase<HFn5> {
+    double al;
+    __host__ __device__ HFn5(double a_al) : al(a_al) {}
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x, auto y) const {
+                                using T = decltype(x);
+                                return static_cast<T>(x - y * al);
+                            
+    }
+};
+
+struct HFn6 : GenFnBase<HFn6> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x, auto y) const {
+ return x * y; 
+    }
+};
+
+struct HFn7 : GenFnBase<HFn7> {
+    double ov;
+    __host__ __device__ HFn7(double a_ov) : ov(a_ov) {}
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x) const -> decltype(x) {
+                                using T = decltype(x);
+                                return static_cast<T>(static_cast<double>(x) * ov);
+                            
+    }
+};
+
+struct HFn8 : GenFnBase<HFn8> {
+    bool floor_mode;
+    __host__ __device__ HFn8(bool a_floor_mode) : floor_mode(a_floor_mode) {}
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x, auto y) const {
+        using T = decltype(x);
+        if constexpr (std::is_integral_v<T>) {
+            if (y == T(0)) return T(0);
+            T q = static_cast<T>(x / y);
+            if (floor_mode) {
+                // The quotient truncates toward zero, so a remainder whose
+                // sign disagrees with the divisor sits one step above the
+                // floor.
+                T r = static_cast<T>(x - q * y);
+                if (r != T(0) && ((r < T(0)) != (y < T(0)))) q = static_cast<T>(q - T(1));
+            }
+            return q;
+        } else {
+            // Half/BFloat16 round through Float32, the width their arithmetic
+            // is defined at; float and double keep their own.
+            using C = std::conditional_t<std::is_same_v<T, double>, double, float>;
+            const C q = static_cast<C>(x) / static_cast<C>(y);
+            return static_cast<T>(floor_mode ? ::floor(q) : ::trunc(q));
+        }
+    
+    }
+};
+
+struct HFn9 : GenFnBase<HFn9> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x) const -> decltype(x) {
+ return static_cast<decltype(x)>(-x); 
+    }
+};
+
+struct HFn10 : GenFnBase<HFn10> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x, auto y) const {
+ return x > y; 
+    }
+};
+
+struct HFn11 : GenFnBase<HFn11> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x, auto y) const {
+ return x >= y; 
+    }
+};
+
+struct HFn12 : GenFnBase<HFn12> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x, auto y) const {
+ return x < y; 
+    }
+};
+
+struct HFn13 : GenFnBase<HFn13> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x, auto y) const {
+ return x <= y; 
+    }
+};
+
+struct HFn14 : GenFnBase<HFn14> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x, auto y) const {
+ return x != y; 
+    }
+};
+
+struct HFn15 : GenFnBase<HFn15> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x) const -> decltype(x) {
+        return static_cast<double>(x) < 0.0 ||
+               (static_cast<double>(x) == 0.0 && 1.0 / static_cast<double>(x) < 0.0);
+    
+    }
+};
+
+struct HFn16 : GenFnBase<HFn16> {
+    __host__ __device__ auto run(bool x) const {
+ return !x; 
+    }
+};
+
+struct HFn17 : GenFnBase<HFn17> {
+    __host__ __device__ auto run(bool x, bool y) const {
+        return x && y;
+    
+    }
+};
+
+struct HFn18 : GenFnBase<HFn18> {
+    __host__ __device__ auto run(bool x, bool y) const {
+        return x || y;
+    
+    }
+};
+
+struct HFn19 : GenFnBase<HFn19> {
+    __host__ __device__ auto run(bool x, bool y) const {
+        return x != y;
+    
+    }
+};
+
+struct HFn20 : GenFnBase<HFn20> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x) const -> decltype(x) {
+        double d = static_cast<double>(x);
+        return d == d && d != std::numeric_limits<double>::infinity() &&
+               d != -std::numeric_limits<double>::infinity();
+    
+    }
+};
+
+struct HFn21 : GenFnBase<HFn21> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x) const -> decltype(x) {
+        double d = static_cast<double>(x);
+        return d == std::numeric_limits<double>::infinity() ||
+               d == -std::numeric_limits<double>::infinity();
+    
+    }
+};
+
+struct HFn22 : GenFnBase<HFn22> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x) const -> decltype(x) {
+        double d = static_cast<double>(x);
+        return d != d;
+    
+    }
+};
+
+struct HFn23 : GenFnBase<HFn23> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x) const -> decltype(x) {
+        return static_cast<double>(x) == -std::numeric_limits<double>::infinity();
+    
+    }
+};
+
+struct HFn24 : GenFnBase<HFn24> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x) const -> decltype(x) {
+        return static_cast<double>(x) == std::numeric_limits<double>::infinity();
+    
+    }
+};
+
+struct HFn25 : GenFnBase<HFn25> {
+    __host__ __device__ auto run(double x) const {
+ return 1.0 / x; 
+    }
+};
+
+struct HFn26 : GenFnBase<HFn26> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x) const {
+                                using T = decltype(x);
+                                double d = static_cast<double>(x);
+                                if (d != d) return static_cast<T>(x);
+                                if (d > 0) return static_cast<T>(1);
+                                if (d < 0) return static_cast<T>(-1);
+                                return static_cast<T>(0);
+                            
+    }
+};
+
+struct HFn27 : GenFnBase<HFn27> {
+    __host__ __device__ auto run(double x) const {
+ return ::exp2(x); 
+    }
+};
+
+struct HFn28 : GenFnBase<HFn28> {
+    __host__ __device__ auto run(double x) const {
+        double px = M_PI * x;
+        return ::fabs(px) < 1e-30 ? 1.0 : ::sin(px) / px;
+    
+    }
+};
+
+struct HFn29 : GenFnBase<HFn29> {
+    __host__ __device__ auto run(double x) const {
+ return x * (M_PI / 180.0); 
+    }
+};
+
+struct HFn30 : GenFnBase<HFn30> {
+    __host__ __device__ auto run(double x) const {
+ return x * (180.0 / M_PI); 
+    }
+};
+
+struct HFn31 : GenFnBase<HFn31> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x) const {
+                                if constexpr (std::is_floating_point_v<decltype(x)>)
+                                    return static_cast<decltype(x)>(::trunc(static_cast<double>(x)));
+                                else
+                                    return x;
+                            
+    }
+};
+
+struct HFn32 : GenFnBase<HFn32> {
+    __host__ __device__ auto run(double x) const {
+ return tensorplay::special_math::calc_erfinv(x); 
+    }
+};
+
+struct HFn33 : GenFnBase<HFn33> {
+    double e;
+    __host__ __device__ HFn33(double a_e) : e(a_e) {}
+    __host__ __device__ auto run(double p) const {
+                               if (e >= 0) p = ::fmin(::fmax(p, e), 1.0 - e);
+                               return ::log(p / (1.0 - p));
+                           
+    }
+};
+
+struct HFn34 : GenFnBase<HFn34> {
+    __host__ __device__ auto run(double v) const {
+        if (v <= 0 && v == ::floor(v)) return ::nan("");
+        double r = 0;
+        while (v < 6.0) { r -= 1.0 / v; v += 1.0; }
+        double inv = 1.0 / v, inv2 = inv * inv;
+        r += ::log(v) - 0.5 * inv
+             - inv2 * (1.0/12.0 - inv2 * (1.0/120.0 - inv2 * (1.0/252.0 - inv2 * (1.0/240.0 - inv2 / 132.0))));
+        return r;
+    
+    }
+};
+
+struct HFn35 : GenFnBase<HFn35> {
+    __host__ __device__ auto run(double v) const {
+        return tensorplay::special_math::modified_bessel_i0_forward(v);
+    
+    }
+};
+
+
+
+struct HFn39 : GenFnBase<HFn39> {
+    __host__ __device__ auto run(double x, double y) const {
+        return tensorplay::special_math::calc_xlogy(x, y);
+    
+    }
+};
+
+struct HFn40 : GenFnBase<HFn40> {
+    __host__ __device__ auto run(double x, double y) const {
+        double m = ::fmax(x, y);
+        if (m == -std::numeric_limits<double>::infinity() || m != m) return m;
+        return m + ::log1p(::exp(-::fabs(x - y)));
+    
+    }
+};
+
+struct HFn41 : GenFnBase<HFn41> {
+    __host__ __device__ auto run(double x, double y) const {
+        double m = ::fmax(x, y);
+        if (m == -std::numeric_limits<double>::infinity() || m != m) return m;
+        return m + ::log1p(::exp2(-::fabs(x - y))) / M_LN2;
+    
+    }
+};
+
+struct HFn42 : GenFnBase<HFn42> {
+    __host__ __device__ auto run(double x, double y) const {
+        return ::copysign(x, y);
+    
+    }
+};
+
+struct HFn43 : GenFnBase<HFn43> {
+    __host__ __device__ auto run(double x, double y) const {
+        return ::hypot(x, y);
+    
+    }
+};
+
+struct HFn44 : GenFnBase<HFn44> {
+    __host__ __device__ auto run(double x, double y) const {
+        return ::nextafter(x, y);
+    
+    }
+};
+
+struct HFn45 : GenFnBase<HFn45> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x, auto y) const {
+                                using T = decltype(x);
+                                long long ux = static_cast<long long>(x < static_cast<T>(0) ? -x : x);
+                                long long uy = static_cast<long long>(y < static_cast<T>(0) ? -y : y);
+                                while (uy) { long long t = ux % uy; ux = uy; uy = t; }
+                                return static_cast<T>(ux);
+                            
+    }
+};
+
+struct HFn46 : GenFnBase<HFn46> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x, auto y) const {
+                                using T = decltype(x);
+                                long long ux = static_cast<long long>(x < static_cast<T>(0) ? -x : x);
+                                long long uy = static_cast<long long>(y < static_cast<T>(0) ? -y : y);
+                                long long g = ux, t2 = uy;
+                                while (t2) { long long t3 = g % t2; g = t2; t2 = t3; }
+                                if (g == 0) return static_cast<T>(0);
+                                return static_cast<T>(ux / g * uy);
+                            
+    }
+};
+
+struct HFn47 : GenFnBase<HFn47> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x, auto v) const {
+                                using T = decltype(x);
+                                double xd = static_cast<double>(x);
+                                if (xd < 0.0) return static_cast<T>(0);
+                                if (xd == 0.0) return static_cast<T>(v);
+                                return static_cast<T>(1);
+                            
+    }
+};
+
+struct HFn48 : GenFnBase<HFn48> {
+    double lo;
+    __host__ __device__ HFn48(double a_lo) : lo(a_lo) {}
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x) const {
+                                using T = decltype(x);
+                                return static_cast<double>(x) < lo ? static_cast<T>(lo)
+                                                                   : static_cast<T>(x);
+                            
+    }
+};
+
+struct HFn49 : GenFnBase<HFn49> {
+    double hi;
+    __host__ __device__ HFn49(double a_hi) : hi(a_hi) {}
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x) const {
+                                using T = decltype(x);
+                                return static_cast<double>(x) > hi ? static_cast<T>(hi)
+                                                                   : static_cast<T>(x);
+                            
+    }
+};
+
+struct HFn50 : GenFnBase<HFn50> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x, auto m) const {
+                                using T = decltype(x);
+                                return static_cast<double>(m) > static_cast<double>(x)
+                                           ? static_cast<T>(m) : static_cast<T>(x);
+                            
+    }
+};
+
+struct HFn51 : GenFnBase<HFn51> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x, auto m) const {
+                                using T = decltype(x);
+                                return static_cast<double>(m) < static_cast<double>(x)
+                                           ? static_cast<T>(m) : static_cast<T>(x);
+                            
+    }
+};
+
+struct HFn52 : GenFnBase<HFn52> {
+    double kAlpha;
+    double kScale;
+    __host__ __device__ HFn52(double a_kAlpha, double a_kScale) : kAlpha(a_kAlpha), kScale(a_kScale) {}
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x) const {
+                                using T = decltype(x);
+                                double v = static_cast<double>(x);
+                                return static_cast<T>(v > 0 ? kScale * v
+                                                            : kScale * kAlpha * (::exp(v) - 1.0));
+    }
+};
+
+struct HFn53 : GenFnBase<HFn53> {
+    double a;
+    __host__ __device__ HFn53(double a_a) : a(a_a) {}
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x) const {
+                                using T = decltype(x);
+                                double v = static_cast<double>(x);
+                                return static_cast<T>(v > 0 ? v : a * (::exp(v / a) - 1.0));
+                            
+    }
+};
+
+struct HFn54 : GenFnBase<HFn54> {
+    double l;
+    __host__ __device__ HFn54(double a_l) : l(a_l) {}
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x) const {
+                                using T = decltype(x);
+                                const double lt = static_cast<double>(static_cast<T>(l));
+                                double v = static_cast<double>(x);
+                                return (v >= -lt && v <= lt) ? static_cast<T>(0) : x;
+                            
+    }
+};
+
+struct HFn55 : GenFnBase<HFn55> {
+    double l;
+    __host__ __device__ HFn55(double a_l) : l(a_l) {}
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x) const {
+                                using T = decltype(x);
+                                const double lt = static_cast<double>(static_cast<T>(l));
+                                double v = static_cast<double>(x);
+                                if (v > lt) return static_cast<T>(v - lt);
+                                if (v < -lt) return static_cast<T>(v + lt);
+                                return static_cast<T>(v * 0.0);
+                            
+    }
+};
+
+struct HFn56 : GenFnBase<HFn56> {
+    double l;
+    __host__ __device__ HFn56(double a_l) : l(a_l) {}
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto g, auto s) const {
+                                using T = decltype(g);
+                                const double lt = static_cast<double>(static_cast<T>(l));
+                                double v = static_cast<double>(s);
+                                return (v >= -lt && v <= lt) ? static_cast<T>(0) : g;
+                            
+    }
+};
+
+struct HFn57 : GenFnBase<HFn57> {
+    double l;
+    __host__ __device__ HFn57(double a_l) : l(a_l) {}
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto g, auto s) const {
+                                using T = decltype(g);
+                                const double lt = static_cast<double>(static_cast<T>(l));
+                                double v = static_cast<double>(s);
+                                return (v >= -lt && v <= lt) ? static_cast<T>(0) : g;
+                            
+    }
+};
+
+struct HFn58 : GenFnBase<HFn58> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto g, auto o) const {
+                                using T = decltype(o);
+                                return g * o * (static_cast<T>(1) - o);
+                            
+    }
+};
+
+struct HFn59 : GenFnBase<HFn59> {
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto g, auto o) const {
+                                using T = decltype(o);
+                                return g * (static_cast<T>(1) - o * o);
+                            
+    }
+};
+
+struct HFn60 : GenFnBase<HFn60> {
+    double e;
+    __host__ __device__ HFn60(double a_e) : e(a_e) {}
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto g, auto s) const -> decltype(s) {
+                                using T = decltype(s);
+                                const T zero = static_cast<T>(0);
+                                const T one = static_cast<T>(1);
+                                if (e < 0) {
+                                    if (s < zero || s > one) return std::numeric_limits<T>::quiet_NaN();
+                                    return static_cast<T>(g / (s * (one - s)));
+                                }
+                                const T lo = static_cast<T>(e);
+                                const T hi = one - lo;
+                                if (s < lo || s > hi) return zero;
+                                return static_cast<T>(g / (s * (one - s)));
+    }
+};
+
+struct HFn61 : GenFnBase<HFn61> {
+    double t;
+    double val;
+    __host__ __device__ HFn61(double a_t, double a_val) : t(a_t), val(a_val) {}
+    template <typename... TP_A>
+    __host__ __device__ auto run(auto x) const {
+                                using T = decltype(x);
+                                return static_cast<double>(x) <= t ? static_cast<T>(val)
+                                                                   : static_cast<T>(x);
+                            
     }
 };
 
@@ -106,7 +673,7 @@ __host__ __device__ bool logical_truth_cuda(const tensorplay::complex<T>& value)
 }
 
 template <typename T>
-__device__ T nan_to_num_replace_cuda(
+__host__ __device__ T nan_to_num_replace_cuda(
         T value, T nan_replacement, T posinf_replacement,
         T neginf_replacement) {
     return value != value
@@ -424,7 +991,7 @@ Tensor true_divide_tensor_cuda(const Tensor& self, const Tensor& other) {
         return div_kernel(self, other);
     }
     return binary_float_cuda(self, other,
-                             GenericFn{[](double x, double y) { return x / y; }}, "true_divide");
+                             HFn1{}, "true_divide");
 }
 Tensor true_divide_scalar_cuda(const Tensor& self, Scalar other) {
     // A Float32 stand-in would widen Half/BFloat16 inputs.
@@ -440,16 +1007,7 @@ Tensor divide_scalar_cuda(const Tensor& self, Scalar other) {
 
 Tensor remainder_tensor_cuda(const Tensor& self, const Tensor& other) {
     return binary_same_cuda(self, other,
-                            GenericFn{[](auto x, auto y) -> decltype(x) {
-                                using T = decltype(x);
-                                T r;
-                                if constexpr (std::is_integral_v<T>)
-                                    r = static_cast<T>(x % y);
-                                else  // Half/BFloat16/float/double via fmod
-                                    r = static_cast<T>(::fmod(static_cast<double>(x), static_cast<double>(y)));
-                                if (r != T(0) && ((r < static_cast<T>(0)) != (y < static_cast<T>(0)))) r = static_cast<T>(r + y);
-                                return r;
-                            }},
+                            HFn2{},
                             "remainder");
 }
 Tensor remainder_scalar_cuda(const Tensor& self, Scalar other) {
@@ -464,12 +1022,7 @@ Tensor remainder_scalar_tensor_cuda(Scalar self, const Tensor& other) {
 }
 Tensor fmod_tensor_cuda(const Tensor& self, const Tensor& other) {
     return binary_same_cuda(self, other,
-                            GenericFn{[](auto x, auto y) -> decltype(x) {
-                                if constexpr (std::is_integral_v<decltype(x)>)
-                                    return static_cast<decltype(x)>(x % y);
-                                else
-                                    return static_cast<decltype(x)>(::fmod(static_cast<double>(x), static_cast<double>(y)));
-                            }},
+                            HFn3{},
                             "fmod");
 }
 Tensor fmod_scalar_cuda(const Tensor& self, Scalar other) {
@@ -480,14 +1033,11 @@ Tensor subtract_tensor_cuda(const Tensor& self, const Tensor& other, Scalar alph
     // alpha == 1 is by far the common call and keeps the unscaled loop.
     if (!alpha.isComplex() && alpha.toDouble() == 1.0) {
         return binary_same_cuda(self, other,
-                                GenericFn{[](auto x, auto y) { return x - y; }}, "subtract");
+                                HFn4{}, "subtract");
     }
     const double al = alpha.toDouble();
     return binary_same_cuda(self, other,
-                            GenericFn{[al](auto x, auto y) {
-                                using T = decltype(x);
-                                return static_cast<T>(x - y * al);
-                            }}, "subtract");
+                            HFn5{al}, "subtract");
 }
 Tensor subtract_scalar_cuda(const Tensor& self, Scalar other, Scalar alpha) {
     const DType dt = scalar_promote(self.dtype(), other);
@@ -496,15 +1046,12 @@ Tensor subtract_scalar_cuda(const Tensor& self, Scalar other, Scalar alpha) {
 }
 Tensor multiply_tensor_cuda(const Tensor& self, const Tensor& other) {
     return binary_same_cuda(self, other,
-                            GenericFn{[](auto x, auto y) { return x * y; }}, "multiply");
+                            HFn6{}, "multiply");
 }
 Tensor multiply_scalar_cuda(const Tensor& self, Scalar other) {
     double ov = other.toDouble();
     return dtype_unary_cuda(self,
-                            GenericFn{[ov](auto x) {
-                                using T = decltype(x);
-                                return static_cast<T>(static_cast<double>(x) * ov);
-                            }},
+                            HFn7{ov},
                             "multiply");
 }
 
@@ -529,27 +1076,7 @@ Tensor div_rounded_core(const Tensor& a, const Tensor& b, DivRounding rounding) 
     // Rounded division stays in the input dtype: an integral pair must come
     // back integral, which the float promotion of true division loses.
     const bool floor_mode = (rounding == DivRounding::kFloor);
-    return binary_same_cuda(a, b, GenericFn{[floor_mode](auto x, auto y) -> decltype(x) {
-        using T = decltype(x);
-        if constexpr (std::is_integral_v<T>) {
-            if (y == T(0)) return T(0);
-            T q = static_cast<T>(x / y);
-            if (floor_mode) {
-                // The quotient truncates toward zero, so a remainder whose
-                // sign disagrees with the divisor sits one step above the
-                // floor.
-                T r = static_cast<T>(x - q * y);
-                if (r != T(0) && ((r < T(0)) != (y < T(0)))) q = static_cast<T>(q - T(1));
-            }
-            return q;
-        } else {
-            // Half/BFloat16 round through Float32, the width their arithmetic
-            // is defined at; float and double keep their own.
-            using C = std::conditional_t<std::is_same_v<T, double>, double, float>;
-            const C q = static_cast<C>(x) / static_cast<C>(y);
-            return static_cast<T>(floor_mode ? ::floor(q) : ::trunc(q));
-        }
-    }}, "div");
+    return binary_same_cuda(a, b, HFn8{floor_mode}, "div");
 }
 
 Tensor div_rounded_scalar(const Tensor& self, Scalar other, DivRounding rounding) {
@@ -578,7 +1105,7 @@ Tensor floor_divide_scalar_cuda(const Tensor& self, Scalar other) {
 
 Tensor negative_cuda(const Tensor& self) {
     return dtype_unary_cuda(self,
-                            GenericFn{[](auto x) { return static_cast<decltype(x)>(-x); }},
+                            HFn9{},
                             "negative");
 }
 Tensor positive_cuda(const Tensor& self) { return self.clone(); }
@@ -588,74 +1115,50 @@ Tensor positive_cuda(const Tensor& self) { return self.clone(); }
 // ===========================================================================
 
 Tensor greater_cuda(const Tensor& a, const Tensor& b) {
-    return binary_bool_cuda(a, b, GenericFn{[](auto x, auto y) { return x > y; }}, "greater");
+    return binary_bool_cuda(a, b, HFn10{}, "greater");
 }
 Tensor greater_equal_cuda(const Tensor& a, const Tensor& b) {
-    return binary_bool_cuda(a, b, GenericFn{[](auto x, auto y) { return x >= y; }}, "greater_equal");
+    return binary_bool_cuda(a, b, HFn11{}, "greater_equal");
 }
 Tensor less_cuda(const Tensor& a, const Tensor& b) {
-    return binary_bool_cuda(a, b, GenericFn{[](auto x, auto y) { return x < y; }}, "less");
+    return binary_bool_cuda(a, b, HFn12{}, "less");
 }
 Tensor less_equal_cuda(const Tensor& a, const Tensor& b) {
-    return binary_bool_cuda(a, b, GenericFn{[](auto x, auto y) { return x <= y; }}, "less_equal");
+    return binary_bool_cuda(a, b, HFn13{}, "less_equal");
 }
 Tensor not_equal_cuda(const Tensor& a, const Tensor& b) {
-    return binary_bool_cuda(a, b, GenericFn{[](auto x, auto y) { return x != y; }}, "not_equal");
+    return binary_bool_cuda(a, b, HFn14{}, "not_equal");
 }
 Tensor signbit_cuda(const Tensor& self) {
-    return bool_unary_cuda(self, GenericFn{[](auto x) -> bool {
-        return static_cast<double>(x) < 0.0 ||
-               (static_cast<double>(x) == 0.0 && 1.0 / static_cast<double>(x) < 0.0);
-    }}, "signbit");
+    return bool_unary_cuda(self, HFn15{}, "signbit");
 }
 Tensor logical_not_cuda(const Tensor& self) {
-    return logical_unary_cuda(self, GenericFn{[](bool x) -> bool { return !x; }},
+    return logical_unary_cuda(self, HFn16{},
                               "logical_not");
 }
 Tensor logical_and_cuda(const Tensor& a, const Tensor& b) {
-    return logical_binary_cuda(a, b, GenericFn{[](bool x, bool y) -> bool {
-        return x && y;
-    }}, "logical_and");
+    return logical_binary_cuda(a, b, HFn17{}, "logical_and");
 }
 Tensor logical_or_cuda(const Tensor& a, const Tensor& b) {
-    return logical_binary_cuda(a, b, GenericFn{[](bool x, bool y) -> bool {
-        return x || y;
-    }}, "logical_or");
+    return logical_binary_cuda(a, b, HFn18{}, "logical_or");
 }
 Tensor logical_xor_cuda(const Tensor& a, const Tensor& b) {
-    return logical_binary_cuda(a, b, GenericFn{[](bool x, bool y) -> bool {
-        return x != y;
-    }}, "logical_xor");
+    return logical_binary_cuda(a, b, HFn19{}, "logical_xor");
 }
 Tensor isfinite_cuda(const Tensor& self) {
-    return bool_unary_cuda(self, GenericFn{[](auto x) -> bool {
-        double d = static_cast<double>(x);
-        return d == d && d != std::numeric_limits<double>::infinity() &&
-               d != -std::numeric_limits<double>::infinity();
-    }}, "isfinite");
+    return bool_unary_cuda(self, HFn20{}, "isfinite");
 }
 Tensor isinf_cuda(const Tensor& self) {
-    return bool_unary_cuda(self, GenericFn{[](auto x) -> bool {
-        double d = static_cast<double>(x);
-        return d == std::numeric_limits<double>::infinity() ||
-               d == -std::numeric_limits<double>::infinity();
-    }}, "isinf");
+    return bool_unary_cuda(self, HFn21{}, "isinf");
 }
 Tensor isnan_cuda(const Tensor& self) {
-    return bool_unary_cuda(self, GenericFn{[](auto x) -> bool {
-        double d = static_cast<double>(x);
-        return d != d;
-    }}, "isnan");
+    return bool_unary_cuda(self, HFn22{}, "isnan");
 }
 Tensor isneginf_cuda(const Tensor& self) {
-    return bool_unary_cuda(self, GenericFn{[](auto x) -> bool {
-        return static_cast<double>(x) == -std::numeric_limits<double>::infinity();
-    }}, "isneginf");
+    return bool_unary_cuda(self, HFn23{}, "isneginf");
 }
 Tensor isposinf_cuda(const Tensor& self) {
-    return bool_unary_cuda(self, GenericFn{[](auto x) -> bool {
-        return static_cast<double>(x) == std::numeric_limits<double>::infinity();
-    }}, "isposinf");
+    return bool_unary_cuda(self, HFn24{}, "isposinf");
 }
 
 // ===========================================================================
@@ -685,76 +1188,48 @@ Tensor reciprocal_cuda(const Tensor& self) {
         CUDA_CHECK(cudaGetLastError());
         return result;
     }
-    return float_math_cuda(self, GenericFn{[](double x) { return 1.0 / x; }}, "reciprocal");
+    return float_math_cuda(self, HFn25{}, "reciprocal");
 }
 Tensor sgn_cuda(const Tensor& self) {
     return dtype_unary_cuda(self,
-                            GenericFn{[](auto x) -> decltype(x) {
-                                using T = decltype(x);
-                                double d = static_cast<double>(x);
-                                if (d != d) return static_cast<T>(x);
-                                if (d > 0) return static_cast<T>(1);
-                                if (d < 0) return static_cast<T>(-1);
-                                return static_cast<T>(0);
-                            }},
+                            HFn26{},
                             "sgn");
 }
 Tensor exp2_cuda(const Tensor& self) {
-    return float_math_cuda(self, GenericFn{[](double x) { return ::exp2(x); }}, "exp2");
+    return float_math_cuda(self, HFn27{}, "exp2");
 }
 Tensor sinc_cuda(const Tensor& self) {
-    return float_math_cuda(self, GenericFn{[](double x) {
-        double px = M_PI * x;
-        return ::fabs(px) < 1e-30 ? 1.0 : ::sin(px) / px;
-    }}, "sinc");
+    return float_math_cuda(self, HFn28{}, "sinc");
 }
 Tensor deg2rad_cuda(const Tensor& self) {
-    return float_math_cuda(self, GenericFn{[](double x) { return x * (M_PI / 180.0); }}, "deg2rad");
+    return float_math_cuda(self, HFn29{}, "deg2rad");
 }
 Tensor rad2deg_cuda(const Tensor& self) {
-    return float_math_cuda(self, GenericFn{[](double x) { return x * (180.0 / M_PI); }}, "rad2deg");
+    return float_math_cuda(self, HFn30{}, "rad2deg");
 }
 Tensor fix_cuda(const Tensor& self) {
     return dtype_unary_cuda(self,
-                            GenericFn{[](auto x) -> decltype(x) {
-                                if constexpr (std::is_floating_point_v<decltype(x)>)
-                                    return static_cast<decltype(x)>(::trunc(static_cast<double>(x)));
-                                else
-                                    return x;
-                            }},
+                            HFn31{},
                             "fix");
 }
 Tensor erfinv_cuda(const Tensor& self) {
     // CUDA has no native erfinv; use the Cephes calc_erfinv from SpecialMath.h
     // host-only ::erfinv — linking that from device code leaves an undefined
     // symbol in libp10.so.
-    return float_math_cuda(self, GenericFn{[](double x) { return tensorplay::special_math::calc_erfinv(x); }}, "erfinv");
+    return float_math_cuda(self, HFn32{}, "erfinv");
 }
 Tensor logit_cuda(const Tensor& self, std::optional<Scalar> eps) {
     double e = eps.has_value() ? eps->toDouble() : -1.0;
     return float_math_cuda(self,
-                           GenericFn{[e](double p) {
-                               if (e >= 0) p = ::fmin(::fmax(p, e), 1.0 - e);
-                               return ::log(p / (1.0 - p));
-                           }},
+                           HFn33{e},
                            "logit");
 }
 Tensor digamma_cuda(const Tensor& self) {
-    return float_math_cuda(self, GenericFn{[](double v) {
-        if (v <= 0 && v == ::floor(v)) return ::nan("");
-        double r = 0;
-        while (v < 6.0) { r -= 1.0 / v; v += 1.0; }
-        double inv = 1.0 / v, inv2 = inv * inv;
-        r += ::log(v) - 0.5 * inv
-             - inv2 * (1.0/12.0 - inv2 * (1.0/120.0 - inv2 * (1.0/252.0 - inv2 * (1.0/240.0 - inv2 / 132.0))));
-        return r;
-    }}, "digamma");
+    return float_math_cuda(self, HFn34{}, "digamma");
 }
 Tensor i0_cuda(const Tensor& self) {
     // Chebyshev expansion, valid over the whole range; see i0_cpu.
-    return float_math_cuda(self, GenericFn{[](double v) {
-        return tensorplay::special_math::modified_bessel_i0_forward(v);
-    }}, "i0");
+    return float_math_cuda(self, HFn35{}, "i0");
 }
 Tensor nan_to_num_cuda(const Tensor& self, Scalar nan,
                        std::optional<Scalar> posinf, std::optional<Scalar> neginf) {
@@ -782,15 +1257,15 @@ Tensor nan_to_num_cuda(const Tensor& self, Scalar nan,
                 value_t neginf_replacement = neginf.has_value()
                     ? static_cast<value_t>(neginf->toDouble())
                     : std::numeric_limits<value_t>::lowest();
-                gpu_kernel(iter, GenericFn{[=](complex_t value) -> complex_t {
-                    return complex_t(
+                gpu_kernel(iter, [nan_replacement, posinf_replacement, neginf_replacement] __host__ __device__(tensorplay::complex<float> value) -> tensorplay::complex<float> {
+                    return tensorplay::complex<float>(
                         nan_to_num_replace_cuda(
                             value.real(), nan_replacement, posinf_replacement,
                             neginf_replacement),
                         nan_to_num_replace_cuda(
                             value.imag(), nan_replacement, posinf_replacement,
                             neginf_replacement));
-                }});
+                });
                 break;
             }
             case DType::ComplexDouble: {
@@ -803,15 +1278,15 @@ Tensor nan_to_num_cuda(const Tensor& self, Scalar nan,
                 value_t neginf_replacement = neginf.has_value()
                     ? static_cast<value_t>(neginf->toDouble())
                     : std::numeric_limits<value_t>::lowest();
-                gpu_kernel(iter, GenericFn{[=](complex_t value) -> complex_t {
-                    return complex_t(
+                gpu_kernel(iter, [nan_replacement, posinf_replacement, neginf_replacement] __host__ __device__(tensorplay::complex<double> value) -> tensorplay::complex<double> {
+                    return tensorplay::complex<double>(
                         nan_to_num_replace_cuda(
                             value.real(), nan_replacement, posinf_replacement,
                             neginf_replacement),
                         nan_to_num_replace_cuda(
                             value.imag(), nan_replacement, posinf_replacement,
                             neginf_replacement));
-                }});
+                });
                 break;
             }
             default:
@@ -828,11 +1303,11 @@ Tensor nan_to_num_cuda(const Tensor& self, Scalar nan,
             ctype neginf_replacement = neginf.has_value() \
                 ? static_cast<ctype>(neginf->toDouble()) \
                 : std::numeric_limits<ctype>::lowest(); \
-            gpu_kernel(iter, GenericFn{[=](ctype value) -> ctype { \
+            gpu_kernel(iter, [nan_replacement, posinf_replacement, neginf_replacement] __host__ __device__(ctype value) -> ctype { \
                 return nan_to_num_replace_cuda( \
                     value, nan_replacement, posinf_replacement, \
                     neginf_replacement); \
-            }}); \
+            }); \
             break; \
         }
         switch (self.dtype()) {
@@ -849,28 +1324,16 @@ Tensor nan_to_num_cuda(const Tensor& self, Scalar nan,
 }
 
 Tensor xlogy_cuda(const Tensor& a, const Tensor& b) {
-    return binary_float_cuda(a, b, GenericFn{[](double x, double y) {
-        return tensorplay::special_math::calc_xlogy(x, y);
-    }}, "xlogy");
+    return binary_float_cuda(a, b, HFn39{}, "xlogy");
 }
 Tensor logaddexp_cuda(const Tensor& a, const Tensor& b) {
-    return binary_float_cuda(a, b, GenericFn{[](double x, double y) {
-        double m = ::fmax(x, y);
-        if (m == -std::numeric_limits<double>::infinity() || m != m) return m;
-        return m + ::log1p(::exp(-::fabs(x - y)));
-    }}, "logaddexp");
+    return binary_float_cuda(a, b, HFn40{}, "logaddexp");
 }
 Tensor logaddexp2_cuda(const Tensor& a, const Tensor& b) {
-    return binary_float_cuda(a, b, GenericFn{[](double x, double y) {
-        double m = ::fmax(x, y);
-        if (m == -std::numeric_limits<double>::infinity() || m != m) return m;
-        return m + ::log1p(::exp2(-::fabs(x - y))) / M_LN2;
-    }}, "logaddexp2");
+    return binary_float_cuda(a, b, HFn41{}, "logaddexp2");
 }
 Tensor copysign_cuda(const Tensor& a, const Tensor& b) {
-    return binary_float_cuda(a, b, GenericFn{[](double x, double y) {
-        return ::copysign(x, y);
-    }}, "copysign");
+    return binary_float_cuda(a, b, HFn42{}, "copysign");
 }
 Tensor copysign_scalar_cuda(const Tensor& self, Scalar other) {
     // The sign comes from the scalar alone, so the divisor width never
@@ -878,52 +1341,28 @@ Tensor copysign_scalar_cuda(const Tensor& self, Scalar other) {
     return copysign_cuda(self, Tensor::full({}, other, DType::Float32, self.device()));
 }
 Tensor hypot_cuda(const Tensor& a, const Tensor& b) {
-    return binary_float_cuda(a, b, GenericFn{[](double x, double y) {
-        return ::hypot(x, y);
-    }}, "hypot");
+    return binary_float_cuda(a, b, HFn43{}, "hypot");
 }
 Tensor nextafter_cuda(const Tensor& a, const Tensor& b) {
-    return binary_float_cuda(a, b, GenericFn{[](double x, double y) {
-        return ::nextafter(x, y);
-    }}, "nextafter");
+    return binary_float_cuda(a, b, HFn44{}, "nextafter");
 }
 Tensor gcd_cuda(const Tensor& a, const Tensor& b) {
     DType dt = promoteTypes(a.dtype(), b.dtype());
     if (isFloatingType(dt)) TP_THROW(TypeError, "gcd only supports integral tensors");
     return binary_same_cuda(a, b,
-                            GenericFn{[](auto x, auto y) -> decltype(x) {
-                                using T = decltype(x);
-                                long long ux = static_cast<long long>(x < static_cast<T>(0) ? -x : x);
-                                long long uy = static_cast<long long>(y < static_cast<T>(0) ? -y : y);
-                                while (uy) { long long t = ux % uy; ux = uy; uy = t; }
-                                return static_cast<T>(ux);
-                            }},
+                            HFn45{},
                             "gcd");
 }
 Tensor lcm_cuda(const Tensor& a, const Tensor& b) {
     DType dt = promoteTypes(a.dtype(), b.dtype());
     if (isFloatingType(dt)) TP_THROW(TypeError, "lcm only supports integral tensors");
     return binary_same_cuda(a, b,
-                            GenericFn{[](auto x, auto y) -> decltype(x) {
-                                using T = decltype(x);
-                                long long ux = static_cast<long long>(x < static_cast<T>(0) ? -x : x);
-                                long long uy = static_cast<long long>(y < static_cast<T>(0) ? -y : y);
-                                long long g = ux, t2 = uy;
-                                while (t2) { long long t3 = g % t2; g = t2; t2 = t3; }
-                                if (g == 0) return static_cast<T>(0);
-                                return static_cast<T>(ux / g * uy);
-                            }},
+                            HFn46{},
                             "lcm");
 }
 Tensor heaviside_cuda(const Tensor& a, const Tensor& values) {
     return binary_same_cuda(a, values,
-                            GenericFn{[](auto x, auto v) -> decltype(x) {
-                                using T = decltype(x);
-                                double xd = static_cast<double>(x);
-                                if (xd < 0.0) return static_cast<T>(0);
-                                if (xd == 0.0) return static_cast<T>(v);
-                                return static_cast<T>(1);
-                            }},
+                            HFn47{},
                             "heaviside");
 }
 
@@ -934,39 +1373,23 @@ Tensor heaviside_cuda(const Tensor& a, const Tensor& values) {
 Tensor clamp_min_scalar_cuda(const Tensor& self, Scalar min) {
     double lo = min.toDouble();
     return dtype_unary_cuda(self,
-                            GenericFn{[lo](auto x) -> decltype(x) {
-                                using T = decltype(x);
-                                return static_cast<double>(x) < lo ? static_cast<T>(lo)
-                                                                   : static_cast<T>(x);
-                            }},
+                            HFn48{lo},
                             "clamp_min");
 }
 Tensor clamp_max_scalar_cuda(const Tensor& self, Scalar max) {
     double hi = max.toDouble();
     return dtype_unary_cuda(self,
-                            GenericFn{[hi](auto x) -> decltype(x) {
-                                using T = decltype(x);
-                                return static_cast<double>(x) > hi ? static_cast<T>(hi)
-                                                                   : static_cast<T>(x);
-                            }},
+                            HFn49{hi},
                             "clamp_max");
 }
 Tensor clamp_min_tensor_cuda(const Tensor& self, const Tensor& min) {
     return binary_same_cuda(self, min,
-                            GenericFn{[](auto x, auto m) -> decltype(x) {
-                                using T = decltype(x);
-                                return static_cast<double>(m) > static_cast<double>(x)
-                                           ? static_cast<T>(m) : static_cast<T>(x);
-                            }},
+                            HFn50{},
                             "clamp_min");
 }
 Tensor clamp_max_tensor_cuda(const Tensor& self, const Tensor& max) {
     return binary_same_cuda(self, max,
-                            GenericFn{[](auto x, auto m) -> decltype(x) {
-                                using T = decltype(x);
-                                return static_cast<double>(m) < static_cast<double>(x)
-                                           ? static_cast<T>(m) : static_cast<T>(x);
-                            }},
+                            HFn51{},
                             "clamp_max");
 }
 Tensor clip_cuda(const Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max) {
@@ -1003,48 +1426,27 @@ Tensor selu_cuda(const Tensor& self) {
     constexpr double kAlpha = 1.6732632423543772848170429916717;
     constexpr double kScale = 1.0507009873554804934193349852946;
     return dtype_unary_cuda(self,
-                            GenericFn{[=](auto x) -> decltype(x) {
-                                using T = decltype(x);
-                                double v = static_cast<double>(x);
-                                return static_cast<T>(v > 0 ? kScale * v
-                                                            : kScale * kAlpha * (::exp(v) - 1.0));
-                            }},
+                            HFn52{kAlpha, kScale},
                             "selu");
 }
 Tensor celu_cuda(const Tensor& self, Scalar alpha) {
     double a = alpha.toDouble();
     return dtype_unary_cuda(self,
-                            GenericFn{[a](auto x) -> decltype(x) {
-                                using T = decltype(x);
-                                double v = static_cast<double>(x);
-                                return static_cast<T>(v > 0 ? v : a * (::exp(v / a) - 1.0));
-                            }},
+                            HFn53{a},
                             "celu");
 }
 Tensor hardshrink_cuda(const Tensor& self, Scalar lambd) {
     double l = lambd.toDouble();
     // lambd.to<scalar_t>(), so float32 boundary values compare exactly.
     return dtype_unary_cuda(self,
-                            GenericFn{[l](auto x) -> decltype(x) {
-                                using T = decltype(x);
-                                const double lt = static_cast<double>(static_cast<T>(l));
-                                double v = static_cast<double>(x);
-                                return (v >= -lt && v <= lt) ? static_cast<T>(0) : x;
-                            }},
+                            HFn54{l},
                             "hardshrink");
 }
 Tensor softshrink_cuda(const Tensor& self, Scalar lambd) {
     double l = lambd.toDouble();
     // (a < -l ? a+l : 0)); the v*0 middle branch keeps NaN propagating.
     return dtype_unary_cuda(self,
-                            GenericFn{[l](auto x) -> decltype(x) {
-                                using T = decltype(x);
-                                const double lt = static_cast<double>(static_cast<T>(l));
-                                double v = static_cast<double>(x);
-                                if (v > lt) return static_cast<T>(v - lt);
-                                if (v < -lt) return static_cast<T>(v + lt);
-                                return static_cast<T>(v * 0.0);
-                            }},
+                            HFn55{l},
                             "softshrink");
 }
 // hard/soft): grad passes through where self is outside the inclusive
@@ -1052,39 +1454,23 @@ Tensor softshrink_cuda(const Tensor& self, Scalar lambd) {
 Tensor hardshrink_backward_cuda(const Tensor& grad_out, const Tensor& self, Scalar lambd) {
     double l = lambd.toDouble();
     return binary_same_cuda(grad_out, self,
-                            GenericFn{[l](auto g, auto s) -> decltype(g) {
-                                using T = decltype(g);
-                                const double lt = static_cast<double>(static_cast<T>(l));
-                                double v = static_cast<double>(s);
-                                return (v >= -lt && v <= lt) ? static_cast<T>(0) : g;
-                            }},
+                            HFn56{l},
                             "hardshrink_backward");
 }
 Tensor softshrink_backward_cuda(const Tensor& grad_output, const Tensor& self, Scalar lambd) {
     double l = lambd.toDouble();
     return binary_same_cuda(grad_output, self,
-                            GenericFn{[l](auto g, auto s) -> decltype(g) {
-                                using T = decltype(g);
-                                const double lt = static_cast<double>(static_cast<T>(l));
-                                double v = static_cast<double>(s);
-                                return (v >= -lt && v <= lt) ? static_cast<T>(0) : g;
-                            }},
+                            HFn57{l},
                             "softshrink_backward");
 }
 Tensor sigmoid_backward_cuda(const Tensor& grad_output, const Tensor& output) {
     return binary_same_cuda(grad_output, output,
-                            GenericFn{[](auto g, auto o) -> decltype(g) {
-                                using T = decltype(o);
-                                return g * o * (static_cast<T>(1) - o);
-                            }},
+                            HFn58{},
                             "sigmoid_backward");
 }
 Tensor tanh_backward_cuda(const Tensor& grad_output, const Tensor& output) {
     return binary_same_cuda(grad_output, output,
-                            GenericFn{[](auto g, auto o) -> decltype(g) {
-                                using T = decltype(o);
-                                return g * (static_cast<T>(1) - o * o);
-                            }},
+                            HFn59{},
                             "tanh_backward");
 }
 // eps (eps<0) the gradient is dy/(x(1-x)) inside [0,1] and NaN outside; with
@@ -1093,29 +1479,13 @@ Tensor tanh_backward_cuda(const Tensor& grad_output, const Tensor& output) {
 Tensor logit_backward_cuda(const Tensor& grad_output, const Tensor& self, std::optional<Scalar> eps) {
     double e = eps.has_value() ? eps->toDouble() : -1.0;
     return binary_same_cuda(grad_output, self,
-                            GenericFn{[e](auto g, auto s) -> decltype(g) {
-                                using T = decltype(s);
-                                const T zero = static_cast<T>(0);
-                                const T one = static_cast<T>(1);
-                                if (e < 0) {
-                                    if (s < zero || s > one) return std::numeric_limits<T>::quiet_NaN();
-                                    return g / (s * (one - s));
-                                }
-                                const T lo = static_cast<T>(e);
-                                const T hi = one - lo;
-                                if (s < lo || s > hi) return zero;
-                                return g / (s * (one - s));
-                            }},
+                            HFn60{e},
                             "logit_backward");
 }
 Tensor threshold_cuda(const Tensor& self, Scalar threshold, Scalar value) {
     double t = threshold.toDouble(), val = value.toDouble();
     return dtype_unary_cuda(self,
-                            GenericFn{[t, val](auto x) -> decltype(x) {
-                                using T = decltype(x);
-                                return static_cast<double>(x) <= t ? static_cast<T>(val)
-                                                                   : static_cast<T>(x);
-                            }},
+                            HFn61{t, val},
                             "threshold");
 }
 namespace {

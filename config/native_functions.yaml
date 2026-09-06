@@ -6385,6 +6385,8 @@
   variants: function
 - func: linear_backward(Tensor self, Tensor grad_output, Tensor weight, bool[3] output_mask) -> (Tensor, Tensor, Tensor)
   variants: function
+  dispatch:
+    Composite: linear_backward_impl
 - func: linear.out(Tensor input, Tensor weight, Tensor? bias=None, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: mkldnn_linear(Tensor self, Tensor weight, Tensor? bias=None) -> Tensor
@@ -6519,6 +6521,8 @@
   variants: function
 - func: matmul_backward(Tensor grad, Tensor self, Tensor other, bool[2] mask) -> (Tensor, Tensor)
   variants: function
+  dispatch:
+    Composite: matmul_backward_impl
 - func: matrix_power.out(Tensor self, int n, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: matrix_exp(Tensor self) -> Tensor
@@ -6539,6 +6543,8 @@
   variants: function
 - func: value_selecting_reduction_backward(Tensor grad, int dim, Tensor indices, SymInt[] sizes, bool keepdim) -> Tensor
   variants: function
+  dispatch:
+    Composite: value_selecting_reduction_backward_impl
 - func: amax.out(Tensor self, int[1] dim=[], bool keepdim=False, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: mkldnn_max_pool2d(Tensor self, int[2] kernel_size, int[2] stride=[], int[2] padding=0, int[2] dilation=1, bool ceil_mode=False) -> Tensor
@@ -6823,6 +6829,8 @@
   variants: function
 - func: infinitely_differentiable_gelu_backward(Tensor grad, Tensor self) -> Tensor
   variants: function
+  dispatch:
+    Composite: infinitely_differentiable_gelu_backward_impl
 - func: hardshrink.out(Tensor self, Scalar lambd=0.5, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: hardshrink_backward.grad_input(Tensor grad_out, Tensor self, Scalar lambd, *, Tensor(a!) grad_input) -> Tensor(a!)
@@ -7292,6 +7300,8 @@
   variants: method
 - func: to_dense_backward(Tensor grad, Tensor input, bool? masked_grad=None) -> Tensor
   variants: function
+  dispatch:
+    Composite: to_dense_backward_impl
 - func: sparse_dim(Tensor self) -> int
   variants: method
 - func: _dimI(Tensor self) -> int
@@ -7533,6 +7543,8 @@
   variants: function, method
 - func: masked_scatter_backward(Tensor grad_output, Tensor mask, SymInt[] sizes) -> Tensor
   variants: function
+  dispatch:
+    Composite: masked_scatter_backward_impl
 - func: _masked_softmax(Tensor self, Tensor mask, int? dim=None, int? mask_type=None) -> Tensor
   variants: function
 - func: _masked_softmax_backward(Tensor grad_output, Tensor output, Tensor mask, int? dim=None) -> Tensor
@@ -7801,6 +7813,8 @@
   variants: function
 - func: index_select_backward(Tensor grad, SymInt[] self_sizes, int dim, Tensor index) -> Tensor
   variants: function
+  dispatch:
+    Composite: index_select_backward_impl
 - func: masked_select.out(Tensor self, Tensor mask, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: masked_select_backward(Tensor grad, Tensor input, Tensor mask) -> Tensor
@@ -7815,6 +7829,8 @@
   variants: function
 - func: gather_backward(Tensor grad, Tensor self, int dim, Tensor index, bool sparse_grad) -> Tensor
   variants: function
+  dispatch:
+    Composite: gather_backward_impl
 - func: _gather_sparse_backward(Tensor self, int dim, Tensor index, Tensor grad) -> Tensor
   variants: function
 - func: addcmul.out(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1, Tensor(a!) out) -> Tensor(a!)
@@ -8313,8 +8329,12 @@
   variants: function
 - func: soft_margin_loss_backward.grad_input(Tensor grad_output, Tensor self, Tensor target, int reduction, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
+  dispatch:
+    Composite: soft_margin_loss_backward_grad_input
 - func: soft_margin_loss_backward(Tensor grad_output, Tensor self, Tensor target, int reduction) -> Tensor
   variants: function
+  dispatch:
+    Composite: soft_margin_loss_backward_impl
 - func: elu.out(Tensor self, Scalar alpha=1, Scalar scale=1, Scalar input_scale=1, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: elu_backward.grad_input(Tensor grad_output, Scalar alpha, Scalar scale, Scalar input_scale, bool is_result, Tensor self_or_result, *, Tensor(a!) grad_input) -> Tensor(a!)
@@ -8325,8 +8345,12 @@
   variants: function
 - func: glu_jvp(Tensor glu, Tensor x, Tensor dx, int dim) -> Tensor
   variants: function
+  dispatch:
+    Composite: glu_jvp_impl
 - func: glu_backward_jvp(Tensor grad_x, Tensor grad_glu, Tensor x, Tensor dgrad_glu, Tensor dx, int dim) -> Tensor
   variants: function
+  dispatch:
+    Composite: glu_backward_jvp_impl
 - func: hardsigmoid.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: hardsigmoid_backward.grad_input(Tensor grad_output, Tensor self, *, Tensor(a!) grad_input) -> Tensor(a!)

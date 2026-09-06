@@ -197,7 +197,7 @@ class LegacyEntryPoints(unittest.TestCase):
         # saved exp(-|x|) buffer
         g = tp.tensor([[0.5, -1.0, 2.0]])
         gi = tp.empty_like(x)
-        tp._C.log_sigmoid_backward(g, x, buffer, gi)
+        tp._C.log_sigmoid_backward(g, x, buffer, grad_input=gi)
         ones = tp.ones_like(x)
         max_deriv = tp.where(x < 0.0, ones, tp.zeros_like(x))
         sign = tp.where(x < 0.0, ones, -ones)

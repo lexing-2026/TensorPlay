@@ -300,8 +300,8 @@ Tensor batch_norm_cuda(
 }
 
 std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cuda(
-    const Tensor&, const Tensor&, std::optional<Tensor>, std::optional<Tensor>,
-    std::optional<Tensor>, bool, double) {
+    const Tensor&, const Tensor&, std::optional<Tensor>,
+    std::optional<Tensor>, std::optional<Tensor>, bool, double) {
     TP_THROW(NotImplementedError, "batch_norm_backward CUDA requires cuDNN");
 }
 
@@ -1041,10 +1041,10 @@ std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cuda(
     return std::make_tuple(grad_input, grad_weight, grad_bias);
 }
 
-Tensor instance_norm_cuda(const Tensor& input, const std::optional<Tensor>& weight_opt,
-                          const std::optional<Tensor>& bias_opt,
-                          std::optional<Tensor>& running_mean_opt,
-                          std::optional<Tensor>& running_var_opt,
+Tensor instance_norm_cuda(const Tensor& input, std::optional<Tensor> weight_opt,
+                          std::optional<Tensor> bias_opt,
+                          std::optional<Tensor> running_mean_opt,
+                          std::optional<Tensor> running_var_opt,
                           bool use_input_stats, double momentum, double eps) {
     if (!use_input_stats) {
         // Eval with tracked stats == BatchNorm eval.
@@ -1090,9 +1090,9 @@ Tensor instance_norm_cuda(const Tensor& input, const std::optional<Tensor>& weig
 
 std::tuple<Tensor, Tensor, Tensor> instance_norm_backward_cuda(
     const Tensor& grad_output, const Tensor& input,
-    const std::optional<Tensor>& weight_opt, const std::optional<Tensor>& bias_opt,
-    const std::optional<Tensor>& running_mean_opt,
-    const std::optional<Tensor>& running_var_opt,
+    std::optional<Tensor> weight_opt, std::optional<Tensor> bias_opt,
+    std::optional<Tensor> running_mean_opt,
+    std::optional<Tensor> running_var_opt,
     bool use_input_stats, double eps) {
     if (use_input_stats) {
         // InstanceNorm backward == GroupNorm backward with G=C.

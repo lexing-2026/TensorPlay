@@ -6,33 +6,11 @@
 #include <vector>
 
 #include "Macros.h"
+#include "DynamicLayerDispatch.h"
 #include "Tensor.h"
 
 namespace tensorplay {
 namespace transform {
-
-enum class Randomness : uint8_t {
-    Error = 0,
-    Same = 1,
-    Different = 2,
-};
-
-enum class Kind : uint8_t {
-    Vmap = 0,
-    Grad = 1,
-    Jvp = 2,
-    Functionalize = 3,
-};
-
-struct P10_API Layer {
-    Kind kind = Kind::Vmap;
-    int64_t level = -1;
-    int64_t batch_size = 0;
-    Randomness randomness = Randomness::Error;
-    bool previous_grad_mode = true;
-    bool previous_forward_grad_mode = true;
-    bool add_back_views = false;
-};
 
 class P10_API DisableTransformsGuard {
 public:
@@ -43,6 +21,7 @@ public:
 
 private:
     bool active_ = true;
+    impl::LocalDispatchKeySet saved_keys_;
 };
 
 P10_API int64_t push_vmap(int64_t batch_size, Randomness randomness);

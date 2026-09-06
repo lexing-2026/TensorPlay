@@ -5,6 +5,7 @@
 #include "Scalar.h"
 #include "OpMathType.h"
 #include "TypePromotion.h"
+#include "TypeProperties.h"
 #include "TensorIterator.h"
 #include "TensorIteratorOps.h"
 #include "Utils.h"
@@ -424,7 +425,7 @@ template <typename ctype>
 ctype div_scalar_element(ctype a, const Scalar& other) {
     if constexpr (is_complex_type_v<ctype>) {
         using math_t = opmath_type<ctype>;
-        const math_t am(static_cast<float>(a.real()), static_cast<float>(a.imag()));
+        const math_t am(a.real(), a.imag());
         const math_t bm = other.to<math_t>();
         const math_t rm = am / bm;
         return ctype(static_cast<typename ctype::value_type>(rm.real()),
@@ -451,7 +452,7 @@ Tensor binary_op_kernel_impl(const Tensor& self, const Tensor& other, Op op, Mkl
         std::cout << std::endl;
         throw;
     }
-    DType result_dtype = promoteTypes(self.dtype(), other.dtype());
+    DType result_dtype = native::result_type(self, other);
     if (force_float && isIntegralType(result_dtype, true)) {
         result_dtype = DType::Float32;
     }
@@ -1591,11 +1592,11 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
         using T = std::decay_t<decltype(a)>;
         if constexpr (std::is_same_v<T, bool>) return static_cast<float>(a) / static_cast<float>(b);
         else if constexpr (is_complex_type_v<T>) {
-            // Half/BFloat16 element types do not model a floating-point
-            // type; route the complex cases through float math.
-            using F = tensorplay::complex<float>;
-            const F af(static_cast<float>(a.real()), static_cast<float>(a.imag()));
-            const F bf(static_cast<float>(b.real()), static_cast<float>(b.imag()));
+            // Reduced-precision complex elements compute in their opmath
+            // domain; float/double complex divide in their own precision.
+            using F = opmath_type<T>;
+            const F af(a.real(), a.imag());
+            const F bf(b.real(), b.imag());
             const F rf = af / bf;
             return T(static_cast<typename T::value_type>(rf.real()),
                      static_cast<typename T::value_type>(rf.imag()));

@@ -1943,7 +1943,15 @@ def pow(input, exponent, *, out=None):
             return _captured
     return _C.pow(input, exponent)
 
-def round(input, *, out=None):
+def round(input, *, decimals=_MISSING, out=None):
+    if decimals is not _MISSING:
+        if out is not None:
+            return _C.round(input, decimals=decimals, out=out)
+        if _capturing():
+            _captured = _capture_call(round, (input,), {'decimals': decimals})
+            if _captured is not None:
+                return _captured
+        return _C.round(input, decimals=decimals)
     if out is not None:
         return _C.round(input, out=out)
     if _capturing():
@@ -4031,7 +4039,15 @@ def aminmax(input, dim=[], keepdim=False, *, out=None):
             return _captured
     return _C.aminmax(self=input, dim=dim, keepdim=keepdim)
 
-def argsort(input, dim=-1, descending=False, *, out=None):
+def argsort(input, dim=-1, descending=False, *, stable=_MISSING, out=None):
+    if stable is not _MISSING:
+        if out is not None:
+            return _C.argsort(input, stable=stable, dim=dim, descending=descending, out=out)
+        if _capturing():
+            _captured = _capture_call(argsort, (input, dim, descending), {'stable': stable})
+            if _captured is not None:
+                return _captured
+        return _C.argsort(input, stable=stable, dim=dim, descending=descending)
     if out is not None:
         return _C.argsort(input, dim, descending, out=out)
     if _capturing():
@@ -4401,7 +4417,15 @@ def bucketize(input, boundaries, *, out_int32=False, right=False, out=None):
             return _captured
     return _C.bucketize(input, boundaries, out_int32=out_int32, right=right)
 
-def scatter(input, dim, index, src, *, out=None):
+def scatter(input, dim, index, src, *, reduce=_MISSING, out=None):
+    if reduce is not _MISSING:
+        if out is not None:
+            return _C.scatter(input, dim, index, src, reduce=reduce, out=out)
+        if _capturing():
+            _captured = _capture_call(scatter, (input, dim, index, src), {'reduce': reduce})
+            if _captured is not None:
+                return _captured
+        return _C.scatter(input, dim, index, src, reduce=reduce)
     if out is not None:
         return _C.scatter(input, dim, index, src, out=out)
     if _capturing():
@@ -4468,7 +4492,13 @@ def scatter_add_(input, dim, index, src):
             return _captured
     return _C.scatter_add_(input, dim, index, src)
 
-def sort(input, dim=-1, descending=False, *, out=None):
+def sort(input, dim=-1, descending=False, *, stable=_MISSING, out=None):
+    if stable is not _MISSING:
+        if _capturing():
+            _captured = _capture_call(sort, (input, dim, descending), {'stable': stable})
+            if _captured is not None:
+                return _captured
+        return _C.sort(input, stable=stable, dim=dim, descending=descending)
     if out is not None:
         return _C.sort(input, dim, descending, out=out)
     if _capturing():

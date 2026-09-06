@@ -1100,6 +1100,128 @@ static bool tuple_contains_advanced_index(py::tuple indices) {
     return false;
 }
 
+struct BatchedTupleIndex final {
+    Tensor base;
+    std::vector<std::optional<Tensor>> indices;
+    bool has_advanced = false;
+};
+
+static bool tuple_has_batched_tensor(py::tuple indices) {
+    for (size_t i = 0; i < indices.size(); ++i) {
+        if (py::isinstance<Tensor>(indices[i]) &&
+            py::cast<Tensor>(indices[i]).is_batched()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static BatchedTupleIndex make_batched_tuple_index(
+    const Tensor& self, py::tuple indices) {
+    int64_t consumed = 0;
+    int64_t ellipsis_position = -1;
+    for (size_t i = 0; i < indices.size(); ++i) {
+        py::handle index = indices[i];
+        if (index.ptr() == Py_Ellipsis) {
+            if (ellipsis_position >= 0) {
+                TP_THROW(IndexError, "an index can only have a single ellipsis");
+            }
+            ellipsis_position = static_cast<int64_t>(i);
+            continue;
+        }
+        consumed += consumed_index_dims(index);
+    }
+    if (consumed > self.dim()) {
+        TP_THROW(IndexError, "too many indices for tensor");
+    }
+
+    BatchedTupleIndex result{self, {}, false};
+    const int64_t ellipsis_fill = self.dim() - consumed;
+    int64_t input_dim = 0;
+    auto append_tensor_index = [&](Tensor index) {
+        if (index.device() != result.base.device()) {
+            index = index.to(result.base.device());
+        }
+        result.indices.emplace_back(std::move(index));
+        result.has_advanced = true;
+    };
+    auto append_full_index = [&]() {
+        result.indices.emplace_back(std::nullopt);
+        ++input_dim;
+    };
+
+    for (size_t i = 0; i < indices.size(); ++i) {
+        py::handle index = indices[i];
+        if (index.ptr() == Py_Ellipsis) {
+            for (int64_t d = 0; d < ellipsis_fill; ++d) {
+                append_full_index();
+            }
+            continue;
+        }
+        if (index.is_none()) {
+            result.base = tensorplay::tpx::ops::unsqueeze(
+                result.base, input_dim);
+            append_full_index();
+            continue;
+        }
+        if (py::isinstance<py::slice>(index)) {
+            auto [start, stop, step, slicelength] = compute_slice(
+                py::cast<py::slice>(index), result.base.size(input_dim));
+            (void)stop;
+            (void)slicelength;
+            result.base = tensorplay::tpx::ops::slice(
+                result.base, input_dim, start, stop, step);
+            append_full_index();
+            continue;
+        }
+        if (py::isinstance<py::int_>(index)) {
+            append_tensor_index(Tensor::full(
+                {}, Scalar(py::cast<int64_t>(index)), DType::Int64,
+                result.base.device()));
+            ++input_dim;
+            continue;
+        }
+        if (py::isinstance<py::bool_>(index)) {
+            const bool value = py::cast<bool>(index);
+            result.base = tensorplay::tpx::ops::unsqueeze(
+                result.base, input_dim);
+            if (!value) {
+                result.base = tensorplay::tpx::ops::slice(
+                    result.base, input_dim, 0, 0, 1);
+            }
+            append_full_index();
+            continue;
+        }
+        if (py::isinstance<py::list>(index)) {
+            const DType dtype = is_python_bool_vector(index)
+                ? DType::Bool : DType::Int64;
+            Tensor list_index = list_to_tensor(
+                index.ptr(), dtype, result.base.device());
+            append_tensor_index(std::move(list_index));
+            input_dim += dtype == DType::Bool
+                ? result.indices.back()->dim() : 1;
+            continue;
+        }
+        if (py::isinstance<Tensor>(index)) {
+            Tensor tensor_index = py::cast<Tensor>(index);
+            if (!is_boolean_mask_dtype(tensor_index.dtype()) &&
+                !isIntegralType(tensor_index.dtype(), /*includeBool=*/false)) {
+                TP_THROW(
+                    TypeError,
+                    "tensors used as indices must be long, int, short, byte or bool tensors");
+            }
+            const int64_t consumed_dims =
+                is_boolean_mask_dtype(tensor_index.dtype())
+                ? tensor_index.dim() : 1;
+            append_tensor_index(std::move(tensor_index));
+            input_dim += consumed_dims;
+            continue;
+        }
+        TP_THROW(TypeError, "Unsupported index type in tuple");
+    }
+    return result;
+}
+
 struct NativeIndexPlan {
     std::vector<int64_t> output_shape;
     std::vector<int64_t> linear_indices;
@@ -1255,8 +1377,9 @@ static void assign_native_index_plan(Tensor& self, const NativeIndexPlan& plan,
     // logical result back through TensorIterator so the view's strides are
     // honored.
     Tensor target = self.is_contiguous() ? self : self.contiguous();
+    Tensor flat_target = target.view({-1});
     tensorplay::tpx::ops::index_put_(
-        target, std::vector<Tensor>{index}, rhs, false);
+        flat_target, std::vector<Tensor>{index}, rhs, false);
     if (!self.is_contiguous()) {
         tensorplay::tpx::ops::copy_(self, target);
     }
@@ -2867,6 +2990,10 @@ void init_tensor(py::module_& m) {
         .def("__getitem__", [](const Tensor& self, py::object index) -> Tensor {
             if (py::isinstance<Tensor>(index)) {
                 Tensor idx = py::cast<Tensor>(index);
+                if (self.is_batched() || idx.is_batched()) {
+                    return tensorplay::tpx::ops::index(
+                        self, std::vector<std::optional<Tensor>>{idx});
+                }
                 if (is_boolean_mask_dtype(idx.dtype())) {
                     if (idx.dim() == 0) {
                         return apply_python_bool_scalar_index(self, idx.item<bool>());
@@ -2895,6 +3022,15 @@ void init_tensor(py::module_& m) {
 
             if (py::isinstance<py::tuple>(index)) {
                  py::tuple indices = py::cast<py::tuple>(index);
+                 if ((self.is_batched() || tuple_has_batched_tensor(indices)) &&
+                     tuple_contains_advanced_index(indices)) {
+                     BatchedTupleIndex native =
+                         make_batched_tuple_index(self, indices);
+                     if (native.has_advanced) {
+                         return tensorplay::tpx::ops::index(
+                             native.base, native.indices);
+                     }
+                 }
                  if (tuple_needs_native_index_plan(indices)) {
                      const auto components = expand_native_index_tuple(self, indices);
                      return apply_native_index_plan(
@@ -2977,6 +3113,25 @@ void init_tensor(py::module_& m) {
             Tensor target;
             if (py::isinstance<py::tuple>(index)) {
                  py::tuple indices = py::cast<py::tuple>(index);
+                 if ((self.is_batched() || tuple_has_batched_tensor(indices)) &&
+                     tuple_contains_advanced_index(indices)) {
+                     BatchedTupleIndex native =
+                         make_batched_tuple_index(self, indices);
+                     if (native.has_advanced) {
+                         Tensor rhs = prepare_setitem_value(
+                             self, std::move(value));
+                         std::vector<Tensor> native_indices;
+                         native_indices.reserve(native.indices.size());
+                         for (const auto& maybe_index : native.indices) {
+                             native_indices.emplace_back(
+                                 maybe_index.has_value()
+                                     ? *maybe_index : Tensor());
+                         }
+                         tensorplay::tpx::ops::index_put_(
+                             native.base, native_indices, rhs, false);
+                         return;
+                     }
+                 }
                  if (tuple_contains_advanced_index(indices) ||
                      tuple_needs_native_index_plan(indices)) {
                      const auto components = expand_native_index_tuple(self, indices);
@@ -3012,6 +3167,14 @@ void init_tensor(py::module_& m) {
                 PreparedTensorIndex prepared;
                 if (py::isinstance<Tensor>(index)) {
                     Tensor tensor_index = py::cast<Tensor>(index);
+                    if (self.is_batched() || tensor_index.is_batched()) {
+                        Tensor rhs = prepare_setitem_value(
+                            self, std::move(value));
+                        tensorplay::tpx::ops::index_put_(
+                            self, std::vector<Tensor>{tensor_index}, rhs,
+                            false);
+                        return;
+                    }
                     if (is_boolean_mask_dtype(tensor_index.dtype())) {
                         if (tensor_index.dim() == 0) {
                             if (!tensor_index.item<bool>()) return;

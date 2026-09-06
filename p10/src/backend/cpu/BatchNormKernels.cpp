@@ -529,11 +529,13 @@ void bn_apply_channels_last(const Tensor& input, Tensor& out,
 // batch_norm forward
 // ---------------------------------------------------------------------------
 
-Tensor batch_norm_cpu(const Tensor& input, const std::optional<Tensor>& weight_opt,
+static Tensor batch_norm_cpu_impl(
+                      const Tensor& input, const std::optional<Tensor>& weight_opt,
                       const std::optional<Tensor>& bias_opt,
-                      std::optional<Tensor>& running_mean_opt,
-                      std::optional<Tensor>& running_var_opt,
-                      bool training, double momentum, double eps) {
+                      const std::optional<Tensor>& running_mean_opt,
+                      const std::optional<Tensor>& running_var_opt,
+                      bool training, double momentum, double eps,
+                      Tensor* save_mean, Tensor* save_invstd) {
     if (input.dim() < 2 || input.dim() > 5)
         TP_THROW(RuntimeError, "batch_norm: Input must be between 2D and 5D");
     if (!isFloatingType(input.dtype()))
@@ -547,33 +549,58 @@ Tensor batch_norm_cpu(const Tensor& input, const std::optional<Tensor>& weight_o
     check_param_dtype(input.dtype(), running_var_opt, "running_var");
 
     const int64_t C = input.size(1);
+    const bool has_running_mean = running_mean_opt.has_value() &&
+        running_mean_opt->defined();
+    const bool has_running_var = running_var_opt.has_value() &&
+        running_var_opt->defined();
+    if (has_running_mean != has_running_var) {
+        TP_THROW(RuntimeError,
+                 "batch_norm: running_mean and running_var must either both be defined or both be absent");
+    }
+    if (!training &&
+        !(has_running_mean && has_running_var)) {
+        TP_THROW(RuntimeError,
+                 "batch_norm: running_mean and running_var must be defined in evaluation mode");
+    }
+    if (save_mean && save_invstd && save_mean->numel() != C && training) {
+        TP_THROW(RuntimeError, "batch_norm: invalid saved statistics shape");
+    }
+    if (input.numel() == 0) {
+        if (save_mean && save_invstd && training) {
+            for (int64_t c = 0; c < C; ++c) {
+                stats_set(*save_mean, c, 0.0);
+                stats_set(*save_invstd, c, 1.0 / std::sqrt(eps));
+            }
+        }
+        return empty_like_format(input);
+    }
 
     std::vector<double> mean(C, 0.0), var(C, 0.0);
     if (training) {
         if (is_channels_last(input)) bn_stats_channels_last(input, mean, var);
         else bn_stats_contiguous(input, mean, var);
 
-        if (running_mean_opt.has_value() && running_mean_opt->defined() &&
-            running_var_opt.has_value() && running_var_opt->defined()) {
+        if (has_running_mean && has_running_var) {
             const double count = static_cast<double>(input.numel() / C);
             const double unbiased = count > 1.0 ? count / (count - 1.0) : 1.0;
             for (int64_t c = 0; c < C; ++c) {
-                stats_set(*running_mean_opt, c,
+                stats_set(const_cast<Tensor&>(*running_mean_opt), c,
                           (1.0 - momentum) * stats_at(*running_mean_opt, c) + momentum * mean[c]);
-                stats_set(*running_var_opt, c,
+                stats_set(const_cast<Tensor&>(*running_var_opt), c,
                           (1.0 - momentum) * stats_at(*running_var_opt, c) + momentum * var[c] * unbiased);
             }
         }
     } else {
         for (int64_t c = 0; c < C; ++c) {
-            if (running_mean_opt.has_value() && running_mean_opt->defined() &&
-                running_var_opt.has_value() && running_var_opt->defined()) {
-                mean[c] = stats_at(*running_mean_opt, c);
-                var[c] = stats_at(*running_var_opt, c);
-            } else {
-                mean[c] = 0.0;
-                var[c] = 0.0;
-            }
+            mean[c] = stats_at(*running_mean_opt, c);
+            var[c] = stats_at(*running_var_opt, c);
+        }
+    }
+
+    if (save_mean && save_invstd && training) {
+        for (int64_t c = 0; c < C; ++c) {
+            stats_set(*save_mean, c, mean[c]);
+            stats_set(*save_invstd, c, 1.0 / std::sqrt(var[c] + eps));
         }
     }
 
@@ -592,6 +619,16 @@ Tensor batch_norm_cpu(const Tensor& input, const std::optional<Tensor>& weight_o
     if (is_channels_last(input)) bn_apply_channels_last(input, out, alpha, beta);
     else bn_apply_contiguous(input, out, alpha, beta);
     return out;
+}
+
+Tensor batch_norm_cpu(const Tensor& input, std::optional<Tensor> weight_opt,
+                      std::optional<Tensor> bias_opt,
+                      std::optional<Tensor> running_mean_opt,
+                      std::optional<Tensor> running_var_opt,
+                      bool training, double momentum, double eps) {
+    return batch_norm_cpu_impl(input, weight_opt, bias_opt, running_mean_opt,
+                               running_var_opt, training, momentum, eps,
+                               nullptr, nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -978,9 +1015,9 @@ void bn_backward_channels_last(const Tensor& grad_output, const Tensor& input,
 
 std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cpu(
     const Tensor& grad_output, const Tensor& input,
-    const std::optional<Tensor>& weight_opt,
-    const std::optional<Tensor>& running_mean_opt,
-    const std::optional<Tensor>& running_var_opt,
+    std::optional<Tensor> weight_opt,
+    std::optional<Tensor> running_mean_opt,
+    std::optional<Tensor> running_var_opt,
     bool training, double eps) {
     const int64_t C = input.size(1);
 
@@ -996,7 +1033,9 @@ std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cpu(
     Tensor grad_input, grad_weight, grad_bias;
     grad_input = empty_like_format(input, gx_dt);
     if (has_w) grad_weight = Tensor::empty({C}, weight_opt->dtype(), weight_opt->device());
-    if (has_w) grad_bias = Tensor::empty({C}, weight_opt->dtype(), weight_opt->device());
+    const DType grad_param_dtype = has_w
+        ? weight_opt->dtype() : stats_dtype_for(input.dtype());
+    grad_bias = Tensor::empty({C}, grad_param_dtype, input.device());
 
     // Resolve mean/invstd (recompute in training mode, running stats in eval).
     std::vector<double> mean(C), invstd(C);
@@ -1023,7 +1062,70 @@ std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cpu(
                                running_var_opt, mean, invstd, training,
                                grad_input, grad_weight, grad_bias);
 
-    if (!has_w) { grad_weight = Tensor(); grad_bias = Tensor(); }
+    if (!has_w) grad_weight = Tensor();
+    return std::make_tuple(grad_input, grad_weight, grad_bias);
+}
+
+std::tuple<Tensor, Tensor, Tensor> native_batch_norm_cpu(
+    const Tensor& input, std::optional<Tensor> weight_opt,
+    std::optional<Tensor> bias_opt,
+    std::optional<Tensor> running_mean_opt,
+    std::optional<Tensor> running_var_opt, bool training,
+    double momentum, double eps) {
+    std::optional<Tensor> running_mean = running_mean_opt;
+    std::optional<Tensor> running_var = running_var_opt;
+    Tensor out = batch_norm_cpu(input, weight_opt, bias_opt, running_mean,
+                                running_var, training, momentum, eps);
+
+    const int64_t channels = input.size(1);
+    const DType stats_dtype = stats_dtype_for(input.dtype());
+    if (input.numel() == 0) {
+        Tensor mean = Tensor::empty({channels}, stats_dtype, input.device());
+        Tensor invstd = Tensor::empty({channels}, stats_dtype, input.device());
+        return std::make_tuple(out, mean, invstd);
+    }
+    if (!training) {
+        Tensor mean = Tensor::empty({0}, stats_dtype, input.device());
+        Tensor invstd = Tensor::empty({0}, stats_dtype, input.device());
+        return std::make_tuple(out, mean, invstd);
+    }
+
+    std::vector<double> mean_values(channels, 0.0);
+    std::vector<double> variance_values(channels, 0.0);
+    if (is_channels_last(input)) {
+        bn_stats_channels_last(input, mean_values, variance_values);
+    } else {
+        bn_stats_contiguous(input, mean_values, variance_values);
+    }
+    Tensor mean = Tensor::empty({channels}, stats_dtype, input.device());
+    Tensor invstd = Tensor::empty({channels}, stats_dtype, input.device());
+    for (int64_t channel = 0; channel < channels; ++channel) {
+        stats_set(mean, channel, mean_values[channel]);
+        stats_set(invstd, channel,
+                  1.0 / std::sqrt(variance_values[channel] + eps));
+    }
+    return std::make_tuple(out, mean, invstd);
+}
+
+std::tuple<Tensor, Tensor, Tensor> native_batch_norm_backward_cpu(
+    const Tensor& grad_out, const Tensor& input,
+    std::optional<Tensor> weight_opt,
+    std::optional<Tensor> running_mean_opt,
+    std::optional<Tensor> running_var_opt,
+    std::optional<Tensor> save_mean_opt,
+    std::optional<Tensor> save_invstd_opt, bool train, double eps,
+    const std::vector<bool>& output_mask) {
+    (void)save_mean_opt;
+    (void)save_invstd_opt;
+    auto grads = batch_norm_backward_cpu(
+        grad_out, input, weight_opt, running_mean_opt, running_var_opt,
+        train, eps);
+    Tensor grad_input = output_mask.size() > 0 && output_mask[0]
+        ? std::get<0>(grads) : Tensor();
+    Tensor grad_weight = output_mask.size() > 1 && output_mask[1]
+        ? std::get<1>(grads) : Tensor();
+    Tensor grad_bias = output_mask.size() > 2 && output_mask[2]
+        ? std::get<2>(grads) : Tensor();
     return std::make_tuple(grad_input, grad_weight, grad_bias);
 }
 
@@ -1031,10 +1133,10 @@ std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cpu(
 // instance_norm: composite over batch_norm (reshape to (1, N*C, S)).
 // ---------------------------------------------------------------------------
 
-Tensor instance_norm_cpu(const Tensor& input, const std::optional<Tensor>& weight_opt,
-                         const std::optional<Tensor>& bias_opt,
-                         std::optional<Tensor>& running_mean_opt,
-                         std::optional<Tensor>& running_var_opt,
+Tensor instance_norm_cpu(const Tensor& input, std::optional<Tensor> weight_opt,
+                         std::optional<Tensor> bias_opt,
+                         std::optional<Tensor> running_mean_opt,
+                         std::optional<Tensor> running_var_opt,
                          bool use_input_stats, double momentum, double eps) {
     if (input.dim() < 3)
         TP_THROW(RuntimeError, "instance_norm: input must have at least 3 dimensions");
@@ -1042,9 +1144,11 @@ Tensor instance_norm_cpu(const Tensor& input, const std::optional<Tensor>& weigh
         TP_THROW(NotImplementedError,
                  std::string("instance_norm: only floating point dtypes are supported (got ") +
                  toString(input.dtype()) + ")");
+    std::optional<Tensor> running_mean = running_mean_opt;
+    std::optional<Tensor> running_var = running_var_opt;
     if (!use_input_stats &&
-        !(running_mean_opt.has_value() && running_mean_opt->defined() &&
-          running_var_opt.has_value() && running_var_opt->defined()))
+        !(running_mean.has_value() && running_mean->defined() &&
+          running_var.has_value() && running_var->defined()))
         TP_THROW(RuntimeError,
                  "instance_norm: running_mean and running_var must be defined when use_input_stats is false");
 
@@ -1058,10 +1162,10 @@ Tensor instance_norm_cpu(const Tensor& input, const std::optional<Tensor>& weigh
         weight_r = repeat_channels(*weight_opt, b, sdt);
     if (bias_opt.has_value() && bias_opt->defined())
         bias_r = repeat_channels(*bias_opt, b, sdt);
-    if (running_mean_opt.has_value() && running_mean_opt->defined())
-        rm_r = repeat_channels(*running_mean_opt, b, sdt);
-    if (running_var_opt.has_value() && running_var_opt->defined())
-        rv_r = repeat_channels(*running_var_opt, b, sdt);
+    if (running_mean.has_value() && running_mean->defined())
+        rm_r = repeat_channels(*running_mean, b, sdt);
+    if (running_var.has_value() && running_var->defined())
+        rv_r = repeat_channels(*running_var, b, sdt);
 
     Tensor input_c = input.contiguous();
     Tensor reshaped = input_c.view({1, b * c, input_c.numel() / (b * c)});
@@ -1071,18 +1175,18 @@ Tensor instance_norm_cpu(const Tensor& input, const std::optional<Tensor>& weigh
     if (use_input_stats) {
         // Fold the updated per-plane stats back: running stats are the average
         // over the batch of the per-sample statistics.
-        if (running_mean_opt.has_value() && running_mean_opt->defined()) {
+        if (running_mean.has_value() && running_mean->defined()) {
             for (int64_t ch = 0; ch < c; ++ch) {
                 double acc = 0.0;
                 for (int64_t n = 0; n < b; ++n) acc += stats_at(*rm_r, n * c + ch);
-                stats_set(*running_mean_opt, ch, acc / static_cast<double>(b));
+                stats_set(*running_mean, ch, acc / static_cast<double>(b));
             }
         }
-        if (running_var_opt.has_value() && running_var_opt->defined()) {
+        if (running_var.has_value() && running_var->defined()) {
             for (int64_t ch = 0; ch < c; ++ch) {
                 double acc = 0.0;
                 for (int64_t n = 0; n < b; ++n) acc += stats_at(*rv_r, n * c + ch);
-                stats_set(*running_var_opt, ch, acc / static_cast<double>(b));
+                stats_set(*running_var, ch, acc / static_cast<double>(b));
             }
         }
     }
@@ -1102,9 +1206,9 @@ std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cpu(
 
 std::tuple<Tensor, Tensor, Tensor> instance_norm_backward_cpu(
     const Tensor& grad_output, const Tensor& input,
-    const std::optional<Tensor>& weight_opt, const std::optional<Tensor>& bias_opt,
-    const std::optional<Tensor>& running_mean_opt,
-    const std::optional<Tensor>& running_var_opt,
+    std::optional<Tensor> weight_opt, std::optional<Tensor> bias_opt,
+    std::optional<Tensor> running_mean_opt,
+    std::optional<Tensor> running_var_opt,
     bool use_input_stats, double eps) {
     if (use_input_stats) {
         const int64_t C = input.size(1);
@@ -1120,6 +1224,8 @@ TENSORPLAY_LIBRARY_IMPL(CPU, BatchNormKernels) {
     using namespace tensorplay::cpu;
     m.impl("batch_norm", batch_norm_cpu);
     m.impl("batch_norm_backward", batch_norm_backward_cpu);
+    m.impl("native_batch_norm", native_batch_norm_cpu);
+    m.impl("native_batch_norm_backward", native_batch_norm_backward_cpu);
     m.impl("instance_norm", instance_norm_cpu);
     m.impl("instance_norm_backward", instance_norm_backward_cpu);
 }
