@@ -674,10 +674,10 @@ Tensor complex_logcumsumexp_cuda(const Tensor& src, int64_t dim) {
 }
 
 // Gather with separate result and source trailing extents.
-template <typename T>
+template <typename T, typename IndexT>
 __global__ void gather_kernel(int64_t n, int64_t idx_dim_size, int64_t idx_inner,
                               int64_t self_dim_size, int64_t self_inner,
-                              const T* s, const int64_t* ip, T* d) {
+                              const T* s, const IndexT* ip, T* d) {
     // The result follows the index shape; source and index trailing extents
     // can differ on axes other than the selected one.
     int64_t flat = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -690,6 +690,59 @@ __global__ void gather_kernel(int64_t n, int64_t idx_dim_size, int64_t idx_inner
         if (idx < 0) idx += self_dim_size;
         d[flat] = s[(outer_off * self_dim_size + idx) * self_inner + t];
     }
+}
+
+template <typename IndexT>
+void launch_gather_kernel_for_index(
+        int64_t n, int64_t idx_dim_size, int64_t idx_inner,
+        int64_t self_dim_size, int64_t self_inner, const Tensor& self,
+        const Tensor& index, Tensor& result, cudaStream_t stream) {
+    const int blocks = static_cast<int>((n + kThreads - 1) / kThreads);
+#define TP_GA_CASE(ctype, name) \
+    case DType::name: \
+        gather_kernel<ctype, IndexT><<<blocks, kThreads, 0, stream>>>( \
+            n, idx_dim_size, idx_inner, self_dim_size, self_inner, \
+            self.data_ptr<ctype>(), index.data_ptr<IndexT>(), \
+            result.data_ptr<ctype>()); \
+        break;
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_GA_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(TP_GA_CASE)
+        case DType::ComplexHalf:
+            gather_kernel<tensorplay::complex<Half>, IndexT><<<
+                blocks, kThreads, 0, stream>>>(
+                n, idx_dim_size, idx_inner, self_dim_size, self_inner,
+                static_cast<const tensorplay::complex<Half>*>(self.data_ptr()),
+                index.data_ptr<IndexT>(),
+                static_cast<tensorplay::complex<Half>*>(result.data_ptr()));
+            break;
+        case DType::ComplexFloat:
+            gather_kernel<tensorplay::complex<float>, IndexT><<<
+                blocks, kThreads, 0, stream>>>(
+                n, idx_dim_size, idx_inner, self_dim_size, self_inner,
+                static_cast<const tensorplay::complex<float>*>(self.data_ptr()),
+                index.data_ptr<IndexT>(),
+                static_cast<tensorplay::complex<float>*>(result.data_ptr()));
+            break;
+        case DType::ComplexDouble:
+            gather_kernel<tensorplay::complex<double>, IndexT><<<
+                blocks, kThreads, 0, stream>>>(
+                n, idx_dim_size, idx_inner, self_dim_size, self_inner,
+                static_cast<const tensorplay::complex<double>*>(self.data_ptr()),
+                index.data_ptr<IndexT>(),
+                static_cast<tensorplay::complex<double>*>(result.data_ptr()));
+            break;
+        case DType::BComplex32:
+            gather_kernel<tensorplay::complex<BFloat16>, IndexT><<<
+                blocks, kThreads, 0, stream>>>(
+                n, idx_dim_size, idx_inner, self_dim_size, self_inner,
+                static_cast<const tensorplay::complex<BFloat16>*>(self.data_ptr()),
+                index.data_ptr<IndexT>(),
+                static_cast<tensorplay::complex<BFloat16>*>(result.data_ptr()));
+            break;
+        default: TP_THROW(TypeError, "gather: unsupported dtype");
+    }
+#undef TP_GA_CASE
 }
 
 __device__ __forceinline__ void atomic_add_rel(int64_t* addr, int64_t v) {
@@ -1853,7 +1906,8 @@ Tensor gather_cuda(const Tensor& self, int64_t dim, const Tensor& index) {
                      " (input: ", self.size(i), ", index: ", index.size(i), ")");
         }
     }
-    Tensor idx_c = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
+    Tensor idx_c = (index.dtype() == DType::Int64 || index.dtype() == DType::Int32)
+        ? index.contiguous() : index.to(DType::Int64).contiguous();
     Tensor self_c = self.contiguous();
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(idx_c.shape()), self.dtype(), self.device());
     int64_t idx_inner = 1;
@@ -1865,50 +1919,15 @@ Tensor gather_cuda(const Tensor& self, int64_t dim, const Tensor& index) {
     int64_t self_dim_size = self.size(dim);
     if (n == 0) return result;
     auto stream = getCurrentCUDAStream().stream();
-#define TP_GA_CASE(ctype, name) \
-    case DType::name: \
-        gather_kernel<ctype><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            n, idx_dim_size, idx_inner, self_dim_size, self_inner, self_c.data_ptr<ctype>(), \
-            idx_c.data_ptr<int64_t>(), result.data_ptr<ctype>()); \
-        break;
-    switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_GA_CASE)
-        TENSORPLAY_FORALL_FP8_TYPES(TP_GA_CASE)
-        case DType::ComplexHalf:
-            gather_kernel<tensorplay::complex<Half>><<<
-                (n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                n, idx_dim_size, idx_inner, self_dim_size, self_inner,
-                static_cast<const tensorplay::complex<Half>*>(self_c.data_ptr()),
-                idx_c.data_ptr<int64_t>(),
-                static_cast<tensorplay::complex<Half>*>(result.data_ptr()));
-            break;
-        case DType::ComplexFloat:
-            gather_kernel<tensorplay::complex<float>><<<
-                (n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                n, idx_dim_size, idx_inner, self_dim_size, self_inner,
-                static_cast<const tensorplay::complex<float>*>(self_c.data_ptr()),
-                idx_c.data_ptr<int64_t>(),
-                static_cast<tensorplay::complex<float>*>(result.data_ptr()));
-            break;
-        case DType::ComplexDouble:
-            gather_kernel<tensorplay::complex<double>><<<
-                (n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                n, idx_dim_size, idx_inner, self_dim_size, self_inner,
-                static_cast<const tensorplay::complex<double>*>(self_c.data_ptr()),
-                idx_c.data_ptr<int64_t>(),
-                static_cast<tensorplay::complex<double>*>(result.data_ptr()));
-            break;
-        case DType::BComplex32:
-            gather_kernel<tensorplay::complex<BFloat16>><<<
-                (n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                n, idx_dim_size, idx_inner, self_dim_size, self_inner,
-                static_cast<const tensorplay::complex<BFloat16>*>(self_c.data_ptr()),
-                idx_c.data_ptr<int64_t>(),
-                static_cast<tensorplay::complex<BFloat16>*>(result.data_ptr()));
-            break;
-        default: TP_THROW(TypeError, "gather: unsupported dtype");
+    if (idx_c.dtype() == DType::Int32) {
+        launch_gather_kernel_for_index<int32_t>(
+            n, idx_dim_size, idx_inner, self_dim_size, self_inner,
+            self_c, idx_c, result, stream);
+    } else {
+        launch_gather_kernel_for_index<int64_t>(
+            n, idx_dim_size, idx_inner, self_dim_size, self_inner,
+            self_c, idx_c, result, stream);
     }
-#undef TP_GA_CASE
     CUDA_CHECK(cudaGetLastError());
     return result;
 }
