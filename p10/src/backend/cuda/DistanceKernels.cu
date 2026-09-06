@@ -63,9 +63,8 @@ __device__ __forceinline__ T distance_pow(T value, T exponent) {
 template <typename InputT, typename AccT>
 __device__ __forceinline__ AccT distance_absdiff(
         InputT lhs, InputT rhs, AccT addend) {
-    const InputT diff = static_cast<InputT>(
-        static_cast<AccT>(lhs) - static_cast<AccT>(rhs) + addend);
-    return distance_abs(static_cast<AccT>(diff));
+    const AccT diff = static_cast<AccT>(lhs) - static_cast<AccT>(rhs) + addend;
+    return distance_abs(diff);
 }
 
 template <typename Real>
