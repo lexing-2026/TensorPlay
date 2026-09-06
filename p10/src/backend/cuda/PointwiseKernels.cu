@@ -1081,18 +1081,10 @@ Tensor gt_scalar_kernel_cuda(const Tensor& self, Scalar other) { return comparis
 Tensor ge_scalar_kernel_cuda(const Tensor& self, Scalar other) { return comparison_scalar_op_kernel(self, other, GeFunctor()); }
 
 template <typename T>
-__global__ void where_broadcast_kernel_cuda_impl(
-    int64_t n, const bool* condition, TensorDesc condition_desc,
-    const T* self, TensorDesc self_desc,
-    const T* other, TensorDesc other_desc,
-    T* output, TensorDesc output_desc) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        const int64_t condition_offset = get_offset(i, condition_desc, output_desc);
-        const int64_t self_offset = get_offset(i, self_desc, output_desc);
-        const int64_t other_offset = get_offset(i, other_desc, output_desc);
-        output[i] = condition[condition_offset] ? self[self_offset] : other[other_offset];
-    }
+void where_loop(TensorIterator& iter) {
+    gpu_kernel(iter, [] __device__(bool condition, T self_value, T other_value) -> T {
+        return condition ? self_value : other_value;
+    });
 }
 
 template <bool Maximum, typename T>
@@ -1116,30 +1108,36 @@ Tensor where_cuda(const Tensor& condition, const Tensor& self, const Tensor& oth
         static_cast<std::vector<int64_t>>(other.shape()));
     DType common_dtype = promoteTypes(self.dtype(), other.dtype());
     Tensor result = Tensor::empty(out_shape, common_dtype, self.device());
-    const int64_t n = result.numel();
-    if (n == 0) return result;
-    dim3 block(256);
-    dim3 grid((n + 255) / 256);
+    if (result.numel() == 0) return result;
     Tensor self_casted = self.dtype() == common_dtype ? self : self.to(common_dtype);
     Tensor other_casted = other.dtype() == common_dtype ? other : other.to(common_dtype);
-    TensorDesc condition_desc = make_desc(condition, out_shape.size());
-    TensorDesc self_desc = make_desc(self_casted, out_shape.size());
-    TensorDesc other_desc = make_desc(other_casted, out_shape.size());
-    TensorDesc output_desc = make_desc(result, out_shape.size());
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(false)
+        .add_output(result)
+        .add_const_input(condition)
+        .add_const_input(self_casted)
+        .add_const_input(other_casted)
+        .build();
 
-    #define WHERE_CASE(ctype, name) \
-        case DType::name: \
-            where_broadcast_kernel_cuda_impl<ctype><<<grid, block, 0, getCurrentCUDAStream().stream()>>>( \
-                n, condition.data_ptr<bool>(), condition_desc, \
-                self_casted.data_ptr<ctype>(), self_desc, other_casted.data_ptr<ctype>(), \
-                other_desc, result.data_ptr<ctype>(), output_desc); \
-            break;
+#define WHERE_CASE(ctype, name) \
+    case DType::name: where_loop<ctype>(iter); break;
     switch (common_dtype) {
         TENSORPLAY_FORALL_SCALAR_TYPES(WHERE_CASE)
+        case DType::ComplexHalf:
+            where_loop<tensorplay::complex<Half>>(iter);
+            break;
+        case DType::ComplexFloat:
+            where_loop<tensorplay::complex<float>>(iter);
+            break;
+        case DType::ComplexDouble:
+            where_loop<tensorplay::complex<double>>(iter);
+            break;
+        case DType::BComplex32:
+            where_loop<tensorplay::complex<BFloat16>>(iter);
+            break;
         default: TP_THROW(NotImplementedError, "CUDA where: unsupported dtype");
     }
     #undef WHERE_CASE
-    CUDA_CHECK(cudaGetLastError());
     return result;
 }
 
