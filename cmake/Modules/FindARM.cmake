@@ -27,8 +27,11 @@ IF(CMAKE_SYSTEM_NAME MATCHES "Linux")
 
   if(TP_CXX_SVE256_PROBE)
     set(TP_CXX_SVE256_FOUND TRUE)
-    set(TP_CXX_SVE256_FLAGS "-march=armv8-a+sve+bf16 -msve-vector-bits=256")
-    set(TP_CXX_SVE128_FLAGS "-march=armv8-a+sve+bf16 -msve-vector-bits=128")
+    # CMake list semantics: each flag must be a separate element, otherwise
+    # target_compile_options passes both flags as one argv and gcc rejects
+    # the combined -march argument.
+    set(TP_CXX_SVE256_FLAGS "-march=armv8-a+sve+bf16" "-msve-vector-bits=256")
+    set(TP_CXX_SVE128_FLAGS "-march=armv8-a+sve+bf16" "-msve-vector-bits=128")
     message(STATUS "SVE vector tiers available (256/128).")
   else()
     set(TP_CXX_SVE256_FOUND FALSE)
