@@ -9,11 +9,14 @@
 #include "Utils.h"
 #include "Exception.h"
 #include "Parallel.h"
+#include "cpu/vec/vec.h"
 #include "tensorplay/ops/TensorRedispatchGenerated.h"
 
+#include <algorithm>
 #include <vector>
 #include <cmath>
 #include <limits>
+#include <type_traits>
 
 namespace tensorplay {
 namespace cpu {
@@ -25,6 +28,113 @@ namespace {
 void require_float(const Tensor& t, const char* who) {
     if (!isFloatingType(t.dtype()))
         TP_THROW(TypeError, who, ": only floating-point tensors are supported");
+}
+
+enum class PdistMode { One, Two, Infinity, General };
+
+template <PdistMode mode, typename T>
+T pdist_distance(const T* lhs, const T* rhs, int64_t width, double p) {
+    using Vec = tensorplay::vec::Vectorized<T>;
+    Vec aggregate(static_cast<T>(0));
+    const int64_t vector_width = Vec::size();
+    int64_t column = 0;
+    for (; column + vector_width <= width; column += vector_width) {
+        const Vec diff =
+            (Vec::loadu(lhs + column) - Vec::loadu(rhs + column)).abs();
+        if constexpr (mode == PdistMode::One) {
+            aggregate = aggregate + diff;
+        } else if constexpr (mode == PdistMode::Two) {
+            aggregate = aggregate + diff * diff;
+        } else if constexpr (mode == PdistMode::Infinity) {
+            aggregate = tensorplay::vec::maximum(aggregate, diff);
+        } else {
+            aggregate = aggregate + diff.pow(Vec(static_cast<T>(p)));
+        }
+    }
+
+    T result = mode == PdistMode::Infinity
+        ? aggregate.reduce_max()
+        : aggregate.reduce_add();
+    for (; column < width; ++column) {
+        const T diff = static_cast<T>(
+            std::abs(lhs[column] - rhs[column]));
+        if constexpr (mode == PdistMode::One) {
+            result += diff;
+        } else if constexpr (mode == PdistMode::Two) {
+            result += diff * diff;
+        } else if constexpr (mode == PdistMode::Infinity) {
+            result = std::max(result, diff);
+        } else {
+            result += static_cast<T>(std::pow(diff, p));
+        }
+    }
+
+    if constexpr (mode == PdistMode::Two) {
+        return static_cast<T>(std::sqrt(result));
+    } else if constexpr (mode == PdistMode::General) {
+        return static_cast<T>(std::pow(result, 1.0 / p));
+    } else {
+        return result;
+    }
+}
+
+template <typename T>
+Tensor pdist_impl(const Tensor& self, double p) {
+    const int64_t n = self.size(0);
+    const int64_t width = self.size(1);
+    const int64_t outn = n * (n - 1) / 2;
+    const DType work_dtype = std::is_same_v<T, double>
+        ? DType::Float64
+        : DType::Float32;
+
+    if (outn == 0) {
+        return Tensor::empty({0}, work_dtype, self.device());
+    }
+    if (width == 0) {
+        return Tensor::zeros({outn}, work_dtype, self.device());
+    }
+
+    Tensor input = self.contiguous().to(work_dtype);
+    const T* data = input.data_ptr<T>();
+    Tensor out = Tensor::empty({outn}, work_dtype, self.device());
+    T* output = out.data_ptr<T>();
+
+    parallel_for(0, outn, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        const double n2 = static_cast<double>(n) - 0.5;
+        int64_t i = static_cast<int64_t>(
+            n2 - std::sqrt(n2 * n2 - 2.0 * static_cast<double>(begin) - 1.0));
+        int64_t j = begin - n * i + i * (i + 1) / 2 + i + 1;
+        for (int64_t index = begin; index < end; ++index) {
+            const T* lhs = data + i * width;
+            const T* rhs = data + j * width;
+            if (p == 0.0) {
+                int64_t count = 0;
+                for (int64_t column = 0; column < width; ++column) {
+                    count += lhs[column] != rhs[column];
+                }
+                output[index] = static_cast<T>(count);
+            } else if (p == 1.0) {
+                output[index] = pdist_distance<PdistMode::One>(
+                    lhs, rhs, width, p);
+            } else if (p == 2.0) {
+                output[index] = pdist_distance<PdistMode::Two>(
+                    lhs, rhs, width, p);
+            } else if (std::isinf(p)) {
+                output[index] = pdist_distance<PdistMode::Infinity>(
+                    lhs, rhs, width, p);
+            } else {
+                output[index] = pdist_distance<PdistMode::General>(
+                    lhs, rhs, width, p);
+            }
+            ++j;
+            if (j == n) {
+                ++i;
+                j = i + 1;
+            }
+        }
+    });
+
+    return out;
 }
 
 }  // namespace
@@ -42,48 +152,17 @@ Tensor pairwise_distance_cpu(const Tensor& x1, const Tensor& x2, double p, doubl
 
 Tensor pdist_cpu(const Tensor& self, double p) {
     require_float(self, "pdist");
-    int64_t n = self.size(0), D = self.size(1);
-    int64_t outn = n * (n - 1) / 2;
-    Tensor a = self.contiguous().to(DType::Float64);
-    const double* ap = a.data_ptr<double>();
-    Tensor out = Tensor::empty({std::max<int64_t>(outn, 1)}, DType::Float64, self.device());
-    double* op = out.data_ptr<double>();
-    parallel_for(0, std::max<int64_t>(outn, 1), GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-        for (int64_t li = begin; li < end; ++li) {
-            // condensed index -> (i, j) pair with i < j
-            int64_t i = static_cast<int64_t>(
-                n - 2 - std::floor(std::sqrt(-8.0 * li + 4.0 * n * (n - 1) - 7) / 2.0 - 0.5));
-            int64_t j = li + i + 1 - (n * (n - 1)) / 2 +
-                        ((n - i) * (n - i - 1)) / 2;
-            double d2 = 0;
-            if (p == std::numeric_limits<double>::infinity()) {
-                for (int64_t c = 0; c < D; ++c)
-                    d2 = std::max(d2, std::fabs(ap[i * D + c] - ap[j * D + c]));
-            } else if (p == 0.0) {
-                int64_t cnt = 0;
-                for (int64_t c = 0; c < D; ++c)
-                    if (ap[i * D + c] != ap[j * D + c]) ++cnt;
-                d2 = static_cast<double>(cnt);
-            } else if (p == 2.0) {
-                for (int64_t c = 0; c < D; ++c) {
-                    double diff = ap[i * D + c] - ap[j * D + c];
-                    d2 += diff * diff;
-                }
-                d2 = std::sqrt(d2);
-            } else if (p == 1.0) {
-                for (int64_t c = 0; c < D; ++c)
-                    d2 += std::fabs(ap[i * D + c] - ap[j * D + c]);
-            } else {
-                for (int64_t c = 0; c < D; ++c)
-                    d2 += std::pow(std::fabs(ap[i * D + c] - ap[j * D + c]), p);
-                d2 = std::pow(d2, 1.0 / p);
-            }
-            op[li] = d2;
-        }
-    });
-    DType out_dt = self.dtype() == DType::Float64 ? DType::Float64 : DType::Float32;
-    Tensor res = out.to(out_dt);
-    return outn == 0 ? res.reshape({0}) : res;
+    if (self.dim() != 2) {
+        TP_THROW(RuntimeError, "pdist only supports 2D tensors, got: ",
+                 self.dim(), "D");
+    }
+    if (p < 0.0) {
+        TP_THROW(RuntimeError, "pdist only supports non-negative p values");
+    }
+    if (self.dtype() == DType::Float64) {
+        return pdist_impl<double>(self, p);
+    }
+    return pdist_impl<float>(self, p);
 }
 
 TENSORPLAY_LIBRARY_IMPL(CPU, Distance) {
