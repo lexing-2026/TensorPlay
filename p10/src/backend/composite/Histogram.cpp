@@ -20,6 +20,39 @@ namespace composite {
 
 namespace ops = tensorplay::tpx::ops;
 
+namespace {
+
+void histc_expand_constant_range(DType dtype, double& lo, double& hi) {
+    switch (dtype) {
+        case DType::Float64:
+            lo = std::min(
+                std::nexttoward(lo, std::numeric_limits<double>::lowest()),
+                lo - 1.0);
+            hi = std::max(
+                std::nexttoward(hi, std::numeric_limits<double>::max()),
+                hi + 1.0);
+            break;
+        case DType::Float32:
+            lo = std::min(
+                static_cast<double>(std::nexttoward(
+                    static_cast<float>(lo),
+                    std::numeric_limits<float>::lowest())),
+                lo - 1.0);
+            hi = std::max(
+                static_cast<double>(std::nexttoward(
+                    static_cast<float>(hi),
+                    std::numeric_limits<float>::max())),
+                hi + 1.0);
+            break;
+        default:
+            lo -= 1.0;
+            hi += 1.0;
+            break;
+    }
+}
+
+} // anonymous namespace
+
 Tensor histc_native(const Tensor& self, int64_t bins, const Scalar& min,
                     const Scalar& max) {
     if (bins <= 0) TP_THROW(RuntimeError, "histc(): bins must be positive");
@@ -35,8 +68,8 @@ Tensor histc_native(const Tensor& self, int64_t bins, const Scalar& min,
         hi = std::get<1>(extrema).item().toDouble();
     }
     if (lo == hi) {
-        lo = std::min(std::nextafter(lo, -std::numeric_limits<double>::infinity()), lo - 1.0);
-        hi = std::max(std::nextafter(hi, std::numeric_limits<double>::infinity()), hi + 1.0);
+        histc_expand_constant_range(self.dtype(), lo, hi);
+        histc_expand_constant_range(self.dtype(), lo, hi);
     }
     if (!std::isfinite(lo) || !std::isfinite(hi)) {
         TP_THROW(RuntimeError, "histc: range of [", lo, ", ", hi,
