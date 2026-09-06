@@ -139,7 +139,7 @@ Tensor& adopt_out(Tensor& out, const Tensor& value) {
 
 }  // namespace
 
-std::tuple<Tensor&, Tensor&, Tensor&> lu_unpack_out_native(
+std::tuple<Tensor, Tensor, Tensor> lu_unpack_out_native(
         const Tensor& LU_data, const Tensor& LU_pivots, bool unpack_data,
         bool unpack_pivots, Tensor& P, Tensor& L, Tensor& U) {
     auto unpacked =

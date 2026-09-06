@@ -16,700 +16,725 @@ namespace composite {
 
 namespace ops = tensorplay::tpx::ops;
 
+namespace {
+
+// out= keeps the destination the caller handed over: the buffer is resized
+// only when the produced value does not already fit and the values are copied
+// into that storage, so a view of the destination observes the result and its
+// address does not move.  A destination that cannot hold the result's element
+// type adopts the value instead, which is the only case where the identity of
+// the buffer changes.
+Tensor& write_out(Tensor& out, const Tensor& value) {
+    if (!out.defined() || out.dtype() != value.dtype() ||
+        out.device() != value.device()) {
+        out = value;
+        return out;
+    }
+    const auto target = static_cast<std::vector<int64_t>>(value.shape());
+    if (static_cast<std::vector<int64_t>>(out.shape()) != target) {
+        out.resize_(target);
+    }
+    out.copy_(value);
+    return out;
+}
+
+}  // namespace
+
+
 Tensor& out_wrap_abs_out(const Tensor& self, Tensor& out) {
-    out = ops::abs(self);
+    write_out(out, ops::abs(self));
     return out;
 }
 
 Tensor& out_wrap_absolute_out(const Tensor& self, Tensor& out) {
-    out = ops::absolute(self);
+    write_out(out, ops::absolute(self));
     return out;
 }
 
 Tensor& out_wrap_angle_out(const Tensor& self, Tensor& out) {
-    out = ops::angle(self);
+    write_out(out, ops::angle(self));
     return out;
 }
 
 Tensor& out_wrap_sgn_out(const Tensor& self, Tensor& out) {
-    out = ops::sgn(self);
+    write_out(out, ops::sgn(self));
     return out;
 }
 
 Tensor& out_wrap_conj_physical_out(const Tensor& self, Tensor& out) {
-    out = ops::conj_physical(self);
+    write_out(out, ops::conj_physical(self));
     return out;
 }
 
 Tensor& out_wrap_acos_out(const Tensor& self, Tensor& out) {
-    out = ops::acos(self);
+    write_out(out, ops::acos(self));
     return out;
 }
 
 Tensor& out_wrap_arccos_out(const Tensor& self, Tensor& out) {
-    out = ops::arccos(self);
+    write_out(out, ops::arccos(self));
     return out;
 }
 
 Tensor& out_wrap_addmv_out(const Tensor& self, const Tensor& mat, const Tensor& vec, Scalar beta, Scalar alpha, Tensor& out) {
-    out = ops::addmv(self, mat, vec, beta, alpha);
+    write_out(out, ops::addmv(self, mat, vec, beta, alpha));
     return out;
 }
 
 Tensor& out_wrap_addr_out(const Tensor& self, const Tensor& vec1, const Tensor& vec2, Scalar beta, Scalar alpha, Tensor& out) {
-    out = ops::addr(self, vec1, vec2, beta, alpha);
+    write_out(out, ops::addr(self, vec1, vec2, beta, alpha));
     return out;
 }
 
 Tensor& out_wrap_argmax_out(const Tensor& self, std::optional<int64_t> dim, bool keepdim, Tensor& out) {
-    out = ops::argmax(self, dim, keepdim);
+    write_out(out, ops::argmax(self, dim, keepdim));
     return out;
 }
 
 Tensor& out_wrap_argmin_out(const Tensor& self, std::optional<int64_t> dim, bool keepdim, Tensor& out) {
-    out = ops::argmin(self, dim, keepdim);
+    write_out(out, ops::argmin(self, dim, keepdim));
     return out;
 }
 
 Tensor& out_wrap_acosh_out(const Tensor& self, Tensor& out) {
-    out = ops::acosh(self);
+    write_out(out, ops::acosh(self));
     return out;
 }
 
 Tensor& out_wrap_arccosh_out(const Tensor& self, Tensor& out) {
-    out = ops::arccosh(self);
+    write_out(out, ops::arccosh(self));
     return out;
 }
 
 Tensor& out_wrap_asinh_out(const Tensor& self, Tensor& out) {
-    out = ops::asinh(self);
+    write_out(out, ops::asinh(self));
     return out;
 }
 
 Tensor& out_wrap_arcsinh_out(const Tensor& self, Tensor& out) {
-    out = ops::arcsinh(self);
+    write_out(out, ops::arcsinh(self));
     return out;
 }
 
 Tensor& out_wrap_atanh_out(const Tensor& self, Tensor& out) {
-    out = ops::atanh(self);
+    write_out(out, ops::atanh(self));
     return out;
 }
 
 Tensor& out_wrap_arctanh_out(const Tensor& self, Tensor& out) {
-    out = ops::arctanh(self);
+    write_out(out, ops::arctanh(self));
     return out;
 }
 
 Tensor& out_wrap_asin_out(const Tensor& self, Tensor& out) {
-    out = ops::asin(self);
+    write_out(out, ops::asin(self));
     return out;
 }
 
 Tensor& out_wrap_arcsin_out(const Tensor& self, Tensor& out) {
-    out = ops::arcsin(self);
+    write_out(out, ops::arcsin(self));
     return out;
 }
 
 Tensor& out_wrap_atan_out(const Tensor& self, Tensor& out) {
-    out = ops::atan(self);
+    write_out(out, ops::atan(self));
     return out;
 }
 
 Tensor& out_wrap_arctan_out(const Tensor& self, Tensor& out) {
-    out = ops::arctan(self);
+    write_out(out, ops::arctan(self));
     return out;
 }
 
 Tensor& out_wrap_binary_cross_entropy_out(const Tensor& self, const Tensor& target, const std::optional<Tensor>& weight, int64_t reduction, Tensor& out) {
-    out = ops::binary_cross_entropy(self, target, weight, reduction);
+    write_out(out, ops::binary_cross_entropy(self, target, weight, reduction));
     return out;
 }
 
 Tensor& out_wrap_bitwise_not_out(const Tensor& self, Tensor& out) {
-    out = ops::bitwise_not(self);
+    write_out(out, ops::bitwise_not(self));
     return out;
 }
 
 Tensor& out_wrap_logical_not_out(const Tensor& self, Tensor& out) {
-    out = ops::logical_not(self);
+    write_out(out, ops::logical_not(self));
     return out;
 }
 
 Tensor& out_wrap_logical_xor_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::logical_xor(self, other);
+    write_out(out, ops::logical_xor(self, other));
     return out;
 }
 
 Tensor& out_wrap_logical_and_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::logical_and(self, other);
+    write_out(out, ops::logical_and(self, other));
     return out;
 }
 
 Tensor& out_wrap_logical_or_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::logical_or(self, other);
+    write_out(out, ops::logical_or(self, other));
     return out;
 }
 
 Tensor& out_wrap_cat_out(const std::vector<Tensor>& tensors, int64_t dim, Tensor& out) {
-    out = ops::cat(tensors, dim);
+    write_out(out, ops::cat(tensors, dim));
     return out;
 }
 
 Tensor& out_wrap_concat_out(const std::vector<Tensor>& tensors, int64_t dim, Tensor& out) {
-    out = ops::concat(tensors, dim);
+    write_out(out, ops::concat(tensors, dim));
     return out;
 }
 
 Tensor& out_wrap_concatenate_out(const std::vector<Tensor>& tensors, int64_t dim, Tensor& out) {
-    out = ops::concatenate(tensors, dim);
+    write_out(out, ops::concatenate(tensors, dim));
     return out;
 }
 
 Tensor& out_wrap_ceil_out(const Tensor& self, Tensor& out) {
-    out = ops::ceil(self);
+    write_out(out, ops::ceil(self));
     return out;
 }
 
 Tensor& out_wrap_chain_matmul_out(const std::vector<Tensor>& matrices, Tensor& out) {
-    out = ops::chain_matmul(matrices);
+    write_out(out, ops::chain_matmul(matrices));
     return out;
 }
 
 Tensor& out_wrap_clamp_out(const Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max, Tensor& out) {
-    out = ops::clamp(self, min, max);
+    write_out(out, ops::clamp(self, min, max));
     return out;
 }
 
 Tensor& out_wrap_clamp_Tensor_out(const Tensor& self, const std::optional<Tensor>& min, const std::optional<Tensor>& max, Tensor& out) {
-    out = ops::clamp(self, min, max);
+    write_out(out, ops::clamp(self, min, max));
     return out;
 }
 
 Tensor& out_wrap_clip_out(const Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max, Tensor& out) {
-    out = ops::clip(self, min, max);
+    write_out(out, ops::clip(self, min, max));
     return out;
 }
 
 Tensor& out_wrap_clip_Tensor_out(const Tensor& self, const std::optional<Tensor>& min, const std::optional<Tensor>& max, Tensor& out) {
-    out = ops::clip(self, min, max);
+    write_out(out, ops::clip(self, min, max));
     return out;
 }
 
 Tensor& out_wrap_cos_out(const Tensor& self, Tensor& out) {
-    out = ops::cos(self);
+    write_out(out, ops::cos(self));
     return out;
 }
 
 Tensor& out_wrap_cosh_out(const Tensor& self, Tensor& out) {
-    out = ops::cosh(self);
+    write_out(out, ops::cosh(self));
     return out;
 }
 
 Tensor& out_wrap_cumprod_out(const Tensor& self, int64_t dim, std::optional<DType> dtype, Tensor& out) {
-    out = ops::cumprod(self, dim, dtype);
+    write_out(out, ops::cumprod(self, dim, dtype));
     return out;
 }
 
 Tensor& out_wrap_cumsum_out(const Tensor& self, int64_t dim, std::optional<DType> dtype, Tensor& out) {
-    out = ops::cumsum(self, dim, dtype);
+    write_out(out, ops::cumsum(self, dim, dtype));
     return out;
 }
 
 Tensor& out_wrap_diff_out(const Tensor& self, int64_t n, int64_t dim, const std::optional<Tensor>& prepend, const std::optional<Tensor>& append, Tensor& out) {
-    out = ops::diff(self, n, dim, prepend, append);
+    write_out(out, ops::diff(self, n, dim, prepend, append));
     return out;
 }
 
 Tensor& out_wrap_dot_out(const Tensor& self, const Tensor& tensor, Tensor& out) {
-    out = ops::dot(self, tensor);
+    write_out(out, ops::dot(self, tensor));
     return out;
 }
 
 Tensor& out_wrap_vdot_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::vdot(self, other);
+    write_out(out, ops::vdot(self, other));
     return out;
 }
 
 Tensor& out_wrap_erf_out(const Tensor& self, Tensor& out) {
-    out = ops::erf(self);
+    write_out(out, ops::erf(self));
     return out;
 }
 
 Tensor& out_wrap_erfc_out(const Tensor& self, Tensor& out) {
-    out = ops::erfc(self);
+    write_out(out, ops::erfc(self));
     return out;
 }
 
 Tensor& out_wrap_exp_out(const Tensor& self, Tensor& out) {
-    out = ops::exp(self);
+    write_out(out, ops::exp(self));
     return out;
 }
 
 Tensor& out_wrap_exp2_out(const Tensor& self, Tensor& out) {
-    out = ops::exp2(self);
+    write_out(out, ops::exp2(self));
     return out;
 }
 
 Tensor& out_wrap_expm1_out(const Tensor& self, Tensor& out) {
-    out = ops::expm1(self);
+    write_out(out, ops::expm1(self));
     return out;
 }
 
 Tensor& out_wrap_floor_out(const Tensor& self, Tensor& out) {
-    out = ops::floor(self);
+    write_out(out, ops::floor(self));
     return out;
 }
 
 Tensor& out_wrap_floor_divide_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::floor_divide(self, other);
+    write_out(out, ops::floor_divide(self, other));
     return out;
 }
 
 Tensor& out_wrap_frac_out(const Tensor& self, Tensor& out) {
-    out = ops::frac(self);
+    write_out(out, ops::frac(self));
     return out;
 }
 
 Tensor& out_wrap_gcd_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::gcd(self, other);
+    write_out(out, ops::gcd(self, other));
     return out;
 }
 
 Tensor& out_wrap_lcm_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::lcm(self, other);
+    write_out(out, ops::lcm(self, other));
     return out;
 }
 
 Tensor& out_wrap_kron_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::kron(self, other);
+    write_out(out, ops::kron(self, other));
     return out;
 }
 
 Tensor& out_wrap_linear_out(const Tensor& input, const Tensor& weight, const std::optional<Tensor>& bias, Tensor& out) {
-    out = ops::linear(input, weight, bias);
+    write_out(out, ops::linear(input, weight, bias));
     return out;
 }
 
 Tensor& out_wrap_ldexp_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::ldexp(self, other);
+    write_out(out, ops::ldexp(self, other));
     return out;
 }
 
 Tensor& out_wrap_log_out(const Tensor& self, Tensor& out) {
-    out = ops::log(self);
+    write_out(out, ops::log(self));
     return out;
 }
 
 Tensor& out_wrap_log10_out(const Tensor& self, Tensor& out) {
-    out = ops::log10(self);
+    write_out(out, ops::log10(self));
     return out;
 }
 
 Tensor& out_wrap_log1p_out(const Tensor& self, Tensor& out) {
-    out = ops::log1p(self);
+    write_out(out, ops::log1p(self));
     return out;
 }
 
 Tensor& out_wrap_log2_out(const Tensor& self, Tensor& out) {
-    out = ops::log2(self);
+    write_out(out, ops::log2(self));
     return out;
 }
 
 Tensor& out_wrap_logaddexp_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::logaddexp(self, other);
+    write_out(out, ops::logaddexp(self, other));
     return out;
 }
 
 Tensor& out_wrap_logaddexp2_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::logaddexp2(self, other);
+    write_out(out, ops::logaddexp2(self, other));
     return out;
 }
 
 Tensor& out_wrap_matrix_power_out(const Tensor& self, int64_t n, Tensor& out) {
-    out = ops::matrix_power(self, n);
+    write_out(out, ops::matrix_power(self, n));
     return out;
 }
 
 Tensor& out_wrap_mv_out(const Tensor& self, const Tensor& vec, Tensor& out) {
-    out = ops::mv(self, vec);
+    write_out(out, ops::mv(self, vec));
     return out;
 }
 
 Tensor& out_wrap_mvlgamma_out(const Tensor& self, int64_t p, Tensor& out) {
-    out = ops::mvlgamma(self, p);
+    write_out(out, ops::mvlgamma(self, p));
     return out;
 }
 
 Tensor& out_wrap_narrow_copy_out(const Tensor& self, int64_t dim, int64_t start, int64_t length, Tensor& out) {
-    out = ops::narrow_copy(self, dim, start, length);
+    write_out(out, ops::narrow_copy(self, dim, start, length));
     return out;
 }
 
 Tensor& out_wrap_rad2deg_out(const Tensor& self, Tensor& out) {
-    out = ops::rad2deg(self);
+    write_out(out, ops::rad2deg(self));
     return out;
 }
 
 Tensor& out_wrap_deg2rad_out(const Tensor& self, Tensor& out) {
-    out = ops::deg2rad(self);
+    write_out(out, ops::deg2rad(self));
     return out;
 }
 
 Tensor& out_wrap_rand_out(const std::vector<int64_t>& size, Tensor& out) {
-    out = ops::rand(size);
+    write_out(out, ops::rand(size));
     return out;
 }
 
 Tensor& out_wrap_rand_generator_out(const std::vector<int64_t>& size, std::optional<Generator> generator, Tensor& out) {
-    out = ops::rand(size, generator);
+    write_out(out, ops::rand(size, generator));
     return out;
 }
 
 Tensor& out_wrap_randn_out(const std::vector<int64_t>& size, Tensor& out) {
-    out = ops::randn(size);
+    write_out(out, ops::randn(size));
     return out;
 }
 
 Tensor& out_wrap_randn_generator_out(const std::vector<int64_t>& size, std::optional<Generator> generator, Tensor& out) {
-    out = ops::randn(size, generator);
+    write_out(out, ops::randn(size, generator));
     return out;
 }
 
 Tensor& out_wrap_randperm_out(int64_t n, Tensor& out) {
-    out = ops::randperm(n);
+    write_out(out, ops::randperm(n));
     return out;
 }
 
 Tensor& out_wrap_randperm_generator_out(int64_t n, std::optional<Generator> generator, Tensor& out) {
-    out = ops::randperm(n, generator);
+    write_out(out, ops::randperm(n, generator));
     return out;
 }
 
 Tensor& out_wrap_reciprocal_out(const Tensor& self, Tensor& out) {
-    out = ops::reciprocal(self);
+    write_out(out, ops::reciprocal(self));
     return out;
 }
 
 Tensor& out_wrap_neg_out(const Tensor& self, Tensor& out) {
-    out = ops::neg(self);
+    write_out(out, ops::neg(self));
     return out;
 }
 
 Tensor& out_wrap_negative_out(const Tensor& self, Tensor& out) {
-    out = ops::negative(self);
+    write_out(out, ops::negative(self));
     return out;
 }
 
 Tensor& out_wrap_round_out(const Tensor& self, Tensor& out) {
-    out = ops::round(self);
+    write_out(out, ops::round(self));
     return out;
 }
 
 Tensor& out_wrap_round_decimals_out(const Tensor& self, int64_t decimals, Tensor& out) {
-    out = ops::round(self, decimals);
+    write_out(out, ops::round(self, decimals));
     return out;
 }
 
 Tensor& out_wrap_gelu_out(const Tensor& self, std::string approximate, Tensor& out) {
-    out = ops::gelu(self, approximate);
+    write_out(out, ops::gelu(self, approximate));
     return out;
 }
 
 Tensor& out_wrap_hardshrink_out(const Tensor& self, Scalar lambd, Tensor& out) {
-    out = ops::hardshrink(self, lambd);
+    write_out(out, ops::hardshrink(self, lambd));
     return out;
 }
 
 Tensor& out_wrap_rsqrt_out(const Tensor& self, Tensor& out) {
-    out = ops::rsqrt(self);
+    write_out(out, ops::rsqrt(self));
     return out;
 }
 
 Tensor& out_wrap_silu_out(const Tensor& self, Tensor& out) {
-    out = ops::silu(self);
+    write_out(out, ops::silu(self));
     return out;
 }
 
 Tensor& out_wrap_mish_out(const Tensor& self, Tensor& out) {
-    out = ops::mish(self);
+    write_out(out, ops::mish(self));
     return out;
 }
 
 Tensor& out_wrap_sigmoid_out(const Tensor& self, Tensor& out) {
-    out = ops::sigmoid(self);
+    write_out(out, ops::sigmoid(self));
     return out;
 }
 
 Tensor& out_wrap_logit_out(const Tensor& self, std::optional<double> eps, Tensor& out) {
-    out = ops::logit(self, eps);
+    write_out(out, ops::logit(self, eps));
     return out;
 }
 
 Tensor& out_wrap_sin_out(const Tensor& self, Tensor& out) {
-    out = ops::sin(self);
+    write_out(out, ops::sin(self));
     return out;
 }
 
 Tensor& out_wrap_sinc_out(const Tensor& self, Tensor& out) {
-    out = ops::sinc(self);
+    write_out(out, ops::sinc(self));
     return out;
 }
 
 Tensor& out_wrap_sinh_out(const Tensor& self, Tensor& out) {
-    out = ops::sinh(self);
+    write_out(out, ops::sinh(self));
     return out;
 }
 
 Tensor& out_wrap_stack_out(const std::vector<Tensor>& tensors, int64_t dim, Tensor& out) {
-    out = ops::stack(tensors, dim);
+    write_out(out, ops::stack(tensors, dim));
     return out;
 }
 
 Tensor& out_wrap_sqrt_out(const Tensor& self, Tensor& out) {
-    out = ops::sqrt(self);
+    write_out(out, ops::sqrt(self));
     return out;
 }
 
 Tensor& out_wrap_square_out(const Tensor& self, Tensor& out) {
-    out = ops::square(self);
+    write_out(out, ops::square(self));
     return out;
 }
 
 Tensor& out_wrap_tan_out(const Tensor& self, Tensor& out) {
-    out = ops::tan(self);
+    write_out(out, ops::tan(self));
     return out;
 }
 
 Tensor& out_wrap_tanh_out(const Tensor& self, Tensor& out) {
-    out = ops::tanh(self);
+    write_out(out, ops::tanh(self));
     return out;
 }
 
 Tensor& out_wrap_threshold_out(const Tensor& self, Scalar threshold, Scalar value, Tensor& out) {
-    out = ops::threshold(self, threshold, value);
+    write_out(out, ops::threshold(self, threshold, value));
     return out;
 }
 
 Tensor& out_wrap_trunc_out(const Tensor& self, Tensor& out) {
-    out = ops::trunc(self);
+    write_out(out, ops::trunc(self));
     return out;
 }
 
 Tensor& out_wrap_fix_out(const Tensor& self, Tensor& out) {
-    out = ops::fix(self);
+    write_out(out, ops::fix(self));
     return out;
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_frexp_Tensor_out(const Tensor& self, Tensor& mantissa, Tensor& exponent) {
+std::tuple<Tensor, Tensor> out_wrap_frexp_Tensor_out(const Tensor& self, Tensor& mantissa, Tensor& exponent) {
     auto __tp_result = ops::frexp(self);
-    mantissa = std::get<0>(__tp_result);
-    exponent = std::get<1>(__tp_result);
+    write_out(mantissa, std::get<0>(__tp_result));
+    write_out(exponent, std::get<1>(__tp_result));
     return { mantissa, exponent };
 }
 
 Tensor& out_wrap_heaviside_out(const Tensor& self, const Tensor& values, Tensor& out) {
-    out = ops::heaviside(self, values);
+    write_out(out, ops::heaviside(self, values));
     return out;
 }
 
 Tensor& out_wrap_not_equal_Scalar_out(const Tensor& self, Scalar other, Tensor& out) {
-    out = ops::not_equal(self, other);
+    write_out(out, ops::not_equal(self, other));
     return out;
 }
 
 Tensor& out_wrap_not_equal_Tensor_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::not_equal(self, other);
+    write_out(out, ops::not_equal(self, other));
     return out;
 }
 
 Tensor& out_wrap_greater_equal_Scalar_out(const Tensor& self, Scalar other, Tensor& out) {
-    out = ops::greater_equal(self, other);
+    write_out(out, ops::greater_equal(self, other));
     return out;
 }
 
 Tensor& out_wrap_greater_equal_Tensor_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::greater_equal(self, other);
+    write_out(out, ops::greater_equal(self, other));
     return out;
 }
 
 Tensor& out_wrap_less_equal_Scalar_out(const Tensor& self, Scalar other, Tensor& out) {
-    out = ops::less_equal(self, other);
+    write_out(out, ops::less_equal(self, other));
     return out;
 }
 
 Tensor& out_wrap_less_equal_Tensor_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::less_equal(self, other);
+    write_out(out, ops::less_equal(self, other));
     return out;
 }
 
 Tensor& out_wrap_greater_Scalar_out(const Tensor& self, Scalar other, Tensor& out) {
-    out = ops::greater(self, other);
+    write_out(out, ops::greater(self, other));
     return out;
 }
 
 Tensor& out_wrap_greater_Tensor_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::greater(self, other);
+    write_out(out, ops::greater(self, other));
     return out;
 }
 
 Tensor& out_wrap_less_Scalar_out(const Tensor& self, Scalar other, Tensor& out) {
-    out = ops::less(self, other);
+    write_out(out, ops::less(self, other));
     return out;
 }
 
 Tensor& out_wrap_less_Tensor_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::less(self, other);
+    write_out(out, ops::less(self, other));
     return out;
 }
 
 Tensor& out_wrap_masked_select_out(const Tensor& self, const Tensor& mask, Tensor& out) {
-    out = ops::masked_select(self, mask);
+    write_out(out, ops::masked_select(self, mask));
     return out;
 }
 
 Tensor& out_wrap_nonzero_out(const Tensor& self, Tensor& out) {
-    out = ops::nonzero(self);
+    write_out(out, ops::nonzero(self));
     return out;
 }
 
 Tensor& out_wrap_nonzero_static_out(const Tensor& self, int64_t size, int64_t fill_value, Tensor& out) {
-    out = ops::nonzero_static(self, size, fill_value);
+    write_out(out, ops::nonzero_static(self, size, fill_value));
     return out;
 }
 
 Tensor& out_wrap_addcmul_out(const Tensor& self, const Tensor& tensor1, const Tensor& tensor2, Scalar value, Tensor& out) {
-    out = ops::addcmul(self, tensor1, tensor2, value);
+    write_out(out, ops::addcmul(self, tensor1, tensor2, value));
     return out;
 }
 
 Tensor& out_wrap_addcdiv_out(const Tensor& self, const Tensor& tensor1, const Tensor& tensor2, Scalar value, Tensor& out) {
-    out = ops::addcdiv(self, tensor1, tensor2, value);
+    write_out(out, ops::addcdiv(self, tensor1, tensor2, value));
     return out;
 }
 
 Tensor& out_wrap_linalg_solve_triangular_out(const Tensor& self, const Tensor& B, bool upper, bool left, bool unitriangular, Tensor& out) {
-    out = ops::linalg_solve_triangular(self, B, upper, left, unitriangular);
+    write_out(out, ops::linalg_solve_triangular(self, B, upper, left, unitriangular));
     return out;
 }
 
 Tensor& out_wrap_cholesky_solve_out(const Tensor& self, const Tensor& input2, bool upper, Tensor& out) {
-    out = ops::cholesky_solve(self, input2, upper);
+    write_out(out, ops::cholesky_solve(self, input2, upper));
     return out;
 }
 
 Tensor& out_wrap_cholesky_inverse_out(const Tensor& self, bool upper, Tensor& out) {
-    out = ops::cholesky_inverse(self, upper);
+    write_out(out, ops::cholesky_inverse(self, upper));
     return out;
 }
 
 Tensor& out_wrap_lgamma_out(const Tensor& self, Tensor& out) {
-    out = ops::lgamma(self);
+    write_out(out, ops::lgamma(self));
     return out;
 }
 
 Tensor& out_wrap_digamma_out(const Tensor& self, Tensor& out) {
-    out = ops::digamma(self);
+    write_out(out, ops::digamma(self));
     return out;
 }
 
 Tensor& out_wrap_polygamma_out(int64_t n, const Tensor& self, Tensor& out) {
-    out = ops::polygamma(n, self);
+    write_out(out, ops::polygamma(n, self));
     return out;
 }
 
 Tensor& out_wrap_erfinv_out(const Tensor& self, Tensor& out) {
-    out = ops::erfinv(self);
+    write_out(out, ops::erfinv(self));
     return out;
 }
 
 Tensor& out_wrap_i0_out(const Tensor& self, Tensor& out) {
-    out = ops::i0(self);
+    write_out(out, ops::i0(self));
     return out;
 }
 
 Tensor& out_wrap_sign_out(const Tensor& self, Tensor& out) {
-    out = ops::sign(self);
+    write_out(out, ops::sign(self));
     return out;
 }
 
 Tensor& out_wrap_signbit_out(const Tensor& self, Tensor& out) {
-    out = ops::signbit(self);
+    write_out(out, ops::signbit(self));
     return out;
 }
 
 Tensor& out_wrap_atan2_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::atan2(self, other);
+    write_out(out, ops::atan2(self, other));
     return out;
 }
 
 Tensor& out_wrap_lerp_Scalar_out(const Tensor& self, const Tensor& end, Scalar weight, Tensor& out) {
-    out = ops::lerp(self, end, weight);
+    write_out(out, ops::lerp(self, end, weight));
     return out;
 }
 
 Tensor& out_wrap_lerp_Tensor_out(const Tensor& self, const Tensor& end, const Tensor& weight, Tensor& out) {
-    out = ops::lerp(self, end, weight);
+    write_out(out, ops::lerp(self, end, weight));
     return out;
 }
 
 Tensor& out_wrap_hypot_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::hypot(self, other);
+    write_out(out, ops::hypot(self, other));
     return out;
 }
 
 Tensor& out_wrap_igamma_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::igamma(self, other);
+    write_out(out, ops::igamma(self, other));
     return out;
 }
 
 Tensor& out_wrap_igammac_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::igammac(self, other);
+    write_out(out, ops::igammac(self, other));
     return out;
 }
 
 Tensor& out_wrap_nextafter_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::nextafter(self, other);
+    write_out(out, ops::nextafter(self, other));
     return out;
 }
 
 Tensor& out_wrap_min_unary_out(const Tensor& self, Tensor& out) {
-    out = ops::min(self);
+    write_out(out, ops::min(self));
     return out;
 }
 
 Tensor& out_wrap_fmin_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::fmin(self, other);
+    write_out(out, ops::fmin(self, other));
     return out;
 }
 
 Tensor& out_wrap_fmax_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::fmax(self, other);
+    write_out(out, ops::fmax(self, other));
     return out;
 }
 
 Tensor& out_wrap_maximum_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::maximum(self, other);
+    write_out(out, ops::maximum(self, other));
     return out;
 }
 
 Tensor& out_wrap_max_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::max(self, other);
+    write_out(out, ops::max(self, other));
     return out;
 }
 
 Tensor& out_wrap_max_unary_out(const Tensor& self, Tensor& out) {
-    out = ops::max(self);
+    write_out(out, ops::max(self));
     return out;
 }
 
 Tensor& out_wrap_minimum_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::minimum(self, other);
+    write_out(out, ops::minimum(self, other));
     return out;
 }
 
 Tensor& out_wrap_min_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::min(self, other);
+    write_out(out, ops::min(self, other));
     return out;
 }
 
@@ -759,214 +784,214 @@ Tensor& out_wrap_nanquantile_scalar_out(const Tensor& self, double q, std::optio
 }
 
 Tensor& out_wrap_float_power_Tensor_Tensor_out(const Tensor& self, const Tensor& exponent, Tensor& out) {
-    out = ops::float_power(self, exponent);
+    write_out(out, ops::float_power(self, exponent));
     return out;
 }
 
 Tensor& out_wrap_float_power_Scalar_out(Scalar self, const Tensor& exponent, Tensor& out) {
-    out = ops::float_power(self, exponent);
+    write_out(out, ops::float_power(self, exponent));
     return out;
 }
 
 Tensor& out_wrap_float_power_Tensor_Scalar_out(const Tensor& self, Scalar exponent, Tensor& out) {
-    out = ops::float_power(self, exponent);
+    write_out(out, ops::float_power(self, exponent));
     return out;
 }
 
 Tensor& out_wrap_normal_Tensor_float_out(const Tensor& mean, double std, std::optional<Generator> generator, Tensor& out) {
-    out = ops::normal(mean, std, generator);
+    write_out(out, ops::normal(mean, std, generator));
     return out;
 }
 
 Tensor& out_wrap_normal_float_Tensor_out(double mean, const Tensor& std, std::optional<Generator> generator, Tensor& out) {
-    out = ops::normal(mean, std, generator);
+    write_out(out, ops::normal(mean, std, generator));
     return out;
 }
 
 Tensor& out_wrap_normal_Tensor_Tensor_out(const Tensor& mean, const Tensor& std, std::optional<Generator> generator, Tensor& out) {
-    out = ops::normal(mean, std, generator);
+    write_out(out, ops::normal(mean, std, generator));
     return out;
 }
 
 Tensor& out_wrap_normal_float_float_out(double mean, double std, const std::vector<int64_t>& size, std::optional<Generator> generator, Tensor& out) {
-    out = ops::normal(mean, std, size, generator);
+    write_out(out, ops::normal(mean, std, size, generator));
     return out;
 }
 
 Tensor& out_wrap_mse_loss_out(const Tensor& self, const Tensor& target, int64_t reduction, Tensor& out) {
-    out = ops::mse_loss(self, target, reduction);
+    write_out(out, ops::mse_loss(self, target, reduction));
     return out;
 }
 
 Tensor& out_wrap_multi_margin_loss_out(const Tensor& self, const Tensor& target, Scalar p, Scalar margin, const std::optional<Tensor>& weight, int64_t reduction, Tensor& out) {
-    out = ops::multi_margin_loss(self, target, p, margin, weight, reduction);
+    write_out(out, ops::multi_margin_loss(self, target, p, margin, weight, reduction));
     return out;
 }
 
 Tensor& out_wrap_smooth_l1_loss_out(const Tensor& self, const Tensor& target, int64_t reduction, double beta, Tensor& out) {
-    out = ops::smooth_l1_loss(self, target, reduction, beta);
+    write_out(out, ops::smooth_l1_loss(self, target, reduction, beta));
     return out;
 }
 
 Tensor& out_wrap_huber_loss_out(const Tensor& self, const Tensor& target, int64_t reduction, double delta, Tensor& out) {
-    out = ops::huber_loss(self, target, reduction, delta);
+    write_out(out, ops::huber_loss(self, target, reduction, delta));
     return out;
 }
 
 Tensor& out_wrap_elu_out(const Tensor& self, Scalar alpha, Scalar scale, Scalar input_scale, Tensor& out) {
-    out = ops::elu(self, alpha, scale, input_scale);
+    write_out(out, ops::elu(self, alpha, scale, input_scale));
     return out;
 }
 
 Tensor& out_wrap_glu_out(const Tensor& self, int64_t dim, Tensor& out) {
-    out = ops::glu(self, dim);
+    write_out(out, ops::glu(self, dim));
     return out;
 }
 
 Tensor& out_wrap_hardtanh_out(const Tensor& self, Scalar min_val, Scalar max_val, Tensor& out) {
-    out = ops::hardtanh(self, min_val, max_val);
+    write_out(out, ops::hardtanh(self, min_val, max_val));
     return out;
 }
 
 Tensor& out_wrap_leaky_relu_out(const Tensor& self, Scalar negative_slope, Tensor& out) {
-    out = ops::leaky_relu(self, negative_slope);
+    write_out(out, ops::leaky_relu(self, negative_slope));
     return out;
 }
 
 Tensor& out_wrap_softplus_out(const Tensor& self, Scalar beta, Scalar threshold, Tensor& out) {
-    out = ops::softplus(self, beta, threshold);
+    write_out(out, ops::softplus(self, beta, threshold));
     return out;
 }
 
 Tensor& out_wrap_softshrink_out(const Tensor& self, Scalar lambd, Tensor& out) {
-    out = ops::softshrink(self, lambd);
+    write_out(out, ops::softshrink(self, lambd));
     return out;
 }
 
 Tensor& out_wrap_avg_pool2d_out(const Tensor& self, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, bool ceil_mode, bool count_include_pad, std::optional<int64_t> divisor_override, Tensor& out) {
-    out = ops::avg_pool2d(self, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override);
+    write_out(out, ops::avg_pool2d(self, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override));
     return out;
 }
 
 Tensor& out_wrap_avg_pool3d_out(const Tensor& self, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, bool ceil_mode, bool count_include_pad, std::optional<int64_t> divisor_override, Tensor& out) {
-    out = ops::avg_pool3d(self, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override);
+    write_out(out, ops::avg_pool3d(self, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override));
     return out;
 }
 
 Tensor& out_wrap_isposinf_out(const Tensor& self, Tensor& out) {
-    out = ops::isposinf(self);
+    write_out(out, ops::isposinf(self));
     return out;
 }
 
 Tensor& out_wrap_isneginf_out(const Tensor& self, Tensor& out) {
-    out = ops::isneginf(self);
+    write_out(out, ops::isneginf(self));
     return out;
 }
 
 Tensor& out_wrap_linalg_cholesky_out(const Tensor& self, bool upper, Tensor& out) {
-    out = ops::linalg_cholesky(self, upper);
+    write_out(out, ops::linalg_cholesky(self, upper));
     return out;
 }
 
 Tensor& out_wrap_linalg_cross_out(const Tensor& self, const Tensor& other, int64_t dim, Tensor& out) {
-    out = ops::linalg_cross(self, other, dim);
+    write_out(out, ops::linalg_cross(self, other, dim));
     return out;
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_linalg_lu_factor_out(const Tensor& A, bool pivot, Tensor& LU, Tensor& pivots) {
+std::tuple<Tensor, Tensor> out_wrap_linalg_lu_factor_out(const Tensor& A, bool pivot, Tensor& LU, Tensor& pivots) {
     auto __tp_result = ops::linalg_lu_factor(A, pivot);
-    LU = std::get<0>(__tp_result);
-    pivots = std::get<1>(__tp_result);
+    write_out(LU, std::get<0>(__tp_result));
+    write_out(pivots, std::get<1>(__tp_result));
     return { LU, pivots };
 }
 
-std::tuple<Tensor&, Tensor&, Tensor&> out_wrap_linalg_lu_out(const Tensor& A, bool pivot, Tensor& P, Tensor& L, Tensor& U) {
+std::tuple<Tensor, Tensor, Tensor> out_wrap_linalg_lu_out(const Tensor& A, bool pivot, Tensor& P, Tensor& L, Tensor& U) {
     auto __tp_result = ops::linalg_lu(A, pivot);
-    P = std::get<0>(__tp_result);
-    L = std::get<1>(__tp_result);
-    U = std::get<2>(__tp_result);
+    write_out(P, std::get<0>(__tp_result));
+    write_out(L, std::get<1>(__tp_result));
+    write_out(U, std::get<2>(__tp_result));
     return { P, L, U };
 }
 
 Tensor& out_wrap_linalg_det_out(const Tensor& A, Tensor& out) {
-    out = ops::linalg_det(A);
+    write_out(out, ops::linalg_det(A));
     return out;
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_linalg_ldl_factor_out(const Tensor& self, bool hermitian, Tensor& LD, Tensor& pivots) {
+std::tuple<Tensor, Tensor> out_wrap_linalg_ldl_factor_out(const Tensor& self, bool hermitian, Tensor& LD, Tensor& pivots) {
     auto __tp_result = ops::linalg_ldl_factor(self, hermitian);
-    LD = std::get<0>(__tp_result);
-    pivots = std::get<1>(__tp_result);
+    write_out(LD, std::get<0>(__tp_result));
+    write_out(pivots, std::get<1>(__tp_result));
     return { LD, pivots };
 }
 
-std::tuple<Tensor&, Tensor&, Tensor&, Tensor&> out_wrap_linalg_lstsq_out(const Tensor& self, const Tensor& b, std::optional<double> rcond, std::optional<std::string> driver, Tensor& solution, Tensor& residuals, Tensor& rank, Tensor& singular_values) {
+std::tuple<Tensor, Tensor, Tensor, Tensor> out_wrap_linalg_lstsq_out(const Tensor& self, const Tensor& b, std::optional<double> rcond, std::optional<std::string> driver, Tensor& solution, Tensor& residuals, Tensor& rank, Tensor& singular_values) {
     auto __tp_result = ops::linalg_lstsq(self, b, rcond, driver);
-    solution = std::get<0>(__tp_result);
-    residuals = std::get<1>(__tp_result);
-    rank = std::get<2>(__tp_result);
-    singular_values = std::get<3>(__tp_result);
+    write_out(solution, std::get<0>(__tp_result));
+    write_out(residuals, std::get<1>(__tp_result));
+    write_out(rank, std::get<2>(__tp_result));
+    write_out(singular_values, std::get<3>(__tp_result));
     return { solution, residuals, rank, singular_values };
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_linalg_slogdet_out(const Tensor& A, Tensor& sign, Tensor& logabsdet) {
+std::tuple<Tensor, Tensor> out_wrap_linalg_slogdet_out(const Tensor& A, Tensor& sign, Tensor& logabsdet) {
     auto __tp_result = ops::linalg_slogdet(A);
-    sign = std::get<0>(__tp_result);
-    logabsdet = std::get<1>(__tp_result);
+    write_out(sign, std::get<0>(__tp_result));
+    write_out(logabsdet, std::get<1>(__tp_result));
     return { sign, logabsdet };
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_linalg_eig_out(const Tensor& self, Tensor& eigenvalues, Tensor& eigenvectors) {
+std::tuple<Tensor, Tensor> out_wrap_linalg_eig_out(const Tensor& self, Tensor& eigenvalues, Tensor& eigenvectors) {
     auto __tp_result = ops::linalg_eig(self);
-    eigenvalues = std::get<0>(__tp_result);
-    eigenvectors = std::get<1>(__tp_result);
+    write_out(eigenvalues, std::get<0>(__tp_result));
+    write_out(eigenvectors, std::get<1>(__tp_result));
     return { eigenvalues, eigenvectors };
 }
 
 Tensor& out_wrap_linalg_eigvals_out(const Tensor& self, Tensor& out) {
-    out = ops::linalg_eigvals(self);
+    write_out(out, ops::linalg_eigvals(self));
     return out;
 }
 
 Tensor& out_wrap_linalg_eigvalsh_out(const Tensor& self, std::string UPLO, Tensor& out) {
-    out = ops::linalg_eigvalsh(self, UPLO);
+    write_out(out, ops::linalg_eigvalsh(self, UPLO));
     return out;
 }
 
 Tensor& out_wrap_linalg_inv_out(const Tensor& A, Tensor& out) {
-    out = ops::linalg_inv(A);
+    write_out(out, ops::linalg_inv(A));
     return out;
 }
 
 Tensor& out_wrap_inner_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = ops::inner(self, other);
+    write_out(out, ops::inner(self, other));
     return out;
 }
 
 Tensor& out_wrap_outer_out(const Tensor& self, const Tensor& vec2, Tensor& out) {
-    out = ops::outer(self, vec2);
+    write_out(out, ops::outer(self, vec2));
     return out;
 }
 
 Tensor& out_wrap_ger_out(const Tensor& self, const Tensor& vec2, Tensor& out) {
-    out = ops::ger(self, vec2);
+    write_out(out, ops::ger(self, vec2));
     return out;
 }
 
 Tensor& out_wrap_linalg_svdvals_out(const Tensor& A, std::optional<std::string> driver, Tensor& out) {
-    out = ops::linalg_svdvals(A, driver);
+    write_out(out, ops::linalg_svdvals(A, driver));
     return out;
 }
 
 Tensor& out_wrap_linalg_solve_out(const Tensor& A, const Tensor& B, bool left, Tensor& out) {
-    out = ops::linalg_solve(A, B, left);
+    write_out(out, ops::linalg_solve(A, B, left));
     return out;
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_linalg_qr_out(const Tensor& A, std::string mode, Tensor& Q, Tensor& R) {
+std::tuple<Tensor, Tensor> out_wrap_linalg_qr_out(const Tensor& A, std::string mode, Tensor& Q, Tensor& R) {
     auto __tp_result = ops::linalg_qr(A, mode);
-    Q = std::get<0>(__tp_result);
-    R = std::get<1>(__tp_result);
+    write_out(Q, std::get<0>(__tp_result));
+    write_out(R, std::get<1>(__tp_result));
     return { Q, R };
 }
 

@@ -664,14 +664,22 @@ std::tuple<Tensor, Tensor> linalg_inv_ex_kernel_cuda(const Tensor& A,
     Tensor identity = Tensor::empty(A.shape(), A.dtype(), A.device());
     run_real(A.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
-        std::vector<T> eye_host(static_cast<size_t>(ms), T(0));
-        for (int64_t i = 0; i < n; ++i)
-            eye_host[static_cast<size_t>(i * n + i)] = T(1);
-        for (int64_t b = 1; b < bs; ++b)
-            std::copy(eye_host.begin(), eye_host.end(),
-                      eye_host.begin() + b * ms);
-        cudaMemcpyAsync(identity.data_ptr(), eye_host.data(), sizeof(T) * ms * bs,
-                        cudaMemcpyHostToDevice, getCurrentCUDAStream().stream());
+        // The staging buffer carries one identity per batch member, which is
+        // exactly what the upload below reads.
+        std::vector<T> eye_host(
+            static_cast<size_t>(ms) * static_cast<size_t>(bs), T(0));
+        for (int64_t b = 0; b < bs; ++b) {
+            T* plane = eye_host.data() + static_cast<size_t>(b * ms);
+            for (int64_t i = 0; i < n; ++i)
+                plane[static_cast<size_t>(i * n + i)] = T(1);
+        }
+        const auto stream = getCurrentCUDAStream().stream();
+        cudaMemcpyAsync(identity.data_ptr(), eye_host.data(),
+                        sizeof(T) * static_cast<size_t>(ms) * static_cast<size_t>(bs),
+                        cudaMemcpyHostToDevice, stream);
+        // The staging vector dies with this scope, so the upload has to be
+        // complete before it is released.
+        cudaStreamSynchronize(stream);
     });
     auto [inv, info] = linalg_solve_ex_kernel_cuda(A, identity, true, false);
     if (check_errors) check_infos(info, "linalg.inv_ex", A.dim() == 2);
