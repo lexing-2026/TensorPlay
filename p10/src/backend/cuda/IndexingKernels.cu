@@ -2651,17 +2651,12 @@ Tensor take_cuda(const Tensor& self, const Tensor& index) {
 // ---------------------------------------------------------------------------
 
 template <typename T>
-__global__ void masked_scatter_kernel(int64_t n, const bool* mask,
-                                      const int64_t* source_offsets,
-                                      int64_t source_size, const T* source,
-                                      T* result) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) {
-        if (mask[i] && source_offsets[i] < source_size) {
-            result[i] = source[source_offsets[i]];
-        }
-    }
+inline void run_masked_scatter_iter(TensorIteratorBase& iter,
+                                    const T* source) {
+    gpu_kernel(iter, [source] __device__(
+        T self_value, bool mask_value, int64_t source_offset) -> T {
+        return mask_value ? source[source_offset] : self_value;
+    });
 }
 
 __global__ void masked_scatter_size_check(
@@ -2679,33 +2674,91 @@ Tensor masked_scatter_cuda(const Tensor& self, const Tensor& mask, const Tensor&
         TP_THROW(TypeError,
                  "masked_scatter: self and source must have the same dtype");
     }
+    if (mask.dtype() != DType::Bool) {
+        TP_THROW(TypeError, "masked_scatter: mask must be bool");
+    }
     if (mask.device() != self.device() || source.device() != self.device()) {
         TP_THROW(DeviceMismatchError,
                  "masked_scatter: self, mask, and source must be on the same device");
     }
-    Tensor m_full = mask.to(DType::Bool).expand(
-        static_cast<std::vector<int64_t>>(self.shape())).contiguous();
+
+    Tensor self_iter = self.dim() == 0 ? self.unsqueeze(0) : self;
+    Tensor mask_temp = mask.dim() == 0 ? mask.unsqueeze(0) : mask;
+    Tensor m_full = mask_temp.expand(
+        static_cast<std::vector<int64_t>>(self_iter.shape())).contiguous();
     Tensor src = source.contiguous();
     Tensor result = ::tensorplay::detail::contiguous_clone(self);
-    int64_t n = result.numel();
+    Tensor result_iter = result.dim() == 0 ? result.unsqueeze(0) : result;
+    const int64_t n = result_iter.numel();
     if (n == 0) return result;
-    Tensor mask_int = m_full.reshape({n}).to(DType::Int64);
-    Tensor source_offsets = mask_int.cumsum(0).sub(mask_int);
-    int64_t src_n = src.numel();
-    auto stream = getCurrentCUDAStream().stream();
+
+    TP_CHECK(n <= static_cast<int64_t>(std::numeric_limits<int>::max()),
+             "masked_scatter: input is too large for device scan");
+    Tensor mask_flat = m_full.reshape({n});
+    Tensor flags = Tensor::empty({n}, DType::Int64, self.device());
+    Tensor source_offsets = Tensor::empty({n}, DType::Int64, self.device());
+    TensorIterator flag_iter = TensorIteratorConfig()
+        .resize_outputs(false)
+        .check_all_same_dtype(false)
+        .add_output(flags)
+        .add_const_input(mask_flat)
+        .build();
+    gpu_kernel(flag_iter, [] __device__(bool value) -> int64_t {
+        return value ? int64_t(1) : int64_t(0);
+    });
+
+    const cudaStream_t stream = getCurrentCUDAStream().stream();
+    size_t scan_bytes = 0;
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        nullptr, scan_bytes, flags.data_ptr<int64_t>(),
+        source_offsets.data_ptr<int64_t>(), static_cast<int>(n), stream));
+    Tensor scan_storage = Tensor::empty(
+        {static_cast<int64_t>(scan_bytes == 0 ? 1 : scan_bytes)},
+        DType::UInt8, self.device());
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        scan_storage.data_ptr(), scan_bytes, flags.data_ptr<int64_t>(),
+        source_offsets.data_ptr<int64_t>(), static_cast<int>(n), stream));
+
     masked_scatter_size_check<<<1, 1, 0, stream>>>(
         source_offsets.data_ptr<int64_t>(), m_full.data_ptr<bool>(), n - 1,
-        src_n);
+        src.numel());
     CUDA_CHECK(cudaGetLastError());
+
+    Tensor source_offsets_view = source_offsets.reshape(
+        static_cast<std::vector<int64_t>>(result_iter.shape()));
+    TensorIterator iter = TensorIteratorConfig()
+        .set_check_mem_overlap(false)
+        .check_all_same_dtype(false)
+        .resize_outputs(false)
+        .add_output(result_iter)
+        .add_input(result_iter)
+        .add_const_input(m_full)
+        .add_input(source_offsets_view)
+        .build();
+
 #define TP_MS_CASE(ctype, name) \
     case DType::name: \
-        masked_scatter_kernel<ctype><<< \
-            (n + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            n, m_full.data_ptr<bool>(), source_offsets.data_ptr<int64_t>(), \
-            src_n, src.data_ptr<ctype>(), result.data_ptr<ctype>()); \
+        run_masked_scatter_iter<ctype>(iter, src.data_ptr<ctype>()); \
         break;
     switch (result.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_MS_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(TP_MS_CASE)
+        case DType::ComplexHalf:
+            run_masked_scatter_iter<tensorplay::complex<Half>>(
+                iter, static_cast<const tensorplay::complex<Half>*>(src.data_ptr()));
+            break;
+        case DType::ComplexFloat:
+            run_masked_scatter_iter<tensorplay::complex<float>>(
+                iter, static_cast<const tensorplay::complex<float>*>(src.data_ptr()));
+            break;
+        case DType::ComplexDouble:
+            run_masked_scatter_iter<tensorplay::complex<double>>(
+                iter, static_cast<const tensorplay::complex<double>*>(src.data_ptr()));
+            break;
+        case DType::BComplex32:
+            run_masked_scatter_iter<tensorplay::complex<BFloat16>>(
+                iter, static_cast<const tensorplay::complex<BFloat16>*>(src.data_ptr()));
+            break;
         default: TP_THROW(TypeError, "masked_scatter: unsupported dtype");
     }
 #undef TP_MS_CASE
