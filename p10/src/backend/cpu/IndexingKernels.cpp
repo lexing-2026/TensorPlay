@@ -1682,6 +1682,60 @@ std::tuple<Tensor, Tensor, Tensor> unique_flat_cpu_template(
     return {values, inverse, counts};
 }
 
+std::tuple<Tensor, Tensor, Tensor> unique_bool_cpu_template(
+        const Tensor& self, bool return_inverse, bool return_counts) {
+    Tensor input = self.dim() == 0 ? self.reshape({1}).contiguous()
+                                   : self.contiguous();
+    const int64_t numel = input.numel();
+    Tensor values = Tensor::empty({0}, self.dtype(), self.device());
+    Tensor inverse = Tensor::empty({0}, DType::Int64, self.device());
+    Tensor counts = Tensor::empty({0}, DType::Int64, self.device());
+    if (numel == 0) {
+        if (return_inverse) {
+            inverse.resize_(static_cast<std::vector<int64_t>>(self.shape()));
+        }
+        return {values, inverse, counts};
+    }
+
+    const bool* input_data = input.data_ptr<bool>();
+    const int thread_count = get_num_threads();
+    std::vector<int64_t> true_counts(static_cast<size_t>(thread_count), 0);
+    parallel_for(0, numel, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        int64_t& count = true_counts[static_cast<size_t>(get_thread_num())];
+        for (int64_t i = begin; i < end; ++i) {
+            count += input_data[i] ? 1 : 0;
+        }
+    });
+
+    int64_t num_true = 0;
+    for (int64_t count : true_counts) num_true += count;
+    const int64_t num_false = numel - num_true;
+    const int64_t num_values = (num_false > 0) + (num_true > 0);
+    values.resize_({num_values});
+    bool* value_data = values.data_ptr<bool>();
+    const int64_t false_index = 0;
+    const int64_t true_index = num_false > 0 ? 1 : 0;
+    if (num_false > 0) value_data[false_index] = false;
+    if (num_true > 0) value_data[true_index] = true;
+
+    if (return_counts) {
+        counts.resize_({num_values});
+        int64_t* count_data = counts.data_ptr<int64_t>();
+        if (num_false > 0) count_data[false_index] = num_false;
+        if (num_true > 0) count_data[true_index] = num_true;
+    }
+    if (return_inverse) {
+        inverse.resize_(static_cast<std::vector<int64_t>>(self.shape()));
+        int64_t* inverse_data = inverse.data_ptr<int64_t>();
+        parallel_for(0, numel, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            for (int64_t i = begin; i < end; ++i) {
+                inverse_data[i] = input_data[i] ? true_index : false_index;
+            }
+        });
+    }
+    return {values, inverse, counts};
+}
+
 // Row-wise grouping over `self.moveaxis(dim, 0).view({n, -1})`: rows are
 // sorted lexicographically (unless `consecutive`, which keeps the original
 // order) and adjacent equal rows collapse into one output row.
@@ -1797,6 +1851,9 @@ std::tuple<Tensor, Tensor, Tensor> unique_any_cpu(const Tensor& self,
                                                   int64_t dim, bool consecutive,
                                                   bool return_inverse,
                                                   bool return_counts) {
+    if (dim < 0 && self.dtype() == DType::Bool) {
+        return unique_bool_cpu_template(self, return_inverse, return_counts);
+    }
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_UNIQUE_CASE)
         default: TP_THROW(TypeError, "unique: unsupported dtype ",
