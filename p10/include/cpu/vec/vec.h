@@ -18,6 +18,10 @@
 #elif defined(CPU_CAPABILITY_SVE256) || defined(CPU_CAPABILITY_SVE128)
 // aarch64 SVE tiers: single fixed-length vector per value.
 #include "cpu/vec/sve/vec_sve.h"
+#elif defined(__aarch64__) && !defined(__arm__)
+// aarch64 desktop default (plain Linux distributions, macOS arm64): 128-bit
+// NEON backends. aarch32 keeps the generic fallback.
+#include "cpu/vec/vec128/vec128_neon.h"
 #else
 // x86 DEFAULT / bare -mavx2 builds and the generic fallback path.
 #include "cpu/vec/vec128/vec128.h"
