@@ -45,7 +45,7 @@ Tensor sum_dim_kernel(const Tensor& self, std::vector<int64_t> dims, bool keepdi
 Tensor mean_kernel(const Tensor& self, DType dtype) {
     DType out_dtype = (dtype == DType::Undefined) ? (isFloatingOrComplexType(self.dtype()) ? self.dtype() : DType::Float32) : dtype;
     Tensor s = sum_kernel(self, out_dtype);
-    return s / Scalar((float)self.numel());
+    return s / Scalar(self.numel());
 }
 
 Tensor mean_dim_kernel(const Tensor& self, std::vector<int64_t> dims, bool keepdim, DType dtype) {
@@ -59,7 +59,7 @@ Tensor mean_dim_kernel(const Tensor& self, std::vector<int64_t> dims, bool keepd
         count *= shape[d];
     }
 
-    return s / Scalar((float)count);
+    return s / Scalar(count);
 }
 
 // Autograd helper for mean.dim.  The forward reduction already returns a
@@ -191,9 +191,9 @@ Tensor std_dim_kernel(const Tensor& self, std::vector<int64_t> dim, int64_t corr
 }
 
 Tensor norm_kernel(const Tensor& self, double p) {
-    if (p == 2.0 &&
-        (self.dtype() == DType::Float32 || self.dtype() == DType::Float64 ||
-         self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16)) {
+    if (self.dtype() == DType::Float32 || self.dtype() == DType::Float64 ||
+        self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16 ||
+        isComplexType(self.dtype())) {
         return norm_stub(DeviceType::CPU, self, p);
     }
     if (std::isinf(p)) {
@@ -204,9 +204,9 @@ Tensor norm_kernel(const Tensor& self, double p) {
 }
 
 Tensor norm_dim_kernel(const Tensor& self, std::vector<int64_t> dim, double p, bool keepdim) {
-    if (p == 2.0 &&
-        (self.dtype() == DType::Float32 || self.dtype() == DType::Float64 ||
-         self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16)) {
+    if (self.dtype() == DType::Float32 || self.dtype() == DType::Float64 ||
+        self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16 ||
+        isComplexType(self.dtype())) {
         return norm_dim_stub(DeviceType::CPU, self, dim, p, keepdim);
     }
     if (std::isinf(p)) {

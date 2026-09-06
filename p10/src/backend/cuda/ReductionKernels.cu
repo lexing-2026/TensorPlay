@@ -939,10 +939,8 @@ Tensor norm2_global_fast_typed(const Tensor& self) {
 
 Tensor norm_global_kernel(const Tensor& self, double p) {
     if (isComplexType(self.dtype())) {
-        // the real counterpart so the float path below handles the reduction.
         Tensor areal = self.abs();
-        if (std::isinf(p)) return p > 0 ? areal.max() : areal.min();
-        return areal.pow(Scalar(p)).sum().pow(Scalar(1.0 / p));
+        return norm_global_kernel(areal, p);
     }
     // A transpose of a contiguous 2-D tensor is logically non-contiguous but
     // still occupies one dense storage span.  Since a global norm is
@@ -973,11 +971,7 @@ Tensor norm_global_kernel(const Tensor& self, double p) {
 Tensor norm_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, double p, bool keepdim) {
     if (isComplexType(self.dtype())) {
         Tensor areal = self.abs();
-        if (std::isinf(p)) {
-            if (p > 0) return Tensor::amax(areal, dim, keepdim);
-            return Tensor::amin(areal, dim, keepdim);
-        }
-        return areal.pow(Scalar(p)).sum(dim, keepdim).pow(Scalar(1.0 / p));
+        return norm_dim_kernel(areal, dim, p, keepdim);
     }
     const ReductionSpec spec = make_reduction_spec(self, dim);
     TP_DISPATCH_FLOAT_REDUCTION(norm_same_dtype, self.dtype(), self, spec, keepdim, p);
