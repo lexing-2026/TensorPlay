@@ -8,6 +8,7 @@
 #include "TypePromotion.h"
 #include "CUDARuntime.h"
 #include "SortingRadixSelect.cuh"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <cuda_runtime.h>
 
@@ -22,6 +23,8 @@
 
 namespace tensorplay {
 namespace cuda {
+
+namespace ops = tensorplay::tpx::ops;
 
 extern std::tuple<Tensor, Tensor> sort_cuda(const Tensor& self, int64_t dim,
                                             bool descending);
@@ -272,31 +275,6 @@ void launch_cummaxmin_innermost(const Tensor& input, Tensor& values, Tensor& ind
         default: TP_THROW(TypeError, "cumulative extremum: unsupported dtype");
     }
 #undef TP_CUM_INNER_CASE
-}
-
-template <typename T>
-__global__ void renorm_slice_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
-                                    const T* in, T* out, double p, double maxnorm) {
-    int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; si < n_slices; si += stride) {
-        int64_t o = si / inner, in2 = si % inner;
-        const T* sp = in + o * d_size * inner + in2;
-        T* dp = out + o * d_size * inner + in2;
-        double norm = 0;
-        if (p == std::numeric_limits<double>::infinity()) {
-            for (int64_t j = 0; j < d_size; ++j)
-                norm = ::fmax(norm, ::fabs(static_cast<double>(sp[j * inner])));
-        } else {
-            double s2 = 0;
-            for (int64_t j = 0; j < d_size; ++j)
-                s2 += ::pow(::fabs(static_cast<double>(sp[j * inner])), p);
-            norm = ::pow(s2, 1.0 / p);
-        }
-        double factor = norm > maxnorm ? maxnorm / norm : 1.0;
-        for (int64_t j = 0; j < d_size; ++j)
-            dp[j * inner] = static_cast<T>(static_cast<double>(sp[j * inner]) * factor);
-    }
 }
 
 // ===========================================================================
@@ -1102,31 +1080,42 @@ std::tuple<Tensor, Tensor> median_dim_cuda(const Tensor& self, int64_t dim,
 }
 
 Tensor renorm_cuda(const Tensor& self, Scalar p, int64_t dim, Scalar maxnorm) {
-    int64_t nd = self.dim();
-    dim = wrap_dim(dim, nd);
-    Tensor sc = self.contiguous();
-    Tensor out = Tensor::empty(shape_of(sc), sc.dtype(), sc.device());
-    int64_t d_size = sc.size(dim);
-    int64_t outer = 1, inner = 1;
-    outer_inner(shape_of(sc), dim, outer, inner);
-    int64_t slices = outer * inner;
-    if (slices > 0 && d_size > 0) {
-        auto stream = getCurrentCUDAStream().stream();
-        dim3 grid = make_grid(slices), block(kThreads);
-        double pd = p.toDouble(), mn = maxnorm.toDouble();
-#define TP_REN(ctype, name_) \
-    case DType::name_: \
-        renorm_slice_kernel<ctype><<<grid, block, 0, stream>>>( \
-            slices, d_size, inner, sc.data_ptr<ctype>(), out.data_ptr<ctype>(), pd, mn); \
-        break;
-        switch (sc.dtype()) {
-            TENSORPLAY_FORALL_SCALAR_TYPES(TP_REN)
-            default: TP_THROW(TypeError, "renorm: unsupported dtype");
-        }
-#undef TP_REN
-        CUDA_CHECK(cudaGetLastError());
+    if (p.isComplex()) {
+        TP_THROW(TypeError, "renorm: p must be real-valued");
     }
-    return out;
+    const double pd = p.toDouble();
+    if (!(pd > 0.0)) {
+        TP_THROW(ValueError, "renorm: norm order must be positive");
+    }
+    if (maxnorm.isComplex()) {
+        TP_THROW(TypeError, "renorm: maxnorm must be real-valued");
+    }
+    const double max_norm = maxnorm.toDouble();
+    if (!(max_norm >= 0.0)) {
+        TP_THROW(ValueError, "renorm: maxnorm must be non-negative");
+    }
+    if (!isFloatingOrComplexType(self.dtype())) {
+        TP_THROW(TypeError, "renorm: input must have a floating or complex dtype");
+    }
+    int64_t nd = self.dim();
+    if (nd <= 1) {
+        TP_THROW(RuntimeError, "renorm: input must have at least 2 dimensions");
+    }
+    dim = wrap_dim(dim, nd);
+    std::vector<int64_t> reduce_dims;
+    reduce_dims.reserve(static_cast<size_t>(nd - 1));
+    for (int64_t axis = 0; axis < nd; ++axis) {
+        if (axis != dim) reduce_dims.push_back(axis);
+    }
+    Tensor norms = ops::norm(self, reduce_dims, pd, true);
+    Tensor factors = ops::where(
+        ops::gt(norms, Scalar(max_norm)),
+        ops::div(
+            Tensor::full_like(norms, Scalar(max_norm), norms.dtype(), norms.device()),
+            ops::add(norms, Scalar(1e-7))),
+        Scalar(1.0));
+    Tensor result = ops::mul(self, factors);
+    return result.dtype() == self.dtype() ? result : result.to(self.dtype());
 }
 
 std::tuple<Tensor, Tensor> interop_kthvalue_values_cuda(const Tensor& self, int64_t k, int64_t dim, bool keepdim,
