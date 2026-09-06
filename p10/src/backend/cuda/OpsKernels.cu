@@ -1362,7 +1362,7 @@ Tensor nanmean_cuda(const Tensor& self, std::optional<int64_t> dim_opt, bool kee
     Tensor total = nansum_cuda2(x, dims, keepdim);
     Tensor valid = isnan_cuda(x).logical_not();
     Tensor count = sum_dim_kernel(valid.to(DType::Float32), dims, keepdim, DType::Float32);
-    Tensor quot = total.to(DType::Float32).div(count);
+    Tensor quot = total.div(count);
     Tensor zero = count.eq(Scalar(0.0f));
     Tensor result = quot.masked_fill(zero, Scalar(std::numeric_limits<double>::quiet_NaN()));
     return result.to(acc_dt != DType::Undefined ? acc_dt : total.dtype());

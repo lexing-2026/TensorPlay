@@ -790,7 +790,7 @@ Tensor nanmean_cpu(const Tensor& self, std::optional<int64_t> dim_opt,
         [](double acc, double value) { return acc + value; },
         [](double acc) { return acc; });
     Tensor zero = count.eq(Scalar(0.0));
-    Tensor quot = total.to(DType::Float32).div(count);
+    Tensor quot = total.div(count);
     return quot.masked_fill(
         zero, Scalar(std::numeric_limits<double>::quiet_NaN()))
         .to(acc_dt != DType::Undefined
