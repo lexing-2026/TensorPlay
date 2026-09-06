@@ -1028,42 +1028,27 @@ Tensor comparison_op_kernel(const Tensor& self, const Tensor& other, Functor fun
         static_cast<std::vector<int64_t>>(other.shape()));
     DType common_dtype = promoteTypes(self.dtype(), other.dtype());
     Tensor result = Tensor::empty(out_shape, DType::Bool, self.device());
-    int64_t n = result.numel();
-    if (n == 0) return result;
-
-    dim3 block(256);
-    dim3 grid((n + 255) / 256);
-
     Tensor a = (self.dtype() == common_dtype) ? self : self.to(common_dtype);
     Tensor b = (other.dtype() == common_dtype) ? other : other.to(common_dtype);
-    Tensor a_c = a.contiguous();
-    Tensor b_c = b.contiguous();
+    if (result.numel() == 0) return result;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(false)
+        .add_output(result)
+        .add_input(a)
+        .add_input(b)
+        .build();
 
     #define COMP_CASE(ctype, name) \
-    case DType::name: { \
-        bool same_shape = (a_c.dim() == static_cast<int64_t>(out_shape.size())) && \
-                          (b_c.dim() == static_cast<int64_t>(out_shape.size())); \
-        if (same_shape) { \
-            for (int64_t d = 0; d < static_cast<int64_t>(out_shape.size()); ++d) { \
-                if (a_c.size(d) != out_shape[d] || b_c.size(d) != out_shape[d]) { same_shape = false; break; } \
-            } \
-        } \
-        if (same_shape) { \
-            comparison_kernel_cuda_impl<ctype><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a_c.data_ptr<ctype>(), b_c.data_ptr<ctype>(), result.data_ptr<bool>(), functor); \
-        } else { \
-            TensorDesc a_desc = make_desc(a_c, out_shape.size()); \
-            TensorDesc b_desc = make_desc(b_c, out_shape.size()); \
-            TensorDesc y_desc = make_desc_from_shape(out_shape); \
-            comparison_broadcast_kernel_cuda_impl<ctype><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a_c.data_ptr<ctype>(), a_desc, b_c.data_ptr<ctype>(), b_desc, result.data_ptr<bool>(), y_desc, functor); \
-        } \
-        break; \
-    }
+    case DType::name: \
+        gpu_kernel(iter, [functor] __device__(ctype lhs, ctype rhs) -> bool { \
+            return functor(lhs, rhs); \
+        }); \
+        break;
     switch (common_dtype) {
         TENSORPLAY_FORALL_SCALAR_TYPES(COMP_CASE)
         default: TP_THROW(TypeError, "CUDA comparison: Unsupported dtype");
     }
     #undef COMP_CASE
-    CUDA_CHECK(cudaGetLastError());
     return result;
 }
 
@@ -1071,16 +1056,20 @@ template<typename Functor>
 Tensor comparison_scalar_op_kernel(const Tensor& self, Scalar other, Functor functor) {
     DType common = result_type_with_scalar_cuda(self, other);
     Tensor in = (self.dtype() == common) ? self : self.to(common);
-    Scalar o = other;
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(in.shape()), DType::Bool, self.device());
-    int64_t n = in.numel();
-    if (n == 0) return result;
-    dim3 block(256);
-    dim3 grid((n + 255) / 256);
+    if (in.numel() == 0) return result;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(false)
+        .add_output(result)
+        .add_input(in)
+        .build();
 
     #define COMP_SCALAR_CASE(ctype, name) \
     case DType::name: { \
-        comparison_scalar_kernel_cuda_impl<ctype><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, in.data_ptr<ctype>(), o.to<ctype>(), result.data_ptr<bool>(), functor); \
+        const ctype rhs = other.to<ctype>(); \
+        gpu_kernel(iter, [functor, rhs] __device__(ctype lhs) -> bool { \
+            return functor(lhs, rhs); \
+        }); \
         break; \
     }
     switch (common) {
@@ -1088,7 +1077,6 @@ Tensor comparison_scalar_op_kernel(const Tensor& self, Scalar other, Functor fun
         default: TP_THROW(TypeError, "CUDA comparison: Unsupported dtype");
     }
     #undef COMP_SCALAR_CASE
-    CUDA_CHECK(cudaGetLastError());
     return result;
 }
 
