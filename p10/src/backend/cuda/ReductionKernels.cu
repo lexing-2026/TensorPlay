@@ -564,6 +564,18 @@ Tensor sum_kernel(const Tensor& self, DType dtype) {
     return sum_dim_kernel(self, {}, false, dtype);
 }
 
+Tensor amax_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim,
+                       bool keepdim) {
+    const ReductionSpec spec = make_reduction_spec(self, dim);
+    TP_DISPATCH_REDUCTION(max_same_dtype, self.dtype(), self, spec, keepdim);
+}
+
+Tensor amin_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim,
+                       bool keepdim) {
+    const ReductionSpec spec = make_reduction_spec(self, dim);
+    TP_DISPATCH_REDUCTION(min_same_dtype, self.dtype(), self, spec, keepdim);
+}
+
 Tensor nansum_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim,
                          bool keepdim, DType dtype) {
     DType out_dtype = dtype;
