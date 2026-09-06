@@ -72,6 +72,19 @@ function(_tp_add_vendored_sleef)
     set(SLEEF_ENABLE_OPENMP OFF CACHE BOOL "" FORCE)
     set(SLEEF_ENABLE_LTO OFF CACHE BOOL "" FORCE)
     set(SLEEF_SHOW_CONFIG OFF CACHE BOOL "" FORCE)
+    # Per-target SIMD variants: the vec backends of the compute library call
+    # the SLEEF entry points compiled for the matching ISA (VSX on PowerPC,
+    # VXE on s390x, SVE on aarch64), so each architecture must request its
+    # variant here in addition to the host-detected x86 set.
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(powerpc|ppc)64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "^(powerpc|ppc)")
+        set(SLEEF_ENABLE_VSX ON CACHE BOOL "" FORCE)
+        set(SLEEF_ENABLE_VSX3 ON CACHE BOOL "" FORCE)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "s390x")
+        set(SLEEF_ENABLE_VXE ON CACHE BOOL "" FORCE)
+        set(SLEEF_ENABLE_VXE2 ON CACHE BOOL "" FORCE)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64" AND NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        set(SLEEF_ENABLE_SVE ON CACHE BOOL "" FORCE)
+    endif()
     add_subdirectory(
         "${CMAKE_CURRENT_LIST_DIR}/../../third_party/sleef"
         "${CMAKE_BINARY_DIR}/third_party/sleef")
