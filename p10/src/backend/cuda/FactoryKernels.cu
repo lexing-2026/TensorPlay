@@ -9,7 +9,6 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
-#include <complex>
 #include <vector>
 
 namespace tensorplay {
@@ -58,31 +57,27 @@ Tensor& fill_kernel(Tensor& self, Scalar value) {
         TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
         // Complex storage dtypes are not part of the real-type macro.
         case DType::ComplexFloat: {
-            std::complex<float> val = value.to<std::complex<float>>();
-            fill_kernel_cuda_impl<std::complex<float>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-                n, self.data_ptr<std::complex<float>>(), val);
+            tensorplay::complex<float> val = value.to<tensorplay::complex<float>>();
+            fill_kernel_cuda_impl<tensorplay::complex<float>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                n, static_cast<tensorplay::complex<float>*>(self.data_ptr()), val);
             break;
         }
         case DType::ComplexDouble: {
-            std::complex<double> val = value.to<std::complex<double>>();
-            fill_kernel_cuda_impl<std::complex<double>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-                n, self.data_ptr<std::complex<double>>(), val);
+            tensorplay::complex<double> val = value.to<tensorplay::complex<double>>();
+            fill_kernel_cuda_impl<tensorplay::complex<double>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                n, static_cast<tensorplay::complex<double>*>(self.data_ptr()), val);
             break;
         }
         case DType::ComplexHalf: {
-            const std::complex<float> val = value.to<std::complex<float>>();
             fill_kernel_cuda_impl<tensorplay::complex<Half>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
                 n, static_cast<tensorplay::complex<Half>*>(self.data_ptr()),
-                tensorplay::complex<Half>(static_cast<Half>(val.real()),
-                                          static_cast<Half>(val.imag())));
+                value.to<tensorplay::complex<Half>>());
             break;
         }
         case DType::BComplex32: {
-            const std::complex<float> val = value.to<std::complex<float>>();
             fill_kernel_cuda_impl<tensorplay::complex<BFloat16>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
                 n, static_cast<tensorplay::complex<BFloat16>*>(self.data_ptr()),
-                tensorplay::complex<BFloat16>(static_cast<BFloat16>(val.real()),
-                                              static_cast<BFloat16>(val.imag())));
+                value.to<tensorplay::complex<BFloat16>>());
             break;
         }
         default: TP_THROW(NotImplementedError, "fill_ not implemented for this dtype on CUDA");
@@ -168,23 +163,23 @@ Tensor& fill_diagonal__kernel(Tensor& self, Scalar fill_value, bool wrap) {
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_FILL_DIAG_CUDA_CASE)
         case DType::ComplexFloat: {
-            std::complex<float>* data = self.data_ptr<std::complex<float>>();
-            std::complex<float> val = fill_value.to<std::complex<float>>();
-            fill_diagonal_strided_cuda_impl<std::complex<float>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+            tensorplay::complex<float>* data = static_cast<tensorplay::complex<float>*>(self.data_ptr());
+            tensorplay::complex<float> val = fill_value.to<tensorplay::complex<float>>();
+            fill_diagonal_strided_cuda_impl<tensorplay::complex<float>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
                 diag_size, data, base, diag_stride, val);
             if (wrap_count > 0) {
-                fill_diagonal_strided_cuda_impl<std::complex<float>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                fill_diagonal_strided_cuda_impl<tensorplay::complex<float>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
                     wrap_count, data, wrap_base, diag_stride, val);
             }
             break;
         }
         case DType::ComplexDouble: {
-            std::complex<double>* data = self.data_ptr<std::complex<double>>();
-            std::complex<double> val = fill_value.to<std::complex<double>>();
-            fill_diagonal_strided_cuda_impl<std::complex<double>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+            tensorplay::complex<double>* data = static_cast<tensorplay::complex<double>*>(self.data_ptr());
+            tensorplay::complex<double> val = fill_value.to<tensorplay::complex<double>>();
+            fill_diagonal_strided_cuda_impl<tensorplay::complex<double>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
                 diag_size, data, base, diag_stride, val);
             if (wrap_count > 0) {
-                fill_diagonal_strided_cuda_impl<std::complex<double>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                fill_diagonal_strided_cuda_impl<tensorplay::complex<double>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
                     wrap_count, data, wrap_base, diag_stride, val);
             }
             break;
@@ -295,14 +290,14 @@ Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device, bool require
     switch (dtype) {
         TENSORPLAY_FORALL_SCALAR_TYPES(EYE_CUDA_CASE)
         case DType::ComplexFloat:
-            eye_kernel_cuda_impl<std::complex<float>>
+            eye_kernel_cuda_impl<tensorplay::complex<float>>
                 <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-                    n, m, t.data_ptr<std::complex<float>>());
+                    n, m, static_cast<tensorplay::complex<float>*>(t.data_ptr()));
             break;
         case DType::ComplexDouble:
-            eye_kernel_cuda_impl<std::complex<double>>
+            eye_kernel_cuda_impl<tensorplay::complex<double>>
                 <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-                    n, m, t.data_ptr<std::complex<double>>());
+                    n, m, static_cast<tensorplay::complex<double>*>(t.data_ptr()));
             break;
         case DType::ComplexHalf:
             eye_kernel_cuda_impl<tensorplay::complex<Half>>
@@ -573,22 +568,22 @@ Tensor linspace_cuda(Scalar start, Scalar end, int64_t steps,
             case DType::ComplexHalf:
                 launch_linspace_complex<
                     tensorplay::complex<float>, tensorplay::complex<Half>,
-                    std::complex<float>>(steps, start, end, t);
+                    tensorplay::complex<float>>(steps, start, end, t);
                 break;
             case DType::ComplexFloat:
                 launch_linspace_complex<
                     tensorplay::complex<float>, tensorplay::complex<float>,
-                    std::complex<float>>(steps, start, end, t);
+                    tensorplay::complex<float>>(steps, start, end, t);
                 break;
             case DType::ComplexDouble:
                 launch_linspace_complex<
                     tensorplay::complex<double>, tensorplay::complex<double>,
-                    std::complex<double>>(steps, start, end, t);
+                    tensorplay::complex<double>>(steps, start, end, t);
                 break;
             case DType::BComplex32:
                 launch_linspace_complex<
                     tensorplay::complex<float>, tensorplay::complex<BFloat16>,
-                    std::complex<float>>(steps, start, end, t);
+                    tensorplay::complex<float>>(steps, start, end, t);
                 break;
             default:
                 TP_THROW(NotImplementedError,
@@ -653,22 +648,22 @@ Tensor logspace_cuda(Scalar start, Scalar end, int64_t steps, double base,
             case DType::ComplexHalf:
                 launch_logspace_complex<
                     tensorplay::complex<float>, tensorplay::complex<Half>,
-                    std::complex<float>>(steps, start, end, base, t);
+                    tensorplay::complex<float>>(steps, start, end, base, t);
                 break;
             case DType::ComplexFloat:
                 launch_logspace_complex<
                     tensorplay::complex<float>, tensorplay::complex<float>,
-                    std::complex<float>>(steps, start, end, base, t);
+                    tensorplay::complex<float>>(steps, start, end, base, t);
                 break;
             case DType::ComplexDouble:
                 launch_logspace_complex<
                     tensorplay::complex<double>, tensorplay::complex<double>,
-                    std::complex<double>>(steps, start, end, base, t);
+                    tensorplay::complex<double>>(steps, start, end, base, t);
                 break;
             case DType::BComplex32:
                 launch_logspace_complex<
                     tensorplay::complex<float>, tensorplay::complex<BFloat16>,
-                    std::complex<float>>(steps, start, end, base, t);
+                    tensorplay::complex<float>>(steps, start, end, base, t);
                 break;
             default:
                 TP_THROW(NotImplementedError,
