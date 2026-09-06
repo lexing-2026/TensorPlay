@@ -7404,7 +7404,7 @@ def detach_(input):
             return _captured
     return _C.detach_(input)
 
-def resize_as_(input, other, memory_format=0):
+def resize_as_(input, other, memory_format=None):
     if _capturing():
         _captured = _capture_call(resize_as_, (input, other, memory_format), {})
         if _captured is not None:

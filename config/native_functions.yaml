@@ -5642,7 +5642,7 @@
 - func: detach_(Tensor(a!) self) -> Tensor(a!)
   variants: function, method
 
-- func: resize_as_(Tensor(a!) self, Tensor other, *, int memory_format=0) -> Tensor(a!)
+- func: resize_as_(Tensor(a!) self, Tensor other, *, MemoryFormat? memory_format=None) -> Tensor(a!)
   variants: function, method
 
 # RNN.cpp: gated recurrent cell (reset/update/new gates, hy=(1-z)*n+z*h).
