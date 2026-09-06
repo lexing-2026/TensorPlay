@@ -785,7 +785,7 @@ std::tuple<Tensor, Tensor> kthvalue_cpu(const Tensor& self, int64_t k,
 template <typename scalar_t>
 inline bool count_nonzero_value(const scalar_t& value) {
     if constexpr (is_complex_type_v<scalar_t>) {
-        return value.real() != 0 || value.imag() != 0;
+        return value != scalar_t(0);
     } else {
         return static_cast<bool>(value);
     }
