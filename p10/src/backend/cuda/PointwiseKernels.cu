@@ -39,64 +39,6 @@ struct NoGradGuard {
     } \
   } while (0)
 
-// Use aligned vector packs when every operand permits them.
-template <typename T, int VecSize>
-struct alignas(VecSize * sizeof(T)) VecPack { T v[VecSize]; };
-
-template <typename T, typename Func>
-__global__ void binary_kernel_cuda_impl(int64_t n, const T* a, const T* b, T* output, Func func) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) {
-        output[i] = func(a[i], b[i]);
-    }
-}
-
-template <typename T, int VecSize, typename Func>
-__global__ void binary_vectorized_kernel_cuda_impl(int64_t n, const T* a, const T* b, T* output, Func func) {
-    int64_t vec_n = n / VecSize;
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < vec_n; i += stride) {
-        VecPack<T, VecSize> va = *reinterpret_cast<const VecPack<T, VecSize>*>(a + i * VecSize);
-        VecPack<T, VecSize> vb = *reinterpret_cast<const VecPack<T, VecSize>*>(b + i * VecSize);
-        VecPack<T, VecSize> vo;
-        #pragma unroll
-        for (int v = 0; v < VecSize; ++v) vo.v[v] = func(va.v[v], vb.v[v]);
-        *reinterpret_cast<VecPack<T, VecSize>*>(output + i * VecSize) = vo;
-    }
-    for (int64_t j = vec_n * VecSize + i; j < n; j += stride) {
-        output[j] = func(a[j], b[j]);
-    }
-}
-
-// --- Dispatchers ---
-
-// elementwise_kernel: one thread block per block-work-size chunk of the
-// tensor (4 elems/thread vectorized, 8 scalar), grid-stride walks make the
-// underfilled tail blocks cheap and there is no occupancy cap: memory-bound
-// elementwise work saturates with one wave of fully provisioned blocks.
-inline void get_elementwise_config(int64_t n, bool vectorized, dim3& grid, dim3& block) {
-    block.x = 256;
-    int64_t per_thread = vectorized ? 4 : 8;
-    int64_t want = (n + block.x * per_thread - 1) / (block.x * per_thread);
-    grid.x = static_cast<unsigned>(want < 1 ? 1 : want);
-}
-
-inline bool ptr_aligned16(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 0; }
-
-template <typename T, typename Func>
-void launch_binary(int64_t n, const T* a, const T* b, T* out, Func func) {
-    dim3 grid, block;
-    if ((n % 4 == 0) && ptr_aligned16(a) && ptr_aligned16(b) && ptr_aligned16(out)) {
-        get_elementwise_config(n, true, grid, block);
-        binary_vectorized_kernel_cuda_impl<T, 4><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a, b, out, func);
-    } else {
-        get_elementwise_config(n, false, grid, block);
-        binary_kernel_cuda_impl<T><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a, b, out, func);
-    }
-}
-
 struct AbsFunctor { template<typename T> __device__ T operator()(T x) const { return x >= T(0) ? x : -x; } };
 struct NegFunctor { template<typename T> __device__ T operator()(T x) const { return -x; } };
 struct SquareFunctor { template<typename T> __device__ T operator()(T x) const { return x * x; } };
