@@ -351,11 +351,10 @@ Tensor log_softmax_kernel_cudnn(const Tensor& self, int64_t dim, DType dtype) {
 #endif  // USE_CUDNN
 
 template <typename T>
-__global__ void threshold_backward_kernel_impl(int64_t n, const T* grad_output, const T* output, T threshold, T* grad_input) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        grad_input[i] = (output[i] > threshold) ? grad_output[i] : static_cast<T>(0);
-    }
+inline void run_threshold_backward_iter(TensorIteratorBase& iter, T threshold) {
+    gpu_kernel(iter, [threshold] __device__(T output_value, T grad_value) -> T {
+        return output_value > threshold ? grad_value : T(0);
+    });
 }
 
 Tensor threshold_backward_kernel(const Tensor& grad_output, const Tensor& output, Scalar threshold) {
@@ -363,51 +362,41 @@ Tensor threshold_backward_kernel(const Tensor& grad_output, const Tensor& output
         TP_THROW(RuntimeError, "threshold_backward: grad_output and output must have same size");
     }
 
-    // Reduction backward can pass an expanded scalar tangent.  Its logical
-    // shape matches ``output``, but its storage has a zero stride and is not
-    // safe to consume as a flat CUDA pointer.  Materialize the same contiguous
-    Tensor grad_contig = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
-    Tensor output_contig = output.is_contiguous() ? output : output.contiguous();
-    
-    Tensor grad_input = Tensor::empty_like(grad_contig, DType::Undefined, grad_contig.device());
-    int64_t n = grad_contig.numel();
-    if (n == 0) return grad_input;
-    
-    dim3 block(256);
-    dim3 grid((n + 255) / 256);
-    
-    if (grad_output.dtype() == DType::Float32) {
-        Tensor output_cast = (output_contig.dtype() == DType::Float32) ? output_contig : output_contig.to(DType::Float32);
-        threshold_backward_kernel_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
-            n, 
-            grad_contig.data_ptr<float>(), 
-            output_cast.data_ptr<float>(), 
-            threshold.to<float>(), 
-            grad_input.data_ptr<float>());
-    } else if (grad_output.dtype() == DType::Float16) {
-        Tensor output_cast = (output_contig.dtype() == DType::Float16) ? output_contig : output_contig.to(DType::Float16);
-        threshold_backward_kernel_impl<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
-            n,
-            grad_contig.data_ptr<tensorplay::Half>(),
-            output_cast.data_ptr<tensorplay::Half>(),
-            tensorplay::Half(threshold.to<float>()),
-            grad_input.data_ptr<tensorplay::Half>());
-    } else if (grad_output.dtype() == DType::BFloat16) {
-        Tensor output_cast = (output_contig.dtype() == DType::BFloat16) ? output_contig : output_contig.to(DType::BFloat16);
-        threshold_backward_kernel_impl<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
-            n,
-            grad_contig.data_ptr<tensorplay::BFloat16>(),
-            output_cast.data_ptr<tensorplay::BFloat16>(),
-            tensorplay::BFloat16(threshold.to<float>()),
-            grad_input.data_ptr<tensorplay::BFloat16>());
-    } else {
+    if (grad_output.dtype() != DType::Float32 &&
+        grad_output.dtype() != DType::Float16 &&
+        grad_output.dtype() != DType::BFloat16) {
         TP_THROW(NotImplementedError, "threshold_backward: only float32/fp16/bf16 supported");
     }
-    
-    cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) {
-        TP_THROW(RuntimeError, std::string("CUDA Error: ") + cudaGetErrorString(error));
-     }
+
+    Tensor grad_input = Tensor::empty_like(
+        grad_output, DType::Undefined, grad_output.device());
+    if (grad_input.numel() == 0) return grad_input;
+    Tensor output_cast = output.dtype() == grad_output.dtype()
+        ? output
+        : output.to(grad_output.dtype());
+    TensorIterator iter = TensorIteratorConfig()
+        .set_check_mem_overlap(false)
+        .check_all_same_dtype(true)
+        .resize_outputs(false)
+        .add_output(grad_input)
+        .add_const_input(output_cast)
+        .add_const_input(grad_output)
+        .build();
+
+    switch (grad_output.dtype()) {
+        case DType::Float32:
+            run_threshold_backward_iter<float>(iter, threshold.to<float>());
+            break;
+        case DType::Float16:
+            run_threshold_backward_iter<Half>(iter, threshold.to<Half>());
+            break;
+        case DType::BFloat16:
+            run_threshold_backward_iter<BFloat16>(iter, threshold.to<BFloat16>());
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "threshold_backward: only float32/fp16/bf16 supported");
+    }
 
     return grad_input;
 }
