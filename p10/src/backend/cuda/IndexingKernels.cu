@@ -1704,10 +1704,10 @@ Tensor cumsum_cuda(const Tensor& self, int64_t dim, std::optional<DType> dtype) 
             out_dtype == DType::ComplexDouble ? DType::ComplexDouble : DType::ComplexFloat;
         Tensor compute_src = src.dtype() == compute_dtype ? src : src.to(compute_dtype);
         if (compute_dtype == DType::ComplexDouble) {
-            return scan_complex_entry<thrust::complex<double>, false>(compute_src, dim)
+            return scan_complex_entry<tensorplay::complex<double>, false>(compute_src, dim)
                 .to(out_dtype);
         }
-        return scan_complex_entry<thrust::complex<float>, false>(compute_src, dim)
+        return scan_complex_entry<tensorplay::complex<float>, false>(compute_src, dim)
             .to(out_dtype);
     }
 #define TP_CS_CASE(ctype, name) \
@@ -1750,10 +1750,10 @@ Tensor cumprod_cuda(const Tensor& self, int64_t dim, std::optional<DType> dtype)
             out_dtype == DType::ComplexDouble ? DType::ComplexDouble : DType::ComplexFloat;
         Tensor compute_src = src.dtype() == compute_dtype ? src : src.to(compute_dtype);
         if (compute_dtype == DType::ComplexDouble) {
-            return scan_complex_entry<thrust::complex<double>, true>(compute_src, dim)
+            return scan_complex_entry<tensorplay::complex<double>, true>(compute_src, dim)
                 .to(out_dtype);
         }
-        return scan_complex_entry<thrust::complex<float>, true>(compute_src, dim)
+        return scan_complex_entry<tensorplay::complex<float>, true>(compute_src, dim)
             .to(out_dtype);
     }
 #define TP_CP_CASE(ctype, name) \
