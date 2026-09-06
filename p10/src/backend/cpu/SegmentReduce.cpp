@@ -458,10 +458,10 @@ Tensor segment_reduce_offsets_backward_cpu(
 }  // namespace
 
 Tensor segment_reduce_cpu(
-    const Tensor& data, std::string_view reduce,
-    const std::optional<Tensor>& lengths, const std::optional<Tensor>& indices,
-    const std::optional<Tensor>& offsets, int64_t axis, bool unsafe,
-    const std::optional<Scalar>& initial) {
+    const Tensor& data, std::string reduce,
+    std::optional<Tensor> lengths, std::optional<Tensor> indices,
+    std::optional<Tensor> offsets, int64_t axis, bool unsafe,
+    std::optional<Scalar> initial) {
     axis = wrap_axis(axis, data.dim());
     TP_CHECK(data.numel() >= 0, "segment_reduce: data must not be negative sized");
 
@@ -525,9 +525,8 @@ Tensor segment_reduce_cpu(
 // forward result is not cached across the two.
 Tensor _segment_reduce_backward_cpu(
     const Tensor& grad, const Tensor& output, const Tensor& data,
-    std::string_view reduce, const std::optional<Tensor>& lengths,
-    const std::optional<Tensor>& offsets, int64_t axis,
-    const std::optional<Scalar>& initial) {
+    std::string reduce, std::optional<Tensor> lengths,
+    std::optional<Tensor> offsets, int64_t axis, std::optional<Scalar> initial) {
     axis = wrap_axis(axis, data.dim());
     const bool lengths_has_value =
         lengths.has_value() && lengths->defined();
