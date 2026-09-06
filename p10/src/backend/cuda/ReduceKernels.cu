@@ -643,6 +643,45 @@ __device__ inline bool mode_value_equal(T lhs, T rhs) {
     return !(lhs < rhs) && !(rhs < lhs);
 }
 
+__global__ void mode_bool_kernel(
+        int64_t n_slices, int64_t d_size, int64_t inner,
+        const bool* input, bool* values, int64_t* indices) {
+    const int64_t si = static_cast<int64_t>(blockIdx.x);
+    if (si >= n_slices) return;
+    __shared__ unsigned long long true_count;
+    __shared__ unsigned long long selected_index;
+    if (threadIdx.x == 0) {
+        true_count = 0;
+        selected_index = static_cast<unsigned long long>(d_size);
+    }
+    __syncthreads();
+
+    const int64_t outer_index = si / inner;
+    const int64_t inner_index = si % inner;
+    const bool* slice_input = input + outer_index * d_size * inner + inner_index;
+    for (uint64_t i = static_cast<uint64_t>(threadIdx.x);
+         i < static_cast<uint64_t>(d_size);
+         i += static_cast<uint64_t>(blockDim.x)) {
+        if (slice_input[i * inner]) atomicAdd(&true_count, 1ull);
+    }
+    __syncthreads();
+
+    const bool mode = true_count >
+        static_cast<unsigned long long>(d_size) - true_count;
+    for (uint64_t i = static_cast<uint64_t>(threadIdx.x);
+         i < static_cast<uint64_t>(d_size);
+         i += static_cast<uint64_t>(blockDim.x)) {
+        if (slice_input[i * inner] == mode) {
+            atomicMin(&selected_index, static_cast<unsigned long long>(i));
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        values[si] = mode;
+        indices[si] = static_cast<int64_t>(selected_index);
+    }
+}
+
 template <typename T>
 __global__ void mode_from_sorted_kernel(int64_t n_slices, int64_t d_size,
                                          int64_t inner, const T* sorted,
@@ -785,6 +824,15 @@ std::tuple<Tensor, Tensor> mode_cuda(const Tensor& self, int64_t dim, bool keepd
     Tensor indices = Tensor::empty(out_shape, DType::Int64, input.device());
     const int64_t slices = outer * inner;
     if (slices == 0) return {values, indices};
+    if (input.dtype() == DType::Bool) {
+        auto stream = getCurrentCUDAStream().stream();
+        mode_bool_kernel<<<
+            dim3(static_cast<unsigned>(slices)), selection_threads(d_size), 0, stream>>>(
+            slices, d_size, inner, input.data_ptr<bool>(), values.data_ptr<bool>(),
+            indices.data_ptr<int64_t>());
+        CUDA_CHECK(cudaGetLastError());
+        return {values, indices};
+    }
     auto sorted_result = sort_cuda(input, dim, false);
     Tensor sorted = std::get<0>(sorted_result);
     Tensor sorted_indices = std::get<1>(sorted_result);
