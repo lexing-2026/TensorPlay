@@ -25,6 +25,30 @@ TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_FP8(
 
 #undef TENSORPLAY_DEFINE_TYPE_TRAIT
 
+template <>
+struct TypeTraits<complex<Half>> {
+    static constexpr ScalarType scalar_type = ScalarType::ComplexHalf;
+    static constexpr ScalarType dtype = ScalarType::ComplexHalf;
+};
+
+template <>
+struct TypeTraits<complex<float>> {
+    static constexpr ScalarType scalar_type = ScalarType::ComplexFloat;
+    static constexpr ScalarType dtype = ScalarType::ComplexFloat;
+};
+
+template <>
+struct TypeTraits<complex<double>> {
+    static constexpr ScalarType scalar_type = ScalarType::ComplexDouble;
+    static constexpr ScalarType dtype = ScalarType::ComplexDouble;
+};
+
+template <>
+struct TypeTraits<complex<BFloat16>> {
+    static constexpr ScalarType scalar_type = ScalarType::BComplex32;
+    static constexpr ScalarType dtype = ScalarType::BComplex32;
+};
+
 template <typename T>
 struct TypeTraits<const T> : TypeTraits<T> {};
 

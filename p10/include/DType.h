@@ -79,6 +79,9 @@
 
 namespace tensorplay {
 
+template <typename T>
+struct complex;
+
 #define TENSORPLAY_FORALL_SCALAR_TYPES(_) \
     _(uint8_t, UInt8)                     \
     _(int8_t, Int8)                       \
@@ -327,6 +330,11 @@ struct is_complex_type : std::false_type {};
 
 template <typename T>
 struct is_complex_type<std::complex<T>> : std::true_type {
+    using value_type = T;
+};
+
+template <typename T>
+struct is_complex_type<complex<T>> : std::true_type {
     using value_type = T;
 };
 
