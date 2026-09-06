@@ -1,11 +1,4 @@
-// nn loss operators - CUDA kernels (native device implementations).
-//
-// Mean reduction pattern: an elementwise (or one-thread-per-row) kernel
-// writes per-element/per-row losses into a Float64 buffer; an atomicAdd
-// reduction sums it; the scalar mean is finalized on the host after one
-// l1/smooth_l1/huber/kl_div/bce/bce_with_logits/cosine_embedding/
-// hinge_embedding/margin_ranking/soft_margin/triplet_margin/poisson_nll/
-// multilabel_soft_margin. (multi_margin_loss / multilabel_margin_loss live
+// Loss operators use device-side elementwise loops and reduction kernels.
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Scalar.h"
@@ -40,12 +33,6 @@ namespace ops = tensorplay::tpx::ops;
   } while (0)
 
 namespace {
-
-constexpr int kThreads = 256;
-
-inline dim3 loss_grid(int64_t work) {
-    return dim3(static_cast<unsigned>((work + kThreads - 1) / kThreads));
-}
 
 inline std::vector<int64_t> shape_of(const Tensor& t) {
     return static_cast<std::vector<int64_t>>(t.shape());
@@ -93,61 +80,6 @@ Tensor tp_scale_grad(const Tensor& grad, int64_t reduction, int64_t numel) {
 
 __host__ __device__ inline double dsp(double y) {
     return ::fmax(y, 0.0) + ::log1p(::exp(-::fabs(y)));
-}
-
-// ---------------------------------------------------------------------------
-// row-wise kernels (one thread per row)
-// ---------------------------------------------------------------------------
-
-__global__ void cosine_row_kernel(int64_t N, int64_t D, const double* a, const double* b,
-                                  const double* g, double margin, double* o) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < N; i += st) {
-        double dot = 0, na = 0, nb = 0;
-        for (int64_t j = 0; j < D; ++j) {
-            dot += a[i * D + j] * b[i * D + j];
-            na += a[i * D + j] * a[i * D + j];
-            nb += b[i * D + j] * b[i * D + j];
-        }
-        double cosv = dot / (::sqrt(na) * ::sqrt(nb) + 1e-12);
-        o[i] = (g[i] == 1.0) ? 1.0 - cosv : ::fmax(0.0, cosv - margin);
-    }
-}
-
-__global__ void triplet_row_kernel(int64_t N, int64_t D, const double* a, const double* p,
-                                   const double* nn, double margin, double pw, double* o) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < N; i += st) {
-        auto dist = [&](const double* u, const double* v) {
-            if (pw == std::numeric_limits<double>::infinity()) {
-                double mx = 0;
-                for (int64_t j = 0; j < D; ++j) mx = ::fmax(mx, ::fabs(u[j] - v[j]));
-                return mx;
-            }
-            double s2 = 0;
-            for (int64_t j = 0; j < D; ++j) s2 += ::pow(::fabs(u[j] - v[j]), pw);
-            return ::pow(s2, 1.0 / pw);
-        };
-        o[i] = ::fmax(0.0, dist(a + i * D, p + i * D) -
-                               dist(a + i * D, nn + i * D) + margin);
-    }
-}
-
-__global__ void mlsm_row_kernel(int64_t N, int64_t C, const double* x, const double* t,
-                                double* o) {
-    // -1/C sum_c [t*logsig(x) + (1-t)*logsig(-x)]; logsig(u) = -dsp(-u)
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < N; i += st) {
-        double row = 0;
-        for (int64_t c = 0; c < C; ++c) {
-            double xv = x[i * C + c], tv = t[i * C + c];
-            row += tv * -dsp(-xv) + (1.0 - tv) * -dsp(xv);
-        }
-        o[i] = -row / C;
-    }
 }
 
 } // anonymous namespace
@@ -316,51 +248,34 @@ Tensor poisson_nll_loss_cuda(const Tensor& input, const Tensor& target, bool log
 
 Tensor cosine_embedding_loss_cuda(const Tensor& x1, const Tensor& x2, const Tensor& target,
                                   Scalar margin) {
-    int64_t N = x1.size(0), D = x1.size(1);
-    Tensor a = x1.contiguous().to(DType::Float64);
-    Tensor b = x2.contiguous().to(DType::Float64);
-    Tensor tg = target.contiguous().to(DType::Float64);
-    if (tg.dim() == 0) tg = tg.expand({N}).contiguous();
-    Tensor elems = Tensor::empty({N}, DType::Float64, x1.device());
-    if (N) {
-        auto stream = getCurrentCUDAStream().stream();
-        cosine_row_kernel<<<loss_grid(N), kThreads, 0, stream>>>(
-            N, D, a.data_ptr<double>(), b.data_ptr<double>(), tg.data_ptr<double>(),
-            margin.toDouble(), elems.data_ptr<double>());
-        CUDA_CHECK(cudaGetLastError());
-    }
-    return mean_from_elems(elems, N, x1.dtype(), x1.device());
+    const std::vector<int64_t> reduce_dims{1};
+    Tensor prod_sum = (x1 * x2).sum(reduce_dims);
+    Tensor mag_square1 = (x1 * x1).sum(reduce_dims) + Scalar(1e-12);
+    Tensor mag_square2 = (x2 * x2).sum(reduce_dims) + Scalar(1e-12);
+    Tensor cosine = prod_sum / (mag_square1 * mag_square2).sqrt();
+    Tensor zeros = Tensor::zeros_like(cosine);
+    Tensor negative = Tensor::where(
+        (cosine - margin).lt(Scalar(0)), Scalar(0), cosine - margin);
+    Tensor loss = Tensor::where(
+        target.eq(Scalar(1)), Scalar(1) - cosine,
+        Tensor::where(target.eq(Scalar(-1)), negative, zeros));
+    return mean_from_elems(loss, loss.numel(), x1.dtype(), x1.device());
 }
 
 Tensor triplet_margin_loss_cuda(const Tensor& anchor, const Tensor& positive,
                                 const Tensor& negative, Scalar margin, double p) {
-    int64_t N = anchor.size(0), D = anchor.size(1);
-    Tensor a = anchor.contiguous().to(DType::Float64);
-    Tensor pp = positive.contiguous().to(DType::Float64);
-    Tensor nn = negative.contiguous().to(DType::Float64);
-    Tensor elems = Tensor::empty({N}, DType::Float64, anchor.device());
-    if (N) {
-        auto stream = getCurrentCUDAStream().stream();
-        triplet_row_kernel<<<loss_grid(N), kThreads, 0, stream>>>(
-            N, D, a.data_ptr<double>(), pp.data_ptr<double>(), nn.data_ptr<double>(),
-            margin.toDouble(), p, elems.data_ptr<double>());
-        CUDA_CHECK(cudaGetLastError());
-    }
-    return mean_from_elems(elems, N, anchor.dtype(), anchor.device());
+    Tensor dist_pos = ops::pairwise_distance(anchor, positive, p, 1e-6, false);
+    Tensor dist_neg = ops::pairwise_distance(anchor, negative, p, 1e-6, false);
+    Tensor raw = dist_pos - dist_neg + margin;
+    Tensor loss = Tensor::where(raw.lt(Scalar(0)), Scalar(0), raw);
+    return mean_from_elems(loss, loss.numel(), anchor.dtype(), anchor.device());
 }
 
 Tensor multilabel_soft_margin_loss_cuda(const Tensor& input, const Tensor& target) {
-    int64_t N = input.size(0), C = input.size(1);
-    auto pr = pair_f64_dev(input, target);
-    Tensor elems = Tensor::empty({N}, DType::Float64, input.device());
-    if (N) {
-        auto stream = getCurrentCUDAStream().stream();
-        mlsm_row_kernel<<<loss_grid(N), kThreads, 0, stream>>>(
-            N, C, pr.first.data_ptr<double>(), pr.second.data_ptr<double>(),
-            elems.data_ptr<double>());
-        CUDA_CHECK(cudaGetLastError());
-    }
-    return mean_from_elems(elems, N, input.dtype(), input.device());
+    Tensor positive = target * (-ops::log_sigmoid(input));
+    Tensor negative = (Scalar(1) - target) * (-ops::log_sigmoid(-input));
+    Tensor row_loss = ops::mean(positive + negative, {1}, false);
+    return mean_from_elems(row_loss, row_loss.numel(), input.dtype(), input.device());
 }
 
 Tensor tp_l1_loss_cuda(const Tensor& input, const Tensor& target,
