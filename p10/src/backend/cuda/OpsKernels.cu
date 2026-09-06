@@ -89,6 +89,19 @@ __device__ bool logical_truth_cuda(const tensorplay::complex<T>& value) {
     return value.real() != T(0) || value.imag() != T(0);
 }
 
+template <typename T>
+__device__ T nan_to_num_replace_cuda(
+        T value, T nan_replacement, T posinf_replacement,
+        T neginf_replacement) {
+    return value != value
+        ? nan_replacement
+        : (value == std::numeric_limits<T>::infinity()
+            ? posinf_replacement
+            : (value == -std::numeric_limits<T>::infinity()
+                ? neginf_replacement
+                : value));
+}
+
 void launch_ew(dim3& grid, dim3& block, int64_t n) {
     block = dim3(kThreads);
     grid = dim3(static_cast<unsigned>((n + kThreads - 1) / kThreads));
@@ -741,41 +754,90 @@ Tensor nan_to_num_cuda(const Tensor& self, Scalar nan,
                        std::optional<Scalar> posinf, std::optional<Scalar> neginf) {
     Tensor out = Tensor::empty(shape_of(self), self.dtype(), self.device());
     if (out.numel() == 0) return out;
+    if (isIntegralType(self.dtype(), true)) {
+        out.copy_(self);
+        return out;
+    }
+
     TensorIterator iter = TensorIteratorConfig()
         .check_all_same_dtype(true)
         .add_output(out)
         .add_const_input(self)
         .build();
-    double nan_v = nan.toDouble();
-    bool has_pos = posinf.has_value(), has_neg = neginf.has_value();
-    double pos_v = has_pos ? posinf->toDouble() : std::numeric_limits<double>::infinity();
-    double neg_v = has_neg ? neginf->toDouble() : -std::numeric_limits<double>::infinity();
-#define TP_NTN(ctype, name_) \
-    case DType::name_: { \
-        ctype pv = has_pos ? static_cast<ctype>(pos_v) \
-                           : (std::numeric_limits<ctype>::has_infinity \
-                                  ? std::numeric_limits<ctype>::infinity() \
-                                  : std::numeric_limits<ctype>::max()); \
-        ctype nv = has_neg ? static_cast<ctype>(neg_v) \
-                           : (std::numeric_limits<ctype>::has_infinity \
-                                  ? -std::numeric_limits<ctype>::infinity() \
-                                  : std::numeric_limits<ctype>::lowest()); \
-        ctype na = static_cast<ctype>(nan_v); \
-        gpu_kernel(iter, [na, pv, nv] __device__ (ctype v) -> ctype { \
-            if constexpr (std::is_floating_point_v<ctype>) { \
-                if (v != v) return na; \
-                if (v == std::numeric_limits<ctype>::infinity()) return pv; \
-                if (v == -std::numeric_limits<ctype>::infinity()) return nv; \
-            } \
-            return v; \
-        }); \
-        break; \
+    if (isComplexType(self.dtype())) {
+        switch (self.dtype()) {
+            case DType::ComplexFloat: {
+                using value_t = float;
+                using complex_t = tensorplay::complex<value_t>;
+                value_t nan_replacement = static_cast<value_t>(nan.toDouble());
+                value_t posinf_replacement = posinf.has_value()
+                    ? static_cast<value_t>(posinf->toDouble())
+                    : std::numeric_limits<value_t>::max();
+                value_t neginf_replacement = neginf.has_value()
+                    ? static_cast<value_t>(neginf->toDouble())
+                    : std::numeric_limits<value_t>::lowest();
+                gpu_kernel(iter, [=] __device__ (complex_t value) -> complex_t {
+                    return complex_t(
+                        nan_to_num_replace_cuda(
+                            value.real(), nan_replacement, posinf_replacement,
+                            neginf_replacement),
+                        nan_to_num_replace_cuda(
+                            value.imag(), nan_replacement, posinf_replacement,
+                            neginf_replacement));
+                });
+                break;
+            }
+            case DType::ComplexDouble: {
+                using value_t = double;
+                using complex_t = tensorplay::complex<value_t>;
+                value_t nan_replacement = static_cast<value_t>(nan.toDouble());
+                value_t posinf_replacement = posinf.has_value()
+                    ? static_cast<value_t>(posinf->toDouble())
+                    : std::numeric_limits<value_t>::max();
+                value_t neginf_replacement = neginf.has_value()
+                    ? static_cast<value_t>(neginf->toDouble())
+                    : std::numeric_limits<value_t>::lowest();
+                gpu_kernel(iter, [=] __device__ (complex_t value) -> complex_t {
+                    return complex_t(
+                        nan_to_num_replace_cuda(
+                            value.real(), nan_replacement, posinf_replacement,
+                            neginf_replacement),
+                        nan_to_num_replace_cuda(
+                            value.imag(), nan_replacement, posinf_replacement,
+                            neginf_replacement));
+                });
+                break;
+            }
+            default:
+                TP_THROW(NotImplementedError,
+                         "nan_to_num: reduced complex types are not supported on CUDA");
+        }
+    } else {
+#define TP_NTN_FLOAT(ctype, name_) \
+        case DType::name_: { \
+            ctype nan_replacement = static_cast<ctype>(nan.toDouble()); \
+            ctype posinf_replacement = posinf.has_value() \
+                ? static_cast<ctype>(posinf->toDouble()) \
+                : std::numeric_limits<ctype>::max(); \
+            ctype neginf_replacement = neginf.has_value() \
+                ? static_cast<ctype>(neginf->toDouble()) \
+                : std::numeric_limits<ctype>::lowest(); \
+            gpu_kernel(iter, [=] __device__ (ctype value) -> ctype { \
+                return nan_to_num_replace_cuda( \
+                    value, nan_replacement, posinf_replacement, \
+                    neginf_replacement); \
+            }); \
+            break; \
+        }
+        switch (self.dtype()) {
+            TP_NTN_FLOAT(float, Float32)
+            TP_NTN_FLOAT(double, Float64)
+            TP_NTN_FLOAT(Half, Float16)
+            TP_NTN_FLOAT(BFloat16, BFloat16)
+            default: TP_THROW(TypeError, "nan_to_num: unsupported dtype");
+        }
+#undef TP_NTN_FLOAT
     }
-    switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_NTN)
-        default: TP_THROW(TypeError, "nan_to_num: unsupported dtype");
-    }
-#undef TP_NTN
     CUDA_CHECK(cudaGetLastError());
     return out;
 }
