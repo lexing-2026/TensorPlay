@@ -794,6 +794,7 @@ __global__ void scatter_kernel(int64_t total_idx, int64_t idx_dim_size, int64_t 
 
 template <typename T>
 __global__ void index_add_kernel(int64_t total, int64_t inner, int64_t row,
+                                 int64_t n_idx,
                                  T* d, const int64_t* ip, const T* sp) {
     // One thread per (source position, inner column): adds sv into the
     // selected destination slice.
@@ -805,11 +806,13 @@ __global__ void index_add_kernel(int64_t total, int64_t inner, int64_t row,
                       std::is_same_v<T, tensorplay::complex<double>> ||
                       std::is_same_v<T, tensorplay::complex<Half>> ||
                       std::is_same_v<T, tensorplay::complex<BFloat16>>) {
-            int64_t k = t / inner;
+            int64_t source_slice = t / inner;
             int64_t c = t % inner;
+            int64_t k = source_slice % n_idx;
+            int64_t o = source_slice / n_idx;
             int64_t iv = ip[k];
             if (iv < 0) iv += row;
-            indexed_atomic_add(&d[iv * inner + c], sp[t]);
+            indexed_atomic_add(&d[(o * row + iv) * inner + c], sp[t]);
         }
     }
 }
@@ -2088,12 +2091,12 @@ Tensor index_add_cuda(const Tensor& self, int64_t dim, const Tensor& index, cons
     if (source_c.size(dim) != n_idx) {
         TP_THROW(RuntimeError, "index_add: source size along dim must equal index length");
     }
-    int64_t total = n_idx * inner;
+    int64_t total = outer * n_idx * inner;
     auto stream = getCurrentCUDAStream().stream();
 #define TP_IADD_CASE(ctype, name) \
         case DType::name: \
             index_add_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-                total, inner, row, result.data_ptr<ctype>(), idx.data_ptr<int64_t>(), \
+                total, inner, row, n_idx, result.data_ptr<ctype>(), idx.data_ptr<int64_t>(), \
                 source_c.data_ptr<ctype>()); \
             break;
     switch (self.dtype()) {
@@ -2101,7 +2104,7 @@ Tensor index_add_cuda(const Tensor& self, int64_t dim, const Tensor& index, cons
         case DType::ComplexFloat:
             index_add_kernel<tensorplay::complex<float>><<<
                 (total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                total, inner, row,
+                total, inner, row, n_idx,
                 static_cast<tensorplay::complex<float>*>(result.data_ptr()),
                 idx.data_ptr<int64_t>(),
                 static_cast<const tensorplay::complex<float>*>(source_c.data_ptr()));
@@ -2109,7 +2112,7 @@ Tensor index_add_cuda(const Tensor& self, int64_t dim, const Tensor& index, cons
         case DType::ComplexDouble:
             index_add_kernel<tensorplay::complex<double>><<<
                 (total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                total, inner, row,
+                total, inner, row, n_idx,
                 static_cast<tensorplay::complex<double>*>(result.data_ptr()),
                 idx.data_ptr<int64_t>(),
                 static_cast<const tensorplay::complex<double>*>(source_c.data_ptr()));
@@ -2117,7 +2120,7 @@ Tensor index_add_cuda(const Tensor& self, int64_t dim, const Tensor& index, cons
         case DType::ComplexHalf:
             index_add_kernel<tensorplay::complex<Half>><<<
                 (total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                total, inner, row,
+                total, inner, row, n_idx,
                 static_cast<tensorplay::complex<Half>*>(result.data_ptr()),
                 idx.data_ptr<int64_t>(),
                 static_cast<const tensorplay::complex<Half>*>(source_c.data_ptr()));
@@ -2125,7 +2128,7 @@ Tensor index_add_cuda(const Tensor& self, int64_t dim, const Tensor& index, cons
         case DType::BComplex32:
             index_add_kernel<tensorplay::complex<BFloat16>><<<
                 (total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                total, inner, row,
+                total, inner, row, n_idx,
                 static_cast<tensorplay::complex<BFloat16>*>(result.data_ptr()),
                 idx.data_ptr<int64_t>(),
                 static_cast<const tensorplay::complex<BFloat16>*>(source_c.data_ptr()));
