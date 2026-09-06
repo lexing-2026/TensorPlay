@@ -702,6 +702,16 @@ std::tuple<Tensor, Tensor> nanmedian_dim_cuda(const Tensor& self, int64_t dim,
 
 std::tuple<Tensor, Tensor> mode_cuda(const Tensor& self, int64_t dim, bool keepdim) {
     int64_t nd = self.dim();
+    if (nd == 0) {
+        if (dim != 0 && dim != -1) {
+            TP_THROW(IndexError,
+                     "Dimension out of range for scalar mode input: ", dim);
+        }
+        Tensor values = Tensor::empty({}, self.dtype(), self.device());
+        Tensor indices = Tensor::zeros({}, DType::Int64, self.device());
+        values.copy_(self);
+        return {values, indices};
+    }
     dim = wrap_dim(dim, nd);
     Tensor input = self.contiguous();
     int64_t d_size = input.size(dim);
@@ -740,10 +750,30 @@ std::tuple<Tensor, Tensor> kthvalue_cuda(const Tensor& self, int64_t k, int64_t 
                                          bool keepdim) {
     Tensor input = self.contiguous();
     int64_t nd = input.dim();
+    if (nd == 0) {
+        if (dim != 0 && dim != -1) {
+            TP_THROW(IndexError,
+                     "Dimension out of range for scalar kthvalue input: ", dim);
+        }
+        if (k != 1) {
+            TP_THROW(RuntimeError,
+                     "kthvalue(): selected number k out of range for dim 0");
+        }
+        Tensor values = Tensor::empty({}, input.dtype(), input.device());
+        Tensor indices = Tensor::zeros({}, DType::Int64, input.device());
+        values.copy_(input);
+        return {values, indices};
+    }
     dim = wrap_dim(dim, nd);
     int64_t d_size = input.size(dim);
     if (k < 1 || k > d_size)
         TP_THROW(RuntimeError, "kthvalue(): selected number k out of range for dim ", dim);
+    std::vector<int64_t> out_shape = shape_of(input);
+    out_shape[dim] = keepdim ? 1 : 0;
+    if (!keepdim) out_shape.erase(out_shape.begin() + dim);
+    Tensor values_out = Tensor::empty(out_shape, input.dtype(), input.device());
+    Tensor indices_out = Tensor::empty(out_shape, DType::Int64, input.device());
+    if (input.numel() == 0) return {values_out, indices_out};
     Tensor selected_values;
     Tensor selected_indices;
     if (input.dtype() == DType::Bool) {
