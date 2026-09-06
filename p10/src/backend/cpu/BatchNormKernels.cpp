@@ -1013,12 +1013,13 @@ void bn_backward_channels_last(const Tensor& grad_output, const Tensor& input,
 
 }  // namespace
 
-std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cpu(
+static std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cpu_impl(
     const Tensor& grad_output, const Tensor& input,
     std::optional<Tensor> weight_opt,
     std::optional<Tensor> running_mean_opt,
     std::optional<Tensor> running_var_opt,
-    bool training, double eps) {
+    bool training, double eps, const Tensor* save_mean_opt,
+    const Tensor* save_invstd_opt, const std::vector<bool>* output_mask) {
     const int64_t C = input.size(1);
 
     check_param_dtype(input.dtype(), weight_opt, "weight");
@@ -1026,20 +1027,41 @@ std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cpu(
     check_param_dtype(input.dtype(), running_var_opt, "running_var");
 
     const bool has_w = weight_opt.has_value() && weight_opt->defined();
+    const bool want_input = output_mask == nullptr || output_mask->empty() ||
+        (output_mask->size() > 0 && (*output_mask)[0]);
+    const bool want_weight = has_w &&
+        (output_mask == nullptr || output_mask->size() <= 1 || (*output_mask)[1]);
+    const bool want_bias = output_mask == nullptr
+        ? has_w
+        : (output_mask->size() > 2 && (*output_mask)[2]);
+
+    if (save_mean_opt || save_invstd_opt) {
+        if (!save_mean_opt || !save_invstd_opt || !save_mean_opt->defined() ||
+            !save_invstd_opt->defined() || save_mean_opt->numel() != C ||
+            save_invstd_opt->numel() != C) {
+            TP_THROW(RuntimeError,
+                     "batch_norm_backward: saved statistics have an invalid shape");
+        }
+    }
 
     // grad_input follows the grad_output dtype (matches autograd expectations);
     // parameter grads follow the affine param dtype.
     const DType gx_dt = grad_output.dtype();
     Tensor grad_input, grad_weight, grad_bias;
-    grad_input = empty_like_format(input, gx_dt);
-    if (has_w) grad_weight = Tensor::empty({C}, weight_opt->dtype(), weight_opt->device());
+    if (want_input) grad_input = empty_like_format(input, gx_dt);
+    if (want_weight) grad_weight = Tensor::empty({C}, weight_opt->dtype(), weight_opt->device());
     const DType grad_param_dtype = has_w
         ? weight_opt->dtype() : stats_dtype_for(input.dtype());
-    grad_bias = Tensor::empty({C}, grad_param_dtype, input.device());
+    if (want_bias) grad_bias = Tensor::empty({C}, grad_param_dtype, input.device());
 
     // Resolve mean/invstd (recompute in training mode, running stats in eval).
     std::vector<double> mean(C), invstd(C);
-    if (training) {
+    if (save_mean_opt) {
+        for (int64_t c = 0; c < C; ++c) {
+            mean[c] = stats_at(*save_mean_opt, c);
+            invstd[c] = stats_at(*save_invstd_opt, c);
+        }
+    } else if (training) {
         std::vector<double> var(C);
         if (is_channels_last(input)) bn_stats_channels_last(input, mean, var);
         else bn_stats_contiguous(input, mean, var);
@@ -1062,8 +1084,18 @@ std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cpu(
                                running_var_opt, mean, invstd, training,
                                grad_input, grad_weight, grad_bias);
 
-    if (!has_w) grad_weight = Tensor();
     return std::make_tuple(grad_input, grad_weight, grad_bias);
+}
+
+std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cpu(
+    const Tensor& grad_output, const Tensor& input,
+    std::optional<Tensor> weight_opt,
+    std::optional<Tensor> running_mean_opt,
+    std::optional<Tensor> running_var_opt,
+    bool training, double eps) {
+    return batch_norm_backward_cpu_impl(
+        grad_output, input, weight_opt, running_mean_opt, running_var_opt,
+        training, eps, nullptr, nullptr, nullptr);
 }
 
 std::tuple<Tensor, Tensor, Tensor> native_batch_norm_cpu(
