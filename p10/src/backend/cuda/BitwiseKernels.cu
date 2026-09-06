@@ -1,6 +1,6 @@
 // Bitwise operator family - CUDA kernels.
 //
-// Grid-stride elementwise kernels over integral and boolean data; boolean
+// Elementwise operations over integral and boolean data; boolean
 // operands apply the corresponding logical operation.  The .Scalar_Tensor
 // variants materialize the leading scalar as a 0-dim tensor in the tensor's
 // dtype (wrapped-number semantics: the tensor dtype wins); a floating or
@@ -20,9 +20,7 @@
 #include "Utils.h"
 #include "Exception.h"
 #include "TypePromotion.h"
-#include "CUDARuntime.h"
-
-#include <cuda_runtime.h>
+#include "CUDALoops.cuh"
 
 #include <cstdint>
 #include <string>
@@ -32,46 +30,10 @@
 namespace tensorplay {
 namespace cuda {
 
-#define CUDA_CHECK(condition) \
-  do { \
-    cudaError_t error = condition; \
-    if (error != cudaSuccess) { \
-      TP_THROW(RuntimeError, std::string("CUDA Error: ") + cudaGetErrorString(error)); \
-    } \
-  } while (0)
-
 namespace {
-
-constexpr int kThreads = 256;
 
 inline std::vector<int64_t> shape_of(const Tensor& t) {
     return static_cast<std::vector<int64_t>>(t.shape());
-}
-
-inline void launch_ew(dim3& grid, dim3& block, int64_t n) {
-    block = dim3(kThreads);
-    grid = dim3(static_cast<unsigned>((n + kThreads - 1) / kThreads));
-}
-
-template <typename T, typename Op>
-__global__ void ew_binary_kernel(int64_t n, const T* a, const T* b, T* out, Op op) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) out[i] = op(a[i], b[i]);
-}
-
-template <typename T, typename Pred>
-__global__ void bitwise_binary_scalar_kernel(int64_t n, const T* sp, T ov, T* dp, Pred pred) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) dp[i] = pred(sp[i], ov);
-}
-
-template <typename T, typename Pred>
-__global__ void bitwise_unary_kernel(int64_t n, const T* sp, T* dp, Pred pred) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) dp[i] = pred(sp[i]);
 }
 
 #define TENSORPLAY_FORALL_INT_TYPES_CUDA(_) \
@@ -83,6 +45,27 @@ __global__ void bitwise_unary_kernel(int64_t n, const T* sp, T* dp, Pred pred) {
     _(uint16_t, UInt16)                     \
     _(uint32_t, UInt32)                     \
     _(uint64_t, UInt64)
+
+struct BitwiseAnd {
+    template <typename T>
+    __device__ T operator()(T lhs, T rhs) const {
+        return static_cast<T>(lhs & rhs);
+    }
+};
+
+struct BitwiseOr {
+    template <typename T>
+    __device__ T operator()(T lhs, T rhs) const {
+        return static_cast<T>(lhs | rhs);
+    }
+};
+
+struct BitwiseXor {
+    template <typename T>
+    __device__ T operator()(T lhs, T rhs) const {
+        return static_cast<T>(lhs ^ rhs);
+    }
+};
 
 inline void bitwise_check_cuda(const Tensor& t, const char* name) {
     if (t.unsafeGetTensorImpl() && t.unsafeGetTensorImpl()->is_batched()) {
@@ -122,56 +105,59 @@ Tensor bitwise_binary_cuda(const Tensor& a_in, const Tensor& b_in, Pred pred, co
     if (dt != DType::Bool && !isIntegralType(dt)) {
         TP_THROW(TypeError, name, ": only integral and boolean types are supported");
     }
-    Tensor ac = (a_in.dtype() == dt ? a_in : a_in.to(dt)).expand(out_shape).contiguous();
-    Tensor bc = (b_in.dtype() == dt ? b_in : b_in.to(dt)).expand(out_shape).contiguous();
+    Tensor ac = a_in.dtype() == dt ? a_in : a_in.to(dt);
+    Tensor bc = b_in.dtype() == dt ? b_in : b_in.to(dt);
     Tensor out = Tensor::empty(out_shape, dt, a_in.device());
-    int64_t n = out.numel();
-    if (n == 0) return out;
-    dim3 grid, block;
-    launch_ew(grid, block, n);
-    auto stream = getCurrentCUDAStream().stream();
+    if (out.numel() == 0) return out;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(out)
+        .add_input(ac)
+        .add_input(bc)
+        .build();
     if (dt == DType::Bool) {
-        ew_binary_kernel<bool><<<grid, block, 0, stream>>>(
-            n, ac.data_ptr<bool>(), bc.data_ptr<bool>(), out.data_ptr<bool>(), pred);
-        CUDA_CHECK(cudaGetLastError());
+        gpu_kernel(iter, [pred] __device__ (bool lhs, bool rhs) -> bool {
+            return pred(lhs, rhs);
+        });
         return out;
     }
 #define TP_BIT_BIN(ctype, name_) \
     case DType::name_: \
-        ew_binary_kernel<ctype><<<grid, block, 0, stream>>>( \
-            n, ac.data_ptr<ctype>(), bc.data_ptr<ctype>(), out.data_ptr<ctype>(), pred); \
+        gpu_kernel(iter, [pred] __device__ (ctype lhs, ctype rhs) -> ctype { \
+            return pred(lhs, rhs); \
+        }); \
         break;
     switch (dt) {
         TENSORPLAY_FORALL_INT_TYPES_CUDA(TP_BIT_BIN)
         default: TP_THROW(TypeError, name, ": unsupported dtype");
     }
 #undef TP_BIT_BIN
-    CUDA_CHECK(cudaGetLastError());
     return out;
 }
 
 template <typename Pred>
 Tensor bitwise_scalar_cuda(const Tensor& self_in, Scalar other, Pred pred, const char* name) {
     bitwise_check_cuda(self_in, name);
-    Tensor sc = self_in.contiguous();
     Tensor out = Tensor::empty(shape_of(self_in), self_in.dtype(), self_in.device());
-    int64_t n = out.numel();
-    if (n == 0) return out;
-    dim3 grid, block;
-    launch_ew(grid, block, n);
-    auto stream = getCurrentCUDAStream().stream();
+    if (out.numel() == 0) return out;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(out)
+        .add_input(self_in)
+        .build();
     if (self_in.dtype() == DType::Bool) {
         const bool ov = other.to<bool>();
-        bitwise_binary_scalar_kernel<bool><<<grid, block, 0, stream>>>(
-            n, sc.data_ptr<bool>(), ov, out.data_ptr<bool>(), pred);
-        CUDA_CHECK(cudaGetLastError());
+        gpu_kernel(iter, [pred, ov] __device__ (bool value) -> bool {
+            return pred(value, ov);
+        });
         return out;
     }
 #define TP_BIT_SCALAR(ctype, name_) \
     case DType::name_: { \
         ctype ov = static_cast<ctype>(other.to<int64_t>()); \
-        bitwise_binary_scalar_kernel<ctype><<<grid, block, 0, stream>>>( \
-            n, sc.data_ptr<ctype>(), ov, out.data_ptr<ctype>(), pred); \
+        gpu_kernel(iter, [pred, ov] __device__ (ctype value) -> ctype { \
+            return pred(value, ov); \
+        }); \
         break; \
     }
     switch (self_in.dtype()) {
@@ -179,38 +165,35 @@ Tensor bitwise_scalar_cuda(const Tensor& self_in, Scalar other, Pred pred, const
         default: TP_THROW(TypeError, name, ": unsupported dtype");
     }
 #undef TP_BIT_SCALAR
-    CUDA_CHECK(cudaGetLastError());
     return out;
 }
 
 Tensor bitwise_not_cuda(const Tensor& self) {
     bitwise_check_cuda(self, "bitwise_not");
-    Tensor sc = self.contiguous();
     Tensor out = Tensor::empty(shape_of(self), self.dtype(), self.device());
-    int64_t n = out.numel();
-    if (n == 0) return out;
-    dim3 grid, block;
-    launch_ew(grid, block, n);
-    auto stream = getCurrentCUDAStream().stream();
+    if (out.numel() == 0) return out;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(out)
+        .add_input(self)
+        .build();
     if (self.dtype() == DType::Bool) {
-        bitwise_unary_kernel<bool><<<grid, block, 0, stream>>>(
-            n, sc.data_ptr<bool>(), out.data_ptr<bool>(),
-            [] __device__ (bool x) -> bool { return !x; });
-        CUDA_CHECK(cudaGetLastError());
+        gpu_kernel(iter, [] __device__ (bool value) -> bool {
+            return !value;
+        });
         return out;
     }
 #define TP_BNOT(ctype, name_) \
     case DType::name_: \
-        bitwise_unary_kernel<ctype><<<grid, block, 0, stream>>>( \
-            n, sc.data_ptr<ctype>(), out.data_ptr<ctype>(), \
-            [] __device__ (ctype x) -> ctype { return static_cast<ctype>(~x); }); \
+        gpu_kernel(iter, [] __device__ (ctype value) -> ctype { \
+            return static_cast<ctype>(~value); \
+        }); \
         break;
     switch (self.dtype()) {
         TENSORPLAY_FORALL_INT_TYPES_CUDA(TP_BNOT)
         default: TP_THROW(TypeError, "bitwise_not: unsupported dtype");
     }
 #undef TP_BNOT
-    CUDA_CHECK(cudaGetLastError());
     return out;
 }
 
@@ -223,21 +206,21 @@ Tensor bitwise_shift_tensor_cuda_impl(const Tensor& a_in, const Tensor& b_in, co
     if (dt != DType::Bool && !isIntegralType(dt)) {
         TP_THROW(TypeError, name, ": only integral and boolean types are supported");
     }
-    Tensor ac = (a_in.dtype() == dt ? a_in : a_in.to(dt)).expand(out_shape).contiguous();
-    Tensor bc = (b_in.dtype() == dt ? b_in : b_in.to(dt)).expand(out_shape).contiguous();
+    Tensor ac = a_in.dtype() == dt ? a_in : a_in.to(dt);
+    Tensor bc = b_in.dtype() == dt ? b_in : b_in.to(dt);
     Tensor out = Tensor::empty(out_shape, dt, a_in.device());
-    int64_t n = out.numel();
-    if (n == 0) return out;
-    dim3 grid, block;
-    launch_ew(grid, block, n);
-    auto stream = getCurrentCUDAStream().stream();
+    if (out.numel() == 0) return out;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(out)
+        .add_input(ac)
+        .add_input(bc)
+        .build();
 #define TP_SHIFT_BIN(ctype, name_) \
     case DType::name_: { \
-        auto op = [] __device__ (ctype x, ctype y) -> ctype { \
-            return bitwise_shift_value<ctype, kLeft>(x, y); \
-        }; \
-        ew_binary_kernel<ctype><<<grid, block, 0, stream>>>( \
-            n, ac.data_ptr<ctype>(), bc.data_ptr<ctype>(), out.data_ptr<ctype>(), op); \
+        gpu_kernel(iter, [] __device__ (ctype value, ctype shift) -> ctype { \
+            return bitwise_shift_value<ctype, kLeft>(value, shift); \
+        }); \
         break; \
     }
     switch (dt) {
@@ -245,7 +228,6 @@ Tensor bitwise_shift_tensor_cuda_impl(const Tensor& a_in, const Tensor& b_in, co
         default: TP_THROW(TypeError, name, ": unsupported dtype");
     }
 #undef TP_SHIFT_BIN
-    CUDA_CHECK(cudaGetLastError());
     return out;
 }
 
@@ -253,21 +235,19 @@ template <bool kLeft>
 Tensor bitwise_shift_scalar_cuda_impl(const Tensor& a_in, Scalar other, const char* name) {
     bitwise_check_cuda(a_in, name);
     const int64_t shift = other.to<int64_t>();
-    Tensor sc = a_in.contiguous();
     Tensor out = Tensor::empty(shape_of(a_in), a_in.dtype(), a_in.device());
-    int64_t n = out.numel();
-    if (n == 0) return out;
-    dim3 grid, block;
-    launch_ew(grid, block, n);
-    auto stream = getCurrentCUDAStream().stream();
+    if (out.numel() == 0) return out;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(out)
+        .add_input(a_in)
+        .build();
 #define TP_SHIFT_SCALAR(ctype, name_) \
     case DType::name_: { \
         const ctype sh = static_cast<ctype>(shift); \
-        auto op = [] __device__ (ctype x, ctype y) -> ctype { \
-            return bitwise_shift_value<ctype, kLeft>(x, y); \
-        }; \
-        bitwise_binary_scalar_kernel<ctype><<<grid, block, 0, stream>>>( \
-            n, sc.data_ptr<ctype>(), sh, out.data_ptr<ctype>(), op); \
+        gpu_kernel(iter, [sh] __device__ (ctype value) -> ctype { \
+            return bitwise_shift_value<ctype, kLeft>(value, sh); \
+        }); \
         break; \
     }
     switch (a_in.dtype()) {
@@ -275,41 +255,28 @@ Tensor bitwise_shift_scalar_cuda_impl(const Tensor& a_in, Scalar other, const ch
         default: TP_THROW(TypeError, name, ": unsupported dtype");
     }
 #undef TP_SHIFT_SCALAR
-    CUDA_CHECK(cudaGetLastError());
     return out;
 }
 
 // --- Named entry points registered with the dispatcher ----------------------
 
 Tensor bitwise_and_tensor_cuda(const Tensor& a, const Tensor& b) {
-    return bitwise_binary_cuda(a, b,
-        [] __device__ (auto x, auto y) { return static_cast<decltype(x)>(x & y); },
-        "bitwise_and");
+    return bitwise_binary_cuda(a, b, BitwiseAnd(), "bitwise_and");
 }
 Tensor bitwise_or_tensor_cuda(const Tensor& a, const Tensor& b) {
-    return bitwise_binary_cuda(a, b,
-        [] __device__ (auto x, auto y) { return static_cast<decltype(x)>(x | y); },
-        "bitwise_or");
+    return bitwise_binary_cuda(a, b, BitwiseOr(), "bitwise_or");
 }
 Tensor bitwise_xor_tensor_cuda(const Tensor& a, const Tensor& b) {
-    return bitwise_binary_cuda(a, b,
-        [] __device__ (auto x, auto y) { return static_cast<decltype(x)>(x ^ y); },
-        "bitwise_xor");
+    return bitwise_binary_cuda(a, b, BitwiseXor(), "bitwise_xor");
 }
 Tensor bitwise_and_scalar_cuda(const Tensor& a, Scalar b) {
-    return bitwise_scalar_cuda(a, b,
-        [] __device__ (auto x, auto y) { return static_cast<decltype(x)>(x & y); },
-        "bitwise_and");
+    return bitwise_scalar_cuda(a, b, BitwiseAnd(), "bitwise_and");
 }
 Tensor bitwise_or_scalar_cuda(const Tensor& a, Scalar b) {
-    return bitwise_scalar_cuda(a, b,
-        [] __device__ (auto x, auto y) { return static_cast<decltype(x)>(x | y); },
-        "bitwise_or");
+    return bitwise_scalar_cuda(a, b, BitwiseOr(), "bitwise_or");
 }
 Tensor bitwise_xor_scalar_cuda(const Tensor& a, Scalar b) {
-    return bitwise_scalar_cuda(a, b,
-        [] __device__ (auto x, auto y) { return static_cast<decltype(x)>(x ^ y); },
-        "bitwise_xor");
+    return bitwise_scalar_cuda(a, b, BitwiseXor(), "bitwise_xor");
 }
 Tensor bitwise_lshift_tensor_cuda(const Tensor& a, const Tensor& b) {
     return bitwise_shift_tensor_cuda_impl<true>(a, b, "bitwise_left_shift");
@@ -339,25 +306,19 @@ Tensor bitwise_and_scalar_tensor_cuda(Scalar self, const Tensor& other) {
     bitwise_check_cuda(other, "bitwise_and");
     bitwise_scalar_check_cuda(self, "bitwise_and");
     Tensor wrapped = Tensor::full({}, self, other.dtype(), other.device());
-    return bitwise_binary_cuda(wrapped, other,
-        [] __device__ (auto x, auto y) { return static_cast<decltype(x)>(x & y); },
-        "bitwise_and");
+    return bitwise_binary_cuda(wrapped, other, BitwiseAnd(), "bitwise_and");
 }
 Tensor bitwise_or_scalar_tensor_cuda(Scalar self, const Tensor& other) {
     bitwise_check_cuda(other, "bitwise_or");
     bitwise_scalar_check_cuda(self, "bitwise_or");
     Tensor wrapped = Tensor::full({}, self, other.dtype(), other.device());
-    return bitwise_binary_cuda(wrapped, other,
-        [] __device__ (auto x, auto y) { return static_cast<decltype(x)>(x | y); },
-        "bitwise_or");
+    return bitwise_binary_cuda(wrapped, other, BitwiseOr(), "bitwise_or");
 }
 Tensor bitwise_xor_scalar_tensor_cuda(Scalar self, const Tensor& other) {
     bitwise_check_cuda(other, "bitwise_xor");
     bitwise_scalar_check_cuda(self, "bitwise_xor");
     Tensor wrapped = Tensor::full({}, self, other.dtype(), other.device());
-    return bitwise_binary_cuda(wrapped, other,
-        [] __device__ (auto x, auto y) { return static_cast<decltype(x)>(x ^ y); },
-        "bitwise_xor");
+    return bitwise_binary_cuda(wrapped, other, BitwiseXor(), "bitwise_xor");
 }
 Tensor bitwise_lshift_scalar_tensor_cuda(Scalar self, const Tensor& other) {
     bitwise_check_cuda(other, "bitwise_left_shift");
