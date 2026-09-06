@@ -1550,15 +1550,13 @@ Tensor binary_float_op_kernel_v2(const Tensor& self, const Tensor& other, Functo
     switch (out_dtype) {
         case DType::Float16:
             gpu_kernel(iter, [functor] __device__(Half lhs, Half rhs) -> Half {
-                return static_cast<Half>(functor(static_cast<float>(lhs),
-                                                 static_cast<float>(rhs)));
+                return functor(lhs, rhs);
             });
             break;
         case DType::BFloat16:
             gpu_kernel(iter, [functor] __device__(BFloat16 lhs,
                                                   BFloat16 rhs) -> BFloat16 {
-                return static_cast<BFloat16>(functor(static_cast<float>(lhs),
-                                                     static_cast<float>(rhs)));
+                return functor(lhs, rhs);
             });
             break;
         case DType::Float32:
