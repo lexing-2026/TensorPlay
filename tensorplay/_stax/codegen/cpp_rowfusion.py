@@ -114,6 +114,9 @@ class RowStep:
     # reduce: the elementwise program feeding the accumulator
     instructions: tuple[tuple[str, int, int, int], ...] = ()
     output_ref: int = 0
+    # reduce: staging slot this pass writes its values into, or -1 when a
+    # later stage does not need them again
+    stage: int = -1
     # rowop: operand references in the shared ref space
     lhs: int = 0
     rhs: int = -1
@@ -124,12 +127,14 @@ class RowFusion:
     """A region reduced to row stages plus a final per-row or per-element value.
 
     References follow the shared program encoding, extended so the first
-    ``input_count`` slots are tensor inputs and the next ``row_slots`` are the
-    per-row values produced by the stages.
+    ``input_count`` slots are tensor inputs, the next ``row_slots`` are the
+    per-row values produced by the stages, and the last ``stage_slots`` are
+    row-length buffers a pass fills for the passes that follow it.
     """
 
     input_count: int
     row_slots: int
+    stage_slots: int
     constants: tuple[float, ...]
     steps: tuple[RowStep, ...]
     output_kind: str  # "elem" | "row"
@@ -139,6 +144,12 @@ class RowFusion:
     rows: int
     in_shape: tuple[int, ...]
     out_shape: tuple[int, ...]
+
+
+def _ref_space(fusion: "RowFusion") -> int:
+    """Size of the reference space a stage program is encoded against."""
+
+    return fusion.input_count + fusion.row_slots + fusion.stage_slots
 
 
 def _row_expr(op: str, lhs: str, rhs: str) -> str:
@@ -171,8 +182,10 @@ def _elem_modes(
 ) -> tuple[tuple[str, int], ...]:
     """Extend the tensor addressing modes with the per-row value slots."""
 
-    return tuple(input_modes) + tuple(
-        ("rowval", slot) for slot in range(fusion.row_slots)
+    return (
+        tuple(input_modes)
+        + tuple(("rowval", slot) for slot in range(fusion.row_slots))
+        + tuple(("staged", slot) for slot in range(fusion.stage_slots))
     )
 
 
@@ -187,7 +200,7 @@ def _emit_reduce_stage(
 
     extent = fusion.reduce_extent
     op = step.op
-    total_inputs = fusion.input_count + fusion.row_slots
+    total_inputs = _ref_space(fusion)
     lines: list[str] = []
     lines.append(f"{indent}{{")
     body = indent + "    "
@@ -197,7 +210,9 @@ def _emit_reduce_stage(
         _cascade_setup(op, f"({extent}L / ({_ILP}L * W))", body, _ILP)
     )
 
-    def program(target_indent: str, offset: str, count: str, suffix: str):
+    def program(
+        target_indent: str, offset: str, row_offset: str, count: str, suffix: str
+    ):
         return emit_value_program(
             list(step.instructions),
             list(fusion.constants),
@@ -209,33 +224,47 @@ def _emit_reduce_stage(
             count_expr=count,
             suffix=suffix,
             input_modes=modes,
+            row_offset=row_offset,
         )
+
+    def stage_store(target_indent: str, result: str, position: str, count: str):
+        # The value is already in a register; keeping it costs one store and
+        # saves every later pass the whole expression that produced it.
+        if step.stage < 0:
+            return []
+        return [f"{target_indent}{result}.store(sc{step.stage} + {position}, {count});"]
 
     lines.append(f"{body}long i = 0;")
     lines.append(f"{body}for (; i + {_ILP}L * W <= {extent}L; i += {_ILP}L * W) {{")
     lane = body + "    "
     results = []
     for group in range(_ILP):
-        offset = "base + i" if group == 0 else f"base + i + {group}L * W"
-        group_lines, result = program(lane, offset, "W", f"_r{step.slot}_{group}")
+        span = "i" if group == 0 else f"i + {group}L * W"
+        group_lines, result = program(
+            lane, f"base + {span}", span, "W", f"_r{step.slot}_{group}"
+        )
         lines.extend(group_lines)
-        results.append(result)
-    for group, result in enumerate(results):
+        results.append((result, span))
+    for group, (result, _span) in enumerate(results):
         lines.append(f"{lane}a{group} = {_combine(op, f'a{group}', result)};")
+    for result, span in results:
+        lines.extend(stage_store(lane, result, span, "W"))
     lines.extend(_cascade_tick(op, lane, _ILP))
     lines.append(f"{body}}}")
 
     lines.append(f"{body}for (; i + W <= {extent}L; i += W) {{")
-    step_lines, result = program(lane, "base + i", "W", f"_r{step.slot}_s")
+    step_lines, result = program(lane, "base + i", "i", "W", f"_r{step.slot}_s")
     lines.extend(step_lines)
     lines.append(f"{lane}a0 = {_combine(op, 'a0', result)};")
+    lines.extend(stage_store(lane, result, "i", "W"))
     lines.append(f"{body}}}")
 
     lines.append(f"{body}if (i < {extent}L) {{")
     lines.append(f"{lane}const long count = {extent}L - i;")
-    tail_lines, result = program(lane, "base + i", "count", f"_r{step.slot}_p")
+    tail_lines, result = program(lane, "base + i", "i", "count", f"_r{step.slot}_p")
     lines.extend(tail_lines)
     lines.append(f"{lane}a0 = V::set(a0, {_combine(op, 'a0', result)}, count);")
+    lines.extend(stage_store(lane, result, "i", "count"))
     lines.append(f"{body}}}")
 
     lines.extend(_cascade_flush(op, body, _ILP))
@@ -260,7 +289,7 @@ def _emit_output_stage(
 ) -> list[str]:
     """Store the row: a full elementwise pass, or the single row value."""
 
-    total_inputs = fusion.input_count + fusion.row_slots
+    total_inputs = _ref_space(fusion)
     if fusion.output_kind == "row":
         return [
             f"{indent}float out_lanes_[{_MAX_LANES}];",
@@ -273,7 +302,9 @@ def _emit_output_stage(
     lines.append(f"{indent}float* __restrict__ orow = out + base;")
     lines.append(f"{indent}long q = 0;")
 
-    def program(target_indent: str, offset: str, count: str, suffix: str):
+    def program(
+        target_indent: str, offset: str, row_offset: str, count: str, suffix: str
+    ):
         return emit_value_program(
             list(fusion.out_instructions),
             list(fusion.constants),
@@ -285,6 +316,7 @@ def _emit_output_stage(
             count_expr=count,
             suffix=suffix,
             input_modes=modes,
+            row_offset=row_offset,
         )
 
     lines.append(f"{indent}for (; q + {_ILP}L * W <= {extent}L; q += {_ILP}L * W) {{")
@@ -293,22 +325,23 @@ def _emit_output_stage(
     # dependency chains overlap instead of serializing on the store port.
     stores: list[tuple[str, str]] = []
     for group in range(_ILP):
-        offset = "base + q" if group == 0 else f"base + q + {group}L * W"
-        group_lines, result = program(lane, offset, "W", f"_o{group}")
+        span = "q" if group == 0 else f"q + {group}L * W"
+        group_lines, result = program(
+            lane, f"base + {span}", span, "W", f"_o{group}"
+        )
         lines.extend(group_lines)
-        target = "orow + q" if group == 0 else f"orow + q + {group}L * W"
-        stores.append((result, target))
+        stores.append((result, f"orow + {span}"))
     for result, target in stores:
         lines.append(f"{lane}{result}.store({target}, W);")
     lines.append(f"{indent}}}")
     lines.append(f"{indent}for (; q + W <= {extent}L; q += W) {{")
-    step_lines, result = program(lane, "base + q", "W", "_os")
+    step_lines, result = program(lane, "base + q", "q", "W", "_os")
     lines.extend(step_lines)
     lines.append(f"{lane}{result}.store(orow + q, W);")
     lines.append(f"{indent}}}")
     lines.append(f"{indent}if (q < {extent}L) {{")
     lines.append(f"{lane}const long count = {extent}L - q;")
-    tail_lines, result = program(lane, "base + q", "count", "_op")
+    tail_lines, result = program(lane, "base + q", "q", "count", "_op")
     lines.extend(tail_lines)
     lines.append(f"{lane}{result}.store(orow + q, count);")
     lines.append(f"{indent}}}")
@@ -339,7 +372,7 @@ def render_row_fusion_source(
         if mode == "colmod" and width != fusion.reduce_extent:
             raise _ProgramError("row-broadcast width is not the row extent")
     modes = _elem_modes(fusion, tensor_modes)
-    total_inputs = fusion.input_count + fusion.row_slots
+    total_inputs = _ref_space(fusion)
 
     # Validate every program against the shared encoding before emitting.
     used_per_step: list[set[int]] = []
@@ -394,11 +427,26 @@ def render_row_fusion_source(
         f"    const V h{ref} = V(in{ref}[0]);" for ref in hoisted
     )
 
-    body_lines: list[str] = [
-        "    float* __restrict__ out = c->out;",
-        "    for (long row = b; row < e; ++row) {",
-        f"        const long base = row * {fusion.reduce_extent}L;",
-    ]
+    body_lines: list[str] = ["    float* __restrict__ out = c->out;"]
+    if fusion.stage_slots:
+        # One row-length buffer per staged value, taken once per worker and
+        # reused by every row it walks.  A row is small enough to sit in the
+        # nearest cache, which is the whole point of staging it.
+        body_lines.append(
+            f"    std::vector<float> staged_((size_t){fusion.stage_slots}"
+            f" * {fusion.reduce_extent}L);"
+        )
+        for slot in range(fusion.stage_slots):
+            body_lines.append(
+                f"    float* __restrict__ sc{slot} = staged_.data()"
+                f" + {slot}L * {fusion.reduce_extent}L;"
+            )
+    body_lines.extend(
+        [
+            "    for (long row = b; row < e; ++row) {",
+            f"        const long base = row * {fusion.reduce_extent}L;",
+        ]
+    )
     for slot in range(fusion.row_slots):
         body_lines.append(f"        V s{slot} = V(0.0f);")
     for index, step in enumerate(fusion.steps):

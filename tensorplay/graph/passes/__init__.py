@@ -3,7 +3,11 @@
 from .base import PassBase, PassResult
 from .constant_folding import ConstFold
 from .dead_code_elimination import DeadCodeElimination
-from .decompose import DecomposePass
+from .decompose import (
+    DecomposePass,
+    DecomposeRowNormalizations,
+    row_normalization_names,
+)
 from .fusion_hint import POINTWISE_FUSED_OP_NAMES, PointwiseFusionHint
 from .fake_tensor_prop import FakeTensorProp
 from .annotate_getitem_nodes import annotate_getitem_nodes
@@ -79,6 +83,8 @@ __all__ = [
     "Component",
     "DeadCodeElimination",
     "DecomposePass",
+    "DecomposeRowNormalizations",
+    "row_normalization_names",
     "GraphDrawer",
     "GraphAccFusionsFinder",
     "GraphNetAccNodesFinder",

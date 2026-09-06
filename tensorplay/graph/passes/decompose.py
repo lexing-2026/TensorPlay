@@ -519,35 +519,146 @@ def _clamp(graph: Graph, node: Node) -> Node:
     return result
 
 
+# --- row-normalization rewrites --------------------------------------------
+#
+# These land on the same primitive set as the table above, but they are kept
+# out of the default pipeline on purpose: each composite here already has a
+# dedicated fused kernel, so expanding it unconditionally would trade one
+# pass over the input for several.  A backend that folds the expansion back
+# into a single kernel -- and the surrounding region with it -- opts in
+# through :class:`DecomposeRowNormalizations`.
+
+_ROW_NORM_METHODS: Dict[str, Callable[[Graph, Node], Node]] = {}
+
+
+def _row_norm(name: str):
+    def register(fn: Callable[[Graph, Node], Node]) -> None:
+        _ROW_NORM_METHODS[name] = fn
+
+    return register
+
+
+def _softmax_arguments(node: Node) -> Any:
+    """Read ``(dim,)`` from a softmax-family call, or ``None`` to decline.
+
+    The trailing positional arguments are ``dim`` then ``dtype``; a request
+    to compute in another dtype needs a conversion these rules do not emit.
+    """
+
+    rest = list(node.args[1:])
+    kwargs = dict(node.kwargs or {})
+    if len(rest) > 2:
+        return None
+    dim: Any = rest[0] if rest else None
+    dtype: Any = rest[1] if len(rest) >= 2 else None
+    if "dim" in kwargs:
+        if dim is not None:
+            return None
+        dim = kwargs.pop("dim")
+    if "dtype" in kwargs:
+        if len(rest) >= 2:
+            return None
+        dtype = kwargs.pop("dtype")
+    if kwargs:
+        return None
+    if dtype is not None and str(dtype).rsplit(".", 1)[-1].lower() != "undefined":
+        return None
+    if dim is None or isinstance(dim, bool) or not isinstance(dim, int):
+        return None
+    return (int(dim),)
+
+
+def _shifted_row(graph: Graph, x: Any, dim: int) -> tuple[Node, Node]:
+    """``x`` minus its row maximum, together with the exponential of it.
+
+    Subtracting the maximum is what keeps the exponential finite for large
+    inputs; it cancels exactly in both quotients below.
+    """
+
+    largest = graph.create_node("call_method", "amax", (x, [dim], True))
+    shifted = _binop(graph, operator.sub, x, largest)
+    return shifted, _unop(graph, "exp", shifted)
+
+
+@_row_norm("softmax")
+def _softmax(graph: Graph, node: Node) -> Node:
+    """softmax(x, dim) -> e / sum(e, dim), e = exp(x - amax(x, dim))"""
+
+    parsed = _softmax_arguments(node)
+    if parsed is None:
+        return node
+    (dim,) = parsed
+    _, exponentials = _shifted_row(graph, node.args[0], dim)
+    total = graph.create_node("call_method", "sum", (exponentials, dim, True))
+    return _binop(graph, operator.truediv, exponentials, total)
+
+
+@_row_norm("log_softmax")
+def _log_softmax(graph: Graph, node: Node) -> Node:
+    """log_softmax(x, dim) -> (x - m) - log(sum(exp(x - m), dim)), m the row max"""
+
+    parsed = _softmax_arguments(node)
+    if parsed is None:
+        return node
+    (dim,) = parsed
+    shifted, exponentials = _shifted_row(graph, node.args[0], dim)
+    total = graph.create_node("call_method", "sum", (exponentials, dim, True))
+    return _binop(graph, operator.sub, shifted, _unop(graph, "log", total))
+
+
+def _rewrite(
+    graph_module: GraphModule, table: Dict[str, Callable[[Graph, Node], Node]]
+) -> PassResult:
+    graph = graph_module.graph
+    changed = False
+    for node in list(graph.nodes):
+        if node.op == "call_method":
+            name = node.target if isinstance(node.target, str) else None
+        elif node.op == "call_function":
+            name = getattr(node.target, "__name__", None)
+        else:
+            continue
+        if name is None:
+            continue
+        rule = table.get(name)
+        if rule is None:
+            continue
+        # Replacement sub-chains must precede the replaced node's users:
+        # create them directly before the original site.  inserting_before
+        with graph.inserting_before(node):
+            replacement = rule(graph, node)
+        if replacement is node:
+            # Rule declined this spelling (unsupported argument shape);
+            # leave the operator for the backend to handle or fall back.
+            continue
+        node.replace_all_uses_with(replacement)
+        changed = True
+    if not changed:
+        return PassResult(graph_module, False)
+    DeadCodeElimination()(graph_module)
+    return PassResult(graph_module, True)
+
+
 class DecomposePass(PassBase):
     """Rewrite registered composite methods into derivative-covered primitives."""
 
     def __call__(self, graph_module: GraphModule) -> PassResult:
-        graph = graph_module.graph
-        changed = False
-        for node in list(graph.nodes):
-            if node.op == "call_method":
-                name = node.target if isinstance(node.target, str) else None
-            elif node.op == "call_function":
-                name = getattr(node.target, "__name__", None)
-            else:
-                continue
-            if name is None:
-                continue
-            rule = _DECOMP_METHODS.get(name)
-            if rule is None:
-                continue
-            # Replacement sub-chains must precede the replaced node's users:
-            # create them directly before the original site.  inserting_before
-            with graph.inserting_before(node):
-                replacement = rule(graph, node)
-            if replacement is node:
-                # Rule declined this spelling (unsupported argument shape);
-                # leave the operator for the backend to handle or fall back.
-                continue
-            node.replace_all_uses_with(replacement)
-            changed = True
-        if not changed:
-            return PassResult(graph_module, False)
-        DeadCodeElimination()(graph_module)
-        return PassResult(graph_module, True)
+        return _rewrite(graph_module, _DECOMP_METHODS)
+
+
+class DecomposeRowNormalizations(PassBase):
+    """Expand the softmax family into reductions and elementwise primitives.
+
+    Opt-in: run it only where the expansion is going to be fused back into
+    one kernel, since the composites it replaces are single fused kernels
+    themselves.
+    """
+
+    def __call__(self, graph_module: GraphModule) -> PassResult:
+        return _rewrite(graph_module, _ROW_NORM_METHODS)
+
+
+def row_normalization_names() -> frozenset:
+    """Operator names :class:`DecomposeRowNormalizations` knows how to expand."""
+
+    return frozenset(_ROW_NORM_METHODS)
