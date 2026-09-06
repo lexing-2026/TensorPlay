@@ -1864,6 +1864,39 @@ Tensor gather_cuda(const Tensor& self, int64_t dim, const Tensor& index) {
         break;
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_GA_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(TP_GA_CASE)
+        case DType::ComplexHalf:
+            gather_kernel<tensorplay::complex<Half>><<<
+                (n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+                n, idx_dim_size, idx_inner, self_dim_size, self_inner,
+                static_cast<const tensorplay::complex<Half>*>(self_c.data_ptr()),
+                idx_c.data_ptr<int64_t>(),
+                static_cast<tensorplay::complex<Half>*>(result.data_ptr()));
+            break;
+        case DType::ComplexFloat:
+            gather_kernel<tensorplay::complex<float>><<<
+                (n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+                n, idx_dim_size, idx_inner, self_dim_size, self_inner,
+                static_cast<const tensorplay::complex<float>*>(self_c.data_ptr()),
+                idx_c.data_ptr<int64_t>(),
+                static_cast<tensorplay::complex<float>*>(result.data_ptr()));
+            break;
+        case DType::ComplexDouble:
+            gather_kernel<tensorplay::complex<double>><<<
+                (n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+                n, idx_dim_size, idx_inner, self_dim_size, self_inner,
+                static_cast<const tensorplay::complex<double>*>(self_c.data_ptr()),
+                idx_c.data_ptr<int64_t>(),
+                static_cast<tensorplay::complex<double>*>(result.data_ptr()));
+            break;
+        case DType::BComplex32:
+            gather_kernel<tensorplay::complex<BFloat16>><<<
+                (n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+                n, idx_dim_size, idx_inner, self_dim_size, self_inner,
+                static_cast<const tensorplay::complex<BFloat16>*>(self_c.data_ptr()),
+                idx_c.data_ptr<int64_t>(),
+                static_cast<tensorplay::complex<BFloat16>*>(result.data_ptr()));
+            break;
         default: TP_THROW(TypeError, "gather: unsupported dtype");
     }
 #undef TP_GA_CASE
