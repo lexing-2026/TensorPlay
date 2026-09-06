@@ -118,7 +118,10 @@ struct Vectorized<double> {
 
   bool has_inf_nan() const {
     __m256d self_sub = _mm256_sub_pd(values, values);
-    return (_mm256_movemask_epi8(_mm256_castpd_si256(self_sub)) & 0x88888888) !=
+    // inf/NaN self-subtract to NaN, whose top exponent byte differs from
+    // zero; the sign byte stays masked out so a quiet NaN (positive sign)
+    // is still detected.
+    return (_mm256_movemask_epi8(_mm256_castpd_si256(self_sub)) & 0x77777777) !=
         0;
   }
 

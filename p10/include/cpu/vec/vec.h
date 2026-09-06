@@ -1,11 +1,25 @@
 #pragma once
 
 // Dispatch header: selects the vec layer for the CPU capability this TU is
+// compiled with. The x86 tiers use the AVX2/AVX-512 backends; the VSX,
+// ZVECTOR and SVE tiers use their own intrinsic backends; every other
+// configuration (x86 DEFAULT, plain aarch64, unknown hosts) falls back to
+// the generic template in vec_base.h.
 
 #if defined(CPU_CAPABILITY_AVX512)
 // Full-width 512-bit layer (float/double; int32/int64 pending).
 #include "cpu/vec/vec512/vec512.h"
+#elif defined(CPU_CAPABILITY_VSX)
+// PowerPC VSX tier: 256-bit emulation over two 128-bit registers.
+#include "cpu/vec/vec256/vsx/vsx.h"
+#elif defined(CPU_CAPABILITY_ZVECTOR)
+// s390x vector-facility tier: 256-bit emulation over two 128-bit registers.
+#include "cpu/vec/vec256/zarch/zarch.h"
+#elif defined(CPU_CAPABILITY_SVE256) || defined(CPU_CAPABILITY_SVE128)
+// aarch64 SVE tiers: single fixed-length vector per value.
+#include "cpu/vec/sve/vec_sve.h"
 #else
+// x86 DEFAULT / bare -mavx2 builds and the generic fallback path.
 #include "cpu/vec/vec128/vec128.h"
 #include "cpu/vec/vec256/vec256.h"
 #endif

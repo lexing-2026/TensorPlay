@@ -7,7 +7,8 @@
 // flags are absent, the macros are derived from the compiler's own ISA
 // macros so that e.g. -mavx2 builds automatically get the AVX2 vec layer.
 
-#if !defined(CPU_CAPABILITY_AVX512) && !defined(CPU_CAPABILITY_AVX2) && \
+#if !defined(CPU_CAPABILITY_DEFAULT) && \
+    !defined(CPU_CAPABILITY_AVX512) && !defined(CPU_CAPABILITY_AVX2) && \
     !defined(CPU_CAPABILITY_VSX) && !defined(CPU_CAPABILITY_ZVECTOR) && \
     !defined(CPU_CAPABILITY_SVE256) && !defined(CPU_CAPABILITY_SVE128)
 #if defined(__AVX2__)
@@ -29,10 +30,11 @@
 #endif
 #endif
 
-// included so that vector type declarations (__m256 etc.) are visible in
-// every TU. Intrinsic *functions* are only usable where the ISA is enabled
-// uninstantiated class members in the vec256 headers therefore compile fine
-// under DEFAULT.
+// included so that vector type declarations (__m256, __vector float,
+// svfloat32_t, ...) are visible in every TU. Intrinsic *functions* are only
+// usable where the ISA is enabled; uninstantiated class members in the
+// vec256 headers therefore compile fine under DEFAULT.
+#include "cpu/vec/Intrinsics.h"
 #if defined(__GNUC__) || defined(__clang__)
 #if defined(__x86_64__) || defined(__i386__)
 #include <x86intrin.h>

@@ -267,3 +267,352 @@ inline __m512d hypot(__m512d a, __m512d b) { return Sleef_hypotd8_u05(a, b); }
 } // namespace tpsleef
 } // namespace tensorplay
 #endif // x86-64 vector helpers
+
+#if defined(__VSX__) || defined(CPU_CAPABILITY_VSX)
+// VSX tier: SLEEF's 2x double / 4x float VSX entry points. The libm
+// dispatcher symbols are used so the running POWER generation picks its
+// best implementation at load time.
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// (f4 = 4 x float)
+__vector float Sleef_expf4_u10(__vector float);
+__vector float Sleef_exp2f4_u10(__vector float);
+__vector float Sleef_expm1f4_u10(__vector float);
+__vector float Sleef_logf4_u10(__vector float);
+__vector float Sleef_log2f4_u10(__vector float);
+__vector float Sleef_log10f4_u10(__vector float);
+__vector float Sleef_log1pf4_u10(__vector float);
+__vector float Sleef_sinf4_u10(__vector float);
+__vector float Sleef_cosf4_u10(__vector float);
+__vector float Sleef_tanf4_u10(__vector float);
+__vector float Sleef_asinf4_u10(__vector float);
+__vector float Sleef_acosf4_u10(__vector float);
+__vector float Sleef_atanf4_u10(__vector float);
+__vector float Sleef_atan2f4_u10(__vector float, __vector float);
+__vector float Sleef_sinhf4_u10(__vector float);
+__vector float Sleef_coshf4_u10(__vector float);
+__vector float Sleef_tanhf4_u10(__vector float);
+__vector float Sleef_asinhf4_u10(__vector float);
+__vector float Sleef_acoshf4_u10(__vector float);
+__vector float Sleef_atanhf4_u10(__vector float);
+__vector float Sleef_erff4_u10(__vector float);
+__vector float Sleef_erfcf4_u15(__vector float);
+__vector float Sleef_powf4_u10(__vector float, __vector float);
+__vector float Sleef_hypotf4_u05(__vector float, __vector float);
+
+// (d2 = 2 x double)
+__vector double Sleef_expd2_u10(__vector double);
+__vector double Sleef_exp2d2_u10(__vector double);
+__vector double Sleef_expm1d2_u10(__vector double);
+__vector double Sleef_logd2_u10(__vector double);
+__vector double Sleef_log2d2_u10(__vector double);
+__vector double Sleef_log10d2_u10(__vector double);
+__vector double Sleef_log1pd2_u10(__vector double);
+__vector double Sleef_sind2_u10(__vector double);
+__vector double Sleef_cosd2_u10(__vector double);
+__vector double Sleef_tand2_u10(__vector double);
+__vector double Sleef_asind2_u10(__vector double);
+__vector double Sleef_acosd2_u10(__vector double);
+__vector double Sleef_atand2_u10(__vector double);
+__vector double Sleef_atan2d2_u10(__vector double, __vector double);
+__vector double Sleef_sinhd2_u10(__vector double);
+__vector double Sleef_coshd2_u10(__vector double);
+__vector double Sleef_tanhd2_u10(__vector double);
+__vector double Sleef_asinhd2_u10(__vector double);
+__vector double Sleef_acoshd2_u10(__vector double);
+__vector double Sleef_atanhd2_u10(__vector double);
+__vector double Sleef_erfd2_u10(__vector double);
+__vector double Sleef_erfcd2_u15(__vector double);
+__vector double Sleef_powd2_u10(__vector double, __vector double);
+__vector double Sleef_hypotd2_u05(__vector double, __vector double);
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
+
+namespace tensorplay {
+namespace tpsleef {
+inline __vector float exp(__vector float a) { return Sleef_expf4_u10(a); }
+inline __vector double exp(__vector double a) { return Sleef_expd2_u10(a); }
+inline __vector float exp2(__vector float a) { return Sleef_exp2f4_u10(a); }
+inline __vector double exp2(__vector double a) { return Sleef_exp2d2_u10(a); }
+inline __vector float expm1(__vector float a) { return Sleef_expm1f4_u10(a); }
+inline __vector double expm1(__vector double a) { return Sleef_expm1d2_u10(a); }
+inline __vector float log(__vector float a) { return Sleef_logf4_u10(a); }
+inline __vector double log(__vector double a) { return Sleef_logd2_u10(a); }
+inline __vector float log2(__vector float a) { return Sleef_log2f4_u10(a); }
+inline __vector double log2(__vector double a) { return Sleef_log2d2_u10(a); }
+inline __vector float log10(__vector float a) { return Sleef_log10f4_u10(a); }
+inline __vector double log10(__vector double a) { return Sleef_log10d2_u10(a); }
+inline __vector float log1p(__vector float a) { return Sleef_log1pf4_u10(a); }
+inline __vector double log1p(__vector double a) { return Sleef_log1pd2_u10(a); }
+inline __vector float sin(__vector float a) { return Sleef_sinf4_u10(a); }
+inline __vector double sin(__vector double a) { return Sleef_sind2_u10(a); }
+inline __vector float cos(__vector float a) { return Sleef_cosf4_u10(a); }
+inline __vector double cos(__vector double a) { return Sleef_cosd2_u10(a); }
+inline __vector float tan(__vector float a) { return Sleef_tanf4_u10(a); }
+inline __vector double tan(__vector double a) { return Sleef_tand2_u10(a); }
+inline __vector float asin(__vector float a) { return Sleef_asinf4_u10(a); }
+inline __vector double asin(__vector double a) { return Sleef_asind2_u10(a); }
+inline __vector float acos(__vector float a) { return Sleef_acosf4_u10(a); }
+inline __vector double acos(__vector double a) { return Sleef_acosd2_u10(a); }
+inline __vector float atan(__vector float a) { return Sleef_atanf4_u10(a); }
+inline __vector double atan(__vector double a) { return Sleef_atand2_u10(a); }
+inline __vector float atan2(__vector float a, __vector float b) { return Sleef_atan2f4_u10(a, b); }
+inline __vector double atan2(__vector double a, __vector double b) { return Sleef_atan2d2_u10(a, b); }
+inline __vector float sinh(__vector float a) { return Sleef_sinhf4_u10(a); }
+inline __vector double sinh(__vector double a) { return Sleef_sinhd2_u10(a); }
+inline __vector float cosh(__vector float a) { return Sleef_coshf4_u10(a); }
+inline __vector double cosh(__vector double a) { return Sleef_coshd2_u10(a); }
+inline __vector float tanh(__vector float a) { return Sleef_tanhf4_u10(a); }
+inline __vector double tanh(__vector double a) { return Sleef_tanhd2_u10(a); }
+inline __vector float asinh(__vector float a) { return Sleef_asinhf4_u10(a); }
+inline __vector double asinh(__vector double a) { return Sleef_asinhd2_u10(a); }
+inline __vector float acosh(__vector float a) { return Sleef_acoshf4_u10(a); }
+inline __vector double acosh(__vector double a) { return Sleef_acoshd2_u10(a); }
+inline __vector float atanh(__vector float a) { return Sleef_atanhf4_u10(a); }
+inline __vector double atanh(__vector double a) { return Sleef_atanhd2_u10(a); }
+inline __vector float erf(__vector float a) { return Sleef_erff4_u10(a); }
+inline __vector double erf(__vector double a) { return Sleef_erfd2_u10(a); }
+inline __vector float erfc(__vector float a) { return Sleef_erfcf4_u15(a); }
+inline __vector double erfc(__vector double a) { return Sleef_erfcd2_u15(a); }
+inline __vector float pow(__vector float a, __vector float b) { return Sleef_powf4_u10(a, b); }
+inline __vector double pow(__vector double a, __vector double b) { return Sleef_powd2_u10(a, b); }
+inline __vector float hypot(__vector float a, __vector float b) { return Sleef_hypotf4_u05(a, b); }
+inline __vector double hypot(__vector double a, __vector double b) { return Sleef_hypotd2_u05(a, b); }
+} // namespace tpsleef
+} // namespace tensorplay
+#endif // VSX helpers
+
+#if defined(__s390x__) && (defined(CPU_CAPABILITY_ZVECTOR) || defined(__VX__))
+// ZVECTOR tier: SLEEF's 2x double / 4x float VXE entry points.
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+__vector float Sleef_expf4_u10(__vector float);
+__vector float Sleef_exp2f4_u10(__vector float);
+__vector float Sleef_expm1f4_u10(__vector float);
+__vector float Sleef_logf4_u10(__vector float);
+__vector float Sleef_log2f4_u10(__vector float);
+__vector float Sleef_log10f4_u10(__vector float);
+__vector float Sleef_log1pf4_u10(__vector float);
+__vector float Sleef_sinf4_u10(__vector float);
+__vector float Sleef_cosf4_u10(__vector float);
+__vector float Sleef_tanf4_u10(__vector float);
+__vector float Sleef_asinf4_u10(__vector float);
+__vector float Sleef_acosf4_u10(__vector float);
+__vector float Sleef_atanf4_u10(__vector float);
+__vector float Sleef_atan2f4_u10(__vector float, __vector float);
+__vector float Sleef_sinhf4_u10(__vector float);
+__vector float Sleef_coshf4_u10(__vector float);
+__vector float Sleef_tanhf4_u10(__vector float);
+__vector float Sleef_asinhf4_u10(__vector float);
+__vector float Sleef_acoshf4_u10(__vector float);
+__vector float Sleef_atanhf4_u10(__vector float);
+__vector float Sleef_erff4_u10(__vector float);
+__vector float Sleef_erfcf4_u15(__vector float);
+__vector float Sleef_powf4_u10(__vector float, __vector float);
+__vector float Sleef_hypotf4_u05(__vector float, __vector float);
+
+__vector double Sleef_expd2_u10(__vector double);
+__vector double Sleef_exp2d2_u10(__vector double);
+__vector double Sleef_expm1d2_u10(__vector double);
+__vector double Sleef_logd2_u10(__vector double);
+__vector double Sleef_log2d2_u10(__vector double);
+__vector double Sleef_log10d2_u10(__vector double);
+__vector double Sleef_log1pd2_u10(__vector double);
+__vector double Sleef_sind2_u10(__vector double);
+__vector double Sleef_cosd2_u10(__vector double);
+__vector double Sleef_tand2_u10(__vector double);
+__vector double Sleef_asind2_u10(__vector double);
+__vector double Sleef_acosd2_u10(__vector double);
+__vector double Sleef_atand2_u10(__vector double);
+__vector double Sleef_atan2d2_u10(__vector double, __vector double);
+__vector double Sleef_sinhd2_u10(__vector double);
+__vector double Sleef_coshd2_u10(__vector double);
+__vector double Sleef_tanhd2_u10(__vector double);
+__vector double Sleef_asinhd2_u10(__vector double);
+__vector double Sleef_acoshd2_u10(__vector double);
+__vector double Sleef_atanhd2_u10(__vector double);
+__vector double Sleef_erfd2_u10(__vector double);
+__vector double Sleef_erfcd2_u15(__vector double);
+__vector double Sleef_powd2_u10(__vector double, __vector double);
+__vector double Sleef_hypotd2_u05(__vector double, __vector double);
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
+
+namespace tensorplay {
+namespace tpsleef {
+inline __vector float exp(__vector float a) { return Sleef_expf4_u10(a); }
+inline __vector double exp(__vector double a) { return Sleef_expd2_u10(a); }
+inline __vector float exp2(__vector float a) { return Sleef_exp2f4_u10(a); }
+inline __vector double exp2(__vector double a) { return Sleef_exp2d2_u10(a); }
+inline __vector float expm1(__vector float a) { return Sleef_expm1f4_u10(a); }
+inline __vector double expm1(__vector double a) { return Sleef_expm1d2_u10(a); }
+inline __vector float log(__vector float a) { return Sleef_logf4_u10(a); }
+inline __vector double log(__vector double a) { return Sleef_logd2_u10(a); }
+inline __vector float log2(__vector float a) { return Sleef_log2f4_u10(a); }
+inline __vector double log2(__vector double a) { return Sleef_log2d2_u10(a); }
+inline __vector float log10(__vector float a) { return Sleef_log10f4_u10(a); }
+inline __vector double log10(__vector double a) { return Sleef_log10d2_u10(a); }
+inline __vector float log1p(__vector float a) { return Sleef_log1pf4_u10(a); }
+inline __vector double log1p(__vector double a) { return Sleef_log1pd2_u10(a); }
+inline __vector float sin(__vector float a) { return Sleef_sinf4_u10(a); }
+inline __vector double sin(__vector double a) { return Sleef_sind2_u10(a); }
+inline __vector float cos(__vector float a) { return Sleef_cosf4_u10(a); }
+inline __vector double cos(__vector double a) { return Sleef_cosd2_u10(a); }
+inline __vector float tan(__vector float a) { return Sleef_tanf4_u10(a); }
+inline __vector double tan(__vector double a) { return Sleef_tand2_u10(a); }
+inline __vector float asin(__vector float a) { return Sleef_asinf4_u10(a); }
+inline __vector double asin(__vector double a) { return Sleef_asind2_u10(a); }
+inline __vector float acos(__vector float a) { return Sleef_acosf4_u10(a); }
+inline __vector double acos(__vector double a) { return Sleef_acosd2_u10(a); }
+inline __vector float atan(__vector float a) { return Sleef_atanf4_u10(a); }
+inline __vector double atan(__vector double a) { return Sleef_atand2_u10(a); }
+inline __vector float atan2(__vector float a, __vector float b) { return Sleef_atan2f4_u10(a, b); }
+inline __vector double atan2(__vector double a, __vector double b) { return Sleef_atan2d2_u10(a, b); }
+inline __vector float sinh(__vector float a) { return Sleef_sinhf4_u10(a); }
+inline __vector double sinh(__vector double a) { return Sleef_sinhd2_u10(a); }
+inline __vector float cosh(__vector float a) { return Sleef_coshf4_u10(a); }
+inline __vector double cosh(__vector double a) { return Sleef_coshd2_u10(a); }
+inline __vector float tanh(__vector float a) { return Sleef_tanhf4_u10(a); }
+inline __vector double tanh(__vector double a) { return Sleef_tanhd2_u10(a); }
+inline __vector float asinh(__vector float a) { return Sleef_asinhf4_u10(a); }
+inline __vector double asinh(__vector double a) { return Sleef_asinhd2_u10(a); }
+inline __vector float acosh(__vector float a) { return Sleef_acoshf4_u10(a); }
+inline __vector double acosh(__vector double a) { return Sleef_acoshd2_u10(a); }
+inline __vector float atanh(__vector float a) { return Sleef_atanhf4_u10(a); }
+inline __vector double atanh(__vector double a) { return Sleef_atanhd2_u10(a); }
+inline __vector float erf(__vector float a) { return Sleef_erff4_u10(a); }
+inline __vector double erf(__vector double a) { return Sleef_erfd2_u10(a); }
+inline __vector float erfc(__vector float a) { return Sleef_erfcf4_u15(a); }
+inline __vector double erfc(__vector double a) { return Sleef_erfcd2_u15(a); }
+inline __vector float pow(__vector float a, __vector float b) { return Sleef_powf4_u10(a, b); }
+inline __vector double pow(__vector double a, __vector double b) { return Sleef_powd2_u10(a, b); }
+inline __vector float hypot(__vector float a, __vector float b) { return Sleef_hypotf4_u05(a, b); }
+inline __vector double hypot(__vector double a, __vector double b) { return Sleef_hypotd2_u05(a, b); }
+} // namespace tpsleef
+} // namespace tensorplay
+#endif // ZVECTOR helpers
+
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && \
+    (defined(CPU_CAPABILITY_SVE256) || defined(CPU_CAPABILITY_SVE128))
+// SVE tiers: SLEEF's vector-length-agnostic entry points operate on
+// svfloat32_t/svfloat64_t with explicit predicate control. Precision
+// suffixes match the other tiers (u10 / u15 for erfc / u05 for hypot).
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+svfloat32_t Sleef_expfx_u10sve(svfloat32_t);
+svfloat32_t Sleef_exp2fx_u10sve(svfloat32_t);
+svfloat32_t Sleef_expm1fx_u10sve(svfloat32_t);
+svfloat32_t Sleef_logfx_u10sve(svfloat32_t);
+svfloat32_t Sleef_log2fx_u10sve(svfloat32_t);
+svfloat32_t Sleef_log10fx_u10sve(svfloat32_t);
+svfloat32_t Sleef_log1pfx_u10sve(svfloat32_t);
+svfloat32_t Sleef_sinfx_u10sve(svfloat32_t);
+svfloat32_t Sleef_cosfx_u10sve(svfloat32_t);
+svfloat32_t Sleef_tanfx_u10sve(svfloat32_t);
+svfloat32_t Sleef_asinfx_u10sve(svfloat32_t);
+svfloat32_t Sleef_acosfx_u10sve(svfloat32_t);
+svfloat32_t Sleef_atanfx_u10sve(svfloat32_t);
+svfloat32_t Sleef_atan2fx_u10sve(svfloat32_t, svfloat32_t);
+svfloat32_t Sleef_sinhfx_u10sve(svfloat32_t);
+svfloat32_t Sleef_coshfx_u10sve(svfloat32_t);
+svfloat32_t Sleef_tanhfx_u10sve(svfloat32_t);
+svfloat32_t Sleef_asinhfx_u10sve(svfloat32_t);
+svfloat32_t Sleef_acoshfx_u10sve(svfloat32_t);
+svfloat32_t Sleef_atanhfx_u10sve(svfloat32_t);
+svfloat32_t Sleef_erffx_u10sve(svfloat32_t);
+svfloat32_t Sleef_erfcfx_u15sve(svfloat32_t);
+svfloat32_t Sleef_powfx_u10sve(svfloat32_t, svfloat32_t);
+svfloat32_t Sleef_hypotfx_u05sve(svfloat32_t, svfloat32_t);
+
+svfloat64_t Sleef_expdx_u10sve(svfloat64_t);
+svfloat64_t Sleef_exp2dx_u10sve(svfloat64_t);
+svfloat64_t Sleef_expm1dx_u10sve(svfloat64_t);
+svfloat64_t Sleef_logdx_u10sve(svfloat64_t);
+svfloat64_t Sleef_log2dx_u10sve(svfloat64_t);
+svfloat64_t Sleef_log10dx_u10sve(svfloat64_t);
+svfloat64_t Sleef_log1pdx_u10sve(svfloat64_t);
+svfloat64_t Sleef_sindx_u10sve(svfloat64_t);
+svfloat64_t Sleef_cosdx_u10sve(svfloat64_t);
+svfloat64_t Sleef_tandx_u10sve(svfloat64_t);
+svfloat64_t Sleef_asindx_u10sve(svfloat64_t);
+svfloat64_t Sleef_acosdx_u10sve(svfloat64_t);
+svfloat64_t Sleef_atandx_u10sve(svfloat64_t);
+svfloat64_t Sleef_atan2dx_u10sve(svfloat64_t, svfloat64_t);
+svfloat64_t Sleef_sinhdx_u10sve(svfloat64_t);
+svfloat64_t Sleef_coshdx_u10sve(svfloat64_t);
+svfloat64_t Sleef_tanhdx_u10sve(svfloat64_t);
+svfloat64_t Sleef_asinhdx_u10sve(svfloat64_t);
+svfloat64_t Sleef_acoshdx_u10sve(svfloat64_t);
+svfloat64_t Sleef_atanhdx_u10sve(svfloat64_t);
+svfloat64_t Sleef_erfdx_u10sve(svfloat64_t);
+svfloat64_t Sleef_erfcdx_u15sve(svfloat64_t);
+svfloat64_t Sleef_powdx_u10sve(svfloat64_t, svfloat64_t);
+svfloat64_t Sleef_hypotdx_u05sve(svfloat64_t, svfloat64_t);
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
+
+namespace tensorplay {
+namespace tpsleef {
+inline svfloat32_t exp(svfloat32_t a) { return Sleef_expfx_u10sve(a); }
+inline svfloat64_t exp(svfloat64_t a) { return Sleef_expdx_u10sve(a); }
+inline svfloat32_t exp2(svfloat32_t a) { return Sleef_exp2fx_u10sve(a); }
+inline svfloat64_t exp2(svfloat64_t a) { return Sleef_exp2dx_u10sve(a); }
+inline svfloat32_t expm1(svfloat32_t a) { return Sleef_expm1fx_u10sve(a); }
+inline svfloat64_t expm1(svfloat64_t a) { return Sleef_expm1dx_u10sve(a); }
+inline svfloat32_t log(svfloat32_t a) { return Sleef_logfx_u10sve(a); }
+inline svfloat64_t log(svfloat64_t a) { return Sleef_logdx_u10sve(a); }
+inline svfloat32_t log2(svfloat32_t a) { return Sleef_log2fx_u10sve(a); }
+inline svfloat64_t log2(svfloat64_t a) { return Sleef_log2dx_u10sve(a); }
+inline svfloat32_t log10(svfloat32_t a) { return Sleef_log10fx_u10sve(a); }
+inline svfloat64_t log10(svfloat64_t a) { return Sleef_log10dx_u10sve(a); }
+inline svfloat32_t log1p(svfloat32_t a) { return Sleef_log1pfx_u10sve(a); }
+inline svfloat64_t log1p(svfloat64_t a) { return Sleef_log1pdx_u10sve(a); }
+inline svfloat32_t sin(svfloat32_t a) { return Sleef_sinfx_u10sve(a); }
+inline svfloat64_t sin(svfloat64_t a) { return Sleef_sindx_u10sve(a); }
+inline svfloat32_t cos(svfloat32_t a) { return Sleef_cosfx_u10sve(a); }
+inline svfloat64_t cos(svfloat64_t a) { return Sleef_cosdx_u10sve(a); }
+inline svfloat32_t tan(svfloat32_t a) { return Sleef_tanfx_u10sve(a); }
+inline svfloat64_t tan(svfloat64_t a) { return Sleef_tandx_u10sve(a); }
+inline svfloat32_t asin(svfloat32_t a) { return Sleef_asinfx_u10sve(a); }
+inline svfloat64_t asin(svfloat64_t a) { return Sleef_asindx_u10sve(a); }
+inline svfloat32_t acos(svfloat32_t a) { return Sleef_acosfx_u10sve(a); }
+inline svfloat64_t acos(svfloat64_t a) { return Sleef_acosdx_u10sve(a); }
+inline svfloat32_t atan(svfloat32_t a) { return Sleef_atanfx_u10sve(a); }
+inline svfloat64_t atan(svfloat64_t a) { return Sleef_atandx_u10sve(a); }
+inline svfloat32_t atan2(svfloat32_t a, svfloat32_t b) { return Sleef_atan2fx_u10sve(a, b); }
+inline svfloat64_t atan2(svfloat64_t a, svfloat64_t b) { return Sleef_atan2dx_u10sve(a, b); }
+inline svfloat32_t sinh(svfloat32_t a) { return Sleef_sinhfx_u10sve(a); }
+inline svfloat64_t sinh(svfloat64_t a) { return Sleef_sinhdx_u10sve(a); }
+inline svfloat32_t cosh(svfloat32_t a) { return Sleef_coshfx_u10sve(a); }
+inline svfloat64_t cosh(svfloat64_t a) { return Sleef_coshdx_u10sve(a); }
+inline svfloat32_t tanh(svfloat32_t a) { return Sleef_tanhfx_u10sve(a); }
+inline svfloat64_t tanh(svfloat64_t a) { return Sleef_tanhdx_u10sve(a); }
+inline svfloat32_t asinh(svfloat32_t a) { return Sleef_asinhfx_u10sve(a); }
+inline svfloat64_t asinh(svfloat64_t a) { return Sleef_asinhdx_u10sve(a); }
+inline svfloat32_t acosh(svfloat32_t a) { return Sleef_acoshfx_u10sve(a); }
+inline svfloat64_t acosh(svfloat64_t a) { return Sleef_acoshdx_u10sve(a); }
+inline svfloat32_t atanh(svfloat32_t a) { return Sleef_atanhfx_u10sve(a); }
+inline svfloat64_t atanh(svfloat64_t a) { return Sleef_atanhdx_u10sve(a); }
+inline svfloat32_t erf(svfloat32_t a) { return Sleef_erffx_u10sve(a); }
+inline svfloat64_t erf(svfloat64_t a) { return Sleef_erfdx_u10sve(a); }
+inline svfloat32_t erfc(svfloat32_t a) { return Sleef_erfcfx_u15sve(a); }
+inline svfloat64_t erfc(svfloat64_t a) { return Sleef_erfcdx_u15sve(a); }
+inline svfloat32_t pow(svfloat32_t a, svfloat32_t b) { return Sleef_powfx_u10sve(a, b); }
+inline svfloat64_t pow(svfloat64_t a, svfloat64_t b) { return Sleef_powdx_u10sve(a, b); }
+inline svfloat32_t hypot(svfloat32_t a, svfloat32_t b) { return Sleef_hypotfx_u05sve(a, b); }
+inline svfloat64_t hypot(svfloat64_t a, svfloat64_t b) { return Sleef_hypotdx_u05sve(a, b); }
+} // namespace tpsleef
+} // namespace tensorplay
+#endif // SVE helpers
