@@ -154,14 +154,13 @@ Tensor interop_histc_cuda(const Tensor& self, int64_t bins, Scalar min, Scalar m
     }
     if (!(lo < hi)) TP_THROW(RuntimeError, "histc: max must be larger than min");
     const Tensor flat = ops::reshape(self, {-1});
-    const Tensor x64 = flat.to(DType::Float64);
-    const Tensor edges = ops::linspace(Scalar(lo), Scalar(hi), bins + 1,
-                                       DType::Float64, self.device());
-    Tensor idx = ops::sub(ops::bucketize(x64, edges, false, true),
-                          Scalar(int64_t(1)));
+    const Tensor in_range = ops::logical_and(ops::ge(flat, Scalar(lo)),
+                                             ops::le(flat, Scalar(hi)));
+    const Tensor safe = Tensor::where(in_range, flat, Tensor::zeros_like(flat));
+    Tensor idx = ops::div(
+        ops::mul(ops::sub(safe, Scalar(lo)), Scalar(bins)),
+        Scalar(hi - lo)).to(DType::Int64);
     idx = ops::clamp(idx, Scalar(int64_t(0)), Scalar(bins - 1));
-    const Tensor in_range = ops::logical_and(ops::ge(x64, Scalar(lo)),
-                                             ops::le(x64, Scalar(hi)));
     const Tensor counted = ops::masked_select(idx, in_range);
     return ops::bincount(counted, std::nullopt, bins).to(self.dtype());
 }
