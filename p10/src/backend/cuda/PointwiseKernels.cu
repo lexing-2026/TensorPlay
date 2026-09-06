@@ -10,6 +10,7 @@
 #include "CUDABroadcast.cuh"
 #include "CUDAComplex.cuh"
 #include "ElementwiseStrided.cuh"
+#include "CUDALoops.cuh"
 #include "GradMode.h"
 #include <thrust/complex.h>
 #include <cuda_runtime.h>
@@ -189,35 +190,28 @@ struct SignFunctor {
     } 
 };
 
-// Unary dispatcher: vectorized contiguous fast path, iterator-driven strided
-// kernel for views/permutations, contiguous-copy fallback for pathological
-// coalesced ranks.
+// Unary dispatcher for same-dtype scalar operations.
 template<typename Functor>
 Tensor unary_op_kernel_v2(const Tensor& self, Functor functor) {
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
-    int64_t n = self.numel();
-    if (n == 0) return result;
-    dim3 block(256);
-    dim3 grid((n + 255) / 256);
-    
+    if (self.numel() == 0) return result;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(result)
+        .add_input(self)
+        .build();
+
     #define OP_CASE(ctype, name) \
-    case DType::name: { \
-        if (self.is_contiguous()) { \
-            launch_unary<ctype>(n, self.data_ptr<ctype>(), result.data_ptr<ctype>(), functor); \
-        } else if (!launch_unary_strided<ctype>(self, result, functor)) { \
-            Tensor self_contig = self.contiguous(); \
-            unary_kernel_cuda_impl<ctype><<<grid, block, 0, getCurrentCUDAStream().stream()>>>( \
-                n, self_contig.data_ptr<ctype>(), result.data_ptr<ctype>(), functor); \
-            CUDA_CHECK(cudaGetLastError()); \
-        } \
-        break; \
-    }
+    case DType::name: \
+        gpu_kernel(iter, [functor] __device__(ctype x) -> ctype { \
+            return functor(x); \
+        }); \
+        break;
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
         default: TP_THROW(TypeError, "CUDA unary op: Unsupported dtype");
     }
     #undef OP_CASE
-    CUDA_CHECK(cudaGetLastError());
     return result;
 }
 
