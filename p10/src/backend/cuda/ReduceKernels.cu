@@ -27,6 +27,12 @@ extern std::tuple<Tensor, Tensor> sort_cuda(const Tensor& self, int64_t dim,
 extern std::tuple<Tensor, Tensor> topk_kernel_cuda(
     const Tensor& self, int64_t k, int64_t dim, bool largest, bool sorted,
     int64_t impl);
+extern Tensor mean_dim_kernel(const Tensor& self,
+                              const std::vector<int64_t>& dim,
+                              bool keepdim, DType dtype);
+extern Tensor var_dim_kernel(const Tensor& self,
+                             const std::vector<int64_t>& dim,
+                             int64_t correction, bool keepdim);
 
 #define CUDA_CHECK(condition) \
   do { \
@@ -167,23 +173,6 @@ __global__ void slice_logsumexp_kernel(int64_t n_slices, int64_t d_size, int64_t
         for (int64_t j = 0; j < d_size; ++j)
             s2 += ::exp(static_cast<double>(sp[j * inner]) - m);
         out[si] = m + ::log(s2);
-    }
-}
-
-template <typename T>
-__global__ void slice_mean_f64_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
-                                      const T* in, double* out, bool squares) {
-    int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; si < n_slices; si += stride) {
-        int64_t o = si / inner, in2 = si % inner;
-        const T* sp = in + o * d_size * inner + in2;
-        double s2 = 0;
-        for (int64_t j = 0; j < d_size; ++j) {
-            double v = static_cast<double>(sp[j * inner]);
-            s2 += squares ? v * v : v;
-        }
-        out[si] = s2 / static_cast<double>(d_size);
     }
 }
 
@@ -401,14 +390,6 @@ Tensor logsumexp_cuda2(const Tensor& self, int64_t dim, bool keepdim) {
     DType out_dt = sc.dtype();
     return accs.reshape(ns).to(out_dt);
 }
-Tensor nansum_cuda2(const Tensor& self, const std::vector<int64_t>& dim_in, bool keepdim) {
-    DType out_dt = isFloatingType(self.dtype()) ? self.dtype() : DType::Int64;
-    std::vector<int64_t> dim = dim_in;
-    if (dim.empty()) {
-        for (int64_t i = 0; i < self.dim(); ++i) dim.push_back(i);
-    }
-    return reduce_iterative(self, dim, keepdim, 2, out_dt);
-}
 Tensor count_nonzero_cuda2(const Tensor& self, const std::vector<int64_t>& dim) {
     Tensor reduce = self.dtype() == DType::Bool
         ? self
@@ -496,56 +477,9 @@ std::tuple<Tensor, Tensor> cummin_cuda(const Tensor& self, int64_t dim) {
 
 std::tuple<Tensor, Tensor> var_mean_cuda(const Tensor& self, std::vector<int64_t> dim,
                                          bool unbiased, bool keepdim) {
-    // var = E[x^2] - E[x]^2 corrected by n/(n-ddof); Float64 accumulation.
-    Tensor xf = self.to(DType::Float64).contiguous();
-    Tensor x2f = xf.mul(xf).contiguous();
-    Tensor mean = xf, msq = x2f;
-    std::vector<int64_t> dims = dim;
-    bool any = false;
-    for (auto& d : dims) { d = wrap_dim(d, self.dim()); any = true; }
-    if (!any) { dims.clear(); for (int64_t i = 0; i < self.dim(); ++i) dims.push_back(i); }
-    auto stream = getCurrentCUDAStream().stream();
-    // Ascend over the original dims; with keepdim=false each pass erases the
-    // reduced axis, so later dims shift down by the number already removed.
-    std::vector<bool> red(static_cast<size_t>(self.dim()), false);
-    for (int64_t d2 : dims) red[static_cast<size_t>(d2)] = true;
-    int64_t shift = 0;
-    for (int64_t dd = 0; dd < self.dim(); ++dd) {
-        if (!red[static_cast<size_t>(dd)]) continue;
-        const int64_t cur_d = dd - shift;
-        int64_t dsz = mean.size(cur_d);
-        int64_t outer = 1, inner = 1;
-        outer_inner(shape_of(mean), cur_d, outer, inner);
-        int64_t slices = outer * inner;
-        Tensor m1 = Tensor::zeros({slices}, DType::Float64, self.device());
-        Tensor m2 = Tensor::zeros(shape_of(m1), DType::Float64, self.device());
-        if (slices > 0) {
-            // The kernel divides by dsz, so dsz==0 slices become NaN, matching
-            dim3 grid = make_grid(slices), block(kThreads);
-            slice_mean_f64_kernel<double><<<grid, block, 0, stream>>>(
-                slices, dsz, inner, mean.data_ptr<double>(), m1.data_ptr<double>(), false);
-            slice_mean_f64_kernel<double><<<grid, block, 0, stream>>>(
-                slices, dsz, inner, msq.data_ptr<double>(), m2.data_ptr<double>(), true);
-            CUDA_CHECK(cudaGetLastError());
-        }
-        std::vector<int64_t> ns = shape_of(mean);
-        if (keepdim) {
-            ns[cur_d] = 1;
-        } else {
-            ns.erase(ns.begin() + cur_d);
-            ++shift;
-        }
-        mean = m1.reshape(ns);
-        msq = m2.reshape(ns);
-    }
-    int64_t n_red = 1;
-    for (int64_t d2 : dims) n_red *= self.size(d2);
-    double ddof = unbiased ? 1.0 : 0.0;
-    Tensor var = msq.sub(mean.mul(mean));
-    Tensor corr = var.mul(Tensor::full({}, Scalar(n_red / (n_red - ddof)),
-                                       DType::Float64, self.device()));
-    DType out_dt = self.dtype() == DType::Float64 ? DType::Float64 : DType::Float32;
-    return {corr.to(out_dt), mean.to(out_dt)};
+    Tensor var = var_dim_kernel(self, dim, unbiased ? 1 : 0, keepdim);
+    Tensor mean = mean_dim_kernel(self, dim, keepdim, DType::Undefined);
+    return {std::move(var), std::move(mean)};
 }
 std::tuple<Tensor, Tensor> std_mean_cuda(const Tensor& self, std::vector<int64_t> dim,
                                          bool unbiased, bool keepdim) {
@@ -877,6 +811,16 @@ std::tuple<Tensor, Tensor> interop_nanmedian_dim_values_cuda(
 }
 
 }  // namespace
+
+Tensor nansum_cuda2(const Tensor& self, const std::vector<int64_t>& dim_in, bool keepdim) {
+    DType out_dt = isFloatingType(self.dtype()) ? self.dtype() : DType::Int64;
+    std::vector<int64_t> dim = dim_in;
+    if (dim.empty()) {
+        for (int64_t i = 0; i < self.dim(); ++i) dim.push_back(i);
+    }
+    return reduce_iterative(self, dim, keepdim, 2, out_dt);
+}
+
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, ReduceKernels) {
     m.impl("amax", amax_cuda2);
