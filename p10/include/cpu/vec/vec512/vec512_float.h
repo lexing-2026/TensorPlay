@@ -13,6 +13,7 @@
 #include <immintrin.h>
 #endif
 #include "cpu/vec/vec_base.h"
+#include "cpu/vec/ErfPoly.h"
 #include "cpu/vec/SleefShims.h"
 #include "cpu/SpecialMath.h"
 
@@ -282,46 +283,33 @@ struct Vectorized<float> {
         _mm512_and_ps(_mm512_set1_ps(-0.0f), sign));
   }
   Vectorized<float> erf() const {
-    // Two ranges, both evaluated and then selected between, so no lane
-    // takes a branch.  Near zero the Maclaurin series is used directly:
-    // the rational tail below ends in ``1 - r``, and for small arguments
-    // that subtraction cancels away the result's low bits.  Away from zero
-    // the series would need many more terms than the tail form, which
-    // reaches float precision with five coefficients and one exponential.
-    // Worst case over the whole line is under three float ulp.
+    // Two forms, both evaluated and then selected between, so no lane takes
+    // a branch; see cpu/vec/ErfPoly.h for why the split is there.
+    namespace poly = tensorplay::vecmath;
     const __m512 sign_bit = _mm512_set1_ps(-0.0f);
     const __m512 one = _mm512_set1_ps(1.0f);
     const __m512 abs_x = _mm512_andnot_ps(sign_bit, values);
     const __m512 sq = _mm512_mul_ps(values, values);
 
-    // erf(x) = x * P(x^2) for |x| < 0.7
-    __m512 near = _mm512_set1_ps(1.2055332981789664e-04f);
-    near = _mm512_fmadd_ps(near, sq, _mm512_set1_ps(-8.5440360144887751e-04f));
-    near = _mm512_fmadd_ps(near, sq, _mm512_set1_ps(5.2239776254421878e-03f));
-    near = _mm512_fmadd_ps(near, sq, _mm512_set1_ps(-2.6866170645131252e-02f));
-    near = _mm512_fmadd_ps(near, sq, _mm512_set1_ps(1.1283791670955126e-01f));
-    near = _mm512_fmadd_ps(near, sq, _mm512_set1_ps(-3.7612638903183752e-01f));
-    near = _mm512_fmadd_ps(near, sq, _mm512_set1_ps(1.1283791670955126e+00f));
+    __m512 near = _mm512_set1_ps(poly::kErfSeries[6]);
+    for (int i = 5; i >= 0; --i)
+      near = _mm512_fmadd_ps(near, sq, _mm512_set1_ps(poly::kErfSeries[i]));
     near = _mm512_mul_ps(values, near);
 
-    // erf(|x|) = 1 - Q(t) * t * exp(-x^2), t = 1 / (1 + 0.3275911 * |x|)
     const __m512 t = _mm512_div_ps(
-        one, _mm512_fmadd_ps(_mm512_set1_ps(0.3275911f), abs_x, one));
-    __m512 tail = _mm512_set1_ps(1.061405429f);
-    tail = _mm512_fmadd_ps(tail, t, _mm512_set1_ps(-1.453152027f));
-    tail = _mm512_fmadd_ps(tail, t, _mm512_set1_ps(1.421413741f));
-    tail = _mm512_fmadd_ps(tail, t, _mm512_set1_ps(-0.284496736f));
-    tail = _mm512_fmadd_ps(tail, t, _mm512_set1_ps(0.254829592f));
+        one, _mm512_fmadd_ps(_mm512_set1_ps(poly::kErfTailScale), abs_x, one));
+    __m512 tail = _mm512_set1_ps(poly::kErfTail[4]);
+    for (int i = 3; i >= 0; --i)
+      tail = _mm512_fmadd_ps(tail, t, _mm512_set1_ps(poly::kErfTail[i]));
     tail = _mm512_mul_ps(tail, t);
     tail = _mm512_sub_ps(
         one,
-        _mm512_mul_ps(
-            tail, tensorplay::tpsleef::exp(_mm512_xor_ps(sign_bit, sq))));
-    // the tail was evaluated on |x|; erf is odd
+        _mm512_mul_ps(tail, tensorplay::tpsleef::exp(_mm512_xor_ps(sign_bit, sq))));
+    // the tail was evaluated on |x|, and erf is odd
     tail = _mm512_or_ps(_mm512_and_ps(sign_bit, values), tail);
 
     return _mm512_mask_blend_ps(
-        _mm512_cmp_ps_mask(abs_x, _mm512_set1_ps(0.7f), _CMP_LT_OQ),
+        _mm512_cmp_ps_mask(abs_x, _mm512_set1_ps(poly::kErfSplit), _CMP_LT_OQ),
         tail,
         near);
   }

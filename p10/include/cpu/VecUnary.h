@@ -26,6 +26,7 @@
 #include "Half.h"
 #include "BFloat16.h"
 
+#include "cpu/vec/ErfPoly.h"
 #include "cpu/vec/SleefShims.h"
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -297,6 +298,39 @@ inline __m256 v_rcp_nr_ps(__m256 d) {
     return _mm256_mul_ps(r, _mm256_fnmadd_ps(d, r, _mm256_set1_ps(2.0f)));
 }
 
+// erf on float lanes: a series near zero and a rational tail away from it,
+// selected per lane.  Coefficients and the reason for the split live in
+// cpu/vec/ErfPoly.h; the vector class evaluates the same function, so a
+// kernel and its compiled counterpart agree.
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_erf_f32(__m256 x) {
+    namespace poly = tensorplay::vecmath;
+    const __m256 sign_bit = _mm256_set1_ps(-0.0f);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 abs_x = _mm256_andnot_ps(sign_bit, x);
+    const __m256 sq = _mm256_mul_ps(x, x);
+
+    __m256 near = _mm256_set1_ps(poly::kErfSeries[6]);
+    for (int i = 5; i >= 0; --i)
+        near = _mm256_fmadd_ps(near, sq, _mm256_set1_ps(poly::kErfSeries[i]));
+    near = _mm256_mul_ps(x, near);
+
+    const __m256 t = _mm256_div_ps(
+        one, _mm256_fmadd_ps(_mm256_set1_ps(poly::kErfTailScale), abs_x, one));
+    __m256 tail = _mm256_set1_ps(poly::kErfTail[4]);
+    for (int i = 3; i >= 0; --i)
+        tail = _mm256_fmadd_ps(tail, t, _mm256_set1_ps(poly::kErfTail[i]));
+    tail = _mm256_mul_ps(tail, t);
+    tail = _mm256_sub_ps(
+        one,
+        _mm256_mul_ps(tail, tensorplay::tpsleef::exp(_mm256_xor_ps(sign_bit, sq))));
+    tail = _mm256_or_ps(_mm256_and_ps(sign_bit, x), tail);
+
+    return _mm256_blendv_ps(
+        tail, near,
+        _mm256_cmp_ps(abs_x, _mm256_set1_ps(poly::kErfSplit), _CMP_LT_OQ));
+}
+
 // Applies op to one AVX2 float vector.  Always-inline: only ever folded into
 // target-attributed callers below.
 __attribute__((target("avx2,fma"), always_inline))
@@ -340,7 +374,7 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
         case VOp::Asinh: return tensorplay::tpsleef::asinh(x);
         case VOp::Acosh: return tensorplay::tpsleef::acosh(x);
         case VOp::Atanh: return tensorplay::tpsleef::atanh(x);
-        case VOp::Erf: return tensorplay::tpsleef::erf(x);
+        case VOp::Erf: return v_erf_f32(x);
         case VOp::Erfc: return tensorplay::tpsleef::erfc(x);
         case VOp::Lgamma: {
             // Callers guarantee all lanes > 0 here.
@@ -359,7 +393,7 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
         }
         case VOp::GeluNone: {
             const __m256 kAlpha = _mm256_set1_ps(static_cast<float>(0.70710678118654752440));
-            __m256 cdf = _mm256_add_ps(one, tensorplay::tpsleef::erf(_mm256_mul_ps(kAlpha, x)));
+            __m256 cdf = _mm256_add_ps(one, v_erf_f32(_mm256_mul_ps(kAlpha, x)));
             return _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5f), x), cdf);
         }
         case VOp::GeluTanh: {
@@ -719,6 +753,39 @@ inline __m512 v_rcp_nr_ps(__m512 d) {
     return _mm512_mul_ps(r, _mm512_fnmadd_ps(d, r, _mm512_set1_ps(2.0f)));
 }
 
+// erf on float lanes: a series near zero and a rational tail away from it,
+// selected per lane.  Coefficients and the reason for the split live in
+// cpu/vec/ErfPoly.h; the vector class evaluates the same function, so a
+// kernel and its compiled counterpart agree.
+__attribute__((target("avx512f,avx512dq"), always_inline))
+inline __m512 v_erf_f32_512(__m512 x) {
+    namespace poly = tensorplay::vecmath;
+    const __m512 sign_bit = _mm512_set1_ps(-0.0f);
+    const __m512 one = _mm512_set1_ps(1.0f);
+    const __m512 abs_x = _mm512_andnot_ps(sign_bit, x);
+    const __m512 sq = _mm512_mul_ps(x, x);
+
+    __m512 near = _mm512_set1_ps(poly::kErfSeries[6]);
+    for (int i = 5; i >= 0; --i)
+        near = _mm512_fmadd_ps(near, sq, _mm512_set1_ps(poly::kErfSeries[i]));
+    near = _mm512_mul_ps(x, near);
+
+    const __m512 t = _mm512_div_ps(
+        one, _mm512_fmadd_ps(_mm512_set1_ps(poly::kErfTailScale), abs_x, one));
+    __m512 tail = _mm512_set1_ps(poly::kErfTail[4]);
+    for (int i = 3; i >= 0; --i)
+        tail = _mm512_fmadd_ps(tail, t, _mm512_set1_ps(poly::kErfTail[i]));
+    tail = _mm512_mul_ps(tail, t);
+    tail = _mm512_sub_ps(
+        one,
+        _mm512_mul_ps(tail, tensorplay::tpsleef::exp(_mm512_xor_ps(sign_bit, sq))));
+    tail = _mm512_or_ps(_mm512_and_ps(sign_bit, x), tail);
+
+    return _mm512_mask_blend_ps(
+        _mm512_cmp_ps_mask(abs_x, _mm512_set1_ps(poly::kErfSplit), _CMP_LT_OQ),
+        tail, near);
+}
+
 __attribute__((target("avx512f,avx512dq"), always_inline))
 inline __m512 gelu_poly_f32_512(__m512 x) {
     const __m512 one = _mm512_set1_ps(1.0f);
@@ -782,7 +849,7 @@ inline __m512 apply16_f32(VOp op, VParams prm, __m512 x) {
         case VOp::Asinh: return tensorplay::tpsleef::asinh(x);
         case VOp::Acosh: return tensorplay::tpsleef::acosh(x);
         case VOp::Atanh: return tensorplay::tpsleef::atanh(x);
-        case VOp::Erf: return tensorplay::tpsleef::erf(x);
+        case VOp::Erf: return v_erf_f32_512(x);
         case VOp::Erfc: return tensorplay::tpsleef::erfc(x);
         case VOp::Lgamma:
             return v_lgamma_pos_f32_512(x);
@@ -797,28 +864,8 @@ inline __m512 apply16_f32(VOp op, VParams prm, __m512 x) {
         }
         case VOp::GeluNone: {
             const __m512 kAlpha = _mm512_set1_ps(0.7071067811865476f);
-            const __m512 z = _mm512_mul_ps(kAlpha, x);
-            const __m512 az = _mm512_andnot_ps(signbit, z);
-            const __m512 t = v_rcp_nr_ps(
-                _mm512_add_ps(one, _mm512_mul_ps(_mm512_set1_ps(0.3275911f), az)));
-            __m512 poly = _mm512_add_ps(_mm512_mul_ps(
-                _mm512_set1_ps(1.061405429f), t),
-                _mm512_set1_ps(-1.453152027f));
-            poly = _mm512_add_ps(_mm512_mul_ps(poly, t),
-                                 _mm512_set1_ps(1.421413741f));
-            poly = _mm512_add_ps(_mm512_mul_ps(poly, t),
-                                 _mm512_set1_ps(-0.284496736f));
-            poly = _mm512_add_ps(_mm512_mul_ps(poly, t),
-                                 _mm512_set1_ps(0.254829592f));
-            poly = _mm512_mul_ps(poly, t);
-            const __m512 erf_abs = _mm512_sub_ps(
-                one, _mm512_mul_ps(poly,
-                    tensorplay::tpsleef::exp(_mm512_sub_ps(_mm512_setzero_ps(),
-                                                  _mm512_mul_ps(az, az)))));
-            const __m512 erf = _mm512_mask_mov_ps(
-                erf_abs, _mm512_cmp_ps_mask(z, zero, _CMP_LT_OQ),
-                _mm512_sub_ps(zero, erf_abs));
-            __m512 cdf = _mm512_add_ps(one, erf);
+            const __m512 cdf =
+                _mm512_add_ps(one, v_erf_f32_512(_mm512_mul_ps(kAlpha, x)));
             return _mm512_mul_ps(_mm512_mul_ps(_mm512_set1_ps(0.5f), x), cdf);
         }
         case VOp::GeluTanh: {
