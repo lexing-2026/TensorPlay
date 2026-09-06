@@ -5,6 +5,7 @@
 #include "Scalar.h"
 #include "Context.h"
 #include "Complex.h"
+#include "CUDALoops.cuh"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -22,17 +23,34 @@ __global__ void fill_kernel_cuda_impl(int n, T* data, T value) {
     }
 }
 
+template <typename T>
+struct FillFunctor {
+    T value;
+
+    __device__ T operator()() const { return value; }
+};
+
+template <typename T>
+inline void fill_iter(TensorIteratorBase& iter, T value) {
+    gpu_kernel(iter, FillFunctor<T>{value});
+}
+
 Tensor& fill_kernel(Tensor& self, Scalar value) {
     int64_t n = self.numel();
     if (n == 0) return self;
     
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
+    TensorIterator iter = TensorIteratorConfig()
+        .set_check_mem_overlap(false)
+        .check_all_same_dtype(false)
+        .add_output(self)
+        .resize_outputs(false)
+        .build();
     
     #define OP_CASE(ctype, name) \
     case DType::name: { \
-        ctype val = value.to<ctype>(); \
-        fill_kernel_cuda_impl<ctype><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<ctype>(), val); \
+        fill_iter<ctype>(iter, value.to<ctype>()); \
         break; \
     }
 
