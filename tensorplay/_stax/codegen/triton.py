@@ -2163,9 +2163,13 @@ def _split_sum_epilogue(
     return tail, producer, "sum"
 
 
-@dataclass
+@dataclass(frozen=True)
 class _ExternSource:
-    """Where a segment's runtime input comes from."""
+    """Where a segment's runtime input comes from.
+
+    Frozen because the wiring keys a lookup table by it: an extern segment
+    resolves each operand by matching the source it was planned against.
+    """
 
     kind: str  # "arg" (graph placeholder position) | "seg" (segment index)
     index: int
@@ -2212,7 +2216,12 @@ def _extern_segment_plan(
         # Shape metadata is advisory; without it downstream segments cannot
         # specialize against this segment's output.
         return None
-    shape, dtype, _requires_grad = meta
+    shape = getattr(meta, "shape", None)
+    dtype = getattr(meta, "dtype", None)
+    if shape is None or dtype is None:
+        # A multi-output operator records a structure rather than one
+        # tensor's metadata; a later segment cannot specialize against it.
+        return None
     if dtype != sample_dtype:
         # Downstream fused kernels assume one dtype per region.
         return None
