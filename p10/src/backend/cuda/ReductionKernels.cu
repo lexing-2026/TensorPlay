@@ -11,6 +11,7 @@
 #include "Scalar.h"
 #include "Allocator.h"
 #include "TensorIterator.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <limits>
@@ -1047,20 +1048,10 @@ Tensor any_kernel(const Tensor& self) {
 // Var / Std
 Tensor var_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, int64_t correction, bool keepdim) {
     if (isComplexType(self.dtype())) {
-        // complex variance = E|z - mean|^2 == var(re) + var(imag); the result
-        // dtype is the real counterpart.  Built from dispatched complex-safe
-        // ops (mean/sub/abs/sum) so both backends share one definition.
-        Tensor mean = self.mean(dim, true);
-        Tensor diff = self - mean;
-        Tensor sum_sq = diff.abs().pow(Scalar(2)).sum(dim, keepdim);
-        std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(self.shape());
-        int64_t n = dim.empty() ? self.numel() : 1;
-        for (int64_t d : dim) {
-            if (d < 0) d += shape.size();
-            n *= shape[d];
-        }
-        double div = std::max<double>(0.0, static_cast<double>(n - correction));
-        return sum_sq / Scalar(div);
+        Tensor real = tensorplay::tpx::ops::real(self);
+        Tensor imag = tensorplay::tpx::ops::imag(self);
+        return var_dim_kernel(real, dim, correction, keepdim) +
+               var_dim_kernel(imag, dim, correction, keepdim);
     }
     const ReductionSpec spec = make_reduction_spec(self, dim);
     TP_DISPATCH_FLOAT_REDUCTION(welford_same_dtype, self.dtype(), self, spec,
@@ -1068,13 +1059,6 @@ Tensor var_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, int64
 }
 
 Tensor var_kernel(const Tensor& self, int64_t correction) {
-    if (isComplexType(self.dtype())) {
-        Tensor diff = self - self.mean();
-        Tensor sum_sq = diff.abs().pow(Scalar(2)).sum();
-        int64_t n = self.numel();
-        double div_val = std::max<double>(0.0, static_cast<double>(n - correction));
-        return sum_sq / Scalar(div_val);
-    }
     return var_dim_kernel(self, {}, correction, false);
 }
 
