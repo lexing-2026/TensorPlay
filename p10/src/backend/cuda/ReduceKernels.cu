@@ -523,7 +523,7 @@ std::tuple<Tensor, Tensor> var_mean_cuda(const Tensor& self, std::vector<int64_t
     }
     int64_t n_red = 1;
     for (int64_t d2 : dims) n_red *= self.size(d2);
-    double ddof = (unbiased && n_red > 1) ? 1.0 : 0.0;
+    double ddof = unbiased ? 1.0 : 0.0;
     Tensor var = msq.sub(mean.mul(mean));
     Tensor corr = var.mul(Tensor::full({}, Scalar(n_red / (n_red - ddof)),
                                        DType::Float64, self.device()));
