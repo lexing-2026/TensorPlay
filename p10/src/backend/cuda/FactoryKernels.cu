@@ -45,6 +45,7 @@ Tensor& fill_kernel(Tensor& self, Scalar value) {
 
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(OP_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(OP_CASE)
         default: TP_THROW(NotImplementedError, "fill_ not implemented for this dtype on CUDA");
     }
     #undef OP_CASE
@@ -122,6 +123,7 @@ Tensor& fill_diagonal__kernel(Tensor& self, Scalar fill_value, bool wrap) {
 
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_FILL_DIAG_CUDA_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(TP_FILL_DIAG_CUDA_CASE)
         case DType::ComplexFloat: {
             tensorplay::complex<float>* data = static_cast<tensorplay::complex<float>*>(self.data_ptr());
             tensorplay::complex<float> val = fill_value.to<tensorplay::complex<float>>();
@@ -237,6 +239,7 @@ Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device, bool require
     }
     switch (dtype) {
         TENSORPLAY_FORALL_SCALAR_TYPES(EYE_CUDA_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(EYE_CUDA_CASE)
         case DType::ComplexFloat: {
             gpu_kernel_with_index(t, [m] GPU_LAMBDA(int64_t index)
                 -> tensorplay::complex<float> {
