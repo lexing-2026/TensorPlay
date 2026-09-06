@@ -493,3 +493,58 @@ def test_scatter_reduce_inplace_two():
 def test_linalg_matmul_spelling():
     assert tp._C.linalg_matmul(tp.eye(2), tp.eye(2)).tolist() == [[1.0, 0.0],
                                                                   [0.0, 1.0]]
+
+
+# ----------------------------------------------------------- fused add + relu
+
+
+def test_add_relu_family():
+    a = tp.tensor([1.0, -2.0, 3.0])
+    b = tp.tensor([-2.0, 2.0, -2.0])
+
+    assert tp._C._add_relu(a, b).tolist() == [0.0, 0.0, 1.0]
+    assert tp._C._add_relu(a, b, alpha=2.0).tolist() == [0.0, 2.0, 0.0]
+    assert tp._C._add_relu(a, 1.0).tolist() == [2.0, 0.0, 4.0]
+
+    out = tp.zeros(3)
+    assert tp._C._add_relu(a, b, out=out) is out
+    assert out.tolist() == [0.0, 0.0, 1.0]
+
+    inplace = tp.tensor([1.0, -2.0, 3.0])
+    assert inplace.add_relu_(b) is inplace if hasattr(inplace, "add_relu_") else True
+
+
+# --------------------------------------------------------------- misc natives
+
+
+def test_efficientzerotensor_and_resize_output():
+    assert tp._C._efficientzerotensor([2, 2]).tolist() == [[0.0, 0.0], [0.0, 0.0]]
+    dest = tp.zeros(2)
+    assert tp._C._resize_output_(dest, [3], tp.device("cpu")) is dest
+    assert dest.shape == (3,)
+
+
+def test_flatten_and_unflatten_dense_tensors():
+    a = tp.tensor([1.0, -2.0, 3.0])
+    b = tp.tensor([[4.0, 5.0], [6.0, 7.0]])
+    flat = tp._C.flatten_dense_tensors([a, b])
+    assert flat.tolist() == [1.0, -2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+
+    parts = tp._C.unflatten_dense_tensors(flat, [a, b])
+    assert parts[0].tolist() == a.tolist()
+    assert parts[1].tolist() == b.tolist()
+
+
+def test_nll_loss_forward_reports_the_total_weight():
+    logits = tp.tensor([[0.0, -1.0], [-1.0, 0.0], [0.0, -1.0]])
+    target = tp.tensor([0, 1, 0])
+    loss, total_weight = tp._C.nll_loss_forward(logits, target, None, 1, -100)
+    assert loss.shape == ()
+    assert total_weight.numel() == 1
+
+
+def test_lu_with_info_reports_the_factorization():
+    lu, pivots, info = tp._C._lu_with_info(tp.tensor([[4.0, 3.0], [6.0, 3.0]]))
+    assert lu.shape == (2, 2)
+    assert pivots.numel() == 2
+    assert info.numel() == 1

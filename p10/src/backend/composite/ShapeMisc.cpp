@@ -26,8 +26,19 @@
 //                         ||a - b||^2 = ||a||^2 - 2 a.b + ||b||^2 folded into
 //                         one matmul, clamped at zero before the root so
 //                         cancellation cannot produce a negative radicand;
-//   polygamma_, igamma_,  the in-place spellings of their functional forms.
+//   polygamma_, igamma_,  the in-place spellings of their functional forms;
 //   igammac_
+//   _add_relu             the fused add-then-rectify family; alpha == 1 rides
+//                         the fused primitive, any other scale folds the
+//                         weighted sum first;
+//   _efficientzerotensor  a zero-filled allocation;
+//   _pin_memory           the function spelling of the pinning method;
+//   _resize_output_       resize a destination in place;
+//   flatten_dense_tensors the concatenation of a parameter list flattened into
+//   unflatten_dense_tensors  one vector, and its inverse split;
+//   nll_loss_forward,     the (loss, total_weight) pair the backward consumes;
+//   nll_loss2d_forward
+//   _lu_with_info         the LU factorization with its per-matrix status.
 
 #include "CompositeCommon.h"
 #include "Tensor.h"
@@ -209,6 +220,123 @@ Tensor& igammac__native(Tensor& self, const Tensor& other) {
     return self;
 }
 
+// A fused add-then-rectify: relu(self + alpha * other).  The unit scale rides
+// the fused primitive each backend already carries; any other scale folds the
+// weighted sum first and rectifies it.
+Tensor _add_relu_native(const Tensor& self, const Tensor& other, Scalar alpha) {
+    if (!alpha.isComplex() && alpha.toDouble() == 1.0) {
+        return ops::add_relu(self, other);
+    }
+    return ops::relu(ops::add(self, other, alpha));
+}
+
+Tensor& _add_relu__native(Tensor& self, const Tensor& other, Scalar alpha) {
+    self.copy_(_add_relu_native(self, other, alpha));
+    return self;
+}
+
+Tensor& _add_relu_out_native(const Tensor& self, const Tensor& other,
+                             Scalar alpha, Tensor& out) {
+    const Tensor value = _add_relu_native(self, other, alpha);
+    if (!out.defined() || out.dtype() != value.dtype()) {
+        out = value;
+        return out;
+    }
+    const auto target = static_cast<std::vector<int64_t>>(value.shape());
+    if (static_cast<std::vector<int64_t>>(out.shape()) != target) {
+        out.resize_(target);
+    }
+    out.copy_(value);
+    return out;
+}
+
+Tensor _add_relu_scalar_native(const Tensor& self, Scalar other, Scalar alpha) {
+    return ops::relu(ops::add(self, other, alpha));
+}
+
+Tensor& _add_relu__scalar_native(Tensor& self, Scalar other, Scalar alpha) {
+    self.copy_(_add_relu_scalar_native(self, other, alpha));
+    return self;
+}
+
+Tensor _efficientzerotensor_native(const std::vector<int64_t>& size,
+                                   std::optional<DType> dtype,
+                                   std::optional<int64_t> /*layout*/,
+                                   std::optional<Device> device,
+                                   std::optional<bool> pin_memory) {
+    return ops::zeros(size, dtype, device, pin_memory.value_or(false), false);
+}
+
+Tensor _pin_memory_native(const Tensor& self, std::optional<Device> device) {
+    return ops::pin_memory(self, device);
+}
+
+Tensor& _resize_output__native(Tensor& self, const std::vector<int64_t>& size,
+                               Device device) {
+    TP_CHECK(self.device() == device,
+             "_resize_output_: the destination lives on ",
+             self.device().toString(), " but ", device.toString(),
+             " was requested");
+    if (static_cast<std::vector<int64_t>>(self.shape()) != size) {
+        self.resize_(size);
+    }
+    return self;
+}
+
+// One contiguous vector holding every element of the list, in order.
+Tensor flatten_dense_tensors_native(const std::vector<Tensor>& tensors) {
+    TP_CHECK(!tensors.empty(), "flatten_dense_tensors: expected a non-empty list");
+    std::vector<Tensor> flattened;
+    flattened.reserve(tensors.size());
+    for (const Tensor& t : tensors) {
+        flattened.push_back(ops::reshape(ops::contiguous(t, kContiguous), {-1}));
+    }
+    if (flattened.size() == 1) return flattened.front();
+    return ops::cat(flattened, 0);
+}
+
+// The inverse split: each output is a view of `flat` carrying the shape of the
+// tensor at the same position.  An empty member gets its own allocation so it
+// does not alias the vector.
+std::vector<Tensor> unflatten_dense_tensors_native(
+        const Tensor& flat, const std::vector<Tensor>& tensors) {
+    std::vector<Tensor> outputs;
+    outputs.reserve(tensors.size());
+    int64_t offset = 0;
+    for (const Tensor& t : tensors) {
+        const auto shape = static_cast<std::vector<int64_t>>(t.shape());
+        const int64_t count = t.numel();
+        if (count == 0) {
+            outputs.push_back(ops::empty(shape, flat.dtype(), flat.device(),
+                                         false, false));
+            continue;
+        }
+        outputs.push_back(ops::reshape(ops::narrow(flat, 0, offset, count), shape));
+        offset += count;
+    }
+    return outputs;
+}
+
+std::tuple<Tensor, Tensor> nll_loss_forward_native(
+        const Tensor& self, const Tensor& target,
+        const std::optional<Tensor>& weight, int64_t reduction,
+        int64_t ignore_index) {
+    return ops::nll_loss(self, target, weight, reduction, ignore_index);
+}
+
+std::tuple<Tensor, Tensor> nll_loss2d_forward_native(
+        const Tensor& self, const Tensor& target,
+        const std::optional<Tensor>& weight, int64_t reduction,
+        int64_t ignore_index) {
+    return ops::nll_loss2d(self, target, weight, reduction, ignore_index);
+}
+
+std::tuple<Tensor, Tensor, Tensor> _lu_with_info_native(const Tensor& self,
+                                                        bool pivot,
+                                                        bool check_errors) {
+    return ops::linalg_lu_factor_ex(self, pivot, check_errors);
+}
+
 }  // namespace composite
 
 TENSORPLAY_LIBRARY_IMPL(Composite, ShapeMiscComposite) {
@@ -229,6 +357,19 @@ TENSORPLAY_LIBRARY_IMPL(Composite, ShapeMiscComposite) {
     m.impl("polygamma_", composite::polygamma__native);
     m.impl("igamma_", composite::igamma__native);
     m.impl("igammac_", composite::igammac__native);
+    m.impl("_add_relu.Tensor", composite::_add_relu_native);
+    m.impl("_add_relu_.Tensor", composite::_add_relu__native);
+    m.impl("_add_relu.out", composite::_add_relu_out_native);
+    m.impl("_add_relu.Scalar", composite::_add_relu_scalar_native);
+    m.impl("_add_relu_.Scalar", composite::_add_relu__scalar_native);
+    m.impl("_efficientzerotensor", composite::_efficientzerotensor_native);
+    m.impl("_pin_memory", composite::_pin_memory_native);
+    m.impl("_resize_output_", composite::_resize_output__native);
+    m.impl("flatten_dense_tensors", composite::flatten_dense_tensors_native);
+    m.impl("unflatten_dense_tensors", composite::unflatten_dense_tensors_native);
+    m.impl("nll_loss_forward", composite::nll_loss_forward_native);
+    m.impl("nll_loss2d_forward", composite::nll_loss2d_forward_native);
+    m.impl("_lu_with_info", composite::_lu_with_info_native);
 }
 
 }  // namespace tensorplay
