@@ -45,6 +45,15 @@ constexpr int kLoopThreadWorkSize = 4;
 constexpr int kLoopBlockWorkSize =
     kLoopThreadWorkSize * static_cast<int>(kLoopNumThreads);
 
+// Compile-time constants exposed as constexpr functions: device code
+// forwards them through forwarding references, and a named static member
+// would make nvcc demand an out-of-line definition that does not exist.
+constexpr int loop_num_threads() { return static_cast<int>(kLoopNumThreads); }
+constexpr int loop_thread_work_size() { return kLoopThreadWorkSize; }
+constexpr int loop_block_work_size() {
+    return loop_thread_work_size() * loop_num_threads();
+}
+
 #define TP_LOOP_LAUNCH_BOUNDS(n) __launch_bounds__(n)
 
 inline void loop_launch_check(const char* what) {
@@ -269,8 +278,9 @@ struct unroll_base {
     loader_t loader;
     storer_t storer;
     static constexpr int tws = elems_per_thread;
-    static constexpr int block_work =
-        elems_per_thread * static_cast<int>(kLoopNumThreads);
+    static constexpr int block_work() {
+        return elems_per_thread * loop_num_threads();
+    }
 
     __device__ unroll_base(data_t data, int remaining, inp_calc_t ic,
                            out_calc_t oc, loader_t l, storer_t s)
@@ -283,7 +293,7 @@ struct unroll_base {
 
     __device__ inline bool check_inbounds(int thread_work_elem) {
         return static_cast<int>(threadIdx.x +
-                                thread_work_elem * kLoopNumThreads) <
+                                thread_work_elem * loop_num_threads()) <
                remaining;
     }
 
@@ -294,11 +304,11 @@ struct unroll_base {
 #pragma unroll
         for (int i = 0; i < elems_per_thread; i++) {
             if (thread_idx < remaining) {
-                int linear_idx = thread_idx + block_work * idx;
+                int linear_idx = thread_idx + block_work() * idx;
                 auto offset = input_offset_calculator.get(linear_idx);
                 detail::static_unroll<detail::unroll_load_helper, arity>::
                     with_args(*this, args, offset, loader, i, num_outputs);
-                thread_idx += static_cast<int>(kLoopNumThreads);
+                thread_idx += loop_num_threads();
             }
         }
     }
@@ -309,10 +319,10 @@ struct unroll_base {
 #pragma unroll
         for (int i = 0; i < elems_per_thread; i++) {
             if (thread_idx < remaining) {
-                int linear_idx = thread_idx + block_work * idx;
+                int linear_idx = thread_idx + block_work() * idx;
                 int offset = output_offset_calculator.get(linear_idx)[0];
                 storer.store(from[i], data[0], offset);
-                thread_idx += static_cast<int>(kLoopNumThreads);
+                thread_idx += loop_num_threads();
             }
         }
     }
@@ -332,8 +342,9 @@ struct vectorized {
                   "The workload per thread must be a multiple of vec_size");
     static constexpr int loop_size = elems_per_thread / vec_size;
     static constexpr int tws = elems_per_thread;
-    static constexpr int block_work =
-        elems_per_thread * static_cast<int>(kLoopNumThreads);
+    static constexpr int block_work() {
+        return elems_per_thread * loop_num_threads();
+    }
 
     data_t data;
 
@@ -356,20 +367,19 @@ struct vectorized {
     __device__ inline void load(args_t* args, int idx) {
         constexpr int arity = std::tuple_size_v<args_t>;
         detail::static_unroll<detail::vectorized_load_helper, arity>::with_args(
-            *this, args, idx, block_work);
+            *this, args, idx, elems_per_thread * loop_num_threads());
     }
 
     template <typename scalar_t>
     __device__ inline void store(scalar_t* from, int idx) {
         using vec_t = aligned_vector<scalar_t, vec_size>;
         scalar_t* to = reinterpret_cast<scalar_t*>(data[0]) +
-                       elems_per_thread * static_cast<int>(kLoopNumThreads) *
-                           idx;
+                       elems_per_thread * loop_num_threads() * idx;
         vec_t* to_ = reinterpret_cast<vec_t*>(to);
         int thread_idx = threadIdx.x;
 #pragma unroll
         for (int i = 0; i < loop_size; i++) {
-            int index = thread_idx + i * static_cast<int>(kLoopNumThreads);
+            int index = thread_idx + i * loop_num_threads();
             vec_t v;
 #pragma unroll
             for (int j = 0; j < vec_size; j++) {
@@ -390,7 +400,7 @@ struct multi_outputs_unroll {
     inp_calc_t input_offset_calculator;
     out_calc_t output_offset_calculator;
     static constexpr int tws = kLoopThreadWorkSize;
-    static constexpr int block_work = kLoopBlockWorkSize;
+    static constexpr int block_work() { return loop_block_work_size(); }
 
     __device__ multi_outputs_unroll(data_t data, int remaining,
                                     inp_calc_t ic, out_calc_t oc)
@@ -401,7 +411,7 @@ struct multi_outputs_unroll {
 
     __device__ inline bool check_inbounds(int thread_work_elem) {
         return static_cast<int>(threadIdx.x +
-                                thread_work_elem * kLoopNumThreads) <
+                                thread_work_elem * loop_num_threads()) <
                remaining;
     }
 
@@ -412,12 +422,12 @@ struct multi_outputs_unroll {
 #pragma unroll
         for (int i = 0; i < kLoopThreadWorkSize; i++) {
             if (thread_idx < remaining) {
-                int linear_idx = thread_idx + block_work * idx;
+                int linear_idx = thread_idx + block_work() * idx;
                 auto offsets = input_offset_calculator.get(linear_idx);
                 detail::static_unroll<detail::unroll_load_helper, arity>::
                     with_args(*this, args, offsets, LoadWithoutCast(), i,
                                num_outputs);
-                thread_idx += static_cast<int>(kLoopNumThreads);
+                thread_idx += loop_num_threads();
             }
         }
     }
@@ -428,12 +438,12 @@ struct multi_outputs_unroll {
 #pragma unroll
         for (int i = 0; i < kLoopThreadWorkSize; i++) {
             if (thread_idx < remaining) {
-                int linear_idx = thread_idx + block_work * idx;
+                int linear_idx = thread_idx + block_work() * idx;
                 auto offsets = output_offset_calculator.get(linear_idx);
                 detail::static_unroll<detail::multi_outputs_store_helper,
                                       num_outputs>::with_args(data, offsets,
                                                               from[i]);
-                thread_idx += static_cast<int>(kLoopNumThreads);
+                thread_idx += loop_num_threads();
             }
         }
     }
@@ -642,7 +652,7 @@ __global__ void unrolled_elementwise_kernel(int N, func_t f, array_t data,
                                             inp_calc_t ic, out_calc_t oc,
                                             loader_t l, storer_t s) {
     int remaining =
-        N - elems_per_thread * static_cast<int>(kLoopNumThreads) * blockIdx.x;
+        N - elems_per_thread * loop_num_threads() * blockIdx.x;
     elementwise_kernel_helper<elems_per_thread>(
         f,
         memory::policies::unroll<array_t, inp_calc_t, out_calc_t, loader_t,
@@ -657,10 +667,11 @@ inline void launch_vectorized_kernel(int64_t N, const func_t& f,
                                      array_t data) {
     TP_CHECK(N > 0 && N <= std::numeric_limits<int32_t>::max(),
              "vectorized kernel range must fit 32-bit indexing");
-    constexpr int tws = kLoopThreadWorkSize;
-    int64_t grid = (N + tws * static_cast<int64_t>(kLoopNumThreads) - 1) /
-                   (tws * static_cast<int64_t>(kLoopNumThreads));
-    hipStream_t stream = getCurrentCUDAStream().stream();
+    constexpr int tws = loop_thread_work_size();
+    constexpr int threads = loop_num_threads();
+    int64_t grid = (N + tws * static_cast<int64_t>(threads) - 1) /
+                   (tws * static_cast<int64_t>(threads));
+    auto stream = getCurrentCUDAStream().stream();
     // vec_size must divide the per-thread workload exactly (the vectorized
     // policy slices each thread's slots into whole vectors), so cap the
     // alignment-derived width at the fixed thread work size.
@@ -870,7 +881,10 @@ void gpu_kernel_impl_nocast(TensorIteratorBase& iter, const func_t& f) {
     constexpr int grp_sz = 128;
     launch_legacy_kernel_manual_unroll<grp_sz, unroll_factor>(
         numel, [=] __device__(int idx, bool unrl) {
-            if constexpr (unroll_factor == 4) {
+            // Runtime branch over the compile-time constant: nvcc rejects
+            // `if constexpr` here because the extended-lambda first-capture
+            // rule trips inside the discarded-statement context.
+            if (unroll_factor == 4) {
                 auto offsets0 = offset_calc.get(idx);
                 auto offsets1 = offset_calc.get(idx + grp_sz);
                 auto offsets2 = offset_calc.get(idx + grp_sz * 2);
