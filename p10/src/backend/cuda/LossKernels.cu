@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <string>
+#include <tuple>
 #include <utility>
 
 namespace tensorplay {
@@ -74,6 +76,25 @@ std::pair<Tensor, Tensor> pair_f64_dev(const Tensor& a, const Tensor& b) {
 
 Tensor expand_f64_dev(const Tensor& a, const std::vector<int64_t>& shape) {
     return a.expand(shape).contiguous().to(DType::Float64);
+}
+
+void tp_validate_reduction(int64_t reduction) {
+    if (reduction != 0 && reduction != 1 && reduction != 2) {
+        TP_THROW(ValueError, "Invalid reduction mode");
+    }
+}
+
+Tensor tp_loss_reduce(const Tensor& loss, int64_t reduction) {
+    tp_validate_reduction(reduction);
+    if (reduction == 0) return loss;
+    if (reduction == 1) return loss.mean();
+    return loss.sum();
+}
+
+Tensor tp_scale_grad(const Tensor& grad, int64_t reduction, int64_t numel) {
+    tp_validate_reduction(reduction);
+    if (reduction == 1) return grad / static_cast<double>(numel);
+    return grad;
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +387,181 @@ Tensor multilabel_soft_margin_loss_cuda(const Tensor& input, const Tensor& targe
     return mean_from_elems(elems, N, input.dtype(), input.device());
 }
 
+Tensor tp_l1_loss_cuda(const Tensor& input, const Tensor& target,
+                       int64_t reduction) {
+    return tp_loss_reduce((input - target).abs(), reduction);
+}
+
+Tensor tp_l1_loss_backward_cuda(const Tensor& grad_output, const Tensor& input,
+                                const Tensor& target, int64_t reduction) {
+    Tensor grad = (input - target).sign() * grad_output;
+    return tp_scale_grad(grad, reduction, input.numel());
+}
+
+Tensor tp_kl_div_cuda(const Tensor& input, const Tensor& target,
+                      int64_t reduction, bool log_target) {
+    Tensor loss;
+    if (log_target) {
+        loss = target.exp() * (target - input);
+    } else {
+        Tensor nonzero = target.ne(Scalar(0)).to(input.dtype());
+        Tensor xlogy = Tensor::where(target.eq(Scalar(0)), target * 0,
+                                     target * target.log());
+        loss = (xlogy - target * input) * nonzero;
+    }
+    return tp_loss_reduce(loss, reduction);
+}
+
+Tensor tp_kl_div_backward_cuda(const Tensor& grad_output, const Tensor& input,
+                               const Tensor& target, int64_t reduction,
+                               bool log_target) {
+    Tensor grad;
+    if (log_target) {
+        grad = -target.exp() * grad_output;
+    } else {
+        Tensor nonzero = target.ne(Scalar(0)).to(input.dtype());
+        grad = (-target * nonzero) * grad_output;
+    }
+    return tp_scale_grad(grad, reduction, input.numel());
+}
+
+Tensor tp_margin_ranking_loss_cuda(const Tensor& input1, const Tensor& input2,
+                                   const Tensor& target, double margin,
+                                   int64_t reduction) {
+    Tensor raw = -(input1 - input2) * target + margin;
+    Tensor loss = Tensor::where(raw.lt(Scalar(0)), Scalar(0), raw);
+    return tp_loss_reduce(loss, reduction);
+}
+
+std::tuple<Tensor, Tensor> tp_margin_ranking_loss_backward_cuda(
+        const Tensor& grad_output, const Tensor& input1, const Tensor& input2,
+        const Tensor& target, double margin, int64_t reduction) {
+    tp_validate_reduction(reduction);
+    Tensor raw = -(input1 - input2) * target + margin;
+    Tensor active = raw.gt(Scalar(0)).to(input1.dtype());
+    Tensor grad = -active * target * grad_output;
+    grad = tp_scale_grad(grad, reduction, input1.numel());
+    return std::make_tuple(grad, -grad);
+}
+
+Tensor tp_hinge_embedding_loss_cuda(const Tensor& input, const Tensor& target,
+                                    double margin, int64_t reduction) {
+    Tensor zeros = Tensor::zeros_like(input);
+    Tensor margin_diff = margin - input;
+    Tensor margin_part = Tensor::where(
+        target.ne(Scalar(1)),
+        Tensor::where(margin_diff.lt(Scalar(0)), Scalar(0), margin_diff),
+        zeros);
+    Tensor self_part = Tensor::where(target.ne(Scalar(-1)), input, zeros);
+    return tp_loss_reduce(margin_part + self_part, reduction);
+}
+
+Tensor tp_hinge_embedding_loss_backward_cuda(const Tensor& grad_output,
+                                             const Tensor& input,
+                                             const Tensor& target, double margin,
+                                             int64_t reduction) {
+    Tensor ones = Tensor::ones_like(input);
+    Tensor active = (margin - input).gt(Scalar(0)).to(input.dtype());
+    Tensor grad = Tensor::where(
+        target.eq(Scalar(1)), ones,
+        Tensor::where(target.eq(Scalar(-1)), -active, ones - active));
+    grad = grad * grad_output;
+    return tp_scale_grad(grad, reduction, input.numel());
+}
+
+Tensor tp_soft_margin_loss_cuda(const Tensor& input, const Tensor& target,
+                                int64_t reduction) {
+    Tensor loss = ((input * target) * Scalar(-1)).exp().add(Scalar(1)).log();
+    return tp_loss_reduce(loss, reduction);
+}
+
+Tensor tp_soft_margin_loss_backward_cuda(const Tensor& grad_output,
+                                         const Tensor& input,
+                                         const Tensor& target,
+                                         int64_t reduction) {
+    Tensor z = ((input * target) * Scalar(-1)).exp();
+    Tensor grad = -target * z.sigmoid() * grad_output;
+    return tp_scale_grad(grad, reduction, input.numel());
+}
+
+Tensor tp_cosine_embedding_loss_cuda(const Tensor& input1, const Tensor& input2,
+                                     const Tensor& target, double margin,
+                                     int64_t reduction) {
+    const std::vector<int64_t> reduce_dims{1};
+    Tensor n1 = (input1 * input1).sum(reduce_dims) + 1e-12;
+    Tensor n2 = (input2 * input2).sum(reduce_dims) + 1e-12;
+    Tensor denom = (n1 * n2).sqrt();
+    Tensor cosine = (input1 * input2).sum(reduce_dims) / denom;
+    Tensor zeros = Tensor::zeros_like(cosine);
+    Tensor negative = Tensor::where((cosine - margin).lt(Scalar(0)), Scalar(0),
+                                    cosine - margin);
+    Tensor loss = Tensor::where(target.eq(Scalar(1)), Scalar(1) - cosine,
+                                Tensor::where(target.eq(Scalar(-1)), negative,
+                                              zeros));
+    return tp_loss_reduce(loss, reduction);
+}
+
+std::tuple<Tensor, Tensor> tp_cosine_embedding_loss_backward_cuda(
+        const Tensor& grad_output, const Tensor& input1, const Tensor& input2,
+        const Tensor& target, double margin, int64_t reduction) {
+    tp_validate_reduction(reduction);
+    const std::vector<int64_t> reduce_dims{1};
+    Tensor n1 = (input1 * input1).sum(reduce_dims) + 1e-12;
+    Tensor n2 = (input2 * input2).sum(reduce_dims) + 1e-12;
+    Tensor denom = (n1 * n2).sqrt();
+    Tensor cosine = (input1 * input2).sum(reduce_dims) / denom;
+
+    Tensor ones = Tensor::ones({input1.size(0)}, input1.dtype(), input1.device());
+    Tensor dl_dcos = Tensor::where(
+        target.eq(Scalar(1)), -ones,
+        Tensor::where(target.eq(Scalar(-1)),
+                      (cosine - margin).gt(Scalar(0)).to(input1.dtype()),
+                      (Scalar(1) - cosine - margin)
+                          .gt(Scalar(0))
+                          .to(input1.dtype()) * Scalar(-1)));
+    if (reduction == 1) {
+        dl_dcos = dl_dcos / static_cast<double>(input1.size(0));
+    }
+
+    Tensor cosine_col = cosine.unsqueeze(1);
+    Tensor denom_col = denom.unsqueeze(1);
+    Tensor grad1 = (input2 / denom_col) -
+                   cosine_col * (input1 / n1.unsqueeze(1));
+    Tensor grad2 = (input1 / denom_col) -
+                   cosine_col * (input2 / n2.unsqueeze(1));
+    Tensor multiplier = (dl_dcos * grad_output).unsqueeze(1);
+    return std::make_tuple(grad1 * multiplier, grad2 * multiplier);
+}
+
+Tensor tp_poisson_nll_loss_cuda(const Tensor& input, const Tensor& target,
+                                bool log_input, bool full, double eps,
+                                int64_t reduction) {
+    Tensor loss = log_input ? input.exp() - target * input
+                            : input - target * (input + eps).log();
+    if (full) {
+        Tensor active = target.gt(Scalar(1)).to(input.dtype());
+        Tensor safe_target = Tensor::where(active, target,
+                                           Tensor::ones_like(target));
+        Tensor stirling = target * safe_target.log() - target +
+                          (safe_target * (2.0 * M_PI)).log() * 0.5;
+        loss = loss + Tensor::where(active, stirling,
+                                    Tensor::zeros_like(stirling));
+    }
+    return tp_loss_reduce(loss, reduction);
+}
+
+Tensor tp_poisson_nll_loss_backward_cuda(const Tensor& grad_output,
+                                         const Tensor& input,
+                                         const Tensor& target, bool log_input,
+                                         bool full, double eps,
+                                         int64_t reduction) {
+    static_cast<void>(full);
+    Tensor grad = log_input ? input.exp() - target
+                            : Scalar(1) - target / (input + eps);
+    grad = grad * grad_output;
+    return tp_scale_grad(grad, reduction, input.numel());
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, LossKernels) {
     m.impl("l1_loss", l1_loss_cuda);
     m.impl("kl_div", kl_div_cuda);
@@ -377,6 +573,20 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, LossKernels) {
     m.impl("triplet_margin_loss", triplet_margin_loss_cuda);
     m.impl("poisson_nll_loss", poisson_nll_loss_cuda);
     m.impl("multilabel_soft_margin_loss", multilabel_soft_margin_loss_cuda);
+    m.impl("tp_l1_loss", tp_l1_loss_cuda);
+    m.impl("tp_l1_loss_backward", tp_l1_loss_backward_cuda);
+    m.impl("tp_kl_div", tp_kl_div_cuda);
+    m.impl("tp_kl_div_backward", tp_kl_div_backward_cuda);
+    m.impl("tp_margin_ranking_loss", tp_margin_ranking_loss_cuda);
+    m.impl("tp_margin_ranking_loss_backward", tp_margin_ranking_loss_backward_cuda);
+    m.impl("tp_hinge_embedding_loss", tp_hinge_embedding_loss_cuda);
+    m.impl("tp_hinge_embedding_loss_backward", tp_hinge_embedding_loss_backward_cuda);
+    m.impl("tp_soft_margin_loss", tp_soft_margin_loss_cuda);
+    m.impl("tp_soft_margin_loss_backward", tp_soft_margin_loss_backward_cuda);
+    m.impl("tp_cosine_embedding_loss", tp_cosine_embedding_loss_cuda);
+    m.impl("tp_cosine_embedding_loss_backward", tp_cosine_embedding_loss_backward_cuda);
+    m.impl("tp_poisson_nll_loss", tp_poisson_nll_loss_cuda);
+    m.impl("tp_poisson_nll_loss_backward", tp_poisson_nll_loss_backward_cuda);
 }
 
 } // namespace cuda
