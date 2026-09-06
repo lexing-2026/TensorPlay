@@ -23,6 +23,18 @@ namespace tensorplay {
 namespace cuda {
 namespace foreach_mta {
 
+namespace math_compat {
+
+__device__ inline float rsqrt(float value) {
+    return ::rsqrtf(value);
+}
+
+__device__ inline double rsqrt(double value) {
+    return ::rsqrt(value);
+}
+
+} // namespace math_compat
+
 // Keep the metadata conservative enough for CUDA's pre-13 kernel argument
 // ILP=4 loop below: a 512-thread block covers a 64K chunk in 32 iterations
 // instead of 256 scalar iterations with the old 256-thread kernel.
@@ -394,11 +406,13 @@ void launch_scalar_list(
 
 template <typename M>
 struct UnarySqrt {
-    __device__ M operator()(M* values) const { return sqrt(values[0]); }
+    __device__ M operator()(M* values) const { return std::sqrt(values[0]); }
 };
 template <typename M>
 struct UnaryRsqrt {
-    __device__ M operator()(M* values) const { return M(1) / sqrt(values[0]); }
+    __device__ M operator()(M* values) const {
+        return math_compat::rsqrt(values[0]);
+    }
 };
 template <typename M>
 struct UnaryNeg {
@@ -407,7 +421,7 @@ struct UnaryNeg {
 template <typename M>
 struct UnaryAbs {
     __device__ M operator()(M* values) const {
-        return fabs(values[0]);
+        return std::abs(values[0]);
     }
 };
 template <typename M>
@@ -468,9 +482,9 @@ struct TernaryAddcmul {
     M value;
     __device__ M operator()(M* values) const {
         if (value == M(1)) {
-            return fma(values[1], values[2], values[0]);
+            return std::fma(values[1], values[2], values[0]);
         }
-        return fma(value, values[1] * values[2], values[0]);
+        return std::fma(value, values[1] * values[2], values[0]);
     }
 };
 template <typename M>
@@ -481,7 +495,7 @@ struct TernaryAddcdiv {
         if (value == M(1)) {
             return values[0] + quotient;
         }
-        return fma(value, quotient, values[0]);
+        return std::fma(value, quotient, values[0]);
     }
 };
 template <typename M>
@@ -535,18 +549,20 @@ struct BinaryMinimumScalarList {
 template <typename M>
 struct UnaryPow {
     M exponent;
-    __device__ M operator()(M* values) const { return pow(values[0], exponent); }
+    __device__ M operator()(M* values) const {
+        return ::pow(values[0], exponent);
+    }
 };
 template <typename M>
 struct UnaryPowScalarList {
     __device__ M operator()(M* values, M exponent) const {
-        return pow(values[0], exponent);
+        return ::pow(values[0], exponent);
     }
 };
 template <typename M>
 struct BinaryPowList {
     __device__ M operator()(M* values) const {
-        return pow(values[0], values[1]);
+        return ::pow(values[0], values[1]);
     }
 };
 
@@ -556,31 +572,31 @@ struct NAME { \
     __device__ M operator()(M* values) const { return (BODY); } \
 };
 
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryExp, exp(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryExpm1, expm1(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryErf, erf(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryErfc, erfc(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryCeil, ceil(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryFloor, floor(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryFrac, values[0] - trunc(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryLgamma, lgamma(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryLog, log(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryLog10, log10(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryLog1p, log1p(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryLog2, log2(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryRound, round(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnarySin, sin(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnarySinh, sinh(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryCos, cos(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryCosh, cosh(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryTan, tan(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryTanh, tanh(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryExp, std::exp(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryExpm1, std::expm1(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryErf, std::erf(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryErfc, std::erfc(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryCeil, std::ceil(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryFloor, std::floor(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryFrac, values[0] - std::trunc(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryLgamma, std::lgamma(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryLog, std::log(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryLog10, std::log10(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryLog1p, std::log1p(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryLog2, std::log2(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryRound, std::round(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnarySin, std::sin(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnarySinh, std::sinh(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryCos, std::cos(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryCosh, std::cosh(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryTan, std::tan(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryTanh, std::tanh(values[0]))
 TP_FOREACH_UNARY_MATH_FUNCTOR(
-    UnarySigmoid, M(1) / (M(1) + exp(-values[0])))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryAcos, acos(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryAsin, asin(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryAtan, atan(values[0]))
-TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryTrunc, trunc(values[0]))
+    UnarySigmoid, M(1) / (M(1) + std::exp(-values[0])))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryAcos, std::acos(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryAsin, std::asin(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryAtan, std::atan(values[0]))
+TP_FOREACH_UNARY_MATH_FUNCTOR(UnaryTrunc, std::trunc(values[0]))
 
 #undef TP_FOREACH_UNARY_MATH_FUNCTOR
 
