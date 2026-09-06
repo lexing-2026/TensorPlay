@@ -378,7 +378,21 @@ Tensor nansum_cuda2(const Tensor& self, const std::vector<int64_t>& dim_in, bool
     return reduce_iterative(self, dim, keepdim, 2, out_dt);
 }
 Tensor count_nonzero_cuda2(const Tensor& self, const std::vector<int64_t>& dim) {
-    return reduce_iterative(self, dim, false, 3, DType::Int64);
+    Tensor reduce = self.dtype() == DType::Bool
+        ? self
+        : self.ne(Scalar(0));
+    if (dim.empty()) {
+        if (self.dim() == 0) {
+            return reduce.to(DType::Int64);
+        }
+        std::vector<int64_t> all_dims;
+        all_dims.reserve(static_cast<size_t>(self.dim()));
+        for (int64_t d = 0; d < self.dim(); ++d) {
+            all_dims.push_back(d);
+        }
+        return reduce_iterative(reduce, all_dims, false, 3, DType::Int64);
+    }
+    return reduce_iterative(reduce, dim, false, 3, DType::Int64);
 }
 
 std::tuple<Tensor, Tensor> cummax_cuda(const Tensor& self, int64_t dim) {
