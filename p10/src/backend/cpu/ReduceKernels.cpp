@@ -574,9 +574,24 @@ std::tuple<Tensor, Tensor> nanmedian_dim_values_cpu(
 std::tuple<Tensor, Tensor> mode_cpu(const Tensor& self, int64_t dim,
                                     bool keepdim) {
     const int64_t nd = self.dim();
+    if (nd == 0) {
+        if (dim != 0 && dim != -1) {
+            TP_THROW(IndexError,
+                     "Dimension out of range for scalar mode input: ", dim);
+        }
+        Tensor values = Tensor::empty({}, self.dtype(), self.device());
+        Tensor indices = Tensor::zeros({}, DType::Int64, self.device());
+        values.copy_(self);
+        return {values, indices};
+    }
     dim = wrap_dim(dim, nd);
     Tensor sc = self.contiguous();
     const int64_t d_size = sc.size(dim);
+    if (d_size == 0) {
+        TP_THROW(RuntimeError,
+                 "mode(): Expected reduction dim ", dim,
+                 " to have non-zero size");
+    }
     int64_t outer = 1;
     int64_t inner = 1;
     outer_inner(static_cast<std::vector<int64_t>>(sc.shape()), dim, outer, inner);
@@ -625,6 +640,20 @@ std::tuple<Tensor, Tensor> mode_cpu(const Tensor& self, int64_t dim,
 std::tuple<Tensor, Tensor> kthvalue_cpu(const Tensor& self, int64_t k,
                                         int64_t dim, bool keepdim) {
     const int64_t nd = self.dim();
+    if (nd == 0) {
+        if (dim != 0 && dim != -1) {
+            TP_THROW(IndexError,
+                     "Dimension out of range for scalar kthvalue input: ", dim);
+        }
+        if (k != 1) {
+            TP_THROW(RuntimeError,
+                     "kthvalue(): selected number k out of range for dim 0");
+        }
+        Tensor values = Tensor::empty({}, self.dtype(), self.device());
+        Tensor indices = Tensor::zeros({}, DType::Int64, self.device());
+        values.copy_(self);
+        return {values, indices};
+    }
     dim = wrap_dim(dim, nd);
     Tensor sc = self.contiguous();
     const int64_t d_size = sc.size(dim);
