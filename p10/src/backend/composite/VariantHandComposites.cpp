@@ -70,7 +70,7 @@ Tensor& write_reduction_out(const char* op, Tensor value, Tensor& out) {
     return out;
 }
 
-Tensor& write_sort_out(const char* op, Tensor value, Tensor& out) {
+Tensor& write_exact_out(const char* op, Tensor value, Tensor& out) {
     if (!out.defined()) {
         out = std::move(value);
         return out;
@@ -230,8 +230,8 @@ std::tuple<Tensor, Tensor> median_dim_values_native(const Tensor& self, int64_t 
                                                      bool keepdim, Tensor& values,
                                                      Tensor& indices) {
     auto r = median_dim_native(self, dim, keepdim);
-    write_sort_out("median", std::get<0>(r), values);
-    write_sort_out("median", std::get<1>(r), indices);
+    write_exact_out("median", std::get<0>(r), values);
+    write_exact_out("median", std::get<1>(r), indices);
     return {values, indices};
 }
 
@@ -248,8 +248,8 @@ std::tuple<Tensor, Tensor> sort_values_stable_native(const Tensor& self,
                                                       int64_t dim, bool descending,
                                                       Tensor& values, Tensor& indices) {
     auto r = sort_stable_native(self, stable, dim, descending);
-    write_sort_out("sort", std::get<0>(r), values);
-    write_sort_out("sort", std::get<1>(r), indices);
+    write_exact_out("sort", std::get<0>(r), values);
+    write_exact_out("sort", std::get<1>(r), indices);
     return {values, indices};
 }
 
@@ -260,9 +260,9 @@ Tensor argsort_stable_native(const Tensor& self, bool stable, int64_t dim, bool 
 
 Tensor& argsort_stable_out_native(const Tensor& self, bool stable, int64_t dim,
                                   bool descending, Tensor& out) {
-    return write_sort_out("argsort", argsort_stable_native(self, stable, dim,
-                                                             descending),
-                          out);
+    return write_exact_out("argsort", argsort_stable_native(self, stable, dim,
+                                                              descending),
+                           out);
 }
 
 std::tuple<Tensor, Tensor> topk_values_native(const Tensor& self, int64_t k, int64_t dim,
@@ -309,8 +309,8 @@ std::tuple<Tensor, Tensor> aminmax_out_native(const Tensor& self,
     std::vector<int64_t> dims;
     if (dim.has_value()) dims.push_back(*dim);
     auto r = ops::aminmax(self, dims, keepdim);
-    write_sort_out("aminmax", std::get<0>(r), min);
-    write_sort_out("aminmax", std::get<1>(r), max);
+    write_exact_out("aminmax", std::get<0>(r), min);
+    write_exact_out("aminmax", std::get<1>(r), max);
     return {min, max};
 }
 
@@ -328,11 +328,15 @@ Tensor& round__decimals_native(Tensor& self, int64_t decimals) {
 Tensor& nan_to_num_out_native(const Tensor& self, std::optional<double> nan,
                               std::optional<double> posinf,
                               std::optional<double> neginf, Tensor& out) {
-    out = ops::nan_to_num(self,
-                          Scalar(nan.value_or(0.0)),
-                          Scalar(posinf.value_or(std::numeric_limits<double>::infinity())),
-                          Scalar(neginf.value_or(-std::numeric_limits<double>::infinity())));
-    return out;
+    const std::optional<Scalar> posinf_value =
+        posinf.has_value() ? std::optional<Scalar>(Scalar(*posinf)) : std::nullopt;
+    const std::optional<Scalar> neginf_value =
+        neginf.has_value() ? std::optional<Scalar>(Scalar(*neginf)) : std::nullopt;
+    return write_exact_out(
+        "nan_to_num",
+        ops::nan_to_num(self, Scalar(nan.value_or(0.0)), posinf_value,
+                        neginf_value),
+        out);
 }
 
 Tensor& nanmean_out_native(const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
