@@ -247,7 +247,7 @@ void segment_reduce_lengths_backward_kernel(
                         const int64_t data_index =
                             outer_idx * data_stride_axis * data_size_axis +
                             j * data_stride_axis + inner_idx;
-                        if (grad_input_data[data_index] > 0) {
+                        if (grad_input_data[data_index] > T(0)) {
                             grad_input_data[data_index] =
                                 grad_input_data[data_index] / static_cast<T>(counter);
                         }
@@ -277,7 +277,7 @@ void segment_reduce_lengths_backward_kernel(
                             outer_idx * data_stride_axis * data_size_axis +
                             j * data_stride_axis + inner_idx;
                         if (std::isnan(static_cast<double>(values_data[data_index])) ||
-                            values_data[data_index] == 0) {
+                            values_data[data_index] == T(0)) {
                             // Zero/NaN participation needs the exclusive
                             // product computed explicitly.
                             T exclusive_prod = initial_prod_value;
