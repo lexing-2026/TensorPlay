@@ -70,6 +70,26 @@ Tensor& write_reduction_out(const char* op, Tensor value, Tensor& out) {
     return out;
 }
 
+Tensor& write_sort_out(const char* op, Tensor value, Tensor& out) {
+    if (!out.defined()) {
+        out = std::move(value);
+        return out;
+    }
+    if (out.dtype() != value.dtype()) {
+        TP_THROW(TypeError, op, ": output dtype must match result dtype");
+    }
+    if (out.device() != value.device()) {
+        TP_THROW(DeviceMismatchError,
+                 op, ": output device must match input device");
+    }
+    const auto target = static_cast<std::vector<int64_t>>(value.shape());
+    if (static_cast<std::vector<int64_t>>(out.shape()) != target) {
+        out.resize_(target);
+    }
+    out.copy_(value);
+    return out;
+}
+
 } // namespace
 
 // ---- norm family -----------------------------------------------------------
@@ -228,8 +248,8 @@ std::tuple<Tensor, Tensor> sort_values_stable_native(const Tensor& self,
                                                       int64_t dim, bool descending,
                                                       Tensor& values, Tensor& indices) {
     auto r = sort_stable_native(self, stable, dim, descending);
-    values = std::get<0>(r);
-    indices = std::get<1>(r);
+    write_sort_out("sort", std::get<0>(r), values);
+    write_sort_out("sort", std::get<1>(r), indices);
     return {values, indices};
 }
 
@@ -240,8 +260,9 @@ Tensor argsort_stable_native(const Tensor& self, bool stable, int64_t dim, bool 
 
 Tensor& argsort_stable_out_native(const Tensor& self, bool stable, int64_t dim,
                                   bool descending, Tensor& out) {
-    out = argsort_stable_native(self, stable, dim, descending);
-    return out;
+    return write_sort_out("argsort", argsort_stable_native(self, stable, dim,
+                                                             descending),
+                          out);
 }
 
 std::tuple<Tensor, Tensor> topk_values_native(const Tensor& self, int64_t k, int64_t dim,
