@@ -4,6 +4,7 @@
 // slice and walk the reduced dimension sequentially. Rare complex ops
 // (mode/kthvalue/nanmedian/dist-special-p) are host-staged reference paths.
 #include "Tensor.h"
+#include "Complex.h"
 #include "CUDAComplex.cuh"
 #include "Dispatcher.h"
 #include "Scalar.h"
@@ -19,7 +20,6 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
-#include <complex>
 #include <limits>
 #include <cstring>
 #include <tuple>
@@ -85,7 +85,7 @@ __device__ bool logical_truth_cuda(const T& value) {
 }
 
 template <typename T>
-__device__ bool logical_truth_cuda(const std::complex<T>& value) {
+__device__ bool logical_truth_cuda(const tensorplay::complex<T>& value) {
     return value.real() != T(0) || value.imag() != T(0);
 }
 
@@ -207,14 +207,14 @@ Tensor logical_binary_cuda(const Tensor& a_in, const Tensor& b_in, Pred pred,
     switch (dt) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_LOGICAL_BIN)
         case DType::ComplexFloat:
-            gpu_kernel(iter, [pred] __device__(std::complex<float> lhs,
-                                                std::complex<float> rhs) -> bool {
+            gpu_kernel(iter, [pred] __device__(tensorplay::complex<float> lhs,
+                                                tensorplay::complex<float> rhs) -> bool {
                 return pred(logical_truth_cuda(lhs), logical_truth_cuda(rhs));
             });
             break;
         case DType::ComplexDouble:
-            gpu_kernel(iter, [pred] __device__(std::complex<double> lhs,
-                                                std::complex<double> rhs) -> bool {
+            gpu_kernel(iter, [pred] __device__(tensorplay::complex<double> lhs,
+                                                tensorplay::complex<double> rhs) -> bool {
                 return pred(logical_truth_cuda(lhs), logical_truth_cuda(rhs));
             });
             break;
@@ -247,12 +247,12 @@ Tensor logical_unary_cuda(const Tensor& self, Pred pred, const char* name) {
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_LOGICAL_UNARY)
         case DType::ComplexFloat:
-            gpu_kernel(iter, [pred] __device__(std::complex<float> value) -> bool {
+            gpu_kernel(iter, [pred] __device__(tensorplay::complex<float> value) -> bool {
                 return pred(logical_truth_cuda(value));
             });
             break;
         case DType::ComplexDouble:
-            gpu_kernel(iter, [pred] __device__(std::complex<double> value) -> bool {
+            gpu_kernel(iter, [pred] __device__(tensorplay::complex<double> value) -> bool {
                 return pred(logical_truth_cuda(value));
             });
             break;
