@@ -1,16 +1,16 @@
 #include "SpecialKernelUtils.cuh"
+#include "CUDALoops.cuh"
 
 #include <SpecialMath.h>
 
 #include <cstdint>
 #include <limits>
+#include <tuple>
 
 namespace tensorplay::cuda {
 namespace {
 
 using special_detail::typed_math_cuda;
-using special_detail::check_cuda;
-using special_detail::launch_ew;
 using tensorplay::special_math::airy_ai_forward;
 using tensorplay::special_math::bessel_j0_forward;
 using tensorplay::special_math::bessel_j1_forward;
@@ -179,18 +179,6 @@ struct PolygammaFn {
     }
 };
 
-template <typename T>
-__global__ void frexp_kernel(
-    int64_t n, const T* input, T* mantissa, int32_t* exponent) {
-    int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; index < n; index += stride) {
-        int exponent_value = 0;
-        mantissa[index] = ::frexp(input[index], &exponent_value);
-        exponent[index] = static_cast<int32_t>(exponent_value);
-    }
-}
-
 Tensor airy_ai_cuda(const Tensor& self) {
     return typed_math_cuda(self, AiryAiFn{});
 }
@@ -268,26 +256,33 @@ std::tuple<Tensor, Tensor> frexp_cuda(const Tensor& self) {
     const DType compute_dtype = self.dtype() == DType::Float64
         ? DType::Float64 : DType::Float32;
     Tensor input = self.dtype() == compute_dtype
-        ? self.contiguous() : self.to(compute_dtype).contiguous();
+        ? self : self.to(compute_dtype);
     Tensor mantissa = Tensor::empty(
         special_detail::shape_of(input), compute_dtype, input.device());
     Tensor exponent = Tensor::empty(
         special_detail::shape_of(input), DType::Int32, input.device());
-    const int64_t elements = input.numel();
-    if (elements > 0) {
-        dim3 grid, block;
-        launch_ew(grid, block, elements);
-        auto stream = getCurrentCUDAStream().stream();
+    if (input.numel() > 0) {
+        TensorIterator iter = TensorIteratorConfig()
+            .check_all_same_dtype(false)
+            .add_output(mantissa)
+            .add_output(exponent)
+            .add_input(input)
+            .build();
         if (compute_dtype == DType::Float64) {
-            frexp_kernel<<<grid, block, 0, stream>>>(
-                elements, input.data_ptr<double>(), mantissa.data_ptr<double>(),
-                exponent.data_ptr<int32_t>());
+            gpu_kernel_multiple_outputs(
+                iter, [] __device__ (double value) -> std::tuple<double, int32_t> {
+                    int exponent_value = 0;
+                    const double mantissa_value = ::frexp(value, &exponent_value);
+                    return {mantissa_value, static_cast<int32_t>(exponent_value)};
+                });
         } else {
-            frexp_kernel<<<grid, block, 0, stream>>>(
-                elements, input.data_ptr<float>(), mantissa.data_ptr<float>(),
-                exponent.data_ptr<int32_t>());
+            gpu_kernel_multiple_outputs(
+                iter, [] __device__ (float value) -> std::tuple<float, int32_t> {
+                    int exponent_value = 0;
+                    const float mantissa_value = ::frexp(value, &exponent_value);
+                    return {mantissa_value, static_cast<int32_t>(exponent_value)};
+                });
         }
-        check_cuda(cudaGetLastError());
     }
     if (compute_dtype != self.dtype()) {
         mantissa = mantissa.to(self.dtype());
