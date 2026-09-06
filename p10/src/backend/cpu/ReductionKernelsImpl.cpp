@@ -7,6 +7,7 @@
 #include "Macros.h"
 #include "ReductionKernels.h"
 #include "TensorIterator.h"
+#include "Complex.h"
 #include "cpu/CascadeSum.h"
 #include "cpu/Reduce.h"
 #include "cpu/vec/vec.h"
@@ -64,7 +65,7 @@ Scalar to_scalar(T val) {
         } else {
             // Scalar storage only holds cfloat/cdouble; widen the reduced
             // complexes through complex64.
-            return Scalar(std::complex<float>(
+            return Scalar(complex<float>(
                 static_cast<float>(val.real()), static_cast<float>(val.imag())));
         }
     } else {
@@ -1927,16 +1928,16 @@ static void sum_kernel_iter(TensorIteratorBase& iter) {
     switch (iter.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
         case DType::ComplexFloat:
-            binary_kernel_reduce(iter, CxSumOps<std::complex<float>>{}, std::complex<float>(0));
+            binary_kernel_reduce(iter, CxSumOps<complex<float>>{}, complex<float>(0));
             break;
         case DType::ComplexDouble:
-            binary_kernel_reduce(iter, CxSumOps<std::complex<double>>{}, std::complex<double>(0));
+            binary_kernel_reduce(iter, CxSumOps<complex<double>>{}, complex<double>(0));
             break;
         case DType::ComplexHalf:
         case DType::BComplex32:
             // Reduced complexes accumulate in complex64 (opmath rule); the
             // caller pre-casts the input to the acc dtype.
-            binary_kernel_reduce(iter, CxSumOps<std::complex<float>>{}, std::complex<float>(0));
+            binary_kernel_reduce(iter, CxSumOps<complex<float>>{}, complex<float>(0));
             break;
         default: TP_THROW(NotImplementedError, "sum not implemented for this dtype");
     }
@@ -2067,11 +2068,10 @@ Tensor sum_kernel_impl(const Tensor& self, DType dtype) {
                                 &re, &im)) {
             Tensor out = Tensor::zeros({}, acc_dtype, self.device());
             if (acc_dtype == DType::ComplexFloat) {
-                *out.data_ptr<std::complex<float>>() = std::complex<float>(
+                *out.data_ptr<complex<float>>() = complex<float>(
                     static_cast<float>(re), static_cast<float>(im));
             } else {
-                *out.data_ptr<std::complex<double>>() =
-                    std::complex<double>(re, im);
+                *out.data_ptr<complex<double>>() = complex<double>(re, im);
             }
             return acc_dtype == out_dtype ? out : out.to(out_dtype);
         }

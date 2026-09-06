@@ -9,6 +9,7 @@
 #include <sstream>
 
 #include "DType.h"
+#include "Complex.h"
 #include "Macros.h"
 #include "Exception.h"
 
@@ -29,6 +30,10 @@ public:
     Scalar(double v) : val_(v), type_(DType::Float64) {}
     Scalar(std::complex<float> v) : val_(v), type_(DType::ComplexFloat) {}
     Scalar(std::complex<double> v) : val_(v), type_(DType::ComplexDouble) {}
+    Scalar(complex<float> v)
+        : val_(static_cast<std::complex<float>>(v)), type_(DType::ComplexFloat) {}
+    Scalar(complex<double> v)
+        : val_(static_cast<std::complex<double>>(v)), type_(DType::ComplexDouble) {}
     Scalar(bool v) : val_(v), type_(DType::Bool) {}
 
     // Copy/Move
