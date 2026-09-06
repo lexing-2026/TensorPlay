@@ -408,7 +408,7 @@ Tensor flip_cuda(const Tensor& self, const std::vector<int64_t>& dims) {
         }
     }
     Tensor sc = self.contiguous();
-    Tensor out = detail::clone_impl(self);
+    Tensor out = ::tensorplay::detail::clone_impl(self);
     int64_t n = sc.numel();
     if (n == 0) return out;
     if (dims.size() == 1 && nd > 0 && out.is_contiguous()) {
@@ -555,7 +555,7 @@ Tensor rot90_cuda(const Tensor& self, int64_t k, const std::vector<int64_t>& dim
         case 1: return transpose_view(flip_cuda(self, {dim1}), dim0, dim1);
         case 2: return flip_cuda(self, {dim0, dim1});
         case 3: return transpose_view(flip_cuda(self, {dim0}), dim0, dim1);
-        default: return detail::contiguous_clone(self);
+        default: return ::tensorplay::detail::contiguous_clone(self);
     }
 }
 
@@ -912,7 +912,7 @@ inline void check_scatter_source(const Tensor& target, const Tensor& src) {
 Tensor select_scatter_cuda(const Tensor& self, const Tensor& src, int64_t dim,
                            int64_t index) {
     dim = wrap_dim(dim, self.dim());
-    Tensor output = detail::clone_impl(self);
+    Tensor output = ::tensorplay::detail::clone_impl(self);
     Tensor target = output.select(dim, index);
     check_scatter_source(target, src);
     target.copy_(src);
@@ -934,7 +934,7 @@ Tensor slice_scatter_cuda(const Tensor& self, const Tensor& src, int64_t dim,
     begin = std::max<int64_t>(0, std::min<int64_t>(begin, length));
     finish = std::max<int64_t>(0, std::min<int64_t>(finish, length));
     if (finish < begin) finish = begin;
-    Tensor output = detail::clone_impl(self);
+    Tensor output = ::tensorplay::detail::clone_impl(self);
     Tensor target = output.slice(dim, begin, finish, step);
     check_scatter_source(target, src);
     target.copy_(src);
@@ -943,7 +943,7 @@ Tensor slice_scatter_cuda(const Tensor& self, const Tensor& src, int64_t dim,
 
 Tensor diagonal_scatter_cuda(const Tensor& self, const Tensor& src,
                              int64_t offset, int64_t dim1, int64_t dim2) {
-    Tensor output = detail::clone_impl(self);
+    Tensor output = ::tensorplay::detail::clone_impl(self);
     Tensor target = output.diagonal(offset, dim1, dim2);
     check_scatter_source(target, src);
     target.copy_(src);
