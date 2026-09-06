@@ -1973,7 +1973,7 @@ Tensor scatter_base_cuda(const Tensor& self, int64_t dim, const Tensor& index,
     }
 #define TP_SC_CASE(ctype, name) \
     case DType::name: \
-        scatter_kernel<ctype, Add><<<(total_idx * inner + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+        scatter_kernel<ctype, Add><<<(total_idx + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
             total_idx, idx_dim_size, idx_inner, self_dim_size, inner, \
             static_cast<ctype*>(result.data_ptr()), idx_c.data_ptr<int64_t>(), \
             static_cast<const ctype*>(src_b.data_ptr())); \
@@ -2056,7 +2056,7 @@ static Tensor& scatter_base_inplace_cuda(Tensor& self, int64_t dim, const Tensor
     auto stream = getCurrentCUDAStream().stream();
 #define TP_SC_INPLACE_ASSIGN_CASE(ctype, name) \
     case DType::name: { \
-        scatter_kernel<ctype, false><<<(total_idx * inner + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+        scatter_kernel<ctype, false><<<(total_idx + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
             total_idx, idx_dim_size, idx_inner, self_dim_size, inner, \
             static_cast<ctype*>(result.data_ptr()), idx_c.data_ptr<int64_t>(), \
             static_cast<const ctype*>(src_b.data_ptr())); \
