@@ -25,10 +25,10 @@ template <typename scalar_t, typename math_t>
 __device__ __forceinline__ math_t exact_addcmul(
         math_t input, math_t tensor1, math_t tensor2, math_t alpha) {
     if (alpha == math_t(1)) {
-        return round_to_scalar<scalar_t>(fma(tensor1, tensor2, input));
+        return round_to_scalar<scalar_t>(std::fma(tensor1, tensor2, input));
     }
     return round_to_scalar<scalar_t>(
-        fma(alpha, tensor1 * tensor2, input));
+        std::fma(alpha, tensor1 * tensor2, input));
 }
 
 template <typename scalar_t, typename math_t>
@@ -38,7 +38,7 @@ __device__ __forceinline__ math_t exact_addcdiv(
     if (alpha == math_t(1)) {
         return round_to_scalar<scalar_t>(input + quotient);
     }
-    return round_to_scalar<scalar_t>(fma(alpha, quotient, input));
+    return round_to_scalar<scalar_t>(std::fma(alpha, quotient, input));
 }
 
 template <typename scalar_t, typename math_t>
@@ -50,7 +50,7 @@ __device__ __forceinline__ math_t exact_add(
 template <typename scalar_t, typename math_t>
 __device__ __forceinline__ math_t exact_lerp(
         math_t start, math_t end, math_t weight) {
-    const math_t value = fabs(weight) < math_t(0.5)
+    const math_t value = std::abs(weight) < math_t(0.5)
         ? start + weight * (end - start)
         : end - (end - start) * (math_t(1) - weight);
     return round_to_scalar<scalar_t>(value);
@@ -93,7 +93,7 @@ struct RmspropExactBody {
                 square, mean, mean, math_t(-1));
         }
 
-        math_t denominator = round_to_scalar<scalar_t>(sqrt(average));
+        math_t denominator = round_to_scalar<scalar_t>(std::sqrt(average));
         denominator = round_to_scalar<scalar_t>(denominator + eps);
         if constexpr (HasMomentum) {
             constexpr int kMomentumIndex = Centered ? 4 : 3;
@@ -136,9 +136,9 @@ struct AdadeltaExactBody {
             square, g, g, one_minus_rho);
         values[2][lane] = square;
 
-        math_t std = round_to_scalar<scalar_t>(sqrt(
+        math_t std = round_to_scalar<scalar_t>(std::sqrt(
             round_to_scalar<scalar_t>(square + eps)));
-        math_t delta = round_to_scalar<scalar_t>(sqrt(
+        math_t delta = round_to_scalar<scalar_t>(std::sqrt(
             round_to_scalar<scalar_t>(values[3][lane] + eps)));
         delta = round_to_scalar<scalar_t>(delta / std);
         delta = round_to_scalar<scalar_t>(delta * g);
@@ -182,7 +182,7 @@ struct AdagradExactBody {
             exact_addcmul<scalar_t>(
                 values[2][lane], g, g, math_t(1)));
         values[2][lane] = sum;
-        math_t denominator = round_to_scalar<scalar_t>(sqrt(sum));
+        math_t denominator = round_to_scalar<scalar_t>(std::sqrt(sum));
         denominator = round_to_scalar<scalar_t>(denominator + eps);
         const math_t numerator = round_to_scalar<scalar_t>(
             corrected_lr * g);
@@ -221,12 +221,12 @@ struct AdamaxExactBody {
             values[2][lane], g, one_minus_beta1);
         math_t inf = round_to_scalar<scalar_t>(
             values[3][lane] * beta2);
-        const math_t abs_g = round_to_scalar<scalar_t>(fabs(g));
+        const math_t abs_g = round_to_scalar<scalar_t>(std::abs(g));
         const math_t candidate = round_to_scalar<scalar_t>(abs_g + eps);
         inf = inf < candidate ? candidate : inf;
         values[3][lane] = round_to_scalar<scalar_t>(inf);
         values[0][lane] = round_to_scalar<scalar_t>(
-            fma(step_size, values[2][lane] / values[3][lane], p));
+            std::fma(step_size, values[2][lane] / values[3][lane], p));
     }
 };
 
@@ -261,8 +261,8 @@ struct RpropExactBody {
                              math_t(1));
         math_t step_size = round_to_scalar<scalar_t>(
             values[3][lane] * sign);
-        step_size = round_to_scalar<scalar_t>(fmin(
-            step_size_max, fmax(step_size_min, step_size)));
+        step_size = round_to_scalar<scalar_t>(::fmin(
+            step_size_max, ::fmax(step_size_min, step_size)));
         values[3][lane] = step_size;
 
         math_t stored_grad = maximize
@@ -294,17 +294,17 @@ struct NadamExactBody {
             tensor_index];
         const double mu_product = metadata.step_metadata.host.correction2_sqrts[
             tensor_index];
-        const double mu = beta1_value * (1.0 - 0.5 * pow(
+        const double mu = beta1_value * (1.0 - 0.5 * ::pow(
             0.96, step * momentum_decay_value));
-        const double mu_next = beta1_value * (1.0 - 0.5 * pow(
+        const double mu_next = beta1_value * (1.0 - 0.5 * ::pow(
             0.96, (step + 1.0) * momentum_decay_value));
         step_size_grads = static_cast<math_t>(
             -lr_value * (1.0 - mu) / (1.0 - mu_product));
         step_size_expavg = static_cast<math_t>(
             -lr_value * mu_next /
             (1.0 - mu_product * mu_next));
-        correction2_sqrt = static_cast<math_t>(sqrt(
-            1.0 - pow(beta2_value, step)));
+        correction2_sqrt = static_cast<math_t>(std::sqrt(
+            1.0 - ::pow(beta2_value, step)));
     }
     __device__ __forceinline__ bool should_load(int) const { return true; }
     __device__ __forceinline__ bool should_store(int depth) const {
@@ -331,7 +331,7 @@ struct NadamExactBody {
             second, g, g, one_minus_beta2);
         values[3][lane] = second;
 
-        math_t denominator = round_to_scalar<scalar_t>(sqrt(second));
+        math_t denominator = round_to_scalar<scalar_t>(std::sqrt(second));
         denominator = round_to_scalar<scalar_t>(
             denominator / correction2_sqrt);
         denominator = round_to_scalar<scalar_t>(denominator + eps);
@@ -385,7 +385,7 @@ struct RadamExactBody {
 
         // sqrt(v), add eps, divide by the rectified coefficient, reciprocal,
         // then add the unrectified coefficient.
-        math_t buffer = round_to_scalar<scalar_t>(sqrt(second));
+        math_t buffer = round_to_scalar<scalar_t>(std::sqrt(second));
         buffer = round_to_scalar<scalar_t>(buffer + eps);
         buffer = round_to_scalar<scalar_t>(
             buffer / rectified_coefficient);
