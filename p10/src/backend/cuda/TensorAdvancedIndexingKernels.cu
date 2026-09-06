@@ -5,6 +5,7 @@
 #include "Exception.h"
 #include "Utils.h"
 #include "CUDARuntime.h"
+#include "CUDALoops.cuh"
 
 #include <cuda_runtime.h>
 
