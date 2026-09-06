@@ -546,13 +546,6 @@ __global__ void radix_sort_all_topk_indices_kernel(
   }
 }
 
-__global__ void topk_fill_segment_offsets(
-    uint32_t* __restrict__ offsets, uint32_t rows, uint32_t length) {
-  const uint32_t index = static_cast<uint32_t>(topk_linear_block_id()) * blockDim.x +
-      threadIdx.x;
-  if (index <= rows) offsets[index] = index * length;
-}
-
 template <typename T>
 __global__ void topk_unpack_sort_kernel(
     const T* __restrict__ values, const int64_t* __restrict__ indices,

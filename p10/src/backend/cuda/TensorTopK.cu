@@ -30,6 +30,13 @@ namespace cuda {
 namespace {
 using namespace topk_detail;
 
+__global__ void topk_fill_segment_offsets(
+    uint32_t* __restrict__ offsets, uint32_t rows, uint32_t length) {
+  const uint32_t index = static_cast<uint32_t>(topk_linear_block_id()) * blockDim.x +
+      threadIdx.x;
+  if (index <= rows) offsets[index] = index * length;
+}
+
 
 const cudaDeviceProp& topk_device_properties() {
   static thread_local cudaDeviceProp properties{};
