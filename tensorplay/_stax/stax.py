@@ -1374,16 +1374,19 @@ def _lower_cpu_fused_reduction(
     )
 
 
-def _elem_dependencies(target: Node, kinds: dict[Node, str]) -> list[Node]:
+def _elem_dependencies(
+    target: Node, kinds: dict[Node, str], stop: set[Node] | None = None
+) -> list[Node]:
     """Order the elementwise nodes one value depends on, producers first.
 
-    Placeholders and row values are read through references rather than
-    recomputed, so they end the walk.  A node reached from two stages appears
-    in both of their orders: each stage re-evaluates it while the row is still
-    in cache, which is cheaper than the memory traffic of materializing it.
+    Placeholders, row values, and anything in ``stop`` are read through
+    references rather than recomputed, so they end the walk.  A node reached
+    from two stages and not staged appears in both of their orders: that
+    stage re-evaluates it while the row is still in cache, which is cheaper
+    than the memory traffic of materializing it.
     """
 
-    if target.op == "placeholder":
+    if target.op == "placeholder" or (stop is not None and target in stop):
         return []
     order: list[Node] = []
     seen: set[Node] = set()
@@ -1399,6 +1402,8 @@ def _elem_dependencies(target: Node, kinds: dict[Node, str]) -> list[Node]:
         stack.append((node, True))
         operands = list(_nodes(node.args)) + list(_nodes(node.kwargs or {}))
         for operand in operands:
+            if stop is not None and operand in stop:
+                continue
             if kinds.get(operand) == "elem" and operand.op != "placeholder":
                 if operand not in seen:
                     stack.append((operand, False))
@@ -1516,19 +1521,47 @@ def _plan_row_fusion(
                 return None
 
     input_count = len(placeholders)
-    total_inputs = input_count + len(slots)
     extra_refs = {node: input_count + slot for node, slot in slots.items()}
+
+    # A value a reduction pass computes and a later pass needs again is worth
+    # keeping: the pass already holds it in a register, so staging it costs
+    # one store and saves the later pass the whole expression behind it.
+    reduce_sources = [
+        node.args[0] for kind, node, _payload in staged if kind == "reduce"
+    ]
+    later: list[set[Node]] = []
+    seen_later: set[Node] = set()
+    for source in reversed(reduce_sources[1:]):
+        seen_later |= set(_elem_dependencies(source, kinds))
+        later.append(set(seen_later))
+    later.reverse()
+    if kinds[target] == "elem":
+        output_deps = set(_elem_dependencies(target, kinds))
+    else:
+        output_deps = set()
+    stages: dict[Node, int] = {}
+    for index, source in enumerate(reduce_sources):
+        if source.op == "placeholder" or source in stages:
+            continue
+        reused = output_deps | (later[index] if index < len(later) else set())
+        if source in reused:
+            stages[source] = len(stages)
+
+    total_inputs = input_count + len(slots) + len(stages)
+    stage_refs = {
+        node: input_count + len(slots) + slot for node, slot in stages.items()
+    }
     constants: list[float] = []
 
-    def elem_program(node: Node) -> Any:
+    def elem_program(node: Node, available: dict[Node, int]) -> Any:
         try:
             return _build_pointwise_program(
                 graph_module,
                 output_override=node,
                 allow_empty=True,
                 opcodes=_TRITON_OPCODES,
-                nodes=_elem_dependencies(node, kinds),
-                extra_refs=extra_refs,
+                nodes=_elem_dependencies(node, kinds, stop=set(available)),
+                extra_refs={**extra_refs, **available},
                 input_slots=total_inputs,
                 constants=constants,
             )
@@ -1544,12 +1577,15 @@ def _plan_row_fusion(
         return -len(constants)
 
     steps: list[Any] = []
+    available: dict[Node, int] = {}
     for entry_kind, node, payload in staged:
         if entry_kind == "reduce":
-            built = elem_program(node.args[0])
+            source = node.args[0]
+            built = elem_program(source, available)
             if built is None:
                 return None
             instructions, output_ref = built[3], built[4]
+            stage = stage_refs.get(source)
             steps.append(
                 RowStep(
                     kind="reduce",
@@ -1557,8 +1593,11 @@ def _plan_row_fusion(
                     op=payload.op,
                     instructions=tuple(instructions),
                     output_ref=output_ref,
+                    stage=-1 if stage is None else stage - input_count - len(slots),
                 )
             )
+            if stage is not None:
+                available[source] = stage
             continue
         lhs = row_operand(node.args[0])
         rhs = -1 if payload in _ROW_UNARY else row_operand(node.args[1])
@@ -1569,7 +1608,7 @@ def _plan_row_fusion(
         )
 
     if kinds[target] == "elem":
-        built = elem_program(target)
+        built = elem_program(target, available)
         if built is None:
             return None
         out_instructions, out_ref = built[3], built[4]
@@ -1586,6 +1625,7 @@ def _plan_row_fusion(
     return RowFusion(
         input_count=input_count,
         row_slots=len(slots),
+        stage_slots=len(stages),
         constants=tuple(constants),
         steps=tuple(steps),
         output_kind=output_kind,
@@ -1620,6 +1660,66 @@ class _CpuRowFusionLowering(_CpuFusedReductionLowering):
                     "compiled specialization"
                 ) from None
             raise
+
+
+def _expand_row_normalizations(graph_module: GraphModule) -> GraphModule | None:
+    """Rewrite the softmax family into primitives on a copy of the region.
+
+    The composites this expands are single fused kernels of their own, so the
+    expansion is only worth having when it is fused back into one kernel.
+    Working on a copy is what makes that conditional: a region the row-staged
+    planner then declines keeps the operators -- and the kernels -- it had.
+    """
+
+    from ..graph.passes import DecomposeRowNormalizations, row_normalization_names
+
+    known = row_normalization_names()
+    present = False
+    for node in graph_module.graph.nodes:
+        if node.op == "call_method":
+            name = node.target if isinstance(node.target, str) else None
+        elif node.op == "call_function":
+            name = getattr(node.target, "__name__", None)
+        else:
+            continue
+        if name in known:
+            present = True
+            break
+    if not present:
+        return None
+    try:
+        clone = _copy_region_graph(graph_module.graph)
+        expanded = GraphModule(
+            graph_module.root, clone, graph_module.signature
+        )
+        result = DecomposeRowNormalizations()(expanded)
+    except Exception:
+        return None
+    return result.graph_module if result.modified else None
+
+
+def _copy_region_graph(graph: Any) -> Any:
+    """Duplicate a graph's nodes without duplicating what they carry.
+
+    Node metadata holds the traced tensor values, so a deep copy of the
+    region would clone every intermediate; node-level copies keep those
+    references shared, which is all a rewrite needs.
+    """
+
+    from ..graph import Graph, map_arg
+
+    clone = Graph()
+    mapping: dict[Node, Node] = {}
+    for node in graph.nodes:
+        if node.op == "output":
+            continue
+        mapping[node] = clone.node_copy(node, lambda value: mapping[value])
+    for node in graph.nodes:
+        if node.op == "output":
+            clone.output(
+                map_arg(node.args[0], lambda value: mapping[value]), node.type
+            )
+    return clone
 
 
 def _lower_cpu_row_fusion(
@@ -1678,7 +1778,13 @@ def _lower_cpu_row_fusion(
 
     fusion = _plan_row_fusion(graph_module, in_shape, input_shapes)
     if fusion is None:
-        return None
+        planned = _expand_row_normalizations(graph_module)
+        if planned is None:
+            return None
+        fusion = _plan_row_fusion(planned, in_shape, input_shapes)
+        if fusion is None:
+            return None
+        graph_module = planned
 
     try:
         from .codegen.cpp_rowfusion import build_cpu_row_fusion_kernel

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import math
 import os
 from typing import Any, Callable, Optional
 
@@ -247,6 +248,11 @@ def _check_ref(
     index = -ref - 1
     if index < 0 or index >= len(constants):
         raise _ProgramError("constant reference out of range")
+    if not math.isfinite(constants[index]):
+        # An infinity or NaN has no literal the emitter can spell, so the
+        # program stays uncompiled instead of producing a unit that would
+        # only fail to build.
+        raise _ProgramError("non-finite program constant")
 
 
 def _analyze_instructions(
@@ -484,6 +490,7 @@ def emit_value_program(
     count_expr: str,
     suffix: str,
     input_modes: tuple[InputMode, ...],
+    row_offset: str | None = None,
 ) -> tuple[list[str], str]:
     """Emit one vector evaluation of the program and name its result.
 
@@ -494,7 +501,9 @@ def emit_value_program(
     one scope, which is how the unrolled accumulator groups keep separate
     dependency chains.  ``splat`` inputs resolve to the hoisted broadcast
     and ``rowval`` inputs to the enclosing loop's per-row value; neither
-    is reloaded.
+    is reloaded.  ``staged`` inputs read a value an earlier pass over this
+    row already wrote, addressed by ``row_offset`` -- the position inside
+    the row rather than the flat index.
 
     Returns the emitted lines and the identifier holding the program result,
     so a caller can feed it straight into an accumulator combine instead of
@@ -519,7 +528,9 @@ def emit_value_program(
         mode, width = input_modes[ref]
         if mode in ("splat", "rowval"):
             continue
-        if mode == "colmod":
+        if mode == "staged":
+            address = f"sc{width} + ({row_offset if row_offset else offset})"
+        elif mode == "colmod":
             address = f"in{ref} + (({offset}) % {width})"
         else:
             address = f"in{ref} + ({offset})"

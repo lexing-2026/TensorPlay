@@ -62,7 +62,12 @@ def test_plan_stages_softmax():
     # The maximum reduces the raw input, so its stage carries no expression.
     assert fusion.steps[0].instructions == ()
     # The sum reduces ``exp(x - m)``, which reads the first stage's row value.
-    assert fusion.steps[1].instructions == (("sub", 0, 1, 3), ("exp", 3, -1, 4))
+    assert fusion.steps[1].instructions == (("sub", 0, 1, 4), ("exp", 4, -1, 5))
+    # The exponential the sum consumes is also what the quotient needs, so
+    # the pass keeps it in a row buffer instead of evaluating it twice.
+    assert fusion.stage_slots == 1
+    assert fusion.steps[1].stage == 0 and fusion.steps[0].stage == -1
+    assert fusion.out_instructions == (("div", 3, 2, 4),)
     assert fusion.output_kind == "elem"
     assert fusion.out_shape == (4, 16)
     assert fusion.reduce_extent == 16 and fusion.rows == 4
@@ -182,6 +187,7 @@ def test_row_expression_rejects_a_shaped_tensor_operand():
     fusion = row.RowFusion(
         input_count=1,
         row_slots=2,
+        stage_slots=0,
         constants=(),
         steps=(
             row.RowStep(kind="reduce", slot=0, op="sum", instructions=(), output_ref=0),
@@ -307,3 +313,108 @@ def test_kill_switch_disables_the_generated_row_kernel(monkeypatch):
         )
         is None
     )
+
+
+# ---------------------------------------------------------------------------
+# softmax-family expansion
+
+
+def _expanded(fn):
+    from tensorplay.graph import symbolic_trace
+    from tensorplay.graph.passes import DecomposeRowNormalizations
+
+    module = symbolic_trace(fn)
+    result = DecomposeRowNormalizations()(module)
+    names = [
+        stax_mod._target_name(node.target)
+        for node in result.graph_module.graph.nodes
+        if node.op in {"call_function", "call_method"}
+    ]
+    return result.modified, names
+
+
+def test_softmax_expands_into_reduction_primitives():
+    modified, names = _expanded(lambda v: v.softmax(-1))
+    assert modified
+    assert names == ["amax", "sub", "exp", "sum", "div"]
+
+
+def test_log_softmax_expands_into_the_shifted_form():
+    import tensorplay.nn.functional as F
+
+    modified, names = _expanded(lambda v: F.log_softmax(v, dim=-1))
+    assert modified
+    # The shift is reused: one maximum, one exponential sum, one logarithm.
+    assert names == ["amax", "sub", "exp", "sum", "log", "sub"]
+
+
+def test_expansion_declines_a_dtype_conversion():
+    modified, names = _expanded(
+        lambda v: v.softmax(-1, tensorplay.float64)
+    )
+    assert not modified
+    assert names == ["softmax"]
+
+
+def test_expansion_leaves_the_original_region_untouched():
+    from tensorplay.graph import symbolic_trace
+
+    module = symbolic_trace(lambda v: v.softmax(-1))
+    expanded = stax_mod._expand_row_normalizations(module)
+    assert expanded is not None and expanded is not module
+    original = [
+        node.target
+        for node in module.graph.nodes
+        if node.op == "call_method"
+    ]
+    assert original == ["softmax"]
+    # A region with nothing to expand does not pay for a copy.
+    assert stax_mod._expand_row_normalizations(
+        symbolic_trace(lambda v: (v * 2).tanh())
+    ) is None
+
+
+SOFTMAX_CASES = [
+    ("softmax-method", lambda v: v.softmax(-1)),
+    ("softmax-functional", lambda v: _F().softmax(v, dim=-1)),
+    ("log-softmax", lambda v: _F().log_softmax(v, dim=-1)),
+    ("softmax-scaled", lambda v: _F().softmax(v * 0.125, dim=-1)),
+    ("softmax-epilogue", lambda v: _F().softmax(v, dim=-1) * 2.0),
+]
+
+
+def _F():
+    import tensorplay.nn.functional as functional
+
+    return functional
+
+
+@pytest.mark.parametrize(
+    "name,fn", SOFTMAX_CASES, ids=[case[0] for case in SOFTMAX_CASES]
+)
+def test_expanded_softmax_matches_the_composite_kernel(name, fn):
+    tensorplay.manual_seed(7)
+    value = tensorplay.randn(11, 96)
+    compiled = tensorplay.compile(fn, backend="stax")
+    # The expansion divides by the row sum where the composite multiplies by
+    # its reciprocal, which costs one rounding either way.
+    _close(compiled(value), fn(value), rel=1e-5)
+    lowering = next(iter(compiled._tensorplay_cache.values()))
+    assert lowering._tensorplay_codegen == "stax-fused-cpu-rowfuse"
+
+
+def test_softmax_over_a_leading_axis_keeps_the_composite_kernel():
+    tensorplay.manual_seed(8)
+    value = tensorplay.randn(11, 96)
+    fn = lambda v: _F().softmax(v, dim=0)  # noqa: E731
+    compiled = tensorplay.compile(fn, backend="stax")
+    _close(compiled(value), fn(value))
+    lowering = next(iter(compiled._tensorplay_cache.values()))
+    assert getattr(lowering, "_tensorplay_codegen", None) != "stax-fused-cpu-rowfuse"
+
+
+def test_non_finite_constants_keep_the_program_uncompiled():
+    with pytest.raises(cpp_mod._ProgramError):
+        cpp_mod._analyze_instructions(
+            [("add", 0, -1, 1)], [float("inf")], 1, 1
+        )
