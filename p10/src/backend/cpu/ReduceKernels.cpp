@@ -13,6 +13,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -669,6 +670,31 @@ std::tuple<Tensor, Tensor> mode_cpu(const Tensor& self, int64_t dim,
     return {values, indices};
 }
 
+template <typename T>
+inline bool kthvalue_is_nan(T value) {
+    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>) {
+        return std::isnan(value);
+    } else if constexpr (std::is_same_v<T, Half> ||
+                         std::is_same_v<T, BFloat16>) {
+        return std::isnan(static_cast<float>(value));
+    } else {
+        return false;
+    }
+}
+
+template <typename T>
+struct KthValueLess {
+    bool operator()(const std::pair<T, int64_t>& lhs,
+                    const std::pair<T, int64_t>& rhs) const {
+        const bool lhs_nan = kthvalue_is_nan(lhs.first);
+        const bool rhs_nan = kthvalue_is_nan(rhs.first);
+        if (lhs_nan != rhs_nan) return !lhs_nan;
+        if (lhs_nan) return lhs.second < rhs.second;
+        if (lhs.first != rhs.first) return lhs.first < rhs.first;
+        return lhs.second < rhs.second;
+    }
+};
+
 std::tuple<Tensor, Tensor> kthvalue_cpu(const Tensor& self, int64_t k,
                                         int64_t dim, bool keepdim) {
     const int64_t nd = self.dim();
@@ -711,7 +737,7 @@ std::tuple<Tensor, Tensor> kthvalue_cpu(const Tensor& self, int64_t k,
                 const int64_t o = si / inner, in2 = si % inner; \
                 const ctype* src = sp + o * d_size * inner + in2; \
                 for (int64_t j = 0; j < d_size; ++j) buf[j] = {src[j * inner], j}; \
-                std::stable_sort(buf.begin(), buf.end(), [](auto& a, auto& b) { return a.first < b.first; }); \
+                std::nth_element(buf.begin(), buf.begin() + (k - 1), buf.end(), KthValueLess<ctype>{}); \
                 const int64_t oi = keepdim ? si : (o * inner + in2); \
                 vp[oi] = buf[static_cast<size_t>(k - 1)].first; \
                 ip[oi] = buf[static_cast<size_t>(k - 1)].second; \
