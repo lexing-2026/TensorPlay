@@ -92,43 +92,48 @@ Tensor& gelu_backward_grad_input_native(const Tensor& grad_output,
                                         const Tensor& self,
                                         std::string approximate,
                                         Tensor& grad_input) {
-    grad_input = ops::gelu_backward(grad_output, self, std::move(approximate));
-    return grad_input;
+    return write_activation_out(
+        "gelu_backward", ops::gelu_backward(grad_output, self, std::move(approximate)),
+        grad_input);
 }
 
 Tensor& silu_backward_grad_input_native(const Tensor& grad_output,
                                         const Tensor& self, Tensor& grad_input) {
-    grad_input = ops::silu_backward(grad_output, self);
-    return grad_input;
+    return write_activation_out("silu_backward", ops::silu_backward(grad_output, self),
+                                grad_input);
 }
 
 Tensor& hardsigmoid_backward_grad_input_native(const Tensor& grad_output,
                                                const Tensor& self,
                                                Tensor& grad_input) {
-    grad_input = ops::hardsigmoid_backward(grad_output, self);
-    return grad_input;
+    return write_activation_out("hardsigmoid_backward",
+                                ops::hardsigmoid_backward(grad_output, self),
+                                grad_input);
 }
 
 Tensor& hardshrink_backward_grad_input_native(const Tensor& grad_out,
                                               const Tensor& self, Scalar lambd,
                                               Tensor& grad_input) {
-    grad_input = ops::hardshrink_backward(grad_out, self, lambd);
-    return grad_input;
+    return write_activation_out("hardshrink_backward",
+                                ops::hardshrink_backward(grad_out, self, lambd),
+                                grad_input);
 }
 
 Tensor& softshrink_backward_grad_input_native(const Tensor& grad_output,
                                               const Tensor& self, Scalar lambd,
                                               Tensor& grad_input) {
-    grad_input = ops::softshrink_backward(grad_output, self, lambd);
-    return grad_input;
+    return write_activation_out("softshrink_backward",
+                                ops::softshrink_backward(grad_output, self, lambd),
+                                grad_input);
 }
 
 Tensor& softplus_backward_grad_input_native(const Tensor& grad_output,
                                             const Tensor& self, Scalar beta,
                                             Scalar threshold,
                                             Tensor& grad_input) {
-    grad_input = ops::softplus_backward(grad_output, self, beta, threshold);
-    return grad_input;
+    return write_activation_out(
+        "softplus_backward",
+        ops::softplus_backward(grad_output, self, beta, threshold), grad_input);
 }
 
 Tensor& leaky_relu_backward_grad_input_native(const Tensor& grad_output,
@@ -136,9 +141,10 @@ Tensor& leaky_relu_backward_grad_input_native(const Tensor& grad_output,
                                               Scalar negative_slope,
                                               bool self_is_result,
                                               Tensor& grad_input) {
-    grad_input = ops::leaky_relu_backward(grad_output, self, negative_slope,
-                                          self_is_result);
-    return grad_input;
+    return write_activation_out(
+        "leaky_relu_backward",
+        ops::leaky_relu_backward(grad_output, self, negative_slope, self_is_result),
+        grad_input);
 }
 
 Tensor& elu_backward_grad_input_native(const Tensor& grad_output, Scalar alpha,
@@ -146,16 +152,18 @@ Tensor& elu_backward_grad_input_native(const Tensor& grad_output, Scalar alpha,
                                        bool is_result,
                                        const Tensor& self_or_result,
                                        Tensor& grad_input) {
-    grad_input = ops::elu_backward(grad_output, alpha, scale, input_scale,
-                                   is_result, self_or_result);
-    return grad_input;
+    return write_activation_out(
+        "elu_backward",
+        ops::elu_backward(grad_output, alpha, scale, input_scale, is_result,
+                          self_or_result),
+        grad_input);
 }
 
 Tensor& glu_backward_grad_input_native(const Tensor& grad_output,
                                        const Tensor& self, int64_t dim,
                                        Tensor& grad_input) {
-    grad_input = ops::glu_backward(grad_output, self, dim);
-    return grad_input;
+    return write_activation_out("glu_backward", ops::glu_backward(grad_output, self, dim),
+                                grad_input);
 }
 
 // threshold_backward: positions with self <= threshold carry no gradient,
@@ -165,8 +173,9 @@ Tensor& threshold_backward_grad_input_native(const Tensor& grad_output,
                                              const Tensor& self,
                                              Scalar threshold,
                                              Tensor& grad_input) {
-    grad_input = ops::threshold_backward(grad_output, self, threshold);
-    return grad_input;
+    return write_activation_out("threshold_backward",
+                                ops::threshold_backward(grad_output, self, threshold),
+                                grad_input);
 }
 
 Tensor& hardsigmoid_out_native(const Tensor& self, Tensor& out) {
