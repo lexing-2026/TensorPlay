@@ -28,12 +28,12 @@ public:
     Scalar(uint64_t v) : val_(v), type_(DType::UInt64) {}
     Scalar(float v) : val_(v), type_(DType::Float32) {}
     Scalar(double v) : val_(v), type_(DType::Float64) {}
-    Scalar(std::complex<float> v) : val_(v), type_(DType::ComplexFloat) {}
-    Scalar(std::complex<double> v) : val_(v), type_(DType::ComplexDouble) {}
-    Scalar(complex<float> v)
-        : val_(static_cast<std::complex<float>>(v)), type_(DType::ComplexFloat) {}
-    Scalar(complex<double> v)
-        : val_(static_cast<std::complex<double>>(v)), type_(DType::ComplexDouble) {}
+    Scalar(std::complex<float> v)
+        : val_(complex<float>(v)), type_(DType::ComplexFloat) {}
+    Scalar(std::complex<double> v)
+        : val_(complex<double>(v)), type_(DType::ComplexDouble) {}
+    Scalar(complex<float> v) : val_(v), type_(DType::ComplexFloat) {}
+    Scalar(complex<double> v) : val_(v), type_(DType::ComplexDouble) {}
     Scalar(bool v) : val_(v), type_(DType::Bool) {}
 
     // Copy/Move
@@ -135,7 +135,7 @@ public:
 
 private:
     std::variant<int32_t, int64_t, uint64_t, float, double, bool,
-                 std::complex<float>, std::complex<double>> val_;
+                 complex<float>, complex<double>> val_;
     DType type_;
     
     // Helper for promotion

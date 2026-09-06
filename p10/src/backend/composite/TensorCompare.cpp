@@ -7,7 +7,6 @@
 #include "TypePromotion.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
-#include <complex>
 #include <cstdint>
 
 namespace tensorplay {
@@ -72,7 +71,7 @@ bool is_nonzero_native(const Tensor& self) {
     }
     const Scalar s = self.item();
     if (s.isComplex()) {
-        const auto c = s.to<std::complex<double>>();
+        const auto c = s.to<complex<double>>();
         return c.real() != 0.0 || c.imag() != 0.0;
     }
     return s.toDouble() != 0.0;

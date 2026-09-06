@@ -23,14 +23,14 @@ Scalar Scalar::operator OP(const Scalar& other) const { \
         float v2 = other.to<float>(); \
         return Scalar(v1 OP v2); \
     } else if (result_dtype == DType::ComplexDouble) { \
-        auto v1 = this->to<std::complex<double>>(); \
-        auto v2 = other.to<std::complex<double>>(); \
+        auto v1 = this->to<complex<double>>(); \
+        auto v2 = other.to<complex<double>>(); \
         return Scalar(v1 OP v2); \
     } else if (result_dtype == DType::ComplexFloat || \
                result_dtype == DType::ComplexHalf || \
                result_dtype == DType::BComplex32) { \
-        auto v1 = this->to<std::complex<float>>(); \
-        auto v2 = other.to<std::complex<float>>(); \
+        auto v1 = this->to<complex<float>>(); \
+        auto v2 = other.to<complex<float>>(); \
         return Scalar(v1 OP v2); \
     } else if (result_dtype == DType::Int64) { \
         int64_t v1 = this->to<int64_t>(); \
@@ -65,11 +65,11 @@ Scalar Scalar::operator/(const Scalar& other) const {
     // Here we implement standard C++ division behavior but promoted
     
     if (result_dtype == DType::ComplexDouble) {
-        return Scalar(this->to<std::complex<double>>() / other.to<std::complex<double>>());
+        return Scalar(this->to<complex<double>>() / other.to<complex<double>>());
     } else if (result_dtype == DType::ComplexFloat ||
                result_dtype == DType::ComplexHalf ||
                result_dtype == DType::BComplex32) {
-        return Scalar(this->to<std::complex<float>>() / other.to<std::complex<float>>());
+        return Scalar(this->to<complex<float>>() / other.to<complex<float>>());
     } else if (isFloatingPoint() || other.isFloatingPoint()) {
         if (result_dtype == DType::Float64) {
             return Scalar(this->to<double>() / other.to<double>());
