@@ -224,6 +224,26 @@ Tensor& write_softmax_out(const char* op, Tensor value, Tensor& out) {
     return out;
 }
 
+Tensor& write_exact_bridge_out(const char* op, Tensor value, Tensor& out) {
+    if (!out.defined()) {
+        out = value;
+        return out;
+    }
+    if (out.dtype() != value.dtype()) {
+        TP_THROW(TypeError, op, ": output dtype must match result dtype");
+    }
+    if (out.device() != value.device()) {
+        TP_THROW(DeviceMismatchError,
+                 op, ": output device must match input device");
+    }
+    const auto target = static_cast<std::vector<int64_t>>(value.shape());
+    if (static_cast<std::vector<int64_t>>(out.shape()) != target) {
+        out.resize_(target);
+    }
+    out.copy_(value);
+    return out;
+}
+
 // half_to_float moves the computation (and the output) to Float32; kernels
 // without a native path satisfy it by materializing the fp32 result.
 Tensor softmax_data_bridge(const Tensor& self, int64_t dim,
@@ -356,8 +376,7 @@ Tensor& rrelu_with_noise_bridge_out(const Tensor& self, Tensor& noise,
                                     std::optional<Generator> generator,
                                     Tensor& out) {
     Tensor result = ops::rrelu_with_noise(self, noise, lower, upper, training);
-    out.copy_(result);
-    return out;
+    return write_exact_bridge_out("rrelu_with_noise", result, out);
 }
 
 Tensor& rrelu_with_noise_bridge_inplace(Tensor& self, Tensor& noise,
@@ -379,49 +398,53 @@ Tensor& arange_bridge_out(Scalar end, DType dtype,
                           std::optional<Device> device, Tensor& out) {
     (void)dtype;
     (void)device;
-    out = ops::arange(end, out.dtype(), std::optional<Device>(out.device()));
-    return out;
+    return write_exact_bridge_out(
+        "arange", ops::arange(end, out.dtype(), std::optional<Device>(out.device())), out);
 }
 
 Tensor& arange_bridge_start_step_out(Scalar start, Scalar end, Scalar step,
                                      Tensor& out) {
-    out = ops::arange(start, end, step, out.dtype(),
-                      std::optional<Device>(out.device()));
-    return out;
+    return write_exact_bridge_out(
+        "arange",
+        ops::arange(start, end, step, out.dtype(),
+                    std::optional<Device>(out.device())),
+        out);
 }
 
 Tensor& linspace_bridge_out(Scalar start, Scalar end, int64_t steps,
                             Tensor& out) {
-    out = ops::linspace(start, end, steps, out.dtype(),
-                        std::optional<Device>(out.device()));
-    return out;
+    return write_exact_bridge_out(
+        "linspace",
+        ops::linspace(start, end, steps, out.dtype(),
+                      std::optional<Device>(out.device())),
+        out);
 }
 
 Tensor& logspace_bridge_out(Scalar start, Scalar end, int64_t steps,
                             double base, Tensor& out) {
-    out = ops::logspace(start, end, steps, base, out.dtype(),
-                        std::optional<Device>(out.device()));
-    return out;
+    return write_exact_bridge_out(
+        "logspace",
+        ops::logspace(start, end, steps, base, out.dtype(),
+                      std::optional<Device>(out.device())),
+        out);
 }
 
 Tensor& eye_bridge_out(int64_t n, Tensor& out) {
-    out = ops::eye(n, -1, out.dtype(), std::optional<Device>(out.device()));
-    return out;
+    return write_exact_bridge_out(
+        "eye", ops::eye(n, -1, out.dtype(), std::optional<Device>(out.device())), out);
 }
 
 Tensor& eye_bridge_m_out(int64_t n, int64_t m, Tensor& out) {
-    out = ops::eye(n, m, out.dtype(), std::optional<Device>(out.device()));
-    return out;
+    return write_exact_bridge_out(
+        "eye", ops::eye(n, m, out.dtype(), std::optional<Device>(out.device())), out);
 }
 
 Tensor& complex_bridge_out(const Tensor& real, const Tensor& imag, Tensor& out) {
-    out = ops::complex(real, imag);
-    return out;
+    return write_exact_bridge_out("complex", ops::complex(real, imag), out);
 }
 
 Tensor& polar_bridge_out(const Tensor& abs, const Tensor& angle, Tensor& out) {
-    out = ops::polar(abs, angle);
-    return out;
+    return write_exact_bridge_out("polar", ops::polar(abs, angle), out);
 }
 
 // ---------------------------------------------------------------------------
