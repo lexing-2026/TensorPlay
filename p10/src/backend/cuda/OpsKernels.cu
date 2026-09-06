@@ -298,17 +298,18 @@ Tensor logical_unary_cuda(const Tensor& self, Pred pred, const char* name) {
 // Dtype-preserving unary.
 template <typename F>
 Tensor dtype_unary_cuda(const Tensor& self, F f, const char* name) {
-    Tensor sc = self.contiguous();
     Tensor out = Tensor::empty(shape_of(self), self.dtype(), self.device());
-    int64_t n = self.numel();
-    if (n == 0) return out;
-    dim3 grid, block;
-    launch_ew(grid, block, n);
-    auto stream = getCurrentCUDAStream().stream();
+    if (self.numel() == 0) return out;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(out)
+        .add_const_input(self)
+        .build();
 #define TP_DU(ctype, name_) \
     case DType::name_: \
-        ew_unary_kernel<ctype><<<grid, block, 0, stream>>>( \
-            n, sc.data_ptr<ctype>(), out.data_ptr<ctype>(), f); \
+        gpu_kernel(iter, [f] __device__(ctype value) -> ctype { \
+            return f(value); \
+        }); \
         break;
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_DU)
