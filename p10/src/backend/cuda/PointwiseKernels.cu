@@ -1601,7 +1601,7 @@ struct CxPowBase {
         return tensorplay_complex_math::pow(base_value, exponent);
     }
 };
-struct Atan2Functor { template<typename T> __device__ T operator()(T a, T b) const { return atan2(a, b); } };
+struct Atan2Functor { template<typename T> __device__ T operator()(T a, T b) const { return ::atan2(a, b); } };
 
 Tensor pow_kernel_cuda(const Tensor& self, const Tensor& other) {
     if (isComplexType(promoteTypes(self.dtype(), other.dtype()))) {
