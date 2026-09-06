@@ -53,6 +53,24 @@ inline void outer_inner(const std::vector<int64_t>& shape, int64_t dim,
     for (int64_t i = dim + 1; i < static_cast<int64_t>(shape.size()); ++i) inner *= shape[i];
 }
 
+Tensor normalize_index_cpu(const Tensor& index, int64_t upper_bound,
+                           const char* op) {
+    Tensor index_c = (index.dtype() == DType::Int64)
+        ? index.contiguous()
+        : index.to(DType::Int64).contiguous();
+    const int64_t* input = index_c.data_ptr<int64_t>();
+    parallel_for(0, index_c.numel(), GRAIN_SIZE,
+                 [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            const int64_t value = input[i];
+            if (value < 0 || value >= upper_bound) {
+                TP_THROW(IndexError, op, ": index out of range");
+            }
+        }
+    });
+    return index_c;
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -564,7 +582,7 @@ Tensor gather_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
                      " (input: ", self.size(i), ", index: ", index.size(i), ")");
         }
     }
-    Tensor idx_c = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
+    Tensor idx_c = normalize_index_cpu(index, self.size(dim), "gather");
     Tensor self_c = self.contiguous();
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(idx_c.shape()), self.dtype(), self.device());
     // Decomposition runs over the RESULT (=index) shape; the source read
@@ -590,7 +608,6 @@ Tensor gather_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
                 int64_t outer_off = rem / (idx_dim_size * idx_inner); rem -= outer_off * idx_dim_size * idx_inner; \
                 int64_t t = rem % idx_inner; \
                 int64_t idx = ip[flat]; \
-                if (idx < 0) idx += self_dim_size; \
                 d[flat] = s[(outer_off * self_dim_size + idx) * self_inner + t]; \
             } \
         }); \
@@ -621,7 +638,7 @@ Tensor scatter_base_cpu(const Tensor& self, int64_t dim, const Tensor& index,
     if (index.dim() != nd) {
         TP_THROW(IndexError, "Index must have same number of dimensions as output tensor");
     }
-    Tensor idx_c = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
+    Tensor idx_c = normalize_index_cpu(index, self.size(dim), "scatter");
     std::vector<int64_t> idx_shape(static_cast<std::vector<int64_t>>(idx_c.shape()));
     Tensor src_b;
     if (src.numel() == 1) {
@@ -664,7 +681,6 @@ Tensor scatter_base_cpu(const Tensor& self, int64_t dim, const Tensor& index,
                 rem -= outer_off * idx_dim_size * idx_inner; \
                 int64_t t = rem % idx_inner; \
                 int64_t idx = ip[flat]; \
-                if (idx < 0) idx += self_dim_size; \
                 int64_t dst = (outer_off * self_dim_size + idx) * self_inner + t; \
                 ctype v = vp[flat]; \
                 if (mode == ScatterMode::Assign) { \
@@ -707,7 +723,7 @@ static Tensor& scatter_base_inplace_cpu(Tensor& self, int64_t dim, const Tensor&
     if (index.dim() != nd) {
         TP_THROW(IndexError, "Index must have same number of dimensions as output tensor");
     }
-    Tensor idx_c = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
+    Tensor idx_c = normalize_index_cpu(index, self.size(dim), "scatter_");
     std::vector<int64_t> idx_shape(static_cast<std::vector<int64_t>>(idx_c.shape()));
     Tensor src_b;
     if (src.numel() == 1) {
@@ -753,7 +769,6 @@ static Tensor& scatter_base_inplace_cpu(Tensor& self, int64_t dim, const Tensor&
                 rem -= outer_off * idx_dim_size * idx_inner; \
                 int64_t t = rem % idx_inner; \
                 int64_t idx = ip[flat]; \
-                if (idx < 0) idx += self_dim_size; \
                 int64_t dst = (outer_off * self_dim_size + idx) * inner + t; \
                 ctype v = vp[flat]; \
                 if (mode == ScatterMode::Assign) { \
@@ -796,22 +811,10 @@ Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
     if (index.dim() != 1) TP_THROW(IndexError, "index_select(): index should be a vector");
-    Tensor idx = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
+    Tensor idx = normalize_index_cpu(index, self.size(dim), "index_select");
     int64_t n_idx = idx.numel();
     int64_t row = self.size(dim);
-    Tensor normalized = Tensor::empty({n_idx}, DType::Int64, index.device());
-    const int64_t* raw_ip = idx.data_ptr<int64_t>();
-    int64_t* normalized_ip = normalized.data_ptr<int64_t>();
-    parallel_for(0, n_idx, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-        for (int64_t i = begin; i < end; ++i) {
-            const int64_t value = raw_ip[i];
-            if (value < 0 || value >= row) {
-                TP_THROW(IndexError, "index_select: index out of range");
-            }
-            normalized_ip[i] = value;
-        }
-    });
-    const int64_t* ip = normalized.data_ptr<int64_t>();
+    const int64_t* ip = idx.data_ptr<int64_t>();
     int64_t outer = 1, inner = 1;
     outer_inner(static_cast<std::vector<int64_t>>(self.shape()), dim, outer, inner);
     std::vector<int64_t> out_shape(static_cast<std::vector<int64_t>>(self.shape()));
@@ -861,7 +864,7 @@ Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
 Tensor index_add_cpu(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
-    Tensor idx = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
+    Tensor idx = normalize_index_cpu(index, self.size(dim), "index_add");
     Tensor result = detail::contiguous_clone(self);
     int64_t n_idx = idx.numel();
     if (n_idx == 0) return result;
@@ -884,7 +887,7 @@ Tensor index_add_cpu(const Tensor& self, int64_t dim, const Tensor& index, const
         parallel_for(0, outer * n_idx, GRAIN_SIZE, [&](int64_t b, int64_t e) { \
             for (int64_t t = b; t < e; ++t) { \
                 int64_t o = t / n_idx, k = t % n_idx; \
-                int64_t iv = ip[k]; if (iv < 0) iv += row; \
+                int64_t iv = ip[k]; \
                 const ctype* sv = source_is_scalar ? sp : sp + (o * n_idx + k) * inner; \
                 ctype* dv = d + (o * row + iv) * inner; \
                 for (int64_t c = 0; c < inner; ++c) dv[c] += sv[c]; \
@@ -909,7 +912,7 @@ Tensor index_add_cpu(const Tensor& self, int64_t dim, const Tensor& index, const
 Tensor index_copy_cpu(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
-    Tensor idx = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
+    Tensor idx = normalize_index_cpu(index, self.size(dim), "index_copy");
     Tensor result = detail::contiguous_clone(self);
     int64_t n_idx = idx.numel();
     if (n_idx == 0) return result;
@@ -924,7 +927,7 @@ Tensor index_copy_cpu(const Tensor& self, int64_t dim, const Tensor& index, cons
         const ctype* sp = source_c.data_ptr<ctype>(); \
         for (int64_t o = 0; o < outer; ++o) { \
             for (int64_t k = 0; k < n_idx; ++k) { \
-                int64_t iv = ip[k]; if (iv < 0) iv += row; \
+                int64_t iv = ip[k]; \
                 std::memcpy(d + (o * row + iv) * inner, sp + (o * n_idx + k) * inner, inner * sizeof(ctype)); \
             } \
         } \
@@ -953,7 +956,7 @@ Tensor index_fill_tensor_cpu(const Tensor& self, int64_t dim, const Tensor& inde
 Tensor index_fill_scalar_cpu(const Tensor& self, int64_t dim, const Tensor& index, Scalar value) {
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
-    Tensor idx = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
+    Tensor idx = normalize_index_cpu(index, self.size(dim), "index_fill");
     Tensor result = detail::contiguous_clone(self);
     int64_t n_idx = idx.numel();
     if (n_idx == 0) return result;
@@ -967,7 +970,7 @@ Tensor index_fill_scalar_cpu(const Tensor& self, int64_t dim, const Tensor& inde
         ctype v = value.to<ctype>(); \
         for (int64_t o = 0; o < outer; ++o) { \
             for (int64_t k = 0; k < n_idx; ++k) { \
-                int64_t iv = ip[k]; if (iv < 0) iv += row; \
+                int64_t iv = ip[k]; \
                 ctype* dp = d + (o * row + iv) * inner; \
                 for (int64_t c = 0; c < inner; ++c) dp[c] = v; \
             } \
