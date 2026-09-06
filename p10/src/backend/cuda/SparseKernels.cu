@@ -2087,5 +2087,10 @@ Tensor spdiags_cuda(const Tensor& diagonals, const Tensor& offsets,
     return result;
 }
 
+TENSORPLAY_LIBRARY_IMPL(CUDA, MetaViewOps) {
+    m.impl("coalesce", coalesce_sparse_cuda);
+    m.impl("_coalesce", coalesce_sparse_cuda);
+}
+
 } // namespace cuda
 } // namespace tensorplay
