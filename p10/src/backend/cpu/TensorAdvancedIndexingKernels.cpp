@@ -2,6 +2,9 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Scalar.h"
+#define TENSORPLAY_INDEXING_SKIP_TENSOR_MEMBERS
+#include "TensorIndexing.h"
+#undef TENSORPLAY_INDEXING_SKIP_TENSOR_MEMBERS
 #include "Utils.h"
 #include "Exception.h"
 
@@ -62,10 +65,26 @@ Tensor take_along_dim_cpu(const Tensor& self, const Tensor& indices, std::option
     return self_b.gather(d, idx_b);
 }
 
+// `index.Tensor` is the dispatcher entry point used by native callers (and by
+// vmap).  The Python `Tensor.__getitem__` path already uses the shared
+// advanced-index planner in TensorIndexing.h; routing the native entry point
+// through the same planner keeps broadcasting, non-contiguous advanced index
+// placement, negative indices, and boolean masks identical on CPU.
+Tensor index_cpu(const Tensor& self,
+                 const std::vector<std::optional<Tensor>>& indices) {
+    std::vector<Tensor> tensor_indices;
+    tensor_indices.reserve(indices.size());
+    for (const auto& index : indices) {
+        tensor_indices.emplace_back(index.has_value() ? *index : Tensor());
+    }
+    return indexing::dispatch_index(self, std::move(tensor_indices));
+}
+
 
 }  // namespace
 
 TENSORPLAY_LIBRARY_IMPL(CPU, TensorAdvancedIndexingKernels) {
+    m.impl("index.Tensor", index_cpu);
     m.impl("take_along_dim", take_along_dim_cpu);
 }
 

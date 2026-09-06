@@ -40,17 +40,17 @@ namespace {
 
 constexpr double kPi = 3.14159265358979323846;
 
-// Layout encoding: 2 == strided (dense); the dense factories below reject the
-// sparse layouts (0 = COO, 1 = CSR).
+// Layout encoding: 5 == strided (dense); the dense factories below reject the
+// sparse layouts (0 = COO, 1 = CSR, 2 = CSC, 3 = BSR, 4 = BSC).
 void require_strided_layout(const char* op_name, const std::optional<int64_t>& layout) {
-    if (layout.has_value() && *layout != 2) {
+    if (layout.has_value() && *layout != 5) {
         TP_THROW(NotImplementedError, std::string(op_name) +
                  " is only implemented for strided (dense) layout tensors");
     }
 }
 
 int64_t layout_of(const Tensor& tensor) {
-    if (!tensor.is_sparse()) return 2;
+    if (!tensor.is_sparse()) return 5;
     return tensor.unsafeGetTensorImpl()->sparse_layout();
 }
 

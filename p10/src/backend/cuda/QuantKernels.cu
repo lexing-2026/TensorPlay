@@ -198,7 +198,7 @@ Tensor empty_affine_quantized_cuda(const std::vector<int64_t>& size,
                                    std::optional<bool> pin_memory,
                                    double scale, int64_t zero_point,
                                    std::optional<int64_t> memory_format) {
-    if (layout.has_value() && *layout != 2) {
+    if (layout.has_value() && *layout != 5) {
         TP_THROW(NotImplementedError,
                  "_empty_affine_quantized is only implemented for strided layout tensors");
     }
@@ -225,7 +225,7 @@ Tensor empty_per_channel_affine_quantized_cuda(
     const Tensor& zero_points, int64_t axis, std::optional<DType> dtype,
     std::optional<int64_t> layout, std::optional<Device> device,
     std::optional<bool> pin_memory, std::optional<int64_t> memory_format) {
-    if (layout.has_value() && *layout != 2) {
+    if (layout.has_value() && *layout != 5) {
         TP_THROW(NotImplementedError,
                  "_empty_per_channel_affine_quantized is only implemented for strided layout tensors");
     }
@@ -260,7 +260,7 @@ Tensor empty_quantized_cuda(const std::vector<int64_t>& size,
                             std::optional<Device> device,
                             std::optional<bool> pin_memory,
                             std::optional<int64_t> memory_format) {
-    if (layout.has_value() && *layout != 2) {
+    if (layout.has_value() && *layout != 5) {
         TP_THROW(NotImplementedError,
                  "empty_quantized is only implemented for strided layout tensors");
     }
