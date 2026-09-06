@@ -865,9 +865,9 @@ __global__ void index_add_kernel(int64_t total, int64_t inner, int64_t row,
 }
 
 // Index-select row gather.
-template <typename T>
+template <typename T, typename IndexT>
 __global__ void index_select_kernel(int64_t total_out_elems, int64_t n_idx, int64_t inner,
-                                    int64_t row, const T* s, const int64_t* ip, T* d) {
+                                    int64_t row, const T* s, const IndexT* ip, T* d) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < total_out_elems; i += stride) {
@@ -880,10 +880,10 @@ __global__ void index_select_kernel(int64_t total_out_elems, int64_t n_idx, int6
     }
 }
 
-template <typename T>
+template <typename T, typename IndexT>
 __global__ void index_select_slice_kernel(int64_t n_slices, int64_t n_idx,
                                           int64_t inner, int64_t row,
-                                          const T* s, const int64_t* ip, T* d) {
+                                          const T* s, const IndexT* ip, T* d) {
     const int64_t slice_stride = static_cast<int64_t>(gridDim.x);
     for (int64_t slice = static_cast<int64_t>(blockIdx.x); slice < n_slices;
          slice += slice_stride) {
@@ -897,6 +897,42 @@ __global__ void index_select_slice_kernel(int64_t n_slices, int64_t n_idx,
             destination[c] = source[c];
         }
     }
+}
+
+template <typename IndexT>
+void launch_index_select_for_index(
+        int64_t total, int64_t n_idx, int64_t inner, int64_t row,
+        int64_t outer, const Tensor& self, const Tensor& index, Tensor& result,
+        int slice_threads, cudaStream_t stream) {
+#define TP_IS_CASE(ctype, name) \
+    case DType::name: { \
+        if (inner >= 64) { \
+            const int64_t slices = outer * n_idx; \
+            const int64_t blocks = std::min<int64_t>(slices, 4096); \
+            index_select_slice_kernel<ctype, IndexT><<< \
+                static_cast<unsigned>(blocks), slice_threads, 0, stream>>>( \
+                slices, n_idx, inner, row, \
+                static_cast<const ctype*>(self.data_ptr()), \
+                index.data_ptr<IndexT>(), static_cast<ctype*>(result.data_ptr())); \
+        } else { \
+            index_select_kernel<ctype, IndexT><<< \
+                (total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+                total, n_idx, inner, row, \
+                static_cast<const ctype*>(self.data_ptr()), \
+                index.data_ptr<IndexT>(), static_cast<ctype*>(result.data_ptr())); \
+        } \
+        break; \
+    }
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_IS_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(TP_IS_CASE)
+        TP_IS_CASE(tensorplay::complex<Half>, ComplexHalf)
+        TP_IS_CASE(tensorplay::complex<float>, ComplexFloat)
+        TP_IS_CASE(tensorplay::complex<double>, ComplexDouble)
+        TP_IS_CASE(tensorplay::complex<BFloat16>, BComplex32)
+        default: TP_THROW(TypeError, "index_select: unsupported dtype");
+    }
+#undef TP_IS_CASE
 }
 
 template <typename T>
@@ -2138,7 +2174,8 @@ Tensor index_select_cuda(const Tensor& self, int64_t dim, const Tensor& index) {
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
     if (index.dim() != 1) TP_THROW(IndexError, "index_select(): index should be a vector");
-    Tensor idx = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
+    Tensor idx = (index.dtype() == DType::Int64 || index.dtype() == DType::Int32)
+        ? index.contiguous() : index.to(DType::Int64).contiguous();
     int64_t n_idx = idx.numel();
     int64_t row = self.size(dim);
     int64_t outer = 1, inner = 1;
@@ -2151,33 +2188,15 @@ Tensor index_select_cuda(const Tensor& self, int64_t dim, const Tensor& index) {
     Tensor self_c = self.contiguous();
     auto stream = getCurrentCUDAStream().stream();
     const int slice_threads = inner >= 1024 ? 512 : kThreads;
-#define TP_IS_CASE(ctype, name) \
-    case DType::name: { \
-        if (inner >= 64) { \
-            const int64_t slices = outer * n_idx; \
-            const int64_t blocks = std::min<int64_t>(slices, 4096); \
-            index_select_slice_kernel<ctype><<<static_cast<unsigned>(blocks), slice_threads, 0, stream>>>( \
-                slices, n_idx, inner, row, \
-                static_cast<const ctype*>(self_c.data_ptr()), \
-                idx.data_ptr<int64_t>(), static_cast<ctype*>(result.data_ptr())); \
-        } else { \
-            index_select_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-                total, n_idx, inner, row, \
-                static_cast<const ctype*>(self_c.data_ptr()), \
-                idx.data_ptr<int64_t>(), static_cast<ctype*>(result.data_ptr())); \
-        } \
-        break; \
+    if (idx.dtype() == DType::Int32) {
+        launch_index_select_for_index<int32_t>(
+            total, n_idx, inner, row, outer, self_c, idx, result,
+            slice_threads, stream);
+    } else {
+        launch_index_select_for_index<int64_t>(
+            total, n_idx, inner, row, outer, self_c, idx, result,
+            slice_threads, stream);
     }
-    switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_IS_CASE)
-        TENSORPLAY_FORALL_FP8_TYPES(TP_IS_CASE)
-        TP_IS_CASE(tensorplay::complex<Half>, ComplexHalf)
-        TP_IS_CASE(tensorplay::complex<float>, ComplexFloat)
-        TP_IS_CASE(tensorplay::complex<double>, ComplexDouble)
-        TP_IS_CASE(tensorplay::complex<BFloat16>, BComplex32)
-        default: TP_THROW(TypeError, "index_select: unsupported dtype");
-    }
-#undef TP_IS_CASE
     CUDA_CHECK(cudaGetLastError());
     return result;
 }
