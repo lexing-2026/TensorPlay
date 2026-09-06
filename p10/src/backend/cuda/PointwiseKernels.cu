@@ -9,7 +9,6 @@
 #include "Complex.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include "CUDABroadcast.cuh"
-#include "CUDAComplex.cuh"
 #include "ElementwiseStrided.cuh"
 #include "CUDALoops.cuh"
 #include "GradMode.h"
@@ -1026,59 +1025,63 @@ struct LeFunctor { template<typename T> __device__ bool operator()(T a, T b) con
 struct GtFunctor { template<typename T> __device__ bool operator()(T a, T b) const { return a > b; } };
 struct GeFunctor { template<typename T> __device__ bool operator()(T a, T b) const { return a >= b; } };
 
-// stay rejected by comparison_op_kernel's real-only dispatch.
-template <typename CxOp>
+template <typename complex_t, typename math_t, typename Functor>
 Tensor complex_comparison_kernel(const Tensor& self, const Tensor& other,
-                                 CxOp op) {
-    DType rd = promoteTypes(self.dtype(), other.dtype());
-    if (rd != DType::ComplexFloat && rd != DType::ComplexDouble)
-        TP_THROW(NotImplementedError,
-                 "CUDA complex comparison: half complexes not supported");
+                                 Functor functor) {
+    const DType rd = promoteTypes(self.dtype(), other.dtype());
     std::vector<int64_t> out_shape = broadcast_shapes(
         static_cast<std::vector<int64_t>>(self.shape()),
         static_cast<std::vector<int64_t>>(other.shape()));
     Tensor result = Tensor::empty(out_shape, DType::Bool, self.device());
+    if (result.numel() == 0) return result;
     Tensor a = self.to(rd);
     Tensor b = other.to(rd);
-    const int64_t n = result.numel();
-    auto stream = getCurrentCUDAStream().stream();
-    bool same = a.is_contiguous() && b.is_contiguous() &&
-                a.dim() == static_cast<int64_t>(out_shape.size()) &&
-                b.dim() == static_cast<int64_t>(out_shape.size());
-    if (same)
-        for (int64_t d = 0; d < static_cast<int64_t>(out_shape.size()); ++d)
-            if (a.size(d) != out_shape[d] || b.size(d) != out_shape[d]) { same = false; break; }
-    if (rd == DType::ComplexFloat) {
-        if (same)
-            cuda::cplx::launch_binary<float>(n, a.data_ptr(), b.data_ptr(),
-                                             result.data_ptr(), op, stream);
-        else
-            cuda::cplx::launch_binary_broadcast<float>(
-                n, a.data_ptr(), make_desc(a, out_shape.size()), b.data_ptr(),
-                make_desc(b, out_shape.size()), result.data_ptr(),
-                make_desc(result, out_shape.size()), op, stream);
-    } else {
-        if (same)
-            cuda::cplx::launch_binary<double>(n, a.data_ptr(), b.data_ptr(),
-                                              result.data_ptr(), op, stream);
-        else
-            cuda::cplx::launch_binary_broadcast<double>(
-                n, a.data_ptr(), make_desc(a, out_shape.size()), b.data_ptr(),
-                make_desc(b, out_shape.size()), result.data_ptr(),
-                make_desc(result, out_shape.size()), op, stream);
-    }
-    CUDA_CHECK(cudaGetLastError());
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(false)
+        .add_output(result)
+        .add_const_input(a)
+        .add_const_input(b)
+        .build();
+    gpu_kernel(iter, [functor] __device__(complex_t lhs, complex_t rhs) -> bool {
+        return functor(static_cast<math_t>(lhs), static_cast<math_t>(rhs));
+    });
     return result;
+}
+
+template <typename Functor>
+Tensor complex_comparison_kernel(const Tensor& self, const Tensor& other,
+                                 Functor functor) {
+    const DType rd = promoteTypes(self.dtype(), other.dtype());
+    switch (rd) {
+        case DType::ComplexHalf:
+            return complex_comparison_kernel<tensorplay::complex<Half>,
+                                              tensorplay::complex<float>>(
+                self, other, functor);
+        case DType::ComplexFloat:
+            return complex_comparison_kernel<tensorplay::complex<float>,
+                                              tensorplay::complex<float>>(
+                self, other, functor);
+        case DType::ComplexDouble:
+            return complex_comparison_kernel<tensorplay::complex<double>,
+                                              tensorplay::complex<double>>(
+                self, other, functor);
+        case DType::BComplex32:
+            return complex_comparison_kernel<tensorplay::complex<BFloat16>,
+                                              tensorplay::complex<float>>(
+                self, other, functor);
+        default:
+            TP_THROW(NotImplementedError, "CUDA complex comparison: unsupported dtype");
+    }
 }
 
 Tensor eq_kernel_cuda(const Tensor& self, const Tensor& other) {
     if (isComplexType(promoteTypes(self.dtype(), other.dtype())))
-        return complex_comparison_kernel(self, other, cuda::cplx::EqOp{});
+        return complex_comparison_kernel(self, other, EqFunctor{});
     return comparison_op_kernel(self, other, EqFunctor());
 }
 Tensor ne_kernel_cuda(const Tensor& self, const Tensor& other) {
     if (isComplexType(promoteTypes(self.dtype(), other.dtype())))
-        return complex_comparison_kernel(self, other, cuda::cplx::NeOp{});
+        return complex_comparison_kernel(self, other, NeFunctor{});
     return comparison_op_kernel(self, other, NeFunctor());
 }
 Tensor lt_kernel_cuda(const Tensor& self, const Tensor& other) { return comparison_op_kernel(self, other, LtFunctor()); }
