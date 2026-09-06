@@ -1,4 +1,5 @@
 #include "Tensor.h"
+#include "Complex.h"
 #include "SparseKernels.h"
 #include "Dispatcher.h"
 #include "Scalar.h"
@@ -417,10 +418,8 @@ inline void bf16_scalar_contiguous(int code, const BFloat16* a, BFloat16* y,
 // --- Helper for Binary Ops ---
 
 // Scalar-division element step. Arithmetic happens in the compute domain
-// (opmath) so Half/BFloat16 inputs divide in float, and complex values over
-// non-floating element types divide in a float complex domain; the standard
-// complex templates require a real floating-point value_type and would
-// otherwise reject the Half/BFloat16 instantiations outright.
+// (opmath) so Half/BFloat16 inputs divide in float, and reduced complex
+// values divide in a float complex domain.
 template <typename ctype>
 ctype div_scalar_element(ctype a, const Scalar& other) {
     if constexpr (is_complex_type_v<ctype>) {
@@ -1594,7 +1593,7 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
         else if constexpr (is_complex_type_v<T>) {
             // Half/BFloat16 element types do not model a floating-point
             // type; route the complex cases through float math.
-            using F = std::complex<float>;
+            using F = tensorplay::complex<float>;
             const F af(static_cast<float>(a.real()), static_cast<float>(a.imag()));
             const F bf(static_cast<float>(b.real()), static_cast<float>(b.imag()));
             const F rf = af / bf;
@@ -2820,20 +2819,20 @@ Tensor addcmul_cpu(const Tensor& self, const Tensor& tensor1,
     switch (result_dtype) {
         TENSORPLAY_FORALL_SCALAR_TYPES(ADDCMUL_CASE)
         case DType::ComplexFloat: {
-            const std::complex<float> alpha = value.to<std::complex<float>>();
-            auto op = [alpha](std::complex<float> x, std::complex<float> y,
-                              std::complex<float> z) { return x + alpha * y * z; };
-            apply_ternary_op_recursive<std::complex<float>, std::complex<float>>( \
-                result.data_ptr<std::complex<float>>(), result.strides(), a, a_strides, \
+            const tensorplay::complex<float> alpha = value.to<tensorplay::complex<float>>();
+            auto op = [alpha](tensorplay::complex<float> x, tensorplay::complex<float> y,
+                              tensorplay::complex<float> z) { return x + alpha * y * z; };
+            apply_ternary_op_recursive<tensorplay::complex<float>, tensorplay::complex<float>>( \
+                result.data_ptr<tensorplay::complex<float>>(), result.strides(), a, a_strides, \
                 b, b_strides, c, c_strides, 0, 0, 0, 0, 0, out_shape, op);
             break;
         }
         case DType::ComplexDouble: {
-            const std::complex<double> alpha = value.to<std::complex<double>>();
-            auto op = [alpha](std::complex<double> x, std::complex<double> y,
-                              std::complex<double> z) { return x + alpha * y * z; };
-            apply_ternary_op_recursive<std::complex<double>, std::complex<double>>( \
-                result.data_ptr<std::complex<double>>(), result.strides(), a, a_strides, \
+            const tensorplay::complex<double> alpha = value.to<tensorplay::complex<double>>();
+            auto op = [alpha](tensorplay::complex<double> x, tensorplay::complex<double> y,
+                              tensorplay::complex<double> z) { return x + alpha * y * z; };
+            apply_ternary_op_recursive<tensorplay::complex<double>, tensorplay::complex<double>>( \
+                result.data_ptr<tensorplay::complex<double>>(), result.strides(), a, a_strides, \
                 b, b_strides, c, c_strides, 0, 0, 0, 0, 0, out_shape, op);
             break;
         }
@@ -2888,20 +2887,20 @@ Tensor& addcmul_inplace_cpu(Tensor& self, const Tensor& tensor1,
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(ADDCMUL_INPLACE_CASE)
         case DType::ComplexFloat: {
-            const std::complex<float> alpha = value.to<std::complex<float>>();
-            auto op = [alpha](std::complex<float> x, std::complex<float> y,
-                              std::complex<float> z) { return x + alpha * y * z; };
-            apply_ternary_op_recursive<std::complex<float>, std::complex<float>>( \
-                self.data_ptr<std::complex<float>>(), self_strides, self, self_strides, \
+            const tensorplay::complex<float> alpha = value.to<tensorplay::complex<float>>();
+            auto op = [alpha](tensorplay::complex<float> x, tensorplay::complex<float> y,
+                              tensorplay::complex<float> z) { return x + alpha * y * z; };
+            apply_ternary_op_recursive<tensorplay::complex<float>, tensorplay::complex<float>>( \
+                self.data_ptr<tensorplay::complex<float>>(), self_strides, self, self_strides, \
                 b, b_strides, c, c_strides, 0, 0, 0, 0, 0, out_shape, op);
             break;
         }
         case DType::ComplexDouble: {
-            const std::complex<double> alpha = value.to<std::complex<double>>();
-            auto op = [alpha](std::complex<double> x, std::complex<double> y,
-                              std::complex<double> z) { return x + alpha * y * z; };
-            apply_ternary_op_recursive<std::complex<double>, std::complex<double>>( \
-                self.data_ptr<std::complex<double>>(), self_strides, self, self_strides, \
+            const tensorplay::complex<double> alpha = value.to<tensorplay::complex<double>>();
+            auto op = [alpha](tensorplay::complex<double> x, tensorplay::complex<double> y,
+                              tensorplay::complex<double> z) { return x + alpha * y * z; };
+            apply_ternary_op_recursive<tensorplay::complex<double>, tensorplay::complex<double>>( \
+                self.data_ptr<tensorplay::complex<double>>(), self_strides, self, self_strides, \
                 b, b_strides, c, c_strides, 0, 0, 0, 0, 0, out_shape, op);
             break;
         }
@@ -2964,20 +2963,20 @@ Tensor addcdiv_cpu(const Tensor& self, const Tensor& tensor1,
     switch (result_dtype) {
         TENSORPLAY_FORALL_SCALAR_TYPES(ADDCDIV_CASE)
         case DType::ComplexFloat: {
-            const std::complex<float> alpha = value.to<std::complex<float>>();
-            auto op = [alpha](std::complex<float> x, std::complex<float> y,
-                              std::complex<float> z) { return x + alpha * (y / z); };
-            apply_ternary_op_recursive<std::complex<float>, std::complex<float>>( \
-                result.data_ptr<std::complex<float>>(), result.strides(), a, a_strides, \
+            const tensorplay::complex<float> alpha = value.to<tensorplay::complex<float>>();
+            auto op = [alpha](tensorplay::complex<float> x, tensorplay::complex<float> y,
+                              tensorplay::complex<float> z) { return x + alpha * (y / z); };
+            apply_ternary_op_recursive<tensorplay::complex<float>, tensorplay::complex<float>>( \
+                result.data_ptr<tensorplay::complex<float>>(), result.strides(), a, a_strides, \
                 b, b_strides, c, c_strides, 0, 0, 0, 0, 0, out_shape, op);
             break;
         }
         case DType::ComplexDouble: {
-            const std::complex<double> alpha = value.to<std::complex<double>>();
-            auto op = [alpha](std::complex<double> x, std::complex<double> y,
-                              std::complex<double> z) { return x + alpha * (y / z); };
-            apply_ternary_op_recursive<std::complex<double>, std::complex<double>>( \
-                result.data_ptr<std::complex<double>>(), result.strides(), a, a_strides, \
+            const tensorplay::complex<double> alpha = value.to<tensorplay::complex<double>>();
+            auto op = [alpha](tensorplay::complex<double> x, tensorplay::complex<double> y,
+                              tensorplay::complex<double> z) { return x + alpha * (y / z); };
+            apply_ternary_op_recursive<tensorplay::complex<double>, tensorplay::complex<double>>( \
+                result.data_ptr<tensorplay::complex<double>>(), result.strides(), a, a_strides, \
                 b, b_strides, c, c_strides, 0, 0, 0, 0, 0, out_shape, op);
             break;
         }
@@ -3035,20 +3034,20 @@ Tensor& addcdiv_inplace_cpu(Tensor& self, const Tensor& tensor1,
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(ADDCDIV_INPLACE_CASE)
         case DType::ComplexFloat: {
-            const std::complex<float> alpha = value.to<std::complex<float>>();
-            auto op = [alpha](std::complex<float> x, std::complex<float> y,
-                              std::complex<float> z) { return x + alpha * (y / z); };
-            apply_ternary_op_recursive<std::complex<float>, std::complex<float>>( \
-                self.data_ptr<std::complex<float>>(), self_strides, self, self_strides, \
+            const tensorplay::complex<float> alpha = value.to<tensorplay::complex<float>>();
+            auto op = [alpha](tensorplay::complex<float> x, tensorplay::complex<float> y,
+                              tensorplay::complex<float> z) { return x + alpha * (y / z); };
+            apply_ternary_op_recursive<tensorplay::complex<float>, tensorplay::complex<float>>( \
+                self.data_ptr<tensorplay::complex<float>>(), self_strides, self, self_strides, \
                 b, b_strides, c, c_strides, 0, 0, 0, 0, 0, out_shape, op);
             break;
         }
         case DType::ComplexDouble: {
-            const std::complex<double> alpha = value.to<std::complex<double>>();
-            auto op = [alpha](std::complex<double> x, std::complex<double> y,
-                              std::complex<double> z) { return x + alpha * (y / z); };
-            apply_ternary_op_recursive<std::complex<double>, std::complex<double>>( \
-                self.data_ptr<std::complex<double>>(), self_strides, self, self_strides, \
+            const tensorplay::complex<double> alpha = value.to<tensorplay::complex<double>>();
+            auto op = [alpha](tensorplay::complex<double> x, tensorplay::complex<double> y,
+                              tensorplay::complex<double> z) { return x + alpha * (y / z); };
+            apply_ternary_op_recursive<tensorplay::complex<double>, tensorplay::complex<double>>( \
+                self.data_ptr<tensorplay::complex<double>>(), self_strides, self, self_strides, \
                 b, b_strides, c, c_strides, 0, 0, 0, 0, 0, out_shape, op);
             break;
         }
