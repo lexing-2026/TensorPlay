@@ -2,6 +2,7 @@
 
 #include "Dispatcher.h"
 #include "Exception.h"
+#include "Complex.h"
 #include "pocketfft_hdronly.h"
 
 #include <algorithm>
@@ -16,6 +17,16 @@ namespace tensorplay {
 namespace cpu {
 
 namespace {
+
+template <typename T>
+const std::complex<T>* pocketfft_complex_input(const void* data) {
+    return reinterpret_cast<const std::complex<T>*>(data);
+}
+
+template <typename T>
+std::complex<T>* pocketfft_complex_output(void* data) {
+    return reinterpret_cast<std::complex<T>*>(data);
+}
 
 struct FFT2Args {
     int64_t first_dim;
@@ -150,7 +161,7 @@ Tensor finish_fft_layout(Tensor output, const std::vector<int64_t>& inverse) {
 
 template <typename T>
 Tensor materialize_complex(const Tensor& input) {
-    using C = std::complex<T>;
+    using C = complex<T>;
     Tensor source = input.contiguous();
     Tensor output(sizes_of(source), complex_dtype(source.dtype()), source.device());
     const T* source_ptr = static_cast<const T*>(source.data_ptr());
@@ -163,7 +174,7 @@ Tensor materialize_complex(const Tensor& input) {
 
 template <typename T>
 Tensor extract_real(const Tensor& input) {
-    using C = std::complex<T>;
+    using C = complex<T>;
     Tensor source = input.contiguous();
     Tensor output(sizes_of(source), real_dtype(source.dtype()), source.device());
     const C* source_ptr = static_cast<const C*>(source.data_ptr());
@@ -221,21 +232,21 @@ Tensor resize_fft_plane(const Tensor& input, int64_t height, int64_t width) {
 template <typename T>
 Tensor c2c_plane(const Tensor& input, bool forward, FFTNorm norm,
                  int64_t transform_size, const pocketfft::shape_t& axes) {
-    using C = std::complex<T>;
+    using C = complex<T>;
     const std::vector<int64_t> sizes = sizes_of(input);
     Tensor output(sizes, input.dtype(), input.device());
     const auto shape = pocket_shape(sizes);
     const auto strides = byte_strides(sizes, sizeof(C));
     pocketfft::c2c<T>(shape, strides, strides, axes, forward,
-                      static_cast<const C*>(input.data_ptr()),
-                      static_cast<C*>(output.data_ptr()),
+                      pocketfft_complex_input<T>(input.data_ptr()),
+                      pocketfft_complex_output<T>(output.data_ptr()),
                       norm_factor<T>(norm, transform_size), 1);
     return output;
 }
 
 template <typename T>
 Tensor r2c_plane(const Tensor& input, FFTNorm norm, int64_t transform_size) {
-    using C = std::complex<T>;
+    using C = complex<T>;
     const std::vector<int64_t> input_sizes = sizes_of(input);
     const int64_t width = input_sizes.back();
     std::vector<int64_t> output_sizes = input_sizes;
@@ -244,7 +255,8 @@ Tensor r2c_plane(const Tensor& input, FFTNorm norm, int64_t transform_size) {
     pocketfft::r2c<T>(
         pocket_shape(input_sizes), byte_strides(input_sizes, sizeof(T)),
         byte_strides(output_sizes, sizeof(C)), input_sizes.size() - 1, true,
-        static_cast<const T*>(input.data_ptr()), static_cast<C*>(output.data_ptr()),
+        static_cast<const T*>(input.data_ptr()),
+        pocketfft_complex_output<T>(output.data_ptr()),
         norm_factor<T>(norm, transform_size), 1);
     return output;
 }
@@ -252,7 +264,7 @@ Tensor r2c_plane(const Tensor& input, FFTNorm norm, int64_t transform_size) {
 template <typename T>
 Tensor c2r_plane(const Tensor& input, int64_t output_width, FFTNorm norm,
                  int64_t transform_size) {
-    using C = std::complex<T>;
+    using C = complex<T>;
     const std::vector<int64_t> input_sizes = sizes_of(input);
     std::vector<int64_t> output_sizes = input_sizes;
     output_sizes.back() = output_width;
@@ -260,7 +272,8 @@ Tensor c2r_plane(const Tensor& input, int64_t output_width, FFTNorm norm,
     pocketfft::c2r<T>(
         pocket_shape(output_sizes), byte_strides(input_sizes, sizeof(C)),
         byte_strides(output_sizes, sizeof(T)), output_sizes.size() - 1, false,
-        static_cast<const C*>(input.data_ptr()), static_cast<T*>(output.data_ptr()),
+        pocketfft_complex_input<T>(input.data_ptr()),
+        static_cast<T*>(output.data_ptr()),
         norm_factor<T>(norm, transform_size), 1);
     return output;
 }
@@ -366,7 +379,7 @@ Tensor fft2_irfft_backward_impl(const Tensor& grad, const Tensor& self,
                                                args.last_dim);
     Tensor resized = resize_fft_plane(moved, self.size(args.first_dim),
                                       self.size(args.last_dim));
-    using C = std::complex<T>;
+    using C = complex<T>;
     C* data = static_cast<C*>(resized.data_ptr());
     const int64_t width = resized.size(-1);
     const int64_t interior_end = (args.last_size + 1) / 2;
