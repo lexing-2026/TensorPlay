@@ -1,15 +1,14 @@
 #pragma once
 
-// Vectorized<std::complex<float>> for the VSX tier: the interleaved (re,
-// im) stream packed into two 128-bit registers (4 complex lanes). Complex
-// multiply/divide, conj, abs and element shuffles run on VSX intrinsics;
-// the transcendental set stays on the scalar <cmath> complex reference
-// exactly as the reference complex layer does.
+// Vectorized<complex<float>> for the VSX tier: the interleaved (re, im)
+// stream packed into two 128-bit registers (4 complex lanes). Complex
+// multiply/divide, conjugation, magnitude and element shuffles run on VSX
+// intrinsics; transcendental functions use the native scalar complex layer.
 
+#include "Complex.h"
 #include "cpu/vec/vec256/vsx/vsx_helpers.h"
 
 #include <cmath>
-#include <complex>
 #include <stdexcept>
 #include <cstring>
 
@@ -52,17 +51,17 @@ constexpr vbool32 zvs_complex_mask2(uint32_t mask) {
 }
 
 template <>
-struct is_vec_specialized_for<std::complex<float>>
+struct is_vec_specialized_for<complex<float>>
     : std::bool_constant<true> {};
 
 template <>
-class Vectorized<std::complex<float>> {
+class Vectorized<complex<float>> {
  private:
   vfloat32 _vec0;
   vfloat32 _vec1;
 
  public:
-  using value_type = std::complex<float>;
+  using value_type = complex<float>;
   using vec_internal_type = vfloat32;
   using size_type = int;
   static constexpr size_type kSize = 4;
@@ -268,7 +267,7 @@ class Vectorized<std::complex<float>> {
   }
 
   Vectorized<value_type> log() const {
-    return map(std::log);
+    return map(tensorplay::log);
   }
   Vectorized<value_type> log2() const {
     auto ret = log();
@@ -294,16 +293,16 @@ class Vectorized<std::complex<float>> {
   }
 
   Vectorized<value_type> sin() const {
-    return map(std::sin);
+    return map(tensorplay::sin);
   }
   Vectorized<value_type> sinh() const {
-    return map(std::sinh);
+    return map(tensorplay::sinh);
   }
   Vectorized<value_type> cos() const {
-    return map(std::cos);
+    return map(tensorplay::cos);
   }
   Vectorized<value_type> cosh() const {
-    return map(std::cosh);
+    return map(tensorplay::cosh);
   }
   Vectorized<value_type> ceil() const {
     return {vec_ceil(_vec0), vec_ceil(_vec1)};
@@ -319,10 +318,10 @@ class Vectorized<std::complex<float>> {
     return {vec_rint(_vec0), vec_rint(_vec1)};
   }
   Vectorized<value_type> tan() const {
-    return map(std::tan);
+    return map(tensorplay::tan);
   }
   Vectorized<value_type> tanh() const {
-    return map(std::tanh);
+    return map(tensorplay::tanh);
   }
   Vectorized<value_type> trunc() const {
     return {vec_trunc(_vec0), vec_trunc(_vec1)};
@@ -331,7 +330,7 @@ class Vectorized<std::complex<float>> {
     return {vec_sqrt(_vec0), vec_sqrt(_vec1)};
   }
   Vectorized<value_type> sqrt() const {
-    return map(std::sqrt);
+    return map(tensorplay::sqrt);
   }
   Vectorized<value_type> reciprocal() const {
     // 1/(a + bi) = (a - bi) / |a + bi|^2
@@ -348,7 +347,7 @@ class Vectorized<std::complex<float>> {
     store(x_tmp);
     exp.store(y_tmp);
     for (const auto i : tensorplay::irange(size())) {
-      x_tmp[i] = std::pow(x_tmp[i], y_tmp[i]);
+      x_tmp[i] = tensorplay::pow(x_tmp[i], y_tmp[i]);
     }
     return loadu(x_tmp);
   }
@@ -361,7 +360,7 @@ class Vectorized<std::complex<float>> {
     return ln * Vectorized<value_type>(zvs_imag_half);
   }
   Vectorized<value_type> atanh() const {
-    return map(std::atanh);
+    return map(tensorplay::atanh);
   }
   Vectorized<value_type> acos() const {
     // acos(z) = pi/2 - asin(z)
@@ -384,20 +383,16 @@ class Vectorized<std::complex<float>> {
     return ln.el_swapped().conj();
   }
   Vectorized<value_type> exp() const {
-    return map(std::exp);
+    return map(tensorplay::exp);
   }
   Vectorized<value_type> expm1() const {
-    // No std::expm1 overload exists for complex; compute via exp(z) - 1
-    // with the scalar reference maintaining complex semantics.
-    return map([](const std::complex<float>& z) {
-      return std::exp(z) - std::complex<float>(1, 0);
-    });
+    return map(tensorplay::expm1);
   }
 
   Vectorized<value_type> eq(const Vectorized<value_type>& other) const {
     // Both parts must compare equal: AND the two lane positions of the
     // elementwise comparison so each complex lane collapses to 0/1 in its
-    // real slot and its imag slot mirrors it.
+    // real slot and its imag slot keeps the same value.
     auto eq = (*this == other);
     auto collapsed = eq & eq.el_swapped();
     return collapsed & Vectorized<value_type>(
@@ -494,58 +489,58 @@ class Vectorized<std::complex<float>> {
 };
 
 template <>
-Vectorized<std::complex<float>> inline maximum(
-    const Vectorized<std::complex<float>>& a,
-    const Vectorized<std::complex<float>>& b) {
+Vectorized<complex<float>> inline maximum(
+    const Vectorized<complex<float>>& a,
+    const Vectorized<complex<float>>& b) {
   // Ordered by square modulus, matching the complex max convention.
   auto abs_a = a.abs_2_();
   auto abs_b = b.abs_2_();
   auto mask = abs_a.elwise_lt_mask(abs_b);
-  return Vectorized<std::complex<float>>::elwise_blendv(a, b, mask);
+  return Vectorized<complex<float>>::elwise_blendv(a, b, mask);
 }
 
 template <>
-Vectorized<std::complex<float>> inline minimum(
-    const Vectorized<std::complex<float>>& a,
-    const Vectorized<std::complex<float>>& b) {
+Vectorized<complex<float>> inline minimum(
+    const Vectorized<complex<float>>& a,
+    const Vectorized<complex<float>>& b) {
   auto abs_a = a.abs_2_();
   auto abs_b = b.abs_2_();
   auto mask = abs_a.elwise_gt_mask(abs_b);
-  return Vectorized<std::complex<float>>::elwise_blendv(a, b, mask);
+  return Vectorized<complex<float>>::elwise_blendv(a, b, mask);
 }
 
 template <>
-Vectorized<std::complex<float>> inline operator+(
-    const Vectorized<std::complex<float>>& a,
-    const Vectorized<std::complex<float>>& b) {
+Vectorized<complex<float>> inline operator+(
+    const Vectorized<complex<float>>& a,
+    const Vectorized<complex<float>>& b) {
   return {vec_add(a.vec0(), b.vec0()), vec_add(a.vec1(), b.vec1())};
 }
 
 template <>
-Vectorized<std::complex<float>> inline operator-(
-    const Vectorized<std::complex<float>>& a,
-    const Vectorized<std::complex<float>>& b) {
+Vectorized<complex<float>> inline operator-(
+    const Vectorized<complex<float>>& a,
+    const Vectorized<complex<float>>& b) {
   return {vec_sub(a.vec0(), b.vec0()), vec_sub(a.vec1(), b.vec1())};
 }
 
 template <>
-Vectorized<std::complex<float>> inline operator&(
-    const Vectorized<std::complex<float>>& a,
-    const Vectorized<std::complex<float>>& b) {
+Vectorized<complex<float>> inline operator&(
+    const Vectorized<complex<float>>& a,
+    const Vectorized<complex<float>>& b) {
   return {vec_and(a.vec0(), b.vec0()), vec_and(a.vec1(), b.vec1())};
 }
 
 template <>
-Vectorized<std::complex<float>> inline operator|(
-    const Vectorized<std::complex<float>>& a,
-    const Vectorized<std::complex<float>>& b) {
+Vectorized<complex<float>> inline operator|(
+    const Vectorized<complex<float>>& a,
+    const Vectorized<complex<float>>& b) {
   return {vec_or(a.vec0(), b.vec0()), vec_or(a.vec1(), b.vec1())};
 }
 
 template <>
-Vectorized<std::complex<float>> inline operator^(
-    const Vectorized<std::complex<float>>& a,
-    const Vectorized<std::complex<float>>& b) {
+Vectorized<complex<float>> inline operator^(
+    const Vectorized<complex<float>>& a,
+    const Vectorized<complex<float>>& b) {
   return {vec_xor(a.vec0(), b.vec0()), vec_xor(a.vec1(), b.vec1())};
 }
 
