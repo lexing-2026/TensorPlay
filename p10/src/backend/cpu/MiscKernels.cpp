@@ -934,16 +934,18 @@ Tensor quantile_compute(const Tensor& self, const Tensor& q,
     Tensor ranks;
     if (ignore_nan) {
         // nanquantile: ranks span [0, k-1] over the non-NaN count k.  Replace
-        // each NaN with +inf so it sorts to the tail under *either* NaN
-        // ordering; ranks capped at k-1 < n-1 never gather a substituted
-        // value.  The count must be computed before substitution.
+        // each NaN in a row containing a valid value with +inf so it sorts
+        // to the tail under either NaN ordering; ranks capped at k-1 < n-1
+        // never gather a substituted value.  All-NaN rows retain a NaN so
+        // their result remains NaN.  The count must be computed first.
         Tensor count = reduced.isnan().logical_not().sum({-1}, true);
         ranks = q.to(DType::Float64).mul(count.sub(1));
         ranks = ranks.masked_fill(ranks.lt(0), 0);
-        if (count.lt(reduced.size(-1)).any().item<bool>()) {
-            reduced = reduced.masked_fill(
-                reduced.isnan(), std::numeric_limits<double>::infinity());
-        }
+        Tensor rows_with_valid = count.gt(0).expand(reduced.shape());
+        Tensor nan_values = reduced.isnan();
+        reduced = reduced.masked_fill(
+            Tensor::logical_and(nan_values, rows_with_valid),
+            std::numeric_limits<double>::infinity());
     } else {
         // quantile: any NaN in the row makes every output NaN.  Detect it
         // first, then fill the whole row with NaN so a gather at any rank --
