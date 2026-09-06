@@ -910,14 +910,14 @@ __global__ void nonzero_fill_kernel(int64_t n, int64_t ndim, const T* x,
 // boundary entry and lands at the end of the searched range.  Boundaries may
 // be 1-D (shared table for all queries) or N-D matching the leading query
 // dimensions (one table per row, shared along the innermost axis).
-template <typename S, typename V>
+template <typename T>
 __global__ void searchsorted_kernel(int64_t n, int64_t seq_len, bool right,
                                     int64_t idim_in, bool is_1d_boundaries,
-                                    const S* sp, const V* vp, int64_t* rp) {
+                                    const T* sp, const T* vp, int64_t* rp) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += stride) {
-        const V v = vp[i];
+        const T v = vp[i];
         // A 1-D boundary table is shared by every query; a row-wise table
         // starts at (query row / input innermost) * table innermost.
         int64_t lo = is_1d_boundaries ? 0 : i / idim_in * seq_len;
@@ -2373,59 +2373,35 @@ Tensor searchsorted_impl_cuda(const Tensor& seq_f, const Tensor& vals_f, bool ou
     if (n == 0) return result;
     auto stream = getCurrentCUDAStream().stream();
 
-    auto run = [&](auto s_type_tag, auto v_type_tag) {
-        using S = decltype(s_type_tag);
-        using V = decltype(v_type_tag);
+    auto run = [&](auto type_tag) {
+        using T = decltype(type_tag);
         if (out_int32) {
             Tensor tmp = Tensor::empty(static_cast<std::vector<int64_t>>(vals.shape()),
                                        DType::Int64, vals.device());
-            searchsorted_kernel<S, V><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+            searchsorted_kernel<T><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
                 n, seq_len, right, idim_in, is_1d_boundaries,
-                seq.data_ptr<S>(), vals.data_ptr<V>(), tmp.data_ptr<int64_t>());
+                seq.data_ptr<T>(), vals.data_ptr<T>(), tmp.data_ptr<int64_t>());
             CUDA_CHECK(cudaGetLastError());
             return tmp.to(DType::Int32);
         }
-        searchsorted_kernel<S, V><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        searchsorted_kernel<T><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
             n, seq_len, right, idim_in, is_1d_boundaries,
-            seq.data_ptr<S>(), vals.data_ptr<V>(), result.data_ptr<int64_t>());
+            seq.data_ptr<T>(), vals.data_ptr<T>(), result.data_ptr<int64_t>());
         CUDA_CHECK(cudaGetLastError());
         return result;
     };
 
-#define TP_SS_V(stype) \
-    if (vals.dtype() == DType::UInt8) return run(stype{}, uint8_t{}); \
-    if (vals.dtype() == DType::Int8) return run(stype{}, int8_t{}); \
-    if (vals.dtype() == DType::Int16) return run(stype{}, int16_t{}); \
-    if (vals.dtype() == DType::Int32) return run(stype{}, int32_t{}); \
-    if (vals.dtype() == DType::Int64) return run(stype{}, int64_t{}); \
-    if (vals.dtype() == DType::UInt16) return run(stype{}, uint16_t{}); \
-    if (vals.dtype() == DType::UInt32) return run(stype{}, uint32_t{}); \
-    if (vals.dtype() == DType::UInt64) return run(stype{}, uint64_t{}); \
-    if (vals.dtype() == DType::Float16) return run(stype{}, Half{}); \
-    if (vals.dtype() == DType::BFloat16) return run(stype{}, BFloat16{}); \
-    if (vals.dtype() == DType::Bool) return run(stype{}, bool{}); \
-    if (vals.dtype() == DType::Float32) return run(stype{}, float{}); \
-    if (vals.dtype() == DType::Float64) return run(stype{}, double{});
-
-    if (seq.dtype() == DType::UInt8) { TP_SS_V(uint8_t) }
-    else if (seq.dtype() == DType::Int8) { TP_SS_V(int8_t) }
-    else if (seq.dtype() == DType::Int16) { TP_SS_V(int16_t) }
-    else if (seq.dtype() == DType::Int32) { TP_SS_V(int32_t) }
-    else if (seq.dtype() == DType::Int64) { TP_SS_V(int64_t) }
-    else if (seq.dtype() == DType::UInt16) { TP_SS_V(uint16_t) }
-    else if (seq.dtype() == DType::UInt32) { TP_SS_V(uint32_t) }
-    else if (seq.dtype() == DType::UInt64) { TP_SS_V(uint64_t) }
-    else if (seq.dtype() == DType::Float16) { TP_SS_V(Half) }
-    else if (seq.dtype() == DType::BFloat16) { TP_SS_V(BFloat16) }
-    else if (seq.dtype() == DType::Bool) { TP_SS_V(bool) }
-    else if (seq.dtype() == DType::Float32) { TP_SS_V(float) }
-    else if (seq.dtype() == DType::Float64) { TP_SS_V(double) }
-    else {
+#define TP_SS_CASE(ctype, name) \
+    case DType::name: return run(ctype{});
+    switch (vals.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_SS_CASE)
+        default: {
         Tensor seq_d = seq.to(DType::Float64);
         Tensor vals_d = vals.to(DType::Float64);
         return searchsorted_impl_cuda(seq_d, vals_d, out_int32, right);
+        }
     }
-#undef TP_SS_V
+#undef TP_SS_CASE
     return result;
 }
 } // anonymous namespace
