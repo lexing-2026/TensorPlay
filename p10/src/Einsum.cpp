@@ -8,6 +8,7 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
+#include "GradMode.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <algorithm>
@@ -493,6 +494,153 @@ Tensor sumproduct_pair(const Tensor& left_, const Tensor& right_,
     return result;
 }
 
+std::vector<int64_t> normalize_tensordot_dims(
+        const std::vector<int64_t>& dims, int64_t ndim, const char* name) {
+    const int64_t dim_post_expr = ndim == 0 ? 1 : ndim;
+    std::vector<int64_t> normalized;
+    normalized.reserve(dims.size());
+    std::vector<bool> seen(static_cast<size_t>(ndim), false);
+    for (const int64_t dim : dims) {
+        if (dim < -dim_post_expr || dim >= dim_post_expr) {
+            TP_THROW(IndexError,
+                     "tensordot: dimension ", dim,
+                     " in ", name, " is out of range for a ", ndim,
+                     "-D tensor");
+        }
+        const int64_t wrapped = dim < 0 ? dim + dim_post_expr : dim;
+        if (wrapped >= ndim) {
+            TP_THROW(IndexError,
+                     "tensordot: dimension ", dim,
+                     " in ", name, " is invalid for a ", ndim,
+                     "-D tensor");
+        }
+        if (seen[static_cast<size_t>(wrapped)]) {
+            TP_THROW(RuntimeError,
+                     "tensordot: dimension ", wrapped,
+                     " appears multiple times in ", name);
+        }
+        seen[static_cast<size_t>(wrapped)] = true;
+        normalized.push_back(wrapped);
+    }
+    return normalized;
+}
+
+Tensor tensordot_kernel(const Tensor& input1, const Tensor& input2,
+                        const std::vector<int64_t>& dims1_arg,
+                        const std::vector<int64_t>& dims2_arg) {
+    if (dims1_arg.size() != dims2_arg.size()) {
+        TP_THROW(RuntimeError,
+                 "tensordot: both dimension lists should have the same length");
+    }
+    if (input1.dtype() != input2.dtype()) {
+        TP_THROW(RuntimeError, "tensordot: both inputs should have the same dtype");
+    }
+    if (input1.device() != input2.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "tensordot: both inputs must be on the same device");
+    }
+
+    const std::vector<int64_t> dims1 =
+        normalize_tensordot_dims(dims1_arg, input1.dim(), "dims_self");
+    const std::vector<int64_t> dims2 =
+        normalize_tensordot_dims(dims2_arg, input2.dim(), "dims_other");
+
+    int64_t contraction_size = 1;
+    Tensor t1 = input1;
+    Tensor t2 = input2;
+    for (size_t i = 0; i < dims1.size(); ++i) {
+        const int64_t size1 = input1.size(dims1[i]);
+        const int64_t size2 = input2.size(dims2[i]);
+        if (size2 == 1) {
+            t1 = t1.sum({dims1[i]}, true, t1.dtype());
+        } else if (size1 == 1) {
+            t2 = t2.sum({dims2[i]}, true, t2.dtype());
+        } else {
+            if (size1 != size2) {
+                TP_THROW(RuntimeError,
+                         "tensordot: contracted dimensions need to match, but "
+                         "first has size ", size1, " in dim ", dims1[i],
+                         " and second has size ", size2, " in dim ", dims2[i]);
+            }
+            contraction_size *= size1;
+        }
+    }
+
+    std::vector<bool> contracted1(static_cast<size_t>(input1.dim()), false);
+    std::vector<bool> contracted2(static_cast<size_t>(input2.dim()), false);
+    for (const int64_t dim : dims1) contracted1[static_cast<size_t>(dim)] = true;
+    for (const int64_t dim : dims2) contracted2[static_cast<size_t>(dim)] = true;
+
+    std::vector<int64_t> permutation1;
+    std::vector<int64_t> permutation2;
+    std::vector<int64_t> result_sizes;
+    permutation1.reserve(static_cast<size_t>(input1.dim()));
+    permutation2.reserve(static_cast<size_t>(input2.dim()));
+    result_sizes.reserve(static_cast<size_t>(input1.dim() + input2.dim()));
+
+    int64_t free_size1 = 1;
+    int64_t free_size2 = 1;
+    for (int64_t dim = 0; dim < input1.dim(); ++dim) {
+        if (!contracted1[static_cast<size_t>(dim)]) {
+            permutation1.push_back(dim);
+            free_size1 *= t1.size(dim);
+            result_sizes.push_back(t1.size(dim));
+        }
+    }
+    permutation1.insert(permutation1.end(), dims1.begin(), dims1.end());
+    permutation2.insert(permutation2.end(), dims2.begin(), dims2.end());
+    for (int64_t dim = 0; dim < input2.dim(); ++dim) {
+        if (!contracted2[static_cast<size_t>(dim)]) {
+            permutation2.push_back(dim);
+            free_size2 *= t2.size(dim);
+            result_sizes.push_back(t2.size(dim));
+        }
+    }
+
+    if (free_size1 != 1 || free_size2 != 1) {
+        t1 = t1.permute(permutation1).reshape({free_size1, contraction_size});
+        t2 = t2.permute(permutation2).reshape({contraction_size, free_size2});
+        return ops::reshape(ops::mm(t1, t2), result_sizes);
+    }
+
+    t1 = t1.permute(permutation1);
+    t2 = t2.permute(permutation2);
+    if (t1.is_contiguous() && t2.is_contiguous()) {
+        return ops::reshape(
+            ops::dot(t1.reshape({-1}), t2.reshape({-1})), result_sizes);
+    }
+    return ops::reshape(
+        ops::sum(ops::mul(t1.squeeze(), t2.squeeze()), t1.dtype()),
+        result_sizes);
+}
+
+Tensor& tensordot_out_kernel(const Tensor& input1, const Tensor& input2,
+                             const std::vector<int64_t>& dims1,
+                             const std::vector<int64_t>& dims2, Tensor& out) {
+    if (out.device() != input1.device() || input1.device() != input2.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "tensordot: all tensors must be on the same device");
+    }
+    if (out.dtype() != input1.dtype()) {
+        TP_THROW(RuntimeError,
+                 "tensordot: output dtype must match the input dtype");
+    }
+    if (GradMode::is_enabled() &&
+        (input1.requires_grad() || input2.requires_grad() || out.requires_grad())) {
+        TP_THROW(RuntimeError,
+                 "tensordot: out variants do not support automatic differentiation "
+                 "when an argument requires grad");
+    }
+
+    Tensor result = tensordot_kernel(input1, input2, dims1, dims2);
+    if (out.shape() == result.shape()) {
+        out.copy_(result);
+    } else {
+        out.unsafeGetTensorImpl()->copy_metadata_from(*result.unsafeGetTensorImpl());
+    }
+    return out;
+}
+
 } // anonymous namespace
 
 Tensor einsum_kernel(const std::string& equation,
@@ -843,10 +991,14 @@ Tensor einsum_kernel(const std::string& equation,
 
 TENSORPLAY_LIBRARY_IMPL(CPU, EinsumKernels) {
     m.impl("einsum", einsum_kernel);
+    m.impl("tensordot", tensordot_kernel);
+    m.impl("tensordot.out", tensordot_out_kernel);
 }
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, EinsumKernelsCUDA) {
     m.impl("einsum", einsum_kernel);
+    m.impl("tensordot", tensordot_kernel);
+    m.impl("tensordot.out", tensordot_out_kernel);
 }
 
 } // namespace tpx
