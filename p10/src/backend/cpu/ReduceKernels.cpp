@@ -8,6 +8,7 @@
 #include "TypePromotion.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cmath>
 #include <complex>
 #include <limits>
@@ -104,6 +105,21 @@ Tensor reduce_dims_impl(const Tensor& self, std::vector<int64_t> dims_in,
     int64_t total_red = 1;
     for (const int64_t dim : red_dims) total_red *= self.size(dim);
 
+#define TP_REDUCE_FORALL_SCALAR_TYPES(_) \
+    _(uint8_t, UInt8) \
+    _(int8_t, Int8) \
+    _(int16_t, Int16) \
+    _(int32_t, Int32) \
+    _(int64_t, Int64) \
+    _(uint16_t, UInt16) \
+    _(uint32_t, UInt32) \
+    _(uint64_t, UInt64) \
+    _(float, Float32) \
+    _(double, Float64) \
+    _(tensorplay::Half, Float16) \
+    _(tensorplay::BFloat16, BFloat16) \
+    _(bool, Bool)
+
 #define TP_REDUCE_RUN_OUTPUT(output_ctype, output_name) \
     case DType::output_name: { \
         output_ctype* output_ptr = out.data_ptr<output_ctype>(); \
@@ -148,11 +164,12 @@ Tensor reduce_dims_impl(const Tensor& self, std::vector<int64_t> dims_in,
         break; \
     }
     switch (sc.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_REDUCE_RUN_INPUT)
+        TP_REDUCE_FORALL_SCALAR_TYPES(TP_REDUCE_RUN_INPUT)
         default: TP_THROW(TypeError, "reduce: unsupported dtype");
     }
 #undef TP_REDUCE_RUN_INPUT
 #undef TP_REDUCE_RUN_OUTPUT
+#undef TP_REDUCE_FORALL_SCALAR_TYPES
     return out;
 }
 
@@ -527,7 +544,9 @@ Tensor nanmedian_cpu(const Tensor& self) {
             out.fill_(Scalar(std::numeric_limits<int64_t>::min()));
         return out;
     }
-    std::sort(values.begin(), values.end());
+    std::nth_element(values.begin(),
+                     values.begin() + static_cast<std::ptrdiff_t>((values.size() - 1) / 2),
+                     values.end());
     return Tensor::zeros({}, out_dtype, self.device())
         .fill_(Scalar(values[(values.size() - 1) / 2]));
 }
