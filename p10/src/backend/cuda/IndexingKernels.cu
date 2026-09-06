@@ -1453,6 +1453,23 @@ inline void dispatch_masked_fill_iter(TensorIteratorBase& iter,
         break;
     switch (dtype) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_MF_ITER_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(TP_MF_ITER_CASE)
+        case DType::ComplexHalf:
+            run_masked_fill_iter<tensorplay::complex<Half>>(
+                iter, value.to<tensorplay::complex<Half>>());
+            break;
+        case DType::ComplexFloat:
+            run_masked_fill_iter<tensorplay::complex<float>>(
+                iter, value.to<tensorplay::complex<float>>());
+            break;
+        case DType::ComplexDouble:
+            run_masked_fill_iter<tensorplay::complex<double>>(
+                iter, value.to<tensorplay::complex<double>>());
+            break;
+        case DType::BComplex32:
+            run_masked_fill_iter<tensorplay::complex<BFloat16>>(
+                iter, value.to<tensorplay::complex<BFloat16>>());
+            break;
         default: TP_THROW(TypeError, "masked_fill: unsupported dtype");
     }
 #undef TP_MF_ITER_CASE
