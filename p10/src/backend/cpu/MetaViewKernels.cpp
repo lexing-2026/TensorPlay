@@ -16,7 +16,6 @@
 #include "Storage.h"
 #include "SparseKernels.h"
 
-#include <complex>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -64,16 +63,16 @@ Scalar item_cpu(const Tensor& self) {
         case DType::UInt64: return Scalar(*impl->data<uint64_t>());
         case DType::Bool: return Scalar(static_cast<bool>(*impl->data<bool>()));
         case DType::ComplexHalf: {
-            const auto value = *impl->data<std::complex<Half>>();
-            return Scalar(std::complex<float>(static_cast<float>(value.real()),
-                                              static_cast<float>(value.imag())));
+            const auto value = *impl->data<complex<Half>>();
+            return Scalar(complex<float>(static_cast<float>(value.real()),
+                                         static_cast<float>(value.imag())));
         }
-        case DType::ComplexFloat: return Scalar(*impl->data<std::complex<float>>());
-        case DType::ComplexDouble: return Scalar(*impl->data<std::complex<double>>());
+        case DType::ComplexFloat: return Scalar(*impl->data<complex<float>>());
+        case DType::ComplexDouble: return Scalar(*impl->data<complex<double>>());
         case DType::BComplex32: {
-            const auto value = *impl->data<std::complex<BFloat16>>();
-            return Scalar(std::complex<float>(static_cast<float>(value.real()),
-                                              static_cast<float>(value.imag())));
+            const auto value = *impl->data<complex<BFloat16>>();
+            return Scalar(complex<float>(static_cast<float>(value.real()),
+                                         static_cast<float>(value.imag())));
         }
         default:
             TP_THROW(NotImplementedError, "item() not implemented for this dtype");
@@ -90,8 +89,7 @@ Tensor coalesce_cpu(const Tensor& self) {
                  "coalesce() is only defined for sparse COO tensors");
     }
     std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
-    if (!impl->is_sparse() ||
-        impl->sparse_layout() == TensorImpl::kSparseCSRLayout) {
+    if (!impl->is_sparse() || impl->is_sparse_compressed()) {
         TP_THROW(RuntimeError,
                  "coalesce() is only defined for sparse COO tensors");
     }
