@@ -219,61 +219,6 @@ __global__ void broadcast_map_kernel(int64_t n, int64_t nd, const T* src, T* dst
 
 namespace {
 
-template <typename T>
-__global__ void pixel_shuffle_map_kernel(int64_t n, int64_t C, int64_t H, int64_t W,
-                                         int64_t r, const T* src, T* dst) {
-    int64_t li = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; li < n; li += stride) {
-        int64_t w = li % W; int64_t rem = li / W;
-        int64_t h = rem % H; rem /= H;
-        int64_t c = rem % C; int64_t bn = rem / C;
-        int64_t ih = h % r, iw = w % r;
-        int64_t src_off = ((((bn * C * r * r) + c * r * r + ih * r + iw) * H) + h / r) * W + w / r;
-        dst[li] = src[src_off];
-    }
-}
-
-template <typename T>
-__global__ void pixel_unshuffle_map_kernel(int64_t n, int64_t C, int64_t H, int64_t W,
-                                           int64_t r, const T* src, T* dst) {
-    // out: (N, C*r^2, H, W); in: (N, C, H*r, W*r)
-    int64_t li = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    int64_t Wr = W * r;
-    for (; li < n; li += stride) {
-        int64_t w = li % W; int64_t rem = li / W;
-        int64_t h = rem % H; rem /= H;
-        int64_t cc = rem % (C * r * r); rem /= (C * r * r);
-        int64_t bn = rem;
-        int64_t c = cc / (r * r);
-        int64_t ij = cc % (r * r);
-        int64_t ih = ij / r, iw = ij % r;
-        int64_t src_off = (((bn * C + c) * (H * r)) + h * r + ih) * Wr + w * r + iw;
-        dst[li] = src[src_off];
-    }
-}
-
-template <typename T>
-__global__ void channel_shuffle_map_kernel(int64_t n, int64_t outer, int64_t C, int64_t inner,
-                                           int64_t cg, const T* src, T* dst) {
-    // li layout: (outer * C + c) * inner + tail; channel shuffle swaps the
-    // group index and the within-group index.
-    int64_t li = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; li < n; li += stride) {
-        int64_t tail = li % inner;
-        int64_t rest = li / inner;
-        int64_t c = rest % C;
-        int64_t o = rest / C;
-        int64_t j = c / cg, gi = c % cg;
-        int64_t src_c = gi * cg + j;
-        dst[li] = src[(o * C + src_c) * inner + tail];
-    }
-}
-
-
-
 } // anonymous namespace
 
 Tensor trace_cuda(const Tensor& self) {
@@ -734,18 +679,31 @@ Tensor pixel_shuffle_cuda(const Tensor& self, int64_t upscale_factor) {
     output_shape.push_back(output_width);
     int64_t r = upscale_factor;
     int64_t C = input_channels / factor_squared;
-    int64_t H = self.size(-2), W = self.size(-1);
     Tensor out = Tensor::empty(output_shape, self.dtype(), self.device());
     if (out.numel() == 0) return out;
     Tensor sc = self.contiguous();
-    int64_t n = out.numel();
-    auto stream = getCurrentCUDAStream().stream();
-    dim3 grid = make_grid(n), block(kThreads);
+    const int64_t input_height = self.size(-2);
+    const int64_t input_width = self.size(-1);
 #define TP_PS(ctype, name_) \
-    case DType::name_: \
-        pixel_shuffle_map_kernel<ctype><<<grid, block, 0, stream>>>( \
-            n, C, H, W, r, sc.data_ptr<ctype>(), out.data_ptr<ctype>()); \
-        break;
+    case DType::name_: { \
+        const ctype* source = sc.data_ptr<ctype>(); \
+        gpu_kernel_with_index(out, [=] GPU_LAMBDA(int64_t linear_index) -> ctype { \
+            const int64_t output_w = linear_index % output_width; \
+            int64_t rest = linear_index / output_width; \
+            const int64_t output_h = rest % output_height; \
+            rest /= output_height; \
+            const int64_t output_c = rest % C; \
+            const int64_t batch = rest / C; \
+            const int64_t sub_h = output_h % r; \
+            const int64_t sub_w = output_w % r; \
+            const int64_t input_c = output_c * r * r + sub_h * r + sub_w; \
+            const int64_t input_index = \
+                ((batch * input_channels + input_c) * input_height + \
+                 output_h / r) * input_width + output_w / r; \
+            return source[input_index]; \
+        }); \
+        break; \
+    }
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_PS)
         default: TP_THROW(TypeError, "pixel_shuffle: unsupported dtype");
@@ -777,14 +735,29 @@ Tensor pixel_unshuffle_cuda(const Tensor& self, int64_t downscale_factor) {
     Tensor out = Tensor::empty(output_shape, self.dtype(), self.device());
     if (out.numel() == 0) return out;
     Tensor sc = self.contiguous();
-    int64_t n = out.numel();
-    auto stream = getCurrentCUDAStream().stream();
-    dim3 grid = make_grid(n), block(kThreads);
+    const int64_t input_height = self.size(-2);
+    const int64_t input_width = self.size(-1);
 #define TP_PU(ctype, name_) \
-    case DType::name_: \
-        pixel_unshuffle_map_kernel<ctype><<<grid, block, 0, stream>>>( \
-            n, C, H, W, r, sc.data_ptr<ctype>(), out.data_ptr<ctype>()); \
-        break;
+    case DType::name_: { \
+        const ctype* source = sc.data_ptr<ctype>(); \
+        gpu_kernel_with_index(out, [=] GPU_LAMBDA(int64_t linear_index) -> ctype { \
+            const int64_t output_w = linear_index % W; \
+            int64_t rest = linear_index / W; \
+            const int64_t output_h = rest % H; \
+            rest /= H; \
+            const int64_t output_c = rest % (C * r * r); \
+            const int64_t batch = rest / (C * r * r); \
+            const int64_t input_c = output_c / (r * r); \
+            const int64_t sub = output_c % (r * r); \
+            const int64_t input_h = output_h * r + sub / r; \
+            const int64_t input_w = output_w * r + sub % r; \
+            const int64_t input_index = \
+                ((batch * C + input_c) * input_height + input_h) * \
+                input_width + input_w; \
+            return source[input_index]; \
+        }); \
+        break; \
+    }
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_PU)
         default: TP_THROW(TypeError, "pixel_unshuffle: unsupported dtype");
@@ -802,8 +775,6 @@ Tensor channel_shuffle_cuda(const Tensor& self, int64_t groups) {
         TP_THROW(RuntimeError, "channel_shuffle: groups must be positive, but got ", groups);
     }
     int64_t C = self.size(1);
-    int64_t outer = 1;
-    for (int64_t i = 0; i < 1; ++i) outer *= self.size(i);
     int64_t inner = 1;
     for (int64_t i = 2; i < self.dim(); ++i) inner *= self.size(i);
     if (C % groups) TP_THROW(RuntimeError, "channel_shuffle: channel dim not divisible by groups");
@@ -812,13 +783,21 @@ Tensor channel_shuffle_cuda(const Tensor& self, int64_t groups) {
     Tensor out = Tensor::empty(shape_of(self), self.dtype(), self.device());
     int64_t n = self.numel();
     if (n == 0) return out;
-    auto stream = getCurrentCUDAStream().stream();
-    dim3 grid = make_grid(n), block(kThreads);
 #define TP_CS(ctype, name_) \
-    case DType::name_: \
-        channel_shuffle_map_kernel<ctype><<<grid, block, 0, stream>>>( \
-            n, outer, C, inner, cg, sc.data_ptr<ctype>(), out.data_ptr<ctype>()); \
-        break;
+    case DType::name_: { \
+        const ctype* source = sc.data_ptr<ctype>(); \
+        gpu_kernel_with_index(out, [=] GPU_LAMBDA(int64_t linear_index) -> ctype { \
+            const int64_t tail = linear_index % inner; \
+            const int64_t rest = linear_index / inner; \
+            const int64_t output_c = rest % C; \
+            const int64_t batch = rest / C; \
+            const int64_t output_group = output_c / cg; \
+            const int64_t channel_in_group = output_c % cg; \
+            const int64_t input_c = channel_in_group * groups + output_group; \
+            return source[(batch * C + input_c) * inner + tail]; \
+        }); \
+        break; \
+    }
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_CS)
         default: TP_THROW(TypeError, "channel_shuffle: unsupported dtype");
