@@ -22,6 +22,19 @@ def test_nested_factory_shape(factory, size):
         np.testing.assert_array_equal(result.numpy(), np.full((2, 3, *size), expected))
 
 
+@pytest.mark.parametrize("factory", ["new_zeros", "new_ones", "new_empty", "new_full"])
+def test_factory_result_keeps_batch_ownership_for_mutation(factory):
+    def make_and_fill(x):
+        args = ((4,), 0) if factory == "new_full" else ((4,),)
+        result = getattr(x, factory)(*args)
+        result[tp.arange(4, dtype=tp.int64)] = x
+        return result
+
+    x = tp.ones((2, 3, 4)) * 7
+    result = tp.func.vmap(tp.func.vmap(make_and_fill))(x)
+    np.testing.assert_array_equal(result.numpy(), x.numpy())
+
+
 @pytest.mark.parametrize("depth", [1, 2, 3])
 def test_nested_indexed_scalar_assignment(depth):
     def fill(x):

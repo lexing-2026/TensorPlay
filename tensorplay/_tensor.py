@@ -313,37 +313,34 @@ def _flag(out, requires_grad):
 _orig_new_empty = Tensor.new_empty
 _orig_new_zeros = Tensor.new_zeros
 _orig_new_ones = Tensor.new_ones
+_orig_new_full = Tensor.new_full
 
 
 def _new_zeros(self, *size, dtype=None, device=None, requires_grad=False,
                layout=None, pin_memory=None, **kwargs):
     shape = _new_size(size, kwargs, "new_zeros")
-    if shape is not None:
-        out = _orig_new_zeros(self, shape, dtype=dtype, layout=layout,
-                              device=device, pin_memory=pin_memory)
-    else:
-        out = _C.zeros_like(self, dtype=dtype or self.dtype,
-                            device=device or self.device)
+    if shape is None:
+        raise TypeError("new_zeros() missing required argument: 'size'")
+    out = _orig_new_zeros(self, shape, dtype=dtype, layout=layout,
+                          device=device, pin_memory=pin_memory)
     return _flag(out, requires_grad)
 
 
 def _new_ones(self, *size, dtype=None, device=None, requires_grad=False,
               layout=None, pin_memory=None, **kwargs):
     shape = _new_size(size, kwargs, "new_ones")
-    if shape is not None:
-        out = _orig_new_ones(self, shape, dtype=dtype, layout=layout,
-                             device=device, pin_memory=pin_memory)
-    else:
-        out = _C.ones_like(self, dtype=dtype or self.dtype,
-                           device=device or self.device)
+    if shape is None:
+        raise TypeError("new_ones() missing required argument: 'size'")
+    out = _orig_new_ones(self, shape, dtype=dtype, layout=layout,
+                         device=device, pin_memory=pin_memory)
     return _flag(out, requires_grad)
 
 
 def _new_full(self, size, fill_value, *, dtype=None, device=None,
-              requires_grad=False):
-    out = _C.full(list(size), fill_value, dtype=dtype or self.dtype,
-                  device=device or self.device)
-    return out.requires_grad_(requires_grad) if requires_grad else out
+              requires_grad=False, layout=None, pin_memory=None):
+    out = _orig_new_full(self, size, fill_value, dtype=dtype, layout=layout,
+                         device=device, pin_memory=pin_memory)
+    return _flag(out, requires_grad)
 
 
 def _new_empty(self, size, *, dtype=None, device=None, requires_grad=False,
@@ -351,12 +348,8 @@ def _new_empty(self, size, *, dtype=None, device=None, requires_grad=False,
     if isinstance(size, builtins_int):
         size = [size]
     shape = _norm_new_size((size,))
-    if shape is not None:
-        out = _orig_new_empty(self, shape, dtype=dtype, layout=layout,
-                              device=device, pin_memory=pin_memory)
-    else:
-        out = _C.empty_like(self, dtype=dtype or self.dtype,
-                            device=device or self.device)
+    out = _orig_new_empty(self, shape, dtype=dtype, layout=layout,
+                          device=device, pin_memory=pin_memory)
     return _flag(out, requires_grad)
 
 
