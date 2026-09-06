@@ -8,12 +8,11 @@
 #include "CUDARuntime.h"
 #include "Exception.h"
 #include "Utils.h"
+#include "Complex.h"
 
 #include <cuda_runtime.h>
-#include <thrust/complex.h>
 
 #include <algorithm>
-#include <complex>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -203,29 +202,7 @@ void launch_cross(const Tensor& result, const Tensor& a, const Tensor& b,
 template <typename scalar_t>
 void launch_cross_complex(const Tensor& result, const Tensor& a,
                           const Tensor& b, int64_t dim) {
-    const int64_t rows = result.numel() / 3;
-    if (rows == 0) {
-        return;
-    }
-    const CrossTensorInfo result_info =
-        make_cross_info(result, static_cast<std::vector<int64_t>>(result.shape()));
-    const CrossTensorInfo a_info =
-        make_cross_info(a, static_cast<std::vector<int64_t>>(result.shape()));
-    const CrossTensorInfo b_info =
-        make_cross_info(b, static_cast<std::vector<int64_t>>(result.shape()));
-    const unsigned int blocks = static_cast<unsigned int>(std::min<int64_t>(
-        (rows + kCrossBlock - 1) / kCrossBlock, 4096));
-    cudaStream_t stream = getCurrentCUDAStream().stream();
-    using device_complex = thrust::complex<scalar_t>;
-    cross_kernel<device_complex><<<blocks, kCrossBlock, 0, stream>>>(
-        rows,
-        reinterpret_cast<device_complex*>(result.data_ptr<std::complex<scalar_t>>()),
-        result_info,
-        reinterpret_cast<const device_complex*>(a.data_ptr<std::complex<scalar_t>>()),
-        a_info,
-        reinterpret_cast<const device_complex*>(b.data_ptr<std::complex<scalar_t>>()),
-        b_info, dim);
-    CUDA_CHECK(cudaGetLastError());
+    launch_cross<tensorplay::complex<scalar_t>>(result, a, b, dim);
 }
 
 Tensor cross_impl(const Tensor& input, const Tensor& other, int64_t dim) {
