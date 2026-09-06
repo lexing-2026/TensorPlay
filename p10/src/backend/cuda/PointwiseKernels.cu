@@ -1161,20 +1161,14 @@ __global__ void where_broadcast_kernel_cuda_impl(
     }
 }
 
-template <typename T, bool Maximum>
-__global__ void maximum_minimum_broadcast_kernel_cuda_impl(
-    int64_t n, const T* self, TensorDesc self_desc,
-    const T* other, TensorDesc other_desc,
-    T* output, TensorDesc output_desc) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        const T a = self[get_offset(i, self_desc, output_desc)];
-        const T b = other[get_offset(i, other_desc, output_desc)];
-        if constexpr (Maximum) {
-            output[i] = a < b ? b : a;
-        } else {
-            output[i] = a < b ? a : b;
-        }
+template <bool Maximum, typename T>
+__device__ inline T maximum_minimum_elem(T a, T b) {
+    if (a != a) return a;
+    if (b != b) return b;
+    if constexpr (Maximum) {
+        return a < b ? b : a;
+    } else {
+        return a < b ? a : b;
     }
 }
 
@@ -1254,28 +1248,27 @@ Tensor maximum_minimum_cuda_impl(const Tensor& self, const Tensor& other) {
         TP_THROW(RuntimeError, "maximum/minimum is not implemented for complex tensors");
     }
     Tensor result = Tensor::empty(out_shape, common_dtype, self.device());
-    const int64_t n = result.numel();
-    if (n == 0) return result;
-    dim3 block(256);
-    dim3 grid((n + 255) / 256);
+    if (result.numel() == 0) return result;
     Tensor a = self.dtype() == common_dtype ? self : self.to(common_dtype);
     Tensor b = other.dtype() == common_dtype ? other : other.to(common_dtype);
-    TensorDesc a_desc = make_desc(a, out_shape.size());
-    TensorDesc b_desc = make_desc(b, out_shape.size());
-    TensorDesc result_desc = make_desc(result, out_shape.size());
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(result)
+        .add_input(a)
+        .add_input(b)
+        .build();
 
     #define MAXMIN_CASE(ctype, name) \
         case DType::name: \
-            maximum_minimum_broadcast_kernel_cuda_impl<ctype, Maximum><<<grid, block, 0, getCurrentCUDAStream().stream()>>>( \
-                n, a.data_ptr<ctype>(), a_desc, b.data_ptr<ctype>(), b_desc, \
-                result.data_ptr<ctype>(), result_desc); \
+            gpu_kernel(iter, [] __device__(ctype lhs, ctype rhs) -> ctype { \
+                return maximum_minimum_elem<Maximum>(lhs, rhs); \
+            }); \
             break;
     switch (common_dtype) {
         TENSORPLAY_FORALL_SCALAR_TYPES(MAXMIN_CASE)
         default: TP_THROW(NotImplementedError, "CUDA maximum/minimum: unsupported dtype");
     }
     #undef MAXMIN_CASE
-    CUDA_CHECK(cudaGetLastError());
     return result;
 }
 
@@ -1326,19 +1319,6 @@ __device__ inline BFloat16 fmaxfmin_elem(BFloat16 a, BFloat16 b) {
     return BFloat16(fmaxfmin_elem<Maximum>(static_cast<float>(a), static_cast<float>(b)));
 }
 
-template <bool Maximum, typename T>
-__global__ void fmaxfmin_broadcast_kernel_cuda_impl(
-    int64_t n, const T* self, TensorDesc self_desc,
-    const T* other, TensorDesc other_desc,
-    T* output, TensorDesc output_desc) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        const T a = self[get_offset(i, self_desc, output_desc)];
-        const T b = other[get_offset(i, other_desc, output_desc)];
-        output[i] = fmaxfmin_elem<Maximum>(a, b);
-    }
-}
-
 template <bool Maximum>
 Tensor fmaxfmin_cuda_impl(const Tensor& self, const Tensor& other) {
     std::vector<int64_t> out_shape = broadcast_shapes(
@@ -1349,28 +1329,27 @@ Tensor fmaxfmin_cuda_impl(const Tensor& self, const Tensor& other) {
         TP_THROW(RuntimeError, "fmax/fmin is not implemented for complex tensors");
     }
     Tensor result = Tensor::empty(out_shape, common_dtype, self.device());
-    const int64_t n = result.numel();
-    if (n == 0) return result;
-    dim3 block(256);
-    dim3 grid((n + 255) / 256);
-    Tensor a = self.dtype() == common_dtype ? self.contiguous() : self.to(common_dtype).contiguous();
-    Tensor b = other.dtype() == common_dtype ? other.contiguous() : other.to(common_dtype).contiguous();
-    TensorDesc a_desc = make_desc(a, out_shape.size());
-    TensorDesc b_desc = make_desc(b, out_shape.size());
-    TensorDesc result_desc = make_desc(result, out_shape.size());
+    if (result.numel() == 0) return result;
+    Tensor a = self.dtype() == common_dtype ? self : self.to(common_dtype);
+    Tensor b = other.dtype() == common_dtype ? other : other.to(common_dtype);
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(result)
+        .add_input(a)
+        .add_input(b)
+        .build();
 
     #define FMAXMIN_CASE(ctype, name) \
         case DType::name: \
-            fmaxfmin_broadcast_kernel_cuda_impl<Maximum, ctype><<<grid, block, 0, getCurrentCUDAStream().stream()>>>( \
-                n, a.data_ptr<ctype>(), a_desc, b.data_ptr<ctype>(), b_desc, \
-                result.data_ptr<ctype>(), result_desc); \
+            gpu_kernel(iter, [] __device__(ctype lhs, ctype rhs) -> ctype { \
+                return fmaxfmin_elem<Maximum>(lhs, rhs); \
+            }); \
             break;
     switch (common_dtype) {
         TENSORPLAY_FORALL_SCALAR_TYPES(FMAXMIN_CASE)
         default: TP_THROW(NotImplementedError, "CUDA fmax/fmin: unsupported dtype");
     }
     #undef FMAXMIN_CASE
-    CUDA_CHECK(cudaGetLastError());
     return result;
 }
 
