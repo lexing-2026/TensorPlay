@@ -37,6 +37,29 @@ void destroy_plan(cufftHandle handle) {
 #endif
 }
 
+// Every rank goes through cufftPlanMany: null embeds mean unit stride, and
+// routing 1D through the same call avoids the rank-specific cufftPlan1d
+// failure mode observed on some driver / cuFFT 11 combinations.
+cufftHandle make_plan(const PlanSpec& spec) {
+    cufftHandle plan;
+    check_cufft(cufftPlanMany(&plan, spec.rank,
+                              reinterpret_cast<int*>(const_cast<int64_t*>(spec.n.data())),
+                              spec.rank == 1
+                                  ? nullptr
+                                  : reinterpret_cast<int*>(const_cast<int64_t*>(spec.inembed.data())),
+                              static_cast<int>(spec.istride),
+                              static_cast<int>(spec.idist),
+                              spec.rank == 1
+                                  ? nullptr
+                                  : reinterpret_cast<int*>(const_cast<int64_t*>(spec.onembed.data())),
+                              static_cast<int>(spec.ostride),
+                              static_cast<int>(spec.odist),
+                              static_cast<cufftType>(spec.type),
+                              static_cast<int>(spec.batch)),
+                "cufftPlanMany");
+    return plan;
+}
+
 }  // namespace
 
 cufftHandle PlanLRUCache::lookup(const PlanSpec& spec) {
@@ -66,25 +89,7 @@ cufftHandle PlanLRUCache::lookup(const PlanSpec& spec) {
         usage_.pop_back();
     }
 
-    cufftHandle plan;
-    if (spec.rank == 1) {
-        check_cufft(cufftPlan1d(&plan, static_cast<int>(spec.n[0]),
-                                static_cast<cufftType>(spec.type),
-                                static_cast<int>(spec.batch)),
-                    "cufftPlan1d");
-    } else {
-        check_cufft(cufftPlanMany(&plan, spec.rank,
-                                  reinterpret_cast<int*>(const_cast<int64_t*>(spec.n.data())),
-                                  reinterpret_cast<int*>(const_cast<int64_t*>(spec.inembed.data())),
-                                  static_cast<int>(spec.istride),
-                                  static_cast<int>(spec.idist),
-                                  reinterpret_cast<int*>(const_cast<int64_t*>(spec.onembed.data())),
-                                  static_cast<int>(spec.ostride),
-                                  static_cast<int>(spec.odist),
-                                  static_cast<cufftType>(spec.type),
-                                  static_cast<int>(spec.batch)),
-                    "cufftPlanMany");
-    }
+    cufftHandle plan = make_plan(spec);
     check_cufft(cufftSetStream(plan, getCurrentCUDAStream().stream()),
                 "cufftSetStream");
 
@@ -202,25 +207,7 @@ cufftHandle acquire_plan(const PlanSpec& spec, int64_t device_index) {
         return cache.lookup(spec);
     }
     // Caching disabled: build a transient plan the caller destroys.
-    cufftHandle plan;
-    if (spec.rank == 1) {
-        check_cufft(cufftPlan1d(&plan, static_cast<int>(spec.n[0]),
-                                static_cast<cufftType>(spec.type),
-                                static_cast<int>(spec.batch)),
-                    "cufftPlan1d");
-    } else {
-        check_cufft(cufftPlanMany(&plan, spec.rank,
-                                  reinterpret_cast<int*>(const_cast<int64_t*>(spec.n.data())),
-                                  reinterpret_cast<int*>(const_cast<int64_t*>(spec.inembed.data())),
-                                  static_cast<int>(spec.istride),
-                                  static_cast<int>(spec.idist),
-                                  reinterpret_cast<int*>(const_cast<int64_t*>(spec.onembed.data())),
-                                  static_cast<int>(spec.ostride),
-                                  static_cast<int>(spec.odist),
-                                  static_cast<cufftType>(spec.type),
-                                  static_cast<int>(spec.batch)),
-                    "cufftPlanMany");
-    }
+    cufftHandle plan = make_plan(spec);
     check_cufft(cufftSetStream(plan, getCurrentCUDAStream().stream()),
                 "cufftSetStream");
     return plan;
