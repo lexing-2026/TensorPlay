@@ -1,4 +1,4 @@
-"""Sparse COO, CSR, and semi-structured tensors.
+"""Sparse COO, compressed (CSR/CSC/BSR/BSC), and semi-structured tensors.
 
 The package keeps the sparse surface under a dedicated namespace so user
 code can use the same tensor objects for sparse construction, arithmetic and
@@ -16,12 +16,19 @@ from tensorplay import Tensor
 
 from ._construction import (
     coalesce,
+    sparse_compressed_tensor,
     sparse_coo_tensor,
     sparse_csr_tensor,
+    sparse_csc_tensor,
+    sparse_bsr_tensor,
+    sparse_bsc_tensor,
     sparse_mask,
     spdiags,
     to_dense,
     to_sparse,
+    to_sparse_bsc,
+    to_sparse_bsr,
+    to_sparse_csc,
     to_sparse_csr,
 )
 from ._gradcheck import as_sparse_gradcheck
@@ -46,8 +53,12 @@ __all__ = [
     "mul",
     "softmax",
     "solve",
+    "sparse_compressed_tensor",
     "sparse_coo_tensor",
     "sparse_csr_tensor",
+    "sparse_csc_tensor",
+    "sparse_bsr_tensor",
+    "sparse_bsc_tensor",
     "sparse_mask",
     "spdiags",
     "sum",
@@ -57,5 +68,8 @@ __all__ = [
     "to_dense",
     "to_sparse",
     "to_sparse_csr",
+    "to_sparse_csc",
+    "to_sparse_bsr",
+    "to_sparse_bsc",
     "to_sparse_semi_structured",
 ]

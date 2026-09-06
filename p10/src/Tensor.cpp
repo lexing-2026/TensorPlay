@@ -190,39 +190,8 @@ Tensor Tensor::make_sparse_csr_tensor(const Tensor& crow,
                                       const Tensor& col,
                                       const Tensor& values,
                                       const std::vector<int64_t>& size) {
-    if (!crow.defined() || !col.defined() || !values.defined()) {
-        TP_THROW(ValueError, "sparse_csr_tensor: crow/col/values must be defined");
-    }
-    if (crow.device() != col.device() || crow.device() != values.device()) {
-        TP_THROW(DeviceMismatchError,
-                 "sparse_csr_tensor: crow/col/values must be on the same device");
-    }
-    if (crow.dim() != 1 || col.dim() != 1) {
-        TP_THROW(ValueError, "sparse_csr_tensor: crow/col must be 1-D tensors");
-    }
-    if (size.size() != 2) {
-        TP_THROW(ValueError, "sparse_csr_tensor: CSR layout supports exactly 2-D sizes");
-    }
-    if (crow.size(0) != size[0] + 1) {
-        TP_THROW(ValueError,
-                 "sparse_csr_tensor: crow must have rows+1 entries");
-    }
-    if (col.size(0) != values.size(0)) {
-        TP_THROW(ValueError,
-                 "sparse_csr_tensor: col and values must have the same nnz");
-    }
-    Tensor canonical_crow = crow.dtype() == DType::Int64 ? crow : crow.to(DType::Int64);
-    Tensor canonical_col = col.dtype() == DType::Int64 ? col : col.to(DType::Int64);
-
-    // Same rationale as the COO constructor: install logical metadata only.
-    Tensor result(std::make_shared<TensorImpl>(
-        size, values.dtype(), values.device(), /*allocate_storage=*/false));
-    result.unsafeGetTensorImpl()->set_sparse_csr_state(
-        canonical_crow.unsafeGetTensorImpl(),
-        canonical_col.unsafeGetTensorImpl(),
-        values.unsafeGetTensorImpl(),
-        size);
-    return result;
+    return make_sparse_compressed_tensor(
+        crow, col, values, size, TensorImpl::kSparseCSRLayout, {0, 0});
 }
 
 Tensor Tensor::make_sparse_compressed_tensor(
@@ -238,68 +207,119 @@ Tensor Tensor::make_sparse_compressed_tensor(
                  "sparse_compressed_tensor: crow/col/values must be on the "
                  "same device");
     }
+    if (layout != TensorImpl::kSparseCSRLayout &&
+        layout != TensorImpl::kSparseCSCLayout &&
+        layout != TensorImpl::kSparseBSRLayout &&
+        layout != TensorImpl::kSparseBSCLayout) {
+        TP_THROW(ValueError,
+                 "sparse_compressed_tensor: invalid compressed layout ",
+                 layout);
+    }
+    if (crow.dim() < 1 || col.dim() != crow.dim()) {
+        TP_THROW(ValueError,
+                 "sparse_compressed_tensor: compressed/plain indices must "
+                 "have the same rank and at least one dimension");
+    }
+    if (crow.dtype() != col.dtype()) {
+        TP_THROW(TypeError,
+                 "sparse_compressed_tensor: compressed/plain indices must "
+                 "have the same dtype");
+    }
+    if (crow.dtype() != DType::Int32 && crow.dtype() != DType::Int64) {
+        TP_THROW(TypeError,
+                 "sparse_compressed_tensor: indices must be Int32 or Int64");
+    }
     if (size.size() < 2) {
         TP_THROW(ValueError,
                  "sparse_compressed_tensor: compressed layouts need at least "
                  "2-D sizes");
     }
-    // Batched inputs keep one leading index entry per batch matrix: the
-    // compressed/plain index tensors are (*batch, units+1) and (*batch, nnz).
-    const int64_t n_batch_dim = size.size() - 2;
-    // The compressed axis enumerates blocks for the blocked layouts and
-    // rows for the unblocked ones.
-    const int64_t compressed_units =
-        (layout == TensorImpl::kSparseBSRLayout ||
-         layout == TensorImpl::kSparseBSCLayout)
-            ? size[0] / blocksize[0]
-            : size[0];
-    if (crow.dim() != n_batch_dim + 1 || col.dim() != n_batch_dim + 1) {
+    const bool blocked =
+        layout == TensorImpl::kSparseBSRLayout ||
+        layout == TensorImpl::kSparseBSCLayout;
+    const bool row_compressed =
+        layout == TensorImpl::kSparseCSRLayout ||
+        layout == TensorImpl::kSparseBSRLayout;
+    const int64_t n_batch_dim = crow.dim() - 1;
+    const int64_t block_ndim = blocked ? 2 : 0;
+    const int64_t dense_dim = values.dim() - n_batch_dim - 1 - block_ndim;
+    if (dense_dim < 0 ||
+        static_cast<int64_t>(size.size()) != n_batch_dim + 2 + dense_dim) {
         TP_THROW(ValueError,
-                 "sparse_compressed_tensor: compressed/plain indices must be "
-                 "(*batch, units+1) and (*batch, nnz)");
+                 "sparse_compressed_tensor: size rank does not match the "
+                 "index/value ranks");
     }
+    for (int64_t d = 0; d < n_batch_dim; ++d) {
+        if (crow.size(d) != size[static_cast<size_t>(d)] ||
+            col.size(d) != size[static_cast<size_t>(d)] ||
+            values.size(d) != size[static_cast<size_t>(d)]) {
+            TP_THROW(ValueError,
+                     "sparse_compressed_tensor: batch dimensions of indices, "
+                     "values, and size must match");
+        }
+    }
+    const int64_t rows = size[static_cast<size_t>(n_batch_dim)];
+    const int64_t cols = size[static_cast<size_t>(n_batch_dim + 1)];
+    for (int64_t extent : size) {
+        if (extent < 0) {
+            TP_THROW(ValueError,
+                     "sparse_compressed_tensor: sizes must be non-negative");
+        }
+    }
+    int64_t b0 = 1;
+    int64_t b1 = 1;
+    if (blocked) {
+        b0 = blocksize[0];
+        b1 = blocksize[1];
+        if (b0 <= 0 || b1 <= 0) {
+            TP_THROW(ValueError,
+                     "sparse_compressed_tensor: blocked layouts require "
+                     "positive block sizes");
+        }
+        if (rows % b0 != 0 || cols % b1 != 0) {
+            TP_THROW(ValueError,
+                     "sparse_compressed_tensor: sizes must be divisible by "
+                     "the block sizes");
+        }
+    } else {
+        blocksize = {0, 0};
+    }
+    const int64_t compressed_units =
+        (row_compressed ? rows / b0 : cols / b1);
     if (crow.size(crow.dim() - 1) != compressed_units + 1) {
         TP_THROW(ValueError,
                  "sparse_compressed_tensor: compressed indices must have "
                  "units+1 entries");
     }
-    // Batched plain indices are (*batch, nnz); compare element counts.
-    if (col.numel() != values.size(0)) {
+    const int64_t nnz = values.size(n_batch_dim);
+    if (col.size(col.dim() - 1) != nnz) {
         TP_THROW(ValueError,
                  "sparse_compressed_tensor: plain indices and values must "
                  "have the same nnz");
     }
-    if (layout == TensorImpl::kSparseBSRLayout ||
-        layout == TensorImpl::kSparseBSCLayout) {
-        const int64_t block_r = blocksize[0];
-        const int64_t block_c = blocksize[1];
-        if (block_r <= 0 || block_c <= 0) {
+    if (blocked &&
+        (values.size(n_batch_dim + 1) != b0 ||
+         values.size(n_batch_dim + 2) != b1)) {
             TP_THROW(ValueError,
-                     "sparse_compressed_tensor: blocked layouts require "
-                     "positive block sizes");
-        }
-        if (size[0] % block_r != 0 || size[1] % block_c != 0) {
+                     "sparse_compressed_tensor: values must contain the "
+                     "declared block dimensions");
+    }
+    const int64_t dense_start = n_batch_dim + 1 + block_ndim;
+    for (int64_t d = 0; d < dense_dim; ++d) {
+        if (values.size(dense_start + d) !=
+            size[static_cast<size_t>(n_batch_dim + 2 + d)]) {
             TP_THROW(ValueError,
-                     "sparse_compressed_tensor: sizes must be divisible by "
-                     "the block sizes");
-        }
-        if (values.dim() < 2 ||
-            values.size(values.dim() - 2) != block_r ||
-            values.size(values.dim() - 1) != block_c) {
-            TP_THROW(ValueError,
-                     "sparse_compressed_tensor: values must end with the two "
-                     "block dimensions");
+                     "sparse_compressed_tensor: values dense dimensions "
+                     "must match size");
         }
     }
-    Tensor canonical_crow = crow.dtype() == DType::Int64 ? crow : crow.to(DType::Int64);
-    Tensor canonical_col = col.dtype() == DType::Int64 ? col : col.to(DType::Int64);
 
     // Same rationale as the COO constructor: install logical metadata only.
     Tensor result(std::make_shared<TensorImpl>(
         size, values.dtype(), values.device(), /*allocate_storage=*/false));
     result.unsafeGetTensorImpl()->set_sparse_compressed_state(
-        canonical_crow.unsafeGetTensorImpl(),
-        canonical_col.unsafeGetTensorImpl(),
+        crow.unsafeGetTensorImpl(),
+        col.unsafeGetTensorImpl(),
         values.unsafeGetTensorImpl(),
         size, layout, blocksize);
     return result;
@@ -413,7 +433,7 @@ Tensor Tensor::pin_memory() const {
 bool Tensor::is_sparse() const { return impl_ && impl_->is_sparse(); }
 
 bool Tensor::is_coalesced() const {
-    if (!is_sparse() || is_sparse_csr()) {
+    if (!is_sparse() || is_sparse_compressed()) {
         TP_THROW(RuntimeError,
                  "is_coalesced expected sparse coordinate tensor layout");
     }
@@ -422,17 +442,23 @@ bool Tensor::is_coalesced() const {
 
 int64_t Tensor::sparse_dim() const {
     if (!is_sparse()) return 0;
-    if (is_sparse_csr()) return 2;
+    if (is_sparse_compressed()) return 2;
     return _indices().dim() == 0 ? 0 : _indices().size(0);
 }
 
 int64_t Tensor::dense_dim() const {
     if (!is_sparse()) return dim();
+    if (is_sparse_compressed()) {
+        const int64_t block_ndim =
+            (is_sparse_bsr() || is_sparse_bsc()) ? 2 : 0;
+        return std::max<int64_t>(
+            0, _values().dim() - _crow_indices().dim() - block_ndim);
+    }
     return _values().dim() == 0 ? 0 : _values().dim() - 1;
 }
 
 Tensor Tensor::_indices() const {
-    if (!is_sparse() || is_sparse_csr()) {
+    if (!is_sparse() || is_sparse_compressed()) {
         TP_THROW(RuntimeError,
                  "_indices() is only defined for sparse COO tensors");
     }
@@ -468,7 +494,7 @@ Tensor Tensor::_col_indices() const {
 }
 
 Tensor Tensor::coalesce() const {
-    if (!is_sparse() || is_sparse_csr()) {
+    if (!is_sparse() || is_sparse_compressed()) {
         TP_THROW(RuntimeError,
                  "coalesce() is only defined for sparse COO tensors");
     }
@@ -951,6 +977,9 @@ Tensor Tensor::view_dtype(DType dtype) const {
 
 Tensor Tensor::select(int64_t dim, int64_t index) const {
     if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
+    if (is_batched()) {
+        return transform::batch::select(*this, dim, index);
+    }
     const int64_t ndim = this->dim();
     if (ndim == 0) {
         TP_THROW(IndexError, "select() cannot be applied to a 0-dim tensor");
@@ -1182,11 +1211,12 @@ Tensor Tensor::to(DType dtype, bool non_blocking, bool copy) const {
     if (!impl_) return Tensor();
     if (is_sparse()) {
         if (dtype == this->dtype()) return copy ? clone() : *this;
-        if (is_sparse_csr()) {
-            return make_sparse_csr_tensor(
+        if (is_sparse_compressed()) {
+            return make_sparse_compressed_tensor(
                 _crow_indices(), _col_indices(),
                 _values().to(dtype, non_blocking, copy),
-                static_cast<std::vector<int64_t>>(shape()));
+                static_cast<std::vector<int64_t>>(shape()),
+                impl_->sparse_layout(), sparse_blocksize());
         }
         return make_sparse_coo_tensor(
             _indices(), _values().to(dtype, non_blocking, copy),
@@ -1205,12 +1235,13 @@ Tensor Tensor::to(Device device, bool non_blocking, bool copy) const {
     if (!impl_) return Tensor();
     if (is_sparse()) {
         if (this->device() == device) return copy ? clone() : *this;
-        if (is_sparse_csr()) {
-            return make_sparse_csr_tensor(
+        if (is_sparse_compressed()) {
+            return make_sparse_compressed_tensor(
                 _crow_indices().to(device, non_blocking, copy),
                 _col_indices().to(device, non_blocking, copy),
                 _values().to(device, non_blocking, copy),
-                static_cast<std::vector<int64_t>>(shape()));
+                static_cast<std::vector<int64_t>>(shape()),
+                impl_->sparse_layout(), sparse_blocksize());
         }
         return make_sparse_coo_tensor(
             _indices().to(device, non_blocking, copy),
@@ -1236,12 +1267,13 @@ Tensor Tensor::to(Device device, DType dtype, bool non_blocking, bool copy) cons
         if (this->device() == device && this->dtype() == dtype) {
             return copy ? clone() : *this;
         }
-        if (is_sparse_csr()) {
-            return make_sparse_csr_tensor(
+        if (is_sparse_compressed()) {
+            return make_sparse_compressed_tensor(
                 _crow_indices().to(device, non_blocking, copy),
                 _col_indices().to(device, non_blocking, copy),
                 _values().to(device, dtype, non_blocking, copy),
-                static_cast<std::vector<int64_t>>(shape()));
+                static_cast<std::vector<int64_t>>(shape()),
+                impl_->sparse_layout(), sparse_blocksize());
         }
         return make_sparse_coo_tensor(
             _indices().to(device, non_blocking, copy),

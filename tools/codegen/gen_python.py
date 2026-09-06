@@ -148,6 +148,29 @@ def _reduction_union_lines(name, base, sib) -> list[str] | None:
     ]
 
 
+def _required_kwonly_sibling(base, group):
+    """Find a sibling overload that only adds required keyword-only arguments.
+
+    ``argsort``/``sort`` spell their stable form as a separate overload whose
+    every parameter matches the plain overload by name, plus a required
+    keyword-only flag (``stable``).  Such a sibling cannot be reached by
+    argument shape -- the plain overload accepts the same positional call --
+    so the public wrapper has to route on the flag being supplied.  Returns
+    ``(sibling, extras)`` or ``None``.
+    """
+    base_names = {a.python_name for a in base.args}
+    for sib in group:
+        if sib is base or sib.overload_name == 'out' or sib.out_args:
+            continue
+        sib_names = {a.python_name for a in sib.args}
+        if not base_names <= sib_names:
+            continue
+        extras = [a for a in sib.args if a.python_name not in base_names]
+        if len(extras) == 1 and extras[0].kwonly and not extras[0].default:
+            return sib, extras[0]
+    return None
+
+
 def generate_functional_py(funcs: list[NativeFunction]) -> str:
     lines = [_HEADER]
 
@@ -474,6 +497,37 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
             ]
             continue
 
+        # Compressed sparse constructors have two call shapes in the native
+        # schema: an explicit-size overload and an overload that infers the
+        # logical shape from the buffers.  Expose both behind the same Python
+        # signature, matching torch.sparse_*_tensor(..., size=None), instead
+        # of letting the generated wrapper make `size` mandatory.
+        compressed_ctor_names = {
+            'sparse_compressed_tensor': ('compressed_indices', 'plain_indices'),
+            'sparse_csr_tensor': ('crow_indices', 'col_indices'),
+            'sparse_csc_tensor': ('ccol_indices', 'row_indices'),
+            'sparse_bsr_tensor': ('crow_indices', 'col_indices'),
+            'sparse_bsc_tensor': ('ccol_indices', 'row_indices'),
+        }
+        if (name in compressed_ctor_names and 'function' in f.variants
+                and sum(1 for g in group
+                        if g.overload_name != 'out' and not g.out_args) >= 2):
+            seen.add(name)
+            first, second = compressed_ctor_names[name]
+            lines += [
+                f'def {name}({first}, {second}, values, size=None, *, dtype=None, layout=None, device=None, pin_memory=False):',
+                '    if _capturing():',
+                f"        _captured = _capture_call({name}, ({first}, {second}, values, size), {{'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory}})",
+                '        if _captured is not None:',
+                '            return _captured',
+                '    _device = _ensure_device(device)',
+                '    if size is None:',
+                f'        return _C.{name}({first}, {second}, values, dtype=dtype, layout=layout, device=_device, pin_memory=pin_memory)',
+                f'    return _C.{name}({first}, {second}, values, size, dtype=dtype, layout=layout, device=_device, pin_memory=pin_memory)',
+                '',
+            ]
+            continue
+
         if 'function' in f.variants:
             if f is out_variant:
                 # The plain overload of the group owns the out-accepting
@@ -611,7 +665,52 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                     if merged:
                         kw += ", " + ", ".join(
                             f"{n}={p}" for n, p in merged)
+                # A sibling that only adds one required keyword-only argument
+                # shares every call shape with this overload, so no amount of
+                # positional forwarding can reach it.  The public signature
+                # carries that argument behind a sentinel and routes on it
+                # being supplied.
+                kw_route = (_required_kwonly_sibling(f, group)
+                            if multi_overload else None)
+                if kw_route is not None:
+                    kw_sib, kw_extra = kw_route
+                    kw_extra_name = _param_name(kw_extra)
+                    kwonly.append(f'{kw_extra_name}=_MISSING')
+                    kw_call = [_param_name(a) for a in kw_sib.args if not a.kwonly]
+                    kw_call += [f'{a.python_name}={_param_name(a)}'
+                                for a in kw_sib.args if a.kwonly]
+                    # The out form of the routed overload is only reachable
+                    # when it spells its destination `out`; grouped multi-output
+                    # schemas name theirs individually and are left alone.
+                    kw_out = any(
+                        (g.overload_name == 'out' or g.out_args)
+                        and {a.python_name for a in g.args}
+                        >= {a.python_name for a in kw_sib.args} | {'out'}
+                        for g in group)
                 lines.append(f'def {name}({", ".join(pos + kwonly + ["out=None"])}):')
+                if kw_route is not None:
+                    lines.append(f'    if {kw_extra_name} is not _MISSING:')
+                    if kw_out:
+                        lines.append('        if out is not None:')
+                        lines.append(
+                            f'            return _C.{name}('
+                            f'{", ".join(kw_call + ["out=out"])})')
+                    cap_kw = ', '.join(
+                        f"'{_param_name(a)}': {_param_name(a)}"
+                        for a in f.args if a.kwonly)
+                    cap_kw = ('{' + cap_kw + (', ' if cap_kw else '')
+                              + f"'{kw_extra_name}': {kw_extra_name}" + '}')
+                    cap_pos = ', '.join(pos_names)
+                    if len(pos_names) == 1:
+                        cap_pos += ','
+                    lines += [
+                        '        if _capturing():',
+                        f'            _captured = _capture_call({name}, '
+                        f'({cap_pos}), {cap_kw})',
+                        '            if _captured is not None:',
+                        '                return _captured',
+                        f'        return _C.{name}({", ".join(kw_call)})',
+                    ]
                 if fwd is not None:
                     lines.append(
                         f'    if out is not None:')

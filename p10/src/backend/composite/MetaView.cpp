@@ -22,6 +22,7 @@
 #include "Allocator.h"
 
 #include <cstdint>
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -273,6 +274,14 @@ int64_t dense_dim_kernel(const Tensor& self) {
     if (!values || values->dim() == 0) {
         return 0;
     }
+    if (impl->is_sparse_compressed()) {
+        const int64_t block_ndim =
+            (impl->is_sparse_bsr() || impl->is_sparse_bsc()) ? 2 : 0;
+        auto compressed = impl->sparse_crow_impl();
+        return compressed
+            ? std::max<int64_t>(0, values->dim() - compressed->dim() - block_ndim)
+            : 0;
+    }
     return values->dim() - 1;
 }
 
@@ -310,7 +319,7 @@ Tensor crow_indices_kernel(const Tensor& self) {
                  "crow_indices expected sparse row compressed tensor layout");
     }
     std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
-    if (!impl->is_sparse_compressed()) {
+    if (!impl->is_sparse_row_compressed()) {
         TP_THROW(RuntimeError,
                  "crow_indices expected sparse row compressed tensor layout");
     }
@@ -328,7 +337,7 @@ Tensor col_indices_kernel(const Tensor& self) {
                  "col_indices expected sparse row compressed tensor layout");
     }
     std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
-    if (!impl->is_sparse_compressed()) {
+    if (!impl->is_sparse_row_compressed()) {
         TP_THROW(RuntimeError,
                  "col_indices expected sparse row compressed tensor layout");
     }

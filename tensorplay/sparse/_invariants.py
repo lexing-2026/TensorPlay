@@ -71,60 +71,50 @@ def _validate_coo(indices, values, size) -> None:
 
 
 def _validate_csr(crow_indices, col_indices, values, size) -> None:
-    """Raises ``RuntimeError`` unless the compressed buffers form a CSR tensor."""
-    if len(size) != 2:
-        raise RuntimeError("`size` must contain exactly two dimensions")
-    if any(int(value) < 0 for value in size):
-        raise RuntimeError("`size` entries must be non-negative")
-    if crow_indices.dtype not in (tensorplay.int32, tensorplay.int64):
-        raise RuntimeError("`crow_indices` must have int32 or int64 dtype")
-    if col_indices.dtype not in (tensorplay.int32, tensorplay.int64):
-        raise RuntimeError("`col_indices` must have int32 or int64 dtype")
-    if (
-        crow_indices.device != col_indices.device
-        or crow_indices.device != values.device
-    ):
-        raise RuntimeError(
-            "`crow_indices`, `col_indices`, and `values` must share one device"
+    """Validate CSR buffers through the shared native invariant worker."""
+    _validate_compressed(
+        crow_indices,
+        col_indices,
+        values,
+        size,
+        tensorplay.sparse_csr,
+    )
+
+
+def _validate_compressed(
+    compressed_indices, plain_indices, values, size, layout
+) -> None:
+    """Validate any CSR/CSC/BSR/BSC component tuple.
+
+    The native worker is deliberately used here as well as by the C++ safe
+    constructors.  That keeps the global ``check_sparse_tensor_invariants``
+    switch byte-for-byte consistent with constructor validation, including
+    batched pointers, block dimensions, dense value tails, and index strides.
+    """
+    layout = int(layout)
+    if layout == int(tensorplay.sparse_csr):
+        tensorplay._C._validate_sparse_csr_tensor_args(
+            compressed_indices, plain_indices, values, list(size)
         )
-    if values.dim() != 1:
-        raise RuntimeError("CSR values must be one-dimensional")
-    if crow_indices.dim() != 1:
-        raise RuntimeError(
-            f"`crow_indices` must be 1-D, got {crow_indices.dim()}-D"
+    elif layout == int(tensorplay.sparse_csc):
+        tensorplay._C._validate_sparse_csc_tensor_args(
+            compressed_indices, plain_indices, values, list(size)
         )
-    if col_indices.dim() != 1:
-        raise RuntimeError(f"`col_indices` must be 1-D, got {col_indices.dim()}-D")
-    nrows = int(size[0])
-    if int(crow_indices.shape[0]) != nrows + 1:
-        raise RuntimeError(
-            f"`len(crow_indices) == size[0] + 1` is not satisfied: "
-            f"{int(crow_indices.shape[0])} != {nrows + 1}"
+    elif layout == int(tensorplay.sparse_bsr):
+        tensorplay._C._validate_sparse_bsr_tensor_args(
+            compressed_indices, plain_indices, values, list(size)
         )
-    nnz = int(col_indices.shape[0])
-    if int(values.shape[0]) != nnz:
-        raise RuntimeError(
-            f"`len(values) == len(col_indices)` is not satisfied: "
-            f"{int(values.shape[0])} != {nnz}"
+    elif layout == int(tensorplay.sparse_bsc):
+        tensorplay._C._validate_sparse_bsc_tensor_args(
+            compressed_indices, plain_indices, values, list(size)
         )
-    if int(crow_indices[0].item()) != 0:
-        raise RuntimeError(
-            f"`crow_indices[0] == 0` is not satisfied: {int(crow_indices[0].item())}"
-        )
-    last = int(crow_indices[nrows].item())
-    if last != nnz:
-        raise RuntimeError(f"`crow_indices[..., -1] == nnz` is not satisfied: {last} != {nnz}")
-    diffs = crow_indices[1:] - crow_indices[:-1]
-    if nrows and bool((diffs < 0).any().item()):
-        raise RuntimeError("`crow_indices` must be non-decreasing")
-    if nnz == 0:
-        return
-    lo = col_indices.min().item()
-    hi = col_indices.max().item()
-    if lo < 0 or hi >= int(size[1]):
-        raise RuntimeError(
-            f"`0 <= col_indices < size[1]` is not satisfied: range [{lo}, {hi}] "
-            f"against {int(size[1])} columns"
+    else:
+        tensorplay._C._validate_sparse_compressed_tensor_args(
+            compressed_indices,
+            plain_indices,
+            values,
+            list(size),
+            layout,
         )
 
 
@@ -133,12 +123,27 @@ def validate(tensor) -> None:
     if not tensor.is_sparse:
         raise RuntimeError("expected a sparse tensor")
     size = list(tensor.shape)
-    if tensor.layout == tensorplay.sparse_csr:
-        _validate_csr(
-            tensor.crow_indices(), tensor.col_indices(), tensor.values(), size
+    layout = int(tensor.layout)
+    if layout == int(tensorplay.sparse_coo):
+        _validate_coo(tensor._indices(), tensor.values(), size)
+    elif layout == int(tensorplay.sparse_csr):
+        _validate_compressed(
+            tensor.crow_indices(), tensor.col_indices(), tensor.values(), size, layout
+        )
+    elif layout == int(tensorplay.sparse_csc):
+        _validate_compressed(
+            tensor.ccol_indices(), tensor.row_indices(), tensor.values(), size, layout
+        )
+    elif layout == int(tensorplay.sparse_bsr):
+        _validate_compressed(
+            tensor.crow_indices(), tensor.col_indices(), tensor.values(), size, layout
+        )
+    elif layout == int(tensorplay.sparse_bsc):
+        _validate_compressed(
+            tensor.ccol_indices(), tensor.row_indices(), tensor.values(), size, layout
         )
     else:
-        _validate_coo(tensor._indices(), tensor.values(), size)
+        raise RuntimeError(f"unsupported sparse layout: {layout}")
 
 
 class check_sparse_tensor_invariants:
