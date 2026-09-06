@@ -639,27 +639,32 @@ std::tuple<Tensor, Tensor> mode_cpu(const Tensor& self, int64_t dim,
         const ctype* sp = sc.data_ptr<ctype>(); \
         ctype* vp = values.data_ptr<ctype>(); \
         int64_t* ip = indices.data_ptr<int64_t>(); \
-        for (int64_t si = 0; si < outer * inner; ++si) { \
-            const int64_t o = si / inner, in2 = si % inner; \
-            const ctype* src = sp + o * d_size * inner + in2; \
-            std::vector<std::pair<ctype, int64_t>> buf(d_size); \
-            for (int64_t j = 0; j < d_size; ++j) buf[j] = {src[j * inner], j}; \
-            std::sort(buf.begin(), buf.end(), [](const auto& a, const auto& b) { \
-                if (!(a.first < b.first) && !(b.first < a.first)) return a.second < b.second; \
-                return a.first < b.first; \
-            }); \
-            ctype best_value = buf[0].first; \
-            int64_t best_count = 0, best_index = buf[0].second, run = 0; \
-            for (int64_t j = 0; j < d_size; ++j) { \
-                const bool same = j > 0 && !(buf[j].first < buf[j - 1].first) && \
-                                  !(buf[j - 1].first < buf[j].first); \
-                run = same ? run + 1 : 1; \
-                if (run > best_count) { \
-                    best_count = run; best_value = buf[j].first; best_index = buf[j].second; \
+        const int64_t slice_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(d_size, 1)); \
+        parallel_for(0, outer * inner, slice_grain, [&](int64_t b, int64_t e) { \
+            using pair_t = std::pair<ctype, int64_t>; \
+            static thread_local std::vector<pair_t> buf; \
+            if (static_cast<int64_t>(buf.size()) < d_size) buf.resize(static_cast<size_t>(d_size)); \
+            for (int64_t si = b; si < e; ++si) { \
+                const int64_t o = si / inner, in2 = si % inner; \
+                const ctype* src = sp + o * d_size * inner + in2; \
+                for (int64_t j = 0; j < d_size; ++j) buf[j] = {src[j * inner], j}; \
+                std::sort(buf.begin(), buf.begin() + d_size, [](const auto& a, const auto& b) { \
+                    if (!(a.first < b.first) && !(b.first < a.first)) return a.second < b.second; \
+                    return a.first < b.first; \
+                }); \
+                ctype best_value = buf[0].first; \
+                int64_t best_count = 0, best_index = buf[0].second, run = 0; \
+                for (int64_t j = 0; j < d_size; ++j) { \
+                    const bool same = j > 0 && !(buf[j].first < buf[j - 1].first) && \
+                                      !(buf[j - 1].first < buf[j].first); \
+                    run = same ? run + 1 : 1; \
+                    if (run > best_count) { \
+                        best_count = run; best_value = buf[j].first; best_index = buf[j].second; \
+                    } \
                 } \
+                vp[si] = best_value; ip[si] = best_index; \
             } \
-            vp[si] = best_value; ip[si] = best_index; \
-        } \
+        }); \
         break; \
     }
     switch (sc.dtype()) {
