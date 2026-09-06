@@ -682,6 +682,10 @@ def _build_pointwise_program(
     output_override: Node | None = None,
     allow_empty: bool = False,
     opcodes: dict[str, int] | None = None,
+    nodes: list[Node] | None = None,
+    extra_refs: dict[Node, int] | None = None,
+    input_slots: int | None = None,
+    constants: list[float] | None = None,
 ) -> tuple[list[Node], list[int], list[float], list[tuple[str, int, int, int]], int] | None:
     """Encode one canonical pointwise graph as Stax's postfix program.
 
@@ -689,6 +693,12 @@ def _build_pointwise_program(
     reduction-epilogue path, which folds a full-reduction ``sum`` tail into
     the kernel instead of lowering it as an op), with ``output_override``
     naming the program's result node.
+
+    ``nodes`` narrows the walk to one ordered slice of the region, with
+    ``extra_refs`` naming values the slice may read but does not compute and
+    ``input_slots`` widening the reference space those extra names live in.
+    A caller passing ``constants`` accumulates into it, so several slices of
+    one region share a single constant pool and a single reference space.
 
     ``opcodes`` selects the target opcode table: the CPU fused interpreter
     supports the base table only, while the Triton code generator accepts
@@ -701,14 +711,15 @@ def _build_pointwise_program(
     table = _TRITON_OPCODES if opcodes is None else opcodes
 
     external_nodes = list(graph_module.graph.placeholders)
+    base = len(external_nodes) if input_slots is None else int(input_slots)
     refs: dict[Node, int] = {
         node: index for index, node in enumerate(external_nodes)
     }
-    ref_types: dict[int, str] = {
-        index: "num" for index in range(len(external_nodes))
-    }
+    refs.update(extra_refs or {})
+    ref_types: dict[int, str] = {index: "num" for index in range(base)}
     program: list[int] = []
-    constants: list[float] = []
+    if constants is None:
+        constants = []
     instructions: list[tuple[str, int, int, int]] = []
     temp_count = 0
 
@@ -734,12 +745,12 @@ def _build_pointwise_program(
         if code is None:
             return None
         program.extend((code, lhs, rhs))
-        result = len(external_nodes) + temp_count
+        result = base + temp_count
         temp_count += 1
         instructions.append((op_name, lhs, rhs, result))
         return result
 
-    for node in graph_module.graph.nodes:
+    for node in graph_module.graph.nodes if nodes is None else nodes:
         if node is skip_node:
             continue
         if node.op in {"placeholder", "output"}:
@@ -1359,6 +1370,339 @@ def _lower_cpu_fused_reduction(
         runner,
         direct,
         out_shape,
+        strict_native,
+    )
+
+
+def _elem_dependencies(target: Node, kinds: dict[Node, str]) -> list[Node]:
+    """Order the elementwise nodes one value depends on, producers first.
+
+    Placeholders and row values are read through references rather than
+    recomputed, so they end the walk.  A node reached from two stages appears
+    in both of their orders: each stage re-evaluates it while the row is still
+    in cache, which is cheaper than the memory traffic of materializing it.
+    """
+
+    if target.op == "placeholder":
+        return []
+    order: list[Node] = []
+    seen: set[Node] = set()
+    stack: list[tuple[Node, bool]] = [(target, False)]
+    while stack:
+        node, expanded = stack.pop()
+        if expanded:
+            order.append(node)
+            continue
+        if node in seen:
+            continue
+        seen.add(node)
+        stack.append((node, True))
+        operands = list(_nodes(node.args)) + list(_nodes(node.kwargs or {}))
+        for operand in operands:
+            if kinds.get(operand) == "elem" and operand.op != "placeholder":
+                if operand not in seen:
+                    stack.append((operand, False))
+    return order
+
+
+def _plan_row_fusion(
+    graph_module: GraphModule,
+    in_shape: tuple[int, ...],
+    input_shapes: tuple[tuple[int, ...], ...],
+) -> Any:
+    """Split a region into row stages, or return ``None``.
+
+    A node is *elementwise* when it carries one value per input element and
+    *row-valued* when it carries one value per row: reductions over the
+    trailing axis turn the former into the latter, and every later stage may
+    read row values as broadcasts.  The region qualifies when at least one
+    such reduction exists and every node lands in one of the two classes.
+    """
+
+    from .codegen.cpp_rowfusion import ROW_OPS, RowFusion, RowStep, _ROW_UNARY
+
+    rank = len(in_shape)
+    if rank < 2 or any(int(extent) <= 0 for extent in in_shape):
+        return None
+    extent = int(in_shape[-1])
+    rows = 1
+    for size in in_shape[:-1]:
+        rows *= int(size)
+
+    placeholders = list(graph_module.graph.placeholders)
+    if not placeholders or len(placeholders) != len(input_shapes):
+        return None
+    # Every input has to span the reduced axis: a value that is constant along
+    # it would be row-valued, and the classification below assumes it is not.
+    for shape in input_shapes:
+        if len(shape) > rank:
+            return None
+        aligned = (1,) * (rank - len(shape)) + tuple(int(size) for size in shape)
+        if aligned[-1] != extent:
+            return None
+
+    output_values = [
+        value
+        for output in graph_module.graph.outputs
+        for value in _nodes(output.args)
+    ]
+    if len(output_values) != 1 or not isinstance(output_values[0], Node):
+        return None
+    target = output_values[0]
+    if target.op == "placeholder":
+        return None
+
+    kinds: dict[Node, str] = {node: "elem" for node in placeholders}
+    row_shapes: dict[Node, tuple[int, ...]] = {}
+    slots: dict[Node, int] = {}
+    staged: list[tuple[str, Node, Any]] = []
+    for node in graph_module.graph.nodes:
+        if node.op in {"placeholder", "output"}:
+            continue
+        if node.op not in {"call_function", "call_method"}:
+            return None
+        spec = _parse_reduction(node, rank)
+        if spec is not None:
+            normalized = spec.normalized(rank)
+            if normalized is None or normalized.dims != (rank - 1,):
+                return None
+            source = node.args[0]
+            if not isinstance(source, Node) or kinds.get(source) != "elem":
+                return None
+            kinds[node] = "row"
+            slots[node] = len(slots)
+            row_shapes[node] = (
+                tuple(in_shape[:-1]) + (1,)
+                if normalized.keepdim
+                else tuple(in_shape[:-1])
+            )
+            staged.append(("reduce", node, normalized))
+            continue
+        operands = list(_nodes(node.args)) + list(_nodes(node.kwargs or {}))
+        if any(operand not in kinds for operand in operands):
+            return None
+        if not operands or any(kinds[operand] == "elem" for operand in operands):
+            kinds[node] = "elem"
+            continue
+        name = _target_name(node.target)
+        if name not in ROW_OPS or (node.kwargs or {}):
+            return None
+        arity = 1 if name in _ROW_UNARY else 2
+        if len(node.args) != arity:
+            return None
+        if any(
+            not isinstance(arg, Node) and not _is_scalar(arg)
+            for arg in node.args
+        ):
+            return None
+        shapes = {
+            row_shapes[arg] for arg in node.args if isinstance(arg, Node)
+        }
+        if len(shapes) != 1:
+            return None
+        kinds[node] = "row"
+        slots[node] = len(slots)
+        row_shapes[node] = next(iter(shapes))
+        staged.append(("rowop", node, name))
+
+    if not slots or not any(entry[0] == "reduce" for entry in staged):
+        return None
+    # A row value an elementwise stage reads has to broadcast along the
+    # reduced axis, which is what the kept trailing dimension expresses.
+    keep = tuple(in_shape[:-1]) + (1,)
+    for node in slots:
+        if any(kinds.get(user) == "elem" for user in node.users):
+            if row_shapes[node] != keep:
+                return None
+
+    input_count = len(placeholders)
+    total_inputs = input_count + len(slots)
+    extra_refs = {node: input_count + slot for node, slot in slots.items()}
+    constants: list[float] = []
+
+    def elem_program(node: Node) -> Any:
+        try:
+            return _build_pointwise_program(
+                graph_module,
+                output_override=node,
+                allow_empty=True,
+                opcodes=_TRITON_OPCODES,
+                nodes=_elem_dependencies(node, kinds),
+                extra_refs=extra_refs,
+                input_slots=total_inputs,
+                constants=constants,
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return None
+
+    def row_operand(value: Any) -> int | None:
+        if isinstance(value, Node):
+            return extra_refs.get(value)
+        if not _is_scalar(value):
+            return None
+        constants.append(float(value))
+        return -len(constants)
+
+    steps: list[Any] = []
+    for entry_kind, node, payload in staged:
+        if entry_kind == "reduce":
+            built = elem_program(node.args[0])
+            if built is None:
+                return None
+            instructions, output_ref = built[3], built[4]
+            steps.append(
+                RowStep(
+                    kind="reduce",
+                    slot=slots[node],
+                    op=payload.op,
+                    instructions=tuple(instructions),
+                    output_ref=output_ref,
+                )
+            )
+            continue
+        lhs = row_operand(node.args[0])
+        rhs = -1 if payload in _ROW_UNARY else row_operand(node.args[1])
+        if lhs is None or rhs is None:
+            return None
+        steps.append(
+            RowStep(kind="rowop", slot=slots[node], op=payload, lhs=lhs, rhs=rhs)
+        )
+
+    if kinds[target] == "elem":
+        built = elem_program(target)
+        if built is None:
+            return None
+        out_instructions, out_ref = built[3], built[4]
+        if not out_instructions:
+            return None
+        output_kind = "elem"
+        out_shape = tuple(int(size) for size in in_shape)
+    else:
+        output_kind = "row"
+        out_instructions = []
+        out_ref = extra_refs[target]
+        out_shape = row_shapes[target]
+
+    return RowFusion(
+        input_count=input_count,
+        row_slots=len(slots),
+        constants=tuple(constants),
+        steps=tuple(steps),
+        output_kind=output_kind,
+        out_instructions=tuple(out_instructions),
+        out_ref=out_ref,
+        reduce_extent=extent,
+        rows=rows,
+        in_shape=tuple(int(size) for size in in_shape),
+        out_shape=tuple(int(size) for size in out_shape),
+    )
+
+
+class _CpuRowFusionLowering(_CpuFusedReductionLowering):
+    """Executable wrapper for a row-staged CPU kernel.
+
+    The route contract is the reduction kernel's: one compiled specialization
+    that owns the whole region, allocates its output, and declines anything
+    outside the layouts it was built for.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._tensorplay_codegen = "stax-fused-cpu-rowfuse"
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return super().__call__(*args, **kwargs)
+        except RuntimeError as error:
+            if "fused CPU reduction" in str(error):
+                raise RuntimeError(
+                    "Stax row-staged CPU kernel received inputs outside its "
+                    "compiled specialization"
+                ) from None
+            raise
+
+
+def _lower_cpu_row_fusion(
+    graph_module: GraphModule,
+    example_inputs: list[Any],
+    *,
+    strict_native: bool = False,
+    dynamic: bool = False,
+) -> Any:
+    """Build one CPU kernel for a region with reductions in the middle.
+
+    The reduction results feed elementwise work over the same axis they were
+    reduced along, so the region cannot be expressed as a pointwise program
+    or as a pointwise program ending in a reduction.  Staging it per row keeps
+    every intermediate in cache instead of writing it out and reading it back.
+    """
+
+    if dynamic:
+        return None
+    try:
+        import tensorplay
+
+        tensor_type = tensorplay.Tensor
+    except (AttributeError, ImportError):
+        return None
+    if not example_inputs or any(
+        not isinstance(value, tensor_type) for value in example_inputs
+    ):
+        return None
+    first = example_inputs[0]
+    if (
+        not first.device.is_cpu()
+        or first.dtype != tensorplay.float32
+        or not first.is_contiguous()
+    ):
+        return None
+    if any(
+        value.device != first.device
+        or value.dtype != first.dtype
+        or not value.is_contiguous()
+        for value in example_inputs[1:]
+    ):
+        return None
+    if any(value.requires_grad for value in example_inputs):
+        return None
+
+    input_shapes = tuple(
+        tuple(int(item) for item in value.shape) for value in example_inputs
+    )
+    input_strides = tuple(
+        tuple(int(item) for item in value.stride()) for value in example_inputs
+    )
+    in_shape = _broadcast_shape(input_shapes)
+    if in_shape is None or not in_shape:
+        return None
+
+    fusion = _plan_row_fusion(graph_module, in_shape, input_shapes)
+    if fusion is None:
+        return None
+
+    try:
+        from .codegen.cpp_rowfusion import build_cpu_row_fusion_kernel
+
+        built = build_cpu_row_fusion_kernel(
+            fusion,
+            device=first.device,
+            input_shapes=input_shapes,
+            input_strides=input_strides,
+        )
+    except Exception:
+        built = None
+    if built is None:
+        return None
+    runner, direct = built
+
+    return _CpuRowFusionLowering(
+        graph_module,
+        first.dtype,
+        first.device,
+        tuple(zip(input_shapes, input_strides)),
+        runner,
+        direct,
+        fusion.out_shape,
         strict_native,
     )
 
@@ -3268,6 +3612,18 @@ def stax(
         if fused_cpu_reduction is not None:
             graph_module._stax_codegen = "stax-fused-cpu-reduce"
             return fused_cpu_reduction
+        # A region whose reductions sit in the middle stages per row: each
+        # reduction folds the row to one value that the following work reads
+        # as a broadcast, so the region still reads its inputs once.
+        row_fused_cpu = _lower_cpu_row_fusion(
+            graph_module,
+            example_inputs,
+            strict_native=strict_native,
+            dynamic=bool(dynamic is True),
+        )
+        if row_fused_cpu is not None:
+            graph_module._stax_codegen = "stax-fused-cpu-rowfuse"
+            return row_fused_cpu
     if use_native and use_triton:
         # Keep Triton optional and lazy.  Importing tensorplay on a CPU-only
         # machine must not import Triton or its compiler toolchain.

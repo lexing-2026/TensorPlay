@@ -492,8 +492,9 @@ def emit_value_program(
     full vector, a runtime ``count`` for a masked tail).  ``suffix``
     disambiguates the temporaries of independent evaluations that coexist in
     one scope, which is how the unrolled accumulator groups keep separate
-    dependency chains.  ``splat`` inputs resolve to the hoisted broadcast and
-    are not reloaded.
+    dependency chains.  ``splat`` inputs resolve to the hoisted broadcast
+    and ``rowval`` inputs to the enclosing loop's per-row value; neither
+    is reloaded.
 
     Returns the emitted lines and the identifier holding the program result,
     so a caller can feed it straight into an accumulator combine instead of
@@ -504,14 +505,19 @@ def emit_value_program(
 
     def name(ref: int) -> str:
         if ref < input_count:
-            if input_modes[ref][0] == "splat":
+            mode, slot = input_modes[ref]
+            if mode == "splat":
                 return f"h{ref}"
+            if mode == "rowval":
+                # A value the enclosing loop already reduced to one number per
+                # row; it enters the expression as a broadcast, never a load.
+                return f"s{slot}"
             return f"x{ref}{suffix}"
         return f"t{ref - input_count}{suffix}"
 
     for ref in sorted(used_inputs):
         mode, width = input_modes[ref]
-        if mode == "splat":
+        if mode in ("splat", "rowval"):
             continue
         if mode == "colmod":
             address = f"in{ref} + (({offset}) % {width})"
