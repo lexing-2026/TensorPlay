@@ -25,6 +25,7 @@
 #include <optional>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 namespace tensorplay {
 namespace composite {
@@ -166,7 +167,24 @@ Tensor& log_sigmoid_out_native(const Tensor& self, Tensor& out) {
 }
 
 Tensor& logcumsumexp_out_native(const Tensor& self, int64_t dim, Tensor& out) {
-    out = ops::logcumsumexp(self, dim);
+    if (out.defined()) {
+        if (out.dtype() != self.dtype()) {
+            TP_THROW(RuntimeError, "logcumsumexp: output dtype must match input dtype");
+        }
+        if (out.device() != self.device()) {
+            TP_THROW(RuntimeError, "logcumsumexp: output device must match input device");
+        }
+    }
+    const Tensor value = ops::logcumsumexp(self, dim);
+    if (!out.defined()) {
+        out = value;
+        return out;
+    }
+    const auto target = static_cast<std::vector<int64_t>>(value.shape());
+    if (static_cast<std::vector<int64_t>>(out.shape()) != target) {
+        out.resize_(target);
+    }
+    out.copy_(value);
     return out;
 }
 

@@ -141,6 +141,14 @@ Tensor _logcumsumexp_native(const Tensor& self, int64_t dim) {
 }
 
 Tensor& _logcumsumexp_out_native(const Tensor& self, int64_t dim, Tensor& out) {
+    if (out.defined()) {
+        if (out.dtype() != self.dtype()) {
+            TP_THROW(RuntimeError, "logcumsumexp: output dtype must match input dtype");
+        }
+        if (out.device() != self.device()) {
+            TP_THROW(RuntimeError, "logcumsumexp: output device must match input device");
+        }
+    }
     const Tensor value = ops::logcumsumexp(self, dim, std::nullopt);
     if (!out.defined()) {
         out = value;
