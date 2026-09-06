@@ -799,7 +799,19 @@ Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
     Tensor idx = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
     int64_t n_idx = idx.numel();
     int64_t row = self.size(dim);
-    const int64_t* ip = idx.data_ptr<int64_t>();
+    Tensor normalized = Tensor::empty({n_idx}, DType::Int64, index.device());
+    const int64_t* raw_ip = idx.data_ptr<int64_t>();
+    int64_t* normalized_ip = normalized.data_ptr<int64_t>();
+    parallel_for(0, n_idx, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            const int64_t value = raw_ip[i];
+            if (value < 0 || value >= row) {
+                TP_THROW(IndexError, "index_select: index out of range");
+            }
+            normalized_ip[i] = value;
+        }
+    });
+    const int64_t* ip = normalized.data_ptr<int64_t>();
     int64_t outer = 1, inner = 1;
     outer_inner(static_cast<std::vector<int64_t>>(self.shape()), dim, outer, inner);
     std::vector<int64_t> out_shape(static_cast<std::vector<int64_t>>(self.shape()));
@@ -817,9 +829,7 @@ Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
                     const ctype* src_row = s + o * row; \
                     ctype* dst_row = d + o * n_idx; \
                     for (int64_t k = 0; k < n_idx; ++k) { \
-                        int64_t iv = ip[k]; if (iv < 0) iv += row; \
-                        if (iv < 0 || iv >= row) TP_THROW(IndexError, "index_select: index out of range"); \
-                        dst_row[k] = src_row[iv]; \
+                        dst_row[k] = src_row[ip[k]]; \
                     } \
                 } \
             }); \
@@ -828,9 +838,7 @@ Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
             parallel_for(0, outer * n_idx, slice_grain, [&](int64_t b, int64_t e) { \
                 for (int64_t t = b; t < e; ++t) { \
                     int64_t o = t / n_idx, k = t % n_idx; \
-                    int64_t iv = ip[k]; if (iv < 0) iv += row; \
-                    if (iv < 0 || iv >= row) TP_THROW(IndexError, "index_select: index out of range"); \
-                    std::memcpy(d + static_cast<int64_t>(t) * inner, s + (o * row + iv) * inner, inner * sizeof(ctype)); \
+                    std::memcpy(d + static_cast<int64_t>(t) * inner, s + (o * row + ip[k]) * inner, inner * sizeof(ctype)); \
                 } \
             }); \
         } \
