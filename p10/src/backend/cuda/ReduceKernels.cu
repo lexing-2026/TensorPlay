@@ -214,22 +214,16 @@ Tensor logsumexp_cuda2(const Tensor& self, int64_t dim, bool keepdim) {
     if (isIntegralType(sc.dtype(), true)) {
         sc = sc.to(globalContext().defaultDType());
     }
-    const DType output_dtype = sc.dtype();
-    if (isFloat8Type(output_dtype)) {
-        sc = sc.to(DType::Float32);
-    }
     const std::vector<int64_t> dims{dim};
     if (sc.numel() == 0) {
-        Tensor result = sum_dim_kernel(sc.exp(), dims, keepdim, sc.dtype()).log();
-        return result.dtype() == output_dtype ? result : result.to(output_dtype);
+        return sum_dim_kernel(sc.exp(), dims, keepdim, sc.dtype()).log();
     }
     Tensor max_keep = amax_dim_kernel(sc, dims, true);
     const Scalar infinity(std::numeric_limits<double>::infinity());
     Tensor safe_max = Tensor::where(max_keep.abs().eq(infinity), Scalar(0), max_keep);
     Tensor summed = sum_dim_kernel((sc - safe_max).exp(), dims, keepdim, sc.dtype());
     Tensor result = summed.log();
-    result = result + (keepdim ? safe_max : safe_max.squeeze(dim));
-    return result.dtype() == output_dtype ? result : result.to(output_dtype);
+    return result + (keepdim ? safe_max : safe_max.squeeze(dim));
 }
 Tensor count_nonzero_cuda2(const Tensor& self, const std::vector<int64_t>& dim) {
     Tensor reduce = self.dtype() == DType::Bool
