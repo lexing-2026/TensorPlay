@@ -3026,14 +3026,6 @@ Tensor argsort_cuda(const Tensor& self, int64_t dim, bool descending) {
 // ---------------------------------------------------------------------------
 namespace {
 
-template <typename T>
-__global__ void unique_flags_kernel(int64_t n, const T* __restrict__ sorted,
-                                    int64_t* __restrict__ flags) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    flags[i] = (i == 0 || sorted[i] != sorted[i - 1]) ? 1 : 0;
-}
-
 __global__ void unique_inverse_kernel(int64_t n, const int64_t* __restrict__ order,
                                       const int64_t* __restrict__ gid,
                                       int64_t* __restrict__ inverse) {
@@ -3052,15 +3044,6 @@ __global__ void unique_emit_kernel(int64_t n, const T* __restrict__ sorted,
     const int64_t g = gid_inclusive[i] - 1;
     values[g] = sorted[i];
     if (starts != nullptr) starts[g] = i;
-}
-
-__global__ void unique_counts_kernel(int64_t num_groups, int64_t n,
-                                     const int64_t* __restrict__ starts,
-                                     int64_t* __restrict__ counts) {
-    int64_t g = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (g >= num_groups) return;
-    const int64_t end = (g + 1 < num_groups) ? starts[g + 1] : n;
-    counts[g] = end - starts[g];
 }
 
 } // namespace
@@ -3087,11 +3070,14 @@ std::tuple<Tensor, Tensor, Tensor> unique_cuda(const Tensor& self, bool sorted,
 
     Tensor flags = Tensor::zeros({n}, DType::Int64, self.device());
 
-    #define UNIQUE_FLAGS_CASE(ctype, name)                                     \
-    case DType::name:                                                          \
-        unique_flags_kernel<ctype><<<blocks, threads>>>(                        \
-            n, sorted_vals.data_ptr<ctype>(), flags.data_ptr<int64_t>());      \
-        break;
+    #define UNIQUE_FLAGS_CASE(ctype, name)                                      \
+    case DType::name: {                                                         \
+        const ctype* sorted = sorted_vals.data_ptr<ctype>();                    \
+        gpu_kernel_with_index(flags, [=] GPU_LAMBDA(int64_t i) -> int64_t {     \
+            return (i == 0 || sorted[i] != sorted[i - 1]) ? 1 : 0;              \
+        });                                                                      \
+        break;                                                                   \
+    }
 
     switch (self.dtype()) {
         UNIQUE_FLAGS_CASE(float, Float32)
@@ -3161,11 +3147,11 @@ std::tuple<Tensor, Tensor, Tensor> unique_cuda(const Tensor& self, bool sorted,
     CUDA_CHECK(cudaGetLastError());
 
     if (return_counts) {
-        const int count_blocks =
-            static_cast<int>((num_groups + threads - 1) / threads);
-        unique_counts_kernel<<<count_blocks, threads>>>(
-            num_groups, n, starts_ptr, counts.data_ptr<int64_t>());
-        CUDA_CHECK(cudaGetLastError());
+        gpu_kernel_with_index(
+            counts, [=] GPU_LAMBDA(int64_t g) -> int64_t {
+                const int64_t end = (g + 1 < num_groups) ? starts_ptr[g + 1] : n;
+                return end - starts_ptr[g];
+            });
     }
     return std::make_tuple(values, inverse, counts);
 }
