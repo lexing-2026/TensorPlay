@@ -1,4 +1,5 @@
 #include "Tensor.h"
+#include "Complex.h"
 #include "Dispatcher.h"
 #include "Utils.h"
 #include "ErrorReporting.h"
@@ -275,7 +276,7 @@ Tensor complex_abs_kernel(const Tensor& self) {
 
     switch (self.dtype()) {
         case DType::ComplexFloat: {
-            using c_t = std::complex<float>;
+            using c_t = tensorplay::complex<float>;
             const c_t* src = reinterpret_cast<const c_t*>(self_contig.data_ptr());
             float* dst = result.data_ptr<float>();
             parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
@@ -286,7 +287,7 @@ Tensor complex_abs_kernel(const Tensor& self) {
             break;
         }
         case DType::ComplexDouble: {
-            using c_t = std::complex<double>;
+            using c_t = tensorplay::complex<double>;
             const c_t* src = reinterpret_cast<const c_t*>(self_contig.data_ptr());
             double* dst = result.data_ptr<double>();
             parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
@@ -300,8 +301,8 @@ Tensor complex_abs_kernel(const Tensor& self) {
         case DType::BComplex32: {
             // Reduced complexes compute the magnitude in float32.
             if (self.dtype() == DType::ComplexHalf) {
-                const std::complex<Half>* src =
-                    reinterpret_cast<const std::complex<Half>*>(self_contig.data_ptr());
+                const tensorplay::complex<Half>* src =
+                    reinterpret_cast<const tensorplay::complex<Half>*>(self_contig.data_ptr());
                 Half* dst = result.data_ptr<Half>();
                 parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
                     for (int64_t i = begin; i < end; ++i) {
@@ -311,8 +312,8 @@ Tensor complex_abs_kernel(const Tensor& self) {
                     }
                 });
             } else {
-                const std::complex<BFloat16>* src =
-                    reinterpret_cast<const std::complex<BFloat16>*>(self_contig.data_ptr());
+                const tensorplay::complex<BFloat16>* src =
+                    reinterpret_cast<const tensorplay::complex<BFloat16>*>(self_contig.data_ptr());
                 BFloat16* dst = result.data_ptr<BFloat16>();
                 parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
                     for (int64_t i = begin; i < end; ++i) {
@@ -423,7 +424,7 @@ Tensor round_kernel(const Tensor& self) {
 // Float ops
 //
 // the complex dtypes (see docs/source/complex_numbers.md).  Complex inputs
-// route through complex_unary_op_kernel with std::complex math or the
+// route through complex_unary_op_kernel with local complex math or the
 // formulas above; real dtypes keep the vectorized paths.
 
 
@@ -449,79 +450,79 @@ static Tensor cplx_unary_vec(const Tensor& self, veccomplex::Op op, F fb) {
 Tensor acos_kernel(const Tensor& self) {
     if (isComplexType(self.dtype()))
         return cplx_unary_vec(self, veccomplex::Op::Acos,
-                              [](auto x) { return std::acos(x);  });
+                              [](auto x) { return tensorplay::acos(x);  });
     return unary_float_op_kernel(self, [](auto x) { return std::acos(x); }, vecunary::VOp::Acos);
 }
 Tensor acosh_kernel(const Tensor& self) {
     if (isComplexType(self.dtype()))
         return cplx_unary_vec(self, veccomplex::Op::Acosh,
-                              [](auto x) { return std::acosh(x);  });
+                              [](auto x) { return tensorplay::acosh(x);  });
     return unary_float_op_kernel(self, [](auto x) { return std::acosh(x); }, vecunary::VOp::Acosh);
 }
 Tensor asin_kernel(const Tensor& self) {
     if (isComplexType(self.dtype()))
         return cplx_unary_vec(self, veccomplex::Op::Asin,
-                              [](auto x) { return std::asin(x);  });
+                              [](auto x) { return tensorplay::asin(x);  });
     return unary_float_op_kernel(self, [](auto x) { return std::asin(x); }, vecunary::VOp::Asin);
 }
 Tensor asinh_kernel(const Tensor& self) {
     if (isComplexType(self.dtype()))
         return cplx_unary_vec(self, veccomplex::Op::Asinh,
-                              [](auto x) { return std::asinh(x);  });
+                              [](auto x) { return tensorplay::asinh(x);  });
     return unary_float_op_kernel(self, [](auto x) { return std::asinh(x); }, vecunary::VOp::Asinh);
 }
 Tensor atan_kernel(const Tensor& self) {
     if (isComplexType(self.dtype()))
         return cplx_unary_vec(self, veccomplex::Op::Atan,
-                              [](auto x) { return std::atan(x);  });
+                              [](auto x) { return tensorplay::atan(x);  });
     return unary_float_op_kernel(self, [](auto x) { return std::atan(x); }, vecunary::VOp::Atan);
 }
 Tensor atanh_kernel(const Tensor& self) {
     if (isComplexType(self.dtype()))
         return cplx_unary_vec(self, veccomplex::Op::Atanh,
-                              [](auto x) { return std::atanh(x);  });
+                              [](auto x) { return tensorplay::atanh(x);  });
     return unary_float_op_kernel(self, [](auto x) { return std::atanh(x); }, vecunary::VOp::Atanh);
 }
 Tensor cos_kernel(const Tensor& self) {
     if (isComplexType(self.dtype()))
         return cplx_unary_vec(self, veccomplex::Op::Cos,
-                              [](auto x) { return std::cos(x);  });
+                              [](auto x) { return tensorplay::cos(x);  });
     return unary_float_op_kernel(self, [](auto x) { return std::cos(x); }, vecunary::VOp::Cos);
 }
 Tensor cosh_kernel(const Tensor& self) {
     if (isComplexType(self.dtype()))
         return cplx_unary_vec(self, veccomplex::Op::Cosh,
-                              [](auto x) { return std::cosh(x);  });
+                              [](auto x) { return tensorplay::cosh(x);  });
     return unary_float_op_kernel(self, [](auto x) { return std::cosh(x); }, vecunary::VOp::Cosh);
 }
 Tensor sin_kernel(const Tensor& self) {
     if (isComplexType(self.dtype()))
         return cplx_unary_vec(self, veccomplex::Op::Sin,
-                              [](auto x) { return std::sin(x);  });
+                              [](auto x) { return tensorplay::sin(x);  });
     return unary_float_op_kernel(self, [](auto x) { return std::sin(x); }, vecunary::VOp::Sin);
 }
 Tensor sinh_kernel(const Tensor& self) {
     if (isComplexType(self.dtype()))
         return cplx_unary_vec(self, veccomplex::Op::Sinh,
-                              [](auto x) { return std::sinh(x);  });
+                              [](auto x) { return tensorplay::sinh(x);  });
     return unary_float_op_kernel(self, [](auto x) { return std::sinh(x); }, vecunary::VOp::Sinh);
 }
 Tensor tan_kernel(const Tensor& self) {
     if (isComplexType(self.dtype()))
         return cplx_unary_vec(self, veccomplex::Op::Tan,
-                              [](auto x) { return std::tan(x);  });
+                              [](auto x) { return tensorplay::tan(x);  });
     return unary_float_op_kernel(self, [](auto x) { return std::tan(x); }, vecunary::VOp::Tan);
 }
 Tensor tanh_kernel(const Tensor& self) {
     if (isComplexType(self.dtype()))
         return cplx_unary_vec(self, veccomplex::Op::Tanh,
-                              [](auto x) { return std::tanh(x);  });
+                              [](auto x) { return tensorplay::tanh(x);  });
     return unary_float_op_kernel(self, [](auto x) { return std::tanh(x); }, vecunary::VOp::Tanh);
 }
 Tensor exp_kernel(const Tensor& self) {
     if (isComplexType(self.dtype()))
         return cplx_unary_vec(self, veccomplex::Op::Exp,
-                              [](auto x) { return std::exp(x);  });
+                              [](auto x) { return tensorplay::exp(x);  });
     return unary_float_op_kernel(self, [](auto x) { return std::exp(x); }, vecunary::VOp::Exp);
 }
 Tensor expm1_kernel(const Tensor& self) {
@@ -535,13 +536,13 @@ Tensor erfc_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](a
 Tensor log_kernel(const Tensor& self) {
     if (isComplexType(self.dtype()))
         return cplx_unary_vec(self, veccomplex::Op::Log,
-                              [](auto x) { return std::log(x);  });
+                              [](auto x) { return tensorplay::log(x);  });
     return unary_float_op_kernel(self, [](auto x) { return std::log(x); }, vecunary::VOp::Log);
 }
 Tensor log10_kernel(const Tensor& self) {
     if (isComplexType(self.dtype()))
         return cplx_unary_vec(self, veccomplex::Op::Log10,
-                              [](auto x) { return std::log10(x);  });
+                              [](auto x) { return tensorplay::log10(x);  });
     return unary_float_op_kernel(self, [](auto x) { return std::log10(x); }, vecunary::VOp::Log10);
 }
 Tensor log1p_kernel(const Tensor& self) {
@@ -560,7 +561,7 @@ Tensor lgamma_kernel(const Tensor& self) { return unary_float_op_kernel(self, []
 Tensor sqrt_kernel(const Tensor& self) {
     if (isComplexType(self.dtype()))
         return cplx_unary_vec(self, veccomplex::Op::Sqrt,
-                              [](auto x) { return std::sqrt(x);  });
+                              [](auto x) { return tensorplay::sqrt(x);  });
     return unary_float_op_kernel(self, [](auto x) { return std::sqrt(x); }, vecunary::VOp::Sqrt);
 }
 Tensor rsqrt_kernel(const Tensor& self) {
@@ -1354,21 +1355,23 @@ Tensor pow_scalar_kernel(const Tensor& self, Scalar exponent) {
             if (ev == 3.0) return complex_unary_op_kernel(base, [](auto x) { return x * x * x; });
             return complex_unary_op_kernel(base, [ev](auto x) {
                 using V = typename decltype(x)::value_type;
-                return std::pow(x, static_cast<V>(ev));
+                return tensorplay::pow(x, static_cast<V>(ev));
             });
         }
         // Complex exponent: promote the scalar into the result dtype once.
         if (result_dtype == DType::ComplexDouble) {
-            auto e = exponent.to<std::complex<double>>();
+            auto e = exponent.to<tensorplay::complex<double>>();
             return complex_unary_op_kernel(base, [e](auto x) {
                 using V = typename decltype(x)::value_type;
-                return std::pow(x, static_cast<std::complex<V>>(e));
+                return tensorplay::pow(
+                    x, tensorplay::complex<V>(static_cast<V>(e.real()), static_cast<V>(e.imag())));
             });
         }
-        auto e = exponent.to<std::complex<float>>();
+        auto e = exponent.to<tensorplay::complex<float>>();
         return complex_unary_op_kernel(base, [e](auto x) {
             using V = typename decltype(x)::value_type;
-            return std::pow(x, static_cast<std::complex<V>>(e));
+            return tensorplay::pow(
+                x, tensorplay::complex<V>(static_cast<V>(e.real()), static_cast<V>(e.imag())));
         });
     }
     if (isIntegralType(self.dtype()) && exponent.isIntegral() && exponent.to<int64_t>() < 0) {
@@ -1439,8 +1442,8 @@ Tensor angle_kernel(const Tensor& self) {
             case DType::BComplex32: {
                 // Reduced complexes compute in float32.
                 if (self.dtype() == DType::ComplexHalf) {
-                    const std::complex<Half>* src =
-                        reinterpret_cast<const std::complex<Half>*>(self_contig.data_ptr());
+                    const tensorplay::complex<Half>* src =
+                        reinterpret_cast<const tensorplay::complex<Half>*>(self_contig.data_ptr());
                     Half* dst = result.data_ptr<Half>();
                     parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
                         for (int64_t i = begin; i < end; ++i) {
@@ -1450,8 +1453,8 @@ Tensor angle_kernel(const Tensor& self) {
                         }
                     });
                 } else {
-                    const std::complex<BFloat16>* src =
-                        reinterpret_cast<const std::complex<BFloat16>*>(self_contig.data_ptr());
+                    const tensorplay::complex<BFloat16>* src =
+                        reinterpret_cast<const tensorplay::complex<BFloat16>*>(self_contig.data_ptr());
                     BFloat16* dst = result.data_ptr<BFloat16>();
                     parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
                         for (int64_t i = begin; i < end; ++i) {
@@ -1464,7 +1467,7 @@ Tensor angle_kernel(const Tensor& self) {
                 break;
             }
             case DType::ComplexFloat: {
-                using c_t = std::complex<float>;
+                using c_t = tensorplay::complex<float>;
                 const c_t* src = reinterpret_cast<const c_t*>(self_contig.data_ptr());
                 float* dst = result.data_ptr<float>();
                 parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
@@ -1475,7 +1478,7 @@ Tensor angle_kernel(const Tensor& self) {
                 break;
             }
             case DType::ComplexDouble: {
-                using c_t = std::complex<double>;
+                using c_t = tensorplay::complex<double>;
                 const c_t* src = reinterpret_cast<const c_t*>(self_contig.data_ptr());
                 double* dst = result.data_ptr<double>();
                 parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
@@ -2141,7 +2144,7 @@ Tensor pow_tensor_tensor_kernel(const Tensor& self, const Tensor& exponent) {
     Tensor exp_c = (exponent.dtype() == result_dtype) ? exponent : exponent.to(result_dtype);
 
     if (isComplexType(result_dtype)) {
-        // and narrow back (std::<complex> internals assume a real float type).
+        // Reduced-width values compute in full precision before narrowing.
         if (result_dtype == DType::ComplexHalf || result_dtype == DType::BComplex32) {
             return pow_tensor_tensor_kernel(self.to(DType::ComplexFloat),
                                             exponent.to(DType::ComplexFloat))
@@ -2153,15 +2156,13 @@ Tensor pow_tensor_tensor_kernel(const Tensor& self, const Tensor& exponent) {
                 if constexpr (is_complex_type_v<B>) {
                     using V = typename B::value_type;
                     if constexpr (std::is_same_v<V, float> || std::is_same_v<V, double>) {
-                        return std::pow(b, e);
+                        return tensorplay::pow(b, e);
                     } else {
-                        // Reduced complexes are unreachable at runtime
-                        // (promoted above); instantiate in float so the
-                        // generic lambda is valid for every iterator slot.
-                        using F = std::complex<float>;
+                        using F = tensorplay::complex<float>;
                         const auto r =
-                            std::pow(F(static_cast<float>(b.real()), static_cast<float>(b.imag())),
-                                     F(static_cast<float>(e.real()), static_cast<float>(e.imag())));
+                            tensorplay::pow(
+                                F(static_cast<float>(b.real()), static_cast<float>(b.imag())),
+                                F(static_cast<float>(e.real()), static_cast<float>(e.imag())));
                         return B(static_cast<V>(r.real()), static_cast<V>(r.imag()));
                     }
                 } else {
