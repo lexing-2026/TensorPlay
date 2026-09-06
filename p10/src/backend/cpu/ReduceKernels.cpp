@@ -179,6 +179,17 @@ Tensor reduce_dims_impl(const Tensor& self, std::vector<int64_t> dims_in,
 std::pair<Tensor, Tensor> mean_var_over_dims(const Tensor& self,
                                              std::vector<int64_t> dims_in,
                                              bool unbiased, bool keepdim) {
+    if (isComplexType(self.dtype())) {
+        const Tensor real = ops::real(self);
+        const Tensor imag = ops::imag(self);
+        const auto real_stats =
+            mean_var_over_dims(real, dims_in, unbiased, keepdim);
+        const auto imag_stats =
+            mean_var_over_dims(imag, dims_in, unbiased, keepdim);
+        return {ops::add(real_stats.first, imag_stats.first),
+                ops::complex(real_stats.second, imag_stats.second)};
+    }
+
     const int64_t nd = self.dim();
     std::vector<int64_t> dims = std::move(dims_in);
     if (dims.empty()) {
@@ -225,10 +236,10 @@ std::pair<Tensor, Tensor> mean_var_over_dims(const Tensor& self,
     }
     int64_t n_red = 1;
     for (const int64_t dim : red_dims) n_red *= self.size(dim);
-    const double ddof = unbiased && n_red > 1 ? 1.0 : 0.0;
+    const double correction = unbiased ? 1.0 : 0.0;
 
     auto compute = [&](auto* sp, auto* mp, auto* vp) {
-        using value_t = std::remove_pointer_t<decltype(sp)>;
+        using output_t = std::remove_cv_t<std::remove_pointer_t<decltype(mp)>>;
         parallel_for(0, out_numel, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
             std::vector<int64_t> coords(red_dims.size(), 0);
             std::vector<int64_t> out_coords(out_sizes.size(), 0);
@@ -247,16 +258,26 @@ std::pair<Tensor, Tensor> mean_var_over_dims(const Tensor& self,
                     base += out_coords[static_cast<size_t>(out_index++)] *
                             strides[static_cast<size_t>(i)];
                 }
-                double sum = 0.0;
-                double square_sum = 0.0;
+                if (n_red == 0) {
+                    const double nan = std::numeric_limits<double>::quiet_NaN();
+                    mp[oi] = static_cast<output_t>(nan);
+                    vp[oi] = static_cast<output_t>(nan);
+                    continue;
+                }
+                double mean_value = 0.0;
+                double m2 = 0.0;
+                int64_t count = 0;
                 std::fill(coords.begin(), coords.end(), 0);
                 for (int64_t c = 0; c < n_red; ++c) {
                     int64_t offset = base;
                     for (size_t r = 0; r < red_dims.size(); ++r)
                         offset += coords[r] * red_strides[r];
                     const double value = static_cast<double>(sp[offset]);
-                    sum += value;
-                    square_sum += value * value;
+                    const int64_t new_count = ++count;
+                    const double delta = value - mean_value;
+                    mean_value += delta / static_cast<double>(new_count);
+                    const double new_delta = value - mean_value;
+                    m2 += delta * new_delta;
                     for (int64_t r = static_cast<int64_t>(red_dims.size()) - 1;
                          r >= 0; --r) {
                         if (++coords[static_cast<size_t>(r)] <
@@ -265,19 +286,30 @@ std::pair<Tensor, Tensor> mean_var_over_dims(const Tensor& self,
                         coords[static_cast<size_t>(r)] = 0;
                     }
                 }
-                const double m = sum / n_red;
-                mp[oi] = static_cast<value_t>(m);
-                const double variance =
-                    (square_sum - m * m * n_red) / (n_red - ddof);
-                vp[oi] = static_cast<value_t>(variance > 0.0 ? variance : 0.0);
+                mp[oi] = static_cast<output_t>(mean_value);
+                vp[oi] = static_cast<output_t>(
+                    m2 / (static_cast<double>(n_red) - correction));
             }
         });
     };
 
-    if (dt == DType::Float64)
-        compute(sc.data_ptr<double>(), mean.data_ptr<double>(), var.data_ptr<double>());
-    else
-        compute(sc.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>());
+    switch (dt) {
+        case DType::Float16:
+            compute(sc.data_ptr<Half>(), mean.data_ptr<Half>(), var.data_ptr<Half>());
+            break;
+        case DType::Float32:
+            compute(sc.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>());
+            break;
+        case DType::Float64:
+            compute(sc.data_ptr<double>(), mean.data_ptr<double>(), var.data_ptr<double>());
+            break;
+        case DType::BFloat16:
+            compute(sc.data_ptr<BFloat16>(), mean.data_ptr<BFloat16>(),
+                    var.data_ptr<BFloat16>());
+            break;
+        default:
+            TP_THROW(TypeError, "std_mean: unsupported dtype ", toString(dt));
+    }
     return {var, mean};
 }
 
