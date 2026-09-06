@@ -1315,8 +1315,13 @@ Tensor ldexp_cuda(const Tensor& self, const Tensor& other) {
     #define LDEXP_CASE(ctype, name) \
         case DType::name: \
             gpu_kernel(iter, [] __device__(ctype x, ctype exponent) -> ctype { \
-                return static_cast<ctype>(::ldexp(static_cast<double>(x), \
-                                                  static_cast<int>(exponent))); \
+                if constexpr (std::is_integral_v<ctype>) { \
+                    return exponent >= static_cast<ctype>(8 * static_cast<int>(sizeof(ctype))) \
+                        ? ctype(0) : static_cast<ctype>(x * (ctype(1) << exponent)); \
+                } else { \
+                    return static_cast<ctype>(static_cast<double>(x) * \
+                                              ::exp2(static_cast<double>(exponent))); \
+                } \
             }); \
             break;
     switch (common_dtype) {
