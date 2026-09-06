@@ -21,7 +21,7 @@
 //   atan(z)  = (i/2)*log((1 - i z)/(1 + i z))
 //   atanh(z) = (log(1+z) - log(1-z)) / 2
 
-#include "cpu/vec/Intrinsics.h"
+#include "cpu/vec/intrinsics.h"
 #include "cpu/vec/SleefShims.h"
 #include "cpu/ComplexKernels.h"
 

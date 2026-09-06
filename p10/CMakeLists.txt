@@ -112,6 +112,7 @@ set(P10_SOURCES
     src/backend/composite/Activation.cpp
     src/backend/composite/ActivationMore.cpp
     src/backend/composite/BackwardHelperComposites.cpp
+    src/backend/composite/GradientBridgeComposites.cpp
     src/backend/composite/OutVariantComposites.cpp
     src/backend/composite/InplaceAliasComposites.cpp
     src/backend/composite/VariantOutComposites.cpp
