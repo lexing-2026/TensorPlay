@@ -267,7 +267,7 @@ Tensor conj_cuda(const Tensor& self) {
         }
         return out;
     }
-    Tensor out = detail::contiguous_clone(self);
+    Tensor out = ::tensorplay::detail::contiguous_clone(self);
     int64_t n = out.numel();
     if (n == 0) return out;
     auto stream = getCurrentCUDAStream();
