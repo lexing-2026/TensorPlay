@@ -12,10 +12,10 @@
 #include "Exception.h"
 #include "Parallel.h"
 #include "Utils.h"
+#include "Complex.h"
 
 #include <vector>
 #include <cmath>
-#include <complex>
 #include <cstring>
 #include <algorithm>
 #include <cstdint>
@@ -347,33 +347,39 @@ Tensor vdot_cpu(const Tensor& a_in, const Tensor& b_in) {
         // Conjugating dot products from the BLAS: single pass, no copies.
         Tensor result = Tensor::empty({}, dt, a.device());
         if (dt == DType::ComplexFloat) {
-            std::complex<float> out{};
-            cblas_cdotc_sub(static_cast<int>(n), a.data_ptr<std::complex<float>>(), 1,
-                            b.data_ptr<std::complex<float>>(), 1, &out);
-            result.data_ptr<std::complex<float>>()[0] = out;
+            complex<float> out{};
+            cblas_cdotc_sub(static_cast<int>(n), a.data_ptr<complex<float>>(), 1,
+                            b.data_ptr<complex<float>>(), 1, &out);
+            result.data_ptr<complex<float>>()[0] = out;
         } else {
-            std::complex<double> out{};
-            cblas_zdotc_sub(static_cast<int>(n), a.data_ptr<std::complex<double>>(), 1,
-                            b.data_ptr<std::complex<double>>(), 1, &out);
-            result.data_ptr<std::complex<double>>()[0] = out;
+            complex<double> out{};
+            cblas_zdotc_sub(static_cast<int>(n), a.data_ptr<complex<double>>(), 1,
+                            b.data_ptr<complex<double>>(), 1, &out);
+            result.data_ptr<complex<double>>()[0] = out;
         }
         return result;
 #else
         if (dt == DType::ComplexFloat) {
-            const std::complex<float>* ap = a.data_ptr<std::complex<float>>();
-            const std::complex<float>* bp = b.data_ptr<std::complex<float>>();
-            std::complex<double> acc = 0;
-            for (int64_t i = 0; i < n; ++i)
-                acc += static_cast<std::complex<double>>(std::conj(ap[i]) * bp[i]);
-            return Tensor::full({}, Scalar(std::complex<float>(
+            const complex<float>* ap = a.data_ptr<complex<float>>();
+            const complex<float>* bp = b.data_ptr<complex<float>>();
+            complex<double> acc = 0;
+            for (int64_t i = 0; i < n; ++i) {
+                const complex<float> conjugate(ap[i].real(), -ap[i].imag());
+                acc += static_cast<complex<double>>(conjugate) *
+                       static_cast<complex<double>>(bp[i]);
+            }
+            return Tensor::full({}, Scalar(complex<float>(
                                      static_cast<float>(acc.real()),
                                      static_cast<float>(acc.imag()))),
                                 dt, a.device());
         }
-        const std::complex<double>* ap = a.data_ptr<std::complex<double>>();
-        const std::complex<double>* bp = b.data_ptr<std::complex<double>>();
-        std::complex<double> acc = 0;
-        for (int64_t i = 0; i < n; ++i) acc += std::conj(ap[i]) * bp[i];
+        const complex<double>* ap = a.data_ptr<complex<double>>();
+        const complex<double>* bp = b.data_ptr<complex<double>>();
+        complex<double> acc = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            const complex<double> conjugate(ap[i].real(), -ap[i].imag());
+            acc += conjugate * bp[i];
+        }
         return Tensor::full({}, Scalar(acc), dt, a.device());
 #endif
     }
