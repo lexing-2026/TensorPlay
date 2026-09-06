@@ -7,6 +7,7 @@
 #include "CUDARuntime.h"
 #include "Exception.h"
 #include "LinearAlgebraNames.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <cublas_v2.h>
 #include <cusolverDn.h>
@@ -22,6 +23,8 @@
 
 namespace tensorplay {
 namespace cuda {
+
+namespace ops = tensorplay::tpx::ops;
 
 namespace {
 
@@ -828,6 +831,22 @@ std::tuple<Tensor, Tensor> linalg_qr_kernel_cuda(const Tensor& A,
     });
 }
 
+std::tuple<Tensor, Tensor> linalg_polar_kernel_cuda(const Tensor& A) {
+    check_is_matrix(A, "linalg.polar");
+    if (A.size(-2) < A.size(-1)) {
+        TP_THROW(RuntimeError,
+                 "linalg.polar: input must have at least as many rows as columns, but got ",
+                 A.size(-2), " by ", A.size(-1), " matrices");
+    }
+
+    auto [Up, S, Vh] = ops::linalg_svd(A, false, std::nullopt);
+    Tensor scaled_vh = ops::mul(ops::unsqueeze(S, -1), Vh);
+    Tensor H = ops::matmul(ops::mH(Vh), scaled_vh);
+    H = ops::mul(ops::add(H, ops::mH(H)), Scalar(0.5));
+    Tensor U = ops::matmul(Up, Vh);
+    return {U.contiguous(), H.contiguous()};
+}
+
 Tensor linalg_householder_product_kernel_cuda(const Tensor& input, const Tensor& tau) {
     const char* api = "linalg.householder_product";
     check_is_matrix(input, api);
@@ -1292,6 +1311,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, LinalgKernels) {
     m.impl("linalg_eigvalsh", linalg_eigvalsh_kernel_cuda);
     m.impl("linalg_eig", linalg_eig_kernel_cuda);
     m.impl("linalg_eigvals", linalg_eigvals_kernel_cuda);
+    m.impl("linalg_polar", linalg_polar_kernel_cuda);
     m.impl("linalg_lstsq", linalg_lstsq_kernel_cuda);
     m.impl("linalg_qr", linalg_qr_kernel_cuda);
     m.impl("linalg_householder_product", linalg_householder_product_kernel_cuda);
