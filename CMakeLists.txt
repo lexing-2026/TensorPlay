@@ -1050,6 +1050,12 @@ if(NOT WIN32)
 endif()
 set(USE_TCP_OPENSSL_LINK OFF CACHE BOOL "" FORCE)
 set(USE_TCP_OPENSSL_LOAD OFF CACHE BOOL "" FORCE)
+# Gloo links statically into the distributed objects and is never installed.
+# A shared gloo would leave a libgloo.so NEEDED entry on _C plus another
+# install tree to ship, and a wheel import then fails wherever the loader
+# does not search the extra directory.
+set(GLOO_INSTALL OFF CACHE BOOL "" FORCE)
+set(GLOO_STATIC_OR_SHARED STATIC CACHE STRING "" FORCE)
 # Gloo builds CPU-only, but its USE_CUDA knob lives in the global namespace:
 # save the project's own switch and restore it after the subdirectory, or a
 # fresh configure silently turns the whole CUDA build off.

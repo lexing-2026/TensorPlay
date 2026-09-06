@@ -189,7 +189,8 @@ jobs:
       - name: Build wheel
         shell: bash
         env:
-          SKBUILD_CMAKE_DEFINE: ${{ inputs.cuda != 'cpu' && 'USE_CUDA=ON' || 'USE_CUDA=OFF' }}
+          SKBUILD_CMAKE_DEFINE: >-
+            ${{ inputs.cuda != 'cpu' && 'USE_CUDA=ON' || 'USE_CUDA=OFF' }};USE_MPI=OFF
         run: |
           python -m pip install --upgrade pip build
           python -m build --wheel
