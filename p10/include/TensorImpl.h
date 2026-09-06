@@ -150,11 +150,11 @@ public:
     DispatchKeySet key_set() const {
         DispatchKey backend = computeDispatchKey(device_);
         DispatchKeySet ks;
+        ks.add(backend);
         if (is_batched()) {
             ks.add(toVmapKey(backend));
             return ks;
         }
-        ks.add(backend);
         if (!inference_tensor_) {
             ks.add(toAutogradKey(backend));
         }
