@@ -2110,17 +2110,24 @@ Tensor index_select_cuda(const Tensor& self, int64_t dim, const Tensor& index) {
             const int64_t slices = outer * n_idx; \
             const int64_t blocks = std::min<int64_t>(slices, 4096); \
             index_select_slice_kernel<ctype><<<static_cast<unsigned>(blocks), slice_threads, 0, stream>>>( \
-                slices, n_idx, inner, row, self_c.data_ptr<ctype>(), \
-                idx.data_ptr<int64_t>(), result.data_ptr<ctype>()); \
+                slices, n_idx, inner, row, \
+                static_cast<const ctype*>(self_c.data_ptr()), \
+                idx.data_ptr<int64_t>(), static_cast<ctype*>(result.data_ptr())); \
         } else { \
             index_select_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-                total, n_idx, inner, row, self_c.data_ptr<ctype>(), \
-                idx.data_ptr<int64_t>(), result.data_ptr<ctype>()); \
+                total, n_idx, inner, row, \
+                static_cast<const ctype*>(self_c.data_ptr()), \
+                idx.data_ptr<int64_t>(), static_cast<ctype*>(result.data_ptr())); \
         } \
         break; \
     }
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_IS_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(TP_IS_CASE)
+        TP_IS_CASE(tensorplay::complex<Half>, ComplexHalf)
+        TP_IS_CASE(tensorplay::complex<float>, ComplexFloat)
+        TP_IS_CASE(tensorplay::complex<double>, ComplexDouble)
+        TP_IS_CASE(tensorplay::complex<BFloat16>, BComplex32)
         default: TP_THROW(TypeError, "index_select: unsupported dtype");
     }
 #undef TP_IS_CASE
