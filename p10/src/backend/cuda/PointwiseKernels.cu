@@ -1615,8 +1615,6 @@ struct CxPowBase {
         return tensorplay_complex_math::pow(base_value, exponent);
     }
 };
-struct Atan2Functor { template<typename T> __device__ T operator()(T a, T b) const { return ::atan2(a, b); } };
-
 Tensor pow_kernel_cuda(const Tensor& self, const Tensor& other) {
     if (isComplexType(promoteTypes(self.dtype(), other.dtype()))) {
         DType rd = promoteTypes(self.dtype(), other.dtype());
@@ -1715,7 +1713,39 @@ Tensor pow_scalar_tensor_kernel_cuda(Scalar base, const Tensor& exponent) {
     return unary_float_op_kernel_v2(
         exponent_cast, PowBaseFunctor{base.toDouble()});
 }
-Tensor atan2_kernel_cuda(const Tensor& self, const Tensor& other) { return binary_float_op_kernel_v2(self, other, Atan2Functor()); }
+Tensor atan2_kernel_cuda(const Tensor& self, const Tensor& other) {
+    if (self.shape() != other.shape()) TP_THROW(RuntimeError, "CUDA binary op: broadcasting not supported");
+
+    DType out_dtype = self.dtype();
+    if (isIntegralType(out_dtype)) out_dtype = DType::Float32;
+
+    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), out_dtype, self.device());
+    if (self.numel() == 0) return result;
+    Tensor a = self.dtype() == out_dtype ? self : self.to(out_dtype);
+    Tensor b = other.dtype() == out_dtype ? other : other.to(out_dtype);
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(result)
+        .add_input(a)
+        .add_input(b)
+        .build();
+
+    #define ATAN2_CASE(ctype, name) \
+    case DType::name: \
+        gpu_kernel_with_scalars(iter, [] __host__ __device__(ctype lhs, ctype rhs) -> ctype { \
+            return ::atan2(lhs, rhs); \
+        }); \
+        break;
+    switch (out_dtype) {
+        ATAN2_CASE(Half, Float16)
+        ATAN2_CASE(BFloat16, BFloat16)
+        ATAN2_CASE(float, Float32)
+        ATAN2_CASE(double, Float64)
+        default: TP_THROW(TypeError, "CUDA atan2: Unsupported output dtype");
+    }
+    #undef ATAN2_CASE
+    return result;
+}
 
 // --- Lerp ---
 template <typename math_t>
