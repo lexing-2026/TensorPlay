@@ -785,7 +785,9 @@ std::tuple<Tensor, Tensor> kthvalue_cpu(const Tensor& self, int64_t k,
 template <typename scalar_t>
 inline bool count_nonzero_value(const scalar_t& value) {
     if constexpr (is_complex_type_v<scalar_t>) {
-        return value != scalar_t(0);
+        using component_t = typename is_complex_type<scalar_t>::value_type;
+        const component_t zero(0);
+        return value.real() != zero || value.imag() != zero;
     } else {
         return static_cast<bool>(value);
     }
@@ -829,38 +831,7 @@ Tensor count_nonzero_cpu(const Tensor& self, const std::vector<int64_t>& dim) {
 }
 
 Tensor dist_cpu(const Tensor& self, const Tensor& other, Scalar p) {
-    const double pd = p.toDouble();
-    Tensor a = self.to(DType::Float64).contiguous();
-    Tensor b = other.to(DType::Float64)
-                   .expand(broadcast_shapes(
-                       static_cast<std::vector<int64_t>>(self.shape()),
-                       static_cast<std::vector<int64_t>>(other.shape())))
-                   .to(DType::Float64)
-                   .contiguous();
-    const int64_t n = a.numel();
-    const double* ap = a.data_ptr<double>();
-    const double* bp = b.data_ptr<double>();
-    double result = 0.0;
-    if (pd == std::numeric_limits<double>::infinity()) {
-        for (int64_t i = 0; i < n; ++i)
-            result = std::max(result, std::fabs(ap[i] - bp[i]));
-    } else if (pd == -std::numeric_limits<double>::infinity()) {
-        result = std::numeric_limits<double>::infinity();
-        for (int64_t i = 0; i < n; ++i)
-            result = std::min(result, std::fabs(ap[i] - bp[i]));
-    } else if (pd == 0.0) {
-        for (int64_t i = 0; i < n; ++i)
-            if (ap[i] != bp[i]) result += 1.0;
-    } else {
-        double sum = 0.0;
-        for (int64_t i = 0; i < n; ++i)
-            sum += std::pow(std::fabs(ap[i] - bp[i]), pd);
-        result = std::pow(sum, 1.0 / pd);
-    }
-    DType out_dtype = promoteTypes(self.dtype(), other.dtype());
-    if (!isFloatingType(out_dtype)) out_dtype = DType::Float32;
-    return Tensor::zeros({}, out_dtype, self.device())
-        .fill_(Scalar(result));
+    return (self - other).norm(p.toDouble());
 }
 
 Tensor renorm_cpu(const Tensor& self, Scalar p, int64_t dim, Scalar maxnorm) {
