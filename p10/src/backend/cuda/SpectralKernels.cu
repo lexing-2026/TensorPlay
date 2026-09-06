@@ -324,7 +324,7 @@ Tensor core_c2c_impl(const Tensor& x, int64_t n_eff, fft_norm_mode mode, bool fo
     const LineInfo li = last_dim_lines(sizes_of(x));
 
     auto stream = getCurrentCUDAStream().stream();
-    Tensor packed({li.lines, n_eff}, x.dtype());
+    Tensor packed({li.lines, n_eff}, x.dtype(), x.device());
     {
         const C* src = static_cast<const C*>(x.data_ptr());
         C* dst = static_cast<C*>(packed.data_ptr());
@@ -385,8 +385,8 @@ Tensor core_r2c_impl(const Tensor& x, int64_t n_eff, fft_norm_mode mode) {
     const int64_t n_out = infer_onesided(n_eff);
 
     auto stream = getCurrentCUDAStream().stream();
-    Tensor packed({li.lines, n_eff}, real_dtype_of(x.dtype()));
-    Tensor spec({li.lines, n_out}, complex_dtype_of(x.dtype()));
+    Tensor packed({li.lines, n_eff}, real_dtype_of(x.dtype()), x.device());
+    Tensor spec({li.lines, n_out}, complex_dtype_of(x.dtype()), x.device());
     {
         const R* src = static_cast<const R*>(x.data_ptr());
         R* dst = static_cast<R*>(packed.data_ptr());
@@ -452,7 +452,7 @@ Tensor core_c2r_impl(const Tensor& x, int64_t n_eff, fft_norm_mode mode) {
     TP_CHECK(bins_in >= bins_needed, "irfft: not enough frequency bins");
 
     auto stream = getCurrentCUDAStream().stream();
-    Tensor cols({li.lines, bins_needed}, x.dtype());
+    Tensor cols({li.lines, bins_needed}, x.dtype(), x.device());
     {
         if constexpr (IsDouble) {
             copy_strided_c2c_kernel<cufftDoubleComplex><<<li.lines, kThreads, 0, stream>>>(
@@ -468,7 +468,7 @@ Tensor core_c2r_impl(const Tensor& x, int64_t n_eff, fft_norm_mode mode) {
         CUDA_CHECK(cudaGetLastError());
     }
 
-    Tensor out({li.lines, n_eff}, real_dtype_of(x.dtype()));
+    Tensor out({li.lines, n_eff}, real_dtype_of(x.dtype()), x.device());
     if (n_eff > 0 && li.lines > 0) {
         cufftHandle plan = acquire_plan(IsDouble ? CUFFT_Z2D : CUFFT_C2R, n_eff, li.lines);
         if (IsDouble) {
@@ -539,7 +539,7 @@ Tensor promote_real_for_c2c_cuda(const Tensor& self) {
     TP_CHECK(self.dtype() == DType::Float32 || self.dtype() == DType::Float64,
              "Unsupported input dtype for spectral op");
     Tensor x = self.contiguous();
-    Tensor out(sizes_of(x), complex_dtype_of(x.dtype()));
+    Tensor out(sizes_of(x), complex_dtype_of(x.dtype()), x.device());
     auto stream = getCurrentCUDAStream().stream();
     const int64_t n = x.numel();
     if constexpr (IsDouble) {
@@ -568,7 +568,7 @@ __global__ void cplx_real_part_kernel(
 template <bool IsDouble>
 Tensor extract_real_part_cuda(const Tensor& z) {
     Tensor zc = z.contiguous();
-    Tensor out(sizes_of(zc), real_dtype_of(zc.dtype()));
+    Tensor out(sizes_of(zc), real_dtype_of(zc.dtype()), zc.device());
     auto stream = getCurrentCUDAStream().stream();
     const int64_t n = zc.numel();
     if constexpr (IsDouble) {
@@ -774,7 +774,7 @@ Tensor window_cuda(int64_t out_len, int64_t formula_len, std::optional<DType> dt
     if (dt == DType::Undefined) dt = DType::Float32;
     if (dt != DType::Float32 && dt != DType::Float64)
         TP_THROW(NotImplementedError, name, ": only float32/float64 windows are supported");
-    Tensor w({std::max<int64_t>(out_len, 0)}, dt);
+    Tensor w({std::max<int64_t>(out_len, 0)}, dt, Device(DeviceType::CUDA, currentDevice()));
     if (out_len == 0) return w;
     auto stream = getCurrentCUDAStream().stream();
     const int64_t total = out_len;
@@ -924,7 +924,7 @@ Tensor stft_cuda_impl(const Tensor& work, int64_t n_fft, int64_t hop, int64_t wi
     }
 
     // time2col + window multiply into a packed real buffer
-    Tensor frames({batch * n_frames, n_fft}, real_dtype_of(work.dtype()));
+    Tensor frames({batch * n_frames, n_fft}, real_dtype_of(work.dtype()), work.device());
     {
         auto stream = getCurrentCUDAStream().stream();
         if constexpr (IsDouble) {
@@ -948,7 +948,7 @@ Tensor stft_cuda_impl(const Tensor& work, int64_t n_fft, int64_t hop, int64_t wi
     TP_CHECK(spec.size(-1) == n_freq, "stft: unexpected spectrum width");
 
     // transpose into output layout (batch, freq, frames)
-    Tensor out_c({batch, n_freq, n_frames}, complex_dtype_of(work.dtype()));
+    Tensor out_c({batch, n_freq, n_frames}, complex_dtype_of(work.dtype()), work.device());
     {
         auto stream = getCurrentCUDAStream().stream();
         const int64_t total = batch * n_freq * n_frames;
@@ -984,7 +984,7 @@ Tensor stft_cuda(const Tensor& self, int64_t n_fft, std::optional<int64_t> hop_l
     if (was_1d) x = x.unsqueeze(0);
     if (center) {
         const int64_t pad = n_fft / 2;
-        Tensor padded(std::vector<int64_t>{x.size(0), x.size(1) + 2 * pad}, x.dtype());
+        Tensor padded(std::vector<int64_t>{x.size(0), x.size(1) + 2 * pad}, x.dtype(), x.device());
         auto stream = getCurrentCUDAStream().stream();
         if (x.dtype() == DType::Float64) {
             pad_time_axis_kernel<double><<<x.size(0), kThreads, 0, stream>>>(
@@ -1095,7 +1095,7 @@ Tensor istft_cuda_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t 
 
     // norm = normalized ? by_root_n : by_n, SpectralOps.cpp:1160)
     const int64_t bins = n_fft / 2 + 1;
-    Tensor cols({batch * frames, bins}, input.dtype());
+    Tensor cols({batch * frames, bins}, input.dtype(), input.device());
     {
         auto stream = getCurrentCUDAStream().stream();
         if constexpr (IsDouble) {
@@ -1115,8 +1115,8 @@ Tensor istft_cuda_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t 
     Tensor tf = core_c2r_impl<IsDouble>(cols, n_fft, mode);
 
     // overlap-add + envelope (unfold_backward step)
-    Tensor y({batch * expected_len}, real_dtype_of(input.dtype()));
-    Tensor env({batch * expected_len}, real_dtype_of(input.dtype()));
+    Tensor y({batch * expected_len}, real_dtype_of(input.dtype()), input.device());
+    Tensor env({batch * expected_len}, real_dtype_of(input.dtype()), input.device());
     {
         auto stream = getCurrentCUDAStream().stream();
         dim3 grid(batch, (expected_len + kThreads - 1) / kThreads);
@@ -1149,7 +1149,7 @@ Tensor istft_cuda_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t 
 
     std::vector<int64_t> out_sizes =
         was_2d ? std::vector<int64_t>{out_len} : std::vector<int64_t>{batch, out_len};
-    Tensor out(out_sizes, real_dtype_of(input.dtype()));
+    Tensor out(out_sizes, real_dtype_of(input.dtype()), input.device());
     {
         auto stream = getCurrentCUDAStream().stream();
         dim3 grid(batch, (out_len + kThreads - 1) / kThreads);
@@ -1288,7 +1288,7 @@ Tensor stft_backward_cuda_impl(const Tensor& grad_output, const Tensor& self, in
 
     // gather grad columns into packed (batch*frames, bins): reuse the spec
     // transpose kernel (grad layout (batch, freq, frames) -> (frames, freq))
-    Tensor cols(std::vector<int64_t>{batch * frames, n_freq}, complex_dtype_of(self.dtype()));
+    Tensor cols(std::vector<int64_t>{batch * frames, n_freq}, complex_dtype_of(self.dtype()), self.device());
     {
         auto stream = getCurrentCUDAStream().stream();
         if constexpr (IsDouble) {
@@ -1351,7 +1351,7 @@ Tensor stft_backward_cuda_impl(const Tensor& grad_output, const Tensor& self, in
     }
 
     std::vector<int64_t> out_sizes = sizes_of(self);
-    Tensor out(out_sizes, self.dtype());
+    Tensor out(out_sizes, self.dtype(), self.device());
     {
         auto stream = getCurrentCUDAStream().stream();
         if (!center) {
