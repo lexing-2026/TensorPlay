@@ -12,6 +12,7 @@
 #include "Utils.h"
 #include "TypePromotion.h"
 #include "CUDARuntime.h"
+#include "CUDALoops.cuh"
 #include "SpecialMath.h"
 
 #include <cuda_runtime.h>
@@ -132,35 +133,6 @@ __global__ void ew_unary_kernel(int64_t n, const T* a, T* out, F f) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += stride) out[i] = f(a[i]);
-}
-
-template <typename F>  // double(double,double)
-__global__ void fm_binary_f64_kernel(int64_t n, const double* a, const double* b, double* out, F f) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) out[i] = f(a[i], b[i]);
-}
-
-template <typename F>  // double(double,double)
-__global__ void fm_binary_f32_kernel(int64_t n, const float* a, const float* b, float* out, F f) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) out[i] = static_cast<float>(f(static_cast<double>(a[i]),
-                                                             static_cast<double>(b[i])));
-}
-
-template <typename F>  // double(double)
-__global__ void fm_unary_f64_kernel(int64_t n, const double* a, double* out, F f) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) out[i] = f(a[i]);
-}
-
-template <typename F>  // double(double)
-__global__ void fm_unary_f32_kernel(int64_t n, const float* a, float* out, F f) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) out[i] = static_cast<float>(f(static_cast<double>(a[i])));
 }
 
 void launch_ew(dim3& grid, dim3& block, int64_t n) {
@@ -354,19 +326,22 @@ Tensor float_math_cuda(const Tensor& self, F f, const char* name) {
     DType in = self.dtype();
     DType out_dt = isFloatingType(in) ? in : DType::Float32;
     DType compute_dt = (in == DType::Float64) ? DType::Float64 : DType::Float32;
-    Tensor w = (in == compute_dt) ? self.contiguous() : self.to(compute_dt).contiguous();
+    Tensor w = (in == compute_dt) ? self : self.to(compute_dt);
     Tensor t = Tensor::empty(shape_of(w), compute_dt, w.device());
-    int64_t n = w.numel();
-    if (n > 0) {
-        dim3 grid, block;
-        launch_ew(grid, block, n);
-        auto stream = getCurrentCUDAStream().stream();
+    if (w.numel() > 0) {
+        TensorIterator iter = TensorIteratorConfig()
+            .check_all_same_dtype(true)
+            .add_output(t)
+            .add_const_input(w)
+            .build();
         if (compute_dt == DType::Float64) {
-            fm_unary_f64_kernel<<<grid, block, 0, stream>>>(n, w.data_ptr<double>(),
-                                                            t.data_ptr<double>(), f);
+            gpu_kernel(iter, [f] __device__(double x) -> double {
+                return f(x);
+            });
         } else {
-            fm_unary_f32_kernel<<<grid, block, 0, stream>>>(n, w.data_ptr<float>(),
-                                                            t.data_ptr<float>(), f);
+            gpu_kernel(iter, [f] __device__(float x) -> float {
+                return static_cast<float>(f(static_cast<double>(x)));
+            });
         }
         CUDA_CHECK(cudaGetLastError());
     }
@@ -378,25 +353,28 @@ template <typename F>
 Tensor binary_float_cuda(const Tensor& a_in, const Tensor& b_in, F f, const char* name) {
     DType dt = promoteTypes(a_in.dtype(), b_in.dtype());
     if (!isFloatingType(dt)) dt = DType::Float32;
-    // Reduced-width inputs are evaluated in Float32 and narrowed once at the
-    // end; the launches below only ever address float or double buffers.
     DType compute_dt = (dt == DType::Float64) ? DType::Float64 : DType::Float32;
-    Tensor ac = a_in.to(compute_dt)
-                    .expand(broadcast_shapes(shape_of(a_in), shape_of(b_in)))
-                    .contiguous();
-    Tensor bc = b_in.to(compute_dt).expand(shape_of(ac)).contiguous();
-    Tensor out = Tensor::empty(shape_of(ac), compute_dt, a_in.device());
-    int64_t n = out.numel();
-    if (n == 0) return (dt == compute_dt) ? out : out.to(dt);
-    dim3 grid, block;
-    launch_ew(grid, block, n);
-    auto stream = getCurrentCUDAStream().stream();
+    const std::vector<int64_t> out_shape = broadcast_shapes(
+        shape_of(a_in), shape_of(b_in));
+    Tensor ac = a_in.to(compute_dt).expand(out_shape);
+    Tensor bc = b_in.to(compute_dt).expand(out_shape);
+    Tensor out = Tensor::empty(out_shape, compute_dt, a_in.device());
+    if (out.numel() == 0) return (dt == compute_dt) ? out : out.to(dt);
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(out)
+        .add_const_input(ac)
+        .add_const_input(bc)
+        .build();
     if (compute_dt == DType::Float64) {
-        fm_binary_f64_kernel<<<grid, block, 0, stream>>>(
-            n, ac.data_ptr<double>(), bc.data_ptr<double>(), out.data_ptr<double>(), f);
+        gpu_kernel(iter, [f] __device__(double x, double y) -> double {
+            return f(x, y);
+        });
     } else {
-        fm_binary_f32_kernel<<<grid, block, 0, stream>>>(
-            n, ac.data_ptr<float>(), bc.data_ptr<float>(), out.data_ptr<float>(), f);
+        gpu_kernel(iter, [f] __device__(float x, float y) -> float {
+            return static_cast<float>(f(static_cast<double>(x),
+                                        static_cast<double>(y)));
+        });
     }
     CUDA_CHECK(cudaGetLastError());
     return (dt == compute_dt) ? out : out.to(dt);
