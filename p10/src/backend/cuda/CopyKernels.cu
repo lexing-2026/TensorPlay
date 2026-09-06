@@ -5,7 +5,7 @@
 #include "Exception.h"
 #include "TensorIterator.h"
 #include "CUDALoops.cuh"
-#include <cuComplex.h>
+#include "Complex.h"
 #include <cuda_runtime.h>
 #include <vector>
 #include <algorithm>
@@ -47,14 +47,14 @@ __device__ int64_t get_linear_offset(int64_t idx, const int64_t* sizes, const in
 }
 
 template <typename T> struct real_of;
-template <> struct real_of<cuFloatComplex> { using type = float; };
-template <> struct real_of<cuDoubleComplex> { using type = double; };
+template <> struct real_of<tensorplay::complex<float>> { using type = float; };
+template <> struct real_of<tensorplay::complex<double>> { using type = double; };
 
 template <typename C> struct dtype_of_complex;
-template <> struct dtype_of_complex<cuFloatComplex> {
+template <> struct dtype_of_complex<tensorplay::complex<float>> {
     static constexpr DType value = DType::ComplexFloat;
 };
-template <> struct dtype_of_complex<cuDoubleComplex> {
+template <> struct dtype_of_complex<tensorplay::complex<double>> {
     static constexpr DType value = DType::ComplexDouble;
 };
 
@@ -108,7 +108,7 @@ __global__ void cast_complex_to_real_kernel(
     if (idx >= numel) return;
     const int64_t dst_offset = get_linear_offset(idx, dst_info.sizes, dst_info.strides, dst_info.ndim);
     const int64_t src_offset = get_linear_offset(idx, dst_info.sizes, src_info.strides, src_info.ndim);
-    dst[dst_offset] = src[src_offset].x;
+    dst[dst_offset] = src[src_offset].real();
 }
 
 template <typename D, typename S>
@@ -120,8 +120,8 @@ __global__ void cast_complex_to_complex_kernel(
     if (idx >= numel) return;
     const int64_t dst_offset = get_linear_offset(idx, dst_info.sizes, dst_info.strides, dst_info.ndim);
     const int64_t src_offset = get_linear_offset(idx, dst_info.sizes, src_info.strides, src_info.ndim);
-    dst[dst_offset] = D{static_cast<RD>(src[src_offset].x),
-                        static_cast<RD>(src[src_offset].y)};
+    dst[dst_offset] = D{static_cast<RD>(src[src_offset].real()),
+                        static_cast<RD>(src[src_offset].imag())};
 }
 
 // ---------------------------------------------------------------------------
@@ -724,21 +724,19 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
     TensorInfo dst_info = get_tensor_info(self);
     TensorInfo src_info = get_tensor_info(src_cuda_tensor);
 
-    // std::complex is a host-side type in this project.  Keep the CUDA copy
-    // path explicit for complex tensors so expanded/strided complex batches
-    // can be materialized without asking nvcc to instantiate std::complex
-    // casts in the generic dtype conversion kernel.
+    // Keep the CUDA copy path explicit for complex tensors so
+    // expanded/strided batches use the native complex scalar.
     if (self.dtype() == src_cuda_tensor.dtype() && self.dtype() == DType::ComplexFloat) {
-        copy_complex_strided_kernel<cuFloatComplex><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-            numel, reinterpret_cast<cuFloatComplex*>(self.data_ptr<std::complex<float>>()), dst_info,
-            reinterpret_cast<const cuFloatComplex*>(src_cuda_tensor.data_ptr<std::complex<float>>()), src_info);
+        copy_complex_strided_kernel<tensorplay::complex<float>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+            numel, static_cast<tensorplay::complex<float>*>(self.data_ptr()), dst_info,
+            static_cast<const tensorplay::complex<float>*>(src_cuda_tensor.data_ptr()), src_info);
         checkCuda(cudaGetLastError(), "CUDA complex float copy kernel");
         return self;
     }
     if (self.dtype() == src_cuda_tensor.dtype() && self.dtype() == DType::ComplexDouble) {
-        copy_complex_strided_kernel<cuDoubleComplex><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-            numel, reinterpret_cast<cuDoubleComplex*>(self.data_ptr<std::complex<double>>()), dst_info,
-            reinterpret_cast<const cuDoubleComplex*>(src_cuda_tensor.data_ptr<std::complex<double>>()), src_info);
+        copy_complex_strided_kernel<tensorplay::complex<double>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+            numel, static_cast<tensorplay::complex<double>*>(self.data_ptr()), dst_info,
+            static_cast<const tensorplay::complex<double>*>(src_cuda_tensor.data_ptr()), src_info);
         checkCuda(cudaGetLastError(), "CUDA complex double copy kernel");
         return self;
     }
@@ -782,12 +780,12 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
             checkCuda(cudaGetLastError(), "CUDA complex cast kernel");          \
             return self;                                                        \
         }
-    TP_CUDA_CPLX_CAST_R2C(Float32, cuFloatComplex)
-    TP_CUDA_CPLX_CAST_R2C(Float64, cuDoubleComplex)
-    TP_CUDA_CPLX_CAST_C2R(cuFloatComplex, Float32)
-    TP_CUDA_CPLX_CAST_C2R(cuDoubleComplex, Float64)
-    TP_CUDA_CPLX_CAST_C2C(cuFloatComplex, cuDoubleComplex)
-    TP_CUDA_CPLX_CAST_C2C(cuDoubleComplex, cuFloatComplex)
+    TP_CUDA_CPLX_CAST_R2C(Float32, tensorplay::complex<float>)
+    TP_CUDA_CPLX_CAST_R2C(Float64, tensorplay::complex<double>)
+    TP_CUDA_CPLX_CAST_C2R(tensorplay::complex<float>, Float32)
+    TP_CUDA_CPLX_CAST_C2R(tensorplay::complex<double>, Float64)
+    TP_CUDA_CPLX_CAST_C2C(tensorplay::complex<float>, tensorplay::complex<double>)
+    TP_CUDA_CPLX_CAST_C2C(tensorplay::complex<double>, tensorplay::complex<float>)
     #undef TP_CUDA_CPLX_CAST_R2C
     #undef TP_CUDA_CPLX_CAST_C2R
     #undef TP_CUDA_CPLX_CAST_C2C
@@ -935,20 +933,20 @@ Scalar item_cuda(const Tensor& self) {
             return Scalar(v);
         }
         case DType::ComplexHalf: {
-            std::complex<Half> v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            tensorplay::complex<Half> v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
             return Scalar(std::complex<float>(static_cast<float>(v.real()),
                                               static_cast<float>(v.imag())));
         }
         case DType::ComplexFloat: {
-            std::complex<float> v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
-            return Scalar(v);
+            tensorplay::complex<float> v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(std::complex<float>(v.real(), v.imag()));
         }
         case DType::ComplexDouble: {
-            std::complex<double> v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
-            return Scalar(v);
+            tensorplay::complex<double> v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(std::complex<double>(v.real(), v.imag()));
         }
         case DType::BComplex32: {
-            std::complex<BFloat16> v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            tensorplay::complex<BFloat16> v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
             return Scalar(std::complex<float>(static_cast<float>(v.real()),
                                               static_cast<float>(v.imag())));
         }
