@@ -1339,28 +1339,20 @@ Tensor ldexp_cuda(const Tensor& self, const Tensor& other) {
     return result;
 }
 
-// clamp.Tensor: same bound logic as clamp_kernel_cuda but each bound is a
-// broadcastable tensor, evaluated per element.
+// clamp.Tensor: each optional bound is a broadcastable input evaluated per
+// element. NaNs in the value or either present bound take precedence.
 template <typename T>
-__global__ void clamp_tensor_broadcast_kernel_cuda_impl(
-    int64_t n, const T* self, TensorDesc self_desc,
-    const T* lo, TensorDesc lo_desc,
-    const T* hi, TensorDesc hi_desc,
-    T* output, TensorDesc output_desc,
-    bool has_min, bool has_max) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        T val = self[get_offset(i, self_desc, output_desc)];
-        if (has_min) {
-            const T m = lo[get_offset(i, lo_desc, output_desc)];
-            if (val < m) val = m;
+void clamp_tensor_loop(TensorIterator& iter, bool has_min, bool has_max) {
+    gpu_kernel(iter, [has_min, has_max] __device__(T value, T lower, T upper) -> T {
+        T result = has_min && value < lower ? lower : value;
+        result = has_max && upper < result ? upper : result;
+        if constexpr (std::numeric_limits<T>::has_quiet_NaN) {
+            if (has_max && upper != upper) result = upper;
+            if (has_min && lower != lower) result = lower;
+            if (value != value) result = value;
         }
-        if (has_max) {
-            const T m = hi[get_offset(i, hi_desc, output_desc)];
-            if (val > m) val = m;
-        }
-        output[i] = val;
-    }
+        return result;
+    });
 }
 
 Tensor clamp_tensor_cuda(const Tensor& self, const std::optional<Tensor>& min,
@@ -1384,38 +1376,33 @@ Tensor clamp_tensor_cuda(const Tensor& self, const std::optional<Tensor>& min,
             static_cast<std::vector<int64_t>>(max->shape()));
     }
     Tensor result = Tensor::empty(out_shape, common_dtype, self.device());
-    const int64_t n = result.numel();
-    if (n == 0) return result;
-    dim3 block(256);
-    dim3 grid((n + 255) / 256);
-    Tensor a = self.dtype() == common_dtype ? self.contiguous() : self.to(common_dtype).contiguous();
-    Tensor lo, hi;
-    TensorDesc a_desc = make_desc(a, out_shape.size());
-    TensorDesc lo_desc = a_desc, hi_desc = a_desc;
+    if (result.numel() == 0) return result;
+    Tensor a = self.dtype() == common_dtype ? self : self.to(common_dtype);
+    Tensor lo = a;
+    Tensor hi = a;
     if (min.has_value()) {
-        lo = min->dtype() == common_dtype ? min->contiguous() : min->to(common_dtype).contiguous();
-        lo_desc = make_desc(lo, out_shape.size());
+        lo = min->dtype() == common_dtype ? *min : min->to(common_dtype);
     }
     if (max.has_value()) {
-        hi = max->dtype() == common_dtype ? max->contiguous() : max->to(common_dtype).contiguous();
-        hi_desc = make_desc(hi, out_shape.size());
+        hi = max->dtype() == common_dtype ? *max : max->to(common_dtype);
     }
-    TensorDesc result_desc = make_desc(result, out_shape.size());
+    const bool has_min = min.has_value();
+    const bool has_max = max.has_value();
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(result)
+        .add_const_input(a)
+        .add_const_input(lo)
+        .add_const_input(hi)
+        .build();
 
-    #define CLAMP_T_CASE(ctype, name) \
-        case DType::name: \
-            clamp_tensor_broadcast_kernel_cuda_impl<ctype><<<grid, block, 0, getCurrentCUDAStream().stream()>>>( \
-                n, a.data_ptr<ctype>(), a_desc, \
-                min.has_value() ? lo.data_ptr<ctype>() : a.data_ptr<ctype>(), lo_desc, \
-                max.has_value() ? hi.data_ptr<ctype>() : a.data_ptr<ctype>(), hi_desc, \
-                result.data_ptr<ctype>(), result_desc, min.has_value(), max.has_value()); \
-            break;
+#define CLAMP_T_CASE(ctype, name) \
+    case DType::name: clamp_tensor_loop<ctype>(iter, has_min, has_max); break;
     switch (common_dtype) {
         TENSORPLAY_FORALL_SCALAR_TYPES(CLAMP_T_CASE)
         default: TP_THROW(NotImplementedError, "CUDA clamp.Tensor: unsupported dtype");
     }
     #undef CLAMP_T_CASE
-    CUDA_CHECK(cudaGetLastError());
     return result;
 }
 
