@@ -885,6 +885,34 @@ def _kill_switch() -> bool:
     return os.environ.get("TP_STAX_CPU_NATIVE", "") == "0"
 
 
+_RUNTIME_FINGERPRINTS: dict[str, str] = {}
+
+
+def _runtime_fingerprint(lib_dir: str) -> str:
+    """Identity of the runtime libraries a generated unit builds against.
+
+    A generated unit inlines the runtime's vector math through its headers,
+    and its own text says nothing about which version that was.  Without this
+    in the key, a kernel built before the library changed would be reused
+    afterwards, still carrying whatever the headers held when it was built.
+    Taken once per process: the libraries do not change under a running one.
+    """
+
+    known = _RUNTIME_FINGERPRINTS.get(lib_dir)
+    if known is not None:
+        return known
+    parts: list[str] = []
+    for name in ("libp10.so", "libtpx.so", "libtp_python.so"):
+        try:
+            info = os.stat(os.path.join(lib_dir, name))
+        except OSError:
+            continue
+        parts.append(f"{name}:{info.st_size}:{int(info.st_mtime)}")
+    digest = hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+    _RUNTIME_FINGERPRINTS[lib_dir] = digest
+    return digest
+
+
 def compile_translation_unit(
     source: str,
     entry: str,
@@ -915,6 +943,7 @@ def compile_translation_unit(
         "ver": version_info[:32],
         "entry": entry,
         "bind": bind_tag,
+        "runtime": _runtime_fingerprint(lib_dir),
     }
     key = cache.cache_key(source, entry, key_options)
     source_path = cache.path_for(key, "cpp")
