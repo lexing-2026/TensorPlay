@@ -244,7 +244,7 @@ class Vectorized<complex<double>> {
   }
 
   Vectorized<value_type> log() const {
-    return map(tensorplay::log);
+    return map(std::log);
   }
   Vectorized<value_type> log2() const {
     auto ret = log();
@@ -270,16 +270,16 @@ class Vectorized<complex<double>> {
   }
 
   Vectorized<value_type> sin() const {
-    return map(tensorplay::sin);
+    return map(std::sin);
   }
   Vectorized<value_type> sinh() const {
-    return map(tensorplay::sinh);
+    return map(std::sinh);
   }
   Vectorized<value_type> cos() const {
-    return map(tensorplay::cos);
+    return map(std::cos);
   }
   Vectorized<value_type> cosh() const {
-    return map(tensorplay::cosh);
+    return map(std::cosh);
   }
   Vectorized<value_type> ceil() const {
     return {vec_ceil(_vec0), vec_ceil(_vec1)};
@@ -295,10 +295,10 @@ class Vectorized<complex<double>> {
     return {vec_rint(_vec0), vec_rint(_vec1)};
   }
   Vectorized<value_type> tan() const {
-    return map(tensorplay::tan);
+    return map(std::tan);
   }
   Vectorized<value_type> tanh() const {
-    return map(tensorplay::tanh);
+    return map(std::tanh);
   }
   Vectorized<value_type> trunc() const {
     return {vec_trunc(_vec0), vec_trunc(_vec1)};
@@ -307,7 +307,7 @@ class Vectorized<complex<double>> {
     return {vec_sqrt(_vec0), vec_sqrt(_vec1)};
   }
   Vectorized<value_type> sqrt() const {
-    return map(tensorplay::sqrt);
+    return map(std::sqrt);
   }
   Vectorized<value_type> reciprocal() const {
     auto c_d = *this ^ conj();
@@ -323,7 +323,7 @@ class Vectorized<complex<double>> {
     store(x_tmp);
     exp.store(y_tmp);
     for (const auto i : tensorplay::irange(size())) {
-      x_tmp[i] = tensorplay::pow(x_tmp[i], y_tmp[i]);
+      x_tmp[i] = std::pow(x_tmp[i], y_tmp[i]);
     }
     return loadu(x_tmp);
   }
@@ -335,7 +335,7 @@ class Vectorized<complex<double>> {
     return ln * Vectorized<value_type>(zvd_imag_half);
   }
   Vectorized<value_type> atanh() const {
-    return map(tensorplay::atanh);
+    return map(std::atanh);
   }
   Vectorized<value_type> acos() const {
     return Vectorized<value_type>(zvd_pi_2) - asin();
@@ -356,10 +356,10 @@ class Vectorized<complex<double>> {
     return ln.el_swapped().conj();
   }
   Vectorized<value_type> exp() const {
-    return map(tensorplay::exp);
+    return map(std::exp);
   }
   Vectorized<value_type> expm1() const {
-    return map(tensorplay::expm1);
+    return map(std::expm1);
   }
 
   Vectorized<value_type> eq(const Vectorized<value_type>& other) const {
