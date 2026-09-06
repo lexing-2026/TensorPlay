@@ -1767,6 +1767,19 @@ struct PowScalarFunctor {
     PowScalarFunctor(double e) : exponent(e) {}
     template<typename T> __device__ T operator()(T x) const { return pow(x, static_cast<T>(exponent)); }
 };
+struct PowBaseFunctor {
+    double base;
+    template<typename T> __device__ T operator()(T exponent) const {
+        return pow(static_cast<T>(base), exponent);
+    }
+};
+struct CxPowBase {
+    double re, im;
+    template <typename T>
+    __device__ thrust::complex<T> operator()(thrust::complex<T> exponent) const {
+        return pow(thrust::complex<T>(static_cast<T>(re), static_cast<T>(im)), exponent);
+    }
+};
 struct Atan2Functor { template<typename T> __device__ T operator()(T a, T b) const { return atan2(a, b); } };
 
 Tensor pow_kernel_cuda(const Tensor& self, const Tensor& other) {
@@ -1845,6 +1858,22 @@ Tensor pow_scalar_kernel_cuda(const Tensor& self, Scalar exponent) {
                                static_cast<float>(exponent.to<std::complex<double>>().imag())});
     }
     return unary_float_op_kernel_v2(self, PowScalarFunctor(exponent.toDouble()));
+}
+Tensor pow_scalar_tensor_kernel_cuda(Scalar base, const Tensor& exponent) {
+    const DType result_dtype = ops::result_type(base, exponent);
+    if (!base.isComplex() && base.toDouble() == 1.0) {
+        return Tensor::ones(static_cast<std::vector<int64_t>>(exponent.shape()),
+                            result_dtype, exponent.device());
+    }
+    Tensor exponent_cast = exponent.dtype() == result_dtype
+        ? exponent : exponent.to(result_dtype);
+    if (isComplexType(result_dtype)) {
+        const auto base_value = base.to<std::complex<double>>();
+        return complex_math_kernel_cuda(
+            exponent_cast, CxPowBase{base_value.real(), base_value.imag()});
+    }
+    return unary_float_op_kernel_v2(
+        exponent_cast, PowBaseFunctor{base.toDouble()});
 }
 Tensor atan2_kernel_cuda(const Tensor& self, const Tensor& other) { return binary_float_op_kernel_v2(self, other, Atan2Functor()); }
 
@@ -2197,6 +2226,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, PointwiseKernels) {
     
     m.impl("pow.Tensor_Tensor", pow_kernel_cuda);
     m.impl("pow.Tensor_Scalar", pow_scalar_kernel_cuda);
+    m.impl("pow.Scalar", pow_scalar_tensor_kernel_cuda);
     m.impl("atan2", atan2_kernel_cuda);
     m.impl("arctan2", atan2_kernel_cuda);
     
