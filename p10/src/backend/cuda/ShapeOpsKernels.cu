@@ -193,21 +193,16 @@ __global__ void flip_map_kernel(int64_t n, int64_t nd, const T* src, T* dst,
 }
 
 template <typename T>
-__global__ void roll_map_kernel(int64_t n, int64_t nd, const T* src, T* dst,
-                                const int64_t* sizes, const int64_t* shifts) {
+__global__ void roll_dim_kernel(int64_t n, int64_t size, int64_t stride,
+                                int64_t shift, const T* src, T* dst) {
     int64_t li = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; li < n; li += stride) {
-        int64_t r2 = li, src_off = 0, mult = 1;
-        for (int64_t d2 = nd - 1; d2 >= 0; --d2) {
-            int64_t c = r2 % sizes[d2];
-            r2 /= sizes[d2];
-            int64_t sc3 = c - shifts[d2];
-            if (sc3 < 0) sc3 += sizes[d2];
-            src_off += sc3 * mult;
-            mult *= sizes[d2];
-        }
-        dst[li] = src[src_off];
+    const int64_t grid_stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; li < n; li += grid_stride) {
+        const int64_t dim_index = (li / stride) % size;
+        const int64_t src_index = dim_index >= shift
+            ? li - shift * stride
+            : li + (size - shift) * stride;
+        dst[li] = src[src_index];
     }
 }
 
@@ -539,22 +534,19 @@ Tensor roll_cuda(const Tensor& self, const std::vector<int64_t>& shifts, const s
     }
     const int64_t dim = wrap_dim(dims[0], nd);
     const int64_t size = self.size(dim);
-    // roll_map_kernel reads src[c - sh] so a normalized positive shift keeps
-    // the mapping identical to cat({narrow(start), narrow(0, start)}).
-    std::vector<int64_t> sh(nd, 0);
-    sh[dim] = ((shifts[0] % size) + size) % size;
+    // A normalized positive shift reads from the preceding position along the
+    // selected dimension, wrapping at its lower boundary.
+    const int64_t shift = ((shifts[0] % size) + size) % size;
     Tensor sc = self.contiguous();
     Tensor out = empty_transform_output(sc);
     int64_t n = sc.numel();
-    Tensor d_sizes = pack_i64(shape_of(sc), sc.device());
-    Tensor d_sh = pack_i64(sh, sc.device());
     auto stream = getCurrentCUDAStream().stream();
     dim3 grid = make_grid(n), block(kThreads);
 #define TP_RL2(ctype, name_) \
     case DType::name_: \
-        roll_map_kernel<ctype><<<grid, block, 0, stream>>>( \
-            n, nd, sc.data_ptr<ctype>(), out.data_ptr<ctype>(), \
-            d_sizes.data_ptr<int64_t>(), d_sh.data_ptr<int64_t>()); \
+        roll_dim_kernel<ctype><<<grid, block, 0, stream>>>( \
+            n, size, sc.stride(dim), shift, sc.data_ptr<ctype>(), \
+            out.data_ptr<ctype>()); \
         break;
     switch (sc.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_RL2)
