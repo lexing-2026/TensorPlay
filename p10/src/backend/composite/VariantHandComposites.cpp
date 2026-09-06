@@ -640,8 +640,7 @@ Tensor mm_dtype_native(const Tensor& self, const Tensor& mat2, DType out_dtype) 
 
 Tensor& mm_dtype_out_native(const Tensor& self, const Tensor& mat2, DType out_dtype,
                             Tensor& out) {
-    out = mm_dtype_native(self, mat2, out_dtype);
-    return out;
+    return write_exact_out("mm", mm_dtype_native(self, mat2, out_dtype), out);
 }
 
 Tensor addmm_dtype_native(const Tensor& self, const Tensor& mat1, const Tensor& mat2,
@@ -652,8 +651,9 @@ Tensor addmm_dtype_native(const Tensor& self, const Tensor& mat1, const Tensor& 
 Tensor& addmm_dtype_out_native(const Tensor& self, const Tensor& mat1, const Tensor& mat2,
                                DType out_dtype, const Scalar& beta, const Scalar& alpha,
                                Tensor& out) {
-    out = addmm_dtype_native(self, mat1, mat2, out_dtype, beta, alpha);
-    return out;
+    return write_exact_out(
+        "addmm", addmm_dtype_native(self, mat1, mat2, out_dtype, beta, alpha),
+        out);
 }
 
 Tensor bmm_dtype_native(const Tensor& self, const Tensor& mat2, DType out_dtype) {
@@ -662,8 +662,7 @@ Tensor bmm_dtype_native(const Tensor& self, const Tensor& mat2, DType out_dtype)
 
 Tensor& bmm_dtype_out_native(const Tensor& self, const Tensor& mat2, DType out_dtype,
                              Tensor& out) {
-    out = bmm_dtype_native(self, mat2, out_dtype);
-    return out;
+    return write_exact_out("bmm", bmm_dtype_native(self, mat2, out_dtype), out);
 }
 
 Tensor baddbmm_dtype_native(const Tensor& self, const Tensor& batch1, const Tensor& batch2,
@@ -674,8 +673,9 @@ Tensor baddbmm_dtype_native(const Tensor& self, const Tensor& batch1, const Tens
 Tensor& baddbmm_dtype_out_native(const Tensor& self, const Tensor& batch1, const Tensor& batch2,
                                  DType out_dtype, const Scalar& beta, const Scalar& alpha,
                                  Tensor& out) {
-    out = baddbmm_dtype_native(self, batch1, batch2, out_dtype, beta, alpha);
-    return out;
+    return write_exact_out(
+        "baddbmm",
+        baddbmm_dtype_native(self, batch1, batch2, out_dtype, beta, alpha), out);
 }
 
 // ---- conv padding overloads ---------------------------------------------------
