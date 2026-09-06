@@ -1680,6 +1680,10 @@ Tensor cumsum_backward_cpu(const Tensor& grad, int64_t dim) {
         TP_CSB_CASE(double, double, Float64)
         TP_CSB_CASE(Half, float, Float16)
         TP_CSB_CASE(BFloat16, float, BFloat16)
+#define TP_CSB_COMPLEX_CASE(ctype, name) \
+        TP_CSB_CASE(ctype, ctype, name)
+        TENSORPLAY_FORALL_COMPLEX_TYPES(TP_CSB_COMPLEX_CASE)
+#undef TP_CSB_COMPLEX_CASE
         default: TP_THROW(TypeError, "cumsum_backward: unsupported dtype");
     }
 #undef TP_CSB_CASE
