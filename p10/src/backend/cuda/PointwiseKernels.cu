@@ -373,34 +373,37 @@ Tensor unary_float_op_kernel_v2(const Tensor& self, Functor functor) {
     DType out_dtype = self.dtype();
     if (isIntegralType(out_dtype)) out_dtype = DType::Float32;
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), out_dtype, self.device());
-    int64_t n = self.numel();
-    if (n == 0) return result;
-    dim3 block(256);
-    dim3 grid((n + 255) / 256);
-    Tensor self_contig = self.contiguous();
-    
-    if (out_dtype == DType::Float16 || out_dtype == DType::BFloat16) {
-        #define REDUCED_FLOAT_CASE(ctype, name) \
-        case DType::name: { \
-            launch_unary_reduced_float<ctype>(n, self_contig.data_ptr<ctype>(), result.data_ptr<ctype>(), functor); \
-            break; \
-        }
-        switch (self.dtype()) {
-            REDUCED_FLOAT_CASE(Half, Float16)
-            REDUCED_FLOAT_CASE(BFloat16, BFloat16)
-            default: TP_THROW(TypeError, "CUDA unary float op: Unsupported dtype");
-        }
-        #undef REDUCED_FLOAT_CASE
-    } else if (out_dtype == DType::Float32) {
-        Tensor in = (self.dtype() == DType::Float32) ? self_contig : self_contig.to(DType::Float32);
-        launch_unary<float>(n, in.data_ptr<float>(), result.data_ptr<float>(), functor);
-    } else if (out_dtype == DType::Float64) {
-        Tensor in = (self.dtype() == DType::Float64) ? self_contig : self_contig.to(DType::Float64);
-        launch_unary<double>(n, in.data_ptr<double>(), result.data_ptr<double>(), functor);
-    } else {
-        TP_THROW(TypeError, "CUDA unary float op: Unsupported output dtype");
+    if (self.numel() == 0) return result;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(self.dtype() == out_dtype)
+        .add_output(result)
+        .add_input(self)
+        .build();
+
+    switch (out_dtype) {
+        case DType::Float16:
+            gpu_kernel(iter, [functor] __device__(Half x) -> Half {
+                return static_cast<Half>(functor(static_cast<float>(x)));
+            });
+            break;
+        case DType::BFloat16:
+            gpu_kernel(iter, [functor] __device__(BFloat16 x) -> BFloat16 {
+                return static_cast<BFloat16>(functor(static_cast<float>(x)));
+            });
+            break;
+        case DType::Float32:
+            gpu_kernel(iter, [functor] __device__(float x) -> float {
+                return functor(x);
+            });
+            break;
+        case DType::Float64:
+            gpu_kernel(iter, [functor] __device__(double x) -> double {
+                return functor(x);
+            });
+            break;
+        default:
+            TP_THROW(TypeError, "CUDA unary float op: Unsupported output dtype");
     }
-    CUDA_CHECK(cudaGetLastError());
     return result;
 }
 
