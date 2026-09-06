@@ -4,6 +4,7 @@
 #include "Tensor.h"
 #include "TypePromotion.h"
 #include "CUDARuntime.h"
+#include "CUDALoops.cuh"
 #include "Complex.h"
 #include "Exception.h"
 #include "Utils.h"
@@ -238,43 +239,69 @@ Tensor complex_cuda(const Tensor& re, const Tensor& im) {
     const DType fdt = re.dtype();
     const DType cdt = toComplexType(fdt);
     std::vector<int64_t> shape = broadcast_shapes(shape_of(re), shape_of(im));
-    Tensor rc = re.expand(shape).contiguous();
-    Tensor ic = im.expand(shape).contiguous().to(rc.dtype());
     Tensor out = Tensor::empty(shape, cdt, re.device());
-    int64_t n = out.numel();
-    if (n == 0) return out;
-    auto stream = getCurrentCUDAStream();
-    dim3 grid = make_grid(n), block(kThreads);
+    if (out.numel() == 0) return out;
     switch (fdt) {
         case DType::Float16:
+        {
+            Tensor rc = re.expand(shape).contiguous();
+            Tensor ic = im.expand(shape).contiguous().to(rc.dtype());
+            const int64_t n = out.numel();
+            auto stream = getCurrentCUDAStream();
+            dim3 grid = make_grid(n), block(kThreads);
             cplx_pack_kernel<tensorplay::complex<Half>, Half>
                 <<<grid, block, 0, stream.stream()>>>(
                     n, rc.data_ptr<Half>(), ic.data_ptr<Half>(),
                     static_cast<tensorplay::complex<Half>*>(out.data_ptr()));
+            CUDA_CHECK(cudaGetLastError());
             break;
+        }
         case DType::Float32:
-            cplx_pack_kernel<std::complex<float>, float>
-                <<<grid, block, 0, stream.stream()>>>(
-                    n, rc.data_ptr<float>(), ic.data_ptr<float>(),
-                    out.data_ptr<std::complex<float>>());
+        {
+            TensorIterator iter = TensorIteratorConfig()
+                .check_all_same_dtype(false)
+                .add_output(out)
+                .add_input(re)
+                .add_input(im)
+                .build();
+            gpu_kernel(iter, [] __device__ (float real, float imag)
+                -> std::complex<float> {
+                return std::complex<float>(real, imag);
+            });
             break;
+        }
         case DType::Float64:
-            cplx_pack_kernel<std::complex<double>, double>
-                <<<grid, block, 0, stream.stream()>>>(
-                    n, rc.data_ptr<double>(), ic.data_ptr<double>(),
-                    out.data_ptr<std::complex<double>>());
+        {
+            TensorIterator iter = TensorIteratorConfig()
+                .check_all_same_dtype(false)
+                .add_output(out)
+                .add_input(re)
+                .add_input(im)
+                .build();
+            gpu_kernel(iter, [] __device__ (double real, double imag)
+                -> std::complex<double> {
+                return std::complex<double>(real, imag);
+            });
             break;
+        }
         case DType::BFloat16:
+        {
+            Tensor rc = re.expand(shape).contiguous();
+            Tensor ic = im.expand(shape).contiguous().to(rc.dtype());
+            const int64_t n = out.numel();
+            auto stream = getCurrentCUDAStream();
+            dim3 grid = make_grid(n), block(kThreads);
             cplx_pack_kernel<tensorplay::complex<BFloat16>, BFloat16>
                 <<<grid, block, 0, stream.stream()>>>(
                     n, rc.data_ptr<BFloat16>(), ic.data_ptr<BFloat16>(),
                     static_cast<tensorplay::complex<BFloat16>*>(
                         out.data_ptr()));
+            CUDA_CHECK(cudaGetLastError());
             break;
+        }
         default:
             TP_THROW(NotImplementedError, "complex does not support this dtype");
     }
-    CUDA_CHECK(cudaGetLastError());
     return out;
 }
 
@@ -283,44 +310,71 @@ Tensor polar_cuda(const Tensor& abs_, const Tensor& angle_) {
     const DType fdt = abs_.dtype();
     const DType cdt = toComplexType(fdt);
     std::vector<int64_t> shape = broadcast_shapes(shape_of(abs_), shape_of(angle_));
-    const DType math_dtype = fdt == DType::Float64 ? DType::Float64 : DType::Float32;
-    Tensor a = abs_.expand(shape).contiguous().to(math_dtype);
-    Tensor th = angle_.expand(shape).contiguous().to(math_dtype);
     Tensor out = Tensor::empty(shape, cdt, abs_.device());
-    int64_t n = out.numel();
-    if (n == 0) return out;
-    auto stream = getCurrentCUDAStream();
-    dim3 grid = make_grid(n), block(kThreads);
+    if (out.numel() == 0) return out;
     switch (cdt) {
         case DType::ComplexHalf:
+        {
+            Tensor a = abs_.expand(shape).contiguous().to(DType::Float32);
+            Tensor th = angle_.expand(shape).contiguous().to(DType::Float32);
+            const int64_t n = out.numel();
+            auto stream = getCurrentCUDAStream();
+            dim3 grid = make_grid(n), block(kThreads);
             polar_kernel<tensorplay::complex<Half>, float>
                 <<<grid, block, 0, stream.stream()>>>(
                     n, a.data_ptr<float>(), th.data_ptr<float>(),
                     static_cast<tensorplay::complex<Half>*>(out.data_ptr()));
+            CUDA_CHECK(cudaGetLastError());
             break;
+        }
         case DType::ComplexFloat:
-            polar_kernel<std::complex<float>, float>
-                <<<grid, block, 0, stream.stream()>>>(
-                    n, a.data_ptr<float>(), th.data_ptr<float>(),
-                    out.data_ptr<std::complex<float>>());
+        {
+            TensorIterator iter = TensorIteratorConfig()
+                .check_all_same_dtype(false)
+                .add_output(out)
+                .add_input(abs_)
+                .add_input(angle_)
+                .build();
+            gpu_kernel(iter, [] __device__ (float radius, float angle)
+                -> std::complex<float> {
+                return std::complex<float>(radius * ::cosf(angle),
+                                           radius * ::sinf(angle));
+            });
             break;
+        }
         case DType::ComplexDouble:
-            polar_kernel<std::complex<double>, double>
-                <<<grid, block, 0, stream.stream()>>>(
-                    n, a.data_ptr<double>(), th.data_ptr<double>(),
-                    out.data_ptr<std::complex<double>>());
+        {
+            TensorIterator iter = TensorIteratorConfig()
+                .check_all_same_dtype(false)
+                .add_output(out)
+                .add_input(abs_)
+                .add_input(angle_)
+                .build();
+            gpu_kernel(iter, [] __device__ (double radius, double angle)
+                -> std::complex<double> {
+                return std::complex<double>(radius * ::cos(angle),
+                                            radius * ::sin(angle));
+            });
             break;
+        }
         case DType::BComplex32:
+        {
+            Tensor a = abs_.expand(shape).contiguous().to(DType::Float32);
+            Tensor th = angle_.expand(shape).contiguous().to(DType::Float32);
+            const int64_t n = out.numel();
+            auto stream = getCurrentCUDAStream();
+            dim3 grid = make_grid(n), block(kThreads);
             polar_kernel<tensorplay::complex<BFloat16>, float>
                 <<<grid, block, 0, stream.stream()>>>(
                     n, a.data_ptr<float>(), th.data_ptr<float>(),
                     static_cast<tensorplay::complex<BFloat16>*>(
                         out.data_ptr()));
+            CUDA_CHECK(cudaGetLastError());
             break;
+        }
         default:
             TP_THROW(NotImplementedError, "polar does not support this dtype");
     }
-    CUDA_CHECK(cudaGetLastError());
     return out;
 }
 
