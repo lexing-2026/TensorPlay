@@ -2900,14 +2900,13 @@ std::tuple<Tensor, Tensor, Tensor> _unique2_cuda(const Tensor& self, bool sorted
 // every column pair is equal (a NaN cell never matches another NaN).
 template <typename T>
 __global__ void unique_row_equal_kernel(int64_t n, int64_t row_len,
-                                        const T* rows, const int64_t* order,
-                                        int64_t* is_new) {
+                                        const T* rows, int64_t* is_new) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += stride) {
         if (i == 0) { is_new[0] = 1; continue; }
-        const T* cur = rows + order[i] * row_len;
-        const T* prev = rows + order[i - 1] * row_len;
+        const T* cur = rows + i * row_len;
+        const T* prev = rows + (i - 1) * row_len;
         int64_t same = 1;
         for (int64_t c = 0; c < row_len; ++c) {
             if (cur[c] != prev[c]) { same = 0; break; }
@@ -2928,7 +2927,7 @@ __global__ void unique_row_emit_kernel(int64_t n, int64_t row_len,
     for (; i < n; i += stride) {
         const int64_t row = order[i];
         const int64_t g = gid[i] - 1;  // inclusive cumsum -> 0-based group id
-        const T* src = rows + row * row_len;
+        const T* src = rows + i * row_len;
         T* dst = out + g * row_len;
         for (int64_t c = 0; c < row_len; ++c) dst[c] = src[c];
         inverse[row] = g;
@@ -2989,10 +2988,9 @@ std::tuple<Tensor, Tensor, Tensor> unique_dim_cuda_impl(const Tensor& self,
             Tensor col_sorted, col_order;
             std::tie(col_sorted, col_order) = sort_cuda(col, 0, false);
             // col_order indexes rows within the current rows_sorted layout.
-            // Compose with the accumulated permutation and gather rows.
-            Tensor composed = col_order.gather(0, order.gather(0, col_order));
-            order = composed;
-            Tensor idx = order.reshape({n, 1})
+            // Apply the same permutation to the row data and original indices.
+            order = order.gather(0, col_order);
+            Tensor idx = col_order.reshape({n, 1})
                              .expand(std::vector<int64_t>{n, row_len});
             rows_sorted = rows_sorted.gather(0, idx);
         }
@@ -3007,7 +3005,7 @@ std::tuple<Tensor, Tensor, Tensor> unique_dim_cuda_impl(const Tensor& self,
     case DType::name:                                                          \
         unique_row_equal_kernel<ctype><<<blocks, threads, 0, stream>>>(        \
             n, row_len, rows_sorted.data_ptr<ctype>(),                         \
-            order.data_ptr<int64_t>(), flags.data_ptr<int64_t>());             \
+            flags.data_ptr<int64_t>());                                         \
         break;
     switch (self.dtype()) {
         UNIQUE_ROW_CASE(float, Float32)
