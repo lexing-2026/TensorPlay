@@ -1591,6 +1591,10 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PoolingKernels) {
     m.impl("adaptive_avg_pool3d", adaptive_avg_pool3d_cpu);
     m.impl("adaptive_avg_pool3d_backward", adaptive_avg_pool3d_backward_cpu);
     m.impl("adaptive_avg_pool2d_backward", adaptive_avg_pool2d_backward_cpu);
+    m.impl("_adaptive_avg_pool2d", adaptive_avg_pool2d_cpu);
+    m.impl("_adaptive_avg_pool2d_backward", adaptive_avg_pool2d_backward_cpu);
+    m.impl("_adaptive_avg_pool3d", adaptive_avg_pool3d_cpu);
+    m.impl("_adaptive_avg_pool3d_backward", adaptive_avg_pool3d_backward_cpu);
     m.impl("adaptive_max_pool2d_backward", adaptive_max_pool2d_backward_cpu);
     m.impl("adaptive_max_pool2d_with_indices", adaptive_max_pool2d_with_indices_cpu);
     m.impl("adaptive_max_pool2d_with_indices_backward", adaptive_max_pool2d_with_indices_backward_cpu);
