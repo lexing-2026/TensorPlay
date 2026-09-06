@@ -5,6 +5,7 @@
 #include "SparseKernels.h"
 #include "Dispatcher.h"
 #include "Exception.h"
+#include "Context.h"
 #include "Quantizer.h"
 #include "Scalar.h"
 #include "TypePromotion.h"
@@ -238,6 +239,11 @@ std::tuple<Tensor, Tensor> median_dim_values_native(const Tensor& self, int64_t 
 }
 
 // ---- sort / topk ------------------------------------------------------------
+// `stable` requests that equal elements keep their input order; it does not
+// forbid an implementation from always doing so.  Every backend sort here
+// breaks ties on the source index (the CPU comparator's final `a.second <
+// b.second`, the radix passes' index key), so the flag selects between two
+// identical orderings and only has to be accepted, not acted on.
 std::tuple<Tensor, Tensor> sort_stable_native(const Tensor& self,
                                               std::optional<bool> stable, int64_t dim,
                                               bool descending) {
@@ -1232,6 +1238,18 @@ Tensor sparse_coo_tensor_size_native(const std::vector<int64_t>& size,
     return ops::sparse_coo_tensor(indices, values, size, false);
 }
 
+Tensor build_compressed_layout_tensor(
+    const Tensor& compressed_indices, const Tensor& plain_indices,
+    const Tensor& values, std::optional<std::vector<int64_t>> size,
+    std::optional<DType> dtype, std::optional<int64_t> layout,
+    std::optional<Device> device, std::optional<bool> pin_memory,
+    bool validate_inputs, int fallback_layout, const char* name);
+
+void validate_compressed_components(
+    const Tensor& compressed_indices, const Tensor& plain_indices,
+    const Tensor& values, const std::vector<int64_t>& size, int layout,
+    const char* name);
+
 void validate_csr_components(const Tensor& crow_indices,
                              const Tensor& col_indices,
                              const Tensor& values,
@@ -1392,9 +1410,14 @@ Tensor build_csr_tensor(const Tensor& crow_indices,
                         std::optional<Device> device,
                         std::optional<bool> pin_memory,
                         bool validate_inputs) {
-    return build_compressed_tensor(crow_indices, col_indices, values, size,
-                                   dtype, layout, device, pin_memory,
-                                   validate_inputs, {0, 0});
+    if (layout.has_value() &&
+        *layout != TensorImpl::kSparseCSRLayout) {
+        TP_THROW(ValueError, "sparse_csr_tensor: layout must be sparse_csr");
+    }
+    return build_compressed_layout_tensor(
+        crow_indices, col_indices, values, size, dtype, layout, device,
+        pin_memory, validate_inputs, TensorImpl::kSparseCSRLayout,
+        "sparse_csr_tensor");
 }
 
 // Dense -> compressed sparse wrappers.  Each public spelling pins the
@@ -1484,7 +1507,614 @@ void validate_sparse_csr_tensor_args_native(
     const Tensor& crow_indices, const Tensor& col_indices, const Tensor& values,
     const std::vector<int64_t>& size, std::optional<bool> check_pinning) {
     (void)check_pinning;
-    validate_csr_components(crow_indices, col_indices, values, size);
+    validate_compressed_components(crow_indices, col_indices, values, size,
+                                   TensorImpl::kSparseCSRLayout,
+                                   "_validate_sparse_csr_tensor_args");
+}
+
+// ---------------------------------------------------------------------------
+// Compressed-sparse constructors.
+//
+// Batch axes stay on the compressed/plain index tensors and on the values
+// tensor: compressed/plain are (*batch, units+1)/(*batch, nnz), while values
+// are (*batch, nnz, *block, *dense).  The shared helper supports CSR, CSC, BSR,
+// and BSC with that representation.
+// ---------------------------------------------------------------------------
+
+bool layout_is_row_compressed(int layout) {
+    return layout == TensorImpl::kSparseCSRLayout ||
+           layout == TensorImpl::kSparseBSRLayout;
+}
+
+bool layout_is_blocked(int layout) {
+    return layout == TensorImpl::kSparseBSRLayout ||
+           layout == TensorImpl::kSparseBSCLayout;
+}
+
+int resolve_compressed_layout(std::optional<int64_t> layout, int fallback,
+                              const char* name) {
+    const int resolved =
+        layout.has_value() ? static_cast<int>(*layout) : fallback;
+    if (resolved != TensorImpl::kSparseCSRLayout &&
+        resolved != TensorImpl::kSparseCSCLayout &&
+        resolved != TensorImpl::kSparseBSRLayout &&
+        resolved != TensorImpl::kSparseBSCLayout) {
+        TP_THROW(ValueError, name,
+                 ": layout must be one of "
+                 "sparse_csr/sparse_csc/sparse_bsr/sparse_bsc");
+    }
+    return resolved;
+}
+
+// Block extents a values payload declares: (*batch, nnz, b0, b1, *dense) for
+// the blocked layouts, (*batch, nnz, *dense) otherwise.
+std::array<int64_t, 2> blocksize_of_values(const Tensor& values,
+                                           int64_t batch_ndim, int layout,
+                                           const char* name) {
+    if (!layout_is_blocked(layout)) return {1, 1};
+    if (values.dim() < batch_ndim + 3) {
+        TP_THROW(ValueError, name,
+                 ": blocked layouts need values shaped "
+                 "(*batch, nnz, block_rows, block_cols, ...)");
+    }
+    return {values.size(batch_ndim + 1), values.size(batch_ndim + 2)};
+}
+
+struct CompressedGeometry {
+    int64_t comp_units;   // entries the compressed pointer array indexes
+    int64_t plain_units;  // exclusive upper bound of a plain coordinate
+};
+
+CompressedGeometry compressed_geometry(const std::vector<int64_t>& size,
+                                       int64_t dense_dim,
+                                       int layout,
+                                       std::array<int64_t, 2> blocksize,
+                                       const char* name) {
+    const int64_t ndim = static_cast<int64_t>(size.size());
+    const int64_t batch_dim = ndim - 2 - dense_dim;
+    if (batch_dim < 0) {
+        TP_THROW(ValueError, name, ": size must hold at least dense_dim(=",
+                 dense_dim, ") + 2 entries, got ", ndim);
+    }
+    for (int64_t extent : size) {
+        if (extent < 0) {
+            TP_THROW(ValueError, name, ": sizes must be non-negative");
+        }
+    }
+    const int64_t rows = size[batch_dim];
+    const int64_t cols = size[batch_dim + 1];
+
+    const bool row_compressed = layout_is_row_compressed(layout);
+    const int64_t b0 = blocksize[0];
+    const int64_t b1 = blocksize[1];
+    if (b0 <= 0 || b1 <= 0) {
+        TP_THROW(ValueError, name, ": block sizes must be positive");
+    }
+    const int64_t comp_axis = row_compressed ? rows : cols;
+    const int64_t plain_axis = row_compressed ? cols : rows;
+    const int64_t comp_extent = row_compressed ? b0 : b1;
+    const int64_t plain_extent = row_compressed ? b1 : b0;
+    if (comp_axis % comp_extent != 0 || plain_axis % plain_extent != 0) {
+        TP_THROW(ValueError, name,
+                 ": sizes must be divisible by the block sizes");
+    }
+    return {comp_axis / comp_extent, plain_axis / plain_extent};
+}
+
+// Dense trailing rank a values payload carries beyond (*batch, nnz[, b0, b1]).
+int64_t dense_dim_of_values(const Tensor& values, int64_t batch_ndim,
+                            int layout, const char* name) {
+    const int64_t payload_rank =
+        batch_ndim + (layout_is_blocked(layout) ? 3 : 1);
+    if (values.dim() < payload_rank) {
+        TP_THROW(ValueError, name, ": values rank is incompatible with the "
+                 "index rank");
+    }
+    return values.dim() - payload_rank;
+}
+
+// Read an index tensor as host Int64 so the structural checks below can walk
+// it regardless of the device or index width it was built with.
+Tensor index_as_host_int64(const Tensor& indices) {
+    Tensor host = indices.device().is_cpu()
+        ? indices.contiguous()
+        : indices.to(Device(DeviceType::CPU)).contiguous();
+    return host.dtype() == DType::Int64 ? host : host.to(DType::Int64);
+}
+
+void validate_compressed_components(const Tensor& compressed_indices,
+                                    const Tensor& plain_indices,
+                                    const Tensor& values,
+                                    const std::vector<int64_t>& size,
+                                    int layout,
+                                    const char* name) {
+    if (compressed_indices.dim() < 1 ||
+        plain_indices.dim() != compressed_indices.dim()) {
+        TP_THROW(ValueError, name,
+                 ": compressed/plain indices must have the same rank and "
+                 "at least one dimension");
+    }
+    if ((compressed_indices.dtype() != DType::Int32 &&
+         compressed_indices.dtype() != DType::Int64) ||
+        plain_indices.dtype() != compressed_indices.dtype()) {
+        TP_THROW(TypeError, name,
+                 ": compressed/plain indices must have the same Int32 or "
+                 "Int64 dtype");
+    }
+    if (compressed_indices.device() != plain_indices.device() ||
+        compressed_indices.device() != values.device()) {
+        TP_THROW(DeviceMismatchError, name,
+                 ": indices and values must share one device");
+    }
+
+    const int64_t batch_ndim = compressed_indices.dim() - 1;
+    const std::array<int64_t, 2> blocksize =
+        blocksize_of_values(values, batch_ndim, layout, name);
+    const int64_t dense_dim =
+        dense_dim_of_values(values, batch_ndim, layout, name);
+    const CompressedGeometry geom =
+        compressed_geometry(size, dense_dim, layout, blocksize, name);
+    const int64_t block_ndim = layout_is_blocked(layout) ? 2 : 0;
+    if (static_cast<int64_t>(size.size()) !=
+        batch_ndim + 2 + dense_dim) {
+        TP_THROW(ValueError, name,
+                 ": size rank does not match the index/value ranks");
+    }
+    for (int64_t d = 0; d < batch_ndim; ++d) {
+        if (compressed_indices.size(d) != size[static_cast<size_t>(d)] ||
+            plain_indices.size(d) != size[static_cast<size_t>(d)] ||
+            values.size(d) != size[static_cast<size_t>(d)]) {
+            TP_THROW(ValueError, name,
+                     ": batch dimensions of indices, values, and size must "
+                     "match");
+        }
+    }
+    const int64_t nnz = values.size(batch_ndim);
+
+    if (compressed_indices.size(batch_ndim) != geom.comp_units + 1) {
+        TP_THROW(ValueError, name, ": compressed indices must have ",
+                 geom.comp_units + 1, " entries, got ",
+                 compressed_indices.size(batch_ndim));
+    }
+    if (plain_indices.size(batch_ndim) != nnz) {
+        TP_THROW(ValueError, name,
+                 ": plain indices and values must agree on nnz");
+    }
+    if (compressed_indices.stride(-1) != 1 ||
+        plain_indices.stride(-1) != 1) {
+        TP_THROW(ValueError, name,
+                 ": the last index dimension must have stride 1");
+    }
+    if (layout_is_blocked(layout) &&
+        (values.size(batch_ndim + 1) != blocksize[0] ||
+         values.size(batch_ndim + 2) != blocksize[1])) {
+        TP_THROW(ValueError, name,
+                 ": values block dimensions do not match the layout");
+    }
+    const int64_t dense_start = batch_ndim + 1 + block_ndim;
+    for (int64_t d = 0; d < dense_dim; ++d) {
+        if (values.size(dense_start + d) !=
+            size[static_cast<size_t>(batch_ndim + 2 + d)]) {
+            TP_THROW(ValueError, name,
+                     ": values dense dimensions must match size");
+        }
+    }
+
+    const Tensor comp64 = index_as_host_int64(compressed_indices);
+    const Tensor plain64 = index_as_host_int64(plain_indices);
+    const int64_t* comp = comp64.data_ptr<int64_t>();
+    const int64_t* plain = plain64.data_ptr<int64_t>();
+    int64_t batch_count = 1;
+    for (int64_t d = 0; d < batch_ndim; ++d) {
+        batch_count *= compressed_indices.size(d);
+    }
+    for (int64_t batch = 0; batch < batch_count; ++batch) {
+        const int64_t comp_base = batch * (geom.comp_units + 1);
+        const int64_t plain_base = batch * nnz;
+        if (comp[comp_base] != 0) {
+            TP_THROW(ValueError, name,
+                     ": compressed indices must start at zero in every "
+                     "batch");
+        }
+        for (int64_t unit = 0; unit < geom.comp_units; ++unit) {
+            if (comp[comp_base + unit] > comp[comp_base + unit + 1]) {
+                TP_THROW(ValueError, name,
+                         ": compressed indices must be non-decreasing");
+            }
+        }
+        if (comp[comp_base + geom.comp_units] != nnz) {
+            TP_THROW(ValueError, name,
+                     ": last compressed index must equal nnz in every batch");
+        }
+        for (int64_t i = 0; i < nnz; ++i) {
+            if (plain[plain_base + i] < 0 ||
+                plain[plain_base + i] >= geom.plain_units) {
+                TP_THROW(ValueError, name, ": plain index is out of range");
+            }
+        }
+    }
+}
+
+// Recover (*batch, rows, cols, *dense) for the spellings that omit `size`: the
+// compressed axis is described by the pointer array, the plain axis by the
+// largest coordinate that appears, and the remaining shape comes from values.
+std::vector<int64_t> infer_compressed_size(const Tensor& compressed_indices,
+                                           const Tensor& plain_indices,
+                                           const Tensor& values,
+                                           int layout,
+                                           std::array<int64_t, 2> blocksize,
+                                           const char* name) {
+    if (compressed_indices.dim() < 1 ||
+        plain_indices.dim() != compressed_indices.dim()) {
+        TP_THROW(ValueError, name,
+                 ": compressed/plain indices must have the same rank and "
+                 "at least one dimension");
+    }
+    if (compressed_indices.dtype() != plain_indices.dtype() ||
+        (compressed_indices.dtype() != DType::Int32 &&
+         compressed_indices.dtype() != DType::Int64)) {
+        TP_THROW(TypeError, name,
+                 ": compressed/plain indices must have the same Int32 or "
+                 "Int64 dtype");
+    }
+    const int64_t batch_ndim = compressed_indices.dim() - 1;
+    if (compressed_indices.size(batch_ndim) == 0) {
+        TP_THROW(ValueError, name, ": compressed indices must not be empty");
+    }
+    const int64_t dense_dim =
+        dense_dim_of_values(values, batch_ndim, layout, name);
+    if (dense_dim < 0) {
+        TP_THROW(ValueError, name,
+                 ": values rank is incompatible with the index rank");
+    }
+    for (int64_t d = 0; d < batch_ndim; ++d) {
+        if (compressed_indices.size(d) != plain_indices.size(d) ||
+            compressed_indices.size(d) != values.size(d)) {
+            TP_THROW(ValueError, name,
+                     ": batch dimensions of indices and values must match");
+        }
+    }
+    const Tensor plain64 = index_as_host_int64(plain_indices);
+    const int64_t nnz = plain_indices.size(batch_ndim);
+    const int64_t* plain = plain64.data_ptr<int64_t>();
+    int64_t plain_units = 0;
+    for (int64_t i = 0; i < plain64.numel(); ++i) {
+        if (plain[i] < 0) {
+            TP_THROW(ValueError, name, ": plain index must be non-negative");
+        }
+        plain_units = std::max(plain_units, plain[i] + 1);
+    }
+    const int64_t comp_units = compressed_indices.size(batch_ndim) - 1;
+    const bool row_compressed = layout_is_row_compressed(layout);
+    const int64_t comp_extent = row_compressed ? blocksize[0] : blocksize[1];
+    const int64_t plain_extent = row_compressed ? blocksize[1] : blocksize[0];
+    const int64_t comp_axis = comp_units * comp_extent;
+    const int64_t plain_axis = plain_units * plain_extent;
+    std::vector<int64_t> result;
+    for (int64_t d = 0; d < batch_ndim; ++d) {
+        result.push_back(compressed_indices.size(d));
+    }
+    if (row_compressed) {
+        result.push_back(comp_axis);
+        result.push_back(plain_axis);
+    } else {
+        result.push_back(plain_axis);
+        result.push_back(comp_axis);
+    }
+    const int64_t dense_start = batch_ndim + 1 +
+        (layout_is_blocked(layout) ? 2 : 0);
+    for (int64_t d = 0; d < dense_dim; ++d) {
+        result.push_back(values.size(dense_start + d));
+    }
+    return result;
+}
+
+// Shared body for every compressed constructor: move the components to the
+// requested dtype/device, fill in an omitted size, validate unless the caller
+// asked for the unchecked spelling, and install them under `layout`.
+Tensor build_compressed_layout_tensor(const Tensor& compressed_indices,
+                                      const Tensor& plain_indices,
+                                      const Tensor& values,
+                                      std::optional<std::vector<int64_t>> size,
+                                      std::optional<DType> dtype,
+                                      std::optional<int64_t> layout,
+                                      std::optional<Device> device,
+                                      std::optional<bool> pin_memory,
+                                      bool validate_inputs,
+                                      int fallback_layout,
+                                      const char* name) {
+    if (fallback_layout < TensorImpl::kSparseCSRLayout &&
+        !layout.has_value()) {
+        TP_THROW(ValueError, name,
+                 " expected sparse compressed tensor layout but got none");
+    }
+    if (fallback_layout >= TensorImpl::kSparseCSRLayout && layout.has_value() &&
+        *layout != fallback_layout) {
+        TP_THROW(ValueError, name,
+                 ": layout does not match the constructor spelling");
+    }
+    const int resolved_layout =
+        resolve_compressed_layout(layout, fallback_layout, name);
+    Tensor target_compressed = compressed_indices;
+    Tensor target_plain = plain_indices;
+    Tensor target_values = values;
+    if (device.has_value()) {
+        target_compressed = target_compressed.to(*device);
+        target_plain = target_plain.to(*device);
+        target_values = target_values.to(*device);
+    }
+    if (dtype.has_value() && *dtype != DType::Undefined &&
+        target_values.dtype() != *dtype) {
+        target_values = target_values.to(*dtype);
+    }
+    if (pin_memory.value_or(false)) {
+        target_compressed = target_compressed.pin_memory();
+        target_plain = target_plain.pin_memory();
+        target_values = target_values.pin_memory();
+    }
+    const int64_t batch_ndim = target_compressed.dim() - 1;
+    const std::array<int64_t, 2> blocksize =
+        blocksize_of_values(target_values, batch_ndim, resolved_layout, name);
+    if (!size.has_value()) {
+        size = infer_compressed_size(target_compressed, target_plain,
+                                     target_values, resolved_layout, blocksize,
+                                     name);
+    }
+    if (validate_inputs) {
+        validate_compressed_components(target_compressed, target_plain,
+                                       target_values, *size, resolved_layout,
+                                       name);
+    }
+    return Tensor::make_sparse_compressed_tensor(
+        target_compressed, target_plain, target_values, *size, resolved_layout,
+        blocksize);
+}
+
+Tensor sparse_compressed_tensor_comp_plain_value_size_native(
+    const Tensor& compressed_indices, const Tensor& plain_indices,
+    const Tensor& values, const std::vector<int64_t>& size,
+    std::optional<DType> dtype, std::optional<int64_t> layout,
+    std::optional<Device> device, std::optional<bool> pin_memory) {
+    return build_compressed_layout_tensor(
+        compressed_indices, plain_indices, values, size, dtype, layout, device,
+        pin_memory, true, -1,
+        "sparse_compressed_tensor");
+}
+
+Tensor sparse_compressed_tensor_comp_plain_value_native(
+    const Tensor& compressed_indices, const Tensor& plain_indices,
+    const Tensor& values, std::optional<DType> dtype,
+    std::optional<int64_t> layout, std::optional<Device> device,
+    std::optional<bool> pin_memory) {
+    return build_compressed_layout_tensor(
+        compressed_indices, plain_indices, values, std::nullopt, dtype, layout,
+        device, pin_memory, true, -1,
+        "sparse_compressed_tensor");
+}
+
+Tensor sparse_compressed_tensor_unsafe_native(
+    const Tensor& compressed_indices, const Tensor& plain_indices,
+    const Tensor& values, const std::vector<int64_t>& size,
+    std::optional<DType> dtype, std::optional<int64_t> layout,
+    std::optional<Device> device, std::optional<bool> pin_memory) {
+    return build_compressed_layout_tensor(
+        compressed_indices, plain_indices, values, size, dtype, layout, device,
+        pin_memory, false, -1,
+        "_sparse_compressed_tensor_unsafe");
+}
+
+// The layout-pinned spellings differ only in which layout they fall back to
+// when the caller leaves the kwarg unset.
+Tensor sparse_csc_tensor_ccol_row_value_size_native(
+    const Tensor& ccol_indices, const Tensor& row_indices, const Tensor& values,
+    const std::vector<int64_t>& size, std::optional<DType> dtype,
+    std::optional<int64_t> layout, std::optional<Device> device,
+    std::optional<bool> pin_memory) {
+    return build_compressed_layout_tensor(
+        ccol_indices, row_indices, values, size, dtype, layout, device,
+        pin_memory, true, TensorImpl::kSparseCSCLayout, "sparse_csc_tensor");
+}
+
+Tensor sparse_csc_tensor_ccol_row_value_native(
+    const Tensor& ccol_indices, const Tensor& row_indices, const Tensor& values,
+    std::optional<DType> dtype, std::optional<int64_t> layout,
+    std::optional<Device> device, std::optional<bool> pin_memory) {
+    return build_compressed_layout_tensor(
+        ccol_indices, row_indices, values, std::nullopt, dtype, layout, device,
+        pin_memory, true, TensorImpl::kSparseCSCLayout, "sparse_csc_tensor");
+}
+
+Tensor sparse_csc_tensor_unsafe_native(
+    const Tensor& ccol_indices, const Tensor& row_indices, const Tensor& values,
+    const std::vector<int64_t>& size, std::optional<DType> dtype,
+    std::optional<int64_t> layout, std::optional<Device> device,
+    std::optional<bool> pin_memory) {
+    return build_compressed_layout_tensor(
+        ccol_indices, row_indices, values, size, dtype, layout, device,
+        pin_memory, false, TensorImpl::kSparseCSCLayout,
+        "_sparse_csc_tensor_unsafe");
+}
+
+Tensor sparse_bsr_tensor_crow_col_value_size_native(
+    const Tensor& crow_indices, const Tensor& col_indices, const Tensor& values,
+    const std::vector<int64_t>& size, std::optional<DType> dtype,
+    std::optional<int64_t> layout, std::optional<Device> device,
+    std::optional<bool> pin_memory) {
+    return build_compressed_layout_tensor(
+        crow_indices, col_indices, values, size, dtype, layout, device,
+        pin_memory, true, TensorImpl::kSparseBSRLayout, "sparse_bsr_tensor");
+}
+
+Tensor sparse_bsr_tensor_crow_col_value_native(
+    const Tensor& crow_indices, const Tensor& col_indices, const Tensor& values,
+    std::optional<DType> dtype, std::optional<int64_t> layout,
+    std::optional<Device> device, std::optional<bool> pin_memory) {
+    return build_compressed_layout_tensor(
+        crow_indices, col_indices, values, std::nullopt, dtype, layout, device,
+        pin_memory, true, TensorImpl::kSparseBSRLayout, "sparse_bsr_tensor");
+}
+
+Tensor sparse_bsr_tensor_unsafe_native(
+    const Tensor& crow_indices, const Tensor& col_indices, const Tensor& values,
+    const std::vector<int64_t>& size, std::optional<DType> dtype,
+    std::optional<int64_t> layout, std::optional<Device> device,
+    std::optional<bool> pin_memory) {
+    return build_compressed_layout_tensor(
+        crow_indices, col_indices, values, size, dtype, layout, device,
+        pin_memory, false, TensorImpl::kSparseBSRLayout,
+        "_sparse_bsr_tensor_unsafe");
+}
+
+Tensor sparse_bsc_tensor_ccol_row_value_size_native(
+    const Tensor& ccol_indices, const Tensor& row_indices, const Tensor& values,
+    const std::vector<int64_t>& size, std::optional<DType> dtype,
+    std::optional<int64_t> layout, std::optional<Device> device,
+    std::optional<bool> pin_memory) {
+    return build_compressed_layout_tensor(
+        ccol_indices, row_indices, values, size, dtype, layout, device,
+        pin_memory, true, TensorImpl::kSparseBSCLayout, "sparse_bsc_tensor");
+}
+
+Tensor sparse_bsc_tensor_ccol_row_value_native(
+    const Tensor& ccol_indices, const Tensor& row_indices, const Tensor& values,
+    std::optional<DType> dtype, std::optional<int64_t> layout,
+    std::optional<Device> device, std::optional<bool> pin_memory) {
+    return build_compressed_layout_tensor(
+        ccol_indices, row_indices, values, std::nullopt, dtype, layout, device,
+        pin_memory, true, TensorImpl::kSparseBSCLayout, "sparse_bsc_tensor");
+}
+
+Tensor sparse_bsc_tensor_unsafe_native(
+    const Tensor& ccol_indices, const Tensor& row_indices, const Tensor& values,
+    const std::vector<int64_t>& size, std::optional<DType> dtype,
+    std::optional<int64_t> layout, std::optional<Device> device,
+    std::optional<bool> pin_memory) {
+    return build_compressed_layout_tensor(
+        ccol_indices, row_indices, values, size, dtype, layout, device,
+        pin_memory, false, TensorImpl::kSparseBSCLayout,
+        "_sparse_bsc_tensor_unsafe");
+}
+
+void validate_sparse_compressed_tensor_args_native(
+    const Tensor& compressed_indices, const Tensor& plain_indices,
+    const Tensor& values, const std::vector<int64_t>& size, int64_t layout,
+    std::optional<bool> check_pinning) {
+    (void)check_pinning;
+    const int resolved = resolve_compressed_layout(
+        layout, TensorImpl::kSparseCSRLayout,
+        "_validate_sparse_compressed_tensor_args");
+    validate_compressed_components(compressed_indices, plain_indices, values,
+                                   size, resolved,
+                                   "_validate_sparse_compressed_tensor_args");
+}
+
+void validate_sparse_csc_tensor_args_native(
+    const Tensor& ccol_indices, const Tensor& row_indices, const Tensor& values,
+    const std::vector<int64_t>& size, std::optional<bool> check_pinning) {
+    (void)check_pinning;
+    validate_compressed_components(ccol_indices, row_indices, values, size,
+                                   TensorImpl::kSparseCSCLayout,
+                                   "_validate_sparse_csc_tensor_args");
+}
+
+void validate_sparse_bsr_tensor_args_native(
+    const Tensor& crow_indices, const Tensor& col_indices, const Tensor& values,
+    const std::vector<int64_t>& size, std::optional<bool> check_pinning) {
+    (void)check_pinning;
+    validate_compressed_components(crow_indices, col_indices, values, size,
+                                   TensorImpl::kSparseBSRLayout,
+                                   "_validate_sparse_bsr_tensor_args");
+}
+
+void validate_sparse_bsc_tensor_args_native(
+    const Tensor& ccol_indices, const Tensor& row_indices, const Tensor& values,
+    const std::vector<int64_t>& size, std::optional<bool> check_pinning) {
+    (void)check_pinning;
+    validate_compressed_components(ccol_indices, row_indices, values, size,
+                                   TensorImpl::kSparseBSCLayout,
+                                   "_validate_sparse_bsc_tensor_args");
+}
+
+// Uninitialized compressed tensor with room for `nnz` stored units.  The
+// indices are left empty on purpose: this is the allocation half of a
+// build, and the caller fills the structure in afterwards, so the result does
+// not satisfy the layout invariants until it does.
+Tensor sparse_compressed_tensor_with_dims_native(
+    int64_t nnz, int64_t dense_dim, const std::vector<int64_t>& size,
+    const std::vector<int64_t>& blocksize, DType index_dtype,
+    std::optional<DType> dtype, std::optional<int64_t> layout,
+    std::optional<Device> device, std::optional<bool> pin_memory) {
+    const char* name = "_sparse_compressed_tensor_with_dims";
+    if (!layout.has_value()) {
+        TP_THROW(ValueError, name,
+                 ": expected a sparse compressed layout but got none");
+    }
+    const int resolved =
+        resolve_compressed_layout(layout, TensorImpl::kSparseCSRLayout, name);
+    if (nnz < 0) {
+        TP_THROW(ValueError, name, ": nnz must be non-negative, got ", nnz);
+    }
+    if (dense_dim < 0) {
+        TP_THROW(ValueError, name, ": dense_dim must be non-negative, got ",
+                 dense_dim);
+    }
+    if (index_dtype != DType::Int32 && index_dtype != DType::Int64) {
+        TP_THROW(TypeError, name, ": index dtype must be Int32 or Int64");
+    }
+    const bool blocked = layout_is_blocked(resolved);
+    if (blocked) {
+        if (blocksize.size() != 2) {
+            TP_THROW(ValueError, name,
+                     ": blocksize must have 2 entries for a blocked layout, got ",
+                     blocksize.size());
+        }
+    } else if (!blocksize.empty()) {
+        TP_THROW(ValueError, name,
+                 ": blocksize cannot be given for a non-blocked layout");
+    }
+    const std::array<int64_t, 2> extents =
+        blocked ? std::array<int64_t, 2>{blocksize[0], blocksize[1]}
+                : std::array<int64_t, 2>{1, 1};
+    const CompressedGeometry geom =
+        compressed_geometry(size, dense_dim, resolved, extents, name);
+
+    const int64_t batch_dim =
+        static_cast<int64_t>(size.size()) - 2 - dense_dim;
+    if (batch_dim < 0) {
+        TP_THROW(ValueError, name, ": size rank is smaller than dense_dim + 2");
+    }
+    std::vector<int64_t> batch_shape(size.begin(),
+                                     size.begin() + batch_dim);
+    std::vector<int64_t> compressed_shape = batch_shape;
+    compressed_shape.push_back(geom.comp_units + 1);
+    std::vector<int64_t> plain_shape = batch_shape;
+    plain_shape.push_back(nnz);
+    std::vector<int64_t> values_shape = batch_shape;
+    values_shape.push_back(nnz);
+    if (blocked) {
+        values_shape.push_back(extents[0]);
+        values_shape.push_back(extents[1]);
+    }
+    for (int64_t d = batch_dim + 2; d < static_cast<int64_t>(size.size()); ++d) {
+        values_shape.push_back(size[d]);
+    }
+
+    Tensor compressed_indices =
+        Tensor::empty(compressed_shape, index_dtype,
+                      device.value_or(globalContext().defaultDevice()));
+    Tensor plain_indices = Tensor::empty(
+        plain_shape, index_dtype,
+        device.value_or(globalContext().defaultDevice()));
+    Tensor values = Tensor::empty(
+        values_shape, dtype.value_or(globalContext().defaultDType()),
+        device.value_or(globalContext().defaultDevice()));
+    if (pin_memory.value_or(false)) {
+        compressed_indices = compressed_indices.pin_memory();
+        plain_indices = plain_indices.pin_memory();
+        values = values.pin_memory();
+    }
+    return Tensor::make_sparse_compressed_tensor(
+        compressed_indices, plain_indices, values, size, resolved, extents);
 }
 
 Tensor& multinomial_out_native(const Tensor& self, int64_t num_samples, bool replacement,
@@ -2012,6 +2642,37 @@ TENSORPLAY_LIBRARY_IMPL(Composite, VariantHandOps) {
     m.impl("_sparse_csr_tensor_unsafe", sparse_csr_tensor_unsafe_native);
     m.impl("_validate_sparse_csr_tensor_args",
            validate_sparse_csr_tensor_args_native);
+    m.impl("sparse_compressed_tensor.comp_plain_value_size",
+           sparse_compressed_tensor_comp_plain_value_size_native);
+    m.impl("sparse_compressed_tensor.comp_plain_value",
+           sparse_compressed_tensor_comp_plain_value_native);
+    m.impl("_sparse_compressed_tensor_unsafe",
+           sparse_compressed_tensor_unsafe_native);
+    m.impl("sparse_csc_tensor.ccol_row_value_size",
+           sparse_csc_tensor_ccol_row_value_size_native);
+    m.impl("sparse_csc_tensor.ccol_row_value",
+           sparse_csc_tensor_ccol_row_value_native);
+    m.impl("_sparse_csc_tensor_unsafe", sparse_csc_tensor_unsafe_native);
+    m.impl("sparse_bsr_tensor.crow_col_value_size",
+           sparse_bsr_tensor_crow_col_value_size_native);
+    m.impl("sparse_bsr_tensor.crow_col_value",
+           sparse_bsr_tensor_crow_col_value_native);
+    m.impl("_sparse_bsr_tensor_unsafe", sparse_bsr_tensor_unsafe_native);
+    m.impl("sparse_bsc_tensor.ccol_row_value_size",
+           sparse_bsc_tensor_ccol_row_value_size_native);
+    m.impl("sparse_bsc_tensor.ccol_row_value",
+           sparse_bsc_tensor_ccol_row_value_native);
+    m.impl("_sparse_bsc_tensor_unsafe", sparse_bsc_tensor_unsafe_native);
+    m.impl("_validate_sparse_compressed_tensor_args",
+           validate_sparse_compressed_tensor_args_native);
+    m.impl("_validate_sparse_csc_tensor_args",
+           validate_sparse_csc_tensor_args_native);
+    m.impl("_validate_sparse_bsr_tensor_args",
+           validate_sparse_bsr_tensor_args_native);
+    m.impl("_validate_sparse_bsc_tensor_args",
+           validate_sparse_bsc_tensor_args_native);
+    m.impl("_sparse_compressed_tensor_with_dims",
+           sparse_compressed_tensor_with_dims_native);
     m.impl("multinomial.out", multinomial_out_native);
     m.impl("linalg_lu_solve.out", linalg_lu_solve_out_native);
     m.impl("split_with_sizes_copy.out", split_with_sizes_copy_out_native);

@@ -2231,8 +2231,16 @@ void init_tensor(py::module_& m) {
         .def("is_floating_point", [](const Tensor& t) {
              return tensorplay::isFloatingType(t.dtype());
         })
-                .def_property_readonly("is_sparse", &Tensor::is_sparse)
+        .def_property_readonly("is_sparse", &Tensor::is_sparse)
         .def("is_sparse_csr", &Tensor::is_sparse_csr)
+        .def("is_sparse_csc", &Tensor::is_sparse_csc)
+        .def("is_sparse_bsr", &Tensor::is_sparse_bsr)
+        .def("is_sparse_bsc", &Tensor::is_sparse_bsc)
+        .def("is_sparse_compressed", &Tensor::is_sparse_compressed)
+        .def("sparse_blocksize", [](const Tensor& t) {
+            const auto blocksize = t.sparse_blocksize();
+            return py::make_tuple(blocksize[0], blocksize[1]);
+        })
         .def("is_coalesced", &Tensor::is_coalesced)
         .def("sparse_dim", &Tensor::sparse_dim)
         .def("dense_dim", &Tensor::dense_dim)
@@ -2243,10 +2251,10 @@ void init_tensor(py::module_& m) {
         .def("values", [](const Tensor& t) { return t._values(); })
         .def("crow_indices", &Tensor::_crow_indices)
         .def("col_indices", &Tensor::_col_indices)
-        // 2 = strided (dense). Compare against tensorplay.sparse_coo etc.
+        // 5 = strided (dense); sparse layouts use their stable 0..4 tags.
         .def_property_readonly("layout", [](const Tensor& t) -> int64_t {
-            if (!t.is_sparse()) return 2;
-            return t.is_sparse_csr() ? 1 : 0;
+            if (!t.is_sparse()) return 5;
+            return t.unsafeGetTensorImpl()->sparse_layout();
         })
         .def("coalesce", &Tensor::coalesce)
         .def("sparse_mask",

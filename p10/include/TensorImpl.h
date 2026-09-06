@@ -323,7 +323,9 @@ public:
         sparse_state_->crow = std::move(crow);
         sparse_state_->col = std::move(col);
         sparse_state_->values = std::move(values);
-        sparse_state_->blocksize = blocksize;
+        sparse_state_->blocksize =
+            (layout == kSparseBSRLayout || layout == kSparseBSCLayout)
+                ? blocksize : std::array<int64_t, 2>{0, 0};
         sparse_state_->sparse_sizes = std::move(dense_sizes);
         sparse_state_->coalesced = true;  // compressed layouts are canonical
         is_contiguous_ = false;

@@ -4,17 +4,24 @@ import operator
 import tensorplay
 from tensorplay._C import sparse_coo_tensor as _sparse_coo_tensor_native
 
-from ._invariants import _is_enabled, _validate_coo, _validate_csr, validate
+from ._invariants import _is_enabled, _validate_coo, validate
 
 __all__ = [
     "coalesce",
     "sparse_coo_tensor",
+    "sparse_compressed_tensor",
     "sparse_csr_tensor",
+    "sparse_csc_tensor",
+    "sparse_bsr_tensor",
+    "sparse_bsc_tensor",
     "sparse_mask",
     "spdiags",
     "to_dense",
     "to_sparse",
     "to_sparse_csr",
+    "to_sparse_csc",
+    "to_sparse_bsr",
+    "to_sparse_bsc",
 ]
 
 
@@ -84,6 +91,90 @@ def sparse_coo_tensor(
     )
 
 
+def _sparse_compressed_tensor(
+    name,
+    compressed_indices,
+    plain_indices,
+    values,
+    size,
+    *,
+    expected_layout,
+    dtype=None,
+    layout=None,
+    device=None,
+    pin_memory=False,
+    check_invariants=None,
+):
+    """Shared Python entry point for the four layout-pinned constructors."""
+    if not all(
+        isinstance(value, tensorplay.Tensor)
+        for value in (compressed_indices, plain_indices, values)
+    ):
+        raise TypeError(
+            "compressed indices, plain indices, and values must be Tensor objects"
+        )
+    if size is not None:
+        size = _normalize_size(size)
+    if layout is not None:
+        layout = _as_index(layout, "layout")
+        if layout != int(expected_layout):
+            raise ValueError(f"{name}() requires its matching sparse layout")
+    checking = check_invariants if check_invariants is not None else _is_enabled()
+    native = getattr(tensorplay._C, name)
+    if size is None:
+        result = native(
+            compressed_indices,
+            plain_indices,
+            values,
+            dtype=dtype,
+            layout=layout,
+            device=device,
+            pin_memory=pin_memory,
+        )
+    else:
+        result = native(
+            compressed_indices,
+            plain_indices,
+            values,
+            size,
+            dtype=dtype,
+            layout=layout,
+            device=device,
+            pin_memory=pin_memory,
+        )
+    if checking:
+        validate(result)
+    return result
+
+
+def sparse_compressed_tensor(
+    compressed_indices,
+    plain_indices,
+    values,
+    size=None,
+    *,
+    dtype=None,
+    layout=None,
+    device=None,
+    pin_memory=False,
+    check_invariants=None,
+):
+    """Build a CSR/CSC/BSR/BSC tensor using an explicit ``layout`` tag."""
+    return _sparse_compressed_tensor(
+        "sparse_compressed_tensor",
+        compressed_indices,
+        plain_indices,
+        values,
+        size,
+        expected_layout=layout if layout is not None else tensorplay.sparse_csr,
+        dtype=dtype,
+        layout=layout,
+        device=device,
+        pin_memory=pin_memory,
+        check_invariants=check_invariants,
+    )
+
+
 def sparse_csr_tensor(
     crow_indices,
     col_indices,
@@ -96,48 +187,76 @@ def sparse_csr_tensor(
     pin_memory=False,
     check_invariants=None,
 ):
-    """Builds a two-dimensional sparse CSR tensor from compressed buffers."""
-    if not all(
-        isinstance(value, tensorplay.Tensor)
-        for value in (crow_indices, col_indices, values)
-    ):
-        raise TypeError("crow_indices, col_indices, and values must be Tensor objects")
-    if size is not None:
-        size = _normalize_size(size)
-        if len(size) != 2:
-            raise ValueError("size must contain exactly two dimensions")
-    if layout is not None:
-        layout = _as_index(layout, "layout")
-        if layout != int(tensorplay.sparse_csr):
-            raise ValueError("sparse_csr_tensor() requires the sparse_csr layout")
-    if check_invariants if check_invariants is not None else _is_enabled():
-        if size is None:
-            raise ValueError("size is required when invariant checking is enabled")
-        _validate_csr(crow_indices, col_indices, values, size)
-    if size is None:
-        result = tensorplay._C.sparse_csr_tensor(
-            crow_indices,
-            col_indices,
-            values,
-            dtype=dtype,
-            layout=layout,
-            device=device,
-            pin_memory=pin_memory,
-        )
-    else:
-        result = tensorplay._C.sparse_csr_tensor(
-            crow_indices,
-            col_indices,
-            values,
-            size,
-            dtype=dtype,
-            layout=layout,
-            device=device,
-            pin_memory=pin_memory,
-        )
-    if check_invariants if check_invariants is not None else _is_enabled():
-        validate(result)
-    return result
+    """Build a sparse CSR tensor from compressed row buffers."""
+    return _sparse_compressed_tensor(
+        "sparse_csr_tensor", crow_indices, col_indices, values, size,
+        expected_layout=tensorplay.sparse_csr, dtype=dtype, layout=layout,
+        device=device, pin_memory=pin_memory,
+        check_invariants=check_invariants,
+    )
+
+
+def sparse_csc_tensor(
+    ccol_indices,
+    row_indices,
+    values,
+    size=None,
+    *,
+    dtype=None,
+    layout=None,
+    device=None,
+    pin_memory=False,
+    check_invariants=None,
+):
+    """Build a sparse CSC tensor from compressed column buffers."""
+    return _sparse_compressed_tensor(
+        "sparse_csc_tensor", ccol_indices, row_indices, values, size,
+        expected_layout=tensorplay.sparse_csc, dtype=dtype, layout=layout,
+        device=device, pin_memory=pin_memory,
+        check_invariants=check_invariants,
+    )
+
+
+def sparse_bsr_tensor(
+    crow_indices,
+    col_indices,
+    values,
+    size=None,
+    *,
+    dtype=None,
+    layout=None,
+    device=None,
+    pin_memory=False,
+    check_invariants=None,
+):
+    """Build a block sparse BSR tensor from compressed row buffers."""
+    return _sparse_compressed_tensor(
+        "sparse_bsr_tensor", crow_indices, col_indices, values, size,
+        expected_layout=tensorplay.sparse_bsr, dtype=dtype, layout=layout,
+        device=device, pin_memory=pin_memory,
+        check_invariants=check_invariants,
+    )
+
+
+def sparse_bsc_tensor(
+    ccol_indices,
+    row_indices,
+    values,
+    size=None,
+    *,
+    dtype=None,
+    layout=None,
+    device=None,
+    pin_memory=False,
+    check_invariants=None,
+):
+    """Build a block sparse BSC tensor from compressed column buffers."""
+    return _sparse_compressed_tensor(
+        "sparse_bsc_tensor", ccol_indices, row_indices, values, size,
+        expected_layout=tensorplay.sparse_bsc, dtype=dtype, layout=layout,
+        device=device, pin_memory=pin_memory,
+        check_invariants=check_invariants,
+    )
 
 
 def spdiags(diagonals, offsets, shape, layout=None):
@@ -178,7 +297,7 @@ def sparse_mask(input, mask):
 
 
 def to_dense(input):
-    """Materializes a sparse COO/CSR tensor into a dense tensor."""
+    """Materializes a sparse COO/CSR/CSC/BSR/BSC tensor into dense form."""
     return tensorplay.to_dense(input)
 
 
@@ -199,7 +318,7 @@ def to_sparse(input, sparse_dim=None, *, check_invariants=None):
 
 
 def to_sparse_csr(input, *, check_invariants=None):
-    """Converts a 2-D dense tensor into a sparse CSR tensor.
+    """Converts a dense tensor into a sparse CSR tensor.
 
     ``check_invariants`` behaves as in :func:`to_sparse`, validating the
     compressed row pointer and column indices of the result.
@@ -208,3 +327,42 @@ def to_sparse_csr(input, *, check_invariants=None):
     if check_invariants if check_invariants is not None else _is_enabled():
         validate(out)
     return out
+
+
+def _to_sparse_compressed(input, name, *args, check_invariants=None, **kwargs):
+    out = getattr(tensorplay, name)(input, *args, **kwargs)
+    if check_invariants if check_invariants is not None else _is_enabled():
+        validate(out)
+    return out
+
+
+def to_sparse_csc(input, dense_dim=None, *, check_invariants=None):
+    """Converts a dense tensor into sparse CSC form."""
+    kwargs = {} if dense_dim is None else {"dense_dim": _as_index(dense_dim, "dense_dim")}
+    return _to_sparse_compressed(
+        input, "to_sparse_csc", check_invariants=check_invariants, **kwargs
+    )
+
+
+def to_sparse_bsr(input, blocksize, dense_dim=None, *, check_invariants=None):
+    """Converts a dense tensor into sparse BSR form."""
+    kwargs = {} if dense_dim is None else {"dense_dim": _as_index(dense_dim, "dense_dim")}
+    return _to_sparse_compressed(
+        input,
+        "to_sparse_bsr",
+        _normalize_size(blocksize, "blocksize"),
+        check_invariants=check_invariants,
+        **kwargs,
+    )
+
+
+def to_sparse_bsc(input, blocksize, dense_dim=None, *, check_invariants=None):
+    """Converts a dense tensor into sparse BSC form."""
+    kwargs = {} if dense_dim is None else {"dense_dim": _as_index(dense_dim, "dense_dim")}
+    return _to_sparse_compressed(
+        input,
+        "to_sparse_bsc",
+        _normalize_size(blocksize, "blocksize"),
+        check_invariants=check_invariants,
+        **kwargs,
+    )

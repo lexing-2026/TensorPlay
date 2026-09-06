@@ -304,14 +304,23 @@ class Layout(IntEnum):
 
     SPARSE_COO = 0
     SPARSE_CSR = 1
-    STRIDED = 2
+    SPARSE_CSC = 2
+    SPARSE_BSR = 3
+    SPARSE_BSC = 4
+    STRIDED = 5
     sparse_coo = 0
     sparse_csr = 1
-    strided = 2
+    sparse_csc = 2
+    sparse_bsr = 3
+    sparse_bsc = 4
+    strided = 5
 
 
 sparse_coo = Layout.SPARSE_COO
 sparse_csr = Layout.SPARSE_CSR
+sparse_csc = Layout.SPARSE_CSC
+sparse_bsr = Layout.SPARSE_BSR
+sparse_bsc = Layout.SPARSE_BSC
 strided = Layout.STRIDED
 contiguous_format = MemoryFormat.CONTIGUOUS
 preserve_format = MemoryFormat.PRESERVE
@@ -324,6 +333,7 @@ __all__ = [
     "sym_float", "sym_int", "sym_not", "sym_min", "sym_max", "sym_ite", "sym_sum",
     "DeviceType", "device", "dtype", "Size",
     "MemoryFormat", "contiguous_format", "preserve_format", "channels_last", "channels_last_3d",
+    "Layout", "sparse_coo", "sparse_csr", "sparse_csc", "sparse_bsr", "sparse_bsc", "strided",
     "uint8", "int8", "int16", "uint16", "uint32", "uint64", "int32", "int64",
     "float16", "bfloat16", "float32", "float64", "complex32", "complex64", "complex128", "bcomplex32", "bool",
     "qint8", "quint8", "qint32", "QScheme", "per_tensor_affine", "per_channel_affine",

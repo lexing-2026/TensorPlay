@@ -152,16 +152,22 @@ int64_t _dimV_native(const Tensor& self) {
     return ops::dense_dim(self);
 }
 
-// Row-compressed layouts keep one compressed index slot and one plain index
-// slot; this build has a single compressed representation, so the ccol/row
-// spellings (the column-compressed reading) serve the same two slots.
+// Compressed layouts keep one compressed index slot and one plain index slot.
+// The accessor spelling selects the orientation: crow/col are row-compressed
+// (CSR/BSR), while ccol/row are column-compressed (CSC/BSC).
 namespace {
 
-Tensor compressed_indices_slot(const Tensor& self, const char* name) {
+Tensor compressed_indices_slot(const Tensor& self, const char* name,
+                               bool column_compressed) {
     const auto impl = self.unsafeGetTensorImpl();
-    if (!impl || !impl->is_sparse() || !impl->is_sparse_compressed()) {
+    if (!impl || !impl->is_sparse() ||
+        (column_compressed ?
+             !(impl->is_sparse_csc() || impl->is_sparse_bsc()) :
+             !impl->is_sparse_row_compressed())) {
         TP_THROW(RuntimeError, name,
-                 " expected a tensor with a sparse compressed layout");
+                 column_compressed
+                     ? " expected a column-compressed sparse tensor"
+                     : " expected a row-compressed sparse tensor");
     }
     auto compressed = impl->sparse_crow_impl();
     TP_CHECK(compressed != nullptr, name,
@@ -169,11 +175,17 @@ Tensor compressed_indices_slot(const Tensor& self, const char* name) {
     return Tensor(std::move(compressed));
 }
 
-Tensor plain_indices_slot(const Tensor& self, const char* name) {
+Tensor plain_indices_slot(const Tensor& self, const char* name,
+                          bool column_compressed) {
     const auto impl = self.unsafeGetTensorImpl();
-    if (!impl || !impl->is_sparse() || !impl->is_sparse_compressed()) {
+    if (!impl || !impl->is_sparse() ||
+        (column_compressed ?
+             !(impl->is_sparse_csc() || impl->is_sparse_bsc()) :
+             !impl->is_sparse_row_compressed())) {
         TP_THROW(RuntimeError, name,
-                 " expected a tensor with a sparse compressed layout");
+                 column_compressed
+                     ? " expected a column-compressed sparse tensor"
+                     : " expected a row-compressed sparse tensor");
     }
     auto plain = impl->sparse_col_impl();
     TP_CHECK(plain != nullptr, name,
@@ -185,12 +197,12 @@ Tensor plain_indices_slot(const Tensor& self, const char* name) {
 
 Tensor ccol_indices_native(const Tensor& self) {
     reject_active_transform(self, "ccol_indices");
-    return compressed_indices_slot(self, "ccol_indices");
+    return compressed_indices_slot(self, "ccol_indices", true);
 }
 
 Tensor row_indices_native(const Tensor& self) {
     reject_active_transform(self, "row_indices");
-    return plain_indices_slot(self, "row_indices");
+    return plain_indices_slot(self, "row_indices", true);
 }
 
 Tensor ccol_indices_copy_native(const Tensor& self) {

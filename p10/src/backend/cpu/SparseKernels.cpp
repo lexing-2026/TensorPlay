@@ -47,6 +47,18 @@ int64_t product(const std::vector<int64_t>& dims) {
     return result;
 }
 
+int64_t sparse_index_value(const Tensor& indices, int64_t offset) {
+    switch (indices.dtype()) {
+        case DType::Int32:
+            return static_cast<int64_t>(indices.data_ptr<int32_t>()[offset]);
+        case DType::Int64:
+            return indices.data_ptr<int64_t>()[offset];
+        default:
+            TP_THROW(TypeError,
+                     "compressed sparse indices must be Int32 or Int64");
+    }
+}
+
 std::vector<int64_t> dense_shape_for(const Tensor& sparse) {
     const int64_t sparse_dim = sparse.sparse_dim();
     std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(sparse.shape());
@@ -388,44 +400,69 @@ Tensor to_dense_sparse_cpu(const Tensor& self) {
         const auto bs = self.sparse_blocksize();
         const int64_t b0 = blocked ? bs[0] : 1;
         const int64_t b1 = blocked ? bs[1] : 1;
+        const int64_t n_batch = crow.dim() - 1;
         const int64_t ndim = self.dim();
-        const int64_t n_batch = ndim - 2;
+        const int64_t dense_dim = ndim - n_batch - 2;
+        if (dense_dim < 0) {
+            TP_THROW(RuntimeError,
+                     "to_dense(): compressed values have an invalid rank");
+        }
         int64_t batch_count = 1;
         for (int64_t d = 0; d < n_batch; ++d) batch_count *= self.size(d);
         const int64_t rows = self.size(n_batch);
         const int64_t cols = self.size(n_batch + 1);
         const int64_t comp_units = row_compressed ? rows / b0 : cols / b1;
-        // Each batch matrix contributes its own compressed/plain components;
-        // the flat nnz axis of values/plain splits evenly across batches.
-        const int64_t nnz = values.size(0);
-        const int64_t nnz_per_batch = batch_count > 0 ? nnz / batch_count : 0;
+        const int64_t nnz_per_batch = values.size(n_batch);
+        int64_t dense_count = 1;
+        for (int64_t d = n_batch + 2; d < ndim; ++d) {
+            dense_count *= self.size(d);
+        }
         const int64_t block_numel = b0 * b1;
         Tensor out = Tensor::zeros(self.shape(), self.dtype(), self.device());
         dispatch_dtype(self.dtype(), [&](auto tag) {
             using scalar_t = typename decltype(tag)::type;
-            const int64_t* crow_ptr = crow.data_ptr<int64_t>();
-            const int64_t* col_ptr = col.data_ptr<int64_t>();
             const scalar_t* value_ptr = values.data_ptr<scalar_t>();
             scalar_t* out_ptr = out.data_ptr<scalar_t>();
-            const int64_t matrix_numel = rows * cols;
+            const int64_t matrix_numel = rows * cols * dense_count;
             for (int64_t k = 0; k < batch_count; ++k) {
-                const int64_t* batch_crow = crow_ptr +
-                    k * (comp_units + 1);
-                const int64_t* batch_col = col_ptr + k * nnz_per_batch;
+                const int64_t crow_base = k * (comp_units + 1);
+                const int64_t col_base = k * nnz_per_batch;
                 const scalar_t* batch_values = value_ptr +
-                    k * nnz_per_batch * block_numel;
+                    k * nnz_per_batch * block_numel * dense_count;
                 scalar_t* batch_out = out_ptr + k * matrix_numel;
                 for (int64_t cu = 0; cu < comp_units; ++cu) {
-                    for (int64_t t = batch_crow[cu]; t < batch_crow[cu + 1]; ++t) {
-                        const int64_t pu = batch_col[t];
+                    const int64_t begin = sparse_index_value(
+                        crow, crow_base + cu);
+                    const int64_t end = sparse_index_value(
+                        crow, crow_base + cu + 1);
+                    if (begin < 0 || end < begin || end > nnz_per_batch) {
+                        TP_THROW(ValueError,
+                                 "to_dense(): compressed index pointers are "
+                                 "out of bounds");
+                    }
+                    for (int64_t t = begin; t < end; ++t) {
+                        const int64_t pu = sparse_index_value(col, col_base + t);
+                        const int64_t max_plain = row_compressed
+                            ? cols / b1 : rows / b0;
+                        if (pu < 0 || pu >= max_plain) {
+                            TP_THROW(ValueError,
+                                     "to_dense(): plain sparse index is out "
+                                     "of bounds");
+                        }
                         for (int64_t i = 0; i < b0; ++i) {
                             for (int64_t j = 0; j < b1; ++j) {
                                 const int64_t row = row_compressed
                                     ? cu * b0 + i : pu * b0 + i;
                                 const int64_t coln = row_compressed
                                     ? pu * b1 + j : cu * b1 + j;
-                                batch_out[row * cols + coln] =
-                                    batch_values[(t * b0 + i) * b1 + j];
+                                const int64_t value_base =
+                                    (t * block_numel + i * b1 + j) * dense_count;
+                                const int64_t output_base =
+                                    (row * cols + coln) * dense_count;
+                                for (int64_t d = 0; d < dense_count; ++d) {
+                                    batch_out[output_base + d] =
+                                        batch_values[value_base + d];
+                                }
                             }
                         }
                     }
