@@ -287,13 +287,29 @@ Tensor& nan_to_num_out_native(const Tensor& self, std::optional<double> nan,
 
 Tensor& nanmean_out_native(const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
                            bool keepdim, std::optional<DType> dtype, Tensor& out) {
+    std::optional<DType> result_dtype = dtype;
+    if (!result_dtype.has_value() && out.defined()) result_dtype = out.dtype();
+    Tensor result;
     if (dim.has_value() && dim->size() == 1) {
-        out = ops::nanmean(self, (*dim)[0], keepdim, dtype);
+        result = ops::nanmean(self, (*dim)[0], keepdim, result_dtype);
     } else if (!dim.has_value()) {
-        out = ops::nanmean(self, std::nullopt, keepdim, dtype);
+        result = ops::nanmean(self, std::nullopt, keepdim, result_dtype);
     } else {
         TP_THROW(NotImplementedError, "nanmean.out with multiple dims is not supported");
     }
+    if (!out.defined()) {
+        out = result;
+        return out;
+    }
+    if (out.dtype() != result.dtype()) {
+        TP_THROW(TypeError, "nanmean(): provided dtype must match dtype of out");
+    }
+    if (out.device() != result.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "nanmean(): out tensor must be on the same device as the input");
+    }
+    out.resize_(static_cast<std::vector<int64_t>>(result.shape()));
+    out.copy_(result);
     return out;
 }
 
