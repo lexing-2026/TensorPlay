@@ -1,12 +1,12 @@
 // Tensor comparison operators - CPU kernels.
 #include "Tensor.h"
+#include "Complex.h"
 #include "Dispatcher.h"
 #include "Utils.h"
 #include "Exception.h"
 #include "Parallel.h"
 
 #include <cmath>
-#include <complex>
 #include <cstdint>
 #include <vector>
 
@@ -39,16 +39,14 @@ Tensor isclose_cpu(const Tensor& self, const Tensor& other, double rtol, double 
     if (isComplexType(self.dtype())) {
         Tensor a = self.to(DType::ComplexDouble).expand(out_shape).contiguous();
         Tensor b = other.to(DType::ComplexDouble).expand(out_shape).contiguous();
-        const std::complex<double>* ap =
-            static_cast<const std::complex<double>*>(a.data_ptr());
-        const std::complex<double>* bp =
-            static_cast<const std::complex<double>*>(b.data_ptr());
+        const tensorplay::complex<double>* ap = a.data_ptr<tensorplay::complex<double>>();
+        const tensorplay::complex<double>* bp = b.data_ptr<tensorplay::complex<double>>();
         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
             for (int64_t i = begin; i < end; ++i) {
-                std::complex<double> x = ap[i], y = bp[i];
+                tensorplay::complex<double> x = ap[i], y = bp[i];
                 bool close = x == y;
                 if (equal_nan) {
-                    auto is_nan = [](const std::complex<double>& v) {
+                    auto is_nan = [](const tensorplay::complex<double>& v) {
                         return std::isnan(v.real()) || std::isnan(v.imag());
                     };
                     close = close || (is_nan(x) && is_nan(y));
@@ -97,12 +95,31 @@ Tensor isreal_cpu(const Tensor& self) {
                                DType::Bool, self.device());
     int64_t n = out.numel();
     bool* dp = out.data_ptr<bool>();
-    if (self.dtype() == DType::ComplexFloat) {
-        const auto* sp = static_cast<const std::complex<float>*>(sc.data_ptr());
-        for (int64_t i = 0; i < n; ++i) dp[i] = sp[i].imag() == 0.0f;
-    } else {
-        const auto* sp = static_cast<const std::complex<double>*>(sc.data_ptr());
-        for (int64_t i = 0; i < n; ++i) dp[i] = sp[i].imag() == 0.0;
+    switch (self.dtype()) {
+        case DType::ComplexHalf: {
+            const auto* sp = sc.data_ptr<tensorplay::complex<Half>>();
+            for (int64_t i = 0; i < n; ++i)
+                dp[i] = static_cast<float>(sp[i].imag()) == 0.0f;
+            break;
+        }
+        case DType::ComplexFloat: {
+            const auto* sp = sc.data_ptr<tensorplay::complex<float>>();
+            for (int64_t i = 0; i < n; ++i) dp[i] = sp[i].imag() == 0.0f;
+            break;
+        }
+        case DType::ComplexDouble: {
+            const auto* sp = sc.data_ptr<tensorplay::complex<double>>();
+            for (int64_t i = 0; i < n; ++i) dp[i] = sp[i].imag() == 0.0;
+            break;
+        }
+        case DType::BComplex32: {
+            const auto* sp = sc.data_ptr<tensorplay::complex<BFloat16>>();
+            for (int64_t i = 0; i < n; ++i)
+                dp[i] = static_cast<float>(sp[i].imag()) == 0.0f;
+            break;
+        }
+        default:
+            TP_THROW(NotImplementedError, "isreal does not support this dtype");
     }
     return out;
 }
