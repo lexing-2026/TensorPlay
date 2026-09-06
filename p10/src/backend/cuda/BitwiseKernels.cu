@@ -140,23 +140,25 @@ Tensor bitwise_scalar_cuda(const Tensor& self_in, Scalar other, Pred pred, const
     bitwise_check_cuda(self_in, name);
     Tensor out = Tensor::empty(shape_of(self_in), self_in.dtype(), self_in.device());
     if (out.numel() == 0) return out;
+    Tensor scalar_tensor = Tensor::full(
+        {}, other, self_in.dtype(), Device(DeviceType::CPU));
     TensorIterator iter = TensorIteratorConfig()
+        .allow_cpu_scalars(true)
         .check_all_same_dtype(true)
         .add_output(out)
         .add_input(self_in)
+        .add_input(scalar_tensor)
         .build();
     if (self_in.dtype() == DType::Bool) {
-        const bool ov = other.to<bool>();
-        gpu_kernel(iter, [pred, ov] __device__ (bool value) -> bool {
-            return pred(value, ov);
+        gpu_kernel_with_scalars(iter, [pred] __device__ (bool value, bool other_value) -> bool {
+            return pred(value, other_value);
         });
         return out;
     }
 #define TP_BIT_SCALAR(ctype, name_) \
     case DType::name_: { \
-        ctype ov = static_cast<ctype>(other.to<int64_t>()); \
-        gpu_kernel(iter, [pred, ov] __device__ (ctype value) -> ctype { \
-            return pred(value, ov); \
+        gpu_kernel_with_scalars(iter, [pred] __device__ (ctype value, ctype other_value) -> ctype { \
+            return pred(value, other_value); \
         }); \
         break; \
     }
@@ -234,19 +236,21 @@ Tensor bitwise_shift_tensor_cuda_impl(const Tensor& a_in, const Tensor& b_in, co
 template <bool kLeft>
 Tensor bitwise_shift_scalar_cuda_impl(const Tensor& a_in, Scalar other, const char* name) {
     bitwise_check_cuda(a_in, name);
-    const int64_t shift = other.to<int64_t>();
     Tensor out = Tensor::empty(shape_of(a_in), a_in.dtype(), a_in.device());
     if (out.numel() == 0) return out;
+    Tensor scalar_tensor = Tensor::full(
+        {}, other, a_in.dtype(), Device(DeviceType::CPU));
     TensorIterator iter = TensorIteratorConfig()
+        .allow_cpu_scalars(true)
         .check_all_same_dtype(true)
         .add_output(out)
         .add_input(a_in)
+        .add_input(scalar_tensor)
         .build();
 #define TP_SHIFT_SCALAR(ctype, name_) \
     case DType::name_: { \
-        const ctype sh = static_cast<ctype>(shift); \
-        gpu_kernel(iter, [sh] __device__ (ctype value) -> ctype { \
-            return bitwise_shift_value<ctype, kLeft>(value, sh); \
+        gpu_kernel_with_scalars(iter, [] __device__ (ctype value, ctype shift) -> ctype { \
+            return bitwise_shift_value<ctype, kLeft>(value, shift); \
         }); \
         break; \
     }
