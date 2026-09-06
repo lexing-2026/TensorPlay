@@ -548,3 +548,34 @@ def test_lu_with_info_reports_the_factorization():
     assert lu.shape == (2, 2)
     assert pivots.numel() == 2
     assert info.numel() == 1
+
+
+# ------------------------------------------------------------- integer matmul
+
+
+def test_int_mm_matches_the_widened_product():
+    a = tp.randint(-8, 8, (5, 7)).to(tp.int8)
+    b = tp.randint(-8, 8, (7, 3)).to(tp.int8)
+    got = tp._C._int_mm(a, b)
+    assert got.dtype == tp.int32
+    assert got.tolist() == tp.matmul(a.to(tp.int32), b.to(tp.int32)).tolist()
+
+
+def test_int_mm_accepts_an_unsigned_left_operand():
+    a = tp.randint(0, 8, (4, 4)).to(tp.uint8)
+    b = tp.randint(-8, 8, (4, 4)).to(tp.int8)
+    assert tp._C._int_mm(a, b).tolist() == tp.matmul(a.to(tp.int32),
+                                                     b.to(tp.int32)).tolist()
+
+
+def test_int_mm_out_writes_into_the_buffer():
+    a = tp.randint(-8, 8, (5, 7)).to(tp.int8)
+    b = tp.randint(-8, 8, (7, 3)).to(tp.int8)
+    out = tp.zeros(5, 3, dtype=tp.int32)
+    assert tp._C._int_mm(a, b, out=out) is out
+    assert out.tolist() == tp.matmul(a.to(tp.int32), b.to(tp.int32)).tolist()
+
+
+def test_int_mm_rejects_mismatched_dtypes():
+    with pytest.raises(Exception):
+        tp._C._int_mm(tp.zeros(2, 2), tp.zeros(2, 2, dtype=tp.int8))

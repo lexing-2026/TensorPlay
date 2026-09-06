@@ -48,6 +48,7 @@ set(P10_SOURCES
     src/backend/cpu/LinearAlgebraKernels.cpp
     src/backend/cpu/LinalgKernels.cpp
     src/backend/cpu/LuUnpack.cpp
+    src/backend/cpu/IntMM.cpp
     src/backend/cpu/Lapack.cpp
     src/backend/cpu/PointwiseKernels.cpp
     src/backend/cpu/PoolingKernels.cpp
@@ -199,6 +200,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/LinearAlgebraKernels.cu
         src/backend/cuda/LinalgKernels.cu
         src/backend/cuda/LuUnpack.cu
+        src/backend/cuda/IntMM.cu
         src/backend/cuda/LinalgSVD.cu
         src/backend/cuda/LinalgLDL.cu
         src/backend/cuda/CudaBlasGemm.cpp
