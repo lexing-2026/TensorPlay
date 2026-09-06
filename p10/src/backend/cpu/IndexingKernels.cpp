@@ -1606,23 +1606,22 @@ Tensor masked_scatter_cpu(const Tensor& self, const Tensor& mask, const Tensor& 
     const bool* mp = m_full.data_ptr<bool>();
     int64_t src_i = 0;
     int64_t src_n = src.numel();
-    int64_t selected = 0;
-    for (int64_t i = 0; i < n; ++i) selected += mp[i] ? 1 : 0;
-    if (selected > src_n) {
-        TP_THROW(RuntimeError,
-                 "masked_scatter: source has fewer elements than the mask selects");
-    }
 #define TP_MS_CASE(ctype, name) \
     case DType::name: { \
         const ctype* sp = src.data_ptr<ctype>(); \
         ctype* d = result.data_ptr<ctype>(); \
-        for (int64_t i = 0; i < n && src_i < src_n; ++i) { \
-            if (mp[i]) d[i] = sp[src_i++]; \
+        for (int64_t i = 0; i < n; ++i) { \
+            if (!mp[i]) continue; \
+            if (src_i >= src_n) { \
+                TP_THROW(RuntimeError, \
+                         "masked_scatter: source has fewer elements than the mask selects"); \
+            } \
+            d[i] = sp[src_i++]; \
         } \
         break; \
     }
     switch (result.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_MS_CASE)
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_MS_CASE)
         default: TP_THROW(TypeError, "masked_scatter: unsupported dtype");
     }
 #undef TP_MS_CASE
