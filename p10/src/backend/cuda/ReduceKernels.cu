@@ -102,30 +102,6 @@ inline std::vector<int64_t> shape_of(const Tensor& t) {
 // ---------------------------------------------------------------------------
 
 template <typename T>
-__global__ void slice_logsumexp_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
-                                       const T* in, double* out) {
-    int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; si < n_slices; si += stride) {
-        int64_t o = si / inner, in2 = si % inner;
-        const T* sp = in + o * d_size * inner + in2;
-        double m = -std::numeric_limits<double>::infinity();
-        bool has_nan = false;
-        for (int64_t j = 0; j < d_size; ++j) {
-            double v = static_cast<double>(sp[j * inner]);
-            if (v != v) { has_nan = true; break; }
-            if (v > m) m = v;
-        }
-        if (has_nan) { out[si] = ::nan(""); continue; }
-        if (m == -std::numeric_limits<double>::infinity()) { out[si] = m; continue; }
-        double s2 = 0;
-        for (int64_t j = 0; j < d_size; ++j)
-            s2 += ::exp(static_cast<double>(sp[j * inner]) - m);
-        out[si] = m + ::log(s2);
-    }
-}
-
-template <typename T>
 __global__ void cummaxmin_scan_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
                                       const T* in, T* vals, int64_t* idxs, bool is_max) {
     int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -238,36 +214,22 @@ Tensor logsumexp_cuda2(const Tensor& self, int64_t dim, bool keepdim) {
     if (isIntegralType(sc.dtype(), true)) {
         sc = sc.to(globalContext().defaultDType());
     }
-    int64_t d_size = sc.size(dim);
-    int64_t outer = 1, inner = 1;
-    outer_inner(shape_of(sc), dim, outer, inner);
-    int64_t slices = outer * inner;
-    Tensor accs = Tensor::zeros({slices}, DType::Float64, self.device());
-    if (slices > 0) {
-        // The kernel handles d_size==0 itself (writes -inf per slice, matching
-        auto stream = getCurrentCUDAStream().stream();
-        dim3 grid = make_grid(slices), block(kThreads);
-#define TP_LSE_CASE(ctype, name) \
-        case DType::name: \
-            slice_logsumexp_kernel<ctype><<<grid, block, 0, stream>>>( \
-                slices, d_size, inner, sc.data_ptr<ctype>(), \
-                accs.data_ptr<double>()); \
-            break;
-        switch (sc.dtype()) {
-            TENSORPLAY_FORALL_SCALAR_TYPES(TP_LSE_CASE)
-            TENSORPLAY_FORALL_FP8_TYPES(TP_LSE_CASE)
-            default:
-                TP_THROW(TypeError, "logsumexp: unsupported dtype ",
-                         toString(sc.dtype()));
-        }
-#undef TP_LSE_CASE
-        CUDA_CHECK(cudaGetLastError());
+    const DType output_dtype = sc.dtype();
+    if (isFloat8Type(output_dtype)) {
+        sc = sc.to(DType::Float32);
     }
-    std::vector<int64_t> ns = shape_of(sc);
-    ns[dim] = keepdim ? 1 : 0;
-    if (!keepdim) ns.erase(ns.begin() + dim);
-    DType out_dt = sc.dtype();
-    return accs.reshape(ns).to(out_dt);
+    const std::vector<int64_t> dims{dim};
+    if (sc.numel() == 0) {
+        Tensor result = sum_dim_kernel(sc.exp(), dims, keepdim, sc.dtype()).log();
+        return result.dtype() == output_dtype ? result : result.to(output_dtype);
+    }
+    Tensor max_keep = amax_dim_kernel(sc, dims, true);
+    const Scalar infinity(std::numeric_limits<double>::infinity());
+    Tensor safe_max = Tensor::where(max_keep.abs().eq(infinity), Scalar(0), max_keep);
+    Tensor summed = sum_dim_kernel((sc - safe_max).exp(), dims, keepdim, sc.dtype());
+    Tensor result = summed.log();
+    result = result + (keepdim ? safe_max : safe_max.squeeze(dim));
+    return result.dtype() == output_dtype ? result : result.to(output_dtype);
 }
 Tensor count_nonzero_cuda2(const Tensor& self, const std::vector<int64_t>& dim) {
     Tensor reduce = self.dtype() == DType::Bool
