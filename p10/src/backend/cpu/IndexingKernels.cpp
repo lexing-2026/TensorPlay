@@ -1967,6 +1967,15 @@ Tensor sr_reduce_forward(const Tensor& self, int64_t dim, const Tensor& index,
         TP_THROW(IndexError,
                  "index must have the same number of dimensions as self");
     }
+    if (index.numel() != 0 && index.dtype() != DType::Int32 &&
+        index.dtype() != DType::Int64) {
+        TP_THROW(TypeError,
+                 "scatter_reduce(): Expected dtype int32/int64 for index");
+    }
+    if (src_in.dtype() != self.dtype()) {
+        TP_THROW(TypeError,
+                 "scatter_reduce(): Expected self.dtype to be equal to src.dtype");
+    }
     Tensor idx_c = (index.dtype() == DType::Int64)
                        ? index.contiguous()
                        : index.to(DType::Int64).contiguous();
@@ -2137,6 +2146,15 @@ Tensor index_reduce_cpu(const Tensor& self, int64_t dim, const Tensor& index,
         TP_THROW(IndexError,
                  "index_reduce(): Index is supposed to be a vector, but got dim: ",
                  index.dim());
+    }
+    if (index.numel() != 0 && index.dtype() != DType::Int32 &&
+        index.dtype() != DType::Int64) {
+        TP_THROW(TypeError,
+                 "index_reduce(): Expected dtype int32/int64 for index");
+    }
+    if (source.dtype() != self.dtype()) {
+        TP_THROW(TypeError,
+                 "index_reduce(): Expected self.dtype to be equal to source.dtype");
     }
     for (int64_t i = 0; i < nd; ++i) {
         if (i == dim) continue;
