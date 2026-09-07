@@ -408,6 +408,23 @@ def _trailing_tensorlist(f, variant: str) -> bool:
     return "tensorlist" in _BRIDGE.get(cpp_arg_type(pos[-1].type), "")
 
 
+def _is_variadic_shape_list(f, variant: str) -> bool:
+    """Whether a trailing integer shape list accepts positional expansion."""
+    self_idx = next((i for i, a in enumerate(f.args) if a.name == "self"), None)
+    pos = [a for i, a in enumerate(f.args)
+           if i != self_idx and not a.kwonly]
+    if not pos:
+        return False
+    shape = pos[-1].type
+    if (not shape.is_list or shape.list_size is not None or
+            shape.kind != "int64_t" or shape.list_elem_opt):
+        return False
+    if len(pos) == 1:
+        return True
+    return (variant == "function" and len(pos) == 2 and
+            pos[0].name == "self" and pos[0].type.is_tensor_like)
+
+
 def _emit_op(out: list[str], f, variant: str, fn: str,
              own_catch: bool = True, dispatch: bool = True,
              helper_tag: str | None = None,
@@ -588,7 +605,7 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
     # into a tuple before parsing instead of rejecting extra positionals.
     _pos = [a for i, a in enumerate(f.args)
             if i != self_idx and not a.kwonly]
-    splat = bool(_pos) and _pos[-1].type.is_list
+    splat = _is_variadic_shape_list(f, variant)
 
     if splat:
         P = user_pos
