@@ -23,6 +23,7 @@
 #include "MemoryFormat.h"
 #include "Quantizer.h"
 #include "Complex.h"
+#include "Unicode.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <algorithm>
@@ -34,10 +35,16 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#include <windows.h>
+// Windows has no POSIX mmap; the shared-map path below runs through the
+// Win32 file-mapping API instead (CreateFileMappingW / MapViewOfFile).
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace tensorplay {
 namespace composite {
@@ -830,6 +837,25 @@ Tensor empty_quantized_kernel(const std::vector<int64_t>& size, const Tensor& qt
 
 namespace {
 
+#if defined(_WIN32)
+
+struct MappedRegion {
+    void* addr;
+    size_t length;
+};
+
+void unmap_mapped_region(void* ctx) {
+    auto* region = static_cast<MappedRegion*>(ctx);
+    if (region != nullptr) {
+        if (region->addr != nullptr) {
+            ::UnmapViewOfFile(region->addr);
+        }
+        delete region;
+    }
+}
+
+#else
+
 struct MappedRegion {
     void* addr;
     size_t length;
@@ -844,6 +870,8 @@ void unmap_mapped_region(void* ctx) {
         delete region;
     }
 }
+
+#endif
 
 }  // namespace
 
@@ -874,6 +902,41 @@ Tensor from_file_kernel(std::string filename, std::optional<bool> shared,
             Storage storage;
             return Tensor(storage, {my_size}, dt);
         }
+#if defined(_WIN32)
+        HANDLE file = ::CreateFileW(
+            tensorplay::utf8_to_utf16(filename).c_str(),
+            GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            TP_THROW(RuntimeError, "from_file: cannot open file '", filename, "'");
+        }
+        LARGE_INTEGER win_size;
+        if (::GetFileSizeEx(file, &win_size) == 0 ||
+            static_cast<uint64_t>(win_size.QuadPart) <
+                static_cast<uint64_t>(size_bytes)) {
+            ::CloseHandle(file);
+            TP_THROW(RuntimeError,
+                     "from_file: file '", filename, "' is smaller than the ",
+                     "requested tensor size (", size_bytes, " bytes)");
+        }
+        HANDLE mapping = ::CreateFileMappingW(
+            file, nullptr, PAGE_READWRITE, 0, 0, nullptr);
+        ::CloseHandle(file);
+        if (mapping == nullptr) {
+            TP_THROW(RuntimeError,
+                     "from_file: cannot memory-map file '", filename, "'");
+        }
+        void* addr = ::MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, size_bytes);
+        ::CloseHandle(mapping);
+        if (addr == nullptr) {
+            TP_THROW(RuntimeError,
+                     "from_file: cannot memory-map file '", filename, "'");
+        }
+        auto* region = new MappedRegion{addr, size_bytes};
+        DataPtr data_ptr(addr, region, &unmap_mapped_region, Device(DeviceType::CPU));
+        Storage storage(std::move(data_ptr), size_bytes, nullptr);
+        return Tensor(storage, {my_size}, dt);
+#else
         const int fd = ::open(filename.c_str(), O_RDWR);
         if (fd < 0) {
             TP_THROW(RuntimeError, "from_file: cannot open file '", filename, "'");
@@ -898,6 +961,7 @@ Tensor from_file_kernel(std::string filename, std::optional<bool> shared,
         DataPtr data_ptr(addr, region, &unmap_mapped_region, Device(DeviceType::CPU));
         Storage storage(std::move(data_ptr), size_bytes, nullptr);
         return Tensor(storage, {my_size}, dt);
+#endif
     }
 
     // Private copy: allocate CPU storage and read the leading bytes of the file.

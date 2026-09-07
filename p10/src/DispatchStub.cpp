@@ -1,6 +1,8 @@
 
 #include "DispatchStub.h"
 
+#include "Macros.h"
+
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -322,7 +324,7 @@ DispatchResult CPUDispatchStubImpl::try_choose_cpu_impl(
     // Quantization kernels have also been disabled on Windows
     // for AVX512 because some of their tests are flaky on Windows.
     // Ideally, we should have AVX512 kernels for all kernels.
-    if (__builtin_expect(!AVX512, 0)) {
+    if (TP_UNLIKELY(!AVX512)) {
       // dispatch to AVX2, since the AVX512 kernel is missing
       return AVX2 != nullptr ? DispatchResult(AVX2) : ErrorType::MissingDeviceKernel;
     } else {
@@ -347,13 +349,13 @@ DispatchResult CPUDispatchStubImpl::try_choose_cpu_impl(
 #endif
 #ifdef HAVE_SVE_CPU_DEFINITION
   if (capability == static_cast<int>(CPUCapability::SVE128)) {
-    if (__builtin_expect(!SVE128, 0)) {
+    if (TP_UNLIKELY(!SVE128)) {
       return DEFAULT != nullptr ? DispatchResult(DEFAULT) : ErrorType::MissingDeviceKernel;
     }
     return DispatchResult(SVE128);
   }
   if (capability == static_cast<int>(CPUCapability::SVE256)) {
-    if (__builtin_expect(!SVE256, 0)) {
+    if (TP_UNLIKELY(!SVE256)) {
       return DEFAULT != nullptr ? DispatchResult(DEFAULT) : ErrorType::MissingDeviceKernel;
     }
     return DispatchResult(SVE256);
@@ -361,13 +363,13 @@ DispatchResult CPUDispatchStubImpl::try_choose_cpu_impl(
 #endif
 #ifdef HAVE_RVV_CPU_DEFINITION
   if (capability == static_cast<int>(CPUCapability::RVVM1)) {
-    if (__builtin_expect(!RVVM1, 0)) {
+    if (TP_UNLIKELY(!RVVM1)) {
       return DEFAULT != nullptr ? DispatchResult(DEFAULT) : ErrorType::MissingDeviceKernel;
     }
     return DispatchResult(RVVM1);
   }
   if (capability == static_cast<int>(CPUCapability::RVVM2)) {
-    if (__builtin_expect(!RVVM2, 0)) {
+    if (TP_UNLIKELY(!RVVM2)) {
       return DEFAULT != nullptr ? DispatchResult(DEFAULT) : ErrorType::MissingDeviceKernel;
     }
     return DispatchResult(RVVM2);
@@ -406,7 +408,7 @@ void* CPUDispatchStubImpl::choose_cpu_impl(
     // Quantization kernels have also been disabled on Windows
     // for AVX512 because some of their tests are flaky on Windows.
     // Ideally, we should have AVX512 kernels for all kernels.
-    if (__builtin_expect(!AVX512, 0)) {
+    if (TP_UNLIKELY(!AVX512)) {
       // dispatch to AVX2, since the AVX512 kernel is missing
       if (AVX2 == nullptr) {
         throw std::runtime_error("DispatchStub: missing AVX2 kernel");
