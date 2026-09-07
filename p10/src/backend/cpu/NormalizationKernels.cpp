@@ -303,7 +303,8 @@ static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cpu_impl(
 
 std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cpu(
         const Tensor& grad_output, const Tensor& input, int64_t num_groups,
-        std::optional<Tensor> weight_opt, std::optional<Tensor> bias_opt,
+        const std::optional<Tensor>& weight_opt,
+        const std::optional<Tensor>& bias_opt,
         double eps) {
     return group_norm_backward_cpu_impl(
         grad_output, input, num_groups, weight_opt, bias_opt, eps, nullptr,
