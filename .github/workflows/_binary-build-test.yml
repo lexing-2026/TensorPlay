@@ -82,44 +82,13 @@ jobs:
           submodules: false
           show-progress: false
 
-      # Linux x86_64 wheels link the same accelerated BLAS as the release
-      # defaults: MKL static libraries unpacked from the mkl wheels under
-      # /opt/intel (MKLROOT), the way the reference project's CI image
-      # provisions it. Other platforms keep their vendor defaults.
-      - name: Install MKL (linux x86_64)
-        if: ${{ runner.os == 'Linux' && runner.arch == 'X64' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ ! -d /opt/intel/lib ]; then
-            sudo mkdir -p /opt/intel
-            pushd "$(mktemp -d)"
-            python -m pip install --quiet wheel
-            python -m pip download --quiet -d . 'mkl-static==2024.2.0'
-            python -m wheel unpack mkl_static-2024.2.0-py2.py3-none-manylinux1_x86_64.whl
-            python -m wheel unpack mkl_include-2024.2.0-py2.py3-none-manylinux1_x86_64.whl
-            sudo cp -a mkl_static-2024.2.0/mkl_static-2024.2.0.data/data/lib/. /opt/intel/lib/
-            sudo cp -a mkl_include-2024.2.0/mkl_include-2024.2.0.data/data/include/. /opt/intel/include/
-            popd
-          fi
-          echo "MKLROOT=/opt/intel" >> "$GITHUB_ENV"
-
-      # Non-x86_64 Linux (arm64) uses OpenBLAS from the runner repositories.
-      - name: Install OpenBLAS (linux arm64)
-        if: ${{ runner.os == 'Linux' && runner.arch == 'ARM64' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libopenblas-dev 1>/dev/null
-
-      # Windows builds run through .github/ci/windows/: the build.sh
-      # orchestrator chains the MSVC env capture (vcvarsall via vswhere),
-      # the pip build-dependency install (backend requirements plus the
-      # pinned MKL trio unpacking into the interpreter prefix's conda-style
-      # Library/ tree, wired into CMake through CMAKE_PREFIX_PATH), the
-      # prebuilt libuv tarball for gloo (libuv_ROOT), and the wheel build
-      # itself. The other platforms keep the inline steps below.
+      # Every platform builds through its .github/ci/<platform>/ scaffold:
+      # the per-platform build.sh orchestrates the same three stages (env
+      # setup, build-dependency install, wheel build) and hands env between
+      # them via export files. Linux stages MKL under /opt/intel (x86_64)
+      # or installs system OpenBLAS (arm64) inside the scaffold; macOS
+      # stages the conda-forge libomp; Windows captures the MSVC env and
+      # provisions the pinned MKL trio plus libuv.
 
       # The wheel links vendored SLEEF/NNPACK trees that CI checkouts do
       # not carry; fetch the pinned revisions before configuring.
@@ -179,24 +148,18 @@ jobs:
           cuda: ${{ inputs.cuda_toolkit }}
 
       - name: Build wheel
-        if: ${{ runner.os != 'Windows' }}
-        shell: bash
-        env:
-          SKBUILD_CMAKE_DEFINE: >-
-            ${{ inputs.cuda != 'cpu' && 'USE_CUDA=ON' || 'USE_CUDA=OFF' }};USE_MPI=OFF
-        run: |
-          python -m pip install --upgrade pip build
-          python -m build --wheel
-
-      - name: Build wheel (windows)
-        if: ${{ runner.os == 'Windows' }}
         shell: bash
         env:
           GPU_ARCH_TYPE: ${{ inputs.cuda != 'cpu' && 'cuda' || 'cpu' }}
           SKBUILD_CMAKE_DEFINE: >-
             ${{ inputs.cuda != 'cpu' && 'USE_CUDA=ON' || 'USE_CUDA=OFF' }};USE_MPI=OFF
         run: |
-          bash .github/ci/windows/build.sh dist
+          case "$RUNNER_OS" in
+            Linux)  bash .github/ci/linux/build.sh ;;
+            macOS)  bash .github/ci/macos/build.sh ;;
+            Windows) bash .github/ci/windows/build.sh dist ;;
+            *) echo "Unsupported runner OS: $RUNNER_OS" >&2; exit 1 ;;
+          esac
 
       - name: Install built wheel
         shell: bash
