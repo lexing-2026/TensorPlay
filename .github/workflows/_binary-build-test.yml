@@ -113,6 +113,22 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq libopenblas-dev 1>/dev/null
 
+      # Windows wheels link the same static MKL as Linux x86_64: the pinned
+      # mkl wheels unpack into a conda-style Library/ tree inside the build
+      # Python's prefix (import libs + headers under Library/lib and
+      # Library/include, runtime DLLs under Library/bin), so CMake finds the
+      # package through CMAKE_PREFIX_PATH and the DLL bundling step derives
+      # its bin directory from the same root. Without this the BLAS detector
+      # falls through to the unaccelerated fallback.
+      - name: Install MKL (windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet 'mkl==2024.2.0' 'mkl-static==2024.2.0' 'mkl-include==2024.2.0'
+          prefix="$(cygpath -m "$(python -c 'import sys, pathlib; print(pathlib.Path(sys.prefix))')")/Library"
+          echo "CMAKE_PREFIX_PATH=${prefix}" >> "$GITHUB_ENV"
+
       # Windows gloo requires a system libuv; provision a prebuilt libuv
       # tarball into the runner's Python prefix and export libuv_ROOT for
       # its find_library call. The Windows Python prints its prefix as a
