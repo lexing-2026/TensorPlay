@@ -5,11 +5,13 @@
 // the op's slot id as an external correlation id so kernel records join
 // back to the op that launched them (op -> runtime API -> kernel).
 //
-// libcupti is dlopen'd (major-line soname candidates first) so the core
-// library never hard-depends on it and sessions on machines without the
-// toolkit degrade gracefully.  Struct definitions come from the toolkit
-// headers the build already ships (CUDAToolkit_INCLUDE_DIRS), so record
-// parsing stays ABI-correct for the CUDA the extension was compiled against.
+// The CUPTI runtime is loaded dynamically (POSIX: libcupti.so.<major> soname
+// candidates; Windows: cupti64_<rev>.dll enumerated from the toolkit's bin
+// directory) so the core library never hard-depends on it and sessions on
+// machines without the toolkit degrade gracefully.  Struct definitions come
+// from the toolkit headers the build already ships (CUDAToolkit_INCLUDE_DIRS),
+// so record parsing stays ABI-correct for the CUDA the extension was compiled
+// against.
 //
 // Hot path: outside a gpu_trace session the only per-op cost is the
 // g_gpu_trace load in GpuTimerPair::arm (one acquire-load, same class as
@@ -58,7 +60,6 @@ using ActivityMemset = CUpti_ActivityMemset3;
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
-#include <dlfcn.h>
 #include <deque>
 #include <mutex>
 #include <string>
@@ -66,8 +67,86 @@ using ActivityMemset = CUpti_ActivityMemset3;
 #include <unordered_map>
 #include <vector>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
 namespace tensorplay {
 namespace prof {
+
+// ---- dynamic loader shim ----------------------------------------------------
+// CUPTI's C ABI is identical across platforms; only the loader differs.
+// Windows ships the runtime as cupti64_<version>.dll inside the toolkit's
+// bin directory (bare cupti64.dll on older layouts), so the probe enumerates
+// the toolkit bin dir instead of guessing sonames.
+namespace {
+
+#if defined(_WIN32)
+using DlHandle = HMODULE;
+
+struct DllCandidate {
+    std::string path;  // full path for LoadLibraryA
+    std::string name;  // file name for GetModuleHandle-style probes
+};
+
+// Enumerate <CUDA_PATH>/bin/cupti64_*.dll (newest revision first) plus the
+// legacy bare cupti64.dll. The bare name at the end loads through the
+// standard DLL search path, covering toolkits on PATH without CUDA_PATH.
+bool collect_dll_candidates(std::vector<DllCandidate>& out) {
+    const char* env = std::getenv("CUDA_PATH");
+    if (env != nullptr && *env != '\0') {
+        std::string dir(env);
+        while (!dir.empty() && (dir.back() == '\\' || dir.back() == '/')) {
+            dir.pop_back();
+        }
+        dir += "\\bin";
+        WIN32_FIND_DATAA fd;
+        std::string pattern = dir + "\\cupti64_*.dll";
+        HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                // Directory order is arbitrary; collect then sort so the
+                // newest revision string wins (lexical, not numeric).
+                out.push_back({dir + "\\" + fd.cFileName, fd.cFileName});
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
+            std::sort(out.begin(), out.end(),
+                      [](const DllCandidate& a, const DllCandidate& b) {
+                          return a.name > b.name;
+                      });
+        }
+        out.push_back({dir + "\\cupti64.dll", "cupti64.dll"});
+    }
+    // PATH-based fallback regardless of CUDA_PATH.
+    out.push_back({"cupti64.dll", "cupti64.dll"});
+    return true;
+}
+
+DlHandle dl_open(const char* name) { return LoadLibraryA(name); }
+void* dl_sym(DlHandle h, const char* n) {
+    return reinterpret_cast<void*>(GetProcAddress(h, n));
+}
+void dl_close(DlHandle h) { FreeLibrary(h); }
+std::string dl_error_text() {
+    return "LoadLibraryA failed for every CUPTI runtime candidate";
+}
+#else
+using DlHandle = void*;
+
+DlHandle dl_open(const char* name) {
+    return dlopen(name, RTLD_LAZY | RTLD_LOCAL);
+}
+void* dl_sym(DlHandle h, const char* n) { return dlsym(h, n); }
+void dl_close(DlHandle h) { dlclose(h); }
+std::string dl_error_text() {
+    const char* err = dlerror();
+    return err != nullptr ? err : "dlopen failed";
+}
+#endif
+
+} // namespace
 
 namespace {
 
@@ -103,9 +182,9 @@ struct CuptiFns {
 };
 
 std::mutex g_cupti_mutex;      // guards everything below (session scope)
-CuptiFns* g_fns = nullptr;     // dlsym'd entry points (null until start)
-void* g_cupti_lib = nullptr;   // dlopen handle (kept for the process life)
-std::string g_last_error;      // init/dlopen diagnostic for the binding
+CuptiFns* g_fns = nullptr;     // resolved entry points (null until start)
+DlHandle g_cupti_lib = nullptr;  // runtime handle (kept for the process life)
+std::string g_last_error;      // loader/init diagnostic for the binding
 bool g_callbacks_registered = false;
 bool g_kinds_enabled = false;
 int64_t g_time_offset_ns = 0;  // steady_ns ~= cupti_ns + offset
@@ -357,23 +436,33 @@ void disable_kinds_locked() {
 
 TENSORPLAY_API std::atomic<bool> g_gpu_trace{false};
 
+// Candidate runtime names, newest major line first; produced by the
+// per-platform collector inside the loader shim above.
 TENSORPLAY_API bool cupti_available() {
     if (g_fns != nullptr) return true;
     std::lock_guard<std::mutex> lock(g_cupti_mutex);
     if (g_fns != nullptr) return true;
     if (g_last_error.empty()) {
-        // Probe the library without enabling anything.
-        const char* candidates[] = {"libcupti.so.13", "libcupti.so.12",
-                                    "libcupti.so.11", "libcupti.so.1",
-                                    "libcupti.so"};
-        for (const char* soname : candidates) {
-            void* lib = dlopen(soname, RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD);
-            if (lib != nullptr) {
+        // Probe without loading anything new: only a runtime that is already
+        // mapped into the process counts as "available" here.
+        std::vector<DllCandidate> candidates;
+        collect_dll_candidates(candidates);
+        for (const auto& cand : candidates) {
+#if defined(_WIN32)
+            HMODULE mapped = nullptr;
+            if (GetModuleHandleExA(0, cand.name.c_str(), &mapped) &&
+                mapped != nullptr) {
+                return true;
+            }
+#else
+            if (void* lib = dlopen(cand.path.c_str(),
+                                   RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD)) {
                 dlclose(lib);
                 return true;
             }
+#endif
         }
-        g_last_error = "libcupti not found (tried libcupti.so.13/.12/.11/.1/.so)";
+        g_last_error = "CUPTI runtime not found among the probed candidates";
     }
     return false;
 }
@@ -395,11 +484,10 @@ TENSORPLAY_API uint32_t cupti_version() {
     }
     void* lib = g_cupti_lib;
     if (lib == nullptr) {
-        const char* candidates[] = {"libcupti.so.13", "libcupti.so.12",
-                                    "libcupti.so.11", "libcupti.so.1",
-                                    "libcupti.so"};
-        for (const char* soname : candidates) {
-            lib = dlopen(soname, RTLD_LAZY | RTLD_LOCAL);
+        std::vector<DllCandidate> candidates;
+        collect_dll_candidates(candidates);
+        for (const auto& cand : candidates) {
+            lib = dl_open(cand.path.c_str());
             if (lib != nullptr) {
                 g_cupti_lib = lib;
                 break;
@@ -407,7 +495,7 @@ TENSORPLAY_API uint32_t cupti_version() {
         }
     }
     if (lib == nullptr) return 0;
-    auto fn = reinterpret_cast<Fn_GetVersion>(dlsym(lib, "cuptiGetVersion"));
+    auto fn = reinterpret_cast<Fn_GetVersion>(dl_sym(lib, "cuptiGetVersion"));
     if (fn == nullptr) return 0;
     uint32_t ver = 0;
     if (fn(&ver) != CUPTI_SUCCESS) return 0;
@@ -422,25 +510,24 @@ TENSORPLAY_API bool cupti_start() {
 
     if (g_fns == nullptr) {
         if (g_cupti_lib == nullptr) {
-            const char* candidates[] = {"libcupti.so.13", "libcupti.so.12",
-                                        "libcupti.so.11", "libcupti.so.1",
-                                        "libcupti.so"};
-            for (const char* soname : candidates) {
-                g_cupti_lib = dlopen(soname, RTLD_LAZY | RTLD_LOCAL);
+            std::vector<DllCandidate> candidates;
+            collect_dll_candidates(candidates);
+            for (const auto& cand : candidates) {
+                g_cupti_lib = dl_open(cand.path.c_str());
                 if (g_cupti_lib != nullptr) break;
             }
             if (g_cupti_lib == nullptr) {
-                g_last_error = std::string("dlopen libcupti failed: ") +
-                               dlerror();
+                g_last_error =
+                    std::string("CUPTI runtime load failed: ") + dl_error_text();
                 return false;
             }
         }
         auto* fns = new CuptiFns();
         #define TP_CUPTI_DLSYM(field, name)                                     \
             fns->field = reinterpret_cast<Fn_##field>(                          \
-                dlsym(g_cupti_lib, name));                                      \
+                dl_sym(g_cupti_lib, name));                                     \
             if (fns->field == nullptr) {                                        \
-                g_last_error = std::string("dlsym ") + name + " failed";        \
+                g_last_error = std::string("resolve ") + name + " failed";      \
                 delete fns;                                                     \
                 return false;                                                   \
             }
@@ -453,11 +540,11 @@ TENSORPLAY_API bool cupti_start() {
         // Optional diagnostics/name helpers: absent from some libcupti
         // exports; call sites null-check.
         fns->GetNumLostRecords = reinterpret_cast<Fn_GetNumLostRecords>(
-            dlsym(g_cupti_lib, "cuptiActivityGetNumLostRecords"));
+            dl_sym(g_cupti_lib, "cuptiActivityGetNumLostRecords"));
         fns->GetCallbackName = reinterpret_cast<Fn_GetCallbackName>(
-            dlsym(g_cupti_lib, "cuptiGetCallbackName"));
+            dl_sym(g_cupti_lib, "cuptiGetCallbackName"));
         fns->GetVersion = reinterpret_cast<Fn_GetVersion>(
-            dlsym(g_cupti_lib, "cuptiGetVersion"));
+            dl_sym(g_cupti_lib, "cuptiGetVersion"));
         TP_CUPTI_DLSYM(PushExternalCorrelationId,
                        "cuptiActivityPushExternalCorrelationId")
         TP_CUPTI_DLSYM(PopExternalCorrelationId,
@@ -565,31 +652,6 @@ TENSORPLAY_API void cupti_pop_ext() {
     (void)fns->PopExternalCorrelationId(
         CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0, &last);
 }
-
-} // namespace prof
-} // namespace tensorplay
-
-#elif defined(_WIN32) // USE_CUDA but Windows: no wired-up CUPTI loader yet
-
-#include <atomic>
-#include <string>
-#include <vector>
-
-namespace tensorplay {
-namespace prof {
-
-// Keep the symbols so the binding links without ifdef noise; GPU rows are
-// simply absent from gpu_trace sessions.
-TENSORPLAY_API std::atomic<bool> g_gpu_trace{false};
-TENSORPLAY_API bool cupti_available() { return false; }
-TENSORPLAY_API std::string cupti_last_error() {
-    return "CUPTI tracing is not available in Windows builds";
-}
-TENSORPLAY_API bool cupti_start() { return false; }
-TENSORPLAY_API void cupti_stop_and_collect(std::vector<GpuActivity>&) {}
-TENSORPLAY_API bool cupti_push_ext(uint64_t) { return false; }
-TENSORPLAY_API void cupti_pop_ext() {}
-TENSORPLAY_API uint32_t cupti_version() { return 0; }
 
 } // namespace prof
 } // namespace tensorplay
