@@ -3,6 +3,9 @@
 #include "Autograd.h"
 #include "Context.h"
 #include "Exception.h"
+#include "TypePromotion.h"
+#include "TensorNumpy.h"
+#include "numpy_stub.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -95,89 +98,132 @@ inline DType infer_dtype(PyObject* list, int depth = 0) {
     int64_t len = GetSize(list);
     if (len == 0) return DType::Float32;  // Empty list default to float32
 
-    bool has_float = false;
-    bool has_complex = false;
-    bool has_int = false;
-    bool has_bool = false;
-    bool has_complex_double = false;
-    
-    // We only check the first element to guess type for optimization? 
-    // Actually, we check all elements to be safe.
-    // For example, for mixed types like [1.0, 2], we need to scan.
-    // Let's scan all elements at this level. Recursive calls will scan sub-levels.
-    
+    DType scalar_type = DType::Undefined;
+
     for (int64_t i = 0; i < len; ++i) {
         PyObject* item = GetItem(list, i);
+        DType item_dtype;
         if (IsListOrTuple(item)) {
             // Recursively infer dtype of sublists
-            DType sub_dtype = infer_dtype(item, depth + 1);
-            if (sub_dtype == DType::ComplexDouble) {
-                has_complex = true;
-                has_complex_double = true;
-            } else if (sub_dtype == DType::ComplexFloat || sub_dtype == DType::ComplexHalf || sub_dtype == DType::BComplex32) {
-                has_complex = true;
-            } else if (sub_dtype == DType::Float32 || sub_dtype == DType::Float64) has_float = true;
-            else if (sub_dtype == DType::Int64 || sub_dtype == DType::Int32) has_int = true;
-            else if (sub_dtype == DType::Bool) has_bool = true;
-        } else {
-            if (PyComplex_Check(item)) {
-                has_complex = true;
-            } else if (PyFloat_Check(item)) {
-                has_float = true;
-            } else if (PyBool_Check(item)) {
-                has_bool = true;
-            } else if (PyLong_Check(item)) {
-                has_int = true;
-            } else {
-                TP_THROW(TypeError, "Unsupported element type (only int/float/bool supported)");
+            item_dtype = infer_dtype(item, depth + 1);
+        } else if (is_numpy_scalar(item)) {
+            // NumPy scalar: lift it into a 0-dim array and read the dtype
+            // from the array header.
+            PyObject* arr = numpy_scalar_to_array(item);
+            if (!arr) {
+                PyErr_Clear();
+                TP_THROW(TypeError, "Unsupported NumPy scalar type");
             }
+            int np_dtype = PyArray_TYPE((PyArrayObject*)arr);
+            Py_DECREF(arr);
+            item_dtype = numpy_dtype_to_tp(np_dtype);
+        } else if (PyComplex_Check(item)) {
+            item_dtype = globalContext().defaultDType() == DType::Float64
+                             ? DType::ComplexDouble
+                             : DType::ComplexFloat;
+        } else if (PyFloat_Check(item)) {
+            item_dtype = globalContext().defaultDType();
+        } else if (PyBool_Check(item)) {
+            item_dtype = DType::Bool;
+        } else if (PyLong_Check(item)) {
+            item_dtype = DType::Int64;
+        } else {
+            TP_THROW(TypeError, "Unsupported element type (only int/float/bool supported)");
+        }
+        scalar_type = (i > 0) ? promoteTypes(scalar_type, item_dtype)
+                              : item_dtype;
+        if (scalar_type == DType::ComplexDouble) {
+            return scalar_type;
         }
     }
-    
-    if (has_complex) {
-        // floating point dtype (float64 -> complex128, else complex64).
-        if (has_complex_double || globalContext().defaultDType() == DType::Float64) {
-            return DType::ComplexDouble;
-        }
-        return DType::ComplexFloat;
-    }
-    if (has_float) return globalContext().defaultDType();
-    if (has_int) return DType::Int64;
-    if (has_bool) return DType::Bool;
 
-    return globalContext().defaultDType(); // Default if nothing found (e.g. empty sublists)
+    if (scalar_type == DType::Undefined) {
+        return globalContext().defaultDType();
+    }
+    return scalar_type;
 }
 
 // Optimized flat copy for the last dimension
+// Scalar unpack helpers, one per destination category, following the same
+// conversion contract as the Python scalar store path: generic conversion
+// entry points accept NumPy scalar types because they implement
+// __float__/__index__/__complex__.
+
+inline double unpack_double_scalar(PyObject* obj) {
+    if (PyFloat_Check(obj)) {
+        return PyFloat_AS_DOUBLE(obj);
+    }
+    double value = PyFloat_AsDouble(obj);
+    if (value == -1.0 && PyErr_Occurred()) {
+        throw py::error_already_set();
+    }
+    return value;
+}
+
+inline Py_complex unpack_complex_scalar(PyObject* obj) {
+    Py_complex value = PyComplex_AsCComplex(obj);
+    if (PyErr_Occurred()) {
+        throw py::error_already_set();
+    }
+    return value;
+}
+
 template <typename T>
 inline T python_scalar_cast(PyObject* item) {
-    if (PyComplex_Check(item)) {
-        Py_complex value = PyComplex_AsCComplex(item);
-        if (PyErr_Occurred()) {
-            throw py::error_already_set();
+    if constexpr (is_complex_type_v<T>) {
+        // NumPy complex scalars answer through __complex__.
+        Py_complex value = unpack_complex_scalar(item);
+        using value_type = typename is_complex_type<T>::value_type;
+        return T(static_cast<value_type>(value.real),
+                 static_cast<value_type>(value.imag));
+    } else if constexpr (std::is_same_v<T, bool>) {
+        if (is_numpy_bool(item)) {
+            int truth = PyObject_IsTrue(item);
+            if (truth < 0) throw py::error_already_set();
+            return truth != 0;
         }
-        if constexpr (is_complex_type_v<T>) {
-            using value_type = typename is_complex_type<T>::value_type;
-            return T(static_cast<value_type>(value.real),
-                     static_cast<value_type>(value.imag));
-        } else {
-            return static_cast<T>(value.real);
+        if (PyFloat_Check(item)) {
+            return PyFloat_AS_DOUBLE(item) != 0.0;
         }
-    }
-    if (PyFloat_Check(item)) return static_cast<T>(PyFloat_AsDouble(item));
-    if (PyBool_Check(item)) return static_cast<T>(item == Py_True);
-    if (PyLong_Check(item)) {
+        if (PyComplex_Check(item)) {
+            double real_val = PyComplex_RealAsDouble(item);
+            double imag_val = PyComplex_ImagAsDouble(item);
+            return !(real_val == 0 && imag_val == 0);
+        }
+        int64_t value = PyLong_AsLongLong(item);
+        if (value == -1 && PyErr_Occurred()) throw py::error_already_set();
+        return value != 0;
+    } else if constexpr (std::is_integral_v<T>) {
+        // Python 3.10+ semantics: floats are no longer silently truncated to
+        // integers, but an explicit conversion is still attempted with a
+        // width check.
         if constexpr (std::is_unsigned_v<T>) {
-            auto value = PyLong_AsUnsignedLongLong(item);
-            if (PyErr_Occurred()) throw py::error_already_set();
-            return static_cast<T>(value);
+            if (PyLong_Check(item) || is_numpy_int(item)) {
+                unsigned long long value = PyLong_AsUnsignedLongLong(item);
+                if (value == static_cast<unsigned long long>(-1) &&
+                    PyErr_Occurred())
+                    throw py::error_already_set();
+                return static_cast<T>(value);
+            }
+            TP_THROW(TypeError, "can't convert non-integer to an unsigned type");
         } else {
-            auto value = PyLong_AsLongLong(item);
-            if (PyErr_Occurred()) throw py::error_already_set();
-            return static_cast<T>(value);
+            if (PyFloat_Check(item)) {
+                double value = PyFloat_AS_DOUBLE(item);
+                return static_cast<T>(value);
+            }
+            if (PyLong_Check(item) || is_numpy_int(item)) {
+                long long value = PyLong_AsLongLong(item);
+                if (value == -1 && PyErr_Occurred())
+                    throw py::error_already_set();
+                return static_cast<T>(value);
+            }
+            TP_THROW(TypeError, "can't convert non-integer to an integer type");
         }
+    } else {
+        // Floating destinations: NumPy float/int scalars answer through
+        // __float__.
+        return static_cast<T>(unpack_double_scalar(item));
     }
-    TP_THROW(TypeError, "Unsupported element type in flat copy");
 }
 
 template <typename T>

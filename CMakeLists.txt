@@ -1136,6 +1136,7 @@ set(TP_C_SOURCES
     src/bindings/python/Size.cpp
     src/bindings/python/Generator.cpp
     src/bindings/python/Storage.cpp
+    src/bindings/python/TensorNumpy.cpp
     src/bindings/python/Autograd.cpp
     src/bindings/python/autocast_mode.cpp
     src/bindings/python/Transforms.cpp
@@ -1207,6 +1208,17 @@ if(USE_ROCM)
 endif()
 pybind11_add_module(_C ${TP_C_SOURCES})
 set_target_properties(_C PROPERTIES UNITY_BUILD ON)
+# The NumPy C-API bootstrap headers (numpy_stub.h) need the NumPy include
+# directory; locate it through the interpreter that owns the extension.
+execute_process(
+    COMMAND "${Python_EXECUTABLE}" -c
+            "import numpy; print(numpy.get_include())"
+    RESULT_VARIABLE TP_NUMPY_PROBE_RESULT
+    OUTPUT_VARIABLE TP_NUMPY_INCLUDE
+    ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(TP_NUMPY_PROBE_RESULT EQUAL 0 AND TP_NUMPY_INCLUDE)
+    target_include_directories(_C PRIVATE "${TP_NUMPY_INCLUDE}")
+endif()
 # Transport selection follows the dependent options above; the fallback
 # branch keeps the wheel buildable where a transport is unavailable.
 if(TARGET tp_python)
