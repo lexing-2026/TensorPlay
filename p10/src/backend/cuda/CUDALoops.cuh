@@ -886,13 +886,11 @@ inline OffsetCalculator<NARGS> make_offset_calculator(
     const TensorIteratorBase& iter) {
     constexpr int array_size = std::max<int>(NARGS, 1);
     std::array<const int64_t*, array_size> strides;
-    int64_t element_sizes[array_size];
     for (int i = 0; i < NARGS; i++) {
         strides[i] = iter.strides(i).data();
-        element_sizes[i] = iter.element_size(i);
     }
     return OffsetCalculator<NARGS>(iter.ndim(), iter.shape().data(),
-                                   strides.data(), element_sizes);
+                                   strides.data());
 }
 
 // -----------------------------------------------------------------------

@@ -49,6 +49,22 @@ class TestCUDAPointwise(unittest.TestCase):
         expected = [1.0, 2.0, 3.0]
         self.assertTrue(tp.allclose(res.cpu(), tp.tensor(expected)), "Sqrt failed")
 
+    def test_noncontiguous_float64_offsets(self):
+        source = tp.tensor(
+            [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]],
+            dtype=tp.float64,
+            device=self.device,
+        )
+        view = source.transpose(0, 1)
+        self.assertFalse(view.is_contiguous())
+
+        result = tp.neg(view)
+        expected = tp.tensor(
+            [[-0.0, -3.0], [-1.0, -4.0], [-2.0, -5.0]],
+            dtype=tp.float64,
+        )
+        self.assertTrue(tp.allclose(result.cpu(), expected), "Strided Float64 unary failed")
+
     def test_activation(self):
         print("\nTesting CUDA activation...")
         device = self.device
