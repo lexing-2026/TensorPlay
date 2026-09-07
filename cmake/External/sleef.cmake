@@ -98,6 +98,15 @@ endfunction()
 
 _tp_add_vendored_sleef()
 message(STATUS "Building vendored SLEEF (static)")
+if(MSVC AND TARGET commonxx_obj)
+    # The CPU-extension probe guards itself with SEH (__try/__except), which
+    # the compiler rejects inside a function whose locals need unwinding
+    # (C2712) when exception handling is enabled. The project appends /EHsc
+    # globally; appending /EHs-c- here puts a later /EH on this object's
+    # command line, which cl resolves in favor of the last one, so the file
+    # compiles with exceptions disabled and keeps the SEH guard.
+    target_compile_options(commonxx_obj PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/EHs-c->)
+endif()
 # Some of SLEEF's tlfloat resolution paths answer with a bare -l style
 # entry whose search directory stays scoped to SLEEF's subdirectory and
 # never reaches the compute library's link line. Scan the resulting link
