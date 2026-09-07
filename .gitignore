@@ -9,9 +9,6 @@ release_site/
 .trae/
 .pytest_cache/
 data_torch/
-# Anchored: an unanchored data/ would also match tracked package
-# directories at deeper levels, which the sdist walk would then drop.
-/data/
 logs_*/
 
 # Compiled binaries
