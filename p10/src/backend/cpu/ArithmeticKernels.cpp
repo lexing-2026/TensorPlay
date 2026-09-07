@@ -870,7 +870,10 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
     #endif
 
     std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
-    DType result_dtype = add_result_dtype(self.dtype(), other.dtype(), alpha);
+    DType result_dtype = native::result_type(self, other);
+    if (alpha.isFloatingPoint() && !isFloatingType(result_dtype)) {
+        result_dtype = promoteTypes(result_dtype, DType::Float32);
+    }
     Tensor result = Tensor::empty(out_shape, result_dtype, self.device());
 
     bool optimized = false;
