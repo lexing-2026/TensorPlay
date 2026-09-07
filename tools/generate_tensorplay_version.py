@@ -76,7 +76,10 @@ def get_tensorplay_version(sha: str | None = None) -> str:
             raise AssertionError(
                 "TENSORPLAY_BUILD_NUMBER must be set when TENSORPLAY_BUILD_VERSION is set"
             )
-        build_number = int(os.getenv("TENSORPLAY_BUILD_NUMBER", ""))
+        # An empty value must not crash the metadata provider: treat it as
+        # the default build number instead of int("") raising.
+        raw_build_number = os.getenv("TENSORPLAY_BUILD_NUMBER", "").strip()
+        build_number = int(raw_build_number) if raw_build_number else 1
         version = os.getenv("TENSORPLAY_BUILD_VERSION", "")
         if build_number > 1:
             version += ".post" + str(build_number)

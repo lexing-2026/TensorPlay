@@ -173,7 +173,9 @@ jobs:
               ;;
           esac
           echo "TENSORPLAY_BUILD_VERSION=${build_version}" >> "$GITHUB_ENV"
-          echo "TENSORPLAY_BUILD_NUMBER=${{ inputs.build_number }}" >> "$GITHUB_ENV"
+          # The caller's build_number is only non-empty on workflow_dispatch;
+          # fall back to 1 so the version metadata never sees an empty value.
+          echo "TENSORPLAY_BUILD_NUMBER=${{ inputs.build_number || '1' }}" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@v5
         with:
