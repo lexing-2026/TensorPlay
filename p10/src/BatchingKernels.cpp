@@ -62,14 +62,7 @@ int64_t normalize_dim(int64_t dim, int64_t ndim) {
 
 Tensor move_to_front(const Tensor& value, int64_t dim) {
     if (dim == 0) return value;
-    const int64_t ndim = value.dim();
-    std::vector<int64_t> permutation;
-    permutation.reserve(static_cast<size_t>(ndim));
-    permutation.push_back(dim);
-    for (int64_t d = 0; d < ndim; ++d) {
-        if (d != dim) permutation.push_back(d);
-    }
-    return value.permute(permutation);
+    return value.movedim(dim, 0);
 }
 
 Tensor expand_unbatched(const Tensor& value, int64_t batch_size,
@@ -126,7 +119,7 @@ Tensor pad_to_logical_rank(const Tensor& value, int64_t bdim,
     for (int64_t d = 1; d < front.dim(); ++d) {
         shape.push_back(front.size(static_cast<size_t>(d)));
     }
-    return front.view(shape);
+    return tpx::ops::view(front, shape);
 }
 
 // Broadcast two operands at the current level: mapped batch dims move to the
@@ -506,43 +499,30 @@ Tensor view(const Tensor& input, const std::vector<int64_t>& shape) {
     physical_shape.reserve(shape.size() + 1);
     physical_shape.push_back(batch_size);
     physical_shape.insert(physical_shape.end(), shape.begin(), shape.end());
-    Tensor result = value.view(physical_shape);
+    Tensor result = tpx::ops::view(value, physical_shape);
     return make_batched(result, 0, operand.level);
 }
 
 Tensor permute(const Tensor& input, const std::vector<int64_t>& dims) {
     Operand operand = unwrap_operand(input);
     if (!operand.bdim.has_value()) {
-        TP_THROW(RuntimeError, "permute batch rule received an unbatched operand");
+        return call_next<Tensor, const Tensor&, const std::vector<int64_t>&>(
+            "permute", input, input, dims);
     }
-    const int64_t ndim = input.dim();
-    if (static_cast<int64_t>(dims.size()) != ndim) {
+    const int64_t logical_rank = input.dim();
+    if (static_cast<int64_t>(dims.size()) != logical_rank) {
         TP_THROW(ValueError, "permute dimensions must cover every public dimension");
     }
-    std::vector<int64_t> actual_dims;
-    actual_dims.reserve(dims.size() + 1);
-    int64_t new_bdim = -1;
-    for (int64_t out_dim = 0; out_dim < ndim; ++out_dim) {
-        const int64_t public_dim = normalize_dim(dims[static_cast<size_t>(out_dim)], ndim);
-        actual_dims.push_back(public_dim < *operand.bdim
-                                  ? public_dim : public_dim + 1);
-    }
-    new_bdim = *operand.bdim;
-    std::vector<int64_t> physical_permutation;
-    physical_permutation.reserve(actual_dims.size() + 1);
-    size_t public_index = 0;
-    for (int64_t physical_dim = 0;
-         physical_dim < static_cast<int64_t>(actual_dims.size() + 1);
-         ++physical_dim) {
-        if (physical_dim == new_bdim) {
-            physical_permutation.push_back(*operand.bdim);
-        } else {
-            physical_permutation.push_back(actual_dims[public_index++]);
-        }
+    Tensor value = move_to_front(operand.value, *operand.bdim);
+    std::vector<int64_t> physical_dims;
+    physical_dims.reserve(dims.size() + 1);
+    physical_dims.push_back(0);
+    for (int64_t dim : dims) {
+        physical_dims.push_back(normalize_dim(dim, logical_rank) + 1);
     }
     Tensor result = call_next<Tensor, const Tensor&, const std::vector<int64_t>&>(
-        "permute", operand.value, operand.value, physical_permutation);
-    return make_batched(result, new_bdim, operand.level);
+        "permute", value, value, physical_dims);
+    return make_batched(result, 0, operand.level);
 }
 
 Tensor transpose(const Tensor& input, int64_t dim0, int64_t dim1) {
@@ -637,12 +617,30 @@ Tensor expand(const Tensor& input, const std::vector<int64_t>& shape,
     if (!operand.bdim.has_value()) {
         TP_THROW(RuntimeError, "expand batch rule received an unbatched operand");
     }
-    std::vector<int64_t> physical_shape = shape;
-    physical_shape.insert(physical_shape.begin(),
-                          layer_for(operand.level).batch_size);
-    Tensor result = call_next<Tensor, const Tensor&, const std::vector<int64_t>&, bool>(
-        "expand", operand.value, operand.value, physical_shape, implicit);
-    return make_batched(result, *operand.bdim, operand.level);
+    const int64_t physical_rank = operand.value.dim();
+    TP_CHECK(static_cast<int64_t>(shape.size()) >= physical_rank - 1,
+             "expand: the number of sizes provided (", shape.size(),
+             ") must be greater or equal to the number of dimensions in the tensor (",
+             physical_rank - 1, ")");
+
+    Tensor value = move_to_front(operand.value, *operand.bdim);
+    const int64_t batch_size = value.size(0);
+    std::vector<int64_t> physical_shape;
+    physical_shape.reserve(shape.size() + 1);
+    physical_shape.push_back(batch_size);
+    physical_shape.insert(physical_shape.end(), shape.begin(), shape.end());
+
+    const int64_t extra_dims =
+        static_cast<int64_t>(shape.size()) - (physical_rank - 1);
+    std::vector<int64_t> view_shape(physical_shape.size(), 1);
+    view_shape[0] = batch_size;
+    for (int64_t dim = 1; dim < physical_rank; ++dim) {
+        view_shape[static_cast<size_t>(dim + extra_dims)] =
+            value.size(static_cast<size_t>(dim));
+    }
+    value = tpx::ops::view(value, view_shape);
+    Tensor result = tpx::ops::expand(value, physical_shape, implicit);
+    return make_batched(result, 0, operand.level);
 }
 
 Tensor squeeze(const Tensor& input) {
@@ -1685,7 +1683,7 @@ Tensor maybe_pad_index_rank(const Tensor& tensor, std::optional<int64_t> bdim,
     for (int64_t d = 1; d < front.dim(); ++d) {
         shape.push_back(front.size(d));
     }
-    return front.view(shape);
+    return tpx::ops::view(front, shape);
 }
 
 std::vector<std::optional<Tensor>> batch_indices(
@@ -1851,7 +1849,7 @@ Tensor& batch_index_put_(Tensor& self, const std::vector<Tensor>& indices,
         for (size_t d = 1; d < old_shape.size(); ++d) {
             new_shape[d + unit_dims] = old_shape[d];
         }
-        values_value = values_value.view(new_shape);
+        values_value = tpx::ops::view(values_value, new_shape);
     }
     std::vector<Tensor> redispatch_indices;
     redispatch_indices.reserve(physical_indices.size());

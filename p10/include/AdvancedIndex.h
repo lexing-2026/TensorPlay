@@ -18,7 +18,8 @@ inline bool has_contiguous_subspace(const std::vector<Tensor>& indices) {
 
 inline std::pair<Tensor, std::vector<Tensor>> prepare_indices(
     Tensor self, const std::vector<std::optional<Tensor>>& original,
-    bool ensure_same_device = false) {
+    bool ensure_same_device = false,
+    bool normalize_int32 = true) {
     TP_CHECK_INDEX(original.size() <= static_cast<size_t>(self.dim()),
                    "too many indices for tensor of dimension ", self.dim());
     std::vector<Tensor> indices;
@@ -93,9 +94,11 @@ inline std::pair<Tensor, std::vector<Tensor>> prepare_indices(
         self = self.permute(permutation);
         indices = std::move(reordered);
     }
-    for (auto& index : indices) {
-        if (index.defined() && index.dtype() == DType::Int32) {
-            index = index.to(DType::Int64);
+    if (normalize_int32) {
+        for (auto& index : indices) {
+            if (index.defined() && index.dtype() == DType::Int32) {
+                index = index.to(DType::Int64);
+            }
         }
     }
     return {std::move(self), std::move(indices)};
@@ -103,7 +106,7 @@ inline std::pair<Tensor, std::vector<Tensor>> prepare_indices(
 
 inline std::vector<int64_t> indexed_shape(
     const Tensor& self, const std::vector<std::optional<Tensor>>& original) {
-    auto [source, indices] = prepare_indices(self, original);
+    auto [source, indices] = prepare_indices(self, original, false, false);
     int64_t before = 0;
     int64_t indexed = 0;
     std::vector<int64_t> replacement;

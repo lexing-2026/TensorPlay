@@ -487,6 +487,7 @@ MANUAL_DERIVATIVES: dict[str, dict] = {
     "matmul": {"saved": ["self", "other"]},
     # List-gradient alignment: apply() pads the index slots so outputs line
     # up with the per-element edges collected for the Tensor[] indices.
+    "index": {"saved": ["self", "indices"]},
     "index_put": {"saved": ["indices", "values", "accumulate"]},
     "index_put_": {"saved": ["indices", "values", "accumulate"]},
     # Two differentiable outputs: the node reads grads[0]/grads[1].

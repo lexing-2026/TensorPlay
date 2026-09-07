@@ -1167,6 +1167,10 @@
 
 # --- scatter / index family (derivatives.yaml:856-880, 1090-1110) ---------
 
+- name: index.Tensor(Tensor self, Tensor?[] indices) -> Tensor
+  self: index_backward(grad.new_zeros_symint(self.sym_sizes(), self.options()), indices, grad)
+  result: auto_linear
+
 - name: scatter.src(Tensor self, int dim, Tensor index, Tensor src) -> Tensor
   self: scatter(grad, dim, index, Scalar(0))
   src: gather(grad, dim, index)
