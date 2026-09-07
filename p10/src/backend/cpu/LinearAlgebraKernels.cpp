@@ -24,7 +24,6 @@
 // Dispatcher-level entry points come from the generated TPXOpsGenerated.h
 // (included at the top).
 
-#if defined(USE_MKL)
 // MKL dispatches AMD/Zen hosts to its generic kernel clones -- measured
 // ~100x off tuned throughput on Zen4 (512^3 f32 GEMM: 291ms vs ~11ms).
 // The documented debug knob doubles as the standard HPC workaround: force
