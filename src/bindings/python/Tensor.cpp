@@ -449,6 +449,18 @@ Tensor create_tensor(py::object data, std::optional<DType> dtype, std::optional<
         return PyObject_HasAttr(ptr, dlpack_attr_name);
     }(data.ptr())) {
         t = from_dlpack(data);
+    } else if (is_numpy_scalar(data.ptr())) {
+        // NumPy scalar types (np.float32, np.complex64, ...) implement no
+        // CPython number protocol, so lift them into a 0-dim array and take
+        // the ndarray path.
+        PyObject* arr = numpy_scalar_to_array(data.ptr());
+        if (!arr) {
+            throw py::error_already_set();
+        }
+        py::object scalar_array = py::reinterpret_steal<py::object>(arr);
+        t = create_tensor(scalar_array, dtype, device);
+        // A 0-dim array produces a 0-dim tensor; a bare NumPy scalar matches
+        // that shape, so no reshape is needed here.
     } else if (py::isinstance<py::list>(data) || py::isinstance<py::tuple>(data)) {
         t = list_to_tensor(data.ptr(), dtype, device);
     } else if (py::isinstance<py::int_>(data) || py::isinstance<py::float_>(data) ||
