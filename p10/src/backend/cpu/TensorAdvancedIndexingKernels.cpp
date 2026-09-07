@@ -123,7 +123,15 @@ void index_put_kernel(TensorIterator& iter, const indexing::native::AdvancedInde
                 parallel::get_num_threads() > 1) {
                 cpu_index_kernel(iter, info.indexed_sizes, info.indexed_strides,
                     [](char* dst, char* src, int64_t offset) {
+                        // Feature-detect atomic_ref: toolchains whose standard
+                        // library predates it fall back to a reinterpret cast
+                        // of the target onto std::atomic<float>, which shares
+                        // the representation the spin loop relies on.
+#if defined(__cpp_lib_atomic_ref) && __cpp_lib_atomic_ref >= 201806L
                         std::atomic_ref<float> target(*reinterpret_cast<float*>(dst + offset));
+#else
+                        auto& target = *reinterpret_cast<std::atomic<float>*>(reinterpret_cast<float*>(dst + offset));
+#endif
                         const float value = *reinterpret_cast<float*>(src);
                         float old = target.load();
                         while (!target.compare_exchange_weak(old, old + value)) {
