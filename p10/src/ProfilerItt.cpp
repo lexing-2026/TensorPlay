@@ -13,7 +13,9 @@
 
 #include "Profiler.h"
 
+#if !defined(_WIN32)
 #include <dlfcn.h>
+#endif
 
 #include <mutex>
 #include <string>
@@ -22,6 +24,24 @@
 
 namespace tensorplay {
 namespace prof {
+
+// The libittnotify distribution probes .so sonames only; there is no wired-up
+// Windows runtime, so the bridge compiles to no-ops there.
+#if defined(_WIN32)
+
+TENSORPLAY_API std::atomic<bool> g_emit_itt{false};
+
+TENSORPLAY_API bool itt_available() { return false; }
+
+TENSORPLAY_API void itt_task_begin_name(const char*) {}
+TENSORPLAY_API void itt_task_end() {}
+TENSORPLAY_API void itt_span_begin(const char*) {}
+TENSORPLAY_API void itt_span_end() {}
+
+} // namespace prof
+} // namespace tensorplay
+
+#else
 
 namespace {
 
@@ -108,3 +128,5 @@ TENSORPLAY_API void itt_span_end() {
 
 } // namespace prof
 } // namespace tensorplay
+
+#endif // _WIN32
