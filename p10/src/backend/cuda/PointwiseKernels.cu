@@ -1730,20 +1730,28 @@ Tensor atan2_kernel_cuda(const Tensor& self, const Tensor& other) {
         .add_input(b)
         .build();
 
-    #define ATAN2_CASE(ctype, name) \
-    case DType::name: \
-        gpu_kernel_with_scalars(iter, [] __host__ __device__(ctype lhs, ctype rhs) -> ctype { \
-            return ::atan2(lhs, rhs); \
-        }); \
-        break;
     switch (out_dtype) {
-        ATAN2_CASE(Half, Float16)
-        ATAN2_CASE(BFloat16, BFloat16)
-        ATAN2_CASE(float, Float32)
-        ATAN2_CASE(double, Float64)
+        case DType::Float16:
+        case DType::BFloat16:
+            opmath_gpu_kernel_with_scalars<float, float, float>(
+                iter, [] __host__ __device__(float lhs, float rhs) -> float {
+                    return ::atan2(lhs, rhs);
+                });
+            break;
+        case DType::Float32:
+            gpu_kernel_with_scalars(iter, [] __host__ __device__(float lhs,
+                                                                  float rhs) -> float {
+                return ::atan2(lhs, rhs);
+            });
+            break;
+        case DType::Float64:
+            gpu_kernel_with_scalars(iter, [] __host__ __device__(double lhs,
+                                                                  double rhs) -> double {
+                return ::atan2(lhs, rhs);
+            });
+            break;
         default: TP_THROW(TypeError, "CUDA atan2: Unsupported output dtype");
     }
-    #undef ATAN2_CASE
     return result;
 }
 
