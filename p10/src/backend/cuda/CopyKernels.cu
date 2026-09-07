@@ -13,130 +13,6 @@
 namespace tensorplay {
 namespace cuda {
 
-// rank through broadcasted batch dimensions, so the strided clone path must
-// not impose the old eight-dimension limit.
-static constexpr int kCopyMaxDims = 64;
-
-struct TensorInfo {
-    int64_t sizes[kCopyMaxDims];
-    int64_t strides[kCopyMaxDims];
-    int ndim;
-};
-
-TensorInfo get_tensor_info(const Tensor& t) {
-    TensorInfo info;
-    info.ndim = t.dim();
-    if (info.ndim > kCopyMaxDims) {
-         TP_THROW(RuntimeError, "Tensor dimension exceeds MAX_DIMS (64) for CUDA copy");
-    }
-    for (int i = 0; i < info.ndim; ++i) {
-        info.sizes[i] = t.size(i);
-        info.strides[i] = t.stride(i);
-    }
-    return info;
-}
-
-__device__ int64_t get_linear_offset(int64_t idx, const int64_t* sizes, const int64_t* strides, int ndim) {
-    int64_t offset = 0;
-    for (int i = ndim - 1; i >= 0; --i) {
-        int64_t mod = idx % sizes[i];
-        idx /= sizes[i];
-        offset += mod * strides[i];
-    }
-    return offset;
-}
-
-template <typename T> struct real_of;
-template <> struct real_of<tensorplay::complex<float>> { using type = float; };
-template <> struct real_of<tensorplay::complex<double>> { using type = double; };
-
-template <typename C> struct dtype_of_complex;
-template <> struct dtype_of_complex<tensorplay::complex<float>> {
-    static constexpr DType value = DType::ComplexFloat;
-};
-template <> struct dtype_of_complex<tensorplay::complex<double>> {
-    static constexpr DType value = DType::ComplexDouble;
-};
-
-template <typename DstT, typename SrcT>
-__global__ void copy_cast_kernel_impl(int64_t numel, DstT* dst, TensorInfo dst_info, const SrcT* src, TensorInfo src_info) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= numel) return;
-    
-    int64_t dst_offset = get_linear_offset(idx, dst_info.sizes, dst_info.strides, dst_info.ndim);
-    // Use dst_info.sizes for src logic as well, assuming shapes match (which is enforced in wrapper)
-    // If src was expanded, its strides handle the mapping correctly.
-    int64_t src_offset = get_linear_offset(idx, dst_info.sizes, src_info.strides, src_info.ndim); 
-    
-    dst[dst_offset] = static_cast<DstT>(src[src_offset]);
-}
-
-template <typename ComplexT>
-__global__ void copy_complex_strided_kernel(
-    int64_t numel, ComplexT* dst, TensorInfo dst_info,
-    const ComplexT* src, TensorInfo src_info) {
-    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= numel) return;
-    const int64_t dst_offset = get_linear_offset(
-        idx, dst_info.sizes, dst_info.strides, dst_info.ndim);
-    const int64_t src_offset = get_linear_offset(
-        idx, dst_info.sizes, src_info.strides, src_info.ndim);
-    dst[dst_offset] = src[src_offset];
-}
-
-// Mixed real<->complex casts.  Storage is interleaved component scalars, so
-// offsets are computed in each tensor's own element units and the complex
-// side addresses its two components through a doubled pointer.
-template <typename C>
-__global__ void cast_real_to_complex_kernel(
-    int64_t numel, C* __restrict__ dst, TensorInfo dst_info,
-    const typename real_of<C>::type* __restrict__ src, TensorInfo src_info) {
-    using R = typename real_of<C>::type;
-    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= numel) return;
-    const int64_t dst_offset = get_linear_offset(idx, dst_info.sizes, dst_info.strides, dst_info.ndim);
-    const int64_t src_offset = get_linear_offset(idx, dst_info.sizes, src_info.strides, src_info.ndim);
-    dst[dst_offset] = C{src[src_offset], R(0)};
-}
-
-template <typename C>
-__global__ void cast_complex_to_real_kernel(
-    int64_t numel, typename real_of<C>::type* __restrict__ dst, TensorInfo dst_info,
-    const C* __restrict__ src, TensorInfo src_info) {
-    using R = typename real_of<C>::type;
-    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= numel) return;
-    const int64_t dst_offset = get_linear_offset(idx, dst_info.sizes, dst_info.strides, dst_info.ndim);
-    const int64_t src_offset = get_linear_offset(idx, dst_info.sizes, src_info.strides, src_info.ndim);
-    dst[dst_offset] = src[src_offset].real();
-}
-
-template <typename D, typename S>
-__global__ void cast_complex_to_complex_kernel(
-    int64_t numel, D* __restrict__ dst, TensorInfo dst_info,
-    const S* __restrict__ src, TensorInfo src_info) {
-    using RD = typename real_of<D>::type;
-    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= numel) return;
-    const int64_t dst_offset = get_linear_offset(idx, dst_info.sizes, dst_info.strides, dst_info.ndim);
-    const int64_t src_offset = get_linear_offset(idx, dst_info.sizes, src_info.strides, src_info.ndim);
-    dst[dst_offset] = D{static_cast<RD>(src[src_offset].real()),
-                        static_cast<RD>(src[src_offset].imag())};
-}
-
-// ---------------------------------------------------------------------------
-// Tiled 2-D transpose copy.  dst is the row-major [rows, cols] contiguous
-// tensor; src is the [rows, cols] live transpose view of row-major
-// [cols, rows] storage, with flat addressing r + c*rows.  The two flat
-// layouts are transposes of each other.  Each block stages a 32x32 tile
-// through shared memory: the read pass walks the view's contiguous axis
-// (rows, stride 1) and the write pass walks the destination rows'
-// contiguous axis (cols, stride 1), so both global passes are fully
-// coalesced for any aspect ratio; the +1 lane padding in the tile removes
-// the shared-memory bank conflict that the direct strided copy hits on
-// every element.
-// ---------------------------------------------------------------------------
-
 namespace {
 
 constexpr int kTransTile = 32;
@@ -738,100 +614,32 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
         return self;
     }
 
-    TensorInfo dst_info = get_tensor_info(self);
-    TensorInfo src_info = get_tensor_info(src_cuda_tensor);
-
-    // --- mixed real<->complex casts ----------------------------------------
-    // the real component.  Width pairs only (f32<->c64, f64<->c128).
-    #define TP_CUDA_CPLX_CAST_R2C(DT_REAL, CU_C)                                \
-        if (self.dtype() == dtype_of_complex<CU_C>::value &&                    \
-            src_cuda_tensor.dtype() == DType::DT_REAL) {                        \
-            cast_real_to_complex_kernel<CU_C>                                   \
-                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(      \
-                    numel,                                                      \
-                    reinterpret_cast<CU_C*>(self.data_ptr()), dst_info,         \
-                    reinterpret_cast<const real_of<CU_C>::type*>(      \
-                        src_cuda_tensor.data_ptr()), src_info);                 \
-            checkCuda(cudaGetLastError(), "CUDA complex cast kernel");          \
-            return self;                                                        \
-        }
-    #define TP_CUDA_CPLX_CAST_C2R(CU_C, DT_REAL)                                \
-        if (self.dtype() == DType::DT_REAL &&                                   \
-            src_cuda_tensor.dtype() == dtype_of_complex<CU_C>::value) {         \
-            cast_complex_to_real_kernel<CU_C>                                   \
-                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(      \
-                    numel,                                                      \
-                    reinterpret_cast<real_of<CU_C>::type*>(            \
-                        self.data_ptr()), dst_info,                             \
-                    reinterpret_cast<const CU_C*>(                              \
-                        src_cuda_tensor.data_ptr()), src_info);                 \
-            checkCuda(cudaGetLastError(), "CUDA complex cast kernel");          \
-            return self;                                                        \
-        }
-    #define TP_CUDA_CPLX_CAST_C2C(CU_DST, CU_SRC)                               \
-        if (self.dtype() == dtype_of_complex<CU_DST>::value &&                  \
-            src_cuda_tensor.dtype() == dtype_of_complex<CU_SRC>::value) {       \
-            cast_complex_to_complex_kernel<CU_DST, CU_SRC>                      \
-                <<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(      \
-                    numel,                                                      \
-                    reinterpret_cast<CU_DST*>(self.data_ptr()), dst_info,       \
-                    reinterpret_cast<const CU_SRC*>(                            \
-                        src_cuda_tensor.data_ptr()), src_info);                 \
-            checkCuda(cudaGetLastError(), "CUDA complex cast kernel");          \
-            return self;                                                        \
-        }
-    TP_CUDA_CPLX_CAST_R2C(Float32, tensorplay::complex<float>)
-    TP_CUDA_CPLX_CAST_R2C(Float64, tensorplay::complex<double>)
-    TP_CUDA_CPLX_CAST_C2R(tensorplay::complex<float>, Float32)
-    TP_CUDA_CPLX_CAST_C2R(tensorplay::complex<double>, Float64)
-    TP_CUDA_CPLX_CAST_C2C(tensorplay::complex<float>, tensorplay::complex<double>)
-    TP_CUDA_CPLX_CAST_C2C(tensorplay::complex<double>, tensorplay::complex<float>)
-    #undef TP_CUDA_CPLX_CAST_R2C
-    #undef TP_CUDA_CPLX_CAST_C2R
-    #undef TP_CUDA_CPLX_CAST_C2C
-    
-    // Define a local macro to avoid recursion of TENSORPLAY_FORALL_SCALAR_TYPES
-    #define LOCAL_FORALL_SCALAR_TYPES(_) \
-        _(uint8_t, UInt8) \
-        _(int8_t, Int8) \
-        _(int16_t, Int16) \
-        _(int32_t, Int32) \
-        _(int64_t, Int64) \
-        _(uint16_t, UInt16) \
-        _(uint32_t, UInt32) \
-        _(uint64_t, UInt64) \
-        _(float, Float32) \
-        _(double, Float64) \
-        _(tensorplay::Half, Float16) \
-        _(tensorplay::BFloat16, BFloat16) \
-        _(bool, Bool)
-
-    #define SRC_CASE(src_ctype, src_name) \
-    case DType::src_name: \
-        copy_cast_kernel_impl<DstT, src_ctype><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(numel, self.data_ptr<DstT>(), dst_info, src_cuda_tensor.data_ptr<src_ctype>(), src_info); \
-        break;
-
-    #define DST_CASE(dst_ctype, dst_name) \
-    case DType::dst_name: { \
-        using DstT = dst_ctype; \
-        switch (src_cuda_tensor.dtype()) { \
-            LOCAL_FORALL_SCALAR_TYPES(SRC_CASE) \
-            default: TP_THROW(NotImplementedError, "Unsupported src dtype for casting"); \
-        } \
-        break; \
-    }
-
+    // Cross-dtype casts follow the unified elementwise lane as well: one
+    // identity functor per destination dtype, with the source operand
+    // converted on load through the dynamic-cast machinery.  This carries
+    // every real/complex combination, including the reduced complex widths,
+    // without per-pair kernels.
+    TensorIterator iter = TensorIteratorConfig()
+                              .check_all_same_dtype(false)
+                              .add_output(self)
+                              .add_input(src_cuda_tensor)
+                              .build();
     switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(DST_CASE)
-        default: TP_THROW(NotImplementedError, "Unsupported dst dtype for casting");
+#define TP_COPY_CAST_CASE(ctype, name)                                     \
+        case DType::name:                                                  \
+            gpu_kernel(iter, [] __host__ __device__(ctype v) { return v; });        \
+            break;
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_COPY_CAST_CASE)
+#undef TP_COPY_CAST_CASE
+        default:
+            TP_THROW(NotImplementedError, "Unsupported dst dtype for casting");
     }
-    #undef DST_CASE
-    #undef SRC_CASE
-    #undef LOCAL_FORALL_SCALAR_TYPES
-    
+
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
          TP_THROW(RuntimeError, std::string("CUDA Copy Kernel Error: ") + cudaGetErrorString(err));
+    }
+
     }
 
     return self;
