@@ -83,6 +83,7 @@ Tensor index_cpu(const Tensor& self,
     config.set_check_mem_overlap(false).check_all_same_dtype(false)
         .add_output(output).add_const_input(info.source);
     for (const auto& index : info.indices) config.add_const_input(index);
+    config.declare_static_dtype_and_device(info.source.dtype(), info.source.device());
     auto iter = config.build();
     const auto item_size = elementSize(self.dtype());
     cpu_index_kernel(iter, info.indexed_sizes, info.indexed_strides,

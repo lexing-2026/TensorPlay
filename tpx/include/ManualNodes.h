@@ -1422,6 +1422,57 @@ inline std::tuple<Tensor, Tensor> index_put_backward(
 // elements included), so list slots are padded with undefined grads.
 // ===========================================================================
 
+struct IndexBackward : public Node {
+    SavedVariable self_;
+    std::vector<std::optional<SavedVariable>> indices_;
+
+    IndexBackward(Tensor self, std::vector<std::optional<Tensor>> indices)
+        : self_(std::move(self)) {
+        indices_.reserve(indices.size());
+        for (auto& index : indices) {
+            if (index.has_value()) {
+                indices_.emplace_back(std::move(*index));
+            } else {
+                indices_.emplace_back(std::nullopt);
+            }
+        }
+    }
+
+    variable_list apply(variable_list&& inputs) override {
+        variable_list grads;
+        grads.reserve(1 + indices_.size());
+        const Tensor grad = inputs.empty() ? Tensor() : inputs[0];
+        if (grad.defined()) {
+            const Tensor self = self_.unpack();
+            std::vector<std::optional<Tensor>> indices;
+            indices.reserve(indices_.size());
+            for (auto& index : indices_) {
+                indices.emplace_back(index.has_value()
+                    ? std::optional<Tensor>(index->unpack())
+                    : std::nullopt);
+            }
+            Tensor zeros = ops::new_zeros(
+                self, static_cast<std::vector<int64_t>>(self.shape()));
+            grads.push_back(ops::_index_put_impl_(
+                zeros, indices, grad, /*accumulate=*/true, /*unsafe=*/true));
+        } else {
+            grads.push_back(Tensor());
+        }
+        for (const auto& index : indices_) {
+            if (index.has_value()) grads.push_back(Tensor());
+        }
+        return grads;
+    }
+
+    void release_variables() override {
+        Node::release_variables();
+        self_.reset_data();
+        for (auto& index : indices_) {
+            if (index.has_value()) index->reset_data();
+        }
+    }
+};
+
 struct IndexPutBackward : public Node {
     std::vector<SavedVariable> indices_;
     SavedVariable values_;
