@@ -218,9 +218,13 @@ jobs:
           else
             version="$(python -c 'from tools.generate_tensorplay_version import compute_nightly_version; print(compute_nightly_version())')"
           fi
+          # The dispatch default applies only to workflow_dispatch; on other
+          # events the input context yields an empty string, which the
+          # wheel build must never see (an empty build number is invalid).
+          build_number="${INPUT_BUILD_NUMBER:-1}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "build_number=${INPUT_BUILD_NUMBER}" >> "$GITHUB_OUTPUT"
-          echo "Nightly base version: ${version} (build number ${INPUT_BUILD_NUMBER})"
+          echo "build_number=${build_number}" >> "$GITHUB_OUTPUT"
+          echo "Nightly base version: ${version} (build number ${build_number})"
 
   create-nightly-release:
     name: create-nightly-release
