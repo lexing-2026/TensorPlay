@@ -57,15 +57,19 @@ jobs:
             ]
           ' .github/wheel-platforms.json)"
           echo "cuda_trunk=$cuda_trunk_matrix" >> "$GITHUB_OUTPUT"
+          # Trunk verifies one Python per platform (aligned with the CUDA
+          # trunk lane): the four wheels of a platform compile identical
+          # C/CUDA code and differ only in the Python ABI, so the full
+          # version sweep adds no signal here. Nightly and release builds
+          # still cover every configured version.
           cpu_matrix="$(jq -c '
             [
               .cpu_platforms[] as $platform |
-              .python_versions[] as $python |
               {
                 platform: $platform.name,
                 runner: $platform.runner,
-                python: $python,
-                build_name: ("tensorplay-" + $platform.name + "-py" + ($python | gsub("\\."; "_")) + "-cpu")
+                python: "3.12",
+                build_name: ("tensorplay-" + $platform.name + "-py3_12-cpu")
               }
             ]
           ' .github/wheel-platforms.json)"
