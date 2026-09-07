@@ -21,6 +21,7 @@ set(P10_SOURCES
     src/Stacktrace.cpp
     src/TensorImpl.cpp
     src/TransformDispatch.cpp
+    src/Unicode.cpp
     src/BatchingKernels.cpp
     src/OneDNNContext.cpp
     src/StaxPointwise.cpp

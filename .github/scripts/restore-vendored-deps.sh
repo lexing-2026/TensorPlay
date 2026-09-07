@@ -34,10 +34,16 @@ clone_pin() {
 }
 
 # --- SLEEF (vector math; static libsleef) ---
-# The SleefShims declarations are only referenced by the x86_64 fast paths,
-# so any other architecture skips the (long) libsleef build entirely; the
-# configure step falls back to scalar libm paths.
-if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]]; then
+# The SleefShims entry points are declared by every CPU vector backend that
+# the build instantiates (x86_64 and the aarch64 NEON tier), so the library
+# must be present wherever the wheel runs on those architectures; MSVC and
+# other configurations degrade to scalar libm paths.
+case "$(uname -s)/$(uname -m)" in
+    Linux/x86_64|Linux/aarch64|Darwin/arm64|Windows_NT/AMD64|MINGW*/x86_64)
+        sleef_supported=1 ;;
+    *) sleef_supported=0 ;;
+esac
+if [[ "$sleef_supported" == "1" ]]; then
     clone_pin sleef https://github.com/shibatch/sleef 7623d6cfa2712462880fa63a4d0f0b5f775d1a83
     if [[ ! -f "$DEST/sleef/submodules/tlfloat/CMakeLists.txt" ]]; then
         echo "::group::Clone sleef tlfloat submodule"

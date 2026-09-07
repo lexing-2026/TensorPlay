@@ -544,9 +544,10 @@ onednn_lstm_backward(const Tensor& grad_y_in, const Tensor& grad_hy_in,
                 // until after execution and the unpack reorders below.
                 std::vector<Tensor> diff_bufs;
                 auto zero_backed_mem = [&](const memory::desc& md) {
-                    Tensor buf = Tensor::zeros({md.get_size() / 4},
-                                               DType::Float32,
-                                               Device(DeviceType::CPU));
+                    Tensor buf = Tensor::zeros(
+                        {static_cast<int64_t>(md.get_size() / 4)},
+                        DType::Float32,
+                        Device(DeviceType::CPU));
                     memory m(md, eng, buf.data_ptr());
                     diff_bufs.push_back(std::move(buf));
                     return m;
