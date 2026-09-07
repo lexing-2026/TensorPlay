@@ -262,12 +262,20 @@ if(WIN32)
         # /MP: Multi-processor compilation
         # /Gm-: Disable minimal rebuild
         set(MSVC_COMMON_FLAGS /EHsc /wd4251 /wd4275 /wd4819 /MP /Gm-)
+        # /MP tells cl to expect several input files; nvcc's host compile
+        # always passes exactly one, so the flag must stay CXX-only.
+        set(MSVC_CUDA_HOST_FLAGS /EHsc /wd4251 /wd4275 /wd4819 /Gm-)
         # M_PI and friends are gated behind this define on MSVC
         add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:_USE_MATH_DEFINES>)
+        # windows.h must not inject the min/max macros (they break
+        # std::min/std::max call sites) nor the full Win32 declaration set.
+        add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
         set(MSVC_REL_FLAGS /O2 /arch:AVX2)
         
         foreach(FLAG ${MSVC_COMMON_FLAGS})
             add_compile_options($<$<COMPILE_LANGUAGE:CXX>:${FLAG}>)
+        endforeach()
+        foreach(FLAG ${MSVC_CUDA_HOST_FLAGS})
             add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${FLAG}>)
         endforeach()
         

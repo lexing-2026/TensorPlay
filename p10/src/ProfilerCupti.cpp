@@ -569,6 +569,31 @@ TENSORPLAY_API void cupti_pop_ext() {
 } // namespace prof
 } // namespace tensorplay
 
+#elif defined(_WIN32) // USE_CUDA but Windows: no wired-up CUPTI loader yet
+
+#include <atomic>
+#include <string>
+#include <vector>
+
+namespace tensorplay {
+namespace prof {
+
+// Keep the symbols so the binding links without ifdef noise; GPU rows are
+// simply absent from gpu_trace sessions.
+TENSORPLAY_API std::atomic<bool> g_gpu_trace{false};
+TENSORPLAY_API bool cupti_available() { return false; }
+TENSORPLAY_API std::string cupti_last_error() {
+    return "CUPTI tracing is not available in Windows builds";
+}
+TENSORPLAY_API bool cupti_start() { return false; }
+TENSORPLAY_API void cupti_stop_and_collect(std::vector<GpuActivity>&) {}
+TENSORPLAY_API bool cupti_push_ext(uint64_t) { return false; }
+TENSORPLAY_API void cupti_pop_ext() {}
+TENSORPLAY_API uint32_t cupti_version() { return 0; }
+
+} // namespace prof
+} // namespace tensorplay
+
 #else  // !USE_CUDA
 
 #include <atomic>

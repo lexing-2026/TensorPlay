@@ -13,7 +13,11 @@
 
 #include "Profiler.h"
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 
 #include <mutex>
 #include <string>
@@ -35,6 +39,23 @@ void (*nv_mark_a)(const char*) = nullptr;
 unsigned long long (*nv_range_start_a)(const char*) = nullptr;
 void (*nv_range_end)(unsigned long long) = nullptr;
 
+#if defined(_WIN32)
+// The NVTX runtime ships inside the CUDA toolkit's bin directory (and
+// system32 when the toolkit installer updates PATH), so probing runs
+// through the Win32 loader with the same symbol set the .so probes use.
+using NvtxHandle = HMODULE;
+static NvtxHandle nvtx_open(const char* name) { return LoadLibraryA(name); }
+static void* nvtx_sym(NvtxHandle h, const char* n) {
+    return reinterpret_cast<void*>(GetProcAddress(h, n));
+}
+#else
+using NvtxHandle = void*;
+static NvtxHandle nvtx_open(const char* name) {
+    return dlopen(name, RTLD_NOW | RTLD_LOCAL);
+}
+static void* nvtx_sym(NvtxHandle h, const char* n) { return dlsym(h, n); }
+#endif
+
 void ensure_loaded() {
     std::lock_guard<std::mutex> lock(g_nvtx_mutex);
     if (g_loaded) return;
@@ -50,6 +71,14 @@ void ensure_loaded() {
         const char* start;
         const char* end;
     };
+#if defined(_WIN32)
+    const Candidate candidates[] = {
+        {"nvToolsExt64_1.dll", "nvtxRangePushA", "nvtxRangePop", "nvtxMarkA",
+         "nvtxRangeStartA", "nvtxRangeEnd"},
+        {"nvToolsExt64.dll", "nvtxRangePushA", "nvtxRangePop", "nvtxMarkA",
+         "nvtxRangeStartA", "nvtxRangeEnd"},
+    };
+#else
     const Candidate candidates[] = {
         {"libnvtx.so", "nvtxRangePushA", "nvtxRangePop", "nvtxMarkA",
          "nvtxRangeStartA", "nvtxRangeEnd"},
@@ -60,19 +89,20 @@ void ensure_loaded() {
         {"libroctx64.so", "roctxRangePushA", "roctxRangePop", "roctxMarkA",
          "roctxRangeStartA", "roctxRangeEnd"},
     };
+#endif
     for (const auto& c : candidates) {
-        if (void* h = dlopen(c.lib, RTLD_NOW | RTLD_LOCAL)) {
+        if (NvtxHandle h = nvtx_open(c.lib)) {
             nv_range_push_a =
-                reinterpret_cast<int (*)(const char*)>(dlsym(h, c.push));
+                reinterpret_cast<int (*)(const char*)>(nvtx_sym(h, c.push));
             nv_range_pop =
-                reinterpret_cast<int (*)()>(dlsym(h, c.pop));
+                reinterpret_cast<int (*)()>(nvtx_sym(h, c.pop));
             nv_mark_a = reinterpret_cast<void (*)(const char*)>(
-                dlsym(h, c.mark));
+                nvtx_sym(h, c.mark));
             nv_range_start_a =
                 reinterpret_cast<unsigned long long (*)(const char*)>(
-                    dlsym(h, c.start));
+                    nvtx_sym(h, c.start));
             nv_range_end = reinterpret_cast<void (*)(unsigned long long)>(
-                dlsym(h, c.end));
+                nvtx_sym(h, c.end));
             g_available = nv_range_push_a && nv_range_pop && nv_mark_a &&
                           nv_range_start_a && nv_range_end;
             return;

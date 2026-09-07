@@ -31,6 +31,9 @@
 // the closest Intel-tuned ISA family.  Runs once at library load, BEFORE
 // the first MKL call initializes its CPU detection; an explicitly exported
 // MKL_DEBUG_CPU_LIST always wins (no overwrite).
+// GCC/Clang only: inline-asm CPUID, __builtin_cpu_supports, and setenv are
+// all absent from MSVC, whose MKL builds ship their own dispatch tuning.
+#if defined(USE_MKL) && (defined(__GNUC__) || defined(__clang__))
 namespace {
 struct MklAmdKernelWorkaround {
     MklAmdKernelWorkaround() {
@@ -60,7 +63,7 @@ struct MklAmdKernelWorkaround {
 };
 static MklAmdKernelWorkaround g_mkl_amd_workaround;
 } // namespace
-#endif
+#endif // USE_MKL && (GCC || Clang)
 #include <algorithm>
 #include <cstring>
 #include <cstdint>
