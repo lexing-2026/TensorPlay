@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from tools.codegen.gen_structured import _render_header, validate_structured
+from tools.codegen.gen_python_c import _is_variadic_shape_list
 from tools.codegen.model import parse_native_yaml, parse_schema
 
 
@@ -86,3 +87,23 @@ def test_structured_groups_emit_dispatch_metadata():
     assert '"_convert_indices_from_csr_to_coo_structured_cpu"' in generated
     assert '"_convert_indices_from_csr_to_coo_structured_cuda"' in generated
     assert "__line__" not in generated
+
+
+def test_python_bridge_only_expands_shape_lists():
+    funcs = parse_native_yaml(str(ROOT / "config" / "native_functions.yaml"))
+
+    view = next(function for function in funcs if function.func_name == "view")
+    reshape = next(function for function in funcs if function.func_name == "reshape")
+    sparse_size = next(
+        function for function in funcs
+        if function.schema.startswith("sparse_csr_tensor.crow_col_value_size(")
+    )
+    as_strided = next(
+        function for function in funcs
+        if function.schema.startswith("as_strided(")
+    )
+
+    assert _is_variadic_shape_list(view, "method")
+    assert _is_variadic_shape_list(reshape, "function")
+    assert not _is_variadic_shape_list(sparse_size, "function")
+    assert not _is_variadic_shape_list(as_strided, "function")
