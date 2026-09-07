@@ -173,7 +173,6 @@ static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cpu_impl(
     if (gb_ptr) gb_buf.assign(static_cast<size_t>(th) * C, 0.0f);
 
     const float feps = static_cast<float>(eps);
-    const int64_t rows = N * G;
     const int64_t row_grain = std::max<int64_t>(
         1, tensorplay::parallel::GRAIN_SIZE / std::max<int64_t>(group_size, 1));
 
@@ -909,16 +908,16 @@ std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu(
         case DType::Float32:
             return layer_norm_backward_cpu_typed<float>(
                 grad_output, input, normalized_shape, weight_opt, bias_opt, eps,
-                nullptr, nullptr);
+                nullptr, nullptr, nullptr);
         case DType::Float64:
             return layer_norm_backward_cpu_typed<double>(
                 grad_output, input, normalized_shape, weight_opt, bias_opt, eps,
-                nullptr, nullptr);
+                nullptr, nullptr, nullptr);
         case DType::Float16:
         case DType::BFloat16:
             return layer_norm_backward_cpu_reduced(
                 grad_output, input, normalized_shape, weight_opt, bias_opt, eps,
-                nullptr, nullptr);
+                nullptr, nullptr, nullptr);
         default:
             TP_THROW(NotImplementedError,
                      "layer_norm_backward only supports Float32/Float64/Float16/BFloat16");
