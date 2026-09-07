@@ -4068,14 +4068,14 @@ def block_diag(*args):
         _captured = _capture_call(block_diag, (*args,), {})
         if _captured is not None:
             return _captured
-    return _C.block_diag(*args)
+    return _C.block_diag(list(args))
 
 def broadcast_tensors(*args):
     if _capturing():
         _captured = _capture_call(broadcast_tensors, (*args,), {})
         if _captured is not None:
             return _captured
-    return _C.broadcast_tensors(*args)
+    return _C.broadcast_tensors(list(args))
 
 def channel_shuffle(input, groups):
     if _capturing():
@@ -5936,21 +5936,27 @@ def atleast_1d(*args):
         _captured = _capture_call(atleast_1d, (*args,), {})
         if _captured is not None:
             return _captured
-    return _C.atleast_1d(*args)
+    if len(args) == 1:
+        return _C.atleast_1d(args[0])
+    return _C.atleast_1d(list(args))
 
 def atleast_2d(*args):
     if _capturing():
         _captured = _capture_call(atleast_2d, (*args,), {})
         if _captured is not None:
             return _captured
-    return _C.atleast_2d(*args)
+    if len(args) == 1:
+        return _C.atleast_2d(args[0])
+    return _C.atleast_2d(list(args))
 
 def atleast_3d(*args):
     if _capturing():
         _captured = _capture_call(atleast_3d, (*args,), {})
         if _captured is not None:
             return _captured
-    return _C.atleast_3d(*args)
+    if len(args) == 1:
+        return _C.atleast_3d(args[0])
+    return _C.atleast_3d(list(args))
 
 def flatten(input, start_dim=0, end_dim=-1):
     if _capturing():
@@ -6332,7 +6338,7 @@ def cartesian_prod(*args):
         _captured = _capture_call(cartesian_prod, (*args,), {})
         if _captured is not None:
             return _captured
-    return _C.cartesian_prod(*args)
+    return _C.cartesian_prod(list(args))
 
 def silu_mul(gate, up):
     if _capturing():
@@ -6951,12 +6957,14 @@ def i0_(input):
             return _captured
     return _C.i0_(input)
 
-def chain_matmul(*args):
+def chain_matmul(*args, out=None):
     if _capturing():
-        _captured = _capture_call(chain_matmul, (*args,), {})
+        _captured = _capture_call(chain_matmul, (*args,), {"out": out})
         if _captured is not None:
             return _captured
-    return _C.chain_matmul(*args)
+    if out is None:
+        return _C.chain_matmul(list(args))
+    return _C.chain_matmul(list(args), out=out)
 
 def tril_indices(row, col, offset=0, dtype=DType.int64, device=None, pin_memory=False):
     if _capturing():
