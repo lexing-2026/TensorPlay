@@ -10,7 +10,8 @@
 set -eux -o pipefail
 
 SCRIPTPATH="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
-REPO_ROOT="$(cd "${SCRIPTPATH}/../.." && pwd)"
+# .github/ci/<platform> -> repository root
+REPO_ROOT="$(cd "${SCRIPTPATH}/../../.." && pwd)"
 
 # Stage the conda-forge libomp first so build_env_setup.py sees
 # /opt/llvm-openmp and exports OMP_PREFIX for the build.

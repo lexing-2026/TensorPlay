@@ -696,50 +696,50 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
     int threads = 256;
     int blocks = (numel + threads - 1) / threads;
 
-    // Same-dtype real copies run through the iterator elementwise lane: the
+    // Same-dtype copies run through the iterator elementwise lane: the
     // iterator coalesces and reorders dimensions, picks the vectorized or
     // unrolled schedule, and splits 64-bit indexing, so strided layouts move
-    // 4-8 elements per thread instead of one.
-    if (self.dtype() == src_cuda_tensor.dtype() &&
-        !isComplexType(self.dtype())) {
+    // 4-8 elements per thread instead of one.  Complex destinations are
+    // served here too — the iterator's dynamic-cast machinery carries
+    // complex values through the same identity functor.
+    if (self.dtype() == src_cuda_tensor.dtype()) {
         TensorIterator iter = TensorIteratorConfig()
                                   .check_all_same_dtype(true)
                                   .add_output(self)
                                   .add_input(src_cuda_tensor)
                                   .build();
-#define TP_COPY_ITER_CASE(ctype, name)                                   \
-        case DType::name:                                                \
-            gpu_kernel(iter, [] __host__ __device__(ctype v) { return v; });      \
-            break;
         switch (self.dtype()) {
+            case DType::ComplexHalf:
+                gpu_kernel(iter, [] __host__ __device__(
+                                     tensorplay::complex<Half> v) { return v; });
+                break;
+            case DType::ComplexFloat:
+                gpu_kernel(iter, [] __host__ __device__(
+                                     tensorplay::complex<float> v) { return v; });
+                break;
+            case DType::ComplexDouble:
+                gpu_kernel(iter, [] __host__ __device__(
+                                     tensorplay::complex<double> v) { return v; });
+                break;
+            case DType::BComplex32:
+                gpu_kernel(iter, [] __host__ __device__(
+                                     tensorplay::complex<BFloat16> v) { return v; });
+                break;
+#define TP_COPY_ITER_CASE(ctype, name)                                   \
+            case DType::name:                                                \
+                gpu_kernel(iter, [] __host__ __device__(ctype v) { return v; });      \
+                break;
             TENSORPLAY_FORALL_SCALAR_TYPES(TP_COPY_ITER_CASE)
+#undef TP_COPY_ITER_CASE
             default:
                 TP_THROW(NotImplementedError, "Unsupported dtype for copy");
         }
-#undef TP_COPY_ITER_CASE
         checkCuda(cudaGetLastError(), "CUDA iterator copy kernel");
         return self;
     }
 
     TensorInfo dst_info = get_tensor_info(self);
     TensorInfo src_info = get_tensor_info(src_cuda_tensor);
-
-    // Keep the CUDA copy path explicit for complex tensors so
-    // expanded/strided batches use the native complex scalar.
-    if (self.dtype() == src_cuda_tensor.dtype() && self.dtype() == DType::ComplexFloat) {
-        copy_complex_strided_kernel<tensorplay::complex<float>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-            numel, static_cast<tensorplay::complex<float>*>(self.data_ptr()), dst_info,
-            static_cast<const tensorplay::complex<float>*>(src_cuda_tensor.data_ptr()), src_info);
-        checkCuda(cudaGetLastError(), "CUDA complex float copy kernel");
-        return self;
-    }
-    if (self.dtype() == src_cuda_tensor.dtype() && self.dtype() == DType::ComplexDouble) {
-        copy_complex_strided_kernel<tensorplay::complex<double>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-            numel, static_cast<tensorplay::complex<double>*>(self.data_ptr()), dst_info,
-            static_cast<const tensorplay::complex<double>*>(src_cuda_tensor.data_ptr()), src_info);
-        checkCuda(cudaGetLastError(), "CUDA complex double copy kernel");
-        return self;
-    }
 
     // --- mixed real<->complex casts ----------------------------------------
     // the real component.  Width pairs only (f32<->c64, f64<->c128).
