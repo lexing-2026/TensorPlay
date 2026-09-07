@@ -2963,12 +2963,39 @@ std::tuple<Tensor, Tensor> sort_cuda(const Tensor& self, int64_t dim, bool desce
     // the global scatter/gather of the segmented device pass.  The slice
     // decomposition is (outer, d_size, inner) over the contiguous layout, so
     // a sort dimension that is not the innermost one is served by the same
-    // kernel through its strided element accessors — no staging pass is
-    // needed.
+    // kernel through its strided element accessors when the row stride stays
+    // small enough to sit inside the cache hierarchy.  A long stride turns
+    // every load and store into its own transaction, so those shapes stage
+    // through a permuted contiguous buffer instead: the staging pass and the
+    // ordered write-back walk contiguous rows, and the layout fix-up is one
+    // strided copy.
     if (self_c.numel() <= std::numeric_limits<int>::max() &&
         d_size >= 2 && d_size <= 4096 && slices > 1) {
-        sort_block_radix_entry(self_c, values, indices,
-                               slices, d_size, inner, descending);
+        constexpr int64_t kMaxStridedInner = 16;
+        if (inner > kMaxStridedInner) {
+            std::vector<int64_t> order(static_cast<size_t>(nd));
+            for (int64_t d = 0; d < nd; ++d) order[static_cast<size_t>(d)] = d;
+            std::swap(order[static_cast<size_t>(dim)],
+                      order[static_cast<size_t>(nd - 1)]);
+            Tensor staged = self_c.permute(order).contiguous();
+            Tensor staged_values = Tensor::empty(
+                static_cast<std::vector<int64_t>>(staged.shape()),
+                staged.dtype(), staged.device());
+            Tensor staged_indices = Tensor::empty(
+                static_cast<std::vector<int64_t>>(staged.shape()),
+                DType::Int64, staged.device());
+            sort_block_radix_entry(staged, staged_values, staged_indices,
+                                   slices, d_size, 1, descending);
+            std::vector<int64_t> inverse(static_cast<size_t>(nd));
+            for (int64_t d = 0; d < nd; ++d) {
+                inverse[static_cast<size_t>(order[static_cast<size_t>(d)])] = d;
+            }
+            values.copy_(staged_values.permute(inverse));
+            indices.copy_(staged_indices.permute(inverse));
+        } else {
+            sort_block_radix_entry(self_c, values, indices,
+                                   slices, d_size, inner, descending);
+        }
         CUDA_CHECK(cudaGetLastError());
         return {values, indices};
     }
