@@ -113,39 +113,13 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq libopenblas-dev 1>/dev/null
 
-      # Windows wheels link the same static MKL as Linux x86_64: the pinned
-      # mkl wheels unpack into a conda-style Library/ tree inside the build
-      # Python's prefix (import libs + headers under Library/lib and
-      # Library/include, runtime DLLs under Library/bin), so CMake finds the
-      # package through CMAKE_PREFIX_PATH and the DLL bundling step derives
-      # its bin directory from the same root. Without this the BLAS detector
-      # falls through to the unaccelerated fallback.
-      - name: Install MKL (windows)
-        if: ${{ runner.os == 'Windows' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m pip install --quiet 'mkl==2024.2.0' 'mkl-static==2024.2.0' 'mkl-include==2024.2.0'
-          prefix="$(cygpath -m "$(python -c 'import sys, pathlib; print(pathlib.Path(sys.prefix))')")/Library"
-          echo "CMAKE_PREFIX_PATH=${prefix}" >> "$GITHUB_ENV"
-
-      # Windows gloo requires a system libuv; provision a prebuilt libuv
-      # tarball into the runner's Python prefix and export libuv_ROOT for
-      # its find_library call. The Windows Python prints its prefix as a
-      # drive path; convert it to an MSYS path before handing it to the
-      # shell tools (tar would otherwise read "C:\..." as a remote spec).
-      - name: Install libuv (windows)
-        if: ${{ runner.os == 'Windows' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          prefix="$(cygpath -u "$(python -c 'import sys, pathlib; print(pathlib.Path(sys.prefix))')")"
-          curl -sL -o libuv.tar.bz2 https://s3.amazonaws.com/ossci-windows/libuv-1.40.0-h8ffe710_0.tar.bz2
-          7z x -aoa libuv.tar.bz2 -o"$PWD" >/dev/null
-          mkdir -p "$prefix"
-          tar -xf libuv.tar -C "$prefix"
-          test -d "$prefix/Library"
-          echo "libuv_ROOT=$(cygpath -w "$prefix/Library")" >> "$GITHUB_ENV"
+      # Windows builds run through .github/ci/windows/: the build.sh
+      # orchestrator chains the MSVC env capture (vcvarsall via vswhere),
+      # the pip build-dependency install (backend requirements plus the
+      # pinned MKL trio unpacking into the interpreter prefix's conda-style
+      # Library/ tree, wired into CMake through CMAKE_PREFIX_PATH), the
+      # prebuilt libuv tarball for gloo (libuv_ROOT), and the wheel build
+      # itself. The other platforms keep the inline steps below.
 
       # The wheel links vendored SLEEF/NNPACK trees that CI checkouts do
       # not carry; fetch the pinned revisions before configuring.
@@ -205,6 +179,7 @@ jobs:
           cuda: ${{ inputs.cuda_toolkit }}
 
       - name: Build wheel
+        if: ${{ runner.os != 'Windows' }}
         shell: bash
         env:
           SKBUILD_CMAKE_DEFINE: >-
@@ -212,6 +187,16 @@ jobs:
         run: |
           python -m pip install --upgrade pip build
           python -m build --wheel
+
+      - name: Build wheel (windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: bash
+        env:
+          GPU_ARCH_TYPE: ${{ inputs.cuda != 'cpu' && 'cuda' || 'cpu' }}
+          SKBUILD_CMAKE_DEFINE: >-
+            ${{ inputs.cuda != 'cpu' && 'USE_CUDA=ON' || 'USE_CUDA=OFF' }};USE_MPI=OFF
+        run: |
+          bash .github/ci/windows/build.sh dist
 
       - name: Install built wheel
         shell: bash
