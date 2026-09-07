@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from tools.codegen.gen_structured import _render_header, validate_structured
 from tools.codegen.model import parse_native_yaml, parse_schema
 
 
@@ -69,3 +70,19 @@ def test_schema_projection_preserves_nested_type_shape():
     assert shape.type.list_size == 2
     assert dim.type.symint is True
     assert str(function.returns[0].type) == "Tensor?[]"
+
+
+def test_structured_groups_emit_dispatch_metadata():
+    funcs = parse_native_yaml(str(ROOT / "config" / "native_functions.yaml"))
+
+    assert validate_structured(funcs) == []
+    groups = [group for group in funcs.grouped_native_functions()
+              if group.structured]
+    generated = _render_header(groups)
+
+    assert len(groups) == 2
+    assert '"_convert_indices_from_coo_to_csr_structured_cpu"' in generated
+    assert '"_convert_indices_from_coo_to_csr_structured_cuda"' in generated
+    assert '"_convert_indices_from_csr_to_coo_structured_cpu"' in generated
+    assert '"_convert_indices_from_csr_to_coo_structured_cuda"' in generated
+    assert "__line__" not in generated

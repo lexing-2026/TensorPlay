@@ -2053,6 +2053,291 @@ Tensor index_reduce_backward_src_cpu(const Tensor& grad, const Tensor& self,
                                      const std::string& reduce,
                                      bool include_self);
 
+namespace {
+
+template <typename input_t, typename output_t>
+void fill_coo_to_csr_cpu(Tensor& result, const Tensor& input, int64_t size) {
+    const Tensor input_c = input.contiguous();
+    const int64_t numel = input_c.numel();
+    const input_t* data_in = input_c.data_ptr<input_t>();
+    output_t* data_out = result.data_ptr<output_t>();
+
+    if (numel == 0) {
+        if (result.numel() > 0) {
+            std::fill_n(data_out, result.numel(), static_cast<output_t>(0));
+        }
+        return;
+    }
+
+    const int64_t first = static_cast<int64_t>(data_in[0]);
+    for (int64_t i = 0; i <= first; ++i) {
+        data_out[i] = static_cast<output_t>(0);
+    }
+
+    parallel_for(0, numel - 1, GRAIN_SIZE,
+                 [&](int64_t begin, int64_t end) {
+        int64_t current = static_cast<int64_t>(data_in[begin]);
+        for (int64_t i = begin; i < end; ++i) {
+            const int64_t next = static_cast<int64_t>(data_in[i + 1]);
+            for (; current < next; ++current) {
+                data_out[current + 1] = static_cast<output_t>(i + 1);
+            }
+        }
+    });
+
+    const int64_t last = static_cast<int64_t>(data_in[numel - 1]);
+    for (int64_t i = last + 1; i < size + 1; ++i) {
+        data_out[i] = static_cast<output_t>(numel);
+    }
+}
+
+template <typename output_t>
+void dispatch_coo_to_csr_input(Tensor& result, const Tensor& input,
+                               int64_t size) {
+#define TP_COO_TO_CSR_CASE(ctype, name)                                      \
+    case DType::name:                                                         \
+        fill_coo_to_csr_cpu<ctype, output_t>(result, input, size);            \
+        return;
+    switch (input.dtype()) {
+        TENSORPLAY_FORALL_INT_TYPES(TP_COO_TO_CSR_CASE)
+        default:
+            TP_THROW(TypeError,
+                     "_convert_indices_from_coo_to_csr: input must be integral");
+    }
+#undef TP_COO_TO_CSR_CASE
+}
+
+void check_coo_to_csr_cpu(const Tensor& input, int64_t size) {
+    TP_CHECK(input.dim() <= 1,
+             "_convert_indices_from_coo_to_csr: input must be a vector, got ",
+             input.dim(), " dimensions");
+    TP_CHECK(size >= 0,
+             "_convert_indices_from_coo_to_csr: size must be non-negative, got ",
+             size);
+    TP_CHECK(isIntegralType(input.dtype(), false),
+             "_convert_indices_from_coo_to_csr: input must be integral");
+}
+
+template <typename crow_t, typename col_t, typename output_t>
+void fill_csr_to_coo_cpu(Tensor& result, const Tensor& crow_indices,
+                         const Tensor& col_indices, bool transpose,
+                         const std::vector<int64_t>& batch_shape) {
+    const Tensor crow_c = crow_indices.contiguous();
+    const Tensor col_c = col_indices.contiguous();
+    const int64_t nrows = crow_c.size(-1) - 1;
+    const int64_t nnz = col_c.size(-1);
+    const int64_t total_nnz = col_c.numel();
+    const int64_t batch_ndim = static_cast<int64_t>(batch_shape.size());
+    const int64_t batch_count =
+        batch_ndim == 0 ? 1 : (nnz == 0 ? 0 : total_nnz / nnz);
+    const int64_t row_count = batch_count * nrows;
+
+    output_t* result_data = result.data_ptr<output_t>();
+    if (nrows == 0 || nnz == 0) {
+        if (result.numel() > 0) {
+            std::fill_n(result_data, result.numel(), static_cast<output_t>(0));
+        }
+        return;
+    }
+
+    output_t* row0 = result.select(0, transpose ? batch_ndim + 1 : batch_ndim)
+                          .data_ptr<output_t>();
+    output_t* row1 = result.select(0, transpose ? batch_ndim : batch_ndim + 1)
+                          .data_ptr<output_t>();
+    const crow_t* crow_data = crow_c.data_ptr<crow_t>();
+    const col_t* col_data = col_c.data_ptr<col_t>();
+
+    parallel_for(0, total_nnz, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t index = begin; index < end; ++index) {
+            const int64_t batch = index / nnz;
+            int64_t remainder = batch;
+            for (int64_t dim = batch_ndim - 1; dim >= 0; --dim) {
+                const int64_t extent = batch_shape[static_cast<size_t>(dim)];
+                result_data[dim * total_nnz + index] =
+                    static_cast<output_t>(remainder % extent);
+                remainder /= extent;
+            }
+            if (transpose) {
+                row0[index] = static_cast<output_t>(col_data[index]);
+            } else {
+                row1[index] = static_cast<output_t>(col_data[index]);
+            }
+        }
+    });
+
+    parallel_for(0, row_count, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t linear_row = begin; linear_row < end; ++linear_row) {
+            const int64_t batch = linear_row / nrows;
+            const int64_t row = linear_row % nrows;
+            const int64_t base = batch * (nrows + 1);
+            const int64_t start = static_cast<int64_t>(crow_data[base + row]);
+            const int64_t finish =
+                static_cast<int64_t>(crow_data[base + row + 1]);
+            for (int64_t index = start; index < finish; ++index) {
+                const int64_t flat = batch * nnz + index;
+                if (transpose) {
+                    row1[flat] = static_cast<output_t>(row);
+                } else {
+                    row0[flat] = static_cast<output_t>(row);
+                }
+            }
+        }
+    });
+}
+
+template <typename crow_t, typename output_t>
+void dispatch_csr_to_coo_columns(Tensor& result, const Tensor& crow_indices,
+                                const Tensor& col_indices, bool transpose,
+                                const std::vector<int64_t>& batch_shape) {
+#define TP_CSR_TO_COO_CASE(ctype, name)                                      \
+    case DType::name:                                                         \
+        fill_csr_to_coo_cpu<crow_t, ctype, output_t>(                         \
+            result, crow_indices, col_indices, transpose, batch_shape);       \
+        return;
+    switch (col_indices.dtype()) {
+        TENSORPLAY_FORALL_INT_TYPES(TP_CSR_TO_COO_CASE)
+        default:
+            TP_THROW(TypeError,
+                     "_convert_indices_from_csr_to_coo: columns must be integral");
+    }
+#undef TP_CSR_TO_COO_CASE
+}
+
+template <typename output_t>
+void dispatch_csr_to_coo_rows(Tensor& result, const Tensor& crow_indices,
+                              const Tensor& col_indices, bool transpose,
+                              const std::vector<int64_t>& batch_shape) {
+#define TP_CSR_TO_COO_ROW_CASE(ctype, name)                                  \
+    case DType::name:                                                         \
+        dispatch_csr_to_coo_columns<ctype, output_t>(                         \
+            result, crow_indices, col_indices, transpose, batch_shape);       \
+        return;
+    switch (crow_indices.dtype()) {
+        TENSORPLAY_FORALL_INT_TYPES(TP_CSR_TO_COO_ROW_CASE)
+        default:
+            TP_THROW(TypeError,
+                     "_convert_indices_from_csr_to_coo: row pointers must be integral");
+    }
+#undef TP_CSR_TO_COO_ROW_CASE
+}
+
+std::vector<int64_t> check_csr_to_coo_cpu(const Tensor& crow_indices,
+                                          const Tensor& col_indices) {
+    TP_CHECK(crow_indices.dim() >= 1 && col_indices.dim() >= 1,
+             "_convert_indices_from_csr_to_coo: inputs must have at least one dimension");
+    TP_CHECK(crow_indices.dim() == col_indices.dim(),
+             "_convert_indices_from_csr_to_coo: inputs must have the same dimensionality");
+    TP_CHECK(crow_indices.size(-1) >= 1,
+             "_convert_indices_from_csr_to_coo: row pointer dimension must be non-empty");
+    for (int64_t dim = 0; dim < crow_indices.dim() - 1; ++dim) {
+        TP_CHECK(crow_indices.size(dim) == col_indices.size(dim),
+                 "_convert_indices_from_csr_to_coo: batch dimensions must match");
+    }
+    TP_CHECK(isIntegralType(crow_indices.dtype(), false),
+             "_convert_indices_from_csr_to_coo: row pointers must be integral");
+    TP_CHECK(isIntegralType(col_indices.dtype(), false),
+             "_convert_indices_from_csr_to_coo: columns must be integral");
+
+    std::vector<int64_t> batch_shape;
+    batch_shape.reserve(static_cast<size_t>(crow_indices.dim() - 1));
+    int64_t batch_count = 1;
+    for (int64_t dim = 0; dim < crow_indices.dim() - 1; ++dim) {
+        const int64_t extent = crow_indices.size(dim);
+        batch_shape.push_back(extent);
+        batch_count *= extent;
+    }
+    const int64_t nrows = crow_indices.size(-1) - 1;
+    const int64_t nnz = col_indices.size(-1);
+    TP_CHECK(col_indices.numel() == batch_count * nnz,
+             "_convert_indices_from_csr_to_coo: invalid batch layout");
+    TP_CHECK(crow_indices.numel() == batch_count * (nrows + 1),
+             "_convert_indices_from_csr_to_coo: invalid row pointer layout");
+    return batch_shape;
+}
+
+Tensor convert_indices_from_coo_to_csr_cpu(const Tensor& input,
+                                           int64_t size, bool out_int32) {
+    check_coo_to_csr_cpu(input, size);
+    Tensor result = Tensor::empty(
+        {size + 1}, out_int32 ? DType::Int32 : DType::Int64, input.device());
+    if (out_int32) {
+        dispatch_coo_to_csr_input<int32_t>(result, input, size);
+    } else {
+        dispatch_coo_to_csr_input<int64_t>(result, input, size);
+    }
+    return result;
+}
+
+Tensor& _convert_indices_from_coo_to_csr_structured_cpu(
+    const Tensor& input, int64_t size, bool out_int32, Tensor& out) {
+    check_coo_to_csr_cpu(input, size);
+    const DType dtype = out_int32 ? DType::Int32 : DType::Int64;
+    TP_CHECK(out.defined() && out.dtype() == dtype,
+             "_convert_indices_from_coo_to_csr: output dtype is incorrect");
+    TP_CHECK(out.device() == input.device(),
+             "_convert_indices_from_coo_to_csr: output device must match input");
+    out.resize_({size + 1});
+    const bool copy_back = !out.is_contiguous();
+    Tensor target = copy_back
+        ? Tensor::empty({size + 1}, dtype, input.device())
+        : out;
+    if (out_int32) {
+        dispatch_coo_to_csr_input<int32_t>(target, input, size);
+    } else {
+        dispatch_coo_to_csr_input<int64_t>(target, input, size);
+    }
+    if (copy_back) out.copy_(target);
+    return out;
+}
+
+Tensor convert_indices_from_csr_to_coo_cpu(const Tensor& crow_indices,
+                                           const Tensor& col_indices,
+                                           bool out_int32, bool transpose) {
+    const std::vector<int64_t> batch_shape =
+        check_csr_to_coo_cpu(crow_indices, col_indices);
+    Tensor result = Tensor::empty(
+        {col_indices.dim() + 1, col_indices.numel()},
+        out_int32 ? DType::Int32 : DType::Int64, crow_indices.device());
+    if (out_int32) {
+        dispatch_csr_to_coo_rows<int32_t>(
+            result, crow_indices, col_indices, transpose, batch_shape);
+    } else {
+        dispatch_csr_to_coo_rows<int64_t>(
+            result, crow_indices, col_indices, transpose, batch_shape);
+    }
+    return result;
+}
+
+Tensor& _convert_indices_from_csr_to_coo_structured_cpu(
+    const Tensor& crow_indices, const Tensor& col_indices, bool out_int32,
+    bool transpose, Tensor& out) {
+    const std::vector<int64_t> batch_shape =
+        check_csr_to_coo_cpu(crow_indices, col_indices);
+    const DType dtype = out_int32 ? DType::Int32 : DType::Int64;
+    TP_CHECK(out.defined() && out.dtype() == dtype,
+             "_convert_indices_from_csr_to_coo: output dtype is incorrect");
+    TP_CHECK(out.device() == crow_indices.device(),
+             "_convert_indices_from_csr_to_coo: output device must match input");
+    const std::vector<int64_t> shape =
+        {col_indices.dim() + 1, col_indices.numel()};
+    out.resize_(shape);
+    const bool copy_back = !out.is_contiguous();
+    Tensor target = copy_back
+        ? Tensor::empty(shape, dtype, crow_indices.device())
+        : out;
+    if (out_int32) {
+        dispatch_csr_to_coo_rows<int32_t>(
+            target, crow_indices, col_indices, transpose, batch_shape);
+    } else {
+        dispatch_csr_to_coo_rows<int64_t>(
+            target, crow_indices, col_indices, transpose, batch_shape);
+    }
+    if (copy_back) out.copy_(target);
+    return out;
+}
+
+} // anonymous namespace
+
 TENSORPLAY_LIBRARY_IMPL(CPU, IndexingKernels) {
     m.impl("masked_fill", masked_fill_cpu);
     m.impl("masked_fill_", masked_fill__cpu);
@@ -2104,6 +2389,12 @@ TENSORPLAY_LIBRARY_IMPL(CPU, IndexingKernels) {
     m.impl("bucketize.Tensor_out", bucketize_out_cpu);
     m.impl("bucketize.Scalar", bucketize_scalar_cpu);
     m.impl("bucketize.Scalar_out", bucketize_scalar_out_cpu);
+    m.impl("_convert_indices_from_coo_to_csr", convert_indices_from_coo_to_csr_cpu);
+    m.impl("_convert_indices_from_coo_to_csr.out",
+           _convert_indices_from_coo_to_csr_structured_cpu);
+    m.impl("_convert_indices_from_csr_to_coo", convert_indices_from_csr_to_coo_cpu);
+    m.impl("_convert_indices_from_csr_to_coo.out",
+           _convert_indices_from_csr_to_coo_structured_cpu);
     m.impl("bincount", bincount_cpu);
     m.impl("take", take_cpu);
     m.impl("masked_scatter", masked_scatter_cpu);
