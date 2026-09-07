@@ -3,6 +3,7 @@ cmake<4.0
 ninja
 pybind11
 PyYAML
+numpy
 packaging>=26.3
 build
 pytest

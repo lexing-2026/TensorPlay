@@ -1216,9 +1216,13 @@ execute_process(
     RESULT_VARIABLE TP_NUMPY_PROBE_RESULT
     OUTPUT_VARIABLE TP_NUMPY_INCLUDE
     ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
-if(TP_NUMPY_PROBE_RESULT EQUAL 0 AND TP_NUMPY_INCLUDE)
-    target_include_directories(_C PRIVATE "${TP_NUMPY_INCLUDE}")
+if(NOT TP_NUMPY_PROBE_RESULT EQUAL 0 OR NOT TP_NUMPY_INCLUDE)
+    message(FATAL_ERROR
+        "NumPy headers not found: the Python extension binds the NumPy C API, "
+        "so the build interpreter must have numpy installed "
+        "(run: ${Python_EXECUTABLE} -m pip install numpy)")
 endif()
+target_include_directories(_C PRIVATE "${TP_NUMPY_INCLUDE}")
 # Transport selection follows the dependent options above; the fallback
 # branch keeps the wheel buildable where a transport is unavailable.
 if(TARGET tp_python)

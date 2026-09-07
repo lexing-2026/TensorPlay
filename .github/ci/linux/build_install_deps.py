@@ -20,6 +20,7 @@ from pathlib import Path
 BUILD_PACKAGES: list[str] = [
     "cmake<4.0",
     "ninja",
+    "numpy",
     "pybind11",
     "pyyaml",
     "wheel",

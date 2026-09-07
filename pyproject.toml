@@ -6,6 +6,7 @@ requires = [
     "pybind11",
     "PyYAML",
     "ninja",
+    "numpy",
     "cmake<4.0",
 ]
 build-backend = "scikit_build_core.build"

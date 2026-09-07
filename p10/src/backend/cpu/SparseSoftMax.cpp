@@ -19,6 +19,8 @@
 #include "Parallel.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
+#include <tuple>
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -363,7 +365,11 @@ Tensor softmax_sparse_forward(const Tensor& input_, int64_t dim_,
                               bool half_to_float, const char* fn_name) {
     TP_CHECK(!half_to_float, fn_name,
              ": with half to float conversion is not supported on CPU");
-    auto [input, output, dim] =
+    // Explicit decomposition: the bindings feed a lambda below, and
+    // capturing structured bindings is not portable across compilers.
+    Tensor input, output;
+    int64_t dim;
+    std::tie(input, output, dim) =
         softmax_sparse_preprocessing(input_, dim_, fn_name);
     if (input.numel() == 0) {
         return output;
