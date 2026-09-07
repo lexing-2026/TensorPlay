@@ -640,8 +640,6 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
          TP_THROW(RuntimeError, std::string("CUDA Copy Kernel Error: ") + cudaGetErrorString(err));
     }
 
-    }
-
     return self;
 }
 
