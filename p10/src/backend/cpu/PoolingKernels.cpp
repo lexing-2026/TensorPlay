@@ -223,10 +223,14 @@ Tensor max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
     int64_t H_in = input_c.size(2);
     int64_t W_in = input_c.size(3);
     
-    auto [kH, kW] = get_pair(kernel_size);
-    auto [sH, sW] = get_pair_from_kernel(stride, kernel_size);
-    auto [pH, pW] = get_pair(padding, 0);
-    auto [dH, dW] = get_pair(dilation, 1);
+    int64_t kH, kW;
+    std::tie(kH, kW) = get_pair(kernel_size);
+    int64_t sH, sW;
+    std::tie(sH, sW) = get_pair_from_kernel(stride, kernel_size);
+    int64_t pH, pW;
+    std::tie(pH, pW) = get_pair(padding, 0);
+    int64_t dH, dW;
+    std::tie(dH, dW) = get_pair(dilation, 1);
     
     int64_t H_out, W_out;
     if (ceil_mode) {
@@ -314,9 +318,12 @@ Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
     int64_t H_in = input.size(2);
     int64_t W_in = input.size(3);
     
-    auto [kH, kW] = get_pair(kernel_size);
-    auto [sH, sW] = get_pair_from_kernel(stride, kernel_size);
-    auto [pH, pW] = get_pair(padding, 0);
+    int64_t kH, kW;
+    std::tie(kH, kW) = get_pair(kernel_size);
+    int64_t sH, sW;
+    std::tie(sH, sW) = get_pair_from_kernel(stride, kernel_size);
+    int64_t pH, pW;
+    std::tie(pH, pW) = get_pair(padding, 0);
     
     int64_t H_out, W_out;
     if (ceil_mode) {
@@ -392,7 +399,8 @@ Tensor adaptive_avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
     int64_t H_in = input_c.size(2);
     int64_t W_in = input_c.size(3);
     
-    auto [H_out, W_out] = get_pair(output_size);
+    int64_t H_out, W_out;
+    std::tie(H_out, W_out) = get_pair(output_size);
     if (H_out <= 0 || W_out <= 0) TP_THROW(RuntimeError, "adaptive_avg_pool2d: Invalid output size");
     
     Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());
@@ -441,7 +449,8 @@ Tensor adaptive_max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
     int64_t H_in = input_c.size(2);
     int64_t W_in = input_c.size(3);
     
-    auto [H_out, W_out] = get_pair(output_size);
+    int64_t H_out, W_out;
+    std::tie(H_out, W_out) = get_pair(output_size);
     if (H_out <= 0 || W_out <= 0) TP_THROW(RuntimeError, "adaptive_max_pool2d: Invalid output size");
 
     Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());
@@ -495,10 +504,14 @@ Tensor max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
     int64_t H_out = grad_output.size(2);
     int64_t W_out = grad_output.size(3);
 
-    auto [kH, kW] = get_pair(kernel_size);
-    auto [sH, sW] = get_pair_from_kernel(stride, kernel_size);
-    auto [pH, pW] = get_pair(padding, 0);
-    auto [dH, dW] = get_pair(dilation, 1);
+    int64_t kH, kW;
+    std::tie(kH, kW) = get_pair(kernel_size);
+    int64_t sH, sW;
+    std::tie(sH, sW) = get_pair_from_kernel(stride, kernel_size);
+    int64_t pH, pW;
+    std::tie(pH, pW) = get_pair(padding, 0);
+    int64_t dH, dW;
+    std::tie(dH, dW) = get_pair(dilation, 1);
 
     Tensor grad_input = Tensor::zeros_like(input);
     
@@ -577,9 +590,12 @@ Tensor avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
     int64_t H_out = grad_output.size(2);
     int64_t W_out = grad_output.size(3);
 
-    auto [kH, kW] = get_pair(kernel_size);
-    auto [sH, sW] = get_pair_from_kernel(stride, kernel_size);
-    auto [pH, pW] = get_pair(padding, 0);
+    int64_t kH, kW;
+    std::tie(kH, kW) = get_pair(kernel_size);
+    int64_t sH, sW;
+    std::tie(sH, sW) = get_pair_from_kernel(stride, kernel_size);
+    int64_t pH, pW;
+    std::tie(pH, pW) = get_pair(padding, 0);
 
     Tensor grad_input = Tensor::zeros_like(input);
 
@@ -737,7 +753,8 @@ std::tuple<Tensor, Tensor> adaptive_max_pool2d_with_indices_cpu(const Tensor& in
     const Tensor input_c = input.contiguous();
     const int64_t N = input_c.size(0), C = input_c.size(1);
     const int64_t H_in = input_c.size(2), W_in = input_c.size(3);
-    auto [H_out, W_out] = get_pair(output_size);
+    int64_t H_out, W_out;
+    std::tie(H_out, W_out) = get_pair(output_size);
     if (H_out <= 0 || W_out <= 0) TP_THROW(RuntimeError, "adaptive_max_pool2d_with_indices: Invalid output size");
 
     Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());

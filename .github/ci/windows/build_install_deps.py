@@ -27,6 +27,7 @@ from _common import download, write_env_exports
 PIP_PACKAGES: list[str] = [
     "cmake<4.0",
     "ninja",
+    "numpy",
     "pybind11",
     "pyyaml",
     "wheel",

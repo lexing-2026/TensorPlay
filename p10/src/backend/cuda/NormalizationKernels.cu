@@ -6,7 +6,9 @@
 #include "CUDNNUtils.h"
 
 #include <cuda_runtime.h>
+#ifdef USE_CUDNN
 #include <cudnn.h>
+#endif
 
 #include <cmath>
 #include <cstdint>

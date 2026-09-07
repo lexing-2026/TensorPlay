@@ -6,7 +6,9 @@
 #include "CUDAComplex.cuh"
 #include "CUDALoops.cuh"
 #include "CUDNNUtils.h"
+#ifdef USE_CUDNN
 #include <cudnn.h>
+#endif
 #include <type_traits>
 #include <limits>
 
