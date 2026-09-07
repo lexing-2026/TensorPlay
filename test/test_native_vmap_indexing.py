@@ -54,6 +54,33 @@ def test_nested_indexed_scalar_assignment(depth):
     np.testing.assert_array_equal(result.numpy(), expected)
 
 
+def test_nested_advanced_indexing():
+    e = tp.rand(7, 4)
+    idx = tp.tensor([0, 1], dtype=tp.int64).view(2, 1)
+
+    def fake_vmap(function, in_dims=0, out_dims=0):
+        def wrapped(input):
+            outputs = [
+                function(input.select(in_dims, i))
+                for i in range(input.size(in_dims))
+            ]
+            return tp.stack(outputs, out_dims)
+
+        return wrapped
+
+    def with_vmap(vectorize):
+        def outer(index):
+            def inner(value):
+                return value[index]
+
+            return vectorize(inner, in_dims=1)(e)
+
+        return vectorize(outer)(idx)
+
+    np.testing.assert_array_equal(with_vmap(tp.func.vmap).numpy(),
+                                  with_vmap(fake_vmap).numpy())
+
+
 def test_outer_only_operand_and_exception_restore_dispatch():
     def outer(x):
         def inner(y):
