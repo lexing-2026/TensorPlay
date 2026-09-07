@@ -21,7 +21,8 @@
 set -eux -o pipefail
 
 CI_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$CI_DIR/../.." && pwd)"
+# .github/ci/<platform> -> repository root
+REPO_ROOT="$(cd "$CI_DIR/../../.." && pwd)"
 
 export GPU_ARCH_TYPE="${GPU_ARCH_TYPE:-cpu}"
 

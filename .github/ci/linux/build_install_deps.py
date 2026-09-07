@@ -55,17 +55,11 @@ def main() -> None:
     pip_install("-q", *BUILD_PACKAGES)
 
     if platform.machine() == "aarch64":
-        apt = os.environ.get("SUDO", "sudo")
-        if os.geteuid() == 0:
-            apt = ""
-        cmd = ([apt] if apt else []) + [
-            "apt-get", "update", "-qq",
-        ]
-        retry(cmd)
-        install = ([apt] if apt else []) + [
-            "apt-get", "install", "-y", "-qq", "libopenblas-dev",
-        ]
-        retry(install + ["1>/dev/null"])
+        # Redirection is shell syntax and must not leak into argv: an arg
+        # like "1>/dev/null" reaches apt-get as a package name.
+        apt_prefix = [] if os.geteuid() == 0 else ["sudo"]
+        retry(apt_prefix + ["apt-get", "update", "-qq"])
+        retry(apt_prefix + ["apt-get", "install", "-y", "-qq", "libopenblas-dev"])
         print("aarch64: system OpenBLAS installed")
 
     print("build_install_deps complete")

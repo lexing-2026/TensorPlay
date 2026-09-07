@@ -9,7 +9,8 @@
 set -eux -o pipefail
 
 SCRIPTPATH="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
-REPO_ROOT="$(cd "${SCRIPTPATH}/../.." && pwd)"
+# .github/ci/<platform> -> repository root
+REPO_ROOT="$(cd "${SCRIPTPATH}/../../.." && pwd)"
 
 ENV_FILE=$(mktemp)
 trap 'rm -f "$ENV_FILE"' EXIT
