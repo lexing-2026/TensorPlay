@@ -1864,22 +1864,28 @@ Tensor& batch_index_put_(Tensor& self, const std::vector<Tensor>& indices,
 
 void batch_copy_(Tensor& self, const Tensor& src, bool non_blocking) {
     Operand self_operand = unwrap_operand(self);
-    if (!self_operand.bdim.has_value()) {
-        Operand src_operand = unwrap_operand(src);
-        if (src_operand.bdim.has_value()) {
-            TP_THROW(RuntimeError,
-                     "vmap: inplace arithmetic (copy_) is not possible "
-                     "because there exists a Tensor other than 'self' in the "
-                     "current vmap level");
-        }
-        call_next<void, Tensor&, const Tensor&, bool>(
-            "copy_", self, self, src, non_blocking);
-        return;
+    Operand src_operand = unwrap_operand(src);
+    if (!self_operand.bdim.has_value() && src_operand.bdim.has_value()) {
+        TP_THROW(RuntimeError,
+                 "vmap: inplace arithmetic (copy_) is not possible "
+                 "because there exists a Tensor other than 'self' in the "
+                 "current vmap level");
     }
-    auto aligned = broadcast_values(self_operand, unwrap_operand(src));
-    Tensor self_value = aligned.first;
-    call_next<void, Tensor&, const Tensor&, bool>(
-        "copy_", self_value, self_value, aligned.second, non_blocking);
+    const int64_t self_logical_rank = static_cast<int64_t>(self_operand.value.dim()) -
+        (self_operand.bdim.has_value() ? 1 : 0);
+    const int64_t src_logical_rank = static_cast<int64_t>(src_operand.value.dim()) -
+        (src_operand.bdim.has_value() ? 1 : 0);
+    const int64_t max_logical_rank =
+        std::max(self_logical_rank, src_logical_rank);
+    Tensor self_value = self_operand.bdim.has_value()
+        ? pad_to_logical_rank(self_operand.value, *self_operand.bdim,
+                              max_logical_rank)
+        : self_operand.value;
+    Tensor src_value = src_operand.bdim.has_value()
+        ? pad_to_logical_rank(src_operand.value, *src_operand.bdim,
+                              max_logical_rank)
+        : src_operand.value;
+    self_value.copy_(src_value, non_blocking);
 }
 
 bool participates_at_level(const Tensor& value, int64_t level) {
