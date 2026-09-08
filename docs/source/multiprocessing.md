@@ -3,6 +3,8 @@
     :class: hidden-section
 ```
 
+(multiprocessing-doc)=
+
 # Multiprocessing package - tensorplay.multiprocessing
 
 :::{warning}
@@ -14,6 +16,8 @@ to you.
 :::
 
 ## Strategy management
+
+(multiprocessing-cuda-note)=
 
 (multiprocessing-cuda-sharing-details)=
 
@@ -128,14 +132,7 @@ facilities for error propagation.
 The `spawn` function below addresses these concerns and takes care
 of error propagation, out of order termination, and will actively
 terminate processes upon detecting an error in one of them.
-```{eval-rst}
-.. class:: SpawnContext
-
-   Returned by :func:`~spawn` when called with ``join=False``.
-
-   .. automethod:: join
-
-```
+A `SpawnContext` is returned by `spawn` when called with `join=False`.
 % This module needs to be documented. Adding here in the meantime
 % for tracking purposes
 

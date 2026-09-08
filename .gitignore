@@ -86,3 +86,6 @@ docs/whitepaper/*.lot
 docs/whitepaper/*.out
 docs/whitepaper/*.pdf
 docs/whitepaper/*.toc
+
+# Autosummary stubs are generated at docs build time, never committed.
+docs/source/generated/

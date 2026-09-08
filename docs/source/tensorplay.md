@@ -928,17 +928,11 @@
     custom_fwd
     data
     dense_dim
-    dequantize_per_channel
-    dequantize_per_tensor
-    dequantize_per_tensor_qint32
-    dequantize_per_tensor_quint8
-    device
     digamma_
     dim
     div_
     divide_
     dropout
-    dtype
     elu
     elu_
     embedding_bag
@@ -1146,8 +1140,6 @@
     pow_
     put_
     qscheme
-    quantize_per_tensor_qint32
-    quantize_per_tensor_quint8
     quantized_add
     quantized_clamp
     quantized_conv2d

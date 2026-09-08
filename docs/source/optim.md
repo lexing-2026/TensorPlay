@@ -137,7 +137,7 @@ for each implementation on the second table below, you are welcome to try them o
 Below is a table showing the available and default implementations of each algorithm:
 ```{eval-rst}
 .. csv-table::
-    :header: "Algorithm", "Default", "Has foreach?", "Has fused?"
+    :header: Algorithm;Default;Has foreach?;Has fused?
     :widths: 25, 25, 25, 25
     :delim: ;
 
@@ -160,7 +160,7 @@ Below is a table showing the available and default implementations of each algor
 Below table is showing the stability status for fused implementations:
 ```{eval-rst}
 .. csv-table::
-    :header: "Algorithm", "CPU", "CUDA", "MPS"
+    :header: Algorithm;CPU;CUDA;MPS
     :widths: 25, 25, 25, 25
     :delim: ;
 
@@ -550,11 +550,5 @@ for tracking purposes -->
 .. py:module:: tensorplay.optim.lr_scheduler
 .. py:module:: tensorplay.optim.optimizer
 .. py:module:: tensorplay.optim.swa_utils
-```
-```{eval-rst}
-.. toctree::
-    :hidden:
-
-    optim.aliases.md
 ```
 

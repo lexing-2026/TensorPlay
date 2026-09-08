@@ -332,7 +332,7 @@ loading.
 ## Memory Pinning
 
 Host to GPU copies are much faster when they originate from pinned (page-locked)
-memory. See {ref}`cuda-memory-pinning` for more details on when and how to use
+memory. See the CUDA memory notes for more details on when and how to use
 pinned memory generally.
 For data loading, passing {attr}`pin_memory=True` to a
 {class}`~tensorplay.utils.data.DataLoader` will automatically put the fetched data

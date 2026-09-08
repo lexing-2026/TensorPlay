@@ -105,6 +105,8 @@ help to detect these issues.
 
 (tf32-on-ampere)=
 
+(tf32_on_ampere)=
+
 ## TensorFloat-32 (TF32) on Nvidia Ampere (and later) devices
 
 On Ampere (and later) Nvidia GPUs, TensorPlay can use TensorFloat32 (TF32) to speed up
@@ -125,10 +127,8 @@ is going to be deprecated).
 
 For more information see {ref}`TensorFloat32 <tf32_on_ampere>`.
 
-```{eval-rst}
-.. _fp16reducedprecision:
-   :noindex:
-```
+(fp16reducedprecision)=
+(bf16reducedprecision)=
 
 ## Reduced Precision Reduction for FP16 and BF16 GEMMs
 

@@ -35,7 +35,7 @@ When combining AMP with `tensorplay.compile`, note that the default
 autocast context as the compiled forward. If you follow AMP's recommended
 training pattern and run backward outside autocast, set
 `backward_pass_autocast` to `"off"` for the
-compiled region. See {ref}`compiler_backward` for details.
+compiled region.
 :::
 {class}`tensorplay.autocast` and {class}`tensorplay.cpu.amp.autocast` are new in version `1.10`.
 ```{contents}

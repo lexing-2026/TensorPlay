@@ -9,6 +9,8 @@ programs, and can aid you in debugging.
 
 (how-autograd-encodes-history)=
 
+(extending-autograd)=
+
 ## How autograd encodes the history
 
 Autograd is a reverse automatic differentiation system.  Conceptually,
@@ -46,7 +48,8 @@ When defining a custom Python {class}`~tensorplay.autograd.Function`, you can us
 {func}`~tensorplay.autograd.function._ContextMethodMixin.save_for_backward` to save
 tensors during the forward pass and
 {attr}`~tensorplay.autograd.function.Function.saved_tensors` to retrieve them
-during the backward pass. See {doc}`/notes/extending` for more information.
+during the backward pass. See the {ref}`extending-autograd` notes above for
+more information.
 
 For operations that TensorPlay defines (e.g. {func}`tensorplay.pow`), tensors are
 automatically saved as needed. You can explore (for educational or debugging
@@ -81,6 +84,8 @@ subject to change and that users should not rely on.
 
 You can control how TensorPlay does packing / unpacking with {ref}`saved-tensors-hooks-doc`.
 
+
+(python-number-overload-resolution)=
 
 (non-differentiable-func-grad)=
 
@@ -378,6 +383,8 @@ a version counter of their containing Tensor is saved as well. Once you access
 an error is raised. This ensures that if you're using in-place
 functions and not seeing any errors, you can be sure that the computed
 gradients are correct.
+
+(bwd-cuda-stream-semantics)=
 
 ## Multithreaded Autograd
 
