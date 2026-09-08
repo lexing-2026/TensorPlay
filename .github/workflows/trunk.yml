@@ -181,6 +181,7 @@ jobs:
       build_environment: ${{ format('trunk-{0}-py{1}-cpu', matrix.platform, matrix.python) }}
       runs_on: ${{ matrix.runner }}
       python_version: ${{ matrix.python }}
+      test_matrix: '[{"name":"native-sparse","test_files":"test/test_set_native.py test/test_compressed_sparse_constructors.py"},{"name":"nn-utils","test_files":"test/test_nn_utils_norm.py"}]'
       # Main-branch pushes publish their smoke-tested wheels to the rolling
       # nightly release; tags and release branches publish to their own.
       build_version: ${{ needs.define-wheel-matrix.outputs.nightly_version }}

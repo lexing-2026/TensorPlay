@@ -48,6 +48,11 @@ on:
         type: string
         default: short
         description: "CPU benchmark suite size: short, long, or all"
+      test_matrix:
+        required: false
+        type: string
+        default: '[{"name":"core","test_files":"test/test_set_native.py test/test_compressed_sparse_constructors.py test/test_nn_utils_norm.py"}]'
+        description: JSON array of test shard names and space-separated test files
       build_version:
         required: false
         type: string
@@ -218,9 +223,13 @@ jobs:
           retention-days: 3
 
   test:
-    name: ${{ inputs.build_name }}-test
+    name: ${{ inputs.build_name }}-test-${{ matrix.name }}
     needs: build
     runs-on: ${{ inputs.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.test_matrix) }}
     permissions:
       contents: read
       actions: read
@@ -281,15 +290,17 @@ jobs:
       - name: Run CPU core regression tests
         if: ${{ inputs.cuda == 'cpu' }}
         shell: bash
+        env:
+          TEST_FILES: ${{ matrix.test_files }}
         run: |
           set -euo pipefail
           test_root="$GITHUB_WORKSPACE/.ci-test-tmp"
           result_root="$GITHUB_WORKSPACE/ci-test-results"
           rm -rf "$test_root" "$result_root"
           mkdir -p "$test_root" "$result_root"
-          cp "$GITHUB_WORKSPACE/test/test_set_native.py" "$test_root/"
-          cp "$GITHUB_WORKSPACE/test/test_compressed_sparse_constructors.py" "$test_root/"
-          cp "$GITHUB_WORKSPACE/test/test_nn_utils_norm.py" "$test_root/"
+          for test_file in $TEST_FILES; do
+            cp "$GITHUB_WORKSPACE/$test_file" "$test_root/"
+          done
           cd "$test_root"
           python -m pytest . --import-mode=importlib -q \
             --junitxml="$result_root/junit.xml" \
@@ -299,7 +310,7 @@ jobs:
         if: ${{ always() && inputs.cuda == 'cpu' }}
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ inputs.build_name }}-core-tests-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ inputs.build_name }}-core-tests-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ci-test-results/
           retention-days: 7
           if-no-files-found: warn
