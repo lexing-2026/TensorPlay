@@ -13,7 +13,11 @@
 #include <gloo/rendezvous/context.h>
 #include <gloo/rendezvous/prefix_store.h>
 #include <gloo/scatter.h>
+#ifdef _WIN32
+#include <gloo/transport/uv/device.h>
+#else
 #include <gloo/transport/tcp/device.h>
+#endif
 
 #include <BFloat16.h>
 #include <Half.h>
@@ -845,14 +849,29 @@ bool doesHostnameResolveToUsableAddress(const std::string& hostname) {
   return rp != nullptr;
 }
 
-std::shared_ptr<::gloo::transport::Device> makeTcpDevice(
-    const ::gloo::transport::tcp::attr& attr,
+#ifdef _WIN32
+using GlooTransportAttr = ::gloo::transport::uv::attr;
+
+std::shared_ptr<::gloo::transport::Device> makeGlooDevice(
+    const GlooTransportAttr& attr,
+    bool lazyInit) {
+  if (lazyInit) {
+    runtimeFailure("The Windows Gloo transport does not support lazy init");
+  }
+  return ::gloo::transport::uv::CreateDevice(attr);
+}
+#else
+using GlooTransportAttr = ::gloo::transport::tcp::attr;
+
+std::shared_ptr<::gloo::transport::Device> makeGlooDevice(
+    const GlooTransportAttr& attr,
     bool lazyInit) {
   if (lazyInit) {
     return ::gloo::transport::tcp::CreateLazyDevice(attr);
   }
   return ::gloo::transport::tcp::CreateDevice(attr);
 }
+#endif
 
 } // namespace
 
@@ -860,9 +879,9 @@ std::shared_ptr<::gloo::transport::Device>
 ProcessGroupGloo::createDeviceForInterface(
     const std::string& interface_name,
     bool lazyInit) {
-  ::gloo::transport::tcp::attr attr;
+  GlooTransportAttr attr;
   attr.iface = interface_name;
-  return makeTcpDevice(attr, lazyInit);
+  return makeGlooDevice(attr, lazyInit);
 }
 
 std::shared_ptr<::gloo::transport::Device>
@@ -872,9 +891,9 @@ ProcessGroupGloo::createDeviceForHostname(
   if (!doesHostnameResolveToUsableAddress(hostname)) {
     runtimeFailure("Cannot resolve " + hostname + " to a (local) address");
   }
-  ::gloo::transport::tcp::attr attr;
+  GlooTransportAttr attr;
   attr.hostname = hostname;
-  return makeTcpDevice(attr, lazyInit);
+  return makeGlooDevice(attr, lazyInit);
 }
 
 std::shared_ptr<::gloo::transport::Device>
