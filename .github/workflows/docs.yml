@@ -70,7 +70,12 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --pattern 'tensorplay-*+cpu-cp312-cp312-linux_x86_64.whl' \
             --dir dist-docs
-          python -m pip install dist-docs/*.whl numpy PyYAML typing-extensions
+          # The rolling nightly release can hold several dev builds per
+          # wheel tag while a trunk push supersedes the previous one; asking
+          # pip to install all of them at once fails on the version
+          # conflict, so pick the highest version.
+          python -m pip install "$(printf '%s\n' dist-docs/*.whl | sort -V | tail -n 1)" \
+            numpy PyYAML typing-extensions
 
       - name: Install TensorPlay wheel (release)
         if: ${{ inputs.tag != '' || github.event.release.tag_name != '' }}
