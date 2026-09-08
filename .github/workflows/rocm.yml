@@ -154,19 +154,3 @@ jobs:
           set -euo pipefail
           gh release upload "$RELEASE_TAG" dist/*.whl \
             --repo "$GITHUB_REPOSITORY" --clobber
-
-  publish-rocm-index:
-    name: publish-gpu-index
-    needs: publish-rocm
-    uses: ./.github/workflows/_cuda-upload.yml
-    permissions:
-      contents: write
-    with:
-      build_environment: optional-rocm
-      pages_branch: pypi-pages
-      release_tag: ${{ inputs.release_tag }}
-      cuda_variants_json: >-
-        [{"variant":"cu124","toolkit":"12.4.1"},
-         {"variant":"cu126","toolkit":"12.6.3"},
-         {"variant":"cu130","toolkit":"13.0.2"},
-         {"variant":"rocm72","toolkit":"7.2.4"}]

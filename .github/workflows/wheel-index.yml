@@ -1,17 +1,13 @@
 name: wheel-index
 
-# Single pathway that publishes the wheel-index site on pypi-pages
-# (followed by Cloudflare Pages). Every release change — creation, wheel
-# uploads, manual asset edits, deletion — triggers a full rebuild of the
-# site straight from release assets, force-pushed as one root commit with
-# no branch history. The publish workflows (release/nightly/ROCm) never
-# touch the index branch themselves.
-#
-# The rolling nightly release keeps, per wheel variant, only the newest
-# dev version: an older asset of a variant is deleted here, right before
-# the indexes are built, so the site can never point at pruned downloads.
-# Retention is per variant, so a partially failed nightly never removes
-# the last installable build of the variant that failed.
+# Reacts to release changes and hands the download site a rebuild signal.
+# The site itself lives in lexing-2026/tensorplay-index: its refresh-manifest
+# workflow re-reads every non-draft release of this repository and republishes
+# the static index. This workflow keeps one piece of release hygiene local:
+# the rolling nightly release keeps only the newest dev version per wheel
+# variant, so the site can never point at pruned downloads. Retention is per
+# variant, so a partially failed nightly never removes the last installable
+# build of the variant that failed.
 
 on:
   release:
@@ -23,26 +19,20 @@ permissions: read-all
 concurrency:
   # Coalesces bursts: rapid edited events (one per uploaded asset) cancel
   # the running rebuild, and only the last one completes.
-  group: pypi-pages
+  group: wheel-index
   cancel-in-progress: true
 
 jobs:
   rebuild:
-    name: rebuild-wheel-indexes
+    name: prune-nightly-and-dispatch-site
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
-      PAGES_BRANCH: pypi-pages
+      INDEX_REPO: lexing-2026/tensorplay-index
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-        with:
-          submodules: false
-          show-progress: false
-
       - name: Enforce nightly rolling retention
         shell: bash
         run: |
@@ -53,12 +43,9 @@ jobs:
           fi
           # Keep, per wheel variant (+cpu, +cuXXX, no-label macOS), only the
           # assets of that variant's newest dev version; delete the rest.
-          # Per-variant retention keeps a partially failed nightly from
-          # removing the last installable build of the failed variant.
           python -m pip install --disable-pip-version-check --quiet packaging
           python - <<'PY'
           import os
-          import re
           import subprocess
 
           from packaging.version import Version
@@ -90,49 +77,19 @@ jobs:
                       )
           PY
 
-      - name: Collect release assets
+      - name: Dispatch site rebuild
         shell: bash
+        env:
+          DISPATCH_TOKEN: ${{ secrets.INDEX_REPO_TOKEN }}
         run: |
           set -euo pipefail
-          gh api --paginate \
-            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-            --jq '.[] | select(.draft == false) | {tag_name: .tag_name, prerelease: .prerelease, assets: [.assets[] | {name: .name, browser_download_url: .browser_download_url}]}' \
-            > "$RUNNER_TEMP/tensorplay-releases.jsonl"
-
-      - name: Build PEP 503 indexes
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m pip install --disable-pip-version-check --quiet packaging
-          # Variants are discovered from the release assets themselves; the
-          # tool rebuilds both channels into one complete site. No wheels
-          # are downloaded: every link points at release assets, without
-          # sha256, which pip handles fine.
-          python tools/build_simple_index.py \
-            --output-dir release_site \
-            --release-tag "${{ github.event.release.tag_name || 'rescan' }}" \
-            --release-base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download" \
-            --releases-json "$RUNNER_TEMP/tensorplay-releases.jsonl"
-
-      - name: Publish static indexes to the Pages branch
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # The whole site is rebuilt from release assets on every run, so
-          # the Pages branch carries exactly one root commit: publish an
-          # orphan tree and force-push it, keeping no history.
-          git worktree add --detach pages-branch
-          git -C pages-branch checkout --orphan pages-publish
-          find pages-branch -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf -- {} +
-          cp -a release_site/. pages-branch/
-          git -C pages-branch add --all
-
-          if git -C pages-branch diff --cached --quiet; then
-            echo "No static index changes to publish"
-          else
-            git -C pages-branch commit -m "Publish wheel indexes from release assets"
-            git -C pages-branch push --force origin "HEAD:$PAGES_BRANCH"
+          if [[ -z "${DISPATCH_TOKEN}" ]]; then
+            echo "::warning::INDEX_REPO_TOKEN secret is not set; skipping site rebuild dispatch."
+            exit 0
           fi
+          gh api \
+            -X POST \
+            "repos/${INDEX_REPO}/dispatches" \
+            -f event_type="wheel-publish" \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}"
+          echo "Dispatched wheel-publish to ${INDEX_REPO}"
