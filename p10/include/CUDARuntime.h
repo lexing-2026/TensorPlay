@@ -63,20 +63,15 @@ public:
         return CUDAStream(device_index, stream);
     }
 
-private:
+    // The pair constructor stays public so the stream accessors mint values
+    // directly: a friend set would be a second declaration whose export
+    // linkage can drift from the definition's, which MSVC rejects.
     CUDAStream(int device_index, cudaStream_t stream) noexcept
         : device_index_(device_index), stream_(stream) {}
 
+private:
     int device_index_;
     cudaStream_t stream_;
-
-    // The exporters construct through the private pair; the friend
-    // declarations must carry the same export attribute as the definitions,
-    // or MSVC reads the later annotated declaration as a linkage change.
-    friend P10_API CUDAStream getStreamFromPool(int, int);
-    friend P10_API CUDAStream getDefaultCUDAStream(int);
-    friend P10_API CUDAStream getCurrentCUDAStream(int);
-    friend P10_API void setCurrentCUDAStream(const CUDAStream&);
 };
 
 P10_API CUDAStream getStreamFromPool(int priority = 0, int device_index = -1);
