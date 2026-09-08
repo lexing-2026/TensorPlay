@@ -70,10 +70,13 @@ private:
     int device_index_;
     cudaStream_t stream_;
 
-    friend CUDAStream getStreamFromPool(int, int);
-    friend CUDAStream getDefaultCUDAStream(int);
-    friend CUDAStream getCurrentCUDAStream(int);
-    friend void setCurrentCUDAStream(const CUDAStream&);
+    // The exporters construct through the private pair; the friend
+    // declarations must carry the same export attribute as the definitions,
+    // or MSVC reads the later annotated declaration as a linkage change.
+    friend P10_API CUDAStream getStreamFromPool(int, int);
+    friend P10_API CUDAStream getDefaultCUDAStream(int);
+    friend P10_API CUDAStream getCurrentCUDAStream(int);
+    friend P10_API void setCurrentCUDAStream(const CUDAStream&);
 };
 
 P10_API CUDAStream getStreamFromPool(int priority = 0, int device_index = -1);
