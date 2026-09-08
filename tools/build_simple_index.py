@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import html
 import json
@@ -148,8 +149,30 @@ def _add_current_wheels(
 
 
 def _package_index(entries: list[dict[str, str | None]]) -> str:
+    # Newest version first: with several dev builds of the same package on
+    # the rolling channel, the current nightly must lead the listing rather
+    # than hide behind a lexicographic filename sort.
+    def _version_of(filename: str):
+        try:
+            return parse_wheel_filename(filename)[1]
+        except Exception:
+            return None
+
+    def compare(left: dict[str, str | None], right: dict[str, str | None]) -> int:
+        left_name = left["filename"] or ""
+        right_name = right["filename"] or ""
+        left_version = _version_of(left_name)
+        right_version = _version_of(right_name)
+        if left_version is not None and right_version is not None and left_version != right_version:
+            return -1 if left_version > right_version else 1
+        if left_name < right_name:
+            return -1
+        if left_name > right_name:
+            return 1
+        return 0
+
     links = []
-    for entry in sorted(entries, key=lambda item: item["filename"] or ""):
+    for entry in sorted(entries, key=functools.cmp_to_key(compare)):
         filename = entry["filename"] or ""
         fragment = f"#sha256={entry['sha256']}" if entry.get("sha256") else ""
         requires_python = entry.get("requires_python")
@@ -172,16 +195,20 @@ def _root_index(projects: list[str], variant: str) -> str:
     )
 
 
-def _landing_index(variants: list[str]) -> str:
-    links = "\n".join(
+def _site_landing_index(nightly: bool, variants: list[str]) -> str:
+    """Root page for the full site: the nightly channel first, then stable."""
+    links = []
+    if nightly:
+        links.append('<p><a href="whl/nightly/">nightly index</a></p>')
+    links.extend(
         f'<p><a href="whl/{html.escape(variant)}/">{html.escape(variant)} index</a></p>'
         for variant in variants
     )
     return (
         "<!doctype html>\n<html><body>\n"
-        "<h1>TensorPlay GPU wheels</h1>\n"
-        f"{links}\n"
-        "</body></html>\n"
+        "<h1>TensorPlay wheels</h1>\n"
+        + "\n".join(links)
+        + "\n</body></html>\n"
     )
 
 
@@ -200,7 +227,13 @@ def _nightly_landing_index(variants: list[str]) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dist-dir", type=Path, required=True, help="Directory containing the current CPU/GPU wheels")
+    parser.add_argument(
+        "--dist-dir",
+        type=Path,
+        default=None,
+        help="Directory containing the current build's wheels; optional when the "
+        "site is rebuilt purely from release assets",
+    )
     parser.add_argument("--output-dir", type=Path, required=True, help="Pages output directory")
     parser.add_argument("--release-tag", required=True, help="Current Git tag, for example v1.0.0")
     parser.add_argument(
@@ -231,7 +264,7 @@ def main() -> None:
         raise SystemExit(f"Invalid variant(s): {invalid!r}")
     if not args.nightly and "cpu" in variants:
         raise SystemExit("The cpu variant is only valid with --nightly")
-    if not args.dist_dir.is_dir():
+    if args.dist_dir is not None and not args.dist_dir.is_dir():
         raise SystemExit(f"Wheel directory does not exist: {args.dist_dir}")
 
     release_records = _read_release_records(args.releases_json)
@@ -250,10 +283,11 @@ def main() -> None:
                 release_records, args.release_base_url, variant,
                 skip_tags=frozenset({NIGHTLY_RELEASE_TAG}),
             )
-        _add_current_wheels(
-            packages, args.dist_dir, args.release_base_url, args.release_tag, variant,
-            nightly=args.nightly,
-        )
+        if args.dist_dir is not None:
+            _add_current_wheels(
+                packages, args.dist_dir, args.release_base_url, args.release_tag, variant,
+                nightly=args.nightly,
+            )
         if not packages:
             # Optional GPU variants, such as ROCm, are not part of every
             # release. Keep the index publishable when an optional asset is
@@ -282,7 +316,10 @@ def main() -> None:
     else:
         if not published_variants:
             raise SystemExit("No wheel assets found for any configured variant")
-        (args.output_dir / "index.html").write_text(_landing_index(published_variants), encoding="utf-8")
+        (args.output_dir / "index.html").write_text(
+            _site_landing_index(nightly=False, variants=published_variants),
+            encoding="utf-8",
+        )
         (args.output_dir / "_headers").write_text(
             "/whl/*\n"
             "  Cache-Control: public, max-age=300, must-revalidate\n",
