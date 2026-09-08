@@ -28,6 +28,19 @@ jobs:
           submodules: false
           show-progress: false
 
+      - name: Set compiler cache location
+        shell: bash
+        run: echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+
+      - name: Restore compiler cache
+        id: compiler-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: buildcache-${{ runner.os }}-${{ runner.arch }}-rocm-linux-x86_64-py3-${{ github.sha }}
+          restore-keys: |
+            buildcache-${{ runner.os }}-${{ runner.arch }}-rocm-linux-x86_64-py3-
+
       # The wheel links vendored SLEEF/NNPACK trees that CI checkouts do
       # not carry; fetch the pinned revisions before configuring.
       - name: Restore vendored build dependencies
@@ -39,7 +52,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libopenblas-dev 1>/dev/null
+          sudo apt-get install -y -qq ccache libopenblas-dev 1>/dev/null
 
       - name: Load ROCm build configuration
         id: rocm-config
@@ -84,6 +97,13 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m build --wheel
+
+      - name: Compiler cache statistics
+        if: always()
+        shell: bash
+        run: |
+          echo "Exact compiler cache hit: ${{ steps.compiler-cache.outputs.cache-hit }}"
+          ccache --show-stats || true
 
       - name: Verify ROCm wheel metadata
         shell: bash
