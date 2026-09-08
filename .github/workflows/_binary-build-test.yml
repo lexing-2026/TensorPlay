@@ -110,7 +110,7 @@ jobs:
           esac
 
       - name: Restore compiler cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ runner.os == 'Windows' && env.SCCACHE_DIR || env.CCACHE_DIR }}
           key: buildcache-${{ runner.os }}-${{ inputs.cuda }}-${{ github.sha }}
@@ -157,7 +157,7 @@ jobs:
           # fall back to 1 so the version metadata never sees an empty value.
           echo "TENSORPLAY_BUILD_NUMBER=${{ inputs.build_number || '1' }}" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ inputs.python_version }}
 

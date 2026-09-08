@@ -52,7 +52,7 @@ jobs:
           submodules: false
           show-progress: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -64,7 +64,7 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           # Download from the rolling nightly release instead of the wheel
-          # index: the index site only mirrors published release assets, and
+          # index: the index site only lists published release assets, and
           # the nightly index is not guaranteed to be in sync yet.
           gh release download nightly \
             --repo "$GITHUB_REPOSITORY" \
