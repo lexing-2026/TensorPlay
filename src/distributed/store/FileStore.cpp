@@ -37,7 +37,9 @@ constexpr int kOpenRdOnly = _O_RDONLY;
 constexpr int kOpenWrOnly = _O_WRONLY;
 constexpr int kOpenAppend = _O_APPEND;
 
-int file_open(const char* path, int flags) { return _open(path, flags); }
+int file_open(const char* path, int flags, int mode = 0) {
+  return _open(path, flags, mode);
+}
 int file_close(int fd) { return _close(fd); }
 Ssize file_write(int fd, const void* buf, size_t len) {
   return _write(fd, buf, static_cast<unsigned>(len));
@@ -76,7 +78,9 @@ constexpr int kOpenRdOnly = O_RDONLY;
 constexpr int kOpenWrOnly = O_WRONLY;
 constexpr int kOpenAppend = O_APPEND;
 
-int file_open(const char* path, int flags) { return ::open(path, flags); }
+int file_open(const char* path, int flags, int mode = 0) {
+  return ::open(path, flags, mode);
+}
 int file_close(int fd) { return file_close(fd); }
 Ssize file_write(int fd, const void* buf, size_t len) {
   return ::write(fd, buf, len);
@@ -183,7 +187,7 @@ FileStore::FileStore(std::string path, std::chrono::milliseconds timeout)
     file_mkdir(parent.c_str());
   }
   // Create eagerly so all ranks agree on the path before rendezvous.
-  int fd = file_open(path_.c_str(), kOpenRdWr | kOpenCreat | kOpenBinary);
+  int fd = file_open(path_.c_str(), kOpenRdWr | kOpenCreat | kOpenBinary, 0644);
   TP_CHECK(fd >= 0, "FileStore: cannot create file");
   file_close(fd);
 }
