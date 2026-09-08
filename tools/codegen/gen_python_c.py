@@ -575,7 +575,11 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
     ]
     if own_catch:
         body.append("    try {")
-    body += [f"        {kwlist}", f"        PyObject* slots[{nargs}];"]
+    body += [f"        {kwlist}"]
+    # MSVC rejects zero-length stack arrays; a no-argument op skips the slot
+    # array entirely and hands nullptr to the parser, which touches no slots.
+    if nargs:
+        body.append(f"        PyObject* slots[{nargs}];")
     if dispatch:
         body += [
             "        PyObject* tpx_dispatch_result = nullptr;",
@@ -660,12 +664,19 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
 
     if is_method:
         # parse_into owns the fill of a contiguous user-slot array; the
-        # receiver's named `self` slot is patched in afterwards.
+        # receiver's named `self` slot is patched in afterwards.  A method
+        # taking only `self` has no user slots: skip the zero-length array
+        # (MSVC forbids it) and let the parser run with a null sink.
         user_idx = [i for i in range(nargs) if i != self_idx]
-        body.append(f"        PyObject* uslots[{nargs - 1}];")
-        body.append(
-            f'        tpx_py_parse_into({arg_arr}, {arg_n}, kwnames, kwlist, '
-            f'{nargs - 1}, "{f.func_name}", uslots);')
+        if user_idx:
+            body.append(f"        PyObject* uslots[{nargs - 1}];")
+            body.append(
+                f'        tpx_py_parse_into({arg_arr}, {arg_n}, kwnames, kwlist, '
+                f'{nargs - 1}, "{f.func_name}", uslots);')
+        else:
+            body.append(
+                f'        tpx_py_parse_into({arg_arr}, {arg_n}, kwnames, kwlist, '
+                f'0, "{f.func_name}", nullptr);')
         for u, i in enumerate(user_idx):
             body.append(f"        slots[{i}] = uslots[{u}];")
         body.append(f"        slots[{self_idx}] = self;")
@@ -677,9 +688,10 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
                         'too many positional arguments");')
             body.append("        }")
     else:
+        sink = "slots" if nargs else "nullptr"
         body.append(
             f'        tpx_py_parse_into({arg_arr}, {arg_n}, kwnames, kwlist, '
-            f'{nargs}, "{f.func_name}", slots);')
+            f'{nargs}, "{f.func_name}", {sink});')
         if not splat and user_pos < nargs:
             body.append(f"        if (nargs > {user_pos}) {{")
             body.append(f'            throw std::invalid_argument("{f.func_name}: '
