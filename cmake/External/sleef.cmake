@@ -85,7 +85,7 @@ function(_tp_add_vendored_sleef)
     elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64" AND NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         set(SLEEF_ENABLE_SVE ON CACHE BOOL "" FORCE)
     endif()
-    add_subdirectory(
+    tp_add_third_party(
         "${CMAKE_CURRENT_LIST_DIR}/../../third_party/sleef"
         "${CMAKE_BINARY_DIR}/third_party/sleef")
     # SLEEF's tlfloat ExternalProject bakes CMAKE_INSTALL_PREFIX into its

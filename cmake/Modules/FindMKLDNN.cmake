@@ -140,7 +140,7 @@ else()
     endif()
 endif()
 
-add_subdirectory("${MKLDNN_ROOT}" "${CMAKE_BINARY_DIR}/third_party/oneDNN")
+tp_add_third_party("${MKLDNN_ROOT}" "${CMAKE_BINARY_DIR}/third_party/oneDNN")
 
 if(NOT TARGET dnnl)
     message(STATUS "oneDNN source build did not produce the dnnl target")

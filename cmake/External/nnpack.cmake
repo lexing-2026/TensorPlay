@@ -84,9 +84,9 @@ if(ANDROID OR IOS OR ${CMAKE_SYSTEM_NAME} STREQUAL "Linux" OR ${CMAKE_SYSTEM_NAM
       message(WARNING "Ancient nnpack forces CMake compatibility")
       set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
     endif()
-    add_subdirectory(
-      "${NNPACK_SOURCE_DIR}"
-      "${CONFU_DEPENDENCIES_BINARY_DIR}/NNPACK")
+    tp_add_third_party(
+        "${NNPACK_SOURCE_DIR}"
+        "${CONFU_DEPENDENCIES_BINARY_DIR}/NNPACK")
     if(CMAKE_VERSION VERSION_GREATER_EQUAL "4.0.0")
       unset(CMAKE_POLICY_VERSION_MINIMUM)
     endif()
