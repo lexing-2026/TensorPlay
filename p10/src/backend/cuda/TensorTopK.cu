@@ -4,6 +4,9 @@
 #include "CUDAContext.h"
 #include "CUDARuntime.h"
 #include <cuda_runtime.h>
+#include <cuda/std/functional>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
 #include "ScanUtils.cuh"
 #include "SortingRadixSelect.cuh"
 #include "SortUtils.cuh"
@@ -544,28 +547,30 @@ void launch_multiblock_topk_impl(const Tensor& input, Tensor& values,
   TP_CUDA_CHECK(cudaGetLastError());
   TP_CHECK(block_count <= static_cast<uint32_t>(std::numeric_limits<int>::max()),
            "topk: scan range exceeds device scan limit");
-  using Counter = cub::CountingInputIterator<uint32_t, uint32_t>;
-  using KeyIterator = cub::TransformInputIterator<
-      uint32_t, topk_multiblock_block_to_row<Key>, Counter>;
+  // CCCL 3 dropped the cub iterator/Equality shorthands; the thrust
+  // counterparts ship in the same package and carry identical semantics.
+  using Counter = thrust::counting_iterator<uint32_t>;
+  using KeyIterator = thrust::transform_iterator<
+      topk_multiblock_block_to_row<Key>, Counter>;
   KeyIterator key_iterator(
       Counter(0), topk_multiblock_block_to_row<Key>{blocks_per_row});
   size_t scan_bytes = 0;
   TP_CUDA_CHECK(cub::DeviceScan::InclusiveSumByKey(
       nullptr, scan_bytes, key_iterator, within_k_counts.data_ptr<uint32_t>(),
       within_k_counts.data_ptr<uint32_t>(), static_cast<int>(block_count),
-      cub::Equality(), getCurrentCUDAStream().stream()));
+      cuda::std::equal_to<>(), getCurrentCUDAStream().stream()));
   Tensor scan_storage = Tensor::empty(
       {static_cast<int64_t>(std::max<size_t>(scan_bytes, 1))}, DType::UInt8,
       input.device());
   TP_CUDA_CHECK(cub::DeviceScan::InclusiveSumByKey(
       scan_storage.data_ptr(), scan_bytes, key_iterator,
       within_k_counts.data_ptr<uint32_t>(), within_k_counts.data_ptr<uint32_t>(),
-      static_cast<int>(block_count), cub::Equality(),
+      static_cast<int>(block_count), cuda::std::equal_to<>(),
       getCurrentCUDAStream().stream()));
   TP_CUDA_CHECK(cub::DeviceScan::InclusiveSumByKey(
       scan_storage.data_ptr(), scan_bytes, key_iterator,
       kth_counts.data_ptr<uint32_t>(), kth_counts.data_ptr<uint32_t>(),
-      static_cast<int>(block_count), cub::Equality(),
+      static_cast<int>(block_count), cuda::std::equal_to<>(),
       getCurrentCUDAStream().stream()));
   topk_multiblock_gather<T, Key, IndexType>
       <<<block_grid, topk_multiblock_threads, 0,
