@@ -435,7 +435,9 @@ def _emit_redispatch(lines, f, variant, dev_src, helper_name):
     lines.append("#endif")
     if f.device_guard:
         lines.append("#ifdef USE_CUDA")
-        lines.append(f"    cuda::OptionalCUDAGuard device_guard({rd_dev});")
+        # Brace-init: a parenthesized placeholder like Device(DeviceType::CPU)
+        # re-parses as a parameter declaration on MSVC (C2751).
+        lines.append(f"    cuda::OptionalCUDAGuard device_guard{{{rd_dev}}};")
         lines.append("#endif")
     lines.append(
         f'    static const OperatorHandle op_handle = '

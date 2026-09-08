@@ -11,8 +11,10 @@
 #ifdef _WIN32
 #include <process.h>  // getpid via _getpid
 #define getpid _getpid
+using tp_pid_t = int;
 #else
 #include <unistd.h>
+using tp_pid_t = pid_t;
 #endif
 
 #include <unordered_map>
@@ -25,7 +27,7 @@ namespace {
 // cudaErrorInitializationError. Seeding must therefore be lazy (never
 // initialize CUDA) and skipped in bad-fork children, preserving
 std::atomic<bool> g_cuda_initialized{false};
-std::atomic<pid_t> g_cuda_init_pid{0};
+std::atomic<tp_pid_t> g_cuda_init_pid{0};
 
 void checkCublas(cublasStatus_t error, const char* operation) {
     if (error != CUBLAS_STATUS_SUCCESS) {
