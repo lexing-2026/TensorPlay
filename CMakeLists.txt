@@ -1071,17 +1071,34 @@ if(NOT WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
-# Distributed transports.  Platform defaults and dependent options follow
-# the reference layout: distributed is off by default outside Linux and
-# Windows; tensorpipe never builds on Windows; gloo requires a 64-bit host.
+# Distributed transports.  Non-Linux, non-Windows platforms default to the
+# CPU extension without distributed bindings; Windows uses the gloo transport
+# when the build environment provides libuv, while RPC remains unavailable.
 # ---------------------------------------------------------------------------
 if(NOT LINUX AND NOT WIN32)
-    set(USE_TP_DISTRIBUTED OFF CACHE BOOL "Use distributed" FORCE)
+    set(USE_TP_DISTRIBUTED OFF CACHE BOOL "Use distributed")
 else()
     set(USE_TP_DISTRIBUTED ON CACHE BOOL "Use distributed")
 endif()
+if(WIN32 AND USE_TP_DISTRIBUTED)
+    find_library(
+        TP_LIBUV_LIBRARY
+        NAMES uv libuv
+        HINTS
+            "${libuv_ROOT}"
+            "$ENV{libuv_ROOT}"
+            "$ENV{CONDA_PREFIX}/Library"
+            "$ENV{PREFIX}/Library"
+        PATH_SUFFIXES lib
+        NO_DEFAULT_PATH)
+    if(NOT TP_LIBUV_LIBRARY)
+        set(USE_TP_DISTRIBUTED OFF)
+        message(WARNING
+            "Windows distributed bindings disabled because libuv was not found")
+    endif()
+endif()
 cmake_dependent_option(TP_USE_GLOO "Use the gloo process-group transport" ON
-    "USE_TP_DISTRIBUTED AND NOT WIN32" OFF)
+    "USE_TP_DISTRIBUTED" OFF)
 # The tensorpipe sources use POSIX-only interfaces (ssize_t and the fd
 # sharing socket API) and do not compile under MSVC; Windows keeps the
 # gloo transport only.
@@ -1113,7 +1130,9 @@ set(USE_RCCL OFF CACHE BOOL "" FORCE)
 # into the shared transport library there (the TCP transport covers our
 # use); Windows gloo only supports the libuv transport, so it stays on and
 # consumes the libuv_ROOT provisioned by CI.
-if(NOT WIN32)
+if(APPLE)
+    set(USE_LIBUV ON CACHE BOOL "" FORCE)
+elseif(NOT WIN32)
     set(USE_LIBUV OFF CACHE BOOL "" FORCE)
 endif()
 set(USE_TCP_OPENSSL_LINK OFF CACHE BOOL "" FORCE)
@@ -1210,58 +1229,59 @@ set(TP_C_SOURCES
     src/bindings/python/Tensor.cpp
     src/bindings/python/Stax.cpp
     src/bindings/python/Parallel.cpp
-    src/bindings/python/Distributed.cpp
-    src/bindings/python/DistributedAutograd.cpp
-    src/distributed/bindings.cpp
     src/bindings/python/Futures.cpp
-    src/bindings/python/Rpc.cpp
-    src/distributed/rpc/agent_utils.cpp
-    src/distributed/rpc/future.cpp
-    src/distributed/rpc/message.cpp
-    src/distributed/rpc/python_call.cpp
-    src/distributed/rpc/python_functions.cpp
-    src/distributed/rpc/python_remote_call.cpp
-    src/distributed/rpc/python_resp.cpp
-    src/distributed/rpc/python_rpc_handler.cpp
-    src/distributed/rpc/py_rref.cpp
-    src/distributed/rpc/rpc_agent.cpp
-    src/distributed/rpc/request_callback.cpp
-    src/distributed/rpc/request_callback_impl.cpp
-    src/distributed/rpc/request_callback_no_python.cpp
-    src/distributed/rpc/rpc_runtime.cpp
-    src/distributed/rpc/rref_context.cpp
-    src/distributed/rpc/rref_impl.cpp
-    src/distributed/rpc/rref_proto.cpp
-    src/distributed/rpc/types.cpp
-    src/distributed/rpc/unpickled_python_call.cpp
-    src/distributed/rpc/unpickled_python_remote_call.cpp
-    src/distributed/rpc/utils.cpp
-    src/distributed/autograd/autograd.cpp
-    src/distributed/autograd/context/container.cpp
-    src/distributed/autograd/context/context.cpp
-    src/distributed/autograd/engine/dist_engine.cpp
-    src/distributed/autograd/functions/recvrpc_backward.cpp
-    src/distributed/autograd/functions/sendrpc_backward.cpp
-    src/distributed/autograd/rpc_messages/autograd_metadata.cpp
-    src/distributed/autograd/rpc_messages/cleanup_autograd_context_req.cpp
-    src/distributed/autograd/rpc_messages/cleanup_autograd_context_resp.cpp
-    src/distributed/autograd/rpc_messages/propagate_gradients_req.cpp
-    src/distributed/autograd/rpc_messages/propagate_gradients_resp.cpp
-    src/distributed/autograd/rpc_messages/rpc_with_autograd.cpp
-    src/distributed/autograd/rpc_messages/rref_backward_req.cpp
-    src/distributed/autograd/rpc_messages/rref_backward_resp.cpp
-    src/distributed/autograd/utils.cpp
-    src/distributed/rpc/metrics/registry.cpp
-    src/distributed/rpc/profiler/remote_profiler_manager.cpp
-    src/distributed/rpc/profiler/server_process_global_profiler.cpp
     src/bindings/python/CudaGraph.cpp
      src/bindings/python/FileCheck.cpp
      src/Version.cpp
 )
-if(TP_USE_TENSORPIPE)
-    # The tensorpipe transport TUs require its headers; they only join the
-    # extension where the transport was built.
+if(USE_TP_DISTRIBUTED)
     list(APPEND TP_C_SOURCES
+        src/bindings/python/Distributed.cpp
+        src/distributed/bindings.cpp)
+endif()
+if(TP_USE_TENSORPIPE)
+    list(APPEND TP_C_SOURCES
+        src/bindings/python/DistributedAutograd.cpp
+        src/bindings/python/Rpc.cpp
+        src/distributed/rpc/agent_utils.cpp
+        src/distributed/rpc/future.cpp
+        src/distributed/rpc/message.cpp
+        src/distributed/rpc/python_call.cpp
+        src/distributed/rpc/python_functions.cpp
+        src/distributed/rpc/python_remote_call.cpp
+        src/distributed/rpc/python_resp.cpp
+        src/distributed/rpc/python_rpc_handler.cpp
+        src/distributed/rpc/py_rref.cpp
+        src/distributed/rpc/rpc_agent.cpp
+        src/distributed/rpc/request_callback.cpp
+        src/distributed/rpc/request_callback_impl.cpp
+        src/distributed/rpc/request_callback_no_python.cpp
+        src/distributed/rpc/rpc_runtime.cpp
+        src/distributed/rpc/rref_context.cpp
+        src/distributed/rpc/rref_impl.cpp
+        src/distributed/rpc/rref_proto.cpp
+        src/distributed/rpc/types.cpp
+        src/distributed/rpc/unpickled_python_call.cpp
+        src/distributed/rpc/unpickled_python_remote_call.cpp
+        src/distributed/rpc/utils.cpp
+        src/distributed/autograd/autograd.cpp
+        src/distributed/autograd/context/container.cpp
+        src/distributed/autograd/context/context.cpp
+        src/distributed/autograd/engine/dist_engine.cpp
+        src/distributed/autograd/functions/recvrpc_backward.cpp
+        src/distributed/autograd/functions/sendrpc_backward.cpp
+        src/distributed/autograd/rpc_messages/autograd_metadata.cpp
+        src/distributed/autograd/rpc_messages/cleanup_autograd_context_req.cpp
+        src/distributed/autograd/rpc_messages/cleanup_autograd_context_resp.cpp
+        src/distributed/autograd/rpc_messages/propagate_gradients_req.cpp
+        src/distributed/autograd/rpc_messages/propagate_gradients_resp.cpp
+        src/distributed/autograd/rpc_messages/rpc_with_autograd.cpp
+        src/distributed/autograd/rpc_messages/rref_backward_req.cpp
+        src/distributed/autograd/rpc_messages/rref_backward_resp.cpp
+        src/distributed/autograd/utils.cpp
+        src/distributed/rpc/metrics/registry.cpp
+        src/distributed/rpc/profiler/remote_profiler_manager.cpp
+        src/distributed/rpc/profiler/server_process_global_profiler.cpp
         src/distributed/rpc/tensorpipe_agent.cpp
         src/distributed/rpc/tensorpipe_backend.cpp
         src/distributed/rpc/tensorpipe_utils.cpp)
@@ -1273,6 +1293,12 @@ if(USE_ROCM)
 endif()
 pybind11_add_module(_C ${TP_C_SOURCES})
 set_target_properties(_C PROPERTIES UNITY_BUILD ON)
+if(USE_TP_DISTRIBUTED)
+    target_compile_definitions(_C PRIVATE TP_USE_DISTRIBUTED)
+endif()
+if(TP_USE_TENSORPIPE)
+    target_compile_definitions(_C PRIVATE TP_USE_RPC)
+endif()
 # The NumPy C-API bootstrap headers (numpy_stub.h) need the NumPy include
 # directory; locate it through the interpreter that owns the extension.
 execute_process(

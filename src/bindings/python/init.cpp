@@ -366,10 +366,14 @@ PYBIND11_MODULE(_C, m) {
     init_dispatch(m);
     init_stax(m);
     init_parallel(m);
+#ifdef TP_USE_DISTRIBUTED
     init_distributed(m);
+#endif
     init_futures(m);
+#ifdef TP_USE_RPC
     init_rpc(m);
     init_distributed_autograd(m);
+#endif
     init_filecheck(m);
     init_cuda_graph(m);
 
