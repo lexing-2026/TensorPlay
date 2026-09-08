@@ -11,10 +11,12 @@ on:
     # Docs and CI-meta pushes cannot change wheel contents (the build-skip
     # job covers the remaining cases); not starting the workflow also keeps
     # a running build from being cancelled by the branch-level concurrency
-    # group, which is what kept killing the macOS lane mid-build.
+    # group, which is what kept killing the macOS lane mid-build. CI-only
+    # edits belong to that set: they ship in the next code-bearing wheel.
     paths-ignore:
       - "**.md"
       - "docs/**"
+      - ".github/**"
       - "LICENSE"
       - ".gitignore"
   workflow_dispatch:
