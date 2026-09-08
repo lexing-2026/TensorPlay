@@ -132,8 +132,10 @@ private:
     std::unordered_map<int, ReadyQueue*> ready_queues_;
     std::unordered_map<int, std::thread> device_threads_;
 
-    // Depth of nested execute() calls on this thread.
-    static thread_local int nested_depth_;
+    // Depth of nested execute() calls on this thread. Backed by a
+    // file-local thread_local in Engine.cpp: MSVC forbids thread storage
+    // duration on members of a dll-interface class.
+    static int& nested_depth();
 };
 
 } // namespace tpx
