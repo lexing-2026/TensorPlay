@@ -10,6 +10,7 @@ Environment variables expected:
 """
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -40,6 +41,8 @@ PIP_PACKAGES: list[str] = [
 
 
 LIBUV_URL = "https://s3.amazonaws.com/ossci-windows/libuv-1.40.0-h8ffe710_0.tar.bz2"
+# Mozilla's prebuilt release; the same channel the build ecosystems use.
+SCCACHE_URL = "https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-x86_64-pc-windows-msvc.zip"
 
 
 def retry(cmd: list[str], delays: tuple[int, ...] = (1, 2, 4, 8)) -> None:
@@ -83,6 +86,27 @@ def install_libuv(workdir: Path, python_prefix: Path) -> Path:
     return libuv_root
 
 
+def install_sccache(workdir: Path) -> dict[str, str]:
+    """Unpack sccache into a private directory and put it on PATH.
+
+    Returns the env diff for --env-out. CMake's USE_CCACHE block finds the
+    binary through its sccache fallback and wires the compiler launchers;
+    sccache itself keeps its cache in SCCACHE_DIR (pinned by the workflow).
+    """
+    sccache_dir = workdir / "sccache-bin"
+    sccache_dir.mkdir(parents=True, exist_ok=True)
+    archive = workdir / "sccache.zip"
+    download(SCCACHE_URL, archive)
+    # 7-Zip is preinstalled on the Windows CI runners.
+    subprocess.run(
+        ["7z", "x", "-aoa", str(archive), f"-o{sccache_dir}"], check=True
+    )
+    sccache_exe = sccache_dir / "sccache.exe"
+    if not sccache_exe.is_file():
+        sys.exit(f"sccache extraction did not produce {sccache_exe}")
+    return {"PATH": f"{sccache_dir};{os.environ.get('PATH', '')}"}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-out", type=Path)
@@ -90,9 +114,13 @@ def main() -> None:
 
     pip_install("-q", *PIP_PACKAGES)
 
+    env_out: dict[str, str] = {}
+    env_out.update(install_sccache(Path(__file__).resolve().parent))
+
     libuv_root = install_libuv(Path(__file__).resolve().parent, Path(sys.prefix))
 
-    write_env_exports({"libuv_ROOT": str(libuv_root)}, args.env_out)
+    env_out["libuv_ROOT"] = str(libuv_root)
+    write_env_exports(env_out, args.env_out)
     print(f"libuv_ROOT={libuv_root}")
     print("build_install_deps complete")
 
