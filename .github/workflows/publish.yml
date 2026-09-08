@@ -143,6 +143,7 @@ jobs:
         include: ${{ fromJSON(needs.define-wheel-matrix.outputs.cpu) }}
     permissions:
       contents: write
+      actions: read
     uses: ./.github/workflows/_binary-build-test.yml
     with:
       build_name: ${{ matrix.build_name }}
@@ -169,6 +170,7 @@ jobs:
         include: ${{ fromJSON(needs.define-wheel-matrix.outputs.cuda) }}
     permissions:
       contents: write
+      actions: read
     uses: ./.github/workflows/_binary-build-test.yml
     with:
       build_name: ${{ matrix.build_name }}

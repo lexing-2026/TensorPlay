@@ -35,6 +35,7 @@ jobs:
     # protected required check cannot be path-filtered safely.
     permissions:
       contents: read
+      actions: read
     uses: ./.github/workflows/_binary-build-test.yml
     with:
       build_name: tensorplay-cpu-operator
