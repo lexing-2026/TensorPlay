@@ -10,7 +10,7 @@
 #include "DataPtr.h"
 #include "Node.h" // For grad_fn
 #include "AccumulateGrad.h" // lazy grad_accumulator creation
-#include "Utils.h" // broadcast shape validation for indexed assignment
+#include "../../p10/include/Utils.h" // broadcast shape validation for indexed assignment
 #include "TypePromotion.h" // complex weak-scalar reflected-op dtype rules
 #include "ScalarOps.h" // wrapped_scalar_tensor for reflected Python scalars
 #include <mutex>
@@ -3483,7 +3483,8 @@ void init_tensor(py::module_& m) {
                 static_cast<std::vector<int64_t>>(self.shape());
             const std::vector<int64_t> strides = self.strides();
             std::vector<StridedElem> elems{
-                {self.data_ptr(), strides.data(), self.itemsize()}};
+                {self.data_ptr(), strides.data(),
+                 static_cast<int64_t>(self.itemsize())}};
             recursive_apply_elems(sizes, self.dtype(), 0, fn.ptr(), elems);
             return self_obj;
         }, "callable"_a)
@@ -3499,9 +3500,10 @@ void init_tensor(py::module_& m) {
             const std::vector<int64_t> strides = self.strides();
             const std::vector<int64_t> other_strides = other_exp.strides();
             std::vector<StridedElem> elems{
-                {self.data_ptr(), strides.data(), self.itemsize()},
+                {self.data_ptr(), strides.data(),
+                 static_cast<int64_t>(self.itemsize())},
                 {other_exp.data_ptr(), other_strides.data(),
-                 other_exp.itemsize()}};
+                 static_cast<int64_t>(other_exp.itemsize())}};
             recursive_apply_elems(sizes, self.dtype(), 0, fn.ptr(), elems);
             return self_obj;
         }, "tensor"_a, "callable"_a)
@@ -3520,9 +3522,12 @@ void init_tensor(py::module_& m) {
             const std::vector<int64_t> x_strides = x_exp.strides();
             const std::vector<int64_t> y_strides = y_exp.strides();
             std::vector<StridedElem> elems{
-                {self.data_ptr(), strides.data(), self.itemsize()},
-                {x_exp.data_ptr(), x_strides.data(), x_exp.itemsize()},
-                {y_exp.data_ptr(), y_strides.data(), y_exp.itemsize()}};
+                {self.data_ptr(), strides.data(),
+                 static_cast<int64_t>(self.itemsize())},
+                {x_exp.data_ptr(), x_strides.data(),
+                 static_cast<int64_t>(x_exp.itemsize())},
+                {y_exp.data_ptr(), y_strides.data(),
+                 static_cast<int64_t>(y_exp.itemsize())}};
             recursive_apply_elems(sizes, self.dtype(), 0, fn.ptr(), elems);
             return self_obj;
         }, "tensor1"_a, "tensor2"_a, "callable"_a)
