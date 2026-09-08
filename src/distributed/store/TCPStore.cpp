@@ -1,9 +1,14 @@
 #include "store/TCPStore.h"
 
 #if defined(_WIN32)
+// windows.h first: winnt.h refuses to compile without an architecture
+// target, which the toolchain headers only set up through this include.
+#include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <windows.h>
+// winerror.h defines ERROR as a macro; the Status::ERROR enumerator below
+// would expand through it.
+#undef ERROR
 #else
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -90,6 +95,36 @@ enum class Status : uint8_t {
   ERROR = 2,
 };
 
+// Socket API shims: Winsock's setsockopt/send/recv take char-typed buffers
+// and unsigned descriptor widths; the call sites below stay written against
+// the POSIX shapes and route through these overloads.
+#if defined(_WIN32)
+int socket_setsockopt(int fd, int level, int optname, const void* optval,
+                      socklen_t optlen) {
+  return ::setsockopt(fd, level, optname,
+                      static_cast<const char*>(optval),
+                      static_cast<int>(optlen));
+}
+int socket_send(int fd, const void* buf, size_t len, int flags) {
+  return ::send(fd, static_cast<const char*>(buf),
+                static_cast<int>(len), flags);
+}
+int socket_recv(int fd, void* buf, size_t len, int flags) {
+  return ::recv(fd, static_cast<char*>(buf), static_cast<int>(len), flags);
+}
+#else
+int socket_setsockopt(int fd, int level, int optname, const void* optval,
+                      socklen_t optlen) {
+  return ::setsockopt(fd, level, optname, optval, optlen);
+}
+int socket_send(int fd, const void* buf, size_t len, int flags) {
+  return ::send(fd, buf, len, flags);
+}
+int socket_recv(int fd, void* buf, size_t len, int flags) {
+  return ::recv(fd, buf, len, flags);
+}
+#endif
+
 bool setSocketTimeout(
     int fd,
     const std::chrono::milliseconds& timeout) {
@@ -103,13 +138,13 @@ bool setSocketTimeout(
       seconds, static_cast<int64_t>(std::numeric_limits<Seconds>::max())));
   value.tv_usec = static_cast<decltype(value.tv_usec)>(
       (timeout.count() % 1000) * 1000);
-  return ::setsockopt(
+  return socket_setsockopt(
              fd,
              SOL_SOCKET,
              SO_RCVTIMEO,
              &value,
              sizeof(value)) == 0 &&
-      ::setsockopt(
+      socket_setsockopt(
              fd,
              SOL_SOCKET,
              SO_SNDTIMEO,
@@ -121,7 +156,7 @@ bool sendAll(int fd, const void* buf, size_t len) {
   const auto* bytes = static_cast<const uint8_t*>(buf);
   size_t sent = 0;
   while (sent < len) {
-    Ssize n = ::send(fd, bytes + sent, len - sent, kMsgNoSignal);
+    Ssize n = socket_send(fd, bytes + sent, len - sent, kMsgNoSignal);
     if (n <= 0) {
       return false;
     }
@@ -142,7 +177,7 @@ bool recvAll(int fd, void* buf, size_t len) {
   auto* bytes = static_cast<uint8_t*>(buf);
   size_t got = 0;
   while (got < len) {
-    Ssize n = ::recv(fd, bytes + got, len - got, 0);
+    Ssize n = socket_recv(fd, bytes + got, len - got, 0);
     if (n <= 0) {
       return false;
     }
@@ -312,7 +347,7 @@ TCPStore::Server::Server(std::string host, uint16_t requestedPort) {
   listenFd_ = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
   TP_CHECK(listenFd_ >= 0, "TCPStore server: socket() failed");
   int reuse = 1;
-  ::setsockopt(
+  socket_setsockopt(
       listenFd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
   struct sockaddr_in addr{};
@@ -379,7 +414,7 @@ bool TCPStore::Server::readRequest(int fd, Request* request) {
 
 void TCPStore::Server::handleConnection(int fd) {
   int one = 1;
-  ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  socket_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stop_) {
