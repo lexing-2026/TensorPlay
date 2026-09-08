@@ -11,6 +11,7 @@ links the system OpenBLAS instead of the x86_64 MKL staging.
 import argparse
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -53,6 +54,13 @@ def main() -> None:
 
     os.chdir(args.package_dir)
     pip_install("-q", *BUILD_PACKAGES)
+
+    # The CMake build picks up ccache as a compiler launcher when it is on
+    # PATH; a persistent cache makes the second build of a lane far cheaper.
+    if shutil.which("ccache") is None:
+        apt_prefix = [] if os.geteuid() == 0 else ["sudo"]
+        retry(apt_prefix + ["apt-get", "update", "-qq"])
+        retry(apt_prefix + ["apt-get", "install", "-y", "-qq", "ccache"])
 
     if platform.machine() == "aarch64":
         # Redirection is shell syntax and must not leak into argv: an arg

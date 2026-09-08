@@ -96,6 +96,27 @@ jobs:
         shell: bash
         run: bash .github/scripts/restore-vendored-deps.sh
 
+      # Compiler cache lives outside the checkout: ccache on the POSIX
+      # runners (found by CMake on PATH), sccache on Windows. The cache
+      # key rolls per OS and CUDA variant so a hit never mixes toolchains;
+      # restore-keys fall back to the previous build of the same lane.
+      - name: Set compiler cache location
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux)  echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV" ;;
+            macOS)  echo "CCACHE_DIR=$HOME/Library/Caches/ccache" >> "$GITHUB_ENV" ;;
+            Windows) echo "SCCACHE_DIR=$HOME/.cache/sccache" >> "$GITHUB_ENV" ;;
+          esac
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.os == 'Windows' && env.SCCACHE_DIR || env.CCACHE_DIR }}
+          key: buildcache-${{ runner.os }}-${{ inputs.cuda }}-${{ github.sha }}
+          restore-keys: |
+            buildcache-${{ runner.os }}-${{ inputs.cuda }}-
+
       # Release tags pin the exact version. CUDA wheels use a local version
       # suffix so CPU and CUDA files can coexist in one GitHub Release.
       - name: Set TENSORPLAY_BUILD_VERSION on release tags
@@ -153,13 +174,32 @@ jobs:
           GPU_ARCH_TYPE: ${{ inputs.cuda != 'cpu' && 'cuda' || 'cpu' }}
           SKBUILD_CMAKE_DEFINE: >-
             ${{ inputs.cuda != 'cpu' && 'USE_CUDA=ON' || 'USE_CUDA=OFF' }};USE_MPI=OFF
+          MAX_JOBS: ${{ runner.os == 'Windows' && '3' || '' }}
+          CCACHE_MAXSIZE: 2G
+          SCCACHE_CACHE_SIZE: 5G
         run: |
+          # Leave the driving shell and I/O a core of headroom; fat device
+          # compiles push memory hard at full parallelism.
+          if [[ "$RUNNER_OS" != "Windows" ]]; then
+            export MAX_JOBS="$(($(nproc) - 1))"
+          fi
           case "$RUNNER_OS" in
             Linux)  bash .github/ci/linux/build.sh ;;
             macOS)  bash .github/ci/macos/build.sh ;;
             Windows) bash .github/ci/windows/build.sh dist ;;
             *) echo "Unsupported runner OS: $RUNNER_OS" >&2; exit 1 ;;
           esac
+
+      - name: Compiler cache statistics
+        if: always()
+        shell: bash
+        run: |
+          if command -v ccache >/dev/null 2>&1; then
+            ccache --show-stats || true
+          fi
+          if command -v sccache >/dev/null 2>&1; then
+            sccache --show-stats || true
+          fi
 
       - name: Install built wheel
         shell: bash
@@ -292,3 +332,12 @@ jobs:
           gh release upload "$release" dist/*.whl \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
+          # The rolling channel keeps only the newest dev build per wheel
+          # tag: without the prune, superseded wheels linger and consumers
+          # globbing a wheel pattern get several mutually exclusive
+          # versions at once.
+          if [[ "$release" == "nightly" ]]; then
+            python .github/scripts/prune_superseded_wheels.py \
+              --repo "$GITHUB_REPOSITORY" \
+              --release nightly
+          fi
