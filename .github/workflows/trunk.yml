@@ -167,10 +167,11 @@ jobs:
     # CI/docs-only pushes publish no new wheel; skip the build matrix.
     if: needs.define-wheel-matrix.outputs.build_skip != 'true'
     permissions:
-      # The called workflow's build-test job needs contents: write to
-      # upload wheels to a GitHub Release on tag builds; the job-level grant
+      # The called workflow's release job needs contents: write to upload
+      # wheels to a GitHub Release on tag builds; the job-level grant
       # here keeps the top-level read-all default untouched.
       contents: write
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -203,6 +204,7 @@ jobs:
     needs: define-wheel-matrix
     permissions:
       contents: write
+      actions: read
     strategy:
       fail-fast: false
       matrix:
