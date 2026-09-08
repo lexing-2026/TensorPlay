@@ -5,6 +5,7 @@
 //   alpha = (L - 1) / 2 with L incremented for periodic windows.
 
 #include "CompositeCommon.h"
+#include "SpecialMath.h"
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
@@ -123,7 +124,10 @@ Tensor kaiser_window_impl(int64_t window_length, bool periodic, double beta,
     const Tensor x2 = ops::mul(x, x);
     const Tensor rad = ops::sqrt(ops::abs(ops::neg(ops::sub(x2, Scalar(1)))));
     const Tensor arg = ops::mul(rad, Scalar(beta));
-    const double denom = std::cyl_bessel_i(0.0, beta);
+    // Normalization uses the modified Bessel of the first kind at beta;
+    // the Chebyshev evaluation holds over the whole range and is not
+    // gated on the standard library providing the special-math overloads.
+    const double denom = tensorplay::special_math::modified_bessel_i0_forward(beta);
     Tensor window = ops::div(ops::i0(arg), Scalar(denom));
     if (periodic) window = ops::narrow(window, 0, 0, window_length);
     return window;
