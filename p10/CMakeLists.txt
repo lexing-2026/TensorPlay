@@ -368,7 +368,9 @@ if(USE_VULKAN)
         ${TP_VULKAN_GEN_CPP}
     )
 endif()
-set_source_files_properties(${GEN_CPP} PROPERTIES GENERATED TRUE)
+set_source_files_properties(${GEN_CPP} ${GEN_TPX_OPS_CPP}
+    ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN_AUTOCAST_CPP}
+    PROPERTIES GENERATED TRUE)
 # ------------------------------------------------------------------
 # CPU kernel multi-version compilation (DEFAULT + AVX2)
 # ------------------------------------------------------------------
