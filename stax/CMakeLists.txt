@@ -12,7 +12,11 @@ target_include_directories(stax PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 
-target_compile_definitions(stax PRIVATE STAX_EXPORTS)
+# Static library: the Export.h header must expand STAX_API to nothing, the
+# same contract the shared p10 library satisfies through its real export
+# define. stax_EXPORTS is only defined by CMake for shared libraries, so the
+# static branch is pinned explicitly here.
+target_compile_definitions(stax PRIVATE TP_STATIC_BUILD)
 
 target_link_libraries(stax PUBLIC p10)
 
