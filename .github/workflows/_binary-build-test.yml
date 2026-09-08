@@ -287,7 +287,7 @@ jobs:
           print("CUDA wheel import ok:", getattr(tp, "__version__", "ok"))
           PY
 
-      - name: Run CPU core regression tests
+      - name: Run CPU regression tests
         if: ${{ inputs.cuda == 'cpu' }}
         shell: bash
         env:
@@ -306,11 +306,11 @@ jobs:
             --junitxml="$result_root/junit.xml" \
             2>&1 | tee "$result_root/pytest.log"
 
-      - name: Upload core test results
+      - name: Upload CPU test results
         if: ${{ always() && inputs.cuda == 'cpu' }}
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ inputs.build_name }}-core-tests-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ inputs.build_name }}-tests-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ci-test-results/
           retention-days: 7
           if-no-files-found: warn
