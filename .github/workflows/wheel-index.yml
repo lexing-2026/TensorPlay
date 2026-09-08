@@ -81,6 +81,7 @@ jobs:
         shell: bash
         env:
           DISPATCH_TOKEN: ${{ secrets.INDEX_REPO_TOKEN }}
+          SOURCE_REF: ${{ github.event.release.tag_name || github.sha }}
         run: |
           set -euo pipefail
           if [[ -z "${DISPATCH_TOKEN}" ]]; then
@@ -91,5 +92,6 @@ jobs:
             -X POST \
             "repos/${INDEX_REPO}/dispatches" \
             -f event_type="wheel-publish" \
+            -f "client_payload[source_ref]=${SOURCE_REF}" \
             -H "Authorization: Bearer ${DISPATCH_TOKEN}"
           echo "Dispatched wheel-publish to ${INDEX_REPO}"

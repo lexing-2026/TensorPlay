@@ -53,10 +53,12 @@ def prune(repo: str, release: str) -> None:
         "--jq",
         r'.assets[] | "\(.id) \(.name)"',
     )
+    asset_ids: dict[str, str] = {}
     groups: dict[tuple[str, str], list[tuple[str, str]]] = {}
     unparsed: list[tuple[str, str]] = []
     for line in listing.splitlines():
         asset_id, _, name = line.strip().partition(" ")
+        asset_ids[name] = asset_id
         match = WHEEL_RE.match(name)
         if match is None:
             unparsed.append((asset_id, name))
@@ -81,6 +83,21 @@ def prune(repo: str, release: str) -> None:
             )
             if result.returncode == 0:
                 print(f"pruned {name} (superseded by {newest} for +{variant}-{rest})")
+                sidecar_name = f"{name}.sigstore.json"
+                sidecar_id = asset_ids.get(sidecar_name)
+                if sidecar_id:
+                    sidecar_result = subprocess.run(
+                        ["gh", "api", "-X", "DELETE", f"repos/{repo}/releases/assets/{sidecar_id}"],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if sidecar_result.returncode == 0:
+                        print(f"pruned {sidecar_name} with {name}")
+                    else:
+                        print(
+                            f"failed to prune {sidecar_name}: {sidecar_result.stderr.strip()}",
+                            file=sys.stderr,
+                        )
             else:
                 print(
                     f"failed to prune {name}: {result.stderr.strip()}",

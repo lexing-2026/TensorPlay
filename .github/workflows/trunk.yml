@@ -172,6 +172,8 @@ jobs:
       # here keeps the top-level read-all default untouched.
       contents: write
       actions: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -205,6 +207,8 @@ jobs:
     permissions:
       contents: write
       actions: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:

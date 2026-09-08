@@ -275,6 +275,8 @@ jobs:
     permissions:
       contents: write
       actions: read
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/_binary-build-test.yml
     with:
       build_name: ${{ matrix.build_name }}
@@ -308,6 +310,8 @@ jobs:
     permissions:
       contents: write
       actions: read
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/_binary-build-test.yml
     with:
       build_name: ${{ matrix.build_name }}

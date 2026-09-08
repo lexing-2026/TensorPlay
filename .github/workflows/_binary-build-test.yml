@@ -404,6 +404,8 @@ jobs:
     permissions:
       contents: write
       actions: read
+      id-token: write
+      attestations: write
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
@@ -416,6 +418,22 @@ jobs:
         with:
           name: tensorplay-wheel-${{ inputs.build_environment }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist
+
+      - name: Generate Sigstore build provenance
+        id: provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/*.whl
+
+      - name: Store Sigstore bundle beside wheel
+        shell: bash
+        env:
+          BUNDLE_PATH: ${{ steps.provenance.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          wheel="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          [[ -n "$wheel" ]]
+          cp "$BUNDLE_PATH" "${wheel}.sigstore.json"
 
       - name: Upload tested wheel to GitHub Release
         shell: bash
@@ -439,7 +457,7 @@ jobs:
           else
             release="$GITHUB_REF_NAME"
           fi
-          gh release upload "$release" dist/*.whl \
+          gh release upload "$release" dist/*.whl dist/*.sigstore.json \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
           # The rolling channel keeps only the newest dev build per wheel
