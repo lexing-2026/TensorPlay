@@ -26,3 +26,4 @@ jobs:
       build_environment: pull-smoke-linux-x86_64-py3_12
       runs_on: ubuntu-22.04
       python_version: "3.12"
+      test_matrix: '[{"name":"native-sparse","test_files":"test/test_set_native.py test/test_compressed_sparse_constructors.py"},{"name":"nn-utils","test_files":"test/test_nn_utils_norm.py"}]'
