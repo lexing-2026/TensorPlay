@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <direct.h>
 #include <fileapi.h>
+#include <fcntl.h>
 #include <io.h>
 #else
 #include <fcntl.h>
@@ -50,20 +51,22 @@ long file_seek_end(int fd) { return _lseek(fd, 0, SEEK_END); }
 int file_mkdir(const char* path) { return _mkdir(path); }
 
 // Whole-file advisory lock via LockFileEx; blocking unless the flag says
-// otherwise, matching flock's semantics for LOCK_EX / LOCK_SH / LOCK_UN.
+// otherwise, matching flock's semantics for exclusive / shared / unlock.
+// The lock op codes below are private spellings (flock's bit layout is not
+// portable), translated here once.
+constexpr int kLockEx = 1;  // distinct values; mapped through file_flock only
+constexpr int kLockSh = 2;
+constexpr int kLockUn = 3;
+
 int file_flock(int fd, int operation) {
   void* handle = reinterpret_cast<void*>(_get_osfhandle(fd));
   OVERLAPPED overlapped{};
-  if (operation & LOCK_UN) {
+  if (operation == kLockUn) {
     return UnlockFileEx(handle, 0, 1, 0, &overlapped) ? 0 : -1;
   }
-  DWORD flags = operation & LOCK_EX ? LOCKFILE_EXCLUSIVE_LOCK : 0;
+  DWORD flags = operation == kLockEx ? LOCKFILE_EXCLUSIVE_LOCK : 0;
   return LockFileEx(handle, flags, 0, 1, 0, &overlapped) ? 0 : -1;
 }
-
-constexpr int kLockEx = 10;  // distinct values; mapped through file_flock only
-constexpr int kLockSh = 20;
-constexpr int kLockUn = 30;
 
 } // namespace
 #else
@@ -83,7 +86,7 @@ constexpr int kOpenAppend = O_APPEND;
 int file_open(const char* path, int flags, int mode = 0) {
   return ::open(path, flags, mode);
 }
-int file_close(int fd) { return file_close(fd); }
+int file_close(int fd) { return ::close(fd); }
 Ssize file_write(int fd, const void* buf, size_t len) {
   return ::write(fd, buf, len);
 }
@@ -94,7 +97,6 @@ int file_flock(int fd, int operation) { return ::flock(fd, operation); }
 constexpr int kLockEx = LOCK_EX;
 constexpr int kLockSh = LOCK_SH;
 constexpr int kLockUn = LOCK_UN;
-
 } // namespace
 #endif
 
