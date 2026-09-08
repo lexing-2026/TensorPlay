@@ -143,6 +143,11 @@ jobs:
           node-version: "22"
 
       - name: Render docs into the website
+        # The generator lives in the website repository's scripts/, and its
+        # repo-root detection is relative to the script location, so run it
+        # from the website checkout; the Sphinx output is consumed through
+        # the absolute TENSORPLAY_DOCS_BUILD path.
+        working-directory: website
         env:
           RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
           TENSORPLAY_DOCS_BUILD: ${{ github.workspace }}/docs-html
