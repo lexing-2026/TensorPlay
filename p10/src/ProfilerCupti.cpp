@@ -497,7 +497,7 @@ TENSORPLAY_API uint32_t cupti_version() {
         if (g_fns->GetVersion(&ver) == CUPTI_SUCCESS) return ver;
         return 0;
     }
-    void* lib = g_cupti_lib;
+    DlHandle lib = g_cupti_lib;
     if (lib == nullptr) {
         std::vector<DllCandidate> candidates;
         collect_dll_candidates(candidates);
