@@ -98,7 +98,8 @@ jobs:
 
       # Compiler cache lives outside the checkout: ccache on the POSIX
       # runners (found by CMake on PATH), sccache on Windows. The cache
-      # key rolls per OS and CUDA variant so a hit never mixes toolchains;
+      # scope includes runner architecture, build lane, Python version, and
+      # variant so native objects never cross incompatible task environments;
       # restore-keys fall back to the previous build of the same lane.
       - name: Set compiler cache location
         shell: bash
@@ -110,12 +111,13 @@ jobs:
           esac
 
       - name: Restore compiler cache
+        id: compiler-cache
         uses: actions/cache@v6
         with:
           path: ${{ runner.os == 'Windows' && env.SCCACHE_DIR || env.CCACHE_DIR }}
-          key: buildcache-${{ runner.os }}-${{ inputs.cuda }}-${{ github.sha }}
+          key: buildcache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.build_environment }}-${{ inputs.python_version }}-${{ inputs.cuda }}-${{ github.sha }}
           restore-keys: |
-            buildcache-${{ runner.os }}-${{ inputs.cuda }}-
+            buildcache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.build_environment }}-${{ inputs.python_version }}-${{ inputs.cuda }}-
 
       # Release tags pin the exact version. CUDA wheels use a local version
       # suffix so CPU and CUDA files can coexist in one GitHub Release.
@@ -160,6 +162,8 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ inputs.python_version }}
+          cache: pip
+          cache-dependency-path: requirements-build.txt
 
       # This installs the compiler/toolkit only. Free GitHub-hosted runners
       # have no GPU, so CUDA kernels are never executed in this workflow.
@@ -196,6 +200,7 @@ jobs:
         if: always()
         shell: bash
         run: |
+          echo "Exact compiler cache hit: ${{ steps.compiler-cache.outputs.cache-hit }}"
           if command -v ccache >/dev/null 2>&1; then
             ccache --show-stats || true
           fi
