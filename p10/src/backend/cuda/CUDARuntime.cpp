@@ -240,7 +240,7 @@ CUDAStream getCurrentCUDAStream(int device_index) {
 }
 
 void setCurrentCUDAStream(const CUDAStream& stream) {
-    setCurrentStreamRaw(stream.device_index_, stream.stream_);
+    setCurrentStreamRaw(stream.device_index(), stream.stream());
 }
 
 CUDAStreamGuard::CUDAStreamGuard(const CUDAStream& stream) {

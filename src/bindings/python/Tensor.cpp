@@ -541,8 +541,9 @@ static void set_storage_from_shm(Tensor& self, py::object shm, size_t nbytes) {
 
 // Normalize a Python slice against a length (py::slice::compute, i.e. PySlice_GetIndicesEx)
 static std::tuple<int64_t, int64_t, int64_t, int64_t> compute_slice(py::slice s, int64_t length) {
-    ssize_t start, stop, step, slicelength;
-    if (!s.compute((ssize_t)length, &start, &stop, &step, &slicelength)) {
+    Py_ssize_t start, stop, step, slicelength;
+    if (!s.compute(static_cast<Py_ssize_t>(length), &start, &stop, &step,
+                   &slicelength)) {
         throw py::error_already_set();
     }
     return {start, stop, step, slicelength};
