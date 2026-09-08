@@ -250,8 +250,8 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-build.txt
 
-      - name: Install ARM Linux CPU runtime dependencies
-        if: ${{ inputs.cuda == 'cpu' && runner.os == 'Linux' && runner.arch == 'ARM64' }}
+      - name: Install Linux CPU runtime dependencies
+        if: ${{ inputs.cuda == 'cpu' && runner.os == 'Linux' }}
         shell: bash
         run: |
           sudo apt-get update -qq
