@@ -250,6 +250,13 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-build.txt
 
+      - name: Install ARM Linux CPU runtime dependencies
+        if: ${{ inputs.cuda == 'cpu' && runner.os == 'Linux' && runner.arch == 'ARM64' }}
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libopenblas0
+
       - name: Download built wheel
         uses: actions/download-artifact@v8
         with:
