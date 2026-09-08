@@ -32,6 +32,11 @@ def _ensure_device(device):
 _MISSING = object()
 '''
 
+_VARIADIC_TENSOR_LIST_FUNCTIONS = frozenset({
+    'atleast_1d', 'atleast_2d', 'atleast_3d',
+    'block_diag', 'broadcast_tensors', 'cartesian_prod', 'chain_matmul',
+})
+
 
 def _param_name(a) -> str:
     name = a.python_name
@@ -544,9 +549,19 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
             # chain_matmul(m1, m2, m3) would demand a single list argument.
             if (len(f.args) == 1 and f.args[0].type.is_tensor_like
                     and f.args[0].type.is_list):
-                lines.append(f'def {name}(*args):')
-                _capture_line(lines, name, ['*args'])
-                lines.append(f'    return _C.{name}(*args)')
+                if name == 'chain_matmul' and out_variant is not None:
+                    lines.append(f'def {name}(*args, out=None):')
+                    _capture_line(lines, name, ['*args'], ['out'])
+                    lines.append('    if out is None:')
+                    lines.append(f'        return _C.{name}(list(args))')
+                    lines.append(f'    return _C.{name}(list(args), out=out)')
+                else:
+                    lines.append(f'def {name}(*args):')
+                    _capture_line(lines, name, ['*args'])
+                    if name in _VARIADIC_TENSOR_LIST_FUNCTIONS:
+                        lines.append(f'    return _C.{name}(list(args))')
+                    else:
+                        lines.append(f'    return _C.{name}(*args)')
                 lines.append('')
                 continue
 
@@ -764,7 +779,13 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                 # Tensor[] candidate (atleast_2d(t) vs atleast_2d(t1, t2)).
                 lines.append(f'def {name}(*args):')
                 _capture_line(lines, name, ['*args'])
-                lines.append(f'    return _C.{name}(*args)')
+                if name in {'atleast_1d', 'atleast_2d', 'atleast_3d'}:
+                    lines.append('    if len(args) == 1:')
+                    lines.append(f'        return _C.{name}(args[0])')
+                if name in _VARIADIC_TENSOR_LIST_FUNCTIONS:
+                    lines.append(f'    return _C.{name}(list(args))')
+                else:
+                    lines.append(f'    return _C.{name}(*args)')
                 lines.append('')
                 continue
 
