@@ -2,8 +2,8 @@ name: publish
 
 # Release orchestrator: on a v*.*.0 tag, build the configured wheel matrix,
 # validate every wheel, publish CPU wheels to PyPI via trusted publishing, and
-# publish every configured CUDA variant through GitHub Releases plus the
-# pypi-pages branch consumed by Cloudflare Pages.
+# publish every configured CUDA variant through GitHub Releases; the
+# wheel-index workflow then triggers the download-site rebuild.
 #
 # Release candidates (v*.*.0-rc*) run the same matrix and create a GitHub
 # *prerelease*, but never touch PyPI or the stable wheel indexes (see
@@ -215,18 +215,3 @@ jobs:
 
       - name: Publish CPU wheels to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-
-  cuda-upload:
-    # Publish one complete static index to the branch tracked by Pages --
-    # stable releases only, never release candidates.
-    if: needs.define-wheel-matrix.outputs.stable_tag == 'true'
-    needs:
-      - define-wheel-matrix
-      - cuda-build
-    uses: ./.github/workflows/_cuda-upload.yml
-    permissions:
-      contents: write
-    with:
-      build_environment: release
-      cuda_variants_json: ${{ needs.define-wheel-matrix.outputs.variants }}
-      pages_branch: pypi-pages

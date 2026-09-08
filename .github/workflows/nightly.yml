@@ -4,8 +4,8 @@ name: nightly
 # branch head, following the X.Y.0.dev<UTC date>[+cuXXX|+cpu] version rule
 # computed by tools/generate_tensorplay_version.py. Wheels land on the
 # rolling "nightly" GitHub Release, and the wheel-index workflow
-# republishes the whl/nightly/<variant>/ indexes on pypi-pages from
-# release events. Only the newest dev version per variant is retained.
+# triggers the download-site rebuild from release events. Only the
+# newest dev version per variant is retained.
 #
 # workflow_dispatch stays available for manual retries of a failed matrix
 # leg or off-schedule builds; the version/build_number/filters inputs
