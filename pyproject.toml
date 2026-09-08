@@ -110,6 +110,22 @@ exclude = [
     "build/**",
 ]
 
+[[tool.scikit-build.overrides]]
+# Force the Ninja generator on Windows. The Visual Studio (multi-config)
+# generator marshals nvcc's host-compiler flag groups differently: the
+# quoted -Xcompiler block arrives split, so nvcc reads the group's tokens
+# as input files and aborts with "A single input file is required". Ninja
+# passes the command line the way CMake wrote it. Generator resolution
+# honors cmake.define.CMAKE_GENERATOR, so this is the single source of
+# truth (and covers plain non-CI editable builds too) instead of a
+# CI-exported env var. Under Ninja, CMake does not default to MSVC, so
+# CC/CXX are pinned to cl to keep the host build on MSVC; setdefault
+# semantics respect an explicitly set CC/CXX (e.g. clang-cl).
+if.platform-system = "win32"
+cmake.define.CMAKE_GENERATOR = "Ninja"
+env.CC = "cl"
+env.CXX = "cl"
+
 [tool.scikit-build.wheel]
 # Python packages to include in the wheel; CMake installs the built
 # libraries/stubs under tensorplay/ relative to the wheel root.
