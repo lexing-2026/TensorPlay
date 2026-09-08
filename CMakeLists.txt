@@ -261,10 +261,10 @@ if(WIN32)
         # /wd...: Suppress warnings
         # /MP: Multi-processor compilation
         # /Gm-: Disable minimal rebuild
-        set(MSVC_COMMON_FLAGS /EHsc /wd4251 /wd4275 /wd4819 /MP /Gm-)
+        set(MSVC_COMMON_FLAGS /EHsc /bigobj /wd4251 /wd4275 /wd4819 /MP /Gm-)
         # /MP tells cl to expect several input files; nvcc's host compile
         # always passes exactly one, so the flag must stay CXX-only.
-        set(MSVC_CUDA_HOST_FLAGS /EHsc /wd4251 /wd4275 /wd4819 /Gm-)
+        set(MSVC_CUDA_HOST_FLAGS /EHsc /bigobj /wd4251 /wd4275 /wd4819 /Gm-)
         # MSVC logs these classes on nearly every third-party template
         # instantiation; none of them is actionable in our code here:
         # 4624 implicitly-deleted destructor, 4068 unknown pragma,

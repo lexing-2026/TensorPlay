@@ -1,10 +1,12 @@
 #include "store/FileStore.h"
 
 #if defined(_WIN32)
+// windows.h first: winnt.h refuses to compile without an architecture
+// target, which the toolchain headers only set up through this include.
+#include <windows.h>
 #include <direct.h>
 #include <fileapi.h>
 #include <io.h>
-#include <windows.h>
 #else
 #include <fcntl.h>
 #include <sys/file.h>
