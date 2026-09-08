@@ -265,6 +265,17 @@ if(WIN32)
         # /MP tells cl to expect several input files; nvcc's host compile
         # always passes exactly one, so the flag must stay CXX-only.
         set(MSVC_CUDA_HOST_FLAGS /EHsc /wd4251 /wd4275 /wd4819 /Gm-)
+        # MSVC logs these classes on nearly every third-party template
+        # instantiation; none of them is actionable in our code here:
+        # 4624 implicitly-deleted destructor, 4068 unknown pragma,
+        # 4067 unexpected tokens after a directive, 4267 size_t width,
+        # 4661 unsatisfied explicit instantiation, 4717 recursive control
+        # paths, 4244/4804 numeric conversions, 4273 dll-linkage.
+        set(MSVC_SUPPRESSED_WARNINGS
+            /wd4624 /wd4068 /wd4067 /wd4267 /wd4661 /wd4717
+            /wd4244 /wd4804 /wd4273)
+        list(APPEND MSVC_COMMON_FLAGS ${MSVC_SUPPRESSED_WARNINGS})
+        list(APPEND MSVC_CUDA_HOST_FLAGS ${MSVC_SUPPRESSED_WARNINGS})
         # M_PI and friends are gated behind this define on MSVC
         add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:_USE_MATH_DEFINES>)
         # windows.h must not inject the min/max macros (they break
@@ -294,11 +305,35 @@ if(WIN32)
 
     endif()
 else()
-    string(APPEND CMAKE_CXX_FLAGS " -std=c++20 -O3 -Wall -Wextra -Wpedantic")
+    # Diagnostics: the -Wno-* list keeps noisy-but-harmless classes out of
+    # the build log. Callback-style internal interfaces legitimately leave
+    # parameters unused; array-bounds / strict-overflow / strict-aliasing
+    # fire false positives on our vector headers and generated code.
+    string(APPEND CMAKE_CXX_FLAGS " -std=c++20 -O3 -Wall -Wextra")
+    string(APPEND CMAKE_CXX_FLAGS " -Wno-unused-parameter")
+    string(APPEND CMAKE_CXX_FLAGS " -Wno-missing-field-initializers")
+    string(APPEND CMAKE_CXX_FLAGS " -Wno-array-bounds")
+    string(APPEND CMAKE_CXX_FLAGS " -Wno-unknown-pragmas")
+    string(APPEND CMAKE_CXX_FLAGS " -Wno-strict-overflow")
+    string(APPEND CMAKE_CXX_FLAGS " -Wno-strict-aliasing")
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
         string(APPEND CMAKE_CXX_FLAGS " -fPIC")
     endif()
 endif()
+
+# Vendored trees compile with the toolchain's default diagnostic level: the
+# project warning flags target our own sources, and third-party code would
+# only flood the build log with noise nobody acts on here.
+macro(tp_add_third_party DIRECTORY)
+    set(_TP_CXX_FLAGS_SAVED "${CMAKE_CXX_FLAGS}")
+    if(MSVC)
+        string(APPEND CMAKE_CXX_FLAGS " /w")
+    else()
+        string(APPEND CMAKE_CXX_FLAGS " -w")
+    endif()
+    add_subdirectory(${DIRECTORY} ${ARGN})
+    set(CMAKE_CXX_FLAGS "${_TP_CXX_FLAGS_SAVED}")
+endmacro()
 
 include_directories(include)
 
@@ -1070,10 +1105,10 @@ set(GLOO_STATIC_OR_SHARED STATIC CACHE STRING "" FORCE)
 # Gloo builds CPU-only, but its USE_CUDA knob lives in the global namespace:
 # save the project's own switch and restore it after the subdirectory, or a
 # fresh configure silently turns the whole CUDA build off.
-set(TP_GLOO_USE_CUDA_SAVE "${USE_CUDA}")
-set(USE_CUDA OFF CACHE BOOL "" FORCE)
-add_subdirectory(third_party/gloo)
-set(USE_CUDA "${TP_GLOO_USE_CUDA_SAVE}" CACHE BOOL "" FORCE)
+    set(TP_GLOO_USE_CUDA_SAVE "${USE_CUDA}")
+    set(USE_CUDA OFF CACHE BOOL "" FORCE)
+    tp_add_third_party(third_party/gloo)
+    set(USE_CUDA "${TP_GLOO_USE_CUDA_SAVE}" CACHE BOOL "" FORCE)
 set(USE_RCCL "${TP_GLOO_USE_RCCL_SAVE}")
 set(USE_RCCL "${TP_GLOO_USE_RCCL_SAVE}" CACHE BOOL "" FORCE)
 endif()
@@ -1084,13 +1119,13 @@ set(TP_BUILD_LIBUV OFF CACHE BOOL "" FORCE)
 set(TP_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
 set(TP_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(TP_BUILD_MISC OFF CACHE BOOL "" FORCE)
-set(TP_BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
-set(TP_STATIC_OR_SHARED STATIC CACHE STRING "" FORCE)
-add_subdirectory(
-    third_party/tensorpipe
-    third_party/tensorpipe-build
-    EXCLUDE_FROM_ALL)
-set_target_properties(tensorpipe PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    set(TP_BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
+    set(TP_STATIC_OR_SHARED STATIC CACHE STRING "" FORCE)
+    tp_add_third_party(
+        third_party/tensorpipe
+        third_party/tensorpipe-build
+        EXCLUDE_FROM_ALL)
+    set_target_properties(tensorpipe PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(TARGET tensorpipe_cuda)
     set_target_properties(tensorpipe_cuda PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
