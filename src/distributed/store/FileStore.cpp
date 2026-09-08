@@ -26,8 +26,8 @@ namespace tensorplay {
 namespace distributed {
 
 #if defined(_WIN32)
-// Thin POSIX-shape wrappers over the Win32 file APIs, following the c10d
-// FileStore arrangement: same call sites, platform-specific only here.
+// Thin POSIX-shape wrappers over the native file APIs keep platform-specific
+// details inside this branch while the store operations share their call sites.
 namespace {
 
 using Ssize = int;
