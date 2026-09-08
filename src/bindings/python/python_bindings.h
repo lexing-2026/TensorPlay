@@ -57,11 +57,15 @@ void init_scalar(py::module_& m);
 void init_symint(py::module_& m);
 void init_stax(py::module_& m);
 void init_parallel(py::module_& m);
+#ifdef TP_USE_DISTRIBUTED
 void init_distributed(py::module_& m);
+#endif
 void init_cuda_graph(py::module_& m);
 void init_futures(py::module_& m);
+#ifdef TP_USE_RPC
 void init_rpc(py::module_& m);
 void init_distributed_autograd(py::module_& m);
+#endif
 
 namespace tensorplay {
 class Exception;
