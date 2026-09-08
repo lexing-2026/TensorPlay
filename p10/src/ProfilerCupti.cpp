@@ -86,11 +86,36 @@ namespace {
 #if defined(_WIN32)
 using DlHandle = HMODULE;
 
+DlHandle dl_open(const char* name) { return LoadLibraryA(name); }
+void* dl_sym(DlHandle h, const char* n) {
+    return reinterpret_cast<void*>(GetProcAddress(h, n));
+}
+void dl_close(DlHandle h) { FreeLibrary(h); }
+std::string dl_error_text() {
+    return "LoadLibraryA failed for every CUPTI runtime candidate";
+}
+#else
+using DlHandle = void*;
+
+DlHandle dl_open(const char* name) {
+    return dlopen(name, RTLD_LAZY | RTLD_LOCAL);
+}
+void* dl_sym(DlHandle h, const char* n) { return dlsym(h, n); }
+void dl_close(DlHandle h) { dlclose(h); }
+std::string dl_error_text() {
+    const char* err = dlerror();
+    return err != nullptr ? err : "dlopen failed";
+}
+#endif
+
+// Platform-neutral candidate record: a load path plus the module name the
+// loader registers it under (needed by the no-load availability probe).
 struct DllCandidate {
-    std::string path;  // full path for LoadLibraryA
-    std::string name;  // file name for GetModuleHandle-style probes
+    std::string path;
+    std::string name;
 };
 
+#if defined(_WIN32)
 // Enumerate <CUDA_PATH>/bin/cupti64_*.dll (newest revision first) plus the
 // legacy bare cupti64.dll. The bare name at the end loads through the
 // standard DLL search path, covering toolkits on PATH without CUDA_PATH.
@@ -123,26 +148,16 @@ bool collect_dll_candidates(std::vector<DllCandidate>& out) {
     out.push_back({"cupti64.dll", "cupti64.dll"});
     return true;
 }
-
-DlHandle dl_open(const char* name) { return LoadLibraryA(name); }
-void* dl_sym(DlHandle h, const char* n) {
-    return reinterpret_cast<void*>(GetProcAddress(h, n));
-}
-void dl_close(DlHandle h) { FreeLibrary(h); }
-std::string dl_error_text() {
-    return "LoadLibraryA failed for every CUPTI runtime candidate";
-}
 #else
-using DlHandle = void*;
-
-DlHandle dl_open(const char* name) {
-    return dlopen(name, RTLD_LAZY | RTLD_LOCAL);
-}
-void* dl_sym(DlHandle h, const char* n) { return dlsym(h, n); }
-void dl_close(DlHandle h) { dlclose(h); }
-std::string dl_error_text() {
-    const char* err = dlerror();
-    return err != nullptr ? err : "dlopen failed";
+// Major-line sonames, newest first; the unversioned name catches distros
+// that ship libcupti without a linker-managed version suffix.
+bool collect_dll_candidates(std::vector<DllCandidate>& out) {
+    for (const char* soname : {"libcupti.so.13", "libcupti.so.12",
+                               "libcupti.so.11", "libcupti.so.1",
+                               "libcupti.so"}) {
+        out.push_back({soname, soname});
+    }
+    return true;
 }
 #endif
 

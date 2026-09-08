@@ -14,7 +14,9 @@
 namespace tensorplay {
 namespace tpx {
 
-thread_local int Engine::nested_depth_ = 0;
+thread_local int g_nested_depth = 0;
+
+int& Engine::nested_depth() { return g_nested_depth; }
 
 namespace {
 thread_local GraphTask* current_graph_task = nullptr;
@@ -679,7 +681,7 @@ variable_list Engine::execute(const edge_list& root_edges, const variable_list& 
         graph_task.init_to_execute(*graph_root, outputs, accumulate_grad, min_topo_nr);
     }
 
-    const bool nested = nested_depth_ > 0;
+    const bool nested = nested_depth() > 0;
 
     // Queue the root. In nested mode every task stays on a local queue that
     // only this thread drains, so reentrant backward can never deadlock
@@ -698,7 +700,7 @@ variable_list Engine::execute(const edge_list& root_edges, const variable_list& 
                      cpu_queue, nested ? &local_queue : nullptr);
     }
 
-    DepthGuard depth_guard(nested_depth_);
+    DepthGuard depth_guard(nested_depth());
     TP_ENGINE_TRACE(nested ? "execute nested" : "execute top-level");
     if (nested) {
         while (!graph_task.is_completed()) {

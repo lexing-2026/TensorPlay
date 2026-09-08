@@ -1,5 +1,10 @@
 #include "store/TCPStore.h"
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#else
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -7,6 +12,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -23,6 +29,42 @@
 
 namespace tensorplay {
 namespace distributed {
+
+#if defined(_WIN32)
+// Winsock2 keeps the BSD-socket call shapes; only the type spellings and
+// process-wide initialization differ. Descriptors stay `int` (SOCKET values
+// fit and INVALID_SOCKET maps to -1), so every call site keeps its shape.
+namespace {
+
+using Ssize = int;
+
+void winsock_init() {
+  static const bool ready = [] {
+    WSADATA data{};
+    return WSAStartup(MAKEWORD(2, 2), &data) == 0;
+  }();
+  (void)ready;
+}
+
+int close_socket(int fd) { return closesocket(fd); }
+
+constexpr int kMsgNoSignal = 0;  // no SIGPIPE semantics on Windows
+constexpr int kShutdownBoth = SD_BOTH;
+
+#else
+namespace {
+
+using Ssize = ssize_t;
+
+void winsock_init() {}
+int close_socket(int fd) { return ::close(fd); }
+
+constexpr int kMsgNoSignal = MSG_NOSIGNAL;
+constexpr int kShutdownBoth = SHUT_RDWR;
+
+#endif
+
+} // namespace
 
 namespace {
 
@@ -79,7 +121,7 @@ bool sendAll(int fd, const void* buf, size_t len) {
   const auto* bytes = static_cast<const uint8_t*>(buf);
   size_t sent = 0;
   while (sent < len) {
-    ssize_t n = ::send(fd, bytes + sent, len - sent, MSG_NOSIGNAL);
+    Ssize n = ::send(fd, bytes + sent, len - sent, kMsgNoSignal);
     if (n <= 0) {
       return false;
     }
@@ -100,7 +142,7 @@ bool recvAll(int fd, void* buf, size_t len) {
   auto* bytes = static_cast<uint8_t*>(buf);
   size_t got = 0;
   while (got < len) {
-    ssize_t n = ::recv(fd, bytes + got, len - got, 0);
+    Ssize n = ::recv(fd, bytes + got, len - got, 0);
     if (n <= 0) {
       return false;
     }
@@ -223,12 +265,12 @@ class TCPStore::Server {
       stop_ = true;
       // Unblocks per-connection handlers so their threads can finish.
       for (int fd : conns_) {
-        ::shutdown(fd, SHUT_RDWR);
+        ::shutdown(fd, kShutdownBoth);
       }
     }
     if (listenFd_ >= 0) {
-      ::shutdown(listenFd_, SHUT_RDWR);
-      ::close(listenFd_);
+      ::shutdown(listenFd_, kShutdownBoth);
+      close_socket(listenFd_);
       listenFd_ = -1;
     }
     if (acceptThread_.joinable()) {
@@ -266,7 +308,8 @@ class TCPStore::Server {
 };
 
 TCPStore::Server::Server(std::string host, uint16_t requestedPort) {
-  listenFd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+  winsock_init();
+  listenFd_ = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
   TP_CHECK(listenFd_ >= 0, "TCPStore server: socket() failed");
   int reuse = 1;
   ::setsockopt(
@@ -340,7 +383,7 @@ void TCPStore::Server::handleConnection(int fd) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stop_) {
-      ::close(fd);
+      close_socket(fd);
       return;
     }
     conns_.insert(fd);
@@ -450,7 +493,7 @@ void TCPStore::Server::handleConnection(int fd) {
         break;
       }
       default:
-        ::close(fd);
+        close_socket(fd);
         {
           std::lock_guard<std::mutex> lock(mutex_);
           conns_.erase(fd);
@@ -458,7 +501,7 @@ void TCPStore::Server::handleConnection(int fd) {
         return;
     }
   }
-  ::close(fd);
+  close_socket(fd);
   {
     std::lock_guard<std::mutex> lock(mutex_);
     conns_.erase(fd);
@@ -467,12 +510,12 @@ void TCPStore::Server::handleConnection(int fd) {
 
 void TCPStore::Server::acceptLoop() {
   while (true) {
-    int fd = ::accept(listenFd_, nullptr, nullptr);
+    int fd = static_cast<int>(::accept(listenFd_, nullptr, nullptr));
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (stop_) {
         if (fd >= 0) {
-          ::close(fd);
+          close_socket(fd);
         }
         return;
       }
@@ -486,7 +529,7 @@ void TCPStore::Server::acceptLoop() {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (stop_) {
-        ::close(fd);
+        close_socket(fd);
         continue;
       }
       connectionThreads_.emplace_back(&Server::handleConnection, this, fd);
@@ -562,7 +605,8 @@ class TCPStoreClientHelper {
   }
 
   static int attemptConnect(const std::string& host, uint16_t port) {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    winsock_init();
+    int fd = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
     if (fd < 0) {
       return -1;
     }
@@ -574,14 +618,14 @@ class TCPStoreClientHelper {
     } else if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
       struct hostent* entry = ::gethostbyname(host.c_str());
       if (entry == nullptr) {
-        ::close(fd);
+        close_socket(fd);
         return -1;
       }
       std::memcpy(&addr.sin_addr, entry->h_addr_list[0], sizeof(addr.sin_addr));
     }
     if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) !=
         0) {
-      ::close(fd);
+      close_socket(fd);
       return -1;
     }
     return fd;
@@ -615,7 +659,7 @@ bool exchange(
       ? std::chrono::milliseconds(-1)
       : (elapsed >= timeout ? std::chrono::milliseconds(0) : timeout - elapsed);
   if (!setSocketTimeout(fd, remaining)) {
-    ::close(fd);
+    close_socket(fd);
     return false;
   }
   const uint8_t opByte = static_cast<uint8_t>(op);
@@ -639,7 +683,7 @@ bool exchange(
   if (ok) {
     ok = consumeReply(fd, static_cast<Status>(status));
   }
-  ::close(fd);
+  close_socket(fd);
   return ok;
 }
 
