@@ -1,8 +1,8 @@
 name: binary-build-test
 
-# Reusable wheel build plus smoke-test workflow. The wheel stays inside the
-# runner, is tested there, and is uploaded directly to the GitHub Release only
-# for a release tag. No Actions artifact is created.
+# Reusable wheel build and test workflow. The build job hands its wheel to the
+# test job through a short-lived Actions artifact, and the tested wheel is
+# uploaded directly to the GitHub Release only for a release tag.
 
 on:
   workflow_call:
@@ -66,11 +66,12 @@ on:
           1 append a .post<N> suffix, allowing a same-day republish.
 
 jobs:
-  build-test:
-    name: ${{ inputs.build_name }}
+  build:
+    name: ${{ inputs.build_name }}-build
     runs-on: ${{ inputs.runs_on }}
     permissions:
-      contents: write
+      contents: read
+      actions: read
     timeout-minutes: 150
     env:
       BUILD_ENVIRONMENT: ${{ inputs.build_environment }}
@@ -208,10 +209,48 @@ jobs:
             sccache --show-stats || true
           fi
 
+      - name: Upload built wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: tensorplay-wheel-${{ inputs.build_environment }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 3
+
+  test:
+    name: ${{ inputs.build_name }}-test
+    needs: build
+    runs-on: ${{ inputs.runs_on }}
+    permissions:
+      contents: read
+      actions: read
+    timeout-minutes: 150
+    env:
+      BUILD_ENVIRONMENT: ${{ inputs.build_environment }}
+      SHA1: ${{ github.event.pull_request.head.sha || github.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          show-progress: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Download built wheel
+        uses: actions/download-artifact@v8
+        with:
+          name: tensorplay-wheel-${{ inputs.build_environment }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist
+
       - name: Install built wheel
         shell: bash
         run: |
-          python -m pip install dist/*.whl numpy PyYAML typing-extensions
+          python -m pip install dist/*.whl numpy PyYAML typing-extensions pytest
 
       - name: Smoke test (CPU import plus tiny op)
         if: ${{ inputs.cuda == 'cpu' }}
@@ -238,6 +277,32 @@ jobs:
           import tensorplay as tp
           print("CUDA wheel import ok:", getattr(tp, "__version__", "ok"))
           PY
+
+      - name: Run CPU core regression tests
+        if: ${{ inputs.cuda == 'cpu' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_root="$GITHUB_WORKSPACE/.ci-test-tmp"
+          result_root="$GITHUB_WORKSPACE/ci-test-results"
+          rm -rf "$test_root" "$result_root"
+          mkdir -p "$test_root" "$result_root"
+          cp "$GITHUB_WORKSPACE/test/test_set_native.py" "$test_root/"
+          cp "$GITHUB_WORKSPACE/test/test_compressed_sparse_constructors.py" "$test_root/"
+          cp "$GITHUB_WORKSPACE/test/test_nn_utils_norm.py" "$test_root/"
+          cd "$test_root"
+          python -m pytest . --import-mode=importlib -q \
+            --junitxml="$result_root/junit.xml" \
+            2>&1 | tee "$result_root/pytest.log"
+
+      - name: Upload core test results
+        if: ${{ always() && inputs.cuda == 'cpu' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.build_name }}-core-tests-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-test-results/
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Run CPU operator, training, and Stax benchmarks
         if: ${{ inputs.run_cpu_benchmarks && inputs.cuda == 'cpu' }}
@@ -313,8 +378,28 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
+  release:
+    name: ${{ inputs.build_name }}-release
+    needs: test
+    if: ${{ inputs.upload_release && (startsWith(github.ref, 'refs/tags/v') || inputs.build_version != '') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          show-progress: false
+
+      - name: Download tested wheel
+        uses: actions/download-artifact@v8
+        with:
+          name: tensorplay-wheel-${{ inputs.build_environment }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist
+
       - name: Upload tested wheel to GitHub Release
-        if: ${{ inputs.upload_release && (startsWith(github.ref, 'refs/tags/v') || inputs.build_version != '') }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

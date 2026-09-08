@@ -19,9 +19,7 @@ jobs:
   smoke-build:
     name: pull-smoke-build
     permissions:
-      # Job-level grant so the called workflow's contents:write job does not
-      # count as a permission elevation over the workflow-level read-all.
-      contents: write
+      contents: read
     uses: ./.github/workflows/_binary-build-test.yml
     with:
       build_name: tensorplay-linux-x86_64-py3_12-cpu
