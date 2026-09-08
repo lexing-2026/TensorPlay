@@ -53,7 +53,7 @@ tensor([ 1,  4,  3,  8,  5, 12,  7, 16,  9])
 ```
 
 Behind the scenes, these tensors share the same "storage." See
-{doc}`Tensor Views <../tensor_view>` for more
+`tensorplay.Tensor.view` for more
 on views and storage.
 
 When TensorPlay saves tensors it saves their storage objects and tensor

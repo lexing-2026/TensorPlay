@@ -123,7 +123,7 @@ def add_out(x: Tensor, y: Tensor, *, out: Tensor) -> Tensor:
 def add_mutate(x: Tensor, y: Tensor) -> None:
     x.add_(y)
 ```
-```{dropdown} More details on mutation, aliasing, and transforms
+```{note} More details on mutation, aliasing, and transforms
 `custom_op` asks for a precise mutation and aliasing contract because TensorPlay
 uses that contract in FakeTensor, autograd, functionalization, and
 `tensorplay.compile`.

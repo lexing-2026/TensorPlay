@@ -3,6 +3,8 @@
     :class: hidden-section
 ```
 
+(nn-init-doc)=
+
 # tensorplay.nn.init
 
 

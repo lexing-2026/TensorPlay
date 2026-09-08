@@ -232,8 +232,6 @@ scaled_dot_product_attention.
     :toctree: generated
     :nosignatures:
 
-    DType
-    Tensor
     adaptive_max_pool1d_with_indices
     adaptive_max_pool2d_with_indices
     adaptive_max_pool3d_with_indices

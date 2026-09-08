@@ -109,6 +109,8 @@
     tensorplay.cuda.graph_annotations.clear_kernel_annotations
 ```
 
+(cuda-memory-management)=
+
 ## Memory management
 
 ```{eval-rst}

@@ -15,6 +15,8 @@
     tensorplay.autograd.grad
 ```
 
+(forward-mode-ad)=
+
 ## Forward-mode Automatic Differentiation
 
 ```{eval-rst}

@@ -70,6 +70,10 @@ myst_heading_anchors = 4
 # autodoc / autosummary options
 autosummary_generate = True
 numpydoc_show_class_members = False
+# Render docstring "Attributes:" blocks as :ivar: fields instead of object
+# descriptions; emitting a second py:attribute per field duplicates what
+# autodoc already documents for the same members.
+napoleon_use_ivar = True
 
 # autosectionlabel throws warnings if section names are duplicated.
 # Do not throw a warning for duplicated section names in different documents.
@@ -107,6 +111,11 @@ import re
 
 _SIGNATURE_ONLY = re.compile(r"^\s*[\w.]+\([^()]*\)\s*->", re.S)
 
+_STDLIB_BYTE_CONVERSION = (
+    "Return the integer represented by the given array of bytes.",
+    "Return an array of bytes representing an integer.",
+)
+
 
 def _strip_reference_assets(app, what, name, obj, options, lines):
     # Generated assets under docs/source/scripts/*_images are not shipped
@@ -117,11 +126,17 @@ def _strip_reference_assets(app, what, name, obj, options, lines):
         if not re.match(r"^\s*\.\.\s+image::\s+\S*(?:scripts/|_images/)", line)
         and "Henry2019" not in line
     ]
+    # Enum helpers re-export the built-in int conversions; their inherited
+    # prose contains inline markup that does not survive reST rendering and
+    # duplicates what the Python reference already documents.
+    text = "\n".join(lines).strip()
+    if name.endswith((".from_bytes", ".to_bytes")) and text.startswith(_STDLIB_BYTE_CONVERSION):
+        lines[:] = []
+        return
     # Native ops whose __doc__ is just the generated C++ signature
     # ("op(Tensor a, *, int dim=0) -> Tensor"): rendered as rst it trips
     # inline-markup warnings and carries no information beyond the stub
     # signature autodoc already prints.
-    text = "\n".join(lines).strip()
     if text and "\n" not in text and _SIGNATURE_ONLY.match(text):
         lines[:] = []
 

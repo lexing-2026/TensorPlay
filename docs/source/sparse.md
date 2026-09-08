@@ -192,7 +192,7 @@ Please also note that we only support CUDA tensors since hardware compatibility 
 The following datatypes are supported for semi-structured sparsity. Note that each datatype has its own shape constraints and compression factor.
 ```{eval-rst}
 .. csv-table::
-   :header: "TensorPlay dtype", "Shape Constraints", "Compression Factor", "Sparsity Pattern"
+   :header: TensorPlay dtype;Shape Constraints;Compression Factor;Sparsity Pattern
    :widths: 15, 45, 10, 10
    :delim: ;
 
@@ -944,7 +944,7 @@ scalar (float or 0-D TensorPlay tensor), `*` is element-wise
 multiplication, and `@` is matrix multiplication.
 ```{eval-rst}
 .. csv-table::
-   :header: "TensorPlay operation", "Sparse grad?", "Layout signature"
+   :header: TensorPlay operation;Sparse grad?;Layout signature
    :widths: 20, 5, 60
    :delim: ;
 
