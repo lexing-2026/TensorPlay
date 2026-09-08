@@ -103,6 +103,11 @@ def install_sccache(workdir: Path) -> dict[str, str]:
     )
     sccache_exe = sccache_dir / "sccache.exe"
     if not sccache_exe.is_file():
+        # The archive nests the payload under a versioned top-level folder.
+        for candidate in sccache_dir.rglob("sccache.exe"):
+            candidate.replace(sccache_exe)
+            break
+    if not sccache_exe.is_file():
         sys.exit(f"sccache extraction did not produce {sccache_exe}")
     return {"PATH": f"{sccache_dir};{os.environ.get('PATH', '')}"}
 
