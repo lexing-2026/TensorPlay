@@ -595,8 +595,15 @@ elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
         set_target_properties(p10_kernel_default_${KERNEL_NAME} PROPERTIES
             POSITION_INDEPENDENT_CODE ON)
         target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
-            P10_EXPORTS CPU_CAPABILITY_DEFAULT CPU_CAPABILITY=DEFAULT
-            HAVE_SVE_CPU_DEFINITION)
+            P10_EXPORTS CPU_CAPABILITY_DEFAULT CPU_CAPABILITY=DEFAULT)
+        # The SVE dispatch slots only exist when the SVE tier objects are
+        # actually built; defining the gate unconditionally would make these
+        # TUs reference static stub members nobody defines on hosts without
+        # the tier probe (e.g. macOS arm64).
+        if(TP_CXX_SVE256_FOUND)
+            target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
+                HAVE_SVE_CPU_DEFINITION)
+        endif()
         target_include_directories(p10_kernel_default_${KERNEL_NAME} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
         target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE

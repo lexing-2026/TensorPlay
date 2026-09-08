@@ -1407,12 +1407,12 @@ if(NOT WIN32)
 endif()
 
 # RPATH: the extension lives in tensorplay/_C while its dependencies
-# (libp10.so, libtpx.so, libstax.so) live in tensorplay/lib. Without an
+# (libp10.so, libstax.so) live in tensorplay/lib. Without an
 # explicit relative RPATH, importing tensorplay from a wheel/venv fails
 # with "cannot open shared object file". Windows ignores RPATH (DLL
 # search is handled by tensorplay/__init__.py via os.add_dll_directory).
 if(NOT WIN32)
-    set_target_properties(p10 tpx stax PROPERTIES
+    set_target_properties(p10 stax PROPERTIES
         INSTALL_RPATH "$ORIGIN"
         BUILD_RPATH "$ORIGIN"
     )
@@ -1427,7 +1427,7 @@ if(NOT WIN32)
 endif()
 
 # Installation
-set(TP_INSTALL_TARGETS p10 tpx stax)
+set(TP_INSTALL_TARGETS p10 stax)
 if(TARGET tp_python)
     list(APPEND TP_INSTALL_TARGETS tp_python)
 endif()

@@ -15,7 +15,15 @@ set(TPX_SOURCES
 
 set_source_files_properties(${GEN_TPX_OPS_CPP} ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN_AUTOCAST_CPP} PROPERTIES GENERATED TRUE)
 
-add_library(tpx ${TPX_SOURCES})
+# The autograd surface is compiled into libp10, not into a separate dylib.
+# Backend and composite kernels call tensorplay::tpx::ops entry points, so a
+# standalone autograd library would create a p10<->tpx dependency cycle that
+# linkers with strict shared-library symbol resolution (macOS two-level
+# namespace) reject.  A single core library also binds these symbols without
+# cross-image indirection and ships one fewer dylib per wheel.
+target_sources(p10 PRIVATE ${TPX_SOURCES})
+add_dependencies(p10 generate_code)
+
 # Engine.cpp instantiates cpu::veccomplex AVX2 inline helpers (VecComplex.h);
 # compile this TU with matching ISA flags so always_inline succeeds.  The
 # complex fast paths themselves are runtime-guarded at their dispatch sites,
@@ -25,45 +33,12 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64)|(AMD64|i[3-9]86)")
     set_source_files_properties(src/Engine.cpp PROPERTIES
         COMPILE_OPTIONS "-mavx2;-mfma")
 endif()
-set_target_properties(tpx PROPERTIES UNITY_BUILD ON)
-add_dependencies(tpx generate_code)
-target_link_libraries(tpx PRIVATE p10)
 
-if(BUILD_SHARED_LIBS)
-    target_compile_definitions(tpx PRIVATE TENSORPLAY_EXPORTS)
-endif()
-
-target_include_directories(tpx PUBLIC 
+# Header-only usage point: consumers keep including tpx headers and linking
+# the tpx target for its include paths; the symbols now come from libp10.
+add_library(tpx INTERFACE)
+target_include_directories(tpx INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
     ${GEN_BASE_DIR}
 )
-
-target_compile_definitions(tpx PRIVATE TENSORPLAY_EXPORTS)
-
-target_link_libraries(tpx PUBLIC p10)
-
-# Installation logic for tpx
-if(NOT DEFINED TP_PACKAGE_DIR)
-    set(TP_PACKAGE_DIR "${CMAKE_SOURCE_DIR}/tensorplay")
-endif()
-set(TP_LIB_DIR "${TP_PACKAGE_DIR}/lib")
-
-set_target_properties(tpx PROPERTIES
-    OUTPUT_NAME "tpx"
-    RUNTIME_OUTPUT_DIRECTORY "${TP_LIB_DIR}"
-    LIBRARY_OUTPUT_DIRECTORY "${TP_LIB_DIR}"
-    ARCHIVE_OUTPUT_DIRECTORY "${TP_LIB_DIR}"
-    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${TP_LIB_DIR}"
-    LIBRARY_OUTPUT_DIRECTORY_RELEASE "${TP_LIB_DIR}"
-    ARCHIVE_OUTPUT_DIRECTORY_RELEASE "${TP_LIB_DIR}"
-    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${TP_LIB_DIR}"
-    LIBRARY_OUTPUT_DIRECTORY_DEBUG "${TP_LIB_DIR}"
-    ARCHIVE_OUTPUT_DIRECTORY_DEBUG "${TP_LIB_DIR}"
-)
-
-install(TARGETS tpx
-    RUNTIME DESTINATION tensorplay/lib
-    LIBRARY DESTINATION tensorplay/lib
-    ARCHIVE DESTINATION tensorplay/lib
-)
+target_link_libraries(tpx INTERFACE p10)
