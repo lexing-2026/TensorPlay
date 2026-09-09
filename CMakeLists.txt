@@ -1409,10 +1409,12 @@ if(TP_CUDA_ENABLED)
     target_link_libraries(_C PRIVATE CUDA::cudart)
 endif()
 
-# if(MSVC)
-#     # Force link all symbols from static libraries to ensure kernels are registered
-#     target_link_options(_C PRIVATE "/WHOLEARCHIVE:p10" "/WHOLEARCHIVE:tpx" "/WHOLEARCHIVE:stax")
-# endif()
+if(MSVC)
+    # Retain registration-only objects from the static backend archives.
+    target_link_options(_C PRIVATE
+        "/WHOLEARCHIVE:$<TARGET_FILE:p10>"
+        "/WHOLEARCHIVE:$<TARGET_FILE:stax>")
+endif()
 
 # target_compile_definitions(_C PRIVATE TP_STATIC_BUILD)
 # Distributed.cpp shares the NCCL stub/context declaration with p10.  Keep
