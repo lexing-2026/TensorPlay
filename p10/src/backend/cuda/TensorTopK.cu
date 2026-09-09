@@ -5,6 +5,7 @@
 #include "CUDARuntime.h"
 #include <cuda_runtime.h>
 #include <cuda/std/functional>
+#include <cub/device/device_scan.cuh>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
 #include "ScanUtils.cuh"
@@ -558,19 +559,19 @@ void launch_multiblock_topk_impl(const Tensor& input, Tensor& values,
   TP_CUDA_CHECK(cub::DeviceScan::InclusiveSumByKey(
       nullptr, scan_bytes, key_iterator, within_k_counts.data_ptr<uint32_t>(),
       within_k_counts.data_ptr<uint32_t>(), static_cast<int>(block_count),
-      cuda::std::equal_to<>(), getCurrentCUDAStream().stream()));
+      ::cuda::std::equal_to<>(), getCurrentCUDAStream().stream()));
   Tensor scan_storage = Tensor::empty(
       {static_cast<int64_t>(std::max<size_t>(scan_bytes, 1))}, DType::UInt8,
       input.device());
   TP_CUDA_CHECK(cub::DeviceScan::InclusiveSumByKey(
       scan_storage.data_ptr(), scan_bytes, key_iterator,
       within_k_counts.data_ptr<uint32_t>(), within_k_counts.data_ptr<uint32_t>(),
-      static_cast<int>(block_count), cuda::std::equal_to<>(),
+      static_cast<int>(block_count), ::cuda::std::equal_to<>(),
       getCurrentCUDAStream().stream()));
   TP_CUDA_CHECK(cub::DeviceScan::InclusiveSumByKey(
       scan_storage.data_ptr(), scan_bytes, key_iterator,
       kth_counts.data_ptr<uint32_t>(), kth_counts.data_ptr<uint32_t>(),
-      static_cast<int>(block_count), cuda::std::equal_to<>(),
+      static_cast<int>(block_count), ::cuda::std::equal_to<>(),
       getCurrentCUDAStream().stream()));
   topk_multiblock_gather<T, Key, IndexType>
       <<<block_grid, topk_multiblock_threads, 0,

@@ -79,6 +79,18 @@ if(USE_CUDA)
         enable_language(CUDA)
         set(CMAKE_CUDA_STANDARD 20)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+        if(MSVC AND CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
+            foreach(_cuda_rule IN ITEMS
+                    CMAKE_CUDA_COMPILE_OBJECT
+                    CMAKE_CUDA_DEVICE_LINK_LIBRARY
+                    CMAKE_CUDA_DEVICE_LINK_EXECUTABLE)
+                string(REPLACE
+                    "-Xcompiler=-Fd<TARGET_COMPILE_PDB>,-FS"
+                    "-Xcompiler=-Fd<TARGET_COMPILE_PDB> -Xcompiler=-FS"
+                    _cuda_rule_value "${${_cuda_rule}}")
+                set("${_cuda_rule}" "${_cuda_rule_value}")
+            endforeach()
+        endif()
         # Sources genuinely require C++20 even for nvcc (the split float8
         # headers use
         # requires-clauses).  cmake 3.25's NVIDIA module predates nvcc's
@@ -1068,6 +1080,9 @@ if(NOT WIN32)
                "${CMAKE_CURRENT_SOURCE_DIR}/src/bindings/python"
                "${CMAKE_CURRENT_SOURCE_DIR}/tpx/include")
     target_link_libraries(tp_python PUBLIC p10 pybind11::pybind11)
+    if(APPLE)
+        target_link_options(tp_python PRIVATE "-undefined" "dynamic_lookup")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -1234,6 +1249,9 @@ set(TP_C_SOURCES
      src/bindings/python/FileCheck.cpp
      src/Version.cpp
 )
+if(WIN32)
+    list(APPEND TP_C_SOURCES src/bindings/python/CPythonBridge.cpp)
+endif()
 if(USE_TP_DISTRIBUTED)
     list(APPEND TP_C_SOURCES
         src/bindings/python/Distributed.cpp
