@@ -14,7 +14,11 @@ namespace cuda {
 
 template <typename T>
 __host__ __device__ inline bool tp_at_isnan(T v) {
+#if defined(__CUDA_ARCH__)
+    return ::isnan(static_cast<float>(v));
+#else
     return std::isnan(v);
+#endif
 }
 
 template <typename T>
