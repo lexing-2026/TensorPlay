@@ -400,7 +400,7 @@ if(USE_CCACHE)
                 CACHE STRING "${_LANG} compiler launcher")
         endforeach()
     elseif(SCCACHE_EXECUTABLE)
-        foreach(_LANG C CXX)
+        foreach(_LANG C CXX CUDA)
             set(CMAKE_${_LANG}_COMPILER_LAUNCHER
                 "${SCCACHE_EXECUTABLE}"
                 CACHE STRING "${_LANG} compiler launcher")
