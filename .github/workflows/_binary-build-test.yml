@@ -250,6 +250,11 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-build.txt
 
+      - uses: jimver/cuda-toolkit@v0.2.36
+        if: ${{ inputs.cuda != 'cpu' && runner.os == 'Linux' }}
+        with:
+          cuda: ${{ inputs.cuda_toolkit }}
+
       - name: Install Linux CPU runtime dependencies
         if: ${{ inputs.cuda == 'cpu' && runner.os == 'Linux' }}
         shell: bash
