@@ -79,7 +79,15 @@ public:
 #if defined(__GNUG__) && !defined(TP_NO_CXA_DEMANGLE)
         return demangle_node_name(typeid(*this).name());
 #else
-        return typeid(*this).name();
+        std::string full = typeid(*this).name();
+        for (const char* prefix : {"struct ", "class "}) {
+            if (full.rfind(prefix, 0) == 0) {
+                full.erase(0, std::char_traits<char>::length(prefix));
+                break;
+            }
+        }
+        const auto pos = full.rfind("::");
+        return pos == std::string::npos ? full : full.substr(pos + 2);
 #endif
     }
 

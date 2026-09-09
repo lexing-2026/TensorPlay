@@ -150,6 +150,28 @@ LibHandle find_library() {
     std::vector<std::string> bases;
     if (const char* cp = std::getenv("CONDA_PREFIX")) bases.push_back(cp);
     if (const char* vp = std::getenv("VIRTUAL_ENV")) bases.push_back(vp);
+    if (const char* py = std::getenv("Python_ROOT_DIR")) {
+        bases.push_back((fs::path(py) / "Lib" / "site-packages").string());
+        bases.push_back((fs::path(py) / "lib" / "site-packages").string());
+    }
+    std::vector<char> executable_path(MAX_PATH);
+    for (;;) {
+        const DWORD length = GetModuleFileNameA(
+            nullptr, executable_path.data(),
+            static_cast<DWORD>(executable_path.size()));
+        if (length == 0) break;
+        if (length + 1 < executable_path.size()) {
+            const fs::path executable(
+                std::string(executable_path.data(), length));
+            const fs::path python_root = executable.parent_path();
+            bases.push_back(
+                (python_root / "Lib" / "site-packages").string());
+            bases.push_back(
+                (python_root / "lib" / "site-packages").string());
+            break;
+        }
+        executable_path.resize(executable_path.size() * 2);
+    }
     bases.push_back("C:\\Python313\\Lib\\site-packages");
     for (const auto& base : bases) {
         std::error_code ec;
