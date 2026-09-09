@@ -45,7 +45,7 @@ __global__ void ctc_loss_log_alpha_gpu_kernel(
         int64_t target_stride,
         int64_t max_target_length,
         int64_t batch_size, int64_t blank) {
-    constexpr scalar_t neginf = -INFINITY;
+    constexpr scalar_t neginf = -std::numeric_limits<scalar_t>::infinity();
 
     const int64_t b = static_cast<int64_t>(threadIdx.y) +
                       static_cast<int64_t>(blockIdx.y) * blockDim.y;
@@ -152,7 +152,7 @@ __global__ void ctc_loss_backward_log_beta_gpu_kernel(
         int64_t target_stride,
         int64_t max_target_length,
         int64_t batch_size, int64_t blank) {
-    constexpr scalar_t neginf = -INFINITY;
+    constexpr scalar_t neginf = -std::numeric_limits<scalar_t>::infinity();
 
     const int64_t b = static_cast<int64_t>(threadIdx.y) +
                       static_cast<int64_t>(blockIdx.y) * blockDim.y;
@@ -239,7 +239,7 @@ __global__ void ctc_loss_backward_collect_gpu_kernel(
         int64_t target_stride,
         int64_t max_target_length, int64_t blank,
         bool zero_infinity) {
-    constexpr scalar_t neginf = -INFINITY;
+    constexpr scalar_t neginf = -std::numeric_limits<scalar_t>::infinity();
     const int64_t t = static_cast<int64_t>(threadIdx.x) +
                       static_cast<int64_t>(blockIdx.x) * blockDim.x;
     const int64_t b = static_cast<int64_t>(threadIdx.y) +
@@ -276,7 +276,9 @@ __global__ void ctc_loss_backward_collect_gpu_kernel(
     const scalar_t grad_scale = grad_out[b];
     for (int64_t c = 0; c < num_labels; ++c) {
         scalar_t& result = gradient[grad_offset + c];
-        if (t < input_length && (!zero_infinity || nll != INFINITY)) {
+        if (t < input_length &&
+            (!zero_infinity ||
+             nll != std::numeric_limits<scalar_t>::infinity())) {
             const scalar_t lp = log_probs[lp_offset + c];
             result = (std::exp(lp) -
                       std::exp(result + nll - lp)) * grad_scale;
