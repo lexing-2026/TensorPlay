@@ -16,6 +16,14 @@ list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+if(APPLE)
+    set(CMAKE_MACOSX_RPATH ON)
+endif()
+if(NOT WIN32)
+    set(CMAKE_SKIP_BUILD_RPATH FALSE)
+    set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
+endif()
+
 # Auto-detect CUDA: default to ON only when an nvcc is available so that a
 # plain `pip install .` on a CPU-only machine still builds successfully.
 if(NOT DEFINED USE_CUDA)
@@ -28,6 +36,14 @@ if(NOT DEFINED USE_CUDA)
 endif()
 option(USE_CUDA "Enable CUDA support" ${USE_CUDA})
 set(TP_CUDA_ENABLED ${USE_CUDA})
+
+# CMake consumes this variable while enabling the CUDA language.  Accept the
+# conventional project-level spelling as a stable override before that point.
+if((NOT DEFINED CMAKE_CUDA_HOST_COMPILER OR NOT CMAKE_CUDA_HOST_COMPILER) AND
+   DEFINED CUDA_HOST_COMPILER)
+    set(CMAKE_CUDA_HOST_COMPILER "${CUDA_HOST_COMPILER}" CACHE FILEPATH
+        "Host compiler used by the CUDA compiler")
+endif()
 
 # AMD GPU support via the HIP toolchain.  Mutually exclusive with CUDA: the
 # HIP backend registers the same device and dispatch slots, so one build can
@@ -76,6 +92,11 @@ if(USE_CUDA)
     endif()
 
     if(CMAKE_CUDA_COMPILER OR CMAKE_CUDA_COMPILER_ID)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND
+           (NOT DEFINED CMAKE_CUDA_HOST_COMPILER OR NOT CMAKE_CUDA_HOST_COMPILER))
+            set(CMAKE_CUDA_HOST_COMPILER "${CMAKE_CXX_COMPILER}" CACHE FILEPATH
+                "Host compiler used by the CUDA compiler")
+        endif()
         enable_language(CUDA)
         set(CMAKE_CUDA_STANDARD 20)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
@@ -119,6 +140,12 @@ endif()
 # Find CUDA Toolkit if enabled
 if(USE_CUDA)
     find_package(CUDAToolkit REQUIRED)
+    if(NOT CMAKE_CUDA_COMPILER_VERSION VERSION_EQUAL CUDAToolkit_VERSION)
+        message(FATAL_ERROR
+            "CUDA compiler version ${CMAKE_CUDA_COMPILER_VERSION} does not match "
+            "CUDA toolkit version ${CUDAToolkit_VERSION}. Set CMAKE_CUDA_COMPILER "
+            "and CUDAToolkit_ROOT to the same toolkit installation.")
+    endif()
     message(STATUS "Found CUDA Toolkit: ${CUDAToolkit_VERSION}")
         string(APPEND CMAKE_CXX_FLAGS " -DUSE_CUDA")
 else()
@@ -333,6 +360,21 @@ else()
     endif()
 endif()
 
+option(WERROR "Treat compiler warnings as errors" OFF)
+if(WERROR)
+    if(MSVC)
+        add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/WX>)
+        if(USE_CUDA)
+            add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/WX>)
+        endif()
+    else()
+        string(APPEND CMAKE_CXX_FLAGS " -Werror")
+        if(USE_CUDA)
+            add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Werror>)
+        endif()
+    endif()
+endif()
+
 # Vendored trees compile with the toolchain's default diagnostic level: the
 # project warning flags target our own sources, and third-party code would
 # only flood the build log with noise nobody acts on here.
@@ -509,25 +551,21 @@ if(USE_BLAS)
     set_property(CACHE BLAS_PROVIDER PROPERTY STRINGS "MKL" "OpenBLAS")
 
     if(BLAS_PROVIDER STREQUAL "MKL")
-        # Select the OpenMP runtime that matches the active toolchain.
-        if(WIN32)
-            set(MKL_THREADING "intel_thread")
-        else()
-            set(MKL_THREADING "gnu_thread")
+        # Select the OpenMP runtime that matches the active toolchain unless
+        # the caller supplied an explicit compatible choice.
+        if(NOT MKL_THREADING)
+            if(WIN32)
+                set(MKL_THREADING "intel_thread")
+            else()
+                set(MKL_THREADING "gnu_thread")
+            endif()
         endif()
         set(MKL_LINK "static")
         # Our kernels use 32-bit cblas indices; MKLConfig defaults to ilp64.
         set(MKL_INTERFACE lp64)
-        # The Windows static package requires its interface, threading, and
-        # runtime libraries to be resolved as one link set.
-        if(WIN32)
-            find_package(MKL MODULE QUIET)
-        else()
-            find_package(MKL CONFIG QUIET)
-            if(NOT MKL_FOUND)
-                find_package(MKL MODULE QUIET)
-            endif()
-        endif()
+        # Resolve the interface, threading, and runtime libraries as one
+        # link set on every platform.
+        find_package(MKL MODULE QUIET)
         
         if(MKL_FOUND)
             message(STATUS "Found MKL: ${MKL_DIR}")

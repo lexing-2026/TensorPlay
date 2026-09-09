@@ -29,12 +29,20 @@
 
 # Additional env vars forwarded with the same name.
 set(_ENV_PASSTHROUGH
+  BLAS_PROVIDER
   CUDA_HOST_COMPILER
   CUDA_NVCC_EXECUTABLE
   CUDA_SEPARABLE_COMPILATION
+  CUDAToolkit_ROOT
   CUDNN_INCLUDE_DIR
   CUDNN_LIBRARY
   CUDNN_ROOT
+  MKL_INTERFACE
+  MKL_LINK
+  MKL_ROOT
+  MKL_THREADING
+  MKLDNN_CPU_RUNTIME
+  WERROR
 )
 
 # Forward passthrough env vars (same name)
