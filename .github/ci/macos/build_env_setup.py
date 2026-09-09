@@ -24,7 +24,7 @@ MACOS_BUILD_ENV: dict[str, str] = {
     "TENSORPLAY_BINARY_BUILD": "1",
     "USE_CUDA": "0",
     "MACOSX_DEPLOYMENT_TARGET": "14.0",
-    "USE_TP_DISTRIBUTED": "1",
+    "USE_TP_DISTRIBUTED": "0",
     "USE_MKLDNN": "OFF",
 }
 
