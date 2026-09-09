@@ -1131,6 +1131,7 @@ from tensorplay import (
     multiprocessing as multiprocessing,
     nn as nn,
     optim as optim,
+    overrides as overrides,
     types as types,
     utils as utils,
 )

@@ -205,6 +205,36 @@ LibHandle find_library() {
     // numpy's wheel directory inside a conda/venv prefix.  Distros install
     // under versioned python3.X paths, so glob every interpreter we can see.
     std::vector<std::string> bases;
+#ifdef __APPLE__
+    auto append_python_root = [&bases](const fs::path& root) {
+        bases.push_back(root.string());
+        bases.push_back((root / "lib").string());
+        for (int minor = 8; minor <= 14; ++minor) {
+            const fs::path versioned =
+                root / "lib" / ("python3." + std::to_string(minor));
+            bases.push_back(versioned.string());
+            bases.push_back((versioned / "site-packages").string());
+            bases.push_back((versioned / "dist-packages").string());
+        }
+    };
+    if (const char* py = std::getenv("Python_ROOT_DIR")) {
+        append_python_root(fs::path(py));
+    }
+    if (const char* home = std::getenv("PYTHONHOME")) {
+        append_python_root(fs::path(home));
+    }
+    const fs::path framework_versions(
+        "/Library/Frameworks/Python.framework/Versions");
+    std::error_code framework_ec;
+    if (fs::is_directory(framework_versions, framework_ec)) {
+        for (const auto& entry : fs::directory_iterator(framework_versions,
+                                                        framework_ec)) {
+            if (entry.is_directory(framework_ec)) {
+                append_python_root(entry.path());
+            }
+        }
+    }
+#endif
     if (const char* cp = std::getenv("CONDA_PREFIX")) bases.push_back(cp);
     if (const char* vp = std::getenv("VIRTUAL_ENV")) bases.push_back(vp);
     {

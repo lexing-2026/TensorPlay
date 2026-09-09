@@ -24,7 +24,11 @@
 #ifdef USE_MKL
 #include <mkl.h>
 #elif defined(USE_BLAS)
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#else
 #include <cblas.h>
+#endif
 #endif
 
 #ifdef _OPENMP
@@ -306,21 +310,20 @@ void gemm_direct(bool transA, bool transB, int64_t M, int64_t N, int64_t K, floa
     #elif defined(USE_ONEDNN)
         onednn_matmul_gemm(transA, transB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
     #else
-        // Naive implementation (Supports only NoTrans for now, fallback to mm_kernel if complex)
-        if (!transA && !transB) {
-            for (int64_t m = 0; m < M; ++m) {
-                for (int64_t n = 0; n < N; ++n) {
-                    float sum = 0;
-                    for (int64_t k = 0; k < K; ++k) {
-                        sum += A[m * lda + k] * B[k * ldb + n];
-                    }
+        for (int64_t m = 0; m < M; ++m) {
+            for (int64_t n = 0; n < N; ++n) {
+                float sum = 0.0f;
+                for (int64_t k = 0; k < K; ++k) {
+                    const float a = transA ? A[k * lda + m] : A[m * lda + k];
+                    const float b = transB ? B[n * ldb + k] : B[k * ldb + n];
+                    sum += a * b;
+                }
+                if (beta == 0.0f) {
+                    C[m * ldc + n] = alpha * sum;
+                } else {
                     C[m * ldc + n] = beta * C[m * ldc + n] + alpha * sum;
                 }
             }
-        } else {
-             // Fallback for naive transpose not implemented here efficiently
-             // Should not happen if we use MKL/BLAS which is required for perf
-             TP_THROW(NotImplementedError, "gemm_direct naive transpose not implemented");
         }
     #endif
 }

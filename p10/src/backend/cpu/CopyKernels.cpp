@@ -403,6 +403,18 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
         throw std::runtime_error("copy_kernel only supports CPU, CUDA or Vulkan source");
     }
 
+    if (self.dim() == 0 && src.dim() == 0) {
+        dispatch_dtype(self.dtype(), [&](auto self_tag) {
+            using self_t = typename decltype(self_tag)::type;
+            dispatch_dtype(src.dtype(), [&](auto src_tag) {
+                using src_t = typename decltype(src_tag)::type;
+                self.data_ptr<self_t>()[0] =
+                    cast_value<self_t>(src.data_ptr<src_t>()[0]);
+            });
+        });
+        return self;
+    }
+
     if (self.dtype() == src.dtype() && self.dim() == 2 && self.numel() >= 60 * 60 &&
         self.shape() == src.shape()) {
         const int64_t rows = self.size(0);
