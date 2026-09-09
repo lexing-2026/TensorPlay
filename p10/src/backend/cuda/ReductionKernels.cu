@@ -696,8 +696,11 @@ Tensor sum_dim_backward_kernel_cuda(const Tensor& grad_output, const Tensor& sel
     std::sort(normalized.begin(), normalized.end());
     Tensor expanded = grad_output;
     if (!keepdim) {
-        for (auto it = normalized.rbegin(); it != normalized.rend(); ++it) {
-            expanded = expanded.unsqueeze(*it);
+        // Insert unit dims at the ORIGINAL (ascending) positions: after the
+        // reduction the surviving dims are left-packed, so ascending order
+        // restores the exact source layout (reverse order misaligns).
+        for (int64_t d : normalized) {
+            expanded = expanded.unsqueeze(d);
         }
     }
     return expanded.expand(static_cast<std::vector<int64_t>>(self.shape()));
