@@ -629,7 +629,7 @@ Tensor& cauchy_kernel_cuda(Tensor& self, double median, double sigma) {
             [med, sig] __device__ (float val) {
                 val = val > 1.f - kEps ? 1.f - kEps : val;
                 val = val < kEps ? kEps : val;
-                return med + sig * ::tanf(static_cast<float>(M_PI) * (val - 0.5f));
+                return med + sig * ::tanf(static_cast<float>(kPi) * (val - 0.5f));
             });
     } else if (self.dtype() == DType::Float64) {
         double* data = self.data_ptr<double>();
