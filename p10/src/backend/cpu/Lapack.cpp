@@ -84,9 +84,15 @@ static void* sym(LibHandle h, const char* n) { return dlsym(h, n); }
 
 void* resolve_one(LibHandle handle, const char* base) {
     char buf[128];
-    // The trailing plain spelling covers system LAPACK implementations
-    // (e.g. Apple's Accelerate) whose CBLAS exports carry no suffix at all.
-    const char* patterns[] = {"scipy_%s_64_", "%s_64_", "%s_", "scipy_%s64_", "%s"};
+    // Order matters: an ILP64 provider must win over a same-named 32-bit
+    // integer ABI (writing ipiv-style int arrays through an LP64 routine
+    // corrupts them).  Apple's Accelerate exposes its ILP64 LAPACK under
+    // the $NEWLAPACK$ILP64 variant and keeps the plain f2c spellings for
+    // the legacy 32-bit interface; its CBLAS exports carry no suffix, and
+    // those take scalar integers only, so the plain spelling is safe.
+    const char* patterns[] = {
+        "scipy_%s_64_", "%s_64_", "%s$NEWLAPACK$ILP64", "scipy_%s64_", "%s_", "%s",
+    };
     for (const char* pattern : patterns) {
         std::snprintf(buf, sizeof(buf), pattern, base);
         if (void* p = sym(handle, buf)) return p;
