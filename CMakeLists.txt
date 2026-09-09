@@ -509,19 +509,24 @@ if(USE_BLAS)
     set_property(CACHE BLAS_PROVIDER PROPERTY STRINGS "MKL" "OpenBLAS")
 
     if(BLAS_PROVIDER STREQUAL "MKL")
-        # 1. Try MKL Config mode (Best for OneAPI)
-        # statically into our .so -- shares the libgomp runtime with our own
-        # parallel_for pool, so no second threading runtime is loaded.
-        set(MKL_THREADING "gnu_thread")
+        # Select the OpenMP runtime that matches the active toolchain.
+        if(WIN32)
+            set(MKL_THREADING "intel_thread")
+        else()
+            set(MKL_THREADING "gnu_thread")
+        endif()
         set(MKL_LINK "static")
         # Our kernels use 32-bit cblas indices; MKLConfig defaults to ilp64.
         set(MKL_INTERFACE lp64)
-        # Config mode first (oneAPI MKLConfig), then the module fallback:
-        # CI unpacks the mkl-static / mkl-include wheels under /opt/intel
-        # (MKLROOT), which only the module layout knows how to assemble.
-        find_package(MKL CONFIG QUIET)
-        if(NOT MKL_FOUND)
+        # The Windows static package requires its interface, threading, and
+        # runtime libraries to be resolved as one link set.
+        if(WIN32)
             find_package(MKL MODULE QUIET)
+        else()
+            find_package(MKL CONFIG QUIET)
+            if(NOT MKL_FOUND)
+                find_package(MKL MODULE QUIET)
+            endif()
         endif()
         
         if(MKL_FOUND)

@@ -32,7 +32,7 @@ include(FindPackageHandleStandardArgs)
 # 1) Config mode.  find_package(MKL CONFIG) resolves only MKLConfig.cmake and
 #    never re-enters this module.
 # ---------------------------------------------------------------------------
-if(NOT TARGET MKL::MKL)
+if(NOT WIN32 AND NOT TARGET MKL::MKL)
     find_package(MKL CONFIG QUIET)
 endif()
 if(TARGET MKL::MKL)

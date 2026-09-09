@@ -753,7 +753,9 @@ add_library(p10 ${P10_SOURCES})
 set_target_properties(p10 PROPERTIES UNITY_BUILD OFF)
 if(MSVC)
     # Template-heavy kernel TUs exceed the default COFF section cap.
-    target_compile_options(p10 PRIVATE /bigobj)
+    target_compile_options(p10 PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:/bigobj>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
 endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
     # Tell DispatchStub (and every TU) that AVX2 kernel copies exist, so the
