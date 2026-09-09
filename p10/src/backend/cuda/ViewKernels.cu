@@ -716,10 +716,11 @@ Tensor select_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self
     if (self.is_sparse()) {
         TP_THROW(RuntimeError, "select(): gradient w.r.t. sparse COO tensors is not supported");
     }
-    Tensor out(self.shape(), grad_output.dtype(), grad_output.device());
-    out.zero_();
-    out.select(dim, index).copy_(grad_output);
-    return out;
+    Tensor grad_input = Tensor::zeros(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        grad_output.dtype(), grad_output.device());
+    grad_input.select(dim, index).copy_(grad_output);
+    return grad_input;
 }
 
 Tensor slice_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self,
