@@ -1508,8 +1508,8 @@ Tensor bmm_kernel(const Tensor& self, const Tensor& batch2) {
     }
     check_cpu_matmul_dtype(self.dtype());
     // Small/thin slices keep the parallel batched-2d path; fat contiguous
-    // stacks go through the fused batched GEMM (one BLAS call per slice
-    // without view-select round trips).
+    // stacks go through the fused batched GEMM without view-select round
+    // trips.
     if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
         batch_items_contiguous_or_transposed(self) &&
         batch_items_contiguous_or_transposed(batch2)) {
@@ -1560,31 +1560,74 @@ void bgemm_batch(const Tensor& batch1, const Tensor& batch2, Tensor& result,
     bool trans_b; int64_t ldb;
     pick_a(trans_a, lda);
     pick_b(trans_b, ldb);
-    const int64_t ldc = sr[1];
     const T* A = batch1.data_ptr<T>();
     const T* Bp = batch2.data_ptr<T>();
     T* C = result.data_ptr<T>();
     const T alpha_t = static_cast<T>(alpha);
     const T beta_t = static_cast<T>(beta);
+#ifdef USE_MKL
+    // The grouped interface uses MKL's native index type.  Keep the
+    // per-slice path for oversized tensors and for nonzero beta, whose
+    // historical first-slice/next-slice semantics cannot be represented by
+    // one grouped call.
+    const auto mkl_int_fits = [](int64_t value) {
+        return value >= static_cast<int64_t>(std::numeric_limits<MKL_INT>::min()) &&
+               value <= static_cast<int64_t>(std::numeric_limits<MKL_INT>::max());
+    };
+    if (B > 1 && beta_t == T(0) &&
+        mkl_int_fits(B) && mkl_int_fits(M) && mkl_int_fits(N) &&
+        mkl_int_fits(K) && mkl_int_fits(lda) && mkl_int_fits(ldb) &&
+        mkl_int_fits(sr[1])) {
+        std::vector<const T*> a_ptrs(static_cast<size_t>(B));
+        std::vector<const T*> b_ptrs(static_cast<size_t>(B));
+        std::vector<T*> c_ptrs(static_cast<size_t>(B));
+        for (int64_t bi = 0; bi < B; ++bi) {
+            a_ptrs[static_cast<size_t>(bi)] = A + bi * s1[0];
+            b_ptrs[static_cast<size_t>(bi)] = Bp + bi * s2[0];
+            c_ptrs[static_cast<size_t>(bi)] = C + bi * sr[0];
+        }
+        const CBLAS_TRANSPOSE TA = trans_a ? CblasTrans : CblasNoTrans;
+        const CBLAS_TRANSPOSE TB = trans_b ? CblasTrans : CblasNoTrans;
+        const MKL_INT m = static_cast<MKL_INT>(M);
+        const MKL_INT n = static_cast<MKL_INT>(N);
+        const MKL_INT k = static_cast<MKL_INT>(K);
+        const MKL_INT lda_mkl = static_cast<MKL_INT>(lda);
+        const MKL_INT ldb_mkl = static_cast<MKL_INT>(ldb);
+        const MKL_INT ldc_mkl = static_cast<MKL_INT>(sr[1]);
+        const MKL_INT group_count = 1;
+        const MKL_INT group_size = static_cast<MKL_INT>(B);
+        if constexpr (std::is_same_v<T, float>) {
+            cblas_sgemm_batch(
+                CblasRowMajor, &TA, &TB, &m, &n, &k, &alpha_t,
+                a_ptrs.data(), &lda_mkl, b_ptrs.data(), &ldb_mkl,
+                &beta_t, c_ptrs.data(), &ldc_mkl, group_count, &group_size);
+        } else {
+            cblas_dgemm_batch(
+                CblasRowMajor, &TA, &TB, &m, &n, &k, &alpha_t,
+                a_ptrs.data(), &lda_mkl, b_ptrs.data(), &ldb_mkl,
+                &beta_t, c_ptrs.data(), &ldc_mkl, group_count, &group_size);
+        }
+        return;
+    }
+#endif
     for (int64_t bi = 0; bi < B; ++bi) {
         const int64_t a_off = bi * s1[0];
         const int64_t b_off = bi * s2[0];
+#if defined(USE_MKL) || defined(USE_BLAS)
         // beta == 0 must stay zero for every slice (bmm); only a nonzero
         // beta turns into an accumulate chain (baddbmm).
         const T beta_i = (bi == 0 || beta_t == T(0)) ? beta_t : T(1);
-#ifdef USE_MKL
-        CBLAS_TRANSPOSE TA = trans_a ? CblasTrans : CblasNoTrans;
-        CBLAS_TRANSPOSE TB = trans_b ? CblasTrans : CblasNoTrans;
+        const int64_t ldc = sr[1];
+        const CBLAS_TRANSPOSE TA = trans_a ? CblasTrans : CblasNoTrans;
+        const CBLAS_TRANSPOSE TB = trans_b ? CblasTrans : CblasNoTrans;
         if constexpr (std::is_same_v<T, float>) {
             cblas_sgemm(CblasRowMajor, TA, TB, (int)M, (int)N, (int)K,
                         alpha_t, A + a_off, (int)lda, Bp + b_off, (int)ldb,
-                        beta_i,
-                        C + bi * sr[0], (int)ldc);
+                        beta_i, C + bi * sr[0], (int)ldc);
         } else {
             cblas_dgemm(CblasRowMajor, TA, TB, (int)M, (int)N, (int)K,
                         alpha_t, A + a_off, (int)lda, Bp + b_off, (int)ldb,
-                        beta_i,
-                        C + bi * sr[0], (int)ldc);
+                        beta_i, C + bi * sr[0], (int)ldc);
         }
 #else
         (void)alpha_t; (void)beta_t;
