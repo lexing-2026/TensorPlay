@@ -2,12 +2,9 @@
 # -------
 #
 # Locate Intel MKL.  Resolution order:
-#   1. oneAPI MKLConfig.cmake (config mode) - full-featured MKL::MKL target.
-#      Honours MKL_THREADING / MKL_LINK / MKL_INTERFACE when set before this
-#      call, matching the oneAPI documented knobs.
-#   2. Manual discovery of a oneAPI ("mkl/latest") or classic ("lib/intel64")
+#   1. Manual discovery of a oneAPI ("mkl/latest") or classic ("lib/intel64")
 #      layout, assembling the interface + threading + core static/dynamic set.
-#   3. Generic FindBLAS with an Intel vendor hint as the last resort.
+#   2. Generic FindBLAS with an Intel vendor hint as the last resort.
 #
 # Input:
 #   MKL_ROOT / MKLROOT   (env/cache) install prefix searched first
@@ -29,12 +26,8 @@
 include(FindPackageHandleStandardArgs)
 
 # ---------------------------------------------------------------------------
-# 1) Config mode.  find_package(MKL CONFIG) resolves only MKLConfig.cmake and
-#    never re-enters this module.
+# 1) Reuse an existing target when the caller supplied one.
 # ---------------------------------------------------------------------------
-if(NOT WIN32 AND NOT TARGET MKL::MKL)
-    find_package(MKL CONFIG QUIET)
-endif()
 if(TARGET MKL::MKL)
     set(MKL_FOUND TRUE)
     if(NOT DEFINED MKL_VERSION)
@@ -181,6 +174,29 @@ if(NOT MKL_FOUND)
             set(MKL_INCLUDE_DIR "")
         endif()
         set(MKL_FOUND TRUE)
+    endif()
+endif()
+
+# Library discovery alone is insufficient for static MKL: the interface,
+# threading, core, and runtime archives must resolve as one link group.
+if(MKL_FOUND AND MKL_LIBRARIES)
+    include(CheckCXXSourceCompiles)
+    set(_TP_MKL_REQUIRED_LIBRARIES "${CMAKE_REQUIRED_LIBRARIES}")
+    set(_TP_MKL_REQUIRED_QUIET "${CMAKE_REQUIRED_QUIET}")
+    set(CMAKE_REQUIRED_LIBRARIES ${MKL_LIBRARIES} ${MKL_LIBRARIES})
+    set(CMAKE_REQUIRED_QUIET TRUE)
+    unset(TP_MKL_LINKS CACHE)
+    check_cxx_source_compiles(
+        "extern \"C\" void cblas_sgemm(); int main() { cblas_sgemm(); return 0; }"
+        TP_MKL_LINKS)
+    set(CMAKE_REQUIRED_LIBRARIES "${_TP_MKL_REQUIRED_LIBRARIES}")
+    set(CMAKE_REQUIRED_QUIET "${_TP_MKL_REQUIRED_QUIET}")
+    unset(_TP_MKL_REQUIRED_LIBRARIES)
+    unset(_TP_MKL_REQUIRED_QUIET)
+    if(NOT TP_MKL_LINKS)
+        message(WARNING "MKL libraries were found but do not form a usable link set.")
+        set(MKL_LIBRARIES "")
+        set(MKL_FOUND FALSE)
     endif()
 endif()
 
