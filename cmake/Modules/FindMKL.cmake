@@ -10,7 +10,8 @@
 #   MKL_ROOT / MKLROOT   (env/cache) install prefix searched first
 #   ONEAPI_ROOT          (env)       oneAPI install root (mkl/latest appended)
 #   MKL_INTERFACE        lp64 (default) or ilp64
-#   MKL_THREADING        sequential (default), gnu_thread, intel_thread, tbb
+#   MKL_THREADING        optional threading preference: sequential,
+#                        gnu_thread, intel_thread, or tbb
 #   MKL_LINK             static (default) or dynamic (uses the mkl_rt single-
 #                        dynamic-library entry point)
 #
@@ -20,6 +21,8 @@
 #   MKL_LIBRARIES        - ordered link set (empty when config mode supplied
 #                          the MKL::MKL target)
 #   MKL_VERSION          - "<year>.<minor>.<update>" when detectable
+#   MKL_OPENMP_TYPE      - selected OpenMP implementation (GNU or Intel)
+#   MKL_OPENMP_LIBRARY   - selected OpenMP runtime link item
 #   MKL::MKL             - interface target (created here only when config
 #                          mode did not already provide one)
 
@@ -61,16 +64,31 @@ set(MKL_INTERFACE_DEFAULT "lp64")
 if(NOT MKL_INTERFACE)
     set(MKL_INTERFACE "${MKL_INTERFACE_DEFAULT}")
 endif()
-if(NOT MKL_THREADING)
-    if(WIN32)
-        set(MKL_THREADING "intel_thread")
-    else()
-        set(MKL_THREADING "sequential")
-    endif()
-endif()
 if(NOT MKL_LINK)
     set(MKL_LINK "static")
 endif()
+
+include(CheckCXXSourceCompiles)
+
+set(MKL_OPENMP_TYPE "")
+set(MKL_OPENMP_LIBRARY "")
+
+# Static archives need the platform services used internally by the dispatch
+# and threading layers.  Apple provides these through its system runtime.
+set(_MKL_SYSTEM_LIBRARIES)
+if(UNIX AND NOT APPLE)
+    list(APPEND _MKL_SYSTEM_LIBRARIES pthread m ${CMAKE_DL_LIBS})
+endif()
+
+function(_tp_mkl_link_works _result)
+    set(CMAKE_REQUIRED_LIBRARIES ${ARGN} ${ARGN})
+    set(CMAKE_REQUIRED_QUIET TRUE)
+    unset(TP_MKL_CANDIDATE_LINKS CACHE)
+    check_cxx_source_compiles(
+        "extern \"C\" void cblas_sgemm(); int main() { cblas_sgemm(); return 0; }"
+        TP_MKL_CANDIDATE_LINKS)
+    set(${_result} "${TP_MKL_CANDIDATE_LINKS}" PARENT_SCOPE)
+endfunction()
 
 if(MKL_INCLUDE_DIR)
     if(MKL_LINK STREQUAL "dynamic")
@@ -80,55 +98,122 @@ if(MKL_INCLUDE_DIR)
             PATH_SUFFIXES lib lib/intel64
         )
         if(MKL_RT_LIBRARY)
-            set(MKL_LIBRARIES "${MKL_RT_LIBRARY}")
+            _tp_mkl_link_works(_MKL_RT_WORKS "${MKL_RT_LIBRARY}")
+            if(_MKL_RT_WORKS)
+                set(MKL_LIBRARIES "${MKL_RT_LIBRARY}")
+            endif()
         endif()
     else()
         set(_MKL_LIB_SUFFIXES lib lib/intel64)
-        if(WIN32)
-            set(_MKL_LIB_SUFFIXES lib lib/intel64)
+        set(_MKL_INTERFACE_NAMES
+            "mkl_${MKL_INTERFACE}"
+            "mkl_intel_${MKL_INTERFACE}")
+        if(NOT WIN32)
+            list(APPEND _MKL_INTERFACE_NAMES "mkl_gf_${MKL_INTERFACE}")
         endif()
-        if(MKL_THREADING STREQUAL "sequential")
-            set(_MKL_THREAD_LIB mkl_sequential)
-        else()
-            set(_MKL_THREAD_LIB mkl_${MKL_THREADING})
-        endif()
-        foreach(_comp mkl_${MKL_INTERFACE} ${_MKL_THREAD_LIB} mkl_core)
-            # Both layouts exist in the wild: OneAPI installs the interface
-            # layer as libmkl_<iface>.a, the pip mkl-static wheel ships
-            # libmkl_intel_<iface>.a.  The interface layer is mandatory --
-            # the cblas entry points live there -- so a miss voids the set
-            # rather than half-configuring.
-            set(_MKL_CANDIDATES "${_comp}")
-            if(_comp STREQUAL "mkl_${MKL_INTERFACE}")
-                list(APPEND _MKL_CANDIDATES "mkl_intel_${MKL_INTERFACE}")
+
+        if(MKL_THREADING)
+            set(_MKL_THREADING_CANDIDATES "${MKL_THREADING}")
+            if(NOT MKL_THREADING STREQUAL "sequential")
+                list(APPEND _MKL_THREADING_CANDIDATES sequential)
             endif()
-            find_library(MKL_${_comp}_LIBRARY
-                NAMES ${_MKL_CANDIDATES}
+        elseif(WIN32)
+            set(_MKL_THREADING_CANDIDATES intel_thread sequential)
+        elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+            set(_MKL_THREADING_CANDIDATES gnu_thread intel_thread sequential)
+        else()
+            set(_MKL_THREADING_CANDIDATES intel_thread sequential)
+        endif()
+        list(REMOVE_DUPLICATES _MKL_THREADING_CANDIDATES)
+
+        find_library(MKL_CORE_LIBRARY
+            NAMES mkl_core
+            HINTS ${_MKL_ROOTS}
+            PATH_SUFFIXES ${_MKL_LIB_SUFFIXES})
+
+        foreach(_MKL_INTERFACE_NAME IN LISTS _MKL_INTERFACE_NAMES)
+            string(MAKE_C_IDENTIFIER "${_MKL_INTERFACE_NAME}" _MKL_INTERFACE_ID)
+            find_library(MKL_INTERFACE_${_MKL_INTERFACE_ID}_LIBRARY
+                NAMES "${_MKL_INTERFACE_NAME}"
                 HINTS ${_MKL_ROOTS}
                 PATH_SUFFIXES ${_MKL_LIB_SUFFIXES}
             )
-            if(MKL_${_comp}_LIBRARY)
-                list(APPEND MKL_LIBRARIES "${MKL_${_comp}_LIBRARY}")
-            elseif(_comp STREQUAL "mkl_${MKL_INTERFACE}")
-                set(MKL_LIBRARIES "")
+            if(NOT MKL_INTERFACE_${_MKL_INTERFACE_ID}_LIBRARY OR
+               NOT MKL_CORE_LIBRARY)
+                continue()
+            endif()
+
+            foreach(_MKL_THREADING_NAME IN LISTS _MKL_THREADING_CANDIDATES)
+                if(_MKL_THREADING_NAME STREQUAL "sequential")
+                    set(_MKL_THREAD_LIBRARY_NAMES mkl_sequential)
+                    set(_MKL_RUNTIME_LIBRARIES)
+                    set(_MKL_CANDIDATE_OPENMP_TYPE "")
+                    set(_MKL_CANDIDATE_OPENMP_LIBRARY "")
+                elseif(_MKL_THREADING_NAME STREQUAL "gnu_thread")
+                    set(_MKL_THREAD_LIBRARY_NAMES mkl_gnu_thread)
+                    if(NOT TARGET OpenMP::OpenMP_CXX)
+                        continue()
+                    endif()
+                    set(_MKL_RUNTIME_LIBRARIES OpenMP::OpenMP_CXX)
+                    set(_MKL_CANDIDATE_OPENMP_TYPE GNU)
+                    set(_MKL_CANDIDATE_OPENMP_LIBRARY OpenMP::OpenMP_CXX)
+                elseif(_MKL_THREADING_NAME STREQUAL "intel_thread")
+                    set(_MKL_THREAD_LIBRARY_NAMES mkl_intel_thread)
+                    find_library(MKL_INTEL_RUNTIME_LIBRARY
+                        NAMES libiomp5md iomp5
+                        HINTS ${_MKL_ROOTS}
+                        PATH_SUFFIXES ${_MKL_LIB_SUFFIXES})
+                    if(NOT MKL_INTEL_RUNTIME_LIBRARY)
+                        continue()
+                    endif()
+                    set(_MKL_RUNTIME_LIBRARIES "${MKL_INTEL_RUNTIME_LIBRARY}")
+                    set(_MKL_CANDIDATE_OPENMP_TYPE Intel)
+                    set(_MKL_CANDIDATE_OPENMP_LIBRARY "${MKL_INTEL_RUNTIME_LIBRARY}")
+                elseif(_MKL_THREADING_NAME STREQUAL "tbb")
+                    set(_MKL_THREAD_LIBRARY_NAMES mkl_tbb_thread)
+                    find_library(MKL_TBB_RUNTIME_LIBRARY
+                        NAMES tbb12 tbb
+                        HINTS ${_MKL_ROOTS}
+                        PATH_SUFFIXES ${_MKL_LIB_SUFFIXES})
+                    if(NOT MKL_TBB_RUNTIME_LIBRARY)
+                        continue()
+                    endif()
+                    set(_MKL_RUNTIME_LIBRARIES "${MKL_TBB_RUNTIME_LIBRARY}")
+                    set(_MKL_CANDIDATE_OPENMP_TYPE "")
+                    set(_MKL_CANDIDATE_OPENMP_LIBRARY "")
+                else()
+                    message(FATAL_ERROR "Unsupported MKL_THREADING value: ${_MKL_THREADING_NAME}")
+                endif()
+
+                string(MAKE_C_IDENTIFIER "${_MKL_THREADING_NAME}" _MKL_THREADING_ID)
+                find_library(MKL_THREAD_${_MKL_THREADING_ID}_LIBRARY
+                    NAMES ${_MKL_THREAD_LIBRARY_NAMES}
+                    HINTS ${_MKL_ROOTS}
+                    PATH_SUFFIXES ${_MKL_LIB_SUFFIXES})
+                if(NOT MKL_THREAD_${_MKL_THREADING_ID}_LIBRARY)
+                    continue()
+                endif()
+
+                set(_MKL_CANDIDATE_LIBRARIES
+                    "${MKL_INTERFACE_${_MKL_INTERFACE_ID}_LIBRARY}"
+                    "${MKL_THREAD_${_MKL_THREADING_ID}_LIBRARY}"
+                    "${MKL_CORE_LIBRARY}"
+                    ${_MKL_RUNTIME_LIBRARIES}
+                    ${_MKL_SYSTEM_LIBRARIES})
+                _tp_mkl_link_works(_MKL_CANDIDATE_WORKS
+                    ${_MKL_CANDIDATE_LIBRARIES})
+                if(_MKL_CANDIDATE_WORKS)
+                    set(MKL_LIBRARIES ${_MKL_CANDIDATE_LIBRARIES})
+                    set(MKL_THREADING "${_MKL_THREADING_NAME}")
+                    set(MKL_OPENMP_TYPE "${_MKL_CANDIDATE_OPENMP_TYPE}")
+                    set(MKL_OPENMP_LIBRARY "${_MKL_CANDIDATE_OPENMP_LIBRARY}")
+                    break()
+                endif()
+            endforeach()
+            if(MKL_LIBRARIES)
+                break()
             endif()
         endforeach()
-        if(WIN32 AND MKL_THREADING STREQUAL "intel_thread")
-            find_library(MKL_THREAD_RUNTIME_LIBRARY
-                NAMES libiomp5md iomp5
-                HINTS ${_MKL_ROOTS}
-                PATH_SUFFIXES ${_MKL_LIB_SUFFIXES}
-            )
-            if(MKL_THREAD_RUNTIME_LIBRARY)
-                list(APPEND MKL_LIBRARIES "${MKL_THREAD_RUNTIME_LIBRARY}")
-            endif()
-        endif()
-        # Threaded layers talk to an OpenMP runtime; carry ours so consumers
-        # resolve the symbols without extra bookkeeping.
-        if(MKL_THREADING MATCHES "^(gnu_thread|intel_thread)$"
-           AND TARGET OpenMP::OpenMP_CXX)
-            list(APPEND MKL_LIBRARIES OpenMP::OpenMP_CXX)
-        endif()
     endif()
 endif()
 
@@ -174,29 +259,6 @@ if(NOT MKL_FOUND)
             set(MKL_INCLUDE_DIR "")
         endif()
         set(MKL_FOUND TRUE)
-    endif()
-endif()
-
-# Library discovery alone is insufficient for static MKL: the interface,
-# threading, core, and runtime archives must resolve as one link group.
-if(MKL_FOUND AND MKL_LIBRARIES)
-    include(CheckCXXSourceCompiles)
-    set(_TP_MKL_REQUIRED_LIBRARIES "${CMAKE_REQUIRED_LIBRARIES}")
-    set(_TP_MKL_REQUIRED_QUIET "${CMAKE_REQUIRED_QUIET}")
-    set(CMAKE_REQUIRED_LIBRARIES ${MKL_LIBRARIES} ${MKL_LIBRARIES})
-    set(CMAKE_REQUIRED_QUIET TRUE)
-    unset(TP_MKL_LINKS CACHE)
-    check_cxx_source_compiles(
-        "extern \"C\" void cblas_sgemm(); int main() { cblas_sgemm(); return 0; }"
-        TP_MKL_LINKS)
-    set(CMAKE_REQUIRED_LIBRARIES "${_TP_MKL_REQUIRED_LIBRARIES}")
-    set(CMAKE_REQUIRED_QUIET "${_TP_MKL_REQUIRED_QUIET}")
-    unset(_TP_MKL_REQUIRED_LIBRARIES)
-    unset(_TP_MKL_REQUIRED_QUIET)
-    if(NOT TP_MKL_LINKS)
-        message(WARNING "MKL libraries were found but do not form a usable link set.")
-        set(MKL_LIBRARIES "")
-        set(MKL_FOUND FALSE)
     endif()
 endif()
 

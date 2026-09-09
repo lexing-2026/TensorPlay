@@ -551,18 +551,13 @@ if(USE_BLAS)
     set_property(CACHE BLAS_PROVIDER PROPERTY STRINGS "MKL" "OpenBLAS")
 
     if(BLAS_PROVIDER STREQUAL "MKL")
-        # Select the OpenMP runtime that matches the active toolchain unless
-        # the caller supplied an explicit compatible choice.
-        if(NOT MKL_THREADING)
-            if(WIN32)
-                set(MKL_THREADING "intel_thread")
-            else()
-                set(MKL_THREADING "gnu_thread")
-            endif()
+        if(NOT MKL_LINK)
+            set(MKL_LINK "static")
         endif()
-        set(MKL_LINK "static")
-        # Our kernels use 32-bit cblas indices; MKLConfig defaults to ilp64.
-        set(MKL_INTERFACE lp64)
+        # Our kernels use 32-bit cblas indices by default.
+        if(NOT MKL_INTERFACE)
+            set(MKL_INTERFACE lp64)
+        endif()
         # Resolve the interface, threading, and runtime libraries as one
         # link set on every platform.
         find_package(MKL MODULE QUIET)
