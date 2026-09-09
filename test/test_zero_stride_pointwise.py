@@ -122,5 +122,33 @@ class TestBroadcastAutogradChain(unittest.TestCase):
                         self.assertEqual(g[r][j].item(), 0.0)
 
 
+class TestBackwardSeedPieces(unittest.TestCase):
+    """Direct checks of the two pieces the grad chain composes, without
+    running the engine: the one-hot seed from select_backward, and the
+    stride metadata of the unsqueeze+expand broadcast.  A failure here
+    names the broken stage; a pass shifts the search downstream."""
+
+    def test_expand_view_strides(self):
+        seed = tp.tensor([1.0, 2.0], dtype=tp.float64)
+        view = seed.unsqueeze(1).expand(2, 3)
+        self.assertEqual(tuple(view.stride()), (1, 0))
+        self.assertFalse(view.is_contiguous())
+        sd = seed.detach()
+        for r in range(2):
+            for c in range(3):
+                self.assertEqual(view[r][c].item(), sd[r].item())
+
+    def test_select_backward_one_hot(self):
+        import tensorplay._C as C
+        vec = tp.rand(4, dtype=tp.float64)
+        for i in range(4):
+            gi = C.select_backward(tp.tensor(1.0, dtype=tp.float64),
+                                   vec, 0, i)
+            expected = [1.0 if r == i else 0.0 for r in range(4)]
+            actual = [gi[r].item() for r in range(4)]
+            self.assertEqual(actual, expected,
+                             msg=f"select_backward index {i}")
+
+
 if __name__ == "__main__":
     unittest.main()

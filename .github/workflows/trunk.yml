@@ -189,7 +189,7 @@ jobs:
         {"name":"nn-utils","test_files":"test/test_nn_utils_norm.py"},
         {"name":"tensor-api","test_files":"test/test_sequence_factories.py test/test_shape_funcs.py test/test_tensor_properties_native.py"},
         {"name":"native-ops","test_files":"test/test_missing_native_ops.py test/test_prev_kernel_less_ops.py test/test_native_vmap_indexing.py"},
-        {"name":"autograd","test_files":"test/test_autograd_engine.py test/test_autograd_functional.py test/test_forward_ad.py test/test_view_rebase.py test/test_version_counter.py"},
+        {"name":"autograd","test_files":"test/test_autograd_engine.py test/test_autograd_functional.py test/test_forward_ad.py test/test_view_rebase.py test/test_version_counter.py test/test_zero_stride_pointwise.py"},
         {"name":"nn-api","test_files":"test/test_init.py test/test_linear_init.py test/test_new_layers.py test/test_nn_repr.py test/test_parameter.py"}]
       # Main-branch pushes publish their smoke-tested wheels to the rolling
       # nightly release; tags and release branches publish to their own.
