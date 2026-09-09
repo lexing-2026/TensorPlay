@@ -9,7 +9,10 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <numeric>
+#include <sstream>
 #include <utility>
 
 namespace tensorplay {
@@ -1123,6 +1126,29 @@ void TensorIteratorBase::build(TensorIteratorConfig& config) {
   // a valid value for the offset
   int64_t ndim_offsets = (ndim() ? ndim() : 1);
   view_offsets_.assign(ndim_offsets, 0);
+
+  if (std::getenv("TP_TENSORITERATOR_DEBUG") != nullptr) {
+    std::ostringstream os;
+    os << "TensorIterator build: is_reduction=" << is_reduction_
+       << " shape=[";
+    for (const auto d : irange(ndim())) os << (d ? ", " : "") << shape_[d];
+    os << "] perm=[";
+    for (const auto d : irange(perm_.size())) os << (d ? ", " : "") << perm_[d];
+    os << "] coalesced=" << (has_coalesced_dimensions_ ? 1 : 0) << "\n";
+    for (const auto arg : irange(operands_.size())) {
+      const auto& op = operands_[arg];
+      os << "  operand " << arg << (op.is_output ? " (out)" : " (in)")
+         << ": shape=[";
+      const auto sizes = static_cast<std::vector<int64_t>>(op.tensor().shape());
+      for (const auto d : irange(sizes.size()))
+        os << (d ? ", " : "") << sizes[d];
+      os << "] stride_bytes=[";
+      for (const auto d : irange(op.stride_bytes.size()))
+        os << (d ? ", " : "") << op.stride_bytes[d];
+      os << "]\n";
+    }
+    std::fputs(os.str().c_str(), stderr);
+  }
 }
 
 void TensorIteratorBase::set_output_raw_strided(
