@@ -181,7 +181,7 @@ Tensor reduce_dims_impl(const Tensor& self, std::vector<int64_t> dims_in,
 // mean_var_over_dims keeps external linkage: ReductionKernels.cpp reaches it
 // through an extern declaration.
 std::pair<Tensor, Tensor> mean_var_over_dims(const Tensor& self,
-                                             std::vector<int64_t> dims_in,
+                                             const std::vector<int64_t>& dims_in,
                                              int64_t correction, bool keepdim) {
     if (isComplexType(self.dtype())) {
         const Tensor real = ops::real(self);
@@ -195,7 +195,7 @@ std::pair<Tensor, Tensor> mean_var_over_dims(const Tensor& self,
     }
 
     const int64_t nd = self.dim();
-    std::vector<int64_t> dims = std::move(dims_in);
+    std::vector<int64_t> dims = dims_in;
     if (dims.empty()) {
         for (int64_t i = 0; i < nd; ++i) dims.push_back(i);
     }
@@ -563,18 +563,18 @@ std::tuple<Tensor, Tensor> cummin_cpu(const Tensor& self, int64_t dim) {
 }
 
 std::tuple<Tensor, Tensor> std_mean_cpu(const Tensor& self,
-                                        std::vector<int64_t> dim,
+                                        const std::vector<int64_t>& dim,
                                         bool unbiased, bool keepdim) {
     auto vr_mean = mean_var_over_dims(
-        self, std::move(dim), unbiased ? int64_t(1) : int64_t(0), keepdim);
+        self, dim, unbiased ? int64_t(1) : int64_t(0), keepdim);
     return {vr_mean.first.sqrt(), vr_mean.second};
 }
 
 std::tuple<Tensor, Tensor> var_mean_cpu(const Tensor& self,
-                                        std::vector<int64_t> dim,
+                                        const std::vector<int64_t>& dim,
                                         bool unbiased, bool keepdim) {
     return mean_var_over_dims(
-        self, std::move(dim), unbiased ? int64_t(1) : int64_t(0), keepdim);
+        self, dim, unbiased ? int64_t(1) : int64_t(0), keepdim);
 }
 
 Tensor nanmedian_cpu(const Tensor& self) {

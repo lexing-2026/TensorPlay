@@ -13,7 +13,7 @@ namespace tensorplay {
 namespace cpu {
 
 extern std::pair<Tensor, Tensor> mean_var_over_dims(
-    const Tensor& self, std::vector<int64_t> dims, int64_t correction,
+    const Tensor& self, const std::vector<int64_t>& dims, int64_t correction,
     bool keepdim);
 
 DEFINE_DISPATCH(sum_stub);
@@ -38,7 +38,7 @@ Tensor sum_kernel(const Tensor& self, DType dtype) {
     return sum_stub(DeviceType::CPU, self, dtype);
 }
 
-Tensor sum_dim_kernel(const Tensor& self, std::vector<int64_t> dims, bool keepdim, DType dtype) {
+Tensor sum_dim_kernel(const Tensor& self, const std::vector<int64_t>& dims, bool keepdim, DType dtype) {
     return sum_dim_stub(DeviceType::CPU, self, std::move(dims), keepdim, dtype);
 }
 
@@ -48,7 +48,7 @@ Tensor mean_kernel(const Tensor& self, DType dtype) {
     return s / Scalar(self.numel());
 }
 
-Tensor mean_dim_kernel(const Tensor& self, std::vector<int64_t> dims, bool keepdim, DType dtype) {
+Tensor mean_dim_kernel(const Tensor& self, const std::vector<int64_t>& dims, bool keepdim, DType dtype) {
     DType out_dtype = (dtype == DType::Undefined) ? (isFloatingOrComplexType(self.dtype()) ? self.dtype() : DType::Float32) : dtype;
     Tensor s = sum_dim_kernel(self, dims, keepdim, out_dtype);
 
@@ -142,7 +142,7 @@ Tensor prod_kernel(const Tensor& self, DType dtype) {
     return prod_stub(DeviceType::CPU, self, dtype);
 }
 
-Tensor prod_dim_kernel(const Tensor& self, std::vector<int64_t> dims, bool keepdim, DType dtype) {
+Tensor prod_dim_kernel(const Tensor& self, const std::vector<int64_t>& dims, bool keepdim, DType dtype) {
     return prod_dim_stub(DeviceType::CPU, self, std::move(dims), keepdim, dtype);
 }
 
@@ -150,7 +150,7 @@ Tensor all_kernel(const Tensor& self) {
     return all_stub(DeviceType::CPU, self);
 }
 
-Tensor all_dim_kernel(const Tensor& self, std::vector<int64_t> dims, bool keepdim) {
+Tensor all_dim_kernel(const Tensor& self, const std::vector<int64_t>& dims, bool keepdim) {
     return all_dim_stub(DeviceType::CPU, self, std::move(dims), keepdim);
 }
 
@@ -162,7 +162,7 @@ Tensor any_kernel(const Tensor& self) {
     return any_stub(DeviceType::CPU, self);
 }
 
-Tensor any_dim_kernel(const Tensor& self, std::vector<int64_t> dims, bool keepdim) {
+Tensor any_dim_kernel(const Tensor& self, const std::vector<int64_t>& dims, bool keepdim) {
     return any_dim_stub(DeviceType::CPU, self, std::move(dims), keepdim);
 }
 
@@ -190,7 +190,7 @@ Tensor std_kernel(const Tensor& self, int64_t correction) {
     return var_kernel(self, correction).sqrt();
 }
 
-Tensor std_dim_kernel(const Tensor& self, std::vector<int64_t> dim, int64_t correction, bool keepdim) {
+Tensor std_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, int64_t correction, bool keepdim) {
     return var_dim_kernel(self, dim, correction, keepdim).sqrt();
 }
 
@@ -207,7 +207,7 @@ Tensor norm_kernel(const Tensor& self, double p) {
     return self.abs().pow(Scalar(p)).sum().pow(Scalar(1.0/p));
 }
 
-Tensor norm_dim_kernel(const Tensor& self, std::vector<int64_t> dim, double p, bool keepdim) {
+Tensor norm_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, double p, bool keepdim) {
     if (self.dtype() == DType::Float32 || self.dtype() == DType::Float64 ||
         self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16 ||
         isComplexType(self.dtype())) {
