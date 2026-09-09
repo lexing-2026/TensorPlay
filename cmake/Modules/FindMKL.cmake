@@ -69,7 +69,11 @@ if(NOT MKL_INTERFACE)
     set(MKL_INTERFACE "${MKL_INTERFACE_DEFAULT}")
 endif()
 if(NOT MKL_THREADING)
-    set(MKL_THREADING "sequential")
+    if(WIN32)
+        set(MKL_THREADING "intel_thread")
+    else()
+        set(MKL_THREADING "sequential")
+    endif()
 endif()
 if(NOT MKL_LINK)
     set(MKL_LINK "static")
@@ -116,6 +120,16 @@ if(MKL_INCLUDE_DIR)
                 set(MKL_LIBRARIES "")
             endif()
         endforeach()
+        if(WIN32 AND MKL_THREADING STREQUAL "intel_thread")
+            find_library(MKL_THREAD_RUNTIME_LIBRARY
+                NAMES libiomp5md iomp5
+                HINTS ${_MKL_ROOTS}
+                PATH_SUFFIXES ${_MKL_LIB_SUFFIXES}
+            )
+            if(MKL_THREAD_RUNTIME_LIBRARY)
+                list(APPEND MKL_LIBRARIES "${MKL_THREAD_RUNTIME_LIBRARY}")
+            endif()
+        endif()
         # Threaded layers talk to an OpenMP runtime; carry ours so consumers
         # resolve the symbols without extra bookkeeping.
         if(MKL_THREADING MATCHES "^(gnu_thread|intel_thread)$"

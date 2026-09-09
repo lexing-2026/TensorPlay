@@ -20,11 +20,7 @@
 
 #include "cpu/vec/intrinsics.h"
 
-#if defined(_MSC_VER) && defined(_M_X64)
-#define TP_SLEEF_CC __vectorcall
-#else
 #define TP_SLEEF_CC
-#endif
 
 // The vector-math entry points exist only on the x86-64 paths; other
 // architectures keep the file includable and compile the scalar fallbacks.
