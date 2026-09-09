@@ -30,9 +30,6 @@
     <a href="https://download.tensorplay.cn/project/tensorplay/">
         <img src="https://badge.tensorplay.cn/v1/badge/tensorplay/version.svg" alt="TensorPlay version">
     </a>
-    <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/lint.yml">
-        <img src="https://img.shields.io/github/actions/workflow/status/lexing-2026/TensorPlay/lint.yml?style=flat-square&label=lint&color=23347A&labelColor=11B5D1&logo=githubactions&logoColor=white" alt="Lint">
-    </a>
     <a href="https://download.tensorplay.cn/status/">
         <img src="https://badge.tensorplay.cn/v1/badge/tensorplay/status.svg" alt="Service status">
     </a>
@@ -41,6 +38,9 @@
     </a>
     <a href="./LICENSE">
         <img src="https://badge.tensorplay.cn/v1/badge/tensorplay/license.svg" alt="License">
+    </a>
+    <a href="https://download.tensorplay.cn/project/tensorplay/stats/">
+        <img src="https://badge.tensorplay.cn/v1/badge/tensorplay/downloads.svg" alt="Weekly downloads">
     </a>
     <a href="#installation">
         <img src="https://badge.tensorplay.cn/v1/badge/tensorplay/pip.svg" alt="pip install tensorplay">
@@ -52,6 +52,9 @@
 <summary>Build matrix &amp; community signals</summary>
 
 <p>
+    <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/lint.yml">
+        <img src="https://img.shields.io/github/actions/workflow/status/lexing-2026/TensorPlay/lint.yml?style=flat-square&label=lint&color=23347A&labelColor=11B5D1&logo=githubactions&logoColor=white" alt="Lint">
+    </a>
     <a href="./README.md">
         <img src="https://img.shields.io/badge/English-🇺🇸-23347A?style=flat-square&labelColor=11B5D1" alt="English">
     </a>
@@ -79,13 +82,6 @@
     </a>
     <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/trunk.yml">
         <img src="https://img.shields.io/badge/coverage-91%25-11B5D1?style=flat-square&labelColor=23347A" alt="Coverage">
-    </a>
-</p>
-
-<!-- Package & Stats -->
-<p>
-    <a href="https://download.tensorplay.cn/project/tensorplay/stats/">
-        <img src="https://badge.tensorplay.cn/v1/badge/tensorplay/downloads.svg" alt="Weekly downloads">
     </a>
 </p>
 
