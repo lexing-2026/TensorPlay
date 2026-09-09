@@ -27,15 +27,23 @@
 </p>
 
 <p>
-    <img src="https://img.shields.io/badge/Python-3.10~3.13-23347A?style=flat-square&labelColor=11B5D1&logo=python&logoColor=white" alt="Python Versions">
+    <a href="https://download.tensorplay.cn/project/tensorplay/">
+        <img src="https://download.tensorplay.cn/v1/badge/tensorplay/version.svg" alt="TensorPlay version">
+    </a>
     <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/lint.yml">
         <img src="https://img.shields.io/github/actions/workflow/status/lexing-2026/TensorPlay/lint.yml?style=flat-square&label=lint&color=23347A&labelColor=11B5D1&logo=githubactions&logoColor=white" alt="Lint">
     </a>
-    <a href="https://pypi.org/project/tensorplay/">
-        <img src="https://img.shields.io/pypi/v/tensorplay?style=flat-square&label=PyPI&color=23347A&labelColor=11B5D1&logo=pypi&logoColor=white" alt="PyPI Version">
+    <a href="https://download.tensorplay.cn/status/">
+        <img src="https://download.tensorplay.cn/v1/badge/tensorplay/status.svg" alt="Service status">
+    </a>
+    <a href="#installation">
+        <img src="https://download.tensorplay.cn/v1/badge/tensorplay/python.svg" alt="Python versions">
     </a>
     <a href="./LICENSE">
-        <img src="https://img.shields.io/badge/License-Apache%202.0-23347A?style=flat-square&labelColor=11B5D1&logo=apache&logoColor=white" alt="License">
+        <img src="https://download.tensorplay.cn/v1/badge/tensorplay/license.svg" alt="License">
+    </a>
+    <a href="#installation">
+        <img src="https://download.tensorplay.cn/v1/badge/tensorplay/pip.svg" alt="pip install tensorplay">
     </a>
 </p>
 </div>
@@ -76,8 +84,8 @@
 
 <!-- Package & Stats -->
 <p>
-    <a href="https://pepy.tech/projects/tensorplay">
-        <img src="https://img.shields.io/pepy/dm/tensorplay?style=flat-square&label=monthly%20downloads&color=11B5D1&labelColor=23347A" alt="Monthly Downloads">
+    <a href="https://download.tensorplay.cn/project/tensorplay/stats/">
+        <img src="https://download.tensorplay.cn/v1/badge/tensorplay/downloads.svg" alt="Weekly downloads">
     </a>
 </p>
 
