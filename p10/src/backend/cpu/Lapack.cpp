@@ -142,11 +142,11 @@ bool resolve_all(LibHandle handle) {
 }
 
 LibHandle find_library() {
+    namespace fs = std::filesystem;
 #ifdef _WIN32
     if (const char* env = std::getenv("TP_LAPACK_LIB")) {
         if (LibHandle h = open_lib(env)) return h;
     }
-    namespace fs = std::filesystem;
     std::vector<std::string> bases;
     if (const char* cp = std::getenv("CONDA_PREFIX")) bases.push_back(cp);
     if (const char* vp = std::getenv("VIRTUAL_ENV")) bases.push_back(vp);
