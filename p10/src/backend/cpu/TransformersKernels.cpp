@@ -29,7 +29,11 @@
 #if defined(USE_MKL)
 #include <mkl.h>
 #elif defined(USE_BLAS)
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#else
 #include <cblas.h>
+#endif
 #endif
 #include "cpu/vec/SleefShims.h"
 

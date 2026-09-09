@@ -31,7 +31,11 @@
 #ifdef USE_MKL
 #include <mkl.h>
 #elif defined(USE_BLAS)
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#else
 #include <cblas.h>
+#endif
 #endif
 
 #ifdef _OPENMP
