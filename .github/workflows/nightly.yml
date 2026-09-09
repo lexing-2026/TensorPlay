@@ -5,7 +5,7 @@ name: nightly
 # computed by tools/generate_tensorplay_version.py. Wheels land on the
 # rolling "nightly" GitHub Release, and the wheel-index workflow
 # triggers the download-site rebuild from release events. Only the
-# newest dev version per variant is retained.
+# newest calendar day of wheels is retained.
 #
 # workflow_dispatch stays available for manual retries of a failed matrix
 # leg or off-schedule builds; the version/build_number/filters inputs

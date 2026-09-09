@@ -481,10 +481,10 @@ jobs:
           gh release upload "$release" dist/*.whl dist/*.sigstore.json \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
-          # The rolling channel keeps only the newest dev build per wheel
-          # tag: without the prune, superseded wheels linger and consumers
-          # globbing a wheel pattern get several mutually exclusive
-          # versions at once.
+          # The rolling channel keeps only the newest calendar day of wheels,
+          # with one same-day build per wheel tag. Without the prune,
+          # superseded wheels linger and consumers globbing a wheel pattern
+          # get several mutually exclusive versions at once.
           if [[ "$release" == "nightly" ]]; then
             python .github/scripts/prune_superseded_wheels.py \
               --repo "$GITHUB_REPOSITORY" \
