@@ -119,11 +119,7 @@ Tensor sum_dim_backward_kernel(const Tensor& grad_output, const Tensor& self,
             expanded = expanded.unsqueeze(d);
         }
     }
-    // Materialize the broadcast instead of returning a zero-stride view:
-    // consumers of this gradient read it back as a dense tensor, and a
-    // strided view couples the result to every caller's iteration order.
-    return expanded.expand(static_cast<std::vector<int64_t>>(self.shape()))
-        .contiguous();
+    return expanded.expand(static_cast<std::vector<int64_t>>(self.shape()));
 }
 
 std::tuple<Tensor, Tensor> max_dim_kernel(const Tensor& self, int64_t dim, bool keepdim) {
