@@ -3,6 +3,6 @@ wheel>=0.34.0
 pybind11>=3.1.0
 numpy>=2.0.0
 sympy>=1.13.3
-megatensors>=0.0.5
+megatensors>=0.0.5; platform_system != 'Darwin'
 tensorboard>=2.11
 pillow>=9.0

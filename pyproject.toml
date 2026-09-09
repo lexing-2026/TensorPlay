@@ -24,7 +24,6 @@ requires-python = ">=3.10,<3.14"
 dependencies = [
     "numpy>=2.0.0",
     "sympy>=1.13.3",
-    "megatensors>=0.0.5",
     "typing-extensions>=4.16.0",
     "PyYAML"
 ]
@@ -56,7 +55,11 @@ all = [
     "scipy",
     "soundfile",
     "tensorboard>=2.11",
-    "pillow>=9.0"
+    "pillow>=9.0",
+    "megatensors>=0.0.5; platform_system != 'Darwin'"
+]
+mega = [
+    "megatensors>=0.0.5; platform_system != 'Darwin'"
 ]
 tensorboard = [
     "tensorboard>=2.11",
