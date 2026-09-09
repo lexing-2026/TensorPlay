@@ -111,9 +111,20 @@ jobs:
         shell: bash
         run: |
           case "$RUNNER_OS" in
-            Linux)  echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV" ;;
-            macOS)  echo "CCACHE_DIR=$HOME/Library/Caches/ccache" >> "$GITHUB_ENV" ;;
-            Windows) echo "SCCACHE_DIR=$HOME/.cache/sccache" >> "$GITHUB_ENV" ;;
+            Linux)
+              echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+              echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+              echo "CCACHE_NOHASHDIR=1" >> "$GITHUB_ENV"
+              ;;
+            macOS)
+              echo "CCACHE_DIR=$HOME/Library/Caches/ccache" >> "$GITHUB_ENV"
+              echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+              echo "CCACHE_NOHASHDIR=1" >> "$GITHUB_ENV"
+              ;;
+            Windows)
+              echo "SCCACHE_DIR=$HOME/.cache/sccache" >> "$GITHUB_ENV"
+              echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
+              ;;
           esac
 
       - name: Restore compiler cache
@@ -124,6 +135,7 @@ jobs:
           key: buildcache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.build_environment }}-${{ inputs.python_version }}-${{ inputs.cuda }}-${{ github.sha }}
           restore-keys: |
             buildcache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.build_environment }}-${{ inputs.python_version }}-${{ inputs.cuda }}-
+          save-always: true
 
       # Release tags pin the exact version. CUDA wheels use a local version
       # suffix so CPU and CUDA files can coexist in one GitHub Release.
@@ -212,6 +224,10 @@ jobs:
           fi
           if command -v sccache >/dev/null 2>&1; then
             sccache --show-stats || true
+          fi
+          if [[ "$RUNNER_OS" == "Windows" ]] &&
+             [[ -f .github/ci/windows/sccache-bin/sccache.exe ]]; then
+            .github/ci/windows/sccache-bin/sccache.exe --show-stats || true
           fi
 
       - name: Upload built wheel

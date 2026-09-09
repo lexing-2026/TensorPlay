@@ -405,6 +405,11 @@ if(USE_CCACHE)
                 "${SCCACHE_EXECUTABLE}"
                 CACHE STRING "${_LANG} compiler launcher")
         endforeach()
+        if(USE_CUDA)
+            set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
+            set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_LIBRARIES 0)
+            set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_OBJECTS 0)
+        endif()
     else()
         message(STATUS
             "Neither ccache nor sccache found; builds will not be cached.")
