@@ -234,6 +234,14 @@ LibHandle find_library() {
             }
         }
     }
+    // Per-user pip installs (the scheme used when the interpreter's
+    // site-packages is not writable by the running account).
+    if (const char* home = std::getenv("HOME")) {
+        for (int minor = 8; minor <= 14; ++minor) {
+            bases.push_back(std::string(home) + "/Library/Python/3." +
+                            std::to_string(minor) + "/lib/python");
+        }
+    }
 #endif
     if (const char* cp = std::getenv("CONDA_PREFIX")) bases.push_back(cp);
     if (const char* vp = std::getenv("VIRTUAL_ENV")) bases.push_back(vp);
@@ -243,40 +251,45 @@ LibHandle find_library() {
     }
     bases.push_back("/usr/local/lib");  // Debian/Ubuntu pip: python3.X/dist-packages
     bases.push_back("/usr/lib");        // apt: python3/dist-packages
-    for (const auto& base : bases) {
-        const std::string dir_path = base + "/numpy.libs";
+    // Wheels bundle their OpenBLAS under platform-specific directories:
+    // "numpy.libs" on manylinux and Windows, "numpy/.dylibs" on macOS.
+    auto scan_openblas_dir = [](const std::string& dir_path) -> LibHandle {
         DIR* dir = opendir(dir_path.c_str());
-        if (!dir) continue;
+        if (!dir) return nullptr;
+        LibHandle found = nullptr;
         while (const dirent* ent = readdir(dir)) {
             const std::string name = ent->d_name;
             if (name.find("scipy_openblas") == std::string::npos &&
                 name.find("openblas64") == std::string::npos) continue;
             const std::string path = dir_path + "/" + name;
-            if (void* h = dlopen(path.c_str(), RTLD_LAZY | RTLD_LOCAL)) return h;
+            found = dlopen(path.c_str(), RTLD_LAZY | RTLD_LOCAL);
+            if (found) break;
         }
         closedir(dir);
+        return found;
+    };
+    for (const auto& base : bases) {
+        if (LibHandle h = scan_openblas_dir(base + "/numpy.libs")) return h;
+        if (LibHandle h = scan_openblas_dir(base + "/numpy/.dylibs")) return h;
     }
     // Versioned interpreter prefixes (python3.Y layout varies across distros).
     for (const char* prefix : {"/usr/local/lib", "/usr/lib"}) {
         for (int minor = 8; minor <= 14; ++minor) {
             for (const char* kind : {"dist-packages", "site-packages"}) {
-                const std::string dir_path = std::string(prefix) + "/python3." +
-                    std::to_string(minor) + "/" + kind + "/numpy.libs";
-                DIR* dir = opendir(dir_path.c_str());
-                if (!dir) continue;
-                while (const dirent* ent = readdir(dir)) {
-                    const std::string name = ent->d_name;
-                    if (name.find("scipy_openblas") == std::string::npos &&
-                        name.find("openblas64") == std::string::npos) continue;
-                    const std::string path = dir_path + "/" + name;
-                    if (void* h = dlopen(path.c_str(), RTLD_LAZY | RTLD_LOCAL)) return h;
-                }
-                closedir(dir);
+                const std::string root = std::string(prefix) + "/python3." +
+                    std::to_string(minor) + "/" + kind;
+                if (LibHandle h = scan_openblas_dir(root + "/numpy.libs")) return h;
+                if (LibHandle h = scan_openblas_dir(root + "/numpy/.dylibs")) return h;
             }
         }
     }
+#ifdef __APPLE__
+    // Last resort: loader search path (dylib spelling on this platform).
+    return dlopen("libscipy_openblas.dylib", RTLD_LAZY | RTLD_LOCAL);
+#else
     // Last resort: loader search path.
     return dlopen("libscipy_openblas.so", RTLD_LAZY | RTLD_LOCAL);
+#endif
 #endif
 }
 
