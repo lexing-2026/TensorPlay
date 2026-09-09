@@ -763,9 +763,12 @@ void launch_sorted_topk(Tensor& values, Tensor& indices, int64_t rows,
   } else if (padded <= 2048) {
     launch_selected_radix_sort<T, Key, 64, 32>(values, indices, rows, k, inner,
                                                 largest);
-  } else if (padded <= 4096) {
-    launch_selected_radix_sort<T, Key, 128, 32>(values, indices, rows, k, inner,
-                                                 largest);
+  } else {
+    // A 4096-slot BlockRadixSort TempStorage needs 67584B of static shared
+    // memory, past the 48KiB per-block cap on sm_75 and every other
+    // consumer-class part.  Route through the global-memory segmented sort,
+    // which carries no shared-memory ceiling.
+    launch_segmented_sorted_topk<T>(values, indices, rows, k, inner, largest);
   }
 }
 

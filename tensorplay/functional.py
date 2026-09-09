@@ -1508,14 +1508,14 @@ def bernoulli(input, p=_MISSING, *, generator=None, out=None):
         if out is not None:
             return _C.bernoulli(self=input, generator=generator, out=out)
         if _capturing():
-            _captured = _capture_call(bernoulli, (input,), {"generator": generator})
+            _captured = _capture_call(bernoulli, (input,), {'generator': generator})
             if _captured is not None:
                 return _captured
         return _C.bernoulli(self=input, generator=generator)
     if out is not None:
         return _C.bernoulli(self=input, p=p, generator=generator, out=out)
     if _capturing():
-        _captured = _capture_call(bernoulli, (input, p), {"generator": generator})
+        _captured = _capture_call(bernoulli, (input, p), {'generator': generator})
         if _captured is not None:
             return _captured
     return _C.bernoulli(self=input, p=p, generator=generator)
@@ -6959,7 +6959,7 @@ def i0_(input):
 
 def chain_matmul(*args, out=None):
     if _capturing():
-        _captured = _capture_call(chain_matmul, (*args,), {"out": out})
+        _captured = _capture_call(chain_matmul, (*args,), {'out': out})
         if _captured is not None:
             return _captured
     if out is None:

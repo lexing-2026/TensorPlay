@@ -193,6 +193,10 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/EmbeddingKernels.cu
         src/backend/cuda/EmbeddingBagKernels.cu
         src/backend/cuda/PointwiseKernels.cu
+        src/backend/cuda/ActivationPointwiseKernels.cu
+        src/backend/cuda/ComparisonPointwiseKernels.cu
+        src/backend/cuda/MinMaxPointwiseKernels.cu
+        src/backend/cuda/BinaryMathPointwiseKernels.cu
         src/backend/cuda/UnaryOps.cu
         src/backend/cuda/Pooling.cu
         src/backend/cuda/MaxPooling.cu
