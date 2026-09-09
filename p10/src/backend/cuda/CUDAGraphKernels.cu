@@ -2,6 +2,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 namespace tensorplay {
 namespace cuda {
 namespace graph {
