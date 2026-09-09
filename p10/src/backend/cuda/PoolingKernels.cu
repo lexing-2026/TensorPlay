@@ -913,7 +913,7 @@ __global__ void max_pool2d_wi_fwd_kernel(
                 if (wi < 0 || wi >= W_in) continue;
                 const int64_t idx = hi * W_in + wi;
                 const M val = static_cast<M>(plane[idx]);
-                if ((val > max_val) || std::isnan(val)) {
+                if ((val > max_val) || ::isnan(val)) {
                     max_val = val;
                     max_idx = idx;
                 }
@@ -1047,7 +1047,7 @@ __global__ void max_pool3d_wi_fwd_kernel(
                     if (wi < 0 || wi >= W_in) continue;
                     const int64_t idx = (di * H_in + hi) * W_in + wi;
                     const M val = static_cast<M>(vol[idx]);
-                    if ((val > max_val) || std::isnan(val)) {
+                    if ((val > max_val) || ::isnan(val)) {
                         max_val = val;
                         max_idx = idx;
                     }
@@ -1084,7 +1084,7 @@ __global__ void adaptive_max_pool3d_fwd_kernel(
         for (int64_t x = ws; x < we; ++x) {
             const int64_t idx = (z * H + y) * W + x;
             const M val = static_cast<M>(vol[idx]);
-            if ((val > max_val) || std::isnan(val)) {
+            if ((val > max_val) || ::isnan(val)) {
                 max_val = val;
                 max_idx = idx;
             }
@@ -1119,7 +1119,7 @@ __global__ void adaptive_max_pool3d_bwd_kernel(
         for (int64_t x = ws; x < we; ++x) {
             const int64_t idx = (z * H + y) * W + x;
             const M val = static_cast<M>(vol[idx]);
-            if ((val > max_val) || std::isnan(val)) {
+            if ((val > max_val) || ::isnan(val)) {
                 max_val = val;
                 max_idx = idx;
             }

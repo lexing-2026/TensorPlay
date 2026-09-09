@@ -109,7 +109,7 @@ __global__ void max_pool1d_kernel(
             const int64_t ij = start + kj * dj;
             if (ij < 0 || ij >= iw) continue;
             const acc_t value = static_cast<acc_t>(input[plane * iw + ij]);
-            if ((value > max_value) || std::isnan(value)) max_value = value;
+            if ((value > max_value) || ::isnan(value)) max_value = value;
         }
         output[index] = static_cast<scalar_t>(max_value);
     }
