@@ -4,10 +4,13 @@
 //   1. $TP_LAPACK_LIB (explicit override)
 //   2. a libscipy_openblas64_* already mapped into this process (numpy
 //      imported before the first linalg call)
-//   3. numpy's wheel directory: <env>/numpy.libs/libscipy_openblas64_*
+//   3. numpy's wheel directory: <env>/numpy.libs/libscipy_openblas64_* or
+//      <env>/numpy/.dylibs (macOS wheel layout)
+//   4. the system ILP64 LAPACK where one ships with the OS (Apple's
+//      Accelerate framework on arm64)
 //
 // Symbols are tried as `scipy_<name>_64_` (scipy-openblas wheels) and then as
-// `<name>_64_` / `<name>_` for other ILP64 OpenBLAS builds.
+// `<name>_64_` / `<name>_` / plain `<name>` for other ILP64 builds.
 
 #include "cpu/Lapack.h"
 
@@ -81,7 +84,9 @@ static void* sym(LibHandle h, const char* n) { return dlsym(h, n); }
 
 void* resolve_one(LibHandle handle, const char* base) {
     char buf[128];
-    const char* patterns[] = {"scipy_%s_64_", "%s_64_", "%s_", "scipy_%s64_"};
+    // The trailing plain spelling covers system LAPACK implementations
+    // (e.g. Apple's Accelerate) whose CBLAS exports carry no suffix at all.
+    const char* patterns[] = {"scipy_%s_64_", "%s_64_", "%s_", "scipy_%s64_", "%s"};
     for (const char* pattern : patterns) {
         std::snprintf(buf, sizeof(buf), pattern, base);
         if (void* p = sym(handle, buf)) return p;
@@ -284,6 +289,16 @@ LibHandle find_library() {
         }
     }
 #ifdef __APPLE__
+#if defined(__aarch64__)
+    // Apple silicon: the system Accelerate framework provides an ILP64
+    // LAPACK (the same library current numpy wheels link against), so no
+    // external provider is required on this platform.
+    if (LibHandle h = dlopen("/System/Library/Frameworks/Accelerate.framework/"
+                             "Versions/A/Accelerate",
+                             RTLD_LAZY | RTLD_LOCAL)) {
+        return h;
+    }
+#endif
     // Last resort: loader search path (dylib spelling on this platform).
     return dlopen("libscipy_openblas.dylib", RTLD_LAZY | RTLD_LOCAL);
 #else
