@@ -81,12 +81,18 @@ if(UNIX AND NOT APPLE)
 endif()
 
 function(_tp_mkl_link_works _result)
+    set(_TP_MKL_SAVED_REQUIRED_LIBRARIES "${CMAKE_REQUIRED_LIBRARIES}")
+    set(_TP_MKL_SAVED_REQUIRED_INCLUDES "${CMAKE_REQUIRED_INCLUDES}")
+    set(_TP_MKL_SAVED_REQUIRED_QUIET "${CMAKE_REQUIRED_QUIET}")
     set(CMAKE_REQUIRED_LIBRARIES ${ARGN} ${ARGN})
     set(CMAKE_REQUIRED_QUIET TRUE)
     unset(TP_MKL_CANDIDATE_LINKS CACHE)
     check_cxx_source_compiles(
         "extern \"C\" void cblas_sgemm(); int main() { cblas_sgemm(); return 0; }"
         TP_MKL_CANDIDATE_LINKS)
+    set(CMAKE_REQUIRED_LIBRARIES "${_TP_MKL_SAVED_REQUIRED_LIBRARIES}")
+    set(CMAKE_REQUIRED_INCLUDES "${_TP_MKL_SAVED_REQUIRED_INCLUDES}")
+    set(CMAKE_REQUIRED_QUIET "${_TP_MKL_SAVED_REQUIRED_QUIET}")
     set(${_result} "${TP_MKL_CANDIDATE_LINKS}" PARENT_SCOPE)
 endfunction()
 

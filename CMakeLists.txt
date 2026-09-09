@@ -589,6 +589,16 @@ if(USE_BLAS)
                          set(MKL_BIN_DIR "${ONEAPI_ROOT}/bin")
                     endif()
                 endif()
+
+                if(NOT MKL_BIN_DIR AND MKL_OPENMP_LIBRARY)
+                    get_filename_component(MKL_OPENMP_LIB_DIR
+                        "${MKL_OPENMP_LIBRARY}" DIRECTORY)
+                    get_filename_component(MKL_ROOT_DERIVED
+                        "${MKL_OPENMP_LIB_DIR}/.." ABSOLUTE)
+                    if(EXISTS "${MKL_ROOT_DERIVED}/bin")
+                        set(MKL_BIN_DIR "${MKL_ROOT_DERIVED}/bin")
+                    endif()
+                endif()
                 
                 if(MKL_BIN_DIR AND EXISTS "${MKL_BIN_DIR}")
                     message(STATUS "Found MKL bin dir: ${MKL_BIN_DIR}")
@@ -598,10 +608,16 @@ if(USE_BLAS)
                         "mkl_core*.dll"
                         "mkl_sequential*.dll" 
                         "mkl_intel_lp64*.dll"
+                        "mkl_intel_thread*.dll"
+                        "mkl_tbb_thread*.dll"
+                        "mkl_rt*.dll"
                         "mkl_def*.dll"
                         "mkl_avx2*.dll"
                         "mkl_vml_avx2*.dll"
                         "mkl_vml_def*.dll"
+                        "libiomp5md*.dll"
+                        "libiompstubs5md*.dll"
+                        "tbb*.dll"
                     )
                     foreach(PATTERN ${MKL_PATTERNS})
                         file(GLOB MKL_DLLS "${MKL_BIN_DIR}/${PATTERN}")
@@ -1501,6 +1517,30 @@ install(TARGETS _C
     LIBRARY DESTINATION tensorplay/_C
     RUNTIME DESTINATION tensorplay/_C
 )
+
+if(WIN32 AND TP_USE_GLOO AND TP_LIBUV_LIBRARY)
+    set(_TP_LIBUV_DLL_CANDIDATES)
+    get_filename_component(_TP_LIBUV_LIB_DIR
+        "${TP_LIBUV_LIBRARY}" DIRECTORY)
+    get_filename_component(_TP_LIBUV_ROOT
+        "${_TP_LIBUV_LIB_DIR}/.." ABSOLUTE)
+    list(APPEND _TP_LIBUV_DLL_CANDIDATES
+        "${_TP_LIBUV_ROOT}/bin/uv.dll"
+        "${_TP_LIBUV_LIB_DIR}/uv.dll")
+    if(DEFINED ENV{libuv_ROOT})
+        list(APPEND _TP_LIBUV_DLL_CANDIDATES
+            "$ENV{libuv_ROOT}/bin/uv.dll"
+            "$ENV{libuv_ROOT}/uv.dll")
+    endif()
+    foreach(_TP_LIBUV_DLL IN LISTS _TP_LIBUV_DLL_CANDIDATES)
+        if(EXISTS "${_TP_LIBUV_DLL}")
+            install(FILES "${_TP_LIBUV_DLL}" DESTINATION tensorplay/lib)
+            file(COPY "${_TP_LIBUV_DLL}" DESTINATION "${TP_LIB_DIR}")
+            message(STATUS "Bundling Windows runtime DLL: ${_TP_LIBUV_DLL}")
+            break()
+        endif()
+    endforeach()
+endif()
 
 # version.py is generated at build time (gitignored, so scikit-build-core's
 # wheel.packages pass cannot pick it up); it must be installed explicitly or
