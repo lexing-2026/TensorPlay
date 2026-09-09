@@ -327,9 +327,13 @@ jobs:
         shell: bash
         env:
           TEST_FILES: ${{ matrix.test_files }}
+          TP_ENGINE_TRACE: ${{ runner.os == 'Windows' && matrix.name == 'autograd' && '3' || '0' }}
         run: |
           set -euo pipefail
           test_root="$GITHUB_WORKSPACE/.ci-test-tmp"
+          if [[ "$RUNNER_OS" == "Windows" && "$TP_ENGINE_TRACE" == "3" ]]; then
+            export TP_TENSORITERATOR_DEBUG=1
+          fi
           result_root="$GITHUB_WORKSPACE/ci-test-results"
           rm -rf "$test_root" "$result_root"
           mkdir -p "$test_root" "$result_root"
