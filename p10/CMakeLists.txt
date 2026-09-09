@@ -187,6 +187,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/SparseKernels.cu
         src/backend/cuda/SemiStructuredKernels.cu
         src/backend/cuda/QuantKernels.cu
+        src/backend/cuda/QuantIntComputeKernels.cu
         src/backend/cuda/QuantGemmKernels.cu
         src/backend/cuda/ForwardKernels.cu
         src/backend/cuda/FactoryKernels.cu
@@ -220,6 +221,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/LossFillKernels.cu
         src/backend/cuda/LossCTC.cu
         src/backend/cuda/ConvKernels.cu
+        src/backend/cuda/ConvFp64Kernels.cu
         src/backend/cuda/Convolution.cu
         src/backend/cuda/PadKernels.cu
         src/backend/cuda/PoolingKernels.cu
@@ -228,6 +230,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/MaxUnpoolKernels.cu
         src/backend/cuda/MarginLossKernels.cu
         src/backend/cuda/RandomKernels.cu
+        src/backend/cuda/RandomSpecialKernels.cu
         src/backend/cuda/ReductionKernels.cu
         src/backend/cuda/DistanceKernels.cu
         src/backend/cuda/ViewKernels.cu
@@ -241,7 +244,9 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/TensorTopK.cu
         src/backend/cuda/SpecialAliasKernels.cu
         src/backend/cuda/AttentionKernels.cu
+        src/backend/cuda/AttentionRopeKernels.cu
         src/backend/cuda/IndexingKernels.cu
+        src/backend/cuda/ScatterReduceKernels.cu
         src/backend/cuda/InteropAliasKernels.cu
         src/backend/cuda/ShapeOpsKernels.cu
         src/backend/cuda/TensorAdvancedIndexingKernels.cu
