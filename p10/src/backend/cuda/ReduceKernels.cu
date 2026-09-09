@@ -306,7 +306,7 @@ Tensor amin_cuda2(const Tensor& self, const std::vector<int64_t>& dim, bool keep
     if (self.numel() == 0) zero_numel_check_dims(self, dim, "amin()");
     return amin_dim_kernel(self, dim, keepdim);
 }
-std::tuple<Tensor, Tensor> aminmax_cuda(const Tensor& self, std::vector<int64_t> dim,
+std::tuple<Tensor, Tensor> aminmax_cuda(const Tensor& self, const std::vector<int64_t>& dim,
                                         bool keepdim) {
     if (self.numel() == 0) {
         if (dim.empty()) {
@@ -430,13 +430,13 @@ std::tuple<Tensor, Tensor> cummin_cuda(const Tensor& self, int64_t dim) {
     return {vals, idxs};
 }
 
-std::tuple<Tensor, Tensor> var_mean_cuda(const Tensor& self, std::vector<int64_t> dim,
+std::tuple<Tensor, Tensor> var_mean_cuda(const Tensor& self, const std::vector<int64_t>& dim,
                                          bool unbiased, bool keepdim) {
     Tensor var = var_dim_kernel(self, dim, unbiased ? 1 : 0, keepdim);
     Tensor mean = mean_dim_kernel(self, dim, keepdim, DType::Undefined);
     return {std::move(var), std::move(mean)};
 }
-std::tuple<Tensor, Tensor> std_mean_cuda(const Tensor& self, std::vector<int64_t> dim,
+std::tuple<Tensor, Tensor> std_mean_cuda(const Tensor& self, const std::vector<int64_t>& dim,
                                          bool unbiased, bool keepdim) {
     auto vm = var_mean_cuda(self, dim, unbiased, keepdim);
     return {std::get<0>(vm).sqrt(), std::get<1>(vm)};
