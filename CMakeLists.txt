@@ -1435,17 +1435,22 @@ endif()
 # with "cannot open shared object file". Windows ignores RPATH (DLL
 # search is handled by tensorplay/__init__.py via os.add_dll_directory).
 if(NOT WIN32)
+    if(APPLE)
+        set(_tp_rpath_origin "@loader_path")
+    else()
+        set(_tp_rpath_origin "$ORIGIN")
+    endif()
     set_target_properties(p10 stax PROPERTIES
-        INSTALL_RPATH "$ORIGIN"
-        BUILD_RPATH "$ORIGIN"
+        INSTALL_RPATH "${_tp_rpath_origin}"
+        BUILD_RPATH "${_tp_rpath_origin}"
     )
     set_target_properties(tp_python PROPERTIES
-        INSTALL_RPATH "$ORIGIN"
-        BUILD_RPATH "$ORIGIN"
+        INSTALL_RPATH "${_tp_rpath_origin}"
+        BUILD_RPATH "${_tp_rpath_origin}"
     )
     set_target_properties(_C PROPERTIES
-        INSTALL_RPATH "$ORIGIN/../lib"
-        BUILD_RPATH "$ORIGIN/../lib"
+        INSTALL_RPATH "${_tp_rpath_origin}/../lib"
+        BUILD_RPATH "${_tp_rpath_origin}/../lib"
     )
 endif()
 
