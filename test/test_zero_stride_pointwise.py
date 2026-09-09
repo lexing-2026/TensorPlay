@@ -150,5 +150,56 @@ class TestBackwardSeedPieces(unittest.TestCase):
                              msg=f"select_backward index {i}")
 
 
+class TestForwardSumDim(unittest.TestCase):
+    """The grad chain inherits its broadcast axis from the forward
+    reduction's recorded dims.  Pin the forward sum(dim) values so a
+    mis-bound dim argument fails here, at the source, instead of
+    surfacing as a transposed backward broadcast."""
+
+    def test_sum_dim_values_2d(self):
+        x = tp.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=tp.float64)
+        s1 = x.sum(dim=1)
+        self.assertEqual(tuple(s1.shape), (2,))
+        self.assertAlmostEqual(s1[0].item(), 3.0, places=10)
+        self.assertAlmostEqual(s1[1].item(), 7.0, places=10)
+        s0 = x.sum(dim=0)
+        self.assertEqual(tuple(s0.shape), (2,))
+        self.assertAlmostEqual(s0[0].item(), 4.0, places=10)
+        self.assertAlmostEqual(s0[1].item(), 6.0, places=10)
+
+    def test_sum_dim_values_3d(self):
+        # dims=[0, 2] of (2, 3, 4) -> shape (3,); values sum over the
+        # outer and inner axes only.
+        x = tp.rand(2, 3, 4, dtype=tp.float64)
+        xd = x.detach()
+        s = x.sum(dim=[0, 2])
+        self.assertEqual(tuple(s.shape), (3,))
+        for j in range(3):
+            acc = 0.0
+            for r in range(2):
+                for k in range(4):
+                    acc += xd[r][j][k].item()
+            self.assertAlmostEqual(s[j].item(), acc, places=10,
+                                   msg=f"index {j}")
+
+    def test_sum_dim_negative_and_keepdim(self):
+        x = tp.rand(2, 3, 4, dtype=tp.float64)
+        xd = x.detach()
+        s = x.sum(dim=-1)
+        self.assertEqual(tuple(s.shape), (2, 3))
+        for r in range(2):
+            for j in range(3):
+                acc = sum(xd[r][j][k].item() for k in range(4))
+                self.assertAlmostEqual(s[r][j].item(), acc, places=10,
+                                       msg=f"({r},{j})")
+        sk = x.sum(dim=1, keepdim=True)
+        self.assertEqual(tuple(sk.shape), (2, 1, 4))
+        for r in range(2):
+            for k in range(4):
+                acc = sum(xd[r][j][k].item() for j in range(3))
+                self.assertAlmostEqual(sk[r][0][k].item(), acc, places=10,
+                                       msg=f"({r},{k})")
+
+
 if __name__ == "__main__":
     unittest.main()
