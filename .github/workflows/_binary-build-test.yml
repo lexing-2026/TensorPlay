@@ -122,20 +122,20 @@ jobs:
               echo "CCACHE_NOHASHDIR=1" >> "$GITHUB_ENV"
               ;;
             Windows)
-              echo "SCCACHE_DIR=$HOME/.cache/sccache" >> "$GITHUB_ENV"
+              sccache_dir="$(cygpath -aw "$HOME/.cache/sccache")"
+              echo "SCCACHE_DIR=$sccache_dir" >> "$GITHUB_ENV"
               echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
               ;;
           esac
 
       - name: Restore compiler cache
         id: compiler-cache
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: ${{ runner.os == 'Windows' && env.SCCACHE_DIR || env.CCACHE_DIR }}
           key: buildcache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.build_environment }}-${{ inputs.python_version }}-${{ inputs.cuda }}-${{ github.sha }}
           restore-keys: |
             buildcache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.build_environment }}-${{ inputs.python_version }}-${{ inputs.cuda }}-
-          save-always: true
 
       # Release tags pin the exact version. CUDA wheels use a local version
       # suffix so CPU and CUDA files can coexist in one GitHub Release.
@@ -229,6 +229,13 @@ jobs:
              [[ -f .github/ci/windows/sccache-bin/sccache.exe ]]; then
             .github/ci/windows/sccache-bin/sccache.exe --show-stats || true
           fi
+
+      - name: Save compiler cache
+        if: ${{ always() && !cancelled() && steps.compiler-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.os == 'Windows' && env.SCCACHE_DIR || env.CCACHE_DIR }}
+          key: buildcache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.build_environment }}-${{ inputs.python_version }}-${{ inputs.cuda }}-${{ github.sha }}
 
       - name: Upload built wheel
         uses: actions/upload-artifact@v7
