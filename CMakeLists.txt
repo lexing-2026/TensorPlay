@@ -315,8 +315,9 @@ if(WIN32)
             /wd4244 /wd4804 /wd4273)
         list(APPEND MSVC_COMMON_FLAGS ${MSVC_SUPPRESSED_WARNINGS})
         list(APPEND MSVC_CUDA_HOST_FLAGS ${MSVC_SUPPRESSED_WARNINGS})
-        # M_PI and friends are gated behind this define on MSVC
-        add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:_USE_MATH_DEFINES>)
+        # M_PI and friends are gated behind this define on MSVC, for both
+        # C++ sources and .cu sources (device code shares the host headers).
+        add_compile_definitions($<$<COMPILE_LANGUAGE:CXX,CUDA>:_USE_MATH_DEFINES>)
         # windows.h must not inject the min/max macros (they break
         # std::min/std::max call sites) nor the full Win32 declaration set.
         add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
