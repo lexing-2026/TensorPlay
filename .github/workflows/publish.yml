@@ -160,6 +160,7 @@ jobs:
         {"name":"autograd","test_files":"test/test_autograd_engine.py test/test_autograd_functional.py test/test_forward_ad.py test/test_view_rebase.py test/test_version_counter.py test/test_zero_stride_pointwise.py"},
         {"name":"nn-api","test_files":"test/test_init.py test/test_linear_init.py test/test_new_layers.py test/test_nn_repr.py test/test_parameter.py"}]
       upload_release: ${{ needs.define-wheel-matrix.outputs.release_tag == 'true' }}
+      save_cache: false
 
   cuda-build:
     name: ${{ matrix.build_name }}-build-test
@@ -184,6 +185,7 @@ jobs:
       cuda: ${{ matrix.variant }}
       cuda_toolkit: ${{ matrix.toolkit }}
       upload_release: ${{ needs.define-wheel-matrix.outputs.release_tag == 'true' }}
+      save_cache: false
 
   pypi-upload:
     # CPU wheels remain on PyPI -- stable releases only, never release

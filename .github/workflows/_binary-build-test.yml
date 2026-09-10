@@ -38,6 +38,15 @@ on:
         type: boolean
         default: false
         description: Upload the tested wheel to a GitHub Release
+      save_cache:
+        required: false
+        type: boolean
+        default: true
+        description: >
+          Persist the compiler cache after the build. The publisher should
+          turn this off: its runs are months apart, so anything it saves is
+          evicted long before the next release reads it, and the duplicate
+          entries crowd the shared pool.
       run_cpu_benchmarks:
         required: false
         type: boolean
@@ -147,9 +156,15 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ${{ env.CACHE_PATH }}
-          key: buildcache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.build_environment }}-${{ inputs.python_version }}-${{ inputs.cuda }}-${{ github.sha }}
+          # The lane identity is os+arch+python+cuda. The publishing
+          # workflow prefixes its build_environment differently from the
+          # trunk and nightly ones, so keying on it would wall the caches
+          # off from each other; keying on the lane identity instead lets
+          # every publisher build reuse the caches that the trunk and the
+          # scheduled nightly runs keep warm for the same environment.
+          key: buildcache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.python_version }}-${{ inputs.cuda }}-${{ github.sha }}
           restore-keys: |
-            buildcache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.build_environment }}-${{ inputs.python_version }}-${{ inputs.cuda }}-
+            buildcache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.python_version }}-${{ inputs.cuda }}-
 
       # Release tags pin the exact version. CUDA wheels use a local version
       # suffix so CPU and CUDA files can coexist in one GitHub Release.
@@ -248,11 +263,11 @@ jobs:
           fi
 
       - name: Save compiler cache
-        if: ${{ always() && !cancelled() && steps.compiler-cache.outputs.cache-hit != 'true' }}
+        if: ${{ always() && !cancelled() && inputs.save_cache && steps.compiler-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v6
         with:
           path: ${{ env.CACHE_PATH }}
-          key: buildcache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.build_environment }}-${{ inputs.python_version }}-${{ inputs.cuda }}-${{ github.sha }}
+          key: buildcache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.python_version }}-${{ inputs.cuda }}-${{ github.sha }}
 
       - name: Upload built wheel
         uses: actions/upload-artifact@v7
