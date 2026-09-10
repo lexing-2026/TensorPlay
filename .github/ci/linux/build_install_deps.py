@@ -29,6 +29,12 @@ BUILD_PACKAGES: list[str] = [
     "wheel",
     "build",
     "scikit-build-core>=1.0",
+    # The PyPI index rejects bare linux_* platform tags, so every Linux
+    # wheel is repacked through auditwheel (with patchelf rewriting the
+    # captured libraries' RPATHs) into a manylinux-tagged one before it
+    # leaves the builder.
+    "auditwheel",
+    "patchelf",
 ]
 
 
