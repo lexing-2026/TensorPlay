@@ -1,14 +1,29 @@
 name: wheel-index
 
-# Reacts to release changes and hands the download site a rebuild signal.
-# The site itself lives in lexing-2026/tensorplay-index: its refresh-manifest
-# workflow re-reads every non-draft release of this repository and republishes
-# the static index. This workflow keeps one piece of release hygiene local:
-# the rolling nightly release keeps only the newest calendar day of wheels,
-# so the site can never point at pruned downloads. Every wheel tag from that
-# day is retained while the matrix finishes.
+# Hands the download site a rebuild signal after every wheel-publishing
+# run. The site itself lives in lexing-2026/tensorplay-index: its
+# refresh-manifest workflow re-reads every non-draft release of this
+# repository and republishes the static index. This workflow keeps one
+# piece of release hygiene local: the rolling nightly release keeps only
+# the newest calendar day of wheels, so the site can never point at
+# pruned downloads. Every wheel tag from that day is retained while the
+# matrix finishes.
+#
+# The trigger listens on workflow_run rather than release events because
+# every release write in this repository (trunk, nightly, publish, rocm)
+# happens through the default GITHUB_TOKEN, and GitHub suppresses
+# workflow-triggering for events created by it to prevent recursion.
+# Workflow completion events are not affected, so a finished publisher
+# run is a reliable rebuild signal.
 
 on:
+  workflow_run:
+    workflows:
+      - trunk
+      - nightly
+      - publish
+      - rocm-wheel
+    types: [completed]
   release:
     types: [published, edited, unpublished, deleted]
   workflow_dispatch:
@@ -24,6 +39,9 @@ concurrency:
 jobs:
   rebuild:
     name: prune-nightly-and-dispatch-site
+    # Failed publisher runs upload no new wheels; skipping them keeps a
+    # late failure from cancelling the rebuild a successful run queued.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -52,12 +70,14 @@ jobs:
       - name: Dispatch site rebuild
         shell: bash
         env:
-          DISPATCH_TOKEN: ${{ secrets.INDEX_REPO_TOKEN }}
-          SOURCE_REF: ${{ github.event.release.tag_name || github.sha }}
+          DISPATCH_TOKEN: ${{ secrets.WEBSITE_DEPLOY_TOKEN }}
+          # Release events carry the tag; workflow_run carries the finished
+          # run's head commit; manual dispatches fall back to this run's SHA.
+          SOURCE_REF: ${{ github.event.release.tag_name || github.event.workflow_run.head_sha || github.sha }}
         run: |
           set -euo pipefail
           if [[ -z "${DISPATCH_TOKEN}" ]]; then
-            echo "::warning::INDEX_REPO_TOKEN secret is not set; skipping site rebuild dispatch."
+            echo "::warning::WEBSITE_DEPLOY_TOKEN secret is not set; skipping site rebuild dispatch."
             exit 0
           fi
           gh api \
