@@ -14,7 +14,9 @@ import platform
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
+import urllib.request
 from pathlib import Path
 
 
@@ -55,10 +57,51 @@ def main() -> None:
     os.chdir(args.package_dir)
     pip_install("-q", *BUILD_PACKAGES)
 
-    # The CMake build picks up ccache as a compiler launcher when it is on
-    # PATH; a persistent cache makes the second build of a lane far cheaper.
-    if shutil.which("ccache") is None:
-        apt_prefix = [] if os.geteuid() == 0 else ["sudo"]
+    # The CMake build wires a compiler launcher through its cache-tool
+    # fallback (ccache preferred, sccache otherwise). ccache only supports
+    # the nvcc driver experimentally and every .cu request misses, so CUDA
+    # lanes would recompile the whole module set on each run; sccache caches
+    # the nvcc pipeline natively. CUDA lanes therefore run sccache alone --
+    # removing ccache keeps the launcher selection deterministic -- while
+    # CPU lanes stay on ccache, which serves their C++ requests well.
+    apt_prefix = [] if os.geteuid() == 0 else ["sudo"]
+    if os.environ.get("GPU_ARCH_TYPE") == "cuda":
+        if shutil.which("ccache") is not None:
+            subprocess.run(
+                apt_prefix + ["apt-get", "remove", "-y", "-qq", "ccache"],
+                check=False,
+            )
+        if shutil.which("ccache") is not None:
+            sys.exit("ccache is still on PATH; the launcher choice would be ambiguous")
+
+        machine = platform.machine()
+        sccache_arch = {
+            "x86_64": "x86_64-unknown-linux-musl",
+            "aarch64": "aarch64-unknown-linux-musl",
+        }.get(machine)
+        if sccache_arch is None:
+            sys.exit(f"no sccache tarball mapping for {machine}")
+        sccache_bin = Path("/usr/local/bin/sccache")
+        if not sccache_bin.exists():
+            version = "0.8.1"
+            workdir = Path("sccache-extract")
+            workdir.mkdir(exist_ok=True)
+            tarball = workdir / "sccache.tar.gz"
+            url = (
+                "https://github.com/mozilla/sccache/releases/download/"
+                f"v{version}/sccache-v{version}-{sccache_arch}.tar.gz"
+            )
+            urllib.request.urlretrieve(url, tarball)
+            with tarfile.open(tarball) as archive:
+                archive.extractall(workdir)
+            payload = (
+                workdir / f"sccache-v{version}-{sccache_arch}" / "sccache"
+            )
+            if not payload.is_file():
+                sys.exit(f"sccache extraction did not produce {payload}")
+            retry(apt_prefix + ["install", "-m", "0755", str(payload), str(sccache_bin)])
+            shutil.rmtree(workdir, ignore_errors=True)
+    elif shutil.which("ccache") is None:
         retry(apt_prefix + ["apt-get", "update", "-qq"])
         retry(apt_prefix + ["apt-get", "install", "-y", "-qq", "ccache"])
 

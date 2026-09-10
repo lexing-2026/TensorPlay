@@ -104,29 +104,41 @@ jobs:
         shell: bash
         run: bash .github/scripts/restore-vendored-deps.sh
 
-      # Compiler cache lives outside the checkout: ccache on the POSIX
-      # runners (found by CMake on PATH), sccache on Windows. The cache
-      # scope includes runner architecture, build lane, Python version, and
-      # variant so native objects never cross incompatible task environments;
-      # restore-keys fall back to the previous build of the same lane.
+      # Compiler cache lives outside the checkout. ccache drives the CPU
+      # lanes on the POSIX runners and macOS; the Linux CUDA lanes use
+      # sccache instead because ccache only experimentally supports the
+      # nvcc driver and every .cu request misses (sccache covers the whole
+      # pipeline, measured at a near-perfect hit rate). CACHE_PATH is the
+      # single restore/save target; the cache scope includes runner
+      # architecture, build lane, Python version, and variant so native
+      # objects never cross incompatible task environments; restore-keys
+      # fall back to the previous build of the same lane.
       - name: Set compiler cache location
         shell: bash
         run: |
           case "$RUNNER_OS" in
             Linux)
-              echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
-              echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
-              echo "CCACHE_NOHASHDIR=1" >> "$GITHUB_ENV"
+              if [[ "${{ inputs.cuda }}" != "cpu" ]]; then
+                echo "SCCACHE_DIR=$HOME/.cache/sccache" >> "$GITHUB_ENV"
+                echo "CACHE_PATH=$HOME/.cache/sccache" >> "$GITHUB_ENV"
+              else
+                echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+                echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+                echo "CCACHE_NOHASHDIR=1" >> "$GITHUB_ENV"
+                echo "CACHE_PATH=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+              fi
               ;;
             macOS)
               echo "CCACHE_DIR=$HOME/Library/Caches/ccache" >> "$GITHUB_ENV"
               echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
               echo "CCACHE_NOHASHDIR=1" >> "$GITHUB_ENV"
+              echo "CACHE_PATH=$HOME/Library/Caches/ccache" >> "$GITHUB_ENV"
               ;;
             Windows)
               sccache_dir="$(cygpath -aw "$HOME/.cache/sccache")"
               echo "SCCACHE_DIR=$sccache_dir" >> "$GITHUB_ENV"
               echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
+              echo "CACHE_PATH=$sccache_dir" >> "$GITHUB_ENV"
               ;;
           esac
 
@@ -134,7 +146,7 @@ jobs:
         id: compiler-cache
         uses: actions/cache/restore@v6
         with:
-          path: ${{ runner.os == 'Windows' && env.SCCACHE_DIR || env.CCACHE_DIR }}
+          path: ${{ env.CACHE_PATH }}
           key: buildcache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.build_environment }}-${{ inputs.python_version }}-${{ inputs.cuda }}-${{ github.sha }}
           restore-keys: |
             buildcache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.build_environment }}-${{ inputs.python_version }}-${{ inputs.cuda }}-
@@ -239,7 +251,7 @@ jobs:
         if: ${{ always() && !cancelled() && steps.compiler-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v6
         with:
-          path: ${{ runner.os == 'Windows' && env.SCCACHE_DIR || env.CCACHE_DIR }}
+          path: ${{ env.CACHE_PATH }}
           key: buildcache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.build_environment }}-${{ inputs.python_version }}-${{ inputs.cuda }}-${{ github.sha }}
 
       - name: Upload built wheel
