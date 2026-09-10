@@ -185,10 +185,13 @@ jobs:
 
       # This installs the compiler/toolkit only. Free GitHub-hosted runners
       # have no GPU, so CUDA kernels are never executed in this workflow.
+      # The downloaded installer (~4GB per CUDA version) must stay out of the
+      # shared 10GB cache pool or it evicts the compiler caches of every lane.
       - uses: jimver/cuda-toolkit@v0.2.36
         if: ${{ inputs.cuda != 'cpu' }}
         with:
           cuda: ${{ inputs.cuda_toolkit }}
+          use-github-cache: 'false'
 
       - name: Build wheel
         shell: bash
@@ -277,6 +280,7 @@ jobs:
         if: ${{ inputs.cuda != 'cpu' && runner.os == 'Linux' }}
         with:
           cuda: ${{ inputs.cuda_toolkit }}
+          use-github-cache: 'false'
 
       - name: Install Linux CPU runtime dependencies
         if: ${{ inputs.cuda == 'cpu' && runner.os == 'Linux' }}
