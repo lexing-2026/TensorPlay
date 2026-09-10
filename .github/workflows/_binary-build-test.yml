@@ -278,8 +278,11 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-build.txt
 
+      # Windows CUDA wheels resolve their runtime DLLs (cudart, cublas, ...)
+      # from the toolkit's bin directory on PATH; without it the _C extension
+      # fails to import on the test runners.
       - uses: jimver/cuda-toolkit@v0.2.36
-        if: ${{ inputs.cuda != 'cpu' && runner.os == 'Linux' }}
+        if: ${{ inputs.cuda != 'cpu' }}
         with:
           cuda: ${{ inputs.cuda_toolkit }}
           use-github-cache: 'false'
