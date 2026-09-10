@@ -46,6 +46,29 @@ def prepend_path(*entries: Path | str) -> str:
     return ";".join((*[str(e) for e in entries], current))
 
 
+# Compute capabilities each CUDA wheel is built for, keyed by toolkit
+# release line. CUDA 13.x dropped the pre-sm_75 targets, so each line
+# needs its own list; leaving the variable unset would let the build fall
+# back to CMake's default of compute_52, which newer nvcc rejects and
+# which predates the double-precision atomics in the kernels.
+TORCH_CUDA_ARCH_LIST_TABLE: dict[str, str] = {
+    "12.4": "5.0;6.0;7.0;7.5;8.0;8.6;9.0",
+    "12.6": "5.0;6.0;7.0;7.5;8.0;8.6;9.0",
+    "13.0": "7.5;8.0;8.6;9.0;10.0;12.0",
+}
+
+
+def toolkit_line(cuda_path: str) -> str:
+    """Reduce the toolkit root (Linux 'cuda-12.6' / Windows 'v12.6') to its
+    release line ('12.6')."""
+    leaf = Path(cuda_path).name
+    for prefix in ("cuda-", "v"):
+        if leaf.startswith(prefix):
+            leaf = leaf[len(prefix):]
+            break
+    return leaf
+
+
 def setup_cuda() -> dict[str, str]:
     """Wire the CUDA toolkit installed by the workflow's toolkit step.
 
@@ -58,9 +81,15 @@ def setup_cuda() -> dict[str, str]:
             f"CUDA toolkit not found under CUDA_PATH={cuda_path!r}; "
             "install the toolkit before the build phase"
         )
+    arch_list = TORCH_CUDA_ARCH_LIST_TABLE.get(toolkit_line(cuda_path))
+    if arch_list is None:
+        sys.exit(
+            f"no TORCH_CUDA_ARCH_LIST entry for toolkit root {cuda_path!r}"
+        )
     return {
         "USE_CUDA": "1",
         "CUDA_PATH": cuda_path,
+        "TORCH_CUDA_ARCH_LIST": arch_list,
         "PATH": prepend_path(Path(cuda_path) / "bin"),
     }
 

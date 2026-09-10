@@ -100,6 +100,25 @@ if(USE_CUDA)
         enable_language(CUDA)
         set(CMAKE_CUDA_STANDARD 20)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+        # Target architectures are taken from TORCH_CUDA_ARCH_LIST (variable
+        # or environment), converted into nvcc gencode flags by the vendored
+        # select_compute_arch helper. CMAKE_CUDA_ARCHITECTURES is not used:
+        # leaving it unset lets CMake default it to 52, which both predates
+        # the double-precision atomics used by the kernels and is rejected
+        # outright by newer toolkits that dropped the pre-sm_75 targets.
+        if((NOT DEFINED TORCH_CUDA_ARCH_LIST) AND (DEFINED ENV{TORCH_CUDA_ARCH_LIST}))
+            set(TORCH_CUDA_ARCH_LIST $ENV{TORCH_CUDA_ARCH_LIST})
+        endif()
+        if(DEFINED CMAKE_CUDA_ARCHITECTURES)
+            set(CMAKE_CUDA_ARCHITECTURES OFF)
+        endif()
+        if(TORCH_CUDA_ARCH_LIST)
+            include(select_compute_arch)
+            cuda_select_nvcc_arch_flags(NVCC_ARCH_FLAGS_EXTRA ${TORCH_CUDA_ARCH_LIST})
+            string(REPLACE ";" " " NVCC_ARCH_FLAGS_EXTRA "${NVCC_ARCH_FLAGS_EXTRA}")
+            set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${NVCC_ARCH_FLAGS_EXTRA}")
+            message(STATUS "Added CUDA NVCC flags for: ${NVCC_ARCH_FLAGS_EXTRA}")
+        endif()
         if(MSVC AND CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
             foreach(_cuda_rule IN ITEMS
                     CMAKE_CUDA_COMPILE_OBJECT
