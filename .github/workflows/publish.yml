@@ -16,9 +16,32 @@ on:
     # Patch tags such as v1.2.1 do not start this workflow.
     tags: ['v*.*.0', 'v*.*.0-rc*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: >
+          Release tag to (re)build, e.g. v1.0.0. The matrix, release notes
+          and wheel version all come from this tag, so a repair run builds
+          exactly what a fresh tag push would build. Leave empty for a plain
+          CI dispatch of the current ref.
+        required: false
+        type: string
+        default: ""
+      lanes:
+        description: >
+          Comma-separated substrings of build_name to rebuild, e.g.
+          "cu124,cu126". Only lanes whose build_name contains any of the
+          substrings run, which is how a failed release is repaired without
+          rebuilding the lanes that already shipped. Empty means the full
+          matrix.
+        required: false
+        type: string
+        default: ""
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref_name }}
+  # Repair dispatches name the tag so they land in the same group as the
+  # original tag run: starting a repair cancels the run it repairs instead
+  # of racing it for the release assets.
+  group: ${{ github.workflow }}-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: true
 
 permissions: read-all
@@ -36,6 +59,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          # A repair dispatch reads the matrix, notes and tag shape from the
+          # release tag itself, so the run behaves exactly like a fresh tag
+          # push.
+          ref: ${{ inputs.tag != '' && inputs.tag || github.ref }}
           submodules: false
           show-progress: false
       - id: read-matrix
@@ -46,12 +73,22 @@ jobs:
           # have no regex helper. release_tag covers full semver tags and
           # their release candidates (vX.Y.Z or vX.Y.Z-rcN); stable_tag only
           # matches the X.Y.0 tags that publish to PyPI and the index branch.
+          # A repair dispatch derives them from the requested tag instead of
+          # GITHUB_REF_NAME, which carries the branch name on dispatches.
+          tag_name="${{ inputs.tag }}"
+          ref_type="branch"
+          if [[ -n "$tag_name" ]]; then
+            ref_type="tag"
+          elif [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            tag_name="${GITHUB_REF_NAME:-}"
+            ref_type="tag"
+          fi
           release_tag=false
           stable_tag=false
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
+          if [[ "$ref_type" == "tag" && "$tag_name" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
             release_tag=true
           fi
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" =~ ^v[0-9]+\.[0-9]+\.0$ ]]; then
+          if [[ "$ref_type" == "tag" && "$tag_name" =~ ^v[0-9]+\.[0-9]+\.0$ ]]; then
             stable_tag=true
           fi
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
@@ -83,6 +120,15 @@ jobs:
               }
             ]
           ' .github/wheel-platforms.json)"
+          # A repair dispatch narrows both matrices to the lanes whose
+          # build_name matches any of the comma-separated substrings; an
+          # empty filter keeps every lane.
+          lanes="${{ inputs.lanes }}"
+          if [[ -n "$lanes" ]]; then
+            lane_pattern="$(printf '%s' "$lanes" | tr ',' '\n' | sed 's/[][\.*^$()+?{}|]/\\&/g' | paste -sd'|' -)"
+            cpu_matrix="$(jq -c --arg re "$lane_pattern" 'map(select(.build_name | test($re)))' <<<"$cpu_matrix")"
+            cuda_matrix="$(jq -c --arg re "$lane_pattern" 'map(select(.build_name | test($re)))' <<<"$cuda_matrix")"
+          fi
           echo "cpu=$cpu_matrix" >> "$GITHUB_OUTPUT"
           echo "cuda=$cuda_matrix" >> "$GITHUB_OUTPUT"
           echo "variants=$(jq -c . .github/cuda-variants.json)" >> "$GITHUB_OUTPUT"
@@ -105,29 +151,30 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $GITHUB_REF_NAME already exists"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists"
           else
             # Curated notes live in docs/release-notes/<tag>.md, compiled from
             # (see docs/release-notes/TEMPLATE.md). Fall back to GitHub's
             # auto-generated notes when the file is missing.
             notes_args=(--generate-notes)
-            notes_file="docs/release-notes/${GITHUB_REF_NAME}.md"
+            notes_file="docs/release-notes/${RELEASE_TAG}.md"
             if [[ -f "$notes_file" ]]; then
               notes_args=(--notes-file "$notes_file")
             fi
             # Release candidates ship as prereleases and never reach PyPI or
             # the stable indexes.
             release_args=()
-            if [[ "$GITHUB_REF_NAME" == *-rc* ]]; then
+            if [[ "$RELEASE_TAG" == *-rc* ]]; then
               release_args=(--prerelease)
             fi
-            gh release create "$GITHUB_REF_NAME" \
+            gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
-              --title "TensorPlay $GITHUB_REF_NAME" \
+              --title "TensorPlay $RELEASE_TAG" \
               "${release_args[@]}" \
               "${notes_args[@]}"
           fi
@@ -161,6 +208,8 @@ jobs:
         {"name":"nn-api","test_files":"test/test_init.py test/test_linear_init.py test/test_new_layers.py test/test_nn_repr.py test/test_parameter.py"}]
       upload_release: ${{ needs.define-wheel-matrix.outputs.release_tag == 'true' }}
       save_cache: false
+      checkout_ref: ${{ inputs.tag }}
+      release_tag_name: ${{ inputs.tag }}
 
   cuda-build:
     name: ${{ matrix.build_name }}-build-test
@@ -186,12 +235,16 @@ jobs:
       cuda_toolkit: ${{ matrix.toolkit }}
       upload_release: ${{ needs.define-wheel-matrix.outputs.release_tag == 'true' }}
       save_cache: false
+      checkout_ref: ${{ inputs.tag }}
+      release_tag_name: ${{ inputs.tag }}
 
   pypi-upload:
     # CPU wheels remain on PyPI -- stable releases only, never release
     # candidates. Release assets are downloaded after every CPU build has
     # tested and uploaded its own wheel.
-    if: needs.define-wheel-matrix.outputs.stable_tag == 'true'
+    if: >-
+      needs.define-wheel-matrix.outputs.stable_tag == 'true' &&
+      needs.cpu-build.result == 'success'
     needs:
       - define-wheel-matrix
       - cpu-build
@@ -210,7 +263,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-assets dist
-          gh release download "$GITHUB_REF_NAME" \
+          gh release download "${{ inputs.tag || github.ref_name }}" \
             --repo "$GITHUB_REPOSITORY" \
             --dir release-assets
 

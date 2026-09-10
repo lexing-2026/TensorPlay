@@ -47,6 +47,22 @@ on:
           turn this off: its runs are months apart, so anything it saves is
           evicted long before the next release reads it, and the duplicate
           entries crowd the shared pool.
+      checkout_ref:
+        required: false
+        type: string
+        default: ""
+        description: >
+          Git ref to check out for the build (a release tag when the
+          publisher dispatches a repair run from the default branch). Empty
+          means the caller's own ref, as before.
+      release_tag_name:
+        required: false
+        type: string
+        default: ""
+        description: >
+          Tag of the GitHub Release the tested wheel belongs to. Empty means
+          the caller's GITHUB_REF_NAME, which only carries a tag shape on
+          real tag pushes.
       run_cpu_benchmarks:
         required: false
         type: boolean
@@ -96,6 +112,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.checkout_ref != '' && inputs.checkout_ref || github.ref }}
           submodules: false
           show-progress: false
 
@@ -296,6 +313,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.checkout_ref != '' && inputs.checkout_ref || github.ref }}
           submodules: false
           show-progress: false
 
@@ -467,7 +485,7 @@ jobs:
   release:
     name: ${{ inputs.build_name }}-release
     needs: test
-    if: ${{ inputs.upload_release && (startsWith(github.ref, 'refs/tags/v') || inputs.build_version != '') }}
+    if: ${{ inputs.upload_release && (startsWith(github.ref, 'refs/tags/v') || inputs.build_version != '' || inputs.release_tag_name != '') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -478,6 +496,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.checkout_ref != '' && inputs.checkout_ref || github.ref }}
           submodules: false
           show-progress: false
 
@@ -522,6 +541,11 @@ jobs:
                 --title "TensorPlay nightly" \
                 --notes-file docs/release-notes/nightly.md
             fi
+          elif [[ "${{ inputs.release_tag_name }}" != "" ]]; then
+            # Repair dispatches run from the default branch, where
+            # GITHUB_REF_NAME carries no tag shape; the publisher passes the
+            # release tag explicitly instead.
+            release="${{ inputs.release_tag_name }}"
           else
             release="$GITHUB_REF_NAME"
           fi
