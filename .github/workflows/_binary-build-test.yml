@@ -77,7 +77,9 @@ jobs:
     permissions:
       contents: read
       actions: read
-    timeout-minutes: 150
+    # A cold Windows CUDA build (no compiler cache, MAX_JOBS=3, ~950 CUDA
+    # translation units) takes over three hours.
+    timeout-minutes: 300
     env:
       BUILD_ENVIRONMENT: ${{ inputs.build_environment }}
       SHA1: ${{ github.event.pull_request.head.sha || github.sha }}
