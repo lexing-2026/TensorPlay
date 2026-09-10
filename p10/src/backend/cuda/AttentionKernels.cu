@@ -1718,7 +1718,8 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
       const void* flash_4warp_kernel =
           reinterpret_cast<const void*>(&sdpa_wmma_flash_half_4warp_kernel);
 #else
-      const void* flash_4warp_kernel = sdpa_wmma_flash_half_4warp_kernel;
+      const void* flash_4warp_kernel =
+          reinterpret_cast<const void*>(sdpa_wmma_flash_half_4warp_kernel);
 #endif
       TP_CUDA_CHECK(cudaFuncSetAttribute(
           flash_4warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1771,7 +1772,8 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
       const void* flash_aligned_kernel =
           reinterpret_cast<const void*>(&sdpa_wmma_flash_half_aligned_kernel);
 #else
-      const void* flash_aligned_kernel = sdpa_wmma_flash_half_aligned_kernel;
+      const void* flash_aligned_kernel =
+          reinterpret_cast<const void*>(sdpa_wmma_flash_half_aligned_kernel);
 #endif
       TP_CUDA_CHECK(cudaFuncSetAttribute(
           flash_aligned_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
