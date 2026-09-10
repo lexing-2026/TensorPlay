@@ -1714,13 +1714,14 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
     }
     static bool shared_memory_configured = false;
     if (!shared_memory_configured) {
-      TP_CUDA_CHECK(cudaFuncSetAttribute(
 #if defined(USE_ROCM)
-          reinterpret_cast<const void*>(&sdpa_wmma_flash_half_4warp_kernel),
+      const void* flash_4warp_kernel =
+          reinterpret_cast<const void*>(&sdpa_wmma_flash_half_4warp_kernel);
 #else
-          sdpa_wmma_flash_half_4warp_kernel,
+      const void* flash_4warp_kernel = sdpa_wmma_flash_half_4warp_kernel;
 #endif
-          cudaFuncAttributeMaxDynamicSharedMemorySize,
+      TP_CUDA_CHECK(cudaFuncSetAttribute(
+          flash_4warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
           static_cast<int>(sizeof(TpWmmaFlashShared))));
       shared_memory_configured = true;
     }
@@ -1766,13 +1767,14 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
     }
     static bool shared_memory_configured = false;
     if (!shared_memory_configured) {
-      TP_CUDA_CHECK(cudaFuncSetAttribute(
 #if defined(USE_ROCM)
-          reinterpret_cast<const void*>(&sdpa_wmma_flash_half_aligned_kernel),
+      const void* flash_aligned_kernel =
+          reinterpret_cast<const void*>(&sdpa_wmma_flash_half_aligned_kernel);
 #else
-          sdpa_wmma_flash_half_aligned_kernel,
+      const void* flash_aligned_kernel = sdpa_wmma_flash_half_aligned_kernel;
 #endif
-          cudaFuncAttributeMaxDynamicSharedMemorySize,
+      TP_CUDA_CHECK(cudaFuncSetAttribute(
+          flash_aligned_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
           static_cast<int>(sizeof(TpWmmaFlashAlignedShared))));
       shared_memory_configured = true;
     }
