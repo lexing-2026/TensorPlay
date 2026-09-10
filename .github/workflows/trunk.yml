@@ -19,6 +19,11 @@ on:
       - ".github/**"
       - "LICENSE"
       - ".gitignore"
+      # Release-bump commits only change the base version string: release
+      # wheels take their version from the tag, and the nightly channel
+      # picks the bump up on its next scheduled run. Not starting the
+      # workflow also keeps a running build from being cancelled.
+      - "version.txt"
   workflow_dispatch:
 
 concurrency:
@@ -154,7 +159,7 @@ jobs:
           skip=false
           if git rev-parse --verify -q "$GH_BEFORE^{commit}" >/dev/null; then
             if [[ -z "$(git diff --name-only "$GH_BEFORE"...HEAD \
-                    | grep -vE '^\.github/|^docs/|\.md$|^LICENSE|^\.gitignore' || true)" ]]; then
+                    | grep -vE '^\.github/|^docs/|\.md$|^LICENSE|^\.gitignore|^version\.txt$' || true)" ]]; then
               echo "CI/docs-only push; skipping the build matrix"
               skip=true
             fi
