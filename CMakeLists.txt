@@ -227,12 +227,19 @@ if(USE_CUDA)
             message(STATUS "Found CUDA bin dir: ${CUDA_BIN_DIR}")
             
             # List of DLLs to bundle
+            # The wheel must carry every runtime DLL behind the import
+            # libraries linked into p10; users' machines have no toolkit.
             # We use glob to find versioned DLLs (e.g. cublas64_11.dll)
             set(CUDA_DLL_PATTERNS
                 "cudart64_*.dll"
                 "cublas64_*.dll"
                 "cublasLt64_*.dll"
-                "nvrtc64_*.dll"
+                "cufft64_*.dll"
+                "curand64_*.dll"
+                "cusolver64_*.dll"
+                "cusparse64_*.dll"
+                "nvrtc*64_*.dll"
+                "nvJitLink_*.dll"
             )
             
             foreach(PATTERN ${CUDA_DLL_PATTERNS})
