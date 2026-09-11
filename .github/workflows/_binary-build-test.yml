@@ -193,7 +193,8 @@ jobs:
         shell: bash
         run: |
           if [[ -n "${{ inputs.release_tag_name }}" ]]; then
-            build_version="${{ inputs.release_tag_name#v }}"
+            build_version="${{ inputs.release_tag_name }}"
+            build_version="${build_version#v}"
           else
             build_version="${GITHUB_REF_NAME#v}"
           fi
