@@ -36,6 +36,15 @@ on:
         required: false
         type: string
         default: ""
+      pypi_only:
+        description: >
+          Republish the CPU wheels already sitting on the release to PyPI
+          without running any build lane: the wheels are downloaded,
+          normalized (the local version segment is stripped and stale bare
+          linux_* assets are dropped) and uploaded.
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   # Repair dispatches name the tag so they land next to the original tag
@@ -182,6 +191,7 @@ jobs:
 
   cpu-build:
     name: ${{ matrix.build_name }}-build-test
+    if: inputs.pypi_only != 'true'
     needs:
       - define-wheel-matrix
       - create-release
@@ -245,7 +255,8 @@ jobs:
     # tested and uploaded its own wheel.
     if: >-
       needs.define-wheel-matrix.outputs.stable_tag == 'true' &&
-      needs.cpu-build.result == 'success'
+      (needs.cpu-build.result == 'success' ||
+       (inputs.pypi_only == 'true' && needs.cpu-build.result == 'skipped'))
     needs:
       - define-wheel-matrix
       - cpu-build
@@ -281,6 +292,58 @@ jobs:
             exit 1
           fi
           printf 'CPU wheels:\n%s\n' "${cpu_wheels[@]}"
+
+      - name: Normalize wheel versions for PyPI
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A repair dispatch builds from the release tag but on the default
+          # branch, so the wheels carry a PEP 440 local version segment that
+          # PyPI rejects outright. Strip it from the filename, the
+          # dist-info directory and the metadata in one pass; bare linux_*
+          # assets from an earlier upload attempt stay on the release but
+          # are never republished.
+          release_tag="${{ inputs.tag || github.ref_name }}"
+          target_version="${release_tag#v}"
+          target_version="${target_version/-rc/rc}"
+          python3 - "$target_version" <<'PY'
+          import re
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          target = sys.argv[1]
+          kept = 0
+          for wheel in sorted(Path("dist").glob("*.whl")):
+              stem = wheel.stem
+              platform_tag = stem.rsplit("-", 1)[-1]
+              if platform_tag.startswith("linux_"):
+                  wheel.unlink()
+                  print(f"dropped bare-linux wheel: {wheel.name}")
+                  continue
+              version = stem.split("-")[1]
+              base = version.split("+")[0]
+              if base == target and "+" not in version:
+                  kept += 1
+                  continue
+              assert base == target, f"{wheel.name}: version {version} does not start with {target}"
+              replacement = stem.replace(version, base)
+              with zipfile.ZipFile(wheel) as archive:
+                  entries = {name: archive.read(name) for name in archive.namelist()}
+              rewritten = {}
+              for name, payload in entries.items():
+                  new_name = name.replace(version, base)
+                  if name.endswith(("METADATA", "RECORD")):
+                      payload = payload.replace(version.encode(), base.encode())
+                  rewritten[new_name] = payload
+              wheel.unlink()
+              with zipfile.ZipFile(f"{replacement}.whl", "w", zipfile.ZIP_DEFLATED) as archive:
+                  for name, payload in rewritten.items():
+                      archive.writestr(name, payload)
+              print(f"normalized: {stem}.whl -> {replacement}.whl")
+              kept += 1
+          assert kept > 0, "no CPU wheels left to publish"
+          PY
 
       - name: Publish CPU wheels to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
