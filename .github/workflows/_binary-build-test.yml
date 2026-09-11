@@ -103,8 +103,10 @@ jobs:
       contents: read
       actions: read
     # A cold Windows CUDA build (no compiler cache, MAX_JOBS=3, ~950 CUDA
-    # translation units) takes over three hours.
-    timeout-minutes: 300
+    # translation units) takes over three hours, and a cold Linux one at
+    # the pinned two-job parallelism lands in the same range; keep a full
+    # hour of margin past that before the runner reaps the job.
+    timeout-minutes: 360
     env:
       BUILD_ENVIRONMENT: ${{ inputs.build_environment }}
       SHA1: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -182,6 +184,7 @@ jobs:
           key: buildcache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.python_version }}-${{ inputs.cuda }}-${{ github.sha }}
           restore-keys: |
             buildcache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.python_version }}-${{ inputs.cuda }}-
+            buildcache-${{ runner.os }}-${{ runner.arch }}-
 
       # Release tags pin the exact version. A repair dispatch derives it
       # from the requested tag for the same reason -- the wheels it builds
