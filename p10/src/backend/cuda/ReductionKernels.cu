@@ -22,6 +22,7 @@
 
 #ifdef USE_CUDNN
 #include <cudnn.h>
+#include "Atomic.cuh"
 #endif
 
 namespace tensorplay {
