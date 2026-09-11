@@ -525,3 +525,59 @@ inline __device__ float gpuAtomicMin(float* address, float val) {
 
 } // namespace cuda
 } // namespace tensorplay
+
+// Note [atomicAdd overloads outside the namespace]
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Kernels call atomicAdd() directly and unqualified. Unqualified lookup
+// never reaches tensorplay::cuda::atomicAdd for calls on raw pointers, so
+// the overloads for the data types the CUDA runtime does not provide must
+// live in the global namespace, exactly where the runtime puts its own.
+// The double fallback covers the architecture levels below sm_60, where
+// the runtime overload is absent from the device overload set.
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 600)
+// from CUDA C Programmic Guide
+inline __device__ double atomicAdd(double* address, double val)
+#if defined(__clang__) && defined(__CUDA__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wgcc-compat"
+    __attribute__((enable_if(true, "")))
+#pragma GCC diagnostic pop
+#endif
+{
+  return tensorplay::cuda::AtomicFPOp<double>()(
+      address, val, [](double val, unsigned long long int assumed) {
+        return __double_as_longlong(val + __longlong_as_double(assumed));
+      });
+}
+#endif
+
+inline __device__ tensorplay::Half atomicAdd(tensorplay::Half* address, tensorplay::Half val) {
+  return tensorplay::cuda::gpuAtomicAdd(address, val);
+}
+
+inline __device__ tensorplay::BFloat16 atomicAdd(
+    tensorplay::BFloat16* address,
+    tensorplay::BFloat16 val) {
+  return tensorplay::cuda::gpuAtomicAdd(address, val);
+}
+
+inline __device__ void atomicAdd(uint8_t* address, uint8_t val) {
+  tensorplay::cuda::gpuAtomicAdd(address, val);
+}
+
+inline __device__ void atomicAdd(int8_t* address, int8_t val) {
+  tensorplay::cuda::gpuAtomicAdd(address, val);
+}
+
+inline __device__ void atomicAdd(int16_t* address, int16_t val) {
+  tensorplay::cuda::gpuAtomicAdd(address, val);
+}
+
+inline __device__ void atomicAdd(int64_t* address, int64_t val) {
+  tensorplay::cuda::gpuAtomicAdd(address, val);
+}
+
+inline __device__ void atomicAdd(bool* address, bool val) {
+  tensorplay::cuda::gpuAtomicAdd(address, val);
+}

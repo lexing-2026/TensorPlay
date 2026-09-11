@@ -19,6 +19,7 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#include "Atomic.cuh"
 
 #define TP_CUDA_CHECK(condition) \
   do { \

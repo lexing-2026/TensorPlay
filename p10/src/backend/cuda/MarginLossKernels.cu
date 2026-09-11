@@ -25,6 +25,7 @@
 #undef NDEBUG
 #endif
 #include <cassert>
+#include "Atomic.cuh"
 
 namespace tensorplay {
 namespace cuda {
