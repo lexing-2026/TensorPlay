@@ -251,7 +251,18 @@ inline __device__ tensorplay::BFloat16 gpuAtomicAdd(
 
 
 inline __device__ double gpuAtomicAdd(double* address, double val) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 600)
+  // Device levels below sm_60 have no double atomicAdd; use a CAS loop over
+  // the bit pattern. The global fallback at the bottom of this header cannot
+  // serve here: it is declared after this definition, and a non-template
+  // inline function resolves unqualified calls at its point of definition.
+  return AtomicFPOp<double>()(
+      address, val, [](double val, unsigned long long int assumed) {
+        return __double_as_longlong(val + __longlong_as_double(assumed));
+      });
+#else
   return atomicAdd(address, val);
+#endif
 }
 
 inline __device__ float gpuAtomicAdd(float* address, float val) {
