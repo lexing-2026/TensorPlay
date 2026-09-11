@@ -327,6 +327,10 @@ jobs:
                   wheel.unlink()
                   print(f"dropped bare-linux wheel: {wheel.name}")
                   continue
+              if wheel.stat().st_size > 100 * 1024 * 1024:
+                  wheel.unlink()
+                  print(f"skipped oversize wheel (PyPI per-file limit): {wheel.name}")
+                  continue
               version = stem.split("-")[1]
               base = version.split("+")[0]
               if base == target and "+" not in version:
@@ -343,7 +347,7 @@ jobs:
                       payload = payload.replace(version.encode(), base.encode())
                   rewritten[new_name] = payload
               wheel.unlink()
-              with zipfile.ZipFile(f"{replacement}.whl", "w", zipfile.ZIP_DEFLATED) as archive:
+              with zipfile.ZipFile(Path("dist") / f"{replacement}.whl", "w", zipfile.ZIP_DEFLATED) as archive:
                   for name, payload in rewritten.items():
                       archive.writestr(name, payload)
               print(f"normalized: {stem}.whl -> {replacement}.whl")
@@ -353,3 +357,5 @@ jobs:
 
       - name: Publish CPU wheels to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
