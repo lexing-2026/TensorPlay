@@ -8,6 +8,7 @@
 // chunks from all tensors are packed into one launch, and each thread handles
 // four contiguous scalar values in the aligned path.
 
+#include "Atomic.cuh"
 #include "CUDARuntime.h"
 #include "Exception.h"
 #include "Tensor.h"
