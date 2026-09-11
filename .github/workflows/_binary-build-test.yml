@@ -183,13 +183,20 @@ jobs:
           restore-keys: |
             buildcache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.python_version }}-${{ inputs.cuda }}-
 
-      # Release tags pin the exact version. CUDA wheels use a local version
-      # suffix so CPU and CUDA files can coexist in one GitHub Release.
+      # Release tags pin the exact version. A repair dispatch derives it
+      # from the requested tag for the same reason -- the wheels it builds
+      # must be identical in version to a fresh tag push. CUDA wheels use a
+      # local version suffix so CPU and CUDA files can coexist in one
+      # GitHub Release.
       - name: Set TENSORPLAY_BUILD_VERSION on release tags
-        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.release_tag_name != '' }}
         shell: bash
         run: |
-          build_version="${GITHUB_REF_NAME#v}"
+          if [[ -n "${{ inputs.release_tag_name }}" ]]; then
+            build_version="${{ inputs.release_tag_name#v }}"
+          else
+            build_version="${GITHUB_REF_NAME#v}"
+          fi
           # Release candidate tags use PEP 440 rc segments:
           # v1.0.0-rc1 -> 1.0.0rc1
           build_version="${build_version/-rc/rc}"
