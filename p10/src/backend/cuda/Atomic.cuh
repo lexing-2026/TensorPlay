@@ -249,23 +249,6 @@ inline __device__ tensorplay::BFloat16 gpuAtomicAdd(
       });
 }
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 600)
-// from CUDA C Programmic Guide
-inline __device__ double atomicAdd(double* address, double val)
-#if defined(__clang__) && defined(__CUDA__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wgcc-compat"
-    __attribute__((enable_if(true, "")))
-#pragma GCC diagnostic pop
-#endif
-{
-
-  return AtomicFPOp<double>()(
-      address, val, [](double val, unsigned long long int assumed) {
-        return __double_as_longlong(val + __longlong_as_double(assumed));
-      });
-}
-#endif
 
 inline __device__ double gpuAtomicAdd(double* address, double val) {
   return atomicAdd(address, val);
@@ -275,41 +258,12 @@ inline __device__ float gpuAtomicAdd(float* address, float val) {
   return atomicAdd(address, val);
 }
 
-/* Note [gpuAtomicAdd vs atomicAdd]
- * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
- * Some extensions call atomicAdd() directly and require non-library provided
- * data type support. Only for these, we continue to provide atomicAdd
- * overloads.
- */
-inline __device__ tensorplay::Half atomicAdd(tensorplay::Half* address, tensorplay::Half val) {
-  return gpuAtomicAdd(address, val);
-}
-
-inline __device__ tensorplay::BFloat16 atomicAdd(
-    tensorplay::BFloat16* address,
-    tensorplay::BFloat16 val) {
-  return gpuAtomicAdd(address, val);
-}
-
-inline __device__ void atomicAdd(uint8_t* address, uint8_t val) {
-  gpuAtomicAdd(address, val);
-}
-
-inline __device__ void atomicAdd(int8_t* address, int8_t val) {
-  gpuAtomicAdd(address, val);
-}
-
-inline __device__ void atomicAdd(int16_t* address, int16_t val) {
-  gpuAtomicAdd(address, val);
-}
-
-inline __device__ void atomicAdd(int64_t* address, int64_t val) {
-  gpuAtomicAdd(address, val);
-}
-
-inline __device__ void atomicAdd(bool* address, bool val) {
-  gpuAtomicAdd(address, val);
-}
+// The atomicAdd() overloads for the dtypes the CUDA runtime does not
+// provide, and the double fallback for pre-sm_60 levels, live in the
+// global namespace at the bottom of this header: kernels call atomicAdd()
+// unqualified on raw pointers, and a namespace-scoped overload set would
+// hide the runtime's own global overloads (unsigned long long, int, float)
+// from that lookup.
 
 inline __device__ void gpuAtomicAddNoReturn(uint8_t* address, uint8_t val) {
   gpuAtomicAdd(address, val);
