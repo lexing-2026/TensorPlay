@@ -166,11 +166,32 @@ jobs:
           fi
           echo "skip=$skip" >> "$GITHUB_OUTPUT"
 
+  # A release run owns the runners while it is open: a trunk matrix started
+  # under it would only race the publisher for machine time and cache pool
+  # space, so the whole trunk matrix yields until the release window closes.
+  release-window:
+    runs-on: ubuntu-latest
+    outputs:
+      open: ${{ steps.gate.outputs.open }}
+    steps:
+      - name: Check for an active release run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          active="$(gh run list --repo "$GITHUB_REPOSITORY" \
+              --workflow publish --status in_progress --limit 1 \
+              --json databaseId --jq length)"
+          echo "open=$([[ "$active" -gt 0 ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
   cpu-build:
     name: ${{ matrix.build_name }}-build-test
-    needs: define-wheel-matrix
+    needs:
+      - define-wheel-matrix
+      - release-window
     # CI/docs-only pushes publish no new wheel; skip the build matrix.
-    if: needs.define-wheel-matrix.outputs.build_skip != 'true'
+    if: needs.define-wheel-matrix.outputs.build_skip != 'true' && needs.release-window.outputs.open != 'true'
     permissions:
       # The called workflow's release job needs contents: write to upload
       # wheels to a GitHub Release on tag builds; the job-level grant
@@ -206,9 +227,11 @@ jobs:
     # toolkit); tags and release branches expand to every configured
     # variant, where the wheels are actually published. Pure frontend,
     # docs, or test-only pushes skip these lanes entirely.
-    if: needs.define-wheel-matrix.outputs.build_skip != 'true' && needs.define-wheel-matrix.outputs.run_cuda == 'true'
+    if: needs.define-wheel-matrix.outputs.build_skip != 'true' && needs.release-window.outputs.open != 'true' && needs.define-wheel-matrix.outputs.run_cuda == 'true'
     name: ${{ matrix.build_name }}-build-test
-    needs: define-wheel-matrix
+    needs:
+      - define-wheel-matrix
+      - release-window
     permissions:
       contents: write
       actions: read
