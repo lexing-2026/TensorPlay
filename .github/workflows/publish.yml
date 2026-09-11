@@ -38,10 +38,11 @@ on:
         default: ""
 
 concurrency:
-  # Repair dispatches name the tag so they land in the same group as the
-  # original tag run: starting a repair cancels the run it repairs instead
-  # of racing it for the release assets.
-  group: ${{ github.workflow }}-${{ inputs.tag || github.ref_name }}
+  # Repair dispatches name the tag so they land next to the original tag
+  # run, and the lane filter is part of the group so complementary repairs
+  # (a CPU one while a CUDA one is still running) do not cancel each other
+  # -- only a dispatch with the same lane filter supersedes its predecessor.
+  group: ${{ github.workflow }}-${{ inputs.tag || github.ref_name }}-${{ inputs.lanes }}
   cancel-in-progress: true
 
 permissions: read-all
