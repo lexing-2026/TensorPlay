@@ -256,7 +256,10 @@ jobs:
     # CPU wheels remain on PyPI -- stable releases only, never release
     # candidates. Release assets are downloaded after every CPU build has
     # tested and uploaded its own wheel.
+    # always() is required: a skipped cpu-build would otherwise short-
+    # circuit the whole condition before the result check gets evaluated.
     if: >-
+      always() &&
       needs.define-wheel-matrix.outputs.stable_tag == 'true' &&
       (needs.cpu-build.result == 'success' ||
        (inputs.pypi_only == 'true' && needs.cpu-build.result == 'skipped'))
