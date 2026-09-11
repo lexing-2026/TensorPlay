@@ -8,6 +8,7 @@
 #include <climits>
 #include <type_traits>
 #include <utility>
+#include "Atomic.cuh"
 
 namespace tensorplay {
 namespace cuda {

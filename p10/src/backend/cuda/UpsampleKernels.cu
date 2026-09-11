@@ -10,6 +10,7 @@
 #include "CUDARuntime.h"
 #include "Utils.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
+#include "Atomic.cuh"
 
 namespace tensorplay {
 namespace cuda {

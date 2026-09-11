@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "Atomic.cuh"
 
 namespace tensorplay {
 namespace cuda {

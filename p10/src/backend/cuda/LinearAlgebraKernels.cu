@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include "Atomic.cuh"
 
 namespace tensorplay {
 namespace cuda {

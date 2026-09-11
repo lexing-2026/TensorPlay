@@ -23,6 +23,7 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include "Atomic.cuh"
 
 namespace tensorplay {
 namespace cuda {
