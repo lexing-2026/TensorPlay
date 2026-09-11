@@ -224,6 +224,7 @@ jobs:
 
   cuda-build:
     name: ${{ matrix.build_name }}-build-test
+    if: inputs.pypi_only != 'true'
     needs:
       - define-wheel-matrix
       - create-release
