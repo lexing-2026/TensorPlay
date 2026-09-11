@@ -319,6 +319,15 @@ jobs:
           from pathlib import Path
 
           target = sys.argv[1]
+          # The OpenMP threading layer is the only MKL layer the build
+          # links; the sequential and TBB layers plus the pre-AVX2 VML
+          # fallback are never loaded on the default path and only push
+          # the Windows wheels over the PyPI per-file limit.
+          dropped_dlls = {
+              b"mkl_sequential.2.dll",
+              b"mkl_tbb_thread.2.dll",
+              b"mkl_vml_def.2.dll",
+          }
           kept = 0
           for wheel in sorted(Path("dist").glob("*.whl")):
               stem = wheel.stem
@@ -342,9 +351,20 @@ jobs:
                   entries = {name: archive.read(name) for name in archive.namelist()}
               rewritten = {}
               for name, payload in entries.items():
+                  leaf = name.rsplit("/", 1)[-1].encode()
+                  if leaf in dropped_dlls or leaf.startswith(b"tbb"):
+                      continue
                   new_name = name.replace(version, base)
-                  if name.endswith(("METADATA", "RECORD")):
+                  if name.endswith("METADATA"):
                       payload = payload.replace(version.encode(), base.encode())
+                  if name.endswith("RECORD"):
+                      payload = b"".join(
+                          line + b"\n" for line in payload.splitlines()
+                          if line
+                          and (lambda p: p not in dropped_dlls and not p.startswith(b"tbb"))(
+                              line.split(b",")[0].rsplit(b"/", 1)[-1]
+                          )
+                      ).replace(version.encode(), base.encode())
                   rewritten[new_name] = payload
               wheel.unlink()
               with zipfile.ZipFile(Path("dist") / f"{replacement}.whl", "w", zipfile.ZIP_DEFLATED) as archive:
