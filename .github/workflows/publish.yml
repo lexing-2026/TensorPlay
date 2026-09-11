@@ -41,10 +41,12 @@ on:
           Republish the CPU wheels already sitting on the release to PyPI
           without running any build lane: the wheels are downloaded,
           normalized (the local version segment is stripped and stale bare
-          linux_* assets are dropped) and uploaded.
+          linux_* assets are dropped) and uploaded. Set to the string
+          "true"; a string input keeps the equality checks in the job
+          conditions free of boolean-to-string coercion surprises.
         required: false
-        type: boolean
-        default: false
+        type: string
+        default: ""
 
 concurrency:
   # Repair dispatches name the tag so they land next to the original tag
