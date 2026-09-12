@@ -151,35 +151,40 @@ jobs:
         shell: bash
         run: bash .github/scripts/restore-vendored-deps.sh
 
-      # Compiler cache lives outside the checkout. ccache drives the CPU
-      # lanes on the POSIX runners and macOS; the Linux CUDA lanes use
-      # sccache instead because ccache only experimentally supports the
-      # nvcc driver and every .cu request misses (sccache covers the whole
-      # pipeline, measured at a near-perfect hit rate). CACHE_PATH is the
-      # single restore/save target; the cache scope includes runner
-      # architecture, build lane, Python version, and variant so native
-      # objects never cross incompatible task environments; restore-keys
-      # fall back to the previous build of the same lane.
+      # Compiler cache lives outside the checkout. Every lane builds through
+      # sccache: ccache only experimentally supports the nvcc driver and
+      # every .cu request misses, while sccache covers the whole pipeline
+      # (measured at a near-perfect hit rate) for C, C++, and CUDA alike.
+      # When the repository carries the object-store credentials, sccache
+      # reads and writes a shared S3-compatible bucket directly and skips
+      # the cache service entirely; without credentials it falls back to a
+      # local disk cache that the cache service moves around. CACHE_PATH
+      # marks the disk fallback's restore/save target; the scope includes
+      # runner architecture, build lane, Python version, and variant so
+      # native objects never cross incompatible task environments;
+      # restore-keys fall back to the previous build of the same lane.
       - name: Set compiler cache location
         shell: bash
+        env:
+          S3_CACHE_BUCKET: ${{ secrets.S3_CACHE_BUCKET }}
+          S3_CACHE_ENDPOINT: ${{ secrets.S3_CACHE_ENDPOINT }}
+          S3_CACHE_REGION: ${{ secrets.S3_CACHE_REGION }}
+          S3_CACHE_ACCESS_KEY_ID: ${{ secrets.S3_CACHE_ACCESS_KEY_ID }}
+          S3_CACHE_SECRET_ACCESS_KEY: ${{ secrets.S3_CACHE_SECRET_ACCESS_KEY }}
         run: |
+          if [[ -n "$S3_CACHE_BUCKET" ]]; then
+            echo "TP_S3_CACHE=1" >> "$GITHUB_ENV"
+            echo "SCCACHE_BUCKET=$S3_CACHE_BUCKET" >> "$GITHUB_ENV"
+            echo "SCCACHE_ENDPOINT=$S3_CACHE_ENDPOINT" >> "$GITHUB_ENV"
+            echo "SCCACHE_REGION=${S3_CACHE_REGION:-us-east-1}" >> "$GITHUB_ENV"
+            echo "SCCACHE_S3_USE_SSL=true" >> "$GITHUB_ENV"
+            echo "AWS_ACCESS_KEY_ID=$S3_CACHE_ACCESS_KEY_ID" >> "$GITHUB_ENV"
+            echo "AWS_SECRET_ACCESS_KEY=$S3_CACHE_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
+          fi
           case "$RUNNER_OS" in
-            Linux)
-              if [[ "${{ inputs.cuda }}" != "cpu" ]]; then
-                echo "SCCACHE_DIR=$HOME/.cache/sccache" >> "$GITHUB_ENV"
-                echo "CACHE_PATH=$HOME/.cache/sccache" >> "$GITHUB_ENV"
-              else
-                echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
-                echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
-                echo "CCACHE_NOHASHDIR=1" >> "$GITHUB_ENV"
-                echo "CACHE_PATH=$HOME/.cache/ccache" >> "$GITHUB_ENV"
-              fi
-              ;;
-            macOS)
-              echo "CCACHE_DIR=$HOME/Library/Caches/ccache" >> "$GITHUB_ENV"
-              echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
-              echo "CCACHE_NOHASHDIR=1" >> "$GITHUB_ENV"
-              echo "CACHE_PATH=$HOME/Library/Caches/ccache" >> "$GITHUB_ENV"
+            Linux|macOS)
+              echo "SCCACHE_DIR=$HOME/.cache/sccache" >> "$GITHUB_ENV"
+              echo "CACHE_PATH=$HOME/.cache/sccache" >> "$GITHUB_ENV"
               ;;
             Windows)
               sccache_dir="$(cygpath -aw "$HOME/.cache/sccache")"
@@ -191,11 +196,12 @@ jobs:
 
       - name: Restore compiler cache
         id: compiler-cache
-        # Self-hosted machines keep the compiler cache on persistent local
-        # disk (SCCACHE_DIR/CCACHE_DIR survive between jobs), so the cache
+        # Self-hosted machines keep the disk fallback cache on persistent
+        # local storage (SCCACHE_DIR survives between jobs), so the cache
         # service would only burn upload bandwidth and evict the hosted
-        # lanes' entries from the shared pool.
-        if: ${{ !contains(runner.name, 'tensorplay-runner') }}
+        # lanes' entries from the shared pool. The object-store backend
+        # replaces the disk cache altogether and needs no restore.
+        if: ${{ !contains(runner.name, 'tensorplay-runner') && env.TP_S3_CACHE != '1' }}
         uses: actions/cache/restore@v6
         with:
           path: ${{ env.CACHE_PATH }}
@@ -346,9 +352,6 @@ jobs:
         shell: bash
         run: |
           echo "Exact compiler cache hit: ${{ steps.compiler-cache.outputs.cache-hit }}"
-          if command -v ccache >/dev/null 2>&1; then
-            ccache --show-stats || true
-          fi
           if command -v sccache >/dev/null 2>&1; then
             sccache --show-stats || true
           fi
@@ -358,7 +361,7 @@ jobs:
           fi
 
       - name: Save compiler cache
-        if: ${{ always() && !cancelled() && inputs.save_cache && steps.compiler-cache.outputs.cache-hit != 'true' && !contains(runner.name, 'tensorplay-runner') }}
+        if: ${{ always() && !cancelled() && inputs.save_cache && steps.compiler-cache.outputs.cache-hit != 'true' && !contains(runner.name, 'tensorplay-runner') && env.TP_S3_CACHE != '1' }}
         uses: actions/cache/save@v6
         with:
           path: ${{ env.CACHE_PATH }}
