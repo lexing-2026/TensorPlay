@@ -47,6 +47,14 @@ on:
         required: false
         type: string
         default: ""
+      linux_cuda_runner:
+        description: >
+          Optional runner override for the linux-x86_64 CUDA lanes, e.g.
+          "ubuntu-22.04" or "self-hosted". Empty keeps the value from
+          .github/wheel-platforms.json.
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   # Repair dispatches name the tag so they land next to the original tag
@@ -117,9 +125,16 @@ jobs:
               }
             ]
           ' .github/wheel-platforms.json)"
-          cuda_matrix="$(jq -c --slurpfile variants .github/cuda-variants.json '
+          # The linux_cuda_runner input re-points the linux-x86_64 CUDA
+          # lanes at dispatch time (hosted pool or a registered runner)
+          # without touching the checked-in default.
+          cuda_matrix="$(jq -c --slurpfile variants .github/cuda-variants.json --arg lcr "${{ inputs.linux_cuda_runner }}" '
             [
               .cuda_platforms[] as $platform |
+              (if $lcr != "" and $platform.name == "linux-x86_64"
+               then $platform + {runner: $lcr}
+               else $platform
+               end) as $platform |
               .python_versions[] as $python |
               $variants[0][] as $cuda |
               {
