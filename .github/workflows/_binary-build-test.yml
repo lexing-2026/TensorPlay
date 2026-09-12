@@ -240,12 +240,37 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-build.txt
 
+      # Reuse a toolkit the runner machine already carries when its release
+      # matches the lane's major.minor; only fall back to the installer
+      # download (~4GB per CUDA version) when nothing suitable is installed.
+      - name: Detect preinstalled CUDA toolkit
+        id: cuda-detect
+        if: ${{ inputs.cuda != 'cpu' && runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          want="${{ inputs.cuda_toolkit }}"
+          major_minor="${want%.*}"
+          want_rel="release ${major_minor/./\\.}"
+          for d in "/usr/local/cuda-${major_minor}" /usr/local/cuda; do
+            if [[ -x "$d/bin/nvcc" ]] &&
+               "$d/bin/nvcc" --version | grep -q "$want_rel"; then
+              found="$d"
+              break
+            fi
+          done
+          if [[ -n "${found:-}" ]]; then
+            echo "preinstalled=$found" >> "$GITHUB_OUTPUT"
+            echo "CUDA_PATH=$found" >> "$GITHUB_ENV"
+            echo "CUDA_PATH_V${major_minor/./_}=$found" >> "$GITHUB_ENV"
+            echo "$found/bin" >> "$GITHUB_PATH"
+          fi
+
       # This installs the compiler/toolkit only. Free GitHub-hosted runners
       # have no GPU, so CUDA kernels are never executed in this workflow.
       # The downloaded installer (~4GB per CUDA version) must stay out of the
       # shared 10GB cache pool or it evicts the compiler caches of every lane.
       - uses: jimver/cuda-toolkit@v0.2.36
-        if: ${{ inputs.cuda != 'cpu' }}
+        if: ${{ inputs.cuda != 'cpu' && steps.cuda-detect.outputs.preinstalled == '' }}
         with:
           cuda: ${{ inputs.cuda_toolkit }}
           use-github-cache: 'false'
