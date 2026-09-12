@@ -293,18 +293,19 @@ jobs:
           GPU_ARCH_TYPE: ${{ inputs.cuda != 'cpu' && 'cuda' || 'cpu' }}
           SKBUILD_CMAKE_DEFINE: >-
             ${{ inputs.cuda != 'cpu' && 'USE_CUDA=ON' || 'USE_CUDA=OFF' }};USE_MPI=OFF
-          MAX_JOBS: ${{ runner.os == 'Windows' && '3' || (inputs.cuda != 'cpu' && '2' || '') }}
+          MAX_JOBS: ${{ runner.os == 'Windows' && '3' || (inputs.cuda != 'cpu' && (contains(runner.name, 'tensorplay-runner') && '4' || '2') || '') }}
           CCACHE_MAXSIZE: 2G
           SCCACHE_CACHE_SIZE: 5G
         run: |
           # Leave the driving shell and I/O a core of headroom; fat device
           # compiles push memory hard at full parallelism. macOS has no
           # nproc, so probe getconf first with nproc as the Linux fallback.
-          # CUDA lanes run on 4-core/16 GB hosted runners where three
-          # parallel fat device compiles exhaust RAM and the runner agent
-          # gets reclaimed mid-build ("lost communication"), so they pin 2;
-          # the auto default below only fills in when the env left MAX_JOBS
-          # empty (CPU lanes, which compile far lighter objects).
+          # CUDA lanes on the hosted 4-core/16 GB pool run two parallel
+          # fat device compiles; the self-hosted pool (tensorplay-runner-*)
+          # carries 20 cores and 30 GB, so four fit comfortably and cut
+          # the cold-build wall time roughly in half. The auto default
+          # below only fills in when the env left MAX_JOBS empty (CPU
+          # lanes, which compile far lighter objects).
           if [[ "$RUNNER_OS" != "Windows" && -z "${MAX_JOBS:-}" ]]; then
             ncpu="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)"
             export MAX_JOBS=$(( ncpu > 1 ? ncpu - 1 : 1 ))
