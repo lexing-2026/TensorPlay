@@ -191,6 +191,11 @@ jobs:
 
       - name: Restore compiler cache
         id: compiler-cache
+        # Self-hosted machines keep the compiler cache on persistent local
+        # disk (SCCACHE_DIR/CCACHE_DIR survive between jobs), so the cache
+        # service would only burn upload bandwidth and evict the hosted
+        # lanes' entries from the shared pool.
+        if: ${{ !contains(runner.name, 'tensorplay-runner') }}
         uses: actions/cache/restore@v6
         with:
           path: ${{ env.CACHE_PATH }}
@@ -353,7 +358,7 @@ jobs:
           fi
 
       - name: Save compiler cache
-        if: ${{ always() && !cancelled() && inputs.save_cache && steps.compiler-cache.outputs.cache-hit != 'true' }}
+        if: ${{ always() && !cancelled() && inputs.save_cache && steps.compiler-cache.outputs.cache-hit != 'true' && !contains(runner.name, 'tensorplay-runner') }}
         uses: actions/cache/save@v6
         with:
           path: ${{ env.CACHE_PATH }}
