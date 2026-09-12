@@ -416,17 +416,10 @@ macro(tp_add_third_party DIRECTORY)
     set(CMAKE_CXX_FLAGS "${_TP_CXX_FLAGS_SAVED}")
 endmacro()
 
-option(USE_CCACHE "Speed up rebuilds with ccache (fallback: sccache) when found" ON)
-if(USE_CCACHE)
-    find_program(CCACHE_PROGRAM ccache)
+option(USE_SCCACHE "Speed up rebuilds with the sccache compiler launcher when found" ON)
+if(USE_SCCACHE)
     find_program(SCCACHE_EXECUTABLE sccache)
-    if(CCACHE_PROGRAM)
-        foreach(_LANG C CXX CUDA)
-            set(CMAKE_${_LANG}_COMPILER_LAUNCHER
-                "${CCACHE_PROGRAM}"
-                CACHE STRING "${_LANG} compiler launcher")
-        endforeach()
-    elseif(SCCACHE_EXECUTABLE)
+    if(SCCACHE_EXECUTABLE)
         foreach(_LANG C CXX CUDA)
             set(CMAKE_${_LANG}_COMPILER_LAUNCHER
                 "${SCCACHE_EXECUTABLE}"
@@ -439,7 +432,7 @@ if(USE_CCACHE)
         endif()
     else()
         message(STATUS
-            "Neither ccache nor sccache found; builds will not be cached.")
+            "sccache not found; builds will not be cached.")
     endif()
 endif()
 
