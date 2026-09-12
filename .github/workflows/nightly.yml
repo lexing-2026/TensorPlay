@@ -293,6 +293,7 @@ jobs:
       build_version: ${{ needs.prepare.outputs.version }}
       build_number: ${{ needs.prepare.outputs.build_number }}
       upload_release: true
+    secrets: inherit
 
   cuda-build:
     name: ${{ matrix.build_name }}-build-test
@@ -323,3 +324,4 @@ jobs:
       build_version: ${{ needs.prepare.outputs.version }}
       build_number: ${{ needs.prepare.outputs.build_number }}
       upload_release: true
+    secrets: inherit
