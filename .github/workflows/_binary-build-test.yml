@@ -240,6 +240,18 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-build.txt
 
+      # Self-hosted runners share one tool cache, so several lanes point at
+      # the SAME interpreter; letting each job pip-install into it would
+      # race concurrent site-packages writes. Isolate every Linux lane in a
+      # per-job venv (RUNNER_TEMP is job-unique) and put it first on PATH;
+      # the tool-cache interpreter itself stays pristine and read-only.
+      - name: Create per-job build venv
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/build-venv"
+          echo "$RUNNER_TEMP/build-venv/bin" >> "$GITHUB_PATH"
+
       # Reuse a toolkit the runner machine already carries when its release
       # matches the lane's major.minor; only fall back to the installer
       # download (~4GB per CUDA version) when nothing suitable is installed.
