@@ -45,6 +45,7 @@ jobs:
       run_cpu_benchmarks: true
       cpu_benchmark_suite: ${{ inputs.test_mode || 'short' }}
       upload_release: false
+    secrets: inherit
 
   publish-bench-data:
     name: publish-bench-data
