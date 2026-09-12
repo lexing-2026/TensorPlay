@@ -112,6 +112,21 @@ jobs:
       SHA1: ${{ github.event.pull_request.head.sha || github.sha }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
+      # Self-hosted machines keep a bare git mirror under
+      # $HOME/actions-runner/mirrors and a global insteadOf rewrites every
+      # github.com clone to it, so checkouts and vendored-dependency clones
+      # read from local disk. Refresh the mirror incrementally first so the
+      # rewritten checkout still sees the requested ref; on hosted runners
+      # (no mirror) this is a no-op.
+      - name: Refresh local git mirror
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          m="$HOME/actions-runner/mirrors/TensorPlay.git"
+          if [[ -d "$m" ]]; then
+            git -C "$m" remote update --prune
+          fi
+
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.checkout_ref != '' && inputs.checkout_ref || github.ref }}
