@@ -635,21 +635,22 @@ if(USE_BLAS)
                 if(MKL_BIN_DIR AND EXISTS "${MKL_BIN_DIR}")
                     message(STATUS "Found MKL bin dir: ${MKL_BIN_DIR}")
                     # Bundle MKL DLLs (using glob to match version suffixes like .2.dll)
-                    # Core, Sequential, Interface, Dispatchers
-                    set(MKL_PATTERNS 
+                    # Core, Interface, Dispatchers. The OpenMP threading layer
+                    # (mkl_intel_thread + libiomp5md) is the only one shipped:
+                    # the build links OpenMP, and mkl_rt resolves to it by
+                    # default, so the sequential and TBB layers plus the
+                    # pre-AVX2 VML fallback would be dead weight that pushes
+                    # the wheel over the PyPI per-file limit.
+                    set(MKL_PATTERNS
                         "mkl_core*.dll"
-                        "mkl_sequential*.dll" 
                         "mkl_intel_lp64*.dll"
                         "mkl_intel_thread*.dll"
-                        "mkl_tbb_thread*.dll"
                         "mkl_rt*.dll"
                         "mkl_def*.dll"
                         "mkl_avx2*.dll"
                         "mkl_vml_avx2*.dll"
-                        "mkl_vml_def*.dll"
                         "libiomp5md*.dll"
                         "libiompstubs5md*.dll"
-                        "tbb*.dll"
                     )
                     foreach(PATTERN ${MKL_PATTERNS})
                         file(GLOB MKL_DLLS "${MKL_BIN_DIR}/${PATTERN}")
