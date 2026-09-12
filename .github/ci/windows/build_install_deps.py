@@ -89,9 +89,9 @@ def install_libuv(workdir: Path, python_prefix: Path) -> Path:
 def install_sccache(workdir: Path) -> dict[str, str]:
     """Unpack sccache into a private directory and put it on PATH.
 
-    Returns the env diff for --env-out. CMake's USE_CCACHE block finds the
-    binary through its sccache fallback and wires the compiler launchers;
-    sccache itself keeps its cache in SCCACHE_DIR (pinned by the workflow).
+    Returns the env diff for --env-out. CMake's USE_SCCACHE block wires the
+    compiler launchers through this binary; sccache itself keeps its cache
+    in SCCACHE_DIR (pinned by the workflow).
     """
     sccache_dir = workdir / "sccache-bin"
     sccache_dir.mkdir(parents=True, exist_ok=True)

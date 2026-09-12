@@ -55,10 +55,11 @@ def main() -> None:
     os.chdir(args.package_dir)
     pip_install("-q", *BUILD_PACKAGES)
 
-    # The CMake build picks up ccache as a compiler launcher when it is on
-    # PATH; a persistent cache makes the second build of a lane far cheaper.
-    if shutil.which("ccache") is None:
-        retry(["brew", "install", "ccache"])
+    # The CMake build picks up sccache as the compiler launcher when it is
+    # on PATH; a shared object-store cache makes the second build of a
+    # lane far cheaper.
+    if shutil.which("sccache") is None:
+        retry(["brew", "install", "sccache"])
 
     # OpenMP: prefer the conda-forge libomp staged at /opt/llvm-openmp (set
     # up by install_libomp.sh as a separate step). Otherwise fall back to
