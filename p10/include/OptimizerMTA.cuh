@@ -32,36 +32,60 @@ constexpr int kILP = 4;
 constexpr int64_t kChunkSize = 65536;
 constexpr int kBlockSize = 512;
 
-// optimizer kernels within the conservative 4 KiB kernel-argument limit.
+// CUDA 13 guarantees a 32 KiB device-kernel argument space; older toolkits
+// cap device-kernel arguments at 4 KiB. Per-launch tensor capacity, the
+// block-index width and the launch-grid cap follow that split: the wide
+// branch packs far more work into one launch, the narrow branch trades
+// launches for fit inside the small budget.
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+constexpr int kKernelArgBudget = 32768;
+constexpr int kMaxBlocks = 2240;
+using BlockIndex = uint16_t;
 template <int Depth>
 constexpr int kMaxTensorsForDepth =
-    Depth == 1 ? 77 :
-    (Depth == 2 ? 62 :
-     (Depth == 3 ? 51 :
-      (Depth == 4 ? 44 :
-       (Depth == 5 ? 38 : 0))));
+    Depth == 1 ? 770 :
+    (Depth == 2 ? 448 :
+     (Depth == 3 ? 336 :
+      (Depth == 4 ? 252 :
+       (Depth == 5 ? 210 : 0))));
+#else
+constexpr int kKernelArgBudget = 4096;
+constexpr int kMaxBlocks = 320;
+using BlockIndex = uint8_t;
+template <int Depth>
+constexpr int kMaxTensorsForDepth =
+    Depth == 1 ? 93 :
+    (Depth == 2 ? 69 :
+     (Depth == 3 ? 55 :
+      (Depth == 4 ? 46 :
+       (Depth == 5 ? 39 : 0))));
+#endif
+// Widest device-side scalar tail across the optimizer kernels (lr, betas,
+// epsilon, decay, guard pointers and flags, rounded up for ABI packing).
+// The capacity tables below must keep the metadata block inside the budget
+// after reserving this much for kernel arguments.
+constexpr int kMaxKernelScalarReserve = 256;
 // Adafactor carries original tensor indices and trailing dimensions for its
 // reduction/apply split, so its metadata has a smaller, extended capacity.
 template <int Depth>
 constexpr int kMaxExtendedTensorsForDepth =
-    Depth == 1 ? 47 :
-    (Depth == 2 ? 41 :
-     (Depth == 3 ? 36 :
-      (Depth == 4 ? 32 :
-       (Depth == 5 ? 29 : 0))));
+    Depth == 1 ? 43 :
+    (Depth == 2 ? 37 :
+     (Depth == 3 ? 32 :
+      (Depth == 4 ? 29 :
+       (Depth == 5 ? 26 : 0))));
 // Plain MTA does not need step values or Adafactor's tensor bookkeeping.
 // Keep a larger per-launch capacity than the extended metadata while staying
-// below CUDA 12's 4 KiB kernel-argument limit.  This matters for the common
+// below the narrow kernel-argument budget.  This matters for the common
 // optimizer shapes: a depth-3 SGD group of 104 tensors fits in two launches,
 // and a depth-5 centered RMSprop group fits in three.
 template <int Depth>
 constexpr int kMaxPlainTensorsForDepth =
-    Depth == 1 ? 128 :
-    (Depth == 2 ? 96 :
-     (Depth == 3 ? 64 :
-      (Depth == 4 ? 48 :
-       (Depth == 5 ? 40 : 0))));
-constexpr int kMaxBlocks = 320;
+    Depth == 1 ? 136 :
+    (Depth == 2 ? 92 :
+     (Depth == 3 ? 68 :
+      (Depth == 4 ? 55 :
+       (Depth == 5 ? 46 : 0))));
 
 template <typename T>
 struct alignas(kILP * sizeof(T)) AlignedVec {
@@ -86,8 +110,8 @@ template <int Depth>
 struct TensorMetadata {
     static constexpr int kMaxTensors = kMaxExtendedTensorsForDepth<Depth>;
     struct HostSteps {
-        double step_sizes[kMaxTensors]{};
-        double correction2_sqrts[kMaxTensors]{};
+        float step_sizes[kMaxTensors]{};
+        float correction2_sqrts[kMaxTensors]{};
     };
     union StepStorage {
         const void* state_steps[kMaxTensors];
@@ -99,7 +123,7 @@ struct TensorMetadata {
     int64_t dim_minus2[kMaxTensors]{};
     int64_t dim_minus1[kMaxTensors]{};
     StepStorage step_metadata{};
-    uint8_t block_to_tensor[kMaxBlocks]{};
+    BlockIndex block_to_tensor[kMaxBlocks]{};
     int32_t block_to_chunk[kMaxBlocks]{};
 };
 
@@ -107,8 +131,8 @@ template <int Depth>
 struct SimpleTensorMetadata {
     static constexpr int kMaxTensors = kMaxTensorsForDepth<Depth>;
     struct HostSteps {
-        double step_sizes[kMaxTensors]{};
-        double correction2_sqrts[kMaxTensors]{};
+        float step_sizes[kMaxTensors]{};
+        float correction2_sqrts[kMaxTensors]{};
     };
     union StepStorage {
         const void* state_steps[kMaxTensors];
@@ -117,7 +141,7 @@ struct SimpleTensorMetadata {
     const void* addresses[Depth][kMaxTensors]{};
     int64_t numel_for_tensor[kMaxTensors]{};
     StepStorage step_metadata{};
-    uint8_t block_to_tensor[kMaxBlocks]{};
+    BlockIndex block_to_tensor[kMaxBlocks]{};
     int32_t block_to_chunk[kMaxBlocks]{};
 };
 
@@ -126,9 +150,27 @@ struct PlainTensorMetadata {
     static constexpr int kMaxTensors = kMaxPlainTensorsForDepth<Depth>;
     const void* addresses[Depth][kMaxTensors]{};
     int64_t numel_for_tensor[kMaxTensors]{};
-    uint8_t block_to_tensor[kMaxBlocks]{};
+    BlockIndex block_to_tensor[kMaxBlocks]{};
     int32_t block_to_chunk[kMaxBlocks]{};
 };
+
+// The metadata travels by value as a kernel argument: keep every variant
+// inside the argument budget once the widest scalar tail is reserved.
+static_assert(sizeof(TensorMetadata<1>) + kMaxKernelScalarReserve <= kKernelArgBudget);
+static_assert(sizeof(TensorMetadata<2>) + kMaxKernelScalarReserve <= kKernelArgBudget);
+static_assert(sizeof(TensorMetadata<3>) + kMaxKernelScalarReserve <= kKernelArgBudget);
+static_assert(sizeof(TensorMetadata<4>) + kMaxKernelScalarReserve <= kKernelArgBudget);
+static_assert(sizeof(TensorMetadata<5>) + kMaxKernelScalarReserve <= kKernelArgBudget);
+static_assert(sizeof(SimpleTensorMetadata<1>) + kMaxKernelScalarReserve <= kKernelArgBudget);
+static_assert(sizeof(SimpleTensorMetadata<2>) + kMaxKernelScalarReserve <= kKernelArgBudget);
+static_assert(sizeof(SimpleTensorMetadata<3>) + kMaxKernelScalarReserve <= kKernelArgBudget);
+static_assert(sizeof(SimpleTensorMetadata<4>) + kMaxKernelScalarReserve <= kKernelArgBudget);
+static_assert(sizeof(SimpleTensorMetadata<5>) + kMaxKernelScalarReserve <= kKernelArgBudget);
+static_assert(sizeof(PlainTensorMetadata<1>) + kMaxKernelScalarReserve <= kKernelArgBudget);
+static_assert(sizeof(PlainTensorMetadata<2>) + kMaxKernelScalarReserve <= kKernelArgBudget);
+static_assert(sizeof(PlainTensorMetadata<3>) + kMaxKernelScalarReserve <= kKernelArgBudget);
+static_assert(sizeof(PlainTensorMetadata<4>) + kMaxKernelScalarReserve <= kKernelArgBudget);
+static_assert(sizeof(PlainTensorMetadata<5>) + kMaxKernelScalarReserve <= kKernelArgBudget);
 
 template <int Depth, typename Metadata>
 inline void set_extended_metadata(
@@ -163,11 +205,11 @@ inline void set_step_metadata(
     }
     if (step_sizes != nullptr) {
         metadata.step_metadata.host.step_sizes[slot] =
-            (*step_sizes)[tensor_index];
+            static_cast<float>((*step_sizes)[tensor_index]);
     }
     if (correction2_sqrts != nullptr) {
         metadata.step_metadata.host.correction2_sqrts[slot] =
-            (*correction2_sqrts)[tensor_index];
+            static_cast<float>((*correction2_sqrts)[tensor_index]);
     }
 }
 
@@ -183,11 +225,11 @@ inline void set_step_metadata(
     }
     if (step_sizes != nullptr) {
         metadata.step_metadata.host.step_sizes[slot] =
-            (*step_sizes)[tensor_index];
+            static_cast<float>((*step_sizes)[tensor_index]);
     }
     if (correction2_sqrts != nullptr) {
         metadata.step_metadata.host.correction2_sqrts[slot] =
-            (*correction2_sqrts)[tensor_index];
+            static_cast<float>((*correction2_sqrts)[tensor_index]);
     }
 }
 
@@ -261,7 +303,7 @@ void launch_batches_impl(
             const int32_t take = std::min(available, remaining);
             for (int32_t chunk = 0; chunk < take; ++chunk) {
                 metadata.block_to_tensor[block_count + chunk] =
-                    static_cast<uint8_t>(tensor_slots - 1);
+                    static_cast<BlockIndex>(tensor_slots - 1);
                 metadata.block_to_chunk[block_count + chunk] =
                     next_chunk + chunk;
             }
