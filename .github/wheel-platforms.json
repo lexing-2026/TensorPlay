@@ -1,5 +1,10 @@
 {
-  "python_versions": ["3.10", "3.11", "3.12", "3.13"],
+  "python_versions": [
+    "3.10",
+    "3.11",
+    "3.12",
+    "3.13"
+  ],
   "cpu_platforms": [
     {
       "name": "linux-x86_64",
@@ -21,7 +26,7 @@
   "cuda_platforms": [
     {
       "name": "linux-x86_64",
-      "runner": "self-hosted"
+      "runner": "ubuntu-22.04"
     },
     {
       "name": "windows-x86_64",
