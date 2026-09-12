@@ -508,6 +508,12 @@ __global__ void sdpa_softmax_kernel(
 // TensorPlay tensor ABI and dispatcher independent.  One block owns 16 query
 // rows of one head; four warps compute QK tiles and eight warps compute the
 // PV output tiles.  The 16 remaining warps each own one online-softmax row.
+//
+// WMMA primitives exist only for compute capability 7.0 and newer CUDA
+// targets; the toolkit omits the namespace from older device passes, so the
+// kernels below are compiled only for the targets that expose them.  The HIP
+// compatibility header defines the namespace for every target it serves.
+#if defined(USE_ROCM) || !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 700)
 __device__ inline __half tp_half_to_cuda(tensorplay::Half value) {
   return *reinterpret_cast<const __half*>(&value);
 }
@@ -686,7 +692,6 @@ __global__ void sdpa_wmma_flash_half_kernel(
 // 64x64 tile, Q is loaded once, and each warp carries two 16-column output
 // fragments.  The Q/accumulator buffers are overlaid because Q is dead after
 // the last PV iteration.
-#if 1
 struct TpWmmaFlashShared {
   __half q[64][128];
   __half k[64][128];
@@ -944,7 +949,6 @@ __global__ void sdpa_wmma_flash_half_4warp_kernel(
     }
   }
 }
-#endif
 
 // Aligned native flash path for the benchmark's Llama head shape.  This is
 // symbols are part of the dependency graph.
@@ -1212,6 +1216,7 @@ __global__ __launch_bounds__(256, 2) void sdpa_wmma_flash_half_aligned_kernel(
                        bh_base, q0, D);
   }
 }
+#endif  // WMMA kernels require compute capability 7.0 or newer.
 
 #if defined(TP_HAS_NATIVE_CUTE_FLASH)
 // This is the exact native 64x64/4-warp schedule used by the aligned CUDA
@@ -1617,7 +1622,18 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
   // other supported dtype at head_dim <= 128 keeps the warp-per-row flash
   // kernel, avoiding the naive kernel's float32 upcast.  The naive
   // row-per-block kernel stays as the fallback for wider heads.
+  bool tensor_cores_available = true;
+#if !defined(USE_ROCM)
   if (impl == 0 && D == 128 && dtype == DType::Float16) {
+    int major = 0;
+    TP_CUDA_CHECK(cudaDeviceGetAttribute(
+        &major, cudaDevAttrComputeCapabilityMajor,
+        getCurrentCUDAStream().device_index()));
+    tensor_cores_available = major >= 7;
+  }
+#endif
+  if (impl == 0 && D == 128 && dtype == DType::Float16 &&
+      tensor_cores_available) {
     impl = 5;
   } else if (impl == 0 && D <= 128) {
     impl = 3;
@@ -1695,6 +1711,7 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
     TP_CUDA_CHECK(cudaGetLastError());
     return out;
   } else if (impl == 8) {
+#if defined(USE_ROCM) || !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 700)
     Tensor out = Tensor::empty({B, H, T, D}, dtype, q.device());
     if (dtype != DType::Float16 || D != 128) {
       TP_THROW(NotImplementedError,
@@ -1737,6 +1754,10 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
         B, H, T, D, scale, is_causal);
     TP_CUDA_CHECK(cudaGetLastError());
     return out;
+#else
+    TP_THROW(NotImplementedError,
+             "sdpa impl=8 (4-warp FP16 WMMA flash) requires compute capability 7.0 or newer");
+#endif
   } else if (impl == 5 || impl == 6 || impl == 7) {
     if (dtype != DType::Float16 || D != 128) {
       TP_THROW(NotImplementedError,
@@ -1750,7 +1771,7 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
       return sdpa_native_cute_flash<true>(q, k, v, B, H, T, D);
     }
     return sdpa_native_cute_flash<false>(q, k, v, B, H, T, D);
-#else
+#elif defined(USE_ROCM) || !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 700)
     Tensor out = Tensor::empty({B, H, T, D}, dtype, q.device());
     // The native 64x64 schedule deliberately requires the original aligned
     // Llama shape.  Keep the older tail-safe kernel for arbitrary lengths.
@@ -1791,8 +1812,12 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
         B, H, T, D, scale, is_causal);
     TP_CUDA_CHECK(cudaGetLastError());
     return out;
+#else
+    TP_THROW(NotImplementedError,
+             "sdpa impl=5 (aligned FP16 WMMA flash) requires compute capability 7.0 or newer");
 #endif  // TP_HAS_NATIVE_CUTE_FLASH
   } else if (impl == 4) {
+#if defined(USE_ROCM) || !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 700)
     Tensor out = Tensor::empty({B, H, T, D}, dtype, q.device());
     if (dtype != DType::Float16 || D != 128) {
       TP_THROW(NotImplementedError,
@@ -1808,6 +1833,10 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
         B, H, T, D, scale, is_causal);
     TP_CUDA_CHECK(cudaGetLastError());
     return out;
+#else
+    TP_THROW(NotImplementedError,
+             "sdpa impl=4 (FP16 WMMA flash) requires compute capability 7.0 or newer");
+#endif
   } else if (impl == 2) {
     if (dtype == DType::Float32) {
       return sdpa_gemm_native<float>(q, k, v, B, H, T, D, is_causal);
