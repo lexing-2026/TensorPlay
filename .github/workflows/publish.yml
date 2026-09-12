@@ -223,6 +223,7 @@ jobs:
       save_cache: false
       checkout_ref: ${{ inputs.tag }}
       release_tag_name: ${{ inputs.tag }}
+    secrets: inherit
 
   cuda-build:
     name: ${{ matrix.build_name }}-build-test
@@ -251,6 +252,7 @@ jobs:
       save_cache: false
       checkout_ref: ${{ inputs.tag }}
       release_tag_name: ${{ inputs.tag }}
+    secrets: inherit
 
   pypi-upload:
     # CPU wheels remain on PyPI -- stable releases only, never release

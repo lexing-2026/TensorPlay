@@ -221,6 +221,7 @@ jobs:
       # nightly release; tags and release branches publish to their own.
       build_version: ${{ needs.define-wheel-matrix.outputs.nightly_version }}
       upload_release: ${{ github.ref_type == 'branch' && github.ref_name == 'main' }}
+    secrets: inherit
 
   cuda-build:
     # Plain main pushes build one regression lane per platform (the newest
@@ -251,3 +252,4 @@ jobs:
       cuda_toolkit: ${{ matrix.toolkit }}
       build_version: ${{ needs.define-wheel-matrix.outputs.nightly_version }}
       upload_release: ${{ github.ref_type == 'branch' && github.ref_name == 'main' }}
+    secrets: inherit
