@@ -123,7 +123,11 @@ jobs:
         shell: bash
         run: |
           m="$HOME/actions-runner/mirrors/TensorPlay.git"
-          if [[ -d "$m" ]]; then
+          ref="${{ inputs.checkout_ref != '' && inputs.checkout_ref || github.ref }}"
+          if [[ -d "$m" ]] &&
+             ! git -C "$m" rev-parse --verify --quiet "${ref}^{commit}" >/dev/null; then
+            # Repair loops re-request the same tag; only pay for a network
+            # fetch when the mirror cannot resolve the requested ref yet.
             git -C "$m" remote update --prune
           fi
 
