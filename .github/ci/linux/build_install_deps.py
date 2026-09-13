@@ -84,26 +84,39 @@ def main() -> None:
     }.get(machine)
     if sccache_arch is None:
         sys.exit(f"no sccache tarball mapping for {machine}")
-    sccache_bin = Path("/usr/local/bin/sccache")
-    if not sccache_bin.exists():
-        version = "0.8.1"
-        workdir = Path("sccache-extract")
-        workdir.mkdir(exist_ok=True)
-        tarball = workdir / "sccache.tar.gz"
-        url = (
-            "https://github.com/mozilla/sccache/releases/download/"
-            f"v{version}/sccache-v{version}-{sccache_arch}.tar.gz"
+    sccache_bin: Path | None
+    found = shutil.which("sccache")
+    if found is not None:
+        sccache_bin = Path(found)
+    else:
+        # Root-less builders cannot write system prefixes, so stage into a
+        # user-owned bin directory that is already on the runner's PATH.
+        install_dir = (
+            Path("/usr/local/bin")
+            if os.geteuid() == 0
+            else Path.home() / ".local" / "bin"
         )
-        urllib.request.urlretrieve(url, tarball)
-        with tarfile.open(tarball) as archive:
-            archive.extractall(workdir)
-        payload = (
-            workdir / f"sccache-v{version}-{sccache_arch}" / "sccache"
-        )
-        if not payload.is_file():
-            sys.exit(f"sccache extraction did not produce {payload}")
-        retry(apt_prefix + ["install", "-m", "0755", str(payload), str(sccache_bin)])
-        shutil.rmtree(workdir, ignore_errors=True)
+        install_dir.mkdir(parents=True, exist_ok=True)
+        sccache_bin = install_dir / "sccache"
+        if not sccache_bin.exists():
+            version = "0.8.1"
+            workdir = Path("sccache-extract")
+            workdir.mkdir(exist_ok=True)
+            tarball = workdir / "sccache.tar.gz"
+            url = (
+                "https://github.com/mozilla/sccache/releases/download/"
+                f"v{version}/sccache-v{version}-{sccache_arch}.tar.gz"
+            )
+            urllib.request.urlretrieve(url, tarball)
+            with tarfile.open(tarball) as archive:
+                archive.extractall(workdir)
+            payload = (
+                workdir / f"sccache-v{version}-{sccache_arch}" / "sccache"
+            )
+            if not payload.is_file():
+                sys.exit(f"sccache extraction did not produce {payload}")
+            retry(["install", "-m", "0755", str(payload), str(sccache_bin)])
+            shutil.rmtree(workdir, ignore_errors=True)
 
     if platform.machine() == "aarch64":
         # Redirection is shell syntax and must not leak into argv: an arg
