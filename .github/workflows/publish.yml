@@ -63,6 +63,15 @@ on:
         required: false
         type: string
         default: ""
+      max_jobs:
+        description: >
+          Pin for the per-machine compile parallelism (MAX_JOBS) inside
+          every lane; empty keeps each OS default. Use "1" when the
+          hosted CUDA runners show instability under parallel fat
+          device compiles.
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   # Repair dispatches name the tag so they land next to the original tag
@@ -249,6 +258,7 @@ jobs:
       save_cache: false
       checkout_ref: ${{ inputs.tag }}
       release_tag_name: ${{ inputs.tag }}
+      max_jobs: ${{ inputs.max_jobs }}
     secrets: inherit
 
   cuda-build:
@@ -279,6 +289,7 @@ jobs:
       save_cache: false
       checkout_ref: ${{ inputs.tag }}
       release_tag_name: ${{ inputs.tag }}
+      max_jobs: ${{ inputs.max_jobs }}
     secrets: inherit
 
   pypi-upload:
