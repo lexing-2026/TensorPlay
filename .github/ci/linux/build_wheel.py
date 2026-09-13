@@ -22,9 +22,10 @@ def configure_blas_env() -> None:
     """Tell CMake which BLAS to use, based on architecture."""
     arch = platform.machine()
     if arch == "x86_64":
-        if Path("/opt/intel/include").is_dir():
-            os.environ["CMAKE_INCLUDE_PATH"] = "/opt/intel/include"
-            os.environ["CMAKE_LIBRARY_PATH"] = "/opt/intel/lib:/lib"
+        mkl_root = Path(os.environ.get("TP_MKL_ROOT", "/opt/intel"))
+        if (mkl_root / "include").is_dir():
+            os.environ["CMAKE_INCLUDE_PATH"] = f"{mkl_root}/include"
+            os.environ["CMAKE_LIBRARY_PATH"] = f"{mkl_root}/lib:/lib"
         return
     if arch == "aarch64":
         # The system OpenBLAS resolves through OPENBLAS_ROOT_DIR (exported
