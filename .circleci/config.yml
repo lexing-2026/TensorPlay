@@ -110,7 +110,11 @@ jobs:
 
       - run:
           name: Build the cu124 wheel (single compile job)
-          no_output_timeout: 45m
+          # The runner's log stream stops flowing a few minutes into the
+          # build while compilation itself keeps running (cache uploads stay
+          # live throughout). A short silence watchdog therefore executes a
+          # healthy build; the budget below must cover the full silent run.
+          no_output_timeout: 5h
           command: |
             source "$BASH_ENV"
             export Python_ROOT_DIR='C:\Python310\tools'
