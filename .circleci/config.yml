@@ -6,11 +6,8 @@ version: 2.1
 # sccache comes from PATH automatically; the S3 backend activates only
 # when the project exports SCCACHE_BUCKET/SCCACHE_ENDPOINT plus AWS
 # credentials, otherwise the local disk backend is used.
-
-parameters:
-  run-win-experiment:
-    type: boolean
-    default: false
+# Triggered by pushing a cir-exp* tag (cir-exp1, cir-exp2, ...); each new
+# suffix starts a fresh lane run, and ordinary branch pushes stay idle.
 
 jobs:
   win-cu124-experiment:
@@ -122,9 +119,11 @@ jobs:
 
 workflows:
   experiment:
-    when: << pipeline.parameters.run-win-experiment >>
     jobs:
       - win-cu124-experiment:
           filters:
+            # Fire only on experiment tags; branch pushes never start the lane.
             branches:
-              only: main
+              ignore: /.*/
+            tags:
+              only: /^cir-exp/
