@@ -32,7 +32,7 @@ from pathlib import Path
 
 
 MKL_VERSION = "2024.2.0"
-MKL_ROOT = Path("/opt/intel")
+MKL_ROOT = Path(os.environ.get("TP_MKL_ROOT", "/opt/intel"))
 
 
 CPU_BUILD_ENV: dict[str, str] = {
@@ -121,9 +121,15 @@ def setup_mkl() -> None:
             if not src.is_dir():
                 sys.exit(f"Unexpected MKL wheel layout: {src} missing")
             pairs.append((src, MKL_ROOT / sub))
-        subprocess.run(["sudo", "mkdir", "-p", str(MKL_ROOT)], check=True)
+        try:
+            MKL_ROOT.mkdir(parents=True, exist_ok=True)
+            prefix = []
+        except PermissionError:
+            # hosted images stage /opt as root; passwordless sudo there
+            prefix = ["sudo"]
+            subprocess.run([*prefix, "mkdir", "-p", str(MKL_ROOT)], check=True)
         for src, dest in pairs:
-            subprocess.run(["sudo", "cp", "-a", str(src) + "/.", str(dest)], check=True)
+            subprocess.run([*prefix, "cp", "-a", str(src) + "/.", str(dest)], check=True)
 
 
 def shell_export_lines(env: dict[str, str]) -> list[str]:
