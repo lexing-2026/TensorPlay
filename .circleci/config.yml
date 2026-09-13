@@ -108,15 +108,13 @@ jobs:
               echo "sccache backend: local disk"
             fi
 
-      # A Windows machine step is killed by the platform at roughly the
-      # one-hour mark ("context deadline exceeded") regardless of output
-      # activity, so a full CUDA build cannot live in a single step. The
-      # build is therefore chunked: each step grants the build a bounded
-      # budget, terminates the compiler tree cleanly on expiry, and exits
-      # zero so the next step resumes in place; ninja + sccache make the
-      # partial progress across chunk boundaries free.
       - run:
-          name: Build the cu124 wheel (chunk 1)
+          name: Build the cu124 wheel
+          # The Free plan caps every job at one hour, so a cold run cannot
+          # finish a full CUDA build in one pipeline. Each pipeline still
+          # converts a batch of uncached translations and pushes them to the
+          # shared cache; the next pipeline replays everything as hits and
+          # resumes the remainder. Convergence takes a few pipelines.
           no_output_timeout: 1h
           command: |
             source "$BASH_ENV"
@@ -124,150 +122,14 @@ jobs:
             export Python_EXECUTABLE='C:\Python310\tools\python.exe'
             hash -r
             which python && python --version
-            bash .github/ci/windows/build.sh dist & BPID=$!
-            START=$SECONDS
-            while kill -0 "$BPID" 2>/dev/null && [ $((SECONDS - START)) -lt 2400 ]; do
-              sleep 15
-            done
-            if kill -0 "$BPID" 2>/dev/null; then
-              echo "chunk budget elapsed; stopping the compiler tree for a resume"
-              WPID=$(ps -W | awk -v p="$BPID" '$1==p {print $4; exit}')
-              [ -n "$WPID" ] && taskkill //F //T //PID "$WPID" || true
-              taskkill //F //T //IM ninja.exe 2>/dev/null || true
-              taskkill //F //T //IM nvcc.exe 2>/dev/null || true
-              taskkill //F //T //IM cicc.exe 2>/dev/null || true
-              taskkill //F //T //IM cl.exe 2>/dev/null || true
-              taskkill //F //T //IM link.exe 2>/dev/null || true
-              sleep 5
-              echo "partial progress kept on disk; next chunk resumes"
-            else
-              wait "$BPID" && echo "build.sh completed within this chunk" || echo "build.sh exited rc=$?"
-            fi
-            ls -la dist || true
-            exit 0
-
-      - run:
-          name: Build the cu124 wheel (chunk 2)
-          no_output_timeout: 1h
-          command: |
-            source "$BASH_ENV"
-            export Python_ROOT_DIR='C:\Python310\tools'
-            export Python_EXECUTABLE='C:\Python310\tools\python.exe'
-            bash .github/ci/windows/build.sh dist & BPID=$!
-            START=$SECONDS
-            while kill -0 "$BPID" 2>/dev/null && [ $((SECONDS - START)) -lt 2400 ]; do
-              sleep 15
-            done
-            if kill -0 "$BPID" 2>/dev/null; then
-              echo "chunk budget elapsed; stopping the compiler tree for a resume"
-              WPID=$(ps -W | awk -v p="$BPID" '$1==p {print $4; exit}')
-              [ -n "$WPID" ] && taskkill //F //T //PID "$WPID" || true
-              taskkill //F //T //IM ninja.exe 2>/dev/null || true
-              taskkill //F //T //IM nvcc.exe 2>/dev/null || true
-              taskkill //F //T //IM cicc.exe 2>/dev/null || true
-              taskkill //F //T //IM cl.exe 2>/dev/null || true
-              taskkill //F //T //IM link.exe 2>/dev/null || true
-              sleep 5
-              echo "partial progress kept on disk; next chunk resumes"
-            else
-              wait "$BPID" && echo "build.sh completed within this chunk" || echo "build.sh exited rc=$?"
-            fi
-            ls -la dist || true
-            exit 0
-
-      - run:
-          name: Build the cu124 wheel (chunk 3)
-          no_output_timeout: 1h
-          command: |
-            source "$BASH_ENV"
-            export Python_ROOT_DIR='C:\Python310\tools'
-            export Python_EXECUTABLE='C:\Python310\tools\python.exe'
-            bash .github/ci/windows/build.sh dist & BPID=$!
-            START=$SECONDS
-            while kill -0 "$BPID" 2>/dev/null && [ $((SECONDS - START)) -lt 2400 ]; do
-              sleep 15
-            done
-            if kill -0 "$BPID" 2>/dev/null; then
-              echo "chunk budget elapsed; stopping the compiler tree for a resume"
-              WPID=$(ps -W | awk -v p="$BPID" '$1==p {print $4; exit}')
-              [ -n "$WPID" ] && taskkill //F //T //PID "$WPID" || true
-              taskkill //F //T //IM ninja.exe 2>/dev/null || true
-              taskkill //F //T //IM nvcc.exe 2>/dev/null || true
-              taskkill //F //T //IM cicc.exe 2>/dev/null || true
-              taskkill //F //T //IM cl.exe 2>/dev/null || true
-              taskkill //F //T //IM link.exe 2>/dev/null || true
-              sleep 5
-              echo "partial progress kept on disk; next chunk resumes"
-            else
-              wait "$BPID" && echo "build.sh completed within this chunk" || echo "build.sh exited rc=$?"
-            fi
-            ls -la dist || true
-            exit 0
-
-      - run:
-          name: Build the cu124 wheel (chunk 4)
-          no_output_timeout: 1h
-          command: |
-            source "$BASH_ENV"
-            export Python_ROOT_DIR='C:\Python310\tools'
-            export Python_EXECUTABLE='C:\Python310\tools\python.exe'
-            bash .github/ci/windows/build.sh dist & BPID=$!
-            START=$SECONDS
-            while kill -0 "$BPID" 2>/dev/null && [ $((SECONDS - START)) -lt 2400 ]; do
-              sleep 15
-            done
-            if kill -0 "$BPID" 2>/dev/null; then
-              echo "chunk budget elapsed; stopping the compiler tree for a resume"
-              WPID=$(ps -W | awk -v p="$BPID" '$1==p {print $4; exit}')
-              [ -n "$WPID" ] && taskkill //F //T //PID "$WPID" || true
-              taskkill //F //T //IM ninja.exe 2>/dev/null || true
-              taskkill //F //T //IM nvcc.exe 2>/dev/null || true
-              taskkill //F //T //IM cicc.exe 2>/dev/null || true
-              taskkill //F //T //IM cl.exe 2>/dev/null || true
-              taskkill //F //T //IM link.exe 2>/dev/null || true
-              sleep 5
-              echo "partial progress kept on disk; next chunk resumes"
-            else
-              wait "$BPID" && echo "build.sh completed within this chunk" || echo "build.sh exited rc=$?"
-            fi
-            ls -la dist || true
-            exit 0
-
-      - run:
-          name: Build the cu124 wheel (chunk 5)
-          no_output_timeout: 1h
-          command: |
-            source "$BASH_ENV"
-            export Python_ROOT_DIR='C:\Python310\tools'
-            export Python_EXECUTABLE='C:\Python310\tools\python.exe'
-            bash .github/ci/windows/build.sh dist & BPID=$!
-            START=$SECONDS
-            while kill -0 "$BPID" 2>/dev/null && [ $((SECONDS - START)) -lt 2400 ]; do
-              sleep 15
-            done
-            if kill -0 "$BPID" 2>/dev/null; then
-              echo "chunk budget elapsed; stopping the compiler tree for a resume"
-              WPID=$(ps -W | awk -v p="$BPID" '$1==p {print $4; exit}')
-              [ -n "$WPID" ] && taskkill //F //T //PID "$WPID" || true
-              taskkill //F //T //IM ninja.exe 2>/dev/null || true
-              taskkill //F //T //IM nvcc.exe 2>/dev/null || true
-              taskkill //F //T //IM cicc.exe 2>/dev/null || true
-              taskkill //F //T //IM cl.exe 2>/dev/null || true
-              taskkill //F //T //IM link.exe 2>/dev/null || true
-              sleep 5
-              echo "partial progress kept on disk; next chunk resumes"
-            else
-              wait "$BPID" && echo "build.sh completed within this chunk" || echo "build.sh exited rc=$?"
-            fi
-            ls -la dist || true
-            exit 0
+            bash .github/ci/windows/build.sh dist
 
       - run:
           name: Verify the wheel artifact
           command: |
             ls -la dist
             test -n "$(ls dist/*.whl 2>/dev/null)" || {
-              echo "no wheel after the chunk budget; the build needs another run"
+              echo "no wheel yet; the shared cache absorbed this round, trigger the next one"
               exit 1
             }
 
