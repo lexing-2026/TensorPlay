@@ -17,8 +17,8 @@ jobs:
     resource_class: windows.medium
     environment:
       GPU_ARCH_TYPE: cuda
-      MAX_JOBS: "1"
-      CMAKE_BUILD_PARALLEL_LEVEL: "1"
+      MAX_JOBS: "2"
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
       TP_CUDA_LINE: "12.4"
       TP_PYTHON_VERSION: "3.10.11"
     steps:
