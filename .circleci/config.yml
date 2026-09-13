@@ -1,0 +1,121 @@
+version: 2.1
+
+# Supplementary build pool experiment: one Windows CUDA lane outside the
+# GitHub hosted fleet, reproducing the release cu124 conditions
+# (toolkit 12.4, CPython 3.10, gencode 5.0..9.0, single compile job).
+# sccache comes from PATH automatically; the S3 backend activates only
+# when the project exports SCCACHE_BUCKET/SCCACHE_ENDPOINT plus AWS
+# credentials, otherwise the local disk backend is used.
+
+parameters:
+  run-win-experiment:
+    type: boolean
+    default: true
+
+jobs:
+  win-cu124-experiment:
+    machine:
+      image: windows-server-2022-gui:current
+      shell: bash.exe
+    resource_class: windows.medium
+    environment:
+      GPU_ARCH_TYPE: cuda
+      MAX_JOBS: "1"
+      CMAKE_BUILD_PARALLEL_LEVEL: "1"
+      TP_CUDA_LINE: "12.4"
+      TP_PYTHON_VERSION: "3.10.11"
+    steps:
+      - checkout
+      - run:
+          name: Build the release tag content
+          command: |
+            git fetch --force origin "refs/tags/v1.0.0:refs/tags/v1.0.0"
+            git checkout -f --detach v1.0.0
+
+      - run:
+          name: Provision CPython 3.10
+          no_output_timeout: 20m
+          command: |
+            choco install python --version=3.10.11 -y --no-progress
+            PYDIR="/c/Python310"
+            export PATH="$PYDIR:$PYDIR/Scripts:$PATH"
+            python --version
+            python -m pip install --upgrade pip
+            {
+              echo "export PATH=\"$PYDIR:$PYDIR/Scripts:\$PATH\""
+            } >> "$BASH_ENV"
+
+      - run:
+          name: Provision CUDA toolkit 12.4
+          no_output_timeout: 60m
+          command: |
+            CUDA_WIN='C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4'
+            if [ ! -x "$(cygpath -u "$CUDA_WIN")/bin/nvcc.exe" ]; then
+              curl -fsSL -o /tmp/cuda_network.exe \
+                "https://developer.download.nvidia.com/compute/cuda/12.4.1/network_installers/cuda_12.4.1_windows_network.exe"
+              /tmp/cuda_network.exe -s
+            fi
+            "$([ -n "$CUDA_WIN" ] && cygpath -u "$CUDA_WIN")/bin/nvcc.exe" --version | tail -2
+            {
+              echo "export CUDA_PATH='$CUDA_WIN'"
+              echo "export PATH=\"$(cygpath -u "$CUDA_WIN")/bin:\$PATH\""
+            } >> "$BASH_ENV"
+
+      - run:
+          name: Provision sccache 0.8.1
+          command: |
+            SC_DIR="/c/tools/sccache"
+            mkdir -p "$SC_DIR"
+            curl -fsSL -o "$SC_DIR/sccache.tar.gz" \
+              "https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-x86_64-pc-windows-msvc.tar.gz"
+            tar -xzf "$SC_DIR/sccache.tar.gz" -C "$SC_DIR"
+            SC_BIN="$(cygpath -u 'C:\tools\sccache')/sccache-v0.8.1-x86_64-pc-windows-msvc"
+            "$SC_BIN/sccache.exe" --version
+            {
+              echo "export PATH=\"$SC_BIN:\$PATH\""
+              echo "export SCCACHE_DIR='C:\tools\sccache-home'"
+              echo "export SCCACHE_CACHE_SIZE=8G"
+            } >> "$BASH_ENV"
+
+      - run:
+          name: Wire the object-storage cache backend when configured
+          command: |
+            if [ -n "${S3_CACHE_BUCKET:-}" ]; then
+              {
+                echo "export SCCACHE_BUCKET='${S3_CACHE_BUCKET}'"
+                echo "export SCCACHE_ENDPOINT='${S3_CACHE_ENDPOINT}'"
+                echo "export SCCACHE_REGION='${S3_CACHE_REGION:-us-east-1}'"
+                echo "export SCCACHE_S3_USE_SSL=true"
+                echo "export AWS_ACCESS_KEY_ID='${S3_CACHE_ACCESS_KEY_ID}'"
+                echo "export AWS_SECRET_ACCESS_KEY='${S3_CACHE_SECRET_ACCESS_KEY}'"
+                echo "export SCCACHE_IDLE_TIMEOUT=0"
+              } >> "$BASH_ENV"
+              echo "sccache backend: object storage"
+            else
+              echo "sccache backend: local disk"
+            fi
+
+      - run:
+          name: Build the cu124 wheel (single compile job)
+          no_output_timeout: 45m
+          command: |
+            source "$BASH_ENV"
+            bash .github/ci/windows/build.sh dist
+
+      - run:
+          name: Compiler cache statistics
+          command: |
+            source "$BASH_ENV"
+            sccache --show-stats || true
+
+      - store_artifacts:
+          path: dist
+
+workflows:
+  experiment:
+    when: << pipeline.parameters.run-win-experiment >>
+    jobs:
+      - win-cu124-experiment:
+          filters:
+            branches:
+              only: main
