@@ -40,7 +40,9 @@ jobs:
             set -e
             curl -fL --retry 3 -o "$HOME/python.nupkg" \
               "https://www.nuget.org/api/v2/package/python/3.10.11"
-            powershell -NoProfile -Command 'Expand-Archive -Force $env:USERPROFILE\python.nupkg -DestinationPath C:\Python310'
+            # Expand-Archive only unpacks files with a .zip extension.
+            mv "$HOME/python.nupkg" "$HOME/python.zip"
+            powershell -NoProfile -Command 'Expand-Archive -Force $env:USERPROFILE\python.zip -DestinationPath C:\Python310'
             PYDIR="/c/Python310/tools"
             "$PYDIR/python.exe" --version
             "$PYDIR/python.exe" -m ensurepip --default-pip
