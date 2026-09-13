@@ -36,14 +36,13 @@ jobs:
           name: Provision CPython 3.10
           no_output_timeout: 20m
           command: |
-            choco install python --version=3.10.11 -y --no-progress
+            curl -fsSL -o /tmp/python310.exe \
+              "https://www.python.org/ftp/python/3.10.11/python-3.10.11-amd64.exe"
+            /tmp/python310.exe /quiet InstallAllUsers=1 PrependPath=1 TargetDir=C:\Python310 Include_test=0
             PYDIR="/c/Python310"
-            export PATH="$PYDIR:$PYDIR/Scripts:$PATH"
-            python --version
-            python -m pip install --upgrade pip
-            {
-              echo "export PATH=\"$PYDIR:$PYDIR/Scripts:\$PATH\""
-            } >> "$BASH_ENV"
+            "$PYDIR/python.exe" --version
+            "$PYDIR/python.exe" -m pip install --upgrade pip
+            echo "export PATH=\"$PYDIR:$PYDIR/Scripts:\$PATH\"" >> "$BASH_ENV"
 
       - run:
           name: Provision CUDA toolkit 12.4
