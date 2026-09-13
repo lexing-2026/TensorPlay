@@ -50,6 +50,26 @@ jobs:
             echo "export PATH=\"$PYDIR:$PYDIR/Scripts:\$PATH\"" >> "$BASH_ENV"
 
       - run:
+          name: Provision sccache 0.8.1
+          command: |
+            SC_DIR="/c/tools/sccache"
+            mkdir -p "$SC_DIR"
+            curl -fL --retry 3 -o "$SC_DIR/sccache.tar.gz" \
+              "https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-x86_64-pc-windows-msvc.tar.gz"
+            tar -xzf "$SC_DIR/sccache.tar.gz" -C "$SC_DIR"
+            SC_BIN="$(cygpath -u 'C:\tools\sccache')/sccache-v0.8.1-x86_64-pc-windows-msvc"
+            "$SC_BIN/sccache.exe" --version
+            {
+              echo "export PATH=\"$SC_BIN:\$PATH\""
+              echo "export SCCACHE_DIR='C:\tools\sccache-home'"
+              echo "export SCCACHE_CACHE_SIZE=8G"
+            } >> "$BASH_ENV"
+
+      - restore_cache:
+          keys:
+            - win-cu124-toolkit-v1
+
+      - run:
           name: Provision CUDA toolkit 12.4
           no_output_timeout: 60m
           command: |
@@ -65,21 +85,10 @@ jobs:
               echo "export PATH=\"$(cygpath -u "$CUDA_WIN")/bin:\$PATH\""
             } >> "$BASH_ENV"
 
-      - run:
-          name: Provision sccache 0.8.1
-          command: |
-            SC_DIR="/c/tools/sccache"
-            mkdir -p "$SC_DIR"
-            curl -fL --retry 3 -o "$SC_DIR/sccache.tar.gz" \
-              "https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-x86_64-pc-windows-msvc.tar.gz"
-            tar -xzf "$SC_DIR/sccache.tar.gz" -C "$SC_DIR"
-            SC_BIN="$(cygpath -u 'C:\tools\sccache')/sccache-v0.8.1-x86_64-pc-windows-msvc"
-            "$SC_BIN/sccache.exe" --version
-            {
-              echo "export PATH=\"$SC_BIN:\$PATH\""
-              echo "export SCCACHE_DIR='C:\tools\sccache-home'"
-              echo "export SCCACHE_CACHE_SIZE=8G"
-            } >> "$BASH_ENV"
+      - save_cache:
+          key: win-cu124-toolkit-v1
+          paths:
+            - C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4
 
       - run:
           name: Wire the object-storage cache backend when configured
