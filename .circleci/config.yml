@@ -122,8 +122,9 @@ workflows:
     jobs:
       - win-cu124-experiment:
           filters:
-            # Fire only on experiment tags; branch pushes never start the lane.
-            branches:
-              ignore: /.*/
+            # Fire only on experiment tags. On branch pipelines the tag value
+            # is empty so the regex never matches; an explicit branches-ignore
+            # block must NOT be added: on tag pipelines the branch value is
+            # empty too, and /.*/ would swallow the tag pipeline as well.
             tags:
               only: /^cir-exp/
