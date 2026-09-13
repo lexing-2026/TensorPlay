@@ -312,7 +312,13 @@ jobs:
           want="${{ inputs.cuda_toolkit }}"
           major_minor="${want%.*}"
           want_rel="release ${major_minor/./\\.}"
-          for d in "/usr/local/cuda-${major_minor}" /usr/local/cuda; do
+          search=("/usr/local/cuda-${major_minor}" "/usr/local/cuda")
+          if [[ -n "${TP_TOOLKIT_ROOT:-}" ]]; then
+            # Root-less self-hosted runners stage toolkits under a writable
+            # prefix; prefer that over the installer fallback.
+            search=("${TP_TOOLKIT_ROOT}/cuda-${major_minor}" "${search[@]}")
+          fi
+          for d in "${search[@]}"; do
             if [[ -x "$d/bin/nvcc" ]] &&
                "$d/bin/nvcc" --version | grep -q "$want_rel"; then
               found="$d"
