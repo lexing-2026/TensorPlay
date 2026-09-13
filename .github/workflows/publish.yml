@@ -72,6 +72,14 @@ on:
         required: false
         type: string
         default: ""
+      s3_cache:
+        description: >
+          Set to "0" to keep the compiler cache on each runner's local
+          disk; empty uses the object-storage backend when the repository
+          secrets are present.
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   # Repair dispatches name the tag so they land next to the original tag
@@ -259,6 +267,7 @@ jobs:
       checkout_ref: ${{ inputs.tag }}
       release_tag_name: ${{ inputs.tag }}
       max_jobs: ${{ inputs.max_jobs }}
+      s3_cache: ${{ inputs.s3_cache }}
     secrets: inherit
 
   cuda-build:
@@ -290,6 +299,7 @@ jobs:
       checkout_ref: ${{ inputs.tag }}
       release_tag_name: ${{ inputs.tag }}
       max_jobs: ${{ inputs.max_jobs }}
+      s3_cache: ${{ inputs.s3_cache }}
     secrets: inherit
 
   pypi-upload:
