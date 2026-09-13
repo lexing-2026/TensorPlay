@@ -63,6 +63,14 @@ on:
           Tag of the GitHub Release the tested wheel belongs to. Empty means
           the caller's GITHUB_REF_NAME, which only carries a tag shape on
           real tag pushes.
+      max_jobs:
+        required: false
+        type: string
+        default: ""
+        description: >
+          Pin for the MAX_JOBS parallelism of the compile step. Empty keeps
+          the per-OS auto value (Windows CUDA 3, hosted Linux CUDA 2,
+          self-hosted CUDA 4, CPU lanes nproc-1).
       run_cpu_benchmarks:
         required: false
         type: boolean
@@ -326,7 +334,7 @@ jobs:
           GPU_ARCH_TYPE: ${{ inputs.cuda != 'cpu' && 'cuda' || 'cpu' }}
           SKBUILD_CMAKE_DEFINE: >-
             ${{ inputs.cuda != 'cpu' && 'USE_CUDA=ON' || 'USE_CUDA=OFF' }};USE_MPI=OFF
-          MAX_JOBS: ${{ runner.os == 'Windows' && '3' || (inputs.cuda != 'cpu' && (contains(runner.name, 'tensorplay-runner') && '4' || '2') || '') }}
+          MAX_JOBS: ${{ inputs.max_jobs != '' && inputs.max_jobs || (runner.os == 'Windows' && '3' || (inputs.cuda != 'cpu' && (contains(runner.name, 'tensorplay-runner') && '4' || '2') || '')) }}
           CCACHE_MAXSIZE: 2G
           SCCACHE_CACHE_SIZE: 5G
         run: |
