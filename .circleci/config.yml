@@ -36,11 +36,13 @@ jobs:
           name: Provision CPython 3.10
           no_output_timeout: 20m
           command: |
-            curl -fsSL -o /tmp/python310.exe \
-              "https://www.python.org/ftp/python/3.10.11/python-3.10.11-amd64.exe"
-            /tmp/python310.exe /quiet InstallAllUsers=1 PrependPath=1 TargetDir=C:\Python310 Include_test=0
-            PYDIR="/c/Python310"
+            curl -fL --retry 3 -o /tmp/python.nupkg \
+              "https://www.nuget.org/api/v2/package/python/3.10.11"
+            mkdir -p /c/Python310
+            powershell -NoProfile -Command "Expand-Archive -Force /tmp/python.nupkg -DestinationPath C:\Python310"
+            PYDIR="/c/Python310/tools"
             "$PYDIR/python.exe" --version
+            "$PYDIR/python.exe" -m ensurepip --default-pip
             "$PYDIR/python.exe" -m pip install --upgrade pip
             echo "export PATH=\"$PYDIR:$PYDIR/Scripts:\$PATH\"" >> "$BASH_ENV"
 
@@ -50,7 +52,7 @@ jobs:
           command: |
             CUDA_WIN='C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4'
             if [ ! -x "$(cygpath -u "$CUDA_WIN")/bin/nvcc.exe" ]; then
-              curl -fsSL -o /tmp/cuda_network.exe \
+              curl -fL --retry 3 -o /tmp/cuda_network.exe \
                 "https://developer.download.nvidia.com/compute/cuda/12.4.1/network_installers/cuda_12.4.1_windows_network.exe"
               /tmp/cuda_network.exe -s
             fi
@@ -65,7 +67,7 @@ jobs:
           command: |
             SC_DIR="/c/tools/sccache"
             mkdir -p "$SC_DIR"
-            curl -fsSL -o "$SC_DIR/sccache.tar.gz" \
+            curl -fL --retry 3 -o "$SC_DIR/sccache.tar.gz" \
               "https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-x86_64-pc-windows-msvc.tar.gz"
             tar -xzf "$SC_DIR/sccache.tar.gz" -C "$SC_DIR"
             SC_BIN="$(cygpath -u 'C:\tools\sccache')/sccache-v0.8.1-x86_64-pc-windows-msvc"
