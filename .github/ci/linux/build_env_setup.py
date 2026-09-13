@@ -93,6 +93,10 @@ def setup_mkl() -> None:
     """
     if (MKL_ROOT / "lib").is_dir():
         return
+    if MKL_ROOT.exists() and not MKL_ROOT.is_dir():
+        # A stale non-directory (e.g. a dangling symlink left behind by
+        # earlier provisioning) would defeat the staging below.
+        MKL_ROOT.unlink()
     with tempfile.TemporaryDirectory() as tmp:
         workdir = Path(tmp)
         subprocess.run(
