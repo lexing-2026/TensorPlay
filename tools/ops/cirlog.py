@@ -1,5 +1,7 @@
 import json
-import os, urllib.request, sys
+import os
+import sys
+import urllib.request
 
 TOKEN = os.environ.get("CIRCLECI_TOKEN", "")
 
