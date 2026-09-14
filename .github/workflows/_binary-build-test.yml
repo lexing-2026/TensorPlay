@@ -319,13 +319,13 @@ jobs:
 
       # This installs the compiler/toolkit only. Free GitHub-hosted runners
       # have no GPU, so CUDA kernels are never executed in this workflow.
-      # The downloaded installer (~4GB per CUDA version) must stay out of the
-      # shared 10GB cache pool or it evicts the compiler caches of every lane.
+      # Cache the toolkit installer across hosted jobs. Compiler objects use
+      # the separate S3 backend, so this cache cannot evict them.
       - uses: jimver/cuda-toolkit@v0.2.36
         if: ${{ inputs.cuda != 'cpu' && steps.cuda-detect.outputs.preinstalled == '' }}
         with:
           cuda: ${{ inputs.cuda_toolkit }}
-          use-github-cache: 'false'
+          use-github-cache: 'true'
 
       - name: Provision CUDA runtime libraries
         if: ${{ inputs.cuda != 'cpu' }}
@@ -450,7 +450,7 @@ jobs:
         if: ${{ inputs.cuda != 'cpu' }}
         with:
           cuda: ${{ inputs.cuda_toolkit }}
-          use-github-cache: 'false'
+          use-github-cache: 'true'
 
       - name: Install CUDA runtime libraries for tests
         if: ${{ inputs.cuda != 'cpu' }}
