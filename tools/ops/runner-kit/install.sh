@@ -9,7 +9,7 @@ REPO_URL="https://github.com/lexing-2026/TensorPlay"
 RELAY="${TP_RELAY:-/tmp/tp-relay}"
 RUNNER_DIR="$RELAY/runner"
 PROXY="http://127.0.0.1:7897"
-NO_PROXY_DOMAINS="127.0.0.1,localhost,.p300s.com,10.0.0.0/8,.internal,.actions.githubusercontent.com,api.github.com,s3.hf.co"
+NO_PROXY_DOMAINS="127.0.0.1,localhost,.p300s.com,10.0.0.0/8,.internal,.actions.githubusercontent.com,api.github.com"
 
 mkdir -p "$RELAY" "$HOME/.local/bin" "$HOME/.config/tensorplay"
 
