@@ -10,7 +10,10 @@ Environment variables expected:
 """
 
 import argparse
+import importlib
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -39,6 +42,11 @@ PIP_PACKAGES: list[str] = [
     "mkl-include==2024.2.0",
 ]
 
+CUDA_CUDNN_PACKAGES = {
+    "12": "nvidia-cudnn-cu12",
+    "13": "nvidia-cudnn-cu13==9.20.0.48",
+}
+
 
 LIBUV_URL = "https://s3.amazonaws.com/ossci-windows/libuv-1.40.0-h8ffe710_0.tar.bz2"
 # Mozilla's prebuilt release; the same channel the build ecosystems use.
@@ -60,6 +68,76 @@ def retry(cmd: list[str], delays: tuple[int, ...] = (1, 2, 4, 8)) -> None:
 
 def pip_install(*args: str) -> None:
     retry([sys.executable, "-m", "pip", "install", *args])
+
+
+def toolkit_major() -> str:
+    toolkit = os.environ.get("CUDA_PATH", "")
+    leaf = Path(toolkit).name
+    if leaf.startswith("v"):
+        leaf = leaf[1:]
+    major = leaf.split(".", 1)[0]
+    if not major.isdigit():
+        sys.exit(f"cannot determine CUDA major version from CUDA_PATH={toolkit!r}")
+    return major
+
+
+def package_root(module_name: str) -> Path:
+    module = importlib.import_module(module_name)
+    roots = list(module.__path__)
+    if len(roots) != 1:
+        sys.exit(f"expected one install root for {module_name}, got {roots}")
+    return Path(roots[0])
+
+
+def prepare_cudnn_import_library(cudnn_root: Path) -> None:
+    dlls = sorted((cudnn_root / "bin").glob("cudnn64_*.dll"))
+    if not dlls:
+        sys.exit(f"cuDNN DLL not found under {cudnn_root / 'bin'}")
+    dumpbin = shutil.which("dumpbin")
+    lib_tool = shutil.which("lib")
+    if not dumpbin or not lib_tool:
+        sys.exit("Visual Studio dumpbin.exe and lib.exe are required for cuDNN")
+    dll = dlls[0]
+    output = subprocess.check_output(
+        [dumpbin, "/exports", str(dll)], text=True, errors="replace"
+    )
+    exports = []
+    for line in output.splitlines():
+        match = re.match(r"^\s*\d+\s+\S+\s+[0-9A-Fa-f]+\s+(\S+)\s*$", line)
+        if match:
+            exports.append(match.group(1))
+    if not exports:
+        sys.exit(f"no exports found in {dll}")
+
+    lib_dir = cudnn_root / "lib"
+    lib_dir.mkdir(parents=True, exist_ok=True)
+    import_lib = lib_dir / "cudnn.lib"
+    if import_lib.is_file():
+        return
+    definition = cudnn_root / "cudnn.def"
+    definition.write_text(
+        f"LIBRARY {dll.name}\nEXPORTS\n"
+        + "\n".join(exports)
+        + "\n"
+    )
+    subprocess.run(
+        [lib_tool, f"/def:{definition}", "/machine:X64", f"/out:{import_lib}"],
+        check=True,
+    )
+
+
+def install_cuda_runtime() -> None:
+    if os.environ.get("GPU_ARCH_TYPE", "cpu") != "cuda":
+        return
+    package = CUDA_CUDNN_PACKAGES.get(toolkit_major())
+    if package is None:
+        sys.exit(f"no cuDNN package for CUDA major {toolkit_major()}")
+    pip_install("-q", package)
+    cudnn_root = package_root("nvidia.cudnn")
+    if not (cudnn_root / "include" / "cudnn.h").is_file():
+        sys.exit(f"cuDNN headers not found under {cudnn_root}")
+    prepare_cudnn_import_library(cudnn_root)
+    print(f"cuDNN root: {cudnn_root}")
 
 
 def install_libuv(workdir: Path, python_prefix: Path) -> Path:
@@ -118,6 +196,7 @@ def main() -> None:
     args = parser.parse_args()
 
     pip_install("-q", *PIP_PACKAGES)
+    install_cuda_runtime()
 
     env_out: dict[str, str] = {}
     env_out.update(install_sccache(Path(__file__).resolve().parent))
