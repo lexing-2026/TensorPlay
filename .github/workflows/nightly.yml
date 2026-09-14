@@ -297,6 +297,7 @@ jobs:
         {"name":"nn-api","test_files":"test/test_init.py test/test_linear_init.py test/test_new_layers.py test/test_nn_repr.py test/test_parameter.py"}]
       build_version: ${{ needs.prepare.outputs.version }}
       build_number: ${{ needs.prepare.outputs.build_number }}
+      max_jobs: "2"
       upload_release: true
     secrets: inherit
 
