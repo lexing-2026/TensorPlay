@@ -120,7 +120,9 @@ jobs:
     name: docs-publish
     needs: docs-build
     # PRs get an artifact preview only; publishes need the website token.
-    if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'release' || inputs.tag != '' }}
+    # A manual dispatch is an explicit publish request: without a tag it
+    # refreshes the rolling latest tree, with a tag it freezes that version.
+    if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'release' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
