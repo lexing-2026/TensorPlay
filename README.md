@@ -207,10 +207,10 @@ First-class custom operators: register an op with `tensorplay.library`, attach f
 # CPU wheels from PyPI
 pip install tensorplay --upgrade
 
-# CUDA wheels from the TensorPlay CUDA index (choose cu124, cu126, or cu130)
+# CUDA 13.0 wheels from the TensorPlay CUDA index
 # Keep PyPI as an extra index for runtime dependencies.
 pip install tensorplay \
-  --index-url https://download.tensorplay.cn/whl/cu124/ \
+  --index-url https://download.tensorplay.cn/whl/cu130/ \
   --extra-index-url https://pypi.org/simple
 ```
 
@@ -222,9 +222,9 @@ pip install tensorplay \
 Try tomorrow's features today: every change that passes our build-and-smoke pipeline lands on the rolling `nightly` channel automatically, following the nightly version format (`X.Y.0.dev<date>+cuXXX` / `+cpu`). Only the latest build per variant is kept.
 
 ```bash
-# CUDA nightly (choose cu124, cu126, or cu130)
+# CUDA nightly
 pip install --pre tensorplay \
-  --index-url https://download.tensorplay.cn/whl/nightly/cu124/ \
+  --index-url https://download.tensorplay.cn/whl/nightly/cu130/ \
   --extra-index-url https://pypi.org/simple
 
 # CPU nightly
