@@ -28,11 +28,10 @@ on:
         default: ""
       lanes:
         description: >
-          Comma-separated substrings of build_name to rebuild, e.g.
-          "cu124,cu126". Only lanes whose build_name contains any of the
-          substrings run, which is how a failed release is repaired without
-          rebuilding the lanes that already shipped. Empty means the full
-          matrix.
+          Comma-separated substrings of the cu130 build_name to rebuild, e.g.
+          "linux-x86_64-cu130-py3_10". Only cu130 CUDA lanes are published;
+          CPU and older CUDA variants are never part of this matrix. Empty
+          means the full cu130 matrix.
         required: false
         type: string
         default: ""
@@ -171,9 +170,10 @@ jobs:
               (if $wcr != "" and $platform.name == "windows-x86_64"
                then $platform + {runner: $wcr}
                else $platform
-               end) as $platform |
+              end) as $platform |
               .python_versions[] as $python |
               $variants[0][] as $cuda |
+              select($cuda.variant == "cu130") |
               {
                 platform: $platform.name,
                 runner: $platform.runner,
