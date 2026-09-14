@@ -1,4 +1,8 @@
-import json, subprocess, sys, time, os
+import json
+import os
+import subprocess
+import sys
+import time
 
 RUN = sys.argv[1]
 INTERVAL = int(sys.argv[2]) if len(sys.argv) > 2 else 30
