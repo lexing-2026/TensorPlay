@@ -55,9 +55,8 @@ def prepend_path(*entries: Path | str) -> str:
 TORCH_CUDA_ARCH_LIST_TABLE: dict[str, str] = {
     "12.4": "5.0;6.0;7.0;7.5;8.0;8.6;9.0",
     "12.6": "5.0;6.0;7.0;7.5;8.0;8.6;9.0",
-    # The cu130 release is intentionally one target: this is the original
-    # hosted-wheel coverage and keeps Linux and Windows builds tractable.
-    "13.0": "7.5",
+    # Cover the two common modern consumer generations in the cu130 wheel.
+    "13.0": "8.6;8.9",
 }
 
 
