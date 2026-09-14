@@ -1,0 +1,44 @@
+name: release-sign
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag whose assets get signed"
+        required: true
+      pattern:
+        description: "Glob matched against release asset names"
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "${{ inputs.pattern }}" \
+            --clobber
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign assets (keyless bundle)
+        run: |
+          for asset in ${{ inputs.pattern }}; do
+            [ -f "$asset" ] || continue
+            case "$asset" in *.sigstore.json) continue ;; esac
+            cosign sign-blob --yes --bundle "$asset.sigstore.json" "$asset"
+          done
+      - name: Upload bundles
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for bundle in *.sigstore.json; do
+            [ -f "$bundle" ] || continue
+            gh release upload "${{ inputs.tag }}" "$bundle" --repo "${{ github.repository }}" --clobber
+          done
