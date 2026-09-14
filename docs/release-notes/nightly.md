@@ -13,22 +13,6 @@ pip install --pre tensorplay \
   --extra-index-url https://pypi.org/simple
 ```
 
-### CUDA 12.4 (Linux x86_64, Windows x86_64)
-
-```bash
-pip install --pre tensorplay \
-  --index-url https://download.tensorplay.cn/whl/nightly/cu124/ \
-  --extra-index-url https://pypi.org/simple
-```
-
-### CUDA 12.6 (Linux x86_64, Windows x86_64)
-
-```bash
-pip install --pre tensorplay \
-  --index-url https://download.tensorplay.cn/whl/nightly/cu126/ \
-  --extra-index-url https://pypi.org/simple
-```
-
 ### CUDA 13.0 (Linux x86_64, Windows x86_64)
 
 ```bash
