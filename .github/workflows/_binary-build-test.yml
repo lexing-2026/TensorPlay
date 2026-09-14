@@ -128,8 +128,8 @@ jobs:
       SHA1: ${{ github.event.pull_request.head.sha || github.sha }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
-      # Self-hosted machines keep a bare git mirror under
-      # $HOME/actions-runner/mirrors and a global insteadOf rewrites every
+      # Self-hosted machines keep a bare git cache under the runner home and a
+      # global insteadOf rewrites every
       # github.com clone to it, so checkouts and vendored-dependency clones
       # read from local disk. Refresh the mirror incrementally first so the
       # rewritten checkout still sees the requested ref; on hosted runners
@@ -327,6 +327,35 @@ jobs:
           cuda: ${{ inputs.cuda_toolkit }}
           use-github-cache: 'false'
 
+      - name: Provision CUDA runtime libraries
+        if: ${{ inputs.cuda != 'cpu' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ inputs.cuda_toolkit }}" in
+            12.*)
+              cudnn_pkg=nvidia-cudnn-cu12
+              nccl_pkg=nvidia-nccl-cu12
+              ;;
+            13.*)
+              cudnn_pkg=nvidia-cudnn-cu13==9.20.0.48
+              nccl_pkg=nvidia-nccl-cu13==2.29.7
+              ;;
+            *)
+              echo "Unsupported CUDA toolkit: ${{ inputs.cuda_toolkit }}" >&2
+              exit 1
+              ;;
+          esac
+          python -m pip install -q "$cudnn_pkg"
+          runtime_root="$(python -c 'import nvidia.cudnn; print(list(nvidia.cudnn.__path__)[0])')"
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            python -m pip install -q "$nccl_pkg"
+            nccl_root="$(python -c 'import nvidia.nccl; print(list(nvidia.nccl.__path__)[0])')"
+            echo "LD_LIBRARY_PATH=$runtime_root/lib:$nccl_root/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          else
+            echo "$runtime_root/bin" >> "$GITHUB_PATH"
+          fi
+
       - name: Build wheel
         shell: bash
         env:
@@ -422,6 +451,35 @@ jobs:
         with:
           cuda: ${{ inputs.cuda_toolkit }}
           use-github-cache: 'false'
+
+      - name: Install CUDA runtime libraries for tests
+        if: ${{ inputs.cuda != 'cpu' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ inputs.cuda_toolkit }}" in
+            12.*)
+              cudnn_pkg=nvidia-cudnn-cu12
+              nccl_pkg=nvidia-nccl-cu12
+              ;;
+            13.*)
+              cudnn_pkg=nvidia-cudnn-cu13==9.20.0.48
+              nccl_pkg=nvidia-nccl-cu13==2.29.7
+              ;;
+            *)
+              echo "Unsupported CUDA toolkit: ${{ inputs.cuda_toolkit }}" >&2
+              exit 1
+              ;;
+          esac
+          python -m pip install -q "$cudnn_pkg"
+          runtime_root="$(python -c 'import nvidia.cudnn; print(list(nvidia.cudnn.__path__)[0])')"
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            python -m pip install -q "$nccl_pkg"
+            nccl_root="$(python -c 'import nvidia.nccl; print(list(nvidia.nccl.__path__)[0])')"
+            echo "LD_LIBRARY_PATH=$runtime_root/lib:$nccl_root/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          else
+            echo "$runtime_root/bin" >> "$GITHUB_PATH"
+          fi
 
       - name: Install Linux CPU runtime dependencies
         if: ${{ inputs.cuda == 'cpu' && runner.os == 'Linux' }}
