@@ -26,7 +26,7 @@
   "cuda_platforms": [
     {
       "name": "linux-x86_64",
-      "runner": "self-hosted"
+      "runner": "ubuntu-22.04"
     },
     {
       "name": "windows-x86_64",
