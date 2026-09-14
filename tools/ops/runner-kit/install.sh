@@ -25,8 +25,12 @@ fi
 curl -s -o /dev/null --max-time 15 -x "$PROXY" https://github.com \
     || { echo "proxy self-check failed" >&2; tail -20 "$RELAY/mihomo/mihomo.log"; exit 1; }
 
-install -m 0755 "$KIT/sccache-0.8.1-x86_64-unknown-linux-musl" "$HOME/.local/bin/sccache"
-install -m 0600 "$KIT/s3-cache.env" "$HOME/.config/tensorplay/s3-cache.env"
+cache_bin_tmp="$HOME/.local/bin/.sccache.$$"
+cache_env_tmp="$HOME/.config/tensorplay/.s3-cache.env.$$"
+install -m 0755 "$KIT/sccache-0.8.1-x86_64-unknown-linux-musl" "$cache_bin_tmp"
+install -m 0600 "$KIT/s3-cache.env" "$cache_env_tmp"
+mv -f "$cache_bin_tmp" "$HOME/.local/bin/sccache"
+mv -f "$cache_env_tmp" "$HOME/.config/tensorplay/s3-cache.env"
 grep -q ".local/bin" "$HOME/.bashrc" 2>/dev/null \
     || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
 
