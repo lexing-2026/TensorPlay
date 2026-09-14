@@ -68,7 +68,7 @@ jobs:
           # the nightly index is not guaranteed to be in sync yet.
           gh release download nightly \
             --repo "$GITHUB_REPOSITORY" \
-            --pattern 'tensorplay-*+cpu-cp312-cp312-linux_x86_64.whl' \
+            --pattern 'tensorplay-*+cpu-cp312-cp312-*x86_64.whl' \
             --dir dist-docs
           # Same-day republishes can leave more than one build for a wheel
           # tag; asking pip to install all of them at once fails on the
@@ -89,7 +89,7 @@ jobs:
           for attempt in 1 2 3 4 5 6 7 8 9 10; do
             if gh release download "$RELEASE_TAG" \
                  --repo "$GITHUB_REPOSITORY" \
-                 --pattern 'tensorplay-*+cpu-cp312-cp312-linux_x86_64.whl' \
+                 --pattern 'tensorplay-*+cpu-cp312-cp312-*x86_64.whl' \
                  --dir dist-docs; then
               break
             fi
