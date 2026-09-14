@@ -1,0 +1,15 @@
+version: 2.1
+
+# Placeholder lane. The CircleCI project integration is still connected at
+# the organization level, so an absent config makes every push report
+# "No configuration was found" and paints the commit status red. A no-op
+# job performs no actions and consumes no credits, keeping the status green
+# until the integration is disconnected in the project settings.
+jobs:
+  noop:
+    type: no-op
+
+workflows:
+  noop:
+    jobs:
+      - noop
