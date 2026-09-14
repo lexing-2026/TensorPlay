@@ -45,10 +45,10 @@ on:
       cuda_variants:
         required: false
         type: string
-        default: ""
+        default: "cu130"
         description: >-
           Space-separated CUDA variants from .github/cuda-variants.json to
-          build, for example "cu124 cu126". Empty means all.
+          build. Only "cu130" is supported; empty also selects cu130.
 
 permissions: read-all
 
@@ -85,9 +85,14 @@ jobs:
           if [[ -n "$CPU_PLATFORMS" ]]; then
             cpu_list="$(printf '%s\n' $CPU_PLATFORMS | jq -R . | jq -s -c .)"
           fi
-          cuda_list='[]'
+          cuda_list='["cu130"]'
           if [[ -n "$CUDA_VARIANTS" ]]; then
             cuda_list="$(printf '%s\n' $CUDA_VARIANTS | jq -R . | jq -s -c .)"
+          fi
+          invalid_cuda="$(jq '[.[] | select(. != "cu130")] | length' <<< "$cuda_list")"
+          if [[ "$invalid_cuda" != "0" ]]; then
+            echo "Nightly CUDA builds support only cu130" >&2
+            exit 1
           fi
           cpu_matrix="$(jq -c --argjson cpu_list "$cpu_list" '
             [
