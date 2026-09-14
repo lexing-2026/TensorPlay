@@ -38,7 +38,10 @@ set(CUDNN_INCLUDE_DIR
 
 find_path(CUDNN_INCLUDE_PATH
     NAMES cudnn.h
-    HINTS ${CUDNN_INCLUDE_DIR}
+    HINTS
+        ${CUDNN_INCLUDE_DIR}
+        ${CUDNN_ROOT}
+        $ENV{CUDNN_ROOT}
     PATH_SUFFIXES cuda/include cuda include
 )
 
@@ -59,6 +62,9 @@ endif()
 find_library(CUDNN_LIBRARY_PATH
     NAMES ${CUDNN_LIBNAME}
     PATHS ${CUDNN_LIBRARY}
+    HINTS
+        ${CUDNN_ROOT}
+        $ENV{CUDNN_ROOT}
     PATH_SUFFIXES lib lib64 cuda/lib cuda/lib64 lib/x64
 )
 

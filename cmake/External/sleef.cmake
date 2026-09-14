@@ -88,6 +88,15 @@ function(_tp_add_vendored_sleef)
     tp_add_third_party(
         "${CMAKE_CURRENT_LIST_DIR}/../../third_party/sleef"
         "${CMAKE_BINARY_DIR}/third_party/sleef")
+    if(NOT SLEEF_BUILD_TESTS)
+        foreach(_TP_SLEEF_TEST_HELPER testerutil_obj qtesterutil_obj)
+            if(TARGET ${_TP_SLEEF_TEST_HELPER})
+                set_property(
+                    TARGET ${_TP_SLEEF_TEST_HELPER}
+                    PROPERTY EXCLUDE_FROM_ALL TRUE)
+            endif()
+        endforeach()
+    endif()
     # SLEEF's tlfloat ExternalProject bakes CMAKE_INSTALL_PREFIX into its
     # configure step at generate time; restore the project prefix only
     # after that value has been captured.
