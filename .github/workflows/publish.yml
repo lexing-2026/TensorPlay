@@ -25,6 +25,14 @@ on:
         required: false
         type: string
         default: ""
+      build_ref:
+        description: >
+          Source ref for the wheel build. Set this to a verified branch or
+          commit when repairing a release without moving the release tag.
+          Empty uses the release tag on repair dispatches.
+        required: false
+        type: string
+        default: ""
       lanes:
         description: >
           Comma-separated substrings of the cu130 build_name to rebuild, e.g.
@@ -95,10 +103,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # A repair dispatch reads the matrix, notes and tag shape from the
-          # release tag itself, so the run behaves exactly like a fresh tag
-          # push.
-          ref: ${{ inputs.tag != '' && inputs.tag || github.ref }}
+          # Matrix metadata comes from the requested source ref; the release
+          # tag remains an explicit version/upload destination.
+          ref: ${{ inputs.build_ref != '' && inputs.build_ref || (inputs.tag != '' && inputs.tag || github.ref) }}
           submodules: false
           show-progress: false
       - id: read-matrix
@@ -171,6 +178,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.build_ref != '' && inputs.build_ref || github.ref }}
           submodules: false
           show-progress: false
       - name: Create release for an eligible tag
@@ -231,7 +239,7 @@ jobs:
       cuda_toolkit: ${{ matrix.toolkit }}
       upload_release: ${{ needs.define-wheel-matrix.outputs.release_tag == 'true' }}
       save_cache: false
-      checkout_ref: ${{ inputs.tag }}
+      checkout_ref: ${{ inputs.build_ref != '' && inputs.build_ref || inputs.tag }}
       release_tag_name: ${{ inputs.tag }}
       max_jobs: ${{ inputs.max_jobs }}
       s3_cache: ${{ inputs.s3_cache }}
