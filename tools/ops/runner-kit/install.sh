@@ -10,6 +10,7 @@ RELAY="${TP_RELAY:-/tmp/tp-relay}"
 RUNNER_DIR="$RELAY/runner"
 PROXY="http://127.0.0.1:7897"
 NO_PROXY_DOMAINS="127.0.0.1,localhost,.p300s.com,10.0.0.0/8,.internal,.actions.githubusercontent.com,api.github.com"
+TOOLKIT_ROOT="$(cd "$KIT/.." && pwd)/toolkits"
 
 mkdir -p "$RELAY" "$HOME/.local/bin" "$HOME/.config/tensorplay"
 
@@ -69,7 +70,7 @@ TP_S3_CACHE=1")"
     echo "no_proxy=$NO_PROXY_DOMAINS"
     echo "$CACHE_ENV"
     echo "TP_MKL_ROOT=$RELAY/mkl"
-    echo "TP_TOOLKIT_ROOT=$RELAY/toolkits"
+    echo "TP_TOOLKIT_ROOT=$TOOLKIT_ROOT"
 } > "$RUNNER_DIR/.env"
 
 cd "$RUNNER_DIR"
