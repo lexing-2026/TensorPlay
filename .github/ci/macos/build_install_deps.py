@@ -71,7 +71,7 @@ def main() -> None:
     }.get(machine)
     if sccache_arch is None:
         sys.exit(f"no sccache tarball mapping for {machine}")
-    version = "0.8.1"
+    version = "0.18.0"
     install_dir = (
         Path(args.package_dir) / ".github" / "ci" / "macos" / "sccache-bin"
     )
