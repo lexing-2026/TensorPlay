@@ -9,10 +9,13 @@ is not staged at /opt/llvm-openmp, falls back to Homebrew's libomp.
 
 import argparse
 import os
+import platform
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
+import urllib.request
 from pathlib import Path
 
 
@@ -57,9 +60,41 @@ def main() -> None:
 
     # The CMake build picks up sccache as the compiler launcher when it is
     # on PATH; a shared object-store cache makes the second build of a
-    # lane far cheaper.
-    if shutil.which("sccache") is None:
-        retry(["brew", "install", "sccache"])
+    # lane far cheaper. Homebrew's sccache floats with the runner image
+    # and ships a much newer release whose object-store client wedges
+    # against the pinned endpoint, so stage the exact release the other
+    # platforms use and let build.sh put it first on PATH.
+    machine = platform.machine()
+    sccache_arch = {
+        "arm64": "aarch64-apple-darwin",
+        "x86_64": "x86_64-apple-darwin",
+    }.get(machine)
+    if sccache_arch is None:
+        sys.exit(f"no sccache tarball mapping for {machine}")
+    version = "0.8.1"
+    install_dir = (
+        Path(args.package_dir) / ".github" / "ci" / "macos" / "sccache-bin"
+    )
+    install_dir.mkdir(parents=True, exist_ok=True)
+    sccache_bin = install_dir / "sccache"
+    if not sccache_bin.exists():
+        workdir = Path("sccache-extract")
+        workdir.mkdir(exist_ok=True)
+        tarball = workdir / "sccache.tar.gz"
+        url = (
+            "https://github.com/mozilla/sccache/releases/download/"
+            f"v{version}/sccache-v{version}-{sccache_arch}.tar.gz"
+        )
+        urllib.request.urlretrieve(url, tarball)
+        with tarfile.open(tarball) as archive:
+            archive.extractall(workdir)
+        payload = workdir / f"sccache-v{version}-{sccache_arch}" / "sccache"
+        if not payload.is_file():
+            sys.exit(f"sccache extraction did not produce {payload}")
+        sccache_bin.write_bytes(payload.read_bytes())
+        sccache_bin.chmod(0o755)
+        shutil.rmtree(workdir, ignore_errors=True)
+    print(f"sccache pinned to v{version} at {sccache_bin}")
 
     # OpenMP: prefer the conda-forge libomp staged at /opt/llvm-openmp (set
     # up by install_libomp.sh as a separate step). Otherwise fall back to
