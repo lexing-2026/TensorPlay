@@ -520,6 +520,15 @@ def main():
     print(f"suite={suite} dtype={args.dtype} cases={len(cases)}")
     for name, category, factory, specs in cases:
         fn = factory()
+        # A kernel may reject a dtype outright; probe once so an unsupported
+        # case is reported and skipped instead of aborting the remaining
+        # measurements of the pass.
+        try:
+            fn()
+        except NotImplementedError as exc:
+            print(f"{name:42} [skipped: {exc}]")
+            del fn
+            continue
         seconds = _time(fn, args.reps)
         entry = {
             "name": name,
