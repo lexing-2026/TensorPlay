@@ -24,7 +24,7 @@ try:
 except ImportError:
     def get_free_port() -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as stream:
-            stream.bind(("", 0))
+            stream.bind(("127.0.0.1", 0))
             return int(stream.getsockname()[1])
 
 
