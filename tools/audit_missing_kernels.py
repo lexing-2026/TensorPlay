@@ -101,7 +101,7 @@ for func, backend, sym in entries:
 
 def op_base(func):
     """yaml `func:` line -> base op name (e.g. `sub.Tensor(Tensor self...)`)."""
-    m = re.match(r"([A-Za-z0-9_]+(?:\.[A-Za-z0-9_.]+)*)\(", func)
+    m = re.match(r"([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\(", func)
     return m.group(1) if m else func
 
 
