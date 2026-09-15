@@ -198,7 +198,10 @@ jobs:
           echo "SCCACHE_ENDPOINT=$S3_CACHE_ENDPOINT" >> "$GITHUB_ENV"
           echo "SCCACHE_REGION=${S3_CACHE_REGION:-us-east-1}" >> "$GITHUB_ENV"
           echo "SCCACHE_S3_USE_SSL=true" >> "$GITHUB_ENV"
-          echo "SCCACHE_NO_DAEMON=1" >> "$GITHUB_ENV"
+          # The server must daemonize on unix: a foreground server inherits
+          # the spawning compile's output pipe and keeps it open forever,
+          # which leaves ninja waiting on task EOF (observed as a silent
+          # full-matrix stall). Windows never daemonizes and is unaffected.
           echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
           echo "AWS_ACCESS_KEY_ID=$S3_CACHE_ACCESS_KEY_ID" >> "$GITHUB_ENV"
           echo "AWS_SECRET_ACCESS_KEY=$S3_CACHE_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
