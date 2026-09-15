@@ -150,7 +150,7 @@ def main() -> None:
         install_dir.mkdir(parents=True, exist_ok=True)
         sccache_bin = install_dir / "sccache"
         if not sccache_bin.exists():
-            version = "0.8.1"
+            version = "0.18.0"
             workdir = Path("sccache-extract")
             workdir.mkdir(exist_ok=True)
             tarball = workdir / "sccache.tar.gz"
