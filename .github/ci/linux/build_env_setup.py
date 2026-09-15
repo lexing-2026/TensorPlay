@@ -27,6 +27,7 @@ import os
 import platform
 import subprocess
 import sys
+import sysconfig
 import tempfile
 from pathlib import Path
 
@@ -48,7 +49,8 @@ CPU_BUILD_ENV: dict[str, str] = {
 TORCH_CUDA_ARCH_LIST_TABLE: dict[str, str] = {
     "12.4": "5.0;6.0;7.0;7.5;8.0;8.6;9.0",
     "12.6": "5.0;6.0;7.0;7.5;8.0;8.6;9.0",
-    "13.0": "7.5;8.0;8.6;9.0;10.0;12.0",
+    # Build the third-generation consumer target in the cu130 wheel.
+    "13.0": "8.6",
 }
 
 
@@ -74,11 +76,20 @@ def setup_cuda() -> dict[str, str]:
     arch_list = TORCH_CUDA_ARCH_LIST_TABLE.get(toolkit_line(cuda_path))
     if arch_list is None:
         sys.exit(f"no TORCH_CUDA_ARCH_LIST entry for toolkit root {cuda_path!r}")
+    site_packages = Path(sysconfig.get_path("purelib"))
+    cudnn_root = site_packages / "nvidia" / "cudnn"
+    nccl_root = site_packages / "nvidia" / "nccl"
+    runtime_libs = f"{cudnn_root}/lib:{nccl_root}/lib"
+    if os.environ.get("LD_LIBRARY_PATH"):
+        runtime_libs = f"{runtime_libs}:{os.environ['LD_LIBRARY_PATH']}"
     return {
         "USE_CUDA": "1",
         "CUDA_PATH": cuda_path,
         "TORCH_CUDA_ARCH_LIST": arch_list,
         "PATH": f"{cuda_path}/bin:{os.environ.get('PATH', '')}",
+        "CUDNN_ROOT": str(cudnn_root),
+        "NCCL_ROOT": str(nccl_root),
+        "LD_LIBRARY_PATH": runtime_libs,
     }
 
 

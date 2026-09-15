@@ -37,5 +37,10 @@ python "$CI_DIR/build_install_deps.py" --env-out "$ENV_FILE"
 # shellcheck source=/dev/null
 source "$ENV_FILE"
 
+# Start one cache server before Ninja launches parallel compiler
+# clients; the script retries transient startup failures instead of
+# aborting the build.
+bash "$CI_DIR/../../scripts/warm_sccache.sh"
+
 cd "$REPO_ROOT"
 python "$CI_DIR/build_wheel.py" "${1:-dist}"

@@ -221,6 +221,7 @@ jobs:
       # Main-branch pushes publish their smoke-tested wheels to the rolling
       # nightly release; tags and release branches publish to their own.
       build_version: ${{ needs.define-wheel-matrix.outputs.nightly_version }}
+      max_jobs: "2"
       upload_release: ${{ github.ref_type == 'branch' && github.ref_name == 'main' }}
     secrets: inherit
 

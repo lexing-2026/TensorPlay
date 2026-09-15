@@ -128,8 +128,8 @@ jobs:
       SHA1: ${{ github.event.pull_request.head.sha || github.sha }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
-      # Self-hosted machines keep a bare git mirror under
-      # $HOME/actions-runner/mirrors and a global insteadOf rewrites every
+      # Self-hosted machines keep a bare git cache under the runner home and a
+      # global insteadOf rewrites every
       # github.com clone to it, so checkouts and vendored-dependency clones
       # read from local disk. Refresh the mirror incrementally first so the
       # rewritten checkout still sees the requested ref; on hosted runners
@@ -198,10 +198,26 @@ jobs:
           echo "SCCACHE_ENDPOINT=$S3_CACHE_ENDPOINT" >> "$GITHUB_ENV"
           echo "SCCACHE_REGION=${S3_CACHE_REGION:-us-east-1}" >> "$GITHUB_ENV"
           echo "SCCACHE_S3_USE_SSL=true" >> "$GITHUB_ENV"
-          echo "SCCACHE_NO_DAEMON=1" >> "$GITHUB_ENV"
+          # The server must daemonize on unix: a foreground server inherits
+          # the spawning compile's output pipe and keeps it open forever,
+          # which leaves ninja waiting on task EOF (observed as a silent
+          # full-matrix stall). Windows never daemonizes and is unaffected.
           echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
           echo "AWS_ACCESS_KEY_ID=$S3_CACHE_ACCESS_KEY_ID" >> "$GITHUB_ENV"
           echo "AWS_SECRET_ACCESS_KEY=$S3_CACHE_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
+          proxy_exclusions="${NO_PROXY:-${no_proxy:-}}"
+          for host in s3.hf.co .actions.githubusercontent.com api.github.com; do
+            case ",$proxy_exclusions," in
+              *",$host,"*) ;;
+              *) proxy_exclusions="${proxy_exclusions:+$proxy_exclusions,}$host" ;;
+            esac
+          done
+          echo "NO_PROXY=$proxy_exclusions" >> "$GITHUB_ENV"
+          echo "no_proxy=$proxy_exclusions" >> "$GITHUB_ENV"
+          sccache_config="$RUNNER_TEMP/sccache-config"
+          printf '%s\n' 'server_startup_timeout_ms = 120000' > "$sccache_config"
+          echo "SCCACHE_CONF=$sccache_config" >> "$GITHUB_ENV"
+          echo "SCCACHE_ERROR_LOG=$RUNNER_TEMP/sccache-error.log" >> "$GITHUB_ENV"
 
       - name: Restore compiler cache
         id: compiler-cache
@@ -319,13 +335,42 @@ jobs:
 
       # This installs the compiler/toolkit only. Free GitHub-hosted runners
       # have no GPU, so CUDA kernels are never executed in this workflow.
-      # The downloaded installer (~4GB per CUDA version) must stay out of the
-      # shared 10GB cache pool or it evicts the compiler caches of every lane.
+      # Cache the toolkit installer across hosted jobs. Compiler objects use
+      # the separate S3 backend, so this cache cannot evict them.
       - uses: jimver/cuda-toolkit@v0.2.36
         if: ${{ inputs.cuda != 'cpu' && steps.cuda-detect.outputs.preinstalled == '' }}
         with:
           cuda: ${{ inputs.cuda_toolkit }}
-          use-github-cache: 'false'
+          use-github-cache: 'true'
+
+      - name: Provision CUDA runtime libraries
+        if: ${{ inputs.cuda != 'cpu' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ inputs.cuda_toolkit }}" in
+            12.*)
+              cudnn_pkg=nvidia-cudnn-cu12
+              nccl_pkg=nvidia-nccl-cu12
+              ;;
+            13.*)
+              cudnn_pkg=nvidia-cudnn-cu13==9.20.0.48
+              nccl_pkg=nvidia-nccl-cu13==2.29.7
+              ;;
+            *)
+              echo "Unsupported CUDA toolkit: ${{ inputs.cuda_toolkit }}" >&2
+              exit 1
+              ;;
+          esac
+          python -m pip install -q "$cudnn_pkg"
+          runtime_root="$(python -c 'import nvidia.cudnn; print(list(nvidia.cudnn.__path__)[0])')"
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            python -m pip install -q "$nccl_pkg"
+            nccl_root="$(python -c 'import nvidia.nccl; print(list(nvidia.nccl.__path__)[0])')"
+            echo "LD_LIBRARY_PATH=$runtime_root/lib:$nccl_root/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          else
+            echo "$runtime_root/bin" >> "$GITHUB_PATH"
+          fi
 
       - name: Build wheel
         shell: bash
@@ -421,7 +466,36 @@ jobs:
         if: ${{ inputs.cuda != 'cpu' }}
         with:
           cuda: ${{ inputs.cuda_toolkit }}
-          use-github-cache: 'false'
+          use-github-cache: 'true'
+
+      - name: Install CUDA runtime libraries for tests
+        if: ${{ inputs.cuda != 'cpu' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ inputs.cuda_toolkit }}" in
+            12.*)
+              cudnn_pkg=nvidia-cudnn-cu12
+              nccl_pkg=nvidia-nccl-cu12
+              ;;
+            13.*)
+              cudnn_pkg=nvidia-cudnn-cu13==9.20.0.48
+              nccl_pkg=nvidia-nccl-cu13==2.29.7
+              ;;
+            *)
+              echo "Unsupported CUDA toolkit: ${{ inputs.cuda_toolkit }}" >&2
+              exit 1
+              ;;
+          esac
+          python -m pip install -q "$cudnn_pkg"
+          runtime_root="$(python -c 'import nvidia.cudnn; print(list(nvidia.cudnn.__path__)[0])')"
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            python -m pip install -q "$nccl_pkg"
+            nccl_root="$(python -c 'import nvidia.nccl; print(list(nvidia.nccl.__path__)[0])')"
+            echo "LD_LIBRARY_PATH=$runtime_root/lib:$nccl_root/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          else
+            echo "$runtime_root/bin" >> "$GITHUB_PATH"
+          fi
 
       - name: Install Linux CPU runtime dependencies
         if: ${{ inputs.cuda == 'cpu' && runner.os == 'Linux' }}

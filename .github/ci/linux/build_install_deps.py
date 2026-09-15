@@ -9,6 +9,7 @@ links the system OpenBLAS instead of the x86_64 MKL staging.
 """
 
 import argparse
+import importlib
 import os
 import platform
 import shutil
@@ -37,6 +38,11 @@ BUILD_PACKAGES: list[str] = [
     "patchelf",
 ]
 
+CUDA_RUNTIME_PACKAGES = {
+    "12": ("nvidia-cudnn-cu12", "nvidia-nccl-cu12"),
+    "13": ("nvidia-cudnn-cu13==9.20.0.48", "nvidia-nccl-cu13==2.29.7"),
+}
+
 
 def retry(cmd: list[str], delays: tuple[int, ...] = (1, 2, 4, 8)) -> None:
     """Run cmd, retrying with backoff on failure."""
@@ -55,6 +61,50 @@ def pip_install(*args: str) -> None:
     retry([sys.executable, "-m", "pip", "install", *args])
 
 
+def toolkit_major() -> str:
+    toolkit = os.environ.get("CUDA_PATH", "")
+    leaf = Path(toolkit).name
+    if leaf.startswith("cuda-"):
+        leaf = leaf[5:]
+    major = leaf.split(".", 1)[0]
+    if not major.isdigit():
+        sys.exit(f"cannot determine CUDA major version from CUDA_PATH={toolkit!r}")
+    return major
+
+
+def package_root(module_name: str) -> Path:
+    module = importlib.import_module(module_name)
+    roots = list(module.__path__)
+    if len(roots) != 1:
+        sys.exit(f"expected one install root for {module_name}, got {roots}")
+    return Path(roots[0])
+
+
+def install_cuda_runtime() -> None:
+    if os.environ.get("GPU_ARCH_TYPE", "cpu") != "cuda":
+        return
+    packages = CUDA_RUNTIME_PACKAGES.get(toolkit_major())
+    if packages is None:
+        sys.exit(f"no CUDA runtime package set for CUDA major {toolkit_major()}")
+    pip_install("-q", *packages)
+
+    cudnn_root = package_root("nvidia.cudnn")
+    nccl_root = package_root("nvidia.nccl")
+    required = [cudnn_root / "include" / "cudnn.h",
+                nccl_root / "include" / "nccl.h"]
+    cudnn_libs = list((cudnn_root / "lib").glob("libcudnn.so*"))
+    nccl_libs = list((nccl_root / "lib").glob("libnccl.so*"))
+    if not cudnn_libs:
+        required.append(cudnn_root / "lib/libcudnn.so*")
+    if not nccl_libs:
+        required.append(nccl_root / "lib/libnccl.so*")
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        sys.exit(f"CUDA runtime installation is incomplete: {missing}")
+    print(f"cuDNN root: {cudnn_root}")
+    print(f"NCCL root: {nccl_root}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("package_dir", type=Path)
@@ -62,6 +112,7 @@ def main() -> None:
 
     os.chdir(args.package_dir)
     pip_install("-q", *BUILD_PACKAGES)
+    install_cuda_runtime()
 
     # The CMake build wires sccache in as the compiler launcher on every
     # lane. ccache only supports the nvcc driver experimentally and every
@@ -99,7 +150,7 @@ def main() -> None:
         install_dir.mkdir(parents=True, exist_ok=True)
         sccache_bin = install_dir / "sccache"
         if not sccache_bin.exists():
-            version = "0.8.1"
+            version = "0.18.0"
             workdir = Path("sccache-extract")
             workdir.mkdir(exist_ok=True)
             tarball = workdir / "sccache.tar.gz"

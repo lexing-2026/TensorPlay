@@ -177,10 +177,10 @@ CPU 与 CUDA 后端刻意做了简化：每个文件一族内核、每个单元�
 # 从 PyPI 安装 CPU 版本
 pip install tensorplay --upgrade
 
-# 从 TensorPlay CUDA 源安装 CUDA 版本（可选 cu124、cu126 或 cu130）
+# 从 TensorPlay CUDA 源安装 CUDA 13.0 版本
 # PyPI 作为运行时依赖的额外索引
 pip install tensorplay \
-  --index-url https://download.tensorplay.cn/whl/cu124/ \
+  --index-url https://download.tensorplay.cn/whl/cu130/ \
   --extra-index-url https://pypi.org/simple
 ```
 
@@ -192,9 +192,9 @@ pip install tensorplay \
 预览明天的功能：每一处通过构建与冒烟流水线的改动都会自动进入滚动的 `nightly` 通道，采用 nightly 版本号格式（`X.Y.0.dev<日期>+cuXXX` / `+cpu`）。每个变体仅保留最新一次构建。
 
 ```bash
-# CUDA nightly（可选 cu124、cu126 或 cu130）
+# CUDA nightly
 pip install --pre tensorplay \
-  --index-url https://download.tensorplay.cn/whl/nightly/cu124/ \
+  --index-url https://download.tensorplay.cn/whl/nightly/cu130/ \
   --extra-index-url https://pypi.org/simple
 
 # CPU nightly

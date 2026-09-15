@@ -77,8 +77,8 @@ a future fix: link the issue/PR, state the affected workload and the plan
 # CPU wheels from PyPI
 pip install tensorplay==X.Y.0
 
-# CUDA wheels from the TensorPlay index (choose cu124, cu126, or cu130)
+# CUDA 13.0 wheels from the TensorPlay index
 pip install tensorplay==X.Y.0 \
-  --index-url https://download.tensorplay.cn/whl/cu124/ \
+  --index-url https://download.tensorplay.cn/whl/cu130/ \
   --extra-index-url https://pypi.org/simple
 ```

@@ -196,28 +196,24 @@ if(USE_CUDA)
         set(CUDNN_STATIC OFF CACHE BOOL "")
     endif()
 
-    find_package(CUDNN QUIET)
-    if(CUDNN_FOUND)
-        if(CUDNN_VERSION VERSION_LESS "8.1.0")
-            message(FATAL_ERROR "TensorPlay requires cuDNN 8.1 and above.")
-        endif()
-        set(USE_CUDNN ON)
-        message(STATUS "Found cuDNN ${CUDNN_VERSION}: ${CUDNN_INCLUDE_PATH}")
-        string(APPEND CMAKE_CXX_FLAGS " -DUSE_CUDNN")
-        if(CUDNN_FRONTEND_INCLUDE_DIR)
-            message(STATUS "Found cuDNN frontend: ${CUDNN_FRONTEND_INCLUDE_DIR}")
-        endif()
+    find_package(CUDNN REQUIRED)
+    if(CUDNN_VERSION VERSION_LESS "8.1.0")
+        message(FATAL_ERROR "TensorPlay requires cuDNN 8.1 and above.")
+    endif()
+    set(USE_CUDNN ON)
+    message(STATUS "Found cuDNN ${CUDNN_VERSION}: ${CUDNN_INCLUDE_PATH}")
+    string(APPEND CMAKE_CXX_FLAGS " -DUSE_CUDNN")
+    if(CUDNN_FRONTEND_INCLUDE_DIR)
+        message(STATUS "Found cuDNN frontend: ${CUDNN_FRONTEND_INCLUDE_DIR}")
+    endif()
 
-        add_library(tp::cudnn INTERFACE IMPORTED)
-        target_include_directories(tp::cudnn INTERFACE ${CUDNN_INCLUDE_PATH})
-        if(CUDNN_STATIC AND NOT WIN32)
-            target_link_options(tp::cudnn INTERFACE
-                "-Wl,--exclude-libs,libcudnn_static.a")
-        else()
-            target_link_libraries(tp::cudnn INTERFACE ${CUDNN_LIBRARY_PATH})
-        endif()
+    add_library(tp::cudnn INTERFACE IMPORTED)
+    target_include_directories(tp::cudnn INTERFACE ${CUDNN_INCLUDE_PATH})
+    if(CUDNN_STATIC AND NOT WIN32)
+        target_link_options(tp::cudnn INTERFACE
+            "-Wl,--exclude-libs,libcudnn_static.a")
     else()
-        message(STATUS "cuDNN not found; CUDA backend will be built without cuDNN support.")
+        target_link_libraries(tp::cudnn INTERFACE ${CUDNN_LIBRARY_PATH})
     endif()
 
     # Install CUDA Runtime Libraries (Windows)
@@ -285,7 +281,8 @@ if(USE_CUDA)
         endif()
     endif()
 
-    # On Windows, copy cuDNN DLLs if they are not in PATH
+    # On Windows, bundle the cuDNN runtime DLLs the build links against;
+    # the wheel must import on machines with no toolkit on PATH.
     if(WIN32 AND USE_CUDNN)
         get_filename_component(CUDNN_LIB_DIR "${CUDNN_LIBRARY}" DIRECTORY)
         # Handle v9.x structure: lib/13.1/x64 -> ../../../bin/13.1
@@ -294,13 +291,21 @@ if(USE_CUDA)
         # Try to find root by going up until we find 'bin'
         get_filename_component(CUDNN_ROOT_V9 "${CUDNN_LIB_DIR}/../../.." ABSOLUTE)
         get_filename_component(CUDNN_ROOT_STD "${CUDNN_LIB_DIR}/../.." ABSOLUTE)
+        # Wheel-package layout: bin/ sits next to lib/
+        get_filename_component(CUDNN_ROOT_PKG "${CUDNN_LIB_DIR}/.." ABSOLUTE)
 
         set(CUDNN_DLLS "")
 
-        if(EXISTS "${CUDNN_ROOT_V9}/bin/13.1")
+        if(CUDNN_ROOT AND EXISTS "${CUDNN_ROOT}/bin")
+            file(GLOB CUDNN_DLLS "${CUDNN_ROOT}/bin/cudnn*.dll")
+        elseif(DEFINED ENV{CUDNN_ROOT} AND EXISTS "$ENV{CUDNN_ROOT}/bin")
+            file(GLOB CUDNN_DLLS "$ENV{CUDNN_ROOT}/bin/cudnn*.dll")
+        elseif(EXISTS "${CUDNN_ROOT_V9}/bin/13.1")
             file(GLOB CUDNN_DLLS "${CUDNN_ROOT_V9}/bin/13.1/cudnn*.dll")
         elseif(EXISTS "${CUDNN_ROOT_STD}/bin")
             file(GLOB CUDNN_DLLS "${CUDNN_ROOT_STD}/bin/cudnn*.dll")
+        elseif(EXISTS "${CUDNN_ROOT_PKG}/bin")
+            file(GLOB CUDNN_DLLS "${CUDNN_ROOT_PKG}/bin/cudnn*.dll")
         endif()
 
         if(NOT CUDNN_DLLS)
@@ -308,10 +313,18 @@ if(USE_CUDA)
             file(GLOB CUDNN_DLLS "${CUDNN_LIB_DIR}/*.dll")
         endif()
 
+        if(NOT CUDNN_DLLS)
+            message(WARNING
+                "No cuDNN runtime DLLs found to bundle; the wheel will fail "
+                "to import where cuDNN is not on PATH "
+                "(CUDNN_LIBRARY=${CUDNN_LIBRARY})")
+        endif()
+
         foreach(DLL ${CUDNN_DLLS})
             file(COPY ${DLL} DESTINATION ${CMAKE_BINARY_DIR}/bin)
             file(COPY ${DLL} DESTINATION ${CMAKE_SOURCE_DIR}/tensorplay/lib)
             install(FILES ${DLL} DESTINATION tensorplay/lib)
+            message(STATUS "  - Bundling cuDNN DLL: ${DLL}")
         endforeach()
     endif()
 endif()
