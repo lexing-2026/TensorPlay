@@ -186,7 +186,7 @@ struct ActCxTanh {
 
 }  // namespace
 
-static Tensor native_activation_dispatch(const Tensor& self, bool is_sigmoid) {
+Tensor native_activation_dispatch(const Tensor& self, bool is_sigmoid) {
     if (isComplexType(self.dtype())) {
         if (self.dtype() != DType::ComplexFloat &&
             self.dtype() != DType::ComplexDouble) {
