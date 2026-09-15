@@ -31,7 +31,7 @@ python3 "${SCRIPTPATH}/build_install_deps.py" "${REPO_ROOT}"
 # Start one cache server before the build launches parallel compiler
 # clients; the script retries transient startup failures instead of
 # aborting the build.
-bash "${SCRIPTPATH}/../warm_sccache.sh"
+bash "${SCRIPTPATH}/../../scripts/warm_sccache.sh"
 
 cd "${REPO_ROOT}"
 python3 "${SCRIPTPATH}/build_wheel.py" dist
