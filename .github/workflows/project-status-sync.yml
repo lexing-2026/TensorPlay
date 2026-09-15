@@ -1,0 +1,151 @@
+name: project-status-sync
+
+# Keeps the Status field of the TensorPlay Roadmap project board
+# (https://github.com/users/lexing-2026/projects/3) in sync with issue and
+# pull request state, so the board never needs manual card moves:
+#
+#   - issue assigned                              -> In Progress
+#   - issue closed                                -> Done
+#   - PR opened/reopened as ready for review      -> In Review
+#   - PR review requested / marked ready          -> In Review
+#   - PR merged                                   -> Done
+#
+# Draft PRs and unmerged PR closes are left untouched. Items that are not on
+# the board yet (e.g. when this workflow races add-to-project) are added here,
+# so neither workflow depends on the other.
+
+on:
+  issues:
+    types: [assigned, closed]
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, review_requested, closed]
+
+permissions: {}
+
+jobs:
+  sync-status:
+    name: sync-status
+    runs-on: ubuntu-latest
+    steps:
+      # Secrets cannot be referenced in job/step `if` directly, so probe it
+      # through an env var first; the job no-ops until PROJECT_TOKEN exists.
+      - name: Check the PROJECT_TOKEN secret
+        id: check
+        env:
+          PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+        shell: bash
+        run: |
+          if [[ -n "$PROJECT_TOKEN" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "PROJECT_TOKEN secret is not set; skipping status sync"
+          fi
+
+      - name: Sync the item status on the board
+        if: ${{ steps.check.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          PROJECT_NUMBER: "3"
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          # Webhook payloads carry the GraphQL node id of the subject, so this
+          # script never needs to read the repository itself (the token only
+          # has the `project` scope).
+          CONTENT_NODE_ID: ${{ github.event.issue.node_id || github.event.pull_request.node_id }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          IS_MERGED: ${{ github.event.pull_request.merged }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 1. Decide the target status from the event, or skip when the event
+          #    carries no status change (draft opens, unmerged closes).
+          status=""
+          if [[ "$EVENT_NAME" == "issues" ]]; then
+            if [[ "$EVENT_ACTION" == "assigned" ]]; then status="In Progress";
+            elif [[ "$EVENT_ACTION" == "closed" ]]; then status="Done"; fi
+          else
+            if [[ "$EVENT_ACTION" == "closed" ]]; then
+              if [[ "$IS_MERGED" == "true" ]]; then status="Done"; fi
+            elif [[ "$EVENT_ACTION" == "ready_for_review" || "$EVENT_ACTION" == "review_requested" ]]; then
+              status="In Review"
+            elif [[ "$IS_DRAFT" != "true" ]]; then
+              status="In Review"
+            fi
+          fi
+          if [[ -z "$status" ]]; then
+            echo "No status change for $EVENT_NAME/$EVENT_ACTION; done."
+            exit 0
+          fi
+
+          # 2. Load the board, its Status field options and current items.
+          #    Items beyond the first page are not re-synced here; by then the
+          #    item exists on the board and add-to-project owns membership.
+          read -r project_id field_id item_id <<< "$(gh api graphql -f query='
+            query($number: Int!) {
+              viewer {
+                projectV2(number: $number) {
+                  id
+                  field(name: "Status") {
+                    ... on ProjectV2SingleSelectField { id options { id name } }
+                  }
+                  items(first: 100) {
+                    nodes {
+                      id
+                      content { ... on Issue { id } ... on PullRequest { id } }
+                    }
+                  }
+                }
+              }
+            }' -F number="$PROJECT_NUMBER" --jq '[
+              .data.viewer.projectV2.id,
+              (.data.viewer.projectV2.field.id // ""),
+              ([.data.viewer.projectV2.items.nodes[]
+                | select(.content.id == "'"$CONTENT_NODE_ID"'") | .id] | first // "")
+            ] | join(" ")')"
+
+          if [[ -z "$field_id" ]]; then
+            echo "Status field not found on project $PROJECT_NUMBER; aborting." >&2
+            exit 1
+          fi
+
+          # 3. Add the item if it is not on the board yet.
+          if [[ -z "$item_id" ]]; then
+            echo "Item not on the board; adding it."
+            item_id="$(gh api graphql -f query='
+              mutation($projectId: ID!, $contentId: ID!) {
+                addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
+                  item { id }
+                }
+              }' -f projectId="$project_id" -f contentId="$CONTENT_NODE_ID" \
+              --jq '.data.addProjectV2ItemById.item.id')"
+          fi
+
+          # 4. Resolve the status option and write it to the item.
+          option_id="$(gh api graphql -f query='
+            query($number: Int!) {
+              viewer {
+                projectV2(number: $number) {
+                  field(name: "Status") {
+                    ... on ProjectV2SingleSelectField { options { id name } }
+                  }
+                }
+              }
+            }' -F number="$PROJECT_NUMBER" \
+            --jq ".data.viewer.projectV2.field.options[] | select(.name == \"$status\") | .id")"
+          if [[ -z "$option_id" ]]; then
+            echo "No '$status' option on the Status field; aborting." >&2
+            exit 1
+          fi
+
+          gh api graphql -f query='
+            mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $projectId
+                itemId: $itemId
+                fieldId: $fieldId
+                value: { singleSelectOptionId: $optionId }
+              }) { projectV2Item { id } }
+            }' -f projectId="$project_id" -f itemId="$item_id" \
+               -f fieldId="$field_id" -f optionId="$option_id" > /dev/null
+          echo "Set item $item_id to '$status'."
