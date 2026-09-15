@@ -19,8 +19,10 @@ jobs:
   smoke-build:
     name: pull-smoke-build
     permissions:
-      contents: read
+      contents: write
       actions: read
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/_binary-build-test.yml
     with:
       build_name: tensorplay-linux-x86_64-py3_12-cpu
