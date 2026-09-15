@@ -1035,7 +1035,7 @@ Tensor rms_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalized_
                 long double acc = 0.0L;
                 if (is_f64) {
                     const double* r = static_cast<const double*>(in) + off;
-                    for (int64_t j = 0; j < inner_size; ++j) acc += double(r[j]) * r[j];
+                    for (int64_t j = 0; j < inner_size; ++j) acc += static_cast<long double>(r[j]) * r[j];
                     const double inv = 1.0 / std::sqrt(double(acc) / inner_size + eps);
                     double* o = static_cast<double*>(op) + off;
                     const double* w = static_cast<const double*>(wp);
