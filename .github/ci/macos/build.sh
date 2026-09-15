@@ -28,6 +28,10 @@ source "$ENV_FILE"
 
 python3 "${SCRIPTPATH}/build_install_deps.py" "${REPO_ROOT}"
 
+# Put the pinned sccache first on PATH; the image's newer release wedges
+# against the object-store endpoint.
+export PATH="${REPO_ROOT}/.github/ci/macos/sccache-bin:${PATH}"
+
 # Start one cache server before the build launches parallel compiler
 # clients; the script retries transient startup failures instead of
 # aborting the build.
