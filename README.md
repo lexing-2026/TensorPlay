@@ -217,6 +217,9 @@ pip install tensorplay \
 > [!NOTE]
 > Make sure your Python version matches the wheel tags (e.g. `cp310` for Python 3.10). For CUDA wheels, the driver and runtime must support the CUDA version of the wheel.
 
+> [!TIP]
+> The CUDA 13.0 wheels target compute capability 8.6 GPUs only. If your GPU has a different compute capability (or the wheel fails to run on your device), [build from source](#from-source) instead and set `CMAKE_CUDA_ARCHITECTURES` to your target — it defaults to `native`, which auto-detects the local GPU.
+
 ### Nightly (preview) builds
 
 Try tomorrow's features today: every change that passes our build-and-smoke pipeline lands on the rolling `nightly` channel automatically, following the nightly version format (`X.Y.0.dev<date>+cuXXX` / `+cpu`). Only the latest build per variant is kept.
