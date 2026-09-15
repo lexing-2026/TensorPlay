@@ -187,6 +187,9 @@ pip install tensorplay \
 > [!NOTE]
 > 请确保 Python 版本与 wheel 标签匹配（如 `cp310` 对应 Python 3.10）。CUDA 版本要求驱动与运行时支持对应 CUDA 版本。
 
+> [!TIP]
+> CUDA 13.0 wheel 仅面向计算能力 8.6 的 GPU。若你的 GPU 计算能力不同（或 wheel 无法在你的设备上运行），请改为[从源码构建](#从源码构建)，并通过 `CMAKE_CUDA_ARCHITECTURES` 指定目标架构——默认值 `native` 会自动探测本机 GPU。
+
 ### Nightly（预览版）
 
 预览明天的功能：每一处通过构建与冒烟流水线的改动都会自动进入滚动的 `nightly` 通道，采用 nightly 版本号格式（`X.Y.0.dev<日期>+cuXXX` / `+cpu`）。每个变体仅保留最新一次构建。
