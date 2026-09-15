@@ -130,6 +130,6 @@ def get_free_port() -> int:
 def get_socket_with_port() -> socket.socket:
     """Create a socket already bound to an ephemeral port (caller closes)."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("", 0))
+    sock.bind(("127.0.0.1", 0))
     sock.listen(1)
     return sock
