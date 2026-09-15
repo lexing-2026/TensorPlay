@@ -17,7 +17,7 @@ on:
       - "**.md"
       - "docs/**"
       - ".github/**"
-      - ".circleci/**"
+      - "tools/ops/**"
       - "LICENSE"
       - ".gitignore"
       # Release-bump commits only change the base version string: release
