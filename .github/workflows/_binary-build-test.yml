@@ -202,6 +202,10 @@ jobs:
           echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
           echo "AWS_ACCESS_KEY_ID=$S3_CACHE_ACCESS_KEY_ID" >> "$GITHUB_ENV"
           echo "AWS_SECRET_ACCESS_KEY=$S3_CACHE_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
+          sccache_config="$RUNNER_TEMP/sccache-config"
+          printf '%s\n' 'server_startup_timeout_ms = 120000' > "$sccache_config"
+          echo "SCCACHE_CONF=$sccache_config" >> "$GITHUB_ENV"
+          echo "SCCACHE_ERROR_LOG=$RUNNER_TEMP/sccache-error.log" >> "$GITHUB_ENV"
 
       - name: Restore compiler cache
         id: compiler-cache
