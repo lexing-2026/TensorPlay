@@ -2,10 +2,14 @@ name: nightly
 
 # Nightly preview wheels are built on a daily schedule from the default
 # branch head, following the X.Y.0.dev<UTC date>[+cuXXX|+cpu] version rule
-# computed by tools/generate_tensorplay_version.py. Wheels land on the
-# rolling "nightly" GitHub Release, and the wheel-index workflow
-# triggers the download-site rebuild from release events. Only the
-# newest calendar day of wheels is retained.
+# computed by tools/generate_tensorplay_version.py. Between releases
+# version.txt carries the next release as an a0 pre-release (e.g.
+# "1.1.0a0"), so the computed nightly base sorts above every published
+# stable and pip resolves the nightly from the nightly index even when
+# PyPI is configured as an extra index. Wheels land on the rolling
+# "nightly" GitHub Release, and the wheel-index workflow triggers the
+# download-site rebuild from release events. Only the newest calendar day
+# of wheels is retained.
 #
 # workflow_dispatch stays available for manual retries of a failed matrix
 # leg or off-schedule builds; the version/build_number/filters inputs
@@ -27,7 +31,7 @@ on:
         default: ""
         description: >-
           Base version without variant local labels. Defaults to the nightly
-          rule applied to version.txt, e.g. 1.0.0.dev20260828.
+          rule applied to version.txt, e.g. 1.1.0.dev20260828.
       build_number:
         required: false
         type: string
