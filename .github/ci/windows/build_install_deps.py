@@ -50,7 +50,7 @@ CUDA_CUDNN_PACKAGES = {
 
 LIBUV_URL = "https://s3.amazonaws.com/ossci-windows/libuv-1.40.0-h8ffe710_0.tar.bz2"
 # Mozilla's prebuilt release; the same channel the build ecosystems use.
-SCCACHE_URL = "https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-x86_64-pc-windows-msvc.zip"
+SCCACHE_URL = "https://github.com/mozilla/sccache/releases/download/v0.18.0/sccache-v0.18.0-x86_64-pc-windows-msvc.zip"
 
 
 def retry(cmd: list[str], delays: tuple[int, ...] = (1, 2, 4, 8)) -> None:
