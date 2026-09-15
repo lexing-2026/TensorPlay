@@ -202,6 +202,15 @@ jobs:
           echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
           echo "AWS_ACCESS_KEY_ID=$S3_CACHE_ACCESS_KEY_ID" >> "$GITHUB_ENV"
           echo "AWS_SECRET_ACCESS_KEY=$S3_CACHE_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
+          proxy_exclusions="${NO_PROXY:-${no_proxy:-}}"
+          for host in s3.hf.co .actions.githubusercontent.com api.github.com; do
+            case ",$proxy_exclusions," in
+              *",$host,"*) ;;
+              *) proxy_exclusions="${proxy_exclusions:+$proxy_exclusions,}$host" ;;
+            esac
+          done
+          echo "NO_PROXY=$proxy_exclusions" >> "$GITHUB_ENV"
+          echo "no_proxy=$proxy_exclusions" >> "$GITHUB_ENV"
           sccache_config="$RUNNER_TEMP/sccache-config"
           printf '%s\n' 'server_startup_timeout_ms = 120000' > "$sccache_config"
           echo "SCCACHE_CONF=$sccache_config" >> "$GITHUB_ENV"
