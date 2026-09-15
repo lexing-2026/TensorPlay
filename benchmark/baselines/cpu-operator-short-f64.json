@@ -1,0 +1,2256 @@
+{
+  "schema_version": 1,
+  "benchmark": "cpu-operator",
+  "suite": "short",
+  "dtype": "f64",
+  "threads": 2,
+  "measurements": [
+    {
+      "name": "add[8x16x32]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 3.895999995506827e-06,
+      "flops": 0,
+      "bytes_moved": 98304
+    },
+    {
+      "name": "sub[8x16x32]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 3.996000003780864e-06,
+      "flops": 0,
+      "bytes_moved": 98304
+    },
+    {
+      "name": "mul[8x16x32]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 3.6659999977928237e-06,
+      "flops": 0,
+      "bytes_moved": 98304
+    },
+    {
+      "name": "div[8x16x32]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 7.330999991950193e-06,
+      "flops": 0,
+      "bytes_moved": 98304
+    },
+    {
+      "name": "maximum[8x16x32]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 9.013000010327232e-06,
+      "flops": 0,
+      "bytes_moved": 98304
+    },
+    {
+      "name": "minimum[8x16x32]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 8.902999994120364e-06,
+      "flops": 0,
+      "bytes_moved": 98304
+    },
+    {
+      "name": "add-scalar[8x16x32]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 8.022000002938512e-06,
+      "flops": 0,
+      "bytes_moved": 65536
+    },
+    {
+      "name": "mul-scalar[8x16x32]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 7.361000001537832e-06,
+      "flops": 0,
+      "bytes_moved": 65536
+    },
+    {
+      "name": "add-broadcast[32x1x64+1x16x64]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          32,
+          1,
+          64
+        ],
+        [
+          1,
+          16,
+          64
+        ]
+      ],
+      "seconds": 8.763300000680374e-05,
+      "flops": 0,
+      "bytes_moved": 40960
+    },
+    {
+      "name": "mul-broadcast[32x1x64*1x16x64]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          32,
+          1,
+          64
+        ],
+        [
+          1,
+          16,
+          64
+        ]
+      ],
+      "seconds": 1.254899999025838e-05,
+      "flops": 0,
+      "bytes_moved": 40960
+    },
+    {
+      "name": "addcmul-broadcast[32x1x64]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          32,
+          1,
+          64
+        ],
+        [
+          1,
+          16,
+          64
+        ],
+        [
+          32,
+          16,
+          64
+        ]
+      ],
+      "seconds": 2.1021000009113777e-05,
+      "flops": 0,
+      "bytes_moved": 548864
+    },
+    {
+      "name": "addcdiv-broadcast[32x1x64]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          32,
+          1,
+          64
+        ],
+        [
+          1,
+          16,
+          64
+        ],
+        [
+          32,
+          16,
+          64
+        ]
+      ],
+      "seconds": 3.419200000109868e-05,
+      "flops": 0,
+      "bytes_moved": 548864
+    },
+    {
+      "name": "eq[8x16x32]",
+      "category": "comparison",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 5.338000008237032e-06,
+      "flops": 0,
+      "bytes_moved": 98304
+    },
+    {
+      "name": "ne[8x16x32]",
+      "category": "comparison",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 4.816999989998294e-06,
+      "flops": 0,
+      "bytes_moved": 98304
+    },
+    {
+      "name": "lt[8x16x32]",
+      "category": "comparison",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 4.145999994875638e-06,
+      "flops": 0,
+      "bytes_moved": 98304
+    },
+    {
+      "name": "le[8x16x32]",
+      "category": "comparison",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 4.28600000645929e-06,
+      "flops": 0,
+      "bytes_moved": 98304
+    },
+    {
+      "name": "gt[8x16x32]",
+      "category": "comparison",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 4.126000007431685e-06,
+      "flops": 0,
+      "bytes_moved": 98304
+    },
+    {
+      "name": "ge[8x16x32]",
+      "category": "comparison",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 4.255999996871651e-06,
+      "flops": 0,
+      "bytes_moved": 98304
+    },
+    {
+      "name": "logical-and[8x16x32]",
+      "category": "comparison",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 2.4339999953326696e-06,
+      "flops": 0,
+      "bytes_moved": 98304
+    },
+    {
+      "name": "logical-or[8x16x32]",
+      "category": "comparison",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 2.494000000297092e-06,
+      "flops": 0,
+      "bytes_moved": 98304
+    },
+    {
+      "name": "logical-xor[8x16x32]",
+      "category": "comparison",
+      "input_shapes": [
+        [
+          8,
+          16,
+          32
+        ],
+        [
+          8,
+          16,
+          32
+        ]
+      ],
+      "seconds": 2.5639999989834905e-06,
+      "flops": 0,
+      "bytes_moved": 98304
+    },
+    {
+      "name": "fmod[256k]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          262144
+        ],
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0009866790000074843,
+      "flops": 0,
+      "bytes_moved": 6291456
+    },
+    {
+      "name": "remainder[256k]",
+      "category": "binary",
+      "input_shapes": [
+        [
+          262144
+        ],
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.001041651999997839,
+      "flops": 0,
+      "bytes_moved": 6291456
+    },
+    {
+      "name": "abs[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 2.8172999989806158e-05,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "acos[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.000282135999995603,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "acosh[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0007030499999984841,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "asin[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0002370670000004793,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "asinh[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0007951099999985445,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "atan[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00033482499999593074,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "atanh[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0004494679999993423,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "ceil[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 3.594400000395126e-05,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "cos[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0001938730000006217,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "cosh[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0003559669999901871,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "erf[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0003807840000007445,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "erfc[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0010290320000052589,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "exp[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00017277000000603948,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "expm1[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0003121209999932262,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "floor[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 3.5823999994022415e-05,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "frac[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 3.556400000093163e-05,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "log[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0001622449999985065,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "log10[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00017197900000098798,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "log1p[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00025687699999821234,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "log2[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00018017099999667607,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "neg[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 2.8142000005004775e-05,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "reciprocal[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 9.297999999091644e-05,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "round[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 3.597499998875264e-05,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "rsqrt[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00011687700001061785,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "sign[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 3.3751000003690024e-05,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "sin[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00016235500000050251,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "sinh[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00036670299999741474,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "sqrt[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 7.711599999993268e-05,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "square[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 2.861299999779021e-05,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "tan[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0002548739999923555,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "tanh[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0004452219999961926,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "trunc[256k]",
+      "category": "unary",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 3.586399999733203e-05,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "sum[1M]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1048576
+        ]
+      ],
+      "seconds": 5.0607000005697955e-05,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "mean[1M]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1048576
+        ]
+      ],
+      "seconds": 5.05360000033761e-05,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "max[1M]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1048576
+        ]
+      ],
+      "seconds": 7.067699999652177e-05,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "min[1M]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1048576
+        ]
+      ],
+      "seconds": 5.4230999992910256e-05,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "prod[1M]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1048576
+        ]
+      ],
+      "seconds": 5.025599999441965e-05,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "norm[1M]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1048576
+        ]
+      ],
+      "seconds": 4.903399999989233e-05,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "median[1M]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1048576
+        ]
+      ],
+      "seconds": 0.010543436000006068,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "sum-dim0[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.00018236500000057276,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "sum-dim1[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 5.533399999535504e-05,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "mean-dim0[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.00018127399999912086,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "mean-dim1[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 5.506299999069597e-05,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "max-dim1[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.0001368759999991198,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "min-dim1[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.00013795799999627434,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "norm-dim1[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.0007221900000047299,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "argmax-dim1[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.00037648800000056326,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "argmin-dim1[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.0004230779999971901,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "cumsum-dim1[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.0004209850000052029,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "all[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 3.1350000000429645e-06,
+      "flops": 0
+    },
+    {
+      "name": "any[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 3.1849999970745557e-06,
+      "flops": 0
+    },
+    {
+      "name": "all-dim1[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 9.223999995811027e-06,
+      "flops": 0
+    },
+    {
+      "name": "any-dim1[1024x1024]",
+      "category": "reduction",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 9.043999995128615e-06,
+      "flops": 0
+    },
+    {
+      "name": "mm[128x256x128]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          128,
+          256
+        ],
+        [
+          256,
+          128
+        ]
+      ],
+      "seconds": 0.0001317190000094115,
+      "flops": 8388608,
+      "bytes_moved": 786432
+    },
+    {
+      "name": "matmul[128x256x128]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          128,
+          256
+        ],
+        [
+          256,
+          128
+        ]
+      ],
+      "seconds": 0.0001279020000026776,
+      "flops": 8388608,
+      "bytes_moved": 786432
+    },
+    {
+      "name": "mm[256x256x256]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          256,
+          256
+        ],
+        [
+          256,
+          256
+        ]
+      ],
+      "seconds": 0.0004046810000062351,
+      "flops": 33554432,
+      "bytes_moved": 1572864
+    },
+    {
+      "name": "matmul[256x256x256]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          256,
+          256
+        ],
+        [
+          256,
+          256
+        ]
+      ],
+      "seconds": 0.00040189700000325956,
+      "flops": 33554432,
+      "bytes_moved": 1572864
+    },
+    {
+      "name": "mv[1024x1024]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ],
+        [
+          1024
+        ]
+      ],
+      "seconds": 0.00012903500000049917,
+      "flops": 0,
+      "bytes_moved": 16785408
+    },
+    {
+      "name": "dot[1M]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          1048576
+        ],
+        [
+          1048576
+        ]
+      ],
+      "seconds": 0.0004327430000046206,
+      "flops": 0,
+      "bytes_moved": 25165824
+    },
+    {
+      "name": "inner[4096x128]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          4096,
+          128
+        ],
+        [
+          4096,
+          128
+        ]
+      ],
+      "seconds": 0.044963660999997046,
+      "flops": 0,
+      "bytes_moved": 12582912
+    },
+    {
+      "name": "outer[4096]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          4096
+        ],
+        [
+          4096
+        ]
+      ],
+      "seconds": 0.006248405999997431,
+      "flops": 0,
+      "bytes_moved": 98304
+    },
+    {
+      "name": "addmm[256]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          256,
+          256
+        ],
+        [
+          256,
+          256
+        ],
+        [
+          256,
+          256
+        ]
+      ],
+      "seconds": 0.0004292179999936252,
+      "flops": 33554432,
+      "bytes_moved": 2097152
+    },
+    {
+      "name": "bmm[16x64x64]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          16,
+          64,
+          64
+        ],
+        [
+          16,
+          64,
+          64
+        ]
+      ],
+      "seconds": 0.00013391199999546188,
+      "flops": 8388608,
+      "bytes_moved": 1572864
+    },
+    {
+      "name": "baddbmm[16x64x64]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          16,
+          64,
+          64
+        ],
+        [
+          16,
+          64,
+          64
+        ],
+        [
+          16,
+          64,
+          64
+        ]
+      ],
+      "seconds": 0.00036395899999774883,
+      "flops": 8388608,
+      "bytes_moved": 2097152
+    },
+    {
+      "name": "addbmm[16x64x64]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          64,
+          64
+        ],
+        [
+          16,
+          64,
+          64
+        ],
+        [
+          16,
+          64,
+          64
+        ]
+      ],
+      "seconds": 0.00018249500000422358,
+      "flops": 0,
+      "bytes_moved": 1605632
+    },
+    {
+      "name": "linear[64x256x512]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          64,
+          256
+        ],
+        [
+          512,
+          256
+        ],
+        [
+          512
+        ]
+      ],
+      "seconds": 0.00020043300000338604,
+      "flops": 0,
+      "bytes_moved": 2232320
+    },
+    {
+      "name": "einsum-bmm[16x64x64]",
+      "category": "matmul",
+      "input_shapes": [
+        [
+          16,
+          64,
+          64
+        ],
+        [
+          16,
+          64,
+          64
+        ]
+      ],
+      "seconds": 0.00013837900000623904,
+      "flops": 8388608,
+      "bytes_moved": 1572864
+    },
+    {
+      "name": "relu[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 5.8638000012933844e-05,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "relu6[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 3.831799999431951e-05,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "gelu[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00040341900000839814,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "gelu-tanh[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0005250119999971048,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "silu[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00016946599998846068,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "hardswish[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 5.1708000000871834e-05,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "hardsigmoid[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 5.152800000018942e-05,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "leaky-relu[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 5.221800000754229e-05,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "elu[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.000587395999986029,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "celu[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.000912937000009606,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "selu[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.000892046000004143,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "mish[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0010507949999976063,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "softplus[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0007482779999889999,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "softsign[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00011079699999072545,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "tanhshrink[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0004868839999971897,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "hardtanh[256k]",
+      "category": "activation",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 3.1867999993551166e-05,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "softmax[1024x1024]",
+      "category": "normalization",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.0009034729999939373,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "log-softmax[1024x1024]",
+      "category": "normalization",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.0009993070000007265,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "softmax[256x256x256]",
+      "category": "normalization",
+      "input_shapes": [
+        [
+          256,
+          256,
+          256
+        ]
+      ],
+      "seconds": 0.015225679000010928,
+      "flops": 0,
+      "bytes_moved": 268435456
+    },
+    {
+      "name": "layer-norm[1024x1024]",
+      "category": "normalization",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ],
+        [
+          1024
+        ],
+        [
+          1024
+        ]
+      ],
+      "seconds": 0.000191329000003293,
+      "flops": 0,
+      "bytes_moved": 16793600
+    },
+    {
+      "name": "batch-norm[8x64x28x28]",
+      "category": "normalization",
+      "input_shapes": [
+        [
+          8,
+          64,
+          28,
+          28
+        ],
+        [
+          64
+        ],
+        [
+          64
+        ],
+        [
+          64
+        ],
+        [
+          64
+        ]
+      ],
+      "seconds": 7.338000000345346e-05,
+      "flops": 0,
+      "bytes_moved": 6424576
+    },
+    {
+      "name": "instance-norm[8x64x28x28]",
+      "category": "normalization",
+      "input_shapes": [
+        [
+          8,
+          64,
+          28,
+          28
+        ],
+        [
+          64
+        ],
+        [
+          64
+        ]
+      ],
+      "seconds": 0.00025326200000108656,
+      "flops": 0,
+      "bytes_moved": 6423552
+    },
+    {
+      "name": "normalize[1024x1024]",
+      "category": "normalization",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.0014519000000063897,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "conv1d-3[8x16x128]",
+      "category": "convolution",
+      "input_shapes": [
+        [
+          8,
+          16,
+          128
+        ],
+        [
+          32,
+          16,
+          3
+        ]
+      ],
+      "seconds": 0.001763661000012462,
+      "flops": 3145728,
+      "bytes_moved": 274432
+    },
+    {
+      "name": "conv2d-3x3[8x64x56x56]",
+      "category": "convolution",
+      "input_shapes": [
+        [
+          8,
+          64,
+          56,
+          56
+        ],
+        [
+          128,
+          64,
+          3,
+          3
+        ]
+      ],
+      "seconds": 1.7462876280000046,
+      "flops": 3699376128,
+      "bytes_moved": 26279936
+    },
+    {
+      "name": "conv2d-1x1[8x64x56x56]",
+      "category": "convolution",
+      "input_shapes": [
+        [
+          8,
+          64,
+          56,
+          56
+        ],
+        [
+          128,
+          64,
+          1,
+          1
+        ]
+      ],
+      "seconds": 0.48478242900000623,
+      "flops": 411041792,
+      "bytes_moved": 25755648
+    },
+    {
+      "name": "conv2d-7x7[2x3x224x224]",
+      "category": "convolution",
+      "input_shapes": [
+        [
+          2,
+          3,
+          224,
+          224
+        ],
+        [
+          64,
+          3,
+          7,
+          7
+        ]
+      ],
+      "seconds": 0.18110471699999664,
+      "flops": 1888223232,
+      "bytes_moved": 4892160
+    },
+    {
+      "name": "conv2d-relu[8x64x56x56]",
+      "category": "convolution",
+      "input_shapes": [
+        [
+          8,
+          64,
+          56,
+          56
+        ],
+        [
+          128,
+          64,
+          3,
+          3
+        ]
+      ],
+      "seconds": 1.7327040929999953,
+      "flops": 3699376128,
+      "bytes_moved": 26279936
+    },
+    {
+      "name": "avg-pool1d[8x16x128]",
+      "category": "pool",
+      "input_shapes": [
+        [
+          8,
+          16,
+          128
+        ]
+      ],
+      "seconds": 5.9069000002409666e-05,
+      "flops": 0,
+      "bytes_moved": 262144
+    },
+    {
+      "name": "max-pool1d[8x16x128]",
+      "category": "pool",
+      "input_shapes": [
+        [
+          8,
+          16,
+          128
+        ]
+      ],
+      "seconds": 6.230400001072667e-05,
+      "flops": 0,
+      "bytes_moved": 262144
+    },
+    {
+      "name": "avg-pool2d[8x64x56x56]",
+      "category": "pool",
+      "input_shapes": [
+        [
+          8,
+          64,
+          56,
+          56
+        ]
+      ],
+      "seconds": 0.0008567120000009254,
+      "flops": 0,
+      "bytes_moved": 25690112
+    },
+    {
+      "name": "max-pool2d[8x64x56x56]",
+      "category": "pool",
+      "input_shapes": [
+        [
+          8,
+          64,
+          56,
+          56
+        ]
+      ],
+      "seconds": 0.003950097000000596,
+      "flops": 0,
+      "bytes_moved": 25690112
+    },
+    {
+      "name": "adaptive-avg-pool2d[8x64x56x56]",
+      "category": "pool",
+      "input_shapes": [
+        [
+          8,
+          64,
+          56,
+          56
+        ]
+      ],
+      "seconds": 0.000455877999996801,
+      "flops": 0,
+      "bytes_moved": 25690112
+    },
+    {
+      "name": "adaptive-max-pool2d[8x64x56x56]",
+      "category": "pool",
+      "input_shapes": [
+        [
+          8,
+          64,
+          56,
+          56
+        ]
+      ],
+      "seconds": 0.0011916469999988522,
+      "flops": 0,
+      "bytes_moved": 25690112
+    },
+    {
+      "name": "interpolate-nearest[8x64x56x56]",
+      "category": "pool",
+      "input_shapes": [
+        [
+          8,
+          64,
+          56,
+          56
+        ]
+      ],
+      "seconds": 0.0005030290000007653,
+      "flops": 0,
+      "bytes_moved": 25690112
+    },
+    {
+      "name": "channel-shuffle[8x64x56x56]",
+      "category": "pool",
+      "input_shapes": [
+        [
+          8,
+          64,
+          56,
+          56
+        ]
+      ],
+      "seconds": 0.00022415799999464525,
+      "flops": 0,
+      "bytes_moved": 25690112
+    },
+    {
+      "name": "embedding[1024x4096x128]",
+      "category": "indexing",
+      "input_shapes": [
+        [
+          4096,
+          128
+        ],
+        [
+          1024
+        ]
+      ],
+      "seconds": 1.890900000489637e-05,
+      "flops": 0,
+      "bytes_moved": 8396800
+    },
+    {
+      "name": "embedding-bag[32x8x128]",
+      "category": "indexing",
+      "input_shapes": [
+        [
+          4096,
+          128
+        ],
+        [
+          256
+        ],
+        [
+          32
+        ]
+      ],
+      "seconds": 1.627500000722648e-05,
+      "flops": 0,
+      "bytes_moved": 8390912
+    },
+    {
+      "name": "index-select[1024x512]",
+      "category": "indexing",
+      "input_shapes": [
+        [
+          4096,
+          512
+        ],
+        [
+          1024
+        ]
+      ],
+      "seconds": 8.78329999949301e-05,
+      "flops": 0,
+      "bytes_moved": 33562624
+    },
+    {
+      "name": "gather-dim0[1024x512]",
+      "category": "indexing",
+      "input_shapes": [
+        [
+          4096,
+          512
+        ],
+        [
+          1024,
+          512
+        ]
+      ],
+      "seconds": 0.0012899350000026288,
+      "flops": 0,
+      "bytes_moved": 37748736
+    },
+    {
+      "name": "gather-dim1[4096x128]",
+      "category": "indexing",
+      "input_shapes": [
+        [
+          4096,
+          512
+        ],
+        [
+          4096,
+          128
+        ]
+      ],
+      "seconds": 0.0011483919999903947,
+      "flops": 0,
+      "bytes_moved": 37748736
+    },
+    {
+      "name": "cat-dim0[2x32x64x28x28]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          32,
+          64,
+          28,
+          28
+        ]
+      ],
+      "seconds": 0.000918755000000715,
+      "flops": 0,
+      "bytes_moved": 25690112
+    },
+    {
+      "name": "cat-dim1[32x128x28x28]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          32,
+          64,
+          28,
+          28
+        ]
+      ],
+      "seconds": 0.0006857040000056713,
+      "flops": 0,
+      "bytes_moved": 25690112
+    },
+    {
+      "name": "stack-dim0[2x32x64x28x28]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          32,
+          64,
+          28,
+          28
+        ]
+      ],
+      "seconds": 0.0009097920000016302,
+      "flops": 0,
+      "bytes_moved": 25690112
+    },
+    {
+      "name": "transpose-copy[1024x1024]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.0016037890000006882,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "permute-copy[32x28x28x64]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          32,
+          64,
+          28,
+          28
+        ]
+      ],
+      "seconds": 0.0006541469999916671,
+      "flops": 0,
+      "bytes_moved": 25690112
+    },
+    {
+      "name": "movedim-copy[32x28x28x64]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          32,
+          64,
+          28,
+          28
+        ]
+      ],
+      "seconds": 0.0006034600000077717,
+      "flops": 0,
+      "bytes_moved": 25690112
+    },
+    {
+      "name": "reshape[1024x1024]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 1.6430000044920234e-06,
+      "flops": 0
+    },
+    {
+      "name": "split[1024x1024]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 4.316000001836073e-06,
+      "flops": 0
+    },
+    {
+      "name": "chunk[1024x1024]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 3.824999993184974e-06,
+      "flops": 0
+    },
+    {
+      "name": "diagonal[1024x1024]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 1.44199999851935e-06,
+      "flops": 0
+    },
+    {
+      "name": "diag[4096]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          4096
+        ]
+      ],
+      "seconds": 0.001750529999995365,
+      "flops": 0
+    },
+    {
+      "name": "unbind[32x64x28x28]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          32,
+          64,
+          28,
+          28
+        ]
+      ],
+      "seconds": 2.249399999243451e-05,
+      "flops": 0
+    },
+    {
+      "name": "broadcast-to[64x1024]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          1,
+          1024
+        ]
+      ],
+      "seconds": 1.4720000081069884e-06,
+      "flops": 0
+    },
+    {
+      "name": "repeat[64x1024]",
+      "category": "layout",
+      "input_shapes": [
+        [
+          1,
+          1024
+        ]
+      ],
+      "seconds": 0.00025296200000468616,
+      "flops": 0,
+      "bytes_moved": 16384
+    },
+    {
+      "name": "where[256k]",
+      "category": "misc",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.00013811799999530194,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "masked-select[256k]",
+      "category": "misc",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0010354619999901615,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "clamp[256k]",
+      "category": "misc",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 2.7720999995040074e-05,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "pow2[256k]",
+      "category": "misc",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 2.802199999507593e-05,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "dropout[256k]",
+      "category": "misc",
+      "input_shapes": [
+        [
+          262144
+        ]
+      ],
+      "seconds": 0.0014453599999910693,
+      "flops": 0,
+      "bytes_moved": 4194304
+    },
+    {
+      "name": "arange[1M]",
+      "category": "misc",
+      "input_shapes": [
+        [
+          1
+        ]
+      ],
+      "seconds": 0.000574346999997033,
+      "flops": 0,
+      "bytes_moved": 16
+    },
+    {
+      "name": "topk8[1024x1024]",
+      "category": "sorting",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.0011981869999999617,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "sort[1024x1024]",
+      "category": "sorting",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.03022814000000551,
+      "flops": 0,
+      "bytes_moved": 16777216
+    },
+    {
+      "name": "argsort[1024x1024]",
+      "category": "sorting",
+      "input_shapes": [
+        [
+          1024,
+          1024
+        ]
+      ],
+      "seconds": 0.030216092000003414,
+      "flops": 0,
+      "bytes_moved": 16777216
+    }
+  ]
+}
