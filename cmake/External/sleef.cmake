@@ -48,6 +48,12 @@ endif()
 # install-prefix cache entry SLEEF's own configure checks; the private
 # prefix keeps the vendored tree's install rules out of the project's.
 function(_tp_add_vendored_sleef)
+    set(TP_SAVED_C_LAUNCHER "${CMAKE_C_COMPILER_LAUNCHER}")
+    set(TP_SAVED_CXX_LAUNCHER "${CMAKE_CXX_COMPILER_LAUNCHER}")
+    set(TP_SAVED_CUDA_LAUNCHER "${CMAKE_CUDA_COMPILER_LAUNCHER}")
+    set(CMAKE_C_COMPILER_LAUNCHER "")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "")
+    set(CMAKE_CUDA_COMPILER_LAUNCHER "")
     set(TP_SAVED_INSTALL_PREFIX "${CMAKE_INSTALL_PREFIX}")
     set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/third_party/sleef-prefix"
         CACHE PATH "" FORCE)
@@ -104,6 +110,9 @@ function(_tp_add_vendored_sleef)
     set(CMAKE_INSTALL_PREFIX "${TP_SAVED_INSTALL_PREFIX}"
         CACHE PATH "" FORCE)
     set(CMAKE_DISABLE_FIND_PACKAGE_PkgConfig OFF)
+    set(CMAKE_C_COMPILER_LAUNCHER "${TP_SAVED_C_LAUNCHER}")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${TP_SAVED_CXX_LAUNCHER}")
+    set(CMAKE_CUDA_COMPILER_LAUNCHER "${TP_SAVED_CUDA_LAUNCHER}")
 endfunction()
 
 _tp_add_vendored_sleef()
