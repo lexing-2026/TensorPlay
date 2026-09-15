@@ -89,7 +89,7 @@ function(_tp_add_vendored_sleef)
         "${CMAKE_CURRENT_LIST_DIR}/../../third_party/sleef"
         "${CMAKE_BINARY_DIR}/third_party/sleef")
     if(NOT SLEEF_BUILD_TESTS)
-        foreach(_TP_SLEEF_TEST_HELPER testerutil_obj qtesterutil_obj)
+        foreach(_TP_SLEEF_TEST_HELPER psha_obj testerutil_obj qtesterutil_obj)
             if(TARGET ${_TP_SLEEF_TEST_HELPER})
                 set_property(
                     TARGET ${_TP_SLEEF_TEST_HELPER}
