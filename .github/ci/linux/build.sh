@@ -21,6 +21,11 @@ source "$ENV_FILE"
 
 python3 "${SCRIPTPATH}/build_install_deps.py" "${REPO_ROOT}"
 
+# Start one cache server before Ninja launches parallel compiler
+# clients; the script retries transient startup failures instead of
+# aborting the build.
+bash "${SCRIPTPATH}/../warm_sccache.sh"
+
 cd "${REPO_ROOT}"
 # Build into a raw directory first. CPU wheels are then repacked through
 # auditwheel: it bundles the libraries the manylinux policy requires to
