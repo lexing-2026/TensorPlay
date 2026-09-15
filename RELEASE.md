@@ -86,25 +86,29 @@ Milestones bucket work per release (`v1.0.0`, `v1.1.0`, ...) and carry **no
 due dates**. `milestone-guard.yml` auto-assigns the milestone derived from
 `version.txt` to PRs that lack one.
 
-## Project board setup (manual, UI)
+## Project board (set up 2026-09-15)
 
-The automation token cannot create ProjectsV2 boards (GraphQL write returns
-403), so create the board once in the GitHub UI:
+The board exists and is wired up; this section records the current state and
+the token constraint discovered during setup.
 
-1. New project (board) named **TensorPlay Roadmap**, owned by `lexing-2026`.
-2. Fields:
-   - `Status` (built-in): Todo / In Progress / Done.
-   - `Priority`: single select — High / Medium / Low.
-   - `Milestone`: single select — v1.0.0 / v1.1.0 (extend per release).
-3. Views:
-   - **Status board**: board layout grouped by `Status`.
-   - **By milestone**: table layout grouped by `Milestone`.
-   - **Priority**: table layout grouped by `Priority`.
-4. Update the project URL in `.github/workflows/add-to-project.yml`
-   (replace `<NUMBER>`).
-5. Create a fine-grained PAT with read/write access to the project and store
-   it as the `PROJECT_TOKEN` repository secret; `add-to-project.yml` no-ops
-   until the secret exists.
+- Board: **TensorPlay Roadmap** —
+  <https://github.com/users/lexing-2026/projects/3>, owned by `lexing-2026`,
+  **public**.
+- Fields: `Status` (Todo / In Progress / In Review / Done), `Priority`
+  (High / Medium / Low). Release tracking uses the built-in `Milestone`
+  field synced from GitHub milestones; there is no separate project-level
+  milestone field.
+- Views: **Status board** (board by `Status`), **By milestone** (table by
+  `Milestone`), **Priority** (table by `Priority`).
+- Automation:
+  - `add-to-project.yml` adds every new issue and PR to the board.
+  - `project-status-sync.yml` keeps `Status` in sync with events (issue
+    assigned/closed, PR ready for review/review requested/merged).
+- `PROJECT_TOKEN` secret: a classic PAT with **only** the `project` scope.
+  Fine-grained PATs cannot be used for ProjectsV2 automation — their
+  permission catalog has no Projects entry, so GraphQL mutations are
+  unauthorized. Rotate this token before its expiry (it is generated without
+  one); when rotating, also confirm the `project` scope is the only one.
 
 ## Branch protection setup (manual, UI)
 
