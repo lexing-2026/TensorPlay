@@ -11,9 +11,9 @@
 # A stale server (possible on reused runners) would keep the cache
 # backend configuration it was started with, so it is stopped first.
 # "Address in use" from a start attempt means a server is already
-# listening, which is the goal as well. A warm-up that exhausts its
-# retries is not fatal: the build then falls back to the on-demand
-# bootstrap it would have done without this script.
+# listening, which is the goal as well. A warm-up that cannot get a real
+# server response is fatal. Letting compiler clients fall back to
+# independent startup attempts recreates the race this script prevents.
 
 set -u
 
@@ -27,10 +27,13 @@ sccache --stop-server >/dev/null 2>&1 || true
 start_log="$(mktemp)"
 trap 'rm -f "$start_log"' EXIT
 
-for _ in 1 2 3 4 5; do
+started=false
+for _ in 1 2 3; do
     if sccache --start-server 2>"$start_log"; then
+        started=true
         break
     elif grep -q "Address in use" "$start_log"; then
+        started=true
         break
     fi
     echo "sccache server warm-up failed, retrying:" >&2
@@ -38,5 +41,24 @@ for _ in 1 2 3 4 5; do
     sleep 5
 done
 
-sccache --zero-stats >/dev/null 2>&1 || true
-exit 0
+if [[ "$started" != true ]]; then
+    echo "sccache server did not start" >&2
+    if [[ -n "${SCCACHE_ERROR_LOG:-}" && -f "$SCCACHE_ERROR_LOG" ]]; then
+        tail -50 "$SCCACHE_ERROR_LOG" >&2
+    fi
+    exit 1
+fi
+
+for _ in 1 2 3 4 5 6; do
+    if sccache --zero-stats >/dev/null 2>>"$start_log"; then
+        exit 0
+    fi
+    sleep 5
+done
+
+echo "sccache server did not become ready" >&2
+cat "$start_log" >&2
+if [[ -n "${SCCACHE_ERROR_LOG:-}" && -f "$SCCACHE_ERROR_LOG" ]]; then
+    tail -50 "$SCCACHE_ERROR_LOG" >&2
+fi
+exit 1
