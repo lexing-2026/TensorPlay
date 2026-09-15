@@ -33,9 +33,15 @@ jobs:
     # This dedicated workflow provides the operator benchmark trigger.
     # pull.yml still runs the same gate for source changes, because a
     # protected required check cannot be path-filtered safely.
+    # The permissions must cover the reusable workflow's release job
+    # (contents/id-token/attestations write), even though that job is
+    # disabled here via upload_release: false; GitHub rejects the whole
+    # call with a startup failure when the caller grants less.
     permissions:
-      contents: read
+      contents: write
       actions: read
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/_binary-build-test.yml
     with:
       build_name: tensorplay-cpu-operator
