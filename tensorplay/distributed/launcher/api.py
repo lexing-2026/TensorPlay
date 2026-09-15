@@ -110,7 +110,7 @@ def _get_addr_and_port(
     addr = "127.0.0.1"
     if port is None:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("", 0))
+            sock.bind(("127.0.0.1", 0))
             port = int(sock.getsockname()[1])
     return addr, port
 
