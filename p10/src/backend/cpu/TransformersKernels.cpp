@@ -947,7 +947,7 @@ std::tuple<Tensor, Tensor> sdpa_flash_cpu_kernel(
           double s = -INFINITY;
           if (j < visible) {
             s = 0.0;
-            for (int64_t d = 0; d < D; ++d) s += qh[t * D + d] * kh[j * D + d];
+            for (int64_t d = 0; d < D; ++d) s += static_cast<double>(qh[t * D + d]) * kh[j * D + d];
             s *= scale_val;
             if (has_mask4d) s += static_cast<double>(mh[t * Skv + j]);
             else if (has_mask2d) s += static_cast<double>(m2[t * Skv + j]);
@@ -1063,7 +1063,7 @@ std::tuple<Tensor, Tensor, Tensor> sdpa_flash_backward_cpu_kernel(
           double s = -INFINITY;
           if (j < visible) {
             s = 0.0;
-            for (int64_t d = 0; d < D; ++d) s += qh[t * D + d] * kh[j * D + d];
+            for (int64_t d = 0; d < D; ++d) s += static_cast<double>(qh[t * D + d]) * kh[j * D + d];
             s *= scale_val;
             if (has_mask4d) s += static_cast<double>(mh[t * Skv + j]);
             else if (has_mask2d) s += static_cast<double>(m2[t * Skv + j]);
