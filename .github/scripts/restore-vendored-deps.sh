@@ -22,10 +22,19 @@ mkdir -p "$DEST"
 
 clone_pin() {
     local dir="$1" url="$2" rev="$3"
-    if [[ -d "$DEST/$dir/.git" ]] && [[ "$(git -C "$DEST/$dir" rev-parse HEAD)" == "$rev" ]]; then
+    if [[ -e "$DEST/$dir/.git" ]] && [[ "$(git -C "$DEST/$dir" rev-parse HEAD)" == "$rev" ]]; then
         return 0
     fi
-    if [[ ! -d "$DEST/$dir/.git" ]]; then
+    # A flattened frozen snapshot (content without .git) is authoritative:
+    # leave it in place instead of failing the clone into a non-empty
+    # directory. An empty directory is not a snapshot -- checkouts with
+    # submodules disabled leave empty placeholder dirs at the gitlink paths,
+    # and cloning into those is exactly what must happen.
+    if [[ -d "$DEST/$dir" && ! -e "$DEST/$dir/.git" ]] \
+       && [[ -n "$(ls -A "$DEST/$dir" 2>/dev/null)" ]]; then
+        return 0
+    fi
+    if [[ ! -e "$DEST/$dir/.git" ]]; then
         echo "::group::Clone $dir @ ${rev:0:12}"
         git -C "$DEST" clone --filter=blob:none "$url" "$dir"
         git -C "$DEST/$dir" -c advice.detachedHead=false checkout "$rev"
@@ -72,7 +81,16 @@ if [[ "$nnpack_supported" == "1" ]]; then
     # vendored Python sources stay under third_party/, never the host env.
     python_pin() {
         local dir="$1" url="$2" rev="$3"
-        if [[ ! -d "$DEST/$dir/.git" ]]; then
+        if [[ -e "$DEST/$dir/.git" ]] && [[ "$(git -C "$DEST/$dir" rev-parse HEAD)" == "$rev" ]]; then
+            return 0
+        fi
+        # Same flattened-snapshot tolerance as clone_pin above; an empty
+        # placeholder dir is not a snapshot and must be cloned into.
+        if [[ -d "$DEST/$dir" && ! -e "$DEST/$dir/.git" ]] \
+           && [[ -n "$(ls -A "$DEST/$dir" 2>/dev/null)" ]]; then
+            return 0
+        fi
+        if [[ ! -e "$DEST/$dir/.git" ]]; then
             echo "::group::Clone $dir @ ${rev:0:12}"
             git -C "$DEST" clone --filter=blob:none "$url" "$dir"
             git -C "$DEST/$dir" -c advice.detachedHead=false checkout "$rev"
@@ -87,11 +105,21 @@ fi
 # --- distributed transports (gloo + tensorpipe) ---
 clone_pin gloo https://github.com/pytorch/gloo 44651678bdc9ffc837181295acdd142ae7880ad9
 clone_pin tensorpipe https://github.com/pytorch/tensorpipe 2b4cd91092d335a697416b2a3cb398283246849d
-if [[ -d "$DEST/tensorpipe/.git" && ! -f "$DEST/tensorpipe/third_party/libuv/CMakeLists.txt" ]]; then
+if [[ -e "$DEST/tensorpipe/.git" && ! -f "$DEST/tensorpipe/third_party/libuv/CMakeLists.txt" ]]; then
     echo "::group::Init tensorpipe submodules (libuv/libnop/pybind11)"
     # --force: the libuv submodule tracks a branch (v1.x), and a shallow
     # first update leaves its worktree empty without it.
     git -C "$DEST/tensorpipe" submodule update --init --force --depth 1
+    echo "::endgroup::"
+fi
+# A flattened tensorpipe snapshot (a frozen checkout without .git) cannot
+# run submodule update; fill its libuv slot from the pinned upstream when
+# the slot is empty. An already-filled slot is left as it stands.
+if [[ -d "$DEST/tensorpipe" && ! -e "$DEST/tensorpipe/.git" \
+      && ! -f "$DEST/tensorpipe/third_party/libuv/CMakeLists.txt" ]]; then
+    echo "::group::Fill flattened tensorpipe's libuv slot @ 5152db2c"
+    git clone --filter=blob:none https://github.com/libuv/libuv "$DEST/tensorpipe/third_party/libuv"
+    git -C "$DEST/tensorpipe/third_party/libuv" -c advice.detachedHead=false checkout 5152db2cbfeb5582e9c27c5ea1dba2cd9e10759b
     echo "::endgroup::"
 fi
 
@@ -102,13 +130,14 @@ fi
 # snapshot without .git (leave it in place instead of failing the clone).
 clone_into() {
     local dir="$1" url="$2" rev="$3"
-    if [[ -d "$DEST/$dir/.git" ]] && [[ "$(git -C "$DEST/$dir" rev-parse HEAD)" == "$rev" ]]; then
+    if [[ -e "$DEST/$dir/.git" ]] && [[ "$(git -C "$DEST/$dir" rev-parse HEAD)" == "$rev" ]]; then
         return 0
     fi
-    if [[ -e "$DEST/$dir" && ! -d "$DEST/$dir/.git" ]]; then
+    if [[ -d "$DEST/$dir" && ! -e "$DEST/$dir/.git" ]] \
+       && [[ -n "$(ls -A "$DEST/$dir" 2>/dev/null)" ]]; then
         return 0
     fi
-    if [[ ! -d "$DEST/$dir/.git" ]]; then
+    if [[ ! -e "$DEST/$dir/.git" ]]; then
         echo "::group::Clone $dir @ ${rev:0:12}"
         git -C "$DEST" clone --filter=blob:none "$url" "$dir"
         git -C "$DEST/$dir" -c advice.detachedHead=false checkout "$rev"
