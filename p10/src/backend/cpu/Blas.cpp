@@ -101,12 +101,14 @@ void bmm_accumulate(const Tensor& batch1, const Tensor& batch2, int64_t bi,
 }
 
 // out = beta * self_b + alpha * work, evaluated in double like the scalar
-// epilogues of the other low-precision GEMM paths.
-template <typename T>
+// epilogues of the other low-precision GEMM paths.  Acc is the workspace
+// element type: float for half/bfloat16/float32 reductions, double for
+// float64.
+template <typename T, typename Acc>
 void addbmm_epilogue(Tensor& out, const Tensor& self_acc, const Tensor& work,
                      double beta, double alpha) {
     const T* sp = self_acc.data_ptr<T>();
-    const float* wp = work.data_ptr<float>();
+    const Acc* wp = work.data_ptr<Acc>();
     T* op = out.data_ptr<T>();
     const int64_t total = out.numel();
     parallel_for(0, total, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
@@ -248,10 +250,17 @@ Tensor addbmm_cpu(const Tensor& self, const Tensor& batch1, const Tensor& batch2
 #endif
 
     // Half/BFloat16 (and no-BLAS builds): accumulate the cross-batch sum in
-    // a float workspace, then apply beta/alpha in one epilogue pass.
-    Tensor work = Tensor::zeros({n, m}, DType::Float32, self.device());
-    Tensor b1 = batch1.contiguous();
-    Tensor b2 = batch2.contiguous();
+    // a workspace held at the reduction's opmath precision (float, or double
+    // for float64 inputs -- the workspace dtype must track the accumulator,
+    // or the accumulate pass writes past the allocation), then apply
+    // beta/alpha in one epilogue pass.  Both factors are converted to the
+    // compute dtype up front so the accumulate pass reads them at one width.
+    const DType work_dt = dt == DType::Float64 ? DType::Float64 : DType::Float32;
+    Tensor work = Tensor::zeros({n, m}, work_dt, self.device());
+    Tensor b1 = batch1.dtype() == dt ? batch1.contiguous()
+                                     : batch1.to(dt).contiguous();
+    Tensor b2 = batch2.dtype() == dt ? batch2.contiguous()
+                                     : batch2.to(dt).contiguous();
     for (int64_t bi = 0; bi < b; ++bi) {
         switch (b1.dtype()) {
             case DType::Float32:
@@ -277,13 +286,13 @@ Tensor addbmm_cpu(const Tensor& self, const Tensor& batch1, const Tensor& batch2
         : detail::contiguous_clone(self.expand({n, m}).to(dt));
     Tensor out = Tensor::empty({n, m}, dt, self.device());
     if (dt == DType::Float32) {
-        addbmm_epilogue<float>(out, self_acc, work, beta_v, alpha_v);
+        addbmm_epilogue<float, float>(out, self_acc, work, beta_v, alpha_v);
     } else if (dt == DType::Float64) {
-        addbmm_epilogue<double>(out, self_acc, work, beta_v, alpha_v);
+        addbmm_epilogue<double, double>(out, self_acc, work, beta_v, alpha_v);
     } else if (dt == DType::Float16) {
-        addbmm_epilogue<Half>(out, self_acc, work, beta_v, alpha_v);
+        addbmm_epilogue<Half, float>(out, self_acc, work, beta_v, alpha_v);
     } else if (dt == DType::BFloat16) {
-        addbmm_epilogue<BFloat16>(out, self_acc, work, beta_v, alpha_v);
+        addbmm_epilogue<BFloat16, float>(out, self_acc, work, beta_v, alpha_v);
     } else {
         TP_THROW(TypeError, "addbmm: unsupported dtype");
     }

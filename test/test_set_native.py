@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 
 import tensorplay as tp
@@ -53,3 +54,45 @@ def test_set_storage_rejects_unchanged_geometry_out_of_bounds():
     target = tp.empty((2,), dtype=tp.float32)
     with pytest.raises(RuntimeError, match="out of bounds"):
         target.set_(tp.UntypedStorage(1), 0, [2])
+
+
+_TP_DTYPE = {
+    np.float16: tp.float16,
+    np.float32: tp.float32,
+    np.float64: tp.float64,
+}
+
+
+def test_addbmm_dtype_promotion_and_broadcast():
+    rng = np.random.default_rng(7)
+    cases = (
+        (np.float32, np.float32),
+        (np.float64, np.float64),
+        # Mixed factors promote to the wider element type.
+        (np.float64, np.float32),
+        (np.float32, np.float64),
+        # The half pair runs the accumulate-fallback path on every build.
+        (np.float16, np.float16),
+    )
+    for seed_dt, factor_dt in cases:
+        batch1 = tp.tensor(rng.standard_normal((4, 8, 16)).astype(factor_dt) * 0.5)
+        batch2 = tp.tensor(rng.standard_normal((4, 16, 8)).astype(factor_dt) * 0.5)
+        seed = tp.tensor(rng.standard_normal((8, 8)).astype(seed_dt) * 0.5)
+        got = tp.addbmm(seed, batch1, batch2, beta=1.5, alpha=0.5)
+
+        assert tuple(got.shape) == (8, 8)
+        assert got.dtype == _TP_DTYPE[factor_dt]
+
+        want = 1.5 * seed.numpy().astype(np.float64)
+        for i in range(4):
+            want = want + 0.5 * (
+                batch1.numpy()[i].astype(np.float64)
+                @ batch2.numpy()[i].astype(np.float64)
+            )
+        actual = got.numpy().astype(np.float64)
+        if factor_dt is np.float16:
+            assert np.allclose(actual, want, rtol=1e-2, atol=5e-2)
+        elif factor_dt is np.float32:
+            assert np.allclose(actual, want, rtol=1e-4, atol=1e-4)
+        else:
+            assert np.allclose(actual, want, rtol=1e-12, atol=1e-12)
