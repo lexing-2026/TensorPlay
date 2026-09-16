@@ -140,13 +140,16 @@ packages = ["tensorplay"]
 # scikit-build-core automatically includes files in wheel.packages
 # We can use exclude to be safe
 # tensorplay/include must NOT be excluded: it carries the runtime headers the
-# JIT kernel generation compiles against in installed environments.
+# JIT kernel generation compiles against in installed environments.  The bare
+# "include"/"share" entries are anchored to the wheel root ("/include") —
+# unanchored patterns match at any depth and would also strip the nested
+# tensorplay/include payload.
 exclude = [
     "tensorplay/share",
     "tensorplay/lib/cmake",
     "tensorplay/lib/*.lib",
-    "include",
-    "share",
+    "/include",
+    "/share",
     "lib/cmake",
     "lib/*.lib" 
 ]
