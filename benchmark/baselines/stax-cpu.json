@@ -12,9 +12,9 @@
       "hidden": 512,
       "eager_seconds": 0.0003089959999442726,
       "compiled_seconds": 0.0002537419999271151,
-      "compile_seconds": 0.0018421510000052876,
+      "compile_seconds": 0.001850997999952142,
       "first_pass_seconds": 0.005023887999982435,
-      "speedup": 1.0317073631397042,
+      "speedup": 1.1381138055645588,
       "codegens": [
         "stax-native"
       ]
@@ -27,9 +27,9 @@
       "hidden": 1024,
       "eager_seconds": 0.001087064999978793,
       "compiled_seconds": 0.001089179000018703,
-      "compile_seconds": 8.235199999262477e-05,
+      "compile_seconds": 0.00014073199997710617,
       "first_pass_seconds": 0.007255724999936319,
-      "speedup": 1.0086824374825691,
+      "speedup": 1.0114036741983896,
       "codegens": [
         "stax-native"
       ]
@@ -42,9 +42,9 @@
       "hidden": 1024,
       "eager_seconds": 0.0011418369999773859,
       "compiled_seconds": 0.001866716999984419,
-      "compile_seconds": 8.220199998731914e-05,
+      "compile_seconds": 0.00012947700002996498,
       "first_pass_seconds": 0.013349156000003859,
-      "speedup": 0.911831627551633,
+      "speedup": 0.8709115198696386,
       "codegens": [
         "stax-native"
       ]
@@ -57,9 +57,9 @@
       "hidden": 1024,
       "eager_seconds": 0.001069111999981942,
       "compiled_seconds": 0.0010557360000120752,
-      "compile_seconds": 9.90660000184107e-05,
-      "first_pass_seconds": 0.018235346000096797,
-      "speedup": 1.0057311335175159,
+      "compile_seconds": 0.0001293070000087937,
+      "first_pass_seconds": 0.02262027400001898,
+      "speedup": 0.9854115886276031,
       "codegens": [
         "stax-native"
       ]
@@ -72,9 +72,9 @@
       "hidden": 1024,
       "eager_seconds": 0.0011463549999461975,
       "compiled_seconds": 0.0011353239999607467,
-      "compile_seconds": 0.00010161000000152853,
+      "compile_seconds": 0.0001253679999990709,
       "first_pass_seconds": 0.00722416600001452,
-      "speedup": 0.9991341896904851,
+      "speedup": 1.0609330296367594,
       "codegens": [
         "stax-native"
       ]
@@ -87,9 +87,9 @@
       "hidden": 2048,
       "eager_seconds": 0.0019342730000744268,
       "compiled_seconds": 0.001305231000060303,
-      "compile_seconds": 9.236699997927644e-05,
+      "compile_seconds": 0.00012602699996477895,
       "first_pass_seconds": 0.010591178000026957,
-      "speedup": 1.017016680848398,
+      "speedup": 0.996278758989097,
       "codegens": [
         "stax-native"
       ]
@@ -102,9 +102,9 @@
       "hidden": 512,
       "eager_seconds": 0.0006213769999021679,
       "compiled_seconds": 0.00030713199998899654,
-      "compile_seconds": 6.782099995916724e-05,
+      "compile_seconds": 0.00011407300002019838,
       "first_pass_seconds": 0.007135091000009197,
-      "speedup": 1.0881841036251663,
+      "speedup": 1.116253743744473,
       "codegens": [
         "stax-native"
       ]
@@ -117,9 +117,9 @@
       "hidden": 256,
       "eager_seconds": 0.00026501399997869157,
       "compiled_seconds": 0.0002772870000171679,
-      "compile_seconds": 8.240300007855694e-05,
-      "first_pass_seconds": 0.005287048000013783,
-      "speedup": 1.0308762902074138,
+      "compile_seconds": 0.00010170299998435439,
+      "first_pass_seconds": 0.005343535000008615,
+      "speedup": 1.0267260198942736,
       "codegens": [
         "stax-native"
       ]
@@ -132,9 +132,9 @@
       "hidden": 512,
       "eager_seconds": 0.00035021200005758146,
       "compiled_seconds": 0.00034304999996948027,
-      "compile_seconds": 6.325699996523326e-05,
-      "first_pass_seconds": 0.004040797000016028,
-      "speedup": 1.0431255337685572,
+      "compile_seconds": 9.765599997990648e-05,
+      "first_pass_seconds": 0.004200379000053545,
+      "speedup": 1.0629408847308026,
       "codegens": [
         "stax-native"
       ]
@@ -147,9 +147,9 @@
       "hidden": 1024,
       "eager_seconds": 0.0010581310000361555,
       "compiled_seconds": 0.0009437680000701221,
-      "compile_seconds": 8.913599992865784e-05,
+      "compile_seconds": 0.00010858299998517396,
       "first_pass_seconds": 7.424388946000022,
-      "speedup": 1.0185763121933318,
+      "speedup": 1.0273793952671024,
       "codegens": [
         "stax-fused-cpu-segments"
       ]
