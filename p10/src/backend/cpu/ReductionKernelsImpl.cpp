@@ -2849,6 +2849,7 @@ std::tuple<Tensor, Tensor> max_dim_kernel_impl(const Tensor& self, int64_t dim0,
         TP_MAXMIN_DIM_CASE(double, Float64, >)         \
         TP_MAXMIN_DIM_CASE(Half, Float16, >)           \
         TP_MAXMIN_DIM_CASE(BFloat16, BFloat16, >)      \
+        TP_MAXMIN_DIM_CASE(bool, Bool, >)              \
         default:                                       \
             TP_THROW(NotImplementedError, "max_dim not implemented for this dtype"); \
     }
@@ -2977,6 +2978,7 @@ std::tuple<Tensor, Tensor> min_dim_kernel_impl(const Tensor& self, int64_t dim0,
         TP_MIN_DIM_CASE(double, Float64)
         TP_MIN_DIM_CASE(Half, Float16)
         TP_MIN_DIM_CASE(BFloat16, BFloat16)
+        TP_MIN_DIM_CASE(bool, Bool)
         default:
             TP_THROW(NotImplementedError, "min_dim not implemented for this dtype");
     }
