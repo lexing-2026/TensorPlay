@@ -36,7 +36,7 @@ prunes older assets from the rolling release (prune aborts if no wheel of the
 new version made it). Only the latest published day is kept.
 
 ```bash
-pip install --pre tensorplay --index-url https://download.tensorplay.cn/whl/nightly/cu124/ --extra-index-url https://pypi.org/simple
+pip install --pre tensorplay --index-url https://download.tensorplay.cn/whl/nightly/cu130/ --extra-index-url https://pypi.org/simple
 ```
 
 ## Release candidate process
