@@ -256,6 +256,14 @@ git clone https://github.com/lexing-2026/TensorPlay.git
 cd TensorPlay
 ```
 
+The repository does not carry the third-party sources in git. Fetch the pinned revisions (vector math, distributed transports, Vulkan headers, ...) with the restore script:
+
+```bash
+bash .github/scripts/restore-vendored-deps.sh
+```
+
+The script is idempotent and works on Linux, macOS and Windows (Git Bash). Skipping it still produces a working build, but the missing pieces degrade: no BLAS vector math, no distributed transports, and the Vulkan backend falls back to CPU unless a system install provides what it needs.
+
 #### Install Build Dependencies
 
 Isolated PEP 517 builds fetch everything automatically. For faster iterative development, install the toolchain once and build without isolation:
@@ -279,10 +287,21 @@ pip install -e . --no-build-isolation
 python -m build --wheel
 ```
 
-On success, `import tensorplay` picks up the compiled `_C` extension from the installed package.
+On success, `import tensorplay` picks up the compiled `_C` extension from the installed package. A quick check:
+
+```bash
+python -c "import tensorplay as tp; print(tp.__version__); print('vulkan:', tp.is_vulkan_available())"
+```
 
 > [!TIP]
 > For day-to-day kernel work, the editable install (`pip install -e . --no-build-isolation`) recompiles only what changed.
+
+#### Run the Test Suite
+
+```bash
+pytest test/ -q          # everything
+pytest test/test_vulkan.py -q   # a single backend suite, e.g. Vulkan
+```
 
 #### Adjusting Build Options (Optional)
 
@@ -306,6 +325,7 @@ CMAKE_CUDA_ARCHITECTURES="70;75;86" pip install .
 | ---- | ---- | ---- |
 | `USE_CUDA` | auto-detect | Enable/disable the CUDA build |
 | `USE_ROCM` | `OFF` | Enable the AMD GPU / HIP build (mutually exclusive with `USE_CUDA`) |
+| `USE_VULKAN` | auto-detect | Enable the Vulkan GPU build; needs a loader on the machine plus the vendored headers and GLSL compiler restored by the script above |
 | `BUILD_TESTS` | `OFF` | Build the C++ test suite |
 | `USE_BLAS` / `USE_ONEDNN` | `ON` | BLAS acceleration / oneDNN primitives |
 | `MAX_JOBS` | machine default | Cap compile parallelism |
