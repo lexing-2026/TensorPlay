@@ -147,19 +147,23 @@ if(TARGET sleef)
             endif()
         endforeach()
         if(TP_SLEEF_IFACE_CHANGED)
-            # The archive is produced by the tlfloat ExternalProject's
-            # install step during the build, not by a node in this build
-            # graph; ninja rejects a missing file it has no rule for, so
-            # seed the location now. The dependency chain (p10 -> sleef ->
-            # ext_tlfloat) guarantees the real archive overwrites the seed
-            # before anything links against it.
-            file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/third_party/sleef-prefix/lib")
-            file(TOUCH "${TP_TLFLOAT_ARCHIVE}")
             set_target_properties(sleef PROPERTIES
                 INTERFACE_LINK_LIBRARIES "${TP_SLEEF_IFACE_FIXED}")
             message(STATUS "Pinned the sleef tlfloat link entry to ${TP_TLFLOAT_ARCHIVE}")
         else()
             message(STATUS "sleef link interface: ${TP_SLEEF_IFACE_FIXED}")
+        endif()
+        # The archive is produced by the tlfloat ExternalProject's install
+        # step during the build, not by a node in this build graph; ninja
+        # rejects a missing file it has no rule for. This covers both shapes
+        # above: the swapped-in entry and an interface that already carries
+        # the absolute archive path. The dependency chain (p10 -> sleef ->
+        # ext_tlfloat) guarantees the real archive overwrites the seed before
+        # anything links against it.
+        if(TP_TLFLOAT_ARCHIVE IN_LIST TP_SLEEF_IFACE_FIXED
+           AND NOT EXISTS "${TP_TLFLOAT_ARCHIVE}")
+            file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/third_party/sleef-prefix/lib")
+            file(TOUCH "${TP_TLFLOAT_ARCHIVE}")
         endif()
     endif()
 endif()
