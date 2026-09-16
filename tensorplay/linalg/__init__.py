@@ -14,6 +14,7 @@ namespace.  The package is split so each family can grow on its own:
 The dense decomposition paths cover float32/float64/complex64/complex128.
 """
 from ._common import (
+    CholeskyExResult,
     EigResult,
     EighResult,
     LinAlgError,

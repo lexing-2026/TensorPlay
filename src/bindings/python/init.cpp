@@ -5,6 +5,7 @@
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include "CPythonBridge.h"
 #include "Context.h"
+#include "Utils.h"
 #include "OneDNNContext.h"
 #include "Profiler.h"
 #include "Graph.h"
@@ -382,6 +383,24 @@ PYBIND11_MODULE(_C, m) {
           "tensor"_a,
           "mesh"_a,
           "placements"_a);
+
+    // Broadcast inference over two shapes.  Size-typed in and out: other
+    // sequence types are rejected so `Size + (n, n)` concatenation downstream
+    // keeps tuple semantics.
+    m.def("_infer_size", [](py::object shape1, py::object shape2) -> py::object {
+        for (int k = 1; k <= 2; ++k) {
+            PyObject* arg = (k == 1) ? shape1.ptr() : shape2.ptr();
+            if (!Size_Check(arg)) {
+                PyErr_Format(PyExc_RuntimeError,
+                             "expected a tensorplay.Size as argument %d", k);
+                throw py::error_already_set();
+            }
+        }
+        tensorplay::Size result = tensorplay::broadcast_shapes(
+            shape1.cast<std::vector<int64_t>>(),
+            shape2.cast<std::vector<int64_t>>());
+        return py::reinterpret_steal<py::object>(Size_New(result));
+    });
 
     // CUDA availability
     m.def("is_cuda_available", []() {

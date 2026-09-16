@@ -11,6 +11,7 @@ on an NVIDIA GPU with compute capability >= 3.0.
 import builtins
 import ctypes
 from enum import IntEnum
+from math import e, inf, nan, pi  # noqa: F401
 import glob
 import importlib
 import inspect
@@ -681,8 +682,11 @@ def as_tensor(data, dtype=None, device=None):
     if isinstance(data, tensorplay.Tensor):
         if dtype is not None and data.dtype != dtype:
             data = data.to(dtype)
-        if device is not None and data.device != tensorplay.device(device):
-            data = data.to(device)
+        if device is not None:
+            if not isinstance(device, tensorplay.device):
+                device = tensorplay.device(device)
+            if data.device != device:
+                data = data.to(device)
         return data
     return tensor(data, dtype=dtype, device=device)
 
