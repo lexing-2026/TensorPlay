@@ -1636,6 +1636,12 @@ if(EXISTS "${CMAKE_BINARY_DIR}/generated")
         FILES_MATCHING PATTERN "*.h"
     )
 endif()
+# The Python bridge headers a C++ extension's generated binding includes
+# (#include "CPythonBridge.h"); the implementation lives in libtp_python.
+install(DIRECTORY "${CMAKE_SOURCE_DIR}/src/bindings/python/"
+    DESTINATION tensorplay/include/bindings
+    FILES_MATCHING PATTERN "*.h"
+)
 
 # Type stubs for the _C extension are generated into the package source tree
 # so IDEs and type checkers pick them up both in-tree and from the install
