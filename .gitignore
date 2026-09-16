@@ -52,16 +52,13 @@ website/
 node_modules/
 **/node_modules/
 
-# Third party sources
-third_party/
-third_party/cudnn/
-third_party/googletest/
-third_party/pybind11/
-third_party/nanobind/
-!third_party/*.py
-!third_party/*.zip
-third_party/torchviz/
-third_party/torchview/
+# Third party sources; hipify is a tracked vendored package, the rest are
+# local clones restored by CI (see .github/scripts/restore-vendored-deps.sh)
+/third_party/*
+!/third_party/hipify/
+!/third_party/hipify/**
+!/third_party/*.py
+!/third_party/*.zip
 
 # Object/library build artifacts (never intentionally versioned)
 *.o
