@@ -954,9 +954,28 @@ def compile_translation_unit(
             import sysconfig
 
             python_include = sysconfig.get_paths()["include"]
-            generated_ops_include = os.path.join(
-                os.path.dirname(generated_include_dir), "generated"
-            )
+            # Tensor.h pulls the generated op declarations when the runtime
+            # headers are present.  The directory that carries them depends
+            # on the layout: a development tree keeps them under the build
+            # directory beside the generated sleef.h, an installed wheel
+            # under a sibling of the shipped include tree.
+            generated_ops_include = ""
+            for candidate in (
+                os.path.join(
+                    os.path.dirname(generated_include_dir), "generated"
+                ),
+                os.path.join(
+                    os.path.dirname(generated_include_dir), "generated_ops"
+                ),
+                generated_include_dir,
+            ):
+                if os.path.isfile(
+                    os.path.join(
+                        candidate, "tensorplay", "ops", "TensorGenerated.h"
+                    )
+                ):
+                    generated_ops_include = candidate
+                    break
             os.makedirs(os.path.dirname(source_path), exist_ok=True)
             with file_lock(output_path + ".lock"):
                 if not os.path.exists(output_path):
@@ -967,9 +986,7 @@ def compile_translation_unit(
                         generated_include_dir,
                         python_include,
                     ]
-                    if os.path.isdir(generated_ops_include):
-                        # Tensor.h pulls the generated op declarations when
-                        # the runtime headers are present.
+                    if generated_ops_include:
                         include_dirs.append(generated_ops_include)
                     options = CppOptions(
                         compiler=compiler,
