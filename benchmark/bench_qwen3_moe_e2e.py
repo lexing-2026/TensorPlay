@@ -11,7 +11,7 @@ spellings (type aliases, single-argument predicate selection, the
 serialization loader entry).
 
 Outputs:
-  parity  — logits/argmax agreement plus greedy generation agreement
+  match   — logits/argmax agreement plus greedy generation agreement
   speed   — prefill latency and decode ms/token, interleaved min-of-R
 """
 
@@ -21,10 +21,18 @@ import importlib.abc
 import importlib.util
 import io
 import json
+import re
 import sys
 import time
 import types
 from pathlib import Path
+
+# Pin the whole package to the repo tree: the editable finder maps the
+# package root here but resolves submodules to the installed copy, which
+# mixes stale files into the import.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import numpy as np
 
@@ -223,7 +231,61 @@ def install_alias():
     st.load = load
     st.save_file = save_file
     st.save = save_file
+    st.storage_ptr = lambda tensor: tensor.untyped_storage().data_ptr()
+    st.storage_size = lambda tensor: tensor.untyped_storage().nbytes()
     _register("safetensors.torch", st)
+
+    # The vision companion package ships compiled kernels bound to the
+    # reference runtime, so the real import cannot work under the alias.
+    # Only the interpolation/decode names the modeling stack reads at import
+    # time are provided; the image paths themselves stay unimplemented.
+    import enum as _enum
+
+    tv = types.ModuleType("torchvision")
+    tv.__version__ = "0.0.0+alias"
+    tv.__path__ = []
+
+    class ImageReadMode(_enum.Enum):
+        UNCHANGED = 0
+        GRAY = 1
+        GRAY_ALPHA = 2
+        RGB = 3
+        RGB_ALPHA = 4
+
+    def _unavailable(*args, **kwargs):
+        raise NotImplementedError(
+            "image decoding is not provided under the alias import"
+        )
+
+    tv_io = types.ModuleType("torchvision.io")
+    tv_io.ImageReadMode = ImageReadMode
+    tv_io.decode_image = _unavailable
+    tv.io = tv_io
+
+    class InterpolationMode(_enum.Enum):
+        NEAREST = "nearest"
+        NEAREST_EXACT = "nearest-exact"
+        BILINEAR = "bilinear"
+        BICUBIC = "bicubic"
+        BOX = "box"
+        HAMMING = "hamming"
+        LANCZOS = "lanczos"
+
+    tv_tr = types.ModuleType("torchvision.transforms")
+    tv_tr.InterpolationMode = InterpolationMode
+    tv.transforms = tv_tr
+
+    tv_trf = types.ModuleType("torchvision.transforms.functional")
+    tv_trf.pil_to_tensor = _unavailable
+    tv_tr.functional = tv_trf
+
+    for name, mod in (
+        ("torchvision", tv),
+        ("torchvision.io", tv_io),
+        ("torchvision.transforms", tv_tr),
+        ("torchvision.transforms.functional", tv_trf),
+    ):
+        _register(name, mod)
 
 
 def build_native_model(model_dir):
@@ -245,7 +307,9 @@ def build_native_model(model_dir):
             value = value.repeat_interleave(groups, dim=1)
         out = tp.nn.functional.scaled_dot_product_attention(
             query, key, value, is_causal=(attention_mask is None))
-        return out, None
+        # interface contract: sequence-major [B, S, H*D] back to the caller
+        out = out.transpose(1, 2).contiguous()
+        return out.reshape(query.shape[0], query.shape[2], -1), None
 
     ALL_ATTENTION_FUNCTIONS["sdpa"] = sdpa_forward
 
@@ -261,8 +325,37 @@ def build_native_model(model_dir):
     model.lm_head.weight = model.model.embed_tokens.weight
 
     sd = tp_ser.load(str(model_dir / "model.safetensors"))
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    print(f"native: missing={list(missing)} unexpected={list(unexpected)}")
+
+    # The checkpoint stores one nn.Linear per expert; the model consumes
+    # grouped weights shaped (num_experts, ...).  Regroup gate/up per expert
+    # along dim 1 and stack the expert dimension along dim 0.
+    pattern = re.compile(
+        r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
+    )
+    per_expert = {}
+    merged_sd = {}
+    for key, value in sd.items():
+        m = pattern.match(key)
+        if m is None:
+            merged_sd[key] = value
+            continue
+        layer, expert, proj = m.group(1), int(m.group(2)), m.group(3)
+        per_expert.setdefault((layer, proj), {})[expert] = value
+    for (layer, proj), tensors in per_expert.items():
+        stacked = tp.stack([tensors[e] for e in sorted(tensors)], 0)
+        if proj == "down_proj":
+            merged_sd[f"model.layers.{layer}.mlp.experts.down_proj"] = stacked
+        else:
+            merged_sd.setdefault(
+                f"model.layers.{layer}.mlp.experts.gate_up_proj", []
+            ).append(stacked)
+    for key, parts in list(merged_sd.items()):
+        if isinstance(parts, list):
+            merged_sd[key] = tp.cat(parts, 1)
+
+    missing, unexpected = model.load_state_dict(merged_sd, strict=False)
+    if missing or unexpected:
+        print(f"native: missing={list(missing)} unexpected={list(unexpected)}")
     model = model.to("cuda").eval()
     return model
 
@@ -287,7 +380,7 @@ def run_native(args):
     d = np.abs(ref["logits"] - logits)
     match = (ref["logits"].argmax(-1) == logits.argmax(-1)).mean()
     agree = int((ref["gen"] == gen).sum())
-    print(f"parity vs reference: shape={logits.shape} max|diff|={d.max():.5f} "
+    print(f"match vs reference: shape={logits.shape} max|diff|={d.max():.5f} "
           f"mean|diff|={d.mean():.6f} top1-match={match:.4f} "
           f"greedy-agree={agree}/{len(ref['gen'])}")
     print(f"native greedy {args.gen_tokens}: {tok.decode(gen.tolist())!r}")
