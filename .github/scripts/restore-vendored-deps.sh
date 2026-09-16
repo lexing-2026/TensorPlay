@@ -95,4 +95,31 @@ if [[ -d "$DEST/tensorpipe/.git" && ! -f "$DEST/tensorpipe/third_party/libuv/CMa
     echo "::endgroup::"
 fi
 
+# --- Vulkan runtime headers (loader-linked GPU backend) ---
+# The backend only builds when a Vulkan loader exists on the machine, so
+# the vendored headers and allocator are fetched on those machines only.
+# clone_into: like clone_pin, but tolerant of a pre-existing flattened
+# snapshot without .git (leave it in place instead of failing the clone).
+clone_into() {
+    local dir="$1" url="$2" rev="$3"
+    if [[ -d "$DEST/$dir/.git" ]] && [[ "$(git -C "$DEST/$dir" rev-parse HEAD)" == "$rev" ]]; then
+        return 0
+    fi
+    if [[ -e "$DEST/$dir" && ! -d "$DEST/$dir/.git" ]]; then
+        return 0
+    fi
+    if [[ ! -d "$DEST/$dir/.git" ]]; then
+        echo "::group::Clone $dir @ ${rev:0:12}"
+        git -C "$DEST" clone --filter=blob:none "$url" "$dir"
+        git -C "$DEST/$dir" -c advice.detachedHead=false checkout "$rev"
+        echo "::endgroup::"
+    fi
+}
+# grep without -q: under pipefail, -q's early exit SIGPIPEs the producer
+# and the pipeline reports failure even on a match.
+if ldconfig -p 2>/dev/null | grep libvulkan.so >/dev/null; then
+    clone_into vulkan-headers https://github.com/KhronosGroup/Vulkan-Headers 217e93c664ec6704ec2d8c36fa116c1a4a1e2d40
+    clone_into vulkan-memory-allocator https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator 3aa921224c154a0d2c43912bc88e1c42ce1f7607
+fi
+
 echo "Vendored dependencies restored under $DEST"
