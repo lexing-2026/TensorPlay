@@ -139,8 +139,9 @@ packages = ["tensorplay"]
 # Ensure we include everything installed by CMake, but exclude unwanted artifacts if they slip through
 # scikit-build-core automatically includes files in wheel.packages
 # We can use exclude to be safe
+# tensorplay/include must NOT be excluded: it carries the runtime headers the
+# JIT kernel generation compiles against in installed environments.
 exclude = [
-    "tensorplay/include",
     "tensorplay/share",
     "tensorplay/lib/cmake",
     "tensorplay/lib/*.lib",
