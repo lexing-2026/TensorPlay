@@ -19,26 +19,36 @@ from typing import Any, Mapping, Sequence
 from onnx import TensorProto, checker, helper, numpy_helper, shape_inference
 
 from ..export import ExportedProgram, export as tp_export
-from . import _external_data, _passes
+from . import _external_data, _passes, errors, testing, utils, verification
 from ._composite_ops import (
     GraphBuilder,
     OpContext,
-    UnsupportedOperatorError,
     Value,
     lookup_function_handler,
     lookup_method_handler,
 )
 from ._type_mapping import _np_dtype_to_onnx, _size_to_tuple, _to_numpy
 from ._verify import VerificationError, VerificationResult, verify_model
+from .errors import (
+    OnnxExporterError,
+    OnnxExporterWarning,
+    UnsupportedOperatorError,
+)
 
 __all__ = [
     "DEFAULT_OPSET_VERSION",
     "MIN_OPSET_VERSION",
+    "OnnxExporterError",
+    "OnnxExporterWarning",
     "UnsupportedOperatorError",
     "VerificationError",
     "VerificationResult",
+    "errors",
     "export",
     "is_supported",
+    "testing",
+    "utils",
+    "verification",
 ]
 
 DEFAULT_OPSET_VERSION = 18
@@ -383,7 +393,7 @@ def _to_exported_program(model: Any, dynamic_axes: Any) -> tuple[ExportedProgram
 def _program_state_values(program: Any) -> dict[str, Any]:
     """Resolve lifted state placeholder names to their tensor values."""
 
-    from .export.graph_signature import InputKind
+    from ..export.graph_signature import InputKind
 
     root = program.graph_module.root
     values: dict[str, Any] = {}
