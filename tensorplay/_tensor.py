@@ -464,12 +464,13 @@ Tensor.min = min
 
 def amax(self, dim=None, keepdim=False):
     from . import functional
-    return functional.amax(self, dim=dim, keepdim=keepdim)
+    # an absent dim means the full reduction, spelled as the empty list
+    return functional.amax(self, dim=[] if dim is None else dim, keepdim=keepdim)
 
 
 def amin(self, dim=None, keepdim=False):
     from . import functional
-    return functional.amin(self, dim=dim, keepdim=keepdim)
+    return functional.amin(self, dim=[] if dim is None else dim, keepdim=keepdim)
 
 
 Tensor.amax = amax

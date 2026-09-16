@@ -798,6 +798,19 @@ int tpx_py_try_function_mode_dispatch(
 // that want the ParsedArgs owner.
 // ---------------------------------------------------------------------------
 
+// numpy-compatibility keyword spellings: a canonical parameter name followed
+// by the alternative names accepted for it.  An unknown keyword that maps to
+// one of these canonical names resolves to the canonical parameter's slot.
+struct NumpyArgAlias {
+    const char* canonical;
+    const char* alias;
+};
+
+constexpr NumpyArgAlias kNumpyArgAliases[] = {
+    {"dim", "axis"},      {"keepdim", "keepdims"}, {"input", "x"},
+    {"input", "a"},       {"input", "x1"},         {"other", "x2"},
+};
+
 void tpx_py_parse_into(PyObject* const* args, Py_ssize_t nargs,
                        PyObject* kwnames, const char* const* kwlist,
                        Py_ssize_t nkws, const char* op_name,
@@ -827,6 +840,23 @@ void tpx_py_parse_into(PyObject* const* args, Py_ssize_t nargs,
                 && PyUnicode_CompareWithASCIIString(key, kwlist[k]) == 0) {
                 slot = static_cast<int>(k);
                 break;
+            }
+        }
+        if (slot < 0) {
+            const char* name = PyUnicode_AsUTF8(key);
+            // numpy-compatibility alias: resolve the spelling to its
+            // canonical parameter when that parameter is part of the schema.
+            for (const NumpyArgAlias& alias : kNumpyArgAliases) {
+                if (!PyUnicode_CompareWithASCIIString(key, alias.alias)) {
+                    for (Py_ssize_t k = 0; k < nkws; ++k) {
+                        if (kwlist[k]
+                            && std::strcmp(kwlist[k], alias.canonical) == 0) {
+                            slot = static_cast<int>(k);
+                            break;
+                        }
+                    }
+                    break;
+                }
             }
         }
         if (slot < 0) {
@@ -1367,7 +1397,12 @@ std::vector<Scalar> tpx_py_scalarlist(PyObject* obj) {
     }
     return r;
 }
-DType tpx_py_dtype(PyObject* obj) { return as_dtype(obj, "op", 0); }
+DType tpx_py_dtype(PyObject* obj) {
+    // `dtype=None` spells "keep the input dtype" (the schema's Undefined
+    // default), matching the lenient spelling the python API accepts.
+    if (obj == Py_None) return DType::Undefined;
+    return as_dtype(obj, "op", 0);
+}
 std::optional<DType> tpx_py_opt_dtype(PyObject* obj) {
     if (obj == Py_None) return std::nullopt;
     return as_dtype(obj, "op", 0);
