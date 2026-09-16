@@ -25,9 +25,13 @@ clone_pin() {
     if [[ -e "$DEST/$dir/.git" ]] && [[ "$(git -C "$DEST/$dir" rev-parse HEAD)" == "$rev" ]]; then
         return 0
     fi
-    # A flattened frozen snapshot (no .git) is authoritative: leave it in
-    # place instead of failing the clone into a non-empty directory.
-    if [[ -e "$DEST/$dir" && ! -e "$DEST/$dir/.git" ]]; then
+    # A flattened frozen snapshot (content without .git) is authoritative:
+    # leave it in place instead of failing the clone into a non-empty
+    # directory. An empty directory is not a snapshot -- checkouts with
+    # submodules disabled leave empty placeholder dirs at the gitlink paths,
+    # and cloning into those is exactly what must happen.
+    if [[ -d "$DEST/$dir" && ! -e "$DEST/$dir/.git" ]] \
+       && [[ -n "$(ls -A "$DEST/$dir" 2>/dev/null)" ]]; then
         return 0
     fi
     if [[ ! -e "$DEST/$dir/.git" ]]; then
@@ -80,8 +84,10 @@ if [[ "$nnpack_supported" == "1" ]]; then
         if [[ -e "$DEST/$dir/.git" ]] && [[ "$(git -C "$DEST/$dir" rev-parse HEAD)" == "$rev" ]]; then
             return 0
         fi
-        # Same flattened-snapshot tolerance as clone_pin above.
-        if [[ -e "$DEST/$dir" && ! -e "$DEST/$dir/.git" ]]; then
+        # Same flattened-snapshot tolerance as clone_pin above; an empty
+        # placeholder dir is not a snapshot and must be cloned into.
+        if [[ -d "$DEST/$dir" && ! -e "$DEST/$dir/.git" ]] \
+           && [[ -n "$(ls -A "$DEST/$dir" 2>/dev/null)" ]]; then
             return 0
         fi
         if [[ ! -e "$DEST/$dir/.git" ]]; then
@@ -127,7 +133,8 @@ clone_into() {
     if [[ -e "$DEST/$dir/.git" ]] && [[ "$(git -C "$DEST/$dir" rev-parse HEAD)" == "$rev" ]]; then
         return 0
     fi
-    if [[ -e "$DEST/$dir" && ! -e "$DEST/$dir/.git" ]]; then
+    if [[ -d "$DEST/$dir" && ! -e "$DEST/$dir/.git" ]] \
+       && [[ -n "$(ls -A "$DEST/$dir" 2>/dev/null)" ]]; then
         return 0
     fi
     if [[ ! -e "$DEST/$dir/.git" ]]; then
