@@ -9,8 +9,8 @@
       "batch_tokens": 512,
       "in_features": 4096,
       "out_features": 4096,
-      "forward_seconds": 0.08036556800652761,
-      "step_seconds": 0.2808993139915401
+      "forward_seconds": 0.11181407300000501,
+      "step_seconds": 0.3232827230000055
     },
     {
       "name": "mlp-up",
@@ -18,8 +18,8 @@
       "batch_tokens": 512,
       "in_features": 4096,
       "out_features": 11008,
-      "forward_seconds": 0.21713474900752772,
-      "step_seconds": 0.7829317459982121
+      "forward_seconds": 0.2671040189999303,
+      "step_seconds": 0.8484394880000536
     },
     {
       "name": "mlp-down",
@@ -27,8 +27,8 @@
       "batch_tokens": 512,
       "in_features": 11008,
       "out_features": 4096,
-      "forward_seconds": 0.22552354700746946,
-      "step_seconds": 0.9071622019982897
+      "forward_seconds": 0.26624212100000477,
+      "step_seconds": 0.9151028869999891
     },
     {
       "name": "small-net",
@@ -36,8 +36,8 @@
       "batch_tokens": 128,
       "in_features": 1024,
       "out_features": 1024,
-      "forward_seconds": 0.0017579639970790595,
-      "step_seconds": 0.0052997930033598095
+      "forward_seconds": 0.0017595369999980903,
+      "step_seconds": 0.006285075999983292
     },
     {
       "name": "decode-1",
@@ -45,8 +45,8 @@
       "batch_tokens": 1,
       "in_features": 4096,
       "out_features": 4096,
-      "forward_seconds": 0.0031879979942459613,
-      "step_seconds": 0.02086972699908074
+      "forward_seconds": 0.0027544309999711913,
+      "step_seconds": 0.024110928000027343
     }
   ]
 }
