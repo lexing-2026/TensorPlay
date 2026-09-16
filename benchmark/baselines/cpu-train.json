@@ -46,7 +46,7 @@
       "in_features": 4096,
       "out_features": 4096,
       "forward_seconds": 0.0027544309999711913,
-      "step_seconds": 0.02212108500003751
+      "step_seconds": 0.024110928000027343
     }
   ]
 }
