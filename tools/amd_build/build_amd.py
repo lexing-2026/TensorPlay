@@ -14,7 +14,9 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO_ROOT / "third_party" / "pytorch" / "torch" / "utils"))
+# The source-translation module ships as a standalone vendored package
+# directly under third_party/ (see .gitignore for the tracking carve-out).
+sys.path.insert(0, str(REPO_ROOT / "third_party"))
 
 STAGE_GLOBS = ["*.h", "*.hpp", "*.cuh", "*.cpp", "*.cc", "*.cu", "*.in"]
 
@@ -107,8 +109,7 @@ def rewrite_leftovers(staging: Path) -> None:
     # both lookup orders (original name and renamed name) on HIP semantics.
     # Prepend the vendored translation module search path so the in-place
     # pass can reuse the same mapping tables.
-    sys.path.insert(
-        0, str(REPO_ROOT / "third_party" / "pytorch" / "torch" / "utils"))
+    sys.path.insert(0, str(REPO_ROOT / "third_party"))
     from hipify import hipify_python as hp
 
     for path in staging.rglob("*"):
