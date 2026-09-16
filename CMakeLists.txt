@@ -1613,6 +1613,30 @@ install(FILES "${CMAKE_SOURCE_DIR}/tensorplay/functional.pyi"
     DESTINATION tensorplay
 )
 
+# Generated kernels are compiled at runtime against the runtime headers; the
+# wheel must carry them or the ISA feasibility probe and every JIT route stay
+# disabled in installed environments (stax/cpp_builder resolves the installed
+# layout under tensorplay/include).  build/include carries the generated
+# sleef.h the vector shims gate their per-ISA declarations behind; skip the
+# rule for configurations that never generate it.
+install(DIRECTORY "${CMAKE_SOURCE_DIR}/p10/include/"
+    DESTINATION tensorplay/include/p10
+)
+if(EXISTS "${CMAKE_BINARY_DIR}/include")
+    install(DIRECTORY "${CMAKE_BINARY_DIR}/include/"
+        DESTINATION tensorplay/include/generated
+    )
+endif()
+# The generated op declarations that p10's Tensor.h pulls in.  Only the
+# headers belong in the wheel; the .cpp definitions are compiled into
+# libp10 at build time.
+if(EXISTS "${CMAKE_BINARY_DIR}/generated")
+    install(DIRECTORY "${CMAKE_BINARY_DIR}/generated/"
+        DESTINATION tensorplay/include/generated_ops
+        FILES_MATCHING PATTERN "*.h"
+    )
+endif()
+
 # Type stubs for the _C extension are generated into the package source tree
 # so IDEs and type checkers pick them up both in-tree and from the install
 # rule above.  Like the other codegen outputs, the stub is a dedicated custom
