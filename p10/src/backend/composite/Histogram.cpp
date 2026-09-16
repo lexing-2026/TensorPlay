@@ -332,10 +332,16 @@ Tensor histogramdd_accumulate(const Tensor& self,
 Tensor histc_native(const Tensor& self, int64_t bins, const Scalar& min,
                     const Scalar& max) {
     if (bins <= 0) TP_THROW(RuntimeError, "histc(): bins must be positive");
-    if (!isFloatingType(self.dtype())) {
+    // Integer inputs compute in float64 on the CUDA device and report
+    // counts in the input dtype; CPU keeps the float-only contract.
+    const bool promote_to_f64 = !isFloatingType(self.dtype());
+    if (promote_to_f64 &&
+        (!isIntegralType(self.dtype(), /*includeBool=*/false) ||
+         !self.device().is_cuda())) {
         TP_THROW(NotImplementedError, "histc(): expected a floating-point tensor, got ",
                  toString(self.dtype()));
     }
+    const Tensor& work = promote_to_f64 ? self.to(DType::Float64) : self;
     double lo = min.toDouble();
     double hi = max.toDouble();
     if (lo == hi && self.numel() > 0) {
@@ -355,7 +361,7 @@ Tensor histc_native(const Tensor& self, int64_t bins, const Scalar& min,
         TP_THROW(RuntimeError, "histc: max must be larger than min");
     }
 
-    const Tensor flat = ops::reshape(self, {-1});
+    const Tensor flat = ops::reshape(work, {-1});
     const Tensor in_range = ops::logical_and(ops::ge(flat, Scalar(lo)),
                                              ops::le(flat, Scalar(hi)));
     const Tensor safe = Tensor::where(in_range, flat, Tensor::zeros_like(flat));

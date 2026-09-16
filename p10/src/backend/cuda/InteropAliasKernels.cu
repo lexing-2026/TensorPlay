@@ -139,10 +139,14 @@ std::tuple<Tensor, Tensor, Tensor> batch_norm_forward_impl(
 
 Tensor interop_histc_cuda(const Tensor& self, int64_t bins, Scalar min, Scalar max) {
     if (bins <= 0) TP_THROW(RuntimeError, "histc(): bins must be positive");
-    if (!isFloatingType(self.dtype())) {
+    // Integer inputs compute in float64 and report counts in the input
+    // dtype; that keeps the CUDA contract wider than the CPU one.
+    const bool promote_to_f64 = !isFloatingType(self.dtype());
+    if (promote_to_f64 && !isIntegralType(self.dtype(), /*includeBool=*/false)) {
         TP_THROW(TypeError, "histc(): expected a floating-point tensor, got ",
                  toString(self.dtype()));
     }
+    const Tensor& work = promote_to_f64 ? self.to(DType::Float64) : self;
     double lo = min.toDouble();
     double hi = max.toDouble();
     if (lo == hi && self.numel() > 0) {
@@ -159,7 +163,7 @@ Tensor interop_histc_cuda(const Tensor& self, int64_t bins, Scalar min, Scalar m
                  "] is not finite");
     }
     if (!(lo < hi)) TP_THROW(RuntimeError, "histc: max must be larger than min");
-    const Tensor flat = ops::reshape(self, {-1});
+    const Tensor flat = ops::reshape(work, {-1});
     const Tensor in_range = ops::logical_and(ops::ge(flat, Scalar(lo)),
                                              ops::le(flat, Scalar(hi)));
     const Tensor safe = Tensor::where(in_range, flat, Tensor::zeros_like(flat));
