@@ -62,6 +62,10 @@ jobs:
     if: ${{ github.event_name != 'pull_request' && always() && needs.cpu-operator-benchmark.result == 'success' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
+    # The workflow defaults to read-all; the forced push to the orphan
+    # bench-data branch needs contents write on the job's own token.
+    permissions:
+      contents: write
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
