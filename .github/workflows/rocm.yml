@@ -65,17 +65,29 @@ jobs:
             buildcache-${{ runner.os }}-${{ runner.arch }}-rocm-linux-x86_64-py3-
 
       # The wheel links vendored SLEEF/NNPACK trees that CI checkouts do
-      # not carry; fetch the pinned revisions before configuring.
+      # not carry; fetch the pinned revisions before configuring. The
+      # container image ships no git, so install it first; container jobs
+      # run as root here, with sudo as a fallback for other images.
       - name: Restore vendored build dependencies
         shell: bash
-        run: bash .github/scripts/restore-vendored-deps.sh
+        run: |
+          set -euo pipefail
+          if ! command -v git >/dev/null 2>&1; then
+            SUDO=""
+            if [ "$(id -u)" != "0" ]; then SUDO=sudo; fi
+            $SUDO apt-get update -qq
+            $SUDO apt-get install -y -qq git 1>/dev/null
+          fi
+          bash .github/scripts/restore-vendored-deps.sh
 
       - name: Install Linux build dependencies
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libopenblas-dev 1>/dev/null
+          SUDO=""
+          if [ "$(id -u)" != "0" ]; then SUDO=sudo; fi
+          $SUDO apt-get update -qq
+          $SUDO apt-get install -y -qq libopenblas-dev 1>/dev/null
           # The container image carries no sccache package; install the
           # pinned release the other lanes use.
           if ! command -v sccache >/dev/null 2>&1; then
