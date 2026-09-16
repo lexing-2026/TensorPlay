@@ -56,24 +56,24 @@ except ImportError:  # pragma: no cover - depends on optional kernels
     pass
 
 # Module types whose outputs are recorded by :func:`compare_model_outputs`
-# when the caller does not supply an explicit allow list.
-DEFAULT_COMPARE_OUTPUT_MODULE_LIST: set[type] = {
-    nn.Conv1d,
-    nn.Conv2d,
-    nn.Conv3d,
-    nn.Linear,
-    nn.ReLU,
-    nn.ReLU6,
-    nn.ELU,
-    nn.LeakyReLU,
-    nn.Hardswish,
-    nn.Sigmoid,
-    nn.Tanh,
-    nn.MaxPool1d,
-    nn.MaxPool2d,
-    nn.AvgPool2d,
-    nn.AdaptiveAvgPool2d,
-}
+# when the caller does not supply an explicit allow list: every float module
+# that has a quantized counterpart, every quantized module produced by
+# conversion, and plain containers.
+from tensorplay.ao.quantization.quantization_mappings import (
+    DEFAULT_DYNAMIC_QUANT_MODULE_MAPPINGS,
+    DEFAULT_QAT_MODULE_MAPPINGS,
+    DEFAULT_STATIC_QUANT_MODULE_MAPPINGS,
+)
+
+DEFAULT_COMPARE_OUTPUT_MODULE_LIST: set[type] = (
+    set(DEFAULT_STATIC_QUANT_MODULE_MAPPINGS.keys())
+    | set(DEFAULT_STATIC_QUANT_MODULE_MAPPINGS.values())
+    | set(DEFAULT_QAT_MODULE_MAPPINGS.keys())
+    | set(DEFAULT_QAT_MODULE_MAPPINGS.values())
+    | set(DEFAULT_DYNAMIC_QUANT_MODULE_MAPPINGS.keys())
+    | set(DEFAULT_DYNAMIC_QUANT_MODULE_MAPPINGS.values())
+    | {nn.Sequential}
+)
 
 
 def _find_match(
@@ -150,6 +150,18 @@ def compare_weights(
             weight_dict[key] = {}
             weight_dict[key]["float"] = float_dict[match_key]
             weight_dict[key]["quantized"] = quantized_dict[key]
+            continue
+
+        # For matching "fc.weight" and "fc._packed_params._packed_params"
+        # (the packed entry is a (weight, bias) pair) or a flat buffer that
+        # merely carries the "_packed_params" name.
+        match_key = _find_match(float_dict, key, "_packed_params")
+        if match_key is not None:
+            entry = quantized_dict[key]
+            weight_dict[key] = {}
+            weight_dict[key]["float"] = float_dict[match_key]
+            weight_dict[key]["quantized"] = (
+                entry[0] if isinstance(entry, (tuple, list)) else entry)
     return weight_dict
 
 
