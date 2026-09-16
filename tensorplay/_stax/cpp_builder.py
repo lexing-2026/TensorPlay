@@ -33,8 +33,11 @@ def package_paths() -> Optional[tuple[str, str, str]]:
     """Return ``(include_dir, generated_include_dir, lib_dir)`` or None.
 
     Locates the runtime headers a generated kernel compiles against and the
-    runtime library it links to.  Development-tree layout only; installed
-    wheels fall back to ``None`` and the native path stays disabled.
+    runtime library it links to.  Two layouts are recognized: a development
+    tree (``p10/include`` and ``build/include`` beside the package) and an
+    installed wheel (the runtime headers ship under ``tensorplay/include``,
+    see the CMake install rules).  Without either, the native path stays
+    disabled.
     """
 
     if "paths" in _PATHS_STATE:
@@ -49,6 +52,12 @@ def package_paths() -> Optional[tuple[str, str, str]]:
             os.path.join(root, "build", "include"),
             os.path.join(pkg, "lib"),
         )
+        if not os.path.isdir(paths[0]):
+            paths = (
+                os.path.join(pkg, "include", "p10"),
+                os.path.join(pkg, "include", "generated"),
+                os.path.join(pkg, "lib"),
+            )
     except Exception:
         paths = None
     if paths and not os.path.isdir(paths[0]):
