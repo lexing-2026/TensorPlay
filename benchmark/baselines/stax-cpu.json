@@ -10,11 +10,11 @@
       "batch": 64,
       "features": 256,
       "hidden": 512,
-      "eager_seconds": 8.848599100019783e-05,
-      "compiled_seconds": 0.00011105799057986587,
-      "compile_seconds": 0.005629364008200355,
-      "first_pass_seconds": 0.0034474759886506945,
-      "speedup": 0.7967548353629207,
+      "eager_seconds": 0.0003089959999442726,
+      "compiled_seconds": 0.0002537419999271151,
+      "compile_seconds": 0.0018421510000052876,
+      "first_pass_seconds": 0.005023887999982435,
+      "speedup": 1.0317073631397042,
       "codegens": [
         "stax-native"
       ]
@@ -25,11 +25,11 @@
       "batch": 128,
       "features": 512,
       "hidden": 1024,
-      "eager_seconds": 0.0005792279989691451,
-      "compiled_seconds": 0.0006697580101899803,
-      "compile_seconds": 0.00011257099686190486,
-      "first_pass_seconds": 0.008176650997484103,
-      "speedup": 0.8648317603619913,
+      "eager_seconds": 0.001087064999978793,
+      "compiled_seconds": 0.001089179000018703,
+      "compile_seconds": 8.235199999262477e-05,
+      "first_pass_seconds": 0.007255724999936319,
+      "speedup": 1.0086824374825691,
       "codegens": [
         "stax-native"
       ]
@@ -40,11 +40,11 @@
       "batch": 128,
       "features": 512,
       "hidden": 1024,
-      "eager_seconds": 0.0008321829955093563,
-      "compiled_seconds": 0.0009331129986094311,
-      "compile_seconds": 0.00014138499682303518,
-      "first_pass_seconds": 0.008924605004722252,
-      "speedup": 0.8918351761785706,
+      "eager_seconds": 0.0011418369999773859,
+      "compiled_seconds": 0.001866716999984419,
+      "compile_seconds": 8.220199998731914e-05,
+      "first_pass_seconds": 0.013349156000003859,
+      "speedup": 0.911831627551633,
       "codegens": [
         "stax-native"
       ]
@@ -55,11 +55,11 @@
       "batch": 64,
       "features": 1024,
       "hidden": 1024,
-      "eager_seconds": 0.0006479470030171797,
-      "compiled_seconds": 0.0007493080047424883,
-      "compile_seconds": 0.00010290401405654848,
-      "first_pass_seconds": 0.006925341003807262,
-      "speedup": 0.8647271868393519,
+      "eager_seconds": 0.001069111999981942,
+      "compiled_seconds": 0.0010557360000120752,
+      "compile_seconds": 9.90660000184107e-05,
+      "first_pass_seconds": 0.018235346000096797,
+      "speedup": 1.0057311335175159,
       "codegens": [
         "stax-native"
       ]
@@ -70,11 +70,11 @@
       "batch": 64,
       "features": 1024,
       "hidden": 1024,
-      "eager_seconds": 0.0009949890081770718,
-      "compiled_seconds": 0.0009172529971692711,
-      "compile_seconds": 0.00012173899449408054,
-      "first_pass_seconds": 0.0083304089930607,
-      "speedup": 1.0847487130025208,
+      "eager_seconds": 0.0011463549999461975,
+      "compiled_seconds": 0.0011353239999607467,
+      "compile_seconds": 0.00010161000000152853,
+      "first_pass_seconds": 0.00722416600001452,
+      "speedup": 0.9991341896904851,
       "codegens": [
         "stax-native"
       ]
@@ -85,11 +85,11 @@
       "batch": 32,
       "features": 1024,
       "hidden": 2048,
-      "eager_seconds": 0.001090509002096951,
-      "compiled_seconds": 0.0008084389992291108,
-      "compile_seconds": 0.0001360360038233921,
-      "first_pass_seconds": 0.027483882993692532,
-      "speedup": 1.348906971505344,
+      "eager_seconds": 0.0019342730000744268,
+      "compiled_seconds": 0.001305231000060303,
+      "compile_seconds": 9.236699997927644e-05,
+      "first_pass_seconds": 0.010591178000026957,
+      "speedup": 1.017016680848398,
       "codegens": [
         "stax-native"
       ]
@@ -100,11 +100,11 @@
       "batch": 64,
       "features": 256,
       "hidden": 512,
-      "eager_seconds": 0.00013306000619195402,
-      "compiled_seconds": 0.00012998499732930213,
-      "compile_seconds": 0.00013893100549466908,
-      "first_pass_seconds": 0.00402295398816932,
-      "speedup": 1.023656644426908,
+      "eager_seconds": 0.0006213769999021679,
+      "compiled_seconds": 0.00030713199998899654,
+      "compile_seconds": 6.782099995916724e-05,
+      "first_pass_seconds": 0.007135091000009197,
+      "speedup": 1.0881841036251663,
       "codegens": [
         "stax-native"
       ]
@@ -115,11 +115,11 @@
       "batch": 64,
       "features": 256,
       "hidden": 256,
-      "eager_seconds": 0.00014676499995402992,
-      "compiled_seconds": 0.00011456500214990228,
-      "compile_seconds": 0.00014331900456454605,
-      "first_pass_seconds": 0.005238559999270365,
-      "speedup": 1.281063127481075,
+      "eager_seconds": 0.00026501399997869157,
+      "compiled_seconds": 0.0002772870000171679,
+      "compile_seconds": 8.240300007855694e-05,
+      "first_pass_seconds": 0.005287048000013783,
+      "speedup": 1.0308762902074138,
       "codegens": [
         "stax-native"
       ]
@@ -130,11 +130,11 @@
       "batch": 256,
       "features": 64,
       "hidden": 512,
-      "eager_seconds": 9.563998901285231e-05,
-      "compiled_seconds": 0.00010235200170427561,
-      "compile_seconds": 0.0001051880099112168,
-      "first_pass_seconds": 0.002507812008843757,
-      "speedup": 0.9344222625873382,
+      "eager_seconds": 0.00035021200005758146,
+      "compiled_seconds": 0.00034304999996948027,
+      "compile_seconds": 6.325699996523326e-05,
+      "first_pass_seconds": 0.004040797000016028,
+      "speedup": 1.0431255337685572,
       "codegens": [
         "stax-native"
       ]
@@ -145,13 +145,13 @@
       "batch": 128,
       "features": 512,
       "hidden": 1024,
-      "eager_seconds": 0.00077985500684008,
-      "compiled_seconds": 0.0006175799935590476,
-      "compile_seconds": 0.00016568100545555353,
-      "first_pass_seconds": 0.005801788996905088,
-      "speedup": 1.262759504798494,
+      "eager_seconds": 0.0010581310000361555,
+      "compiled_seconds": 0.0009437680000701221,
+      "compile_seconds": 8.913599992865784e-05,
+      "first_pass_seconds": 7.424388946000022,
+      "speedup": 1.0185763121933318,
       "codegens": [
-        "stax-native"
+        "stax-fused-cpu-segments"
       ]
     }
   ]
