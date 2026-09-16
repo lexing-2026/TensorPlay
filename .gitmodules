@@ -1,0 +1,42 @@
+[submodule "third_party/sleef"]
+	path = third_party/sleef
+	url = https://github.com/shibatch/sleef
+[submodule "third_party/NNPACK"]
+	path = third_party/NNPACK
+	url = https://github.com/Maratyszcza/NNPACK
+[submodule "third_party/cpuinfo"]
+	path = third_party/cpuinfo
+	url = https://github.com/pytorch/cpuinfo
+[submodule "third_party/FP16"]
+	path = third_party/FP16
+	url = https://github.com/Maratyszcza/FP16
+[submodule "third_party/FXdiv"]
+	path = third_party/FXdiv
+	url = https://github.com/Maratyszcza/FXdiv
+[submodule "third_party/psimd"]
+	path = third_party/psimd
+	url = https://github.com/Maratyszcza/psimd
+[submodule "third_party/pthreadpool"]
+	path = third_party/pthreadpool
+	url = https://github.com/google/pthreadpool
+[submodule "third_party/python-six"]
+	path = third_party/python-six
+	url = https://github.com/benjaminp/six
+[submodule "third_party/python-opcodes"]
+	path = third_party/python-opcodes
+	url = https://github.com/Maratyszcza/opcodes
+[submodule "third_party/python-peachpy"]
+	path = third_party/python-peachpy
+	url = https://github.com/malfet/PeachPy
+[submodule "third_party/gloo"]
+	path = third_party/gloo
+	url = https://github.com/pytorch/gloo
+[submodule "third_party/tensorpipe"]
+	path = third_party/tensorpipe
+	url = https://github.com/pytorch/tensorpipe
+[submodule "third_party/vulkan-headers"]
+	path = third_party/vulkan-headers
+	url = https://github.com/KhronosGroup/Vulkan-Headers
+[submodule "third_party/vulkan-memory-allocator"]
+	path = third_party/vulkan-memory-allocator
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
