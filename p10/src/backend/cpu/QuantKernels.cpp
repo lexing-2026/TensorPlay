@@ -1969,6 +1969,410 @@ Tensor _make_per_channel_quantized_tensor_cpu(const Tensor& self,
         make_per_channel_affine_quantizer(scale, zero_point, axis, qdt), qdt);
 }
 
+// ---------------------------------------------------------------------------
+// Quantized activations and shape ops.
+//
+// Elementwise activations (leaky_relu, elu, hardswish, hardsigmoid, sigmoid,
+// tanh) read the input qparams from the tensor, evaluate the float formula on
+// the dequantized values, and requantize into the explicit output qparams.
+// relu/relu6 and max pooling are order-preserving on the affine grid, so they
+// run on the integer codes and inherit the input qparams.  cat copies code
+// bytes directly when every input already carries the output qparams and
+// otherwise requantizes each element.  conv1d promotes its operands to 2d and
+// reuses the 2d kernel; conv3d runs the float convolution on the
+// dequantized operands.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Float-domain elementwise path shared by the requantizing activations.
+template <typename Fn>
+Tensor quantized_unary_float_cpu(const Tensor& self, double out_scale,
+                                 int64_t out_zero_point, const char* op_name,
+                                 Fn&& fn) {
+    if (self.dtype() != DType::QInt8) {
+        TP_THROW(TypeError,
+                 std::string(op_name) + "(): expected a QInt8 tensor");
+    }
+    if (!(out_scale > 0.0)) {
+        TP_THROW(ValueError,
+                 std::string(op_name) + "(): out_scale must be positive");
+    }
+    const Tensor sc = self.is_contiguous() ? self : self.contiguous();
+    Tensor out = Tensor::empty(self.shape(), DType::QInt8, self.device());
+    const int8_t* in = sc.data_ptr<int8_t>();
+    int8_t* po = out.data_ptr<int8_t>();
+    const int64_t numel = self.numel();
+    const double scale = quantized::q_scale(self);
+    const double zp = static_cast<double>(quantized::q_zero_point(self));
+    const double inv_out = 1.0 / out_scale;
+    for (int64_t i = 0; i < numel; ++i) {
+        const double x = (static_cast<double>(in[i]) - zp) * scale;
+        po[i] = requantize_value(fn(x), inv_out, out_zero_point);
+    }
+    out.impl()->set_quantizer(make_per_tensor_affine_quantizer(
+        out_scale, out_zero_point, DType::QInt8));
+    return out;
+}
+
+// Integer-domain elementwise path shared by the order-preserving ops; the
+// input quantizer is attached to the output unchanged.
+template <typename Fn>
+Tensor quantized_unary_code_cpu(const Tensor& self, const char* op_name,
+                                Fn&& fn) {
+    if (self.dtype() != DType::QInt8) {
+        TP_THROW(TypeError,
+                 std::string(op_name) + "(): expected a QInt8 tensor");
+    }
+    const Tensor sc = self.is_contiguous() ? self : self.contiguous();
+    Tensor out = Tensor::empty(self.shape(), DType::QInt8, self.device());
+    const int8_t* in = sc.data_ptr<int8_t>();
+    int8_t* po = out.data_ptr<int8_t>();
+    const int64_t numel = self.numel();
+    for (int64_t i = 0; i < numel; ++i) {
+        po[i] = fn(in[i]);
+    }
+    out.impl()->set_quantizer(self.impl()->quantizer());
+    return out;
+}
+
+Tensor quantized_cat_impl_cpu(const std::vector<Tensor>& tensors, int64_t dim,
+                              std::optional<double> scale,
+                              std::optional<int64_t> zero_point,
+                              bool relu_fused) {
+    if (tensors.empty()) {
+        TP_THROW(ValueError,
+                 "quantized_cat(): expected a non-empty tensor list");
+    }
+    for (const Tensor& t : tensors) {
+        if (t.dtype() != DType::QInt8) {
+            TP_THROW(TypeError,
+                     "quantized_cat(): only per-tensor QInt8 quantization is "
+                     "supported");
+        }
+        if (t.dim() != tensors[0].dim()) {
+            TP_THROW(ValueError,
+                     "quantized_cat(): tensors must have the same number of "
+                     "dimensions");
+        }
+    }
+    if (dim < 0) dim += tensors[0].dim();
+    if (dim < 0 || dim >= tensors[0].dim()) {
+        TP_THROW(ValueError, "quantized_cat(): dim out of range");
+    }
+    for (const Tensor& t : tensors) {
+        for (int64_t d = 0; d < t.dim(); ++d) {
+            if (d != dim && t.size(d) != tensors[0].size(d)) {
+                TP_THROW(ValueError,
+                         "quantized_cat(): sizes must match on the "
+                         "non-concatenated dimensions");
+            }
+        }
+    }
+
+    const double out_scale =
+        scale.has_value() ? *scale : quantized::q_scale(tensors[0]);
+    const int64_t out_zp =
+        zero_point.has_value() ? *zero_point : quantized::q_zero_point(tensors[0]);
+    if (!(out_scale > 0.0)) {
+        TP_THROW(ValueError, "quantized_cat(): scale must be positive");
+    }
+
+    std::vector<int64_t> out_shape =
+        static_cast<std::vector<int64_t>>(tensors[0].shape());
+    int64_t concat_size = 0;
+    for (const Tensor& t : tensors) concat_size += t.size(dim);
+    out_shape[dim] = concat_size;
+
+    Tensor out = Tensor::empty(out_shape, DType::QInt8, tensors[0].device());
+    int8_t* po = out.data_ptr<int8_t>();
+
+    int64_t outer = 1;
+    for (int64_t d = 0; d < dim; ++d) outer *= out_shape[d];
+    int64_t inner = 1;
+    for (int64_t d = dim + 1; d < out.dim(); ++d) inner *= out_shape[d];
+
+    bool same_qparams = true;
+    for (const Tensor& t : tensors) {
+        if (quantized::q_scale(t) != out_scale ||
+            quantized::q_zero_point(t) != out_zp) {
+            same_qparams = false;
+            break;
+        }
+    }
+
+    const double inv_out = 1.0 / out_scale;
+    int64_t offset = 0;
+    for (const Tensor& t : tensors) {
+        const Tensor tc = t.contiguous();
+        const int8_t* pi = tc.data_ptr<int8_t>();
+        const int64_t seg = t.size(dim);
+        if (same_qparams) {
+            // Grid-identical inputs: the codes concatenate verbatim.
+            for (int64_t o = 0; o < outer; ++o) {
+                std::memcpy(po + (o * concat_size + offset) * inner,
+                            pi + o * seg * inner,
+                            static_cast<size_t>(seg * inner) * sizeof(int8_t));
+            }
+        } else {
+            const double in_scale = quantized::q_scale(t);
+            const double in_zp = static_cast<double>(quantized::q_zero_point(t));
+            for (int64_t o = 0; o < outer; ++o) {
+                int8_t* dst =
+                    po + (o * concat_size + offset) * inner;
+                const int8_t* src = pi + o * seg * inner;
+                for (int64_t k = 0; k < seg * inner; ++k) {
+                    const double x =
+                        (static_cast<double>(src[k]) - in_zp) * in_scale;
+                    dst[k] = requantize_value(x, inv_out, out_zp);
+                }
+            }
+        }
+        offset += seg;
+    }
+    if (relu_fused) {
+        const int8_t q_zero = static_cast<int8_t>(out_zp);
+        const int64_t numel = out.numel();
+        for (int64_t i = 0; i < numel; ++i) {
+            po[i] = std::max(po[i], q_zero);
+        }
+    }
+    out.impl()->set_quantizer(make_per_tensor_affine_quantizer(
+        out_scale, out_zp, DType::QInt8));
+    return out;
+}
+
+} // namespace
+
+// Float 3d pooling lives in its own translation unit.
+Tensor max_pool3d_cpu(const Tensor& input,
+                      const std::vector<int64_t>& kernel_size,
+                      const std::vector<int64_t>& stride,
+                      const std::vector<int64_t>& padding,
+                      const std::vector<int64_t>& dilation, bool ceil_mode);
+
+Tensor quantized_relu_cpu(const Tensor& self) {
+    // On the affine grid the negative half-space is the code segment below
+    // the zero point, so relu is an integer max against the zero point.
+    const int64_t zp = quantized::q_zero_point(self);
+    return quantized_unary_code_cpu(
+        self, "quantized_relu", [zp](int8_t v) {
+            return static_cast<int8_t>(std::max<int64_t>(v, zp));
+        });
+}
+
+Tensor quantized_relu6_cpu(const Tensor& self) {
+    const double scale = quantized::q_scale(self);
+    const int64_t zp = quantized::q_zero_point(self);
+    // The upper bound is the grid position of the real value 6 under the
+    // input qparams; the lower bound is the zero point itself.
+    const int8_t q_six = requantize_value(6.0, 1.0 / scale, zp);
+    return quantized_unary_code_cpu(
+        self, "quantized_relu6", [zp, q_six](int8_t v) {
+            return static_cast<int8_t>(
+                std::min<int64_t>(std::max<int64_t>(v, zp), q_six));
+        });
+}
+
+Tensor quantized_leaky_relu_cpu(const Tensor& self, double negative_slope,
+                                double out_scale, int64_t out_zero_point) {
+    return quantized_unary_float_cpu(
+        self, out_scale, out_zero_point, "quantized_leaky_relu",
+        [negative_slope](double x) {
+            return x > 0.0 ? x : x * negative_slope;
+        });
+}
+
+Tensor quantized_elu_cpu(const Tensor& self, double out_scale,
+                         int64_t out_zero_point, double alpha, double scale,
+                         double input_scale) {
+    // Generalized formula: x >= 0 maps to x * scale, x < 0 maps to
+    // alpha * scale * expm1(x * input_scale).  For the standard ELU both
+    // scale and input_scale are 1.
+    return quantized_unary_float_cpu(
+        self, out_scale, out_zero_point, "quantized_elu",
+        [alpha, scale, input_scale](double x) {
+            return x >= 0.0 ? x * scale
+                            : std::expm1(x * input_scale) * alpha * scale;
+        });
+}
+
+Tensor quantized_hardswish_cpu(const Tensor& self, double out_scale,
+                               int64_t out_zero_point) {
+    return quantized_unary_float_cpu(
+        self, out_scale, out_zero_point, "quantized_hardswish",
+        [](double x) { return x * std::min(std::max(x + 3.0, 0.0), 6.0) / 6.0; });
+}
+
+Tensor quantized_hardsigmoid_cpu(const Tensor& self, double out_scale,
+                                 int64_t out_zero_point) {
+    return quantized_unary_float_cpu(
+        self, out_scale, out_zero_point, "quantized_hardsigmoid",
+        [](double x) { return std::min(std::max(x / 6.0 + 0.5, 0.0), 1.0); });
+}
+
+Tensor quantized_sigmoid_cpu(const Tensor& self, double out_scale,
+                             int64_t out_zero_point) {
+    return quantized_unary_float_cpu(
+        self, out_scale, out_zero_point, "quantized_sigmoid",
+        [](double x) { return 1.0 / (1.0 + std::exp(-x)); });
+}
+
+Tensor quantized_tanh_cpu(const Tensor& self, double out_scale,
+                          int64_t out_zero_point) {
+    return quantized_unary_float_cpu(
+        self, out_scale, out_zero_point, "quantized_tanh",
+        [](double x) { return std::tanh(x); });
+}
+
+Tensor quantized_cat_cpu(const std::vector<Tensor>& tensors, int64_t dim,
+                         std::optional<double> scale,
+                         std::optional<int64_t> zero_point) {
+    return quantized_cat_impl_cpu(tensors, dim, scale, zero_point, false);
+}
+
+Tensor quantized_cat_relu_cpu(const std::vector<Tensor>& tensors, int64_t dim,
+                              std::optional<double> scale,
+                              std::optional<int64_t> zero_point) {
+    return quantized_cat_impl_cpu(tensors, dim, scale, zero_point, true);
+}
+
+Tensor quantized_max_pool1d_cpu(
+    const Tensor& self, const std::vector<int64_t>& kernel_size,
+    const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+    const std::vector<int64_t>& dilation, bool ceil_mode) {
+    if (self.dtype() != DType::QInt8) {
+        TP_THROW(TypeError,
+                 "quantized_max_pool1d(): expected a QInt8 tensor");
+    }
+    if (self.dim() != 3) {
+        TP_THROW(ValueError,
+                 "quantized_max_pool1d(): expected a 3d input");
+    }
+    if (kernel_size.size() != 1 || padding.size() != 1 ||
+        dilation.size() != 1) {
+        TP_THROW(ValueError,
+                 "quantized_max_pool1d(): kernel_size, padding and dilation "
+                 "must have one element");
+    }
+    // The single spatial axis is lifted into a 2d window and the 2d pooling
+    // kernel runs on the code storage; the input quantizer is inherited.
+    const int64_t n = self.size(0), c = self.size(1), l = self.size(2);
+    const int64_t k = kernel_size[0];
+    const int64_t s = stride.empty() ? k : stride[0];
+    Tensor codes =
+        quantized::strip_quantizer(self).contiguous().view({n, c, 1, l});
+    Tensor pooled =
+        max_pool2d_cpu(codes, {1, k}, {1, s}, {0, padding[0]},
+                       {1, dilation[0]}, ceil_mode);
+    Tensor out = pooled.view(
+        {n, c, static_cast<std::vector<int64_t>>(pooled.shape())[3]});
+    return quantized::make_qtensor(out, self.impl()->quantizer(),
+                                   DType::QInt8);
+}
+
+Tensor quantized_max_pool3d_cpu(
+    const Tensor& self, const std::vector<int64_t>& kernel_size,
+    const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+    const std::vector<int64_t>& dilation, bool ceil_mode) {
+    if (self.dtype() != DType::QInt8) {
+        TP_THROW(TypeError,
+                 "quantized_max_pool3d(): expected a QInt8 tensor");
+    }
+    // The window maximum is order-preserving in the quantized domain, so the
+    // pooling runs on the code storage and the output inherits the input
+    // quantizer.
+    Tensor codes = quantized::strip_quantizer(self).contiguous();
+    Tensor out =
+        max_pool3d_cpu(codes, kernel_size, stride, padding, dilation,
+                       ceil_mode);
+    return quantized::make_qtensor(out, self.impl()->quantizer(),
+                                   DType::QInt8);
+}
+
+Tensor quantized_conv1d_cpu(
+    const Tensor& input, const Tensor& weight, std::optional<Tensor> bias,
+    double input_scale, int64_t input_zero_point, double weight_scale,
+    int64_t weight_zero_point, double out_scale, int64_t out_zero_point,
+    const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+    const std::vector<int64_t>& dilation, int64_t groups) {
+    if (input.dtype() != DType::QInt8 || weight.dtype() != DType::QInt8) {
+        TP_THROW(TypeError,
+                 "quantized_conv1d(): activations and weights must be QInt8");
+    }
+    if (input.dim() != 3 || weight.dim() != 3) {
+        TP_THROW(ValueError,
+                 "quantized_conv1d(): expected 3d activations and weights");
+    }
+    // 1d operands are promoted to 2d and the 2d kernel runs unchanged; the
+    // inserted length-1 spatial axis is dropped from the result.
+    const int64_t n = input.size(0), c = input.size(1), l = input.size(2);
+    const int64_t o = weight.size(0), cw = weight.size(1), k = weight.size(2);
+    Tensor in4 = quantized::make_qtensor(
+        quantized::strip_quantizer(input).contiguous().view({n, c, 1, l}),
+        input.impl()->quantizer(), DType::QInt8);
+    Tensor w4 = quantized::make_qtensor(
+        quantized::strip_quantizer(weight).contiguous().view({o, cw, 1, k}),
+        weight.impl()->quantizer(), DType::QInt8);
+    auto expand1 = [](const std::vector<int64_t>& v, int64_t fill) {
+        return v.empty() ? std::vector<int64_t>{fill, fill}
+                         : std::vector<int64_t>{fill, v[0]};
+    };
+    const std::vector<int64_t> stride2 = expand1(stride, 1);
+    const std::vector<int64_t> padding2 = expand1(padding, 0);
+    const std::vector<int64_t> dilation2 = expand1(dilation, 1);
+    Tensor out4 = quantized_conv2d_cpu(
+        in4, w4, std::move(bias), input_scale, input_zero_point, weight_scale,
+        weight_zero_point, out_scale, out_zero_point, stride2, padding2,
+        dilation2, groups);
+    const int64_t l_out =
+        static_cast<std::vector<int64_t>>(out4.shape())[3];
+    Tensor out = quantized::strip_quantizer(out4).contiguous().view({n, o, l_out});
+    return quantized::make_qtensor(
+        out, make_per_tensor_affine_quantizer(out_scale, out_zero_point,
+                                              DType::QInt8),
+        DType::QInt8);
+}
+
+Tensor quantized_conv3d_cpu(
+    const Tensor& input, const Tensor& weight, std::optional<Tensor> bias,
+    double input_scale, int64_t input_zero_point, double weight_scale,
+    int64_t weight_zero_point, double out_scale, int64_t out_zero_point,
+    const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+    const std::vector<int64_t>& dilation, int64_t groups) {
+    if (input.dtype() != DType::QInt8 || weight.dtype() != DType::QInt8) {
+        TP_THROW(TypeError,
+                 "quantized_conv3d(): activations and weights must be QInt8");
+    }
+    if (!(out_scale > 0.0)) {
+        TP_THROW(ValueError, "quantized_conv3d(): out_scale must be positive");
+    }
+    // Dequantize both operands, run the float 3d convolution (the bias is
+    // already in the float domain), then requantize into the output qparams.
+    Tensor x = dequantize_per_tensor_qint8_cpu(
+        input, input_scale, input_zero_point);
+    Tensor w = dequantize_per_tensor_qint8_cpu(
+        weight, weight_scale, weight_zero_point);
+    Tensor acc = conv3d_cpu(
+        x, w,
+        bias.has_value() ? bias->to(DType::Float32).contiguous() : Tensor(),
+        stride, padding, dilation, groups);
+
+    Tensor out = Tensor::empty(
+        static_cast<std::vector<int64_t>>(acc.shape()), DType::QInt8,
+        input.device());
+    const float* pa = acc.data_ptr<float>();
+    int8_t* po = out.data_ptr<int8_t>();
+    const int64_t numel = acc.numel();
+    const double inv_out = 1.0 / out_scale;
+    for (int64_t i = 0; i < numel; ++i) {
+        po[i] = requantize_value(pa[i], inv_out, out_zero_point);
+    }
+    out.impl()->set_quantizer(make_per_tensor_affine_quantizer(
+        out_scale, out_zero_point, DType::QInt8));
+    return out;
+}
+
 TENSORPLAY_LIBRARY_IMPL(CPU, QuantKernels) {
     m.impl("quantize_per_tensor", quantize_per_tensor_cpu);
     m.impl("quantize_per_channel", quantize_per_channel_cpu);
@@ -1978,8 +2382,22 @@ TENSORPLAY_LIBRARY_IMPL(CPU, QuantKernels) {
     m.impl("quantized_mul", quantized_mul_cpu);
     m.impl("quantized_div", quantized_div_cpu);
     m.impl("quantized_clamp", quantized_clamp_cpu);
+    m.impl("quantized_relu", quantized_relu_cpu);
+    m.impl("quantized_relu6", quantized_relu6_cpu);
+    m.impl("quantized_leaky_relu", quantized_leaky_relu_cpu);
+    m.impl("quantized_elu", quantized_elu_cpu);
+    m.impl("quantized_hardswish", quantized_hardswish_cpu);
+    m.impl("quantized_hardsigmoid", quantized_hardsigmoid_cpu);
+    m.impl("quantized_sigmoid", quantized_sigmoid_cpu);
+    m.impl("quantized_tanh", quantized_tanh_cpu);
+    m.impl("quantized_cat", quantized_cat_cpu);
+    m.impl("quantized_cat_relu", quantized_cat_relu_cpu);
+    m.impl("quantized_max_pool1d", quantized_max_pool1d_cpu);
     m.impl("quantized_max_pool2d", quantized_max_pool2d_cpu);
+    m.impl("quantized_max_pool3d", quantized_max_pool3d_cpu);
+    m.impl("quantized_conv1d", quantized_conv1d_cpu);
     m.impl("quantized_conv2d", quantized_conv2d_cpu);
+    m.impl("quantized_conv3d", quantized_conv3d_cpu);
     m.impl("quantized_conv2d_prepack", quantized_conv2d_prepack_cpu);
     m.impl("quantized_conv2d_unpack", quantized_conv2d_unpack_cpu);
     m.impl("fake_quantize_per_tensor_affine",

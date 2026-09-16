@@ -633,6 +633,15 @@ bool tpsa_equal(const Tensor& self, const Tensor& other) {
     if (self.dtype() != other.dtype()) return false;
     if (!(self.device() == other.device())) return false;
     if (self.numel() == 0) return true;
+    if (isQuantizedType(self.dtype())) {
+        // Quantized equality: identical affine parameters plus identical
+        // integer codes; the float domain is never entered.
+        if (!quantized::quantizer_of(self)->equalTo(quantized::quantizer_of(other))) {
+            return false;
+        }
+        const Tensor eq = quantized::strip_quantizer(self).eq(quantized::strip_quantizer(other));
+        return eq.all().item().to<bool>();
+    }
     const Tensor eq = self.eq(other);
     if (eq.numel() == 0) return true;
     const Tensor all = eq.all();
