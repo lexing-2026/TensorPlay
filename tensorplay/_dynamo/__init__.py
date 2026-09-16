@@ -7,7 +7,11 @@ eager execution the markers are inert metadata — the semantics of the marked
 callables never change.
 """
 
-from tensorplay.compiler import allow_in_graph  # noqa: F401
+from tensorplay.compiler import (
+    allow_in_graph,
+    assume_constant_result,
+    is_compiling,
+)  # noqa: F401
 
 
 def disallow_in_graph(fn):
@@ -33,6 +37,6 @@ def mark_static(tensor, dim=None):
     """Mark ``tensor`` (or one dimension of it) as static for shape policies.
 
     Eager execution has no dynamic shape environment, so this records
-    nothing; the marker stays a no-op that mirrors the compile-time API.
+    nothing; the marker stays a no-op matching the compile-time API.
     """
     return tensor

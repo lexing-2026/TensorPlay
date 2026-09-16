@@ -176,7 +176,7 @@ if __name__ == "__main__":
 
     with open(version_path, "w") as f:
         f.write("from typing import Optional\n\n")
-        f.write("__all__ = ['__version__', 'debug', 'cuda', 'git_version']\n")
+        f.write("__all__ = ['__version__', 'debug', 'cuda', 'git_version', 'hip', 'rocm', 'xpu']\n")
         f.write(f"__version__ = '{version}'\n")
         # NB: This is not 100% accurate, because you could have built the
         # library code with DEBUG, but csrc without DEBUG (in which case
@@ -184,3 +184,8 @@ if __name__ == "__main__":
         f.write(f"debug = {repr(bool(args.is_debug))}\n")
         f.write(f"cuda: Optional[str] = {repr(args.cuda_version)}\n")
         f.write(f"git_version = {repr(sha)}\n")
+        # Only CUDA builds are produced; the other accelerator fields exist
+        # so callers can probe them uniformly and read None as absent.
+        f.write("hip: Optional[str] = None\n")
+        f.write("rocm: Optional[str] = None\n")
+        f.write("xpu: Optional[str] = None\n")
