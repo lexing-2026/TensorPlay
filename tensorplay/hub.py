@@ -1,4 +1,5 @@
 import hashlib
+import os
 import re
 from types import ModuleType
 import logging
@@ -31,6 +32,19 @@ if not DEFAULT_CACHE_DIR.exists():
         DEFAULT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 _hub_dir: Optional[Path] = None
+
+# Home of the cache tree: $TENSORPLAY_HOME, falling back to
+# $XDG_CACHE_HOME/tensorplay, then ~/.cache/tensorplay.
+_ENV_HOME = "TENSORPLAY_HOME"
+_ENV_XDG_CACHE_HOME = "XDG_CACHE_HOME"
+
+def _get_torch_home() -> Path:
+    env_val = os.getenv(_ENV_HOME)
+    if env_val:
+        return Path(env_val).expanduser().resolve()
+    xdg = os.getenv(_ENV_XDG_CACHE_HOME)
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".cache"
+    return base / "tensorplay"
 
 def get_dir() -> Path:
     """Get the TensorPlay Hub cache directory used for storing downloaded models & weights."""

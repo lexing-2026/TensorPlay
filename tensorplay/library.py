@@ -230,7 +230,16 @@ def _validate_schema(schema: Any) -> str | None:
     if not isinstance(schema, str):
         raise TypeError(f"schema must be a str or None, got {type(schema)!r}")
     signature = schema.split("(", 1)[0].strip()
-    _validate_name(signature)
+    if signature:
+        _validate_name(signature)
+    elif not schema.lstrip().startswith("("):
+        # Bare-fragment spelling: custom_op carries the qualified name in
+        # its own argument, so the schema is just the signature.  A string
+        # that is neither a qualified head nor a signature is a typo.
+        raise ValueError(
+            f'expected a schema like "(Tensor x) -> Tensor" or '
+            f'"mylib::my_op(Tensor x) -> Tensor", got {schema!r}'
+        )
     return schema
 
 

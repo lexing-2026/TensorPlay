@@ -47,6 +47,7 @@ _T = TypeVar("_T")
 
 FlattenFn = Callable[[PyTree], tuple[list[Any], Context]]
 UnflattenFn = Callable[[Iterable[Any], Context], PyTree]
+FlattenWithKeysFn = Callable[[PyTree], tuple[list[Any], Context]]
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,9 @@ class NodeDef:
     flatten_fn: FlattenFn
     unflatten_fn: UnflattenFn
     serialized_type_name: Optional[str] = None
+    flatten_with_keys_fn: Optional[FlattenWithKeysFn] = None
+    to_dumpable_context: Optional[Any] = None
+    from_dumpable_context: Optional[Any] = None
 
 
 SUPPORTED_NODES: dict[type[Any], NodeDef] = {}
@@ -81,6 +85,9 @@ def register_pytree_node(
     unflatten_fn: UnflattenFn,
     *,
     serialized_type_name: Optional[str] = None,
+    flatten_with_keys_fn: Optional[FlattenWithKeysFn] = None,
+    to_dumpable_context: Optional[Any] = None,
+    from_dumpable_context: Optional[Any] = None,
 ) -> None:
     """Registers ``cls`` as a container type.
 
@@ -89,10 +96,20 @@ def register_pytree_node(
     children do not -- dict keys, a namedtuple's class, a defaultdict's
     factory.  ``serialized_type_name`` is the fully qualified name recorded
     when the tree spec is serialized; it must uniquely identify ``cls``.
+    ``flatten_with_keys_fn`` optionally supplies a key-aware flatten; the
+    dumpable-context pair optionalizes the spec serialization hooks.
     """
     if cls in SUPPORTED_NODES:
         raise ValueError(f"{cls} is already registered as a pytree node type")
-    SUPPORTED_NODES[cls] = NodeDef(cls, flatten_fn, unflatten_fn, serialized_type_name)
+    SUPPORTED_NODES[cls] = NodeDef(
+        cls,
+        flatten_fn,
+        unflatten_fn,
+        serialized_type_name,
+        flatten_with_keys_fn,
+        to_dumpable_context,
+        from_dumpable_context,
+    )
 
 
 def _deregister_pytree_node(cls: type[Any]) -> None:
@@ -431,6 +448,43 @@ def _list_unflatten(values, context):
 
 def _dict_flatten(d):
     return list(d.values()), list(d.keys())
+
+
+class MappingKey:
+    """A dictionary key carried inside a key path.
+
+    Wraps the key so flattened-with-keys results stay addressable through
+    ``get`` regardless of whether the key is hashable-stable across trees.
+    """
+
+    __slots__ = ("key",)
+
+    def __init__(self, key):
+        self.key = key
+
+    def __eq__(self, other):
+        return isinstance(other, MappingKey) and self.key == other.key
+
+    def __hash__(self):
+        return hash(self.key)
+
+    def __str__(self):
+        return f"[{self.key!r}]"
+
+    def get(self, mapping):
+        return mapping[self.key]
+
+
+def key_get(obj, kp):
+    """Resolve a key path (a sequence of key entries) against an object."""
+    for k in kp:
+        obj = k.get(obj)
+    return obj
+
+
+def _dict_flatten_with_keys(d):
+    values, context = _dict_flatten(d)
+    return [(MappingKey(k), v) for k, v in zip(context, values)], context
 
 
 def _dict_unflatten(values, context):
