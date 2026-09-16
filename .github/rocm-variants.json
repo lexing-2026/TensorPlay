@@ -2,7 +2,13 @@
   {
     "variant": "rocm72",
     "toolkit": "7.2.4",
-    "arch": "gfx1100",
+    "arch": ["gfx1100"],
+    "image": "rocm/dev-ubuntu-22.04:7.2.4-complete"
+  },
+  {
+    "variant": "rocm72-multiarch",
+    "toolkit": "7.2.4",
+    "arch": ["gfx90a", "gfx942", "gfx950", "gfx1100"],
     "image": "rocm/dev-ubuntu-22.04:7.2.4-complete"
   }
 ]

@@ -11,6 +11,10 @@ on:
         required: true
         type: string
         description: Existing GitHub Release tag to receive the ROCm wheel, e.g. v1.0.0
+      variant:
+        required: false
+        type: string
+        description: HIP variant from .github/rocm-variants.json; empty builds the default (gfx1100) variant
 
 permissions: read-all
 
@@ -27,20 +31,30 @@ jobs:
           show-progress: false
       - id: read-matrix
         shell: bash
+        env:
+          WANT_VARIANT: ${{ inputs.variant }}
         run: |
           set -euo pipefail
           # The HIP lane sweeps the same Python versions as the CPU/CUDA
           # publishing matrix; the extension module is ABI-bound, so each
-          # version needs its own compiled wheel.
-          matrix="$(jq -c --slurpfile variants .github/rocm-variants.json '
+          # version needs its own compiled wheel. An empty variant input
+          # pins the run to the first (default) entry, so adding opt-in
+          # variants never widens the default build; arch entries may be
+          # a single target or a list baked into one wheel.
+          matrix="$(jq -c --slurpfile variants .github/rocm-variants.json --arg want "$WANT_VARIANT" '
             [
               .python_versions[] as $python |
-              $variants[0][0] as $rocm |
+              (if $want == ""
+               then $variants[0][0]
+               else ($variants[0][] | select(.variant == $want))
+               end) as $rocm |
               {
                 python: $python,
                 variant: $rocm.variant,
                 toolkit: $rocm.toolkit,
-                arch: $rocm.arch,
+                arch: (if ($rocm.arch | type) == "array"
+                       then ($rocm.arch | join(";"))
+                       else $rocm.arch end),
                 image: $rocm.image,
                 build_name: ("tensorplay-linux-" + $rocm.variant + "-py" + ($python | gsub("\\."; "_")))
               }
@@ -245,7 +259,7 @@ jobs:
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v7
         with:
-          name: tensorplay-rocm72-${{ matrix.python }}-wheel
+          name: tensorplay-rocm-${{ matrix.variant }}-${{ matrix.python }}-wheel
           path: dist/*.whl
           if-no-files-found: error
 
@@ -258,7 +272,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          pattern: tensorplay-rocm72-*-wheel
+          pattern: tensorplay-rocm-*-wheel
           merge-multiple: true
           path: dist
 

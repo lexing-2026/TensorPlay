@@ -556,21 +556,37 @@ endif()
 
 option(USE_BLAS "Enable BLAS linear algebra acceleration" ON)
 
-# Vulkan backend: enabled when a Vulkan loader can be located.  The loader
-# is linked from the system; headers are vendored under
+# Vulkan backend: enabled when the full toolchain can be located.  The
+# loader is linked from the system; headers are vendored under
 # third_party/vulkan-headers and the GLSL compiler is vendored under
 # tools/bin/glslangValidator, so no Vulkan SDK install is required.
+# The loader probe accepts the versioned runtime library too: machines
+# with driver stacks routinely lack the unversioned development symlink,
+# and linking the versioned soname produces the same runtime dependency.
+# Auto-detection requires every piece (loader, headers, GLSL compiler) so
+# a partial install degrades to a CPU build instead of failing the
+# configure step; an explicit USE_VULKAN=ON keeps the hard errors so a
+# forced build surfaces what is actually missing.
 if(NOT DEFINED USE_VULKAN)
-    find_library(VULKAN_LOADER_CANDIDATE vulkan)
-    if(VULKAN_LOADER_CANDIDATE)
+    find_library(TP_VULKAN_PROBE_LIB NAMES vulkan libvulkan.so.1)
+    find_path(TP_VULKAN_PROBE_INCLUDE vulkan/vulkan.h
+        HINTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan-headers"
+              "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan-headers/include")
+    find_program(TP_VULKAN_PROBE_GLSLANG glslangValidator
+        PATHS "${CMAKE_CURRENT_SOURCE_DIR}/tools/bin"
+        NO_DEFAULT_PATH)
+    if(TP_VULKAN_PROBE_LIB AND TP_VULKAN_PROBE_INCLUDE AND TP_VULKAN_PROBE_GLSLANG)
         set(USE_VULKAN ON)
     else()
         set(USE_VULKAN OFF)
+        if(TP_VULKAN_PROBE_LIB)
+            message(STATUS "Vulkan loader found but the headers or the GLSL compiler are missing; building without Vulkan support.")
+        endif()
     endif()
 endif()
 option(USE_VULKAN "Enable Vulkan support" ${USE_VULKAN})
 if(USE_VULKAN)
-    find_library(VULKAN_LIBRARY NAMES vulkan)
+    find_library(VULKAN_LIBRARY NAMES vulkan libvulkan.so.1)
     if(NOT VULKAN_LIBRARY)
         message(FATAL_ERROR "USE_VULKAN is ON but the Vulkan loader library was not found.")
     endif()

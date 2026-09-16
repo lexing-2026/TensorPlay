@@ -855,9 +855,14 @@ if(WIN32)
     endif()
 endif()
 if(USE_VULKAN)
+    # The vendored trees come in two layouts: a flattened snapshot (headers
+    # at the tree root) and a restored upstream clone (headers under
+    # include/); list both roots so either checkout resolves.
     target_include_directories(p10 SYSTEM PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/vulkan-headers"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/vulkan-headers/include"
         "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/vulkan-memory-allocator"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/vulkan-memory-allocator/include"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/vulkan/api"
         "${TP_VULKAN_GEN_DIR}")
     target_link_libraries(p10 PRIVATE ${VULKAN_LIBRARY})
