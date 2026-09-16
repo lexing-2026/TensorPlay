@@ -32,8 +32,7 @@ _INT64_MAX = np.iinfo(np.int64).max
 _INT64_MIN = np.iinfo(np.int64).min
 
 
-class UnsupportedOperatorError(NotImplementedError):
-    """Raised when a captured operation has no ONNX lowering."""
+from .errors import UnsupportedOperatorError  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
