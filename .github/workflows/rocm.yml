@@ -134,7 +134,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --break-system-packages \
+          SUDO=""
+          if [ "$(id -u)" != "0" ]; then SUDO=sudo; fi
+          # python -m build creates an isolated venv, and the wheel links
+          # host objects, so both the venv module and a C/C++ toolchain
+          # must be present even though HIP carries its own device clang.
+          $SUDO apt-get update -qq
+          $SUDO apt-get install -y -qq python3-venv build-essential 1>/dev/null
+          # Older system pips predate the PEP 668 escape hatch; only pass
+          # the flag when the installed pip actually understands it.
+          PIP_EXTRA=""
+          if python3 -m pip install --help 2>&1 | grep -q -- --break-system-packages; then
+            PIP_EXTRA="--break-system-packages"
+            echo "PIP_EXTRA=--break-system-packages" >> "$GITHUB_ENV"
+          fi
+          python3 -m pip install $PIP_EXTRA \
             --disable-pip-version-check --upgrade \
             pip build packaging numpy PyYAML typing-extensions
 
@@ -188,7 +202,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --break-system-packages --force-reinstall dist/*.whl
+          python3 -m pip install ${PIP_EXTRA:-} --force-reinstall dist/*.whl
           cd /tmp
           python3 - <<'PY'
           import tensorplay as tp
