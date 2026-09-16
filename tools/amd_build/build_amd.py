@@ -34,6 +34,10 @@ INCLUDE_FIXES = {
     # thrust compatibility layer on the AMD side; the CUDA device-standard
     # headers have no HIP-spelled equivalent to map onto.
     "#include <cuda/std/functional>": "#include <thrust/functional.h>",
+    # The collectives wrapper re-exports the cub namespace over hipCUB on the
+    # AMD side, so per-feature cub headers map onto the hipCUB umbrella;
+    # the AMD toolchain ships no cub/ header directory of its own.
+    "#include <cub/device/device_scan.cuh>": "#include <hipcub/hipcub.hpp>",
     # The HIP staging copies the loops header to hip/HIPLoops.cuh; the
     # hipifier drops this include when file ordering puts the target
     # after the includer, so the mapping is pinned here.
