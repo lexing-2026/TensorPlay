@@ -141,6 +141,19 @@ if sys.platform == 'win32':
 # Keep the same behavior here: a normal CPU-only import does not eagerly load
 # CUDA, while a CUDA build remains importable from NVIDIA Python wheels.
 elif sys.platform.startswith('linux'):
+    # The CUDA wheels consolidate their libraries under a per-toolkit-major
+    # directory (nvidia/cuNN, e.g. cu13 for the 13.x generation). Derive the
+    # directory from the toolkit version baked into the build metadata so the
+    # scan follows the wheel generation this package was linked against. A
+    # package whose metadata names no toolkit (CPU build) skips the scan; a
+    # preloaded object carrying a foreign SONAME satisfies nothing and the
+    # extension retry surfaces the honest missing-soname error.
+    try:
+        from .version import cuda as _tp_cuda_toolkit
+    except ImportError:
+        _tp_cuda_toolkit = None
+    _tp_cuda_wheel_dir = _tp_cuda_toolkit.split('.', 1)[0] if _tp_cuda_toolkit else None
+
     def _get_cuda_dep_paths(path, lib_folder, lib_name):
         paths = []
         # Exact wheel layout only (nvidia/cuda_runtime, nvidia/cublas, ...).
@@ -148,10 +161,16 @@ elif sys.platform.startswith('linux'):
         # wheels like nvidia/cu13 and dlopen the wrong libcudart SONAME,
         paths.extend(glob.glob(os.path.join(path, 'nvidia', lib_folder, 'lib', lib_name)))
         paths.extend(glob.glob(os.path.join(path, lib_folder, 'lib', lib_name)))
+        if _tp_cuda_wheel_dir:
+            paths.extend(glob.glob(os.path.join(
+                path, 'nvidia', 'cu' + _tp_cuda_wheel_dir, 'lib', lib_name)))
         if not paths and '.so.' in lib_name:
             stem = lib_name.split('.so.', 1)[0]
             paths.extend(glob.glob(os.path.join(path, 'nvidia', lib_folder, 'lib', stem + '.so')))
             paths.extend(glob.glob(os.path.join(path, lib_folder, 'lib', stem + '.so')))
+            if _tp_cuda_wheel_dir:
+                paths.extend(glob.glob(os.path.join(
+                    path, 'nvidia', 'cu' + _tp_cuda_wheel_dir, 'lib', stem + '.so')))
         return paths
 
     def _preload_cuda_lib(lib_folder, lib_name, required=True):
@@ -221,7 +240,7 @@ from ._C import (tensor, DType, Size, Scalar, SymInt, SymBool, SymFloat,
 from .autograd import (no_grad, enable_grad, set_grad_enabled, is_grad_enabled,
                        inference_mode)
 from .serialization import save, load, inspect_checkpoint
-from .serialization import archive as _serialization_torch
+from .serialization import archive as _serialization_archive
 from .random import fork_rng
 
 # -------------------------------------------------------------------------

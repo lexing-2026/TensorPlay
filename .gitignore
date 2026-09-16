@@ -52,13 +52,28 @@ website/
 node_modules/
 **/node_modules/
 
-# Third party sources; hipify is a tracked vendored package, the rest are
-# local clones restored by CI (see .github/scripts/restore-vendored-deps.sh)
+# Third party sources; hipify is a tracked vendored package, the pinned
+# dependencies are git submodules, and everything else stays a local clone
+# restored by CI (see .github/scripts/restore-vendored-deps.sh)
 /third_party/*
 !/third_party/hipify/
 !/third_party/hipify/**
 !/third_party/*.py
 !/third_party/*.zip
+!/third_party/sleef
+!/third_party/NNPACK
+!/third_party/cpuinfo
+!/third_party/FP16
+!/third_party/FXdiv
+!/third_party/psimd
+!/third_party/pthreadpool
+!/third_party/python-six
+!/third_party/python-opcodes
+!/third_party/python-peachpy
+!/third_party/gloo
+!/third_party/tensorpipe
+!/third_party/vulkan-headers
+!/third_party/vulkan-memory-allocator
 
 # Object/library build artifacts (never intentionally versioned)
 *.o
