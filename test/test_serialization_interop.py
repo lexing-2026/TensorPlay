@@ -13,7 +13,7 @@ import pytest
 import tensorplay as tp
 
 from tensorplay.serialization import inspect_checkpoint, _sniff_format
-from tensorplay import _serialization_torch as st
+from tensorplay import _serialization_archive as st
 
 
 TORCH_MAGIC_NUMBER = 0x1950A86A20F9469CFC6C

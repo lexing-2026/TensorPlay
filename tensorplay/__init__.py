@@ -240,7 +240,7 @@ from ._C import (tensor, DType, Size, Scalar, SymInt, SymBool, SymFloat,
 from .autograd import (no_grad, enable_grad, set_grad_enabled, is_grad_enabled,
                        inference_mode)
 from .serialization import save, load, inspect_checkpoint
-from .serialization import archive as _serialization_torch
+from .serialization import archive as _serialization_archive
 from .random import fork_rng
 
 # -------------------------------------------------------------------------
