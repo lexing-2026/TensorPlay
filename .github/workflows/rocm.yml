@@ -2,6 +2,7 @@ name: rocm-wheel
 
 # ROCm is intentionally opt-in. This workflow is dispatched manually after a
 # release exists; it does not expand the default CPU/CUDA release matrix.
+# Like the publishing matrix, it builds one wheel per supported Python ABI.
 
 on:
   workflow_dispatch:
@@ -10,16 +11,67 @@ on:
         required: true
         type: string
         description: Existing GitHub Release tag to receive the ROCm wheel, e.g. v1.0.0
+      variant:
+        required: false
+        type: string
+        description: HIP variant from .github/rocm-variants.json; empty builds the default (gfx1100) variant
 
 permissions: read-all
 
 jobs:
+  define-rocm-matrix:
+    name: define-rocm-matrix
+    runs-on: ubuntu-latest
+    outputs:
+      builds: ${{ steps.read-matrix.outputs.builds }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          show-progress: false
+      - id: read-matrix
+        shell: bash
+        env:
+          WANT_VARIANT: ${{ inputs.variant }}
+        run: |
+          set -euo pipefail
+          # The HIP lane sweeps the same Python versions as the CPU/CUDA
+          # publishing matrix; the extension module is ABI-bound, so each
+          # version needs its own compiled wheel. An empty variant input
+          # pins the run to the first (default) entry, so adding opt-in
+          # variants never widens the default build; arch entries may be
+          # a single target or a list baked into one wheel.
+          matrix="$(jq -c --slurpfile variants .github/rocm-variants.json --arg want "$WANT_VARIANT" '
+            [
+              .python_versions[] as $python |
+              (if $want == ""
+               then $variants[0][0]
+               else ($variants[0][] | select(.variant == $want))
+               end) as $rocm |
+              {
+                python: $python,
+                variant: $rocm.variant,
+                toolkit: $rocm.toolkit,
+                arch: (if ($rocm.arch | type) == "array"
+                       then ($rocm.arch | join(";"))
+                       else $rocm.arch end),
+                image: $rocm.image,
+                build_name: ("tensorplay-linux-" + $rocm.variant + "-py" + ($python | gsub("\\."; "_")))
+              }
+            ]' .github/wheel-platforms.json)"
+          echo "builds=$matrix" >> "$GITHUB_OUTPUT"
+
   build-rocm:
-    name: tensorplay-linux-rocm72-py3
+    name: ${{ matrix.build_name }}
+    needs: define-rocm-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.define-rocm-matrix.outputs.builds) }}
     runs-on: ubuntu-22.04
     timeout-minutes: 150
     container:
-      image: rocm/dev-ubuntu-22.04:7.2.4-complete
+      image: ${{ matrix.image }}
     permissions:
       contents: read
     steps:
@@ -27,6 +79,12 @@ jobs:
         with:
           submodules: false
           show-progress: false
+
+      # The container's system interpreter is too old for the build; every
+      # lane pins the matrix Python, which also fixes the wheel's ABI tag.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
 
       - name: Set compiler cache location
         shell: bash
@@ -60,9 +118,9 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ${{ env.CACHE_PATH }}
-          key: buildcache-${{ runner.os }}-${{ runner.arch }}-rocm-linux-x86_64-py3-${{ github.sha }}
+          key: buildcache-${{ runner.os }}-${{ runner.arch }}-rocm-linux-x86_64-py${{ matrix.python }}-${{ github.sha }}
           restore-keys: |
-            buildcache-${{ runner.os }}-${{ runner.arch }}-rocm-linux-x86_64-py3-
+            buildcache-${{ runner.os }}-${{ runner.arch }}-rocm-linux-x86_64-py${{ matrix.python }}-
 
       # The wheel links vendored SLEEF/NNPACK trees that CI checkouts do
       # not carry; fetch the pinned revisions before configuring. The
@@ -104,25 +162,11 @@ jobs:
             rm -rf /tmp/sccache.tar.gz "/tmp/sccache-v0.8.1-${sccache_target}"
           fi
 
-      - name: Load ROCm build configuration
-        id: rocm-config
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json
-          from pathlib import Path
-
-          config = json.loads(Path(".github/rocm-variants.json").read_text())[0]
-          for key in ("variant", "toolkit", "arch"):
-              print(f"{key}={config[key]}")
-          PY
-
       - name: Set ROCm wheel version
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
-          VARIANT: ${{ steps.rocm-config.outputs.variant }}
+          VARIANT: ${{ matrix.variant }}
         run: |
           set -euo pipefail
           build_version="${RELEASE_TAG#v}"
@@ -134,7 +178,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --break-system-packages \
+          SUDO=""
+          if [ "$(id -u)" != "0" ]; then SUDO=sudo; fi
+          # python -m build creates an isolated venv, and the wheel links
+          # host objects, so both the venv module and a C/C++ toolchain
+          # must be present even though HIP carries its own device clang.
+          $SUDO apt-get update -qq
+          $SUDO apt-get install -y -qq python3-venv build-essential 1>/dev/null
+          # Older system pips predate the PEP 668 escape hatch; only pass
+          # the flag when the installed pip actually understands it. The
+          # tool-cache interpreter the matrix pins does not carry the
+          # marker, but the fallback keeps bare images working too.
+          PIP_EXTRA=""
+          if python3 -m pip install --help 2>&1 | grep -q -- --break-system-packages; then
+            PIP_EXTRA="--break-system-packages"
+            echo "PIP_EXTRA=--break-system-packages" >> "$GITHUB_ENV"
+          fi
+          python3 -m pip install $PIP_EXTRA \
             --disable-pip-version-check --upgrade \
             pip build packaging numpy PyYAML typing-extensions
 
@@ -143,7 +203,7 @@ jobs:
         env:
           USE_CUDA: "OFF"
           USE_ROCM: "ON"
-          TP_ROCM_ARCH: ${{ steps.rocm-config.outputs.arch }}
+          TP_ROCM_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           python3 -m build --wheel
@@ -160,12 +220,12 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: ${{ env.CACHE_PATH }}
-          key: buildcache-${{ runner.os }}-${{ runner.arch }}-rocm-linux-x86_64-py3-${{ github.sha }}
+          key: buildcache-${{ runner.os }}-${{ runner.arch }}-rocm-linux-x86_64-py${{ matrix.python }}-${{ github.sha }}
 
       - name: Verify ROCm wheel metadata
         shell: bash
         env:
-          VARIANT: ${{ steps.rocm-config.outputs.variant }}
+          VARIANT: ${{ matrix.variant }}
         run: |
           set -euo pipefail
           python3 - "$VARIANT" <<'PY'
@@ -188,7 +248,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --break-system-packages --force-reinstall dist/*.whl
+          python3 -m pip install ${PIP_EXTRA:-} --force-reinstall dist/*.whl
           cd /tmp
           python3 - <<'PY'
           import tensorplay as tp
@@ -199,7 +259,7 @@ jobs:
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v7
         with:
-          name: tensorplay-rocm72-wheel
+          name: tensorplay-rocm-${{ matrix.variant }}-${{ matrix.python }}-wheel
           path: dist/*.whl
           if-no-files-found: error
 
@@ -212,7 +272,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: tensorplay-rocm72-wheel
+          pattern: tensorplay-rocm-*-wheel
+          merge-multiple: true
           path: dist
 
       - name: Verify target release exists

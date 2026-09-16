@@ -28,12 +28,35 @@ message(STATUS "Found ROCm: ${ROCM_PATH}")
 list(APPEND CMAKE_PREFIX_PATH ${ROCM_PATH})
 
 # GPU architectures to codegen for.  The value accepts an
-# env var list ("gfx1103;gfx1100"); a bare arch string is accepted too.  A
-# cache variable set with -DTP_ROCM_ARCH=... takes precedence.
+# env var list ("gfx1100;gfx1103"); a bare arch string is accepted too.  A
+# cache variable set with -DTP_ROCM_ARCH=... takes precedence.  Without an
+# explicit list the installed GPUs are enumerated; a machine with no
+# detectable AMD GPU fails the configure step and must set TP_ROCM_ARCH.
 if(NOT TP_ROCM_ARCH AND DEFINED ENV{TP_ROCM_ARCH})
   set(TP_ROCM_ARCH $ENV{TP_ROCM_ARCH})
-elseif(NOT TP_ROCM_ARCH)
-  set(TP_ROCM_ARCH "gfx1103")
+endif()
+if(NOT TP_ROCM_ARCH)
+  find_program(TP_ROCM_AGENT_ENUMERATOR rocm_agent_enumerator
+    HINTS "${ROCM_PATH}/bin")
+  if(NOT TP_ROCM_AGENT_ENUMERATOR)
+    message(FATAL_ERROR
+      "TP_ROCM_ARCH is not set and rocm_agent_enumerator was not found "
+      "under ${ROCM_PATH}; set TP_ROCM_ARCH to the architecture list to "
+      "build for (e.g. gfx1100).")
+  endif()
+  execute_process(
+    COMMAND "${TP_ROCM_AGENT_ENUMERATOR}"
+    COMMAND bash "-c" "grep -v gfx000 | sort -u | paste -sd';'"
+    RESULT_VARIABLE TP_ROCM_AGENT_RESULT
+    OUTPUT_VARIABLE TP_ROCM_ARCH_INSTALLED
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(NOT TP_ROCM_AGENT_RESULT EQUAL 0 OR "${TP_ROCM_ARCH_INSTALLED}" STREQUAL "")
+    message(FATAL_ERROR
+      "Could not detect an AMD GPU architecture on this machine "
+      "(rocm_agent_enumerator exit ${TP_ROCM_AGENT_RESULT}); set "
+      "TP_ROCM_ARCH to the architecture list to build for.")
+  endif()
+  set(TP_ROCM_ARCH "${TP_ROCM_ARCH_INSTALLED}")
 endif()
 string(REPLACE "," ";" TP_ROCM_ARCH "${TP_ROCM_ARCH}")
 string(REPLACE " " ";" TP_ROCM_ARCH "${TP_ROCM_ARCH}")
