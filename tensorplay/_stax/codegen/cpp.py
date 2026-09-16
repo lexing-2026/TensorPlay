@@ -984,14 +984,14 @@ def compile_translation_unit(
                             *isa.build_arch_flags(),
                         ],
                         library_dirs=[lib_dir],
-                        # ``tpx`` must stay on the link line: libp10 carries
-                        # undefined references into the tpx ops namespace,
-                        # and a kernel module that omits it fails to dlopen
-                        # under RTLD_LOCAL (then silently loses the compiled
-                        # route to the interpreter fallback).
-                        libraries=["p10", "tpx", "tp_python"]
+                        # ``tpx`` is a header-only interface target: its ops
+                        # namespace is compiled into libp10, so there is no
+                        # libtpx artifact to link and naming it fails every
+                        # kernel build (which then silently loses the
+                        # compiled route to the interpreter fallback).
+                        libraries=["p10", "tp_python"]
                         if pinned
-                        else ["p10", "tpx"],
+                        else ["p10"],
                         ldflags=[f"-Wl,-rpath,{lib_dir}"],
                     )
                     builder = CppBuilder(
