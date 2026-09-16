@@ -85,8 +85,17 @@ static DType result_type_with_scalar(const Tensor& t, const Scalar& s) {
 
 // Helper for comparison ops.
 // kEquality=false: ordering ops (lt/le/gt/ge) are undefined over complex.
+Tensor dequantize_self_cpu(const Tensor& self);
+
+// Comparator ops accept quantized tensors by dequantizing both operands into
+// the float domain; the comparison itself runs on the dequantized values.
 template<bool kEquality, typename Op>
 Tensor comparison_kernel_impl(const Tensor& self, const Tensor& other, Op op) {
+    if (isQuantizedType(self.dtype()) || isQuantizedType(other.dtype())) {
+        Tensor self_f = isQuantizedType(self.dtype()) ? dequantize_self_cpu(self) : self;
+        Tensor other_f = isQuantizedType(other.dtype()) ? dequantize_self_cpu(other) : other;
+        return comparison_kernel_impl<kEquality>(self_f, other_f, op);
+    }
     std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
 
     // Result is always Bool
@@ -141,9 +150,10 @@ Tensor ge_tensor_kernel(const Tensor& self, const Tensor& other) {
 // casting it into self.dtype() (which truncated e.g. eq(2.5) on int tensors)
 #define DEFINE_CMP_SCALAR_KERNEL(NAME) \
 Tensor NAME##_scalar_kernel(const Tensor& self, Scalar other) { \
-    DType common = result_type_with_scalar(self, other); \
-    Tensor other_t = Tensor::full({}, other, common, self.device()); \
-    return NAME##_tensor_kernel(self.to(common), other_t); \
+    Tensor self_f = isQuantizedType(self.dtype()) ? dequantize_self_cpu(self) : self; \
+    DType common = result_type_with_scalar(self_f, other); \
+    Tensor other_t = Tensor::full({}, other, common, self_f.device()); \
+    return NAME##_tensor_kernel(self_f.to(common), other_t); \
 }
 
 DEFINE_CMP_SCALAR_KERNEL(eq)

@@ -4604,6 +4604,77 @@
     CUDA: quantized_conv2d_cuda
     Vulkan: quantized_conv2d
 
+# Quantized relu keeps the input qparams: on the affine grid the negative
+# half-space is the code segment below the zero point, so the op is an
+# integer max and the output inherits the input quantizer.
+- func: quantized_relu(Tensor self) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_relu_cpu
+
+# Quantized relu6 clamps the codes between the zero point and the grid
+# position of the real value 6 under the input qparams.
+- func: quantized_relu6(Tensor self) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_relu6_cpu
+
+- func: quantized_leaky_relu(Tensor self, float negative_slope, float output_scale, int output_zero_point) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_leaky_relu_cpu
+
+# Generalized ELU: x >= 0 maps to x * scale, x < 0 maps to
+# alpha * scale * expm1(x * input_scale).  The standard ELU passes
+# scale = input_scale = 1.
+- func: quantized_elu(Tensor self, float output_scale, int output_zero_point, float alpha=1.0, float scale=1.0, float input_scale=1.0) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_elu_cpu
+
+- func: quantized_hardswish(Tensor self, float output_scale, int output_zero_point) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_hardswish_cpu
+
+- func: quantized_hardsigmoid(Tensor self, float output_scale, int output_zero_point) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_hardsigmoid_cpu
+
+- func: quantized_sigmoid(Tensor self, float output_scale, int output_zero_point) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_sigmoid_cpu
+
+- func: quantized_tanh(Tensor self, float output_scale, int output_zero_point) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_tanh_cpu
+
+# Per-tensor affine concatenation.  The output qparams default to the first
+# input's; inputs already carrying them are concatenated at the byte level,
+# the others are requantized elementwise.
+- func: quantized_cat(Tensor[] tensors, int dim=0, float? scale=None, int? zero_point=None) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_cat_cpu
+
+- func: quantized_cat_relu(Tensor[] tensors, int dim=0, float? scale=None, int? zero_point=None) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_cat_relu_cpu
+
+- func: quantized_conv1d(Tensor input, Tensor weight, Tensor? bias, float input_scale, int input_zero_point, float weight_scale, int weight_zero_point, float out_scale, int out_zero_point, int[] stride=1, int[] padding=0, int[] dilation=1, int groups=1) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_conv1d_cpu
+
+- func: quantized_conv3d(Tensor input, Tensor weight, Tensor? bias, float input_scale, int input_zero_point, float weight_scale, int weight_zero_point, float out_scale, int out_zero_point, int[] stride=1, int[] padding=0, int[] dilation=1, int groups=1) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_conv3d_cpu
+
 # ---------------------------------------------------------------------------
 # Native forward-mode AD (JVP) kernels: each op evaluates the primal and its
 # tangent propagation in one pass, {primal_out, tangent_out}.  Used by
@@ -6557,8 +6628,14 @@
   variants: function
 - func: quantized_max_pool1d(Tensor self, int[1] kernel_size, int[1] stride=[], int[1] padding=0, int[1] dilation=1, bool ceil_mode=False) -> Tensor
   variants: function
+  dispatch:
+    CPU: quantized_max_pool1d_cpu
+
 - func: quantized_max_pool3d(Tensor self, int[3] kernel_size, int[3] stride=[], int[3] padding=0, int[3] dilation=1, bool ceil_mode=False) -> Tensor
   variants: function
+  dispatch:
+    CPU: quantized_max_pool3d_cpu
+
 - func: mean.dtype_out(Tensor self, *, ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: mean.out(Tensor self, int[1]? dim, bool keepdim=False, *, ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)
