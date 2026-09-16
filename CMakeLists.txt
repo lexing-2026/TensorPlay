@@ -100,25 +100,49 @@ if(USE_CUDA)
         enable_language(CUDA)
         set(CMAKE_CUDA_STANDARD 20)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-        # Target architectures are taken from TORCH_CUDA_ARCH_LIST (variable
-        # or environment), converted into nvcc gencode flags by the vendored
-        # select_compute_arch helper. CMAKE_CUDA_ARCHITECTURES is not used:
-        # leaving it unset lets CMake default it to 52, which both predates
-        # the double-precision atomics used by the kernels and is rejected
-        # outright by newer toolkits that dropped the pre-sm_75 targets.
-        if((NOT DEFINED TORCH_CUDA_ARCH_LIST) AND (DEFINED ENV{TORCH_CUDA_ARCH_LIST}))
-            set(TORCH_CUDA_ARCH_LIST $ENV{TORCH_CUDA_ARCH_LIST})
+        # Target architectures resolve in priority order: TP_CUDA_ARCH_LIST
+        # (variable or environment), then a user-provided
+        # CMAKE_CUDA_ARCHITECTURES environment value, then runtime detection
+        # of the local GPU. The resolved list is converted into nvcc gencode
+        # flags by the select_compute_arch helper and applied globally; the
+        # per-target CMAKE_CUDA_ARCHITECTURES machinery is switched off so
+        # the flags are not emitted twice. The cache variable of that same
+        # name is seeded by the language enablement with the compiler's
+        # default target -- which predates the double-precision atomics used
+        # by the kernels and is rejected by toolkits that dropped the
+        # pre-sm_75 targets -- so only an explicit user value is honored.
+        if((NOT DEFINED TP_CUDA_ARCH_LIST) AND (DEFINED ENV{TP_CUDA_ARCH_LIST}))
+            set(TP_CUDA_ARCH_LIST $ENV{TP_CUDA_ARCH_LIST})
         endif()
-        if(DEFINED CMAKE_CUDA_ARCHITECTURES)
-            set(CMAKE_CUDA_ARCHITECTURES OFF)
+        set(TP_CUDA_ARCH_INPUT "")
+        if(TP_CUDA_ARCH_LIST)
+            set(TP_CUDA_ARCH_INPUT ${TP_CUDA_ARCH_LIST})
+        elseif(DEFINED ENV{CMAKE_CUDA_ARCHITECTURES})
+            # Accept the CMake spellings: "all"/"all-major" map onto the
+            # helper's catalog names, and a bare "86" means 8.6; dotted and
+            # name entries pass through untouched.
+            foreach(_tp_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+                if(_tp_arch STREQUAL "all")
+                    set(_tp_arch "All")
+                elseif(_tp_arch STREQUAL "all-major")
+                    set(_tp_arch "Common")
+                elseif(_tp_arch MATCHES "^([0-9]+)([0-9])([af]?(\\+PTX)?)$")
+                    string(REGEX REPLACE "^([0-9]+)([0-9])([af]?(\\+PTX)?)$"
+                           "\\1.\\2\\3" _tp_arch "${_tp_arch}")
+                endif()
+                list(APPEND TP_CUDA_ARCH_INPUT "${_tp_arch}")
+            endforeach()
         endif()
-        if(TORCH_CUDA_ARCH_LIST)
-            include(select_compute_arch)
-            cuda_select_nvcc_arch_flags(NVCC_ARCH_FLAGS_EXTRA ${TORCH_CUDA_ARCH_LIST})
-            string(REPLACE ";" " " NVCC_ARCH_FLAGS_EXTRA "${NVCC_ARCH_FLAGS_EXTRA}")
-            set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${NVCC_ARCH_FLAGS_EXTRA}")
-            message(STATUS "Added CUDA NVCC flags for: ${NVCC_ARCH_FLAGS_EXTRA}")
+        if(NOT TP_CUDA_ARCH_INPUT)
+            # Neither knob given: build for the GPUs on this machine.
+            set(TP_CUDA_ARCH_INPUT "Auto")
         endif()
+        include(select_compute_arch)
+        cuda_select_nvcc_arch_flags(NVCC_ARCH_FLAGS_EXTRA ${TP_CUDA_ARCH_INPUT})
+        string(REPLACE ";" " " NVCC_ARCH_FLAGS_EXTRA "${NVCC_ARCH_FLAGS_EXTRA}")
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${NVCC_ARCH_FLAGS_EXTRA}")
+        set(CMAKE_CUDA_ARCHITECTURES OFF)
+        message(STATUS "Added CUDA NVCC flags for: ${NVCC_ARCH_FLAGS_EXTRA}")
         if(MSVC AND CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
             foreach(_cuda_rule IN ITEMS
                     CMAKE_CUDA_COMPILE_OBJECT
@@ -1296,6 +1320,15 @@ set(TP_BUILD_LIBUV OFF CACHE BOOL "" FORCE)
 set(TP_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
 set(TP_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(TP_BUILD_MISC OFF CACHE BOOL "" FORCE)
+    # The cuda_ipc channel compiles against NVML's header. The CUDA 13
+    # toolkit no longer ships nvml.h, so the channel drops when the header
+    # is absent from the toolkit and the system prefixes.
+    find_path(TP_NVML_HEADER nvml.h HINTS ${CUDAToolkit_INCLUDE_DIRS})
+    mark_as_advanced(TP_NVML_HEADER)
+    if(NOT TP_NVML_HEADER)
+        set(TP_ENABLE_CUDA_IPC OFF CACHE BOOL "" FORCE)
+        message(STATUS "nvml.h not found; building tensorpipe without the cuda_ipc channel.")
+    endif()
     set(TP_BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
     set(TP_STATIC_OR_SHARED STATIC CACHE STRING "" FORCE)
     tp_add_third_party(

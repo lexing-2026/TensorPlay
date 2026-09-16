@@ -49,10 +49,11 @@ def prepend_path(*entries: Path | str) -> str:
 
 # Compute capabilities each CUDA wheel is built for, keyed by toolkit
 # release line. CUDA 13.x dropped the pre-sm_75 targets, so each line
-# needs its own list; leaving the variable unset would let the build fall
-# back to CMake's default of compute_52, which newer nvcc rejects and
-# which predates the double-precision atomics in the kernels.
-TORCH_CUDA_ARCH_LIST_TABLE: dict[str, str] = {
+# needs its own list; leaving the variable unset on the GPU-less runners
+# would fall back to the common-architecture catalog, whose low entries
+# newer nvcc rejects and which predate the double-precision atomics in
+# the kernels.
+TP_CUDA_ARCH_LIST_TABLE: dict[str, str] = {
     "12.4": "5.0;6.0;7.0;7.5;8.0;8.6;9.0",
     "12.6": "5.0;6.0;7.0;7.5;8.0;8.6;9.0",
     # Build the third-generation consumer target in the cu130 wheel.
@@ -83,17 +84,17 @@ def setup_cuda() -> dict[str, str]:
             f"CUDA toolkit not found under CUDA_PATH={cuda_path!r}; "
             "install the toolkit before the build phase"
         )
-    arch_list = TORCH_CUDA_ARCH_LIST_TABLE.get(toolkit_line(cuda_path))
+    arch_list = TP_CUDA_ARCH_LIST_TABLE.get(toolkit_line(cuda_path))
     if arch_list is None:
         sys.exit(
-            f"no TORCH_CUDA_ARCH_LIST entry for toolkit root {cuda_path!r}"
+            f"no TP_CUDA_ARCH_LIST entry for toolkit root {cuda_path!r}"
         )
     site_packages = Path(sysconfig.get_path("purelib"))
     cudnn_root = site_packages / "nvidia" / "cudnn"
     return {
         "USE_CUDA": "1",
         "CUDA_PATH": cuda_path,
-        "TORCH_CUDA_ARCH_LIST": arch_list,
+        "TP_CUDA_ARCH_LIST": arch_list,
         "PATH": prepend_path(Path(cuda_path) / "bin"),
         "CUDNN_ROOT": str(cudnn_root),
     }
