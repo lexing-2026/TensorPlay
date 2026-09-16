@@ -20,7 +20,7 @@ def map_module(name):
     if name == "torch":
         return "tensorplay"
     if name.startswith("torch.ao."):
-        return "tensorplay.quantization"
+        return "tensorplay.ao.quantization"
     if name.startswith("torch."):
         return "tensorplay." + name[len("torch."):]
     return None
@@ -336,13 +336,12 @@ def scrub_prose(text):
 def strip_upstream_only_blocks(text):
     """Remove upstream-lifecycle announcements that do not apply to TP.
 
-    torch.ao quantization was deprecated in favor of the external torchao
-    project; tensorplay keeps its own tensorplay.quantization package, so the
-    migration notice would mislead users.
+    The lifecycle notice does not apply here: quantization lives on as the
+    ``tensorplay.ao.quantization`` package.
     """
     return re.sub(
         r"We are centralizing all quantization[\s\S]*?cleared\.\n\n",
-        "Quantization is provided by the ``tensorplay.quantization`` package.\n\n",
+        "Quantization is provided by the ``tensorplay.ao.quantization`` package.\n\n",
         text)
 
 

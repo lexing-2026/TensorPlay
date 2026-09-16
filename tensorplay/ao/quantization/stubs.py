@@ -14,7 +14,7 @@ from tensorplay._C import (
 )
 from tensorplay import nn
 
-from .fake_quant import FakeQuantize
+from .fake_quantize import FakeQuantize
 
 __all__ = ["QuantStub", "DeQuantStub"]
 

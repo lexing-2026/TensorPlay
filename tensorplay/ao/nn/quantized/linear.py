@@ -13,8 +13,6 @@ from tensorplay._C import (
     _make_per_tensor_quantized_tensor as _make_per_tensor_quantized_tensor,
 )
 
-from .observer import ObserverBase
-
 __all__ = ["QuantizedLinear"]
 
 
@@ -75,7 +73,7 @@ class QuantizedLinear(nn.Module):
                 f"input_zero_point={self.input_zero_point}")
 
     @classmethod
-    def from_float(cls, float_module, input_scale, input_zero_point):
+    def from_float(cls, float_module, input_scale=None, input_zero_point=None):
         """Quantizes a calibrated float Linear's weights per output channel.
 
         The activation range must come from calibration ahead of conversion
@@ -84,9 +82,19 @@ class QuantizedLinear(nn.Module):
         """
         if not isinstance(float_module, nn.Linear):
             raise TypeError("from_float(): expected a Linear module")
+        from ...quantization.observer import ObserverBase
+        if input_scale is None or input_zero_point is None:
+            observer = getattr(float_module, "input_activation_post_process", None)
+            if observer is None:
+                raise ValueError(
+                    "from_float(): needs explicit input scale/zero point, or a "
+                    "prepared float module carrying input_activation_post_process")
+            input_scale, input_zero_point = observer.calculate_qparams()
+        input_scale = float(input_scale)
+        input_zero_point = int(input_zero_point)
         weight = float_module.weight.detach()
         out_features, in_features = weight.shape
-        min_vals, max_vals = tensorplay.aminmax(weight, dim=[0], keepdim=False)
+        min_vals, max_vals = tensorplay.aminmax(weight, dim=list(range(1, weight.dim())), keepdim=False)
         # Per-output-channel affine params from each row's observed range.
         scales = []
         zero_points = []

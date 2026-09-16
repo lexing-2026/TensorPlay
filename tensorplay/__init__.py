@@ -1178,7 +1178,7 @@ else:
         "func",
         "fft",
         "linalg",
-        "quantization",
+        "ao",
         "sparse",
         "special",
         "vision",

@@ -8,7 +8,6 @@ swap a module for a replacement that keeps the original's forward hooks.
 
 from __future__ import annotations
 
-from itertools import chain
 from typing import TypeVar
 
 from tensorplay import nn
@@ -54,31 +53,28 @@ def parent_child_names(name: str) -> tuple[str, str]:
 
 
 def swap_module(
-    mod: ModT, mapping: dict[type, type]
+    mod: ModT, mapping: dict[type, type], qconfig_dict: dict
 ) -> nn.Module:
     """Replace ``mod`` with the module produced by its mapped class.
 
     When ``type(mod)`` is a key of ``mapping``, the mapped class builds the
-    replacement through its ``from_dense`` constructor and the original's
+    replacement through its ``from_float`` constructor and the original's
     forward hooks are carried over, so they keep firing around the
     replacement.  Modules whose type is not mapped are returned unchanged.
-    All parameters and buffers must live on a single device; the
-    replacement is moved there.
 
     Args:
         mod: module to replace
         mapping: dict mapping module types to replacement classes
+        qconfig_dict: quantization configuration carried onto the
+            replacement (unused when the mapped class ignores it)
 
     Return:
         The replacement module, or ``mod`` itself when its type is not
         mapped.
-
-    Raises:
-        AssertionError: when the parameters and buffers of ``mod`` span
-            more than one device.
     """
     if type(mod) in mapping:
-        new_mod = mapping[type(mod)].from_dense(mod)
+        new_mod = mapping[type(mod)].from_float(mod)
+        new_mod.qconfig = qconfig_dict
 
         # Carry over the pre forward hooks; they run on the replacement's
         # input.
@@ -88,17 +84,6 @@ def swap_module(
         # output.
         for hook_fn in mod._forward_hooks.values():
             new_mod.register_forward_hook(hook_fn)
-
-        # Keep the replacement on the device of the module it replaces.
-        devices = {p.device for p in chain(mod.parameters(), mod.buffers())}
-        if len(devices) > 1:
-            raise AssertionError(
-                "swap_module requires all parameters and buffers of the "
-                f"module to live on a single device, but got devices {devices}"
-            )
-        device = next(iter(devices)) if len(devices) > 0 else None
-        if device:
-            new_mod.to(device)
 
         return new_mod
     return mod
