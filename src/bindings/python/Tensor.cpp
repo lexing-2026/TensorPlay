@@ -2793,6 +2793,12 @@ void init_tensor(py::module_& m) {
         .def("to", [](const Tensor& self, Device device, DType dtype, bool non_blocking, bool copy) {
             return tensorplay::tpx::to(self, device, dtype, non_blocking, copy);
         }, "device"_a, "dtype"_a, "non_blocking"_a = false, "copy"_a = false)
+        // Tensor-flavored target: dtype and device both come from the
+        // argument tensor, matching the reference spelling x.to(y).
+        .def("to", [](const Tensor& self, const Tensor& other, bool non_blocking, bool copy) {
+            return tensorplay::tpx::to(self, other.device(), other.dtype(),
+                                       non_blocking, copy);
+        }, "other"_a, "non_blocking"_a = false, "copy"_a = false)
         // Full keyword form: layout/device/pin_memory/memory_format select
         // the target metadata; unspecified fields keep their current value.
         .def("to", [](const Tensor& self,
@@ -3569,6 +3575,24 @@ void init_tensor(py::module_& m) {
                     !py::isinstance<py::bool_>(arg)) {
                     const int64_t n = arg.cast<int64_t>();
                     return Tensor::empty({n}, self.dtype(), target);
+                }
+                // A tuple (Size included) of integers is a size; tuples with
+                // non-integer members, like lists, fall through as data.
+                if (py::isinstance<py::tuple>(arg)) {
+                    py::sequence seq = py::reinterpret_borrow<py::sequence>(arg);
+                    std::vector<int64_t> shape;
+                    bool all_ints = true;
+                    for (auto elem : seq) {
+                        if (!py::isinstance<py::int_>(elem) ||
+                            py::isinstance<py::bool_>(elem)) {
+                            all_ints = false;
+                            break;
+                        }
+                        shape.push_back(elem.cast<int64_t>());
+                    }
+                    if (all_ints) {
+                        return Tensor::empty(shape, self.dtype(), target);
+                    }
                 }
                 if (py::isinstance<tensorplay::Storage>(arg)) {
                     const auto& storage = arg.cast<const tensorplay::Storage&>();

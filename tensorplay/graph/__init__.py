@@ -31,6 +31,15 @@ from .node import Node, has_side_effect, map_arg
 from .proxy import Proxy, gate
 from .symbolic_trace import symbolic_trace, wrap
 from .tracer import NodePathTracer, Tracer
+
+
+def script_if_tracing(fn):
+    """Run the helper eagerly and keep it opaque to symbolic tracing.
+
+    Helpers holding python control flow are recorded as a single call node
+    during a trace instead of being inlined.
+    """
+    return wrap(fn)
 from .annotate import annotate
 from .immutable_collections import immutable_dict, immutable_list
 from .interpreter import Interpreter, Transformer
@@ -72,6 +81,7 @@ __all__ = [
     "map_arg",
     "replace_pattern",
     "replace_pattern_with_filters",
+    "script_if_tracing",
     "symbolic_trace",
     "wrap",
 ]

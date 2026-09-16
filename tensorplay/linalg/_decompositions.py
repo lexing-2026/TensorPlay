@@ -20,7 +20,7 @@ from tensorplay._C import (
     linalg_lu_factor_ex as lu_factor_ex,
 )
 
-from ._common import EigResult, EighResult, QRResult, SVDResult, check_floating
+from ._common import CholeskyExResult, EigResult, EighResult, QRResult, SVDResult, check_floating
 
 __all__ = [
     "cholesky",
@@ -48,8 +48,9 @@ def cholesky(A, *, upper=False):
 
 
 def cholesky_ex(A, *, upper=False, check_errors=False):
-    """cholesky_ex(A, *, upper=False, check_errors=False) -> (Tensor, Tensor)"""
-    return linalg_cholesky_ex(A, upper=upper, check_errors=check_errors)
+    """cholesky_ex(A, *, upper=False, check_errors=False) -> CholeskyExResult(L, info)"""
+    L, info = linalg_cholesky_ex(A, upper=upper, check_errors=check_errors)
+    return CholeskyExResult(L, info)
 
 
 def eigh(A, UPLO="L"):

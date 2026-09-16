@@ -22,6 +22,7 @@ LstsqResult = namedtuple(
 EighResult = namedtuple("EighResult", ["eigenvalues", "eigenvectors"])
 EigResult = namedtuple("EigResult", ["eigenvalues", "eigenvectors"])
 SVDResult = namedtuple("SVDResult", ["U", "S", "Vh"])
+CholeskyExResult = namedtuple("CholeskyExResult", ["L", "info"])
 
 
 class LinAlgError(RuntimeError):
