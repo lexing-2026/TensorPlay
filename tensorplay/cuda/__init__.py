@@ -1155,3 +1155,19 @@ __all__ = [
 
 # Submodules referenced by __all__
 from . import graph_annotations as graph_annotations, graphs as graphs, jiterator, memory as memory, nccl, nvtx, profiler, random as random, sparse, streams as streams, tunable  # noqa: E402
+
+
+def _tensor_record_stream(self, stream) -> None:
+    r"""Marks the tensor's storage as in use on ``stream``.
+
+    The caching allocator reuses a freed block for allocations running on
+    the stream the block was allocated on.  When a tensor is handed to work
+    on another stream, mark it first so the allocator defers reuse of the
+    block until that stream's recorded work has drained.
+    """
+    core = getattr(stream, "_stream", stream)
+    _lcuda.record_stream(self, core)
+
+
+if hasattr(_lcuda, "record_stream"):
+    tensorplay.Tensor.record_stream = _tensor_record_stream

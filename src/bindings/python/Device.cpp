@@ -143,6 +143,23 @@ void init_device(py::module_& m) {
         });
 #endif
 
+#ifdef USE_CUDA
+    // The caching allocator reuses a freed block for allocations on its
+    // allocation stream; a block whose storage is also used on another
+    // stream must be marked so its reuse waits until that stream's
+    // recorded work drains.
+    cuda.def("record_stream",
+             [](Tensor& self, const tensorplay::cuda::CUDAStream& stream) {
+                 if (self.device().type() != DeviceType::CUDA) {
+                     TP_THROW(RuntimeError,
+                              "record_stream: expected a CUDA tensor");
+                 }
+                 tensorplay::cuda::recordStream(
+                     self.impl()->storage().data(), stream);
+             },
+             "tensor"_a, "stream"_a);
+#endif
+
     cuda.def("get_version", []() {
 #ifdef USE_CUDA
         int ver = 0;
