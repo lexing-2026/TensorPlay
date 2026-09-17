@@ -24,14 +24,18 @@ void gemm_strided_batched_3d(const Tensor& self_3d, const Tensor& other_3d,
                              double alpha, double beta);
 
 // Ragged grouped GEMM fast path: one persistent tensor-op kernel covers all
-// groups.  A is row-major (M_total, K); B stacks G row-major (K, N) expert
-// matrices; `offs` holds the G group-end offsets (int32/int64, on any
-// device) and `ends_host` repeats it on the host after validation.
-// `max_group_rows` is the largest per-group row count and feeds the tile
-// choice.  Per-group descriptors (sizes, operand pointers, leading
-// dimensions) are built on the device from `offs`, so the launch path
-// carries no host staging.  Half inputs run the native mma with an f32
-// accumulator; Float32 runs the tensor-op path when
+// groups.  A is row-major (M_total, K); B stacks G per-expert [K, N]
+// matrices -- dense [G, K, N] row-major stacks read as RowMajor, stacks of
+// [N, K] row-major weights seen through their transpose read as ColumnMajor
+// with no copy; any other stride pattern is materialized first.  `offs`
+// holds the G group-end offsets (int32/int64, on any device).  `ends_host` is the host-validated copy of those offsets; pass
+// null to run without any host read of `offs` -- the kernel then clamps
+// malformed offsets into [0, M_total] and zeroes rows past the last offset
+// itself, and `max_group_rows` is only an upper bound on the per-group row
+// count (M_total is a safe choice).  Per-group descriptors (sizes, operand
+// pointers, leading dimensions) are built on the device from `offs`, so the
+// launch path carries no host staging.  Half inputs run the native mma with
+// an f32 accumulator; Float32 runs the tensor-op path when
 // Context::allowTF32CuBLAS() selects the reduced-exponent f32 compute.
 // Returns false when the configuration is outside the envelope (dtype,
 // operand alignment, device capability, kernel launch) and the caller must

@@ -17,6 +17,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <optional>
 #include <tuple>
 #include <vector>
@@ -453,13 +454,14 @@ std::tuple<Tensor, Tensor> fused_rope_cuda(
 }
 
 // MoE expert compute on CUDA: ragged grouped GEMM.
-//   - No-grad fast path: zero-fill allocation covers uncovered tail rows,
-//     then a single persistent tensor-op kernel walks every group
-//     (try_grouped_gemm_tensor_op); when the dtype/shape is outside its
-//     envelope the plan-cached cublasLt entry (gemm_impl) runs one pass
-//     over zero-copy slice views, still writing straight into the
-//     preallocated output -- no per-group dispatcher round-trips, no cat
-//     copy pass.
+//   - No-grad fast path: a single persistent tensor-op kernel walks every
+//     group with descriptors built and clamped on the device; device-side
+//     offsets never round-trip to the host (TP_GROUPED_MM_VALIDATE=1 forces
+//     the eager check).  When the dtype/shape is outside the tensor-op
+//     envelope the host bounds are materialized once and the plan-cached
+//     cublasLt entry (gemm_impl) runs one pass over zero-copy slice views,
+//     still writing straight into the preallocated output -- no per-group
+//     dispatcher round-trips, no cat copy pass.
 //   - GradMode path: differentiable composite (narrow/mm/cat through the
 //     dispatcher) so CIA records inner nodes automatically.
 Tensor grouped_mm_cuda(const Tensor& self, const Tensor& mat2,
@@ -487,45 +489,57 @@ Tensor grouped_mm_cuda(const Tensor& self, const Tensor& mat2,
   }
   const Tensor offs_c = offs.is_contiguous() ? offs : offs.contiguous();
 
-  // Loop bounds live on the host: read directly when offs is CPU-resident
-  // (the common construction site), stream-scoped D2H copy when it lives on
-  // the device.
-  const int64_t nbytes =
-      G * (offs_c.dtype() == DType::Int32 ? 4 : 8);
-  std::vector<unsigned char> hoff(static_cast<size_t>(nbytes));
-  if (offs_c.device().type() == DeviceType::CUDA) {
-    cudaStream_t cur = getCurrentCUDAStream().stream();
-    TP_CUDA_CHECK(cudaMemcpyAsync(hoff.data(), offs_c.data_ptr(), nbytes,
-                                  cudaMemcpyDeviceToHost, cur));
-    TP_CUDA_CHECK(cudaStreamSynchronize(cur));
-  } else {
-    std::memcpy(hoff.data(), offs_c.data_ptr(), static_cast<size_t>(nbytes));
-  }
+  // Host validation reads the loop bounds up front: free when the offsets
+  // already live on the host, a stream-scoped D2H copy when they do not.
+  // Device-resident offsets skip that round trip entirely (the tensor-op
+  // path derives and clamps every descriptor on the device); setting
+  // TP_GROUPED_MM_VALIDATE restores the eager check for debugging.
+  static const bool strict_validate =
+      std::getenv("TP_GROUPED_MM_VALIDATE") != nullptr;
+  const bool offs_on_host = offs_c.device().type() != DeviceType::CUDA;
+  std::vector<unsigned char> hoff;
+  std::vector<int64_t> ends(static_cast<size_t>(G));
+  int64_t max_group_rows = 0;
+  bool host_validated = false;
   auto read_off = [&](int64_t i) -> int64_t {
     return offs_c.dtype() == DType::Int32
                ? static_cast<int64_t>(
                      reinterpret_cast<const int32_t*>(hoff.data())[i])
                : reinterpret_cast<const int64_t*>(hoff.data())[i];
   };
-  int64_t covered = 0;
-  int64_t max_group_rows = 0;
-  std::vector<int64_t> ends(static_cast<size_t>(G));
-  for (int64_t g = 0; g < G; ++g) {
-    const int64_t end = read_off(g);
-    if (end < covered || end > M) {
-      TP_THROW(RuntimeError,
-               "grouped_mm(): offs must be non-decreasing in [0, M_total=", M,
-               "], got offs[", g, "]=", end);
+  auto validate_host = [&]() {
+    const int64_t nbytes =
+        G * (offs_c.dtype() == DType::Int32 ? 4 : 8);
+    hoff.resize(static_cast<size_t>(nbytes));
+    if (offs_on_host) {
+      std::memcpy(hoff.data(), offs_c.data_ptr(), static_cast<size_t>(nbytes));
+    } else {
+      cudaStream_t cur = getCurrentCUDAStream().stream();
+      TP_CUDA_CHECK(cudaMemcpyAsync(hoff.data(), offs_c.data_ptr(), nbytes,
+                                    cudaMemcpyDeviceToHost, cur));
+      TP_CUDA_CHECK(cudaStreamSynchronize(cur));
     }
-    max_group_rows = std::max(max_group_rows, end - covered);
-    ends[static_cast<size_t>(g)] = end;
-    covered = end;
-  }
+    int64_t covered = 0;
+    for (int64_t g = 0; g < G; ++g) {
+      const int64_t end = read_off(g);
+      if (end < covered || end > M) {
+        TP_THROW(RuntimeError,
+                 "grouped_mm(): offs must be non-decreasing in [0, M_total=", M,
+                 "], got offs[", g, "]=", end);
+      }
+      max_group_rows = std::max(max_group_rows, end - covered);
+      ends[static_cast<size_t>(g)] = end;
+      covered = end;
+    }
+    host_validated = true;
+  };
+  if (offs_on_host || strict_validate) validate_host();
 
   const bool needs_grad =
       GradMode::is_enabled() && (self.requires_grad() || mat2.requires_grad());
   if (needs_grad) {
     // Differentiable composite: dispatcher primitives record inner nodes.
+    if (!host_validated) validate_host();
     std::vector<Tensor> parts;
     parts.reserve(G + 1);
     int64_t start = 0;
@@ -551,19 +565,26 @@ Tensor grouped_mm_cuda(const Tensor& self, const Tensor& mat2,
     return tpx::ops::cat(parts, 0);
   }
 
-  // Fast path: zero-fill allocation covers uncovered tail rows (skipped
-  // when the offsets already span every row), then one persistent tensor-op
-  // kernel walks every group (try_grouped_gemm_tensor_op); when the
-  // dtype/shape is outside its envelope the plan-cached cublasLt entry
-  // (gemm_impl) runs one pass over zero-copy slice views, still writing
-  // straight into the preallocated output -- no per-group dispatcher
-  // round-trips, no cat copy pass.
+  // Fast path: one persistent tensor-op kernel walks every group with
+  // descriptors built on the device.  `ends_host == nullptr` selects the
+  // synchronization-free mode -- the kernel clamps malformed offsets and
+  // zeroes uncovered tail rows itself.  When the dtype/shape is outside the
+  // tensor-op envelope the host bounds are materialized (one D2H copy, only
+  // here) and the plan-cached cublasLt entry (gemm_impl) runs one pass over
+  // zero-copy slice views, still writing straight into the preallocated
+  // output -- no per-group dispatcher round-trips, no cat copy pass.
   Tensor out = Tensor::empty({M, N}, self.dtype(), self.device());
-  if (G == 0 || ends[static_cast<size_t>(G - 1)] < M) {
+  if (host_validated && (G == 0 || ends[static_cast<size_t>(G - 1)] < M)) {
     zero_matmul_output_cuda(out);
   }
-  if (!try_grouped_gemm_tensor_op(self, mat2, offs_c, out, ends.data(),
-                                  max_group_rows)) {
+  if (!try_grouped_gemm_tensor_op(
+          self, mat2, offs_c, out,
+          host_validated ? ends.data() : nullptr,
+          // Without host-validated bounds the per-group row count is only
+          // bounded by M; the uniform-split average keeps the tile choice
+          // from overshooting on decode-sized batches.
+          host_validated ? max_group_rows : (G > 0 ? (M + G - 1) / G : M))) {
+    if (!host_validated) validate_host();
     int64_t start = 0;
     for (int64_t g = 0; g < G; ++g) {
       const int64_t end = read_off(g);
