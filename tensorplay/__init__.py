@@ -240,6 +240,36 @@ from ._C import (tensor, DType, Size, Scalar, SymInt, SymBool, SymFloat,
                 in_parallel_region, get_parallel_info)
 from .autograd import (no_grad, enable_grad, set_grad_enabled, is_grad_enabled,
                        inference_mode)
+
+if hasattr(_C, "get_num_interop_threads"):
+    from ._C import get_num_interop_threads, set_num_interop_threads
+else:
+    # The compiled extension predates the interop thread entry points; expose
+    # wrappers over the shared thread pool until the extension is rebuilt.
+    def get_num_interop_threads():
+        """Returns the number of threads used for interop parallelism on CPU.
+
+        The parallel layer runs a single shared thread pool, so this equals
+        the number of intraop threads.
+        """
+        return get_num_threads()
+
+    def set_num_interop_threads(nthreads):
+        """Sets the number of threads used for interop parallelism on CPU.
+
+        The parallel layer runs a single shared thread pool, so the request is
+        accepted only when it matches the pool size configured via
+        ``set_num_threads``; any other size raises RuntimeError.
+        """
+        if nthreads <= 0:
+            raise ValueError("Expected positive number of threads")
+        current = get_num_threads()
+        if nthreads != current:
+            raise RuntimeError(
+                f"cannot set number of interop threads to {nthreads}: the "
+                f"parallel layer uses a single shared thread pool whose size "
+                f"({current}) is configured via set_num_threads before "
+                f"parallel work has started")
 from .serialization import save, load, inspect_checkpoint
 from .serialization import archive as _serialization_archive
 from .random import fork_rng
@@ -364,6 +394,7 @@ __all__ = [
     "allclose", "index",
     "compile", "compiler", "graph", "library",
     "set_num_threads", "get_num_threads", "get_thread_num",
+    "set_num_interop_threads", "get_num_interop_threads",
     "in_parallel_region", "get_parallel_info",
     "default_generator", "manual_seed", "seed", "initial_seed", "Generator",
     "UntypedStorage",

@@ -24,6 +24,13 @@ P10_API void set_num_threads(int nthreads);
 // Returns the maximum number of threads that may be used in a parallel region.
 P10_API int get_num_threads();
 
+// Configures the number of threads assigned to inter-op parallelism
+// (independent tasks submitted by higher-level execution layers).
+P10_API void set_num_interop_threads(int nthreads);
+
+// Returns the number of threads assigned to inter-op parallelism.
+P10_API int get_num_interop_threads();
+
 // Returns the current thread number (starting from 0) inside a parallel
 // region, or 0 in the sequential region.
 P10_API int get_thread_num();

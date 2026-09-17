@@ -300,6 +300,31 @@ int get_num_threads() {
   return static_cast<int>(get_intraop_pool().size() + 1);
 }
 
+// This parallel layer runs one shared worker pool that serves both intra-op
+// (chunked kernel work) and inter-op (independent higher-level tasks)
+// parallelism. There is no separately sized inter-op pool, so the inter-op
+// entry points report the shared pool's size, and a resize request is only
+// honored when it asks for the size the pool already has. A pool cannot be
+// resized once parallel work has started, so any other request is an error.
+void set_num_interop_threads(int nthreads) {
+  TP_CHECK_VALUE(nthreads > 0, "Expected positive number of threads");
+  int current = get_num_threads();
+  if (nthreads == current) {
+    return;
+  }
+  TP_THROW(
+      RuntimeError,
+      "cannot set number of interop threads to ",
+      nthreads,
+      ": the parallel layer uses a single shared thread pool whose size (",
+      current,
+      ") is configured via set_num_threads before parallel work has started");
+}
+
+int get_num_interop_threads() {
+  return get_num_threads();
+}
+
 int get_thread_num() {
   return thread_num_;
 }
