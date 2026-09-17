@@ -206,6 +206,25 @@ struct TF32GroupedGemm {
     using Gemm = cutlass::gemm::device::GemmGrouped<Kernel>;
 };
 
+// Scalar fp32 grouped GEMM: plain FMA arithmetic with fp32 accumulation, so
+// numerics match the per-group cublas path bit-for-bit in spirit while the
+// device-side descriptor machinery stays identical to the tensor-op routes.
+// This is the entry point that keeps full-precision fp32 callers on the
+// synchronization-free fast path.
+template <typename LayoutB>
+struct SimtGroupedGemm {
+    using Kernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
+        float, cutlass::layout::RowMajor, cutlass::ComplexTransform::kNone, 1,
+        float, LayoutB, cutlass::ComplexTransform::kNone, 1,
+        float, cutlass::layout::RowMajor, float, cutlass::arch::OpClassSimt,
+        cutlass::arch::Sm80, cutlass::gemm::GemmShape<128, 128, 8>,
+        cutlass::gemm::GemmShape<64, 64, 8>, cutlass::gemm::GemmShape<1, 1, 1>,
+        cutlass::epilogue::thread::LinearCombination<float, 1, float, float>,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 3,
+        cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly>::GemmKernel;
+    using Gemm = cutlass::gemm::device::GemmGrouped<Kernel>;
+};
+
 // Occupancy of a config is device-constant for the process; cache it per
 // instantiation.  A failure here only shrinks the grid, never correctness.
 template <typename Gemm>
@@ -372,12 +391,15 @@ bool try_grouped_gemm_tensor_op(const Tensor& self, const Tensor& mat2,
     if (cc_major < 8) return false;
 
     const DType dt = self.dtype();
+    const bool is_f32 = dt == DType::Float32;
     const bool f32_tensor_op =
-        dt == DType::Float32 && tensorplay::globalContext().allowTF32CuBLAS();
-    if (dt != DType::Float16 && dt != DType::BFloat16 && !f32_tensor_op)
+        is_f32 && tensorplay::globalContext().allowTF32CuBLAS();
+    if (dt != DType::Float16 && dt != DType::BFloat16 && !is_f32)
         return false;
-    // Row starts must carry the mainloop's 16-byte access granularity.
-    const int64_t align = f32_tensor_op ? 4 : 8;
+    // Mainloop access granularity: the vectorized tensor-op routes need
+    // 8- or 4-element row alignment; the scalar fp32 route reads
+    // element-wise.
+    const int64_t align = f32_tensor_op ? 4 : (is_f32 ? 1 : 8);
     if ((k_dim % align) != 0 || (n_dim % align) != 0) return false;
     if (self.size(0) > INT32_MAX || k_dim > INT32_MAX || n_dim > INT32_MAX)
         return false;
@@ -439,6 +461,18 @@ bool try_grouped_gemm_tensor_op(const Tensor& self, const Tensor& mat2,
         return run_half_grouped_gemm<cutlass::bfloat16_t>(
             offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, m_total, k_dim,
             n_dim, b_col, max_group_rows, sm_count, smem_optin, stream);
+    }
+    if (is_f32 && !f32_tensor_op) {
+        if (b_col) {
+            return run_grouped_config<
+                SimtGroupedGemm<cutlass::layout::ColumnMajor>::Gemm, float>(
+                offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, m_total,
+                k_dim, n_dim, /*b_col=*/true, 128, 128, sm_count, stream);
+        }
+        return run_grouped_config<
+            SimtGroupedGemm<cutlass::layout::RowMajor>::Gemm, float>(
+            offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, m_total, k_dim,
+            n_dim, /*b_col=*/false, 128, 128, sm_count, stream);
     }
     if (b_col) {
         return run_grouped_config<
