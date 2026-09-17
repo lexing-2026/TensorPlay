@@ -606,3 +606,62 @@ def test_int_mm_out_writes_into_the_buffer():
 def test_int_mm_rejects_mismatched_dtypes():
     with pytest.raises(Exception):
         tp._C._int_mm(tp.zeros(2, 2), tp.zeros(2, 2, dtype=tp.int8))
+
+
+# ------------------------------------------------------------ hashing / fused qkv
+
+
+def test_hash_tensor_reduces_every_dim_when_dim_is_empty():
+    t = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+    # The no-arg spelling (binding default) and an explicit empty list both
+    # reduce all dims instead of crashing.
+    full = tp._C.hash_tensor(t)
+    explicit = tp._C.hash_tensor(t, [])
+    assert "uint64" in str(full.dtype)
+    assert full.tolist() == explicit.tolist()
+    # XOR-sum is order-independent, so the scalar hash equals the fold of
+    # the per-column hashes.
+    per_column = tp._C.hash_tensor(t, [0]).tolist()
+    assert full.tolist() == per_column[0] ^ per_column[1]
+
+
+def test_hash_tensor_keepdim_and_error_paths():
+    t = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+    kept = tp._C.hash_tensor(t, [0], keepdim=True)
+    assert kept.tolist() == [tp._C.hash_tensor(t, [0]).tolist()]
+    with pytest.raises(RuntimeError, match="numel"):
+        tp._C.hash_tensor(tp.zeros(0))
+    with pytest.raises(RuntimeError, match="Unknown hash_tensor mode"):
+        tp._C.hash_tensor(t, [0], mode=7)
+    with pytest.raises(RuntimeError, match="uint64"):
+        tp._C.hash_tensor(t, [0], mode=0, out=tp.zeros(2))
+
+
+def test_transform_bias_rescale_qkv_splits_adds_bias_and_rescales():
+    B, T, D, H = 2, 3, 4, 2
+    dph = D // H
+    qkv = tp.arange(0, B * T * 3 * D, dtype=tp.float32).reshape(B, T, 3 * D)
+    bias = tp.arange(0, 3 * D, dtype=tp.float32)
+    q, k, v = tp._C._transform_bias_rescale_qkv(qkv, bias, H)
+    assert tuple(q.shape) == (B, H, T, dph)
+    scaled = (qkv[..., :D] + bias[:D]).reshape(B, T, H, dph).permute(0, 2, 1, 3) \
+        / math.sqrt(dph)
+    assert tp.allclose(q, scaled)
+    assert tp.allclose(
+        k, (qkv[..., D:2 * D] + bias[D:2 * D]).reshape(B, T, H, dph).permute(0, 2, 1, 3))
+    assert tp.allclose(
+        v, (qkv[..., 2 * D:] + bias[2 * D:]).reshape(B, T, H, dph).permute(0, 2, 1, 3))
+
+
+def test_transform_bias_rescale_qkv_rejects_malformed_inputs():
+    with pytest.raises(RuntimeError, match="3-D"):
+        tp._C._transform_bias_rescale_qkv(tp.zeros(2, 2), tp.zeros(6), 2)
+    good = tp.zeros(1, 2, 6)
+    with pytest.raises(RuntimeError, match="multiple of 3"):
+        tp._C._transform_bias_rescale_qkv(tp.zeros(1, 2, 4), tp.zeros(4), 2)
+    with pytest.raises(RuntimeError, match="num_head must be positive"):
+        tp._C._transform_bias_rescale_qkv(good, tp.zeros(6), 0)
+    with pytest.raises(RuntimeError, match="divide"):
+        tp._C._transform_bias_rescale_qkv(good, tp.zeros(6), 4)
+    with pytest.raises(RuntimeError, match="qkv_bias"):
+        tp._C._transform_bias_rescale_qkv(good, tp.zeros(3), 2)
