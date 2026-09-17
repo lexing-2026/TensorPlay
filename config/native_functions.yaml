@@ -9382,6 +9382,11 @@
   variants: function
 - func: _segment_reduce_backward(Tensor grad, Tensor output, Tensor data, str reduce, *, Tensor? lengths=None, Tensor? offsets=None, int axis=0, Scalar? initial=None) -> Tensor
   variants: function
+- func: _segment_reduce(Tensor data, str reduce, *, Tensor? lengths=None, Tensor? offsets=None, int axis=0, Scalar? initial=None) -> Tensor
+  variants: function
+  dispatch:
+    CPU: _segment_reduce_cpu
+    CUDA: _segment_reduce_cuda
 - func: pad_sequence(Tensor[] sequences, bool batch_first=False, float padding_value=0.0, str padding_side="right") -> Tensor
   variants: function
 - func: flatten_dense_tensors(Tensor[] tensors) -> Tensor
