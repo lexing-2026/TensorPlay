@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -101,9 +102,7 @@ struct GemmPlan {
     std::vector<cublasLtMatmulHeuristicResult_t> candidates;
     bool autotuned = false;
     size_t workspace_size = 0;
-    // Owned by workspace_registry(); entries are never erased so pointers
-    // stay valid for the process lifetime.
-    void* workspace_ptr = nullptr;
+    // Scratch storage is resolved per matmul call from shared_workspace().
 
     ~GemmPlan() {
         if (pref) cublasLtMatmulPreferenceDestroy(pref);
@@ -114,9 +113,31 @@ struct GemmPlan {
     }
 };
 
-std::vector<Tensor>& workspace_registry() {
-    static auto* registry = new std::vector<Tensor>();
-    return *registry;
+// One shared scratch buffer per (device, stream).  cublasLt treats the
+// workspace as scratch for a single enqueued matmul, and operations on one
+// stream serialize, so every plan on a stream can share that stream's
+// buffer.  Handing each plan its own buffer pinned one 32MB allocation per
+// distinct GEMM shape: decode grows the sequence one token at a time, every
+// new length minted fresh plans, and the never-erased registry held them
+// for the process lifetime -- gigabytes over a long generation.
+void* shared_workspace(int device, size_t bytes) {
+    struct Entry {
+        Tensor buf;
+        void* ptr = nullptr;
+        size_t size = 0;
+    };
+    static std::mutex ws_mutex;
+    static auto* table = new std::map<std::pair<int, void*>, Entry>();
+    void* stream = getCurrentCUDAStream().stream();
+    std::lock_guard<std::mutex> lock(ws_mutex);
+    auto& entry = (*table)[{device, stream}];
+    if (entry.size < bytes) {
+        entry.buf = Tensor({static_cast<int64_t>(bytes)}, DType::UInt8,
+                           Device(DeviceType::CUDA, device));
+        entry.ptr = entry.buf.data_ptr();
+        entry.size = bytes;
+    }
+    return entry.ptr;
 }
 
 std::mutex& plan_mutex() {
@@ -249,11 +270,6 @@ std::shared_ptr<GemmPlan> get_gemm_plan(DType dtype, int64_t M, int64_t N, int64
         TP_THROW(RuntimeError, "cuBLASLt: no heuristic algorithm found");
     }
     plan->candidates.resize(returned);
-
-    workspace_registry().push_back(
-        Tensor({static_cast<int64_t>(workspace_size)}, DType::UInt8,
-               Device(DeviceType::CUDA, device)));
-    plan->workspace_ptr = workspace_registry().back().data_ptr();
 
     cache.emplace(key, plan);
     return plan;
@@ -490,7 +506,7 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
                 beta_ptr,
                 result.data_ptr(), plan->c_desc,
                 result.data_ptr(), plan->c_desc,
-                &plan->candidates[c].algo, plan->workspace_ptr, plan->workspace_size,
+                &plan->candidates[c].algo, shared_workspace(plan->device, plan->workspace_size), plan->workspace_size,
                 getCurrentCUDAStream().stream());
             if (st != CUBLAS_STATUS_SUCCESS) {
                 cudaEventDestroy(ev_start);
@@ -507,7 +523,7 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
                     beta_ptr,
                     result.data_ptr(), plan->c_desc,
                     result.data_ptr(), plan->c_desc,
-                    &plan->candidates[c].algo, plan->workspace_ptr, plan->workspace_size,
+                    &plan->candidates[c].algo, shared_workspace(plan->device, plan->workspace_size), plan->workspace_size,
                     getCurrentCUDAStream().stream());
             }
             cudaEventRecord(ev_end, getCurrentCUDAStream().stream());
@@ -544,7 +560,7 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
         beta_ptr,
         result.data_ptr(), plan->c_desc,
         result.data_ptr(), plan->c_desc,
-        &plan->candidates[0].algo, plan->workspace_ptr, plan->workspace_size,
+        &plan->candidates[0].algo, shared_workspace(plan->device, plan->workspace_size), plan->workspace_size,
         getCurrentCUDAStream().stream()));
 }
 
