@@ -552,9 +552,10 @@ static std::tuple<int64_t, int64_t, int64_t, int64_t> compute_slice(py::slice s,
 // Python's list/tensor indexing is advanced indexing, not a view operation.
 // Keep the conversion here, at the C++ binding boundary, so all Python entry
 // points (including DataLoader datasets) use the same device, bounds, and
-// autograd-aware index_select path.  In particular, do not read a CUDA index
-// through data_ptr() on the host: stage it explicitly before normalizing
-// negative values and checking bounds.
+// autograd-aware index_select path.  Device indices are handed to the
+// indexing kernels as-is (the kernels wrap negative values per element and
+// reject out-of-range ones); only host-side consumers and 0-dim indices
+// stage values through CPU memory.
 struct PreparedTensorIndex {
     Tensor flat;
     std::vector<int64_t> shape;
@@ -601,7 +602,8 @@ static Tensor make_normalized_index(const Tensor& self, int64_t dim,
 
 static PreparedTensorIndex prepare_integer_index(const Tensor& self,
                                                  int64_t dim,
-                                                 const Tensor& raw_index) {
+                                                 const Tensor& raw_index,
+                                                 bool stage_host_values = true) {
     dim = checked_index_dim(self, dim);
     if (raw_index.dtype() == DType::Bool ||
         !isIntegralType(raw_index.dtype(), /*includeBool=*/false)) {
@@ -613,18 +615,30 @@ static PreparedTensorIndex prepare_integer_index(const Tensor& self,
     prepared.shape = static_cast<std::vector<int64_t>>(raw_index.shape());
     prepared.scalar = raw_index.dim() == 0;
 
-    Tensor index = raw_index.to(DType::Int64).contiguous();
-    Tensor host_index = index;
-    if (!host_index.device().is_cpu()) {
-        host_index = host_index.to(Device(DeviceType::CPU));
+    // Device indices stay on their own device: the indexing kernels wrap
+    // negative values per element, so the common path needs no host staging.
+    // The host pass remains for callers that consume index values on the CPU
+    // (the tuple index planner) and for 0-dim indices, whose single value
+    // feeds select().
+    if (stage_host_values || prepared.scalar || raw_index.device().is_cpu()) {
+        Tensor index = raw_index.to(DType::Int64).contiguous();
+        Tensor host_index = index;
+        if (!host_index.device().is_cpu()) {
+            host_index = host_index.to(Device(DeviceType::CPU));
+        }
+        host_index = host_index.contiguous();
+        prepared.values.resize(static_cast<size_t>(host_index.numel()));
+        if (!prepared.values.empty()) {
+            std::memcpy(prepared.values.data(), host_index.data_ptr<int64_t>(),
+                        prepared.values.size() * sizeof(int64_t));
+        }
+        prepared.flat = make_normalized_index(self, dim, prepared.values);
+        return prepared;
     }
-    host_index = host_index.contiguous();
-    prepared.values.resize(static_cast<size_t>(host_index.numel()));
-    if (!prepared.values.empty()) {
-        std::memcpy(prepared.values.data(), host_index.data_ptr<int64_t>(),
-                    prepared.values.size() * sizeof(int64_t));
-    }
-    prepared.flat = make_normalized_index(self, dim, prepared.values);
+
+    const int64_t numel = raw_index.numel();
+    Tensor flat = raw_index.to(DType::Int64).contiguous();
+    prepared.flat = flat.reshape({numel});
     return prepared;
 }
 
@@ -793,7 +807,7 @@ static void assign_prepared_index_dim0(Tensor& self,
     // index shape; the remaining tensor dimensions retain their layout.
     std::vector<int64_t> source_shape;
     source_shape.reserve(indexed_shape.size() - prepared.shape.size() + 1);
-    source_shape.push_back(static_cast<int64_t>(prepared.values.size()));
+    source_shape.push_back(prepared.flat.numel());
     const auto self_shape = static_cast<std::vector<int64_t>>(self.shape());
     source_shape.insert(source_shape.end(), self_shape.begin() + 1, self_shape.end());
     rhs = rhs.reshape(source_shape).contiguous();
@@ -2787,11 +2801,17 @@ void init_tensor(py::module_& m) {
         .def("to", [](const Tensor& self, DType dtype, bool non_blocking, bool copy) {
             return tensorplay::tpx::to(self, dtype, non_blocking, copy);
         }, "dtype"_a, "non_blocking"_a = false, "copy"_a = false)
-        .def("to", [](const Tensor& self, Device device, bool non_blocking, bool copy) {
-            return tensorplay::tpx::to(self, device, non_blocking, copy);
+        // The module cast path spells to(None, ...) when only one of device
+        // or dtype moves; a None device keeps the tensor's current one.
+        .def("to", [](const Tensor& self, std::optional<Device> device, bool non_blocking, bool copy) {
+            if (!device.has_value()) return self;
+            return tensorplay::tpx::to(self, *device, non_blocking, copy);
         }, "device"_a, "non_blocking"_a = false, "copy"_a = false)
-        .def("to", [](const Tensor& self, Device device, DType dtype, bool non_blocking, bool copy) {
-            return tensorplay::tpx::to(self, device, dtype, non_blocking, copy);
+        .def("to", [](const Tensor& self, std::optional<Device> device, DType dtype, bool non_blocking, bool copy) {
+            if (!device.has_value()) {
+                return tensorplay::tpx::to(self, dtype, non_blocking, copy);
+            }
+            return tensorplay::tpx::to(self, *device, dtype, non_blocking, copy);
         }, "device"_a, "dtype"_a, "non_blocking"_a = false, "copy"_a = false)
         // Tensor-flavored target: dtype and device both come from the
         // argument tensor, matching the reference spelling x.to(y).
@@ -3022,7 +3042,8 @@ void init_tensor(py::module_& m) {
                 }
                 if (isIntegralType(idx.dtype(), /*includeBool=*/false)) {
                     return apply_prepared_index(
-                        self, 0, prepare_integer_index(self, 0, idx));
+                        self, 0, prepare_integer_index(self, 0, idx,
+                                                       /*stage_host_values=*/false));
                 }
                 TP_THROW(TypeError,
                          "tensors used as indices must be long, int, short, byte or bool tensors");
@@ -3081,11 +3102,12 @@ void init_tensor(py::module_& m) {
                          if (is_boolean_mask_dtype(tensor_index.dtype())) {
                              prepared = prepare_bool_tensor_index(result, target_dim,
                                                                    tensor_index);
-                         } else if (isIntegralType(tensor_index.dtype(),
-                                                   /*includeBool=*/false)) {
-                             prepared = prepare_integer_index(result, target_dim,
-                                                              tensor_index);
-                         } else {
+                        } else if (isIntegralType(tensor_index.dtype(),
+                                                  /*includeBool=*/false)) {
+                            prepared = prepare_integer_index(result, target_dim,
+                                                             tensor_index,
+                                                             /*stage_host_values=*/false);
+                        } else {
                              TP_THROW(TypeError,
                                       "tensors used as indices must be long, int, short, byte or bool tensors");
                          }
@@ -3208,7 +3230,8 @@ void init_tensor(py::module_& m) {
                             std::move(value));
                         return;
                     }
-                    prepared = prepare_integer_index(self, 0, tensor_index);
+                    prepared = prepare_integer_index(self, 0, tensor_index,
+                                                     /*stage_host_values=*/false);
                 } else {
                     prepared = is_python_bool_vector(index)
                                    ? prepare_python_bool_index(self, 0, index)
