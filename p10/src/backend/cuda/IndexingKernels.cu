@@ -28,6 +28,15 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+
+// Index kernels validate their index values on the device itself: an
+// out-of-range value faults the launch instead of reading or writing out of
+// bounds.  The check is deliberately active in release builds, so invalid
+// indexing input cannot corrupt memory silently.  Negative values wrap into
+// range afterwards, matching advanced-indexing semantics.
+#define TP_INDEX_RANGE_GUARD(iv, row)                 \
+    if ((iv) < -(row) || (iv) >= (row)) { __trap(); } \
+    if ((iv) < 0) { (iv) += (row); }
 #include <mutex>
 #include <optional>
 #include <string>
@@ -886,7 +895,7 @@ __global__ void index_select_kernel(int64_t total_out_elems, int64_t n_idx, int6
         int64_t c = i % inner;
         int64_t k = t % n_idx;
         int64_t iv = ip[k];
-        if (iv < 0) iv += row;
+        TP_INDEX_RANGE_GUARD(iv, row);
         d[i] = s[(t / n_idx * row + iv) * inner + c];
     }
 }
@@ -901,7 +910,7 @@ __global__ void index_select_slice_kernel(int64_t n_slices, int64_t n_idx,
         const int64_t outer_index = slice / n_idx;
         const int64_t index_position = slice % n_idx;
         int64_t source_index = ip[index_position];
-        if (source_index < 0) source_index += row;
+        TP_INDEX_RANGE_GUARD(source_index, row);
         const T* source = s + (outer_index * row + source_index) * inner;
         T* destination = d + slice * inner;
         for (int64_t c = threadIdx.x; c < inner; c += blockDim.x) {
@@ -954,7 +963,7 @@ __global__ void index_copy_kernel(int64_t n_idx_x_inner, int64_t inner, int64_t 
     for (; t < n_idx_x_inner; t += stride) {
         int64_t k = t / inner, c = t % inner;
         int64_t iv = ip[k];
-        if (iv < 0) iv += row;
+        TP_INDEX_RANGE_GUARD(iv, row);
         d[iv * inner + c] = sp[t];
     }
 }
@@ -967,16 +976,19 @@ __global__ void index_fill_kernel(int64_t total, int64_t inner, int64_t row,
     for (; t < total; t += stride) {
         int64_t k = t / inner, c = t % inner;
         int64_t iv = ip[k];
-        if (iv < 0) iv += row;
+        TP_INDEX_RANGE_GUARD(iv, row);
         d[iv * inner + c] = v;
     }
 }
 
 template <typename T, bool Accumulate>
-__global__ void index_put_kernel(int64_t n, T* d, const int64_t* ip, const T* vp) {
+__global__ void index_put_kernel(int64_t n, int64_t dst_numel, T* d,
+                                 const int64_t* ip, const T* vp) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += stride) {
+        const int64_t slot = ip[i];
+        if (slot < 0 || slot >= dst_numel) { __trap(); }
         if constexpr (Accumulate) {
             if constexpr (
                 scatter_add_supported_v<T> ||
@@ -984,10 +996,10 @@ __global__ void index_put_kernel(int64_t n, T* d, const int64_t* ip, const T* vp
                 std::is_same_v<T, tensorplay::complex<double>> ||
                 std::is_same_v<T, tensorplay::complex<Half>> ||
                 std::is_same_v<T, tensorplay::complex<BFloat16>>) {
-                indexed_atomic_add(&d[ip[i]], vp[i]);
+                indexed_atomic_add(&d[slot], vp[i]);
             }
         }
-        else d[ip[i]] = vp[i];
+        else d[slot] = vp[i];
     }
 }
 
@@ -2372,7 +2384,7 @@ Tensor index_put_impl_cuda(Tensor& result, const std::vector<Tensor>& indices,
 #define TP_IP_ACC_CASE(ctype, name) \
             case DType::name: \
                 index_put_kernel<ctype, true><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-                    n, static_cast<ctype*>(result.data_ptr()), \
+                    n, numel_self, static_cast<ctype*>(result.data_ptr()), \
                     flat_idx.data_ptr<int64_t>(), \
                     static_cast<const ctype*>(vals.data_ptr())); \
                 break;
@@ -2390,7 +2402,7 @@ Tensor index_put_impl_cuda(Tensor& result, const std::vector<Tensor>& indices,
 #define TP_IP_CASE(ctype, name) \
         case DType::name: \
             index_put_kernel<ctype, false><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-                n, static_cast<ctype*>(result.data_ptr()), \
+                n, numel_self, static_cast<ctype*>(result.data_ptr()), \
                 flat_idx.data_ptr<int64_t>(), \
                 static_cast<const ctype*>(vals.data_ptr())); \
             break;
