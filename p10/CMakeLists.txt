@@ -123,6 +123,7 @@ set(P10_SOURCES
     src/backend/composite/DeadEndBridgeComposites.cpp
     src/backend/composite/DunderBinaryComposite.cpp
     src/backend/composite/FactoryToolsComposite.cpp
+    src/backend/composite/NestedTensorComposite.cpp
     src/backend/composite/ChanelShuffle.cpp
     src/backend/composite/BaseMetaComposites.cpp
     src/backend/composite/MetaView.cpp
@@ -245,6 +246,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/SpecialAliasKernels.cu
         src/backend/cuda/AttentionKernels.cu
         src/backend/cuda/AttentionRopeKernels.cu
+        src/backend/cuda/GroupedGemmKernels.cu
         src/backend/cuda/IndexingKernels.cu
         src/backend/cuda/ScatterReduceKernels.cu
         src/backend/cuda/InteropAliasKernels.cu
