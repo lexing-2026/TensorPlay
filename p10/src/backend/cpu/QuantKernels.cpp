@@ -510,11 +510,27 @@ Tensor dequantize_per_channel_dtype_cpu(const Tensor& self,
     }
 }
 
+namespace {
+
+// Requantize a value in the dequantized domain into an Int8 code under the
+// output affine parameters: q = clamp(nearbyint(y / out_scale) + out_zp).
+inline int8_t linear_requantize_value(double y, double inv_out_scale,
+                                      int64_t out_zero_point) {
+    const double rounded =
+        std::nearbyint(y * inv_out_scale) + static_cast<double>(out_zero_point);
+    return static_cast<int8_t>(
+        std::min<int64_t>(127, std::max<int64_t>(
+                                   -128, static_cast<int64_t>(rounded))));
+}
+
+}  // namespace
+
 Tensor quantized_linear_cpu(const Tensor& input, const Tensor& weight,
                             double input_scale, int64_t input_zero_point,
                             const Tensor& weight_scales,
                             const Tensor& weight_zero_points,
-                            std::optional<Tensor> bias) {
+                            std::optional<Tensor> bias,
+                            double out_scale, int64_t out_zero_point) {
     // Fused Int8 GEMM with per-channel weight requantization (the dynamic
     // quantized linear output stage): out[m, n] = input_scale *
     // weight_scales[n] * Σ_k (x[m,k] - x_zp) * (w[n,k] - w_zp[n]) + bias[n].
@@ -529,6 +545,9 @@ Tensor quantized_linear_cpu(const Tensor& input, const Tensor& weight,
     }
     if (!(input_scale > 0.0)) {
         TP_THROW(ValueError, "quantized_linear(): scale must be positive");
+    }
+    if (!(out_scale > 0.0)) {
+        TP_THROW(ValueError, "quantized_linear(): out_scale must be positive");
     }
     if (input.size(1) != weight.size(1)) {
         TP_THROW(ValueError,
@@ -570,19 +589,21 @@ Tensor quantized_linear_cpu(const Tensor& input, const Tensor& weight,
 
     const int64_t m_size = x.size(0);
     const int64_t k_size = x.size(1);
-    Tensor out = Tensor::empty({m_size, out_features}, DType::Float32,
+    Tensor out = Tensor::empty({m_size, out_features}, DType::Int8,
                                x.device());
     const int8_t* x_ptr = x.data_ptr<int8_t>();
     const int8_t* w_ptr = w.data_ptr<int8_t>();
     const float* sc_ptr = sc.data_ptr<float>();
     const float* b_ptr = bias_f.data_ptr<float>();
+    const double inv_out_scale = 1.0 / out_scale;
+    int8_t* out_ptr = out.data_ptr<int8_t>();
 
     parallel::parallel_for(
         0, m_size, /*grain_size=*/4,
         [&](int64_t begin, int64_t end) {
         for (int64_t m = begin; m < end; ++m) {
             const int8_t* x_row = x_ptr + m * k_size;
-            float* out_row = out.data_ptr<float>() + m * out_features;
+            int8_t* out_row = out_ptr + m * out_features;
             for (int64_t n = 0; n < out_features; ++n) {
                 const int64_t w_zp = zp_ptr[n];
                 const int8_t* w_row = w_ptr + n * k_size;
@@ -591,14 +612,28 @@ Tensor quantized_linear_cpu(const Tensor& input, const Tensor& weight,
                     acc += static_cast<int64_t>(x_row[k] - input_zero_point) *
                            static_cast<int64_t>(w_row[k] - w_zp);
                 }
-                out_row[n] = static_cast<float>(input_scale) * sc_ptr[n] *
-                                 static_cast<float>(acc) +
-                             b_ptr[n];
+                // exact integer accumulation, requantized only at the output
+                const double y =
+                    static_cast<double>(acc) *
+                        (static_cast<double>(input_scale) *
+                         static_cast<double>(sc_ptr[n])) +
+                    static_cast<double>(b_ptr[n]);
+                out_row[n] = linear_requantize_value(y, inv_out_scale,
+                                                     out_zero_point);
             }
         }
     });
-    return out;
+    return quantized::make_qtensor(
+        out, make_per_tensor_affine_quantizer(out_scale, out_zero_point,
+                                              DType::QInt8),
+        DType::QInt8);
 }
+
+struct QParams {
+    double scale;
+    int64_t zero_point;
+};
+
 
 // ---------------------------------------------------------------------------
 // Quantized elementwise arithmetic over Int8 storage with explicit qparams.
@@ -610,6 +645,7 @@ Tensor quantized_linear_cpu(const Tensor& input, const Tensor& weight,
 // ---------------------------------------------------------------------------
 
 namespace {
+
 
 inline int8_t requantize_value(double y, double inv_out_scale,
                                int64_t out_zero_point) {
@@ -831,11 +867,6 @@ constexpr double kSmallScaleThreshold = 6.1e-5;
 // (max - min) / (qmax - qmin) with degenerate/too-small ranges repaired,
 // and the zero point is nudged into the grid with round-half-even.
 // preserve_sparsity forces a symmetric range and a centered zero point.
-struct QParams {
-    double scale;
-    int64_t zero_point;
-};
-
 QParams choose_qparams_cpu(double min, double max, int64_t qmin,
                            int64_t qmax, bool preserve_sparsity) {
     TP_CHECK(min <= max, "choose qparams: min must be <= max");
@@ -1689,6 +1720,137 @@ Tensor quantize_per_tensor_dynamic_cpu(const Tensor& self, DType dtype,
     return out;
 }
 
+Tensor quantized_linear_dynamic_cpu(const Tensor& input, const Tensor& weight,
+                                    const Tensor& weight_scales,
+                                    const Tensor& weight_zero_points,
+                                    std::optional<Tensor> bias,
+                                    bool reduce_range) {
+    // Dynamic quantized linear: activations are quantized per row from their
+    // observed range, the GEMM runs in the integer domain, and the result is
+    // returned in the float domain:
+    // out[m, n] = x_scale[m] * weight_scales[n] *
+    //             sum_k (x_q[m,k] - x_zp[m]) * (w_q[n,k] - w_zp[n]) + bias[n].
+    if (weight.dtype() != DType::QInt8) {
+        TP_THROW(TypeError,
+                 "quantized_linear_dynamic(): weight must be QInt8");
+    }
+    if (input.dim() != 2 || weight.dim() != 2) {
+        TP_THROW(ValueError,
+                 "quantized_linear_dynamic(): expected 2-D [M,K] activations "
+                 "and [N,K] weights");
+    }
+    if (input.size(1) != weight.size(1)) {
+        TP_THROW(ValueError,
+                 "quantized_linear_dynamic(): incompatible K dimensions (" +
+                     std::to_string(input.size(1)) + " vs " +
+                     std::to_string(weight.size(1)) + ")");
+    }
+    const int64_t out_features = weight.size(0);
+    if (weight_scales.dim() != 1 || weight_scales.size(0) != out_features ||
+        weight_zero_points.shape() != weight_scales.shape()) {
+        TP_THROW(ValueError,
+                 "quantized_linear_dynamic(): weight scales/zero_points must "
+                 "be 1-D of length out_features");
+    }
+
+    Tensor x = input.is_contiguous() ? input : input.contiguous();
+    Tensor w = weight.is_contiguous() ? weight : weight.contiguous();
+    Tensor sc = weight_scales.to(DType::Float32).contiguous();
+    Tensor zp = weight_zero_points.to(DType::Int64).contiguous();
+    const int64_t* zp_ptr = zp.data_ptr<int64_t>();
+    for (int64_t n = 0; n < out_features; ++n) {
+        if (zp_ptr[n] < -128 || zp_ptr[n] > 127) {
+            TP_THROW(ValueError,
+                     "quantized_linear_dynamic(): weight zero_point outside "
+                     "the Int8 range");
+        }
+    }
+    if (x.dtype() != DType::Float32) {
+        TP_THROW(TypeError,
+                 "quantized_linear_dynamic(): activations must be Float32");
+    }
+
+    Tensor bias_f;
+    if (bias.has_value()) {
+        if (!isFloatingType(bias->dtype()) || bias->dim() != 1 ||
+            bias->size(0) != out_features) {
+            TP_THROW(ValueError,
+                     "quantized_linear_dynamic(): bias must be a 1-D floating "
+                     "tensor of length out_features");
+        }
+        bias_f = bias->to(DType::Float32).contiguous();
+    } else {
+        bias_f = Tensor::zeros({out_features}, DType::Float32, x.device());
+    }
+
+    const int64_t m_size = x.size(0);
+    const int64_t k_size = x.size(1);
+    const int8_t* w_ptr = w.data_ptr<int8_t>();
+    const float* x_f = x.data_ptr<float>();
+    const float* sc_ptr = sc.data_ptr<float>();
+    const float* b_ptr = bias_f.data_ptr<float>();
+
+    Tensor out = Tensor::empty({m_size, out_features}, DType::Float32,
+                               x.device());
+    float* out_ptr = out.data_ptr<float>();
+    // Row-wise activation quantization parameters and code storage.
+    Tensor xs_t = Tensor::empty({m_size}, DType::Float64, x.device());
+    Tensor xzp_t = Tensor::empty({m_size}, DType::Int64, x.device());
+    Tensor xq_t = Tensor::empty({m_size, k_size}, DType::Int8, x.device());
+    double* xs_ptr = xs_t.data_ptr<double>();
+    int64_t* xzp_ptr = xzp_t.data_ptr<int64_t>();
+    int8_t* xq_ptr = xq_t.data_ptr<int8_t>();
+
+    parallel::parallel_for(
+        0, m_size, /*grain_size=*/1,
+        [&](int64_t begin, int64_t end) {
+        for (int64_t m = begin; m < end; ++m) {
+            const float* row = x_f + m * k_size;
+            double rmin = row[0], rmax = row[0];
+            for (int64_t k = 1; k < k_size; ++k) {
+                const double v = static_cast<double>(row[k]);
+                rmin = std::min(rmin, v);
+                rmax = std::max(rmax, v);
+            }
+            const QParams qp =
+                dynamic_qparams_cpu(rmin, rmax, reduce_range, -128, 127);
+            xs_ptr[m] = qp.scale;
+            xzp_ptr[m] = qp.zero_point;
+            const double inv_scale = 1.0 / qp.scale;
+            int8_t* qrow = xq_ptr + m * k_size;
+            for (int64_t k = 0; k < k_size; ++k) {
+                qrow[k] = linear_requantize_value(
+                    static_cast<double>(row[k]), inv_scale, qp.zero_point);
+            }
+        }
+    });
+
+    parallel::parallel_for(
+        0, m_size, /*grain_size=*/4,
+        [&](int64_t begin, int64_t end) {
+        for (int64_t m = begin; m < end; ++m) {
+            const int8_t* x_row = xq_ptr + m * k_size;
+            const int64_t x_zp = xzp_ptr[m];
+            const double x_sc = xs_ptr[m];
+            float* out_row = out_ptr + m * out_features;
+            for (int64_t n = 0; n < out_features; ++n) {
+                const int64_t w_zp = zp_ptr[n];
+                const int8_t* w_row = w_ptr + n * k_size;
+                int64_t acc = 0;
+                for (int64_t k = 0; k < k_size; ++k) {
+                    acc += static_cast<int64_t>(x_row[k] - x_zp) *
+                           static_cast<int64_t>(w_row[k] - w_zp);
+                }
+                out_row[n] = static_cast<float>(
+                    static_cast<double>(acc) * x_sc *
+                        static_cast<double>(sc_ptr[n]) +
+                    static_cast<double>(b_ptr[n]));
+            }
+        }
+    });
+    return out;
+}
+
 std::tuple<double, int64_t> _choose_qparams_per_tensor_cpu(
     const Tensor& self, bool reduce_range) {
     check_real_dtype(self, "_choose_qparams_per_tensor");
@@ -2377,6 +2539,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, QuantKernels) {
     m.impl("quantize_per_tensor", quantize_per_tensor_cpu);
     m.impl("quantize_per_channel", quantize_per_channel_cpu);
     m.impl("quantized_linear", quantized_linear_cpu);
+    m.impl("quantized_linear_dynamic", quantized_linear_dynamic_cpu);
     m.impl("quantized_add", quantized_add_cpu);
     m.impl("quantized_sub", quantized_sub_cpu);
     m.impl("quantized_mul", quantized_mul_cpu);

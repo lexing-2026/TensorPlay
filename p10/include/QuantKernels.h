@@ -26,13 +26,23 @@ Tensor quantize_per_channel_dtype_cpu(const Tensor& self, const Tensor& scales,
 Tensor dequantize_per_channel_dtype_cpu(
     const Tensor& self, const Tensor& scales, const Tensor& zero_points,
     int64_t axis, DType dtype);
-// Fused Int8 GEMM: out[m,n] = x_scale * w_scale[n] * Σ_k (x_q[m,k]-x_zp) *
-// (w_q[n,k]-w_zp[n]) + bias[n] -> Float32 [M,N].
+// Fused Int8 GEMM with per-channel weight requantization; the result is
+// requantized into QInt8 under (out_scale, out_zero_point).
 Tensor quantized_linear_cpu(const Tensor& input, const Tensor& weight,
                              double input_scale, int64_t input_zero_point,
                              const Tensor& weight_scales,
                              const Tensor& weight_zero_points,
-                             std::optional<Tensor> bias);
+                             std::optional<Tensor> bias,
+                             double out_scale, int64_t out_zero_point);
+
+// Dynamic quantized linear: activations are quantized per row from their
+// observed range, the GEMM runs in the integer domain, and the result is
+// returned in the float domain.
+Tensor quantized_linear_dynamic_cpu(const Tensor& input, const Tensor& weight,
+                                    const Tensor& weight_scales,
+                                    const Tensor& weight_zero_points,
+                                    std::optional<Tensor> bias,
+                                    bool reduce_range);
 
 // Quantized elementwise arithmetic: dequantize both operands with their
 // affine qparams, apply the float operation, requantize into
@@ -223,7 +233,13 @@ Tensor quantized_linear_cuda(const Tensor& input, const Tensor& weight,
                               double input_scale, int64_t input_zero_point,
                               const Tensor& weight_scales,
                               const Tensor& weight_zero_points,
-                              std::optional<Tensor> bias);
+                              std::optional<Tensor> bias,
+                              double out_scale, int64_t out_zero_point);
+Tensor quantized_linear_dynamic_cuda(const Tensor& input, const Tensor& weight,
+                                     const Tensor& weight_scales,
+                                     const Tensor& weight_zero_points,
+                                     std::optional<Tensor> bias,
+                                     bool reduce_range);
 Tensor quantized_add_cuda(const Tensor& a, const Tensor& b,
                            double a_scale, int64_t a_zero_point,
                            double b_scale, int64_t b_zero_point,

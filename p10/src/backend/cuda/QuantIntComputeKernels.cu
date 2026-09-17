@@ -27,7 +27,9 @@ __global__ void quantized_linear_kernel(int64_t total, int64_t k_size,
                                         int64_t input_zero_point,
                                         const float* w_scales,
                                         const int64_t* w_zps,
-                                        const float* bias, float* out) {
+                                        const float* bias, int8_t* out,
+                                        double out_scale,
+                                        int64_t out_zero_point) {
     const int64_t e = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (e >= total) return;
     const int64_t m = e / out_features;
@@ -40,16 +42,176 @@ __global__ void quantized_linear_kernel(int64_t total, int64_t k_size,
         acc += static_cast<int64_t>(x_row[k] - input_zero_point) *
                static_cast<int64_t>(w_row[k] - w_zp);
     }
-    out[e] = static_cast<float>(input_scale) * w_scales[n] *
-                 static_cast<float>(acc) +
-             bias[n];
+    // exact integer accumulation, requantized only at the output
+    const double y =
+        static_cast<double>(acc) *
+            (input_scale * static_cast<double>(w_scales[n])) +
+        static_cast<double>(bias[n]);
+    const double rounded =
+        ::nearbyint(y / out_scale) + static_cast<double>(out_zero_point);
+    out[e] = static_cast<int8_t>(::min(static_cast<long long>(127),
+                                       ::max(static_cast<long long>(-128),
+                                             static_cast<long long>(rounded))));
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic quantized linear: activations are quantized per row from their
+// observed range, the GEMM runs in the integer domain, and the result is
+// returned in the float domain.
+// ---------------------------------------------------------------------------
+
+__global__ void dynamic_row_quantize_kernel(int64_t m_size, int64_t k_size,
+                                            const float* x, double* x_scales,
+                                            int64_t* x_zps, int8_t* x_q) {
+    const int64_t m = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (m >= m_size) return;
+    const float* row = x + m * k_size;
+    double rmin = static_cast<double>(row[0]);
+    double rmax = rmin;
+    for (int64_t k = 1; k < k_size; ++k) {
+        const double v = static_cast<double>(row[k]);
+        rmin = ::min(rmin, v);
+        rmax = ::max(rmax, v);
+    }
+    // zero stays exactly representable on the grid
+    rmin = ::min(rmin, 0.0);
+    rmax = ::max(rmax, 0.0);
+    double scale = (rmax - rmin) / 255.0;
+    if (scale <= 0.0) scale = 0.1;
+    const int64_t zero_point =
+        static_cast<int64_t>(::nearbyint(-rmin / scale)) - 128;
+    x_scales[m] = scale;
+    x_zps[m] = zero_point;
+    int8_t* qrow = x_q + m * k_size;
+    for (int64_t k = 0; k < k_size; ++k) {
+        const double rounded = ::nearbyint(static_cast<double>(row[k]) / scale) +
+                               static_cast<double>(zero_point);
+        qrow[k] = static_cast<int8_t>(
+            ::min(static_cast<long long>(127),
+                  ::max(static_cast<long long>(-128),
+                        static_cast<long long>(rounded))));
+    }
+}
+
+__global__ void quantized_linear_dynamic_kernel(
+    int64_t total, int64_t k_size, int64_t out_features, const int8_t* x_q,
+    const int64_t* x_zps, const double* x_scales, const int8_t* w,
+    const float* w_scales, const int64_t* w_zps, const float* bias,
+    float* out) {
+    const int64_t e = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (e >= total) return;
+    const int64_t m = e / out_features;
+    const int64_t n = e - m * out_features;
+    const int8_t* x_row = x_q + m * k_size;
+    const int8_t* w_row = w + n * k_size;
+    const int64_t x_zp = x_zps[m];
+    const int64_t w_zp = w_zps[n];
+    int64_t acc = 0;
+    for (int64_t k = 0; k < k_size; ++k) {
+        acc += static_cast<int64_t>(x_row[k] - x_zp) *
+               static_cast<int64_t>(w_row[k] - w_zp);
+    }
+    out[e] = static_cast<float>(static_cast<double>(acc) * x_scales[m] *
+                                    static_cast<double>(w_scales[n]) +
+                                static_cast<double>(bias[n]));
+}
+
+
+Tensor quantized_linear_dynamic_cuda(const Tensor& input, const Tensor& weight,
+                                     const Tensor& weight_scales,
+                                     const Tensor& weight_zero_points,
+                                     std::optional<Tensor> bias,
+                                     bool reduce_range) {
+    // Dynamic quantized linear: one pass quantizes each activation row from
+    // its observed range, then the integer GEMM returns float results.
+    if (weight.dtype() != DType::QInt8) {
+        TP_THROW(TypeError,
+                 "quantized_linear_dynamic(): weight must be QInt8");
+    }
+    if (input.dim() != 2 || weight.dim() != 2) {
+        TP_THROW(ValueError,
+                 "quantized_linear_dynamic(): expected 2-D [M,K] activations "
+                 "and [N,K] weights");
+    }
+    if (input.size(1) != weight.size(1)) {
+        TP_THROW(ValueError,
+                 "quantized_linear_dynamic(): incompatible K dimensions (" +
+                     std::to_string(input.size(1)) + " vs " +
+                     std::to_string(weight.size(1)) + ")");
+    }
+    const int64_t out_features = weight.size(0);
+    if (weight_scales.dim() != 1 || weight_scales.size(0) != out_features ||
+        weight_zero_points.shape() != weight_scales.shape()) {
+        TP_THROW(ValueError,
+                 "quantized_linear_dynamic(): weight scales/zero_points must "
+                 "be 1-D of length out_features");
+    }
+    if (input.dtype() != DType::Float32) {
+        TP_THROW(TypeError,
+                 "quantized_linear_dynamic(): activations must be Float32");
+    }
+    (void)reduce_range;
+
+    Tensor x = input.contiguous();
+    Tensor w = weight.contiguous();
+    Tensor sc = weight_scales.to(DType::Float32).contiguous();
+    Tensor zp = weight_zero_points.to(DType::Int64).contiguous();
+    Tensor zps_host = zp.to(Device(DeviceType::CPU));
+    const int64_t* host_zps = zps_host.data_ptr<int64_t>();
+    for (int64_t n = 0; n < out_features; ++n) {
+        if (host_zps[n] < -128 || host_zps[n] > 127) {
+            TP_THROW(ValueError,
+                     "quantized_linear_dynamic(): weight zero_point outside "
+                     "the Int8 range");
+        }
+    }
+
+    Tensor bias_f;
+    if (bias.has_value()) {
+        if (!isFloatingType(bias->dtype()) || bias->dim() != 1 ||
+            bias->size(0) != out_features) {
+            TP_THROW(ValueError,
+                     "quantized_linear_dynamic(): bias must be a 1-D floating "
+                     "tensor of length out_features");
+        }
+        bias_f = bias->to(DType::Float32).contiguous();
+    } else {
+        bias_f = Tensor::zeros({out_features}, DType::Float32, x.device());
+    }
+
+    const int64_t m_size = x.size(0);
+    const int64_t k_size = x.size(1);
+    Tensor xs_t = Tensor::empty({m_size}, DType::Float64, x.device());
+    Tensor xzp_t = Tensor::empty({m_size}, DType::Int64, x.device());
+    Tensor xq_t = Tensor::empty({m_size, k_size}, DType::Int8, x.device());
+    Tensor out = Tensor::empty({m_size, out_features}, DType::Float32,
+                               x.device());
+    const int64_t total = m_size * out_features;
+    if (total == 0) return out;
+
+    const cudaStream_t stream = getCurrentCUDAStream().stream();
+    const int threads = 128;
+    dynamic_row_quantize_kernel<<<
+        static_cast<int>((m_size + threads - 1) / threads), threads, 0,
+        stream>>>(m_size, k_size, x.data_ptr<float>(), xs_t.data_ptr<double>(),
+                  xzp_t.data_ptr<int64_t>(), xq_t.data_ptr<int8_t>());
+    checkCuda(cudaGetLastError(), "CUDA dynamic row quantize kernel");
+    quantized_linear_dynamic_kernel<<<static_cast<int>((total + threads - 1) / threads),
+                                    threads, 0, stream>>>(
+        total, k_size, out_features, xq_t.data_ptr<int8_t>(),
+        xzp_t.data_ptr<int64_t>(), xs_t.data_ptr<double>(),
+        w.data_ptr<int8_t>(), sc.data_ptr<float>(), zp.data_ptr<int64_t>(),
+        bias_f.data_ptr<float>(), out.data_ptr<float>());
+    checkCuda(cudaGetLastError(), "CUDA quantized_linear_dynamic kernel");
+    return out;
 }
 
 Tensor quantized_linear_cuda(const Tensor& input, const Tensor& weight,
                              double input_scale, int64_t input_zero_point,
                              const Tensor& weight_scales,
                              const Tensor& weight_zero_points,
-                             std::optional<Tensor> bias) {
+                             std::optional<Tensor> bias,
+                             double out_scale, int64_t out_zero_point) {
     // Fused Int8 GEMM with per-channel weight requantization; one thread per
     // (m, n) output element streams both operand rows over K.
     if (input.dtype() != DType::QInt8 || weight.dtype() != DType::QInt8) {
@@ -63,6 +225,9 @@ Tensor quantized_linear_cuda(const Tensor& input, const Tensor& weight,
     }
     if (!(input_scale > 0.0)) {
         TP_THROW(ValueError, "quantized_linear(): scale must be positive");
+    }
+    if (!(out_scale > 0.0)) {
+        TP_THROW(ValueError, "quantized_linear(): out_scale must be positive");
     }
     if (input.size(1) != weight.size(1)) {
         TP_THROW(ValueError,
@@ -106,10 +271,15 @@ Tensor quantized_linear_cuda(const Tensor& input, const Tensor& weight,
 
     const int64_t m_size = x.size(0);
     const int64_t k_size = x.size(1);
-    Tensor out = Tensor::empty({m_size, out_features}, DType::Float32,
+    Tensor out = Tensor::empty({m_size, out_features}, DType::Int8,
                                x.device());
     const int64_t total = m_size * out_features;
-    if (total == 0) return out;
+    if (total == 0) {
+        return quantized::make_qtensor(
+            out, make_per_tensor_affine_quantizer(out_scale, out_zero_point,
+                                                  DType::QInt8),
+            DType::QInt8);
+    }
 
     const cudaStream_t stream = getCurrentCUDAStream().stream();
     const int threads = 128;
@@ -118,9 +288,13 @@ Tensor quantized_linear_cuda(const Tensor& input, const Tensor& weight,
         total, k_size, out_features, x.data_ptr<int8_t>(),
         w.data_ptr<int8_t>(), input_scale, input_zero_point,
         sc.data_ptr<float>(), zp.data_ptr<int64_t>(),
-        bias_f.data_ptr<float>(), out.data_ptr<float>());
+        bias_f.data_ptr<float>(), out.data_ptr<int8_t>(), out_scale,
+        out_zero_point);
     checkCuda(cudaGetLastError(), "CUDA quantized_linear kernel");
-    return out;
+    return quantized::make_qtensor(
+        out, make_per_tensor_affine_quantizer(out_scale, out_zero_point,
+                                              DType::QInt8),
+        DType::QInt8);
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +502,7 @@ Tensor quantized_clamp_cuda(
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, QuantIntComputeKernels) {
     m.impl("quantized_linear", quantized_linear_cuda);
+    m.impl("quantized_linear_dynamic", quantized_linear_dynamic_cuda);
     m.impl("quantized_add", quantized_add_cuda);
     m.impl("quantized_sub", quantized_sub_cuda);
     m.impl("quantized_mul", quantized_mul_cuda);

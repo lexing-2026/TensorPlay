@@ -14,6 +14,7 @@ from tensorplay._C import (
     quantize_per_tensor_dynamic as quantize_per_tensor_dynamic,
 )
 from tensorplay._C import quantized_linear as quantized_linear
+from tensorplay._C import quantized_linear_dynamic as quantized_linear_dynamic
 from tensorplay._C import (
     int_repr as int_repr,
     is_quantized as is_quantized,
@@ -67,6 +68,7 @@ __all__ = [
     "quantize_per_channel",
     "quantize_per_tensor_dynamic",
     "quantized_linear",
+    "quantized_linear_dynamic",
     "dequantize",
     "int_repr",
     "is_quantized",
