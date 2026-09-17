@@ -363,6 +363,7 @@ class _NativeLowering:
         native_values: dict[Node, Any] | None = None,
         output_spec: Any = None,
         public_output_count: int | None = None,
+        mutations: list[tuple[int, int]] | None = None,
     ) -> None:
         self.graph_module = graph_module
         self.graph = graph
@@ -374,13 +375,21 @@ class _NativeLowering:
             output_count if public_output_count is None else public_output_count
         )
         self._output_spec = output_spec
+        # (input position, absolute output index) pairs: the native graph
+        # computes buffer updates functionally and the wrapper copies each
+        # result back into the source input after every execution.
+        self._mutations = list(mutations or [])
         self.native_values = dict(native_values or {})
         self._tensorplay_codegen = "stax-native"
         # (id, _version) memo of the last resolved input vector; attributes
         # and constants appended by _bind_inputs are process-stable.
         self._bind_fp: Any = None
         self._last_bound_inputs: list[Any] | None = None
-        _attach_fast_call(self)
+        # Mutating graphs copy results back into module state in Python after
+        # execution; the C trampoline bypasses that epilogue, so they keep the
+        # interpreted wrapper as their only execution entry.
+        if not self._mutations:
+            _attach_fast_call(self)
 
     @staticmethod
     def _input_route_fingerprint(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
@@ -436,6 +445,8 @@ class _NativeLowering:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         inputs = self._bind_inputs(*args, **kwargs)
         outputs = self.graph.execute(inputs)
+        for position, output_index in self._mutations:
+            inputs[position].copy_(outputs[output_index])
         public_outputs = outputs[: self._public_output_count]
         if self._output_spec is not None:
             value, consumed = _consume_template(self._output_spec, public_outputs, 0)
@@ -2870,12 +2881,19 @@ def _lower_native(
         visit_native_dependency(output.args)
     for extra_node in extra_output_nodes or []:
         visit_native_dependency(extra_node)
+    # Buffer-update nodes are epilogue state: even when no consumer reads
+    # their value, the update must run, so their module-state operands stay
+    # live inputs of the native graph.
+    for node in graph_module.graph.nodes:
+        if node.op == "call_method" and node.target in {"add_", "sub_", "mul_"}:
+            visit_native_dependency(node)
 
     fused_relu_convs: dict[Node, Node] = {}
     fused_add_relus: dict[Node, Node] = {}
     fused_relu_nodes: set[Node] = set()
     layout_values: dict[Node, bool] = {}
     channels_last_values: dict[Node, Any] = {}
+    mutations: list[tuple[int, Any]] = []
     peel_conv_bias = bool(example_inputs and example_inputs[0].device.is_cuda())
     # This is the same producer/sole-consumer legality check used by
     # training graph because add_relu has a generated autograd formula; the
@@ -2924,8 +2942,12 @@ def _lower_native(
             if source.users != {relu} or conv.users != ({source} if source is not conv else {relu}):
                 continue
             fused_relu_convs[conv] = relu
+    input_positions: dict[Node, int] = {}
+    next_input_index = 0
     for node in graph_module.graph.placeholders:
         values[node] = graph.add_input()
+        input_positions[node] = next_input_index
+        next_input_index += 1
         layout_values[node] = False
 
     def channels_last_value(node: Any) -> Any | None:
@@ -2956,6 +2978,8 @@ def _lower_native(
         if not isinstance(attribute, tensor_type):
             return None
         values[node] = graph.add_input()
+        input_positions[node] = next_input_index
+        next_input_index += 1
         attribute_targets.append(node.target)
 
     for node in graph_module.graph.nodes:
@@ -2965,6 +2989,7 @@ def _lower_native(
         _, folded_weight, folded_bias = folded
         native_weight = graph.add_input()
         native_bias = graph.add_input()
+        next_input_index += 2
         folded_native_inputs[node] = (native_weight, native_bias)
         constant_values.extend((folded_weight, folded_bias))
 
@@ -3022,6 +3047,31 @@ def _lower_native(
                 or node.kwargs not in ({"inplace": False}, {"inplace": True})
             ):
                 return None
+        if op_name in {"add_", "sub_", "mul_"}:
+            # In-place updates of module state (e.g. a batch counter) have no
+            # aliasing target inside the functional native graph.  Lower the
+            # arithmetic functionally; the executable wrapper copies the
+            # result back into the source input after every execution.
+            if len(node.args) != 2:
+                return None
+            source_node, delta = node.args
+            if not isinstance(source_node, Node) or source_node not in input_positions:
+                return None
+            if not _is_scalar(delta) and not (
+                isinstance(delta, Node) and delta in values
+            ):
+                return None
+            native_node = graph.create_node(op_name[:-1], node.name)
+            native_node.add_input(values[source_node])
+            if _is_scalar(delta):
+                _set_scalar_attr(native_node, delta, 1)
+            else:
+                native_node.add_input(values[delta])
+            mutation_value = native_node.add_output()
+            values[node] = mutation_value
+            layout_values[node] = False
+            mutations.append((input_positions[source_node], mutation_value))
+            continue
         if op_name not in _NATIVE_OPS:
             return None
 
@@ -3064,30 +3114,24 @@ def _lower_native(
             input_node, weight_node, bias_node, stride, padding, dilation, groups = node.args
             fused_relu = fused_relu_convs.get(node)
             use_conv_relu = fused_relu is not None and not peel_conv_bias
-            native_node = graph.create_node(
-                "conv2d_relu" if use_conv_relu else "conv2d",
-                node.name,
-            )
+            # A consumer must be created after the layout-conversion node
+            # feeding it: native execution walks nodes in creation order.
             conv_input = channels_last_value(input_node)
             if conv_input is None:
                 return None
-            native_node.add_input(conv_input)
             folded_inputs = folded_native_inputs.get(node)
             bias_input = None
             bias_tensor = None
             if folded_inputs is not None:
-                native_node.add_input(folded_inputs[0])
+                weight_input = folded_inputs[0]
                 bias_input = folded_inputs[1]
                 folded_spec = folded_convs.get(node)
                 bias_tensor = folded_spec[2] if folded_spec is not None else None
             else:
-                conv_weight = channels_last_value(weight_node)
-                if conv_weight is None:
+                weight_input = channels_last_value(weight_node)
+                if weight_input is None:
                     return None
-                native_node.add_input(conv_weight)
-                if bias_node is None:
-                    native_node.set_int_attr("has_bias", 0)
-                else:
+                if bias_node is not None:
                     bias_input = node_value(bias_node)
                     if bias_input is None:
                         return None
@@ -3095,6 +3139,14 @@ def _lower_native(
                         bias_tensor = graph_module._get_attr(bias_node.target)
                     except (AttributeError, TypeError):
                         return None
+            native_node = graph.create_node(
+                "conv2d_relu" if use_conv_relu else "conv2d",
+                node.name,
+            )
+            native_node.add_input(conv_input)
+            native_node.add_input(weight_input)
+            if bias_node is None and folded_inputs is None:
+                native_node.set_int_attr("has_bias", 0)
             if bias_input is None:
                 native_node.set_int_attr("has_bias", 0)
             elif not peel_conv_bias or use_conv_relu:
@@ -3226,7 +3278,16 @@ def _lower_native(
             continue
 
         if op_name == "flatten":
-            if len(node.args) != 2 or node.args[1] != 1 or node.kwargs:
+            # The canonical signature is (input, start_dim=0, end_dim=-1);
+            # capture stamps the end_dim default, so both the two- and
+            # three-argument forms arrive here.  The native node flattens
+            # (1, -1) only, which is what every accepted form must request.
+            if (
+                node.kwargs
+                or len(node.args) not in (2, 3)
+                or node.args[1] != 1
+                or (len(node.args) == 3 and node.args[2] != -1)
+            ):
                 return None
             native_node = graph.create_node("flatten", node.name)
             if not add_tensor_input(native_node, node.args[0]):
@@ -3451,7 +3512,16 @@ def _lower_native(
             graph.register_output(extra_values)
             registered_extra_outputs += 1
 
-    if use_fusion and not registered_extra_outputs:
+    # Buffer updates run last: each registered mutation output pairs with an
+    # input position, and the wrapper copies it back after execution.
+    mutation_outputs: list[tuple[int, int]] = []
+    for position, value in mutations:
+        graph.register_output(value)
+        mutation_outputs.append(
+            (position, public_output_count + registered_extra_outputs + len(mutation_outputs))
+        )
+
+    if use_fusion and not registered_extra_outputs and not mutation_outputs:
         graph.fuse()
     return _NativeLowering(
         graph_module,
@@ -3462,6 +3532,7 @@ def _lower_native(
         native_values=values,
         output_spec=output_spec,
         public_output_count=public_output_count,
+        mutations=mutation_outputs,
     )
 
 
@@ -3872,6 +3943,21 @@ def _build_aot_formula_env(
             "adaptive_avg_pool2d_backward", (grad, input_value), shape=input_value.shape
         )
 
+    def maybe_multiply(value: Any, factor: Any) -> Any:
+        # Derivative-formula helper: multiplication by a unit scalar is
+        # skipped; anything else lowers to a native multiply that accepts
+        # symbol/symbol or symbol/scalar operands.
+        if isinstance(factor, numbers.Real) and factor == 1:
+            return value
+        if isinstance(value, numbers.Real) and value == 1:
+            return factor
+        return builder.binary("mul", value, factor)
+
+    def maybe_divide(value: Any, divisor: Any) -> Any:
+        if isinstance(divisor, numbers.Real) and divisor == 1:
+            return value
+        return builder.binary("div", value, divisor)
+
     def threshold_backward(grad, output, threshold):
         return builder.helper(
             "threshold_backward",
@@ -3893,6 +3979,8 @@ def _build_aot_formula_env(
         "reshape": builder.reshape,
         "sum": builder.sum,
         "get_tuple": get_tuple,
+        "maybe_multiply": maybe_multiply,
+        "maybe_divide": maybe_divide,
         "batch_norm_backward": batch_norm_backward,
         "conv2d_grad_input": conv_grad("conv2d_grad_input"),
         "conv2d_grad_weight": conv_grad("conv2d_grad_weight"),
@@ -4040,6 +4128,31 @@ def _build_aot_backward(
                 return None
             continue
 
+        if op_name == "max_pool2d":
+            # The captured op carries no indices value, so the derivative
+            # formula for the with-indices overload cannot apply; the native
+            # backward kernel recomputes the argmax instead.
+            if len(node.args) != 7 or not isinstance(node.args[0], Node):
+                return None
+            input_node = node.args[0]
+            if input_node not in forward_symbols:
+                return None
+            contribution = builder.helper(
+                "max_pool2d_backward",
+                (grad, forward_symbols[input_node]),
+                attrs={
+                    "kernel_size": tuple(node.args[1]),
+                    "stride": tuple(node.args[2]),
+                    "padding": tuple(node.args[3]),
+                    "dilation": tuple(node.args[4]),
+                    "ceil_mode": bool(node.args[5]),
+                },
+                shape=forward_symbols[input_node].shape,
+            )
+            if not _aot_add_adjoint(builder, adjoints, input_node, contribution):
+                return None
+            continue
+
         schema = _aot_schema_for(specs, op_name)
         if schema is None:
             return None
@@ -4108,6 +4221,11 @@ def _build_aot_backward(
     return builder.graph, grad_positions, needed_saved_nodes
 
 
+def _copy_back_mutations(lowering: Any, inputs: Any, outputs: Any) -> None:
+    for position, output_index in lowering._mutations:
+        inputs[position].copy_(outputs[output_index])
+
+
 class _AotNativeLowering:
 
     def __init__(
@@ -4117,6 +4235,7 @@ class _AotNativeLowering:
         backward_graph: Any,
         attribute_targets: list[str],
         grad_positions: list[int],
+        mutations: list[tuple[int, int]] | None = None,
     ) -> None:
         self.graph_module = graph_module
         self.forward_graph = forward_graph
@@ -4124,6 +4243,7 @@ class _AotNativeLowering:
         self.placeholders = graph_module.graph.placeholders
         self.attribute_targets = attribute_targets
         self.grad_positions = list(grad_positions)
+        self._mutations = list(mutations or [])
         self.input_count = len(self.placeholders) + len(self.attribute_targets)
         self._tensorplay_codegen = "stax-aot-native"
         self._tensorplay_backward_codegen = "stax-aot-native"
@@ -4134,7 +4254,13 @@ class _AotNativeLowering:
             @staticmethod
             def forward(ctx: Any, *inputs: Any) -> Any:
                 outputs = lowering.forward_graph.execute(list(inputs))
-                ctx.save_for_backward(*inputs, *outputs[1:])
+                _copy_back_mutations(lowering, inputs, outputs)
+                # Buffer-update outputs trail the saved tensors; they are
+                # epilogue state, not backward inputs.
+                ctx.save_for_backward(
+                    *inputs,
+                    *outputs[1 : len(outputs) - len(lowering._mutations)],
+                )
                 return outputs[0]
 
             @staticmethod
@@ -4166,7 +4292,9 @@ class _AotNativeLowering:
         if not tensorplay.is_grad_enabled() or not any(
             getattr(value, "requires_grad", False) for value in inputs
         ):
-            return self.forward_graph.execute(inputs)[0]
+            outputs = self.forward_graph.execute(inputs)
+            _copy_back_mutations(self, inputs, outputs)
+            return outputs[0]
         return self._autograd_function.apply(*inputs)
 
 
@@ -4248,7 +4376,7 @@ def _lower_aot_native(
                 for value, snapshot in snapshots:
                     value.copy_(snapshot)
 
-    if len(forward_outputs) != 1 + len(saved_nodes):
+    if len(forward_outputs) != 1 + len(saved_nodes) + len(forward_lowering._mutations):
         return None
     runtime_values: dict[Node, Any] = {public_node: forward_outputs[0]}
     for index, node in enumerate(saved_nodes, start=1):
@@ -4297,6 +4425,7 @@ def _lower_aot_native(
         backward_graph,
         attribute_targets,
         grad_positions,
+        mutations=forward_lowering._mutations,
     )
 
 
