@@ -277,16 +277,16 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
             if (input.strides() == target_strides) {
                 result = input;
             } else {
-                // Clone the logical NHWC view, then reinterpret its
-                // contiguous storage as logical NCHW with channels-last
-                // strides.  This is the same one-copy reorder emitted by
-                // before a convolution when the user input is
-                // still contiguous NCHW.
+                // Materialize the logical NHWC view into an NHWC-ordered
+                // buffer, then reinterpret its contiguous storage as logical
+                // NCHW with channels-last strides.  A stride-preserving copy
+                // would keep the source's physical order and the final
+                // reinterpretation would read elements in the wrong places.
                 const std::vector<int64_t> physical_shape{n, h, w, c};
                 const std::vector<int64_t> physical_strides{
                     input.stride(0), input.stride(2), input.stride(3), input.stride(1)};
                 Tensor physical = input.as_strided(
-                    physical_shape, physical_strides).clone();
+                    physical_shape, physical_strides).contiguous();
                 result = physical.as_strided(
                     {n, c, h, w}, target_strides);
             }
