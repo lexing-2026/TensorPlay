@@ -153,7 +153,7 @@ def test_quantized_max_pool2d_all_negative_window_keeps_true_max():
     assert got.int_repr().tolist() == [[[-25]]]
     # The dense int8 path shares the kernel and must behave the same.
     codes = tp.tensor([[[[-5, -2], [-9, -4]]]], dtype=tp.int8)
-    assert tp.max_pool2d(codes, [2, 2], [2, 2]).tolist() == [[[-2]]]
+    assert tp.max_pool2d(codes, [2, 2], [2, 2]).tolist() == [[[[-2]]]]
 
 
 def test_quantized_max_pool2d_matches_float():
