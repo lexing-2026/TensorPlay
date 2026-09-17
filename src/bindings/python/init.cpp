@@ -18,6 +18,7 @@
 
 // Extern declarations (if not in header)
 void init_scalar(py::module_& m);
+void init_monitor(py::module_& m);
 void init_filecheck(py::module_& m);
 
 namespace tensorplay {
@@ -319,6 +320,7 @@ py::tuple dtensor_compute_global_tensor_info(
 } // anonymous namespace
 
 PYBIND11_MODULE(_C, m) {
+    init_monitor(m);
     m.doc() = "The C extension module of tensorplay";
 
     // Catchable device-mismatch exception (RuntimeError subclass), so users

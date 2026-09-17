@@ -1398,6 +1398,7 @@ set(TP_C_SOURCES
     src/bindings/python/Tensor.cpp
     src/bindings/python/Stax.cpp
     src/bindings/python/Parallel.cpp
+    src/bindings/python/Monitor.cpp
     src/bindings/python/Futures.cpp
     src/bindings/python/CudaGraph.cpp
      src/bindings/python/FileCheck.cpp
