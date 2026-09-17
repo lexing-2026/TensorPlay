@@ -362,6 +362,9 @@ def build_native_model(model_dir):
 
 def run_native(args):
     install_alias()
+    if getattr(args, "tf32", False):
+        import tensorplay as _tp_flag
+        _tp_flag.backends.cuda.matmul.allow_tf32 = True
     model = build_native_model(args.model)
     import tensorplay as tp
 
@@ -423,6 +426,7 @@ def main():
     ap.add_argument("side", choices=("ref", "native"))
     ap.add_argument("--gen-tokens", type=int, default=24)
     ap.add_argument("--timing-runs", type=int, default=3)
+    ap.add_argument("--tf32", action="store_true")
     args = ap.parse_args()
     if args.side == "ref":
         run_reference(args)
