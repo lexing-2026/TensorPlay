@@ -665,3 +665,40 @@ def test_transform_bias_rescale_qkv_rejects_malformed_inputs():
         tp._C._transform_bias_rescale_qkv(good, tp.zeros(6), 4)
     with pytest.raises(RuntimeError, match="qkv_bias"):
         tp._C._transform_bias_rescale_qkv(good, tp.zeros(3), 2)
+
+
+def test_arange_out_uses_the_destination_options():
+    single = tp.zeros(5, dtype=tp.float32)
+    tp.arange(5, out=single)
+    assert single.tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
+    buf = tp.zeros(4, dtype=tp.float64)
+    tp.arange(0, 4, out=buf)
+    assert tp.equal(buf, tp.tensor([0, 1, 2, 3], dtype=tp.float64))
+    stepped = tp.zeros(3, dtype=tp.int32)
+    tp.arange(10, 16, 2, out=stepped)
+    assert stepped.tolist() == [10, 12, 14]
+
+
+def test_record_stream_marks_storage_on_the_extra_stream():
+    if not tp.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    t = tp.arange(0, 8, dtype=tp.float32, device="cuda")
+    s = tp.cuda.Stream()
+    # Accepts both the Stream wrapper and the raw core stream.
+    t.record_stream(s)
+    t.record_stream(s._stream)
+    with pytest.raises(RuntimeError, match="CUDA tensor"):
+        tp._C._cuda.record_stream(tp.arange(0, 8), s._stream)
+
+
+def test_arange_out_uses_the_destination_options():
+    single = tp.zeros(5, dtype=tp.float32)
+    tp.arange(5, out=single)
+    assert single.tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
+    buf = tp.zeros(4, dtype=tp.float64)
+    tp.arange(0, 4, out=buf)
+    assert tp.equal(buf, tp.tensor([0, 1, 2, 3], dtype=tp.float64))
+    stepped = tp.zeros(3, dtype=tp.int32)
+    tp.arange(10, 16, 2, out=stepped)
+    assert stepped.tolist() == [10, 12, 14]
+

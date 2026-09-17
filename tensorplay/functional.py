@@ -2208,7 +2208,16 @@ def eye(n, m=-1, *, dtype=DType.float32, device=None, requires_grad=False, out=N
             return _captured
     return _C.eye(n, m, dtype=dtype, device=device, requires_grad=requires_grad)
 
-def arange(*args, dtype=DType.undefined, device=None, requires_grad=False):
+def arange(*args, dtype=DType.undefined, device=None, requires_grad=False, out=None):
+    if out is not None:
+        # The out= contract takes the destination's dtype and device.
+        if len(args) == 1:
+            return _C.arange(args[0], out=out)
+        if len(args) == 2:
+            return _C.arange(args[0], args[1], out=out)
+        if len(args) == 3:
+            return _C.arange(args[0], args[1], args[2], out=out)
+        raise TypeError(f'arange expected 1-3 positional arguments, got {len(args)}')
     _captured = _capture_call(arange, tuple(args), {'dtype': dtype, 'device': device, 'requires_grad': requires_grad})
     if _captured is not None:
         return _captured

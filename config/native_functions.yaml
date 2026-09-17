@@ -5992,6 +5992,14 @@
     Composite: arange_bridge_out
 - func: arange.start_step_out(Scalar start, Scalar end, Scalar step=1, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
+- func: arange.out(Scalar end, *, Tensor(a!) out) -> Tensor(a!)
+  variants: function
+  dispatch:
+    Composite: arange_end_only_bridge_out
+- func: arange.start_out(Scalar start, Scalar end, Scalar step=1, *, Tensor(a!) out) -> Tensor(a!)
+  variants: function
+  dispatch:
+    Composite: arange_bridge_start_step_out
 - func: _dim_arange(Tensor like, int dim) -> Tensor
   variants: function
 - func: argmax.out(Tensor self, int? dim=None, bool keepdim=False, *, Tensor(a!) out) -> Tensor(a!)
