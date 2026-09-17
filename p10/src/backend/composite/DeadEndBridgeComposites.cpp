@@ -411,6 +411,13 @@ Tensor& arange_bridge_start_step_out(Scalar start, Scalar end, Scalar step,
         out);
 }
 
+Tensor& arange_end_only_bridge_out(Scalar end, Tensor& out) {
+    return write_exact_bridge_out(
+        "arange",
+        ops::arange(end, out.dtype(), std::optional<Device>(out.device())),
+        out);
+}
+
 Tensor& linspace_bridge_out(Scalar start, Scalar end, int64_t steps,
                             Tensor& out) {
     return write_exact_bridge_out(
@@ -485,6 +492,8 @@ TENSORPLAY_LIBRARY_IMPL(Composite, DeadEndBridgeKernels) {
 
     m.impl("arange.end_out", arange_bridge_out);
     m.impl("arange.start_step_out", arange_bridge_start_step_out);
+    m.impl("arange.out", arange_end_only_bridge_out);
+    m.impl("arange.start_out", arange_bridge_start_step_out);
     m.impl("linspace.out", linspace_bridge_out);
     m.impl("logspace.out", logspace_bridge_out);
     m.impl("eye.out", eye_bridge_out);
