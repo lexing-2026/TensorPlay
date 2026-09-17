@@ -147,8 +147,10 @@ def test_quantized_max_pool2d_all_negative_window_keeps_true_max():
     # A window whose every code is negative must surface the true maximum,
     # not a zero-initialized running value.
     x = _make_qtensor([[[-11.0, -7.0], [-7.0, -4.0]]], 0.15, 2)
+    # Codes are round(v / 0.15) + 2, so the window holds [-71, -45, -45, -25]
+    # and the true maximum code is -25.
     got = tp._C.quantized_max_pool2d(x, [2, 2], [2, 2])
-    assert got.int_repr().tolist() == [[[-4]]]
+    assert got.int_repr().tolist() == [[[-25]]]
     # The dense int8 path shares the kernel and must behave the same.
     codes = tp.tensor([[[[-5, -2], [-9, -4]]]], dtype=tp.int8)
     assert tp.max_pool2d(codes, [2, 2], [2, 2]).tolist() == [[[-2]]]
