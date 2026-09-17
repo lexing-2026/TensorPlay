@@ -83,19 +83,27 @@ MetaLayout meta_layout(int64_t groups) {
 }
 
 // Group g covers rows [offs[g-1], offs[g]) of A; its B expert is slice g of
-// the operand stack.  Offsets were validated non-decreasing in [0, M] by the
-// caller, so the descriptors need no clamping.
+// the operand stack.  Every boundary is clamped into [0, m_total] and an
+// inverted span collapses to zero rows, so offsets that were not validated
+// on the host can neither launch out-of-bounds tiles nor carry negative
+// extents; the launch path therefore needs no device-to-host round trip.
+// `ldb_b` is B's leading dimension: N for row-major experts, K for
+// column-major ones (the [E, out, in] weight stacks read through their
+// transpose).
 template <typename ElementT, typename OffsetT>
 __global__ void build_grouped_meta_kernel(
     char* meta, MetaLayout layout, const OffsetT* offs, int64_t groups,
-    const ElementT* a_base, const ElementT* b_base, ElementT* d_base,
-    int64_t k_dim, int64_t n_dim) {
+    int64_t m_total, const ElementT* a_base, const ElementT* b_base,
+    ElementT* d_base, int64_t k_dim, int64_t n_dim, int64_t ldb_b) {
     const int64_t g = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (g >= groups) return;
-    const int64_t start = g ? int64_t(offs[g - 1]) : 0;
-    const int64_t end = int64_t(offs[g]);
+    int64_t start = g ? int64_t(offs[g - 1]) : 0;
+    int64_t end = int64_t(offs[g]);
+    start = start < 0 ? 0 : (start > m_total ? m_total : start);
+    end = end < 0 ? 0 : (end > m_total ? m_total : end);
+    const int64_t rows = end > start ? end - start : 0;
     reinterpret_cast<GemmCoord*>(meta + layout.problem_sizes)[g] =
-        GemmCoord(int(end - start), int(n_dim), int(k_dim));
+        GemmCoord(int(rows), int(n_dim), int(k_dim));
     reinterpret_cast<const ElementT**>(meta + layout.ptr_a)[g] =
         a_base + start * k_dim;
     reinterpret_cast<const ElementT**>(meta + layout.ptr_b)[g] =
@@ -105,20 +113,69 @@ __global__ void build_grouped_meta_kernel(
     reinterpret_cast<ElementT**>(meta + layout.ptr_d)[g] =
         d_base + start * n_dim;
     reinterpret_cast<int64_t*>(meta + layout.lda)[g] = k_dim;
-    reinterpret_cast<int64_t*>(meta + layout.ldb)[g] = n_dim;
+    reinterpret_cast<int64_t*>(meta + layout.ldb)[g] = ldb_b;
     reinterpret_cast<int64_t*>(meta + layout.ldc)[g] = n_dim;
     reinterpret_cast<int64_t*>(meta + layout.ldd)[g] = n_dim;
+}
+
+// Rows beyond the last offset belong to no group; the grouped kernel leaves
+// them untouched, so the synchronization-free path zeroes that tail on the
+// device instead of deciding on the host.
+template <typename ElementT, typename OffsetT>
+__global__ void grouped_gemm_tail_zero_kernel(ElementT* d,
+                                              const OffsetT* offs,
+                                              int64_t groups, int64_t m_total,
+                                              int64_t n) {
+    __shared__ int64_t s_end;
+    if (threadIdx.x == 0) {
+        int64_t end = groups ? int64_t(offs[groups - 1]) : 0;
+        end = end < 0 ? 0 : (end > m_total ? m_total : end);
+        s_end = end;
+    }
+    __syncthreads();
+    const int64_t total = (m_total - s_end) * n;
+    const int64_t stride = int64_t(gridDim.x) * blockDim.x;
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total;
+         i += stride) {
+        d[s_end * n + i] = ElementT(0);
+    }
+}
+
+template <typename ElementT>
+bool launch_grouped_tail_zero(void* d_ptr, const Tensor& offs_dev,
+                              int64_t groups, int64_t m_total, int64_t n_dim,
+                              cudaStream_t stream) {
+    const int64_t total = m_total * n_dim;
+    if (total <= 0) return true;
+    const int blocks =
+        static_cast<int>(std::min<int64_t>((total + 255) / 256, 4096));
+    if (offs_dev.dtype() == DType::Int32) {
+        grouped_gemm_tail_zero_kernel<ElementT, int32_t><<<blocks, 256, 0, stream>>>(
+            static_cast<ElementT*>(d_ptr),
+            static_cast<const int32_t*>(offs_dev.data_ptr()), groups, m_total,
+            n_dim);
+    } else {
+        grouped_gemm_tail_zero_kernel<ElementT, int64_t><<<blocks, 256, 0, stream>>>(
+            static_cast<ElementT*>(d_ptr),
+            static_cast<const int64_t*>(offs_dev.data_ptr()), groups, m_total,
+            n_dim);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }
 
 // Tensor-op config for half inputs: mma.m16n8k16 with an f32 accumulator.
 // The 128x128 tile feeds the tensor cores on prefill-sized groups; the
 // 64x64 tile keeps small decode groups from reserving whole 128-row waves.
-template <typename ElementT, int TbM, int TbN, int TbK, int WarpM, int WarpN,
-          int WarpK>
+// LayoutB selects how the per-expert [K, N] operand reads: RowMajor for
+// dense stacks, ColumnMajor for stacks of [N, K] row-major weights viewed
+// through their transpose (the linear-layer convention).
+template <typename ElementT, typename LayoutB, int TbM, int TbN, int TbK,
+          int WarpM, int WarpN, int WarpK>
 struct HalfGroupedGemm {
     using Kernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
         ElementT, cutlass::layout::RowMajor, cutlass::ComplexTransform::kNone,
-        8, ElementT, cutlass::layout::RowMajor,
+        8, ElementT, LayoutB,
         cutlass::ComplexTransform::kNone, 8, ElementT,
         cutlass::layout::RowMajor, float, cutlass::arch::OpClassTensorOp,
         cutlass::arch::Sm80, cutlass::gemm::GemmShape<TbM, TbN, TbK>,
@@ -134,10 +191,11 @@ struct HalfGroupedGemm {
 // operands (OpMultiplyAddFastF32), f32 accumulator.  The f32 epilogue
 // staging tile keeps the tile at 128x64 so the shared-memory footprint
 // stays within the consumer-ampere budget.
+template <typename LayoutB>
 struct TF32GroupedGemm {
     using Kernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
         float, cutlass::layout::RowMajor, cutlass::ComplexTransform::kNone, 4,
-        float, cutlass::layout::RowMajor, cutlass::ComplexTransform::kNone, 4,
+        float, LayoutB, cutlass::ComplexTransform::kNone, 4,
         float, cutlass::layout::RowMajor, float, cutlass::arch::OpClassTensorOp,
         cutlass::arch::Sm80, cutlass::gemm::GemmShape<128, 64, 16>,
         cutlass::gemm::GemmShape<64, 32, 16>, cutlass::gemm::GemmShape<16, 8, 8>,
@@ -161,17 +219,24 @@ int grouped_gemm_max_active() {
 
 // Tiles assigned to the persistent grid: every tile of every group, capped
 // by the co-resident capacity -- extra CTAs would only rescan the problem
-// list.
-int64_t total_tile_count(const int64_t* ends_host, int64_t groups, int64_t n,
-                         int tb_m, int tb_n) {
-    int64_t tiles = 0;
-    int64_t start = 0;
-    for (int64_t g = 0; g < groups; ++g) {
-        const int64_t rows = ends_host[g] - start;
-        start = ends_host[g];
-        tiles += ((rows + tb_m - 1) / tb_m) * ((n + tb_n - 1) / tb_n);
+// list.  Without host-validated offsets an upper bound from the row total
+// stands in for the per-group arithmetic; the device scheduler sizes the
+// work from the clamped descriptors, so an overestimate only means some
+// CTAs exit without tiles.
+int64_t total_tile_count(const int64_t* ends_host, int64_t groups,
+                         int64_t m_total, int64_t n, int64_t tb_m,
+                         int64_t tb_n) {
+    if (ends_host) {
+        int64_t tiles = 0;
+        int64_t start = 0;
+        for (int64_t g = 0; g < groups; ++g) {
+            const int64_t rows = ends_host[g] - start;
+            start = ends_host[g];
+            tiles += ((rows + tb_m - 1) / tb_m) * ((n + tb_n - 1) / tb_n);
+        }
+        return tiles;
     }
-    return tiles;
+    return groups * ((m_total + tb_m - 1) / tb_m) * ((n + tb_n - 1) / tb_n);
 }
 
 template <typename Gemm, typename ElementT>
@@ -212,28 +277,30 @@ template <typename Gemm, typename ElementT>
 bool run_grouped_config(const Tensor& offs_dev, const void* a_ptr,
                         const void* b_ptr, void* d_ptr,
                         const int64_t* ends_host, int64_t groups,
-                        int64_t k_dim, int64_t n_dim, int tb_m, int tb_n,
-                        int sm_count, cudaStream_t stream) {
+                        int64_t m_total, int64_t k_dim, int64_t n_dim,
+                        bool b_col, int tb_m, int tb_n, int sm_count,
+                        cudaStream_t stream) {
     const int64_t tiles =
-        total_tile_count(ends_host, groups, n_dim, tb_m, tb_n);
-    if (tiles == 0) return true;  // caller's zero-filled output is the result
+        total_tile_count(ends_host, groups, m_total, n_dim, tb_m, tb_n);
+    if (tiles == 0) return true;  // zero-filled rows [0, M) are the result
     MetaLayout layout = meta_layout(groups);
     Tensor meta =
         Tensor::empty({layout.total}, DType::UInt8, Device(DeviceType::CUDA));
     char* meta_base = static_cast<char*>(meta.data_ptr());
     const int blocks = static_cast<int>((groups + 255) / 256);
+    const int64_t ldb_b = b_col ? k_dim : n_dim;
     if (offs_dev.dtype() == DType::Int32) {
         build_grouped_meta_kernel<ElementT, int32_t><<<blocks, 256, 0, stream>>>(
             meta_base, layout, static_cast<const int32_t*>(offs_dev.data_ptr()),
-            groups, static_cast<const ElementT*>(a_ptr),
+            groups, m_total, static_cast<const ElementT*>(a_ptr),
             static_cast<const ElementT*>(b_ptr),
-            static_cast<ElementT*>(d_ptr), k_dim, n_dim);
+            static_cast<ElementT*>(d_ptr), k_dim, n_dim, ldb_b);
     } else {
         build_grouped_meta_kernel<ElementT, int64_t><<<blocks, 256, 0, stream>>>(
             meta_base, layout, static_cast<const int64_t*>(offs_dev.data_ptr()),
-            groups, static_cast<const ElementT*>(a_ptr),
+            groups, m_total, static_cast<const ElementT*>(a_ptr),
             static_cast<const ElementT*>(b_ptr),
-            static_cast<ElementT*>(d_ptr), k_dim, n_dim);
+            static_cast<ElementT*>(d_ptr), k_dim, n_dim, ldb_b);
     }
     CUDA_CHECK(cudaGetLastError());
     const int threadblock_count = static_cast<int>(std::min(
@@ -242,26 +309,45 @@ bool run_grouped_config(const Tensor& offs_dev, const void* a_ptr,
                                                threadblock_count, stream);
 }
 
-template <typename ElementT>
-bool run_half_grouped_gemm(const Tensor& offs_dev, const void* a_ptr,
-                           const void* b_ptr, void* d_ptr,
-                           const int64_t* ends_host, int64_t groups,
-                           int64_t k_dim, int64_t n_dim,
-                           int64_t max_group_rows, int sm_count,
-                           int smem_optin, cudaStream_t stream) {
-    using Big = HalfGroupedGemm<ElementT, 128, 128, 32, 64, 64, 32>;
-    using Small = HalfGroupedGemm<ElementT, 64, 64, 32, 32, 32, 32>;
-    if (max_group_rows >= 64 &&
+template <typename ElementT, typename LayoutB>
+bool run_half_layout(const Tensor& offs_dev, const void* a_ptr,
+                     const void* b_ptr, void* d_ptr,
+                     const int64_t* ends_host, int64_t groups,
+                     int64_t m_total, int64_t k_dim, int64_t n_dim,
+                     int64_t max_rows_bound, int sm_count, int smem_optin,
+                     cudaStream_t stream) {
+    using Big = HalfGroupedGemm<ElementT, LayoutB, 128, 128, 32, 64, 64, 32>;
+    using Small = HalfGroupedGemm<ElementT, LayoutB, 64, 64, 32, 32, 32, 32>;
+    if (max_rows_bound >= 64 &&
         int(sizeof(typename Big::Kernel::SharedStorage)) <= smem_optin) {
         return run_grouped_config<typename Big::Gemm, ElementT>(
-            offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, k_dim, n_dim,
+            offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, m_total, k_dim,
+            n_dim, /*b_col=*/!std::is_same<LayoutB, cutlass::layout::RowMajor>::value,
             128, 128, sm_count, stream);
     }
     if (int(sizeof(typename Small::Kernel::SharedStorage)) > smem_optin)
         return false;
     return run_grouped_config<typename Small::Gemm, ElementT>(
-        offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, k_dim, n_dim, 64,
-        64, sm_count, stream);
+        offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, m_total, k_dim,
+        n_dim, /*b_col=*/!std::is_same<LayoutB, cutlass::layout::RowMajor>::value,
+        64, 64, sm_count, stream);
+}
+
+template <typename ElementT>
+bool run_half_grouped_gemm(const Tensor& offs_dev, const void* a_ptr,
+                           const void* b_ptr, void* d_ptr,
+                           const int64_t* ends_host, int64_t groups,
+                           int64_t m_total, int64_t k_dim, int64_t n_dim,
+                           bool b_col, int64_t max_rows_bound, int sm_count,
+                           int smem_optin, cudaStream_t stream) {
+    if (b_col) {
+        return run_half_layout<ElementT, cutlass::layout::ColumnMajor>(
+            offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, m_total, k_dim,
+            n_dim, max_rows_bound, sm_count, smem_optin, stream);
+    }
+    return run_half_layout<ElementT, cutlass::layout::RowMajor>(
+        offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, m_total, k_dim,
+        n_dim, max_rows_bound, sm_count, smem_optin, stream);
 }
 
 }  // namespace
@@ -296,8 +382,23 @@ bool try_grouped_gemm_tensor_op(const Tensor& self, const Tensor& mat2,
     if (self.size(0) > INT32_MAX || k_dim > INT32_MAX || n_dim > INT32_MAX)
         return false;
 
+    // B reads each expert as a [K, N] matrix.  A dense [E, K, N] stack is
+    // row-major; a stack of [N, K] row-major weights viewed through its
+    // transpose is column-major with zero-copy consumption.  Any other
+    // stride pattern pays one materializing copy.
+    const int64_t batch_span = k_dim * n_dim;
+    bool b_col = false;
+    Tensor b = mat2;
+    const bool dense_stack = mat2.size(0) == 1 || mat2.stride(0) == batch_span;
+    if (dense_stack && mat2.stride(2) == 1 && mat2.stride(1) == n_dim) {
+        b_col = false;
+    } else if (dense_stack && mat2.stride(1) == 1 && mat2.stride(2) == k_dim) {
+        b_col = true;
+    } else {
+        b = mat2.contiguous();
+        b_col = false;
+    }
     Tensor a = self.is_contiguous() ? self : self.contiguous();
-    Tensor b = mat2.is_contiguous() ? mat2 : mat2.contiguous();
     if (!offs.is_contiguous() || !out.is_contiguous()) return false;
     const Device out_dev = a.device();
     Tensor offs_dev;
@@ -312,20 +413,43 @@ bool try_grouped_gemm_tensor_op(const Tensor& self, const Tensor& mat2,
     const void* a_ptr = a.data_ptr();
     const void* b_ptr = b.data_ptr();
     void* d_ptr = out.data_ptr();
+    const int64_t m_total = self.size(0);
+
+    if (ends_host == nullptr) {
+        // Unvalidated offsets: zero the never-covered tail on the device so
+        // no host read of the offsets is needed anywhere on this path.
+        if (dt == DType::Float16) {
+            launch_grouped_tail_zero<cutlass::half_t>(
+                d_ptr, offs_dev, groups, m_total, n_dim, stream);
+        } else if (dt == DType::BFloat16) {
+            launch_grouped_tail_zero<cutlass::bfloat16_t>(
+                d_ptr, offs_dev, groups, m_total, n_dim, stream);
+        } else {
+            launch_grouped_tail_zero<float>(
+                d_ptr, offs_dev, groups, m_total, n_dim, stream);
+        }
+    }
 
     if (dt == DType::Float16) {
         return run_half_grouped_gemm<cutlass::half_t>(
-            offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, k_dim, n_dim,
-            max_group_rows, sm_count, smem_optin, stream);
+            offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, m_total, k_dim,
+            n_dim, b_col, max_group_rows, sm_count, smem_optin, stream);
     }
     if (dt == DType::BFloat16) {
         return run_half_grouped_gemm<cutlass::bfloat16_t>(
-            offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, k_dim, n_dim,
-            max_group_rows, sm_count, smem_optin, stream);
+            offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, m_total, k_dim,
+            n_dim, b_col, max_group_rows, sm_count, smem_optin, stream);
     }
-    return run_grouped_config<typename TF32GroupedGemm::Gemm, float>(
-        offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, k_dim, n_dim, 128,
-        64, sm_count, stream);
+    if (b_col) {
+        return run_grouped_config<
+            TF32GroupedGemm<cutlass::layout::ColumnMajor>::Gemm, float>(
+            offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, m_total, k_dim,
+            n_dim, /*b_col=*/true, 128, 64, sm_count, stream);
+    }
+    return run_grouped_config<TF32GroupedGemm<cutlass::layout::RowMajor>::Gemm,
+                              float>(
+        offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, m_total, k_dim,
+        n_dim, /*b_col=*/false, 128, 64, sm_count, stream);
 }
 
 }  // namespace cuda
