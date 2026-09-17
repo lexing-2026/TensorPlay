@@ -521,6 +521,69 @@ Tensor segment_reduce_cpu(
         reduction, data_contig, lengths_contig, axis, initial);
 }
 
+// Autograd-free forward entry: same contraction contract as segment_reduce
+// above, but boundaries come only as lengths or offsets (never both) and the
+// lengths consistency checks always run -- the schema carries no unsafe
+// escape hatch.
+Tensor _segment_reduce_cpu(
+    const Tensor& data, std::string reduce, std::optional<Tensor> lengths,
+    std::optional<Tensor> offsets, int64_t axis, std::optional<Scalar> initial) {
+    axis = wrap_axis(axis, data.dim());
+    TP_CHECK(data.numel() >= 0, "segment_reduce: data must not be negative sized");
+
+    const bool lengths_has_value = lengths.has_value() && lengths->defined();
+    const bool offsets_has_value = offsets.has_value() && offsets->defined();
+    TP_CHECK(lengths_has_value != offsets_has_value,
+             "_segment_reduce(): exactly one of lengths or offsets must be "
+             "defined.");
+
+    const SegmentReduction reduction = get_segment_reduction(reduce);
+    const Tensor data_contig = data.contiguous();
+
+    if (offsets_has_value) {
+        const Tensor& offsets_value = *offsets;
+        TP_CHECK(data.device() == offsets_value.device(),
+                 "segment_reduce: data and offsets must be on the same device");
+        TP_CHECK(data.dim() >= offsets_value.dim(),
+                 "segment_reduce: data must have at least as many dimensions "
+                 "as offsets");
+        TP_CHECK(axis == offsets_value.dim() - 1,
+                 "segment_reduce(): Expected axis to be the last dimension of "
+                 "offsets but got ", axis, ".");
+
+        const Tensor offsets_contig = offsets_value.contiguous();
+        return segment_reduce_offsets_cpu(
+            reduction, data_contig, offsets_contig, axis, initial);
+    }
+
+    const Tensor& lengths_value = *lengths;
+    TP_CHECK(data.device() == lengths_value.device(),
+             "segment_reduce: data and lengths must be on the same device");
+    TP_CHECK(data.dim() >= lengths_value.dim(),
+             "segment_reduce: data must have at least as many dimensions as "
+             "lengths");
+    TP_CHECK(axis == lengths_value.dim() - 1,
+             "segment_reduce(): Expected axis to be the last dimension of "
+             "lengths but got ", axis, ".");
+
+    const Tensor min_length_t = lengths_value.min();
+    const int64_t min_length = min_length_t.item().to<int64_t>();
+    TP_CHECK(min_length >= 0, "lengths contains negative value!");
+    // Every row of lengths (the last axis) must cover the reduction axis of
+    // data exactly.
+    const Tensor row_sums = lengths_value.sum({static_cast<int64_t>(
+        lengths_value.dim() - 1)});
+    const bool sums_match = row_sums.eq(Scalar(static_cast<double>(
+        data.size(axis)))).all().item().to<bool>();
+    TP_CHECK(sums_match,
+             "segment_reduce(): Expected all rows of lengths along axis ",
+             axis, " to sum to data.size(lengths.dim()-1).");
+
+    const Tensor lengths_contig = lengths_value.contiguous();
+    return segment_reduce_lengths_cpu(
+        reduction, data_contig, lengths_contig, axis, initial);
+}
+
 // The forward and backward sweeps duplicate the segment-boundary walk; the
 // forward result is not cached across the two.
 Tensor _segment_reduce_backward_cpu(
@@ -558,5 +621,6 @@ Tensor _segment_reduce_backward_cpu(
 TENSORPLAY_LIBRARY_IMPL(CPU, SegmentReduce) {
     using namespace tensorplay::cpu;
     m.impl("segment_reduce", segment_reduce_cpu);
+    m.impl("_segment_reduce", _segment_reduce_cpu);
     m.impl("_segment_reduce_backward", _segment_reduce_backward_cpu);
 }

@@ -13200,6 +13200,15 @@ def _segment_reduce_backward(grad, output, data, reduce, lengths=None, offsets=N
         initial = tensorplay.Scalar(initial)
     return _C._segment_reduce_backward(grad, output, data, reduce, lengths=lengths, offsets=offsets, axis=axis, initial=initial)
 
+def _segment_reduce(data, reduce, lengths=None, offsets=None, axis=0, initial=None):
+    if _capturing():
+        _captured = _capture_call(_segment_reduce, (data, reduce, lengths, offsets, axis, initial), {})
+        if _captured is not None:
+            return _captured
+    if initial is not None and not isinstance(initial, (tensorplay.Scalar, tensorplay.Tensor)):
+        initial = tensorplay.Scalar(initial)
+    return _C._segment_reduce(data, reduce, lengths=lengths, offsets=offsets, axis=axis, initial=initial)
+
 def pad_sequence(sequences, batch_first=False, padding_value=0.0, padding_side='right'):
     if _capturing():
         _captured = _capture_call(pad_sequence, (sequences, batch_first, padding_value, padding_side), {})
