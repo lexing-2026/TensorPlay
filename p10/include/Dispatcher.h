@@ -220,7 +220,9 @@ public:
     // Type-safe registration helper
     template<typename Func>
     Library& impl(const std::string& name, Func func) {
-        Dispatcher::singleton().registerKernel(name, key_, (KernelFunction)func);
+        // Unary + decays a captureless lambda to its function pointer, so
+        // lambdas and named functions register through the same path.
+        Dispatcher::singleton().registerKernel(name, key_, (KernelFunction)(+func));
         return *this;
     }
 
