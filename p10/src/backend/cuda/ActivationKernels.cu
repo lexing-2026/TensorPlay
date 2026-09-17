@@ -302,41 +302,52 @@ Tensor elu_kernel_cudnn(const Tensor& self, Scalar alpha) {
     return cudnn_activation(self, CUDNN_ACTIVATION_ELU, alpha.to<double>()); 
 }
 
+Tensor softmax_native_impl(const Tensor& self, int64_t dim, bool log_mode);
+
 Tensor cudnn_softmax(const Tensor& self, int64_t dim, bool log) {
     int64_t ndim = self.dim();
     if (dim < 0) dim += ndim;
-    
+    // The DNN softmax call below is only wired for 4-byte element types;
+    // reduced-precision inputs would be described with a mismatched element
+    // size and read/written out of bounds.  Route them to the native kernel,
+    // which accumulates in float and returns the input dtype.
+    if (self.dtype() != DType::Float32 && self.dtype() != DType::Float64) {
+        return softmax_native_impl(self, dim, log);
+    }
+    // The descriptor maps logical dims onto contiguous layout.
+    Tensor input = self.is_contiguous() ? self : self.contiguous();
+
     // Map to NCHW where C is the softmax dim
     // N = outer_size, C = softmax_size, H = inner_size, W = 1
     int64_t outer_size = 1;
-    for(int i=0; i<dim; ++i) outer_size *= self.size(i);
-    int64_t softmax_size = self.size(dim);
+    for(int i=0; i<dim; ++i) outer_size *= input.size(i);
+    int64_t softmax_size = input.size(dim);
     int64_t inner_size = 1;
-    for(int i=dim+1; i<ndim; ++i) inner_size *= self.size(i);
-    
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
-    
+    for(int i=dim+1; i<ndim; ++i) inner_size *= input.size(i);
+
+    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(input.shape()), input.dtype(), input.device());
+
     cudnnHandle_t handle = CUDAContext::getCudnnHandle();
-    
+
     cudnnTensorDescriptor_t desc;
     CUDNN_CHECK(cudnnCreateTensorDescriptor(&desc));
-    
-    cudnnDataType_t c_dtype = (self.dtype() == DType::Float64) ? CUDNN_DATA_DOUBLE : CUDNN_DATA_FLOAT;
+
+    cudnnDataType_t c_dtype = (input.dtype() == DType::Float64) ? CUDNN_DATA_DOUBLE : CUDNN_DATA_FLOAT;
     // Set 4D descriptor with logical dims
     CUDNN_CHECK(cudnnSetTensor4dDescriptor(desc, CUDNN_TENSOR_NCHW, c_dtype, (int)outer_size, (int)softmax_size, (int)inner_size, 1));
-    
+
     cudnnSoftmaxAlgorithm_t algo = log ? CUDNN_SOFTMAX_LOG : CUDNN_SOFTMAX_ACCURATE;
     cudnnSoftmaxMode_t mode = CUDNN_SOFTMAX_MODE_CHANNEL; // Softmax over C
-    
+
     float alpha = 1.0f, beta = 0.0f;
     double alpha_d = 1.0, beta_d = 0.0;
     void *alpha_p = &alpha, *beta_p = &beta;
-    if (self.dtype() == DType::Float64) { alpha_p = &alpha_d; beta_p = &beta_d; }
-    
-    CUDNN_CHECK(cudnnSoftmaxForward(handle, algo, mode, alpha_p, desc, self.data_ptr(), beta_p, desc, result.data_ptr()));
-    
+    if (input.dtype() == DType::Float64) { alpha_p = &alpha_d; beta_p = &beta_d; }
+
+    CUDNN_CHECK(cudnnSoftmaxForward(handle, algo, mode, alpha_p, desc, input.data_ptr(), beta_p, desc, result.data_ptr()));
+
     CUDNN_CHECK(cudnnDestroyTensorDescriptor(desc));
-    
+
     return result;
 }
 
