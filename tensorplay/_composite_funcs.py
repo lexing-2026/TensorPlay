@@ -641,6 +641,37 @@ def repeat_interleave(input, repeats, dim=None, *, output_size=None):
         axis = 1
     else:
         axis = _norm_dim(dim, input.dim())
+    # Scalar repeats keep the repetition count on the host, so the result
+    # shape is known without reading device data; an expanded view plus one
+    # materializing copy replaces the index-map construction.
+    if isinstance(repeats, (int, bool)) and not isinstance(
+            repeats, tensorplay.Tensor):
+        rep_n = int(repeats)
+        if rep_n < 0:
+            raise ValueError(
+                "repeat_interleave(): repeats must be non-negative")
+        n = src.size(axis)
+        total = n * rep_n
+        if output_size is not None and int(output_size) != total:
+            raise RuntimeError(
+                "repeat_interleave(): output_size does not match the repeated "
+                f"length ({int(output_size)} != {total})"
+            )
+        if total == 0:
+            output_shape = list(src.shape)
+            output_shape[axis] = 0
+            picked = tensorplay.empty(
+                output_shape, dtype=input.dtype, device=input.device)
+            return picked.reshape([-1]) if dim is None else picked
+        view_shape = list(src.shape)
+        view_shape.insert(axis + 1, rep_n)
+        out_shape = list(src.shape)
+        out_shape[axis] = total
+        picked = src.unsqueeze(axis + 1).expand(view_shape) \
+            .reshape(out_shape)
+        if dim is None:
+            return picked.reshape([-1])
+        return picked
     if isinstance(repeats, tensorplay.Tensor) or not isinstance(
             repeats, (int, float, bool)):
         rep = _as_tensor(repeats).to(DType.int64).to(device=input.device)
