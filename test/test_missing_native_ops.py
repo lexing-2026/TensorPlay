@@ -304,6 +304,32 @@ def test_safe_softmax_zeroes_fully_masked_rows():
     assert out.tolist() == [[0.0, 0.0], [0.5, 0.5]]
 
 
+def test_masked_softmax_restricts_and_zeroes_rejected_entries():
+    x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+    mask = tp.tensor([[True, False], [True, True]])
+    out = tp._C._masked_softmax(x, mask, -1, None)
+    # Row 0 keeps only its selected entry, so its probability is 1 there;
+    # row 1 reduces the ordinary softmax of the full row.
+    _allclose(out, tp.tensor([[1.0, 0.0], [0.268941, 0.731059]]))
+
+    # A row the mask rejects entirely answers zeros, not NaN.
+    empty = tp._C._masked_softmax(x, tp.zeros(2, 2, dtype=tp.bool), -1, None)
+    assert empty.tolist() == [[0.0, 0.0], [0.0, 0.0]]
+
+    # Omitting the reduction axis defaults to the last one.
+    default = tp._C._masked_softmax(x, mask, None, None)
+    _allclose(default, out)
+
+
+def test_masked_softmax_backward_matches_the_masked_correction():
+    x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+    mask = tp.tensor([[True, False], [True, True]])
+    out = tp._C._masked_softmax(x, mask, -1, None)
+    grad = tp.tensor([[1.0, 2.0], [0.5, 1.5]])
+    g = tp._C._masked_softmax_backward(grad, out, mask, -1)
+    _allclose(g, tp.tensor([[0.0, 0.0], [-0.196612, 0.196612]]))
+
+
 # ------------------------------------------------------------ reductions / misc
 
 
