@@ -373,6 +373,11 @@ def run_native(args):
             return model(input_ids=t, use_cache=False).logits
 
     logits = fwd(ids).float().cpu().numpy()
+    # Co-tenant training jobs shrink the free pool between runs; release
+    # every cached block before the autoregressive loop peaks.
+    import gc as _gc
+    _gc.collect()
+    tp.cuda.empty_cache()
     gen = greedy_steps(fwd, ids, args.gen_tokens, tp.cat)
     gen = gen.cpu().numpy()[0, ids_np.shape[1]:]
 
