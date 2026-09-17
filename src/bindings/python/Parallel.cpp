@@ -11,6 +11,18 @@ void init_parallel(py::module_& m) {
     m.def("get_num_threads", &tensorplay::parallel::get_num_threads,
           "Returns the number of threads used for parallelizing CPU operations");
 
+    m.def("set_num_interop_threads", &tensorplay::parallel::set_num_interop_threads,
+          py::arg("nthreads"),
+          "Sets the number of threads used for interop parallelism on CPU. "
+          "The parallel layer uses a single shared thread pool, so the request "
+          "is accepted only when it matches the pool size configured via "
+          "set_num_threads.");
+
+    m.def("get_num_interop_threads", &tensorplay::parallel::get_num_interop_threads,
+          "Returns the number of threads used for interop parallelism on CPU. "
+          "The parallel layer uses a single shared thread pool, so this equals "
+          "the number of intraop threads.");
+
     m.def("get_thread_num", &tensorplay::parallel::get_thread_num,
           "Returns the current thread number (starting from 0) in the current "
           "parallel region, or 0 in the sequential region");
