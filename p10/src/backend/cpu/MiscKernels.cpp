@@ -241,16 +241,32 @@ struct XorSumOps {
 
 // View the reduction result with size-1 stride-0 dims at the reduced
 // positions so the iterator can identify the reduced dims from the output's
-// strides (used when keepdim=false).
+// strides (used when keepdim=false).  The result carries one entry per
+// surviving dim; walking the full rank merges those entries back into their
+// original positions, inserting a size-1 zero-stride slot at every reduced
+// dim (all dims reduced leaves a 0-dim result, so positions cannot be
+// derived from the result's own rank).
 Tensor insert_reduce_strides(const Tensor& result, int64_t ndim,
                              const std::vector<bool>& mask, bool keepdim) {
     if (keepdim) return result;
-    std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(result.shape());
-    std::vector<int64_t> stride = static_cast<std::vector<int64_t>>(result.strides());
-    for (int64_t dim = ndim - 1; dim >= 0; --dim) {
+    const std::vector<int64_t> result_shape =
+        static_cast<std::vector<int64_t>>(result.shape());
+    const std::vector<int64_t> result_strides = result.strides();
+    std::vector<int64_t> shape, stride;
+    shape.reserve(static_cast<size_t>(ndim));
+    stride.reserve(static_cast<size_t>(ndim));
+    size_t r = 0;
+    for (int64_t dim = 0; dim < ndim; ++dim) {
         if (mask[static_cast<size_t>(dim)]) {
-            shape.insert(shape.begin() + dim, 1);
-            stride.insert(stride.begin() + dim, 0);
+            shape.push_back(1);
+            stride.push_back(0);
+        } else {
+            TP_CHECK(r < result_shape.size(),
+                     "hash_tensor: reduction output rank does not match the "
+                     "input rank minus the reduced dims");
+            shape.push_back(result_shape[r]);
+            stride.push_back(result_strides[r]);
+            ++r;
         }
     }
     Tensor as_strided_src = result;
@@ -295,6 +311,10 @@ void hash_tensor_check(const Tensor& self, const std::vector<int64_t>& dims,
 void hash_tensor_into(const Tensor& self, const std::vector<int64_t>& dims,
                       bool keepdim, int64_t mode, Tensor& result) {
     hash_tensor_check(self, dims, mode);
+    if (result.defined() && result.dtype() != DType::UInt64) {
+        TP_THROW(RuntimeError,
+                 "hash_tensor: expected the result to have dtype uint64");
+    }
     const int64_t ndim = self.dim();
     std::vector<bool> mask(static_cast<size_t>(ndim > 0 ? ndim : 1), false);
     std::vector<int64_t> wrapped_dims;
@@ -348,6 +368,18 @@ Tensor& hash_tensor_out_cpu(const Tensor& self, const std::vector<int64_t>& dims
     if (!result.defined()) {
         result = hash_tensor_cpu(self, dims, keepdim, mode);
         return result;
+    }
+    std::vector<int64_t> wrapped;
+    wrapped.reserve(dims.size());
+    for (int64_t d : dims) {
+        wrapped.push_back(d < 0 ? d + self.dim() : d);
+    }
+    const std::vector<int64_t> want =
+        compute_reduction_shape(self, wrapped, keepdim);
+    if (static_cast<std::vector<int64_t>>(result.shape()) != want) {
+        TP_THROW(RuntimeError,
+                 "hash_tensor.out: the result shape must match the input "
+                 "reduced over the requested dims");
     }
     hash_tensor_into(self, dims, keepdim, mode, result);
     return result;
@@ -429,17 +461,26 @@ void transform_bias_rescale_qkv_kernel(
 
 std::tuple<Tensor, Tensor, Tensor> transform_bias_rescale_qkv_cpu(
     const Tensor& qkv, const Tensor& qkv_bias, int64_t num_head) {
-    const int64_t B = qkv.size(0);
-    const int64_t T = qkv.size(1);
-    const int64_t _3D = qkv.size(2);
-    const int64_t D = _3D / 3;
-    TP_CHECK(D % num_head == 0, "embedding dim must divide num_head");
+    // Nested inputs are padded first; the packed kernel below walks dense
+    // storage only.
+    const Tensor dense = qkv.is_nested() ? qkv.to_padded_tensor(0.0) : qkv;
+    TP_CHECK(dense.dim() == 3,
+             "_transform_bias_rescale_qkv: expected qkv to be 3-D {B, T, 3D}");
+    const int64_t B = dense.size(0);
+    const int64_t T = dense.size(1);
+    const int64_t _3D = dense.size(2);
     TP_CHECK(_3D % 3 == 0, "third dimension must be a multiple of 3");
+    const int64_t D = _3D / 3;
+    TP_CHECK(num_head > 0, "num_head must be positive");
+    TP_CHECK(D % num_head == 0, "embedding dim must divide num_head");
     const int64_t dim_per_head = D / num_head;
+    TP_CHECK(qkv_bias.dim() == 1 && qkv_bias.numel() == _3D,
+             "_transform_bias_rescale_qkv: expected qkv_bias to be 1-D of the "
+             "same length as the last qkv dimension");
     Tensor q_k_v = Tensor::empty({3, B, num_head, T, dim_per_head},
-                                 qkv.dtype(), qkv.device());
+                                 dense.dtype(), dense.device());
 
-    const Tensor qkv_contig = qkv.contiguous();
+    const Tensor qkv_contig = dense.contiguous();
     const Tensor qkv_bias_contig = qkv_bias.contiguous();
 
 #define TP_QKV_CASE(ctype, name) \
@@ -449,7 +490,7 @@ std::tuple<Tensor, Tensor, Tensor> transform_bias_rescale_qkv_cpu(
             qkv_bias_contig.data_ptr<ctype>(), \
             B, T, D, num_head); \
         break;
-    switch (qkv.dtype()) {
+    switch (dense.dtype()) {
         case DType::Float32: TP_QKV_CASE(float, Float32)
         case DType::Float64: TP_QKV_CASE(double, Float64)
         case DType::Float16: TP_QKV_CASE(Half, Float16)
