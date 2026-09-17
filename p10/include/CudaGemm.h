@@ -23,6 +23,24 @@ void gemm_strided_batched_3d(const Tensor& self_3d, const Tensor& other_3d,
                              long long stride_a, long long stride_b,
                              double alpha, double beta);
 
+// Ragged grouped GEMM fast path: one persistent tensor-op kernel covers all
+// groups.  A is row-major (M_total, K); B stacks G row-major (K, N) expert
+// matrices; `offs` holds the G group-end offsets (int32/int64, on any
+// device) and `ends_host` repeats it on the host after validation.
+// `max_group_rows` is the largest per-group row count and feeds the tile
+// choice.  Per-group descriptors (sizes, operand pointers, leading
+// dimensions) are built on the device from `offs`, so the launch path
+// carries no host staging.  Half inputs run the native mma with an f32
+// accumulator; Float32 runs the tensor-op path when
+// Context::allowTF32CuBLAS() selects the reduced-exponent f32 compute.
+// Returns false when the configuration is outside the envelope (dtype,
+// operand alignment, device capability, kernel launch) and the caller must
+// use the per-group cuBLAS entry; `out` is written only on success.
+bool try_grouped_gemm_tensor_op(const Tensor& self, const Tensor& mat2,
+                                const Tensor& offs, Tensor& out,
+                                const int64_t* ends_host,
+                                int64_t max_group_rows);
+
 // Zero-fill used for empty-K GEMM outputs.
 Tensor& zero_matmul_output_cuda(Tensor& output);
 
