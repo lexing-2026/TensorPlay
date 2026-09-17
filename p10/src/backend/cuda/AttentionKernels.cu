@@ -1674,7 +1674,12 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
   if (impl == 0 && flash_tensor_core_dtype && tensor_cores_available) {
     impl = 5;
   } else if (impl == 0 && D <= 128) {
-    impl = 3;
+    // Scalar-precision attention outgrows the warp-per-row flash quickly:
+    // the GEMM-native route runs tuned BLAS kernels and wins from short
+    // sequences onward (crossover measured near T=64; at T=1024 it is an
+    // order of magnitude ahead).  Short sequences keep the flash kernel's
+    // single-launch simplicity.
+    impl = (dtype == DType::Float32 && T >= 64) ? 2 : 3;
   }
 
   if (impl == 0) {
