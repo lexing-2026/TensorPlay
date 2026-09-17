@@ -86,6 +86,7 @@ TensorImpl::TensorImpl(const TensorImpl& other)
       storage_(other.storage_),
       shared_state_(other.shared_state_),
       sparse_state_(other.sparse_state_),
+      nested_state_(other.nested_state_),
       transform_value_(other.transform_value_),
       transform_batch_dim_(other.transform_batch_dim_),
       transform_level_(other.transform_level_),
@@ -114,6 +115,7 @@ void TensorImpl::copy_metadata_from(const TensorImpl& other) {
     is_contiguous_ = other.is_contiguous_;
     memory_format_ = other.memory_format_;
     sparse_state_ = other.sparse_state_;
+    nested_state_ = other.nested_state_;
     transform_value_ = other.transform_value_;
     transform_batch_dim_ = other.transform_batch_dim_;
     transform_level_ = other.transform_level_;

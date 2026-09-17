@@ -7465,6 +7465,8 @@
   variants: function, method
 - func: is_quantized(Tensor self) -> bool
   variants: function, method
+- func: is_nested(Tensor self) -> bool
+  variants: function, method
 - func: qscheme(Tensor self) -> int
   variants: function, method
 - func: int_repr(Tensor self) -> Tensor

@@ -1068,7 +1068,8 @@ from ._finfo import finfo, iinfo
 # composite operator.  ``_amp_*`` dispatcher hooks follow the same rule
 for _foreach_name in dir(functional):
     if (_foreach_name.startswith("_foreach_") or _foreach_name.startswith("_amp_")
-            or _foreach_name.startswith("_fused_")):
+            or _foreach_name.startswith("_fused_")
+            or _foreach_name.startswith("_nested_")):
         globals()[_foreach_name] = getattr(functional, _foreach_name)
         if _foreach_name not in __all__:
             __all__.append(_foreach_name)
@@ -1181,6 +1182,7 @@ else:
         "ao",
         "contrib",
         "monitor",
+        "nested",
         "sparse",
         "special",
         "vision",

@@ -88,6 +88,19 @@ private:
     };
     std::shared_ptr<SparseState> sparse_state_;
 
+    // Nested (jagged) tensors keep one flat buffer plus per-constituent
+    // metadata.  `nested_sizes` is a [B, R] Int64 tensor whose row i is the
+    // shape of constituent i, `nested_strides` its row-major strides, and
+    // `storage_offsets` a [B] Int64 tensor of element offsets into the
+    // buffer.  A nested tensor reports dim() == R + 1 and numel() equal to
+    // the sum of the row volumes; a single dense size does not exist.
+    struct NestedState {
+        std::shared_ptr<TensorImpl> nested_sizes;
+        std::shared_ptr<TensorImpl> nested_strides;
+        std::shared_ptr<TensorImpl> storage_offsets;
+    };
+    std::shared_ptr<NestedState> nested_state_;
+
     // A transform wrapper keeps the physical value separate from its public
     // logical metadata. The wrapper is immutable with respect to storage;
     // batching rules create a new wrapper for each result.
@@ -162,6 +175,23 @@ public:
     }
 
     bool is_inference() const { return inference_tensor_; }
+
+    bool is_nested() const { return nested_state_ != nullptr; }
+    const std::shared_ptr<NestedState>& nested_state() const { return nested_state_; }
+    void set_nested_state(std::shared_ptr<NestedState> state) {
+        nested_state_ = std::move(state);
+    }
+    // Mounts per-constituent metadata (all three tables Int64 on the buffer
+    // device) onto a flat buffer impl.
+    void set_nested_state(std::shared_ptr<TensorImpl> sizes,
+                          std::shared_ptr<TensorImpl> strides,
+                          std::shared_ptr<TensorImpl> offsets) {
+        auto state = std::make_shared<NestedState>();
+        state->nested_sizes = std::move(sizes);
+        state->nested_strides = std::move(strides);
+        state->storage_offsets = std::move(offsets);
+        nested_state_ = std::move(state);
+    }
 
     bool is_batched() const { return transform_value_ != nullptr; }
     int64_t batch_dim() const { return transform_batch_dim_; }

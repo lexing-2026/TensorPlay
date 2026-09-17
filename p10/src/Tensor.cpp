@@ -341,16 +341,76 @@ std::array<int64_t, 2> Tensor::sparse_blocksize() const {
     return impl_ ? impl_->sparse_blocksize() : std::array<int64_t, 2>{0, 0};
 }
 
-int64_t Tensor::dim() const { return impl_ ? impl_->dim() : 0; }
-int64_t Tensor::numel() const { return impl_ ? impl_->numel() : 0; }
-Size Tensor::shape() const { return impl_ ? Size(impl_->sizes()) : Size(); }
+int64_t Tensor::dim() const {
+    if (!impl_) return 0;
+    if (impl_->is_nested()) {
+        return impl_->nested_state()->nested_sizes->size(1) + 1;
+    }
+    return impl_->dim();
+}
+
+int64_t Tensor::numel() const {
+    if (!impl_) return 0;
+    if (impl_->is_nested()) {
+        const auto& st = impl_->nested_state();
+        const Tensor sizes(st->nested_sizes);
+        const int64_t rows = sizes.size(0), cols = sizes.size(1);
+        // Metadata may live beside a non-CPU buffer; host-side reads go
+        // through a copy (a no-op for CPU metadata).
+        Tensor flat = sizes.reshape({rows * cols}).contiguous()
+                          .to(Device(DeviceType::CPU));
+        const int64_t* p = flat.data_ptr<int64_t>();
+        int64_t total = 0;
+        for (int64_t i = 0; i < rows; ++i) {
+            int64_t vol = 1;
+            for (int64_t j = 0; j < cols; ++j) vol *= p[i * cols + j];
+            total += vol;
+        }
+        return total;
+    }
+    return impl_->numel();
+}
+
+Size Tensor::shape() const {
+    if (impl_ && impl_->is_nested()) {
+        TP_THROW(RuntimeError,
+                 "nested tensors carry a size per constituent; a single "
+                 "dense size does not exist (use _nested_tensor_size())");
+    }
+    return impl_ ? Size(impl_->sizes()) : Size();
+}
 std::vector<int64_t> Tensor::strides() const {
+    if (impl_ && impl_->is_nested()) {
+        TP_THROW(RuntimeError,
+                 "nested tensors carry a stride per constituent; a single "
+                 "dense stride does not exist (use _nested_tensor_strides())");
+    }
     if (is_sparse()) return std::vector<int64_t>(static_cast<size_t>(dim()), 0);
     return impl_ ? impl_->strides().vec() : std::vector<int64_t>();
 }
 int64_t Tensor::size(int64_t dim) const {
     if (!impl_) return 0;
-    if (dim < 0) dim += impl_->dim();
+    if (dim < 0) dim += this->dim();
+    if (impl_->is_nested()) {
+        // dim 0 is the batch; deeper dims report the maximum extent across
+        // constituents (the padded upper bound)
+        const auto& st = impl_->nested_state();
+        const Tensor sizes(st->nested_sizes);
+        const int64_t ndim = sizes.size(1) + 1;
+        if (dim < 0 || dim >= ndim) {
+            TP_THROW(IndexError, format_dim_range(ndim, dim));
+        }
+        if (dim == 0) return sizes.size(0);
+        // Metadata may live beside a non-CPU buffer; host-side reads go
+        // through a copy (a no-op for CPU metadata).
+        const int64_t rows = sizes.size(0), cols = sizes.size(1);
+        Tensor flat = sizes.reshape({rows * cols}).contiguous()
+                          .to(Device(DeviceType::CPU));
+        const int64_t* p = flat.data_ptr<int64_t>();
+        int64_t m = 0;
+        for (int64_t i = 0; i < rows; ++i) m = std::max(m, p[i * cols + dim - 1]);
+        return m;
+    }
     return impl_->size(dim);
 }
 int64_t Tensor::stride(int64_t dim) const {
@@ -727,7 +787,38 @@ std::string Tensor::toString() const {
                << ", layout=sparse_coo)";
         return sparse.str();
     }
-    
+
+    if (is_nested()) {
+        const auto& st = impl_->nested_state();
+        const Tensor sizes(st->nested_sizes);
+        const Tensor offsets_t(st->storage_offsets);
+        const Device host = Device(DeviceType::CPU);
+        Tensor sizes_host = sizes.contiguous().to(host);
+        Tensor offsets_host = offsets_t.contiguous().to(host);
+        const int64_t batch = sizes.size(0), rank = sizes.size(1);
+        const int64_t* sp = sizes_host.data_ptr<int64_t>();
+        const int64_t* op = offsets_host.data_ptr<int64_t>();
+        // A plain dense alias of the backing buffer: each constituent is a
+        // slice of it, printed one per row of the size table. Offsets are
+        // positions inside the buffer, so the alias shares its base.
+        Tensor flat(impl_->storage(), {impl_->numel()}, {1}, dtype(),
+                    static_cast<size_t>(impl_->storage_offset()));
+        std::stringstream nested;
+        nested << "nested_tensor([";
+        for (int64_t i = 0; i < batch; ++i) {
+            if (i) nested << ", ";
+            std::vector<int64_t> row_shape;
+            int64_t vol = 1;
+            for (int64_t j = 0; j < rank; ++j) {
+                row_shape.push_back(sp[i * rank + j]);
+                vol *= sp[i * rank + j];
+            }
+            nested << flat.narrow(0, op[i], vol).view(row_shape).toString();
+        }
+        nested << "])";
+        return nested.str();
+    }
+
     std::stringstream ss;
 
     // 为了支持非CPU张量的打印（如CUDA），我们需要将其拷贝到CPU
