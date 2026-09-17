@@ -37,7 +37,9 @@ def _contiguous_strides_offsets(nested_sizes):
     it; packed rows place constituent ``i`` at the total volume of the rows
     before it.
     """
-    rows = nested_sizes.tolist()
+    # Metadata may sit beside a non-CPU buffer; the row-wise walk reads it
+    # on the host (the tables are tiny, so the copy is negligible).
+    rows = nested_sizes.cpu().tolist()
     strides, offsets = [], []
     running = 0
     for row in rows:

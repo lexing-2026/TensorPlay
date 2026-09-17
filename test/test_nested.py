@@ -182,3 +182,15 @@ def test_non_contiguous_and_offset_rows():
     assert tp.allclose(padded[1, :3], base[1, :3])
     # Blanks in the buffer stay blanks: padding fills them, not neighbors.
     assert float(padded[1][3]) == 0.0
+
+
+def test_dense_view_on_cuda_keeps_metadata_on_device():
+    if not tp.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    dense = tp.arange(0, 12, dtype=tp.float32).reshape(3, 4).to("cuda")
+    nt = as_nested_tensor(dense)
+    assert nt.is_nested()
+    assert nt.dim() == 2 and nt.size(0) == 3 and nt.numel() == 12
+    assert nt._nested_tensor_size().device.type == "cuda"
+    padded = to_padded_tensor(nt, 0.0)
+    assert tp.equal(padded.cpu(), dense.cpu())
