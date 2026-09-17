@@ -143,6 +143,17 @@ def test_quantized_cat_relu():
     assert tp.dequantize(got).tolist() == [0.0, 2.0, 0.0, 2.0]
 
 
+def test_quantized_max_pool2d_all_negative_window_keeps_true_max():
+    # A window whose every code is negative must surface the true maximum,
+    # not a zero-initialized running value.
+    x = _make_qtensor([[[-11.0, -7.0], [-7.0, -4.0]]], 0.15, 2)
+    got = tp._C.quantized_max_pool2d(x, [2, 2], [2, 2])
+    assert got.int_repr().tolist() == [[[-4]]]
+    # The dense int8 path shares the kernel and must behave the same.
+    codes = tp.tensor([[[[-5, -2], [-9, -4]]]], dtype=tp.int8)
+    assert tp.max_pool2d(codes, [2, 2], [2, 2]).tolist() == [[[-2]]]
+
+
 def test_quantized_max_pool2d_matches_float():
     x = _make_qtensor(tp.rand(1, 2, 6, 6).mul(4).sub(2).tolist(), 0.15, 2)
     got = tp._C.quantized_max_pool2d(x, [2, 2], [2, 2])

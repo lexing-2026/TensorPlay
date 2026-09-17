@@ -273,7 +273,9 @@ Tensor max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
 
                 for (int64_t w = 0; w < W_out; ++w) {
                     const int64_t w_start = w * sW - pW;
-                    scalar_t max_val = -std::numeric_limits<scalar_t>::infinity();
+                    scalar_t max_val = std::numeric_limits<scalar_t>::is_iec559
+                        ? -std::numeric_limits<scalar_t>::infinity()
+                        : std::numeric_limits<scalar_t>::lowest();
                     if (dW == 1) {
                         const int64_t kw0 = w_start < 0 ? -w_start : 0;
                         const int64_t kw1 = w_start + kW > W_in ? W_in - w_start : kW;
@@ -475,7 +477,9 @@ Tensor adaptive_max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
                     const int64_t w_start = (w * W_in) / W_out;
                     const int64_t w_end = 1 + (((w + 1) * W_in) - 1) / W_out;
 
-                    scalar_t max_val = -std::numeric_limits<scalar_t>::infinity();
+                    scalar_t max_val = std::numeric_limits<scalar_t>::is_iec559
+                        ? -std::numeric_limits<scalar_t>::infinity()
+                        : std::numeric_limits<scalar_t>::lowest();
                     for (int64_t ih = h_start; ih < h_end; ++ih) {
                         const scalar_t* row = in_base + ih * W_in;
                         for (int64_t iw = w_start; iw < w_end; ++iw) {
@@ -541,7 +545,9 @@ Tensor max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
 
                     for (int64_t w = 0; w < W_out; ++w) {
                         const int64_t w_start = w * sW - pW;
-                        scalar_t max_val = -std::numeric_limits<scalar_t>::infinity();
+                        scalar_t max_val = std::numeric_limits<scalar_t>::is_iec559
+                            ? -std::numeric_limits<scalar_t>::infinity()
+                            : std::numeric_limits<scalar_t>::lowest();
                         int64_t max_off = -1;
                         if (dW == 1) {
                             const int64_t kw0 = w_start < 0 ? -w_start : 0;
@@ -722,7 +728,9 @@ Tensor adaptive_max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor&
                         const int64_t w_start = (w * W_in) / W_out;
                         const int64_t w_end = 1 + (((w + 1) * W_in) - 1) / W_out;
 
-                        scalar_t max_val = -std::numeric_limits<scalar_t>::infinity();
+                        scalar_t max_val = std::numeric_limits<scalar_t>::is_iec559
+                            ? -std::numeric_limits<scalar_t>::infinity()
+                            : std::numeric_limits<scalar_t>::lowest();
                         int64_t max_off = -1;
                         for (int64_t ih = h_start; ih < h_end; ++ih) {
                             const scalar_t* row = in_base + ih * W_in;
@@ -776,7 +784,9 @@ std::tuple<Tensor, Tensor> adaptive_max_pool2d_with_indices_cpu(const Tensor& in
                 for (int64_t w = 0; w < W_out; ++w) {
                     const int64_t w_start = (w * W_in) / W_out;
                     const int64_t w_end = 1 + (((w + 1) * W_in) - 1) / W_out;
-                    scalar_t max_val = -std::numeric_limits<scalar_t>::infinity();
+                    scalar_t max_val = std::numeric_limits<scalar_t>::is_iec559
+                        ? -std::numeric_limits<scalar_t>::infinity()
+                        : std::numeric_limits<scalar_t>::lowest();
                     int64_t max_off = -1;
                     for (int64_t ih = h_start; ih < h_end; ++ih) {
                         const scalar_t* row = in_base + ih * W_in;
@@ -1065,7 +1075,9 @@ std::tuple<Tensor, Tensor> max_pool2d_with_indices_cpu(
                     }
                     for (int64_t w = 0; w < W_out; ++w) {
                         const int64_t w_start = w * sW - pW;
-                        scalar_t max_val = -std::numeric_limits<scalar_t>::infinity();
+                        scalar_t max_val = std::numeric_limits<scalar_t>::is_iec559
+                            ? -std::numeric_limits<scalar_t>::infinity()
+                            : std::numeric_limits<scalar_t>::lowest();
                         int64_t max_idx = -1;
                         if (dW == 1) {
                             const int64_t kw0 = w_start < 0 ? -w_start : 0;
@@ -1251,7 +1263,9 @@ std::tuple<Tensor, Tensor> max_pool3d_with_indices_cpu(
                         }
                         for (int64_t w = 0; w < W_out; ++w) {
                             const int64_t w_start = w * sW - pW;
-                            scalar_t max_val = -std::numeric_limits<scalar_t>::infinity();
+                            scalar_t max_val = std::numeric_limits<scalar_t>::is_iec559
+                                ? -std::numeric_limits<scalar_t>::infinity()
+                                : std::numeric_limits<scalar_t>::lowest();
                             int64_t max_idx = -1;
                             const bool unit_w = (dW == 1);
                             const int64_t kw0 = unit_w && w_start < 0 ? -w_start : 0;
@@ -1360,7 +1374,9 @@ Tensor max_pool3d_backward_cpu(const Tensor& grad_output, const Tensor& input,
                         }
                         for (int64_t w = 0; w < W_out; ++w) {
                             const int64_t w_start = w * sW - pW;
-                            scalar_t max_val = -std::numeric_limits<scalar_t>::infinity();
+                            scalar_t max_val = std::numeric_limits<scalar_t>::is_iec559
+                                ? -std::numeric_limits<scalar_t>::infinity()
+                                : std::numeric_limits<scalar_t>::lowest();
                             int64_t max_idx = -1;
                             const bool unit_w = (dW == 1);
                             const int64_t kw0 = unit_w && w_start < 0 ? -w_start : 0;
@@ -1493,7 +1509,9 @@ Tensor adaptive_max_pool3d_impl(const Tensor& input,
                         for (int64_t w = 0; w < oW; ++w) {
                             const int64_t ws = w * W / oW;
                             const int64_t we = 1 + (((w + 1) * W) - 1) / oW;
-                            scalar_t max_val = -std::numeric_limits<scalar_t>::infinity();
+                            scalar_t max_val = std::numeric_limits<scalar_t>::is_iec559
+                                ? -std::numeric_limits<scalar_t>::infinity()
+                                : std::numeric_limits<scalar_t>::lowest();
                             int64_t max_idx = -1;
                             for (int64_t z = ds; z < de; ++z)
                             for (int64_t y = hs; y < he; ++y) {
@@ -1573,7 +1591,9 @@ Tensor adaptive_max_pool3d_backward_cpu(const Tensor& grad_output, const Tensor&
                         for (int64_t w = 0; w < oW; ++w) {
                             const int64_t ws = w * W / oW;
                             const int64_t we = 1 + (((w + 1) * W) - 1) / oW;
-                            scalar_t max_val = -std::numeric_limits<scalar_t>::infinity();
+                            scalar_t max_val = std::numeric_limits<scalar_t>::is_iec559
+                                ? -std::numeric_limits<scalar_t>::infinity()
+                                : std::numeric_limits<scalar_t>::lowest();
                             int64_t max_idx = -1;
                             for (int64_t z = ds; z < de; ++z)
                             for (int64_t y = hs; y < he; ++y) {
