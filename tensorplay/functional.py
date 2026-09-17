@@ -5613,12 +5613,19 @@ def dequantize(*args):
             return _captured
     return _C.dequantize(*args)
 
-def quantized_linear(input, weight, input_scale, input_zero_point, weight_scales, weight_zero_points, bias=None):
+def quantized_linear(input, weight, input_scale, input_zero_point, weight_scales, weight_zero_points, bias=None, out_scale=1.0, out_zero_point=0):
     if _capturing():
-        _captured = _capture_call(quantized_linear, (input, weight, input_scale, input_zero_point, weight_scales, weight_zero_points, bias), {})
+        _captured = _capture_call(quantized_linear, (input, weight, input_scale, input_zero_point, weight_scales, weight_zero_points, bias, out_scale, out_zero_point), {})
         if _captured is not None:
             return _captured
-    return _C.quantized_linear(input, weight, input_scale, input_zero_point, weight_scales, weight_zero_points, bias)
+    return _C.quantized_linear(input, weight, input_scale, input_zero_point, weight_scales, weight_zero_points, bias, out_scale, out_zero_point)
+
+def quantized_linear_dynamic(input, weight, weight_scales, weight_zero_points, bias=None, reduce_range=False):
+    if _capturing():
+        _captured = _capture_call(quantized_linear_dynamic, (input, weight, weight_scales, weight_zero_points, bias, reduce_range), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_linear_dynamic(input, weight, weight_scales, weight_zero_points, bias, reduce_range)
 
 def quantized_add(a, b, a_scale, a_zero_point, b_scale, b_zero_point, out_scale, out_zero_point):
     if _capturing():
@@ -5723,6 +5730,102 @@ def quantized_conv2d(input, weight, bias, input_scale, input_zero_point, weight_
     if isinstance(dilation, int) and not isinstance(dilation, bool):
         dilation = [dilation]
     return _C.quantized_conv2d(input, weight, bias, input_scale, input_zero_point, weight_scale, weight_zero_point, out_scale, out_zero_point, stride, padding, dilation, groups)
+
+def quantized_relu(input):
+    if _capturing():
+        _captured = _capture_call(quantized_relu, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_relu(input)
+
+def quantized_relu6(input):
+    if _capturing():
+        _captured = _capture_call(quantized_relu6, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_relu6(input)
+
+def quantized_leaky_relu(input, negative_slope, output_scale, output_zero_point):
+    if _capturing():
+        _captured = _capture_call(quantized_leaky_relu, (input, negative_slope, output_scale, output_zero_point), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_leaky_relu(input, negative_slope, output_scale, output_zero_point)
+
+def quantized_elu(input, output_scale, output_zero_point, alpha=1.0, scale=1.0, input_scale=1.0):
+    if _capturing():
+        _captured = _capture_call(quantized_elu, (input, output_scale, output_zero_point, alpha, scale, input_scale), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_elu(input, output_scale, output_zero_point, alpha, scale, input_scale)
+
+def quantized_hardswish(input, output_scale, output_zero_point):
+    if _capturing():
+        _captured = _capture_call(quantized_hardswish, (input, output_scale, output_zero_point), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_hardswish(input, output_scale, output_zero_point)
+
+def quantized_hardsigmoid(input, output_scale, output_zero_point):
+    if _capturing():
+        _captured = _capture_call(quantized_hardsigmoid, (input, output_scale, output_zero_point), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_hardsigmoid(input, output_scale, output_zero_point)
+
+def quantized_sigmoid(input, output_scale, output_zero_point):
+    if _capturing():
+        _captured = _capture_call(quantized_sigmoid, (input, output_scale, output_zero_point), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_sigmoid(input, output_scale, output_zero_point)
+
+def quantized_tanh(input, output_scale, output_zero_point):
+    if _capturing():
+        _captured = _capture_call(quantized_tanh, (input, output_scale, output_zero_point), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_tanh(input, output_scale, output_zero_point)
+
+def quantized_cat(tensors, dim=0, scale=None, zero_point=None):
+    if _capturing():
+        _captured = _capture_call(quantized_cat, (tensors, dim, scale, zero_point), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_cat(tensors, dim, scale, zero_point)
+
+def quantized_cat_relu(tensors, dim=0, scale=None, zero_point=None):
+    if _capturing():
+        _captured = _capture_call(quantized_cat_relu, (tensors, dim, scale, zero_point), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_cat_relu(tensors, dim, scale, zero_point)
+
+def quantized_conv1d(input, weight, bias, input_scale, input_zero_point, weight_scale, weight_zero_point, out_scale, out_zero_point, stride=1, padding=0, dilation=1, groups=1):
+    if _capturing():
+        _captured = _capture_call(quantized_conv1d, (input, weight, bias, input_scale, input_zero_point, weight_scale, weight_zero_point, out_scale, out_zero_point, stride, padding, dilation, groups), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.quantized_conv1d(input, weight, bias, input_scale, input_zero_point, weight_scale, weight_zero_point, out_scale, out_zero_point, stride, padding, dilation, groups)
+
+def quantized_conv3d(input, weight, bias, input_scale, input_zero_point, weight_scale, weight_zero_point, out_scale, out_zero_point, stride=1, padding=0, dilation=1, groups=1):
+    if _capturing():
+        _captured = _capture_call(quantized_conv3d, (input, weight, bias, input_scale, input_zero_point, weight_scale, weight_zero_point, out_scale, out_zero_point, stride, padding, dilation, groups), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.quantized_conv3d(input, weight, bias, input_scale, input_zero_point, weight_scale, weight_zero_point, out_scale, out_zero_point, stride, padding, dilation, groups)
 
 def forward_neg(a, da):
     if _capturing():

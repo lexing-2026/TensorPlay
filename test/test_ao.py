@@ -235,12 +235,40 @@ def test_quantized_linear_matches_float_reference():
     float_linear = nn.Linear(8, 4)
     x = tp.rand(2, 8)
     scale, zp = 0.25, 2
-    qlinear = nnq.Linear.from_float(float_linear, scale, zp)
+    out_scale, out_zp = 0.1, 5
+    qlinear = nnq.Linear.from_float(float_linear, scale, zp,
+                                    out_scale=out_scale,
+                                    out_zero_point=out_zp)
     xq = tp.quantize_per_tensor(x, scale, zp, tp.qint8)
     got = qlinear(xq)
+    # quantized output under the module's output affine parameters
+    assert got.is_quantized() and got.dtype == tp.qint8
+    assert got.q_scale() == out_scale and got.q_zero_point() == out_zp
     want = float_linear(x)
     assert got.shape == (2, 4)
-    assert tp.allclose(got, want, atol=0.15)
+    assert tp.allclose(got.dequantize(), want, atol=0.2)
+
+
+def test_quantized_linear_chain_closed_loop():
+    # two quantized linears compose: the first emits a QInt8 output that
+    # feeds the second directly, matching the packed-output contract
+    tp.manual_seed(3)
+    fc1 = nn.Linear(8, 6)
+    fc2 = nn.Linear(6, 4)
+    in_scale, in_zp = 0.25, 2
+    mid_scale, mid_zp = 0.2, 0
+    out_scale, out_zp = 0.5, 4
+    q1 = nnq.Linear.from_float(fc1, in_scale, in_zp,
+                               out_scale=mid_scale, out_zero_point=mid_zp)
+    q2 = nnq.Linear.from_float(fc2, mid_scale, mid_zp,
+                               out_scale=out_scale, out_zero_point=out_zp)
+    x = tp.rand(2, 8)
+    xq = tp.quantize_per_tensor(x, in_scale, in_zp, tp.qint8)
+    got = q2(q1(xq))
+    assert got.is_quantized()
+    assert got.q_scale() == out_scale and got.q_zero_point() == out_zp
+    reference = fc2(fc1(x))
+    assert tp.allclose(got.dequantize(), reference, atol=0.4)
 
 
 def test_quantize_dequantize_modules_roundtrip():
@@ -298,25 +326,30 @@ def test_qfunctional_add():
 
 
 def test_prepare_convert_linear_workflow():
-    # the quantized linear takes a quantized input and emits a float32
-    # result, so the workflow is exercised around a single swapped layer
-    model = nn.Sequential(nn.Linear(4, 4), nn.ReLU())
+    # two swapped linears chain through a quantized intermediate: fc1 emits
+    # a QInt8 output carrying its calibrated affine parameters and fc2
+    # consumes it directly
+    model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
     model[0].qconfig = default_qconfig
+    model[1].qconfig = default_qconfig
     model.eval()
     prepared = prepare(model, inplace=False)
     for _ in range(3):
         prepared(tp.rand(4, 4))
     converted = convert(prepared, inplace=False)
     assert isinstance(converted[0], nnq.QuantizedLinear)
+    assert isinstance(converted[1], nnq.QuantizedLinear)
     x = tp.rand(4, 4)
     reference = model(x)
     scale = converted[0].input_scale
     zero_point = converted[0].input_zero_point
     xq = tp.quantize_per_tensor(x, scale, zero_point, tp.qint8)
     got = converted(xq)
+    # the chained quantized linears emit a quantized result
+    assert got.is_quantized()
     assert got.shape == reference.shape
     # int8 weights keep the output close to the float model
-    assert tp.allclose(got, reference, atol=0.2)
+    assert tp.allclose(got.dequantize(), reference, atol=0.2)
 
 
 def test_fuse_conv_bn_matches_manual_folding():

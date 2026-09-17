@@ -2,7 +2,8 @@
 
 Closed loop: activations are native QInt8 tensors carrying their affine
 parameters, weights are stored as per-channel QInt8, and the fused native
-kernel produces a Float32 [M,N] output.
+kernel produces a QInt8 [M,N] output carrying the module's output affine
+parameters.
 """
 
 import tensorplay
@@ -19,14 +20,15 @@ __all__ = ["QuantizedLinear"]
 class QuantizedLinear(nn.Module):
     """Applies a linear transformation on a quantized input with QInt8 weights.
 
-    out[m, n] = input_scale * weight_scales[n] *
+    out_q[m, n] = requantize( input_scale * weight_scales[n] *
                 sum_k (x_q[m,k] - input_zero_point) *
-                      (w_q[n,k] - weight_zero_points[n]) + bias[n]
+                      (w_q[n,k] - weight_zero_points[n]) + bias[n] )
+    under (out_scale, out_zero_point).
     """
 
     def __init__(self, in_features, out_features, input_scale,
                  input_zero_point, qweight, weight_scales, weight_zero_points,
-                 bias=None):
+                 bias=None, out_scale=1.0, out_zero_point=0):
         super().__init__()
         if qweight.dtype not in (tensorplay.qint8, tensorplay.int8):
             raise TypeError("QuantizedLinear expects QInt8 (or raw Int8) weights")
@@ -34,6 +36,8 @@ class QuantizedLinear(nn.Module):
         self.out_features = int(out_features)
         self.input_scale = float(input_scale)
         self.input_zero_point = int(input_zero_point)
+        self.out_scale = float(out_scale)
+        self.out_zero_point = int(out_zero_point)
         self.register_buffer("qweight", qweight.contiguous())
         self.register_buffer("weight_scales",
                              weight_scales.to(tensorplay.float32).contiguous())
@@ -64,21 +68,28 @@ class QuantizedLinear(nn.Module):
             input_zero_point=self.input_zero_point,
             weight_scales=self.weight_scales,
             weight_zero_points=self.weight_zero_points,
-            bias=self.bias)
+            bias=self.bias, out_scale=self.out_scale,
+            out_zero_point=self.out_zero_point)
 
     def extra_repr(self):
         return (f"in_features={self.in_features}, "
                 f"out_features={self.out_features}, "
                 f"input_scale={self.input_scale}, "
-                f"input_zero_point={self.input_zero_point}")
+                f"input_zero_point={self.input_zero_point}, "
+                f"out_scale={self.out_scale}, "
+                f"out_zero_point={self.out_zero_point}")
 
     @classmethod
-    def from_float(cls, float_module, input_scale=None, input_zero_point=None):
+    def from_float(cls, float_module, input_scale=None, input_zero_point=None,
+                   out_scale=None, out_zero_point=None):
         """Quantizes a calibrated float Linear's weights per output channel.
 
-        The activation range must come from calibration ahead of conversion
-        (MinMax over the intended input distribution), matching the static
-        PTQ convert step.
+        Activation ranges must come from calibration ahead of conversion
+        (MinMax over the intended distributions) or be given explicitly: the
+        input range through ``input_scale``/``input_zero_point`` or a
+        prepared ``input_activation_post_process``, the output range through
+        ``out_scale``/``out_zero_point`` or a prepared
+        ``activation_post_process``.
         """
         if not isinstance(float_module, nn.Linear):
             raise TypeError("from_float(): expected a Linear module")
@@ -90,6 +101,13 @@ class QuantizedLinear(nn.Module):
                     "from_float(): needs explicit input scale/zero point, or a "
                     "prepared float module carrying input_activation_post_process")
             input_scale, input_zero_point = observer.calculate_qparams()
+        if out_scale is None or out_zero_point is None:
+            out_observer = getattr(float_module, "activation_post_process", None)
+            if out_observer is None:
+                raise ValueError(
+                    "from_float(): needs explicit output scale/zero point, or "
+                    "a prepared float module carrying activation_post_process")
+            out_scale, out_zero_point = out_observer.calculate_qparams()
         input_scale = float(input_scale)
         input_zero_point = int(input_zero_point)
         weight = float_module.weight.detach()
@@ -115,4 +133,6 @@ class QuantizedLinear(nn.Module):
         if float_module.bias is not None:
             bias = float_module.bias.detach().to(tensorplay.float32)
         return cls(in_features, out_features, input_scale, input_zero_point,
-                   qweight, scales_t, zero_points_t, bias=bias)
+                   qweight, scales_t, zero_points_t, bias=bias,
+                   out_scale=float(out_scale),
+                   out_zero_point=int(out_zero_point))

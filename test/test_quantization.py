@@ -1,7 +1,7 @@
 import unittest
 
 import tensorplay as tp
-from tensorplay.quantization import (
+from tensorplay.ao.quantization import (
     DeQuantStub,
     FakeQuantize,
     FixedQParamsObserver,
@@ -175,17 +175,23 @@ class TestStubsAndQuantizedLinear(unittest.TestCase):
             weight = linear.weight.detach()
         x_float = tp.randn(m, k) * 1.5
 
-        from tensorplay.quantization import quantize_per_tensor
+        from tensorplay.ao.quantization import quantize_per_tensor
         scale, zp = 0.05, 12
         qx = quantize_per_tensor(self=x_float, scale=scale, zero_point=zp,
                                  dtype=tp.qint8)
 
-        qlin = QuantizedLinear.from_float(linear, scale, zp)
+        out_scale, out_zp = 0.08, -7
+        qlin = QuantizedLinear.from_float(linear, scale, zp,
+                                          out_scale=out_scale,
+                                          out_zero_point=out_zp)
         out = qlin(qx)
+        self.assertTrue(out.is_quantized())
+        self.assertAlmostEqual(out.q_scale(), out_scale, places=7)
+        self.assertEqual(out.q_zero_point(), out_zp)
         ref = tp.nn.functional.linear(x_float, weight, None)
-        err = float((out - ref).abs().max().item())
+        err = float((out.dequantize() - ref).abs().max().item())
         bound = 4.0 * scale * (float(weight.abs().max().item()) / 127.0) * k ** 0.5 \
-            + 1e-3
+            + out_scale + 1e-3
         self.assertLess(err, max(bound, 0.35))
 
         with self.assertRaises(TypeError):

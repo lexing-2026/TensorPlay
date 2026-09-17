@@ -4514,11 +4514,17 @@
 # Fused Int8 GEMM with per-channel weight requantization (dynamic-quantized
 # linear output stage): activations [M,K] and weights [N,K] are Int8 with
 # affine qparams; the result is Float32 [M,N].
-- func: quantized_linear(Tensor input, Tensor weight, float input_scale, int input_zero_point, Tensor weight_scales, Tensor weight_zero_points, Tensor? bias=None) -> Tensor
+- func: quantized_linear(Tensor input, Tensor weight, float input_scale, int input_zero_point, Tensor weight_scales, Tensor weight_zero_points, Tensor? bias=None, float out_scale=1.0, int out_zero_point=0) -> Tensor
   variants: function
   dispatch:
     CPU: quantized_linear_cpu
     CUDA: quantized_linear_cuda
+
+- func: quantized_linear_dynamic(Tensor input, Tensor weight, Tensor weight_scales, Tensor weight_zero_points, Tensor? bias=None, bool reduce_range=False) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_linear_dynamic_cpu
+    CUDA: quantized_linear_dynamic_cuda
 
 # Elementwise quantized arithmetic over Int8 tensors with explicit affine
 # qparams: each operand is dequantized as (q - zero_point) * scale, the float

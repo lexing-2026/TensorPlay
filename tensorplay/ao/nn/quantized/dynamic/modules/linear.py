@@ -1,8 +1,9 @@
 """Dynamically quantized linear module.
 
 Weights are quantized per output channel at conversion time; activations are
-quantized per tensor at inference from their own observed range, so no
-calibration pass is required.
+quantized per row at inference from their own observed range inside the
+fused kernel, so no calibration pass is required. The output stays in the
+float domain.
 """
 
 from __future__ import annotations
@@ -11,8 +12,7 @@ import tensorplay
 from tensorplay import nn
 from tensorplay._C import (
     quantize_per_channel as _quantize_per_channel,
-    quantize_per_tensor_dynamic as _quantize_per_tensor_dynamic,
-    quantized_linear as _quantized_linear,
+    quantized_linear_dynamic as _quantized_linear_dynamic,
 )
 
 __all__ = ["Linear"]
@@ -58,13 +58,9 @@ class Linear(nn.Module):
 
     def forward(self, x):
         if x.is_quantized():
-            xq = x
-        else:
-            xq = _quantize_per_tensor_dynamic(
-                self=x, dtype=tensorplay.qint8, reduce_range=False)
-        return _quantized_linear(
-            xq, self.weight,
-            input_scale=xq.q_scale(), input_zero_point=xq.q_zero_point(),
+            x = x.dequantize()
+        return _quantized_linear_dynamic(
+            x, self.weight,
             weight_scales=self.weight_scales,
             weight_zero_points=self.weight_zero_points,
             bias=self.bias)
