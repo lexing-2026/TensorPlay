@@ -18,6 +18,11 @@
 //                         followed by a permute;
 //   _safe_softmax         softmax that answers 0 instead of NaN on rows that
 //                         are masked out entirely (every entry -inf);
+//   _masked_softmax(+backward)
+//                         softmax restricted to the entries a mask selects,
+//                         rejected positions answer zero; the backward
+//                         applies the mask to both operands before the
+//                         usual o * (g - <g, o>) correction;
 //   _logcumsumexp(+out)   the internal spelling of the log-domain cumulative
 //                         sum;
 //   _pdist_forward,       the internal spellings of the pairwise and
@@ -47,6 +52,7 @@
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -152,6 +158,38 @@ Tensor _safe_softmax_native(const Tensor& self, int64_t dim,
     const Tensor masked_rows =
         ops::all(ops::isneginf(self), dim, /*keepdim=*/true);
     return ops::where(masked_rows, Scalar(0.0), out);
+}
+
+// _masked_softmax: softmax over the entries the mask selects; rejected
+// positions contribute nothing and stay zero in the output.  Rejected
+// logits are replaced with -inf before the reduction so their exponential
+// underflows to zero instead of poisoning the row, and the mask is applied
+// to the result again so rejected positions answer exactly zero.
+Tensor _masked_softmax_native(const Tensor& self, const Tensor& mask,
+                              std::optional<int64_t> dim,
+                              std::optional<int64_t> mask_type) {
+    (void)mask_type;
+    const int64_t d = dim.has_value() ? *dim : -1;
+    Tensor neg_inf =
+        ops::full_like(self, Scalar(-std::numeric_limits<double>::infinity()));
+    Tensor masked = ops::where(mask, self, neg_inf);
+    Tensor out = ops::softmax(masked, d, DType::Undefined);
+    return ops::where(mask, out, ops::zeros_like(self));
+}
+
+// Gradient of the masked softmax: rejected positions pass nothing through,
+// and the selected positions carry the usual softmax correction
+// o * (g - <g, o>) with both vectors restricted to the selected entries.
+Tensor _masked_softmax_backward_native(const Tensor& grad_output,
+                                       const Tensor& output,
+                                       const Tensor& mask,
+                                       std::optional<int64_t> dim) {
+    const int64_t d = dim.has_value() ? *dim : -1;
+    Tensor g = ops::where(mask, grad_output, ops::zeros_like(grad_output));
+    Tensor o = ops::where(mask, output, ops::zeros_like(output));
+    Tensor dot = ops::sum(ops::mul(g, o), {d}, true);
+    return ops::where(mask, ops::mul(o, ops::sub(g, dot)),
+                      ops::zeros_like(grad_output));
 }
 
 Tensor _logcumsumexp_native(const Tensor& self, int64_t dim) {
@@ -349,6 +387,8 @@ TENSORPLAY_LIBRARY_IMPL(Composite, ShapeMiscComposite) {
     m.impl("_reshape_copy", composite::_reshape_copy_native);
     m.impl("empty_permuted", composite::empty_permuted_native);
     m.impl("_safe_softmax", composite::_safe_softmax_native);
+    m.impl("_masked_softmax", composite::_masked_softmax_native);
+    m.impl("_masked_softmax_backward", composite::_masked_softmax_backward_native);
     m.impl("_logcumsumexp", composite::_logcumsumexp_native);
     m.impl("_logcumsumexp.out", composite::_logcumsumexp_out_native);
     m.impl("_pdist_forward", composite::_pdist_forward_native);
