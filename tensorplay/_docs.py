@@ -8796,88 +8796,89 @@ Example::
 """,
 )
 
-add_docstr(
-    tensorplay.qr,
-    r"""
-qr(input: Tensor, some: bool = True, *, out: Union[Tensor, Tuple[Tensor, ...], List[Tensor], None]) -> (Tensor, Tensor)
+if hasattr(tensorplay, "qr"):
+    add_docstr(
+        tensorplay.qr,
+        r"""
+    qr(input: Tensor, some: bool = True, *, out: Union[Tensor, Tuple[Tensor, ...], List[Tensor], None]) -> (Tensor, Tensor)
 
-Computes the QR decomposition of a matrix or a batch of matrices :attr:`input`,
-and returns a namedtuple (Q, R) of tensors such that :math:`\text{input} = Q R`
-with :math:`Q` being an orthogonal matrix or batch of orthogonal matrices and
-:math:`R` being an upper triangular matrix or batch of upper triangular matrices.
+    Computes the QR decomposition of a matrix or a batch of matrices :attr:`input`,
+    and returns a namedtuple (Q, R) of tensors such that :math:`\text{input} = Q R`
+    with :math:`Q` being an orthogonal matrix or batch of orthogonal matrices and
+    :math:`R` being an upper triangular matrix or batch of upper triangular matrices.
 
-If :attr:`some` is ``True``, then this function returns the thin (reduced) QR factorization.
-Otherwise, if :attr:`some` is ``False``, this function returns the complete QR factorization.
+    If :attr:`some` is ``True``, then this function returns the thin (reduced) QR factorization.
+    Otherwise, if :attr:`some` is ``False``, this function returns the complete QR factorization.
 
-.. warning::
+    .. warning::
 
-    :func:`tensorplay.qr` is deprecated in favor of :func:`tensorplay.linalg.qr`
-    replaced with a string parameter :attr:`mode`.
+        :func:`tensorplay.qr` is deprecated in favor of :func:`tensorplay.linalg.qr`
+        replaced with a string parameter :attr:`mode`.
 
-    ``Q, R = tensorplay.qr(A)`` should be replaced with
+        ``Q, R = tensorplay.qr(A)`` should be replaced with
 
-    .. code:: python
+        .. code:: python
 
-        Q, R = tensorplay.linalg.qr(A)
+            Q, R = tensorplay.linalg.qr(A)
 
-    ``Q, R = tensorplay.qr(A, some=False)`` should be replaced with
+        ``Q, R = tensorplay.qr(A, some=False)`` should be replaced with
 
-    .. code:: python
+        .. code:: python
 
-        Q, R = tensorplay.linalg.qr(A, mode="complete")
+            Q, R = tensorplay.linalg.qr(A, mode="complete")
 
-.. warning::
-          If you plan to backpropagate through QR, note that the current backward implementation
-          is only well-defined when the first :math:`\min(input.size(-1), input.size(-2))`
-          columns of :attr:`input` are linearly independent.
-          This behavior will probably change once QR supports pivoting.
+    .. warning::
+              If you plan to backpropagate through QR, note that the current backward implementation
+              is only well-defined when the first :math:`\min(input.size(-1), input.size(-2))`
+              columns of :attr:`input` are linearly independent.
+              This behavior will probably change once QR supports pivoting.
 
-.. note:: This function uses LAPACK for CPU inputs and MAGMA for CUDA inputs,
-          and may produce different (valid) decompositions on different device types
-          or different platforms.
+    .. note:: This function uses LAPACK for CPU inputs and MAGMA for CUDA inputs,
+              and may produce different (valid) decompositions on different device types
+              or different platforms.
 
-Args:
-    input (Tensor): the input tensor of size :math:`(*, m, n)` where `*` is zero or more
-                batch dimensions consisting of matrices of dimension :math:`m \times n`.
-    some (bool, optional): Set to ``True`` for reduced QR decomposition and ``False`` for
-                complete QR decomposition. If `k = min(m, n)` then:
+    Args:
+        input (Tensor): the input tensor of size :math:`(*, m, n)` where `*` is zero or more
+                    batch dimensions consisting of matrices of dimension :math:`m \times n`.
+        some (bool, optional): Set to ``True`` for reduced QR decomposition and ``False`` for
+                    complete QR decomposition. If `k = min(m, n)` then:
 
-                  * ``some=True`` : returns `(Q, R)` with dimensions (m, k), (k, n) (default)
+                      * ``some=True`` : returns `(Q, R)` with dimensions (m, k), (k, n) (default)
 
-                  * ``'some=False'``: returns `(Q, R)` with dimensions (m, m), (m, n)
+                      * ``'some=False'``: returns `(Q, R)` with dimensions (m, m), (m, n)
 
-Keyword args:
-    out (tuple, optional): tuple of `Q` and `R` tensors.
-                The dimensions of `Q` and `R` are detailed in the description of :attr:`some` above.
+    Keyword args:
+        out (tuple, optional): tuple of `Q` and `R` tensors.
+                    The dimensions of `Q` and `R` are detailed in the description of :attr:`some` above.
 
-Example::
+    Example::
 
-    >>> a = tensorplay.tensor([[12., -51, 4], [6, 167, -68], [-4, 24, -41]])
-    >>> q, r = tensorplay.qr(a)
-    >>> q
-    tensor([[-0.8571,  0.3943,  0.3314],
-            [-0.4286, -0.9029, -0.0343],
-            [ 0.2857, -0.1714,  0.9429]])
-    >>> r
-    tensor([[ -14.0000,  -21.0000,   14.0000],
-            [   0.0000, -175.0000,   70.0000],
-            [   0.0000,    0.0000,  -35.0000]])
-    >>> tensorplay.mm(q, r).round()
-    tensor([[  12.,  -51.,    4.],
-            [   6.,  167.,  -68.],
-            [  -4.,   24.,  -41.]])
-    >>> tensorplay.mm(q.t(), q).round()
-    tensor([[ 1.,  0.,  0.],
-            [ 0.,  1., -0.],
-            [ 0., -0.,  1.]])
-    >>> a = tensorplay.randn(3, 4, 5)
-    >>> q, r = tensorplay.qr(a, some=False)
-    >>> tensorplay.allclose(tensorplay.matmul(q, r), a)
-    True
-    >>> tensorplay.allclose(tensorplay.matmul(q.mT, q), tensorplay.eye(5))
-    True
-""",
-)
+        >>> a = tensorplay.tensor([[12., -51, 4], [6, 167, -68], [-4, 24, -41]])
+        >>> q, r = tensorplay.qr(a)
+        >>> q
+        tensor([[-0.8571,  0.3943,  0.3314],
+                [-0.4286, -0.9029, -0.0343],
+                [ 0.2857, -0.1714,  0.9429]])
+        >>> r
+        tensor([[ -14.0000,  -21.0000,   14.0000],
+                [   0.0000, -175.0000,   70.0000],
+                [   0.0000,    0.0000,  -35.0000]])
+        >>> tensorplay.mm(q, r).round()
+        tensor([[  12.,  -51.,    4.],
+                [   6.,  167.,  -68.],
+                [  -4.,   24.,  -41.]])
+        >>> tensorplay.mm(q.t(), q).round()
+        tensor([[ 1.,  0.,  0.],
+                [ 0.,  1., -0.],
+                [ 0., -0.,  1.]])
+        >>> a = tensorplay.randn(3, 4, 5)
+        >>> q, r = tensorplay.qr(a, some=False)
+        >>> tensorplay.allclose(tensorplay.matmul(q, r), a)
+        True
+        >>> tensorplay.allclose(tensorplay.matmul(q.mT, q), tensorplay.eye(5))
+        True
+    """,
+    )
 
 add_docstr(
     tensorplay.rad2deg,
@@ -9765,33 +9766,34 @@ Example::
 """.format(**common_args),
 )
 
-add_docstr(
-    tensorplay.set_flush_denormal,
-    r"""
-set_flush_denormal(mode) -> bool
+if hasattr(tensorplay, "set_flush_denormal"):
+    add_docstr(
+        tensorplay.set_flush_denormal,
+        r"""
+    set_flush_denormal(mode) -> bool
 
-Disables denormal floating numbers on CPU.
+    Disables denormal floating numbers on CPU.
 
-Returns ``True`` if your system supports flushing denormal numbers and it
-successfully configures flush denormal mode.  :meth:`~tensorplay.set_flush_denormal`
-is supported on x86 architectures supporting SSE3 and AArch64 architecture.
+    Returns ``True`` if your system supports flushing denormal numbers and it
+    successfully configures flush denormal mode.  :meth:`~tensorplay.set_flush_denormal`
+    is supported on x86 architectures supporting SSE3 and AArch64 architecture.
 
-Args:
-    mode (bool): Controls whether to enable flush denormal mode or not
+    Args:
+        mode (bool): Controls whether to enable flush denormal mode or not
 
-Example::
+    Example::
 
-    >>> tensorplay.set_flush_denormal(True)
-    True
-    >>> tensorplay.tensor([1e-323], dtype=tensorplay.float64)
-    tensor([ 0.], dtype=tensorplay.float64)
-    >>> tensorplay.set_flush_denormal(False)
-    True
-    >>> tensorplay.tensor([1e-323], dtype=tensorplay.float64)
-    tensor(9.88131e-324 *
-           [ 1.0000], dtype=tensorplay.float64)
-""",
-)
+        >>> tensorplay.set_flush_denormal(True)
+        True
+        >>> tensorplay.tensor([1e-323], dtype=tensorplay.float64)
+        tensor([ 0.], dtype=tensorplay.float64)
+        >>> tensorplay.set_flush_denormal(False)
+        True
+        >>> tensorplay.tensor([1e-323], dtype=tensorplay.float64)
+        tensor(9.88131e-324 *
+               [ 1.0000], dtype=tensorplay.float64)
+    """,
+    )
 
 add_docstr(
     tensorplay.set_num_threads,
@@ -13523,7 +13525,7 @@ Example::
 
 
 add_docstr(
-    tensorplay.Stream,
+    tensorplay.cuda.Stream,
     r"""
 Stream(device, *, priority) -> Stream
 
@@ -13555,7 +13557,7 @@ Example::
 
 
 add_docstr(
-    tensorplay.Stream.query,
+    tensorplay.cuda.Stream.query,
     r"""
 Stream.query() -> bool
 
@@ -13574,7 +13576,7 @@ Example::
 
 
 add_docstr(
-    tensorplay.Stream.record_event,
+    tensorplay.cuda.Stream.record_event,
     r"""
 Stream.record_event(event) -> Event
 
@@ -13595,7 +13597,7 @@ Example::
 
 
 add_docstr(
-    tensorplay.Stream.synchronize,
+    tensorplay.cuda.Stream.synchronize,
     r"""
 Stream.synchronize() -> None
 
@@ -13610,7 +13612,7 @@ Example::
 
 
 add_docstr(
-    tensorplay.Stream.wait_event,
+    tensorplay.cuda.Stream.wait_event,
     r"""
 Stream.wait_event(event) -> None
 
@@ -13630,7 +13632,7 @@ Example::
 
 
 add_docstr(
-    tensorplay.Stream.wait_stream,
+    tensorplay.cuda.Stream.wait_stream,
     r"""
 Stream.wait_stream(stream) -> None
 
@@ -13650,7 +13652,7 @@ Example::
 
 
 add_docstr(
-    tensorplay.Event,
+    tensorplay.cuda.Event,
     r"""
 Event(device=None, *, enable_timing=False, blocking=False, interprocess=False)
 
@@ -13679,7 +13681,7 @@ Example::
 
 
 add_docstr(
-    tensorplay.Event.elapsed_time,
+    tensorplay.cuda.Event.elapsed_time,
     r"""
 Event.elapsed_time(end_event) -> float
 
@@ -13703,7 +13705,7 @@ Example::
 
 
 add_docstr(
-    tensorplay.Event.query,
+    tensorplay.cuda.Event.query,
     r"""
 Event.query() -> bool
 
@@ -13724,7 +13726,7 @@ Example::
 
 
 add_docstr(
-    tensorplay.Event.record,
+    tensorplay.cuda.Event.record,
     r"""
 Event.record(stream=None) -> None
 
@@ -13744,7 +13746,7 @@ Example::
 
 
 add_docstr(
-    tensorplay.Event.synchronize,
+    tensorplay.cuda.Event.synchronize,
     r"""
 Event.synchronize() -> None
 
@@ -13760,7 +13762,7 @@ Example::
 
 
 add_docstr(
-    tensorplay.Event.wait,
+    tensorplay.cuda.Event.wait,
     r"""
 Event.wait(stream=None) -> None
 
@@ -13840,58 +13842,61 @@ Example::
 """,
 )
 
-add_docstr(
-    tensorplay.Generator.graphsafe_set_state,
-    r"""
-Generator.graphsafe_set_state(state) -> None
+if hasattr(tensorplay.Generator, "graphsafe_set_state"):
+    add_docstr(
+        tensorplay.Generator.graphsafe_set_state,
+        r"""
+    Generator.graphsafe_set_state(state) -> None
 
-Sets the state of the generator to the specified state in a manner that is safe for use in graph capture.
-This method is crucial for ensuring that the generator's state can be captured in the CUDA graph.
+    Sets the state of the generator to the specified state in a manner that is safe for use in graph capture.
+    This method is crucial for ensuring that the generator's state can be captured in the CUDA graph.
 
-Arguments:
-    state (tensorplay.Generator): A Generator point to the new state for the generator, typically obtained from `graphsafe_get_state`.
+    Arguments:
+        state (tensorplay.Generator): A Generator point to the new state for the generator, typically obtained from `graphsafe_get_state`.
 
-Example:
-    >>> g_cuda = tensorplay.Generator(device='cuda')
-    >>> g_cuda_other = tensorplay.Generator(device='cuda')
-    >>> current_state = g_cuda_other.graphsafe_get_state()
-    >>> g_cuda.graphsafe_set_state(current_state)
-""",
-)
+    Example:
+        >>> g_cuda = tensorplay.Generator(device='cuda')
+        >>> g_cuda_other = tensorplay.Generator(device='cuda')
+        >>> current_state = g_cuda_other.graphsafe_get_state()
+        >>> g_cuda.graphsafe_set_state(current_state)
+    """,
+    )
 
-add_docstr(
-    tensorplay.Generator.graphsafe_get_state,
-    r"""
-Generator.graphsafe_get_state() -> tensorplay.Generator
+if hasattr(tensorplay.Generator, "graphsafe_get_state"):
+    add_docstr(
+        tensorplay.Generator.graphsafe_get_state,
+        r"""
+    Generator.graphsafe_get_state() -> tensorplay.Generator
 
-Retrieves the current state of the generator in a manner that is safe for graph capture.
-This method is crucial for ensuring that the generator's state can be captured in the CUDA graph.
+    Retrieves the current state of the generator in a manner that is safe for graph capture.
+    This method is crucial for ensuring that the generator's state can be captured in the CUDA graph.
 
-Returns:
-    tensorplay.Generator: A Generator point to the current state of the generator
+    Returns:
+        tensorplay.Generator: A Generator point to the current state of the generator
 
-Example:
-    >>> g_cuda = tensorplay.Generator(device='cuda')
-    >>> current_state = g_cuda.graphsafe_get_state()
-""",
-)
+    Example:
+        >>> g_cuda = tensorplay.Generator(device='cuda')
+        >>> current_state = g_cuda.graphsafe_get_state()
+    """,
+    )
 
-add_docstr(
-    tensorplay.Generator.clone_state,
-    r"""
-Generator.clone_state() -> tensorplay.Generator
+if hasattr(tensorplay.Generator, "clone_state"):
+    add_docstr(
+        tensorplay.Generator.clone_state,
+        r"""
+    Generator.clone_state() -> tensorplay.Generator
 
-Clones the current state of the generator and returns a new generator pointing to this cloned state.
-This method is beneficial for preserving a particular state of a generator to restore at a later point.
+    Clones the current state of the generator and returns a new generator pointing to this cloned state.
+    This method is beneficial for preserving a particular state of a generator to restore at a later point.
 
-Returns:
-    tensorplay.Generator: A Generator pointing to the newly cloned state.
+    Returns:
+        tensorplay.Generator: A Generator pointing to the newly cloned state.
 
-Example:
-    >>> g_cuda = tensorplay.Generator(device='cuda')
-    >>> cloned_state = g_cuda.clone_state()
-""",
-)
+    Example:
+        >>> g_cuda = tensorplay.Generator(device='cuda')
+        >>> cloned_state = g_cuda.clone_state()
+    """,
+    )
 
 add_docstr(
     tensorplay.Generator.manual_seed,
