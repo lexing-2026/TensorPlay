@@ -1179,6 +1179,8 @@ else:
         "fft",
         "linalg",
         "ao",
+        "contrib",
+        "monitor",
         "sparse",
         "special",
         "vision",
