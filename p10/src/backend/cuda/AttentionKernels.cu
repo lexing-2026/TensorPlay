@@ -1221,20 +1221,57 @@ __global__ __launch_bounds__(256, 2) void sdpa_wmma_flash_half_aligned_kernel(
 #if defined(TP_HAS_NATIVE_CUTE_FLASH)
 // This is the exact native 64x64/4-warp schedule used by the aligned CUDA
 // path.  The wrapper only translates TensorPlay's [B,H,T,D] strides into the
-// boundary.
-template <bool IsCausal, bool IsEvenMN>
-__global__ void tp_native_flash_hdim128_fp16_kernel(
+// boundary.  Head dimension and element type are compile-time parameters;
+// 96-wide heads and the bf16 element type share the fp16/128 schedule.
+template <bool IsCausal, bool IsEvenMN, int Headdim, typename ElementT>
+__global__ void tp_native_flash_kernel(
     const ::tensorplay_native_flash::Flash_fwd_params params) {
   // Flash_fwd_kernel_traits is intentionally a global layout type in the
   // standalone source; only the executable helpers live in FLASH_NAMESPACE.
   using Traits = Flash_fwd_kernel_traits<
-      128, 64, 64, 4, false, false, cutlass::half_t>;
+      Headdim, 64, 64, 4, false, false, ElementT>;
   ::tensorplay_native_flash::compute_attn<
       Traits, false, IsCausal, false, false, IsEvenMN, true, false, false>(
       params);
 }
 
+template <bool IsCausal, int Headdim, typename ElementT>
+Tensor sdpa_native_cute_flash(
+    const Tensor& q, const Tensor& k, const Tensor& v,
+    int64_t B, int64_t H, int64_t T, int64_t D);
+
 template <bool IsCausal>
+Tensor sdpa_cute_flash_dispatch(
+    const Tensor& q, const Tensor& k, const Tensor& v,
+    int64_t B, int64_t H, int64_t T, int64_t D) {
+  const DType dtype = q.dtype();
+  // The 64/96/128 head dimensions share the 64x64 tile plan; the element
+  // type picks the tensor-core operand width.
+  if (D == 128) {
+    if (dtype == DType::Float16) {
+      return sdpa_native_cute_flash<IsCausal, 128, cutlass::half_t>(
+          q, k, v, B, H, T, D);
+    }
+    return sdpa_native_cute_flash<IsCausal, 128, cutlass::bfloat16_t>(
+        q, k, v, B, H, T, D);
+  }
+  if (D == 96) {
+    if (dtype == DType::Float16) {
+      return sdpa_native_cute_flash<IsCausal, 96, cutlass::half_t>(
+          q, k, v, B, H, T, D);
+    }
+    return sdpa_native_cute_flash<IsCausal, 96, cutlass::bfloat16_t>(
+        q, k, v, B, H, T, D);
+  }
+  if (dtype == DType::Float16) {
+    return sdpa_native_cute_flash<IsCausal, 64, cutlass::half_t>(
+        q, k, v, B, H, T, D);
+  }
+  return sdpa_native_cute_flash<IsCausal, 64, cutlass::bfloat16_t>(
+      q, k, v, B, H, T, D);
+}
+
+template <bool IsCausal, int Headdim, typename ElementT>
 Tensor sdpa_native_cute_flash(
     const Tensor& q, const Tensor& k, const Tensor& v,
     int64_t B, int64_t H, int64_t T, int64_t D) {
@@ -1299,7 +1336,7 @@ Tensor sdpa_native_cute_flash(
   params.window_size_right = IsCausal ? 0 : -1;
   params.softcap = 0.f;
   params.rng_state = nullptr;
-  params.is_bf16 = false;
+  params.is_bf16 = std::is_same<ElementT, cutlass::bfloat16_t>::value;
   params.is_causal = IsCausal;
   params.is_seqlens_k_cumulative = false;
   params.is_rotary_interleaved = false;
@@ -1309,25 +1346,24 @@ Tensor sdpa_native_cute_flash(
   params.unpadded_lse = false;
   params.seqlenq_ngroups_swapped = false;
 
-  static bool shared_memory_configured = false;
-  if (!shared_memory_configured) {
-    TP_CUDA_CHECK(cudaFuncSetAttribute(
-        tp_native_flash_hdim128_fp16_kernel<IsCausal, true>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemSize));
-    TP_CUDA_CHECK(cudaFuncSetAttribute(
-        tp_native_flash_hdim128_fp16_kernel<IsCausal, false>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemSize));
-    shared_memory_configured = true;
-  }
+  // Shared-memory headroom is a property of each instantiation, so the
+  // attribute is raised per call (the driver call is cheap next to the
+  // kernel launch it enables).
+  TP_CUDA_CHECK(cudaFuncSetAttribute(
+      tp_native_flash_kernel<IsCausal, true, Headdim, ElementT>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemSize));
+  TP_CUDA_CHECK(cudaFuncSetAttribute(
+      tp_native_flash_kernel<IsCausal, false, Headdim, ElementT>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemSize));
 
   dim3 grid((static_cast<unsigned>(T) + 63u) / 64u,
             static_cast<unsigned>(B), static_cast<unsigned>(H));
   if ((T & 63) == 0) {
-    tp_native_flash_hdim128_fp16_kernel<IsCausal, true><<<
+    tp_native_flash_kernel<IsCausal, true, Headdim, ElementT><<<
         grid, Traits::kNThreads, Traits::kSmemSize,
         getCurrentCUDAStream().stream()>>>(params);
   } else {
-    tp_native_flash_hdim128_fp16_kernel<IsCausal, false><<<
+    tp_native_flash_kernel<IsCausal, false, Headdim, ElementT><<<
         grid, Traits::kNThreads, Traits::kSmemSize,
         getCurrentCUDAStream().stream()>>>(params);
   }
@@ -1617,14 +1653,17 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
 
   constexpr int kThreads = 256;
 
-  // Default (impl=0) routing: fp16 with head_dim 128 takes the tensor-core
-  // flash path, which beats the warp-per-row kernel on compact GPUs; every
-  // other supported dtype at head_dim <= 128 keeps the warp-per-row flash
-  // kernel, avoiding the naive kernel's float32 upcast.  The naive
-  // row-per-block kernel stays as the fallback for wider heads.
+  // Default (impl=0) routing: fp16/bf16 with head_dim 64/96/128 takes the
+  // tensor-core flash path, which beats the warp-per-row kernel on compact
+  // GPUs; every other supported dtype at head_dim <= 128 keeps the
+  // warp-per-row flash kernel, avoiding the naive kernel's float32 upcast.
+  // The naive row-per-block kernel stays as the fallback for wider heads.
+  const bool flash_tensor_core_dtype =
+      (dtype == DType::Float16 || dtype == DType::BFloat16) &&
+      (D == 64 || D == 96 || D == 128);
   bool tensor_cores_available = true;
 #if !defined(USE_ROCM)
-  if (impl == 0 && D == 128 && dtype == DType::Float16) {
+  if (impl == 0 && flash_tensor_core_dtype) {
     int major = 0;
     TP_CUDA_CHECK(cudaDeviceGetAttribute(
         &major, cudaDevAttrComputeCapabilityMajor,
@@ -1632,8 +1671,7 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
     tensor_cores_available = major >= 7;
   }
 #endif
-  if (impl == 0 && D == 128 && dtype == DType::Float16 &&
-      tensor_cores_available) {
+  if (impl == 0 && flash_tensor_core_dtype && tensor_cores_available) {
     impl = 5;
   } else if (impl == 0 && D <= 128) {
     impl = 3;
@@ -1759,18 +1797,19 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
              "sdpa impl=8 (4-warp FP16 WMMA flash) requires compute capability 7.0 or newer");
 #endif
   } else if (impl == 5 || impl == 6 || impl == 7) {
-    if (dtype != DType::Float16 || D != 128) {
+    if ((dtype != DType::Float16 && dtype != DType::BFloat16) ||
+        (D != 64 && D != 96 && D != 128)) {
       TP_THROW(NotImplementedError,
-               "sdpa impl=5 (aligned FP16 WMMA flash) requires dtype=float16 and D=128");
+               "sdpa impl=5 (aligned WMMA flash) requires dtype=float16/bfloat16 and D in {64, 96, 128}");
     }
 #if defined(TP_HAS_NATIVE_CUTE_FLASH)
     // Use the native CUTE/CUTLASS aligned path for both full and tail tiles;
     // its internal predicate schedule is also needed by autoregressive decode
     // once T grows past a multiple of 64.
     if (is_causal) {
-      return sdpa_native_cute_flash<true>(q, k, v, B, H, T, D);
+      return sdpa_cute_flash_dispatch<true>(q, k, v, B, H, T, D);
     }
-    return sdpa_native_cute_flash<false>(q, k, v, B, H, T, D);
+    return sdpa_cute_flash_dispatch<false>(q, k, v, B, H, T, D);
 #elif defined(USE_ROCM) || !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 700)
     Tensor out = Tensor::empty({B, H, T, D}, dtype, q.device());
     // The native 64x64 schedule deliberately requires the original aligned
