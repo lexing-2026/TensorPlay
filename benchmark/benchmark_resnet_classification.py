@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import json
 import sys
 import time
@@ -530,6 +531,11 @@ def benchmark_compiled_inference(
 
     def one_framework(framework: str) -> dict[str, object]:
         codegens: list[str] = []
+        if framework == "tensorplay" and context.name == "cuda":
+            # The reference run's cached blocks would otherwise starve the
+            # native side of the card during the compiled phases.
+            gc.collect()
+            torch.cuda.empty_cache()
         if framework == "torch":
             model = torch_model
             batches = torch_batches
@@ -737,6 +743,11 @@ def benchmark_compiled_training(
 
     def one_framework(framework: str) -> dict[str, object]:
         codegens: list[str] = []
+        if framework == "tensorplay" and context.name == "cuda":
+            # The reference run's cached blocks would otherwise starve the
+            # native side of the card during the compiled phases.
+            gc.collect()
+            torch.cuda.empty_cache()
         if framework == "torch":
             model = torchvision_resnet18(weights=None, num_classes=NUM_CLASSES).to(
                 context.torch_device
