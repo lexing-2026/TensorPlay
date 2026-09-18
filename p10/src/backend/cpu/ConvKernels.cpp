@@ -876,6 +876,8 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
             convolution_forward prim;
             std::vector<std::pair<memory::desc, reorder>> reorder_input_cache;
             std::vector<std::pair<memory::desc, reorder>> reorder_weights_cache;
+            dnnl::memory scratchpad;
+            bool has_scratchpad = false;
         };
 
         static std::unordered_map<ConvKey, CachedConv> cache;
@@ -966,7 +968,11 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
             
             auto conv = convolution_forward(conv_pd);
             
-            cached_entry = {conv_pd, conv};
+            cached_entry = {conv_pd, conv, {}, {}, memory(), false};
+            if (conv_pd.scratchpad_desc().get_size() > 0) {
+                cached_entry.scratchpad = memory(conv_pd.scratchpad_desc(), eng);
+                cached_entry.has_scratchpad = true;
+            }
 
             {
                 std::lock_guard<std::mutex> lock(mtx);
@@ -1199,14 +1205,8 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
             args.insert({DNNL_ARG_BIAS, bias_mem});
         }
 
-        // The scratchpad is written by the primitive: the storage must stay
-        // alive for the execute() call.
-        Storage scratch_storage_handle;
-        if (pd.scratchpad_desc().get_size() > 0) {
-            scratch_storage_handle = Storage(pd.scratchpad_desc().get_size(),
-                                             getAllocator(output.device().type()));
-            args.insert({DNNL_ARG_SCRATCHPAD,
-                         memory(pd.scratchpad_desc(), eng, scratch_storage_handle.data())});
+        if (cached_entry.has_scratchpad) {
+            args.insert({DNNL_ARG_SCRATCHPAD, cached_entry.scratchpad});
         }
 
         conv.execute(s, args);
@@ -1429,6 +1429,10 @@ static bool conv2d_grad_input_nhwc(
     struct CachedNHWCBwdData {
         convolution_backward_data::primitive_desc pd;
         convolution_backward_data prim;
+        // Allocated once with the primitive and reused across calls; the
+        // scratchpad is written by the primitive during execute().
+        dnnl::memory scratchpad;
+        bool has_scratchpad = false;
     };
     static std::unordered_map<ConvKey, CachedNHWCBwdData> cache;
     static std::mutex mtx;
@@ -1460,11 +1464,10 @@ static bool conv2d_grad_input_nhwc(
             }
         }
         if (!found) {
-            // 3x3 用 Winograd（与 forward 的自研 F(2,3) 策略一致），其余用
-            // direct；形状不支持时回退到 auto。
-            dnnl::algorithm algo = (kH == 3 && kW == 3)
-                ? algorithm::convolution_winograd
-                : algorithm::convolution_direct;
+            // Backward kernels leave the algorithm to the engine heuristics:
+            // hand-picking winograd here silently executes a slow emulated
+            // path on ISAs without native winograd backward support.
+            dnnl::algorithm algo = algorithm::convolution_auto;
             convolution_forward::primitive_desc fwd_pd;
             try {
                 fwd_pd = convolution_forward::primitive_desc(
@@ -1507,7 +1510,11 @@ static bool conv2d_grad_input_nhwc(
                 }
             }
 
-            entry = {bwd_pd, convolution_backward_data(bwd_pd)};
+            entry = {bwd_pd, convolution_backward_data(bwd_pd), memory(), false};
+            if (bwd_pd.scratchpad_desc().get_size() > 0) {
+                entry.scratchpad = memory(bwd_pd.scratchpad_desc(), eng);
+                entry.has_scratchpad = true;
+            }
             {
                 std::lock_guard<std::mutex> lock(mtx);
                 cache.insert({key, entry});
@@ -1531,12 +1538,8 @@ static bool conv2d_grad_input_nhwc(
             {DNNL_ARG_WEIGHTS, weights_mem},
             {DNNL_ARG_DIFF_SRC, diff_src_mem},
         };
-        Storage scratch_handle;
-        if (bwd_pd.scratchpad_desc().get_size() > 0) {
-            scratch_handle = Storage(bwd_pd.scratchpad_desc().get_size(),
-                                       getAllocator(grad_input.device().type()));
-            args.insert({DNNL_ARG_SCRATCHPAD,
-                       memory(bwd_pd.scratchpad_desc(), eng, scratch_handle.data())});
+        if (entry.has_scratchpad) {
+            args.insert({DNNL_ARG_SCRATCHPAD, entry.scratchpad});
         }
         bwd.execute(s, args);
         s.wait();
@@ -1587,6 +1590,10 @@ static bool conv2d_grad_weight_nhwc(
     struct CachedNHWCBwdWeights {
         convolution_backward_weights::primitive_desc pd;
         convolution_backward_weights prim;
+        // Allocated once with the primitive and reused across calls; the
+        // scratchpad is written by the primitive during execute().
+        dnnl::memory scratchpad;
+        bool has_scratchpad = false;
     };
     static std::unordered_map<ConvKey, CachedNHWCBwdWeights> cache;
     static std::mutex mtx;
@@ -1618,9 +1625,9 @@ static bool conv2d_grad_weight_nhwc(
             }
         }
         if (!found) {
-            dnnl::algorithm algo = (kH == 3 && kW == 3)
-                ? algorithm::convolution_winograd
-                : algorithm::convolution_direct;
+            // Engine heuristics pick the backward algorithm; see the
+            // backward-data note above.
+            dnnl::algorithm algo = algorithm::convolution_auto;
             convolution_forward::primitive_desc fwd_pd;
             try {
                 fwd_pd = convolution_forward::primitive_desc(
@@ -1663,7 +1670,11 @@ static bool conv2d_grad_weight_nhwc(
                 }
             }
 
-            entry = {bwd_w_pd, convolution_backward_weights(bwd_w_pd)};
+            entry = {bwd_w_pd, convolution_backward_weights(bwd_w_pd), memory(), false};
+            if (bwd_w_pd.scratchpad_desc().get_size() > 0) {
+                entry.scratchpad = memory(bwd_w_pd.scratchpad_desc(), eng);
+                entry.has_scratchpad = true;
+            }
             {
                 std::lock_guard<std::mutex> lock(mtx);
                 cache.insert({key, entry});
@@ -1687,12 +1698,8 @@ static bool conv2d_grad_weight_nhwc(
             {DNNL_ARG_DIFF_DST, diff_dst_mem},
             {DNNL_ARG_DIFF_WEIGHTS, diff_weights_mem},
         };
-        Storage scratch_handle;
-        if (bwd_w_pd.scratchpad_desc().get_size() > 0) {
-            scratch_handle = Storage(bwd_w_pd.scratchpad_desc().get_size(),
-                                     getAllocator(grad_weight.device().type()));
-            args.insert({DNNL_ARG_SCRATCHPAD,
-                       memory(bwd_w_pd.scratchpad_desc(), eng, scratch_handle.data())});
+        if (entry.has_scratchpad) {
+            args.insert({DNNL_ARG_SCRATCHPAD, entry.scratchpad});
         }
         bwd_w.execute(s, args);
         s.wait();
@@ -1746,6 +1753,8 @@ static bool conv2d_grad_input_onednn(const Tensor& grad_output, const Tensor& in
             convolution_backward_data prim;
             std::vector<std::pair<memory::desc, reorder>> reorder_grad_output_cache;
             std::vector<std::pair<memory::desc, reorder>> reorder_weight_cache;
+            dnnl::memory scratchpad;
+            bool has_scratchpad = false;
         };
 
         static std::unordered_map<ConvKey, CachedConvBwdData> cache;
@@ -1828,7 +1837,11 @@ static bool conv2d_grad_input_onednn(const Tensor& grad_output, const Tensor& in
              }
 
              auto bwd_d = convolution_backward_data(bwd_d_pd);
-             cached_entry = {bwd_d_pd, bwd_d};
+             cached_entry = {bwd_d_pd, bwd_d, {}, {}, memory(), false};
+             if (bwd_d_pd.scratchpad_desc().get_size() > 0) {
+                 cached_entry.scratchpad = memory(bwd_d_pd.scratchpad_desc(), eng);
+                 cached_entry.has_scratchpad = true;
+             }
              
              {
                  std::lock_guard<std::mutex> lock(mtx);
@@ -1979,19 +1992,13 @@ static bool conv2d_grad_input_onednn(const Tensor& grad_output, const Tensor& in
         }
 
         auto start_conv = std::chrono::high_resolution_clock::now();
-        // The scratchpad is written by the primitive: the storage must stay
-        // alive for the execute() call.
-        Storage bwd_d_scratch_handle;
         std::unordered_map<int, memory> bwd_d_args = {
             {DNNL_ARG_DIFF_DST, diff_dst_mem},
             {DNNL_ARG_WEIGHTS, weights_mem},
             {DNNL_ARG_DIFF_SRC, diff_src_mem}
         };
-        if (pd.scratchpad_desc().get_size() > 0) {
-            bwd_d_scratch_handle = Storage(pd.scratchpad_desc().get_size(),
-                                           getAllocator(grad_input.device().type()));
-            bwd_d_args.insert({DNNL_ARG_SCRATCHPAD,
-                               memory(pd.scratchpad_desc(), eng, bwd_d_scratch_handle.data())});
+        if (cached_entry.has_scratchpad) {
+            bwd_d_args.insert({DNNL_ARG_SCRATCHPAD, cached_entry.scratchpad});
         }
         bwd_d.execute(s, bwd_d_args);
         
@@ -2049,6 +2056,8 @@ static bool conv2d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
             convolution_backward_weights prim;
             std::vector<std::pair<memory::desc, reorder>> reorder_input_cache;
             std::vector<std::pair<memory::desc, reorder>> reorder_grad_output_cache;
+            dnnl::memory scratchpad;
+            bool has_scratchpad = false;
         };
 
         static std::unordered_map<ConvKey, CachedConvBwdWeights> cache;
@@ -2133,7 +2142,11 @@ static bool conv2d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
             }
 
             auto bwd_w = convolution_backward_weights(bwd_w_pd);
-            cached_entry = {bwd_w_pd, bwd_w};
+            cached_entry = {bwd_w_pd, bwd_w, {}, {}, memory(), false};
+            if (bwd_w_pd.scratchpad_desc().get_size() > 0) {
+                cached_entry.scratchpad = memory(bwd_w_pd.scratchpad_desc(), eng);
+                cached_entry.has_scratchpad = true;
+            }
             
             {
                 std::lock_guard<std::mutex> lock(mtx);
@@ -2286,19 +2299,13 @@ static bool conv2d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
         }
 #endif
 
-        // The scratchpad is written by the primitive: the storage must stay
-        // alive for the execute() call.
-        Storage bwd_w_scratch_handle;
         std::unordered_map<int, memory> bwd_w_args = {
             {DNNL_ARG_SRC, src_mem},
             {DNNL_ARG_DIFF_DST, diff_dst_mem},
             {DNNL_ARG_DIFF_WEIGHTS, diff_weights_mem}
         };
-        if (pd.scratchpad_desc().get_size() > 0) {
-            bwd_w_scratch_handle = Storage(pd.scratchpad_desc().get_size(),
-                                           getAllocator(grad_weight.device().type()));
-            bwd_w_args.insert({DNNL_ARG_SCRATCHPAD,
-                               memory(pd.scratchpad_desc(), eng, bwd_w_scratch_handle.data())});
+        if (cached_entry.has_scratchpad) {
+            bwd_w_args.insert({DNNL_ARG_SCRATCHPAD, cached_entry.scratchpad});
         }
         bwd_w.execute(s, bwd_w_args);
 
@@ -3877,10 +3884,10 @@ Tensor conv2d_grad_input_cpu(const Tensor& grad_output, const Tensor& input, con
     }
 
     #ifdef USE_ONEDNN
-    if (conv2d_grad_input_nhwc(grad_output_contig, input, weight, stride, pH, pH, pW, pW, dilation, groups, grad_input)) {
+    if (conv2d_grad_input_onednn(grad_output_contig, input, weight, stride, pH, pH, pW, pW, dilation, groups, grad_input)) {
         return grad_input;
     }
-    if (conv2d_grad_input_onednn(grad_output_contig, input, weight, stride, pH, pH, pW, pW, dilation, groups, grad_input)) {
+    if (conv2d_grad_input_nhwc(grad_output_contig, input, weight, stride, pH, pH, pW, pW, dilation, groups, grad_input)) {
         return grad_input;
     }
     #endif
@@ -4026,10 +4033,10 @@ static Tensor conv2d_grad_weight_cpu_impl(const Tensor& grad_output, const Tenso
     }
 
     #ifdef USE_ONEDNN
-    if (conv2d_grad_weight_nhwc(grad_output_contig, input_contig, weight, stride, pH, pH, pW, pW, dilation, groups, grad_weight)) {
+    if (conv2d_grad_weight_onednn(grad_output_contig, input_contig, weight, stride, pH, pH, pW, pW, dilation, groups, grad_weight)) {
         return grad_weight;
     }
-    if (conv2d_grad_weight_onednn(grad_output_contig, input_contig, weight, stride, pH, pH, pW, pW, dilation, groups, grad_weight)) {
+    if (conv2d_grad_weight_nhwc(grad_output_contig, input_contig, weight, stride, pH, pH, pW, pW, dilation, groups, grad_weight)) {
         return grad_weight;
     }
     #endif
