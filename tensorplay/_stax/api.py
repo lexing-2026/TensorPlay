@@ -603,6 +603,67 @@ def _is_module_like(value: Any) -> bool:
     )
 
 
+def _region_is_training(example_inputs: tuple[Any, ...], example_kwargs: dict[str, Any]) -> bool:
+    """Whether any example input carries an autograd requirement.
+
+    Backends declare what they support (``BackendCapabilities``); this only
+    decides whether the declaration matters for the region at hand.
+    """
+
+    import tensorplay
+
+    def touches_autograd(value: Any) -> bool:
+        if isinstance(value, tensorplay.Tensor):
+            return bool(value.requires_grad)
+        if isinstance(value, (tuple, list)):
+            return any(touches_autograd(item) for item in value)
+        if isinstance(value, dict):
+            return any(touches_autograd(item) for item in value.values())
+        return False
+
+    return any(touches_autograd(item) for item in example_inputs) or any(
+        touches_autograd(item) for item in example_kwargs.values()
+    )
+
+
+def _adapt_backend_to_region(
+    compiler_fn: CompilerFn,
+    example_inputs: tuple[Any, ...],
+    example_kwargs: dict[str, Any],
+) -> CompilerFn:
+    """Match a backend's declared capabilities to the region being compiled.
+
+    Training regions through an inference-only backend are routed through
+    ahead-of-time autograd: the forward graph goes to the backend, the
+    backward graph runs as traced (correctness-first default).  Backends
+    that support neither training nor inference-only wrapping are rejected
+    for training regions with an actionable error.
+    """
+
+    from .registry import get_backend_capabilities
+
+    capabilities = get_backend_capabilities(compiler_fn)
+    if capabilities.handles_training or not _region_is_training(
+        example_inputs, example_kwargs
+    ):
+        return compiler_fn
+    if not capabilities.inference_only:
+        raise RuntimeError(
+            f"backend {getattr(compiler_fn, '__name__', compiler_fn)!r} does not "
+            "support training regions and does not declare itself "
+            "inference-only; it cannot be used for this region"
+        )
+    from .aot_autograd import default_partition
+    from .common import aot_autograd
+    from .debugging import boxed_nop
+
+    return aot_autograd(
+        fw_compiler=compiler_fn,
+        bw_compiler=boxed_nop,
+        partition_fn=default_partition,
+    )
+
+
 def _compile_region(
     model: Callable[..., Any],
     compiler_fn: CompilerFn,
@@ -679,6 +740,8 @@ def _compile_region(
         ShapeProp(backend_inputs)(graph_module)
     except (GraphCaptureError, RuntimeError):
         pass
+
+    compiler_fn = _adapt_backend_to_region(compiler_fn, example_inputs, example_kwargs)
 
     regional_inductor_invoke_subgraph(
         graph_module,

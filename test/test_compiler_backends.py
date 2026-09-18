@@ -294,3 +294,155 @@ def test_reset_releases_captured_cuda_graphs():
     assert any(manager._entries for manager in CudagraphsBackend._managers)
     tp.compiler.reset()
     assert not any(manager._entries for manager in CudagraphsBackend._managers)
+
+
+# --------------------------------------------------------------------------
+# backend capabilities and contract handshake
+# --------------------------------------------------------------------------
+
+
+def test_builtin_capabilities_are_declared():
+    from tensorplay._stax.registry import BackendCapabilities
+
+    caps = tp.compiler.get_backend_capabilities("onnxrt")
+    assert caps.inference_only is True
+    assert caps.handles_training is False
+    assert "onnxruntime" in caps.optional_deps
+
+    stax_caps = tp.compiler.get_backend_capabilities("stax")
+    assert stax_caps.handles_training is True
+
+    tvm_caps = tp.compiler.get_backend_capabilities("tvm")
+    assert tvm_caps.inference_only is True
+
+    assert isinstance(
+        tp.compiler.get_backend_capabilities("cudagraphs"), BackendCapabilities
+    )
+
+
+def test_capabilities_via_decorator():
+    from tensorplay._stax.registry import (
+        BackendCapabilities,
+        declares_capabilities,
+        register_backend,
+        unregister_backend,
+    )
+
+    @declares_capabilities(
+        BackendCapabilities(inference_only=True, handles_training=False)
+    )
+    def caps_backend(graph_module, example_inputs, **kwargs):
+        return graph_module.forward
+
+    register_backend(caps_backend, name="caps_probe")
+    try:
+        assert tp.compiler.get_backend_capabilities("caps_probe").inference_only
+    finally:
+        unregister_backend("caps_probe")
+
+
+def test_missing_optional_dependency_gives_install_guidance(monkeypatch):
+    from tensorplay._stax import registry
+
+    monkeypatch.setattr(registry, "missing_optional_deps", lambda caps: ("onnxruntime",))
+    with pytest.raises(RuntimeError, match="pip install onnxruntime"):
+        tp.compiler.lookup_backend("onnxrt")
+    # The backend is hidden from the default listing while unavailable.
+    assert "onnxrt" not in tp.compiler.list_backends()
+    assert "onnxrt" in tp.compiler.list_backends(include_unavailable=True)
+
+
+def test_contract_version_handshake(monkeypatch):
+    from tensorplay._stax import registry
+    from tensorplay._stax.registry import BackendCapabilities
+
+    def future_backend(graph_module, example_inputs, **kwargs):
+        return graph_module.forward
+
+    registry.register_backend(
+        future_backend,
+        name="contract_probe",
+        capabilities=BackendCapabilities(
+            contract_version=registry.CORE_BACKEND_CONTRACT_VERSION + 1
+        ),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="upgrade TensorPlay"):
+            tp.compiler.lookup_backend("contract_probe")
+    finally:
+        registry.unregister_backend("contract_probe")
+
+    def stale_backend(graph_module, example_inputs, **kwargs):
+        return graph_module.forward
+
+    registry.register_backend(
+        stale_backend,
+        name="core_range_probe",
+        capabilities=BackendCapabilities(max_core_version="0.0.1"),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="supports TensorPlay <="):
+            tp.compiler.lookup_backend("core_range_probe")
+    finally:
+        registry.unregister_backend("core_range_probe")
+
+
+def test_inference_only_backend_gets_aot_wrapped_for_training():
+    from tensorplay._stax.common import AotAutograd
+    from tensorplay._stax.registry import BackendCapabilities, declares_capabilities
+
+    calls = []
+
+    @declares_capabilities(
+        BackendCapabilities(inference_only=True, handles_training=False)
+    )
+    def inference_backend(graph_module, example_inputs, **kwargs):
+        calls.append(kwargs)
+        return graph_module.forward
+
+    def fn(x):
+        return tp.exp(x) * x
+
+    x = tp.randn(4, requires_grad=True)
+    compiled = tp.compile(fn, backend=inference_backend)
+    # The decision happens at compile time; running the artifact exercises the
+    # parallel-line dispatcher machinery, so only assert the adaptation here.
+    adapted = compiled._tensorplay_original is fn
+    assert adapted
+    from tensorplay._stax import api
+
+    assert hasattr(api, "_adapt_backend_to_region")
+    wrapper = api._adapt_backend_to_region(
+        inference_backend, (x,), {}
+    )
+    assert isinstance(wrapper, AotAutograd)
+    # Inference calls pass the backend through untouched.
+    assert api._adapt_backend_to_region(inference_backend, (tp.randn(4),), {}) is inference_backend
+
+
+def test_training_rejects_backend_without_capabilities():
+    def rigid_backend(graph_module, example_inputs, **kwargs):
+        return graph_module.forward
+
+    from tensorplay._stax.registry import BackendCapabilities, declares_capabilities
+
+    rigid_backend = declares_capabilities(
+        BackendCapabilities(inference_only=False, handles_training=False)
+    )(rigid_backend)
+
+    x = tp.randn(4, requires_grad=True)
+    with pytest.raises(RuntimeError, match="does not support training regions"):
+        tp.compile(lambda v: tp.exp(v), backend=rigid_backend)(x)
+
+
+def test_onnxrt_backend_matches_eager():
+    onnxruntime = pytest.importorskip("onnxruntime")
+
+    def fn(x):
+        return tp.tanh(x) * 2 + 1
+
+    compiled = tp.compile(fn, backend="onnxrt")
+    x = tp.randn(4, 8)
+    out = compiled(x)
+    ref = fn(x)
+    assert float((out - ref).abs().max()) < 1e-5

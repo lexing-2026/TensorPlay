@@ -1159,12 +1159,21 @@ def reset() -> None:
 
 def list_backends(
     exclude_tags: tuple[str, ...] | list[str] | None = ("debug", "experimental"),
+    *,
+    include_unavailable: bool = False,
 ) -> list[str]:
-    """Return registered backend names accepted by :func:`compile`."""
+    """Return registered backend names accepted by :func:`compile`.
+
+    Backends whose optional dependencies are missing are hidden unless
+    ``include_unavailable`` is set; selecting one by name produces an error
+    naming what to install.
+    """
 
     from tensorplay import _stax
 
-    return _stax.list_backends(exclude_tags=exclude_tags)
+    return _stax.list_backends(
+        exclude_tags=exclude_tags, include_unavailable=include_unavailable
+    )
 
 
 def lookup_backend(backend: str | Callable[..., Any]) -> Callable[..., Any]:
@@ -1223,6 +1232,14 @@ def get_default_backend() -> str | Callable[..., Any]:
     return _stax.get_default_backend()
 
 
+def get_backend_capabilities(backend: str | Callable[..., Any]) -> Any:
+    """Return the :class:`BackendCapabilities` a backend declares."""
+
+    from tensorplay._stax.registry import get_backend_capabilities as _get
+
+    return _get(backend)
+
+
 def __getattr__(name: str) -> Any:
     # The registry module is loaded on demand so importing the facade stays
     # free of backend-host imports.
@@ -1230,4 +1247,16 @@ def __getattr__(name: str) -> Any:
         from tensorplay._stax.registry import InvalidBackend
 
         return InvalidBackend
+    if name == "BackendCapabilities":
+        from tensorplay._stax.registry import BackendCapabilities
+
+        return BackendCapabilities
+    if name == "CORE_BACKEND_CONTRACT_VERSION":
+        from tensorplay._stax.registry import CORE_BACKEND_CONTRACT_VERSION
+
+        return CORE_BACKEND_CONTRACT_VERSION
+    if name == "declares_capabilities":
+        from tensorplay._stax.registry import declares_capabilities
+
+        return declares_capabilities
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
