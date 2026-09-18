@@ -20,6 +20,7 @@ stand-in must expose a ``CUDAGraph`` class with ``capture_begin``,
 from __future__ import annotations
 
 import logging
+import threading
 import weakref
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -45,24 +46,123 @@ def _default_native() -> Any:
     return _C
 
 
+def _looks_tensor(value: Any) -> bool:
+    """Duck-typed tensor probe: a device with an ``is_cuda`` predicate.
+
+    Keeps the manager usable with stand-in tensors in tests and avoids
+    importing the runtime type here.
+    """
+    device = getattr(value, "device", None)
+    return device is not None and callable(getattr(device, "is_cuda", None))
+
+
 def _shape_signature(args: Sequence[Any]) -> Tuple:
-    return tuple(
-        (tuple(getattr(a, "shape", ())), str(getattr(a, "dtype", "")))
-        for a in args
-    )
+    signature: List[Any] = []
+    for a in args:
+        if _looks_tensor(a):
+            signature.append((tuple(a.shape), str(a.dtype)))
+        else:
+            # Non-tensor inputs are baked into the capture; their value
+            # joins the signature so a drift is refused at replay instead
+            # of silently replaying a stale constant.
+            signature.append(("scalar", type(a).__name__, a))
+    return tuple(signature)
+
+
+def _pin_triton_driver_stream(handle: int) -> list:
+    """Shadow the Triton driver's stream query for the capture window.
+
+    Every Triton launch path (generated launchers, row-fusion, plain
+    ``JITFunction`` dispatch) resolves its raw launch stream through the
+    active driver's ``get_current_stream``; pinning it to the capture side
+    stream is what makes the kernels enter the recorded graph.
+    """
+    try:
+        from triton.runtime import driver as triton_driver
+
+        active = triton_driver.active
+        original = active.get_current_stream
+    except Exception:  # noqa: BLE001 - no Triton runtime: nothing to pin
+        return []
+
+    # The driver may define the query on the class or install it per
+    # instance; record which, so the restore puts back exactly what was
+    # there instead of deleting a lazily-installed method for good.
+    was_instance_attr = "get_current_stream" in vars(active)
+
+    def pinned(device: Any = None) -> int:
+        return handle
+
+    active.get_current_stream = pinned
+
+    def restore():
+        if was_instance_attr:
+            active.get_current_stream = original
+        else:
+            try:
+                del active.get_current_stream
+            except AttributeError:
+                pass
+
+    return [restore]
+
+
+def _pin_launch_stream_to_capture():
+    """Route generated-kernel launches onto the capture stream.
+
+    During a capture window the driver-level stream query still reports the
+    legacy default stream, so kernels launched through it stay outside the
+    window and the recorded graph ends up empty.  Returns a restorer, or
+    None when there is no CUDA runtime to pin (stand-in natives, CPU-only
+    builds).
+    """
+    try:
+        import tensorplay
+
+        handle = tensorplay.cuda.current_stream().cuda_stream
+    except Exception:  # noqa: BLE001 - no CUDA runtime: nothing to pin
+        return None
+    restore = _pin_triton_driver_stream(handle)
+    fastlaunch = None
+    previous = None
+    try:
+        from .runtime import fastlaunch
+
+        previous = fastlaunch.set_capture_stream(handle)
+    except Exception:  # noqa: BLE001 - launcher layer optional
+        pass
+
+    def undo():
+        if fastlaunch is not None:
+            fastlaunch.set_capture_stream(previous)
+        for step in restore:
+            step()
+
+    return undo
 
 
 class _GraphEntry:
     __slots__ = ("key", "signature", "graph", "static_inputs",
-                 "static_outputs", "replays", "bulk")
+                 "static_outputs", "tensor_positions", "warmup_structure",
+                 "replays", "bulk")
 
     def __init__(self, key: str, signature: Tuple, graph: Any,
-                 static_inputs: List[Any], static_outputs: List[Any]) -> None:
+                 static_inputs: List[Any], static_outputs: List[Any],
+                 tensor_positions: Tuple[int, ...],
+                 warmup_structure: Tuple) -> None:
         self.key = key
         self.signature = signature
         self.graph = graph
         self.static_inputs = static_inputs
         self.static_outputs = static_outputs
+        # Positions of tensor inputs; only they are staged onto static
+        # buffers at replay.  Non-tensor inputs live inside the captured
+        # executable and never take part in staging.
+        self.tensor_positions = tensor_positions
+        # Shape of the warmup run's return value: ("single",), ("tuple", n),
+        # ("list", n) over one level of tensors, or ("unsupported",).  The
+        # buffers behind static_outputs are the replay outputs themselves.
+        self.warmup_structure = warmup_structure
         self.replays = 0
         # Bulk staging keeps the whole replay inside one native call;
         # stand-in natives without stage_and_launch fall back to per-tensor
@@ -117,7 +217,19 @@ class CudaGraphManager:
             # Warmup executes lazy initialisations outside capture (cuBLAS
             # workspaces etc.); the native capture stream matches the stream
             # capture will run on.
-            fn(*sample_args)
+            warmup_output = fn(*sample_args)
+            if warmup_output is None or _looks_tensor(warmup_output):
+                warmup_structure: Tuple = ("single",)
+            elif isinstance(warmup_output, (list, tuple)):
+                if all(_looks_tensor(item) for item in warmup_output):
+                    warmup_structure = (
+                        "tuple" if isinstance(warmup_output, tuple) else "list",
+                        len(warmup_output),
+                    )
+                else:
+                    warmup_structure = ("unsupported",)
+            else:
+                warmup_structure = ("unsupported",)
             # Static input buffers must be allocated AND filled before the
             # capture window opens: a clone issued inside capture becomes a
             # captured node that would overwrite the staged replay inputs
@@ -128,16 +240,26 @@ class CudaGraphManager:
             # time the staging copies are enqueued on the launch stream ahead
             # of the graph.
             static_inputs = [
-                a.clone() if hasattr(a, "clone") else a for a in sample_args
+                a.clone() if _looks_tensor(a) else a for a in sample_args
             ]
+            tensor_positions = tuple(
+                index for index, arg in enumerate(sample_args)
+                if _looks_tensor(arg)
+            )
             self.capturing = key
             graph.capture_begin()
-            outputs = fn(*static_inputs)
+            restore_stream = _pin_launch_stream_to_capture()
+            try:
+                outputs = fn(*static_inputs)
+            finally:
+                if restore_stream is not None:
+                    restore_stream()
             graph.capture_end()
         finally:
             self.capturing = None
         out_list = list(outputs) if isinstance(outputs, (list, tuple)) else [outputs]
-        entry = _GraphEntry(key, signature, graph, static_inputs, out_list)
+        entry = _GraphEntry(key, signature, graph, static_inputs, out_list,
+                            tensor_positions, warmup_structure)
         self._entries[key] = entry
         return entry
 
@@ -155,10 +277,12 @@ class CudaGraphManager:
                 f"entry {key!r} captured for {entry.signature}, replay args are {signature}"
             )
         if entry.bulk:
-            entry.graph.stage_and_launch(entry.static_inputs, list(args))
+            staged_static = [entry.static_inputs[i] for i in entry.tensor_positions]
+            staged_args = [args[i] for i in entry.tensor_positions]
+            entry.graph.stage_and_launch(staged_static, staged_args)
         else:
-            for dst, src in zip(entry.static_inputs, args):
-                dst.copy_(src)
+            for i in entry.tensor_positions:
+                entry.static_inputs[i].copy_(args[i])
             entry.graph.replay()
         entry.replays += 1
         return list(entry.static_outputs)
@@ -477,3 +601,175 @@ def cudagraphs(gm: Any, example_inputs: Sequence[Any], *, strict_native: bool = 
     runner = _CudagraphRunner(gm, manager)
     runner._tensorplay_codegen = "cudagraphs"  # type: ignore[attr-defined]
     return runner
+
+
+# ---------------------------------------------------------------------------
+# mode="reduce-overhead" replay shell around a stax-compiled artifact
+# ---------------------------------------------------------------------------
+#
+# Where the ``cudagraphs`` backend above captures the Python executor, the
+# ``stax`` backend with ``mode="reduce-overhead"`` (or ``"max-autotune"``)
+# wraps its own compiled artifact: the region's kernels are warmed up,
+# recorded into a CUDA graph once, and afterwards only replayed.  Unlike the
+# backend runner, outputs are returned without copying - they alias the
+# graph-private pool and are overwritten by the next replay, so a caller
+# keeping outputs across calls must clone them.  Regions that cannot be
+# replayed safely are left unwrapped with a reason attached to the graph
+# module, mirroring the skip checks of the backend runner.
+
+
+def wrap_skip_reason(
+    compiled: Any,
+    gm: Any,
+    example_inputs: Sequence[Any],
+    *,
+    dynamic: bool | None = None,
+) -> str | None:
+    """Why a compiled artifact may not run behind a captured CUDA graph."""
+
+    if dynamic:
+        return format_default_skip_message("dynamic shape specialization")
+    saw_cuda_tensor = False
+    for value in example_inputs:
+        if _is_tensor(value):
+            if not value.device.is_cuda():
+                return format_default_skip_message("input on a non-CUDA device")
+            if value.requires_grad:
+                return format_default_skip_message("input requires grad")
+            saw_cuda_tensor = True
+        elif not isinstance(value, (int, float, bool, type(None))):
+            return format_default_skip_message(
+                f"unsupported input type ({type(value).__name__})"
+            )
+    if not saw_cuda_tensor:
+        return format_default_skip_message("no CUDA tensor input")
+    if getattr(compiled, "_mutations", None):
+        return format_default_skip_message("artifact replays input mutations")
+    mutated = find_input_mutations(gm)
+    if mutated:
+        names = ", ".join(gm.graph.placeholders[i].name for i in sorted(mutated))
+        return format_default_skip_message(f"mutated inputs ({names})")
+    if (node := get_first_incompatible_cudagraph_node(gm)) is not None:
+        return format_default_skip_message(f"incompatible op ({node.name})")
+    devices = get_device_node_mapping(gm)
+    if devices:
+        device_skip = check_multiple_devices_or_any_cpu_nodes(devices)
+        if device_skip is not None:
+            return device_skip
+    return None
+
+
+class CudagraphCompiledCallable:
+    """Capture a compiled artifact once and replay it against static buffers.
+
+    The first call warms up the artifact and records it; steady-state calls
+    stage the fresh inputs onto the static buffers and replay in one native
+    launch.  Outputs alias the graph-private pool: each replay overwrites
+    the tensors returned by the previous one.
+    """
+
+    def __init__(self, compiled: Any, native: Any = None) -> None:
+        self._compiled = compiled
+        self._manager = CudaGraphManager(native=native)
+        CudagraphsBackend._managers.add(self._manager)
+        self._key = f"artifact-{id(self):x}"
+        self._state = "cold"
+        self._lock = threading.Lock()
+        self._single_output = True
+        self._arity = 0
+        self.__name__ = getattr(compiled, "__name__", "cudagraph_compiled")
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if kwargs or self._state == "fallback":
+            return self._compiled(*args, **kwargs)
+        if self._state == "live":
+            return self._replay(args)
+        with self._lock:
+            if self._state == "cold":
+                return self._capture(args)
+            if self._state == "live":
+                return self._replay(args)
+            return self._compiled(*args)
+
+    def _capture(self, args: Tuple[Any, ...]) -> Any:
+        try:
+            self._manager.capture(self._key, self._compiled, *args)
+        except (CudaGraphError, NotImplementedError, RuntimeError, TypeError) as exc:
+            self._state = "fallback"
+            log.warning("cudagraph capture failed; running the artifact directly: %s", exc)
+            return self._compiled(*args)
+        entry = self._manager._entries[self._key]
+        if entry.warmup_structure[0] == "unsupported":
+            self._state = "fallback"
+            log.warning(
+                format_default_skip_message("unsupported output structure")
+            )
+            return self._compiled(*args)
+        self._single_output = entry.warmup_structure == ("single",)
+        self._arity = len(args)
+        self._state = "live"
+        self._install_fast_call()
+        return self._replay(args)
+
+    def _replay(self, args: Tuple[Any, ...]) -> Any:
+        try:
+            outputs = self._manager.replay(self._key, *args)
+        except (CudaGraphError, RuntimeError, TypeError) as exc:
+            self._state = "fallback"
+            log.warning("cudagraph replay failed; running the artifact directly: %s", exc)
+            return self._compiled(*args)
+        if self._single_output:
+            return outputs[0]
+        return tuple(outputs)
+
+    def _install_fast_call(self) -> None:
+        """Bind the steady-state replay into the C call trampoline.
+
+        Same contract as the lowerings use: identical objects with unchanged
+        versions take the C fast path, everything else vectorcalls back into
+        this wrapper.  Best effort - a build without the installer keeps the
+        plain Python replay.
+        """
+        try:
+            import tensorplay
+
+            installer = tensorplay._C._stax.install_call_trampoline
+        except Exception:  # noqa: BLE001 - trampoline is an optional accelerator
+            return
+
+        def replay_flat(values: List[Any]) -> List[Any]:
+            return self._manager.replay(self._key, *values)
+
+        try:
+            self._fast_call = installer(  # type: ignore[attr-defined]
+                self,
+                replay_flat,
+                [],
+                tensorplay.Tensor,
+                self._arity,
+                1 if self._single_output else 2,
+                False,
+                0,
+            )
+        except Exception:  # noqa: BLE001 - trampoline is an optional accelerator
+            self._fast_call = None
+
+
+def cudagraph_wrap(
+    compiled: Any,
+    gm: Any,
+    example_inputs: Sequence[Any],
+    *,
+    dynamic: bool | None = None,
+    native: Any = None,
+) -> tuple[Any, str | None]:
+    """Wrap a compiled CUDA artifact for reduce-overhead replay.
+
+    Returns ``(wrapped, None)`` when the artifact is eligible, otherwise
+    ``(compiled, reason)`` with the skip reason.
+    """
+    reason = wrap_skip_reason(compiled, gm, example_inputs, dynamic=dynamic)
+    if reason is not None:
+        log.warning(reason)
+        return compiled, reason
+    return CudagraphCompiledCallable(compiled, native=native), None

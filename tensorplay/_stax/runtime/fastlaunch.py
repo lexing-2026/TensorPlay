@@ -72,9 +72,30 @@ def hooks_clear() -> bool:
         return False
 
 
+_CAPTURE_STREAM: Optional[int] = None
+
+
+def set_capture_stream(handle: Optional[int]) -> Optional[int]:
+    """Pin generated-kernel launches to ``handle`` for a capture window.
+
+    Generated launchers resolve the raw launch stream through this module on
+    every call (fast and slow paths alike).  During a CUDA capture window the
+    native runtime runs on its capture side stream while the driver-level
+    query below still reports the legacy default stream, so kernels would be
+    launched outside the window and the recorded graph would stay empty.
+    Returns the previous override for restoration.
+    """
+    global _CAPTURE_STREAM
+    previous = _CAPTURE_STREAM
+    _CAPTURE_STREAM = handle
+    return previous
+
+
 def current_stream() -> int:
     """Raw current-device CUDA stream, exactly what ``JITFunction.run`` uses."""
 
+    if _CAPTURE_STREAM is not None:
+        return _CAPTURE_STREAM
     drv = _driver.active
     device = drv.get_current_device()
     return drv.get_current_stream(device)
