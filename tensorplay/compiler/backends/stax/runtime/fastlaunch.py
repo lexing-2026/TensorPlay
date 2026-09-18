@@ -64,10 +64,18 @@ def hooks_clear() -> bool:
         return False
     try:
         runtime = _knobs.runtime
-        return (
-            runtime.launch_enter_hook is None
-            and runtime.launch_exit_hook is None
-        )
+        for hook in (runtime.launch_enter_hook, runtime.launch_exit_hook):
+            if hook is None:
+                continue
+            # A hook is either a plain callable or a chain container; only a
+            # chain holding at least one callback builds per-launch metadata.
+            calls = getattr(hook, "calls", None)
+            if calls is None:
+                if hook:
+                    return False
+            elif calls:
+                return False
+        return True
     except Exception:  # noqa: BLE001 - unknown knobs layout: stay slow
         return False
 
