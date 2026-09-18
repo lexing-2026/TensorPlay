@@ -8,7 +8,7 @@ import tensorplay as tp
 @pytest.fixture(autouse=True)
 def _clean_probe_backends():
     yield
-    for name in ("p1_probe", "p1_meta_probe"):
+    for name in ("p1_probe", "p1_meta_probe", "while_loop_test_TESTING_ONLY"):
         tp._stax.unregister_backend(name)
 
 
@@ -160,3 +160,94 @@ def test_gate_outside_capture_raises():
     t = tp.tensor([1.0])
     with pytest.raises(tp.graph.GraphCaptureError):
         tp.graph.gate(t.sum())
+
+
+# ---------------------------------------------------------------------------
+# Symbolic while_loop: one specialization for every trip count
+# ---------------------------------------------------------------------------
+
+
+def test_eager_while_loop_runs_python_control_flow():
+    x = tp.tensor([1.0, 2.0])
+    out = tp.graph.while_loop(lambda c: c.sum() < 10, lambda c: c + 1, x)
+    # sum grows by 2 per step: 3 -> 5 -> 7 -> 9 -> 11
+    assert out.tolist() == [5.0, 6.0]
+
+
+def test_captured_loop_stays_one_specialization_across_trip_counts():
+    calls = []
+
+    @tp._stax.register_backend(name="while_loop_test_TESTING_ONLY")
+    def graph_passthrough(graph_module, example_inputs, **kwargs):
+        calls.append(1)
+        return graph_module
+
+    def probe(x):
+        return tp.graph.while_loop(lambda c: c.sum() < 100, lambda c: c + 1, x)
+
+    compiled = tp.compile(probe, backend="while_loop_test_TESTING_ONLY")
+    for values in ([1.0, 2.0], [2.0, 2.0], [0.5, 0.5]):
+        got = compiled(tp.tensor(values)).tolist()
+        start, n = int(sum(values)), len(values)
+        steps = max(0, (100 - start + n - 1) // n)
+        assert got == [v + steps for v in values]
+    # Unrolling would recompile per trip count; the loop node keeps one.
+    assert len(calls) == 1
+
+
+def test_captured_loop_supports_tuple_carry():
+    @tp._stax.register_backend(name="while_loop_test_TESTING_ONLY")
+    def graph_passthrough(graph_module, example_inputs, **kwargs):
+        return graph_module
+
+    def probe(acc, i):
+        def cond(t):
+            a, j = t
+            return (j < 4).sum() > 0
+
+        def body(t):
+            a, j = t
+            return (a + j, j + 1)
+
+        return tp.graph.while_loop(cond, body, (acc, i))
+
+    compiled = tp.compile(probe, backend="while_loop_test_TESTING_ONLY")
+    a, b = compiled(tp.tensor([1.0]), tp.tensor([0.0]))
+    assert a.tolist() == [7.0] and b.tolist() == [4.0]
+
+
+def test_captured_loop_survives_the_region_cache(tmp_path, monkeypatch):
+    @tp._stax.register_backend(name="while_loop_test_TESTING_ONLY")
+    def graph_passthrough(graph_module, example_inputs, **kwargs):
+        return graph_module
+
+    monkeypatch.setattr(
+        "tensorplay.compiler.backends.stax.codecache._default_caches", {}
+    )
+    monkeypatch.setenv("TP_CACHE_DIR", str(tmp_path))
+
+    def probe(x):
+        return tp.graph.while_loop(lambda c: c.sum() < 100, lambda c: c + 1, x)
+
+    compiled = tp.compile(probe, backend="while_loop_test_TESTING_ONLY")
+    assert compiled(tp.tensor([1.0, 2.0])).tolist() == [50.0, 51.0]
+    # A fresh process holds no memoized instances: the region, including the
+    # loop node's condition and body subgraphs, must reload from disk.
+    monkeypatch.setattr(
+        "tensorplay.compiler.backends.stax.codecache._default_caches", {}
+    )
+    reloaded = tp.compile(probe, backend="while_loop_test_TESTING_ONLY")
+    assert reloaded(tp.tensor([1.0, 2.0])).tolist() == [50.0, 51.0]
+
+
+def test_captured_loop_rejects_training_carry():
+    @tp._stax.register_backend(name="while_loop_test_TESTING_ONLY")
+    def graph_passthrough(graph_module, example_inputs, **kwargs):
+        return graph_module
+
+    def probe(x):
+        return tp.graph.while_loop(lambda c: c.sum() < 10, lambda c: c + 1, x)
+
+    compiled = tp.compile(probe, backend="while_loop_test_TESTING_ONLY")
+    with pytest.raises(tp.compiler.GraphCaptureError):
+        compiled(tp.tensor([1.0], requires_grad=True))
