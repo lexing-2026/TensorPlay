@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import linecache
+import operator
 import textwrap
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -2439,12 +2440,37 @@ def _extern_segment_plan(
     sample_device: Any,
     placeholder_positions: dict,
     export_ports: dict,
+    *,
+    sample_feed: list | None = None,
+    max_autotune: bool = False,
+    training: bool = False,
 ) -> _ExternPlan | None:
-    """Build the eager executor for one extern segment; None when unsupported."""
+    """Build the eager executor for one extern segment; None when unsupported.
+
+    With ``max_autotune`` (inference regions only), a two-dimensional fp32
+    matmul segment additionally benches tiled Triton GEMM candidates against
+    the native operator and bakes the winner into the launch.
+    """
 
     import tensorplay as _tp
 
     node = seg.nodes[0]
+    if node.op == "get_attr":
+        # A lifted constant (module parameter or buffer) becomes its own
+        # extern segment: serve the same tensor on every call.  Training
+        # regions keep the native path — a constant needs no tangent, and
+        # the analytic-VJP chain does not model leaves.
+        if training:
+            return None
+        value = graph_module._get_attr(node.target)
+        return _ExternPlan(
+            launch=lambda feed: value,
+            extern_sources=sources,
+            example=value,
+            output_shape=tuple(int(dim) for dim in value.shape),
+            vjp_ready=False,
+            backward_launch=None,
+        )
     if node.op not in {"call_function", "call_method"}:
         # Attribute loads and friends stay on the fallback path.
         return None
@@ -2513,6 +2539,38 @@ def _extern_segment_plan(
     vjp = _build_extern_analytic_vjp(node, position_of)
 
     output_shape = tuple(int(dim) for dim in shape)
+    if max_autotune and not training and sample_feed is not None:
+        from .triton_gemm import tuned_matmul_launch
+
+        # Each operand is either a feed-resolvable graph node or a literal
+        # tensor (module weights captured as constants).
+        operand_specs = tuple(
+            (
+                position_of(value) if isinstance(value, Node) else None,
+                None if isinstance(value, Node) else value,
+            )
+            for value in node.args
+        )
+        if (
+            len(operand_specs) == 2
+            and all(
+                position is not None or literal is not None
+                for position, literal in operand_specs
+            )
+            and not node.kwargs
+            and (
+                (node.op == "call_function" and node.target is operator.matmul)
+                or (node.op == "call_method" and node.target == "matmul")
+            )
+        ):
+            try:
+                tuned = tuned_matmul_launch(
+                    launch, sample_feed, operand_specs, output_shape
+                )
+            except Exception:  # noqa: BLE001 - tuning is an optimization only
+                tuned = None
+            if tuned is not None:
+                launch = tuned
     example = _tp.empty(
         output_shape, dtype=dtype, device=sample_device
     )
@@ -2818,6 +2876,36 @@ def compile_graph_module(
     #: records the output shape when it is built (segment order guarantees
     #: it exists before any later consumer asks).
     extern_shapes: dict[int, tuple] = {}
+
+    def _sample_feed(sources_list: tuple) -> list:
+        """Sample tensors for one segment's extern sources, in feed order.
+
+        Arg sources reuse the region's own example tensors; producer
+        sources get empty stand-ins shaped like the producer's export
+        (extern_shapes entries filled by earlier loop iterations).
+        """
+
+        feed = []
+        for source in sources_list:
+            if source.kind == "arg":
+                feed.append(example_inputs[source.index])
+            else:
+                producer_seg = segments[source.index]
+                if producer_seg.kind == "pw+red":
+                    # Reduction output (scalar for full, kept-dims for axis
+                    # reductions); an epilogue tail has the same shape.
+                    shape: tuple[int, ...] = producer_seg.reduction.output_shape(
+                        reference_shape
+                    )
+                elif producer_seg.kind == "extern":
+                    shape = extern_shapes[source.index]
+                else:
+                    shape = reference_shape
+                feed.append(
+                    _tp.empty(shape, dtype=sample_dtype, device=sample_device)
+                )
+        return feed
+
     for seg_index, seg in enumerate(segments):
         sources = _extern_sources(seg_index, seg)
         if sources is None:
@@ -2833,6 +2921,9 @@ def compile_graph_module(
                 sample_device,
                 placeholder_positions_all,
                 export_ports,
+                sample_feed=_sample_feed(sources),
+                max_autotune=max_autotune,
+                training=any_grad,
             )
             if extern_plan is None:
                 scheduler_annotate(graph_module, segments)
@@ -2933,25 +3024,7 @@ def compile_graph_module(
             # ``output_ref`` stays the MAIN program's reduction source; the
             # epilogue tail replaces only the STORE value inside codegen.
             epilogue_payload = (eprogram, econstants, esrc)
-        seg_examples = []
-        for source in sources:
-            if source.kind == "arg":
-                seg_examples.append(example_inputs[source.index])
-            else:
-                producer_seg = segments[source.index]
-                if producer_seg.kind == "pw+red":
-                    # Reduction output (scalar for full, kept-dims for axis
-                    # reductions); an epilogue tail has the same shape.
-                    shape: tuple[int, ...] = producer_seg.reduction.output_shape(
-                        reference_shape
-                    )
-                elif producer_seg.kind == "extern":
-                    shape = extern_shapes[source.index]
-                else:
-                    shape = reference_shape
-                seg_examples.append(
-                    _tp.empty(shape, dtype=sample_dtype, device=sample_device)
-                )
+        seg_examples = _sample_feed(sources)
         # Segments compose: each lowers against the broadcast shape of ITS
         # OWN inputs, which for later segments is an intermediate shape, not
         # the graph-wide reference.
