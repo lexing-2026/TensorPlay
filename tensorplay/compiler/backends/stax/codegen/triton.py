@@ -1697,12 +1697,16 @@ def _dims_decision_key(
     device_repr: str,
     value_dtype: str | None,
     epilogue_repr: str,
+    *,
+    tier: str = "table",
 ) -> str:
     """Persisted-decision key for the axis-reduction family (M5d).
 
     Covers codegen generation, tuning salt, program content, reduction spec,
     shape buckets, device, value dtype and epilogue so a hit can never pin a
-    decision from an older emitter or candidate table.
+    decision from an older emitter or candidate table.  The selection tier
+    is part of the key: a coordinate-descent refinement and a baseline-table
+    pick for the same program are separate records.
     """
 
     from ..runtime import stax_autotune
@@ -1711,7 +1715,7 @@ def _dims_decision_key(
         _CODEGEN_VERSION
         + "|"
         + stax_autotune.TUNING_VERSION
-        + "|"
+        + f"|{tier}|"
         + digest
         + f"|{reduction.op}|{reduction.dims}|{int(reduction.keepdim)}"
         + f"|{stax_autotune.xnumel_bucket(onumel)}|{stax_autotune.xnumel_bucket(rnumel)}"
@@ -1732,15 +1736,26 @@ def _autotune_dims_program(
     reference_shape: tuple[int, ...] | None,
     value_dtype: str | None = None,
     epilogue: tuple[list[int], list[float], int] | None = None,
+    max_autotune: bool = False,
+    coordinate_descent_tuning: bool = False,
 ):
     """Benchmark ``_DIM_REDUCTION_CANDIDATES`` once; persist the decision.
 
     The decision cache key covers program content, reduction spec, shape
     buckets and device, so a hit skips both benchmarking and recompiles.
+    The key also carries the selection tier (baseline table, exhaustive
+    max-autotune table, coordinate-descent refinement) so policies never
+    read each other's records.
     """
 
     assert reference_shape is not None and isinstance(reduction, ReductionSpec)
     from ..runtime import stax_autotune
+
+    tier = (
+        "coordesc"
+        if coordinate_descent_tuning
+        else ("exhaustive" if max_autotune else "table")
+    )
 
     def build(config: tuple[int, ...]):
         return _compile_program(
@@ -1777,6 +1792,7 @@ def _autotune_dims_program(
         repr(example_inputs[0].device),
         value_dtype,
         epilogue is not None and repr(epilogue) or "",
+        tier=tier,
     )
 
     try:
@@ -1790,20 +1806,8 @@ def _autotune_dims_program(
     if payload is not None:
         try:
             record = json.loads(payload.decode())
-            if record.get("rblock") is not None:
-                cached: tuple[int, ...] = (
-                    int(record["xblock"]),
-                    int(record["warps"]),
-                    int(record["rblock"]),
-                    int(record["stages"]),
-                )
-            else:
-                cached = (
-                    int(record["xblock"]),
-                    int(record["warps"]),
-                    int(record["stages"]),
-                )
-            if any(entry == cached for entry in _DIM_REDUCTION_CANDIDATES):
+            cached = _dims_record_config(record)
+            if _dims_decision_acceptable(cached, tier):
                 return build(cached)
         except (ValueError, KeyError, TypeError):
             pass
@@ -1816,6 +1820,12 @@ def _autotune_dims_program(
     )
     if best_config is None:
         return build(_STATIC_DIM_TRIPLE)
+    if coordinate_descent_tuning:
+        from ..runtime import coordinate_descent
+
+        best_config, best_launch = coordinate_descent.refiner_for(
+            coordinate_descent.dims_fields(len(best_config))
+        )(build, best_config, list(example_inputs))
     try:
         record = {
             "xblock": best_config[0],
@@ -1830,6 +1840,32 @@ def _autotune_dims_program(
     return best_launch
 
 
+def _dims_record_config(record: dict) -> tuple[int, ...]:
+    if record.get("rblock") is not None:
+        return (
+            int(record["xblock"]),
+            int(record["warps"]),
+            int(record["rblock"]),
+            int(record["stages"]),
+        )
+    return (int(record["xblock"]), int(record["warps"]), int(record["stages"]))
+
+
+def _dims_decision_acceptable(config: tuple[int, ...], tier: str) -> bool:
+    """Validate a loaded decision against the policy that produced it.
+
+    Table tiers only accept configs from the curated candidate table; the
+    coordinate-descent tier accepts any structurally valid config because
+    the descent may leave the table.
+    """
+
+    if tier == "coordesc":
+        return len(config) in (3, 4) and all(
+            isinstance(value, int) and value >= 1 for value in config
+        )
+    return any(entry == config for entry in _DIM_REDUCTION_CANDIDATES)
+
+
 def _autotune_split_program(
     role: str,
     program: list[int],
@@ -1842,10 +1878,22 @@ def _autotune_split_program(
     reference_shape,
     value_dtype=None,
     epilogue=None,
+    max_autotune: bool = False,
+    coordinate_descent_tuning: bool = False,
 ):
-    """Bench classic vs persistent split-reduction forms once per bucket."""
+    """Bench classic vs persistent split-reduction forms once per bucket.
+
+    The decision key carries the selection tier so baseline-table records
+    and coordinate-descent refinements never shadow each other.
+    """
 
     from ..runtime import stax_autotune
+
+    tier = (
+        "coordesc"
+        if coordinate_descent_tuning
+        else ("exhaustive" if max_autotune else "table")
+    )
 
     def build(config):
         return _compile_program(
@@ -1865,7 +1913,7 @@ def _autotune_split_program(
         _CODEGEN_VERSION
         + "|split|"
         + stax_autotune.TUNING_VERSION
-        + "|"
+        + f"|{tier}|"
         + stax_autotune.program_digest(program, constants, output_refs)
         + f"|{reduction.op}|{stax_autotune.xnumel_bucket(_prod(reference_shape))}"
         + f"|{repr(example_inputs[0].device)}|{epilogue is not None}"
@@ -1886,11 +1934,18 @@ def _autotune_split_program(
             cfg = cfg + (int(record["nprog"]),)
         return cfg
 
+    def _acceptable(cfg):
+        # The coordinate-descent tier may leave the curated table; every
+        # other tier only accepts table members.
+        if tier == "coordesc":
+            return len(cfg) in (2, 3) and all(value >= 1 for value in cfg)
+        return any(tuple(c) == cfg for c in _SPLIT_CANDIDATES)
+
     if payload is not None:
         try:
             record = json.loads(payload.decode())
             cached = _valid(record)
-            if any(tuple(c) == cached for c in _SPLIT_CANDIDATES):
+            if _acceptable(cached):
                 return build(cached)
         except (ValueError, KeyError, TypeError):
             pass
@@ -1907,6 +1962,12 @@ def _autotune_split_program(
             if any(len(c) > 2 for c in _SPLIT_CANDIDATES)
             else _STATIC_REDUCTION_CONFIG
         )
+    if coordinate_descent_tuning:
+        from ..runtime import coordinate_descent
+
+        best_cfg, best_launch = coordinate_descent.refiner_for(
+            coordinate_descent.SPLIT_FIELDS
+        )(build, best_cfg, list(example_inputs))
     record = {"xblock": best_cfg[0], "warps": best_cfg[1]}
     if len(best_cfg) > 2:
         record["nprog"] = best_cfg[2]
@@ -1931,12 +1992,16 @@ def _autotune_launch(
     bucket_numel: int | None = None,
     value_dtype: str | None = None,
     epilogue: tuple[list[int], list[float], int] | None = None,
+    max_autotune: bool = False,
+    coordinate_descent_tuning: bool = False,
 ):
     """Compile a program, autotuning the launch config when possible (M2).
 
     Benchmark candidate configs once at compile time and emit a
     fixed-config kernel; persist the decision so later processes skip
-    benchmarking.  Any failure falls back to a static
+    benchmarking.  The max-autotune knobs widen the search: an exhaustive
+    candidate table for pointwise programs and coordinate-descent
+    refinement of the benchmark winner.  Any failure falls back to a static
     pinned config for reductions (the split workspace is baked per config)
     or the plain ``@triton.autotune`` emission for pointwise programs.
     """
@@ -1979,6 +2044,8 @@ def _autotune_launch(
             reference_shape=reference_shape,
             value_dtype=value_dtype,
             epilogue=epilogue,
+            max_autotune=max_autotune,
+            coordinate_descent_tuning=coordinate_descent_tuning,
         )
     if spec is not None and spec.is_full and reduction_mode == "split":
         return _autotune_split_program(
@@ -1992,6 +2059,8 @@ def _autotune_launch(
             reference_shape=reference_shape,
             value_dtype=value_dtype,
             epilogue=epilogue,
+            max_autotune=max_autotune,
+            coordinate_descent_tuning=coordinate_descent_tuning,
         )
     if disabled_autotune():
         if reduction:
@@ -2003,7 +2072,7 @@ def _autotune_launch(
             reference_shape=reference_shape,
         )
     try:
-        from ..runtime import stax_autotune
+        from ..runtime import coordinate_descent, stax_autotune
 
         digest = stax_autotune.program_digest(program, constants, output_refs)
         if bucket_numel is not None:
@@ -2023,6 +2092,23 @@ def _autotune_launch(
             device_key,
             build_fixed,
             list(example_inputs),
+            candidates=(
+                stax_autotune.EXHAUSTIVE_CANDIDATE_CONFIGS
+                if max_autotune
+                else None
+            ),
+            refiner=(
+                coordinate_descent.refiner_for(
+                    coordinate_descent.POINTWISE_FIELDS
+                )
+                if coordinate_descent_tuning
+                else None
+            ),
+            tier=(
+                "coordesc"
+                if coordinate_descent_tuning
+                else ("exhaustive" if max_autotune else "table")
+            ),
         )
         del config  # baked into the returned fixed-config launch
         return launch
@@ -2568,11 +2654,12 @@ def compile_graph_module(
     graph_module: GraphModule,
     example_inputs: list[Any],
     *,
-    mode: str | None = None,
+    max_autotune: bool = False,
+    coordinate_descent_tuning: bool = False,
     strict_native: bool = False,
     **kwargs: Any,
 ):
-    del mode, kwargs
+    del kwargs
     if not HAS_TRITON:
         _dbg('fallback gate #1')
         return None
@@ -2903,6 +2990,8 @@ def compile_graph_module(
             bucket_numel=_prod(local_ref),
             value_dtype=str(sample_dtype) if reduction is not None else None,
             epilogue=epilogue_payload,
+            max_autotune=max_autotune,
+            coordinate_descent_tuning=coordinate_descent_tuning,
         )
         segment_plans.append(
             _SegmentPlan(
@@ -2974,6 +3063,8 @@ def compile_graph_module(
                 backward_constants,
                 backward_outputs,
                 [*example_inputs, example_inputs[0]],
+                max_autotune=max_autotune,
+                coordinate_descent_tuning=coordinate_descent_tuning,
             )
         else:
             # M5c training: chain one local VJP program per segment.  The
@@ -3015,6 +3106,8 @@ def compile_graph_module(
                     bwd_constants,
                     bwd_outputs,
                     [*plan.examples, plan.examples[0]],
+                    max_autotune=max_autotune,
+                    coordinate_descent_tuning=coordinate_descent_tuning,
                 )
 
         from .....autograd import Function
