@@ -194,3 +194,128 @@ def test_dense_view_on_cuda_keeps_metadata_on_device():
     assert nt._nested_tensor_size().device.type == "cuda"
     padded = to_padded_tensor(nt, 0.0)
     assert tp.equal(padded.cpu(), dense.cpu())
+
+
+def test_nested_accessor_family():
+    nt = nested_tensor([tp.tensor([[1.0, 2.0], [3.0, 4.0]]), tp.tensor([[5.0]])])
+    vals = tp._C._nested_get_values(nt)
+    assert vals.numel() == 5
+    assert vals.tolist() == [1.0, 2.0, 3.0, 4.0, 5.0]
+    copy = tp._C._nested_get_values_copy(nt)
+    assert copy.tolist() == vals.tolist()
+    assert tp._C._nested_get_offsets(nt).tolist() == [0, 4]
+    # The ragged axis is the first size column: lengths [2, 1].
+    assert tp._C._nested_get_lengths(nt).tolist() == [2, 1]
+    assert tp._C._nested_get_ragged_idx(nt) == 0
+    assert tp._C._nested_get_min_seqlen(nt).tolist() == [1]
+    assert tp._C._nested_get_max_seqlen(nt).tolist() == [2]
+    dummy = tp._C._nested_get_jagged_dummy(nt)
+    assert dummy.numel() == 0 and dummy.dtype == nt.dtype
+
+
+def test_nested_compute_contiguous_strides_offsets():
+    sizes = tp.tensor([[2, 3], [1, 3]], dtype=tp.int64)
+    strides, offsets = tp._C._nested_compute_contiguous_strides_offsets(sizes)
+    assert strides.tolist() == [[3, 1], [3, 1]]
+    assert offsets.tolist() == [0, 6]
+
+
+def test_nested_view_from_jagged():
+    values = tp.arange(0, 8, dtype=tp.float32)
+    offsets = tp.tensor([0, 5, 8], dtype=tp.int64)
+    dummy = tp._C._nested_get_jagged_dummy(values)
+    nt = tp._C._nested_view_from_jagged(values, offsets, dummy, None, 1,
+                                        None, None)
+    assert nt.is_nested() and nt.dim() == 2 and nt.numel() == 8
+    assert nt._nested_tensor_size().tolist() == [[5], [3]]
+    assert nt._nested_tensor_storage_offsets().tolist() == [0, 5]
+    padded = to_padded_tensor(nt, -1.0)
+    assert padded.tolist() == [[0.0, 1.0, 2.0, 3.0, 4.0],
+                               [5.0, 6.0, 7.0, -1.0, -1.0]]
+
+    # A ragged first axis with trailing extents: offsets index rows of the
+    # values batch and scale by the trailing volume inside the buffer.
+    values2 = tp.arange(0, 12, dtype=tp.float32).reshape(6, 2)
+    offsets2 = tp.tensor([0, 4, 6], dtype=tp.int64)
+    nt2 = tp._C._nested_view_from_jagged(values2, offsets2, dummy, None, 1,
+                                         None, None)
+    assert nt2._nested_tensor_size().tolist() == [[4, 2], [2, 2]]
+    p2 = to_padded_tensor(nt2, 0.0)
+    assert tuple(p2.shape) == (2, 4, 2)
+    assert p2[1].tolist() == [[8.0, 9.0], [10.0, 11.0], [0.0, 0.0], [0.0, 0.0]]
+
+    with pytest.raises(RuntimeError, match="ragged_idx"):
+        tp._C._nested_view_from_jagged(values, offsets, dummy, None, 2,
+                                       None, None)
+    with pytest.raises(RuntimeError, match="past the values"):
+        tp._C._nested_view_from_jagged(
+            values, tp.tensor([0, 5, 99], dtype=tp.int64), dummy, None, 1,
+            None, None)
+
+
+def test_nested_view_from_jagged_copy_does_not_alias():
+    values = tp.arange(0, 4, dtype=tp.float32)
+    dummy = tp._C._nested_get_jagged_dummy(values)
+    nt = tp._C._nested_view_from_jagged_copy(
+        values, tp.tensor([0, 2, 4], dtype=tp.int64), dummy, None, 1, None,
+        None)
+    tp._C._nested_get_values(nt).fill_(0.0)
+    assert values.tolist() == [0.0, 1.0, 2.0, 3.0]
+
+
+def test_nested_from_padded_and_mask():
+    padded = tp.arange(0, 24, dtype=tp.float32).reshape(2, 4, 3)
+    sizes = tp.tensor([[3, 3], [2, 3]], dtype=tp.int64)
+    nt = tp._C._nested_from_padded(padded, sizes, False)
+    assert nt.numel() == 15 and nt.dim() == 3 and nt.size(0) == 2
+    assert nt._nested_tensor_size().tolist() == [[3, 3], [2, 3]]
+    assert nt._nested_tensor_storage_offsets().tolist() == [0, 12]
+
+    mask = tp.tensor([[True, True, True, False], [True, True, False, False]])
+    nt2 = tp._C._nested_tensor_from_mask(padded, mask, True)
+    assert tp.equal(nt2._nested_tensor_size(), sizes)
+    assert tp.equal(tp._C._nested_get_values(nt2), tp._C._nested_get_values(nt))
+    assert tp._C._nested_tensor_from_mask_left_aligned(padded, mask)
+
+    gapped = tp.tensor([[True, False, True, False], [True, True, True, True]])
+    assert not tp._C._nested_tensor_from_mask_left_aligned(padded, gapped)
+    with pytest.raises(RuntimeError, match="left-aligned"):
+        tp._C._nested_tensor_from_mask(padded, gapped, True)
+
+
+def test_nested_sum_backward_repeats_along_the_ragged_axis():
+    nt = nested_tensor([tp.tensor([[1.0, 2.0], [3.0, 4.0]]),
+                        tp.tensor([[5.0, 6.0]])])
+    grad = nested_tensor([tp.tensor([10.0, 20.0]), tp.tensor([30.0])])
+    b = tp._C._nested_sum_backward(grad, nt, None, False)
+    assert tp._C._nested_get_values(b).tolist() == [
+        10.0, 10.0, 20.0, 20.0, 30.0, 30.0]
+    assert tp.equal(b._nested_tensor_size(), nt._nested_tensor_size())
+
+
+def test_nested_select_backward_places_grad_at_the_selection():
+    nt = nested_tensor([tp.tensor([[1.0, 2.0], [3.0, 4.0]]),
+                        tp.tensor([[5.0, 6.0]])])
+    # dim 0: only the selected constituent receives its gradient.
+    b0 = tp._C._nested_select_backward(
+        tp.tensor([[1.0, 2.0], [3.0, 4.0]]), nt, 0, 0)
+    assert tp._C._nested_get_values(b0).tolist() == [1.0, 2.0, 3.0, 4.0, 0.0, 0.0]
+    # dim 1, index 0: the first row of each constituent.
+    b1 = tp._C._nested_select_backward(
+        tp.tensor([[1.0, 2.0], [5.0, 6.0]]), nt, 1, 0)
+    assert tp._C._nested_get_values(b1).tolist() == [1.0, 2.0, 0.0, 0.0, 5.0, 6.0]
+    with pytest.raises(IndexError):
+        tp._C._nested_select_backward(
+            tp.tensor([[1.0, 2.0], [5.0, 6.0]]), nt, 1, 1)
+
+
+def test_nested_softmax_with_shape_normalizes_each_ragged_row():
+    nt = nested_tensor([tp.tensor([[1.0, 2.0], [3.0, 4.0]]),
+                        tp.tensor([[5.0]])])
+    s = tp._C._nested_tensor_softmax_with_shape(nt, tp.zeros(2, 1))
+    assert tp.equal(s._nested_tensor_size(), nt._nested_tensor_size())
+    # softmax([1, 2]) = [1/(1+e), e/(1+e)]
+    q = 1.0 / (1.0 + 2.718281828)
+    assert tp.allclose(
+        tp._C._nested_get_values(s),
+        tp.tensor([q, 1.0 - q, q, 1.0 - q, 1.0]), atol=1e-5)
