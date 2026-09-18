@@ -138,7 +138,7 @@ def _scaled_dot_product_attention_quantized(
             UserWarning,
         )
     # Directly call the internal flash attention operator which has descale support
-    result = tensorplay.ops.aten._scaled_dot_product_flash_attention.quantized(
+    result = tensorplay.ops.tp._scaled_dot_product_flash_attention.quantized(
         query,
         key,
         value,

@@ -504,6 +504,7 @@ set(GEN_TPX_AUTOGRAD_REG_CPP "${GEN_INCLUDE_DIR}/TPXAutogradRegistration.cpp")
 set(GEN_AUTOCAST_CPP "${GEN_INCLUDE_DIR}/AutocastGenerated.cpp")
 set(GEN_TPX_REDISPATCH_H "${GEN_INCLUDE_DIR}/TensorRedispatchGenerated.h")
 set(GEN_STRUCTURED_H "${GEN_INCLUDE_DIR}/StructuredGenerated.h")
+set(GEN_PYTHON_DISPATCH_CPP "${GEN_INCLUDE_DIR}/PythonDispatchGenerated.cpp")
 
 # Python Interface Stub Generation
 if(NOT DEFINED TP_PACKAGE_DIR)
@@ -524,7 +525,7 @@ add_custom_command(
 )
 
 # Add a custom target to ensure code generation runs before library building
-add_custom_target(generate_code DEPENDS ${GEN_HEADER} ${GEN_CPP} ${GEN_TPX_OPS_CPP} ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN_AUTOCAST_CPP} ${GEN_TPX_REDISPATCH_H} ${GEN_STRUCTURED_H} ${TP_VERSION_PY})
+add_custom_target(generate_code DEPENDS ${GEN_HEADER} ${GEN_CPP} ${GEN_TPX_OPS_CPP} ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN_AUTOCAST_CPP} ${GEN_TPX_REDISPATCH_H} ${GEN_STRUCTURED_H} ${GEN_PYTHON_DISPATCH_CPP} ${TP_VERSION_PY})
 
 include_directories(${GEN_BASE_DIR})
 
@@ -1157,7 +1158,7 @@ add_custom_command(
                    ${GEN_CPYTHON_HEADER}
                    ${GEN_AUTOGRAD_NODES_H} ${GEN_TPX_OPS_H} ${GEN_TPX_OPS_CPP}
                    ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN_AUTOCAST_CPP} ${GEN_TPX_REDISPATCH_H}
-                   ${GEN_STRUCTURED_H}
+                   ${GEN_STRUCTURED_H} ${GEN_PYTHON_DISPATCH_CPP}
             COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR} ${Python_EXECUTABLE} -m tools.codegen.main
                     --yaml ${CMAKE_CURRENT_SOURCE_DIR}/config/native_functions.yaml
                     --derivatives ${CMAKE_CURRENT_SOURCE_DIR}/config/derivatives.yaml
@@ -1190,7 +1191,7 @@ set_source_files_properties(
     ${GEN_HEADER} ${GEN_CPP} ${GEN_BINDINGS_HEADER}
     ${GEN_AUTOGRAD_NODES_H} ${GEN_TPX_OPS_H} ${GEN_TPX_OPS_CPP}
     ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN_AUTOCAST_CPP} ${GEN_TPX_REDISPATCH_H}
-    ${GEN_STRUCTURED_H}
+    ${GEN_STRUCTURED_H} ${GEN_PYTHON_DISPATCH_CPP}
     PROPERTIES GENERATED TRUE
 )
 
@@ -1395,6 +1396,8 @@ set(TP_C_SOURCES
     src/bindings/python/Transforms.cpp
     src/bindings/python/Ops.cpp
     src/bindings/python/Dispatch.cpp
+    src/bindings/python/PythonDispatch.cpp
+    ${GEN_PYTHON_DISPATCH_CPP}
     src/bindings/python/Tensor.cpp
     src/bindings/python/Stax.cpp
     src/bindings/python/Parallel.cpp

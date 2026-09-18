@@ -1,4 +1,6 @@
 #include "python_bindings.h"
+#include <unordered_map>
+#include <vector>
 #include "PyNewRef.h"
 #include "tensorplay/ops/Config.h"
 #include "tensorplay/ops/TensorCPythonGenerated.h"
@@ -335,6 +337,10 @@ PYBIND11_MODULE(_C, m) {
     py::register_exception_translator([](std::exception_ptr p) {
         try {
             std::rethrow_exception(p);
+        } catch (const tensorplay::python_c::PythonError& e) {
+            // A Python exception that crossed C++ frames (a dispatch mode
+            // handler raising inside an operator) resurfaces unchanged.
+            e.restore();
         } catch (const tensorplay::Exception &e) {
             std::string msg = e.msg();
             const char* env_val = std::getenv("TENSORPLAY_SHOW_CPP_STACKTRACES");
@@ -367,6 +373,49 @@ PYBIND11_MODULE(_C, m) {
     init_transforms(m);
     init_ops(m);
     init_dispatch(m);
+    init_python_dispatch(m);
+    // Operator overload objects call exactly one overload through its
+    // hook-free generated entry.
+    m.def("_call_overload", [](const std::string& name, py::tuple args, py::dict kwargs) -> py::object {
+        static const auto table = [] {
+            std::unordered_map<std::string, const tensorplay::python_c::GeneratedOverloadCall*> map;
+            for (const auto* row = tensorplay::python_c::generated_overload_calls;
+                 row->name != nullptr; ++row) {
+                map.emplace(row->name, row);
+            }
+            return map;
+        }();
+        auto it = table.find(name);
+        if (it == table.end()) {
+            throw py::value_error("no operator overload named '" + name + "'");
+        }
+        const auto* row = it->second;
+        const Py_ssize_t nargs = static_cast<Py_ssize_t>(args.size());
+        const Py_ssize_t nkw = static_cast<Py_ssize_t>(kwargs.size());
+        std::vector<PyObject*> stack;
+        stack.reserve(static_cast<size_t>(nargs + nkw));
+        for (auto item : args) stack.push_back(item.ptr());
+        py::tuple kwnames(nkw);
+        Py_ssize_t k = 0;
+        for (auto item : kwargs) {
+            kwnames[k++] = item.first;
+            stack.push_back(item.second.ptr());
+        }
+        PyObject* kw = nkw ? kwnames.ptr() : nullptr;
+        using Fast = PyObject* (*)(PyObject*, PyObject* const*, Py_ssize_t, PyObject*);
+        auto entry = reinterpret_cast<Fast>(reinterpret_cast<void*>(row->entry));
+        PyObject* result = nullptr;
+        if (row->receiver) {
+            if (nargs == 0) {
+                throw py::type_error("operator overload '" + name + "' requires self");
+            }
+            result = entry(stack[0], stack.data() + 1, nargs - 1, kw);
+        } else {
+            result = entry(nullptr, stack.data(), nargs, kw);
+        }
+        if (result == nullptr) throw py::error_already_set();
+        return py::reinterpret_steal<py::object>(result);
+    });
     init_stax(m);
     init_parallel(m);
 #ifdef TP_USE_DISTRIBUTED

@@ -245,7 +245,7 @@ class CausalBias(tensorplay.Tensor):
                     query = tensorplay.nn.functional.pad(query, (0, pad_len))
                     key = tensorplay.nn.functional.pad(key, (0, pad_len))
                     value = tensorplay.nn.functional.pad(value, (0, pad_len))
-                out = tensorplay.ops.aten._scaled_dot_product_flash_attention(
+                out = tensorplay.ops.tp._scaled_dot_product_flash_attention(
                     query,
                     key,
                     value,
@@ -259,7 +259,7 @@ class CausalBias(tensorplay.Tensor):
                 compute_log_sumexp = False
                 if _input_requires_grad(query, key, value):
                     compute_log_sumexp = True
-                return tensorplay.ops.aten._efficient_attention_forward(
+                return tensorplay.ops.tp._efficient_attention_forward(
                     query.transpose(1, 2),
                     key.transpose(1, 2),
                     value.transpose(1, 2),

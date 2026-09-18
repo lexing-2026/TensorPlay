@@ -434,7 +434,7 @@ Tensor as_strided(const Tensor& self, const std::vector<int64_t>& size,
                   std::optional<int64_t> storage_offset) {
     const bool requires_grad =
         GradMode::is_enabled() && !InferenceMode::is_enabled() &&
-        self.requires_grad();
+        self.requires_grad() && !autograd_dispatch_excluded();
     std::shared_ptr<Node> grad_fn;
     if (requires_grad) {
         const int64_t base_offset = static_cast<int64_t>(

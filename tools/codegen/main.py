@@ -152,6 +152,17 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
     gen(ctx)
 
 
+@register_generator("PythonDispatch")
+def _gen_python_dispatch(ctx: CodegenContext) -> None:
+    from .gen_python_dispatch import generate_python_dispatch_cpp
+    source, skipped = generate_python_dispatch_cpp(ctx.funcs)
+    if skipped:
+        raise SystemExit(
+            "Python dispatch kernels cannot be generated for:\n  "
+            + "\n  ".join(skipped))
+    ctx.write("PythonDispatchGenerated.cpp", source)
+
+
 @register_generator("Structured")
 def _gen_structured(ctx: CodegenContext) -> None:
     from .gen_structured import _gen_structured as gen
@@ -194,7 +205,7 @@ def _gen_pyi(ctx: CodegenContext) -> None:
 DEFAULT_TARGETS = ["TensorMethods", "Redispatch", "AutogradNodes", "TPXOps",
                    "AutogradRegistration", "Bindings", "Autocast",
                    "InplaceOrView", "Structured", "PythonFunctional",
-                   "PythonCAPI"]
+                   "PythonCAPI", "PythonDispatch"]
 
 
 def run_gen(ctx: CodegenContext, targets: list[str]) -> None:

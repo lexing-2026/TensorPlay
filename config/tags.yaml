@@ -35,3 +35,17 @@
   desc: Operator uses a custom binding method.
 - tag: deprecated
   desc: Operator is deprecated but retained for schema compatibility.
+- tag: core
+  desc: Operator belongs to the minimal set every compiler backend lowers directly; the rest decompose into it.
+- tag: pointwise
+  desc: Operator computes each output element from the matching input elements only (after broadcasting).
+- tag: reduction
+  desc: Operator reduces one or more dimensions of its input.
+- tag: data_dependent_output
+  desc: Operator output values are read back to the host to decide the result (a host synchronization).
+- tag: maybe_aliasing_or_mutating
+  desc: Operator may alias or mutate its inputs depending on the arguments; analyses must treat it conservatively.
+- tag: needs_exact_strides
+  desc: Operator requires inputs with exactly the strides observed at capture time.
+- tag: needs_fixed_stride_order
+  desc: Operator requires inputs whose stride order matches the one observed at capture time.

@@ -192,6 +192,7 @@ void Engine::execute_task(ReadyQueue::NodeTask&& task, ReadyQueue& cpu_queue,
     if (engine_trace_enabled()) fprintf(stderr, "[tp-engine] exec node %s\n", task.fn_->name().c_str());
     try {
         GraphTaskGuard graph_guard(&graph);
+        ::tensorplay::impl::DispatchModeStateGuard modes_guard(graph.dispatch_modes_);
         evaluate_function(graph, task.fn_.get(), task.input_buffer_, cpu_queue, local_queue);
     } catch (...) {
         // A failing node must not hang the whole backward: record the error

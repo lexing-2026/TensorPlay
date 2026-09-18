@@ -1,3 +1,5 @@
+import contextlib
+import warnings
 from collections.abc import Sequence
 from typing import Optional, overload, Protocol, Union
 from typing_extensions import TypeIs
@@ -9,6 +11,127 @@ _is_in_tensorplay_dispatch_mode = False
 _is_in_non_infra_tensorplay_dispatch_mode = False
 # If inside any mode that has ignore_compile_internals() = False
 _is_in_any_mode_without_ignore_compile_internals = False
+
+
+class TensorPlayDispatchMode:
+    """Intercept every operator that reaches its backend, within a scope.
+
+    Entering the mode pushes it on the thread's dispatch-mode stack; while it
+    is active the dispatcher hands each operator -- including the ones the
+    autograd engine runs during backward -- to
+    ``__tensorplay_dispatch__(func, types, args, kwargs)``, where ``func`` is
+    the :class:`tensorplay._ops.OpOverload` being run.  Inside the handler
+    the mode is popped: calling ``func(*args, **kwargs)`` reaches the next
+    mode on the stack, or the backend kernel, without recording autograd
+    history again.  Modes compose by nesting ``with`` blocks.
+    """
+
+    def __init__(self) -> None:
+        self._old_mode_flags: list[tuple[bool, bool, bool]] = []
+
+    def __tensorplay_dispatch__(self, func, types, args=(), kwargs=None):
+        raise NotImplementedError
+
+    def __enter__(self):
+        global _is_in_tensorplay_dispatch_mode
+        global _is_in_non_infra_tensorplay_dispatch_mode
+        global _is_in_any_mode_without_ignore_compile_internals
+
+        if not hasattr(self, "_old_mode_flags"):
+            self._old_mode_flags = []
+        self._old_mode_flags.append(
+            (
+                _is_in_tensorplay_dispatch_mode,
+                _is_in_non_infra_tensorplay_dispatch_mode,
+                _is_in_any_mode_without_ignore_compile_internals,
+            )
+        )
+        _is_in_tensorplay_dispatch_mode = True
+        _is_in_non_infra_tensorplay_dispatch_mode = (
+            _is_in_non_infra_tensorplay_dispatch_mode or not self.is_infra_mode()
+        )
+        _is_in_any_mode_without_ignore_compile_internals = (
+            _is_in_any_mode_without_ignore_compile_internals
+            or not self.ignore_compile_internals()
+        )
+        tensorplay._C._push_dispatch_mode(self)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        global _is_in_tensorplay_dispatch_mode
+        global _is_in_non_infra_tensorplay_dispatch_mode
+        global _is_in_any_mode_without_ignore_compile_internals
+
+        top = tensorplay._C._pop_dispatch_mode()
+        if top is not self:
+            tensorplay._C._push_dispatch_mode(top)
+            raise RuntimeError("dispatch mode stack is not properly nested")
+        (
+            _is_in_tensorplay_dispatch_mode,
+            _is_in_non_infra_tensorplay_dispatch_mode,
+            _is_in_any_mode_without_ignore_compile_internals,
+        ) = self._old_mode_flags.pop()
+
+    @classmethod
+    def push(cls, *args, **kwargs):
+        warnings.warn(
+            "`Mode.push()` is no longer necessary and can be replaced with just `with Mode()`",
+            stacklevel=2,
+        )
+        return cls(*args, **kwargs)
+
+    @classmethod
+    def is_infra_mode(cls) -> bool:
+        return False
+
+    @classmethod
+    def ignore_compile_internals(cls) -> bool:
+        """Whether operators run inside compiled regions bypass this mode."""
+
+        return cls.is_infra_mode()
+
+
+def _len_dispatch_mode_stack() -> int:
+    return tensorplay._C._len_dispatch_mode()
+
+
+def _get_current_dispatch_mode() -> Optional[TensorPlayDispatchMode]:
+    """The innermost active mode (the next one to receive an operator)."""
+
+    length = tensorplay._C._len_dispatch_mode()
+    return tensorplay._C._get_dispatch_mode(length - 1) if length else None
+
+
+def _get_current_dispatch_mode_stack() -> list[TensorPlayDispatchMode]:
+    return [
+        tensorplay._C._get_dispatch_mode(i)
+        for i in range(tensorplay._C._len_dispatch_mode())
+    ]
+
+
+@contextlib.contextmanager
+def _pop_mode_temporarily():
+    """Pop the innermost mode for the duration of the block."""
+
+    mode = tensorplay._C._pop_dispatch_mode()
+    try:
+        yield mode
+    finally:
+        tensorplay._C._push_dispatch_mode(mode)
+
+
+@contextlib.contextmanager
+def _disable_current_modes():
+    """Run the block with no dispatch mode active; restores the stack after."""
+
+    popped = []
+    try:
+        while tensorplay._C._len_dispatch_mode():
+            popped.append(tensorplay._C._pop_dispatch_mode())
+        yield list(reversed(popped))
+    finally:
+        for mode in reversed(popped):
+            tensorplay._C._push_dispatch_mode(mode)
 
 
 def is_in_tensorplay_dispatch_mode(include_infra_modes=True) -> bool:
