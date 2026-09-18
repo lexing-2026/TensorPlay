@@ -4455,7 +4455,7 @@ def stax(
         if not isinstance(options, dict):
             raise TypeError(f"options must be a dict, got {type(options)!r}")
         unknown = set(options).difference(
-            {"stax.native", "stax.fusion", "stax.triton"}
+            {"stax.native", "stax.fusion", "stax.triton", "stax.cudagraphs"}
         )
         if unknown:
             raise RuntimeError(
@@ -4466,6 +4466,56 @@ def stax(
     use_native = options is None or options.get("stax.native", True)
     use_fusion = options is None or options.get("stax.fusion", True)
     use_triton = options is None or options.get("stax.triton", True)
+    # Replay-through-CUDA-graph follows the mode contract: reduce-overhead
+    # and max-autotune enable it, the no-cudagraphs variant and the default
+    # mode leave the artifact untouched.  ``stax.cudagraphs`` overrides.
+    cudagraphs_requested = (
+        options.get("stax.cudagraphs") if options is not None else None
+    )
+    if cudagraphs_requested is None:
+        cudagraphs_requested = mode in ("reduce-overhead", "max-autotune")
+    compiled = _lower_stax_region(
+        graph_module,
+        example_inputs,
+        mode=mode,
+        use_native=use_native,
+        use_fusion=use_fusion,
+        use_triton=use_triton,
+        dynamic=dynamic,
+        strict_native=strict_native,
+    )
+    if not cudagraphs_requested or isinstance(compiled, GraphModule):
+        return compiled
+    from .cudagraphs import cudagraph_wrap
+
+    wrapped, reason = cudagraph_wrap(
+        compiled, graph_module, example_inputs, dynamic=dynamic
+    )
+    if reason is not None:
+        graph_module._stax_cudagraph_skip_reason = reason
+        return compiled
+    return wrapped
+
+
+def _lower_stax_region(
+    graph_module: GraphModule,
+    example_inputs: list[Any],
+    *,
+    mode: str | None,
+    use_native: bool,
+    use_fusion: bool,
+    use_triton: bool,
+    dynamic: bool | None,
+    strict_native: bool,
+):
+    """Lower one canonical graph and return an executable callable.
+
+    ``example_inputs`` and backend options are part of the same contract as
+    metadata in the frontend and uses the native graph when its lowering
+    contract is satisfied.  ``strict_native`` makes a failed lowering a hard
+    compiler error, so a benchmark can never report the Python GraphModule
+    executor as compiled performance.
+    """
     if use_native and use_fusion:
         fused_cpu_graph = _lower_cpu_fused_pointwise(
             graph_module,
