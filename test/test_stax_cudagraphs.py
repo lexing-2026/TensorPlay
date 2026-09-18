@@ -402,3 +402,94 @@ def test_reduce_overhead_falls_back_when_capture_fails(caplog, monkeypatch):
         x = tp.randn(4, device="cuda")
         assert compiled(x).item() == (x * 2).relu().sum().item()
     assert "capture failed" in caplog.text
+
+
+# --------------------------------------------------------------------------
+# mode-to-options mapping
+# --------------------------------------------------------------------------
+
+def test_list_mode_options_mapping():
+    from tensorplay.compiler import list_mode_options
+
+    assert list_mode_options("default") == {}
+    assert list_mode_options("reduce-overhead") == {"stax.cudagraphs": True}
+    assert list_mode_options("max-autotune-no-cudagraphs") == {
+        "stax.max_autotune": True,
+        "stax.coordinate_descent_tuning": True,
+    }
+    assert list_mode_options("max-autotune") == {
+        "stax.max_autotune": True,
+        "stax.cudagraphs": True,
+        "stax.coordinate_descent_tuning": True,
+    }
+    full = list_mode_options()
+    assert set(full) == {
+        "default",
+        "reduce-overhead",
+        "max-autotune",
+        "max-autotune-no-cudagraphs",
+    }
+    with pytest.raises(RuntimeError, match="Unrecognized mode"):
+        list_mode_options("fastest")
+
+
+def test_stax_mode_patch_overlaid_by_explicit_options(monkeypatch):
+    from tensorplay.compiler.backends.stax import backend as stax_backend
+    from tensorplay.compiler.backends import cudagraphs as cg
+
+    captured: dict = {}
+
+    def fake_lower(graph_module, example_inputs, **kwargs):
+        captured.update(kwargs)
+        return lambda *args: "lowered"
+
+    monkeypatch.setattr(stax_backend, "_lower_stax_region", fake_lower)
+
+    wrapped: list = []
+
+    def fake_wrap(compiled, graph_module, example_inputs, dynamic=None):
+        wrapped.append(compiled)
+        return compiled, None
+
+    monkeypatch.setattr(cg, "cudagraph_wrap", fake_wrap)
+    graph_like = SimpleNamespace()
+
+    # the mode's patch lands as defaults and drives the replay wrap...
+    stax_backend.stax(graph_like, [], mode="max-autotune")
+    assert captured["max_autotune"] is True
+    assert captured["coordinate_descent_tuning"] is True
+    assert len(wrapped) == 1
+
+    # ...and an explicit option wins over the mode patch per key
+    stax_backend.stax(
+        graph_like, [], mode="max-autotune", options={"stax.cudagraphs": False}
+    )
+    assert captured["max_autotune"] is True
+    assert len(wrapped) == 1  # no further wrap: explicit opt-out
+
+    # a mode without the autotune knobs leaves them off
+    stax_backend.stax(
+        graph_like, [], mode="reduce-overhead", options={"stax.native": False}
+    )
+    assert captured["max_autotune"] is False
+    assert captured["coordinate_descent_tuning"] is False
+    assert captured["use_native"] is False
+    assert len(wrapped) == 2
+
+
+def test_max_autotune_mode_compiles_and_matches_eager():
+    def fn(a):
+        return (a * 3 + 1).relu().sum()
+
+    compiled = tp.compile(fn, mode="max-autotune")
+    x = tp.randn(16, 64)
+    assert tp.allclose(compiled(x), fn(x))
+
+
+def test_max_autotune_no_cudagraphs_mode_compiles_and_matches_eager():
+    def fn(a):
+        return (a.sin() * a).sum()
+
+    compiled = tp.compile(fn, mode="max-autotune-no-cudagraphs")
+    x = tp.randn(32, 16)
+    assert tp.allclose(compiled(x), fn(x))

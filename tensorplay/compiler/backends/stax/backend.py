@@ -4454,6 +4454,58 @@ def _lower_aot_native(
     )
 
 
+# Option patch each compile ``mode`` selects, keyed by the backend option
+# namespace.  ``default`` leaves every knob at its built-in value;
+# ``reduce-overhead`` replays the artifact through CUDA graphs;
+# ``max-autotune(-no-cudagraphs)`` additionally selects the exhaustive
+# search tier: the widened pointwise candidate table plus coordinate-descent
+# refinement of every benchmark winner.
+_MODE_OPTIONS: dict[str, dict[str, bool]] = {
+    "default": {},
+    "reduce-overhead": {
+        "stax.cudagraphs": True,
+    },
+    "max-autotune-no-cudagraphs": {
+        "stax.max_autotune": True,
+        "stax.coordinate_descent_tuning": True,
+    },
+    "max-autotune": {
+        "stax.max_autotune": True,
+        "stax.cudagraphs": True,
+        "stax.coordinate_descent_tuning": True,
+    },
+}
+
+# Every backend option key accepted by ``stax`` (and therefore by explicit
+# ``options`` dicts and mode patches alike).
+_STAX_OPTIONS = (
+    "stax.native",
+    "stax.fusion",
+    "stax.triton",
+    "stax.cudagraphs",
+    "stax.max_autotune",
+    "stax.coordinate_descent_tuning",
+)
+
+
+def list_mode_options(mode: str | None = None) -> dict[str, Any]:
+    """Return the optimization options each compile ``mode`` selects.
+
+    With ``mode`` set, returns that mode's option patch; with ``mode``
+    unset, returns the full mode-to-options mapping.  Unknown modes raise.
+    The patch feeds the same validation path as explicit backend options,
+    so options supplied by a caller override the mode patch per key.
+    """
+
+    try:
+        return dict(_MODE_OPTIONS[mode]) if mode else dict(_MODE_OPTIONS)
+    except KeyError as exc:
+        raise RuntimeError(
+            f"Unrecognized mode={mode}, should be one of: "
+            f"{', '.join(_MODE_OPTIONS)}"
+        ) from exc
+
+
 def stax(
     graph_module: GraphModule,
     example_inputs: list[Any],
@@ -4474,38 +4526,38 @@ def stax(
     executor as compiled performance.
     """
     del name, kwargs
-    if mode not in {None, "default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"}:
+    if mode not in (None, *_MODE_OPTIONS):
         raise RuntimeError(f"unknown Stax optimization mode: {mode!r}")
+    # A mode's option patch is applied first; explicit options overlay it
+    # per key (a mode selects defaults, an explicit option wins).
+    resolved = dict(_MODE_OPTIONS[mode or "default"])
     if options is not None:
         if not isinstance(options, dict):
             raise TypeError(f"options must be a dict, got {type(options)!r}")
-        unknown = set(options).difference(
-            {"stax.native", "stax.fusion", "stax.triton", "stax.cudagraphs"}
-        )
+        unknown = set(options).difference(_STAX_OPTIONS)
         if unknown:
             raise RuntimeError(
                 f"Unexpected Stax optimization option(s): {sorted(unknown)!r}"
             )
         if any(not isinstance(value, bool) for value in options.values()):
             raise RuntimeError("Stax optimization options must be bool values")
-    use_native = options is None or options.get("stax.native", True)
-    use_fusion = options is None or options.get("stax.fusion", True)
-    use_triton = options is None or options.get("stax.triton", True)
-    # Replay-through-CUDA-graph follows the mode contract: reduce-overhead
-    # and max-autotune enable it, the no-cudagraphs variant and the default
-    # mode leave the artifact untouched.  ``stax.cudagraphs`` overrides.
-    cudagraphs_requested = (
-        options.get("stax.cudagraphs") if options is not None else None
+        resolved.update(options)
+    use_native = resolved.get("stax.native", True)
+    use_fusion = resolved.get("stax.fusion", True)
+    use_triton = resolved.get("stax.triton", True)
+    max_autotune = resolved.get("stax.max_autotune", False)
+    coordinate_descent_tuning = resolved.get(
+        "stax.coordinate_descent_tuning", False
     )
-    if cudagraphs_requested is None:
-        cudagraphs_requested = mode in ("reduce-overhead", "max-autotune")
+    cudagraphs_requested = resolved.get("stax.cudagraphs", False)
     compiled = _lower_stax_region(
         graph_module,
         example_inputs,
-        mode=mode,
         use_native=use_native,
         use_fusion=use_fusion,
         use_triton=use_triton,
+        max_autotune=max_autotune,
+        coordinate_descent_tuning=coordinate_descent_tuning,
         dynamic=dynamic,
         strict_native=strict_native,
     )
@@ -4526,10 +4578,11 @@ def _lower_stax_region(
     graph_module: GraphModule,
     example_inputs: list[Any],
     *,
-    mode: str | None,
     use_native: bool,
     use_fusion: bool,
     use_triton: bool,
+    max_autotune: bool,
+    coordinate_descent_tuning: bool,
     dynamic: bool | None,
     strict_native: bool,
 ):
@@ -4596,7 +4649,8 @@ def _lower_stax_region(
             triton_graph = compile_triton_graph(
                 graph_module,
                 example_inputs,
-                mode=mode,
+                max_autotune=max_autotune,
+                coordinate_descent_tuning=coordinate_descent_tuning,
                 strict_native=strict_native,
             )
             if triton_graph is not None:

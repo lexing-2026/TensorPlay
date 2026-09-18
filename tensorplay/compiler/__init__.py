@@ -92,6 +92,7 @@ __all__ = [
     "is_exporting",
     "isinstance",
     "list_backends",
+    "list_mode_options",
     "lookup_backend",
     "NestedCompileRegionOptions",
     "nested_compile_region",
@@ -1259,4 +1260,8 @@ def __getattr__(name: str) -> Any:
         from tensorplay.compiler._core.registry import declares_capabilities
 
         return declares_capabilities
+    if name == "list_mode_options":
+        from tensorplay.compiler.backends.stax.backend import list_mode_options
+
+        return list_mode_options
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

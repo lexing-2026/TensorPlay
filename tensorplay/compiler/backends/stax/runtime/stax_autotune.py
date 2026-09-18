@@ -34,6 +34,16 @@ CANDIDATE_CONFIGS: Tuple[Tuple[int, int], ...] = (
     (2048, 4),
 )
 
+# Exhaustive tier selected by the max-autotune mode: the full
+# (XBLOCK, num_warps) cross product over the geometry points of the
+# baseline table, including the 8-warp columns of the two smallest XBLOCKs
+# the baseline omits.  Only reachable through explicit opt-in, so the extra
+# benchmarking cost is part of the mode's contract.
+EXHAUSTIVE_CANDIDATE_CONFIGS: Tuple[Tuple[int, int], ...] = tuple(
+    sorted({(xblock, warps) for xblock in (128, 256, 512, 1024, 2048)
+            for warps in (4, 8)})
+)
+
 # Salt folded into every persisted decision (pointwise ``decision_key`` and
 # the dims/split reduction keys in ``codegen.triton``).  ``program_digest``
 # hashes only the kernel program — it cannot see emitter or candidate-table
@@ -82,25 +92,48 @@ def _decision_cache():
     return default_cache("triton-autotune")
 
 
-def decision_key(digest: str, bucket: int, device: str) -> str:
+def decision_key(digest: str, bucket: int, device: str,
+                 tier: str = "table") -> str:
+    """Hashed decision key; ``tier`` separates the selection policies.
+
+    ``"table"`` is the baseline candidate benchmark, ``"exhaustive"`` the
+    widened max-autotune table and ``"coordesc"`` a winner refined by
+    coordinate descent.  Distinct tiers never read each other's decisions:
+    a config chosen under one policy is not necessarily valid input for
+    another policy's validation.
+    """
+
     h = hashlib.sha256(
-        f"{TUNING_VERSION}|{digest}|{bucket}|{device}".encode()
+        f"{TUNING_VERSION}|{tier}|{digest}|{bucket}|{device}".encode()
     )
     return h.hexdigest()[:24]
 
 
-def load_decision(digest: str, bucket: int,
-                  device: str) -> Optional[Tuple[int, int]]:
-    """Return ``(xblock, num_warps)`` previously chosen for this key."""
+def load_decision(digest: str, bucket: int, device: str, *,
+                  tier: str = "table",
+                  candidates: Optional[Sequence[Tuple[int, int]]] = None
+                  ) -> Optional[Tuple[int, int]]:
+    """Return ``(xblock, num_warps)`` previously chosen for this key.
 
-    payload = _decision_cache().load(decision_key(digest, bucket, device),
+    Table tiers only accept configs that are members of the table they were
+    selected from (the baseline or exhaustive set); the ``"coordesc"`` tier
+    accepts any structurally valid pair because descent may leave the
+    table.
+    """
+
+    payload = _decision_cache().load(decision_key(digest, bucket, device, tier),
                                      ext="json")
     if payload is None:
         return None
     try:
         record = json.loads(payload.decode())
         config = (int(record["xblock"]), int(record["warps"]))
-        if config not in CANDIDATE_CONFIGS:
+        if tier == "coordesc":
+            if config[0] >= 1 and config[1] >= 1:
+                return config
+            return None
+        table = CANDIDATE_CONFIGS if candidates is None else tuple(candidates)
+        if config not in table:
             return None
         return config
     except (ValueError, KeyError, TypeError):
@@ -108,9 +141,9 @@ def load_decision(digest: str, bucket: int,
 
 
 def store_decision(digest: str, bucket: int, device: str,
-                   config: Tuple[int, int]) -> None:
+                   config: Tuple[int, int], tier: str = "table") -> None:
     payload = json.dumps({"xblock": config[0], "warps": config[1]}).encode()
-    _decision_cache().store(decision_key(digest, bucket, device), payload,
+    _decision_cache().store(decision_key(digest, bucket, device, tier), payload,
                             ext="json")
 
 
@@ -220,12 +253,20 @@ def pick_config(
     build_launch: Callable[[Tuple[int, int]], Any],
     sample_args: list,
     *,
+    candidates: Optional[Sequence[Tuple[int, int]]] = None,
+    refiner: Optional[Callable[[Callable, Tuple[int, int], list],
+                               Tuple[Tuple[int, int], Any]]] = None,
+    tier: str = "table",
     bench_fn: Optional[Callable[[Any, list], float]] = None,
 ) -> Tuple[Tuple[int, int], Any]:
     """Benchmark candidates and return ``(config, launch_callable)``.
 
     ``build_launch(config)`` must compile and return a launch callable for a
     fixed-config kernel; it may raise, which disqualifies that candidate.
+    ``candidates`` replaces the baseline table (the exhaustive tier passes
+    the widened set); ``refiner`` optionally refines the benchmark winner
+    and returns the final ``(config, launch)`` pair.  ``tier`` selects the
+    decision-cache namespace so policies never read each other's records.
     A cached decision short-circuits benchmarking entirely (only one compile
     runs).  ``bench_fn`` is injectable for tests.
     """
@@ -233,17 +274,22 @@ def pick_config(
     if bench_fn is None:
         bench_fn = bench_launch
     bucket = xnumel_bucket(xnumel)
+    table = CANDIDATE_CONFIGS if candidates is None else tuple(candidates)
 
-    cached = load_decision(digest, bucket, device_key)
+    cached = load_decision(digest, bucket, device_key,
+                           tier=tier, candidates=table)
     if cached is not None:
         return cached, build_launch(cached)
 
     best_config, best_launch, _ = bench_candidates(
-        build_launch, CANDIDATE_CONFIGS, sample_args, bench_fn=bench_fn
+        build_launch, table, sample_args, bench_fn=bench_fn
     )
     if best_config is None:
         raise RuntimeError(
             "stax autotune: all candidate configs failed to compile or run"
         )
-    store_decision(digest, bucket, device_key, best_config)
+    if refiner is not None:
+        best_config, best_launch = refiner(build_launch, best_config,
+                                           sample_args)
+    store_decision(digest, bucket, device_key, best_config, tier=tier)
     return best_config, best_launch

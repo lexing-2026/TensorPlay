@@ -532,3 +532,181 @@ def test_dims_autotune_rblock_record_roundtrip(cache_root, monkeypatch):
     )
     assert built == [quad]
     assert cached.config == quad
+
+
+# --- max-autotune mode plumbing: exhaustive tier + coordinate descent --------
+
+from tensorplay.compiler.backends.stax.runtime import coordinate_descent as cd
+from tensorplay.compiler.backends.stax.runtime.stax_autotune import (
+    EXHAUSTIVE_CANDIDATE_CONFIGS,
+)
+
+
+def test_exhaustive_candidates_extend_baseline():
+    assert set(CANDIDATE_CONFIGS) <= set(EXHAUSTIVE_CANDIDATE_CONFIGS)
+    # the widened tier completes the (XBLOCK, warps) cross product the
+    # baseline omits
+    assert (128, 8) in EXHAUSTIVE_CANDIDATE_CONFIGS
+    assert (256, 8) in EXHAUSTIVE_CANDIDATE_CONFIGS
+    assert len(EXHAUSTIVE_CANDIDATE_CONFIGS) == 10
+
+
+def test_decision_tiers_are_isolated(cache_root):
+    digest = sa.program_digest([1, 0, 2], [1.0], (4,))
+    sa.store_decision(digest, 256, "cuda:0", (1024, 8))
+    sa.store_decision(digest, 256, "cuda:0", (96, 8), tier="coordesc")
+    assert sa.load_decision(digest, 256, "cuda:0") == (1024, 8)
+    # the descent tier accepts configs off the curated table
+    assert sa.load_decision(digest, 256, "cuda:0", tier="coordesc") == (96, 8)
+    # table tiers never read the descent record
+    assert sa.load_decision(digest, 256, "cuda:0", tier="exhaustive") is None
+
+
+def test_pick_config_exhaustive_tier_persists_and_replays(cache_root):
+    digest = sa.program_digest([1], [], (0,))
+    builds: list[tuple[int, int]] = []
+
+    def build(config):
+        builds.append(config)
+        return SimpleNamespace(config=config)
+
+    timings = {c: (0.1 if c == (128, 8) else 1.0) for c in
+               EXHAUSTIVE_CANDIDATE_CONFIGS}
+    config, launch = sa.pick_config(
+        digest, 256, "cuda:0", build, [],
+        candidates=EXHAUSTIVE_CANDIDATE_CONFIGS,
+        tier="exhaustive",
+        bench_fn=lambda launch, args: timings[launch.config],
+    )
+    assert config == (128, 8)
+
+    # a same-tier reload hits the decision cache and never benchmarks
+    builds.clear()
+    config2, _ = sa.pick_config(
+        digest, 256, "cuda:0", build, [],
+        candidates=EXHAUSTIVE_CANDIDATE_CONFIGS,
+        tier="exhaustive",
+        bench_fn=lambda launch, args: pytest.fail("must not bench"),
+    )
+    assert config2 == (128, 8)
+    assert builds == [(128, 8)]
+
+
+def test_pick_config_applies_refiner(cache_root):
+    digest = sa.program_digest([2], [], (0,))
+    timings = {c: 1.0 for c in CANDIDATE_CONFIGS}
+
+    def refiner(build, config, args):
+        return (64, 2), SimpleNamespace(config=(64, 2))
+
+    def build(config):
+        return SimpleNamespace(config=config)
+
+    config, launch = sa.pick_config(
+        digest, 256, "cuda:0", build, [],
+        refiner=refiner,
+        tier="coordesc",
+        bench_fn=lambda launch, args: timings[launch.config],
+    )
+    assert config == (64, 2)
+    assert sa.load_decision(digest, 256, "cuda:0", tier="coordesc") == (64, 2)
+
+
+def test_coordinate_descent_walks_to_better_neighbour():
+    cost = {(128, 4): 1.0, (256, 4): 0.5, (256, 8): 0.6, (128, 8): 0.9,
+            (64, 4): 1.2, (128, 2): 1.1}
+    tuner = cd.CoordinateDescentTuner(
+        cd.POINTWISE_FIELDS, bench_fn=lambda launch, args: cost[launch]
+    )
+    config, launch = tuner.refine(lambda c: c, (128, 4), [])
+    assert config == (256, 4)
+    assert launch == (256, 4)
+
+
+def test_coordinate_descent_chains_across_fields():
+    # (128, 4) -> (256, 4) through XBLOCK, then (256, 8) through warps: the
+    # walk must pick the chain up without a restart
+    cost = {(128, 4): 1.0, (256, 4): 0.5, (256, 8): 0.4, (512, 8): 0.9,
+            (512, 4): 0.8, (128, 8): 0.9, (64, 4): 1.2, (128, 2): 1.1,
+            (256, 2): 0.7}
+    tuner = cd.CoordinateDescentTuner(
+        cd.POINTWISE_FIELDS, bench_fn=lambda launch, args: cost[launch]
+    )
+    config, _ = tuner.refine(lambda c: c, (128, 4), [])
+    assert config == (256, 8)
+
+
+def test_coordinate_descent_disqualifies_unbuildable():
+    def build(config):
+        if config[0] > 256:
+            raise RuntimeError("tile too large")
+        return config
+
+    cost = {(128, 4): 1.0, (256, 4): 0.5, (256, 8): 0.4, (128, 8): 0.9,
+            (64, 4): 1.2, (128, 2): 1.1, (256, 2): 0.7}
+    tuner = cd.CoordinateDescentTuner(
+        cd.POINTWISE_FIELDS, bench_fn=lambda launch, args: cost[launch]
+    )
+    config, _ = tuner.refine(build, (128, 4), [])
+    # every config above XBLOCK 256 benches as disqualified, so the walk
+    # settles on the best buildable one
+    assert config == (256, 8)
+
+
+def test_coordinate_descent_bounds_and_radius():
+    warps = cd.TunableField(1, "pow2", hi=32)
+    tuner = cd.CoordinateDescentTuner((warps,))
+    assert tuner._neighbour_values(warps, 32) == [16]
+    assert tuner._neighbour_values(warps, 4) == [8, 2]
+
+    stages = cd.TunableField(0, "stages", hi=4)
+    tuner = cd.CoordinateDescentTuner((stages,))
+    assert tuner._neighbour_values(stages, 4) == [3]
+    assert tuner._neighbour_values(stages, 1) == [2]
+
+    wide = cd.CoordinateDescentTuner((cd.TunableField(0, "pow2"),), radius=2)
+    assert wide._neighbour_values(cd.TunableField(0, "pow2"), 128) == [
+        256, 512, 64, 32
+    ]
+
+    with pytest.raises(ValueError):
+        cd.CoordinateDescentTuner(cd.POINTWISE_FIELDS, radius=0)
+
+
+def test_coordinate_descent_all_directions_sweep():
+    # a diagonal-only basin: no single-field neighbour improves, only the
+    # simultaneous (XBLOCK, warps) step does
+    cost = {(128, 4): 1.0, (256, 8): 0.5}
+
+    def bench(launch, args):
+        try:
+            return cost[launch]
+        except KeyError:
+            raise RuntimeError("unbuildable")
+
+    stalled = cd.CoordinateDescentTuner(cd.POINTWISE_FIELDS, bench_fn=bench)
+    config, _ = stalled.refine(lambda c: c, (128, 4), [])
+    assert config == (128, 4)
+
+    swept = cd.CoordinateDescentTuner(
+        cd.POINTWISE_FIELDS, check_all_directions=True, bench_fn=bench
+    )
+    config, _ = swept.refine(lambda c: c, (128, 4), [])
+    assert config == (256, 8)
+
+
+def test_refiner_for_matches_pick_config_protocol(cache_root):
+    digest = sa.program_digest([9], [], (0,))
+    cost = {(128, 4): 1.0, (256, 4): 0.5, (256, 8): 0.4, (128, 8): 0.9,
+            (64, 4): 1.2, (128, 2): 1.1, (256, 2): 0.7, (512, 4): 0.8,
+            (512, 8): 0.9, (1024, 4): 1.0, (1024, 8): 1.0, (2048, 4): 1.0,
+            (2048, 8): 1.0}
+    config, launch = sa.pick_config(
+        digest, 256, "cuda:0", lambda c: c, [],
+        refiner=cd.refiner_for(
+            cd.POINTWISE_FIELDS, bench_fn=lambda launch, args: cost[launch]
+        ),
+        tier="coordesc",
+        bench_fn=lambda launch, args: cost[launch],
+    )
+    assert config == (256, 8)
