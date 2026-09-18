@@ -105,6 +105,9 @@ Tensor _coalesce_cpu(const Tensor& self) {
 
 TENSORPLAY_LIBRARY_IMPL(CPU, MetaViewOps) {
     m.impl("item", item_cpu);
+}
+
+TENSORPLAY_LIBRARY_IMPL(Sparse, MetaViewSparseOps) {
     m.impl("coalesce", coalesce_cpu);
     m.impl("_coalesce", _coalesce_cpu);
 }

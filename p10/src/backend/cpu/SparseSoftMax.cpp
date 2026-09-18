@@ -466,7 +466,7 @@ Tensor _sparse_log_softmax_backward_data_cpu(const Tensor& grad,
 }  // namespace cpu
 }  // namespace tensorplay
 
-TENSORPLAY_LIBRARY_IMPL(CPU, SparseSoftMax) {
+TENSORPLAY_LIBRARY_IMPL(Sparse, SparseSoftMax) {
     using namespace tensorplay::cpu;
     m.impl("_sparse_softmax", _sparse_softmax_cpu);
     m.impl("_sparse_softmax.int", _sparse_softmax_int_cpu);
