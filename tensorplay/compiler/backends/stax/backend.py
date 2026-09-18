@@ -4557,24 +4557,17 @@ def _lower_stax_region(
             is_cuda = first.device.is_cuda()
         except (AttributeError, IndexError):
             is_cuda = False
-        if is_cuda and use_fusion:
-            # A region whose reductions sit in the middle keeps its row
-            # resident across every stage; splitting it at each reduction
-            # would stream the input once per stage instead.
-            row_fused_cuda = _lower_cuda_row_fusion(
-                graph_module,
-                example_inputs,
-                strict_native=strict_native,
-                dynamic=bool(dynamic is True),
-            )
-            if row_fused_cuda is not None:
-                graph_module._stax_codegen = "stax-fused-cuda-rowfuse"
-                return row_fused_cuda
         if is_cuda:
             from .codegen.triton import (
                 compile_graph_module as compile_triton_graph,
             )
 
+            # The per-segment emitter is the source of fusion truth for the
+            # shapes it accepts: one trailing reduction per segment plus a
+            # store-time epilogue.  The row-staged kernel answers only for
+            # what that form cannot express -- a reduction whose result
+            # feeds elementwise work feeding another reduction (softmax,
+            # normalization) -- so it claims the region last.
             triton_graph = compile_triton_graph(
                 graph_module,
                 example_inputs,
@@ -4584,6 +4577,16 @@ def _lower_stax_region(
             if triton_graph is not None:
                 graph_module._stax_codegen = "triton"
                 return triton_graph
+            if use_fusion:
+                row_fused_cuda = _lower_cuda_row_fusion(
+                    graph_module,
+                    example_inputs,
+                    strict_native=strict_native,
+                    dynamic=bool(dynamic is True),
+                )
+                if row_fused_cuda is not None:
+                    graph_module._stax_codegen = "stax-fused-cuda-rowfuse"
+                    return row_fused_cuda
     if use_native and getattr(graph_module.root, "training", False):
         aot_graph = _lower_aot_native(graph_module, example_inputs)
         if aot_graph is not None:
