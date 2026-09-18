@@ -239,7 +239,7 @@ from ._C import (tensor, DType, Size, Scalar, SymInt, SymBool, SymFloat,
                 set_num_threads, get_num_threads, get_thread_num,
                 in_parallel_region, get_parallel_info)
 from .autograd import (no_grad, enable_grad, set_grad_enabled, is_grad_enabled,
-                       inference_mode)
+                       inference_mode, is_inference_mode_enabled)
 
 if hasattr(_C, "get_num_interop_threads"):
     from ._C import get_num_interop_threads, set_num_interop_threads
@@ -300,6 +300,11 @@ undefined = DType.undefined
 qint8 = DType.qint8
 quint8 = DType.quint8
 qint32 = DType.qint32
+float8_e4m3fn = DType.float8_e4m3fn
+float8_e4m3fnuz = DType.float8_e4m3fnuz
+float8_e5m2 = DType.float8_e5m2
+float8_e5m2fnuz = DType.float8_e5m2fnuz
+float8_e8m0fnu = DType.float8_e8m0fnu
 
 half = DType.float16
 float = DType.float32
@@ -391,6 +396,7 @@ __all__ = [
     "half", "float", "double", "short", "int", "long", "cfloat", "cdouble", "chalf",
     "save", "load", "inspect_checkpoint", "as_tensor",
     "no_grad", "enable_grad", "set_grad_enabled", "is_grad_enabled",
+    "is_inference_mode_enabled",
     "allclose", "index",
     "compile", "compiler", "graph", "library",
     "set_num_threads", "get_num_threads", "get_thread_num",
@@ -539,6 +545,7 @@ if not TYPE_CHECKING:
 
 
 from .functional import *
+from .functional import _assert_async
 
 
 def unique(input, sorted=True, return_inverse=False, return_counts=False):

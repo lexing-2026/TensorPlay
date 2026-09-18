@@ -11012,6 +11012,13 @@ def is_quantized(input):
             return _captured
     return _C.is_quantized(input)
 
+def is_nested(input):
+    if _capturing():
+        _captured = _capture_call(is_nested, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.is_nested(input)
+
 def qscheme(input):
     if _capturing():
         _captured = _capture_call(qscheme, (input,), {})
