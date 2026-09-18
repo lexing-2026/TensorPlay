@@ -1735,8 +1735,7 @@ def _autotune_dims_program(
 ):
     """Benchmark ``_DIM_REDUCTION_CANDIDATES`` once; persist the decision.
 
-    Uses the CachingAutotuner flow for the axis-reduction kernel family:
-    the decision cache key covers program content, reduction spec, shape
+    The decision cache key covers program content, reduction spec, shape
     buckets and device, so a hit skips both benchmarking and recompiles.
     """
 
@@ -1935,9 +1934,9 @@ def _autotune_launch(
 ):
     """Compile a program, autotuning the launch config when possible (M2).
 
-    Uses the CachingAutotuner flow: benchmark candidate configs once at
-    compile time and emit a fixed-config kernel; persist the decision so
-    later processes skip benchmarking.  Any failure falls back to a static
+    Benchmark candidate configs once at compile time and emit a
+    fixed-config kernel; persist the decision so later processes skip
+    benchmarking.  Any failure falls back to a static
     pinned config for reductions (the split workspace is baked per config)
     or the plain ``@triton.autotune`` emission for pointwise programs.
     """
@@ -2169,10 +2168,13 @@ class _ExternSource:
 
     Frozen because the wiring keys a lookup table by it: an extern segment
     resolves each operand by matching the source it was planned against.
+    ``port`` selects one output buffer of the producing kernel (0 = main
+    export; horizontal fusion assigns further ports to extra stores).
     """
 
     kind: str  # "arg" (graph placeholder position) | "seg" (segment index)
     index: int
+    port: int = 0
 
 
 @dataclass
@@ -2201,7 +2203,7 @@ def _extern_segment_plan(
     sample_dtype: Any,
     sample_device: Any,
     placeholder_positions: dict,
-    node_to_seg: dict,
+    export_ports: dict,
 ) -> _ExternPlan | None:
     """Build the eager executor for one extern segment; None when unsupported."""
 
@@ -2226,17 +2228,23 @@ def _extern_segment_plan(
         # Downstream fused kernels assume one dtype per region.
         return None
     key_positions = {
-        (_ExternSource(source.kind, source.index)): position
-        for position, source in enumerate(sources)
+        source: position for position, source in enumerate(sources)
     }
+    unplanned = object()
 
     def resolve(feed: list, value: Any) -> Any:
         if isinstance(value, Node):
             if value.op == "placeholder":
                 key = _ExternSource("arg", placeholder_positions[value.name])
             else:
-                key = _ExternSource("seg", node_to_seg[value])
-            return feed[key_positions[key]]
+                located = export_ports.get(value)
+                if located is None:
+                    return unplanned
+                key = _ExternSource("seg", located[0], located[1])
+            position = key_positions.get(key)
+            if position is None:
+                return unplanned
+            return feed[position]
         return value
 
     def launch(feed: list) -> Any:
@@ -2244,6 +2252,10 @@ def _extern_segment_plan(
         kwargs = {
             name: resolve(feed, value) for name, value in node.kwargs.items()
         }
+        if any(value is unplanned for value in args) or any(
+            value is unplanned for value in kwargs.values()
+        ):
+            raise RuntimeError("extern segment resolved an unplanned operand")
         if node.op == "call_function":
             return node.target(*args, **kwargs)
         owner, rest = args[0], args[1:]
@@ -2273,6 +2285,9 @@ class _SegmentPlan:
     constants: list[float] | None = None
     instructions: list[tuple[str, int, int, int]] | None = None
     output_ref: int = 0
+    #: every kernel output ref — the main export plus horizontal-fusion
+    #: extra stores; the launch returns one buffer per ref
+    output_refs: tuple = ()
     #: example inputs feeding this segment (launch specialization shape)
     examples: tuple = ()
     #: True when some segment input broadcasts against the local reference —
@@ -2321,12 +2336,14 @@ def _reduction_tangent_plan(
 
 
 def _extract_segment_view(
-    graph: Graph, nodes, export_node: Node
+    graph: Graph, nodes, export_node: Node, extra_exports: tuple = ()
 ):
     """Clone ``nodes`` into a standalone Graph with placeholder externals.
 
     Returns ``(view, mapping)`` where ``view.graph`` feeds the program
     builder and ``mapping`` translates original nodes to their clones.
+    ``extra_exports`` names further nodes (clones of ``nodes``) stored
+    alongside ``export_node`` — horizontal fusion's extra kernel outputs.
     """
 
     sub = Graph()
@@ -2357,7 +2374,15 @@ def _extract_segment_view(
     export_new = mapping.get(export_node)
     if export_new is None:
         export_new = externals[export_node]
-    sub.output(export_new)
+    # Multi-value output node: one output carrying the main export plus the
+    # extra horizontal-fusion stores (Graph.output holds a single result).
+    sub.create_node(
+        "output",
+        "output",
+        (export_new, *(mapping[node] for node in extra_exports)),
+        {},
+        "output",
+    )
     return SimpleNamespace(graph=sub), mapping, externals
 
 
@@ -2425,6 +2450,11 @@ def compile_graph_module(
         for value in example_inputs
     )
     any_grad = any(value.requires_grad for value in example_inputs)
+    if any_grad and any(len(seg.exports) > 1 for seg in segments):
+        # Horizontal fusion kernels carry extra stores; the local-VJP
+        # training sweep routes gradients through the single export only.
+        _dbg('fallback gate #5d')
+        return None
     if any_grad:
         # Training lowers through per-segment local VJPs.  Pointwise
         # segments take elementwise VJPs; sum/mean reduction segments take
@@ -2481,8 +2511,8 @@ def compile_graph_module(
                 user for user in node.users if user not in inside
             ]
             is_final = node is final_value
-            if (outside_users or is_final) and node is not seg.export_node:
-                # interior skip connections need multi-output segments (v2)
+            if (outside_users or is_final) and node not in seg.exports:
+                # a consumed interior value the producer cannot store
                 _dbg('fallback gate #8')
                 return None
             deps = set(_nodes(node.args)) | set(
@@ -2496,19 +2526,20 @@ def compile_graph_module(
                     if position is None:
                         _dbg('fallback gate #9')
                         return None
-                    key = ("arg", position)
+                    key = ("arg", position, 0)
                 else:
                     producer_seg = node_to_seg.get(dep)
                     if producer_seg is None or producer_seg >= seg_index:
                         _dbg('fallback gate #10')
                         return None
-                    if dep is not segments[producer_seg].export_node:
+                    producer_exports = segments[producer_seg].exports
+                    if dep not in producer_exports:
                         _dbg('fallback gate #11')
                         return None
-                    key = ("seg", producer_seg)
+                    key = ("seg", producer_seg, producer_exports.index(dep))
                 if key not in seen:
                     seen.add(key)
-                    sources.append(_ExternSource(key[0], key[1]))
+                    sources.append(_ExternSource(key[0], key[1], key[2]))
         return tuple(sources)
 
     segment_plans: list[_SegmentPlan] = []
@@ -2520,6 +2551,15 @@ def compile_graph_module(
         node.name: position
         for position, node in enumerate(graph_module.graph.placeholders)
     }
+    export_ports = {
+        node: (seg_index, port)
+        for seg_index, seg in enumerate(segments)
+        for port, node in enumerate(seg.exports)
+    }
+    #: extern segments have no scheduler-side shape; their eager plan
+    #: records the output shape when it is built (segment order guarantees
+    #: it exists before any later consumer asks).
+    extern_shapes: dict[int, tuple] = {}
     for seg_index, seg in enumerate(segments):
         sources = _extern_sources(seg_index, seg)
         if sources is None:
@@ -2534,16 +2574,18 @@ def compile_graph_module(
                 sample_dtype,
                 sample_device,
                 placeholder_positions_all,
-                node_to_seg,
+                export_ports,
             )
             if extern_plan is None:
                 scheduler_annotate(graph_module, segments)
                 _dbg('fallback gate #12b')
                 return None
+            extern_shapes[seg_index] = extern_plan.output_shape
             segment_plans.append(extern_plan)
             continue
+        extra_exports = tuple(seg.exports[1:])
         sub_view, mapping, externals = _extract_segment_view(
-            graph_module.graph, seg.nodes, seg.tail
+            graph_module.graph, seg.nodes, seg.tail, extra_exports
         )
         reduction = None
         reduction_mode_local = None
@@ -2574,13 +2616,27 @@ def compile_graph_module(
                 allow_empty=True,
             )
         else:
-            pointwise = _build_pointwise_program(sub_view)
+            pointwise = _build_pointwise_program(
+                sub_view,
+                extra_outputs=(
+                    [mapping[node] for node in extra_exports]
+                    if extra_exports
+                    else None
+                ),
+            )
         if pointwise is None:
             _dbg('fallback gate #15')
             return None
-        placeholders_s, forward_program, forward_constants, instructions, output_ref = (
-            pointwise
-        )
+        if seg.kind == "pw+red" or not extra_exports:
+            placeholders_s, forward_program, forward_constants, instructions, output_ref = (
+                pointwise
+            )
+            extra_refs: tuple[int, ...] = ()
+        else:
+            placeholders_s, forward_program, forward_constants, instructions, output_ref, extra_refs = (
+                pointwise
+            )
+        output_refs = (output_ref, *extra_refs)
         # M5e: red→pw store epilogue — the post-reduction pointwise chain
         # runs on the accumulator registers inside the same kernel.
         epilogue_payload = None
@@ -2626,7 +2682,7 @@ def compile_graph_module(
                         reference_shape
                     )
                 elif producer_seg.kind == "extern":
-                    shape = producer_seg.output_shape
+                    shape = extern_shapes[source.index]
                 else:
                     shape = reference_shape
                 seg_examples.append(
@@ -2659,7 +2715,7 @@ def compile_graph_module(
             f"fwd{seg_index}",
             forward_program,
             forward_constants,
-            (output_ref,),
+            output_refs,
             seg_examples,
             reduction=reduction,
             reduction_mode=reduction_mode_local,
@@ -2680,6 +2736,7 @@ def compile_graph_module(
                 constants=list(forward_constants),
                 instructions=list(instructions),
                 output_ref=output_ref,
+                output_refs=output_refs,
                 examples=tuple(seg_examples),
                 needs_broadcast=bool(local_needs_broadcast),
                 tangent_plan=(
@@ -2693,6 +2750,23 @@ def compile_graph_module(
     placeholders = graph_module.graph.placeholders
     backward_launch = None
     autograd_function: Any | None = None
+
+    def _run_segment(plan, feed):
+        """Run one segment; normalize the launch result to an export tuple."""
+
+        values = plan.launch(feed)
+        if isinstance(values, list):
+            return tuple(values)
+        return (values,)
+
+    # The graph output is one of the last kernel's exports (the scheduler
+    # promotes an interior final value to an extra store).
+    last_exports = segments[-1].exports
+    if final_value not in last_exports:
+        scheduler_annotate(graph_module, segments)
+        _dbg('fallback gate #22')
+        return None
+    final_port = last_exports.index(final_value)
     if any(value.requires_grad for value in example_inputs):
         if len(segment_plans) == 1:
             plan = segment_plans[0]
@@ -2766,20 +2840,23 @@ def compile_graph_module(
         class _StaxTritonAutograd(Function):
             @staticmethod
             def forward(ctx: Any, *forward_inputs: Any) -> Any:
-                intermediates = {}
+                intermediates: dict[int, tuple] = {}
                 feed_all = []
                 for index, plan in enumerate(segment_plans):
                     feed = [
                         forward_inputs[source.index]
                         if source.kind == "arg"
-                        else intermediates[source.index]
+                        else intermediates[source.index][source.port]
                         for source in plan.extern_sources
                     ]
-                    intermediates[index] = plan.launch(feed)
+                    intermediates[index] = _run_segment(plan, feed)
                     feed_all.append(feed)
                 ctx.stax_feed_all = feed_all
-                ctx.save_for_backward(*forward_inputs, *intermediates.values())
-                return intermediates[len(segment_plans) - 1]
+                ctx.save_for_backward(
+                    *forward_inputs,
+                    *(value for values in intermediates.values() for value in values),
+                )
+                return intermediates[len(segment_plans) - 1][final_port]
 
             @staticmethod
             def backward(ctx: Any, *grad_outputs: Any) -> tuple[Any, ...]:
@@ -2867,16 +2944,16 @@ def compile_graph_module(
             value.requires_grad for value in inputs
         ):
             return autograd_function.apply(*inputs)
-        intermediates: dict[int, Any] = {}
+        intermediates: dict[int, tuple] = {}
         for index, plan in enumerate(segment_plans):
             feed = [
                 inputs[source.index]
                 if source.kind == "arg"
-                else intermediates[source.index]
+                else intermediates[source.index][source.port]
                 for source in plan.extern_sources
             ]
-            intermediates[index] = plan.launch(feed)
-        return intermediates[len(segment_plans) - 1]
+            intermediates[index] = _run_segment(plan, feed)
+        return intermediates[len(segment_plans) - 1][final_port]
 
     compiled._tensorplay_codegen = "triton"  # type: ignore[attr-defined]
     compiled._tensorplay_backward_codegen = (  # type: ignore[attr-defined]

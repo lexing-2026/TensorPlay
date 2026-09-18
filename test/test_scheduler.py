@@ -117,8 +117,9 @@ def test_mixed_graph_interleaves_fused_and_eager():
     assert describe(segs) == "extern -> pw"
 
 
-def test_interior_value_across_barrier_falls_back():
-    """A value interior to one kernel cannot feed a later segment (v1)."""
+def test_interior_value_across_barrier_gains_extra_export():
+    """M5g horizontal fusion: a later segment reading an interior value
+    makes the producer store it as an extra export, not a fallback."""
 
     x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
 
@@ -126,6 +127,46 @@ def test_interior_value_across_barrier_falls_back():
         g = (t * 2.0).relu()  # interior: consumed by h and by the output
         h = g * 3.0
         return t.softmax(dim=1) * h * g
+
+    _, segs = _segments(fn, x)
+    assert segs is not None and describe(segs) == "pw -> extern -> pw"
+    assert segs[0].export_node is segs[0].nodes[-1]  # h, the main export
+    assert segs[0].exports == (segs[0].nodes[-1], segs[0].nodes[1])  # + g
+    assert len(segs[2].exports) == 1
+
+
+def test_independent_chains_share_one_kernel():
+    """Two sibling pointwise chains coalesce into one multi-export kernel."""
+
+    x = tp.tensor([1.0, 2.0])
+    _, segs = _segments(lambda t: (t * 2.0) + (t * 3.0).sigmoid(), x)
+    assert segs is not None and len(segs) == 1
+    assert segs[0].kind == "pw"
+    assert len(segs[0].exports) == 1  # only the final add crosses out
+
+
+def test_final_value_interior_to_last_kernel_is_promoted():
+    x = tp.tensor([1.0, 2.0])
+
+    def fn(t):
+        a = t * 2.0
+        b = t * 3.0
+        return a  # b stays in the same run; a becomes an extra store
+
+    _, segs = _segments(fn, x)
+    assert segs is not None and len(segs) == 1
+    assert segs[0].export_node is segs[0].nodes[-1]  # b
+    assert segs[0].exports[-1] is segs[0].nodes[0]  # a, the graph output
+
+
+def test_reduction_interior_across_segments_still_falls_back():
+    """Pre-reduction values do not survive the accumulator: no extra store."""
+
+    x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+    def fn(t):
+        p = (t * 2.0).relu()  # interior of the pw+red kernel
+        return p.sum() * p.mean()
 
     _, segs = _segments(fn, x)
     assert segs is None
