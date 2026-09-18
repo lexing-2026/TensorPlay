@@ -179,7 +179,12 @@ class CodeCache:
         options: Optional[Dict[str, Any]] = None,
         ext: str = "bin",
     ) -> Tuple[bytes, str]:
-        """Return ``(artifact, path)``, compiling through ``compile_fn`` on miss."""
+        """Return ``(artifact, path)``, compiling through ``compile_fn`` on miss.
+
+        The compile itself runs under the per-key advisory lock with a
+        re-check inside, so concurrent processes racing on one miss produce
+        the artifact once instead of duplicating the toolchain run.
+        """
 
         key = self.cache_key(source, entry, options)
         if self._caches_disabled():
@@ -187,9 +192,12 @@ class CodeCache:
         cached = self.load(key, ext)
         if cached is not None:
             return cached, self.path_for(key, ext)
-        artifact = compile_fn(source)
-        self.store(key, artifact, ext)
-        return artifact, self.path_for(key, ext)
+        with file_lock(self._path_for(key, "lock", create=True)):
+            cached = self.load(key, ext)
+            if cached is None:
+                cached = compile_fn(source)
+                self.store(key, cached, ext)
+        return cached, self.path_for(key, ext)
 
     # -- process-level memo ---------------------------------------------------
 
