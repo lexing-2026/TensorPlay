@@ -31,7 +31,7 @@ class CudaGraphError(RuntimeError):
 
 def _default_native() -> Any:
     try:
-        from .. import _C  # type: ignore
+        from ... import _C  # type: ignore
     except Exception as exc:  # pragma: no cover - import failure diagnostics
         raise NotImplementedError(
             "CUDA graph support requires tensorplay._C; import failed: "
@@ -126,7 +126,7 @@ def _pin_launch_stream_to_capture():
     fastlaunch = None
     previous = None
     try:
-        from .runtime import fastlaunch
+        from .stax.runtime import fastlaunch
 
         previous = fastlaunch.set_capture_stream(handle)
     except Exception:  # noqa: BLE001 - launcher layer optional
@@ -383,7 +383,7 @@ def _mutated_argument(node: Any) -> Any:
 def find_input_mutations(gm: Any) -> set[int]:
     """Placeholder indices whose storage an in-place node writes."""
 
-    from ..graph import Node
+    from ...graph import Node
 
     storages: dict[Any, set[int]] = {}
     mutated: set[int] = set()
@@ -427,7 +427,7 @@ def check_multiple_devices_or_any_cpu_nodes(mapping: dict[str, Any]) -> str | No
 
 
 def get_first_incompatible_cudagraph_node(gm: Any) -> Any:
-    from ..graph import Node
+    from ...graph import Node
 
     for node in gm.graph.nodes:
         if node.op not in ("call_function", "call_method"):

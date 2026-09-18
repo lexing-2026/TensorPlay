@@ -37,7 +37,7 @@ from typing import Any, Callable, Optional, Sequence
 
 from tensorplay.graph import GraphModule
 
-from .codecache import default_cache
+from ..backends.stax.codecache import default_cache
 
 # Bump when capture recording, the pass pipeline, or this serialization
 # format changes such that a stored graph is no longer faithful.

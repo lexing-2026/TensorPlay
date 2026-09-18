@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .registry import BackendCapabilities, register_backend
+from .._core.registry import BackendCapabilities, register_backend
 
 
 def register() -> None:

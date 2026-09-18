@@ -11,6 +11,10 @@ generating code.  All are registered with the ``debug`` tag, so
   graphs).
 * ``eager_debug`` — run node by node through the graph interpreter, so an
   error names the failing node and its original source location.
+* ``aot_eager`` / ``aot_eager_default_partitioner`` — ahead-of-time autograd
+  with pass-through compilers: forward and backward graphs are traced and
+  partitioned (min-cut / default partitioner) and then run as traced, which
+  isolates autograd tracing and partitioning problems from code generation.
 * ``*_TESTING_ONLY`` — inject compile-time, run-time and accuracy failures on
   ``relu`` for exercising error reporting and minimization tooling.
 """
@@ -21,8 +25,8 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-from ..graph import GraphModule
-from .registry import register_debug_backend as register_backend
+from ...graph import GraphModule
+from .._core.registry import register_debug_backend as register_backend
 
 log = logging.getLogger(__name__)
 
@@ -61,12 +65,107 @@ def eager_debug(
     if kwargs:
         log.warning("eager_debug backend ignoring extra kwargs %s", kwargs)
 
-    from ..graph.interpreter import Interpreter
+    from ...graph.interpreter import Interpreter
 
     def inner(*args: Any, **call_kwargs: Any) -> Any:
         return Interpreter(gm).run(*args, **call_kwargs)
 
     return inner
+
+
+def make_eager_backend_with_function_mode(mode: Any) -> Callable[..., Any]:
+    return make_eager_backend_with_function_modes([mode])
+
+
+def make_eager_backend_with_function_modes(modes: Any) -> Callable[..., Any]:
+    """Eager backend that runs the graph under the given function modes.
+
+    The modes are entered around each call instead of being traced, for
+    regions whose modes must observe the executed operators.
+    """
+
+    from contextlib import ExitStack
+
+    modes = list(modes)
+
+    def fn(gm: GraphModule, example_inputs: list[Any], **kwargs: Any) -> Callable[..., Any]:
+        def wrapper(*args: Any, **call_kwargs: Any) -> Any:
+            with ExitStack() as stack:
+                for mode in modes:
+                    stack.enter_context(mode)
+                return gm.forward(*args, **call_kwargs)
+
+        return wrapper
+
+    return fn
+
+
+# --------------------------------------------------------------------------
+# Ahead-of-time autograd with pass-through compilers
+# --------------------------------------------------------------------------
+
+
+def boxed_nop(fx_g: GraphModule, example_inputs: list[Any]) -> Callable[..., Any]:
+    """Run a traced graph as is, taking its inputs as one list it may clear."""
+
+    from ...graph.graph import _BoxedCodeGen
+
+    fx_g.graph.set_codegen(_BoxedCodeGen())
+    fx_g.recompile()
+    forward_fn = fx_g.forward
+
+    def run(args: Any) -> Any:
+        return forward_fn(args)
+
+    run._boxed_call = True  # type: ignore[attr-defined]
+    return run
+
+
+def boxed_nop_with_mode(fx_g: GraphModule, example_inputs: list[Any], *, mode: Any) -> Callable[..., Any]:
+    run_graph = boxed_nop(fx_g, example_inputs)
+
+    def run(args: Any) -> Any:
+        with mode:
+            return run_graph(args)
+
+    run._boxed_call = True  # type: ignore[attr-defined]
+    return run
+
+
+def aot_eager(
+    gm: GraphModule,
+    example_inputs: list[Any],
+    fw_compiler: Callable[..., Any] | None = None,
+    bw_compiler: Callable[..., Any] | None = None,
+    **kwargs: Any,
+) -> Callable[..., Any]:
+    from .._core.aot_autograd import min_cut_rematerialization_partition
+    from .._core.common import aot_autograd
+
+    return aot_autograd(
+        fw_compiler=fw_compiler or boxed_nop,
+        bw_compiler=bw_compiler or boxed_nop,
+        partition_fn=min_cut_rematerialization_partition,
+        keep_inference_input_mutations=True,
+    )(gm, example_inputs, **kwargs)
+
+
+register_backend(name="aot_eager", compiler_fn=aot_eager)
+
+
+def aot_eager_default_partitioner(
+    gm: GraphModule, example_inputs: list[Any], **kwargs: Any
+) -> Callable[..., Any]:
+    from .._core.common import aot_autograd
+
+    return aot_autograd(fw_compiler=boxed_nop, keep_inference_input_mutations=True)(
+        gm, example_inputs, **kwargs
+    )
+
+
+register_backend(
+    name="aot_eager_default_partitioner", compiler_fn=aot_eager_default_partitioner
+)
 
 
 # --------------------------------------------------------------------------

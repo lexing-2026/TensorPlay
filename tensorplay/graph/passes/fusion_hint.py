@@ -7,7 +7,7 @@ consume the hints instead of re-deriving fusibility, and mixed graphs can
 state exactly which subgraph is fusable.
 
 The op set is the single source of truth shared with
-``tensorplay/_stax/stax.py`` (which imports it), replacing the previously
+``tensorplay/compiler/backends/stax/stax.py`` (which imports it), replacing the previously
 duplicated private constant.
 """
 
@@ -18,7 +18,7 @@ from .base import PassBase, PassResult
 __all__ = ["POINTWISE_FUSED_OP_NAMES", "PointwiseFusionHint"]
 
 # Keep in sync with the fused-lowering opcode tables in
-# ``tensorplay/_stax/stax.py``; stax imports this set as the fusible-name
+# ``tensorplay/compiler/backends/stax/stax.py``; stax imports this set as the fusible-name
 # source of truth.  The CPU fused interpreter implements the base table only
 # (see ``_CPU_FUSED_OPCODES``); the Triton code generator implements the full
 # surface.  Backends whose tables miss a name reject the program and fall

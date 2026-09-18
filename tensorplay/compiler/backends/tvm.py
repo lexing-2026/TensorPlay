@@ -22,9 +22,9 @@ import importlib.util
 from collections.abc import Mapping
 from typing import Any
 
-from ..graph import GraphModule, Node
-from ..graph._utils import _iter_nodes
-from .stax import _is_scalar
+from ...graph import GraphModule, Node
+from ...graph._utils import _iter_nodes
+from .stax.backend import _is_scalar
 
 __all__ = ["tvm", "has_tvm"]
 
