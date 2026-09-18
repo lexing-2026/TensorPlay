@@ -40,7 +40,7 @@ def test_compile_uses_single_public_entrypoint_and_stax_backend():
     assert not hasattr(tp, "not_a_tensorplay_name")
     assert actual.tolist() == expected.tolist()
     assert compiled._tensorplay_backend == "stax"
-    assert tp._stax.list_backends() == ["stax", "tvm"]
+    assert tp._stax.list_backends() == ["cudagraphs", "stax", "tvm"]
 
 
 def test_custom_backend_receives_graph_module_and_caches_specializations():

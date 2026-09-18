@@ -202,3 +202,95 @@ def test_tvm_backend_accepts_compile_options(monkeypatch):
 
     with pytest.raises(RuntimeError, match="bogus"):
         tp.compile(lambda x: x + 1, backend="tvm", options={"bogus": 1})(tp.ones(2))
+
+
+# --------------------------------------------------------------------------
+# cudagraphs backend
+# --------------------------------------------------------------------------
+
+requires_cuda = pytest.mark.skipif(
+    not tp.cuda.is_available(), reason="CUDA runtime is not available"
+)
+
+
+def test_cudagraphs_backend_is_listed():
+    assert "cudagraphs" in tp.compiler.list_backends()
+    assert tp.compiler.lookup_backend("cudagraphs").compiler_name == "cudagraphs"
+
+
+def test_cudagraphs_skips_cpu_regions(caplog):
+    compiled = tp.compile(lambda a: a * 2, backend="cudagraphs")
+    with caplog.at_level("WARNING", logger="tensorplay._stax.cudagraphs"):
+        assert compiled(tp.tensor([1.0, 2.0])).tolist() == [2.0, 4.0]
+    assert "skipping cudagraphs due to cpu device" in caplog.text
+
+
+def test_cudagraphs_strict_native_rejects_skipped_regions():
+    from tensorplay._stax import CudaGraphError
+
+    compiled = tp.compile(lambda a: a * 2, backend="cudagraphs", strict_native=True)
+    with pytest.raises(CudaGraphError, match="cpu device"):
+        compiled(tp.tensor([1.0]))
+
+
+@requires_cuda
+def test_cudagraphs_replays_new_data_and_keeps_outputs():
+    lin = tp.nn.Linear(16, 16).cuda()
+
+    def fn(x, scale: float = 2.0):
+        y = lin(x).relu() * scale
+        return y.sum(dim=-1), y.shape[0], {"y": y}
+
+    compiled = tp.compile(fn, backend="cudagraphs")
+    with tp.no_grad():
+        x1 = tp.randn(4, 16, device="cuda")
+        first = compiled(x1)
+        x2 = tp.randn(4, 16, device="cuda")
+        second = compiled(x2)
+        for got, x in ((first, x1), (second, x2)):
+            expected = fn(x)
+            assert (got[0] - expected[0]).abs().max().item() < 1e-5
+            assert got[1] == 4
+            assert (got[2]["y"] - expected[2]["y"]).abs().max().item() < 1e-5
+        # Outputs are copies: a later replay must not overwrite them.
+        assert (first[0] - fn(x1)[0]).abs().max().item() < 1e-5
+        # A new input layout is captured separately.
+        assert tuple(compiled(tp.randn(3, 16, device="cuda"))[0].shape) == (3,)
+
+
+@requires_cuda
+def test_cudagraphs_training_region_keeps_autograd():
+    lin = tp.nn.Linear(8, 8).cuda()
+    compiled = tp.compile(lambda x: lin(x).relu().sum(), backend="cudagraphs")
+    x = tp.randn(2, 8, device="cuda", requires_grad=True)
+    compiled(x).backward()
+    assert x.grad is not None and lin.weight.grad is not None
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("fn", "reason"),
+    [
+        (lambda a: a.add_(1), "mutated inputs (a)"),
+        (lambda a: a.cpu() + 1, "cpu device"),
+        (lambda a: a[a > 0], "incompatible op"),
+        (lambda a: a.nonzero(), "incompatible op"),
+    ],
+)
+def test_cudagraphs_skip_reasons(fn, reason, caplog):
+    compiled = tp.compile(fn, backend="cudagraphs")
+    with caplog.at_level("WARNING", logger="tensorplay._stax.cudagraphs"):
+        compiled(tp.randn(4, device="cuda"))
+    assert f"skipping cudagraphs due to {reason}" in caplog.text
+
+
+@requires_cuda
+def test_reset_releases_captured_cuda_graphs():
+    from tensorplay._stax.cudagraphs import CudagraphsBackend
+
+    compiled = tp.compile(lambda a: a * 3, backend="cudagraphs")
+    with tp.no_grad():
+        compiled(tp.randn(4, device="cuda"))
+    assert any(manager._entries for manager in CudagraphsBackend._managers)
+    tp.compiler.reset()
+    assert not any(manager._entries for manager in CudagraphsBackend._managers)

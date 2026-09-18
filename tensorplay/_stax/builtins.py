@@ -17,3 +17,7 @@ def register() -> None:
     from .tvm import tvm as tvm_backend
 
     register_backend(tvm_backend, name="tvm")
+
+    from .cudagraphs import CudagraphsBackend
+
+    register_backend(CudagraphsBackend(), name="cudagraphs")
