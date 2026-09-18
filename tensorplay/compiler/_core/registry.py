@@ -187,7 +187,7 @@ def _load_builtins() -> None:
 
     # Imports are lazy so importing tensorplay does not import Triton or a
     # backend's optional compiler toolchain.
-    from . import builtins as _builtins
+    from ..backends import builtins as _builtins
 
     _builtins.register()
 

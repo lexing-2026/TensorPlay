@@ -1125,10 +1125,10 @@ def compile(
         if recompile_limit < 1:
             raise ValueError("recompile_limit must be positive")
 
-    from tensorplay import _stax
+    from tensorplay.compiler import _core
 
     capture_root = _capture_root(model)
-    compiled = _stax.compile(
+    compiled = _core.compile(
         capture_root,
         fullgraph=fullgraph,
         dynamic=dynamic,
@@ -1148,9 +1148,9 @@ def compile(
 def reset() -> None:
     """Clear compiler specializations and capture-time constant values."""
 
-    from tensorplay import _stax
+    from tensorplay.compiler import _core
 
-    _stax.reset()
+    _core.reset()
     with _records_lock:
         for record in _records.values():
             record.constant_ready = False
@@ -1169,9 +1169,9 @@ def list_backends(
     naming what to install.
     """
 
-    from tensorplay import _stax
+    from tensorplay.compiler import _core
 
-    return _stax.list_backends(
+    return _core.list_backends(
         exclude_tags=exclude_tags, include_unavailable=include_unavailable
     )
 
@@ -1179,63 +1179,63 @@ def list_backends(
 def lookup_backend(backend: str | Callable[..., Any]) -> Callable[..., Any]:
     """Resolve a backend name or validate a backend callable."""
 
-    from tensorplay import _stax
+    from tensorplay.compiler import _core
 
-    return _stax.lookup_backend(backend)
+    return _core.lookup_backend(backend)
 
 
 def register_backend(*args: Any, **kwargs: Any) -> Any:
     """Register a backend in the TensorPlay compiler registry."""
 
-    from tensorplay import _stax
+    from tensorplay.compiler import _core
 
-    return _stax.register_backend(*args, **kwargs)
+    return _core.register_backend(*args, **kwargs)
 
 
 def register_debug_backend(*args: Any, **kwargs: Any) -> Any:
     """Register a backend tagged for diagnostics."""
 
-    from tensorplay import _stax
+    from tensorplay.compiler import _core
 
-    return _stax.register_debug_backend(*args, **kwargs)
+    return _core.register_debug_backend(*args, **kwargs)
 
 
 def register_experimental_backend(*args: Any, **kwargs: Any) -> Any:
     """Register a backend tagged for experimental use."""
 
-    from tensorplay import _stax
+    from tensorplay.compiler import _core
 
-    return _stax.register_experimental_backend(*args, **kwargs)
+    return _core.register_experimental_backend(*args, **kwargs)
 
 
 def unregister_backend(name: str) -> None:
     """Remove a named backend from the compiler registry."""
 
-    from tensorplay import _stax
+    from tensorplay.compiler import _core
 
-    _stax.unregister_backend(name)
+    _core.unregister_backend(name)
 
 
 def set_default_backend(backend: str | Callable[..., Any] | None) -> None:
     """Set the backend used when :func:`compile` receives no backend name."""
 
-    from tensorplay import _stax
+    from tensorplay.compiler import _core
 
-    _stax.set_default_backend(backend)
+    _core.set_default_backend(backend)
 
 
 def get_default_backend() -> str | Callable[..., Any]:
     """Return the currently selected default backend."""
 
-    from tensorplay import _stax
+    from tensorplay.compiler import _core
 
-    return _stax.get_default_backend()
+    return _core.get_default_backend()
 
 
 def get_backend_capabilities(backend: str | Callable[..., Any]) -> Any:
     """Return the :class:`BackendCapabilities` a backend declares."""
 
-    from tensorplay._stax.registry import get_backend_capabilities as _get
+    from tensorplay.compiler._core.registry import get_backend_capabilities as _get
 
     return _get(backend)
 
@@ -1244,19 +1244,19 @@ def __getattr__(name: str) -> Any:
     # The registry module is loaded on demand so importing the facade stays
     # free of backend-host imports.
     if name == "InvalidBackend":
-        from tensorplay._stax.registry import InvalidBackend
+        from tensorplay.compiler._core.registry import InvalidBackend
 
         return InvalidBackend
     if name == "BackendCapabilities":
-        from tensorplay._stax.registry import BackendCapabilities
+        from tensorplay.compiler._core.registry import BackendCapabilities
 
         return BackendCapabilities
     if name == "CORE_BACKEND_CONTRACT_VERSION":
-        from tensorplay._stax.registry import CORE_BACKEND_CONTRACT_VERSION
+        from tensorplay.compiler._core.registry import CORE_BACKEND_CONTRACT_VERSION
 
         return CORE_BACKEND_CONTRACT_VERSION
     if name == "declares_capabilities":
-        from tensorplay._stax.registry import declares_capabilities
+        from tensorplay.compiler._core.registry import declares_capabilities
 
         return declares_capabilities
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -655,7 +655,7 @@ def _adapt_backend_to_region(
         )
     from .aot_autograd import default_partition
     from .common import aot_autograd
-    from .debugging import boxed_nop
+    from ..backends.debugging import boxed_nop
 
     return aot_autograd(
         fw_compiler=compiler_fn,

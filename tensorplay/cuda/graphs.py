@@ -159,7 +159,7 @@ class CUDAGraph:
                 anything else falls back to full copy semantics.
 
         This is the low-overhead bulk entry used by
-        :mod:`tensorplay._stax.cudagraphs`: one Python-to-native crossing
+        :mod:`tensorplay.compiler.backends.cudagraphs`: one Python-to-native crossing
         for the whole replay instead of one dispatcher round trip per input.
         """
 

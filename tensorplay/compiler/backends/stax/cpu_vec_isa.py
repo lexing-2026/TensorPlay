@@ -207,7 +207,7 @@ extern "C" int tp_isa_probe_entry() {
 
 def _package_version() -> str:
     try:
-        from ..version import __version__ as pkg_version
+        from ....version import __version__ as pkg_version
 
         return str(pkg_version)
     except Exception:

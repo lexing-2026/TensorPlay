@@ -8,7 +8,7 @@ and optimizer development.
 
 from __future__ import annotations
 
-from ._stax.stax import stax
+from .compiler.backends.stax import stax
 
 try:
     from . import _C

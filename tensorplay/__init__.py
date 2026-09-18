@@ -570,7 +570,7 @@ from .utils.comparison import allclose
 
 from ._ops import ops as ops
 from . import _stax
-from ._stax import compile
+from .compiler._core import compile
 from . import compiler
 from . import library
 from . import profiler

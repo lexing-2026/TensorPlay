@@ -16,9 +16,9 @@ import numbers
 import re
 from typing import Any
 
-from ..graph.passes import POINTWISE_FUSED_OP_NAMES
-from ..graph import GraphModule, Node
-from ..library import CustomOpDef as _CustomOpDef
+from ....graph.passes import POINTWISE_FUSED_OP_NAMES
+from ....graph import GraphModule, Node
+from ....library import CustomOpDef as _CustomOpDef
 
 
 def _nodes(value: Any):
@@ -503,7 +503,7 @@ class _CpuFusedPointwiseLowering(_NativeLowering):
         self._route: str | None = None
         _attach_fast_call(self, exec_fn=self._native_runner)
         if gradient_plan is not None:
-            from ..autograd import Function
+            from ....autograd import Function
 
             lowering = self
 
@@ -1684,7 +1684,7 @@ def _expand_row_normalizations(graph_module: GraphModule) -> GraphModule | None:
     planner then declines keeps the operators -- and the kernels -- it had.
     """
 
-    from ..graph.passes import DecomposeRowNormalizations, row_normalization_names
+    from ....graph.passes import DecomposeRowNormalizations, row_normalization_names
 
     known = row_normalization_names()
     present = False
@@ -1719,7 +1719,7 @@ def _copy_region_graph(graph: Any) -> Any:
     references shared, which is all a rewrite needs.
     """
 
-    from ..graph import Graph, map_arg
+    from ....graph import Graph, map_arg
 
     clone = Graph()
     mapping: dict[Node, Node] = {}
@@ -2279,7 +2279,7 @@ def _lower_cpu_segmented(
             for item in (*node.args, *kwargs_template.values())
         )
         if not simple:
-            from ..graph import map_arg
+            from ....graph import map_arg
 
             def run_general(values: list[Any]) -> Any:
                 resolve = lambda item: values[table[item]]  # noqa: E731
@@ -4248,7 +4248,7 @@ class _AotNativeLowering:
         self._tensorplay_codegen = "stax-aot-native"
         self._tensorplay_backward_codegen = "stax-aot-native"
         lowering = self
-        from ..autograd import Function
+        from ....autograd import Function
 
         class _AotAutogradFunction(Function):
             @staticmethod
@@ -4486,7 +4486,7 @@ def stax(
     )
     if not cudagraphs_requested or isinstance(compiled, GraphModule):
         return compiled
-    from .cudagraphs import cudagraph_wrap
+    from ..cudagraphs import cudagraph_wrap
 
     wrapped, reason = cudagraph_wrap(
         compiled, graph_module, example_inputs, dynamic=dynamic

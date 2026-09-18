@@ -43,7 +43,7 @@ from ..scheduler import segment_graph
 # load cache annotations, new fused opcodes) so stale generated sources
 # cannot be replayed against a new compiler.
 _CODEGEN_VERSION = "m9-2026-08-30-pw-surface"
-from ..stax import (
+from ..backend import (
     _CPU_FUSED_AUTOGRAD_OPS,
     _CPU_FUSED_OPS,
     _CAST_DTYPE_IDS,
@@ -2759,7 +2759,7 @@ def compile_graph_module(
                     [*plan.examples, plan.examples[0]],
                 )
 
-        from ...autograd import Function
+        from .....autograd import Function
 
         multi_segment_training = len(segment_plans) > 1
 

@@ -23,8 +23,8 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-from ..graph import GraphModule
-from .registry import BackendCapabilities, declares_capabilities
+from ...graph import GraphModule
+from .._core.registry import BackendCapabilities, declares_capabilities
 
 __all__ = ["onnxrt"]
 
