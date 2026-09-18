@@ -26,6 +26,7 @@ from ._utils import (
     _iter_proxies,
 )
 from .graph import CodeGen, Graph
+from .control_flow import while_loop
 from .graph_module import GraphModule
 from .node import Node, has_side_effect, map_arg
 from .proxy import Proxy, gate
@@ -72,6 +73,7 @@ __all__ = [
     "create_feature_extractor",
     "get_graph_node_names",
     "gate",
+    "while_loop",
     "gate_outcome",
     "has_side_effect",
     "immutable_dict",
