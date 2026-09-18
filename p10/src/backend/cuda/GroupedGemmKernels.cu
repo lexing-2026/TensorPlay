@@ -211,14 +211,16 @@ struct TF32GroupedGemm {
 // device-side descriptor machinery stays identical to the tensor-op routes.
 // This is the entry point that keeps full-precision fp32 callers on the
 // synchronization-free fast path.
-template <typename LayoutB>
+template <typename LayoutB, int TbM, int TbN, int TbK,
+          int WarpM, int WarpN, int WarpK>
 struct SimtGroupedGemm {
     using Kernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
         float, cutlass::layout::RowMajor, cutlass::ComplexTransform::kNone, 1,
         float, LayoutB, cutlass::ComplexTransform::kNone, 1,
         float, cutlass::layout::RowMajor, float, cutlass::arch::OpClassSimt,
-        cutlass::arch::Sm80, cutlass::gemm::GemmShape<128, 128, 8>,
-        cutlass::gemm::GemmShape<64, 64, 8>, cutlass::gemm::GemmShape<1, 1, 1>,
+        cutlass::arch::Sm80, cutlass::gemm::GemmShape<TbM, TbN, TbK>,
+        cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>,
+        cutlass::gemm::GemmShape<1, 1, 1>,
         cutlass::epilogue::thread::LinearCombination<float, 1, float, float>,
         cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 3,
         cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly>::GemmKernel;
@@ -369,6 +371,60 @@ bool run_half_grouped_gemm(const Tensor& offs_dev, const void* a_ptr,
         n_dim, max_rows_bound, sm_count, smem_optin, stream);
 }
 
+// Scalar-precision tile selection.  Tile choice drives two opposite costs:
+// wide accumulators pay one register each and strand residency, while small
+// tiles multiply the number of B-matrix passes.  The row count per group is
+// unknown on the host (no synchronization here), so selection runs on an
+// even-split estimate -- malformed offsets only shift work between
+// equivalent tiles, never correctness.
+template <typename LayoutB>
+bool run_simt_layout(const Tensor& offs_dev, const void* a_ptr,
+                     const void* b_ptr, void* d_ptr,
+                     const int64_t* ends_host, int64_t groups,
+                     int64_t m_total, int64_t k_dim, int64_t n_dim,
+                     int sm_count, cudaStream_t stream) {
+    using Big = SimtGroupedGemm<LayoutB, 128, 128, 8, 64, 64, 8>;
+    using Small = SimtGroupedGemm<LayoutB, 64, 128, 8, 32, 32, 8>;
+    using Skinny = SimtGroupedGemm<LayoutB, 32, 128, 8, 32, 32, 8>;
+    const bool b_col =
+        !std::is_same<LayoutB, cutlass::layout::RowMajor>::value;
+    const int64_t rows_est = (m_total + groups - 1) / groups;
+    if (rows_est <= 32) {
+        // Each group covers at most one skinny M tile: the grid walks the
+        // full B matrices exactly once, which is what tiny-M launches are
+        // bound by.
+        return run_grouped_config<typename Skinny::Gemm, float>(
+            offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, m_total, k_dim,
+            n_dim, b_col, 32, 128, sm_count, stream);
+    }
+    const int64_t big_tiles =
+        groups * ((rows_est + 127) / 128) * ((n_dim + 127) / 128);
+    if (big_tiles > 2 * sm_count) {
+        return run_grouped_config<typename Big::Gemm, float>(
+            offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, m_total, k_dim,
+            n_dim, b_col, 128, 128, sm_count, stream);
+    }
+    return run_grouped_config<typename Small::Gemm, float>(
+        offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, m_total, k_dim,
+        n_dim, b_col, 64, 128, sm_count, stream);
+}
+
+template <typename LayoutB>
+bool run_simt_grouped_gemm(const Tensor& offs_dev, const void* a_ptr,
+                           const void* b_ptr, void* d_ptr,
+                           const int64_t* ends_host, int64_t groups,
+                           int64_t m_total, int64_t k_dim, int64_t n_dim,
+                           bool b_col, int sm_count, cudaStream_t stream) {
+    if (b_col) {
+        return run_simt_layout<cutlass::layout::ColumnMajor>(
+            offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, m_total, k_dim,
+            n_dim, sm_count, stream);
+    }
+    return run_simt_layout<cutlass::layout::RowMajor>(
+        offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, m_total, k_dim,
+        n_dim, sm_count, stream);
+}
+
 }  // namespace
 
 bool try_grouped_gemm_tensor_op(const Tensor& self, const Tensor& mat2,
@@ -463,16 +519,9 @@ bool try_grouped_gemm_tensor_op(const Tensor& self, const Tensor& mat2,
             n_dim, b_col, max_group_rows, sm_count, smem_optin, stream);
     }
     if (is_f32 && !f32_tensor_op) {
-        if (b_col) {
-            return run_grouped_config<
-                SimtGroupedGemm<cutlass::layout::ColumnMajor>::Gemm, float>(
-                offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, m_total,
-                k_dim, n_dim, /*b_col=*/true, 128, 128, sm_count, stream);
-        }
-        return run_grouped_config<
-            SimtGroupedGemm<cutlass::layout::RowMajor>::Gemm, float>(
+        return run_simt_grouped_gemm<cutlass::layout::RowMajor>(
             offs_dev, a_ptr, b_ptr, d_ptr, ends_host, groups, m_total, k_dim,
-            n_dim, /*b_col=*/false, 128, 128, sm_count, stream);
+            n_dim, b_col, sm_count, stream);
     }
     if (b_col) {
         return run_grouped_config<
