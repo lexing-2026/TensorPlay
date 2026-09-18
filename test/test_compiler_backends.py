@@ -178,3 +178,27 @@ def test_non_leaf_compile_error_backend():
     fresh = tp.compile(fn, backend="non_leaf_compile_error_TESTING_ONLY")
     with pytest.raises(TestingOnlyCompileError):
         fresh(leaf * 2)
+
+
+def test_tvm_backend_accepts_compile_options(monkeypatch):
+    from tensorplay._stax import tvm as tvm_backend
+
+    seen = {}
+
+    def fake_lower(graph_module, example_inputs, *, target, parallel):
+        seen.update(target=target, parallel=parallel)
+        return None  # unsupported region -> interpreter fallback
+
+    monkeypatch.setattr(tvm_backend, "_require_tvm", lambda: (object(), object()))
+    monkeypatch.setattr(tvm_backend, "_lower_pointwise", fake_lower)
+
+    compiled = tp.compile(
+        lambda x: x + 1,
+        backend="tvm",
+        options={"target": "llvm -mcpu=generic", "parallel": True},
+    )
+    assert compiled(tp.ones(2)).tolist() == [2.0, 2.0]
+    assert seen == {"target": "llvm -mcpu=generic", "parallel": True}
+
+    with pytest.raises(RuntimeError, match="bogus"):
+        tp.compile(lambda x: x + 1, backend="tvm", options={"bogus": 1})(tp.ones(2))

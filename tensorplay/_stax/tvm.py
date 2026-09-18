@@ -19,6 +19,7 @@ Data crosses through DLPack without copies: TensorPlay tensors implement
 from __future__ import annotations
 
 import importlib.util
+from collections.abc import Mapping
 from typing import Any
 
 from ..graph import GraphModule, Node
@@ -361,11 +362,14 @@ def _lower_pointwise(
 def tvm(
     graph_module: GraphModule,
     example_inputs: list[Any],
-    **options: Any,
+    *,
+    options: Mapping[str, Any] | None = None,
+    **kwargs: Any,
 ):
     """Compile ``graph_module`` with Apache-TVM (backend entry point).
 
-    Options:
+    Options (given through ``tensorplay.compile(options=...)`` or as
+    keyword arguments):
         ``target``: TVM target string override (default ``"cuda"`` for CUDA
         inputs, ``"llvm"`` otherwise).
         ``parallel``: parallelize CPU kernels over the flattened domain
@@ -380,6 +384,9 @@ def tvm(
         raise ValueError("the tvm backend needs at least one input")
     tvm_module, _ = _require_tvm()
 
+    # ``tensorplay.compile(..., options={...})`` delivers the mapping as one
+    # ``options`` keyword; direct calls may pass the same keys flat.
+    options = {**dict(options or {}), **kwargs}
     strict_native = bool(options.pop("strict_native", False))
     target = options.pop("target", None)
     parallel = options.pop("parallel", False)
