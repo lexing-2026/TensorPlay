@@ -759,8 +759,11 @@ def _extract_shape_guard_params(graph_module: GraphModule) -> frozenset[str]:
 
 
 def reset() -> None:
-    """Clear all per-wrapper compiler specializations."""
+    """Clear all per-wrapper compiler specializations and backend state."""
 
+    from .registry import reset_backends
+
+    reset_backends()
     for wrapper in list(_compiled_wrappers):
         cache = getattr(wrapper, "_tensorplay_cache", None)
         if cache is not None:

@@ -2,6 +2,21 @@
 
 ``backend(graph_module, example_inputs, **options) -> callable``.
 Backends do not capture Python and do not own graph-break policy.
+
+Backends come from three sources, resolved lazily on first lookup:
+
+* explicit :func:`register_backend` calls (decorator or plain call);
+* the built-ins in :mod:`tensorplay._stax.builtins`;
+* installed third-party packages that declare an entry point in the
+  ``tensorplay_compiler_backends`` group, for example::
+
+      [project.entry-points.tensorplay_compiler_backends]
+      my_compiler = "my_backend.compiler:my_compiler_function"
+
+  The entry point is only imported when its name is first looked up.
+
+Tags categorize backends; :func:`list_backends` hides ``debug`` and
+``experimental`` ones by default.
 """
 
 from __future__ import annotations
@@ -28,6 +43,29 @@ _backend_tags: dict[str, tuple[str, ...]] = {}
 _default_backend: str | CompilerFn = "stax"
 _entrypoints_loaded = False
 _builtins_loaded = False
+
+_ENTRY_POINT_GROUP = "tensorplay_compiler_backends"
+
+
+class InvalidBackend(ValueError, RuntimeError):
+    """A backend name that no registered, built-in or entry-point backend owns.
+
+    Derives from ``ValueError`` (what unknown names raised historically) and
+    ``RuntimeError`` (the compiler error family), so either handler works.
+    """
+
+    def __init__(self, name: str, suggestions: Sequence[str] | None = None) -> None:
+        self.name = name
+        self.suggestions = list(suggestions or ())
+        message = f"Invalid backend: {name!r}"
+        if self.suggestions:
+            message += f", did you mean: {', '.join(map(repr, self.suggestions))}?"
+        else:
+            message += "."
+        message += (
+            " See `tensorplay.compiler.list_backends()` for available backends."
+        )
+        super().__init__(message)
 
 
 def register_backend(
@@ -97,11 +135,13 @@ def _load_entrypoints() -> None:
         _entrypoints_loaded = True
 
     try:
-        discovered = entry_points(group="tensorplay_compiler_backends")
+        discovered = entry_points(group=_ENTRY_POINT_GROUP)
     except TypeError:  # Python versions with the pre-3.10 API
-        discovered = entry_points().get("tensorplay_compiler_backends", ())
+        discovered = entry_points().get(_ENTRY_POINT_GROUP, ())
     with _lock:
         for item in discovered:
+            # A registered or built-in backend keeps its name; the entry point
+            # only claims names nobody owns yet.
             _backends.setdefault(item.name, item)
 
 
@@ -116,16 +156,34 @@ def lookup_backend(backend: str | CompilerFn) -> CompilerFn:
     _load_builtins()
     _load_entrypoints()
     with _lock:
-        if backend not in _backends:
-            available = ", ".join(list_backends(exclude_tags=None)) or "<none>"
-            raise ValueError(f"unknown TensorPlay compiler backend {backend!r}; available: {available}")
+        known = backend in _backends
         compiler_fn = _compiler_fns.get(backend)
         entrypoint = _backends.get(backend)
+    if not known:
+        import difflib
+
+        suggestions = difflib.get_close_matches(
+            backend, list_backends(exclude_tags=None), n=2
+        )
+        raise InvalidBackend(backend, suggestions)
 
     if compiler_fn is None and entrypoint is not None:
-        loaded = entrypoint.load()
-        register_backend(loaded, name=backend)
-        compiler_fn = loaded
+        try:
+            loaded = entrypoint.load()
+        except Exception as exc:
+            raise RuntimeError(
+                f"failed to load compiler backend {backend!r} from entry point "
+                f"{entrypoint.value!r} (group {_ENTRY_POINT_GROUP!r})"
+            ) from exc
+        if not callable(loaded):
+            raise TypeError(
+                f"entry point {entrypoint.value!r} for backend {backend!r} "
+                f"resolved to {type(loaded)!r}; expected a callable"
+            )
+        with _lock:
+            # Another thread may have finished the same load first.
+            compiler_fn = _compiler_fns.setdefault(backend, loaded)
+            _backend_tags.setdefault(backend, ())
 
     if compiler_fn is None:
         raise RuntimeError(f"backend {backend!r} was discovered but could not be loaded")
@@ -146,6 +204,31 @@ def list_backends(
             for name in _backends
             if not excluded.intersection(_backend_tags.get(name, ()))
         )
+
+
+def _is_registered_backend(compiler_fn: CompilerFn) -> bool:
+    """Whether ``compiler_fn`` is a loaded registry backend (not a bare callable)."""
+
+    _load_builtins()
+    _load_entrypoints()
+    with _lock:
+        return any(compiler_fn is fn for fn in _compiler_fns.values())
+
+
+def reset_backends() -> None:
+    """Invoke ``reset()`` on every loaded backend that defines one.
+
+    Backends holding process-wide state (captured CUDA graphs, compiled
+    kernel pools) expose ``reset`` so :func:`tensorplay.compiler.reset`
+    can release it together with the frontend caches.
+    """
+
+    with _lock:
+        loaded = list(_compiler_fns.values())
+    for compiler_fn in loaded:
+        reset = getattr(compiler_fn, "reset", None)
+        if callable(reset):
+            reset()
 
 
 def set_default_backend(backend: str | CompilerFn | None) -> None:

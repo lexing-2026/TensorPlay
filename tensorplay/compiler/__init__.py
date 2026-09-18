@@ -86,6 +86,7 @@ __all__ = [
     "disable_capture",
     "export",
     "get_default_backend",
+    "InvalidBackend",
     "is_compiling",
     "is_dynamo_compiling",
     "is_exporting",
@@ -1220,3 +1221,13 @@ def get_default_backend() -> str | Callable[..., Any]:
     from tensorplay import _stax
 
     return _stax.get_default_backend()
+
+
+def __getattr__(name: str) -> Any:
+    # The registry module is loaded on demand so importing the facade stays
+    # free of backend-host imports.
+    if name == "InvalidBackend":
+        from tensorplay._stax.registry import InvalidBackend
+
+        return InvalidBackend
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
