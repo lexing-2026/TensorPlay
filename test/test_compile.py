@@ -357,3 +357,40 @@ def test_cuda_relu_backward_materializes_expanded_sum_gradient():
     values.relu().sum().backward()
     expected = tp.tensor([0.0, 0.0, 1.0, 1.0], device="cuda")
     assert tp.allclose(values.grad, expected, rtol=0.0, atol=0.0)
+
+
+def test_compile_specializes_none_inputs():
+    def fn(a, b=None):
+        return a * 2 if b is None else a + b
+
+    compiled = tp.compile(fn, backend="eager")
+    x = tp.tensor([1.0, 2.0])
+    assert compiled(x).tolist() == [2.0, 4.0]
+    assert compiled(x, x).tolist() == [2.0, 4.0]
+    assert compiled(x, tp.ones(2)).tolist() == [2.0, 3.0]
+    assert compiled(x).tolist() == [2.0, 4.0]
+
+
+@pytest.mark.parametrize("backend", ["eager", "stax"])
+def test_compile_public_function_with_out(backend):
+    x = tp.tensor([0.0, 1.0, 2.0])
+    compiled = tp.compile(tp.sin, backend=backend)
+    assert (compiled(x) - x.sin()).abs().max().item() == 0.0
+    out = tp.empty(3)
+    compiled(x, out=out)
+    assert (out - x.sin()).abs().max().item() == 0.0
+
+
+def test_compile_records_public_spelling_for_out_calls():
+    seen = {}
+
+    def backend(graph_module, example_inputs, **kwargs):
+        seen["gm"] = graph_module
+        return graph_module
+
+    tp.compile(lambda a, out: tp.addcmul(a, a, a, value=2, out=out), backend=backend)(
+        tp.ones(2), tp.empty(2)
+    )
+    (call,) = [n for n in seen["gm"].graph.nodes if n.op == "call_function"]
+    assert "self" not in call.kwargs
+    assert set(call.kwargs) == {"value", "out"}
