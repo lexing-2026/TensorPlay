@@ -210,6 +210,37 @@ def _load_entrypoints() -> None:
             _backends.setdefault(item.name, item)
 
 
+def _ensure_loaded(backend: str, entrypoint: EntryPoint) -> CompilerFn:
+    """Import a not-yet-loaded entry-point backend and record its metadata.
+
+    Capabilities can only be read off the loaded callable, so availability
+    reporting and selection share this one load; it runs at most once.
+    """
+
+    try:
+        loaded = entrypoint.load()
+    except Exception as exc:
+        raise RuntimeError(
+            f"failed to load compiler backend {backend!r} from entry point "
+            f"{entrypoint.value!r} (group {_ENTRY_POINT_GROUP!r})"
+        ) from exc
+    if not callable(loaded):
+        raise TypeError(
+            f"entry point {entrypoint.value!r} for backend {backend!r} "
+            f"resolved to {type(loaded)!r}; expected a callable"
+        )
+    with _lock:
+        # Another thread may have finished the same load first.
+        compiler_fn = _compiler_fns.setdefault(backend, loaded)
+        _backend_tags.setdefault(backend, ())
+        _backend_capabilities.setdefault(
+            backend,
+            getattr(loaded, "_tensorplay_capabilities", None)
+            or DEFAULT_CAPABILITIES,
+        )
+    return compiler_fn
+
+
 def _is_missing_dep(name: str) -> bool:
     known = _missing_dep_cache.get(name)
     if known is None:
@@ -296,27 +327,7 @@ def lookup_backend(backend: str | CompilerFn) -> CompilerFn:
         raise InvalidBackend(backend, suggestions)
 
     if compiler_fn is None and entrypoint is not None:
-        try:
-            loaded = entrypoint.load()
-        except Exception as exc:
-            raise RuntimeError(
-                f"failed to load compiler backend {backend!r} from entry point "
-                f"{entrypoint.value!r} (group {_ENTRY_POINT_GROUP!r})"
-            ) from exc
-        if not callable(loaded):
-            raise TypeError(
-                f"entry point {entrypoint.value!r} for backend {backend!r} "
-                f"resolved to {type(loaded)!r}; expected a callable"
-            )
-        with _lock:
-            # Another thread may have finished the same load first.
-            compiler_fn = _compiler_fns.setdefault(backend, loaded)
-            _backend_tags.setdefault(backend, ())
-            _backend_capabilities.setdefault(
-                backend,
-                getattr(loaded, "_tensorplay_capabilities", None)
-                or DEFAULT_CAPABILITIES,
-            )
+        compiler_fn = _ensure_loaded(backend, entrypoint)
 
     if compiler_fn is None:
         raise RuntimeError(f"backend {backend!r} was discovered but could not be loaded")
@@ -367,8 +378,16 @@ def get_backend_capabilities(backend: str | CompilerFn) -> BackendCapabilities:
         _load_builtins()
         _load_entrypoints()
         with _lock:
+            known = backend in _backends
+            entrypoint = _backends.get(backend)
             caps = _backend_capabilities.get(backend)
             compiler_fn = _compiler_fns.get(backend)
+        if known and compiler_fn is None and entrypoint is not None:
+            # Importing the module is the only way to read its declared
+            # capabilities; an introspection call may pay that cost.
+            _ensure_loaded(backend, entrypoint)
+            with _lock:
+                caps = _backend_capabilities.get(backend)
     else:
         compiler_fn = backend
         with _lock:
