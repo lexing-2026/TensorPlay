@@ -7,11 +7,15 @@ eager execution the markers are inert metadata — the semantics of the marked
 callables never change.
 """
 
-from tensorplay.compiler import (
+from tensorplay.compiler import (  # noqa: F401
     allow_in_graph,
     assume_constant_result,
     is_compiling,
-)  # noqa: F401
+    list_backends,
+    lookup_backend,
+    register_backend,
+    reset,
+)
 
 
 def disallow_in_graph(fn):
