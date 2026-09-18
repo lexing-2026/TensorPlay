@@ -180,3 +180,40 @@ def test_persistent_region_cache_skips_recapture(tmp_path, monkeypatch):
         assert len(_probe_runs) == 1
     finally:
         _registry.unregister_backend(backend_name)
+
+
+_gate_probe_runs: list[int] = []
+
+
+def _region_cache_gate_probe(x):
+    # Branch on data: capture bakes one outcome and records a guard replay;
+    # a stored region must carry that replay so later calls key on it.
+    _gate_probe_runs.append(1)
+    if x.sum() > 2:
+        return x * 10
+    return x
+
+
+def test_persistent_region_cache_keeps_gate_replay(tmp_path, monkeypatch):
+    backend_name = "region_cache_gate_TESTING_ONLY"
+
+    def noop_backend(graph_module, example_inputs, **kwargs):
+        return graph_module
+
+    _registry.register_backend(noop_backend, name=backend_name)
+    monkeypatch.setattr("tensorplay._stax.codecache._default_caches", {})
+    monkeypatch.setenv("TP_CACHE_DIR", str(tmp_path))
+    try:
+        assert tp.compile(_region_cache_gate_probe, backend=backend_name)(
+            tp.tensor([1.0, 2.0])
+        ).tolist() == [10.0, 20.0]
+        assert len(_gate_probe_runs) == 1
+        # Same shapes, opposite branch outcome: the loaded region's guard
+        # replay must route this to a re-specialization, not the stale graph.
+        monkeypatch.setattr("tensorplay._stax.codecache._default_caches", {})
+        compiled = tp.compile(_region_cache_gate_probe, backend=backend_name)
+        assert compiled(tp.tensor([1.0, 2.0])).tolist() == [10.0, 20.0]
+        assert compiled(tp.tensor([0.5, 0.5])).tolist() == [0.5, 0.5]
+        assert len(_gate_probe_runs) == 2
+    finally:
+        _registry.unregister_backend(backend_name)
