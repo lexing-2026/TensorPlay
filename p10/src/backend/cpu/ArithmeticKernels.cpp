@@ -2918,6 +2918,12 @@ Tensor& addcmul_inplace_cpu(Tensor& self, const Tensor& tensor1,
     return self;
 }
 
+Tensor& addcmul_out_cpu(const Tensor& self, const Tensor& tensor1,
+                        const Tensor& tensor2, Scalar value, Tensor& out) {
+    out = addcmul_cpu(self, tensor1, tensor2, value);
+    return out;
+}
+
 Tensor addcdiv_cpu(const Tensor& self, const Tensor& tensor1,
                    const Tensor& tensor2, Scalar value) {
     if (isIntegralType(tensor1.dtype(), true) && isIntegralType(tensor2.dtype(), true)) {
@@ -3075,6 +3081,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ArithmeticKernels) {
     m.impl("div.Tensor", div_kernel);
     m.impl("addcmul", addcmul_cpu);
     m.impl("addcmul_", addcmul_inplace_cpu);
+    m.impl("addcmul.out", addcmul_out_cpu);
     m.impl("addcdiv", addcdiv_cpu);
     m.impl("addcdiv_", addcdiv_inplace_cpu);
     m.impl("fused_mul_add", fused_mul_add_kernel);

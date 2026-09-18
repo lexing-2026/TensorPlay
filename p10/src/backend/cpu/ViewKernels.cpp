@@ -628,6 +628,12 @@ Tensor diagonal_kernel(const Tensor& self, int64_t offset, int64_t dim1, int64_t
     return self.as_strided(sizes, strides, new_offset);
 }
 
+Tensor as_strided_cpu(const Tensor& self, const std::vector<int64_t>& size,
+                      const std::vector<int64_t>& stride,
+                      std::optional<int64_t> storage_offset) {
+    return self.as_strided(size, stride, storage_offset);
+}
+
 Tensor diagonal_backward_kernel(const Tensor& grad, const std::vector<int64_t>& input_sizes,
                                 int64_t offset, int64_t dim1, int64_t dim2) {
     Tensor result = Tensor::zeros(input_sizes, grad.dtype(), grad.device());
@@ -772,6 +778,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ViewKernels) {
     m.impl("split.sizes", split_sizes_kernel);
     m.impl("chunk", chunk_kernel);
     m.impl("reshape", reshape_kernel);
+    m.impl("as_strided", as_strided_cpu);
     m.impl("unbind", unbind_kernel);
 }
 

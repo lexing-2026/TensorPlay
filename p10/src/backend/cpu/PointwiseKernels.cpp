@@ -501,6 +501,10 @@ Tensor sin_kernel(const Tensor& self) {
                               [](auto x) { return tensorplay::sin(x);  });
     return unary_float_op_kernel(self, [](auto x) { return std::sin(x); }, vecunary::VOp::Sin);
 }
+Tensor& sin_out_cpu(const Tensor& self, Tensor& out) {
+    out = sin_kernel(self);
+    return out;
+}
 Tensor sinh_kernel(const Tensor& self) {
     if (isComplexType(self.dtype()))
         return cplx_unary_vec(self, veccomplex::Op::Sinh,
@@ -2479,6 +2483,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("cos", cos_kernel);
     m.impl("cosh", cosh_kernel);
     m.impl("sin", sin_kernel);
+    m.impl("sin.out", sin_out_cpu);
     m.impl("sinh", sinh_kernel);
     m.impl("tan", tan_kernel);
     m.impl("tanh", tanh_kernel);
