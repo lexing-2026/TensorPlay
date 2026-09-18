@@ -4,8 +4,8 @@ import pytest
 
 import tensorplay as tp
 import tensorplay.nn as nn
-from tensorplay._stax.codecache import CodeCache
-from tensorplay._stax.region_cache import (
+from tensorplay.compiler.backends.stax.codecache import CodeCache
+from tensorplay.compiler._core.region_cache import (
     load_region,
     region_key,
     store_region,
@@ -13,7 +13,7 @@ from tensorplay._stax.region_cache import (
 from tensorplay.graph import Graph, GraphModule
 
 try:
-    from tensorplay._stax import registry as _registry
+    from tensorplay.compiler._core import registry as _registry
 except ImportError:  # pragma: no cover - registry ships with the package
     _registry = None
 
@@ -44,7 +44,7 @@ def _build_gm():
 def isolated_region_cache(tmp_path, monkeypatch):
     """Point the capture-region store at a fresh per-test cache root."""
 
-    monkeypatch.setattr("tensorplay._stax.codecache._default_caches", {})
+    monkeypatch.setattr("tensorplay.compiler.backends.stax.codecache._default_caches", {})
     monkeypatch.setenv("TP_CACHE_DIR", str(tmp_path))
 
 
@@ -161,7 +161,7 @@ def test_persistent_region_cache_skips_recapture(tmp_path, monkeypatch):
         return graph_module
 
     _registry.register_backend(noop_backend, name=backend_name)
-    monkeypatch.setattr("tensorplay._stax.codecache._default_caches", {})
+    monkeypatch.setattr("tensorplay.compiler.backends.stax.codecache._default_caches", {})
     monkeypatch.setenv("TP_CACHE_DIR", str(tmp_path))
     try:
         x = tp.tensor([1.0, 2.0])
@@ -172,7 +172,7 @@ def test_persistent_region_cache_skips_recapture(tmp_path, monkeypatch):
         assert len(_probe_runs) == 1
         # A fresh process would hold no memoized cache instance and no
         # captured region: the region must come from the disk store.
-        monkeypatch.setattr("tensorplay._stax.codecache._default_caches", {})
+        monkeypatch.setattr("tensorplay.compiler.backends.stax.codecache._default_caches", {})
         assert tp.compile(_region_cache_probe, backend=backend_name)(x).tolist() == [
             3.0,
             5.0,
@@ -201,7 +201,7 @@ def test_persistent_region_cache_keeps_gate_replay(tmp_path, monkeypatch):
         return graph_module
 
     _registry.register_backend(noop_backend, name=backend_name)
-    monkeypatch.setattr("tensorplay._stax.codecache._default_caches", {})
+    monkeypatch.setattr("tensorplay.compiler.backends.stax.codecache._default_caches", {})
     monkeypatch.setenv("TP_CACHE_DIR", str(tmp_path))
     try:
         assert tp.compile(_region_cache_gate_probe, backend=backend_name)(
@@ -210,7 +210,7 @@ def test_persistent_region_cache_keeps_gate_replay(tmp_path, monkeypatch):
         assert len(_gate_probe_runs) == 1
         # Same shapes, opposite branch outcome: the loaded region's guard
         # replay must route this to a re-specialization, not the stale graph.
-        monkeypatch.setattr("tensorplay._stax.codecache._default_caches", {})
+        monkeypatch.setattr("tensorplay.compiler.backends.stax.codecache._default_caches", {})
         compiled = tp.compile(_region_cache_gate_probe, backend=backend_name)
         assert compiled(tp.tensor([1.0, 2.0])).tolist() == [10.0, 20.0]
         assert compiled(tp.tensor([0.5, 0.5])).tolist() == [0.5, 0.5]
