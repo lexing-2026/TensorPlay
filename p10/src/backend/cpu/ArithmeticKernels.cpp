@@ -3096,5 +3096,13 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ArithmeticKernels) {
     m.impl("div_.Scalar", div_scalar_inplace_kernel);
 }
 
+// A sparse operand outranks the dense one when the dispatch key is derived
+// from the arguments, so in-place accumulation of a sparse tensor into a
+// dense destination registers under the sparse backend; the kernel itself
+// keeps branching on whether the trailing operand is sparse.
+TENSORPLAY_LIBRARY_IMPL(Sparse, ArithSparseInplace) {
+    m.impl("add_.Tensor", add_inplace_kernel);
+}
+
 } // namespace cpu
 } // namespace tensorplay

@@ -928,22 +928,40 @@ Tensor embedding_backward_cpu(const Tensor& grad_output, const Tensor& indices,
                                        padding_idx, scale_grad_by_freq);
 }
 
+// Dense-entry operations: factories whose inputs are dense tensors and ops
+// that only ever see dense self dispatch under the dense backend key. Ops
+// whose self is a sparse tensor register in the Sparse block below.
 TENSORPLAY_LIBRARY_IMPL(CPU, CopyKernels) {
     m.impl("masked_select", masked_select_cpu);
     m.impl("copy_", copy_kernel);
     m.impl("sparse_coo_tensor", sparse_coo_tensor_cpu);
-    m.impl("sparse_mask", sparse_mask_cpu);
+    // to_dense is the identity on dense self and the COO/CSR expansion on
+    // sparse self, so it registers under both backends.
     m.impl("to_dense", to_dense_sparse_cpu);
     m.impl("to_sparse", to_sparse_coo_cpu);
     m.impl("to_sparse_csr", to_sparse_csr_cpu);
+    m.impl("spdiags", spdiags_cpu);
+    m.impl("_spdiags", spdiags_cpu);
+    m.impl("embedding", embedding_cpu);
+    m.impl("embedding_renorm_", embedding_renorm_cpu);
+    m.impl("embedding_dense_backward", embedding_dense_backward_cpu);
+    m.impl("embedding_sparse_backward", embedding_sparse_backward_cpu);
+    m.impl("embedding_backward", embedding_backward_cpu);
+}
+
+TENSORPLAY_LIBRARY_IMPL(Sparse, CopySparseKernels) {
+    m.impl("sparse_mask", sparse_mask_cpu);
+    m.impl("to_dense", to_dense_sparse_cpu);
     m.impl("_nnz", sparse_nnz_cpu);
+    // The COO conversion accepts sparse self as well as dense self, so it
+    // registers under both backends and re-coalesces when given a layout
+    // that is already sparse.
+    m.impl("to_sparse", to_sparse_coo_cpu);
     m.impl("sparse_mm", sparse_mm_cpu);
     m.impl("smm", smm_cpu);
     m.impl("sparse_sum", sparse_sum_cpu);
     m.impl("sparse_add", sparse_add_cpu);
     m.impl("sparse_mul", sparse_mul_cpu);
-    m.impl("spdiags", spdiags_cpu);
-    m.impl("_spdiags", spdiags_cpu);
     m.impl("_sparse_sum", _sparse_sum_cpu);
     m.impl("_sparse_sum.dtype", _sparse_sum_dtype_cpu);
     m.impl("_sparse_sum.dim", _sparse_sum_dim_cpu_2);
@@ -951,11 +969,6 @@ TENSORPLAY_LIBRARY_IMPL(CPU, CopyKernels) {
     m.impl("_sparse_sum_backward", _sparse_sum_backward_cpu);
     m.impl("native_norm", native_norm_cpu);
     m.impl("native_norm.ScalarOpt_dim_dtype", native_norm_dim_cpu);
-    m.impl("embedding", embedding_cpu);
-    m.impl("embedding_renorm_", embedding_renorm_cpu);
-    m.impl("embedding_dense_backward", embedding_dense_backward_cpu);
-    m.impl("embedding_sparse_backward", embedding_sparse_backward_cpu);
-    m.impl("embedding_backward", embedding_backward_cpu);
 }
 
 } // namespace cpu

@@ -775,5 +775,12 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ViewKernels) {
     m.impl("unbind", unbind_kernel);
 }
 
+// A sparse self derives the sparse dispatch key, so sparse layout cloning
+// needs its own slot; clone_impl copies the sparse metadata alongside the
+// values buffer.
+TENSORPLAY_LIBRARY_IMPL(Sparse, ViewSparseKernels) {
+    m.impl("clone", clone_kernel);
+}
+
 } // namespace cpu
 } // namespace tensorplay

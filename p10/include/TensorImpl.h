@@ -159,9 +159,13 @@ public:
     DType dtype() const { return dtype_; }
     Device device() const { return device_; }
 
-    // The dispatch key set describing this tensor and its backend.
+    // The dispatch key set describing this tensor and its backend. Sparse
+    // layouts route to the Sparse backend key regardless of the device's
+    // dense backend, so sparse registrations are selected ahead of the
+    // dense kernels a plain device lookup would find.
     DispatchKeySet key_set() const {
-        DispatchKey backend = computeDispatchKey(device_);
+        const DispatchKey backend =
+            sparse_state_ ? DispatchKey::Sparse : computeDispatchKey(device_);
         DispatchKeySet ks;
         ks.add(backend);
         if (is_batched()) {

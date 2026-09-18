@@ -1768,15 +1768,44 @@ Tensor native_norm_dim_cpu(const Tensor& self, std::optional<Scalar> p,
                            std::vector<int64_t> dims, bool keepdim,
                            std::optional<DType> dtype) {
     TP_CHECK(self.is_sparse(), "norm(): expected a sparse tensor");
-    (void)dims;
-    TP_CHECK(dims.empty() ||
-                 static_cast<int64_t>(dims.size()) == self.dim(),
-             "norm(): currently only supports full reductions");
+    if (!dims.empty()) {
+        // A full reduction lists every dimension exactly once; negative
+        // entries wrap before the coverage and duplicate checks.
+        const int64_t ndim = self.dim();
+        TP_CHECK(static_cast<int64_t>(dims.size()) == ndim,
+                 "norm(): currently only supports full reductions");
+        std::vector<bool> seen(static_cast<size_t>(ndim), false);
+        for (int64_t d : dims) {
+            const int64_t wrapped = d < 0 ? d + ndim : d;
+            TP_CHECK(wrapped >= 0 && wrapped < ndim,
+                     "norm(): dimension out of range");
+            TP_CHECK(!seen[static_cast<size_t>(wrapped)],
+                     "norm(): duplicate dimensions are not supported");
+            seen[static_cast<size_t>(wrapped)] = true;
+        }
+    }
     TP_CHECK(!keepdim, "norm(): currently does not support keepdim=True");
     TP_CHECK(!dtype.has_value(), "norm(): currently does not support 'dtype'");
     Tensor canonical = self.is_coalesced() ? self : self.coalesce();
     const double p_value = p.has_value() ? p->toDouble() : 2.0;
     return canonical._values().norm(p_value);
+}
+
+// Norm entry points for the sparse backend: the sparse registration of the
+// public norm operators reaches the same reduction rules as native_norm.
+Tensor norm_sparse_cpu(const Tensor& self, double p) {
+    return native_norm_dim_cpu(self, Scalar(p), {}, false, std::nullopt);
+}
+
+Tensor norm_sparse_dim_cpu(const Tensor& self,
+                           const std::vector<int64_t>& dim, double p,
+                           bool keepdim) {
+    return native_norm_dim_cpu(self, Scalar(p), dim, keepdim, std::nullopt);
+}
+
+TENSORPLAY_LIBRARY_IMPL(Sparse, SparseNormKernels) {
+    m.impl("norm", norm_sparse_cpu);
+    m.impl("norm.dim", norm_sparse_dim_cpu);
 }
 
 } // namespace cpu
