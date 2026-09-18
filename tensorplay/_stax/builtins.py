@@ -9,6 +9,9 @@ def register() -> None:
     from .stax import stax
 
     register_backend(stax, name="stax")
+    # Importing the module registers the debug-tagged backends.
+    from . import debugging  # noqa: F401
+
     # Apache-TVM is an optional dependency; the backend module itself stays
     # import-light and only validates availability at compile time.
     from .tvm import tvm as tvm_backend

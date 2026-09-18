@@ -93,3 +93,88 @@ def test_reset_calls_backend_reset_hooks():
         assert calls == ["reset"]
     finally:
         tp.compiler.unregister_backend("stateful_reset_backend")
+
+
+DEBUG_BACKENDS = (
+    "eager",
+    "eager_debug",
+    "eager_noexcept",
+    "non_leaf_compile_error_TESTING_ONLY",
+    "relu_accuracy_error_TESTING_ONLY",
+    "relu_compile_error_TESTING_ONLY",
+    "relu_runtime_error_TESTING_ONLY",
+)
+
+
+def _relu_fn(x):
+    return tp.relu(x) * 2 + x.relu()
+
+
+def test_debug_backends_are_hidden_by_default():
+    visible = tp.compiler.list_backends()
+    everything = tp.compiler.list_backends(exclude_tags=None)
+    for name in DEBUG_BACKENDS:
+        assert name not in visible
+        assert name in everything
+
+
+@pytest.mark.parametrize("backend", ["eager", "eager_noexcept", "eager_debug"])
+def test_eager_backends_match_uncompiled(backend):
+    x = tp.tensor([-1.0, 2.0])
+    assert tp.compile(_relu_fn, backend=backend)(x).tolist() == [0.0, 6.0]
+
+
+def test_eager_noexcept_wraps_graph_errors():
+    from tensorplay._stax.debugging import eager_noexcept
+
+    class Boom:
+        def __call__(self, *args, **kwargs):
+            raise ValueError("boom")
+
+    inner = eager_noexcept(Boom(), [])
+    with pytest.raises(RuntimeError, match="Unexpected exception") as info:
+        inner()
+    assert isinstance(info.value.__cause__, ValueError)
+
+
+def test_eager_debug_reports_failing_node():
+    def fn(x, y):
+        return tp.matmul(x, y) + 1
+
+    compiled = tp.compile(fn, backend="eager_debug")
+    assert tuple(compiled(tp.randn(2, 3), tp.randn(3, 2)).shape) == (2, 2)
+    with pytest.raises(Exception, match="While executing"):
+        compiled(tp.randn(2, 3), tp.randn(4, 2))
+
+
+def test_relu_compile_error_backend():
+    from tensorplay._stax.debugging import ReluCompileError
+
+    with pytest.raises(ReluCompileError):
+        tp.compile(_relu_fn, backend="relu_compile_error_TESTING_ONLY")(tp.randn(2))
+
+
+def test_relu_runtime_error_backend():
+    with pytest.raises(AssertionError, match="ReluRuntimeError"):
+        tp.compile(_relu_fn, backend="relu_runtime_error_TESTING_ONLY")(tp.randn(2))
+
+
+def test_relu_accuracy_error_backend():
+    x = tp.tensor([-1.0, 2.0])
+    compiled = tp.compile(_relu_fn, backend="relu_accuracy_error_TESTING_ONLY")
+    # relu(x) is replaced by x + 1.
+    assert compiled(x).tolist() == [0.0, 9.0]
+
+
+def test_non_leaf_compile_error_backend():
+    from tensorplay._stax.debugging import TestingOnlyCompileError
+
+    def fn(x):
+        return tp.sin(x)
+
+    leaf = tp.tensor([1.0, 2.0], requires_grad=True)
+    compiled = tp.compile(fn, backend="non_leaf_compile_error_TESTING_ONLY")
+    compiled(leaf)
+    fresh = tp.compile(fn, backend="non_leaf_compile_error_TESTING_ONLY")
+    with pytest.raises(TestingOnlyCompileError):
+        fresh(leaf * 2)
