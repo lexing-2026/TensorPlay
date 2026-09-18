@@ -623,6 +623,11 @@ def _rewrite(
         rule = table.get(name)
         if rule is None:
             continue
+        if node.kwargs.get("out") is not None:
+            # Rules build a fresh functional result; an out= call must write
+            # its destination (resize, dtype check, return ``out``), which
+            # the native operator already does.
+            continue
         # Replacement sub-chains must precede the replaced node's users:
         # create them directly before the original site.  inserting_before
         with graph.inserting_before(node):
