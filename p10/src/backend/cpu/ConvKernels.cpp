@@ -641,6 +641,7 @@ static void conv2d_winograd_3x3(const Tensor& input, const Tensor& weight, const
     }
 }
 
+
 // Im2Col implementation
 template <typename T>
 void im2col(const T* data_im, int64_t channels, int64_t height, int64_t width,
@@ -1388,6 +1389,325 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         return false;
     }
 }
+
+// NHWC 直通 backward 路径：oneDNN 在连续 NHWC 用户内存上直接执行卷积
+// backward（权重用 HWIO），避免每次调用中 NCHW<->blocked 的显式重排。
+// 输入/梯度先转为 NHWC 连续，结果再转回 NCHW/OIHW。
+#ifdef USE_ONEDNN
+static bool conv2d_grad_input_nhwc(
+    const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+    const std::vector<int64_t>& stride,
+    int64_t pH_top, int64_t pH_bottom, int64_t pW_left, int64_t pW_right,
+    const std::vector<int64_t>& dilation, int64_t groups,
+    Tensor& grad_input) {
+    if (!OneDNNContext::is_enabled()) return false;
+    if (input.dtype() != DType::Float32) return false;
+    if (groups != 1) return false;
+    if (input.dim() != 4 || weight.dim() != 4) return false;
+
+    const int64_t N = input.size(0);
+    const int64_t C_in = input.size(1);
+    const int64_t H_in = input.size(2);
+    const int64_t W_in = input.size(3);
+    const int64_t C_out = weight.size(0);
+    const int64_t kH = weight.size(2);
+    const int64_t kW = weight.size(3);
+    const int64_t H_out = grad_output.size(2);
+    const int64_t W_out = grad_output.size(3);
+
+    ConvKey key;
+    key.n = N; key.ic = C_in; key.ih = H_in; key.iw = W_in;
+    key.oc = C_out; key.kh = kH; key.kw = kW;
+    key.oh = H_out; key.ow = W_out;
+    key.sh = stride[0]; key.sw = stride[1];
+    key.ph_t = pH_top; key.ph_b = pH_bottom; key.pw_l = pW_left; key.pw_r = pW_right;
+    key.dh = dilation[0]; key.dw = dilation[1];
+    key.groups = groups;
+    key.has_bias = false;
+    key.type = 1; // bwd_data
+
+    struct CachedNHWCBwdData {
+        convolution_backward_data::primitive_desc pd;
+        convolution_backward_data prim;
+    };
+    static std::unordered_map<ConvKey, CachedNHWCBwdData> cache;
+    static std::mutex mtx;
+
+    try {
+        auto& eng = OneDNNContext::get_engine();
+        auto& s = OneDNNContext::get_stream();
+
+        memory::dims src_dims = {N, H_out, W_out, C_out};
+        memory::dims diff_src_dims = {N, H_in, W_in, C_in};
+        memory::dims weights_dims = {kH, kW, C_in, C_out};
+        memory::dims strides_dims = {stride[0], stride[1]};
+        memory::dims padding_l = {pH_top, pW_left};
+        memory::dims padding_r = {pH_bottom, pW_right};
+        memory::dims dilates = {dilation[0] - 1, dilation[1] - 1};
+
+        auto src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::nhwc);
+        auto diff_src_md = memory::desc(diff_src_dims, memory::data_type::f32, memory::format_tag::nhwc);
+        auto weights_md = memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::hwio);
+
+        CachedNHWCBwdData entry;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            auto it = cache.find(key);
+            if (it != cache.end()) {
+                entry = it->second;
+                found = true;
+            }
+        }
+        if (!found) {
+            // 3x3 用 Winograd（与 forward 的自研 F(2,3) 策略一致），其余用
+            // direct；形状不支持时回退到 auto。
+            dnnl::algorithm algo = (kH == 3 && kW == 3)
+                ? algorithm::convolution_winograd
+                : algorithm::convolution_direct;
+            convolution_forward::primitive_desc fwd_pd;
+            try {
+                fwd_pd = convolution_forward::primitive_desc(
+                    eng, prop_kind::forward_inference, algo,
+                    src_md, weights_md, memory::desc(), src_md,
+                    strides_dims, dilates, padding_l, padding_r);
+            } catch (...) {
+                if (algo == algorithm::convolution_auto) return false;
+                try {
+                    fwd_pd = convolution_forward::primitive_desc(
+                        eng, prop_kind::forward_inference, algorithm::convolution_auto,
+                        src_md, weights_md, memory::desc(), src_md,
+                        strides_dims, dilates, padding_l, padding_r);
+                } catch (...) {
+                    return false;
+                }
+                algo = algorithm::convolution_auto;
+            }
+
+            convolution_backward_data::primitive_desc bwd_pd;
+            try {
+                bwd_pd = convolution_backward_data::primitive_desc(
+                    eng, algo,
+                    src_md, weights_md, src_md,
+                    strides_dims, dilates, padding_l, padding_r,
+                    fwd_pd);
+            } catch (...) {
+                if (algo != algorithm::convolution_auto) {
+                    try {
+                        bwd_pd = convolution_backward_data::primitive_desc(
+                            eng, algorithm::convolution_auto,
+                            src_md, weights_md, src_md,
+                            strides_dims, dilates, padding_l, padding_r,
+                            fwd_pd);
+                    } catch (...) {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+
+            entry = {bwd_pd, convolution_backward_data(bwd_pd)};
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                cache.insert({key, entry});
+            }
+        }
+
+        auto& bwd = entry.prim;
+        auto& bwd_pd = entry.pd;
+
+        Tensor grad_output_nhwc = grad_output.contiguous().permute({0, 2, 3, 1}).contiguous();
+        Tensor weight_hwio = weight.contiguous().permute({2, 3, 1, 0}).contiguous();
+
+        memory src_mem(src_md, eng, grad_output_nhwc.data_ptr<float>());
+        memory weights_mem(weights_md, eng, weight_hwio.data_ptr<float>());
+
+        Tensor grad_input_nhwc = Tensor::empty({N, H_in, W_in, C_in}, input.dtype(), input.device());
+        memory diff_src_mem(diff_src_md, eng, grad_input_nhwc.data_ptr<float>());
+
+        std::unordered_map<int, memory> args = {
+            {DNNL_ARG_DIFF_DST, src_mem},
+            {DNNL_ARG_WEIGHTS, weights_mem},
+            {DNNL_ARG_DIFF_SRC, diff_src_mem},
+        };
+        Storage scratch_handle;
+        if (bwd_pd.scratchpad_desc().get_size() > 0) {
+            scratch_handle = Storage(bwd_pd.scratchpad_desc().get_size(),
+                                       getAllocator(grad_input.device().type()));
+            args.insert({DNNL_ARG_SCRATCHPAD,
+                       memory(bwd_pd.scratchpad_desc(), eng, scratch_handle.data())});
+        }
+        bwd.execute(s, args);
+        s.wait();
+
+        Tensor grad_input_nchw = grad_input_nhwc.permute({0, 3, 1, 2}).contiguous();
+        if (grad_input.numel() == grad_input_nchw.numel()) {
+            std::memcpy(grad_input.data_ptr<float>(), grad_input_nchw.data_ptr<float>(),
+                       grad_input.numel() * sizeof(float));
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool conv2d_grad_weight_nhwc(
+    const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+    const std::vector<int64_t>& stride,
+    int64_t pH_top, int64_t pH_bottom, int64_t pW_left, int64_t pW_right,
+    const std::vector<int64_t>& dilation, int64_t groups,
+    Tensor& grad_weight) {
+    if (!OneDNNContext::is_enabled()) return false;
+    if (input.dtype() != DType::Float32) return false;
+    if (groups != 1) return false;
+    if (input.dim() != 4 || weight.dim() != 4) return false;
+
+    const int64_t N = input.size(0);
+    const int64_t C_in = input.size(1);
+    const int64_t H_in = input.size(2);
+    const int64_t W_in = input.size(3);
+    const int64_t C_out = weight.size(0);
+    const int64_t kH = weight.size(2);
+    const int64_t kW = weight.size(3);
+    const int64_t H_out = grad_output.size(2);
+    const int64_t W_out = grad_output.size(3);
+
+    ConvKey key;
+    key.n = N; key.ic = C_in; key.ih = H_in; key.iw = W_in;
+    key.oc = C_out; key.kh = kH; key.kw = kW;
+    key.oh = H_out; key.ow = W_out;
+    key.sh = stride[0]; key.sw = stride[1];
+    key.ph_t = pH_top; key.ph_b = pH_bottom; key.pw_l = pW_left; key.pw_r = pW_right;
+    key.dh = dilation[0]; key.dw = dilation[1];
+    key.groups = groups;
+    key.has_bias = false;
+    key.type = 2; // bwd_weights
+
+    struct CachedNHWCBwdWeights {
+        convolution_backward_weights::primitive_desc pd;
+        convolution_backward_weights prim;
+    };
+    static std::unordered_map<ConvKey, CachedNHWCBwdWeights> cache;
+    static std::mutex mtx;
+
+    try {
+        auto& eng = OneDNNContext::get_engine();
+        auto& s = OneDNNContext::get_stream();
+
+        memory::dims src_dims = {N, H_in, W_in, C_in};
+        memory::dims diff_dst_dims = {N, H_out, W_out, C_out};
+        memory::dims weights_dims = {kH, kW, C_in, C_out};
+        memory::dims strides_dims = {stride[0], stride[1]};
+        memory::dims padding_l = {pH_top, pW_left};
+        memory::dims padding_r = {pH_bottom, pW_right};
+        memory::dims dilates = {dilation[0] - 1, dilation[1] - 1};
+
+        auto src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::nhwc);
+        auto diff_dst_md = memory::desc(diff_dst_dims, memory::data_type::f32, memory::format_tag::nhwc);
+        auto weights_md = memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::hwio);
+
+        CachedNHWCBwdWeights entry;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            auto it = cache.find(key);
+            if (it != cache.end()) {
+                entry = it->second;
+                found = true;
+            }
+        }
+        if (!found) {
+            dnnl::algorithm algo = (kH == 3 && kW == 3)
+                ? algorithm::convolution_winograd
+                : algorithm::convolution_direct;
+            convolution_forward::primitive_desc fwd_pd;
+            try {
+                fwd_pd = convolution_forward::primitive_desc(
+                    eng, prop_kind::forward_inference, algo,
+                    src_md, weights_md, memory::desc(), diff_dst_md,
+                    strides_dims, dilates, padding_l, padding_r);
+            } catch (...) {
+                if (algo == algorithm::convolution_auto) return false;
+                try {
+                    fwd_pd = convolution_forward::primitive_desc(
+                        eng, prop_kind::forward_inference, algorithm::convolution_auto,
+                        src_md, weights_md, memory::desc(), diff_dst_md,
+                        strides_dims, dilates, padding_l, padding_r);
+                } catch (...) {
+                    return false;
+                }
+                algo = algorithm::convolution_auto;
+            }
+
+            convolution_backward_weights::primitive_desc bwd_w_pd;
+            try {
+                bwd_w_pd = convolution_backward_weights::primitive_desc(
+                    eng, algo,
+                    src_md, weights_md, memory::desc(), diff_dst_md,
+                    strides_dims, dilates, padding_l, padding_r,
+                    fwd_pd);
+            } catch (...) {
+                if (algo != algorithm::convolution_auto) {
+                    try {
+                        bwd_w_pd = convolution_backward_weights::primitive_desc(
+                            eng, algorithm::convolution_auto,
+                            src_md, weights_md, memory::desc(), diff_dst_md,
+                            strides_dims, dilates, padding_l, padding_r,
+                            fwd_pd);
+                    } catch (...) {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+
+            entry = {bwd_w_pd, convolution_backward_weights(bwd_w_pd)};
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                cache.insert({key, entry});
+            }
+        }
+
+        auto& bwd_w = entry.prim;
+        auto& bwd_w_pd = entry.pd;
+
+        Tensor input_nhwc = input.contiguous().permute({0, 2, 3, 1}).contiguous();
+        Tensor grad_output_nhwc = grad_output.contiguous().permute({0, 2, 3, 1}).contiguous();
+
+        memory src_mem(src_md, eng, input_nhwc.data_ptr<float>());
+        memory diff_dst_mem(diff_dst_md, eng, grad_output_nhwc.data_ptr<float>());
+
+        Tensor grad_w_hwio = Tensor::empty({kH, kW, C_in, C_out}, input.dtype(), input.device());
+        memory diff_weights_mem(weights_md, eng, grad_w_hwio.data_ptr<float>());
+
+        std::unordered_map<int, memory> args = {
+            {DNNL_ARG_SRC, src_mem},
+            {DNNL_ARG_DIFF_DST, diff_dst_mem},
+            {DNNL_ARG_DIFF_WEIGHTS, diff_weights_mem},
+        };
+        Storage scratch_handle;
+        if (bwd_w_pd.scratchpad_desc().get_size() > 0) {
+            scratch_handle = Storage(bwd_w_pd.scratchpad_desc().get_size(),
+                                     getAllocator(grad_weight.device().type()));
+            args.insert({DNNL_ARG_SCRATCHPAD,
+                       memory(bwd_w_pd.scratchpad_desc(), eng, scratch_handle.data())});
+        }
+        bwd_w.execute(s, args);
+        s.wait();
+
+        Tensor grad_w_oihw = grad_w_hwio.permute({3, 2, 0, 1}).contiguous();
+        if (grad_weight.numel() == grad_w_oihw.numel()) {
+            std::memcpy(grad_weight.data_ptr<float>(), grad_w_oihw.data_ptr<float>(),
+                       grad_weight.numel() * sizeof(float));
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+#endif // USE_ONEDNN
 
 static bool conv2d_grad_input_onednn(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
                                     const std::vector<int64_t>& stride,
@@ -2256,46 +2576,6 @@ static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg,
     // oneDNN claims the call first when enabled and its shape heuristics hold;
     // otherwise the call falls through to NNPACK or the native kernels.
     if (onednn_claims_conv2d(input, weight, sH, sW, dH, dW, groups)) {
-        // Optimization: Winograd Input Size Alignment (User Request: Break constraints)
-        // Force padding to multiple of 8 for 3x3s1 convolutions to enable Winograd on AVX2
-        // Only apply if input is NCHW (not blocked) to avoid messing up OneDNN formats
-        if (groups == 1 && kH == 3 && kW == 3 && sH == 1 && sW == 1 && dH == 1 && dW == 1 &&
-            input.dtype() == DType::Float32 && !input.unsafeGetTensorImpl()->has_onednn_md() &&
-            !fused_relu) {
-
-            int64_t h_padded_total = H_in + pH_top + pH_bottom;
-            int64_t w_padded_total = W_in + pW_left + pW_right;
-
-            int64_t pad_h_extra = (h_padded_total % 8 != 0) ? (8 - (h_padded_total % 8)) : 0;
-            int64_t pad_w_extra = (w_padded_total % 8 != 0) ? (8 - (w_padded_total % 8)) : 0;
-
-            // Check overhead to avoid performance regression
-            // Winograd usually gives 2-2.5x speedup, but padding adds copy + larger compute.
-            // We conservatively allow up to 15% overhead.
-            // 64x64 (pad=1) -> 66x66. Aligned to 72x72. Overhead ~19%. Too high.
-            double overhead = (double)((h_padded_total + pad_h_extra) * (w_padded_total + pad_w_extra)) /
-                              (double)(h_padded_total * w_padded_total);
-
-            if ((pad_h_extra > 0 || pad_w_extra > 0) && overhead < 1.15) {
-                // Apply padding: (left, right, top, bottom)
-                // We need to preserve existing padding logic, so we pass 0 to conv2d_onednn
-                // and apply ALL padding here.
-                std::vector<int64_t> pads = {pW_left, pW_right + pad_w_extra, pH_top, pH_bottom + pad_h_extra};
-                Tensor input_padded = constant_pad_nd_cpu(input, pads, 0.0f);
-
-                // Output size will be larger
-                int64_t H_out_padded = h_padded_total + pad_h_extra - 2; // 3x3 kernel: L - K + 1 = L - 3 + 1 = L - 2
-                int64_t W_out_padded = w_padded_total + pad_w_extra - 2;
-
-                Tensor out_padded = Tensor::empty({N, C_out, H_out_padded, W_out_padded}, input.dtype(), input.device());
-
-                if (conv2d_onednn(input_padded, weight, bias, stride, 0, 0, 0, 0, dilation, groups, out_padded)) {
-                     // Crop to original size
-                     return out_padded.slice(2, 0, H_out).slice(3, 0, W_out).contiguous();
-                }
-            }
-        }
-
         handled = conv2d_onednn(input, weight, bias, stride, pH_top, pH_bottom, pW_left, pW_right, dilation, groups, out, fused_relu);
     }
 #endif
@@ -3444,6 +3724,65 @@ Tensor conv_transpose3d_cpu(const Tensor& input, const Tensor& weight, const Ten
 }
 
 // conv2d_grad_input implementation (using col2im)
+// Validate the operand shapes of a conv2d backward call before any parallel
+// section: a mismatch discovered inside an OpenMP region would unwind through
+// the structured block, which terminates the process instead of reporting.
+// extra_output_h/w widen the accepted grad_output extent in both directions
+// for callers whose spatial sizes come from a transposed convolution with
+// output padding; the kernels derive every loop bound from the actual
+// grad_output extent, so anything inside the window computes correctly.
+static void check_conv2d_backward_shapes(
+        const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+        const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+        const std::vector<int64_t>& dilation, int64_t groups,
+        int64_t extra_output_h = 0, int64_t extra_output_w = 0) {
+    if (input.dim() != 4 || weight.dim() != 4 || grad_output.dim() != 4) {
+        TP_THROW(RuntimeError, "conv2d backward: expected 4D grad_output, input and weight");
+    }
+    const int64_t N = input.size(0);
+    const int64_t C_in = input.size(1);
+    const int64_t C_out = weight.size(0);
+    const int64_t C_in_group = weight.size(1);
+    if (C_in % groups != 0) {
+        TP_THROW(RuntimeError, "in_channels must be divisible by groups");
+    }
+    if (C_out % groups != 0) {
+        TP_THROW(RuntimeError, "out_channels must be divisible by groups");
+    }
+    if (C_in / groups != C_in_group) {
+        TP_THROW(RuntimeError, "Weight shape mismatch: expected " + std::to_string(C_in / groups) +
+                 " input channels per group, got " + std::to_string(C_in_group));
+    }
+    if (grad_output.size(0) != N) {
+        TP_THROW(RuntimeError, "grad_output batch size (" + std::to_string(grad_output.size(0)) +
+                 ") must match input batch size (" + std::to_string(N) + ")");
+    }
+    if (grad_output.size(1) != C_out) {
+        TP_THROW(RuntimeError, "grad_output channels (" + std::to_string(grad_output.size(1)) +
+                 ") must match weight out_channels (" + std::to_string(C_out) + ")");
+    }
+    const int64_t H_in = input.size(2);
+    const int64_t W_in = input.size(3);
+    const int64_t kH = weight.size(2);
+    const int64_t kW = weight.size(3);
+    const int64_t H_out =
+        (H_in + 2 * padding[0] - dilation[0] * (kH - 1) - 1) / stride[0] + 1;
+    const int64_t W_out =
+        (W_in + 2 * padding[1] - dilation[1] * (kW - 1) - 1) / stride[1] + 1;
+    if (grad_output.size(2) < H_out - extra_output_h ||
+        grad_output.size(2) > H_out + extra_output_h) {
+        TP_THROW(RuntimeError, "grad_output height (" + std::to_string(grad_output.size(2)) +
+                 ") must match the expected output height (" + std::to_string(H_out) +
+                 (extra_output_h ? " +/- " + std::to_string(extra_output_h) : "") + ")");
+    }
+    if (grad_output.size(3) < W_out - extra_output_w ||
+        grad_output.size(3) > W_out + extra_output_w) {
+        TP_THROW(RuntimeError, "grad_output width (" + std::to_string(grad_output.size(3)) +
+                 ") must match the expected output width (" + std::to_string(W_out) +
+                 (extra_output_w ? " +/- " + std::to_string(extra_output_w) : "") + ")");
+    }
+}
+
 Tensor conv2d_grad_input_cpu(const Tensor& grad_output, const Tensor& input, const Tensor& weight, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups) {
     // grad_output: (N, C_out, H_out, W_out)
     // weight: (C_out, C_in_group, kH, kW)
@@ -3477,10 +3816,12 @@ Tensor conv2d_grad_input_cpu(const Tensor& grad_output, const Tensor& input, con
     int64_t sH = stride[0]; int64_t sW = stride[1];
     int64_t pH = padding[0]; int64_t pW = padding[1];
     int64_t dH = dilation[0]; int64_t dW = dilation[1];
-    
+
+    check_conv2d_backward_shapes(grad_output, input, weight, stride, padding, dilation, groups);
+
     int64_t H_out = grad_output.size(2);
     int64_t W_out = grad_output.size(3);
-    
+
     Tensor grad_input = Tensor::zeros({N, C_in, H_in, W_in}, input.dtype(), input.device());
     
     Tensor grad_output_contig = grad_output.contiguous();
@@ -3536,6 +3877,9 @@ Tensor conv2d_grad_input_cpu(const Tensor& grad_output, const Tensor& input, con
     }
 
     #ifdef USE_ONEDNN
+    if (conv2d_grad_input_nhwc(grad_output_contig, input, weight, stride, pH, pH, pW, pW, dilation, groups, grad_input)) {
+        return grad_input;
+    }
     if (conv2d_grad_input_onednn(grad_output_contig, input, weight, stride, pH, pH, pW, pW, dilation, groups, grad_input)) {
         return grad_input;
     }
@@ -3590,11 +3934,12 @@ Tensor conv2d_grad_input_cpu(const Tensor& grad_output, const Tensor& input, con
     return grad_input;
 }
 
-Tensor conv2d_grad_weight_cpu(const Tensor& grad_output, const Tensor& input, const Tensor& weight, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups) {
+static Tensor conv2d_grad_weight_cpu_impl(const Tensor& grad_output, const Tensor& input, const Tensor& weight, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups, int64_t extra_output_h, int64_t extra_output_w) {
     if (conv_is_low_precision(grad_output.dtype())) {
-        return conv2d_grad_weight_cpu(grad_output.to(DType::Float32), input.to(DType::Float32),
+        return conv2d_grad_weight_cpu_impl(grad_output.to(DType::Float32), input.to(DType::Float32),
                                       weight.to(DType::Float32),
-                                      stride_arg, padding_arg, dilation_arg, groups).to(grad_output.dtype());
+                                      stride_arg, padding_arg, dilation_arg, groups,
+                                      extra_output_h, extra_output_w).to(grad_output.dtype());
     }
     if (grad_output.dtype() == DType::Float64) {
         auto stride = expand_param(stride_arg, 2, "stride");
@@ -3622,10 +3967,13 @@ Tensor conv2d_grad_weight_cpu(const Tensor& grad_output, const Tensor& input, co
     int64_t sH = stride[0]; int64_t sW = stride[1];
     int64_t pH = padding[0]; int64_t pW = padding[1];
     int64_t dH = dilation[0]; int64_t dW = dilation[1];
-    
+
+    check_conv2d_backward_shapes(grad_output, input, weight, stride, padding, dilation, groups,
+                                 extra_output_h, extra_output_w);
+
     int64_t H_out = grad_output_contig.size(2);
     int64_t W_out = grad_output_contig.size(3);
-    
+
     Tensor grad_weight = Tensor::zeros(static_cast<std::vector<int64_t>>(weight.shape()), weight.dtype(), weight.device());
     
     // Optimization: 1x1 NCHW MatMul (User Request: MatMul Algorithm)
@@ -3678,6 +4026,9 @@ Tensor conv2d_grad_weight_cpu(const Tensor& grad_output, const Tensor& input, co
     }
 
     #ifdef USE_ONEDNN
+    if (conv2d_grad_weight_nhwc(grad_output_contig, input_contig, weight, stride, pH, pH, pW, pW, dilation, groups, grad_weight)) {
+        return grad_weight;
+    }
     if (conv2d_grad_weight_onednn(grad_output_contig, input_contig, weight, stride, pH, pH, pW, pW, dilation, groups, grad_weight)) {
         return grad_weight;
     }
@@ -3758,8 +4109,12 @@ Tensor conv2d_grad_weight_cpu(const Tensor& grad_output, const Tensor& input, co
     } else {
         TP_THROW(NotImplementedError, "conv2d_grad_weight only supports Float32");
     }
-    
+
     return grad_weight;
+}
+
+Tensor conv2d_grad_weight_cpu(const Tensor& grad_output, const Tensor& input, const Tensor& weight, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups) {
+    return conv2d_grad_weight_cpu_impl(grad_output, input, weight, stride_arg, padding_arg, dilation_arg, groups, 0, 0);
 }
 
 Tensor conv2d_grad_bias_cpu(const Tensor& grad_output, const Tensor& input, const Tensor& weight, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups) {
@@ -4389,7 +4744,9 @@ Tensor conv_transpose2d_grad_weight_cpu(const Tensor& grad_output, const Tensor&
         }
     }
 #endif // USE_ONEDNN
-    return conv2d_grad_weight_cpu(input, grad_output, weight, stride, padding, dilation, groups);
+    return conv2d_grad_weight_cpu_impl(input, grad_output, weight, stride, padding, dilation, groups,
+                                       output_padding.empty() ? 0 : output_padding[0],
+                                       output_padding.size() < 2 ? 0 : output_padding[1]);
 }
 
 Tensor conv_transpose2d_grad_bias_cpu(const Tensor& grad_output, const Tensor& input, const Tensor& weight, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& output_padding, int64_t groups, const std::vector<int64_t>& dilation) {
