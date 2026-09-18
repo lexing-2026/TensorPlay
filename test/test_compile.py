@@ -40,7 +40,11 @@ def test_compile_uses_single_public_entrypoint_and_stax_backend():
     assert not hasattr(tp, "not_a_tensorplay_name")
     assert actual.tolist() == expected.tolist()
     assert compiled._tensorplay_backend == "stax"
-    assert tp.compiler.list_backends() == ["cudagraphs", "onnxrt", "stax", "tvm"]
+    # The core set must always be registered; optional providers (e.g.
+    # tensorrt through the onnxruntime bridge) depend on the environment.
+    assert {"cudagraphs", "onnxrt", "stax", "tvm"}.issubset(
+        tp.compiler.list_backends()
+    )
 
 
 def test_custom_backend_receives_graph_module_and_caches_specializations():

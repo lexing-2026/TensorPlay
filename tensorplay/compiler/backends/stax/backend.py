@@ -697,6 +697,7 @@ def _build_pointwise_program(
     extra_refs: dict[Node, int] | None = None,
     input_slots: int | None = None,
     constants: list[float] | None = None,
+    extra_outputs: list[Node] | None = None,
 ) -> tuple[list[Node], list[int], list[float], list[tuple[str, int, int, int]], int] | None:
     """Encode one canonical pointwise graph as Stax's postfix program.
 
@@ -717,6 +718,11 @@ def _build_pointwise_program(
     Values are typed numerically — comparisons yield booleans, everything
     else yields floats, and the program output must be a float value (the
     store path types outputs off the sample dtype).
+
+    ``extra_outputs`` names additional result nodes the kernel stores
+    alongside the main one (horizontal fusion).  When given, the return
+    grows a sixth element: a tuple of refs for those nodes, in call order —
+    each becomes one more ``out_ptr`` at the shared reference shape.
     """
 
     table = _TRITON_OPCODES if opcodes is None else opcodes
@@ -881,14 +887,29 @@ def _build_pointwise_program(
             for value in _nodes(output.args)
         ]
     )
-    if (not program and not allow_empty) or len(output_values) != 1 or (
+    expected_outputs = 1 if extra_outputs is None else 1 + len(extra_outputs)
+    if (not program and not allow_empty) or len(output_values) != expected_outputs or (
         output_values[0] not in refs
     ):
         return None
     if value_type(refs[output_values[0]]) != "num":
         # A boolean program output would need a typed store path.
         return None
-    return external_nodes, program, constants, instructions, refs[output_values[0]]
+    if extra_outputs is None:
+        return external_nodes, program, constants, instructions, refs[output_values[0]]
+    extra_output_refs = []
+    for node in extra_outputs:
+        if node not in refs or value_type(refs[node]) != "num":
+            return None
+        extra_output_refs.append(refs[node])
+    return (
+        external_nodes,
+        program,
+        constants,
+        instructions,
+        refs[output_values[0]],
+        tuple(extra_output_refs),
+    )
 
 
 def _broadcast_shape(shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...] | None:
@@ -2230,6 +2251,10 @@ def _lower_cpu_segmented(
         classify_reduction=classify_reduction,
     )
     if segments is None:
+        return None
+    if any(len(segment.exports) > 1 for segment in segments):
+        # Horizontal fusion (extra kernel stores) is a Triton-path
+        # capability; the CPU mixed scheduler keeps one value per kernel.
         return None
     if any(segment.epilogue for segment in segments):
         return None
