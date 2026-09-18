@@ -6,6 +6,17 @@
 #include <iostream>
 #include <unordered_map>
 #include <tuple>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <set>
+#include <thread>
+#include <exception>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace tensorplay {
 namespace stax {
@@ -249,8 +260,10 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
         return std::get<int64_t>(it->second);
     };
 
-    for (const auto& node_ptr : nodes) {
-        const OpNode& node = *node_ptr;
+    // The dispatch body is wrapped so the scheduler below can run
+    // independent nodes concurrently; the eager engine gets that overlap at
+    // residual forks for free and a sequential walk forfeits it.
+    auto run_node = [&](const OpNode& node) -> void {
         if (node.outputs.empty()) {
             throw std::runtime_error("Stax operation has no output: " + node.op_type);
         }
@@ -629,8 +642,7 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
             env[node.outputs[0]->id] = std::get<0>(backward);
             env[node.outputs[1]->id] = std::get<1>(backward);
             env[node.outputs[2]->id] = std::get<2>(backward);
-            release_inputs(node);
-            continue;
+            return;
         } else if (node.op_type == "reshape") {
             if (node.inputs.size() != 1) {
                 throw std::runtime_error("Stax reshape expects one input");
@@ -700,8 +712,7 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                     result = tpx::ops::fused_mul_add(
                         value(node.inputs[0]), *mul_scalar, *add_scalar);
                     env[node.outputs[0]->id] = std::move(result);
-                    release_inputs(node);
-                    continue;
+                    return;
                 }
                 Tensor product = tpx::ops::mul(value(node.inputs[0]), *mul_scalar);
                 result = add_scalar.has_value()
@@ -749,8 +760,7 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
             for (size_t oi = 0; oi < op_outputs.size(); ++oi) {
                 env[node.outputs[oi]->id] = std::move(op_outputs[oi]);
             }
-            release_inputs(node);
-            handled_by_custom_op = true;
+            return;
         } else {
             throw std::runtime_error("Stax Graph::execute does not support op: " + node.op_type);
         }
@@ -762,6 +772,118 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                     node.op_type);
             }
             env[node.outputs[0]->id] = std::move(result);
+        }
+    };
+
+    // Fork-point overlap: with several workers, independent ready nodes run
+    // concurrently and the residual-branch chains stop serializing.  Graphs
+    // without forks (a single ready node at any time) gain nothing and only
+    // pay the synchronization, so they keep the sequential walk.
+    bool has_custom_op = false;
+    for (const auto& node_ptr : nodes) {
+        if (node_ptr->op_type == "custom_op") {
+            has_custom_op = true;
+            break;
+        }
+    }
+#ifdef _OPENMP
+    const unsigned worker_budget = static_cast<unsigned>(omp_get_max_threads());
+#else
+    const unsigned worker_budget = 1;
+#endif
+    if (nodes.size() >= 24 && !has_custom_op && worker_budget > 1) {
+        std::vector<int> producer_of(this->values.size(), -1);
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            for (const auto& o : nodes[i]->outputs) {
+                producer_of[o->id] = static_cast<int>(i);
+            }
+        }
+        std::vector<int> indegree(nodes.size(), 0);
+        std::vector<std::vector<int>> succs(nodes.size());
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            std::set<int> distinct;
+            for (const ValueNode* in : nodes[i]->inputs) {
+                int producer = producer_of[in->id];
+                if (producer >= 0) {
+                    distinct.insert(producer);
+                }
+            }
+            indegree[i] = static_cast<int>(distinct.size());
+            for (int producer : distinct) {
+                succs[producer].push_back(static_cast<int>(i));
+            }
+        }
+        std::mutex sched_mtx;
+        std::condition_variable sched_cv;
+        std::deque<size_t> ready;
+        std::vector<int> pending(nodes.size(), 0);
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            pending[i] = indegree[i];
+            if (indegree[i] == 0) {
+                ready.push_back(i);
+            }
+        }
+        size_t completed = 0;
+        bool aborted = false;
+        std::exception_ptr error;
+        auto worker = [&]() {
+            for (;;) {
+                size_t idx;
+                {
+                    std::unique_lock<std::mutex> lock(sched_mtx);
+                    sched_cv.wait(lock, [&] {
+                        return aborted || !ready.empty() || completed == nodes.size();
+                    });
+                    if (aborted || ready.empty()) {
+                        return;
+                    }
+                    idx = ready.front();
+                    ready.pop_front();
+                }
+                try {
+                    run_node(*nodes[idx]);
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(sched_mtx);
+                    if (!error) {
+                        error = std::current_exception();
+                    }
+                    aborted = true;
+                    sched_cv.notify_all();
+                    return;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(sched_mtx);
+                    release_inputs(*nodes[idx]);
+                    for (int succ : succs[idx]) {
+                        if (--pending[succ] == 0) {
+                            ready.push_back(static_cast<size_t>(succ));
+                        }
+                    }
+                    ++completed;
+                }
+                sched_cv.notify_all();
+            }
+        };
+        size_t extra = static_cast<size_t>(worker_budget - 1);
+        if (extra > 8) {
+            extra = 8;
+        }
+        std::vector<std::thread> threads;
+        threads.reserve(extra);
+        for (size_t t = 0; t < extra; ++t) {
+            threads.emplace_back(worker);
+        }
+        worker();
+        for (auto& thread : threads) {
+            thread.join();
+        }
+        if (error) {
+            std::rethrow_exception(error);
+        }
+    } else {
+        for (const auto& node_ptr : nodes) {
+            const OpNode& node = *node_ptr;
+            run_node(node);
             release_inputs(node);
         }
     }
