@@ -161,19 +161,84 @@ PyOpSlot parse_bridge_key(const std::string& device_type) {
 
 } // namespace
 
+namespace {
+
+// tensor() is a flagship constructor, so its argument errors and repr are
+// part of the public face.  The pybind11 typed-arg surface answers a mismatch
+// with an aggregate "incompatible function arguments" dump that spells out
+// internal type names, and its function-record object leaks a mangled helper
+// type into repr.  A plain METH_FASTCALL entry with the bridge's shared
+// parser keeps the same accepted argument surface while errors quote only
+// the public argument names and repr reads as a built-in function.
+PyObject* tensor_fastcall(PyObject*, PyObject* const* args, Py_ssize_t nargs,
+                          PyObject* kwnames) {
+    try {
+        static const char* kwlist[] = {"data", "dtype", "device", "pin_memory",
+                                       "requires_grad", nullptr};
+        if (nargs > 1) {
+            throw std::invalid_argument("tensor: too many positional arguments");
+        }
+        PyObject* slots[5];
+        tensorplay::python_c::tpx_py_parse_into(args, nargs, kwnames, kwlist, 5,
+                                                "tensor", slots);
+        if (slots[0] == nullptr) {
+            throw std::invalid_argument(
+                "tensor: missing required argument \"data\"");
+        }
+        py::object data = py::reinterpret_borrow<py::object>(slots[0]);
+        std::optional<DType> dtype;
+        if (slots[1] != nullptr && slots[1] != Py_None) {
+            if (!py::isinstance<DType>(py::handle(slots[1]))) {
+                throw std::invalid_argument(
+                    std::string("tensor: argument 'dtype' must be dtype, not ")
+                    + Py_TYPE(slots[1])->tp_name);
+            }
+            dtype = py::reinterpret_borrow<py::object>(slots[1]).cast<DType>();
+        }
+        std::optional<Device> device;
+        if (slots[2] != nullptr && slots[2] != Py_None) {
+            if (!PyUnicode_Check(slots[2])
+                && !py::isinstance<Device>(py::handle(slots[2]))) {
+                throw std::invalid_argument(
+                    std::string("tensor: argument 'device' must be Device, not ")
+                    + Py_TYPE(slots[2])->tp_name);
+            }
+            device = tensorplay::python_c::tpx_py_device(slots[2]);
+        }
+        auto bool_arg = [&](PyObject* slot, const char* name) {
+            if (slot == nullptr || slot == Py_False) return false;
+            if (slot == Py_True) return true;
+            throw std::invalid_argument(
+                std::string("tensor: argument '") + name + "' must be bool, not "
+                + Py_TYPE(slot)->tp_name);
+        };
+        bool pin_memory = bool_arg(slots[3], "pin_memory");
+        bool requires_grad = bool_arg(slots[4], "requires_grad");
+        Tensor t = create_tensor(data, dtype, device);
+        if (pin_memory) t = Tensor(t.pin_memory());
+        if (requires_grad) {
+            tensorplay::tpx::impl::set_requires_grad(t, true);
+        }
+        return tensorplay::python_c::tpx_py_wrap(t);
+    } catch (const std::exception& e) {
+        tensorplay::python_c::tpx_py_set_error(e);
+        return nullptr;
+    }
+}
+
+PyMethodDef tensor_def = {
+    "tensor", (PyCFunction)(void*)tensor_fastcall,
+    METH_FASTCALL | METH_KEYWORDS,
+    "tensor(data, *, dtype: Optional[DType] = None, device: Optional[Device] "
+    "= None, pin_memory: bool = False, requires_grad: bool = False) -> Tensor"};
+
+}  // namespace
+
 void init_ops(py::module_& m) {
     // Module functions
-    m.def("tensor", [](py::object data, std::optional<DType> dtype, std::optional<Device> device,
-                        bool pin_memory, bool requires_grad) {
-         Tensor t = create_tensor(data, dtype, device);
-         if (pin_memory) t = Tensor(t.pin_memory());
-         if (requires_grad) {
-             tensorplay::tpx::impl::set_requires_grad(t, true);
-         }
-         return t;
-    }, "data"_a, py::kw_only(), "dtype"_a = py::none(), "device"_a = py::none(),
-       "pin_memory"_a = false, "requires_grad"_a = false,
-    "tensor(data, *, dtype: Optional[DType] = None, device: Optional[Device] = None, pin_memory: bool = False, requires_grad: bool = False) -> Tensor");
+    static PyObject* module_name = PyUnicode_InternFromString("tensorplay._C");
+    m.add_object("tensor", py::reinterpret_steal<py::object>(
+        PyCFunction_NewEx(&tensor_def, nullptr, module_name)));
 
 
     // Python implementation is functionally correct but spends most of a
@@ -348,19 +413,13 @@ void init_ops(py::module_& m) {
                 // trampoline resolves the composite implementation itself.
                 entry->composite = std::move(kernel);
                 tensorplay::Dispatcher::singleton().registerKernel(
-                    op_name, tensorplay::DispatchKey::CPU,
-                    reinterpret_cast<tensorplay::KernelFunction>(
-                        &python_op_trampoline));
+                    op_name, tensorplay::DispatchKey::CPU, &python_op_trampoline);
                 tensorplay::Dispatcher::singleton().registerKernel(
-                    op_name, tensorplay::DispatchKey::CUDA,
-                    reinterpret_cast<tensorplay::KernelFunction>(
-                        &python_op_trampoline));
+                    op_name, tensorplay::DispatchKey::CUDA, &python_op_trampoline);
                 return;
         }
         tensorplay::Dispatcher::singleton().registerKernel(
-            op_name, dispatch_key,
-            reinterpret_cast<tensorplay::KernelFunction>(
-                &python_op_trampoline));
+            op_name, dispatch_key, &python_op_trampoline);
     }, "op_name"_a, "device_type"_a, "kernel"_a);
 
     m.def("_call_native_op", [](const std::string& op_name,

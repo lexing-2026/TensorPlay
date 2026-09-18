@@ -667,16 +667,20 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
         # receiver's named `self` slot is patched in afterwards.  A method
         # taking only `self` has no user slots: skip the zero-length array
         # (MSVC forbids it) and let the parser run with a null sink.
+        #
+        # Argument errors quote the Python-visible base name: the overload
+        # suffix in the schema name is an internal dispatch identity users
+        # never spell, and every entry point registers under the base name.
         user_idx = [i for i in range(nargs) if i != self_idx]
         if user_idx:
             body.append(f"        PyObject* uslots[{nargs - 1}];")
             body.append(
                 f'        tpx_py_parse_into({arg_arr}, {arg_n}, kwnames, kwlist, '
-                f'{nargs - 1}, "{f.func_name}", uslots);')
+                f'{nargs - 1}, "{f.base_name}", uslots);')
         else:
             body.append(
                 f'        tpx_py_parse_into({arg_arr}, {arg_n}, kwnames, kwlist, '
-                f'0, "{f.func_name}", nullptr);')
+                f'0, "{f.base_name}", nullptr);')
         for u, i in enumerate(user_idx):
             body.append(f"        slots[{i}] = uslots[{u}];")
         body.append(f"        slots[{self_idx}] = self;")
@@ -684,17 +688,17 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
             # std::invalid_argument (not a Python error) so multi-overload
             # dispatch can fall through to the next candidate signature.
             body.append(f"        if (nargs > {user_pos}) {{")
-            body.append(f'            throw std::invalid_argument("{f.func_name}: '
+            body.append(f'            throw std::invalid_argument("{f.base_name}: '
                         'too many positional arguments");')
             body.append("        }")
     else:
         sink = "slots" if nargs else "nullptr"
         body.append(
             f'        tpx_py_parse_into({arg_arr}, {arg_n}, kwnames, kwlist, '
-            f'{nargs}, "{f.func_name}", {sink});')
+            f'{nargs}, "{f.base_name}", {sink});')
         if not splat and user_pos < nargs:
             body.append(f"        if (nargs > {user_pos}) {{")
-            body.append(f'            throw std::invalid_argument("{f.func_name}: '
+            body.append(f'            throw std::invalid_argument("{f.base_name}: '
                         'too many positional arguments");')
             body.append("        }")
     out.extend(body)
@@ -724,7 +728,7 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
         check_n = nargs - 1 if is_method else nargs
         out.append(
             f'        tpx_py_check_types({check_arr}, {check_n}, '
-            f'"{f.func_name}", kwlist, tpx_kinds, {user_pos});')
+            f'"{f.base_name}", kwlist, tpx_kinds, {user_pos});')
 
     first_default = 0
     splat_slot = -1
@@ -751,7 +755,7 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
             # never flow into the unpackers -- they would deref null.
             out.append(f"        if ({src} == nullptr) {{")
             out.append(
-                f'            throw std::invalid_argument("{f.func_name}: '
+                f'            throw std::invalid_argument("{f.base_name}: '
                 f'missing required argument \\"{name}\\"");')
             out.append("        }")
             out.append(f"        PyObject* r_{i} = {src};")
