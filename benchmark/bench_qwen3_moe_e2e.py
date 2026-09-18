@@ -288,6 +288,9 @@ def install_alias():
         _register(name, mod)
 
 
+NATIVE_DTYPE = None  # set from --dtype in main()
+
+
 def build_native_model(model_dir):
     """Patch the few machinery pieces, then build and load the model."""
     import tensorplay as tp
@@ -321,7 +324,14 @@ def build_native_model(model_dir):
     PreTrainedModel.post_init = lambda self: None
     config = Qwen3MoeConfig.from_pretrained(str(model_dir))
     config._attn_implementation = "sdpa"
-    model = Qwen3MoeForCausalLM(config)
+    # Match the reference runner's load dtype: parameters are constructed in
+    # the checkpoint's precision instead of being silently upcast to fp32.
+    prev_default = tp.get_default_dtype()
+    tp.set_default_dtype(NATIVE_DTYPE)
+    try:
+        model = Qwen3MoeForCausalLM(config)
+    finally:
+        tp.set_default_dtype(prev_default)
     model.lm_head.weight = model.model.embed_tokens.weight
 
     sd = tp_ser.load(str(model_dir / "model.safetensors"))
@@ -360,7 +370,14 @@ def build_native_model(model_dir):
     return model
 
 
+def tp_dtype_module():
+    import tensorplay as _tp
+    return _tp
+
+
 def run_native(args):
+    global NATIVE_DTYPE
+    NATIVE_DTYPE = getattr(tp_dtype_module(), args.dtype)
     install_alias()
     if getattr(args, "tf32", False):
         import tensorplay as _tp_flag
@@ -427,6 +444,7 @@ def main():
     ap.add_argument("--gen-tokens", type=int, default=24)
     ap.add_argument("--timing-runs", type=int, default=3)
     ap.add_argument("--tf32", action="store_true")
+    ap.add_argument("--dtype", choices=("float16", "float32"), default="float16")
     args = ap.parse_args()
     if args.side == "ref":
         run_reference(args)
