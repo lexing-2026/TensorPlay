@@ -62,6 +62,24 @@ def _capture_line(lines, fn_name, params, kwparams=()):
     lines.append('            return _captured')
 
 
+def _out_capture_lines(fn_name, params, kwparams=(), indent='    '):
+    # The out= branch forwards native argument spellings (``self=``) to _C.
+    # Under capture the dispatcher records the public function as the node
+    # target, so the node would carry names the public signature rejects;
+    # recording through _capture_call keeps the public spelling, with the
+    # destination riding as the ``out`` keyword.
+    tup = ', '.join(params)
+    if len(params) == 1:
+        tup += ','
+    kw = '{' + ', '.join([f"'{k}': {k}" for k in kwparams] + ["'out': out"]) + '}'
+    return [
+        f'{indent}if _capturing():',
+        f'{indent}    _captured = _capture_call({fn_name}, ({tup}), {kw})',
+        f'{indent}    if _captured is not None:',
+        f'{indent}        return _captured',
+    ]
+
+
 def _sig_param(a) -> str:
     s = _param_name(a)
     if a.default:
@@ -298,6 +316,7 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
             lines += [
                 'def matmul(input, other, *, out=None):',
                 '    if out is not None:',
+                *_out_capture_lines('matmul', ['input', 'other'], indent='        '),
                 '        return _C.matmul(input, other, out=out)',
                 '    if _capturing():',
                 '        _captured = _capture_call(matmul, (input, other), {})',
@@ -368,7 +387,17 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
             # integral args -> int64, any float arg -> default float dtype.
             # Passing Undefined through the binding crashes on some builds.
             lines += [
-                'def arange(*args, dtype=DType.undefined, device=None, requires_grad=False):',
+                'def arange(*args, dtype=DType.undefined, device=None, requires_grad=False, out=None):',
+                '    if out is not None:',
+                "        # The out= contract takes the destination's dtype and device.",
+                *_out_capture_lines('arange', ['*args'], indent='        '),
+                '        if len(args) == 1:',
+                '            return _C.arange(args[0], out=out)',
+                '        if len(args) == 2:',
+                '            return _C.arange(args[0], args[1], out=out)',
+                '        if len(args) == 3:',
+                '            return _C.arange(args[0], args[1], args[2], out=out)',
+                "        raise TypeError(f'arange expected 1-3 positional arguments, got {len(args)}')",
                 "    _captured = _capture_call(arange, tuple(args), {'dtype': dtype, 'device': device, 'requires_grad': requires_grad})",
                 '    if _captured is not None:',
                 '        return _captured',
@@ -577,6 +606,8 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                     'def bernoulli(input, p=_MISSING, *, generator=None, out=None):',
                     '    if p is _MISSING:',
                     '        if out is not None:',
+                    *_out_capture_lines('bernoulli', ['input'], ['generator'],
+                                        indent='            '),
                     '            return _C.bernoulli(self=input, generator=generator, out=out)',
                     '        if _capturing():',
                     "            _captured = _capture_call(bernoulli, (input,), {'generator': generator})",
@@ -584,6 +615,8 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                     '                return _captured',
                     '        return _C.bernoulli(self=input, generator=generator)',
                     '    if out is not None:',
+                    *_out_capture_lines('bernoulli', ['input', 'p'], ['generator'],
+                                        indent='        '),
                     '        return _C.bernoulli(self=input, p=p, generator=generator, out=out)',
                     '    if _capturing():',
                     "        _captured = _capture_call(bernoulli, (input, p), {'generator': generator})",
@@ -708,6 +741,11 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                     lines.append(f'    if {kw_extra_name} is not _MISSING:')
                     if kw_out:
                         lines.append('        if out is not None:')
+                        lines += _out_capture_lines(
+                            name, pos_names,
+                            [_param_name(a) for a in f.args if a.kwonly]
+                            + [kw_extra_name],
+                            indent='            ')
                         lines.append(
                             f'            return _C.{name}('
                             f'{", ".join(kw_call + ["out=out"])})')
@@ -727,13 +765,19 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                         '                return _captured',
                         f'        return _C.{name}({", ".join(kw_call)})',
                     ]
+                out_capture = _out_capture_lines(
+                    name, pos_names,
+                    [_param_name(a) for a in f.args if a.kwonly],
+                    indent='        ')
                 if fwd is not None:
                     lines.append(
                         f'    if out is not None:')
+                    lines += out_capture
                     lines.append(
                         f'        return _C.{name}({", ".join(fwd + ["out=out"])})')
                 else:
                     lines.append('    if out is not None:')
+                    lines += out_capture
                     lines.append(f'        return _C.{name}({kw}, out=out)')
                 _capture_line(
                     lines,

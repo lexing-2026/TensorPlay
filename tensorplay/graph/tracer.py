@@ -297,7 +297,18 @@ class Tracer:
                 if sample is not None:
                     self._samples[parameter.name] = sample
                     self._node_samples[placeholder_node.name] = sample
-                values[parameter.name] = self.proxy(placeholder_node)
+                if (
+                    sample is None
+                    and parameter.name in self.sample_inputs
+                    and parameter.kind is not inspect.Parameter.POSITIONAL_ONLY
+                ):
+                    # A None input is part of the specialization key, so
+                    # the traced body sees the constant: ``x is None``
+                    # branches resolve at capture time.  The placeholder
+                    # stays so the graph keeps the caller's signature.
+                    values[parameter.name] = None
+                else:
+                    values[parameter.name] = self.proxy(placeholder_node)
 
         with compiler_context():
             if _is_module(root):
