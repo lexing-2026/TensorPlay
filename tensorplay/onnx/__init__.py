@@ -27,7 +27,12 @@ from ._composite_ops import (
     lookup_function_handler,
     lookup_method_handler,
 )
-from ._type_mapping import _np_dtype_to_onnx, _size_to_tuple, _to_numpy
+from ._type_mapping import (
+    _dtype_to_numpy,
+    _np_dtype_to_onnx,
+    _size_to_tuple,
+    _to_numpy,
+)
 from ._verify import VerificationError, VerificationResult, verify_model
 from .errors import (
     OnnxExporterError,
@@ -103,6 +108,16 @@ def _annotate(result: Any, sample: Any) -> Any:
 
 
 def _numpy_dtype(tensor: Any) -> Any:
+    # Annotate from the dtype metadata first: a device-resident sample cannot
+    # be materialized on the host without a transfer, and reading an input's
+    # type must never force one.  Exotic dtypes fall back to host
+    # materialization (bfloat16 rounds through float32 there).
+    dtype = getattr(tensor, "dtype", None)
+    if dtype is not None:
+        try:
+            return _dtype_to_numpy(dtype)
+        except TypeError:
+            pass
     try:
         return _to_numpy(tensor).dtype
     except Exception:  # noqa: BLE001 - exotic dtypes stay unannotated
