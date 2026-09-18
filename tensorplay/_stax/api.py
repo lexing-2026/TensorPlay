@@ -35,6 +35,11 @@ from tensorplay.graph.passes.regional_inductor_invoke_subgraph import (
     regional_inductor_invoke_subgraph,
 )
 from .registry import CompilerFn, get_default_backend, lookup_backend
+from .region_cache import (
+    load_region,
+    region_key as make_region_key,
+    store_region,
+)
 
 
 _compiled_wrappers: WeakSet[Any] = WeakSet()
@@ -500,6 +505,11 @@ def compile(
                     kwargs,
                     fullgraph=fullgraph,
                     backend_kwargs=backend_kwargs,
+                    region_key=make_region_key(
+                        target_cache,
+                        model if _is_module_like(model) else None,
+                        key,
+                    ),
                 )
                 # Keys gain a guard component once capture reveals metadata
                 # reads or control-flow gates; invalidate so entries are stored
@@ -601,38 +611,44 @@ def _compile_region(
     *,
     fullgraph: bool,
     backend_kwargs: dict[str, Any],
+    region_key: str | None = None,
 ) -> tuple[Callable[..., Any], GraphModule]:
-    try:
-        with _compiler_context():
-            graph_module = Tracer(execute=True).trace(
-                model,
-                sample_inputs=_bind_sample_arguments(
-                    model, example_inputs, example_kwargs
-                ),
-            )
-            # Default capture pipeline: canonicalize operators, then constant
-            # folding, then decomposition, common-subexpression elimination
-            # and dead code elimination; fusion hints are stamped last so
-            # they see the final graph.  CSE runs after decomposition so
-            # shared sub-chains across rewritten composites collapse too
-            # (two gelu sites share one erf chain).  Backends always receive
-            # a folded, linted, hint-annotated graph; ShapeProp below
-            # additionally annotates tensor shapes.
-            pass_result = PassManager(
-                [
-                    NormalizeOperators(),
-                    ConstFold(),
-                    DecomposePass(),
-                    CSEPass(get_CSE_banned_ops()),
-                    DeadCodeElimination(),
-                    PointwiseFusionHint(),
-                ]
-            )(graph_module)
-            graph_module = pass_result.graph_module
-    except GraphCaptureError as exc:
-        raise GraphCaptureError(
-            "TensorPlay could not capture the requested compiler region"
-        ) from exc
+    stored = load_region(region_key)
+    if stored is not None:
+        graph_module = stored
+    else:
+        try:
+            with _compiler_context():
+                graph_module = Tracer(execute=True).trace(
+                    model,
+                    sample_inputs=_bind_sample_arguments(
+                        model, example_inputs, example_kwargs
+                    ),
+                )
+                # Default capture pipeline: canonicalize operators, then constant
+                # folding, then decomposition, common-subexpression elimination
+                # and dead code elimination; fusion hints are stamped last so
+                # they see the final graph.  CSE runs after decomposition so
+                # shared sub-chains across rewritten composites collapse too
+                # (two gelu sites share one erf chain).  Backends always receive
+                # a folded, linted, hint-annotated graph; ShapeProp below
+                # additionally annotates tensor shapes.
+                pass_result = PassManager(
+                    [
+                        NormalizeOperators(),
+                        ConstFold(),
+                        DecomposePass(),
+                        CSEPass(get_CSE_banned_ops()),
+                        DeadCodeElimination(),
+                        PointwiseFusionHint(),
+                    ]
+                )(graph_module)
+                graph_module = pass_result.graph_module
+        except GraphCaptureError as exc:
+            raise GraphCaptureError(
+                "TensorPlay could not capture the requested compiler region"
+            ) from exc
+        store_region(region_key, graph_module)
 
     # Backend failures are compiler failures, not graph breaks.  In
     # particular, a Stax lowering error must not silently turn a requested
