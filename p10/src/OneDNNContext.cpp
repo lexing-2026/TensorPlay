@@ -109,12 +109,17 @@ DnnlThreadpoolBridge& get_bridge() {
 #endif // THREADPOOL runtime
 
 dnnl::stream& OneDNNContext::get_stream() {
+    // oneDNN streams are not thread-safe for concurrent primitive execution,
+    // and several kernels (winograd backward, conv backward) call gemm/conv
+    // primitives from inside parallel regions. Give every thread its own
+    // stream so concurrent primitive execution is safe; the scratchpad
+    // discipline already used by callers keeps memory objects disjoint.
 #if DNNL_CPU_RUNTIME == DNNL_RUNTIME_THREADPOOL
-    static dnnl::stream* s = new dnnl::stream(
+    thread_local dnnl::stream* s = new dnnl::stream(
         dnnl::threadpool_interop::make_stream(get_engine(), &get_bridge()));
     return *s;
 #else
-    static dnnl::stream* s = new dnnl::stream(get_engine());
+    thread_local dnnl::stream* s = new dnnl::stream(get_engine());
     return *s;
 #endif
 }

@@ -20,6 +20,11 @@ const char* dtype_name(DType dtype) {
         case DType::ComplexFloat: return "complex64";
         case DType::ComplexDouble: return "complex128";
         case DType::BComplex32: return "bcomplex32";
+        case DType::Float8_e4m3fn: return "float8_e4m3fn";
+        case DType::Float8_e4m3fnuz: return "float8_e4m3fnuz";
+        case DType::Float8_e5m2: return "float8_e5m2";
+        case DType::Float8_e5m2fnuz: return "float8_e5m2fnuz";
+        case DType::Float8_e8m0fnu: return "float8_e8m0fnu";
         case DType::QInt8: return "qint8";
         case DType::QUInt8: return "quint8";
         case DType::QInt32: return "qint32";
@@ -53,6 +58,11 @@ void init_dtype(py::module_& m) {
         .value("complex64", DType::ComplexFloat)
         .value("complex128", DType::ComplexDouble)
         .value("bcomplex32", DType::BComplex32)
+        .value("float8_e4m3fn", DType::Float8_e4m3fn)
+        .value("float8_e4m3fnuz", DType::Float8_e4m3fnuz)
+        .value("float8_e5m2", DType::Float8_e5m2)
+        .value("float8_e5m2fnuz", DType::Float8_e5m2fnuz)
+        .value("float8_e8m0fnu", DType::Float8_e8m0fnu)
         .value("qint8", DType::QInt8)
         .value("quint8", DType::QUInt8)
         .value("qint32", DType::QInt32)
@@ -92,6 +102,11 @@ void init_dtype(py::module_& m) {
     m.attr("complex64") = DType::ComplexFloat;
     m.attr("complex128") = DType::ComplexDouble;
     m.attr("bcomplex32") = DType::BComplex32;
+    m.attr("float8_e4m3fn") = DType::Float8_e4m3fn;
+    m.attr("float8_e4m3fnuz") = DType::Float8_e4m3fnuz;
+    m.attr("float8_e5m2") = DType::Float8_e5m2;
+    m.attr("float8_e5m2fnuz") = DType::Float8_e5m2fnuz;
+    m.attr("float8_e8m0fnu") = DType::Float8_e8m0fnu;
     m.attr("qint8") = DType::QInt8;
     m.attr("quint8") = DType::QUInt8;
     m.attr("qint32") = DType::QInt32;
