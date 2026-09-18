@@ -335,6 +335,12 @@ def aot_module_simplified(
     count = len(names)
 
     def flat_fn(*flat: Any) -> Any:
+        # A captured region carries no state of its own (a bare GraphModule
+        # exposes neither named_parameters nor named_buffers); the substituted
+        # state would be empty and functional_call -- whose contract requires
+        # a Module -- would reject the object.  Call it directly instead.
+        if count == 0:
+            return module(*flat)
         state = dict(zip(names, flat[:count]))
         return functional_call(module, state, tuple(flat[count:]))
 
