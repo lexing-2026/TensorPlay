@@ -12,6 +12,7 @@ from tensorplay._C import (
     quantize_per_channel as _quantize_per_channel,
     quantized_linear as _quantized_linear,
     _make_per_tensor_quantized_tensor as _make_per_tensor_quantized_tensor,
+    _make_per_channel_quantized_tensor as _make_per_channel_quantized_tensor,
 )
 
 __all__ = ["QuantizedLinear"]
@@ -32,6 +33,13 @@ class QuantizedLinear(nn.Module):
         super().__init__()
         if qweight.dtype not in (tensorplay.qint8, tensorplay.int8):
             raise TypeError("QuantizedLinear expects QInt8 (or raw Int8) weights")
+        if qweight.dtype == tensorplay.int8:
+            # A raw code tensor carries no quantizer of its own; mount the
+            # module's per-channel affine parameters so the fused kernel sees
+            # the same per-channel QInt8 operand the from_float path builds.
+            qweight = _make_per_channel_quantized_tensor(
+                qweight, weight_scales.to(tensorplay.float32),
+                weight_zero_points.to(tensorplay.int64), 0)
         self.in_features = int(in_features)
         self.out_features = int(out_features)
         self.input_scale = float(input_scale)
