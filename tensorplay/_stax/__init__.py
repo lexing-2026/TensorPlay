@@ -6,6 +6,7 @@ from .codecache import CodeCache, default_cache
 from .cudagraphs import CudaGraphError, CudaGraphManager
 from .guards import Guard, GuardChain, format_recompile_reasons
 from .registry import (
+    InvalidBackend,
     get_default_backend,
     list_backends,
     lookup_backend,
@@ -23,6 +24,7 @@ __all__ = [
     "CudaGraphManager",
     "Guard",
     "GuardChain",
+    "InvalidBackend",
     "build_aot",
     "compile",
     "default_cache",
