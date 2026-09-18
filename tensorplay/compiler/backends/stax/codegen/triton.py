@@ -2187,6 +2187,10 @@ class _ExternPlan:
     casts the program cannot express, ...).  ``launch`` resolves the node's
     dependencies through ``extern_sources`` — the same wiring contract fused
     segments use — and calls the operator on real tensors.
+
+    Training closes each extern segment with a closed-form tangent rule
+    (``backward_launch``, engine-free — see ``_build_extern_analytic_vjp``);
+    ``vjp_ready`` marks whether the operator has a covered rule.
     """
 
     launch: Any
@@ -2194,6 +2198,151 @@ class _ExternPlan:
     #: example output buffer (shape/dtype of this segment's export)
     example: Any = None
     output_shape: tuple = ()
+    #: True when the operator has a closed-form tangent rule
+    vjp_ready: bool = False
+    #: fields mirroring ``_SegmentPlan`` so the training sweep treats both
+    #: plan kinds uniformly
+    spec: Any = None
+    instructions: tuple = ()
+    needs_broadcast: bool = False
+    tangent_plan: tuple | None = None
+    backward_launch: Any = None
+
+
+def _build_extern_analytic_vjp(node: Any, position_of: Any):
+    """Closed-form tangent rule for one eager operator, engine-free.
+
+    The autograd engine cannot serve a re-entrant grad call from inside a
+    backward pass on CUDA (the second engine run deadlocks), so mixed-region
+    training closes each extern segment analytically: the rule recomputes
+    whatever operand values it needs with plain eager ops under the caller's
+    no-grad context and returns one gradient per feed position.  ``None``
+    when the operator has no covered rule — the region then stays eager.
+    """
+
+    name = str(getattr(node.target, "__name__", node.target))
+    if not node.args or not isinstance(node.args[0], Node):
+        return None
+    x_pos = position_of(node.args[0])
+    if x_pos is None:
+        return None
+
+    def recompute(feed: list, rule) -> Any:
+        return rule(feed[x_pos])
+
+    def single(rule):
+        """Wrap a unary input rule ``(x, y_or_none) -> dx``."""
+
+        def vjp(feed: list, tangent: Any) -> tuple:
+            grads = [None] * len(feed)
+            grads[x_pos] = rule(feed[x_pos], feed, tangent)
+            return tuple(grads)
+
+        return vjp
+
+    def arg_or_kwarg(index: int, key: str, default: Any = None) -> Any:
+        if len(node.args) > index + 1:
+            return node.args[index + 1]
+        return (node.kwargs or {}).get(key, default)
+
+    if name == "softmax":
+        dim = arg_or_kwarg(0, "dim", 0)
+
+        def rule(x: Any, feed: list, tangent: Any) -> Any:
+            y = x.softmax(dim=dim)
+            inner = (tangent * y).sum(dim=dim)
+            shape = [1 if axis == dim else extent
+                     for axis, extent in enumerate(y.shape)]
+            return y * (tangent - inner.reshape(shape))
+
+        return single(rule)
+
+    if name in ("reshape", "view", "flatten"):
+        def rule(x: Any, feed: list, tangent: Any) -> Any:
+            return tangent.reshape([int(extent) for extent in x.shape])
+
+        return single(rule)
+
+    if name == "transpose":
+        d0 = arg_or_kwarg(0, "dim0", 0)
+        d1 = arg_or_kwarg(1, "dim1", 1)
+
+        def rule(x: Any, feed: list, tangent: Any) -> Any:
+            return tangent.transpose(d0, d1)
+
+        return single(rule)
+
+    if name == "permute":
+        dims = node.args[1:] or (node.kwargs or {}).get("dims", ())
+        inverse = [0] * len(dims)
+        for out_axis, in_axis in enumerate(dims):
+            inverse[int(in_axis)] = out_axis
+
+        def rule(x: Any, feed: list, tangent: Any) -> Any:
+            return tangent.permute(inverse)
+
+        return single(rule)
+
+    if name == "contiguous":
+        return single(lambda x, feed, tangent: tangent)
+
+    if name == "neg":
+        return single(lambda x, feed, tangent: -tangent)
+
+    if name == "exp":
+        def rule(x: Any, feed: list, tangent: Any) -> Any:
+            return tangent * x.exp()
+
+        return single(rule)
+
+    if name == "sigmoid":
+        def rule(x: Any, feed: list, tangent: Any) -> Any:
+            y = x.sigmoid()
+            return tangent * y * (1.0 - y)
+
+        return single(rule)
+
+    if name == "tanh":
+        def rule(x: Any, feed: list, tangent: Any) -> Any:
+            y = x.tanh()
+            return tangent * (1.0 - y * y)
+
+        return single(rule)
+
+    if name == "sqrt":
+        def rule(x: Any, feed: list, tangent: Any) -> Any:
+            return 0.5 * tangent / x.sqrt()
+
+        return single(rule)
+
+    if name == "rsqrt":
+        def rule(x: Any, feed: list, tangent: Any) -> Any:
+            y = x.rsqrt()
+            return -0.5 * tangent * y * y * y
+
+        return single(rule)
+
+    if name == "abs":
+        def rule(x: Any, feed: list, tangent: Any) -> Any:
+            return tangent * x.sign()
+
+        return single(rule)
+
+    if name == "relu":
+        def rule(x: Any, feed: list, tangent: Any) -> Any:
+            return tangent * (x > 0).to(x.dtype)
+
+        return single(rule)
+
+    if name == "to":
+        # no dtype conversion in the tangent: the gradient keeps the
+        # input's dtype, which the eager cast of the rule handles
+        def rule(x: Any, feed: list, tangent: Any) -> Any:
+            return tangent.to(x.dtype)
+
+        return single(rule)
+
+    return None
 
 
 def _extern_segment_plan(
@@ -2247,6 +2396,20 @@ def _extern_segment_plan(
             return feed[position]
         return value
 
+    def position_of(value: Any) -> int | None:
+        """Feed position of a Node operand; None when it is not a source."""
+
+        if not isinstance(value, Node):
+            return None
+        if value.op == "placeholder":
+            key = _ExternSource("arg", placeholder_positions[value.name])
+        else:
+            located = export_ports.get(value)
+            if located is None:
+                return None
+            key = _ExternSource("seg", located[0], located[1])
+        return key_positions.get(key)
+
     def launch(feed: list) -> Any:
         args = [resolve(feed, value) for value in node.args]
         kwargs = {
@@ -2261,6 +2424,8 @@ def _extern_segment_plan(
         owner, rest = args[0], args[1:]
         return getattr(owner, node.target)(*rest, **kwargs)
 
+    vjp = _build_extern_analytic_vjp(node, position_of)
+
     output_shape = tuple(int(dim) for dim in shape)
     example = _tp.empty(
         output_shape, dtype=dtype, device=sample_device
@@ -2270,6 +2435,13 @@ def _extern_segment_plan(
         extern_sources=sources,
         example=example,
         output_shape=output_shape,
+        vjp_ready=vjp is not None,
+        backward_launch=(
+            (lambda feed_and_tangent, vjp=vjp: vjp(feed_and_tangent[:-1],
+                                                   feed_and_tangent[-1]))
+            if vjp is not None
+            else None
+        ),
     )
 
 
@@ -2459,15 +2631,13 @@ def compile_graph_module(
         # Training lowers through per-segment local VJPs.  Pointwise
         # segments take elementwise VJPs; sum/mean reduction segments take
         # an expanded tangent into their prologue's VJP program (the
-        # forward program already exports the reduction input).  Store-time
-        # epilogues, index reductions, extremum reductions and extern
-        # segments still need their own gradient paths (M5f).
+        # forward program already exports the reduction input).  Extern
+        # segments take an engine VJP through one recomputed eager call;
+        # store-time epilogues, index reductions and extremum reductions
+        # still need their own gradient paths (M5f).
         for seg in segments:
             if seg.epilogue:
                 _dbg('fallback gate #5a')
-                return None
-            if seg.kind == "extern":
-                _dbg('fallback gate #5c')
                 return None
             if seg.kind == "pw+red" and (
                 seg.reduction.tracks_indices
@@ -2515,10 +2685,11 @@ def compile_graph_module(
                 # a consumed interior value the producer cannot store
                 _dbg('fallback gate #8')
                 return None
-            deps = set(_nodes(node.args)) | set(
-                _nodes(node.kwargs)
-            )
-            for dep in deps:
+            # Deterministic encounter order — args before kwargs, segment
+            # node order — MUST match the sub-view's placeholder numbering:
+            # the launch feeds positionally by ref, and the VJP program's
+            # gradient outputs are ordered by the same refs.
+            for dep in (*_nodes(node.args), *_nodes(node.kwargs or {})):
                 if dep in inside:
                     continue
                 if dep.op == "placeholder":
@@ -2579,6 +2750,12 @@ def compile_graph_module(
             if extern_plan is None:
                 scheduler_annotate(graph_module, segments)
                 _dbg('fallback gate #12b')
+                return None
+            if any_grad and not extern_plan.vjp_ready:
+                # no closed-form tangent for this operator: the region
+                # stays eager (engine re-entrant grad is not available)
+                scheduler_annotate(graph_module, segments)
+                _dbg('fallback gate #12c')
                 return None
             extern_shapes[seg_index] = extern_plan.output_shape
             segment_plans.append(extern_plan)
@@ -2767,8 +2944,12 @@ def compile_graph_module(
         _dbg('fallback gate #22')
         return None
     final_port = last_exports.index(final_value)
+    single_fused_training = (
+        len(segment_plans) == 1
+        and not isinstance(segment_plans[0], _ExternPlan)
+    )
     if any(value.requires_grad for value in example_inputs):
-        if len(segment_plans) == 1:
+        if single_fused_training:
             plan = segment_plans[0]
             if any(
                 op_name not in _CPU_FUSED_AUTOGRAD_OPS
@@ -2811,6 +2992,9 @@ def compile_graph_module(
                     _dbg('fallback gate #20')
                     return None
             for seg_index, plan in enumerate(segment_plans):
+                if plan.backward_launch is not None:
+                    # extern plans carry their engine VJP from plan time
+                    continue
                 gradient_plan = _build_fused_gradient_graphs(
                     len(plan.extern_sources),
                     plan.instructions,
@@ -2835,7 +3019,19 @@ def compile_graph_module(
 
         from .....autograd import Function
 
-        multi_segment_training = len(segment_plans) > 1
+        multi_segment_training = not single_fused_training
+
+        def _grads_of(plan, feed_and_tangent):
+            """One gradient per extern source, always a flat sequence.
+
+            A single-output launch returns one tensor, not a list — zip
+            would otherwise iterate its leading dimension as if each row
+            were a separate source gradient.
+            """
+            values = plan.backward_launch(feed_and_tangent)
+            if isinstance(values, (list, tuple)):
+                return values
+            return [values]
 
         class _StaxTritonAutograd(Function):
             @staticmethod
@@ -2869,7 +3065,12 @@ def compile_graph_module(
                     grad_output = _normalize_pointwise_grad_output(
                         grad_output, saved[0]
                     )
-                    return tuple(backward_launch([*saved[:inputs_count], grad_output]))
+                    values = backward_launch(
+                        [*saved[:inputs_count], grad_output]
+                    )
+                    if not isinstance(values, (list, tuple)):
+                        values = [values]
+                    return tuple(values)
                 # normalize once against the final output's operand shape;
                 # every downstream tangent already has its producer shape.
                 seg_grads: dict[int, Any] = {
@@ -2903,8 +3104,8 @@ def compile_graph_module(
                             tangent = tangent * scale
                         else:
                             tangent = tangent.contiguous()
-                    grads = plan.backward_launch(
-                        [*ctx.stax_feed_all[index], tangent]
+                    grads = _grads_of(
+                        plan, [*ctx.stax_feed_all[index], tangent]
                     )
                     for source, grad in zip(plan.extern_sources, grads):
                         if source.kind == "arg":

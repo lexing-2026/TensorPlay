@@ -203,3 +203,127 @@ def test_multi_segment_training_matches_eager_gpu():
     assert tp.abs(out.cpu() - ref_out.cpu()).max().item() < 1e-5
     for got, want in zip(ins, ref_ins):
         assert tp.abs(got.grad.cpu() - want.grad.cpu()).max().item() < 1e-5
+
+
+# --- extern-segment analytic VJP rules (M5f) ---------------------------------------
+
+
+def _vjp_rule(target, kwargs=None, args_after=()):
+    """Build one extern tangent rule against a synthetic single-input node."""
+
+    from types import SimpleNamespace
+
+    from tensorplay.graph import Graph
+
+    operand = Graph().placeholder("x")
+    node = SimpleNamespace(
+        target=target, args=(operand, *args_after), kwargs=kwargs or {}
+    )
+    return st._build_extern_analytic_vjp(
+        node, lambda v: 0 if v is operand else None
+    )
+
+
+def test_extern_analytic_vjp_rules_match_engine():
+    g = tp.randn(4, 8)
+    cases = [
+        ("softmax", {"dim": 1}, lambda t: t.softmax(dim=1), False),
+        ("neg", {}, lambda t: -t, False),
+        ("exp", {}, lambda t: t.exp(), False),
+        ("sigmoid", {}, lambda t: t.sigmoid(), False),
+        ("tanh", {}, lambda t: t.tanh(), False),
+        ("sqrt", {}, lambda t: t.sqrt(), True),
+        ("rsqrt", {}, lambda t: t.rsqrt(), True),
+        ("abs", {}, lambda t: t.abs(), False),
+        ("relu", {}, lambda t: t.relu(), False),
+    ]
+    for target, kwargs, fwd, positive in cases:
+        # sqrt/rsqrt rules are only real on the positive domain
+        x = (tp.rand(4, 8) + 0.5 if positive else tp.randn(4, 8)).requires_grad_(True)
+        vjp = _vjp_rule(target, kwargs)
+        assert vjp is not None, target
+        (dx,) = vjp([x.detach()], g)
+        ref = tp.autograd.grad(fwd(x), x, grad_outputs=g)[0]
+        assert tp.abs(dx - ref).max().item() < 1e-5, target
+
+
+def test_extern_reshape_rule_restores_input_shape():
+    x = tp.randn(4, 8)
+    g = tp.randn(2, 16)
+    vjp = _vjp_rule("reshape", {})
+    (dx,) = vjp([x], g)
+    assert list(dx.shape) == [4, 8]
+    assert tp.abs(dx - g.reshape([4, 8])).max().item() < 1e-6
+
+
+def test_extern_transpose_rule_is_involution():
+    x = tp.randn(2, 3, 4)
+    g = tp.randn(2, 4, 3)
+    vjp = _vjp_rule("transpose", {}, args_after=(1, 2))
+    (dx,) = vjp([x], g)
+    assert tp.abs(dx - g.transpose(1, 2)).max().item() < 1e-6
+
+
+def test_extern_uncovered_operator_has_no_rule():
+    from types import SimpleNamespace
+
+    from tensorplay.graph import Graph
+
+    operand = Graph().placeholder("x")
+    node = SimpleNamespace(
+        target="cumsum", args=(operand,), kwargs={"dim": 1}
+    )
+    assert (
+        st._build_extern_analytic_vjp(
+            node, lambda v: 0 if v is operand else None
+        )
+        is None
+    )
+
+
+# --- mixed-graph training on a real GPU --------------------------------------------
+
+
+@pytest.mark.skipif(not st.runtime_available(), reason="Triton/CUDA unavailable")
+def test_mixed_extern_segment_training_matches_eager_gpu():
+    """Fused runs, an eager softmax between them, and a reduction tail
+    train through the chained local VJPs with the closed-form extern
+    tangent rule."""
+
+    def fn(t):
+        g = (t * 2.0).relu()
+        s = t.softmax(dim=1)
+        return (s * g).sum(dim=1)
+
+    xc = tp.randn(4, 8, device=tp.device("cuda", 0), requires_grad=True)
+    compiled = tp.compile(fn, fullgraph=True)
+    out = compiled(xc)
+    out.sum().backward()
+
+    xr = xc.detach().clone().requires_grad_(True)
+    ref = fn(xr)
+    ref.sum().backward()
+
+    assert tp.abs(out.cpu() - ref.cpu()).max().item() < 1e-5
+    assert tp.abs(xc.grad.cpu() - xr.grad.cpu()).max().item() < 1e-5
+
+
+@pytest.mark.skipif(not st.runtime_available(), reason="Triton/CUDA unavailable")
+def test_extern_uncovered_training_keeps_eager_fallback():
+    """An eager operator without a tangent rule rejects the region; the
+    eager fallback still trains exactly."""
+
+    def fn(t):
+        return t.cumsum(dim=1).sum()
+
+    xc = tp.randn(4, 8, device=tp.device("cuda", 0), requires_grad=True)
+    compiled = tp.compile(fn, fullgraph=True)
+    out = compiled(xc)
+    out.sum().backward()
+
+    xr = xc.detach().clone().requires_grad_(True)
+    ref = fn(xr)
+    ref.sum().backward()
+
+    assert tp.abs(out.cpu() - ref.cpu()).max().item() < 1e-5
+    assert tp.abs(xc.grad.cpu() - xr.grad.cpu()).max().item() < 1e-5
