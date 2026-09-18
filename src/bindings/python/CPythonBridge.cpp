@@ -1017,6 +1017,13 @@ Tensor& tensor_mref_slow(PyObject* obj) {
 Tensor tpx_py_tensor(PyObject* obj) { return as_tensor(obj, "op", 0); }
 
 const Tensor& tpx_py_tensor_cref(PyObject* obj) {
+    // Generated entry points run the absent-argument checks after the
+    // per-slot aliases are taken, so a missing tensor can reach this
+    // extractor as a null slot; answer with a python-visible error instead
+    // of dereferencing it.
+    if (obj == nullptr) {
+        throw std::invalid_argument("missing required tensor argument");
+    }
     if (g_tensor_type != nullptr && PyObject_TypeCheck(obj, g_tensor_type)) {
         // Registered wrappers use a simple value-holder layout, so direct
         // access avoids a registry lookup for the common case.
@@ -1029,6 +1036,9 @@ const Tensor& tpx_py_tensor_cref(PyObject* obj) {
 }
 
 Tensor& tpx_py_tensor_mref(PyObject* obj) {
+    if (obj == nullptr) {
+        throw std::invalid_argument("missing required tensor argument");
+    }
     if (g_tensor_type != nullptr && PyObject_TypeCheck(obj, g_tensor_type)) {
         auto* inst = reinterpret_cast<py::detail::instance*>(obj);
         if (inst->simple_layout && inst->simple_value_holder[0] != nullptr) {
