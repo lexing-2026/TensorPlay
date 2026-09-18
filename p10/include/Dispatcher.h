@@ -28,6 +28,16 @@ namespace autocast {
 // consult autocast state without pulling autocast_mode.h -- and its Tensor.h
 // dependency -- into every dispatcher user.
 P10_API bool is_enabled(DispatchKey autocast_key);
+
+// Whether a call site may route through ``autocast_key`` now: autocast is on
+// for that backend and the key is not excluded on this thread (a Python
+// dispatch mode handler runs with every layer above the Python key
+// excluded).  Call sites that pass their own kernel ABI for the autocast key
+// must gate on this, not on is_enabled alone.
+inline bool dispatch_enabled(DispatchKey autocast_key) {
+    return is_enabled(autocast_key) &&
+           !impl::tls_local_dispatch_key_set().excluded.has(autocast_key);
+}
 } // namespace autocast
 
 // Helper to determine the backend dispatch key for a device
@@ -153,6 +163,12 @@ public:
         }
         if (selected == DispatchKey::VmapMode && !handle.getKernel(selected)) {
             keys.remove(DispatchKey::VmapMode);
+            selected = keys.highest_priority_key();
+        }
+        if (selected == DispatchKey::Python && !handle.getKernel(selected)) {
+            // Operators without a schema-level Python kernel (internal
+            // registrations with no public contract) run below the mode.
+            keys.remove(DispatchKey::Python);
             selected = keys.highest_priority_key();
         }
         if (selected == DispatchKey::DynamicLayerBackMode) {

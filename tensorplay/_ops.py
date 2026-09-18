@@ -86,9 +86,184 @@ def _flash_attention_adapter(
 # kernel registration in this build.  Each entry adapts over the kernels
 # that do exist; anything without an entry resolves through the native
 # dispatcher and raises its own "kernel not found" error.
-_ATEN_FALLBACKS: dict[str, Any] = {
+_NATIVE_FALLBACKS: dict[str, Any] = {
     "_scaled_dot_product_flash_attention": _flash_attention_adapter,
 }
+
+
+# Namespace of the operators declared in the op contract (config/); an
+# interop identifier the public ``tensorplay.ops.<ns>`` surface already uses.
+NATIVE_NAMESPACE = "tp"
+
+
+class OpOverload:
+    """One operator overload of the op contract (``add.Tensor``).
+
+    Calling it runs exactly that overload through the dispatcher.  Dispatch
+    modes receive these objects as ``func``; ``_schema`` describes the
+    arguments, returns and alias annotations.
+    """
+
+    # The dunder identity attributes are written per instance; ``__dict__``
+    # carries them because CPython forbids ``__name__``/``__qualname__``/
+    # ``__module__`` inside ``__slots__`` (they collide with reserved
+    # class-level attributes).
+    __slots__ = (
+        "_schema",
+        "_overloadpacket",
+        "_overloadname",
+        "_opname",
+        "_key",
+        "_tags",
+        "__weakref__",
+        "__dict__",
+    )
+
+    def __init__(self, packet: "OpOverloadPacket", key: str, schema: Any, tags: tuple[str, ...]) -> None:
+        self._schema = schema
+        self._overloadpacket = packet
+        self._overloadname = schema.overload_name or "default"
+        self._opname = schema.name
+        self._key = key
+        self._tags = tags
+
+    def __call__(self, /, *args: Any, **kwargs: Any) -> Any:
+        return _C._call_overload(self._key, args, kwargs)
+
+    @property
+    def overloadpacket(self) -> "OpOverloadPacket":
+        return self._overloadpacket
+
+    @property
+    def op(self) -> "OpOverload":
+        return self
+
+    @property
+    def namespace(self) -> str:
+        return self._schema.namespace
+
+    @property
+    def tags(self) -> tuple[str, ...]:
+        return self._tags
+
+    @property
+    def is_view(self) -> bool:
+        return self._schema._is_view_op()
+
+    def name(self) -> str:
+        return f"{self._schema.namespace}::{self._key}"
+
+    def has_kernel_for_dispatch_key(self, key: str) -> bool:
+        return bool(_C._dispatch_has_kernel_for_dispatch_key(self._key, key))
+
+    def __repr__(self) -> str:
+        return (
+            f"<OpOverload(op='{self._schema.namespace}.{self._opname}', "
+            f"overload='{self._overloadname}')>"
+        )
+
+    def __str__(self) -> str:
+        return f"{self._schema.namespace}.{self._opname}.{self._overloadname}"
+
+    def __reduce__(self) -> Any:
+        return (_overload_for_dispatch, (self._key,))
+
+    def __deepcopy__(self, memo: Any) -> "OpOverload":
+        return self
+
+
+class OpOverloadPacket:
+    """All overloads of one operator name (``add``).
+
+    Attribute access yields an overload (``.Tensor``, ``.default``); calling
+    the packet resolves the overload from the arguments.
+    """
+
+    def __init__(self, namespace: str, name: str) -> None:
+        self._namespace = namespace
+        self._opname = name
+        self._qualified_op_name = f"{namespace}::{name}"
+        self.__name__ = name
+        self.__qualname__ = name
+        self.__module__ = f"tensorplay.ops.{namespace}"
+        self._overloads: dict[str, OpOverload] = {}
+
+    def _add(self, overload: OpOverload) -> None:
+        self._overloads[overload._overloadname] = overload
+
+    def overloads(self) -> list[str]:
+        return list(self._overloads)
+
+    def __getattr__(self, name: str) -> OpOverload:
+        if name.startswith("__"):
+            raise AttributeError(name)
+        try:
+            return self._overloads[name]
+        except KeyError:
+            raise AttributeError(
+                f"'{self._qualified_op_name}' has no overload named '{name}'"
+            ) from None
+
+    def __call__(self, /, *args: Any, **kwargs: Any) -> Any:
+        resolver = getattr(_C, self._opname, None)
+        if resolver is not None:
+            return resolver(*args, **kwargs)
+        # No public binding: the single declared overload, or the first
+        # whose arguments bind.
+        errors: list[str] = []
+        for overload in self._overloads.values():
+            try:
+                return overload(*args, **kwargs)
+            except TypeError as exc:
+                errors.append(f"{overload}: {exc}")
+        raise TypeError(
+            f"no overload of {self._qualified_op_name} accepts these arguments:\n  "
+            + "\n  ".join(errors)
+        )
+
+    def __repr__(self) -> str:
+        return f"<OpOverloadPacket(op='{self._namespace}.{self._opname}')>"
+
+    def __str__(self) -> str:
+        return f"{self._namespace}.{self._opname}"
+
+    def __reduce__(self) -> Any:
+        return (_packet_for, (self._opname,))
+
+
+_packets: dict[str, OpOverloadPacket] | None = None
+_overloads_by_key: dict[str, OpOverload] = {}
+
+
+def _load_native_overloads() -> dict[str, OpOverloadPacket]:
+    global _packets
+    if _packets is not None:
+        return _packets
+    from ._function_schema import parse_schema
+
+    packets: dict[str, OpOverloadPacket] = {}
+    entries = getattr(_C, "_python_dispatch_entries", None)
+    for key, schema_text, _names, _npos, tags in (entries() if entries else ()):
+        schema = parse_schema(schema_text, namespace=NATIVE_NAMESPACE)
+        packet = packets.get(schema.name)
+        if packet is None:
+            packet = packets[schema.name] = OpOverloadPacket(NATIVE_NAMESPACE, schema.name)
+        overload = OpOverload(packet, key, schema, tuple(t for t in tags.split(",") if t))
+        packet._add(overload)
+        _overloads_by_key[key] = overload
+    _packets = packets
+    return packets
+
+
+def _packet_for(name: str) -> OpOverloadPacket:
+    return _load_native_overloads()[name]
+
+
+def _overload_for_dispatch(key: str) -> OpOverload:
+    """The interned overload object for a dispatcher key (``add.Tensor``)."""
+
+    _load_native_overloads()
+    return _overloads_by_key[key]
 
 
 class _OpNamespace(types.ModuleType):
@@ -104,12 +279,16 @@ class _OpNamespace(types.ModuleType):
         own = self.__dict__.get(opname)
         if own is not None:
             return own
-        if self.ns == "aten":
+        if self.ns == NATIVE_NAMESPACE:
             # Composite fallbacks come first: they wrap the fused kernels of
             # this build for contracts without their own registration.
-            fallback = _ATEN_FALLBACKS.get(opname)
+            fallback = _NATIVE_FALLBACKS.get(opname)
             if fallback is not None:
                 return fallback
+            packet = _load_native_overloads().get(opname)
+            if packet is not None:
+                setattr(self, opname, packet)
+                return packet
             native = getattr(_C, opname, None)
             if native is not None:
                 return native

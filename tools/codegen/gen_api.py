@@ -350,9 +350,12 @@ def _emit_redispatch(lines, f, variant, dev_src, helper_name):
         if a.name == "requires_grad":
             continue
         st = stub_arg_type(a.type)
-        tmpl.append(st)
+        # The helper keeps the schema-level parameter type; the kernel ABI
+        # honors the unwrap boundary, so every call site of one handle agrees
+        # on the signature its kernels were registered with.
+        tmpl.append(stub_arg_type_for(f.base_name, a))
         rd_args.append(f"{st} {a.name}")
-        rd_call.append(a.name)
+        rd_call.append(call_arg_expr(f.base_name, a))
 
     rd_dev = dev_src
     if variant == "method" and f.self_arg() is not None:
@@ -693,7 +696,7 @@ def generate_cpp(funcs: list[NativeFunction], *,
                 # is_enabled first: one thread-local load short-circuits the
                 # common (disabled) path before touching the dispatch table.
                 lines.append(
-                    "        if (autocast::is_enabled(__ac_key) && __ac_handle && __ac_handle.getKernel(__ac_key)) {")
+                    "        if (autocast::dispatch_enabled(__ac_key) && __ac_handle && __ac_handle.getKernel(__ac_key)) {")
                 ac_call = f"DispatchStub<{', '.join(tmpl)}>::call(__ac_handle, __ac_key, {call_str})"
                 if ret_void:
                     lines.append(f"            {ac_call};")
@@ -705,7 +708,7 @@ def generate_cpp(funcs: list[NativeFunction], *,
 
             node = autograd_ops.get(f.func_name)
             if node:
-                lines.append("    if (GradMode::is_enabled()) {")
+                lines.append("    if (GradMode::is_enabled() && !autograd_dispatch_excluded()) {")
                 lines.append(
                     '        static const OperatorHandle ag_handle = '
                     f'Dispatcher::singleton().findHandle("{f.func_name}");')

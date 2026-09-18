@@ -458,11 +458,17 @@ void Tensor::set_retains_grad(bool retains_grad) {
 }
 
 Tensor Tensor::detach() const {
+    if (impl_ && impl::python_dispatch_active()) {
+        return detail::redispatch_detach_method(*this);
+    }
     if (!impl_) return Tensor();
     return Tensor(std::make_shared<TensorImpl>(*impl_));
 }
 
 bool Tensor::is_pinned() const {
+    if (impl_ && impl::python_dispatch_active()) {
+        return detail::redispatch_is_pinned_method(*this, std::nullopt);
+    }
 #ifdef USE_CUDA
     return impl_ && device().is_cpu() && impl_->has_storage() &&
            impl_->storage().allocator() == getPinnedMemoryAllocator();
@@ -472,6 +478,9 @@ bool Tensor::is_pinned() const {
 }
 
 Tensor Tensor::pin_memory() const {
+    if (impl_ && impl::python_dispatch_active()) {
+        return detail::redispatch_pin_memory_method(*this, std::nullopt);
+    }
     if (!impl_) return Tensor();
     if (!device().is_cpu()) {
         TP_THROW(RuntimeError, "cannot pin a tensor on " + device().toString() +
@@ -493,6 +502,9 @@ Tensor Tensor::pin_memory() const {
 bool Tensor::is_sparse() const { return impl_ && impl_->is_sparse(); }
 
 bool Tensor::is_coalesced() const {
+    if (impl_ && impl::python_dispatch_active()) {
+        return detail::redispatch_is_coalesced_method(*this);
+    }
     if (!is_sparse() || is_sparse_compressed()) {
         TP_THROW(RuntimeError,
                  "is_coalesced expected sparse coordinate tensor layout");
@@ -518,6 +530,9 @@ int64_t Tensor::dense_dim() const {
 }
 
 Tensor Tensor::_indices() const {
+    if (impl_ && impl::python_dispatch_active()) {
+        return detail::redispatch__indices_method(*this);
+    }
     if (!is_sparse() || is_sparse_compressed()) {
         TP_THROW(RuntimeError,
                  "_indices() is only defined for sparse COO tensors");
@@ -526,6 +541,9 @@ Tensor Tensor::_indices() const {
 }
 
 Tensor Tensor::_values() const {
+    if (impl_ && impl::python_dispatch_active()) {
+        return detail::redispatch__values_method(*this);
+    }
     if (!is_sparse()) {
         TP_THROW(RuntimeError,
                  "_values() is only defined for sparse tensors");
@@ -554,6 +572,9 @@ Tensor Tensor::_col_indices() const {
 }
 
 Tensor Tensor::coalesce() const {
+    if (impl_ && impl::python_dispatch_active()) {
+        return detail::redispatch_coalesce_method(*this);
+    }
     if (!is_sparse() || is_sparse_compressed()) {
         TP_THROW(RuntimeError,
                  "coalesce() is only defined for sparse COO tensors");
@@ -567,6 +588,9 @@ Tensor Tensor::coalesce() const {
 }
 
 Tensor Tensor::sparse_mask(const Tensor& mask) const {
+    if (impl_ && impl::python_dispatch_active()) {
+        return detail::redispatch_sparse_mask_method(*this, mask);
+    }
     if (is_sparse()) {
         TP_THROW(RuntimeError, "sparse_mask(): self must be dense");
     }
@@ -597,6 +621,9 @@ void* Tensor::data_ptr() const {
 }
 
 Scalar Tensor::item() const {
+    if (impl_ && impl::python_dispatch_active()) {
+        return detail::redispatch_item_method(*this);
+    }
     if (is_sparse()) {
         TP_THROW(RuntimeError, "item() is not supported for sparse tensors");
     }
@@ -926,6 +953,9 @@ Tensor operator-(const Tensor& t) {
 Tensor Tensor::as_strided(const std::vector<int64_t>& size,
                           const std::vector<int64_t>& stride,
                           std::optional<int64_t> storage_offset) const {
+    if (impl_ && impl::python_dispatch_active()) {
+        return detail::redispatch_as_strided_method(*this, size, stride, storage_offset);
+    }
     if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
     if (size.size() != stride.size()) {
         TP_THROW(ValueError,
@@ -965,6 +995,9 @@ Tensor Tensor::as_strided(const std::vector<int64_t>& size,
 }
 
 Tensor Tensor::view(const std::vector<int64_t>& shape) const {
+    if (impl_ && impl::python_dispatch_active()) {
+        return detail::redispatch_view_method(*this, shape);
+    }
     if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
 
     std::vector<int64_t> inferred = SizesAndStrides::infer_size(shape, numel());
@@ -1067,6 +1100,14 @@ Tensor Tensor::view_dtype(DType dtype) const {
 }
 
 Tensor Tensor::select(int64_t dim, int64_t index) const {
+    if (impl_ && impl::python_dispatch_active()) {
+        // select.int is registered by hand; its dispatcher ABI is the
+        // schema stub signature.
+        static const OperatorHandle handle =
+            Dispatcher::singleton().findHandle("select.int");
+        return DispatchStub<Tensor, const Tensor&, int64_t, int64_t>::call(
+            handle, computeDispatchKey(device()), *this, dim, index);
+    }
     if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
     if (is_batched()) {
         return transform::batch::select(*this, dim, index);
@@ -1100,6 +1141,10 @@ Tensor Tensor::select(int64_t dim, int64_t index) const {
 }
 
 Tensor Tensor::slice(int64_t dim, int64_t start, int64_t end, int64_t step) const {
+    if (impl_ && impl::python_dispatch_active()) {
+        return detail::redispatch_slice_Tensor_method(
+            *this, dim, std::optional<int64_t>(start), std::optional<int64_t>(end), step);
+    }
     if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
     if (is_batched()) {
         return transform::batch::slice(
@@ -1299,6 +1344,9 @@ Tensor contiguous_impl(const Tensor& self, int64_t memory_format_raw) {
 
 
 Tensor Tensor::to(DType dtype, bool non_blocking, bool copy) const {
+    if (impl_ && impl::python_dispatch_active()) {
+        return detail::redispatch_to_dtype_method(*this, dtype, non_blocking, copy, std::nullopt);
+    }
     if (!impl_) return Tensor();
     if (is_sparse()) {
         if (dtype == this->dtype()) return copy ? clone() : *this;
@@ -1323,6 +1371,10 @@ Tensor Tensor::to(DType dtype, bool non_blocking, bool copy) const {
 }
 
 Tensor Tensor::to(Device device, bool non_blocking, bool copy) const {
+    if (impl_ && impl::python_dispatch_active()) {
+        return detail::redispatch_to_device_method(
+            *this, device, this->dtype(), non_blocking, copy, std::nullopt);
+    }
     if (!impl_) return Tensor();
     if (is_sparse()) {
         if (this->device() == device) return copy ? clone() : *this;
@@ -1353,6 +1405,10 @@ Tensor Tensor::to(Device device, bool non_blocking, bool copy) const {
 }
 
 Tensor Tensor::to(Device device, DType dtype, bool non_blocking, bool copy) const {
+    if (impl_ && impl::python_dispatch_active()) {
+        return detail::redispatch_to_device_method(
+            *this, device, dtype, non_blocking, copy, std::nullopt);
+    }
     if (!impl_) return Tensor();
     if (is_sparse()) {
         if (this->device() == device && this->dtype() == dtype) {

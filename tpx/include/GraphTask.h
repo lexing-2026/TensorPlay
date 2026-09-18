@@ -13,6 +13,7 @@
 #include "Edge.h"
 #include "Node.h"
 #include "InputBuffer.h"
+#include "PythonDispatchModeTLS.h"
 
 namespace tensorplay {
 namespace tpx {
@@ -35,6 +36,10 @@ struct GraphTask {
 
     bool keep_graph_;
     bool grad_mode_;
+    // Dispatch modes active when backward was requested; device workers
+    // install them so backward operators reach the same modes.
+    ::tensorplay::impl::DispatchModeState dispatch_modes_ =
+        ::tensorplay::impl::DispatchModeTLS::get_state();
 
     // Monotonic id for TP_ENGINE_TRACE correlation across concurrent or
     // nested graphs. Zero cost when tracing is off.

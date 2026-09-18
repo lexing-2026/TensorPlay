@@ -8,12 +8,12 @@ namespace tensorplay {
 
 // Dispatch keys used by the runtime.
 //
-// Backend keys occupy the low bits, autograd keys sit above them, and
-// autocast keys sit above the autograd keys. Dispatch walks from the
-// numerically largest key down, so the priority is Autocast > Autograd >
-// backend. Sparse layouts form their own backend component: a tensor whose
-// storage is sparse metadata carries the Sparse key instead of the dense
-// backend key of its device.
+// Backend keys occupy the low bits; the Python key sits directly above them,
+// autograd keys above that, and autocast keys above the autograd keys.
+// Dispatch walks from the numerically largest key down, so the priority is
+// Autocast > Autograd > Python > backend. Sparse layouts form their own
+// backend component: a tensor whose storage is sparse metadata carries the
+// Sparse key instead of the dense backend key of its device.
 enum class DispatchKey : uint8_t {
     // Backend component keys (dense backends plus the sparse layout family).
     CPU = 0,
@@ -21,46 +21,67 @@ enum class DispatchKey : uint8_t {
     Vulkan = 2,
     Sparse = 3,
 
+    // Python dispatch modes.  Included in the thread-local key set while a
+    // dispatch mode is active: every operator that reaches its backend --
+    // including the ones autograd runs during backward -- is handed to the
+    // innermost mode first.  Every key above it is excluded while a mode
+    // handler runs, so re-entering an operator from the handler neither
+    // records autograd history nor re-applies autocast or batching.
+    Python = 4,
+
     // Autograd keys related to backends by a fixed offset.
-    DynamicLayerBackMode = 4,
-    AutogradCPU = 5,
-    AutogradCUDA = 6,
-    AutogradVulkan = 7,
-    AutogradSparse = 8,
+    DynamicLayerBackMode = 5,
+    AutogradCPU = 6,
+    AutogradCUDA = 7,
+    AutogradVulkan = 8,
+    AutogradSparse = 9,
 
     // Autocast keys related to backends by a fixed offset.  They sit above
     // the autograd keys so casts happen before autograd history recording.
-    AutocastCPU = 9,
-    AutocastCUDA = 10,
-    AutocastVulkan = 11,
-    AutocastSparse = 12,
+    AutocastCPU = 10,
+    AutocastCUDA = 11,
+    AutocastVulkan = 12,
+    AutocastSparse = 13,
 
     // Backend-neutral composite key. One registration serves every backend
     // until a backend registers its own kernel. Lookups never walk this key
     // from a tensor key set; the dispatcher consults it only when a backend
     // slot is empty.
-    Composite = 20,
+    Composite = 21,
 
     // Per-backend batching keys. These must outrank autograd and backend
     // keys so a transform can unwrap its operands before ordinary kernels
     // and autograd nodes observe them.
-    VmapCPU = 13,
-    VmapCUDA = 14,
-    VmapVulkan = 15,
-    VmapSparse = 16,
-    VmapMode = 21,
-    DynamicLayerFrontMode = 22,
+    VmapCPU = 14,
+    VmapCUDA = 15,
+    VmapVulkan = 16,
+    VmapSparse = 17,
+    VmapMode = 22,
+    DynamicLayerFrontMode = 23,
 
     // One past every real key; the sentinel value must stay above all of
     // them, so it is spelled out rather than derived from the previous
     // entry.
-    EndOfKeys = 23 // Sentinel
+    EndOfKeys = 24 // Sentinel
 };
 
 constexpr size_t kBackendKeyCount = 4;           // CPU, CUDA, Vulkan, Sparse
-constexpr size_t kAutogradKeyOffset = 5;         // AutogradCPU - CPU
-constexpr size_t kAutocastKeyOffset = 9;         // AutocastCPU - CPU
-constexpr size_t kVmapKeyOffset = 13;            // VmapCPU - CPU
+constexpr size_t kAutogradKeyOffset = 6;         // AutogradCPU - CPU
+constexpr size_t kAutocastKeyOffset = 10;        // AutocastCPU - CPU
+constexpr size_t kVmapKeyOffset = 14;            // VmapCPU - CPU
+
+static_assert(static_cast<size_t>(DispatchKey::AutogradCPU) ==
+                  static_cast<size_t>(DispatchKey::CPU) + kAutogradKeyOffset,
+              "autograd key offset out of sync with the key layout");
+static_assert(static_cast<size_t>(DispatchKey::AutocastCPU) ==
+                  static_cast<size_t>(DispatchKey::CPU) + kAutocastKeyOffset,
+              "autocast key offset out of sync with the key layout");
+static_assert(static_cast<size_t>(DispatchKey::VmapCPU) ==
+                  static_cast<size_t>(DispatchKey::CPU) + kVmapKeyOffset,
+              "vmap key offset out of sync with the key layout");
+static_assert(static_cast<size_t>(DispatchKey::Python) > static_cast<size_t>(DispatchKey::Sparse) &&
+                  static_cast<size_t>(DispatchKey::Python) < static_cast<size_t>(DispatchKey::DynamicLayerBackMode),
+              "the Python key must sit between the backends and every transform/autograd layer");
 
 inline constexpr DispatchKey toAutocastKey(DispatchKey backend) {
     return static_cast<DispatchKey>(static_cast<uint8_t>(backend) + kAutocastKeyOffset);
@@ -132,6 +153,7 @@ inline std::string toString(DispatchKey key) {
         case DispatchKey::VmapMode: return "VmapMode";
         case DispatchKey::DynamicLayerFrontMode: return "DynamicLayerFrontMode";
         case DispatchKey::DynamicLayerBackMode: return "DynamicLayerBackMode";
+        case DispatchKey::Python: return "Python";
         default: return "Unknown";
     }
 }
@@ -172,6 +194,14 @@ public:
         raw_t m = mask_;
         while (m >>= 1) ++idx;
         return static_cast<DispatchKey>(idx);
+    }
+
+    // Every key numerically above ``key`` -- the layers that have already
+    // run by the time dispatch reaches ``key``.
+    static constexpr DispatchKeySet above(DispatchKey key) {
+        const raw_t end = raw_t(1) << static_cast<uint8_t>(DispatchKey::EndOfKeys);
+        const raw_t upto = raw_t(1) << (static_cast<uint8_t>(key) + 1);
+        return DispatchKeySet((end - 1) & ~(upto - 1));
     }
 
     // Remove every autograd key (used for redispatch below the autograd layer,

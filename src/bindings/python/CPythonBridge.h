@@ -7,6 +7,7 @@
 
 #include <Python.h>
 
+#include <exception>
 #include <string>
 #include <optional>
 #include <vector>
@@ -240,6 +241,31 @@ PyObject* tpx_py_wrap_scalarlist(const std::vector<Scalar>& v);
 
 // keep `self` alive while the returned alias references its storage
 void tpx_py_keep_alive(PyObject* self);
+
+// A Python exception carried through C++ frames.  Constructed with the
+// interpreter lock held and a Python error set: it takes ownership of that
+// error, which restore() re-raises unchanged (same type, value, traceback)
+// once control is back at a Python boundary.  Destruction may happen on any
+// thread; it acquires the lock before dropping the reference.
+class PythonError : public std::exception {
+public:
+    PythonError();
+    ~PythonError() override;
+    PythonError(const PythonError& other);
+    PythonError& operator=(const PythonError&) = delete;
+
+    const char* what() const noexcept override { return message_.c_str(); }
+    // Re-raises the stored exception; the interpreter lock must be held.
+    void restore() const;
+
+private:
+    // Normalized exception triple; value carries the traceback on 3.12+,
+    // where type and traceback stay null.
+    PyObject* type_ = nullptr;
+    PyObject* value_ = nullptr;
+    PyObject* traceback_ = nullptr;
+    std::string message_;
+};
 
 // exception translation: sets a Python error from a C++ exception
 void tpx_py_set_error(const std::exception& e);

@@ -69,7 +69,7 @@ def _fa4_import_module(module_path: str) -> ModuleType:
 
 
 def _fa4_register_kernels() -> Library:
-    lib = Library("aten", "IMPL")
+    lib = Library("tp", "IMPL")
     lib.impl("_flash_attention_forward", _fa4_flash_attention_forward_impl,
              dispatch_key="CUDA")
     lib.impl(

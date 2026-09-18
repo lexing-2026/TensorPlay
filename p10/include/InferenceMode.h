@@ -1,6 +1,7 @@
 #pragma once
 
 #include "GradMode.h"
+#include "LocalDispatchKeySet.h"
 #include "Macros.h"
 
 namespace tensorplay {
@@ -16,6 +17,17 @@ public:
 private:
     InferenceMode() = delete;
 };
+
+// Whether the autograd layer is excluded from dispatch on this thread.  A
+// Python dispatch mode handler runs below autograd: operators it re-enters
+// execute without recording history, whatever the grad-mode flag says.
+inline bool autograd_dispatch_excluded() {
+    const auto excluded = impl::tls_local_dispatch_key_set().excluded;
+    return excluded.has(DispatchKey::AutogradCPU) ||
+           excluded.has(DispatchKey::AutogradCUDA) ||
+           excluded.has(DispatchKey::AutogradVulkan) ||
+           excluded.has(DispatchKey::AutogradSparse);
+}
 
 // RAII helper for C++ call sites.
 struct P10_API InferenceModeGuard {

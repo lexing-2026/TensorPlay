@@ -936,9 +936,44 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
         else:
             fn_table.append(entry_line)
 
+    # Hook-free entry point per overload.  An operator overload object
+    # calls exactly one overload: the binding-layer function modes, tensor
+    # function hooks and subclass hooks already had their turn when the
+    # overload object was reached, and overload selection must not re-run.
+    overload_rows: list[str] = []
+    seen_overloads: set[str] = set()
+    for index, f in enumerate(ctx.funcs):
+        if f.func_name in seen_overloads:
+            continue
+        seen_overloads.add(f.func_name)
+        if "function" in f.variants or "method" not in f.variants:
+            variant = "function"
+        else:
+            variant = "method"
+        _op_supported(f, variant)
+        fn = f"pyovl_{f.func_name.replace('.', '__')}"
+        _emit_op(out, f, variant, fn, own_catch=True, dispatch=False,
+                 helper_tag=f"ovl{index}", splat_singleton=False)
+        receiver = "true" if variant == "method" and any(
+            a.name == "self" for a in f.args) else "false"
+        overload_rows.append(
+            f'    {{"{f.func_name}", (PyCFunction)(void*){fn}, {receiver}}},')
+
     # Not constexpr: the (PyCFunction)(void*) casts in each entry are not a
     # constant expression, so these tables stay dynamically initialized.
     out += [
+        "// One hook-free entry per operator overload, keyed by overload name.",
+        "// receiver=true entries take the schema `self` as the C receiver.",
+        "struct GeneratedOverloadCall {",
+        "    const char* name;",
+        "    PyCFunction entry;",
+        "    bool receiver;",
+        "};",
+        "inline const GeneratedOverloadCall generated_overload_calls[] = {",
+        *overload_rows,
+        "    {nullptr, nullptr, false},",
+        "};",
+        "",
         "// Module-level op functions.",
         f"inline PyMethodDef generated_functions[] = {{",
         *fn_table,

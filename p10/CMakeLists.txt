@@ -11,6 +11,7 @@ set(P10_SOURCES
     src/Generator.cpp
     src/GradMode.cpp
     src/InferenceMode.cpp
+    src/PythonDispatchModeTLS.cpp
     src/Parallel.cpp
     src/Scalar.cpp
     src/SymNodeImpl.cpp

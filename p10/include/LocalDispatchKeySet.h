@@ -14,6 +14,15 @@ P10_API LocalDispatchKeySet tls_local_dispatch_key_set();
 P10_API void force_tls_local_dispatch_key_set(LocalDispatchKeySet state);
 P10_API void tls_set_dispatch_key_included(DispatchKey key, bool included);
 
+// True while a Python dispatch mode receives operators on this thread:
+// hand-written fast paths for schema operators (views, conversions) must
+// route through the dispatcher then, so the mode observes them too.
+inline bool python_dispatch_active() {
+    const auto state = tls_local_dispatch_key_set();
+    return state.included.has(DispatchKey::Python) &&
+           !state.excluded.has(DispatchKey::Python);
+}
+
 class IncludeDispatchKeyGuard {
 public:
     explicit IncludeDispatchKeyGuard(DispatchKeySet keys)

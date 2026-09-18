@@ -29,9 +29,10 @@ __all__ = [
 def fork_rng(devices=None, enabled=True, _caller="fork_rng", _devices_kw="devices"):
     """Forks the RNG state: code inside the context gets a pristine RNG.
 
-    Saves the CPU RNG state on entry and restores it on exit, so random
-    operations inside the block do not advance the outer stream. The saved
-    state is restored
+    Saves the CPU RNG state and the RNG state of every CUDA device listed in
+    ``devices`` on entry and restores them on exit, so random operations
+    inside the block do not advance the outer streams.  ``devices=[]`` forks
+    only the CPU generator.
     """
     if not enabled:
         yield
@@ -42,8 +43,19 @@ def fork_rng(devices=None, enabled=True, _caller="fork_rng", _devices_kw="device
             "argument, which is no longer allowed since it defaults to forking all "
             "CUDA devices. Pass devices=[] to only fork the CPU RNG."
         )
+    device_states = []
+    if devices:
+        import tensorplay.cuda as _cuda
+
+        for device in devices:
+            device_states.append((device, _cuda.get_rng_state(device)))
     cpu_state = get_rng_state()
     try:
         yield
     finally:
         set_rng_state(cpu_state)
+        if device_states:
+            import tensorplay.cuda as _cuda
+
+            for device, state in device_states:
+                _cuda.set_rng_state(state, device)

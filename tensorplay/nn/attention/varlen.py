@@ -195,7 +195,7 @@ def _varlen_attn(
 
     if backend == _CUDNN_ATTENTION_BACKEND:
         log.info("Using cuDNN backend for varlen_attn")
-        result = tensorplay.ops.aten._cudnn_attention_forward(
+        result = tensorplay.ops.tp._cudnn_attention_forward(
             query=query,
             key=key,
             value=value,
@@ -216,7 +216,7 @@ def _varlen_attn(
         output, softmax_lse, rng_state = result[0], result[1], result[6]
     elif backend == _FLASH_ATTENTION_BACKEND:
         log.info("Using Flash Attention backend for varlen_attn")
-        output, softmax_lse, rng_state, _, _ = tensorplay.ops.aten._flash_attention_forward(
+        output, softmax_lse, rng_state, _, _ = tensorplay.ops.tp._flash_attention_forward(
             query,
             key,
             value,
@@ -482,7 +482,7 @@ def _varlen_attn_out(
     window_size = _normalize_window_size(window_size)
 
     log.info("Using Flash Attention backend for varlen_attn_out")
-    softmax_lse = tensorplay.ops.aten._flash_attention_forward_no_dropout_inplace(
+    softmax_lse = tensorplay.ops.tp._flash_attention_forward_no_dropout_inplace(
         out,
         query,
         key,
@@ -663,7 +663,7 @@ def _varlen_attn_backward(
 
     if backend == _CUDNN_ATTENTION_BACKEND:
         log.info("Using cuDNN backend for varlen_attn")
-        dq, dk, dv = tensorplay.ops.aten._cudnn_attention_backward(
+        dq, dk, dv = tensorplay.ops.tp._cudnn_attention_backward(
             grad_out=grad_out,
             query=query,
             key=key,
@@ -683,7 +683,7 @@ def _varlen_attn_backward(
         )
     elif backend == _FLASH_ATTENTION_BACKEND:
         log.info("Using Flash Attention backend for varlen_attn")
-        dq, dk, dv = tensorplay.ops.aten._flash_attention_backward(
+        dq, dk, dv = tensorplay.ops.tp._flash_attention_backward(
             grad_out,
             query,
             key,
@@ -774,7 +774,7 @@ def _backward(
 _varlen_attn.register_autograd(_backward, setup_context=_setup_context)
 
 tensorplay._dynamo.disallow_in_graph(
-    tensorplay.ops.aten._flash_attention_forward_no_dropout_inplace
+    tensorplay.ops.tp._flash_attention_forward_no_dropout_inplace
 )
 
 from tensorplay.utils.flop_counter import (

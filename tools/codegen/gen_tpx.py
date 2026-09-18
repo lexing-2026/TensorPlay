@@ -186,7 +186,7 @@ def _emit_autocast_block(lines, f, arg_types):
         f'        DispatchKey __ac_key = toAutocastKey(computeDispatchKey({dev_src}));')
     lines.append(
         '        if (__ac_handle && __ac_handle.getKernel(__ac_key) && '
-        '::tensorplay::autocast::is_enabled(__ac_key)) {')
+        '::tensorplay::autocast::dispatch_enabled(__ac_key)) {')
     if ret_void:
         lines.append(f'            {ac_call};')
         lines.append('            return;')
@@ -254,7 +254,7 @@ def _emit_requires_grad_detection(lines, f):
         cond = ' || '.join(checks)
         lines.append(
             '    if (GradMode::is_enabled() && !InferenceMode::is_enabled() '
-            f'&& ({cond})) requires_grad = true;')
+            f'&& ({cond}) && !autograd_dispatch_excluded()) requires_grad = true;')
 
 
 def _emit_leaf_checks(lines, f):

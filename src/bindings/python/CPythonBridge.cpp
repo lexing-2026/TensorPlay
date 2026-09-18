@@ -1746,8 +1746,65 @@ int tpx_tensor_guard_probe(PyObject* obj, long long* version_out) {
     }
 }
 
+PythonError::PythonError() {
+#if PY_VERSION_HEX >= 0x030C0000
+    value_ = PyErr_GetRaisedException();
+#else
+    PyErr_Fetch(&type_, &value_, &traceback_);
+    PyErr_NormalizeException(&type_, &value_, &traceback_);
+    if (value_ != nullptr && traceback_ != nullptr) {
+        PyException_SetTraceback(value_, traceback_);
+    }
+#endif
+    if (value_ == nullptr) {
+        message_ = "unknown Python error";
+        return;
+    }
+    PyObject* text = PyObject_Str(value_);
+    const char* utf8 = text != nullptr ? PyUnicode_AsUTF8(text) : nullptr;
+    message_ = std::string(Py_TYPE(value_)->tp_name) + ": " +
+               (utf8 != nullptr ? utf8 : "");
+    Py_XDECREF(text);
+    PyErr_Clear();
+}
+
+PythonError::PythonError(const PythonError& other)
+    : std::exception(other), message_(other.message_) {
+    PyGILState_STATE gil = PyGILState_Ensure();
+    type_ = Py_XNewRef(other.type_);
+    value_ = Py_XNewRef(other.value_);
+    traceback_ = Py_XNewRef(other.traceback_);
+    PyGILState_Release(gil);
+}
+
+PythonError::~PythonError() {
+    if ((type_ || value_ || traceback_) && Py_IsInitialized()) {
+        PyGILState_STATE gil = PyGILState_Ensure();
+        Py_XDECREF(type_);
+        Py_XDECREF(value_);
+        Py_XDECREF(traceback_);
+        PyGILState_Release(gil);
+    }
+}
+
+void PythonError::restore() const {
+    if (value_ == nullptr) {
+        PyErr_SetString(PyExc_RuntimeError, message_.c_str());
+        return;
+    }
+#if PY_VERSION_HEX >= 0x030C0000
+    PyErr_SetRaisedException(Py_NewRef(value_));
+#else
+    PyErr_Restore(Py_XNewRef(type_), Py_NewRef(value_), Py_XNewRef(traceback_));
+#endif
+}
+
 void tpx_py_set_error(const std::exception& e) {
     if (PyErr_Occurred()) return;  // already translated deeper down
+    if (const PythonError* python = dynamic_cast<const PythonError*>(&e)) {
+        python->restore();
+        return;
+    }
     // Bridge argument-shape errors read as TypeError, the builtin callers
     // expect for bad arguments.
     if (dynamic_cast<const std::invalid_argument*>(&e)) {
