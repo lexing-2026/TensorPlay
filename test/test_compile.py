@@ -388,9 +388,23 @@ def test_compile_records_public_spelling_for_out_calls():
         seen["gm"] = graph_module
         return graph_module
 
-    tp.compile(lambda a, out: tp.addcmul(a, a, a, value=2, out=out), backend=backend)(
-        tp.ones(2), tp.empty(2)
+    compiled = tp.compile(
+        lambda a, out: tp.addcmul(a, a, a, value=2, out=out), backend=backend
     )
+    compiled(tp.ones(2), tp.empty(2))
     (call,) = [n for n in seen["gm"].graph.nodes if n.op == "call_function"]
     assert "self" not in call.kwargs
     assert set(call.kwargs) == {"value", "out"}
+
+
+@pytest.mark.parametrize("backend", ["eager", "stax"])
+def test_compile_out_call_writes_destination_on_every_call(backend):
+    compiled = tp.compile(
+        lambda a, out: tp.addcmul(a, a, a, value=2, out=out), backend=backend
+    )
+    compiled(tp.ones(2), tp.zeros(2))
+    # The second call is served from the cache, not by capture-time execution.
+    out = tp.zeros(2)
+    result = compiled(tp.full((2,), 2.0), out)
+    assert out.tolist() == [10.0, 10.0]
+    assert result.tolist() == [10.0, 10.0]
