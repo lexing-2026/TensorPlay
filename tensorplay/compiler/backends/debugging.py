@@ -9,8 +9,10 @@ generating code.  All are registered with the ``debug`` tag, so
 * ``eager_noexcept`` — as ``eager``, but any exception raised by the graph
   is reported as a compiler failure (checks that capture emits runnable
   graphs).
-* ``eager_debug`` — run node by node through the graph interpreter, so an
-  error names the failing node and its original source location.
+* ``eager_debug`` — run node by node through the graph interpreter under
+  :class:`~tensorplay._subclasses.SchemaCheckMode`, so an error names the
+  failing node and any operator whose schema misstates its mutations or
+  aliasing is reported.
 * ``aot_eager`` / ``aot_eager_default_partitioner`` — ahead-of-time autograd
   with pass-through compilers: forward and backward graphs are traced and
   partitioned (min-cut / default partitioner) and then run as traced, which
@@ -66,9 +68,13 @@ def eager_debug(
         log.warning("eager_debug backend ignoring extra kwargs %s", kwargs)
 
     from ...graph.interpreter import Interpreter
+    from tensorplay._subclasses.schema_check_mode import SchemaCheckMode
 
+    # Every operator the graph runs is checked against its schema: an
+    # undeclared mutation or aliasing raises.
     def inner(*args: Any, **call_kwargs: Any) -> Any:
-        return Interpreter(gm).run(*args, **call_kwargs)
+        with SchemaCheckMode():
+            return Interpreter(gm).run(*args, **call_kwargs)
 
     return inner
 
