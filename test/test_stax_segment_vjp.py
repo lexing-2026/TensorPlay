@@ -145,8 +145,9 @@ def test_fanout_gradient_accumulation(monkeypatch):
     assert tp.abs(xc.grad - expected_grad).max().item() < 1e-5
 
 
-def test_untrainable_reduction_still_falls_back(monkeypatch):
-    """amax has no uniform VJP: whole graph must fall back (M5f)."""
+def test_bare_extremum_reduction_trains_via_mask_vjp(monkeypatch):
+    """A bare extremum reduction trains through the eager select-mask VJP:
+    only the forward kernel is emitted, no backward kernel."""
 
     calls = []
     _fake_runtime(monkeypatch, {})
@@ -164,9 +165,34 @@ def test_untrainable_reduction_still_falls_back(monkeypatch):
     x = tp.rand(16, requires_grad=True)
     gm = Tracer().trace(lambda t: t.amax(dim=0), sample_inputs={"t": x})
     compiled = st.compile_graph_module(gm, [x])
-    # amax training graphs keep the eager fallback for now
+    assert compiled is not None
+    assert compiled._tensorplay_backward_codegen == "triton"
+    assert calls == ["fwd0"]
+
+
+def test_extremum_reduction_producer_chain_still_falls_back(monkeypatch):
+    """A pointwise chain feeding the extremum has no eager VJP in v1: the
+    whole region keeps the eager fallback."""
+
+    calls = []
+    _fake_runtime(monkeypatch, {})
+
+    def fake_autotune(name, *args, **kwargs):
+        calls.append(name)
+
+        def launch(values):
+            return None
+
+        return launch
+
+    monkeypatch.setattr(st, "_autotune_launch", fake_autotune)
+
+    x = tp.rand(16, requires_grad=True)
+    gm = Tracer().trace(lambda t: (t * 2).amax(dim=0), sample_inputs={"t": x})
+    compiled = st.compile_graph_module(gm, [x])
+    # the forward kernel is built before the plan gate rejects the sweep
     assert compiled is None
-    assert calls == []
+    assert calls == ["fwd0"]
 
 
 # --- numeric checks on a real GPU -------------------------------------------------
@@ -329,6 +355,77 @@ def _spy_canonical_launches(monkeypatch):
 
     monkeypatch.setattr(canonical, "_autotune_launch", spy)
     return seen
+
+
+@pytest.mark.skipif(not st.runtime_available(), reason="Triton/CUDA unavailable")
+def test_bare_amax_training_matches_eager_gpu(monkeypatch):
+    """Bare extremum reduction: the select-mask VJP splits ties evenly."""
+
+    def fn(t):
+        return t.amax(dim=1)
+
+    launches = _spy_canonical_launches(monkeypatch)
+    x = tp.randn(4, 8, device=tp.device("cuda", 0), requires_grad=True)
+    compiled = tp.compile(fn, fullgraph=True)
+    out = compiled(x)
+    out.sum().backward()
+    tp.cuda.synchronize()
+    assert launches and not [n for n in launches if n.startswith("bwd")]
+
+    ref_in = x.detach().clone().requires_grad_(True)
+    ref = fn(ref_in)
+    ref.sum().backward()
+
+    assert tp.abs(out.cpu() - ref.cpu()).max().item() < 1e-5
+    assert tp.abs(x.grad.cpu() - ref_in.grad.cpu()).max().item() < 1e-5
+
+
+@pytest.mark.skipif(not st.runtime_available(), reason="Triton/CUDA unavailable")
+def test_extremum_mask_vjp_flows_between_segments_gpu(monkeypatch):
+    """softmax extern -> bare amax -> sum: the reduction tangent flows back
+    through the mask VJP into the extern segment's engine rule."""
+
+    def fn(t):
+        return t.softmax(dim=1).amax(dim=1).sum()
+
+    launches = _spy_canonical_launches(monkeypatch)
+    x = tp.randn(4, 8, device=tp.device("cuda", 0), requires_grad=True)
+    compiled = tp.compile(fn, fullgraph=True)
+    out = compiled(x)
+    out.backward()
+    tp.cuda.synchronize()
+    assert [n for n in launches if n.startswith("bwd")], launches
+
+    ref_in = x.detach().clone().requires_grad_(True)
+    ref = fn(ref_in)
+    ref.backward()
+
+    assert tp.abs(out.cpu() - ref.cpu()).max().item() < 1e-5
+    assert tp.abs(x.grad.cpu() - ref_in.grad.cpu()).max().item() < 1e-5
+
+
+@pytest.mark.skipif(not st.runtime_available(), reason="Triton/CUDA unavailable")
+def test_min_amin_training_matches_eager_gpu(monkeypatch):
+    """amin fuses forward (tl.minimum) and trains through the mask VJP;
+    full-reduction min() trains the same way."""
+
+    def fn(t):
+        return t.amin(dim=1).sum() + t.min()
+
+    launches = _spy_canonical_launches(monkeypatch)
+    x = tp.randn(4, 8, device=tp.device("cuda", 0), requires_grad=True)
+    compiled = tp.compile(fn, fullgraph=True)
+    out = compiled(x)
+    out.backward()
+    tp.cuda.synchronize()
+    assert launches
+
+    ref_in = x.detach().clone().requires_grad_(True)
+    ref = fn(ref_in)
+    ref.backward()
+
+    assert tp.abs(out.cpu() - ref.cpu()).max().item() < 1e-5
+    assert tp.abs(x.grad.cpu() - ref_in.grad.cpu()).max().item() < 1e-5
 
 
 @pytest.mark.skipif(not st.runtime_available(), reason="Triton/CUDA unavailable")

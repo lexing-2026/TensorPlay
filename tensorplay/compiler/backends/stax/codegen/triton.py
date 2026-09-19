@@ -156,6 +156,8 @@ _ACC_UPDATE = {
     "mean": "acc + chunk",
     "amax": "tl.maximum(acc, chunk)",
     "max": "tl.maximum(acc, chunk)",
+    "amin": "tl.minimum(acc, chunk)",
+    "min": "tl.minimum(acc, chunk)",
 }
 
 # Value-stream dtype for index reductions (M5b dual-stream skeleton).  The
@@ -236,7 +238,7 @@ _PERSISTENT_RNUMEL_MAX = 512
 class ReductionSpec:
     """Structured description of a reduction epilogue (L5-M5b).
 
-    ``op``    : "sum" | "mean" | "amax" | "max" | "argmax"
+    ``op``    : "sum" | "mean" | "amax" | "amin" | "max" | "min" | "argmax"
     ``dims``  : reduction axes, ascending; empty tuple = full reduction
     ``keepdim``: whether reduced axes stay as size-1 dimensions
 
@@ -248,18 +250,29 @@ class ReductionSpec:
     __slots__ = ("op", "dims", "keepdim")
 
     # kernel-side combine/finalize/neutral per op
-    _FINAL = {"sum": "tl.sum", "mean": "tl.sum", "amax": "tl.max", "max": "tl.max"}
+    _FINAL = {
+        "sum": "tl.sum",
+        "mean": "tl.sum",
+        "amax": "tl.max",
+        "max": "tl.max",
+        "amin": "tl.min",
+        "min": "tl.min",
+    }
     _COMBINE = {
         "sum": "acc + {value}",
         "mean": "acc + {value}",
         "amax": "tl.maximum(acc, {value})",
         "max": "tl.maximum(acc, {value})",
+        "amin": "tl.minimum(acc, {value})",
+        "min": "tl.minimum(acc, {value})",
     }
     _NEUTRAL = {
         "sum": "0.0",
         "mean": "0.0",
         "amax": "float('-inf')",
         "max": "float('-inf')",
+        "amin": "float('inf')",
+        "min": "float('inf')",
         "argmax": "float('-inf')",
     }
 
@@ -2122,7 +2135,16 @@ def _autotune_launch(
         return build(None)
 
 
-_REDUCTION_TAIL_OPS = {"sum", "mean", "amax", "max", "argmax"}
+# Value-only reduction tails; "min"/"max" with explicit dims return a
+# (values, indices) pair and are rejected by the parser below, and
+# "argmax" is the index reduction.
+_REDUCTION_SCALAR_TAILS = frozenset({"sum", "mean", "amax", "amin", "max", "min"})
+_REDUCTION_PAIR_TAILS = frozenset({"max", "min"})
+_REDUCTION_INDEX_TAILS = frozenset({"argmax"})
+_REDUCTION_TAIL_OPS = _REDUCTION_SCALAR_TAILS | _REDUCTION_PAIR_TAILS | _REDUCTION_INDEX_TAILS
+# Extremum reductions: the tangent selects the positions attaining the
+# extremum instead of distributing uniformly (M5f select-mask VJP).
+_MASK_REDUCTION_OPS = frozenset({"amax", "amin", "max", "min"})
 
 
 def _reduction_spec_from_node(node: Node) -> ReductionSpec | None:
@@ -2181,10 +2203,10 @@ def _reduction_spec_from_node(node: Node) -> ReductionSpec | None:
     else:
         return None
 
-    if op == "amax" and not dims:
+    if op in ("amax", "amin") and not dims:
         return None
-    if op == "max" and dims:
-        return None  # max(dim) yields a (values, indices) pair
+    if op in ("max", "min") and dims:
+        return None  # max(dim)/min(dim) yield a (values, indices) pair
     try:
         return ReductionSpec(op, dims, keepdim=keepdim)
     except ValueError:
@@ -2740,6 +2762,45 @@ def _reduction_tangent_plan(
     return (reshape_sizes, tuple(int(size) for size in producer_shape), scale)
 
 
+def _reduction_mask_vjp(spec: ReductionSpec, input_position: int):
+    """Select-mask VJP for a bare extremum reduction (M5f).
+
+    The export tangent flows to every position attaining the extremum,
+    splitting ties evenly: ``expand(t) * (x == y) / tie_count`` per
+    reduced slice.  The extremum value is recomputed from the reduction
+    input, so the backward needs no extra forward state.  ``feed`` is the
+    segment feed with the reduction input at ``input_position``; returns
+    one gradient per feed position.
+    """
+
+    def vjp(feed: list, tangent: Any) -> list:
+        x = feed[input_position]
+        rank = len(x.shape)
+        dims = (
+            list(range(rank)) if spec.is_full else list(spec.normalized_dims(rank))
+        )
+        if spec.op == "max":
+            y = x.max()
+        elif spec.op == "min":
+            y = x.min()
+        else:
+            y = getattr(x, spec.op)(dim=dims, keepdim=spec.keepdim)
+        keep_shape = [
+            1 if dim in dims else int(size) for dim, size in enumerate(x.shape)
+        ]
+        y_b = y.reshape(keep_shape)
+        mask = (x == y_b).to(x.dtype)
+        # every reduced slice attains its extremum at least once, so the
+        # tie count is never zero where the mask selects
+        ties = mask.sum(dim=dims, keepdim=True)
+        grad_x = tangent.reshape(keep_shape) * mask / ties
+        grads = [None] * len(feed)
+        grads[input_position] = grad_x
+        return grads
+
+    return vjp
+
+
 def _extract_segment_view(
     graph: Graph, nodes, export_node: Node, extra_exports: tuple = ()
 ):
@@ -2865,18 +2926,17 @@ def compile_graph_module(
         # Training lowers through per-segment local VJPs.  Pointwise
         # segments take elementwise VJPs; sum/mean reduction segments take
         # an expanded tangent into their prologue's VJP program (the
-        # forward program already exports the reduction input).  Extern
+        # forward program already exports the reduction input); bare
+        # extremum reductions take an eager select-mask VJP.  Extern
         # segments take an engine VJP through one recomputed eager call;
-        # store-time epilogues, index reductions and extremum reductions
-        # still need their own gradient paths (M5f).
+        # store-time epilogues and index reductions still need their own
+        # gradient paths, and extremum reductions behind a pointwise chain
+        # fall back at the plan gate.
         for seg in segments:
             if seg.epilogue:
                 _dbg('fallback gate #5a')
                 return None
-            if seg.kind == "pw+red" and (
-                seg.reduction.tracks_indices
-                or seg.reduction.op not in ("sum", "mean")
-            ):
+            if seg.kind == "pw+red" and seg.reduction.tracks_indices:
                 _dbg('fallback gate #5b')
                 return None
     if any_grad and needs_broadcast:
@@ -3155,6 +3215,21 @@ def compile_graph_module(
             max_autotune=max_autotune,
             coordinate_descent_tuning=coordinate_descent_tuning,
         )
+        # M5f: a bare extremum reduction (input is a direct source, no
+        # pointwise producer) trains through the eager select-mask VJP; no
+        # backward kernel is built for it.
+        mask_launch = None
+        if (
+            reduction is not None
+            and reduction.op in _MASK_REDUCTION_OPS
+            and len(sources) == 1
+            and seg.producer is not None
+            and seg.producer not in seg.nodes
+        ):
+            mask_vjp = _reduction_mask_vjp(reduction, 0)
+            mask_launch = lambda feed_and_tangent, vjp=mask_vjp: vjp(  # noqa: E731
+                feed_and_tangent[:-1], feed_and_tangent[-1]
+            )
         segment_plans.append(
             _SegmentPlan(
                 seg_launch,
@@ -3172,6 +3247,7 @@ def compile_graph_module(
                     if reduction is None
                     else _reduction_tangent_plan(reduction, local_ref)
                 ),
+                backward_launch=mask_launch,
             )
         )
 
@@ -3198,6 +3274,14 @@ def compile_graph_module(
     single_fused_training = (
         len(segment_plans) == 1
         and not isinstance(segment_plans[0], _ExternPlan)
+        # a bare extremum reduction carries its own eager VJP; an extremum
+        # reduction behind an in-segment producer chain has no local VJP
+        # and must fall back through the plan gate instead
+        and segment_plans[0].backward_launch is None
+        and (
+            segment_plans[0].spec is None
+            or segment_plans[0].spec.op not in _MASK_REDUCTION_OPS
+        )
     )
     if any(value.requires_grad for value in example_inputs):
         if single_fused_training:
@@ -3236,7 +3320,9 @@ def compile_graph_module(
             for plan in segment_plans:
                 if (
                     plan.needs_broadcast
-                    or plan.tangent_plan is None and plan.spec is not None
+                    or plan.tangent_plan is None
+                    and plan.spec is not None
+                    and plan.backward_launch is None
                     or any(
                         op_name not in _CPU_FUSED_AUTOGRAD_OPS
                         for op_name, *_ in plan.instructions
