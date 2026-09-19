@@ -67,11 +67,14 @@ struct GemmKey {
     int device;
     bool has_bias;
     bool other_transposed;
+    // the plan bakes the compute type into its descriptor; a precision
+    // switch must not reuse a plan built under the other mode
+    bool tf32;
 
     bool operator==(const GemmKey& o) const {
         return dtype == o.dtype && m == o.m && n == o.n && k == o.k &&
                device == o.device && has_bias == o.has_bias &&
-               other_transposed == o.other_transposed;
+               other_transposed == o.other_transposed && tf32 == o.tf32;
     }
 };
 
@@ -84,6 +87,7 @@ struct GemmKeyHash {
         h ^= std::hash<int>()(k.device) + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= std::hash<bool>()(k.has_bias) + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= std::hash<bool>()(k.other_transposed) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<bool>()(k.tf32) + 0x9e3779b9 + (h << 6) + (h >> 2);
         return h;
     }
 };
@@ -214,7 +218,8 @@ void* to_scalar_ptr(double v, DType t, int slot) {
 std::shared_ptr<GemmPlan> get_gemm_plan(DType dtype, int64_t M, int64_t N, int64_t K,
                                         bool has_bias, bool other_transposed) {
     const int device = currentDevice();
-    GemmKey key{dtype, M, N, K, device, has_bias, other_transposed};
+    const bool tf32 = dtype == DType::Float32 && globalContext().allowTF32CuBLAS();
+    GemmKey key{dtype, M, N, K, device, has_bias, other_transposed, tf32};
     std::lock_guard<std::mutex> lock(plan_mutex());
     auto& cache = plan_cache();
     auto it = cache.find(key);
