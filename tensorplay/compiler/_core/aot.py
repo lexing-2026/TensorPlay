@@ -219,6 +219,7 @@ def _copy_nodes(
                 if not external_as_inputs:
                     raise AOTError(f"unmapped node {value.name} during extraction")
                 mapping[value] = graph.placeholder(value.name)
+                mapping[value].meta.update(value.meta)
             return mapping[value]
         if isinstance(value, tuple):
             return tuple(remap(v) for v in value)
@@ -234,7 +235,7 @@ def _copy_nodes(
         new_args = tuple(remap(a) for a in node.args)
         new_kwargs = {k: remap(v) for k, v in node.kwargs.items()}
         clone = graph.create_node(node.op, node.target, new_args, new_kwargs, name=node.name)
-        clone.meta.update({k: v for k, v in node.meta.items() if k != "val"})
+        clone.meta.update(node.meta)
         mapping[node] = clone
     graph.output(tuple(remap(o) for o in outputs) if len(outputs) > 1 else remap(outputs[0]))
     return graph, mapping, [mapping[n] for n in nodes]
@@ -294,6 +295,7 @@ def partition_default(
                 return bw_map[node]
             if node.op in _LEAF_OPS:
                 clone = bw_graph.placeholder(node.name)
+                clone.meta.update(node.meta)
                 bw_map[node] = clone
                 if node.op == "placeholder" and node.meta.get("is_backward"):
                     input_kinds.append("tangent")
@@ -312,9 +314,7 @@ def partition_default(
             clone = bw_graph.create_node(
                 node.op, node.target, new_args, new_kwargs, name=node.name
             )
-            clone.meta.update(
-                {k: v for k, v in node.meta.items() if k != "val"}
-            )
+            clone.meta.update(node.meta)
             bw_map[node] = clone
             return clone
 
@@ -353,7 +353,9 @@ def partition_default(
                 for p in graph.placeholders
             ]
         )
-        return GraphModule(None, graph, sig)
+        # Rooted on the joint module: attributes the partitioned graphs
+        # still read (lifted constants) resolve there.
+        return GraphModule(joint_gm, graph, sig)
 
     return (
         _gm(fw_graph),
@@ -557,6 +559,7 @@ def partition_min_cut(
         )
         if external:
             clone = bw_graph.placeholder(node.name)
+            clone.meta.update(node.meta)
             bw_map[node] = clone
             if node.op == "placeholder" and node.meta.get("is_backward"):
                 input_kinds.append("tangent")
@@ -576,6 +579,7 @@ def partition_min_cut(
             for k, v in node.kwargs.items()
         }
         clone = bw_graph.create_node(node.op, node.target, new_args, new_kwargs, name=node.name)
+        clone.meta.update(node.meta)
         bw_map[node] = clone
         return clone
 
@@ -593,7 +597,9 @@ def partition_min_cut(
                 for p in graph.placeholders
             ]
         )
-        return GraphModule(None, graph, sig)
+        # Rooted on the joint module: attributes the partitioned graphs
+        # still read (lifted constants) resolve there.
+        return GraphModule(joint_gm, graph, sig)
 
     return (
         _gm(fw_graph),

@@ -7,6 +7,8 @@ never asked to discover Python control flow; it only receives a captured
 
 from __future__ import annotations
 
+import contextlib
+
 import functools
 import inspect
 import threading
@@ -664,6 +666,32 @@ def _adapt_backend_to_region(
     )
 
 
+@contextlib.contextmanager
+def _preserve_module_state(program: Any) -> Any:
+    """Undo the state updates an executing capture makes.
+
+    Capture runs the program to record it; in-place updates it performs on
+    the module's parameters and buffers (running statistics, counters) must
+    not count as a call, so their values are restored afterwards.
+    """
+
+    import tensorplay
+
+    module = program if isinstance(program, tensorplay.nn.Module) else getattr(program, "__self__", None)
+    if not isinstance(module, tensorplay.nn.Module):
+        yield
+        return
+    with tensorplay.no_grad():
+        saved = [(t, t.clone()) for t in list(module.parameters()) + list(module.buffers())]
+    try:
+        yield
+    finally:
+        with tensorplay.no_grad():
+            for tensor, value in saved:
+                if tuple(tensor.shape) == tuple(value.shape):
+                    tensor.copy_(value)
+
+
 def _compile_region(
     model: Callable[..., Any],
     compiler_fn: CompilerFn,
@@ -674,12 +702,12 @@ def _compile_region(
     backend_kwargs: dict[str, Any],
     region_key: str | None = None,
 ) -> tuple[Callable[..., Any], GraphModule]:
-    stored = load_region(region_key)
+    stored = load_region(region_key, model)
     if stored is not None:
         graph_module = stored
     else:
         try:
-            with _compiler_context():
+            with _compiler_context(), _preserve_module_state(model):
                 graph_module = Tracer(execute=True).trace(
                     model,
                     sample_inputs=_bind_sample_arguments(
@@ -736,8 +764,10 @@ def _compile_region(
 
     # Advisory shape/value metadata for backends and visualization; never a
     # reason to reject an otherwise compilable region.
+    # Propagation executes the graph: it must not count as a call either.
     try:
-        ShapeProp(backend_inputs)(graph_module)
+        with _preserve_module_state(model):
+            ShapeProp(backend_inputs)(graph_module)
     except (GraphCaptureError, RuntimeError):
         pass
 

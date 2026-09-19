@@ -268,10 +268,31 @@ def test_cudagraphs_training_region_keeps_autograd():
 
 
 @requires_cuda
+def test_cudagraphs_training_replays_forward_and_backward():
+    from tensorplay._stax.cudagraphs import CudagraphsBackend
+
+    tp.manual_seed(0)
+    eager = tp.nn.Linear(8, 8).cuda()
+    compiled_lin = tp.nn.Linear(8, 8).cuda()
+    compiled_lin.load_state_dict(eager.state_dict())
+    compiled = tp.compile(lambda x: compiled_lin(x).relu().sum(), backend="cudagraphs")
+    for _ in range(3):
+        x = tp.randn(4, 8, device="cuda", requires_grad=True)
+        x_ref = x.detach().clone().requires_grad_(True)
+        eager(x_ref).relu().sum().backward()
+        compiled(x).backward()
+        assert (x.grad - x_ref.grad).abs().max().item() < 1e-5
+    assert (compiled_lin.weight.grad - eager.weight.grad).abs().max().item() < 1e-4
+    # Both the forward and the backward graph were captured.
+    captured = sum(len(manager._entries) for manager in CudagraphsBackend._managers)
+    assert captured >= 2
+
+
+@requires_cuda
 @pytest.mark.parametrize(
     ("fn", "reason"),
     [
-        (lambda a: a.add_(1), "mutated inputs (a)"),
+        (lambda a: a.add_(1), "mutated inputs (1 instances)"),
         (lambda a: a.cpu() + 1, "cpu device"),
         (lambda a: a[a > 0], "incompatible op"),
         (lambda a: a.nonzero(), "incompatible op"),
