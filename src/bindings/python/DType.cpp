@@ -69,7 +69,25 @@ void init_dtype(py::module_& m) {
         .value("bool", DType::Bool)
         .value("undefined", DType::Undefined)
         .def("__str__", [](DType d) { return dtype_repr(d); })
-        .def("__repr__", [](DType d) { return dtype_repr(d); })
+        // attr() rather than def(): def() would append to the overload set
+        // pybind installs for the enum, whose object-level fallback then
+        // shadows this spelling on repr().
+        .def("__init__", [](DType& self, py::args args, py::kwargs kwargs) {
+            if (kwargs.size() > 0 || args.size() != 1) {
+                throw std::invalid_argument(
+                    "DType() takes exactly one dtype or int argument");
+            }
+            PyObject* v = args[0].ptr();
+            if (PyLong_Check(v)) {  // bool is an int subclass: same spelling
+                new (&self) DType(static_cast<DType>(PyLong_AsLongLong(v)));
+            } else if (py::isinstance<DType>(args[0])) {
+                new (&self) DType(args[0].cast<DType>());
+            } else {
+                throw std::invalid_argument(
+                    std::string("DType() expects a dtype or int, not ")
+                    + Py_TYPE(v)->tp_name);
+            }
+        })
         .def_property_readonly("is_floating_point", [](DType d) {
             return tensorplay::isFloatingType(d);
         })
@@ -85,6 +103,13 @@ void init_dtype(py::module_& m) {
         .def_property_readonly("itemsize", [](DType d) {
             return tensorplay::elementSize(d);
         });
+    // attr() rather than def(): the chained def() appends to the overload set
+    // pybind installs for the enum, whose object-level fallback then shadows
+    // this spelling on repr().
+    dtype.attr("__repr__") = py::cpp_function(
+        [](DType d) { return dtype_repr(d); }, py::is_method(dtype));
+    dtype.attr("__str__") = py::cpp_function(
+        [](DType d) { return dtype_repr(d); }, py::is_method(dtype));
 
     m.attr("uint8") = DType::UInt8;
     m.attr("int8") = DType::Int8;

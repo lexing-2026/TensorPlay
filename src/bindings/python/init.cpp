@@ -7,6 +7,7 @@
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include "CPythonBridge.h"
 #include "Context.h"
+#include "Device.h"
 #include "Utils.h"
 #include "OneDNNContext.h"
 #include "Profiler.h"
@@ -320,6 +321,40 @@ py::tuple dtensor_compute_global_tensor_info(
 }
 
 } // anonymous namespace
+
+namespace {
+
+// METH_FASTCALL surface for set_printoptions: bad keyword arguments raise
+// the shared bridge error text instead of a pybind11 caster dump.
+PyObject* set_printoptions_fastcall(PyObject*, PyObject* const* args,
+                                    Py_ssize_t nargs, PyObject* kwnames) {
+    try {
+        static const char* kwlist[] = {"edge_items", "threshold", "precision",
+                                       "linewidth", nullptr};
+        PyObject* slots[4];
+        tensorplay::python_c::tpx_py_parse_into(args, nargs, kwnames, kwlist, 4,
+                                                "set_printoptions", slots);
+        static const unsigned char tpx_kinds[] = {
+            tensorplay::python_c::TPK_INT | tensorplay::python_c::TPK_OPTIONAL,
+            tensorplay::python_c::TPK_INT | tensorplay::python_c::TPK_OPTIONAL,
+            tensorplay::python_c::TPK_INT | tensorplay::python_c::TPK_OPTIONAL,
+            tensorplay::python_c::TPK_INT | tensorplay::python_c::TPK_OPTIONAL};
+        tensorplay::python_c::tpx_py_check_types(slots, 4, "set_printoptions",
+                                                 kwlist, tpx_kinds, 4);
+        auto pick = [&](PyObject* slot) -> int64_t {
+            if (slot == nullptr || slot == Py_None) return -1;
+            return tensorplay::python_c::tpx_py_int64(slot);
+        };
+        tensorplay::set_printoptions(pick(slots[0]), pick(slots[1]),
+                                     pick(slots[2]), pick(slots[3]));
+        Py_RETURN_NONE;
+    } catch (const std::exception& e) {
+        tensorplay::python_c::tpx_py_set_error(e);
+        return nullptr;
+    }
+}
+
+}  // namespace
 
 PYBIND11_MODULE(_C, m) {
     init_monitor(m);
@@ -845,12 +880,19 @@ PYBIND11_MODULE(_C, m) {
         return true;
     });
 
-    m.def("set_printoptions", &tensorplay::set_printoptions, 
-          "Set print options", 
-          py::arg("edge_items") = -1, 
-          py::arg("threshold") = -1, 
-          py::arg("precision") = -1, 
-          py::arg("linewidth") = -1);
+    // METH_FASTCALL surface: the pybind typed-arg surface answers bad
+    // keyword arguments with an aggregate dump naming pybind11 types.
+    {
+        static PyMethodDef printoptions_def = {
+            "set_printoptions", (PyCFunction)(void*)set_printoptions_fastcall,
+            METH_FASTCALL | METH_KEYWORDS,
+            "set_printoptions(*, edge_items=-1, threshold=-1, precision=-1, "
+            "linewidth=-1)\n\nSets the formatting options used by repr()."};
+        static PyObject* module_name =
+            PyUnicode_InternFromString("tensorplay._C");
+        m.add_object("set_printoptions", py::reinterpret_steal<py::object>(
+            PyCFunction_NewEx(&printoptions_def, nullptr, module_name)));
+    }
 
     // Backends
     m.def("has_mkldnn", &tensorplay::OneDNNContext::is_available);
@@ -1093,4 +1135,64 @@ PYBIND11_MODULE(_C, m) {
           [](py::module_& mod, py::dict wrappers) {
               install_factory_fast_paths_impl(mod, wrappers);
           }, "mod"_a, "wrappers"_a);
+
+    // pybind11 helper types and the extension module path leak through
+    // repr() and binary-op type errors: the metaclass prints its vendor
+    // type name, bound methods print the function-record type name, and
+    // registered classes print "<extmodule>.<ClassName>".  All are
+    // implementation details users must never see.  All binding-layer
+    // checks compare Py_TYPE pointers, so display-only retitles are safe;
+    // the replacement strings live for the process, matching the static
+    // tp_name slots they patch.
+    {
+        static std::string class_name = "tensorplay.tp_class";
+        static std::string method_name = "tensorplay.tp_method";
+        static std::vector<std::string> renamed;
+        auto* meta = Py_TYPE(py::type::of<Device>().ptr());
+        meta->tp_name = class_name.c_str();
+        py::object record_host = m.attr("_call_overload");
+        auto* host = reinterpret_cast<PyCFunctionObject*>(record_host.ptr());
+        auto* record_ty = Py_TYPE(host->m_self);
+        record_ty->tp_name = method_name.c_str();
+        // Heap types render repr() from __module__/__qualname__ rather than
+        // tp_name; retitle those too so no vendor spelling survives.
+        auto retitle = [](PyTypeObject* ty, const char* qual) {
+            if (!(ty->tp_flags & Py_TPFLAGS_HEAPTYPE)) return;
+            PyObject* owner = reinterpret_cast<PyObject*>(ty);
+            PyObject* qname = PyUnicode_FromString(qual);
+            if (qname != nullptr) {
+                PyObject_SetAttrString(owner, "__qualname__", qname);
+                Py_DECREF(qname);
+            }
+            PyObject* pkg = PyUnicode_FromString("tensorplay");
+            if (pkg != nullptr) {
+                PyObject_SetAttrString(owner, "__module__", pkg);
+                Py_DECREF(pkg);
+            }
+            PyErr_Clear();
+        };
+        retitle(meta, "tp_class");
+        retitle(record_ty, "tp_method");
+        // Registered classes: binary-op type errors read tp_name directly,
+        // so retitle those to the public package path as well, under the
+        // exported attribute name.  The Python layer rewrites the exported
+        // __module__/__qualname__ spellings on top of this.
+        renamed.reserve(48);
+        PyObject* dict = PyModule_GetDict(m.ptr());
+        PyObject* key = nullptr;
+        PyObject* value = nullptr;
+        Py_ssize_t pos = 0;
+        while (PyDict_Next(dict, &pos, &key, &value)) {
+            if (!PyType_Check(value) || !PyUnicode_Check(key)) continue;
+            auto* ty = reinterpret_cast<PyTypeObject*>(value);
+            if (ty->tp_name == nullptr ||
+                std::strncmp(ty->tp_name, "tensorplay._C.", 14) != 0) {
+                continue;
+            }
+            const char* exported = PyUnicode_AsUTF8(key);
+            if (exported == nullptr) { PyErr_Clear(); continue; }
+            renamed.push_back(std::string("tensorplay.") + exported);
+            ty->tp_name = renamed.back().c_str();
+        }
+    }
 }

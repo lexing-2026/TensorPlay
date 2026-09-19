@@ -3,12 +3,32 @@
 
 void init_scalar(py::module_& m) {
     py::class_<Scalar>(m, "Scalar")
-        // then int64_t so Python ints stay integral, double last.
-        .def(py::init<bool>())
-        .def(py::init<int64_t>())
-        .def(py::init<double>())
-        .def(py::init<std::complex<float>>())
-        .def(py::init<std::complex<double>>())
+        // One raw-args __init__ instead of typed pybind overloads: a bad
+        // argument raises a one-line error instead of an aggregate dump of
+        // constructor signatures.
+        .def("__init__", [](Scalar& self, py::args args, py::kwargs kwargs) {
+            if (kwargs.size() > 0 || args.size() != 1) {
+                throw std::invalid_argument(
+                    "Scalar() takes exactly one Number argument");
+            }
+            PyObject* v = args[0].ptr();
+            if (PyBool_Check(v)) {
+                new (&self) Scalar(v == Py_True);
+            } else if (PyLong_Check(v)) {
+                new (&self) Scalar(static_cast<int64_t>(PyLong_AsLongLong(v)));
+            } else if (PyFloat_Check(v)) {
+                new (&self) Scalar(PyFloat_AS_DOUBLE(v));
+            } else if (PyComplex_Check(v)) {
+                new (&self) Scalar(std::complex<double>(
+                    PyComplex_RealAsDouble(v), PyComplex_ImagAsDouble(v)));
+            } else if (py::isinstance<Scalar>(args[0])) {
+                new (&self) Scalar(args[0].cast<const Scalar&>());
+            } else {
+                throw std::invalid_argument(
+                    std::string("Scalar() expects a Number, not ")
+                    + Py_TYPE(v)->tp_name);
+            }
+        })
         .def("__repr__", &Scalar::toString)
         .def("is_complex", &Scalar::isComplex)
         .def("__float__", [](const Scalar& s) { return s.to<double>(); })

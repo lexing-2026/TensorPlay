@@ -17,6 +17,7 @@ import importlib
 import inspect
 import os
 import sys
+import types
 import threading
 from typing import (
     Any as _Any,
@@ -1318,8 +1319,87 @@ def _as_tensor_fullprec(t):
         return tensorplay.as_tensor(t)
 
 
+# ---------------------------------------------------------------------------
+# Public-surface presentation pass.  Runs last so it sees every binding the
+# extension installed.
+# ---------------------------------------------------------------------------
+
+class _CleanFunction:
+    """Python shim over a bound C entry whose own object is an extension
+    helper type.  Only the object identity differs: ``__call__`` forwards to
+    the original, and the docstring is carried over."""
+
+    # The identity attributes live in the instance __dict__: ``__doc__`` and
+    # ``__module__`` are class attributes and cannot be slots.
+    __slots__ = ("_fn", "__dict__")
+
+    def __init__(self, fn, name):
+        self._fn = fn
+        self.__name__ = self.__qualname__ = name
+        self.__doc__ = fn.__doc__
+        self.__module__ = getattr(fn, "__module__", None) or "tensorplay"
+        self.__wrapped__ = fn
+
+    def __repr__(self):
+        return f"<built-in function {self.__name__}>"
+
+    def __call__(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
+
+
+def _polish_public_surface():
+    # The package's own ``types`` submodule shadows the standard module here.
+    import types as _stdlib_types
+
+    # 1) Classes re-exported here but registered on the extension quote the
+    #    extension's module path in type errors and reprs ("tensorplay._C.DType"
+    #    in `unsupported operand type(s)`); retitle them to the public package.
+    for name, obj in list(globals().items()):
+        if name.startswith("_") or not isinstance(obj, type):
+            continue
+        # Match on the exported name: a class may be registered on the
+        # extension under an internal spell (``TensorBase``) while the
+        # public alias differs, so its own __qualname__ is not a usable
+        # lookup key.  Rewriting __qualname__ to the exported spelling
+        # keeps ``tensorplay.<name>`` the one name everywhere (generated
+        # code relies on that resolution).
+        if (
+            obj.__module__ in ("tensorplay", "tensorplay._C")
+            and globals().get(name) is obj
+        ):
+            # immutable extension types (e.g. Size) reject retitling; the
+            # exported spelling is already theirs to keep then
+            try:
+                if obj.__module__ != "tensorplay":
+                    obj.__module__ = "tensorplay"
+                if obj.__qualname__ != name:
+                    obj.__qualname__ = name
+            except TypeError:
+                pass
+    # 2) Extension functions carry a binding-helper object as their bound
+    #    self; repr() and __qualname__ then quote that helper's C type name
+    #    ("PyCapsule").  Wrap those in a shim with a clean repr.  Regular
+    #    builtins, extension classes and non-callables pass through
+    #    untouched.
+    for module in list(sys.modules.values()):
+        if module is None or not isinstance(module, _stdlib_types.ModuleType):
+            continue
+        module_name = getattr(module, "__name__", "")
+        if not module_name.startswith("tensorplay") or "._" in module_name:
+            continue
+        for name, obj in list(vars(module).items()):
+            if name.startswith("_") or isinstance(obj, type):
+                continue
+            qualname = getattr(obj, "__qualname__", None)
+            if not isinstance(qualname, str) or not qualname.startswith("PyCapsule."):
+                continue
+            vars(module)[name] = _CleanFunction(obj, name)
+
+
 # `_import_device_backends` should be kept at the end to ensure
 # all the other functions in this module that may be accessed by
 # an autoloaded backend are defined
 if _is_device_backend_autoload_enabled():
     _import_device_backends()
+
+_polish_public_surface()

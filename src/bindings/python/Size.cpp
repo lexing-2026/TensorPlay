@@ -31,12 +31,12 @@ inline bool item_is_int(PyObject* item) {
 
 PyObject* size_repr(PyObject* self) {
     Py_ssize_t n = PyTuple_GET_SIZE(self);
-    std::string repr("tensorplay.Size(");
+    std::string repr("tensorplay.Size([");
     for (Py_ssize_t i = 0; i < n; ++i) {
         if (i != 0) repr += ", ";
         repr += std::to_string(PyLong_AsLongLong(PyTuple_GET_ITEM(self, i)));
     }
-    repr += ")";
+    repr += "])";
     return PyUnicode_FromString(repr.c_str());
 }
 

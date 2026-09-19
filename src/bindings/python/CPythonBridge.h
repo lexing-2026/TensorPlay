@@ -268,6 +268,12 @@ private:
 };
 
 // exception translation: sets a Python error from a C++ exception
+// Renders the user-supplied arguments for error messages, e.g.
+// "(int, dtype=int)": positional value types, then `name=type` spellings for
+// keyword values (which trail the positionals in METH_FASTCALL arrays).
+// `receiver` (a bound method's self) is described first when non-null.
+std::string tpx_py_args_desc(PyObject* const* args, Py_ssize_t nargs,
+                             PyObject* kwnames, PyObject* receiver);
 void tpx_py_set_error(const std::exception& e);
 
 }  // namespace python_c
