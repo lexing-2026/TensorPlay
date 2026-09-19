@@ -6,6 +6,8 @@ import itertools
 import weakref
 from typing import Any
 
+import tensorplay
+
 from ._triton_ops_meta import _get_device_name, get_meta
 
 __all__ = [
@@ -42,8 +44,10 @@ def check(condition: Any, message: str) -> None:
 
 
 def check_bsr_layout(function_name: str, value: Any) -> None:
-    layout = getattr(value, "layout", None)
-    check(str(layout).lower() in {"bsr", "sparse_bsr", "2", "12"}, f"{function_name} requires BSR layout")
+    check(
+        getattr(value, "layout", None) == tensorplay.sparse_bsr,
+        f"{function_name}(): only BSR sparse format is supported for the sparse argument.",
+    )
 
 
 def check_device(function_name: str, value: Any, device: Any) -> None:

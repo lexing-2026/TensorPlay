@@ -26,11 +26,11 @@ namespace {
 // hot path (using a cached CPython tensor type).
 PyTypeObject* g_fast_tensor_type = nullptr;
 inline bool fast_is_tensor(PyObject* obj) {
-    if (g_fast_tensor_type)
-        return PyObject_TypeCheck(obj, g_fast_tensor_type) != 0;
-    bool ok = py::isinstance<Tensor>(py::handle(obj));
-    if (ok) g_fast_tensor_type = Py_TYPE(obj);
-    return ok;
+    // Cache the registered base class, never the type of the first object
+    // seen: a subclass cached here would reject every plain tensor.
+    if (!g_fast_tensor_type)
+        g_fast_tensor_type = reinterpret_cast<PyTypeObject*>(py::type::of<Tensor>().ptr());
+    return PyObject_TypeCheck(obj, g_fast_tensor_type) != 0;
 }
 
 using PyObjectRef = std::shared_ptr<PyObject>;

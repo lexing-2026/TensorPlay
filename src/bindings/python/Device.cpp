@@ -50,6 +50,12 @@ void init_device(py::module_& m) {
         .def("__hash__", [](const Device& d) {
             return std::hash<std::string>()(d.toString());
         })
+        // Picklable (and so copy/deepcopy-able): rebuilt from its spelling,
+        // "cpu" or "cuda:1".
+        .def("__reduce__", [](const Device& d) {
+            return py::make_tuple(py::type::of<Device>(),
+                                  py::make_tuple(d.toString()));
+        })
         // device object scopes the default device for factory functions, so
         // `with tensorplay.device('cuda'):` allocates on that device.
         .def("__enter__", [](py::object self) {

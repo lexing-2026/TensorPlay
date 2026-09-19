@@ -2945,9 +2945,13 @@ void init_tensor(py::module_& m) {
         })
                 
         // Indexing
-        .def("tolist", [](const Tensor& self) -> py::object {
+        .def("tolist", [](const Tensor& tensor) -> py::object {
+            // Conjugate / negative views resolve first; device data is
+            // copied to the host before conversion.
+            Tensor self = tensorplay::tpx::ops::resolve_neg(
+                tensorplay::tpx::ops::resolve_conj(tensor));
             if (self.device().type() != DeviceType::CPU) {
-                 TP_THROW(RuntimeError, "tolist() is only supported on CPU tensors");
+                self = self.to(Device(DeviceType::CPU));
             }
 
             auto get_dtype_size = [](DType dtype) -> size_t {
