@@ -511,3 +511,158 @@ def test_extern_engine_vjp_trainable_between_fused_kernels(monkeypatch):
     assert tp.abs(got.cpu() - ref.cpu()).max().item() < 1e-4
     for g, want in zip(ins, ref_ins):
         assert tp.abs(g.grad.cpu() - want.grad.cpu()).max().item() < 1e-4
+
+
+# --- M5f: broadcast operands train through sum-to-shape ---------------------------
+
+
+def test_broadcast_operand_single_segment_trains(monkeypatch):
+    """(x + b).relu().sum() with b (N,) against x (M, N): the bias partial
+    comes back at the fused iteration space and is summed to (N,)."""
+
+    def fwd0(x, b):
+        return (x + b).relu().sum()
+
+    def bwd0(x, b, go):
+        mask = ((x + b) > 0).to(x.dtype)
+        # both partials at the fused (M, N) space; the sweep must reduce
+        # the second to b's own shape
+        return (go * mask, go * mask)
+
+    _fake_runtime(monkeypatch, {"fwd0": fwd0, "bwd0": bwd0})
+
+    x = tp.randn(8, 16, requires_grad=True)
+    b = tp.randn(16, requires_grad=True)
+
+    def fn(x, b):
+        return (x + b).relu().sum()
+
+    gm = Tracer().trace(fn, sample_inputs={"x": x, "b": b})
+    compiled = st.compile_graph_module(gm, [x, b])
+    assert compiled is not None
+    assert compiled._tensorplay_codegen == "triton"
+    assert compiled._tensorplay_backward_codegen == "triton"
+
+    xe = x.detach().requires_grad_(True)
+    be = b.detach().requires_grad_(True)
+    fn(xe, be).backward()
+    ref_gx, ref_gb = xe.grad, be.grad
+    assert tuple(ref_gb.shape) == (16,)
+
+    xc = x.detach().requires_grad_(True)
+    bc = b.detach().requires_grad_(True)
+    out = compiled(xc, bc)
+    out.backward()
+    assert tp.abs(out - fn(x.detach(), b.detach())).max().item() < 1e-6
+    assert tuple(bc.grad.shape) == (16,)
+    assert tp.abs(xc.grad - ref_gx).max().item() < 1e-5
+    assert tp.abs(bc.grad - ref_gb).max().item() < 1e-5
+
+
+def test_broadcast_operand_multi_segment_trains(monkeypatch):
+    """Two reduction chains over one broadcast bias: each segment's partial
+    is summed to (N,) before the fan-out accumulation."""
+
+    def fwd0(x, b):
+        return (x + b).relu().sum()
+
+    def bwd0(x, b, go):
+        mask = ((x + b) > 0).to(x.dtype)
+        return (go * mask, go * mask)
+
+    def fwd1(x, b):
+        return (x * b).sum()
+
+    def bwd1(x, b, go):
+        return (go * b, go * x)
+
+    def fwd2(a, b):
+        return a + b
+
+    def bwd2(a, b, go):
+        return (go, go)
+
+    _fake_runtime(
+        monkeypatch,
+        {"fwd0": fwd0, "bwd0": bwd0, "fwd1": fwd1, "bwd1": bwd1, "fwd2": fwd2, "bwd2": bwd2},
+    )
+
+    x = tp.randn(8, 16, requires_grad=True)
+    b = tp.randn(16, requires_grad=True)
+
+    def fn(x, b):
+        return (x + b).relu().sum() + (x * b).sum()
+
+    gm = Tracer().trace(fn, sample_inputs={"x": x, "b": b})
+    compiled = st.compile_graph_module(gm, [x, b])
+    assert compiled is not None
+    segments = gm.meta["stax_segments"]
+    assert [seg["kind"] for seg in segments] == ["pw+red", "pw+red", "pw"]
+
+    xe = x.detach().requires_grad_(True)
+    be = b.detach().requires_grad_(True)
+    fn(xe, be).backward()
+    ref_gx, ref_gb = xe.grad, be.grad
+
+    xc = x.detach().requires_grad_(True)
+    bc = b.detach().requires_grad_(True)
+    out = compiled(xc, bc)
+    out.backward()
+    assert tp.abs(out - fn(x.detach(), b.detach())).max().item() < 1e-6
+    assert tuple(bc.grad.shape) == (16,)
+    assert tp.abs(xc.grad - ref_gx).max().item() < 1e-5
+    assert tp.abs(bc.grad - ref_gb).max().item() < 1e-5
+
+
+@pytest.mark.skipif(not st.runtime_available(), reason="Triton/CUDA unavailable")
+def test_broadcast_operand_training_matches_eager_gpu():
+    device = tp.device("cuda", 0)
+
+    def fn(x, b):
+        return (x + b).relu().sum()
+
+    xs = [
+        tp.randn(32, 48, device=device, requires_grad=True),
+        tp.randn(48, device=device, requires_grad=True),
+    ]
+    compiled = tp.compile(fn, fullgraph=True)
+    ins = [v.detach().clone().requires_grad_(True) for v in xs]
+    got = compiled(*ins)
+    got.backward()
+    tp.cuda.synchronize()
+    assert tuple(ins[1].grad.shape) == (48,)
+
+    ref_ins = [v.detach().clone().requires_grad_(True) for v in xs]
+    ref = fn(*ref_ins)
+    ref.backward()
+    assert tp.abs(got.cpu() - ref.cpu()).max().item() < 1e-3
+    for g, want in zip(ins, ref_ins):
+        assert tp.abs(g.grad.cpu() - want.grad.cpu()).max().item() < 1e-3
+
+
+@pytest.mark.skipif(not st.runtime_available(), reason="Triton/CUDA unavailable")
+def test_broadcast_operand_scalar_tangent_gpu():
+    """A scalar hand-back expands against the output shape, not a broadcast
+    input, and every operand still receives its own-shape gradient."""
+
+    device = tp.device("cuda", 0)
+
+    def fn(b, x):
+        return ((x + b) * x).sum()
+
+    xs = [
+        tp.randn(48, device=device, requires_grad=True),
+        tp.randn(32, 48, device=device, requires_grad=True),
+    ]
+    compiled = tp.compile(fn, fullgraph=True)
+    ins = [v.detach().clone().requires_grad_(True) for v in xs]
+    got = compiled(*ins)
+    got.backward()
+    tp.cuda.synchronize()
+
+    ref_ins = [v.detach().clone().requires_grad_(True) for v in xs]
+    ref = fn(*ref_ins)
+    ref.backward()
+    assert tp.abs(got.cpu() - ref.cpu()).max().item() < 1e-3
+    for g, want in zip(ins, ref_ins):
+        assert tp.abs(g.grad.cpu() - want.grad.cpu()).max().item() < 1e-3
