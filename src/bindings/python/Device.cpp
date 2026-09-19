@@ -25,9 +25,68 @@ void init_device(py::module_& m) {
         .value("Unknown", DeviceType::Unknown);
 
     py::class_<Device>(m, "Device")
-        .def(py::init<DeviceType, int64_t>(), "type"_a, "index"_a = -1)
-        .def(py::init<const std::string&>(), "device"_a)
-        .def(py::init<const std::string&, int64_t>(), "type"_a, "index"_a)
+        // One raw-args __init__ instead of typed pybind overloads: a bad
+        // argument raises a one-line error naming the accepted forms, instead
+        // of an aggregate dump of constructor signatures.
+        .def("__init__", [](Device& self, py::args args, py::kwargs kwargs) {
+            if (kwargs.size() > 0) {
+                throw std::invalid_argument(
+                    "device() got unexpected keyword arguments");
+            }
+            std::string spelling;
+            if (args.size() == 1) {
+                py::object spec = args[0];
+                if (py::isinstance<Device>(spec)) {
+                    spelling = spec.cast<const Device&>().toString();
+                } else if (py::isinstance<py::tuple>(spec)
+                           || py::isinstance<py::list>(spec)) {
+                    if (py::len(spec) != 2) {
+                        throw std::invalid_argument(
+                            "device(): (type, index) pair must have 2 "
+                            "elements");
+                    }
+                    const py::sequence pair = spec.cast<py::sequence>();
+                    if (!PyUnicode_Check(pair[0].ptr())
+                        || !PyIndex_Check(pair[1].ptr())) {
+                        throw std::invalid_argument(
+                            "device(): (type, index) pair must be a str and "
+                            "an integer");
+                    }
+                    spelling = pair[0].cast<std::string>() + ":"
+                               + std::to_string(pair[1].cast<int64_t>());
+                } else if (py::isinstance<DeviceType>(spec)) {
+                    new (&self) Device(spec.cast<DeviceType>(), -1);
+                    return;
+                } else if (PyUnicode_Check(spec.ptr())) {
+                    spelling = spec.cast<std::string>();
+                } else {
+                    throw std::invalid_argument(
+                        "device() expects a str, Device, DeviceType, or (type, "
+                        "index) pair, not "
+                        + std::string(Py_TYPE(spec.ptr())->tp_name));
+                }
+            } else if (args.size() == 2) {
+                if (py::isinstance<DeviceType>(args[0])
+                    && PyIndex_Check(args[1].ptr())) {
+                    new (&self) Device(args[0].cast<DeviceType>(),
+                                       args[1].cast<int64_t>());
+                    return;
+                }
+                if (!PyUnicode_Check(args[0].ptr())
+                    || !PyIndex_Check(args[1].ptr())) {
+                    throw std::invalid_argument(
+                        "device() expects a device type spelling and an "
+                        "integer index");
+                }
+                spelling = args[0].cast<std::string>() + ":"
+                           + std::to_string(args[1].cast<int64_t>());
+            } else {
+                throw std::invalid_argument(
+                    "device() takes a str, a Device, a (type, index) pair, or "
+                    "a type and index");
+            }
+            new (&self) Device(spelling);
+        })
         .def_property_readonly("type", [](const Device& d) {
             std::string s = d.toString();
             size_t colon = s.find(':');

@@ -331,6 +331,57 @@ def _tuple_invoke(f, invoke_expr: str, site_hook: str) -> str | None:
             + " ".join(statements))
 
 
+_PY_SIG_TYPE = {
+    "Tensor": "Tensor", "Tensor&": "Tensor", "const Tensor&": "Tensor",
+    "std::optional<Tensor>": "Tensor?",
+    "DType": "DType", "std::optional<DType>": "DType?",
+    "Device": "Device", "std::optional<Device>": "Device?",
+    "Scalar": "Number", "std::optional<Scalar>": "Number?",
+    "int64_t": "int", "std::optional<int64_t>": "int?",
+    "double": "float", "std::optional<double>": "float?",
+    "bool": "bool", "std::optional<bool>": "bool?",
+    "std::string": "str", "std::optional<std::string>": "str?",
+    "const std::vector<int64_t>&": "int[]", "std::vector<int64_t>": "int[]",
+    "const std::vector<double>&": "float[]",
+    "const std::vector<Tensor>&": "Tensor[]",
+    "const std::vector<std::optional<Tensor>>&": "Tensor?[]",
+    "const std::vector<bool>&": "bool[]",
+    "const std::vector<std::string>&": "str[]",
+    "Generator": "Generator", "Storage": "Storage",
+    "SymInt": "SymInt", "std::optional<SymInt>": "SymInt?",
+    "SymBool": "SymBool", "SymFloat": "SymFloat",
+}
+
+
+def _py_sig_default(dflt: str | None) -> str:
+    if dflt is None:
+        return ""
+    spelled = {
+        "false": "False", "true": "True", "nullptr": "None",
+        "DType::Undefined": "None",
+    }
+    text = spelled.get(dflt, dflt.replace("::", "."))
+    if text.endswith("_a") or text.startswith("pydflt_"):
+        return ""
+    return f"={text}"
+
+
+def _py_signature(f, variant: str) -> str:
+    """Python-style overload signature shown when no candidate matched."""
+    is_method = variant == "method" and any(a.name == "self" for a in f.args)
+    parts = [a for a in f.args
+             if not (is_method and a.name == "self")]
+    display = []
+    seen_kwonly = False
+    for a in parts:
+        if a.kwonly and not seen_kwonly:
+            display.append("*")
+            seen_kwonly = True
+        cxx = _PY_SIG_TYPE.get(cpp_arg_type(a.type), cpp_arg_type(a.type))
+        display.append(f"{cxx} {a.name}{_py_sig_default(a.default)}")
+    return f"{f.base_name}({', '.join(display)})"
+
+
 def _op_supported(f, variant: str) -> bool:
     """Validate one overload and report that it has a native entry point."""
     _validate_op_support(f, variant)
@@ -905,13 +956,26 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
                 out.append("            }")
                 out.append("        }")
                 out.append("    }")
-            out.append("        std::exception_ptr arg_err;")
-            for ovn in ovfns:
-                out.append(f"        try {{ return {ovn}(self, args, nargs, kwnames); }}")
-                out.append(
-                    "        catch (const std::invalid_argument&) "
-                    "{ arg_err = std::current_exception(); }")
-            out.append("        std::rethrow_exception(arg_err);")
+            # No candidate accepted the call.  Report every candidate with
+            # its Python-visible signature and the reason it rejected the
+            # arguments, instead of surfacing whichever overload happened
+            # to be tried last.
+            out.append("        std::string tpx_reasons;")
+            for k, ovn in enumerate(ovfns):
+                out.append("        try { return " + ovn
+                           + "(self, args, nargs, kwnames); }")
+                out.append("        catch (const std::invalid_argument& e) {")
+                sig = _py_signature(fs[k], variant).replace('\\', '\\\\').replace('"', '\\"')
+                out.append(f'            tpx_reasons += "\\n * {sig}: ";')
+                out.append("            tpx_reasons += e.what();")
+                out.append("        }")
+            receiver = "self" if variant == "method" else "nullptr"
+            out.append(
+                '        throw std::invalid_argument(std::string("'
+                + f"{fs[0].base_name}()"
+                + ' received an invalid combination of arguments - got ")'
+                + " + tpx_py_args_desc(args, nargs, kwnames, " + receiver + ")"
+                + ' + ", but expected one of:" + tpx_reasons);')
             out.append("    } catch (const std::exception& e) {")
             out.append("        tpx_py_set_error(e);")
             out.append("        return nullptr;")

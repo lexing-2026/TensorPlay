@@ -6,6 +6,8 @@
 #include "CPythonBridge.h"
 
 #include <pybind11/pybind11.h>
+// List/optional packers below cast standard containers.
+#include <pybind11/stl.h>
 
 #include <cstdlib>
 #include <cstddef>
@@ -35,6 +37,16 @@ namespace {
     const char* got = obj ? Py_TYPE(obj)->tp_name : "None";
     std::string msg = std::string(op) + ": argument " + std::to_string(index)
                       + " must be " + want + ", not " + got;
+    throw std::invalid_argument(msg);
+}
+
+// Generic conversion failure raised by the shared unpacking helpers.  These
+// run after argument-position reporting has already happened (or carry no
+// position at all), so the message states the expectation alone instead of a
+// fabricated operation name.
+[[noreturn]] void cast_error(PyObject* obj, const char* want) {
+    std::string msg = std::string("expected ") + want + ", not "
+                      + (obj ? Py_TYPE(obj)->tp_name : "NoneType");
     throw std::invalid_argument(msg);
 }
 
@@ -913,7 +925,7 @@ Tensor as_tensor(PyObject* obj, const char* op, int idx) {
     try {
         return py::reinterpret_borrow<py::object>(obj).cast<Tensor>();
     } catch (const py::cast_error&) {
-        type_error(obj, op, idx, "a Tensor");
+        cast_error(obj, "a Tensor");
     }
 }
 
@@ -928,7 +940,7 @@ Scalar as_scalar(PyObject* obj, const char* op, int idx) {
         try {
             return py::reinterpret_borrow<py::object>(obj).cast<Scalar>();
         } catch (const py::cast_error&) {
-            type_error(obj, op, idx, "a Scalar");
+            cast_error(obj, "a Scalar");
         }
     }
     if (PyFloat_Check(obj)) return Scalar(PyFloat_AS_DOUBLE(obj));
@@ -939,7 +951,7 @@ Scalar as_scalar(PyObject* obj, const char* op, int idx) {
     try {
         return py::reinterpret_borrow<py::object>(obj).cast<Scalar>();
     } catch (const py::cast_error&) {
-        type_error(obj, op, idx, "a Scalar");
+        cast_error(obj, "a Scalar");
     }
 }
 
@@ -947,7 +959,7 @@ DType as_dtype(PyObject* obj, const char* op, int idx) {
     try {
         return py::reinterpret_borrow<py::object>(obj).cast<DType>();
     } catch (const py::cast_error&) {
-        type_error(obj, op, idx, "a DType");
+        cast_error(obj, "a DType");
     }
 }
 
@@ -959,17 +971,16 @@ int64_t as_int(PyObject* obj, const char* op, int idx) {
         if (static_cast<double>(static_cast<int64_t>(d)) == d) {
             return static_cast<int64_t>(d);
         }
-        type_error(obj, op, idx, "an integer");
+        cast_error(obj, "an integer");
     }
-    if (!PyIndex_Check(obj)) type_error(obj, op, idx, "an integer");
+    if (!PyIndex_Check(obj)) cast_error(obj, "an integer");
     // AsSsize_t with an error-raising sentinel: without the check an
     // out-of-range value would silently saturate and the kernel would run
     // with garbage before anyone noticed the pending exception.
     int64_t v = PyNumber_AsSsize_t(obj, nullptr);
     if (v == -1 && PyErr_Occurred()) {
         PyErr_Clear();
-        std::string msg = std::string(op) + ": argument " + std::to_string(idx)
-                          + " integer out of range";
+        std::string msg = std::string("integer out of range");
         throw std::invalid_argument(msg);
     }
     return v;
@@ -979,7 +990,7 @@ double as_double(PyObject* obj, const char* op, int idx) {
     double v = PyFloat_AsDouble(obj);
     if (v == -1.0 && PyErr_Occurred()) {
         PyErr_Clear();
-        type_error(obj, op, idx, "a float");
+        cast_error(obj, "a float");
     }
     return v;
 }
@@ -999,7 +1010,7 @@ const Tensor& tensor_cref_slow(PyObject* obj) {
             py::cast<const Tensor&>(py::reinterpret_borrow<py::object>(obj));
         return t;
     } catch (const py::cast_error&) {
-        type_error(obj, "op", 0, "a Tensor");
+        cast_error(obj, "a Tensor");
     }
 }
 
@@ -1008,7 +1019,7 @@ Tensor& tensor_mref_slow(PyObject* obj) {
         Tensor& t = py::cast<Tensor&>(py::reinterpret_borrow<py::object>(obj));
         return t;
     } catch (const py::cast_error&) {
-        type_error(obj, "op", 0, "a Tensor");
+        cast_error(obj, "a Tensor");
     }
 }
 
@@ -1059,7 +1070,7 @@ bool tpx_py_bool(PyObject* obj) {
     // Only real bools are accepted by this conversion.  Truthiness of
     // arbitrary objects would silently change the call contract.
     if (PyBool_Check(obj)) return obj == Py_True;
-    type_error(obj, "op", 0, "a bool");
+    cast_error(obj, "a bool");
 }
 std::optional<int64_t> tpx_py_opt_int64(PyObject* obj) {
     if (obj == Py_None) return std::nullopt;
@@ -1081,7 +1092,7 @@ Generator tpx_py_generator(PyObject* obj) {
     try {
         return py::cast<Generator>(py::reinterpret_borrow<py::object>(obj));
     } catch (const py::cast_error&) {
-        type_error(obj, "op", 0, "a Generator");
+        cast_error(obj, "a Generator");
     }
 }
 std::optional<Generator> tpx_py_opt_generator(PyObject* obj) {
@@ -1092,7 +1103,7 @@ Storage tpx_py_storage(PyObject* obj) {
     try {
         return py::cast<Storage>(py::reinterpret_borrow<py::object>(obj));
     } catch (const py::cast_error&) {
-        type_error(obj, "op", 0, "a Storage");
+        cast_error(obj, "a Storage");
     }
 }
 Device tpx_py_device(PyObject* obj) {
@@ -1107,7 +1118,7 @@ Device tpx_py_device(PyObject* obj) {
     try {
         return py::cast<Device>(py::reinterpret_borrow<py::object>(obj));
     } catch (const py::cast_error&) {
-        type_error(obj, "op", 0, "a Device");
+        cast_error(obj, "a Device");
     }
 }
 std::optional<Device> tpx_py_opt_device(PyObject* obj) {
@@ -1797,6 +1808,59 @@ void PythonError::restore() const {
 #else
     PyErr_Restore(Py_XNewRef(type_), Py_NewRef(value_), Py_XNewRef(traceback_));
 #endif
+}
+
+namespace {
+
+// Renders one argument the way error messages quote it: public type names
+// only, never internal spellings.
+const char* arg_typename(PyObject* obj) {
+    if (obj == nullptr || obj == Py_None) return "None";
+    if (obj_is_tensor(obj)) return "Tensor";
+    if (PyBool_Check(obj)) return "bool";
+    if (PyLong_Check(obj)) return "int";
+    if (PyFloat_Check(obj)) return "float";
+    if (PyComplex_Check(obj)) return "complex";
+    if (PyUnicode_Check(obj)) return "str";
+    if (PyList_Check(obj)) return "list";
+    if (PyTuple_Check(obj)) return "tuple";
+    if (PyDict_Check(obj)) return "dict";
+    if (py::isinstance<DType>(py::handle(obj))) return "DType";
+    if (py::isinstance<Device>(py::handle(obj))) return "Device";
+    if (py::isinstance<Scalar>(py::handle(obj))) return "Scalar";
+    return Py_TYPE(obj)->tp_name;
+}
+
+}  // namespace
+
+std::string tpx_py_args_desc(PyObject* const* args, Py_ssize_t nargs,
+                             PyObject* kwnames, PyObject* receiver) {
+    // METH_FASTCALL layout: args[0..nargs) are positionals, kwargs values
+    // trail behind them keyed by kwnames.
+    std::string desc = "(";
+    bool first = true;
+    auto push = [&](const std::string& text) {
+        if (!first) desc += ", ";
+        first = false;
+        desc += text;
+    };
+    if (receiver != nullptr) {
+        push(arg_typename(receiver));
+    }
+    for (Py_ssize_t i = 0; i < nargs; ++i) {
+        push(arg_typename(args[i]));
+    }
+    if (kwnames != nullptr && PyTuple_CheckExact(kwnames)) {
+        Py_ssize_t nkw = PyTuple_GET_SIZE(kwnames);
+        for (Py_ssize_t i = 0; i < nkw; ++i) {
+            PyObject* key = PyTuple_GET_ITEM(kwnames, i);
+            const char* text = PyUnicode_AsUTF8(key);
+            push(std::string(text ? text : "?") + "="
+                 + arg_typename(args[nargs + i]));
+        }
+    }
+    desc += ")";
+    return desc;
 }
 
 void tpx_py_set_error(const std::exception& e) {

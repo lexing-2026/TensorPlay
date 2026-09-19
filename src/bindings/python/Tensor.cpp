@@ -1365,7 +1365,7 @@ void check_tensor_subclass_type(py::object cls, const char* fn) {
     if (res < 0) throw py::error_already_set();
     if (!res) {
         TP_THROW(TypeError, fn,
-                 ": cls must be a subclass of tensorplay._C.TensorBase");
+                 ": cls must be a subclass of tensorplay.Tensor");
     }
 }
 
@@ -1467,6 +1467,44 @@ py::object as_tensor(py::object data, std::optional<DType> dtype, std::optional<
     return py::cast(create_tensor(data, dtype, device));
 }
 
+namespace {
+
+// METH_FASTCALL surface for to_dlpack: rejects non-tensor arguments with the
+// shared bridge error text instead of a pybind11 caster dump.
+PyObject* to_dlpack_fastcall(PyObject*, PyObject* const* args,
+                             Py_ssize_t nargs, PyObject* kwnames) {
+    try {
+        static const char* kwlist[] = {"obj", "stream", nullptr};
+        if (nargs > 2) {
+            throw std::invalid_argument(
+                "to_dlpack: too many positional arguments");
+        }
+        PyObject* slots[2];
+        tensorplay::python_c::tpx_py_parse_into(args, nargs, kwnames, kwlist, 2,
+                                                "to_dlpack", slots);
+        static const unsigned char tpx_kinds[] = {
+            tensorplay::python_c::TPK_TENSOR};
+        tensorplay::python_c::tpx_py_check_types(slots, 1, "to_dlpack", kwlist,
+                                                 tpx_kinds, 1);
+        if (slots[0] == nullptr) {
+            throw std::invalid_argument(
+                "to_dlpack: missing required argument \"obj\"");
+        }
+        std::optional<int64_t> stream;
+        if (slots[1] != nullptr && slots[1] != Py_None) {
+            stream = tensorplay::python_c::tpx_py_opt_int64(slots[1]);
+        }
+        py::capsule capsule =
+            to_dlpack(py::reinterpret_borrow<py::object>(slots[0]), stream);
+        return capsule.release().ptr();
+    } catch (const std::exception& e) {
+        tensorplay::python_c::tpx_py_set_error(e);
+        return nullptr;
+    }
+}
+
+}  // namespace
+
 void init_tensor(py::module_& m) {
     // tensor_from_numpy(): zero-copy from_blob view; non-writable arrays warn
     // once instead of failing; byte-stride divisibility, negative strides and
@@ -1552,9 +1590,20 @@ void init_tensor(py::module_& m) {
     }, "buffer"_a, "dtype"_a = DType::Float32, "count"_a = -1, "offset"_a = 0,
        "requires_grad"_a = false);
 
-    // Expose from_dlpack as a module function
+    // Expose from_dlpack as a module function.  to_dlpack takes its own
+    // METH_FASTCALL entry below: the pybind typed-arg surface answers a bad
+    // tensor argument with a caster dump naming pybind11 helper macros.
     m.def("from_dlpack", &from_dlpack, "obj"_a);
-    m.def("to_dlpack", &to_dlpack, "obj"_a, "stream"_a = py::none());
+
+    static PyMethodDef to_dlpack_def = {
+        "to_dlpack", (PyCFunction)(void*)to_dlpack_fastcall,
+        METH_FASTCALL | METH_KEYWORDS,
+        "to_dlpack(obj, *, stream=None) -> capsule\n\n"
+        "Exports ``obj`` as a DLPack capsule without copying its data."};
+    static PyObject* dlpack_module_name =
+        PyUnicode_InternFromString("tensorplay._C");
+    m.add_object("to_dlpack", py::reinterpret_steal<py::object>(
+        PyCFunction_NewEx(&to_dlpack_def, nullptr, dlpack_module_name)));
 
     // asarray(): alias when possible; copy on explicit copy=True or a
     // device/dtype mismatch with copy unset; sequences always copy.
@@ -1720,7 +1769,11 @@ void init_tensor(py::module_& m) {
 
     py::class_<Tensor> tensor(m, "TensorBase", py::dynamic_attr());
     tensor.attr("__module__") = "tensorplay._C";
-    
+    // The Python layer exports this class under the ``Tensor`` spelling;
+    // keep an extension attribute in step so type-name rendering uses the
+    // public name instead of the registered implementation name.
+    m.attr("Tensor") = tensor;
+
     tensor
         .def(py::init<>())
         .def(py::init([](py::object data, std::optional<DType> dtype, std::optional<Device> device, bool requires_grad) {
