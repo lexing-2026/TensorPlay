@@ -261,20 +261,20 @@ Tensor& igammac__native(Tensor& self, const Tensor& other) {
 // A fused add-then-rectify: relu(self + alpha * other).  The unit scale rides
 // the fused primitive each backend already carries; any other scale folds the
 // weighted sum first and rectifies it.
-Tensor _add_relu_native(const Tensor& self, const Tensor& other, Scalar alpha) {
+Tensor _add_relu_native(const Tensor& self, const Tensor& other, const Scalar& alpha) {
     if (!alpha.isComplex() && alpha.toDouble() == 1.0) {
         return ops::add_relu(self, other);
     }
     return ops::relu(ops::add(self, other, alpha));
 }
 
-Tensor& _add_relu__native(Tensor& self, const Tensor& other, Scalar alpha) {
+Tensor& _add_relu__native(Tensor& self, const Tensor& other, const Scalar& alpha) {
     self.copy_(_add_relu_native(self, other, alpha));
     return self;
 }
 
 Tensor& _add_relu_out_native(const Tensor& self, const Tensor& other,
-                             Scalar alpha, Tensor& out) {
+                             const Scalar& alpha, Tensor& out) {
     const Tensor value = _add_relu_native(self, other, alpha);
     if (!out.defined() || out.dtype() != value.dtype()) {
         out = value;
@@ -288,11 +288,11 @@ Tensor& _add_relu_out_native(const Tensor& self, const Tensor& other,
     return out;
 }
 
-Tensor _add_relu_scalar_native(const Tensor& self, Scalar other, Scalar alpha) {
+Tensor _add_relu_scalar_native(const Tensor& self, const Scalar& other, const Scalar& alpha) {
     return ops::relu(ops::add(self, other, alpha));
 }
 
-Tensor& _add_relu__scalar_native(Tensor& self, Scalar other, Scalar alpha) {
+Tensor& _add_relu__scalar_native(Tensor& self, const Scalar& other, const Scalar& alpha) {
     self.copy_(_add_relu_scalar_native(self, other, alpha));
     return self;
 }

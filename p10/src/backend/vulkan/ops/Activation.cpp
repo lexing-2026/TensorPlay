@@ -217,19 +217,19 @@ Tensor& gelu_inplace_kernel(Tensor& self, const std::string& approximate) {
   return activation_inplace("gelu", "buffer_gelu", self, 0.0f, 0.0f);
 }
 
-Tensor leaky_relu_kernel(const Tensor& self, Scalar negative_slope) {
+Tensor leaky_relu_kernel(const Tensor& self, const Scalar& negative_slope) {
   return activation_out(
       "leaky_relu", "buffer_leaky_relu", self,
       static_cast<float>(negative_slope.toDouble()), 0.0f);
 }
 
-Tensor& leaky_relu_inplace_kernel(Tensor& self, Scalar negative_slope) {
+Tensor& leaky_relu_inplace_kernel(Tensor& self, const Scalar& negative_slope) {
   return activation_inplace(
       "leaky_relu", "buffer_leaky_relu", self,
       static_cast<float>(negative_slope.toDouble()), 0.0f);
 }
 
-Tensor threshold_kernel(const Tensor& self, Scalar threshold, Scalar value) {
+Tensor threshold_kernel(const Tensor& self, const Scalar& threshold, const Scalar& value) {
   return activation_out(
       "threshold", "buffer_threshold", self,
       static_cast<float>(threshold.toDouble()),
@@ -238,15 +238,15 @@ Tensor threshold_kernel(const Tensor& self, Scalar threshold, Scalar value) {
 
 Tensor& threshold_inplace_kernel(
     Tensor& self,
-    Scalar threshold,
-    Scalar value) {
+    const Scalar& threshold,
+    const Scalar& value) {
   return activation_inplace(
       "threshold", "buffer_threshold", self,
       static_cast<float>(threshold.toDouble()),
       static_cast<float>(value.toDouble()));
 }
 
-Tensor hardshrink_kernel(const Tensor& self, Scalar lambd) {
+Tensor hardshrink_kernel(const Tensor& self, const Scalar& lambd) {
   return activation_out(
       "hardshrink", "buffer_hardshrink", self,
       static_cast<float>(lambd.toDouble()), 0.0f);
@@ -261,7 +261,7 @@ Tensor& hardshrink_inplace_kernel(Tensor& self, Scalar lambd) {
 Tensor hardshrink_backward_kernel(
     const Tensor& grad_out,
     const Tensor& self,
-    Scalar lambd) {
+    const Scalar& lambd) {
   // Gradient of hardshrink: identity where the input magnitude exceeded the
   // threshold, zero inside the dead band.  Composed from existing
   // elementwise kernels: mask = abs(x) <= lambd; grad * (1 - mask).

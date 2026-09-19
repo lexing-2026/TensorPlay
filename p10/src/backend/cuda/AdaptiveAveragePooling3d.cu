@@ -14,6 +14,7 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#include "OutWrite.h"
 
 namespace tensorplay {
 namespace cuda {
@@ -262,15 +263,14 @@ namespace {
 Tensor& adaptive_avg_pool3d_out_cuda(const Tensor& self,
                                      const std::vector<int64_t>& output_size,
                                      Tensor& out) {
-    out = adaptive_avg_pool3d_native_cuda(self, output_size);
+    write_out(out, adaptive_avg_pool3d_native_cuda(self, output_size));
     return out;
 }
 
 Tensor& adaptive_avg_pool3d_backward_grad_input_cuda(const Tensor& grad_output,
                                                      const Tensor& input,
                                                      Tensor& grad_input) {
-    grad_input =
-        adaptive_avg_pool3d_backward_native_cuda(grad_output, input);
+    write_out(grad_input, adaptive_avg_pool3d_backward_native_cuda(grad_output, input));
     return grad_input;
 }
 

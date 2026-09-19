@@ -443,13 +443,13 @@ std::vector<Tensor> map_pair_scalar_lists_inplace(std::vector<Tensor> self,
 std::vector<Tensor> foreach_add_scalar_cpu(const std::vector<Tensor>& self, Scalar scalar) {
     return map_tensors(self, [&](const Tensor& value) { return value.add(scalar); });
 }
-std::vector<Tensor> foreach_add_list_cpu(const std::vector<Tensor>& self, const std::vector<Tensor>& other, Scalar alpha) {
+std::vector<Tensor> foreach_add_list_cpu(const std::vector<Tensor>& self, const std::vector<Tensor>& other, const Scalar& alpha) {
     return map_tensor_lists(self, other, [&](const Tensor& value, const Tensor& rhs) { return value.add(rhs, alpha); });
 }
 std::vector<Tensor> foreach_add_scalar_list_cpu(const std::vector<Tensor>& self, const std::vector<Scalar>& scalars) {
     return map_scalar_lists(self, scalars, [&](const Tensor& value, Scalar scalar) { return value.add(scalar); });
 }
-std::vector<Tensor> foreach_add_tensor_cpu(const std::vector<Tensor>& self, const Tensor& other, Scalar alpha) {
+std::vector<Tensor> foreach_add_tensor_cpu(const std::vector<Tensor>& self, const Tensor& other, const Scalar& alpha) {
     return map_tensors(self, [&](const Tensor& value) { return value.add(other, alpha); });
 }
 void foreach_add_scalar_inplace_cpu(std::vector<Tensor> self, Scalar scalar) {
@@ -461,7 +461,7 @@ void foreach_add_list_inplace_cpu(std::vector<Tensor> self, const std::vector<Te
 void foreach_add_scalar_list_inplace_cpu(std::vector<Tensor> self, const std::vector<Scalar>& scalars) {
     map_scalar_lists_inplace(std::move(self), scalars, [&](Tensor& value, Scalar scalar) { value.add_(scalar); });
 }
-void foreach_add_tensor_inplace_cpu(std::vector<Tensor> self, const Tensor& other, Scalar alpha) {
+void foreach_add_tensor_inplace_cpu(std::vector<Tensor> self, const Tensor& other, const Scalar& alpha) {
     // Broadcast singleton fast path (optimizer state-step bumps): one flat
     // schedule instead of 100+ dispatcher round trips.
     if (other.defined() && other.numel() == 1 && other.is_contiguous() &&
@@ -482,14 +482,14 @@ void foreach_add_tensor_inplace_cpu(std::vector<Tensor> self, const Tensor& othe
 }
 
 #define DEFINE_FOREACH_OP(NAME, METHOD) \
-std::vector<Tensor> foreach_##NAME##_scalar_cpu(const std::vector<Tensor>& self, Scalar scalar) { \
+std::vector<Tensor> foreach_##NAME##_scalar_cpu(const std::vector<Tensor>& self, const Scalar& scalar) { \
     return map_tensors(self, [&](const Tensor& value) { return value.METHOD(scalar); }); \
 } \
 std::vector<Tensor> foreach_##NAME##_list_cpu(const std::vector<Tensor>& self, const std::vector<Tensor>& other) { \
     return map_tensor_lists(self, other, [&](const Tensor& value, const Tensor& rhs) { return value.METHOD(rhs); }); \
 } \
 std::vector<Tensor> foreach_##NAME##_scalar_list_cpu(const std::vector<Tensor>& self, const std::vector<Scalar>& scalars) { \
-    return map_scalar_lists(self, scalars, [&](const Tensor& value, Scalar scalar) { return value.METHOD(scalar); }); \
+    return map_scalar_lists(self, scalars, [&](const Tensor& value, const Scalar& scalar) { return value.METHOD(scalar); }); \
 } \
 std::vector<Tensor> foreach_##NAME##_tensor_cpu(const std::vector<Tensor>& self, const Tensor& other) { \
     return map_tensors(self, [&](const Tensor& value) { return value.METHOD(other); }); \
@@ -497,14 +497,14 @@ std::vector<Tensor> foreach_##NAME##_tensor_cpu(const std::vector<Tensor>& self,
 void foreach_##NAME##_tensor_inplace_cpu(std::vector<Tensor> self, const Tensor& other) { \
     map_tensors_inplace(std::move(self), [&](Tensor& value) { value.copy_(value.METHOD(other)); }); \
 } \
-void foreach_##NAME##_scalar_inplace_cpu(std::vector<Tensor> self, Scalar scalar) { \
+void foreach_##NAME##_scalar_inplace_cpu(std::vector<Tensor> self, const Scalar& scalar) { \
     map_tensors_inplace(std::move(self), [&](Tensor& value) { value.copy_(value.METHOD(scalar)); }); \
 } \
 void foreach_##NAME##_list_inplace_cpu(std::vector<Tensor> self, const std::vector<Tensor>& other) { \
     map_tensor_lists_inplace(std::move(self), other, [&](Tensor& value, const Tensor& rhs) { value.copy_(value.METHOD(rhs)); }); \
 } \
 void foreach_##NAME##_scalar_list_inplace_cpu(std::vector<Tensor> self, const std::vector<Scalar>& scalars) { \
-    map_scalar_lists_inplace(std::move(self), scalars, [&](Tensor& value, Scalar scalar) { value.copy_(value.METHOD(scalar)); }); \
+    map_scalar_lists_inplace(std::move(self), scalars, [&](Tensor& value, const Scalar& scalar) { value.copy_(value.METHOD(scalar)); }); \
 }
 
 DEFINE_FOREACH_OP(mul, mul)
@@ -514,23 +514,23 @@ DEFINE_FOREACH_OP(div, div)
 // sub's out variants call the base kernels with an alpha, following the
 // hand-written add kernels above), so spell them out instead of using
 // DEFINE_FOREACH_OP.
-std::vector<Tensor> foreach_sub_scalar_cpu(const std::vector<Tensor>& self, Scalar scalar) {
+std::vector<Tensor> foreach_sub_scalar_cpu(const std::vector<Tensor>& self, const Scalar& scalar) {
     return map_tensors(self, [&](const Tensor& value) { return value.sub(scalar); });
 }
-std::vector<Tensor> foreach_sub_list_cpu(const std::vector<Tensor>& self, const std::vector<Tensor>& other, Scalar alpha) {
+std::vector<Tensor> foreach_sub_list_cpu(const std::vector<Tensor>& self, const std::vector<Tensor>& other, const Scalar& alpha) {
     return map_tensor_lists(self, other, [&](const Tensor& value, const Tensor& rhs) { return value.sub(rhs, alpha); });
 }
 std::vector<Tensor> foreach_sub_scalar_list_cpu(const std::vector<Tensor>& self, const std::vector<Scalar>& scalars) {
     return map_scalar_lists(self, scalars, [&](const Tensor& value, Scalar scalar) { return value.sub(scalar); });
 }
-std::vector<Tensor> foreach_sub_tensor_cpu(const std::vector<Tensor>& self, const Tensor& other, Scalar alpha) {
+std::vector<Tensor> foreach_sub_tensor_cpu(const std::vector<Tensor>& self, const Tensor& other, const Scalar& alpha) {
     return map_tensors(self, [&](const Tensor& value) { return value.sub(other, alpha); });
 }
-void foreach_sub_tensor_inplace_cpu(std::vector<Tensor> self, const Tensor& other) {
+void foreach_sub_tensor_inplace_cpu(std::vector<Tensor> self, const Tensor& other, const Scalar& alpha) {
     if (other.defined() && other.numel() == 1 && other.is_contiguous() &&
         !self.empty() && self[0].dtype() == other.dtype() &&
         (other.dtype() == DType::Float32 || other.dtype() == DType::Float64)) {
-        const double v = other.item().toDouble();
+        const double v = other.item().toDouble() * alpha.to<double>();
         if (try_flat2_scalar_inplace(self, std::vector<Scalar>{Scalar(v)},
                 [v](float* x, float, int64_t b, int64_t e) {
                     for (int64_t i = b; i < e; ++i) x[i] -= static_cast<float>(v);
@@ -539,13 +539,13 @@ void foreach_sub_tensor_inplace_cpu(std::vector<Tensor> self, const Tensor& othe
                     for (int64_t i = b; i < e; ++i) x[i] -= v;
                 })) return;
     }
-    map_tensors_inplace(std::move(self), [&](Tensor& value) { value.copy_(value.sub(other)); });
+    map_tensors_inplace(std::move(self), [&](Tensor& value) { value.copy_(value.sub(other, alpha)); });
 }
-void foreach_sub_scalar_inplace_cpu(std::vector<Tensor> self, Scalar scalar) {
+void foreach_sub_scalar_inplace_cpu(std::vector<Tensor> self, const Scalar& scalar) {
     map_tensors_inplace(std::move(self), [&](Tensor& value) { value.copy_(value.sub(scalar)); });
 }
-void foreach_sub_list_inplace_cpu(std::vector<Tensor> self, const std::vector<Tensor>& other) {
-    map_tensor_lists_inplace(std::move(self), other, [&](Tensor& value, const Tensor& rhs) { value.copy_(value.sub(rhs)); });
+void foreach_sub_list_inplace_cpu(std::vector<Tensor> self, const std::vector<Tensor>& other, const Scalar& alpha) {
+    map_tensor_lists_inplace(std::move(self), other, [&](Tensor& value, const Tensor& rhs) { value.copy_(value.sub(rhs, alpha)); });
 }
 void foreach_sub_scalar_list_inplace_cpu(std::vector<Tensor> self, const std::vector<Scalar>& scalars) {
     map_scalar_lists_inplace(std::move(self), scalars, [&](Tensor& value, Scalar scalar) { value.copy_(value.sub(scalar)); });
@@ -595,7 +595,7 @@ std::vector<Tensor> foreach_max_cpu(const std::vector<Tensor>& self) {
 }
 
 std::vector<Tensor> foreach_norm_cpu(const std::vector<Tensor>& self,
-                                     Scalar ord,
+                                     const Scalar& ord,
                                      std::optional<DType> dtype) {
     return map_tensors(self, [&](const Tensor& value) {
         Tensor input = dtype.has_value() ? value.to(*dtype) : value;
@@ -604,7 +604,7 @@ std::vector<Tensor> foreach_norm_cpu(const std::vector<Tensor>& self,
 }
 
 std::vector<Tensor> foreach_powsum_cpu(const std::vector<Tensor>& self,
-                                       Scalar ord,
+                                       const Scalar& ord,
                                        std::optional<DType> dtype) {
     return map_tensors(self, [&](const Tensor& value) {
         Tensor input = dtype.has_value() ? value.to(*dtype) : value;
@@ -646,7 +646,7 @@ void foreach_reciprocal_inplace_cpu(std::vector<Tensor> self) {
 
 std::vector<Tensor> foreach_addcmul_scalar_cpu(
         const std::vector<Tensor>& self, const std::vector<Tensor>& tensor1,
-        const std::vector<Tensor>& tensor2, Scalar value) {
+        const std::vector<Tensor>& tensor2, const Scalar& value) {
     return map_ternary_lists(self, tensor1, tensor2,
         [&](const Tensor& x, const Tensor& a, const Tensor& b) {
             return x.addcmul(a, b, value);
@@ -660,7 +660,7 @@ void foreach_addcmul_scalar_inplace_cpu(
 }
 std::vector<Tensor> foreach_addcdiv_scalar_cpu(
         const std::vector<Tensor>& self, const std::vector<Tensor>& tensor1,
-        const std::vector<Tensor>& tensor2, Scalar value) {
+        const std::vector<Tensor>& tensor2, const Scalar& value) {
     return map_ternary_lists(self, tensor1, tensor2,
         [&](const Tensor& x, const Tensor& a, const Tensor& b) {
             return x.addcdiv(a, b, value);
@@ -746,7 +746,7 @@ void foreach_addcdiv_tensor_inplace_cpu(
 }
 
 std::vector<Tensor> foreach_lerp_scalar_cpu(
-        const std::vector<Tensor>& self, const std::vector<Tensor>& end, Scalar weight) {
+        const std::vector<Tensor>& self, const std::vector<Tensor>& end, const Scalar& weight) {
     return map_tensor_lists(self, end,
         [&](const Tensor& x, const Tensor& y) { return x.lerp(y, weight); });
 }
@@ -787,11 +787,11 @@ void foreach_lerp_scalar_list_inplace_cpu(
         [&](Tensor& x, const Tensor& y, Scalar w) { x.copy_(x.lerp(y, w)); });
 }
 
-std::vector<Tensor> foreach_pow_scalar_cpu(const std::vector<Tensor>& self, Scalar exponent) {
+std::vector<Tensor> foreach_pow_scalar_cpu(const std::vector<Tensor>& self, const Scalar& exponent) {
     return map_tensors(self, [&](const Tensor& value) { return value.pow(exponent); });
 }
 std::vector<Tensor> foreach_pow_scalar_tensor_cpu(
-        Scalar self, const std::vector<Tensor>& exponent) {
+        const Scalar& self, const std::vector<Tensor>& exponent) {
     return map_tensors(exponent, [&](const Tensor& value) {
         Tensor base = Tensor::full({}, self, value.dtype(), value.device());
         return base.pow(value);
@@ -806,7 +806,7 @@ std::vector<Tensor> foreach_pow_tensor_tensor_cpu(
 std::vector<Tensor> foreach_pow_list_cpu(const std::vector<Tensor>& self, const std::vector<Tensor>& exponent) {
     return map_tensor_lists(self, exponent, [&](const Tensor& value, const Tensor& rhs) { return value.pow(rhs); });
 }
-void foreach_pow_scalar_inplace_cpu(std::vector<Tensor> self, Scalar exponent) {
+void foreach_pow_scalar_inplace_cpu(std::vector<Tensor> self, const Scalar& exponent) {
     map_tensors_inplace(std::move(self), [&](Tensor& value) { value.copy_(value.pow(exponent)); });
 }
 void foreach_pow_list_inplace_cpu(std::vector<Tensor> self, const std::vector<Tensor>& exponent) {
@@ -823,10 +823,10 @@ void foreach_pow_scalar_list_inplace_cpu(
         [&](Tensor& value, Scalar rhs) { value.copy_(value.pow(rhs)); });
 }
 
-std::vector<Tensor> foreach_clamp_min_scalar_cpu(const std::vector<Tensor>& self, Scalar scalar) {
+std::vector<Tensor> foreach_clamp_min_scalar_cpu(const std::vector<Tensor>& self, const Scalar& scalar) {
     return map_tensors(self, [&](const Tensor& value) { return value.clamp(scalar, std::nullopt); });
 }
-std::vector<Tensor> foreach_clamp_max_scalar_cpu(const std::vector<Tensor>& self, Scalar scalar) {
+std::vector<Tensor> foreach_clamp_max_scalar_cpu(const std::vector<Tensor>& self, const Scalar& scalar) {
     return map_tensors(self, [&](const Tensor& value) { return value.clamp(std::nullopt, scalar); });
 }
 void foreach_clamp_min_scalar_inplace_cpu(std::vector<Tensor> self, Scalar scalar) {
@@ -877,16 +877,16 @@ void foreach_clamp_max_scalar_list_inplace_cpu(
         [&](Tensor& value, Scalar rhs) { value.copy_(value.clamp(std::nullopt, rhs)); });
 }
 
-std::vector<Tensor> foreach_maximum_scalar_cpu(const std::vector<Tensor>& self, Scalar scalar) {
+std::vector<Tensor> foreach_maximum_scalar_cpu(const std::vector<Tensor>& self, const Scalar& scalar) {
     return foreach_clamp_min_scalar_cpu(self, scalar);
 }
-std::vector<Tensor> foreach_minimum_scalar_cpu(const std::vector<Tensor>& self, Scalar scalar) {
+std::vector<Tensor> foreach_minimum_scalar_cpu(const std::vector<Tensor>& self, const Scalar& scalar) {
     return foreach_clamp_max_scalar_cpu(self, scalar);
 }
-void foreach_maximum_scalar_inplace_cpu(std::vector<Tensor> self, Scalar scalar) {
+void foreach_maximum_scalar_inplace_cpu(std::vector<Tensor> self, const Scalar& scalar) {
     foreach_clamp_min_scalar_inplace_cpu(std::move(self), scalar);
 }
-void foreach_minimum_scalar_inplace_cpu(std::vector<Tensor> self, Scalar scalar) {
+void foreach_minimum_scalar_inplace_cpu(std::vector<Tensor> self, const Scalar& scalar) {
     foreach_clamp_max_scalar_inplace_cpu(std::move(self), scalar);
 }
 
@@ -995,13 +995,13 @@ DEFINE_FOREACH_UNARY_OUT(trunc)
 #undef DEFINE_FOREACH_UNARY_OUT
 
 #define DEFINE_FOREACH_ADD_SUB_OUT(NAME) \
-void foreach_##NAME##_scalar_out_cpu(const std::vector<Tensor>& self, Scalar scalar, \
+void foreach_##NAME##_scalar_out_cpu(const std::vector<Tensor>& self, const Scalar& scalar, \
                                      std::vector<Tensor> out) { \
     copy_foreach_out_cpu(foreach_##NAME##_scalar_cpu(self, scalar), std::move(out), \
                          "_foreach_" #NAME ".Scalar_out"); \
 } \
 void foreach_##NAME##_list_out_cpu(const std::vector<Tensor>& self, \
-                                   const std::vector<Tensor>& other, Scalar alpha, \
+                                   const std::vector<Tensor>& other, const Scalar& alpha, \
                                    std::vector<Tensor> out) { \
     copy_foreach_out_cpu(foreach_##NAME##_list_cpu(self, other, alpha), std::move(out), \
                          "_foreach_" #NAME ".List_out"); \
@@ -1013,7 +1013,7 @@ void foreach_##NAME##_scalar_list_out_cpu(const std::vector<Tensor>& self, \
                          "_foreach_" #NAME ".ScalarList_out"); \
 } \
 void foreach_##NAME##_tensor_out_cpu(const std::vector<Tensor>& self, const Tensor& other, \
-                                     Scalar alpha, std::vector<Tensor> out) { \
+                                     const Scalar& alpha, std::vector<Tensor> out) { \
     copy_foreach_out_cpu(foreach_##NAME##_tensor_cpu(self, other, alpha), std::move(out), \
                          "_foreach_" #NAME ".Tensor_out"); \
 }
@@ -1022,7 +1022,7 @@ DEFINE_FOREACH_ADD_SUB_OUT(sub)
 #undef DEFINE_FOREACH_ADD_SUB_OUT
 
 #define DEFINE_FOREACH_MUL_DIV_OUT(NAME) \
-void foreach_##NAME##_scalar_out_cpu(const std::vector<Tensor>& self, Scalar scalar, \
+void foreach_##NAME##_scalar_out_cpu(const std::vector<Tensor>& self, const Scalar& scalar, \
                                      std::vector<Tensor> out) { \
     copy_foreach_out_cpu(foreach_##NAME##_scalar_cpu(self, scalar), std::move(out), \
                          "_foreach_" #NAME ".Scalar_out"); \
@@ -1051,7 +1051,7 @@ DEFINE_FOREACH_MUL_DIV_OUT(div)
 #define DEFINE_FOREACH_TERNARY_OUT(NAME) \
 void foreach_##NAME##_scalar_out_cpu(const std::vector<Tensor>& self, \
                                      const std::vector<Tensor>& tensor1, \
-                                     const std::vector<Tensor>& tensor2, Scalar value, \
+                                     const std::vector<Tensor>& tensor2, const Scalar& value, \
                                      std::vector<Tensor> out) { \
     copy_foreach_out_cpu(foreach_##NAME##_scalar_cpu(self, tensor1, tensor2, value), \
                          std::move(out), "_foreach_" #NAME ".Scalar_out"); \
@@ -1097,7 +1097,7 @@ void foreach_lerp_scalar_list_out_cpu(const std::vector<Tensor>& self,
 }
 
 #define DEFINE_FOREACH_CLAMP_OUT(NAME) \
-void foreach_##NAME##_scalar_out_cpu(const std::vector<Tensor>& self, Scalar scalar, \
+void foreach_##NAME##_scalar_out_cpu(const std::vector<Tensor>& self, const Scalar& scalar, \
                                      std::vector<Tensor> out) { \
     copy_foreach_out_cpu(foreach_##NAME##_scalar_cpu(self, scalar), std::move(out), \
                          "_foreach_" #NAME ".Scalar_out"); \
@@ -1178,7 +1178,7 @@ void foreach_zero_out_cpu(const std::vector<Tensor>& self, std::vector<Tensor> o
 // (non-contiguous, mixed dtype/device, non-fp32/64, non-CPU).
 // ------------------------------------------------------------------
 
-void foreach_add_scalar_fast_cpu(std::vector<Tensor> self, Scalar s) {
+void foreach_add_scalar_fast_cpu(std::vector<Tensor> self, const Scalar& s) {
     if (try_flat2_scalar_inplace(self, std::vector<Scalar>{s},
             [](float* x, float v, int64_t b, int64_t e) {
                 for (int64_t i = b; i < e; ++i) x[i] += v;
@@ -1202,7 +1202,7 @@ void foreach_add_scalar_list_fast_cpu(std::vector<Tensor> self,
 }
 
 void foreach_add_list_fast_cpu(std::vector<Tensor> self,
-                               const std::vector<Tensor>& other, Scalar a) {
+                               const std::vector<Tensor>& other, const Scalar& a) {
     if (try_flat2_inplace(self, other,
             [a](float* x, const float* y, int64_t b, int64_t e) {
                 const float av = a.to<float>();
@@ -1216,7 +1216,7 @@ void foreach_add_list_fast_cpu(std::vector<Tensor> self,
 }
 
 #define TP_FAST_BINARY_SCALAR(NAME, OP)                                       \
-void foreach_##NAME##_scalar_fast_cpu(std::vector<Tensor> self, Scalar s) {   \
+void foreach_##NAME##_scalar_fast_cpu(std::vector<Tensor> self, const Scalar& s) {   \
     if (try_flat2_scalar_inplace(self, std::vector<Scalar>{s},                \
             [](float* x, float v, int64_t b, int64_t e) {                     \
                 for (int64_t i = b; i < e; ++i) x[i] = x[i] OP v;             \
@@ -1266,18 +1266,20 @@ void foreach_sub_scalar_list_fast_cpu(std::vector<Tensor> self,
 }
 
 void foreach_sub_list_fast_cpu(std::vector<Tensor> self,
-                               const std::vector<Tensor>& other) {
+                               const std::vector<Tensor>& other, const Scalar& alpha) {
+    const double a = alpha.to<double>();
     if (try_flat2_inplace(self, other,
-            [](float* x, const float* y, int64_t b, int64_t e) {
-                for (int64_t i = b; i < e; ++i) x[i] -= y[i];
+            [a](float* x, const float* y, int64_t b, int64_t e) {
+                const float af = static_cast<float>(a);
+                for (int64_t i = b; i < e; ++i) x[i] -= af * y[i];
             },
-            [](double* x, const double* y, int64_t b, int64_t e) {
-                for (int64_t i = b; i < e; ++i) x[i] -= y[i];
+            [a](double* x, const double* y, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) x[i] -= a * y[i];
             })) return;
-    foreach_sub_list_inplace_cpu(std::move(self), other);
+    foreach_sub_list_inplace_cpu(std::move(self), other, alpha);
 }
 
-void foreach_sub_scalar_fast_cpu(std::vector<Tensor> self, Scalar s) {
+void foreach_sub_scalar_fast_cpu(std::vector<Tensor> self, const Scalar& s) {
     if (try_flat2_scalar_inplace(self, std::vector<Scalar>{s},
             [](float* x, float v, int64_t b, int64_t e) {
                 for (int64_t i = b; i < e; ++i) x[i] -= v;
@@ -1359,7 +1361,7 @@ void foreach_maximum_list_fast_cpu(std::vector<Tensor> self,
 
 void foreach_lerp_scalar_fast_cpu(std::vector<Tensor> self,
                                   const std::vector<Tensor>& end,
-                                  Scalar weight) {
+                                  const Scalar& weight) {
     if (try_flat2_inplace(self, end,
             [weight](float* x, const float* y, int64_t b, int64_t e) {
                 const float w = weight.to<float>();
@@ -1375,7 +1377,7 @@ void foreach_lerp_scalar_fast_cpu(std::vector<Tensor> self,
 void foreach_addcmul_scalar_fast_cpu(std::vector<Tensor> self,
                                      const std::vector<Tensor>& t1,
                                      const std::vector<Tensor>& t2,
-                                     Scalar value) {
+                                     const Scalar& value) {
     if (!flat_group_ok({&self, &t1, &t2})) {
         foreach_addcmul_scalar_inplace_cpu(std::move(self), t1, t2, value);
         return;
@@ -1429,7 +1431,7 @@ void foreach_addcmul_scalar_fast_cpu(std::vector<Tensor> self,
 void foreach_addcdiv_scalar_fast_cpu(std::vector<Tensor> self,
                                      const std::vector<Tensor>& t1,
                                      const std::vector<Tensor>& t2,
-                                     Scalar value) {
+                                     const Scalar& value) {
     if (!flat_group_ok({&self, &t1, &t2})) {
         foreach_addcdiv_scalar_inplace_cpu(std::move(self), t1, t2, value);
         return;
@@ -1486,7 +1488,7 @@ void foreach_addcdiv_scalar_fast_cpu(std::vector<Tensor> self,
     flat_bump(self);
 }
 
-void foreach_clamp_min_scalar_fast_cpu(std::vector<Tensor> self, Scalar s) {
+void foreach_clamp_min_scalar_fast_cpu(std::vector<Tensor> self, const Scalar& s) {
     if (try_flat2_scalar_inplace(self, std::vector<Scalar>{s},
             [](float* x, float v, int64_t b, int64_t e) {
                 for (int64_t i = b; i < e; ++i) if (x[i] < v) x[i] = v;
@@ -1497,7 +1499,7 @@ void foreach_clamp_min_scalar_fast_cpu(std::vector<Tensor> self, Scalar s) {
     foreach_clamp_min_scalar_inplace_cpu(std::move(self), s);
 }
 
-void foreach_clamp_max_scalar_fast_cpu(std::vector<Tensor> self, Scalar s) {
+void foreach_clamp_max_scalar_fast_cpu(std::vector<Tensor> self, const Scalar& s) {
     if (try_flat2_scalar_inplace(self, std::vector<Scalar>{s},
             [](float* x, float v, int64_t b, int64_t e) {
                 for (int64_t i = b; i < e; ++i) if (x[i] > v) x[i] = v;
@@ -1809,7 +1811,7 @@ static bool flat_binary_scalar_ret(const std::vector<Tensor>& xs, Scalar s,
 }
 
 std::vector<Tensor> foreach_sub_scalar_ret_fast_cpu(
-        const std::vector<Tensor>& self, Scalar s) {
+        const std::vector<Tensor>& self, const Scalar& s) {
     std::vector<Tensor> out = foreach_alloc_like(self);
     if (flat_binary_scalar_ret(self, s, out,
             [](float* d, const float* x, float v, int64_t b, int64_t e) {
@@ -1822,7 +1824,7 @@ std::vector<Tensor> foreach_sub_scalar_ret_fast_cpu(
 }
 
 std::vector<Tensor> foreach_add_scalar_ret_fast_cpu(
-        const std::vector<Tensor>& self, Scalar s) {
+        const std::vector<Tensor>& self, const Scalar& s) {
     std::vector<Tensor> out = foreach_alloc_like(self);
     if (flat_binary_scalar_ret(self, s, out,
             [](float* d, const float* x, float v, int64_t b, int64_t e) {
@@ -1835,7 +1837,7 @@ std::vector<Tensor> foreach_add_scalar_ret_fast_cpu(
 }
 
 std::vector<Tensor> foreach_mul_scalar_ret_fast_cpu(
-        const std::vector<Tensor>& self, Scalar s) {
+        const std::vector<Tensor>& self, const Scalar& s) {
     std::vector<Tensor> out = foreach_alloc_like(self);
     if (flat_binary_scalar_ret(self, s, out,
             [](float* d, const float* x, float v, int64_t b, int64_t e) {
@@ -1848,7 +1850,7 @@ std::vector<Tensor> foreach_mul_scalar_ret_fast_cpu(
 }
 
 std::vector<Tensor> foreach_div_scalar_ret_fast_cpu(
-        const std::vector<Tensor>& self, Scalar s) {
+        const std::vector<Tensor>& self, const Scalar& s) {
     std::vector<Tensor> out = foreach_alloc_like(self);
     if (flat_binary_scalar_ret(self, s, out,
             [](float* d, const float* x, float v, int64_t b, int64_t e) {

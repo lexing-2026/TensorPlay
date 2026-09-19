@@ -102,7 +102,7 @@ using namespace dnnl;
 Tensor mm_kernel(const Tensor& self, const Tensor& mat2);
 
 // Forward declaration from PadKernels.cpp
-Tensor constant_pad_nd_cpu(const Tensor& self, const std::vector<int64_t>& pad, Scalar value);
+Tensor constant_pad_nd_cpu(const Tensor& self, const std::vector<int64_t>& pad, const Scalar& value);
 
 // Naive Float64 conv drivers and helpers, defined near the bottom of this
 // file but used by the conv paths above.
@@ -2788,9 +2788,10 @@ Tensor conv2d_cpu(const Tensor& input, const Tensor& weight, const Tensor& bias,
     return conv2d_cpu_impl(input, weight, bias, stride, padding, dilation, groups, false);
 }
 
-Tensor conv2d_relu_cpu(const Tensor& input, const Tensor& weight, const Tensor& bias,
+Tensor conv2d_relu_cpu(const Tensor& input, const Tensor& weight, const std::optional<Tensor>& bias_opt,
                        const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                        const std::vector<int64_t>& dilation, int64_t groups) {
+    const Tensor bias = bias_opt.has_value() ? *bias_opt : Tensor();
     if (conv_is_low_precision(input.dtype())) {
         return conv2d_cpu_impl(input.to(DType::Float32), weight.to(DType::Float32),
                                (bias.defined() && bias.numel() > 0) ? bias.to(DType::Float32) : bias,

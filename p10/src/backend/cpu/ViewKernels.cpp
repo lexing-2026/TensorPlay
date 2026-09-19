@@ -765,7 +765,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ViewKernels) {
     m.impl("squeeze.dims", squeeze_dims_kernel);
     m.impl("unsqueeze", unsqueeze_kernel);
     m.impl("clone", clone_kernel);
-    m.impl("slice", slice_kernel);
+    m.impl("slice.Tensor", slice_kernel);
     m.impl("contiguous", contiguous_kernel);
     m.impl("select_backward", select_backward_kernel);
     m.impl("slice_backward", slice_backward_kernel);

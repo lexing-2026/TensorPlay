@@ -357,8 +357,8 @@ Tensor multilabel_margin_loss_backward_impl(const Tensor& grad_output, const Ten
 
 } // namespace
 
-Tensor multi_margin_loss_cpu(const Tensor& input, const Tensor& target, Scalar p,
-                             Scalar margin, const std::optional<Tensor>& weight,
+Tensor multi_margin_loss_cpu(const Tensor& input, const Tensor& target, const Scalar& p,
+                             const Scalar& margin, const std::optional<Tensor>& weight,
                              int64_t reduction) {
     check_reduction(reduction, "multi_margin_loss");
     const int64_t pint = p.to<int64_t>();
@@ -369,7 +369,7 @@ Tensor multi_margin_loss_cpu(const Tensor& input, const Tensor& target, Scalar p
 }
 
 Tensor multi_margin_loss_cpu_backward(const Tensor& grad_output, const Tensor& input,
-                                      const Tensor& target, Scalar p, Scalar margin,
+                                      const Tensor& target, const Scalar& p, const Scalar& margin,
                                       const std::optional<Tensor>& weight, int64_t reduction) {
     check_reduction(reduction, "multi_margin_loss_backward");
     const int64_t pint = p.to<int64_t>();

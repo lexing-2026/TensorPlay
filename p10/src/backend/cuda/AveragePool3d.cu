@@ -19,6 +19,7 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#include "OutWrite.h"
 
 namespace tensorplay {
 namespace cuda {
@@ -446,8 +447,8 @@ Tensor& avg_pool3d_out_cuda(const Tensor& self,
                             bool ceil_mode, bool count_include_pad,
                             std::optional<int64_t> divisor_override,
                             Tensor& out) {
-    out = avg_pool3d_native_cuda(self, kernel_size, stride, padding, ceil_mode,
-                                 count_include_pad, divisor_override);
+    write_out(out, avg_pool3d_native_cuda(self, kernel_size, stride, padding, ceil_mode,
+                                 count_include_pad, divisor_override));
     return out;
 }
 
@@ -457,9 +458,9 @@ Tensor& avg_pool3d_backward_grad_input_cuda(
     const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
     bool ceil_mode, bool count_include_pad,
     std::optional<int64_t> divisor_override, Tensor& grad_input) {
-    grad_input = avg_pool3d_backward_native_cuda(
+    write_out(grad_input, avg_pool3d_backward_native_cuda(
         grad_output, input, kernel_size, stride, padding, ceil_mode,
-        count_include_pad, divisor_override);
+        count_include_pad, divisor_override));
     return grad_input;
 }
 

@@ -307,7 +307,7 @@ Tensor float_math_kernel(const Tensor& self, F f, const char* name) {
 // Arithmetic
 // ===========================================================================
 
-Tensor rsub_scalar_cpu(const Tensor& self, Scalar other, Scalar alpha) {
+Tensor rsub_scalar_cpu(const Tensor& self, const Scalar& other, const Scalar& alpha) {
     // Reversed subtraction: other - alpha * self, under weak scalar promotion.
     // alpha scales the subtrahend, which is self here, not other.
     DType dt = scalar_promote(self.dtype(), other);
@@ -333,7 +333,7 @@ Tensor rsub_scalar_cpu(const Tensor& self, Scalar other, Scalar alpha) {
     return out;
 }
 
-Tensor rsub_tensor_cpu(const Tensor& self, const Tensor& other, Scalar alpha) {
+Tensor rsub_tensor_cpu(const Tensor& self, const Tensor& other, const Scalar& alpha) {
     // other - alpha * self: the same arithmetic as sub with the operands
     // exchanged, so alpha still scales the subtrahend.
     return binary_same_kernel<true>(self, other,
@@ -358,14 +358,14 @@ static Tensor true_divide_core(const Tensor& a, const Tensor& b) {
     return binary_float_kernel(a, b, [](double x, double y) { return x / y; }, "true_divide");
 }
 Tensor true_divide_tensor_cpu(const Tensor& self, const Tensor& other) { return true_divide_core(self, other); }
-Tensor true_divide_scalar_cpu(const Tensor& self, Scalar other) {
+Tensor true_divide_scalar_cpu(const Tensor& self, const Scalar& other) {
     // A Float32 stand-in would widen Half/BFloat16 inputs; the weak-scalar
     // rule keeps the tensor dtype unless the scalar itself is floating.
     return true_divide_core(
         self, Tensor::full({}, other, scalar_promote(self.dtype(), other), self.device()));
 }
 Tensor divide_tensor_cpu(const Tensor& self, const Tensor& other) { return true_divide_core(self, other); }
-Tensor divide_scalar_cpu(const Tensor& self, Scalar other) { return true_divide_scalar_cpu(self, other); }
+Tensor divide_scalar_cpu(const Tensor& self, const Scalar& other) { return true_divide_scalar_cpu(self, other); }
 
 Tensor remainder_tensor_cpu(const Tensor& self, const Tensor& other) {
     // Python modulo: sign follows the divisor
@@ -384,14 +384,14 @@ Tensor remainder_tensor_cpu(const Tensor& self, const Tensor& other) {
         }
     }, "remainder");
 }
-Tensor remainder_scalar_cpu(const Tensor& self, Scalar other) {
+Tensor remainder_scalar_cpu(const Tensor& self, const Scalar& other) {
     // Forcing the scalar into self's dtype would truncate a float divisor
     // against an integral tensor; the pair promotes first.
     const DType dt = scalar_promote(self.dtype(), other);
     return remainder_tensor_cpu(self.to(dt), Tensor::full({}, other, dt, self.device()));
 }
 
-Tensor remainder_scalar_tensor_cpu(Scalar self, const Tensor& other) {
+Tensor remainder_scalar_tensor_cpu(const Scalar& self, const Tensor& other) {
     const DType dt = scalar_promote(other.dtype(), self);
     return remainder_tensor_cpu(Tensor::full({}, self, dt, other.device()), other.to(dt));
 }
@@ -407,12 +407,12 @@ Tensor fmod_tensor_cpu(const Tensor& self, const Tensor& other) {
                                                       static_cast<double>(y)));
     }, "fmod");
 }
-Tensor fmod_scalar_cpu(const Tensor& self, Scalar other) {
+Tensor fmod_scalar_cpu(const Tensor& self, const Scalar& other) {
     const DType dt = scalar_promote(self.dtype(), other);
     return fmod_tensor_cpu(self.to(dt), Tensor::full({}, other, dt, self.device()));
 }
 
-Tensor subtract_tensor_cpu(const Tensor& self, const Tensor& other, Scalar alpha) {
+Tensor subtract_tensor_cpu(const Tensor& self, const Tensor& other, const Scalar& alpha) {
     // alpha == 1 is by far the common call, and the scaled form costs a
     // Scalar conversion per element, so it keeps its own loop.
     if (!alpha.isComplex() && alpha.toDouble() == 1.0) {
@@ -429,7 +429,7 @@ Tensor subtract_tensor_cpu(const Tensor& self, const Tensor& other, Scalar alpha
             }
         }, "subtract");
 }
-Tensor subtract_scalar_cpu(const Tensor& self, Scalar other, Scalar alpha) {
+Tensor subtract_scalar_cpu(const Tensor& self, const Scalar& other, const Scalar& alpha) {
     DType dt = scalar_promote(self.dtype(), other);
     return subtract_tensor_cpu(self.to(dt),
                                Tensor::full({}, other, dt, self.device()), alpha);
@@ -437,7 +437,7 @@ Tensor subtract_scalar_cpu(const Tensor& self, Scalar other, Scalar alpha) {
 Tensor multiply_tensor_cpu(const Tensor& self, const Tensor& other) {
     return binary_same_kernel<true>(self, other, [](auto x, auto y) { return x * y; }, "multiply");
 }
-Tensor multiply_scalar_cpu(const Tensor& self, Scalar other) {
+Tensor multiply_scalar_cpu(const Tensor& self, const Scalar& other) {
     if (isComplexType(self.dtype()) || other.isComplex()) {
         DType dt;
         if (isComplexType(self.dtype())) {
@@ -519,17 +519,17 @@ Tensor div_rounded_scalar(const Tensor& self, Scalar other, DivRounding rounding
 }  // namespace
 
 Tensor div_mode_tensor_cpu(const Tensor& self, const Tensor& other,
-                           std::optional<std::string> rounding_mode) {
+                           const std::optional<std::string>& rounding_mode) {
     return div_rounded_core(self, other, parse_div_rounding(rounding_mode));
 }
-Tensor div_mode_scalar_cpu(const Tensor& self, Scalar other,
-                           std::optional<std::string> rounding_mode) {
+Tensor div_mode_scalar_cpu(const Tensor& self, const Scalar& other,
+                           const std::optional<std::string>& rounding_mode) {
     return div_rounded_scalar(self, other, parse_div_rounding(rounding_mode));
 }
 Tensor floor_divide_cpu(const Tensor& self, const Tensor& other) {
     return div_rounded_core(self, other, DivRounding::kFloor);
 }
-Tensor floor_divide_scalar_cpu(const Tensor& self, Scalar other) {
+Tensor floor_divide_scalar_cpu(const Tensor& self, const Scalar& other) {
     return div_rounded_scalar(self, other, DivRounding::kFloor);
 }
 
@@ -661,7 +661,7 @@ Tensor erfinv_cpu(const Tensor& self) {
         return special_math::calc_erfinv(x);
     }, "erfinv");
 }
-Tensor logit_cpu(const Tensor& self, std::optional<Scalar> eps) {
+Tensor logit_cpu(const Tensor& self, const std::optional<Scalar>& eps) {
     double e = eps.has_value() ? eps->toDouble() : -1.0;
     return float_math_kernel(self, [e](double p) {
         if (e >= 0) p = std::min(std::max(p, e), 1.0 - e);
@@ -687,8 +687,8 @@ Tensor i0_cpu(const Tensor& self) {
         return tensorplay::special_math::modified_bessel_i0_forward(v);
     }, "i0");
 }
-Tensor nan_to_num_cpu(const Tensor& self, Scalar nan,
-                      std::optional<Scalar> posinf, std::optional<Scalar> neginf) {
+Tensor nan_to_num_cpu(const Tensor& self, const Scalar& nan,
+                      const std::optional<Scalar>& posinf, const std::optional<Scalar>& neginf) {
     Tensor sc = self.contiguous();
     Tensor out = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
     int64_t n = self.numel();
@@ -753,7 +753,7 @@ Tensor copysign_cpu(const Tensor& a, const Tensor& b) {
         return std::copysign(x, y);
     }, "copysign");
 }
-Tensor copysign_scalar_cpu(const Tensor& self, Scalar other) {
+Tensor copysign_scalar_cpu(const Tensor& self, const Scalar& other) {
     // The sign comes from the scalar alone, so the divisor width never
     // participates in promotion -- Float32 carries every sign bit exactly.
     return copysign_cpu(self, Tensor::full({}, other, DType::Float32, self.device()));
@@ -974,7 +974,7 @@ Tensor clamp_max_tensor_cpu(const Tensor& self, const Tensor& max) {
         return static_cast<double>(m) < static_cast<double>(x) ? static_cast<T>(m) : static_cast<T>(x);
     }, "clamp_max");
 }
-Tensor clip_cpu(const Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max) {
+Tensor clip_cpu(const Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
     if (min.has_value() && max.has_value()) {
         const double lo = min->toDouble();
         const double hi = max->toDouble();
@@ -1034,7 +1034,7 @@ Tensor clip_cpu(const Tensor& self, std::optional<Scalar> min, std::optional<Sca
     if (max.has_value()) return clamp_max_scalar_cpu(self, *max);
     return self.clone();
 }
-Tensor& clamp__cpu(Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max) {
+Tensor& clamp__cpu(Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
     Tensor r = clip_cpu(self, std::move(min), std::move(max));
     self.copy_(r);
     return self;
@@ -1054,7 +1054,7 @@ Tensor selu_cpu(const Tensor& self) {
         return static_cast<T>(v > 0 ? kScale * v : kScale * kAlpha * (std::exp(v) - 1.0));
     }, "selu");
 }
-Tensor celu_cpu(const Tensor& self, Scalar alpha) {
+Tensor celu_cpu(const Tensor& self, const Scalar& alpha) {
     // celu: max(0,x) + alpha * (exp(x/alpha) - 1) on the negative side
     double a = alpha.toDouble();
     return dtype_unary_kernel(self, [a](auto x) -> decltype(x) {
@@ -1063,7 +1063,7 @@ Tensor celu_cpu(const Tensor& self, Scalar alpha) {
         return static_cast<T>(v > 0 ? v : a * (std::exp(v / a) - 1.0));
     }, "celu");
 }
-Tensor hardshrink_cpu(const Tensor& self, Scalar lambd) {
+Tensor hardshrink_cpu(const Tensor& self, const Scalar& lambd) {
     double l = lambd.toDouble();
     // lambd.to<scalar_t>(), so float32 boundary values compare exactly.
     return dtype_unary_kernel(self, [l](auto x) -> decltype(x) {
@@ -1073,7 +1073,7 @@ Tensor hardshrink_cpu(const Tensor& self, Scalar lambd) {
         return (v >= -lt && v <= lt) ? static_cast<T>(0) : x;
     }, "hardshrink");
 }
-Tensor softshrink_cpu(const Tensor& self, Scalar lambd) {
+Tensor softshrink_cpu(const Tensor& self, const Scalar& lambd) {
     double l = lambd.toDouble();
     return dtype_unary_kernel(self, [l](auto x) -> decltype(x) {
         using T = decltype(x);
@@ -1085,7 +1085,7 @@ Tensor softshrink_cpu(const Tensor& self, Scalar lambd) {
     }, "softshrink");
 }
 // passes through where self is outside the inclusive [-lambd, lambd] band.
-Tensor hardshrink_backward_cpu(const Tensor& grad_out, const Tensor& self, Scalar lambd) {
+Tensor hardshrink_backward_cpu(const Tensor& grad_out, const Tensor& self, const Scalar& lambd) {
     double l = lambd.toDouble();
     return binary_same_kernel(grad_out, self, [l](auto g, auto s) -> decltype(g) {
         using T = decltype(g);
@@ -1094,7 +1094,7 @@ Tensor hardshrink_backward_cpu(const Tensor& grad_out, const Tensor& self, Scala
         return (v >= -lt && v <= lt) ? static_cast<T>(0) : g;
     }, "hardshrink_backward");
 }
-Tensor softshrink_backward_cpu(const Tensor& grad_output, const Tensor& self, Scalar lambd) {
+Tensor softshrink_backward_cpu(const Tensor& grad_output, const Tensor& self, const Scalar& lambd) {
     double l = lambd.toDouble();
     return binary_same_kernel(grad_output, self, [l](auto g, auto s) -> decltype(g) {
         using T = decltype(g);
@@ -1120,7 +1120,7 @@ Tensor tanh_backward_cpu(const Tensor& grad_output, const Tensor& output) {
 // gradient is dy/(x(1-x)) inside [0,1], NaN outside, and dy*inf at exact
 // 0/1; with eps>=0 values outside [eps, 1-eps] (compared in scalar_t) are
 // masked to zero.
-Tensor logit_backward_cpu(const Tensor& grad_output, const Tensor& self, std::optional<Scalar> eps) {
+Tensor logit_backward_cpu(const Tensor& grad_output, const Tensor& self, const std::optional<Scalar>& eps) {
     double e = eps.has_value() ? eps->toDouble() : -1.0;
     return binary_same_kernel(grad_output, self, [e](auto g, auto s) -> decltype(g) {
         using T = decltype(s);
@@ -1139,7 +1139,7 @@ Tensor logit_backward_cpu(const Tensor& grad_output, const Tensor& self, std::op
         return g / (s * (one - s));
     }, "logit_backward");
 }
-Tensor threshold_cpu(const Tensor& self, Scalar threshold, Scalar value) {
+Tensor threshold_cpu(const Tensor& self, const Scalar& threshold, const Scalar& value) {
     double t = threshold.toDouble(), val = value.toDouble();
     return dtype_unary_kernel(self, [t, val](auto x) -> decltype(x) {
         using T = decltype(x);

@@ -9,6 +9,7 @@
 #include "Parallel.h"
 #include "Context.h"
 #include "cpu/vec/vec.h"
+#include "TensorIterator.h"
 #include <vector>
 #include <cmath>
 #include <type_traits>
@@ -18,7 +19,7 @@
 namespace tensorplay {
 namespace cpu {
 
-Tensor& fill_kernel(Tensor& self, Scalar value);
+Tensor& fill_kernel(Tensor& self, const Scalar& value);
 
 Tensor allocate_cpu_tensor(const std::vector<int64_t>& size, DType dtype, bool pin_memory) {
 #ifdef USE_CUDA
@@ -162,21 +163,42 @@ Tensor full_kernel(const std::vector<int64_t>& size, Scalar fill_value, DType dt
     return t;
 }
 
-Tensor& fill_kernel(Tensor& self, Scalar value) {
+Tensor& fill_kernel(Tensor& self, const Scalar& value) {
+    if (self.numel() == 0) return self;
+    // Dense storage fills in one sweep; any other layout walks its strides.
+    if (self.is_contiguous()) {
+        #define OP_CASE(ctype, name) \
+        case DType::name: { \
+            ctype* data = self.data_ptr<ctype>(); \
+            std::fill(data, data + self.numel(), value.to<ctype>()); \
+            break; \
+        }
+        switch (self.dtype()) {
+            TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(OP_CASE)
+            default: TP_THROW(NotImplementedError, "fill_ not implemented for this dtype");
+        }
+        #undef OP_CASE
+        return self;
+    }
+    TensorIterator iter = TensorIteratorConfig()
+        .set_check_mem_overlap(false)
+        .check_all_same_dtype(false)
+        .add_output(self)
+        .resize_outputs(false)
+        .build();
     #define OP_CASE(ctype, name) \
     case DType::name: { \
-        ctype* data = self.data_ptr<ctype>(); \
-        int64_t n = self.numel(); \
-        ctype val = value.to<ctype>(); \
-        std::fill(data, data + n, val); \
+        const ctype val = value.to<ctype>(); \
+        iter.for_each([val](char** data, const int64_t* strides, int64_t n) { \
+            for (int64_t i = 0; i < n; ++i) { \
+                *reinterpret_cast<ctype*>(data[0] + i * strides[0]) = val; \
+            } \
+        }); \
         break; \
     }
-
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(OP_CASE)
-        default: 
-            std::cerr << "fill_kernel error: dtype=" << (int)self.dtype() << std::endl;
-            TP_THROW(NotImplementedError, "fill_ not implemented for this dtype");
+        default: TP_THROW(NotImplementedError, "fill_ not implemented for this dtype");
     }
     #undef OP_CASE
     return self;
@@ -742,7 +764,7 @@ Tensor ones_like_kernel(const Tensor& self, DType dtype, std::optional<Device> d
     return ones_kernel(static_cast<std::vector<int64_t>>(self.shape()), dtype, dev, false);
 }
 
-Tensor full_like_kernel(const Tensor& self, Scalar fill_value, DType dtype, std::optional<Device> device) {
+Tensor full_like_kernel(const Tensor& self, const Scalar& fill_value, DType dtype, std::optional<Device> device) {
     if (dtype == DType::Undefined) dtype = self.dtype();
     Device dev = device.has_value() ? *device : self.device();
     return full_kernel(static_cast<std::vector<int64_t>>(self.shape()), fill_value, dtype, dev, false);
@@ -810,22 +832,22 @@ Tensor eye_stub(int64_t n, int64_t m, DType dtype, std::optional<Device> device)
     return eye_kernel(n, m, dtype, resolve_factory_device(device));
 }
 
-Tensor arange_start_step_stub(Scalar start, Scalar end, Scalar step, DType dtype,
+Tensor arange_start_step_stub(const Scalar& start, const Scalar& end, const Scalar& step, DType dtype,
                               std::optional<Device> device) {
     return arange_start_step_kernel(start, end, step, dtype,
                                     resolve_factory_device(device));
 }
 
-Tensor arange_end_stub(Scalar end, DType dtype, std::optional<Device> device) {
+Tensor arange_end_stub(const Scalar& end, DType dtype, std::optional<Device> device) {
     return arange_kernel(end, dtype, resolve_factory_device(device));
 }
 
-Tensor linspace_stub(Scalar start, Scalar end, int64_t steps, DType dtype,
+Tensor linspace_stub(const Scalar& start, const Scalar& end, int64_t steps, DType dtype,
                      std::optional<Device> device) {
     return linspace_kernel(start, end, steps, dtype, resolve_factory_device(device));
 }
 
-Tensor logspace_stub(Scalar start, Scalar end, int64_t steps, double base,
+Tensor logspace_stub(const Scalar& start, const Scalar& end, int64_t steps, double base,
                      DType dtype, std::optional<Device> device) {
     return logspace_kernel(start, end, steps, base, dtype,
                            resolve_factory_device(device));
@@ -849,7 +871,7 @@ Tensor ones_stub(const std::vector<int64_t>& size, std::optional<DType> dtype,
                        resolve_factory_device(device), pin_memory);
 }
 
-Tensor full_stub(const std::vector<int64_t>& size, Scalar fill_value,
+Tensor full_stub(const std::vector<int64_t>& size, const Scalar& fill_value,
                  DType dtype, std::optional<Device> device, bool pin_memory) {
     return full_kernel(size, fill_value, dtype, resolve_factory_device(device),
                        pin_memory);

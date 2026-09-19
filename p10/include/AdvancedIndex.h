@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <optional>
+#include <vector>
 #include "Tensor.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
@@ -122,6 +124,43 @@ inline std::vector<int64_t> indexed_shape(
     shape.erase(shape.begin() + before, shape.begin() + before + indexed);
     shape.insert(shape.begin() + before, replacement.begin(), replacement.end());
     return shape;
+}
+
+// A non-accumulating put of one host scalar through a single mask is a
+// masked fill: returns the mask broadcast against self, or nothing when the
+// indices take another form.
+inline std::optional<Tensor> can_dispatch_to_masked_fill(
+    const Tensor& self, const std::vector<std::optional<Tensor>>& indices,
+    const Tensor& value) {
+    if (!(value.numel() == 1 && value.device().is_cpu())) return std::nullopt;
+    int64_t consumed = 0;
+    Tensor mask;
+    for (const auto& maybe_index : indices) {
+        if (!maybe_index.has_value() || !maybe_index->defined()) {
+            if (!mask.defined()) ++consumed;
+            continue;
+        }
+        const Tensor& index = *maybe_index;
+        if ((index.dtype() != DType::Bool && index.dtype() != DType::UInt8) ||
+            index.device() != self.device() || mask.defined()) {
+            return std::nullopt;
+        }
+        mask = index;
+        for (int64_t d = 0; d < index.dim(); ++d) {
+            const int64_t source_dim = consumed + d;
+            TP_CHECK_INDEX(source_dim < self.dim() &&
+                           index.size(d) == self.size(source_dim),
+                           "The shape of the mask ", index.shape(), " at index ", d,
+                           " does not match the shape of the indexed tensor ",
+                           self.shape(), " at index ", source_dim);
+        }
+        consumed += mask.dim();
+    }
+    if (!mask.defined()) return std::nullopt;
+    for (int64_t d = consumed; d < self.dim(); ++d) {
+        mask = tpx::ops::unsqueeze(mask, -1);
+    }
+    return mask;
 }
 
 struct AdvancedIndex {

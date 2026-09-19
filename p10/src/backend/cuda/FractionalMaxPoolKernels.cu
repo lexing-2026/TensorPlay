@@ -16,6 +16,7 @@
 #include <tuple>
 #include <cmath>
 #include <limits>
+#include "OutWrite.h"
 
 namespace tensorplay {
 namespace cuda {
@@ -401,12 +402,16 @@ Tensor fractional_max_pool3d_backward_cuda(
     }
 }
 
-Tensor& interop_fractional_max_pool2d_output_cuda(const Tensor& self, const std::vector<int64_t>& kernel_size,
+std::tuple<Tensor, Tensor> interop_fractional_max_pool2d_output_cuda(const Tensor& self, const std::vector<int64_t>& kernel_size,
               const std::vector<int64_t>& output_size, const Tensor& random_samples,
               Tensor& output, Tensor& indices) {
-        std::tie(output, indices) = fractional_max_pool2d_cuda(
+        {
+            auto __tp_result = fractional_max_pool2d_cuda(
             self, kernel_size, output_size, random_samples);
-        return output;
+            write_out(output, std::get<0>(__tp_result));
+            write_out(indices, std::get<1>(__tp_result));
+        }
+        return {output, indices};
     
 }
 
@@ -414,18 +419,22 @@ Tensor& interop_fractional_max_pool2d_backward_grad_input_cuda(const Tensor& gra
               const std::vector<int64_t>& kernel_size,
               const std::vector<int64_t>& output_size, const Tensor& indices,
               Tensor& grad_input) {
-        grad_input = fractional_max_pool2d_backward_cuda(
-            grad_output, self, kernel_size, output_size, indices);
+        write_out(grad_input, fractional_max_pool2d_backward_cuda(
+            grad_output, self, kernel_size, output_size, indices));
         return grad_input;
     
 }
 
-Tensor& interop_fractional_max_pool3d_output_cuda(const Tensor& self, const std::vector<int64_t>& kernel_size,
+std::tuple<Tensor, Tensor> interop_fractional_max_pool3d_output_cuda(const Tensor& self, const std::vector<int64_t>& kernel_size,
               const std::vector<int64_t>& output_size, const Tensor& random_samples,
               Tensor& output, Tensor& indices) {
-        std::tie(output, indices) = fractional_max_pool3d_cuda(
+        {
+            auto __tp_result = fractional_max_pool3d_cuda(
             self, kernel_size, output_size, random_samples);
-        return output;
+            write_out(output, std::get<0>(__tp_result));
+            write_out(indices, std::get<1>(__tp_result));
+        }
+        return {output, indices};
     
 }
 
@@ -433,8 +442,8 @@ Tensor& interop_fractional_max_pool3d_backward_grad_input_cuda(const Tensor& gra
               const std::vector<int64_t>& kernel_size,
               const std::vector<int64_t>& output_size, const Tensor& indices,
               Tensor& grad_input) {
-        grad_input = fractional_max_pool3d_backward_cuda(
-            grad_output, self, kernel_size, output_size, indices);
+        write_out(grad_input, fractional_max_pool3d_backward_cuda(
+            grad_output, self, kernel_size, output_size, indices));
         return grad_input;
     
 }

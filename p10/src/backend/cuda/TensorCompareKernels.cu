@@ -67,7 +67,7 @@ AssertMessage make_assert_message(const std::string& assert_msg) {
     return message;
 }
 
-void assert_async_msg_cuda(const Tensor& self, std::string assert_msg) {
+void assert_async_msg_cuda(const Tensor& self, const std::string& assert_msg) {
     const int64_t n = self.numel();
     if (n == 0) {
         TP_THROW(RuntimeError,

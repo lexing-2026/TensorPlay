@@ -1022,9 +1022,10 @@ Tensor conv2d_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias
 // Keep the fused IR contract shared with CPU.  The cuDNN frontend plan owns
 // the Conv(+bias)->ReLU graph, so this path launches one backend plan rather
 // than a convolution followed by a separate pointwise kernel.
-Tensor conv2d_relu_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias,
+Tensor conv2d_relu_cuda(const Tensor& input, const Tensor& weight, const std::optional<Tensor>& bias_opt,
                         const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                         const std::vector<int64_t>& dilation, int64_t groups) {
+    const Tensor bias = bias_opt.has_value() ? *bias_opt : Tensor();
     return conv2d_cuda_impl(input, weight, bias, stride, padding, dilation, groups, true);
 }
 

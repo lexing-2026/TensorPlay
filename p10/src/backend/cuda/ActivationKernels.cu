@@ -11,6 +11,7 @@
 #endif
 #include <type_traits>
 #include <limits>
+#include "OutWrite.h"
 
 #define CUDA_CHECK(condition) \
   do { \
@@ -371,7 +372,7 @@ inline void run_threshold_backward_iter(TensorIteratorBase& iter, T threshold) {
     });
 }
 
-Tensor threshold_backward_kernel(const Tensor& grad_output, const Tensor& output, Scalar threshold) {
+Tensor threshold_backward_kernel(const Tensor& grad_output, const Tensor& output, const Scalar& threshold) {
     if (grad_output.numel() != output.numel()) {
         TP_THROW(RuntimeError, "threshold_backward: grad_output and output must have same size");
     }
@@ -1024,8 +1025,8 @@ Tensor _softmax_backward_data_cuda(const Tensor& grad_output,
 Tensor& _softmax_backward_data_out_cuda(const Tensor& grad_output,
                                         const Tensor& output, int64_t dim,
                                         DType input_dtype, Tensor& grad_input) {
-  grad_input = softmax_backward_native_impl(grad_output, output, dim,
-                                            input_dtype, /*log_mode=*/false);
+  write_out(grad_input, softmax_backward_native_impl(grad_output, output, dim,
+                                            input_dtype, /*log_mode=*/false));
   return grad_input;
 }
 
@@ -1040,8 +1041,8 @@ Tensor& _log_softmax_backward_data_out_cuda(const Tensor& grad_output,
                                             const Tensor& output, int64_t dim,
                                             DType input_dtype,
                                             Tensor& grad_input) {
-  grad_input = softmax_backward_native_impl(grad_output, output, dim,
-                                            input_dtype, /*log_mode=*/true);
+  write_out(grad_input, softmax_backward_native_impl(grad_output, output, dim,
+                                            input_dtype, /*log_mode=*/true));
   return grad_input;
 }
 
@@ -1051,7 +1052,7 @@ Tensor& _softmax_out_cuda(const Tensor& self, int64_t dim, bool half_to_float,
     TP_THROW(RuntimeError,
              "softmax with half to float conversion is not supported on this backend");
   }
-  out = softmax_native_impl(self, dim, false);
+  write_out(out, softmax_native_impl(self, dim, false));
   return out;
 }
 
@@ -1061,7 +1062,7 @@ Tensor& _log_softmax_out_cuda(const Tensor& self, int64_t dim,
     TP_THROW(RuntimeError,
              "log_softmax with half to float conversion is not supported on this backend");
   }
-  out = softmax_native_impl(self, dim, true);
+  write_out(out, softmax_native_impl(self, dim, true));
   return out;
 }
 

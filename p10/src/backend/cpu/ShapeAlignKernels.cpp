@@ -659,7 +659,7 @@ bool tpsa_allclose(const Tensor& self, const Tensor& other, double rtol, double 
 // dtype/device identically.
 // ---------------------------------------------------------------------------
 
-Tensor tpsa_fill_scalar(const Tensor& self, Scalar value) {
+Tensor tpsa_fill_scalar(const Tensor& self, const Scalar& value) {
     return Tensor::full_like(self, value, self.dtype(), self.device());
 }
 

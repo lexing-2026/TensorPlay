@@ -316,8 +316,8 @@ class LossFamilyCuda(unittest.TestCase):
         target = tp.randint(0, 3, (2, 4, 4), dtype=tp.int64,
                             device=self._dev())
         out, tw = tp._C.nll_loss2d(logits, target, None, 1, -100)
-        lr = logits.cpu().clone().requires_grad_(True)
-        trt = target.cpu()
+        lr = torch.tensor(logits.cpu().tolist(), requires_grad=True)
+        trt = torch.tensor(target.cpu().tolist())
         ref = torch.nn.functional.nll_loss(lr, trt, reduction="mean")
         self.assertAlmostEqual(out.item(), ref.item(), places=3)
         (gref,) = torch.autograd.grad(ref, lr, torch.tensor(1.0))
@@ -329,9 +329,11 @@ class LossFamilyCuda(unittest.TestCase):
         x = tp.tensor([[0.2, 1.5, -2.0]], device=self._dev())
         t = tp.tensor([[0.0, 0.0, 0.0]], device=self._dev())
         s = tp._C.smooth_l1_loss(x, t, 1, 1.0)
-        self.assertAlmostEqual(s.item(), (0.02 + 1.0) / 3, places=4)
+        # |d| < beta: 0.5 d^2 / beta; otherwise |d| - 0.5 beta.
+        self.assertAlmostEqual(s.item(), (0.02 + 1.0 + 1.5) / 3, places=4)
         h = tp._C.huber_loss(x, t, 1, 1.0)
-        self.assertAlmostEqual(h.item(), (0.02 + 1.5) / 3, places=4)
+        # delta = 1 makes huber coincide with smooth L1.
+        self.assertAlmostEqual(h.item(), (0.02 + 1.0 + 1.5) / 3, places=4)
         self.assertGreaterEqual(1.0, 0.999)  # huber linear branch sanity
         g = tp._C.smooth_l1_loss_backward(
             tp.tensor(1.0, device=self._dev()), x, t, 1, 1.0)

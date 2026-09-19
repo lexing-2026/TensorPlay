@@ -604,7 +604,7 @@ Tensor pdist_cuda(const Tensor& self, double p) {
     return output;
 }
 
-Tensor dist_cuda(const Tensor& self, const Tensor& other, Scalar p_scalar) {
+Tensor dist_cuda(const Tensor& self, const Tensor& other, const Scalar& p_scalar) {
     return tpx::ops::norm(tpx::ops::sub(self, other), p_scalar.toDouble());
 }
 

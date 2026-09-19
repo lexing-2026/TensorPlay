@@ -161,18 +161,18 @@ Tensor layer_norm_impl(
 Tensor layer_norm_kernel(
     const Tensor& input,
     const std::vector<int64_t>& normalized_shape,
-    std::optional<Tensor> weight_opt,
-    std::optional<Tensor> bias_opt,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& bias_opt,
     double eps) {
   return layer_norm_impl(input, normalized_shape, weight_opt, bias_opt, eps);
 }
 
 Tensor batch_norm_kernel(
     const Tensor& input,
-    std::optional<Tensor> weight_opt,
-    std::optional<Tensor> bias_opt,
-    std::optional<Tensor> running_mean_opt,
-    std::optional<Tensor> running_var_opt,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& bias_opt,
+    const std::optional<Tensor>& running_mean_opt,
+    const std::optional<Tensor>& running_var_opt,
     bool training,
     double momentum,
     double eps) {

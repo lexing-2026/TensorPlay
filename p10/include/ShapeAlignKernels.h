@@ -80,7 +80,7 @@ bool tpsa_equal(const Tensor& self, const Tensor& other);
 bool tpsa_allclose(const Tensor& self, const Tensor& other, double rtol, double atol,
                    bool equal_nan);
 
-Tensor tpsa_fill_scalar(const Tensor& self, Scalar value);
+Tensor tpsa_fill_scalar(const Tensor& self, const Scalar& value);
 Tensor tpsa_fill_tensor(const Tensor& self, const Tensor& value);
 
 } // namespace shapeops

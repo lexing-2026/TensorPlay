@@ -147,33 +147,33 @@ Tensor& clamp_(
 
 } // namespace
 
-Tensor clamp_kernel(const Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max) {
+Tensor clamp_kernel(const Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
   return clamp(self, min, max);
 }
 
 Tensor& clamp_inplace_kernel(
     Tensor& self,
-    std::optional<Scalar> min,
-    std::optional<Scalar> max) {
+    const std::optional<Scalar>& min,
+    const std::optional<Scalar>& max) {
   return clamp_(self, min, max);
 }
 
 // One-sided clamps delegate to the two-sided entry with the opposite bound
 // left unset, and the in-place forms round-trip through the copy kernel.
-Tensor clamp_min_kernel(const Tensor& self, Scalar min) {
+Tensor clamp_min_kernel(const Tensor& self, const Scalar& min) {
   return clamp(self, min, std::nullopt);
 }
 
-Tensor clamp_max_kernel(const Tensor& self, Scalar max) {
+Tensor clamp_max_kernel(const Tensor& self, const Scalar& max) {
   return clamp(self, std::nullopt, max);
 }
 
-Tensor& clamp_min_inplace_kernel(Tensor& self, Scalar min) {
+Tensor& clamp_min_inplace_kernel(Tensor& self, const Scalar& min) {
   self.copy_(clamp(self, min, std::nullopt));
   return self;
 }
 
-Tensor& clamp_max_inplace_kernel(Tensor& self, Scalar max) {
+Tensor& clamp_max_inplace_kernel(Tensor& self, const Scalar& max) {
   self.copy_(clamp(self, std::nullopt, max));
   return self;
 }
@@ -182,11 +182,11 @@ Tensor& clamp_max_inplace_kernel(Tensor& self, Scalar max) {
  * Hard tanh is the clamping range applied under the activation's name; the
  * entry points reuse the clamp dispatches directly.
  */
-Tensor hardtanh_kernel(const Tensor& self, Scalar min, Scalar max) {
+Tensor hardtanh_kernel(const Tensor& self, const Scalar& min, const Scalar& max) {
   return clamp(self, min, max);
 }
 
-Tensor& hardtanh_inplace_kernel(Tensor& self, Scalar min, Scalar max) {
+Tensor& hardtanh_inplace_kernel(Tensor& self, const Scalar& min, const Scalar& max) {
   return clamp_(self, min, max);
 }
 

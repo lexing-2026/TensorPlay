@@ -220,7 +220,7 @@ Tensor ihfftn_impl(const Tensor& input,
 }
 
 Tensor fft_hfft_native(const Tensor& input, std::optional<int64_t> n,
-                       int64_t dim, std::optional<std::string> norm) {
+                       int64_t dim, const std::optional<std::string>& norm) {
     TP_CHECK(is_supported_complex_dtype(input.dtype()),
              "hfft expects a complex-valued input tensor");
     return ops::fft_irfft(ops::conj(input), n.value_or(-1), dim,
@@ -228,13 +228,13 @@ Tensor fft_hfft_native(const Tensor& input, std::optional<int64_t> n,
 }
 
 Tensor& fft_hfft_out_native(const Tensor& input, std::optional<int64_t> n,
-                            int64_t dim, std::optional<std::string> norm,
+                            int64_t dim, const std::optional<std::string>& norm,
                             Tensor& out) {
     return write_fft_out(out, fft_hfft_native(input, n, dim, norm), "hfft");
 }
 
 Tensor fft_ihfft_native(const Tensor& input, std::optional<int64_t> n,
-                        int64_t dim, std::optional<std::string> norm) {
+                        int64_t dim, const std::optional<std::string>& norm) {
     TP_CHECK(!is_complex_dtype(input.dtype()),
              "ihfft expects a real-valued input tensor");
     return ops::conj_physical(ops::fft_rfft(input, n.value_or(-1), dim,
@@ -242,7 +242,7 @@ Tensor fft_ihfft_native(const Tensor& input, std::optional<int64_t> n,
 }
 
 Tensor& fft_ihfft_out_native(const Tensor& input, std::optional<int64_t> n,
-                             int64_t dim, std::optional<std::string> norm,
+                             int64_t dim, const std::optional<std::string>& norm,
                              Tensor& out) {
     return write_fft_out(out, fft_ihfft_native(input, n, dim, norm), "ihfft");
 }

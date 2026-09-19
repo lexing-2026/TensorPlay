@@ -18,6 +18,7 @@
 #undef NDEBUG
 #endif
 #include <cassert>
+#include "OutWrite.h"
 
 namespace tensorplay {
 namespace cuda {
@@ -260,7 +261,7 @@ Tensor max_unpool3d_backward_cuda(const Tensor& grad_output, const Tensor& indic
 
 Tensor& interop_max_unpool2d_out_cuda(const Tensor& self, const Tensor& indices,
               const std::vector<int64_t>& output_size, Tensor& out) {
-        out = max_unpool2d_cuda(self, indices, output_size);
+        write_out(out, max_unpool2d_cuda(self, indices, output_size));
         return out;
     
 }
@@ -269,7 +270,7 @@ Tensor& interop_max_unpool3d_out_cuda(const Tensor& self, const Tensor& indices,
               const std::vector<int64_t>& output_size,
               const std::vector<int64_t>& stride,
               const std::vector<int64_t>& padding, Tensor& out) {
-        out = max_unpool3d_cuda(self, indices, output_size, stride, padding);
+        write_out(out, max_unpool3d_cuda(self, indices, output_size, stride, padding));
         return out;
     
 }

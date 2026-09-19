@@ -278,21 +278,31 @@ def stub_arg_type(t: Type) -> str:
         if t.is_mutable_ref:
             return "Tensor&"
         if t.is_opt:
-            return f"std::optional<{_cpp_value_type(make_type(t.kind, t.is_list, False, None, t.symint, t.list_elem_opt))}>"
+            value = f"std::optional<{_cpp_value_type(make_type(t.kind, t.is_list, False, None, t.symint, t.list_elem_opt))}>"
+            # Owning optionals of non-trivial types travel by const reference.
+            return value if t.mutability else f"const {value}&"
         if t.is_list:
             elem = "std::optional<Tensor>" if t.list_elem_opt else "Tensor"
             vector = f"std::vector<{elem}>"
             return vector if t.mutability else f"const {vector}&"
         return "const Tensor&"
+    # Owning non-trivial values (Scalar, strings, lists and their optionals)
+    # travel by const reference; trivially copyable atoms and their
+    # optionals travel by value.
+    if t.kind == "Scalar" and not t.is_list:
+        return "const std::optional<Scalar>&" if t.is_opt else "const Scalar&"
     atom = BaseCType(_RAW_ATOMIC[t.kind])
     if t.list_elem_opt:
         atom = StdOptionalCType(atom)
     if t.is_list:
         vec = StdVectorCType(atom)
         return f"const {vec.cpp_type()}&" if not t.is_opt \
-            else StdOptionalCType(vec).cpp_type()
+            else f"const {StdOptionalCType(vec).cpp_type()}&"
     if t.is_opt:
-        return StdOptionalCType(atom).cpp_type()
+        value = StdOptionalCType(atom).cpp_type()
+        return f"const {value}&" if t.kind == "str" else value
+    if t.kind == "str":
+        return f"const {atom.cpp_type()}&"
     return atom.cpp_type()
 
 
@@ -570,6 +580,7 @@ UNWRAP_OPT_TENSOR: dict[str, set[str]] = {
     "conv_transpose2d": {"bias"},
     "conv_transpose3d": {"bias"},
     "nll_loss_backward": {"total_weight"},
+    "nll_loss2d_backward": {"total_weight"},
 }
 
 
@@ -585,6 +596,18 @@ def stub_arg_type_for(op_base: str, a) -> str:
         t = make_type("Tensor", False, False, None, False, False, False)
         return stub_arg_type(t)
     return stub_arg_type(a.type)
+
+
+def rewrap_arg_expr(op_base: str, a, expr: str) -> str:
+    """Turn a stub-ABI argument back into its public C++ type.
+
+    Across the unwrap boundary an optional tensor travels as a plain
+    (possibly undefined) Tensor; public entry points take the optional.
+    """
+    if _unwrap_targeted(op_base, a):
+        return (f"({a.name}.defined() ? std::optional<Tensor>({expr}) "
+                f": std::optional<Tensor>())")
+    return expr
 
 
 def call_arg_expr(op_base: str, a) -> str:

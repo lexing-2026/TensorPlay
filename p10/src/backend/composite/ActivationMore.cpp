@@ -55,7 +55,7 @@ Tensor& write_activation_out(const char* op, Tensor value, Tensor& out) {
 }
 
 // clamp_max(self, max) == clamp(self, min=nullopt, max)
-Tensor& clamp_max_out_native(const Tensor& self, Scalar max, Tensor& out) {
+Tensor& clamp_max_out_native(const Tensor& self, const Scalar& max, Tensor& out) {
     return write_activation_out("clamp_max", ops::clamp(self, std::nullopt, max),
                                 out);
 }
@@ -72,7 +72,7 @@ Tensor& clamp_max__tensor_native(Tensor& self, const Tensor& max) {
 }
 
 // clamp_min(self, min) == clamp(self, min, max=nullopt)
-Tensor& clamp_min_out_native(const Tensor& self, Scalar min, Tensor& out) {
+Tensor& clamp_min_out_native(const Tensor& self, const Scalar& min, Tensor& out) {
     return write_activation_out("clamp_min", ops::clamp(self, min, std::nullopt),
                                 out);
 }
@@ -90,7 +90,7 @@ Tensor& clamp_min__tensor_native(Tensor& self, const Tensor& min) {
 
 Tensor& gelu_backward_grad_input_native(const Tensor& grad_output,
                                         const Tensor& self,
-                                        std::string approximate,
+                                        const std::string& approximate,
                                         Tensor& grad_input) {
     return write_activation_out(
         "gelu_backward", ops::gelu_backward(grad_output, self, std::move(approximate)),
@@ -112,7 +112,7 @@ Tensor& hardsigmoid_backward_grad_input_native(const Tensor& grad_output,
 }
 
 Tensor& hardshrink_backward_grad_input_native(const Tensor& grad_out,
-                                              const Tensor& self, Scalar lambd,
+                                              const Tensor& self, const Scalar& lambd,
                                               Tensor& grad_input) {
     return write_activation_out("hardshrink_backward",
                                 ops::hardshrink_backward(grad_out, self, lambd),
@@ -120,7 +120,7 @@ Tensor& hardshrink_backward_grad_input_native(const Tensor& grad_out,
 }
 
 Tensor& softshrink_backward_grad_input_native(const Tensor& grad_output,
-                                              const Tensor& self, Scalar lambd,
+                                              const Tensor& self, const Scalar& lambd,
                                               Tensor& grad_input) {
     return write_activation_out("softshrink_backward",
                                 ops::softshrink_backward(grad_output, self, lambd),
@@ -128,8 +128,8 @@ Tensor& softshrink_backward_grad_input_native(const Tensor& grad_output,
 }
 
 Tensor& softplus_backward_grad_input_native(const Tensor& grad_output,
-                                            const Tensor& self, Scalar beta,
-                                            Scalar threshold,
+                                            const Tensor& self, const Scalar& beta,
+                                            const Scalar& threshold,
                                             Tensor& grad_input) {
     return write_activation_out(
         "softplus_backward",
@@ -138,7 +138,7 @@ Tensor& softplus_backward_grad_input_native(const Tensor& grad_output,
 
 Tensor& leaky_relu_backward_grad_input_native(const Tensor& grad_output,
                                               const Tensor& self,
-                                              Scalar negative_slope,
+                                              const Scalar& negative_slope,
                                               bool self_is_result,
                                               Tensor& grad_input) {
     return write_activation_out(
@@ -147,8 +147,8 @@ Tensor& leaky_relu_backward_grad_input_native(const Tensor& grad_output,
         grad_input);
 }
 
-Tensor& elu_backward_grad_input_native(const Tensor& grad_output, Scalar alpha,
-                                       Scalar scale, Scalar input_scale,
+Tensor& elu_backward_grad_input_native(const Tensor& grad_output, const Scalar& alpha,
+                                       const Scalar& scale, const Scalar& input_scale,
                                        bool is_result,
                                        const Tensor& self_or_result,
                                        Tensor& grad_input) {
@@ -171,7 +171,7 @@ Tensor& glu_backward_grad_input_native(const Tensor& grad_output,
 // this as threshold() with value = 0).
 Tensor& threshold_backward_grad_input_native(const Tensor& grad_output,
                                              const Tensor& self,
-                                             Scalar threshold,
+                                             const Scalar& threshold,
                                              Tensor& grad_input) {
     return write_activation_out("threshold_backward",
                                 ops::threshold_backward(grad_output, self, threshold),

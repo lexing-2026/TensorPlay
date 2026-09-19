@@ -13,6 +13,9 @@
 #include "../../p10/include/Utils.h" // broadcast shape validation for indexed assignment
 #include "TypePromotion.h" // complex weak-scalar reflected-op dtype rules
 #include "ScalarOps.h" // wrapped_scalar_tensor for reflected Python scalars
+#define TENSORPLAY_INDEXING_SKIP_TENSOR_MEMBERS
+#include "TensorIndexing.h" // copy_to / slicePrefix1sSize for indexed assignment
+#undef TENSORPLAY_INDEXING_SKIP_TENSOR_MEMBERS
 #include <mutex>
 #include <pybind11/functional.h>
 #include <algorithm>
@@ -549,98 +552,12 @@ static std::tuple<int64_t, int64_t, int64_t, int64_t> compute_slice(py::slice s,
     return {start, stop, step, slicelength};
 }
 
-// Python's list/tensor indexing is advanced indexing, not a view operation.
-// Keep the conversion here, at the C++ binding boundary, so all Python entry
-// points (including DataLoader datasets) use the same device, bounds, and
-// autograd-aware index_select path.  Device indices are handed to the
-// indexing kernels as-is (the kernels wrap negative values per element and
-// reject out-of-range ones); only host-side consumers and 0-dim indices
-// stage values through CPU memory.
-struct PreparedTensorIndex {
-    Tensor flat;
-    std::vector<int64_t> shape;
-    std::vector<int64_t> values;
-    bool scalar = false;
-};
-
 // deprecation warning).  Keep that interpretation at this boundary instead
 // of treating a byte mask as an integer index tensor.
 static bool is_boolean_mask_dtype(DType dtype) {
     return dtype == DType::Bool || dtype == DType::UInt8;
 }
 
-static int64_t checked_index_dim(const Tensor& self, int64_t dim) {
-    const int64_t ndim = self.dim();
-    if (ndim == 0) {
-        TP_THROW(IndexError, "too many indices for tensor of dimension 0");
-    }
-    if (dim < 0) dim += ndim;
-    if (dim < 0 || dim >= ndim) {
-        TP_THROW(IndexError, "Dimension out of range");
-    }
-    return dim;
-}
-
-static Tensor make_normalized_index(const Tensor& self, int64_t dim,
-                                    std::vector<int64_t>& values) {
-    dim = checked_index_dim(self, dim);
-    const int64_t dim_size = self.size(dim);
-    for (int64_t& value : values) {
-        if (value < 0) value += dim_size;
-        if (value < 0 || value >= dim_size) {
-            TP_THROW(IndexError, "index out of range");
-        }
-    }
-
-    // Tensor::tensor(vector, ...) is a CPU factory.  Constructing the small
-    // index on CPU and moving it once is also the safe route for CUDA: the
-    // CUDA index_select kernel must never be handed a host pointer.
-    Tensor result = Tensor::tensor(values, DType::Int64);
-    if (!self.device().is_cpu()) result = result.to(self.device());
-    return result;
-}
-
-static PreparedTensorIndex prepare_integer_index(const Tensor& self,
-                                                 int64_t dim,
-                                                 const Tensor& raw_index,
-                                                 bool stage_host_values = true) {
-    dim = checked_index_dim(self, dim);
-    if (raw_index.dtype() == DType::Bool ||
-        !isIntegralType(raw_index.dtype(), /*includeBool=*/false)) {
-        TP_THROW(TypeError,
-                 "tensors used as indices must be long, int, short, byte or bool tensors");
-    }
-
-    PreparedTensorIndex prepared;
-    prepared.shape = static_cast<std::vector<int64_t>>(raw_index.shape());
-    prepared.scalar = raw_index.dim() == 0;
-
-    // Device indices stay on their own device: the indexing kernels wrap
-    // negative values per element, so the common path needs no host staging.
-    // The host pass remains for callers that consume index values on the CPU
-    // (the tuple index planner) and for 0-dim indices, whose single value
-    // feeds select().
-    if (stage_host_values || prepared.scalar || raw_index.device().is_cpu()) {
-        Tensor index = raw_index.to(DType::Int64).contiguous();
-        Tensor host_index = index;
-        if (!host_index.device().is_cpu()) {
-            host_index = host_index.to(Device(DeviceType::CPU));
-        }
-        host_index = host_index.contiguous();
-        prepared.values.resize(static_cast<size_t>(host_index.numel()));
-        if (!prepared.values.empty()) {
-            std::memcpy(prepared.values.data(), host_index.data_ptr<int64_t>(),
-                        prepared.values.size() * sizeof(int64_t));
-        }
-        prepared.flat = make_normalized_index(self, dim, prepared.values);
-        return prepared;
-    }
-
-    const int64_t numel = raw_index.numel();
-    Tensor flat = raw_index.to(DType::Int64).contiguous();
-    prepared.flat = flat.reshape({numel});
-    return prepared;
-}
 
 static bool is_python_bool_vector(py::handle object) {
     if (!PyList_Check(object.ptr()) && !PyTuple_Check(object.ptr())) return false;
@@ -654,84 +571,6 @@ static bool is_python_bool_vector(py::handle object) {
     return true;
 }
 
-static PreparedTensorIndex prepare_python_bool_index(const Tensor& self,
-                                                     int64_t dim,
-                                                     py::handle object) {
-    dim = checked_index_dim(self, dim);
-    py::sequence sequence = py::reinterpret_borrow<py::sequence>(object);
-    const int64_t length = static_cast<int64_t>(sequence.size());
-    if (length != self.size(dim)) {
-        TP_THROW(IndexError, "The shape of the mask does not match the indexed tensor");
-    }
-
-    PreparedTensorIndex prepared;
-    for (int64_t i = 0; i < length; ++i) {
-        if (PyObject_IsTrue(sequence[static_cast<Py_ssize_t>(i)].ptr())) {
-            prepared.values.push_back(i);
-        }
-    }
-    prepared.shape = {static_cast<int64_t>(prepared.values.size())};
-    prepared.flat = make_normalized_index(self, dim, prepared.values);
-    return prepared;
-}
-
-static PreparedTensorIndex prepare_bool_tensor_index(const Tensor& self,
-                                                     int64_t dim,
-                                                     const Tensor& raw_index) {
-    dim = checked_index_dim(self, dim);
-    if (raw_index.dim() != 1 || raw_index.size(0) != self.size(dim)) {
-        TP_THROW(IndexError, "The shape of the mask does not match the indexed tensor");
-    }
-
-    Tensor host_mask = raw_index;
-    if (!host_mask.device().is_cpu()) {
-        host_mask = host_mask.to(Device(DeviceType::CPU));
-    }
-    host_mask = host_mask.contiguous();
-
-    PreparedTensorIndex prepared;
-    const bool* bool_mask = host_mask.dtype() == DType::Bool
-                                ? host_mask.data_ptr<bool>()
-                                : nullptr;
-    const uint8_t* byte_mask = host_mask.dtype() == DType::UInt8
-                                   ? host_mask.data_ptr<uint8_t>()
-                                   : nullptr;
-    for (int64_t i = 0; i < host_mask.numel(); ++i) {
-        if (bool_mask ? bool_mask[i] : byte_mask[i]) {
-            prepared.values.push_back(i);
-        }
-    }
-    prepared.shape = {static_cast<int64_t>(prepared.values.size())};
-    prepared.flat = make_normalized_index(self, dim, prepared.values);
-    return prepared;
-}
-
-static PreparedTensorIndex prepare_python_integer_index(const Tensor& self,
-                                                        int64_t dim,
-                                                        py::handle object) {
-    // list_to_tensor handles nested lists as well, so e.g. x[[[0, 1]]]
-    // preserves the [1, 2] index shape after index_select.
-    Tensor raw = list_to_tensor(object.ptr(), DType::Int64,
-                                Device(DeviceType::CPU));
-    return prepare_integer_index(self, dim, raw);
-}
-
-static Tensor apply_prepared_index(const Tensor& self, int64_t dim,
-                                   const PreparedTensorIndex& prepared) {
-    dim = checked_index_dim(self, dim);
-    if (prepared.scalar) {
-        return tensorplay::tpx::ops::select(self, dim, prepared.values.at(0));
-    }
-
-    Tensor selected = tensorplay::tpx::ops::index_select(self, dim, prepared.flat);
-    if (prepared.shape.size() <= 1) return selected;
-
-    std::vector<int64_t> output_shape = static_cast<std::vector<int64_t>>(self.shape());
-    output_shape.erase(output_shape.begin() + dim);
-    output_shape.insert(output_shape.begin() + dim,
-                        prepared.shape.begin(), prepared.shape.end());
-    return tensorplay::tpx::ops::reshape(selected, output_shape);
-}
 
 static Tensor prepare_setitem_value(const Tensor& self, py::object value) {
     if (py::isinstance<Tensor>(value)) {
@@ -765,6 +604,33 @@ static Tensor prepare_setitem_value(const Tensor& self, py::object value) {
     TP_THROW(TypeError, "Unsupported value type for setitem");
 }
 
+// Converts the right-hand side of an indexed assignment.  Python scalars
+// become 0-d tensors of the destination dtype; for accelerator
+// destinations they stay on the host so the assignment lowers to a fill.
+static Tensor setitem_value_to_tensor(const Tensor& self, py::object value) {
+    const Device scalar_device = self.device().type() == DeviceType::CPU
+        ? self.device() : Device(DeviceType::CPU);
+    // Preserve Python integer precision: going through double would round
+    // large int64 assignments.
+    if (py::isinstance<py::bool_>(value)) {
+        return Tensor::full({}, Scalar(py::cast<bool>(value)), self.dtype(),
+                            scalar_device);
+    }
+    if (py::isinstance<py::int_>(value)) {
+        return Tensor::full({}, Scalar(py::cast<int64_t>(value)), self.dtype(),
+                            scalar_device);
+    }
+    if (py::isinstance<py::float_>(value)) {
+        return Tensor::full({}, Scalar(py::cast<double>(value)), self.dtype(),
+                            scalar_device);
+    }
+    if (PyComplex_Check(value.ptr())) {
+        return Tensor::full({}, Scalar(py::cast<std::complex<double>>(value)),
+                            self.dtype(), scalar_device);
+    }
+    return prepare_setitem_value(self, std::move(value));
+}
+
 static Tensor prepare_setitem_value(const Tensor& self, py::object value,
                                     const std::vector<int64_t>& target_shape) {
     Tensor result = prepare_setitem_value(self, std::move(value));
@@ -779,179 +645,6 @@ static Tensor prepare_setitem_value(const Tensor& self, py::object value,
     return result;
 }
 
-static std::vector<int64_t> indexed_result_shape_dim0(
-    const Tensor& self, const PreparedTensorIndex& prepared) {
-    std::vector<int64_t> shape = prepared.shape;
-    const auto self_shape = static_cast<std::vector<int64_t>>(self.shape());
-    shape.insert(shape.end(), self_shape.begin() + 1, self_shape.end());
-    return shape;
-}
-
-static void assign_prepared_index_dim0(Tensor& self,
-                                       const PreparedTensorIndex& prepared,
-                                       py::object value) {
-    if (prepared.scalar) {
-        Tensor target = self.select(0, prepared.values.at(0));
-        Tensor rhs = prepare_setitem_value(self, std::move(value),
-                                           static_cast<std::vector<int64_t>>(target.shape()));
-        tensorplay::tpx::ops::copy_(target, rhs);
-        return;
-    }
-
-    const std::vector<int64_t> indexed_shape =
-        indexed_result_shape_dim0(self, prepared);
-    Tensor rhs = prepare_setitem_value(self, std::move(value), indexed_shape);
-
-    // index_copy_ consumes a one-dimensional index and a source whose
-    // indexed dimension is the index length.  Flatten only the advanced
-    // index shape; the remaining tensor dimensions retain their layout.
-    std::vector<int64_t> source_shape;
-    source_shape.reserve(indexed_shape.size() - prepared.shape.size() + 1);
-    source_shape.push_back(prepared.flat.numel());
-    const auto self_shape = static_cast<std::vector<int64_t>>(self.shape());
-    source_shape.insert(source_shape.end(), self_shape.begin() + 1, self_shape.end());
-    rhs = rhs.reshape(source_shape).contiguous();
-    tensorplay::tpx::ops::index_copy_(self, 0, prepared.flat, rhs);
-}
-
-// A tuple can contain more than one advanced index.  Applying those indices
-// one at a time is observably wrong for non-adjacent indices (x[[0, 1], :,
-// [1, 2]] must pair the two index vectors, rather than form a cartesian
-// product).  Keep a small native index planner for this less common path;
-// the one-dimensional top-level path above stays on index_select/index_copy_
-// for DataLoader-sized batches.
-enum class NativeIndexKind {
-    Integer,
-    Slice,
-    Advanced,
-    NewAxis,
-};
-
-struct NativeIndexComponent {
-    NativeIndexKind kind = NativeIndexKind::Slice;
-    int64_t input_dim = -1;
-    int64_t integer = 0;
-    int64_t start = 0;
-    int64_t step = 1;
-    int64_t length = 0;
-    std::vector<int64_t> values;
-    std::vector<int64_t> shape;
-};
-
-static int64_t checked_shape_numel(const std::vector<int64_t>& shape) {
-    int64_t result = 1;
-    for (const int64_t size : shape) {
-        if (size < 0 || (size != 0 &&
-                         result > std::numeric_limits<int64_t>::max() / size)) {
-            TP_THROW(RuntimeError, "invalid or overflowing indexed shape");
-        }
-        result *= size;
-    }
-    return result;
-}
-
-static NativeIndexComponent make_full_index_component(const Tensor& self,
-                                                      int64_t input_dim) {
-    NativeIndexComponent component;
-    component.kind = NativeIndexKind::Slice;
-    component.input_dim = input_dim;
-    component.length = self.size(input_dim);
-    return component;
-}
-
-static NativeIndexComponent make_slice_index_component(const Tensor& self,
-                                                       int64_t input_dim,
-                                                       py::slice slice) {
-    auto [start, stop, step, length] = compute_slice(slice, self.size(input_dim));
-    NativeIndexComponent component;
-    component.kind = NativeIndexKind::Slice;
-    component.input_dim = input_dim;
-    component.start = start;
-    component.step = step;
-    component.length = length;
-    (void)stop;
-    return component;
-}
-
-static NativeIndexComponent make_integer_index_component(const Tensor& self,
-                                                         int64_t input_dim,
-                                                         int64_t value) {
-    input_dim = checked_index_dim(self, input_dim);
-    const int64_t size = self.size(input_dim);
-    if (value < 0) value += size;
-    if (value < 0 || value >= size) TP_THROW(IndexError, "index out of range");
-
-    NativeIndexComponent component;
-    component.kind = NativeIndexKind::Integer;
-    component.input_dim = input_dim;
-    component.integer = value;
-    return component;
-}
-
-static NativeIndexComponent make_advanced_index_component(
-    int64_t input_dim, PreparedTensorIndex prepared) {
-    NativeIndexComponent component;
-    component.kind = NativeIndexKind::Advanced;
-    component.input_dim = input_dim;
-    component.values = std::move(prepared.values);
-    component.shape = std::move(prepared.shape);
-    return component;
-}
-
-static std::vector<NativeIndexComponent> make_bool_tensor_components(
-    const Tensor& self, int64_t first_dim, const Tensor& raw_mask) {
-    first_dim = checked_index_dim(self, first_dim);
-    const int64_t mask_dim = raw_mask.dim();
-    if (mask_dim == 0 || first_dim + mask_dim > self.dim()) {
-        TP_THROW(IndexError, "The shape of the mask does not match the indexed tensor");
-    }
-    for (int64_t d = 0; d < mask_dim; ++d) {
-        if (raw_mask.size(d) != self.size(first_dim + d)) {
-            TP_THROW(IndexError, "The shape of the mask does not match the indexed tensor");
-        }
-    }
-
-    Tensor host_mask = raw_mask;
-    if (!host_mask.device().is_cpu()) {
-        host_mask = host_mask.to(Device(DeviceType::CPU));
-    }
-    host_mask = host_mask.contiguous();
-    const int64_t mask_numel = host_mask.numel();
-    const bool* bool_mask = host_mask.dtype() == DType::Bool
-                                ? host_mask.data_ptr<bool>()
-                                : nullptr;
-    const uint8_t* byte_mask = host_mask.dtype() == DType::UInt8
-                                   ? host_mask.data_ptr<uint8_t>()
-                                   : nullptr;
-    std::vector<std::vector<int64_t>> coordinates(
-        static_cast<size_t>(mask_dim));
-    for (int64_t linear = 0; linear < mask_numel; ++linear) {
-        if (!(bool_mask ? bool_mask[linear] : byte_mask[linear])) continue;
-        int64_t remainder = linear;
-        std::vector<int64_t> current(static_cast<size_t>(mask_dim));
-        for (int64_t d = mask_dim - 1; d >= 0; --d) {
-            const int64_t size = raw_mask.size(d);
-            current[static_cast<size_t>(d)] = size == 0 ? 0 : remainder % size;
-            if (size != 0) remainder /= size;
-        }
-        for (int64_t d = 0; d < mask_dim; ++d) {
-            coordinates[static_cast<size_t>(d)].push_back(
-                current[static_cast<size_t>(d)]);
-        }
-    }
-
-    std::vector<NativeIndexComponent> components;
-    components.reserve(static_cast<size_t>(mask_dim));
-    for (int64_t d = 0; d < mask_dim; ++d) {
-        NativeIndexComponent component;
-        component.kind = NativeIndexKind::Advanced;
-        component.input_dim = first_dim + d;
-        component.values = std::move(coordinates[static_cast<size_t>(d)]);
-        component.shape = {static_cast<int64_t>(component.values.size())};
-        components.push_back(std::move(component));
-    }
-    return components;
-}
 
 static int64_t consumed_index_dims(py::handle index) {
     if (index.is_none() || index.ptr() == Py_Ellipsis) return 0;
@@ -975,175 +668,20 @@ static int64_t consumed_index_dims(py::handle index) {
     TP_THROW(TypeError, "Unsupported index type in tuple");
 }
 
-static std::vector<NativeIndexComponent> expand_native_index_tuple(
-    const Tensor& self, py::tuple indices) {
-    const int64_t ndim = self.dim();
-    int64_t consumed = 0;
-    int64_t ellipsis = -1;
-    for (size_t i = 0; i < indices.size(); ++i) {
-        py::handle index = indices[i];
-        if (index.ptr() == Py_Ellipsis) {
-            if (ellipsis >= 0) {
-                TP_THROW(IndexError, "an index can only have a single ellipsis");
-            }
-            ellipsis = static_cast<int64_t>(i);
-            continue;
-        }
-        consumed += consumed_index_dims(index);
-    }
-    if (consumed > ndim) TP_THROW(IndexError, "too many indices for tensor");
 
-    const int64_t ellipsis_fill = ndim - consumed;
-    std::vector<NativeIndexComponent> components;
-    components.reserve(static_cast<size_t>(ndim + indices.size()));
-    int64_t input_dim = 0;
-
-    auto append_index = [&](py::handle index) {
-        if (index.is_none()) {
-            NativeIndexComponent component;
-            component.kind = NativeIndexKind::NewAxis;
-            component.length = 1;
-            components.push_back(std::move(component));
-            return;
-        }
-        if (py::isinstance<py::bool_>(index)) {
-            NativeIndexComponent component;
-            component.kind = NativeIndexKind::NewAxis;
-            component.length = py::cast<bool>(index) ? 1 : 0;
-            components.push_back(std::move(component));
-            return;
-        }
-        if (py::isinstance<py::int_>(index)) {
-            components.push_back(make_integer_index_component(
-                self, input_dim++, py::cast<int64_t>(index)));
-            return;
-        }
-        if (py::isinstance<py::slice>(index)) {
-            components.push_back(make_slice_index_component(
-                self, input_dim++, py::cast<py::slice>(index)));
-            return;
-        }
-        if (py::isinstance<py::list>(index)) {
-            PreparedTensorIndex prepared =
-                is_python_bool_vector(index)
-                    ? prepare_python_bool_index(self, input_dim, index)
-                    : prepare_python_integer_index(self, input_dim, index);
-            components.push_back(make_advanced_index_component(
-                input_dim++, std::move(prepared)));
-            return;
-        }
-        if (py::isinstance<Tensor>(index)) {
-            Tensor tensor_index = py::cast<Tensor>(index);
-            if (is_boolean_mask_dtype(tensor_index.dtype())) {
-                if (tensor_index.dim() == 0) {
-                    NativeIndexComponent component;
-                    component.kind = NativeIndexKind::NewAxis;
-                    component.length = tensor_index.item<bool>() ? 1 : 0;
-                    components.push_back(std::move(component));
-                    return;
-                }
-                std::vector<NativeIndexComponent> mask_components =
-                    make_bool_tensor_components(self, input_dim, tensor_index);
-                input_dim += tensor_index.dim();
-                for (auto& component : mask_components) {
-                    components.push_back(std::move(component));
-                }
-                return;
-            }
-            if (!isIntegralType(tensor_index.dtype(), /*includeBool=*/false)) {
-                TP_THROW(TypeError,
-                         "tensors used as indices must be long, int, short, byte or bool tensors");
-            }
-            PreparedTensorIndex prepared =
-                prepare_integer_index(self, input_dim, tensor_index);
-            if (prepared.scalar) {
-                components.push_back(make_integer_index_component(
-                    self, input_dim++, prepared.values.at(0)));
-            } else {
-                components.push_back(make_advanced_index_component(
-                    input_dim++, std::move(prepared)));
-            }
-            return;
-        }
-        TP_THROW(TypeError, "Unsupported index type in tuple");
-    };
-
-    for (size_t i = 0; i < indices.size(); ++i) {
-        py::handle index = indices[i];
-        if (index.ptr() == Py_Ellipsis) {
-            for (int64_t d = 0; d < ellipsis_fill; ++d) {
-                components.push_back(make_full_index_component(self, input_dim++));
-            }
-        } else {
-            append_index(index);
-        }
-    }
-    while (input_dim < ndim) {
-        components.push_back(make_full_index_component(self, input_dim++));
-    }
-    return components;
-}
-
-static bool tuple_needs_native_index_plan(py::tuple indices) {
-    int64_t advanced_count = 0;
-    for (size_t i = 0; i < indices.size(); ++i) {
-        py::handle index = indices[i];
-        if (index.is_none()) return true;
-        if (py::isinstance<py::bool_>(index)) return true;
-        if (py::isinstance<py::list>(index)) {
-            ++advanced_count;
-            continue;
-        }
-        if (py::isinstance<Tensor>(index)) {
-            Tensor tensor_index = py::cast<Tensor>(index);
-            if (is_boolean_mask_dtype(tensor_index.dtype())) {
-                if (tensor_index.dim() == 0 || tensor_index.dim() > 1) return true;
-                if (tensor_index.dim() == 1) ++advanced_count;
-            } else if (isIntegralType(tensor_index.dtype(), /*includeBool=*/false)) {
-                // A scalar integer tensor is a basic index, but sending it
-                // through the native planner keeps tuple getitem/setitem on
-                // the same path (the old setter only handled Python ints).
-                if (tensor_index.dim() == 0) return true;
-                ++advanced_count;
-            }
-        }
-    }
-    return advanced_count > 1;
-}
-
-static bool tuple_contains_advanced_index(py::tuple indices) {
-    for (size_t i = 0; i < indices.size(); ++i) {
-        py::handle index = indices[i];
-        if (py::isinstance<py::list>(index)) return true;
-        if (!py::isinstance<Tensor>(index)) continue;
-        Tensor tensor_index = py::cast<Tensor>(index);
-        if (is_boolean_mask_dtype(tensor_index.dtype())) {
-            if (tensor_index.dim() > 0) return true;
-        } else if (isIntegralType(tensor_index.dtype(), /*includeBool=*/false) &&
-                   tensor_index.dim() > 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-struct BatchedTupleIndex final {
+// Python indexing splits an index into basic parts (ints, slices, None,
+// Ellipsis, bools), applied as views on ``base``, and advanced parts
+// (tensors and sequences), gathered by the index operators afterwards.
+// One entry of ``indices`` per remaining dimension of ``base``; nullopt
+// marks a dimension taken whole.
+struct AdvancedTupleIndex final {
     Tensor base;
     std::vector<std::optional<Tensor>> indices;
     bool has_advanced = false;
 };
 
-static bool tuple_has_batched_tensor(py::tuple indices) {
-    for (size_t i = 0; i < indices.size(); ++i) {
-        if (py::isinstance<Tensor>(indices[i]) &&
-            py::cast<Tensor>(indices[i]).is_batched()) {
-            return true;
-        }
-    }
-    return false;
-}
 
-static BatchedTupleIndex make_batched_tuple_index(
+static AdvancedTupleIndex make_advanced_tuple_index(
     const Tensor& self, py::tuple indices) {
     int64_t consumed = 0;
     int64_t ellipsis_position = -1;
@@ -1162,7 +700,7 @@ static BatchedTupleIndex make_batched_tuple_index(
         TP_THROW(IndexError, "too many indices for tensor");
     }
 
-    BatchedTupleIndex result{self, {}, false};
+    AdvancedTupleIndex result{self, {}, false};
     const int64_t ellipsis_fill = self.dim() - consumed;
     int64_t input_dim = 0;
     auto append_tensor_index = [&](Tensor index) {
@@ -1201,22 +739,23 @@ static BatchedTupleIndex make_batched_tuple_index(
             append_full_index();
             continue;
         }
-        if (py::isinstance<py::int_>(index)) {
-            append_tensor_index(Tensor::full(
-                {}, Scalar(py::cast<int64_t>(index)), DType::Int64,
-                result.base.device()));
+        if (py::isinstance<py::bool_>(index)) {
+            // A boolean adds a dimension of size 1 and indexes it with an
+            // advanced index: true keeps the element, false selects nothing.
+            result.base = tensorplay::tpx::ops::unsqueeze(
+                result.base, input_dim);
+            Tensor bool_index = py::cast<bool>(index)
+                ? Tensor::zeros({1}, DType::Int64, result.base.device())
+                : Tensor::empty({0}, DType::Int64, result.base.device());
+            append_tensor_index(std::move(bool_index));
             ++input_dim;
             continue;
         }
-        if (py::isinstance<py::bool_>(index)) {
-            const bool value = py::cast<bool>(index);
-            result.base = tensorplay::tpx::ops::unsqueeze(
-                result.base, input_dim);
-            if (!value) {
-                result.base = tensorplay::tpx::ops::slice(
-                    result.base, input_dim, 0, 0, 1);
-            }
-            append_full_index();
+        if (py::isinstance<py::int_>(index)) {
+            // Integers select and drop their dimension; they do not take
+            // part in advanced-index broadcasting.
+            result.base = tensorplay::tpx::ops::select(
+                result.base, input_dim, py::cast<int64_t>(index));
             continue;
         }
         if (py::isinstance<py::list>(index)) {
@@ -1237,6 +776,23 @@ static BatchedTupleIndex make_batched_tuple_index(
                     TypeError,
                     "tensors used as indices must be long, int, short, byte or bool tensors");
             }
+            if (tensor_index.dim() == 0 && !tensor_index.is_batched()) {
+                if (is_boolean_mask_dtype(tensor_index.dtype())) {
+                    const bool value = tensor_index.dtype() == DType::Bool
+                        ? tensor_index.item<bool>()
+                        : tensor_index.item<uint8_t>() != 0;
+                    result.base = tensorplay::tpx::ops::unsqueeze(
+                        result.base, input_dim);
+                    append_tensor_index(value
+                        ? Tensor::zeros({1}, DType::Int64, result.base.device())
+                        : Tensor::empty({0}, DType::Int64, result.base.device()));
+                    ++input_dim;
+                } else {
+                    result.base = tensorplay::tpx::ops::select(
+                        result.base, input_dim, tensor_index.item<int64_t>());
+                }
+                continue;
+            }
             const int64_t consumed_dims =
                 is_boolean_mask_dtype(tensor_index.dtype())
                 ? tensor_index.dim() : 1;
@@ -1249,168 +805,17 @@ static BatchedTupleIndex make_batched_tuple_index(
     return result;
 }
 
-struct NativeIndexPlan {
-    std::vector<int64_t> output_shape;
-    std::vector<int64_t> linear_indices;
-};
-
-static NativeIndexPlan build_native_index_plan(
-    const Tensor& self, const std::vector<NativeIndexComponent>& components) {
-    std::vector<size_t> advanced_positions;
-    std::vector<int64_t> advanced_shape;
-    for (size_t i = 0; i < components.size(); ++i) {
-        if (components[i].kind != NativeIndexKind::Advanced) continue;
-        advanced_positions.push_back(i);
-        if (advanced_shape.empty()) {
-            advanced_shape = components[i].shape;
-        } else {
-            advanced_shape = tensorplay::broadcast_shapes(
-                advanced_shape, components[i].shape);
-        }
+static Tensor finish_advanced_getitem(const Tensor& self,
+                                     AdvancedTupleIndex native) {
+    if (native.has_advanced) {
+        return tensorplay::tpx::ops::index(native.base, native.indices);
     }
-
-    NativeIndexPlan plan;
-    const bool has_advanced = !advanced_positions.empty();
-    const size_t first_advanced = has_advanced ? advanced_positions.front()
-                                               : components.size();
-    const size_t last_advanced = has_advanced ? advanced_positions.back()
-                                              : components.size();
-    const bool advanced_contiguous =
-        !has_advanced || last_advanced - first_advanced + 1 == advanced_positions.size();
-    int64_t advanced_output_start = 0;
-    std::vector<int64_t> component_output_axis(components.size(), -1);
-
-    auto append_basic_shape = [&](size_t component_index) {
-        const auto& component = components[component_index];
-        if (component.kind == NativeIndexKind::NewAxis) {
-            component_output_axis[component_index] =
-                static_cast<int64_t>(plan.output_shape.size());
-            plan.output_shape.push_back(component.length);
-        } else if (component.kind == NativeIndexKind::Slice) {
-            component_output_axis[component_index] =
-                static_cast<int64_t>(plan.output_shape.size());
-            plan.output_shape.push_back(component.length);
-        }
-    };
-
-    if (!has_advanced) {
-        for (size_t i = 0; i < components.size(); ++i) {
-            append_basic_shape(i);
-        }
-    } else if (!advanced_contiguous) {
-        plan.output_shape.insert(plan.output_shape.end(),
-                                 advanced_shape.begin(), advanced_shape.end());
-        for (size_t i = 0; i < components.size(); ++i) {
-            if (components[i].kind != NativeIndexKind::Advanced) {
-                append_basic_shape(i);
-            }
-        }
-    } else {
-        for (size_t i = 0; i < components.size(); ++i) {
-            if (i == first_advanced) {
-                advanced_output_start =
-                    static_cast<int64_t>(plan.output_shape.size());
-                plan.output_shape.insert(plan.output_shape.end(),
-                                         advanced_shape.begin(), advanced_shape.end());
-            }
-            if (components[i].kind != NativeIndexKind::Advanced) {
-                append_basic_shape(i);
-            }
-        }
+    // A pure basic index that left the tensor untouched (e.g. ``x[...]``)
+    // still returns a new view object.
+    if (native.base.unsafeGetTensorImpl() == self.unsafeGetTensorImpl()) {
+        return tensorplay::tpx::ops::alias(self);
     }
-
-    const int64_t output_numel = checked_shape_numel(plan.output_shape);
-    plan.linear_indices.resize(static_cast<size_t>(output_numel));
-    const int64_t advanced_rank = static_cast<int64_t>(advanced_shape.size());
-    auto advanced_value = [&](const NativeIndexComponent& component,
-                              const std::vector<int64_t>& output_coords) {
-        int64_t offset = 0;
-        const int64_t component_rank = static_cast<int64_t>(component.shape.size());
-        for (int64_t d = 0; d < component_rank; ++d) {
-            const int64_t output_dim = advanced_output_start + advanced_rank -
-                                       component_rank + d;
-            const int64_t coordinate =
-                component.shape[static_cast<size_t>(d)] == 1
-                    ? 0
-                    : output_coords[static_cast<size_t>(output_dim)];
-            offset = offset * component.shape[static_cast<size_t>(d)] + coordinate;
-        }
-        return component.values[static_cast<size_t>(offset)];
-    };
-
-    // The planner is used for advanced tuples only.  Decode the output in
-    // row-major order, then map each coordinate back to one source element.
-    // order for both contiguous and non-contiguous advanced groups.
-    for (int64_t linear = 0; linear < output_numel; ++linear) {
-        std::vector<int64_t> output_coords(plan.output_shape.size(), 0);
-        int64_t remainder = linear;
-        for (int64_t d = static_cast<int64_t>(plan.output_shape.size()) - 1;
-             d >= 0; --d) {
-            const int64_t size = plan.output_shape[static_cast<size_t>(d)];
-            output_coords[static_cast<size_t>(d)] = size == 0 ? 0 : remainder % size;
-            if (size != 0) remainder /= size;
-        }
-
-        int64_t source_linear = 0;
-        for (const auto& component : components) {
-            if (component.kind == NativeIndexKind::NewAxis) continue;
-            int64_t coordinate = 0;
-            if (component.kind == NativeIndexKind::Integer) {
-                coordinate = component.integer;
-            } else if (component.kind == NativeIndexKind::Slice) {
-                // Find the output dimension assigned to this basic component.
-                // NewAxis and integer components do not consume an output slot.
-                // component_output_axis was filled in the same order as the
-                // output shape above.
-                const size_t component_index = static_cast<size_t>(
-                    &component - components.data());
-                const int64_t output_dim = component_output_axis[component_index];
-                coordinate = component.start + component.step *
-                    output_coords[static_cast<size_t>(output_dim)];
-            } else {
-                coordinate = advanced_value(component, output_coords);
-            }
-            source_linear = source_linear * self.size(component.input_dim) + coordinate;
-        }
-        plan.linear_indices[static_cast<size_t>(linear)] = source_linear;
-    }
-    return plan;
-}
-
-static Tensor apply_native_index_plan(const Tensor& self,
-                                      const NativeIndexPlan& plan) {
-    Tensor index = Tensor::tensor(plan.linear_indices, DType::Int64);
-    if (!self.device().is_cpu()) index = index.to(self.device());
-    Tensor flat = self.reshape({self.numel()});
-    Tensor selected = tensorplay::tpx::ops::index_select(flat, 0, index);
-    return tensorplay::tpx::ops::reshape(selected, plan.output_shape);
-}
-
-static void assign_native_index_plan(Tensor& self, const NativeIndexPlan& plan,
-                                     py::object value) {
-    Tensor rhs = prepare_setitem_value(self, std::move(value), plan.output_shape);
-    rhs = rhs.reshape({static_cast<int64_t>(plan.linear_indices.size())})
-              .contiguous()
-              .clone();
-    if (plan.linear_indices.empty()) return;
-
-    Tensor index = Tensor::tensor(plan.linear_indices, DType::Int64);
-    if (!self.device().is_cpu()) index = index.to(self.device());
-    // The planner's offsets address the flattened logical destination.
-    // A non-contiguous destination is copied back through its original strides.
-    Tensor target = self.is_contiguous() ? self : self.contiguous();
-    Tensor flat_target = target.view({-1});
-    tensorplay::tpx::ops::index_put_(
-        flat_target, std::vector<Tensor>{index}, rhs, false);
-    if (!self.is_contiguous()) {
-        tensorplay::tpx::ops::copy_(self, target);
-    }
-}
-
-static Tensor apply_python_bool_scalar_index(const Tensor& self, bool value) {
-    Tensor with_index_dim = tensorplay::tpx::ops::unsqueeze(self, 0);
-    if (value) return with_index_dim;
-    return tensorplay::tpx::ops::slice(with_index_dim, 0, 0, 0, 1);
+    return native.base;
 }
 
 static std::pair<Tensor, py::dict> setstate_helper(py::tuple state) {
@@ -3026,120 +2431,21 @@ void init_tensor(py::module_& m) {
         })
 
         .def("__getitem__", [](const Tensor& self, py::object index) -> Tensor {
-            if (py::isinstance<Tensor>(index)) {
-                Tensor idx = py::cast<Tensor>(index);
-                if (self.is_batched() || idx.is_batched()) {
-                    return tensorplay::tpx::ops::index(
-                        self, std::vector<std::optional<Tensor>>{idx});
-                }
-                if (is_boolean_mask_dtype(idx.dtype())) {
-                    if (idx.dim() == 0) {
-                        return apply_python_bool_scalar_index(self, idx.item<bool>());
-                    }
-                    std::vector<NativeIndexComponent> components =
-                        make_bool_tensor_components(self, 0, idx);
-                    for (int64_t dim = idx.dim(); dim < self.dim(); ++dim) {
-                        components.push_back(make_full_index_component(self, dim));
-                    }
-                    return apply_native_index_plan(
-                        self, build_native_index_plan(self, components));
-                }
-                if (isIntegralType(idx.dtype(), /*includeBool=*/false)) {
-                    return apply_prepared_index(
-                        self, 0, prepare_integer_index(self, 0, idx,
-                                                       /*stage_host_values=*/false));
-                }
-                TP_THROW(TypeError,
-                         "tensors used as indices must be long, int, short, byte or bool tensors");
-            } else if (py::isinstance<py::list>(index)) {
-                PreparedTensorIndex prepared =
-                    is_python_bool_vector(index)
-                        ? prepare_python_bool_index(self, 0, index)
-                        : prepare_python_integer_index(self, 0, index);
-                return apply_prepared_index(self, 0, prepared);
+            // Tensor and sequence indices are advanced indices: basic parts
+            // (ints, slices, None, bools) apply as views first, then the
+            // remaining tensors go through the index operator.
+            if (py::isinstance<Tensor>(index) || py::isinstance<py::list>(index)) {
+                return finish_advanced_getitem(
+                    self, make_advanced_tuple_index(self, py::make_tuple(index)));
             }
 
             if (py::isinstance<py::tuple>(index)) {
-                 py::tuple indices = py::cast<py::tuple>(index);
-                 if ((self.is_batched() || tuple_has_batched_tensor(indices)) &&
-                     tuple_contains_advanced_index(indices)) {
-                     BatchedTupleIndex native =
-                         make_batched_tuple_index(self, indices);
-                     if (native.has_advanced) {
-                         return tensorplay::tpx::ops::index(
-                             native.base, native.indices);
-                     }
-                 }
-                 if (tuple_needs_native_index_plan(indices)) {
-                     const auto components = expand_native_index_tuple(self, indices);
-                     return apply_native_index_plan(
-                         self, build_native_index_plan(self, components));
-                 }
-                 Tensor result = self;
-                 bool ellipsis_seen = false;
-                 int64_t target_dim = 0;
-                 for (size_t i = 0; i < indices.size(); ++i) {
-                     py::object idx = indices[i];
-                     if (py::isinstance<py::int_>(idx)) {
-                         int64_t val = py::cast<int64_t>(idx);
-                         // Route indexing through the autograd-aware wrapper;
-                         // calling the raw Tensor view would sever gradients
-                         // for common RoPE/decoder slicing patterns.
-                         result = tensorplay::tpx::ops::select(result, target_dim, val);
-                     } else if (py::isinstance<py::slice>(idx)) {
-                         py::slice s = py::cast<py::slice>(idx);
-                         auto [start, stop, step, slicelength] = compute_slice(s, result.size(target_dim));
-                         result = tensorplay::tpx::ops::slice(result, target_dim, start, stop, step);
-                         target_dim++;
-                     } else if (py::isinstance<py::list>(idx)) {
-                         PreparedTensorIndex prepared =
-                             is_python_bool_vector(idx)
-                                 ? prepare_python_bool_index(result, target_dim, idx)
-                                 : prepare_python_integer_index(result, target_dim, idx);
-                         result = apply_prepared_index(result, target_dim, prepared);
-                         if (!prepared.scalar) {
-                             target_dim += static_cast<int64_t>(prepared.shape.size());
-                         }
-                     } else if (py::isinstance<Tensor>(idx)) {
-                         Tensor tensor_index = py::cast<Tensor>(idx);
-                         PreparedTensorIndex prepared;
-                         if (is_boolean_mask_dtype(tensor_index.dtype())) {
-                             prepared = prepare_bool_tensor_index(result, target_dim,
-                                                                   tensor_index);
-                        } else if (isIntegralType(tensor_index.dtype(),
-                                                  /*includeBool=*/false)) {
-                            prepared = prepare_integer_index(result, target_dim,
-                                                             tensor_index,
-                                                             /*stage_host_values=*/false);
-                        } else {
-                             TP_THROW(TypeError,
-                                      "tensors used as indices must be long, int, short, byte or bool tensors");
-                         }
-                         result = apply_prepared_index(result, target_dim, prepared);
-                         if (!prepared.scalar) {
-                             target_dim += static_cast<int64_t>(prepared.shape.size());
-                         }
-                      } else if (idx.ptr() == Py_Ellipsis) {
-                         // every dimension not covered by the other indices.
-                         if (ellipsis_seen) {
-                             TP_THROW(IndexError, "an index can only have a single ellipsis");
-                         }
-                         ellipsis_seen = true;
-                         const int64_t remaining =
-                             static_cast<int64_t>(indices.size() - i - 1);
-                         const int64_t absorbed = result.dim() - target_dim - remaining;
-                         if (absorbed < 0) {
-                             TP_THROW(IndexError, "too many indices for tensor");
-                         }
-                         target_dim += absorbed;
-                      } else {
-                         TP_THROW(TypeError, "Unsupported index type in tuple");
-                     }
-                 }
-                 return result;
-            } else if (py::isinstance<py::bool_>(index)) {
-                return apply_python_bool_scalar_index(
-                    self, py::cast<bool>(index));
+                return finish_advanced_getitem(
+                    self, make_advanced_tuple_index(self, py::cast<py::tuple>(index)));
+            } else if (py::isinstance<py::bool_>(index) || index.is_none() ||
+                       index.ptr() == Py_Ellipsis) {
+                return finish_advanced_getitem(
+                    self, make_advanced_tuple_index(self, py::make_tuple(index)));
             } else if (py::isinstance<py::int_>(index)) {
                 return tensorplay::tpx::ops::select(self, 0, py::cast<int64_t>(index));
             } else if (py::isinstance<py::slice>(index)) {
@@ -3150,124 +2456,32 @@ void init_tensor(py::module_& m) {
             TP_THROW(TypeError, "Unsupported index type");
         })
         .def("__setitem__", [](Tensor& self, py::object index, py::object value) {
-            Tensor target;
-            if (py::isinstance<py::tuple>(index)) {
-                 py::tuple indices = py::cast<py::tuple>(index);
-                 if ((self.is_batched() || tuple_has_batched_tensor(indices)) &&
-                     tuple_contains_advanced_index(indices)) {
-                     BatchedTupleIndex native =
-                         make_batched_tuple_index(self, indices);
-                     if (native.has_advanced) {
-                         Tensor rhs = prepare_setitem_value(
-                             self, std::move(value));
-                         std::vector<Tensor> native_indices;
-                         native_indices.reserve(native.indices.size());
-                         for (const auto& maybe_index : native.indices) {
-                             native_indices.emplace_back(
-                                 maybe_index.has_value()
-                                     ? *maybe_index : Tensor());
-                         }
-                         tensorplay::tpx::ops::index_put_(
-                             native.base, native_indices, rhs, false);
-                         return;
-                     }
-                 }
-                 if (tuple_contains_advanced_index(indices) ||
-                     tuple_needs_native_index_plan(indices)) {
-                     const auto components = expand_native_index_tuple(self, indices);
-                     assign_native_index_plan(
-                         self, build_native_index_plan(self, components),
-                         std::move(value));
-                     return;
-                 }
-                 target = self;
-                 int64_t target_dim = 0;
-                 for (size_t i = 0; i < indices.size(); ++i) {
-                     py::object idx = indices[i];
-                     if (py::isinstance<py::int_>(idx)) {
-                         int64_t val = py::cast<int64_t>(idx);
-                         target = target.select(target_dim, val);
-                     } else if (py::isinstance<py::slice>(idx)) {
-                          py::slice s = py::cast<py::slice>(idx);
-                          auto [start, stop, step, slicelength] = compute_slice(s, target.size(target_dim));
-                          target = target.slice(target_dim, start, stop, step);
-                          target_dim++;
-                      } else if (idx.ptr() == Py_Ellipsis) {
-                          int64_t absorbed = static_cast<int64_t>(self.dim())
-                                             - static_cast<int64_t>(indices.size()) + 1;
-                          if (absorbed > 0) target_dim += absorbed;
-                      } else {
-                          TP_THROW(TypeError, "Unsupported index type in tuple");
-                      }
-                  }
-            } else if (index.ptr() == Py_Ellipsis) {
-                target = self;
-            } else if (py::isinstance<py::list>(index) ||
-                       py::isinstance<Tensor>(index)) {
-                PreparedTensorIndex prepared;
-                if (py::isinstance<Tensor>(index)) {
-                    Tensor tensor_index = py::cast<Tensor>(index);
-                    if (self.is_batched() || tensor_index.is_batched()) {
-                        Tensor rhs = prepare_setitem_value(
-                            self, std::move(value));
-                        tensorplay::tpx::ops::index_put_(
-                            self, std::vector<Tensor>{tensor_index}, rhs,
-                            false);
-                        return;
-                    }
-                    if (is_boolean_mask_dtype(tensor_index.dtype())) {
-                        if (tensor_index.dim() == 0) {
-                            if (!tensor_index.item<bool>()) return;
-                            Tensor rhs = prepare_setitem_value(
-                                self, std::move(value),
-                                static_cast<std::vector<int64_t>>(self.shape()));
-                            tensorplay::tpx::ops::copy_(self, rhs);
-                            return;
-                        }
-                        std::vector<NativeIndexComponent> components =
-                            make_bool_tensor_components(self, 0, tensor_index);
-                        for (int64_t dim = tensor_index.dim(); dim < self.dim(); ++dim) {
-                            components.push_back(make_full_index_component(self, dim));
-                        }
-                        assign_native_index_plan(
-                            self, build_native_index_plan(self, components),
-                            std::move(value));
-                        return;
-                    }
-                    prepared = prepare_integer_index(self, 0, tensor_index,
-                                                     /*stage_host_values=*/false);
-                } else {
-                    prepared = is_python_bool_vector(index)
-                                   ? prepare_python_bool_index(self, 0, index)
-                                   : prepare_python_integer_index(self, 0, index);
-                }
-                if (prepared.scalar) {
-                    target = self.select(0, prepared.values.at(0));
-                } else {
-                    assign_prepared_index_dim0(self, prepared, std::move(value));
-                    return;
-                }
-            } else if (py::isinstance<py::bool_>(index)) {
-                if (!py::cast<bool>(index)) return;
-                Tensor rhs = prepare_setitem_value(
-                    self, std::move(value),
-                    static_cast<std::vector<int64_t>>(self.shape()));
-                tensorplay::tpx::ops::copy_(self, rhs);
-                return;
-            } else if (py::isinstance<py::int_>(index)) {
-                target = tensorplay::tpx::ops::select(self, 0, py::cast<int64_t>(index));
-            } else if (py::isinstance<py::slice>(index)) {
-                py::slice s = py::cast<py::slice>(index);
-                auto [start, stop, step, slicelength] = compute_slice(s, self.size(0));
-                target = tensorplay::tpx::ops::slice(self, 0, start, stop, step);
-            } else {
-                TP_THROW(TypeError, "Unsupported index type");
+            if (self.is_sparse() || self.is_sparse_csr()) {
+                TP_THROW(TypeError, "Cannot assign to a sparse tensor");
             }
-
-            Tensor rhs = prepare_setitem_value(
-                self, std::move(value),
-                static_cast<std::vector<int64_t>>(target.shape()));
-            tensorplay::tpx::ops::copy_(target, rhs);
+            Tensor rhs = setitem_value_to_tensor(self, std::move(value));
+            if (py::isinstance<py::bool_>(index) && !py::cast<bool>(index)) {
+                // A false index selects nothing; the value only has to
+                // be convertible.
+                return;
+            }
+            const py::tuple indices = py::isinstance<py::tuple>(index)
+                ? py::cast<py::tuple>(index) : py::make_tuple(index);
+            AdvancedTupleIndex native = make_advanced_tuple_index(self, indices);
+            if (!native.has_advanced) {
+                tensorplay::indexing::copy_to(native.base, rhs);
+                return;
+            }
+            const auto value_sizes = static_cast<std::vector<int64_t>>(rhs.shape());
+            const auto sliced_sizes = tensorplay::indexing::slicePrefix1sSize(value_sizes);
+            if (sliced_sizes != value_sizes) {
+                rhs = tensorplay::tpx::ops::view(rhs, sliced_sizes);
+            }
+            if (rhs.device() != native.base.device()) {
+                rhs = rhs.to(native.base.device());
+            }
+            tensorplay::tpx::ops::index_put_(
+                native.base, native.indices, rhs, false);
         })
         
         // Operators

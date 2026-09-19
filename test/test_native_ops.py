@@ -125,20 +125,21 @@ class TestRreluWithNoise(unittest.TestCase):
                             np.all(ratios[neg] <= 0.4 + 1e-5),
                             f"rrelu training grad ratios out of range ({dev})")
 
-    def test_native_op_with_given_noise(self):
+    def test_native_op_records_drawn_noise(self):
         for dev in _devices():
             torch.manual_seed(5)
             x_t = torch.randn(5, 9)
-            noise_t = torch.rand(5, 9) * 0.3 + 0.1
-            # With a pre-filled noise tensor the math is x <= 0 ? x*r : x
-            x_np = x_t.detach().numpy()
-            r_np = noise_t.numpy()
-            expected = np.where(x_np <= 0, x_np * r_np, x_np)
-
             x = _tp_tensor(x_t, dev)
-            out = tp.functional.rrelu_with_noise(
-                x, tp.tensor(r_np, device=dev), 0.125, 1.0 / 3, True)
-            np.testing.assert_allclose(_np(out), expected, rtol=1e-5, atol=1e-6)
+            noise = tp.full((5, 9), -7.0, device=dev)
+            # Training draws slopes into noise: U(lower, upper) where x <= 0,
+            # 1 elsewhere; the output is x * noise.
+            out = tp.functional.rrelu_with_noise(x, noise, 0.125, 1.0 / 3, True)
+            x_np = x_t.detach().numpy()
+            r_np = _np(noise)
+            neg = x_np <= 0
+            self.assertTrue(np.all(r_np[~neg] == 1.0))
+            self.assertTrue(np.all((r_np[neg] >= 0.125) & (r_np[neg] <= 1.0 / 3)))
+            np.testing.assert_allclose(_np(out), x_np * r_np, rtol=1e-5, atol=1e-6)
 
 
 class TestNllLoss2d(unittest.TestCase):

@@ -733,7 +733,27 @@ Tensor max_pool2d_cuda(const Tensor& input, const std::vector<int64_t>& kernel_s
 #endif
 }
 
-Tensor avg_pool2d_cuda(const Tensor& input, const std::vector<int64_t>& kernel_size_arg, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, bool ceil_mode, bool count_include_pad) {
+Tensor avg_pool2d_native_cuda(const Tensor& input,
+                              const std::vector<int64_t>& kernel_size_arg,
+                              const std::vector<int64_t>& stride_arg,
+                              const std::vector<int64_t>& padding_arg,
+                              bool ceil_mode, bool count_include_pad,
+                              std::optional<int64_t> divisor_override);
+Tensor avg_pool2d_backward_native_cuda(const Tensor& grad_output,
+                                       const Tensor& input,
+                                       const std::vector<int64_t>& kernel_size_arg,
+                                       const std::vector<int64_t>& stride_arg,
+                                       const std::vector<int64_t>& padding_arg,
+                                       bool ceil_mode, bool count_include_pad,
+                                       std::optional<int64_t> divisor_override);
+
+Tensor avg_pool2d_cuda(const Tensor& input, const std::vector<int64_t>& kernel_size_arg, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, bool ceil_mode, bool count_include_pad, std::optional<int64_t> divisor_override) {
+    // The DNN library divides by the full window; an explicit divisor, and
+    // windows clipped by ceil_mode, go through the native kernel.
+    if (divisor_override.has_value() || (ceil_mode && count_include_pad)) {
+        return avg_pool2d_native_cuda(input, kernel_size_arg, stride_arg, padding_arg,
+                                      ceil_mode, count_include_pad, divisor_override);
+    }
 #ifdef USE_CUDNN
     auto kernel_size = expand_param_if_needed(kernel_size_arg, 2, 0);
     auto stride = stride_arg;
@@ -813,7 +833,12 @@ Tensor max_pool2d_backward_cuda(const Tensor& grad_output, const Tensor& input, 
 #endif
 }
 
-Tensor avg_pool2d_backward_cuda(const Tensor& grad_output, const Tensor& input, const std::vector<int64_t>& kernel_size_arg, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, bool ceil_mode, bool count_include_pad) {
+Tensor avg_pool2d_backward_cuda(const Tensor& grad_output, const Tensor& input, const std::vector<int64_t>& kernel_size_arg, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, bool ceil_mode, bool count_include_pad, std::optional<int64_t> divisor_override) {
+    if (divisor_override.has_value() || (ceil_mode && count_include_pad)) {
+        return avg_pool2d_backward_native_cuda(grad_output, input, kernel_size_arg, stride_arg,
+                                               padding_arg, ceil_mode, count_include_pad,
+                                               divisor_override);
+    }
 #ifdef USE_CUDNN
     auto kernel_size = expand_param_if_needed(kernel_size_arg, 2, 0);
     auto stride = stride_arg;
@@ -826,7 +851,7 @@ Tensor avg_pool2d_backward_cuda(const Tensor& grad_output, const Tensor& input, 
     TensorDesc dy_desc; dy_desc.set(grad_output);
     
     // Recompute output as required by cudnnPoolingBackward
-    Tensor output = avg_pool2d_cuda(input, kernel_size_arg, stride_arg, padding_arg, ceil_mode, count_include_pad);
+    Tensor output = avg_pool2d_cuda(input, kernel_size_arg, stride_arg, padding_arg, ceil_mode, count_include_pad, std::nullopt);
     TensorDesc y_desc; y_desc.set(output);
     
     PoolingDesc pool_desc;
@@ -940,16 +965,46 @@ __global__ void max_pool_wi_bwd_kernel(
 }
 
 // Average pooling shares the grid-stride structure of the max variants.
-// Padded positions contribute zero to the numerator either way; the divisor
-// is the window size or the count of valid positions depending on
-// count_include_pad.  A window that lands entirely in padding divides by
-// zero, which yields zero here as well.
+// Padded positions contribute zero to the numerator.  The divisor is
+// divisor_override when given; otherwise the window clipped to the padded
+// extent (count_include_pad) or to the input (valid positions only).  A
+// window with no input position writes zero.
+struct AvgPoolWindow {
+    int64_t hstart, hend, wstart, wend, pool_size;
+};
+
+__device__ inline AvgPoolWindow avg_pool_window(
+    int64_t h, int64_t w, int64_t H_in, int64_t W_in, int64_t kH, int64_t kW,
+    int64_t sH, int64_t sW, int64_t pH, int64_t pW) {
+    AvgPoolWindow win;
+    win.hstart = h * sH - pH;
+    win.wstart = w * sW - pW;
+    win.hend = min(win.hstart + kH, H_in + pH);
+    win.wend = min(win.wstart + kW, W_in + pW);
+    win.pool_size = (win.hend - win.hstart) * (win.wend - win.wstart);
+    win.hstart = max(win.hstart, int64_t(0));
+    win.wstart = max(win.wstart, int64_t(0));
+    win.hend = min(win.hend, H_in);
+    win.wend = min(win.wend, W_in);
+    return win;
+}
+
+__device__ inline int64_t avg_pool_divisor(const AvgPoolWindow& win,
+                                           bool count_include_pad,
+                                           bool use_divisor,
+                                           int64_t divisor_override) {
+    if (use_divisor) return divisor_override;
+    return count_include_pad
+        ? win.pool_size
+        : (win.hend - win.hstart) * (win.wend - win.wstart);
+}
+
 template <typename T, typename M>
 __global__ void avg_pool2d_fwd_kernel(
     int64_t total, int64_t H_in, int64_t W_in, int64_t H_out, int64_t W_out,
     int64_t kH, int64_t kW, int64_t sH, int64_t sW, int64_t pH, int64_t pW,
-    bool count_include_pad, const T* __restrict__ input,
-    T* __restrict__ output) {
+    bool count_include_pad, bool use_divisor, int64_t divisor_override,
+    const T* __restrict__ input, T* __restrict__ output) {
     int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
     const int64_t stride = (int64_t)blockDim.x * gridDim.x;
     const int64_t out_spatial = H_out * W_out;
@@ -958,21 +1013,21 @@ __global__ void avg_pool2d_fwd_kernel(
         const int64_t h = (i / W_out) % H_out;
         const int64_t nc = i / out_spatial;
         const T* plane = input + nc * H_in * W_in;
+        const AvgPoolWindow win =
+            avg_pool_window(h, w, H_in, W_in, kH, kW, sH, sW, pH, pW);
+        if (win.hstart >= win.hend || win.wstart >= win.wend) {
+            output[i] = T(0);
+            continue;
+        }
         M acc = M(0);
-        int64_t cnt = 0;
-        for (int64_t kh = 0; kh < kH; ++kh) {
-            const int64_t hi = h * sH - pH + kh;
-            if (hi < 0 || hi >= H_in) continue;
-            for (int64_t kw = 0; kw < kW; ++kw) {
-                const int64_t wi = w * sW - pW + kw;
-                if (wi < 0 || wi >= W_in) continue;
+        for (int64_t hi = win.hstart; hi < win.hend; ++hi) {
+            for (int64_t wi = win.wstart; wi < win.wend; ++wi) {
                 acc += static_cast<M>(plane[hi * W_in + wi]);
-                ++cnt;
             }
         }
-        const M divisor = count_include_pad ? static_cast<M>(kH * kW)
-                                            : static_cast<M>(cnt);
-        output[i] = divisor > M(0) ? static_cast<T>(acc / divisor) : T(0);
+        const M divisor = static_cast<M>(avg_pool_divisor(
+            win, count_include_pad, use_divisor, divisor_override));
+        output[i] = static_cast<T>(acc / divisor);
     }
 }
 
@@ -980,8 +1035,8 @@ template <typename T, typename M>
 __global__ void avg_pool2d_bwd_kernel(
     int64_t total, int64_t H_in, int64_t W_in, int64_t H_out, int64_t W_out,
     int64_t kH, int64_t kW, int64_t sH, int64_t sW, int64_t pH, int64_t pW,
-    bool count_include_pad, const T* __restrict__ grad_output,
-    T* __restrict__ grad_input) {
+    bool count_include_pad, bool use_divisor, int64_t divisor_override,
+    const T* __restrict__ grad_output, T* __restrict__ grad_input) {
     int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
     const int64_t stride = (int64_t)blockDim.x * gridDim.x;
     const int64_t out_spatial = H_out * W_out;
@@ -990,27 +1045,15 @@ __global__ void avg_pool2d_bwd_kernel(
         const int64_t w = i % W_out;
         const int64_t h = (i / W_out) % H_out;
         const int64_t nc = i / out_spatial;
-        int64_t cnt = 0;
-        for (int64_t kh = 0; kh < kH; ++kh) {
-            const int64_t hi = h * sH - pH + kh;
-            if (hi < 0 || hi >= H_in) continue;
-            for (int64_t kw = 0; kw < kW; ++kw) {
-                const int64_t wi = w * sW - pW + kw;
-                if (wi < 0 || wi >= W_in) continue;
-                ++cnt;
-            }
-        }
-        const M divisor = count_include_pad ? static_cast<M>(kH * kW)
-                                            : static_cast<M>(cnt);
-        if (divisor <= M(0)) continue;
+        const AvgPoolWindow win =
+            avg_pool_window(h, w, H_in, W_in, kH, kW, sH, sW, pH, pW);
+        if (win.hstart >= win.hend || win.wstart >= win.wend) continue;
+        const M divisor = static_cast<M>(avg_pool_divisor(
+            win, count_include_pad, use_divisor, divisor_override));
         const M g = static_cast<M>(grad_output[i]) / divisor;
         T* plane = grad_input + nc * in_plane;
-        for (int64_t kh = 0; kh < kH; ++kh) {
-            const int64_t hi = h * sH - pH + kh;
-            if (hi < 0 || hi >= H_in) continue;
-            for (int64_t kw = 0; kw < kW; ++kw) {
-                const int64_t wi = w * sW - pW + kw;
-                if (wi < 0 || wi >= W_in) continue;
+        for (int64_t hi = win.hstart; hi < win.hend; ++hi) {
+            for (int64_t wi = win.wstart; wi < win.wend; ++wi) {
                 gpuAtomicAdd(plane + hi * W_in + wi, static_cast<T>(g));
             }
         }
@@ -1566,8 +1609,18 @@ Tensor avg_pool2d_native_cuda(const Tensor& input,
                               const std::vector<int64_t>& kernel_size_arg,
                               const std::vector<int64_t>& stride_arg,
                               const std::vector<int64_t>& padding_arg,
-                              bool ceil_mode, bool count_include_pad) {
-    if (input.dim() != 4) TP_THROW(RuntimeError, "avg_pool2d: Expected 4D input");
+                              bool ceil_mode, bool count_include_pad,
+                              std::optional<int64_t> divisor_override) {
+    if (input.dim() == 3) {  // unbatched (C, H, W)
+        return avg_pool2d_native_cuda(input.unsqueeze(0), kernel_size_arg, stride_arg,
+                                      padding_arg, ceil_mode, count_include_pad,
+                                      divisor_override).squeeze(0);
+    }
+    if (input.dim() != 4) TP_THROW(RuntimeError, "avg_pool2d: Expected 3D or 4D input");
+    if (divisor_override.has_value() && *divisor_override == 0)
+        TP_THROW(RuntimeError, "divisor must be not zero");
+    const bool use_divisor = divisor_override.has_value();
+    const int64_t divisor_value = divisor_override.value_or(0);
     const Tensor input_c = input.contiguous();
     const int64_t N = input_c.size(0), C = input_c.size(1);
     const int64_t H_in = input_c.size(2), W_in = input_c.size(3);
@@ -1593,20 +1646,20 @@ Tensor avg_pool2d_native_cuda(const Tensor& input,
         POOL_CUDA_DISPATCH(float, Float32,
             avg_pool2d_fwd_kernel<float, M><<<blocks, threads, 0, stream>>>(
                 total, H_in, W_in, H_out, W_out, kH, kW, sH, sW, pH, pW,
-                count_include_pad, input_c.data_ptr<float>(), out.data_ptr<float>()))
+                count_include_pad, use_divisor, divisor_value, input_c.data_ptr<float>(), out.data_ptr<float>()))
         POOL_CUDA_DISPATCH(double, Float64,
             avg_pool2d_fwd_kernel<double, M><<<blocks, threads, 0, stream>>>(
                 total, H_in, W_in, H_out, W_out, kH, kW, sH, sW, pH, pW,
-                count_include_pad, input_c.data_ptr<double>(), out.data_ptr<double>()))
+                count_include_pad, use_divisor, divisor_value, input_c.data_ptr<double>(), out.data_ptr<double>()))
         POOL_CUDA_DISPATCH(tensorplay::Half, Float16,
             (avg_pool2d_fwd_kernel<tensorplay::Half, M><<<blocks, threads, 0, stream>>>(
                 total, H_in, W_in, H_out, W_out, kH, kW, sH, sW, pH, pW,
-                count_include_pad, input_c.data_ptr<tensorplay::Half>(),
+                count_include_pad, use_divisor, divisor_value, input_c.data_ptr<tensorplay::Half>(),
                 out.data_ptr<tensorplay::Half>())))
         POOL_CUDA_DISPATCH(tensorplay::BFloat16, BFloat16,
             (avg_pool2d_fwd_kernel<tensorplay::BFloat16, M><<<blocks, threads, 0, stream>>>(
                 total, H_in, W_in, H_out, W_out, kH, kW, sH, sW, pH, pW,
-                count_include_pad, input_c.data_ptr<tensorplay::BFloat16>(),
+                count_include_pad, use_divisor, divisor_value, input_c.data_ptr<tensorplay::BFloat16>(),
                 out.data_ptr<tensorplay::BFloat16>())))
         default:
             TP_THROW(NotImplementedError,
@@ -1620,9 +1673,19 @@ Tensor avg_pool2d_backward_native_cuda(const Tensor& grad_output,
                                        const std::vector<int64_t>& kernel_size_arg,
                                        const std::vector<int64_t>& stride_arg,
                                        const std::vector<int64_t>& padding_arg,
-                                       bool ceil_mode, bool count_include_pad) {
+                                       bool ceil_mode, bool count_include_pad,
+                                       std::optional<int64_t> divisor_override) {
+    if (input.dim() == 3) {  // unbatched (C, H, W)
+        return avg_pool2d_backward_native_cuda(
+            grad_output.unsqueeze(0), input.unsqueeze(0), kernel_size_arg, stride_arg,
+            padding_arg, ceil_mode, count_include_pad, divisor_override).squeeze(0);
+    }
     if (input.dim() != 4)
-        TP_THROW(RuntimeError, "avg_pool2d_backward: Expected 4D input");
+        TP_THROW(RuntimeError, "avg_pool2d_backward: Expected 3D or 4D input");
+    if (divisor_override.has_value() && *divisor_override == 0)
+        TP_THROW(RuntimeError, "divisor must be not zero");
+    const bool use_divisor = divisor_override.has_value();
+    const int64_t divisor_value = divisor_override.value_or(0);
     const Tensor input_c = input.contiguous();
     const Tensor go = grad_output.contiguous();
     const int64_t N = input_c.size(0), C = input_c.size(1);
@@ -1650,20 +1713,20 @@ Tensor avg_pool2d_backward_native_cuda(const Tensor& grad_output,
         POOL_CUDA_DISPATCH(float, Float32,
             avg_pool2d_bwd_kernel<float, M><<<blocks, threads, 0, stream>>>(
                 total, H_in, W_in, H_out, W_out, kH, kW, sH, sW, pH, pW,
-                count_include_pad, go.data_ptr<float>(), grad_input.data_ptr<float>()))
+                count_include_pad, use_divisor, divisor_value, go.data_ptr<float>(), grad_input.data_ptr<float>()))
         POOL_CUDA_DISPATCH(double, Float64,
             avg_pool2d_bwd_kernel<double, M><<<blocks, threads, 0, stream>>>(
                 total, H_in, W_in, H_out, W_out, kH, kW, sH, sW, pH, pW,
-                count_include_pad, go.data_ptr<double>(), grad_input.data_ptr<double>()))
+                count_include_pad, use_divisor, divisor_value, go.data_ptr<double>(), grad_input.data_ptr<double>()))
         POOL_CUDA_DISPATCH(tensorplay::Half, Float16,
             (avg_pool2d_bwd_kernel<tensorplay::Half, M><<<blocks, threads, 0, stream>>>(
                 total, H_in, W_in, H_out, W_out, kH, kW, sH, sW, pH, pW,
-                count_include_pad, go.data_ptr<tensorplay::Half>(),
+                count_include_pad, use_divisor, divisor_value, go.data_ptr<tensorplay::Half>(),
                 grad_input.data_ptr<tensorplay::Half>())))
         POOL_CUDA_DISPATCH(tensorplay::BFloat16, BFloat16,
             (avg_pool2d_bwd_kernel<tensorplay::BFloat16, M><<<blocks, threads, 0, stream>>>(
                 total, H_in, W_in, H_out, W_out, kH, kW, sH, sW, pH, pW,
-                count_include_pad, go.data_ptr<tensorplay::BFloat16>(),
+                count_include_pad, use_divisor, divisor_value, go.data_ptr<tensorplay::BFloat16>(),
                 grad_input.data_ptr<tensorplay::BFloat16>())))
         default:
             TP_THROW(NotImplementedError,
@@ -1696,11 +1759,10 @@ Tensor& interop_avg_pool2d_out_cuda(const Tensor& self, const std::vector<int64_
                                 const std::vector<int64_t>& padding, bool ceil_mode,
                                 bool count_include_pad,
                                 std::optional<int64_t> divisor_override, Tensor& out) {
-        (void)divisor_override;
         return write_pooling_out(
             "avg_pool2d",
             avg_pool2d_native_cuda(self, kernel_size, stride, padding,
-                                   ceil_mode, count_include_pad),
+                                   ceil_mode, count_include_pad, divisor_override),
             out);
     
 }
@@ -1710,12 +1772,11 @@ Tensor& interop_avg_pool2d_backward_grad_input_cuda(const Tensor& grad_output, c
               const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
               bool ceil_mode, bool count_include_pad,
               std::optional<int64_t> divisor_override, Tensor& grad_input) {
-        (void)divisor_override;
         return write_pooling_out(
             "avg_pool2d_backward",
             avg_pool2d_backward_native_cuda(
                 grad_output, input, kernel_size, stride, padding, ceil_mode,
-                count_include_pad),
+                count_include_pad, divisor_override),
             grad_input);
     
 }
@@ -1733,12 +1794,12 @@ Tensor& interop_adaptive_avg_pool2d_backward_grad_input_cuda(const Tensor& grad_
     
 }
 
-Tensor& interop_adaptive_max_pool2d_out_cuda(const Tensor& self, const std::vector<int64_t>& output_size,
+std::tuple<Tensor, Tensor> interop_adaptive_max_pool2d_out_cuda(const Tensor& self, const std::vector<int64_t>& output_size,
               Tensor& out, Tensor& indices) {
         auto result = adaptive_max_pool2d_with_indices_cuda(self, output_size);
         write_pooling_out("adaptive_max_pool2d", std::get<0>(result), out);
         write_pooling_out("adaptive_max_pool2d", std::get<1>(result), indices);
-        return out;
+        return {out, indices};
     
 }
 
@@ -1751,12 +1812,12 @@ Tensor& interop_adaptive_max_pool2d_backward_grad_input_cuda(const Tensor& grad_
     
 }
 
-Tensor& interop_adaptive_max_pool3d_out_cuda(const Tensor& self, const std::vector<int64_t>& output_size,
+std::tuple<Tensor, Tensor> interop_adaptive_max_pool3d_out_cuda(const Tensor& self, const std::vector<int64_t>& output_size,
               Tensor& out, Tensor& indices) {
         auto result = adaptive_max_pool3d_with_indices_cuda(self, output_size);
         write_pooling_out("adaptive_max_pool3d", std::get<0>(result), out);
         write_pooling_out("adaptive_max_pool3d", std::get<1>(result), indices);
-        return out;
+        return {out, indices};
     
 }
 
@@ -1769,7 +1830,7 @@ Tensor& interop_adaptive_max_pool3d_backward_grad_input_cuda(const Tensor& grad_
     
 }
 
-Tensor& interop_max_pool2d_with_indices_out_cuda(const Tensor& self, const std::vector<int64_t>& kernel_size,
+std::tuple<Tensor, Tensor> interop_max_pool2d_with_indices_out_cuda(const Tensor& self, const std::vector<int64_t>& kernel_size,
               const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
               const std::vector<int64_t>& dilation, bool ceil_mode, Tensor& out,
               Tensor& indices) {
@@ -1777,7 +1838,7 @@ Tensor& interop_max_pool2d_with_indices_out_cuda(const Tensor& self, const std::
             self, kernel_size, stride, padding, dilation, ceil_mode);
         write_pooling_out("max_pool2d_with_indices", std::get<0>(result), out);
         write_pooling_out("max_pool2d_with_indices", std::get<1>(result), indices);
-        return out;
+        return {out, indices};
     
 }
 
@@ -1795,7 +1856,7 @@ Tensor& interop_max_pool2d_with_indices_backward_grad_input_cuda(const Tensor& g
     
 }
 
-Tensor& interop_max_pool3d_with_indices_out_cuda(const Tensor& self, const std::vector<int64_t>& kernel_size,
+std::tuple<Tensor, Tensor> interop_max_pool3d_with_indices_out_cuda(const Tensor& self, const std::vector<int64_t>& kernel_size,
               const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
               const std::vector<int64_t>& dilation, bool ceil_mode, Tensor& out,
               Tensor& indices) {
@@ -1803,7 +1864,7 @@ Tensor& interop_max_pool3d_with_indices_out_cuda(const Tensor& self, const std::
             self, kernel_size, stride, padding, dilation, ceil_mode);
         write_pooling_out("max_pool3d_with_indices", std::get<0>(result), out);
         write_pooling_out("max_pool3d_with_indices", std::get<1>(result), indices);
-        return out;
+        return {out, indices};
     
 }
 

@@ -160,7 +160,7 @@ Tensor binary_cross_entropy_with_logits_cuda(const Tensor& self, const Tensor& t
     return mean_from_elems(elems, n, self.dtype(), self.device());
 }
 
-Tensor hinge_embedding_loss_cuda(const Tensor& input, const Tensor& target, Scalar margin) {
+Tensor hinge_embedding_loss_cuda(const Tensor& input, const Tensor& target, const Scalar& margin) {
     auto pr = pair_f64_dev(input, target);
     Tensor elems = Tensor::empty(shape_of(pr.first), DType::Float64, input.device());
     int64_t n = elems.numel();
@@ -181,7 +181,7 @@ Tensor hinge_embedding_loss_cuda(const Tensor& input, const Tensor& target, Scal
 }
 
 Tensor margin_ranking_loss_cuda(const Tensor& input1, const Tensor& input2,
-                                const Tensor& target, Scalar margin) {
+                                const Tensor& target, const Scalar& margin) {
     auto pr = pair_f64_dev(input1, input2);
     Tensor tg = expand_f64_dev(target, shape_of(pr.first));
     Tensor elems = Tensor::empty(shape_of(pr.first), DType::Float64, input1.device());
@@ -247,7 +247,7 @@ Tensor poisson_nll_loss_cuda(const Tensor& input, const Tensor& target, bool log
 }
 
 Tensor cosine_embedding_loss_cuda(const Tensor& x1, const Tensor& x2, const Tensor& target,
-                                  Scalar margin) {
+                                  const Scalar& margin) {
     const std::vector<int64_t> reduce_dims{1};
     Tensor prod_sum = (x1 * x2).sum(reduce_dims);
     Tensor mag_square1 = (x1 * x1).sum(reduce_dims) + Scalar(1e-12);
@@ -263,7 +263,7 @@ Tensor cosine_embedding_loss_cuda(const Tensor& x1, const Tensor& x2, const Tens
 }
 
 Tensor triplet_margin_loss_cuda(const Tensor& anchor, const Tensor& positive,
-                                const Tensor& negative, Scalar margin, double p) {
+                                const Tensor& negative, const Scalar& margin, double p) {
     Tensor dist_pos = ops::pairwise_distance(anchor, positive, p, 1e-6, false);
     Tensor dist_neg = ops::pairwise_distance(anchor, negative, p, 1e-6, false);
     Tensor raw = dist_pos - dist_neg + margin;

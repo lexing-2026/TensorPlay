@@ -7,6 +7,7 @@
 #include "Exception.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include "tensorplay/ops/TensorRedispatchGenerated.h"
+#include "OutWrite.h"
 
 #include <cmath>
 #include <optional>
@@ -66,8 +67,10 @@ Tensor& copysign_tensor_out(const Tensor& self, const Tensor& other, Tensor& out
 
 // ---- clamp/clip with tensor bounds: promote each bound to a tensor and fall
 //      back to the registered Scalar-based clamp when only one side is given.
-Tensor clamp_tensor(const Tensor& self, const std::optional<Tensor>& min,
-                    const std::optional<Tensor>& max) {
+Tensor clamp_tensor(const Tensor& self, const std::optional<Tensor>& min_arg,
+                    const std::optional<Tensor>& max_arg) {
+    std::optional<Tensor> min = min_arg;
+    std::optional<Tensor> max = max_arg;
     // .item() is only legal on 1-element tensors; any other bound shape goes
     // through the elementwise maximum/minimum composition below.
     const auto is_scalar_bound = [](const std::optional<Tensor>& b) {
@@ -113,9 +116,9 @@ Tensor& clip__tensor(Tensor& self, const std::optional<Tensor>& min,
     return clamp__tensor(self, min, max);
 }
 
-Tensor& clip_tensor_out(const Tensor& self, const std::optional<Tensor>& min,
-                        const std::optional<Tensor>& max, Tensor& out) {
-    return clamp_tensor_out(self, min, max, out);
+Tensor& clip_scalar_out(const Tensor& self, const std::optional<Scalar>& min,
+                        const std::optional<Scalar>& max, Tensor& out) {
+    return write_out(out, ops::clamp(self, min, max));
 }
 
 // ---- _conj / _neg_view: view-style wrappers over the physical kernels
@@ -139,10 +142,16 @@ Tensor& _conj_physical__(Tensor& self) {
     return self;
 }
 
-// ---- copy: explicit dtype/device-copy entry shared by Tensor.clone paths
-Tensor copy_impl(const Tensor& self, bool non_blocking) {
-    (void)non_blocking;
-    return self.clone();
+// ---- copy: the functional form of copy_ -- self's metadata, src's values
+Tensor copy_impl(const Tensor& self, const Tensor& src, bool non_blocking) {
+    const auto sizes = static_cast<std::vector<int64_t>>(self.shape());
+    // Without storage there is nothing to clone; copy_ overwrites every
+    // element anyway.
+    Tensor r = self.impl()->storage().nbytes() == 0
+        ? ops::empty_strided(sizes, self.strides(), self.dtype(), self.device())
+        : ops::clone(self, /*Preserve=*/int64_t(1));
+    r.copy_(src, non_blocking);
+    return r;
 }
 
 Tensor _copy_from_impl(const Tensor& src, const Tensor& dst) {
@@ -155,25 +164,21 @@ Tensor _copy_from_and_resize_impl(const Tensor& src, const Tensor& dst) {
              "_copy_from_and_resize is an internal resize-view helper and should not be called directly");
 }
 
-// ---- contiguous: memory-format aware wrappers over the registered kernel
-Tensor contiguous_default(const Tensor& self) {
-    return ops::contiguous(self);
-}
-
+// ---- contiguous: self when already laid out in memory_format, else a copy
 Tensor contiguous_format(const Tensor& self, int64_t memory_format) {
+    if (memory_format == 1) {  // Preserve
+        TP_THROW(RuntimeError,
+                 "preserve memory format is unsupported by the contiguous operator");
+    }
     if (self.is_contiguous(static_cast<MemoryFormat>(memory_format))) {
         return self;
     }
-    if (memory_format == 2) {  // channels_last
-        return ops::contiguous(self);
-    }
-    return ops::contiguous(self);
+    return ops::clone(self, memory_format);
 }
 
 // ---- chalf: reinterpret/cast to the complex half dtype
-Tensor chalf_impl(const Tensor& self, int64_t memory_format) {
-    (void)memory_format;
-    return self.to(DType::ComplexHalf);
+Tensor chalf_impl(const Tensor& self, std::optional<int64_t> memory_format) {
+    return ops::to(self, DType::ComplexHalf, false, false, memory_format);
 }
 
 // ---- _shape_as_tensor: sizes as an int64 tensor
@@ -192,8 +197,7 @@ Tensor _shape_as_tensor_impl(const Tensor& self) {
     return r2;
 }
 
-Tensor _dim_arange_impl(const Tensor& like, int64_t dim, int64_t device_index) {
-    (void)device_index;
+Tensor _dim_arange_impl(const Tensor& like, int64_t dim) {
     return ops::arange(Scalar(like.size(dim)), DType::Int64, like.device());
 }
 
@@ -205,8 +209,30 @@ Tensor _masked_scale_impl(const Tensor& self, const Tensor& mask, double scale) 
 }
 
 // ---- _mkldnn_transpose / _to_sparse bridges route to the registered kernels
-Tensor _to_sparse_impl(const Tensor& self) {
-    return ops::to_sparse(self);
+// Layout codes: 0 COO, 1 CSR, 2 CSC, 3 BSR, 4 BSC.
+Tensor _to_sparse_impl(const Tensor& self, std::optional<int64_t> layout,
+                       const std::optional<std::vector<int64_t>>& blocksize,
+                       std::optional<int64_t> dense_dim) {
+    const int64_t layout_to = layout.value_or(0);
+    if ((layout_to == 3 || layout_to == 4) && !blocksize.has_value()) {
+        TP_THROW(RuntimeError, "_to_sparse: blocksize is required for blocked sparse layouts");
+    }
+    if (layout_to < 3 && blocksize.has_value()) {
+        TP_THROW(RuntimeError, "_to_sparse: blocksize is only supported for blocked sparse layouts");
+    }
+    switch (layout_to) {
+        case 0: return ops::to_sparse(self, self.dim() - dense_dim.value_or(0));
+        case 1:
+            if (dense_dim.value_or(0) != 0) {
+                TP_THROW(NotImplementedError, "_to_sparse: CSR conversion with dense dimensions");
+            }
+            return ops::to_sparse_csr(self);
+        case 2: return ops::to_sparse_csc(self, dense_dim);
+        case 3: return ops::to_sparse_bsr(self, *blocksize, dense_dim);
+        case 4: return ops::to_sparse_bsc(self, *blocksize, dense_dim);
+        default: break;
+    }
+    TP_THROW(RuntimeError, "_to_sparse: conversion to layout ", layout_to, " not supported");
 }
 
 TENSORPLAY_LIBRARY_IMPL(Composite, MiscBridgeComposites) {
@@ -216,14 +242,13 @@ TENSORPLAY_LIBRARY_IMPL(Composite, MiscBridgeComposites) {
     m.impl("clamp_.Tensor", clamp__tensor);
     m.impl("clip.Tensor", clip_tensor);
     m.impl("clip_.Tensor", clip__tensor);
-    m.impl("clip.out", clip_tensor_out);
+    m.impl("clip.out", clip_scalar_out);
     m.impl("_conj", _conj_view);
     m.impl("_neg_view", _neg_view);
     m.impl("_conj_physical", _conj_physical_impl);
     m.impl("_conj_physical_", _conj_physical__);
     m.impl("copy", copy_impl);
-    m.impl("contiguous", contiguous_default);
-    m.impl("contiguous.memory_format", contiguous_format);
+    m.impl("contiguous", contiguous_format);
     m.impl("chalf", chalf_impl);
     m.impl("_shape_as_tensor", _shape_as_tensor_impl);
     m.impl("_dim_arange", _dim_arange_impl);

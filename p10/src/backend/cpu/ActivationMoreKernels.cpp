@@ -38,6 +38,7 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include "OutWrite.h"
 
 namespace tensorplay {
 
@@ -47,7 +48,7 @@ namespace cpu {
 Tensor softmax_kernel(const Tensor& self, int64_t dim, DType dtype);
 Tensor log_softmax_kernel(const Tensor& self, int64_t dim, DType dtype);
 // Leaky ReLU elementwise kernel lives in PointwiseKernels.cpp.
-Tensor leaky_relu_kernel_impl(const Tensor& self, Scalar negative_slope);
+Tensor leaky_relu_kernel_impl(const Tensor& self, const Scalar& negative_slope);
 
 using tensorplay::parallel::GRAIN_SIZE;
 using tensorplay::parallel::parallel_for;
@@ -288,7 +289,7 @@ Tensor _softmax_cpu(const Tensor& self, int64_t dim, bool half_to_float) {
 
 Tensor& _softmax_out_cpu(const Tensor& self, int64_t dim, bool half_to_float,
                          Tensor& out) {
-    out = _softmax_cpu(self, dim, half_to_float);
+    write_out(out, _softmax_cpu(self, dim, half_to_float));
     return out;
 }
 
@@ -302,7 +303,7 @@ Tensor _log_softmax_cpu(const Tensor& self, int64_t dim, bool half_to_float) {
 
 Tensor& _log_softmax_out_cpu(const Tensor& self, int64_t dim, bool half_to_float,
                              Tensor& out) {
-    out = _log_softmax_cpu(self, dim, half_to_float);
+    write_out(out, _log_softmax_cpu(self, dim, half_to_float));
     return out;
 }
 
@@ -321,8 +322,7 @@ Tensor _softmax_backward_data_cpu(const Tensor& grad_output, const Tensor& outpu
 Tensor& _softmax_backward_data_out_cpu(const Tensor& grad_output,
                                        const Tensor& output, int64_t dim,
                                        DType input_dtype, Tensor& grad_input) {
-    grad_input =
-        _softmax_backward_data_cpu(grad_output, output, dim, input_dtype);
+    write_out(grad_input, _softmax_backward_data_cpu(grad_output, output, dim, input_dtype));
     return grad_input;
 }
 
@@ -338,8 +338,7 @@ Tensor _log_softmax_backward_data_cpu(const Tensor& grad_output,
 Tensor& _log_softmax_backward_data_out_cpu(const Tensor& grad_output,
                                            const Tensor& output, int64_t dim,
                                            DType input_dtype, Tensor& grad_input) {
-    grad_input =
-        _log_softmax_backward_data_cpu(grad_output, output, dim, input_dtype);
+    write_out(grad_input, _log_softmax_backward_data_cpu(grad_output, output, dim, input_dtype));
     return grad_input;
 }
 
@@ -483,7 +482,9 @@ std::tuple<Tensor, Tensor> log_sigmoid_forward_cpu(const Tensor& input) {
 std::tuple<Tensor, Tensor> log_sigmoid_forward_out_cpu(const Tensor& input,
                                                        Tensor& result,
                                                        Tensor& buffer) {
-    std::tie(result, buffer) = log_sigmoid_forward_cpu(input);
+    auto computed = log_sigmoid_forward_cpu(input);
+    write_out(result, std::get<0>(computed));
+    write_out(buffer, std::get<1>(computed));
     return {result, buffer};
 }
 
@@ -522,7 +523,7 @@ Tensor& log_sigmoid_backward_out_cpu(const Tensor& grad_output,
                 TP_THROW(TypeError, "log_sigmoid_backward: unsupported dtype");
         }
     }
-    grad_input = result;
+    write_out(grad_input, result);
     return grad_input;
 }
 
@@ -531,18 +532,36 @@ Tensor& log_sigmoid_backward_out_cpu(const Tensor& grad_output,
 // ---------------------------------------------------------------------------
 
 Tensor& rrelu_with_noise_out_cpu(const Tensor& self, Tensor& noise,
-                                 Scalar lower, Scalar upper, bool training,
+                                 const Scalar& lower, const Scalar& upper, bool training,
                                  std::optional<Generator> generator,
                                  Tensor& output) {
     TP_CHECK(self.shape() == noise.shape(),
              "noise tensor shape must match self tensor shape. Got self.shape = ",
              self.shape(), " noise.shape = ", noise.shape());
-    output = rrelu_with_noise_core(self, noise, lower, upper, training, generator);
+    Tensor result =
+        rrelu_with_noise_core(self, noise, lower, upper, training, generator);
+    const auto target = static_cast<std::vector<int64_t>>(result.shape());
+    if (static_cast<std::vector<int64_t>>(output.shape()) != target) {
+        output.resize_(target);
+    }
+    output.copy_(result);
     return output;
 }
 
-Tensor& rrelu_with_noise__cpu(Tensor& self, Tensor& noise, Scalar lower,
-                              Scalar upper, bool training,
+// Functional form: training draws a slope from U(lower, upper) for every
+// non-positive element and records it in noise (1 elsewhere); evaluation
+// applies the midpoint slope.
+Tensor rrelu_with_noise_cpu(const Tensor& self, Tensor& noise, const Scalar& lower,
+                            const Scalar& upper, bool training,
+                            std::optional<Generator> generator) {
+    TP_CHECK(self.shape() == noise.shape(),
+             "noise tensor shape must match self tensor shape. Got self.shape = ",
+             self.shape(), " noise.shape = ", noise.shape());
+    return rrelu_with_noise_core(self, noise, lower, upper, training, generator);
+}
+
+Tensor& rrelu_with_noise__cpu(Tensor& self, Tensor& noise, const Scalar& lower,
+                              const Scalar& upper, bool training,
                               std::optional<Generator> generator) {
     TP_CHECK(self.shape() == noise.shape(),
              "noise tensor shape must match self tensor shape. Got self.shape = ",
@@ -568,6 +587,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ActivationMoreOps) {
     m.impl("log_sigmoid_forward.output", log_sigmoid_forward_out_cpu);
     m.impl("log_sigmoid_backward.grad_input", log_sigmoid_backward_out_cpu);
     m.impl("rrelu_with_noise.out", rrelu_with_noise_out_cpu);
+    m.impl("rrelu_with_noise", rrelu_with_noise_cpu);
     m.impl("rrelu_with_noise_", rrelu_with_noise__cpu);
 }
 

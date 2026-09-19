@@ -244,11 +244,14 @@ void validate_conv_args(
 Tensor conv2d_kernel(
     const Tensor& input_arg,
     const Tensor& weight_arg,
-    std::optional<Tensor> bias,
+    const Tensor& bias_tensor,
     const std::vector<int64_t>& stride,
     const std::vector<int64_t>& padding,
     const std::vector<int64_t>& dilation,
     int64_t groups) {
+  // The dispatcher passes an absent bias as an undefined tensor.
+  const std::optional<Tensor> bias =
+      bias_tensor.defined() ? std::optional<Tensor>(bias_tensor) : std::nullopt;
   validate_conv_input(input_arg);
   validate_conv_args(stride, padding, dilation);
 
@@ -591,12 +594,15 @@ Tensor conv2d_kernel(
 Tensor conv_transpose2d_kernel(
     const Tensor& input_arg,
     const Tensor& weight_arg,
-    std::optional<Tensor> bias,
+    const Tensor& bias_tensor,
     const std::vector<int64_t>& stride,
     const std::vector<int64_t>& padding,
     const std::vector<int64_t>& output_padding,
     int64_t groups,
     const std::vector<int64_t>& dilation) {
+  // The dispatcher passes an absent bias as an undefined tensor.
+  const std::optional<Tensor> bias =
+      bias_tensor.defined() ? std::optional<Tensor>(bias_tensor) : std::nullopt;
   validate_conv_input(input_arg);
   const bool has_bias = bias.has_value() && bias->defined();
 
@@ -753,11 +759,14 @@ Tensor conv_transpose2d_kernel(
 Tensor conv1d_kernel(
     const Tensor& input_arg,
     const Tensor& weight_arg,
-    std::optional<Tensor> bias,
+    const Tensor& bias_tensor,
     const std::vector<int64_t>& stride,
     const std::vector<int64_t>& padding,
     const std::vector<int64_t>& dilation,
     int64_t groups) {
+  // The dispatcher passes an absent bias as an undefined tensor.
+  const std::optional<Tensor> bias =
+      bias_tensor.defined() ? std::optional<Tensor>(bias_tensor) : std::nullopt;
   validate_conv_input(input_arg);
 
   TP_CHECK(input_arg.dim() == 3, "Vulkan conv1d requires a 3d input");

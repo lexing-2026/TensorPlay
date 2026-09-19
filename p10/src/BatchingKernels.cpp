@@ -762,7 +762,7 @@ Tensor slice(const Tensor& input, int64_t dim,
     const int64_t actual_dim = public_dim < *operand.bdim ? public_dim : public_dim + 1;
     Tensor result = call_next<Tensor, const Tensor&, int64_t,
                                  std::optional<int64_t>, std::optional<int64_t>, int64_t>(
-        "slice", operand.value, operand.value, actual_dim, start, end, step);
+        "slice.Tensor", operand.value, operand.value, actual_dim, start, end, step);
     return make_batched(result, actual_dim < *operand.bdim
                                     ? *operand.bdim : *operand.bdim,
                         operand.level);
@@ -1113,55 +1113,55 @@ TP_BATCH_BINARY(batch_bitwise_xor, "bitwise_xor.Tensor")
 TP_BATCH_BINARY(batch_bitwise_lshift, "bitwise_left_shift.Tensor")
 TP_BATCH_BINARY(batch_bitwise_rshift, "bitwise_right_shift.Tensor")
 
-Tensor batch_add(const Tensor& left, const Tensor& right, Scalar alpha) {
+Tensor batch_add(const Tensor& left, const Tensor& right, const Scalar& alpha) {
     return binary_alpha("add.Tensor", left, right, alpha);
 }
-Tensor batch_sub(const Tensor& left, const Tensor& right, Scalar alpha) {
+Tensor batch_sub(const Tensor& left, const Tensor& right, const Scalar& alpha) {
     return binary_alpha("sub.Tensor", left, right, alpha);
 }
-Tensor batch_add_scalar(const Tensor& input, Scalar value, Scalar alpha) {
+Tensor batch_add_scalar(const Tensor& input, const Scalar& value, const Scalar& alpha) {
     return scalar_alpha("add.Scalar", input, value, alpha);
 }
-Tensor batch_sub_scalar(const Tensor& input, Scalar value, Scalar alpha) {
+Tensor batch_sub_scalar(const Tensor& input, const Scalar& value, const Scalar& alpha) {
     return scalar_alpha("sub.Scalar", input, value, alpha);
 }
-Tensor batch_mul_scalar(const Tensor& input, Scalar value) {
+Tensor batch_mul_scalar(const Tensor& input, const Scalar& value) {
     return scalar("mul.Scalar", input, value);
 }
-Tensor batch_div_scalar(const Tensor& input, Scalar value) {
+Tensor batch_div_scalar(const Tensor& input, const Scalar& value) {
     return scalar("div.Scalar", input, value);
 }
-Tensor batch_bitwise_and_scalar(const Tensor& input, Scalar value) {
+Tensor batch_bitwise_and_scalar(const Tensor& input, const Scalar& value) {
     return scalar("bitwise_and.Scalar", input, value);
 }
-Tensor batch_bitwise_or_scalar(const Tensor& input, Scalar value) {
+Tensor batch_bitwise_or_scalar(const Tensor& input, const Scalar& value) {
     return scalar("bitwise_or.Scalar", input, value);
 }
-Tensor batch_bitwise_xor_scalar(const Tensor& input, Scalar value) {
+Tensor batch_bitwise_xor_scalar(const Tensor& input, const Scalar& value) {
     return scalar("bitwise_xor.Scalar", input, value);
 }
-Tensor batch_bitwise_lshift_scalar(const Tensor& input, Scalar value) {
+Tensor batch_bitwise_lshift_scalar(const Tensor& input, const Scalar& value) {
     return scalar("bitwise_left_shift.Tensor_Scalar", input, value);
 }
-Tensor batch_bitwise_rshift_scalar(const Tensor& input, Scalar value) {
+Tensor batch_bitwise_rshift_scalar(const Tensor& input, const Scalar& value) {
     return scalar("bitwise_right_shift.Tensor_Scalar", input, value);
 }
-Tensor batch_bitwise_and_stensor(Scalar value, const Tensor& input) {
+Tensor batch_bitwise_and_stensor(const Scalar& value, const Tensor& input) {
     return scalar_left("bitwise_and.Scalar_Tensor", input, value);
 }
-Tensor batch_bitwise_or_stensor(Scalar value, const Tensor& input) {
+Tensor batch_bitwise_or_stensor(const Scalar& value, const Tensor& input) {
     return scalar_left("bitwise_or.Scalar_Tensor", input, value);
 }
-Tensor batch_bitwise_xor_stensor(Scalar value, const Tensor& input) {
+Tensor batch_bitwise_xor_stensor(const Scalar& value, const Tensor& input) {
     return scalar_left("bitwise_xor.Scalar_Tensor", input, value);
 }
-Tensor batch_bitwise_lshift_stensor(Scalar value, const Tensor& input) {
+Tensor batch_bitwise_lshift_stensor(const Scalar& value, const Tensor& input) {
     return scalar_left("bitwise_left_shift.Scalar_Tensor", input, value);
 }
-Tensor batch_bitwise_rshift_stensor(Scalar value, const Tensor& input) {
+Tensor batch_bitwise_rshift_stensor(const Scalar& value, const Tensor& input) {
     return scalar_left("bitwise_right_shift.Scalar_Tensor", input, value);
 }
-Tensor batch_pow_scalar(const Tensor& input, Scalar exponent) {
+Tensor batch_pow_scalar(const Tensor& input, const Scalar& exponent) {
     return scalar("pow.Tensor_Scalar", input, exponent);
 }
 Tensor batch_pow_tensor(const Tensor& left, const Tensor& right) {
@@ -1234,7 +1234,7 @@ Tensor batch_bmm(const Tensor& left, const Tensor& right) {
     return bmm(left, right);
 }
 Tensor batch_linear(const Tensor& input, const Tensor& weight,
-                    std::optional<Tensor> bias) {
+                    const std::optional<Tensor>& bias) {
     return linear(input, weight, std::move(bias));
 }
 
@@ -1277,7 +1277,7 @@ Tensor batch_randn_like(const Tensor& input, DType dtype,
 #define TP_BATCH_PREDICATE_TENSOR(NAME, OP) \
     Tensor NAME(const Tensor& left, const Tensor& right) { return binary(OP, left, right); }
 #define TP_BATCH_PREDICATE_SCALAR(NAME, OP) \
-    Tensor NAME(const Tensor& input, Scalar value) { return scalar(OP, input, value); }
+    Tensor NAME(const Tensor& input, const Scalar& value) { return scalar(OP, input, value); }
 
 TP_BATCH_PREDICATE_TENSOR(batch_eq_tensor, "eq.Tensor")
 TP_BATCH_PREDICATE_TENSOR(batch_ne_tensor, "ne.Tensor")
@@ -1305,7 +1305,7 @@ Tensor batch_where_self(const Tensor& condition, const Tensor& self,
     return make_batched(result, 0, aligned.second);
 }
 
-Tensor batch_where_scalar_self(const Tensor& condition, Scalar self,
+Tensor batch_where_scalar_self(const Tensor& condition, const Scalar& self,
                                const Tensor& other) {
     auto aligned = align_tensor_list({condition, other});
     Tensor result = call_next<Tensor, const Tensor&, Scalar, const Tensor&>(
@@ -1315,7 +1315,7 @@ Tensor batch_where_scalar_self(const Tensor& condition, Scalar self,
 }
 
 Tensor batch_where_scalar_other(const Tensor& condition, const Tensor& self,
-                                Scalar other) {
+                                const Scalar& other) {
     auto aligned = align_tensor_list({condition, self});
     Tensor result = call_next<Tensor, const Tensor&, const Tensor&, Scalar>(
         "where.ScalarOther", aligned.first[0], aligned.first[0],
@@ -1323,7 +1323,7 @@ Tensor batch_where_scalar_other(const Tensor& condition, const Tensor& self,
     return make_batched(result, 0, aligned.second);
 }
 
-Tensor batch_where_scalar(const Tensor& condition, Scalar self, Scalar other) {
+Tensor batch_where_scalar(const Tensor& condition, const Scalar& self, const Scalar& other) {
     return unary_impl(condition, [&](const Tensor& value) {
         return call_next<Tensor, const Tensor&, Scalar, Scalar>(
             "where.Scalar", value, value, self, other);
@@ -1336,8 +1336,8 @@ Tensor batch_where_scalar(const Tensor& condition, Scalar self, Scalar other) {
 // output, following the shape rules of sum_dim above.
 // ---------------------------------------------------------------------------
 
-Tensor batch_clamp(const Tensor& input, std::optional<Scalar> min,
-                   std::optional<Scalar> max) {
+Tensor batch_clamp(const Tensor& input, const std::optional<Scalar>& min,
+                   const std::optional<Scalar>& max) {
     return unary_impl(input, [&](const Tensor& value) {
         return call_next<Tensor, const Tensor&, std::optional<Scalar>,
                          std::optional<Scalar>>("clamp", value, value, min, max);
@@ -1528,7 +1528,7 @@ Tensor batch_new_ones(const Tensor& self, const std::vector<int64_t>& size,
 }
 
 Tensor batch_new_full(const Tensor& self, const std::vector<int64_t>& size,
-                      Scalar fill_value, std::optional<DType> dtype,
+                      const Scalar& fill_value, std::optional<DType> dtype,
                       std::optional<int64_t> layout,
                       std::optional<Device> device,
                       std::optional<bool> pin_memory) {
@@ -1796,7 +1796,8 @@ Tensor batch_index(const Tensor& self,
         active.level);
 }
 
-Tensor& batch_index_put_(Tensor& self, const std::vector<Tensor>& indices,
+Tensor& batch_index_put_(Tensor& self,
+                         const std::vector<std::optional<Tensor>>& indices,
                          const Tensor& values, bool accumulate) {
     const tensorplay::transform::Layer active = current_vmap_layer();
     const Operand self_operand = operand_at_level(self, active.level);
@@ -1812,12 +1813,12 @@ Tensor& batch_index_put_(Tensor& self, const std::vector<Tensor>& indices,
     index_values.reserve(indices.size());
     index_bdims.reserve(indices.size());
     for (const auto& index : indices) {
-        if (!index.defined()) {
+        if (!index.has_value() || !index->defined()) {
             index_values.push_back(std::nullopt);
             index_bdims.push_back(std::nullopt);
             continue;
         }
-        const Operand index_operand = operand_at_level(index, active.level);
+        const Operand index_operand = operand_at_level(*index, active.level);
         index_values.push_back(index_operand.value);
         index_bdims.push_back(index_operand.bdim);
     }
@@ -1851,16 +1852,11 @@ Tensor& batch_index_put_(Tensor& self, const std::vector<Tensor>& indices,
         }
         values_value = tpx::ops::view(values_value, new_shape);
     }
-    std::vector<Tensor> redispatch_indices;
-    redispatch_indices.reserve(physical_indices.size());
-    for (const auto& index : physical_indices) {
-        redispatch_indices.emplace_back(index.has_value() ? *index : Tensor());
-    }
-    tpx::ops::index_put_(self_value, redispatch_indices, values_value, accumulate);
+    tpx::ops::index_put_(self_value, physical_indices, values_value, accumulate);
     return self;
 }
 
-void batch_copy_(Tensor& self, const Tensor& src, bool non_blocking) {
+Tensor& batch_copy_(Tensor& self, const Tensor& src, bool non_blocking) {
     Operand self_operand = unwrap_operand(self);
     Operand src_operand = unwrap_operand(src);
     if (!self_operand.bdim.has_value() && src_operand.bdim.has_value()) {
@@ -1884,6 +1880,7 @@ void batch_copy_(Tensor& self, const Tensor& src, bool non_blocking) {
                               max_logical_rank)
         : src_operand.value;
     self_value.copy_(src_value, non_blocking);
+    return self;
 }
 
 bool participates_at_level(const Tensor& value, int64_t level) {
@@ -1940,8 +1937,7 @@ void register_batch_rule(tensorplay::Library& library, const char* name) {
     library.impl(name, &Plumbing::call);
     if constexpr (Random) {
         Dispatcher::singleton().registerKernel(
-            name, DispatchKey::VmapMode,
-            reinterpret_cast<KernelFunction>(&Plumbing::call));
+            name, DispatchKey::VmapMode, &Plumbing::call);
     }
 }
 
@@ -2014,7 +2010,7 @@ void register_batch_rules(tensorplay::Library& library) {
     register_batch_rule<&batch_unsqueeze>(library, "unsqueeze");
     register_batch_rule<&batch_contiguous>(library, "contiguous");
     register_batch_rule<&batch_select>(library, "select.int");
-    register_batch_rule<&batch_slice>(library, "slice");
+    register_batch_rule<&batch_slice>(library, "slice.Tensor");
     register_batch_rule<&batch_narrow>(library, "narrow");
     register_batch_rule<&batch_index_select>(library, "index_select");
     register_batch_rule<&batch_cat>(library, "cat");

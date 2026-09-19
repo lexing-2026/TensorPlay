@@ -490,6 +490,8 @@ MANUAL_DERIVATIVES: dict[str, dict] = {
     "index": {"saved": ["self", "indices"]},
     "index_put": {"saved": ["indices", "values", "accumulate"]},
     "index_put_": {"saved": ["indices", "values", "accumulate"]},
+    "_index_put_impl_": {"saved": ["indices", "values", "accumulate"],
+                         "node": "IndexPutBackward"},
     # Two differentiable outputs: the node reads grads[0]/grads[1].
     "aminmax": {"saved": ["self", "dim", "keepdim"]},
     "std_mean": {"saved": ["self", "dim", "unbiased", "keepdim"]},
@@ -606,7 +608,7 @@ def load_derivatives(path: str, native_by_opname: dict[str, NativeFunction]) \
         saved = [a for a in native.args if a.name in spec["saved"]]
         members = [(a.name, node_member_type(a.type)) for a in saved]
         out[native.func_name] = OpDerivatives(
-            func=native, node_name=autograd_node_name(base),
+            func=native, node_name=spec.get("node", autograd_node_name(base)),
             formulas={}, grad_slots=native.tensor_args,
             members=members,
             used_input_names=set(spec["saved"]), used_output_names=set(),

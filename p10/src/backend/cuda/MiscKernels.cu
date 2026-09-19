@@ -25,13 +25,13 @@ std::tuple<Tensor, Tensor> native_alpha_dropout_cuda(const Tensor& input, double
 Tensor alpha_dropout_backward_cuda(const Tensor& grad, const Tensor& mask, double p);
 std::tuple<Tensor, Tensor> native_feature_dropout_cuda(const Tensor& input, double p);
 Tensor feature_dropout_backward_cuda(const Tensor& grad, const Tensor& mask, double p);
-Tensor trapezoid_cuda(const Tensor& y, const std::optional<Tensor>& x, Scalar dx, int64_t dim);
-Tensor cumulative_trapezoid_cuda(const Tensor& y, const std::optional<Tensor>& x, Scalar dx, int64_t dim);
+Tensor trapezoid_cuda(const Tensor& y, const std::optional<Tensor>& x, const Scalar& dx, int64_t dim);
+Tensor cumulative_trapezoid_cuda(const Tensor& y, const std::optional<Tensor>& x, const Scalar& dx, int64_t dim);
 Tensor trapezoid_backward_cuda(const Tensor& grad, const std::optional<Tensor>& x,
-                               const std::vector<int64_t>& ysizes, Scalar dx,
+                               const std::vector<int64_t>& ysizes, const Scalar& dx,
                                int64_t dim);
 Tensor cumulative_trapezoid_backward_cuda(const Tensor& grad, const std::optional<Tensor>& x,
-                                          Scalar dx, int64_t dim);
+                                          const Scalar& dx, int64_t dim);
 Tensor cov_cuda(const Tensor& self, int64_t correction,
                 const std::optional<Tensor>& fweights_opt,
                 const std::optional<Tensor>& aweights_opt);
@@ -76,7 +76,9 @@ static Tensor diff_helper(const Tensor& self, int64_t n, int64_t dim) {
     return result;
 }
 
-Tensor diff_cuda(const Tensor& self, int64_t n, int64_t dim, const Tensor& prepend, const Tensor& append) {
+Tensor diff_cuda(const Tensor& self, int64_t n, int64_t dim, const std::optional<Tensor>& prepend_opt, const std::optional<Tensor>& append_opt) {
+    const Tensor prepend = prepend_opt.has_value() ? *prepend_opt : Tensor();
+    const Tensor append = append_opt.has_value() ? *append_opt : Tensor();
     const int64_t d = wrap_dim_local(dim, self.dim());
     const bool has_prepend = prepend.defined();
     const bool has_append = append.defined();
@@ -584,7 +586,7 @@ Tensor segment_widths(const Tensor& x, int64_t d) {
 
 } // anonymous namespace
 
-Tensor trapezoid_cuda(const Tensor& y, const std::optional<Tensor>& x_opt, Scalar dx_s, int64_t dim) {
+Tensor trapezoid_cuda(const Tensor& y, const std::optional<Tensor>& x_opt, const Scalar& dx_s, int64_t dim) {
     const double dx = dx_s.toDouble();
     const Tensor x = x_opt.value_or(Tensor());
     const int64_t d = trapz_dim(dim, y.dim());
@@ -608,7 +610,7 @@ Tensor trapezoid_cuda(const Tensor& y, const std::optional<Tensor>& x_opt, Scala
     return avg.sum(std::vector<int64_t>{d}, false);
 }
 
-Tensor cumulative_trapezoid_cuda(const Tensor& y, const std::optional<Tensor>& x_opt, Scalar dx_s,
+Tensor cumulative_trapezoid_cuda(const Tensor& y, const std::optional<Tensor>& x_opt, const Scalar& dx_s,
                                 int64_t dim) {
     const double dx = dx_s.toDouble();
     const Tensor x = x_opt.value_or(Tensor());
@@ -645,7 +647,7 @@ Tensor apply_sum_weights(const Tensor& grad, int64_t d, const Tensor& w1d) {
 } // anonymous namespace
 
 Tensor trapezoid_backward_cuda(const Tensor& grad, const std::optional<Tensor>& x_opt,
-                               const std::vector<int64_t>& ysizes, Scalar dx_s,
+                               const std::vector<int64_t>& ysizes, const Scalar& dx_s,
                                int64_t dim) {
     const double dx = dx_s.toDouble();
     const Tensor x = x_opt.value_or(Tensor());
@@ -667,7 +669,7 @@ Tensor trapezoid_backward_cuda(const Tensor& grad, const std::optional<Tensor>& 
 
 Tensor cumulative_trapezoid_backward_cuda(const Tensor& grad,
                                           const std::optional<Tensor>& x_opt,
-                                          Scalar dx_s, int64_t dim) {
+                                          const Scalar& dx_s, int64_t dim) {
     // Same dual-suffix-sum structure as the CPU kernel.
     const Tensor x = x_opt.value_or(Tensor());
     const double dx = dx_s.toDouble();

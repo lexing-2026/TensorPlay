@@ -1,6 +1,7 @@
 // Hand-written overload wiring: entries whose argument shapes differ from
 // any registered sibling in ways the mechanical matcher rejects, but whose
 // semantics are a plain forward to an already-registered kernel.
+#include <numeric>
 #include "Tensor.h"
 #include "SparseKernels.h"
 #include "Dispatcher.h"
@@ -25,6 +26,7 @@
 #include <tuple>
 #include <type_traits>
 #include <vector>
+#include "OutWrite.h"
 
 namespace tensorplay {
 namespace composite {
@@ -160,13 +162,24 @@ Tensor& prod_int_out_native(const Tensor& self, int64_t dim, bool keepdim,
                                out);
 }
 
+// Reduction dimensions of a ``dim=None`` call that keeps its dimensions:
+// every dimension, so the result keeps the input's rank.
+std::optional<std::vector<int64_t>> correction_reduce_dims(
+        const Tensor& self, const std::optional<std::vector<int64_t>>& dim, bool keepdim) {
+    if (dim.has_value() || !keepdim) return dim;
+    std::vector<int64_t> all(static_cast<size_t>(self.dim()));
+    std::iota(all.begin(), all.end(), int64_t{0});
+    return all;
+}
+
 Tensor std_correction_native(const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
                              const std::optional<Scalar>& correction, bool keepdim) {
-    if (dim.has_value()) {
-        const int64_t c = correction.has_value() ? correction->to<int64_t>() : 1;
-        return ops::std(self, *dim, c, keepdim);
+    const int64_t c = correction.has_value() ? correction->to<int64_t>() : 1;
+    const auto dims = correction_reduce_dims(self, dim, keepdim);
+    if (dims.has_value()) {
+        return ops::std(self, *dims, c, keepdim);
     }
-    return ops::std(self, correction.has_value() ? correction->to<int64_t>() : 1);
+    return ops::std(self, c);
 }
 
 Tensor& std_correction_out_native(const Tensor& self,
@@ -186,11 +199,21 @@ Tensor& std_out_native(const Tensor& self, const std::optional<std::vector<int64
 
 Tensor var_correction_native(const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
                              const std::optional<Scalar>& correction, bool keepdim) {
-    if (dim.has_value()) {
-        const int64_t c = correction.has_value() ? correction->to<int64_t>() : 1;
-        return ops::var(self, *dim, c, keepdim);
+    const int64_t c = correction.has_value() ? correction->to<int64_t>() : 1;
+    const auto dims = correction_reduce_dims(self, dim, keepdim);
+    if (dims.has_value()) {
+        return ops::var(self, *dims, c, keepdim);
     }
-    return ops::var(self, correction.has_value() ? correction->to<int64_t>() : 1);
+    return ops::var(self, c);
+}
+
+Tensor mean_for_correction(const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
+                           bool keepdim) {
+    const auto dims = correction_reduce_dims(self, dim, keepdim);
+    if (dims.has_value()) {
+        return ops::mean(self, *dims, keepdim);
+    }
+    return ops::mean(self);
 }
 
 Tensor& var_correction_out_native(const Tensor& self,
@@ -211,15 +234,15 @@ Tensor& var_out_native(const Tensor& self, const std::optional<std::vector<int64
 std::tuple<Tensor, Tensor> std_mean_correction_native(
         const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
         const std::optional<Scalar>& correction, bool keepdim) {
-    Tensor s = std_correction_native(self, dim, correction, keepdim);
-    Tensor v = var_correction_native(self, dim, correction, keepdim);
-    return {s, v};
+    return {std_correction_native(self, dim, correction, keepdim),
+            mean_for_correction(self, dim, keepdim)};
 }
 
 std::tuple<Tensor, Tensor> var_mean_correction_native(
         const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
         const std::optional<Scalar>& correction, bool keepdim) {
-    return std_mean_correction_native(self, dim, correction, keepdim);
+    return {var_correction_native(self, dim, correction, keepdim),
+            mean_for_correction(self, dim, keepdim)};
 }
 
 std::tuple<Tensor, Tensor> median_dim_native(const Tensor& self, int64_t dim, bool keepdim) {
@@ -277,8 +300,8 @@ std::tuple<Tensor, Tensor> topk_values_native(const Tensor& self, int64_t k, int
                                                bool largest, bool sorted, Tensor& values,
                                                Tensor& indices) {
     auto r = ops::topk(self, k, dim, largest, sorted);
-    values = std::get<0>(r);
-    indices = std::get<1>(r);
+    write_out(values, std::get<0>(r));
+    write_out(indices, std::get<1>(r));
     return {values, indices};
 }
 
@@ -699,27 +722,27 @@ std::vector<int64_t> padding_from_mode(const std::string& padding, int64_t k) {
 } // namespace
 
 Tensor conv1d_padding_native(const Tensor& input, const Tensor& weight,
-                             const std::optional<Tensor>& bias,
+                             const Tensor& bias,
                              const std::vector<int64_t>& stride, const std::string& padding,
                              const std::vector<int64_t>& dilation, int64_t groups) {
     const auto pad = padding_from_mode(padding, 1);
-    return ops::conv1d(input, weight, bias, stride, pad, dilation, groups);
+    return ops::conv1d(input, weight, bias.defined() ? std::optional<Tensor>(bias) : std::nullopt, stride, pad, dilation, groups);
 }
 
 Tensor conv2d_padding_native(const Tensor& input, const Tensor& weight,
-                             const std::optional<Tensor>& bias,
+                             const Tensor& bias,
                              const std::vector<int64_t>& stride, const std::string& padding,
                              const std::vector<int64_t>& dilation, int64_t groups) {
     const auto pad = padding_from_mode(padding, 2);
-    return ops::conv2d(input, weight, bias, stride, pad, dilation, groups);
+    return ops::conv2d(input, weight, bias.defined() ? std::optional<Tensor>(bias) : std::nullopt, stride, pad, dilation, groups);
 }
 
 Tensor conv3d_padding_native(const Tensor& input, const Tensor& weight,
-                             const std::optional<Tensor>& bias,
+                             const Tensor& bias,
                              const std::vector<int64_t>& stride, const std::string& padding,
                              const std::vector<int64_t>& dilation, int64_t groups) {
     const auto pad = padding_from_mode(padding, 3);
-    return ops::conv3d(input, weight, bias, stride, pad, dilation, groups);
+    return ops::conv3d(input, weight, bias.defined() ? std::optional<Tensor>(bias) : std::nullopt, stride, pad, dilation, groups);
 }
 
 Tensor _convolution_deprecated_native(const Tensor& input, const Tensor& weight,
@@ -766,8 +789,8 @@ Tensor& max_pool2d_with_indices_backward_gi_native(const Tensor& grad_output,
                                                    const std::vector<int64_t>& dilation,
                                                    bool ceil_mode, const Tensor& indices,
                                                    Tensor& grad_input) {
-    grad_input = ops::max_pool2d_with_indices_backward(grad_output, self, kernel_size, stride,
-                                                       padding, dilation, ceil_mode, indices);
+    write_out(grad_input, ops::max_pool2d_with_indices_backward(grad_output, self, kernel_size, stride,
+                                                       padding, dilation, ceil_mode, indices));
     return grad_input;
 }
 
@@ -779,8 +802,8 @@ Tensor& max_pool3d_with_indices_backward_gi_native(const Tensor& grad_output,
                                                    const std::vector<int64_t>& dilation,
                                                    bool ceil_mode, const Tensor& indices,
                                                    Tensor& grad_input) {
-    grad_input = ops::max_pool3d_with_indices_backward(grad_output, self, kernel_size, stride,
-                                                       padding, dilation, ceil_mode, indices);
+    write_out(grad_input, ops::max_pool3d_with_indices_backward(grad_output, self, kernel_size, stride,
+                                                       padding, dilation, ceil_mode, indices));
     return grad_input;
 }
 
@@ -2393,20 +2416,31 @@ namespace {
 std::vector<int64_t> upsample_out_size(const Tensor& input,
                                        const std::optional<std::vector<int64_t>>& output_size,
                                        const std::optional<std::vector<double>>& scale_factors) {
-    if (output_size.has_value()) return *output_size;
-    if (!scale_factors.has_value()) {
-        TP_THROW(RuntimeError, "upsample: either output_size or scale_factors must be set");
+    // Spatial output extents: exactly one of output_size / scale_factors.
+    const int64_t spatial = input.dim() - 2;
+    if (output_size.has_value()) {
+        TP_CHECK(!scale_factors.has_value(),
+                 "Must specify exactly one of output_size and scale_factors");
+        TP_CHECK(static_cast<int64_t>(output_size->size()) == spatial,
+                 "upsample: output_size must have ", spatial, " elements");
+        return *output_size;
     }
-    const std::vector<int64_t> in = static_cast<std::vector<int64_t>>(input.shape());
-    if (scale_factors->size() != in.size() - 2) {
-        TP_THROW(RuntimeError, "upsample: scale_factors must match the spatial dims");
-    }
-    std::vector<int64_t> sizes = {in[0], in[1]};
-    for (size_t i = 2; i < in.size(); ++i) {
-        sizes.push_back(static_cast<int64_t>(std::floor(
-            static_cast<double>(in[i]) * (*scale_factors)[i - 2])));
+    TP_CHECK(scale_factors.has_value(),
+             "Must specify exactly one of output_size and scale_factors");
+    TP_CHECK(static_cast<int64_t>(scale_factors->size()) == spatial,
+             "upsample: scale_factors must have ", spatial, " elements");
+    std::vector<int64_t> sizes;
+    for (int64_t i = 0; i < spatial; ++i) {
+        sizes.push_back(static_cast<int64_t>(
+            static_cast<double>(input.size(i + 2)) * (*scale_factors)[static_cast<size_t>(i)]));
     }
     return sizes;
+}
+
+std::optional<double> upsample_scale(const std::optional<std::vector<double>>& scale_factors,
+                                     size_t idx) {
+    if (!scale_factors.has_value()) return std::nullopt;
+    return scale_factors->at(idx);
 }
 
 } // namespace
@@ -2416,14 +2450,14 @@ Tensor upsample_linear1d_vec_native(const Tensor& input,
                                     bool align_corners,
                                     const std::optional<std::vector<double>>& scale_factors) {
     const auto sz = upsample_out_size(input, output_size, scale_factors);
-    return ops::upsample_linear1d(input, sz, align_corners);
+    return ops::upsample_linear1d(input, sz, align_corners, upsample_scale(scale_factors, 0));
 }
 
 Tensor upsample_nearest1d_vec_native(const Tensor& input,
                                      const std::optional<std::vector<int64_t>>& output_size,
                                      const std::optional<std::vector<double>>& scale_factors) {
     const auto sz = upsample_out_size(input, output_size, scale_factors);
-    return ops::upsample_nearest1d(input, sz);
+    return ops::upsample_nearest1d(input, sz, upsample_scale(scale_factors, 0));
 }
 
 Tensor upsample_bilinear2d_vec_native(const Tensor& input,
@@ -2431,7 +2465,7 @@ Tensor upsample_bilinear2d_vec_native(const Tensor& input,
                                       bool align_corners,
                                       const std::optional<std::vector<double>>& scale_factors) {
     const auto sz = upsample_out_size(input, output_size, scale_factors);
-    return ops::upsample_bilinear2d(input, sz, align_corners);
+    return ops::upsample_bilinear2d(input, sz, align_corners, upsample_scale(scale_factors, 0), upsample_scale(scale_factors, 1));
 }
 
 Tensor upsample_bicubic2d_vec_native(const Tensor& input,
@@ -2439,7 +2473,7 @@ Tensor upsample_bicubic2d_vec_native(const Tensor& input,
                                      bool align_corners,
                                      const std::optional<std::vector<double>>& scale_factors) {
     const auto sz = upsample_out_size(input, output_size, scale_factors);
-    return ops::upsample_bicubic2d(input, sz, align_corners);
+    return ops::upsample_bicubic2d(input, sz, align_corners, upsample_scale(scale_factors, 0), upsample_scale(scale_factors, 1));
 }
 
 Tensor upsample_trilinear3d_vec_native(const Tensor& input,
@@ -2447,21 +2481,21 @@ Tensor upsample_trilinear3d_vec_native(const Tensor& input,
                                        bool align_corners,
                                        const std::optional<std::vector<double>>& scale_factors) {
     const auto sz = upsample_out_size(input, output_size, scale_factors);
-    return ops::upsample_trilinear3d(input, sz, align_corners);
+    return ops::upsample_trilinear3d(input, sz, align_corners, upsample_scale(scale_factors, 0), upsample_scale(scale_factors, 1), upsample_scale(scale_factors, 2));
 }
 
 Tensor upsample_nearest2d_vec_native(const Tensor& input,
                                      const std::optional<std::vector<int64_t>>& output_size,
                                      const std::optional<std::vector<double>>& scale_factors) {
     const auto sz = upsample_out_size(input, output_size, scale_factors);
-    return ops::upsample_nearest2d(input, sz);
+    return ops::upsample_nearest2d(input, sz, upsample_scale(scale_factors, 0), upsample_scale(scale_factors, 1));
 }
 
 Tensor upsample_nearest3d_vec_native(const Tensor& input,
                                      const std::optional<std::vector<int64_t>>& output_size,
                                      const std::optional<std::vector<double>>& scale_factors) {
     const auto sz = upsample_out_size(input, output_size, scale_factors);
-    return ops::upsample_nearest3d(input, sz);
+    return ops::upsample_nearest3d(input, sz, upsample_scale(scale_factors, 0), upsample_scale(scale_factors, 1), upsample_scale(scale_factors, 2));
 }
 
 // nearest-exact .vec entry points: same size/scale handling as the legacy
@@ -2470,21 +2504,21 @@ Tensor _upsample_nearest_exact1d_vec_native(const Tensor& input,
                                             const std::optional<std::vector<int64_t>>& output_size,
                                             const std::optional<std::vector<double>>& scale_factors) {
     const auto sz = upsample_out_size(input, output_size, scale_factors);
-    return ops::_upsample_nearest_exact1d(input, sz);
+    return ops::_upsample_nearest_exact1d(input, sz, upsample_scale(scale_factors, 0));
 }
 
 Tensor _upsample_nearest_exact2d_vec_native(const Tensor& input,
                                             const std::optional<std::vector<int64_t>>& output_size,
                                             const std::optional<std::vector<double>>& scale_factors) {
     const auto sz = upsample_out_size(input, output_size, scale_factors);
-    return ops::_upsample_nearest_exact2d(input, sz);
+    return ops::_upsample_nearest_exact2d(input, sz, upsample_scale(scale_factors, 0), upsample_scale(scale_factors, 1));
 }
 
 Tensor _upsample_nearest_exact3d_vec_native(const Tensor& input,
                                             const std::optional<std::vector<int64_t>>& output_size,
                                             const std::optional<std::vector<double>>& scale_factors) {
     const auto sz = upsample_out_size(input, output_size, scale_factors);
-    return ops::_upsample_nearest_exact3d(input, sz);
+    return ops::_upsample_nearest_exact3d(input, sz, upsample_scale(scale_factors, 0), upsample_scale(scale_factors, 1), upsample_scale(scale_factors, 2));
 }
 
 // ---- misc forwards ------------------------------------------------------------

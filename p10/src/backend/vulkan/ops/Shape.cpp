@@ -676,7 +676,7 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ShapeKernels) {
   m.impl("permute", &tensorplay::vulkan::ops::permute_kernel);
   m.impl("squeeze.dim", &tensorplay::vulkan::ops::squeeze_dim_kernel);
   m.impl("unsqueeze", &tensorplay::vulkan::ops::unsqueeze_kernel);
-  m.impl("slice", &tensorplay::vulkan::ops::slice_kernel);
+  m.impl("slice.Tensor", &tensorplay::vulkan::ops::slice_kernel);
   m.impl("select.int", &tensorplay::vulkan::ops::select_kernel);
   m.impl("cat", &tensorplay::vulkan::ops::cat_kernel);
   m.impl("stack", &tensorplay::vulkan::ops::stack_kernel);

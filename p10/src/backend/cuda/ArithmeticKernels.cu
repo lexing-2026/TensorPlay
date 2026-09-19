@@ -139,8 +139,8 @@ static void run_cplx_div_scalar(Tensor& x, const Scalar& other, Tensor& y) {
     for (; i < n; i += tp_stride)
 
 // Forward declarations for the scalar fallback used by the fused kernel.
-Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha);
-Tensor mul_scalar_kernel(const Tensor& self, Scalar other);
+Tensor add_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& alpha);
+Tensor mul_scalar_kernel(const Tensor& self, const Scalar& other);
 #ifdef USE_CUDNN
 Tensor& relu_inplace_kernel_cudnn(Tensor& self);
 #else
@@ -346,6 +346,18 @@ inline void run_binary_iter(TensorIteratorBase& iter, const Scalar& alpha) {
             opmath_gpu_kernel_with_scalars<float, float, float>(
                 iter, FunctorT<float>{alpha.to<float>()});
             break;
+        case DType::UInt8:
+            opmath_gpu_kernel_with_scalars<uint8_t, uint8_t, uint8_t>(
+                iter, FunctorT<uint8_t>{alpha.to<uint8_t>()});
+            break;
+        case DType::Int8:
+            opmath_gpu_kernel_with_scalars<int8_t, int8_t, int8_t>(
+                iter, FunctorT<int8_t>{alpha.to<int8_t>()});
+            break;
+        case DType::Int16:
+            opmath_gpu_kernel_with_scalars<int16_t, int16_t, int16_t>(
+                iter, FunctorT<int16_t>{alpha.to<int16_t>()});
+            break;
         case DType::Int32:
             opmath_gpu_kernel_with_scalars<int, int, int>(
                 iter, FunctorT<int>{alpha.to<int>()});
@@ -396,9 +408,9 @@ __global__ void binary_same_shape_vectorized_kernel(
     T* __restrict__ y, typename BinaryOpMath<T>::type alpha, Op op) {
     using M = typename BinaryOpMath<T>::type;
     const int64_t vec_n = n / VecSize;
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < vec_n; i += stride) {
+    for (int64_t i = tid; i < vec_n; i += stride) {
         TPVecPack<T, VecSize> pa = *reinterpret_cast<const TPVecPack<T, VecSize>*>(a + i * VecSize);
         TPVecPack<T, VecSize> pb = *reinterpret_cast<const TPVecPack<T, VecSize>*>(b + i * VecSize);
         TPVecPack<T, VecSize> po;
@@ -407,7 +419,8 @@ __global__ void binary_same_shape_vectorized_kernel(
             po.v[v] = static_cast<T>(op(static_cast<M>(pa.v[v]), static_cast<M>(pb.v[v]), static_cast<M>(alpha)));
         *reinterpret_cast<TPVecPack<T, VecSize>*>(y + i * VecSize) = po;
     }
-    for (int64_t j = vec_n * VecSize + i; j < n; j += stride) {
+    // Tail elements past the last full vector, one per thread.
+    for (int64_t j = vec_n * VecSize + tid; j < n; j += stride) {
         y[j] = static_cast<T>(op(static_cast<M>(a[j]), static_cast<M>(b[j]), static_cast<M>(alpha)));
     }
 }
@@ -676,9 +689,9 @@ template <typename T, int VecSize, typename Op>
 __global__ void binary_bool_vectorized_kernel(int64_t n, const T* __restrict__ a,
                                               const T* __restrict__ b, T* __restrict__ y, Op op) {
     const int64_t vec_n = n / VecSize;
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < vec_n; i += stride) {
+    for (int64_t i = tid; i < vec_n; i += stride) {
         TPVecPack<T, VecSize> pa = *reinterpret_cast<const TPVecPack<T, VecSize>*>(a + i * VecSize);
         TPVecPack<T, VecSize> pb = *reinterpret_cast<const TPVecPack<T, VecSize>*>(b + i * VecSize);
         TPVecPack<T, VecSize> po;
@@ -686,7 +699,8 @@ __global__ void binary_bool_vectorized_kernel(int64_t n, const T* __restrict__ a
         for (int v = 0; v < VecSize; ++v) po.v[v] = op(pa.v[v], pb.v[v]);
         *reinterpret_cast<TPVecPack<T, VecSize>*>(y + i * VecSize) = po;
     }
-    for (int64_t j = vec_n * VecSize + i; j < n; j += stride) {
+    // Tail elements past the last full vector, one per thread.
+    for (int64_t j = vec_n * VecSize + tid; j < n; j += stride) {
         y[j] = op(a[j], b[j]);
     }
 }
@@ -697,6 +711,9 @@ inline bool launch_bool_vec(int64_t n, const Tensor& a, const Tensor& b, Tensor&
                             BoolBinOp op, cudaStream_t stream) {
     constexpr int kVec = 8;
     constexpr size_t kAlign = sizeof(bool) * kVec;
+    // Elementwise over equally sized operands only; broadcasts take the
+    // strided kernel.
+    if (a.numel() != n || b.numel() != n) return false;
     const bool* pa = a.data_ptr<bool>();
     const bool* pb = b.data_ptr<bool>();
     bool* py = y.data_ptr<bool>();
@@ -933,7 +950,7 @@ void cudnn_binary_op(const Tensor& a, const Tensor& b, Tensor& c, cudnnOpTensorO
 #endif
 
 // ADD
-Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
+Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) {
     std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
     DType result_dtype = native::result_type(self, other);
     if (alpha.isFloatingPoint() && !isFloatingType(result_dtype)) {
@@ -981,7 +998,7 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
     return result;
 }
 
-Tensor& add_out_kernel(const Tensor& self, const Tensor& other, Scalar alpha,
+Tensor& add_out_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha,
                        Tensor& out) {
     if (self.device() != other.device() || self.device() != out.device()) {
         TP_THROW(DeviceMismatchError,
@@ -1101,7 +1118,7 @@ Tensor add_relu_cuda(const Tensor& self, const Tensor& other) {
 #endif
 }
 
-Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
+Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, const Scalar& alpha) {
     if (other.is_sparse()) {
         return add_sparse_to_dense_cuda(self, other, alpha);
     }
@@ -1148,7 +1165,7 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
 }
 
 // SUB
-Tensor sub_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
+Tensor sub_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) {
     std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
     DType result_dtype = native::result_type(self, other);
     Tensor result = Tensor::empty(out_shape, result_dtype,
@@ -1194,7 +1211,7 @@ Tensor sub_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
     return result;
 }
 
-Tensor& sub_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
+Tensor& sub_inplace_kernel(Tensor& self, const Tensor& other, const Scalar& alpha) {
     int64_t n = self.numel();
     if (n == 0) return self;
 
@@ -1335,7 +1352,7 @@ Tensor fused_mul_add_kernel(const Tensor& self, const Tensor& other, const Tenso
     return add_kernel(mul_kernel(self, other), addend, Scalar(1));
 }
 
-Tensor fused_mul_add_scalar_kernel(const Tensor& self, Scalar other, Scalar addend) {
+Tensor fused_mul_add_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& addend) {
     if (self.dtype() == DType::Float32 && self.is_contiguous()) {
         Tensor result = Tensor::empty(
             static_cast<std::vector<int64_t>>(self.shape()), DType::Float32, self.device());
@@ -1430,7 +1447,7 @@ Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
 }
 
 
-Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
+Tensor add_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& alpha) {
     DType result_dtype = cuda::cplx::scalar_result_dtype(
         self.dtype(), other, &alpha);
 
@@ -1465,7 +1482,7 @@ Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
     return result;
 }
 
-Tensor& add_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
+Tensor& add_scalar_inplace_kernel(Tensor& self, const Scalar& other, const Scalar& alpha) {
     if (self.numel() == 0) return self;
 
     if (self.dtype() == DType::ComplexFloat || self.dtype() == DType::ComplexDouble) {
@@ -1502,7 +1519,7 @@ Tensor& add_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
     return self;
 }
 
-Tensor sub_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
+Tensor sub_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& alpha) {
     DType result_dtype = cuda::cplx::scalar_result_dtype(
         self.dtype(), other, &alpha);
 
@@ -1537,7 +1554,7 @@ Tensor sub_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
     return result;
 }
 
-Tensor& sub_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
+Tensor& sub_scalar_inplace_kernel(Tensor& self, const Scalar& other, const Scalar& alpha) {
     if (self.numel() == 0) return self;
 
     if (self.dtype() == DType::ComplexFloat || self.dtype() == DType::ComplexDouble) {
@@ -1574,7 +1591,7 @@ Tensor& sub_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
     return self;
 }
 
-Tensor mul_scalar_kernel(const Tensor& self, Scalar other) {
+Tensor mul_scalar_kernel(const Tensor& self, const Scalar& other) {
     DType result_dtype = cuda::cplx::scalar_result_dtype(self.dtype(), other);
 
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
@@ -1608,7 +1625,7 @@ Tensor mul_scalar_kernel(const Tensor& self, Scalar other) {
     return result;
 }
 
-Tensor& mul_scalar_inplace_kernel(Tensor& self, Scalar other) {
+Tensor& mul_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
     if (self.numel() == 0) return self;
 
     if (self.dtype() == DType::ComplexFloat || self.dtype() == DType::ComplexDouble) {
@@ -1645,7 +1662,7 @@ Tensor& mul_scalar_inplace_kernel(Tensor& self, Scalar other) {
     return self;
 }
 
-Tensor div_scalar_kernel(const Tensor& self, Scalar other) {
+Tensor div_scalar_kernel(const Tensor& self, const Scalar& other) {
     DType result_dtype = self.dtype();
     // True division promotes integral tensors to Float32 (ComplexFloat for a
     if (!isFloatingOrComplexType(result_dtype)) {
@@ -1685,7 +1702,7 @@ Tensor div_scalar_kernel(const Tensor& self, Scalar other) {
     return result;
 }
 
-Tensor& div_scalar_inplace_kernel(Tensor& self, Scalar other) {
+Tensor& div_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
     if (self.numel() == 0) return self;
 
     if (self.dtype() == DType::ComplexFloat || self.dtype() == DType::ComplexDouble) {
@@ -1824,22 +1841,22 @@ Tensor& addc_cuda_inplace_impl(Tensor& self, const Tensor& tensor1,
 }
 
 Tensor addcmul_cuda(const Tensor& self, const Tensor& tensor1,
-                    const Tensor& tensor2, Scalar value) {
+                    const Tensor& tensor2, const Scalar& value) {
     return addc_cuda_impl<false>(self, tensor1, tensor2, value);
 }
 
 Tensor& addcmul_inplace_cuda(Tensor& self, const Tensor& tensor1,
-                             const Tensor& tensor2, Scalar value) {
+                             const Tensor& tensor2, const Scalar& value) {
     return addc_cuda_inplace_impl<false>(self, tensor1, tensor2, value);
 }
 
 Tensor addcdiv_cuda(const Tensor& self, const Tensor& tensor1,
-                    const Tensor& tensor2, Scalar value) {
+                    const Tensor& tensor2, const Scalar& value) {
     return addc_cuda_impl<true>(self, tensor1, tensor2, value);
 }
 
 Tensor& addcdiv_inplace_cuda(Tensor& self, const Tensor& tensor1,
-                             const Tensor& tensor2, Scalar value) {
+                             const Tensor& tensor2, const Scalar& value) {
     return addc_cuda_inplace_impl<true>(self, tensor1, tensor2, value);
 }
 

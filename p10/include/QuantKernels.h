@@ -32,7 +32,7 @@ Tensor quantized_linear_cpu(const Tensor& input, const Tensor& weight,
                              double input_scale, int64_t input_zero_point,
                              const Tensor& weight_scales,
                              const Tensor& weight_zero_points,
-                             std::optional<Tensor> bias,
+                             const std::optional<Tensor>& bias,
                              double out_scale, int64_t out_zero_point);
 
 // Dynamic quantized linear: activations are quantized per row from their
@@ -41,7 +41,7 @@ Tensor quantized_linear_cpu(const Tensor& input, const Tensor& weight,
 Tensor quantized_linear_dynamic_cpu(const Tensor& input, const Tensor& weight,
                                     const Tensor& weight_scales,
                                     const Tensor& weight_zero_points,
-                                    std::optional<Tensor> bias,
+                                    const std::optional<Tensor>& bias,
                                     bool reduce_range);
 
 // Quantized elementwise arithmetic: dequantize both operands with their
@@ -66,8 +66,8 @@ Tensor quantized_div_cpu(const Tensor& a, const Tensor& b,
 Tensor quantized_clamp_cpu(const Tensor& self, double self_scale,
                             int64_t self_zero_point, double out_scale,
                             int64_t out_zero_point,
-                            std::optional<Scalar> min,
-                            std::optional<Scalar> max);
+                            const std::optional<Scalar>& min,
+                            const std::optional<Scalar>& max);
 // Window maximum on Int8 storage; the result inherits the input qparams.
 Tensor quantized_max_pool2d_cpu(const Tensor& self,
                                  const std::vector<int64_t>& kernel_size,
@@ -80,7 +80,7 @@ Tensor quantized_max_pool2d_cpu(const Tensor& self,
 // float convolution (float-domain bias added after the accumulation), and
 // requantize into the output qparams.
 Tensor quantized_conv2d_cpu(
-    const Tensor& input, const Tensor& weight, std::optional<Tensor> bias,
+    const Tensor& input, const Tensor& weight, const std::optional<Tensor>& bias,
     double input_scale, int64_t input_zero_point, double weight_scale,
     int64_t weight_zero_point, double out_scale, int64_t out_zero_point,
     const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
@@ -233,12 +233,12 @@ Tensor quantized_linear_cuda(const Tensor& input, const Tensor& weight,
                               double input_scale, int64_t input_zero_point,
                               const Tensor& weight_scales,
                               const Tensor& weight_zero_points,
-                              std::optional<Tensor> bias,
+                              const std::optional<Tensor>& bias,
                               double out_scale, int64_t out_zero_point);
 Tensor quantized_linear_dynamic_cuda(const Tensor& input, const Tensor& weight,
                                      const Tensor& weight_scales,
                                      const Tensor& weight_zero_points,
-                                     std::optional<Tensor> bias,
+                                     const std::optional<Tensor>& bias,
                                      bool reduce_range);
 Tensor quantized_add_cuda(const Tensor& a, const Tensor& b,
                            double a_scale, int64_t a_zero_point,
@@ -259,8 +259,8 @@ Tensor quantized_div_cuda(const Tensor& a, const Tensor& b,
 Tensor quantized_clamp_cuda(const Tensor& self, double self_scale,
                              int64_t self_zero_point, double out_scale,
                              int64_t out_zero_point,
-                             std::optional<Scalar> min,
-                             std::optional<Scalar> max);
+                             const std::optional<Scalar>& min,
+                             const std::optional<Scalar>& max);
 Tensor quantized_max_pool2d_cuda(const Tensor& self,
                                   const std::vector<int64_t>& kernel_size,
                                   const std::vector<int64_t>& stride,
@@ -268,7 +268,7 @@ Tensor quantized_max_pool2d_cuda(const Tensor& self,
                                   const std::vector<int64_t>& dilation,
                                   bool ceil_mode);
 Tensor quantized_conv2d_cuda(
-    const Tensor& input, const Tensor& weight, std::optional<Tensor> bias,
+    const Tensor& input, const Tensor& weight, const std::optional<Tensor>& bias,
     double input_scale, int64_t input_zero_point, double weight_scale,
     int64_t weight_zero_point, double out_scale, int64_t out_zero_point,
     const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,

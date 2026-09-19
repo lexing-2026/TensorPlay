@@ -26,6 +26,7 @@
 #endif
 #include <cassert>
 #include "Atomic.cuh"
+#include "OutWrite.h"
 
 namespace tensorplay {
 namespace cuda {
@@ -296,8 +297,8 @@ Tensor scalar_from_rows(const Tensor& rows_f64, int64_t n, DType dt, const Devic
 
 } // namespace
 
-Tensor multi_margin_loss_cuda(const Tensor& input, const Tensor& target, Scalar p,
-                              Scalar margin, const std::optional<Tensor>& weight,
+Tensor multi_margin_loss_cuda(const Tensor& input, const Tensor& target, const Scalar& p,
+                              const Scalar& margin, const std::optional<Tensor>& weight,
                               int64_t reduction) {
     check_reduction(reduction, "multi_margin_loss");
     const int64_t pint = p.to<int64_t>();
@@ -378,7 +379,7 @@ Tensor multi_margin_loss_cuda(const Tensor& input, const Tensor& target, Scalar 
 }
 
 Tensor multi_margin_loss_cuda_backward(const Tensor& grad_output, const Tensor& input,
-                                       const Tensor& target, Scalar p, Scalar margin,
+                                       const Tensor& target, const Scalar& p, const Scalar& margin,
                                        const std::optional<Tensor>& weight, int64_t reduction) {
     check_reduction(reduction, "multi_margin_loss_backward");
     const int64_t pint = p.to<int64_t>();
@@ -532,35 +533,27 @@ Tensor multilabel_margin_loss_backward_cuda(const Tensor& grad_output, const Ten
     return grad_input.to(dt);
 }
 
-Tensor& interop_multi_margin_loss_out_cuda(const Tensor& input, const Tensor& target, Scalar p, Scalar margin,
+Tensor& interop_multi_margin_loss_out_cuda(const Tensor& input, const Tensor& target, const Scalar& p, const Scalar& margin,
               const std::optional<Tensor>& weight, int64_t reduction, Tensor& out) {
-        out = multi_margin_loss_cuda(input, target, p, margin, weight, reduction);
+        write_out(out, multi_margin_loss_cuda(input, target, p, margin, weight, reduction));
         return out;
     
 }
 
 Tensor& interop_multi_margin_loss_backward_grad_input_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& target,
-              Scalar p, Scalar margin, const std::optional<Tensor>& weight,
+              const Scalar& p, const Scalar& margin, const std::optional<Tensor>& weight,
               int64_t reduction, Tensor& grad_input) {
-        grad_input = multi_margin_loss_cuda_backward(grad_output, input, target, p,
-                                                     margin, weight, reduction);
+        write_out(grad_input, multi_margin_loss_cuda_backward(grad_output, input, target, p,
+                                                     margin, weight, reduction));
         return grad_input;
     
 }
 
 Tensor& interop_multilabel_margin_loss_backward_grad_input_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& target,
               int64_t reduction, const Tensor& is_target, Tensor& grad_input) {
-        grad_input = multilabel_margin_loss_backward_cuda(grad_output, input, target,
-                                                          reduction, is_target);
+        write_out(grad_input, multilabel_margin_loss_backward_cuda(grad_output, input, target,
+                                                          reduction, is_target));
         return grad_input;
-    
-}
-
-Tensor& interop_multilabel_margin_loss_forward_output_cuda(const Tensor& input, const Tensor& target, int64_t reduction,
-              Tensor& output, Tensor& is_target) {
-        std::tie(output, is_target) = multilabel_margin_loss_forward_cuda(
-            input, target, reduction);
-        return output;
     
 }
 
@@ -573,7 +566,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, MarginLossKernels) {
     m.impl("multi_margin_loss.out", interop_multi_margin_loss_out_cuda);
     m.impl("multi_margin_loss_backward.grad_input", interop_multi_margin_loss_backward_grad_input_cuda);
     m.impl("multilabel_margin_loss_backward.grad_input", interop_multilabel_margin_loss_backward_grad_input_cuda);
-    m.impl("multilabel_margin_loss_forward.output", interop_multilabel_margin_loss_forward_output_cuda);
 }
 
 } // namespace cuda

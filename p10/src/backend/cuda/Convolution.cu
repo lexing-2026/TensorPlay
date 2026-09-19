@@ -38,7 +38,7 @@ Tensor convolution_cuda(const Tensor& input, const Tensor& weight,
 
 std::tuple<Tensor, Tensor, Tensor> convolution_backward_cuda(
         const Tensor& grad_output, const Tensor& input, const Tensor& weight,
-        std::optional<std::vector<int64_t>> bias_sizes,
+        const std::optional<std::vector<int64_t>>& bias_sizes,
         const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
         const std::vector<int64_t>& dilation, bool transposed,
         const std::vector<int64_t>& output_padding, int64_t groups,

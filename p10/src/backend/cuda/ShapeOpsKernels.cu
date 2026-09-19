@@ -323,8 +323,9 @@ Tensor narrow_cuda(const Tensor& self, int64_t dim, int64_t start, int64_t lengt
     return self.slice(dim, start, start + length, 1);
 }
 
-std::vector<Tensor> split_with_sizes_cuda(const Tensor& self, std::vector<int64_t> split_sizes,
+std::vector<Tensor> split_with_sizes_cuda(const Tensor& self, const std::vector<int64_t>& split_sizes_arg,
                                           int64_t dim) {
+    std::vector<int64_t> split_sizes = split_sizes_arg;
     if (self.dim() == 0) {
         TP_THROW(RuntimeError, "split expects at least a 1-dimensional tensor");
     }
@@ -791,9 +792,10 @@ Tensor channel_shuffle_cuda(const Tensor& self, int64_t groups) {
             const int64_t rest = linear_index / inner; \
             const int64_t output_c = rest % C; \
             const int64_t batch = rest / C; \
-            const int64_t output_group = output_c / cg; \
-            const int64_t channel_in_group = output_c % cg; \
-            const int64_t input_c = channel_in_group * groups + output_group; \
+            /* output channel j * groups + g reads input channel g * cg + j */ \
+            const int64_t position = output_c / groups; \
+            const int64_t group = output_c % groups; \
+            const int64_t input_c = group * cg + position; \
             return source[(batch * C + input_c) * inner + tail]; \
         }); \
         break; \

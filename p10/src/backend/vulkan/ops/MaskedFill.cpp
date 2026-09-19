@@ -82,7 +82,7 @@ Tensor masked_fill_impl(
 } // namespace
 
 Tensor masked_fill_scalar_kernel(
-    const Tensor& self, const Tensor& mask, Scalar value) {
+    const Tensor& self, const Tensor& mask, const Scalar& value) {
   return masked_fill_impl(self, mask, value, "masked_fill");
 }
 
@@ -96,7 +96,7 @@ Tensor masked_fill_tensor_kernel(
 }
 
 Tensor& masked_fill_scalar_inplace_kernel(
-    Tensor& self, const Tensor& mask, Scalar value) {
+    Tensor& self, const Tensor& mask, const Scalar& value) {
   self.copy_(masked_fill_scalar_kernel(self, mask, value));
   return self;
 }

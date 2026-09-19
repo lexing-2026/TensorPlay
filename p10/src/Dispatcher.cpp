@@ -9,7 +9,8 @@ Dispatcher& Dispatcher::singleton() {
     return *instance;
 }
 
-void Dispatcher::registerKernel(const std::string& op_name, DispatchKey key, KernelFunction kernel) {
+void Dispatcher::registerKernel(const std::string& op_name, DispatchKey key, KernelFunction kernel,
+                                const std::type_info* signature) {
     if (dispatchKeyIndex(key) >= kDispatchKeyCount) {
         throw std::invalid_argument("invalid dispatch key for operator: " + op_name);
     }
@@ -18,7 +19,17 @@ void Dispatcher::registerKernel(const std::string& op_name, DispatchKey key, Ker
     if (!table) {
         table = std::make_unique<DispatchTable>(op_name);
     }
+    table->signatures[dispatchKeyIndex(key)].store(signature, std::memory_order_release);
     table->kernels[dispatchKeyIndex(key)].store(kernel, std::memory_order_release);
+}
+
+const std::type_info* Dispatcher::signature(const std::string& op_name, DispatchKey key) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = operators_.find(op_name);
+    if (it == operators_.end() || dispatchKeyIndex(key) >= kDispatchKeyCount) {
+        return nullptr;
+    }
+    return it->second->signatures[dispatchKeyIndex(key)].load(std::memory_order_acquire);
 }
 
 KernelFunction Dispatcher::getKernel(const std::string& op_name, DispatchKey key) {

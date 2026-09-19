@@ -33,6 +33,7 @@
 #include <string>
 #include <tuple>
 #include <vector>
+#include "OutWrite.h"
 
 namespace tensorplay {
 namespace cuda {
@@ -156,7 +157,7 @@ __global__ void histc_count_kernel(const InT* input, int64_t n, double lo,
     }
 }
 
-Tensor interop_histc_cuda(const Tensor& self, int64_t bins, Scalar min, Scalar max) {
+Tensor interop_histc_cuda(const Tensor& self, int64_t bins, const Scalar& min, const Scalar& max) {
     if (bins <= 0) TP_THROW(RuntimeError, "histc(): bins must be positive");
     // Integer inputs compute in double precision and report counts in the
     // input dtype; that keeps the CUDA contract wider than the CPU one.
@@ -235,8 +236,8 @@ Tensor interop_histc_cuda(const Tensor& self, int64_t bins, Scalar min, Scalar m
     return counts.to(self.dtype());
 }
 
-Tensor& interop_histc_out_cuda(const Tensor& self, int64_t bins, Scalar min,
-                               Scalar max, Tensor& out) {
+Tensor& interop_histc_out_cuda(const Tensor& self, int64_t bins, const Scalar& min,
+                               const Scalar& max, Tensor& out) {
     if (out.dtype() != self.dtype()) {
         TP_THROW(TypeError,
                  "histc(): out tensor must have the same dtype as the input");
@@ -371,7 +372,7 @@ Tensor& interop_nonzero_static_out_cuda(const Tensor& self, int64_t size,
     if (copy_n > 0) {
         result.narrow(0, 0, copy_n).copy_(nz.narrow(0, 0, copy_n));
     }
-    out = std::move(result);
+    write_out(out, result);
     return out;
 }
 
@@ -453,17 +454,17 @@ Tensor& interop_embedding_renorm__cuda(Tensor& weight, const Tensor& indices,
 // ---------------------------------------------------------------------------
 
 Tensor interop_sspaddmm_cuda(const Tensor& /*self*/, const Tensor& mat1,
-                             const Tensor& /*mat2*/, Scalar /*beta*/,
-                             Scalar /*alpha*/) {
+                             const Tensor& /*mat2*/, const Scalar& /*beta*/,
+                             const Scalar& /*alpha*/) {
     TP_THROW(NotImplementedError,
              "sspaddmm requires a sparse CUDA backend; mat1 is dense with dtype ",
              toString(mat1.dtype()));
 }
 
 Tensor& interop_sspaddmm_out_cuda(const Tensor& self, const Tensor& mat1,
-                                  const Tensor& mat2, Scalar beta, Scalar alpha,
+                                  const Tensor& mat2, const Scalar& beta, const Scalar& alpha,
                                   Tensor& out) {
-    out = interop_sspaddmm_cuda(self, mat1, mat2, beta, alpha);
+    write_out(out, interop_sspaddmm_cuda(self, mat1, mat2, beta, alpha));
     return out;
 }
 
@@ -596,7 +597,7 @@ Tensor interop_chunk_cat_cuda(const std::vector<Tensor>& tensors, int64_t dim,
 Tensor& interop__chunk_cat_out_cuda(const std::vector<Tensor>& tensors,
                                     int64_t dim, int64_t num_chunks,
                                     Tensor& out) {
-    out = interop_chunk_cat_cuda(tensors, dim, num_chunks);
+    write_out(out, interop_chunk_cat_cuda(tensors, dim, num_chunks));
     return out;
 }
 
@@ -661,8 +662,8 @@ Tensor& interop__conv_depthwise2d_out_cuda(
         const std::vector<int64_t>& padding,
         const std::vector<int64_t>& dilation, Tensor& out) {
     (void)kernel_size;
-    out = dispatch_cuda<Tensor>("conv2d", self, weight, bias, stride, padding,
-                                dilation, weight.size(0));
+    write_out(out, dispatch_cuda<Tensor>("conv2d", self, weight, bias, stride, padding,
+                                dilation, weight.size(0)));
     return out;
 }
 
@@ -695,8 +696,8 @@ Tensor& interop__slow_conv2d_forward_output_cuda(
         const std::vector<int64_t>& padding, Tensor& output) {
     (void)kernel_size;
     const std::vector<int64_t> dilation{1, 1};
-    output = dispatch_cuda<Tensor>("conv2d", self, weight, bias, stride,
-                                   padding, dilation, int64_t(1));
+    write_out(output, dispatch_cuda<Tensor>("conv2d", self, weight, bias, stride,
+                                   padding, dilation, int64_t(1)));
     return output;
 }
 
@@ -708,15 +709,15 @@ std::tuple<Tensor, Tensor, Tensor> interop__slow_conv2d_backward_grad_input_cuda
         Tensor& grad_weight, Tensor& grad_bias) {
     (void)kernel_size;
     const std::vector<int64_t> dilation{1, 1};
-    grad_input = dispatch_cuda<Tensor>("conv2d_grad_input", grad_output, self,
+    write_out(grad_input, dispatch_cuda<Tensor>("conv2d_grad_input", grad_output, self,
                                       weight, stride, padding, dilation,
-                                      int64_t(1));
-    grad_weight = dispatch_cuda<Tensor>("conv2d_grad_weight", grad_output, self,
+                                      int64_t(1)));
+    write_out(grad_weight, dispatch_cuda<Tensor>("conv2d_grad_weight", grad_output, self,
                                        weight, stride, padding, dilation,
-                                       int64_t(1));
-    grad_bias = dispatch_cuda<Tensor>("conv2d_grad_bias", grad_output, self,
+                                       int64_t(1)));
+    write_out(grad_bias, dispatch_cuda<Tensor>("conv2d_grad_bias", grad_output, self,
                                       weight, stride, padding, dilation,
-                                      int64_t(1));
+                                      int64_t(1)));
     return std::make_tuple(grad_input, grad_weight, grad_bias);
 }
 
@@ -777,8 +778,8 @@ Tensor& interop_slow_conv_transpose2d_out_cuda(
         const std::vector<int64_t>& output_padding,
         const std::vector<int64_t>& dilation, Tensor& out) {
     (void)kernel_size;
-    out = dispatch_cuda<Tensor>("conv_transpose2d", input, weight, bias, stride,
-                                padding, output_padding, int64_t(1), dilation);
+    write_out(out, dispatch_cuda<Tensor>("conv_transpose2d", input, weight, bias, stride,
+                                padding, output_padding, int64_t(1), dilation));
     return out;
 }
 
@@ -803,9 +804,9 @@ Tensor& interop_slow_conv_transpose3d_out_cuda(
         const std::vector<int64_t>& output_padding,
         const std::vector<int64_t>& dilation, Tensor& out) {
     (void)kernel_size;
-    out = dispatch_cuda<Tensor>("conv_transpose3d", input, weight, bias,
+    write_out(out, dispatch_cuda<Tensor>("conv_transpose3d", input, weight, bias,
                                 stride, padding, output_padding, int64_t(1),
-                                dilation);
+                                dilation));
     return out;
 }
 
@@ -831,9 +832,14 @@ std::tuple<Tensor, Tensor, Tensor> interop_native_batch_norm_out_cuda(
         const std::optional<Tensor>& running_var, bool training,
         double momentum, double eps, Tensor& out, Tensor& save_mean,
         Tensor& save_invstd) {
-    std::tie(out, save_mean, save_invstd) = batch_norm_forward_impl(
+    {
+        auto __tp_result = batch_norm_forward_impl(
         input, weight, bias, running_mean, running_var, training, momentum,
         eps);
+        write_out(out, std::get<0>(__tp_result));
+        write_out(save_mean, std::get<1>(__tp_result));
+        write_out(save_invstd, std::get<2>(__tp_result));
+    }
     return std::make_tuple(out, save_mean, save_invstd);
 }
 
@@ -850,9 +856,14 @@ std::tuple<Tensor, Tensor, Tensor> interop__native_batch_norm_legit_out_cuda(
         const std::optional<Tensor>& bias, Tensor& running_mean,
         Tensor& running_var, bool training, double momentum, double eps,
         Tensor& out, Tensor& save_mean, Tensor& save_invstd) {
-    std::tie(out, save_mean, save_invstd) = batch_norm_forward_impl(
+    {
+        auto __tp_result = batch_norm_forward_impl(
         input, weight, bias, running_mean, running_var, training, momentum,
         eps);
+        write_out(out, std::get<0>(__tp_result));
+        write_out(save_mean, std::get<1>(__tp_result));
+        write_out(save_invstd, std::get<2>(__tp_result));
+    }
     return std::make_tuple(out, save_mean, save_invstd);
 }
 
@@ -891,22 +902,25 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> interop__batch_norm_with_update_cuda(
     return std::make_tuple(out, save_mean, save_invstd, reserve);
 }
 
-std::tuple<Tensor, Tensor, Tensor> interop__batch_norm_no_update_cuda(
+std::tuple<Tensor, Tensor, Tensor, Tensor> interop__batch_norm_no_update_cuda(
         const Tensor& input, const std::optional<Tensor>& weight,
         const std::optional<Tensor>& bias,
         const std::optional<Tensor>& running_mean,
         const std::optional<Tensor>& running_var, double momentum,
         double eps) {
-    // Normalize with batch statistics but never touch the running buffers:
-    // the kernel sees no statistics and works on internal scratch.
-    Tensor out;
-    Tensor save_mean;
-    Tensor save_invstd;
-    std::tie(out, save_mean, save_invstd) = batch_norm_forward_impl(
-        input, weight, bias, std::nullopt, std::nullopt, true, momentum, eps);
-    (void)running_mean;
-    (void)running_var;
-    return std::make_tuple(out, save_mean, save_invstd);
+    // Evaluation-style normalization with the running statistics, which are
+    // read but never updated; the fourth output is the (empty) reserve.
+    TP_CHECK(running_mean.has_value() && running_mean->defined(),
+             "running_mean must be defined in evaluation mode");
+    TP_CHECK(running_var.has_value() && running_var->defined(),
+             "running_var must be defined in evaluation mode");
+    auto result = batch_norm_forward_impl(input, weight, bias, running_mean,
+                                          running_var, false, momentum, eps);
+    // Evaluation keeps no batch statistics: the saved values are empty.
+    Tensor save_mean = Tensor::empty({0}, input.dtype(), input.device());
+    Tensor save_var = Tensor::empty({0}, input.dtype(), input.device());
+    Tensor reserve = Tensor::empty({0}, DType::UInt8, input.device());
+    return std::make_tuple(std::get<0>(result), save_mean, save_var, reserve);
 }
 
 // batch_norm_stats: per-channel mean and reciprocal standard deviation.
@@ -942,7 +956,7 @@ Tensor& interop_batch_norm_elemt_out_cuda(const Tensor& input,
                                           const Tensor& mean,
                                           const Tensor& invstd, double eps,
                                           Tensor& out) {
-    out = interop_batch_norm_elemt_cuda(input, weight, bias, mean, invstd, eps);
+    write_out(out, interop_batch_norm_elemt_cuda(input, weight, bias, mean, invstd, eps));
     return out;
 }
 
@@ -1220,7 +1234,7 @@ Tensor& interop__fft_r2c_out_cuda(const Tensor& self,
                                  const std::vector<int64_t>& dim,
                                  int64_t normalization, bool onesided,
                                  Tensor& out) {
-    out = interop__fft_r2c_cuda(self, dim, normalization, onesided);
+    write_out(out, interop__fft_r2c_cuda(self, dim, normalization, onesided));
     return out;
 }
 
@@ -1241,7 +1255,7 @@ Tensor& interop__fft_c2r_out_cuda(const Tensor& self,
                                  const std::vector<int64_t>& dim,
                                  int64_t normalization, int64_t last_dim_size,
                                  Tensor& out) {
-    out = interop__fft_c2r_cuda(self, dim, normalization, last_dim_size);
+    write_out(out, interop__fft_c2r_cuda(self, dim, normalization, last_dim_size));
     return out;
 }
 
@@ -1268,7 +1282,7 @@ Tensor& interop__fft_c2c_out_cuda(const Tensor& self,
                                  const std::vector<int64_t>& dim,
                                  int64_t normalization, bool forward,
                                  Tensor& out) {
-    out = interop__fft_c2c_cuda(self, dim, normalization, forward);
+    write_out(out, interop__fft_c2c_cuda(self, dim, normalization, forward));
     return out;
 }
 
@@ -1820,14 +1834,16 @@ Tensor interop__adaptive_avg_pool3d_backward_cuda(const Tensor& grad_output,
 
 void interop__cummax_helper_cuda(const Tensor& self, Tensor& values,
                                  Tensor& indices, int64_t dim) {
-    std::tie(values, indices) =
-        dispatch_cuda<std::tuple<Tensor, Tensor>>("cummax", self, dim);
+    auto result = dispatch_cuda<std::tuple<Tensor, Tensor>>("cummax", self, dim);
+    write_out(values, std::get<0>(result));
+    write_out(indices, std::get<1>(result));
 }
 
 void interop__cummin_helper_cuda(const Tensor& self, Tensor& values,
                                  Tensor& indices, int64_t dim) {
-    std::tie(values, indices) =
-        dispatch_cuda<std::tuple<Tensor, Tensor>>("cummin", self, dim);
+    auto result = dispatch_cuda<std::tuple<Tensor, Tensor>>("cummin", self, dim);
+    write_out(values, std::get<0>(result));
+    write_out(indices, std::get<1>(result));
 }
 
 // ---------------------------------------------------------------------------

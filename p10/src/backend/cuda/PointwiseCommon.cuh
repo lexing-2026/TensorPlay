@@ -338,7 +338,8 @@ struct RreluWithNoiseEvalBackwardFunctor {
     double slope_;
     explicit RreluWithNoiseEvalBackwardFunctor(double s) : slope_(s) {}
     template<typename T> __host__ __device__ T operator()(T dy, T x) const {
-        return x >= static_cast<T>(0) ? dy : dy * static_cast<T>(slope_);
+        // The leaky slope applies at zero as well (x > 0 passes through).
+        return x > static_cast<T>(0) ? dy : dy * static_cast<T>(slope_);
     }
 };
 

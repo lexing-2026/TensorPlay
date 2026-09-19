@@ -179,7 +179,7 @@ Tensor kaiser_window_beta_native(int64_t window_length, bool periodic,
 // Inclusive interval: the end participates, realized as arange over
 // [start, end + step) so integer and float steps both terminate on the
 // last representable value below end + step.
-Tensor range_native(Scalar start, Scalar end, Scalar step,
+Tensor range_native(const Scalar& start, const Scalar& end, const Scalar& step,
                     std::optional<DType> dtype, std::optional<Device> device) {
     Scalar end_plus_step;
     if (end.isFloatingPoint() || step.isFloatingPoint()) {

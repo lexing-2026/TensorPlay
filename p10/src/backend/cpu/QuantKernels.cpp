@@ -529,7 +529,7 @@ Tensor quantized_linear_cpu(const Tensor& input, const Tensor& weight,
                             double input_scale, int64_t input_zero_point,
                             const Tensor& weight_scales,
                             const Tensor& weight_zero_points,
-                            std::optional<Tensor> bias,
+                            const std::optional<Tensor>& bias,
                             double out_scale, int64_t out_zero_point) {
     // Fused Int8 GEMM with per-channel weight requantization (the dynamic
     // quantized linear output stage): out[m, n] = input_scale *
@@ -762,7 +762,7 @@ Tensor quantized_div_cpu(
 Tensor quantized_clamp_cpu(
     const Tensor& self, double self_scale, int64_t self_zero_point,
     double out_scale, int64_t out_zero_point,
-    std::optional<Scalar> min, std::optional<Scalar> max) {
+    const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
     if (self.dtype() != DType::QInt8) {
         TP_THROW(TypeError, "quantized_clamp(): expected a QInt8 tensor");
     }
@@ -813,7 +813,7 @@ Tensor quantized_max_pool2d_cpu(
 }
 
 Tensor quantized_conv2d_cpu(
-    const Tensor& input, const Tensor& weight, std::optional<Tensor> bias,
+    const Tensor& input, const Tensor& weight, const std::optional<Tensor>& bias,
     double input_scale, int64_t input_zero_point, double weight_scale,
     int64_t weight_zero_point, double out_scale, int64_t out_zero_point,
     const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
@@ -1723,7 +1723,7 @@ Tensor quantize_per_tensor_dynamic_cpu(const Tensor& self, DType dtype,
 Tensor quantized_linear_dynamic_cpu(const Tensor& input, const Tensor& weight,
                                     const Tensor& weight_scales,
                                     const Tensor& weight_zero_points,
-                                    std::optional<Tensor> bias,
+                                    const std::optional<Tensor>& bias,
                                     bool reduce_range) {
     // Dynamic quantized linear: activations are quantized per row from their
     // observed range, the GEMM runs in the integer domain, and the result is
@@ -2453,7 +2453,7 @@ Tensor quantized_max_pool3d_cpu(
 }
 
 Tensor quantized_conv1d_cpu(
-    const Tensor& input, const Tensor& weight, std::optional<Tensor> bias,
+    const Tensor& input, const Tensor& weight, const std::optional<Tensor>& bias,
     double input_scale, int64_t input_zero_point, double weight_scale,
     int64_t weight_zero_point, double out_scale, int64_t out_zero_point,
     const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
@@ -2497,7 +2497,7 @@ Tensor quantized_conv1d_cpu(
 }
 
 Tensor quantized_conv3d_cpu(
-    const Tensor& input, const Tensor& weight, std::optional<Tensor> bias,
+    const Tensor& input, const Tensor& weight, const std::optional<Tensor>& bias,
     double input_scale, int64_t input_zero_point, double weight_scale,
     int64_t weight_zero_point, double out_scale, int64_t out_zero_point,
     const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,

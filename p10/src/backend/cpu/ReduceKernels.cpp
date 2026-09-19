@@ -19,6 +19,7 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include "OutWrite.h"
 
 namespace tensorplay {
 namespace cpu {
@@ -676,8 +677,8 @@ std::tuple<Tensor, Tensor> nanmedian_dim_values_cpu(
     const Tensor& self, int64_t dim, bool keepdim, Tensor& values,
     Tensor& indices) {
     auto result = nanmedian_dim_cpu(self, dim, keepdim);
-    values = std::get<0>(result);
-    indices = std::get<1>(result);
+    write_out(values, std::get<0>(result));
+    write_out(indices, std::get<1>(result));
     return {values, indices};
 }
 
@@ -883,11 +884,11 @@ Tensor count_nonzero_cpu(const Tensor& self, const std::vector<int64_t>& dim) {
         [](double acc) { return acc; });
 }
 
-Tensor dist_cpu(const Tensor& self, const Tensor& other, Scalar p) {
+Tensor dist_cpu(const Tensor& self, const Tensor& other, const Scalar& p) {
     return (self - other).norm(p.toDouble());
 }
 
-Tensor renorm_cpu(const Tensor& self, Scalar p, int64_t dim, Scalar maxnorm) {
+Tensor renorm_cpu(const Tensor& self, const Scalar& p, int64_t dim, const Scalar& maxnorm) {
     if (p.isComplex()) {
         TP_THROW(TypeError, "renorm: p must be real-valued");
     }

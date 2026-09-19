@@ -14,7 +14,7 @@ using namespace tensorplay::parallel;
 
 // Composite over narrow/fill_/copy_ so one body serves CPU and CUDA; negative
 // pads crop the input through narrow, positive pads fill an output canvas.
-Tensor constant_pad_nd_cpu(const Tensor& self, const std::vector<int64_t>& pad, Scalar value) {
+Tensor constant_pad_nd_cpu(const Tensor& self, const std::vector<int64_t>& pad, const Scalar& value) {
     auto input_sizes = self.shape();
     int64_t l_inp = self.dim();
     int64_t l_pad = static_cast<int64_t>(pad.size()) / 2;

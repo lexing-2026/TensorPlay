@@ -93,7 +93,7 @@ Tensor& clamp_tensor_out_cuda(const Tensor& self, const std::optional<Tensor>& m
 }
 
 
-Tensor clamp_kernel_cuda(const Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max) {
+Tensor clamp_kernel_cuda(const Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
     if (self.numel() == 0) return result;
     const bool has_min = min.has_value();
@@ -123,7 +123,7 @@ Tensor clamp_kernel_cuda(const Tensor& self, std::optional<Scalar> min, std::opt
     return result;
 }
 
-Tensor clamp_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max) {
+Tensor clamp_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(grad_output.shape()), grad_output.dtype(), grad_output.device());
     int64_t n = grad_output.numel();
     if (n == 0) return result;
@@ -290,7 +290,7 @@ Tensor pow_kernel_cuda(const Tensor& self, const Tensor& other) {
     }
     return binary_float_op_kernel_v2(self, other, PowFunctor());
 }
-Tensor pow_scalar_kernel_cuda(const Tensor& self, Scalar exponent) {
+Tensor pow_scalar_kernel_cuda(const Tensor& self, const Scalar& exponent) {
     if (!isComplexType(self.dtype()) && !exponent.isComplex() &&
         isIntegralType(self.dtype()) && !exponent.isFloatingPoint() &&
         exponent.to<int64_t>() < 0) {
@@ -314,7 +314,7 @@ Tensor pow_scalar_kernel_cuda(const Tensor& self, Scalar exponent) {
     }
     return unary_float_op_kernel_v2(self, PowScalarFunctor(exponent.toDouble()));
 }
-Tensor pow_scalar_tensor_kernel_cuda(Scalar base, const Tensor& exponent) {
+Tensor pow_scalar_tensor_kernel_cuda(const Scalar& base, const Tensor& exponent) {
     const DType result_dtype = ops::result_type(base, exponent);
     if (!base.isComplex() && base.toDouble() == 1.0) {
         return Tensor::ones(static_cast<std::vector<int64_t>>(exponent.shape()),
@@ -417,7 +417,7 @@ void complex_lerp_tensor_loop(TensorIterator& iter) {
     });
 }
 
-Tensor lerp_scalar_kernel_cuda(const Tensor& self, const Tensor& end, Scalar weight) {
+Tensor lerp_scalar_kernel_cuda(const Tensor& self, const Tensor& end, const Scalar& weight) {
     if (self.shape() != end.shape()) TP_THROW(RuntimeError, "CUDA lerp: broadcasting not supported");
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
     if (self.numel() == 0) return result;
@@ -525,7 +525,7 @@ Tensor lerp_tensor_kernel_cuda(const Tensor& self, const Tensor& end, const Tens
     return result;
 }
 
-Tensor& lerp_scalar_inplace_kernel_cuda(Tensor& self, const Tensor& end, Scalar weight) {
+Tensor& lerp_scalar_inplace_kernel_cuda(Tensor& self, const Tensor& end, const Scalar& weight) {
     self.copy_(lerp_scalar_kernel_cuda(self, end, weight));
     return self;
 }

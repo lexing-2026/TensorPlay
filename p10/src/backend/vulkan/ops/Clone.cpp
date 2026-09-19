@@ -9,7 +9,11 @@ namespace tensorplay {
 namespace vulkan {
 namespace ops {
 
-Tensor clone_kernel(const Tensor& self) {
+Tensor clone_kernel(const Tensor& self, std::optional<int64_t> memory_format) {
+  // Textures carry no strides: only the layout-neutral formats apply.
+  const int64_t format = memory_format.value_or(1);  // Preserve
+  TP_CHECK(format == 1 || format == 0,
+           "Vulkan supports Preserve and Contiguous memory formats");
   api::Context* const context = api::context();
 
   api::vTensor v_self = convert(self);

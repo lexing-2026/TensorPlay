@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <type_traits>
+#include <typeinfo>
 #include <utility>
 #include <unordered_map>
 #include <vector>
@@ -64,6 +65,9 @@ struct P10_API DispatchTable {
         for (auto& kernel : kernels) {
             kernel.store(nullptr, std::memory_order_relaxed);
         }
+        for (auto& signature : signatures) {
+            signature.store(nullptr, std::memory_order_relaxed);
+        }
     }
 
     DispatchTable(const DispatchTable&) = delete;
@@ -71,6 +75,12 @@ struct P10_API DispatchTable {
 
     std::string name;
     std::array<std::atomic<KernelFunction>, kDispatchKeyCount> kernels;
+    // Exact function-pointer type each kernel was registered with (null for
+    // registrations made through the untyped entry point).  Every caller of a
+    // handle casts the slot back to the stub signature, so a kernel whose
+    // type differs is undefined behaviour; the recorded type lets that be
+    // detected instead of executed.
+    std::array<std::atomic<const std::type_info*>, kDispatchKeyCount> signatures;
 };
 
 class P10_API OperatorHandle {
@@ -111,8 +121,18 @@ class P10_API Dispatcher {
 public:
     static Dispatcher& singleton();
 
-    // Register a kernel for a specific operator and dispatch key
-    void registerKernel(const std::string& op_name, DispatchKey key, KernelFunction kernel);
+    // Register a kernel for a specific operator and dispatch key.  The
+    // typed overload records the kernel's exact signature; prefer it.
+    void registerKernel(const std::string& op_name, DispatchKey key, KernelFunction kernel,
+                        const std::type_info* signature = nullptr);
+    template <typename Return, typename... Args>
+    void registerKernel(const std::string& op_name, DispatchKey key, Return (*kernel)(Args...)) {
+        registerKernel(op_name, key, reinterpret_cast<KernelFunction>(kernel),
+                       &typeid(Return (*)(Args...)));
+    }
+
+    // Signature recorded for ``op_name`` under ``key`` (null when unknown).
+    const std::type_info* signature(const std::string& op_name, DispatchKey key) const;
 
     // Get the kernel for a specific operator and dispatch key
     KernelFunction getKernel(const std::string& op_name, DispatchKey key);
@@ -221,7 +241,7 @@ public:
 #define TENSORPLAY_REGISTER_KERNEL(OP_NAME, KEY, FUNC) \
     static struct Register##OP_NAME##KEY { \
         Register##OP_NAME##KEY() { \
-            ::tensorplay::Dispatcher::singleton().registerKernel(#OP_NAME, ::tensorplay::DispatchKey::KEY, (::tensorplay::KernelFunction)FUNC); \
+            ::tensorplay::Dispatcher::singleton().registerKernel(#OP_NAME, ::tensorplay::DispatchKey::KEY, +FUNC); \
         } \
     } register_##OP_NAME##KEY;
 
@@ -237,8 +257,8 @@ public:
     template<typename Func>
     Library& impl(const std::string& name, Func func) {
         // Unary + decays a captureless lambda to its function pointer, so
-        // lambdas and named functions register through the same path.
-        Dispatcher::singleton().registerKernel(name, key_, (KernelFunction)(+func));
+        // lambdas and named functions register through the same typed path.
+        Dispatcher::singleton().registerKernel(name, key_, +func);
         return *this;
     }
 

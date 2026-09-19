@@ -11,7 +11,7 @@ namespace tensorplay {
 namespace cpu {
 
 Tensor sparse_coo_tensor_cpu(const Tensor& indices, const Tensor& values,
-                             std::optional<std::vector<int64_t>> size,
+                             const std::optional<std::vector<int64_t>>& size,
                              bool is_coalesced);
 Tensor coalesce_sparse_cpu(const Tensor& self);
 Tensor sparse_mask_cpu(const Tensor& dense, const Tensor& mask);
@@ -39,11 +39,11 @@ Tensor sparse_mul_cpu(const Tensor& self, const Tensor& other);
 Tensor sparse_add_cpu(const Tensor& self, const Tensor& other);
 // coalesced COO over the kept dims (duplicates folded); all sparse dims ->
 // dense tensor.  ``dtype`` converts the input first (accumulation dtype).
-Tensor sparse_sum_cpu(const Tensor& self, std::optional<std::vector<int64_t>> dim,
+Tensor sparse_sum_cpu(const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
                       std::optional<DType> dtype);
 // ``layout`` selects the output: 0 = sparse COO, 1 = sparse CSR.
 Tensor spdiags_cpu(const Tensor& diagonals, const Tensor& offsets,
-                   std::vector<int64_t> shape,
+                   const std::vector<int64_t>& shape,
                    std::optional<int64_t> layout);
 // r = beta * t + alpha * (sparse COO @ dense), materialized as a sparse COO
 // over the union of the accumulator's coordinates and every column of each
@@ -69,16 +69,16 @@ Tensor _sparse_sum_dtype_cpu(const Tensor& input, DType dtype);
 Tensor _sparse_sum_dim_cpu(const Tensor& input, std::vector<int64_t> dims_to_sum,
                            std::optional<DType> dtype);
 Tensor _sparse_sum_dim_dtype_cpu(const Tensor& input,
-                                 std::vector<int64_t> dims_to_sum,
+                                 const std::vector<int64_t>& dims_to_sum,
                                  DType dtype);
 Tensor _sparse_sum_dim_cpu_2(const Tensor& input,
-                             std::vector<int64_t> dims_to_sum);
+                             const std::vector<int64_t>& dims_to_sum);
 Tensor _sparse_sum_backward_cpu(const Tensor& grad, const Tensor& input,
-                                std::vector<int64_t> dims_to_sum);
+                                const std::vector<int64_t>& dims_to_sum);
 // Sparse norm: full reductions only, no keepdim/dtype support.
-Tensor native_norm_cpu(const Tensor& self, Scalar p);
-Tensor native_norm_dim_cpu(const Tensor& self, std::optional<Scalar> p,
-                           std::vector<int64_t> dims, bool keepdim,
+Tensor native_norm_cpu(const Tensor& self, const Scalar& p);
+Tensor native_norm_dim_cpu(const Tensor& self, const std::optional<Scalar>& p,
+                           const std::vector<int64_t>& dims, bool keepdim,
                            std::optional<DType> dtype);
 
 } // namespace cpu
@@ -87,7 +87,7 @@ Tensor native_norm_dim_cpu(const Tensor& self, std::optional<Scalar> p,
 namespace cuda {
 
 Tensor sparse_coo_tensor_cuda(const Tensor& indices, const Tensor& values,
-                              std::optional<std::vector<int64_t>> size,
+                              const std::optional<std::vector<int64_t>>& size,
                               bool is_coalesced);
 Tensor coalesce_sparse_cuda(const Tensor& self);
 Tensor sparse_mask_cuda(const Tensor& dense, const Tensor& mask);
@@ -103,10 +103,10 @@ Tensor to_sparse_coo_cuda(const Tensor& self);
 Tensor to_sparse_coo_cuda_sparse_dim(const Tensor& self, int64_t sparse_dim);
 Tensor to_sparse_csr_cuda(const Tensor& self);
 Tensor sparse_mm_cuda(const Tensor& self, const Tensor& dense);
-Tensor sparse_sum_cuda(const Tensor& self, std::optional<std::vector<int64_t>> dim,
+Tensor sparse_sum_cuda(const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
                        std::optional<DType> dtype);
 Tensor spdiags_cuda(const Tensor& diagonals, const Tensor& offsets,
-                    std::vector<int64_t> shape,
+                    const std::vector<int64_t>& shape,
                     std::optional<int64_t> layout);
 
 Tensor sparse_mul_cuda(const Tensor& self, const Tensor& other);

@@ -376,7 +376,7 @@ Tensor histc_native(const Tensor& self, int64_t bins, const Scalar& min,
 
 std::vector<Tensor> histogramdd_bin_edges_native(
         const Tensor& self, const std::vector<int64_t>& bins,
-        std::optional<std::vector<double>> range,
+        const std::optional<std::vector<double>>& range,
         const std::optional<Tensor>& weight, bool density) {
     (void)weight;
     (void)density;
@@ -385,7 +385,7 @@ std::vector<Tensor> histogramdd_bin_edges_native(
 
 Tensor histogramdd_from_bin_cts_native(
         const Tensor& self, const std::vector<int64_t>& bins,
-        std::optional<std::vector<double>> range,
+        const std::optional<std::vector<double>>& range,
         const std::optional<Tensor>& weight, bool density) {
     std::vector<Tensor> bin_edges =
         histogramdd_make_bin_edges(self, bins, range);
@@ -405,7 +405,7 @@ Tensor histogramdd_from_bin_tensors_native(
 
 std::tuple<Tensor, std::vector<Tensor>> histogramdd_native(
         const Tensor& self, const std::vector<int64_t>& bins,
-        std::optional<std::vector<double>> range,
+        const std::optional<std::vector<double>>& range,
         const std::optional<Tensor>& weight, bool density) {
     std::vector<Tensor> bin_edges =
         histogramdd_make_bin_edges(self, bins, range);
@@ -415,7 +415,7 @@ std::tuple<Tensor, std::vector<Tensor>> histogramdd_native(
 
 std::tuple<Tensor, std::vector<Tensor>> histogramdd_int_bins_native(
         const Tensor& self, int64_t bins,
-        std::optional<std::vector<double>> range,
+        const std::optional<std::vector<double>>& range,
         const std::optional<Tensor>& weight, bool density) {
     histogramdd_check_input(self);
     std::vector<int64_t> bin_counts(
@@ -425,7 +425,7 @@ std::tuple<Tensor, std::vector<Tensor>> histogramdd_int_bins_native(
 
 std::tuple<Tensor, std::vector<Tensor>> histogramdd_tensorlist_bins_native(
         const Tensor& self, const std::vector<Tensor>& bins,
-        std::optional<std::vector<double>> range,
+        const std::optional<std::vector<double>>& range,
         const std::optional<Tensor>& weight, bool density) {
     (void)range;
     Tensor hist = histogramdd_from_bin_tensors_native(self, bins, weight, density);

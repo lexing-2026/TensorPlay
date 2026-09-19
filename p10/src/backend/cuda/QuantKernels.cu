@@ -552,7 +552,7 @@ Tensor quantized_max_pool2d_cuda(
 }
 
 Tensor quantized_conv2d_cuda(
-    const Tensor& input, const Tensor& weight, std::optional<Tensor> bias,
+    const Tensor& input, const Tensor& weight, const std::optional<Tensor>& bias,
     double input_scale, int64_t input_zero_point, double weight_scale,
     int64_t weight_zero_point, double out_scale, int64_t out_zero_point,
     const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,

@@ -16,6 +16,7 @@
 #include <tuple>
 #include <type_traits>
 #include <vector>
+#include <limits>
 
 namespace tensorplay {
 namespace cuda {
@@ -76,10 +77,10 @@ void check_cuda_launch(const char* name) {
 
 Tensor batch_norm_cuda(
     const Tensor& input,
-    std::optional<Tensor> weight_opt,
-    std::optional<Tensor> bias_opt,
-    std::optional<Tensor> running_mean_opt,
-    std::optional<Tensor> running_var_opt,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& bias_opt,
+    const std::optional<Tensor>& running_mean_opt,
+    const std::optional<Tensor>& running_var_opt,
     bool training,
     double momentum,
     double eps) {
@@ -162,9 +163,9 @@ Tensor batch_norm_cuda(
 std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cuda(
     const Tensor& grad_output,
     const Tensor& input,
-    std::optional<Tensor> weight_opt,
-    std::optional<Tensor> running_mean_opt,
-    std::optional<Tensor> running_var_opt,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& running_mean_opt,
+    const std::optional<Tensor>& running_var_opt,
     bool training,
     double eps) {
     check_batch_norm_input(input);
@@ -1043,10 +1044,10 @@ std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cuda(
     return std::make_tuple(grad_input, grad_weight, grad_bias);
 }
 
-Tensor instance_norm_cuda(const Tensor& input, std::optional<Tensor> weight_opt,
-                          std::optional<Tensor> bias_opt,
-                          std::optional<Tensor> running_mean_opt,
-                          std::optional<Tensor> running_var_opt,
+Tensor instance_norm_cuda(const Tensor& input, const std::optional<Tensor>& weight_opt,
+                          const std::optional<Tensor>& bias_opt,
+                          const std::optional<Tensor>& running_mean_opt,
+                          const std::optional<Tensor>& running_var_opt,
                           bool use_input_stats, double momentum, double eps) {
     if (!use_input_stats) {
         // Eval with tracked stats == BatchNorm eval.
@@ -1092,9 +1093,9 @@ Tensor instance_norm_cuda(const Tensor& input, std::optional<Tensor> weight_opt,
 
 std::tuple<Tensor, Tensor, Tensor> instance_norm_backward_cuda(
     const Tensor& grad_output, const Tensor& input,
-    std::optional<Tensor> weight_opt, std::optional<Tensor> bias_opt,
-    std::optional<Tensor> running_mean_opt,
-    std::optional<Tensor> running_var_opt,
+    const std::optional<Tensor>& weight_opt, const std::optional<Tensor>& bias_opt,
+    const std::optional<Tensor>& running_mean_opt,
+    const std::optional<Tensor>& running_var_opt,
     bool use_input_stats, double eps) {
     if (use_input_stats) {
         // InstanceNorm backward == GroupNorm backward with G=C.
@@ -1164,7 +1165,11 @@ __global__ void rms_norm_row_kernel(const T* __restrict__ x,
 Tensor rms_norm_cuda(const Tensor& input,
                      const std::vector<int64_t>& normalized_shape,
                      const std::optional<Tensor>& weight_opt,
-                     double eps) {
+                     std::optional<double> eps_opt) {
+    // An unset epsilon is the machine epsilon of the computation type.
+    const double eps = eps_opt.has_value() ? *eps_opt
+        : (input.dtype() == DType::Float64 ? std::numeric_limits<double>::epsilon()
+                                           : static_cast<double>(std::numeric_limits<float>::epsilon()));
     const int64_t norm_ndim = static_cast<int64_t>(normalized_shape.size());
     const int64_t input_ndim = input.dim();
     if (norm_ndim > input_ndim)

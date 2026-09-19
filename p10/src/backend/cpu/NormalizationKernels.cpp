@@ -56,9 +56,9 @@ void normalization_stats_write(Tensor& tensor, int64_t index, double value) {
 
 std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cpu(
     const Tensor& grad_output, const Tensor& input,
-    std::optional<Tensor> weight_opt,
-    std::optional<Tensor> running_mean_opt,
-    std::optional<Tensor> running_var_opt,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& running_mean_opt,
+    const std::optional<Tensor>& running_var_opt,
     bool training, double eps);
 
 }  // namespace cpu
@@ -69,6 +69,7 @@ std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cpu(
 #include <numeric>
 #if defined(__x86_64__)
 #include <immintrin.h>
+#include <limits>
 #endif
 
 namespace tensorplay {
@@ -519,8 +520,8 @@ static Tensor layer_norm_cpu_impl(
 }
 
 Tensor layer_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalized_shape,
-                      std::optional<Tensor> weight_opt,
-                      std::optional<Tensor> bias_opt, double eps) {
+                      const std::optional<Tensor>& weight_opt,
+                      const std::optional<Tensor>& bias_opt, double eps) {
     return layer_norm_cpu_impl(input, normalized_shape, weight_opt, bias_opt,
                                eps, nullptr, nullptr);
 }
@@ -640,8 +641,8 @@ static Tensor group_norm_cpu_impl(
 }
 
 Tensor group_norm_cpu(const Tensor& input, int64_t num_groups,
-                      std::optional<Tensor> weight_opt,
-                      std::optional<Tensor> bias_opt, double eps) {
+                      const std::optional<Tensor>& weight_opt,
+                      const std::optional<Tensor>& bias_opt, double eps) {
     return group_norm_cpu_impl(input, num_groups, weight_opt, bias_opt, eps,
                                nullptr, nullptr);
 }
@@ -903,8 +904,8 @@ static std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu_reduced(
 std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu(
                               const Tensor& grad_output, const Tensor& input,
                               const std::vector<int64_t>& normalized_shape,
-                              std::optional<Tensor> weight_opt,
-                              std::optional<Tensor> bias_opt, double eps) {
+                              const std::optional<Tensor>& weight_opt,
+                              const std::optional<Tensor>& bias_opt, double eps) {
     switch (input.dtype()) {
         case DType::Float32:
             return layer_norm_backward_cpu_typed<float>(
@@ -927,8 +928,8 @@ std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu(
 
 std::tuple<Tensor, Tensor, Tensor> native_layer_norm_cpu(
         const Tensor& input, const std::vector<int64_t>& normalized_shape,
-        std::optional<Tensor> weight_opt,
-        std::optional<Tensor> bias_opt, double eps) {
+        const std::optional<Tensor>& weight_opt,
+        const std::optional<Tensor>& bias_opt, double eps) {
     int64_t inner_size = 1;
     if (normalized_shape.empty())
         TP_THROW(RuntimeError, "native_layer_norm: normalized_shape must not be empty");
@@ -945,8 +946,8 @@ std::tuple<Tensor, Tensor, Tensor> native_layer_norm_cpu(
 std::tuple<Tensor, Tensor, Tensor> native_layer_norm_backward_cpu(
         const Tensor& grad_output, const Tensor& input,
         const std::vector<int64_t>& normalized_shape, const Tensor& mean,
-    const Tensor& rstd, std::optional<Tensor> weight_opt,
-        std::optional<Tensor> bias_opt,
+    const Tensor& rstd, const std::optional<Tensor>& weight_opt,
+        const std::optional<Tensor>& bias_opt,
         const std::vector<bool>& output_mask) {
     switch (input.dtype()) {
         case DType::Float32:
@@ -969,8 +970,8 @@ std::tuple<Tensor, Tensor, Tensor> native_layer_norm_backward_cpu(
 }
 
 std::tuple<Tensor, Tensor, Tensor> native_group_norm_cpu(
-        const Tensor& input, std::optional<Tensor> weight_opt,
-        std::optional<Tensor> bias_opt, int64_t N, int64_t C,
+        const Tensor& input, const std::optional<Tensor>& weight_opt,
+        const std::optional<Tensor>& bias_opt, int64_t N, int64_t C,
         int64_t HxW, int64_t group, double eps) {
     TP_CHECK(N == input.size(0) && C == input.size(1),
              "native_group_norm: supplied dimensions do not match input");
@@ -986,7 +987,7 @@ std::tuple<Tensor, Tensor, Tensor> native_group_norm_cpu(
 
 std::tuple<Tensor, Tensor, Tensor> native_group_norm_backward_cpu(
         const Tensor& grad_out, const Tensor& input, const Tensor& mean,
-        const Tensor& rstd, std::optional<Tensor> weight_opt,
+        const Tensor& rstd, const std::optional<Tensor>& weight_opt,
         int64_t N, int64_t C, int64_t HxW, int64_t group,
         const std::vector<bool>& output_mask) {
     TP_CHECK(N == input.size(0) && C == input.size(1),
@@ -1002,7 +1003,11 @@ std::tuple<Tensor, Tensor, Tensor> native_group_norm_backward_cpu(
 // Native single kernel replaces a 6-op python composite that cost ~24 extra
 // dispatches per Llama layer per token in the e2e profile.
 Tensor rms_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalized_shape,
-                    const std::optional<Tensor>& weight_opt, double eps) {
+                    const std::optional<Tensor>& weight_opt, std::optional<double> eps_opt) {
+    // An unset epsilon is the machine epsilon of the computation type.
+    const double eps = eps_opt.has_value() ? *eps_opt
+        : (input.dtype() == DType::Float64 ? std::numeric_limits<double>::epsilon()
+                                           : static_cast<double>(std::numeric_limits<float>::epsilon()));
     const int64_t norm_ndim = (int64_t)normalized_shape.size();
     const int64_t input_ndim = input.dim();
     if (norm_ndim > input_ndim)

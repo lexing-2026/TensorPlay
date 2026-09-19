@@ -753,7 +753,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, ViewKernels) {
     m.impl("squeeze.dims", squeeze_dims_kernel_cuda);
     m.impl("unsqueeze", unsqueeze_kernel_cuda);
     m.impl("clone", clone_kernel_cuda);
-    m.impl("slice", slice_kernel_cuda);
+    m.impl("slice.Tensor", slice_kernel_cuda);
     m.impl("contiguous", contiguous_kernel_cuda);
     m.impl("select_backward", select_backward_kernel_cuda);
     m.impl("slice_backward", slice_backward_kernel_cuda);

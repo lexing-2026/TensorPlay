@@ -149,7 +149,7 @@ Tensor ge_tensor_kernel(const Tensor& self, const Tensor& other) {
 // Scalar versions: promote the scalar with weak-scalar rules instead of
 // casting it into self.dtype() (which truncated e.g. eq(2.5) on int tensors)
 #define DEFINE_CMP_SCALAR_KERNEL(NAME) \
-Tensor NAME##_scalar_kernel(const Tensor& self, Scalar other) { \
+Tensor NAME##_scalar_kernel(const Tensor& self, const Scalar& other) { \
     Tensor self_f = isQuantizedType(self.dtype()) ? dequantize_self_cpu(self) : self; \
     DType common = result_type_with_scalar(self_f, other); \
     Tensor other_t = Tensor::full({}, other, common, self_f.device()); \
@@ -270,13 +270,13 @@ Tensor where_cpu(const Tensor& condition, const Tensor& self, const Tensor& othe
         [](bool select_self, auto a, auto b) { return select_self ? a : b; });
 }
 
-Tensor where_scalar_self_cpu(const Tensor& condition, Scalar self, const Tensor& other) {
+Tensor where_scalar_self_cpu(const Tensor& condition, const Scalar& self, const Tensor& other) {
     DType common_dtype = result_type(self, other.dtype());
     Tensor self_tensor = Tensor::full({}, self, common_dtype, other.device());
     return where_cpu(condition, self_tensor, other);
 }
 
-Tensor where_scalar_other_cpu(const Tensor& condition, const Tensor& self, Scalar other) {
+Tensor where_scalar_other_cpu(const Tensor& condition, const Tensor& self, const Scalar& other) {
     DType common_dtype = result_type(other, self.dtype());
     Tensor other_tensor = Tensor::full({}, other, common_dtype, self.device());
     return where_cpu(condition, self, other_tensor);
@@ -293,7 +293,7 @@ static DType where_scalar_dtype(const Scalar& self, const Scalar& other) {
     return DType::Int64;
 }
 
-Tensor where_scalar_scalar_cpu(const Tensor& condition, Scalar self, Scalar other) {
+Tensor where_scalar_scalar_cpu(const Tensor& condition, const Scalar& self, const Scalar& other) {
     DType common_dtype = where_scalar_dtype(self, other);
     Tensor self_tensor = Tensor::full({}, self, common_dtype, condition.device());
     Tensor other_tensor = Tensor::full({}, other, common_dtype, condition.device());

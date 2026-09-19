@@ -13,6 +13,7 @@ from .api_types import (
     cpp_arg_type,
     cpp_default,
     cpp_return_type,
+    rewrap_arg_expr,
     stub_arg_type_for,
     tuple_element_cpp_types,
     tuple_element_names,
@@ -603,6 +604,8 @@ def generate_autograd_registration(funcs: list[NativeFunction], *,
         '    RegisterTPXAutogradKernels() {',
         '        auto& D = Dispatcher::singleton();',
     ]
+    registrations: list[str] = []
+    adapters: list[str] = []
     seen: set[str] = set()
     for f in funcs:
         if not _has_autograd(f, derivatives):
@@ -610,10 +613,24 @@ def generate_autograd_registration(funcs: list[NativeFunction], *,
         if _dedup_key(f) in seen:
             continue
         seen.add(_dedup_key(f))
-        fn_type = (f'{cpp_return_type(f)} (*)({", ".join(cpp_arg_type(a.type) for a in f.args)})')
-        cast = f'static_cast<{fn_type}>(&::tensorplay::tpx::ops::{f.cpp_name})'
+        # The dispatch table holds kernels with the dispatcher-stub ABI; the
+        # adapter converts back to the public tpx::ops signature.
+        kernel = f'autograd_kernel_{len(adapters)}'
+        ret = cpp_return_type(f)
+        # ``requires_grad`` is resolved before dispatch and is not part of
+        # the kernel ABI.
+        params = ', '.join(f'{stub_arg_type_for(f.base_name, a)} {a.name}'
+                           for a in f.args if a.name != 'requires_grad')
+        args = ', '.join('false' if a.name == 'requires_grad'
+                         else rewrap_arg_expr(f.base_name, a, a.name) for a in f.args)
+        body = f'::tensorplay::tpx::ops::{f.cpp_name}({args})'
+        adapters.append(f'{ret} {kernel}({params}) {{ '
+                        f'{"return " if ret != "void" else ""}{body}; }}')
         for key in ('AutogradCPU', 'AutogradCUDA', 'AutogradVulkan'):
-            lines.append(f'        D.registerKernel("{f.func_name}", DispatchKey::{key}, (KernelFunction){cast});')
+            registrations.append(f'        D.registerKernel("{f.func_name}", DispatchKey::{key}, &{kernel});')
+    struct_at = lines.index('struct RegisterTPXAutogradKernels {')
+    lines[struct_at:struct_at] = adapters + ['']
+    lines += registrations
     lines += [
         '    }',
         '};',

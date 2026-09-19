@@ -344,8 +344,8 @@ Tensor eye_kernel(
 }
 
 Tensor linspace_kernel(
-    Scalar start,
-    Scalar end,
+    const Scalar& start,
+    const Scalar& end,
     int64_t steps,
     DType dtype,
     std::optional<Device> device) {
@@ -363,8 +363,8 @@ Tensor linspace_kernel(
 }
 
 Tensor logspace_kernel(
-    Scalar start,
-    Scalar end,
+    const Scalar& start,
+    const Scalar& end,
     int64_t steps,
     double base,
     DType dtype,
@@ -414,7 +414,7 @@ Tensor ones_like_kernel(
 
 Tensor full_like_kernel(
     const Tensor& self,
-    Scalar fill_value,
+    const Scalar& fill_value,
     DType dtype,
     std::optional<Device> device) {
   DType dt = dtype == DType::Undefined ? self.dtype() : dtype;
@@ -426,7 +426,7 @@ Tensor full_like_kernel(
       false);
 }
 
-Tensor& fill_kernel(Tensor& self, Scalar value) {
+Tensor& fill_kernel(Tensor& self, const Scalar& value) {
   return fill_impl(self, value);
 }
 
@@ -468,7 +468,7 @@ Tensor ones_stub(
 
 Tensor full_stub(
     const std::vector<int64_t>& size,
-    Scalar fill_value,
+    const Scalar& fill_value,
     DType dtype,
     std::optional<Device> device,
     bool pin_memory) {

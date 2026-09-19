@@ -780,7 +780,7 @@ Tensor sparse_semi_structured_mm_right_cuda(
 
 Tensor sparse_semi_structured_addmm_cuda(
     const Tensor& input, const Tensor& packed, const Tensor& meta,
-    const Tensor& dense, Scalar alpha, Scalar beta,
+    const Tensor& dense, const Scalar& alpha, const Scalar& beta,
     std::optional<DType> out_dtype) {
     SemiConfig cfg{};
     int64_t rows = 0;

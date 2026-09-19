@@ -108,7 +108,7 @@ std::vector<Tensor> foreach_mm_cuda(const std::vector<Tensor>& self,
 }
 
 std::vector<Tensor> foreach_norm_cuda(const std::vector<Tensor>& self,
-                                      Scalar ord,
+                                      const Scalar& ord,
                                       std::optional<DType> dtype) {
     std::vector<Tensor> out;
     out.reserve(self.size());
@@ -120,7 +120,7 @@ std::vector<Tensor> foreach_norm_cuda(const std::vector<Tensor>& self,
 }
 
 std::vector<Tensor> foreach_powsum_cuda(const std::vector<Tensor>& self,
-                                        Scalar ord,
+                                        const Scalar& ord,
                                         std::optional<DType> dtype) {
     std::vector<Tensor> out;
     out.reserve(self.size());
@@ -170,13 +170,13 @@ DEFINE_FOREACH_UNARY_OUT_CUDA(trunc)
 #undef DEFINE_FOREACH_UNARY_OUT_CUDA
 
 #define DEFINE_FOREACH_ADDSUB_OUT_CUDA(NAME) \
-void foreach_##NAME##_scalar_out_cuda(const std::vector<Tensor>& self, Scalar scalar, \
+void foreach_##NAME##_scalar_out_cuda(const std::vector<Tensor>& self, const Scalar& scalar, \
                                       std::vector<Tensor> out) { \
     copy_foreach_out_cuda(foreach_##NAME##_scalar_cuda(self, scalar), std::move(out), \
                           "_foreach_" #NAME ".Scalar_out"); \
 } \
 void foreach_##NAME##_list_out_cuda(const std::vector<Tensor>& self, \
-                                    const std::vector<Tensor>& other, Scalar alpha, \
+                                    const std::vector<Tensor>& other, const Scalar& alpha, \
                                     std::vector<Tensor> out) { \
     copy_foreach_out_cuda(foreach_##NAME##_list_cuda(self, other, alpha), std::move(out), \
                           "_foreach_" #NAME ".List_out"); \
@@ -188,7 +188,7 @@ void foreach_##NAME##_scalar_list_out_cuda(const std::vector<Tensor>& self, \
                           "_foreach_" #NAME ".ScalarList_out"); \
 } \
 void foreach_##NAME##_tensor_out_cuda(const std::vector<Tensor>& self, const Tensor& other, \
-                                      Scalar alpha, std::vector<Tensor> out) { \
+                                      const Scalar& alpha, std::vector<Tensor> out) { \
     copy_foreach_out_cuda(foreach_##NAME##_tensor_cuda(self, other, alpha), std::move(out), \
                           "_foreach_" #NAME ".Tensor_out"); \
 }
@@ -197,7 +197,7 @@ DEFINE_FOREACH_ADDSUB_OUT_CUDA(sub)
 #undef DEFINE_FOREACH_ADDSUB_OUT_CUDA
 
 #define DEFINE_FOREACH_MULDIV_OUT_CUDA(NAME) \
-void foreach_##NAME##_scalar_out_cuda(const std::vector<Tensor>& self, Scalar scalar, \
+void foreach_##NAME##_scalar_out_cuda(const std::vector<Tensor>& self, const Scalar& scalar, \
                                       std::vector<Tensor> out) { \
     copy_foreach_out_cuda(foreach_##NAME##_scalar_cuda(self, scalar), std::move(out), \
                           "_foreach_" #NAME ".Scalar_out"); \
@@ -224,7 +224,7 @@ DEFINE_FOREACH_MULDIV_OUT_CUDA(div)
 #undef DEFINE_FOREACH_MULDIV_OUT_CUDA
 
 #define DEFINE_FOREACH_CLAMP_OUT_CUDA(NAME) \
-void foreach_##NAME##_scalar_out_cuda(const std::vector<Tensor>& self, Scalar scalar, \
+void foreach_##NAME##_scalar_out_cuda(const std::vector<Tensor>& self, const Scalar& scalar, \
                                       std::vector<Tensor> out) { \
     copy_foreach_out_cuda(foreach_##NAME##_scalar_cuda(self, scalar), std::move(out), \
                           "_foreach_" #NAME ".Scalar_out"); \
@@ -290,7 +290,7 @@ void foreach_pow_scalar_list_out_cuda(const std::vector<Tensor>& self,
 
 void foreach_addcmul_scalar_out_cuda(const std::vector<Tensor>& self,
                                      const std::vector<Tensor>& tensor1,
-                                     const std::vector<Tensor>& tensor2, Scalar value,
+                                     const std::vector<Tensor>& tensor2, const Scalar& value,
                                      std::vector<Tensor> out) {
     std::vector<Tensor> result;
     result.reserve(self.size());
@@ -311,7 +311,7 @@ void foreach_addcmul_scalar_list_out_cuda(const std::vector<Tensor>& self,
 }
 void foreach_addcmul_tensor_out_cuda(const std::vector<Tensor>& self,
                                      const std::vector<Tensor>& tensor1,
-                                     const std::vector<Tensor>& tensor2, Scalar value,
+                                     const std::vector<Tensor>& tensor2, const Scalar& value,
                                      std::vector<Tensor> out) {
     std::vector<Tensor> result;
     result.reserve(self.size());
@@ -321,7 +321,7 @@ void foreach_addcmul_tensor_out_cuda(const std::vector<Tensor>& self,
 }
 void foreach_addcdiv_scalar_out_cuda(const std::vector<Tensor>& self,
                                      const std::vector<Tensor>& tensor1,
-                                     const std::vector<Tensor>& tensor2, Scalar value,
+                                     const std::vector<Tensor>& tensor2, const Scalar& value,
                                      std::vector<Tensor> out) {
     std::vector<Tensor> result;
     result.reserve(self.size());
@@ -342,7 +342,7 @@ void foreach_addcdiv_scalar_list_out_cuda(const std::vector<Tensor>& self,
 }
 void foreach_addcdiv_tensor_out_cuda(const std::vector<Tensor>& self,
                                      const std::vector<Tensor>& tensor1,
-                                     const std::vector<Tensor>& tensor2, Scalar value,
+                                     const std::vector<Tensor>& tensor2, const Scalar& value,
                                      std::vector<Tensor> out) {
     std::vector<Tensor> result;
     result.reserve(self.size());

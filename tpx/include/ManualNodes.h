@@ -1362,56 +1362,16 @@ inline Tensor mean_backward(const Tensor& grad,
                     Scalar(static_cast<double>(count)));
 }
 
-// Emulation of grad.index(indices) (advanced indexing gather) via a linear
-// index + index_select; indices address the leading dims, broadcast against
-// each other, and may be negative (wrapped).
-inline Tensor index_nd(const Tensor& grad, const std::vector<Tensor>& indices) {
-    const int64_t nd = grad.dim();
-    const int64_t nidx = static_cast<int64_t>(indices.size());
-    if (nidx == 0) return grad;
-    TP_CHECK(nidx <= nd, "index_nd: more indices than input dims");
-    std::vector<int64_t> bshape = {1};
-    for (const auto& idx : indices) {
-        const auto s = static_cast<std::vector<int64_t>>(idx.shape());
-        std::vector<int64_t> out(std::max(bshape.size(), s.size()), 1);
-        for (size_t i = 0; i < out.size(); ++i) {
-            const int64_t a = i < out.size() - bshape.size()
-                                  ? 1 : bshape[i - (out.size() - bshape.size())];
-            const int64_t b = i < out.size() - s.size()
-                                  ? 1 : s[i - (out.size() - s.size())];
-            out[i] = std::max(a, b);
-        }
-        bshape = std::move(out);
-    }
-    Tensor linear;
-    for (int64_t i = 0; i < nidx; ++i) {
-        Tensor idx = indices[i];
-        if (idx.dtype() != DType::Int64) idx = idx.to(DType::Int64);
-        idx = ops::where(ops::lt(idx, Scalar(0)), idx + grad.size(i), idx);
-        idx = ops::expand(idx, bshape);
-        int64_t stride = 1;
-        for (int64_t j = i + 1; j < nd; ++j) stride *= grad.size(j);
-        const Tensor term = idx * stride;
-        linear = linear.defined() ? linear + term : term;
-    }
-    int64_t outer = 1;
-    for (int64_t i = 0; i < nidx; ++i) outer *= grad.size(i);
-    const Tensor flat = ops::reshape(grad, {outer, -1});
-    const Tensor sel = ops::index_select(flat, 0, ops::reshape(linear, {-1}));
-    std::vector<int64_t> out_shape = bshape;
-    for (int64_t i = nidx; i < nd; ++i) out_shape.push_back(grad.size(i));
-    return ops::reshape(sel, out_shape);
-}
-
 // self keeps grad except at overwritten positions (unless accumulate);
 // values gather grad at the indexed positions.
 inline std::tuple<Tensor, Tensor> index_put_backward(
         const Tensor& grad, bool accumulate,
-        const std::vector<Tensor>& indices, const Tensor& values) {
+        const std::vector<std::optional<Tensor>>& indices,
+        const Tensor& values) {
     const Tensor grad_self = accumulate
         ? grad
         : ops::index_put(grad, indices, ops::zeros_like(values), false);
-    return {grad_self, index_nd(grad, indices)};
+    return {grad_self, ops::index(grad, indices)};
 }
 
 // ===========================================================================
@@ -1473,41 +1433,57 @@ struct IndexBackward : public Node {
     }
 };
 
+// Shared by index_put, index_put_ and _index_put_impl_: outputs line up
+// with the edges collected at record time (self, one per present index,
+// values).
 struct IndexPutBackward : public Node {
-    std::vector<SavedVariable> indices_;
+    std::vector<std::optional<SavedVariable>> indices_;
     SavedVariable values_;
     bool accumulate_;
 
-    IndexPutBackward(std::vector<Tensor> indices, Tensor values, bool accumulate)
+    IndexPutBackward(std::vector<std::optional<Tensor>> indices, Tensor values,
+                     bool accumulate)
         : values_(std::move(values)), accumulate_(accumulate) {
         indices_.reserve(indices.size());
-        for (auto& t : indices) indices_.emplace_back(std::move(t));
+        for (auto& index : indices) {
+            if (index.has_value()) {
+                indices_.emplace_back(std::move(*index));
+            } else {
+                indices_.emplace_back(std::nullopt);
+            }
+        }
     }
 
     variable_list apply(variable_list&& inputs) override {
         variable_list grads;
         grads.reserve(indices_.size() + 2);
         const Tensor grad = inputs.empty() ? Tensor() : inputs[0];
+        Tensor grad_self;
+        Tensor grad_values;
         if (grad.defined()) {
-            std::vector<Tensor> idx;
-            idx.reserve(indices_.size());
-            for (auto& sv : indices_) idx.push_back(sv.unpack());
-            auto [gself, gvalues] =
-                index_put_backward(grad, accumulate_, idx, values_.unpack());
-            grads.push_back(std::move(gself));
-            for (size_t i = 0; i < indices_.size(); ++i) grads.push_back(Tensor());
-            grads.push_back(std::move(gvalues));
-        } else {
-            grads.push_back(Tensor());
-            for (size_t i = 0; i < indices_.size(); ++i) grads.push_back(Tensor());
-            grads.push_back(Tensor());
+            std::vector<std::optional<Tensor>> indices;
+            indices.reserve(indices_.size());
+            for (auto& index : indices_) {
+                indices.emplace_back(index.has_value()
+                    ? std::optional<Tensor>(index->unpack())
+                    : std::nullopt);
+            }
+            std::tie(grad_self, grad_values) = index_put_backward(
+                grad, accumulate_, indices, values_.unpack());
         }
+        grads.push_back(std::move(grad_self));
+        for (const auto& index : indices_) {
+            if (index.has_value()) grads.push_back(Tensor());
+        }
+        grads.push_back(std::move(grad_values));
         return grads;
     }
 
     void release_variables() override {
         Node::release_variables();
-        for (auto& sv : indices_) sv.reset_data();
+        for (auto& index : indices_) {
+            if (index.has_value()) index->reset_data();
+        }
         values_.reset_data();
     }
 };

@@ -158,80 +158,80 @@ std::vector<Tensor> foreach_map_pair_scalars_inplace(
 }
 
 #define DEFINE_FOREACH_ADD_SUB(NAME, METHOD) \
-std::vector<Tensor> foreach_##NAME##_scalar_cuda(const std::vector<Tensor>& self, Scalar scalar) { \
+std::vector<Tensor> foreach_##NAME##_scalar_cuda(const std::vector<Tensor>& self, const Scalar& scalar) { \
     return foreach_map(self, [&](const Tensor& value) { return value.METHOD(scalar); }); \
 } \
-std::vector<Tensor> foreach_##NAME##_list_cuda(const std::vector<Tensor>& self, const std::vector<Tensor>& other, Scalar alpha) { \
+std::vector<Tensor> foreach_##NAME##_list_cuda(const std::vector<Tensor>& self, const std::vector<Tensor>& other, const Scalar& alpha) { \
     return foreach_map_pair(self, other, [&](const Tensor& value, const Tensor& rhs) { return value.METHOD(rhs, alpha); }); \
 } \
 std::vector<Tensor> foreach_##NAME##_scalar_list_cuda(const std::vector<Tensor>& self, const std::vector<Scalar>& scalars) { \
-    return foreach_map_scalars(self, scalars, [&](const Tensor& value, Scalar scalar) { return value.METHOD(scalar); }); \
+    return foreach_map_scalars(self, scalars, [&](const Tensor& value, const Scalar& scalar) { return value.METHOD(scalar); }); \
 } \
-std::vector<Tensor> foreach_##NAME##_tensor_cuda(const std::vector<Tensor>& self, const Tensor& other, Scalar alpha) { \
+std::vector<Tensor> foreach_##NAME##_tensor_cuda(const std::vector<Tensor>& self, const Tensor& other, const Scalar& alpha) { \
     return foreach_map(self, [&](const Tensor& value) { return value.METHOD(other, alpha); }); \
 } \
-void foreach_##NAME##_scalar_inplace_cuda(std::vector<Tensor> self, Scalar scalar) { \
+void foreach_##NAME##_scalar_inplace_cuda(std::vector<Tensor> self, const Scalar& scalar) { \
     foreach_map_inplace(self, [&](Tensor& value) { value.METHOD##_(scalar); }); \
 } \
-void foreach_##NAME##_list_inplace_cuda(std::vector<Tensor> self, const std::vector<Tensor>& other, Scalar alpha) { \
+void foreach_##NAME##_list_inplace_cuda(std::vector<Tensor> self, const std::vector<Tensor>& other, const Scalar& alpha) { \
     foreach_map_pair_inplace(self, other, [&](Tensor& value, const Tensor& rhs) { value.METHOD##_(rhs, alpha); }); \
 } \
 void foreach_##NAME##_scalar_list_inplace_cuda(std::vector<Tensor> self, const std::vector<Scalar>& scalars) { \
-    foreach_map_scalars_inplace(self, scalars, [&](Tensor& value, Scalar scalar) { value.METHOD##_(scalar); }); \
+    foreach_map_scalars_inplace(self, scalars, [&](Tensor& value, const Scalar& scalar) { value.METHOD##_(scalar); }); \
 } \
-void foreach_##NAME##_tensor_inplace_cuda(std::vector<Tensor> self, const Tensor& other, Scalar alpha) { \
+void foreach_##NAME##_tensor_inplace_cuda(std::vector<Tensor> self, const Tensor& other, const Scalar& alpha) { \
     foreach_map_inplace(self, [&](Tensor& value) { value.METHOD##_(other, alpha); }); \
 }
 
 DEFINE_FOREACH_ADD_SUB(sub, sub)
 #undef DEFINE_FOREACH_ADD_SUB
 
-std::vector<Tensor> foreach_add_scalar_cuda(const std::vector<Tensor>& self, Scalar scalar) {
+std::vector<Tensor> foreach_add_scalar_cuda(const std::vector<Tensor>& self, const Scalar& scalar) {
     return foreach_map(self, [&](const Tensor& value) { return value.add(scalar); });
 }
-std::vector<Tensor> foreach_add_list_cuda(const std::vector<Tensor>& self, const std::vector<Tensor>& other, Scalar alpha) {
+std::vector<Tensor> foreach_add_list_cuda(const std::vector<Tensor>& self, const std::vector<Tensor>& other, const Scalar& alpha) {
     return foreach_map_pair(self, other, [&](const Tensor& value, const Tensor& rhs) { return value.add(rhs, alpha); });
 }
 std::vector<Tensor> foreach_add_scalar_list_cuda(const std::vector<Tensor>& self, const std::vector<Scalar>& scalars) {
     return foreach_map_scalars(self, scalars, [&](const Tensor& value, Scalar scalar) { return value.add(scalar); });
 }
-std::vector<Tensor> foreach_add_tensor_cuda(const std::vector<Tensor>& self, const Tensor& other, Scalar alpha) {
+std::vector<Tensor> foreach_add_tensor_cuda(const std::vector<Tensor>& self, const Tensor& other, const Scalar& alpha) {
     return foreach_map(self, [&](const Tensor& value) { return value.add(other, alpha); });
 }
-void foreach_add_scalar_inplace_cuda(std::vector<Tensor> self, Scalar scalar) {
+void foreach_add_scalar_inplace_cuda(std::vector<Tensor> self, const Scalar& scalar) {
     foreach_map_inplace(self, [&](Tensor& value) { value.add_(scalar); });
 }
-void foreach_add_list_inplace_cuda(std::vector<Tensor> self, const std::vector<Tensor>& other, Scalar alpha) {
+void foreach_add_list_inplace_cuda(std::vector<Tensor> self, const std::vector<Tensor>& other, const Scalar& alpha) {
     foreach_map_pair_inplace(self, other, [&](Tensor& value, const Tensor& rhs) { value.add_(rhs, alpha); });
 }
 void foreach_add_scalar_list_inplace_cuda(std::vector<Tensor> self, const std::vector<Scalar>& scalars) {
     foreach_map_scalars_inplace(self, scalars, [&](Tensor& value, Scalar scalar) { value.add_(scalar); });
 }
-void foreach_add_tensor_inplace_cuda(std::vector<Tensor> self, const Tensor& other, Scalar alpha) {
+void foreach_add_tensor_inplace_cuda(std::vector<Tensor> self, const Tensor& other, const Scalar& alpha) {
     foreach_map_inplace(self, [&](Tensor& value) { value.add_(other, alpha); });
 }
 
 #define DEFINE_FOREACH_MUL_DIV(NAME, METHOD) \
-std::vector<Tensor> foreach_##NAME##_scalar_cuda(const std::vector<Tensor>& self, Scalar scalar) { \
+std::vector<Tensor> foreach_##NAME##_scalar_cuda(const std::vector<Tensor>& self, const Scalar& scalar) { \
     return foreach_map(self, [&](const Tensor& value) { return value.METHOD(scalar); }); \
 } \
 std::vector<Tensor> foreach_##NAME##_list_cuda(const std::vector<Tensor>& self, const std::vector<Tensor>& other) { \
     return foreach_map_pair(self, other, [&](const Tensor& value, const Tensor& rhs) { return value.METHOD(rhs); }); \
 } \
 std::vector<Tensor> foreach_##NAME##_scalar_list_cuda(const std::vector<Tensor>& self, const std::vector<Scalar>& scalars) { \
-    return foreach_map_scalars(self, scalars, [&](const Tensor& value, Scalar scalar) { return value.METHOD(scalar); }); \
+    return foreach_map_scalars(self, scalars, [&](const Tensor& value, const Scalar& scalar) { return value.METHOD(scalar); }); \
 } \
 std::vector<Tensor> foreach_##NAME##_tensor_cuda(const std::vector<Tensor>& self, const Tensor& other) { \
     return foreach_map(self, [&](const Tensor& value) { return value.METHOD(other); }); \
 } \
-void foreach_##NAME##_scalar_inplace_cuda(std::vector<Tensor> self, Scalar scalar) { \
+void foreach_##NAME##_scalar_inplace_cuda(std::vector<Tensor> self, const Scalar& scalar) { \
     foreach_map_inplace(self, [&](Tensor& value) { value.METHOD##_(scalar); }); \
 } \
 void foreach_##NAME##_list_inplace_cuda(std::vector<Tensor> self, const std::vector<Tensor>& other) { \
     foreach_map_pair_inplace(self, other, [&](Tensor& value, const Tensor& rhs) { value.METHOD##_(rhs); }); \
 } \
 void foreach_##NAME##_scalar_list_inplace_cuda(std::vector<Tensor> self, const std::vector<Scalar>& scalars) { \
-    foreach_map_scalars_inplace(self, scalars, [&](Tensor& value, Scalar scalar) { value.METHOD##_(scalar); }); \
+    foreach_map_scalars_inplace(self, scalars, [&](Tensor& value, const Scalar& scalar) { value.METHOD##_(scalar); }); \
 } \
 void foreach_##NAME##_tensor_inplace_cuda(std::vector<Tensor> self, const Tensor& other) { \
     foreach_map_inplace(self, [&](Tensor& value) { value.METHOD##_(other); }); \
@@ -266,16 +266,16 @@ void foreach_reciprocal_inplace_cuda(std::vector<Tensor> self) {
     });
 }
 
-std::vector<Tensor> foreach_addcmul_scalar_cuda(const std::vector<Tensor>& self, const std::vector<Tensor>& tensor1, const std::vector<Tensor>& tensor2, Scalar value) {
+std::vector<Tensor> foreach_addcmul_scalar_cuda(const std::vector<Tensor>& self, const std::vector<Tensor>& tensor1, const std::vector<Tensor>& tensor2, const Scalar& value) {
     return foreach_map_ternary(self, tensor1, tensor2, [&](const Tensor& x, const Tensor& a, const Tensor& b) { return x.addcmul(a, b, value); });
 }
-void foreach_addcmul_scalar_inplace_cuda(std::vector<Tensor> self, const std::vector<Tensor>& tensor1, const std::vector<Tensor>& tensor2, Scalar value) {
+void foreach_addcmul_scalar_inplace_cuda(std::vector<Tensor> self, const std::vector<Tensor>& tensor1, const std::vector<Tensor>& tensor2, const Scalar& value) {
     foreach_map_ternary_inplace(self, tensor1, tensor2, [&](Tensor& x, const Tensor& a, const Tensor& b) { x.addcmul_(a, b, value); });
 }
-std::vector<Tensor> foreach_addcdiv_scalar_cuda(const std::vector<Tensor>& self, const std::vector<Tensor>& tensor1, const std::vector<Tensor>& tensor2, Scalar value) {
+std::vector<Tensor> foreach_addcdiv_scalar_cuda(const std::vector<Tensor>& self, const std::vector<Tensor>& tensor1, const std::vector<Tensor>& tensor2, const Scalar& value) {
     return foreach_map_ternary(self, tensor1, tensor2, [&](const Tensor& x, const Tensor& a, const Tensor& b) { return x.addcdiv(a, b, value); });
 }
-void foreach_addcdiv_scalar_inplace_cuda(std::vector<Tensor> self, const std::vector<Tensor>& tensor1, const std::vector<Tensor>& tensor2, Scalar value) {
+void foreach_addcdiv_scalar_inplace_cuda(std::vector<Tensor> self, const std::vector<Tensor>& tensor1, const std::vector<Tensor>& tensor2, const Scalar& value) {
     foreach_map_ternary_inplace(self, tensor1, tensor2, [&](Tensor& x, const Tensor& a, const Tensor& b) { x.addcdiv_(a, b, value); });
 }
 
@@ -333,7 +333,7 @@ void foreach_addcdiv_tensor_inplace_cuda(
     foreach_addcdiv_scalar_inplace_cuda(std::move(self), tensor1, tensor2, scalars.item());
 }
 
-std::vector<Tensor> foreach_lerp_scalar_cuda(const std::vector<Tensor>& self, const std::vector<Tensor>& end, Scalar weight) {
+std::vector<Tensor> foreach_lerp_scalar_cuda(const std::vector<Tensor>& self, const std::vector<Tensor>& end, const Scalar& weight) {
     return foreach_map_pair(self, end, [&](const Tensor& x, const Tensor& y) { return x.lerp(y, weight); });
 }
 std::vector<Tensor> foreach_lerp_list_cuda(const std::vector<Tensor>& self, const std::vector<Tensor>& end, const std::vector<Tensor>& weight) {
@@ -367,7 +367,7 @@ std::vector<Tensor> foreach_pow_scalar_cuda(const std::vector<Tensor>& self, Sca
     return foreach_map(self, [&](const Tensor& value) { return value.pow(exponent); });
 }
 std::vector<Tensor> foreach_pow_scalar_tensor_cuda(
-        Scalar self, const std::vector<Tensor>& exponent) {
+        const Scalar& self, const std::vector<Tensor>& exponent) {
     return foreach_map(exponent, [&](const Tensor& value) {
         Tensor base = Tensor::full({}, self, value.dtype(), value.device());
         return base.pow(value);
@@ -399,16 +399,16 @@ void foreach_pow_scalar_list_inplace_cuda(
         [&](Tensor& value, Scalar rhs) { value.copy_(value.pow(rhs)); });
 }
 
-std::vector<Tensor> foreach_clamp_min_scalar_cuda(const std::vector<Tensor>& self, Scalar scalar) {
+std::vector<Tensor> foreach_clamp_min_scalar_cuda(const std::vector<Tensor>& self, const Scalar& scalar) {
     return foreach_map(self, [&](const Tensor& value) { return value.clamp(scalar, std::nullopt); });
 }
-std::vector<Tensor> foreach_clamp_max_scalar_cuda(const std::vector<Tensor>& self, Scalar scalar) {
+std::vector<Tensor> foreach_clamp_max_scalar_cuda(const std::vector<Tensor>& self, const Scalar& scalar) {
     return foreach_map(self, [&](const Tensor& value) { return value.clamp(std::nullopt, scalar); });
 }
-void foreach_clamp_min_scalar_inplace_cuda(std::vector<Tensor> self, Scalar scalar) {
+void foreach_clamp_min_scalar_inplace_cuda(std::vector<Tensor> self, const Scalar& scalar) {
     foreach_map_inplace(self, [&](Tensor& value) { value.copy_(value.clamp(scalar, std::nullopt)); });
 }
-void foreach_clamp_max_scalar_inplace_cuda(std::vector<Tensor> self, Scalar scalar) {
+void foreach_clamp_max_scalar_inplace_cuda(std::vector<Tensor> self, const Scalar& scalar) {
     foreach_map_inplace(self, [&](Tensor& value) { value.copy_(value.clamp(std::nullopt, scalar)); });
 }
 std::vector<Tensor> foreach_clamp_min_list_cuda(
@@ -451,10 +451,10 @@ void foreach_clamp_max_scalar_list_inplace_cuda(
     foreach_map_scalars_inplace(std::move(self), scalars,
         [&](Tensor& value, Scalar rhs) { value.copy_(value.clamp(std::nullopt, rhs)); });
 }
-std::vector<Tensor> foreach_maximum_scalar_cuda(const std::vector<Tensor>& self, Scalar scalar) { return foreach_clamp_min_scalar_cuda(self, scalar); }
-std::vector<Tensor> foreach_minimum_scalar_cuda(const std::vector<Tensor>& self, Scalar scalar) { return foreach_clamp_max_scalar_cuda(self, scalar); }
-void foreach_maximum_scalar_inplace_cuda(std::vector<Tensor> self, Scalar scalar) { foreach_clamp_min_scalar_inplace_cuda(self, scalar); }
-void foreach_minimum_scalar_inplace_cuda(std::vector<Tensor> self, Scalar scalar) { foreach_clamp_max_scalar_inplace_cuda(self, scalar); }
+std::vector<Tensor> foreach_maximum_scalar_cuda(const std::vector<Tensor>& self, const Scalar& scalar) { return foreach_clamp_min_scalar_cuda(self, scalar); }
+std::vector<Tensor> foreach_minimum_scalar_cuda(const std::vector<Tensor>& self, const Scalar& scalar) { return foreach_clamp_max_scalar_cuda(self, scalar); }
+void foreach_maximum_scalar_inplace_cuda(std::vector<Tensor> self, const Scalar& scalar) { foreach_clamp_min_scalar_inplace_cuda(self, scalar); }
+void foreach_minimum_scalar_inplace_cuda(std::vector<Tensor> self, const Scalar& scalar) { foreach_clamp_max_scalar_inplace_cuda(self, scalar); }
 std::vector<Tensor> foreach_maximum_list_cuda(
         const std::vector<Tensor>& self, const std::vector<Tensor>& other) {
     return foreach_map_pair(self, other,

@@ -22,6 +22,7 @@
 #include <mutex>
 #include <string>
 #include <type_traits>
+#include "OutWrite.h"
 
 namespace tensorplay {
 namespace cuda {
@@ -762,9 +763,9 @@ Tensor index_reduce_backward_src_cuda(const Tensor& grad,
 }
 
 Tensor& interop_index_reduce_out_cuda(const Tensor& self, int64_t dim, const Tensor& index,
-              const Tensor& source, std::string reduce, bool include_self,
+              const Tensor& source, const std::string& reduce, bool include_self,
               Tensor& out) {
-        out = index_reduce_cuda(self, dim, index, source, reduce, include_self);
+        write_out(out, index_reduce_cuda(self, dim, index, source, reduce, include_self));
         return out;
 
 }
