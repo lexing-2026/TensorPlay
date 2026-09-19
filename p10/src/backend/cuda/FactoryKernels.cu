@@ -26,7 +26,7 @@ inline void fill_iter(TensorIteratorBase& iter, T value) {
     gpu_kernel(iter, FillFunctor<T>{value});
 }
 
-Tensor& fill_kernel(Tensor& self, Scalar value) {
+Tensor& fill_kernel(Tensor& self, const Scalar& value) {
     int64_t n = self.numel();
     if (n == 0) return self;
     
@@ -72,7 +72,7 @@ __global__ void fill_diagonal_strided_cuda_impl(
     }
 }
 
-Tensor& fill_diagonal__kernel(Tensor& self, Scalar fill_value, bool wrap) {
+Tensor& fill_diagonal__kernel(Tensor& self, const Scalar& fill_value, bool wrap) {
     const int64_t n_dims = self.dim();
     if (n_dims < 2) {
         TP_THROW(ValueError, "fill_diagonal_ expects a tensor with at least 2 dimensions");
@@ -187,7 +187,7 @@ Tensor empty_like_kernel(const Tensor& self, DType dtype, std::optional<Device> 
     return empty_kernel(static_cast<std::vector<int64_t>>(self.shape()), dtype, dev, false);
 }
 
-Tensor full_like_kernel(const Tensor& self, Scalar fill_value, DType dtype, std::optional<Device> device) {
+Tensor full_like_kernel(const Tensor& self, const Scalar& fill_value, DType dtype, std::optional<Device> device) {
     if (dtype == DType::Undefined) dtype = self.dtype();
     Device dev = device.has_value() ? *device : self.device();
     Tensor t = empty_kernel(static_cast<std::vector<int64_t>>(self.shape()), dtype, dev, false);
@@ -663,7 +663,7 @@ Tensor empty_memory_format_stub(const std::vector<int64_t>& size,
                         pin_memory.value_or(false));
 }
 
-Tensor full_stub(const std::vector<int64_t>& size, Scalar fill_value,
+Tensor full_stub(const std::vector<int64_t>& size, const Scalar& fill_value,
                  DType dtype, std::optional<Device> device, bool pin_memory) {
     return full_kernel(size, fill_value, dtype,
                        device.value_or(Device(DeviceType::CUDA)), pin_memory);
@@ -673,21 +673,21 @@ Tensor eye_stub(int64_t n, int64_t m, DType dtype, std::optional<Device> device)
     return eye_kernel(n, m, dtype, device.value_or(Device(DeviceType::CUDA)), false);
 }
 
-Tensor arange_start_step_stub(Scalar start, Scalar end, Scalar step, DType dtype,
+Tensor arange_start_step_stub(const Scalar& start, const Scalar& end, const Scalar& step, DType dtype,
                               std::optional<Device> device) {
     return arange_start_step_cuda(start, end, step, dtype, device);
 }
 
-Tensor arange_end_stub(Scalar end, DType dtype, std::optional<Device> device) {
+Tensor arange_end_stub(const Scalar& end, DType dtype, std::optional<Device> device) {
     return arange_end_cuda(end, dtype, device);
 }
 
-Tensor linspace_stub(Scalar start, Scalar end, int64_t steps, DType dtype,
+Tensor linspace_stub(const Scalar& start, const Scalar& end, int64_t steps, DType dtype,
                      std::optional<Device> device) {
     return linspace_cuda(start, end, steps, dtype, device);
 }
 
-Tensor logspace_stub(Scalar start, Scalar end, int64_t steps, double base,
+Tensor logspace_stub(const Scalar& start, const Scalar& end, int64_t steps, double base,
                      DType dtype, std::optional<Device> device) {
     return logspace_cuda(start, end, steps, base, dtype, device);
 }

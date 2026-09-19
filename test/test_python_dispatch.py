@@ -65,7 +65,7 @@ def test_backward_on_device_worker_threads_reaches_the_mode():
     x = tp.tensor([1.0, 2.0], device="cuda", requires_grad=True)
     with RecordingMode() as mode:
         (x.sin() * 3).sum().backward()
-    assert "cos" in mode.names()
+    assert "cos.default" in mode.names()
     assert (x.grad.cpu() - x.detach().cpu().cos() * 3).abs().max().item() < 1e-6
 
 
@@ -93,7 +93,7 @@ def test_nested_modes_run_innermost_first():
     x = tp.tensor([1.0])
     with Tag("outer"), Tag("inner"):
         x.neg()
-    assert order == [("inner", "neg"), ("outer", "neg")]
+    assert order == [("inner", "neg.default"), ("outer", "neg.default")]
 
 
 def test_mode_can_replace_results():
@@ -148,7 +148,7 @@ def test_view_operators_are_dispatched():
         x[:, 1:3]
         x.t()
     names = mode.names()
-    assert "view" in names
+    assert "view.default" in names
     assert "select.int" in names
     assert "slice.Tensor" in names
 
@@ -187,3 +187,38 @@ def test_overload_objects_expose_schemas():
     assert add(x, 1).tolist() == [2.0, 3.0]
     assert pickle.loads(pickle.dumps(overload)) is overload
     assert ops.sin.default is ops.sin.default
+
+
+def test_every_kernel_matches_its_operator_abi():
+    # Each registered kernel must have exactly the signature every caller of
+    # its operator casts the slot to; anything else is a mismatched call.
+    mismatches = tp._C._dispatch_abi_mismatches()
+    assert mismatches == [], "\n".join(
+        f"{op} [{key}]: registered {got}, expected {want}"
+        for op, key, got, want in mismatches[:50]
+    )
+
+
+def test_mask_indexing_is_recorded_not_baked():
+    from tensorplay.graph.experimental._dispatch_trace import dispatch_make_graph
+
+    def fn(a):
+        return a[a > 0]
+
+    graph = dispatch_make_graph(fn)(tp.tensor([1.0, -2.0, 3.0, -4.0]))
+    targets = [str(node.target) for node in graph.graph.nodes if node.op == "call_function"]
+    assert any("index.Tensor" in t for t in targets)
+    other = tp.tensor([-1.0, 2.0, -3.0, 4.0])
+    assert graph(other).tolist() == [2.0, 4.0]
+
+
+def test_mask_assignment_is_recorded():
+    from tensorplay.graph.experimental._dispatch_trace import dispatch_make_graph
+
+    def fn(a):
+        b = a.clone()
+        b[b > 0] = 0.0
+        return b
+
+    graph = dispatch_make_graph(fn)(tp.tensor([1.0, -2.0, 3.0]))
+    assert graph(tp.tensor([-1.0, 2.0, -3.0])).tolist() == [-1.0, 0.0, -3.0]

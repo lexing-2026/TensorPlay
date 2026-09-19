@@ -153,6 +153,8 @@ Tensor avg_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
                       const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                       bool ceil_mode, bool count_include_pad,
                       std::optional<int64_t> divisor_override) {
+    if (divisor_override.has_value() && *divisor_override == 0)
+        TP_THROW(RuntimeError, "divisor must be not zero");
     if (input.dim() == 4) {
         return avg_pool3d_cpu(input.unsqueeze(0), kernel_size, stride, padding,
                               ceil_mode, count_include_pad,
@@ -308,6 +310,8 @@ Tensor max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
 }
 
 Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, bool ceil_mode, bool count_include_pad, std::optional<int64_t> divisor_override) {
+    if (divisor_override.has_value() && *divisor_override == 0)
+        TP_THROW(RuntimeError, "divisor must be not zero");
     if (input.dim() == 3) {
         return avg_pool2d_cpu(input.unsqueeze(0), kernel_size, stride, padding,
                               ceil_mode, count_include_pad, divisor_override).squeeze(0);
@@ -585,6 +589,8 @@ Tensor max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
 }
 
 Tensor avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, bool ceil_mode, bool count_include_pad, std::optional<int64_t> divisor_override) {
+    if (divisor_override.has_value() && *divisor_override == 0)
+        TP_THROW(RuntimeError, "divisor must be not zero");
     if (grad_output.dim() != 4 || input.dim() != 4) TP_THROW(RuntimeError, "avg_pool2d_backward: Expected 4D input and grad_output");
     const Tensor input_c = input.contiguous();
 
@@ -858,6 +864,8 @@ Tensor avg_pool3d_backward_cpu(const Tensor& grad_output, const Tensor& input,
                                const std::vector<int64_t>& padding,
                                bool ceil_mode, bool count_include_pad,
                                std::optional<int64_t> divisor_override) {
+    if (divisor_override.has_value() && *divisor_override == 0)
+        TP_THROW(RuntimeError, "divisor must be not zero");
     if (grad_output.dim() == 4 && input.dim() == 4) {
         return avg_pool3d_backward_cpu(grad_output.unsqueeze(0), input.unsqueeze(0),
                                        kernel_size, stride, padding, ceil_mode,

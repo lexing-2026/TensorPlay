@@ -514,8 +514,8 @@ Tensor addmm_kernel(
     const Tensor& bias,
     const Tensor& mat1,
     const Tensor& mat2,
-    Scalar beta,
-    Scalar alpha) {
+    const Scalar& beta,
+    const Scalar& alpha) {
   TP_CHECK(
       mat1.dtype() == DType::Float32 && mat2.dtype() == DType::Float32,
       "Vulkan addmm supports Float32 tensors only");
@@ -668,8 +668,8 @@ Tensor baddbmm_kernel(
     const Tensor& self,
     const Tensor& batch1,
     const Tensor& batch2,
-    Scalar beta,
-    Scalar alpha) {
+    const Scalar& beta,
+    const Scalar& alpha) {
   TP_CHECK(
       batch1.dtype() == DType::Float32 && batch2.dtype() == DType::Float32,
       "Vulkan baddbmm supports Float32 tensors only");

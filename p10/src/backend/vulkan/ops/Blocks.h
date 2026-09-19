@@ -203,7 +203,7 @@ int32_t get_dim_i(const std::vector<int64_t>& sizes) {
 }
 
 // Defined in Clone.cpp; shared by ops that build on exact copies.
-Tensor clone_kernel(const Tensor& self);
+Tensor clone_kernel(const Tensor& self, std::optional<int64_t> memory_format = std::nullopt);
 
 // Defined in View.cpp; broadcast-expands through zero-stride gathers.
 Tensor expand_kernel(const Tensor& self, const std::vector<int64_t>& size, bool implicit);

@@ -132,7 +132,7 @@ Tensor& write_out(Tensor& out, const Tensor& value) {
 
 Tensor scatter_reduce_variant_native(const Tensor& self, int64_t dim,
                                      const Tensor& index, const Tensor& src,
-                                     std::string reduce) {
+                                     const std::string& reduce) {
     return ops::scatter_reduce(self, dim, index, src, legacy_reduce_name(reduce),
                                /*include_self=*/true);
 }
@@ -140,35 +140,35 @@ Tensor scatter_reduce_variant_native(const Tensor& self, int64_t dim,
 Tensor& scatter_reduce_variant_inplace_native(Tensor& self, int64_t dim,
                                               const Tensor& index,
                                               const Tensor& src,
-                                              std::string reduce) {
+                                              const std::string& reduce) {
     self.copy_(scatter_reduce_variant_native(self, dim, index, src, reduce));
     return self;
 }
 
 Tensor& scatter_reduce_variant_out_native(const Tensor& self, int64_t dim,
                                           const Tensor& index, const Tensor& src,
-                                          std::string reduce, Tensor& out) {
+                                          const std::string& reduce, Tensor& out) {
     return write_out(out,
                      scatter_reduce_variant_native(self, dim, index, src, reduce));
 }
 
 Tensor scatter_value_reduce_native(const Tensor& self, int64_t dim,
-                                   const Tensor& index, Scalar value,
-                                   std::string reduce) {
+                                   const Tensor& index, const Scalar& value,
+                                   const std::string& reduce) {
     return scatter_reduce_variant_native(
         self, dim, index, scalar_source_like(self, index, value), reduce);
 }
 
 Tensor& scatter_value_reduce_inplace_native(Tensor& self, int64_t dim,
-                                            const Tensor& index, Scalar value,
-                                            std::string reduce) {
+                                            const Tensor& index, const Scalar& value,
+                                            const std::string& reduce) {
     self.copy_(scatter_value_reduce_native(self, dim, index, value, reduce));
     return self;
 }
 
 Tensor& scatter_value_reduce_out_native(const Tensor& self, int64_t dim,
-                                        const Tensor& index, Scalar value,
-                                        std::string reduce, Tensor& out) {
+                                        const Tensor& index, const Scalar& value,
+                                        const std::string& reduce, Tensor& out) {
     return write_out(out,
                      scatter_value_reduce_native(self, dim, index, value, reduce));
 }
@@ -180,19 +180,9 @@ Tensor& scatter_src_out_native(const Tensor& self, int64_t dim,
 }
 
 Tensor& scatter_value_out_native(const Tensor& self, int64_t dim,
-                                 const Tensor& index, Scalar value,
+                                 const Tensor& index, const Scalar& value,
                                  Tensor& out) {
     return write_out(out, ops::scatter(self, dim, index, value));
-}
-
-std::vector<Tensor> materialize_optional_indices(
-    const std::vector<std::optional<Tensor>>& indices) {
-    std::vector<Tensor> materialized;
-    materialized.reserve(indices.size());
-    for (const auto& index : indices) {
-        materialized.emplace_back(index.has_value() ? *index : Tensor());
-    }
-    return materialized;
 }
 
 void check_unsafe_indices(
@@ -277,7 +267,7 @@ std::vector<std::optional<Tensor>> clamp_unsafe_indices(
 
 Tensor unsafe_masked_index_composite(
     const Tensor& self, const Tensor& mask,
-    const std::vector<std::optional<Tensor>>& indices, Scalar fill) {
+    const std::vector<std::optional<Tensor>>& indices, const Scalar& fill) {
     const auto clamped = clamp_unsafe_indices(self, indices,
                                                "_unsafe_masked_index");
     if (self.numel() == 0) {
@@ -299,30 +289,31 @@ Tensor unsafe_masked_index_put_accumulate_composite(
         self, indices, "_unsafe_masked_index_put_accumulate");
     const Tensor masked_values =
         ops::masked_fill(values, ops::logical_not(mask), Scalar(0));
-    Tensor result = ops::clone(self, std::nullopt);
-    indexing::dispatch_index_put_(
-        result, materialize_optional_indices(clamped), masked_values,
-        /*accumulate=*/true);
-    return result;
+    return ops::_unsafe_index_put(self, clamped, masked_values,
+                                  /*accumulate=*/true);
 }
 
 Tensor unsafe_index_put_composite(
     const Tensor& self,
     const std::vector<std::optional<Tensor>>& indices,
     const Tensor& values, bool accumulate) {
-    Tensor result = ops::clone(self, std::nullopt);
-    indexing::dispatch_index_put_(
-        result, materialize_optional_indices(indices), values, accumulate);
-    return result;
+    return ops::index_put(self, indices, values, accumulate);
 }
 
-Tensor& index_put_impl_composite(
+Tensor index_put_composite(
+    const Tensor& self,
+    const std::vector<std::optional<Tensor>>& indices,
+    const Tensor& values, bool accumulate) {
+    Tensor result = ops::clone(
+        self, static_cast<int64_t>(MemoryFormat::Preserve));
+    return ops::index_put_(result, indices, values, accumulate);
+}
+
+Tensor& index_put__composite(
     Tensor& self, const std::vector<std::optional<Tensor>>& indices,
-    const Tensor& values, bool accumulate, bool unsafe) {
-    (void)unsafe;
-    indexing::dispatch_index_put_(
-        self, materialize_optional_indices(indices), values, accumulate);
-    return self;
+    const Tensor& values, bool accumulate) {
+    return ops::_index_put_impl_(self, indices, values, accumulate,
+                                 /*unsafe=*/false);
 }
 
 TENSORPLAY_LIBRARY_IMPL(Composite, TensorAdvancedIndexingComposite) {
@@ -332,7 +323,8 @@ TENSORPLAY_LIBRARY_IMPL(Composite, TensorAdvancedIndexingComposite) {
     m.impl("_unsafe_masked_index_put_accumulate",
            unsafe_masked_index_put_accumulate_composite);
     m.impl("_unsafe_index_put", unsafe_index_put_composite);
-    m.impl("_index_put_impl_", index_put_impl_composite);
+    m.impl("index_put", index_put_composite);
+    m.impl("index_put_", index_put__composite);
     m.impl("put", put_native);
     m.impl("nonzero_static", nonzero_static_native);
     m.impl("scatter.reduce", scatter_reduce_variant_native);

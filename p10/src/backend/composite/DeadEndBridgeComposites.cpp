@@ -129,7 +129,7 @@ Tensor _convolution_bridge(const Tensor& input, const Tensor& weight,
 // addmm plus an elementwise activation: relu, or tanh-approximate gelu when
 // requested.  beta/alpha keep their gemm meaning.
 Tensor _addmm_activation_bridge(const Tensor& self, const Tensor& mat1,
-                                const Tensor& mat2, Scalar beta, Scalar alpha,
+                                const Tensor& mat2, const Scalar& beta, const Scalar& alpha,
                                 bool use_gelu) {
     Tensor mm = ops::addmm(self, mat1, mat2, beta, alpha);
     return use_gelu ? ops::gelu(mm) : ops::relu(mm);
@@ -361,7 +361,9 @@ std::tuple<Tensor, Tensor> log_sigmoid_forward_bridge(const Tensor& self) {
 
 std::tuple<Tensor, Tensor> log_sigmoid_forward_bridge_output(
     const Tensor& self, Tensor& output, Tensor& buffer) {
-    std::tie(output, buffer) = log_sigmoid_forward_bridge(self);
+    auto result = log_sigmoid_forward_bridge(self);
+    write_exact_bridge_out("log_sigmoid_forward", std::get<0>(result), output);
+    write_exact_bridge_out("log_sigmoid_forward", std::get<1>(result), buffer);
     return {output, buffer};
 }
 
@@ -372,18 +374,18 @@ std::tuple<Tensor, Tensor> log_sigmoid_forward_bridge_output(
 // The base kernel owns the random-leak selection and the eval-mode midpoint
 // slope; the out/inplace variants only steer where the result lands.
 Tensor& rrelu_with_noise_bridge_out(const Tensor& self, Tensor& noise,
-                                    Scalar lower, Scalar upper, bool training,
+                                    const Scalar& lower, const Scalar& upper, bool training,
                                     std::optional<Generator> generator,
                                     Tensor& out) {
-    Tensor result = ops::rrelu_with_noise(self, noise, lower, upper, training);
+    Tensor result = ops::rrelu_with_noise(self, noise, lower, upper, training, generator);
     return write_exact_bridge_out("rrelu_with_noise", result, out);
 }
 
 Tensor& rrelu_with_noise_bridge_inplace(Tensor& self, Tensor& noise,
-                                        Scalar lower, Scalar upper,
+                                        const Scalar& lower, const Scalar& upper,
                                         bool training,
                                         std::optional<Generator> generator) {
-    Tensor result = ops::rrelu_with_noise(self, noise, lower, upper, training);
+    Tensor result = ops::rrelu_with_noise(self, noise, lower, upper, training, generator);
     self.copy_(result);
     return self;
 }
@@ -394,7 +396,7 @@ Tensor& rrelu_with_noise_bridge_inplace(Tensor& self, Tensor& noise,
 
 // The out= contract takes the destination's dtype/device/grad mode; the
 // TensorOptions arguments are accepted for schema compatibility and ignored.
-Tensor& arange_bridge_out(Scalar end, DType dtype,
+Tensor& arange_bridge_out(const Scalar& end, DType dtype,
                           std::optional<Device> device, Tensor& out) {
     (void)dtype;
     (void)device;
@@ -402,7 +404,7 @@ Tensor& arange_bridge_out(Scalar end, DType dtype,
         "arange", ops::arange(end, out.dtype(), std::optional<Device>(out.device())), out);
 }
 
-Tensor& arange_bridge_start_step_out(Scalar start, Scalar end, Scalar step,
+Tensor& arange_bridge_start_step_out(const Scalar& start, const Scalar& end, const Scalar& step,
                                      Tensor& out) {
     return write_exact_bridge_out(
         "arange",
@@ -411,14 +413,14 @@ Tensor& arange_bridge_start_step_out(Scalar start, Scalar end, Scalar step,
         out);
 }
 
-Tensor& arange_end_only_bridge_out(Scalar end, Tensor& out) {
+Tensor& arange_end_only_bridge_out(const Scalar& end, Tensor& out) {
     return write_exact_bridge_out(
         "arange",
         ops::arange(end, out.dtype(), std::optional<Device>(out.device())),
         out);
 }
 
-Tensor& linspace_bridge_out(Scalar start, Scalar end, int64_t steps,
+Tensor& linspace_bridge_out(const Scalar& start, const Scalar& end, int64_t steps,
                             Tensor& out) {
     return write_exact_bridge_out(
         "linspace",
@@ -427,7 +429,7 @@ Tensor& linspace_bridge_out(Scalar start, Scalar end, int64_t steps,
         out);
 }
 
-Tensor& logspace_bridge_out(Scalar start, Scalar end, int64_t steps,
+Tensor& logspace_bridge_out(const Scalar& start, const Scalar& end, int64_t steps,
                             double base, Tensor& out) {
     return write_exact_bridge_out(
         "logspace",

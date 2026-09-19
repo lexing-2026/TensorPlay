@@ -10,6 +10,7 @@
 #include <string>
 #include <tuple>
 #include <vector>
+#include "OutWrite.h"
 
 namespace tensorplay {
 namespace composite {
@@ -18,30 +19,10 @@ namespace ops = tensorplay::tpx::ops;
 
 namespace {
 
-// out= keeps the destination the caller handed over: the buffer is resized
-// only when the produced value does not already fit and the values are copied
-// into that storage, so a view of the destination observes the result and its
-// address does not move.  A destination that cannot hold the result's element
-// type adopts the value instead, which is the only case where the identity of
-// the buffer changes.
-Tensor& write_out(Tensor& out, const Tensor& value) {
-    if (!out.defined() || out.dtype() != value.dtype() ||
-        out.device() != value.device()) {
-        out = value;
-        return out;
-    }
-    const auto target = static_cast<std::vector<int64_t>>(value.shape());
-    if (static_cast<std::vector<int64_t>>(out.shape()) != target) {
-        out.resize_(target);
-    }
-    out.copy_(value);
-    return out;
-}
-
 }  // namespace
 
 
-Tensor& out_wrap__addmm_activation_out(const Tensor& self, const Tensor& mat1, const Tensor& mat2, Scalar beta, Scalar alpha, bool use_gelu, Tensor& out) {
+Tensor& out_wrap__addmm_activation_out(const Tensor& self, const Tensor& mat1, const Tensor& mat2, const Scalar& beta, const Scalar& alpha, bool use_gelu, Tensor& out) {
     Tensor mm = ops::addmm(self, mat1, mat2, beta, alpha);
     write_out(out, use_gelu ? ops::gelu(mm) : ops::relu(mm));
     return out;
@@ -62,12 +43,12 @@ Tensor& out_wrap_adaptive_avg_pool3d_backward_grad_input(const Tensor& grad_outp
     return grad_input;
 }
 
-Tensor& out_wrap_addbmm_out(const Tensor& self, const Tensor& batch1, const Tensor& batch2, Scalar beta, Scalar alpha, Tensor& out) {
+Tensor& out_wrap_addbmm_out(const Tensor& self, const Tensor& batch1, const Tensor& batch2, const Scalar& beta, const Scalar& alpha, Tensor& out) {
     write_out(out, ops::addbmm(self, batch1, batch2, beta, alpha));
     return out;
 }
 
-Tensor& out_wrap_addmm_out(const Tensor& self, const Tensor& mat1, const Tensor& mat2, Scalar beta, Scalar alpha, Tensor& out) {
+Tensor& out_wrap_addmm_out(const Tensor& self, const Tensor& mat1, const Tensor& mat2, const Scalar& beta, const Scalar& alpha, Tensor& out) {
     write_out(out, ops::addmm(self, mat1, mat2, beta, alpha));
     return out;
 }
@@ -92,7 +73,7 @@ Tensor& out_wrap_avg_pool3d_backward_grad_input(const Tensor& grad_output, const
     return grad_input;
 }
 
-Tensor& out_wrap_baddbmm_out(const Tensor& self, const Tensor& batch1, const Tensor& batch2, Scalar beta, Scalar alpha, Tensor& out) {
+Tensor& out_wrap_baddbmm_out(const Tensor& self, const Tensor& batch1, const Tensor& batch2, const Scalar& beta, const Scalar& alpha, Tensor& out) {
     write_out(out, ops::baddbmm(self, batch1, batch2, beta, alpha));
     return out;
 }
@@ -136,42 +117,42 @@ Tensor& out_wrap_diag_out(const Tensor& self, int64_t diagonal, Tensor& out) {
     return out;
 }
 
-Tensor& out_wrap_fft_fft_out(const Tensor& self, std::optional<int64_t> n, int64_t dim, std::optional<std::string> norm, Tensor& out) {
+Tensor& out_wrap_fft_fft_out(const Tensor& self, std::optional<int64_t> n, int64_t dim, const std::optional<std::string>& norm, Tensor& out) {
     write_out(out, ops::fft_fft(self, n.value_or(-1), dim, norm.value_or("backward")));
     return out;
 }
 
-Tensor& out_wrap_fft_fft2_out(const Tensor& self, std::optional<std::vector<int64_t>> s, const std::vector<int64_t>& dim, std::optional<std::string> norm, Tensor& out) {
+Tensor& out_wrap_fft_fft2_out(const Tensor& self, const std::optional<std::vector<int64_t>>& s, const std::vector<int64_t>& dim, const std::optional<std::string>& norm, Tensor& out) {
     write_out(out, ops::fft_fft2(self, s, dim, norm.value_or("backward")));
     return out;
 }
 
-Tensor& out_wrap_fft_ifft_out(const Tensor& self, std::optional<int64_t> n, int64_t dim, std::optional<std::string> norm, Tensor& out) {
+Tensor& out_wrap_fft_ifft_out(const Tensor& self, std::optional<int64_t> n, int64_t dim, const std::optional<std::string>& norm, Tensor& out) {
     write_out(out, ops::fft_ifft(self, n.value_or(-1), dim, norm.value_or("backward")));
     return out;
 }
 
-Tensor& out_wrap_fft_ifft2_out(const Tensor& self, std::optional<std::vector<int64_t>> s, const std::vector<int64_t>& dim, std::optional<std::string> norm, Tensor& out) {
+Tensor& out_wrap_fft_ifft2_out(const Tensor& self, const std::optional<std::vector<int64_t>>& s, const std::vector<int64_t>& dim, const std::optional<std::string>& norm, Tensor& out) {
     write_out(out, ops::fft_ifft2(self, s, dim, norm.value_or("backward")));
     return out;
 }
 
-Tensor& out_wrap_fft_irfft_out(const Tensor& self, std::optional<int64_t> n, int64_t dim, std::optional<std::string> norm, Tensor& out) {
+Tensor& out_wrap_fft_irfft_out(const Tensor& self, std::optional<int64_t> n, int64_t dim, const std::optional<std::string>& norm, Tensor& out) {
     write_out(out, ops::fft_irfft(self, n.value_or(-1), dim, norm.value_or("backward")));
     return out;
 }
 
-Tensor& out_wrap_fft_irfft2_out(const Tensor& self, std::optional<std::vector<int64_t>> s, const std::vector<int64_t>& dim, std::optional<std::string> norm, Tensor& out) {
+Tensor& out_wrap_fft_irfft2_out(const Tensor& self, const std::optional<std::vector<int64_t>>& s, const std::vector<int64_t>& dim, const std::optional<std::string>& norm, Tensor& out) {
     write_out(out, ops::fft_irfft2(self, s, dim, norm.value_or("backward")));
     return out;
 }
 
-Tensor& out_wrap_fft_rfft_out(const Tensor& self, std::optional<int64_t> n, int64_t dim, std::optional<std::string> norm, Tensor& out) {
+Tensor& out_wrap_fft_rfft_out(const Tensor& self, std::optional<int64_t> n, int64_t dim, const std::optional<std::string>& norm, Tensor& out) {
     write_out(out, ops::fft_rfft(self, n.value_or(-1), dim, norm.value_or("backward")));
     return out;
 }
 
-Tensor& out_wrap_fft_rfft2_out(const Tensor& self, std::optional<std::vector<int64_t>> s, const std::vector<int64_t>& dim, std::optional<std::string> norm, Tensor& out) {
+Tensor& out_wrap_fft_rfft2_out(const Tensor& self, const std::optional<std::vector<int64_t>>& s, const std::vector<int64_t>& dim, const std::optional<std::string>& norm, Tensor& out) {
     write_out(out, ops::fft_rfft2(self, s, dim, norm.value_or("backward")));
     return out;
 }
@@ -205,12 +186,12 @@ Tensor& out_wrap_gather_out(const Tensor& self, int64_t dim, const Tensor& index
     return out;
 }
 
-Tensor& out_wrap_hardtanh_backward_grad_input(const Tensor& grad_output, const Tensor& self, Scalar min_val, Scalar max_val, Tensor& grad_input) {
+Tensor& out_wrap_hardtanh_backward_grad_input(const Tensor& grad_output, const Tensor& self, const Scalar& min_val, const Scalar& max_val, Tensor& grad_input) {
     write_out(grad_input, ops::hardtanh_backward(grad_output, self, min_val, max_val));
     return grad_input;
 }
 
-Tensor& out_wrap_histc_out(const Tensor& self, int64_t bins, Scalar min, Scalar max, Tensor& out) {
+Tensor& out_wrap_histc_out(const Tensor& self, int64_t bins, const Scalar& min, const Scalar& max, Tensor& out) {
     if (out.dtype() != self.dtype()) {
         TP_THROW(TypeError,
                  "histc(): out tensor must have the same dtype as the input");
@@ -248,7 +229,7 @@ std::tuple<Tensor, Tensor> out_wrap_histogram_bins_tensor_out(
 
 std::tuple<Tensor, Tensor> out_wrap_histogram_bin_ct_out(
         const Tensor& self, int64_t bins,
-        std::optional<std::vector<double>> range,
+        const std::optional<std::vector<double>>& range,
         const std::optional<Tensor>& weight, bool density, Tensor& hist,
         Tensor& bin_edges) {
     if (hist.dtype() != self.dtype() || bin_edges.dtype() != self.dtype()) {
@@ -278,8 +259,10 @@ Tensor& out_wrap_im2col_out(const Tensor& self, const std::vector<int64_t>& kern
     return out;
 }
 
-Tensor& out_wrap_index_add_out(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source, Scalar alpha, Tensor& out) {
-    write_out(out, ops::index_add(self, dim, index, source));
+Tensor& out_wrap_index_add_out(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source, const Scalar& alpha, Tensor& out) {
+    // The functional overload has no alpha: scale the source instead.
+    const bool unit = !alpha.isComplex() && alpha.toDouble() == 1.0;
+    write_out(out, ops::index_add(self, dim, index, unit ? source : ops::mul(source, alpha)));
     return out;
 }
 
@@ -288,7 +271,7 @@ Tensor& out_wrap_index_copy_out(const Tensor& self, int64_t dim, const Tensor& i
     return out;
 }
 
-Tensor& out_wrap_index_reduce_out(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source, std::string reduce, bool include_self, Tensor& out) {
+Tensor& out_wrap_index_reduce_out(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source, const std::string& reduce, bool include_self, Tensor& out) {
     write_out(out, ops::index_reduce(self, dim, index, source, reduce, include_self));
     return out;
 }
@@ -317,7 +300,7 @@ std::tuple<Tensor, Tensor> out_wrap_linalg_cholesky_ex_L(const Tensor& self, boo
     return { L, info };
 }
 
-std::tuple<Tensor, Tensor> out_wrap_linalg_eigh_eigvals(const Tensor& self, std::string UPLO, Tensor& eigvals, Tensor& eigvecs) {
+std::tuple<Tensor, Tensor> out_wrap_linalg_eigh_eigvals(const Tensor& self, const std::string& UPLO, Tensor& eigvals, Tensor& eigvecs) {
     auto __tp_result = ops::linalg_eigh(self, UPLO);
     write_out(eigvals, std::get<0>(__tp_result));
     write_out(eigvecs, std::get<1>(__tp_result));
@@ -364,7 +347,7 @@ std::tuple<Tensor, Tensor> out_wrap_linalg_solve_ex_out(const Tensor& A, const T
     return { result, info };
 }
 
-std::tuple<Tensor, Tensor, Tensor> out_wrap_linalg_svd_U(const Tensor& A, bool full_matrices, std::optional<std::string> driver, Tensor& U, Tensor& S, Tensor& Vh) {
+std::tuple<Tensor, Tensor, Tensor> out_wrap_linalg_svd_U(const Tensor& A, bool full_matrices, const std::optional<std::string>& driver, Tensor& U, Tensor& S, Tensor& Vh) {
     auto __tp_result = ops::linalg_svd(A, full_matrices, driver);
     write_out(U, std::get<0>(__tp_result));
     write_out(S, std::get<1>(__tp_result));
@@ -436,7 +419,7 @@ Tensor& out_wrap_mean_dtype_out(const Tensor& self, std::optional<DType> dtype, 
     return out;
 }
 
-Tensor& out_wrap_mean_out(const Tensor& self, std::optional<std::vector<int64_t>> dim, bool keepdim, std::optional<DType> dtype, Tensor& out) {
+Tensor& out_wrap_mean_out(const Tensor& self, const std::optional<std::vector<int64_t>>& dim, bool keepdim, std::optional<DType> dtype, Tensor& out) {
     write_out(out, ops::mean(self, dim.value_or(std::vector<int64_t>()), keepdim, dtype.value_or(DType::Undefined)));
     return out;
 }
@@ -470,7 +453,7 @@ Tensor& out_wrap_msort_out(const Tensor& self, Tensor& out) {
     return out;
 }
 
-Tensor& out_wrap_multi_margin_loss_backward_grad_input(const Tensor& grad_output, const Tensor& self, const Tensor& target, Scalar p, Scalar margin, const std::optional<Tensor>& weight, int64_t reduction, Tensor& grad_input) {
+Tensor& out_wrap_multi_margin_loss_backward_grad_input(const Tensor& grad_output, const Tensor& self, const Tensor& target, const Scalar& p, const Scalar& margin, const std::optional<Tensor>& weight, int64_t reduction, Tensor& grad_input) {
     write_out(grad_input, ops::multi_margin_loss_backward(grad_output, self, target, p, margin, weight, reduction));
     return grad_input;
 }
@@ -492,9 +475,23 @@ std::tuple<Tensor, Tensor> out_wrap_multilabel_margin_loss_forward_output(const 
     return { output, is_target };
 }
 
-Tensor& out_wrap_nansum_out(const Tensor& self, std::optional<std::vector<int64_t>> dim, bool keepdim, std::optional<DType> dtype, Tensor& out) {
+Tensor& out_wrap_nansum_out(const Tensor& self, const std::optional<std::vector<int64_t>>& dim, bool keepdim, std::optional<DType> dtype, Tensor& out) {
     write_out(out, ops::nansum(self, dim.value_or(std::vector<int64_t>()), keepdim));
     return out;
+}
+
+std::tuple<Tensor, Tensor> out_wrap_nll_loss_forward_output(const Tensor& self, const Tensor& target, const std::optional<Tensor>& weight, int64_t reduction, int64_t ignore_index, Tensor& output, Tensor& total_weight) {
+    auto __tp_result = ops::nll_loss_forward(self, target, weight, reduction, ignore_index);
+    write_out(output, std::get<0>(__tp_result));
+    write_out(total_weight, std::get<1>(__tp_result));
+    return { output, total_weight };
+}
+
+std::tuple<Tensor, Tensor> out_wrap_nll_loss2d_forward_output(const Tensor& self, const Tensor& target, const std::optional<Tensor>& weight, int64_t reduction, int64_t ignore_index, Tensor& output, Tensor& total_weight) {
+    auto __tp_result = ops::nll_loss2d_forward(self, target, weight, reduction, ignore_index);
+    write_out(output, std::get<0>(__tp_result));
+    write_out(total_weight, std::get<1>(__tp_result));
+    return { output, total_weight };
 }
 
 Tensor& out_wrap_nll_loss2d_backward_grad_input(const Tensor& grad_output, const Tensor& self, const Tensor& target, const std::optional<Tensor>& weight, int64_t reduction, int64_t ignore_index, const Tensor& total_weight, Tensor& grad_input) {
@@ -523,12 +520,12 @@ Tensor& out_wrap_randint_low_out(int64_t low, int64_t high, const std::vector<in
     return out;
 }
 
-Tensor& out_wrap_range_out(Scalar start, Scalar end, Scalar step, Tensor& out) {
+Tensor& out_wrap_range_out(const Scalar& start, const Scalar& end, const Scalar& step, Tensor& out) {
     write_out(out, ops::range(start, end, step, std::optional<DType>(), std::optional<Device>()));
     return out;
 }
 
-Tensor& out_wrap_range_out_(Scalar start, Scalar end, Tensor& out) {
+Tensor& out_wrap_range_out_(const Scalar& start, const Scalar& end, Tensor& out) {
     write_out(out, ops::range(start, end, 1, std::optional<DType>(), std::optional<Device>()));
     return out;
 }
@@ -584,7 +581,7 @@ Tensor& out_wrap_replication_pad3d_backward_grad_input(const Tensor& grad_output
     return grad_input;
 }
 
-Tensor& out_wrap_renorm_out(const Tensor& self, Scalar p, int64_t dim, Scalar maxnorm, Tensor& out) {
+Tensor& out_wrap_renorm_out(const Tensor& self, const Scalar& p, int64_t dim, const Scalar& maxnorm, Tensor& out) {
     write_out(out, ops::renorm(self, p, dim, maxnorm));
     return out;
 }
@@ -609,7 +606,7 @@ Tensor& out_wrap_scatter_add_out(const Tensor& self, int64_t dim, const Tensor& 
     return out;
 }
 
-Tensor& out_wrap_scatter_reduce_two_out(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& src, std::string reduce, bool include_self, Tensor& out) {
+Tensor& out_wrap_scatter_reduce_two_out(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& src, const std::string& reduce, bool include_self, Tensor& out) {
     write_out(out, ops::scatter_reduce(self, dim, index, src, reduce, include_self));
     return out;
 }
@@ -641,7 +638,7 @@ std::tuple<Tensor, Tensor> out_wrap_sort_values(const Tensor& self, int64_t dim,
     return { values, indices };
 }
 
-Tensor& out_wrap_sum_IntList_out(const Tensor& self, std::optional<std::vector<int64_t>> dim, bool keepdim, std::optional<DType> dtype, Tensor& out) {
+Tensor& out_wrap_sum_IntList_out(const Tensor& self, const std::optional<std::vector<int64_t>>& dim, bool keepdim, std::optional<DType> dtype, Tensor& out) {
     write_out(out, ops::sum(self, dim.value_or(std::vector<int64_t>()), keepdim, dtype.value_or(DType::Undefined)));
     return out;
 }
@@ -847,8 +844,10 @@ TENSORPLAY_LIBRARY_IMPL(Composite, VariantWiringoutvariants) {
     m.impl("multilabel_margin_loss_backward.grad_input", composite::out_wrap_multilabel_margin_loss_backward_grad_input);
     m.impl("multilabel_margin_loss_forward.output", composite::out_wrap_multilabel_margin_loss_forward_output);
     m.impl("nansum.out", composite::out_wrap_nansum_out);
+    m.impl("nll_loss2d_forward.output", composite::out_wrap_nll_loss2d_forward_output);
     m.impl("nll_loss2d_backward.grad_input", composite::out_wrap_nll_loss2d_backward_grad_input);
     m.impl("nll_loss_backward.grad_input", composite::out_wrap_nll_loss_backward_grad_input);
+    m.impl("nll_loss_forward.output", composite::out_wrap_nll_loss_forward_output);
     m.impl("orgqr.out", composite::out_wrap_orgqr_out);
     m.impl("ormqr.out", composite::out_wrap_ormqr_out);
     m.impl("randint.low_out", composite::out_wrap_randint_low_out);

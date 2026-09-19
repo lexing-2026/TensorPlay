@@ -525,7 +525,7 @@ Tensor coo_to_csr_native(const Tensor& coalesced) {
 } // namespace
 
 Tensor sparse_coo_tensor_cuda(const Tensor& indices, const Tensor& values,
-                              std::optional<std::vector<int64_t>> size,
+                              const std::optional<std::vector<int64_t>>& size,
                               bool is_coalesced) {
     if (size.has_value()) {
         return Tensor::make_sparse_coo_tensor(indices, values, *size, is_coalesced);
@@ -1567,7 +1567,7 @@ Tensor sparse_mm_cuda(const Tensor& self, const Tensor& dense) {
 }
 
 Tensor sparse_sum_cuda(const Tensor& self,
-                       std::optional<std::vector<int64_t>> dim,
+                       const std::optional<std::vector<int64_t>>& dim,
                        std::optional<DType> dtype) {
     if (!self.is_sparse()) {
         TP_THROW(RuntimeError, "sparse_sum(): expected a sparse tensor");
@@ -1949,7 +1949,7 @@ __global__ void spdiags_duplicate_kernel(int64_t n_offsets,
 }
 
 Tensor spdiags_cuda(const Tensor& diagonals, const Tensor& offsets,
-                    std::vector<int64_t> shape,
+                    const std::vector<int64_t>& shape,
                     std::optional<int64_t> layout) {
     if (layout.has_value() && *layout != 0 && *layout != 1) {
         TP_THROW(ValueError,

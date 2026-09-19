@@ -29,7 +29,7 @@ std::tuple<Tensor, Tensor> quantized_conv2d_prepack_cpu(
     const Tensor& weight,
     const Tensor& weight_scales,
     const Tensor& weight_zero_points,
-    std::optional<Tensor> bias,
+    const std::optional<Tensor>& bias,
     bool transposed);
 
 // Rebuilds the float-domain weight [O, C, KH, KW] and bias [O] from the

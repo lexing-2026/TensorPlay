@@ -199,7 +199,7 @@ void check_infos(const Tensor& infos_dev, std::string_view api_name, bool is_mat
     }
 }
 
-void linalg_check_errors_kernel(const Tensor& infos, std::string api_name,
+void linalg_check_errors_kernel(const Tensor& infos, const std::string& api_name,
                                 bool is_matrix) {
     check_infos(infos, api_name, is_matrix);
 }
@@ -915,7 +915,7 @@ std::tuple<Tensor, Tensor> linalg_qr_kernel_cuda_impl(const Tensor& A,
 }
 
 std::tuple<Tensor, Tensor> linalg_qr_kernel_cuda(const Tensor& A,
-                                                 std::string mode) {
+                                                 const std::string& mode) {
     check_is_matrix(A, "linalg.qr");
     if (mode != "reduced" && mode != "complete" && mode != "r" && mode != "R") {
         TP_THROW(RuntimeError, "linalg.qr: mode '", mode, "' not recognized.");
@@ -927,7 +927,7 @@ std::tuple<Tensor, Tensor> linalg_qr_kernel_cuda(const Tensor& A,
 }
 
 std::tuple<Tensor, Tensor> linalg_qr_out_kernel_cuda(const Tensor& A,
-                                                     std::string mode,
+                                                     const std::string& mode,
                                                      Tensor& Q, Tensor& R) {
     auto result = linalg_qr_kernel_cuda(A, mode);
     write_linalg_output("linalg.qr", std::get<0>(result), Q);
@@ -1056,23 +1056,23 @@ std::tuple<Tensor, Tensor> eigh_impl_cuda(const Tensor& A, bool upper,
 }
 
 std::tuple<Tensor, Tensor> linalg_eigh_internal_kernel_cuda(
-        const Tensor& A, std::string UPLO, bool compute_v) {
+        const Tensor& A, const std::string& UPLO, bool compute_v) {
     if (UPLO != "U" && UPLO != "L") {
         TP_THROW(RuntimeError, "linalg.eigh: UPLO argument must be 'U' or 'L', got ", UPLO);
     }
     return eigh_impl_cuda(A, UPLO == "U", compute_v);
 }
 
-std::tuple<Tensor, Tensor> linalg_eigh_kernel_cuda(const Tensor& A, std::string UPLO) {
+std::tuple<Tensor, Tensor> linalg_eigh_kernel_cuda(const Tensor& A, const std::string& UPLO) {
     return linalg_eigh_internal_kernel_cuda(A, UPLO, true);
 }
 
-Tensor linalg_eigvalsh_kernel_cuda(const Tensor& A, std::string UPLO) {
+Tensor linalg_eigvalsh_kernel_cuda(const Tensor& A, const std::string& UPLO) {
     return std::get<0>(linalg_eigh_internal_kernel_cuda(A, UPLO, false));
 }
 
 std::tuple<Tensor, Tensor> linalg_eigh_internal_out_kernel_cuda(
-        const Tensor& A, std::string UPLO, bool compute_v, Tensor& values,
+        const Tensor& A, const std::string& UPLO, bool compute_v, Tensor& values,
         Tensor& vectors) {
     auto result = linalg_eigh_internal_kernel_cuda(A, UPLO, compute_v);
     write_linalg_output("linalg.eigh", std::get<0>(result), values);
@@ -1081,11 +1081,11 @@ std::tuple<Tensor, Tensor> linalg_eigh_internal_out_kernel_cuda(
 }
 
 std::tuple<Tensor, Tensor> linalg_eigh_eigvals_out_kernel_cuda(
-        const Tensor& A, std::string UPLO, Tensor& values, Tensor& vectors) {
+        const Tensor& A, const std::string& UPLO, Tensor& values, Tensor& vectors) {
     return linalg_eigh_internal_out_kernel_cuda(A, UPLO, true, values, vectors);
 }
 
-Tensor& linalg_eigvalsh_out_kernel_cuda(const Tensor& A, std::string UPLO,
+Tensor& linalg_eigvalsh_out_kernel_cuda(const Tensor& A, const std::string& UPLO,
                                         Tensor& out) {
     auto result = linalg_eigh_internal_kernel_cuda(A, UPLO, false);
     write_linalg_output("linalg.eigvalsh", std::get<0>(result), out);
@@ -1138,7 +1138,7 @@ Tensor linalg_solve_triangular_kernel_cuda(const Tensor& A, const Tensor& B,
 
 std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_lstsq_kernel_cuda(
         const Tensor& A, const Tensor& B, std::optional<double> rcond,
-        std::optional<std::string> driver_opt) {
+        const std::optional<std::string>& driver_opt) {
     const char* api = "linalg.lstsq";
     const std::string driver = driver_opt.value_or("gels");
     if (driver != "gels") {

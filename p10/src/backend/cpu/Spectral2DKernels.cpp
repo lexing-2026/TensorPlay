@@ -393,32 +393,32 @@ Tensor fft2_irfft_backward_impl(const Tensor& grad, const Tensor& self,
 
 }  // namespace
 
-Tensor fft_fft2_cpu(const Tensor& self, std::optional<std::vector<int64_t>> s,
-                   const std::vector<int64_t>& dim, std::string norm) {
+Tensor fft_fft2_cpu(const Tensor& self, const std::optional<std::vector<int64_t>>& s,
+                   const std::vector<int64_t>& dim, const std::string& norm) {
     const FFT2Args args = canonicalize_fft2(self, s, dim, false);
     return self.dtype() == DType::ComplexDouble || self.dtype() == DType::Float64
         ? fft2_c2c_impl<double>(self, args, norm_from_string(norm, true), true)
         : fft2_c2c_impl<float>(self, args, norm_from_string(norm, true), true);
 }
 
-Tensor fft_ifft2_cpu(const Tensor& self, std::optional<std::vector<int64_t>> s,
-                    const std::vector<int64_t>& dim, std::string norm) {
+Tensor fft_ifft2_cpu(const Tensor& self, const std::optional<std::vector<int64_t>>& s,
+                    const std::vector<int64_t>& dim, const std::string& norm) {
     const FFT2Args args = canonicalize_fft2(self, s, dim, false);
     return self.dtype() == DType::ComplexDouble || self.dtype() == DType::Float64
         ? fft2_c2c_impl<double>(self, args, norm_from_string(norm, false), false)
         : fft2_c2c_impl<float>(self, args, norm_from_string(norm, false), false);
 }
 
-Tensor fft_rfft2_cpu(const Tensor& self, std::optional<std::vector<int64_t>> s,
-                    const std::vector<int64_t>& dim, std::string norm) {
+Tensor fft_rfft2_cpu(const Tensor& self, const std::optional<std::vector<int64_t>>& s,
+                    const std::vector<int64_t>& dim, const std::string& norm) {
     const FFT2Args args = canonicalize_fft2(self, s, dim, false);
     return self.dtype() == DType::Float64
         ? fft2_r2c_impl<double>(self, args, norm_from_string(norm, true))
         : fft2_r2c_impl<float>(self, args, norm_from_string(norm, true));
 }
 
-Tensor fft_irfft2_cpu(const Tensor& self, std::optional<std::vector<int64_t>> s,
-                     const std::vector<int64_t>& dim, std::string norm) {
+Tensor fft_irfft2_cpu(const Tensor& self, const std::optional<std::vector<int64_t>>& s,
+                     const std::vector<int64_t>& dim, const std::string& norm) {
     const FFT2Args args = canonicalize_fft2(self, s, dim, true);
     return self.dtype() == DType::ComplexDouble
         ? fft2_c2r_impl<double>(self, args, norm_from_string(norm, false))
@@ -426,8 +426,8 @@ Tensor fft_irfft2_cpu(const Tensor& self, std::optional<std::vector<int64_t>> s,
 }
 
 Tensor fft_fft2_backward_cpu(const Tensor& grad, const Tensor& self,
-                             std::optional<std::vector<int64_t>> s,
-                             const std::vector<int64_t>& dim, std::string norm) {
+                             const std::optional<std::vector<int64_t>>& s,
+                             const std::vector<int64_t>& dim, const std::string& norm) {
     const FFT2Args args = canonicalize_fft2(self, s, dim, false);
     return grad.dtype() == DType::ComplexDouble
         ? fft2_c2c_backward_impl<double>(grad, self, args, norm, true)
@@ -435,8 +435,8 @@ Tensor fft_fft2_backward_cpu(const Tensor& grad, const Tensor& self,
 }
 
 Tensor fft_ifft2_backward_cpu(const Tensor& grad, const Tensor& self,
-                              std::optional<std::vector<int64_t>> s,
-                              const std::vector<int64_t>& dim, std::string norm) {
+                              const std::optional<std::vector<int64_t>>& s,
+                              const std::vector<int64_t>& dim, const std::string& norm) {
     const FFT2Args args = canonicalize_fft2(self, s, dim, false);
     return grad.dtype() == DType::ComplexDouble
         ? fft2_c2c_backward_impl<double>(grad, self, args, norm, false)
@@ -444,8 +444,8 @@ Tensor fft_ifft2_backward_cpu(const Tensor& grad, const Tensor& self,
 }
 
 Tensor fft_rfft2_backward_cpu(const Tensor& grad, const Tensor& self,
-                              std::optional<std::vector<int64_t>> s,
-                              const std::vector<int64_t>& dim, std::string norm) {
+                              const std::optional<std::vector<int64_t>>& s,
+                              const std::vector<int64_t>& dim, const std::string& norm) {
     const FFT2Args args = canonicalize_fft2(self, s, dim, false);
     return grad.dtype() == DType::ComplexDouble
         ? fft2_rfft_backward_impl<double>(grad, self, args, norm)
@@ -453,8 +453,8 @@ Tensor fft_rfft2_backward_cpu(const Tensor& grad, const Tensor& self,
 }
 
 Tensor fft_irfft2_backward_cpu(const Tensor& grad, const Tensor& self,
-                               std::optional<std::vector<int64_t>> s,
-                               const std::vector<int64_t>& dim, std::string norm) {
+                               const std::optional<std::vector<int64_t>>& s,
+                               const std::vector<int64_t>& dim, const std::string& norm) {
     const FFT2Args args = canonicalize_fft2(self, s, dim, true);
     return grad.dtype() == DType::Float64
         ? fft2_irfft_backward_impl<double>(grad, self, args, norm)

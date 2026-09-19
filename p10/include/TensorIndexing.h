@@ -214,7 +214,7 @@ inline Tensor applySlice(
       sizes[dim] <= stop && step == 1) {
     return self;
   }
-  return self.slice(dim, start, stop, step);
+  return tpx::ops::slice(self, dim, start, stop, step);
 }
 
 inline Tensor applySelect(
@@ -239,7 +239,7 @@ inline Tensor applySelect(
       real_dim,
       " with size ",
       size);
-  return self.select(dim, index);
+  return tpx::ops::select(self, dim, index);
 }
 
 // A boolean index adds one axis: true keeps it whole, false empties it.
@@ -291,300 +291,6 @@ inline int64_t count_specified_dimensions(
 
 } // namespace impl
 
-// Boolean masks decode on the host: for every true lane the mask's own
-// coordinates become one element in each axis's index vector.
-inline std::vector<std::vector<int64_t>> decode_bool_mask(
-    const Tensor& mask) {
-  Tensor host_mask = mask;
-  if (!host_mask.device().is_cpu()) {
-    host_mask = host_mask.to(Device(DeviceType::CPU));
-  }
-  host_mask = host_mask.contiguous();
-  const int64_t mask_dim = mask.dim();
-  const int64_t mask_numel = host_mask.numel();
-  const auto sizes = static_cast<std::vector<int64_t>>(mask.shape());
-
-  std::vector<std::vector<int64_t>> coordinates(static_cast<size_t>(mask_dim));
-  if (mask.dtype() == DType::Bool) {
-    const bool* lanes = host_mask.data_ptr<bool>();
-    for (int64_t linear = 0; linear < mask_numel; ++linear) {
-      if (!lanes[linear]) continue;
-      int64_t remainder = linear;
-      std::vector<int64_t> current(static_cast<size_t>(mask_dim));
-      for (int64_t d = mask_dim - 1; d >= 0; --d) {
-        const int64_t size = sizes[static_cast<size_t>(d)];
-        current[static_cast<size_t>(d)] = size == 0 ? 0 : remainder % size;
-        if (size != 0) remainder /= size;
-      }
-      for (int64_t d = 0; d < mask_dim; ++d) {
-        coordinates[static_cast<size_t>(d)].push_back(
-            current[static_cast<size_t>(d)]);
-      }
-    }
-  } else {
-    const uint8_t* lanes = host_mask.data_ptr<uint8_t>();
-    for (int64_t linear = 0; linear < mask_numel; ++linear) {
-      if (!lanes[linear]) continue;
-      int64_t remainder = linear;
-      std::vector<int64_t> current(static_cast<size_t>(mask_dim));
-      for (int64_t d = mask_dim - 1; d >= 0; --d) {
-        const int64_t size = sizes[static_cast<size_t>(d)];
-        current[static_cast<size_t>(d)] = size == 0 ? 0 : remainder % size;
-        if (size != 0) remainder /= size;
-      }
-      for (int64_t d = 0; d < mask_dim; ++d) {
-        coordinates[static_cast<size_t>(d)].push_back(
-            current[static_cast<size_t>(d)]);
-      }
-    }
-  }
-  return coordinates;
-}
-
-namespace detail {
-
-// One advanced index tensor after materialization: the axis it gathers
-// over, the broadcast shape of the index, and the (host) index values in
-// row-major order of that shape.
-struct AdvancedComponent final {
-  int64_t input_dim = -1;
-  std::vector<int64_t> shape;
-  std::vector<int64_t> values;
-};
-
-// Materializes one integer index tensor into an AdvancedComponent: values
-// wrap for negative codes and bounds-check against their axis.
-inline AdvancedComponent make_advanced_component(
-    const Tensor& self,
-    int64_t input_dim,
-    const Tensor& raw_index) {
-  TP_CHECK(
-      isIntegralType(raw_index.dtype(), /*includeBool=*/false),
-      "tensors used as indices must be long, int, short, byte or bool tensors");
-  AdvancedComponent component;
-  component.input_dim = input_dim;
-  component.shape = static_cast<std::vector<int64_t>>(raw_index.shape());
-
-  Tensor host_index = raw_index.to(DType::Int64);
-  if (!host_index.device().is_cpu()) {
-    host_index = host_index.to(Device(DeviceType::CPU));
-  }
-  host_index = host_index.contiguous();
-  const int64_t dim_size = self.size(input_dim);
-  const int64_t n = host_index.numel();
-  component.values.resize(static_cast<size_t>(n));
-  if (n > 0) {
-    std::memcpy(
-        component.values.data(),
-        host_index.data_ptr<int64_t>(),
-        static_cast<size_t>(n) * sizeof(int64_t));
-  }
-  for (int64_t& value : component.values) {
-    if (value < 0) value += dim_size;
-    TP_CHECK_INDEX(
-        value >= 0 && value < dim_size,
-        "index ",
-        value,
-        " is out of bounds for dimension ",
-        input_dim,
-        " with size ",
-        dim_size);
-  }
-  return component;
-}
-
-// A boolean or byte mask fans out into one component per mask axis: for
-// every true lane, the mask's own coordinates enter each axis's index
-// vector element-wise.
-inline std::vector<AdvancedComponent> make_mask_components(
-    const Tensor& self,
-    int64_t input_dim,
-    const Tensor& mask) {
-  const int64_t mask_dim = mask.dim();
-  TP_CHECK_INDEX(
-      mask_dim > 0 && input_dim + mask_dim <= self.dim(),
-      "The shape of the mask does not match the indexed tensor");
-  const auto self_sizes = static_cast<std::vector<int64_t>>(self.shape());
-  for (int64_t d = 0; d < mask_dim; ++d) {
-    TP_CHECK_INDEX(
-        mask.size(d) == self_sizes[static_cast<size_t>(input_dim + d)],
-        "The shape of the mask does not match the indexed tensor");
-  }
-  const std::vector<std::vector<int64_t>> coordinates = decode_bool_mask(mask);
-  const int64_t count = coordinates.empty()
-                            ? 0
-                            : static_cast<int64_t>(coordinates[0].size());
-  std::vector<AdvancedComponent> components;
-  components.reserve(static_cast<size_t>(mask_dim));
-  for (int64_t d = 0; d < mask_dim; ++d) {
-    AdvancedComponent component;
-    component.input_dim = input_dim + d;
-    component.shape = {count};
-    component.values = coordinates[static_cast<size_t>(d)];
-    components.push_back(std::move(component));
-  }
-  return components;
-}
-
-inline int64_t checked_shape_numel(const std::vector<int64_t>& shape) {
-  int64_t result = 1;
-  for (const int64_t size : shape) {
-    if (size < 0 ||
-        (size != 0 && result > std::numeric_limits<int64_t>::max() / size)) {
-      TP_THROW(RuntimeError, "invalid or overflowing indexed shape");
-    }
-    result *= size;
-  }
-  return result;
-}
-
-//
-// The advanced gather plan: map every output element to one flat source
-// offset.  `indexed` lists one component per indexed axis in axis order;
-// every other axis of `self` copies through.  The gather shape sits in
-// place when the indexed axes are adjacent, otherwise it moves to the
-// front.
-//
-struct AdvancedPlan final {
-  std::vector<int64_t> output_shape;
-  std::vector<int64_t> linear_indices;
-};
-
-inline AdvancedPlan build_advanced_plan(
-    const Tensor& self,
-    const std::vector<AdvancedComponent>& components) {
-  AdvancedPlan plan;
-  const int64_t ndim = self.dim();
-
-  std::vector<int64_t> advanced_shape;
-  for (const auto& component : components) {
-    if (advanced_shape.empty()) {
-      advanced_shape = component.shape;
-    } else {
-      advanced_shape = broadcast_shapes(advanced_shape, component.shape);
-    }
-  }
-
-  int64_t first_dim = ndim;
-  int64_t last_dim = -1;
-  for (const auto& component : components) {
-    first_dim = std::min(first_dim, component.input_dim);
-    last_dim = std::max(last_dim, component.input_dim);
-  }
-  const bool adjacent =
-      components.empty() || (last_dim - first_dim + 1 ==
-                             static_cast<int64_t>(components.size()));
-
-  // Output axis assignment for every input axis: -1 for absorbed axes.
-  std::vector<int64_t> axis_of_dim(static_cast<size_t>(ndim), -1);
-  std::vector<const AdvancedComponent*> component_of_dim(
-      static_cast<size_t>(ndim), nullptr);
-  for (const auto& component : components) {
-    component_of_dim[static_cast<size_t>(component.input_dim)] = &component;
-  }
-
-  const auto push_basic_axis = [&](int64_t d) {
-    axis_of_dim[static_cast<size_t>(d)] =
-        static_cast<int64_t>(plan.output_shape.size());
-    plan.output_shape.push_back(self.size(d));
-  };
-
-  int64_t advanced_start = 0;
-  if (adjacent) {
-    for (int64_t d = 0; d < ndim; ++d) {
-      if (d == first_dim) {
-        advanced_start = static_cast<int64_t>(plan.output_shape.size());
-        for (const int64_t size : advanced_shape) {
-          plan.output_shape.push_back(size);
-        }
-      }
-      if (component_of_dim[static_cast<size_t>(d)] == nullptr) {
-        push_basic_axis(d);
-      }
-    }
-  } else {
-    for (const int64_t size : advanced_shape) {
-      plan.output_shape.push_back(size);
-    }
-    for (int64_t d = 0; d < ndim; ++d) {
-      if (component_of_dim[static_cast<size_t>(d)] == nullptr) {
-        push_basic_axis(d);
-      }
-    }
-  }
-
-  const int64_t advanced_rank = static_cast<int64_t>(advanced_shape.size());
-  const int64_t output_numel = checked_shape_numel(plan.output_shape);
-  plan.linear_indices.resize(static_cast<size_t>(output_numel));
-
-  // The broadcast value of one component at a given output coordinate: the
-  // component's own rank aligns to the trailing advanced axes, and
-  // singleton axes read coordinate zero.
-  const auto advanced_value =
-      [&](const AdvancedComponent& component,
-          const std::vector<int64_t>& output_coords) {
-        int64_t offset = 0;
-        const int64_t component_rank =
-            static_cast<int64_t>(component.shape.size());
-        for (int64_t d = 0; d < component_rank; ++d) {
-          const int64_t output_dim = advanced_start + advanced_rank -
-                                     component_rank + d;
-          const int64_t coordinate =
-              component.shape[static_cast<size_t>(d)] == 1
-                  ? 0
-                  : output_coords[static_cast<size_t>(output_dim)];
-          offset = offset * component.shape[static_cast<size_t>(d)] + coordinate;
-        }
-        return component.values[static_cast<size_t>(offset)];
-      };
-
-  std::vector<int64_t> output_coords(plan.output_shape.size(), 0);
-  for (int64_t linear = 0; linear < output_numel; ++linear) {
-    int64_t source_linear = 0;
-    for (int64_t d = 0; d < ndim; ++d) {
-      int64_t coordinate = 0;
-      const AdvancedComponent* component =
-          component_of_dim[static_cast<size_t>(d)];
-      if (component != nullptr) {
-        coordinate = advanced_value(*component, output_coords);
-      } else {
-        coordinate = output_coords[static_cast<size_t>(
-            axis_of_dim[static_cast<size_t>(d)])];
-      }
-      source_linear = source_linear * self.size(d) + coordinate;
-    }
-    plan.linear_indices[static_cast<size_t>(linear)] = source_linear;
-
-    int64_t remainder = linear;
-    for (int64_t d = static_cast<int64_t>(plan.output_shape.size()) - 1;
-         d >= 0;
-         --d) {
-      const int64_t size = plan.output_shape[static_cast<size_t>(d)];
-      output_coords[static_cast<size_t>(d)] = size == 0 ? 0 : remainder % size;
-      if (size != 0) remainder /= size;
-    }
-  }
-  return plan;
-}
-
-// Flattens the payload into a row-major 1-D view and gathers with the
-// precomputed offsets.
-inline Tensor gather_linear(const Tensor& self, const AdvancedPlan& plan) {
-  Tensor index = Tensor::tensor(plan.linear_indices, DType::Int64);
-  if (self.device().is_vulkan()) {
-    // The 8-byte code type has no texture format on the device; the
-    // gather pipeline narrows the codes to the 4-byte store, so the index
-    // rides the device in that width.
-    index = index.to(DType::Int32).to(self.device());
-  } else if (!self.device().is_cpu()) {
-    index = index.to(self.device());
-  }
-  Tensor flat = self.reshape({self.numel()});
-  Tensor selected = tpx::ops::index_select(flat, 0, index);
-  return tpx::ops::reshape(selected, plan.output_shape);
-}
-
-} // namespace detail
 
 // To match the scalar-assignment semantics of the element-wise set path:
 // strip leading unit axes off the source before broadcasting it against
@@ -620,11 +326,11 @@ inline void copy_to(const Tensor& dst, const Tensor& src) {
     tpx::ops::copy_(const_cast<Tensor&>(dst), src);
     return;
   }
-  if (src.dim() == 0) {
-    tpx::ops::fill_(const_cast<Tensor&>(dst), src.item());
+  if (src.dim() == 0 && src.device().type() == DeviceType::CPU) {
+    tpx::ops::fill_(const_cast<Tensor&>(dst), src);
     return;
   }
-  Tensor src_view = src.view(slicePrefix1sSize(src_sizes));
+  Tensor src_view = tpx::ops::view(src, slicePrefix1sSize(src_sizes));
   Tensor expanded = tpx::ops::expand(src_view, dst_sizes);
   tpx::ops::copy_(const_cast<Tensor&>(dst), expanded);
 }
@@ -664,14 +370,14 @@ inline Tensor handleDimInMultiDimIndexing(
     }
     return prev_dim_result;
   } else if (index.is_none()) {
-    Tensor result = prev_dim_result.unsqueeze(*dim_ptr);
+    Tensor result = tpx::ops::unsqueeze(prev_dim_result, *dim_ptr);
     (*dim_ptr)++;
     if (!out_indices.empty()) {
       out_indices.resize(out_indices.size() + 1);
     }
     return result;
   } else if (index.is_boolean()) {
-    Tensor result = prev_dim_result.unsqueeze(*dim_ptr);
+    Tensor result = tpx::ops::unsqueeze(prev_dim_result, *dim_ptr);
     impl::recordTensorIndex(
         impl::boolToIndexingTensor(result, index.boolean()),
         out_indices,
@@ -686,7 +392,7 @@ inline Tensor handleDimInMultiDimIndexing(
         result = impl::applySelect(
             result, *dim_ptr, tensor.item().to<int64_t>(), real_dim);
       } else {
-        result = result.unsqueeze(*dim_ptr);
+        result = tpx::ops::unsqueeze(result, *dim_ptr);
         const bool flag = tensor.dtype() == DType::Bool
                               ? tensor.item().to<bool>()
                               : tensor.item().to<uint8_t>() != 0;
@@ -734,130 +440,35 @@ inline Tensor applySlicing(
 
 } // namespace impl
 
-// Expands one positional index entry into advanced components: a mask
-// fans out into one component per mask axis, an integer index becomes a
-// single component.  Returns the number of input axes consumed.
-inline int64_t expand_index_entry(
+// Index lists as the operator contract spells them: undefined entries are
+// dimensions taken whole.  Index tensors follow the indexed tensor's device.
+inline std::vector<std::optional<Tensor>> typeConvertIndices(
     const Tensor& self,
-    int64_t dim,
-    const Tensor& entry,
-    std::vector<detail::AdvancedComponent>& components) {
-  if (entry.dtype() == DType::Bool || entry.dtype() == DType::UInt8) {
-    std::vector<detail::AdvancedComponent> mask_components =
-        detail::make_mask_components(self, dim, entry);
-    const int64_t consumed = static_cast<int64_t>(mask_components.size());
-    for (auto& component : mask_components) {
-      components.push_back(std::move(component));
+    std::vector<Tensor>&& indices) {
+  std::vector<std::optional<Tensor>> converted;
+  converted.reserve(indices.size());
+  for (auto& index : indices) {
+    if (!index.defined()) {
+      converted.emplace_back(std::nullopt);
+    } else if (index.device() != self.device()) {
+      converted.emplace_back(index.to(self.device()));
+    } else {
+      converted.emplace_back(std::move(index));
     }
-    return consumed;
   }
-  components.push_back(detail::make_advanced_component(self, dim, entry));
-  return 1;
+  return converted;
 }
 
-inline Tensor dispatch_index(const Tensor& self, std::vector<Tensor> indices) {
-  while (!indices.empty() && !indices.back().defined()) {
-    indices.pop_back();
-  }
-  if (indices.empty()) {
-    return self;
-  }
-
-  // Entry k gathers over axis k; undefined trailing entries were dropped
-  // above, so every remaining entry consumes its axis in order.
-  const int64_t ndim = self.dim();
-  std::vector<detail::AdvancedComponent> components;
-  int64_t dim = 0;
-  for (const auto& entry : indices) {
-    TP_CHECK_INDEX(
-        dim < ndim,
-        "too many indices for tensor of dimension ",
-        ndim);
-    if (!entry.defined()) {
-      dim += 1;
-      continue;
-    }
-    dim += expand_index_entry(self, dim, entry, components);
-  }
-  if (components.empty()) {
-    return self;
-  }
-
-  const detail::AdvancedPlan plan = detail::build_advanced_plan(self, components);
-  return detail::gather_linear(self, plan);
+inline Tensor dispatch_index(const Tensor& self, std::vector<Tensor>&& indices) {
+  return tpx::ops::index(self, typeConvertIndices(self, std::move(indices)));
 }
 
 inline Tensor& dispatch_index_put_(
     Tensor& self,
-    std::vector<Tensor> indices,
-    const Tensor& value,
-    bool accumulate = false) {
-  while (!indices.empty() && !indices.back().defined()) {
-    indices.pop_back();
-  }
-  if (indices.empty()) {
-    if (accumulate) {
-      copy_to(self, tpx::ops::add(self, value));
-    } else {
-      copy_to(self, value);
-    }
-    return self;
-  }
-
-  const int64_t ndim = self.dim();
-  std::vector<detail::AdvancedComponent> components;
-  int64_t dim = 0;
-  for (const auto& entry : indices) {
-    TP_CHECK_INDEX(
-        dim < ndim,
-        "too many indices for tensor of dimension ",
-        ndim);
-    if (!entry.defined()) {
-      dim += 1;
-      continue;
-    }
-    dim += expand_index_entry(self, dim, entry, components);
-  }
-  if (components.empty()) {
-    if (accumulate) {
-      copy_to(self, tpx::ops::add(self, value));
-    } else {
-      copy_to(self, value);
-    }
-    return self;
-  }
-
-  const detail::AdvancedPlan plan = detail::build_advanced_plan(self, components);
-  if (plan.linear_indices.empty()) {
-    return self;
-  }
-
-  Tensor rhs = value;
-  if (rhs.dtype() != self.dtype() || rhs.device() != self.device()) {
-    rhs = rhs.to(self.device(), self.dtype());
-  }
-  rhs = rhs.view(slicePrefix1sSize(
-            static_cast<std::vector<int64_t>>(rhs.shape())))
-            .expand(plan.output_shape)
-            .reshape({detail::checked_shape_numel(plan.output_shape)})
-            .contiguous()
-            .clone();
-
-  // A single flat index tensor drives the linear writer; the host planner
-  // produces Int64 offsets, and the backend's linear writer consumes them
-  // on the destination's device.
-  Tensor index = Tensor::tensor(plan.linear_indices, DType::Int64);
-  if (!self.device().is_cpu()) {
-    index = index.to(self.device());
-  }
-  Tensor target = self.is_contiguous() ? self : self.contiguous();
-  Tensor flat_target = target.view({-1});
-  tpx::ops::index_put_(
-      flat_target, std::vector<Tensor>{index}, rhs, accumulate);
-  if (!self.is_contiguous()) {
-    tpx::ops::copy_(self, target);
-  }
-  return self;
+    std::vector<Tensor>&& indices,
+    const Tensor& value) {
+  return tpx::ops::index_put_(
+      self, typeConvertIndices(self, std::move(indices)), value);
 }
 
 //
@@ -881,11 +492,11 @@ inline Tensor get_item(
           index.slice().step(),
           /*disable_slice_optimization=*/true);
     } else if (index.is_none()) {
-      return self.unsqueeze(0);
+      return tpx::ops::unsqueeze(self, 0);
     } else if (index.is_ellipsis()) {
       return tpx::ops::alias(self);
     } else if (index.is_boolean()) {
-      Tensor result = self.unsqueeze(0);
+      Tensor result = tpx::ops::unsqueeze(self, 0);
       return dispatch_index(
           result,
           std::vector<Tensor>{impl::boolToIndexingTensor(result, index.boolean())});
@@ -924,7 +535,7 @@ inline void set_item(
       copy_to(self, value);
       return;
     } else if (index.is_none() || (index.is_boolean() && index.boolean())) {
-      copy_to(self.unsqueeze(0), value);
+      copy_to(tpx::ops::unsqueeze(self, 0), value);
       return;
     } else if (index.is_integer()) {
       copy_to(impl::applySelect(self, 0, index.integer(), 0), value);

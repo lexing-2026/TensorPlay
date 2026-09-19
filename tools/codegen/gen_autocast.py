@@ -8,7 +8,7 @@ casts remain visible to autograd and saved inputs use the post-cast values.
 
 from __future__ import annotations
 
-from .api_types import cpp_arg_type, cpp_return_type
+from .api_types import cpp_return_type, rewrap_arg_expr, stub_arg_type_for
 from .model import NativeFunction, Type
 
 # ===========================================================================
@@ -203,15 +203,21 @@ def generate_autocast_registration(funcs: list[NativeFunction]) -> str:
                       f'{device_key.lower()}')
             kernels.append((name, kernel, device_key))
 
-            sig_args = [f'{cpp_arg_type(a.type)} {a.name}' for a in f.args]
+            # Registered kernels take the dispatcher-stub ABI.
+            sig_args = [f'{stub_arg_type_for(f.base_name, a)} {a.name}'
+                        for a in f.args if a.name != 'requires_grad']
+            if any(a.name == 'requires_grad' for a in f.args):
+                raise ValueError(f"autocast policy on factory operator {name} is not supported")
             ret = cpp_return_type(f)
             ret_void = ret == 'void'
             lines.append(f'{ret} {kernel}({", ".join(sig_args)}) {{')
             lines.append(f'    const DeviceType __device_type = DeviceType::{device_key};')
             lines.append('    ::tensorplay::autocast::ExcludeAutocastGuard no_autocast(__device_type);')
 
-            call_str = ', '.join(_arg_expr(policy, a) for a in f.args)
+            call_str = ', '.join(rewrap_arg_expr(f.base_name, a, _arg_expr(policy, a))
+                                 for a in f.args)
             plain = ', '.join(a.name for a in f.args)
+            plain_call = ', '.join(rewrap_arg_expr(f.base_name, a, a.name) for a in f.args)
             call = f'::tensorplay::tpx::ops::{f.cpp_name}'
 
             if policy == 'banned':
@@ -236,8 +242,8 @@ def generate_autocast_registration(funcs: list[NativeFunction]) -> str:
                 if ret_void:
                     lines.append('        return;')
                 lines.append('    }')
-                lines.append(f'    return {call}({plain});' if not ret_void
-                             else f'    {call}({plain});')
+                lines.append(f'    return {call}({plain_call});' if not ret_void
+                             else f'    {call}({plain_call});')
             else:  # promote
                 lines.append(
                     '    const DType __to_type = ::tensorplay::autocast::promote_type(')

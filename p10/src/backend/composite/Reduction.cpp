@@ -91,13 +91,13 @@ Tensor& reduce_dims_out(const Tensor& self,
 } // namespace
 
 Tensor all_dims_default(const Tensor& self,
-                        std::optional<std::vector<int64_t>> dim,
+                        const std::optional<std::vector<int64_t>>& dim,
                         bool keepdim) {
     return reduce_dims_default<true>(self, dim, keepdim);
 }
 
 Tensor any_dims_default(const Tensor& self,
-                        std::optional<std::vector<int64_t>> dim,
+                        const std::optional<std::vector<int64_t>>& dim,
                         bool keepdim) {
     return reduce_dims_default<false>(self, dim, keepdim);
 }
@@ -113,13 +113,13 @@ Tensor& any_out_default(const Tensor& self, int64_t dim, bool keepdim,
 }
 
 Tensor& all_dims_out_default(
-        const Tensor& self, std::optional<std::vector<int64_t>> dim,
+        const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
         bool keepdim, Tensor& out) {
     return reduce_dims_out<true>(self, dim, keepdim, out);
 }
 
 Tensor& any_dims_out_default(
-        const Tensor& self, std::optional<std::vector<int64_t>> dim,
+        const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
         bool keepdim, Tensor& out) {
     return reduce_dims_out<false>(self, dim, keepdim, out);
 }

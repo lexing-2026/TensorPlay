@@ -273,13 +273,13 @@ Tensor bitwise_or_tensor_cuda(const Tensor& a, const Tensor& b) {
 Tensor bitwise_xor_tensor_cuda(const Tensor& a, const Tensor& b) {
     return bitwise_binary_cuda(a, b, BitwiseXor(), "bitwise_xor");
 }
-Tensor bitwise_and_scalar_cuda(const Tensor& a, Scalar b) {
+Tensor bitwise_and_scalar_cuda(const Tensor& a, const Scalar& b) {
     return bitwise_scalar_cuda(a, b, BitwiseAnd(), "bitwise_and");
 }
-Tensor bitwise_or_scalar_cuda(const Tensor& a, Scalar b) {
+Tensor bitwise_or_scalar_cuda(const Tensor& a, const Scalar& b) {
     return bitwise_scalar_cuda(a, b, BitwiseOr(), "bitwise_or");
 }
-Tensor bitwise_xor_scalar_cuda(const Tensor& a, Scalar b) {
+Tensor bitwise_xor_scalar_cuda(const Tensor& a, const Scalar& b) {
     return bitwise_scalar_cuda(a, b, BitwiseXor(), "bitwise_xor");
 }
 Tensor bitwise_lshift_tensor_cuda(const Tensor& a, const Tensor& b) {
@@ -288,10 +288,10 @@ Tensor bitwise_lshift_tensor_cuda(const Tensor& a, const Tensor& b) {
 Tensor bitwise_rshift_tensor_cuda(const Tensor& a, const Tensor& b) {
     return bitwise_shift_tensor_cuda_impl<false>(a, b, "bitwise_right_shift");
 }
-Tensor bitwise_lshift_scalar_cuda(const Tensor& a, Scalar b) {
+Tensor bitwise_lshift_scalar_cuda(const Tensor& a, const Scalar& b) {
     return bitwise_shift_scalar_cuda_impl<true>(a, b, "bitwise_left_shift");
 }
-Tensor bitwise_rshift_scalar_cuda(const Tensor& a, Scalar b) {
+Tensor bitwise_rshift_scalar_cuda(const Tensor& a, const Scalar& b) {
     return bitwise_shift_scalar_cuda_impl<false>(a, b, "bitwise_right_shift");
 }
 
@@ -306,31 +306,31 @@ inline void bitwise_scalar_check_cuda(Scalar self, const char* name) {
              ": only integral and boolean scalar operands are supported");
 }
 
-Tensor bitwise_and_scalar_tensor_cuda(Scalar self, const Tensor& other) {
+Tensor bitwise_and_scalar_tensor_cuda(const Scalar& self, const Tensor& other) {
     bitwise_check_cuda(other, "bitwise_and");
     bitwise_scalar_check_cuda(self, "bitwise_and");
     Tensor wrapped = Tensor::full({}, self, other.dtype(), other.device());
     return bitwise_binary_cuda(wrapped, other, BitwiseAnd(), "bitwise_and");
 }
-Tensor bitwise_or_scalar_tensor_cuda(Scalar self, const Tensor& other) {
+Tensor bitwise_or_scalar_tensor_cuda(const Scalar& self, const Tensor& other) {
     bitwise_check_cuda(other, "bitwise_or");
     bitwise_scalar_check_cuda(self, "bitwise_or");
     Tensor wrapped = Tensor::full({}, self, other.dtype(), other.device());
     return bitwise_binary_cuda(wrapped, other, BitwiseOr(), "bitwise_or");
 }
-Tensor bitwise_xor_scalar_tensor_cuda(Scalar self, const Tensor& other) {
+Tensor bitwise_xor_scalar_tensor_cuda(const Scalar& self, const Tensor& other) {
     bitwise_check_cuda(other, "bitwise_xor");
     bitwise_scalar_check_cuda(self, "bitwise_xor");
     Tensor wrapped = Tensor::full({}, self, other.dtype(), other.device());
     return bitwise_binary_cuda(wrapped, other, BitwiseXor(), "bitwise_xor");
 }
-Tensor bitwise_lshift_scalar_tensor_cuda(Scalar self, const Tensor& other) {
+Tensor bitwise_lshift_scalar_tensor_cuda(const Scalar& self, const Tensor& other) {
     bitwise_check_cuda(other, "bitwise_left_shift");
     bitwise_scalar_check_cuda(self, "bitwise_left_shift");
     Tensor wrapped = Tensor::full({}, self, other.dtype(), other.device());
     return bitwise_shift_tensor_cuda_impl<true>(wrapped, other, "bitwise_left_shift");
 }
-Tensor bitwise_rshift_scalar_tensor_cuda(Scalar self, const Tensor& other) {
+Tensor bitwise_rshift_scalar_tensor_cuda(const Scalar& self, const Tensor& other) {
     bitwise_check_cuda(other, "bitwise_right_shift");
     bitwise_scalar_check_cuda(self, "bitwise_right_shift");
     Tensor wrapped = Tensor::full({}, self, other.dtype(), other.device());
@@ -360,13 +360,13 @@ Tensor& bitwise_or_tensor_out_cuda(const Tensor& a, const Tensor& b, Tensor& out
 Tensor& bitwise_xor_tensor_out_cuda(const Tensor& a, const Tensor& b, Tensor& out) {
     return bitwise_assign_out_cuda(out, bitwise_xor_tensor_cuda(a, b));
 }
-Tensor& bitwise_and_scalar_out_cuda(const Tensor& a, Scalar b, Tensor& out) {
+Tensor& bitwise_and_scalar_out_cuda(const Tensor& a, const Scalar& b, Tensor& out) {
     return bitwise_assign_out_cuda(out, bitwise_and_scalar_cuda(a, b));
 }
-Tensor& bitwise_or_scalar_out_cuda(const Tensor& a, Scalar b, Tensor& out) {
+Tensor& bitwise_or_scalar_out_cuda(const Tensor& a, const Scalar& b, Tensor& out) {
     return bitwise_assign_out_cuda(out, bitwise_or_scalar_cuda(a, b));
 }
-Tensor& bitwise_xor_scalar_out_cuda(const Tensor& a, Scalar b, Tensor& out) {
+Tensor& bitwise_xor_scalar_out_cuda(const Tensor& a, const Scalar& b, Tensor& out) {
     return bitwise_assign_out_cuda(out, bitwise_xor_scalar_cuda(a, b));
 }
 Tensor& bitwise_lshift_tensor_out_cuda(const Tensor& a, const Tensor& b, Tensor& out) {
@@ -375,10 +375,10 @@ Tensor& bitwise_lshift_tensor_out_cuda(const Tensor& a, const Tensor& b, Tensor&
 Tensor& bitwise_rshift_tensor_out_cuda(const Tensor& a, const Tensor& b, Tensor& out) {
     return bitwise_assign_out_cuda(out, bitwise_rshift_tensor_cuda(a, b));
 }
-Tensor& bitwise_lshift_scalar_out_cuda(const Tensor& a, Scalar b, Tensor& out) {
+Tensor& bitwise_lshift_scalar_out_cuda(const Tensor& a, const Scalar& b, Tensor& out) {
     return bitwise_assign_out_cuda(out, bitwise_lshift_scalar_cuda(a, b));
 }
-Tensor& bitwise_rshift_scalar_out_cuda(const Tensor& a, Scalar b, Tensor& out) {
+Tensor& bitwise_rshift_scalar_out_cuda(const Tensor& a, const Scalar& b, Tensor& out) {
     return bitwise_assign_out_cuda(out, bitwise_rshift_scalar_cuda(a, b));
 }
 

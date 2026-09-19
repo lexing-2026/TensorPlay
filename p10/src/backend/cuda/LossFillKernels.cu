@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 #include "Atomic.cuh"
+#include "OutWrite.h"
 
 namespace tensorplay {
 namespace cuda {
@@ -85,8 +86,8 @@ std::pair<Tensor, Tensor> pair_f64_dev(const Tensor& a, const Tensor& b) {
             for (size_t i = 0; i < n; ++i) out[i] = std::max(ra[i], rb[i]);
             return out;
         }();
-        ae = ac.expand(bs);
-        be = bc.expand(bs);
+        ae = ac.expand(bs).contiguous();
+        be = bc.expand(bs).contiguous();
     }
     return {ae.to(DType::Float64), be.to(DType::Float64)};
 }
@@ -240,13 +241,14 @@ __global__ void nll2d_grad_none_kernel(int64_t rows, int64_t C, int64_t HW,
 }
 
 // Scalar-output modes: every valid row contributes -w * g / tw.
-__global__ void nll_grad_scalar_kernel(int64_t n, int64_t C, const double g,
+__global__ void nll_grad_scalar_kernel(int64_t n, int64_t C, const double* g,
                                        const int64_t* tgt, const double* w,
-                                       bool has_w, int64_t ignore, double tw,
+                                       bool has_w, int64_t ignore,
+                                       const double* tw, bool size_average,
                                        double* gi) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    const double gg = tw > 0 ? g / tw : g;
+    const double gg = size_average ? *g / *tw : *g;
     for (; i < n; i += st) {
         const int64_t t = tgt[i];
         if (t == ignore || t < 0 || t >= C) continue;
@@ -256,12 +258,13 @@ __global__ void nll_grad_scalar_kernel(int64_t n, int64_t C, const double g,
 }
 
 __global__ void nll2d_grad_scalar_kernel(int64_t rows, int64_t C, int64_t HW,
-                                         const double g, const int64_t* tgt,
+                                         const double* g, const int64_t* tgt,
                                          const double* w, bool has_w,
-                                         int64_t ignore, double tw, double* gi) {
+                                         int64_t ignore, const double* tw,
+                                         bool size_average, double* gi) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    const double gg = tw > 0 ? g / tw : g;
+    const double gg = size_average ? *g / *tw : *g;
     for (; i < rows; i += st) {
         const int64_t t = tgt[i];
         if (t == ignore || t < 0 || t >= C) continue;
@@ -331,10 +334,10 @@ Tensor mse_loss_cuda(const Tensor& input, const Tensor& target,
 Tensor mse_loss_backward_cuda(const Tensor& grad_output, const Tensor& input,
                               const Tensor& target, int64_t reduction) {
     auto pr = pair_f64_dev(input, target);
-    Tensor g = f64_dev(grad_output);
-    if (g.shape() != pr.first.shape() && reduction != 0) {
-        g = g.expand(shape_of(pr.first));
-    }
+    // The kernels read grad linearly: materialize its broadcast.
+    const Tensor g = grad_output.shape() == pr.first.shape()
+        ? f64_dev(grad_output)
+        : f64_dev(grad_output.expand(shape_of(pr.first)));
     Tensor out = Tensor::empty(shape_of(pr.first), DType::Float64,
                                 input.device());
     const int64_t n = out.numel();
@@ -388,10 +391,10 @@ Tensor smooth_l1_loss_backward_cuda(const Tensor& grad_output,
                                     const Tensor& input, const Tensor& target,
                                     int64_t reduction, double beta) {
     auto pr = pair_f64_dev(input, target);
-    Tensor g = f64_dev(grad_output);
-    if (g.shape() != pr.first.shape() && reduction != 0) {
-        g = g.expand(shape_of(pr.first));
-    }
+    // The kernels read grad linearly: materialize its broadcast.
+    const Tensor g = grad_output.shape() == pr.first.shape()
+        ? f64_dev(grad_output)
+        : f64_dev(grad_output.expand(shape_of(pr.first)));
     Tensor out = Tensor::empty(shape_of(pr.first), DType::Float64,
                                input.device());
     const int64_t n = out.numel();
@@ -445,10 +448,10 @@ Tensor huber_loss_backward_cuda(const Tensor& grad_output,
                                 const Tensor& input, const Tensor& target,
                                 int64_t reduction, double delta) {
     auto pr = pair_f64_dev(input, target);
-    Tensor g = f64_dev(grad_output);
-    if (g.shape() != pr.first.shape() && reduction != 0) {
-        g = g.expand(shape_of(pr.first));
-    }
+    // The kernels read grad linearly: materialize its broadcast.
+    const Tensor g = grad_output.shape() == pr.first.shape()
+        ? f64_dev(grad_output)
+        : f64_dev(grad_output.expand(shape_of(pr.first)));
     Tensor out = Tensor::empty(shape_of(pr.first), DType::Float64,
                                input.device());
     const int64_t n = out.numel();
@@ -518,10 +521,10 @@ Tensor binary_cross_entropy_backward_cuda(const Tensor& grad_output,
                                           const std::optional<Tensor>& weight_opt,
                                           int64_t reduction) {
     auto pr = pair_f64_dev(input, target);
-    Tensor g = f64_dev(grad_output);
-    if (g.shape() != pr.first.shape() && reduction != 0) {
-        g = g.expand(shape_of(pr.first));
-    }
+    // The kernels read grad linearly: materialize its broadcast.
+    const Tensor g = grad_output.shape() == pr.first.shape()
+        ? f64_dev(grad_output)
+        : f64_dev(grad_output.expand(shape_of(pr.first)));
     const bool has_w = weight_opt.has_value() && weight_opt->defined();
     Tensor w = has_w ? f64_dev(weight_opt->expand(shape_of(pr.first)))
                      : pr.first;
@@ -576,15 +579,16 @@ std::tuple<Tensor, Tensor> nll_loss_cuda(const Tensor& input,
         CUDA_CHECK(cudaGetLastError());
     }
     const double wtotal = host_sum_f64(wrows, N);
-    const DType tw_dt =
-        input.dtype() == DType::Float64 ? DType::Float64 : DType::Float32;
-    Tensor total_weight =
-        Tensor::full({}, Scalar(wtotal), tw_dt, input.device());
     if (reduction == 0) {
-        return {loss_rows.to(input.dtype()), total_weight};
+        // Unreduced batched losses carry no normalizer.
+        return {loss_rows.to(input.dtype()),
+                Tensor::full({}, Scalar(0.0), input.dtype(), input.device())};
     }
+    Tensor total_weight =
+        Tensor::full({}, Scalar(wtotal), input.dtype(), input.device());
     const double total = host_sum_f64(loss_rows, N);
-    const double v = reduction == 1 && wtotal > 0 ? total / wtotal : total;
+    // Every target ignored under mean reduction: 0 / 0 is NaN.
+    const double v = reduction == 1 ? total / wtotal : total;
     return {Tensor::full({}, Scalar(v), out_scalar_dtype(input.dtype()),
                          input.device())
                 .to(input.dtype()),
@@ -613,21 +617,16 @@ Tensor nll_loss_backward_cuda(const Tensor& grad_output, const Tensor& input,
                 has_w ? w.data_ptr<double>() : nullptr, has_w, ignore_index,
                 grad_input.data_ptr<double>());
         } else {
-            const double g = grad_output.item().to<double>();
-            double tw = total_weight.defined()
-                            ? total_weight.item().to<double>()
-                            : 0.0;
-            // mean normalizer: total_weight when provided, otherwise the
-            // count of non-ignored rows
-            if (tw == 0) {
-                Tensor valid = tgt.ne(Scalar(static_cast<double>(ignore_index)))
-                                   .to(DType::Float64)
-                                   .sum();
-                tw = valid.item().to<double>();
-            }
+            TP_CHECK(grad_output.numel() == 1,
+                     "nll_loss_backward: expected grad_output to be a single element tensor");
+            TP_CHECK(total_weight.numel() == 1,
+                     "nll_loss_backward: expected total_weight to be a single element tensor");
+            const Tensor g = f64_dev(grad_output);
+            const Tensor tw = f64_dev(total_weight);
             nll_grad_scalar_kernel<<<loss_grid(N), kThreads, 0, stream>>>(
-                N, C, g, tgt.data_ptr<int64_t>(),
-                has_w ? w.data_ptr<double>() : nullptr, has_w, ignore_index, tw,
+                N, C, g.data_ptr<double>(), tgt.data_ptr<int64_t>(),
+                has_w ? w.data_ptr<double>() : nullptr, has_w, ignore_index,
+                tw.data_ptr<double>(), reduction == 1,
                 grad_input.data_ptr<double>());
         }
         CUDA_CHECK(cudaGetLastError());
@@ -676,17 +675,17 @@ std::tuple<Tensor, Tensor> nll_loss2d_cuda(const Tensor& input,
         CUDA_CHECK(cudaGetLastError());
     }
     const double wtotal = host_sum_f64(wrows, rows);
-    const DType tw_dt =
-        input.dtype() == DType::Float64 ? DType::Float64 : DType::Float32;
-    Tensor total_weight =
-        Tensor::full({}, Scalar(wtotal), tw_dt, input.device());
     if (reduction == 0) {
+        // Unreduced losses carry no normalizer: total_weight stays zero.
         return {loss_rows.to(input.dtype())
                     .reshape({N, H, W}),
-                total_weight};
+                Tensor::full({}, Scalar(0.0), input.dtype(), input.device())};
     }
+    Tensor total_weight =
+        Tensor::full({}, Scalar(wtotal), input.dtype(), input.device());
     const double total = host_sum_f64(loss_rows, rows);
-    const double v = reduction == 1 && wtotal > 0 ? total / wtotal : total;
+    // Every target ignored under mean reduction: 0 / 0 is NaN.
+    const double v = reduction == 1 ? total / wtotal : total;
     return {Tensor::full({}, Scalar(v), out_scalar_dtype(input.dtype()),
                          input.device())
                 .to(input.dtype()),
@@ -716,18 +715,16 @@ Tensor nll_loss2d_backward_cuda(const Tensor& grad_output, const Tensor& input,
                 has_w ? w.data_ptr<double>() : nullptr, has_w, ignore_index,
                 grad_input.data_ptr<double>());
         } else {
-            const double g = grad_output.item().to<double>();
-            double tw = total_weight.defined() ? total_weight.item().to<double>()
-                                               : 0.0;
-            if (tw == 0) {
-                Tensor valid = tgt.ne(Scalar(static_cast<double>(ignore_index)))
-                                   .to(DType::Float64)
-                                   .sum();
-                tw = valid.item().to<double>();
-            }
+            TP_CHECK(grad_output.numel() == 1,
+                     "nll_loss2d_backward: expected grad_output to be a single element tensor");
+            TP_CHECK(total_weight.numel() == 1,
+                     "nll_loss2d_backward: expected total_weight to be a single element tensor");
+            const Tensor g = f64_dev(grad_output);
+            const Tensor tw = f64_dev(total_weight);
             nll2d_grad_scalar_kernel<<<loss_grid(rows), kThreads, 0, stream>>>(
-                rows, C, H * W, g, tgt.data_ptr<int64_t>(),
-                has_w ? w.data_ptr<double>() : nullptr, has_w, ignore_index, tw,
+                rows, C, H * W, g.data_ptr<double>(), tgt.data_ptr<int64_t>(),
+                has_w ? w.data_ptr<double>() : nullptr, has_w, ignore_index,
+                tw.data_ptr<double>(), reduction == 1,
                 grad_input.data_ptr<double>());
         }
         CUDA_CHECK(cudaGetLastError());
@@ -741,15 +738,15 @@ Tensor nll_loss2d_backward_cuda(const Tensor& grad_output, const Tensor& input,
 
 Tensor& interop_smooth_l1_loss_backward_grad_input_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& target,
               int64_t reduction, double beta, Tensor& grad_input) {
-        grad_input = smooth_l1_loss_backward_cuda(grad_output, input, target,
-                                                  reduction, beta);
+        write_out(grad_input, smooth_l1_loss_backward_cuda(grad_output, input, target,
+                                                  reduction, beta));
         return grad_input;
     
 }
 
 Tensor& interop_binary_cross_entropy_out_cuda(const Tensor& input, const Tensor& target,
               const std::optional<Tensor>& weight, int64_t reduction, Tensor& out) {
-        out = binary_cross_entropy_cuda(input, target, weight, reduction);
+        write_out(out, binary_cross_entropy_cuda(input, target, weight, reduction));
         return out;
     
 }
@@ -757,8 +754,8 @@ Tensor& interop_binary_cross_entropy_out_cuda(const Tensor& input, const Tensor&
 Tensor& interop_binary_cross_entropy_backward_grad_input_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& target,
               const std::optional<Tensor>& weight, int64_t reduction,
               Tensor& grad_input) {
-        grad_input = binary_cross_entropy_backward_cuda(grad_output, input, target,
-                                                        weight, reduction);
+        write_out(grad_input, binary_cross_entropy_backward_cuda(grad_output, input, target,
+                                                        weight, reduction));
         return grad_input;
     
 }
@@ -767,8 +764,8 @@ Tensor& interop_nll_loss_backward_grad_input_cuda(const Tensor& grad_output, con
               const std::optional<Tensor>& weight, int64_t reduction,
               int64_t ignore_index, const Tensor& total_weight,
               Tensor& grad_input) {
-        grad_input = nll_loss_backward_cuda(grad_output, input, target, weight,
-                                            reduction, ignore_index, total_weight);
+        write_out(grad_input, nll_loss_backward_cuda(grad_output, input, target, weight,
+                                            reduction, ignore_index, total_weight));
         return grad_input;
     
 }
@@ -777,27 +774,9 @@ Tensor& interop_nll_loss2d_backward_grad_input_cuda(const Tensor& grad_output, c
               const std::optional<Tensor>& weight, int64_t reduction,
               int64_t ignore_index, const Tensor& total_weight,
               Tensor& grad_input) {
-        grad_input = nll_loss2d_backward_cuda(grad_output, input, target, weight,
-                                              reduction, ignore_index, total_weight);
+        write_out(grad_input, nll_loss2d_backward_cuda(grad_output, input, target, weight,
+                                              reduction, ignore_index, total_weight));
         return grad_input;
-    
-}
-
-Tensor& interop_nll_loss_forward_output_cuda(const Tensor& input, const Tensor& target,
-              const std::optional<Tensor>& weight, int64_t reduction,
-              int64_t ignore_index, Tensor& output, Tensor& total_weight) {
-        std::tie(output, total_weight) = nll_loss_cuda(input, target, weight,
-                                                       reduction, ignore_index);
-        return output;
-    
-}
-
-Tensor& interop_nll_loss2d_forward_output_cuda(const Tensor& input, const Tensor& target,
-              const std::optional<Tensor>& weight, int64_t reduction,
-              int64_t ignore_index, Tensor& output, Tensor& total_weight) {
-        std::tie(output, total_weight) = nll_loss2d_cuda(input, target, weight,
-                                                         reduction, ignore_index);
-        return output;
     
 }
 
@@ -822,8 +801,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, LossFillKernels) {
     m.impl("binary_cross_entropy_backward.grad_input", interop_binary_cross_entropy_backward_grad_input_cuda);
     m.impl("nll_loss_backward.grad_input", interop_nll_loss_backward_grad_input_cuda);
     m.impl("nll_loss2d_backward.grad_input", interop_nll_loss2d_backward_grad_input_cuda);
-    m.impl("nll_loss_forward.output", interop_nll_loss_forward_output_cuda);
-    m.impl("nll_loss2d_forward.output", interop_nll_loss2d_forward_output_cuda);
 }
 
 }  // namespace cuda

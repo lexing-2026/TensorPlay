@@ -122,7 +122,7 @@ void foreach_zero_mta_inplace_cuda(std::vector<Tensor> self) {
 
 #define TP_MTA_SCALAR_INPLACE(NAME, FUNCTOR)                                  \
 void foreach_##NAME##_scalar_mta_inplace_cuda(std::vector<Tensor> self,       \
-                                              Scalar s) {                     \
+                                              const Scalar& s) {                     \
     if (!mta_ready(self) || !foreach_mta::eligible_list(self)) {              \
         foreach_##NAME##_scalar_inplace_cuda(std::move(self), s);             \
         return;                                                               \
@@ -216,7 +216,7 @@ TP_MTA_LIST_INPLACE(minimum, foreach_mta::BinaryMinimumList)
 
 void foreach_add_list_mta_inplace_cuda(std::vector<Tensor> self,
                                        const std::vector<Tensor>& other,
-                                       Scalar alpha) {
+                                       const Scalar& alpha) {
     if (!mta_ready(self) || !foreach_mta::eligible_pair(self, other)) {
         foreach_add_list_inplace_cuda(std::move(self), other, alpha);
         return;
@@ -237,7 +237,7 @@ void foreach_add_list_mta_inplace_cuda(std::vector<Tensor> self,
 
 void foreach_lerp_scalar_mta_inplace_cuda(std::vector<Tensor> self,
                                           const std::vector<Tensor>& end,
-                                          Scalar weight) {
+                                          const Scalar& weight) {
     if (!mta_ready(self) || !foreach_mta::eligible_pair(self, end)) {
         foreach_lerp_scalar_inplace_cuda(std::move(self), end, weight);
         return;
@@ -258,7 +258,7 @@ void foreach_lerp_scalar_mta_inplace_cuda(std::vector<Tensor> self,
 
 void foreach_addcmul_scalar_mta_inplace_cuda(
         std::vector<Tensor> self, const std::vector<Tensor>& t1,
-        const std::vector<Tensor>& t2, Scalar value) {
+        const std::vector<Tensor>& t2, const Scalar& value) {
     if (!mta_ready(self) || !foreach_mta::eligible_ternary(self, t1, t2)) {
         foreach_addcmul_scalar_inplace_cuda(std::move(self), t1, t2, value);
         return;
@@ -279,7 +279,7 @@ void foreach_addcmul_scalar_mta_inplace_cuda(
 
 void foreach_addcdiv_scalar_mta_inplace_cuda(
         std::vector<Tensor> self, const std::vector<Tensor>& t1,
-        const std::vector<Tensor>& t2, Scalar value) {
+        const std::vector<Tensor>& t2, const Scalar& value) {
     if (!mta_ready(self) || !foreach_mta::eligible_ternary(self, t1, t2)) {
         foreach_addcdiv_scalar_inplace_cuda(std::move(self), t1, t2, value);
         return;
@@ -354,7 +354,7 @@ void foreach_lerp_scalar_list_mta_inplace_cuda(
 
 
 std::vector<Tensor> foreach_sub_scalar_mta_ret_cuda(
-        const std::vector<Tensor>& self, Scalar s) {
+        const std::vector<Tensor>& self, const Scalar& s) {
     if (!mta_ready(self) || !foreach_mta::eligible_list(self)) {
         return foreach_sub_scalar_cuda(self, s);
     }
@@ -372,7 +372,7 @@ std::vector<Tensor> foreach_sub_scalar_mta_ret_cuda(
 
 void foreach_sub_list_mta_inplace_cuda(std::vector<Tensor> self,
                                        const std::vector<Tensor>& other,
-                                       Scalar alpha) {
+                                       const Scalar& alpha) {
     if (!mta_ready(self) || !foreach_mta::eligible_pair(self, other)) {
         foreach_sub_list_inplace_cuda(std::move(self), other, alpha);
         return;
@@ -395,7 +395,7 @@ void foreach_sub_list_mta_inplace_cuda(std::vector<Tensor> self,
 
 #define TP_MTA_SCALAR_RET(NAME, FUNCTOR)                                      \
 std::vector<Tensor> foreach_##NAME##_scalar_mta_ret_cuda(                     \
-        const std::vector<Tensor>& self, Scalar s) {                          \
+        const std::vector<Tensor>& self, const Scalar& s) {                   \
     if (!mta_ready(self) || !foreach_mta::eligible_list(self)) {              \
         return foreach_##NAME##_scalar_cuda(self, s);                         \
     }                                                                         \
@@ -515,7 +515,7 @@ TP_MTA_LIST_RET(div, foreach_mta::BinaryDivList)
 #define TP_MTA_LIST_ALPHA_RET(NAME, FUNCTOR)                                  \
 std::vector<Tensor> foreach_##NAME##_list_mta_ret_cuda(                       \
         const std::vector<Tensor>& self, const std::vector<Tensor>& other,    \
-        Scalar alpha) {                                                       \
+        const Scalar& alpha) {                                                       \
     if (!mta_ready(self) || !foreach_mta::eligible_pair(self, other)) {       \
         return foreach_##NAME##_list_cuda(self, other, alpha);                \
     }                                                                         \

@@ -621,10 +621,10 @@ static Tensor batch_norm_cpu_impl(
     return out;
 }
 
-Tensor batch_norm_cpu(const Tensor& input, std::optional<Tensor> weight_opt,
-                      std::optional<Tensor> bias_opt,
-                      std::optional<Tensor> running_mean_opt,
-                      std::optional<Tensor> running_var_opt,
+Tensor batch_norm_cpu(const Tensor& input, const std::optional<Tensor>& weight_opt,
+                      const std::optional<Tensor>& bias_opt,
+                      const std::optional<Tensor>& running_mean_opt,
+                      const std::optional<Tensor>& running_var_opt,
                       bool training, double momentum, double eps) {
     return batch_norm_cpu_impl(input, weight_opt, bias_opt, running_mean_opt,
                                running_var_opt, training, momentum, eps,
@@ -1089,9 +1089,9 @@ static std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cpu_impl(
 
 std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cpu(
     const Tensor& grad_output, const Tensor& input,
-    std::optional<Tensor> weight_opt,
-    std::optional<Tensor> running_mean_opt,
-    std::optional<Tensor> running_var_opt,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& running_mean_opt,
+    const std::optional<Tensor>& running_var_opt,
     bool training, double eps) {
     return batch_norm_backward_cpu_impl(
         grad_output, input, weight_opt, running_mean_opt, running_var_opt,
@@ -1099,10 +1099,10 @@ std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cpu(
 }
 
 std::tuple<Tensor, Tensor, Tensor> native_batch_norm_cpu(
-    const Tensor& input, std::optional<Tensor> weight_opt,
-    std::optional<Tensor> bias_opt,
-    std::optional<Tensor> running_mean_opt,
-    std::optional<Tensor> running_var_opt, bool training,
+    const Tensor& input, const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& bias_opt,
+    const std::optional<Tensor>& running_mean_opt,
+    const std::optional<Tensor>& running_var_opt, bool training,
     double momentum, double eps) {
     const int64_t channels = input.size(1);
     const DType stats_dtype = stats_dtype_for(input.dtype());
@@ -1120,11 +1120,11 @@ std::tuple<Tensor, Tensor, Tensor> native_batch_norm_cpu(
 
 std::tuple<Tensor, Tensor, Tensor> native_batch_norm_backward_cpu(
     const Tensor& grad_out, const Tensor& input,
-    std::optional<Tensor> weight_opt,
-    std::optional<Tensor> running_mean_opt,
-    std::optional<Tensor> running_var_opt,
-    std::optional<Tensor> save_mean_opt,
-    std::optional<Tensor> save_invstd_opt, bool train, double eps,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& running_mean_opt,
+    const std::optional<Tensor>& running_var_opt,
+    const std::optional<Tensor>& save_mean_opt,
+    const std::optional<Tensor>& save_invstd_opt, bool train, double eps,
     const std::vector<bool>& output_mask) {
     (void)save_mean_opt;
     (void)save_invstd_opt;
@@ -1144,10 +1144,10 @@ std::tuple<Tensor, Tensor, Tensor> native_batch_norm_backward_cpu(
 // instance_norm: composite over batch_norm (reshape to (1, N*C, S)).
 // ---------------------------------------------------------------------------
 
-Tensor instance_norm_cpu(const Tensor& input, std::optional<Tensor> weight_opt,
-                         std::optional<Tensor> bias_opt,
-                         std::optional<Tensor> running_mean_opt,
-                         std::optional<Tensor> running_var_opt,
+Tensor instance_norm_cpu(const Tensor& input, const std::optional<Tensor>& weight_opt,
+                         const std::optional<Tensor>& bias_opt,
+                         const std::optional<Tensor>& running_mean_opt,
+                         const std::optional<Tensor>& running_var_opt,
                          bool use_input_stats, double momentum, double eps) {
     if (input.dim() < 3)
         TP_THROW(RuntimeError, "instance_norm: input must have at least 3 dimensions");
@@ -1217,9 +1217,9 @@ std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cpu(
 
 std::tuple<Tensor, Tensor, Tensor> instance_norm_backward_cpu(
     const Tensor& grad_output, const Tensor& input,
-    std::optional<Tensor> weight_opt, std::optional<Tensor> bias_opt,
-    std::optional<Tensor> running_mean_opt,
-    std::optional<Tensor> running_var_opt,
+    const std::optional<Tensor>& weight_opt, const std::optional<Tensor>& bias_opt,
+    const std::optional<Tensor>& running_mean_opt,
+    const std::optional<Tensor>& running_var_opt,
     bool use_input_stats, double eps) {
     if (use_input_stats) {
         const int64_t C = input.size(1);

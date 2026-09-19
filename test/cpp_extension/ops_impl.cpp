@@ -5,7 +5,7 @@ namespace tp_custom {
 namespace myext {
 namespace impl {
 
-Tensor scale_add_cpu(const Tensor& self, double factor, Scalar bias) {
+Tensor scale_add_cpu(const Tensor& self, double factor, const Scalar& bias) {
     Tensor out = self.mul(factor);
     if (bias.toDouble() != 0.0) {
         out = out.add(bias.toDouble());

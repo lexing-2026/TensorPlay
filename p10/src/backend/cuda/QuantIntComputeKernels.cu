@@ -120,7 +120,7 @@ __global__ void quantized_linear_dynamic_kernel(
 Tensor quantized_linear_dynamic_cuda(const Tensor& input, const Tensor& weight,
                                      const Tensor& weight_scales,
                                      const Tensor& weight_zero_points,
-                                     std::optional<Tensor> bias,
+                                     const std::optional<Tensor>& bias,
                                      bool reduce_range) {
     // Dynamic quantized linear: one pass quantizes each activation row from
     // its observed range, then the integer GEMM returns float results.
@@ -210,7 +210,7 @@ Tensor quantized_linear_cuda(const Tensor& input, const Tensor& weight,
                              double input_scale, int64_t input_zero_point,
                              const Tensor& weight_scales,
                              const Tensor& weight_zero_points,
-                             std::optional<Tensor> bias,
+                             const std::optional<Tensor>& bias,
                              double out_scale, int64_t out_zero_point) {
     // Fused Int8 GEMM with per-channel weight requantization; one thread per
     // (m, n) output element streams both operand rows over K.
@@ -473,7 +473,7 @@ Tensor quantized_div_cuda(
 Tensor quantized_clamp_cuda(
     const Tensor& self, double self_scale, int64_t self_zero_point,
     double out_scale, int64_t out_zero_point,
-    std::optional<Scalar> min, std::optional<Scalar> max) {
+    const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
     if (self.dtype() != DType::Int8) {
         TP_THROW(TypeError, "quantized_clamp(): expected an Int8 tensor");
     }

@@ -39,6 +39,12 @@ def _cpp_sym(f) -> str:
     return f.cpp_name.replace("::", "_").replace(".", "_")
 
 
+def _stub_arg_type(t):
+    """Kernel ABI type: what the dispatcher passes a registered kernel."""
+    from tools.codegen.api_types import stub_arg_type
+    return stub_arg_type(t)
+
+
 def _stub_template(f):
     from tools.codegen.api_types import stub_arg_type
     parts = [cpp_return_type(f)]
@@ -74,7 +80,8 @@ def generate_header(funcs, module_name: str) -> str:
     for f in funcs:
         for dev, impl in sorted(f.dispatch.items()):
             ret = cpp_return_type(f)
-            args = [f"{cpp_arg_type(a.type)} {a.name}" for a in f.args]
+            args = [f"{_stub_arg_type(a.type)} {a.name}" for a in f.args
+                    if a.name != "requires_grad"]
             lines.append(f"{ret} {impl}({', '.join(args)});")
     lines += ["", "} // namespace impl", f"}} // namespace {module_name}",
               "} // namespace tp_custom"]
@@ -136,10 +143,10 @@ def generate_binding(funcs, module_name: str) -> str:
         for dev, impl in sorted(f.dispatch.items()):
             key = "CPU" if dev.upper().startswith("CPU") else "CUDA"
             fn_type = (f"{cpp_return_type(f)} (*)("
-                       f"{', '.join(cpp_arg_type(a.type) for a in f.args)})")
+                       f"{', '.join(_stub_arg_type(a.type) for a in f.args if a.name != 'requires_grad')})")
             cast = f"static_cast<{fn_type}>(&impl::{impl})"
             L.append(f'        D.registerKernel("{f.func_name}", '
-                     f"DispatchKey::{key}, (KernelFunction){cast});")
+                     f"DispatchKey::{key}, {cast});")
     L += [
         "        }",
         "};",
@@ -165,7 +172,7 @@ def generate_binding(funcs, module_name: str) -> str:
                      f'Dispatcher::singleton().findHandle("{f.func_name}");')
             L.append(f"    DispatchKey key = computeDispatchKey({dev});")
             call = (f"DispatchStub<{_stub_template(f)}>::call(handle, key, "
-                    f"{', '.join(call_args)})")
+                    f"{', '.join(n for n in call_args if n != 'requires_grad')})")
             L.append(f"    {'return ' + call + ';' if not ret_void else call + ';'}")
         else:
             L.append(f'    TP_THROW(NotImplementedError, "{f.cpp_name}: no backend");')

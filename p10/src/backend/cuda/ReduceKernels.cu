@@ -21,6 +21,7 @@
 #include <utility>
 #include <type_traits>
 #include "Atomic.cuh"
+#include "OutWrite.h"
 
 namespace tensorplay {
 namespace cuda {
@@ -1080,7 +1081,7 @@ std::tuple<Tensor, Tensor> median_dim_cuda(const Tensor& self, int64_t dim,
     return {values, indices};
 }
 
-Tensor renorm_cuda(const Tensor& self, Scalar p, int64_t dim, Scalar maxnorm) {
+Tensor renorm_cuda(const Tensor& self, const Scalar& p, int64_t dim, const Scalar& maxnorm) {
     if (p.isComplex()) {
         TP_THROW(TypeError, "renorm: p must be real-valued");
     }
@@ -1121,7 +1122,11 @@ Tensor renorm_cuda(const Tensor& self, Scalar p, int64_t dim, Scalar maxnorm) {
 
 std::tuple<Tensor, Tensor> interop_kthvalue_values_cuda(const Tensor& self, int64_t k, int64_t dim, bool keepdim,
               Tensor& values, Tensor& indices) {
-        std::tie(values, indices) = kthvalue_cuda(self, k, dim, keepdim);
+        {
+            auto __tp_result = kthvalue_cuda(self, k, dim, keepdim);
+            write_out(values, std::get<0>(__tp_result));
+            write_out(indices, std::get<1>(__tp_result));
+        }
         return {values, indices};
 
 }
@@ -1129,14 +1134,22 @@ std::tuple<Tensor, Tensor> interop_kthvalue_values_cuda(const Tensor& self, int6
 std::tuple<Tensor, Tensor> interop_median_dim_values_cuda(
     const Tensor& self, int64_t dim, bool keepdim, Tensor& values,
     Tensor& indices) {
-    std::tie(values, indices) = median_dim_cuda(self, dim, keepdim);
+    {
+        auto __tp_result = median_dim_cuda(self, dim, keepdim);
+        write_out(values, std::get<0>(__tp_result));
+        write_out(indices, std::get<1>(__tp_result));
+    }
     return {values, indices};
 }
 
 std::tuple<Tensor, Tensor> interop_nanmedian_dim_values_cuda(
     const Tensor& self, int64_t dim, bool keepdim, Tensor& values,
     Tensor& indices) {
-    std::tie(values, indices) = nanmedian_dim_cuda(self, dim, keepdim);
+    {
+        auto __tp_result = nanmedian_dim_cuda(self, dim, keepdim);
+        write_out(values, std::get<0>(__tp_result));
+        write_out(indices, std::get<1>(__tp_result));
+    }
     return {values, indices};
 }
 

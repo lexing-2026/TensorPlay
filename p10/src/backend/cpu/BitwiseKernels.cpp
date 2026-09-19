@@ -329,15 +329,15 @@ Tensor bitwise_xor_tensor_cpu(const Tensor& a, const Tensor& b) {
     return bitwise_binary_cpu(a, b,
         [](auto x, auto y) { return static_cast<decltype(x)>(x ^ y); }, "bitwise_xor");
 }
-Tensor bitwise_and_scalar_cpu(const Tensor& a, Scalar b) {
+Tensor bitwise_and_scalar_cpu(const Tensor& a, const Scalar& b) {
     return bitwise_scalar_cpu(a, b,
         [](auto x, auto y) { return static_cast<decltype(x)>(x & y); }, "bitwise_and");
 }
-Tensor bitwise_or_scalar_cpu(const Tensor& a, Scalar b) {
+Tensor bitwise_or_scalar_cpu(const Tensor& a, const Scalar& b) {
     return bitwise_scalar_cpu(a, b,
         [](auto x, auto y) { return static_cast<decltype(x)>(x | y); }, "bitwise_or");
 }
-Tensor bitwise_xor_scalar_cpu(const Tensor& a, Scalar b) {
+Tensor bitwise_xor_scalar_cpu(const Tensor& a, const Scalar& b) {
     return bitwise_scalar_cpu(a, b,
         [](auto x, auto y) { return static_cast<decltype(x)>(x ^ y); }, "bitwise_xor");
 }
@@ -347,10 +347,10 @@ Tensor bitwise_lshift_tensor_cpu(const Tensor& a, const Tensor& b) {
 Tensor bitwise_rshift_tensor_cpu(const Tensor& a, const Tensor& b) {
     return bitwise_shift_tensor_cpu<false>(a, b, "bitwise_right_shift");
 }
-Tensor bitwise_lshift_scalar_cpu(const Tensor& a, Scalar b) {
+Tensor bitwise_lshift_scalar_cpu(const Tensor& a, const Scalar& b) {
     return bitwise_shift_scalar_cpu<true>(a, b, "bitwise_left_shift");
 }
-Tensor bitwise_rshift_scalar_cpu(const Tensor& a, Scalar b) {
+Tensor bitwise_rshift_scalar_cpu(const Tensor& a, const Scalar& b) {
     return bitwise_shift_scalar_cpu<false>(a, b, "bitwise_right_shift");
 }
 
@@ -365,34 +365,34 @@ inline void bitwise_scalar_check_cpu(Scalar self, const char* name) {
              ": only integral and boolean scalar operands are supported");
 }
 
-Tensor bitwise_and_scalar_tensor_cpu(Scalar self, const Tensor& other) {
+Tensor bitwise_and_scalar_tensor_cpu(const Scalar& self, const Tensor& other) {
     bitwise_check_cpu(other, "bitwise_and");
     bitwise_scalar_check_cpu(self, "bitwise_and");
     Tensor wrapped = Tensor::full({}, self, other.dtype(), other.device());
     return bitwise_binary_cpu(wrapped, other,
         [](auto x, auto y) { return static_cast<decltype(x)>(x & y); }, "bitwise_and");
 }
-Tensor bitwise_or_scalar_tensor_cpu(Scalar self, const Tensor& other) {
+Tensor bitwise_or_scalar_tensor_cpu(const Scalar& self, const Tensor& other) {
     bitwise_check_cpu(other, "bitwise_or");
     bitwise_scalar_check_cpu(self, "bitwise_or");
     Tensor wrapped = Tensor::full({}, self, other.dtype(), other.device());
     return bitwise_binary_cpu(wrapped, other,
         [](auto x, auto y) { return static_cast<decltype(x)>(x | y); }, "bitwise_or");
 }
-Tensor bitwise_xor_scalar_tensor_cpu(Scalar self, const Tensor& other) {
+Tensor bitwise_xor_scalar_tensor_cpu(const Scalar& self, const Tensor& other) {
     bitwise_check_cpu(other, "bitwise_xor");
     bitwise_scalar_check_cpu(self, "bitwise_xor");
     Tensor wrapped = Tensor::full({}, self, other.dtype(), other.device());
     return bitwise_binary_cpu(wrapped, other,
         [](auto x, auto y) { return static_cast<decltype(x)>(x ^ y); }, "bitwise_xor");
 }
-Tensor bitwise_lshift_scalar_tensor_cpu(Scalar self, const Tensor& other) {
+Tensor bitwise_lshift_scalar_tensor_cpu(const Scalar& self, const Tensor& other) {
     bitwise_check_cpu(other, "bitwise_left_shift");
     bitwise_scalar_check_cpu(self, "bitwise_left_shift");
     Tensor wrapped = Tensor::full({}, self, other.dtype(), other.device());
     return bitwise_shift_tensor_cpu<true>(wrapped, other, "bitwise_left_shift");
 }
-Tensor bitwise_rshift_scalar_tensor_cpu(Scalar self, const Tensor& other) {
+Tensor bitwise_rshift_scalar_tensor_cpu(const Scalar& self, const Tensor& other) {
     bitwise_check_cpu(other, "bitwise_right_shift");
     bitwise_scalar_check_cpu(self, "bitwise_right_shift");
     Tensor wrapped = Tensor::full({}, self, other.dtype(), other.device());
@@ -422,13 +422,13 @@ Tensor& bitwise_or_tensor_out_cpu(const Tensor& a, const Tensor& b, Tensor& out)
 Tensor& bitwise_xor_tensor_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
     return bitwise_assign_out_cpu(out, bitwise_xor_tensor_cpu(a, b));
 }
-Tensor& bitwise_and_scalar_out_cpu(const Tensor& a, Scalar b, Tensor& out) {
+Tensor& bitwise_and_scalar_out_cpu(const Tensor& a, const Scalar& b, Tensor& out) {
     return bitwise_assign_out_cpu(out, bitwise_and_scalar_cpu(a, b));
 }
-Tensor& bitwise_or_scalar_out_cpu(const Tensor& a, Scalar b, Tensor& out) {
+Tensor& bitwise_or_scalar_out_cpu(const Tensor& a, const Scalar& b, Tensor& out) {
     return bitwise_assign_out_cpu(out, bitwise_or_scalar_cpu(a, b));
 }
-Tensor& bitwise_xor_scalar_out_cpu(const Tensor& a, Scalar b, Tensor& out) {
+Tensor& bitwise_xor_scalar_out_cpu(const Tensor& a, const Scalar& b, Tensor& out) {
     return bitwise_assign_out_cpu(out, bitwise_xor_scalar_cpu(a, b));
 }
 Tensor& bitwise_lshift_tensor_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
@@ -437,10 +437,10 @@ Tensor& bitwise_lshift_tensor_out_cpu(const Tensor& a, const Tensor& b, Tensor& 
 Tensor& bitwise_rshift_tensor_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
     return bitwise_assign_out_cpu(out, bitwise_rshift_tensor_cpu(a, b));
 }
-Tensor& bitwise_lshift_scalar_out_cpu(const Tensor& a, Scalar b, Tensor& out) {
+Tensor& bitwise_lshift_scalar_out_cpu(const Tensor& a, const Scalar& b, Tensor& out) {
     return bitwise_assign_out_cpu(out, bitwise_lshift_scalar_cpu(a, b));
 }
-Tensor& bitwise_rshift_scalar_out_cpu(const Tensor& a, Scalar b, Tensor& out) {
+Tensor& bitwise_rshift_scalar_out_cpu(const Tensor& a, const Scalar& b, Tensor& out) {
     return bitwise_assign_out_cpu(out, bitwise_rshift_scalar_cpu(a, b));
 }
 

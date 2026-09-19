@@ -25,7 +25,7 @@ void validate_elementwise_4d(const Tensor& t, const char* name) {
 
 } // namespace
 
-Tensor pow_scalar_kernel(const Tensor& self, Scalar exponent) {
+Tensor pow_scalar_kernel(const Tensor& self, const Scalar& exponent) {
   validate_elementwise_4d(self, "pow");
   api::Context* const context = api::context();
 
@@ -106,7 +106,7 @@ Tensor pow_tensor_kernel(const Tensor& self, const Tensor& exponent) {
   return convert(v_output);
 }
 
-Tensor lerp_scalar_kernel(const Tensor& self, const Tensor& end, Scalar weight) {
+Tensor lerp_scalar_kernel(const Tensor& self, const Tensor& end, const Scalar& weight) {
   validate_elementwise_4d(self, "lerp");
   TP_CHECK(
       end.numel() == 1 || end.shape() == self.shape(),
@@ -205,7 +205,7 @@ Tensor lerp_tensor_kernel(
 Tensor& lerp_scalar_inplace_kernel(
     Tensor& self,
     const Tensor& end,
-    Scalar weight) {
+    const Scalar& weight) {
   validate_elementwise_4d(self, "lerp");
   TP_CHECK(
       end.numel() == 1 || end.shape() == self.shape(),

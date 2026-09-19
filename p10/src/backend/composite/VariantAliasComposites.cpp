@@ -24,12 +24,12 @@ Tensor alias_wrap__ctc_loss_backward_Tensor(const Tensor& grad, const Tensor& lo
     return ops::_ctc_loss_backward(grad, log_probs, targets, input_lengths, target_lengths, neg_log_likelihood, log_alpha, blank, zero_infinity);
 }
 
-Tensor alias_wrap_conv_transpose2d_input(const Tensor& input, const Tensor& weight, const std::optional<Tensor>& bias, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& output_padding, int64_t groups, const std::vector<int64_t>& dilation) {
-    return ops::conv_transpose2d(input, weight, bias, stride, padding, output_padding, groups, dilation);
+Tensor alias_wrap_conv_transpose2d_input(const Tensor& input, const Tensor& weight, const Tensor& bias, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& output_padding, int64_t groups, const std::vector<int64_t>& dilation) {
+    return ops::conv_transpose2d(input, weight, bias.defined() ? std::optional<Tensor>(bias) : std::nullopt, stride, padding, output_padding, groups, dilation);
 }
 
-Tensor alias_wrap_conv_transpose3d_input(const Tensor& input, const Tensor& weight, const std::optional<Tensor>& bias, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& output_padding, int64_t groups, const std::vector<int64_t>& dilation) {
-    return ops::conv_transpose3d(input, weight, bias, stride, padding, output_padding, groups, dilation);
+Tensor alias_wrap_conv_transpose3d_input(const Tensor& input, const Tensor& weight, const Tensor& bias, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& output_padding, int64_t groups, const std::vector<int64_t>& dilation) {
+    return ops::conv_transpose3d(input, weight, bias.defined() ? std::optional<Tensor>(bias) : std::nullopt, stride, padding, output_padding, groups, dilation);
 }
 
 Tensor alias_wrap_count_nonzero_dim_IntList(const Tensor& self, const std::vector<int64_t>& dim) {
@@ -52,7 +52,7 @@ Tensor alias_wrap_ldexp_Tensor(const Tensor& self, const Tensor& other) {
     return ops::ldexp(self, other);
 }
 
-Tensor alias_wrap_lerp_Scalar(const Tensor& self, const Tensor& end, Scalar weight) {
+Tensor alias_wrap_lerp_Scalar(const Tensor& self, const Tensor& end, const Scalar& weight) {
     return ops::lerp(self, end, weight);
 }
 
@@ -64,11 +64,11 @@ std::tuple<Tensor, Tensor, Tensor> alias_wrap_lstm_input(const Tensor& input, co
     return ops::lstm(input, hx, params, has_biases, num_layers, dropout, train, bidirectional, batch_first);
 }
 
-Tensor alias_wrap_masked_fill_Scalar(const Tensor& self, const Tensor& mask, Scalar value) {
+Tensor alias_wrap_masked_fill_Scalar(const Tensor& self, const Tensor& mask, const Scalar& value) {
     return ops::masked_fill(self, mask, value);
 }
 
-std::vector<Tensor> alias_wrap_meshgrid_indexing(const std::vector<Tensor>& tensors, std::string indexing) {
+std::vector<Tensor> alias_wrap_meshgrid_indexing(const std::vector<Tensor>& tensors, const std::string& indexing) {
     return ops::meshgrid(tensors, indexing);
 }
 
@@ -84,12 +84,8 @@ Tensor alias_wrap_normal_Tensor_Tensor(const Tensor& mean, const Tensor& std, st
     return ops::normal(mean, std);
 }
 
-Tensor alias_wrap_scatter_reduce_two(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& src, std::string reduce, bool include_self) {
+Tensor alias_wrap_scatter_reduce_two(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& src, const std::string& reduce, bool include_self) {
     return ops::scatter_reduce(self, dim, index, src, reduce, include_self);
-}
-
-Tensor alias_wrap_slice_Tensor(const Tensor& self, int64_t dim, std::optional<int64_t> start, std::optional<int64_t> end, int64_t step) {
-    return ops::slice(self, dim, start, end, step);
 }
 
 Tensor alias_wrap_softmax_int(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
@@ -100,11 +96,11 @@ std::vector<Tensor> alias_wrap_split_Tensor(const Tensor& self, int64_t split_si
     return ops::split(self, split_size, dim);
 }
 
-std::tuple<Tensor, Tensor> alias_wrap_std_mean_dim(const Tensor& self, std::optional<std::vector<int64_t>> dim, bool unbiased, bool keepdim) {
+std::tuple<Tensor, Tensor> alias_wrap_std_mean_dim(const Tensor& self, const std::optional<std::vector<int64_t>>& dim, bool unbiased, bool keepdim) {
     return ops::std_mean(self, dim.value_or(std::vector<int64_t>()), unbiased, keepdim);
 }
 
-Tensor alias_wrap_stft_center(const Tensor& self, int64_t n_fft, std::optional<int64_t> hop_length, std::optional<int64_t> win_length, const std::optional<Tensor>& window, bool center, std::string pad_mode, bool normalized, std::optional<bool> onesided, std::optional<bool> return_complex, std::optional<bool> align_to_window) {
+Tensor alias_wrap_stft_center(const Tensor& self, int64_t n_fft, std::optional<int64_t> hop_length, std::optional<int64_t> win_length, const std::optional<Tensor>& window, bool center, const std::string& pad_mode, bool normalized, std::optional<bool> onesided, std::optional<bool> return_complex, std::optional<bool> align_to_window) {
     return ops::stft(self, n_fft, hop_length, win_length, window, center, pad_mode, normalized, onesided.value_or(true), return_complex.value_or(true));
 }
 
@@ -116,7 +112,7 @@ std::vector<Tensor> alias_wrap_unbind_int(const Tensor& self, int64_t dim) {
     return ops::unbind(self, dim);
 }
 
-std::tuple<Tensor, Tensor> alias_wrap_var_mean_dim(const Tensor& self, std::optional<std::vector<int64_t>> dim, bool unbiased, bool keepdim) {
+std::tuple<Tensor, Tensor> alias_wrap_var_mean_dim(const Tensor& self, const std::optional<std::vector<int64_t>>& dim, bool unbiased, bool keepdim) {
     return ops::var_mean(self, dim.value_or(std::vector<int64_t>()), unbiased, keepdim);
 }
 
@@ -124,7 +120,7 @@ Tensor alias_wrap_xlogy_Tensor(const Tensor& self, const Tensor& other) {
     return ops::xlogy(self, other);
 }
 
-Tensor& inplace_wrap_masked_fill_dd_Scalar(Tensor& self, const Tensor& mask, Scalar value) {
+Tensor& inplace_wrap_masked_fill_dd_Scalar(Tensor& self, const Tensor& mask, const Scalar& value) {
     ops::copy_(self, ops::masked_fill_(self, mask, value));
     return self;
 }
@@ -162,7 +158,6 @@ TENSORPLAY_LIBRARY_IMPL(Composite, VariantWiringaliasoverloads) {
     m.impl("movedim.intlist", composite::alias_wrap_movedim_intlist);
     m.impl("normal.Tensor_Tensor", composite::alias_wrap_normal_Tensor_Tensor);
     m.impl("scatter_reduce.two", composite::alias_wrap_scatter_reduce_two);
-    m.impl("slice.Tensor", composite::alias_wrap_slice_Tensor);
     m.impl("softmax.int", composite::alias_wrap_softmax_int);
     m.impl("split.Tensor", composite::alias_wrap_split_Tensor);
     m.impl("std_mean.dim", composite::alias_wrap_std_mean_dim);

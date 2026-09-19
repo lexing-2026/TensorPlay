@@ -200,7 +200,7 @@
 - name: select.int(Tensor self, int dim, SymInt index) -> Tensor
   self: tensorplay::tpx::ops::select_backward(grad, self, dim, index)
 
-- name: slice(Tensor self, int dim=0, int? start=None, int? end=None, int step=1) -> Tensor
+- name: slice.Tensor(Tensor self, int dim=0, SymInt? start=None, SymInt? end=None, SymInt step=1) -> Tensor
   self: tensorplay::tpx::ops::slice_backward(grad, self, dim, start, end, step)
 
 # The two scatter-back ops above are linear in grad_output, and their own
@@ -638,7 +638,12 @@
   self: leaky_relu_backward(grad, self, negative_slope, false)
 
 # Scalar upper=0.3333333333333333, bool training=False, bool inplace=False)
-- name: rrelu_with_noise(Tensor self, Tensor noise, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False) -> Tensor
+- name: rrelu_with_noise(Tensor self, Tensor(b!) noise, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False, Generator? generator=None) -> Tensor
+  self: rrelu_with_noise_backward(grad, self, noise, lower, upper, training, false)
+
+# In-place overloads share the functional node; ``self`` is the value
+# captured before the update, so the formula is the functional one.
+- name: rrelu_with_noise_(Tensor(a!) self, Tensor(b!) noise, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False, Generator? generator=None) -> Tensor(a!)
   self: rrelu_with_noise_backward(grad, self, noise, lower, upper, training, false)
 
 # the numerically stable branch split (no exp overflow for large |self|).

@@ -11,23 +11,24 @@ namespace cuda {
 
 #define TP_DECLARE_FOREACH_ADD_SUB(NAME)                                      \
 std::vector<Tensor> foreach_##NAME##_scalar_cuda(                             \
-        const std::vector<Tensor>& self, Scalar scalar);                     \
+        const std::vector<Tensor>& self, const Scalar& scalar);                     \
 std::vector<Tensor> foreach_##NAME##_list_cuda(                               \
         const std::vector<Tensor>& self, const std::vector<Tensor>& other,    \
-        Scalar alpha);                                                        \
+        const Scalar& alpha);                                                        \
 std::vector<Tensor> foreach_##NAME##_scalar_list_cuda(                        \
         const std::vector<Tensor>& self, const std::vector<Scalar>& scalars); \
 std::vector<Tensor> foreach_##NAME##_tensor_cuda(                             \
-        const std::vector<Tensor>& self, const Tensor& other, Scalar alpha);  \
+        const std::vector<Tensor>& self, const Tensor& other,                 \
+        const Scalar& alpha);                                                 \
 void foreach_##NAME##_scalar_inplace_cuda(                                    \
-        std::vector<Tensor> self, Scalar scalar);                             \
+        std::vector<Tensor> self, const Scalar& scalar);                             \
 void foreach_##NAME##_list_inplace_cuda(                                      \
         std::vector<Tensor> self, const std::vector<Tensor>& other,           \
-        Scalar alpha);                                                        \
+        const Scalar& alpha);                                                        \
 void foreach_##NAME##_scalar_list_inplace_cuda(                               \
         std::vector<Tensor> self, const std::vector<Scalar>& scalars);        \
 void foreach_##NAME##_tensor_inplace_cuda(                                    \
-        std::vector<Tensor> self, const Tensor& other, Scalar alpha);
+        std::vector<Tensor> self, const Tensor& other, const Scalar& alpha);
 
 TP_DECLARE_FOREACH_ADD_SUB(add)
 TP_DECLARE_FOREACH_ADD_SUB(sub)
@@ -35,7 +36,7 @@ TP_DECLARE_FOREACH_ADD_SUB(sub)
 
 #define TP_DECLARE_FOREACH_MUL_DIV(NAME)                                      \
 std::vector<Tensor> foreach_##NAME##_scalar_cuda(                             \
-        const std::vector<Tensor>& self, Scalar scalar);                     \
+        const std::vector<Tensor>& self, const Scalar& scalar);                     \
 std::vector<Tensor> foreach_##NAME##_list_cuda(                               \
         const std::vector<Tensor>& self, const std::vector<Tensor>& other);   \
 std::vector<Tensor> foreach_##NAME##_scalar_list_cuda(                        \
@@ -43,7 +44,7 @@ std::vector<Tensor> foreach_##NAME##_scalar_list_cuda(                        \
 std::vector<Tensor> foreach_##NAME##_tensor_cuda(                             \
         const std::vector<Tensor>& self, const Tensor& other);                \
 void foreach_##NAME##_scalar_inplace_cuda(                                    \
-        std::vector<Tensor> self, Scalar scalar);                             \
+        std::vector<Tensor> self, const Scalar& scalar);                             \
 void foreach_##NAME##_list_inplace_cuda(                                      \
         std::vector<Tensor> self, const std::vector<Tensor>& other);          \
 void foreach_##NAME##_scalar_list_inplace_cuda(                               \
@@ -97,10 +98,10 @@ void foreach_reciprocal_inplace_cuda(std::vector<Tensor> self);
 #define TP_DECLARE_FOREACH_TERNARY(NAME)                                      \
 std::vector<Tensor> foreach_##NAME##_scalar_cuda(                             \
         const std::vector<Tensor>& self, const std::vector<Tensor>& tensor1,  \
-        const std::vector<Tensor>& tensor2, Scalar value);                    \
+        const std::vector<Tensor>& tensor2, const Scalar& value);                    \
 void foreach_##NAME##_scalar_inplace_cuda(                                    \
         std::vector<Tensor> self, const std::vector<Tensor>& tensor1,         \
-        const std::vector<Tensor>& tensor2, Scalar value);                    \
+        const std::vector<Tensor>& tensor2, const Scalar& value);                    \
 std::vector<Tensor> foreach_##NAME##_scalar_list_cuda(                        \
         const std::vector<Tensor>& self, const std::vector<Tensor>& tensor1,  \
         const std::vector<Tensor>& tensor2, const std::vector<Scalar>& values);\
@@ -120,7 +121,7 @@ TP_DECLARE_FOREACH_TERNARY(addcdiv)
 
 std::vector<Tensor> foreach_lerp_scalar_cuda(
         const std::vector<Tensor>& self, const std::vector<Tensor>& end,
-        Scalar weight);
+        const Scalar& weight);
 std::vector<Tensor> foreach_lerp_list_cuda(
         const std::vector<Tensor>& self, const std::vector<Tensor>& end,
         const std::vector<Tensor>& weight);
@@ -139,7 +140,7 @@ void foreach_lerp_scalar_list_inplace_cuda(
 std::vector<Tensor> foreach_pow_scalar_cuda(
         const std::vector<Tensor>& self, Scalar exponent);
 std::vector<Tensor> foreach_pow_scalar_tensor_cuda(
-        Scalar self, const std::vector<Tensor>& exponent);
+        const Scalar& self, const std::vector<Tensor>& exponent);
 std::vector<Tensor> foreach_pow_tensor_tensor_cuda(
         const Tensor& self, const std::vector<Tensor>& exponent);
 std::vector<Tensor> foreach_pow_list_cuda(
@@ -154,9 +155,9 @@ void foreach_pow_scalar_list_inplace_cuda(
 
 #define TP_DECLARE_FOREACH_CLAMP(NAME)                                       \
 std::vector<Tensor> foreach_##NAME##_scalar_cuda(                            \
-        const std::vector<Tensor>& self, Scalar scalar);                    \
+        const std::vector<Tensor>& self, const Scalar& scalar);                    \
 void foreach_##NAME##_scalar_inplace_cuda(                                   \
-        std::vector<Tensor> self, Scalar scalar);                            \
+        std::vector<Tensor> self, const Scalar& scalar);                            \
 std::vector<Tensor> foreach_##NAME##_list_cuda(                              \
         const std::vector<Tensor>& self, const std::vector<Tensor>& other);  \
 void foreach_##NAME##_list_inplace_cuda(                                     \
@@ -188,10 +189,10 @@ std::vector<Tensor> foreach_copy_cuda(
 std::vector<Tensor> foreach_mm_cuda(
         const std::vector<Tensor>& self, const std::vector<Tensor>& mat2);
 std::vector<Tensor> foreach_norm_cuda(
-        const std::vector<Tensor>& self, Scalar ord,
+        const std::vector<Tensor>& self, const Scalar& ord,
         std::optional<DType> dtype);
 std::vector<Tensor> foreach_powsum_cuda(
-        const std::vector<Tensor>& self, Scalar ord,
+        const std::vector<Tensor>& self, const Scalar& ord,
         std::optional<DType> dtype);
 
 #define TP_DECLARE_FOREACH_UNARY_OUT(NAME)                                    \
@@ -232,16 +233,16 @@ TP_DECLARE_FOREACH_UNARY_OUT(trunc)
 
 #define TP_DECLARE_FOREACH_ADD_SUB_OUT(NAME)                                  \
 void foreach_##NAME##_scalar_out_cuda(                                       \
-        const std::vector<Tensor>& self, Scalar scalar,                      \
+        const std::vector<Tensor>& self, const Scalar& scalar,                      \
         std::vector<Tensor> out);                                             \
 void foreach_##NAME##_list_out_cuda(                                         \
         const std::vector<Tensor>& self, const std::vector<Tensor>& other,    \
-        Scalar alpha, std::vector<Tensor> out);                               \
+        const Scalar& alpha, std::vector<Tensor> out);                               \
 void foreach_##NAME##_scalar_list_out_cuda(                                  \
         const std::vector<Tensor>& self, const std::vector<Scalar>& scalars,  \
         std::vector<Tensor> out);                                             \
 void foreach_##NAME##_tensor_out_cuda(                                       \
-        const std::vector<Tensor>& self, const Tensor& other, Scalar alpha,   \
+        const std::vector<Tensor>& self, const Tensor& other, const Scalar& alpha,   \
         std::vector<Tensor> out);
 
 TP_DECLARE_FOREACH_ADD_SUB_OUT(add)
@@ -250,7 +251,7 @@ TP_DECLARE_FOREACH_ADD_SUB_OUT(sub)
 
 #define TP_DECLARE_FOREACH_MUL_DIV_OUT(NAME)                                  \
 void foreach_##NAME##_scalar_out_cuda(                                       \
-        const std::vector<Tensor>& self, Scalar scalar,                      \
+        const std::vector<Tensor>& self, const Scalar& scalar,                      \
         std::vector<Tensor> out);                                             \
 void foreach_##NAME##_list_out_cuda(                                         \
         const std::vector<Tensor>& self, const std::vector<Tensor>& other,    \
@@ -268,7 +269,7 @@ TP_DECLARE_FOREACH_MUL_DIV_OUT(div)
 
 #define TP_DECLARE_FOREACH_CLAMP_OUT(NAME)                                    \
 void foreach_##NAME##_scalar_out_cuda(                                       \
-        const std::vector<Tensor>& self, Scalar scalar,                      \
+        const std::vector<Tensor>& self, const Scalar& scalar,                      \
         std::vector<Tensor> out);                                             \
 void foreach_##NAME##_list_out_cuda(                                         \
         const std::vector<Tensor>& self, const std::vector<Tensor>& other,    \
@@ -306,7 +307,7 @@ void foreach_pow_scalar_list_out_cuda(
 #define TP_DECLARE_FOREACH_TERNARY_OUT(NAME)                                  \
 void foreach_##NAME##_scalar_out_cuda(                                       \
         const std::vector<Tensor>& self, const std::vector<Tensor>& tensor1,  \
-        const std::vector<Tensor>& tensor2, Scalar value,                     \
+        const std::vector<Tensor>& tensor2, const Scalar& value,                     \
         std::vector<Tensor> out);                                             \
 void foreach_##NAME##_scalar_list_out_cuda(                                  \
         const std::vector<Tensor>& self, const std::vector<Tensor>& tensor1,  \
@@ -314,7 +315,7 @@ void foreach_##NAME##_scalar_list_out_cuda(                                  \
         std::vector<Tensor> out);                                             \
 void foreach_##NAME##_tensor_out_cuda(                                       \
         const std::vector<Tensor>& self, const std::vector<Tensor>& tensor1,  \
-        const std::vector<Tensor>& tensor2, Scalar value,                     \
+        const std::vector<Tensor>& tensor2, const Scalar& value,                     \
         std::vector<Tensor> out);
 
 TP_DECLARE_FOREACH_TERNARY_OUT(addcmul)
@@ -381,9 +382,9 @@ std::vector<Tensor> foreach_zero_mta_ret_cuda(
 
 #define TP_DECLARE_MTA_SCALAR(NAME)                                           \
 void foreach_##NAME##_scalar_mta_inplace_cuda(                                \
-        std::vector<Tensor> self, Scalar scalar);                             \
+        std::vector<Tensor> self, const Scalar& scalar);                             \
 std::vector<Tensor> foreach_##NAME##_scalar_mta_ret_cuda(                     \
-        const std::vector<Tensor>& self, Scalar scalar);
+        const std::vector<Tensor>& self, const Scalar& scalar);
 
 TP_DECLARE_MTA_SCALAR(add)
 TP_DECLARE_MTA_SCALAR(sub)
@@ -431,10 +432,10 @@ TP_DECLARE_MTA_LIST(minimum)
 #define TP_DECLARE_MTA_LIST_ALPHA(NAME)                                       \
 void foreach_##NAME##_list_mta_inplace_cuda(                                  \
         std::vector<Tensor> self, const std::vector<Tensor>& other,           \
-        Scalar alpha);                                                        \
+        const Scalar& alpha);                                                        \
 std::vector<Tensor> foreach_##NAME##_list_mta_ret_cuda(                       \
         const std::vector<Tensor>& self, const std::vector<Tensor>& other,    \
-        Scalar alpha);
+        const Scalar& alpha);
 
 TP_DECLARE_MTA_LIST_ALPHA(add)
 TP_DECLARE_MTA_LIST_ALPHA(sub)
@@ -442,19 +443,19 @@ TP_DECLARE_MTA_LIST_ALPHA(sub)
 
 void foreach_lerp_scalar_mta_inplace_cuda(
         std::vector<Tensor> self, const std::vector<Tensor>& end,
-        Scalar weight);
+        const Scalar& weight);
 void foreach_lerp_scalar_list_mta_inplace_cuda(
         std::vector<Tensor> self, const std::vector<Tensor>& end,
         const std::vector<Scalar>& weights);
 void foreach_addcmul_scalar_mta_inplace_cuda(
         std::vector<Tensor> self, const std::vector<Tensor>& tensor1,
-        const std::vector<Tensor>& tensor2, Scalar value);
+        const std::vector<Tensor>& tensor2, const Scalar& value);
 void foreach_addcmul_scalar_list_mta_inplace_cuda(
         std::vector<Tensor> self, const std::vector<Tensor>& tensor1,
         const std::vector<Tensor>& tensor2, const std::vector<Scalar>& scalars);
 void foreach_addcdiv_scalar_mta_inplace_cuda(
         std::vector<Tensor> self, const std::vector<Tensor>& tensor1,
-        const std::vector<Tensor>& tensor2, Scalar value);
+        const std::vector<Tensor>& tensor2, const Scalar& value);
 void foreach_addcdiv_scalar_list_mta_inplace_cuda(
         std::vector<Tensor> self, const std::vector<Tensor>& tensor1,
         const std::vector<Tensor>& tensor2, const std::vector<Scalar>& scalars);

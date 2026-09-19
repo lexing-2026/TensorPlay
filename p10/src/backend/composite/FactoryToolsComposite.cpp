@@ -360,7 +360,7 @@ Tensor hamming_window_periodic_alpha_beta_native(int64_t window_length, bool per
                                layout, device, pin_memory);
 }
 
-Tensor arange_start_native(Scalar start, Scalar end, std::optional<DType> dtype,
+Tensor arange_start_native(const Scalar& start, const Scalar& end, std::optional<DType> dtype,
                            std::optional<int64_t> layout,
                            std::optional<Device> device,
                            std::optional<bool> pin_memory) {
@@ -368,7 +368,7 @@ Tensor arange_start_native(Scalar start, Scalar end, std::optional<DType> dtype,
                                dtype, layout, device, pin_memory);
 }
 
-Tensor arange_start_step_native(Scalar start, Scalar end, Scalar step,
+Tensor arange_start_step_native(const Scalar& start, const Scalar& end, const Scalar& step,
                                 std::optional<DType> dtype,
                                 std::optional<int64_t> layout,
                                 std::optional<Device> device,
@@ -403,7 +403,7 @@ Tensor linspace_tensor_tensor_native(const Tensor& start, const Tensor& end,
                                 device, pin_memory);
 }
 
-Tensor linspace_tensor_scalar_native(const Tensor& start, Scalar end, int64_t steps,
+Tensor linspace_tensor_scalar_native(const Tensor& start, const Scalar& end, int64_t steps,
                                      std::optional<DType> dtype,
                                      std::optional<int64_t> layout,
                                      std::optional<Device> device,
@@ -417,7 +417,7 @@ Tensor linspace_tensor_scalar_native(const Tensor& start, Scalar end, int64_t st
                                 pin_memory);
 }
 
-Tensor linspace_scalar_tensor_native(Scalar start, const Tensor& end, int64_t steps,
+Tensor linspace_scalar_tensor_native(const Scalar& start, const Tensor& end, int64_t steps,
                                      std::optional<DType> dtype,
                                      std::optional<int64_t> layout,
                                      std::optional<Device> device,
@@ -442,7 +442,7 @@ Tensor& linspace_tensor_tensor_out_native(const Tensor& start, const Tensor& end
     return ops::linspace(start.item(), end.item(), steps, out);
 }
 
-Tensor& linspace_tensor_scalar_out_native(const Tensor& start, Scalar end,
+Tensor& linspace_tensor_scalar_out_native(const Tensor& start, const Scalar& end,
                                           int64_t steps, Tensor& out) {
     if (start.dim() != 0) {
         TP_THROW(RuntimeError,
@@ -452,7 +452,7 @@ Tensor& linspace_tensor_scalar_out_native(const Tensor& start, Scalar end,
     return ops::linspace(start.item(), end, steps, out);
 }
 
-Tensor& linspace_scalar_tensor_out_native(Scalar start, const Tensor& end,
+Tensor& linspace_scalar_tensor_out_native(const Scalar& start, const Tensor& end,
                                           int64_t steps, Tensor& out) {
     if (end.dim() != 0) {
         TP_THROW(RuntimeError,
@@ -478,7 +478,7 @@ Tensor logspace_tensor_tensor_native(const Tensor& start, const Tensor& end,
                                 device, pin_memory);
 }
 
-Tensor logspace_tensor_scalar_native(const Tensor& start, Scalar end, int64_t steps,
+Tensor logspace_tensor_scalar_native(const Tensor& start, const Scalar& end, int64_t steps,
                                      double base, std::optional<DType> dtype,
                                      std::optional<int64_t> layout,
                                      std::optional<Device> device,
@@ -492,7 +492,7 @@ Tensor logspace_tensor_scalar_native(const Tensor& start, Scalar end, int64_t st
                                 pin_memory);
 }
 
-Tensor logspace_scalar_tensor_native(Scalar start, const Tensor& end, int64_t steps,
+Tensor logspace_scalar_tensor_native(const Scalar& start, const Tensor& end, int64_t steps,
                                      double base, std::optional<DType> dtype,
                                      std::optional<int64_t> layout,
                                      std::optional<Device> device,
@@ -517,7 +517,7 @@ Tensor& logspace_tensor_tensor_out_native(const Tensor& start, const Tensor& end
     return ops::logspace(start.item(), end.item(), steps, base, out);
 }
 
-Tensor& logspace_tensor_scalar_out_native(const Tensor& start, Scalar end,
+Tensor& logspace_tensor_scalar_out_native(const Tensor& start, const Scalar& end,
                                           int64_t steps, double base, Tensor& out) {
     if (start.dim() != 0) {
         TP_THROW(RuntimeError,
@@ -527,7 +527,7 @@ Tensor& logspace_tensor_scalar_out_native(const Tensor& start, Scalar end,
     return ops::logspace(start.item(), end, steps, base, out);
 }
 
-Tensor& logspace_scalar_tensor_out_native(Scalar start, const Tensor& end,
+Tensor& logspace_scalar_tensor_out_native(const Scalar& start, const Tensor& end,
                                           int64_t steps, double base, Tensor& out) {
     if (end.dim() != 0) {
         TP_THROW(RuntimeError,
@@ -553,7 +553,7 @@ Tensor& zeros_out_native(const std::vector<int64_t>& size, Tensor& out) {
     return out;
 }
 
-Tensor& full_out_native(const std::vector<int64_t>& size, Scalar fill_value, Tensor& out) {
+Tensor& full_out_native(const std::vector<int64_t>& size, const Scalar& fill_value, Tensor& out) {
     ops::resize_(out, size);
     ops::fill_(out, fill_value);
     return out;
@@ -598,7 +598,7 @@ Tensor new_empty_strided_native(const Tensor& self, const std::vector<int64_t>& 
 }
 
 Tensor new_full_native(const Tensor& self, const std::vector<int64_t>& size,
-                       Scalar fill_value, std::optional<DType> dtype,
+                       const Scalar& fill_value, std::optional<DType> dtype,
                        std::optional<int64_t> layout, std::optional<Device> device,
                        std::optional<bool> pin_memory) {
     Tensor r = new_empty_impl(self, size, dtype, layout, device, pin_memory);
@@ -690,8 +690,8 @@ Tensor normal_functional_native(const Tensor& self, double mean, double std,
 // ---------------------------------------------------------------------------
 
 void assert_tensor_metadata_native(const Tensor& a,
-                                   std::optional<std::vector<int64_t>> size,
-                                   std::optional<std::vector<int64_t>> stride,
+                                   const std::optional<std::vector<int64_t>>& size,
+                                   const std::optional<std::vector<int64_t>>& stride,
                                    std::optional<DType> dtype,
                                    std::optional<Device> device,
                                    std::optional<int64_t> layout) {
@@ -780,20 +780,20 @@ Tensor is_any_true_native(const Tensor& self) {
     return ops::any(self);
 }
 
-void assert_scalar_native(Scalar self, std::string assert_msg) {
+void assert_scalar_native(const Scalar& self, const std::string& assert_msg) {
     if (!self.to<bool>()) {
         TP_THROW(RuntimeError,
                  !assert_msg.empty() ? assert_msg : std::string("Assertion is failed"));
     }
 }
 
-Tensor functional_assert_scalar_native(Scalar self, std::string assert_msg,
+Tensor functional_assert_scalar_native(const Scalar& self, const std::string& assert_msg,
                                        const Tensor& dep_token) {
     assert_scalar_native(self, assert_msg);
     return ops::clone(dep_token);
 }
 
-void print_native(std::string s) {
+void print_native(const std::string& s) {
     std::cout << s << '\n';
 }
 
@@ -801,7 +801,7 @@ void print_native(std::string s) {
 // symbolic size constraints
 // ---------------------------------------------------------------------------
 
-void sym_constrain_range_native(Scalar size, std::optional<int64_t> min,
+void sym_constrain_range_native(const Scalar& size, std::optional<int64_t> min,
                                 std::optional<int64_t> max) {
     const int64_t min_val =
         min.has_value() ? *min : std::numeric_limits<int64_t>::min();
@@ -820,7 +820,7 @@ void sym_constrain_range_native(Scalar size, std::optional<int64_t> min,
     }
 }
 
-void sym_constrain_range_for_size_native(Scalar size, std::optional<int64_t> min,
+void sym_constrain_range_for_size_native(const Scalar& size, std::optional<int64_t> min,
                                          std::optional<int64_t> max) {
     const int64_t min_val = min.has_value() ? *min : 0;
     if (max.has_value() && *max <= 2) {
@@ -831,14 +831,14 @@ void sym_constrain_range_for_size_native(Scalar size, std::optional<int64_t> min
     sym_constrain_range_native(size, min_val, max);
 }
 
-Tensor functional_sym_constrain_range_native(Scalar size, std::optional<int64_t> min,
+Tensor functional_sym_constrain_range_native(const Scalar& size, std::optional<int64_t> min,
                                              std::optional<int64_t> max,
                                              const Tensor& dep_token) {
     sym_constrain_range_native(size, min, max);
     return ops::clone(dep_token);
 }
 
-Tensor functional_sym_constrain_range_for_size_native(Scalar size,
+Tensor functional_sym_constrain_range_for_size_native(const Scalar& size,
                                                       std::optional<int64_t> min,
                                                       std::optional<int64_t> max,
                                                       const Tensor& dep_token) {

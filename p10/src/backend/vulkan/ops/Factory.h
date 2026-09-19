@@ -44,11 +44,11 @@ Tensor ones_like_kernel(const Tensor& self, DType dtype, std::optional<Device> d
 
 Tensor full_like_kernel(
     const Tensor& self,
-    Scalar fill_value,
+    const Scalar& fill_value,
     DType dtype,
     std::optional<Device> device);
 
-Tensor& fill_kernel(Tensor& self, Scalar value);
+Tensor& fill_kernel(Tensor& self, const Scalar& value);
 
 } // namespace ops
 } // namespace vulkan

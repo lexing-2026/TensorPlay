@@ -434,11 +434,11 @@ Tensor& binary_op_scalar_inplace(
 
 } // namespace
 
-Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
+Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) {
   return binary_op_tensor("add", "buffer_add", self, other, alpha, "add");
 }
 
-Tensor sub_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
+Tensor sub_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) {
   return binary_op_tensor("sub", "buffer_sub", self, other, alpha, "sub");
 }
 
@@ -455,22 +455,22 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
   return binary_op_tensor("div", "buffer_div", self, other, Scalar(1.0), "div");
 }
 
-Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
+Tensor add_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& alpha) {
   return binary_op_scalar("add_scalar", "buffer_add_scalar", self, other,
                           alpha, "add");
 }
 
-Tensor sub_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
+Tensor sub_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& alpha) {
   return binary_op_scalar("add_scalar", "buffer_add_scalar", self,
                           Scalar(-other.toDouble()), alpha, "add");
 }
 
-Tensor mul_scalar_kernel(const Tensor& self, Scalar other) {
+Tensor mul_scalar_kernel(const Tensor& self, const Scalar& other) {
   return binary_op_scalar("mul_scalar", "buffer_mul_scalar", self, other,
                           Scalar(1.0), "mul");
 }
 
-Tensor div_scalar_kernel(const Tensor& self, Scalar other) {
+Tensor div_scalar_kernel(const Tensor& self, const Scalar& other) {
   if (self.dtype() == DType::Int32) {
     return binary_op_scalar(
         "mul_scalar", "buffer_mul_scalar", self.to(DType::Float32),
@@ -480,12 +480,12 @@ Tensor div_scalar_kernel(const Tensor& self, Scalar other) {
                           Scalar(1.0 / other.toDouble()), Scalar(1.0), "mul");
 }
 
-Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
+Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, const Scalar& alpha) {
   return binary_op_tensor_inplace("addinplace", "buffer_addinplace", self,
                                   other, alpha, "add");
 }
 
-Tensor& sub_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
+Tensor& sub_inplace_kernel(Tensor& self, const Tensor& other, const Scalar& alpha) {
   return binary_op_tensor_inplace("subinplace", "buffer_subinplace", self,
                                   other, alpha, "sub");
 }
@@ -500,13 +500,13 @@ Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
                                   other, Scalar(1.0), "div");
 }
 
-Tensor& add_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
+Tensor& add_scalar_inplace_kernel(Tensor& self, const Scalar& other, const Scalar& alpha) {
   return binary_op_scalar_inplace("add_scalarinplace",
                                   "buffer_add_scalarinplace",
                                   self, other, alpha, "add");
 }
 
-Tensor& mul_scalar_inplace_kernel(Tensor& self, Scalar other) {
+Tensor& mul_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
   return binary_op_scalar_inplace("mul_scalarinplace",
                                   "buffer_mul_scalarinplace",
                                   self, other, Scalar(1.0), "mul");
@@ -514,13 +514,13 @@ Tensor& mul_scalar_inplace_kernel(Tensor& self, Scalar other) {
 
 // The subtraction in-place scalar flavor uses the add writer with the
 // negated product: x -= y * alpha runs as x += -(y * alpha).
-Tensor& sub_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
+Tensor& sub_scalar_inplace_kernel(Tensor& self, const Scalar& other, const Scalar& alpha) {
   return binary_op_scalar_inplace("add_scalarinplace",
                                   "buffer_add_scalarinplace",
                                   self, other, Scalar(-alpha.toDouble()), "add");
 }
 
-Tensor& div_scalar_inplace_kernel(Tensor& self, Scalar other) {
+Tensor& div_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
   TP_CHECK(
       other.toDouble() != 0.0,
       "div_.Scalar: can't divide by zero");
@@ -537,7 +537,7 @@ Tensor floor_divide_kernel(const Tensor& self, const Tensor& other) {
                           Scalar(1.0), "floor_divide");
 }
 
-Tensor floor_divide_scalar_kernel(const Tensor& self, Scalar other) {
+Tensor floor_divide_scalar_kernel(const Tensor& self, const Scalar& other) {
   TP_CHECK(
       other.toDouble() != 0.0,
       "floor_divide.Scalar: can't divide by zero");
@@ -552,7 +552,7 @@ Tensor& floor_divide_inplace_kernel(Tensor& self, const Tensor& other) {
                                   self, other, Scalar(1.0), "floor_divide");
 }
 
-Tensor& floor_divide_scalar_inplace_kernel(Tensor& self, Scalar other) {
+Tensor& floor_divide_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
   TP_CHECK(
       other.toDouble() != 0.0,
       "floor_divide_.Scalar: can't divide by zero");
@@ -566,13 +566,13 @@ Tensor& floor_divide_scalar_inplace_kernel(Tensor& self, Scalar other) {
  * Scalar-base power: the base broadcast comes in as the shader's scalar
  * argument while the tensor operand supplies the exponents.
  */
-Tensor pow_scalar_base_kernel(Scalar base, const Tensor& self) {
+Tensor pow_scalar_base_kernel(const Scalar& base, const Tensor& self) {
   return binary_op_scalar(
       "pow_scalar_tensor", "pow_scalar_tensor", self, base,
       Scalar(1.0), "pow");
 }
 
-Tensor& pow_tensor_scalar_inplace_kernel(Tensor& self, Scalar exponent) {
+Tensor& pow_tensor_scalar_inplace_kernel(Tensor& self, const Scalar& exponent) {
   return binary_op_scalar_inplace(
       "pow_tensor_scalarinplace", "pow_tensor_scalarinplace", self, exponent,
       Scalar(1.0), "pow");
@@ -613,12 +613,17 @@ Tensor atan2_kernel(const Tensor& self, const Tensor& other) {
                           Scalar(1.0), "atan2");
 }
 
+Tensor& atan2__kernel(Tensor& self, const Tensor& other) {
+  self.copy_(atan2_kernel(self, other));
+  return self;
+}
+
 Tensor logaddexp_kernel(const Tensor& self, const Tensor& other) {
   return binary_op_tensor("logaddexp", "buffer_logaddexp", self, other,
                           Scalar(1.0), "logaddexp");
 }
 
-Tensor rsub_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
+Tensor rsub_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& alpha) {
   return binary_op_scalar("rsub_scalar", "buffer_rsub_scalar", self, other,
                           alpha, "rsub");
 }
@@ -627,7 +632,7 @@ Tensor true_divide_kernel(const Tensor& self, const Tensor& other) {
   return div_kernel(self, other);
 }
 
-Tensor true_divide_scalar_kernel(const Tensor& self, Scalar other) {
+Tensor true_divide_scalar_kernel(const Tensor& self, const Scalar& other) {
   TP_CHECK(
       other.toDouble() != 0.0,
       "true_divide.Scalar: can't divide by zero");
@@ -638,12 +643,12 @@ Tensor divide_tensor_kernel(const Tensor& self, const Tensor& other) {
   return div_kernel(self, other);
 }
 
-Tensor divide_scalar_kernel(const Tensor& self, Scalar other) {
+Tensor divide_scalar_kernel(const Tensor& self, const Scalar& other) {
   return true_divide_scalar_kernel(self, other);
 }
 
 Tensor subtract_tensor_kernel(const Tensor& self, const Tensor& other,
-                              Scalar alpha) {
+                              const Scalar& alpha) {
   return binary_op_tensor("sub", "buffer_sub", self, other, alpha, "subtract");
 }
 
@@ -692,7 +697,7 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, BinaryOpKernels) {
   m.impl("remainder.Tensor", &tensorplay::vulkan::ops::remainder_kernel);
   m.impl("fmod.Tensor", &tensorplay::vulkan::ops::fmod_kernel);
   m.impl("atan2", &tensorplay::vulkan::ops::atan2_kernel);
-  m.impl("atan2_", &tensorplay::vulkan::ops::atan2_kernel);
+  m.impl("atan2_", &tensorplay::vulkan::ops::atan2__kernel);
   m.impl("logaddexp", &tensorplay::vulkan::ops::logaddexp_kernel);
   m.impl("rsub.Scalar", &tensorplay::vulkan::ops::rsub_scalar_kernel);
   m.impl("rsub.Tensor", &tensorplay::vulkan::ops::subtract_tensor_kernel);

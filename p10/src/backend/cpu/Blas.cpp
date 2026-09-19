@@ -125,7 +125,7 @@ void addbmm_epilogue(Tensor& out, const Tensor& self_acc, const Tensor& work,
 // ---------------------------------------------------------------------------
 
 Tensor addmv_cpu(const Tensor& self, const Tensor& mat, const Tensor& vec,
-                 Scalar beta, Scalar alpha) {
+                 const Scalar& beta, const Scalar& alpha) {
     require_float(mat, "addmv");
     require_float(vec, "addmv");
     if (mat.dim() != 2) TP_THROW(RuntimeError, "addmv: mat must be a matrix");
@@ -198,7 +198,8 @@ Tensor addmv_cpu(const Tensor& self, const Tensor& mat, const Tensor& vec,
 // ---------------------------------------------------------------------------
 
 Tensor addbmm_cpu(const Tensor& self, const Tensor& batch1, const Tensor& batch2,
-                  Scalar beta, Scalar alpha) {
+                  const Scalar& beta_arg, const Scalar& alpha) {
+    Scalar beta = beta_arg;
     require_float(batch1, "addbmm");
     require_float(batch2, "addbmm");
     if (batch1.dim() != 3) TP_THROW(RuntimeError, "batch1 must be a 3D tensor");
@@ -304,7 +305,7 @@ Tensor addbmm_cpu(const Tensor& self, const Tensor& batch1, const Tensor& batch2
 // ---------------------------------------------------------------------------
 
 Tensor addr_cpu(const Tensor& self, const Tensor& vec1, const Tensor& vec2,
-                Scalar beta, Scalar alpha) {
+                const Scalar& beta, const Scalar& alpha) {
     require_float(vec1, "addr");
     require_float(vec2, "addr");
     const int64_t m = vec1.numel(), k = vec2.numel();

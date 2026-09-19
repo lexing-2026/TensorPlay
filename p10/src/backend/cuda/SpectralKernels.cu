@@ -587,7 +587,7 @@ Tensor extract_real_part_cuda(const Tensor& z) {
 
 }  // namespace
 
-Tensor fft_fft_cuda(const Tensor& self, int64_t n, int64_t dim, std::string norm) {
+Tensor fft_fft_cuda(const Tensor& self, int64_t n, int64_t dim, const std::string& norm) {
     const bool real_in = !is_cplx(self.dtype());
     Tensor inp = real_in
         ? (self.dtype() == DType::Float64 ? promote_real_for_c2c_cuda<true>(self)
@@ -607,7 +607,7 @@ Tensor fft_fft_cuda(const Tensor& self, int64_t n, int64_t dim, std::string norm
     return finish_layout(std::move(out), inv);
 }
 
-Tensor fft_ifft_cuda(const Tensor& self, int64_t n, int64_t dim, std::string norm) {
+Tensor fft_ifft_cuda(const Tensor& self, int64_t n, int64_t dim, const std::string& norm) {
     const bool real_in = !is_cplx(self.dtype());
     Tensor inp = real_in
         ? (self.dtype() == DType::Float64 ? promote_real_for_c2c_cuda<true>(self)
@@ -627,7 +627,7 @@ Tensor fft_ifft_cuda(const Tensor& self, int64_t n, int64_t dim, std::string nor
     return finish_layout(std::move(out), inv);
 }
 
-Tensor fft_rfft_cuda(const Tensor& self, int64_t n, int64_t dim, std::string norm) {
+Tensor fft_rfft_cuda(const Tensor& self, int64_t n, int64_t dim, const std::string& norm) {
     TP_CHECK(!is_cplx(self.dtype()), "fft.rfft expects a real input");
     TP_CHECK(self.dim() >= 1, "rfft expects at least 1 dimension");
     dim = wrap_dim(dim, self.dim());
@@ -643,7 +643,7 @@ Tensor fft_rfft_cuda(const Tensor& self, int64_t n, int64_t dim, std::string nor
     return finish_layout(std::move(out), inv);
 }
 
-Tensor fft_irfft_cuda(const Tensor& self, int64_t n, int64_t dim, std::string norm) {
+Tensor fft_irfft_cuda(const Tensor& self, int64_t n, int64_t dim, const std::string& norm) {
     TP_CHECK(is_cplx(self.dtype()), "fft.irfft expects a complex input");
     TP_CHECK(self.dim() >= 1, "irfft expects at least 1 dimension");
     dim = wrap_dim(dim, self.dim());
@@ -667,7 +667,7 @@ Tensor fft_irfft_cuda(const Tensor& self, int64_t n, int64_t dim, std::string no
 //   _fft_c2c: _fft_c2c(grad, dim, normalization, !forward)
 // ---------------------------------------------------------------------------
 
-Tensor fft_fft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t dim, std::string norm) {
+Tensor fft_fft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t dim, const std::string& norm) {
     dim = wrap_dim(dim, self.dim());
     const bool real_primal = !is_cplx(self.dtype());
     auto [g, inv] = prepare_lastdim(grad, dim);
@@ -685,7 +685,7 @@ Tensor fft_fft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t dim
         : std::move(out);
 }
 
-Tensor fft_ifft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t dim, std::string norm) {
+Tensor fft_ifft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t dim, const std::string& norm) {
     dim = wrap_dim(dim, self.dim());
     const bool real_primal = !is_cplx(self.dtype());
     auto [g, inv] = prepare_lastdim(grad, dim);
@@ -721,7 +721,7 @@ Tensor rfft_backward_core_cuda(const Tensor& g, int64_t input_len, fft_norm_mode
 }
 }  // namespace
 
-Tensor fft_rfft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t dim, std::string norm) {
+Tensor fft_rfft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t dim, const std::string& norm) {
     dim = wrap_dim(dim, self.dim());
     auto [g, inv] = prepare_lastdim(grad, dim);
     const int64_t input_len = self.size(dim);
@@ -750,7 +750,7 @@ Tensor irfft_backward_core(const Tensor& g, int64_t freq_bins, fft_norm_mode mod
 }
 }  // namespace
 
-Tensor fft_irfft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t dim, std::string norm) {
+Tensor fft_irfft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t dim, const std::string& norm) {
     dim = wrap_dim(dim, self.dim());
     auto [g, inv] = prepare_lastdim(grad, dim);
     const int64_t freq_bins = self.size(dim);
@@ -971,7 +971,7 @@ Tensor stft_cuda_impl(const Tensor& work, int64_t n_fft, int64_t hop, int64_t wi
 
 Tensor stft_cuda(const Tensor& self, int64_t n_fft, std::optional<int64_t> hop_length,
                  std::optional<int64_t> win_length, const std::optional<Tensor>& window,
-                 bool center, std::string pad_mode, bool normalized, bool onesided,
+                 bool center, const std::string& pad_mode, bool normalized, bool onesided,
                  bool return_complex) {
     TP_CHECK(!is_cplx(self.dtype()), "stft: expected a real floating point input");
     TP_CHECK(self.dim() >= 1 && self.dim() <= 2, "stft: expected 1D or 2D input");
@@ -1378,7 +1378,7 @@ Tensor stft_backward_cuda_impl(const Tensor& grad_output, const Tensor& self, in
 Tensor stft_backward_cuda(const Tensor& grad_output, const Tensor& self, int64_t n_fft,
                           std::optional<int64_t> hop_length, std::optional<int64_t> win_length,
                           const std::optional<Tensor>& window, bool center,
-                          std::string pad_mode, bool normalized, bool onesided) {
+                          const std::string& pad_mode, bool normalized, bool onesided) {
     TP_CHECK(!is_cplx(self.dtype()), "stft_backward: expected real input");
     TP_CHECK(!center || pad_mode == "constant" || pad_mode == "reflect",
              "stft_backward: unsupported pad_mode (use constant|reflect)");

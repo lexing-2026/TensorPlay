@@ -40,6 +40,7 @@
 
 #ifdef _OPENMP
 #include <omp.h>
+#include "OutWrite.h"
 #endif
 
 namespace tensorplay {
@@ -47,8 +48,8 @@ namespace cpu {
 using namespace tensorplay::parallel;
 
 // Forward declarations for the scalar fallback used by the fused kernel.
-Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha);
-Tensor mul_scalar_kernel(const Tensor& self, Scalar other);
+Tensor add_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& alpha);
+Tensor mul_scalar_kernel(const Tensor& self, const Scalar& other);
 Tensor& relu_inplace_kernel(Tensor& self);
 
 // --- AVX-512 runtime-dispatched contiguous binary kernels -------------------
@@ -671,7 +672,7 @@ bool try_add_tensor_iterator_out(const Tensor& self, const Tensor& other,
     return true;
 }
 
-Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
+Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) {
 #if defined(__x86_64__)
     bool plain_layout = true;
 #ifdef USE_ONEDNN
@@ -1172,7 +1173,7 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
     return result;
 }
 
-Tensor& add_out_kernel(const Tensor& self, const Tensor& other, Scalar alpha,
+Tensor& add_out_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha,
                        Tensor& out) {
     if (self.device() != other.device() || self.device() != out.device()) {
         TP_THROW(DeviceMismatchError,
@@ -1262,7 +1263,7 @@ Tensor add_relu_cpu(const Tensor& self, const Tensor& other) {
     return relu_inplace_kernel(result);
 }
 
-Tensor sub_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
+Tensor sub_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) {
     if (self.dtype() == DType::Bool && other.dtype() == DType::Bool) {
         TP_THROW(RuntimeError,
                  "Subtraction, the `-` operator, with two bool tensors is not "
@@ -1646,7 +1647,7 @@ Tensor fused_mul_add_kernel(const Tensor& self, const Tensor& other, const Tenso
     return add_kernel(mul_kernel(self, other), addend, Scalar(1));
 }
 
-Tensor fused_mul_add_scalar_kernel(const Tensor& self, Scalar other, Scalar addend) {
+Tensor fused_mul_add_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& addend) {
     if (self.dtype() == DType::Float32 && self.is_contiguous()) {
         Tensor result = Tensor::empty(
             static_cast<std::vector<int64_t>>(self.shape()), DType::Float32, self.device());
@@ -1668,7 +1669,7 @@ Tensor fused_mul_add_scalar_kernel(const Tensor& self, Scalar other, Scalar adde
 
 // --- Inplace Binary Kernels ---
 
-Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
+Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, const Scalar& alpha) {
     if (other.is_sparse()) {
         return add_sparse_to_dense_cpu(self, other, alpha);
     }
@@ -2059,7 +2060,7 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
     return self;
 }
 
-Tensor& sub_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
+Tensor& sub_inplace_kernel(Tensor& self, const Tensor& other, const Scalar& alpha) {
     if (alpha.isFloatingPoint()) {
         return add_inplace_kernel(self, other, Scalar(-alpha.toDouble()));
     } else {
@@ -2381,7 +2382,7 @@ inline DType scalar_result_dtype(DType self_dt, const Scalar& other,
 }
 } // namespace
 
-Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
+Tensor add_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& alpha) {
     DType result_dtype = scalar_result_dtype(self.dtype(), other, &alpha);
 
 #if defined(__x86_64__)
@@ -2436,7 +2437,7 @@ Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
     return result;
 }
 
-Tensor sub_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
+Tensor sub_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& alpha) {
     DType result_dtype = scalar_result_dtype(self.dtype(), other, &alpha);
 
 #if defined(__x86_64__)
@@ -2490,7 +2491,7 @@ Tensor sub_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
     return result;
 }
 
-Tensor mul_scalar_kernel(const Tensor& self, Scalar other) {
+Tensor mul_scalar_kernel(const Tensor& self, const Scalar& other) {
     DType result_dtype = scalar_result_dtype(self.dtype(), other);
 
 #if defined(__x86_64__)
@@ -2552,7 +2553,7 @@ Tensor mul_scalar_kernel(const Tensor& self, Scalar other) {
     return result;
 }
 
-Tensor div_scalar_kernel(const Tensor& self, Scalar other) {
+Tensor div_scalar_kernel(const Tensor& self, const Scalar& other) {
     // True division promotes integral tensors to Float32 (or ComplexFloat
     // for a wrapped complex divisor), while preserving floating tensor
     DType result_dtype = self.dtype();
@@ -2626,7 +2627,7 @@ Tensor div_scalar_kernel(const Tensor& self, Scalar other) {
 }
 
 // Inplace Scalar
-Tensor& add_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
+Tensor& add_scalar_inplace_kernel(Tensor& self, const Scalar& other, const Scalar& alpha) {
 #if defined(__x86_64__)
     if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
         !other.isComplex() && !alpha.isComplex() && self.is_contiguous() &&
@@ -2662,7 +2663,7 @@ Tensor& add_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
     return self;
 }
 
-Tensor& sub_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
+Tensor& sub_scalar_inplace_kernel(Tensor& self, const Scalar& other, const Scalar& alpha) {
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         auto op = [other, alpha](ctype a) -> ctype { \
@@ -2681,7 +2682,7 @@ Tensor& sub_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
     return self;
 }
 
-Tensor& mul_scalar_inplace_kernel(Tensor& self, Scalar other) {
+Tensor& mul_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
 #if defined(__x86_64__)
     if (self.dtype() == DType::Float32 && !other.isComplex() &&
         self.is_contiguous() && cpu_has_avx512()) {
@@ -2727,7 +2728,7 @@ Tensor& mul_scalar_inplace_kernel(Tensor& self, Scalar other) {
     return self;
 }
 
-Tensor& div_scalar_inplace_kernel(Tensor& self, Scalar other) {
+Tensor& div_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
 #if defined(__x86_64__)
     if (self.dtype() == DType::Float32 && !other.isComplex() &&
         self.is_contiguous() && cpu_has_avx512()) {
@@ -2778,7 +2779,7 @@ Tensor& div_scalar_inplace_kernel(Tensor& self, Scalar other) {
 // composing mul() and add() here would reintroduce the Python/composite
 // implementation that this operator is meant to replace.
 Tensor addcmul_cpu(const Tensor& self, const Tensor& tensor1,
-                   const Tensor& tensor2, Scalar value) {
+                   const Tensor& tensor2, const Scalar& value) {
     if (self.dtype() == DType::Float32 && tensor1.dtype() == DType::Float32 &&
         tensor2.dtype() == DType::Float32 && self.is_contiguous() &&
         tensor1.is_contiguous() && tensor2.is_contiguous() &&
@@ -2851,7 +2852,7 @@ Tensor addcmul_cpu(const Tensor& self, const Tensor& tensor1,
 }
 
 Tensor& addcmul_inplace_cpu(Tensor& self, const Tensor& tensor1,
-                            const Tensor& tensor2, Scalar value) {
+                            const Tensor& tensor2, const Scalar& value) {
     if (self.dtype() == DType::Float32 && tensor1.dtype() == DType::Float32 &&
         tensor2.dtype() == DType::Float32 && self.is_contiguous() &&
         tensor1.is_contiguous() && tensor2.is_contiguous() &&
@@ -2919,13 +2920,13 @@ Tensor& addcmul_inplace_cpu(Tensor& self, const Tensor& tensor1,
 }
 
 Tensor& addcmul_out_cpu(const Tensor& self, const Tensor& tensor1,
-                        const Tensor& tensor2, Scalar value, Tensor& out) {
-    out = addcmul_cpu(self, tensor1, tensor2, value);
+                        const Tensor& tensor2, const Scalar& value, Tensor& out) {
+    write_out(out, addcmul_cpu(self, tensor1, tensor2, value));
     return out;
 }
 
 Tensor addcdiv_cpu(const Tensor& self, const Tensor& tensor1,
-                   const Tensor& tensor2, Scalar value) {
+                   const Tensor& tensor2, const Scalar& value) {
     if (isIntegralType(tensor1.dtype(), true) && isIntegralType(tensor2.dtype(), true)) {
         TP_THROW(RuntimeError, "Integer division with addcdiv is not supported");
     }
@@ -3001,7 +3002,7 @@ Tensor addcdiv_cpu(const Tensor& self, const Tensor& tensor1,
 }
 
 Tensor& addcdiv_inplace_cpu(Tensor& self, const Tensor& tensor1,
-                            const Tensor& tensor2, Scalar value) {
+                            const Tensor& tensor2, const Scalar& value) {
     if (isIntegralType(tensor1.dtype(), true) && isIntegralType(tensor2.dtype(), true)) {
         TP_THROW(RuntimeError, "Integer division with addcdiv is not supported");
     }

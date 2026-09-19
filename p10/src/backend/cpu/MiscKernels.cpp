@@ -22,6 +22,7 @@
 #include <limits>
 #include <numeric>
 #include <tuple>
+#include "OutWrite.h"
 
 namespace tensorplay {
 namespace cpu {
@@ -41,14 +42,14 @@ std::tuple<Tensor, Tensor> native_alpha_dropout_cpu(const Tensor& input, double 
 Tensor alpha_dropout_backward_cpu(const Tensor& grad, const Tensor& mask, double p);
 std::tuple<Tensor, Tensor> native_feature_dropout_cpu(const Tensor& input, double p);
 Tensor feature_dropout_backward_cpu(const Tensor& grad, const Tensor& mask, double p);
-Tensor trapezoid_cpu(const Tensor& y, const std::optional<Tensor>& x, Scalar dx, int64_t dim);
-Tensor cumulative_trapezoid_cpu(const Tensor& y, const std::optional<Tensor>& x, Scalar dx, int64_t dim);
+Tensor trapezoid_cpu(const Tensor& y, const std::optional<Tensor>& x, const Scalar& dx, int64_t dim);
+Tensor cumulative_trapezoid_cpu(const Tensor& y, const std::optional<Tensor>& x, const Scalar& dx, int64_t dim);
 Tensor trapezoid_backward_cpu(const Tensor& grad, const std::optional<Tensor>& x,
-                              const std::vector<int64_t>& ysizes, Scalar dx,
+                              const std::vector<int64_t>& ysizes, const Scalar& dx,
                               int64_t dim);
 Tensor cumulative_trapezoid_backward_cpu(const Tensor& grad,
                                          const std::optional<Tensor>& x_opt,
-                                         Scalar dx_s, int64_t dim);
+                                         const Scalar& dx_s, int64_t dim);
 Tensor cov_cpu(const Tensor& self, int64_t correction,
                const std::optional<Tensor>& fweights_opt,
                const std::optional<Tensor>& aweights_opt);
@@ -59,10 +60,10 @@ Tensor cov_backward_cpu(const Tensor& grad, const Tensor& self, int64_t correcti
 Tensor corrcoef_backward_cpu(const Tensor& grad, const Tensor& self);
 Tensor quantile_kernel(const Tensor& self, const Tensor& q,
                        std::optional<int64_t> dim, bool keepdim,
-                       std::string interpolation);
+                       const std::string& interpolation);
 Tensor nanquantile_kernel(const Tensor& self, const Tensor& q,
                           std::optional<int64_t> dim, bool keepdim,
-                          std::string interpolation);
+                          const std::string& interpolation);
 std::tuple<Tensor, Tensor> histogram_bins_tensor_kernel(
     const Tensor& self, const Tensor& bins,
     const std::optional<Tensor>& weight, bool density);
@@ -366,7 +367,7 @@ Tensor hash_tensor_cpu(const Tensor& self, const std::vector<int64_t>& dims,
 Tensor& hash_tensor_out_cpu(const Tensor& self, const std::vector<int64_t>& dims,
                             bool keepdim, int64_t mode, Tensor& result) {
     if (!result.defined()) {
-        result = hash_tensor_cpu(self, dims, keepdim, mode);
+        write_out(result, hash_tensor_cpu(self, dims, keepdim, mode));
         return result;
     }
     std::vector<int64_t> wrapped;
@@ -780,7 +781,7 @@ Tensor segment_widths(const Tensor& x, int64_t d) {
 
 } // anonymous namespace
 
-Tensor trapezoid_cpu(const Tensor& y, const std::optional<Tensor>& x_opt, Scalar dx_s, int64_t dim) {
+Tensor trapezoid_cpu(const Tensor& y, const std::optional<Tensor>& x_opt, const Scalar& dx_s, int64_t dim) {
     const double dx = dx_s.toDouble();
     const Tensor x = x_opt.value_or(Tensor());
     const int64_t d = trapz_dim(dim, y.dim());
@@ -805,7 +806,7 @@ Tensor trapezoid_cpu(const Tensor& y, const std::optional<Tensor>& x_opt, Scalar
 }
 
 Tensor cumulative_trapezoid_cpu(const Tensor& y, const std::optional<Tensor>& x_opt,
-                                Scalar dx_s, int64_t dim) {
+                                const Scalar& dx_s, int64_t dim) {
     const double dx = dx_s.toDouble();
     const Tensor x = x_opt.value_or(Tensor());
     const int64_t d = trapz_dim(dim, y.dim());
@@ -841,7 +842,7 @@ Tensor apply_sum_weights(const Tensor& grad, int64_t d, const Tensor& w1d) {
 } // anonymous namespace
 
 Tensor trapezoid_backward_cpu(const Tensor& grad, const std::optional<Tensor>& x_opt,
-                              const std::vector<int64_t>& ysizes, Scalar dx_s,
+                              const std::vector<int64_t>& ysizes, const Scalar& dx_s,
                               int64_t dim) {
     const double dx = dx_s.toDouble();
     const Tensor x = x_opt.value_or(Tensor());
@@ -862,7 +863,7 @@ Tensor trapezoid_backward_cpu(const Tensor& grad, const std::optional<Tensor>& x
 }
 
 Tensor cumulative_trapezoid_backward_cpu(const Tensor& grad, const std::optional<Tensor>& x_opt,
-                                         Scalar dx_s, int64_t dim) {
+                                         const Scalar& dx_s, int64_t dim) {
     // Each output element k accumulates segments 0..k; y_j is the right end
     // of segment j-1 and the left end of segment j:
     //   g_y[j] = w[j]*suffix(j) + w[j-1]*suffix(j-1)
@@ -1324,7 +1325,7 @@ Tensor quantile_compute(const Tensor& self, const Tensor& q,
 
 Tensor quantile_kernel(const Tensor& self, const Tensor& q,
                        std::optional<int64_t> dim, bool keepdim,
-                       std::string interpolation) {
+                       const std::string& interpolation) {
     quantile_checks(self, q);
     const QuantileInterp mode = get_quantile_interpolation_mode(interpolation);
     int64_t wrapped_dim = dim.has_value() ? dim.value() : 0;
@@ -1342,7 +1343,7 @@ Tensor quantile_kernel(const Tensor& self, const Tensor& q,
 
 Tensor nanquantile_kernel(const Tensor& self, const Tensor& q,
                           std::optional<int64_t> dim, bool keepdim,
-                          std::string interpolation) {
+                          const std::string& interpolation) {
     quantile_checks(self, q);
     const QuantileInterp mode = get_quantile_interpolation_mode(interpolation);
     int64_t wrapped_dim = dim.has_value() ? dim.value() : 0;

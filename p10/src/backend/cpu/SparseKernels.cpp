@@ -68,8 +68,9 @@ std::vector<int64_t> dense_shape_for(const Tensor& sparse) {
 } // namespace
 
 Tensor sparse_coo_tensor_cpu(const Tensor& indices, const Tensor& values,
-                             std::optional<std::vector<int64_t>> size,
+                             const std::optional<std::vector<int64_t>>& size_arg,
                              bool is_coalesced) {
+    std::optional<std::vector<int64_t>> size = size_arg;
     // and the values shape (dense dims).  The reduction needs host data, so
     // CUDA indices are staged through the CPU like coalesce_cuda does.
     if (!size.has_value()) {
@@ -772,7 +773,7 @@ Tensor sparse_mm_cpu(const Tensor& self, const Tensor& dense) {
 // surviving coordinate rows, rebuilds the COO over the kept dims and folds
 // duplicate coordinates via coalesce(), returning a sparse tensor.  ``dtype``
 // converts the input first, acting as the accumulation type.
-Tensor sparse_sum_cpu(const Tensor& self, std::optional<std::vector<int64_t>> dim,
+Tensor sparse_sum_cpu(const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
                       std::optional<DType> dtype) {
     if (!self.is_sparse()) {
         TP_THROW(RuntimeError, "sparse_sum(): expected a sparse tensor");
@@ -997,7 +998,7 @@ Tensor coo_to_csr_cpu(const Tensor& coalesced, int64_t rows) {
 } // namespace
 
 Tensor spdiags_cpu(const Tensor& diagonals, const Tensor& offsets,
-                   std::vector<int64_t> shape,
+                   const std::vector<int64_t>& shape,
                    std::optional<int64_t> layout) {
     if (layout.has_value() && *layout != 0 && *layout != 1) {
         TP_THROW(ValueError,
@@ -1596,18 +1597,19 @@ Tensor _sparse_sum_dim_cpu(const Tensor& input, std::vector<int64_t> dims_to_sum
 }
 
 Tensor _sparse_sum_dim_dtype_cpu(const Tensor& input,
-                                 std::vector<int64_t> dims_to_sum,
+                                 const std::vector<int64_t>& dims_to_sum,
                                  DType dtype) {
     return _sparse_sum_dim_cpu(input, std::move(dims_to_sum), dtype);
 }
 
 Tensor _sparse_sum_dim_cpu_2(const Tensor& input,
-                             std::vector<int64_t> dims_to_sum) {
+                             const std::vector<int64_t>& dims_to_sum) {
     return _sparse_sum_dim_cpu(input, std::move(dims_to_sum), std::nullopt);
 }
 
 Tensor _sparse_sum_backward_cpu(const Tensor& grad_, const Tensor& input_,
-                                std::vector<int64_t> dims_to_sum) {
+                                const std::vector<int64_t>& dims_to_sum_arg) {
+    std::vector<int64_t> dims_to_sum = dims_to_sum_arg;
     TP_CHECK(input_.is_sparse() && !input_.is_sparse_compressed(),
              "_sparse_sum_backward(): expected a sparse COO tensor");
     if ((grad_.is_sparse() && grad_._nnz() == 0) || grad_.numel() == 0) {
@@ -1760,12 +1762,12 @@ Tensor _sparse_sum_backward_cpu(const Tensor& grad_, const Tensor& input_,
 // must not be hybrid, and the reduced values carry the dense norm.
 // ---------------------------------------------------------------------------
 
-Tensor native_norm_cpu(const Tensor& self, Scalar p) {
+Tensor native_norm_cpu(const Tensor& self, const Scalar& p) {
     return native_norm_dim_cpu(self, p, {}, false, std::nullopt);
 }
 
-Tensor native_norm_dim_cpu(const Tensor& self, std::optional<Scalar> p,
-                           std::vector<int64_t> dims, bool keepdim,
+Tensor native_norm_dim_cpu(const Tensor& self, const std::optional<Scalar>& p,
+                           const std::vector<int64_t>& dims, bool keepdim,
                            std::optional<DType> dtype) {
     TP_CHECK(self.is_sparse(), "norm(): expected a sparse tensor");
     if (!dims.empty()) {

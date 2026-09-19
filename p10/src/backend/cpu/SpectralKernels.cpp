@@ -253,7 +253,7 @@ Tensor promote_real_input_for_c2c(const Tensor& self) {
 }
 }  // namespace
 
-Tensor fft_fft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string norm) {
+Tensor fft_fft_cpu(const Tensor& self, int64_t n, int64_t dim, const std::string& norm) {
     Tensor x_in = is_cplx(self.dtype()) ? self.contiguous() : promote_real_input_for_c2c(self);
     TP_CHECK(x_in.dim() >= 1, "fft expects at least 1 dimension");
     dim = wrap_dim(dim, x_in.dim());
@@ -266,7 +266,7 @@ Tensor fft_fft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string norm)
     return core_c2c<double>(x_in, dim, n_eff, mode, true);
 }
 
-Tensor fft_ifft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string norm) {
+Tensor fft_ifft_cpu(const Tensor& self, int64_t n, int64_t dim, const std::string& norm) {
     Tensor x_in = is_cplx(self.dtype()) ? self.contiguous() : promote_real_input_for_c2c(self);
     TP_CHECK(x_in.dim() >= 1, "ifft expects at least 1 dimension");
     dim = wrap_dim(dim, x_in.dim());
@@ -279,7 +279,7 @@ Tensor fft_ifft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string norm
     return core_c2c<double>(x_in, dim, n_eff, mode, false);
 }
 
-Tensor fft_rfft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string norm) {
+Tensor fft_rfft_cpu(const Tensor& self, int64_t n, int64_t dim, const std::string& norm) {
     TP_CHECK(!is_cplx(self.dtype()), "fft.rfft expects a real input");
     TP_CHECK(self.dim() >= 1, "rfft expects at least 1 dimension");
     dim = wrap_dim(dim, self.dim());
@@ -294,7 +294,7 @@ Tensor fft_rfft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string norm
     return core_r2c<double>(x, dim, mode, true);
 }
 
-Tensor fft_irfft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string norm) {
+Tensor fft_irfft_cpu(const Tensor& self, int64_t n, int64_t dim, const std::string& norm) {
     TP_CHECK(is_cplx(self.dtype()), "fft.irfft expects a complex input");
     TP_CHECK(self.dim() >= 1, "irfft expects at least 1 dimension");
     dim = wrap_dim(dim, self.dim());
@@ -337,7 +337,7 @@ Tensor c2c_backward_core(const Tensor& grad, int64_t input_len, int64_t dim,
 }
 }  // namespace
 
-Tensor fft_fft_backward_cpu(const Tensor& grad, const Tensor& self, int64_t dim, std::string norm) {
+Tensor fft_fft_backward_cpu(const Tensor& grad, const Tensor& self, int64_t dim, const std::string& norm) {
     dim = wrap_dim(dim, self.dim());
     const int64_t input_len = self.size(dim);
     const bool real_primal = !is_cplx(self.dtype());
@@ -349,7 +349,7 @@ Tensor fft_fft_backward_cpu(const Tensor& grad, const Tensor& self, int64_t dim,
     return real_primal ? extract_real_part<double>(g) : g;
 }
 
-Tensor fft_ifft_backward_cpu(const Tensor& grad, const Tensor& self, int64_t dim, std::string norm) {
+Tensor fft_ifft_backward_cpu(const Tensor& grad, const Tensor& self, int64_t dim, const std::string& norm) {
     dim = wrap_dim(dim, self.dim());
     const int64_t input_len = self.size(dim);
     const bool real_primal = !is_cplx(self.dtype());
@@ -386,7 +386,7 @@ Tensor rfft_backward_core(const Tensor& grad, int64_t input_len, int64_t dim,
 }
 }  // namespace
 
-Tensor fft_rfft_backward_cpu(const Tensor& grad, const Tensor& self, int64_t dim, std::string norm) {
+Tensor fft_rfft_backward_cpu(const Tensor& grad, const Tensor& self, int64_t dim, const std::string& norm) {
     dim = wrap_dim(dim, self.dim());
     const auto mode = norm_from_string(norm, true);
     if (grad.dtype() == DType::ComplexFloat)
@@ -414,7 +414,7 @@ Tensor irfft_backward_core(const Tensor& grad, int64_t freq_bins, int64_t dim,
 }
 }  // namespace
 
-Tensor fft_irfft_backward_cpu(const Tensor& grad, const Tensor& self, int64_t dim, std::string norm) {
+Tensor fft_irfft_backward_cpu(const Tensor& grad, const Tensor& self, int64_t dim, const std::string& norm) {
     dim = wrap_dim(dim, self.dim());
     const auto mode = norm_from_string(norm, false);
     if (grad.dtype() == DType::Float32)
@@ -669,7 +669,7 @@ Tensor stft_impl(const Tensor& work, int64_t n_fft, int64_t hop, int64_t win,
 
 Tensor stft_cpu(const Tensor& self, int64_t n_fft, std::optional<int64_t> hop_length,
                 std::optional<int64_t> win_length, const std::optional<Tensor>& window,
-                bool center, std::string pad_mode, bool normalized, bool onesided,
+                bool center, const std::string& pad_mode, bool normalized, bool onesided,
                 bool return_complex) {
     TP_CHECK(!is_cplx(self.dtype()), "stft: complex input not supported; use a real waveform");
     TP_CHECK(self.dtype() == DType::Float32 || self.dtype() == DType::Float64,
@@ -919,7 +919,7 @@ Tensor istft_cpu(const Tensor& input, int64_t n_fft, std::optional<int64_t> hop_
 
 Tensor stft_backward_cpu(const Tensor& grad_output, const Tensor& self, int64_t n_fft,
                          std::optional<int64_t> hop_length, std::optional<int64_t> win_length,
-                         const std::optional<Tensor>& window, bool center, std::string pad_mode,
+                         const std::optional<Tensor>& window, bool center, const std::string& pad_mode,
                          bool normalized, bool onesided) {
     TP_CHECK(!is_cplx(self.dtype()), "stft_backward: expected real input");
     TP_CHECK(!center || pad_mode == "constant" || pad_mode == "reflect",

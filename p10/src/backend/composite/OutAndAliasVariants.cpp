@@ -18,6 +18,7 @@
 #include <string>
 #include <tuple>
 #include <vector>
+#include "OutWrite.h"
 
 namespace tensorplay {
 namespace composite {
@@ -26,25 +27,12 @@ namespace ops = tensorplay::tpx::ops;
 
 namespace {
 
-Tensor& write_out(Tensor& out, const Tensor& value) {
-    if (!out.defined()) {
-        out = value;
-        return out;
-    }
-    const auto target = static_cast<std::vector<int64_t>>(value.shape());
-    if (static_cast<std::vector<int64_t>>(out.shape()) != target) {
-        out.resize_(target);
-    }
-    out.copy_(value);
-    return out;
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------- comparison
 
 #define TP_COMPARE_OUT(name)                                                   \
-    Tensor& name##_scalar_out_native(const Tensor& self, Scalar other,         \
+    Tensor& name##_scalar_out_native(const Tensor& self, const Scalar& other,         \
                                      Tensor& out) {                            \
         return write_out(out, ops::name(self, other));                         \
     }                                                                          \
@@ -68,16 +56,16 @@ Tensor& pow_tensor_tensor_out_native(const Tensor& self, const Tensor& exponent,
     return write_out(out, ops::pow(self, exponent));
 }
 
-Tensor& pow_scalar_out_native(Scalar self, const Tensor& exponent, Tensor& out) {
+Tensor& pow_scalar_out_native(const Scalar& self, const Tensor& exponent, Tensor& out) {
     return write_out(out, ops::pow(self, exponent));
 }
 
-Tensor& pow_tensor_scalar_out_native(const Tensor& self, Scalar exponent,
+Tensor& pow_tensor_scalar_out_native(const Tensor& self, const Scalar& exponent,
                                      Tensor& out) {
     return write_out(out, ops::pow(self, exponent));
 }
 
-Tensor& fmod_scalar_out_native(const Tensor& self, Scalar other, Tensor& out) {
+Tensor& fmod_scalar_out_native(const Tensor& self, const Scalar& other, Tensor& out) {
     return write_out(out, ops::fmod(self, other));
 }
 
@@ -86,7 +74,7 @@ Tensor& fmod_tensor_out_native(const Tensor& self, const Tensor& other,
     return write_out(out, ops::fmod(self, other));
 }
 
-Tensor& remainder_scalar_out_native(const Tensor& self, Scalar other,
+Tensor& remainder_scalar_out_native(const Tensor& self, const Scalar& other,
                                     Tensor& out) {
     return write_out(out, ops::remainder(self, other));
 }
@@ -111,7 +99,7 @@ Tensor& div_out_native(const Tensor& self, const Tensor& other, Tensor& out) {
 }
 
 Tensor& div_out_mode_native(const Tensor& self, const Tensor& other,
-                            std::optional<std::string> rounding_mode,
+                            const std::optional<std::string>& rounding_mode,
                             Tensor& out) {
     return write_out(out, ops::div(self, other, rounding_mode));
 }
@@ -125,7 +113,7 @@ Tensor& mul_out_native(const Tensor& self, const Tensor& other, Tensor& out) {
     return write_out(out, ops::mul(self, other));
 }
 
-Tensor& sub_out_native(const Tensor& self, const Tensor& other, Scalar alpha,
+Tensor& sub_out_native(const Tensor& self, const Tensor& other, const Scalar& alpha,
                        Tensor& out) {
     return write_out(out, ops::sub(self, other, alpha));
 }
@@ -146,13 +134,13 @@ Tensor& isin_tensor_tensor_out_native(const Tensor& elements,
 }
 
 Tensor& isin_tensor_scalar_out_native(const Tensor& elements,
-                                      Scalar test_element, bool assume_unique,
+                                      const Scalar& test_element, bool assume_unique,
                                       bool invert, Tensor& out) {
     return write_out(out,
                      ops::isin(elements, test_element, assume_unique, invert));
 }
 
-Tensor& isin_scalar_tensor_out_native(Scalar element,
+Tensor& isin_scalar_tensor_out_native(const Scalar& element,
                                       const Tensor& test_elements,
                                       bool assume_unique, bool invert,
                                       Tensor& out) {
@@ -163,12 +151,12 @@ Tensor& isin_scalar_tensor_out_native(Scalar element,
 // ------------------------------------------------------- indexing / scatter
 
 Tensor index_fill_int_scalar_native(const Tensor& self, int64_t dim,
-                                    const Tensor& index, Scalar value) {
+                                    const Tensor& index, const Scalar& value) {
     return ops::index_fill(self, dim, index, value);
 }
 
 Tensor& index_fill__int_scalar_native(Tensor& self, int64_t dim,
-                                      const Tensor& index, Scalar value) {
+                                      const Tensor& index, const Scalar& value) {
     self.copy_(ops::index_fill(self, dim, index, value));
     return self;
 }
@@ -187,7 +175,7 @@ Tensor& index_fill__int_tensor_native(Tensor& self, int64_t dim,
 
 Tensor& scatter_reduce__two_native(Tensor& self, int64_t dim,
                                    const Tensor& index, const Tensor& src,
-                                   std::string reduce, bool include_self) {
+                                   const std::string& reduce, bool include_self) {
     self.copy_(ops::scatter_reduce(self, dim, index, src, reduce, include_self));
     return self;
 }

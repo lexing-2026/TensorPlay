@@ -10,6 +10,7 @@
 #include "GradMode.h"
 #include <cuda_runtime.h>
 #include <vector>
+#include "tensorplay/ops/TensorRedispatchGenerated.h"
 
 namespace tensorplay {
 namespace cuda {
@@ -435,7 +436,8 @@ static std::tuple<Tensor, Tensor, Tensor> rnn_cuda_impl(
     int kind,  // 0=lstm, 1=gru, 2=tanh, 3=relu
     const Tensor& input, const std::vector<Tensor>& hx,
     const std::vector<Tensor>& params, bool has_biases, int64_t num_layers,
-    bool bidirectional, bool batch_first) {
+    bool bidirectional, bool batch_first,
+    double dropout_p, bool training) {
     RnnForwardNoGrad no_grad_guard;
     using tensorplay::cuda::rnn::fused_gru_cell;
     using tensorplay::cuda::rnn::fused_lstm_cell;
@@ -519,6 +521,10 @@ static std::tuple<Tensor, Tensor, Tensor> rnn_cuda_impl(
             layer_out = Tensor::cat({dir_outs[0], dir_outs[1]}, 2);
         }
         x = layer_out;
+        // Dropout applies to every layer's output except the last one.
+        if (dropout_p != 0 && training && layer < L - 1) {
+            x = ::tensorplay::detail::redispatch_dropout_function(x, dropout_p, true);
+        }
     }
     Tensor y = batch_first ? x.transpose(0, 1).contiguous() : x;
     return {y, hn_out, cn_out};
@@ -530,37 +536,33 @@ std::tuple<Tensor, Tensor, Tensor> lstm_cuda(const Tensor& input,
                                              const std::vector<Tensor>& hx,
                                              const std::vector<Tensor>& params,
                                              bool has_biases, int64_t num_layers,
-                                             float dropout_p, bool training,
+                                             double dropout_p, bool training,
                                              bool bidirectional, bool batch_first) {
-    (void)dropout_p; (void)training;
     return rnn_cuda_impl(0, input, hx, params, has_biases, num_layers,
-                         bidirectional, batch_first);
+                         bidirectional, batch_first, dropout_p, training);
 }
 std::tuple<Tensor, Tensor> gru_cuda(const Tensor& input, const std::vector<Tensor>& hx,
                                     const std::vector<Tensor>& params, bool has_biases,
-                                    int64_t num_layers, float dropout_p, bool training,
+                                    int64_t num_layers, double dropout_p, bool training,
                                     bool bidirectional, bool batch_first) {
-    (void)dropout_p; (void)training;
     auto r = rnn_cuda_impl(1, input, hx, params, has_biases, num_layers,
-                           bidirectional, batch_first);
+                           bidirectional, batch_first, dropout_p, training);
     return {std::get<0>(r), std::get<1>(r)};
 }
 std::tuple<Tensor, Tensor> rnn_relu_cuda(const Tensor& input, const std::vector<Tensor>& hx,
                                          const std::vector<Tensor>& params, bool has_biases,
-                                         int64_t num_layers, float dropout_p, bool training,
+                                         int64_t num_layers, double dropout_p, bool training,
                                          bool bidirectional, bool batch_first) {
-    (void)dropout_p; (void)training;
     auto r = rnn_cuda_impl(3, input, hx, params, has_biases, num_layers,
-                           bidirectional, batch_first);
+                           bidirectional, batch_first, dropout_p, training);
     return {std::get<0>(r), std::get<1>(r)};
 }
 std::tuple<Tensor, Tensor> rnn_tanh_cuda(const Tensor& input, const std::vector<Tensor>& hx,
                                          const std::vector<Tensor>& params, bool has_biases,
-                                         int64_t num_layers, float dropout_p, bool training,
+                                         int64_t num_layers, double dropout_p, bool training,
                                          bool bidirectional, bool batch_first) {
-    (void)dropout_p; (void)training;
     auto r = rnn_cuda_impl(2, input, hx, params, has_biases, num_layers,
-                           bidirectional, batch_first);
+                           bidirectional, batch_first, dropout_p, training);
     return {std::get<0>(r), std::get<1>(r)};
 }
 

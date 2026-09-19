@@ -1642,16 +1642,9 @@ def rrelu(
 
     See :class:`~tensorplay.nn.RReLU` for more details.
     """
-    if training:
-        noise = lower + (upper - lower) * _C.rand(input.shape, device=input.device)
-        result = _C.rrelu_with_noise(input, noise, lower, upper, True)
-    else:
-        # Eval ignores noise (leaky slope (lower+upper)/2); pass input itself
-        # to avoid an allocation.
-        result = _C.rrelu_with_noise(input, input, lower, upper, False)
     if inplace:
-        return input.copy_(result)
-    return result
+        return _C.rrelu_(input, lower, upper, training)
+    return _C.rrelu(input, lower, upper, training)
 
 
 # -----------------------------------------------------------------------------

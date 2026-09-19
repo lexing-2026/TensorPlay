@@ -94,7 +94,7 @@ Tensor where_kernel(
 // Scalar variants fold into full tensors and reuse the tensor form.  The
 // folded tensor takes the branch dtype so the pair stays in one vocabulary.
 Tensor where_scalar_self_kernel(
-    const Tensor& condition, Scalar self, const Tensor& other) {
+    const Tensor& condition, const Scalar& self, const Tensor& other) {
   Tensor folded = full_kernel(
       static_cast<std::vector<int64_t>>(other.shape()),
       self,
@@ -105,7 +105,7 @@ Tensor where_scalar_self_kernel(
 }
 
 Tensor where_scalar_other_kernel(
-    const Tensor& condition, const Tensor& self, Scalar other) {
+    const Tensor& condition, const Tensor& self, const Scalar& other) {
   Tensor folded = full_kernel(
       static_cast<std::vector<int64_t>>(self.shape()),
       other,

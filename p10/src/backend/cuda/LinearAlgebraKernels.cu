@@ -285,7 +285,7 @@ Tensor matmul_batched_2d_cuda(
 }
 
 Tensor addmm_kernel_cuda(const Tensor& input, const Tensor& mat1, const Tensor& mat2,
-                         Scalar beta, Scalar alpha) {
+                         const Scalar& beta, const Scalar& alpha) {
     if (mat1.dim() != 2 || mat2.dim() != 2) TP_THROW(RuntimeError, "mat1 and mat2 shapes cannot be multiplied (",
         mat1.dim(), "D and ", mat2.dim(), "D)");
     if (mat1.size(1) != mat2.size(0)) {
@@ -698,7 +698,7 @@ Tensor bmm_kernel_cuda(const Tensor& self, const Tensor& batch2) {
 }
 
 Tensor baddbmm_kernel_cuda(const Tensor& input, const Tensor& batch1, const Tensor& batch2,
-                           Scalar beta, Scalar alpha) {
+                           const Scalar& beta, const Scalar& alpha) {
     if (batch1.dim() != 3) TP_THROW(RuntimeError, "batch1 must be a 3D tensor");
     if (batch2.dim() != 3) TP_THROW(RuntimeError, "batch2 must be a 3D tensor");
     if (batch1.size(0) != batch2.size(0) || batch1.size(2) != batch2.size(1)) {

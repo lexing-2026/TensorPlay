@@ -42,6 +42,7 @@ DEFINE_DISPATCH(silu_f64_stub);
 
 #ifdef _OPENMP
 #include <omp.h>
+#include "OutWrite.h"
 #endif
 
 namespace tensorplay {
@@ -502,7 +503,7 @@ Tensor sin_kernel(const Tensor& self) {
     return unary_float_op_kernel(self, [](auto x) { return std::sin(x); }, vecunary::VOp::Sin);
 }
 Tensor& sin_out_cpu(const Tensor& self, Tensor& out) {
-    out = sin_kernel(self);
+    write_out(out, sin_kernel(self));
     return out;
 }
 Tensor sinh_kernel(const Tensor& self) {
@@ -970,7 +971,7 @@ Tensor gelu_backward_impl(const Tensor& grad_output, const Tensor& self, const s
     TP_THROW(ValueError, "approximate argument must be either none or tanh, but got " + approximate);
 }
 
-Tensor hardtanh_kernel_impl(const Tensor& self, Scalar min_val, Scalar max_val) {
+Tensor hardtanh_kernel_impl(const Tensor& self, const Scalar& min_val, const Scalar& max_val) {
     vecunary::VParams prm;
     prm.p0 = min_val.toDouble();
     prm.p1 = max_val.toDouble();
@@ -982,7 +983,7 @@ Tensor hardtanh_kernel_impl(const Tensor& self, Scalar min_val, Scalar max_val) 
     }, vecunary::VOp::Hardtanh, prm);
 }
 
-Tensor hardtanh_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, Scalar min_val, Scalar max_val) {
+Tensor hardtanh_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, const Scalar& min_val, const Scalar& max_val) {
     double lo = min_val.toDouble();
     double hi = max_val.toDouble();
     return activation_backward_kernel(grad_output, self,
@@ -1003,12 +1004,13 @@ Tensor hardswish_kernel_impl(const Tensor& self) {
 }
 
 Tensor hardswish_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) {
-    //   x <= -3 -> 0 ; x >= 3 -> dy ; else dy * (x/6 + 0.5)
+    //   d/dx [x * relu6(x + 3) / 6]:
+    //   x <= -3 -> 0 ; -3 < x < 3 -> dy * (x/3 + 0.5) ; x >= 3 -> dy
     return activation_backward_kernel(grad_output, self,
         [](float dy, float x) -> float {
             if (x <= -3.0f) return 0.0f;
-            if (x >= 3.0f) return dy;
-            return dy * (x / 6.0f + 0.5f);
+            if (x < 3.0f) return dy * (x / 3.0f + 0.5f);
+            return dy;
         });
 }
 
@@ -1032,15 +1034,15 @@ Tensor hardsigmoid_kernel_impl(const Tensor& self) {
 }
 
 Tensor hardsigmoid_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) {
-    //   x <= -3 -> 0 ; x >= 3 -> 0 ; else dy * (x/6 + 0.5)
+    //   d/dx [relu6(x + 3) / 6]: dy / 6 strictly inside (-3, 3), else 0
     return activation_backward_kernel(grad_output, self,
         [](float dy, float x) -> float {
             if (x <= -3.0f || x >= 3.0f) return 0.0f;
-            return dy * (x / 6.0f + 0.5f);
+            return dy / 6.0f;
         });
 }
 
-Tensor leaky_relu_kernel_impl(const Tensor& self, Scalar negative_slope) {
+Tensor leaky_relu_kernel_impl(const Tensor& self, const Scalar& negative_slope) {
     double slope = negative_slope.toDouble();
     vecunary::VParams prm;
     prm.p0 = slope;
@@ -1051,14 +1053,14 @@ Tensor leaky_relu_kernel_impl(const Tensor& self, Scalar negative_slope) {
     }, vecunary::VOp::LeakyRelu, prm);
 }
 
-Tensor leaky_relu_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, Scalar negative_slope, bool self_is_result) {
+Tensor leaky_relu_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, const Scalar& negative_slope, bool self_is_result) {
     (void)self_is_result; // out-of-place call always receives the input itself
     double slope = negative_slope.toDouble();
     return activation_backward_kernel(grad_output, self,
         [slope](float dy, float x) -> float { return x > 0.0f ? dy : dy * static_cast<float>(slope); });
 }
 
-Tensor elu_kernel_impl(const Tensor& self, Scalar alpha, Scalar scale, Scalar input_scale) {
+Tensor elu_kernel_impl(const Tensor& self, const Scalar& alpha, const Scalar& scale, const Scalar& input_scale) {
     //   a < 0 ? expm1(a * input_scale) * negcoef : a * poscoef
     double negcoef = alpha.toDouble() * scale.toDouble();
     double poscoef = scale.toDouble();
@@ -1076,7 +1078,7 @@ Tensor elu_kernel_impl(const Tensor& self, Scalar alpha, Scalar scale, Scalar in
     }, vecunary::VOp::Elu, prm);
 }
 
-Tensor elu_backward_kernel_impl(const Tensor& grad_output, Scalar alpha, Scalar scale, Scalar input_scale, bool is_result, const Tensor& self_or_result) {
+Tensor elu_backward_kernel_impl(const Tensor& grad_output, const Scalar& alpha, const Scalar& scale, const Scalar& input_scale, bool is_result, const Tensor& self_or_result) {
     //   is_result: b <= 0 ? a*negiptcoef*(b + negcoef) : a*poscoef
     //   else:      b <= 0 ? a*negiptcoef*negcoef*exp(b*negiptcoef) : a*poscoef
     double negcoef = alpha.toDouble() * scale.toDouble();
@@ -1138,7 +1140,7 @@ Tensor celu_kernel_impl(const Tensor& self, Scalar alpha) {
     }, vecunary::VOp::Celu, prm);
 }
 
-Tensor softplus_kernel_impl(const Tensor& self, Scalar beta, Scalar threshold) {
+Tensor softplus_kernel_impl(const Tensor& self, const Scalar& beta, const Scalar& threshold) {
     //   beta_in * a > threshold ? a : log1p(exp(beta_in * a)) / beta_in
     double beta_in = beta.toDouble();
     double threshold_in = threshold.toDouble();
@@ -1155,7 +1157,7 @@ Tensor softplus_kernel_impl(const Tensor& self, Scalar beta, Scalar threshold) {
     }, vecunary::VOp::Softplus, prm);
 }
 
-Tensor softplus_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, Scalar beta, Scalar threshold) {
+Tensor softplus_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, const Scalar& beta, const Scalar& threshold) {
     //   beta_in * a > threshold ? dy : dy * sigmoid(beta_in * a)
     double beta_in = beta.toDouble();
     double threshold_in = threshold.toDouble();
@@ -1282,23 +1284,10 @@ static Tensor binary_float_kernel(const Tensor& a, const Tensor& b, Func func) {
     return result;
 }
 
-Tensor rrelu_with_noise_kernel_impl(const Tensor& self, const Tensor& noise, Scalar lower, Scalar upper, bool training) {
+Tensor rrelu_with_noise_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, const Tensor& noise, const Scalar& lower, const Scalar& upper, bool training, bool self_is_result) {
     const float slope = static_cast<float>((lower.toDouble() + upper.toDouble()) / 2.0);
-    if (training) {
-        return binary_float_kernel(self, noise, [](float x, float r) -> float {
-            return x <= 0.0f ? x * r : x;
-        });
-    }
-    return binary_float_kernel(self, noise, [slope](float x, float) -> float {
-        return x >= 0.0f ? x : x * slope;
-    });
-}
-
-Tensor rrelu_with_noise_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, const Tensor& noise, Scalar lower, Scalar upper, bool training, bool self_is_result) {
-    // forward overwrites noise with 1 on positive elements, which lets its
-    // backward be a plain noise*grad; this kernel leaves the caller's noise
-    // untouched, so the training branch masks with self instead (same value).
-    const float slope = static_cast<float>((lower.toDouble() + upper.toDouble()) / 2.0);
+    // Training: the forward recorded each slope in noise (1 for positive
+    // inputs), so the gradient is grad * noise.
     if (training) {
         if (grad_output.shape() != self.shape() || grad_output.shape() != noise.shape())
             TP_THROW(RuntimeError, "rrelu_with_noise_backward: shape mismatch");
@@ -1307,20 +1296,16 @@ Tensor rrelu_with_noise_backward_kernel_impl(const Tensor& grad_output, const Te
         const int64_t n = grad_output.numel();
         if (n == 0) return result;
         const Tensor gc = grad_output.contiguous();
-        const Tensor sc = self.contiguous();
         const Tensor nc = noise.contiguous();
         #define RRELU_TERN_CASE(ctype, name) \
         case DType::name: { \
             const ctype* gp = gc.data_ptr<ctype>(); \
-            const ctype* sp = sc.data_ptr<ctype>(); \
             const ctype* np = nc.data_ptr<ctype>(); \
             ctype* yp = result.data_ptr<ctype>(); \
             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
                 for (int64_t i = begin; i < end; ++i) { \
-                    const float x = static_cast<float>(sp[i]); \
-                    yp[i] = static_cast<ctype>(x <= 0.0f \
-                        ? static_cast<float>(gp[i]) * static_cast<float>(np[i]) \
-                        : static_cast<float>(gp[i])); \
+                    yp[i] = static_cast<ctype>( \
+                        static_cast<float>(gp[i]) * static_cast<float>(np[i])); \
                 } \
             }); \
             break; \
@@ -1332,13 +1317,14 @@ Tensor rrelu_with_noise_backward_kernel_impl(const Tensor& grad_output, const Te
         #undef RRELU_TERN_CASE
         return result;
     }
-    (void)self_is_result; // result >= 0 iff self >= 0 for a positive slope.
+    (void)self_is_result; // result > 0 iff self > 0 for a positive slope.
+    // The leaky slope applies at zero as well (x > 0 passes through).
     return binary_float_kernel(grad_output, self, [slope](float dy, float x) -> float {
-        return x >= 0.0f ? dy : dy * slope;
+        return x > 0.0f ? dy : dy * slope;
     });
 }
 
-Tensor pow_scalar_kernel(const Tensor& self, Scalar exponent) {
+Tensor pow_scalar_kernel(const Tensor& self, const Scalar& exponent) {
     if (self.dtype() == DType::Bool) TP_THROW(TypeError, "pow is not supported for bool tensors");
     if (isComplexType(self.dtype()) || exponent.isComplex()) {
         // scalar both produce complex results.  Negative integer exponents
@@ -1549,7 +1535,7 @@ void clamp_f64_avx512(const double* src, double* dst, int64_t n,
 } // namespace
 #endif
 
-Tensor clamp_kernel(const Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max) {
+Tensor clamp_kernel(const Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
     int64_t n = self.numel();
     Tensor self_contig = self.contiguous();
@@ -1606,23 +1592,23 @@ Tensor clamp_kernel(const Tensor& self, std::optional<Scalar> min, std::optional
 }
 
 // clamp(self, bound, nullopt); delegate to the same kernel here.
-Tensor clamp_min_kernel(const Tensor& self, Scalar min) {
+Tensor clamp_min_kernel(const Tensor& self, const Scalar& min) {
     return clamp_kernel(self, min, std::nullopt);
 }
-Tensor clamp_max_kernel(const Tensor& self, Scalar max) {
+Tensor clamp_max_kernel(const Tensor& self, const Scalar& max) {
     return clamp_kernel(self, std::nullopt, max);
 }
-Tensor clamp_min__kernel(Tensor& self, Scalar min) {
+Tensor& clamp_min__kernel(Tensor& self, const Scalar& min) {
     self.copy_(clamp_kernel(self, min, std::nullopt));
     return self;
 }
-Tensor clamp_max__kernel(Tensor& self, Scalar max) {
+Tensor& clamp_max__kernel(Tensor& self, const Scalar& max) {
     self.copy_(clamp_kernel(self, std::nullopt, max));
     return self;
 }
 
 // Helper for clamp backward
-Tensor clamp_backward_kernel(const Tensor& grad_output, const Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max) {
+Tensor clamp_backward_kernel(const Tensor& grad_output, const Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(grad_output.shape()), grad_output.dtype(), grad_output.device());
     int64_t n = grad_output.numel();
     
@@ -1658,7 +1644,7 @@ Tensor clamp_backward_kernel(const Tensor& grad_output, const Tensor& self, std:
     return result;
 }
 
-Tensor threshold_backward_kernel(const Tensor& grad_output, const Tensor& output, Scalar threshold) {
+Tensor threshold_backward_kernel(const Tensor& grad_output, const Tensor& output, const Scalar& threshold) {
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(grad_output.shape()), grad_output.dtype(), grad_output.device());
     int64_t n = grad_output.numel();
     
@@ -2183,7 +2169,7 @@ Tensor pow_tensor_tensor_kernel(const Tensor& self, const Tensor& exponent) {
 
 // Scalar-base power: a base of 1 short-circuits to ones, anything else
 // wraps the scalar as a 0-dim tensor and reuses the Tensor_Tensor kernel.
-Tensor pow_scalar_tensor_kernel(Scalar base, const Tensor& exponent) {
+Tensor pow_scalar_tensor_kernel(const Scalar& base, const Tensor& exponent) {
     const DType result_dtype = ops::result_type(base, exponent);
     if (!base.isComplex() && base.toDouble() == 1.0) {
         return Tensor::ones(static_cast<std::vector<int64_t>>(exponent.shape()),
@@ -2399,7 +2385,7 @@ Tensor lerp_tensor_kernel(const Tensor& self, const Tensor& end, const Tensor& w
     return s + w * (e - s);
 }
 
-Tensor lerp_scalar_kernel(const Tensor& self, const Tensor& end, Scalar weight) {
+Tensor lerp_scalar_kernel(const Tensor& self, const Tensor& end, const Scalar& weight) {
     if (self.dtype() == end.dtype() && lerp_same_shape(self, end) &&
         self.is_contiguous() && end.is_contiguous() &&
         (self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16 ||
@@ -2428,7 +2414,7 @@ Tensor lerp_scalar_kernel(const Tensor& self, const Tensor& end, Scalar weight) 
     return e - (e - s) * (1.0 - w);
 }
 
-Tensor& lerp_scalar_inplace_kernel(Tensor& self, const Tensor& end, Scalar weight) {
+Tensor& lerp_scalar_inplace_kernel(Tensor& self, const Tensor& end, const Scalar& weight) {
     if (self.dtype() == end.dtype() && lerp_same_shape(self, end) &&
         self.is_contiguous() && end.is_contiguous() &&
         (self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16 ||
@@ -2527,7 +2513,6 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("softplus_backward", softplus_backward_kernel_impl);
     m.impl("log_sigmoid", log_sigmoid_kernel_impl);
     m.impl("log_sigmoid_backward", log_sigmoid_backward_kernel_impl);
-    m.impl("rrelu_with_noise", rrelu_with_noise_kernel_impl);
     m.impl("rrelu_with_noise_backward", rrelu_with_noise_backward_kernel_impl);
     m.impl("pow.Tensor_Scalar", pow_scalar_kernel);
     m.impl("angle", angle_kernel);

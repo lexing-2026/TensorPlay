@@ -75,7 +75,7 @@ Tensor binary_cross_entropy_with_logits_cpu(const Tensor& self, const Tensor& ta
     return Tensor::full({}, Scalar(mean), out_dt, self.device());
 }
 
-Tensor hinge_embedding_loss_cpu(const Tensor& input, const Tensor& target, Scalar margin) {
+Tensor hinge_embedding_loss_cpu(const Tensor& input, const Tensor& target, const Scalar& margin) {
     // target == 1 -> x ; else relu(margin - x); mean.
     Tensor x = input.contiguous().to(DType::Float64);
     Tensor t = target.contiguous().to(DType::Float64).expand(shape_of(x)).contiguous();
@@ -92,7 +92,7 @@ Tensor hinge_embedding_loss_cpu(const Tensor& input, const Tensor& target, Scala
 }
 
 Tensor margin_ranking_loss_cpu(const Tensor& input1, const Tensor& input2,
-                               const Tensor& target, Scalar margin) {
+                               const Tensor& target, const Scalar& margin) {
     // mean(relu(margin - target*(x1 - x2)))
     Tensor a = input1.contiguous().to(DType::Float64);
     Tensor b = input2.contiguous().to(DType::Float64).expand(shape_of(a)).contiguous();
@@ -135,7 +135,7 @@ Tensor kl_div_cpu(const Tensor& input, const Tensor& target) {
 }
 
 Tensor cosine_embedding_loss_cpu(const Tensor& x1, const Tensor& x2, const Tensor& target,
-                                 Scalar margin) {
+                                 const Scalar& margin) {
     Tensor a = x1.contiguous().to(DType::Float64);
     Tensor b = x2.contiguous().to(DType::Float64);
     Tensor tg = target.contiguous().to(DType::Float64);
@@ -172,7 +172,7 @@ Tensor soft_margin_loss_cpu(const Tensor& input, const Tensor& target) {
 }
 
 Tensor triplet_margin_loss_cpu(const Tensor& anchor, const Tensor& positive,
-                               const Tensor& negative, Scalar margin, double p) {
+                               const Tensor& negative, const Scalar& margin, double p) {
     int64_t N = anchor.size(0), D = anchor.size(1);
     Tensor a = anchor.contiguous().to(DType::Float64);
     Tensor pp2 = positive.contiguous().to(DType::Float64);

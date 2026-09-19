@@ -111,42 +111,42 @@ Tensor compare_scalar(const Tensor& self, Scalar other, const char* name) {
 Tensor eq_tensor_kernel(const Tensor& self, const Tensor& other) {
   return compare_impl(self, other, "eq", "eq");
 }
-Tensor eq_scalar_kernel(const Tensor& self, Scalar other) {
+Tensor eq_scalar_kernel(const Tensor& self, const Scalar& other) {
   return compare_scalar(self, other, "eq");
 }
 
 Tensor ne_tensor_kernel(const Tensor& self, const Tensor& other) {
   return compare_impl(self, other, "ne", "ne");
 }
-Tensor ne_scalar_kernel(const Tensor& self, Scalar other) {
+Tensor ne_scalar_kernel(const Tensor& self, const Scalar& other) {
   return compare_scalar(self, other, "ne");
 }
 
 Tensor lt_tensor_kernel(const Tensor& self, const Tensor& other) {
   return compare_impl(self, other, "lt", "lt");
 }
-Tensor lt_scalar_kernel(const Tensor& self, Scalar other) {
+Tensor lt_scalar_kernel(const Tensor& self, const Scalar& other) {
   return compare_scalar(self, other, "lt");
 }
 
 Tensor le_tensor_kernel(const Tensor& self, const Tensor& other) {
   return compare_impl(self, other, "le", "le");
 }
-Tensor le_scalar_kernel(const Tensor& self, Scalar other) {
+Tensor le_scalar_kernel(const Tensor& self, const Scalar& other) {
   return compare_scalar(self, other, "le");
 }
 
 Tensor gt_tensor_kernel(const Tensor& self, const Tensor& other) {
   return compare_impl(self, other, "gt", "gt");
 }
-Tensor gt_scalar_kernel(const Tensor& self, Scalar other) {
+Tensor gt_scalar_kernel(const Tensor& self, const Scalar& other) {
   return compare_scalar(self, other, "gt");
 }
 
 Tensor ge_tensor_kernel(const Tensor& self, const Tensor& other) {
   return compare_impl(self, other, "ge", "ge");
 }
-Tensor ge_scalar_kernel(const Tensor& self, Scalar other) {
+Tensor ge_scalar_kernel(const Tensor& self, const Scalar& other) {
   return compare_scalar(self, other, "ge");
 }
 

@@ -524,7 +524,7 @@
   dispatch:
     CPU: _amp_foreach_non_finite_check_and_unscale_cpu
 
-- func: _amp_update_scale_(Tensor(a!) self, Tensor growth_tracker, Tensor found_inf, float growth_factor, float backoff_factor, int growth_interval) -> Tensor(a!)
+- func: _amp_update_scale_(Tensor(a!) self, Tensor(b!) growth_tracker, Tensor found_inf, float growth_factor, float backoff_factor, int growth_interval) -> Tensor(a!)
   variants: function
   dispatch:
     CPU: _amp_update_scale_cpu
@@ -567,35 +567,35 @@
   variants: function
   device_check: NoCheck
   dispatch: {CPU: fused_rmsprop_cpu, CUDA: fused_rmsprop_cuda}
-- func: _fused_adadelta_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] square_avgs, Tensor(c!)[] acc_deltas, Tensor[] state_steps, *, float lr, float rho, float eps, float weight_decay, bool maximize) -> ()
+- func: _fused_adadelta_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] square_avgs, Tensor(c!)[] acc_deltas, Tensor(d!)[] state_steps, *, float lr, float rho, float eps, float weight_decay, bool maximize) -> ()
   variants: function
   device_check: NoCheck
   dispatch: {CPU: fused_adadelta_cpu, CUDA: fused_adadelta_cuda}
-- func: _fused_adamax_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] exp_avgs, Tensor(c!)[] exp_infs, Tensor[] state_steps, *, float lr, float beta1, float beta2, float eps, float weight_decay, bool maximize) -> ()
+- func: _fused_adamax_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] exp_avgs, Tensor(c!)[] exp_infs, Tensor(d!)[] state_steps, *, float lr, float beta1, float beta2, float eps, float weight_decay, bool maximize) -> ()
   variants: function
   device_check: NoCheck
   dispatch: {CPU: fused_adamax_cpu, CUDA: fused_adamax_cuda}
-- func: _fused_asgd_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] axs, Tensor(c!)[] mus, Tensor(d!)[] etas, Tensor[] state_steps, *, float lr, float lambd, float t0, float alpha, float weight_decay, bool maximize) -> ()
+- func: _fused_asgd_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] axs, Tensor(c!)[] mus, Tensor(d!)[] etas, Tensor(e!)[] state_steps, *, float lr, float lambd, float t0, float alpha, float weight_decay, bool maximize) -> ()
   variants: function
   device_check: NoCheck
   dispatch: {CPU: fused_asgd_cpu, CUDA: fused_asgd_cuda}
-- func: _fused_rprop_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] prevs, Tensor(c!)[] step_sizes, Tensor[] state_steps, *, float step_size_min, float step_size_max, float etaminus, float etaplus, bool maximize) -> ()
+- func: _fused_rprop_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] prevs, Tensor(c!)[] step_sizes, Tensor(d!)[] state_steps, *, float step_size_min, float step_size_max, float etaminus, float etaplus, bool maximize) -> ()
   variants: function
   device_check: NoCheck
   dispatch: {CPU: fused_rprop_cpu, CUDA: fused_rprop_cuda}
-- func: _fused_nadam_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] exp_avgs, Tensor(c!)[] exp_avg_sqs, Tensor(d!)[] mu_products, Tensor[] state_steps, *, float lr, float beta1, float beta2, float eps, float weight_decay, float momentum_decay, bool decoupled_weight_decay, bool maximize) -> ()
+- func: _fused_nadam_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] exp_avgs, Tensor(c!)[] exp_avg_sqs, Tensor(d!)[] mu_products, Tensor(e!)[] state_steps, *, float lr, float beta1, float beta2, float eps, float weight_decay, float momentum_decay, bool decoupled_weight_decay, bool maximize) -> ()
   variants: function
   device_check: NoCheck
   dispatch: {CPU: fused_nadam_cpu, CUDA: fused_nadam_cuda}
-- func: _fused_radam_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] exp_avgs, Tensor(c!)[] exp_avg_sqs, Tensor[] state_steps, *, float lr, float beta1, float beta2, float eps, float weight_decay, bool decoupled_weight_decay, bool maximize) -> ()
+- func: _fused_radam_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] exp_avgs, Tensor(c!)[] exp_avg_sqs, Tensor(d!)[] state_steps, *, float lr, float beta1, float beta2, float eps, float weight_decay, bool decoupled_weight_decay, bool maximize) -> ()
   variants: function
   device_check: NoCheck
   dispatch: {CPU: fused_radam_cpu, CUDA: fused_radam_cuda}
-- func: _fused_adafactor_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] variances, Tensor[] state_steps, *, float lr, float beta2_decay, float eps1, float eps2, float d, float weight_decay, bool maximize) -> ()
+- func: _fused_adafactor_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] variances, Tensor(c!)[] state_steps, *, float lr, float beta2_decay, float eps1, float eps2, float d, float weight_decay, bool maximize) -> ()
   variants: function
   device_check: NoCheck
   dispatch: {CPU: fused_adafactor_cpu, CUDA: fused_adafactor_cuda}
-- func: _fused_adafactor_factored_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] row_vars, Tensor(c!)[] col_vars, Tensor[] state_steps, *, float lr, float beta2_decay, float eps1, float eps2, float d, float weight_decay, bool maximize) -> ()
+- func: _fused_adafactor_factored_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] row_vars, Tensor(c!)[] col_vars, Tensor(d!)[] state_steps, *, float lr, float beta2_decay, float eps1, float eps2, float d, float weight_decay, bool maximize) -> ()
   variants: function
   device_check: NoCheck
   dispatch: {CPU: fused_adafactor_factored_cpu, CUDA: fused_adafactor_factored_cuda}
@@ -983,12 +983,12 @@
 
 # are metadata-only views: the backend must preserve storage and the shared
 # version counter rather than materializing a copy.
-- func: view_as_real(Tensor self) -> Tensor
+- func: view_as_real(Tensor(a) self) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: view_as_real_cpu
 
-- func: view_as_complex(Tensor self) -> Tensor
+- func: view_as_complex(Tensor(a) self) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: view_as_complex_cpu
@@ -1161,7 +1161,7 @@
   dispatch:
     CPU: copy_kernel
 
-- func: view(Tensor self, int[] shape) -> Tensor
+- func: view(Tensor(a) self, int[] shape) -> Tensor(a)
   variants: method
   tags: core
 
@@ -1171,17 +1171,17 @@
     CPU: fill_kernel
     CUDA: fill_kernel
 
-- func: transpose(Tensor self, int dim0, int dim1) -> Tensor
+- func: transpose(Tensor(a) self, int dim0, int dim1) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: transpose_kernel
 
-- func: t(Tensor self) -> Tensor
+- func: t(Tensor(a) self) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: t_kernel
 
-- func: permute(Tensor self, int[] dims) -> Tensor
+- func: permute(Tensor(a) self, int[] dims) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: permute_kernel
@@ -1192,7 +1192,7 @@
   dispatch:
     CPU: permute_backward_kernel
 
-- func: squeeze(Tensor self) -> Tensor
+- func: squeeze(Tensor(a) self) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: squeeze_kernel
@@ -1202,27 +1202,27 @@
   dispatch:
     CPU: squeeze_backward_kernel
 
-- func: squeeze.dim(Tensor self, int dim) -> Tensor
+- func: squeeze.dim(Tensor(a) self, int dim) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: squeeze_dim_kernel
     CUDA: squeeze_dim_kernel_cuda
   tags: core
 
-- func: squeeze.dims(Tensor self, int[] dim) -> Tensor
+- func: squeeze.dims(Tensor(a) self, int[] dim) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: squeeze_dims_kernel
     CUDA: squeeze_dims_kernel_cuda
   tags: core
 
-- func: unsqueeze(Tensor self, int dim) -> Tensor
+- func: unsqueeze(Tensor(a) self, int dim) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: unsqueeze_kernel
   tags: core
 
-- func: diagonal(Tensor self, int offset=0, int dim1=0, int dim2=1) -> Tensor
+- func: diagonal(Tensor(a) self, int offset=0, int dim1=0, int dim2=1) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: diagonal_kernel
@@ -1234,7 +1234,7 @@
   dispatch:
     CPU: diagonal_backward_kernel
 
-- func: movedim(Tensor self, int[] source, int[] destination) -> Tensor
+- func: movedim(Tensor(a) self, int[] source, int[] destination) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: movedim_kernel
@@ -1250,35 +1250,30 @@
   dispatch:
     CPU: stack_kernel
 
-- func: split(Tensor self, int split_size, int dim=0) -> Tensor[]
+- func: split(Tensor(a) self, int split_size, int dim=0) -> Tensor(a)[]
   variants: function, method
   dispatch:
     CPU: split_kernel
 
-- func: split.sizes(Tensor self, int[] split_sizes, int dim=0) -> Tensor[]
+- func: split.sizes(Tensor(a) self, int[] split_sizes, int dim=0) -> Tensor(a)[]
   variants: function, method
   dispatch:
     CPU: split_sizes_kernel
 
-- func: chunk(Tensor self, int chunks, int dim=0) -> Tensor[]
+- func: chunk(Tensor(a -> *) self, int chunks, int dim=0) -> Tensor(a)[]
   variants: function, method
   dispatch:
     CPU: chunk_kernel
 
-- func: reshape(Tensor self, int[] shape) -> Tensor
+- func: reshape(Tensor(a) self, int[] shape) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: reshape_kernel
 
-- func: unbind(Tensor self, int dim=0) -> Tensor[]
+- func: unbind(Tensor(a) self, int dim=0) -> Tensor(a)[]
   variants: function, method
   dispatch:
     CPU: unbind_kernel
-
-- func: slice(Tensor self, int dim=0, int? start=None, int? end=None, int step=1) -> Tensor
-  variants: method
-  dispatch:
-    CPU: slice_kernel
 
 - func: clone(Tensor self, *, MemoryFormat? memory_format=None) -> Tensor
   variants: method
@@ -1287,7 +1282,7 @@
     CUDA: clone_kernel_cuda
   tags: [core, pointwise]
 
-- func: contiguous(Tensor self, *, MemoryFormat memory_format=Contiguous) -> Tensor
+- func: contiguous(Tensor(a) self, *, MemoryFormat memory_format=Contiguous) -> Tensor(a)
   variants: method
   dispatch:
     CPU: contiguous_kernel
@@ -2817,7 +2812,7 @@
   dispatch:
     CPU: polar_cpu
 
-- func: real(Tensor self) -> Tensor
+- func: real(Tensor(a) self) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: real_cpu
@@ -3006,7 +3001,7 @@
     CPU: ldl_solve_impl
     CUDA: linalg_ldl_solve_cuda
 
-- func: linalg_diagonal(Tensor A, *, int offset=0, int dim1=-2, int dim2=-1) -> Tensor
+- func: linalg_diagonal(Tensor(a) A, *, int offset=0, int dim1=-2, int dim2=-1) -> Tensor(a)
   variants: function
   dispatch:
     CPU: linalg_diagonal_kernel
@@ -3017,7 +3012,7 @@
   dispatch:
     CPU: roll_cpu
 
-- func: unfold(Tensor self, int dimension, int size, int step) -> Tensor
+- func: unfold(Tensor(a) self, int dimension, int size, int step) -> Tensor(a)
   variants: function
   dispatch:
     CPU: unfold_cpu
@@ -3063,10 +3058,10 @@
 
 # scales negative elements by the caller-provided noise tensor; eval path is
 # leaky_relu with slope (lower + upper) / 2.
-- func: rrelu_with_noise(Tensor self, Tensor noise, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False) -> Tensor
+- func: rrelu_with_noise(Tensor self, Tensor(b!) noise, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False, Generator? generator=None) -> Tensor
   variants: function
   dispatch:
-    CPU: rrelu_with_noise_kernel_impl
+    CPU: rrelu_with_noise_cpu
     CUDA: rrelu_with_noise_kernel_cuda
   tags: nondeterministic_seeded
 
@@ -3227,7 +3222,7 @@
     CUDA: one_hot_cuda
   tags: dynamic_output_shape
 
-- func: narrow(Tensor self, int dim, int start, int length) -> Tensor
+- func: narrow(Tensor(a) self, int dim, int start, int length) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: narrow_cpu
@@ -3555,19 +3550,19 @@
     CPU: complex_cpu
     CUDA: complex_cuda
 
-- func: conj(Tensor self) -> Tensor
+- func: conj(Tensor(a) self) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: conj_cpu
     CUDA: conj_cuda
 
-- func: adjoint(Tensor self) -> Tensor
+- func: adjoint(Tensor(a) self) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: adjoint_cpu
     CUDA: adjoint_cuda
 
-- func: imag(Tensor self) -> Tensor
+- func: imag(Tensor(a) self) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: imag_cpu
@@ -3836,18 +3831,16 @@
     CPU: masked_fill_tensor__cpu
     CUDA: masked_fill_tensor__cuda
 
-- func: index_put(Tensor self, Tensor[] indices, Tensor values, bool accumulate=False) -> Tensor
+- func: index_put(Tensor self, Tensor?[] indices, Tensor values, bool accumulate=False) -> Tensor
   variants: function, method
   dispatch:
-    CPU: index_put_cpu
-    CUDA: index_put_cuda
+    Composite: index_put_composite
   tags: core
 
-- func: index_put_(Tensor(a!) self, Tensor[] indices, Tensor values, bool accumulate=False) -> Tensor(a!)
+- func: index_put_(Tensor(a!) self, Tensor?[] indices, Tensor values, bool accumulate=False) -> Tensor(a!)
   variants: function, method
   dispatch:
-    CPU: index_put__cpu
-    CUDA: index_put__cuda
+    Composite: index_put__composite
 
 - func: masked_fill(Tensor self, Tensor mask, Scalar value) -> Tensor
   variants: function, method
@@ -3945,7 +3938,7 @@
     CPU: rot90_cpu
     CUDA: rot90_cuda
 
-- func: split_with_sizes(Tensor self, int[] split_sizes, int dim=0) -> Tensor[]
+- func: split_with_sizes(Tensor(a) self, int[] split_sizes, int dim=0) -> Tensor(a)[]
   variants: function, method
   dispatch:
     CPU: split_with_sizes_cpu
@@ -4232,7 +4225,7 @@
     CPU: negative_cpu
     CUDA: negative_cuda
 
-- func: positive(Tensor self) -> Tensor
+- func: positive(Tensor(a) self) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: positive_cpu
@@ -5055,14 +5048,14 @@
 #   ReduceOps.cpp            equal()/allclose() via eq/all/isclose composition
 # ---------------------------------------------------------------------------
 
-- func: expand(Tensor self, int[] size, *, bool implicit=False) -> Tensor
+- func: expand(Tensor(a) self, int[] size, *, bool implicit=False) -> Tensor(a)
   variants: method
   dispatch:
     CPU: tpsa_expand
     CUDA: tpsa_expand
   tags: core
 
-- func: expand_as(Tensor self, Tensor other) -> Tensor
+- func: expand_as(Tensor(a) self, Tensor other) -> Tensor(a)
   variants: method
   dispatch:
     CPU: tpsa_expand_as
@@ -5147,55 +5140,55 @@
     CPU: tpsa_column_stack_out
     CUDA: tpsa_column_stack_out
 
-- func: tensor_split.sections(Tensor self, int sections, int dim=0) -> Tensor[]
+- func: tensor_split.sections(Tensor(a) self, int sections, int dim=0) -> Tensor(a)[]
   variants: function, method
   dispatch:
     CPU: tpsa_tensor_split_sections
     CUDA: tpsa_tensor_split_sections
 
-- func: tensor_split.indices(Tensor self, int[] indices, int dim=0) -> Tensor[]
+- func: tensor_split.indices(Tensor(a) self, int[] indices, int dim=0) -> Tensor(a)[]
   variants: function, method
   dispatch:
     CPU: tpsa_tensor_split_indices
     CUDA: tpsa_tensor_split_indices
 
-- func: tensor_split.tensor_indices_or_sections(Tensor self, Tensor tensor_indices_or_sections, int dim=0) -> Tensor[]
+- func: tensor_split.tensor_indices_or_sections(Tensor(a -> *) self, Tensor tensor_indices_or_sections, int dim=0) -> Tensor(a)[]
   variants: function, method
   dispatch:
     CPU: tpsa_tensor_split_tensor
     CUDA: tpsa_tensor_split_tensor
 
-- func: hsplit.int(Tensor self, int sections) -> Tensor[]
+- func: hsplit.int(Tensor(a -> *) self, int sections) -> Tensor(a)[]
   variants: function, method
   dispatch:
     CPU: tpsa_hsplit_int
     CUDA: tpsa_hsplit_int
 
-- func: hsplit.array(Tensor self, int[] indices) -> Tensor[]
+- func: hsplit.array(Tensor(a -> *) self, int[] indices) -> Tensor(a)[]
   variants: function, method
   dispatch:
     CPU: tpsa_hsplit_array
     CUDA: tpsa_hsplit_array
 
-- func: vsplit.int(Tensor self, int sections) -> Tensor[]
+- func: vsplit.int(Tensor(a -> *) self, int sections) -> Tensor(a)[]
   variants: function, method
   dispatch:
     CPU: tpsa_vsplit_int
     CUDA: tpsa_vsplit_int
 
-- func: vsplit.array(Tensor self, int[] indices) -> Tensor[]
+- func: vsplit.array(Tensor(a -> *) self, int[] indices) -> Tensor(a)[]
   variants: function, method
   dispatch:
     CPU: tpsa_vsplit_array
     CUDA: tpsa_vsplit_array
 
-- func: dsplit.int(Tensor self, int sections) -> Tensor[]
+- func: dsplit.int(Tensor(a -> *) self, int sections) -> Tensor(a)[]
   variants: function, method
   dispatch:
     CPU: tpsa_dsplit_int
     CUDA: tpsa_dsplit_int
 
-- func: dsplit.array(Tensor self, int[] indices) -> Tensor[]
+- func: dsplit.array(Tensor(a -> *) self, int[] indices) -> Tensor(a)[]
   variants: function, method
   dispatch:
     CPU: tpsa_dsplit_array
@@ -5240,7 +5233,7 @@
     CPU: tpsa_atleast_3d_seq
     CUDA: tpsa_atleast_3d_seq
 
-- func: flatten.using_ints(Tensor self, int start_dim=0, int end_dim=-1) -> Tensor
+- func: flatten.using_ints(Tensor(a) self, int start_dim=0, int end_dim=-1) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: tpsa_flatten
@@ -5252,31 +5245,31 @@
     CPU: tpsa_unflatten
     CUDA: tpsa_unflatten
 
-- func: ravel(Tensor self) -> Tensor
+- func: ravel(Tensor(a) self) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: tpsa_ravel
     CUDA: tpsa_ravel
 
-- func: moveaxis.intlist(Tensor self, int[] source, int[] destination) -> Tensor
+- func: moveaxis.intlist(Tensor(a) self, int[] source, int[] destination) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: tpsa_moveaxis_intlist
     CUDA: tpsa_moveaxis_intlist
 
-- func: moveaxis.int(Tensor self, int source, int destination) -> Tensor
+- func: moveaxis.int(Tensor(a) self, int source, int destination) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: tpsa_moveaxis_int
     CUDA: tpsa_moveaxis_int
 
-- func: swapaxes(Tensor self, int axis0, int axis1) -> Tensor
+- func: swapaxes(Tensor(a) self, int axis0, int axis1) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: tpsa_swapaxes
     CUDA: tpsa_swapaxes
 
-- func: swapdims(Tensor self, int dim0, int dim1) -> Tensor
+- func: swapdims(Tensor(a) self, int dim0, int dim1) -> Tensor(a)
   variants: function, method
   dispatch:
     CPU: tpsa_swapdims
@@ -6026,11 +6019,11 @@
   tags: nondeterministic_seeded
 
 # rrelu_with_noise in training).
-- func: rrelu(Tensor self, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False) -> Tensor
+- func: rrelu(Tensor self, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False, Generator? generator=None) -> Tensor
   variants: function, method
   tags: [pointwise, nondeterministic_seeded]
 
-- func: rrelu_(Tensor(a!) self, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False) -> Tensor(a!)
+- func: rrelu_(Tensor(a!) self, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False, Generator? generator=None) -> Tensor(a!)
   variants: function, method
   tags: nondeterministic_seeded
 
@@ -6869,7 +6862,8 @@
 - func: _index_put_impl_(Tensor(a!) self, Tensor?[] indices, Tensor values, bool accumulate=False, bool unsafe=False) -> Tensor(a!)
   variants: function
   dispatch:
-    Composite: index_put_impl_composite
+    CPU: index_put_impl_cpu
+    CUDA: index_put_impl_cuda
 - func: isin.Tensor_Tensor_out(Tensor elements, Tensor test_elements, *, bool assume_unique=False, bool invert=False, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: isin.Tensor_Scalar_out(Tensor elements, Scalar test_element, *, bool assume_unique=False, bool invert=False, Tensor(a!) out) -> Tensor(a!)
@@ -7492,6 +7486,8 @@
   tags: core
 - func: slice.Tensor(Tensor(a) self, int dim=0, SymInt? start=None, SymInt? end=None, SymInt step=1) -> Tensor(a)
   variants: function, method
+  dispatch:
+    CPU: slice_kernel
   tags: core
 - func: slice_inverse(Tensor(a) self, Tensor src, int dim=0, SymInt? start=None, SymInt? end=None, SymInt step=1) -> Tensor(a)
   variants: function, method

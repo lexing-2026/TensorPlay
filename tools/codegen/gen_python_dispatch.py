@@ -204,7 +204,7 @@ def _emit_kernel(out: list[str], f: NativeFunction) -> str:
     out.append("")
     signature = ", ".join(stub_arg_type_for(f.base_name, a) for a in args)
     return (f'    D.registerKernel({_cpp_string(f.func_name)}, DispatchKey::Python, '
-            f'(KernelFunction)static_cast<{ret} (*)({signature})>(&kernel_{sym}));')
+            f'static_cast<{ret} (*)({signature})>(&kernel_{sym}));')
 
 
 def generate_python_dispatch_cpp(funcs: list[NativeFunction]) -> tuple[str, list[str]]:

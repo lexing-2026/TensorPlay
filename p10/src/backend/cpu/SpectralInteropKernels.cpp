@@ -10,10 +10,10 @@
 namespace tensorplay {
 namespace cpu {
 
-Tensor fft_fft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string norm);
-Tensor fft_ifft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string norm);
-Tensor fft_rfft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string norm);
-Tensor fft_irfft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string norm);
+Tensor fft_fft_cpu(const Tensor& self, int64_t n, int64_t dim, const std::string& norm);
+Tensor fft_ifft_cpu(const Tensor& self, int64_t n, int64_t dim, const std::string& norm);
+Tensor fft_rfft_cpu(const Tensor& self, int64_t n, int64_t dim, const std::string& norm);
+Tensor fft_irfft_cpu(const Tensor& self, int64_t n, int64_t dim, const std::string& norm);
 
 namespace {
 

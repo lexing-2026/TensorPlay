@@ -875,13 +875,13 @@ Tensor& linalg_tensorinv_native_cpu_out(const Tensor& self, int64_t ind,
 
 Tensor linalg_tensorsolve_native_cpu(
     const Tensor& self, const Tensor& other,
-    std::optional<std::vector<int64_t>> dims) {
+    const std::optional<std::vector<int64_t>>& dims) {
     return linalg_tensorsolve_impl(self, other, dims);
 }
 
 Tensor& linalg_tensorsolve_native_cpu_out(
     const Tensor& self, const Tensor& other,
-    std::optional<std::vector<int64_t>> dims, Tensor& out) {
+    const std::optional<std::vector<int64_t>>& dims, Tensor& out) {
     if (out.defined()) {
         if (out.dtype() != self.dtype()) {
             TP_THROW(TypeError,
@@ -903,78 +903,78 @@ Tensor& linalg_tensorsolve_native_cpu_out(
 }
 
 Tensor linalg_vector_norm_native_cpu(
-    const Tensor& self, Scalar ord,
-    std::optional<std::vector<int64_t>> dims, bool keepdim,
+    const Tensor& self, const Scalar& ord,
+    const std::optional<std::vector<int64_t>>& dims, bool keepdim,
     std::optional<DType> dtype) {
     return linalg_vector_norm_impl(self, ord, dims, keepdim, dtype);
 }
 
 Tensor& linalg_vector_norm_native_cpu_out(
-    const Tensor& self, Scalar ord,
-    std::optional<std::vector<int64_t>> dims, bool keepdim,
+    const Tensor& self, const Scalar& ord,
+    const std::optional<std::vector<int64_t>>& dims, bool keepdim,
     std::optional<DType> dtype, Tensor& out) {
     return write_linalg_norm_output(
         linalg_vector_norm_impl(self, ord, dims, keepdim, dtype), out);
 }
 
 Tensor linalg_powsum_native_cpu(
-    const Tensor& self, Scalar ord,
-    std::optional<std::vector<int64_t>> dims, bool keepdim,
+    const Tensor& self, const Scalar& ord,
+    const std::optional<std::vector<int64_t>>& dims, bool keepdim,
     std::optional<DType> dtype) {
     return linalg_powsum_impl(self, ord, dims, keepdim, dtype);
 }
 
 Tensor linalg_matrix_norm_native_cpu(
-    const Tensor& self, Scalar ord, const std::vector<int64_t>& dims,
+    const Tensor& self, const Scalar& ord, const std::vector<int64_t>& dims,
     bool keepdim, std::optional<DType> dtype) {
     return linalg_matrix_norm_impl(self, ord, dims, keepdim, dtype);
 }
 
 Tensor& linalg_matrix_norm_native_cpu_out(
-    const Tensor& self, Scalar ord, const std::vector<int64_t>& dims,
+    const Tensor& self, const Scalar& ord, const std::vector<int64_t>& dims,
     bool keepdim, std::optional<DType> dtype, Tensor& out) {
     return write_linalg_norm_output(
         linalg_matrix_norm_impl(self, ord, dims, keepdim, dtype), out);
 }
 
 Tensor linalg_matrix_norm_string_native_cpu(
-    const Tensor& self, std::string ord, const std::vector<int64_t>& dims,
+    const Tensor& self, const std::string& ord, const std::vector<int64_t>& dims,
     bool keepdim, std::optional<DType> dtype) {
     return linalg_matrix_norm_string_impl(self, ord, dims, keepdim, dtype);
 }
 
 Tensor& linalg_matrix_norm_string_native_cpu_out(
-    const Tensor& self, std::string ord, const std::vector<int64_t>& dims,
+    const Tensor& self, const std::string& ord, const std::vector<int64_t>& dims,
     bool keepdim, std::optional<DType> dtype, Tensor& out) {
     return write_linalg_norm_output(
         linalg_matrix_norm_string_impl(self, ord, dims, keepdim, dtype), out);
 }
 
 Tensor linalg_norm_native_cpu(
-    const Tensor& self, std::optional<Scalar> ord,
-    std::optional<std::vector<int64_t>> dims, bool keepdim,
+    const Tensor& self, const std::optional<Scalar>& ord,
+    const std::optional<std::vector<int64_t>>& dims, bool keepdim,
     std::optional<DType> dtype) {
     return linalg_norm_impl(self, ord, dims, keepdim, dtype);
 }
 
 Tensor& linalg_norm_native_cpu_out(
-    const Tensor& self, std::optional<Scalar> ord,
-    std::optional<std::vector<int64_t>> dims, bool keepdim,
+    const Tensor& self, const std::optional<Scalar>& ord,
+    const std::optional<std::vector<int64_t>>& dims, bool keepdim,
     std::optional<DType> dtype, Tensor& out) {
     return write_linalg_norm_output(
         linalg_norm_impl(self, ord, dims, keepdim, dtype), out);
 }
 
 Tensor linalg_norm_string_native_cpu(
-    const Tensor& self, std::string ord,
-    std::optional<std::vector<int64_t>> dims, bool keepdim,
+    const Tensor& self, const std::string& ord,
+    const std::optional<std::vector<int64_t>>& dims, bool keepdim,
     std::optional<DType> dtype) {
     return linalg_norm_string_impl(self, ord, dims, keepdim, dtype);
 }
 
 Tensor& linalg_norm_string_native_cpu_out(
-    const Tensor& self, std::string ord,
-    std::optional<std::vector<int64_t>> dims, bool keepdim,
+    const Tensor& self, const std::string& ord,
+    const std::optional<std::vector<int64_t>>& dims, bool keepdim,
     std::optional<DType> dtype, Tensor& out) {
     return write_linalg_norm_output(
         linalg_norm_string_impl(self, ord, dims, keepdim, dtype), out);
@@ -1140,20 +1140,20 @@ Tensor& linalg_matrix_rank_native_cpu_tol_tensor_out(
 }
 
 Tensor linalg_cond_native_cpu(const Tensor& self,
-                              std::optional<Scalar> ord) {
+                              const std::optional<Scalar>& ord) {
     return linalg_cond_impl(self, ord);
 }
 
 Tensor& linalg_cond_native_cpu_out(const Tensor& self,
-                                   std::optional<Scalar> ord, Tensor& out) {
+                                   const std::optional<Scalar>& ord, Tensor& out) {
     return write_linalg_norm_output(linalg_cond_impl(self, ord), out);
 }
 
-Tensor linalg_cond_string_native_cpu(const Tensor& self, std::string ord) {
+Tensor linalg_cond_string_native_cpu(const Tensor& self, const std::string& ord) {
     return linalg_cond_string_impl(self, ord);
 }
 
-Tensor& linalg_cond_string_native_cpu_out(const Tensor& self, std::string ord,
+Tensor& linalg_cond_string_native_cpu_out(const Tensor& self, const std::string& ord,
                                           Tensor& out) {
     return write_linalg_norm_output(linalg_cond_string_impl(self, ord), out);
 }

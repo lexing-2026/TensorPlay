@@ -11,6 +11,7 @@
 #include "Utils.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include "Atomic.cuh"
+#include "OutWrite.h"
 
 namespace tensorplay {
 namespace cuda {
@@ -109,6 +110,15 @@ inline std::vector<int64_t> out_shape(const Tensor& self, const std::vector<int6
     std::vector<int64_t> s{self.size(0), self.size(1)};
     s.insert(s.end(), out_sizes.begin(), out_sizes.end());
     return s;
+}
+
+// Backward kernels take the full input shape (batch, channels, spatial...).
+inline std::vector<int64_t> grad_input_shape(const Tensor& grad_output,
+                                             const std::vector<int64_t>& input_size) {
+    TP_CHECK(static_cast<int64_t>(input_size.size()) == grad_output.dim(),
+             "It is expected input_size equals to ", grad_output.dim(),
+             ", but got size ", input_size.size());
+    return input_size;
 }
 
 inline void launch_dims(int64_t total, dim3& block, dim3& grid) {
@@ -650,7 +660,7 @@ __global__ void upsample_bicubic2d_backward_out_frame(
 // Public entry points
 // ---------------------------------------------------------------------------
 
-Tensor upsample_nearest1d_cuda(const Tensor& self, std::vector<int64_t> output_size, std::optional<double> scales) {
+Tensor upsample_nearest1d_cuda(const Tensor& self, const std::vector<int64_t>& output_size, std::optional<double> scales) {
     Tensor in = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
     const int64_t N = in.size(0), C = in.size(1);
@@ -667,7 +677,7 @@ Tensor upsample_nearest1d_cuda(const Tensor& self, std::vector<int64_t> output_s
     return result;
 }
 
-Tensor upsample_nearest2d_cuda(const Tensor& self, std::vector<int64_t> output_size, std::optional<double> scales_h, std::optional<double> scales_w) {
+Tensor upsample_nearest2d_cuda(const Tensor& self, const std::vector<int64_t>& output_size, std::optional<double> scales_h, std::optional<double> scales_w) {
     Tensor in = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
     const int64_t N = in.size(0), C = in.size(1);
@@ -685,7 +695,7 @@ Tensor upsample_nearest2d_cuda(const Tensor& self, std::vector<int64_t> output_s
     return result;
 }
 
-Tensor upsample_nearest3d_cuda(const Tensor& self, std::vector<int64_t> output_size, std::optional<double> scales_d, std::optional<double> scales_h, std::optional<double> scales_w) {
+Tensor upsample_nearest3d_cuda(const Tensor& self, const std::vector<int64_t>& output_size, std::optional<double> scales_d, std::optional<double> scales_h, std::optional<double> scales_w) {
     Tensor in = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
     const int64_t N = in.size(0), C = in.size(1);
@@ -704,11 +714,11 @@ Tensor upsample_nearest3d_cuda(const Tensor& self, std::vector<int64_t> output_s
     return result;
 }
 
-Tensor upsample_nearest1d_backward_cuda(const Tensor& grad_output, std::vector<int64_t> output_size, std::vector<int64_t> input_size, std::optional<double> scales) {
+Tensor upsample_nearest1d_backward_cuda(const Tensor& grad_output, const std::vector<int64_t>& output_size, const std::vector<int64_t>& input_size, std::optional<double> scales) {
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
-    Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
+    Tensor grad_input = Tensor::zeros(grad_input_shape(go, input_size), go.dtype(), go.device());
     const int64_t dim_b = go.size(0), dim_c = go.size(1);
-    const int64_t W2 = output_size[0], W1 = input_size[0];
+    const int64_t W2 = output_size[0], W1 = input_size[2];
     if (go.numel() == 0 || W2 == 0 || W1 == 0) return grad_input;
     UP_DISPATCH(go, {
         // zeroed buffer is already scalar_t so accumulate via an accscalar
@@ -724,12 +734,12 @@ Tensor upsample_nearest1d_backward_cuda(const Tensor& grad_output, std::vector<i
     return grad_input;
 }
 
-Tensor upsample_nearest2d_backward_cuda(const Tensor& grad_output, std::vector<int64_t> output_size, std::vector<int64_t> input_size, std::optional<double> scales_h, std::optional<double> scales_w) {
+Tensor upsample_nearest2d_backward_cuda(const Tensor& grad_output, const std::vector<int64_t>& output_size, const std::vector<int64_t>& input_size, std::optional<double> scales_h, std::optional<double> scales_w) {
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
-    Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
+    Tensor grad_input = Tensor::zeros(grad_input_shape(go, input_size), go.dtype(), go.device());
     const int64_t dim_b = go.size(0), dim_c = go.size(1);
     const int64_t H2 = output_size[0], W2 = output_size[1];
-    const int64_t H1 = input_size[0], W1 = input_size[1];
+    const int64_t H1 = input_size[2], W1 = input_size[3];
     if (go.numel() == 0 || H2 * W2 == 0 || H1 * W1 == 0) return grad_input;
     UP_DISPATCH(go, {
         dim3 block, grid;
@@ -743,12 +753,12 @@ Tensor upsample_nearest2d_backward_cuda(const Tensor& grad_output, std::vector<i
     return grad_input;
 }
 
-Tensor upsample_nearest3d_backward_cuda(const Tensor& grad_output, std::vector<int64_t> output_size, std::vector<int64_t> input_size, std::optional<double> scales_d, std::optional<double> scales_h, std::optional<double> scales_w) {
+Tensor upsample_nearest3d_backward_cuda(const Tensor& grad_output, const std::vector<int64_t>& output_size, const std::vector<int64_t>& input_size, std::optional<double> scales_d, std::optional<double> scales_h, std::optional<double> scales_w) {
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
-    Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
+    Tensor grad_input = Tensor::zeros(grad_input_shape(go, input_size), go.dtype(), go.device());
     const int64_t dim_b = go.size(0), dim_c = go.size(1);
     const int64_t D2 = output_size[0], H2 = output_size[1], W2 = output_size[2];
-    const int64_t D1 = input_size[0], H1 = input_size[1], W1 = input_size[2];
+    const int64_t D1 = input_size[2], H1 = input_size[3], W1 = input_size[4];
     if (go.numel() == 0) return grad_input;
     UP_DISPATCH(go, {
         dim3 block, grid;
@@ -763,7 +773,7 @@ Tensor upsample_nearest3d_backward_cuda(const Tensor& grad_output, std::vector<i
     return grad_input;
 }
 
-Tensor upsample_linear1d_cuda(const Tensor& self, std::vector<int64_t> output_size, bool align_corners, std::optional<double> scales) {
+Tensor upsample_linear1d_cuda(const Tensor& self, const std::vector<int64_t>& output_size, bool align_corners, std::optional<double> scales) {
     Tensor in = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
     const int64_t N = in.size(0), C = in.size(1);
@@ -780,7 +790,7 @@ Tensor upsample_linear1d_cuda(const Tensor& self, std::vector<int64_t> output_si
     return result;
 }
 
-Tensor upsample_bilinear2d_cuda(const Tensor& self, std::vector<int64_t> output_size, bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w) {
+Tensor upsample_bilinear2d_cuda(const Tensor& self, const std::vector<int64_t>& output_size, bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w) {
     Tensor in = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
     const int64_t batchsize = in.size(0), channels = in.size(1);
@@ -802,7 +812,7 @@ Tensor upsample_bilinear2d_cuda(const Tensor& self, std::vector<int64_t> output_
     return result;
 }
 
-Tensor upsample_trilinear3d_cuda(const Tensor& self, std::vector<int64_t> output_size, bool align_corners, std::optional<double> scales_d, std::optional<double> scales_h, std::optional<double> scales_w) {
+Tensor upsample_trilinear3d_cuda(const Tensor& self, const std::vector<int64_t>& output_size, bool align_corners, std::optional<double> scales_d, std::optional<double> scales_h, std::optional<double> scales_w) {
     Tensor in = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
     const int64_t batchsize = in.size(0), channels = in.size(1);
@@ -825,13 +835,13 @@ Tensor upsample_trilinear3d_cuda(const Tensor& self, std::vector<int64_t> output
     return result;
 }
 
-Tensor upsample_linear1d_backward_cuda(const Tensor& grad_output, std::vector<int64_t> output_size, std::vector<int64_t> input_size, bool align_corners, std::optional<double> scales) {
+Tensor upsample_linear1d_backward_cuda(const Tensor& grad_output, const std::vector<int64_t>& output_size, const std::vector<int64_t>& input_size, bool align_corners, std::optional<double> scales) {
     // Accumulates with atomicAdd (no deterministic variant implemented).
     globalContext().alertNotDeterministic("upsample_linear1d_backward_cuda");
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
-    Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
+    Tensor grad_input = Tensor::zeros(grad_input_shape(go, input_size), go.dtype(), go.device());
     const int64_t batchsize = go.size(0), channels = go.size(1);
-    const int64_t W2 = output_size[0], W1 = input_size[0];
+    const int64_t W2 = output_size[0], W1 = input_size[2];
     if (go.numel() == 0 || W2 == 0 || W1 == 0) return grad_input;
     UP_DISPATCH(go, {
         dim3 block, grid;
@@ -846,13 +856,13 @@ Tensor upsample_linear1d_backward_cuda(const Tensor& grad_output, std::vector<in
     return grad_input;
 }
 
-Tensor upsample_bilinear2d_backward_cuda(const Tensor& grad_output, std::vector<int64_t> output_size, std::vector<int64_t> input_size, bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w) {
+Tensor upsample_bilinear2d_backward_cuda(const Tensor& grad_output, const std::vector<int64_t>& output_size, const std::vector<int64_t>& input_size, bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w) {
     // Accumulates with atomicAdd (no deterministic variant implemented).
     globalContext().alertNotDeterministic("upsample_bilinear2d_backward_cuda");
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
-    Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
+    Tensor grad_input = Tensor::zeros(grad_input_shape(go, input_size), go.dtype(), go.device());
     const int64_t batchsize = go.size(0), channels = go.size(1);
-    const int64_t height1 = input_size[0], width1 = input_size[1];
+    const int64_t height1 = input_size[2], width1 = input_size[3];
     const int64_t height2 = output_size[0], width2 = output_size[1];
     if (go.numel() == 0 || height2 * width2 == 0 || height1 * width1 == 0) return grad_input;
     UP_DISPATCH(go, {
@@ -870,15 +880,15 @@ Tensor upsample_bilinear2d_backward_cuda(const Tensor& grad_output, std::vector<
     return grad_input;
 }
 
-Tensor upsample_trilinear3d_backward_cuda(const Tensor& grad_output, std::vector<int64_t> output_size, std::vector<int64_t> input_size, bool align_corners, std::optional<double> scales_d, std::optional<double> scales_h, std::optional<double> scales_w) {
+Tensor upsample_trilinear3d_backward_cuda(const Tensor& grad_output, const std::vector<int64_t>& output_size, const std::vector<int64_t>& input_size, bool align_corners, std::optional<double> scales_d, std::optional<double> scales_h, std::optional<double> scales_w) {
     // Accumulates with atomicAdd (no deterministic variant implemented).
     globalContext().alertNotDeterministic("upsample_trilinear3d_backward_cuda");
     // trilinear scatter with atomicAdd; implemented as two chained bilinear
     // scatters per depth slice pair (identical weight decomposition).
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
-    Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
+    Tensor grad_input = Tensor::zeros(grad_input_shape(go, input_size), go.dtype(), go.device());
     const int64_t batchsize = go.size(0), channels = go.size(1);
-    const int64_t depth1 = input_size[0], height1 = input_size[1], width1 = input_size[2];
+    const int64_t depth1 = input_size[2], height1 = input_size[3], width1 = input_size[4];
     const int64_t depth2 = output_size[0], height2 = output_size[1], width2 = output_size[2];
     if (go.numel() == 0 || depth1 * height1 * width1 == 0 || depth2 * height2 * width2 == 0) return grad_input;
     UP_DISPATCH(go, {
@@ -897,7 +907,7 @@ Tensor upsample_trilinear3d_backward_cuda(const Tensor& grad_output, std::vector
     return grad_input;
 }
 
-Tensor upsample_bicubic2d_cuda(const Tensor& self, std::vector<int64_t> output_size, bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w) {
+Tensor upsample_bicubic2d_cuda(const Tensor& self, const std::vector<int64_t>& output_size, bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w) {
     Tensor in = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
     const int64_t batchsize = in.size(0), channels = in.size(1);
@@ -919,13 +929,13 @@ Tensor upsample_bicubic2d_cuda(const Tensor& self, std::vector<int64_t> output_s
     return result;
 }
 
-Tensor upsample_bicubic2d_backward_cuda(const Tensor& grad_output, std::vector<int64_t> output_size, std::vector<int64_t> input_size, bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w) {
+Tensor upsample_bicubic2d_backward_cuda(const Tensor& grad_output, const std::vector<int64_t>& output_size, const std::vector<int64_t>& input_size, bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w) {
     // Accumulates with atomicAdd (no deterministic variant implemented).
     globalContext().alertNotDeterministic("upsample_bicubic2d_backward_cuda");
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
-    Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
+    Tensor grad_input = Tensor::zeros(grad_input_shape(go, input_size), go.dtype(), go.device());
     const int64_t batchsize = go.size(0), channels = go.size(1);
-    const int64_t input_height = input_size[0], input_width = input_size[1];
+    const int64_t input_height = input_size[2], input_width = input_size[3];
     const int64_t output_height = output_size[0], output_width = output_size[1];
     if (go.numel() == 0) return grad_input;
     UP_DISPATCH(go, {
@@ -1261,9 +1271,9 @@ Tensor aa_2d_backward_cuda(const Tensor& grad_output, const std::vector<int64_t>
                            const std::optional<double>& scales_h, const std::optional<double>& scales_w,
                            int taps_half, aa_filter_h filter) {
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
-    Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
+    Tensor grad_input = Tensor::zeros(grad_input_shape(go, input_size), go.dtype(), go.device());
     const int64_t N = go.size(0), C = go.size(1);
-    const int64_t H1 = input_size[0], W1 = input_size[1];
+    const int64_t H1 = input_size[2], W1 = input_size[3];
     const int64_t H2 = output_size[0], W2 = output_size[1];
     if (go.numel() == 0 || H1 == 0 || W1 == 0 || H2 == 0 || W2 == 0) return grad_input;
     const double sh = aa_axis_scale_h(H1, H2, align_corners, scales_h);
@@ -1287,7 +1297,7 @@ Tensor aa_2d_backward_cuda(const Tensor& grad_output, const std::vector<int64_t>
 
 } // anonymous namespace
 
-Tensor upsample_bilinear2d_aa_cuda(const Tensor& self, std::vector<int64_t> output_size,
+Tensor upsample_bilinear2d_aa_cuda(const Tensor& self, const std::vector<int64_t>& output_size,
                                    bool align_corners, std::optional<double> scales_h,
                                    std::optional<double> scales_w) {
     Tensor in = self.is_contiguous() ? self : self.contiguous();
@@ -1295,7 +1305,7 @@ Tensor upsample_bilinear2d_aa_cuda(const Tensor& self, std::vector<int64_t> outp
                               /*taps_half=*/1, aa_triangle_h);
 }
 
-Tensor upsample_bicubic2d_aa_cuda(const Tensor& self, std::vector<int64_t> output_size,
+Tensor upsample_bicubic2d_aa_cuda(const Tensor& self, const std::vector<int64_t>& output_size,
                                   bool align_corners, std::optional<double> scales_h,
                                   std::optional<double> scales_w) {
     Tensor in = self.is_contiguous() ? self : self.contiguous();
@@ -1303,49 +1313,49 @@ Tensor upsample_bicubic2d_aa_cuda(const Tensor& self, std::vector<int64_t> outpu
                               /*taps_half=*/2, aa_cubic_h);
 }
 
-Tensor upsample_bilinear2d_aa_backward_cuda(const Tensor& grad_output, std::vector<int64_t> output_size,
-                                            std::vector<int64_t> input_size, bool align_corners,
+Tensor upsample_bilinear2d_aa_backward_cuda(const Tensor& grad_output, const std::vector<int64_t>& output_size,
+                                            const std::vector<int64_t>& input_size, bool align_corners,
                                             std::optional<double> scales_h, std::optional<double> scales_w) {
     return aa_2d_backward_cuda(grad_output, output_size, input_size, align_corners, scales_h, scales_w,
                                /*taps_half=*/1, aa_triangle_h);
 }
 
-Tensor upsample_bicubic2d_aa_backward_cuda(const Tensor& grad_output, std::vector<int64_t> output_size,
-                                           std::vector<int64_t> input_size, bool align_corners,
+Tensor upsample_bicubic2d_aa_backward_cuda(const Tensor& grad_output, const std::vector<int64_t>& output_size,
+                                           const std::vector<int64_t>& input_size, bool align_corners,
                                            std::optional<double> scales_h, std::optional<double> scales_w) {
     return aa_2d_backward_cuda(grad_output, output_size, input_size, align_corners, scales_h, scales_w,
                                /*taps_half=*/2, aa_cubic_h);
 }
 
-Tensor& upsample_bilinear2d_aa_out_cuda(const Tensor& self, std::vector<int64_t> output_size,
+Tensor& upsample_bilinear2d_aa_out_cuda(const Tensor& self, const std::vector<int64_t>& output_size,
                                         bool align_corners, std::optional<double> scales_h,
                                         std::optional<double> scales_w, Tensor& out) {
-    out = upsample_bilinear2d_aa_cuda(self, std::move(output_size), align_corners, scales_h, scales_w);
+    write_out(out, upsample_bilinear2d_aa_cuda(self, std::move(output_size), align_corners, scales_h, scales_w));
     return out;
 }
 
-Tensor& upsample_bicubic2d_aa_out_cuda(const Tensor& self, std::vector<int64_t> output_size,
+Tensor& upsample_bicubic2d_aa_out_cuda(const Tensor& self, const std::vector<int64_t>& output_size,
                                        bool align_corners, std::optional<double> scales_h,
                                        std::optional<double> scales_w, Tensor& out) {
-    out = upsample_bicubic2d_aa_cuda(self, std::move(output_size), align_corners, scales_h, scales_w);
+    write_out(out, upsample_bicubic2d_aa_cuda(self, std::move(output_size), align_corners, scales_h, scales_w));
     return out;
 }
 
-Tensor& upsample_bilinear2d_aa_backward_grad_input_cuda(const Tensor& grad_output, std::vector<int64_t> output_size,
-                                                        std::vector<int64_t> input_size, bool align_corners,
+Tensor& upsample_bilinear2d_aa_backward_grad_input_cuda(const Tensor& grad_output, const std::vector<int64_t>& output_size,
+                                                        const std::vector<int64_t>& input_size, bool align_corners,
                                                         std::optional<double> scales_h,
                                                         std::optional<double> scales_w, Tensor& grad_input) {
-    grad_input = upsample_bilinear2d_aa_backward_cuda(grad_output, std::move(output_size),
-                                                      std::move(input_size), align_corners, scales_h, scales_w);
+    write_out(grad_input, upsample_bilinear2d_aa_backward_cuda(grad_output, std::move(output_size),
+                                                      std::move(input_size), align_corners, scales_h, scales_w));
     return grad_input;
 }
 
-Tensor& upsample_bicubic2d_aa_backward_grad_input_cuda(const Tensor& grad_output, std::vector<int64_t> output_size,
-                                                       std::vector<int64_t> input_size, bool align_corners,
+Tensor& upsample_bicubic2d_aa_backward_grad_input_cuda(const Tensor& grad_output, const std::vector<int64_t>& output_size,
+                                                       const std::vector<int64_t>& input_size, bool align_corners,
                                                        std::optional<double> scales_h,
                                                        std::optional<double> scales_w, Tensor& grad_input) {
-    grad_input = upsample_bicubic2d_aa_backward_cuda(grad_output, std::move(output_size),
-                                                     std::move(input_size), align_corners, scales_h, scales_w);
+    write_out(grad_input, upsample_bicubic2d_aa_backward_cuda(grad_output, std::move(output_size),
+                                                     std::move(input_size), align_corners, scales_h, scales_w));
     return grad_input;
 }
 
@@ -1373,22 +1383,22 @@ std::vector<int64_t> aa_vec_output_size_h(const Tensor& input,
 } // anonymous namespace
 
 Tensor _upsample_bilinear2d_aa_vec_cuda(const Tensor& input,
-                                        std::optional<std::vector<int64_t>> output_size,
+                                        const std::optional<std::vector<int64_t>>& output_size,
                                         bool align_corners,
-                                        std::optional<std::vector<double>> scale_factors) {
+                                        const std::optional<std::vector<double>>& scale_factors) {
     return tpx::ops::_upsample_bilinear2d_aa(
         input, aa_vec_output_size_h(input, output_size, scale_factors), align_corners);
 }
 
 Tensor _upsample_bicubic2d_aa_vec_cuda(const Tensor& input,
-                                       std::optional<std::vector<int64_t>> output_size,
+                                       const std::optional<std::vector<int64_t>>& output_size,
                                        bool align_corners,
-                                       std::optional<std::vector<double>> scale_factors) {
+                                       const std::optional<std::vector<double>>& scale_factors) {
     return tpx::ops::_upsample_bicubic2d_aa(
         input, aa_vec_output_size_h(input, output_size, scale_factors), align_corners);
 }
 
-Tensor _upsample_nearest_exact1d_cuda(const Tensor& self, std::vector<int64_t> output_size,
+Tensor _upsample_nearest_exact1d_cuda(const Tensor& self, const std::vector<int64_t>& output_size,
                                       std::optional<double> scales) {
     Tensor in = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
@@ -1406,7 +1416,7 @@ Tensor _upsample_nearest_exact1d_cuda(const Tensor& self, std::vector<int64_t> o
     return result;
 }
 
-Tensor _upsample_nearest_exact2d_cuda(const Tensor& self, std::vector<int64_t> output_size,
+Tensor _upsample_nearest_exact2d_cuda(const Tensor& self, const std::vector<int64_t>& output_size,
                                       std::optional<double> scales_h, std::optional<double> scales_w) {
     Tensor in = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
@@ -1425,7 +1435,7 @@ Tensor _upsample_nearest_exact2d_cuda(const Tensor& self, std::vector<int64_t> o
     return result;
 }
 
-Tensor _upsample_nearest_exact3d_cuda(const Tensor& self, std::vector<int64_t> output_size,
+Tensor _upsample_nearest_exact3d_cuda(const Tensor& self, const std::vector<int64_t>& output_size,
                                       std::optional<double> scales_d, std::optional<double> scales_h,
                                       std::optional<double> scales_w) {
     Tensor in = self.is_contiguous() ? self : self.contiguous();
@@ -1446,12 +1456,12 @@ Tensor _upsample_nearest_exact3d_cuda(const Tensor& self, std::vector<int64_t> o
     return result;
 }
 
-Tensor _upsample_nearest_exact1d_backward_cuda(const Tensor& grad_output, std::vector<int64_t> output_size,
-                                               std::vector<int64_t> input_size, std::optional<double> scales) {
+Tensor _upsample_nearest_exact1d_backward_cuda(const Tensor& grad_output, const std::vector<int64_t>& output_size,
+                                               const std::vector<int64_t>& input_size, std::optional<double> scales) {
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
-    Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
+    Tensor grad_input = Tensor::zeros(grad_input_shape(go, input_size), go.dtype(), go.device());
     const int64_t N = go.size(0), C = go.size(1);
-    const int64_t W1 = input_size[0], W2 = output_size[0];
+    const int64_t W1 = input_size[2], W2 = output_size[0];
     if (go.numel() == 0 || W1 == 0 || W2 == 0) return grad_input;
     UP_DISPATCH(go, {
         dim3 block, grid;
@@ -1464,13 +1474,13 @@ Tensor _upsample_nearest_exact1d_backward_cuda(const Tensor& grad_output, std::v
     return grad_input;
 }
 
-Tensor _upsample_nearest_exact2d_backward_cuda(const Tensor& grad_output, std::vector<int64_t> output_size,
-                                               std::vector<int64_t> input_size, std::optional<double> scales_h,
+Tensor _upsample_nearest_exact2d_backward_cuda(const Tensor& grad_output, const std::vector<int64_t>& output_size,
+                                               const std::vector<int64_t>& input_size, std::optional<double> scales_h,
                                                std::optional<double> scales_w) {
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
-    Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
+    Tensor grad_input = Tensor::zeros(grad_input_shape(go, input_size), go.dtype(), go.device());
     const int64_t N = go.size(0), C = go.size(1);
-    const int64_t H1 = input_size[0], W1 = input_size[1];
+    const int64_t H1 = input_size[2], W1 = input_size[3];
     const int64_t H2 = output_size[0], W2 = output_size[1];
     if (go.numel() == 0 || H1 * W1 == 0 || H2 * W2 == 0) return grad_input;
     UP_DISPATCH(go, {
@@ -1484,13 +1494,13 @@ Tensor _upsample_nearest_exact2d_backward_cuda(const Tensor& grad_output, std::v
     return grad_input;
 }
 
-Tensor _upsample_nearest_exact3d_backward_cuda(const Tensor& grad_output, std::vector<int64_t> output_size,
-                                               std::vector<int64_t> input_size, std::optional<double> scales_d,
+Tensor _upsample_nearest_exact3d_backward_cuda(const Tensor& grad_output, const std::vector<int64_t>& output_size,
+                                               const std::vector<int64_t>& input_size, std::optional<double> scales_d,
                                                std::optional<double> scales_h, std::optional<double> scales_w) {
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
-    Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
+    Tensor grad_input = Tensor::zeros(grad_input_shape(go, input_size), go.dtype(), go.device());
     const int64_t N = go.size(0), C = go.size(1);
-    const int64_t D1 = input_size[0], H1 = input_size[1], W1 = input_size[2];
+    const int64_t D1 = input_size[2], H1 = input_size[3], W1 = input_size[4];
     const int64_t D2 = output_size[0], H2 = output_size[1], W2 = output_size[2];
     if (go.numel() == 0 || D1 * H1 * W1 == 0 || D2 * H2 * W2 == 0) return grad_input;
     UP_DISPATCH(go, {
@@ -1506,195 +1516,195 @@ Tensor _upsample_nearest_exact3d_backward_cuda(const Tensor& grad_output, std::v
     return grad_input;
 }
 
-Tensor& upsample_nearest_exact1d_out_cuda(const Tensor& self, std::vector<int64_t> output_size,
+Tensor& upsample_nearest_exact1d_out_cuda(const Tensor& self, const std::vector<int64_t>& output_size,
                                           std::optional<double> scales, Tensor& out) {
-    out = _upsample_nearest_exact1d_cuda(self, std::move(output_size), scales);
+    write_out(out, _upsample_nearest_exact1d_cuda(self, std::move(output_size), scales));
     return out;
 }
 
-Tensor& upsample_nearest_exact2d_out_cuda(const Tensor& self, std::vector<int64_t> output_size,
+Tensor& upsample_nearest_exact2d_out_cuda(const Tensor& self, const std::vector<int64_t>& output_size,
                                           std::optional<double> scales_h, std::optional<double> scales_w,
                                           Tensor& out) {
-    out = _upsample_nearest_exact2d_cuda(self, std::move(output_size), scales_h, scales_w);
+    write_out(out, _upsample_nearest_exact2d_cuda(self, std::move(output_size), scales_h, scales_w));
     return out;
 }
 
-Tensor& upsample_nearest_exact3d_out_cuda(const Tensor& self, std::vector<int64_t> output_size,
+Tensor& upsample_nearest_exact3d_out_cuda(const Tensor& self, const std::vector<int64_t>& output_size,
                                           std::optional<double> scales_d, std::optional<double> scales_h,
                                           std::optional<double> scales_w, Tensor& out) {
-    out = _upsample_nearest_exact3d_cuda(self, std::move(output_size), scales_d, scales_h, scales_w);
+    write_out(out, _upsample_nearest_exact3d_cuda(self, std::move(output_size), scales_d, scales_h, scales_w));
     return out;
 }
 
-Tensor& upsample_nearest_exact1d_backward_grad_input_cuda(const Tensor& grad_output, std::vector<int64_t> output_size,
-                                                          std::vector<int64_t> input_size, std::optional<double> scales,
+Tensor& upsample_nearest_exact1d_backward_grad_input_cuda(const Tensor& grad_output, const std::vector<int64_t>& output_size,
+                                                          const std::vector<int64_t>& input_size, std::optional<double> scales,
                                                           Tensor& grad_input) {
-    grad_input = _upsample_nearest_exact1d_backward_cuda(grad_output, std::move(output_size),
-                                                         std::move(input_size), scales);
+    write_out(grad_input, _upsample_nearest_exact1d_backward_cuda(grad_output, std::move(output_size),
+                                                         std::move(input_size), scales));
     return grad_input;
 }
 
-Tensor& upsample_nearest_exact2d_backward_grad_input_cuda(const Tensor& grad_output, std::vector<int64_t> output_size,
-                                                          std::vector<int64_t> input_size, std::optional<double> scales_h,
+Tensor& upsample_nearest_exact2d_backward_grad_input_cuda(const Tensor& grad_output, const std::vector<int64_t>& output_size,
+                                                          const std::vector<int64_t>& input_size, std::optional<double> scales_h,
                                                           std::optional<double> scales_w, Tensor& grad_input) {
-    grad_input = _upsample_nearest_exact2d_backward_cuda(grad_output, std::move(output_size),
-                                                         std::move(input_size), scales_h, scales_w);
+    write_out(grad_input, _upsample_nearest_exact2d_backward_cuda(grad_output, std::move(output_size),
+                                                         std::move(input_size), scales_h, scales_w));
     return grad_input;
 }
 
-Tensor& upsample_nearest_exact3d_backward_grad_input_cuda(const Tensor& grad_output, std::vector<int64_t> output_size,
-                                                          std::vector<int64_t> input_size, std::optional<double> scales_d,
+Tensor& upsample_nearest_exact3d_backward_grad_input_cuda(const Tensor& grad_output, const std::vector<int64_t>& output_size,
+                                                          const std::vector<int64_t>& input_size, std::optional<double> scales_d,
                                                           std::optional<double> scales_h, std::optional<double> scales_w,
                                                           Tensor& grad_input) {
-    grad_input = _upsample_nearest_exact3d_backward_cuda(grad_output, std::move(output_size),
-                                                         std::move(input_size), scales_d, scales_h, scales_w);
+    write_out(grad_input, _upsample_nearest_exact3d_backward_cuda(grad_output, std::move(output_size),
+                                                         std::move(input_size), scales_d, scales_h, scales_w));
     return grad_input;
 }
 
 namespace {
 
 Tensor& upsample_nearest1d_out_cuda(const Tensor& self,
-                                    std::vector<int64_t> output_size,
+                                    const std::vector<int64_t>& output_size,
                                     std::optional<double> scales,
                                     Tensor& out) {
-    out = upsample_nearest1d_cuda(self, std::move(output_size), scales);
+    write_out(out, upsample_nearest1d_cuda(self, std::move(output_size), scales));
     return out;
 }
 
 Tensor& upsample_nearest2d_out_cuda(const Tensor& self,
-                                    std::vector<int64_t> output_size,
+                                    const std::vector<int64_t>& output_size,
                                     std::optional<double> scales_h,
                                     std::optional<double> scales_w,
                                     Tensor& out) {
-    out = upsample_nearest2d_cuda(self, std::move(output_size), scales_h,
-                                  scales_w);
+    write_out(out, upsample_nearest2d_cuda(self, std::move(output_size), scales_h,
+                                  scales_w));
     return out;
 }
 
 Tensor& upsample_nearest3d_out_cuda(const Tensor& self,
-                                    std::vector<int64_t> output_size,
+                                    const std::vector<int64_t>& output_size,
                                     std::optional<double> scales_d,
                                     std::optional<double> scales_h,
                                     std::optional<double> scales_w,
                                     Tensor& out) {
-    out = upsample_nearest3d_cuda(self, std::move(output_size), scales_d,
-                                  scales_h, scales_w);
+    write_out(out, upsample_nearest3d_cuda(self, std::move(output_size), scales_d,
+                                  scales_h, scales_w));
     return out;
 }
 
 Tensor& upsample_nearest1d_backward_grad_input_cuda(
-    const Tensor& grad_output, std::vector<int64_t> output_size,
-    std::vector<int64_t> input_size, std::optional<double> scales,
+    const Tensor& grad_output, const std::vector<int64_t>& output_size,
+    const std::vector<int64_t>& input_size, std::optional<double> scales,
     Tensor& grad_input) {
-    grad_input = upsample_nearest1d_backward_cuda(
-        grad_output, std::move(output_size), std::move(input_size), scales);
+    write_out(grad_input, upsample_nearest1d_backward_cuda(
+        grad_output, std::move(output_size), std::move(input_size), scales));
     return grad_input;
 }
 
 Tensor& upsample_nearest2d_backward_grad_input_cuda(
-    const Tensor& grad_output, std::vector<int64_t> output_size,
-    std::vector<int64_t> input_size, std::optional<double> scales_h,
+    const Tensor& grad_output, const std::vector<int64_t>& output_size,
+    const std::vector<int64_t>& input_size, std::optional<double> scales_h,
     std::optional<double> scales_w, Tensor& grad_input) {
-    grad_input = upsample_nearest2d_backward_cuda(
+    write_out(grad_input, upsample_nearest2d_backward_cuda(
         grad_output, std::move(output_size), std::move(input_size), scales_h,
-        scales_w);
+        scales_w));
     return grad_input;
 }
 
 Tensor& upsample_nearest3d_backward_grad_input_cuda(
-    const Tensor& grad_output, std::vector<int64_t> output_size,
-    std::vector<int64_t> input_size, std::optional<double> scales_d,
+    const Tensor& grad_output, const std::vector<int64_t>& output_size,
+    const std::vector<int64_t>& input_size, std::optional<double> scales_d,
     std::optional<double> scales_h, std::optional<double> scales_w,
     Tensor& grad_input) {
-    grad_input = upsample_nearest3d_backward_cuda(
+    write_out(grad_input, upsample_nearest3d_backward_cuda(
         grad_output, std::move(output_size), std::move(input_size), scales_d,
-        scales_h, scales_w);
+        scales_h, scales_w));
     return grad_input;
 }
 
 Tensor& upsample_linear1d_out_cuda(const Tensor& self,
-                                   std::vector<int64_t> output_size,
+                                   const std::vector<int64_t>& output_size,
                                    bool align_corners,
                                    std::optional<double> scales, Tensor& out) {
-    out = upsample_linear1d_cuda(self, std::move(output_size), align_corners,
-                                 scales);
+    write_out(out, upsample_linear1d_cuda(self, std::move(output_size), align_corners,
+                                 scales));
     return out;
 }
 
 Tensor& upsample_linear1d_backward_grad_input_cuda(
-    const Tensor& grad_output, std::vector<int64_t> output_size,
-    std::vector<int64_t> input_size, bool align_corners,
+    const Tensor& grad_output, const std::vector<int64_t>& output_size,
+    const std::vector<int64_t>& input_size, bool align_corners,
     std::optional<double> scales, Tensor& grad_input) {
-    grad_input = upsample_linear1d_backward_cuda(
+    write_out(grad_input, upsample_linear1d_backward_cuda(
         grad_output, std::move(output_size), std::move(input_size),
-        align_corners, scales);
+        align_corners, scales));
     return grad_input;
 }
 
 Tensor& upsample_bilinear2d_out_cuda(const Tensor& self,
-                                     std::vector<int64_t> output_size,
+                                     const std::vector<int64_t>& output_size,
                                      bool align_corners,
                                      std::optional<double> scales_h,
                                      std::optional<double> scales_w,
                                      Tensor& out) {
-    out = upsample_bilinear2d_cuda(self, std::move(output_size), align_corners,
-                                   scales_h, scales_w);
+    write_out(out, upsample_bilinear2d_cuda(self, std::move(output_size), align_corners,
+                                   scales_h, scales_w));
     return out;
 }
 
 Tensor& upsample_bilinear2d_backward_grad_input_cuda(
-    const Tensor& grad_output, std::vector<int64_t> output_size,
-    std::vector<int64_t> input_size, bool align_corners,
+    const Tensor& grad_output, const std::vector<int64_t>& output_size,
+    const std::vector<int64_t>& input_size, bool align_corners,
     std::optional<double> scales_h, std::optional<double> scales_w,
     Tensor& grad_input) {
-    grad_input = upsample_bilinear2d_backward_cuda(
+    write_out(grad_input, upsample_bilinear2d_backward_cuda(
         grad_output, std::move(output_size), std::move(input_size),
-        align_corners, scales_h, scales_w);
+        align_corners, scales_h, scales_w));
     return grad_input;
 }
 
 Tensor& upsample_bicubic2d_out_cuda(const Tensor& self,
-                                    std::vector<int64_t> output_size,
+                                    const std::vector<int64_t>& output_size,
                                     bool align_corners,
                                     std::optional<double> scales_h,
                                     std::optional<double> scales_w,
                                     Tensor& out) {
-    out = upsample_bicubic2d_cuda(self, std::move(output_size), align_corners,
-                                  scales_h, scales_w);
+    write_out(out, upsample_bicubic2d_cuda(self, std::move(output_size), align_corners,
+                                  scales_h, scales_w));
     return out;
 }
 
 Tensor& upsample_bicubic2d_backward_grad_input_cuda(
-    const Tensor& grad_output, std::vector<int64_t> output_size,
-    std::vector<int64_t> input_size, bool align_corners,
+    const Tensor& grad_output, const std::vector<int64_t>& output_size,
+    const std::vector<int64_t>& input_size, bool align_corners,
     std::optional<double> scales_h, std::optional<double> scales_w,
     Tensor& grad_input) {
-    grad_input = upsample_bicubic2d_backward_cuda(
+    write_out(grad_input, upsample_bicubic2d_backward_cuda(
         grad_output, std::move(output_size), std::move(input_size),
-        align_corners, scales_h, scales_w);
+        align_corners, scales_h, scales_w));
     return grad_input;
 }
 
 Tensor& upsample_trilinear3d_out_cuda(const Tensor& self,
-                                      std::vector<int64_t> output_size,
+                                      const std::vector<int64_t>& output_size,
                                       bool align_corners,
                                       std::optional<double> scales_d,
                                       std::optional<double> scales_h,
                                       std::optional<double> scales_w,
                                       Tensor& out) {
-    out = upsample_trilinear3d_cuda(self, std::move(output_size), align_corners,
-                                    scales_d, scales_h, scales_w);
+    write_out(out, upsample_trilinear3d_cuda(self, std::move(output_size), align_corners,
+                                    scales_d, scales_h, scales_w));
     return out;
 }
 
 Tensor& upsample_trilinear3d_backward_grad_input_cuda(
-    const Tensor& grad_output, std::vector<int64_t> output_size,
-    std::vector<int64_t> input_size, bool align_corners,
+    const Tensor& grad_output, const std::vector<int64_t>& output_size,
+    const std::vector<int64_t>& input_size, bool align_corners,
     std::optional<double> scales_d, std::optional<double> scales_h,
     std::optional<double> scales_w, Tensor& grad_input) {
-    grad_input = upsample_trilinear3d_backward_cuda(
+    write_out(grad_input, upsample_trilinear3d_backward_cuda(
         grad_output, std::move(output_size), std::move(input_size),
-        align_corners, scales_d, scales_h, scales_w);
+        align_corners, scales_d, scales_h, scales_w));
     return grad_input;
 }
 

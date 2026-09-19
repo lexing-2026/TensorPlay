@@ -22,6 +22,7 @@
 #include <cmath>
 #include <optional>
 #include <vector>
+#include "OutWrite.h"
 
 namespace tensorplay {
 
@@ -86,23 +87,23 @@ Tensor& alias_erfinv_out(const Tensor& self, Tensor& out);
 Tensor alias_ndtr(const Tensor& self);
 Tensor& alias_ndtr_out(const Tensor& self, Tensor& out);
 Tensor alias_xlog1py(const Tensor& self, const Tensor& other);
-Tensor alias_xlog1py_self_scalar(Scalar self, const Tensor& other);
-Tensor alias_xlog1py_other_scalar(const Tensor& self, Scalar other);
+Tensor alias_xlog1py_self_scalar(const Scalar& self, const Tensor& other);
+Tensor alias_xlog1py_other_scalar(const Tensor& self, const Scalar& other);
 Tensor& alias_xlog1py_out(const Tensor& self, const Tensor& other, Tensor& out);
-Tensor& alias_xlog1py_self_scalar_out(Scalar self, const Tensor& other, Tensor& out);
-Tensor& alias_xlog1py_other_scalar_out(const Tensor& self, Scalar other, Tensor& out);
+Tensor& alias_xlog1py_self_scalar_out(const Scalar& self, const Tensor& other, Tensor& out);
+Tensor& alias_xlog1py_other_scalar_out(const Tensor& self, const Scalar& other, Tensor& out);
 Tensor alias_xlogy(const Tensor& self, const Tensor& other);
-Tensor alias_xlogy_self_scalar(Scalar self, const Tensor& other);
-Tensor alias_xlogy_other_scalar(const Tensor& self, Scalar other);
+Tensor alias_xlogy_self_scalar(const Scalar& self, const Tensor& other);
+Tensor alias_xlogy_other_scalar(const Tensor& self, const Scalar& other);
 Tensor& alias_xlogy_out(const Tensor& self, const Tensor& other, Tensor& out);
-Tensor& alias_xlogy_self_scalar_out(Scalar self, const Tensor& other, Tensor& out);
-Tensor& alias_xlogy_other_scalar_out(const Tensor& self, Scalar other, Tensor& out);
+Tensor& alias_xlogy_self_scalar_out(const Scalar& self, const Tensor& other, Tensor& out);
+Tensor& alias_xlogy_other_scalar_out(const Tensor& self, const Scalar& other, Tensor& out);
 Tensor alias_zeta(const Tensor& self, const Tensor& other);
-Tensor alias_zeta_self_scalar(Scalar self, const Tensor& other);
-Tensor alias_zeta_other_scalar(const Tensor& self, Scalar other);
+Tensor alias_zeta_self_scalar(const Scalar& self, const Tensor& other);
+Tensor alias_zeta_other_scalar(const Tensor& self, const Scalar& other);
 Tensor& alias_zeta_out(const Tensor& self, const Tensor& other, Tensor& out);
-Tensor& alias_zeta_self_scalar_out(Scalar self, const Tensor& other, Tensor& out);
-Tensor& alias_zeta_other_scalar_out(const Tensor& self, Scalar other, Tensor& out);
+Tensor& alias_zeta_self_scalar_out(const Scalar& self, const Tensor& other, Tensor& out);
+Tensor& alias_zeta_other_scalar_out(const Tensor& self, const Scalar& other, Tensor& out);
 Tensor alias_i0(const Tensor& self);
 Tensor& alias_i0_out(const Tensor& self, Tensor& out);
 Tensor alias_i0e(const Tensor& self);
@@ -144,53 +145,53 @@ Tensor& alias_bessel_y0_out(const Tensor& self, Tensor& out);
 Tensor alias_bessel_y1(const Tensor& self);
 Tensor& alias_bessel_y1_out(const Tensor& self, Tensor& out);
 Tensor alias_chebyshev_polynomial_t(const Tensor& x, const Tensor& n);
-Tensor alias_chebyshev_polynomial_t_x_scalar(Scalar x, const Tensor& n);
-Tensor alias_chebyshev_polynomial_t_n_scalar(const Tensor& x, Scalar n);
+Tensor alias_chebyshev_polynomial_t_x_scalar(const Scalar& x, const Tensor& n);
+Tensor alias_chebyshev_polynomial_t_n_scalar(const Tensor& x, const Scalar& n);
 Tensor& alias_chebyshev_polynomial_t_out(const Tensor& x, const Tensor& n, Tensor& out);
-Tensor& alias_chebyshev_polynomial_t_x_scalar_out(Scalar x, const Tensor& n, Tensor& out);
-Tensor& alias_chebyshev_polynomial_t_n_scalar_out(const Tensor& x, Scalar n, Tensor& out);
+Tensor& alias_chebyshev_polynomial_t_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out);
+Tensor& alias_chebyshev_polynomial_t_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out);
 Tensor alias_chebyshev_polynomial_u(const Tensor& x, const Tensor& n);
-Tensor alias_chebyshev_polynomial_u_x_scalar(Scalar x, const Tensor& n);
-Tensor alias_chebyshev_polynomial_u_n_scalar(const Tensor& x, Scalar n);
+Tensor alias_chebyshev_polynomial_u_x_scalar(const Scalar& x, const Tensor& n);
+Tensor alias_chebyshev_polynomial_u_n_scalar(const Tensor& x, const Scalar& n);
 Tensor& alias_chebyshev_polynomial_u_out(const Tensor& x, const Tensor& n, Tensor& out);
-Tensor& alias_chebyshev_polynomial_u_x_scalar_out(Scalar x, const Tensor& n, Tensor& out);
-Tensor& alias_chebyshev_polynomial_u_n_scalar_out(const Tensor& x, Scalar n, Tensor& out);
+Tensor& alias_chebyshev_polynomial_u_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out);
+Tensor& alias_chebyshev_polynomial_u_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out);
 Tensor alias_chebyshev_polynomial_v(const Tensor& x, const Tensor& n);
-Tensor alias_chebyshev_polynomial_v_x_scalar(Scalar x, const Tensor& n);
-Tensor alias_chebyshev_polynomial_v_n_scalar(const Tensor& x, Scalar n);
+Tensor alias_chebyshev_polynomial_v_x_scalar(const Scalar& x, const Tensor& n);
+Tensor alias_chebyshev_polynomial_v_n_scalar(const Tensor& x, const Scalar& n);
 Tensor& alias_chebyshev_polynomial_v_out(const Tensor& x, const Tensor& n, Tensor& out);
-Tensor& alias_chebyshev_polynomial_v_x_scalar_out(Scalar x, const Tensor& n, Tensor& out);
-Tensor& alias_chebyshev_polynomial_v_n_scalar_out(const Tensor& x, Scalar n, Tensor& out);
+Tensor& alias_chebyshev_polynomial_v_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out);
+Tensor& alias_chebyshev_polynomial_v_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out);
 Tensor alias_chebyshev_polynomial_w(const Tensor& x, const Tensor& n);
-Tensor alias_chebyshev_polynomial_w_x_scalar(Scalar x, const Tensor& n);
-Tensor alias_chebyshev_polynomial_w_n_scalar(const Tensor& x, Scalar n);
+Tensor alias_chebyshev_polynomial_w_x_scalar(const Scalar& x, const Tensor& n);
+Tensor alias_chebyshev_polynomial_w_n_scalar(const Tensor& x, const Scalar& n);
 Tensor& alias_chebyshev_polynomial_w_out(const Tensor& x, const Tensor& n, Tensor& out);
-Tensor& alias_chebyshev_polynomial_w_x_scalar_out(Scalar x, const Tensor& n, Tensor& out);
-Tensor& alias_chebyshev_polynomial_w_n_scalar_out(const Tensor& x, Scalar n, Tensor& out);
+Tensor& alias_chebyshev_polynomial_w_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out);
+Tensor& alias_chebyshev_polynomial_w_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out);
 Tensor alias_hermite_polynomial_h(const Tensor& x, const Tensor& n);
-Tensor alias_hermite_polynomial_h_x_scalar(Scalar x, const Tensor& n);
-Tensor alias_hermite_polynomial_h_n_scalar(const Tensor& x, Scalar n);
+Tensor alias_hermite_polynomial_h_x_scalar(const Scalar& x, const Tensor& n);
+Tensor alias_hermite_polynomial_h_n_scalar(const Tensor& x, const Scalar& n);
 Tensor& alias_hermite_polynomial_h_out(const Tensor& x, const Tensor& n, Tensor& out);
-Tensor& alias_hermite_polynomial_h_x_scalar_out(Scalar x, const Tensor& n, Tensor& out);
-Tensor& alias_hermite_polynomial_h_n_scalar_out(const Tensor& x, Scalar n, Tensor& out);
+Tensor& alias_hermite_polynomial_h_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out);
+Tensor& alias_hermite_polynomial_h_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out);
 Tensor alias_hermite_polynomial_he(const Tensor& x, const Tensor& n);
-Tensor alias_hermite_polynomial_he_x_scalar(Scalar x, const Tensor& n);
-Tensor alias_hermite_polynomial_he_n_scalar(const Tensor& x, Scalar n);
+Tensor alias_hermite_polynomial_he_x_scalar(const Scalar& x, const Tensor& n);
+Tensor alias_hermite_polynomial_he_n_scalar(const Tensor& x, const Scalar& n);
 Tensor& alias_hermite_polynomial_he_out(const Tensor& x, const Tensor& n, Tensor& out);
-Tensor& alias_hermite_polynomial_he_x_scalar_out(Scalar x, const Tensor& n, Tensor& out);
-Tensor& alias_hermite_polynomial_he_n_scalar_out(const Tensor& x, Scalar n, Tensor& out);
+Tensor& alias_hermite_polynomial_he_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out);
+Tensor& alias_hermite_polynomial_he_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out);
 Tensor alias_laguerre_polynomial_l(const Tensor& x, const Tensor& n);
-Tensor alias_laguerre_polynomial_l_x_scalar(Scalar x, const Tensor& n);
-Tensor alias_laguerre_polynomial_l_n_scalar(const Tensor& x, Scalar n);
+Tensor alias_laguerre_polynomial_l_x_scalar(const Scalar& x, const Tensor& n);
+Tensor alias_laguerre_polynomial_l_n_scalar(const Tensor& x, const Scalar& n);
 Tensor& alias_laguerre_polynomial_l_out(const Tensor& x, const Tensor& n, Tensor& out);
-Tensor& alias_laguerre_polynomial_l_x_scalar_out(Scalar x, const Tensor& n, Tensor& out);
-Tensor& alias_laguerre_polynomial_l_n_scalar_out(const Tensor& x, Scalar n, Tensor& out);
+Tensor& alias_laguerre_polynomial_l_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out);
+Tensor& alias_laguerre_polynomial_l_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out);
 Tensor alias_legendre_polynomial_p(const Tensor& x, const Tensor& n);
-Tensor alias_legendre_polynomial_p_x_scalar(Scalar x, const Tensor& n);
-Tensor alias_legendre_polynomial_p_n_scalar(const Tensor& x, Scalar n);
+Tensor alias_legendre_polynomial_p_x_scalar(const Scalar& x, const Tensor& n);
+Tensor alias_legendre_polynomial_p_n_scalar(const Tensor& x, const Scalar& n);
 Tensor& alias_legendre_polynomial_p_out(const Tensor& x, const Tensor& n, Tensor& out);
-Tensor& alias_legendre_polynomial_p_x_scalar_out(Scalar x, const Tensor& n, Tensor& out);
-Tensor& alias_legendre_polynomial_p_n_scalar_out(const Tensor& x, Scalar n, Tensor& out);
+Tensor& alias_legendre_polynomial_p_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out);
+Tensor& alias_legendre_polynomial_p_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out);
 Tensor alias_modified_bessel_i0(const Tensor& self);
 Tensor& alias_modified_bessel_i0_out(const Tensor& self, Tensor& out);
 Tensor alias_modified_bessel_i1(const Tensor& self);
@@ -204,29 +205,29 @@ Tensor& alias_scaled_modified_bessel_k0_out(const Tensor& x, Tensor& out);
 Tensor alias_scaled_modified_bessel_k1(const Tensor& x);
 Tensor& alias_scaled_modified_bessel_k1_out(const Tensor& x, Tensor& out);
 Tensor alias_shifted_chebyshev_polynomial_t(const Tensor& x, const Tensor& n);
-Tensor alias_shifted_chebyshev_polynomial_t_x_scalar(Scalar x, const Tensor& n);
-Tensor alias_shifted_chebyshev_polynomial_t_n_scalar(const Tensor& x, Scalar n);
+Tensor alias_shifted_chebyshev_polynomial_t_x_scalar(const Scalar& x, const Tensor& n);
+Tensor alias_shifted_chebyshev_polynomial_t_n_scalar(const Tensor& x, const Scalar& n);
 Tensor& alias_shifted_chebyshev_polynomial_t_out(const Tensor& x, const Tensor& n, Tensor& out);
-Tensor& alias_shifted_chebyshev_polynomial_t_x_scalar_out(Scalar x, const Tensor& n, Tensor& out);
-Tensor& alias_shifted_chebyshev_polynomial_t_n_scalar_out(const Tensor& x, Scalar n, Tensor& out);
+Tensor& alias_shifted_chebyshev_polynomial_t_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out);
+Tensor& alias_shifted_chebyshev_polynomial_t_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out);
 Tensor alias_shifted_chebyshev_polynomial_u(const Tensor& x, const Tensor& n);
-Tensor alias_shifted_chebyshev_polynomial_u_x_scalar(Scalar x, const Tensor& n);
-Tensor alias_shifted_chebyshev_polynomial_u_n_scalar(const Tensor& x, Scalar n);
+Tensor alias_shifted_chebyshev_polynomial_u_x_scalar(const Scalar& x, const Tensor& n);
+Tensor alias_shifted_chebyshev_polynomial_u_n_scalar(const Tensor& x, const Scalar& n);
 Tensor& alias_shifted_chebyshev_polynomial_u_out(const Tensor& x, const Tensor& n, Tensor& out);
-Tensor& alias_shifted_chebyshev_polynomial_u_x_scalar_out(Scalar x, const Tensor& n, Tensor& out);
-Tensor& alias_shifted_chebyshev_polynomial_u_n_scalar_out(const Tensor& x, Scalar n, Tensor& out);
+Tensor& alias_shifted_chebyshev_polynomial_u_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out);
+Tensor& alias_shifted_chebyshev_polynomial_u_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out);
 Tensor alias_shifted_chebyshev_polynomial_v(const Tensor& x, const Tensor& n);
-Tensor alias_shifted_chebyshev_polynomial_v_x_scalar(Scalar x, const Tensor& n);
-Tensor alias_shifted_chebyshev_polynomial_v_n_scalar(const Tensor& x, Scalar n);
+Tensor alias_shifted_chebyshev_polynomial_v_x_scalar(const Scalar& x, const Tensor& n);
+Tensor alias_shifted_chebyshev_polynomial_v_n_scalar(const Tensor& x, const Scalar& n);
 Tensor& alias_shifted_chebyshev_polynomial_v_out(const Tensor& x, const Tensor& n, Tensor& out);
-Tensor& alias_shifted_chebyshev_polynomial_v_x_scalar_out(Scalar x, const Tensor& n, Tensor& out);
-Tensor& alias_shifted_chebyshev_polynomial_v_n_scalar_out(const Tensor& x, Scalar n, Tensor& out);
+Tensor& alias_shifted_chebyshev_polynomial_v_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out);
+Tensor& alias_shifted_chebyshev_polynomial_v_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out);
 Tensor alias_shifted_chebyshev_polynomial_w(const Tensor& x, const Tensor& n);
-Tensor alias_shifted_chebyshev_polynomial_w_x_scalar(Scalar x, const Tensor& n);
-Tensor alias_shifted_chebyshev_polynomial_w_n_scalar(const Tensor& x, Scalar n);
+Tensor alias_shifted_chebyshev_polynomial_w_x_scalar(const Scalar& x, const Tensor& n);
+Tensor alias_shifted_chebyshev_polynomial_w_n_scalar(const Tensor& x, const Scalar& n);
 Tensor& alias_shifted_chebyshev_polynomial_w_out(const Tensor& x, const Tensor& n, Tensor& out);
-Tensor& alias_shifted_chebyshev_polynomial_w_x_scalar_out(Scalar x, const Tensor& n, Tensor& out);
-Tensor& alias_shifted_chebyshev_polynomial_w_n_scalar_out(const Tensor& x, Scalar n, Tensor& out);
+Tensor& alias_shifted_chebyshev_polynomial_w_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out);
+Tensor& alias_shifted_chebyshev_polynomial_w_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out);
 Tensor alias_spherical_bessel_j0(const Tensor& x);
 Tensor& alias_spherical_bessel_j0_out(const Tensor& x, Tensor& out);
 
@@ -236,7 +237,7 @@ Tensor alias_entr(const Tensor& self) {
 }
 
 Tensor& alias_entr_out(const Tensor& self, Tensor& out) {
-    out = alias_entr(self);
+    write_out(out, alias_entr(self));
     return out;
 }
 
@@ -246,7 +247,7 @@ Tensor alias_ndtri(const Tensor& self) {
 }
 
 Tensor& alias_ndtri_out(const Tensor& self, Tensor& out) {
-    out = alias_ndtri(self);
+    write_out(out, alias_ndtri(self));
     return out;
 }
 
@@ -256,7 +257,7 @@ Tensor alias_log_ndtr(const Tensor& self) {
 }
 
 Tensor& alias_log_ndtr_out(const Tensor& self, Tensor& out) {
-    out = alias_log_ndtr(self);
+    write_out(out, alias_log_ndtr(self));
     return out;
 }
 
@@ -266,7 +267,7 @@ Tensor alias_expm1(const Tensor& self) {
 }
 
 Tensor& alias_expm1_out(const Tensor& self, Tensor& out) {
-    out = alias_expm1(self);
+    write_out(out, alias_expm1(self));
     return out;
 }
 
@@ -276,7 +277,7 @@ Tensor alias_exp2(const Tensor& self) {
 }
 
 Tensor& alias_exp2_out(const Tensor& self, Tensor& out) {
-    out = alias_exp2(self);
+    write_out(out, alias_exp2(self));
     return out;
 }
 
@@ -286,7 +287,7 @@ Tensor alias_psi(const Tensor& self) {
 }
 
 Tensor& alias_psi_out(const Tensor& self, Tensor& out) {
-    out = alias_psi(self);
+    write_out(out, alias_psi(self));
     return out;
 }
 
@@ -296,7 +297,7 @@ Tensor alias_digamma(const Tensor& self) {
 }
 
 Tensor& alias_digamma_out(const Tensor& self, Tensor& out) {
-    out = alias_digamma(self);
+    write_out(out, alias_digamma(self));
     return out;
 }
 
@@ -306,7 +307,7 @@ Tensor alias_gammaln(const Tensor& self) {
 }
 
 Tensor& alias_gammaln_out(const Tensor& self, Tensor& out) {
-    out = alias_gammaln(self);
+    write_out(out, alias_gammaln(self));
     return out;
 }
 
@@ -316,7 +317,7 @@ Tensor alias_erf(const Tensor& self) {
 }
 
 Tensor& alias_erf_out(const Tensor& self, Tensor& out) {
-    out = alias_erf(self);
+    write_out(out, alias_erf(self));
     return out;
 }
 
@@ -326,7 +327,7 @@ Tensor alias_erfc(const Tensor& self) {
 }
 
 Tensor& alias_erfc_out(const Tensor& self, Tensor& out) {
-    out = alias_erfc(self);
+    write_out(out, alias_erfc(self));
     return out;
 }
 
@@ -336,7 +337,7 @@ Tensor alias_erfcx(const Tensor& self) {
 }
 
 Tensor& alias_erfcx_out(const Tensor& self, Tensor& out) {
-    out = alias_erfcx(self);
+    write_out(out, alias_erfcx(self));
     return out;
 }
 
@@ -346,7 +347,7 @@ Tensor alias_erfinv(const Tensor& self) {
 }
 
 Tensor& alias_erfinv_out(const Tensor& self, Tensor& out) {
-    out = alias_erfinv(self);
+    write_out(out, alias_erfinv(self));
     return out;
 }
 
@@ -356,7 +357,7 @@ Tensor alias_ndtr(const Tensor& self) {
 }
 
 Tensor& alias_ndtr_out(const Tensor& self, Tensor& out) {
-    out = alias_ndtr(self);
+    write_out(out, alias_ndtr(self));
     return out;
 }
 
@@ -365,26 +366,26 @@ Tensor alias_xlog1py(const Tensor& self, const Tensor& other) {
     return detail::redispatch_xlog1py_function(self, other);
 }
 
-Tensor alias_xlog1py_self_scalar(Scalar self, const Tensor& other) {
+Tensor alias_xlog1py_self_scalar(const Scalar& self, const Tensor& other) {
     return detail::redispatch_xlog1py_function(scalar_like(self, other), other);
 }
 
-Tensor alias_xlog1py_other_scalar(const Tensor& self, Scalar other) {
+Tensor alias_xlog1py_other_scalar(const Tensor& self, const Scalar& other) {
     return detail::redispatch_xlog1py_function(self, scalar_like(other, self));
 }
 
 Tensor& alias_xlog1py_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = alias_xlog1py(self, other);
+    write_out(out, alias_xlog1py(self, other));
     return out;
 }
 
-Tensor& alias_xlog1py_self_scalar_out(Scalar self, const Tensor& other, Tensor& out) {
-    out = alias_xlog1py_self_scalar(self, other);
+Tensor& alias_xlog1py_self_scalar_out(const Scalar& self, const Tensor& other, Tensor& out) {
+    write_out(out, alias_xlog1py_self_scalar(self, other));
     return out;
 }
 
-Tensor& alias_xlog1py_other_scalar_out(const Tensor& self, Scalar other, Tensor& out) {
-    out = alias_xlog1py_other_scalar(self, other);
+Tensor& alias_xlog1py_other_scalar_out(const Tensor& self, const Scalar& other, Tensor& out) {
+    write_out(out, alias_xlog1py_other_scalar(self, other));
     return out;
 }
 
@@ -393,26 +394,26 @@ Tensor alias_xlogy(const Tensor& self, const Tensor& other) {
     return detail::redispatch_xlogy_function(self, other);
 }
 
-Tensor alias_xlogy_self_scalar(Scalar self, const Tensor& other) {
+Tensor alias_xlogy_self_scalar(const Scalar& self, const Tensor& other) {
     return detail::redispatch_xlogy_function(scalar_like(self, other), other);
 }
 
-Tensor alias_xlogy_other_scalar(const Tensor& self, Scalar other) {
+Tensor alias_xlogy_other_scalar(const Tensor& self, const Scalar& other) {
     return detail::redispatch_xlogy_function(self, scalar_like(other, self));
 }
 
 Tensor& alias_xlogy_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = alias_xlogy(self, other);
+    write_out(out, alias_xlogy(self, other));
     return out;
 }
 
-Tensor& alias_xlogy_self_scalar_out(Scalar self, const Tensor& other, Tensor& out) {
-    out = alias_xlogy_self_scalar(self, other);
+Tensor& alias_xlogy_self_scalar_out(const Scalar& self, const Tensor& other, Tensor& out) {
+    write_out(out, alias_xlogy_self_scalar(self, other));
     return out;
 }
 
-Tensor& alias_xlogy_other_scalar_out(const Tensor& self, Scalar other, Tensor& out) {
-    out = alias_xlogy_other_scalar(self, other);
+Tensor& alias_xlogy_other_scalar_out(const Tensor& self, const Scalar& other, Tensor& out) {
+    write_out(out, alias_xlogy_other_scalar(self, other));
     return out;
 }
 
@@ -421,26 +422,26 @@ Tensor alias_zeta(const Tensor& self, const Tensor& other) {
     return detail::redispatch_zeta_function(self, other);
 }
 
-Tensor alias_zeta_self_scalar(Scalar self, const Tensor& other) {
+Tensor alias_zeta_self_scalar(const Scalar& self, const Tensor& other) {
     return detail::redispatch_zeta_function(scalar_like(self, other), other);
 }
 
-Tensor alias_zeta_other_scalar(const Tensor& self, Scalar other) {
+Tensor alias_zeta_other_scalar(const Tensor& self, const Scalar& other) {
     return detail::redispatch_zeta_function(self, scalar_like(other, self));
 }
 
 Tensor& alias_zeta_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = alias_zeta(self, other);
+    write_out(out, alias_zeta(self, other));
     return out;
 }
 
-Tensor& alias_zeta_self_scalar_out(Scalar self, const Tensor& other, Tensor& out) {
-    out = alias_zeta_self_scalar(self, other);
+Tensor& alias_zeta_self_scalar_out(const Scalar& self, const Tensor& other, Tensor& out) {
+    write_out(out, alias_zeta_self_scalar(self, other));
     return out;
 }
 
-Tensor& alias_zeta_other_scalar_out(const Tensor& self, Scalar other, Tensor& out) {
-    out = alias_zeta_other_scalar(self, other);
+Tensor& alias_zeta_other_scalar_out(const Tensor& self, const Scalar& other, Tensor& out) {
+    write_out(out, alias_zeta_other_scalar(self, other));
     return out;
 }
 
@@ -450,7 +451,7 @@ Tensor alias_i0(const Tensor& self) {
 }
 
 Tensor& alias_i0_out(const Tensor& self, Tensor& out) {
-    out = alias_i0(self);
+    write_out(out, alias_i0(self));
     return out;
 }
 
@@ -460,7 +461,7 @@ Tensor alias_i0e(const Tensor& self) {
 }
 
 Tensor& alias_i0e_out(const Tensor& self, Tensor& out) {
-    out = alias_i0e(self);
+    write_out(out, alias_i0e(self));
     return out;
 }
 
@@ -470,7 +471,7 @@ Tensor alias_i1(const Tensor& self) {
 }
 
 Tensor& alias_i1_out(const Tensor& self, Tensor& out) {
-    out = alias_i1(self);
+    write_out(out, alias_i1(self));
     return out;
 }
 
@@ -480,7 +481,7 @@ Tensor alias_i1e(const Tensor& self) {
 }
 
 Tensor& alias_i1e_out(const Tensor& self, Tensor& out) {
-    out = alias_i1e(self);
+    write_out(out, alias_i1e(self));
     return out;
 }
 
@@ -490,7 +491,7 @@ Tensor alias_logit(const Tensor& self, std::optional<double> eps) {
 }
 
 Tensor& alias_logit_out(const Tensor& self, std::optional<double> eps, Tensor& out) {
-    out = alias_logit(self, eps);
+    write_out(out, alias_logit(self, eps));
     return out;
 }
 
@@ -500,7 +501,7 @@ Tensor alias_polygamma(int64_t n, const Tensor& self) {
 }
 
 Tensor& alias_polygamma_out(int64_t n, const Tensor& self, Tensor& out) {
-    out = alias_polygamma(n, self);
+    write_out(out, alias_polygamma(n, self));
     return out;
 }
 
@@ -513,7 +514,7 @@ Tensor alias_logsumexp(const Tensor& self, const std::vector<int64_t>& dim, bool
 }
 
 Tensor& alias_logsumexp_out(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim, Tensor& out) {
-    out = alias_logsumexp(self, dim, keepdim);
+    write_out(out, alias_logsumexp(self, dim, keepdim));
     return out;
 }
 
@@ -523,7 +524,7 @@ Tensor alias_expit(const Tensor& self) {
 }
 
 Tensor& alias_expit_out(const Tensor& self, Tensor& out) {
-    out = alias_expit(self);
+    write_out(out, alias_expit(self));
     return out;
 }
 
@@ -533,7 +534,7 @@ Tensor alias_sinc(const Tensor& self) {
 }
 
 Tensor& alias_sinc_out(const Tensor& self, Tensor& out) {
-    out = alias_sinc(self);
+    write_out(out, alias_sinc(self));
     return out;
 }
 
@@ -558,7 +559,7 @@ Tensor alias_round(const Tensor& self, int64_t decimals) {
 }
 
 Tensor& alias_round_out(const Tensor& self, int64_t decimals, Tensor& out) {
-    out = alias_round(self, decimals);
+    write_out(out, alias_round(self, decimals));
     return out;
 }
 
@@ -568,7 +569,7 @@ Tensor alias_log1p(const Tensor& self) {
 }
 
 Tensor& alias_log1p_out(const Tensor& self, Tensor& out) {
-    out = alias_log1p(self);
+    write_out(out, alias_log1p(self));
     return out;
 }
 
@@ -579,7 +580,7 @@ Tensor alias_log_softmax(const Tensor& self, int64_t dim, std::optional<DType> d
 
 // special_gammainc -> gammainc
 Tensor& alias_gammainc_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = alias_gammainc(self, other);
+    write_out(out, alias_gammainc(self, other));
     return out;
 }
 
@@ -589,7 +590,7 @@ Tensor alias_gammainc(const Tensor& self, const Tensor& other) {
 
 // special_gammaincc -> gammaincc
 Tensor& alias_gammaincc_out(const Tensor& self, const Tensor& other, Tensor& out) {
-    out = alias_gammaincc(self, other);
+    write_out(out, alias_gammaincc(self, other));
     return out;
 }
 
@@ -603,7 +604,7 @@ Tensor alias_multigammaln(const Tensor& self, int64_t p) {
 }
 
 Tensor& alias_multigammaln_out(const Tensor& self, int64_t p, Tensor& out) {
-    out = alias_multigammaln(self, p);
+    write_out(out, alias_multigammaln(self, p));
     return out;
 }
 
@@ -618,7 +619,7 @@ Tensor alias_airy_ai(const Tensor& x) {
 }
 
 Tensor& alias_airy_ai_out(const Tensor& x, Tensor& out) {
-    out = alias_airy_ai(x);
+    write_out(out, alias_airy_ai(x));
     return out;
 }
 
@@ -628,7 +629,7 @@ Tensor alias_bessel_j0(const Tensor& self) {
 }
 
 Tensor& alias_bessel_j0_out(const Tensor& self, Tensor& out) {
-    out = alias_bessel_j0(self);
+    write_out(out, alias_bessel_j0(self));
     return out;
 }
 
@@ -638,7 +639,7 @@ Tensor alias_bessel_j1(const Tensor& self) {
 }
 
 Tensor& alias_bessel_j1_out(const Tensor& self, Tensor& out) {
-    out = alias_bessel_j1(self);
+    write_out(out, alias_bessel_j1(self));
     return out;
 }
 
@@ -648,7 +649,7 @@ Tensor alias_bessel_y0(const Tensor& self) {
 }
 
 Tensor& alias_bessel_y0_out(const Tensor& self, Tensor& out) {
-    out = alias_bessel_y0(self);
+    write_out(out, alias_bessel_y0(self));
     return out;
 }
 
@@ -658,7 +659,7 @@ Tensor alias_bessel_y1(const Tensor& self) {
 }
 
 Tensor& alias_bessel_y1_out(const Tensor& self, Tensor& out) {
-    out = alias_bessel_y1(self);
+    write_out(out, alias_bessel_y1(self));
     return out;
 }
 
@@ -667,26 +668,26 @@ Tensor alias_chebyshev_polynomial_t(const Tensor& x, const Tensor& n) {
     return detail::redispatch_chebyshev_polynomial_t_function(x, n);
 }
 
-Tensor alias_chebyshev_polynomial_t_x_scalar(Scalar x, const Tensor& n) {
+Tensor alias_chebyshev_polynomial_t_x_scalar(const Scalar& x, const Tensor& n) {
     return detail::redispatch_chebyshev_polynomial_t_function(scalar_like(x, n), n);
 }
 
-Tensor alias_chebyshev_polynomial_t_n_scalar(const Tensor& x, Scalar n) {
+Tensor alias_chebyshev_polynomial_t_n_scalar(const Tensor& x, const Scalar& n) {
     return detail::redispatch_chebyshev_polynomial_t_function(x, scalar_like(n, x));
 }
 
 Tensor& alias_chebyshev_polynomial_t_out(const Tensor& x, const Tensor& n, Tensor& out) {
-    out = alias_chebyshev_polynomial_t(x, n);
+    write_out(out, alias_chebyshev_polynomial_t(x, n));
     return out;
 }
 
-Tensor& alias_chebyshev_polynomial_t_x_scalar_out(Scalar x, const Tensor& n, Tensor& out) {
-    out = alias_chebyshev_polynomial_t_x_scalar(x, n);
+Tensor& alias_chebyshev_polynomial_t_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out) {
+    write_out(out, alias_chebyshev_polynomial_t_x_scalar(x, n));
     return out;
 }
 
-Tensor& alias_chebyshev_polynomial_t_n_scalar_out(const Tensor& x, Scalar n, Tensor& out) {
-    out = alias_chebyshev_polynomial_t_n_scalar(x, n);
+Tensor& alias_chebyshev_polynomial_t_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out) {
+    write_out(out, alias_chebyshev_polynomial_t_n_scalar(x, n));
     return out;
 }
 
@@ -695,26 +696,26 @@ Tensor alias_chebyshev_polynomial_u(const Tensor& x, const Tensor& n) {
     return detail::redispatch_chebyshev_polynomial_u_function(x, n);
 }
 
-Tensor alias_chebyshev_polynomial_u_x_scalar(Scalar x, const Tensor& n) {
+Tensor alias_chebyshev_polynomial_u_x_scalar(const Scalar& x, const Tensor& n) {
     return detail::redispatch_chebyshev_polynomial_u_function(scalar_like(x, n), n);
 }
 
-Tensor alias_chebyshev_polynomial_u_n_scalar(const Tensor& x, Scalar n) {
+Tensor alias_chebyshev_polynomial_u_n_scalar(const Tensor& x, const Scalar& n) {
     return detail::redispatch_chebyshev_polynomial_u_function(x, scalar_like(n, x));
 }
 
 Tensor& alias_chebyshev_polynomial_u_out(const Tensor& x, const Tensor& n, Tensor& out) {
-    out = alias_chebyshev_polynomial_u(x, n);
+    write_out(out, alias_chebyshev_polynomial_u(x, n));
     return out;
 }
 
-Tensor& alias_chebyshev_polynomial_u_x_scalar_out(Scalar x, const Tensor& n, Tensor& out) {
-    out = alias_chebyshev_polynomial_u_x_scalar(x, n);
+Tensor& alias_chebyshev_polynomial_u_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out) {
+    write_out(out, alias_chebyshev_polynomial_u_x_scalar(x, n));
     return out;
 }
 
-Tensor& alias_chebyshev_polynomial_u_n_scalar_out(const Tensor& x, Scalar n, Tensor& out) {
-    out = alias_chebyshev_polynomial_u_n_scalar(x, n);
+Tensor& alias_chebyshev_polynomial_u_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out) {
+    write_out(out, alias_chebyshev_polynomial_u_n_scalar(x, n));
     return out;
 }
 
@@ -723,26 +724,26 @@ Tensor alias_chebyshev_polynomial_v(const Tensor& x, const Tensor& n) {
     return detail::redispatch_chebyshev_polynomial_v_function(x, n);
 }
 
-Tensor alias_chebyshev_polynomial_v_x_scalar(Scalar x, const Tensor& n) {
+Tensor alias_chebyshev_polynomial_v_x_scalar(const Scalar& x, const Tensor& n) {
     return detail::redispatch_chebyshev_polynomial_v_function(scalar_like(x, n), n);
 }
 
-Tensor alias_chebyshev_polynomial_v_n_scalar(const Tensor& x, Scalar n) {
+Tensor alias_chebyshev_polynomial_v_n_scalar(const Tensor& x, const Scalar& n) {
     return detail::redispatch_chebyshev_polynomial_v_function(x, scalar_like(n, x));
 }
 
 Tensor& alias_chebyshev_polynomial_v_out(const Tensor& x, const Tensor& n, Tensor& out) {
-    out = alias_chebyshev_polynomial_v(x, n);
+    write_out(out, alias_chebyshev_polynomial_v(x, n));
     return out;
 }
 
-Tensor& alias_chebyshev_polynomial_v_x_scalar_out(Scalar x, const Tensor& n, Tensor& out) {
-    out = alias_chebyshev_polynomial_v_x_scalar(x, n);
+Tensor& alias_chebyshev_polynomial_v_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out) {
+    write_out(out, alias_chebyshev_polynomial_v_x_scalar(x, n));
     return out;
 }
 
-Tensor& alias_chebyshev_polynomial_v_n_scalar_out(const Tensor& x, Scalar n, Tensor& out) {
-    out = alias_chebyshev_polynomial_v_n_scalar(x, n);
+Tensor& alias_chebyshev_polynomial_v_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out) {
+    write_out(out, alias_chebyshev_polynomial_v_n_scalar(x, n));
     return out;
 }
 
@@ -751,26 +752,26 @@ Tensor alias_chebyshev_polynomial_w(const Tensor& x, const Tensor& n) {
     return detail::redispatch_chebyshev_polynomial_w_function(x, n);
 }
 
-Tensor alias_chebyshev_polynomial_w_x_scalar(Scalar x, const Tensor& n) {
+Tensor alias_chebyshev_polynomial_w_x_scalar(const Scalar& x, const Tensor& n) {
     return detail::redispatch_chebyshev_polynomial_w_function(scalar_like(x, n), n);
 }
 
-Tensor alias_chebyshev_polynomial_w_n_scalar(const Tensor& x, Scalar n) {
+Tensor alias_chebyshev_polynomial_w_n_scalar(const Tensor& x, const Scalar& n) {
     return detail::redispatch_chebyshev_polynomial_w_function(x, scalar_like(n, x));
 }
 
 Tensor& alias_chebyshev_polynomial_w_out(const Tensor& x, const Tensor& n, Tensor& out) {
-    out = alias_chebyshev_polynomial_w(x, n);
+    write_out(out, alias_chebyshev_polynomial_w(x, n));
     return out;
 }
 
-Tensor& alias_chebyshev_polynomial_w_x_scalar_out(Scalar x, const Tensor& n, Tensor& out) {
-    out = alias_chebyshev_polynomial_w_x_scalar(x, n);
+Tensor& alias_chebyshev_polynomial_w_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out) {
+    write_out(out, alias_chebyshev_polynomial_w_x_scalar(x, n));
     return out;
 }
 
-Tensor& alias_chebyshev_polynomial_w_n_scalar_out(const Tensor& x, Scalar n, Tensor& out) {
-    out = alias_chebyshev_polynomial_w_n_scalar(x, n);
+Tensor& alias_chebyshev_polynomial_w_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out) {
+    write_out(out, alias_chebyshev_polynomial_w_n_scalar(x, n));
     return out;
 }
 
@@ -779,26 +780,26 @@ Tensor alias_hermite_polynomial_h(const Tensor& x, const Tensor& n) {
     return detail::redispatch_hermite_polynomial_h_function(x, n);
 }
 
-Tensor alias_hermite_polynomial_h_x_scalar(Scalar x, const Tensor& n) {
+Tensor alias_hermite_polynomial_h_x_scalar(const Scalar& x, const Tensor& n) {
     return detail::redispatch_hermite_polynomial_h_function(scalar_like(x, n), n);
 }
 
-Tensor alias_hermite_polynomial_h_n_scalar(const Tensor& x, Scalar n) {
+Tensor alias_hermite_polynomial_h_n_scalar(const Tensor& x, const Scalar& n) {
     return detail::redispatch_hermite_polynomial_h_function(x, scalar_like(n, x));
 }
 
 Tensor& alias_hermite_polynomial_h_out(const Tensor& x, const Tensor& n, Tensor& out) {
-    out = alias_hermite_polynomial_h(x, n);
+    write_out(out, alias_hermite_polynomial_h(x, n));
     return out;
 }
 
-Tensor& alias_hermite_polynomial_h_x_scalar_out(Scalar x, const Tensor& n, Tensor& out) {
-    out = alias_hermite_polynomial_h_x_scalar(x, n);
+Tensor& alias_hermite_polynomial_h_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out) {
+    write_out(out, alias_hermite_polynomial_h_x_scalar(x, n));
     return out;
 }
 
-Tensor& alias_hermite_polynomial_h_n_scalar_out(const Tensor& x, Scalar n, Tensor& out) {
-    out = alias_hermite_polynomial_h_n_scalar(x, n);
+Tensor& alias_hermite_polynomial_h_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out) {
+    write_out(out, alias_hermite_polynomial_h_n_scalar(x, n));
     return out;
 }
 
@@ -807,26 +808,26 @@ Tensor alias_hermite_polynomial_he(const Tensor& x, const Tensor& n) {
     return detail::redispatch_hermite_polynomial_he_function(x, n);
 }
 
-Tensor alias_hermite_polynomial_he_x_scalar(Scalar x, const Tensor& n) {
+Tensor alias_hermite_polynomial_he_x_scalar(const Scalar& x, const Tensor& n) {
     return detail::redispatch_hermite_polynomial_he_function(scalar_like(x, n), n);
 }
 
-Tensor alias_hermite_polynomial_he_n_scalar(const Tensor& x, Scalar n) {
+Tensor alias_hermite_polynomial_he_n_scalar(const Tensor& x, const Scalar& n) {
     return detail::redispatch_hermite_polynomial_he_function(x, scalar_like(n, x));
 }
 
 Tensor& alias_hermite_polynomial_he_out(const Tensor& x, const Tensor& n, Tensor& out) {
-    out = alias_hermite_polynomial_he(x, n);
+    write_out(out, alias_hermite_polynomial_he(x, n));
     return out;
 }
 
-Tensor& alias_hermite_polynomial_he_x_scalar_out(Scalar x, const Tensor& n, Tensor& out) {
-    out = alias_hermite_polynomial_he_x_scalar(x, n);
+Tensor& alias_hermite_polynomial_he_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out) {
+    write_out(out, alias_hermite_polynomial_he_x_scalar(x, n));
     return out;
 }
 
-Tensor& alias_hermite_polynomial_he_n_scalar_out(const Tensor& x, Scalar n, Tensor& out) {
-    out = alias_hermite_polynomial_he_n_scalar(x, n);
+Tensor& alias_hermite_polynomial_he_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out) {
+    write_out(out, alias_hermite_polynomial_he_n_scalar(x, n));
     return out;
 }
 
@@ -835,26 +836,26 @@ Tensor alias_laguerre_polynomial_l(const Tensor& x, const Tensor& n) {
     return detail::redispatch_laguerre_polynomial_l_function(x, n);
 }
 
-Tensor alias_laguerre_polynomial_l_x_scalar(Scalar x, const Tensor& n) {
+Tensor alias_laguerre_polynomial_l_x_scalar(const Scalar& x, const Tensor& n) {
     return detail::redispatch_laguerre_polynomial_l_function(scalar_like(x, n), n);
 }
 
-Tensor alias_laguerre_polynomial_l_n_scalar(const Tensor& x, Scalar n) {
+Tensor alias_laguerre_polynomial_l_n_scalar(const Tensor& x, const Scalar& n) {
     return detail::redispatch_laguerre_polynomial_l_function(x, scalar_like(n, x));
 }
 
 Tensor& alias_laguerre_polynomial_l_out(const Tensor& x, const Tensor& n, Tensor& out) {
-    out = alias_laguerre_polynomial_l(x, n);
+    write_out(out, alias_laguerre_polynomial_l(x, n));
     return out;
 }
 
-Tensor& alias_laguerre_polynomial_l_x_scalar_out(Scalar x, const Tensor& n, Tensor& out) {
-    out = alias_laguerre_polynomial_l_x_scalar(x, n);
+Tensor& alias_laguerre_polynomial_l_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out) {
+    write_out(out, alias_laguerre_polynomial_l_x_scalar(x, n));
     return out;
 }
 
-Tensor& alias_laguerre_polynomial_l_n_scalar_out(const Tensor& x, Scalar n, Tensor& out) {
-    out = alias_laguerre_polynomial_l_n_scalar(x, n);
+Tensor& alias_laguerre_polynomial_l_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out) {
+    write_out(out, alias_laguerre_polynomial_l_n_scalar(x, n));
     return out;
 }
 
@@ -863,26 +864,26 @@ Tensor alias_legendre_polynomial_p(const Tensor& x, const Tensor& n) {
     return detail::redispatch_legendre_polynomial_p_function(x, n);
 }
 
-Tensor alias_legendre_polynomial_p_x_scalar(Scalar x, const Tensor& n) {
+Tensor alias_legendre_polynomial_p_x_scalar(const Scalar& x, const Tensor& n) {
     return detail::redispatch_legendre_polynomial_p_function(scalar_like(x, n), n);
 }
 
-Tensor alias_legendre_polynomial_p_n_scalar(const Tensor& x, Scalar n) {
+Tensor alias_legendre_polynomial_p_n_scalar(const Tensor& x, const Scalar& n) {
     return detail::redispatch_legendre_polynomial_p_function(x, scalar_like(n, x));
 }
 
 Tensor& alias_legendre_polynomial_p_out(const Tensor& x, const Tensor& n, Tensor& out) {
-    out = alias_legendre_polynomial_p(x, n);
+    write_out(out, alias_legendre_polynomial_p(x, n));
     return out;
 }
 
-Tensor& alias_legendre_polynomial_p_x_scalar_out(Scalar x, const Tensor& n, Tensor& out) {
-    out = alias_legendre_polynomial_p_x_scalar(x, n);
+Tensor& alias_legendre_polynomial_p_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out) {
+    write_out(out, alias_legendre_polynomial_p_x_scalar(x, n));
     return out;
 }
 
-Tensor& alias_legendre_polynomial_p_n_scalar_out(const Tensor& x, Scalar n, Tensor& out) {
-    out = alias_legendre_polynomial_p_n_scalar(x, n);
+Tensor& alias_legendre_polynomial_p_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out) {
+    write_out(out, alias_legendre_polynomial_p_n_scalar(x, n));
     return out;
 }
 
@@ -892,7 +893,7 @@ Tensor alias_modified_bessel_i0(const Tensor& self) {
 }
 
 Tensor& alias_modified_bessel_i0_out(const Tensor& self, Tensor& out) {
-    out = alias_modified_bessel_i0(self);
+    write_out(out, alias_modified_bessel_i0(self));
     return out;
 }
 
@@ -902,7 +903,7 @@ Tensor alias_modified_bessel_i1(const Tensor& self) {
 }
 
 Tensor& alias_modified_bessel_i1_out(const Tensor& self, Tensor& out) {
-    out = alias_modified_bessel_i1(self);
+    write_out(out, alias_modified_bessel_i1(self));
     return out;
 }
 
@@ -912,7 +913,7 @@ Tensor alias_modified_bessel_k0(const Tensor& self) {
 }
 
 Tensor& alias_modified_bessel_k0_out(const Tensor& self, Tensor& out) {
-    out = alias_modified_bessel_k0(self);
+    write_out(out, alias_modified_bessel_k0(self));
     return out;
 }
 
@@ -922,7 +923,7 @@ Tensor alias_modified_bessel_k1(const Tensor& self) {
 }
 
 Tensor& alias_modified_bessel_k1_out(const Tensor& self, Tensor& out) {
-    out = alias_modified_bessel_k1(self);
+    write_out(out, alias_modified_bessel_k1(self));
     return out;
 }
 
@@ -932,7 +933,7 @@ Tensor alias_scaled_modified_bessel_k0(const Tensor& x) {
 }
 
 Tensor& alias_scaled_modified_bessel_k0_out(const Tensor& x, Tensor& out) {
-    out = alias_scaled_modified_bessel_k0(x);
+    write_out(out, alias_scaled_modified_bessel_k0(x));
     return out;
 }
 
@@ -942,7 +943,7 @@ Tensor alias_scaled_modified_bessel_k1(const Tensor& x) {
 }
 
 Tensor& alias_scaled_modified_bessel_k1_out(const Tensor& x, Tensor& out) {
-    out = alias_scaled_modified_bessel_k1(x);
+    write_out(out, alias_scaled_modified_bessel_k1(x));
     return out;
 }
 
@@ -951,26 +952,26 @@ Tensor alias_shifted_chebyshev_polynomial_t(const Tensor& x, const Tensor& n) {
     return detail::redispatch_shifted_chebyshev_polynomial_t_function(x, n);
 }
 
-Tensor alias_shifted_chebyshev_polynomial_t_x_scalar(Scalar x, const Tensor& n) {
+Tensor alias_shifted_chebyshev_polynomial_t_x_scalar(const Scalar& x, const Tensor& n) {
     return detail::redispatch_shifted_chebyshev_polynomial_t_function(scalar_like(x, n), n);
 }
 
-Tensor alias_shifted_chebyshev_polynomial_t_n_scalar(const Tensor& x, Scalar n) {
+Tensor alias_shifted_chebyshev_polynomial_t_n_scalar(const Tensor& x, const Scalar& n) {
     return detail::redispatch_shifted_chebyshev_polynomial_t_function(x, scalar_like(n, x));
 }
 
 Tensor& alias_shifted_chebyshev_polynomial_t_out(const Tensor& x, const Tensor& n, Tensor& out) {
-    out = alias_shifted_chebyshev_polynomial_t(x, n);
+    write_out(out, alias_shifted_chebyshev_polynomial_t(x, n));
     return out;
 }
 
-Tensor& alias_shifted_chebyshev_polynomial_t_x_scalar_out(Scalar x, const Tensor& n, Tensor& out) {
-    out = alias_shifted_chebyshev_polynomial_t_x_scalar(x, n);
+Tensor& alias_shifted_chebyshev_polynomial_t_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out) {
+    write_out(out, alias_shifted_chebyshev_polynomial_t_x_scalar(x, n));
     return out;
 }
 
-Tensor& alias_shifted_chebyshev_polynomial_t_n_scalar_out(const Tensor& x, Scalar n, Tensor& out) {
-    out = alias_shifted_chebyshev_polynomial_t_n_scalar(x, n);
+Tensor& alias_shifted_chebyshev_polynomial_t_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out) {
+    write_out(out, alias_shifted_chebyshev_polynomial_t_n_scalar(x, n));
     return out;
 }
 
@@ -979,26 +980,26 @@ Tensor alias_shifted_chebyshev_polynomial_u(const Tensor& x, const Tensor& n) {
     return detail::redispatch_shifted_chebyshev_polynomial_u_function(x, n);
 }
 
-Tensor alias_shifted_chebyshev_polynomial_u_x_scalar(Scalar x, const Tensor& n) {
+Tensor alias_shifted_chebyshev_polynomial_u_x_scalar(const Scalar& x, const Tensor& n) {
     return detail::redispatch_shifted_chebyshev_polynomial_u_function(scalar_like(x, n), n);
 }
 
-Tensor alias_shifted_chebyshev_polynomial_u_n_scalar(const Tensor& x, Scalar n) {
+Tensor alias_shifted_chebyshev_polynomial_u_n_scalar(const Tensor& x, const Scalar& n) {
     return detail::redispatch_shifted_chebyshev_polynomial_u_function(x, scalar_like(n, x));
 }
 
 Tensor& alias_shifted_chebyshev_polynomial_u_out(const Tensor& x, const Tensor& n, Tensor& out) {
-    out = alias_shifted_chebyshev_polynomial_u(x, n);
+    write_out(out, alias_shifted_chebyshev_polynomial_u(x, n));
     return out;
 }
 
-Tensor& alias_shifted_chebyshev_polynomial_u_x_scalar_out(Scalar x, const Tensor& n, Tensor& out) {
-    out = alias_shifted_chebyshev_polynomial_u_x_scalar(x, n);
+Tensor& alias_shifted_chebyshev_polynomial_u_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out) {
+    write_out(out, alias_shifted_chebyshev_polynomial_u_x_scalar(x, n));
     return out;
 }
 
-Tensor& alias_shifted_chebyshev_polynomial_u_n_scalar_out(const Tensor& x, Scalar n, Tensor& out) {
-    out = alias_shifted_chebyshev_polynomial_u_n_scalar(x, n);
+Tensor& alias_shifted_chebyshev_polynomial_u_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out) {
+    write_out(out, alias_shifted_chebyshev_polynomial_u_n_scalar(x, n));
     return out;
 }
 
@@ -1007,26 +1008,26 @@ Tensor alias_shifted_chebyshev_polynomial_v(const Tensor& x, const Tensor& n) {
     return detail::redispatch_shifted_chebyshev_polynomial_v_function(x, n);
 }
 
-Tensor alias_shifted_chebyshev_polynomial_v_x_scalar(Scalar x, const Tensor& n) {
+Tensor alias_shifted_chebyshev_polynomial_v_x_scalar(const Scalar& x, const Tensor& n) {
     return detail::redispatch_shifted_chebyshev_polynomial_v_function(scalar_like(x, n), n);
 }
 
-Tensor alias_shifted_chebyshev_polynomial_v_n_scalar(const Tensor& x, Scalar n) {
+Tensor alias_shifted_chebyshev_polynomial_v_n_scalar(const Tensor& x, const Scalar& n) {
     return detail::redispatch_shifted_chebyshev_polynomial_v_function(x, scalar_like(n, x));
 }
 
 Tensor& alias_shifted_chebyshev_polynomial_v_out(const Tensor& x, const Tensor& n, Tensor& out) {
-    out = alias_shifted_chebyshev_polynomial_v(x, n);
+    write_out(out, alias_shifted_chebyshev_polynomial_v(x, n));
     return out;
 }
 
-Tensor& alias_shifted_chebyshev_polynomial_v_x_scalar_out(Scalar x, const Tensor& n, Tensor& out) {
-    out = alias_shifted_chebyshev_polynomial_v_x_scalar(x, n);
+Tensor& alias_shifted_chebyshev_polynomial_v_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out) {
+    write_out(out, alias_shifted_chebyshev_polynomial_v_x_scalar(x, n));
     return out;
 }
 
-Tensor& alias_shifted_chebyshev_polynomial_v_n_scalar_out(const Tensor& x, Scalar n, Tensor& out) {
-    out = alias_shifted_chebyshev_polynomial_v_n_scalar(x, n);
+Tensor& alias_shifted_chebyshev_polynomial_v_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out) {
+    write_out(out, alias_shifted_chebyshev_polynomial_v_n_scalar(x, n));
     return out;
 }
 
@@ -1035,26 +1036,26 @@ Tensor alias_shifted_chebyshev_polynomial_w(const Tensor& x, const Tensor& n) {
     return detail::redispatch_shifted_chebyshev_polynomial_w_function(x, n);
 }
 
-Tensor alias_shifted_chebyshev_polynomial_w_x_scalar(Scalar x, const Tensor& n) {
+Tensor alias_shifted_chebyshev_polynomial_w_x_scalar(const Scalar& x, const Tensor& n) {
     return detail::redispatch_shifted_chebyshev_polynomial_w_function(scalar_like(x, n), n);
 }
 
-Tensor alias_shifted_chebyshev_polynomial_w_n_scalar(const Tensor& x, Scalar n) {
+Tensor alias_shifted_chebyshev_polynomial_w_n_scalar(const Tensor& x, const Scalar& n) {
     return detail::redispatch_shifted_chebyshev_polynomial_w_function(x, scalar_like(n, x));
 }
 
 Tensor& alias_shifted_chebyshev_polynomial_w_out(const Tensor& x, const Tensor& n, Tensor& out) {
-    out = alias_shifted_chebyshev_polynomial_w(x, n);
+    write_out(out, alias_shifted_chebyshev_polynomial_w(x, n));
     return out;
 }
 
-Tensor& alias_shifted_chebyshev_polynomial_w_x_scalar_out(Scalar x, const Tensor& n, Tensor& out) {
-    out = alias_shifted_chebyshev_polynomial_w_x_scalar(x, n);
+Tensor& alias_shifted_chebyshev_polynomial_w_x_scalar_out(const Scalar& x, const Tensor& n, Tensor& out) {
+    write_out(out, alias_shifted_chebyshev_polynomial_w_x_scalar(x, n));
     return out;
 }
 
-Tensor& alias_shifted_chebyshev_polynomial_w_n_scalar_out(const Tensor& x, Scalar n, Tensor& out) {
-    out = alias_shifted_chebyshev_polynomial_w_n_scalar(x, n);
+Tensor& alias_shifted_chebyshev_polynomial_w_n_scalar_out(const Tensor& x, const Scalar& n, Tensor& out) {
+    write_out(out, alias_shifted_chebyshev_polynomial_w_n_scalar(x, n));
     return out;
 }
 
@@ -1064,7 +1065,7 @@ Tensor alias_spherical_bessel_j0(const Tensor& x) {
 }
 
 Tensor& alias_spherical_bessel_j0_out(const Tensor& x, Tensor& out) {
-    out = alias_spherical_bessel_j0(x);
+    write_out(out, alias_spherical_bessel_j0(x));
     return out;
 }
 

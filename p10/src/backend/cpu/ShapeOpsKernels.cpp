@@ -254,7 +254,8 @@ Tensor narrow_cpu(const Tensor& self, int64_t dim, int64_t start, int64_t length
     return self.slice(dim, start, start + length, 1);
 }
 
-std::vector<Tensor> split_with_sizes_cpu(const Tensor& self, std::vector<int64_t> split_sizes, int64_t dim) {
+std::vector<Tensor> split_with_sizes_cpu(const Tensor& self, const std::vector<int64_t>& split_sizes_arg, int64_t dim) {
+    std::vector<int64_t> split_sizes = split_sizes_arg;
     if (self.dim() == 0) {
         TP_THROW(RuntimeError, "split expects at least a 1-dimensional tensor");
     }
@@ -637,10 +638,12 @@ Tensor pixel_shuffle_cpu(const Tensor& self, int64_t upscale_factor) {
     int64_t H = self.size(-2), W = self.size(-1);
     int64_t n = self.numel();
     auto wk = [&](int64_t b, int64_t e) {
+        // li walks the output (bn, c, h, w) over [.., C, H * r, W * r].
+        const int64_t OH = H * r, OW = W * r;
         for (int64_t li = b; li < e; ++li) {
             int64_t rem = li;
-            int64_t w = rem % W; rem /= W;
-            int64_t h = rem % H; rem /= H;
+            int64_t w = rem % OW; rem /= OW;
+            int64_t h = rem % OH; rem /= OH;
             int64_t c = rem % C; rem /= C;
             int64_t bn = rem;
             int64_t ih = h % r, iw = w % r;
@@ -729,7 +732,9 @@ Tensor channel_shuffle_cpu(const Tensor& self, int64_t groups) {
             int64_t rest = li / inner;
             int64_t c = rest % C;
             int64_t o = rest / C;
-            int64_t j = c / cg, gi = c % cg;
+            // Output channel c = j * groups + gi reads input channel
+            // gi * cg + j: the (groups, cg) channel grid transposed.
+            int64_t j = c / groups, gi = c % groups;
             int64_t src_c = gi * cg + j;
             int64_t src = ((o * C) + src_c) * inner + tail;
             switch (self.dtype()) {

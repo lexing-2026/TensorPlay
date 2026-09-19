@@ -3,6 +3,12 @@
 #include "Tensor.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <memory>
+#include <typeinfo>
+#if defined(__GNUG__)
+#include <cxxabi.h>
+#endif
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -21,6 +27,7 @@ const tensorplay::DispatchKey kDumpKeys[] = {
     tensorplay::DispatchKey::CUDA,
     tensorplay::DispatchKey::Vulkan,
     tensorplay::DispatchKey::Sparse,
+    tensorplay::DispatchKey::Python,
     tensorplay::DispatchKey::AutogradCPU,
     tensorplay::DispatchKey::AutogradCUDA,
     tensorplay::DispatchKey::AutogradVulkan,
@@ -46,6 +53,7 @@ tensorplay::DispatchKey parse_key_or_throw(const std::string& name) {
             {"CUDA", tensorplay::DispatchKey::CUDA},
             {"Vulkan", tensorplay::DispatchKey::Vulkan},
             {"Sparse", tensorplay::DispatchKey::Sparse},
+            {"Python", tensorplay::DispatchKey::Python},
             {"AutogradCPU", tensorplay::DispatchKey::AutogradCPU},
             {"AutogradCUDA", tensorplay::DispatchKey::AutogradCUDA},
             {"AutogradVulkan", tensorplay::DispatchKey::AutogradVulkan},
@@ -68,6 +76,17 @@ tensorplay::DispatchKey parse_key_or_throw(const std::string& name) {
         TP_THROW(RuntimeError, "unknown dispatch key: ", name);
     }
     return it->second;
+}
+
+std::string readable_type(const std::type_info* type) {
+    if (type == nullptr) return "<untyped>";
+#if defined(__GNUG__)
+    int status = 0;
+    std::unique_ptr<char, void (*)(void*)> name(
+        abi::__cxa_demangle(type->name(), nullptr, nullptr, &status), std::free);
+    if (status == 0 && name) return name.get();
+#endif
+    return type->name();
 }
 
 } // namespace
@@ -160,7 +179,32 @@ void init_dispatch(py::module_& m) {
         .value("VmapMode", tensorplay::DispatchKey::VmapMode)
         .value("DynamicLayerFrontMode", tensorplay::DispatchKey::DynamicLayerFrontMode)
         .value("DynamicLayerBackMode", tensorplay::DispatchKey::DynamicLayerBackMode)
+        .value("Python", tensorplay::DispatchKey::Python)
         .export_values();
+
+    // Kernels whose registered signature differs from the operator's
+    // dispatcher signature (the one its Python-key kernel is registered
+    // with).  Every caller casts the slot to that signature, so each entry is
+    // a call with a mismatched ABI.  Returns (op, key, registered, expected).
+    m.def("_dispatch_abi_mismatches", []() {
+        auto& dispatcher = tensorplay::Dispatcher::singleton();
+        py::list out;
+        for (const auto& op : dispatcher.operator_names()) {
+            const std::type_info* expected =
+                dispatcher.signature(op, tensorplay::DispatchKey::Python);
+            if (expected == nullptr) continue;
+            for (auto key : kDumpKeys) {
+                if (key == tensorplay::DispatchKey::Python) continue;
+                if (!dispatcher.has_kernel(op, key)) continue;
+                const std::type_info* registered = dispatcher.signature(op, key);
+                if (registered != nullptr && *registered == *expected) continue;
+                out.append(py::make_tuple(op, tensorplay::toString(key),
+                                          readable_type(registered),
+                                          readable_type(expected)));
+            }
+        }
+        return out;
+    });
 
     m.def("_dispatch_key_name", [](tensorplay::DispatchKey key) {
         return tensorplay::toString(key);

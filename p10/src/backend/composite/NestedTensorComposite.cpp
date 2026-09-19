@@ -166,7 +166,7 @@ Tensor nested_storage_offsets_accessor(const Tensor& self) {
 
 Tensor to_padded_tensor(
     const Tensor& self, double padding,
-    std::optional<std::vector<int64_t>> output_size) {
+    const std::optional<std::vector<int64_t>>& output_size) {
     const auto st = require_nested_state(self, "to_padded_tensor");
     const Tensor sizes(st->nested_sizes);
     const Tensor offsets_t(st->storage_offsets);
@@ -487,8 +487,10 @@ Tensor nested_from_padded(const Tensor& padded, const Tensor& nested_size,
 // the ragged axis is logical dim 1 (the only placement this layout carries).
 Tensor nested_from_padded_tensor(
     const Tensor& padded, const Tensor& offsets, const Tensor& dummy,
-    int64_t ragged_idx, const Tensor& min_seqlen, const Tensor& max_seqlen,
+    int64_t ragged_idx, const std::optional<Tensor>& min_seqlen_opt, const std::optional<Tensor>& max_seqlen_opt,
     std::optional<int64_t> sum_s) {
+    const Tensor min_seqlen = min_seqlen_opt.has_value() ? *min_seqlen_opt : Tensor();
+    const Tensor max_seqlen = max_seqlen_opt.has_value() ? *max_seqlen_opt : Tensor();
     (void)dummy;
     (void)min_seqlen;
     (void)max_seqlen;
@@ -658,7 +660,7 @@ bool nested_from_mask_left_aligned(const Tensor& t, const Tensor& mask) {
 // gradient arrives as a nested tensor whose size table matches the input's
 // with the summed axis removed (or sized 1 under keepdim).
 Tensor nested_sum_backward(const Tensor& grad, const Tensor& self,
-                           std::optional<std::vector<int64_t>> dims,
+                           const std::optional<std::vector<int64_t>>& dims,
                            bool keepdim) {
     (void)dims;
     (void)keepdim;
@@ -843,19 +845,21 @@ TENSORPLAY_LIBRARY_IMPL(Composite, NestedTensorKernels) {
     m.impl("_nested_from_padded_tensor", nested_from_padded_tensor);
     m.impl("_nested_view_from_jagged",
            [](const Tensor& values, const Tensor& offsets, const Tensor& dummy,
-              const Tensor& lengths, int64_t ragged_idx,
-              const Tensor& min_seqlen, const Tensor& max_seqlen) {
-               return nested_view_from_jagged(values, offsets, dummy, lengths,
-                                              ragged_idx, min_seqlen,
-                                              max_seqlen, false);
+              const std::optional<Tensor>& lengths, int64_t ragged_idx,
+              const std::optional<Tensor>& min_seqlen,
+              const std::optional<Tensor>& max_seqlen) {
+               return nested_view_from_jagged(
+                   values, offsets, dummy, lengths.value_or(Tensor()), ragged_idx,
+                   min_seqlen.value_or(Tensor()), max_seqlen.value_or(Tensor()), false);
            });
     m.impl("_nested_view_from_jagged_copy",
            [](const Tensor& values, const Tensor& offsets, const Tensor& dummy,
-              const Tensor& lengths, int64_t ragged_idx,
-              const Tensor& min_seqlen, const Tensor& max_seqlen) {
-               return nested_view_from_jagged(values, offsets, dummy, lengths,
-                                              ragged_idx, min_seqlen,
-                                              max_seqlen, true);
+              const std::optional<Tensor>& lengths, int64_t ragged_idx,
+              const std::optional<Tensor>& min_seqlen,
+              const std::optional<Tensor>& max_seqlen) {
+               return nested_view_from_jagged(
+                   values, offsets, dummy, lengths.value_or(Tensor()), ragged_idx,
+                   min_seqlen.value_or(Tensor()), max_seqlen.value_or(Tensor()), true);
            });
     m.impl("_nested_tensor_from_mask", nested_from_mask);
     m.impl("_nested_tensor_from_mask_left_aligned",

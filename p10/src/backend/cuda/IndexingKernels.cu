@@ -44,6 +44,7 @@
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
+#include "OutWrite.h"
 
 namespace {
 inline std::vector<int64_t> broadcast_shapes(const std::vector<int64_t>& a,
@@ -981,28 +982,6 @@ __global__ void index_fill_kernel(int64_t total, int64_t inner, int64_t row,
     }
 }
 
-template <typename T, bool Accumulate>
-__global__ void index_put_kernel(int64_t n, int64_t dst_numel, T* d,
-                                 const int64_t* ip, const T* vp) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) {
-        const int64_t slot = ip[i];
-        if (slot < 0 || slot >= dst_numel) { __trap(); }
-        if constexpr (Accumulate) {
-            if constexpr (
-                scatter_add_supported_v<T> ||
-                std::is_same_v<T, tensorplay::complex<float>> ||
-                std::is_same_v<T, tensorplay::complex<double>> ||
-                std::is_same_v<T, tensorplay::complex<Half>> ||
-                std::is_same_v<T, tensorplay::complex<BFloat16>>) {
-                indexed_atomic_add(&d[slot], vp[i]);
-            }
-        }
-        else d[slot] = vp[i];
-    }
-}
-
 template <typename T>
 inline void run_nonzero_mark_iter(TensorIteratorBase& iter) {
     gpu_kernel(iter, [] __host__ __device__(T value) -> int64_t {
@@ -1594,7 +1573,7 @@ inline void dispatch_masked_fill_iter(TensorIteratorBase& iter,
 #undef TP_MF_ITER_CASE
 }
 
-Tensor masked_fill_cuda(const Tensor& self, const Tensor& mask, Scalar value) {
+Tensor masked_fill_cuda(const Tensor& self, const Tensor& mask, const Scalar& value) {
     // Broadcast the mask and source once, then apply the replacement in one pass.
     if (mask.dtype() != DType::Bool) {
         TP_THROW(TypeError, "masked_fill only supports boolean masks");
@@ -1614,7 +1593,7 @@ Tensor masked_fill_cuda(const Tensor& self, const Tensor& mask, Scalar value) {
     return result;
 }
 
-Tensor& masked_fill__cuda(Tensor& self, const Tensor& mask, Scalar value) {
+Tensor& masked_fill__cuda(Tensor& self, const Tensor& mask, const Scalar& value) {
     if (mask.dtype() != DType::Bool) {
         TP_THROW(TypeError, "masked_fill only supports boolean masks");
     }
@@ -2078,7 +2057,7 @@ Tensor scatter_add_cuda(const Tensor& self, int64_t dim, const Tensor& index, co
 Tensor scatter_src_cuda(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& src) {
     return scatter_base_cuda<false>(self, dim, index, src);
 }
-Tensor scatter_value_cuda(const Tensor& self, int64_t dim, const Tensor& index, Scalar value) {
+Tensor scatter_value_cuda(const Tensor& self, int64_t dim, const Tensor& index, const Scalar& value) {
     Tensor full = Tensor::full({}, value, self.dtype(), self.device());
     return scatter_base_cuda<false>(self, dim, index, full);
 }
@@ -2174,7 +2153,7 @@ Tensor& scatter_inplace_src_cuda(Tensor& self, int64_t dim, const Tensor& index,
     return scatter_base_inplace_cuda(self, dim, index, src, /*add=*/false);
 }
 
-Tensor& scatter_inplace_value_cuda(Tensor& self, int64_t dim, const Tensor& index, Scalar value) {
+Tensor& scatter_inplace_value_cuda(Tensor& self, int64_t dim, const Tensor& index, const Scalar& value) {
     Tensor full = Tensor::full({}, value, self.dtype(), self.device());
     return scatter_base_inplace_cuda(self, dim, index, full, /*add=*/false);
 }
@@ -2290,7 +2269,7 @@ Tensor index_copy_cuda(const Tensor& self, int64_t dim, const Tensor& index, con
     return result;
 }
 
-Tensor index_fill_scalar_cuda(const Tensor& self, int64_t dim, const Tensor& index, Scalar value);
+Tensor index_fill_scalar_cuda(const Tensor& self, int64_t dim, const Tensor& index, const Scalar& value);
 
 Tensor index_fill_tensor_cuda(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& value) {
     if (value.dim() != 0) {
@@ -2302,7 +2281,7 @@ Tensor index_fill_tensor_cuda(const Tensor& self, int64_t dim, const Tensor& ind
     return index_fill_scalar_cuda(self, dim, index, v);
 }
 
-Tensor index_fill_scalar_cuda(const Tensor& self, int64_t dim, const Tensor& index, Scalar value) {
+Tensor index_fill_scalar_cuda(const Tensor& self, int64_t dim, const Tensor& index, const Scalar& value) {
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
     Tensor idx = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
@@ -2336,7 +2315,7 @@ Tensor index_fill_scalar_cuda(const Tensor& self, int64_t dim, const Tensor& ind
     return result;
 }
 
-Tensor& index_fill_scalar__cuda(Tensor& self, int64_t dim, const Tensor& index, Scalar value) {
+Tensor& index_fill_scalar__cuda(Tensor& self, int64_t dim, const Tensor& index, const Scalar& value) {
     // Fill a clone, then copy it back through the existing in-place path.
     self.copy_(index_fill_scalar_cuda(self, dim, index, value));
     return self;
@@ -2349,89 +2328,6 @@ Tensor& index_fill_tensor__cuda(Tensor& self, int64_t dim, const Tensor& index, 
                  value.dim(), " dimension(s).");
     }
     return index_fill_scalar__cuda(self, dim, index, value.item());
-}
-
-// ---------------------------------------------------------------------------
-// index_put / index_put_.
-// ---------------------------------------------------------------------------
-
-namespace {
-Tensor index_put_impl_cuda(Tensor& result, const std::vector<Tensor>& indices,
-                           const Tensor& values, bool accumulate) {
-    if (indices.empty()) TP_THROW(IndexError, "index_put: at least one index tensor required");
-    if (accumulate) {
-        // Accumulates with atomicAdd (no deterministic variant implemented).
-        globalContext().alertNotDeterministic("index_put");
-    }
-    int64_t numel_self = result.numel();
-    Tensor flat_idx = indices[0].to(DType::Int64).contiguous();
-    for (size_t i = 1; i < indices.size(); ++i) {
-        flat_idx = flat_idx * static_cast<int64_t>(result.size(i)) +
-                   indices[i].to(DType::Int64).contiguous();
-    }
-    Tensor vals = values.to(result.dtype()).contiguous();
-    int64_t n = flat_idx.numel();
-    bool scalar_vals = vals.numel() == 1;
-    if (!scalar_vals && vals.numel() != n) {
-        TP_THROW(RuntimeError, "index_put: values must match number of indexed elements");
-    }
-    if (!scalar_vals) {
-        // broadcast scalar-shaped values to n
-        vals = vals.expand(std::vector<int64_t>{n}).contiguous();
-    }
-    auto stream = getCurrentCUDAStream().stream();
-    if (accumulate) {
-#define TP_IP_ACC_CASE(ctype, name) \
-            case DType::name: \
-                index_put_kernel<ctype, true><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-                    n, numel_self, static_cast<ctype*>(result.data_ptr()), \
-                    flat_idx.data_ptr<int64_t>(), \
-                    static_cast<const ctype*>(vals.data_ptr())); \
-                break;
-        switch (result.dtype()) {
-            TENSORPLAY_FORALL_SCALAR_TYPES(TP_IP_ACC_CASE)
-            TP_IP_ACC_CASE(tensorplay::complex<Half>, ComplexHalf)
-            TP_IP_ACC_CASE(tensorplay::complex<float>, ComplexFloat)
-            TP_IP_ACC_CASE(tensorplay::complex<double>, ComplexDouble)
-            TP_IP_ACC_CASE(tensorplay::complex<BFloat16>, BComplex32)
-#undef TP_IP_ACC_CASE
-            default:
-                TP_THROW(NotImplementedError, "index_put accumulate=True on CUDA does not support this dtype");
-        }
-    } else {
-#define TP_IP_CASE(ctype, name) \
-        case DType::name: \
-            index_put_kernel<ctype, false><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-                n, numel_self, static_cast<ctype*>(result.data_ptr()), \
-                flat_idx.data_ptr<int64_t>(), \
-                static_cast<const ctype*>(vals.data_ptr())); \
-            break;
-        switch (result.dtype()) {
-            TENSORPLAY_FORALL_SCALAR_TYPES(TP_IP_CASE)
-            TENSORPLAY_FORALL_FP8_TYPES(TP_IP_CASE)
-            TP_IP_CASE(tensorplay::complex<Half>, ComplexHalf)
-            TP_IP_CASE(tensorplay::complex<float>, ComplexFloat)
-            TP_IP_CASE(tensorplay::complex<double>, ComplexDouble)
-            TP_IP_CASE(tensorplay::complex<BFloat16>, BComplex32)
-            default: TP_THROW(TypeError, "index_put: unsupported dtype");
-        }
-#undef TP_IP_CASE
-    }
-    CUDA_CHECK(cudaGetLastError());
-    return result;
-}
-} // anonymous namespace
-
-Tensor index_put_cuda(const Tensor& self, const std::vector<Tensor>& indices,
-                      const Tensor& values, bool accumulate) {
-    Tensor result = ::tensorplay::detail::contiguous_clone(self);
-    return index_put_impl_cuda(result, indices, values, accumulate);
-}
-
-Tensor& index_put__cuda(Tensor& self, const std::vector<Tensor>& indices,
-                        const Tensor& values, bool accumulate) {
-    index_put_impl_cuda(self, indices, values, accumulate);
-    return self;
 }
 
 // ---------------------------------------------------------------------------
@@ -3479,27 +3375,19 @@ Tensor index_reduce_backward_src_cuda(const Tensor& grad,
                                       const std::string& reduce,
                                       bool include_self);
 Tensor& interop_tril_out_cuda(const Tensor& self, int64_t diagonal, Tensor& out) {
-        out = tril_cuda(self, diagonal);
+        write_out(out, tril_cuda(self, diagonal));
         return out;
 
 }
 
 Tensor& interop_triu_out_cuda(const Tensor& self, int64_t diagonal, Tensor& out) {
-        out = triu_cuda(self, diagonal);
-        return out;
-
-}
-
-Tensor& interop_index_add_out_cuda(const Tensor& self, int64_t dim, const Tensor& index,
-              const Tensor& source, Scalar alpha, Tensor& out) {
-        (void)alpha;
-        out = index_add_cuda(self, dim, index, source);
+        write_out(out, triu_cuda(self, diagonal));
         return out;
 
 }
 
 
-Tensor& interop_masked_fill__Scalar_cuda(Tensor& self, const Tensor& mask, Scalar value) {
+Tensor& interop_masked_fill__Scalar_cuda(Tensor& self, const Tensor& mask, const Scalar& value) {
         return masked_fill__cuda(self, mask, value);
     
 }
@@ -3529,8 +3417,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, IndexingKernels) {
     m.impl("index_fill.Scalar", index_fill_scalar_cuda);
     m.impl("index_fill_.Tensor", index_fill_tensor__cuda);
     m.impl("index_fill_.Scalar", index_fill_scalar__cuda);
-    m.impl("index_put", index_put_cuda);
-    m.impl("index_put_", index_put__cuda);
     m.impl("nonzero", nonzero_cuda);
     m.impl("sort", sort_cuda);
     m.impl("argsort", argsort_cuda);
@@ -3555,7 +3441,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, IndexingKernels) {
     // buffer.  masked_fill_.Scalar routes through the tensor-overload kernel.
     m.impl("tril.out", interop_tril_out_cuda);
     m.impl("triu.out", interop_triu_out_cuda);
-    m.impl("index_add.out", interop_index_add_out_cuda);
     m.impl("masked_fill_.Scalar", interop_masked_fill__Scalar_cuda);
 }
 

@@ -967,9 +967,9 @@ __global__ void slice_reduce_f64_kernel(int64_t n_slices, int64_t d_size, int64_
 // Arithmetic
 // ===========================================================================
 
-Tensor sub_kernel(const Tensor& self, const Tensor& other, Scalar alpha);
+Tensor sub_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha);
 
-Tensor rsub_scalar_cuda(const Tensor& self, Scalar other, Scalar alpha) {
+Tensor rsub_scalar_cuda(const Tensor& self, const Scalar& other, const Scalar& alpha) {
     DType dt = isFloatingType(other.dtype())
                    ? (isFloatingType(self.dtype()) ? self.dtype() : DType::Float32)
                    : self.dtype();
@@ -980,7 +980,7 @@ Tensor rsub_scalar_cuda(const Tensor& self, Scalar other, Scalar alpha) {
     return sub_kernel(full, sc, alpha);
 }
 
-Tensor rsub_tensor_cuda(const Tensor& self, const Tensor& other, Scalar alpha) {
+Tensor rsub_tensor_cuda(const Tensor& self, const Tensor& other, const Scalar& alpha) {
     return sub_kernel(other, self, alpha);
 }
 
@@ -993,7 +993,7 @@ Tensor true_divide_tensor_cuda(const Tensor& self, const Tensor& other) {
     return binary_float_cuda(self, other,
                              HFn1{}, "true_divide");
 }
-Tensor true_divide_scalar_cuda(const Tensor& self, Scalar other) {
+Tensor true_divide_scalar_cuda(const Tensor& self, const Scalar& other) {
     // A Float32 stand-in would widen Half/BFloat16 inputs.
     const DType dt = scalar_promote(self.dtype(), other);
     return true_divide_tensor_cuda(self, Tensor::full({}, other, dt, self.device()));
@@ -1001,7 +1001,7 @@ Tensor true_divide_scalar_cuda(const Tensor& self, Scalar other) {
 Tensor divide_tensor_cuda(const Tensor& self, const Tensor& other) {
     return true_divide_tensor_cuda(self, other);
 }
-Tensor divide_scalar_cuda(const Tensor& self, Scalar other) {
+Tensor divide_scalar_cuda(const Tensor& self, const Scalar& other) {
     return true_divide_scalar_cuda(self, other);
 }
 
@@ -1010,13 +1010,13 @@ Tensor remainder_tensor_cuda(const Tensor& self, const Tensor& other) {
                             HFn2{},
                             "remainder");
 }
-Tensor remainder_scalar_cuda(const Tensor& self, Scalar other) {
+Tensor remainder_scalar_cuda(const Tensor& self, const Scalar& other) {
     // Forcing the scalar into self's dtype would truncate a float divisor
     // against an integral tensor; the pair promotes first.
     const DType dt = scalar_promote(self.dtype(), other);
     return remainder_tensor_cuda(self.to(dt), Tensor::full({}, other, dt, self.device()));
 }
-Tensor remainder_scalar_tensor_cuda(Scalar self, const Tensor& other) {
+Tensor remainder_scalar_tensor_cuda(const Scalar& self, const Tensor& other) {
     const DType dt = scalar_promote(other.dtype(), self);
     return remainder_tensor_cuda(Tensor::full({}, self, dt, other.device()), other.to(dt));
 }
@@ -1025,11 +1025,11 @@ Tensor fmod_tensor_cuda(const Tensor& self, const Tensor& other) {
                             HFn3{},
                             "fmod");
 }
-Tensor fmod_scalar_cuda(const Tensor& self, Scalar other) {
+Tensor fmod_scalar_cuda(const Tensor& self, const Scalar& other) {
     const DType dt = scalar_promote(self.dtype(), other);
     return fmod_tensor_cuda(self.to(dt), Tensor::full({}, other, dt, self.device()));
 }
-Tensor subtract_tensor_cuda(const Tensor& self, const Tensor& other, Scalar alpha) {
+Tensor subtract_tensor_cuda(const Tensor& self, const Tensor& other, const Scalar& alpha) {
     // alpha == 1 is by far the common call and keeps the unscaled loop.
     if (!alpha.isComplex() && alpha.toDouble() == 1.0) {
         return binary_same_cuda(self, other,
@@ -1039,7 +1039,7 @@ Tensor subtract_tensor_cuda(const Tensor& self, const Tensor& other, Scalar alph
     return binary_same_cuda(self, other,
                             HFn5{al}, "subtract");
 }
-Tensor subtract_scalar_cuda(const Tensor& self, Scalar other, Scalar alpha) {
+Tensor subtract_scalar_cuda(const Tensor& self, const Scalar& other, const Scalar& alpha) {
     const DType dt = scalar_promote(self.dtype(), other);
     return subtract_tensor_cuda(self.to(dt),
                                 Tensor::full({}, other, dt, self.device()), alpha);
@@ -1048,7 +1048,7 @@ Tensor multiply_tensor_cuda(const Tensor& self, const Tensor& other) {
     return binary_same_cuda(self, other,
                             HFn6{}, "multiply");
 }
-Tensor multiply_scalar_cuda(const Tensor& self, Scalar other) {
+Tensor multiply_scalar_cuda(const Tensor& self, const Scalar& other) {
     double ov = other.toDouble();
     return dtype_unary_cuda(self,
                             HFn7{ov},
@@ -1089,17 +1089,17 @@ Tensor div_rounded_scalar(const Tensor& self, Scalar other, DivRounding rounding
 }  // namespace
 
 Tensor div_mode_tensor_cuda(const Tensor& self, const Tensor& other,
-                            std::optional<std::string> rounding_mode) {
+                            const std::optional<std::string>& rounding_mode) {
     return div_rounded_core(self, other, parse_div_rounding(rounding_mode));
 }
-Tensor div_mode_scalar_cuda(const Tensor& self, Scalar other,
-                            std::optional<std::string> rounding_mode) {
+Tensor div_mode_scalar_cuda(const Tensor& self, const Scalar& other,
+                            const std::optional<std::string>& rounding_mode) {
     return div_rounded_scalar(self, other, parse_div_rounding(rounding_mode));
 }
 Tensor floor_divide_cuda(const Tensor& self, const Tensor& other) {
     return div_rounded_core(self, other, DivRounding::kFloor);
 }
-Tensor floor_divide_scalar_cuda(const Tensor& self, Scalar other) {
+Tensor floor_divide_scalar_cuda(const Tensor& self, const Scalar& other) {
     return div_rounded_scalar(self, other, DivRounding::kFloor);
 }
 
@@ -1218,7 +1218,7 @@ Tensor erfinv_cuda(const Tensor& self) {
     // symbol in libp10.so.
     return float_math_cuda(self, HFn32{}, "erfinv");
 }
-Tensor logit_cuda(const Tensor& self, std::optional<Scalar> eps) {
+Tensor logit_cuda(const Tensor& self, const std::optional<Scalar>& eps) {
     double e = eps.has_value() ? eps->toDouble() : -1.0;
     return float_math_cuda(self,
                            HFn33{e},
@@ -1231,8 +1231,8 @@ Tensor i0_cuda(const Tensor& self) {
     // Chebyshev expansion, valid over the whole range; see i0_cpu.
     return float_math_cuda(self, HFn35{}, "i0");
 }
-Tensor nan_to_num_cuda(const Tensor& self, Scalar nan,
-                       std::optional<Scalar> posinf, std::optional<Scalar> neginf) {
+Tensor nan_to_num_cuda(const Tensor& self, const Scalar& nan,
+                       const std::optional<Scalar>& posinf, const std::optional<Scalar>& neginf) {
     Tensor out = Tensor::empty(shape_of(self), self.dtype(), self.device());
     if (out.numel() == 0) return out;
     if (isIntegralType(self.dtype(), true)) {
@@ -1335,7 +1335,7 @@ Tensor logaddexp2_cuda(const Tensor& a, const Tensor& b) {
 Tensor copysign_cuda(const Tensor& a, const Tensor& b) {
     return binary_float_cuda(a, b, HFn42{}, "copysign");
 }
-Tensor copysign_scalar_cuda(const Tensor& self, Scalar other) {
+Tensor copysign_scalar_cuda(const Tensor& self, const Scalar& other) {
     // The sign comes from the scalar alone, so the divisor width never
     // participates in promotion -- Float32 carries every sign bit exactly.
     return copysign_cuda(self, Tensor::full({}, other, DType::Float32, self.device()));
@@ -1370,13 +1370,13 @@ Tensor heaviside_cuda(const Tensor& a, const Tensor& values) {
 // Clamp family
 // ===========================================================================
 
-Tensor clamp_min_scalar_cuda(const Tensor& self, Scalar min) {
+Tensor clamp_min_scalar_cuda(const Tensor& self, const Scalar& min) {
     double lo = min.toDouble();
     return dtype_unary_cuda(self,
                             HFn48{lo},
                             "clamp_min");
 }
-Tensor clamp_max_scalar_cuda(const Tensor& self, Scalar max) {
+Tensor clamp_max_scalar_cuda(const Tensor& self, const Scalar& max) {
     double hi = max.toDouble();
     return dtype_unary_cuda(self,
                             HFn49{hi},
@@ -1392,7 +1392,7 @@ Tensor clamp_max_tensor_cuda(const Tensor& self, const Tensor& max) {
                             HFn51{},
                             "clamp_max");
 }
-Tensor clip_cuda(const Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max) {
+Tensor clip_cuda(const Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
     if (min.has_value() && max.has_value()) {
         Tensor r = clamp_min_scalar_cuda(self, *min);
         return clamp_max_scalar_cuda(r, *max);
@@ -1401,7 +1401,7 @@ Tensor clip_cuda(const Tensor& self, std::optional<Scalar> min, std::optional<Sc
     if (max.has_value()) return clamp_max_scalar_cuda(self, *max);
     return self.clone();
 }
-Tensor& clamp__cuda(Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max) {
+Tensor& clamp__cuda(Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
     Tensor r = clip_cuda(self, std::move(min), std::move(max));
     self.copy_(r);
     return self;
@@ -1409,11 +1409,11 @@ Tensor& clamp__cuda(Tensor& self, std::optional<Scalar> min, std::optional<Scala
 
 // Keep them separate from clamp_ (which accepts two optional bounds): these
 // are the unsuffixed dispatcher names used by the generated native schemas.
-Tensor& clamp_min__scalar_cuda(Tensor& self, Scalar min) {
+Tensor& clamp_min__scalar_cuda(Tensor& self, const Scalar& min) {
     self.copy_(clamp_min_scalar_cuda(self, min));
     return self;
 }
-Tensor& clamp_max__scalar_cuda(Tensor& self, Scalar max) {
+Tensor& clamp_max__scalar_cuda(Tensor& self, const Scalar& max) {
     self.copy_(clamp_max_scalar_cuda(self, max));
     return self;
 }
@@ -1429,20 +1429,20 @@ Tensor selu_cuda(const Tensor& self) {
                             HFn52{kAlpha, kScale},
                             "selu");
 }
-Tensor celu_cuda(const Tensor& self, Scalar alpha) {
+Tensor celu_cuda(const Tensor& self, const Scalar& alpha) {
     double a = alpha.toDouble();
     return dtype_unary_cuda(self,
                             HFn53{a},
                             "celu");
 }
-Tensor hardshrink_cuda(const Tensor& self, Scalar lambd) {
+Tensor hardshrink_cuda(const Tensor& self, const Scalar& lambd) {
     double l = lambd.toDouble();
     // lambd.to<scalar_t>(), so float32 boundary values compare exactly.
     return dtype_unary_cuda(self,
                             HFn54{l},
                             "hardshrink");
 }
-Tensor softshrink_cuda(const Tensor& self, Scalar lambd) {
+Tensor softshrink_cuda(const Tensor& self, const Scalar& lambd) {
     double l = lambd.toDouble();
     // (a < -l ? a+l : 0)); the v*0 middle branch keeps NaN propagating.
     return dtype_unary_cuda(self,
@@ -1451,13 +1451,13 @@ Tensor softshrink_cuda(const Tensor& self, Scalar lambd) {
 }
 // hard/soft): grad passes through where self is outside the inclusive
 // [-lambd, lambd] band.
-Tensor hardshrink_backward_cuda(const Tensor& grad_out, const Tensor& self, Scalar lambd) {
+Tensor hardshrink_backward_cuda(const Tensor& grad_out, const Tensor& self, const Scalar& lambd) {
     double l = lambd.toDouble();
     return binary_same_cuda(grad_out, self,
                             HFn56{l},
                             "hardshrink_backward");
 }
-Tensor softshrink_backward_cuda(const Tensor& grad_output, const Tensor& self, Scalar lambd) {
+Tensor softshrink_backward_cuda(const Tensor& grad_output, const Tensor& self, const Scalar& lambd) {
     double l = lambd.toDouble();
     return binary_same_cuda(grad_output, self,
                             HFn57{l},
@@ -1476,13 +1476,13 @@ Tensor tanh_backward_cuda(const Tensor& grad_output, const Tensor& output) {
 // eps (eps<0) the gradient is dy/(x(1-x)) inside [0,1] and NaN outside; with
 // eps>=0 values outside [eps, 1-eps] (compared in the element dtype) are
 // masked to zero. Exact 0/1 fall through to the division (dy/0 -> inf).
-Tensor logit_backward_cuda(const Tensor& grad_output, const Tensor& self, std::optional<Scalar> eps) {
+Tensor logit_backward_cuda(const Tensor& grad_output, const Tensor& self, const std::optional<Scalar>& eps) {
     double e = eps.has_value() ? eps->toDouble() : -1.0;
     return binary_same_cuda(grad_output, self,
                             HFn60{e},
                             "logit_backward");
 }
-Tensor threshold_cuda(const Tensor& self, Scalar threshold, Scalar value) {
+Tensor threshold_cuda(const Tensor& self, const Scalar& threshold, const Scalar& value) {
     double t = threshold.toDouble(), val = value.toDouble();
     return dtype_unary_cuda(self,
                             HFn61{t, val},

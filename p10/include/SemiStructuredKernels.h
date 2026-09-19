@@ -25,7 +25,7 @@ Tensor sparse_semi_structured_mm_right_cpu(
     std::optional<DType> out_dtype);
 Tensor sparse_semi_structured_addmm_cpu(
     const Tensor& input, const Tensor& packed, const Tensor& meta,
-    const Tensor& dense, Scalar alpha, Scalar beta,
+    const Tensor& dense, const Scalar& alpha, const Scalar& beta,
     std::optional<DType> out_dtype);
 
 } // namespace cpu
@@ -49,7 +49,7 @@ Tensor sparse_semi_structured_mm_right_cuda(
     std::optional<DType> out_dtype);
 Tensor sparse_semi_structured_addmm_cuda(
     const Tensor& input, const Tensor& packed, const Tensor& meta,
-    const Tensor& dense, Scalar alpha, Scalar beta,
+    const Tensor& dense, const Scalar& alpha, const Scalar& beta,
     std::optional<DType> out_dtype);
 
 } // namespace cuda

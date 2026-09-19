@@ -112,6 +112,7 @@ set(P10_SOURCES
     # (CompositeCommon.h holds the shared helpers).
     # Registered under the Composite dispatch key; see the files themselves.
     src/backend/composite/Activation.cpp
+    src/backend/composite/BatchNormVariants.cpp
     src/backend/composite/ActivationMore.cpp
     src/backend/composite/BackwardHelperComposites.cpp
     src/backend/composite/GradientBridgeComposites.cpp

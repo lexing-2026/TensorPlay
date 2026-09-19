@@ -133,7 +133,7 @@ void arange_fill_data(scalar_t* data, int64_t size, const Scalar& start,
     }
 }
 
-Tensor& arange_out_kernel(Scalar start, Scalar end, Scalar step, Tensor& result) {
+Tensor& arange_out_kernel(const Scalar& start, const Scalar& end, const Scalar& step, Tensor& result) {
     const double dstart = start.toDouble();
     const double dend = end.toDouble();
     const double dstep = step.toDouble();
@@ -216,7 +216,7 @@ Tensor& arange_out_kernel(Scalar start, Scalar end, Scalar step, Tensor& result)
     return result;
 }
 
-Tensor arange_start_step_options_kernel(Scalar start, Scalar end, Scalar step,
+Tensor arange_start_step_options_kernel(const Scalar& start, const Scalar& end, const Scalar& step,
                                         std::optional<DType> dtype,
                                         std::optional<int64_t> layout,
                                         std::optional<Device> device,
@@ -237,7 +237,7 @@ Tensor arange_start_step_options_kernel(Scalar start, Scalar end, Scalar step,
 }
 
 // Overload wrappers over the shared implementation above.
-Tensor arange_start_step_options_kernel_start(Scalar start, Scalar end,
+Tensor arange_start_step_options_kernel_start(const Scalar& start, const Scalar& end,
                                               std::optional<DType> dtype,
                                               std::optional<int64_t> layout,
                                               std::optional<Device> device,
@@ -246,7 +246,7 @@ Tensor arange_start_step_options_kernel_start(Scalar start, Scalar end,
                                             dtype, layout, device, pin_memory);
 }
 
-Tensor& arange_out_end_kernel(Scalar end, Tensor& out) {
+Tensor& arange_out_end_kernel(const Scalar& end, Tensor& out) {
     return arange_out_kernel(Scalar(static_cast<int64_t>(0)), end,
                              Scalar(static_cast<int64_t>(1)), out);
 }
@@ -337,7 +337,7 @@ void linspace_fill_dispatch(Tensor& r, const Scalar& start, const Scalar& end,
     }
 }
 
-Tensor& linspace_out_scalar_kernel(Scalar start, Scalar end, int64_t steps, Tensor& result) {
+Tensor& linspace_out_scalar_kernel(const Scalar& start, const Scalar& end, int64_t steps, Tensor& result) {
     if (steps < 0) {
         TP_THROW(RuntimeError, "number of steps must be non-negative");
     }
@@ -443,7 +443,7 @@ void logspace_fill_dispatch(Tensor& r, const Scalar& start, const Scalar& end,
     }
 }
 
-Tensor& logspace_out_scalar_kernel(Scalar start, Scalar end, int64_t steps,
+Tensor& logspace_out_scalar_kernel(const Scalar& start, const Scalar& end, int64_t steps,
                                    double base, Tensor& result) {
     if (steps < 0) {
         TP_THROW(RuntimeError, "number of steps must be non-negative");
@@ -485,7 +485,7 @@ Tensor& linspace_out_tt_kernel(const Tensor& start, const Tensor& end,
     return linspace_out_scalar_kernel(start.item(), end.item(), steps, out);
 }
 
-Tensor& linspace_out_ts_kernel(const Tensor& start, Scalar end, int64_t steps, Tensor& out) {
+Tensor& linspace_out_ts_kernel(const Tensor& start, const Scalar& end, int64_t steps, Tensor& out) {
     if (start.dim() != 0) {
         TP_THROW(RuntimeError,
                  "linspace only supports 0-dimensional start and end tensors, "
@@ -494,7 +494,7 @@ Tensor& linspace_out_ts_kernel(const Tensor& start, Scalar end, int64_t steps, T
     return linspace_out_scalar_kernel(start.item(), end, steps, out);
 }
 
-Tensor& linspace_out_st_kernel(Scalar start, const Tensor& end, int64_t steps, Tensor& out) {
+Tensor& linspace_out_st_kernel(const Scalar& start, const Tensor& end, int64_t steps, Tensor& out) {
     if (end.dim() != 0) {
         TP_THROW(RuntimeError,
                  "linspace only supports 0-dimensional start and end tensors, "
@@ -514,7 +514,7 @@ Tensor& logspace_out_tt_kernel(const Tensor& start, const Tensor& end,
     return logspace_out_scalar_kernel(start.item(), end.item(), steps, base, out);
 }
 
-Tensor& logspace_out_ts_kernel(const Tensor& start, Scalar end, int64_t steps,
+Tensor& logspace_out_ts_kernel(const Tensor& start, const Scalar& end, int64_t steps,
                                double base, Tensor& out) {
     if (start.dim() != 0) {
         TP_THROW(RuntimeError,
@@ -524,7 +524,7 @@ Tensor& logspace_out_ts_kernel(const Tensor& start, Scalar end, int64_t steps,
     return logspace_out_scalar_kernel(start.item(), end, steps, base, out);
 }
 
-Tensor& logspace_out_st_kernel(Scalar start, const Tensor& end, int64_t steps,
+Tensor& logspace_out_st_kernel(const Scalar& start, const Tensor& end, int64_t steps,
                                double base, Tensor& out) {
     if (end.dim() != 0) {
         TP_THROW(RuntimeError,
@@ -875,7 +875,7 @@ void unmap_mapped_region(void* ctx) {
 
 }  // namespace
 
-Tensor from_file_kernel(std::string filename, std::optional<bool> shared,
+Tensor from_file_kernel(const std::string& filename, std::optional<bool> shared,
                         std::optional<int64_t> size,
                         std::optional<DType> dtype,
                         std::optional<int64_t> layout,
@@ -992,14 +992,14 @@ void assert_async_kernel(const Tensor& self) {
     }
 }
 
-void assert_async_msg_kernel(const Tensor& self, std::string assert_msg) {
+void assert_async_msg_kernel(const Tensor& self, const std::string& assert_msg) {
     if (!composite::is_nonzero_native(self)) {
         TP_THROW(RuntimeError,
                  !assert_msg.empty() ? assert_msg : std::string("Assertion is failed"));
     }
 }
 
-Tensor functional_assert_async_msg_kernel(const Tensor& self, std::string assert_msg,
+Tensor functional_assert_async_msg_kernel(const Tensor& self, const std::string& assert_msg,
                                           const Tensor& dep_token) {
     assert_async_msg_kernel(self, assert_msg);
     return ops::clone(dep_token);

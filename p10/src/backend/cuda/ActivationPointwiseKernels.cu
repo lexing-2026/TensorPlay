@@ -1,5 +1,6 @@
 // Pointwise CUDA kernels: activation family.
 #include "PointwiseCommon.cuh"
+#include "OutWrite.h"
 
 namespace tensorplay {
 namespace cuda {
@@ -94,9 +95,10 @@ struct HardswishFunctor {
 };
 struct HardswishBackwardFunctor {
     template<typename T> __device__ T operator()(T dy, T x) const {
+        // d/dx [x * relu6(x + 3) / 6]
         return x <= static_cast<T>(-3) ? static_cast<T>(0)
-             : x >= static_cast<T>(3)  ? dy
-             : dy * (x / static_cast<T>(6) + static_cast<T>(0.5));
+             : x < static_cast<T>(3) ? dy * (x / static_cast<T>(3) + static_cast<T>(0.5))
+             : dy;
     }
 };
 struct HardsigmoidFunctor {
@@ -108,8 +110,9 @@ struct HardsigmoidFunctor {
 };
 struct HardsigmoidBackwardFunctor {
     template<typename T> __device__ T operator()(T dy, T x) const {
+        // d/dx [relu6(x + 3) / 6]
         return (x <= static_cast<T>(-3) || x >= static_cast<T>(3)) ? static_cast<T>(0)
-                                                                   : dy * (x / static_cast<T>(6) + static_cast<T>(0.5));
+                                                                   : dy / static_cast<T>(6);
     }
 };
 struct LeakyReluFunctor {
@@ -244,10 +247,10 @@ Tensor gelu_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, 
     else if (approximate != "none") TP_THROW(ValueError, "approximate argument must be either none or tanh, but got " + approximate);
     return activation_backward_kernel_cuda(grad_output, self, GeluBackwardNoneFunctor());
 }
-Tensor hardtanh_kernel_cuda(const Tensor& self, Scalar min_val, Scalar max_val) {
+Tensor hardtanh_kernel_cuda(const Tensor& self, const Scalar& min_val, const Scalar& max_val) {
     return unary_float_op_kernel_v2(self, HardtanhFunctor(min_val.toDouble(), max_val.toDouble()));
 }
-Tensor hardtanh_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, Scalar min_val, Scalar max_val) {
+Tensor hardtanh_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, const Scalar& min_val, const Scalar& max_val) {
     return activation_backward_kernel_cuda(grad_output, self, HardtanhBackwardFunctor(min_val.toDouble(), max_val.toDouble()));
 }
 Tensor relu6_kernel_cuda(const Tensor& self) { return hardtanh_kernel_cuda(self, Scalar(0.0), Scalar(6.0)); }
@@ -259,17 +262,17 @@ Tensor hardsigmoid_kernel_cuda(const Tensor& self) { return unary_float_op_kerne
 Tensor hardsigmoid_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self) {
     return activation_backward_kernel_cuda(grad_output, self, HardsigmoidBackwardFunctor());
 }
-Tensor leaky_relu_kernel_cuda(const Tensor& self, Scalar negative_slope) {
+Tensor leaky_relu_kernel_cuda(const Tensor& self, const Scalar& negative_slope) {
     return unary_float_op_kernel_v2(self, LeakyReluFunctor(negative_slope.toDouble()));
 }
-Tensor leaky_relu_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, Scalar negative_slope, bool self_is_result) {
+Tensor leaky_relu_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, const Scalar& negative_slope, bool self_is_result) {
     (void)self_is_result;
     return activation_backward_kernel_cuda(grad_output, self, LeakyReluBackwardFunctor(negative_slope.toDouble()));
 }
-Tensor elu_kernel_cuda(const Tensor& self, Scalar alpha, Scalar scale, Scalar input_scale) {
+Tensor elu_kernel_cuda(const Tensor& self, const Scalar& alpha, const Scalar& scale, const Scalar& input_scale) {
     return unary_float_op_kernel_v2(self, EluFunctor(alpha.toDouble(), scale.toDouble(), input_scale.toDouble()));
 }
-Tensor elu_backward_kernel_cuda(const Tensor& grad_output, Scalar alpha, Scalar scale, Scalar input_scale, bool is_result, const Tensor& self_or_result) {
+Tensor elu_backward_kernel_cuda(const Tensor& grad_output, const Scalar& alpha, const Scalar& scale, const Scalar& input_scale, bool is_result, const Tensor& self_or_result) {
     return activation_backward_kernel_cuda(grad_output, self_or_result,
         EluBackwardFunctor(alpha.toDouble(), scale.toDouble(), input_scale.toDouble(), is_result));
 }
@@ -278,11 +281,11 @@ Tensor mish_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self) 
     return activation_backward_kernel_cuda(grad_output, self, MishBackwardFunctor());
 }
 Tensor selu_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, SeluFunctor()); }
-Tensor celu_kernel_cuda(const Tensor& self, Scalar alpha) { return unary_float_op_kernel_v2(self, CeluFunctor(alpha.toDouble())); }
-Tensor softplus_kernel_cuda(const Tensor& self, Scalar beta, Scalar threshold) {
+Tensor celu_kernel_cuda(const Tensor& self, const Scalar& alpha) { return unary_float_op_kernel_v2(self, CeluFunctor(alpha.toDouble())); }
+Tensor softplus_kernel_cuda(const Tensor& self, const Scalar& beta, const Scalar& threshold) {
     return unary_float_op_kernel_v2(self, SoftplusFunctor(beta.toDouble(), threshold.toDouble()));
 }
-Tensor softplus_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, Scalar beta, Scalar threshold) {
+Tensor softplus_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, const Scalar& beta, const Scalar& threshold) {
     return activation_backward_kernel_cuda(grad_output, self, SoftplusBackwardFunctor(beta.toDouble(), threshold.toDouble()));
 }
 
@@ -316,8 +319,8 @@ Tensor& log_sigmoid_backward_out_cuda(const Tensor& grad_output,
                                       const Tensor& self, const Tensor& buffer,
                                       Tensor& grad_input) {
     (void)buffer;
-    grad_input = activation_backward_kernel_cuda(grad_output, self,
-                                                 LogSigmoidBackwardFunctor());
+    write_out(grad_input, activation_backward_kernel_cuda(grad_output, self,
+                                                 LogSigmoidBackwardFunctor()));
     return grad_input;
 }
 
@@ -331,25 +334,33 @@ Tensor binary_float_op_kernel_v2(const Tensor& self, const Tensor& other, Functo
 template<typename Functor>
 Tensor binary_float_op_kernel_v2(const Tensor& self, const Tensor& other, Functor functor);
 
-Tensor rrelu_with_noise_kernel_cuda(const Tensor& self, const Tensor& noise, Scalar lower, Scalar upper, bool training) {
+// Training draws a slope from U(lower, upper) for every non-positive element
+// and records it in noise (1 elsewhere), so the backward is noise * grad;
+// evaluation applies the midpoint slope.
+void draw_rrelu_noise_cuda(const Tensor& self, Tensor& noise, const Scalar& lower,
+                           const Scalar& upper, std::optional<Generator> generator) {
+    TP_CHECK(self.shape() == noise.shape(),
+             "noise tensor shape must match self tensor shape. Got self.shape = ",
+             self.shape(), " noise.shape = ", noise.shape());
+    Tensor draw = Tensor::empty(static_cast<std::vector<int64_t>>(noise.shape()),
+                                noise.dtype(), noise.device());
+    draw.uniform_(lower.toDouble(), upper.toDouble(), generator);
+    noise.copy_(draw.masked_fill(self.gt(Scalar(0)), Scalar(1)));
+}
+
+Tensor rrelu_with_noise_kernel_cuda(const Tensor& self, Tensor& noise, const Scalar& lower,
+                                    const Scalar& upper, bool training,
+                                    std::optional<Generator> generator) {
+    if (training) draw_rrelu_noise_cuda(self, noise, lower, upper, generator);
     return binary_float_op_kernel_v2(self, noise,
         RreluWithNoiseFunctor(lower.toDouble(), upper.toDouble(), training));
 }
-// inplace out-variant: recompute and write back through the same functor.
-Tensor& rrelu_with_noise__cuda(Tensor& self, Tensor& noise, Scalar lower,
-                               Scalar upper, bool training) {
-    Tensor result = binary_float_op_kernel_v2(self, noise,
-        RreluWithNoiseFunctor(lower.toDouble(), upper.toDouble(), training));
-    self.copy_(result);
+
+Tensor& rrelu_with_noise__cuda(Tensor& self, Tensor& noise, const Scalar& lower,
+                               const Scalar& upper, bool training,
+                               std::optional<Generator> generator) {
+    self.copy_(rrelu_with_noise_kernel_cuda(self, noise, lower, upper, training, generator));
     return self;
-}
-// out-variant of the forward: the noise buffer is filled on the fly and
-// returned alongside the result.
-Tensor rrelu_with_noise_out_cuda(const Tensor& self, Tensor& noise, Scalar lower,
-                                 Scalar upper, bool training) {
-    noise = binary_float_op_kernel_v2(self, noise,
-        RreluWithNoiseFunctor(lower.toDouble(), upper.toDouble(), training));
-    return noise;
 }
 // log_sigmoid forward with its saved buffer: log_sigmoid(x) = -softplus(-x);
 // the buffer caches ::exp(-|x|), the stable remainder of the softplus
@@ -373,30 +384,30 @@ std::tuple<Tensor, Tensor> log_sigmoid_forward_components_cuda(const Tensor& sel
 // out-variants: run the value kernel, then transfer into the caller's buffer.
 Tensor& gelu_out_cuda(const Tensor& self, const std::string& approximate,
                       Tensor& out) {
-    out = gelu_kernel_cuda_v2(self, approximate);
+    write_out(out, gelu_kernel_cuda_v2(self, approximate));
     return out;
 }
 Tensor& gelu_backward_grad_input_cuda(const Tensor& grad_output,
                                       const Tensor& self,
                                       const std::string& approximate,
                                       Tensor& grad_input) {
-    grad_input = gelu_backward_kernel_cuda(grad_output, self, approximate);
+    write_out(grad_input, gelu_backward_kernel_cuda(grad_output, self, approximate));
     return grad_input;
 }
 Tensor& glu_backward_grad_input_cuda(const Tensor& grad_output, const Tensor& self,
                                      int64_t dim, Tensor& grad_input) {
-    grad_input = glu_backward_cuda(grad_output, self, dim);
+    write_out(grad_input, glu_backward_cuda(grad_output, self, dim));
     return grad_input;
 }
 std::tuple<Tensor, Tensor> log_sigmoid_forward_out_cuda(const Tensor& self,
                                                         Tensor& output,
                                                         Tensor& buffer) {
     auto [o, b] = log_sigmoid_forward_components_cuda(self);
-    output = std::move(o);
-    buffer = std::move(b);
+    write_out(output, o);
+    write_out(buffer, b);
     return std::make_tuple(output, buffer);
 }
-Tensor rrelu_with_noise_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, const Tensor& noise, Scalar lower, Scalar upper, bool training, bool self_is_result) {
+Tensor rrelu_with_noise_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, const Tensor& noise, const Scalar& lower, const Scalar& upper, bool training, bool self_is_result) {
     // Training uses the saved per-element noise; evaluation uses the mean
     // slope (lower + upper) / 2.
     if (training) {
@@ -439,7 +450,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, PointwiseKernels) {
     m.impl("log_sigmoid_forward", log_sigmoid_forward_components_cuda);
     m.impl("log_sigmoid_forward.output", log_sigmoid_forward_out_cuda);
     m.impl("rrelu_with_noise", rrelu_with_noise_kernel_cuda);
-    m.impl("rrelu_with_noise.out", rrelu_with_noise_out_cuda);
     m.impl("rrelu_with_noise_", rrelu_with_noise__cuda);
     m.impl("rrelu_with_noise_backward", rrelu_with_noise_backward_kernel_cuda);
 

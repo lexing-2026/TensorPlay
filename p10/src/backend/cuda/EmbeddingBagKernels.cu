@@ -825,11 +825,11 @@ Tensor _embedding_bag_per_sample_weights_backward_cuda(
 // GPU contraction for ragged segment reduction is not wired up yet; the
 // registration exists so the schema dispatch table stays complete and the
 // failure is an explicit rejection instead of a silent kernel miss.
-Tensor _segment_reduce_cuda(const Tensor& /*data*/, std::string /*reduce*/,
-                            std::optional<Tensor> /*lengths*/,
-                            std::optional<Tensor> /*offsets*/,
+Tensor _segment_reduce_cuda(const Tensor& /*data*/, const std::string& /*reduce*/,
+                            const std::optional<Tensor>& /*lengths*/,
+                            const std::optional<Tensor>& /*offsets*/,
                             int64_t /*axis*/,
-                            std::optional<Scalar> /*initial*/) {
+                            const std::optional<Scalar>& /*initial*/) {
     TP_THROW(NotImplementedError,
              "_segment_reduce: no CUDA kernel yet; run the op on CPU");
 }

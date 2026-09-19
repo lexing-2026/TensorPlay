@@ -19,17 +19,17 @@ Tensor& inplace_copysign_dd_Tensor(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor& inplace_copysign_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_copysign_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::copysign(self, other));
     return self;
 }
 
-Tensor& inplace_div_dd_Tensor_mode(Tensor& self, const Tensor& other, std::optional<std::string> rounding_mode) {
+Tensor& inplace_div_dd_Tensor_mode(Tensor& self, const Tensor& other, const std::optional<std::string>& rounding_mode) {
     ops::copy_(self, ops::div(self, other, rounding_mode));
     return self;
 }
 
-Tensor& inplace_div_dd_Scalar_mode(Tensor& self, Scalar other, std::optional<std::string> rounding_mode) {
+Tensor& inplace_div_dd_Scalar_mode(Tensor& self, const Scalar& other, const std::optional<std::string>& rounding_mode) {
     ops::copy_(self, ops::div(self, other, rounding_mode));
     return self;
 }
@@ -39,17 +39,17 @@ Tensor& inplace_divide_dd_Tensor(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor& inplace_divide_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_divide_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::divide(self, other));
     return self;
 }
 
-Tensor& inplace_divide_dd_Tensor_mode(Tensor& self, const Tensor& other, std::optional<std::string> rounding_mode) {
+Tensor& inplace_divide_dd_Tensor_mode(Tensor& self, const Tensor& other, const std::optional<std::string>& rounding_mode) {
     ops::copy_(self, ops::divide(self, other, rounding_mode));
     return self;
 }
 
-Tensor& inplace_divide_dd_Scalar_mode(Tensor& self, Scalar other, std::optional<std::string> rounding_mode) {
+Tensor& inplace_divide_dd_Scalar_mode(Tensor& self, const Scalar& other, const std::optional<std::string>& rounding_mode) {
     ops::copy_(self, ops::divide(self, other, rounding_mode));
     return self;
 }
@@ -59,7 +59,7 @@ Tensor& inplace_true_divide_dd_Tensor(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor& inplace_true_divide_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_true_divide_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::true_divide(self, other));
     return self;
 }
@@ -69,7 +69,7 @@ Tensor& inplace_fill_dd_Tensor(Tensor& self, const Tensor& value) {
     return self;
 }
 
-Tensor& inplace_floor_divide_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_floor_divide_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::floor_divide(self, other));
     return self;
 }
@@ -79,7 +79,7 @@ Tensor& inplace_multiply_dd_Tensor(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor& inplace_multiply_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_multiply_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::multiply(self, other));
     return self;
 }
@@ -124,12 +124,12 @@ Tensor& inplace_unsqueeze_(Tensor& self, int64_t dim) {
     return self;
 }
 
-Tensor& inplace_subtract_dd_Tensor(Tensor& self, const Tensor& other, Scalar alpha) {
+Tensor& inplace_subtract_dd_Tensor(Tensor& self, const Tensor& other, const Scalar& alpha) {
     ops::copy_(self, ops::subtract(self, other, alpha));
     return self;
 }
 
-Tensor& inplace_subtract_dd_Scalar(Tensor& self, Scalar other, Scalar alpha) {
+Tensor& inplace_subtract_dd_Scalar(Tensor& self, const Scalar& other, const Scalar& alpha) {
     ops::copy_(self, ops::subtract(self, other, alpha));
     return self;
 }
@@ -139,7 +139,7 @@ Tensor& inplace_put_(Tensor& self, const Tensor& index, const Tensor& source, bo
     return self;
 }
 
-Tensor& inplace_eq_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_eq_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::eq(self, other));
     return self;
 }
@@ -149,7 +149,7 @@ Tensor& inplace_eq_dd_Tensor(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor& inplace_bitwise_and_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_bitwise_and_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::bitwise_and(self, other));
     return self;
 }
@@ -159,7 +159,7 @@ Tensor& inplace_bitwise_and_dd_Tensor(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor& inplace_bitwise_or_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_bitwise_or_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::bitwise_or(self, other));
     return self;
 }
@@ -169,7 +169,7 @@ Tensor& inplace_bitwise_or_dd_Tensor(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor& inplace_bitwise_xor_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_bitwise_xor_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::bitwise_xor(self, other));
     return self;
 }
@@ -184,7 +184,7 @@ Tensor& inplace_bitwise_left_shift_dd_Tensor(Tensor& self, const Tensor& other) 
     return self;
 }
 
-Tensor& inplace_bitwise_left_shift_dd_Tensor_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_bitwise_left_shift_dd_Tensor_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::bitwise_left_shift(self, other));
     return self;
 }
@@ -194,7 +194,7 @@ Tensor& inplace_bitwise_right_shift_dd_Tensor(Tensor& self, const Tensor& other)
     return self;
 }
 
-Tensor& inplace_bitwise_right_shift_dd_Tensor_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_bitwise_right_shift_dd_Tensor_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::bitwise_right_shift(self, other));
     return self;
 }
@@ -204,7 +204,7 @@ Tensor& inplace_digamma_(Tensor& self) {
     return self;
 }
 
-Tensor& inplace_ne_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_ne_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::ne(self, other));
     return self;
 }
@@ -214,7 +214,7 @@ Tensor& inplace_ne_dd_Tensor(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor alias_not_equal_Scalar(const Tensor& self, Scalar other) {
+Tensor alias_not_equal_Scalar(const Tensor& self, const Scalar& other) {
     return ops::ne(self, other);
 }
 
@@ -222,7 +222,7 @@ Tensor alias_not_equal_Tensor(const Tensor& self, const Tensor& other) {
     return ops::ne(self, other);
 }
 
-Tensor& inplace_not_equal_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_not_equal_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::not_equal(self, other));
     return self;
 }
@@ -232,7 +232,7 @@ Tensor& inplace_not_equal_dd_Tensor(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor& inplace_ge_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_ge_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::ge(self, other));
     return self;
 }
@@ -242,7 +242,7 @@ Tensor& inplace_ge_dd_Tensor(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor alias_greater_equal_Scalar(const Tensor& self, Scalar other) {
+Tensor alias_greater_equal_Scalar(const Tensor& self, const Scalar& other) {
     return ops::ge(self, other);
 }
 
@@ -250,7 +250,7 @@ Tensor alias_greater_equal_Tensor(const Tensor& self, const Tensor& other) {
     return ops::ge(self, other);
 }
 
-Tensor& inplace_greater_equal_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_greater_equal_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::greater_equal(self, other));
     return self;
 }
@@ -260,7 +260,7 @@ Tensor& inplace_greater_equal_dd_Tensor(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor& inplace_le_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_le_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::le(self, other));
     return self;
 }
@@ -270,7 +270,7 @@ Tensor& inplace_le_dd_Tensor(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor alias_less_equal_Scalar(const Tensor& self, Scalar other) {
+Tensor alias_less_equal_Scalar(const Tensor& self, const Scalar& other) {
     return ops::le(self, other);
 }
 
@@ -278,7 +278,7 @@ Tensor alias_less_equal_Tensor(const Tensor& self, const Tensor& other) {
     return ops::le(self, other);
 }
 
-Tensor& inplace_less_equal_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_less_equal_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::less_equal(self, other));
     return self;
 }
@@ -288,7 +288,7 @@ Tensor& inplace_less_equal_dd_Tensor(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor& inplace_gt_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_gt_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::gt(self, other));
     return self;
 }
@@ -298,7 +298,7 @@ Tensor& inplace_gt_dd_Tensor(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor alias_greater_Scalar(const Tensor& self, Scalar other) {
+Tensor alias_greater_Scalar(const Tensor& self, const Scalar& other) {
     return ops::gt(self, other);
 }
 
@@ -306,7 +306,7 @@ Tensor alias_greater_Tensor(const Tensor& self, const Tensor& other) {
     return ops::gt(self, other);
 }
 
-Tensor& inplace_greater_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_greater_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::greater(self, other));
     return self;
 }
@@ -316,7 +316,7 @@ Tensor& inplace_greater_dd_Tensor(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor& inplace_lt_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_lt_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::lt(self, other));
     return self;
 }
@@ -326,7 +326,7 @@ Tensor& inplace_lt_dd_Tensor(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor alias_less_Scalar(const Tensor& self, Scalar other) {
+Tensor alias_less_Scalar(const Tensor& self, const Scalar& other) {
     return ops::lt(self, other);
 }
 
@@ -334,7 +334,7 @@ Tensor alias_less_Tensor(const Tensor& self, const Tensor& other) {
     return ops::lt(self, other);
 }
 
-Tensor& inplace_less_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_less_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::less(self, other));
     return self;
 }
@@ -354,7 +354,7 @@ Tensor& inplace_swapdims_(Tensor& self, int64_t dim0, int64_t dim1) {
     return self;
 }
 
-Tensor& inplace_fmod_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_fmod_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::fmod(self, other));
     return self;
 }
@@ -364,7 +364,7 @@ Tensor& inplace_fmod_dd_Tensor(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor& inplace_remainder_dd_Scalar(Tensor& self, Scalar other) {
+Tensor& inplace_remainder_dd_Scalar(Tensor& self, const Scalar& other) {
     ops::copy_(self, ops::remainder(self, other));
     return self;
 }

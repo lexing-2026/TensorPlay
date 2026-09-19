@@ -1458,13 +1458,6 @@ def unbind(input, dim=0):
             return _captured
     return _C.unbind(input, dim)
 
-def slice(input, dim=0, start=None, end=None, step=1):
-    if _capturing():
-        _captured = _capture_call(slice, (input, dim, start, end, step), {})
-        if _captured is not None:
-            return _captured
-    return input.slice(dim=dim, start=start, end=end, step=step)
-
 def clone(input, memory_format=None):
     if _capturing():
         _captured = _capture_call(clone, (input, memory_format), {})
@@ -3992,18 +3985,18 @@ def leaky_relu_backward(grad_output, input, negative_slope, self_is_result, *, o
             return _captured
     return _C.leaky_relu_backward(grad_output=grad_output, self=input, negative_slope=negative_slope, self_is_result=self_is_result)
 
-def rrelu_with_noise(input, noise, lower=0.125, upper=0.3333333333333333, training=False, *, out=None):
+def rrelu_with_noise(input, noise, lower=0.125, upper=0.3333333333333333, training=False, generator=None, *, out=None):
     if out is not None:
         if _capturing():
-            _captured = _capture_call(rrelu_with_noise, (input, noise, lower, upper, training), {'out': out})
+            _captured = _capture_call(rrelu_with_noise, (input, noise, lower, upper, training, generator), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.rrelu_with_noise(self=input, noise=noise, lower=lower, upper=upper, training=training, out=out)
+        return _C.rrelu_with_noise(self=input, noise=noise, lower=lower, upper=upper, training=training, generator=generator, out=out)
     if _capturing():
-        _captured = _capture_call(rrelu_with_noise, (input, noise, lower, upper, training), {})
+        _captured = _capture_call(rrelu_with_noise, (input, noise, lower, upper, training, generator), {})
         if _captured is not None:
             return _captured
-    return _C.rrelu_with_noise(self=input, noise=noise, lower=lower, upper=upper, training=training)
+    return _C.rrelu_with_noise(self=input, noise=noise, lower=lower, upper=upper, training=training, generator=generator)
 
 def rrelu_with_noise_backward(grad_output, input, noise, lower, upper, training, self_is_result):
     if _capturing():
@@ -8543,27 +8536,27 @@ def feature_alpha_dropout_(input, p=0.5, train=True):
             return _captured
     return _C.feature_alpha_dropout_(input, p, train)
 
-def rrelu(input, lower=0.125, upper=0.3333333333333333, training=False):
+def rrelu(input, lower=0.125, upper=0.3333333333333333, training=False, generator=None):
     if _capturing():
-        _captured = _capture_call(rrelu, (input, lower, upper, training), {})
+        _captured = _capture_call(rrelu, (input, lower, upper, training, generator), {})
         if _captured is not None:
             return _captured
     if not isinstance(lower, (tensorplay.Scalar, tensorplay.Tensor)):
         lower = tensorplay.Scalar(lower)
     if not isinstance(upper, (tensorplay.Scalar, tensorplay.Tensor)):
         upper = tensorplay.Scalar(upper)
-    return _C.rrelu(input, lower, upper, training)
+    return _C.rrelu(input, lower, upper, training, generator)
 
-def rrelu_(input, lower=0.125, upper=0.3333333333333333, training=False):
+def rrelu_(input, lower=0.125, upper=0.3333333333333333, training=False, generator=None):
     if _capturing():
-        _captured = _capture_call(rrelu_, (input, lower, upper, training), {})
+        _captured = _capture_call(rrelu_, (input, lower, upper, training, generator), {})
         if _captured is not None:
             return _captured
     if not isinstance(lower, (tensorplay.Scalar, tensorplay.Tensor)):
         lower = tensorplay.Scalar(lower)
     if not isinstance(upper, (tensorplay.Scalar, tensorplay.Tensor)):
         upper = tensorplay.Scalar(upper)
-    return _C.rrelu_(input, lower, upper, training)
+    return _C.rrelu_(input, lower, upper, training, generator)
 
 def bilinear(input1, input2, weight, bias=None):
     if _capturing():
@@ -11039,6 +11032,13 @@ def sym_storage_offset(input):
         if _captured is not None:
             return _captured
     return _C.sym_storage_offset(input)
+
+def slice(input, dim=0, start=None, end=None, step=1):
+    if _capturing():
+        _captured = _capture_call(slice, (input, dim, start, end, step), {})
+        if _captured is not None:
+            return _captured
+    return _C.slice(input, dim, start, end, step)
 
 def slice_inverse(input, src, dim=0, start=None, end=None, step=1):
     if _capturing():

@@ -20,6 +20,7 @@
 #include <type_traits>
 #include <vector>
 #include "Atomic.cuh"
+#include "OutWrite.h"
 
 #define TP_CUDA_CHECK(condition) \
   do { \
@@ -924,7 +925,11 @@ std::tuple<Tensor, Tensor> topk_kernel_cuda(const Tensor& self, int64_t k, int64
 std::tuple<Tensor, Tensor> interop_topk_values_cuda(const Tensor& self, int64_t k, int64_t dim,
                                                     bool largest, bool sorted,
                                                     Tensor& values, Tensor& indices) {
-  std::tie(values, indices) = topk_kernel_cuda(self, k, dim, largest, sorted, 0);
+  {
+      auto __tp_result = topk_kernel_cuda(self, k, dim, largest, sorted, 0);
+      write_out(values, std::get<0>(__tp_result));
+      write_out(indices, std::get<1>(__tp_result));
+  }
   return {values, indices};
 }
 

@@ -10,6 +10,7 @@
 #include <string>
 #include <tuple>
 #include <vector>
+#include "OutWrite.h"
 
 namespace tensorplay {
 namespace composite {
@@ -17,26 +18,6 @@ namespace composite {
 namespace ops = tensorplay::tpx::ops;
 
 namespace {
-
-// out= keeps the destination the caller handed over: the buffer is resized
-// only when the produced value does not already fit and the values are copied
-// into that storage, so a view of the destination observes the result and its
-// address does not move.  A destination that cannot hold the result's element
-// type adopts the value instead, which is the only case where the identity of
-// the buffer changes.
-Tensor& write_out(Tensor& out, const Tensor& value) {
-    if (!out.defined() || out.dtype() != value.dtype() ||
-        out.device() != value.device()) {
-        out = value;
-        return out;
-    }
-    const auto target = static_cast<std::vector<int64_t>>(value.shape());
-    if (static_cast<std::vector<int64_t>>(out.shape()) != target) {
-        out.resize_(target);
-    }
-    out.copy_(value);
-    return out;
-}
 
 }  // namespace
 
@@ -76,12 +57,12 @@ Tensor& out_wrap_arccos_out(const Tensor& self, Tensor& out) {
     return out;
 }
 
-Tensor& out_wrap_addmv_out(const Tensor& self, const Tensor& mat, const Tensor& vec, Scalar beta, Scalar alpha, Tensor& out) {
+Tensor& out_wrap_addmv_out(const Tensor& self, const Tensor& mat, const Tensor& vec, const Scalar& beta, const Scalar& alpha, Tensor& out) {
     write_out(out, ops::addmv(self, mat, vec, beta, alpha));
     return out;
 }
 
-Tensor& out_wrap_addr_out(const Tensor& self, const Tensor& vec1, const Tensor& vec2, Scalar beta, Scalar alpha, Tensor& out) {
+Tensor& out_wrap_addr_out(const Tensor& self, const Tensor& vec1, const Tensor& vec2, const Scalar& beta, const Scalar& alpha, Tensor& out) {
     write_out(out, ops::addr(self, vec1, vec2, beta, alpha));
     return out;
 }
@@ -201,7 +182,7 @@ Tensor& out_wrap_chain_matmul_out(const std::vector<Tensor>& matrices, Tensor& o
     return out;
 }
 
-Tensor& out_wrap_clamp_out(const Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max, Tensor& out) {
+Tensor& out_wrap_clamp_out(const Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max, Tensor& out) {
     write_out(out, ops::clamp(self, min, max));
     return out;
 }
@@ -211,7 +192,7 @@ Tensor& out_wrap_clamp_Tensor_out(const Tensor& self, const std::optional<Tensor
     return out;
 }
 
-Tensor& out_wrap_clip_out(const Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max, Tensor& out) {
+Tensor& out_wrap_clip_out(const Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max, Tensor& out) {
     write_out(out, ops::clip(self, min, max));
     return out;
 }
@@ -436,12 +417,12 @@ Tensor& out_wrap_round_decimals_out(const Tensor& self, int64_t decimals, Tensor
     return out;
 }
 
-Tensor& out_wrap_gelu_out(const Tensor& self, std::string approximate, Tensor& out) {
+Tensor& out_wrap_gelu_out(const Tensor& self, const std::string& approximate, Tensor& out) {
     write_out(out, ops::gelu(self, approximate));
     return out;
 }
 
-Tensor& out_wrap_hardshrink_out(const Tensor& self, Scalar lambd, Tensor& out) {
+Tensor& out_wrap_hardshrink_out(const Tensor& self, const Scalar& lambd, Tensor& out) {
     write_out(out, ops::hardshrink(self, lambd));
     return out;
 }
@@ -511,7 +492,7 @@ Tensor& out_wrap_tanh_out(const Tensor& self, Tensor& out) {
     return out;
 }
 
-Tensor& out_wrap_threshold_out(const Tensor& self, Scalar threshold, Scalar value, Tensor& out) {
+Tensor& out_wrap_threshold_out(const Tensor& self, const Scalar& threshold, const Scalar& value, Tensor& out) {
     write_out(out, ops::threshold(self, threshold, value));
     return out;
 }
@@ -538,7 +519,7 @@ Tensor& out_wrap_heaviside_out(const Tensor& self, const Tensor& values, Tensor&
     return out;
 }
 
-Tensor& out_wrap_not_equal_Scalar_out(const Tensor& self, Scalar other, Tensor& out) {
+Tensor& out_wrap_not_equal_Scalar_out(const Tensor& self, const Scalar& other, Tensor& out) {
     write_out(out, ops::not_equal(self, other));
     return out;
 }
@@ -548,7 +529,7 @@ Tensor& out_wrap_not_equal_Tensor_out(const Tensor& self, const Tensor& other, T
     return out;
 }
 
-Tensor& out_wrap_greater_equal_Scalar_out(const Tensor& self, Scalar other, Tensor& out) {
+Tensor& out_wrap_greater_equal_Scalar_out(const Tensor& self, const Scalar& other, Tensor& out) {
     write_out(out, ops::greater_equal(self, other));
     return out;
 }
@@ -558,7 +539,7 @@ Tensor& out_wrap_greater_equal_Tensor_out(const Tensor& self, const Tensor& othe
     return out;
 }
 
-Tensor& out_wrap_less_equal_Scalar_out(const Tensor& self, Scalar other, Tensor& out) {
+Tensor& out_wrap_less_equal_Scalar_out(const Tensor& self, const Scalar& other, Tensor& out) {
     write_out(out, ops::less_equal(self, other));
     return out;
 }
@@ -568,7 +549,7 @@ Tensor& out_wrap_less_equal_Tensor_out(const Tensor& self, const Tensor& other, 
     return out;
 }
 
-Tensor& out_wrap_greater_Scalar_out(const Tensor& self, Scalar other, Tensor& out) {
+Tensor& out_wrap_greater_Scalar_out(const Tensor& self, const Scalar& other, Tensor& out) {
     write_out(out, ops::greater(self, other));
     return out;
 }
@@ -578,7 +559,7 @@ Tensor& out_wrap_greater_Tensor_out(const Tensor& self, const Tensor& other, Ten
     return out;
 }
 
-Tensor& out_wrap_less_Scalar_out(const Tensor& self, Scalar other, Tensor& out) {
+Tensor& out_wrap_less_Scalar_out(const Tensor& self, const Scalar& other, Tensor& out) {
     write_out(out, ops::less(self, other));
     return out;
 }
@@ -603,12 +584,12 @@ Tensor& out_wrap_nonzero_static_out(const Tensor& self, int64_t size, int64_t fi
     return out;
 }
 
-Tensor& out_wrap_addcmul_out(const Tensor& self, const Tensor& tensor1, const Tensor& tensor2, Scalar value, Tensor& out) {
+Tensor& out_wrap_addcmul_out(const Tensor& self, const Tensor& tensor1, const Tensor& tensor2, const Scalar& value, Tensor& out) {
     write_out(out, ops::addcmul(self, tensor1, tensor2, value));
     return out;
 }
 
-Tensor& out_wrap_addcdiv_out(const Tensor& self, const Tensor& tensor1, const Tensor& tensor2, Scalar value, Tensor& out) {
+Tensor& out_wrap_addcdiv_out(const Tensor& self, const Tensor& tensor1, const Tensor& tensor2, const Scalar& value, Tensor& out) {
     write_out(out, ops::addcdiv(self, tensor1, tensor2, value));
     return out;
 }
@@ -668,7 +649,7 @@ Tensor& out_wrap_atan2_out(const Tensor& self, const Tensor& other, Tensor& out)
     return out;
 }
 
-Tensor& out_wrap_lerp_Scalar_out(const Tensor& self, const Tensor& end, Scalar weight, Tensor& out) {
+Tensor& out_wrap_lerp_Scalar_out(const Tensor& self, const Tensor& end, const Scalar& weight, Tensor& out) {
     write_out(out, ops::lerp(self, end, weight));
     return out;
 }
@@ -753,12 +734,12 @@ Tensor& write_quantile_out(const Tensor& self, const Tensor& result,
     return out;
 }
 
-Tensor& out_wrap_quantile_out(const Tensor& self, const Tensor& q, std::optional<int64_t> dim, bool keepdim, std::string interpolation, Tensor& out) {
+Tensor& out_wrap_quantile_out(const Tensor& self, const Tensor& q, std::optional<int64_t> dim, bool keepdim, const std::string& interpolation, Tensor& out) {
     return write_quantile_out(
         self, ops::quantile(self, q, dim, keepdim, interpolation), out);
 }
 
-Tensor& out_wrap_quantile_scalar_out(const Tensor& self, double q, std::optional<int64_t> dim, bool keepdim, std::string interpolation, Tensor& out) {
+Tensor& out_wrap_quantile_scalar_out(const Tensor& self, double q, std::optional<int64_t> dim, bool keepdim, const std::string& interpolation, Tensor& out) {
     if (!(q >= 0.0 && q <= 1.0)) {
         TP_THROW(ValueError,
                  "quantile() q must be in the range [0, 1] but got ", q);
@@ -768,12 +749,12 @@ Tensor& out_wrap_quantile_scalar_out(const Tensor& self, double q, std::optional
         self, ops::quantile(self, qv, dim, keepdim, interpolation), out);
 }
 
-Tensor& out_wrap_nanquantile_out(const Tensor& self, const Tensor& q, std::optional<int64_t> dim, bool keepdim, std::string interpolation, Tensor& out) {
+Tensor& out_wrap_nanquantile_out(const Tensor& self, const Tensor& q, std::optional<int64_t> dim, bool keepdim, const std::string& interpolation, Tensor& out) {
     return write_quantile_out(
         self, ops::nanquantile(self, q, dim, keepdim, interpolation), out);
 }
 
-Tensor& out_wrap_nanquantile_scalar_out(const Tensor& self, double q, std::optional<int64_t> dim, bool keepdim, std::string interpolation, Tensor& out) {
+Tensor& out_wrap_nanquantile_scalar_out(const Tensor& self, double q, std::optional<int64_t> dim, bool keepdim, const std::string& interpolation, Tensor& out) {
     if (!(q >= 0.0 && q <= 1.0)) {
         TP_THROW(ValueError,
                  "quantile() q must be in the range [0, 1] but got ", q);
@@ -788,12 +769,12 @@ Tensor& out_wrap_float_power_Tensor_Tensor_out(const Tensor& self, const Tensor&
     return out;
 }
 
-Tensor& out_wrap_float_power_Scalar_out(Scalar self, const Tensor& exponent, Tensor& out) {
+Tensor& out_wrap_float_power_Scalar_out(const Scalar& self, const Tensor& exponent, Tensor& out) {
     write_out(out, ops::float_power(self, exponent));
     return out;
 }
 
-Tensor& out_wrap_float_power_Tensor_Scalar_out(const Tensor& self, Scalar exponent, Tensor& out) {
+Tensor& out_wrap_float_power_Tensor_Scalar_out(const Tensor& self, const Scalar& exponent, Tensor& out) {
     write_out(out, ops::float_power(self, exponent));
     return out;
 }
@@ -823,7 +804,7 @@ Tensor& out_wrap_mse_loss_out(const Tensor& self, const Tensor& target, int64_t 
     return out;
 }
 
-Tensor& out_wrap_multi_margin_loss_out(const Tensor& self, const Tensor& target, Scalar p, Scalar margin, const std::optional<Tensor>& weight, int64_t reduction, Tensor& out) {
+Tensor& out_wrap_multi_margin_loss_out(const Tensor& self, const Tensor& target, const Scalar& p, const Scalar& margin, const std::optional<Tensor>& weight, int64_t reduction, Tensor& out) {
     write_out(out, ops::multi_margin_loss(self, target, p, margin, weight, reduction));
     return out;
 }
@@ -838,7 +819,7 @@ Tensor& out_wrap_huber_loss_out(const Tensor& self, const Tensor& target, int64_
     return out;
 }
 
-Tensor& out_wrap_elu_out(const Tensor& self, Scalar alpha, Scalar scale, Scalar input_scale, Tensor& out) {
+Tensor& out_wrap_elu_out(const Tensor& self, const Scalar& alpha, const Scalar& scale, const Scalar& input_scale, Tensor& out) {
     write_out(out, ops::elu(self, alpha, scale, input_scale));
     return out;
 }
@@ -848,22 +829,22 @@ Tensor& out_wrap_glu_out(const Tensor& self, int64_t dim, Tensor& out) {
     return out;
 }
 
-Tensor& out_wrap_hardtanh_out(const Tensor& self, Scalar min_val, Scalar max_val, Tensor& out) {
+Tensor& out_wrap_hardtanh_out(const Tensor& self, const Scalar& min_val, const Scalar& max_val, Tensor& out) {
     write_out(out, ops::hardtanh(self, min_val, max_val));
     return out;
 }
 
-Tensor& out_wrap_leaky_relu_out(const Tensor& self, Scalar negative_slope, Tensor& out) {
+Tensor& out_wrap_leaky_relu_out(const Tensor& self, const Scalar& negative_slope, Tensor& out) {
     write_out(out, ops::leaky_relu(self, negative_slope));
     return out;
 }
 
-Tensor& out_wrap_softplus_out(const Tensor& self, Scalar beta, Scalar threshold, Tensor& out) {
+Tensor& out_wrap_softplus_out(const Tensor& self, const Scalar& beta, const Scalar& threshold, Tensor& out) {
     write_out(out, ops::softplus(self, beta, threshold));
     return out;
 }
 
-Tensor& out_wrap_softshrink_out(const Tensor& self, Scalar lambd, Tensor& out) {
+Tensor& out_wrap_softshrink_out(const Tensor& self, const Scalar& lambd, Tensor& out) {
     write_out(out, ops::softshrink(self, lambd));
     return out;
 }
@@ -925,7 +906,7 @@ std::tuple<Tensor, Tensor> out_wrap_linalg_ldl_factor_out(const Tensor& self, bo
     return { LD, pivots };
 }
 
-std::tuple<Tensor, Tensor, Tensor, Tensor> out_wrap_linalg_lstsq_out(const Tensor& self, const Tensor& b, std::optional<double> rcond, std::optional<std::string> driver, Tensor& solution, Tensor& residuals, Tensor& rank, Tensor& singular_values) {
+std::tuple<Tensor, Tensor, Tensor, Tensor> out_wrap_linalg_lstsq_out(const Tensor& self, const Tensor& b, std::optional<double> rcond, const std::optional<std::string>& driver, Tensor& solution, Tensor& residuals, Tensor& rank, Tensor& singular_values) {
     auto __tp_result = ops::linalg_lstsq(self, b, rcond, driver);
     write_out(solution, std::get<0>(__tp_result));
     write_out(residuals, std::get<1>(__tp_result));
@@ -953,7 +934,7 @@ Tensor& out_wrap_linalg_eigvals_out(const Tensor& self, Tensor& out) {
     return out;
 }
 
-Tensor& out_wrap_linalg_eigvalsh_out(const Tensor& self, std::string UPLO, Tensor& out) {
+Tensor& out_wrap_linalg_eigvalsh_out(const Tensor& self, const std::string& UPLO, Tensor& out) {
     write_out(out, ops::linalg_eigvalsh(self, UPLO));
     return out;
 }
@@ -978,7 +959,7 @@ Tensor& out_wrap_ger_out(const Tensor& self, const Tensor& vec2, Tensor& out) {
     return out;
 }
 
-Tensor& out_wrap_linalg_svdvals_out(const Tensor& A, std::optional<std::string> driver, Tensor& out) {
+Tensor& out_wrap_linalg_svdvals_out(const Tensor& A, const std::optional<std::string>& driver, Tensor& out) {
     write_out(out, ops::linalg_svdvals(A, driver));
     return out;
 }
@@ -988,7 +969,7 @@ Tensor& out_wrap_linalg_solve_out(const Tensor& A, const Tensor& B, bool left, T
     return out;
 }
 
-std::tuple<Tensor, Tensor> out_wrap_linalg_qr_out(const Tensor& A, std::string mode, Tensor& Q, Tensor& R) {
+std::tuple<Tensor, Tensor> out_wrap_linalg_qr_out(const Tensor& A, const std::string& mode, Tensor& Q, Tensor& R) {
     auto __tp_result = ops::linalg_qr(A, mode);
     write_out(Q, std::get<0>(__tp_result));
     write_out(R, std::get<1>(__tp_result));

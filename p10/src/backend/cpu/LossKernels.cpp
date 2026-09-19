@@ -16,49 +16,66 @@ namespace cpu {
 namespace ops = tensorplay::tpx::ops;
 
 template <typename scalar_t>
-std::tuple<Tensor, Tensor> nll_loss_impl(const Tensor& input, const Tensor& target,
-                                         const std::optional<Tensor>& weight,
+std::tuple<Tensor, Tensor> nll_loss_impl(const Tensor& input_arg, const Tensor& target_arg,
+                                         const std::optional<Tensor>& weight_arg,
                                          int64_t reduction, int64_t ignore_index) {
-    // reduction: 0=none, 1=mean, 2=sum
-    int64_t n_batch = input.size(0);
-    int64_t n_classes = input.size(1);
+    // reduction: 0=none, 1=mean, 2=sum.  input is (N, C) with target (N), or
+    // (C) with a 0-d target.
+    const bool no_batch = input_arg.dim() == 1;
+    const Tensor input = (no_batch ? input_arg.unsqueeze(0) : input_arg).contiguous();
+    const Tensor target = (no_batch ? target_arg.reshape({1}) : target_arg)
+                              .to(DType::Int64).contiguous();
+    const int64_t n_batch = input.size(0);
+    const int64_t n_classes = input.size(1);
+    if (target.numel() != n_batch) {
+        TP_THROW(ValueError, "nll_loss: expected target of ", n_batch,
+                 " elements, got ", target.numel());
+    }
+    Tensor weight;
+    if (weight_arg.has_value() && weight_arg->defined()) {
+        if (weight_arg->numel() != n_classes) {
+            TP_THROW(RuntimeError, "weight tensor should be defined either for all ",
+                     n_classes, " classes or no classes");
+        }
+        weight = weight_arg->to(input.dtype()).contiguous();
+    }
 
     const scalar_t* input_data = input.data_ptr<scalar_t>();
     const int64_t* target_data = target.data_ptr<int64_t>();
-    const scalar_t* weight_data = weight.has_value() && weight->defined() ? weight->data_ptr<scalar_t>() : nullptr;
+    const scalar_t* weight_data = weight.defined() ? weight.data_ptr<scalar_t>() : nullptr;
 
-    std::vector<scalar_t> output_data(n_batch);
+    std::vector<scalar_t> output_data(static_cast<size_t>(n_batch));
     double total_weight = 0;
-
     for (int64_t i = 0; i < n_batch; ++i) {
-        int64_t t = target_data[i];
+        const int64_t t = target_data[i];
         if (t == ignore_index) {
-            output_data[i] = 0;
+            output_data[static_cast<size_t>(i)] = 0;
             continue;
         }
-        if (t < 0 || t >= n_classes) TP_THROW(RuntimeError, "Target out of bounds");
-
-        double w = weight_data ? static_cast<double>(weight_data[t]) : 1.0;
-        output_data[i] = static_cast<scalar_t>(-static_cast<double>(input_data[i * n_classes + t]) * w);
+        if (t < 0 || t >= n_classes) TP_THROW(IndexError, "Target ", t, " is out of bounds.");
+        const double w = weight_data ? static_cast<double>(weight_data[t]) : 1.0;
+        output_data[static_cast<size_t>(i)] =
+            static_cast<scalar_t>(-static_cast<double>(input_data[i * n_classes + t]) * w);
         total_weight += w;
     }
 
-    DType dt = input.dtype();
-    Tensor total_weight_tensor = Tensor::tensor({total_weight}, DType::Float64, input.device()).to(dt == DType::Float64 ? DType::Float64 : DType::Float32);
-
-    if (reduction == 0) { // None
-        return std::make_tuple(Tensor::tensor(output_data, dt, input.device()), total_weight_tensor);
-    } else if (reduction == 1) { // Mean
-        double sum = 0;
-        for (scalar_t x : output_data) sum += x;
-        if (total_weight > 0) sum /= total_weight;
-        return std::make_tuple(Tensor::tensor({sum}, DType::Float64, input.device()).to(dt).reshape({}), total_weight_tensor);
-    } else if (reduction == 2) { // Sum
-        double sum = 0;
-        for (scalar_t x : output_data) sum += x;
-        return std::make_tuple(Tensor::tensor({sum}, DType::Float64, input.device()).to(dt).reshape({}), total_weight_tensor);
+    const DType dt = input.dtype();
+    if (reduction == 0) {
+        Tensor per_sample = Tensor::tensor(output_data, dt, input.device());
+        if (no_batch) per_sample = per_sample.reshape({});
+        // Unreduced batched losses carry no normalizer.
+        const double reported = no_batch ? total_weight : 0.0;
+        return std::make_tuple(per_sample, Tensor::full({}, Scalar(reported), dt, input.device()));
     }
-    TP_THROW(ValueError, "Invalid reduction mode");
+    double sum = 0;
+    for (scalar_t x : output_data) sum += static_cast<double>(x);
+    if (reduction == 1) {
+        sum /= total_weight;  // every target ignored: 0 / 0 is NaN
+    } else if (reduction != 2) {
+        TP_THROW(ValueError, "Invalid reduction mode");
+    }
+    return std::make_tuple(Tensor::full({}, Scalar(sum), dt, input.device()),
+                           Tensor::full({}, Scalar(total_weight), dt, input.device()));
 }
 
 std::tuple<Tensor, Tensor> nll_loss_kernel(const Tensor& input, const Tensor& target, const std::optional<Tensor>& weight, int64_t reduction, int64_t ignore_index) {
@@ -163,15 +180,16 @@ std::tuple<Tensor, Tensor> nll_loss2d_impl(const Tensor& input, const Tensor& ta
     }
 
     DType dt = input.dtype();
-    DType tw_dt = dt == DType::Float64 ? DType::Float64 : DType::Float32;
-    Tensor total_weight_tensor = Tensor::tensor({total_weight}, DType::Float64, input.device()).to(tw_dt);
-
     if (reduction == 0) {
-        return std::make_tuple(Tensor::tensor(output_data, dt, input.device()).reshape({N, H, W}), total_weight_tensor);
+        // Unreduced losses carry no normalizer: total_weight stays zero.
+        return std::make_tuple(Tensor::tensor(output_data, dt, input.device()).reshape({N, H, W}),
+                               Tensor::full({}, Scalar(0.0), dt, input.device()));
     }
-    if (reduction == 1 && total_weight > 0) sum /= total_weight;
     if (reduction != 1 && reduction != 2) TP_THROW(ValueError, "Invalid reduction mode");
-    return std::make_tuple(Tensor::tensor({sum}, DType::Float64, input.device()).to(dt).reshape({}), total_weight_tensor);
+    // Every target ignored under mean reduction: 0 / 0 is NaN.
+    if (reduction == 1) sum /= total_weight;
+    return std::make_tuple(Tensor::full({}, Scalar(sum), dt, input.device()),
+                           Tensor::full({}, Scalar(total_weight), dt, input.device()));
 }
 
 std::tuple<Tensor, Tensor> nll_loss2d_kernel(const Tensor& input, const Tensor& target, const std::optional<Tensor>& weight, int64_t reduction, int64_t ignore_index) {

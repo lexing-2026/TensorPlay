@@ -627,7 +627,8 @@ static std::tuple<Tensor, Tensor, Tensor> rnn_impl(
     int kind,  // 0=lstm, 1=gru, 2=tanh, 3=relu
     const Tensor& input, const std::vector<Tensor>& hx,
     const std::vector<Tensor>& params, bool has_biases, int64_t num_layers,
-    bool bidirectional, bool batch_first) {
+    bool bidirectional, bool batch_first,
+    double dropout_p, bool training) {
     RnnForwardNoGrad no_grad_guard;
     // (FullLayer::operator() runs one sequence-wide linear_ih GEMM, then
     // the element kernels widen to fp32 internally (opmath semantics).
@@ -642,7 +643,8 @@ static std::tuple<Tensor, Tensor, Tensor> rnn_impl(
     if (kind == 0 && hx.size() != 2) TP_THROW(RuntimeError, "lstm expects two hidden states");
 #ifdef USE_ONEDNN
     // that fast path.  Falls back to the decomposed loop if unavailable.
-    if (kind == 0) {
+    // The fused primitive has no inter-layer dropout.
+    if (kind == 0 && !(dropout_p != 0 && training && num_layers > 1)) {
         if (auto r = onednn_lstm_forward(input, hx, params, has_biases,
                                          num_layers, bidirectional, batch_first))
             return *r;
@@ -772,6 +774,10 @@ static std::tuple<Tensor, Tensor, Tensor> rnn_impl(
             layer_out = cat_kernel({dir_outs[0], dir_outs[1]}, 2);
         }
         x = layer_out;
+        // Dropout applies to every layer's output except the last one.
+        if (dropout_p != 0 && training && layer < L - 1) {
+            x = ::tensorplay::detail::redispatch_dropout_function(x, dropout_p, true);
+        }
     }
     Tensor y = batch_first ? x.transpose(0, 1).contiguous() : x;
     return {y, hn_out, cn_out};
@@ -779,34 +785,30 @@ static std::tuple<Tensor, Tensor, Tensor> rnn_impl(
 
 std::tuple<Tensor, Tensor> rnn_relu_cpu(const Tensor& input, const std::vector<Tensor>& hx,
                                         const std::vector<Tensor>& params, bool has_biases,
-                                        int64_t num_layers, float dropout_p, bool training,
+                                        int64_t num_layers, double dropout_p, bool training,
                                         bool bidirectional, bool batch_first) {
-    (void)dropout_p; (void)training;
-    auto r = rnn_impl(3, input, hx, params, has_biases, num_layers, bidirectional, batch_first);
+    auto r = rnn_impl(3, input, hx, params, has_biases, num_layers, bidirectional, batch_first, dropout_p, training);
     return {std::get<0>(r), std::get<1>(r)};
 }
 std::tuple<Tensor, Tensor> rnn_tanh_cpu(const Tensor& input, const std::vector<Tensor>& hx,
                                         const std::vector<Tensor>& params, bool has_biases,
-                                        int64_t num_layers, float dropout_p, bool training,
+                                        int64_t num_layers, double dropout_p, bool training,
                                         bool bidirectional, bool batch_first) {
-    (void)dropout_p; (void)training;
-    auto r = rnn_impl(2, input, hx, params, has_biases, num_layers, bidirectional, batch_first);
+    auto r = rnn_impl(2, input, hx, params, has_biases, num_layers, bidirectional, batch_first, dropout_p, training);
     return {std::get<0>(r), std::get<1>(r)};
 }
 std::tuple<Tensor, Tensor> gru_cpu(const Tensor& input, const std::vector<Tensor>& hx,
                                    const std::vector<Tensor>& params, bool has_biases,
-                                   int64_t num_layers, float dropout_p, bool training,
+                                   int64_t num_layers, double dropout_p, bool training,
                                    bool bidirectional, bool batch_first) {
-    (void)dropout_p; (void)training;
-    auto r = rnn_impl(1, input, hx, params, has_biases, num_layers, bidirectional, batch_first);
+    auto r = rnn_impl(1, input, hx, params, has_biases, num_layers, bidirectional, batch_first, dropout_p, training);
     return {std::get<0>(r), std::get<1>(r)};
 }
 std::tuple<Tensor, Tensor, Tensor> lstm_cpu(const Tensor& input, const std::vector<Tensor>& hx,
                                             const std::vector<Tensor>& params, bool has_biases,
-                                            int64_t num_layers, float dropout_p, bool training,
+                                            int64_t num_layers, double dropout_p, bool training,
                                             bool bidirectional, bool batch_first) {
-    (void)dropout_p; (void)training;
-    return rnn_impl(0, input, hx, params, has_biases, num_layers, bidirectional, batch_first);
+    return rnn_impl(0, input, hx, params, has_biases, num_layers, bidirectional, batch_first, dropout_p, training);
 }
 
 

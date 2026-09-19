@@ -454,8 +454,8 @@ Tensor quantized_clamp_kernel(
     int64_t self_zero_point,
     double out_scale,
     int64_t out_zero_point,
-    std::optional<Scalar> min,
-    std::optional<Scalar> max) {
+    const std::optional<Scalar>& min,
+    const std::optional<Scalar>& max) {
   validate_quantized_operand(self);
   TP_CHECK(
       out_scale > 0.0, "Vulkan quantized_clamp(): out_scale must be positive");
@@ -603,10 +603,14 @@ Tensor quantized_linear_kernel(
     int64_t input_zero_point,
     const Tensor& weight_scales,
     const Tensor& weight_zero_points,
-    std::optional<Tensor> bias) {
+    const std::optional<Tensor>& bias,
+    double out_scale,
+    int64_t out_zero_point) {
   TP_CHECK(
       input.dtype() == DType::QInt8 && weight.dtype() == DType::QInt8,
       "Vulkan quantized_linear: activations and weights must be QInt8");
+  TP_CHECK(
+      out_scale > 0.0, "Vulkan quantized_linear: out_scale must be positive");
   TP_CHECK(
       input.dim() == 2 && weight.dim() == 2,
       "Vulkan quantized_linear: expected 2-D [M,K] activations and [N,K] "
@@ -706,13 +710,15 @@ Tensor quantized_linear_kernel(
       v_params.image(pipeline_barrier, api::PipelineStage::COMPUTE),
       params.buffer());
 
-  return convert(v_output);
+  // The float accumulation is requantized onto the output grid.
+  return quantize_per_tensor_qint8_kernel(
+      convert(v_output), out_scale, out_zero_point, -128, 127);
 }
 
 Tensor quantized_conv2d_kernel(
     const Tensor& input,
     const Tensor& weight,
-    std::optional<Tensor> bias,
+    const std::optional<Tensor>& bias,
     double input_scale,
     int64_t input_zero_point,
     double weight_scale,
@@ -1257,8 +1263,8 @@ Tensor quantized_conv2d_run_kernel(
     const std::vector<int64_t>& output_padding,
     int64_t groups,
     bool transposed,
-    std::optional<Scalar> output_min,
-    std::optional<Scalar> output_max) {
+    const std::optional<Scalar>& output_min,
+    const std::optional<Scalar>& output_max) {
   TP_CHECK(
       input.dtype() == DType::QInt8,
       "Vulkan quantized_conv2d_run: activations must be QInt8");

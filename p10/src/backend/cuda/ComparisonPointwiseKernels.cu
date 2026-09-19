@@ -150,7 +150,7 @@ Tensor le_kernel_cuda(const Tensor& self, const Tensor& other) { return comparis
 Tensor gt_kernel_cuda(const Tensor& self, const Tensor& other) { return comparison_op_kernel<false>(self, other, GtFunctor()); }
 Tensor ge_kernel_cuda(const Tensor& self, const Tensor& other) { return comparison_op_kernel<false>(self, other, GeFunctor()); }
 
-Tensor eq_scalar_kernel_cuda(const Tensor& self, Scalar other) {
+Tensor eq_scalar_kernel_cuda(const Tensor& self, const Scalar& other) {
     if (other.isComplex()) {
         DType rd = isComplexType(self.dtype())
             ? self.dtype()
@@ -162,7 +162,7 @@ Tensor eq_scalar_kernel_cuda(const Tensor& self, Scalar other) {
     }
     return comparison_scalar_op_kernel<true>(self, other, EqFunctor());
 }
-Tensor ne_scalar_kernel_cuda(const Tensor& self, Scalar other) {
+Tensor ne_scalar_kernel_cuda(const Tensor& self, const Scalar& other) {
     if (other.isComplex()) {
         DType rd = isComplexType(self.dtype())
             ? self.dtype()
@@ -174,10 +174,10 @@ Tensor ne_scalar_kernel_cuda(const Tensor& self, Scalar other) {
     }
     return comparison_scalar_op_kernel<true>(self, other, NeFunctor());
 }
-Tensor lt_scalar_kernel_cuda(const Tensor& self, Scalar other) { return comparison_scalar_op_kernel<false>(self, other, LtFunctor()); }
-Tensor le_scalar_kernel_cuda(const Tensor& self, Scalar other) { return comparison_scalar_op_kernel<false>(self, other, LeFunctor()); }
-Tensor gt_scalar_kernel_cuda(const Tensor& self, Scalar other) { return comparison_scalar_op_kernel<false>(self, other, GtFunctor()); }
-Tensor ge_scalar_kernel_cuda(const Tensor& self, Scalar other) { return comparison_scalar_op_kernel<false>(self, other, GeFunctor()); }
+Tensor lt_scalar_kernel_cuda(const Tensor& self, const Scalar& other) { return comparison_scalar_op_kernel<false>(self, other, LtFunctor()); }
+Tensor le_scalar_kernel_cuda(const Tensor& self, const Scalar& other) { return comparison_scalar_op_kernel<false>(self, other, LeFunctor()); }
+Tensor gt_scalar_kernel_cuda(const Tensor& self, const Scalar& other) { return comparison_scalar_op_kernel<false>(self, other, GtFunctor()); }
+Tensor ge_scalar_kernel_cuda(const Tensor& self, const Scalar& other) { return comparison_scalar_op_kernel<false>(self, other, GeFunctor()); }
 
 template <typename T>
 void where_loop(TensorIterator& iter) {
@@ -240,12 +240,12 @@ Tensor where_cuda(const Tensor& condition, const Tensor& self, const Tensor& oth
     return result;
 }
 
-Tensor where_scalar_self_cuda(const Tensor& condition, Scalar self, const Tensor& other) {
+Tensor where_scalar_self_cuda(const Tensor& condition, const Scalar& self, const Tensor& other) {
     DType common_dtype = result_type(self, other.dtype());
     return where_cuda(condition, Tensor::full({}, self, common_dtype, other.device()), other);
 }
 
-Tensor where_scalar_other_cuda(const Tensor& condition, const Tensor& self, Scalar other) {
+Tensor where_scalar_other_cuda(const Tensor& condition, const Tensor& self, const Scalar& other) {
     DType common_dtype = result_type(other, self.dtype());
     return where_cuda(condition, self, Tensor::full({}, other, common_dtype, self.device()));
 }
@@ -261,7 +261,7 @@ static DType where_scalar_dtype(const Scalar& self, const Scalar& other) {
     return DType::Int64;
 }
 
-Tensor where_scalar_scalar_cuda(const Tensor& condition, Scalar self, Scalar other) {
+Tensor where_scalar_scalar_cuda(const Tensor& condition, const Scalar& self, const Scalar& other) {
     DType common_dtype = where_scalar_dtype(self, other);
     return where_cuda(
         condition,

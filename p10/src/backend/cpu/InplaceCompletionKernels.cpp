@@ -38,25 +38,25 @@ Tensor& acosh_inplace_kernel(Tensor& self) {
     return self;
 }
 
-Tensor& addbmm_inplace_kernel(Tensor& self, const Tensor& batch1, const Tensor& batch2, Scalar beta, Scalar alpha) {
+Tensor& addbmm_inplace_kernel(Tensor& self, const Tensor& batch1, const Tensor& batch2, const Scalar& beta, const Scalar& alpha) {
     NoGradGuard __tp_nograd;
     self.copy_(Tensor::addbmm(self, batch1, batch2, beta, alpha));
     return self;
 }
 
-Tensor& addmm_inplace_kernel(Tensor& self, const Tensor& mat1, const Tensor& mat2, Scalar beta, Scalar alpha) {
+Tensor& addmm_inplace_kernel(Tensor& self, const Tensor& mat1, const Tensor& mat2, const Scalar& beta, const Scalar& alpha) {
     NoGradGuard __tp_nograd;
     self.copy_(Tensor::addmm(self, mat1, mat2, beta, alpha));
     return self;
 }
 
-Tensor& addmv_inplace_kernel(Tensor& self, const Tensor& mat, const Tensor& vec, Scalar beta, Scalar alpha) {
+Tensor& addmv_inplace_kernel(Tensor& self, const Tensor& mat, const Tensor& vec, const Scalar& beta, const Scalar& alpha) {
     NoGradGuard __tp_nograd;
     self.copy_(Tensor::addmv(self, mat, vec, beta, alpha));
     return self;
 }
 
-Tensor& addr_inplace_kernel(Tensor& self, const Tensor& vec1, const Tensor& vec2, Scalar beta, Scalar alpha) {
+Tensor& addr_inplace_kernel(Tensor& self, const Tensor& vec1, const Tensor& vec2, const Scalar& beta, const Scalar& alpha) {
     NoGradGuard __tp_nograd;
     self.copy_(Tensor::addr(self, vec1, vec2, beta, alpha));
     return self;
@@ -98,7 +98,7 @@ Tensor& bitwise_not_inplace_kernel(Tensor& self) {
     return self;
 }
 
-Tensor& baddbmm_inplace_kernel(Tensor& self, const Tensor& batch1, const Tensor& batch2, Scalar beta, Scalar alpha) {
+Tensor& baddbmm_inplace_kernel(Tensor& self, const Tensor& batch1, const Tensor& batch2, const Scalar& beta, const Scalar& alpha) {
     NoGradGuard __tp_nograd;
     self.copy_(Tensor::baddbmm(self, batch1, batch2, beta, alpha));
     return self;
@@ -110,13 +110,13 @@ Tensor& ceil_inplace_kernel(Tensor& self) {
     return self;
 }
 
-Tensor& celu_inplace_kernel(Tensor& self, Scalar alpha) {
+Tensor& celu_inplace_kernel(Tensor& self, const Scalar& alpha) {
     NoGradGuard __tp_nograd;
     self.copy_(self.celu(alpha));
     return self;
 }
 
-Tensor& clip_inplace_kernel(Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max) {
+Tensor& clip_inplace_kernel(Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
     NoGradGuard __tp_nograd;
     self.copy_(self.clamp(min, max));
     return self;
@@ -152,7 +152,7 @@ Tensor& deg2rad_inplace_kernel(Tensor& self) {
     return self;
 }
 
-Tensor& elu_inplace_kernel(Tensor& self, Scalar alpha, Scalar scale, Scalar input_scale) {
+Tensor& elu_inplace_kernel(Tensor& self, const Scalar& alpha, const Scalar& scale, const Scalar& input_scale) {
     NoGradGuard __tp_nograd;
     self.copy_(self.elu(alpha, scale, input_scale));
     return self;
@@ -212,7 +212,7 @@ Tensor& gcd_inplace_kernel(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor& gelu_inplace_kernel(Tensor& self, std::string approximate) {
+Tensor& gelu_inplace_kernel(Tensor& self, const std::string& approximate) {
     NoGradGuard __tp_nograd;
     self.copy_(self.gelu(approximate));
     return self;
@@ -230,7 +230,7 @@ Tensor& hardswish_inplace_kernel(Tensor& self) {
     return self;
 }
 
-Tensor& hardtanh_inplace_kernel(Tensor& self, Scalar min_val, Scalar max_val) {
+Tensor& hardtanh_inplace_kernel(Tensor& self, const Scalar& min_val, const Scalar& max_val) {
     NoGradGuard __tp_nograd;
     self.copy_(self.hardtanh(min_val, max_val));
     return self;
@@ -260,7 +260,7 @@ Tensor& index_copy_inplace_kernel(Tensor& self, int64_t dim, const Tensor& index
     return self;
 }
 
-Tensor& index_reduce_inplace_kernel(Tensor& self, int64_t dim, const Tensor& index, const Tensor& source, std::string reduce, bool include_self) {
+Tensor& index_reduce_inplace_kernel(Tensor& self, int64_t dim, const Tensor& index, const Tensor& source, const std::string& reduce, bool include_self) {
     NoGradGuard __tp_nograd;
     self.copy_(self.index_reduce(dim, index, source, reduce, include_self));
     return self;
@@ -272,7 +272,7 @@ Tensor& lcm_inplace_kernel(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor& leaky_relu_inplace_kernel(Tensor& self, Scalar negative_slope) {
+Tensor& leaky_relu_inplace_kernel(Tensor& self, const Scalar& negative_slope) {
     NoGradGuard __tp_nograd;
     self.copy_(self.leaky_relu(negative_slope));
     return self;
@@ -332,7 +332,7 @@ Tensor& logical_xor_inplace_kernel(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor& logit_inplace_kernel(Tensor& self, std::optional<Scalar> eps) {
+Tensor& logit_inplace_kernel(Tensor& self, const std::optional<Scalar>& eps) {
     NoGradGuard __tp_nograd;
     self.copy_(self.logit(eps));
     return self;
@@ -350,7 +350,7 @@ Tensor& mish_inplace_kernel(Tensor& self) {
     return self;
 }
 
-Tensor& nan_to_num_inplace_kernel(Tensor& self, Scalar nan, std::optional<Scalar> posinf, std::optional<Scalar> neginf) {
+Tensor& nan_to_num_inplace_kernel(Tensor& self, const Scalar& nan, const std::optional<Scalar>& posinf, const std::optional<Scalar>& neginf) {
     NoGradGuard __tp_nograd;
     self.copy_(self.nan_to_num(nan, posinf, neginf));
     return self;
@@ -380,7 +380,7 @@ Tensor& relu6_inplace_kernel(Tensor& self) {
     return self;
 }
 
-Tensor& renorm_inplace_kernel(Tensor& self, Scalar p, int64_t dim, Scalar maxnorm) {
+Tensor& renorm_inplace_kernel(Tensor& self, const Scalar& p, int64_t dim, const Scalar& maxnorm) {
     NoGradGuard __tp_nograd;
     self.copy_(self.renorm(p, dim, maxnorm));
     return self;
@@ -476,7 +476,7 @@ Tensor& trunc_inplace_kernel(Tensor& self) {
     return self;
 }
 
-Tensor& threshold_inplace_kernel(Tensor& self, Scalar threshold, Scalar value) {
+Tensor& threshold_inplace_kernel(Tensor& self, const Scalar& threshold, const Scalar& value) {
     NoGradGuard __tp_nograd;
     self.copy_(Tensor::threshold(self, threshold, value));
     return self;
@@ -487,7 +487,7 @@ Tensor& i0_inplace_kernel(Tensor& self) {
     return self;
 }
 
-Tensor& pow_scalar_inplace_kernel(Tensor& self, Scalar exponent) {
+Tensor& pow_scalar_inplace_kernel(Tensor& self, const Scalar& exponent) {
     NoGradGuard __tp_nograd;
     self.copy_(self.pow(exponent));
     return self;
@@ -499,7 +499,7 @@ Tensor& pow_tensor_inplace_kernel(Tensor& self, const Tensor& exponent) {
     return self;
 }
 
-Tensor& float_power_scalar_inplace_kernel(Tensor& self, Scalar exponent) {
+Tensor& float_power_scalar_inplace_kernel(Tensor& self, const Scalar& exponent) {
     NoGradGuard __tp_nograd;
     self.copy_(self.float_power(exponent));
     return self;
@@ -516,7 +516,7 @@ Tensor& float_power_tensor_inplace_kernel(Tensor& self, const Tensor& exponent) 
 // positions past the column edge.  Raw strided writes: the diagonal of a
 // row-major matrix is never contiguous, so a linear fill would corrupt the
 // layout.
-Tensor& fill_diagonal__kernel(Tensor& self, Scalar fill_value, bool wrap) {
+Tensor& fill_diagonal__kernel(Tensor& self, const Scalar& fill_value, bool wrap) {
     NoGradGuard __tp_nograd;
     const int64_t n_dims = self.dim();
     if (n_dims < 2) {

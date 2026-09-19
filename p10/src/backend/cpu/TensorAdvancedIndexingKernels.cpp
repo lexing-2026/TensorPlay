@@ -159,8 +159,10 @@ void index_put_kernel(TensorIterator& iter, const indexing::native::AdvancedInde
 
 } // namespace
 
-Tensor& index_put_native_cpu(Tensor& self, const std::vector<Tensor>& indices,
-                              const Tensor& values, bool accumulate) {
+Tensor& index_put_impl_cpu(Tensor& self,
+                           const std::vector<std::optional<Tensor>>& indices,
+                           const Tensor& values, bool accumulate, bool unsafe) {
+    (void)unsafe;
     TP_CHECK_INDEX(indices.size() <= static_cast<size_t>(self.dim()),
                    "too many indices for tensor of dimension ", self.dim());
     for (int64_t d = 0; d < self.dim(); ++d) {
@@ -169,30 +171,10 @@ Tensor& index_put_native_cpu(Tensor& self, const std::vector<Tensor>& indices,
             break;
         }
     }
-    if (!accumulate && values.numel() == 1 && values.device().is_cpu()) {
-        Tensor mask;
-        int64_t consumed = 0;
-        bool can_mask_fill = true;
-        for (const auto& index : indices) {
-            if (!index.defined()) {
-                if (!mask.defined()) ++consumed;
-            } else if ((index.dtype() != DType::Bool && index.dtype() != DType::UInt8) ||
-                       index.device() != self.device() || mask.defined()) {
-                can_mask_fill = false;
-                break;
-            } else {
-                mask = index;
-                for (int64_t d = 0; d < mask.dim(); ++d) {
-                    TP_CHECK_INDEX(consumed + d < self.dim() &&
-                                   mask.size(d) == self.size(consumed + d),
-                                   "The shape of the mask does not match the indexed tensor");
-                }
-                consumed += mask.dim();
-            }
-        }
-        if (can_mask_fill && mask.defined()) {
-            for (int64_t d = consumed; d < self.dim(); ++d) mask = mask.unsqueeze(-1);
-            return tpx::ops::masked_fill_(self, mask, values.item());
+    if (!accumulate) {
+        if (auto mask = indexing::native::can_dispatch_to_masked_fill(
+                self, indices, values)) {
+            return tpx::ops::masked_fill_(self, *mask, values.item());
         }
     }
     Tensor value = values;
@@ -200,14 +182,12 @@ Tensor& index_put_native_cpu(Tensor& self, const std::vector<Tensor>& indices,
         value = value.to(self.device());
     }
     assert_no_index_overlap(self, values);
-    std::vector<std::optional<Tensor>> optional_indices;
     for (const auto& index : indices) {
-        if (index.defined()) {
-            assert_no_index_overlap(self, index);
-            optional_indices.emplace_back(index);
-        } else optional_indices.emplace_back(std::nullopt);
+        if (index.has_value() && index->defined()) {
+            assert_no_index_overlap(self, *index);
+        }
     }
-    indexing::native::AdvancedIndex info(self, optional_indices);
+    indexing::native::AdvancedIndex info(self, indices);
     TP_CHECK(value.dtype() == self.dtype(),
              "Index put requires the source and destination dtypes match");
     const auto shape = static_cast<std::vector<int64_t>>(info.source.shape());
@@ -240,6 +220,7 @@ Tensor& index_put_native_cpu(Tensor& self, const std::vector<Tensor>& indices,
 TENSORPLAY_LIBRARY_IMPL(CPU, TensorAdvancedIndexingKernels) {
     m.impl("index.Tensor", index_cpu);
     m.impl("take_along_dim", take_along_dim_cpu);
+    m.impl("_index_put_impl_", index_put_impl_cpu);
 }
 
 } // namespace cpu

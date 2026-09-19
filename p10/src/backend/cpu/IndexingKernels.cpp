@@ -54,19 +54,28 @@ inline void outer_inner(const std::vector<int64_t>& shape, int64_t dim,
     for (int64_t i = dim + 1; i < static_cast<int64_t>(shape.size()); ++i) inner *= shape[i];
 }
 
+// Validates an index tensor against [0, upper_bound).  With
+// ``wrap_negative`` the accepted range is [-upper_bound, upper_bound) and
+// negative values are returned wrapped into range (operators that count
+// from the end: take, index_fill).
 Tensor normalize_index_cpu(const Tensor& index, int64_t upper_bound,
-                           const char* op) {
+                           const char* op, bool wrap_negative = false) {
     Tensor index_c = (index.dtype() == DType::Int64)
         ? index.contiguous()
         : index.to(DType::Int64).contiguous();
-    const int64_t* input = index_c.data_ptr<int64_t>();
+    if (wrap_negative) {
+        index_c = index_c.clone();
+    }
+    int64_t* values = index_c.data_ptr<int64_t>();
+    const int64_t lower_bound = wrap_negative ? -upper_bound : 0;
     parallel_for(0, index_c.numel(), GRAIN_SIZE,
                  [&](int64_t begin, int64_t end) {
         for (int64_t i = begin; i < end; ++i) {
-            const int64_t value = input[i];
-            if (value < 0 || value >= upper_bound) {
+            const int64_t value = values[i];
+            if (value < lower_bound || value >= upper_bound) {
                 TP_THROW(IndexError, op, ": index out of range");
             }
+            if (value < 0) values[i] = value + upper_bound;
         }
     });
     return index_c;
@@ -81,7 +90,7 @@ Tensor normalize_index_cpu(const Tensor& index, int64_t upper_bound,
 // the input before applying the selected value to matching elements.
 // ---------------------------------------------------------------------------
 
-Tensor masked_fill_cpu(const Tensor& self, const Tensor& mask, Scalar value) {
+Tensor masked_fill_cpu(const Tensor& self, const Tensor& mask, const Scalar& value) {
     if (mask.dtype() != DType::Bool) {
         TP_THROW(TypeError, "masked_fill only supports boolean masks");
     }
@@ -111,7 +120,7 @@ Tensor masked_fill_cpu(const Tensor& self, const Tensor& mask, Scalar value) {
     return result;
 }
 
-Tensor& masked_fill__cpu(Tensor& self, const Tensor& mask, Scalar value) {
+Tensor& masked_fill__cpu(Tensor& self, const Tensor& mask, const Scalar& value) {
     Tensor r = masked_fill_cpu(self, mask, value);
     self.copy_(r);
     return self;
@@ -709,7 +718,7 @@ Tensor scatter_src_cpu(const Tensor& self, int64_t dim, const Tensor& index, con
     return scatter_base_cpu(self, dim, index, src, ScatterMode::Assign);
 }
 
-Tensor scatter_value_cpu(const Tensor& self, int64_t dim, const Tensor& index, Scalar value) {
+Tensor scatter_value_cpu(const Tensor& self, int64_t dim, const Tensor& index, const Scalar& value) {
     Tensor full = Tensor::full({}, value, self.dtype(), self.device());
     return scatter_base_cpu(self, dim, index, full, ScatterMode::Assign);
 }
@@ -793,7 +802,7 @@ Tensor& scatter_inplace_src_cpu(Tensor& self, int64_t dim, const Tensor& index, 
     return scatter_base_inplace_cpu(self, dim, index, src, ScatterMode::Assign);
 }
 
-Tensor& scatter_inplace_value_cpu(Tensor& self, int64_t dim, const Tensor& index, Scalar value) {
+Tensor& scatter_inplace_value_cpu(Tensor& self, int64_t dim, const Tensor& index, const Scalar& value) {
     Tensor full = Tensor::full({}, value, self.dtype(), self.device());
     return scatter_base_inplace_cpu(self, dim, index, full, ScatterMode::Assign);
 }
@@ -942,7 +951,7 @@ Tensor index_copy_cpu(const Tensor& self, int64_t dim, const Tensor& index, cons
     return result;
 }
 
-Tensor index_fill_scalar_cpu(const Tensor& self, int64_t dim, const Tensor& index, Scalar value);
+Tensor index_fill_scalar_cpu(const Tensor& self, int64_t dim, const Tensor& index, const Scalar& value);
 
 Tensor index_fill_tensor_cpu(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& value) {
     if (value.dim() != 0) {
@@ -954,10 +963,11 @@ Tensor index_fill_tensor_cpu(const Tensor& self, int64_t dim, const Tensor& inde
     return index_fill_scalar_cpu(self, dim, index, v);
 }
 
-Tensor index_fill_scalar_cpu(const Tensor& self, int64_t dim, const Tensor& index, Scalar value) {
+Tensor index_fill_scalar_cpu(const Tensor& self, int64_t dim, const Tensor& index, const Scalar& value) {
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
-    Tensor idx = normalize_index_cpu(index, self.size(dim), "index_fill");
+    Tensor idx = normalize_index_cpu(index, self.size(dim), "index_fill",
+                                     /*wrap_negative=*/true);
     Tensor result = detail::contiguous_clone(self);
     int64_t n_idx = idx.numel();
     if (n_idx == 0) return result;
@@ -986,7 +996,7 @@ Tensor index_fill_scalar_cpu(const Tensor& self, int64_t dim, const Tensor& inde
     return result;
 }
 
-Tensor& index_fill_scalar__cpu(Tensor& self, int64_t dim, const Tensor& index, Scalar value) {
+Tensor& index_fill_scalar__cpu(Tensor& self, int64_t dim, const Tensor& index, const Scalar& value) {
     // slice loop; tp composes it as fill-then-copy_ like the other
     // in-place index ops.
     self.copy_(index_fill_scalar_cpu(self, dim, index, value));
@@ -1000,29 +1010,6 @@ Tensor& index_fill_tensor__cpu(Tensor& self, int64_t dim, const Tensor& index, c
                  value.dim(), " dimension(s).");
     }
     return index_fill_scalar__cpu(self, dim, index, value.item());
-}
-
-// ---------------------------------------------------------------------------
-// index_put / index_put_
-//
-// Native advanced indexing preserves destination strides and broadcasts
-// values over the indexed result shape.
-// ---------------------------------------------------------------------------
-
-
-Tensor index_put_cpu(const Tensor& self, const std::vector<Tensor>& indices,
-                     const Tensor& values, bool accumulate) {
-    extern Tensor& index_put_native_cpu(Tensor&, const std::vector<Tensor>&,
-                                         const Tensor&, bool);
-    Tensor result = self.clone();
-    return index_put_native_cpu(result, indices, values, accumulate);
-}
-
-Tensor& index_put__cpu(Tensor& self, const std::vector<Tensor>& indices,
-                       const Tensor& values, bool accumulate) {
-    extern Tensor& index_put_native_cpu(Tensor&, const std::vector<Tensor>&,
-                                         const Tensor&, bool);
-    return index_put_native_cpu(self, indices, values, accumulate);
 }
 
 // ---------------------------------------------------------------------------
@@ -1547,7 +1534,10 @@ Tensor bincount_cpu(const Tensor& self, const std::optional<Tensor>& weights_opt
 
 Tensor take_cpu(const Tensor& self, const Tensor& index) {
     Tensor flat = self.reshape({self.numel()});
-    return index_select_cpu(flat, 0, index.reshape({index.numel()}))
+    // take counts negative indices from the end of the flattened input.
+    Tensor wrapped = normalize_index_cpu(index.reshape({index.numel()}), self.numel(),
+                                         "take", /*wrap_negative=*/true);
+    return index_select_cpu(flat, 0, wrapped)
         .reshape(static_cast<std::vector<int64_t>>(index.shape()));
 }
 
@@ -2370,8 +2360,6 @@ TENSORPLAY_LIBRARY_IMPL(CPU, IndexingKernels) {
     m.impl("index_fill.Scalar", index_fill_scalar_cpu);
     m.impl("index_fill_.Tensor", index_fill_tensor__cpu);
     m.impl("index_fill_.Scalar", index_fill_scalar__cpu);
-    m.impl("index_put", index_put_cpu);
-    m.impl("index_put_", index_put__cpu);
     m.impl("nonzero", nonzero_cpu);
     m.impl("unique", unique_cpu);
     m.impl("_unique", _unique_cpu);

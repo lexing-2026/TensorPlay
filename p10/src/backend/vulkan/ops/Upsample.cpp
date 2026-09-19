@@ -45,7 +45,7 @@ struct BilinearBlock final {
 
 Tensor upsample_nearest2d_kernel(
     const Tensor& self,
-    std::vector<int64_t> output_size,
+    const std::vector<int64_t>& output_size,
     std::optional<double> scales_h,
     std::optional<double> scales_w) {
   validate_float_4d(self, "upsample_nearest2d");
@@ -95,7 +95,7 @@ Tensor upsample_nearest2d_kernel(
 
 Tensor upsample_bilinear2d_kernel(
     const Tensor& self,
-    std::vector<int64_t> output_size,
+    const std::vector<int64_t>& output_size,
     bool align_corners,
     std::optional<double> scales_h,
     std::optional<double> scales_w) {

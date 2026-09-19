@@ -129,8 +129,10 @@ std::tuple<Tensor, Tensor> sort_kernel(
 }
 
 std::tuple<Tensor, Tensor> topk_kernel(
-    const Tensor& self, int64_t k, int64_t dim, bool largest, bool sorted) {
+    const Tensor& self, int64_t k, int64_t dim, bool largest, bool sorted,
+    int64_t impl) {
   (void)sorted; // Sorted output also satisfies the unordered top-k contract.
+  (void)impl;   // Algorithm selection hint; one implementation here.
   TP_CHECK(k >= 0, "Vulkan topk: k must be non-negative");
   return sort_impl(self, dim, largest, k);
 }

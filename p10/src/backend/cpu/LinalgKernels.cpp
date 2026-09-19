@@ -498,7 +498,7 @@ void linalg_check_errors(const Tensor& infos, std::string_view api_name, bool is
     }
 }
 
-void linalg_check_errors_kernel(const Tensor& infos, std::string api_name,
+void linalg_check_errors_kernel(const Tensor& infos, const std::string& api_name,
                                 bool is_matrix) {
     linalg_check_errors(infos, api_name, is_matrix);
 }
@@ -1167,7 +1167,7 @@ std::tuple<Tensor, Tensor> eigh_impl(const Tensor& A, bool upper, bool compute_e
 }
 
 std::tuple<Tensor, Tensor> linalg_eigh_internal_kernel(const Tensor& A,
-                                                       std::string UPLO,
+                                                       const std::string& UPLO,
                                                        bool compute_v) {
     if (UPLO != "U" && UPLO != "L") {
         TP_THROW(RuntimeError, "linalg.eigh: UPLO argument must be 'U' or 'L', got ", UPLO);
@@ -1176,16 +1176,16 @@ std::tuple<Tensor, Tensor> linalg_eigh_internal_kernel(const Tensor& A,
 }
 
 // Public entries: schema passes UPLO as a string.
-std::tuple<Tensor, Tensor> linalg_eigh_kernel(const Tensor& A, std::string UPLO) {
+std::tuple<Tensor, Tensor> linalg_eigh_kernel(const Tensor& A, const std::string& UPLO) {
     return linalg_eigh_internal_kernel(A, UPLO, true);
 }
 
-Tensor linalg_eigvalsh_kernel(const Tensor& A, std::string UPLO) {
+Tensor linalg_eigvalsh_kernel(const Tensor& A, const std::string& UPLO) {
     return std::get<0>(linalg_eigh_internal_kernel(A, UPLO, false));
 }
 
 std::tuple<Tensor, Tensor> linalg_eigh_internal_out_kernel(
-        const Tensor& A, std::string UPLO, bool compute_v, Tensor& values,
+        const Tensor& A, const std::string& UPLO, bool compute_v, Tensor& values,
         Tensor& vectors) {
     auto result = linalg_eigh_internal_kernel(A, UPLO, compute_v);
     write_linalg_output("linalg.eigh", std::get<0>(result), values);
@@ -1194,11 +1194,11 @@ std::tuple<Tensor, Tensor> linalg_eigh_internal_out_kernel(
 }
 
 std::tuple<Tensor, Tensor> linalg_eigh_eigvals_out_kernel(
-        const Tensor& A, std::string UPLO, Tensor& values, Tensor& vectors) {
+        const Tensor& A, const std::string& UPLO, Tensor& values, Tensor& vectors) {
     return linalg_eigh_internal_out_kernel(A, UPLO, true, values, vectors);
 }
 
-Tensor& linalg_eigvalsh_out_kernel(const Tensor& A, std::string UPLO,
+Tensor& linalg_eigvalsh_out_kernel(const Tensor& A, const std::string& UPLO,
                                    Tensor& out) {
     auto result = linalg_eigh_internal_kernel(A, UPLO, false);
     write_linalg_output("linalg.eigvalsh", std::get<0>(result), out);
@@ -1537,7 +1537,8 @@ std::tuple<Tensor, Tensor, Tensor> svd_impl(const Tensor& A, bool full_matrices,
     return {U.contiguous(), S.contiguous(), Vh.contiguous()};
 }
 
-void check_cpu_svd_driver(const std::optional<std::string>& driver) {
+void check_cpu_svd_driver(const std::optional<std::string>& driver_arg) {
+    std::optional<std::string> driver = driver_arg;
     if (driver.has_value()) {
         TP_THROW(RuntimeError,
                  "linalg.svd: keyword argument `driver=` is only supported on CUDA inputs");
@@ -1546,23 +1547,23 @@ void check_cpu_svd_driver(const std::optional<std::string>& driver) {
 
 std::tuple<Tensor, Tensor, Tensor> linalg_svd_internal_kernel(
         const Tensor& A, bool full_matrices, bool compute_uv,
-        std::optional<std::string> driver) {
+        const std::optional<std::string>& driver) {
     check_cpu_svd_driver(driver);
     return svd_impl(A, full_matrices, compute_uv);
 }
 
 std::tuple<Tensor, Tensor, Tensor> linalg_svd_kernel(const Tensor& A, bool full_matrices,
-                                                     std::optional<std::string> driver) {
+                                                     const std::optional<std::string>& driver) {
     return linalg_svd_internal_kernel(A, full_matrices, true, driver);
 }
 
-Tensor linalg_svdvals_kernel(const Tensor& A, std::optional<std::string> driver) {
+Tensor linalg_svdvals_kernel(const Tensor& A, const std::optional<std::string>& driver) {
     return std::get<1>(linalg_svd_internal_kernel(A, false, false, driver));
 }
 
 std::tuple<Tensor, Tensor, Tensor> linalg_svd_internal_out_kernel(
         const Tensor& A, bool full_matrices, bool compute_uv,
-        std::optional<std::string> driver, Tensor& U, Tensor& S, Tensor& Vh) {
+        const std::optional<std::string>& driver, Tensor& U, Tensor& S, Tensor& Vh) {
     auto result = linalg_svd_internal_kernel(A, full_matrices, compute_uv,
                                              driver);
     write_linalg_output("linalg.svd", std::get<0>(result), U);
@@ -1572,14 +1573,14 @@ std::tuple<Tensor, Tensor, Tensor> linalg_svd_internal_out_kernel(
 }
 
 std::tuple<Tensor, Tensor, Tensor> linalg_svd_out_kernel(
-        const Tensor& A, bool full_matrices, std::optional<std::string> driver,
+        const Tensor& A, bool full_matrices, const std::optional<std::string>& driver,
         Tensor& U, Tensor& S, Tensor& Vh) {
     return linalg_svd_internal_out_kernel(A, full_matrices, true, driver, U,
                                           S, Vh);
 }
 
 Tensor& linalg_svdvals_out_kernel(const Tensor& A,
-                                  std::optional<std::string> driver,
+                                  const std::optional<std::string>& driver,
                                   Tensor& out) {
     auto result = linalg_svd_internal_kernel(A, false, false, driver);
     write_linalg_output("linalg.svdvals", std::get<1>(result), out);
@@ -1671,7 +1672,7 @@ void apply_orgqr(Tensor& self, const Tensor& tau) {
     }
 }
 
-std::tuple<Tensor, Tensor> linalg_qr_kernel(const Tensor& A, std::string mode) {
+std::tuple<Tensor, Tensor> linalg_qr_kernel(const Tensor& A, const std::string& mode) {
     require_lapack("linalg.qr");
     check_is_matrix(A, "linalg.qr");
     if (mode != "reduced" && mode != "complete" && mode != "r") {
@@ -1730,7 +1731,7 @@ std::tuple<Tensor, Tensor> linalg_qr_kernel(const Tensor& A, std::string mode) {
             R.contiguous()};
 }
 
-std::tuple<Tensor, Tensor> linalg_qr_out_kernel(const Tensor& A, std::string mode,
+std::tuple<Tensor, Tensor> linalg_qr_out_kernel(const Tensor& A, const std::string& mode,
                                                 Tensor& Q, Tensor& R) {
     auto result = linalg_qr_kernel(A, mode);
     write_linalg_output("linalg.qr", std::get<0>(result), Q);
@@ -1866,7 +1867,7 @@ void apply_lstsq(const Tensor& A, Tensor& B, Tensor& rank,
 
 std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_lstsq_kernel(
         const Tensor& A, const Tensor& B, std::optional<double> rcond,
-        std::optional<std::string> driver_opt) {
+        const std::optional<std::string>& driver_opt) {
     const char* api = "linalg.lstsq";
     require_lapack(api);
     check_is_matrix(A, api);

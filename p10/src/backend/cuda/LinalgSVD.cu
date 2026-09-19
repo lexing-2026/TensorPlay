@@ -844,25 +844,25 @@ std::tuple<Tensor, Tensor, Tensor> svd_impl_cuda(
 
 std::tuple<Tensor, Tensor, Tensor> linalg_svd_internal_kernel_cuda(
         const Tensor& input, bool full_matrices, bool compute_uv,
-        std::optional<std::string> driver) {
+        const std::optional<std::string>& driver) {
     return svd_impl_cuda(input, full_matrices, compute_uv, driver);
 }
 
 std::tuple<Tensor, Tensor, Tensor> linalg_svd_kernel_cuda(
         const Tensor& input, bool full_matrices,
-        std::optional<std::string> driver) {
+        const std::optional<std::string>& driver) {
     return linalg_svd_internal_kernel_cuda(input, full_matrices, true, driver);
 }
 
 Tensor linalg_svdvals_kernel_cuda(const Tensor& input,
-                                  std::optional<std::string> driver) {
+                                  const std::optional<std::string>& driver) {
     return std::get<1>(linalg_svd_internal_kernel_cuda(input, false, false,
                                                        driver));
 }
 
 std::tuple<Tensor, Tensor, Tensor> linalg_svd_internal_out_kernel_cuda(
         const Tensor& input, bool full_matrices, bool compute_uv,
-        std::optional<std::string> driver, Tensor& U, Tensor& S, Tensor& Vh) {
+        const std::optional<std::string>& driver, Tensor& U, Tensor& S, Tensor& Vh) {
     auto result = linalg_svd_internal_kernel_cuda(input, full_matrices,
                                                   compute_uv, driver);
     write_linalg_output("linalg.svd", std::get<0>(result), U);
@@ -873,13 +873,13 @@ std::tuple<Tensor, Tensor, Tensor> linalg_svd_internal_out_kernel_cuda(
 
 std::tuple<Tensor, Tensor, Tensor> linalg_svd_out_kernel_cuda(
         const Tensor& input, bool full_matrices,
-        std::optional<std::string> driver, Tensor& U, Tensor& S, Tensor& Vh) {
+        const std::optional<std::string>& driver, Tensor& U, Tensor& S, Tensor& Vh) {
     return linalg_svd_internal_out_kernel_cuda(input, full_matrices, true,
                                                driver, U, S, Vh);
 }
 
 Tensor& linalg_svdvals_out_kernel_cuda(const Tensor& input,
-                                       std::optional<std::string> driver,
+                                       const std::optional<std::string>& driver,
                                        Tensor& out) {
     auto result = linalg_svd_internal_kernel_cuda(input, false, false, driver);
     write_linalg_output("linalg.svdvals", std::get<1>(result), out);

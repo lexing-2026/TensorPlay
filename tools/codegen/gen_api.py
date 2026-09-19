@@ -618,8 +618,10 @@ def generate_cpp(funcs: list[NativeFunction], *,
 
             if f.cpp_name == "copy_":
                 lines.append('    if (!impl_ || !src.impl_) TP_THROW(RuntimeError, "Tensor not defined");')
+                # src broadcasts to self's shape; expand rejects shapes that
+                # cannot broadcast.
                 lines.append("    if (this->shape() != src.shape()) {")
-                lines.append('    TP_THROW(RuntimeError, "copy_(): shapes mismatch (broadcasting not yet supported)");')
+                lines.append("        return this->copy_(src.expand(static_cast<std::vector<int64_t>>(this->shape())), non_blocking);")
                 lines.append("    }")
 
             if f.cpp_name == "contiguous":
