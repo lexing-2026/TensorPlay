@@ -3,7 +3,11 @@
 import pytest
 
 import tensorplay as tp
-from tensorplay._stax import CudaGraphError, CudaGraphManager
+from tensorplay._stax import (
+    CudaGraphError,
+    CudaGraphInputDrift,
+    CudaGraphManager,
+)
 
 
 class FakeGraph:
@@ -34,22 +38,8 @@ class FakeGraph:
         self.resets += 1
 
 
-class FakeNativeNoBulk:
-    """Stand-in module exposing only the minimal pre-bulk surface."""
-
+class FakeNative:
     CUDAGraph = FakeGraph
-
-
-class FakeGraphBulk(FakeGraph):
-    def stage_and_launch(self, static_inputs, inputs):
-        assert self.captured
-        for dst, src in zip(static_inputs, inputs):
-            dst.copy_(src)
-        self.replays += 1
-
-
-class FakeNative(FakeNativeNoBulk):
-    CUDAGraph = FakeGraphBulk
 
 
 def _manager(native=FakeNative):
@@ -67,7 +57,7 @@ def test_missing_native_reports_surface(monkeypatch):
     assert "CUDAGraph" in str(ei.value)
 
 
-def test_capture_once_replay_copies_inputs():
+def test_capture_binds_caller_storage():
     mgr = _manager()
 
     def fn(x, w):
@@ -75,34 +65,42 @@ def test_capture_once_replay_copies_inputs():
 
     x0, w0 = tp.tensor([1.0, -2.0]), tp.tensor([3.0, 4.0])
     entry = mgr.capture("mm", fn, x0, w0)
-    out = mgr.replay("mm", tp.tensor([-1.0, 2.0]), tp.tensor([1.0, 1.0]))[0]
-    # static buffers staged the replay inputs before launch
-    assert entry.static_inputs[0].tolist() == [-1.0, 2.0]
+    # the graph is captured against the caller's own tensors, no staging clones
+    assert entry.static_inputs[0] is x0 and entry.static_inputs[1] is w0
+    assert entry.input_ptrs[0] == x0.data_ptr()
+    out = mgr.replay("mm", x0, w0)[0]
     assert out is entry.static_outputs[0]
-    with pytest.raises(CudaGraphError):
-        mgr.replay("mm", tp.tensor([1.0]))  # arity mismatch
-    with pytest.raises(CudaGraphError):
-        mgr.replay("mm", tp.tensor([1.0]), tp.tensor([1.0, 2.0, 3.0]))  # shape drift
     assert entry.graph.replays == 1 and entry.replays == 1
 
 
-def test_bulk_replay_routes_through_stage_and_launch():
+def test_replay_refuses_drifted_inputs_and_stays_replayable():
     mgr = _manager()
-    entry = mgr.capture("a", lambda x: x * 2, tp.tensor([1.0]))
-    assert entry.bulk is True
-    out = mgr.replay("a", tp.tensor([5.0]))[0]
-    assert entry.static_inputs[0].tolist() == [5.0]
-    assert out is entry.static_outputs[0]
-    assert entry.graph.replays == 1
+    x0, w0 = tp.tensor([1.0, -2.0]), tp.tensor([3.0, 4.0])
+    mgr.capture("mm", lambda x, w: (x * w).relu(), x0, w0)
+    # a different-address tensor cannot be seen by the captured graph
+    with pytest.raises(CudaGraphInputDrift):
+        mgr.replay("mm", tp.tensor([-1.0, 2.0]), w0)
+    with pytest.raises(CudaGraphInputDrift):
+        mgr.replay("mm", tp.tensor([1.0]))  # arity mismatch
+    with pytest.raises(CudaGraphInputDrift):
+        mgr.replay("mm", tp.tensor([1.0]), tp.tensor([1.0, 2.0, 3.0]))  # shape drift
+    with pytest.raises(CudaGraphError):
+        mgr.replay("mm", tp.tensor([1.0]))  # drift subclasses the base error
+    # drift is transient: the captured tensors replay again afterwards
+    mgr.replay("mm", x0, w0)
+    assert mgr._entries["mm"].graph.replays == 1
 
 
-def test_fallback_replay_without_bulk_path():
-    mgr = _manager(native=FakeNativeNoBulk)
-    entry = mgr.capture("a", lambda x: x * 2, tp.tensor([1.0]))
-    assert entry.bulk is False
-    mgr.replay("a", tp.tensor([-3.0]))
-    assert entry.static_inputs[0].tolist() == [-3.0]
-    assert entry.graph.replays == 1
+def test_replay_signature_rejects_layout_drift():
+    mgr = _manager()
+    x0 = tp.randn(4, 4)
+    mgr.capture("mm", lambda x: x.sin().sum(), x0)
+    # same storage, same shape, different strides: the kernels were captured
+    # against the contiguous layout, so a transposed view must not replay
+    with pytest.raises(CudaGraphInputDrift):
+        mgr.replay("mm", x0.t())
+    mgr.replay("mm", x0)
+    assert mgr._entries["mm"].graph.replays == 1
 
 
 def test_same_key_same_signature_returns_entry():

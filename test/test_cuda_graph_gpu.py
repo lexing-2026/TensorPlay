@@ -15,7 +15,6 @@ pytestmark = pytest.mark.skipif(
     not tp.cuda.is_available(), reason="CUDA runtime is not available"
 )
 
-from tensorplay._stax import CudaGraphManager  # noqa: E402
 from tensorplay.cuda.graphs import make_graphed_callables  # noqa: E402
 
 
@@ -46,33 +45,33 @@ def test_stage_and_launch_bulk_path():
     device = _cuda_device()
     w = tp.randn((32, 32), device=device)
     x0 = tp.randn((32, 32), device=device)
-    mgr = CudaGraphManager()
-
-    def fn(x):
-        return (x @ w).relu() * 2.0
-
-    entry = mgr.capture("bulk", fn, x0)
+    g = tp.cuda.CUDAGraph()
+    static_x = x0.clone()
+    with tp.cuda.graph(g):
+        static_y = (tp.matmul(static_x, w).relu() * 2.0)
     for i in range(3):
         a = tp.randn((32, 32), device=device)
-        got = mgr.replay("bulk", a)[0]
+        g.stage_and_launch([static_x], [a])
         tp.cuda.synchronize()
-        want = fn(a)
+        got = static_y.clone()
+        want = (tp.matmul(a, w).relu() * 2.0)
         assert tp.allclose(got, want), f"iteration {i} diverged"
-    assert entry.replays == 3
 
 
 def test_stage_and_launch_noncontiguous_fallback():
     device = _cuda_device()
     x0 = tp.arange(64, device=device).reshape(8, 8).contiguous().float()
-    mgr = CudaGraphManager()
-    entry = mgr.capture("nc", lambda x: x.relu(), x0)
+    g = tp.cuda.CUDAGraph()
+    static_x = x0.clone()
+    with tp.cuda.graph(g):
+        static_y = static_x.relu()
     big = tp.arange(128, device=device).float().reshape(16, 8)
     view = big[::2]  # non-contiguous view of shape (8, 8)
     assert not view.is_contiguous()
-    got = mgr.replay("nc", view.contiguous())[0]
+    g.stage_and_launch([static_x], [view.contiguous()])
     tp.cuda.synchronize()
     want = view.contiguous().relu()
-    assert tp.allclose(got, want)
+    assert tp.allclose(static_y.clone(), want)
 
 
 def test_rng_fresh_across_replays():

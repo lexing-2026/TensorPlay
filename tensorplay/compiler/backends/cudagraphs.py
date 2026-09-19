@@ -1,20 +1,23 @@
 """CUDA graphs orchestration (L5-M3).
 
-(capture once, replay against static buffers), driven entirely by the native
-:class:`tensorplay._C.CUDAGraph` class:
+(capture once, replay against the captured inputs), driven entirely by the
+native :class:`tensorplay._C.CUDAGraph` class:
 
 * ``capture_begin/capture_end`` own the dedicated per-device side stream,
   route allocations into a graph-private allocator pool and register
   graph-safe RNG state; instantiation happens eagerly at ``capture_end``.
-* ``stage_and_launch`` is the low-overhead replay path: every input is
-  copied onto its static buffer with a raw async device-to-device copy and
-  the cached executable is launched - one Python-to-native crossing per
-  replay instead of one dispatcher round trip per input plus launch.
+* Replay binds the graph directly to the caller's input storage: capture
+  records the input addresses, and every replay first checks that the
+  incoming tensors still live at those addresses.  Matching inputs are read
+  live by the captured kernels - no staging copy at all, which keeps large
+  memory-bound workloads from paying a full extra read+write of every input
+  per replay.  Inputs that drifted to a different address raise
+  :class:`CudaGraphInputDrift`; callers run the underlying artifact
+  directly for that call.
 
 Tests may inject a stand-in via ``CudaGraphManager(native=...)``; the
 stand-in must expose a ``CUDAGraph`` class with ``capture_begin``,
-``capture_end``, ``replay``, ``reset`` and optionally
-``stage_and_launch``.
+``capture_end``, ``replay`` and ``reset``.
 """
 
 from __future__ import annotations
@@ -27,6 +30,16 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 class CudaGraphError(RuntimeError):
     """Raised for capture/replay contract violations."""
+
+
+class CudaGraphInputDrift(CudaGraphError):
+    """Replay arguments no longer fit the captured graph.
+
+    Either the tensors moved to different addresses (the graph reads the
+    captured storage directly, so a moved input cannot be seen) or their
+    shape/layout signature changed.  Transient by nature: the next call
+    with matching arguments replays again.
+    """
 
 
 def _default_native() -> Any:
@@ -60,13 +73,30 @@ def _shape_signature(args: Sequence[Any]) -> Tuple:
     signature: List[Any] = []
     for a in args:
         if _looks_tensor(a):
-            signature.append((tuple(a.shape), str(a.dtype)))
+            # Strides join the signature because replay reads the input
+            # storage with the strides the kernels were captured against:
+            # a same-shape view with a different layout (e.g. a transpose)
+            # must not reuse the entry.
+            signature.append(
+                (tuple(a.shape), tuple(a.stride()), str(a.dtype), str(a.device))
+            )
         else:
             # Non-tensor inputs are baked into the capture; their value
             # joins the signature so a drift is refused at replay instead
             # of silently replaying a stale constant.
             signature.append(("scalar", type(a).__name__, a))
     return tuple(signature)
+
+
+def _input_data_ptr(value: Any) -> Optional[int]:
+    """Address of a tensor's storage, or None when unverifiable."""
+    ptr = getattr(value, "data_ptr", None)
+    if ptr is None:
+        return None
+    try:
+        return int(ptr())
+    except Exception:  # noqa: BLE001 - exotic stand-ins: treat as unverifiable
+        return None
 
 
 def _pin_triton_driver_stream(handle: int) -> list:
@@ -144,7 +174,7 @@ def _pin_launch_stream_to_capture():
 class _GraphEntry:
     __slots__ = ("key", "signature", "graph", "static_inputs",
                  "static_outputs", "tensor_positions", "warmup_structure",
-                 "replays", "bulk")
+                 "replays", "input_ptrs")
 
     def __init__(self, key: str, signature: Tuple, graph: Any,
                  static_inputs: List[Any], static_outputs: List[Any],
@@ -153,25 +183,25 @@ class _GraphEntry:
         self.key = key
         self.signature = signature
         self.graph = graph
+        # The captured input tensors themselves.  The executable reads this
+        # storage live on every replay, so the manager pins them for the
+        # entry's lifetime; a caller mutating them between replays sees the
+        # mutation on the next replay, exactly as an eager call would.
         self.static_inputs = static_inputs
         self.static_outputs = static_outputs
-        # Positions of tensor inputs; only they are staged onto static
-        # buffers at replay.  Non-tensor inputs live inside the captured
-        # executable and never take part in staging.
+        # Positions of tensor inputs; their addresses are recorded at
+        # capture and re-verified on every replay.
         self.tensor_positions = tensor_positions
         # Shape of the warmup run's return value: ("single",), ("tuple", n),
         # ("list", n) over one level of tensors, or ("unsupported",).  The
         # buffers behind static_outputs are the replay outputs themselves.
         self.warmup_structure = warmup_structure
         self.replays = 0
-        # Bulk staging keeps the whole replay inside one native call;
-        # stand-in natives without stage_and_launch fall back to per-tensor
-        # copies plus replay().
-        self.bulk = hasattr(graph, "stage_and_launch")
+        self.input_ptrs: Tuple[Optional[int], ...] = ()
 
 
 class CudaGraphManager:
-    """Capture functions once, replay them against static buffers."""
+    """Capture functions once, replay them against the captured inputs."""
 
     def __init__(self, native: Optional[Any] = None, max_entries: int = 8) -> None:
         self._native_module = native
@@ -230,18 +260,12 @@ class CudaGraphManager:
                     warmup_structure = ("unsupported",)
             else:
                 warmup_structure = ("unsupported",)
-            # Static input buffers must be allocated AND filled before the
-            # capture window opens: a clone issued inside capture becomes a
-            # captured node that would overwrite the staged replay inputs
-            # with the sample values on every replay.  Allocating outside
-            # also keeps them out of the graph-private pool, so their
-            # lifetime is independent of graph reset.  No ordering fence is
-            # needed here: nothing executes during capture, and at replay
-            # time the staging copies are enqueued on the launch stream ahead
-            # of the graph.
-            static_inputs = [
-                a.clone() if _looks_tensor(a) else a for a in sample_args
-            ]
+            # The graph is captured against the caller's own tensors: the
+            # recorded kernels read their storage live, so replay needs no
+            # staging copy.  The manager keeps references for the entry's
+            # lifetime, which also stops the allocator from recycling those
+            # addresses for unrelated allocations while the entry exists.
+            static_inputs = list(sample_args)
             tensor_positions = tuple(
                 index for index, arg in enumerate(sample_args)
                 if _looks_tensor(arg)
@@ -260,6 +284,10 @@ class CudaGraphManager:
         out_list = list(outputs) if isinstance(outputs, (list, tuple)) else [outputs]
         entry = _GraphEntry(key, signature, graph, static_inputs, out_list,
                             tensor_positions, warmup_structure)
+        entry.input_ptrs = tuple(
+            _input_data_ptr(sample_args[position])
+            for position in tensor_positions
+        )
         self._entries[key] = entry
         return entry
 
@@ -268,22 +296,28 @@ class CudaGraphManager:
         if entry is None:
             raise CudaGraphError(f"no captured graph under key {key!r}")
         if len(args) != len(entry.static_inputs):
-            raise CudaGraphError(
+            raise CudaGraphInputDrift(
                 f"entry {key!r} expects {len(entry.static_inputs)} inputs, got {len(args)}"
             )
         signature = _shape_signature(args)
         if signature != entry.signature:
-            raise CudaGraphError(
+            raise CudaGraphInputDrift(
                 f"entry {key!r} captured for {entry.signature}, replay args are {signature}"
             )
-        if entry.bulk:
-            staged_static = [entry.static_inputs[i] for i in entry.tensor_positions]
-            staged_args = [args[i] for i in entry.tensor_positions]
-            entry.graph.stage_and_launch(staged_static, staged_args)
-        else:
-            for i in entry.tensor_positions:
-                entry.static_inputs[i].copy_(args[i])
-            entry.graph.replay()
+        # The executable reads the captured input storage directly, so every
+        # replay verifies the tensors still live there.  A drifted tensor
+        # cannot be seen by the graph - copying it onto the captured storage
+        # is not an option, that storage is the caller's own tensor.
+        for position, recorded in zip(entry.tensor_positions, entry.input_ptrs):
+            actual = _input_data_ptr(args[position])
+            if actual != recorded:
+                raise CudaGraphInputDrift(
+                    f"entry {key!r} input at position {position} lives at "
+                    f"{actual!r}, but the graph was captured against "
+                    f"{recorded!r}; run the artifact directly for drifted "
+                    "inputs"
+                )
+        entry.graph.replay()
         entry.replays += 1
         return list(entry.static_outputs)
 
@@ -306,8 +340,8 @@ class CudaGraphManager:
 #
 # ``tensorplay.compile(fn, backend="cudagraphs")`` runs the captured graph on
 # its Python executor once per input layout, records that run into a CUDA
-# graph and afterwards only replays it: staging copies into the static input
-# buffers, one launch, and copies of the static outputs.  Regions that cannot
+# graph and afterwards only replays it: one launch reading the captured input
+# storage, plus copies of the outputs.  Regions that cannot
 # be replayed safely are left uncaptured and run on the executor; the reason
 # is logged.
 
@@ -361,11 +395,32 @@ def _target_name(node: Any) -> str:
     return str(getattr(node.target, "__name__", node.target))
 
 
+def _schema_written_arguments(node: Any) -> list[Any] | None:
+    """Values an operator-overload node writes, from its schema; None when
+    the target carries no schema."""
+
+    schema = getattr(node.target, "_schema", None)
+    if schema is None:
+        return None
+    written = []
+    for index, argument in enumerate(schema.arguments):
+        if argument.alias_info is None or not argument.alias_info.is_write:
+            continue
+        if argument.name in node.kwargs:
+            written.append(node.kwargs[argument.name])
+        elif index < len(node.args) and not argument.kwarg_only:
+            written.append(node.args[index])
+    return written
+
+
 def _mutated_argument(node: Any) -> Any:
     """The graph value an in-place node writes to, if any."""
 
     if node.op not in ("call_function", "call_method"):
         return None
+    written = _schema_written_arguments(node)
+    if written is not None:
+        return tuple(written) if written else None
     out = node.kwargs.get("out")
     if out is not None:
         return out
@@ -426,12 +481,44 @@ def check_multiple_devices_or_any_cpu_nodes(mapping: dict[str, Any]) -> str | No
     return format_default_skip_message(f"multiple devices: {', '.join(mapping)}")
 
 
+# Operators whose output size is computed from tensor data only for mask
+# indices; with integer indices the size follows from the index shapes.
+_MASK_SIZED_OPS = frozenset({"index", "index_put", "index_put_", "_index_put_impl_"})
+
+
+def _has_mask_index(node: Any) -> bool:
+    from ...graph import Node
+
+    for item in _iter_index_values(node.args[1:] if len(node.args) > 1 else ()):
+        if isinstance(item, Node):
+            value = item.meta.get("val")
+            if _is_tensor(value) and str(value.dtype).rsplit(".", 1)[-1] in ("bool", "uint8"):
+                return True
+    return False
+
+
+def _data_dependent_node(node: Any) -> bool:
+    """An operator node whose output size or value needs the device data."""
+
+    tags = getattr(node.target, "tags", None)
+    if tags is None:
+        return False
+    if "cudagraph_unsafe" in tags or "data_dependent_output" in tags:
+        return True
+    if "dynamic_output_shape" in tags:
+        name = getattr(node.target, "_opname", "")
+        return _has_mask_index(node) if name in _MASK_SIZED_OPS else True
+    return False
+
+
 def get_first_incompatible_cudagraph_node(gm: Any) -> Any:
     from ...graph import Node
 
     for node in gm.graph.nodes:
         if node.op not in ("call_function", "call_method"):
             continue
+        if _data_dependent_node(node):
+            return node
         if _target_name(node).rsplit(".", 1)[-1] in _UNSAFE_OPS:
             return node
         # Boolean-mask indexing computes the result size from the data.
@@ -458,9 +545,7 @@ def _iter_index_values(value: Any):
 def check_for_skip(gm: Any) -> str | None:
     mutated = find_input_mutations(gm)
     if mutated:
-        placeholders = gm.graph.placeholders
-        names = ", ".join(placeholders[i].name for i in sorted(mutated))
-        return format_default_skip_message(f"mutated inputs ({names})")
+        return format_default_skip_message(f"mutated inputs ({len(mutated)} instances)")
     if skip := check_multiple_devices_or_any_cpu_nodes(get_device_node_mapping(gm)):
         return skip
     if (node := get_first_incompatible_cudagraph_node(gm)) is not None:
@@ -565,7 +650,13 @@ class _CudagraphRunner:
 
             self.manager.capture(key, region, *tensors)
             template = self.templates[key] = captured_template[0]
-        outputs = self.manager.replay(key, *tensors)
+        try:
+            outputs = self.manager.replay(key, *tensors)
+        except CudaGraphInputDrift:
+            # This call's tensors live elsewhere; run the executor uncaptured
+            # and keep the entry for the calls that match the captured
+            # addresses.
+            return self.executor(*args, **kwargs)
         return _fill_outputs(template, [output.clone() for output in outputs])
 
 
@@ -589,18 +680,56 @@ class CudagraphsBackend:
         return cudagraphs(gm, example_inputs, strict_native=strict_native)
 
 
-def cudagraphs(gm: Any, example_inputs: Sequence[Any], *, strict_native: bool = False) -> Any:
+def _cudagraphify(gm: Any, strict_native: bool) -> Any:
+    """A replaying runner for ``gm``, or None when it cannot be captured."""
+
     skip = check_for_skip(gm)
     if skip is not None:
         if strict_native:
             raise CudaGraphError(f"strict_native=True: {skip}")
         log.warning(skip)
-        return gm.forward
+        return None
     manager = CudaGraphManager()
     CudagraphsBackend._managers.add(manager)
     runner = _CudagraphRunner(gm, manager)
     runner._tensorplay_codegen = "cudagraphs"  # type: ignore[attr-defined]
     return runner
+
+
+def cudagraphs(gm: Any, example_inputs: Sequence[Any], *, strict_native: bool = False) -> Any:
+    """Capture the forward and the backward graph of ``gm`` separately.
+
+    Ahead-of-time autograd splits the region into a forward and a backward
+    graph; each is captured into its own CUDA graph and replayed, so
+    training replays both passes.  A forward that cannot be captured also
+    leaves its backward uncaptured.
+    """
+
+    import functools
+
+    from .._core.common import aot_autograd
+
+    do_cudagraphs = [True]
+
+    def forward_cudagraphs(aot_model: Any, aot_inputs: list[Any], is_inference: bool = False) -> Any:
+        runner = _cudagraphify(aot_model, strict_native)
+        if runner is None:
+            do_cudagraphs[0] = False
+            return aot_model.forward
+        return runner
+
+    def backward_cudagraphs(aot_model: Any, aot_inputs: list[Any]) -> Any:
+        if not do_cudagraphs[0]:
+            return aot_model.forward
+        runner = _cudagraphify(aot_model, strict_native)
+        return aot_model.forward if runner is None else runner
+
+    aot_cudagraphs = aot_autograd(
+        fw_compiler=forward_cudagraphs,
+        bw_compiler=backward_cudagraphs,
+        inference_compiler=functools.partial(forward_cudagraphs, is_inference=True),
+    )
+    return aot_cudagraphs(gm, list(example_inputs))
 
 
 # ---------------------------------------------------------------------------
@@ -660,12 +789,14 @@ def wrap_skip_reason(
 
 
 class CudagraphCompiledCallable:
-    """Capture a compiled artifact once and replay it against static buffers.
+    """Capture a compiled artifact once and replay it against its inputs.
 
-    The first call warms up the artifact and records it; steady-state calls
-    stage the fresh inputs onto the static buffers and replay in one native
-    launch.  Outputs alias the graph-private pool: each replay overwrites
-    the tensors returned by the previous one.
+    The first call warms up the artifact and records it against the caller's
+    own tensors; steady-state calls whose tensors live at the captured
+    addresses replay with no input staging at all, and calls whose tensors
+    drifted run the artifact directly for that round.  Outputs alias the
+    graph-private pool: each replay overwrites the tensors returned by the
+    previous one.
     """
 
     def __init__(self, compiled: Any, native: Any = None) -> None:
@@ -714,6 +845,11 @@ class CudagraphCompiledCallable:
     def _replay(self, args: Tuple[Any, ...]) -> Any:
         try:
             outputs = self._manager.replay(self._key, *args)
+        except CudaGraphInputDrift:
+            # Inputs moved or changed layout: the graph cannot see them, but
+            # the artifact itself still runs them fine.  Transient - the next
+            # call whose tensors match the captured addresses replays again.
+            return self._compiled(*args)
         except (CudaGraphError, RuntimeError, TypeError) as exc:
             self._state = "fallback"
             log.warning("cudagraph replay failed; running the artifact directly: %s", exc)
