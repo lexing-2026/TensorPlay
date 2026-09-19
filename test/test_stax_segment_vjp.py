@@ -429,6 +429,35 @@ def test_min_amin_training_matches_eager_gpu(monkeypatch):
 
 
 @pytest.mark.skipif(not st.runtime_available(), reason="Triton/CUDA unavailable")
+def test_reduction_with_pointwise_tail_training_gpu(monkeypatch):
+    """A reduction with a pointwise tail trains: the schedule splits the
+    store-time epilogue into its own segment closed by a local VJP."""
+
+    def fn(t, w):
+        return ((t * w).relu().sum(dim=1) + 1.0).relu()
+
+    launches = _spy_canonical_launches(monkeypatch)
+    ts = [
+        tp.randn(8, 8, device=tp.device("cuda", 0), requires_grad=True),
+        tp.randn(8, 8, device=tp.device("cuda", 0), requires_grad=True),
+    ]
+    compiled = tp.compile(fn, fullgraph=True)
+    ins = [v.detach().clone().requires_grad_(True) for v in ts]
+    got = compiled(*ins)
+    got.sum().backward()
+    tp.cuda.synchronize()
+    assert [n for n in launches if n.startswith("bwd")], launches
+
+    ref_ins = [v.detach().clone().requires_grad_(True) for v in ts]
+    ref = fn(*ref_ins)
+    ref.sum().backward()
+
+    assert tp.abs(got.cpu() - ref.cpu()).max().item() < 1e-4
+    for g, want in zip(ins, ref_ins):
+        assert tp.abs(g.grad.cpu() - want.grad.cpu()).max().item() < 1e-4
+
+
+@pytest.mark.skipif(not st.runtime_available(), reason="Triton/CUDA unavailable")
 def test_extern_uncovered_training_uses_engine_vjp(monkeypatch):
     """An eager operator without a closed-form rule trains through the
     engine rule (recompute + nested grad) inside the compiled region."""

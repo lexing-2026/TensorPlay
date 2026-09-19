@@ -126,6 +126,7 @@ def segment_graph(
     *,
     is_pointwise: Callable[[Node], bool],
     classify_reduction: Callable[[Node], Any],
+    allow_epilogue: bool = True,
 ) -> Optional[List[Segment]]:
     """Partition ``graph_module`` into ordered fusion segments.
 
@@ -231,7 +232,13 @@ def segment_graph(
                 # pw after a reduction joins the SAME kernel as a store-time
                 # epilogue when it lives on the reduction's registers;
                 # otherwise the kernel boundary falls here (v1 rule).
-                if _epilogue_join(node, current[-1], tuple(current_epilogue)):
+                # Training schedules split the epilogue into its own
+                # pointwise segment instead: the backward then closes each
+                # piece with its own local VJP, mirroring forward/backward
+                # graphs being scheduled independently.
+                if allow_epilogue and _epilogue_join(
+                    node, current[-1], tuple(current_epilogue)
+                ):
                     current_epilogue.append(node)
                     continue
                 if not route(dependencies, close_open=True):

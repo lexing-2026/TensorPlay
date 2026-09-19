@@ -12,7 +12,7 @@ def _trace(fn, *args):
     return Tracer().trace(fn, sample_inputs=sample)
 
 
-def _segments(fn, *args):
+def _segments(fn, *args, **kwargs):
     gm = _trace(fn, *args)
 
     def is_pointwise(node):
@@ -35,7 +35,8 @@ def _segments(fn, *args):
 
     gm._preds = (is_pointwise, classify)
     return gm, segment_graph(gm, is_pointwise=is_pointwise,
-                             classify_reduction=classify)
+                             classify_reduction=classify,
+                             **kwargs)
 
 
 def test_pointwise_run_is_one_segment():
@@ -288,3 +289,20 @@ def test_scalar_intermediate_folds_into_epilogue():
     seg0 = plans[0][0]
     # full reduction with a two-node epilogue chain (mul, add)
     assert seg0.reduction.is_full and len(seg0.epilogue) == 2
+
+
+def test_training_schedule_splits_epilogue():
+    """Training scheduling keeps the store-time epilogue out of the
+    reduction kernel: it becomes its own pointwise segment closed by a
+    local VJP; inference keeps the join."""
+
+    gm, segs = _segments(lambda t: t.sum() * 2.0 + 1.0)
+    assert describe(segs) == "pw+red+ep"
+
+    _, split = _segments(lambda t: t.sum() * 2.0 + 1.0, allow_epilogue=False)
+    assert describe(split) == "pw+red -> pw"
+    red, epi = split
+    assert red.reduction.is_full and not red.epilogue
+    assert len(epi.nodes) == 2
+    # the split epilogue reads the reduction export, not an interior value
+    assert epi.exports == (epi.nodes[-1],)

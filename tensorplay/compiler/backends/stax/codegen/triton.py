@@ -2902,10 +2902,14 @@ def compile_graph_module(
     # number of validated segments lowers through per-segment emission;
     # each segment's externals must be graph placeholders or the exported
     # tail of an earlier segment.
+    any_grad = any(value.requires_grad for value in example_inputs)
     segments = segment_graph(
         graph_module,
         is_pointwise=_is_pointwise,
         classify_reduction=_classify_reduction,
+        # training schedules keep store-time epilogues out: the split
+        # epilogue becomes its own pointwise segment closed by a local VJP
+        allow_epilogue=not any_grad,
     )
     if segments is None:
         _dbg('fallback gate #4')
@@ -2916,7 +2920,6 @@ def compile_graph_module(
         tuple(int(dim) for dim in value.shape) != reference_shape
         for value in example_inputs
     )
-    any_grad = any(value.requires_grad for value in example_inputs)
     if any_grad and any(len(seg.exports) > 1 for seg in segments):
         # Horizontal fusion kernels carry extra stores; the local-VJP
         # training sweep routes gradients through the single export only.
