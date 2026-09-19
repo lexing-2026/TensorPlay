@@ -2275,9 +2275,11 @@ class _ExternPlan:
     dependencies through ``extern_sources`` — the same wiring contract fused
     segments use — and calls the operator on real tensors.
 
-    Training closes each extern segment with a closed-form tangent rule
-    (``backward_launch``, engine-free — see ``_build_extern_analytic_vjp``);
-    ``vjp_ready`` marks whether the operator has a covered rule.
+    Training closes each extern segment with a tangent rule
+    (``backward_launch``): a closed-form rule when one exists
+    (``_build_extern_analytic_vjp``), otherwise the engine rule
+    (``_build_extern_engine_vjp`` — recompute + nested ``grad``).
+    ``vjp_ready`` marks whether a rule was found.
     """
 
     launch: Any
@@ -2297,14 +2299,15 @@ class _ExternPlan:
 
 
 def _build_extern_analytic_vjp(node: Any, position_of: Any):
-    """Closed-form tangent rule for one eager operator, engine-free.
+    """Closed-form tangent rule for one eager operator.
 
-    The autograd engine cannot serve a re-entrant grad call from inside a
-    backward pass on CUDA (the second engine run deadlocks), so mixed-region
-    training closes each extern segment analytically: the rule recomputes
-    whatever operand values it needs with plain eager ops under the caller's
-    no-grad context and returns one gradient per feed position.  ``None``
-    when the operator has no covered rule — the region then stays eager.
+    Analytic rules are preferred over the engine fallback because they
+    recompute only what the rule needs with plain eager ops (no nested
+    engine run, no leaf clones) — mixed-region training closes each extern
+    segment with one of these when covered.  The rule receives the segment
+    feed and the export tangent and returns one gradient per feed position.
+    ``None`` when the operator has no covered rule — the engine rule
+    (``_build_extern_engine_vjp``) then takes over.
     """
 
     name = str(getattr(node.target, "__name__", node.target))
@@ -2432,6 +2435,90 @@ def _build_extern_analytic_vjp(node: Any, position_of: Any):
     return None
 
 
+def _build_extern_engine_vjp(node: Any, resolve: Any, position_of: Any):
+    """Engine tangent rule for one eager operator: recompute + grad.
+
+    Covers every differentiable operator the closed-form table misses —
+    cumsum, matmul, reductions without a uniform rule, composites — by
+    running the operator a second time on fresh leaf clones under grad mode
+    and differentiating with a nested ``autograd.grad`` call.  The engine
+    serves such re-entrant calls from any thread: a caller busy evaluating
+    a node runs the nested graph on its own local queue.  Analytic rules
+    stay preferred where they exist (no recompute, no re-entrancy); this is
+    the general fallback.  ``None`` when no operand is a feed-resolvable
+    tensor — nothing to differentiate.
+    """
+
+    import tensorplay as _tp
+
+    specs = [("arg", i, value) for i, value in enumerate(node.args)]
+    specs += [
+        ("kwarg", name, value) for name, value in (node.kwargs or {}).items()
+    ]
+    # one differentiation slot per tensor operand that resolves to a feed
+    # position; non-floating operands (index tensors, masks) never carry a
+    # gradient and constants need none
+    slots = [
+        (kind, key, position_of(value))
+        for kind, key, value in specs
+        if isinstance(value, Node) and position_of(value) is not None
+    ]
+    if not slots:
+        return None
+
+    def vjp(feed: list, tangent: Any) -> tuple:
+        args = [resolve(feed, value) for value in node.args]
+        kwargs = {
+            name: resolve(feed, value) for name, value in node.kwargs.items()
+        }
+        # under a create_graph backward the caller's grad mode is on; the
+        # recomputed graph and the returned tangents must join that
+        # higher-order graph exactly like the closed-form rules' ops do
+        track_higher_order = _tp.autograd.is_grad_enabled()
+        leaves = []
+        leaf_positions = []
+        with _tp.autograd.enable_grad():
+            for kind, key, position in slots:
+                value = feed[position]
+                if not value.dtype.is_floating_point:
+                    continue
+                leaf = value.detach().clone()
+                leaf.requires_grad_(True)
+                leaves.append(leaf)
+                leaf_positions.append(position)
+                if kind == "arg":
+                    args[key] = leaf
+                else:
+                    kwargs[key] = leaf
+            if not leaves:
+                return tuple(None for _ in feed)
+            if node.op == "call_function":
+                out = node.target(*args, **kwargs)
+            else:
+                out = getattr(args[0], node.target)(*args[1:], **kwargs)
+            if not out.requires_grad:
+                return tuple(None for _ in feed)
+            grads = _tp.autograd.grad(
+                out,
+                leaves,
+                grad_outputs=[tangent],
+                allow_unused=True,
+                create_graph=track_higher_order,
+            )
+        # one gradient per feed position; an operand resolved from the same
+        # source twice contributes both partials to that position
+        returned: list = [None] * len(feed)
+        for position, grad in zip(leaf_positions, grads):
+            if grad is not None:
+                existing = returned[position]
+                returned[position] = (
+                    grad if existing is None else existing + grad
+                )
+        return tuple(returned)
+
+    return vjp
+
+
 def _extern_segment_plan(
     graph_module: GraphModule,
     seg: Any,
@@ -2537,6 +2624,8 @@ def _extern_segment_plan(
         return getattr(owner, node.target)(*rest, **kwargs)
 
     vjp = _build_extern_analytic_vjp(node, position_of)
+    if vjp is None:
+        vjp = _build_extern_engine_vjp(node, resolve, position_of)
 
     output_shape = tuple(int(dim) for dim in shape)
     if max_autotune and not training and sample_feed is not None:
@@ -2930,8 +3019,8 @@ def compile_graph_module(
                 _dbg('fallback gate #12b')
                 return None
             if any_grad and not extern_plan.vjp_ready:
-                # no closed-form tangent for this operator: the region
-                # stays eager (engine re-entrant grad is not available)
+                # no tangent rule of either kind: the operator has no
+                # differentiable eager form the VJP can close
                 scheduler_annotate(graph_module, segments)
                 _dbg('fallback gate #12c')
                 return None
