@@ -137,7 +137,8 @@ class HigherOrderOperator:
     def has_impl(self, role: str) -> bool:
         return role in self._impls
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    def __call__(self, /, *args: Any, **kwargs: Any) -> Any:
+        # Positional-only receiver: operator arguments may be named ``self``.
         # A running proxy capture sees every call first so it can record the
         # operator node instead of executing the eager implementation.
         if "ProxyTorchDispatchMode" in self._impls:
