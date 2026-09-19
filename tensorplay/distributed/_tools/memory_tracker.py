@@ -7,6 +7,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 import tensorplay as tp
+from tensorplay.utils._dispatch import TensorPlayDispatchMode
 
 BYTES_PER_MB = 1024 * 1024.0
 
@@ -18,17 +19,12 @@ def _tensor_bytes(value: Any) -> int:
     return int(getattr(value, "numel", lambda: 0)()) * int(getattr(value, "element_size", lambda: 1)())
 
 
-class MemoryProfileDispatchMode:
-    """Record a memory sample after each explicitly dispatched operation."""
+class MemoryProfileDispatchMode(TensorPlayDispatchMode):
+    """Record a memory sample after each dispatched operator."""
 
     def __init__(self, memory_tracker: "MemoryTracker") -> None:
+        super().__init__()
         self.memory_tracker = memory_tracker
-
-    def __enter__(self) -> "MemoryProfileDispatchMode":
-        return self
-
-    def __exit__(self, *args: Any) -> None:
-        del args
 
     def __tensorplay_dispatch__(self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None) -> Any:
         del types
@@ -102,7 +98,7 @@ class MemoryTracker:
 
     def _create_post_forward_hook(self, name: str) -> Callable[..., Any]:
         def hook(module: Any, inputs: Any, outputs: Any) -> None:
-            del name, inputs
+            del inputs
             self._current_memory = max(self._current_memory, self._module_memory(module) + sum(_tensor_bytes(value) for value in _walk_tensors(outputs)))
             if getattr(module, "_memory_tracker_is_root", False):
                 self._add_marker("fw_bw_boundary")

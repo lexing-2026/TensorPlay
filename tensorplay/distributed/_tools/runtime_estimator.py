@@ -7,6 +7,8 @@ from typing import Any
 
 import tensorplay as tp
 
+from tensorplay.utils._dispatch import TensorPlayDispatchMode
+
 from .mod_tracker import ModTracker
 
 __all__ = ["RuntimeEstimator"]
@@ -30,7 +32,7 @@ def _tensor_bytes(value: Any) -> int:
     return int(value.numel()) * int(getattr(value, "element_size", lambda: 1)())
 
 
-class RuntimeEstimator:
+class RuntimeEstimator(TensorPlayDispatchMode):
     """Estimate execution time and aggregate it by active module."""
 
     _no_fallback_kernel: set[Any] = set()
@@ -38,6 +40,7 @@ class RuntimeEstimator:
     gpu_type: str | None = None
 
     def __init__(self, gpu_type: str | None = None) -> None:
+        super().__init__()
         self._gpu_type = gpu_type
         self._estimate: Callable[..., tuple[Any, float]] = self._benchmark_estimate
         self._estimate_mode_type = "operator-level-benchmark"
@@ -111,8 +114,10 @@ class RuntimeEstimator:
             post_bw_hook=lambda module, grad: self.mod_bw_post_order.append(self._mod_tracker.get_known_fqn(module) or type(module).__name__),
         )
         self._mod_tracker.__enter__()
+        super().__enter__()
         return self
 
     def __exit__(self, *args: Any) -> None:
+        super().__exit__(*args)
         self._mod_tracker.clear_user_hooks()
         self._mod_tracker.__exit__(*args)

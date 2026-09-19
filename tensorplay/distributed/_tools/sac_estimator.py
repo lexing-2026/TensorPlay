@@ -6,6 +6,8 @@ from typing import Any, NamedTuple
 
 import tensorplay as tp
 
+from tensorplay.utils._dispatch import TensorPlayDispatchMode
+
 from .mod_tracker import ModTracker
 from .runtime_estimator import RuntimeEstimator
 
@@ -87,10 +89,11 @@ def _walk_tensors(value: Any):
             yield from _walk_tensors(child)
 
 
-class SACEstimator:
+class SACEstimator(TensorPlayDispatchMode):
     """Collect activation records and build memory/runtime trade-off curves."""
 
     def __init__(self, gpu_type: str | None = None) -> None:
+        super().__init__()
         self.sac_mod_stats: dict[str, SACStats] = {}
         self.sac_mod_tradeoff_stats: dict[str, SACTradeOffStats] = {}
         self.sac_mod_greedy_order_meta: dict[str, SACGreedyOrderMeta] = {}
@@ -189,8 +192,9 @@ class SACEstimator:
         self.sac_mod_stats.clear()
         self._mod_tracker.register_user_hooks(self._pre_fw_hook, self._post_fw_hook)
         self._mod_tracker.__enter__()
-        return self
+        return super().__enter__()
 
     def __exit__(self, *args: Any) -> None:
         self._mod_tracker.clear_user_hooks()
         self._mod_tracker.__exit__(*args)
+        super().__exit__(*args)

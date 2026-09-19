@@ -13,6 +13,7 @@ import tensorplay as tp
 
 from .common_utils import get_untyped_storages
 from .mod_tracker import ModTracker
+from tensorplay.utils._dispatch import TensorPlayDispatchMode
 
 __all__ = ["MemTracker"]
 
@@ -188,10 +189,11 @@ def _tensor_memory(value: Any) -> int:
     return int(numel()) * int(element_size())
 
 
-class MemTracker:
+class MemTracker(TensorPlayDispatchMode):
     """Capture tensor memory by device and by execution phase."""
 
     def __init__(self) -> None:
+        super().__init__()
         self.memory_tracking: dict[Any, _ModMemStats] = {}
         self._curr_mem_snap: dict[Any, dict[str, int]] = {}
         self._peak_mem_snap: dict[Any, dict[str, int]] = {}
@@ -404,6 +406,7 @@ class MemTracker:
             self._mod_tracker.__enter__()
             self._peak_mem_snap = self.get_tracker_snapshot()
             self._peak_mem = {device: values[_TOTAL_KEY] for device, values in self._peak_mem_snap.items()}
+        super().__enter__()
         self._depth += 1
         return self
 
@@ -413,6 +416,7 @@ class MemTracker:
             self._deregister_param_and_optimizer_hooks()
             self._mod_tracker.clear_user_hooks()
             self._mod_tracker.__exit__(*args)
+        super().__exit__(*args)
 
     def __tensorplay_dispatch__(self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None) -> Any:
         del types
