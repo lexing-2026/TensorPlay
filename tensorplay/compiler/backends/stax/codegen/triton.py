@@ -2718,8 +2718,11 @@ class _SegmentPlan:
     #: example inputs feeding this segment (launch specialization shape)
     examples: tuple = ()
     #: True when some segment input broadcasts against the local reference —
-    #: broadcast VJPs need sum-to-shape (M5f), so training rejects these.
+    #: its VJP partial is summed to the operand shape before accumulation.
     needs_broadcast: bool = False
+    #: output-shaped stand-in anchoring the backward launch's tangent input;
+    #: broadcast inputs leave the iteration space to this example.
+    tangent_example: Any = None
     #: fused local-VJP launch (training mode); None until built.
     backward_launch: Any = None
     #: compile-time tangent layout for reduction segments:
@@ -2760,6 +2763,30 @@ def _reduction_tangent_plan(
         producer_shape
     )
     return (reshape_sizes, tuple(int(size) for size in producer_shape), scale)
+
+
+def _sum_to_shape(grad: Any, target_shape: tuple[int, ...]) -> Any:
+    """Reduce an expanded elementwise partial back to one operand's shape.
+
+    Sums the leading extra dims plus every dim the target carries as size 1
+    (keepdim), then views the kept leading ones away, so a gradient that
+    lives at the fused iteration space lands exactly on the broadcast
+    operand it belongs to.
+    """
+
+    if grad is None:
+        return None
+    if tuple(int(dim) for dim in grad.shape) == tuple(
+        int(dim) for dim in target_shape
+    ):
+        return grad
+    leading = grad.ndim - len(target_shape)
+    dims = list(range(leading)) + [
+        leading + index
+        for index, size in enumerate(target_shape)
+        if int(size) == 1 and int(grad.shape[leading + index]) != 1
+    ]
+    return grad.sum(dim=dims, keepdim=True).reshape(list(target_shape))
 
 
 def _reduction_mask_vjp(spec: ReductionSpec, input_position: int):
@@ -2942,10 +2969,9 @@ def compile_graph_module(
             if seg.kind == "pw+red" and seg.reduction.tracks_indices:
                 _dbg('fallback gate #5b')
                 return None
-    if any_grad and needs_broadcast:
-        # broadcast gradients need sum-to-shape (M5f).
-        _dbg('fallback gate #6')
-        return None
+    # Broadcast operands train through the per-segment local VJPs: each
+    # elementwise partial comes back at the fused iteration space and is
+    # summed to the operand's own shape before accumulation.
 
     # --- acceptance gate for runtime wiring (M5c per-segment emission) ----
     output_values = [
@@ -3245,6 +3271,9 @@ def compile_graph_module(
                 output_refs=output_refs,
                 examples=tuple(seg_examples),
                 needs_broadcast=bool(local_needs_broadcast),
+                tangent_example=_tp.empty(
+                    local_ref, dtype=sample_dtype, device=sample_device
+                ),
                 tangent_plan=(
                     None
                     if reduction is None
@@ -3274,28 +3303,32 @@ def compile_graph_module(
         _dbg('fallback gate #22')
         return None
     final_port = last_exports.index(final_value)
-    single_fused_training = (
-        len(segment_plans) == 1
-        and not isinstance(segment_plans[0], _ExternPlan)
-        # a bare extremum reduction carries its own eager VJP; an extremum
-        # reduction behind an in-segment producer chain has no local VJP
-        # and must fall back through the plan gate instead
-        and segment_plans[0].backward_launch is None
-        and (
-            segment_plans[0].spec is None
-            or segment_plans[0].spec.op not in _MASK_REDUCTION_OPS
-        )
-    )
     if any(value.requires_grad for value in example_inputs):
-        if single_fused_training:
-            plan = segment_plans[0]
-            if any(
-                op_name not in _CPU_FUSED_AUTOGRAD_OPS
-                for op_name, *_ in plan.instructions
+        # M5c training: chain one local VJP program per segment.  The
+        # reverse sweep feeds each segment's export-gradient through its
+        # own fused backward kernel and accumulates contributions into
+        # segment boundaries / placeholders (fan-out sums).  Gradients are
+        # keyed by the segment's extern sources, whose order follows the
+        # kernel's input-ref order — not the placeholder order — so the
+        # sweep maps every contribution back through the source indices.
+        for plan in segment_plans:
+            if (
+                plan.tangent_plan is None
+                and plan.spec is not None
+                and plan.backward_launch is None
+                or any(
+                    op_name not in _CPU_FUSED_AUTOGRAD_OPS
+                    for op_name, *_ in plan.instructions
+                )
             ):
+                _dbg('fallback gate #20')
                 return None
+        for seg_index, plan in enumerate(segment_plans):
+            if plan.backward_launch is not None:
+                # extern plans carry their engine VJP from plan time
+                continue
             gradient_plan = _build_fused_gradient_graphs(
-                len(placeholders),
+                len(plan.extern_sources),
                 plan.instructions,
                 plan.program,
                 plan.constants,
@@ -3303,67 +3336,34 @@ def compile_graph_module(
                 plan.output_ref,
             )
             if gradient_plan is None:
+                _dbg('fallback gate #21')
                 return None
-            backward_program, backward_constants, backward_outputs = gradient_plan
-            # The extra input is the tangent/grad-output supplied by autograd.
-            backward_launch = _autotune_launch(
-                "bwd",
-                backward_program,
-                backward_constants,
-                backward_outputs,
-                [*example_inputs, example_inputs[0]],
+            bwd_program, bwd_constants, bwd_outputs = gradient_plan
+            # Same input-count convention as forward: the final external
+            # input is this segment's export tangent, expanded to the
+            # segment's iteration space (the anchor against broadcast
+            # operands); per-input shapes keep broadcast operands on
+            # their own offsets inside the VJP kernel.
+            bwd_examples = [*plan.examples, plan.tangent_example]
+            plan.backward_launch = _autotune_launch(
+                f"bwd{seg_index}",
+                bwd_program,
+                bwd_constants,
+                bwd_outputs,
+                bwd_examples,
+                input_shapes=tuple(
+                    tuple(int(dim) for dim in value.shape)
+                    for value in bwd_examples
+                ),
+                reference_shape=tuple(
+                    int(dim) for dim in plan.tangent_example.shape
+                ),
+                bucket_numel=_prod(plan.tangent_example.shape),
                 max_autotune=max_autotune,
                 coordinate_descent_tuning=coordinate_descent_tuning,
             )
-        else:
-            # M5c training: chain one local VJP program per segment.  The
-            # reverse sweep feeds each segment's export-gradient through its
-            # own fused backward kernel and accumulates contributions into
-            # segment boundaries / placeholders (fan-out sums).
-            for plan in segment_plans:
-                if (
-                    plan.needs_broadcast
-                    or plan.tangent_plan is None
-                    and plan.spec is not None
-                    and plan.backward_launch is None
-                    or any(
-                        op_name not in _CPU_FUSED_AUTOGRAD_OPS
-                        for op_name, *_ in plan.instructions
-                    )
-                ):
-                    _dbg('fallback gate #20')
-                    return None
-            for seg_index, plan in enumerate(segment_plans):
-                if plan.backward_launch is not None:
-                    # extern plans carry their engine VJP from plan time
-                    continue
-                gradient_plan = _build_fused_gradient_graphs(
-                    len(plan.extern_sources),
-                    plan.instructions,
-                    plan.program,
-                    plan.constants,
-                    len(plan.program) // 3,
-                    plan.output_ref,
-                )
-                if gradient_plan is None:
-                    _dbg('fallback gate #21')
-                    return None
-                bwd_program, bwd_constants, bwd_outputs = gradient_plan
-                # Same input-count convention as forward: the final external
-                # input is this segment's export tangent.
-                plan.backward_launch = _autotune_launch(
-                    f"bwd{seg_index}",
-                    bwd_program,
-                    bwd_constants,
-                    bwd_outputs,
-                    [*plan.examples, plan.examples[0]],
-                    max_autotune=max_autotune,
-                    coordinate_descent_tuning=coordinate_descent_tuning,
-                )
 
         from .....autograd import Function
-
-        multi_segment_training = not single_fused_training
 
         def _grads_of(plan, feed_and_tangent):
             """One gradient per extern source, always a flat sequence.
@@ -3405,16 +3405,6 @@ def compile_graph_module(
                 if grad_output is None:
                     return (None,) * len(saved)
                 inputs_count = len(placeholders)
-                if not multi_segment_training:
-                    grad_output = _normalize_pointwise_grad_output(
-                        grad_output, saved[0]
-                    )
-                    values = backward_launch(
-                        [*saved[:inputs_count], grad_output]
-                    )
-                    if not isinstance(values, (list, tuple)):
-                        values = [values]
-                    return tuple(values)
                 # normalize once against the final output's operand shape;
                 # every downstream tangent already has its producer shape.
                 seg_grads: dict[int, Any] = {
@@ -3451,7 +3441,18 @@ def compile_graph_module(
                     grads = _grads_of(
                         plan, [*ctx.stax_feed_all[index], tangent]
                     )
-                    for source, grad in zip(plan.extern_sources, grads):
+                    for position, (source, grad) in enumerate(
+                        zip(plan.extern_sources, grads)
+                    ):
+                        # an elementwise partial lives at the fused iteration
+                        # space; broadcast operands receive their own shape.
+                        # extern plans resolve operands at call time and
+                        # their VJPs return operand-shaped gradients.
+                        examples = getattr(plan, "examples", ())
+                        if examples:
+                            grad = _sum_to_shape(
+                                grad, tuple(examples[position].shape)
+                            )
                         if source.kind == "arg":
                             accumulate(arg_grads, source.index, grad)
                         else:
