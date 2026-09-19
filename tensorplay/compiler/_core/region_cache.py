@@ -132,8 +132,55 @@ def region_key(
     return h.hexdigest()
 
 
-def load_region(key: Optional[str]) -> Optional[GraphModule]:
-    """The stored graph for ``key``, or ``None`` on any miss."""
+def _live_root(program: Any) -> Any:
+    """The module a traced program reads its state from, if any."""
+
+    import tensorplay
+
+    if isinstance(program, tensorplay.nn.Module):
+        return program
+    owner = getattr(program, "__self__", None)
+    return owner if isinstance(owner, tensorplay.nn.Module) else None
+
+
+def _rebind(graph_module: GraphModule, root: Any) -> GraphModule:
+    """Point a reloaded graph at the live module's state.
+
+    The stored entry carries a copy of the module; parameters and buffers
+    must be the live objects so gradients, optimizer steps and running
+    statistic updates reach the caller's module.
+    """
+
+    from tensorplay.graph.graph_module import _lookup_path
+
+    # The root is a property; assignment through the module protocol would
+    # register a submodule named ``root`` instead.
+    object.__setattr__(graph_module, "_root", root)
+    # Submodules, parameters and buffers copied onto the graph module at
+    # capture resolve before the root: point them at the live objects.
+    for table_name in ("_modules", "_parameters", "_buffers"):
+        table = graph_module.__dict__.get(table_name, {})
+        for name in list(table):
+            try:
+                table[name] = _lookup_path(root, name)
+            except (AttributeError, KeyError, IndexError, TypeError):
+                continue
+    attrs = graph_module.__dict__.get("_graph_attrs", {})
+    for target in list(attrs):
+        try:
+            attrs[target] = _lookup_path(root, target)
+        except (AttributeError, KeyError, IndexError, TypeError):
+            # Constants that are not module state keep their stored value.
+            continue
+    return graph_module
+
+
+def load_region(key: Optional[str], program: Any = None) -> Optional[GraphModule]:
+    """The stored graph for ``key``, or ``None`` on any miss.
+
+    With ``program``, a reloaded graph is rebound onto the live module the
+    program belongs to.
+    """
 
     if not key:
         return None
@@ -144,7 +191,10 @@ def load_region(key: Optional[str]) -> Optional[GraphModule]:
         graph_module = pickle.loads(payload)
     except Exception:  # noqa: BLE001 - corrupt or unreadable entry
         return None
-    return graph_module if isinstance(graph_module, GraphModule) else None
+    if not isinstance(graph_module, GraphModule):
+        return None
+    root = _live_root(program)
+    return _rebind(graph_module, root) if root is not None else graph_module
 
 
 def store_region(key: Optional[str], graph_module: GraphModule) -> None:

@@ -6,7 +6,10 @@ native extension probes) loads on first attribute access, so importing
 ``tensorplay`` never pays for this package.
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .backend import stax
 
 __all__ = ["stax"]
 

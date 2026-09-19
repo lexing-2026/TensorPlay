@@ -21,6 +21,8 @@ callable:
 
 from __future__ import annotations
 
+import contextlib
+
 import itertools
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -179,6 +181,22 @@ def _trace_joint(fn: Callable[..., Any], primals: Sequence[Any], decompositions)
     return joint, out_spec, flat_out, len(fwd_values), trace_primals, tangents
 
 
+def _functionalize(gm: GraphModule, example_inputs: Sequence[Any]) -> GraphModule:
+    """Mutation-free equivalent of ``gm`` with fresh value metadata.
+
+    The metadata pass runs the graph, so it gets private copies of the
+    inputs: the trailing input updates must not reach the caller's tensors.
+    """
+
+    from tensorplay.graph.passes.functionalize import functionalize
+    from tensorplay.graph.passes.shape_prop import ShapeProp
+
+    functional = functionalize(gm)
+    with tensorplay.no_grad():
+        ShapeProp(list(example_inputs))(functional)
+    return functional
+
+
 # ---------------------------------------------------------------------------
 # Runtime
 # ---------------------------------------------------------------------------
@@ -204,8 +222,11 @@ def _bind_backward_inputs(bw_module, input_kinds, input_keys, saved, grad_output
             values.append(tangent_by_name[placeholder.name])
         elif kind == "saved":
             values.append(saved_by_name[key])
-        else:
+        elif key in primal_by_name:
             values.append(primal_by_name[key])
+        else:
+            # A graph constant (get_attr) read by the backward.
+            values.append(bw_module._get_attr(key))
     return values
 
 
@@ -234,6 +255,7 @@ def aot_function(
     if not needs_grad:
         with tensorplay.no_grad():
             fw_module, out_spec, _ = _trace_forward(fn, primals, decompositions)
+            fw_module = _functionalize(fw_module, _trace_inputs(primals))
         compiled_fw = inference_compiler(fw_module, primals)
 
         def run_inference(*args: Any) -> Any:
@@ -245,6 +267,9 @@ def aot_function(
 
     joint, out_spec, flat_out, num_fwd, trace_primals, tangents = _trace_joint(
         fn, primals, decompositions
+    )
+    joint = _functionalize(
+        joint, _trace_inputs(trace_primals) + [t.clone() for t in tangents]
     )
     diff_out_mask = [_is_tensor(o) and o.requires_grad for o in flat_out]
     grad_mask = [_is_tensor(p) and p.requires_grad for p in primals]
@@ -315,6 +340,30 @@ def aot_function(
     return run_training
 
 
+def _bind_graph_inputs(module: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[Any]:
+    """Call arguments as the module's graph inputs, in placeholder order.
+
+    A captured graph module takes its program's parameters: keywords and
+    defaults are resolved against its signature.
+    """
+
+    signature = getattr(module, "signature", None)
+    placeholders = getattr(getattr(module, "graph", None), "placeholders", None)
+    if signature is None or placeholders is None:
+        if kwargs:
+            raise TypeError("keyword arguments need a module with a signature")
+        return list(args)
+    if not kwargs and len(args) == len(placeholders):
+        return list(args)
+    bound = signature.bind_partial(*args, **kwargs)
+    bound.apply_defaults()
+    values = []
+    for node in placeholders:
+        key = node.target if isinstance(node.target, str) else node.name
+        values.append(bound.arguments[key] if key in bound.arguments else bound.arguments[node.name])
+    return values
+
+
 def aot_module_simplified(
     module: Any,
     example_inputs: Sequence[Any],
@@ -326,25 +375,24 @@ def aot_module_simplified(
     keep_inference_input_mutations: bool = False,
     **_: Any,
 ) -> Callable[..., Any]:
-    """Compile a module whose parameters and buffers become graph inputs."""
+    """Compile a module whose parameters and buffers become graph inputs.
 
-    from tensorplay.func import functional_call
+    A module's state is what ``named_parameters``/``named_buffers`` report.
+    A captured :class:`GraphModule` reads its state through ``get_attr``
+    nodes resolved against its root, so its state is the tensors those nodes
+    name; they are substituted on the root for each call.
+    """
 
-    named_state = list(_named_state(module))
-    names = [name for name, _ in named_state]
+    names, read_state, substitute = _state_access(module)
     count = len(names)
 
     def flat_fn(*flat: Any) -> Any:
-        # A captured region carries no state of its own (a bare GraphModule
-        # exposes neither named_parameters nor named_buffers); the substituted
-        # state would be empty and functional_call -- whose contract requires
-        # a Module -- would reject the object.  Call it directly instead.
         if count == 0:
             return module(*flat)
-        state = dict(zip(names, flat[:count]))
-        return functional_call(module, state, tuple(flat[count:]))
+        with substitute(dict(zip(names, flat[:count]))):
+            return module(*flat[count:])
 
-    example = [value for _, value in named_state] + list(example_inputs)
+    example = read_state() + list(example_inputs)
     compiled = aot_function(
         flat_fn,
         example,
@@ -356,12 +404,105 @@ def aot_module_simplified(
         keep_inference_input_mutations=keep_inference_input_mutations,
     )
 
-    def forward(*args: Any) -> Any:
-        state = [value for _, value in _named_state(module)]
-        return compiled(*state, *args)
+    def forward(*args: Any, **kwargs: Any) -> Any:
+        return compiled(*read_state(), *_bind_graph_inputs(module, args, kwargs))
 
     forward._tensorplay_aot_graphs = getattr(compiled, "_tensorplay_aot_graphs", ())  # type: ignore[attr-defined]
     return forward
+
+
+def _lift_literal_tensors(module: GraphModule) -> None:
+    """Turn tensors embedded in node arguments into ``get_attr`` nodes.
+
+    Capture records tensors a program closes over (parameters of a module it
+    calls, constants) as literal arguments.  As graph attributes they become
+    inputs of the compiled function, so gradients reach the original tensors.
+    """
+
+    by_id: dict[int, Any] = {}
+    changed = False
+
+    def lift(value: Any, before: Any) -> Any:
+        nonlocal changed
+        if isinstance(value, tensorplay.Tensor):
+            node = by_id.get(id(value))
+            if node is None:
+                name = f"_lifted_tensor_{len(by_id)}"
+                # Instance attribute: generated code and _get_attr both
+                # resolve it without going through the root.
+                object.__setattr__(module, name, value)
+                with module.graph.inserting_before(before):
+                    node = module.graph.get_attr(name)
+                node.meta["val"] = value
+                by_id[id(value)] = node
+            changed = True
+            return node
+        if isinstance(value, tuple):
+            return tuple(lift(v, before) for v in value)
+        if isinstance(value, list):
+            return [lift(v, before) for v in value]
+        if isinstance(value, dict):
+            return {k: lift(v, before) for k, v in value.items()}
+        return value
+
+    for node in list(module.graph.nodes):
+        if node.op in ("placeholder", "get_attr", "output"):
+            continue
+        node.args = lift(node.args, node)
+        node.kwargs = lift(dict(node.kwargs), node)
+    if changed:
+        module.recompile()
+
+
+def _state_access(module: Any):
+    """``(names, read_state, substitute)`` for the tensors a module reads."""
+
+    from tensorplay.nn.utils.stateless import _reparametrize_module
+
+    if isinstance(module, GraphModule):
+        _lift_literal_tensors(module)
+        targets: list[str] = []
+        seen: set[int] = set()
+        for node in module.graph.nodes:
+            if node.op != "get_attr" or node.target in targets:
+                continue
+            value = module._get_attr(node.target)
+            if isinstance(value, tensorplay.Tensor) and id(value) not in seen:
+                seen.add(id(value))
+                targets.append(node.target)
+
+        def read_graph_state() -> list[Any]:
+            return [module._get_attr(target) for target in targets]
+
+        root = module.root
+        owned = module.__dict__
+
+        @contextlib.contextmanager
+        def substitute(state: dict[str, Any]):
+            # Lifted literals live on the graph module itself; module state
+            # lives on the root.
+            local = {k: v for k, v in state.items() if k in owned}
+            rooted = {k: v for k, v in state.items() if k not in owned}
+            saved = {k: owned[k] for k in local}
+            owned.update(local)
+            try:
+                if rooted and root is not None:
+                    with _reparametrize_module(root, rooted):
+                        yield
+                else:
+                    yield
+            finally:
+                owned.update(saved)
+
+        return targets, read_graph_state, substitute
+
+    named = list(_named_state(module))
+    names = [name for name, _ in named]
+
+    def read_module_state() -> list[Any]:
+        return [value for _, value in _named_state(module)]
+
+    return names, read_module_state, lambda state: _reparametrize_module(module, state)
 
 
 def _named_state(module: Any):

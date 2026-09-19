@@ -13,7 +13,7 @@ import types
 from collections.abc import Callable, Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 from tensorplay.graph._utils import (
     GraphCaptureError,
@@ -24,6 +24,9 @@ from tensorplay.graph._utils import (
 
 from . import config
 from .annotations import Final, annotate, isinstance
+
+if TYPE_CHECKING:
+    from tensorplay.compiler._core.registry import InvalidBackend
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -1241,6 +1244,17 @@ def get_backend_capabilities(backend: str | Callable[..., Any]) -> Any:
     return _get(backend)
 
 
+def list_mode_options(mode: str | None = None) -> dict[str, Any]:
+    """Return the optimization options each compile ``mode`` selects.
+
+    With ``mode`` set, returns that mode's option patch; with ``mode`` unset,
+    returns the full mode-to-options mapping.  Unknown modes raise.
+    """
+    from tensorplay.compiler.backends.stax.backend import list_mode_options as _list
+
+    return _list(mode)
+
+
 def __getattr__(name: str) -> Any:
     # The registry module is loaded on demand so importing the facade stays
     # free of backend-host imports.
@@ -1260,8 +1274,4 @@ def __getattr__(name: str) -> Any:
         from tensorplay.compiler._core.registry import declares_capabilities
 
         return declares_capabilities
-    if name == "list_mode_options":
-        from tensorplay.compiler.backends.stax.backend import list_mode_options
-
-        return list_mode_options
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
