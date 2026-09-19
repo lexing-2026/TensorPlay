@@ -327,6 +327,13 @@ class MemoryFormat(IntEnum):
     channels_last = 2
     channels_last_3d = 3
 
+    # Printed as the public module attribute, so generated graph code can
+    # spell the value back.
+    def __repr__(self):
+        return f"tensorplay.{('contiguous_format', 'preserve_format', 'channels_last', 'channels_last_3d')[self.value]}"
+
+    __str__ = __repr__
+
 
 class QScheme(IntEnum):
     """Quantization scheme attached to a quantized tensor's quantizer."""
@@ -341,6 +348,11 @@ class QScheme(IntEnum):
     per_tensor_symmetric = PER_TENSOR_SYMMETRIC
     per_channel_symmetric = PER_CHANNEL_SYMMETRIC
     per_channel_affine_float_qparams = PER_CHANNEL_AFFINE_FLOAT_QPARAMS
+
+    def __repr__(self):
+        return f"tensorplay.{self.name.lower()}"
+
+    __str__ = __repr__
 
 
 per_tensor_affine = QScheme.PER_TENSOR_AFFINE
@@ -369,6 +381,11 @@ class Layout(IntEnum):
     sparse_bsr = 3
     sparse_bsc = 4
     strided = 5
+
+    def __repr__(self):
+        return f"tensorplay.{self.name.lower()}"
+
+    __str__ = __repr__
 
 
 sparse_coo = Layout.SPARSE_COO
