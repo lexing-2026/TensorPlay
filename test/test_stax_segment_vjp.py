@@ -309,21 +309,79 @@ def test_mixed_extern_segment_training_matches_eager_gpu():
 
 
 @pytest.mark.skipif(not st.runtime_available(), reason="Triton/CUDA unavailable")
-def test_extern_uncovered_training_keeps_eager_fallback():
-    """An eager operator without a tangent rule rejects the region; the
-    eager fallback still trains exactly."""
+def _spy_canonical_launches(monkeypatch):
+    """Record lowering launches; the frontend pipeline imports its own
+    backend module instance, so the spy must target the canonical entry
+    (fetched from sys.modules after a warmup compile, never imported
+    directly at test scope)."""
+
+    import sys
+
+    device = tp.device("cuda", 0)
+    tp.compile(lambda a: a * 2, fullgraph=True)(tp.rand(4, device=device))
+    canonical = sys.modules["tensorplay.compiler.backends.stax.codegen.triton"]
+    seen = []
+    original = canonical._autotune_launch
+
+    def spy(name, *args, **kwargs):
+        seen.append(name)
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(canonical, "_autotune_launch", spy)
+    return seen
+
+
+@pytest.mark.skipif(not st.runtime_available(), reason="Triton/CUDA unavailable")
+def test_extern_uncovered_training_uses_engine_vjp(monkeypatch):
+    """An eager operator without a closed-form rule trains through the
+    engine rule (recompute + nested grad) inside the compiled region."""
 
     def fn(t):
-        return t.cumsum(dim=1).sum()
+        return (t * 2).cumsum(dim=1).sum()
 
-    xc = tp.randn(4, 8, device=tp.device("cuda", 0), requires_grad=True)
+    launches = _spy_canonical_launches(monkeypatch)
+    x = tp.randn(4, 8, device=tp.device("cuda", 0), requires_grad=True)
     compiled = tp.compile(fn, fullgraph=True)
-    out = compiled(xc)
-    out.sum().backward()
+    out = compiled(x)
+    out.backward()
+    tp.cuda.synchronize()
+    # fused pointwise and reduction kernels around the extern cumsum
+    assert [name for name in launches if name.startswith("bwd")], launches
 
-    xr = xc.detach().clone().requires_grad_(True)
-    ref = fn(xr)
-    ref.sum().backward()
+    ref_in = x.detach().clone().requires_grad_(True)
+    ref = fn(ref_in)
+    ref.backward()
 
     assert tp.abs(out.cpu() - ref.cpu()).max().item() < 1e-5
-    assert tp.abs(xc.grad.cpu() - xr.grad.cpu()).max().item() < 1e-5
+    assert tp.abs(x.grad.cpu() - ref_in.grad.cpu()).max().item() < 1e-5
+
+
+@pytest.mark.skipif(not st.runtime_available(), reason="Triton/CUDA unavailable")
+def test_extern_engine_vjp_trainable_between_fused_kernels(monkeypatch):
+    """matmul extern segment between fused kernels: the engine rule returns
+    gradients for every floating operand."""
+
+    def fn(t, w):
+        return (t * 2).matmul(w).relu().sum()
+
+    launches = _spy_canonical_launches(monkeypatch)
+    # same-shape operands: the region contract admits one reference shape
+    ts = [
+        tp.randn(8, 8, device=tp.device("cuda", 0), requires_grad=True),
+        tp.randn(8, 8, device=tp.device("cuda", 0), requires_grad=True),
+    ]
+    compiled = tp.compile(fn, fullgraph=True)
+    ins = [v.detach().clone().requires_grad_(True) for v in ts]
+    got = compiled(*ins)
+    got.backward()
+    tp.cuda.synchronize()
+    assert [name for name in launches if name.startswith("bwd")], launches
+
+    ref_ins = [v.detach().clone().requires_grad_(True) for v in ts]
+    ref = fn(*ref_ins)
+    ref.backward()
+
+    # fp32 matmul reassociates the accumulation order against cuBLAS
+    assert tp.abs(got.cpu() - ref.cpu()).max().item() < 1e-4
+    for g, want in zip(ins, ref_ins):
+        assert tp.abs(g.grad.cpu() - want.grad.cpu()).max().item() < 1e-4
