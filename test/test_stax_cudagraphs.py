@@ -57,6 +57,12 @@ class FakeTensor:
         self.data.copy_(other.data)
         return self
 
+    def data_ptr(self):
+        return self.data.data_ptr()
+
+    def stride(self):
+        return tuple(self.data.stride())
+
     def tolist(self):
         return self.data.tolist()
 
@@ -94,28 +100,22 @@ class FakeGraph:
 
     def replay(self):
         assert self.captured
+        # a real recorded graph re-executes its kernels against the captured
+        # input storage; the stand-in recomputes its output the same way
+        if self.recompute is not None:
+            self.recompute()
         self.replays += 1
 
     def reset(self):
         self.resets += 1
 
 
-class FakeGraphBulk(FakeGraph):
-    def stage_and_launch(self, static_inputs, inputs):
-        assert self.captured
-        for dst, src in zip(static_inputs, inputs):
-            dst.copy_(src)
-        if self.recompute is not None:
-            self.recompute()
-        self.replays += 1
-
-
 class FakeNative:
-    CUDAGraph = FakeGraphBulk
+    CUDAGraph = FakeGraph
 
 
 class FakeNativeNoCapture(FakeNative):
-    class CUDAGraph(FakeGraphBulk):
+    class CUDAGraph(FakeGraph):
         def capture_begin(self, *args, **kwargs):
             raise RuntimeError("capture rejected by the driver")
 
@@ -124,8 +124,8 @@ def _twice_artifact(graph):
     """Callable standing in for a compiled kernel: out = in * 2.
 
     During the capture window it registers a recompute hook so the stand-in
-    replay refreshes the static output from the staged static input, the way
-    a real recorded graph re-executes its kernels against those buffers.
+    replay refreshes the static output from the captured input storage, the
+    way a real recorded graph re-executes its kernels against that storage.
     """
 
     def artifact(x):
@@ -221,9 +221,9 @@ def test_skip_reason_clean_region_is_none(fake_cuda_probe):
 # --------------------------------------------------------------------------
 
 
-def test_wrap_and_replay_stages_new_data(fake_cuda_probe):
+def test_wrap_and_replay_reads_captured_storage(fake_cuda_probe):
     gm = _clean_gm()
-    graph = FakeGraphBulk()
+    graph = FakeGraph()
     native = SimpleNamespace(CUDAGraph=lambda: graph)
     artifact = _twice_artifact(graph)
     wrapped, reason = cudagraph_wrap(
@@ -231,24 +231,57 @@ def test_wrap_and_replay_stages_new_data(fake_cuda_probe):
     )
     assert reason is None and isinstance(wrapped, CudagraphCompiledCallable)
 
-    out1 = wrapped(FakeTensor(tp.tensor([3.0])))
+    held = FakeTensor(tp.tensor([3.0]))
+    out1 = wrapped(held)
     assert out1.tolist() == [6.0]
-    out2 = wrapped(FakeTensor(tp.tensor([-4.0])))
+    held.data.copy_(tp.tensor([-4.0]))  # fresh data, same storage
+    out2 = wrapped(held)
+    # the replay re-reads the captured storage live: same graph, new values
     assert out2.tolist() == [-8.0]
     # steady state is a replay, not an artifact call: one launch per call
     assert graph.replays == 2  # first call replays once after capture
     assert graph.captured
 
 
+def test_drifted_input_runs_artifact_directly(fake_cuda_probe):
+    gm = _clean_gm()
+    graph = FakeGraph()
+    native = SimpleNamespace(CUDAGraph=lambda: graph)
+    calls = []
+
+    def artifact(x):
+        calls.append(x.data.tolist())
+        return FakeTensor(x.data * 2)
+
+    wrapped, _ = cudagraph_wrap(artifact, gm, [FakeTensor(tp.tensor([1.0]))], native=native)
+    held = FakeTensor(tp.tensor([3.0]))
+    assert wrapped(held).tolist() == [6.0]
+    assert graph.replays == 1  # capture + same-storage replay
+    # a tensor at a different address cannot be seen by the graph: the call
+    # runs the artifact directly instead
+    other = FakeTensor(tp.tensor([-4.0]))
+    assert wrapped(other).tolist() == [-8.0]
+    assert graph.replays == 1
+    # warmup and the capture window both ran on the first call's tensor
+    assert calls == [[3.0], [3.0], [-4.0]]
+    # drift is transient: the wrapper stays live and replays again for the
+    # captured storage
+    assert wrapped._state == "live"
+    assert wrapped(held).tolist() == [6.0]
+    assert graph.replays == 2
+
+
 def test_replayed_outputs_alias_static_buffers(fake_cuda_probe):
     gm = _clean_gm()
-    graph = FakeGraphBulk()
+    graph = FakeGraph()
     native = SimpleNamespace(CUDAGraph=lambda: graph)
     wrapped, _ = cudagraph_wrap(
         _twice_artifact(graph), gm, [FakeTensor(tp.tensor([1.0]))], native=native
     )
-    first = wrapped(FakeTensor(tp.tensor([1.0])))
-    again = wrapped(FakeTensor(tp.tensor([5.0])))
+    held = FakeTensor(tp.tensor([1.0]))
+    first = wrapped(held)
+    held.data.copy_(tp.tensor([5.0]))
+    again = wrapped(held)
     assert first is again
     # the previous output is overwritten by the next replay
     assert first.tolist() == [10.0]
@@ -275,7 +308,7 @@ def test_capture_failure_falls_back_permanently(fake_cuda_probe):
 
 def test_kwargs_delegate_to_artifact(fake_cuda_probe):
     gm = _clean_gm()
-    graph = FakeGraphBulk()
+    graph = FakeGraph()
     native = SimpleNamespace(CUDAGraph=lambda: graph)
     calls = []
 
@@ -303,7 +336,7 @@ def test_reset_releases_wrapped_graphs(fake_cuda_probe):
     from tensorplay._stax.cudagraphs import CudagraphsBackend
 
     gm = _clean_gm()
-    graph = FakeGraphBulk()
+    graph = FakeGraph()
     native = SimpleNamespace(CUDAGraph=lambda: graph)
     wrapped, _ = cudagraph_wrap(
         _twice_artifact(graph), gm, [FakeTensor(tp.tensor([1.0]))], native=native
@@ -361,16 +394,21 @@ def test_reduce_overhead_replays_compiled_region():
         lambda a: (a * 2).relu().sum(dim=-1), mode="reduce-overhead"
     )
     with tp.no_grad():
-        x1 = tp.randn(4, 8, device="cuda")
-        first = compiled(x1)
-        expected1 = (x1 * 2).relu().sum(dim=-1)
+        x = tp.randn(4, 8, device="cuda")
+        first = compiled(x)
+        expected1 = (x * 2).relu().sum(dim=-1)
         assert (first - expected1).abs().max().item() < 1e-5
-        x2 = tp.randn(4, 8, device="cuda")
-        second = compiled(x2)
-        expected2 = (x2 * 2).relu().sum(dim=-1)
+        x.copy_(tp.randn(4, 8, device="cuda"))  # fresh data, same storage
+        second = compiled(x)
+        expected2 = (x * 2).relu().sum(dim=-1)
         assert (second - expected2).abs().max().item() < 1e-5
         # outputs alias the graph pool: the second replay overwrote the first
         assert first is second
+        # a tensor at a new address cannot be seen by the captured graph;
+        # the call still computes correctly, running the artifact directly
+        y = tp.randn(4, 8, device="cuda")
+        third = compiled(y)
+        assert (third - (y * 2).relu().sum(dim=-1)).abs().max().item() < 1e-5
 
 
 @requires_cuda
@@ -390,7 +428,7 @@ def test_reduce_overhead_falls_back_when_capture_fails(caplog, monkeypatch):
 
     import tensorplay._stax.cudagraphs as cg
 
-    class ExplodingGraph(FakeGraphBulk):
+    class ExplodingGraph(FakeGraph):
         def capture_begin(self, *args, **kwargs):
             raise CudaGraphError("capture rejected by the driver")
 

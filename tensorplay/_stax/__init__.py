@@ -62,6 +62,10 @@ _HISTORICAL_SURFACE = {
     "CodeCache": ("tensorplay.compiler.backends.stax.codecache", "CodeCache"),
     "default_cache": ("tensorplay.compiler.backends.stax.codecache", "default_cache"),
     "CudaGraphError": ("tensorplay.compiler.backends.cudagraphs", "CudaGraphError"),
+    "CudaGraphInputDrift": (
+        "tensorplay.compiler.backends.cudagraphs",
+        "CudaGraphInputDrift",
+    ),
     "CudaGraphManager": ("tensorplay.compiler.backends.cudagraphs", "CudaGraphManager"),
     "Guard": ("tensorplay.compiler._core.guards", "Guard"),
     "GuardChain": ("tensorplay.compiler._core.guards", "GuardChain"),
@@ -167,6 +171,7 @@ __all__ = [
     "AOTError",
     "CodeCache",
     "CudaGraphError",
+    "CudaGraphInputDrift",
     "CudaGraphManager",
     "Guard",
     "GuardChain",
