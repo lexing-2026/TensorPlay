@@ -46,7 +46,7 @@ GEMM_CANDIDATE_CONFIGS: Tuple[Tuple[int, int, int, int, int], ...] = (
 
 # Salt for the persisted decision: bump when the kernel body or the
 # candidate table changes so old decisions cannot pin stale geometry.
-GEMM_TUNING_VERSION = "gemm-v1"
+GEMM_TUNING_VERSION = "gemm-v2"
 
 _DECISION_NAMESPACE = "triton-autotune"
 
@@ -60,12 +60,16 @@ if HAS_TRITON:
         stride_bk, stride_bn,
         stride_cm, stride_cn,
         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-        EVEN_K: tl.constexpr,
+        EVEN_K: tl.constexpr, ALLOW_TF32: tl.constexpr,
     ):
-        """C = A(M,K) @ B(K,N), full-fp32 accumulation (no TF32).
+        """C = A(M,K) @ B(K,N) with fp32 accumulation.
 
-        Output rows/cols wrap with ``% M``/``% N`` so the store needs no
-        separate bounds mask; loads guard the k tail unless EVEN_K.
+        TF32 shortens the multiplier datapath when ``ALLOW_TF32`` is set:
+        the accumulated sum stays fp32 either way, and the reduced mantissa
+        precision is the trade the caller opted into through the global
+        matmul switch.  Output rows/cols wrap with ``% M``/``% N`` so the
+        store needs no separate bounds mask; loads guard the k tail unless
+        EVEN_K.
         """
 
         pid_m = tl.program_id(0)
@@ -84,7 +88,10 @@ if HAS_TRITON:
                 k_tail = K - k * BK
                 a = tl.load(a_ptrs, mask=off_k[None, :] < k_tail, other=0.0)
                 b = tl.load(b_ptrs, mask=off_k[:, None] < k_tail, other=0.0)
-            acc = tl.dot(a, b, acc, input_precision="ieee")
+            if ALLOW_TF32:
+                acc = tl.dot(a, b, acc, input_precision="tf32")
+            else:
+                acc = tl.dot(a, b, acc, input_precision="ieee")
             a_ptrs += BK * stride_ak
             b_ptrs += BK * stride_bk
         c_ptrs = c_ptr + off_m[:, None] * stride_cm + off_n[None, :] * stride_cn
@@ -115,9 +122,32 @@ def _standard_2d(shape: Tuple[int, ...], stride: Tuple[int, ...]) -> bool:
     return unit_row or unit_col
 
 
-def _decision_key(M: int, N: int, K: int, dtype: str, device: str) -> str:
+def _matmul_allow_tf32() -> bool:
+    """The global fp32-matmul precision switch, gated on hardware support.
+
+    TF32 tiles only enter the candidate table when the device executes them
+    natively; the same switch governs the native cuBLAS floor, so candidate
+    and floor stay on one precision footing either way.
+    """
+
+    import tensorplay as tp
+
+    try:
+        if not tp.cuda.is_tf32_supported():
+            return False
+        from tensorplay.backends import cuda as cuda_backends
+
+        return bool(cuda_backends.matmul.allow_tf32)
+    except Exception:  # noqa: BLE001 - precision is an opt-in only
+        return False
+
+
+def _decision_key(
+    M: int, N: int, K: int, dtype: str, device: str, allow_tf32: bool
+) -> str:
     source = (
         f"gemm|{_kernel_source_digest()}|{M}|{N}|{K}|{dtype}|{device}"
+        f"|tf32={int(allow_tf32)}"
     )
     return hashlib.sha256(source.encode()).hexdigest()[:24]
 
@@ -145,6 +175,7 @@ def _triton_launch_factory(
     M: int, N: int, K: int,
     config: Tuple[int, int, int, int, int],
     base_launch: Callable[[list], Any],
+    allow_tf32: bool = False,
 ):
     """Build a launch closure running one fixed GEMM tile configuration.
 
@@ -180,6 +211,7 @@ def _triton_launch_factory(
             out.stride(0), out.stride(1),
             BM=block_m, BN=block_n, BK=block_k,
             EVEN_K=(K % block_k == 0),
+            ALLOW_TF32=allow_tf32,
             num_warps=num_warps, num_stages=num_stages,
         )
         return out
@@ -234,7 +266,8 @@ def tuned_matmul_launch(
     M, K = shape_a
     N = shape_b[1]
     device_key = repr(a.device)
-    cache_key = _decision_key(M, N, K, str(a.dtype), device_key)
+    allow_tf32 = _matmul_allow_tf32()
+    cache_key = _decision_key(M, N, K, str(a.dtype), device_key, allow_tf32)
 
     try:
         from ..codecache import default_cache
@@ -253,6 +286,7 @@ def tuned_matmul_launch(
         return _triton_launch_factory(
             operand_specs[0], operand_specs[1],
             M, N, K, config, base_launch,
+            allow_tf32=bool(choice.get("tf32", False)),
         )
 
     payload = cache.load(cache_key, ext="json")
@@ -273,6 +307,7 @@ def tuned_matmul_launch(
         return _triton_launch_factory(
             operand_specs[0], operand_specs[1],
             M, N, K, candidate[1], base_launch,
+            allow_tf32=allow_tf32,
         )
 
     def bench(launch: Any, args: list) -> float:
@@ -280,15 +315,20 @@ def tuned_matmul_launch(
 
         return bench_launch(launch, args)
 
+    # TF32 tiles trade mantissa precision for tensor-core throughput, so the
+    # gate against the native floor widens accordingly; anything grossly
+    # wrong still loses to the native operator.
+    tolerance = (2e-2, 2e-2) if allow_tf32 else (1e-4, 1e-3)
+
     try:
         best, best_launch, _ = _bench_candidates(build, candidates, probe, bench)
         if best is None or best[0] == "native":
-            record = {"choice": "native"}
+            record = {"choice": "native", "tf32": allow_tf32}
         else:
             reference = base_launch(probe)
             produced = best_launch(probe)
-            if not tp.allclose(produced, reference, rtol=1e-4, atol=1e-3):
-                record = {"choice": "native"}
+            if not tp.allclose(produced, reference, rtol=tolerance[0], atol=tolerance[1]):
+                record = {"choice": "native", "tf32": allow_tf32}
                 best_launch = base_launch
             else:
                 cfg = best[1]
@@ -296,6 +336,7 @@ def tuned_matmul_launch(
                     "choice": "triton",
                     "bm": cfg[0], "bn": cfg[1], "bk": cfg[2],
                     "warps": cfg[3], "stages": cfg[4],
+                    "tf32": allow_tf32,
                 }
         cache.store(cache_key, json.dumps(record).encode(), ext="json")
         return launch_for(record)

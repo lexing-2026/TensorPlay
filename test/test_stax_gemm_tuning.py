@@ -27,11 +27,29 @@ def test_standard_2d_accepts_both_major_orders():
     assert not tg._standard_2d((4, 4), (2, 8))      # overlapping stride
 
 
-def test_decision_key_tracks_shape_and_device():
-    a = tg._decision_key(64, 32, 48, "tensorplay.float32", "cuda:0")
-    assert a == tg._decision_key(64, 32, 48, "tensorplay.float32", "cuda:0")
-    assert a != tg._decision_key(32, 64, 48, "tensorplay.float32", "cuda:0")
-    assert a != tg._decision_key(64, 32, 48, "tensorplay.float32", "cuda:1")
+def test_decision_key_tracks_shape_device_and_precision():
+    a = tg._decision_key(64, 32, 48, "tensorplay.float32", "cuda:0", False)
+    assert a == tg._decision_key(64, 32, 48, "tensorplay.float32", "cuda:0", False)
+    assert a != tg._decision_key(32, 64, 48, "tensorplay.float32", "cuda:0", False)
+    assert a != tg._decision_key(64, 32, 48, "tensorplay.float32", "cuda:1", False)
+    # the precision switch separates decision records: tf32 numerics must
+    # never replay through an ieee decision or vice versa
+    assert a != tg._decision_key(64, 32, 48, "tensorplay.float32", "cuda:0", True)
+
+
+def test_matmul_allow_tf32_gated_by_hardware_and_knob(monkeypatch):
+    import tensorplay.backends.cuda as cuda_backends
+
+    # hardware without native tf32 never opts in, whatever the knob says
+    monkeypatch.setattr(tp.cuda, "is_tf32_supported", lambda: False)
+    assert tg._matmul_allow_tf32() is False
+
+    monkeypatch.setattr(tp.cuda, "is_tf32_supported", lambda: True)
+    monkeypatch.setattr(cuda_backends.matmul, "allow_tf32", True)
+    assert tg._matmul_allow_tf32() is True
+
+    monkeypatch.setattr(cuda_backends.matmul, "allow_tf32", False)
+    assert tg._matmul_allow_tf32() is False
 
 
 def test_tuned_matmul_declines_without_cuda():
@@ -117,3 +135,55 @@ def test_module_region_with_parameters_matches_eager(cache_root):
     x = tp.randn(64, 48, device="cuda")
     compiled = tp.compile(module, mode="max-autotune")
     assert tp.allclose(compiled(x), module(x))
+
+
+@requires_cuda
+def test_tf32_opt_in_persists_flag_and_stays_correct(cache_root, monkeypatch):
+    import tensorplay.backends.cuda as cuda_backends
+
+    monkeypatch.setattr(cuda_backends.matmul, "allow_tf32", True)
+    w = tp.randn(64, 96, device="cuda")
+
+    def fn(x):
+        return x @ w.t()
+
+    x = tp.randn(128, 96, device="cuda")
+    compiled = tp.compile(fn, mode="max-autotune")
+    got = compiled(x)
+    # tf32 shortens the mantissa: compare against a float64 reference within
+    # the accepted precision trade instead of the fp32 gate
+    ref64 = x.double() @ w.t().double()
+    assert tp.allclose(got.double(), ref64, rtol=2e-2, atol=2e-2)
+
+    records = [
+        json.loads(path.read_bytes().decode())
+        for path in cache_root.rglob("*.json")
+    ]
+    gemm_records = [r for r in records if "choice" in r]
+    assert gemm_records, "the matmul extern segment must persist a decision"
+    assert gemm_records[0].get("tf32") is True
+
+
+@requires_cuda
+def test_gemm_decision_replay_skips_benchmarking_with_tf32(cache_root, monkeypatch):
+    import tensorplay.backends.cuda as cuda_backends
+
+    monkeypatch.setattr(cuda_backends.matmul, "allow_tf32", True)
+    w = tp.randn(64, 96, device="cuda")
+
+    def fn(x):
+        return x @ w.t()
+
+    x = tp.randn(128, 96, device="cuda")
+    first = tp.compile(fn, mode="max-autotune")
+    assert tp.allclose(first(x), fn(x), rtol=2e-2, atol=2e-2)
+
+    from tensorplay.compiler.backends.stax.codegen import triton_gemm
+
+    monkeypatch.setattr(
+        triton_gemm,
+        "_bench_candidates",
+        lambda *a, **k: pytest.fail("a persisted decision must not re-bench"),
+    )
+    second = tp.compile(fn, mode="max-autotune")
+    assert tp.allclose(second(x), fn(x), rtol=2e-2, atol=2e-2)
