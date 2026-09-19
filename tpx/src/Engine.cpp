@@ -682,7 +682,12 @@ variable_list Engine::execute(const edge_list& root_edges, const variable_list& 
         graph_task.init_to_execute(*graph_root, outputs, accumulate_grad, min_topo_nr);
     }
 
-    const bool nested = nested_depth() > 0;
+    // Nested when called from inside another execute(), and equally when the
+    // caller is a thread currently evaluating a node of some other graph
+    // (device worker or the initiating thread mid-drain): such a thread can no
+    // longer service its own ready queue, so a task pushed there would never
+    // run -- every task must stay on the local queue this call drains itself.
+    const bool nested = nested_depth() > 0 || current_graph_task != nullptr;
 
     // Queue the root. In nested mode every task stays on a local queue that
     // only this thread drains, so reentrant backward can never deadlock

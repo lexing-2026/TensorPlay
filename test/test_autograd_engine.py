@@ -45,12 +45,47 @@ class TestAutogradEngine(unittest.TestCase):
         x = tp.Tensor([2.0], requires_grad=True)
         y1 = x * x
         y2 = x * x * x
-        
+
         # backward on both
         tp.autograd.backward([y1, y2])
-        
+
         # grad should be dy1/dx + dy2/dx = 2x + 3x^2 = 4 + 12 = 16
         self.assertEqual(x.grad.item(), 16.0)
+
+    def _check_reentrant_grad(self, device):
+        from tensorplay.autograd import enable_grad, Function
+
+        class ReentrantGrad(Function):
+            @staticmethod
+            def forward(ctx, x):
+                ctx.save_for_backward(x)
+                return x * 2
+
+            @staticmethod
+            def backward(ctx, grad):
+                (x,) = ctx.saved_tensors
+                with enable_grad():
+                    # gradient of a dependent graph computed inside backward
+                    (g,) = tp.autograd.grad((x * x).sum(), x)
+                return grad * g
+
+        x = tp.rand(8, device=device, requires_grad=True)
+        ReentrantGrad.apply(x).sum().backward()
+        self.assertEqual(x.grad.shape, (8,))
+
+    def test_reentrant_grad_inside_backward(self):
+        # backward runs with grad mode off; the nested graph needs it on.
+        # The engine must run the nested graph on a queue the current thread
+        # drains itself instead of parking it on a busy device queue.
+        self._check_reentrant_grad(tp.device("cpu"))
+
+    def test_reentrant_grad_inside_backward_cuda(self):
+        if not tp.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        # top-level backward parks on the device worker; the nested grad()
+        # call runs on that worker, so a device-queue enqueue deadlocks.
+        self._check_reentrant_grad(tp.device("cuda", 0))
+
 
 if __name__ == '__main__':
     unittest.main()
