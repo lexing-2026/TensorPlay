@@ -83,6 +83,23 @@ def dims_fields(length: int) -> Tuple[TunableField, ...]:
     raise ValueError(f"unsupported axis-reduction config length: {length}")
 
 
+def split_fields(length: int) -> Tuple[TunableField, ...]:
+    """Field layout for a split-reduction config of ``length`` components.
+
+    The candidate table benches two families side by side: the classic
+    two-kernel form carrying the (XBLOCK, num_warps) pair and the persistent
+    grid-stride form adding the program count as its third slot.  The
+    refinement field set must follow the benchmark winner's arity instead
+    of assuming either family won.
+    """
+
+    if length == 2:
+        return POINTWISE_FIELDS
+    if length == 3:
+        return SPLIT_FIELDS
+    raise ValueError(f"unsupported split-reduction config length: {length}")
+
+
 class CoordinateDescentTuner:
     """One-field-at-a-time refinement around a benchmarked baseline config."""
 
