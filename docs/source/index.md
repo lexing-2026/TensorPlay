@@ -19,6 +19,7 @@ The APIs and performance characteristics of these features may change.
 ```{toctree}
 :maxdepth: 2
 
+guide/index
 tensorplay
 autograd
 nn
