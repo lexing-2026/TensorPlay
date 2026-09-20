@@ -69,19 +69,33 @@ class CodegenContext:
 
     def write(self, filename: str, content: str) -> None:
         path = os.path.join(self.out_dir, filename)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(content)
+        _write_if_changed(path, content)
         self.written[filename] = path
-        print(f'Generated "{path}"')
 
     def write_pkg(self, relname: str, content: str) -> None:
         assert self.pkg_out, "pkg_out not provided"
-        path = os.path.join(self.pkg_out, relname)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(content)
-        print(f'Generated "{path}"')
+        _write_if_changed(os.path.join(self.pkg_out, relname), content)
+
+
+def _write_if_changed(path: str, content: str) -> None:
+    """Write ``content`` unless ``path`` already holds it.
+
+    An unchanged output keeps its timestamp, so a contract edit that touches
+    one generated file does not force every generated translation unit to
+    recompile.
+    """
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            if fh.read() == content:
+                print(f'Unchanged "{path}"')
+                return
+    except FileNotFoundError:
+        pass
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(content)
+    print(f'Generated "{path}"')
 
 
 # ---------------------------------------------------------------------------
@@ -195,11 +209,7 @@ def _gen_pyi(ctx: CodegenContext) -> None:
         outputs = generate_pyi(ctx.funcs, ctx.pyi_template, dtype_header,
                                dtype_binding)
         for name, content in outputs.items():
-            path = os.path.join(out_dir, name)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(content)
-            print(f'Generated "{path}"')
+            _write_if_changed(os.path.join(out_dir, name), content)
 
 
 DEFAULT_TARGETS = ["TensorMethods", "Redispatch", "AutogradNodes", "TPXOps",
