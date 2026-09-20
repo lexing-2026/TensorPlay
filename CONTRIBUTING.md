@@ -159,6 +159,17 @@ The file lives in `test/expect/<Class>.<test>[-<subname>].expect` next to
 the suite. To (re)generate it, run the test with `TP_TEST_ACCEPT=1`; a
 mismatch otherwise shows a diff and names the file to regenerate.
 
+## Sharding a run
+
+The suite can be split across machines without maintaining file lists:
+
+```bash
+pytest --num-shards 3 --shard-id 1   # run a third of every file
+```
+
+Tests are assigned by a stable hash of their id, so shards stay balanced
+and adding tests only moves the new ones.
+
 ## Documentation
 
 Documentation is built using Sphinx.
