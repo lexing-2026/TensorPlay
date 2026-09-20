@@ -21,6 +21,13 @@ The APIs and performance characteristics of these features may change.
 
 guide/index
 tensorplay
+tensor_attributes
+tensor_view
+type_info
+size
+deterministic
+dlpack
+complex_numbers
 autograd
 nn
 nn.functional
