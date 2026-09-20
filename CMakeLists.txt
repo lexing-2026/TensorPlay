@@ -1284,6 +1284,7 @@ set(BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
 set(USE_REDIS OFF CACHE BOOL "" FORCE)
 set(USE_IBVERBS OFF CACHE BOOL "" FORCE)
 set(TP_GLOO_USE_RCCL_SAVE "${USE_RCCL}")
+set(TP_GLOO_USE_NCCL_SAVE "${USE_NCCL}")
 set(USE_NCCL OFF CACHE BOOL "" FORCE)
 set(USE_RCCL OFF)
 set(USE_RCCL OFF CACHE BOOL "" FORCE)
@@ -1313,6 +1314,10 @@ set(GLOO_STATIC_OR_SHARED STATIC CACHE STRING "" FORCE)
     set(USE_CUDA "${TP_GLOO_USE_CUDA_SAVE}" CACHE BOOL "" FORCE)
 set(USE_RCCL "${TP_GLOO_USE_RCCL_SAVE}")
 set(USE_RCCL "${TP_GLOO_USE_RCCL_SAVE}" CACHE BOOL "" FORCE)
+# The project-level switch shares the name with the transport's own knob;
+# restore it so a fresh configure keeps the requested default instead of
+# inheriting the subdirectory's forced-off value.
+set(USE_NCCL "${TP_GLOO_USE_NCCL_SAVE}" CACHE BOOL "" FORCE)
 endif()
 
 if(TP_USE_TENSORPIPE)
