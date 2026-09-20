@@ -82,7 +82,9 @@ print(const.requires_grad)  # False — shared data, but detached from the graph
 the initial gradient you want it to use:
 
 ```python
-loss = (model(x) - target).pow(2).mean()
+x = tp.tensor([1.0, 2.0], requires_grad=True)
+target = tp.tensor([2.0, 2.0])
+loss = ((x * 2 - target) ** 2).mean()
 loss.backward()   # loss is a scalar, fine
 ```
 

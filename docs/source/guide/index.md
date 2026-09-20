@@ -1,17 +1,34 @@
 # Getting Started
 
-This guide is the fastest path from "I just installed TensorPlay" to "I'm training a model."
-It assumes no prior knowledge of TensorPlay, only basic Python. Each page is short, has a
-copy-paste example you can run, and points you to deeper references when you want them.
+This guide is the fastest path from "I just installed TensorPlay" to "I trained a model."
+It is organized as a small series of lessons, each short enough to read and run in one sitting.
+Every example is copy-paste runnable against an installed TensorPlay.
 
 ```{toctree}
 :maxdepth: 1
 
 tensors
-autograd
+datasets
+transforms
 models
+autograd
 training
+saveload
 ```
+
+## The path
+
+Follow the pages in order. Each one builds on the previous.
+
+1. [Tensors](tensors.md) — create, inspect, index, and do math with tensors.
+2. [Datasets and DataLoaders](datasets.md) — organize data and stream it in batches.
+3. [Transforms](transforms.md) — preprocess and augment data before it reaches a model.
+4. [Models](models.md) — build a neural network with `nn.Module`.
+5. [Autograd](autograd.md) — make tensors learnable and get gradients automatically.
+6. [Training](training.md) — the loss + optimizer + loop that makes the model learn.
+7. [Save and Load](saveload.md) — keep the trained weights and checkpoints.
+
+After those seven lessons you can train, evaluate, and persist a real model.
 
 ## What TensorPlay is
 
@@ -24,8 +41,9 @@ every line of code:
   scalar loss you can call `loss.backward()` and get the gradient of that loss with respect
   to every tensor that was involved (`tensorplay.autograd`).
 - **A neural-network toolkit** — layers and models expressed as `tensorplay.nn.Module`,
-  optimizers such as `SGD` and `Adam` (`tensorplay.optim`), and data helpers such as
-  `DataLoader` and `TensorDataset` (`tensorplay.utils.data`).
+  optimizers such as `SGD` and `Adam` (`tensorplay.optim`), vision transforms
+  (`tensorplay.vision.transforms`), and data helpers such as `DataLoader` and
+  `TensorDataset` (`tensorplay.utils.data`).
 
 A defining design choice: the engine is explicit and readable. The graph that `backward()`
 walks is real code you can step through, which makes TensorPlay a good place to *learn* how
@@ -46,18 +64,6 @@ print(x.grad)  # tensor([2., 4., 6.])
 ```
 
 If that prints `2 4 6` as a gradient, your installation is working.
-
-## A learning path
-
-The four pages above walk you through a single arc, in order. Each one depends on the
-previous, so start at the beginning if you are new.
-
-| Page | You will learn | You end up able to |
-| --- | --- | --- |
-| [Tensors](tensors.md) | creating, inspecting, indexing, and combining tensors | move data in and out of tensors and do vectorized math |
-| [Autograd](autograd.md) | `requires_grad`, `backward()`, `.grad`, `no_grad` | compute gradients for the parameters of any model |
-| [Models](models.md) | `nn.Module`, layers, parameters, `state_dict` | define and inspect a neural network |
-| [Training](training.md) | loss, optimizer, `DataLoader`, the training loop | train a real classifier and save the trained model |
 
 ## Where to go next
 
