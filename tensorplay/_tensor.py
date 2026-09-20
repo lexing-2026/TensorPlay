@@ -399,21 +399,20 @@ def _cf(name):
     return getattr(_composite_funcs, name)
 
 
-def _as_tensor(x):
+def _as_tensor(x, device=None):
     from . import as_tensor
-    return as_tensor(x)
+    return as_tensor(x, device=device)
 
 
 # floor_divide/remainder/fmod/true_divide are native methods; only the
 # reflected forms need a wrapper, since the left operand arrives as a plain
-# Python number.
+# Python number.  The materialized number joins the right operand's device.
 def __rfloordiv__(self, other):
-    return _as_tensor(other).floor_divide(self)
+    return _as_tensor(other, device=self.device).floor_divide(self)
 
 
 def __rmod__(self, other):
-    import tensorplay
-    return tensorplay.remainder(other, self)
+    return _as_tensor(other, device=self.device).remainder(self)
 
 
 Tensor.__rfloordiv__ = __rfloordiv__
