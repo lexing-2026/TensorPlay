@@ -52,6 +52,7 @@ distributed
 distributed.device_mesh
 distributed.tensor
 distributed.tensor.parallel
+distributed.fsdp
 distributions
 func
 profiler
