@@ -23,6 +23,13 @@ def _is_module(value: Any) -> bool:
         getattr(value, "named_children", None)
     )
 
+
+# Marks a value that carries no concrete sample yet.  Distinct from a
+# literal ``None`` argument, which is a legitimate value that must flow
+# through sample execution unchanged.
+_UNRESOLVED = object()
+
+
 class Tracer:
     """Capture a callable into the canonical graph.
 
@@ -138,31 +145,49 @@ class Tracer:
     def resolve_sample(self, value: Any) -> Any:
         """Resolve the concrete sample behind a captured value.
 
-        Proxies look up ``_node_samples``; containers recurse (returning
-        ``None`` when any element is unresolved); everything else is itself.
+        Proxies look up ``_node_samples``; containers recurse (returning the
+        ``_UNRESOLVED`` sentinel when any element is unresolved); everything
+        else — including a literal ``None`` passed as an argument value — is
+        itself.
         """
 
         if isinstance(value, Proxy):
-            return self._node_samples.get(value.node.name)
+            sample = self._node_samples.get(value.node.name)
+            return _UNRESOLVED if sample is None else sample
         if isinstance(value, Node):
-            return self._node_samples.get(value.name)
+            sample = self._node_samples.get(value.name)
+            return _UNRESOLVED if sample is None else sample
         if isinstance(value, tuple):
             resolved = [self.resolve_sample(item) for item in value]
-            return None if any(item is None for item in resolved) else tuple(resolved)
+            return (
+                _UNRESOLVED if any(item is _UNRESOLVED for item in resolved)
+                else tuple(resolved)
+            )
         if isinstance(value, list):
             resolved = [self.resolve_sample(item) for item in value]
-            return None if any(item is None for item in resolved) else resolved
+            return (
+                _UNRESOLVED if any(item is _UNRESOLVED for item in resolved)
+                else resolved
+            )
         if isinstance(value, dict):
             resolved = {
                 key: self.resolve_sample(item) for key, item in value.items()
             }
-            return None if any(item is None for item in resolved.values()) else resolved
+            return (
+                _UNRESOLVED
+                if any(item is _UNRESOLVED for item in resolved.values())
+                else resolved
+            )
         if isinstance(value, slice):
             start = self.resolve_sample(value.start)
             stop = self.resolve_sample(value.stop)
             step = self.resolve_sample(value.step)
-            if start is None or stop is None or step is None:
-                return None
+            if (
+                start is _UNRESOLVED
+                or stop is _UNRESOLVED
+                or step is _UNRESOLVED
+            ):
+                return _UNRESOLVED
             return slice(start, stop, step)
         return value
 
@@ -188,7 +213,7 @@ class Tracer:
             return
         sample_args = self.resolve_sample(args)
         sample_kwargs = self.resolve_sample(kwargs)
-        if sample_args is None or sample_kwargs is None:
+        if sample_args is _UNRESOLVED or sample_kwargs is _UNRESOLVED:
             return
 
         def _run() -> Any:
@@ -307,6 +332,17 @@ class Tracer:
                     # branches resolve at capture time.  The placeholder
                     # stays so the graph keeps the caller's signature.
                     values[parameter.name] = None
+                elif (
+                    sample is not None
+                    and callable(sample)
+                    and not isinstance(sample, (Proxy, Node))
+                ):
+                    # Callable inputs (score and mask modifiers, closures)
+                    # cannot be graph values, so the traced body gets the
+                    # constant and calls straight into it; the value
+                    # signature keys on the callable's identity, so a
+                    # different callable recompiles.
+                    values[parameter.name] = sample
                 else:
                     values[parameter.name] = self.proxy(placeholder_node)
 

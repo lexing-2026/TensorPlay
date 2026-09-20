@@ -290,6 +290,34 @@ class GraphAppendingTracer(TracerBase):
         self.node_name_to_scope: dict[str, tuple[str, type[Any] | None]] = {}
 
 
+# Marks "the container has no such element"; distinct from None, which is a
+# legitimate element value.
+_NO_ELEMENT = object()
+
+
+def _container_element(sample: Any, key: Any) -> Any:
+    """Concrete element of a sampled container, or ``_NO_ELEMENT``.
+
+    Tensor and nested-container elements are left symbolic (returning the
+    sentinel): tensors are graph values that must keep their extraction
+    node, and nested containers may hold tensors of their own.  Every other
+    plain Python value — a callable, a scalar, a module — is returned
+    concretely.
+    """
+
+    try:
+        element = sample[key]
+    except (IndexError, TypeError, KeyError):
+        return _NO_ELEMENT
+    import tensorplay as _tensorplay
+
+    if isinstance(element, (_tensorplay.Tensor, Proxy, Node)):
+        return _NO_ELEMENT
+    if isinstance(element, (tuple, list, dict)):
+        return _NO_ELEMENT
+    return element
+
+
 class Proxy:
     """Symbolic value used while the frontend captures Python operations.
 
@@ -388,6 +416,16 @@ class Proxy:
         return self._unary(operator.pos)
 
     def __getitem__(self, key: Any) -> "Proxy":
+        # A container-typed sample whose element is a plain Python value (a
+        # callable, a scalar, ...) resolves concretely: such elements are not
+        # graph values, and their extraction is part of the compile
+        # signature the way other metadata is.  Tensor elements stay symbolic.
+        if isinstance(key, (int, slice)) and not isinstance(key, bool):
+            sample = self._sample()
+            if isinstance(sample, (tuple, list)):
+                element = _container_element(sample, key)
+                if element is not _NO_ELEMENT:
+                    return element
         return self.tracer.create_proxy("call_function", operator.getitem, (self, key), {})
 
     def __abs__(self) -> "Proxy":
