@@ -134,7 +134,7 @@ We use `pytest` for testing.
 pytest
 
 # Run specific test file
-pytest test/test_tensor_basic.py
+pytest test/test_tensor_methods.py
 ```
 
 Flaky test? Rerun automatically to confirm:
