@@ -17,26 +17,15 @@
 
 #include <cuda_runtime.h>
 
-// The persistent tensor-op route below consumes the standalone CUTLASS
-// headers through the include directory the build adds only when a vendored
-// tree is present.  Builds without that tree (and the HIP lane) keep the
-// plain per-group cuBLAS fallback in grouped_mm; the guard hides the whole
-// route and leaves a stub that declines every dispatch.
-#if !defined(USE_ROCM) && __has_include("cutlass/cutlass.h") && \
-    __has_include("cutlass/gemm/device/gemm_grouped.h")
-#define TP_GROUPED_GEMM_TENSOR_OP 1
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm_grouped.h"
 #include "cutlass/gemm/kernel/default_gemm_grouped.h"
 #include "cutlass/gemm/threadblock/threadblock_swizzle.h"
-#endif
 
 #include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
-
-#if defined(TP_GROUPED_GEMM_TENSOR_OP)
 
 namespace tensorplay {
 namespace cuda {
@@ -546,20 +535,5 @@ bool try_grouped_gemm_tensor_op(const Tensor& self, const Tensor& mat2,
         n_dim, /*b_col=*/false, 128, 64, sm_count, stream);
 }
 
-#else
-
-namespace tensorplay {
-namespace cuda {
-
-// No vendored CUTLASS tree: grouped_mm stays on its per-group cuBLAS
-// fallback, so every dispatch is declined here.
-bool try_grouped_gemm_tensor_op(const Tensor&, const Tensor&,
-                                const Tensor&, Tensor&, const int64_t*,
-                                int64_t) {
-    return false;
-}
-
 }  // namespace cuda
 }  // namespace tensorplay
-
-#endif  // TP_GROUPED_GEMM_TENSOR_OP
