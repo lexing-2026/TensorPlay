@@ -53,6 +53,9 @@ distributed.device_mesh
 distributed.tensor
 distributed.tensor.parallel
 distributed.fsdp
+distributed.checkpoint
+distributed.elastic
+distributed.rpc
 distributions
 func
 profiler
