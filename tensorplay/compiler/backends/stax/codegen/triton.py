@@ -2200,7 +2200,7 @@ def _autotune_split_program(
         from ..runtime import coordinate_descent
 
         best_cfg, best_launch = coordinate_descent.refiner_for(
-            coordinate_descent.SPLIT_FIELDS
+            coordinate_descent.split_fields(len(best_cfg))
         )(build, best_cfg, list(example_inputs))
     record = {"xblock": best_cfg[0], "warps": best_cfg[1]}
     if len(best_cfg) > 2:

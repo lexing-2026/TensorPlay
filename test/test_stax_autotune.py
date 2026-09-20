@@ -710,3 +710,24 @@ def test_refiner_for_matches_pick_config_protocol(cache_root):
         bench_fn=lambda launch, args: cost[launch],
     )
     assert config == (256, 8)
+
+
+def test_split_fields_dispatch_matches_config_arity():
+    # the classic two-kernel (XBLOCK, warps) pair and the persistent
+    # (XBLOCK, warps, NPROG) triple refine with their own field layouts
+    assert cd.split_fields(2) == cd.POINTWISE_FIELDS
+    assert cd.split_fields(3) == cd.SPLIT_FIELDS
+    with pytest.raises(ValueError):
+        cd.split_fields(4)
+
+
+def test_coordinate_descent_refines_two_slot_split_winner():
+    # a classic-form winner walks its own two slots; the walk never touches
+    # a third (persistent-only) tuple position
+    cost = {(2048, 8): 1.0, (4096, 8): 0.6, (2048, 4): 0.9, (1024, 8): 1.1}
+    tuner = cd.CoordinateDescentTuner(
+        cd.split_fields(2), bench_fn=lambda launch, args: cost[launch]
+    )
+    config, launch = tuner.refine(lambda c: c, (2048, 8), [])
+    assert config == (4096, 8)
+    assert launch == (4096, 8)
