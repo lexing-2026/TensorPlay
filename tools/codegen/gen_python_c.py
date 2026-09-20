@@ -844,10 +844,11 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
     fn_table: list[str] = []
     meth_table: list[str] = []
     # descriptors), not methods -- their zero-arg method wrappers double as
-    # property getters.  T/H are hand-written pybind properties; the rest of
-    # the transposed-view family (mT, mH, adjoint, matrix_H) reuses the same
-    # shape through the generated getter shim.
-    property_methods = {"real", "imag", "mT", "mH", "adjoint", "matrix_H"}
+    # property getters.  T/H are hand-written pybind properties; the
+    # transposed-view family (mT, mH) reuses the same shape through the
+    # generated getter shim.  adjoint and matrix_H stay methods: their
+    # documented and functional surfaces call them with parentheses.
+    property_methods = {"real", "imag", "mT", "mH"}
     prop_table: list[str] = []
     claimed = plan_groups(ctx.funcs)
     for (variant, cname), fs in sorted(claimed.items()):
