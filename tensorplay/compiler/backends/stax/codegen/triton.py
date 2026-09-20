@@ -33,6 +33,9 @@ except ImportError:  # pragma: no cover - exercised on CPU-only installs
 # folding detector treats absence as "op not available" instead of failing at
 # kernel-compile time (backend failures are hard compiler errors).
 HAS_TL_ARGMAX = HAS_TRITON and hasattr(tl, "argmax")
+# Pair reductions over the lowest value (min(dim)) carry their index stream
+# with ``tl.argmin``; same availability contract as argmax.
+HAS_TL_ARGMIN = HAS_TRITON and hasattr(tl, "argmin")
 
 from tensorplay.graph import Graph, GraphModule, Node
 from tensorplay.graph._utils import _map_arg
@@ -43,7 +46,7 @@ from ..scheduler import segment_graph
 # EMITTER changes semantics (masking, NaN handling, launcher allocation,
 # load cache annotations, new fused opcodes) so stale generated sources
 # cannot be replayed against a new compiler.
-_CODEGEN_VERSION = "m9-2026-08-30-pw-surface"
+_CODEGEN_VERSION = "m10-2026-09-20-loop-pass-pair"
 from ..backend import (
     _CPU_FUSED_AUTOGRAD_OPS,
     _CPU_FUSED_OPS,
@@ -243,8 +246,11 @@ class ReductionSpec:
     ``keepdim``: whether reduced axes stay as size-1 dimensions
 
     ``argmax`` is an *index* reduction: the kernel carries a value stream and
-    an index stream side by side (the dual-output skeleton) but v1 stores only
-    It requires explicit dims and float32/float64 inputs.
+    an index stream side by side and stores the index stream only; it
+    requires explicit dims and float32/float64 inputs.  ``max``/``min`` WITH
+    an axis are *pair* reductions (``is_pair``): the same dual-stream kernel
+    stores one output per consumed projection — "values", "indices" — as the
+    segment's exports.
     """
 
     __slots__ = ("op", "dims", "keepdim")
@@ -293,6 +299,12 @@ class ReductionSpec:
     @property
     def tracks_indices(self) -> bool:
         return self.op == "argmax"
+
+    @property
+    def is_pair(self) -> bool:
+        """True for ``max(dim)``/``min(dim)``: value+index pair output."""
+
+        return self.op in ("max", "min") and bool(self.dims)
 
     @property
     def is_full(self) -> bool:
@@ -452,6 +464,7 @@ class TritonProgramCodegen:
         reference_shape: tuple[int, ...] | None = None,
         value_dtype: str | None = None,
         epilogue: tuple[list[int], list[float], int] | None = None,
+        reduction_outputs: tuple[str, ...] | None = None,
     ) -> None:
         if len(program) % 3:
             raise ValueError("Triton Stax program must contain triples")
@@ -464,14 +477,23 @@ class TritonProgramCodegen:
             if len(eprogram) % 3:
                 raise ValueError("epilogue program must contain triples")
             if reduction is None or (
-                isinstance(reduction, ReductionSpec) and reduction.tracks_indices
+                isinstance(reduction, ReductionSpec)
+                and (reduction.tracks_indices or reduction.is_pair)
             ):
-                # Index reductions emit an int64 stream; float pointwise on
-                # top of it is meaningless, and plain pw needs no acc.
+                # Index-carrying reductions emit an int64 stream; float
+                # pointwise on top of it is meaningless, and plain pw needs
+                # no acc.
                 raise ValueError(
                     "reduction epilogues require a value reduction"
                 )
         self.epilogue = epilogue
+        if reduction_outputs is not None and not all(
+            kind in ("values", "indices") for kind in reduction_outputs
+        ):
+            raise ValueError(
+                f"unsupported reduction output kinds: {reduction_outputs!r}"
+            )
+        self.reduction_outputs = reduction_outputs
         if isinstance(reduction, ReductionSpec):
             self.reduction_spec: ReductionSpec | None = reduction
         elif reduction == "sum":
@@ -762,32 +784,73 @@ class TritonProgramCodegen:
         split_reduction = full_reduction and not single_reduction
         dims_reduction = spec is not None and not spec.is_full
 
-        body: list[str] = [
-            "xoffset = tl.program_id(0) * XBLOCK",
-            # AxisInfo hint: proves contiguity+alignment of every xindex
-            # derived access, unlocking vectorized ld/st through the
-            # multiple_of annotation.
-            "xoffset = tl.multiple_of(xoffset, XBLOCK)",
-            "xindex = xoffset + tl.arange(0, XBLOCK)",
-            "xmask = xindex < xnumel",
-        ]
         numel_total = (
             _prod(self.reference_shape)
             if self.reference_shape is not None
             else None
         )
+        # Loop-pass vectorize width (pointwise kernels only — the reduction
+        # families carry their own iteration spaces).  The row-uniform mask
+        # contract needs the element count to divide the width.
+        vec = 1
+        if (
+            fixed_config is not None
+            and len(fixed_config) > 2
+            and spec is None
+            and numel_total is not None
+            and numel_total % int(fixed_config[2]) == 0
+        ):
+            vec = int(fixed_config[2])
+
+        body: list[str]
+        if vec > 1:
+            # Packed iteration space: each lane owns VEC consecutive
+            # elements, so one load/store covers one contiguous segment and
+            # the backend emits vector memory instructions.  The mask is
+            # row-uniform (xnumel % VEC == 0 makes a row full whenever its
+            # base is in-bounds), which keeps the vector access intact in
+            # the last partial block.
+            body = [
+                f"xoffset = tl.program_id(0) * XBLOCK * {vec}",
+                # AxisInfo hint: proves contiguity+alignment of every xindex
+                # derived access, unlocking vectorized ld/st through the
+                # multiple_of annotation.
+                f"xoffset = tl.multiple_of(xoffset, XBLOCK * {vec})",
+                "xrow = tl.arange(0, XBLOCK)",
+                "xlane = tl.arange(0, VEC)",
+                "xindex = xoffset + xrow[:, None] * VEC + xlane[None, :]",
+                f"xmask = (xoffset + xrow * {vec})[:, None] < xnumel",
+            ]
+        else:
+            body = [
+                "xoffset = tl.program_id(0) * XBLOCK",
+                # AxisInfo hint: proves contiguity+alignment of every xindex
+                # derived access, unlocking vectorized ld/st through the
+                # multiple_of annotation.
+                "xoffset = tl.multiple_of(xoffset, XBLOCK)",
+                "xindex = xoffset + tl.arange(0, XBLOCK)",
+                "xmask = xindex < xnumel",
+            ]
         if dims_reduction:
             assert self.reference_shape is not None and spec is not None
             block, warps, rblock, stages_default = _dim_reduction_config(
                 self.reference_shape, spec
             )
             stages = stages_default
+            # Loop-pass knobs (extended dims-config tail): reduction-r-loop
+            # unroll factor and main/tail split flag.  Both default to the
+            # loop-neutral emission.
+            unroll = 1
+            tail_split = False
             if fixed_config is not None:
                 block, warps = fixed_config[0], fixed_config[1]
                 if len(fixed_config) > 3:
                     rblock, stages = fixed_config[2], fixed_config[3]
                 elif len(fixed_config) > 2:
                     stages = fixed_config[2]
+                if len(fixed_config) > 5:
+                    unroll = int(fixed_config[4])
+                    tail_split = bool(fixed_config[5])
             reference = self.reference_shape
             rank = len(reference)
             reduced_dims = tuple(dim % rank for dim in spec.dims)
@@ -936,13 +999,16 @@ class TritonProgramCodegen:
                     expr = f"{expr} + xindex[:, None] * 0" if expr != "0" else "xindex[:, None] * 0"
                 return expr
 
-            tracks_indices = spec.tracks_indices
+            dual_stream = spec.tracks_indices or spec.is_pair
             persistent = rnumel <= rblock
-            if tracks_indices:
+            # Split applicability: only a loop whose tile does not exactly
+            # divide the reduction space has a masked tail to peel.
+            split_tail = tail_split and not persistent and not div_r
+            if dual_stream:
                 body.append(
                     f"acc = tl.full([XBLOCK], {spec.neutral()}, dtype={self.value_type})"
                 )
-                # Index stream: the running argmax in flat reduced-space
+                # Index stream: the running winner in flat reduced-space
                 # coordinates (same order the r-loop enumerates).
                 body.append("acci = tl.zeros([XBLOCK], dtype=tl.int64)")
             else:
@@ -950,111 +1016,166 @@ class TritonProgramCodegen:
                     f"acc = tl.full([XBLOCK], {spec.neutral()}, dtype=tl.float32)"
                 )
             pfx = "" if persistent else "    "
-            if not persistent:
-                body.append(
-                    f"for roffset in tl.range(0, {rnumel}, RBLOCK, "
-                    f"num_stages={stages}):"
-                )
-            inner = [
-                (
-                    "rindex = tl.arange(0, RBLOCK)"
-                    if persistent
-                    else "rindex = roffset + tl.arange(0, RBLOCK)"
-                ),
-            ]
-            if not div_r:
-                inner.append("rmask = rindex < %d" % rnumel)
-            if div_x and div_r:
-                mask_text = ""          # every lane valid
-            elif div_r:
-                mask_text = "xmask[:, None]"
-            elif div_x:
-                mask_text = "rmask[None, :]"
-            else:
-                mask_text = "m2"
-                inner.append("m2 = rmask[None, :] & xmask[:, None]")
-            for index in range(self.input_count):
-                inner.append(f"in_off{index} = {_input_offset(index)}")
-                # Reduction tiles stream through L2 exactly once, so give the
-                # lines evict-first priority — the rule for every load
-                # inside a reduction loop; persistent single-tile reads keep
-                # it too (the tile is still read-once).
-                if mask_text:
-                    inner.append(
-                        f"in{index} = tl.load(in_ptr{index} + in_off{index}, "
-                        f"eviction_policy='evict_first', "
-                        f"mask={mask_text}, other={spec.neutral()})"
+
+            if dual_stream:
+                # Priority-stream polarity: max-family scans for the greatest
+                # value, min-family for the lowest.  tl.argmax/tl.argmin
+                # break ties toward the lower lane, and combining chunks with
+                # a strict compare keeps the earlier chunk, so the global
+                # winner is the first extremum — the value-selection tie
+                # rule.  NaN ordering is explicit: several triton versions
+                # ignore NaNs inside reductions.  A finite sentinel ranks NaN
+                # beyond every real value (above for max, below for min),
+                # letting cval double as the has-NaN flag without a second
+                # reduction per chunk.
+                if spec.op == "min":
+                    sentinel, cmp, val_fn, win_fn = (
+                        "-1.0e38", "<", "tl.min", "tl.argmin",
                     )
                 else:
-                    inner.append(
-                        f"in{index} = tl.load(in_ptr{index} + in_off{index}, "
-                        "eviction_policy='evict_first')"
+                    sentinel, cmp, val_fn, win_fn = (
+                        "1.0e38", ">", "tl.max", "tl.argmax",
                     )
-            body.extend(textwrap.indent(line, pfx) for line in inner)
-            body.extend(
-                textwrap.indent(line, pfx)
-                for line in self._program_lines(
-                    self.program, self._ref, "tmp"
-                )
-            )
-            last = self._ref(self.output_refs[0])
-            # The pointwise program transforms padded lanes' neutral loads
-            # into non-neutral values (sigmoid(0) = 0.5 and friends), so the
-            # reduction must re-mask its INPUT — unless the r-tile is exact.
-            if div_r:
-                last_masked = last
+
+            def emit_r_tile(rbase: str, exact: bool, indent: str) -> None:
+                """Emit loads + program + combine for ONE r-tile at ``rbase``.
+
+                ``exact`` marks a tile whose lanes are all in-bounds (no
+                rmask predication); ``indent`` prefixes every line (loop
+                bodies are indented, a peeled tail is not).
+                """
+
+                inner = [f"rindex = {rbase} + tl.arange(0, RBLOCK)"]
+                if not exact:
+                    inner.append(f"rmask = rindex < {rnumel}")
+                if div_x and exact:
+                    mask_text = ""          # every lane valid
+                elif exact:
+                    mask_text = "xmask[:, None]"
+                elif div_x:
+                    mask_text = "rmask[None, :]"
+                else:
+                    mask_text = "m2"
+                    inner.append("m2 = rmask[None, :] & xmask[:, None]")
+                for index in range(self.input_count):
+                    inner.append(f"in_off{index} = {_input_offset(index)}")
+                    # Reduction tiles stream through L2 exactly once, so give the
+                    # lines evict-first priority — the rule for every load
+                    # inside a reduction loop; persistent single-tile reads keep
+                    # it too (the tile is still read-once).
+                    if mask_text:
+                        inner.append(
+                            f"in{index} = tl.load(in_ptr{index} + in_off{index}, "
+                            f"eviction_policy='evict_first', "
+                            f"mask={mask_text}, other={spec.neutral()})"
+                        )
+                    else:
+                        inner.append(
+                            f"in{index} = tl.load(in_ptr{index} + in_off{index}, "
+                            "eviction_policy='evict_first')"
+                        )
+                inner.extend(self._program_lines(self.program, self._ref, "tmp"))
+                body.extend(textwrap.indent(line, indent) for line in inner)
+                last = self._ref(self.output_refs[0])
+                # The pointwise program transforms padded lanes' neutral loads
+                # into non-neutral values (sigmoid(0) = 0.5 and friends), so
+                # the reduction must re-mask its INPUT — unless the r-tile is
+                # exact.
+                if exact:
+                    last_masked = last
+                else:
+                    last_masked = (
+                        f"tl.where(rmask[None, :], {last}, {spec.neutral()})"
+                    )
+                if dual_stream:
+                    body.append(f"{indent}isnan_ = {last_masked} != {last_masked}")
+                    body.append(
+                        f"{indent}prio = tl.where(isnan_, {sentinel}, {last_masked})"
+                    )
+                    body.append(f"{indent}cval = {val_fn}(prio, axis=1)")
+                    body.append(
+                        f"{indent}cwin = {win_fn}(prio, axis=1) + {rbase}"
+                    )
+                    body.append(f"{indent}live = acc == acc")
+                    body.append(
+                        f"{indent}hit = ((cval {cmp} acc) | (cval == {sentinel})) & live"
+                    )
+                    body.append(
+                        f"{indent}acci = tl.where(hit, cwin.to(tl.int64), acci)"
+                    )
+                    body.append(
+                        f"{indent}acc = tl.where((cval == {sentinel}) & live, "
+                        f"float('nan'), tl.where((cval {cmp} acc) & live, cval, acc))"
+                    )
+                else:
+                    body.append(
+                        f"{indent}chunk = {spec.finalize_call(last_masked + ', axis=1')}"
+                    )
+                    body.append(f"{indent}acc = {_ACC_UPDATE[spec.op]}")
+
+            if persistent:
+                emit_r_tile("0", div_r, "")
             else:
-                last_masked = (
-                    f"tl.where(rmask[None, :], {last}, {spec.neutral()})"
-                )
-            chunk_offset_add = "" if persistent else " + roffset"
-            if tracks_indices:
-                # Per-chunk winners over the priority stream.  tl.argmax
-                # breaks ties toward the lower lane, and combining chunks
-                # with a strict ``>`` keeps the earlier chunk, so the global
-                #
-                # NaN ordering is explicit: several triton versions ignore
-                # greatest value (first NaN wins).  A finite sentinel ranks
-                # NaN above every real value, letting cval double as the
-                # has-NaN flag without a second reduction per chunk.
-                body.append(f"{pfx}isnan_ = {last_masked} != {last_masked}")
-                body.append(
-                    f"{pfx}prio = tl.where(isnan_, 1.0e38, {last_masked})"
-                )
-                body.append(f"{pfx}cval = tl.max(prio, axis=1)")
-                body.append(
-                    f"{pfx}cwin = tl.argmax(prio, axis=1){chunk_offset_add}"
-                )
-                body.append(f"{pfx}live = acc == acc")
-                body.append(
-                    f"{pfx}hit = ((cval > acc) | (cval == 1.0e38)) & live"
-                )
-                body.append(f"{pfx}acci = tl.where(hit, cwin.to(tl.int64), acci)")
-                body.append(
-                    f"{pfx}acc = tl.where((cval == 1.0e38) & live, float('nan'), "
-                    f"tl.where((cval > acc) & live, cval, acc))"
-                )
-            else:
-                body.append(
-                    f"{pfx}chunk = {spec.finalize_call(last_masked + ', axis=1')}"
-                )
-                body.append(f"{pfx}acc = {_ACC_UPDATE[spec.op]}")
+                range_kwargs = f"num_stages={stages}"
+                if unroll > 1:
+                    range_kwargs += f", loop_unroll_factor={unroll}"
+                if split_tail:
+                    # Main part: full tiles only — every lane in-bounds, so
+                    # the loop body carries no r-side predication.  The
+                    # remainder runs once after the loop, masked.
+                    rmain = rnumel - rnumel % rblock
+                    body.append(
+                        f"for roffset in tl.range(0, {rmain}, RBLOCK, "
+                        f"{range_kwargs}):"
+                    )
+                    emit_r_tile("roffset", True, "    ")
+                    emit_r_tile(repr(rmain), False, "")
+                else:
+                    body.append(
+                        f"for roffset in tl.range(0, {rnumel}, RBLOCK, "
+                        f"{range_kwargs}):"
+                    )
+                    emit_r_tile("roffset", div_r, "    ")
             if spec.op == "mean":
                 body.append(f"acc = acc * {repr(1.0 / rnumel)}")
-            store_source = "acci" if tracks_indices else "acc"
-            if self.epilogue is not None and not tracks_indices:
-                epilogue_lines, epilogue_last = self._epilogue_lines("acc")
-                body.extend(epilogue_lines)
-                store_source = epilogue_last
-            if div_x:
-                body.append(f"tl.store(out_ptr0 + xindex, {store_source})")
+            if dual_stream:
+                out_kinds = self.reduction_outputs
+                if spec.is_pair:
+                    if not out_kinds:
+                        raise ValueError(
+                            "pair reduction without value/index projections"
+                        )
+                elif out_kinds is None:
+                    out_kinds = ("indices",)
+                for port, kind in enumerate(out_kinds):
+                    store_source = "acci" if kind == "indices" else "acc"
+                    if div_x:
+                        body.append(
+                            f"tl.store(out_ptr{port} + xindex, {store_source})"
+                        )
+                    else:
+                        body.append(
+                            f"tl.store(out_ptr{port} + xindex, "
+                            f"{store_source}, mask=xmask)"
+                        )
             else:
-                body.append(
-                    f"tl.store(out_ptr0 + xindex, {store_source}, mask=xmask)"
-                )
+                store_source = "acc"
+                if self.epilogue is not None:
+                    epilogue_lines, epilogue_last = self._epilogue_lines("acc")
+                    body.extend(epilogue_lines)
+                    store_source = epilogue_last
+                if div_x:
+                    body.append(f"tl.store(out_ptr0 + xindex, {store_source})")
+                else:
+                    body.append(
+                        f"tl.store(out_ptr0 + xindex, {store_source}, mask=xmask)"
+                    )
+            n_out_ports = (
+                len(out_kinds) if dual_stream else 1
+            )
             signature = [
                 *(f"in_ptr{index}" for index in range(self.input_count)),
-                "out_ptr0",
+                *(f"out_ptr{port}" for port in range(n_out_ports)),
                 "xnumel",
                 "XBLOCK: tl.constexpr",
                 "RBLOCK: tl.constexpr",
@@ -1158,7 +1279,7 @@ class TritonProgramCodegen:
             use_xmask = not (
                 pw_block is not None
                 and numel_total is not None
-                and numel_total % pw_block == 0
+                and numel_total % (pw_block * vec) == 0
             )
             body.extend(self._load_lines(use_mask=use_xmask))
             body.extend(self._program_lines(self.program, self._ref, "tmp"))
@@ -1234,6 +1355,7 @@ class TritonProgramCodegen:
                 *(f"out_ptr{index}" for index in range(len(self.output_refs))),
                 "xnumel",
                 "XBLOCK: tl.constexpr",
+                *(["VEC: tl.constexpr"] if vec > 1 else []),
             ]
 
         source = (
@@ -1317,24 +1439,41 @@ class TritonProgramCodegen:
             )
             onumel = _prod(out_shape)
             grid_size = max(1, -(-onumel // block))
-            # Index reductions always materialize int64 indices regardless of
-            # the value-stream dtype.
-            out_dtype = "tp.int64" if spec.tracks_indices else "inputs[0].dtype"
-            call_args = [*(f"inputs[{index}]" for index in range(self.input_count)), "out"]
+            # One output buffer per kernel port: an index stream always
+            # materializes int64 regardless of the value-stream dtype; a
+            # value port keeps the input dtype.
+            out_kinds = self.reduction_outputs
+            if out_kinds is None:
+                out_kinds = ("indices",) if spec.tracks_indices else ("values",)
+            if not out_kinds:
+                raise ValueError("dims reduction needs at least one output")
+            out_dtypes = tuple(
+                "tp.int64" if kind == "indices" else "inputs[0].dtype"
+                for kind in out_kinds
+            )
+            call_args = [
+                *(f"inputs[{index}]" for index in range(self.input_count)),
+                *(f"outs[{port}]" for port in range(len(out_kinds))),
+            ]
             args_txt = ", ".join(call_args)
             ptrs = " | ".join(
                 [
                     *(f"inputs[{i}].data_ptr()" for i in range(self.input_count)),
-                    "out.data_ptr()",
+                    *(f"outs[{p}].data_ptr()" for p in range(len(out_kinds))),
                 ]
             )
             guard = f"({ptrs}) % 16 == 0"
             source += "_rec = None\n\n"
             source += "def kernel_launch(inputs):\n"
             source += "    global _rec\n"
+            dtype_tuple = (
+                f"({out_dtypes[0]},)"
+                if len(out_dtypes) == 1
+                else "(" + ", ".join(out_dtypes) + ")"
+            )
             source += (
-                f"    out = tp.empty({out_shape!r}, dtype={out_dtype}, "
-                "device=inputs[0].device)\n"
+                f"    outs = [tp.empty({out_shape!r}, dtype=dt, "
+                f"device=inputs[0].device) for dt in {dtype_tuple}]\n"
             )
             # Fast path: see the single-reduction branch; the scalar arg is
             # the compile-time output numel, so the guard is exact.
@@ -1350,7 +1489,7 @@ class TritonProgramCodegen:
                 f"None, None, None, {args_txt}, {onumel}, {block}, {rblock})\n"
             )
             source += "            _fl.bump()\n"
-            source += "            return out\n"
+            source += "            return outs[0] if len(outs) == 1 else outs\n"
             source += "        except Exception:\n"
             source += "            _rec = None\n"
             source += "    _snap = -1\n"
@@ -1370,7 +1509,9 @@ class TritonProgramCodegen:
             source += f"        _g = _fl.take_kernel({kernel_name}, _snap)\n"
             source += "        if _g is not None:\n"
             source += f"            _rec = _g + ({onumel},)\n"
-            source += "    return out\n"
+            source += (
+                "    return outs[0] if len(outs) == 1 else outs\n"
+            )
         elif split_reduction:
             assert spec is not None
             finalize_name = kernel_name + "_finalize"
@@ -1550,14 +1691,16 @@ class TritonProgramCodegen:
             ]
             call_args_txt = ", ".join(call_args)
             # When a fixed config is given, always bake constexpr overrides
-            # (XBLOCK, num_warps) into the kernel call so the triton dispatch
-            # does not have to resolve them per-call through meta. This works
-            # whether the grid is literal or via a lambda.
+            # (XBLOCK, num_warps, and the vectorize width when packed) into
+            # the kernel call so the triton dispatch does not have to resolve
+            # them per-call through meta. This works whether the grid is
+            # literal or via a lambda.
+            constexpr_extra = f", VEC={vec}" if vec > 1 else ""
             constexpr_kw = ""
             if fixed_config is not None:
                 constexpr_kw = (
                     f", XBLOCK={fixed_config[0]}, "
-                    f"num_warps={fixed_config[1]}"
+                    f"num_warps={fixed_config[1]}{constexpr_extra}"
                 )
             if fixed_config is not None:
                 ptrs = " | ".join(
@@ -1576,13 +1719,17 @@ class TritonProgramCodegen:
                 # Fast path (fastlaunch): see the reduction branches.  The
                 # grid is recomputed from the guarded xnumel when the shape
                 # is not compile-time, so the recorded binary always sees
-                # the geometry it was compiled for.
+                # the geometry it was compiled for.  A packed iteration
+                # space launches one program per XBLOCK*VEC elements.
                 if self.reference_shape is not None:
                     grid_src = repr(
-                        -(-_prod(self.reference_shape) // fixed_config[0])
+                        -(-_prod(self.reference_shape)
+                          // (fixed_config[0] * vec))
                     )
                 else:
-                    grid_src = f"-(-xnumel // {fixed_config[0]})"
+                    grid_src = (
+                        f"-(-xnumel // {fixed_config[0] * vec})"
+                    )
                 source += "    _r = _rec\n"
                 source += (
                     f"    if _r is not None and {guard} and "
@@ -1592,8 +1739,8 @@ class TritonProgramCodegen:
                 source += "            _s = _fl.current_stream()\n"
                 source += (
                     f"            _r[0]({grid_src}, 1, 1, _s, _r[1], _r[2], "
-                    f"None, None, None, {call_args_txt}, "
-                    f"{fixed_config[0]})\n"
+                    f"None, None, None, {call_args_txt}, {fixed_config[0]}"
+                    f"{', ' + str(vec) if vec > 1 else ''})\n"
                 )
                 source += "            _fl.bump()\n"
                 if len(self.output_refs) == 1:
@@ -1612,7 +1759,9 @@ class TritonProgramCodegen:
                 # it literally instead of paying triton's per-call
                 # grid-lambda/meta resolution (the launch path is the pw
                 # chain's bottleneck once kernels reach hardware throughput).
-                grid_n = -(-_prod(self.reference_shape) // fixed_config[0])
+                grid_n = -(
+                    -_prod(self.reference_shape) // (fixed_config[0] * vec)
+                )
                 source += (
                     f"    {kernel_name}[({grid_n},)]({call_args_txt}{constexpr_kw})\n"
                 )
@@ -1648,6 +1797,7 @@ def _compile_program(
     reference_shape: tuple[int, ...] | None = None,
     value_dtype: str | None = None,
     epilogue: tuple[list[int], list[float], int] | None = None,
+    reduction_outputs: tuple[str, ...] | None = None,
 ):
     if not HAS_TRITON:
         raise RuntimeError("Triton is not installed")
@@ -1657,7 +1807,17 @@ def _compile_program(
         raise NotImplementedError("Triton requires matching contiguous CUDA tensors")
     digest = hashlib.sha256(
         (
-            repr((_CODEGEN_VERSION, program, constants, output_refs, reduction, epilogue))
+            repr(
+                (
+                    _CODEGEN_VERSION,
+                    program,
+                    constants,
+                    output_refs,
+                    reduction,
+                    epilogue,
+                    reduction_outputs,
+                )
+            )
             + repr(
                 [
                     (tuple(value.shape), repr(value.dtype), repr(value.device))
@@ -1680,6 +1840,7 @@ def _compile_program(
         reference_shape=reference_shape,
         value_dtype=value_dtype,
         epilogue=epilogue,
+        reduction_outputs=reduction_outputs,
     ).generate(kernel_name, fixed_config=fixed_config)
     try:
         from ..codecache import default_cache
@@ -1713,14 +1874,15 @@ def _dims_decision_key(
     epilogue_repr: str,
     *,
     tier: str = "table",
+    outputs_repr: str = "",
 ) -> str:
     """Persisted-decision key for the axis-reduction family (M5d).
 
     Covers codegen generation, tuning salt, program content, reduction spec,
-    shape buckets, device, value dtype and epilogue so a hit can never pin a
-    decision from an older emitter or candidate table.  The selection tier
-    is part of the key: a coordinate-descent refinement and a baseline-table
-    pick for the same program are separate records.
+    output-port kinds, shape buckets, device, value dtype and epilogue so a
+    hit can never pin a decision from an older emitter or candidate table.
+    The selection tier is part of the key: a coordinate-descent refinement
+    and a baseline-table pick for the same program are separate records.
     """
 
     from ..runtime import stax_autotune
@@ -1733,7 +1895,7 @@ def _dims_decision_key(
         + digest
         + f"|{reduction.op}|{reduction.dims}|{int(reduction.keepdim)}"
         + f"|{stax_autotune.xnumel_bucket(onumel)}|{stax_autotune.xnumel_bucket(rnumel)}"
-        + f"|{device_repr}|{value_dtype}|{epilogue_repr}"
+        + f"|{device_repr}|{value_dtype}|{epilogue_repr}|{outputs_repr}"
     )
     return hashlib.sha256(f"dimred|{digest_source}".encode()).hexdigest()[:24]
 
@@ -1750,20 +1912,24 @@ def _autotune_dims_program(
     reference_shape: tuple[int, ...] | None,
     value_dtype: str | None = None,
     epilogue: tuple[list[int], list[float], int] | None = None,
+    reduction_outputs: tuple[str, ...] | None = None,
     max_autotune: bool = False,
     coordinate_descent_tuning: bool = False,
 ):
-    """Benchmark ``_DIM_REDUCTION_CANDIDATES`` once; persist the decision.
+    """Benchmark the axis-reduction candidate table once; persist the decision.
 
-    The decision cache key covers program content, reduction spec, shape
-    buckets and device, so a hit skips both benchmarking and recompiles.
-    The key also carries the selection tier (baseline table, exhaustive
-    max-autotune table, coordinate-descent refinement) so policies never
-    read each other's records.
+    The decision cache key covers program content, reduction spec, output
+    kinds, shape buckets and device, so a hit skips both benchmarking and
+    recompiles.  The key also carries the selection tier (baseline table,
+    exhaustive max-autotune table, coordinate-descent refinement) so
+    policies never read each other's records.  The exhaustive tier widens the
+    base geometries with the loop-pass space (r-loop unroll factors and
+    main/tail split variants).
     """
 
     assert reference_shape is not None and isinstance(reduction, ReductionSpec)
     from ..runtime import stax_autotune
+    from . import loop_pass
 
     tier = (
         "coordesc"
@@ -1783,6 +1949,7 @@ def _autotune_dims_program(
             reference_shape=reference_shape,
             value_dtype=value_dtype,
             epilogue=epilogue,
+            reduction_outputs=reduction_outputs,
         )
 
     rank = len(reference_shape)
@@ -1798,6 +1965,7 @@ def _autotune_dims_program(
         ),
     )
     rnumel = max(1, reduction.reduction_numel(reference_shape))
+    outputs_repr = ",".join(reduction_outputs or ())
     decision_key = _dims_decision_key(
         stax_autotune.program_digest(program, constants, output_refs),
         reduction,
@@ -1807,6 +1975,7 @@ def _autotune_dims_program(
         value_dtype,
         epilogue is not None and repr(epilogue) or "",
         tier=tier,
+        outputs_repr=outputs_repr,
     )
 
     try:
@@ -1829,8 +1998,13 @@ def _autotune_dims_program(
     if disabled_autotune():
         return build(_STATIC_DIM_TRIPLE)
 
+    candidates: tuple[tuple[int, ...], ...] = _DIM_REDUCTION_CANDIDATES
+    if max_autotune:
+        candidates = loop_pass.dims_loop_candidates(
+            rnumel, candidates
+        )
     best_config, best_launch, best_time = stax_autotune.bench_candidates(
-        build, _DIM_REDUCTION_CANDIDATES, list(example_inputs)
+        build, candidates, list(example_inputs)
     )
     if best_config is None:
         return build(_STATIC_DIM_TRIPLE)
@@ -1844,10 +2018,15 @@ def _autotune_dims_program(
         record = {
             "xblock": best_config[0],
             "warps": best_config[1],
-            "stages": best_config[-1],
+            "stages": best_config[3]
+            if len(best_config) > 3
+            else best_config[-1],
         }
         if len(best_config) > 3:
             record["rblock"] = best_config[2]
+        if len(best_config) > 5:
+            record["unroll"] = best_config[4]
+            record["split"] = int(bool(best_config[5]))
         cache.store(decision_key, json.dumps(record).encode(), ext="json")
     except Exception:  # noqa: BLE001 - cache is best-effort
         pass
@@ -1855,27 +2034,68 @@ def _autotune_dims_program(
 
 
 def _dims_record_config(record: dict) -> tuple[int, ...]:
+    """Rebuild a config tuple from a persisted decision record.
+
+    ``unroll``/``split`` are written only by the loop-pass tiers; a record
+    without them decodes to the base 3/4-tuple.
+    """
+
     if record.get("rblock") is not None:
-        return (
+        config = (
             int(record["xblock"]),
             int(record["warps"]),
             int(record["rblock"]),
             int(record["stages"]),
         )
-    return (int(record["xblock"]), int(record["warps"]), int(record["stages"]))
+    else:
+        config = (
+            int(record["xblock"]),
+            int(record["warps"]),
+            int(record["stages"]),
+        )
+    if record.get("unroll") is not None:
+        config = config + (
+            int(record["unroll"]),
+            int(record.get("split", 0)),
+        )
+    return config
 
 
-def _dims_decision_acceptable(config: tuple[int, ...], tier: str) -> bool:
+def _dims_decision_acceptable(
+    config: tuple[int, ...], tier: str
+) -> bool:
     """Validate a loaded decision against the policy that produced it.
 
-    Table tiers only accept configs from the curated candidate table; the
-    coordinate-descent tier accepts any structurally valid config because
-    the descent may leave the table.
+    The table tier only accepts members of the curated candidate table; the
+    exhaustive tier also accepts loop-pass-extended six-tuples whose geometry
+    prefix is a table member and whose loop knobs stay in the searched
+    space; the coordinate-descent tier accepts any structurally valid config
+    because the descent may leave the table.
     """
 
     if tier == "coordesc":
-        return len(config) in (3, 4) and all(
+        return len(config) in (3, 4, 6) and all(
             isinstance(value, int) and value >= 1 for value in config
+        )
+    if tier == "exhaustive" and len(config) == 6:
+        from . import loop_pass
+
+        # The geometry prefix must be a table member (3-tuple geometries
+        # compare by (xblock, warps) because the extension materializes
+        # their derived RBLOCK), and the loop knobs must stay in the
+        # searched space.
+        prefixes = {
+            (entry[0], entry[1], len(entry)) for entry in _DIM_REDUCTION_CANDIDATES
+        }
+        matched = (config[0], config[1], 4) in prefixes or (
+            config[0],
+            config[1],
+            3,
+        ) in prefixes
+        return (
+            matched
+            and int(config[4]) in loop_pass.UNROLL_FACTORS
+            and int(config[5]) in (0, 1)
         )
     return any(entry == config for entry in _DIM_REDUCTION_CANDIDATES)
 
@@ -2006,6 +2226,7 @@ def _autotune_launch(
     bucket_numel: int | None = None,
     value_dtype: str | None = None,
     epilogue: tuple[list[int], list[float], int] | None = None,
+    reduction_outputs: tuple[str, ...] | None = None,
     max_autotune: bool = False,
     coordinate_descent_tuning: bool = False,
 ):
@@ -2014,10 +2235,11 @@ def _autotune_launch(
     Benchmark candidate configs once at compile time and emit a
     fixed-config kernel; persist the decision so later processes skip
     benchmarking.  The max-autotune knobs widen the search: an exhaustive
-    candidate table for pointwise programs and coordinate-descent
-    refinement of the benchmark winner.  Any failure falls back to a static
-    pinned config for reductions (the split workspace is baked per config)
-    or the plain ``@triton.autotune`` emission for pointwise programs.
+    candidate table for pointwise programs (extended with the loop-pass
+    vectorize widths) and coordinate-descent refinement of the benchmark
+    winner.  Any failure falls back to a static pinned config for reductions
+    (the split workspace is baked per config) or the plain
+    ``@triton.autotune`` emission for pointwise programs.
     """
 
     def build(config: tuple[int, int] | None):
@@ -2032,6 +2254,7 @@ def _autotune_launch(
             reference_shape=reference_shape,
             value_dtype=value_dtype,
             epilogue=epilogue,
+            reduction_outputs=reduction_outputs,
         )
 
     spec = (
@@ -2058,6 +2281,7 @@ def _autotune_launch(
             reference_shape=reference_shape,
             value_dtype=value_dtype,
             epilogue=epilogue,
+            reduction_outputs=reduction_outputs,
             max_autotune=max_autotune,
             coordinate_descent_tuning=coordinate_descent_tuning,
         )
@@ -2098,6 +2322,23 @@ def _autotune_launch(
         def build_fixed(config: tuple[int, int]):
             return build(config)
 
+        pointwise_candidates = (
+            stax_autotune.EXHAUSTIVE_CANDIDATE_CONFIGS
+            if max_autotune
+            else None
+        )
+        if max_autotune:
+            from . import loop_pass
+
+            itemsize = int(
+                getattr(example_inputs[0].dtype, "itemsize", 4) or 4
+            )
+            pointwise_candidates = loop_pass.pointwise_loop_candidates(
+                xnumel,
+                itemsize,
+                stax_autotune.EXHAUSTIVE_CANDIDATE_CONFIGS,
+            )
+
         # Key on the bare program digest: load_decision() consumers key the
         # same way, and role namespacing is redundant given bucket+device.
         config, launch = stax_autotune.pick_config(
@@ -2106,11 +2347,7 @@ def _autotune_launch(
             device_key,
             build_fixed,
             list(example_inputs),
-            candidates=(
-                stax_autotune.EXHAUSTIVE_CANDIDATE_CONFIGS
-                if max_autotune
-                else None
-            ),
+            candidates=pointwise_candidates,
             refiner=(
                 coordinate_descent.refiner_for(
                     coordinate_descent.POINTWISE_FIELDS
@@ -2135,9 +2372,9 @@ def _autotune_launch(
         return build(None)
 
 
-# Value-only reduction tails; "min"/"max" with explicit dims return a
-# (values, indices) pair and are rejected by the parser below, and
-# "argmax" is the index reduction.
+# Reduction-tail op families: scalar value tails (no axes for min/max —
+# with an axis they become pair tails), pair tails (min/max over one axis,
+# values+indices), and the index reduction.
 _REDUCTION_SCALAR_TAILS = frozenset({"sum", "mean", "amax", "amin", "max", "min"})
 _REDUCTION_PAIR_TAILS = frozenset({"max", "min"})
 _REDUCTION_INDEX_TAILS = frozenset({"argmax"})
@@ -2151,7 +2388,7 @@ def _reduction_spec_from_node(node: Node) -> ReductionSpec | None:
     """Parse a ``call_method`` reduction node into a :class:`ReductionSpec`.
 
     Returns ``None`` for anything this backend cannot fold yet (unknown
-    kwargs like ``dtype``, ``min``/``max`` value-index pairs, tensor ``dim``
+    kwargs like ``dtype``, multi-axis value-index pairs, tensor ``dim``
     values, ``amax()`` without axes, ``argmax()`` without axes).
     """
 
@@ -2205,8 +2442,10 @@ def _reduction_spec_from_node(node: Node) -> ReductionSpec | None:
 
     if op in ("amax", "amin") and not dims:
         return None
-    if op in ("max", "min") and dims:
-        return None  # max(dim)/min(dim) yield a (values, indices) pair
+    if op in ("max", "min") and dims and len(dims) != 1:
+        # The value-index pair form takes exactly one axis; multi-axis
+        # spellings stay on the eager path.
+        return None
     try:
         return ReductionSpec(op, dims, keepdim=keepdim)
     except ValueError:
@@ -2447,9 +2686,11 @@ def _build_extern_analytic_vjp(node: Any, position_of: Any):
         return single(rule)
 
     if name == "to":
-        # no dtype conversion in the tangent: the gradient keeps the
-        # input's dtype, which the eager cast of the rule handles
         def rule(x: Any, feed: list, tangent: Any) -> Any:
+            if not x.dtype.is_floating_point:
+                # An integer source (an index stream) has no differentiable
+                # path: the cast carries no tangent back.
+                return None
             return tangent.to(x.dtype)
 
         return single(rule)
@@ -2553,25 +2794,50 @@ def _extern_segment_plan(
     sample_feed: list | None = None,
     max_autotune: bool = False,
     training: bool = False,
+    attr_position: int | None = None,
 ) -> _ExternPlan | None:
     """Build the eager executor for one extern segment; None when unsupported.
 
     With ``max_autotune`` (inference regions only), a two-dimensional fp32
     matmul segment additionally benches tiled Triton GEMM candidates against
     the native operator and bakes the winner into the launch.
+
+    A ``get_attr`` segment serves a lifted module attribute (parameter or
+    buffer).  Inference keeps the closure value; training wires the CURRENT
+    attribute value as a trailing autograd input (``attr_position`` names
+    it among the region's attributes) so the sweep routes its gradient back
+    to the leaf — the identity tangent rule, since the segment is a pure
+    pass-through of the attribute value.
     """
 
     import tensorplay as _tp
 
     node = seg.nodes[0]
     if node.op == "get_attr":
-        # A lifted constant (module parameter or buffer) becomes its own
-        # extern segment: serve the same tensor on every call.  Training
-        # regions keep the native path — a constant needs no tangent, and
-        # the analytic-VJP chain does not model leaves.
-        if training:
-            return None
         value = graph_module._get_attr(node.target)
+        if training:
+            if (
+                attr_position is None
+                or not isinstance(value, _tp.Tensor)
+                or value.dtype != sample_dtype
+                or value.device != sample_device
+                or not value.is_contiguous()
+            ):
+                # Training closes every extern segment with a tangent rule
+                # over feed values; an attribute outside that contract (a
+                # non-tensor constant, a foreign dtype downstream kernels
+                # did not specialize for) keeps the native path.
+                return None
+            return _ExternPlan(
+                launch=lambda feed: feed[0],
+                extern_sources=(_ExternSource("attr", attr_position, 0),),
+                example=value,
+                output_shape=tuple(int(dim) for dim in value.shape),
+                vjp_ready=True,
+                backward_launch=(
+                    lambda feed_and_tangent: (feed_and_tangent[-1],)
+                ),
+            )
         return _ExternPlan(
             launch=lambda feed: value,
             extern_sources=sources,
@@ -2828,6 +3094,56 @@ def _reduction_mask_vjp(spec: ReductionSpec, input_position: int):
     return vjp
 
 
+def _reduction_pair_vjp(spec: ReductionSpec, input_position: int):
+    """Index-scatter VJP for a bare pair reduction (``max(dim)``/``min(dim)``).
+
+    The tangent on the values output flows to the extremum position each
+    reduced slice selected: a zero gradient buffer with the tangent
+    scattered in at the recorded indices.  ``feed`` is the segment feed
+    with the reduction input at ``input_position``; the indices are
+    recomputed from that input, so the backward needs no extra forward
+    state.  The indices output itself carries no tangent — an integer
+    stream has no differentiable path.
+    """
+
+    def vjp(feed: list, tangent: Any) -> list:
+        import tensorplay as _tp
+
+        x = feed[input_position]
+        dim = spec.normalized_dims(len(x.shape))[0]
+        pair = getattr(x, spec.op)(dim=dim, keepdim=spec.keepdim)
+        if spec.keepdim:
+            grad, indices = tangent, pair.indices
+        else:
+            grad = tangent.unsqueeze(dim)
+            indices = pair.indices.unsqueeze(dim)
+        grad_x = _tp.zeros_like(x).scatter_(
+            dim, indices, grad.to(x.dtype)
+        )
+        grads = [None] * len(feed)
+        grads[input_position] = grad_x
+        return grads
+
+    return vjp
+
+
+def _reduction_drop_vjp(source_count: int):
+    """No-tangent rule for an index reduction segment.
+
+    An argmax output is an integer stream: no gradient path exists through
+    it, matching eager semantics where the index result never joins the
+    autograd graph.  The rule accepts the sweep's combined feed+tangent and
+    returns no gradient per feed position, so any spurious tangent dies
+    here.
+    """
+
+    def backward(feed_and_tangent: list) -> list:
+        del feed_and_tangent
+        return [None] * source_count
+
+    return backward
+
+
 def _extract_segment_view(
     graph: Graph, nodes, export_node: Node, extra_exports: tuple = ()
 ):
@@ -2947,9 +3263,13 @@ def compile_graph_module(
         tuple(int(dim) for dim in value.shape) != reference_shape
         for value in example_inputs
     )
-    if any_grad and any(len(seg.exports) > 1 for seg in segments):
+    if any_grad and any(
+        seg.kind == "pw" and len(seg.exports) > 1 for seg in segments
+    ):
         # Horizontal fusion kernels carry extra stores; the local-VJP
         # training sweep routes gradients through the single export only.
+        # Pair reductions are exempt: their multi-port exports ARE the
+        # per-stream outputs the scatter VJP closes.
         _dbg('fallback gate #5d')
         return None
     if any_grad:
@@ -2957,17 +3277,15 @@ def compile_graph_module(
         # segments take elementwise VJPs; sum/mean reduction segments take
         # an expanded tangent into their prologue's VJP program (the
         # forward program already exports the reduction input); bare
-        # extremum reductions take an eager select-mask VJP.  Extern
-        # segments take an engine VJP through one recomputed eager call;
-        # store-time epilogues and index reductions still need their own
-        # gradient paths, and extremum reductions behind a pointwise chain
-        # fall back at the plan gate.
+        # extremum reductions take an eager select-mask VJP and bare pair
+        # reductions (max/min with dim) an eager index-scatter VJP; index
+        # reductions (argmax) drop the tangent — an integer stream carries
+        # no gradient path.  Extern segments take an engine VJP through one
+        # recomputed eager call; extremum reductions behind a pointwise
+        # chain fall back at the plan gate.
         for seg in segments:
             if seg.epilogue:
                 _dbg('fallback gate #5a')
-                return None
-            if seg.kind == "pw+red" and seg.reduction.tracks_indices:
-                _dbg('fallback gate #5b')
                 return None
     # Broadcast operands train through the per-segment local VJPs: each
     # elementwise partial comes back at the fused iteration space and is
@@ -2986,13 +3304,15 @@ def compile_graph_module(
     final_value = output_values[0]
     node_to_seg: dict = {}
     for index, seg in enumerate(segments):
-        for node in [*seg.nodes, *seg.epilogue]:
+        # exports included: a pair reduction's projection nodes wire like
+        # any other producer output though they are not emission nodes
+        for node in [*seg.nodes, *seg.epilogue, *seg.exports]:
             node_to_seg[node] = index
 
     def _extern_sources(seg_index: int, seg):
         """Validate cross-segment wiring; None when unsupported."""
 
-        inside = set(seg.nodes) | set(seg.epilogue)
+        inside = set(seg.nodes) | set(seg.epilogue) | set(seg.exports)
         placeholder_positions = {
             node.name: position
             for position, node in enumerate(graph_module.graph.placeholders)
@@ -3084,6 +3404,14 @@ def compile_graph_module(
                 )
         return feed
 
+    #: lifted module attributes (get_attr segments) in encounter order —
+    #: training passes their CURRENT values as trailing autograd inputs
+    #: and returns their gradients alongside the placeholder gradients.
+    attr_targets: list[str] = []
+
+    def _attr_value(target: str):
+        return graph_module._get_attr(target)
+
     for seg_index, seg in enumerate(segments):
         sources = _extern_sources(seg_index, seg)
         if sources is None:
@@ -3091,6 +3419,16 @@ def compile_graph_module(
             _dbg('fallback gate #12')
             return None
         if seg.kind == "extern":
+            attr_position = None
+            if (
+                any_grad
+                and seg.nodes[0].op == "get_attr"
+                and seg.nodes[0].target not in attr_targets
+            ):
+                attr_targets.append(seg.nodes[0].target)
+                attr_position = len(attr_targets) - 1
+            elif any_grad and seg.nodes[0].op == "get_attr":
+                attr_position = attr_targets.index(seg.nodes[0].target)
             extern_plan = _extern_segment_plan(
                 graph_module,
                 seg,
@@ -3102,6 +3440,7 @@ def compile_graph_module(
                 sample_feed=_sample_feed(sources),
                 max_autotune=max_autotune,
                 training=any_grad,
+                attr_position=attr_position,
             )
             if extern_plan is None:
                 scheduler_annotate(graph_module, segments)
@@ -3116,15 +3455,35 @@ def compile_graph_module(
             extern_shapes[seg_index] = extern_plan.output_shape
             segment_plans.append(extern_plan)
             continue
-        extra_exports = tuple(seg.exports[1:])
+        # Horizontal-fusion extra stores are a pointwise-only concept; a
+        # pair reduction's exports are projection nodes the view must not
+        # clone (the kernel's dual streams carry them).
+        extra_exports = (
+            tuple(seg.exports[1:]) if seg.kind == "pw" else ()
+        )
         sub_view, mapping, externals = _extract_segment_view(
             graph_module.graph, seg.nodes, seg.tail, extra_exports
         )
         reduction = None
         reduction_mode_local = None
+        reduction_outputs = None
         if seg.kind == "pw+red":
             reduction = seg.reduction
-            if reduction.tracks_indices:
+            if reduction.is_pair:
+                # The pair kernel needs both a projection set to export
+                # and the dual-stream runtime (tl.argmax/tl.argmin with
+                # float32/float64 value streams).
+                if not seg.export_kinds:
+                    _dbg('fallback gate #13b')
+                    return None
+                if not (HAS_TL_ARGMAX and HAS_TL_ARGMIN):
+                    _dbg('fallback gate #13')
+                    return None
+                if sample_dtype not in (_tp.float32, _tp.float64):
+                    _dbg('fallback gate #14')
+                    return None
+                reduction_outputs = tuple(seg.export_kinds)
+            elif reduction.tracks_indices:
                 # v1 index reductions: float32/float64 only + tl.argmax.
                 if not HAS_TL_ARGMAX:
                     _dbg('fallback gate #13')
@@ -3132,10 +3491,14 @@ def compile_graph_module(
                 if sample_dtype not in (_tp.float32, _tp.float64):
                     _dbg('fallback gate #14')
                     return None
-            if seg.epilogue:
-                assert not reduction.tracks_indices, (
-                    "scheduler never joins an epilogue onto argmax"
-                )
+                reduction_outputs = ("indices",)
+            if seg.epilogue and (reduction.tracks_indices or reduction.is_pair):
+                # A pointwise chain living on an index-carrying reduction's
+                # registers would have to run on the int64 index stream —
+                # the store-time epilogue programs are float-value-space
+                # only.  The region falls back instead.
+                _dbg('fallback gate #13c')
+                return None
         if seg.kind == "pw+red":
             producer_new = mapping.get(seg.producer)
             if producer_new is None:
@@ -3241,24 +3604,45 @@ def compile_graph_module(
             bucket_numel=_prod(local_ref),
             value_dtype=str(sample_dtype) if reduction is not None else None,
             epilogue=epilogue_payload,
+            reduction_outputs=reduction_outputs,
             max_autotune=max_autotune,
             coordinate_descent_tuning=coordinate_descent_tuning,
         )
-        # M5f: a bare extremum reduction (input is a direct source, no
-        # pointwise producer) trains through the eager select-mask VJP; no
-        # backward kernel is built for it.
+        # Plan-time eager VJPs (training): no backward kernel is built for
+        # these segments.
+        #   bare extremum reduction (input a direct source, no pointwise
+        #     producer) — the select-mask VJP;
+        #   bare pair reduction — the index-scatter VJP;
+        #   index reduction — the no-tangent rule (integer stream).
         mask_launch = None
-        if (
-            reduction is not None
-            and reduction.op in _MASK_REDUCTION_OPS
-            and len(sources) == 1
-            and seg.producer is not None
-            and seg.producer not in seg.nodes
-        ):
-            mask_vjp = _reduction_mask_vjp(reduction, 0)
-            mask_launch = lambda feed_and_tangent, vjp=mask_vjp: vjp(  # noqa: E731
-                feed_and_tangent[:-1], feed_and_tangent[-1]
+        if reduction is not None and any_grad:
+            bare = (
+                len(sources) == 1
+                and seg.producer is not None
+                and seg.producer not in seg.nodes
             )
+            if (
+                reduction.op in _MASK_REDUCTION_OPS
+                and not reduction.is_pair
+                and bare
+            ):
+                mask_vjp = _reduction_mask_vjp(reduction, 0)
+                mask_launch = lambda feed_and_tangent, vjp=mask_vjp: vjp(  # noqa: E731
+                    feed_and_tangent[:-1], feed_and_tangent[-1]
+                )
+            elif reduction.is_pair:
+                if not bare:
+                    # A pair reduction behind an in-segment producer chain
+                    # has no scatter VJP wiring yet.
+                    scheduler_annotate(graph_module, segments)
+                    _dbg('fallback gate #20b')
+                    return None
+                pair_vjp = _reduction_pair_vjp(reduction, 0)
+                mask_launch = lambda feed_and_tangent, vjp=pair_vjp: vjp(  # noqa: E731
+                    feed_and_tangent[:-1], feed_and_tangent[-1]
+                )
+            elif reduction.tracks_indices:
+                mask_launch = _reduction_drop_vjp(len(sources))
         segment_plans.append(
             _SegmentPlan(
                 seg_launch,
@@ -3365,6 +3749,22 @@ def compile_graph_module(
 
         from .....autograd import Function
 
+        attr_count = len(attr_targets)
+
+        def _feed_of(forward_inputs, intermediates, plan):
+            """One segment's runtime inputs from args, attrs and exports."""
+
+            return [
+                forward_inputs[source.index]
+                if source.kind == "arg"
+                else (
+                    forward_inputs[len(placeholders) + source.index]
+                    if source.kind == "attr"
+                    else intermediates[source.index][source.port]
+                )
+                for source in plan.extern_sources
+            ]
+
         def _grads_of(plan, feed_and_tangent):
             """One gradient per extern source, always a flat sequence.
 
@@ -3383,12 +3783,7 @@ def compile_graph_module(
                 intermediates: dict[int, tuple] = {}
                 feed_all = []
                 for index, plan in enumerate(segment_plans):
-                    feed = [
-                        forward_inputs[source.index]
-                        if source.kind == "arg"
-                        else intermediates[source.index][source.port]
-                        for source in plan.extern_sources
-                    ]
+                    feed = _feed_of(forward_inputs, intermediates, plan)
                     intermediates[index] = _run_segment(plan, feed)
                     feed_all.append(feed)
                 ctx.stax_feed_all = feed_all
@@ -3402,9 +3797,9 @@ def compile_graph_module(
             def backward(ctx: Any, *grad_outputs: Any) -> tuple[Any, ...]:
                 grad_output = grad_outputs[0] if grad_outputs else None
                 saved = ctx.saved_tensors
-                if grad_output is None:
-                    return (None,) * len(saved)
                 inputs_count = len(placeholders)
+                if grad_output is None:
+                    return (None,) * (inputs_count + attr_count)
                 # normalize once against the final output's operand shape;
                 # every downstream tangent already has its producer shape.
                 seg_grads: dict[int, Any] = {
@@ -3413,6 +3808,7 @@ def compile_graph_module(
                     )
                 }
                 arg_grads: dict[int, Any] = {}
+                attr_grads: dict[int, Any] = {}
 
                 def accumulate(bucket: dict, key: int, value: Any) -> None:
                     if value is None:
@@ -3455,10 +3851,19 @@ def compile_graph_module(
                             )
                         if source.kind == "arg":
                             accumulate(arg_grads, source.index, grad)
+                        elif source.kind == "attr":
+                            accumulate(attr_grads, source.index, grad)
                         else:
                             accumulate(seg_grads, source.index, grad)
-                return tuple(
-                    arg_grads.get(position) for position in range(inputs_count)
+                return (
+                    tuple(
+                        arg_grads.get(position)
+                        for position in range(inputs_count)
+                    )
+                    + tuple(
+                        attr_grads.get(position)
+                        for position in range(attr_count)
+                    )
                 )
 
         autograd_function = _StaxTritonAutograd
@@ -3486,10 +3891,13 @@ def compile_graph_module(
                 )
             assert fallback is not None
             return fallback(*args, **call_kwargs)
+        # lifted attributes re-fetch per call: an optimizer step that
+        # rebinds the module's parameter must be seen by the region
+        attr_values = [_attr_value(target) for target in attr_targets]
         if autograd_function is not None and any(
             value.requires_grad for value in inputs
         ):
-            return autograd_function.apply(*inputs)
+            return autograd_function.apply(*inputs, *attr_values)
         intermediates: dict[int, tuple] = {}
         for index, plan in enumerate(segment_plans):
             feed = [

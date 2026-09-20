@@ -59,6 +59,10 @@ DIMS_QUAD_FIELDS = (
     TunableField(2, "pow2"),
     TunableField(3, "stages", hi=16),
 )
+# (XBLOCK, num_warps, RBLOCK, num_stages, unroll, split) loop-pass-extended
+# axis-reduction configs: the descent refines the geometry prefix only and
+# keeps the loop knobs at the benchmark winner's values.
+DIMS_LOOP_FIELDS = DIMS_QUAD_FIELDS
 # (XBLOCK, num_warps, NPROG) persistent split-reduction triples.
 SPLIT_FIELDS = (
     TunableField(0, "pow2"),
@@ -74,6 +78,8 @@ def dims_fields(length: int) -> Tuple[TunableField, ...]:
         return DIMS_TRIPLE_FIELDS
     if length == 4:
         return DIMS_QUAD_FIELDS
+    if length == 6:
+        return DIMS_LOOP_FIELDS
     raise ValueError(f"unsupported axis-reduction config length: {length}")
 
 

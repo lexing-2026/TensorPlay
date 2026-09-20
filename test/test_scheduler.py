@@ -306,3 +306,83 @@ def test_training_schedule_splits_epilogue():
     assert len(epi.nodes) == 2
     # the split epilogue reads the reduction export, not an interior value
     assert epi.exports == (epi.nodes[-1],)
+
+
+def test_pair_reduction_projections_become_exports():
+    """max(dim) folds as a pair reduction; the value/index projection
+    nodes are its exports (in encounter order, with per-port kinds)."""
+
+    x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+    def fn(t):
+        m = t.max(dim=1)
+        return m.values * 2.0 + m.indices.to(tp.float32)
+
+    gm, segs = _segments(fn, x)
+    assert segs is not None
+    assert [s.kind for s in segs] == ["pw+red", "pw"]
+    pair, tail = segs
+    assert pair.reduction.op == "max" and pair.reduction.is_pair
+    assert pair.export_kinds == ("values", "indices")
+    assert all(node.op == "call_function" for node in pair.exports)
+    assert pair.exports[0].args[1] == "values"
+    assert pair.exports[1].args[1] == "indices"
+    # the tail pointwise segment wires against the projection ports
+    assert gm is not None
+
+
+def test_pair_reduction_values_only_consumption():
+    x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+    _, segs = _segments(lambda t: t.max(dim=1).values * 2.0, x)
+    assert segs is not None and len(segs) == 2
+    assert segs[0].kind == "pw+red"
+    # only the values stream was consumed: one port, that kind
+    assert segs[0].export_kinds == ("values",)
+    assert segs[1].kind == "pw"
+
+
+def test_pair_reduction_getitem_projection():
+    x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+    _, segs = _segments(lambda t: t.max(dim=1)[1].to(tp.float32), x)
+    assert segs is not None and len(segs) == 2
+    assert segs[0].export_kinds == ("indices",)
+
+
+def test_pair_projection_attaches_after_segment_closed():
+    """A projection arriving after the pair segment closed (another node
+    intervened) still attaches to that segment as an export."""
+
+    x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+    def fn(t):
+        pair = t.max(dim=1)
+        other = t * 2.0
+        return pair.values + other
+
+    _, segs = _segments(fn, x)
+    assert segs is not None
+    assert [seg.kind for seg in segs] == ["pw+red", "pw"]
+    assert segs[0].export_kinds == ("values",)
+    # the later pw run reads the projection, wired as the pair's export
+    assert segs[1].exports == (segs[1].nodes[-1],)
+
+
+def test_pair_tail_as_graph_output_has_no_exports():
+    """The raw pair node is not a wireable value: a region returning it
+    exports nothing from the pair segment, and the backend falls back."""
+
+    x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+    _, segs = _segments(lambda t: t.max(dim=1), x)
+    assert segs is not None
+    assert segs[0].kind == "pw+red" and segs[0].exports == ()
+
+
+def test_min_dim_is_pair_amax_is_not():
+    x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+    _, segs = _segments(lambda t: t.min(dim=1).values, x)
+    assert segs is not None
+    assert segs[0].reduction.op == "min" and segs[0].reduction.is_pair
+
+    _, segs2 = _segments(lambda t: t.amax(dim=1), x)
+    assert segs2 is not None
+    assert not segs2[0].reduction.is_pair
