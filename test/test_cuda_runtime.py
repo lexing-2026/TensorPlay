@@ -58,11 +58,6 @@ def test_stream_aware_allocator_prevents_early_reuse():
     tp.cuda.synchronize()
     tp.cuda.empty_cache()
     tp.cuda.reset_peak_memory_stats()
-    # Global allocator stats may retain blocks from earlier failing tests
-    # (pytest keeps their tracebacks, and frames keep tensors alive), so all
-    # assertions below are expressed as deltas of this baseline.
-    baseline_allocated = tp.cuda.memory_allocated()
-    baseline_reserved = tp.cuda.memory_reserved()
 
     # Warm enough allocator blocks before queuing work. A cold cudaMalloc may
     # synchronize the device, which would hide the cross-stream lifetime this
@@ -73,6 +68,16 @@ def test_stream_aware_allocator_prevents_early_reuse():
     del warm_result, warm
     gc.collect()
     tp.cuda.synchronize()
+
+    # Global allocator stats may retain blocks from earlier failing tests
+    # (pytest keeps their tracebacks, and frames keep tensors alive), and
+    # those blocks are not tied to this test's lifetime: they can also be
+    # released partway through it.  The baseline is therefore captured after
+    # the collection above, and the closing assertions compare against an
+    # upper bound of it: foreign releases drop the counts below the
+    # baseline, while a leak of this test's own tensors pushes them above.
+    baseline_allocated = tp.cuda.memory_allocated()
+    baseline_reserved = tp.cuda.memory_reserved()
 
     producer = tp.cuda.Stream()
     consumer = tp.cuda.Stream()
@@ -104,10 +109,10 @@ def test_stream_aware_allocator_prevents_early_reuse():
     del replacement, result
     gc.collect()
     tp.cuda.synchronize()
-    assert tp.cuda.memory_allocated() == baseline_allocated
+    assert tp.cuda.memory_allocated() <= baseline_allocated
     assert tp.cuda.memory_reserved() > baseline_reserved
     tp.cuda.empty_cache()
-    assert tp.cuda.memory_reserved() == baseline_reserved
+    assert tp.cuda.memory_reserved() <= baseline_reserved
 
 
 def test_same_stream_allocator_reuses_ordered_block_without_event_fence():
