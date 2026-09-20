@@ -7,10 +7,11 @@ import sys
 import numpy as np
 import pytest
 
+pytest.importorskip("tensorboard")
+PILImage = pytest.importorskip("PIL.Image")
+
 import tensorplay as tp
 from tensorplay.utils.tensorboard import FileWriter, SummaryWriter
-
-PILImage = pytest.importorskip("PIL.Image")
 
 from tensorboard.backend.event_processing import event_accumulator as _ea
 from tensorboard.backend.event_processing.event_file_loader import EventFileLoader
