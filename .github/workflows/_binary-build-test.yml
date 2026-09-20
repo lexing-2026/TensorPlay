@@ -568,6 +568,9 @@ jobs:
           for test_file in $TEST_FILES; do
             cp "$GITHUB_WORKSPACE/$test_file" "$test_root/"
           done
+          if [[ -d "$GITHUB_WORKSPACE/test/expect" ]]; then
+            cp -r "$GITHUB_WORKSPACE/test/expect" "$test_root/"
+          fi
           cd "$test_root"
           python -m pytest . --import-mode=importlib -q \
             --junitxml="$result_root/junit.xml" \

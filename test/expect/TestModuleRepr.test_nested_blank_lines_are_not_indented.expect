@@ -1,0 +1,7 @@
+_WrapperModule(
+  (child): _MultilineModule(
+    first
+
+    third
+  )
+)

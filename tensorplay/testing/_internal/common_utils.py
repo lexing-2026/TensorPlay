@@ -602,6 +602,38 @@ class TestCase(unittest.TestCase):
         with self.assertRaises(AssertionError, msg=msg):
             self.assertEqual(x, y, msg, atol=atol, rtol=rtol, **kwargs)
 
+    def assertExpected(self, actual, subname: str | None = None) -> None:
+        """Compare against a golden file instead of an inline literal.
+
+        The golden file lives in ``expect/<Class>.<test>[-<subname>].expect``
+        next to the calling test module, so a suite that uses golden files
+        ships them alongside the tests. Regenerate by running the test with
+        ``TP_TEST_ACCEPT=1`` set; without it, a mismatch shows a diff and
+        names the file to regenerate.
+        """
+        module_file = getattr(sys.modules[type(self).__module__], "__file__", None)
+        if module_file is None:
+            raise AssertionError("assertExpected needs the test module on disk")
+        name = f"{type(self).__name__}.{self._testMethodName}"
+        if subname is not None:
+            name = f"{name}-{subname}"
+        path = os.path.join(os.path.dirname(os.path.abspath(module_file)),
+                            "expect", f"{name}.expect")
+        if os.environ.get("TP_TEST_ACCEPT") == "1":
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(str(actual))
+            return
+        if not os.path.exists(path):
+            raise AssertionError(
+                f"missing golden file {path}; run the test with "
+                "TP_TEST_ACCEPT=1 to create it")
+        with open(path, encoding="utf-8") as f:
+            expected = f.read()
+        self.assertMultiLineEqual(
+            str(actual), expected,
+            msg=f"golden file {path} (regenerate with TP_TEST_ACCEPT=1)")
+
     def assertEqualIgnoreType(self, *args, **kwargs) -> None:
         # If you are seeing this function used, that means the test is written
         # loosely with respect to dtypes and deserves detailed investigation.

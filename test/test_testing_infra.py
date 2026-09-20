@@ -518,6 +518,20 @@ class TestReferenceHelpers(TestCase):
             assert_reference_close(from_reference(ref, "cpu"), ref + 1)
 
 
+class TestAssertExpected(TestCase):
+    def test_golden_roundtrip(self):
+        self.assertExpected("a fixed golden value\nwith two lines")
+
+    def test_mismatch_names_the_golden_file(self):
+        with self.assertRaisesRegex(
+                AssertionError, r"expect.*TestAssertExpected.*regenerate"):
+            self.assertExpected("this text no longer matches")
+
+    def test_missing_golden_names_the_file(self):
+        with self.assertRaisesRegex(AssertionError, "missing golden file"):
+            self.assertExpected("anything", "no_such_golden")
+
+
 class TestMakeTensor(TestCase):
     def test_floating_range(self):
         t = make_tensor(1000, dtype=tp.float32, device="cpu")
