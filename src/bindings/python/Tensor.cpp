@@ -2,7 +2,7 @@
 #include "tensorplay/ops/TensorBindingsGenerated.h"
 #include "tensorplay/ops/TensorCPythonGenerated.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
-#include "utils.h"
+#include "PythonUtils.h"
 #include "dlpack_types.h"
 #include "TensorImpl.h" // For unsafeGetTensorImpl
 #include "Autograd.h" // tpx autograd helpers; Tensor is the p10 tensor type
