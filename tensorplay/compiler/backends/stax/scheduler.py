@@ -9,6 +9,10 @@ Splits a captured graph into an ordered list of fusion segments:
   folds back INTO the same kernel as a store-time epilogue (red→pw
   vertical fusion, ``Segment.epilogue``); chains reading anything else
   start a new kernel;
+* an extern segment carries the same store-time epilogue: a pointwise
+  chain whose only tensor input is the operator's output attaches to the
+  segment while no other value competes for it (the fused form re-runs
+  inside the plan that lowers the operator);
 * back-to-back reductions split into separate segments;
 * any non-pointwise, non-reduction operator becomes a ONE-NODE ``"extern"``
   segment: the backend runs it eagerly between fused kernels, so a graph
@@ -51,7 +55,9 @@ class Segment:
     reduction: Any = None
     #: pointwise chain computed on the reduction result INSIDE the same
     ## kernel (store-time epilogue).  Every node here transitively consumes
-    #: ``nodes[-1]``; anything else stays a separate segment.
+    #: ``nodes[-1]``; anything else stays a separate segment.  An extern
+    #: segment carries the same field: the chain runs on the operator's
+    #: output inside the plan that lowers the segment.
     epilogue: Tuple[Node, ...] = ()
     #: Every value this kernel leaves in a runtime buffer: the main export
     #: first (epilogue tail when present, else the run tail), then extra
@@ -180,6 +186,38 @@ def segment_graph(
     open_extras: List[Node] = []
     #: closed-segment node -> segment index
     owner: dict = {}
+    #: the most recent extern segment and its index — a pointwise chain
+    #: reading only the operator output may attach as its store-time
+    #: epilogue (the last extern wins: chains from older operators keep
+    #: their own kernels)
+    open_extern: Optional[Segment] = None
+    open_extern_index: int = -1
+
+    def extern_epilogue_attach(node: Node) -> bool:
+        """May ``node`` continue the open extern segment's epilogue?
+
+        The chain stays strictly linear: the node's only tensor dependency
+        is the operator output (or the epilogue tail built so far) — every
+        other argument a scalar — and the value it continues from carries
+        this node as its ONLY user.  The single-user rule is what keeps the
+        chain foldable without extra stores: neither the raw operator
+        output nor an interior epilogue value is ever read outside the
+        chain, and no competing consumer can appear later in the walk.
+        """
+
+        if open_extern is None:
+            return False
+        live_tail = (
+            open_extern.epilogue[-1]
+            if open_extern.epilogue
+            else open_extern.nodes[-1]
+        )
+        if live_tail.users != {node}:
+            return False
+        deps = set(_flatten_values(node.args)) | set(
+            _flatten_values(node.kwargs)
+        )
+        return deps == {live_tail}
 
     def close() -> None:
         nonlocal current, current_reduction, current_epilogue, open_extras
@@ -296,6 +334,19 @@ def segment_graph(
             current_reduction = reduction
             continue
         if is_pointwise(node):
+            if (
+                allow_epilogue
+                and open_extern is not None
+                and extern_epilogue_attach(node)
+            ):
+                # Store-time epilogue on the extern segment: the plan that
+                # lowers the operator runs this chain on its output (the
+                # training path never reaches here — it schedules without
+                # epilogues).
+                open_extern.epilogue = open_extern.epilogue + (node,)
+                open_extern.exports = (node,)
+                owner[node] = open_extern_index
+                continue
             if current_reduction is not None:
                 # pw after a reduction joins the SAME kernel as a store-time
                 # epilogue when it lives on the reduction's registers;
@@ -333,6 +384,8 @@ def segment_graph(
         segments.append(
             Segment(nodes=(node,), kind="extern", exports=(node,))
         )
+        open_extern = segments[-1]
+        open_extern_index = len(segments) - 1
         continue
 
     # The graph output counts as a consumer: a final value interior to the

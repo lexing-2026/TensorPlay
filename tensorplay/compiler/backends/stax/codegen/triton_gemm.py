@@ -46,9 +46,68 @@ GEMM_CANDIDATE_CONFIGS: Tuple[Tuple[int, int, int, int, int], ...] = (
 
 # Salt for the persisted decision: bump when the kernel body or the
 # candidate table changes so old decisions cannot pin stale geometry.
-GEMM_TUNING_VERSION = "gemm-v2"
+GEMM_TUNING_VERSION = "gemm-v3"
 
 _DECISION_NAMESPACE = "triton-autotune"
+
+# Head of the epilogue-fused tile kernel: identical arithmetic to
+# ``_gemm_kernel`` up to the accumulator; the chain's instruction lines and
+# the final store splice in after the k-loop.  The epilogue runs on the
+# accumulator registers, so the unfused product never touches memory.
+_GEMM_EPI_TEMPLATE_HEAD = '''\
+import triton
+import triton.language as tl
+import triton.language.extra.cuda.libdevice as libdevice
+
+
+@triton.jit
+def _gemm_epi_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    EVEN_K: tl.constexpr, ALLOW_TF32: tl.constexpr,
+):
+    """Epilogue-fused C = chain(A @ B) with fp32 accumulation.
+
+    TF32 shortens the multiplier datapath when ``ALLOW_TF32`` is set (the
+    caller's global matmul switch); the accumulated sum stays fp32 either
+    way.  Output rows/cols wrap with ``% M``/``% N`` so the store needs no
+    separate bounds mask; loads guard the k tail unless ``EVEN_K``.
+    """
+
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    off_m = (pid_m * BM + tl.arange(0, BM)) % M
+    off_n = (pid_n * BN + tl.arange(0, BN)) % N
+    off_k = tl.arange(0, BK)
+    a_ptrs = a_ptr + off_m[:, None] * stride_am + off_k[None, :] * stride_ak
+    b_ptrs = b_ptr + off_k[:, None] * stride_bk + off_n[None, :] * stride_bn
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BK)):
+        if EVEN_K:
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
+        else:
+            k_tail = K - k * BK
+            a = tl.load(a_ptrs, mask=off_k[None, :] < k_tail, other=0.0)
+            b = tl.load(b_ptrs, mask=off_k[:, None] < k_tail, other=0.0)
+        if ALLOW_TF32:
+            acc = tl.dot(a, b, acc, input_precision="tf32")
+        else:
+            acc = tl.dot(a, b, acc, input_precision="ieee")
+        a_ptrs += BK * stride_ak
+        b_ptrs += BK * stride_bk
+'''
+
+_GEMM_EPI_TEMPLATE_STORE = '''\
+    c_ptrs = c_ptr + off_m[:, None] * stride_cm + off_n[None, :] * stride_cn
+    tl.store(c_ptrs, {store_source})
+'''
+
+_EPI_KERNEL_MEMO: dict = {}
 
 if HAS_TRITON:
 
@@ -143,12 +202,23 @@ def _matmul_allow_tf32() -> bool:
 
 
 def _decision_key(
-    M: int, N: int, K: int, dtype: str, device: str, allow_tf32: bool
+    M: int,
+    N: int,
+    K: int,
+    dtype: str,
+    device: str,
+    allow_tf32: bool,
+    epilogue: Optional[Tuple[list[int], list[float], int]] = None,
 ) -> str:
     source = (
         f"gemm|{_kernel_source_digest()}|{M}|{N}|{K}|{dtype}|{device}"
         f"|tf32={int(allow_tf32)}"
     )
+    if epilogue is not None:
+        program, constants, esrc = epilogue
+        source += "|epi=" + hashlib.sha256(
+            repr((tuple(program), tuple(constants), esrc)).encode()
+        ).hexdigest()[:12]
     return hashlib.sha256(source.encode()).hexdigest()[:24]
 
 
@@ -169,6 +239,60 @@ def _probe_feed(M: int, K: int, N: int, dtype: Any, device: Any) -> list:
     return [ramp(M, K).reshape(M, K), ramp(K, N).reshape(K, N)]
 
 
+def _fused_gemm_kernel(
+    epilogue: Tuple[list[int], list[float], int],
+    config: Tuple[int, int, int, int, int],
+    allow_tf32: bool,
+):
+    """JIT the epilogue-fused tile kernel for one payload and config.
+
+    The chain's instruction lines are spliced between the k-loop and the
+    store; the memo keeps one JITFunction per (payload, config, precision)
+    so repeated candidate launches reuse the compiled binary.
+    """
+
+    program, constants, esrc = epilogue
+    key = hashlib.sha256(
+        (
+            GEMM_TUNING_VERSION
+            + repr((tuple(program), tuple(constants), esrc))
+            + repr(config)
+            + repr(allow_tf32)
+        ).encode()
+    ).hexdigest()[:16]
+    cached = _EPI_KERNEL_MEMO.get(key)
+    if cached is not None:
+        return cached
+    from .triton import emit_tile_epilogue_lines
+
+    lines, store_source = emit_tile_epilogue_lines(
+        list(program), list(constants), esrc, "acc"
+    )
+    source = (
+        _GEMM_EPI_TEMPLATE_HEAD
+        + "\n".join("    " + line for line in lines)
+        + "\n"
+        + _GEMM_EPI_TEMPLATE_STORE.format(store_source=store_source)
+    )
+    import linecache
+
+    fake_file = f"<tensorplay-stax-gemm-epi-{key}>"
+    # The jit decorator reads the decorated function's source through the
+    # linecache, so the generated text must be registered under the
+    # compile-time filename before the exec that defines it.
+    linecache.cache[fake_file] = (
+        len(source),
+        None,
+        source.splitlines(True),
+        fake_file,
+    )
+    namespace: dict[str, Any] = {"triton": triton, "tl": tl}
+    exec(compile(source, fake_file, "exec"), namespace, namespace)
+    kernel = namespace["_gemm_epi_kernel"]
+    _EPI_KERNEL_MEMO[key] = kernel
+    return kernel
+
+
 def _triton_launch_factory(
     a_spec: Tuple[Optional[int], Any],
     b_spec: Tuple[Optional[int], Any],
@@ -176,15 +300,23 @@ def _triton_launch_factory(
     config: Tuple[int, int, int, int, int],
     base_launch: Callable[[list], Any],
     allow_tf32: bool = False,
+    epilogue: Optional[Tuple[list[int], list[float], int]] = None,
 ):
     """Build a launch closure running one fixed GEMM tile configuration.
 
     Each operand spec is ``(feed position, literal tensor)`` — exactly one
     side is set: graph operands come from the feed, constants (module
-    weights captured as literals) are closed over.
+    weights captured as literals) are closed over.  With ``epilogue`` the
+    tile kernel applies the pointwise chain to the accumulator before the
+    store; ``base_launch`` (the full region fallback, epilogue included)
+    still covers non-standard operand layouts at call time.
     """
 
     block_m, block_n, block_k, num_warps, num_stages = config
+    if epilogue is None:
+        kernel = _gemm_kernel
+    else:
+        kernel = _fused_gemm_kernel(epilogue, config, allow_tf32)
 
     def operand(feed: list, spec: Tuple[Optional[int], Any]) -> Any:
         position, literal = spec
@@ -200,11 +332,11 @@ def _triton_launch_factory(
             and _standard_2d(tuple(b.shape), tuple(b.stride()))
         ):
             # The baked kernel assumes standard 2-D layouts; a differently
-            # strayed call takes the native operator instead.
+            # strayed call takes the fallback launch instead.
             return base_launch(feed)
         out = tp.empty((M, N), dtype=a.dtype, device=a.device)
         grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
-        _gemm_kernel[grid](
+        kernel[grid](
             a, b, out, M, N, K,
             a.stride(0), a.stride(1),
             b.stride(0), b.stride(1),
@@ -224,6 +356,9 @@ def tuned_matmul_launch(
     sample_feed: Sequence[Any],
     operand_specs: Tuple[Tuple[Optional[int], Any], Tuple[Optional[int], Any]],
     out_shape: Tuple[int, ...],
+    *,
+    epilogue: Optional[Tuple[list[int], list[float], int]] = None,
+    epilogue_launch: Optional[Callable[[list], Any]] = None,
 ) -> Optional[Callable[[list], Any]]:
     """Benchmark native vs Triton GEMM for one matmul extern segment.
 
@@ -233,14 +368,34 @@ def tuned_matmul_launch(
     segment does not qualify (non-2D, non-fp32, non-CUDA, exotic layouts)
     or the native operator wins.  ``base_launch`` remains the floor: it is
     one of the benched candidates and the fallback for unbenchable inputs.
+
+    With ``epilogue`` (a ``(program, constants, esrc)`` chain replaying on
+    the matmul output), the Triton candidates fuse the chain into the tile
+    kernel and the native side composes ``base_launch`` (the bare operator)
+    with ``epilogue_launch`` (the chain as its own kernel) — every benched
+    candidate runs the full region, so the comparison stays fair.
     """
 
     import tensorplay as tp
 
+    if epilogue is not None and epilogue_launch is None:
+        # No composed chain kernel: the caller keeps its own launch.
+        return None
     if not HAS_TRITON or len(out_shape) != 2:
         return None
     if not tp.cuda.is_available():
         return None
+
+    if epilogue is None:
+        native_launch = base_launch
+    else:
+
+        def native_launch(
+            feed: list,
+            _base: Callable[[list], Any] = base_launch,
+            _epi: Callable[[list], Any] = epilogue_launch,
+        ):
+            return _epi([_base(feed)])
 
     def operand_tensor(spec: Tuple[Optional[int], Any]) -> Any:
         position, literal = spec
@@ -267,7 +422,9 @@ def tuned_matmul_launch(
     N = shape_b[1]
     device_key = repr(a.device)
     allow_tf32 = _matmul_allow_tf32()
-    cache_key = _decision_key(M, N, K, str(a.dtype), device_key, allow_tf32)
+    cache_key = _decision_key(
+        M, N, K, str(a.dtype), device_key, allow_tf32, epilogue
+    )
 
     try:
         from ..codecache import default_cache
@@ -278,15 +435,16 @@ def tuned_matmul_launch(
 
     def launch_for(choice: dict) -> Callable[[list], Any]:
         if choice.get("choice") != "triton":
-            return base_launch
+            return native_launch
         config = (
             int(choice["bm"]), int(choice["bn"]), int(choice["bk"]),
             int(choice["warps"]), int(choice["stages"]),
         )
         return _triton_launch_factory(
             operand_specs[0], operand_specs[1],
-            M, N, K, config, base_launch,
+            M, N, K, config, native_launch,
             allow_tf32=bool(choice.get("tf32", False)),
+            epilogue=epilogue,
         )
 
     payload = cache.load(cache_key, ext="json")
@@ -303,11 +461,12 @@ def tuned_matmul_launch(
 
     def build(candidate):
         if candidate[0] == "native":
-            return base_launch
+            return native_launch
         return _triton_launch_factory(
             operand_specs[0], operand_specs[1],
-            M, N, K, candidate[1], base_launch,
+            M, N, K, candidate[1], native_launch,
             allow_tf32=allow_tf32,
+            epilogue=epilogue,
         )
 
     def bench(launch: Any, args: list) -> float:
@@ -325,11 +484,11 @@ def tuned_matmul_launch(
         if best is None or best[0] == "native":
             record = {"choice": "native", "tf32": allow_tf32}
         else:
-            reference = base_launch(probe)
+            reference = native_launch(probe)
             produced = best_launch(probe)
             if not tp.allclose(produced, reference, rtol=tolerance[0], atol=tolerance[1]):
                 record = {"choice": "native", "tf32": allow_tf32}
-                best_launch = base_launch
+                best_launch = native_launch
             else:
                 cfg = best[1]
                 record = {
@@ -341,7 +500,7 @@ def tuned_matmul_launch(
         cache.store(cache_key, json.dumps(record).encode(), ext="json")
         return launch_for(record)
     except Exception:  # noqa: BLE001 - tuning is an optimization only
-        return base_launch
+        return native_launch
 
 
 def _bench_candidates(build, candidates, args, bench):

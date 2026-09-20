@@ -187,3 +187,141 @@ def test_gemm_decision_replay_skips_benchmarking_with_tf32(cache_root, monkeypat
     )
     second = tp.compile(fn, mode="max-autotune")
     assert tp.allclose(second(x), fn(x), rtol=2e-2, atol=2e-2)
+
+
+# --- epilogue-fused tiles (M5e) -------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not tp.cuda.is_available(), reason="CUDA unavailable"
+)
+def test_epilogue_decision_key_separates_chains():
+    """Different store-time chains on one shape never share a decision."""
+
+    key_relu = tg._decision_key(
+        64, 32, 48, "tensorplay.float32", "cuda:0", False, ([17, 0, -1], [], 0)
+    )
+    key_sig = tg._decision_key(
+        64, 32, 48, "tensorplay.float32", "cuda:0", False, ([21, 0, -1], [], 0)
+    )
+    bare = tg._decision_key(64, 32, 48, "tensorplay.float32", "cuda:0", False)
+    assert len({key_relu, key_sig, bare}) == 3
+
+
+@pytest.mark.skipif(
+    not tp.cuda.is_available(), reason="CUDA unavailable"
+)
+def test_emit_tile_epilogue_lines_pins_chain_on_register():
+    """The shared emitter resolves the chain's single tensor input onto the
+    accumulator register and stores the chain's final temporary."""
+
+    from tensorplay.compiler.backends.stax.codegen.triton import (
+        TritonProgramCodegen,
+        emit_tile_epilogue_lines,
+    )
+
+    opcode = {
+        name: code for code, name in TritonProgramCodegen._OP_NAMES.items()
+    }
+    # relu(acc); etmp1 * 0.5 (unused rhs slots point at spare constants)
+    program = [opcode["relu"], 0, -1, opcode["mul"], 1, -2]
+    lines, final = emit_tile_epilogue_lines(program, [0.0, 0.5], 0, "acc")
+    assert lines == [
+        "etmp1 = tl.maximum(acc, 0.0)",
+        "etmp2 = etmp1 * 0.5",
+    ]
+    assert final == "etmp2"
+
+
+@pytest.mark.skipif(
+    not tp.cuda.is_available(), reason="CUDA unavailable"
+)
+def test_fused_epilogue_matmul_matches_eager_gpu(cache_root):
+    """A matmul with a single-user pointwise tail compiles to one fused
+    tile under max-autotune and matches eager within fp32 tile-order
+    noise; every benched candidate runs the full region."""
+
+    import importlib
+
+    canonical_gemm = importlib.import_module(
+        "tensorplay.compiler.backends.stax.codegen.triton_gemm"
+    )
+
+    device = tp.device("cuda", 0)
+    w = tp.randn(512, 512, device=device)
+
+    def fn(t):
+        return (t @ w).relu()
+
+    x = tp.randn(512, 512, device=device)
+    compiled = tp.compile(fn, mode="max-autotune", fullgraph=True)
+    out = compiled(x)
+    ref = fn(x)
+    assert out.shape == ref.shape
+    assert tp.allclose(out, ref, rtol=1e-4, atol=1e-4)
+    # the fused tile candidates were built and benched (the region never
+    # silently degrades to the composite native floor)
+    assert len(canonical_gemm._EPI_KERNEL_MEMO) > 0
+
+    def chain(t):
+        return (((t @ w).relu() + 1.0) * 0.5).sigmoid()
+
+    x2 = tp.randn(513, 512, device=device)
+    compiled2 = tp.compile(chain, mode="max-autotune", fullgraph=True)
+    out2 = compiled2(x2)
+    ref2 = chain(x2)
+    assert tp.allclose(out2, ref2, rtol=1e-4, atol=1e-4)
+
+    records = [
+        json.loads(path.read_bytes().decode())
+        for path in cache_root.rglob("*.json")
+    ]
+    gemm_records = [r for r in records if "choice" in r]
+    assert gemm_records, "the fused segment must persist a decision"
+
+
+@pytest.mark.skipif(
+    not tp.cuda.is_available(), reason="CUDA unavailable"
+)
+def test_extern_epilogue_region_feeds_reduction_gpu(cache_root):
+    """The folded chain's export wires into a following reduction
+    segment; numerics stay on the eager schedule."""
+
+    device = tp.device("cuda", 0)
+    w = tp.randn(96, 128, device=device)
+
+    def fn(t):
+        return ((t @ w).relu()).sum(dim=1)
+
+    x = tp.randn(64, 96, device=device)
+    compiled = tp.compile(fn, mode="max-autotune", fullgraph=True)
+    out = compiled(x)
+    ref = fn(x)
+    assert out.shape == ref.shape
+    assert tp.allclose(out, ref, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(
+    not tp.cuda.is_available(), reason="CUDA unavailable"
+)
+def test_extern_epilogue_training_stays_segmented_gpu(cache_root):
+    """Training schedules carry no store-time epilogues: the pointwise tail
+    keeps its own segment and gradients match eager (the output magnitude
+    is O(sum), so tolerances are relative)."""
+
+    device = tp.device("cuda", 0)
+    w = tp.randn(64, 96, device=device)
+
+    def fn(t):
+        return ((t @ w).relu()).sum()
+
+    xc = tp.randn(8, 64, device=device, requires_grad=True)
+    compiled = tp.compile(fn, fullgraph=True)
+    out = compiled(xc)
+    out.backward()
+
+    xr = xc.detach().clone().requires_grad_(True)
+    ref = fn(xr)
+    ref.backward()
+    assert tp.allclose(out, ref, rtol=1e-5, atol=1e-4)
+    assert tp.allclose(xc.grad, xr.grad, rtol=1e-5, atol=1e-4)
