@@ -146,6 +146,19 @@ pytest --reruns 2 test/test_something.py
 If a test only fails intermittently, open an issue with the `kind/flaky`
 label rather than silently rerunning in CI.
 
+## Golden files
+
+Tests that pin a whole printed block (reprs, rendered output) can compare
+against a golden file instead of an inline literal:
+
+```python
+self.assertExpected(repr(module))
+```
+
+The file lives in `test/expect/<Class>.<test>[-<subname>].expect` next to
+the suite. To (re)generate it, run the test with `TP_TEST_ACCEPT=1`; a
+mismatch otherwise shows a diff and names the file to regenerate.
+
 ## Documentation
 
 Documentation is built using Sphinx.
