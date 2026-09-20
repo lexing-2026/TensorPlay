@@ -1131,6 +1131,12 @@ Tensor batch_mul_scalar(const Tensor& input, const Scalar& value) {
 Tensor batch_div_scalar(const Tensor& input, const Scalar& value) {
     return scalar("div.Scalar", input, value);
 }
+Tensor batch_floor_divide_scalar(const Tensor& input, const Scalar& value) {
+    return scalar("floor_divide.Scalar", input, value);
+}
+Tensor batch_remainder_scalar(const Tensor& input, const Scalar& value) {
+    return scalar("remainder.Scalar", input, value);
+}
 Tensor batch_bitwise_and_scalar(const Tensor& input, const Scalar& value) {
     return scalar("bitwise_and.Scalar", input, value);
 }
@@ -1992,6 +1998,8 @@ void register_batch_rules(tensorplay::Library& library) {
     register_batch_rule<&batch_sub_scalar>(library, "sub.Scalar");
     register_batch_rule<&batch_mul_scalar>(library, "mul.Scalar");
     register_batch_rule<&batch_div_scalar>(library, "div.Scalar");
+    register_batch_rule<&batch_floor_divide_scalar>(library, "floor_divide.Scalar");
+    register_batch_rule<&batch_remainder_scalar>(library, "remainder.Scalar");
     register_batch_rule<&batch_add>(library, "add.Tensor");
     register_batch_rule<&batch_sub>(library, "sub.Tensor");
     register_batch_rule<&batch_pow_scalar>(library, "pow.Tensor_Scalar");
