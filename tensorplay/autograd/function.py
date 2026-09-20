@@ -290,10 +290,6 @@ class _Context:
         for arg in args:
             if not isinstance(arg, tensorplay.Tensor):
                 raise RuntimeError("mark_non_differentiable only accepts Tensors")
-            if arg.is_leaf:
-                raise RuntimeError(
-                    "Only non-leaf tensors can be marked as non-differentiable"
-                )
             self._non_differentiable.add(id(arg))
 
 def once_differentiable(fn):
