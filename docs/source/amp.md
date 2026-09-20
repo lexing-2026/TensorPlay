@@ -20,7 +20,7 @@ are much faster in `lower_precision_fp`. Other ops, like reductions, often requi
 range of `float32`. Mixed precision tries to match each op to its appropriate datatype.
 Ordinarily, "automatic mixed precision training" with datatype of `tensorplay.float16` uses {class}`tensorplay.autocast` and
 {class}`tensorplay.amp.GradScaler` together, as shown in the {ref}`Automatic Mixed Precision examples<amp-examples>`
-and [Automatic Mixed Precision recipe](https://tensorplay.org/tutorials/recipes/recipes/amp_recipe.html).
+and [Automatic Mixed Precision recipe](https://www.tensorplay.cn/guide/tutorials).
 However, {class}`tensorplay.autocast` and {class}`tensorplay.GradScaler` are modular, and may be used separately if desired.
 As shown in the CPU example section of {class}`tensorplay.autocast`, "automatic mixed precision training/inference" on CPU with
 datatype of `tensorplay.bfloat16` only uses {class}`tensorplay.autocast`.

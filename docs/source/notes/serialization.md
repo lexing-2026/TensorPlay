@@ -103,7 +103,7 @@ before saving.
 
 ## Saving and loading tensorplay.nn.Modules
 
-See also: [Tutorial: Saving and loading modules](https://tensorplay.org/tutorials/beginner/saving_loading_models.html)
+See also: [Tutorial: Saving and loading modules](https://www.tensorplay.cn/guide/tutorials)
 
 In TensorPlay, a module’s state is frequently serialized using a ‘state dict.’
 A module’s state dict contains all of its parameters and persistent buffers:

@@ -6,7 +6,7 @@
 # Distributed communication package - tensorplay.distributed
 
 :::{note}
-Please refer to [TensorPlay Distributed Overview](https://tensorplay.org/tutorials/beginner/dist_overview.html)
+Please refer to [TensorPlay Distributed Overview](https://www.tensorplay.cn/guide/tutorials)
 for a brief introduction to all features related to distributed training.
 :::
 
@@ -304,7 +304,7 @@ that the CUDA operation is completed, since CUDA operations are asynchronous. Fo
 further function calls utilizing the output of the collective call will behave as expected. For CUDA collectives,
 function calls utilizing the output on the same CUDA stream will behave as expected. Users must take care of
 synchronization under the scenario of running under different streams. For details on CUDA semantics such as stream
-synchronization, see [CUDA Semantics](https://tensorplay.org/docs/stable/notes/cuda.html).
+synchronization, see [CUDA Semantics](https://www.tensorplay.cn/docs/cuda.html).
 See the below script to see examples of differences in these semantics for CPU and CUDA operations.
 **Asynchronous operation** - when `async_op` is set to True. The collective operation function
 returns a distributed request object. In general, you don't need to create it manually and it
@@ -372,7 +372,7 @@ with tensorplay.profiler():
     tensor = tensorplay.randn(20, 10)
     dist.all_reduce(tensor)
 ```
-Please refer to the [profiler documentation](https://tensorplay.org/docs/main/profiler.html) for a full overview of profiler features.
+Please refer to the [profiler documentation](https://www.tensorplay.cn/docs/) for a full overview of profiler features.
 
 ### NCCL Symmetric Kernels
 
@@ -454,7 +454,7 @@ moving tensors to CPU before passing them as inputs to an object collective.
 Besides the builtin GLOO/MPI/NCCL backends, TensorPlay distributed supports
 third-party backends through a run-time register mechanism.
 For references on how to develop a third-party backend through C++ Extension,
-please refer to [Tutorials - Custom C++ and CUDA Extensions](https://tensorplay.org/tutorials/advanced/cpp_extension.html) and
+please refer to [Tutorials - Custom C++ and CUDA Extensions](https://www.tensorplay.cn/guide/tutorials) and
 the samples under `test/cpp_extension/`. The capability of third-party
 backends are decided by their own implementations.
 The new backend derives from {class}`tensorplay.distributed.ProcessGroup` and registers the backend

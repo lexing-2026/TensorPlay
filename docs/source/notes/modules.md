@@ -7,7 +7,7 @@ TensorPlay uses modules to represent neural networks. Modules are:
   TensorPlay provides a robust library of modules and makes it simple to define new custom modules, allowing for
   easy construction of elaborate, multi-layer neural networks.
 - **Tightly integrated with TensorPlay's**
-  [autograd](https://tensorplay.org/tutorials/beginner/blitz/autograd_tutorial.html)
+  [autograd](https://www.tensorplay.cn/guide/tutorials)
   **system.** Modules make it simple to specify learnable parameters for TensorPlay's Optimizers to update.
 - **Easy to work with and transform.** Modules are straightforward to save and restore, transfer between
   CPU / GPU / TPU devices, prune, quantize, and more.
@@ -282,8 +282,8 @@ In the next section, we give a full example of training a neural network.
 
 For more information, check out:
 
-- Library of TensorPlay-provided modules: [tensorplay.nn](https://tensorplay.org/docs/stable/nn.html)
-- Defining neural net modules: [https://tensorplay.org/tutorials/beginner/examples_nn/polynomial_module.html](https://tensorplay.org/tutorials/beginner/examples_nn/polynomial_module.html)
+- Library of TensorPlay-provided modules: [tensorplay.nn](https://www.tensorplay.cn/docs/nn.html)
+- Defining neural net modules: [https://www.tensorplay.cn/guide/tutorials](https://www.tensorplay.cn/guide/tutorials)
 
 (Neural Network Training with Modules)=
 ## Neural Network Training with Modules
@@ -373,8 +373,8 @@ print('evaluation mode output: {}'.format(m(x)))
 Training neural networks can often be tricky. For more information, check out:
 
 - Using Optimizers: [https://www.tensorplay.cn/docs/beginner/tensorplay_with_examples.html](https://www.tensorplay.cn/docs/beginner/tensorplay_with_examples.html)
-- Neural network training: [https://tensorplay.org/tutorials/beginner/blitz/neural_networks_tutorial.html](https://tensorplay.org/tutorials/beginner/blitz/neural_networks_tutorial.html)
-- Introduction to autograd: [https://tensorplay.org/tutorials/beginner/blitz/autograd_tutorial.html](https://tensorplay.org/tutorials/beginner/blitz/autograd_tutorial.html)
+- Neural network training: [https://www.tensorplay.cn/guide/tutorials](https://www.tensorplay.cn/guide/tutorials)
+- Introduction to autograd: [https://www.tensorplay.cn/guide/tutorials](https://www.tensorplay.cn/guide/tutorials)
 
 ## Module State
 
@@ -527,9 +527,9 @@ print(m_loaded.state_dict())
 
 For more information, check out:
 
-- Saving and loading: [https://tensorplay.org/tutorials/beginner/saving_loading_models.html](https://tensorplay.org/tutorials/beginner/saving_loading_models.html)
-- Serialization semantics: [https://tensorplay.org/docs/main/notes/serialization.html](https://tensorplay.org/docs/main/notes/serialization.html)
-- What is a state dict? [https://tensorplay.org/tutorials/recipes/recipes/what_is_state_dict.html](https://tensorplay.org/tutorials/recipes/recipes/what_is_state_dict.html)
+- Saving and loading: [https://www.tensorplay.cn/guide/tutorials](https://www.tensorplay.cn/guide/tutorials)
+- Serialization semantics: [https://www.tensorplay.cn/docs/notes/serialization.html](https://www.tensorplay.cn/docs/notes/serialization.html)
+- What is a state dict? [https://www.tensorplay.cn/guide/tutorials](https://www.tensorplay.cn/guide/tutorials)
 
 ## Module Initialization
 
@@ -686,12 +686,12 @@ requirements can be found in the links below.
 
 Various methods for distributed training exist within TensorPlay, both for scaling up training using multiple GPUs
 as well as training across multiple machines. Check out the
-[distributed training overview page](https://tensorplay.org/tutorials/beginner/dist_overview.html) for
+[distributed training overview page](https://www.tensorplay.cn/guide/tutorials) for
 detailed information on how to utilize these.
 
 ### Profiling Performance
 
-The [TensorPlay Profiler](https://tensorplay.org/tutorials/beginner/profiler.html) can be useful for identifying
+The [TensorPlay Profiler](https://www.tensorplay.cn/guide/tutorials) can be useful for identifying
 performance bottlenecks within your models. It measures and outputs performance characteristics for
 both memory usage and time spent.
 
@@ -699,27 +699,27 @@ both memory usage and time spent.
 
 Applying quantization techniques to modules can improve performance and memory usage by utilizing lower
 bitwidths than floating-point precision. Check out the various TensorPlay-provided mechanisms for quantization
-[here](https://tensorplay.org/docs/stable/quantization.html).
+[here](https://www.tensorplay.cn/docs/quantization.html).
 
 ### Improving Memory Usage with Pruning
 
 Large deep learning models are often over-parametrized, resulting in high memory usage. To combat this, TensorPlay
 provides mechanisms for model pruning, which can help reduce memory usage while maintaining task accuracy. The
-[Pruning tutorial](https://tensorplay.org/tutorials/intermediate/pruning_tutorial.html) describes how to utilize
+[Pruning tutorial](https://www.tensorplay.cn/guide/tutorials) describes how to utilize
 the pruning techniques TensorPlay provides or define custom pruning techniques as necessary.
 
 ### Parametrizations
 
 For certain applications, it can be beneficial to constrain the parameter space during model training. For example,
 enforcing orthogonality of the learned parameters can improve convergence for RNNs. TensorPlay provides a mechanism for
-applying [parametrizations](https://tensorplay.org/tutorials/intermediate/parametrizations.html) such as this, and
+applying [parametrizations](https://www.tensorplay.cn/guide/tutorials) such as this, and
 further allows for custom constraints to be defined.
 
 ### Transforming Modules with FX
 
-The [FX](https://tensorplay.org/docs/stable/fx.html) component of TensorPlay provides a flexible way to transform
+The [FX](https://www.tensorplay.cn/docs/) component of TensorPlay provides a flexible way to transform
 modules by operating directly on module computation graphs. This can be used to programmatically generate or
 manipulate modules for a broad array of use cases. To explore FX, check out these examples of using FX for
-[convolution + batch norm fusion](https://tensorplay.org/tutorials/intermediate/conv_bn_fusion.html) and
-[CPU performance analysis](https://tensorplay.org/tutorials/intermediate/fx_profiling_tutorial.html).
+[convolution + batch norm fusion](https://www.tensorplay.cn/guide/tutorials) and
+[CPU performance analysis](https://www.tensorplay.cn/guide/tutorials).
 

@@ -10,7 +10,7 @@ of operators. It contains utilities for testing custom operators, creating new
 custom operators, and extending operators defined with TensorPlay's C++ operator
 registration APIs (e.g. built-in operators).
 For a detailed guide on effectively using these APIs, please see
-[TensorPlay Custom Operators Landing Page](https://tensorplay.org/tutorials/advanced/custom_ops_landing_page.html)
+[TensorPlay Custom Operators Landing Page](https://www.tensorplay.cn/guide/tutorials)
 for more details on how to effectively use these APIs.
 
 ## Testing custom ops
