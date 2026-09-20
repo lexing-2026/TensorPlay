@@ -1,13 +1,15 @@
-"""
+"""RNN-family numerics against the reference framework.
 
-Cases: lstm / gru / rnn_tanh x {bidirectional, batch_first, num_layers,
-module so both stacks compute the exact same function.
+Cases: lstm / gru / rnn_tanh crossed with bidirectional, batch_first,
+num_layers and dtype; parameters are copied from a reference module so
+both stacks compute the exact same function.
 """
 import itertools
 import os
 import sys
 
 import numpy as np
+import pytest
 import torch
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -97,28 +99,18 @@ def run_case(kind, T, N, feat, H, num_layers, bidir, batch_first, bias, dtype):
     return max(errs), tol
 
 
-def main():
-    failures = 0
-    total = 0
-    for kind in ["lstm", "gru", "rnn_tanh"]:
-        for bidir, bf, layers, bias, dtype in itertools.product(
-                [False, True], [False, True], [1, 2], [True],
-                ["fp16", "bf16", "fp32", "fp64"]):
-            total += 1
-            case = (kind, 6, 3, 4, 5, layers, bidir, bf, bias, dtype)
-            try:
-                err, tol = run_case(*case)
-                ok = err < tol
-            except Exception as e:
-                print(f"ERROR {case}: {type(e).__name__}: {e}")
-                failures += 1
-                continue
-            if not ok:
-                failures += 1
-            print(f"{'OK  ' if ok else 'FAIL'} {case} err={err:.3e}")
-    print(f"\n{total - failures}/{total} passed")
-    return 1 if failures else 0
+_CASES = list(itertools.product(
+    ["lstm", "gru", "rnn_tanh"],
+    [False, True],   # bidir
+    [False, True],   # batch_first
+    [1, 2],          # num_layers
+    [True],          # bias
+    ["fp16", "bf16", "fp32", "fp64"],
+))
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+@pytest.mark.parametrize("kind,bidir,batch_first,num_layers,bias,dtype", _CASES)
+def test_rnn_numerics(kind, bidir, batch_first, num_layers, bias, dtype):
+    err, tol = run_case(kind, 6, 3, 4, 5, num_layers, bidir, batch_first,
+                        bias, dtype)
+    assert err < tol, f"max abs err {err:.3e} >= tol {tol:.3e}"
