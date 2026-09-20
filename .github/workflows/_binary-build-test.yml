@@ -161,6 +161,15 @@ jobs:
       # stages the conda-forge libomp; Windows captures the MSVC env and
       # provisions the pinned MKL trio plus libuv.
 
+      # The CUDA kernel sources (grouped GEMM tensor-op route, native flash
+      # attention) consume the cutlass and flash-attention submodules; the
+      # pinned gitlinks come with the checkout, so only the worktrees are
+      # missing.  CPU lanes compile no .cu sources and skip the fetch.
+      - name: Fetch CUDA kernel submodules
+        if: ${{ inputs.cuda != 'cpu' }}
+        shell: bash
+        run: git submodule update --init third_party/cutlass third_party/flash-attention
+
       # The wheel links vendored SLEEF/NNPACK trees that CI checkouts do
       # not carry; fetch the pinned revisions before configuring.
       - name: Restore vendored build dependencies
