@@ -816,6 +816,16 @@
 - name: remainder.Scalar(Tensor self, Scalar other) -> Tensor
   self: grad
 
+# The floored quotient is a step function of both operands: locally constant
+# everywhere it is defined, so both gradients are zero (same convention as
+# floor above).
+- name: floor_divide.Tensor(Tensor self, Tensor other) -> Tensor
+  self: zeros_like(grad)
+  other: zeros_like(grad)
+
+- name: floor_divide.Scalar(Tensor self, Scalar other) -> Tensor
+  self: zeros_like(grad)
+
 - name: fmod.Scalar(Tensor self, Scalar other) -> Tensor
   self: grad
 
