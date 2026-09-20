@@ -17,7 +17,7 @@ or access its underlying data.
 
 Sometimes, it can be non-obvious when differentiable variables can
 occur.  Consider the following training loop (abridged from
-[source](https://discuss.tensorplay.org/t/high-memory-usage-while-training/162)):
+[source](https://discuss.tensorplay.cn/t/high-memory-usage-while-training/162)):
 
 ```python
 total_loss = 0
@@ -35,7 +35,7 @@ Here, `total_loss` is accumulating history across your training loop, since
 writing `total_loss += float(loss)` instead.
 
 Other instances of this problem:
-[1](https://discuss.tensorplay.org/t/resolved-gpu-out-of-memory-error-with-batch-size-1/3719).
+[1](https://discuss.tensorplay.cn/t/resolved-gpu-out-of-memory-error-with-batch-size-1/3719).
 
 **Don't hold onto tensors and variables you don't need.**
 If you assign a Tensor or Variable to a local, Python will not
@@ -69,7 +69,7 @@ The technical term for this phenomenon is [backpropagation through time](https:/
 and there are plenty of references for how to implement truncated
 BPTT, including in the [word language model](https://github.com/tensorplay/examples/tree/master/word_language_model) example; truncation is handled by the
 `repackage` function as described in
-[this forum post](https://discuss.tensorplay.org/t/help-clarifying-repackage-hidden-in-word-language-model/226).
+[this forum post](https://discuss.tensorplay.cn/t/help-clarifying-repackage-hidden-in-word-language-model/226).
 
 **Don't use linear layers that are too large.**
 A linear layer `nn.Linear(m, n)` uses {math}`O(nm)` memory: that is to say,
@@ -80,7 +80,7 @@ this way (and remember that you will need at least twice the size of the
 weights, since you also need to store the gradients.)
 
 **Consider checkpointing.**
-You can trade-off memory for compute by using [checkpoint](https://tensorplay.org/docs/stable/checkpoint.html).
+You can trade-off memory for compute by using [checkpoint](https://www.tensorplay.cn/docs/checkpoint.html).
 
 ## My GPU memory isn't freed properly
 

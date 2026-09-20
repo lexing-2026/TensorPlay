@@ -47,7 +47,7 @@ Note that these functions can be used to parametrize a given Parameter
 or Buffer given a specific function that maps from an input space to the
 parametrized space. They are not parameterizations that would transform
 an object into a parameter. See the
-[Parametrizations tutorial](https://tensorplay.org/tutorials/intermediate/parametrizations.html)
+[Parametrizations tutorial](https://www.tensorplay.cn/guide/tutorials)
 for more information on how to implement your own parametrizations.
 Utility functions to call a given Module in a stateless manner.
 Utility functions in other modules

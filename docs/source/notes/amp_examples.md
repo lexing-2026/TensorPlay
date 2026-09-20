@@ -21,7 +21,7 @@ gradients by minimizing gradient underflow, as explained {ref}`here <gradient-sc
 In the samples below, each is used as its individual documentation suggests.
 
 (Samples here are illustrative. See the
-[Automatic Mixed Precision recipe](https://tensorplay.org/tutorials/recipes/recipes/amp_recipe.html)
+[Automatic Mixed Precision recipe](https://www.tensorplay.cn/guide/tutorials)
 for a runnable walkthrough.)
 
 ```{contents}
@@ -345,7 +345,7 @@ autocast compatibility if any function
 - takes multiple floating-point Tensor inputs,
 - wraps any autocastable op (see the {ref}`Autocast Op Reference <autocast-op-reference>`), or
 - requires a particular `dtype` (for example, if it wraps
-  [CUDA extensions](https://tensorplay.org/tutorials/advanced/cpp_extension.html)
+  [CUDA extensions](https://www.tensorplay.cn/guide/tutorials)
   that were only compiled for `dtype`).
 
 In all cases, if you're importing the function and can't alter its definition, a safe fallback

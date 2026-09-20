@@ -61,7 +61,7 @@ You can see the full script in
       model.load_state_dict(state_dict)
 
       # For checkpoint saved elsewhere
-      checkpoint = 'https://download.tensorplay.org/models/resnet18-5c106cde.pth'
+      checkpoint = 'https://download.tensorplay.cn/models/resnet18-5c106cde.pth'
       model.load_state_dict(tensorplay.hub.load_state_dict_from_url(checkpoint, progress=False))
 ```
 
