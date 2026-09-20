@@ -72,6 +72,8 @@ node_modules/
 !/third_party/python-peachpy
 !/third_party/gloo
 !/third_party/tensorpipe
+!/third_party/cutlass
+!/third_party/flash-attention
 !/third_party/vulkan-headers
 !/third_party/vulkan-memory-allocator
 
