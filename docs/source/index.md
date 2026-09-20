@@ -34,10 +34,12 @@ nn.functional
 nn.init
 optim
 cuda
+accelerator
 amp
 linalg
 fft
 special
+signal
 sparse
 random
 data
