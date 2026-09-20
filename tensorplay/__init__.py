@@ -1388,9 +1388,22 @@ def _polish_public_surface():
         if not module_name.startswith("tensorplay") or "._" in module_name:
             continue
         for name, obj in list(vars(module).items()):
-            if name.startswith("_") or isinstance(obj, type):
+            # The shim only targets C functions, so submodules and other
+            # non-callables are skipped.  Probing them is not just wasted
+            # work: attribute access on lazy proxies such as the cuFFT
+            # plan-cache manager runs device init and raises on CPU-only
+            # builds, and getattr's default only suppresses AttributeError.
+            if (
+                name.startswith("_")
+                or isinstance(obj, (type, _stdlib_types.ModuleType))
+                or not callable(obj)
+            ):
                 continue
-            qualname = getattr(obj, "__qualname__", None)
+            try:
+                qualname = getattr(obj, "__qualname__", None)
+            except Exception:
+                # a callable proxy may still run arbitrary code on access
+                continue
             if not isinstance(qualname, str) or not qualname.startswith("PyCapsule."):
                 continue
             vars(module)[name] = _CleanFunction(obj, name)
