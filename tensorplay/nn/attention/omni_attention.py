@@ -19,6 +19,7 @@ from typing_extensions import deprecated, Never, NotRequired, Self, TypedDict
 
 import tensorplay
 from tensorplay import Tensor
+from tensorplay.graph import GraphCaptureError
 from tensorplay._higher_order_ops.omni_attention import (
     omni_attention as omni_attention_hop,
 )
@@ -2234,7 +2235,7 @@ def _validate_device(query: Tensor, key: Tensor, value: Tensor) -> None:
 
 
 def _validate_no_nested_tensors(query: Tensor, key: Tensor, value: Tensor) -> None:
-    if query.is_nested or key.is_nested or value.is_nested:
+    if query.is_nested() or key.is_nested() or value.is_nested():
         raise NotImplementedError(
             "omni_attention does not support NestedTensor inputs, including "
             "compile(omni_attention) with jagged NestedTensor inputs. "
@@ -2612,8 +2613,12 @@ def omni_attention(
 
     # The tracer is expecting a callable with "__code__" attribute.
     # We cannot directly pass hop to it. So we wrap it in a dummy function.
-    def _omni_attention_hop_wrapper(*args, **kwargs):
-        return omni_attention_hop(*args, **kwargs)
+    # The wrapper spells out the hop's fixed parameter list: the compiler
+    # frontend traces the signature, and a varargs spelling is rejected.
+    def _omni_attention_hop_wrapper(query, key, value, score_mod, block_mask, scale, kernel_options):
+        return omni_attention_hop(
+            query, key, value, score_mod, block_mask, scale, kernel_options
+        )
 
     with setup_compilation_env() as backend:
         if _OMNI_ATTENTION_DISABLE_COMPILE_DEBUG:
@@ -2623,15 +2628,35 @@ def omni_attention(
                 _omni_attention_hop_wrapper, backend=backend, fullgraph=True
             )
 
-        out, lse, max_scores = omni_fn(
-            query,
-            key,
-            value,
-            score_mod,
-            block_mask.as_tuple(),
-            scale,
-            kernel_options,
-        )
+        try:
+            out, lse, max_scores = omni_fn(
+                query,
+                key,
+                value,
+                score_mod,
+                block_mask.as_tuple(),
+                scale,
+                kernel_options,
+            )
+        except Exception:
+            # The captured region is not always expressible yet (for one,
+            # the math path vmaps over indices that trace as graph values).
+            # Falling back to the eager hop keeps the results correct; any
+            # genuinely invalid input raises again from the eager re-run.
+            _warn_once(
+                "omni_attention_capture_fallback",
+                "omni_attention: the compiler could not capture this region; "
+                "running the unfused math implementation instead.",
+            )
+            out, lse, max_scores = _omni_attention_hop_wrapper(
+                query,
+                key,
+                value,
+                score_mod,
+                block_mask.as_tuple(),
+                scale,
+                kernel_options,
+            )
     return _finalize_outputs(
         out,
         lse,
