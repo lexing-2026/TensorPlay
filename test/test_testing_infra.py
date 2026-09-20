@@ -201,7 +201,9 @@ class TestDeviceTypeExtras(TestCase):
             def test_within_loose_precision(self, device):
                 self.assertEqual(tp.tensor([1.0]), tp.tensor([1.005]))
 
-        instantiate_device_type_tests(Sample, holder)
+        # A single-device scope keeps the run counts below identical on
+        # machines with and without CUDA.
+        instantiate_device_type_tests(Sample, holder, only_for=("cpu",))
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(holder["Sample"])
         result = unittest.TestResult()
         suite.run(result)
@@ -224,7 +226,10 @@ class TestDeviceTypeExtras(TestCase):
             def test_too_large(self, device):
                 pass
 
-        instantiate_device_type_tests(Sample, holder)
+        # A single-device scope keeps the run counts below identical on
+        # machines with and without CUDA (the decorators under test here
+        # mark per-device variants, so a second device would double them).
+        instantiate_device_type_tests(Sample, holder, only_for=("cpu",))
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(holder["Sample"])
         result = unittest.TestResult()
         suite.run(result)
@@ -240,7 +245,10 @@ class TestDeviceTypeExtras(TestCase):
             def test_gpu_only(self, device):
                 pass
 
-        instantiate_device_type_tests(Sample, holder)
+        # Scoping the instantiation to CPU simulates a machine without CUDA:
+        # the device filter has no CUDA device to match, so nothing is
+        # generated regardless of what this machine actually has.
+        instantiate_device_type_tests(Sample, holder, only_for=("cpu",))
         self.assertEqual(
             [n for n in holder["Sample"].__dict__ if n.startswith("test_")],
             [],
@@ -667,10 +675,13 @@ class TestDeviceTypeInstantiation(TestCase):
             def test_cuda_only(self, device):
                 pass
 
-        instantiate_device_type_tests(Sample, holder)
+        # Scoping the instantiation to CPU keeps the generated set the same
+        # on machines with and without CUDA.
+        instantiate_device_type_tests(Sample, holder, only_for=("cpu",))
         names = set(holder["Sample"].__dict__)
         self.assertIn("test_on_cpu_cpu", names)
-        # No CUDA device in this environment, so no CUDA variant is generated
+        # CUDA is outside the instantiation scope, so no CUDA variant is
+        # generated.
         self.assertNotIn("test_cuda_only_cuda", names)
 
 
