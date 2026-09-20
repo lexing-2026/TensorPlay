@@ -49,6 +49,9 @@ hub
 multiprocessing
 library
 distributed
+distributed.device_mesh
+distributed.tensor
+distributed.tensor.parallel
 distributions
 func
 profiler
