@@ -331,7 +331,7 @@ print(model)  # 自动生成层结构可视化
 ### 训练循环
 
 ```python
-from tensorplay.data import DataLoader, TensorDataset
+from tensorplay.utils.data import DataLoader, TensorDataset
 
 train_data = TensorDataset(tp.randn(100, 10), tp.randn(100, 1))
 train_loader = DataLoader(dataset=train_data, batch_size=8, shuffle=True)
