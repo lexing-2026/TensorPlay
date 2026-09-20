@@ -556,7 +556,12 @@ def _capture_nested_region(
         sample_output = child_tracer.resolve_sample(
             child.graph.output_node.args[0]
         )
-        if sample_output is None:
+        from tensorplay.graph.tracer import _UNRESOLVED as _TRACER_UNRESOLVED
+
+        if (
+            sample_output is None
+            or sample_output is _TRACER_UNRESOLVED
+        ):
             raise GraphCaptureError(
                 "nested compile region output has no executable sample"
             )
