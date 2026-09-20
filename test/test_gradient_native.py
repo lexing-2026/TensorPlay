@@ -161,11 +161,6 @@ class TestGradientAutograd:
             depth += 1
         assert depth > 2
 
-    @pytest.mark.xfail(
-        reason="engine create_graph limitation, not gradient-specific: the "
-               "same breakage reproduces with a manual narrow/sub/div/cat "
-               "composite (plain backward is exact); owned by the "
-               "high-order-derivative engine line")
     def test_double_backward(self):
         w = [1.0, -1.0, 2.0, -2.0, 3.0, -3.0]
         yt = torch.tensor(Y6, dtype=torch.float64, requires_grad=True)
