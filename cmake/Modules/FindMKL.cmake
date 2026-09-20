@@ -50,6 +50,10 @@ set(_MKL_ROOTS
     "$ENV{INTEL_MKL_DIR}"
     "$ENV{ONEAPI_ROOT}/mkl/latest"
     "/opt/intel/oneapi/mkl/latest"
+    # Flat standalone layout: mkl.h directly under include/ and archives
+    # directly under lib/, used when a copy is unpacked into the prefix
+    # without the oneAPI or classic suite structure around it.
+    "/opt/intel"
 )
 file(GLOB _MKL_CLASSIC_ROOTS "/opt/intel/mkl*")
 list(APPEND _MKL_ROOTS ${_MKL_CLASSIC_ROOTS})
