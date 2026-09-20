@@ -226,6 +226,7 @@
     CPU: conv_transpose3d_grad_bias_cpu
 
 - func: add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: add_cpu
@@ -233,6 +234,7 @@
   tags: [core, pointwise]
 
 - func: add.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: add_scalar_cpu
@@ -240,6 +242,7 @@
   tags: [core, pointwise]
 
 - func: add_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: add_cpu
@@ -247,6 +250,7 @@
   tags: pointwise
 
 - func: add_.Scalar(Tensor(a!) self, Scalar other, Scalar alpha=1) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: add_scalar_cpu
@@ -254,6 +258,7 @@
   tags: pointwise
 
 - func: sub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: sub_cpu
@@ -261,6 +266,7 @@
   tags: [core, pointwise]
 
 - func: sub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: sub_scalar_cpu
@@ -268,6 +274,7 @@
   tags: [core, pointwise]
 
 - func: sub_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: sub_cpu
@@ -275,6 +282,7 @@
   tags: pointwise
 
 - func: sub_.Scalar(Tensor(a!) self, Scalar other, Scalar alpha=1) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: sub_scalar_cpu
@@ -282,6 +290,7 @@
   tags: pointwise
 
 - func: mul.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: mul_cpu
@@ -289,6 +298,7 @@
   tags: [core, pointwise]
 
 - func: mul.Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: mul_scalar_cpu
@@ -296,6 +306,7 @@
   tags: [core, pointwise]
 
 - func: mul_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: mul_cpu
@@ -303,6 +314,7 @@
   tags: pointwise
 
 - func: mul_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: mul_scalar_cpu
@@ -310,6 +322,7 @@
   tags: pointwise
 
 - func: div.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: div_cpu
@@ -326,6 +339,7 @@
 # ---------------------------------------------------------------------------
 
 - func: div.Tensor_mode(Tensor self, Tensor other, *, str? rounding_mode) -> Tensor
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: div_mode_tensor_cpu
@@ -364,6 +378,7 @@
     CUDA: div_mode_scalar_cuda
 
 - func: true_divide.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: true_divide_tensor_cpu
@@ -371,18 +386,21 @@
   tags: pointwise
 
 - func: true_divide.Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: true_divide_scalar_cpu
     CUDA: true_divide_scalar_cuda
 
 - func: floor_divide(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: floor_divide_cpu
     CUDA: floor_divide_cuda
 
 - func: floor_divide.Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: floor_divide_scalar_cpu
@@ -413,6 +431,7 @@
     CUDA: subtract_scalar_cuda
 
 - func: remainder.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: remainder_tensor_cpu
@@ -427,6 +446,7 @@
   tags: [core, pointwise]
 
 - func: remainder.Scalar_Tensor(Scalar self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: remainder_scalar_tensor_cpu
@@ -434,6 +454,7 @@
   tags: pointwise
 
 - func: fmod.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: fmod_tensor_cpu
@@ -441,6 +462,7 @@
   tags: [core, pointwise]
 
 - func: fmod.Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: fmod_scalar_cpu
@@ -448,6 +470,7 @@
   tags: [core, pointwise]
 
 - func: copysign.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: copysign_cpu
@@ -476,12 +499,14 @@
   tags: pointwise
 
 - func: rsub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: rsub_tensor_cpu
     CUDA: rsub_tensor_cuda
 
 - func: rsub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: rsub_scalar_cpu
@@ -603,49 +628,63 @@
 # algorithm kernels; these schemas cover the list-wise arithmetic building
 # blocks used by the remaining optimizer source ports and by user code.
 - func: _foreach_add.Scalar(Tensor[] self, Scalar scalar) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_add_scalar_cpu, CUDA: foreach_add_scalar_cuda}
 - func: _foreach_add.List(Tensor[] self, Tensor[] other, *, Scalar alpha=1) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_add_list_cpu, CUDA: foreach_add_list_cuda}
 - func: _foreach_add.ScalarList(Tensor[] self, Scalar[] scalars) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_add_scalar_list_cpu, CUDA: foreach_add_scalar_list_cuda}
 - func: _foreach_add.Tensor(Tensor[] self, Tensor other, *, Scalar alpha=1) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_add_tensor_cpu, CUDA: foreach_add_tensor_cuda}
 - func: _foreach_add_.Scalar(Tensor(a!)[] self, Scalar scalar) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_add_scalar_inplace_cpu, CUDA: foreach_add_scalar_inplace_cuda}
 - func: _foreach_add_.List(Tensor(a!)[] self, Tensor[] other, *, Scalar alpha=1) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_add_list_inplace_cpu, CUDA: foreach_add_list_inplace_cuda}
 - func: _foreach_add_.ScalarList(Tensor(a!)[] self, Scalar[] scalars) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_add_scalar_list_inplace_cpu, CUDA: foreach_add_scalar_list_inplace_cuda}
 - func: _foreach_add_.Tensor(Tensor(a!)[] self, Tensor other, *, Scalar alpha=1) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_add_tensor_inplace_cpu, CUDA: foreach_add_tensor_inplace_cuda}
 
 - func: _foreach_sub.Scalar(Tensor[] self, Scalar scalar) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_sub_scalar_cpu, CUDA: foreach_sub_scalar_cuda}
 - func: _foreach_sub.List(Tensor[] self, Tensor[] other, *, Scalar alpha=1) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_sub_list_cpu, CUDA: foreach_sub_list_cuda}
 - func: _foreach_sub.ScalarList(Tensor[] self, Scalar[] scalars) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_sub_scalar_list_cpu, CUDA: foreach_sub_scalar_list_cuda}
 - func: _foreach_sub.Tensor(Tensor[] self, Tensor other, *, Scalar alpha=1) -> Tensor[]
   variants: function
   dispatch: {CPU: foreach_sub_tensor_cpu, CUDA: foreach_sub_tensor_cuda}
 - func: _foreach_sub_.Scalar(Tensor(a!)[] self, Scalar scalar) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_sub_scalar_inplace_cpu, CUDA: foreach_sub_scalar_inplace_cuda}
 - func: _foreach_sub_.List(Tensor(a!)[] self, Tensor[] other, *, Scalar alpha=1) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_sub_list_inplace_cpu, CUDA: foreach_sub_list_inplace_cuda}
 - func: _foreach_sub_.ScalarList(Tensor(a!)[] self, Scalar[] scalars) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_sub_scalar_list_inplace_cpu, CUDA: foreach_sub_scalar_list_inplace_cuda}
 - func: _foreach_sub_.Tensor(Tensor(a!)[] self, Tensor other, *, Scalar alpha=1) -> ()
@@ -653,249 +692,329 @@
   dispatch: {CPU: foreach_sub_tensor_inplace_cpu, CUDA: foreach_sub_tensor_inplace_cuda}
 
 - func: _foreach_mul.Scalar(Tensor[] self, Scalar scalar) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_mul_scalar_cpu, CUDA: foreach_mul_scalar_cuda}
 - func: _foreach_mul.List(Tensor[] self, Tensor[] other) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_mul_list_cpu, CUDA: foreach_mul_list_cuda}
 - func: _foreach_mul.ScalarList(Tensor[] self, Scalar[] scalars) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_mul_scalar_list_cpu, CUDA: foreach_mul_scalar_list_cuda}
 - func: _foreach_mul.Tensor(Tensor[] self, Tensor other) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_mul_tensor_cpu, CUDA: foreach_mul_tensor_cuda}
 - func: _foreach_mul_.Scalar(Tensor(a!)[] self, Scalar scalar) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_mul_scalar_inplace_cpu, CUDA: foreach_mul_scalar_inplace_cuda}
 - func: _foreach_mul_.List(Tensor(a!)[] self, Tensor[] other) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_mul_list_inplace_cpu, CUDA: foreach_mul_list_inplace_cuda}
 - func: _foreach_mul_.ScalarList(Tensor(a!)[] self, Scalar[] scalars) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_mul_scalar_list_inplace_cpu, CUDA: foreach_mul_scalar_list_inplace_cuda}
 - func: _foreach_mul_.Tensor(Tensor(a!)[] self, Tensor other) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_mul_tensor_inplace_cpu, CUDA: foreach_mul_tensor_inplace_cuda}
 
 - func: _foreach_div.Scalar(Tensor[] self, Scalar scalar) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_div_scalar_cpu, CUDA: foreach_div_scalar_cuda}
 - func: _foreach_div.List(Tensor[] self, Tensor[] other) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_div_list_cpu, CUDA: foreach_div_list_cuda}
 - func: _foreach_div.ScalarList(Tensor[] self, Scalar[] scalars) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_div_scalar_list_cpu, CUDA: foreach_div_scalar_list_cuda}
 - func: _foreach_div.Tensor(Tensor[] self, Tensor other) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_div_tensor_cpu, CUDA: foreach_div_tensor_cuda}
 - func: _foreach_div_.Scalar(Tensor(a!)[] self, Scalar scalar) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_div_scalar_inplace_cpu, CUDA: foreach_div_scalar_inplace_cuda}
 - func: _foreach_div_.List(Tensor(a!)[] self, Tensor[] other) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_div_list_inplace_cpu, CUDA: foreach_div_list_inplace_cuda}
 - func: _foreach_div_.ScalarList(Tensor(a!)[] self, Scalar[] scalars) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_div_scalar_list_inplace_cpu, CUDA: foreach_div_scalar_list_inplace_cuda}
 - func: _foreach_div_.Tensor(Tensor(a!)[] self, Tensor other) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_div_tensor_inplace_cpu, CUDA: foreach_div_tensor_inplace_cuda}
 
 - func: _foreach_addcmul.Scalar(Tensor[] self, Tensor[] tensor1, Tensor[] tensor2, Scalar value=1) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_addcmul_scalar_cpu, CUDA: foreach_addcmul_scalar_cuda}
 - func: _foreach_addcmul_.Scalar(Tensor(a!)[] self, Tensor[] tensor1, Tensor[] tensor2, Scalar value=1) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_addcmul_scalar_inplace_cpu, CUDA: foreach_addcmul_scalar_inplace_cuda}
 - func: _foreach_addcmul.ScalarList(Tensor[] self, Tensor[] tensor1, Tensor[] tensor2, Scalar[] scalars) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_addcmul_scalar_list_cpu, CUDA: foreach_addcmul_scalar_list_cuda}
 - func: _foreach_addcmul_.ScalarList(Tensor(a!)[] self, Tensor[] tensor1, Tensor[] tensor2, Scalar[] scalars) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_addcmul_scalar_list_inplace_cpu, CUDA: foreach_addcmul_scalar_list_inplace_cuda}
 - func: _foreach_addcmul.Tensor(Tensor[] self, Tensor[] tensor1, Tensor[] tensor2, Tensor scalars) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_addcmul_tensor_cpu, CUDA: foreach_addcmul_tensor_cuda}
 - func: _foreach_addcmul_.Tensor(Tensor(a!)[] self, Tensor[] tensor1, Tensor[] tensor2, Tensor scalars) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_addcmul_tensor_inplace_cpu, CUDA: foreach_addcmul_tensor_inplace_cuda}
 - func: _foreach_addcdiv.Scalar(Tensor[] self, Tensor[] tensor1, Tensor[] tensor2, Scalar value=1) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_addcdiv_scalar_cpu, CUDA: foreach_addcdiv_scalar_cuda}
 - func: _foreach_addcdiv_.Scalar(Tensor(a!)[] self, Tensor[] tensor1, Tensor[] tensor2, Scalar value=1) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_addcdiv_scalar_inplace_cpu, CUDA: foreach_addcdiv_scalar_inplace_cuda}
 - func: _foreach_addcdiv.ScalarList(Tensor[] self, Tensor[] tensor1, Tensor[] tensor2, Scalar[] scalars) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_addcdiv_scalar_list_cpu, CUDA: foreach_addcdiv_scalar_list_cuda}
 - func: _foreach_addcdiv_.ScalarList(Tensor(a!)[] self, Tensor[] tensor1, Tensor[] tensor2, Scalar[] scalars) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_addcdiv_scalar_list_inplace_cpu, CUDA: foreach_addcdiv_scalar_list_inplace_cuda}
 - func: _foreach_addcdiv.Tensor(Tensor[] self, Tensor[] tensor1, Tensor[] tensor2, Tensor scalars) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_addcdiv_tensor_cpu, CUDA: foreach_addcdiv_tensor_cuda}
 - func: _foreach_addcdiv_.Tensor(Tensor(a!)[] self, Tensor[] tensor1, Tensor[] tensor2, Tensor scalars) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_addcdiv_tensor_inplace_cpu, CUDA: foreach_addcdiv_tensor_inplace_cuda}
 
 - func: _foreach_lerp.Scalar(Tensor[] self, Tensor[] tensors1, Scalar weight) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_lerp_scalar_cpu, CUDA: foreach_lerp_scalar_cuda}
 - func: _foreach_lerp.List(Tensor[] self, Tensor[] tensors1, Tensor[] weights) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_lerp_list_cpu, CUDA: foreach_lerp_list_cuda}
 - func: _foreach_lerp_.Scalar(Tensor(a!)[] self, Tensor[] tensors1, Scalar weight) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_lerp_scalar_inplace_cpu, CUDA: foreach_lerp_scalar_inplace_cuda}
 - func: _foreach_lerp_.List(Tensor(a!)[] self, Tensor[] tensors1, Tensor[] weights) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_lerp_list_inplace_cpu, CUDA: foreach_lerp_list_inplace_cuda}
 - func: _foreach_lerp.ScalarList(Tensor[] self, Tensor[] tensors1, Scalar[] weight) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_lerp_scalar_list_cpu, CUDA: foreach_lerp_scalar_list_cuda}
 - func: _foreach_lerp_.ScalarList(Tensor(a!)[] self, Tensor[] tensors1, Scalar[] weight) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_lerp_scalar_list_inplace_cpu, CUDA: foreach_lerp_scalar_list_inplace_cuda}
 
 - func: _foreach_sqrt(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_sqrt_cpu, CUDA: foreach_sqrt_cuda}
 - func: _foreach_sqrt_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_sqrt_inplace_cpu, CUDA: foreach_sqrt_inplace_cuda}
 - func: _foreach_rsqrt(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_rsqrt_cpu, CUDA: foreach_rsqrt_cuda}
 - func: _foreach_rsqrt_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_rsqrt_inplace_cpu, CUDA: foreach_rsqrt_inplace_cuda}
 - func: _foreach_neg(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_neg_cpu, CUDA: foreach_neg_cuda}
 - func: _foreach_neg_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_neg_inplace_cpu, CUDA: foreach_neg_inplace_cuda}
 - func: _foreach_abs(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_abs_cpu, CUDA: foreach_abs_cuda}
 - func: _foreach_abs_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_abs_inplace_cpu, CUDA: foreach_abs_inplace_cuda}
 - func: _foreach_reciprocal(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_reciprocal_cpu, CUDA: foreach_reciprocal_cuda}
 - func: _foreach_reciprocal_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_reciprocal_inplace_cpu, CUDA: foreach_reciprocal_inplace_cuda}
 - func: _foreach_sign(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_sign_cpu, CUDA: foreach_sign_cuda}
 - func: _foreach_sign_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_sign_inplace_cpu, CUDA: foreach_sign_inplace_cuda}
 - func: _foreach_pow.Scalar(Tensor[] self, Scalar exponent) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_pow_scalar_cpu, CUDA: foreach_pow_scalar_cuda}
 - func: _foreach_pow.ScalarAndTensor(Scalar self, Tensor[] exponent) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_pow_scalar_tensor_cpu, CUDA: foreach_pow_scalar_tensor_cuda}
 - func: _foreach_pow.List(Tensor[] self, Tensor[] exponent) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_pow_list_cpu, CUDA: foreach_pow_list_cuda}
 - func: _foreach_pow_.Scalar(Tensor(a!)[] self, Scalar exponent) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_pow_scalar_inplace_cpu, CUDA: foreach_pow_scalar_inplace_cuda}
 - func: _foreach_pow_.List(Tensor(a!)[] self, Tensor[] exponent) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_pow_list_inplace_cpu, CUDA: foreach_pow_list_inplace_cuda}
 - func: _foreach_pow.ScalarList(Tensor[] self, Scalar[] exponent) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_pow_scalar_list_cpu, CUDA: foreach_pow_scalar_list_cuda}
 - func: _foreach_pow_.ScalarList(Tensor(a!)[] self, Scalar[] exponent) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_pow_scalar_list_inplace_cpu, CUDA: foreach_pow_scalar_list_inplace_cuda}
 
 - func: _foreach_clamp_min.Scalar(Tensor[] self, Scalar scalar) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_clamp_min_scalar_cpu, CUDA: foreach_clamp_min_scalar_cuda}
 - func: _foreach_clamp_max.Scalar(Tensor[] self, Scalar scalar) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_clamp_max_scalar_cpu, CUDA: foreach_clamp_max_scalar_cuda}
 - func: _foreach_clamp_min.List(Tensor[] self, Tensor[] other) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_clamp_min_list_cpu, CUDA: foreach_clamp_min_list_cuda}
 - func: _foreach_clamp_min_.List(Tensor(a!)[] self, Tensor[] other) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_clamp_min_list_inplace_cpu, CUDA: foreach_clamp_min_list_inplace_cuda}
 - func: _foreach_clamp_min.ScalarList(Tensor[] self, Scalar[] scalars) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_clamp_min_scalar_list_cpu, CUDA: foreach_clamp_min_scalar_list_cuda}
 - func: _foreach_clamp_min_.ScalarList(Tensor(a!)[] self, Scalar[] scalars) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_clamp_min_scalar_list_inplace_cpu, CUDA: foreach_clamp_min_scalar_list_inplace_cuda}
 - func: _foreach_clamp_max.List(Tensor[] self, Tensor[] other) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_clamp_max_list_cpu, CUDA: foreach_clamp_max_list_cuda}
 - func: _foreach_clamp_max_.List(Tensor(a!)[] self, Tensor[] other) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_clamp_max_list_inplace_cpu, CUDA: foreach_clamp_max_list_inplace_cuda}
 - func: _foreach_clamp_max.ScalarList(Tensor[] self, Scalar[] scalars) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_clamp_max_scalar_list_cpu, CUDA: foreach_clamp_max_scalar_list_cuda}
 - func: _foreach_clamp_max_.ScalarList(Tensor(a!)[] self, Scalar[] scalars) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_clamp_max_scalar_list_inplace_cpu, CUDA: foreach_clamp_max_scalar_list_inplace_cuda}
 - func: _foreach_clamp_min_.Scalar(Tensor(a!)[] self, Scalar scalar) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_clamp_min_scalar_inplace_cpu, CUDA: foreach_clamp_min_scalar_inplace_cuda}
 - func: _foreach_clamp_max_.Scalar(Tensor(a!)[] self, Scalar scalar) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_clamp_max_scalar_inplace_cpu, CUDA: foreach_clamp_max_scalar_inplace_cuda}
 - func: _foreach_maximum.Scalar(Tensor[] self, Scalar scalar) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_maximum_scalar_cpu, CUDA: foreach_maximum_scalar_cuda}
 - func: _foreach_minimum.Scalar(Tensor[] self, Scalar scalar) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_minimum_scalar_cpu, CUDA: foreach_minimum_scalar_cuda}
 - func: _foreach_maximum.List(Tensor[] self, Tensor[] other) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_maximum_list_cpu, CUDA: foreach_maximum_list_cuda}
 - func: _foreach_maximum_.List(Tensor(a!)[] self, Tensor[] other) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_maximum_list_inplace_cpu, CUDA: foreach_maximum_list_inplace_cuda}
 - func: _foreach_maximum.ScalarList(Tensor[] self, Scalar[] scalars) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_maximum_scalar_list_cpu, CUDA: foreach_maximum_scalar_list_cuda}
 - func: _foreach_maximum_.ScalarList(Tensor(a!)[] self, Scalar[] scalars) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_maximum_scalar_list_inplace_cpu, CUDA: foreach_maximum_scalar_list_inplace_cuda}
 - func: _foreach_minimum.List(Tensor[] self, Tensor[] other) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_minimum_list_cpu, CUDA: foreach_minimum_list_cuda}
 - func: _foreach_minimum_.List(Tensor(a!)[] self, Tensor[] other) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_minimum_list_inplace_cpu, CUDA: foreach_minimum_list_inplace_cuda}
 - func: _foreach_minimum.ScalarList(Tensor[] self, Scalar[] scalars) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_minimum_scalar_list_cpu, CUDA: foreach_minimum_scalar_list_cuda}
 - func: _foreach_minimum_.ScalarList(Tensor(a!)[] self, Scalar[] scalars) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_minimum_scalar_list_inplace_cpu, CUDA: foreach_minimum_scalar_list_inplace_cuda}
 - func: _foreach_maximum_.Scalar(Tensor(a!)[] self, Scalar scalar) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_maximum_scalar_inplace_cpu, CUDA: foreach_maximum_scalar_inplace_cuda}
 - func: _foreach_minimum_.Scalar(Tensor(a!)[] self, Scalar scalar) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_minimum_scalar_inplace_cpu, CUDA: foreach_minimum_scalar_inplace_cuda}
 - func: _foreach_copy_(Tensor(a!)[] self, Tensor[] src, bool non_blocking=False) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_copy_inplace_cpu, CUDA: foreach_copy_inplace_cuda}
 - func: _foreach_zero_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_zero_inplace_cpu, CUDA: foreach_zero_inplace_cuda}
 
 - func: div.Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: div_scalar_cpu
@@ -903,6 +1022,7 @@
   tags: [core, pointwise]
 
 - func: div_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: div_cpu
@@ -910,6 +1030,7 @@
   tags: pointwise
 
 - func: div_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: div_scalar_cpu
@@ -919,24 +1040,28 @@
 # them as native dispatches so the Python optimizer never materializes the
 # product/quotient through a Python-level composite implementation.
 - func: addcmul(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: addcmul_cpu
   tags: pointwise
 
 - func: addcmul_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: addcmul_inplace_cpu
   tags: pointwise
 
 - func: addcdiv(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: addcdiv_cpu
   tags: pointwise
 
 - func: addcdiv_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: addcdiv_inplace_cpu
@@ -945,6 +1070,7 @@
 # optimizer paths.  Keep all overloads in the dispatcher; the generated
 # Python functional surface is only a thin binding to these kernels.
 - func: where.self(Tensor condition, Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: where_cpu
@@ -970,12 +1096,14 @@
     CUDA: where_scalar_scalar_cuda
 
 - func: maximum(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: maximum_cpu
   tags: [core, pointwise]
 
 - func: minimum(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: minimum_cpu
@@ -994,6 +1122,7 @@
     CPU: view_as_complex_cpu
 
 - func: is_complex(Tensor self) -> bool
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: is_complex_cpu
@@ -1085,87 +1214,102 @@
     CPU: einsum_kernel
 
 - func: eq.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: eq_tensor_kernel
   tags: [core, pointwise]
 
 - func: eq.Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: eq_scalar_kernel
   tags: [core, pointwise]
 
 - func: ne.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: ne_tensor_kernel
   tags: [core, pointwise]
 
 - func: ne.Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: ne_scalar_kernel
   tags: [core, pointwise]
 
 - func: lt.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: lt_tensor_kernel
   tags: [core, pointwise]
 
 - func: lt.Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: lt_scalar_kernel
   tags: [core, pointwise]
 
 - func: le.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: le_tensor_kernel
   tags: [core, pointwise]
 
 - func: le.Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: le_scalar_kernel
   tags: [core, pointwise]
 
 - func: gt.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: gt_tensor_kernel
   tags: [core, pointwise]
 
 - func: gt.Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: gt_scalar_kernel
   tags: [core, pointwise]
 
 - func: ge.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: ge_tensor_kernel
   tags: [core, pointwise]
 
 - func: ge.Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: ge_scalar_kernel
   tags: [core, pointwise]
 
 - func: copy_(Tensor(a!) self, Tensor src, bool non_blocking=False) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: copy_kernel
 
 - func: view(Tensor(a) self, int[] shape) -> Tensor(a)
+  device_check: NoCheck
   variants: method
   tags: core
 
 - func: fill_.Scalar(Tensor(a!) self, Scalar value) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: fill_kernel
@@ -1177,6 +1321,7 @@
     CPU: transpose_kernel
 
 - func: t(Tensor(a) self) -> Tensor(a)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: t_kernel
@@ -1193,6 +1338,7 @@
     CPU: permute_backward_kernel
 
 - func: squeeze(Tensor(a) self) -> Tensor(a)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: squeeze_kernel
@@ -1203,6 +1349,7 @@
     CPU: squeeze_backward_kernel
 
 - func: squeeze.dim(Tensor(a) self, int dim) -> Tensor(a)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: squeeze_dim_kernel
@@ -1210,6 +1357,7 @@
   tags: core
 
 - func: squeeze.dims(Tensor(a) self, int[] dim) -> Tensor(a)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: squeeze_dims_kernel
@@ -1217,6 +1365,7 @@
   tags: core
 
 - func: unsqueeze(Tensor(a) self, int dim) -> Tensor(a)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: unsqueeze_kernel
@@ -1230,6 +1379,7 @@
 
 # Scatter gradient back into the positions selected by diagonal().
 - func: diagonal_backward(Tensor grad_output, SymInt[] input_sizes, int offset, int dim1, int dim2) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: diagonal_backward_kernel
@@ -1261,11 +1411,13 @@
     CPU: split_sizes_kernel
 
 - func: chunk(Tensor(a -> *) self, int chunks, int dim=0) -> Tensor(a)[]
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: chunk_kernel
 
 - func: reshape(Tensor(a) self, int[] shape) -> Tensor(a)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: reshape_kernel
@@ -1293,11 +1445,13 @@
   tags: data_dependent_output
 
 - func: select_backward(Tensor grad_output, Tensor self, int dim, int index) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: select_backward_kernel
 
 - func: slice_backward(Tensor grad_output, Tensor self, int dim=0, int? start=None, int? end=None, int step=1) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: slice_backward_kernel
@@ -1345,6 +1499,7 @@
   tags: [core, nondeterministic_seeded]
 
 - func: bernoulli(Tensor self, *, Generator? generator=None) -> Tensor
+  device_check: NoCheck
   variants: method, function
   dispatch:
     CPU: bernoulli_kernel
@@ -1352,6 +1507,7 @@
   tags: nondeterministic_seeded
 
 - func: bernoulli.out(Tensor self, *, Generator? generator=None, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: bernoulli_out_kernel
@@ -1359,6 +1515,7 @@
   tags: nondeterministic_seeded
 
 - func: bernoulli.p(Tensor self, float p, *, Generator? generator=None) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: bernoulli_p_kernel
@@ -1511,6 +1668,7 @@
 # resize_ grows the storage in place when needed (preserving contents) and
 # adopts contiguous strides; shrinking is logical-only. Non-differentiable,
 - func: resize_(Tensor(a!) self, int[] size) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: resize__cpu
@@ -1522,12 +1680,14 @@
   variants: function
 
 - func: abs(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: abs_kernel
   tags: [core, pointwise]
 
 - func: acos(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: acos_kernel
@@ -1540,6 +1700,7 @@
   tags: [core, pointwise]
 
 - func: angle(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: angle_kernel
@@ -1547,6 +1708,7 @@
   tags: pointwise
 
 - func: asin(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: asin_kernel
@@ -1559,12 +1721,14 @@
   tags: [core, pointwise]
 
 - func: atan(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: atan_kernel
   tags: [core, pointwise]
 
 - func: atan2(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: atan2_cpu
@@ -1572,6 +1736,7 @@
   tags: [core, pointwise]
 
 - func: poisson(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: poisson_kernel
@@ -1584,12 +1749,14 @@
   tags: [core, pointwise]
 
 - func: ceil(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: ceil_kernel
   tags: [core, pointwise]
 
 - func: clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: clamp_kernel
@@ -1601,66 +1768,77 @@
     CPU: clamp_backward_kernel
 
 - func: cos(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: cos_kernel
   tags: [core, pointwise]
 
 - func: cosh(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: cosh_kernel
   tags: [core, pointwise]
 
 - func: erf(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: erf_kernel
   tags: [core, pointwise]
 
 - func: erfc(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: erfc_kernel
   tags: pointwise
 
 - func: expm1(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: expm1_kernel
   tags: [core, pointwise]
 
 - func: lgamma(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: lgamma_kernel
   tags: pointwise
 
 - func: log2(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: log2_kernel
   tags: [core, pointwise]
 
 - func: reciprocal(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: reciprocal_cpu
   tags: [core, pointwise]
 
 - func: trunc(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: trunc_kernel
   tags: [core, pointwise]
 
 - func: exp(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: exp_kernel
   tags: [core, pointwise]
 
 - func: floor(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: floor_kernel
@@ -1672,6 +1850,7 @@
     CPU: lerp_scalar_kernel
 
 - func: lerp.Tensor(Tensor self, Tensor end, Tensor weight) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: lerp_tensor_kernel
@@ -1679,6 +1858,7 @@
   tags: pointwise
 
 - func: lerp_.Scalar(Tensor(a!) self, Tensor end, Scalar weight) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: lerp_scalar_inplace_kernel
@@ -1686,6 +1866,7 @@
   tags: pointwise
 
 - func: lerp_.Tensor(Tensor(a!) self, Tensor end, Tensor weight) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: lerp_tensor_inplace_kernel
@@ -1693,83 +1874,97 @@
   tags: pointwise
 
 - func: abs_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: abs_inplace_kernel
 
 - func: neg_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: neg_inplace_kernel
   tags: pointwise
 
 - func: sqrt_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: sqrt_inplace_kernel
   tags: pointwise
 
 - func: rsqrt_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: rsqrt_inplace_kernel
   tags: pointwise
 
 - func: log(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: log_kernel
   tags: [core, pointwise]
 
 - func: neg(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: neg_kernel
   tags: [core, pointwise]
 
 - func: pow.Tensor_Scalar(Tensor self, Scalar exponent) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: pow_scalar_kernel
   tags: [core, pointwise]
 
 - func: pow.Tensor_Tensor(Tensor self, Tensor exponent) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: pow_tensor_tensor_kernel
   tags: [core, pointwise]
 
 - func: round(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: round_kernel
   tags: [core, pointwise]
 
 - func: rsqrt(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: rsqrt_kernel
   tags: [core, pointwise]
 
 - func: sigmoid(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: sigmoid_kernel
   tags: [core, pointwise]
 
 - func: sign(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: sign_kernel
   tags: [core, pointwise]
 
 - func: sin(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: sin_kernel
   tags: [core, pointwise]
 
 - func: sinh(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: sinh_kernel
@@ -1786,36 +1981,42 @@
     CPU: log_softmax_kernel
 
 - func: sqrt(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: sqrt_kernel
   tags: [core, pointwise]
 
 - func: square(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: square_kernel
   tags: pointwise
 
 - func: tan(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: tan_kernel
   tags: [core, pointwise]
 
 - func: tanh(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: tanh_kernel
   tags: [core, pointwise]
 
 - func: relu(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: relu_kernel
   tags: [core, pointwise]
 
 - func: relu_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: relu_inplace_kernel
@@ -1828,6 +2029,7 @@
   tags: pointwise
 
 - func: gelu(Tensor self, str approximate="none") -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: gelu_kernel
@@ -1901,24 +2103,28 @@
     CPU: logspace_kernel
 
 - func: sum(Tensor self, *, ScalarType dtype=Undefined) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: sum_kernel
   tags: reduction
 
 - func: sum.dim_IntList(Tensor self, int[] dim, bool keepdim=false, *, ScalarType dtype=Undefined) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: sum_dim_kernel
   tags: [core, reduction]
 
 - func: mean(Tensor self, *, ScalarType dtype=Undefined) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: mean_kernel
   tags: [core, reduction]
 
 - func: mean.dim(Tensor self, int[] dim, bool keepdim=false, *, ScalarType dtype=Undefined) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: mean_dim_kernel
@@ -1936,30 +2142,35 @@
     CPU: mean_dim_backward_kernel
 
 - func: max(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: max_kernel
   tags: reduction
 
 - func: max.dim(Tensor self, int64_t dim, bool keepdim=false) -> (Tensor values, Tensor indices)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: max_dim_kernel
   tags: [core, reduction]
 
 - func: min(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: min_kernel
   tags: reduction
 
 - func: min.dim(Tensor self, int64_t dim, bool keepdim=false) -> (Tensor values, Tensor indices)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: min_dim_kernel
   tags: [core, reduction]
 
 - func: prod(Tensor self, *, ScalarType dtype=Undefined) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: prod_kernel
@@ -1971,30 +2182,35 @@
     CPU: prod_dim_kernel
 
 - func: argmax(Tensor self, int? dim=None, bool keepdim=False) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: argmax_kernel
   tags: [core, reduction]
 
 - func: argmin(Tensor self, int? dim=None, bool keepdim=False) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: argmin_kernel
   tags: [core, reduction]
 
 - func: all(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: all_kernel
   tags: reduction
 
 - func: all.dim(Tensor self, int dim, bool keepdim=False) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: all_dim_int_kernel
   tags: reduction
 
 - func: all.dims(Tensor self, int[]? dim=None, bool keepdim=False) -> Tensor
+  device_check: NoCheck
   variants: function, method
   cpp_no_default_args: ['dim']
   dispatch:
@@ -2002,12 +2218,14 @@
   tags: reduction
 
 - func: all.out(Tensor self, int dim, bool keepdim=False, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   dispatch:
     CompositeExplicitAutograd: all_out_default
   tags: reduction
 
 - func: all.dims_out(Tensor self, int[]? dim=None, bool keepdim=False, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   cpp_no_default_args: ['dim']
   dispatch:
@@ -2015,18 +2233,21 @@
   tags: reduction
 
 - func: any(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: any_kernel
   tags: [core, reduction]
 
 - func: any.dim(Tensor self, int dim, bool keepdim=False) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: any_dim_int_kernel
   tags: [core, reduction]
 
 - func: any.dims(Tensor self, int[]? dim=None, bool keepdim=False) -> Tensor
+  device_check: NoCheck
   variants: function, method
   cpp_no_default_args: ['dim']
   dispatch:
@@ -2034,12 +2255,14 @@
   tags: [core, reduction]
 
 - func: any.out(Tensor self, int dim, bool keepdim=False, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   dispatch:
     CompositeExplicitAutograd: any_out_default
   tags: reduction
 
 - func: any.dims_out(Tensor self, int[]? dim=None, bool keepdim=False, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   cpp_no_default_args: ['dim']
   dispatch:
@@ -2047,24 +2270,28 @@
   tags: reduction
 
 - func: var(Tensor self, int correction=1) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: var_kernel
   tags: reduction
 
 - func: var.dim(Tensor self, int[] dim, int correction=1, bool keepdim=false) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: var_dim_kernel
   tags: [core, reduction]
 
 - func: std(Tensor self, int correction=1) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: std_kernel
   tags: reduction
 
 - func: std.dim(Tensor self, int[] dim, int correction=1, bool keepdim=false) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: std_dim_kernel
@@ -2086,42 +2313,49 @@
     CPU: norm_dim_kernel
 
 - func: exponential_(Tensor(a!) self, float lambd=1.0) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: exponential_kernel
   tags: nondeterministic_seeded
 
 - func: geometric_(Tensor(a!) self, float p) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: geometric_kernel
   tags: nondeterministic_seeded
 
 - func: log_normal_(Tensor(a!) self, float mean=1.0, float std=2.0) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: log_normal_kernel
   tags: nondeterministic_seeded
 
 - func: normal_(Tensor(a!) self, float mean=0.0, float std=1.0, *, Generator? generator=None) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: normal_inplace_kernel
   tags: nondeterministic_seeded
 
 - func: random_(Tensor(a!) self, int low=0, int high=0) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: random_kernel
   tags: nondeterministic_seeded
 
 - func: uniform_(Tensor(a!) self, float from=0.0, float to=1.0, *, Generator? generator=None) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: uniform_kernel
   tags: nondeterministic_seeded
 
 - func: bernoulli_.Tensor(Tensor(a!) self, Tensor p, *, Generator? generator=None) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: bernoulli_tensor_inplace_kernel
@@ -2129,6 +2363,7 @@
   tags: nondeterministic_seeded
 
 - func: bernoulli_.float(Tensor(a!) self, float p=0.5, *, Generator? generator=None) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   cpp_no_default_args: ['p']
   dispatch:
@@ -2137,12 +2372,14 @@
   tags: nondeterministic_seeded
 
 - func: cauchy_(Tensor(a!) self, float median=0.0, float sigma=1.0) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: cauchy_kernel
   tags: nondeterministic_seeded
 
 - func: empty_like(Tensor self, *, ScalarType dtype=Undefined, Device? device=None, bool requires_grad=false) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: empty_like_kernel
@@ -2170,6 +2407,7 @@
   tags: dynamic_output_shape
 
 - func: zero_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: zero_kernel
@@ -2386,6 +2624,7 @@
     CUDA: _ctc_loss_backward_cuda
 
 - func: mse_loss(Tensor self, Tensor target, int reduction=1) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: mse_loss_kernel
@@ -2740,6 +2979,7 @@
 # ===========================================================================
 # ===========================================================================
 - func: cumsum(Tensor self, int dim=0, ScalarType? dtype=None) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: cumsum_cpu
@@ -2783,18 +3023,21 @@
   tags: reduction
 
 - func: log10(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: log10_kernel
   tags: [core, pointwise]
 
 - func: log1p(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: log1p_kernel
   tags: [core, pointwise]
 
 - func: frac(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: frac_kernel
@@ -2813,6 +3056,7 @@
     CPU: polar_cpu
 
 - func: real(Tensor(a) self) -> Tensor(a)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: real_cpu
@@ -2824,6 +3068,7 @@
     CPU: diff_cpu
 
 - func: logical_and(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: logical_and_cpu
@@ -3013,6 +3258,7 @@
     CPU: roll_cpu
 
 - func: unfold(Tensor(a) self, int dimension, int size, int step) -> Tensor(a)
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: unfold_cpu
@@ -3030,6 +3276,7 @@
 # ============================================================================
 
 - func: threshold(Tensor self, Scalar threshold, Scalar value) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: threshold_cpu
@@ -3044,6 +3291,7 @@
   tags: pointwise
 
 - func: leaky_relu(Tensor self, Scalar negative_slope=0.01) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: leaky_relu_kernel_impl
@@ -3073,6 +3321,7 @@
 
 # log(sigmoid(x)) = min(x, 0) - log1p(exp(-|x|)); backward is grad * sigmoid(-x).
 - func: log_sigmoid(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: log_sigmoid_kernel_impl
@@ -3085,6 +3334,7 @@
     CUDA: log_sigmoid_backward_kernel_cuda
 
 - func: hardtanh(Tensor self, Scalar min_val=-1, Scalar max_val=1) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: hardtanh_kernel_impl
@@ -3098,6 +3348,7 @@
     CUDA: hardtanh_backward_kernel_cuda
 
 - func: hardswish(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: hardswish_kernel_impl
@@ -3110,6 +3361,7 @@
     CUDA: hardswish_backward_kernel_cuda
 
 - func: hardsigmoid(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: hardsigmoid_kernel_impl
@@ -3123,6 +3375,7 @@
     CUDA: hardsigmoid_backward_kernel_cuda
 
 - func: softplus(Tensor self, Scalar beta=1, Scalar threshold=20) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: softplus_kernel_impl
@@ -3136,6 +3389,7 @@
     CUDA: softplus_backward_kernel_cuda
 
 - func: elu(Tensor self, Scalar alpha=1, Scalar scale=1, Scalar input_scale=1) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: elu_kernel_impl
@@ -3149,6 +3403,7 @@
     CUDA: elu_backward_kernel_cuda
 
 - func: selu(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: selu_cpu
@@ -3156,6 +3411,7 @@
   tags: pointwise
 
 - func: celu(Tensor self, Scalar alpha=1.0) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: celu_cpu
@@ -3176,6 +3432,7 @@
     CUDA: mish_backward_kernel_cuda
 
 - func: softshrink(Tensor self, Scalar lambd=0.5) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: softshrink_cpu
@@ -3191,6 +3448,7 @@
     CUDA: softshrink_backward_cuda
 
 - func: hardshrink(Tensor self, Scalar lambd=0.5) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: hardshrink_cpu
@@ -3204,6 +3462,7 @@
     CUDA: hardshrink_backward_cuda
 
 - func: glu(Tensor self, int dim=-1) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: glu_cpu
@@ -3223,6 +3482,7 @@
   tags: dynamic_output_shape
 
 - func: narrow(Tensor(a) self, int dim, int start, int length) -> Tensor(a)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: narrow_cpu
@@ -3446,6 +3706,7 @@
   tags: [core, reduction]
 
 - func: aminmax(Tensor self, int[] dim=[], bool keepdim=False) -> (Tensor min, Tensor max)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: aminmax_cpu
@@ -3453,6 +3714,7 @@
   tags: reduction
 
 - func: argsort(Tensor self, int dim=-1, bool descending=False) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: argsort_cpu
@@ -3472,6 +3734,7 @@
     CUDA: block_diag_cuda
 
 - func: broadcast_tensors(Tensor[] tensors) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: broadcast_tensors_cpu
@@ -3509,6 +3772,7 @@
   tags: pointwise
 
 - func: clamp_(Tensor(a!) self, Scalar? min=None, Scalar? max=None) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: clamp__cpu
@@ -3517,6 +3781,7 @@
 
 
 - func: clamp_min(Tensor self, Scalar min) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: clamp_min_kernel
@@ -3524,6 +3789,7 @@
   tags: pointwise
 
 - func: clamp_max(Tensor self, Scalar max) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: clamp_max_kernel
@@ -3531,6 +3797,7 @@
   tags: pointwise
 
 - func: clamp_min_(Tensor(a!) self, Scalar min) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: clamp_min__kernel
@@ -3538,6 +3805,7 @@
   tags: pointwise
 
 - func: clamp_max_(Tensor(a!) self, Scalar max) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: clamp_max__kernel
@@ -3563,24 +3831,28 @@
     CUDA: adjoint_cuda
 
 - func: imag(Tensor(a) self) -> Tensor(a)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: imag_cpu
     CUDA: imag_cuda
 
 - func: cummax(Tensor self, int dim) -> (Tensor values, Tensor indices)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: cummax_cpu
     CUDA: cummax_cuda
 
 - func: cummin(Tensor self, int dim) -> (Tensor values, Tensor indices)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: cummin_cpu
     CUDA: cummin_cuda
 
 - func: cumprod(Tensor self, int dim, ScalarType? dtype=None) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: cumprod_cpu
@@ -3605,6 +3877,7 @@
     CUDA: diag_embed_cuda
 
 - func: dist(Tensor self, Tensor other, Scalar p=2) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: dist_cpu
@@ -3630,6 +3903,7 @@
     CUDA: take_along_dim_cuda
 
 - func: select_scatter(Tensor self, Tensor src, int dim, int index) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: select_scatter_cpu
@@ -3637,6 +3911,7 @@
   tags: core
 
 - func: slice_scatter(Tensor self, Tensor src, int dim=0, int? start=None, int? end=None, int step=1) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: slice_scatter_cpu
@@ -3644,6 +3919,7 @@
   tags: [core, view_copy]
 
 - func: diagonal_scatter(Tensor self, Tensor src, int offset=0, int dim1=0, int dim2=1) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: diagonal_scatter_cpu
@@ -3656,6 +3932,7 @@
     CUDA: msort_cuda
 
 - func: nanmean(Tensor self, int? dim=None, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: nanmean_cpu
@@ -3674,6 +3951,7 @@
     CUDA: isreal_cuda
 
 - func: bitwise_not(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: bitwise_not_cpu
@@ -3681,6 +3959,7 @@
   tags: [core, pointwise]
 
 - func: bitwise_and.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: bitwise_and_tensor_cpu
@@ -3688,6 +3967,7 @@
   tags: [core, pointwise]
 
 - func: bitwise_and.Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: bitwise_and_scalar_cpu
@@ -3695,6 +3975,7 @@
   tags: [core, pointwise]
 
 - func: bitwise_or.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: bitwise_or_tensor_cpu
@@ -3702,6 +3983,7 @@
   tags: [core, pointwise]
 
 - func: bitwise_or.Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: bitwise_or_scalar_cpu
@@ -3709,6 +3991,7 @@
   tags: [core, pointwise]
 
 - func: bitwise_xor.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: bitwise_xor_tensor_cpu
@@ -3716,6 +3999,7 @@
   tags: [core, pointwise]
 
 - func: bitwise_xor.Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: bitwise_xor_scalar_cpu
@@ -3723,6 +4007,7 @@
   tags: [core, pointwise]
 
 - func: bitwise_left_shift.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: bitwise_lshift_tensor_cpu
@@ -3730,6 +4015,7 @@
   tags: pointwise
 
 - func: bitwise_left_shift.Tensor_Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: bitwise_lshift_scalar_cpu
@@ -3737,6 +4023,7 @@
   tags: pointwise
 
 - func: bitwise_right_shift.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: bitwise_rshift_tensor_cpu
@@ -3744,6 +4031,7 @@
   tags: pointwise
 
 - func: bitwise_right_shift.Tensor_Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: bitwise_rshift_scalar_cpu
@@ -3820,24 +4108,28 @@
     CUDA: scatter_inplace_value_cuda
 
 - func: masked_fill.Tensor(Tensor self, Tensor mask, Tensor value) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: masked_fill_tensor_cpu
     CUDA: masked_fill_tensor_cuda
 
 - func: masked_fill_.Tensor(Tensor(a!) self, Tensor mask, Tensor value) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: masked_fill_tensor__cpu
     CUDA: masked_fill_tensor__cuda
 
 - func: index_put(Tensor self, Tensor?[] indices, Tensor values, bool accumulate=False) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     Composite: index_put_composite
   tags: core
 
 - func: index_put_(Tensor(a!) self, Tensor?[] indices, Tensor values, bool accumulate=False) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     Composite: index_put__composite
@@ -3875,6 +4167,7 @@
     CUDA: scatter_add_inplace_cuda
 
 - func: sort(Tensor self, int dim=-1, bool descending=False) -> (Tensor values, Tensor indices)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: sort_cpu
@@ -3907,6 +4200,7 @@
   tags: reduction
 
 - func: std_mean(Tensor self, int[] dim=[], bool unbiased=True, bool keepdim=False) -> (Tensor std, Tensor mean)
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: std_mean_cpu
@@ -3914,6 +4208,7 @@
   tags: reduction
 
 - func: var_mean(Tensor self, int[] dim=[], bool unbiased=True, bool keepdim=False) -> (Tensor var, Tensor mean)
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: var_mean_cpu
@@ -3927,6 +4222,7 @@
     CUDA: trace_cuda
 
 - func: renorm(Tensor self, Scalar p, int dim, Scalar maxnorm) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: renorm_cpu
@@ -3939,6 +4235,7 @@
     CUDA: rot90_cuda
 
 - func: split_with_sizes(Tensor(a) self, int[] split_sizes, int dim=0) -> Tensor(a)[]
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: split_with_sizes_cpu
@@ -3982,6 +4279,7 @@
     CUDA: not_equal_cuda
 
 - func: logical_not(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: logical_not_cpu
@@ -3989,6 +4287,7 @@
   tags: [core, pointwise]
 
 - func: logical_or(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: logical_or_cpu
@@ -3996,6 +4295,7 @@
   tags: [core, pointwise]
 
 - func: logical_xor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: logical_xor_cpu
@@ -4030,6 +4330,7 @@
     CUDA: fix_cuda
 
 - func: digamma(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: digamma_cpu
@@ -4037,6 +4338,7 @@
   tags: pointwise
 
 - func: erfinv(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: erfinv_cpu
@@ -4101,6 +4403,7 @@
   tags: pointwise
 
 - func: heaviside(Tensor self, Tensor values) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: heaviside_cpu
@@ -4108,6 +4411,7 @@
   tags: pointwise
 
 - func: hypot(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: hypot_cpu
@@ -4178,6 +4482,7 @@
   tags: pointwise
 
 - func: isfinite(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: isfinite_cpu
@@ -4185,6 +4490,7 @@
   tags: pointwise
 
 - func: isinf(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: isinf_cpu
@@ -4192,6 +4498,7 @@
   tags: [core, pointwise]
 
 - func: isnan(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: isnan_cpu
@@ -4275,6 +4582,7 @@
     CUDA: l1_loss_cuda
 
 - func: smooth_l1_loss(Tensor self, Tensor target, int reduction=1, float beta=1.0) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: smooth_l1_loss_cpu
@@ -4305,6 +4613,7 @@
     CUDA: kl_div_cuda
 
 - func: binary_cross_entropy(Tensor self, Tensor target, Tensor? weight=None, int reduction=1) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: binary_cross_entropy_cpu
@@ -4317,6 +4626,7 @@
     CUDA: binary_cross_entropy_backward_cuda
 
 - func: binary_cross_entropy_with_logits(Tensor self, Tensor target, Tensor? weight=None, Tensor? pos_weight=None) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: binary_cross_entropy_with_logits_cpu
@@ -4424,6 +4734,7 @@
     CUDA: rnn_tanh_cuda
 
 - func: logsumexp(Tensor self, int dim, bool keepdim=False) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: logsumexp_cpu
@@ -4626,6 +4937,7 @@
     CUDA: gammaincc_cuda
 
 - func: polygamma(int n, Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: polygamma_cpu
@@ -4660,6 +4972,7 @@
     CUDA: to_sparse_csr_cuda
 
 - func: _nnz(Tensor self) -> int
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: sparse_nnz_cpu
@@ -5049,6 +5362,7 @@
 # ---------------------------------------------------------------------------
 
 - func: expand(Tensor(a) self, int[] size, *, bool implicit=False) -> Tensor(a)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: tpsa_expand
@@ -5056,6 +5370,7 @@
   tags: core
 
 - func: expand_as(Tensor(a) self, Tensor other) -> Tensor(a)
+  device_check: NoCheck
   variants: method
   dispatch:
     CPU: tpsa_expand_as
@@ -5264,12 +5579,14 @@
     CUDA: tpsa_moveaxis_int
 
 - func: swapaxes(Tensor(a) self, int axis0, int axis1) -> Tensor(a)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: tpsa_swapaxes
     CUDA: tpsa_swapaxes
 
 - func: swapdims(Tensor(a) self, int dim0, int dim1) -> Tensor(a)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: tpsa_swapdims
@@ -5382,9 +5699,11 @@
 #   native/Itertools.cpp      cartesian_prod
 # ------------------------------------------------------------------
 - func: absolute(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
 
 - func: absolute_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 
 - func: arccos(Tensor self) -> Tensor
@@ -5507,6 +5826,7 @@
 # Kernels registered from backend InplaceCompletionKernels.{cpp,cu}.
 # ------------------------------------------------------------------
 - func: acos_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
@@ -5527,6 +5847,7 @@
   variants: function, method
 
 - func: asin_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
@@ -5535,6 +5856,7 @@
   tags: pointwise
 
 - func: atan2_(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: atan2_inplace_kernel
@@ -5542,6 +5864,7 @@
   tags: pointwise
 
 - func: atan_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
@@ -5550,14 +5873,17 @@
   tags: pointwise
 
 - func: bitwise_not_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: ceil_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: celu_(Tensor(a!) self, Scalar alpha=1.0) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
@@ -5566,10 +5892,12 @@
   tags: pointwise
 
 - func: cos_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: cosh_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
@@ -5584,18 +5912,22 @@
   tags: pointwise
 
 - func: elu_(Tensor(a!) self, Scalar alpha=1, Scalar scale=1, Scalar input_scale=1) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: erf_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: erfc_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: erfinv_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
@@ -5604,18 +5936,22 @@
   tags: pointwise
 
 - func: exp_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: expm1_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: floor_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: frac_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
@@ -5623,23 +5959,29 @@
   variants: function, method
 
 - func: gelu_(Tensor(a!) self, str approximate="none") -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
 
 - func: hardsigmoid_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: hardswish_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
 
 - func: hardtanh_(Tensor(a!) self, Scalar min_val=-1, Scalar max_val=1) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: heaviside_(Tensor(a!) self, Tensor values) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
 
 - func: hypot_(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
@@ -5656,42 +5998,52 @@
   variants: function, method
 
 - func: leaky_relu_(Tensor(a!) self, Scalar negative_slope=0.01) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: lgamma_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: log10_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: log1p_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: log2_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: log_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: logical_and_(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: logical_not_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: logical_or_(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: logical_xor_(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
@@ -5718,6 +6070,7 @@
   tags: pointwise
 
 - func: reciprocal_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
@@ -5725,13 +6078,16 @@
   variants: function, method
 
 - func: renorm_(Tensor(a!) self, Scalar p, int dim, Scalar maxnorm) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
 
 - func: round_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: selu_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
@@ -5740,10 +6096,12 @@
   tags: pointwise
 
 - func: sigmoid_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: sign_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
@@ -5752,6 +6110,7 @@
   tags: pointwise
 
 - func: sin_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
@@ -5760,18 +6119,22 @@
   tags: pointwise
 
 - func: sinh_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: square_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: tan_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: tanh_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
@@ -5782,10 +6145,12 @@
   variants: function, method
 
 - func: trunc_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
 - func: threshold_(Tensor(a!) self, Scalar threshold, Scalar value) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
 
 - func: i0_(Tensor(a!) self) -> Tensor(a!)
@@ -5860,12 +6225,15 @@
   variants: function, method
 
 - func: is_nonzero(Tensor self) -> bool
+  device_check: NoCheck
   variants: function, method
 
 - func: is_same_size(Tensor self, Tensor other) -> bool
+  device_check: NoCheck
   variants: function, method
 
 - func: get_device(Tensor self) -> int
+  device_check: NoCheck
   variants: function, method
 
 - func: can_cast(ScalarType from_, ScalarType to) -> bool
@@ -5972,14 +6340,17 @@
   tags: view_copy
 
 - func: reshape_as(Tensor(a) self, Tensor other) -> Tensor(a)
+  device_check: NoCheck
   variants: function, method
 
 # TensorShape.cpp; used by autograd internals).
 - func: unsafe_chunk(Tensor self, int chunks, int dim=0) -> Tensor[]
+  device_check: NoCheck
   variants: function, method
   tags: maybe_aliasing_or_mutating
 
 - func: unsafe_split.Tensor(Tensor self, SymInt split_size, int dim=0) -> Tensor[]
+  device_check: NoCheck
   variants: function, method
 
 - func: cosine_similarity(Tensor x1, Tensor x2, int dim=1, float eps=1e-8) -> Tensor
@@ -6020,10 +6391,12 @@
 
 # rrelu_with_noise in training).
 - func: rrelu(Tensor self, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False, Generator? generator=None) -> Tensor
+  device_check: NoCheck
   variants: function, method
   tags: [pointwise, nondeterministic_seeded]
 
 - func: rrelu_(Tensor(a!) self, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False, Generator? generator=None) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: nondeterministic_seeded
 
@@ -6077,6 +6450,7 @@
   tags: view_copy
 
 - func: unsafe_split_with_sizes(Tensor self, int[] split_sizes, int dim=0) -> Tensor[]
+  device_check: NoCheck
   variants: function, method
 
 - func: detach_copy(Tensor self) -> Tensor
@@ -6131,6 +6505,7 @@
   tags: pointwise
 
 - func: fmax(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: fmax_cpu
@@ -6138,6 +6513,7 @@
   tags: pointwise
 
 - func: fmin(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: fmin_cpu
@@ -6148,6 +6524,7 @@
   variants: function, method
 
 - func: mvlgamma(Tensor self, int p) -> Tensor
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 
@@ -6168,6 +6545,7 @@
 
 # TensorProperties.cpp.
 - func: is_signed(Tensor self) -> bool
+  device_check: NoCheck
   variants: function, method
 
 # TensorAdvancedIndexing.cpp: fixed-size nonzero indices, padded/truncated.
@@ -6270,18 +6648,23 @@
 - func: _make_dep_token(*, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None, MemoryFormat? memory_format=None) -> Tensor
   variants: function
 - func: _use_cudnn_ctc_loss(Tensor log_probs, Tensor targets, int[] input_lengths, int[] target_lengths, int blank) -> bool
+  device_check: NoCheck
   variants: function
 - func: _use_cudnn_ctc_loss.Tensor(Tensor log_probs, Tensor targets, Tensor input_lengths, Tensor target_lengths, int blank) -> bool
+  device_check: NoCheck
   variants: function
 - func: _cudnn_ctc_loss(Tensor log_probs, Tensor targets, int[] input_lengths, int[] target_lengths, int blank, bool deterministic, bool zero_infinity) -> (Tensor, Tensor)
+  device_check: NoCheck
   variants: function
 - func: _cudnn_ctc_loss.Tensor(Tensor log_probs, Tensor targets, Tensor input_lengths, Tensor target_lengths, int blank, bool deterministic, bool zero_infinity) -> (Tensor, Tensor)
+  device_check: NoCheck
   variants: function
 - func: _use_cudnn_rnn_flatten_weight() -> bool
   variants: function
 - func: _cudnn_rnn_flatten_weight(Tensor[] weight_arr, int weight_stride0, SymInt input_size, int mode, SymInt hidden_size, SymInt proj_size, int num_layers, bool batch_first, bool bidirectional) -> Tensor
   variants: function
 - func: _cudnn_rnn(Tensor input, Tensor[] weight, int weight_stride0, Tensor? weight_buf, Tensor hx, Tensor? cx, int mode, SymInt hidden_size, SymInt proj_size, int num_layers, bool batch_first, float dropout, bool train, bool bidirectional, SymInt[] batch_sizes, Tensor? dropout_state) -> (Tensor, Tensor, Tensor, Tensor, Tensor)
+  device_check: NoCheck
   variants: function
   tags: nondeterministic_seeded
 - func: _cudnn_rnn_backward(Tensor input, Tensor[] weight, int weight_stride0, Tensor weight_buf, Tensor hx, Tensor? cx, Tensor output, Tensor? grad_output, Tensor? grad_hy, Tensor? grad_cy, int mode, SymInt hidden_size, SymInt proj_size, int num_layers, bool batch_first, float dropout, bool train, bool bidirectional, SymInt[] batch_sizes, Tensor? dropout_state, Tensor reserve, bool[4] output_mask) -> (Tensor, Tensor, Tensor, Tensor[])
@@ -6309,11 +6692,14 @@
 - func: _shape_as_tensor(Tensor self) -> Tensor
   variants: function
 - func: abs.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: absolute.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: angle.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: sgn.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
@@ -6332,11 +6718,13 @@
 - func: _neg_view(Tensor(a) self) -> Tensor(a)
   variants: function, method
 - func: acos.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: arccos.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: add.out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: _add_relu.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
@@ -6408,17 +6796,21 @@
 - func: arctanh.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: as_strided(Tensor(a) self, SymInt[] size, SymInt[] stride, SymInt? storage_offset=None) -> Tensor(a)
+  device_check: NoCheck
   variants: function, method
   tags: core
 - func: as_strided_(Tensor(a!) self, SymInt[] size, SymInt[] stride, SymInt? storage_offset=None) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: inplace_view
 - func: asin.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: arcsin.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: atan.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: arctan.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
@@ -6445,16 +6837,20 @@
 - func: _batch_norm_impl_index_backward(int impl_index, Tensor input, Tensor grad_output, Tensor? weight, Tensor? running_mean, Tensor? running_var, Tensor? save_mean, Tensor? save_var_transform, bool train, float eps, bool[3] output_mask, Tensor reservedSpace) -> (Tensor, Tensor, Tensor)
   variants: function
 - func: binary_cross_entropy.out(Tensor self, Tensor target, Tensor? weight=None, int reduction=Mean, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: binary_cross_entropy_backward.grad_input(Tensor grad_output, Tensor self, Tensor target, Tensor? weight=None, int reduction=Mean, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: bitwise_not.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: copysign.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: copysign_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: copysign_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
   variants: method
@@ -6464,15 +6860,19 @@
 - func: _lazy_clone(Tensor self) -> Tensor
   variants: function, method
 - func: logical_not.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: logical_xor.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: logical_and.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: logical_or.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: blackman_window.periodic(int window_length, bool periodic, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
@@ -6493,6 +6893,7 @@
 - func: concatenate.out(Tensor[] tensors, int dim=0, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: ceil.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: chain_matmul.out(Tensor[] matrices, *, Tensor(a!) out) -> Tensor(a!)
@@ -6504,27 +6905,33 @@
   variants: function, method
   tags: pointwise
 - func: clamp.out(Tensor self, Scalar? min=None, Scalar? max=None, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: clamp.Tensor_out(Tensor self, Tensor? min=None, Tensor? max=None, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: clamp_max_.Tensor(Tensor(a!) self, Tensor max) -> Tensor(a!)
   variants: function, method
   tags: pointwise
 - func: clamp_max.out(Tensor self, Scalar max, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: clamp_max.Tensor_out(Tensor self, Tensor max, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: clamp_min_.Tensor(Tensor(a!) self, Tensor min) -> Tensor(a!)
   variants: function, method
   tags: pointwise
 - func: clamp_min.out(Tensor self, Scalar min, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: clamp_min.Tensor_out(Tensor self, Tensor min, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: clip.Tensor(Tensor self, Tensor? min=None, Tensor? max=None) -> Tensor
@@ -6539,6 +6946,7 @@
 - func: clip.Tensor_out(Tensor self, Tensor? min=None, Tensor? max=None, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: cudnn_is_acceptable(Tensor self) -> bool
+  device_check: NoCheck
   variants: function
 - func: complex.out(Tensor real, Tensor imag, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -6574,9 +6982,11 @@
 - func: _copy_from_and_resize(Tensor self, Tensor dst) -> Tensor
   variants: function
 - func: cos.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: cosh.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: count_nonzero.dim_IntList(Tensor self, int[] dim) -> Tensor
@@ -6614,20 +7024,26 @@
 - func: cudnn_grid_sampler_backward(Tensor self, Tensor grid, Tensor grad_output) -> (Tensor grad_self, Tensor grad_grid)
   variants: function
 - func: cummax.out(Tensor self, int dim, *, Tensor(a!) values, Tensor(b!) indices) -> (Tensor(a!) values, Tensor(b!) indices)
+  device_check: NoCheck
   variants: function
 - func: _cummax_helper(Tensor self, Tensor(a!) values, Tensor(b!) indices, int dim) -> ()
   variants: function
 - func: cummin.out(Tensor self, int dim, *, Tensor(a!) values, Tensor(b!) indices) -> (Tensor(a!) values, Tensor(b!) indices)
+  device_check: NoCheck
   variants: function
 - func: _cummin_helper(Tensor self, Tensor(a!) values, Tensor(b!) indices, int dim) -> ()
   variants: function
 - func: cummaxmin_backward(Tensor grad, Tensor input, Tensor indices, int dim) -> Tensor
+  device_check: NoCheck
   variants: function
 - func: cumprod.out(Tensor self, int dim, *, ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: cumprod_backward(Tensor grad, Tensor input, int dim, Tensor output) -> Tensor
+  device_check: NoCheck
   variants: function
 - func: cumsum.out(Tensor self, int dim, *, ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: cumulative_trapezoid.x(Tensor y, Tensor x, *, int dim=-1) -> Tensor
   variants: function
@@ -6661,12 +7077,15 @@
 - func: gradient.tensorarray(Tensor self, *, Tensor[] spacing, int[] dim, int edge_order=1) -> Tensor[]
   variants: function
 - func: div.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: div_.Tensor_mode(Tensor(a!) self, Tensor other, *, str? rounding_mode) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: div.out_mode(Tensor self, Tensor other, *, str? rounding_mode, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: div_.Scalar_mode(Tensor(a!) self, Scalar other, *, str? rounding_mode) -> Tensor(a!)
@@ -6685,10 +7104,13 @@
 - func: divide_.Scalar_mode(Tensor(a!) self, Scalar other, *, str? rounding_mode) -> Tensor(a!)
   variants: method
 - func: true_divide_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: true_divide.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: true_divide_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: dot.out(Tensor self, Tensor tensor, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -6743,20 +7165,25 @@
 - func: empty_quantized(int[] size, Tensor qtensor, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None, MemoryFormat? memory_format=None) -> Tensor
   variants: function
 - func: empty.out(SymInt[] size, *, MemoryFormat? memory_format=None, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: erf.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: erfc.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: exp.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: exp2.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
   tags: pointwise
 - func: expm1.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: eye.m(SymInt n, SymInt m, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
@@ -6766,17 +7193,23 @@
 - func: eye.m_out(SymInt n, SymInt m, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: fill_.Tensor(Tensor(a!) self, Tensor value) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
 - func: floor.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: floor_divide_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: floor_divide.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: floor_divide_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: frac.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: full.out(SymInt[] size, Scalar fill_value, *, Tensor(a!) out) -> Tensor(a!)
@@ -6830,14 +7263,17 @@
 - func: _fft_c2c.out(Tensor self, SymInt[] dim, int normalization, bool forward, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: _validate_compressed_sparse_indices(bool is_crow, Tensor compressed_idx, Tensor plain_idx, int cdim, int dim, int nnz) -> ()
+  device_check: NoCheck
   variants: function
 - func: index.Tensor(Tensor self, Tensor?[] indices) -> Tensor
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: index_cpu
     CUDA: index_cuda
   tags: [core, dynamic_output_shape]
 - func: index.Tensor_out(Tensor self, Tensor?[] indices, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   dispatch:
     Composite: index_out_composite
@@ -6856,10 +7292,12 @@
 - func: index_copy.out(Tensor self, int dim, Tensor index, Tensor source, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: _unsafe_index_put(Tensor self, Tensor?[] indices, Tensor values, bool accumulate=False) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     Composite: unsafe_index_put_composite
 - func: _index_put_impl_(Tensor(a!) self, Tensor?[] indices, Tensor values, bool accumulate=False, bool unsafe=False) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: index_put_impl_cpu
@@ -6871,28 +7309,36 @@
 - func: isin.Scalar_Tensor_out(Scalar element, Tensor test_elements, *, bool assume_unique=False, bool invert=False, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: is_distributed(Tensor self) -> bool
+  device_check: NoCheck
   variants: function, method
 - func: is_floating_point(Tensor self) -> bool
+  device_check: NoCheck
   variants: function, method
 - func: _is_zerotensor(Tensor self) -> bool
   variants: function, method
 - func: is_inference(Tensor self) -> bool
+  device_check: NoCheck
   variants: function, method
 - func: numel(Tensor self) -> int
+  device_check: NoCheck
   variants: method
   manual_cpp_binding: true
   manual_kernel_registration: true
 - func: dim(Tensor self) -> int
+  device_check: NoCheck
   variants: method
   manual_cpp_binding: true
   manual_kernel_registration: true
 - func: storage_offset(Tensor self) -> int
+  device_check: NoCheck
   variants: method
 - func: is_contiguous(Tensor self) -> bool
+  device_check: NoCheck
   variants: method
   manual_cpp_binding: true
   manual_kernel_registration: true
 - func: is_contiguous.memory_format(Tensor self, MemoryFormat memory_format) -> bool
+  device_check: NoCheck
   variants: method
 - func: kron.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -6987,15 +7433,19 @@
 - func: linspace.Scalar_Tensor_out(Scalar start, Tensor end, int steps, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: log.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: log10.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: log1p.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: log2.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: logaddexp.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
@@ -7005,26 +7455,34 @@
   variants: function
   tags: pointwise
 - func: xlogy.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 - func: xlogy.Scalar_Self(Scalar self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: xlogy.Scalar_Other(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 - func: xlogy_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 - func: xlogy_.Scalar_Other(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
 - func: xlogy.OutTensor(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: xlogy.OutScalar_Self(Scalar self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: xlogy.OutScalar_Other(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: logspace.Tensor_Tensor(Tensor start, Tensor end, int steps, float base=10.0, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
@@ -7063,6 +7521,7 @@
 - func: logcumsumexp.out(Tensor self, int dim, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: logsumexp.out(Tensor self, int[1] dim, bool keepdim=False, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: reduction
 - func: matmul_backward(Tensor grad, Tensor self, Tensor other, bool[2] mask) -> (Tensor, Tensor)
@@ -7080,6 +7539,7 @@
 - func: _aminmax.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor, Tensor)
   variants: function
 - func: aminmax.out(Tensor self, *, int? dim=None, bool keepdim=False, Tensor(a!) min, Tensor(b!) max) -> (Tensor(a!) min, Tensor(b!) max)
+  device_check: NoCheck
   variants: function
   tags: reduction
 - func: _compute_linear_combination(Tensor input, Tensor coefficients) -> Tensor
@@ -7087,9 +7547,11 @@
 - func: _compute_linear_combination.out(Tensor input, Tensor coefficients, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: max.dim_max(Tensor self, int dim, bool keepdim=False, *, Tensor(a!) max, Tensor(b!) max_values) -> (Tensor(a!) values, Tensor(b!) indices)
+  device_check: NoCheck
   variants: function
   tags: reduction
 - func: value_selecting_reduction_backward(Tensor grad, int dim, Tensor indices, SymInt[] sizes, bool keepdim) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     Composite: value_selecting_reduction_backward_impl
@@ -7115,12 +7577,15 @@
     CPU: quantized_max_pool3d_cpu
 
 - func: mean.dtype_out(Tensor self, *, ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: reduction
 - func: mean.out(Tensor self, int[1]? dim, bool keepdim=False, *, ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: reduction
 - func: nanmean.out(Tensor self, int[1]? dim=None, bool keepdim=False, *, ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: median.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values, Tensor indices)
   variants: function, method
@@ -7131,6 +7596,7 @@
 - func: nanmedian.dim_values(Tensor self, int dim, bool keepdim=False, *, Tensor(a!) values, Tensor(b!) indices) -> (Tensor(a!) values, Tensor(b!) indices)
   variants: function
 - func: min.dim_min(Tensor self, int dim, bool keepdim=False, *, Tensor(a!) min, Tensor(b!) min_indices) -> (Tensor(a!) values, Tensor(b!) indices)
+  device_check: NoCheck
   variants: function
   tags: reduction
 - func: amin.out(Tensor self, int[1] dim=[], bool keepdim=False, *, Tensor(a!) out) -> Tensor(a!)
@@ -7166,12 +7632,16 @@
 - func: miopen_rnn_backward(Tensor input, Tensor[] weight, int weight_stride0, Tensor weight_buf, Tensor hx, Tensor? cx, Tensor output, Tensor? grad_output, Tensor? grad_hy, Tensor? grad_cy, int mode, int hidden_size, int num_layers, bool batch_first, float dropout, bool train, bool bidirectional, int[] batch_sizes, Tensor? dropout_state, Tensor reserve, bool[4] output_mask) -> (Tensor, Tensor, Tensor, Tensor[])
   variants: function
 - func: _use_miopen_ctc_loss(Tensor log_probs, Tensor targets, int[] input_lengths, int[] target_lengths, int blank) -> bool
+  device_check: NoCheck
   variants: function
 - func: _use_miopen_ctc_loss.Tensor(Tensor log_probs, Tensor targets, Tensor input_lengths, Tensor target_lengths, int blank) -> bool
+  device_check: NoCheck
   variants: function
 - func: miopen_ctc_loss(Tensor log_probs, Tensor targets, int[] input_lengths, int[] target_lengths, int blank, bool deterministic, bool zero_infinity) -> (Tensor, Tensor)
+  device_check: NoCheck
   variants: function
 - func: miopen_ctc_loss.Tensor(Tensor log_probs, Tensor targets, Tensor input_lengths, Tensor target_lengths, int blank, bool deterministic, bool zero_infinity) -> (Tensor, Tensor)
+  device_check: NoCheck
   variants: function
 - func: mm.out(Tensor self, Tensor mat2, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -7208,6 +7678,7 @@
 - func: mode.values(Tensor self, int dim=-1, bool keepdim=False, *, Tensor(a!) values, Tensor(b!) indices) -> (Tensor(a!) values, Tensor(b!) indices)
   variants: function
 - func: mul.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: multiply_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
@@ -7222,11 +7693,13 @@
   variants: function
   tags: pointwise
 - func: mvlgamma_(Tensor(a!) self, int p) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: narrow_copy.out(Tensor self, int dim, SymInt start, SymInt length, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: narrow.Tensor(Tensor(a) self, int dim, Tensor start, SymInt length) -> Tensor(a)
+  device_check: NoCheck
   variants: function, method
 - func: native_batch_norm(Tensor input, Tensor? weight, Tensor? bias, Tensor? running_mean, Tensor? running_var, bool training, float momentum, float eps) -> (Tensor, Tensor, Tensor)
   variants: function
@@ -7387,9 +7860,11 @@
 - func: range.out(Scalar start, Scalar end, Scalar step=1, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: reciprocal.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: neg.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: negative.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
@@ -7404,19 +7879,25 @@
 - func: _reshape_copy(Tensor self, SymInt[] size) -> Tensor
   variants: function
 - func: _reshape_alias(Tensor(a) self, SymInt[] size, SymInt[] stride) -> Tensor(a)
+  device_check: NoCheck
   variants: function, method
 - func: _mkldnn_reshape(Tensor self, int[] shape) -> Tensor
+  device_check: NoCheck
   variants: function
 - func: round.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: round.decimals(Tensor self, *, int decimals) -> Tensor
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 - func: round_.decimals(Tensor(a!) self, *, int decimals) -> Tensor(a!)
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 - func: round.decimals_out(Tensor self, *, int decimals, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: _prelu_kernel(Tensor self, Tensor weight) -> Tensor
@@ -7424,26 +7905,32 @@
 - func: _prelu_kernel_backward(Tensor grad_output, Tensor self, Tensor weight) -> (Tensor, Tensor)
   variants: function
 - func: gelu.out(Tensor self, *, str approximate='none', Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: gelu_backward.grad_input(Tensor grad_output, Tensor self, *, str approximate='none', Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: infinitely_differentiable_gelu_backward(Tensor grad, Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     Composite: infinitely_differentiable_gelu_backward_impl
 - func: hardshrink.out(Tensor self, Scalar lambd=0.5, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: hardshrink_backward.grad_input(Tensor grad_out, Tensor self, Scalar lambd, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: rsqrt.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: select.int(Tensor(a) self, int dim, SymInt index) -> Tensor(a)
+  device_check: NoCheck
   variants: function, method
   manual_cpp_binding: true
   manual_kernel_registration: true
   tags: core
 - func: _nested_select_backward(Tensor grad_output, Tensor self, int dim, SymInt index) -> Tensor
+  device_check: NoCheck
   variants: function
 - func: silu.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -7454,44 +7941,55 @@
 - func: mish.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: sigmoid.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: logit.out(Tensor self, float? eps=None, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
   tags: pointwise
 - func: sin.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: sinc.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
   tags: pointwise
 - func: sinh.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: detach(Tensor(a) self) -> Tensor(a)
   variants: function, method
 - func: size.int(Tensor self, int dim) -> int
+  device_check: NoCheck
   variants: function
 - func: sym_size.int(Tensor self, int dim) -> SymInt
+  device_check: NoCheck
   variants: function
   tags: core
 - func: sym_is_contiguous(Tensor self, MemoryFormat memory_format=contiguous_format) -> SymBool
+  device_check: NoCheck
   variants: function
   tags: core
 - func: sym_numel(Tensor self) -> SymInt
+  device_check: NoCheck
   variants: function
   tags: core
 - func: sym_storage_offset(Tensor self) -> SymInt
+  device_check: NoCheck
   variants: function
   tags: core
 - func: slice.Tensor(Tensor(a) self, int dim=0, SymInt? start=None, SymInt? end=None, SymInt step=1) -> Tensor(a)
+  device_check: NoCheck
   variants: function, method
   dispatch:
     CPU: slice_kernel
   tags: core
 - func: slice_inverse(Tensor(a) self, Tensor src, int dim=0, SymInt? start=None, SymInt? end=None, SymInt step=1) -> Tensor(a)
+  device_check: NoCheck
   variants: function, method
 - func: as_strided_scatter(Tensor self, Tensor src, SymInt[] size, SymInt[] stride, SymInt? storage_offset=None) -> Tensor
+  device_check: NoCheck
   variants: function, method
 - func: smm(Tensor self, Tensor mat2) -> Tensor
   variants: function, method
@@ -7511,14 +8009,18 @@
 - func: _softmax_backward_data.out(Tensor grad_output, Tensor output, int dim, ScalarType input_dtype, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: split.Tensor(Tensor(a -> *) self, SymInt split_size, int dim=0) -> Tensor(a)[]
+  device_check: NoCheck
   variants: function, method
 - func: squeeze_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: inplace_view
 - func: squeeze_.dim(Tensor(a!) self, int dim) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: inplace_view
 - func: squeeze_.dims(Tensor(a!) self, int[] dim) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: inplace_view
 - func: sspaddmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1) -> Tensor
@@ -7538,11 +8040,14 @@
 - func: stft.center(Tensor self, int n_fft, int? hop_length=None, int? win_length=None, Tensor? window=None, bool center=True, str pad_mode="reflect", bool normalized=False, bool? onesided=None, bool? return_complex=None, bool? align_to_window=None) -> Tensor
   variants: function, method
 - func: stride.int(Tensor self, int dim) -> int
+  device_check: NoCheck
   variants: function
 - func: sym_stride.int(Tensor self, int dim) -> SymInt
+  device_check: NoCheck
   variants: function
   tags: core
 - func: sum.IntList_out(Tensor self, int[1]? dim, bool keepdim=False, *, ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: reduction
 - func: _nested_sum_backward(Tensor grad, Tensor self, int[1]? dim, bool keepdim=False) -> Tensor
@@ -7555,41 +8060,53 @@
 - func: hash_tensor.out(Tensor self, int[1] dim=[], *, bool keepdim=False, int mode=0, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: sum_to_size(Tensor self, SymInt[] size) -> Tensor
+  device_check: NoCheck
   variants: method
 - func: sqrt.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: square.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
   tags: pointwise
 - func: std.correction(Tensor self, int[1]? dim=None, *, Scalar? correction=None, bool keepdim=False) -> Tensor
+  device_check: NoCheck
   variants: function, method
   tags: reduction
 - func: std_mean.dim(Tensor self, int[1]? dim, bool unbiased=True, bool keepdim=False) -> (Tensor, Tensor)
+  device_check: NoCheck
   variants: function
   tags: reduction
 - func: std_mean.correction(Tensor self, int[1]? dim=None, *, Scalar? correction=None, bool keepdim=False) -> (Tensor, Tensor)
+  device_check: NoCheck
   variants: function
   tags: reduction
 - func: std.out(Tensor self, int[1]? dim, bool unbiased=True, bool keepdim=False, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: reduction
 - func: std.correction_out(Tensor self, int[1]? dim=None, *, Scalar? correction=None, bool keepdim=False, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: reduction
 - func: prod.dim_int(Tensor self, int dim, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor
+  device_check: NoCheck
   variants: function, method
   tags: [core, reduction]
 - func: prod.int_out(Tensor self, int dim, bool keepdim=False, *, ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: reduction
 - func: t_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: inplace_view
 - func: tan.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: tanh.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: tensordot(Tensor self, Tensor other, int[] dims_self, int[] dims_other) -> Tensor
@@ -7597,17 +8114,22 @@
 - func: tensordot.out(Tensor self, Tensor other, int[] dims_self, int[] dims_other, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: threshold.out(Tensor self, Scalar threshold, Scalar value, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: threshold_backward.grad_input(Tensor grad_output, Tensor self, Scalar threshold, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: transpose.int(Tensor(a) self, int dim0, int dim1) -> Tensor(a)
+  device_check: NoCheck
   variants: function, method
 - func: _mkldnn_transpose(Tensor self, int dim0, int dim1) -> Tensor
+  device_check: NoCheck
   variants: function
 - func: transpose_(Tensor(a!) self, int dim0, int dim1) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: inplace_view
 - func: _mkldnn_transpose_(Tensor(a!) self, int dim0, int dim1) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: trapezoid.x(Tensor y, Tensor x, *, int dim=-1) -> Tensor
   variants: function
@@ -7620,6 +8142,7 @@
 - func: _nested_tensor_from_mask_left_aligned(Tensor t, Tensor mask) -> bool
   variants: function
 - func: _nested_from_padded(Tensor padded, Tensor cpu_nested_shape_example, bool fuse_transform_0213=False) -> Tensor
+  device_check: NoCheck
   variants: function
 - func: _nested_tensor_size(Tensor self) -> Tensor
   variants: method
@@ -7630,37 +8153,50 @@
 - func: _nested_from_padded_and_nested_example(Tensor padded, Tensor nt_example) -> Tensor
   variants: function
 - func: _nested_view_from_buffer(Tensor(a) self, Tensor nested_size, Tensor nested_strides, Tensor offsets) -> Tensor(a)
+  device_check: NoCheck
   variants: function
 - func: _nested_view_from_buffer_copy(Tensor self, Tensor nested_size, Tensor nested_strides, Tensor offsets) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: view_copy
 - func: _nested_view_from_jagged(Tensor(a) self, Tensor offsets, Tensor dummy, Tensor? lengths=None, int ragged_idx=1, Tensor? min_seqlen=None, Tensor? max_seqlen=None) -> Tensor(a)
+  device_check: NoCheck
   variants: function
 - func: _nested_view_from_jagged_copy(Tensor self, Tensor offsets, Tensor dummy, Tensor? lengths=None, int ragged_idx=1, Tensor? min_seqlen=None, Tensor? max_seqlen=None) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: view_copy
 - func: _nested_get_values(Tensor(a) self) -> Tensor(a)
+  device_check: NoCheck
   variants: function
 - func: _nested_get_values_copy(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: view_copy
 - func: _nested_get_offsets(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function
 - func: _nested_get_lengths(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function
 - func: _nested_get_ragged_idx(Tensor self) -> int
+  device_check: NoCheck
   variants: function
 - func: _nested_get_min_seqlen(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function
 - func: _nested_get_max_seqlen(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function
 - func: _nested_get_jagged_dummy(Tensor any) -> Tensor
   variants: function
 - func: _nested_compute_contiguous_strides_offsets(Tensor nested_size) -> (Tensor, Tensor)
+  device_check: NoCheck
   variants: function
 - func: _trilinear(Tensor i1, Tensor i2, Tensor i3, int[] expand1, int[] expand2, int[] expand3, int[] sumdim, int unroll_dim=1) -> Tensor
   variants: function
 - func: trunc.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: fix_(Tensor(a!) self) -> Tensor(a!)
@@ -7698,28 +8234,37 @@
 - func: _unsafe_view(Tensor self, SymInt[] size) -> Tensor
   variants: function
 - func: unsqueeze_(Tensor(a!) self, int dim) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: inplace_view
 - func: var.correction(Tensor self, int[1]? dim=None, *, Scalar? correction=None, bool keepdim=False) -> Tensor
+  device_check: NoCheck
   variants: function, method
   tags: [core, reduction]
 - func: var.out(Tensor self, int[1]? dim, bool unbiased=True, bool keepdim=False, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: reduction
 - func: var.correction_out(Tensor self, int[1]? dim=None, *, Scalar? correction=None, bool keepdim=False, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: reduction
 - func: var_mean.dim(Tensor self, int[1]? dim, bool unbiased=True, bool keepdim=False) -> (Tensor, Tensor)
+  device_check: NoCheck
   variants: function
   tags: reduction
 - func: var_mean.correction(Tensor self, int[1]? dim=None, *, Scalar? correction=None, bool keepdim=False) -> (Tensor, Tensor)
+  device_check: NoCheck
   variants: function
   tags: reduction
 - func: view_as(Tensor(a) self, Tensor other) -> Tensor(a)
+  device_check: NoCheck
   variants: method
 - func: where.self_out(Tensor condition, Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: where(Tensor condition) -> Tensor[]
+  device_check: NoCheck
   variants: function
 - func: norm_except_dim(Tensor v, int pow=2, int dim=0) -> Tensor
   variants: function
@@ -7760,6 +8305,7 @@
     CPU: sample_dirichlet_kernel
   tags: nondeterministic_seeded
 - func: binomial(Tensor count, Tensor prob, Generator? generator=None) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: binomial_kernel
@@ -7803,21 +8349,27 @@
 - func: _spdiags(Tensor diagonals, Tensor offsets, int[] shape, Layout? layout=None) -> Tensor
   variants: function
 - func: norm.ScalarOpt_dtype(Tensor self, Scalar? p, *, ScalarType dtype) -> Tensor
+  device_check: NoCheck
   variants: function, method
   tags: reduction
 - func: norm.Scalar(Tensor self, Scalar p=2) -> Tensor
+  device_check: NoCheck
   variants: function, method
   tags: reduction
 - func: norm.ScalarOpt_dim_dtype(Tensor self, Scalar? p, int[1] dim, bool keepdim, *, ScalarType dtype) -> Tensor
+  device_check: NoCheck
   variants: function, method
   tags: reduction
 - func: norm.ScalarOpt_dim(Tensor self, Scalar? p, int[1] dim, bool keepdim=False) -> Tensor
+  device_check: NoCheck
   variants: function, method
   tags: reduction
 - func: norm.dtype_out(Tensor self, Scalar? p, int[1] dim, bool keepdim, *, ScalarType dtype, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: reduction
 - func: norm.out(Tensor self, Scalar? p, int[1] dim, bool keepdim=False, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: reduction
 - func: frexp.Tensor(Tensor self) -> (Tensor mantissa, Tensor exponent)
@@ -7841,6 +8393,7 @@
 - func: resize_as_sparse_(Tensor(a!) self, Tensor the_template) -> Tensor(a!)
   variants: function, method
 - func: sub.out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: subtract.out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
@@ -7850,6 +8403,7 @@
 - func: subtract_.Scalar(Tensor(a!) self, Scalar other, Scalar alpha=1) -> Tensor(a!)
   variants: method
 - func: heaviside.out(Tensor self, Tensor values, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: _sparse_addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1) -> Tensor
@@ -7973,42 +8527,57 @@
   dispatch:
     Composite: to_dense_backward_impl
 - func: sparse_dim(Tensor self) -> int
+  device_check: NoCheck
   variants: method
 - func: _dimI(Tensor self) -> int
+  device_check: NoCheck
   variants: method
 - func: dense_dim(Tensor self) -> int
+  device_check: NoCheck
   variants: method
 - func: _dimV(Tensor self) -> int
+  device_check: NoCheck
   variants: method
 - func: coalesce(Tensor(a) self) -> Tensor(a)
   variants: method
 - func: _coalesce(Tensor self) -> Tensor
   variants: function
 - func: is_coalesced(Tensor self) -> bool
+  device_check: NoCheck
   variants: method
 - func: _indices(Tensor(a) self) -> Tensor(a)
+  device_check: NoCheck
   variants: method
 - func: _values(Tensor(a) self) -> Tensor(a)
+  device_check: NoCheck
   variants: method
 - func: _coalesced_(Tensor(a!) self, bool coalesced) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: indices(Tensor(a) self) -> Tensor(a)
+  device_check: NoCheck
   variants: method
 - func: values(Tensor(a) self) -> Tensor(a)
+  device_check: NoCheck
   variants: method
 - func: crow_indices(Tensor(a) self) -> Tensor(a)
+  device_check: NoCheck
   variants: method
 - func: col_indices(Tensor(a) self) -> Tensor(a)
+  device_check: NoCheck
   variants: method
 - func: ccol_indices(Tensor(a) self) -> Tensor(a)
+  device_check: NoCheck
   variants: method
 - func: row_indices(Tensor(a) self) -> Tensor(a)
+  device_check: NoCheck
   variants: method
 - func: hspmm.out(Tensor mat1, Tensor mat2, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: hspmm(Tensor mat1, Tensor mat2) -> Tensor
   variants: function
 - func: copy_sparse_to_sparse_(Tensor(a!) self, Tensor src, bool non_blocking=False) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: unbind.int(Tensor(a -> *) self, int dim=0) -> Tensor(a)[]
   variants: function, method
@@ -8057,14 +8626,17 @@
 - func: qscheme(Tensor self) -> int
   variants: function, method
 - func: int_repr(Tensor self) -> Tensor
+  device_check: NoCheck
   variants: function, method
 - func: _make_per_tensor_quantized_tensor(Tensor self, float scale, int zero_point) -> Tensor
   variants: function
 - func: _make_per_channel_quantized_tensor(Tensor self, Tensor scale, Tensor zero_point, int axis) -> Tensor
   variants: function
 - func: fake_quantize_per_tensor_affine(Tensor self, float scale, int zero_point, int quant_min, int quant_max) -> Tensor
+  device_check: NoCheck
   variants: function
 - func: fake_quantize_per_tensor_affine.tensor_qparams(Tensor self, Tensor scale, Tensor zero_point, int quant_min, int quant_max) -> Tensor
+  device_check: NoCheck
   variants: function
 - func: fake_quantize_per_tensor_affine_cachemask(Tensor self, float scale, int zero_point, int quant_min, int quant_max) -> (Tensor output, Tensor mask)
   variants: function
@@ -8077,6 +8649,7 @@
 - func: _fake_quantize_learnable_per_tensor_affine_backward(Tensor grad, Tensor self, Tensor scale, Tensor zero_point, int quant_min, int quant_max, float grad_factor=1.0) -> (Tensor, Tensor, Tensor)
   variants: function
 - func: fake_quantize_per_channel_affine(Tensor self, Tensor scale, Tensor zero_point, int axis, int quant_min, int quant_max) -> Tensor
+  device_check: NoCheck
   variants: function
 - func: fake_quantize_per_channel_affine_cachemask(Tensor self, Tensor scale, Tensor zero_point, int axis, int quant_min, int quant_max) -> (Tensor output, Tensor mask)
   variants: function
@@ -8101,17 +8674,22 @@
 - func: _autocast_to_full_precision(Tensor(a) self, bool cuda_enabled, bool cpu_enabled) -> Tensor(a)
   variants: method
 - func: _to_copy(Tensor self, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None, bool non_blocking=False, MemoryFormat? memory_format=None) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     Composite: to_copy_composite
   tags: core
 - func: to.dtype_layout(Tensor(a) self, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None, bool non_blocking=False, bool copy=False, MemoryFormat? memory_format=None) -> Tensor(a)
+  device_check: NoCheck
   variants: method
 - func: to.device(Tensor(a) self, Device device, ScalarType dtype, bool non_blocking=False, bool copy=False, MemoryFormat? memory_format=None) -> Tensor(a)
+  device_check: NoCheck
   variants: method
 - func: to.dtype(Tensor(a) self, ScalarType dtype, bool non_blocking=False, bool copy=False, MemoryFormat? memory_format=None) -> Tensor(a)
+  device_check: NoCheck
   variants: method
 - func: to.other(Tensor(a) self, Tensor other, bool non_blocking=False, bool copy=False, MemoryFormat? memory_format=None) -> Tensor(a)
+  device_check: NoCheck
   variants: method
 - func: meshgrid.indexing(Tensor[] tensors, *, str indexing) -> Tensor[]
   variants: function
@@ -8220,10 +8798,13 @@
   variants: function
   tags: view_copy
 - func: is_set_to(Tensor self, Tensor tensor) -> bool
+  device_check: NoCheck
   variants: method
 - func: masked_fill_.Scalar(Tensor(a!) self, Tensor mask, Scalar value) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: masked_fill.Scalar(Tensor self, Tensor mask, Scalar value) -> Tensor
+  device_check: NoCheck
   variants: function, method
   tags: pointwise
 - func: masked_scatter_backward(Tensor grad_output, Tensor mask, SymInt[] sizes) -> Tensor
@@ -8235,6 +8816,7 @@
 - func: _masked_softmax_backward(Tensor grad_output, Tensor output, Tensor mask, int? dim=None) -> Tensor
   variants: function
 - func: view.dtype(Tensor(a) self, ScalarType dtype) -> Tensor(a)
+  device_check: NoCheck
   variants: method
 - func: put_(Tensor(a!) self, Tensor index, Tensor source, bool accumulate=False) -> Tensor(a!)
   variants: method
@@ -8243,12 +8825,16 @@
 - func: index_reduce.out(Tensor self, int dim, Tensor index, Tensor source, str reduce, *, bool include_self=True, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: index_fill_.int_Scalar(Tensor(a!) self, int dim, Tensor index, Scalar value) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: index_fill.int_Scalar(Tensor self, int dim, Tensor index, Scalar value) -> Tensor
+  device_check: NoCheck
   variants: function, method
 - func: index_fill_.int_Tensor(Tensor(a!) self, int dim, Tensor index, Tensor value) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: index_fill.int_Tensor(Tensor self, int dim, Tensor index, Tensor value) -> Tensor
+  device_check: NoCheck
   variants: function, method
 - func: scatter.src_out(Tensor self, int dim, Tensor index, Tensor src, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -8276,143 +8862,193 @@
 - func: scatter_reduce.two_out(Tensor self, int dim, Tensor index, Tensor src, str reduce, *, bool include_self=True, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: eq_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: eq_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: bitwise_and.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: bitwise_and.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: bitwise_and.Scalar_Tensor(Scalar self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: bitwise_and_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: bitwise_and_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: __and__.Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: method, function
 - func: __and__.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: method, function
 - func: __iand__.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: __iand__.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: bitwise_or.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: bitwise_or.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: bitwise_or.Scalar_Tensor(Scalar self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: bitwise_or_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: bitwise_or_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: __or__.Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: method, function
 - func: __or__.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: method, function
 - func: __ior__.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: __ior__.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: bitwise_xor.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: bitwise_xor.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: bitwise_xor.Scalar_Tensor(Scalar self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: bitwise_xor_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: bitwise_xor_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: __xor__.Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: method, function
   tags: pointwise
 - func: __xor__.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: method, function
   tags: pointwise
 - func: __ixor__.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: __ixor__.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: __lshift__.Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: method, function
   tags: pointwise
 - func: __lshift__.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: method, function
   tags: pointwise
 - func: __ilshift__.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: __ilshift__.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: bitwise_left_shift_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: bitwise_left_shift.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: bitwise_left_shift_.Tensor_Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: bitwise_left_shift.Tensor_Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: bitwise_left_shift.Scalar_Tensor(Scalar self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: __rshift__.Scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: method, function
   tags: pointwise
 - func: __rshift__.Tensor(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: method, function
   tags: pointwise
 - func: __irshift__.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: __irshift__.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: bitwise_right_shift_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: bitwise_right_shift.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: bitwise_right_shift_.Tensor_Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: bitwise_right_shift.Tensor_Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: bitwise_right_shift.Scalar_Tensor(Scalar self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: digamma_(Tensor(a!) self) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: addbmm.out(Tensor self, Tensor batch1, Tensor batch2, *, Scalar beta=1, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: random_.from(Tensor(a!) self, int from, int? to, *, Generator? generator=None) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: nondeterministic_seeded
 - func: random_.to(Tensor(a!) self, int to, *, Generator? generator=None) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: nondeterministic_seeded
 - func: diag.out(Tensor self, int diagonal=0, *, Tensor(a!) out) -> Tensor(a!)
@@ -8424,16 +9060,21 @@
 - func: tril.out(Tensor self, SymInt diagonal=0, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: trace_backward(Tensor grad, SymInt[] sizes) -> Tensor
+  device_check: NoCheck
   variants: function
 - func: ne.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: ne.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: ne_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: ne_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: not_equal.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -8448,20 +9089,26 @@
 - func: not_equal_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
   variants: method
 - func: eq.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: eq.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: ge.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: ge.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: ge_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: ge_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: greater_equal.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -8476,14 +9123,18 @@
 - func: greater_equal_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
   variants: method
 - func: le.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: le.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: le_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: le_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: less_equal.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -8498,14 +9149,18 @@
 - func: less_equal_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
   variants: method
 - func: gt.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: gt.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: gt_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: gt_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: greater.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -8520,14 +9175,18 @@
 - func: greater_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
   variants: method
 - func: lt.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: lt.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: lt_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: lt_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
 - func: less.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -8548,6 +9207,7 @@
 - func: index_select.out(Tensor self, int dim, Tensor index, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: index_select_backward(Tensor grad, SymInt[] self_sizes, int dim, Tensor index) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     Composite: index_select_backward_impl
@@ -8555,6 +9215,7 @@
   variants: function
   tags: dynamic_output_shape
 - func: masked_select_backward(Tensor grad, Tensor input, Tensor mask) -> Tensor
+  device_check: NoCheck
   variants: function
 - func: nonzero.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
@@ -8566,15 +9227,18 @@
 - func: gather.out(Tensor self, int dim, Tensor index, *, bool sparse_grad=False, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: gather_backward(Tensor grad, Tensor self, int dim, Tensor index, bool sparse_grad) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     Composite: gather_backward_impl
 - func: _gather_sparse_backward(Tensor self, int dim, Tensor index, Tensor grad) -> Tensor
   variants: function
 - func: addcmul.out(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: addcdiv.out(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: cross_entropy_loss(Tensor self, Tensor target, Tensor? weight=None, int reduction=Mean, SymInt ignore_index=-100, float label_smoothing=0.0) -> Tensor
@@ -8590,9 +9254,11 @@
 - func: svd.U(Tensor self, bool some=True, bool compute_uv=True, *, Tensor(a!) U, Tensor(b!) S, Tensor(c!) V) -> (Tensor(a!) U, Tensor(b!) S, Tensor(c!) V)
   variants: function
 - func: swapaxes_(Tensor(a!) self, int axis0, int axis1) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: inplace_view
 - func: swapdims_(Tensor(a!) self, int dim0, int dim1) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: inplace_view
 - func: cholesky_solve.out(Tensor self, Tensor input2, bool upper=False, *, Tensor(a!) out) -> Tensor(a!)
@@ -8631,30 +9297,37 @@
   variants: function
   tags: nondeterministic_seeded
 - func: lgamma.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: digamma.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: polygamma.out(int n, Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: polygamma_(Tensor(a!) self, int n) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: erfinv.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: i0.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
   tags: pointwise
 - func: sign.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: signbit.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
   tags: pointwise
 - func: atan2.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: [core, pointwise]
 - func: arctan2(Tensor self, Tensor other) -> Tensor
@@ -8663,6 +9336,7 @@
     CPU: atan2_cpu
     CUDA: atan2_kernel_cuda
 - func: arctan2.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: arctan2_(Tensor(a!) self, Tensor other) -> Tensor(a!)
   variants: method
@@ -8670,12 +9344,15 @@
     CPU: atan2_inplace_kernel
     CUDA: atan2_inplace_kernel
 - func: lerp.Scalar_out(Tensor self, Tensor end, Scalar weight, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: lerp.Tensor_out(Tensor self, Tensor end, Tensor weight, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: lerp.Scalar(Tensor self, Tensor end, Scalar weight) -> Tensor
+  device_check: NoCheck
   variants: method, function
   tags: pointwise
 - func: histc.out(Tensor self, int bins=100, Scalar min=0, Scalar max=0, *, Tensor(a!) out) -> Tensor(a!)
@@ -8699,18 +9376,23 @@
 - func: histogramdd.TensorList_bins(Tensor self, Tensor[] bins, float[]? range=None, Tensor? weight=None, bool density=False) -> (Tensor hist, Tensor[] bin_edges)
   variants: function
 - func: fmod.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: fmod_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: fmod.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: fmod_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: hypot.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: igamma.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
@@ -8735,39 +9417,51 @@
   variants: method
   tags: pointwise
 - func: remainder.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: remainder_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: min.unary_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: reduction
 - func: fmin.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: fmax.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: maximum.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: max.other(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: method, function
   tags: pointwise
 - func: max.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: max.unary_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: reduction
 - func: minimum.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: min.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: min.other(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: method, function
   tags: pointwise
 - func: quantile.out(Tensor self, Tensor q, int? dim=None, bool keepdim=False, *, str interpolation='linear', Tensor(a!) out) -> Tensor(a!)
@@ -8783,6 +9477,7 @@
 - func: nanquantile.scalar_out(Tensor self, float q, int? dim=None, bool keepdim=False, *, str interpolation='linear', Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: sort.values(Tensor self, int dim=-1, bool descending=False, *, Tensor(a!) values, Tensor(b!) indices) -> (Tensor(a!) values, Tensor(b!) indices)
+  device_check: NoCheck
   variants: function
 - func: sort.values_stable(Tensor self, *, bool? stable, int dim=-1, bool descending=False, Tensor(a!) values, Tensor(b!) indices) -> (Tensor(a!) values, Tensor(b!) indices)
   variants: function
@@ -8791,39 +9486,50 @@
 - func: msort.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: argsort.stable(Tensor self, *, bool stable, int dim=-1, bool descending=False) -> Tensor
+  device_check: NoCheck
   variants: method, function
 - func: argsort.stable_out(Tensor self, *, bool stable, int dim=-1, bool descending=False, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: topk.values(Tensor self, SymInt k, int dim=-1, bool largest=True, bool sorted=True, *, Tensor(a!) values, Tensor(b!) indices) -> (Tensor(a!) values, Tensor(b!) indices)
   variants: function
 - func: all.all_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   dispatch:
     CompositeExplicitAutograd: all_all_out_default
   tags: reduction
 - func: any.all_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   dispatch:
     CompositeExplicitAutograd: any_all_out_default
   tags: reduction
 - func: renorm.out(Tensor self, Scalar p, int dim, Scalar maxnorm, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: pow.Tensor_Tensor_out(Tensor self, Tensor exponent, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: pow.Scalar_out(Scalar self, Tensor exponent, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: pow.Scalar(Scalar self, Tensor exponent) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: [core, pointwise]
 - func: pow.Tensor_Scalar_out(Tensor self, Scalar exponent, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: pow_.Scalar(Tensor(a!) self, Scalar exponent) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: pow_.Tensor(Tensor(a!) self, Tensor exponent) -> Tensor(a!)
+  device_check: NoCheck
   variants: method
   tags: pointwise
 - func: float_power.Tensor_Tensor_out(Tensor self, Tensor exponent, *, Tensor(a!) out) -> Tensor(a!)
@@ -8851,6 +9557,7 @@
   variants: method
   tags: pointwise
 - func: normal_functional(Tensor self, float mean=0, float std=1, *, Generator? generator=None) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     Composite: normal_functional
@@ -8884,175 +9591,229 @@
   variants: method, function
   tags: core
 - func: _foreach_acos(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_acos_cpu, CUDA: foreach_acos_cuda}
 - func: _foreach_acos_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_acos_inplace_cpu, CUDA: foreach_acos_inplace_cuda}
 - func: _foreach_asin(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_asin_cpu, CUDA: foreach_asin_cuda}
 - func: _foreach_asin_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_asin_inplace_cpu, CUDA: foreach_asin_inplace_cuda}
 - func: _foreach_atan(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_atan_cpu, CUDA: foreach_atan_cuda}
 - func: _foreach_atan_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_atan_inplace_cpu, CUDA: foreach_atan_inplace_cuda}
 - func: _foreach_ceil(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_ceil_cpu, CUDA: foreach_ceil_cuda}
 - func: _foreach_ceil_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_ceil_inplace_cpu, CUDA: foreach_ceil_inplace_cuda}
 - func: _foreach_cos(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_cos_cpu, CUDA: foreach_cos_cuda}
 - func: _foreach_cos_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_cos_inplace_cpu, CUDA: foreach_cos_inplace_cuda}
 - func: _foreach_cosh(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_cosh_cpu, CUDA: foreach_cosh_cuda}
 - func: _foreach_cosh_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_cosh_inplace_cpu, CUDA: foreach_cosh_inplace_cuda}
 - func: _foreach_erf(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_erf_cpu, CUDA: foreach_erf_cuda}
 - func: _foreach_erf_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_erf_inplace_cpu, CUDA: foreach_erf_inplace_cuda}
 - func: _foreach_erfc(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_erfc_cpu, CUDA: foreach_erfc_cuda}
 - func: _foreach_erfc_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_erfc_inplace_cpu, CUDA: foreach_erfc_inplace_cuda}
 - func: _foreach_exp(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_exp_cpu, CUDA: foreach_exp_cuda}
 - func: _foreach_exp_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_exp_inplace_cpu, CUDA: foreach_exp_inplace_cuda}
 - func: _foreach_expm1(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_expm1_cpu, CUDA: foreach_expm1_cuda}
 - func: _foreach_expm1_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_expm1_inplace_cpu, CUDA: foreach_expm1_inplace_cuda}
 - func: _foreach_floor(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_floor_cpu, CUDA: foreach_floor_cuda}
 - func: _foreach_floor_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_floor_inplace_cpu, CUDA: foreach_floor_inplace_cuda}
 - func: _foreach_frac(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_frac_cpu, CUDA: foreach_frac_cuda}
 - func: _foreach_frac_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_frac_inplace_cpu, CUDA: foreach_frac_inplace_cuda}
 - func: _foreach_lgamma(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_lgamma_cpu, CUDA: foreach_lgamma_cuda}
 - func: _foreach_lgamma_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_lgamma_inplace_cpu, CUDA: foreach_lgamma_inplace_cuda}
 - func: _foreach_log(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_log_cpu, CUDA: foreach_log_cuda}
 - func: _foreach_log_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_log_inplace_cpu, CUDA: foreach_log_inplace_cuda}
 - func: _foreach_log10(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_log10_cpu, CUDA: foreach_log10_cuda}
 - func: _foreach_log10_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_log10_inplace_cpu, CUDA: foreach_log10_inplace_cuda}
 - func: _foreach_log1p(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_log1p_cpu, CUDA: foreach_log1p_cuda}
 - func: _foreach_log1p_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_log1p_inplace_cpu, CUDA: foreach_log1p_inplace_cuda}
 - func: _foreach_log2(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_log2_cpu, CUDA: foreach_log2_cuda}
 - func: _foreach_log2_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_log2_inplace_cpu, CUDA: foreach_log2_inplace_cuda}
 - func: _foreach_max(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: foreach_max_cpu
     CUDA: foreach_max_cuda
 - func: _foreach_norm.Scalar(Tensor[] self, Scalar ord=2, ScalarType? dtype=None) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: foreach_norm_cpu
     CUDA: foreach_norm_cuda
 - func: _foreach_powsum.Scalar(Tensor[] self, Scalar ord=2, ScalarType? dtype=None) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: foreach_powsum_cpu
     CUDA: foreach_powsum_cuda
 - func: _foreach_round(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_round_cpu, CUDA: foreach_round_cuda}
 - func: _foreach_round_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_round_inplace_cpu, CUDA: foreach_round_inplace_cuda}
 - func: _foreach_sigmoid(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_sigmoid_cpu, CUDA: foreach_sigmoid_cuda}
 - func: _foreach_sigmoid_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_sigmoid_inplace_cpu, CUDA: foreach_sigmoid_inplace_cuda}
 - func: _foreach_sin(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_sin_cpu, CUDA: foreach_sin_cuda}
 - func: _foreach_sin_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_sin_inplace_cpu, CUDA: foreach_sin_inplace_cuda}
 - func: _foreach_sinh(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_sinh_cpu, CUDA: foreach_sinh_cuda}
 - func: _foreach_sinh_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_sinh_inplace_cpu, CUDA: foreach_sinh_inplace_cuda}
 - func: _foreach_tan(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_tan_cpu, CUDA: foreach_tan_cuda}
 - func: _foreach_tan_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_tan_inplace_cpu, CUDA: foreach_tan_inplace_cuda}
 - func: _foreach_tanh(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_tanh_cpu, CUDA: foreach_tanh_cuda}
 - func: _foreach_tanh_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_tanh_inplace_cpu, CUDA: foreach_tanh_inplace_cuda}
 - func: _foreach_trunc(Tensor[] self) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_trunc_cpu, CUDA: foreach_trunc_cuda}
 - func: _foreach_trunc_(Tensor(a!)[] self) -> ()
+  device_check: NoCheck
   variants: function
   dispatch: {CPU: foreach_trunc_inplace_cpu, CUDA: foreach_trunc_inplace_cuda}
 - func: _foreach_clone(Tensor[] self, *, MemoryFormat? memory_format=None) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: foreach_clone_cpu
     CUDA: foreach_clone_cuda
 - func: _foreach_copy(Tensor[] self, Tensor[] src, bool non_blocking=False) -> Tensor[] self_out
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: foreach_copy_cpu
     CUDA: foreach_copy_cuda
 - func: _foreach_mm(Tensor[] self, Tensor[] mat2) -> Tensor[]
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: foreach_mm_cpu
@@ -9101,6 +9862,7 @@
     CPU: _convert_indices_from_csr_to_coo_structured_cpu
     CUDA: _convert_indices_from_csr_to_coo_structured_cuda
 - func: mse_loss.out(Tensor self, Tensor target, int reduction=Mean, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: mse_loss_backward.grad_input(Tensor grad_output, Tensor self, Tensor target, int reduction, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
@@ -9133,6 +9895,7 @@
 - func: nll_loss2d_backward.grad_input(Tensor grad_output, Tensor self, Tensor target, Tensor? weight, int reduction, SymInt ignore_index, Tensor total_weight, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: smooth_l1_loss.out(Tensor self, Tensor target, int reduction=Mean, float beta=1.0, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: smooth_l1_loss_backward.grad_input(Tensor grad_output, Tensor self, Tensor target, int reduction, float beta, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
@@ -9151,6 +9914,7 @@
   dispatch:
     Composite: soft_margin_loss_backward_impl
 - func: elu.out(Tensor self, Scalar alpha=1, Scalar scale=1, Scalar input_scale=1, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: elu_backward.grad_input(Tensor grad_output, Scalar alpha, Scalar scale, Scalar input_scale, bool is_result, Tensor self_or_result, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
@@ -9167,24 +9931,31 @@
   dispatch:
     Composite: glu_backward_jvp_impl
 - func: hardsigmoid.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: hardsigmoid_backward.grad_input(Tensor grad_output, Tensor self, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: hardtanh.out(Tensor self, Scalar min_val=-1, Scalar max_val=1, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: hardtanh_backward.grad_input(Tensor grad_output, Tensor self, Scalar min_val, Scalar max_val, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: hardswish.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: leaky_relu.out(Tensor self, Scalar negative_slope=0.01, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: leaky_relu_backward.grad_input(Tensor grad_output, Tensor self, Scalar negative_slope, bool self_is_result, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: log_sigmoid.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: log_sigmoid_forward.output(Tensor self, *, Tensor(a!) output, Tensor(b!) buffer) -> (Tensor(a!), Tensor(b!))
+  device_check: NoCheck
   variants: function
 - func: log_sigmoid_forward(Tensor self) -> (Tensor output, Tensor buffer)
+  device_check: NoCheck
   variants: function
 - func: log_sigmoid_backward.grad_input(Tensor grad_output, Tensor self, Tensor buffer, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
@@ -9195,10 +9966,12 @@
   variants: function
   tags: nondeterministic_seeded
 - func: softplus.out(Tensor self, Scalar beta=1, Scalar threshold=20, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: softplus_backward.grad_input(Tensor grad_output, Tensor self, Scalar beta, Scalar threshold, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: softshrink.out(Tensor self, Scalar lambd=0.5, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: softshrink_backward.grad_input(Tensor grad_output, Tensor self, Scalar lambd, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
@@ -9695,60 +10468,78 @@
 - func: special_ndtr.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: special_xlog1py(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: xlog1py_cpu
     CUDA: xlog1py_cuda
   tags: pointwise
 - func: special_xlog1py.self_scalar(Scalar self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_xlog1py.other_scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_xlog1py.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_xlog1py.self_scalar_out(Scalar self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_xlog1py.other_scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_xlogy(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: xlogy_cpu
     CUDA: xlogy_cuda
 - func: special_xlogy.self_scalar(Scalar self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function
 - func: special_xlogy.other_scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: function
 - func: special_xlogy.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: special_xlogy.self_scalar_out(Scalar self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: special_xlogy.other_scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
 - func: special_zeta(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: zeta_cpu
     CUDA: zeta_cuda
   tags: pointwise
 - func: special_zeta.self_scalar(Scalar self, Tensor other) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_zeta.other_scalar(Tensor self, Scalar other) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_zeta.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_zeta.self_scalar_out(Scalar self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_zeta.other_scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_i0(Tensor self) -> Tensor
@@ -10229,6 +11020,7 @@
 - func: _padded_dense_to_jagged_forward(Tensor dense, Tensor[] offsets, SymInt? total_L=None) -> Tensor
   variants: function
 - func: _nested_from_padded_tensor(Tensor padded, Tensor offsets, Tensor dummy, int ragged_idx=1, Tensor? min_seqlen=None, Tensor? max_seqlen=None, SymInt? sum_S=None) -> Tensor
+  device_check: NoCheck
   variants: function
 - func: _nested_tensor_softmax_with_shape(Tensor self, Tensor query) -> Tensor
   variants: function
@@ -10261,15 +11053,19 @@
   variants: function
   tags: nondeterministic_seeded
 - func: _scaled_dot_product_flash_attention_backward(Tensor grad_out, Tensor query, Tensor key, Tensor value, Tensor out, Tensor logsumexp, Tensor cum_seq_q, Tensor cum_seq_k, SymInt max_q, SymInt max_k, float dropout_p, bool is_causal, Tensor philox_seed, Tensor philox_offset, *, float? scale=None) -> (Tensor grad_query, Tensor grad_key, Tensor grad_value)
+  device_check: NoCheck
   variants: function
 - func: _scaled_dot_product_flash_attention_for_cpu_backward(Tensor grad_out, Tensor query, Tensor key, Tensor value, Tensor out, Tensor logsumexp, float dropout_p, bool is_causal, *, Tensor? attn_mask=None, float? scale=None) -> (Tensor grad_query, Tensor grad_key, Tensor grad_value)
+  device_check: NoCheck
   variants: function
 - func: _scaled_dot_product_fused_attention_overrideable_backward(Tensor grad_out, Tensor query, Tensor key, Tensor value, Tensor attn_bias, bool[4] grad_input_mask, Tensor out, Tensor logsumexp, Tensor cum_seq_q, Tensor cum_seq_k, SymInt max_q, SymInt max_k, float dropout_p, bool is_causal, Tensor philox_seed, Tensor philox_offset, *, float? scale=None) -> (Tensor grad_query, Tensor grad_key, Tensor grad_value, Tensor grad_attn_bias)
+  device_check: NoCheck
   variants: function
 - func: _scaled_dot_product_efficient_attention(Tensor query, Tensor key, Tensor value, Tensor? attn_bias, bool compute_log_sumexp, float dropout_p=0.0, bool is_causal=False, *, float? scale=None) -> (Tensor output, Tensor log_sumexp, Tensor philox_seed, Tensor philox_offset)
   variants: function
   tags: nondeterministic_seeded
 - func: _scaled_dot_product_efficient_attention_backward(Tensor grad_out_, Tensor query, Tensor key, Tensor value, Tensor attn_bias, Tensor out, Tensor logsumexp, Tensor philox_seed, Tensor philox_offset, float dropout_p, bool[4] grad_input_mask, bool is_causal=False, *, float? scale=None) -> (Tensor, Tensor, Tensor, Tensor)
+  device_check: NoCheck
   variants: function
   tags: nondeterministic_seeded
 - func: _scaled_dot_product_cudnn_attention(Tensor query, Tensor key, Tensor value, Tensor? attn_bias, bool compute_log_sumexp, float dropout_p=0.0, bool is_causal=False, bool return_debug_mask=False, *, float? scale=None) -> (Tensor output, Tensor logsumexp, Tensor cum_seq_q, Tensor cum_seq_k, SymInt max_q, SymInt max_k, Tensor philox_seed, Tensor philox_offset, Tensor debug_attn_mask)
@@ -10288,11 +11084,13 @@
   variants: function
   tags: nondeterministic_seeded
 - func: _flash_attention_backward(Tensor grad_out, Tensor query, Tensor key, Tensor value, Tensor out, Tensor logsumexp, Tensor cum_seq_q, Tensor cum_seq_k, SymInt max_q, SymInt max_k, float dropout_p, bool is_causal, Tensor rng_state, Tensor unused, *, float? scale=None, SymInt? window_size_left=None, SymInt? window_size_right=None) -> (Tensor, Tensor, Tensor)
+  device_check: NoCheck
   variants: function
 - func: _efficient_attention_forward(Tensor query, Tensor key, Tensor value, Tensor? bias, Tensor? cu_seqlens_q, Tensor? cu_seqlens_k, SymInt? max_seqlen_q, SymInt? max_seqlen_k, float dropout_p, int custom_mask_type, bool compute_log_sumexp=False, *, float? scale=None, Tensor? seqlen_k=None, int? window_size=None) -> (Tensor output, Tensor logsumexp, Tensor philox_seed, Tensor philox_offset, SymInt max_seqlen_batch_q, SymInt max_seqlen_batch_k)
   variants: function
   tags: nondeterministic_seeded
 - func: _efficient_attention_backward(Tensor grad_out_, Tensor query, Tensor key, Tensor value, Tensor? bias, Tensor out, Tensor? cu_seqlens_q, Tensor? cu_seqlens_k, SymInt max_seqlen_q, SymInt max_seqlen_k, Tensor logsumexp, float dropout_p, Tensor philox_seed, Tensor philox_offset, int custom_mask_type, bool bias_requires_grad, *, float? scale=None, int? num_splits_key=None, int? window_size=None, bool shared_storage_dqdkdv=False) -> (Tensor, Tensor, Tensor, Tensor)
+  device_check: NoCheck
   variants: function
 - func: _cudnn_attention_forward(Tensor query, Tensor key, Tensor value, Tensor? attn_bias, Tensor? cum_seq_q, Tensor? cum_seq_k, SymInt max_q, SymInt max_k, bool compute_log_sumexp, float dropout_p=0.0, bool is_causal=False, bool return_debug_mask=False, *, float? scale=None, Tensor? seqused_k=None, Tensor? block_table=None) -> (Tensor output, Tensor logsumexp, Tensor cum_seq_q, Tensor cum_seq_k, SymInt max_q, SymInt max_k, Tensor philox_seed, Tensor philox_offset, Tensor debug_attn_mask)
   variants: function
@@ -10354,171 +11152,219 @@
   variants: function
   tags: pointwise
 - func: special_chebyshev_polynomial_t(Tensor x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: chebyshev_polynomial_t_cpu
     CUDA: chebyshev_polynomial_t_cuda
   tags: pointwise
 - func: special_chebyshev_polynomial_t.x_scalar(Scalar x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_chebyshev_polynomial_t.n_scalar(Tensor x, Scalar n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_chebyshev_polynomial_t.out(Tensor x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_chebyshev_polynomial_t.x_scalar_out(Scalar x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_chebyshev_polynomial_t.n_scalar_out(Tensor x, Scalar n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_chebyshev_polynomial_u(Tensor x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: chebyshev_polynomial_u_cpu
     CUDA: chebyshev_polynomial_u_cuda
   tags: pointwise
 - func: special_chebyshev_polynomial_u.x_scalar(Scalar x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_chebyshev_polynomial_u.n_scalar(Tensor x, Scalar n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_chebyshev_polynomial_u.out(Tensor x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_chebyshev_polynomial_u.x_scalar_out(Scalar x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_chebyshev_polynomial_u.n_scalar_out(Tensor x, Scalar n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_chebyshev_polynomial_v(Tensor x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: chebyshev_polynomial_v_cpu
     CUDA: chebyshev_polynomial_v_cuda
   tags: pointwise
 - func: special_chebyshev_polynomial_v.x_scalar(Scalar x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_chebyshev_polynomial_v.n_scalar(Tensor x, Scalar n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_chebyshev_polynomial_v.out(Tensor x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_chebyshev_polynomial_v.x_scalar_out(Scalar x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_chebyshev_polynomial_v.n_scalar_out(Tensor x, Scalar n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_chebyshev_polynomial_w(Tensor x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: chebyshev_polynomial_w_cpu
     CUDA: chebyshev_polynomial_w_cuda
   tags: pointwise
 - func: special_chebyshev_polynomial_w.x_scalar(Scalar x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_chebyshev_polynomial_w.n_scalar(Tensor x, Scalar n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_chebyshev_polynomial_w.out(Tensor x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_chebyshev_polynomial_w.x_scalar_out(Scalar x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_chebyshev_polynomial_w.n_scalar_out(Tensor x, Scalar n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_hermite_polynomial_h(Tensor x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: hermite_polynomial_h_cpu
     CUDA: hermite_polynomial_h_cuda
   tags: pointwise
 - func: special_hermite_polynomial_h.x_scalar(Scalar x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_hermite_polynomial_h.n_scalar(Tensor x, Scalar n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_hermite_polynomial_h.out(Tensor x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_hermite_polynomial_h.x_scalar_out(Scalar x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_hermite_polynomial_h.n_scalar_out(Tensor x, Scalar n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_hermite_polynomial_he(Tensor x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: hermite_polynomial_he_cpu
     CUDA: hermite_polynomial_he_cuda
   tags: pointwise
 - func: special_hermite_polynomial_he.x_scalar(Scalar x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_hermite_polynomial_he.n_scalar(Tensor x, Scalar n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_hermite_polynomial_he.out(Tensor x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_hermite_polynomial_he.x_scalar_out(Scalar x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_hermite_polynomial_he.n_scalar_out(Tensor x, Scalar n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_laguerre_polynomial_l(Tensor x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: laguerre_polynomial_l_cpu
     CUDA: laguerre_polynomial_l_cuda
   tags: pointwise
 - func: special_laguerre_polynomial_l.x_scalar(Scalar x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_laguerre_polynomial_l.n_scalar(Tensor x, Scalar n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_laguerre_polynomial_l.out(Tensor x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_laguerre_polynomial_l.x_scalar_out(Scalar x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_laguerre_polynomial_l.n_scalar_out(Tensor x, Scalar n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_legendre_polynomial_p(Tensor x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: legendre_polynomial_p_cpu
     CUDA: legendre_polynomial_p_cuda
   tags: pointwise
 - func: special_legendre_polynomial_p.x_scalar(Scalar x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_legendre_polynomial_p.n_scalar(Tensor x, Scalar n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_legendre_polynomial_p.out(Tensor x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_legendre_polynomial_p.x_scalar_out(Scalar x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_legendre_polynomial_p.n_scalar_out(Tensor x, Scalar n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_modified_bessel_i0(Tensor self) -> Tensor
@@ -10576,87 +11422,111 @@
   variants: function
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_t(Tensor x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: shifted_chebyshev_polynomial_t_cpu
     CUDA: shifted_chebyshev_polynomial_t_cuda
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_t.x_scalar(Scalar x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_t.n_scalar(Tensor x, Scalar n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_t.out(Tensor x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_t.x_scalar_out(Scalar x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_t.n_scalar_out(Tensor x, Scalar n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_u(Tensor x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: shifted_chebyshev_polynomial_u_cpu
     CUDA: shifted_chebyshev_polynomial_u_cuda
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_u.x_scalar(Scalar x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_u.n_scalar(Tensor x, Scalar n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_u.out(Tensor x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_u.x_scalar_out(Scalar x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_u.n_scalar_out(Tensor x, Scalar n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_v(Tensor x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: shifted_chebyshev_polynomial_v_cpu
     CUDA: shifted_chebyshev_polynomial_v_cuda
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_v.x_scalar(Scalar x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_v.n_scalar(Tensor x, Scalar n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_v.out(Tensor x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_v.x_scalar_out(Scalar x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_v.n_scalar_out(Tensor x, Scalar n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_w(Tensor x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   dispatch:
     CPU: shifted_chebyshev_polynomial_w_cpu
     CUDA: shifted_chebyshev_polynomial_w_cuda
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_w.x_scalar(Scalar x, Tensor n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_w.n_scalar(Tensor x, Scalar n) -> Tensor
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_w.out(Tensor x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_w.x_scalar_out(Scalar x, Tensor n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_shifted_chebyshev_polynomial_w.n_scalar_out(Tensor x, Scalar n, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
   variants: function
   tags: pointwise
 - func: special_spherical_bessel_j0(Tensor x) -> Tensor
