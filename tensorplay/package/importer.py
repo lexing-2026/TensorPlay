@@ -66,12 +66,13 @@ class Importer(ABC):
                 don't use otherwise.
         Returns:
             A tuple (parent_module_name, attr_name) that can be used to retrieve `obj` from this environment.
-            Use it like:
+            To use it::
+
                 mod = importer.import_module(parent_module_name)
                 obj = getattr(mod, attr_name)
 
         Raises:
-            ObjNotFoundError: we couldn't retrieve `obj by name.
+            ObjNotFoundError: we couldn't retrieve `obj` by name.
             ObjMisMatchError: we found a different object with the same name as `obj`.
         """
         if name is None and obj and _Pickler.dispatch.get(type(obj)) is None:

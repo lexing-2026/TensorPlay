@@ -176,7 +176,6 @@
     CUDAPluggableAllocator
     CudaError
     DeferredCudaCallError
-    Device
     MemPool
     caching_allocator_alloc
     caching_allocator_delete
