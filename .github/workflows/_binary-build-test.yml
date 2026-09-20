@@ -624,11 +624,19 @@ jobs:
           if [[ "$suite" == "all" ]]; then
             suite=long
           fi
+          f64_args=()
+          if [[ -f "benchmark/baselines/cpu-operator-$suite-f64.json" ]]; then
+            f64_args=(
+              --operator-f64-json benchmark-results/cpu-operator-f64.json
+              --operator-f64-baseline-json "benchmark/baselines/cpu-operator-$suite-f64.json"
+            )
+          else
+            echo "No committed f64 baseline for suite '$suite'; skipping the f64 gate."
+          fi
           python benchmark/check_performance_regression.py \
             --operator-json benchmark-results/cpu-operator.json \
             --operator-baseline-json "benchmark/baselines/cpu-operator-$suite.json" \
-            --operator-f64-json benchmark-results/cpu-operator-f64.json \
-            --operator-f64-baseline-json "benchmark/baselines/cpu-operator-$suite-f64.json" \
+            "${f64_args[@]}" \
             --train-json benchmark-results/cpu-train.json \
             --train-baseline-json benchmark/baselines/cpu-train.json \
             --stax-json benchmark-results/stax-cpu.json \
