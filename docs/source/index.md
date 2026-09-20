@@ -45,6 +45,7 @@ _stax
 stax
 vision
 audio
+viz
 ```
 
 ## Indices and tables

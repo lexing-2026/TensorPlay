@@ -14,14 +14,19 @@ except ImportError:
     HAS_NETWORKX = False
 
 def make_dot(var, params=None):
-    """
-    If a node is a Variable (requires_grad=True), it will be blue.
-    If a node is an operation (grad_fn), it will be gray.
-    
+    """Render the computation graph recorded for ``var``.
+
+    Leaf tensors with ``requires_grad=True`` are drawn light blue and are
+    labeled by the name passed in ``params``; the output tensor is light
+    green; recorded operations are white and labeled by operation name.
+
     Args:
-        var: output Variable
-        params: dict of (name, Variable) to add names to node that
-            require grad (TODO: implement param naming)
+        var: output tensor whose recorded chain should be drawn.
+        params: dict mapping a name to a leaf tensor, used for labeling.
+
+    Returns a renderable object: a ``graphviz.Digraph`` when the graphviz
+    package is installed, otherwise a matplotlib wrapper with the same
+    ``render(filename, format="png")`` call from the networkx fallback.
     """
     if params is not None:
         assert isinstance(params.values().__iter__().__next__(), tensorplay.Tensor)
