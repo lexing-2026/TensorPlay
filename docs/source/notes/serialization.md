@@ -351,25 +351,22 @@ if one does not have access to the `tensorplay.load` callsites.
 
 ## Utility functions
 
-The following utility functions are related to serialization:
+The following utility functions are related to serialization (their signatures
+and docstrings are on the [serialization reference page](../serialization.md)):
 
-```{eval-rst}
-.. currentmodule:: tensorplay.serialization
-
-.. autofunction:: register_package
-.. autofunction:: get_crc32_options
-.. autofunction:: set_crc32_options
-.. autofunction:: get_default_load_endianness
-.. autofunction:: set_default_load_endianness
-.. autofunction:: get_default_mmap_options
-.. autofunction:: set_default_mmap_options
-.. autofunction:: add_safe_globals
-.. autofunction:: clear_safe_globals
-.. autofunction:: get_safe_globals
-.. autofunction:: get_unsafe_globals_in_checkpoint
-.. autoclass:: safe_globals
-.. autoclass:: skip_data
-```
+- {func}`tensorplay.serialization.register_package`
+- {func}`tensorplay.serialization.get_crc32_options`
+- {func}`tensorplay.serialization.set_crc32_options`
+- {func}`tensorplay.serialization.get_default_load_endianness`
+- {func}`tensorplay.serialization.set_default_load_endianness`
+- {func}`tensorplay.serialization.get_default_mmap_options`
+- {func}`tensorplay.serialization.set_default_mmap_options`
+- {func}`tensorplay.serialization.add_safe_globals`
+- {func}`tensorplay.serialization.clear_safe_globals`
+- {func}`tensorplay.serialization.get_safe_globals`
+- {func}`tensorplay.serialization.get_unsafe_globals_in_checkpoint`
+- {class}`tensorplay.serialization.safe_globals`
+- {class}`tensorplay.serialization.skip_data`
 
 (serialization config)=
 
