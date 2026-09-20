@@ -1,13 +1,19 @@
-"""
-verified) CPU implementation plus an end-to-end training smoke test that
+"""RNN-family CUDA numerics: the device path against the (independently
+verified) CPU implementation, plus an end-to-end training smoke test that
 exercises the differentiable python path (chunk/split/linear on GPU)."""
+import itertools
 import os
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tensorplay as tp
+
+pytestmark = pytest.mark.skipif(
+    not tp.cuda.is_available(), reason="requires CUDA build of tensorplay"
+)
 
 
 def _tp_tensor(a, dt, device):
@@ -19,7 +25,6 @@ def run_native_case(kind, T, N, feat, H, num_layers, bidir, batch_first,
     """Returns max |cuda_out - cpu_out| over output/hy[/cy]."""
     tp_dt = {"fp64": tp.float64, "fp32": tp.float32,
              "fp16": tp.float16, "bf16": tp.bfloat16}[dtype]
-    np_dt = np.float64 if dtype == "fp64" else np.float32
     rng = np.random.RandomState(7)
     if batch_first:
         x_np = rng.randn(N, T, feat)
@@ -63,7 +68,26 @@ def run_native_case(kind, T, N, feat, H, num_layers, bidir, batch_first,
     return max(errs)
 
 
-def training_smoke():
+_CASES = list(itertools.product(
+    ["lstm", "gru", "rnn_tanh", "rnn_relu"],
+    [False, True],   # bidir
+    [False, True],   # batch_first
+    [1, 2],          # num_layers
+    [True],          # bias
+    ["fp16", "bf16", "fp32", "fp64"],
+))
+
+
+@pytest.mark.parametrize("kind,bidir,batch_first,num_layers,bias,dtype", _CASES)
+def test_rnn_native_device_agreement(kind, bidir, batch_first, num_layers,
+                                     bias, dtype):
+    err = run_native_case(kind, 6, 3, 4, 5, num_layers, bidir, batch_first,
+                          bias, dtype)
+    tol = {"fp32": 2e-4, "fp64": 1e-9, "fp16": 1e-2, "bf16": 1e-1}[dtype]
+    assert err < tol, f"max abs err {err:.3e} >= tol {tol:.3e}"
+
+
+def test_training_smoke():
     """Backward through nn.LSTM on cuda: grads must be finite and non-zero;
     one SGD step must reduce loss on a fixed batch."""
     T, N, feat, H = 8, 4, 3, 6
@@ -91,52 +115,12 @@ def training_smoke():
         return loss
 
     l0 = step_loss()
-    missing = [type(m).__name__ + f"[{i}]" for i, p in enumerate(params)
-               if p.grad is None for m in [p]]
-    gn = [np.abs(np.asarray(p.grad.cpu().tolist())).sum()
-          for p in params if p.grad is not None]
-    n_with_grad = sum(1 for p in params if p.grad is not None)
+    assert all(p.grad is not None for p in params), "some parameters got no gradient"
+    grads = [np.asarray(p.grad.cpu().tolist()) for p in params]
+    assert all(np.isfinite(g).all() for g in grads), "non-finite gradient"
+    assert sum(np.abs(g).sum() for g in grads) > 0, "all-zero gradients"
 
     opt.step()
     l1 = step_loss()
-    ok = all(np.isfinite(g).all() for g in gn) and sum(gn) > 0 \
-        and n_with_grad == len(params) \
-        and float(l1.item()) < float(l0.item())
-    print(f"training smoke: loss {float(l0.item()):.4f} -> {float(l1.item()):.4f}, "
-          f"grads on {n_with_grad}/{len(params)} params "
-          f"(missing: {missing}), ok={ok}")
-    return ok
-
-
-def main():
-    if not tp.cuda.is_available():
-        print("CUDA not available")
-        return 1
-    import itertools
-    failures = 0
-    total = 0
-    for kind in ["lstm", "gru", "rnn_tanh", "rnn_relu"]:
-        for bidir, bf, layers, bias, dtype in itertools.product(
-                [False, True], [False, True], [1, 2], [True],
-                ["fp16", "bf16", "fp32", "fp64"]):
-            total += 1
-            case = (kind, 6, 3, 4, 5, layers, bidir, bf, bias, dtype)
-            try:
-                err = run_native_case(*case)
-                tol = {"fp32": 2e-4, "fp64": 1e-9,
-                       "fp16": 1e-2, "bf16": 1e-1}[dtype]
-                ok = err < tol
-            except Exception as e:
-                print(f"ERROR {case}: {type(e).__name__}: {e}")
-                failures += 1
-                continue
-            if not ok:
-                failures += 1
-                print(f"FAIL {case} err={err:.3e}")
-    print(f"native cases: {total - failures}/{total} passed")
-    smoke_ok = training_smoke()
-    return 1 if (failures or not smoke_ok) else 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    assert float(l1.item()) < float(l0.item()), (
+        f"loss did not decrease: {float(l0.item())} -> {float(l1.item())}")
