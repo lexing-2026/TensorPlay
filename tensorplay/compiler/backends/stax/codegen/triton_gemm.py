@@ -50,10 +50,11 @@ GEMM_TUNING_VERSION = "gemm-v3"
 
 _DECISION_NAMESPACE = "triton-autotune"
 
-# Head of the epilogue-fused tile kernel: identical arithmetic to
-# ``_gemm_kernel`` up to the accumulator; the chain's instruction lines and
-# the final store splice in after the k-loop.  The epilogue runs on the
-# accumulator registers, so the unfused product never touches memory.
+# Head of the bias/epilogue-fused tile kernel: identical arithmetic to
+# ``_gemm_kernel`` up to the accumulator; an optional row-broadcast bias
+# load, the chain's instruction lines and the final store splice in after
+# the k-loop.  The tail work runs on the accumulator registers, so the
+# unfused product never touches memory.
 _GEMM_EPI_TEMPLATE_HEAD = '''\
 import triton
 import triton.language as tl
@@ -62,20 +63,23 @@ import triton.language.extra.cuda.libdevice as libdevice
 
 @triton.jit
 def _gemm_epi_kernel(
-    a_ptr, b_ptr, c_ptr,
+    a_ptr, b_ptr, bias_ptr, c_ptr,
     M, N, K,
     stride_am, stride_ak,
     stride_bk, stride_bn,
     stride_cm, stride_cn,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
     EVEN_K: tl.constexpr, ALLOW_TF32: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
-    """Epilogue-fused C = chain(A @ B) with fp32 accumulation.
+    """Bias-and-epilogue fused C = chain(A @ B) with fp32 accumulation.
 
     TF32 shortens the multiplier datapath when ``ALLOW_TF32`` is set (the
     caller's global matmul switch); the accumulated sum stays fp32 either
     way.  Output rows/cols wrap with ``% M``/``% N`` so the store needs no
-    separate bounds mask; loads guard the k tail unless ``EVEN_K``.
+    separate bounds mask (wrapped lanes recompute identical values); loads
+    guard the k tail unless ``EVEN_K``.  ``HAS_BIAS`` adds the length-N
+    column bias to every row of the accumulator tile.
     """
 
     pid_m = tl.program_id(0)
@@ -100,6 +104,8 @@ def _gemm_epi_kernel(
             acc = tl.dot(a, b, acc, input_precision="ieee")
         a_ptrs += BK * stride_ak
         b_ptrs += BK * stride_bk
+    if HAS_BIAS:
+        acc = acc + tl.load(bias_ptr + off_n)[None, :]
 '''
 
 _GEMM_EPI_TEMPLATE_STORE = '''\
@@ -209,6 +215,8 @@ def _decision_key(
     device: str,
     allow_tf32: bool,
     epilogue: Optional[Tuple[list[int], list[float], int]] = None,
+    bias: bool = False,
+    b_transposed: bool = False,
 ) -> str:
     source = (
         f"gemm|{_kernel_source_digest()}|{M}|{N}|{K}|{dtype}|{device}"
@@ -219,15 +227,23 @@ def _decision_key(
         source += "|epi=" + hashlib.sha256(
             repr((tuple(program), tuple(constants), esrc)).encode()
         ).hexdigest()[:12]
+    if bias or b_transposed:
+        # the linear form: a transposed weight operand plus an optional
+        # length-N bias — never share a record with the plain matmul
+        source += f"|lin={int(bias)}{int(b_transposed)}"
     return hashlib.sha256(source.encode()).hexdigest()[:24]
 
 
-def _probe_feed(M: int, K: int, N: int, dtype: Any, device: Any) -> list:
-    """Deterministic operand pair exercising every load/store lane.
+def _probe_feed(
+    M: int, K: int, N: int, dtype: Any, device: Any, bias: bool = False
+) -> list:
+    """Deterministic operand set exercising every load/store lane.
 
     A linear ramp keeps values in a small band so the fp32 accumulation of
     the reference and the candidate stay comparable, while still making any
-    stride or masking bug produce a grossly wrong product.
+    stride or masking bug produce a grossly wrong product.  With ``bias``
+    the feed carries the linear form: the (N, K) weight stand-in (the
+    launch transposes it) and a length-N bias ramp.
     """
 
     import tensorplay as tp
@@ -236,26 +252,35 @@ def _probe_feed(M: int, K: int, N: int, dtype: Any, device: Any) -> list:
         flat = tp.arange(rows * cols, dtype=dtype, device=device)
         return flat * 3.17e-4 - 0.5
 
+    if bias:
+        return [
+            ramp(M, K).reshape(M, K),
+            ramp(N, K).reshape(N, K),
+            tp.arange(N, dtype=dtype, device=device) * 3.17e-4 - 0.5,
+        ]
     return [ramp(M, K).reshape(M, K), ramp(K, N).reshape(K, N)]
 
 
 def _fused_gemm_kernel(
-    epilogue: Tuple[list[int], list[float], int],
+    has_bias: bool,
+    epilogue: Optional[Tuple[list[int], list[float], int]],
     config: Tuple[int, int, int, int, int],
     allow_tf32: bool,
 ):
-    """JIT the epilogue-fused tile kernel for one payload and config.
+    """JIT the bias/epilogue-fused tile kernel for one form and config.
 
-    The chain's instruction lines are spliced between the k-loop and the
-    store; the memo keeps one JITFunction per (payload, config, precision)
-    so repeated candidate launches reuse the compiled binary.
+    The optional bias load, the chain's instruction lines and the final
+    store are spliced after the k-loop; the memo keeps one JITFunction per
+    (form, config, precision) so repeated candidate launches reuse the
+    compiled binary.
     """
 
-    program, constants, esrc = epilogue
     key = hashlib.sha256(
         (
             GEMM_TUNING_VERSION
-            + repr((tuple(program), tuple(constants), esrc))
+            + f"|bias={int(has_bias)}"
+            + (repr((tuple(epilogue[0]), tuple(epilogue[1]), epilogue[2]))
+               if epilogue is not None else "-")
             + repr(config)
             + repr(allow_tf32)
         ).encode()
@@ -263,11 +288,14 @@ def _fused_gemm_kernel(
     cached = _EPI_KERNEL_MEMO.get(key)
     if cached is not None:
         return cached
-    from .triton import emit_tile_epilogue_lines
+    if epilogue is None:
+        lines, store_source = [], "acc"
+    else:
+        from .triton import emit_tile_epilogue_lines
 
-    lines, store_source = emit_tile_epilogue_lines(
-        list(program), list(constants), esrc, "acc"
-    )
+        lines, store_source = emit_tile_epilogue_lines(
+            list(epilogue[0]), list(epilogue[1]), epilogue[2], "acc"
+        )
     source = (
         _GEMM_EPI_TEMPLATE_HEAD
         + "\n".join("    " + line for line in lines)
@@ -301,22 +329,29 @@ def _triton_launch_factory(
     base_launch: Callable[[list], Any],
     allow_tf32: bool = False,
     epilogue: Optional[Tuple[list[int], list[float], int]] = None,
+    bias_spec: Optional[Tuple[Optional[int], Any]] = None,
+    b_transposed: bool = False,
 ):
     """Build a launch closure running one fixed GEMM tile configuration.
 
     Each operand spec is ``(feed position, literal tensor)`` — exactly one
     side is set: graph operands come from the feed, constants (module
-    weights captured as literals) are closed over.  With ``epilogue`` the
-    tile kernel applies the pointwise chain to the accumulator before the
-    store; ``base_launch`` (the full region fallback, epilogue included)
-    still covers non-standard operand layouts at call time.
+    weights captured as literals) are closed over.  ``b_transposed`` marks
+    the ``linear`` layout (B arrives as the (N, K) weight; the kernel
+    consumes its zero-copy transposed view).  With ``bias_spec`` or
+    ``epilogue`` the generated tile adds the row-broadcast bias and applies
+    the pointwise chain to the accumulator before the store;
+    ``base_launch`` (the full region fallback) still covers non-standard
+    operand layouts at call time.
     """
 
     block_m, block_n, block_k, num_warps, num_stages = config
-    if epilogue is None:
+    has_bias = bias_spec is not None
+    fused = has_bias or epilogue is not None
+    if not fused:
         kernel = _gemm_kernel
     else:
-        kernel = _fused_gemm_kernel(epilogue, config, allow_tf32)
+        kernel = _fused_gemm_kernel(has_bias, epilogue, config, allow_tf32)
 
     def operand(feed: list, spec: Tuple[Optional[int], Any]) -> Any:
         position, literal = spec
@@ -327,25 +362,50 @@ def _triton_launch_factory(
 
         a = operand(feed, a_spec)
         b = operand(feed, b_spec)
+        if b_transposed:
+            b = b.t()
+        bias = operand(feed, bias_spec) if has_bias else a
         if not (
             _standard_2d(tuple(a.shape), tuple(a.stride()))
             and _standard_2d(tuple(b.shape), tuple(b.stride()))
+            and (
+                not has_bias
+                or (
+                    bias.dim() == 1
+                    and int(bias.shape[0]) == N
+                    and bias.is_contiguous()
+                )
+            )
         ):
-            # The baked kernel assumes standard 2-D layouts; a differently
-            # strayed call takes the fallback launch instead.
+            # The baked kernel assumes standard 2-D layouts (and a plain
+            # length-N bias); a differently strayed call takes the
+            # fallback launch instead.
             return base_launch(feed)
         out = tp.empty((M, N), dtype=a.dtype, device=a.device)
         grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
-        kernel[grid](
-            a, b, out, M, N, K,
-            a.stride(0), a.stride(1),
-            b.stride(0), b.stride(1),
-            out.stride(0), out.stride(1),
-            BM=block_m, BN=block_n, BK=block_k,
-            EVEN_K=(K % block_k == 0),
-            ALLOW_TF32=allow_tf32,
-            num_warps=num_warps, num_stages=num_stages,
-        )
+        if fused:
+            kernel[grid](
+                a, b, bias, out, M, N, K,
+                a.stride(0), a.stride(1),
+                b.stride(0), b.stride(1),
+                out.stride(0), out.stride(1),
+                BM=block_m, BN=block_n, BK=block_k,
+                EVEN_K=(K % block_k == 0),
+                ALLOW_TF32=allow_tf32,
+                HAS_BIAS=has_bias,
+                num_warps=num_warps, num_stages=num_stages,
+            )
+        else:
+            kernel[grid](
+                a, b, out, M, N, K,
+                a.stride(0), a.stride(1),
+                b.stride(0), b.stride(1),
+                out.stride(0), out.stride(1),
+                BM=block_m, BN=block_n, BK=block_k,
+                EVEN_K=(K % block_k == 0),
+                ALLOW_TF32=allow_tf32,
+                num_warps=num_warps, num_stages=num_stages,
+            )
         return out
 
     return launch
@@ -359,8 +419,10 @@ def tuned_matmul_launch(
     *,
     epilogue: Optional[Tuple[list[int], list[float], int]] = None,
     epilogue_launch: Optional[Callable[[list], Any]] = None,
+    bias_spec: Optional[Tuple[Optional[int], Any]] = None,
+    b_transposed: bool = False,
 ) -> Optional[Callable[[list], Any]]:
-    """Benchmark native vs Triton GEMM for one matmul extern segment.
+    """Benchmark native vs Triton GEMM for one matmul-family extern segment.
 
     Each operand spec is ``(feed position, literal tensor)`` with exactly
     one side set; ``sample_feed`` supplies the stand-in tensor for every
@@ -374,6 +436,9 @@ def tuned_matmul_launch(
     kernel and the native side composes ``base_launch`` (the bare operator)
     with ``epilogue_launch`` (the chain as its own kernel) — every benched
     candidate runs the full region, so the comparison stays fair.
+    ``bias_spec``/``b_transposed`` select the ``linear`` form: the B operand
+    arrives as the (N, K) weight (the launch consumes its transposed view)
+    and an optional length-N bias joins the accumulator before the chain.
     """
 
     import tensorplay as tp
@@ -403,27 +468,48 @@ def tuned_matmul_launch(
 
     a = operand_tensor(operand_specs[0])
     b = operand_tensor(operand_specs[1])
+    bias = operand_tensor(bias_spec) if bias_spec is not None else None
     if a is None or b is None:
         return None
     if str(a.dtype) != "tensorplay.float32" or str(b.dtype) != "tensorplay.float32":
         return None
+    if bias is not None and str(bias.dtype) != "tensorplay.float32":
+        return None
     if not a.device.is_cuda():
         return None
     shape_a, shape_b = tuple(a.shape), tuple(b.shape)
-    if len(shape_a) != 2 or len(shape_b) != 2 or shape_a[1] != shape_b[0]:
+    if b_transposed:
+        # the linear layout: B is the (N, K) weight; the kernel consumes
+        # its zero-copy transposed view
+        if len(shape_a) != 2 or len(shape_b) != 2 or shape_a[1] != shape_b[1]:
+            return None
+        M, K = shape_a[0], shape_a[1]
+        N = shape_b[0]
+        if not _standard_2d(
+            (shape_b[1], shape_b[0]), (b.stride(1), b.stride(0))
+        ):
+            return None
+    else:
+        if len(shape_a) != 2 or len(shape_b) != 2 or shape_a[1] != shape_b[0]:
+            return None
+        M, K = shape_a
+        N = shape_b[1]
+        if not _standard_2d(shape_b, tuple(b.stride())):
+            return None
+    if not _standard_2d(shape_a, tuple(a.stride())):
         return None
-    if not (
-        _standard_2d(shape_a, tuple(a.stride()))
-        and _standard_2d(shape_b, tuple(b.stride()))
+    if bias is not None and (
+        bias.dim() != 1
+        or int(bias.shape[0]) != N
+        or not bias.is_contiguous()
     ):
         return None
 
-    M, K = shape_a
-    N = shape_b[1]
     device_key = repr(a.device)
     allow_tf32 = _matmul_allow_tf32()
     cache_key = _decision_key(
-        M, N, K, str(a.dtype), device_key, allow_tf32, epilogue
+        M, N, K, str(a.dtype), device_key, allow_tf32,
+        epilogue, bias_spec is not None, b_transposed,
     )
 
     try:
@@ -445,6 +531,8 @@ def tuned_matmul_launch(
             M, N, K, config, native_launch,
             allow_tf32=bool(choice.get("tf32", False)),
             epilogue=epilogue,
+            bias_spec=bias_spec,
+            b_transposed=b_transposed,
         )
 
     payload = cache.load(cache_key, ext="json")
@@ -457,7 +545,9 @@ def tuned_matmul_launch(
     candidates: list = [("native",)]
     candidates.extend(("triton", cfg) for cfg in GEMM_CANDIDATE_CONFIGS)
 
-    probe = _probe_feed(M, K, N, a.dtype, a.device)
+    probe = _probe_feed(
+        M, K, N, a.dtype, a.device, bias=bias_spec is not None
+    )
 
     def build(candidate):
         if candidate[0] == "native":
@@ -467,6 +557,8 @@ def tuned_matmul_launch(
             M, N, K, candidate[1], native_launch,
             allow_tf32=allow_tf32,
             epilogue=epilogue,
+            bias_spec=bias_spec,
+            b_transposed=b_transposed,
         )
 
     def bench(launch: Any, args: list) -> float:

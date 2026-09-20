@@ -325,3 +325,115 @@ def test_extern_epilogue_training_stays_segmented_gpu(cache_root):
     ref.backward()
     assert tp.allclose(out, ref, rtol=1e-5, atol=1e-4)
     assert tp.allclose(xc.grad, xr.grad, rtol=1e-5, atol=1e-4)
+
+
+# --- linear-form tiles (bias + optional chain) ---------------------------------
+
+
+@pytest.mark.skipif(
+    not tp.cuda.is_available(), reason="CUDA unavailable"
+)
+def test_linear_decision_key_separates_forms():
+    base = tg._decision_key(64, 32, 48, "tensorplay.float32", "cuda:0", False)
+    lin = tg._decision_key(
+        64, 32, 48, "tensorplay.float32", "cuda:0", False, None, True, True
+    )
+    assert base != lin
+
+
+@pytest.mark.skipif(
+    not tp.cuda.is_available(), reason="CUDA unavailable"
+)
+def test_linear_tile_launch_bias_and_chain_match_eager_gpu():
+    """The generated linear tile (transposed weight view, row-broadcast
+    bias, chain on the accumulator) matches eager directly, independent of
+    which side the benchmark prefers."""
+
+    from tensorplay.compiler.backends.stax.codegen.triton import (
+        TritonProgramCodegen,
+        emit_tile_epilogue_lines,
+    )
+
+    opcode = {
+        name: code for code, name in TritonProgramCodegen._OP_NAMES.items()
+    }
+    chain = [opcode["relu"], 0, -1]
+
+    device = tp.device("cuda", 0)
+    K, N, M = 96, 128, 64
+    x = tp.randn(M, K, device=device)
+    w = tp.randn(N, K, device=device)
+    b = tp.randn(N, device=device)
+
+    def eager(feed):
+        return (feed[0] @ feed[1].t() + feed[2]).relu()
+
+    launch = tg._triton_launch_factory(
+        (0, None), (1, None),
+        M, N, K,
+        (32, 64, 32, 4, 3),
+        eager,
+        epilogue=(chain, [], 0),
+        bias_spec=(2, None),
+        b_transposed=True,
+    )
+    out = launch([x, w, b])
+    ref = (x @ w.t() + b).relu()
+    assert tp.allclose(out, ref, rtol=1e-4, atol=1e-4)
+
+    # bias without a chain: the store leaves the accumulator directly
+    bare = tg._triton_launch_factory(
+        (0, None), (1, None),
+        M, N, K,
+        (32, 64, 32, 4, 3),
+        lambda feed: feed[0] @ feed[1].t() + feed[2],
+        bias_spec=(2, None),
+        b_transposed=True,
+    )
+    out2 = bare([x, w, b])
+    ref2 = x @ w.t() + b
+    assert tp.allclose(out2, ref2, rtol=1e-4, atol=1e-4)
+
+    # a non-contiguous runtime bias takes the fallback launch
+    bad_bias = tp.randn(N * 2, device=device)[::2]
+    assert not bad_bias.is_contiguous() or bad_bias.stride(0) == 1
+    hijacked = tg._triton_launch_factory(
+        (0, None), (1, None),
+        M, N, K,
+        (32, 64, 32, 4, 3),
+        lambda feed: "fallback",
+        bias_spec=(2, None),
+        b_transposed=True,
+    )
+    assert hijacked([x, w, tp.randn(N + 1, device=device)]) == "fallback"
+
+
+@pytest.mark.skipif(
+    not tp.cuda.is_available(), reason="CUDA unavailable"
+)
+def test_module_linear_region_with_chain_matches_eager_gpu(cache_root):
+    """A Linear module region with a single-user pointwise tail compiles
+    under max-autotune; every candidate runs the full region, so the
+    output matches eager whichever side won the bench."""
+
+    device = tp.device("cuda", 0)
+
+    class M(tp.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = tp.nn.Linear(512, 512, bias=True)
+
+        def forward(self, x):
+            return self.lin(x).relu()
+
+    m = M().cuda()
+    x = tp.randn(512, 512, device=device)
+    compiled = tp.compile(m, mode="max-autotune", fullgraph=True)
+    out = compiled(x)
+    ref = m(x)
+    assert tp.allclose(out, ref, rtol=1e-4, atol=1e-4)
+    records = [
+        json.loads(path.read_bytes().decode())
+        for path in cache_root.rglob("*.json")
+    ]
+    assert any("choice" in r for r in records)

@@ -3032,35 +3032,56 @@ def _extern_segment_plan(
     if max_autotune and not training and sample_feed is not None:
         from .triton_gemm import tuned_matmul_launch
 
-        # Each operand is either a feed-resolvable graph node or a literal
-        # tensor (module weights captured as constants).
-        operand_specs = tuple(
-            (
-                position_of(value) if isinstance(value, Node) else None,
-                None if isinstance(value, Node) else value,
-            )
-            for value in node.args
+        def operand_spec(value: Any) -> tuple | None:
+            """``(feed position, literal)`` for one operand; None when the
+            plan cannot resolve it (an unplanned graph dependency)."""
+
+            if isinstance(value, Node):
+                position = position_of(value)
+                return (position, None) if position is not None else None
+            return (None, value)
+
+        is_matmul = (
+            node.op == "call_function" and node.target is operator.matmul
+        ) or (node.op == "call_method" and node.target == "matmul")
+        is_linear = (
+            node.op == "call_function"
+            and getattr(node.target, "__name__", "") == "linear"
+            and getattr(node.target, "__module__", "")
+            == "tensorplay.nn.functional"
         )
+        bias_spec = None
+        if is_matmul and len(node.args) == 2:
+            a_spec = operand_spec(node.args[0])
+            b_spec = operand_spec(node.args[1])
+            b_transposed = False
+        elif is_linear and 2 <= len(node.args) <= 3 and not node.kwargs:
+            # linear(input, weight, bias?): the tile consumes the weight's
+            # transposed view and adds the length-N bias to the accumulator
+            a_spec = operand_spec(node.args[0])
+            b_spec = operand_spec(node.args[1])
+            b_transposed = True
+            if len(node.args) > 2 and node.args[2] is not None:
+                bias_spec = operand_spec(node.args[2])
+        else:
+            a_spec = b_spec = None
+            b_transposed = False
         if (
-            len(operand_specs) == 2
-            and all(
-                position is not None or literal is not None
-                for position, literal in operand_specs
-            )
-            and not node.kwargs
-            and (
-                (node.op == "call_function" and node.target is operator.matmul)
-                or (node.op == "call_method" and node.target == "matmul")
-            )
+            a_spec is not None
+            and b_spec is not None
+            and (bias_spec is None or bias_spec[0] is not None
+                 or bias_spec[1] is not None)
         ):
             try:
                 tuned = tuned_matmul_launch(
                     bare_launch,
                     sample_feed,
-                    operand_specs,
+                    (a_spec, b_spec),
                     output_shape,
                     epilogue=epilogue_payload,
                     epilogue_launch=epi_launch,
+                    bias_spec=bias_spec,
+                    b_transposed=b_transposed,
                 )
             except Exception:  # noqa: BLE001 - tuning is an optimization only
                 tuned = None
