@@ -161,27 +161,27 @@ class TestCUDAOps(unittest.TestCase):
         print("\nTesting CUDA activations...")
         device = self.device
         a = tp.tensor([-2.0, -1.0, 0.0, 1.0, 2.0], device=device)
-        
+
         # ReLU
         res = tp.relu(a)
         expected = [0.0, 0.0, 0.0, 1.0, 2.0]
-        self.assertTrue(tp.allclose(res.cpu(), tp.tensor(expected)), "ReLU failed")
-        
+        self.assertTrue(tp.allclose(res.cpu(), tp.tensor(expected, dtype=tp.float32)), "ReLU failed")
+
         # Sigmoid
         # sigmoid(0) = 0.5
         res = tp.sigmoid(a)
         expected = [1/(1+np.exp(2)), 1/(1+np.exp(1)), 0.5, 1/(1+np.exp(-1)), 1/(1+np.exp(-2))]
-        self.assertTrue(tp.allclose(res.cpu(), tp.tensor(expected), atol=1e-5), "Sigmoid failed")
-        
+        self.assertTrue(tp.allclose(res.cpu(), tp.tensor(expected, dtype=tp.float32), atol=1e-5), "Sigmoid failed")
+
         # Tanh
         res = tp.tanh(a)
         expected = np.tanh([-2.0, -1.0, 0.0, 1.0, 2.0])
-        self.assertTrue(tp.allclose(res.cpu(), tp.tensor(expected.tolist()), atol=1e-5), "Tanh failed")
-        
+        self.assertTrue(tp.allclose(res.cpu(), tp.tensor(expected.tolist(), dtype=tp.float32), atol=1e-5), "Tanh failed")
+
         # SiLU (x * sigmoid(x))
         res = tp.silu(a)
         expected = [-2.0/(1+np.exp(2)), -1.0/(1+np.exp(1)), 0.0, 1.0/(1+np.exp(-1)), 2.0/(1+np.exp(-2))]
-        self.assertTrue(tp.allclose(res.cpu(), tp.tensor(expected), atol=1e-5), "SiLU failed")
+        self.assertTrue(tp.allclose(res.cpu(), tp.tensor(expected, dtype=tp.float32), atol=1e-5), "SiLU failed")
 
 if __name__ == "__main__":
     unittest.main()
