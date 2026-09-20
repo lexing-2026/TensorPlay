@@ -7,6 +7,8 @@ import re
 import unittest
 
 import numpy as np
+import pytest
+
 import tensorplay as tp
 
 from tensorplay.testing import (
@@ -40,6 +42,12 @@ from tensorplay.testing._internal.common_dtype import (
     get_all_complex_dtypes,
     get_all_math_dtypes,
     highest_precision_float,
+)
+from tensorplay.testing._internal.reference import (
+    assert_reference_close,
+    from_reference,
+    reference_devices,
+    to_numpy,
 )
 from tensorplay.testing._internal.common_device_type import (
     dtypes,
@@ -463,6 +471,51 @@ class TestAssertClose(TestCase):
         assert_allclose([1.0], [1.0 + 1e-4], rtol=0, atol=1e-3)
         with self.assertRaises(AssertionError):
             assert_allclose([1.0], [2.0])
+
+
+class TestReferenceHelpers(TestCase):
+    def test_to_numpy_passthrough_and_arraylike(self):
+        arr = np.array([1.0, 2.0])
+        self.assertIs(to_numpy(arr), arr)
+        self.assertTrue(np.array_equal(to_numpy([1, 2]), arr))
+        self.assertEqual(to_numpy(3.5).shape, ())
+
+    def test_to_numpy_detaches_and_moves_to_host(self):
+        t = tp.arange(4, dtype=tp.float32)
+        out = to_numpy(t)
+        self.assertIsInstance(out, np.ndarray)
+        self.assertTrue(np.array_equal(out, np.arange(4, dtype=np.float32)))
+
+    def test_assert_reference_close(self):
+        assert_reference_close(tp.ones(3), np.ones(3))
+        assert_reference_close(tp.tensor([1.0, 2.0]), [1.0, 2.0])
+        with self.assertRaises(AssertionError):
+            assert_reference_close(tp.zeros(3), tp.ones(3))
+        with self.assertRaisesRegex(AssertionError, "tag"):
+            assert_reference_close(tp.zeros(3), tp.ones(3), msg="tag")
+
+    def test_reference_devices_shape(self):
+        devs = reference_devices()
+        self.assertEqual(devs[0], "cpu")
+        self.assertLessEqual(len(devs), 2)
+        if len(devs) == 2:
+            self.assertEqual(devs[1], "cuda")
+
+    def test_from_reference(self):
+        arr = np.array([[1.0, 2.0], [3.0, 4.0]])
+        t = from_reference(arr, "cpu")
+        self.assertIsInstance(t, tp.Tensor)
+        self.assertTrue(np.array_equal(to_numpy(t), arr))
+        t = from_reference(arr, "cpu", requires_grad=True)
+        self.assertTrue(t.requires_grad)
+
+    def test_reference_side_is_duck_typed(self):
+        torch = pytest.importorskip("torch")
+        ref = torch.arange(5, dtype=torch.float32)
+        assert_reference_close(from_reference(ref, "cpu"), ref)
+        self.assertTrue(np.array_equal(to_numpy(ref), np.arange(5, dtype=np.float32)))
+        with self.assertRaises(AssertionError):
+            assert_reference_close(from_reference(ref, "cpu"), ref + 1)
 
 
 class TestMakeTensor(TestCase):

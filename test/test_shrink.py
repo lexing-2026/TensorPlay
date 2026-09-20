@@ -19,34 +19,12 @@ import torch.nn.functional as torch_F
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tensorplay as tp
 import tensorplay.nn.functional as F
-
-
-def _np(t):
-    return t.detach().cpu().numpy()
-
-
-def _assert_close(case, tp_t, torch_t, rtol=1e-5, atol=1e-6, msg=""):
-    np.testing.assert_allclose(_np(tp_t), _np(torch_t), rtol=rtol, atol=atol,
-                               err_msg=msg)
-
-
-def _devices():
-    devs = ["cpu"]
-    if tp.cuda.is_available():
-        devs.append("cuda")
-    return devs
-
-
-def _tp_tensor(torch_t, device, requires_grad=False):
-    t = tp.tensor(torch_t.detach().numpy(), device=device)
-    if requires_grad:
-        t = t.requires_grad_(True)
-    return t
+from tensorplay.testing._internal.reference import assert_reference_close, from_reference, reference_devices, to_numpy
 
 
 class TestShrinkForward(unittest.TestCase):
     def test_configs(self):
-        for dev in _devices():
+        for dev in reference_devices():
             for lambd in (0.5, 0.3, 1.0):
                 for shape in ((16,), (3, 5), (2, 3, 4)):
                     for fn_t, fn_tp in ((torch_F.hardshrink, F.hardshrink),
@@ -59,22 +37,22 @@ class TestShrinkForward(unittest.TestCase):
                         input_t.view(-1)[::11] = -lambd
                         input_t.view(-1)[::13] = 0.0
                         ref = fn_t(input_t, lambd)
-                        got = fn_tp(_tp_tensor(input_t, dev), lambd)
+                        got = fn_tp(from_reference(input_t, dev), lambd)
                         tag = f"{fn_t.__name__} shape={shape} lambd={lambd} ({dev})"
-                        _assert_close(self, got, ref, msg=tag)
+                        assert_reference_close(got, ref, msg=tag)
 
     def test_nan_inf_passthrough(self):
         # inf passes through as outside the band.
-        for dev in _devices():
+        for dev in reference_devices():
             vals = torch.tensor([float("nan"), float("inf"), float("-inf"),
                                  0.3, -0.3, 0.5, -0.5])
             for fn_t, fn_tp in ((torch_F.hardshrink, F.hardshrink),
                                 (torch_F.softshrink, F.softshrink)):
                 ref = fn_t(vals, 0.5)
-                got = fn_tp(_tp_tensor(vals, dev), 0.5)
+                got = fn_tp(from_reference(vals, dev), 0.5)
                 tag = f"{fn_t.__name__} nan/inf ({dev})"
                 np.testing.assert_allclose(
-                    _np(got), _np(ref), rtol=1e-5, atol=1e-6, equal_nan=True,
+                    to_numpy(got), to_numpy(ref), rtol=1e-5, atol=1e-6, equal_nan=True,
                     err_msg=tag)
 
 
@@ -89,12 +67,12 @@ class TestShrinkBackwardNative(unittest.TestCase):
 
         ref = aten_fn(grad_t, input_t, lambd)
         tp_fn = getattr(_C, tp_fn_name)
-        got = tp_fn(_tp_tensor(grad_t, dev), _tp_tensor(input_t, dev), lambd)
+        got = tp_fn(from_reference(grad_t, dev), from_reference(input_t, dev), lambd)
         tag = f"{tp_fn_name} shape={shape} lambd={lambd} ({dev})"
-        _assert_close(self, got, ref, msg=tag)
+        assert_reference_close(got, ref, msg=tag)
 
     def test_configs(self):
-        for dev in _devices():
+        for dev in reference_devices():
             for lambd in (0.5, 0.3, 1.0):
                 for shape in ((16,), (3, 5), (2, 3, 4)):
                     self._run(shape, lambd, dev, 11,
@@ -106,7 +84,7 @@ class TestShrinkBackwardNative(unittest.TestCase):
 
     def test_broadcast(self):
         from tensorplay import _C
-        for dev in _devices():
+        for dev in reference_devices():
             grad_t = torch.randn(4, 1)
             input_t = torch.randn(4, 5)
             for aten_fn, name in ((torch.ops.aten.hardshrink_backward,
@@ -114,9 +92,9 @@ class TestShrinkBackwardNative(unittest.TestCase):
                                   (torch.ops.aten.softshrink_backward,
                                    "softshrink_backward")):
                 ref = aten_fn(grad_t, input_t, 0.5)
-                got = getattr(_C, name)(_tp_tensor(grad_t, dev),
-                                        _tp_tensor(input_t, dev), 0.5)
-                _assert_close(self, got, ref, msg=f"{name} broadcast ({dev})")
+                got = getattr(_C, name)(from_reference(grad_t, dev),
+                                        from_reference(input_t, dev), 0.5)
+                assert_reference_close(got, ref, msg=f"{name} broadcast ({dev})")
 
 
 class TestShrinkAutograd(unittest.TestCase):
@@ -131,16 +109,16 @@ class TestShrinkAutograd(unittest.TestCase):
         g_t = torch.randn_like(ref_out)
         (ref_grad,) = torch.autograd.grad(ref_out, ref_in, grad_outputs=g_t)
 
-        x = _tp_tensor(input_t, dev, requires_grad=True)
+        x = from_reference(input_t, dev, requires_grad=True)
         out = fn_tp(x, lambd)
-        out.backward(_tp_tensor(g_t, dev))
+        out.backward(from_reference(g_t, dev))
 
         tag = f"{fn_t.__name__} shape={shape} lambd={lambd} ({dev})"
-        _assert_close(self, out, ref_out, msg=f"fwd {tag}")
-        _assert_close(self, x.grad, ref_grad, msg=f"grad {tag}")
+        assert_reference_close(out, ref_out, msg=f"fwd {tag}")
+        assert_reference_close(x.grad, ref_grad, msg=f"grad {tag}")
 
     def test_configs(self):
-        for dev in _devices():
+        for dev in reference_devices():
             for lambd in (0.5, 0.3, 1.0):
                 for shape in ((16,), (3, 5), (2, 3, 4)):
                     self._run(shape, lambd, dev, 21,
@@ -151,23 +129,23 @@ class TestShrinkAutograd(unittest.TestCase):
     def test_negative_grad_sign(self):
         # Regression: the old composite softshrink derivative multiplied by
         # sign(self), flipping the gradient for negative out-of-band inputs.
-        for dev in _devices():
+        for dev in reference_devices():
             vals = torch.tensor([-2.0, -0.7, -0.3, 0.0, 0.3, 0.7, 2.0])
             ref_in = vals.clone().requires_grad_(True)
             ref_out = torch_F.softshrink(ref_in, lambd=0.5)
             g_t = torch.ones_like(ref_out)
             (ref_grad,) = torch.autograd.grad(ref_out, ref_in,
                                               grad_outputs=g_t)
-            x = _tp_tensor(vals, dev, requires_grad=True)
+            x = from_reference(vals, dev, requires_grad=True)
             out = F.softshrink(x, lambd=0.5)
-            out.backward(_tp_tensor(g_t, dev))
-            _assert_close(self, x.grad, ref_grad,
+            out.backward(from_reference(g_t, dev))
+            assert_reference_close(x.grad, ref_grad,
                           msg=f"softshrink negative-side grad ({dev})")
 
 
 class TestShrinkModules(unittest.TestCase):
     def test_modules(self):
-        for dev in _devices():
+        for dev in reference_devices():
             torch.manual_seed(31)
             input_t = torch.randn(4, 6)
             for mod_t_cls, mod_tp_cls, lambd in (
@@ -181,12 +159,12 @@ class TestShrinkModules(unittest.TestCase):
                                                   grad_outputs=g_t)
 
                 mod = mod_tp_cls(lambd=lambd)
-                x = _tp_tensor(input_t, dev, requires_grad=True)
+                x = from_reference(input_t, dev, requires_grad=True)
                 out = mod(x)
-                out.backward(_tp_tensor(g_t, dev))
+                out.backward(from_reference(g_t, dev))
                 name = mod_t_cls.__name__
-                _assert_close(self, out, ref_out, msg=f"{name} fwd ({dev})")
-                _assert_close(self, x.grad, ref_grad,
+                assert_reference_close(out, ref_out, msg=f"{name} fwd ({dev})")
+                assert_reference_close(x.grad, ref_grad,
                               msg=f"{name} grad ({dev})")
 
 

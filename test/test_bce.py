@@ -12,36 +12,13 @@ import os
 import sys
 import unittest
 
-import numpy as np
 import torch
 import torch.nn.functional as torch_F
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tensorplay as tp
 import tensorplay.nn.functional as F
-
-
-def _np(t):
-    return t.detach().cpu().numpy()
-
-
-def _assert_close(case, tp_t, torch_t, rtol=1e-5, atol=1e-6, msg=""):
-    np.testing.assert_allclose(_np(tp_t), _np(torch_t), rtol=rtol, atol=atol,
-                               err_msg=msg)
-
-
-def _devices():
-    devs = ["cpu"]
-    if tp.cuda.is_available():
-        devs.append("cuda")
-    return devs
-
-
-def _tp_tensor(torch_t, device, requires_grad=False):
-    t = tp.tensor(torch_t.detach().numpy(), device=device)
-    if requires_grad:
-        t = t.requires_grad_(True)
-    return t
+from tensorplay.testing._internal.reference import assert_reference_close, from_reference, reference_devices
 
 
 def _reduction_enum(reduction):
@@ -57,14 +34,14 @@ class TestBCEForward(unittest.TestCase):
         ref = torch_F.binary_cross_entropy(input_t, target_t, weight_t,
                                            reduction=reduction)
         got = F.binary_cross_entropy(
-            _tp_tensor(input_t, dev), _tp_tensor(target_t, dev),
-            _tp_tensor(weight_t, dev) if with_weight else None,
+            from_reference(input_t, dev), from_reference(target_t, dev),
+            from_reference(weight_t, dev) if with_weight else None,
             reduction=reduction)
         tag = f"bce shape={shape} reduction={reduction} weight={with_weight} ({dev})"
-        _assert_close(self, got, ref, msg=tag)
+        assert_reference_close(got, ref, msg=tag)
 
     def test_configs(self):
-        for dev in _devices():
+        for dev in reference_devices():
             for reduction in ("none", "mean", "sum"):
                 for with_weight in (False, True):
                     for shape in ((16,), (4, 5), (2, 3, 4)):
@@ -72,24 +49,24 @@ class TestBCEForward(unittest.TestCase):
 
     def test_boundary_zero_one(self):
         # input=0/target=1 and input=1/target=0 contribute exactly 100.
-        for dev in _devices():
+        for dev in reference_devices():
             input_t = torch.tensor([0.0, 1.0, 0.5, 0.25])
             target_t = torch.tensor([1.0, 0.0, 1.0, 0.0])
             for reduction in ("none", "mean", "sum"):
                 ref = torch_F.binary_cross_entropy(input_t, target_t,
                                                    reduction=reduction)
-                got = F.binary_cross_entropy(_tp_tensor(input_t, dev),
-                                             _tp_tensor(target_t, dev),
+                got = F.binary_cross_entropy(from_reference(input_t, dev),
+                                             from_reference(target_t, dev),
                                              reduction=reduction)
-                _assert_close(self, got, ref,
+                assert_reference_close(got, ref,
                               msg=f"bce boundary reduction={reduction} ({dev})")
 
     def test_input_out_of_range_raises(self):
         for bad_in, bad_tgt in ((torch.tensor([1.5]), torch.tensor([1.0])),
                                 (torch.tensor([0.5]), torch.tensor([-0.1]))):
             with self.assertRaises(RuntimeError) as cm:
-                F.binary_cross_entropy(_tp_tensor(bad_in, "cpu"),
-                                       _tp_tensor(bad_tgt, "cpu"))
+                F.binary_cross_entropy(from_reference(bad_in, "cpu"),
+                                       from_reference(bad_tgt, "cpu"))
             self.assertIn("between 0 and 1", str(cm.exception))
 
 
@@ -104,15 +81,15 @@ class TestBCEBackwardNative(unittest.TestCase):
         ref = torch.ops.aten.binary_cross_entropy_backward(
             grad_t, input_t, target_t, weight_t, _reduction_enum(reduction))
         got = _C.binary_cross_entropy_backward(
-            _tp_tensor(grad_t, dev), _tp_tensor(input_t, dev),
-            _tp_tensor(target_t, dev),
-            _tp_tensor(weight_t, dev) if with_weight else None,
+            from_reference(grad_t, dev), from_reference(input_t, dev),
+            from_reference(target_t, dev),
+            from_reference(weight_t, dev) if with_weight else None,
             _reduction_enum(reduction))
         tag = f"bce_backward shape={shape} reduction={reduction} weight={with_weight} ({dev})"
-        _assert_close(self, got, ref, msg=tag)
+        assert_reference_close(got, ref, msg=tag)
 
     def test_configs(self):
-        for dev in _devices():
+        for dev in reference_devices():
             for reduction in ("none", "mean", "sum"):
                 for with_weight in (False, True):
                     for shape in ((16,), (4, 5), (2, 3, 4)):
@@ -136,19 +113,19 @@ class TestBCEAutograd(unittest.TestCase):
             g_t = torch.tensor(1.0)
             (ref_grad,) = torch.autograd.grad(ref_out, ref_in)
 
-        x = _tp_tensor(input_t, dev, requires_grad=True)
+        x = from_reference(input_t, dev, requires_grad=True)
         out = F.binary_cross_entropy(
-            x, _tp_tensor(target_t, dev),
-            _tp_tensor(weight_t, dev) if with_weight else None,
+            x, from_reference(target_t, dev),
+            from_reference(weight_t, dev) if with_weight else None,
             reduction=reduction)
-        out.backward(_tp_tensor(g_t, dev))
+        out.backward(from_reference(g_t, dev))
 
         tag = f"bce shape={shape} reduction={reduction} weight={with_weight} ({dev})"
-        _assert_close(self, out, ref_out, msg=f"fwd {tag}")
-        _assert_close(self, x.grad, ref_grad, msg=f"grad {tag}")
+        assert_reference_close(out, ref_out, msg=f"fwd {tag}")
+        assert_reference_close(x.grad, ref_grad, msg=f"grad {tag}")
 
     def test_configs(self):
-        for dev in _devices():
+        for dev in reference_devices():
             for reduction in ("none", "mean", "sum"):
                 for with_weight in (False, True):
                     for shape in ((16,), (4, 5), (2, 3, 4)):
@@ -157,7 +134,7 @@ class TestBCEAutograd(unittest.TestCase):
 
 class TestBCELossModule(unittest.TestCase):
     def test_modules(self):
-        for dev in _devices():
+        for dev in reference_devices():
             torch.manual_seed(31)
             input_t = torch.rand(4, 6).clamp(0.01, 0.99)
             target_t = torch.rand(4, 6).round()
@@ -176,14 +153,14 @@ class TestBCELossModule(unittest.TestCase):
                         (ref_grad,) = torch.autograd.grad(ref_out, ref_in)
 
                     mod = tp.nn.BCELoss(
-                        weight=_tp_tensor(weight_t, dev) if weight_t is not None else None,
+                        weight=from_reference(weight_t, dev) if weight_t is not None else None,
                         reduction=reduction)
-                    x = _tp_tensor(input_t, dev, requires_grad=True)
-                    out = mod(x, _tp_tensor(target_t, dev))
-                    out.backward(_tp_tensor(g_t, dev))
+                    x = from_reference(input_t, dev, requires_grad=True)
+                    out = mod(x, from_reference(target_t, dev))
+                    out.backward(from_reference(g_t, dev))
                     tag = f"BCELoss reduction={reduction} weight={weight_t is not None} ({dev})"
-                    _assert_close(self, out, ref_out, msg=f"fwd {tag}")
-                    _assert_close(self, x.grad, ref_grad, msg=f"grad {tag}")
+                    assert_reference_close(out, ref_out, msg=f"fwd {tag}")
+                    assert_reference_close(x.grad, ref_grad, msg=f"grad {tag}")
 
 
 if __name__ == "__main__":

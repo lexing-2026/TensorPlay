@@ -12,19 +12,11 @@ import torch.nn.functional as torch_F
 
 import tensorplay as tp
 import tensorplay.functional as tp_F
-
-
-def _np(value):
-    return value.detach().cpu().numpy()
+from tensorplay.testing._internal.reference import assert_reference_close
 
 
 def _tp(value):
     return tp.tensor(value.detach().cpu().numpy(), device="cpu")
-
-
-def _assert_close(got, expected, *, rtol=1e-5, atol=1e-6):
-    np.testing.assert_allclose(_np(got), _np(expected) if isinstance(expected, torch.Tensor) else expected,
-                               rtol=rtol, atol=atol)
 
 
 def _dtype_name(dtype):
@@ -63,12 +55,12 @@ def test_chain_matmul():
     mats_np = [np.random.randn(3, 4), np.random.randn(4, 2), np.random.randn(2, 5)]
     got = tp_F.chain_matmul(*[_tp(torch.from_numpy(m)) for m in mats_np])
     expected = torch.chain_matmul(*[torch.from_numpy(m) for m in mats_np])
-    _assert_close(got, expected, rtol=1e-4)
+    assert_reference_close(got, expected, rtol=1e-4)
 
 
 def test_chain_matmul_single():
     m = torch.randn(3, 3)
-    _assert_close(tp_F.chain_matmul(_tp(m)), m)
+    assert_reference_close(tp_F.chain_matmul(_tp(m)), m)
 
 
 @pytest.mark.parametrize("r,with_replacement", [(2, False), (3, False), (2, True)])
@@ -86,21 +78,21 @@ def test_combinations(r, with_replacement):
 def test_trapz_x():
     y = torch.tensor([[1.0, 4.0, 9.0], [2.0, 3.0, 5.0]])
     x = torch.tensor([0.0, 1.0, 3.0])
-    _assert_close(tp_F.trapz(_tp(y), _tp(x)), torch.trapz(y, x))
+    assert_reference_close(tp_F.trapz(_tp(y), _tp(x)), torch.trapz(y, x))
     x0 = torch.tensor([0.0, 2.0])
-    _assert_close(tp_F.trapz(_tp(y), _tp(x0), dim=0), torch.trapz(y, x0, dim=0))
+    assert_reference_close(tp_F.trapz(_tp(y), _tp(x0), dim=0), torch.trapz(y, x0, dim=0))
 
 
 def test_trapz_dx():
     y = torch.tensor([1.0, 4.0, 9.0])
-    _assert_close(tp_F.trapz(_tp(y)), torch.trapz(y))
-    _assert_close(tp_F.trapz(_tp(y), dx=0.5), torch.trapz(y, dx=0.5))
+    assert_reference_close(tp_F.trapz(_tp(y)), torch.trapz(y))
+    assert_reference_close(tp_F.trapz(_tp(y), dx=0.5), torch.trapz(y, dx=0.5))
 
 
 def test_histc():
     x = torch.tensor([1.0, 2.0, 2.5, 3.0, 4.0, 5.0])
-    _assert_close(tp_F.histc(_tp(x), 4, 1.0, 5.0), torch.histc(x, 4, 1.0, 5.0))
-    _assert_close(tp_F.histc(_tp(x)), torch.histc(x))
+    assert_reference_close(tp_F.histc(_tp(x), 4, 1.0, 5.0), torch.histc(x, 4, 1.0, 5.0))
+    assert_reference_close(tp_F.histc(_tp(x)), torch.histc(x))
 
 
 def test_isin_overloads():
@@ -187,8 +179,8 @@ def test_put():
     x = torch.tensor([1.0, 2.0, 3.0, 4.0])
     idx = torch.tensor([0, 2])
     src = torch.tensor([9.0, 8.0])
-    _assert_close(tp_F.put(_tp(x), _tp(idx), _tp(src)), torch.put(x, idx, src))
-    _assert_close(tp_F.put(_tp(x), _tp(idx), _tp(src), True),
+    assert_reference_close(tp_F.put(_tp(x), _tp(idx), _tp(src)), torch.put(x, idx, src))
+    assert_reference_close(tp_F.put(_tp(x), _tp(idx), _tp(src), True),
                   torch.put(x, idx, src, True))
 
 
@@ -206,49 +198,49 @@ def test_copy_family():
     x = torch.arange(24.0).reshape(2, 3, 4)
     tx = _tp(x)
 
-    _assert_close(tp_F.alias_copy(tx), x)
-    _assert_close(tp_F.t_copy(_tp(x[0])), x[0].t())
-    _assert_close(tp_F.permute_copy(tx, [2, 0, 1]), x.permute(2, 0, 1))
-    _assert_close(tp_F.transpose_copy(tx, 0, 2), x.transpose(0, 2))
-    _assert_close(tp_F.squeeze_copy(_tp(x[:, :1, :])), x[:, :1, :].squeeze())
-    _assert_close(tp_F.squeeze_copy(_tp(x[:, :1, :]), 1), x[:, :1, :].squeeze(1))
-    _assert_close(tp_F.unsqueeze_copy(tx, 0), x.unsqueeze(0))
-    _assert_close(tp_F.select_copy(tx, 1, 2), x.select(1, 2))
-    _assert_close(tp_F.slice_copy(tx, 2, 1, 3), x[:, :, 1:3])
-    _assert_close(tp_F.narrow_copy(tx, 1, 1, 2), x.narrow(1, 1, 2))
-    _assert_close(tp_F.diagonal_copy(_tp(x[0])), x[0].diagonal())
-    _assert_close(tp_F.diagonal_copy(_tp(x[0]), 1), x[0].diagonal(1))
+    assert_reference_close(tp_F.alias_copy(tx), x)
+    assert_reference_close(tp_F.t_copy(_tp(x[0])), x[0].t())
+    assert_reference_close(tp_F.permute_copy(tx, [2, 0, 1]), x.permute(2, 0, 1))
+    assert_reference_close(tp_F.transpose_copy(tx, 0, 2), x.transpose(0, 2))
+    assert_reference_close(tp_F.squeeze_copy(_tp(x[:, :1, :])), x[:, :1, :].squeeze())
+    assert_reference_close(tp_F.squeeze_copy(_tp(x[:, :1, :]), 1), x[:, :1, :].squeeze(1))
+    assert_reference_close(tp_F.unsqueeze_copy(tx, 0), x.unsqueeze(0))
+    assert_reference_close(tp_F.select_copy(tx, 1, 2), x.select(1, 2))
+    assert_reference_close(tp_F.slice_copy(tx, 2, 1, 3), x[:, :, 1:3])
+    assert_reference_close(tp_F.narrow_copy(tx, 1, 1, 2), x.narrow(1, 1, 2))
+    assert_reference_close(tp_F.diagonal_copy(_tp(x[0])), x[0].diagonal())
+    assert_reference_close(tp_F.diagonal_copy(_tp(x[0]), 1), x[0].diagonal(1))
 
     got = tp_F.unbind_copy(tx, 1)
     expected = x.unbind(1)
     assert len(got) == len(expected)
     for g, e in zip(got, expected):
-        _assert_close(g, e)
+        assert_reference_close(g, e)
 
     got = tp_F.split_copy(_tp(torch.arange(10.0)), 3)
     expected = torch.arange(10.0).split(3)
     assert len(got) == len(expected)
     for g, e in zip(got, expected):
-        _assert_close(g, e)
+        assert_reference_close(g, e)
 
-    _assert_close(tp_F.view_copy(tx, [6, 4]), x.view(6, 4))
-    _assert_close(tp_F.expand_copy(_tp(torch.ones(1, 3)), [4, 3]),
+    assert_reference_close(tp_F.view_copy(tx, [6, 4]), x.view(6, 4))
+    assert_reference_close(tp_F.expand_copy(_tp(torch.ones(1, 3)), [4, 3]),
                   torch.ones(1, 3).expand(4, 3))
-    _assert_close(tp_F.unfold_copy(_tp(torch.arange(7.0)), 0, 3, 2),
+    assert_reference_close(tp_F.unfold_copy(_tp(torch.arange(7.0)), 0, 3, 2),
                   torch.arange(7.0).unfold(0, 3, 2))
-    _assert_close(tp_F.reshape_as(tx, _tp(torch.zeros(4, 6))), x.reshape(4, 6))
+    assert_reference_close(tp_F.reshape_as(tx, _tp(torch.zeros(4, 6))), x.reshape(4, 6))
 
     got = tp_F.unsafe_chunk(tx, 2, 0)
     expected = torch.chunk(x, 2, 0)
     assert len(got) == len(expected)
     for g, e in zip(got, expected):
-        _assert_close(g, e)
+        assert_reference_close(g, e)
 
     got = tp_F.unsafe_split(_tp(torch.arange(10.0)), 4)
     expected = torch.split(torch.arange(10.0), 4)
     assert len(got) == len(expected)
     for g, e in zip(got, expected):
-        _assert_close(g, e)
+        assert_reference_close(g, e)
 
 
 def test_view_copy_dtype():
@@ -265,9 +257,9 @@ def test_view_copy_dtype():
 def test_cosine_similarity():
     a = torch.randn(5, 8)
     b = torch.randn(5, 8)
-    _assert_close(tp_F.cosine_similarity(_tp(a), _tp(b)),
+    assert_reference_close(tp_F.cosine_similarity(_tp(a), _tp(b)),
                   torch_F.cosine_similarity(a, b))
-    _assert_close(tp_F.cosine_similarity(_tp(a), _tp(b), dim=0),
+    assert_reference_close(tp_F.cosine_similarity(_tp(a), _tp(b), dim=0),
                   torch_F.cosine_similarity(a, b, dim=0))
 
 
@@ -290,7 +282,7 @@ def test_dropout_train_statistics():
 
 def test_rrelu_eval():
     x = torch.tensor([-2.0, -0.5, 0.0, 0.5, 2.0])
-    _assert_close(tp_F.rrelu(_tp(x), 0.125, 0.5, False),
+    assert_reference_close(tp_F.rrelu(_tp(x), 0.125, 0.5, False),
                   torch_F.rrelu(x, 0.125, 0.5, False))
 
 
@@ -310,9 +302,9 @@ def test_bilinear():
     x2 = torch.randn(4, 7)
     w = torch.randn(5, 6, 7)
     bias = torch.randn(5)
-    _assert_close(tp_F.bilinear(_tp(x1), _tp(x2), _tp(w), _tp(bias)),
+    assert_reference_close(tp_F.bilinear(_tp(x1), _tp(x2), _tp(w), _tp(bias)),
                   torch_F.bilinear(x1, x2, w, bias), rtol=1e-4)
-    _assert_close(tp_F.bilinear(_tp(x1), _tp(x2), _tp(w)),
+    assert_reference_close(tp_F.bilinear(_tp(x1), _tp(x2), _tp(w)),
                   torch_F.bilinear(x1, x2, w), rtol=1e-4)
 
 
@@ -329,10 +321,10 @@ def test_bilinear_backward():
     tb = _tp(bias.detach()); tb.requires_grad_(True)
     tp_F.bilinear(t1, t2, tw, tb).sum().backward()
 
-    _assert_close(t1.grad, x1.grad, rtol=1e-4)
-    _assert_close(t2.grad, x2.grad, rtol=1e-4)
-    _assert_close(tw.grad, w.grad, rtol=1e-4)
-    _assert_close(tb.grad, bias.grad, rtol=1e-4)
+    assert_reference_close(t1.grad, x1.grad, rtol=1e-4)
+    assert_reference_close(t2.grad, x2.grad, rtol=1e-4)
+    assert_reference_close(tw.grad, w.grad, rtol=1e-4)
+    assert_reference_close(tb.grad, bias.grad, rtol=1e-4)
 
 
 def test_conv_tbc():
@@ -340,7 +332,7 @@ def test_conv_tbc():
     w = torch.randn(3, 3, 4)          # (width, in, out)
     b = torch.randn(4)
     for pad in (0, 1):
-        _assert_close(tp_F.conv_tbc(_tp(x), _tp(w), _tp(b), pad),
+        assert_reference_close(tp_F.conv_tbc(_tp(x), _tp(w), _tp(b), pad),
                       torch_F.conv_tbc(x, w, b, pad), rtol=1e-4)
 
 
@@ -353,8 +345,8 @@ def test_lstm_cell():
     got = tp_F.lstm_cell(_tp(x), _tp(hx[0]), _tp(hx[1]),
                          _tp(w_ih), _tp(w_hh), _tp(b_ih), _tp(b_hh))
     expected = torch._VF.lstm_cell(x, hx, w_ih, w_hh, b_ih, b_hh)
-    _assert_close(got[0], expected[0], rtol=1e-4)
-    _assert_close(got[1], expected[1], rtol=1e-4)
+    assert_reference_close(got[0], expected[0], rtol=1e-4)
+    assert_reference_close(got[1], expected[1], rtol=1e-4)
 
 
 @pytest.mark.parametrize("fn,torch_fn", [
@@ -367,14 +359,14 @@ def test_rnn_cells(fn, torch_fn):
     hx = torch.randn(2, 8)
     w_ih, w_hh = torch.randn(8, 4), torch.randn(8, 8)
     b_ih, b_hh = torch.randn(8), torch.randn(8)
-    _assert_close(fn(_tp(x), _tp(hx), _tp(w_ih), _tp(w_hh), _tp(b_ih), _tp(b_hh)),
+    assert_reference_close(fn(_tp(x), _tp(hx), _tp(w_ih), _tp(w_hh), _tp(b_ih), _tp(b_hh)),
                   torch_fn(x, hx, w_ih, w_hh, b_ih, b_hh), rtol=1e-4)
 
 
 def test_native_channel_shuffle():
     x = torch.randn(2, 6, 4, 4)
     for groups in (2, 3):
-        _assert_close(tp_F.native_channel_shuffle(_tp(x), groups),
+        assert_reference_close(tp_F.native_channel_shuffle(_tp(x), groups),
                       torch.native_channel_shuffle(x, groups))
 
 
@@ -384,9 +376,9 @@ def test_native_channel_shuffle():
 
 def test_kaiser_window():
     for length in (0, 1, 5, 8):
-        _assert_close(tp_F.kaiser_window(length), torch.kaiser_window(length))
-    _assert_close(tp_F.kaiser_window(6, False), torch.kaiser_window(6, False))
-    _assert_close(tp_F.kaiser_window(6, True, 8.0), torch.kaiser_window(6, True, 8.0))
+        assert_reference_close(tp_F.kaiser_window(length), torch.kaiser_window(length))
+    assert_reference_close(tp_F.kaiser_window(6, False), torch.kaiser_window(6, False))
+    assert_reference_close(tp_F.kaiser_window(6, True, 8.0), torch.kaiser_window(6, True, 8.0))
     got = tp_F.kaiser_window(5, dtype=tp.float64)
     assert _dtype_name(got.dtype) == "float64"
-    _assert_close(got, torch.kaiser_window(5, dtype=torch.float64))
+    assert_reference_close(got, torch.kaiser_window(5, dtype=torch.float64))
