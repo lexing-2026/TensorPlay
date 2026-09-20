@@ -4,7 +4,7 @@ Measures ns/iter of forward+backward through a custom Function minus the
 bare-op floor, isolating each framework's apply()/graph-attach cost.
 
 Usage:
-    PYTHONPATH=/home/mega/TensorPlay python3 benchmark/autograd_function_overhead.py
+    PYTHONPATH=. python3 benchmark/autograd_function_overhead.py
 """
 
 import argparse
