@@ -2582,6 +2582,22 @@ class _ExternPlan:
     backward_launch: Any = None
 
 
+def _collective_helpers():
+    """The synchronous-collective callables for extern tangent rules.
+
+    Imported lazily: the collectives module pulls the full distributed
+    runtime, which must not load for compiler-only use.
+    """
+
+    from tensorplay.distributed import _functional_collectives as fc
+
+    return (
+        fc.all_reduce_sync,
+        fc.all_gather_sync,
+        fc.reduce_scatter_sync,
+    )
+
+
 def _build_extern_analytic_vjp(node: Any, position_of: Any):
     """Closed-form tangent rule for one eager operator.
 
@@ -2717,6 +2733,50 @@ def _build_extern_analytic_vjp(node: Any, position_of: Any):
             return tangent.to(x.dtype)
 
         return single(rule)
+
+    if name in ("all_reduce_sync", "all_gather_sync", "reduce_scatter_sync"):
+        # Synchronous collectives (the captured-graph surface): the three
+        # leading-axis forms with closed-form tangents.  ``group`` is a
+        # non-differentiable keyword.  V1 contract: the rule re-runs the
+        # SAME collective on the tangent, so a collective segment inside a
+        # training region is only legal when the surrounding schedule runs
+        # once per call — exactly what the extern plan guarantees.
+        module = getattr(node.target, "__module__", "")
+        if module != "tensorplay.distributed._functional_collectives":
+            return None
+        group_name = (node.kwargs or {}).get("group")
+        if group_name is None and len(node.args) > 1:
+            group_name = node.args[1]
+        if not isinstance(group_name, str):
+            return None
+        if node.kwargs.get("op") is not None:
+            return None
+        ar_sync, ag_sync, rs_sync = _collective_helpers()
+
+        def collective(rule):
+            def vjp(feed: list, tangent: Any) -> tuple:
+                grads = [None] * len(feed)
+                grads[x_pos] = rule(feed[x_pos], tangent, group_name)
+                return tuple(grads)
+
+            return vjp
+
+        if name == "all_reduce_sync":
+            # sum all-reduce: the identity tangent — one more sum all-reduce
+            return collective(
+                lambda x, tangent, group: ar_sync(tangent, "sum", group)
+            )
+        if name == "all_gather_sync":
+            # leading-axis all-gather: the sum reduce-scatter tangent splits
+            # the gradient back to each rank's shard
+            return collective(
+                lambda x, tangent, group: rs_sync(tangent, group)
+            )
+        # reduce_scatter_sync: leading-axis sum reduce-scatter; the tangent
+        # is the all-gather of the shard gradient
+        return collective(
+            lambda x, tangent, group: ag_sync(tangent, group)
+        )
 
     return None
 
