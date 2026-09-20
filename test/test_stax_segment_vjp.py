@@ -666,3 +666,155 @@ def test_broadcast_operand_scalar_tangent_gpu():
     assert tp.abs(got.cpu() - ref.cpu()).max().item() < 1e-3
     for g, want in zip(ins, ref_ins):
         assert tp.abs(g.grad.cpu() - want.grad.cpu()).max().item() < 1e-3
+
+
+def test_bare_pair_reduction_trains_via_scatter_vjp(monkeypatch):
+    """x.max(dim=1).values.sum(): the pair segment's projection export is
+    closed by the eager index-scatter VJP (no backward kernel)."""
+
+    launches = {
+        # the pair segment exports its values projection (one port)
+        "fwd0": lambda x: x.max(dim=1).values,
+        # the sum segment reduces the values export
+        "fwd1": lambda v: v.sum(),
+        # sum backward: the expanded tangent passes through unchanged
+        "bwd1": lambda v, go: (go,),
+    }
+
+    _fake_runtime(monkeypatch, launches)
+
+    x = tp.randn(6, 8, requires_grad=True)
+
+    def fn(x):
+        return x.max(dim=1).values.sum()
+
+    gm = Tracer().trace(fn, sample_inputs={"x": x})
+    compiled = st.compile_graph_module(gm, [x])
+    assert compiled is not None
+    assert compiled._tensorplay_backward_codegen == "triton"
+    segments = gm.meta["stax_segments"]
+    assert [seg["kind"] for seg in segments] == ["pw+red", "pw+red"]
+
+    out = compiled(x.detach())
+    expected = fn(x.detach())
+    assert tp.abs(out - expected).max().item() < 1e-6
+
+    xc = x.detach().requires_grad_(True)
+    out_c = compiled(xc)
+    out_c.backward()
+    xe = x.detach().requires_grad_(True)
+    fn(xe).backward()
+    assert tp.abs(out_c - fn(xe)).max().item() < 1e-6
+    assert tp.abs(xc.grad - xe.grad).max().item() < 1e-5
+
+
+def test_argmax_segment_trains_without_gradient_path(monkeypatch):
+    """A training region containing argmax compiles instead of falling
+    back wholesale: the index reduction closes with the no-tangent rule and
+    its integer output flows to an extern consumer (index_select) whose
+    engine VJP skips the non-float operand."""
+
+    table = tp.randn(8, 4)
+    # segment order: [pw+red mul+sum] [pw+red argmax] [extern index_select]
+    # [pw+red gathered sum] [pw add] — the extern segment runs eagerly, the
+    # fused segments take fake launches keyed by segment index
+    launches = {
+        "fwd0": lambda x: (x * 2.0).sum(),
+        "bwd0": lambda x, go: (go * 2.0,),
+        "fwd1": lambda x: x.argmax(dim=1),
+        "fwd3": lambda rows: rows.sum(),
+        "bwd3": lambda rows, go: (go,),
+        "fwd4": lambda a, b: a + b,
+        "bwd4": lambda a, b, go: (go, go),
+    }
+
+    _fake_runtime(monkeypatch, launches)
+
+    x = tp.randn(5, 8, requires_grad=True)
+
+    def fn(x):
+        return (x * 2.0).sum() + tp.index_select(
+            table, 0, x.argmax(dim=1)
+        ).sum()
+
+    from types import SimpleNamespace
+
+    gm = Tracer().trace(fn, sample_inputs={"x": x})
+    # the direct trace skips the frontend's tensor-meta propagation; the
+    # extern plan needs the index_select output signature
+    for node in gm.graph.nodes:
+        if node.op == "call_function" and getattr(
+            node.target, "__name__", ""
+        ) == "index_select":
+            node.meta["tensor_meta"] = SimpleNamespace(
+                shape=(5, 4), dtype=tp.float32
+            )
+    compiled = st.compile_graph_module(gm, [x])
+    assert compiled is not None
+    assert compiled._tensorplay_backward_codegen == "triton"
+    segments = gm.meta["stax_segments"]
+    assert "pw+red" in [seg["kind"] for seg in segments]
+
+    xc = x.detach().requires_grad_(True)
+    out_c = compiled(xc)
+    out_c.backward()
+
+    # eager: the argmax branch carries no gradient path
+    xe = x.detach().requires_grad_(True)
+    out_e = fn(xe)
+    out_e.backward()
+    assert tp.abs(out_c - out_e).max().item() < 1e-5
+    assert tp.abs(xc.grad - xe.grad).max().item() < 1e-5
+
+
+def test_get_attr_segment_trains_through_function_tail(monkeypatch):
+    """A lifted module parameter trains: the get_attr extern segment serves
+    the CURRENT attribute value and its identity VJP routes the export
+    tangent back to the leaf via the trailing autograd input."""
+
+    import operator
+
+    from tensorplay.graph import Graph, GraphModule
+
+    class _Root:
+        pass
+
+    root = _Root()
+    scale = tp.randn(6, requires_grad=True)
+    root.scale = scale
+
+    g = Graph()
+    x = g.placeholder("x")
+    s = g.get_attr("scale")
+    g.output(g.call_function(operator.mul, (x, s)))
+    gm = GraphModule(root, g)
+
+    # segment order: [extern get_attr] [pw mul] — the get_attr segment runs
+    # its real plan, the fused mul takes the fake launch at index 1
+    launches = {
+        "fwd1": lambda x, s: x * s,
+        "bwd1": lambda x, s, go: (go * s, go * x),
+    }
+    _fake_runtime(monkeypatch, launches)
+
+    x = tp.randn(4, 6, requires_grad=True)
+    compiled = st.compile_graph_module(gm, [x])
+    assert compiled is not None
+    assert compiled._tensorplay_backward_codegen == "triton"
+
+    xc = x.detach().requires_grad_(True)
+    out = compiled(xc)
+    out.sum().backward()
+
+    # the parameter rebind is picked up per call
+    root.scale = tp.full_like(scale, 2.0)
+    out2 = compiled(xc)
+    assert tp.abs(out2 - xc * 2.0).max().item() < 1e-6
+
+    xr = x.detach().requires_grad_(True)
+    sr = scale.detach().clone().requires_grad_(True)
+    (xr * sr).sum().backward()
+    assert tp.abs(out - xr * sr).max().item() < 1e-6
+    assert tp.abs(xc.grad - xr.grad).max().item() < 1e-5
+    assert scale.grad is not None
+    assert tp.abs(scale.grad - sr.grad).max().item() < 1e-5

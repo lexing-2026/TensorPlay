@@ -110,14 +110,16 @@ def decision_key(digest: str, bucket: int, device: str,
 
 
 def load_decision(digest: str, bucket: int, device: str, *,
-                  tier: str = "table",
-                  candidates: Optional[Sequence[Tuple[int, int]]] = None
-                  ) -> Optional[Tuple[int, int]]:
-    """Return ``(xblock, num_warps)`` previously chosen for this key.
+                   tier: str = "table",
+                   candidates: Optional[Sequence[Tuple[int, ...]]] = None
+                   ) -> Optional[Tuple[int, ...]]:
+    """Return the config previously chosen for this key.
 
-    Table tiers only accept configs that are members of the table they were
+    A pointwise config is ``(xblock, num_warps)`` or ``(xblock, num_warps,
+    vec)`` when the loop-pass vectorize width was part of the pick.  Table
+    tiers only accept configs that are members of the table they were
     selected from (the baseline or exhaustive set); the ``"coordesc"`` tier
-    accepts any structurally valid pair because descent may leave the
+    accepts any structurally valid tuple because descent may leave the
     table.
     """
 
@@ -127,9 +129,14 @@ def load_decision(digest: str, bucket: int, device: str, *,
         return None
     try:
         record = json.loads(payload.decode())
-        config = (int(record["xblock"]), int(record["warps"]))
+        config: Tuple[int, ...] = (
+            int(record["xblock"]),
+            int(record["warps"]),
+        )
+        if record.get("vec") is not None:
+            config = config + (int(record["vec"]),)
         if tier == "coordesc":
-            if config[0] >= 1 and config[1] >= 1:
+            if all(value >= 1 for value in config):
                 return config
             return None
         table = CANDIDATE_CONFIGS if candidates is None else tuple(candidates)
@@ -141,8 +148,11 @@ def load_decision(digest: str, bucket: int, device: str, *,
 
 
 def store_decision(digest: str, bucket: int, device: str,
-                   config: Tuple[int, int], tier: str = "table") -> None:
-    payload = json.dumps({"xblock": config[0], "warps": config[1]}).encode()
+                   config: Tuple[int, ...], tier: str = "table") -> None:
+    record = {"xblock": config[0], "warps": config[1]}
+    if len(config) > 2:
+        record["vec"] = config[2]
+    payload = json.dumps(record).encode()
     _decision_cache().store(decision_key(digest, bucket, device, tier), payload,
                             ext="json")
 

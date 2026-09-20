@@ -31,6 +31,8 @@ fusibility decisions — the old ad-hoc whole-graph detectors delegate here).
 
 from __future__ import annotations
 
+import builtins
+import operator
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -57,6 +59,12 @@ class Segment:
     #: Each export shares the kernel's reference shape, so one extra store
     #: costs one output buffer, not a second kernel.
     exports: Tuple[Node, ...] = ()
+    #: Per-export stream semantics, parallel to ``exports``.  Non-empty only
+    #: for pair reductions (``max(dim)``/``min(dim)``): each export is a
+    #: projection of the reduction tail — "values" or "indices" — naming the
+    #: stream the corresponding output buffer carries.  Empty for every other
+    #: segment (one value stream per export).
+    export_kinds: Tuple[str, ...] = ()
 
     @property
     def tail(self) -> Node | None:
@@ -121,6 +129,33 @@ def _epilogue_join(
     return touches_live
 
 
+def _pair_projection(node: Node):
+    """Return ``(kind, pair_node)`` when ``node`` projects a pair-tail node.
+
+    A ``max(dim)``/``min(dim)`` tail produces a (values, indices) pair, and
+    every use goes through one of these projection nodes — the tracer
+    materializes them for named access (``m.values``) and positional access
+    (``m[0]``) alike.  ``kind`` is "values" or "indices"; ``None`` for
+    anything else.
+    """
+
+    if node.op != "call_function":
+        return None
+    if len(node.args) != 2 or not isinstance(node.args[0], Node):
+        return None
+    selector = node.args[1]
+    if node.target is builtins.getattr:
+        if isinstance(selector, str) and selector in ("values", "indices"):
+            return selector, node.args[0]
+        return None
+    if node.target is operator.getitem:
+        if isinstance(selector, int) and not isinstance(selector, bool):
+            if selector in (0, 1):
+                return ("values", "indices")[selector], node.args[0]
+        return None
+    return None
+
+
 def segment_graph(
     graph_module: GraphModule,
     *,
@@ -151,15 +186,25 @@ def segment_graph(
         if not current:
             return
         kind = "pw+red" if current_reduction is not None else "pw"
-        main = current_epilogue[-1] if current_epilogue else current[-1]
         index = len(segments)
+        if getattr(current_reduction, "is_pair", False):
+            # Pair tails export only through their projection nodes, which
+            # attach after the close (the tail itself is not a wireable
+            # value).  Projections consumed by nobody leave no export.
+            exports: Tuple[Node, ...] = ()
+            kinds: Tuple[str, ...] = ()
+        else:
+            main = current_epilogue[-1] if current_epilogue else current[-1]
+            exports = (main, *open_extras)
+            kinds = ()
         segments.append(
             Segment(
                 nodes=tuple(current),
                 kind=kind,
                 reduction=current_reduction,
                 epilogue=tuple(current_epilogue),
-                exports=(main, *open_extras),
+                exports=exports,
+                export_kinds=kinds,
             )
         )
         for node in (*current, *current_epilogue):
@@ -210,6 +255,29 @@ def segment_graph(
     for node in graph_module.graph.nodes:
         if node.op in {"placeholder", "output"}:
             continue
+        projection = _pair_projection(node)
+        if projection is not None:
+            kind, pair_node = projection
+            if pair_node in current and current_reduction is not None and getattr(
+                current_reduction, "is_pair", False
+            ):
+                # The open run IS the pair kernel: close it so the
+                # projection attaches to a settled segment.
+                close()
+            index = owner.get(pair_node)
+            if index is None or not getattr(
+                segments[index].reduction, "is_pair", False
+            ):
+                # Not a projection this scheduler understands — let the
+                # generic routing reject the region.
+                projection = None
+            else:
+                segments[index].exports = segments[index].exports + (node,)
+                segments[index].export_kinds = (
+                    segments[index].export_kinds + (kind,)
+                )
+                owner[node] = index
+                continue
         dependencies = set(_flatten_values(node.args)) | set(
             _flatten_values(node.kwargs)
         )
@@ -235,9 +303,18 @@ def segment_graph(
                 # Training schedules split the epilogue into its own
                 # pointwise segment instead: the backward then closes each
                 # piece with its own local VJP, mirroring forward/backward
-                # graphs being scheduled independently.
-                if allow_epilogue and _epilogue_join(
-                    node, current[-1], tuple(current_epilogue)
+                # graphs being scheduled independently.  Index-carrying
+                # reductions never take an epilogue: the chain would run on
+                # the int64 index stream, outside the float value space.
+                index_carrying = getattr(
+                    current_reduction, "tracks_indices", False
+                ) or getattr(current_reduction, "is_pair", False)
+                if (
+                    allow_epilogue
+                    and not index_carrying
+                    and _epilogue_join(
+                        node, current[-1], tuple(current_epilogue)
+                    )
                 ):
                     current_epilogue.append(node)
                     continue
