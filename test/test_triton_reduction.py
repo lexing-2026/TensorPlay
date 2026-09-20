@@ -281,7 +281,7 @@ def test_axis_reduction_codegen_structure():
     src = codegen.generate("k", fixed_config=(32, 4))
     assert src.count("@triton.jit") == 1
     assert "for roffset in" not in src
-    assert "rindex = tl.arange(0, RBLOCK)" in src
+    assert "rindex = 0 + tl.arange(0, RBLOCK)" in src
     # exact tiles: no predication anywhere (divisible fast path);
     # reduction tile loads carry the read-once eviction hint
     assert "rmask" not in src and "m2" not in src
@@ -455,7 +455,7 @@ def test_argmax_codegen_structure():
     assert "tl.store(out_ptr0 + xindex, acci)" in src
     assert "tl.store(out_ptr0 + xindex, acc," not in src.replace("acci", "")
     # launcher materializes int64 output
-    assert "tp.empty((32,), dtype=tp.int64" in src
+    assert "tp.empty((32,), dtype=dt, device=inputs[0].device) for dt in (tp.int64,)" in src
 
 
 def test_argmax_f64_accumulator_dtype():
@@ -467,7 +467,7 @@ def test_argmax_f64_accumulator_dtype():
     )
     src = codegen.generate("k")
     assert "dtype=tl.float64" in src
-    assert "tp.empty((1, 8), dtype=tp.int64" in src
+    assert "tp.empty((1, 8), dtype=dt, device=inputs[0].device) for dt in (tp.int64,)" in src
 
 
 def test_argmax_digest_differs_from_amax():
