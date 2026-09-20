@@ -187,9 +187,6 @@ def test_multilabel_margin_loss():
     assert xi.grad is not None and float(np.abs(_np(xi.grad)).sum()) > 0
 
 
-@pytest.mark.xfail(reason="the fused ctc backward path disagrees with its numeric "
-                         "gradient when target_lengths < S (the implementation follows "
-                         "the mathematical result)", strict=False)
 def test_ctc_loss_matches_torch():
     rng = np.random.RandomState(8)
     T, N, C, S = 20, 4, 7, 5
