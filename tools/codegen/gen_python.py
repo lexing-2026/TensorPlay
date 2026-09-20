@@ -30,6 +30,13 @@ def _ensure_device(device):
     return device
 
 _MISSING = object()
+
+def _as_left_operand(value, other):
+    # A plain-number left operand joins the right operand's device when one
+    # is given, so reflected calls stay on the tensor's device.
+    if isinstance(other, tensorplay.Tensor):
+        return tensorplay.as_tensor(value, device=other.device)
+    return tensorplay.as_tensor(value)
 '''
 
 _VARIADIC_TENSOR_LIST_FUNCTIONS = frozenset({
@@ -264,7 +271,7 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                 '        if _captured is not None:',
                 '            return _captured',
                 '    if not isinstance(input, tensorplay.Tensor):',
-                '        input = tensorplay.as_tensor(input)',
+                '        input = _as_left_operand(input, other)',
                 '    if rounding_mode is None:',
                 f'        return input.{name}(other=other)',
                 f'    return input.{name}(other=other, rounding_mode=rounding_mode)',
@@ -959,8 +966,9 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                 _capture_line(lines, name,
                               ['input'] + [a.python_name for a in args[1:]])
             if scalar_rhs:
+                second = args[1].python_name
                 lines.append('    if not isinstance(input, tensorplay.Tensor):')
-                lines.append('        input = tensorplay.as_tensor(input)')
+                lines.append(f'        input = _as_left_operand(input, {second})')
             lines.append(f'    return input.{name}({", ".join(call_args)})')
             lines.append('')
 

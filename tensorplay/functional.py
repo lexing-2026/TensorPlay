@@ -18,6 +18,13 @@ def _ensure_device(device):
 
 _MISSING = object()
 
+def _as_left_operand(value, other):
+    # A plain-number left operand joins the right operand's device when one
+    # is given, so reflected calls stay on the tensor's device.
+    if isinstance(other, tensorplay.Tensor):
+        return tensorplay.as_tensor(value, device=other.device)
+    return tensorplay.as_tensor(value)
+
 def embedding(weight, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False):
     if _capturing():
         _captured = _capture_call(embedding, (weight, indices, padding_idx, scale_grad_by_freq, sparse), {})
@@ -460,7 +467,7 @@ def sub(input, other, alpha=1):
         if _captured is not None:
             return _captured
     if not isinstance(input, tensorplay.Tensor):
-        input = tensorplay.as_tensor(input)
+        input = _as_left_operand(input, other)
     return input.sub(other=other, alpha=alpha)
 
 def sub_(input, other, alpha=1):
@@ -472,7 +479,7 @@ def mul(input, other):
         if _captured is not None:
             return _captured
     if not isinstance(input, tensorplay.Tensor):
-        input = tensorplay.as_tensor(input)
+        input = _as_left_operand(input, other)
     return input.mul(other=other)
 
 def mul_(input, other):
@@ -484,7 +491,7 @@ def div(input, other, rounding_mode=None):
         if _captured is not None:
             return _captured
     if not isinstance(input, tensorplay.Tensor):
-        input = tensorplay.as_tensor(input)
+        input = _as_left_operand(input, other)
     if rounding_mode is None:
         return input.div(other=other)
     return input.div(other=other, rounding_mode=rounding_mode)
@@ -495,7 +502,7 @@ def divide(input, other, rounding_mode=None):
         if _captured is not None:
             return _captured
     if not isinstance(input, tensorplay.Tensor):
-        input = tensorplay.as_tensor(input)
+        input = _as_left_operand(input, other)
     if rounding_mode is None:
         return input.divide(other=other)
     return input.divide(other=other, rounding_mode=rounding_mode)
@@ -506,7 +513,7 @@ def true_divide(input, other):
         if _captured is not None:
             return _captured
     if not isinstance(input, tensorplay.Tensor):
-        input = tensorplay.as_tensor(input)
+        input = _as_left_operand(input, other)
     return input.true_divide(other=other)
 
 def floor_divide(input, other):
@@ -515,7 +522,7 @@ def floor_divide(input, other):
         if _captured is not None:
             return _captured
     if not isinstance(input, tensorplay.Tensor):
-        input = tensorplay.as_tensor(input)
+        input = _as_left_operand(input, other)
     return input.floor_divide(other=other)
 
 def multiply(input, other):
@@ -524,7 +531,7 @@ def multiply(input, other):
         if _captured is not None:
             return _captured
     if not isinstance(input, tensorplay.Tensor):
-        input = tensorplay.as_tensor(input)
+        input = _as_left_operand(input, other)
     return input.multiply(other=other)
 
 def subtract(input, other, alpha=1):
@@ -533,7 +540,7 @@ def subtract(input, other, alpha=1):
         if _captured is not None:
             return _captured
     if not isinstance(input, tensorplay.Tensor):
-        input = tensorplay.as_tensor(input)
+        input = _as_left_operand(input, other)
     return input.subtract(other=other, alpha=alpha)
 
 def remainder(input, other, *, out=None):
@@ -555,7 +562,7 @@ def fmod(input, other):
         if _captured is not None:
             return _captured
     if not isinstance(input, tensorplay.Tensor):
-        input = tensorplay.as_tensor(input)
+        input = _as_left_operand(input, other)
     return input.fmod(other=other)
 
 def copysign(input, other):
@@ -564,7 +571,7 @@ def copysign(input, other):
         if _captured is not None:
             return _captured
     if not isinstance(input, tensorplay.Tensor):
-        input = tensorplay.as_tensor(input)
+        input = _as_left_operand(input, other)
     return input.copysign(other=other)
 
 def clamp_min(input, min):
@@ -573,7 +580,7 @@ def clamp_min(input, min):
         if _captured is not None:
             return _captured
     if not isinstance(input, tensorplay.Tensor):
-        input = tensorplay.as_tensor(input)
+        input = _as_left_operand(input, min)
     return input.clamp_min(min=min)
 
 def clamp_max(input, max):
@@ -582,7 +589,7 @@ def clamp_max(input, max):
         if _captured is not None:
             return _captured
     if not isinstance(input, tensorplay.Tensor):
-        input = tensorplay.as_tensor(input)
+        input = _as_left_operand(input, max)
     return input.clamp_max(max=max)
 
 def rsub(input, other, alpha=1):
@@ -992,7 +999,7 @@ def div_(input, other, rounding_mode=None):
         if _captured is not None:
             return _captured
     if not isinstance(input, tensorplay.Tensor):
-        input = tensorplay.as_tensor(input)
+        input = _as_left_operand(input, other)
     if rounding_mode is None:
         return input.div_(other=other)
     return input.div_(other=other, rounding_mode=rounding_mode)
@@ -9695,7 +9702,7 @@ def divide_(input, other, rounding_mode=None):
         if _captured is not None:
             return _captured
     if not isinstance(input, tensorplay.Tensor):
-        input = tensorplay.as_tensor(input)
+        input = _as_left_operand(input, other)
     if rounding_mode is None:
         return input.divide_(other=other)
     return input.divide_(other=other, rounding_mode=rounding_mode)
