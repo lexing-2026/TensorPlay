@@ -2540,14 +2540,20 @@ def monitored_barrier(group=None, timeout=None, wait_all_ranks: bool = False):
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 def _get_object_coll_device(group=None) -> str:
-    """Device for object collectives: CPU backends marshal on the CPU."""
-    if group is not None or (
-            _backend != "" and _backend != Backend.NCCL):
-        return "cpu"
+    """Device for object collectives, chosen by the group's backend.
+
+    A device-only backend marshals the pickled bytes through the current
+    device; CPU-capable backends marshal on the CPU (the object already
+    lives in host memory, so no device copy is needed).
+    """
+
     try:
-        return f"cuda:{tp.cuda.current_device()}"
-    except Exception:
-        return "cpu"
+        pg = _resolve_group(group)
+        if pg.backend == Backend.NCCL:
+            return f"cuda:{tp.cuda.current_device()}"
+    except Exception:  # noqa: BLE001 - fall back to the CPU marshal path
+        pass
+    return "cpu"
 
 
 def _object_to_tensor(obj, device, group=None):

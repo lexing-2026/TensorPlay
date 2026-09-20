@@ -241,9 +241,12 @@ assert L(xa.grad) == [float(world)] * 2, f"all_reduce_coalesced bwd {L(xa.grad)}
 ga = tp.full((2,), float(rank + 1), dtype=tp.float32,
              device=dev).requires_grad_(True)
 outg = fc.all_gather_single_coalesced([ga], dist.group.WORLD)[0]
-assert list(outg.shape) == [world, 2], f"all_gather coalesced shape {outg.shape}"
+# leading-axis concatenation: one flat gathered tensor, rank shards are
+# consecutive row blocks
+assert list(outg.shape) == [world * 2], f"all_gather coalesced shape {outg.shape}"
 for r in range(world):
-    assert L(outg[r]) == [float(r + 1)] * 2, f"all_gather_coalesced[{r}] {L(outg[r])}"
+    assert L(outg[r * 2:(r + 1) * 2]) == [float(r + 1)] * 2, \
+        f"all_gather_coalesced[{r}] {L(outg[r * 2:(r + 1) * 2])}"
 outg.sum().backward()
 assert L(ga.grad) == [float(world)] * 2, f"all_gather_coalesced bwd {L(ga.grad)}"
 
