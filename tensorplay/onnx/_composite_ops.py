@@ -1989,6 +1989,37 @@ def _handle_nll_loss(ctx: OpContext) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Export-time shape guards
+# ---------------------------------------------------------------------------
+
+
+def _guard_noop(ctx: OpContext) -> None:
+    """Lower an export-time shape guard to nothing.
+
+    The guards validate dynamic dimension constraints when the exported
+    program runs eagerly; an ONNX model declares those dimensions
+    symbolically instead, so the guards carry no information for export.
+    Their results are never consumed by other nodes.
+    """
+
+
+for _guard_name, _guard_params in (
+    ("_assert_dim_range", "tensor index min max name"),
+    ("_assert_dims_equal", "tensor_a index_a tensor_b index_b name"),
+    (
+        "_assert_dim_relation",
+        "tensor_root index_root tensor_derived index_derived scale offset name",
+    ),
+):
+    register(
+        _guard_name,
+        _guard_params,
+        module="tensorplay.export._trace",
+        methods=False,
+    )(_guard_noop)
+
+
+# ---------------------------------------------------------------------------
 # Indexing
 # ---------------------------------------------------------------------------
 
