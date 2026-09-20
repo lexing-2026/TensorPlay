@@ -39,19 +39,23 @@ void destroy_plan(cufftHandle handle) {
 
 // Every rank goes through cufftPlanMany: null embeds mean unit stride, and
 // routing 1D through the same call avoids the rank-specific cufftPlan1d
-// failure mode observed on some driver / cuFFT 11 combinations.
+// failure mode observed on some driver / cuFFT 11 combinations. The planner
+// reads its layout arrays as 32-bit ints, so the spec's 64-bit fields are
+// materialized first: a bytewise reinterpret would make element 1 of each
+// array land on the high half of element 0 and read as zero.
 cufftHandle make_plan(const PlanSpec& spec) {
+    int n[2] = {static_cast<int>(spec.n[0]), static_cast<int>(spec.n[1])};
+    int inembed[2] = {static_cast<int>(spec.inembed[0]),
+                      static_cast<int>(spec.inembed[1])};
+    int onembed[2] = {static_cast<int>(spec.onembed[0]),
+                      static_cast<int>(spec.onembed[1])};
     cufftHandle plan;
     check_cufft(cufftPlanMany(&plan, spec.rank,
-                              reinterpret_cast<int*>(const_cast<int64_t*>(spec.n.data())),
-                              spec.rank == 1
-                                  ? nullptr
-                                  : reinterpret_cast<int*>(const_cast<int64_t*>(spec.inembed.data())),
+                              n,
+                              spec.rank == 1 ? nullptr : inembed,
                               static_cast<int>(spec.istride),
                               static_cast<int>(spec.idist),
-                              spec.rank == 1
-                                  ? nullptr
-                                  : reinterpret_cast<int*>(const_cast<int64_t*>(spec.onembed.data())),
+                              spec.rank == 1 ? nullptr : onembed,
                               static_cast<int>(spec.ostride),
                               static_cast<int>(spec.odist),
                               static_cast<cufftType>(spec.type),
