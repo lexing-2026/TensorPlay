@@ -783,36 +783,15 @@ elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64" AND (TP_CXX_RVVM1_F
     target_compile_definitions(p10 PUBLIC HAVE_RVV_CPU_DEFINITION)
 endif()
 if(USE_CUDA)
-    # The native aligned flash path consumes only the standalone CUTE/CUTLASS
-    # headers and flash kernels.  It intentionally does not include or link
-    # them into the library; ordinary kernels remain buildable.
-    file(GLOB TP_VENDOR_ROOTS LIST_DIRECTORIES true
-        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/*")
-    foreach(TP_VENDOR_ROOT ${TP_VENDOR_ROOTS})
-        if(EXISTS "${TP_VENDOR_ROOT}/third_party/flash-attention/csrc/flash_attn/src/flash.h" AND
-           EXISTS "${TP_VENDOR_ROOT}/third_party/cutlass/include/cute/tensor.hpp")
-            set(TP_NATIVE_FLASH_SRC
-                "${TP_VENDOR_ROOT}/third_party/flash-attention/csrc/flash_attn/src")
-            set(TP_NATIVE_CUTLASS_INCLUDE
-                "${TP_VENDOR_ROOT}/third_party/cutlass/include")
-            break()
-        endif()
-    endforeach()
-    # Standalone vendoring at third_party/<lib> is preferred; the nested
-    # layout above is only a fallback for older checkouts.
-    if(NOT TP_NATIVE_FLASH_SRC AND
-       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/flash-attention/csrc/flash_attn/src/flash.h" AND
-       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/cutlass/include/cute/tensor.hpp")
-        set(TP_NATIVE_FLASH_SRC
-            "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/flash-attention/csrc/flash_attn/src")
-        set(TP_NATIVE_CUTLASS_INCLUDE
-            "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/cutlass/include")
-    endif()
-    if(EXISTS "${TP_NATIVE_FLASH_SRC}/flash.h" AND
-       EXISTS "${TP_NATIVE_CUTLASS_INCLUDE}/cute/tensor.hpp")
+    # The grouped tensor-op route consumes the CUTE/CUTLASS headers of the
+    # registered third_party/cutlass submodule; the flash kernel sources
+    # are reached through their repo-relative include in
+    # AttentionKernels.cu.  Only the header directory joins the include
+    # path: the flash source tree carries a lowercase utils.h that must
+    # never shadow the core Utils.h on case-insensitive filesystems.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/cutlass/include/cute/tensor.hpp")
         target_include_directories(p10 PRIVATE
-            "${TP_NATIVE_FLASH_SRC}"
-            "${TP_NATIVE_CUTLASS_INCLUDE}")
+            "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/cutlass/include")
     endif()
     # CUDA kernel alignment: allow __device__ lambdas and constexpr libm calls in .cu kernels
     target_compile_options(p10 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda --expt-relaxed-constexpr>)
