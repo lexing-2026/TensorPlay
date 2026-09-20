@@ -2187,11 +2187,9 @@ def _lower_cpu_segmented(
 ) -> _CpuSegmentedLowering | None:
     """Compile the fusible runs of a region the whole-region paths declined.
 
-    The scheduler partitions the region; every pointwise run and every run
-    ending in a reduction becomes one generated kernel, and each remaining
-    operator stays a single call between them.  A store-time epilogue is the
-    one schedule this path cannot wire yet, and a region containing one keeps
-    its existing route rather than losing the fusion the epilogue expresses.
+    The scheduler partitions the region without store-time epilogues; every
+    pointwise run and every run ending in a reduction becomes one generated
+    kernel, and each remaining operator stays a single call between them.
     """
 
     if dynamic:
@@ -2245,10 +2243,16 @@ def _lower_cpu_segmented(
 
     from .scheduler import segment_graph
 
+    # Scheduled without epilogues, like the training path: a single-user
+    # pointwise tail over an eager operator stays its own kernel here
+    # (composing it into the operator's store is a whole-region-path
+    # capability), so a mixed region never loses its kernels to a schedule
+    # this path cannot wire.
     segments = segment_graph(
         graph_module,
         is_pointwise=is_pointwise,
         classify_reduction=classify_reduction,
+        allow_epilogue=False,
     )
     if segments is None:
         return None
