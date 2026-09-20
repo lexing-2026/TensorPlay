@@ -106,7 +106,7 @@ class TestCppCustomOp:
         assert tp.allclose(s, x.sum(1))
 
     def test_type_error_path(self, myext):
-        with pytest.raises(TypeError, match="must be a Tensor"):
+        with pytest.raises(TypeError, match="expected a Tensor"):
             myext.scale_add("not-a-tensor", 1.0)
 
     def test_result_is_tensorplay_tensor(self, myext):
