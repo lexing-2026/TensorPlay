@@ -249,16 +249,19 @@ def math_attention(
         Scores and Values are dtype cast to input query.dtype at the end.
     """
     # broadcast query & key along head dim for GQA
-    G = query.size(1) // key.size(1)
+    # ``.shape`` reads resolve concretely under capture (metadata is part of
+    # the compile signature); the ``.size(i)`` method form stays symbolic and
+    # cannot feed Python arithmetic or unpacking.
+    G = query.shape[1] // key.shape[1]
     value = tensorplay.repeat_interleave(value, G, dim=1)
     key = tensorplay.repeat_interleave(key, G, dim=1)
 
-    Bq, Bkv = query.size(0), key.size(0)
+    Bq, Bkv = query.shape[0], key.shape[0]
     if not ((Bq == Bkv) or (Bq > 1 and Bkv == 1)):
         raise RuntimeError(f"Bq and Bkv must broadcast. Got Bq={Bq} and Bkv={Bkv}")
 
-    key = key.expand((Bq, *key.size()[1:]))
-    value = value.expand((Bq, *value.size()[1:]))
+    key = key.expand((Bq, *key.shape[1:]))
+    value = value.expand((Bq, *value.shape[1:]))
 
     _, post_mod_scores = _math_attention_inner(
         query,
@@ -1065,14 +1068,14 @@ def sdpa_dense_backward(
         score_mod_other_buffers, joint_graph
     )
 
-    Bq, Bkv = query.size(0), key.size(0)
+    Bq, Bkv = query.shape[0], key.shape[0]
     if not ((Bq == Bkv) or (Bq > 1 and Bkv == 1)):
         raise RuntimeError(f"Bq and Bkv must broadcast. Got Bq={Bq} and Bkv={Bkv}")
 
-    key = key.expand((Bq, *key.size()[1:]))
-    value = value.expand((Bq, *value.size()[1:]))
+    key = key.expand((Bq, *key.shape[1:]))
+    value = value.expand((Bq, *value.shape[1:]))
 
-    G = query.size(1) // key.size(1)
+    G = query.shape[1] // key.shape[1]
     key = tensorplay.repeat_interleave(key, G, dim=1)
     value = tensorplay.repeat_interleave(value, G, dim=1)
 

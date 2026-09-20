@@ -1092,11 +1092,13 @@ __all__.extend(
 from tensorplay import functional as functional
 from tensorplay.functional import *
 
-# Underscore sampling ops are skipped by the star-import above; expose them
-# explicitly so tensorplay._standard_gamma / _sample_dirichlet resolve.
+# Underscore ops are skipped by the star-import above; expose them
+# explicitly so tensorplay._standard_gamma / _sample_dirichlet /
+# _safe_softmax resolve.
 from tensorplay.functional import (
     _standard_gamma as _standard_gamma,
     _sample_dirichlet as _sample_dirichlet,
+    _safe_softmax as _safe_softmax,
 )
 
 # Keep package-level dtype aliases and composite signatures after importing
