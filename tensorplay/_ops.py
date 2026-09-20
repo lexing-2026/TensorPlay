@@ -126,6 +126,9 @@ class OpOverload:
         self._opname = schema.name
         self._key = key
         self._tags = tags
+        self.__name__ = f"{schema.name}.{self._overloadname}"
+        self.__qualname__ = self.__name__
+        self.__module__ = f"tensorplay.ops.{schema.namespace}"
 
     def __call__(self, /, *args: Any, **kwargs: Any) -> Any:
         return _C._call_overload(self._key, args, kwargs)
