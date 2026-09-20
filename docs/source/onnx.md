@@ -7,7 +7,6 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay.onnx.ExportedProgram
     tensorplay.onnx.GraphBuilder
     tensorplay.onnx.OnnxExporterError
     tensorplay.onnx.OnnxExporterWarning
