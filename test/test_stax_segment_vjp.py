@@ -818,3 +818,43 @@ def test_get_attr_segment_trains_through_function_tail(monkeypatch):
     assert tp.abs(xc.grad - xr.grad).max().item() < 1e-5
     assert scale.grad is not None
     assert tp.abs(scale.grad - sr.grad).max().item() < 1e-5
+
+
+def test_extern_epilogue_composes_chain_after_operator(monkeypatch):
+    """The pointwise tail an extern segment carries replays as a tuned
+    pointwise launch over the operator's eager output (inference)."""
+
+    from types import SimpleNamespace
+
+    launches = {}
+
+    def fwd0ep(y):
+        return (y.relu() + 1.0).sigmoid()
+
+    launches["fwd0ep"] = fwd0ep
+    _fake_runtime(monkeypatch, launches)
+
+    w = tp.randn(6, 5)
+
+    def fn(t):
+        return ((t @ w).relu() + 1.0).sigmoid()
+
+    x = tp.randn(4, 6)
+    gm = Tracer(execute=True).trace(fn, sample_inputs={"t": x})
+    for node in gm.graph.nodes:
+        if node.op in {"call_function", "call_method"}:
+            node.meta["tensor_meta"] = SimpleNamespace(
+                shape=(4, 5), dtype=tp.float32
+            )
+    compiled = st.compile_graph_module(gm, [x])
+    assert compiled is not None
+    assert compiled._tensorplay_codegen == "triton"
+    segments = gm.meta["stax_segments"]
+    assert [seg["kind"] for seg in segments] == ["extern"]
+    assert [seg["epilogue"] for seg in segments] == [
+        ["relu", "add", "sigmoid"]
+    ]
+
+    out = compiled(x)
+    expected = fn(x)
+    assert tp.abs(out - expected).max().item() < 1e-6

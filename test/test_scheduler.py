@@ -39,6 +39,13 @@ def _segments(fn, *args, **kwargs):
                              **kwargs)
 
 
+def _name(node) -> str:
+    """Target spelling shared by call_function and call_method nodes."""
+
+    target = node.target
+    return getattr(target, "__name__", str(target))
+
+
 def test_pointwise_run_is_one_segment():
     x = tp.tensor([1.0, -2.0])
     gm, segs = _segments(lambda t: ((t * 2.0).relu() + 1.0).sigmoid(), x)
@@ -115,7 +122,9 @@ def test_mixed_graph_interleaves_fused_and_eager():
     x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
     _, segs = _segments(lambda t: t.softmax(dim=1).exp() + 1.0, x)
     assert segs is not None
-    assert describe(segs) == "extern -> pw"
+    # the eager operator carries the single-user pointwise tail itself
+    # (store-time epilogue); no separate pw kernel follows
+    assert describe(segs) == "extern+ep"
 
 
 def test_interior_value_across_barrier_gains_extra_export():
@@ -386,3 +395,90 @@ def test_min_dim_is_pair_amax_is_not():
     _, segs2 = _segments(lambda t: t.amax(dim=1), x)
     assert segs2 is not None
     assert not segs2[0].reduction.is_pair
+
+
+# --- extern store-time epilogue (M5e) ------------------------------------------
+
+
+def test_extern_pointwise_tail_attaches_as_epilogue():
+    """A single-user pointwise chain over the operator output folds into
+    the extern segment; the chain tail is the segment's only export."""
+
+    w = tp.randn(4, 6)
+    _, segs = _segments(lambda t: ((t @ w).relu() + 1.0).sigmoid(), tp.randn(3, 4))
+    assert segs is not None and len(segs) == 1
+    assert segs[0].kind == "extern"
+    assert describe(segs) == "extern+ep"
+    assert [_name(n) for n in segs[0].epilogue] == [
+        "relu", "add", "sigmoid",
+    ]
+    assert segs[0].exports == (segs[0].epilogue[-1],)
+
+
+def test_extern_epilogue_requires_single_user_chain():
+    """A second consumer of the raw operator output blocks the attach: the
+    whole chain keeps its own pw segment so every reader stays wired."""
+
+    w = tp.randn(4, 6)
+
+    def fn(t):
+        y = t @ w
+        return y.relu() + y
+
+    _, segs = _segments(fn, tp.randn(3, 4))
+    assert segs is not None and [seg.kind for seg in segs] == ["extern", "pw"]
+    assert segs[0].epilogue == ()
+    assert segs[0].exports == (segs[0].nodes[-1],)
+
+
+def test_extern_epilogue_stops_at_sibling_reader():
+    """The chain continues while each value feeds exactly one node; a
+    branching reader ends the fold at the last linear value."""
+
+    w = tp.randn(4, 6)
+
+    def fn(t):
+        y = (t @ w).relu()
+        return y * 2.0 + y * 3.0
+
+    _, segs = _segments(fn, tp.randn(3, 4))
+    assert segs is not None and [seg.kind for seg in segs] == [
+        "extern", "pw",
+    ]
+    assert [_name(n) for n in segs[0].epilogue] == ["relu"]
+    # the branching tail reads the folded chain through the export
+    assert segs[0].exports == (segs[0].epilogue[-1],)
+
+
+def test_extern_epilogue_needs_only_tensor_input():
+    """A chain node reading a placeholder as well cannot fold (the fused
+    tile would need a second input); it starts a regular pw run."""
+
+    w = tp.randn(4, 6)
+    x = tp.randn(3, 4)
+    z = tp.randn(3, 6)
+    _, segs = _segments(lambda t, u: (t @ w).relu() + u, x, z)
+    assert segs is not None and [seg.kind for seg in segs] == [
+        "extern", "pw",
+    ]
+    assert [str(n.target) for n in segs[0].epilogue] == ["relu"]
+
+
+def test_training_schedule_carries_no_extern_epilogue():
+    w = tp.randn(4, 6)
+    _, segs = _segments(
+        lambda t: (t @ w).relu(),
+        tp.randn(3, 4),
+        allow_epilogue=False,
+    )
+    assert segs is not None and describe(segs) == "extern -> pw"
+
+
+def test_extern_epilogue_feeds_following_segment():
+    """The folded chain's export wires into a later reduction segment."""
+
+    w = tp.randn(4, 6)
+    _, segs = _segments(lambda t: ((t @ w).relu()).sum(dim=1), tp.randn(3, 4))
+    assert segs is not None
+    assert describe(segs) == "extern+ep -> pw+red"
+    assert segs[1].producer is segs[0].epilogue[-1]

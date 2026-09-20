@@ -1785,6 +1785,29 @@ class TritonProgramCodegen:
         return source
 
 
+def emit_tile_epilogue_lines(
+    program: list[int], constants: list[float], esrc: int, source_reg: str
+) -> tuple[list[str], str]:
+    """Emit a pointwise chain applied to one tile register.
+
+    The store-time epilogue renderer shared by reduction tails and the GEMM
+    tile: ``esrc`` names the chain's single tensor input (mapped onto
+    ``source_reg``, the register already holding the pre-epilogue value);
+    negatives index epilogue constants; other positive refs are temporaries
+    numbered from 1.  Returns the source lines and the final register
+    holding the chain result.
+    """
+
+    if len(program) % 3:
+        raise ValueError("epilogue program must contain triples")
+    # The instance only carries the payload the shared instruction renderer
+    # reads (``_epilogue_lines`` touches nothing else); no kernel is
+    # generated from it.
+    emitter = object.__new__(TritonProgramCodegen)
+    emitter.epilogue = (program, constants, esrc)
+    return emitter._epilogue_lines(source_reg)
+
+
 def _compile_program(
     program: list[int],
     constants: list[float],
@@ -2795,6 +2818,8 @@ def _extern_segment_plan(
     max_autotune: bool = False,
     training: bool = False,
     attr_position: int | None = None,
+    role: str = "fwd?",
+    coordinate_descent_tuning: bool = False,
 ) -> _ExternPlan | None:
     """Build the eager executor for one extern segment; None when unsupported.
 
@@ -2808,11 +2833,82 @@ def _extern_segment_plan(
     it among the region's attributes) so the sweep routes its gradient back
     to the leaf — the identity tangent rule, since the segment is a pure
     pass-through of the attribute value.
+
+    A pointwise chain the scheduler attached as the segment's store-time
+    epilogue runs on the operator output: composed as its own tuned
+    pointwise kernel after the eager call, and — for a qualifying matmul
+    under ``max_autotune`` — baked into the benched GEMM tile instead.
     """
 
     import tensorplay as _tp
 
     node = seg.nodes[0]
+
+    epilogue_payload = None
+    epi_output_ref = None
+    if seg.epilogue:
+        # Inference only: training schedules carry no store-time epilogues.
+        if training:
+            return None
+        epi_view, epi_mapping, epi_externals = _extract_segment_view(
+            graph_module.graph, list(seg.epilogue), seg.epilogue[-1]
+        )
+        # v1 epilogue contract: the ONLY tensor input is the operator
+        # output; everything else is a scalar constant (guaranteed by the
+        # scheduler's single-user attach — re-checked here).
+        if len(epi_externals) != 1 or node not in epi_externals:
+            return None
+        built_epi = _build_pointwise_program(
+            epi_view, output_override=epi_mapping[seg.epilogue[-1]]
+        )
+        if built_epi is None:
+            return None
+        _, eprogram, econstants, _, epi_output_ref = built_epi
+        esrc = next(
+            index
+            for index, placeholder in enumerate(epi_view.graph.placeholders)
+            if placeholder.name == node.name
+        )
+        epilogue_payload = (eprogram, econstants, esrc)
+
+    def _epilogue_compose(base_launch, out_shape, out_dtype):
+        """Wrap ``base_launch`` with the chain as its own pointwise kernel.
+
+        Returns ``(composed_launch, chain_launch)``; both ``None`` when the
+        chain leaves the operator's shape or dtype — the plan's example
+        feed and the fused tile store assume both.
+        """
+
+        epi_meta = seg.epilogue[-1].meta.get("tensor_meta")
+        if (
+            epi_meta is None
+            or tuple(int(dim) for dim in getattr(epi_meta, "shape", ()))
+            != out_shape
+            or getattr(epi_meta, "dtype", None) != out_dtype
+        ):
+            return None, None
+        eprogram, econstants, _ = epilogue_payload
+        epi_example = _tp.empty(
+            out_shape, dtype=out_dtype, device=sample_device
+        )
+        chain_launch = _autotune_launch(
+            f"{role}ep",
+            eprogram,
+            econstants,
+            (epi_output_ref,),
+            [epi_example],
+            input_shapes=(out_shape,),
+            reference_shape=out_shape,
+            bucket_numel=_prod(out_shape),
+            max_autotune=max_autotune,
+            coordinate_descent_tuning=coordinate_descent_tuning,
+        )
+
+        def composed(feed, _base=base_launch, _chain=chain_launch):
+            return _chain([_base(feed)])
+
+        return composed, chain_launch
+
     if node.op == "get_attr":
         value = graph_module._get_attr(node.target)
         if training:
@@ -2838,8 +2934,16 @@ def _extern_segment_plan(
                     lambda feed_and_tangent: (feed_and_tangent[-1],)
                 ),
             )
+        attr_launch = lambda feed: value  # noqa: E731
+        if epilogue_payload is not None:
+            composed, _ = _epilogue_compose(
+                attr_launch, tuple(int(dim) for dim in value.shape), value.dtype
+            )
+            if composed is None:
+                return None
+            attr_launch = composed
         return _ExternPlan(
-            launch=lambda feed: value,
+            launch=attr_launch,
             extern_sources=sources,
             example=value,
             output_shape=tuple(int(dim) for dim in value.shape),
@@ -2916,6 +3020,15 @@ def _extern_segment_plan(
         vjp = _build_extern_engine_vjp(node, resolve, position_of)
 
     output_shape = tuple(int(dim) for dim in shape)
+    bare_launch = launch
+    epi_launch = None
+    if epilogue_payload is not None:
+        composed, epi_launch = _epilogue_compose(
+            bare_launch, output_shape, dtype
+        )
+        if composed is None:
+            return None
+        launch = composed
     if max_autotune and not training and sample_feed is not None:
         from .triton_gemm import tuned_matmul_launch
 
@@ -2942,7 +3055,12 @@ def _extern_segment_plan(
         ):
             try:
                 tuned = tuned_matmul_launch(
-                    launch, sample_feed, operand_specs, output_shape
+                    bare_launch,
+                    sample_feed,
+                    operand_specs,
+                    output_shape,
+                    epilogue=epilogue_payload,
+                    epilogue_launch=epi_launch,
                 )
             except Exception:  # noqa: BLE001 - tuning is an optimization only
                 tuned = None
@@ -3441,6 +3559,8 @@ def compile_graph_module(
                 max_autotune=max_autotune,
                 training=any_grad,
                 attr_position=attr_position,
+                role=f"fwd{seg_index}",
+                coordinate_descent_tuning=coordinate_descent_tuning,
             )
             if extern_plan is None:
                 scheduler_annotate(graph_module, segments)
