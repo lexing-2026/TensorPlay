@@ -13,36 +13,13 @@ import os
 import sys
 import unittest
 
-import numpy as np
 import torch
 import torch.nn.functional as torch_F
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tensorplay as tp
 import tensorplay.nn.functional as F
-
-
-def _np(t):
-    return t.detach().cpu().numpy()
-
-
-def _assert_close(case, tp_t, torch_t, rtol=1e-5, atol=1e-6, msg=""):
-    np.testing.assert_allclose(_np(tp_t), _np(torch_t), rtol=rtol, atol=atol,
-                               err_msg=msg)
-
-
-def _devices():
-    devs = ["cpu"]
-    if tp.cuda.is_available():
-        devs.append("cuda")
-    return devs
-
-
-def _tp_tensor(torch_t, device, requires_grad=False):
-    t = tp.tensor(torch_t.detach().numpy(), device=device)
-    if requires_grad:
-        t = t.requires_grad_(True)
-    return t
+from tensorplay.testing._internal.reference import assert_reference_close, from_reference, reference_devices
 
 
 def _reduction_enum(reduction):
@@ -59,14 +36,14 @@ class TestSmoothL1Forward(unittest.TestCase):
         input_t.view(-1)[::11] = target_t.view(-1)[::11] - beta
         ref = torch_F.smooth_l1_loss(input_t, target_t, reduction=reduction,
                                      beta=beta)
-        got = F.smooth_l1_loss(_tp_tensor(input_t, dev),
-                               _tp_tensor(target_t, dev),
+        got = F.smooth_l1_loss(from_reference(input_t, dev),
+                               from_reference(target_t, dev),
                                reduction=reduction, beta=beta)
-        _assert_close(self, got, ref,
+        assert_reference_close(got, ref,
                       msg=f"smooth_l1 shape={shape} red={reduction} beta={beta} ({dev})")
 
     def test_configs(self):
-        for dev in _devices():
+        for dev in reference_devices():
             for reduction in ("none", "mean", "sum"):
                 for beta in (0.5, 1.0, 2.0):
                     for shape in ((16,), (4, 5), (2, 3, 4)):
@@ -82,21 +59,21 @@ class TestHuberForward(unittest.TestCase):
         input_t.view(-1)[::11] = target_t.view(-1)[::11] - delta
         ref = torch_F.huber_loss(input_t, target_t, reduction=reduction,
                                  delta=delta)
-        got = F.huber_loss(_tp_tensor(input_t, dev), _tp_tensor(target_t, dev),
+        got = F.huber_loss(from_reference(input_t, dev), from_reference(target_t, dev),
                            reduction=reduction, delta=delta)
-        _assert_close(self, got, ref,
+        assert_reference_close(got, ref,
                       msg=f"huber shape={shape} red={reduction} delta={delta} ({dev})")
 
     def test_configs(self):
-        for dev in _devices():
+        for dev in reference_devices():
             for reduction in ("none", "mean", "sum"):
                 for delta in (0.5, 1.0, 2.0):
                     for shape in ((16,), (4, 5), (2, 3, 4)):
                         self._run(shape, reduction, delta, dev, 7)
 
     def test_validation(self):
-        x = _tp_tensor(torch.randn(4), "cpu")
-        t = _tp_tensor(torch.randn(4), "cpu")
+        x = from_reference(torch.randn(4), "cpu")
+        t = from_reference(torch.randn(4), "cpu")
         with self.assertRaises((ValueError, RuntimeError)):
             F.huber_loss(x, t, delta=0.0)
         with self.assertRaises((ValueError, RuntimeError)):
@@ -114,13 +91,13 @@ class TestBackwardNative(unittest.TestCase):
         grad_t = torch.rand(*shape) if reduction == "none" else torch.rand(1).sum()
         ref = aten_fn(grad_t, input_t, target_t, _reduction_enum(reduction), thresh)
         got = getattr(_C, tp_fn_name)(
-            _tp_tensor(grad_t, dev), _tp_tensor(input_t, dev),
-            _tp_tensor(target_t, dev), _reduction_enum(reduction), thresh)
-        _assert_close(self, got, ref,
+            from_reference(grad_t, dev), from_reference(input_t, dev),
+            from_reference(target_t, dev), _reduction_enum(reduction), thresh)
+        assert_reference_close(got, ref,
                       msg=f"{tp_fn_name} shape={shape} red={reduction} thr={thresh} ({dev})")
 
     def test_configs(self):
-        for dev in _devices():
+        for dev in reference_devices():
             for reduction in ("none", "mean", "sum"):
                 for thresh in (0.5, 1.0, 2.0):
                     for shape in ((16,), (4, 5), (2, 3, 4)):
@@ -146,17 +123,17 @@ class TestAutograd(unittest.TestCase):
             g_t = torch.tensor(1.0)
             (ref_grad,) = torch.autograd.grad(ref_out, ref_in)
 
-        x = _tp_tensor(input_t, dev, requires_grad=True)
-        out = fn_tp(x, _tp_tensor(target_t, dev), reduction=reduction,
+        x = from_reference(input_t, dev, requires_grad=True)
+        out = fn_tp(x, from_reference(target_t, dev), reduction=reduction,
                     **{kw: thresh})
-        out.backward(_tp_tensor(g_t, dev))
+        out.backward(from_reference(g_t, dev))
 
         tag = f"{fn_t.__name__} shape={shape} red={reduction} {kw}={thresh} ({dev})"
-        _assert_close(self, out, ref_out, msg=f"fwd {tag}")
-        _assert_close(self, x.grad, ref_grad, msg=f"grad {tag}")
+        assert_reference_close(out, ref_out, msg=f"fwd {tag}")
+        assert_reference_close(x.grad, ref_grad, msg=f"grad {tag}")
 
     def test_configs(self):
-        for dev in _devices():
+        for dev in reference_devices():
             for reduction in ("none", "mean", "sum"):
                 for thresh in (0.5, 1.0, 2.0):
                     for shape in ((16,), (4, 5)):
@@ -170,7 +147,7 @@ class TestAutograd(unittest.TestCase):
 
 class TestModules(unittest.TestCase):
     def test_modules(self):
-        for dev in _devices():
+        for dev in reference_devices():
             torch.manual_seed(31)
             input_t = torch.randn(4, 6)
             target_t = torch.randn(4, 6)
@@ -190,13 +167,13 @@ class TestModules(unittest.TestCase):
                         (ref_grad,) = torch.autograd.grad(ref_out, ref_in)
 
                     mod = mod_tp_cls(reduction=reduction, **{kw: thr})
-                    x = _tp_tensor(input_t, dev, requires_grad=True)
-                    out = mod(x, _tp_tensor(target_t, dev))
-                    out.backward(_tp_tensor(g_t, dev))
+                    x = from_reference(input_t, dev, requires_grad=True)
+                    out = mod(x, from_reference(target_t, dev))
+                    out.backward(from_reference(g_t, dev))
                     name = mod_t_cls.__name__
                     tag = f"{name} red={reduction} {kw}={thr} ({dev})"
-                    _assert_close(self, out, ref_out, msg=f"fwd {tag}")
-                    _assert_close(self, x.grad, ref_grad, msg=f"grad {tag}")
+                    assert_reference_close(out, ref_out, msg=f"fwd {tag}")
+                    assert_reference_close(x.grad, ref_grad, msg=f"grad {tag}")
 
 
 if __name__ == "__main__":

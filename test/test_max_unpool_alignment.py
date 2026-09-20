@@ -16,30 +16,8 @@ import torch.nn.functional as torch_F
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tensorplay as tp
 import tensorplay.nn.functional as F
-from tensorplay import Tensor
 
-
-def _np(t):
-    return t.detach().cpu().numpy()
-
-
-def _assert_close(case, tp_t, torch_t, rtol=1e-5, atol=1e-6, msg=""):
-    np.testing.assert_allclose(_np(tp_t), _np(torch_t), rtol=rtol, atol=atol,
-                               err_msg=msg)
-
-
-def _devices():
-    devs = ["cpu"]
-    if tp.cuda.is_available():
-        devs.append("cuda")
-    return devs
-
-
-def _tp_tensor(torch_t, device, requires_grad=False):
-    t = tp.tensor(torch_t.detach().numpy(), device=device)
-    if requires_grad:
-        t = t.requires_grad_(True)
-    return t
+from tensorplay.testing._internal.reference import assert_reference_close, from_reference, reference_devices, to_numpy
 
 
 class TestMaxUnpool2d(unittest.TestCase):
@@ -59,23 +37,23 @@ class TestMaxUnpool2d(unittest.TestCase):
         g_t = torch.randn_like(ref_unpool)
         ref_unpool.backward(g_t)
 
-        x = _tp_tensor(input_t, dev, requires_grad=True)
+        x = from_reference(input_t, dev, requires_grad=True)
         pool, idx = F.max_pool2d(
             x, kernel_size, stride=stride, padding=padding, return_indices=True)
         unpool = F.max_unpool2d(
             pool, idx, kernel_size, stride=stride, padding=padding,
             output_size=out_size)
-        unpool.backward(_tp_tensor(g_t, dev))
+        unpool.backward(from_reference(g_t, dev))
 
         tag = f"shape={shape} k={kernel_size} s={stride} p={padding} ({dev})"
-        _assert_close(self, pool, ref_pool, msg=f"pool values {tag}")
-        np.testing.assert_array_equal(_np(idx), _np(ref_idx),
+        assert_reference_close(pool, ref_pool, msg=f"pool values {tag}")
+        np.testing.assert_array_equal(to_numpy(idx), to_numpy(ref_idx),
                                       err_msg=f"pool indices {tag}")
-        _assert_close(self, unpool, ref_unpool, msg=f"unpool values {tag}")
-        _assert_close(self, x.grad, input_ref.grad, msg=f"unpool grad {tag}")
+        assert_reference_close(unpool, ref_unpool, msg=f"unpool values {tag}")
+        assert_reference_close(x.grad, input_ref.grad, msg=f"unpool grad {tag}")
 
     def test_configs(self):
-        for dev in _devices():
+        for dev in reference_devices():
             self._run((2, 3, 8, 8), 2, None, 0, dev, 0)
             self._run((2, 3, 9, 7), 2, 2, 0, dev, 1)
             self._run((1, 4, 10, 10), 3, 2, 1, dev, 2)
@@ -86,32 +64,32 @@ class TestMaxUnpool2d(unittest.TestCase):
         from tensorplay import _C
         torch.manual_seed(5)
         input_t = torch.randn(2, 3, 8, 8)
-        for dev in _devices():
+        for dev in reference_devices():
             pool_t, idx_t = torch_F.max_pool2d(input_t, 2, return_indices=True)
-            x = _tp_tensor(pool_t, dev)
-            ix = _tp_tensor(idx_t, dev)
+            x = from_reference(pool_t, dev)
+            ix = from_reference(idx_t, dev)
             out = _C.max_unpool2d(x, ix, [8, 8])
             ref = torch._C._nn.max_unpool2d(pool_t, idx_t, [8, 8])
-            _assert_close(self, out, ref, msg=f"native max_unpool2d fwd ({dev})")
+            assert_reference_close(out, ref, msg=f"native max_unpool2d fwd ({dev})")
 
             g_t = torch.randn_like(ref)
-            gi = _C.max_unpool2d_backward(_tp_tensor(g_t, dev), ix, [8, 8])
+            gi = _C.max_unpool2d_backward(from_reference(g_t, dev), ix, [8, 8])
             pool_ref = pool_t.clone().requires_grad_(True)
             torch._C._nn.max_unpool2d(pool_ref, idx_t, [8, 8]).backward(g_t)
-            _assert_close(self, gi, pool_ref.grad, msg=f"native max_unpool2d bwd ({dev})")
+            assert_reference_close(gi, pool_ref.grad, msg=f"native max_unpool2d bwd ({dev})")
 
     def test_round_trip(self):
         # unpool(pool(x)) places each window max back at its argmax position;
         # every pooled value must survive the round trip at its index.
         torch.manual_seed(6)
         input_t = torch.randn(2, 2, 7, 9)
-        for dev in _devices():
+        for dev in reference_devices():
             pool_t, idx_t = torch_F.max_pool2d(input_t, 2, return_indices=True)
-            out = F.max_unpool2d(_tp_tensor(pool_t, dev), _tp_tensor(idx_t, dev), 2,
+            out = F.max_unpool2d(from_reference(pool_t, dev), from_reference(idx_t, dev), 2,
                                  output_size=list(input_t.shape[-2:]))
             ref = torch_F.max_unpool2d(pool_t, idx_t, 2,
                                        output_size=list(input_t.shape[-2:]))
-            _assert_close(self, out, ref, msg=f"round trip values ({dev})")
+            assert_reference_close(out, ref, msg=f"round trip values ({dev})")
             flat_in = input_t.reshape(-1)
             for b in range(2):
                 for c in range(2):
@@ -126,21 +104,21 @@ class TestMaxUnpool2d(unittest.TestCase):
     def test_module_smoke(self):
         torch.manual_seed(7)
         input_t = torch.randn(2, 2, 8, 8)
-        for dev in _devices():
+        for dev in reference_devices():
             pool = tp.nn.MaxPool2d(2, return_indices=True)
             unpool = tp.nn.MaxUnpool2d(2)
-            x = _tp_tensor(input_t, dev, requires_grad=True)
+            x = from_reference(input_t, dev, requires_grad=True)
             pooled, idx = pool(x)
             out = unpool(pooled, idx)
             self.assertEqual(tuple(out.shape), (2, 2, 8, 8))
-            out.backward(_tp_tensor(torch.randn(2, 2, 8, 8), dev))
+            out.backward(from_reference(torch.randn(2, 2, 8, 8), dev))
             self.assertIsNotNone(x.grad)
             self.assertEqual(tuple(x.grad.shape), tuple(input_t.shape))
 
 
 class TestMaxUnpool1d(unittest.TestCase):
     def test_configs(self):
-        for dev in _devices():
+        for dev in reference_devices():
             for shape, k, stride, padding, seed in [
                     ((2, 3, 10), 2, None, 0, 20),
                     ((2, 2, 11), 3, 2, 1, 21),
@@ -159,17 +137,17 @@ class TestMaxUnpool1d(unittest.TestCase):
                 g_t = torch.randn_like(ref_unpool)
                 ref_unpool.backward(g_t)
 
-                x = _tp_tensor(input_t, dev, requires_grad=True)
+                x = from_reference(input_t, dev, requires_grad=True)
                 pool, idx = F.max_pool1d(
                     x, k, stride=stride, padding=padding, return_indices=True)
                 unpool = F.max_unpool1d(
                     pool, idx, k, stride=stride, padding=padding,
                     output_size=out_size)
-                unpool.backward(_tp_tensor(g_t, dev))
+                unpool.backward(from_reference(g_t, dev))
 
                 tag = f"shape={shape} k={k} s={stride} p={padding} ({dev})"
-                _assert_close(self, unpool, ref_unpool, msg=f"unpool1d values {tag}")
-                _assert_close(self, x.grad, input_ref.grad, msg=f"unpool1d grad {tag}")
+                assert_reference_close(unpool, ref_unpool, msg=f"unpool1d values {tag}")
+                assert_reference_close(x.grad, input_ref.grad, msg=f"unpool1d grad {tag}")
 
 
 class TestMaxUnpool3d(unittest.TestCase):
@@ -188,23 +166,23 @@ class TestMaxUnpool3d(unittest.TestCase):
         g_t = torch.randn_like(ref_unpool)
         ref_unpool.backward(g_t)
 
-        x = _tp_tensor(input_t, dev, requires_grad=True)
+        x = from_reference(input_t, dev, requires_grad=True)
         pool, idx = F.max_pool3d(
             x, kernel_size, stride=stride, padding=padding, return_indices=True)
         unpool = F.max_unpool3d(
             pool, idx, kernel_size, stride=stride, padding=padding,
             output_size=out_size)
-        unpool.backward(_tp_tensor(g_t, dev))
+        unpool.backward(from_reference(g_t, dev))
 
         tag = f"shape={shape} k={kernel_size} s={stride} p={padding} ({dev})"
-        _assert_close(self, pool, ref_pool, msg=f"pool values {tag}")
-        np.testing.assert_array_equal(_np(idx), _np(ref_idx),
+        assert_reference_close(pool, ref_pool, msg=f"pool values {tag}")
+        np.testing.assert_array_equal(to_numpy(idx), to_numpy(ref_idx),
                                       err_msg=f"pool indices {tag}")
-        _assert_close(self, unpool, ref_unpool, msg=f"unpool values {tag}")
-        _assert_close(self, x.grad, input_ref.grad, msg=f"unpool grad {tag}")
+        assert_reference_close(unpool, ref_unpool, msg=f"unpool values {tag}")
+        assert_reference_close(x.grad, input_ref.grad, msg=f"unpool grad {tag}")
 
     def test_configs(self):
-        for dev in _devices():
+        for dev in reference_devices():
             self._run((2, 2, 6, 6, 6), 2, None, 0, dev, 10)
             self._run((1, 3, 7, 5, 5), 2, 2, 0, dev, 11)
             self._run((2, 6, 6, 6), 2, None, 0, dev, 12)        # unbatched
@@ -214,33 +192,33 @@ class TestMaxUnpool3d(unittest.TestCase):
         from tensorplay import _C
         torch.manual_seed(14)
         input_t = torch.randn(2, 2, 4, 6, 6)
-        for dev in _devices():
+        for dev in reference_devices():
             pool_t, idx_t = torch_F.max_pool3d(input_t, 2, return_indices=True)
-            x = _tp_tensor(pool_t, dev)
-            ix = _tp_tensor(idx_t, dev)
+            x = from_reference(pool_t, dev)
+            ix = from_reference(idx_t, dev)
             out = _C.max_unpool3d(x, ix, [4, 6, 6], [2, 2, 2], [0, 0, 0])
             ref = torch._C._nn.max_unpool3d(
                 pool_t, idx_t, [4, 6, 6], [2, 2, 2], [0, 0, 0])
-            _assert_close(self, out, ref, msg=f"native max_unpool3d fwd ({dev})")
+            assert_reference_close(out, ref, msg=f"native max_unpool3d fwd ({dev})")
 
             g_t = torch.randn_like(ref)
-            gi = _C.max_unpool3d_backward(_tp_tensor(g_t, dev), ix, [4, 6, 6])
+            gi = _C.max_unpool3d_backward(from_reference(g_t, dev), ix, [4, 6, 6])
             pool_ref = pool_t.clone().requires_grad_(True)
             torch._C._nn.max_unpool3d(
                 pool_ref, idx_t, [4, 6, 6], [2, 2, 2], [0, 0, 0]).backward(g_t)
-            _assert_close(self, gi, pool_ref.grad, msg=f"native max_unpool3d bwd ({dev})")
+            assert_reference_close(gi, pool_ref.grad, msg=f"native max_unpool3d bwd ({dev})")
 
     def test_module_smoke(self):
         torch.manual_seed(15)
         input_t = torch.randn(1, 2, 4, 4, 4)
-        for dev in _devices():
+        for dev in reference_devices():
             pool = tp.nn.MaxPool3d(2, return_indices=True)
             unpool = tp.nn.MaxUnpool3d(2)
-            x = _tp_tensor(input_t, dev, requires_grad=True)
+            x = from_reference(input_t, dev, requires_grad=True)
             pooled, idx = pool(x)
             out = unpool(pooled, idx)
             self.assertEqual(tuple(out.shape), (1, 2, 4, 4, 4))
-            out.backward(_tp_tensor(torch.randn(1, 2, 4, 4, 4), dev))
+            out.backward(from_reference(torch.randn(1, 2, 4, 4, 4), dev))
             self.assertIsNotNone(x.grad)
             self.assertEqual(tuple(x.grad.shape), tuple(input_t.shape))
 
