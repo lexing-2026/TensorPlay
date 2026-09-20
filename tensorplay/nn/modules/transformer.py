@@ -48,7 +48,7 @@ def _generate_square_subsequent_mask(
 
 
 def _get_seq_len(src: Tensor, batch_first: bool) -> int | None:
-    if getattr(src, "is_nested", False):
+    if getattr(src, "is_nested", lambda: False)():
         return None
     else:
         src_size = src.size()
