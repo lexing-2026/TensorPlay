@@ -7,6 +7,7 @@
 #include "TypePromotion.h"
 #include "OneDNNContext.h"
 #include "Allocator.h"
+#include "OutWrite.h"
 #include "Parallel.h"
 #include "cpu/VecUnary.h"
 #include "cpu/ComplexUnary.h"
@@ -42,7 +43,6 @@ DEFINE_DISPATCH(silu_f64_stub);
 
 #ifdef _OPENMP
 #include <omp.h>
-#include "OutWrite.h"
 #endif
 
 namespace tensorplay {

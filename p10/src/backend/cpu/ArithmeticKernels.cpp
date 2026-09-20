@@ -14,6 +14,7 @@
 #include "OneDNNContext.h"
 #include "Allocator.h"
 #include "GradMode.h"
+#include "OutWrite.h"
 #include "cpu/VecComplex.h"
 #include <iostream>
 #include <vector>
@@ -40,7 +41,6 @@
 
 #ifdef _OPENMP
 #include <omp.h>
-#include "OutWrite.h"
 #endif
 
 namespace tensorplay {
