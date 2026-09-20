@@ -1145,19 +1145,44 @@ _max_return_type = _collections.namedtuple("max_return_type", ["values", "indice
 _min_return_type = _collections.namedtuple("min_return_type", ["values", "indices"])
 
 
-def max(input, other=None, *, dim=None, keepdim=False):
+def max(input, *args, dim=None, keepdim=False):
+    # ``args`` carries the elementwise partner of the two-argument form, or
+    # the ``(dim, keepdim)`` pair when a recorded graph replays the native
+    # call form.  ``dim``/``keepdim`` stay keyword-only for the public API.
+    if len(args) == 2:
+        result = _C.max(input, args[0], args[1])
+        if not isinstance(result, tuple):
+            return result
+        return _max_return_type(*result)
+    other = args[0] if args else None
     if other is not None:
         return _C.maximum(input, other)
     if dim is not None:
-        return _max_return_type(*_C.max(input, dim, keepdim))
+        result = _C.max(input, dim, keepdim)
+        # A graph value stands for the whole multi-output call: consumers
+        # split the outputs downstream, so the named tuple is only
+        # constructed for eager results.
+        if not isinstance(result, tuple):
+            return result
+        return _max_return_type(*result)
     return functional.max(input)
 
 
-def min(input, other=None, *, dim=None, keepdim=False):
+def min(input, *args, dim=None, keepdim=False):
+    # Same dual-form convention as max above.
+    if len(args) == 2:
+        result = _C.min(input, args[0], args[1])
+        if not isinstance(result, tuple):
+            return result
+        return _min_return_type(*result)
+    other = args[0] if args else None
     if other is not None:
         return _C.minimum(input, other)
     if dim is not None:
-        return _min_return_type(*_C.min(input, dim, keepdim))
+        result = _C.min(input, dim, keepdim)
+        if not isinstance(result, tuple):
+            return result
+        return _min_return_type(*result)
     return functional.min(input)
 
 
