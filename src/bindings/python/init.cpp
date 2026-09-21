@@ -14,6 +14,7 @@
 #include "Graph.h"
 #ifdef USE_CUDA
 #include "CuFFTPlanCache.h"
+#include "CudaTunable.h"
 #endif
 #include <cstdlib>
 #include <cstring>
@@ -806,6 +807,141 @@ PYBIND11_MODULE(_C, m) {
               (void)device_index;
               throw std::runtime_error("cuFFT plan cache requires CUDA");
           }, "device_index"_a);
+#endif
+
+    // --------------------------------------------------------------------
+    // GEMM tuning context (TunableOp)
+    // --------------------------------------------------------------------
+#ifdef USE_CUDA
+    m.def("_cuda_tunableop_enable",
+          [](bool value) {
+              tensorplay::cuda::tunable::TuningContext::get().setEnabled(value);
+          }, "value"_a,
+          "Turns GEMM kernel tuning on or off.");
+    m.def("_cuda_tunableop_is_enabled", []() {
+        return tensorplay::cuda::tunable::TuningContext::get().isEnabled();
+    });
+    m.def("_cuda_tunableop_tuning_enable",
+          [](bool value) {
+              tensorplay::cuda::tunable::TuningContext::get().setTuningEnabled(value);
+          }, "value"_a,
+          "Controls whether untuned GEMM shapes are measured.");
+    m.def("_cuda_tunableop_tuning_is_enabled", []() {
+        return tensorplay::cuda::tunable::TuningContext::get().isTuningEnabled();
+    });
+    m.def("_cuda_tunableop_record_untuned_enable",
+          [](bool value) {
+              tensorplay::cuda::tunable::TuningContext::get().setRecordUntuned(value);
+          }, "value"_a,
+          "Controls logging of GEMMs that ran without a tuned choice.");
+    m.def("_cuda_tunableop_record_untuned_is_enabled", []() {
+        return tensorplay::cuda::tunable::TuningContext::get().isRecordUntunedEnabled();
+    });
+    m.def("_cuda_tunableop_set_verbose",
+          [](bool value) {
+              tensorplay::cuda::tunable::TuningContext::get().setVerbose(value);
+          }, "value"_a,
+          "Controls diagnostic logging of the tuning context.");
+    m.def("_cuda_tunableop_is_verbose", []() {
+        return tensorplay::cuda::tunable::TuningContext::get().isVerbose();
+    });
+    m.def("_cuda_tunableop_set_max_tuning_duration",
+          [](int64_t value) {
+              tensorplay::cuda::tunable::TuningContext::get().setMaxTuningDurationMs(
+                  static_cast<int>(value));
+          }, "value"_a,
+          "Milliseconds each candidate may run during one measurement pass.");
+    m.def("_cuda_tunableop_get_max_tuning_duration", []() {
+        return tensorplay::cuda::tunable::TuningContext::get().maxTuningDurationMs();
+    });
+    m.def("_cuda_tunableop_set_max_tuning_samples",
+          [](int64_t value) {
+              tensorplay::cuda::tunable::TuningContext::get().setMaxTuningSamples(
+                  static_cast<int>(value));
+          }, "value"_a,
+          "Timed samples each candidate may run during one measurement pass.");
+    m.def("_cuda_tunableop_get_max_tuning_samples", []() {
+        return tensorplay::cuda::tunable::TuningContext::get().maxTuningSamples();
+    });
+    m.def("_cuda_tunableop_set_filename",
+          [](const std::string& filename, bool insert_device_ordinal) {
+              tensorplay::cuda::tunable::TuningContext::get().setFilename(
+                  filename, insert_device_ordinal);
+          }, "filename"_a, "insert_device_ordinal"_a = false,
+          "Sets the results file used for tuning persistence.");
+    m.def("_cuda_tunableop_get_filename", []() {
+        return tensorplay::cuda::tunable::TuningContext::get().getFilename();
+    });
+    m.def("_cuda_tunableop_read_file",
+          [](const std::string& filename) {
+              return tensorplay::cuda::tunable::TuningContext::get().readFile(filename);
+          }, "filename"_a,
+          "Merges a tuning results file into the database.\n\n"
+          "An empty filename falls back to the configured results file.");
+    m.def("_cuda_tunableop_write_file", []() {
+        tensorplay::cuda::tunable::TuningContext::get().writeFile();
+    });
+    m.def("_cuda_tunableop_get_results", []() {
+        py::list out;
+        for (const auto& entry :
+             tensorplay::cuda::tunable::TuningContext::get().resultsSnapshot()) {
+            out.append(py::make_tuple(std::get<0>(entry), std::get<1>(entry),
+                                       std::get<2>(entry), std::get<3>(entry)));
+        }
+        return out;
+    });
+#else
+    m.def("_cuda_tunableop_enable",
+          [](bool value) {
+              (void)value;
+              throw std::runtime_error("TunableOp requires a CUDA build");
+          }, "value"_a);
+    m.def("_cuda_tunableop_is_enabled", []() { return false; });
+    m.def("_cuda_tunableop_tuning_enable",
+          [](bool value) {
+              (void)value;
+              throw std::runtime_error("TunableOp requires a CUDA build");
+          }, "value"_a);
+    m.def("_cuda_tunableop_tuning_is_enabled", []() { return false; });
+    m.def("_cuda_tunableop_record_untuned_enable",
+          [](bool value) {
+              (void)value;
+              throw std::runtime_error("TunableOp requires a CUDA build");
+          }, "value"_a);
+    m.def("_cuda_tunableop_record_untuned_is_enabled", []() { return false; });
+    m.def("_cuda_tunableop_set_verbose",
+          [](bool value) {
+              (void)value;
+              throw std::runtime_error("TunableOp requires a CUDA build");
+          }, "value"_a);
+    m.def("_cuda_tunableop_is_verbose", []() { return false; });
+    m.def("_cuda_tunableop_set_max_tuning_duration",
+          [](int64_t value) {
+              (void)value;
+              throw std::runtime_error("TunableOp requires a CUDA build");
+          }, "value"_a);
+    m.def("_cuda_tunableop_get_max_tuning_duration", []() { return 0; });
+    m.def("_cuda_tunableop_set_max_tuning_samples",
+          [](int64_t value) {
+              (void)value;
+              throw std::runtime_error("TunableOp requires a CUDA build");
+          }, "value"_a);
+    m.def("_cuda_tunableop_get_max_tuning_samples", []() { return 0; });
+    m.def("_cuda_tunableop_set_filename",
+          [](const std::string& filename, bool insert_device_ordinal) {
+              (void)filename; (void)insert_device_ordinal;
+              throw std::runtime_error("TunableOp requires a CUDA build");
+          }, "filename"_a, "insert_device_ordinal"_a = false);
+    m.def("_cuda_tunableop_get_filename", []() { return std::string(); });
+    m.def("_cuda_tunableop_read_file",
+          [](const std::string& filename) {
+              (void)filename;
+              throw std::runtime_error("TunableOp requires a CUDA build");
+          }, "filename"_a);
+    m.def("_cuda_tunableop_write_file", []() {
+        throw std::runtime_error("TunableOp requires a CUDA build");
+    });
+    m.def("_cuda_tunableop_get_results", []() { return py::list(); });
 #endif
 
     // --------------------------------------------------------------------
