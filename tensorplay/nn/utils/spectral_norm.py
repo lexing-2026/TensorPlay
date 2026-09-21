@@ -113,7 +113,16 @@ class SpectralNorm:
             [weight_mat.t().mm(weight_mat).pinverse(), weight_mat.t(),
              u.unsqueeze(1)]
         ).squeeze(1)
-        return v.mul_(target_sigma / tp.dot(u, tp.mv(weight_mat, v)))
+        v = v.mul_(target_sigma / tp.dot(u, tp.mv(weight_mat, v)))
+        if not bool(tp.isfinite(v).all()):
+            # The SVD-backed pseudo-inverse runs on whatever LAPACK the host
+            # provides, and rank-deficient input can come back with non-finite
+            # entries there.  The stored invariant u = normalize(W @ v) makes
+            # W^T @ u an admissible direction, so rebuild from it using only
+            # matvec and normalize.
+            v = F.normalize(tp.mv(weight_mat.t(), u), dim=0, eps=self.eps)
+            v = v.mul_(target_sigma / tp.dot(u, tp.mv(weight_mat, v)))
+        return v
 
     @staticmethod
     def apply(
