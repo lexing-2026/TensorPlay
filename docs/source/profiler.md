@@ -7,6 +7,7 @@
     :toctree: generated
     :nosignatures:
 
+    tensorplay.profiler.DeviceType
     tensorplay.profiler.EventList
     tensorplay.profiler.FunctionEvent
     tensorplay.profiler.FunctionEventAvg

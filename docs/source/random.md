@@ -18,6 +18,7 @@
     tensorplay.random.get_rng_state
     tensorplay.random.set_rng_state
     tensorplay.random.fork_rng
+    tensorplay.random.thread_safe_generator
     tensorplay.random.default_generator
 ```
 
