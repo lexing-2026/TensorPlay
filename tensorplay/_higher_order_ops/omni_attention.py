@@ -186,9 +186,7 @@ def _math_attention_inner(
     score_mod_other_buffers: tuple = (),
     mask_mod_other_buffers: tuple = (),
 ) -> tuple[Tensor, Tensor]:
-    from tensorplay._dynamo._trace_wrapped_higher_order_op import (
-        TransformGetItemToIndex,
-    )
+    from tensorplay._higher_order_ops.utils import TransformGetItemToIndex
     from tensorplay.nn.attention.omni_attention import _vmap_for_bhqkv
 
     working_precision = tensorplay.float64 if query.dtype == tensorplay.float64 else tensorplay.float32
@@ -430,7 +428,7 @@ def trace_omni_attention(
     """
     from contextlib import nullcontext
 
-    from tensorplay._dynamo._trace_wrapped_higher_order_op import TransformGetItemToIndex
+    from tensorplay._higher_order_ops.utils import TransformGetItemToIndex
     from tensorplay.graph.experimental.proxy_tensor import (
         track_tensor_tree,
         unwrap_proxy,
@@ -560,7 +558,7 @@ def omni_attention_functionalize(
     guard against any mutations in the score_mod function, to the other_buffers since those
     are free variables.
     """
-    from tensorplay._dynamo._trace_wrapped_higher_order_op import TransformGetItemToIndex
+    from tensorplay._higher_order_ops.utils import TransformGetItemToIndex
 
     query_unwrapped = ctx.unwrap_tensors(query)
     key_unwrapped = ctx.unwrap_tensors(key)
@@ -904,9 +902,7 @@ def omni_attention_autograd(
     score_mod_other_buffers: tuple[Tensor, ...] = (),
     mask_mod_other_buffers: tuple[Tensor, ...] = (),
 ) -> tuple[Tensor, Tensor, Tensor]:
-    from tensorplay._dynamo._trace_wrapped_higher_order_op import (
-        TransformGetItemToIndex,
-    )
+    from tensorplay._higher_order_ops.utils import TransformGetItemToIndex
 
     with TransformGetItemToIndex():
         input_requires_grad = any(
@@ -1046,9 +1042,7 @@ def sdpa_dense_backward(
         _, joint_graph = create_fw_bw_graph(
             fw_graph, example_vals, score_mod_other_buffers
         )
-    from tensorplay._dynamo._trace_wrapped_higher_order_op import (
-        TransformGetItemToIndex,
-    )
+    from tensorplay._higher_order_ops.utils import TransformGetItemToIndex
     from tensorplay.nn.attention.omni_attention import _vmap_for_bhqkv
 
     Bq, Hq, seq_len_q, qk_head_dim = query.shape
@@ -1242,7 +1236,7 @@ def trace_omni_attention_backward(
     """We already have the forward graph and joint graph from the forward pass, so we create a proxy attach both graphs"""
     from contextlib import nullcontext
 
-    from tensorplay._dynamo._trace_wrapped_higher_order_op import TransformGetItemToIndex
+    from tensorplay._higher_order_ops.utils import TransformGetItemToIndex
     from tensorplay.graph.experimental.proxy_tensor import (
         track_tensor_tree,
         unwrap_proxy,

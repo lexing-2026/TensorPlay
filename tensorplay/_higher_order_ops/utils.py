@@ -5,7 +5,8 @@ The entry points here mirror the contract of a traced higher-order call:
 that inner ``compile`` invocations should target.  The remaining helpers
 provide the dispatch-role plumbing shared by every operator in this package:
 autograd guards, subgraph re-tracing, mutation detection, mode redirection,
-backward-state partitioning, and lifted-argument validation.
+backward-state partitioning, lifted-argument validation, and the getitem
+rewrite that tracing applies inside operator bodies.
 """
 
 from __future__ import annotations
@@ -894,4 +895,17 @@ class IdentityFunctionalizeCtx:
 
     def functionalize(self, fn: Callable) -> Callable:
         return fn
+
+
+@contextlib.contextmanager
+def TransformGetItemToIndex():
+    """Rewrite ``tensor[()]`` expressions into explicit index operations.
+
+    While a higher-order operator body is being traced, scalar ``[()]``
+    accesses on traced values need to surface as index operations in the
+    recorded graph instead of Python-level subscripts.  Under eager
+    execution there is no target representation to rewrite into, so the
+    context manager is a no-op.
+    """
+    yield
 

@@ -24,10 +24,10 @@ from tensorplay.nn.attention._utils import (
 __all__ = ["causal_upper_left", "causal_lower_right", "CausalVariant", "CausalBias"]
 
 
-tensorplay._dynamo.allow_in_graph(is_flash_attention_available)
-tensorplay._dynamo.allow_in_graph(can_use_flash_attention)
-tensorplay._dynamo.allow_in_graph(can_use_efficient_attention)
-tensorplay._dynamo.allow_in_graph(SDPAParams)
+tensorplay.compiler.allow_in_graph(is_flash_attention_available)
+tensorplay.compiler.allow_in_graph(can_use_flash_attention)
+tensorplay.compiler.allow_in_graph(can_use_efficient_attention)
+tensorplay.compiler.allow_in_graph(SDPAParams)
 
 
 class CausalVariant(IntEnum):

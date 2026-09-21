@@ -100,7 +100,7 @@ def _validate_block_mask_shape(
     has_unbacked_input_lengths = has_free_unbacked_symbols(
         query
     ) or has_free_unbacked_symbols(key)
-    if not tensorplay.compiler.is_dynamo_compiling():
+    if not tensorplay.compiler.is_compiling():
         lengths = (q_len, kv_len, block_mask_q_len, block_mask_kv_len)
         has_unbacked_input_lengths = (
             has_unbacked_input_lengths or has_free_unbacked_symbols(lengths)
@@ -1865,9 +1865,7 @@ def create_mask(
     n = tensorplay.arange(0, KV_LEN, device=device)
     mod_type = _get_mod_type(mod_fn)
 
-    from tensorplay._dynamo._trace_wrapped_higher_order_op import (
-        TransformGetItemToIndex,
-    )
+    from tensorplay._higher_order_ops.utils import TransformGetItemToIndex
 
     with TransformGetItemToIndex():
         if mod_type == _ModificationType.SCORE_MOD:
@@ -2572,11 +2570,11 @@ def omni_attention(
 
         return out
 
-    if tensorplay.compiler.is_dynamo_compiling():
+    if tensorplay.compiler.is_compiling():
         # mark head_dim and number of heads to be static
         for x in [query, key, value]:
-            tensorplay._dynamo.mark_static(x, -3)
-            tensorplay._dynamo.mark_static(x, -1)
+            tensorplay.compiler.mark_static(x, -3)
+            tensorplay.compiler.mark_static(x, -1)
 
         out, lse, max_scores = omni_attention_hop(
             query,
@@ -2608,7 +2606,7 @@ def omni_attention(
             ),
         )
 
-    if not tensorplay._dynamo.is_dynamo_supported():
+    if not hasattr(tensorplay.compiler, "compile"):
         raise RuntimeError("omni_attention requires graph tracer support")
 
     # The tracer is expecting a callable with "__code__" attribute.

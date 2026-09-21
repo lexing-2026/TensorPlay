@@ -1441,7 +1441,6 @@ if TYPE_CHECKING:
 
 else:
     _lazy_modules = {
-        "_dynamo",
         "accelerator",
         "audio",
         "cpu",
@@ -1537,7 +1536,8 @@ def _check(cond, msg=None):
 def _as_tensor_fullprec(t):
     """
     Like tensorplay.as_tensor, but when given Python data types it will keep
-    them in full precision.  Used for calling convention for Dynamo.
+    them in full precision.  Used when a captured region converts Python
+    values to tensors and the exact scalar widths must survive.
     """
     ty = type(t)
     if ty is builtins.float:
