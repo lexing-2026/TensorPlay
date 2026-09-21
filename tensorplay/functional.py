@@ -8892,7 +8892,7 @@ def igammac(input, other, *, out=None):
             return _captured
     return _C.igammac(self=input, other=other)
 
-def empty_strided(size, stride, dtype=None, device=None, pin_memory=False):
+def empty_strided(size, stride, dtype=None, device=None, pin_memory=False, requires_grad=False):
     if _capturing():
         _captured = _capture_call(empty_strided, (size, stride, dtype, device, pin_memory), {})
         if _captured is not None:
@@ -8903,7 +8903,10 @@ def empty_strided(size, stride, dtype=None, device=None, pin_memory=False):
         stride = [stride]
     if dtype is None:
             dtype = DType.undefined
-    return _C.empty_strided(size, stride, dtype=dtype, device=_ensure_device(device), pin_memory=pin_memory)
+    out = _C.empty_strided(size, stride, dtype=dtype, device=_ensure_device(device), pin_memory=pin_memory)
+    if requires_grad:
+        out.requires_grad_(True)
+    return out
 
 def _cast_Byte(input, non_blocking=False):
     if _capturing():
