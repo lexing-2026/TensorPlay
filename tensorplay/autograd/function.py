@@ -322,6 +322,61 @@ class FunctionMeta(type):
         return f"{cls.__name__}Backward"
 
 
+def _maybe_process_forward_ad(cls, ctx, args, output):
+    """Forward-mode AD for custom Functions.
+
+    When any input carries a tangent at the active forward level, the user's
+    ``jvp`` computes the output tangents, which are attached to the outputs
+    one-for-one.  Tangent reads stay disabled while ``jvp`` runs so the
+    tangent arithmetic itself never re-enters forward propagation.
+    """
+    if cls.jvp is Function.jvp:
+        return output
+
+    grad_inputs = []
+    any_fw = False
+
+    def collect(a):
+        nonlocal any_fw
+        if isinstance(a, tensorplay.Tensor):
+            g = tensorplay._C._fw_grad(a, 0)
+            if g.defined():
+                any_fw = True
+                grad_inputs.append(g)
+            else:
+                grad_inputs.append(None)
+        elif isinstance(a, (list, tuple)):
+            for item in a:
+                collect(item)
+        elif isinstance(a, dict):
+            for v in a.values():
+                collect(v)
+        else:
+            grad_inputs.append(None)
+
+    for a in args:
+        collect(a)
+    if not any_fw:
+        return output
+
+    from .forward_ad import _set_fwd_grad_enabled
+
+    outs = output if isinstance(output, (tuple, list)) else (output,)
+    with _set_fwd_grad_enabled(False):
+        tangent_outs = cls.jvp(ctx, *grad_inputs)
+    if not isinstance(tangent_outs, (tuple, list)):
+        tangent_outs = (tangent_outs,)
+    if len(tangent_outs) != len(outs):
+        raise RuntimeError(
+            f"jvp for {cls.__name__} returned {len(tangent_outs)} tangents "
+            f"but the forward returned {len(outs)} outputs")
+    for out, t in zip(outs, tangent_outs):
+        if (isinstance(out, tensorplay.Tensor) and t is not None
+                and out.defined() and t.defined()):
+            tensorplay._C._set_fw_grad(out, t, 0, False)
+    return output
+
+
 class Function(metaclass=FunctionMeta):
     r"""Records operation history and defines formulas for differentiating ops.
 
@@ -393,12 +448,14 @@ class Function(metaclass=FunctionMeta):
     def jvp(ctx, *grad_inputs):
         r"""Defines a formula for computing the jacobian-vector product.
 
-        Not yet supported by this engine; provided for API compatibility.
+        Called by forward-mode AD when at least one input of this Function
+        carries a tangent: ``grad_inputs`` holds the tangent of each input
+        (``None`` for inputs without one), and the returned tangents are
+        attached to the outputs one-for-one.
         """
         raise NotImplementedError(
             "You must implement the jvp method for your custom autograd "
-            "Function to use it with forward-mode AD. Forward-mode AD is not "
-            "supported by this engine yet."
+            "Function to use it with forward-mode AD."
         )
 
     @staticmethod
@@ -448,8 +505,8 @@ class Function(metaclass=FunctionMeta):
                 else:
                     ctx._engine_materializes = True
                 ctx.backward = _make_backward(ctx, cls)
-                return output
-            return output
+                return _maybe_process_forward_ad(cls, ctx, args, output)
+            return _maybe_process_forward_ad(cls, ctx, args, output)
 
         fast = (
             _FAST_GRAPH and _RUN_FWD is not None and _FAST_ATTACH
@@ -509,7 +566,7 @@ class Function(metaclass=FunctionMeta):
                 cls.setup_context(ctx, args, output)
 
         if not executable:
-            return output
+            return _maybe_process_forward_ad(cls, ctx, args, output)
 
         # choice (possibly set inside setup_context) to the ENGINE, so
         # zero-filling of missing gradient slots happens in C++.
@@ -576,7 +633,7 @@ class Function(metaclass=FunctionMeta):
             attach_all(output)
 
         ctx.backward = _make_backward(ctx, cls)
-        return output
+        return _maybe_process_forward_ad(cls, ctx, args, output)
 
 
 class InplaceFunction(Function):

@@ -1,216 +1,184 @@
 """Forward-mode automatic differentiation support.
 
-The per-level stack lets ``make_dual`` pair a primal with its tangent at the
-current level, and arithmetic on duals propagates tangents analytically
-(Jacobian-vector products computed inline -- no graph, no backward pass).
+Forward gradients (tangents) live on the tensors themselves, keyed by an
+active forward-AD *level*.  ``enter_dual_level`` hands out the level's
+integer handle; ``make_dual`` pairs a primal with its tangent inside that
+level; arithmetic on dual tensors then propagates tangents through each
+operation's forward-derivative formula (Jacobian-vector products computed
+inline -- no backward graph); ``unpack_dual`` reads the primal and tangent
+back out.  Exiting the level erases every tangent registered with it.
 
-kernel. Here the propagation rules are implemented explicitly per supported
-op (the seed set below covers linear/algebraic composition); unsupported
-operations raise instead of silently dropping tangents.
+Nesting is not supported: a single forward-AD level is active at a time.
+Higher-order forward gradients can be composed by running :func:`jvp`
+inside another :func:`jvp`.
 """
 
 from __future__ import annotations
 
-import threading
+from typing import Any, NamedTuple
 
 import tensorplay as tp
+from .grad_mode import _DecoratorContextManager
 
 __all__ = [
+    "UnpackedDualTensor",
+    "current_dual_level",
     "enter_dual_level",
     "exit_dual_level",
-    "current_dual_level",
     "make_dual",
     "unpack_dual",
+    "dual_level",
     "is_dual_tensor",
-    "DualTensor",
 ]
 
-_levels = threading.local()
+_C = tp._C
 
-
-def _depth() -> int:
-    return getattr(_levels, "d", 0)
+# Python-side mirror of the active level so make_dual / unpack_dual can use
+# it as their default; the C++ registry stays the source of truth.
+_current_level = -1
 
 
 def current_dual_level() -> int:
-    """Returns the current forward-AD nesting level (-1 = none active,
-"""
-    return _depth() - 1
+    """Returns the current forward-AD level (-1 when none is active)."""
+    return _current_level
 
 
 def enter_dual_level() -> int:
-    """Enters a new forward gradient level and returns its index
-"""
-    lvl = _depth()
-    _levels.d = lvl + 1
-    return lvl
+    """Enters a new forward grad level and returns its index.
 
-
-def exit_dual_level(level: int | None = None):
-    """Exits the given (default: most recent) forward gradient level.
-
-    Any levels nested inside ``level`` are exited as well, matching
+    This level can be used to make and unpack dual Tensors to compute
+    forward gradients.  Levels cannot nest: entering while another level is
+    active raises, so all forward AD computation happens inside one level.
     """
-    d = _depth()
-    if d == 0:
+    global _current_level
+    new_level = _C._enter_dual_level()
+    if new_level != _current_level + 1:
+        raise RuntimeError(
+            "Entering a new forward AD level but the current level "
+            "is not valid. Make sure you did not modify it directly."
+        )
+    _current_level = new_level
+    return new_level
+
+
+def exit_dual_level(*, level: int | None = None) -> None:
+    """Exits a forward grad level.
+
+    This deletes all the tangents associated with this level.  Only exiting
+    the most recently entered level is allowed.
+    """
+    global _current_level
+    if _current_level < 0:
         raise RuntimeError(
             "Trying to exit a forward AD level but no level is active")
-    target = d - 1 if level is None else int(level)
-    if not 0 <= target < d:
+    if level is None:
+        level = _current_level
+    if level != _current_level:
         raise RuntimeError(
-            f"Trying to exit a forward AD level that was not entered: {level}")
-    _levels.d = target
+            "Trying to exit a forward AD level that was not the last one "
+            "that was created. This is not supported."
+        )
+    _C._exit_dual_level(level)
+    _current_level = level - 1
 
 
-class DualTensor:
-    """(primal, tangent) pair flowing through forward-mode evaluation."""
+def make_dual(tensor: tp.Tensor, tangent: tp.Tensor, *,
+              level: int | None = None) -> tp.Tensor:
+    """Associates a tensor value with its tangent to create a "dual tensor".
 
-    __slots__ = ("primal", "tangent", "level")
+    The result is a new tensor aliased to ``tensor`` with ``tangent``
+    attached as its forward gradient.  The tangent can be recovered with
+    :func:`unpack_dual`.
 
-    def __init__(self, primal, tangent, level):
-        if isinstance(tangent, (int, float)):
-            # Scalar constants carry a numeric zero tangent.
-            tangent = float(tangent)
-        elif not isinstance(tangent, tp.Tensor):
-            raise TypeError("tangent must be a tensorplay.Tensor")
-        self.primal = primal
-        self.tangent = tangent
-        self.level = level
+    Given a function ``f`` whose jacobian is ``J``, this computes the
+    Jacobian-vector product (``jvp``) between ``J`` and a given vector ``v``::
 
-    def __getattr__(self, name):
-        if name.startswith("__"):
-            raise AttributeError(name)
-        raise TypeError(
-            f"forward_ad: operation '{name}' is not in the native seed set "
-            "and would silently drop tangents")
-
-    # -- arithmetic (seed Jacobian-vector products) --------------------
-    def _co(self, other):
-        if isinstance(other, DualTensor):
-            return other
-        return DualTensor(other, tp.zeros_like(other)
-                          if isinstance(other, tp.Tensor) else 0.0,
-                          self.level)
-
-    @staticmethod
-    def _unwrap(v):
-        return v
-
-    def __add__(self, other):
-        o = self._co(other)
-        t = self.tangent + o.tangent if isinstance(o.tangent, tp.Tensor) \
-            else self.tangent
-        return DualTensor(self.primal + o.primal, t, self.level)
-
-    __radd__ = __add__
-
-    def __sub__(self, other):
-        o = self._co(other)
-        t = self.tangent - o.tangent if isinstance(o.tangent, tp.Tensor) \
-            else self.tangent
-        return DualTensor(self.primal - o.primal, t, self.level)
-
-    def __rsub__(self, other):
-        o = self._co(other)
-        return DualTensor(o.primal - self.primal,
-                          (o.tangent - self.tangent)
-                          if isinstance(o.tangent, tp.Tensor) else self.tangent * -1,
-                          self.level)
-
-    def __mul__(self, other):
-        o = self._co(other)
-        if isinstance(o.tangent, tp.Tensor):
-            t = o.tangent * self.primal + self.tangent * o.primal
-        else:
-            t = self.tangent * o.primal
-        return DualTensor(self.primal * o.primal, t, self.level)
-
-    __rmul__ = __mul__
-
-    def __truediv__(self, other):
-        o = self._co(other)
-        op2 = o.primal * o.primal
-        num_t = (self.tangent * o.primal - self.primal * o.tangent) \
-            if isinstance(o.tangent, tp.Tensor) else self.tangent * o.primal
-        return DualTensor(self.primal / o.primal, num_t / op2, self.level)
-
-    def __neg__(self):
-        return DualTensor(-self.primal, -self.tangent, self.level)
-
-    def __pow__(self, e):
-        # d(x**e) = e * x**(e-1) * dx  (constant exponent)
-        base = self.primal ** (e - 1)
-        return DualTensor(self.primal ** e, e * base * self.tangent,
-                          self.level)
-
-    # -- transcendental seeds ------------------------------------------
-    def exp(self):
-        v = self.primal.exp()
-        return DualTensor(v, v * self.tangent, self.level)
-
-    def log(self):
-        return DualTensor(self.primal.log(), self.tangent / self.primal,
-                          self.level)
-
-    def sin(self):
-        return DualTensor(self.primal.sin(), self.primal.cos() * self.tangent,
-                          self.level)
-
-    def cos(self):
-        return DualTensor(self.primal.cos(),
-                          -self.primal.sin() * self.tangent, self.level)
-
-    def sum(self, *a, **k):
-        return DualTensor(self.primal.sum(*a, **k),
-                          self.tangent.sum(*a, **k), self.level)
-
-    def reshape(self, *shape):
-        return DualTensor(self.primal.reshape(*shape),
-                          self.tangent.reshape(*shape), self.level)
-
-    def view(self, *shape):
-        return self.reshape(*shape)
-
-    @property
-    def shape(self):
-        return self.primal.shape
-
-    def item(self):
-        raise TypeError(
-            "unpack_dual() first: item() would silently drop the tangent")
-
-    def __repr__(self):
-        return (f"DualTensor(level={self.level}, "
-                f"primal={self.primal!r}, tangent={self.tangent!r})")
-
-
-def is_dual_tensor(obj) -> bool:
-    """True when ``obj`` carries a forward-mode tangent."""
-    return isinstance(obj, DualTensor)
-
-
-def make_dual(primal, tangent, *, level: int | None = None):
-    """Pairs ``primal`` with ``tangent`` at ``level`` (default: current).
-
+        >>> # xdoctest: +SKIP("Undefined variables")
+        >>> with dual_level():
+        ...     inp = make_dual(x, v)
+        ...     out = f(inp)
+        ...     y, jvp = unpack_dual(out)
     """
-    lvl = current_dual_level() if level is None else level
-    if lvl < 0:
+    from ..functional import _make_dual as _op_make_dual
+
+    if level is None:
+        level = _current_level
+
+    if level < 0:
         raise RuntimeError(
-            "make_dual requires an active forward AD level "
-            "(call enter_dual_level() first)")
-    if not isinstance(primal, tp.Tensor) or not isinstance(tangent, tp.Tensor):
-        raise TypeError("make_dual: primal and tangent must be tensors")
-    if tangent.dtype != primal.dtype:
-        tangent = tp.to(tangent, primal.dtype) if hasattr(tp, "to") \
-            else tangent.to(primal.dtype)
-    return DualTensor(primal, tangent, lvl)
+            "Trying to create a dual Tensor for forward AD but no level "
+            "exists, make sure to enter_dual_level() first."
+        )
+    return _op_make_dual(tensor, tangent, level)
 
 
-def unpack_dual(dual):
-    """Returns ``(tangent, primal)``; ``tangent`` is None for plain tensors."""
-    if isinstance(dual, DualTensor):
-        return dual.tangent, dual.primal
-    if isinstance(dual, tp.Tensor):
-        from .graph import _hook_stack  # noqa: F401  (import symmetry check)
-        return None, dual
-    raise TypeError("unpack_dual: expected a tensor or DualTensor")
+class UnpackedDualTensor(NamedTuple):
+    """Namedtuple with the primal and tangent parts of a dual tensor."""
+
+    primal: tp.Tensor
+    tangent: tp.Tensor | None
+
+
+def unpack_dual(tensor: tp.Tensor, *,
+                level: int | None = None) -> UnpackedDualTensor:
+    """Unpacks a dual tensor into its primal value and forward gradient.
+
+    Returns ``(primal, tangent)`` where ``primal`` is a view of ``tensor``'s
+    primal and ``tangent`` is ``tensor``'s tangent (``None`` when ``tensor``
+    carries no tangent at ``level``).
+    """
+    from ..functional import _unpack_dual as _op_unpack_dual
+
+    if level is None:
+        level = _current_level
+
+    if level < 0:
+        return UnpackedDualTensor(tensor, None)
+
+    primal, tangent = _op_unpack_dual(tensor, level)
+    # An absent tangent comes back as an undefined tensor; normalize it to
+    # None so callers can branch on the python value.
+    if tangent is not None and not tangent.defined():
+        tangent = None
+    return UnpackedDualTensor(primal, tangent)
+
+
+def is_dual_tensor(tensor: Any) -> bool:
+    """True when ``tensor`` carries a forward-mode tangent."""
+    if not isinstance(tensor, tp.Tensor):
+        raise TypeError(
+            f"is_dual_tensor: expected a tensorplay.Tensor, got {type(tensor)}")
+    if _current_level < 0:
+        return False
+    return _C._fw_grad(tensor, _current_level).defined()
+
+
+class dual_level(_DecoratorContextManager):
+    """Context manager for forward AD.
+
+    All forward AD computation must occur within a ``dual_level`` context,
+    which enters the level on entry and exits it (erasing its tangents) on
+    exit.  Nested ``dual_level`` contexts are not supported; to compute
+    higher-order forward gradients, use :func:`jvp`.
+    """
+
+    def __enter__(self) -> int:
+        return enter_dual_level()
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        exit_dual_level()
+
+
+# Private helper to enable or disable tangent reads; transformations that
+# run a function under forward AD enable it only for the duration of the
+# traced call so unrelated code never observes tangents.
+class _set_fwd_grad_enabled(_DecoratorContextManager):
+    def __init__(self, mode: bool) -> None:
+        self.prev = _C._get_fwd_grad_enabled()
+        _C._set_fwd_grad_enabled(mode)
+
+    def __enter__(self) -> None:
+        pass
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        _C._set_fwd_grad_enabled(self.prev)

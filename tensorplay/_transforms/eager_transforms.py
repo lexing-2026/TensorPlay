@@ -876,12 +876,21 @@ def _jvp_with_argnums(
     strict: bool = False,
     has_aux: bool = False,
 ):
-    """The Jacobian-vector product, obtained from the reverse-mode graph.
+    """The Jacobian-vector product, computed in true forward mode.
 
-    ``v -> J(x)^T v`` is linear in ``v``, so its derivative with respect to
-    ``v`` in the direction ``t`` is ``J(x) t`` -- no separate forward rule set
-    is needed.  The cotangent placeholders below stand in for ``v``.
+    Every differentiable primal is paired with its tangent as a dual tensor
+    inside an active forward-AD level; the function then runs on the duals
+    and each output's forward gradient is the Jacobian-vector product.  A
+    single pass over ``func`` computes both the primal outputs and their
+    tangents -- no backward graph and no second evaluation is needed.
     """
+    from tensorplay.autograd.forward_ad import (
+        _set_fwd_grad_enabled,
+        dual_level,
+        make_dual,
+        unpack_dual,
+    )
+
     if not isinstance(tangents, tuple):
         raise RuntimeError(
             "jvp(f, primals, tangents): Expected tangents to be a tuple of Tensors"
@@ -906,12 +915,6 @@ def _jvp_with_argnums(
     assert_non_empty_list_of_tensors(flat_primals, "jvp(f, primals, tangents)", "primals")
     assert_non_empty_list_of_tensors(flat_tangents, "jvp(f, primals, tangents)", "tangents")
 
-    keep_graph = (
-        _any_requires_grad(flat_primals)
-        or _any_requires_grad(flat_tangents)
-        or _transform_depth.get() > 1
-    )
-
     for index, (primal, tangent) in enumerate(zip(flat_primals, flat_tangents)):
         if primal.shape != tangent.shape:
             raise RuntimeError(
@@ -926,48 +929,54 @@ def _jvp_with_argnums(
                 f"dtype {primal.dtype}"
             )
 
-    with tensorplay.enable_grad():
-        flat_diff_primals = list(
-            _create_differentiable(flat_primals, "jvp(f, primals, tangents)")
+    with dual_level(), _set_fwd_grad_enabled(True):
+        duals = tuple(
+            make_dual(primal, tangent)
+            for primal, tangent in zip(flat_primals, flat_tangents)
         )
-        new_diff = tree_unflatten(flat_diff_primals, primals_spec)
         if argnums is None:
-            call_args = new_diff
+            call_args = duals
         else:
-            call_args = _replace_args(primals, new_diff, argnums)
-        primals_out = func(*call_args)
+            call_args = _replace_args(primals, duals, argnums)
+        results = func(*call_args)
 
         if has_aux:
-            if not (isinstance(primals_out, tuple) and len(primals_out) == 2):
+            if not (isinstance(results, tuple) and len(results) == 2):
                 raise RuntimeError(
                     "jvp(f, primals, tangents): output of function f should be a "
                     "tuple: (output, aux) if has_aux is True"
                 )
-            primals_out, aux = primals_out
-            aux = _undo_create_differentiable(aux, keep_graph)
+            results, aux = results
+            aux = tree_map(
+                lambda x: unpack_dual(x).primal
+                if isinstance(x, tensorplay.Tensor) else x,
+                aux,
+            )
 
-        flat_primals_out, primals_out_spec = tree_flatten(primals_out)
-        assert_non_empty_tensor_output(flat_primals_out, "jvp(f, primals, tangents)")
+        flat_results, results_spec = tree_flatten(results)
+        assert_non_empty_tensor_output(flat_results, "jvp(f, primals, tangents)")
 
-        placeholders = tuple(
-            tensorplay.zeros_like(out).requires_grad_(True) for out in flat_primals_out
-        )
-        cotangent_map = _autograd_grad(
-            flat_primals_out, flat_diff_primals, placeholders, create_graph=True
-        )
-        if strict and any(not output.requires_grad for output in flat_primals_out):
+        primal_outs = []
+        tangent_outs = []
+        independent = []
+        for out in flat_results:
+            primal, tangent = unpack_dual(out)
+            independent.append(tangent is None)
+            if tangent is None:
+                # The output does not depend on any dual input, so its
+                # Jacobian-vector product is zero.
+                tangent = tensorplay.zeros_like(primal)
+            primal_outs.append(primal)
+            tangent_outs.append(tangent)
+
+        if strict and any(independent):
             raise RuntimeError(
                 "jvp(f, primals, tangents, strict=True): The output of f is "
                 "independent of the inputs. This is not allowed with strict=True."
             )
-        flat_jvp_out = _autograd_grad(
-            cotangent_map, placeholders, flat_tangents, create_graph=keep_graph
-        )
 
-        primals_out = _undo_create_differentiable(primals_out, keep_graph)
-        jvp_out = _undo_create_differentiable(
-            tree_unflatten(list(flat_jvp_out), primals_out_spec), keep_graph
-        )
+        primals_out = tree_unflatten(primal_outs, results_spec)
+        jvp_out = tree_unflatten(tangent_outs, results_spec)
 
     if has_aux:
         return primals_out, jvp_out, aux
@@ -1062,8 +1071,10 @@ def jacfwd(
 def hessian(func: Callable, argnums: argnums_t = 0):
     """Returns a function computing the Hessian of ``func``.
 
-    Composing forward mode over reverse mode is the cheaper ordering for the
-    square Jacobian-of-a-gradient that a Hessian is.
+    Built as the reverse-mode jacobian of the reverse-mode gradient.  The
+    forward-over-reverse ordering would need tangents to flow through the
+    backward pass itself, which this engine's reverse mode does not carry;
+    reverse-over-reverse composes two plain jacobians instead.
 
     Example:
 
@@ -1073,7 +1084,7 @@ def hessian(func: Callable, argnums: argnums_t = 0):
         >>> hess.shape
         tensorplay.Size(5, 5)
     """
-    return jacfwd(jacrev(func, argnums), argnums)
+    return jacrev(jacrev(func, argnums), argnums)
 
 
 # --------------------------------------------------------------- linearize --
