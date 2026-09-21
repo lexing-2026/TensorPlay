@@ -11,8 +11,6 @@ import tensorplay
 from tensorplay import nn
 from tensorplay.nn import functional as F
 
-from ....quantization.fake_quantize import PerChannelFakeQuantize
-
 __all__ = ["Conv1d", "Conv2d", "Conv3d"]
 
 
@@ -26,8 +24,14 @@ class _ConvNd(nn.Module):
         self.base = self._BASE(
             in_channels, out_channels, kernel_size, stride=stride,
             padding=padding, dilation=dilation, groups=groups, bias=bias)
-        self.weight_fake_quant = (
-            PerChannelFakeQuantize(ch_axis=0) if qconfig is None else qconfig.weight())
+        if qconfig is None:
+            # Resolved lazily: the quantization package imports this package
+            # at module scope, so an eager import here would be circular.
+            from ....quantization.fake_quantize import PerChannelFakeQuantize
+
+            self.weight_fake_quant = PerChannelFakeQuantize(ch_axis=0)
+        else:
+            self.weight_fake_quant = qconfig.weight()
         self.qconfig = qconfig
 
     @property

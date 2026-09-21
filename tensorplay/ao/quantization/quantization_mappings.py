@@ -35,9 +35,13 @@ DEFAULT_STATIC_QUANT_MODULE_MAPPINGS: dict = {
     nn.Conv3d: nnq.Conv3d,
     nn.ELU: nnq.ELU,
     nn.Hardswish: nnq.Hardswish,
+    nn.Hardsigmoid: nnq.Hardsigmoid,
     nn.LeakyReLU: nnq.LeakyReLU,
     nn.Linear: nnq.Linear,
+    nn.ReLU: nnq.ReLU,
     nn.ReLU6: nnq.ReLU6,
+    nn.Sigmoid: nnq.Sigmoid,
+    nn.Tanh: nnq.Tanh,
     # wrapper modules
     nnq.FloatFunctional: nnq.QFunctional,
     # fused modules

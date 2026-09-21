@@ -10,8 +10,6 @@ from __future__ import annotations
 import tensorplay
 from tensorplay import nn
 
-from ....quantization.fake_quantize import PerChannelFakeQuantize
-
 __all__ = ["Linear"]
 
 
@@ -20,8 +18,14 @@ class Linear(nn.Linear):
 
     def __init__(self, in_features, out_features, bias=True, qconfig=None):
         super().__init__(in_features, out_features, bias)
-        self.weight_fake_quant = (
-            PerChannelFakeQuantize(ch_axis=0) if qconfig is None else qconfig.weight())
+        if qconfig is None:
+            # Resolved lazily: the quantization package imports this package
+            # at module scope, so an eager import here would be circular.
+            from ....quantization.fake_quantize import PerChannelFakeQuantize
+
+            self.weight_fake_quant = PerChannelFakeQuantize(ch_axis=0)
+        else:
+            self.weight_fake_quant = qconfig.weight()
         self.qconfig = qconfig
 
     def forward(self, input):
