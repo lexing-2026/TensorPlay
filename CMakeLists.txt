@@ -1413,6 +1413,7 @@ set(TP_C_SOURCES
     src/bindings/python/CudaJiterator.cpp
      src/bindings/python/FileCheck.cpp
      src/Version.cpp
+    src/bindings/python/StaxStaticLauncher.cpp
 )
 if(WIN32)
     list(APPEND TP_C_SOURCES src/bindings/python/CPythonBridge.cpp)
@@ -1517,7 +1518,7 @@ if(TP_CUDA_ENABLED)
 endif()
 
 if(TP_CUDA_ENABLED)
-    target_link_libraries(_C PRIVATE CUDA::cudart)
+    target_link_libraries(_C PRIVATE CUDA::cudart CUDA::cuda_driver)
 endif()
 
 if(MSVC)

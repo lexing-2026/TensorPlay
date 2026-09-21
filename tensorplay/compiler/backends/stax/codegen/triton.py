@@ -1493,6 +1493,10 @@ class TritonProgramCodegen:
             source += "    if _snap >= 0:\n"
             source += f"        _g = _fl.take_kernel({kernel_name}, _snap)\n"
             source += "        if _g is not None:\n"
+            source += (
+                f"            _g = _fl.native_wrap({kernel_name}, _snap, "
+                f"{self.input_count + 3}) or _g\n"
+            )
             source += "            _rec = _g + (xnumel,)\n"
             source += "    return out\n"
         elif dims_reduction:
@@ -1571,6 +1575,10 @@ class TritonProgramCodegen:
             source += "    if _snap >= 0:\n"
             source += f"        _g = _fl.take_kernel({kernel_name}, _snap)\n"
             source += "        if _g is not None:\n"
+            source += (
+                f"            _g = _fl.native_wrap({kernel_name}, _snap, "
+                f"{self.input_count + len(out_kinds) + 3}) or _g\n"
+            )
             source += f"            _rec = _g + ({onumel},)\n"
             source += (
                 "    return outs[0] if len(outs) == 1 else outs\n"
@@ -1714,6 +1722,14 @@ class TritonProgramCodegen:
             source += f"        _g0 = _fl.take_kernel({kernel_name}, _s0)\n"
             source += f"        _g1 = _fl.take_kernel({finalize_name}, _s1)\n"
             source += "        if _g0 is not None and _g1 is not None:\n"
+            source += (
+                f"            _g0 = _fl.native_wrap({kernel_name}, _s0, "
+                f"{self.input_count + 3}) or _g0\n"
+            )
+            source += (
+                f"            _g1 = _fl.native_wrap({finalize_name}, _s1, 4)"
+                " or _g1\n"
+            )
             source += "            _rec = _g0 + _g1 + (xnumel,)\n"
             source += "    return out\n"
         else:
@@ -1835,11 +1851,21 @@ class TritonProgramCodegen:
                     f"    {kernel_name}[grid]({call_args_txt}{constexpr_kw})\n"
                 )
             if fixed_config is not None:
+                n_full = (
+                    self.input_count
+                    + len(self.output_refs)
+                    + 2
+                    + (1 if vec > 1 else 0)
+                )
                 source += "    if _snap >= 0:\n"
                 source += (
                     f"        _g = _fl.take_kernel({kernel_name}, _snap)\n"
                 )
                 source += "        if _g is not None:\n"
+                source += (
+                    f"            _g = _fl.native_wrap({kernel_name}, "
+                    f"_snap, {n_full}) or _g\n"
+                )
                 source += "            _rec = _g + (xnumel,)\n"
             if len(self.output_refs) == 1:
                 source += "    return outputs[0]\n"
