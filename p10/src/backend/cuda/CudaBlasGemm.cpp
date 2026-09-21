@@ -361,9 +361,9 @@ bool parseLtAlgoConfig(const std::string& name, LtAlgoConfig* out) {
 #endif
 }
 
-// Rebuilds an algorithm from its serialized configuration. The tile and
-// schedule fields are what the heuristic search actually chose, so writing
-// them back onto an initialized algorithm of the same id reproduces it.
+// Rebuilds an algorithm from its serialized configuration: the
+// initialization pins the identifier, then the schedule fields read off the
+// measured winner are written back onto it.
 bool initLtAlgoFromConfig(const LtAlgoConfig& c, cublasComputeType_t compute,
                           cudaDataType_t scale, cudaDataType_t type,
                           cublasLtMatmulAlgo_t* algo) {
@@ -377,8 +377,7 @@ bool initLtAlgoFromConfig(const LtAlgoConfig& c, cublasComputeType_t compute,
         return cublasLtMatmulAlgoConfigSetAttribute(algo, attr, value,
                                                     size) == CUBLAS_STATUS_SUCCESS;
     };
-    bool ok = write(CUBLASLT_ALGO_CONFIG_ID, &c.id, sizeof(c.id)) &&
-              write(CUBLASLT_ALGO_CONFIG_TILE_ID, &c.tile, sizeof(c.tile)) &&
+    bool ok = write(CUBLASLT_ALGO_CONFIG_TILE_ID, &c.tile, sizeof(c.tile)) &&
               write(CUBLASLT_ALGO_CONFIG_STAGES_ID, &c.stages, sizeof(c.stages)) &&
               write(CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &c.splitk, sizeof(c.splitk)) &&
               write(CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &c.reduction,
@@ -395,14 +394,16 @@ bool initLtAlgoFromConfig(const LtAlgoConfig& c, cublasComputeType_t compute,
 }
 
 // A reconstructed algorithm is only usable when the library confirms it can
-// run for this plan's descriptors on the current device.
+// run for this plan's descriptors on the current device, within the
+// workspace the plan reserves.
 bool algoRunsOnPlan(const GemmPlan& plan, const cublasLtMatmulAlgo_t& algo) {
     cublasLtMatmulHeuristicResult_t result{};
     return cublasLtMatmulAlgoCheck(CUDAContext::getCublasLtHandle(),
                                    plan.matmul_desc, plan.a_desc, plan.b_desc,
                                    plan.c_desc, plan.c_desc, &algo,
                                    &result) == CUBLAS_STATUS_SUCCESS &&
-           result.state == CUBLAS_STATUS_SUCCESS;
+           result.state == CUBLAS_STATUS_SUCCESS &&
+           result.workspaceSize <= plan.workspace_size;
 }
 
 // Times `samples` back-to-back executions of one candidate after a single
@@ -555,8 +556,13 @@ const cublasLtMatmulAlgo_t* tunable_select(GemmPlan& plan, DType dtype,
                 // The recorded configuration no longer runs on this plan;
                 // measure again so the database heals instead of pinning a
                 // choice nobody can execute.
+                ctx.logVerbose("recorded winner " + hit.kernel +
+                               " does not run on this plan; re-measuring");
                 measure_and_record();
             } else {
+                ctx.logVerbose("recorded winner " + hit.kernel +
+                               " does not run on this plan; using the "
+                               "heuristic top choice");
                 plan.tunable_epoch = ctx.epoch();
             }
         } else if (tensorplay::cuda::isCapturing()) {
