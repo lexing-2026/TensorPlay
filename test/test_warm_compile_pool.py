@@ -23,14 +23,28 @@ from tensorplay.compiler.backends.stax.runtime import warm_compile
 # --- gates -----------------------------------------------------------------------
 
 
-def test_environment_switch_disables_everything(monkeypatch):
+@pytest.fixture
+def fresh_pool_state():
+    """Pin the process-persistent pool out of the gate checks.
+
+    Other suites exercise the production autotune path, which may have
+    already built the shared pool; the gates must observe a clean slate.
+    """
+
+    saved = warm_compile._executor
+    warm_compile._executor = None
+    yield
+    warm_compile._executor = saved
+
+
+def test_environment_switch_disables_everything(monkeypatch, fresh_pool_state):
     monkeypatch.setenv("TP_STAX_PARALLEL_COMPILE", "0")
     assert warm_compile.enabled() is False
     assert warm_compile.warm_sources([]) == 0
     assert warm_compile._executor is None
 
 
-def test_single_task_is_not_worth_a_pool():
+def test_single_task_is_not_worth_a_pool(fresh_pool_state):
     # One candidate has nothing to overlap; the gate declines without
     # building the executor regardless of runtime availability.
     assert warm_compile.warm_sources([("src", "<f>", ())]) == 0
