@@ -73,7 +73,7 @@ void init_cuda_jiterator(py::module_& m) {
         "_cuda_jiterator_compile_and_launch_kernel",
         [](const py::object&, const py::object&, const py::object&,
            const py::object&, const py::object&, const py::object&) {
-            throw py::runtime_error(
+            throw std::runtime_error(
                 "jiterator requires a CUDA-enabled TensorPlay build");
         },
         py::arg("code_string"), py::arg("kernel_name"),
