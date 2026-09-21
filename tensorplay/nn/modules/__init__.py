@@ -23,6 +23,7 @@ from .activation import (
     SiLU,
     Softmin,
     Softmax,
+    Softmax2d,
     Softplus,
     Softshrink,
     Softsign,
@@ -109,6 +110,7 @@ from .loss import (
     TripletMarginWithDistanceLoss,
 )
 from .normalization import (
+    CrossMapLRN2d,
     GroupNorm,
     LayerNorm,
     LocalResponseNorm,
@@ -212,6 +214,7 @@ __all__ = [
     "CosineEmbeddingLoss",
     "CosineSimilarity",
     "CrossEntropyLoss",
+    "CrossMapLRN2d",
     "DepthwiseConv2d",
     "Dropout",
     "Dropout1d",
@@ -313,6 +316,7 @@ __all__ = [
     "SmoothL1Loss",
     "SoftMarginLoss",
     "Softmax",
+    "Softmax2d",
     "Softmin",
     "Softplus",
     "Softshrink",

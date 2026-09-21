@@ -9,7 +9,7 @@ from tensorplay.nn.parameter import Parameter
 from .module import Module
 
 
-__all__ = ["LocalResponseNorm", "LayerNorm", "GroupNorm", "RMSNorm"]
+__all__ = ["LocalResponseNorm", "CrossMapLRN2d", "LayerNorm", "GroupNorm", "RMSNorm"]
 
 
 class LocalResponseNorm(Module):
@@ -64,6 +64,36 @@ class LocalResponseNorm(Module):
         return F.local_response_norm(input, self.size, self.alpha, self.beta, self.k)
 
     def extra_repr(self):
+        """
+        Return the extra representation of the module.
+        """
+        return "{size}, alpha={alpha}, beta={beta}, k={k}".format(**self.__dict__)
+
+
+class CrossMapLRN2d(Module):
+    size: int
+    alpha: float
+    beta: float
+    k: float
+
+    def __init__(
+        self, size: int, alpha: float = 1e-4, beta: float = 0.75, k: float = 1
+    ) -> None:
+        super().__init__()
+        self.size = size
+        self.alpha = alpha
+        self.beta = beta
+        self.k = k
+
+    def forward(self, input: Tensor) -> Tensor:
+        """
+        Runs the forward pass.
+        """
+        from ._functions import CrossMapLRN2d as _CrossMapLRN2d
+
+        return _CrossMapLRN2d.apply(input, self.size, self.alpha, self.beta, self.k)
+
+    def extra_repr(self) -> str:
         """
         Return the extra representation of the module.
         """

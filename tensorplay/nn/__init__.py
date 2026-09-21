@@ -8,6 +8,7 @@ from tensorplay.nn.modules import *
 from tensorplay.nn import (
     attention as attention,
     functional as functional,
+    grad as grad,
     init as init,
     modules as modules,
     parameter as parameter,
