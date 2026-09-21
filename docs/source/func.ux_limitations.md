@@ -99,16 +99,6 @@ Not yet covered — they raise the `NotImplementedError` above: `dot`,
 `randn_like`, the norm layers (`batch_norm`, `group_norm`, `layer_norm`),
 `nonzero`, and `item`.
 
-:::{warning}
-`vmap` over a `Linear` module — or over `functional.linear` — with a
-*batched input* currently mis-shapes the output: the result arrives with an
-extra leading dimension (each slice along it identical), instead of the
-stacked per-sample outputs. Until the rule propagates the batch tag,
-formulate the layer explicitly — `x @ W + b` maps correctly — or map over
-the *parameters* instead of the inputs, which is the
-{func}`stack_module_state` ensemble pattern and works as documented.
-:::
-
 ### In-place operations
 
 In-place arithmetic has no batching rule and raises cleanly:
@@ -123,18 +113,18 @@ out-of-place form under `vmap`, or `x + y` directly.
 
 ### Data-dependent operations
 
-`.item()` and `nonzero` raise `NotImplementedError` under `vmap`; the
-output of a data-dependent op varies per sample, so no single stacked
-result exists. Rewrite the code to avoid materializing per-sample
-shapes.
+`.item()` raises `RuntimeError` under `vmap` — converting a batched value
+to a scalar is rejected because the result would depend on which sample is
+looked at — and `nonzero` raises `NotImplementedError`; the output of a
+data-dependent op varies per sample, so no single stacked result exists.
+Rewrite the code to avoid materializing per-sample shapes.
 
 ### Data-dependent Python control flow
 
 :::{warning}
 The condition of an `if` (or a `while`/`for` test) must not be a tensor
-being mapped over. In the current build this does not fail gracefully —
-it **crashes the interpreter** (a fault in the layer that converts a
-batched tensor to a boolean), so treat it as a hard error:
+being mapped over. The boolean conversion fails with a `RuntimeError` that
+explains the problem:
 
 ```python
 def relu(x):
@@ -142,7 +132,9 @@ def relu(x):
         return x
     return 0 * x
 
-vmap(relu)(tp.randn(3))     # crashes the process
+vmap(relu)(tp.randn(3))
+# RuntimeError: item() is not supported on a vmap-batched tensor;
+# data-dependent control flow cannot see per-batch values. ...
 ```
 
 Re-express value-dependent branches with {func}`tp.where`, whose
@@ -199,8 +191,9 @@ Verified compositions of the transforms with each other:
 ## Norm layers
 
 `batch_norm`, `group_norm`, and `layer_norm` all lack batching rules, so
-{func}`vmap` over any of them raises. Worse, the reverse-mode Jacobian
-transforms do not fail loudly on batch norm — they return garbage values
-(order 1e33, or NaN once running stats are disabled). See
+{func}`vmap` over any of them raises. The reverse-mode transforms
+({func}`grad` and {func}`jacrev`) do work through `batch_norm` — the
+running-stat update is in-place, so it bypasses the transform machinery,
+but the values themselves are correct. See
 [patching batch norm](func.batch_norm.md) before transforming a model that
 contains normalization.
