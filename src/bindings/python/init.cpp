@@ -1219,12 +1219,31 @@ PYBIND11_MODULE(_C, m) {
          if (obj.is_none()) {
               return py::none();
          }
-         try {
-             if (py::hasattr(obj, "__doc__")) {
-                  py::setattr(obj, "__doc__", py::str(doc.c_str()));
-             }
-         } catch (...) {
-             // Ignore errors if docstring cannot be set (e.g. read-only attribute)
+         // The stored strings must outlive this call: C-level descriptors keep
+         // only a pointer to the docstring text.
+         static std::vector<std::string> owned_docs;
+         owned_docs.push_back(doc);
+         const char* doc_str = owned_docs.back().c_str();
+         PyTypeObject* obj_type = Py_TYPE(obj.ptr());
+         if (obj_type == &PyCFunction_Type) {
+              // Builtins expose __doc__ as read-only; write the underlying
+              // method-table record instead.
+              auto* f = reinterpret_cast<PyCFunctionObject*>(obj.ptr());
+              f->m_ml->ml_doc = doc_str;
+         } else if (std::strcmp(obj_type->tp_name, "method_descriptor") == 0) {
+              auto* descr = reinterpret_cast<PyMethodDescrObject*>(obj.ptr());
+              descr->d_method->ml_doc = doc_str;
+         } else if (std::strcmp(obj_type->tp_name, "getset_descriptor") == 0) {
+              auto* descr = reinterpret_cast<PyGetSetDescrObject*>(obj.ptr());
+              descr->d_getset->doc = doc_str;
+         } else {
+              try {
+                  if (py::hasattr(obj, "__doc__")) {
+                       py::setattr(obj, "__doc__", py::str(doc_str));
+                  }
+              } catch (...) {
+                  // Ignore errors if docstring cannot be set (e.g. read-only attribute)
+              }
          }
          return obj;
      }, py::arg("obj").none(), py::arg("doc"), "Adds or replaces the docstring of a Python object.");
