@@ -100,6 +100,14 @@ def _module_names(tree: ast.Module) -> set[str]:
 
 
 def _replaces_module_object(tree: ast.Module) -> bool:
+    # PEP 562: a module-level __getattr__ resolves names lazily, so a name
+    # missing from globals() does not mean it is not exported.
+    if any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "__getattr__"
+        for node in tree.body
+    ):
+        return True
     return any(
         (
             isinstance(node, ast.Attribute)
