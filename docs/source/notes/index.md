@@ -9,6 +9,7 @@
 amp_examples
 autograd
 broadcasting
+cuda
 faq
 gradcheck
 modules
