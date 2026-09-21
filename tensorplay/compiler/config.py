@@ -16,6 +16,7 @@ __all__ = [
     "recompile_limit",
     "accumulated_recompile_limit",
     "compile_threads",
+    "cpu_row_tiling",
     "verbose",
     "fail_on_recompile_limit_hit",
     "force_disable_caches",
@@ -108,4 +109,15 @@ compile_threads: int | None = None
 first, then the machine's CPU count capped at a small bound.  ``1`` keeps
 every build on the calling thread, which keeps debugger stepping intact.
 Values below one are rejected at resolution time.
+"""
+
+
+cpu_row_tiling: bool = True
+"""Emit row-structured CPU kernels for layouts flat addressing rejects.
+
+Column broadcasts (one value per row), row-strided inputs, and
+row-broadcast widths the vector peel cannot align compile as an outer row
+loop with inner vector lanes instead of losing the fused route entirely.
+``False`` restores the legacy surface: those layouts decline the
+generated kernel and the region keeps its fallback execution.
 """

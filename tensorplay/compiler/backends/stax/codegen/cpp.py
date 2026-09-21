@@ -15,6 +15,12 @@ Code structure per kernel:
 * a scalar tail handling the final partial vector through the partial-width
   ``loadu``/``store`` overloads.
 
+Layouts the flat emitter cannot prove contiguous (column broadcasts,
+per-row scalars, strided rows, row-broadcast widths no vector peel can
+align) switch the loop nest to a row-structured plan instead: an outer
+row loop carries per-row base pointers and hoisted per-row scalars while
+the same three loop phases run along the row.
+
 Every data pointer is ``__restrict__``-qualified and the hot loops carry
 ``#pragma GCC ivdep`` so the compiler can reorder loads and stores freely.
 Constants are materialized once per body, outside all loops.
@@ -236,6 +242,154 @@ def analyze_input_modes(
                 continue
         return None
     return tuple(modes)
+
+
+def _row_tiling_enabled() -> bool:
+    """Whether row-structured kernels may rescue declined flat layouts."""
+
+    try:
+        from ....config import cpu_row_tiling
+    except ImportError:  # pragma: no cover - package layout is fixed
+        return True
+    return bool(cpu_row_tiling)
+
+
+def analyze_input_rows(
+    input_shapes: tuple[tuple[int, ...], ...],
+    input_strides: tuple[tuple[int, ...], ...],
+    out_shape: tuple[int, ...],
+) -> tuple[InputMode, ...] | None:
+    """Classify each input as an affine address over (row, column).
+
+    The row view flattens every output dimension but the last into the row
+    index ``r`` and keeps the last dimension as the column ``c``, which is
+    how the freshly allocated contiguous output is addressed.  An input is
+    row-addressable when its element address is exactly ``a*r + c`` (any row
+    stride, contiguous inside the row) or ``a*r`` (one element per row,
+    hoisted as a per-row broadcast) -- the two shapes a row loop can serve
+    with plain induction variables.  Transpositions, inner strides other
+    than one, and broadcasts that repeat an inner block across a varying
+    outer axis are not functions of the flat row index and keep the generic
+    fallback.
+
+    Returns one mode per input, or ``None`` when any input is outside that
+    surface.
+    """
+
+    if len(input_shapes) != len(input_strides) or not input_shapes:
+        return None
+    rank = len(out_shape)
+    if rank < 2:
+        return None
+    # Radix weight of each outer dimension over the dimensions that actually
+    # vary: the flat row index is sum(m_d * weight_d) with size-1 dimensions
+    # contributing nothing.
+    weights = [1] * rank
+    radix = 1
+    for d in range(rank - 2, -1, -1):
+        weights[d] = radix
+        if int(out_shape[d]) != 1:
+            radix *= int(out_shape[d])
+    varying = [d for d in range(rank - 1) if int(out_shape[d]) != 1]
+
+    modes: list[InputMode] = []
+    for shape, strides in zip(input_shapes, input_strides):
+        if len(shape) != len(strides) or len(shape) > rank:
+            return None
+        pad = rank - len(shape)
+        aligned_shape = (1,) * pad + tuple(int(d) for d in shape)
+        aligned_strides = (0,) * pad + tuple(int(s) for s in strides)
+        # Dims that contribute nothing to the address: size-1 (broadcast) or
+        # stride-0 (``expand`` of any extent).
+        live = {
+            d
+            for d in range(rank)
+            if aligned_shape[d] != 1 and aligned_strides[d] != 0
+        }
+        if not live:
+            modes.append(("splat", 0))
+            continue
+        if any(aligned_shape[d] != int(out_shape[d]) for d in live):
+            # A live dim must cover the full output extent; anything else is
+            # not a broadcast this view can serve.
+            return None
+        live_varying = [d for d in varying if d in live]
+        if live_varying:
+            if len(live_varying) != len(varying):
+                # A varying outer axis this input broadcasts along repeats
+                # its inner block across rows: the address stops being a
+                # function of the flat row index.
+                return None
+            row_stride: int | None = None
+            for d in varying:
+                stride = aligned_strides[d]
+                weight = weights[d]
+                if stride < 0 or stride % weight != 0:
+                    return None
+                candidate = stride // weight
+                if row_stride is None:
+                    row_stride = candidate
+                elif row_stride != candidate:
+                    return None
+        else:
+            # No live outer contribution: the address is column-only.
+            row_stride = 0
+        if rank - 1 in live:
+            if aligned_strides[rank - 1] != 1:
+                return None
+            modes.append(("rowstrided", int(row_stride)))
+        else:
+            modes.append(("rowscalar", int(row_stride)))
+    return tuple(modes)
+
+
+def _classify_pinned_layouts(
+    input_shapes: tuple[tuple[int, ...], ...],
+    input_strides: tuple[tuple[int, ...], ...],
+    out_shape: tuple[int, ...],
+    lane_count: int,
+) -> tuple[tuple[InputMode, ...] | None, tuple[InputMode, ...] | None]:
+    """Pick the addressing plan for a pinned specialization.
+
+    Returns ``(flat_modes, row_modes)`` with at most one non-``None``.
+    Flat addressing wins whenever it can express every input -- including
+    row broadcasts through the aligned modulo path, whose generated kernels
+    stay byte-for-byte what they were.  The row-structured plan only
+    rescues layouts the flat emitter must reject (column broadcasts,
+    per-row scalars, strided rows, unaligned row-broadcast widths): there
+    it is the only correct emitter, so it is chosen for expressibility
+    rather than speed.
+    """
+
+    try:
+        flat_modes = analyze_input_modes(
+            input_shapes, input_strides, out_shape, lane_count
+        )
+    except (TypeError, ValueError):
+        flat_modes = None
+    if flat_modes is not None:
+        return flat_modes, None
+    if not _row_tiling_enabled():
+        return None, None
+    try:
+        row_modes = analyze_input_rows(input_shapes, input_strides, out_shape)
+    except (TypeError, ValueError):
+        row_modes = None
+    return None, row_modes
+
+
+def layouts_addressable(
+    input_shapes: tuple[tuple[int, ...], ...],
+    input_strides: tuple[tuple[int, ...], ...],
+    out_shape: tuple[int, ...],
+    lane_count: int,
+) -> bool:
+    """Whether the CPU generators can address these exact input layouts."""
+
+    flat_modes, row_modes = _classify_pinned_layouts(
+        input_shapes, input_strides, out_shape, lane_count
+    )
+    return flat_modes is not None or row_modes is not None
 
 
 def _check_ref(
@@ -503,7 +657,9 @@ def emit_value_program(
     and ``rowval`` inputs to the enclosing loop's per-row value; neither
     is reloaded.  ``staged`` inputs read a value an earlier pass over this
     row already wrote, addressed by ``row_offset`` -- the position inside
-    the row rather than the flat index.
+    the row rather than the flat index.  ``rowptr`` inputs read through a
+    per-row base pointer ``p{ref}`` the enclosing row loop maintains, which
+    keeps the offset column-only regardless of the input's row stride.
 
     Returns the emitted lines and the identifier holding the program result,
     so a caller can feed it straight into an accumulator combine instead of
@@ -532,6 +688,8 @@ def emit_value_program(
             address = f"sc{width} + ({row_offset if row_offset else offset})"
         elif mode == "colmod":
             address = f"in{ref} + (({offset}) % {width})"
+        elif mode == "rowptr":
+            address = f"p{ref} + ({offset})"
         else:
             address = f"in{ref} + ({offset})"
         lines.append(f"{indent}V {name(ref)} = V::loadu({address}, {count_expr});")
@@ -587,9 +745,16 @@ def render_kernel_source(
 
     ``input_shapes``/``input_strides`` (when given) select per-input
     addressing modes: broadcast scalars become hoisted splats and row
-    broadcasts become ``i % S`` addresses under an alignment peel.  Passing
-    them without ``out_shape`` has no effect -- the modes are only valid for
-    a pinned specialization.
+    broadcasts become ``i % S`` addresses under an alignment peel.  Layouts
+    the flat emitter cannot prove contiguous switch to the row-structured
+    plan instead: an outer row loop carries per-row base pointers and
+    hoisted per-row scalars while the same vector lanes run along the row,
+    which also covers column broadcasts, strided rows, and row-broadcast
+    widths no vector peel can align.  Layouts neither plan can address
+    raise, so the caller declines instead of trusting flat addresses
+    against differently shaped buffers.  Passing them without
+    ``out_shape`` has no effect -- the modes are only valid for a pinned
+    specialization.
     """
 
     used_inputs = _analyze_instructions(
@@ -611,57 +776,32 @@ def render_kernel_source(
     # tier width, which is conservative in the safe direction: a ``colmod``
     # width divisible by 16 is divisible by every smaller lane count.
     tier_width = lane_count if lane_count is not None else 16
+    layouts_given = (
+        out_shape is not None
+        and input_shapes is not None
+        and input_strides is not None
+    )
     input_modes: tuple[InputMode, ...] | None = None
-    if out_shape is not None and input_shapes is not None and input_strides is not None:
-        try:
-            input_modes = analyze_input_modes(
-                input_shapes, input_strides, out_shape, tier_width
-            )
-        except (TypeError, ValueError):
-            input_modes = None
-    if input_modes is None:
+    row_modes: tuple[InputMode, ...] | None = None
+    if layouts_given:
+        pinned_out_shape = tuple(int(d) for d in out_shape)
+        input_modes, row_modes = _classify_pinned_layouts(
+            input_shapes, input_strides, pinned_out_shape, tier_width
+        )
+        if input_modes is None and row_modes is None:
+            # The pinned route trusts these layouts: an input outside the
+            # generators' addressing surface must decline the kernel here
+            # instead of emitting flat addresses into a differently shaped
+            # buffer.
+            raise _ProgramError("input layouts outside the CPU addressing surface")
+    if input_modes is None and row_modes is None:
         input_modes = (("flat", 0),) * input_count
+    active_modes = row_modes if row_modes is not None else input_modes
     splat_refs = [
-        ref for ref in sorted(used_inputs) if input_modes[ref][0] == "splat"
+        ref for ref in sorted(used_inputs) if active_modes[ref][0] == "splat"
     ]
     splat_decls = "\n".join(
         f"    const V h{ref} = V(in{ref}[0]);" for ref in splat_refs
-    )
-
-    unrolled_body = ""
-    if len(instructions) <= _UNROLL_MAX_STEPS:
-        unrolled_body = _emit_body(
-            instructions,
-            constants,
-            input_count,
-            output_ref,
-            used_inputs,
-            "        ",
-            unrolled=True,
-            partial=False,
-            input_modes=input_modes,
-        )
-    single_body = _emit_body(
-        instructions,
-        constants,
-        input_count,
-        output_ref,
-        used_inputs,
-        "        ",
-        unrolled=False,
-        partial=False,
-        input_modes=input_modes,
-    )
-    tail_body = _emit_body(
-        instructions,
-        constants,
-        input_count,
-        output_ref,
-        used_inputs,
-        "        ",
-        unrolled=False,
-        partial=True,
-        input_modes=input_modes,
     )
 
     input_params = ", ".join(
@@ -674,35 +814,6 @@ def render_kernel_source(
         for i in range(input_count)
     )
 
-    # Alignment peel for ``colmod`` inputs: every vector must start at a
-    # flat index congruent to 0 mod the vector width so, together with the
-    # row width being a multiple of the widest tier width, the whole vector
-    # stays inside one row.  Advance from the chunk start to the next
-    # boundary with scalar steps; interior iterations are then fully
-    # vectorized row-interior loads.
-    peel_needed = any(mode == "colmod" for mode, _ in input_modes)
-    peel_loop = ""
-    if peel_needed:
-        peel_loop = (
-            "    for (; i % W != 0 && i < e; ++i) {\n"
-            "        const long count = 1;\n"
-            f"{tail_body}\n"
-            "    }\n"
-        )
-
-    splat_hoists = ""
-    if splat_refs:
-        splat_hoists = f"{splat_decls}\n"
-
-    unrolled_loop = ""
-    if unrolled_body:
-        unrolled_loop = (
-            "    #pragma GCC ivdep\n"
-            "    for (; i + 4 * W <= e; i += 4 * W) {\n"
-            f"{unrolled_body}\n"
-            "    }\n"
-        )
-
     # Worksharing policy follows the parallel-depth decision of the
     # CPU kernels: a region runs on the shared pool only when each
     # thread would still receive at least one minimum chunk (otherwise the
@@ -713,7 +824,185 @@ def render_kernel_source(
     threads = _pool_threads()
     serial_cutoff = threads * min_chunk
 
-    entry_call_tail = ""
+    splat_hoists = ""
+    if splat_refs:
+        splat_hoists = f"{splat_decls}\n"
+
+    if row_modes is not None:
+        # Row-structured plan: the parallel range counts rows, each row's
+        # base pointers and per-row scalars are set up once, and the vector
+        # lanes (plus the same four-way unroll and masked tail) run along
+        # the row.  Broadcast widths need no modulo here -- the column
+        # index is the broadcast index directly.
+        body_range_params = "long long rb, long long re"
+        element_count = 1
+        for d in out_shape:
+            element_count *= int(d)
+        cols = int(out_shape[-1])
+        row_count = element_count // cols if cols else 0
+        emit_modes = tuple(
+            ("splat", 0)
+            if mode == "splat"
+            else ("rowval", ref)
+            if mode == "rowscalar"
+            else ("rowptr", 0)
+            for ref, (mode, _param) in enumerate(row_modes)
+        )
+
+        def row_section(offset: str, count_expr: str, suffix: str) -> str:
+            section_lines, result = emit_value_program(
+                instructions,
+                constants,
+                input_count,
+                output_ref,
+                used_inputs,
+                indent="            ",
+                offset=offset,
+                count_expr=count_expr,
+                suffix=suffix,
+                input_modes=emit_modes,
+            )
+            section_lines.append(
+                f"            {result}.store(orow + ({offset}), {count_expr});"
+            )
+            return "\n".join(section_lines)
+
+        preamble_lines: list[str] = []
+        for ref in sorted(used_inputs):
+            mode, param = row_modes[ref]
+            if mode == "rowstrided":
+                preamble_lines.append(
+                    f"        const float* __restrict__ p{ref} = in{ref} + r * {param}LL;"
+                )
+            elif mode == "rowscalar":
+                preamble_lines.append(
+                    f"        const V s{ref} = V(in{ref}[r * {param}LL]);"
+                )
+        preamble_lines.append(
+            f"        float* __restrict__ orow = out + r * {cols}LL;"
+        )
+        preamble = "\n".join(preamble_lines)
+
+        unrolled_src = ""
+        if len(instructions) <= _UNROLL_MAX_STEPS:
+            lanes = [
+                row_section(
+                    "col" if lane == 0 else f"col + {lane} * W", "W", str(lane)
+                )
+                for lane in range(4)
+            ]
+            unrolled_src = (
+                "        #pragma GCC ivdep\n"
+                f"        for (; col + 4 * W <= {cols}LL; col += 4 * W) {{\n"
+                + "\n".join(lanes)
+                + "\n        }\n"
+            )
+        single_src = row_section("col", "W", "")
+        tail_src = row_section("col", "count", "")
+        grain_rows = max(1, min_chunk // cols) if cols else 1
+        body_loops = (
+            "    for (long long r = rb; r < re; ++r) {\n"
+            f"{preamble}\n"
+            "        long long col = 0;\n"
+            f"{unrolled_src}"
+            "        #pragma GCC ivdep\n"
+            f"        for (; col + W <= {cols}LL; col += W) {{\n"
+            f"{single_src}\n"
+            "        }\n"
+            f"        if (col < {cols}LL) {{\n"
+            f"            const long count = {cols}LL - col;\n"
+            f"{tail_src}\n"
+            "        }\n"
+            "    }"
+        )
+        entry_dispatch = (
+            f"        tp_body(&ctx, 0, {row_count}LL);\n"
+            "    } else {\n"
+            f"        tp_parallel_for_c(0, {row_count}LL, {grain_rows}LL, tp_body, &ctx);\n"
+            "    }"
+        )
+    else:
+        body_range_params = "long long b, long long e"
+        unrolled_body = ""
+        if len(instructions) <= _UNROLL_MAX_STEPS:
+            unrolled_body = _emit_body(
+                instructions,
+                constants,
+                input_count,
+                output_ref,
+                used_inputs,
+                "        ",
+                unrolled=True,
+                partial=False,
+                input_modes=input_modes,
+            )
+        single_body = _emit_body(
+            instructions,
+            constants,
+            input_count,
+            output_ref,
+            used_inputs,
+            "        ",
+            unrolled=False,
+            partial=False,
+            input_modes=input_modes,
+        )
+        tail_body = _emit_body(
+            instructions,
+            constants,
+            input_count,
+            output_ref,
+            used_inputs,
+            "        ",
+            unrolled=False,
+            partial=True,
+            input_modes=input_modes,
+        )
+
+        # Alignment peel for ``colmod`` inputs: every vector must start at a
+        # flat index congruent to 0 mod the vector width so, together with the
+        # row width being a multiple of the widest tier width, the whole vector
+        # stays inside one row.  Advance from the chunk start to the next
+        # boundary with scalar steps; interior iterations are then fully
+        # vectorized row-interior loads.
+        peel_needed = any(mode == "colmod" for mode, _ in input_modes)
+        peel_loop = ""
+        if peel_needed:
+            peel_loop = (
+                "    for (; i % W != 0 && i < e; ++i) {\n"
+                "        const long count = 1;\n"
+                f"{tail_body}\n"
+                "    }\n"
+            )
+
+        unrolled_loop = ""
+        if unrolled_body:
+            unrolled_loop = (
+                "    #pragma GCC ivdep\n"
+                "    for (; i + 4 * W <= e; i += 4 * W) {\n"
+                f"{unrolled_body}\n"
+                "    }\n"
+            )
+        body_loops = (
+            "    long i = b;\n"
+            f"{peel_loop}"
+            f"{unrolled_loop}"
+            "    #pragma GCC ivdep\n"
+            "    for (; i + W <= e; i += W) {\n"
+            f"{single_body}\n"
+            "    }\n"
+            "    if (i < e) {\n"
+            "        const long count = e - i;\n"
+            f"{tail_body}\n"
+            "    }"
+        )
+        entry_dispatch = (
+            "        tp_body(&ctx, 0, n);\n"
+            "    } else {\n"
+            f"        tp_parallel_for_c(0, n, {min_chunk}LL, tp_body, &ctx);\n"
+            "    }"
+        )
+
     runner_section = ""
     direct_section = ""
     extra_includes = ""
@@ -827,33 +1116,20 @@ def render_kernel_source(
         "    float* out;\n"
         "} TP_Ctx;\n"
         "\n"
-        "static void tp_body(void* ctxp, long long b, long long e) {\n"
+        f"static void tp_body(void* ctxp, {body_range_params}) {{\n"
         "    const TP_Ctx* c = (const TP_Ctx*)ctxp;\n"
         f"{ctx_loads}"
         "    float* __restrict__ out = c->out;\n"
         "    const long W = V::size();\n"
         f"{const_decls}\n"
         f"{splat_hoists}"
-        "    long i = b;\n"
-        f"{peel_loop}"
-        f"{unrolled_loop}"
-        "    #pragma GCC ivdep\n"
-        "    for (; i + W <= e; i += W) {\n"
-        f"{single_body}\n"
-        "    }\n"
-        "    if (i < e) {\n"
-        "        const long count = e - i;\n"
-        f"{tail_body}\n"
-        "    }\n"
+        f"{body_loops}\n"
         "}\n"
         "\n"
         f'extern "C" void {entry}(long n, {input_params}, float* __restrict__ out) {{\n'
         f"    TP_Ctx ctx{{{ctx_init}}};\n"
         f"    if (n < {serial_cutoff}LL) {{\n"
-        "        tp_body(&ctx, 0, n);\n"
-        "    } else {\n"
-        f"        tp_parallel_for_c(0, n, {min_chunk}LL, tp_body, &ctx);\n"
-        "    }\n"
+        f"{entry_dispatch}\n"
         "}\n"
         f"{runner_section}"
         f"{direct_section}"
@@ -1042,11 +1318,14 @@ def _digest_entry_key(
     version_info,
     pinned_shape=None,
     layout_key=None,
+    tiling=None,
 ) -> str:
     # The pinned shape and per-input layouts are baked into the generated
     # unit (output allocation, addressing modes), so they belong in the
     # entry symbol: two specializations sharing one program must never
-    # collide on a cached artifact.
+    # collide on a cached artifact.  The tiling plan follows from the same
+    # layouts and the row-tiling switch, so it is named explicitly rather
+    # than left implicit in the layout key.
     return hashlib.sha256(
         repr(
             (
@@ -1058,6 +1337,7 @@ def _digest_entry_key(
                 version_info,
                 pinned_shape,
                 layout_key,
+                tiling,
             )
         ).encode()
     ).hexdigest()[:16]
@@ -1144,19 +1424,29 @@ def build_cpu_native_kernel(
             tuple(tuple(int(s) for s in st) for st in input_strides),
         )
 
-    entry = f"tp_native_{_digest_entry_key(instructions, constants, input_count, output_ref, isa.name, version_info, pinned_shape, layout_key)}"
-    source = render_kernel_source(
-        instructions,
-        constants,
-        input_count,
-        output_ref,
-        entry,
-        out_shape=pinned_shape,
-        out_device=out_device_code,
-        input_shapes=input_shapes if layout_key is not None else None,
-        input_strides=input_strides if layout_key is not None else None,
-        lane_count=isa.nelements(),
-    )
+    entry_key_tiling = None
+    if layout_key is not None:
+        _flat_modes, plan_rows = _classify_pinned_layouts(
+            input_shapes, input_strides, pinned_shape, isa.nelements()
+        )
+        entry_key_tiling = "row" if plan_rows is not None else None
+
+    entry = f"tp_native_{_digest_entry_key(instructions, constants, input_count, output_ref, isa.name, version_info, pinned_shape, layout_key, entry_key_tiling)}"
+    try:
+        source = render_kernel_source(
+            instructions,
+            constants,
+            input_count,
+            output_ref,
+            entry,
+            out_shape=pinned_shape,
+            out_device=out_device_code,
+            input_shapes=input_shapes if layout_key is not None else None,
+            input_strides=input_strides if layout_key is not None else None,
+            lane_count=isa.nelements(),
+        )
+    except _ProgramError:
+        return None
     pinned = pinned_shape is not None and out_device_code is not None
 
     lib = compile_translation_unit(
