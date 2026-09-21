@@ -22,7 +22,35 @@ __all__ = [
     "manual_seed",
     "seed",
     "set_rng_state",
+    "thread_safe_generator",
 ]
+
+
+def thread_safe_generator():
+    """Returns a thread-safe random number generator for use in DataLoader workers.
+
+    This function provides a convenient way for transforms and user code to use
+    thread-safe random number generation without manually checking worker context.
+
+    When called in a DataLoader thread worker, returns the worker's thread-local
+    :class:`tensorplay.Generator`. When called in the main process or process workers,
+    returns ``None`` (which causes operations to use the default global RNG).
+
+    Example:
+        >>> from tensorplay.random import thread_safe_generator
+        >>> generator = thread_safe_generator()
+        >>> tensorplay.randint(0, 10, (5,), generator=generator)
+    """
+    from .utils.data import get_worker_info
+
+    worker_info = get_worker_info()
+    if (
+        worker_info is not None
+        and worker_info.worker_method == "thread"
+        and worker_info.rng is not None
+    ):
+        return worker_info.rng.torch_generator
+    return None
 
 
 @contextlib.contextmanager
