@@ -409,7 +409,6 @@ has_lapack = True
 has_spectral = True
 compiled_with_cxx11_abi = True
 
-
 __all__ = [
     "Tensor", "tensor", "from_dlpack", "Scalar", "SymInt", "SymBool", "SymFloat",
     "sym_float", "sym_int", "sym_not", "sym_min", "sym_max", "sym_ite", "sym_sum",
@@ -436,6 +435,7 @@ __all__ = [
     "is_storage",
     "get_rng_state", "set_rng_state", "fork_rng", "thread_safe_generator",
     "DeviceMismatchError",
+    "cond", "while_loop",
     "__config__",
 ]
 
@@ -1645,3 +1645,9 @@ if _is_device_backend_autoload_enabled():
     _import_device_backends()
 
 _polish_public_surface()
+
+
+# Structural control flow operators; map and scan stay under
+# tensorplay._higher_order_ops.  Imported last: the operator modules reach
+# back into the package surface through the graph and nn layers.
+from tensorplay._higher_order_ops import cond as cond, while_loop as while_loop

@@ -18,7 +18,11 @@ from typing import Any, Iterator
 
 import tensorplay
 from tensorplay import Tensor
-from tensorplay._higher_order_ops._hop_base import _AutoDispatchBelowAutograd
+from tensorplay._higher_order_ops._hop_base import (
+    _AutoDispatchBelowAutograd,
+    disable_functional_mode,
+    suspend_functionalization,
+)
 
 
 @dataclass
@@ -87,8 +91,9 @@ def autograd_not_implemented(op: Callable[..., Any], deferred_error: bool) -> Ca
 def _maybe_run_with_interpreter(fn):
     maybe_interpreted_fn = fn
     from tensorplay.graph import traceback as fx_traceback
+    from tensorplay.graph.graph_module import GraphModule as _GraphModule
 
-    if isinstance(fn, tensorplay.graph_module.GraphModule) and (
+    if isinstance(fn, _GraphModule) and (
         fx_traceback.should_preserve_node_meta
     ):
         # Running graph with interpreter is needed for propagating the stack_trace
@@ -244,7 +249,7 @@ def _graph_mutated_inputs(gm: Any, inputs: Sequence[Any]) -> list[int]:
 
 def _as_graph_module(gm: Any, inputs: Sequence[Any], pre_dispatch: bool = False) -> Any:
     """Materialize a callable into a GraphModule when it is not one yet."""
-    from tensorplay.graph_module import GraphModule as _GM
+    from tensorplay.graph.graph_module import GraphModule as _GM
 
     if isinstance(gm, _GM):
         return gm
@@ -412,3 +417,481 @@ def setup_compilation_env() -> Iterator[Any]:
     from tensorplay.compiler import get_default_backend
 
     yield get_default_backend()
+
+
+# ---------------------------------------------------------------------------
+# Structural control-flow operator helpers (cond / while_loop / map / scan).
+# These helpers operate on flattened argument lists produced by the pytree
+# flattening that each structural control-flow operator performs on entry.
+# ---------------------------------------------------------------------------
+
+
+def _pytree_api():
+    """Late-bound pytree access (avoids import cycles at module scope)."""
+    from tensorplay.utils import _pytree
+
+    return _pytree
+
+
+def _tensor_data_ptr(t: Tensor) -> Any:
+    """A hashable storage identity for aliasing checks, or None."""
+    get = getattr(t, "data_ptr", None)
+    if callable(get):
+        try:
+            return (get(), t.storage_offset() if hasattr(t, "storage_offset") else 0)
+        except Exception:
+            return None
+    return None
+
+
+def filter_with_masks(data: Sequence[Any], masks: Sequence[bool]) -> list[Any]:
+    """Keep only the positions of ``data`` whose mask entry is True."""
+    if len(data) != len(masks):
+        raise AssertionError(
+            f"data length ({len(data)}) != masks length ({len(masks)})"
+        )
+    return [item for item, keep in zip(data, masks) if keep]
+
+
+def fill_none_with_masks(data: Sequence[Any], masks: Sequence[bool]) -> list[Any]:
+    """Reinsert None at the positions dropped by :func:`filter_with_masks`."""
+    data_iter = iter(data)
+    return [next(data_iter) if kept else None for kept in masks]
+
+
+def create_fn_remove_none(fn: Callable) -> tuple[Callable, list[bool]]:
+    """Wrap ``fn`` so its non-Tensor output leaves are dropped.
+
+    Returns ``(wrapped, mask)``: ``wrapped(*args)`` calls ``fn(*args)``,
+    flattens the pytree result and returns only its Tensor leaves as a
+    list.  ``mask`` is one bool per leaf, True where the leaf is a Tensor;
+    it is populated when ``wrapped`` runs, so callers must read it AFTER
+    invoking ``wrapped`` and pass it to :func:`fill_none_with_masks` to
+    reconstruct the full output with None at the dropped slots.
+    """
+    mask: list[bool] = []
+
+    @functools.wraps(fn)
+    def wrapped(*args: Any, **kwargs: Any) -> list[Tensor]:
+        leaves = _pytree_api().tree_leaves(fn(*args, **kwargs))
+        mask.clear()
+        mask.extend(isinstance(o, Tensor) for o in leaves)
+        return filter_with_masks(leaves, mask)
+
+    return wrapped, mask
+
+
+def get_tensor_mask(tensor_list: Iterable[Any]) -> list[bool]:
+    """One bool per element: whether it is a Tensor."""
+    return [bool(isinstance(v, Tensor)) for v in tensor_list]
+
+
+def mask_list(
+    mask: Sequence[bool], inp: Sequence[Any], other: Sequence[Any] | None = None
+) -> list[Any]:
+    """Filter ``inp`` by ``mask``; with ``other``, replace instead of drop."""
+    if len(mask) != len(inp):
+        raise AssertionError(
+            f"The length of the mask ({len(mask)}) needs to be identical to the "
+            f"length of the input ({len(inp)})"
+        )
+    if other is not None:
+        if len(inp) != len(other):
+            raise AssertionError(
+                f"If an input and an other list is provided, they need to have "
+                f"the same length ({len(inp)} != {len(other)})"
+            )
+        return [i if m else o for m, i, o in zip(mask, inp, other)]
+    return [i for m, i in zip(mask, inp) if m]
+
+
+def first_slice_copy(t: Tensor, dim: int = 0) -> Tensor:
+    """A copy of the first slice along ``dim`` (zeros when the dim is empty)."""
+    if t.shape[dim] == 0:
+        shape = list(t.shape)
+        del shape[dim]
+        return t.new_zeros(shape)
+    return t.select(dim, 0).clone()
+
+
+def unique_graph_id(proxy_mode: Any, prefix: str) -> tuple[int, str]:
+    """A name and its index unused on the capture root, for attaching subgraphs."""
+    root = getattr(proxy_mode.tracer, "root", None)
+    next_name = None
+    i = 0
+    while not next_name:
+        candidate = f"{prefix}_{i}"
+        if root is not None and hasattr(root, candidate):
+            i += 1
+        else:
+            next_name = candidate
+    return i, next_name
+
+
+def _from_fun(t: Any) -> Any:
+    """A metadata stand-in for ``t`` that shares no state with the original.
+
+    Used when a callable is traced into a subgraph: the capture only reads
+    metadata, so an uninitialized allocation with matching shape, stride,
+    dtype and device keeps the original values out of the traced body.
+    """
+    if isinstance(t, Tensor):
+        if t.dtype != tensorplay.bool:
+            stand_in = tensorplay.empty_strided(
+                t.size(),
+                t.stride(),
+                dtype=t.dtype,
+                device=t.device,
+            )
+            if t.requires_grad:
+                stand_in.requires_grad_(True)
+            return stand_in
+        return t.clone()
+    return t
+
+
+def _unstack_pytree(xs: Any) -> list[Any]:
+    """Split a pytree whose leaves share a leading dim into per-index pytrees."""
+    pytree = _pytree_api()
+    flat_xs, inspec = pytree.tree_flatten(xs)
+    if not all(isinstance(x, Tensor) for x in flat_xs):
+        raise RuntimeError(f"Leaves of xs must be Tensor {flat_xs}")
+
+    if not all(x.shape[0] == flat_xs[0].shape[0] for x in flat_xs):
+        raise RuntimeError(
+            "Leaves of xs must have same leading dimension size "
+            f"{[x.shape for x in flat_xs]}"
+        )
+
+    return [pytree.tree_unflatten(tuple, inspec) for tuple in zip(*flat_xs)]
+
+
+def _stack_pytree(pytrees: Sequence[Any]) -> Any:
+    """Stack per-index pytrees back into one pytree with a leading dim."""
+    pytree = _pytree_api()
+    flat_out = []
+    out_spec = None
+    for pt in pytrees:
+        flat_pt, out_spec = pytree.tree_flatten(pt)
+        flat_out.append(flat_pt)
+    if out_spec is None:
+        raise AssertionError("out_spec cannot be None")
+    stacked_out = []
+    for leaves in zip(*flat_out):
+        if all(isinstance(leaf, Tensor) for leaf in leaves):
+            stacked_out.append(tensorplay.stack(list(leaves)))
+        elif all(leaf is None for leaf in leaves):
+            # A backward body can return None where the forward input did
+            # not require grad; keep the slot instead of failing the stack.
+            stacked_out.append(None)
+        else:
+            raise RuntimeError(f"Cannot stack {leaves}.")
+    return pytree.tree_unflatten(stacked_out, out_spec)
+
+
+def _clone_aliasing_output(
+    inputs: Sequence[Any], outputs: Sequence[Any]
+) -> list[Any]:
+    """Copy outputs that share storage with an input or a previous output.
+
+    A gradient that aliases an operand or another gradient (a view returned
+    by the differentiated body) would let later in-place accumulation on the
+    caller's side corrupt values it does not own, so every such alias is
+    broken with an explicit copy.
+    """
+    seen_ptrs = set()
+    for t in inputs:
+        if isinstance(t, Tensor):
+            ptr = _tensor_data_ptr(t)
+            if ptr is not None:
+                seen_ptrs.add(ptr)
+    final_outputs = []
+    for out in outputs:
+        if isinstance(out, Tensor):
+            ptr = _tensor_data_ptr(out)
+            if ptr is not None and ptr in seen_ptrs:
+                out = out.clone()
+                ptr = _tensor_data_ptr(out)
+            if ptr is not None:
+                seen_ptrs.add(ptr)
+        final_outputs.append(out)
+    return final_outputs
+
+
+def check_meta_consistency(
+    lhs_list: Sequence[Any],
+    rhs_list: Sequence[Any],
+    lhs_name: str,
+    rhs_name: str,
+) -> None:
+    """Raise unless two flat value lists carry matching tensor metadata."""
+
+    def _describe(t: Any) -> str:
+        if isinstance(t, Tensor):
+            return (
+                f"shape {tuple(t.shape)}, dtype {t.dtype}, device {t.device}"
+            )
+        return repr(t)
+
+    if len(lhs_list) != len(rhs_list):
+        raise RuntimeError(
+            f"Expected {lhs_name} and {rhs_name} to have the same number of "
+            f"outputs but got lhs: {list(lhs_list)} and rhs: {list(rhs_list)}."
+        )
+    for i, (lhs, rhs) in enumerate(zip(lhs_list, rhs_list)):
+        if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+            if (
+                tuple(lhs.shape) != tuple(rhs.shape)
+                or lhs.dtype != rhs.dtype
+                or str(lhs.device) != str(rhs.device)
+            ):
+                raise RuntimeError(
+                    f"Expected {lhs_name} and {rhs_name} to have the same "
+                    f"metadata but pair[{i}] differ: {_describe(lhs)} vs "
+                    f"{_describe(rhs)}."
+                )
+        elif isinstance(lhs, Tensor) != isinstance(rhs, Tensor):
+            raise RuntimeError(
+                f"Expected {lhs_name} and {rhs_name} to have the same types "
+                f"but pair[{i}] differ: {_describe(lhs)} vs {_describe(rhs)}."
+            )
+
+
+def check_input_alias_and_mutation_return_outputs(
+    gm: Any,
+) -> tuple[dict[int, int], dict[int, int], dict[int, int], list[int], list[Any]]:
+    """Structural alias/mutation report for a traced graph.
+
+    Input mutation is detected by the in-place naming convention on graph
+    calls (see :func:`_graph_mutated_inputs`); input-output aliasing is
+    detected for placeholder outputs that pass through the graph unchanged.
+    Output-output storage aliasing is not observable structurally in this
+    build and stays empty.  Returns
+    ``(inp_inp_alias, inp_out_alias, out_out_alias, mutated_inputs, outputs)``
+    where ``outputs`` are the flattened output leaves.
+    """
+    graph = getattr(gm, "graph", None)
+    if graph is None:
+        return {}, {}, {}, [], []
+    from tensorplay.graph.node import Node
+
+    placeholders = [n for n in graph.nodes if n.op == "placeholder"]
+    ph_index = {n.name: i for i, n in enumerate(placeholders)}
+    mutated = _graph_mutated_inputs(gm, [])
+
+    output_node = next((n for n in graph.nodes if n.op == "output"), None)
+    outputs: list[Any] = []
+    if output_node is not None:
+        outputs = list(_pytree_api().tree_flatten(output_node.args[0])[0])
+    inp_out_alias = {}
+    for i, out in enumerate(outputs):
+        if isinstance(out, Node) and out.op == "placeholder":
+            inp_out_alias[ph_index[out.name]] = i
+    return {}, inp_out_alias, {}, mutated, outputs
+
+
+def check_input_alias_and_mutation(
+    gm: Any, fake_args: Sequence[Any]
+) -> tuple[dict[int, int], dict[int, int], dict[int, int], list[int]]:
+    """Alias maps and mutated-input list for a traced graph."""
+    inp_inp, inp_out, out_out, mutated, _ = check_input_alias_and_mutation_return_outputs(
+        gm
+    )
+    return inp_inp, inp_out, out_out, mutated
+
+
+def materialize_as_graph(
+    fn: Callable,
+    args: Sequence[Any],
+    include_key_set: Any = None,
+    exclude_key_set: Any = None,
+    force_enable_grad: bool = False,
+) -> Any:
+    """Trace ``fn`` on metadata stand-ins into a standalone GraphModule.
+
+    ``include_key_set`` / ``exclude_key_set`` are accepted for call-site
+    compatibility; this build has no dispatch key sets, so the surrounding
+    role state is irrelevant to the produced graph.  The callable must be a
+    plain dataflow function: bodies that consult the autograd engine (for
+    example a backward closure) cannot be captured and stay eager.
+    """
+    from tensorplay.graph.experimental.proxy_tensor import (
+        disable_proxy_modes_tracing as _disable_tracing,
+    )
+
+    del include_key_set, exclude_key_set
+    with suspend_functionalization(), disable_functional_mode():
+        with _disable_tracing():
+            stand_ins = [_from_fun(arg) for arg in args]
+            if force_enable_grad:
+                with tensorplay.enable_grad():
+                    return _maybe_reenter_make_fx(fn)(*stand_ins)
+            return _maybe_reenter_make_fx(fn)(*stand_ins)
+
+
+def create_bw_fn(
+    fn: Callable, args: Sequence[Any], return_fw_outputs: bool = False
+) -> Callable:
+    """Build the vector-Jacobian closure of ``fn`` over flat ``args``.
+
+    For a function invoked as ``fw_out = fn(*args)``, the returned closure
+    computes::
+
+        grad_args = bw_fn(*args, *grad_out)
+
+    with the following invariants:
+      1. ``args`` plus the flattened ``fw_out`` leaves stand in 1-1
+         correspondence with the closure's flat arguments.
+      2. ``grad_args`` has 1-1 correspondence with ``args``.
+      3. a Tensor argument whose gradient is not reachable (None) still
+         receives a zero tensor of the argument's shape and dtype.
+      4. gradients aliasing the closure's inputs or each other are copied.
+
+    The closure recomputes the forward on detached leaf copies under
+    enabled-grad, so it is safe to call from inside a backward and supports
+    nested (higher-order) differentiation.
+    """
+    n_primals = len(args)
+    pytree = _pytree_api()
+
+    def _detach_leaf(t: Any) -> Any:
+        if isinstance(t, Tensor) and (
+            tensorplay.is_floating_point(t) or tensorplay.is_complex(t)
+        ):
+            leaf = t.detach()
+            leaf.requires_grad_(True)
+            return leaf
+        return t
+
+    def flat_fn(*args_and_grad_outs: Any) -> list[Any]:
+        primals = args_and_grad_outs[:n_primals]
+        tangents = list(args_and_grad_outs[n_primals:])
+        if len(tangents) != len(primals) and not tangents:
+            raise AssertionError(
+                "backward closure requires at least one cotangent"
+            )
+        with tensorplay.enable_grad():
+            leaves = tuple(_detach_leaf(p) for p in primals)
+            fw_out = fn(*leaves)
+            flat_out, _ = pytree.tree_flatten(fw_out)
+            tang_it = iter(tangents)
+            out_tensors: list[Tensor] = []
+            out_cots: list[Tensor] = []
+            for o in flat_out:
+                if not isinstance(o, Tensor):
+                    continue
+                cot = next(tang_it, None)
+                if cot is None:
+                    cot = tensorplay.zeros_like(o)
+                if o.requires_grad:
+                    out_tensors.append(o)
+                    out_cots.append(cot)
+            diff_idx = [
+                i for i, l in enumerate(leaves) if isinstance(l, Tensor) and l.requires_grad
+            ]
+            if out_tensors and diff_idx:
+                raw = tensorplay.autograd.grad(
+                    out_tensors,
+                    [leaves[i] for i in diff_idx],
+                    grad_outputs=out_cots,
+                    allow_unused=True,
+                )
+            else:
+                raw = [None] * len(diff_idx)
+            by_pos = dict(zip(diff_idx, raw))
+            grad_args: list[Any] = []
+            for i, l in enumerate(leaves):
+                grad = by_pos.get(i)
+                if grad is None:
+                    grad = tensorplay.zeros_like(l) if isinstance(l, Tensor) else None
+                grad_args.append(grad)
+        grad_args = _clone_aliasing_output(args_and_grad_outs, grad_args)
+        if return_fw_outputs:
+            return [*flat_out, *grad_args]
+        return grad_args
+
+    return flat_fn
+
+
+def _resolve_real_sample(value: Any, tracer: Any = None) -> Any:
+    """The concrete value flowing behind a graph placeholder proxy, or None.
+
+    Under a graph capture a tensor argument reaches an operator as a proxy;
+    the tracer records the concrete value that fed each placeholder, which
+    is what subgraph tracing and example-output computation need.
+    Intermediate (non-placeholder) proxies have no recorded sample.
+    """
+    from tensorplay.graph.node import Node
+    from tensorplay.graph.proxy import Proxy
+
+    if not isinstance(value, Proxy):
+        return value
+    owner = tracer if tracer is not None else value.tracer
+    samples = getattr(owner, "_node_samples", None)
+    if not samples:
+        return None
+    resolved = samples.get(value.node.name)
+    if resolved is None or isinstance(resolved, (Proxy, Node)):
+        return None
+    return resolved
+
+
+def _path_getitem(value: Any, path: tuple[int, ...]) -> Any:
+    """Index ``value`` through a fixed path of positions."""
+    for idx in path:
+        value = value[idx]
+    return value
+
+
+def _bind_example_output(example: Any, out_proxy: Any, tracer: Any) -> Any:
+    """Bind an example result to a freshly created operator node's proxy.
+
+    Returns the value the surrounding capture should keep flowing: the node
+    proxy itself for scalar results, or a matching tree of per-element
+    accessor nodes for sequence results, so downstream unpacking and element
+    use continue symbolically inside the outer graph.  The example values
+    are attached as node metadata.
+    """
+    from tensorplay.graph.experimental.proxy_tensor import track_tensor
+
+    if isinstance(example, (tuple, list)):
+        elems = []
+        for i, item in enumerate(example):
+            item_proxy = tracer.create_proxy(
+                "call_function", _path_getitem, (out_proxy, (i,)), {}
+            )
+            if isinstance(item, (tuple, list)):
+                elems.append(_bind_example_output(item, item_proxy, tracer))
+            else:
+                if isinstance(item, Tensor):
+                    track_tensor(item, item_proxy, constant=None, tracer=tracer)
+                elems.append(item_proxy)
+        return tuple(elems) if isinstance(example, tuple) else elems
+    if isinstance(example, Tensor):
+        track_tensor(example, out_proxy, constant=None, tracer=tracer)
+    return out_proxy
+
+
+class IdentityFunctionalizeCtx:
+    """Default functionalization context.
+
+    Tensor wrappers do not exist in this build, so unwrapping and wrapping are
+    identities and redispatch continues at the same operator.
+    """
+
+    mode = None
+
+    def unwrap_tensors(self, x: Any) -> Any:
+        return x
+
+    def wrap_tensors(self, x: Any) -> Any:
+        return x
+
+    def redispatch_to_next(self):
+        import contextlib
+
+        return contextlib.nullcontext()
+
+    def functionalize(self, fn: Callable) -> Callable:
+        return fn
+
