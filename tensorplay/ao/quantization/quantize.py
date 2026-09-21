@@ -155,7 +155,7 @@ def convert(module, mapping=None, inplace=False, remove_qconfig=True):
         module = copy.deepcopy(module)
     if mapping is None:
         mapping = get_default_static_quant_module_mappings()
-    _convert(module, mapping)
+    module = _convert(module, mapping)
     if remove_qconfig:
         _remove_qconfig(module)
     return module
