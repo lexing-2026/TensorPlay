@@ -56,6 +56,8 @@ distributed.fsdp
 distributed.checkpoint
 distributed.elastic
 distributed.rpc
+distributed.pipelining
+distributed.optim
 distributions
 func
 profiler
