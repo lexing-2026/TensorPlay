@@ -1158,23 +1158,26 @@ def _optim_state_dict(
             canonical = aliases.get(name, name)
             info = infos.get(canonical)
             if info is None:
-                result_state[name] = _clone_state(value, cpu_offload)
+                result_state[canonical] = _clone_state(value, cpu_offload)
                 continue
             record = _record_for_name(info, canonical)
             if record is None:
-                result_state[name] = _clone_state(value, cpu_offload)
+                result_state[canonical] = _clone_state(value, cpu_offload)
                 continue
             converted = value
             if _is_tensor(value) and value.dim() > 0 and not shard_state:
                 converted = _gather_param_value(value, record, info)
-            result_state[name] = _clone_state(converted, cpu_offload)
+            # Keyed by the cleaned name so save and load agree regardless of
+            # the wrapper's own submodule attribute name.
+            result_state[canonical] = _clone_state(converted, cpu_offload)
     result: dict[str, Any] = {"state": result_state}
     if "param_groups" in source:
         groups = copy.deepcopy(source["param_groups"])
         for group_data in groups:
             params: list[Any] = []
             for key in group_data.get("params", ()):
-                params.extend(key_to_names.get(key, (key,)))
+                for name in key_to_names.get(key, (key,)):
+                    params.append(aliases.get(name, name))
             group_data["params"] = list(dict.fromkeys(params))
         result["param_groups"] = groups
     del use_orig_params
@@ -1226,7 +1229,25 @@ def _get_fqn_to_fsdp_param_info(model: Any) -> dict[str, FSDPParamInfo]:
     def return_fn(
         fqn_to_param_info: dict[str, FSDPParamInfo],
     ) -> dict[str, FSDPParamInfo]:
-        return fqn_to_param_info
+        # One FSDP state is reachable through several module paths (the
+        # wrapper, the module it manages, per-child FSDP modules), which
+        # registers the same parameters under wrapper-prefixed names too.
+        # Keep the shortest fully-qualified name per (state, group, index)
+        # so state-dict keys stay clean.
+        cleaned: dict[str, FSDPParamInfo] = {}
+        seen: dict[tuple[int, int, int], str] = {}
+        for fqn in sorted(fqn_to_param_info, key=len):
+            info = fqn_to_param_info[fqn]
+            index = info.param_indices.get(fqn)
+            if index is None:
+                cleaned[fqn] = info
+                continue
+            key = (id(info.state), id(info.handle), int(index))
+            if key in seen:
+                continue
+            seen[key] = fqn
+            cleaned[fqn] = info
+        return cleaned
 
     result: dict[str, FSDPParamInfo] = {}
     return _apply_to_modules(

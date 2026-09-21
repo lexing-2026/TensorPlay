@@ -181,6 +181,11 @@ def _unshard_fsdp_state_params(
                         (param, local.detach().clone(), getattr(local, "device", None))
                     )
                 group.unshard()
+                # Materialize the unsharded parameters before the caller's
+                # body runs: without the wait, module attributes still point
+                # at the sharded tensors and the reshard on exit would gather
+                # stale values, silently dropping writes made in the body.
+                group.wait_for_unshard()
             if nonzero_rank:
                 for group in reversed(groups):
                     group.reshard()
