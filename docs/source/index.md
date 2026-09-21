@@ -58,6 +58,8 @@ distributed.elastic
 distributed.rpc
 distributed.pipelining
 distributed.optim
+distributed.nn
+distributed.autograd
 distributions
 func
 profiler
