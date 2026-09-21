@@ -453,6 +453,7 @@ PYBIND11_MODULE(_C, m) {
         return py::reinterpret_steal<py::object>(result);
     });
     init_stax(m);
+    init_stax_static_launcher(m);
     init_parallel(m);
     init_env_allocator(m);
 #ifdef TP_USE_DISTRIBUTED
