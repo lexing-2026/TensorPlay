@@ -180,15 +180,15 @@ unsharded for (the `int` form is not supported on an SPMD mesh).
     :toctree: generated
     :nosignatures:
 
-    tensorplay.distributed.fsdp.fully_shard
-    tensorplay.distributed.fsdp.FSDPModule
-    tensorplay.distributed.fsdp.UnshardHandle
-    tensorplay.distributed.fsdp.MixedPrecisionPolicy
-    tensorplay.distributed.fsdp.CPUOffloadPolicy
-    tensorplay.distributed.fsdp.OffloadPolicy
-    tensorplay.distributed.fsdp.DataParallelMeshDims
-    tensorplay.distributed.fsdp.register_fsdp_forward_method
-    tensorplay.distributed.fsdp.share_comm_ctx
+    fully_shard
+    FSDPModule
+    UnshardHandle
+    MixedPrecisionPolicy
+    CPUOffloadPolicy
+    OffloadPolicy
+    DataParallelMeshDims
+    register_fsdp_forward_method
+    share_comm_ctx
 ```
 
 - {class}`MixedPrecisionPolicy` selects the dtypes of the all-gathered

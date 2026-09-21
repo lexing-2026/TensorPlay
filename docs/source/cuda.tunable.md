@@ -196,26 +196,26 @@ measurement per candidate — and is paid once per shape per machine.
     :toctree: generated
     :nosignatures:
 
-    tensorplay.cuda.tunable.enable
-    tensorplay.cuda.tunable.disable
-    tensorplay.cuda.tunable.is_enabled
-    tensorplay.cuda.tunable.tuning_enable
-    tensorplay.cuda.tunable.tuning_disable
-    tensorplay.cuda.tunable.tuning_is_enabled
-    tensorplay.cuda.tunable.record_untuned_enable
-    tensorplay.cuda.tunable.record_untuned_disable
-    tensorplay.cuda.tunable.record_untuned_is_enabled
-    tensorplay.cuda.tunable.set_verbose
-    tensorplay.cuda.tunable.is_verbose
-    tensorplay.cuda.tunable.set_max_tuning_duration
-    tensorplay.cuda.tunable.get_max_tuning_duration
-    tensorplay.cuda.tunable.set_max_tuning_samples
-    tensorplay.cuda.tunable.get_max_tuning_samples
-    tensorplay.cuda.tunable.set_filename
-    tensorplay.cuda.tunable.get_filename
-    tensorplay.cuda.tunable.get_results
-    tensorplay.cuda.tunable.read_file
-    tensorplay.cuda.tunable.write_file
+    enable
+    disable
+    is_enabled
+    tuning_enable
+    tuning_disable
+    tuning_is_enabled
+    record_untuned_enable
+    record_untuned_disable
+    record_untuned_is_enabled
+    set_verbose
+    is_verbose
+    set_max_tuning_duration
+    get_max_tuning_duration
+    set_max_tuning_samples
+    get_max_tuning_samples
+    set_filename
+    get_filename
+    get_results
+    read_file
+    write_file
 ```
 
 The `enable` pair is the master switch; the `tuning_*` pair controls

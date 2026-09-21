@@ -48,6 +48,6 @@ points at paged key/value blocks so the cache does not have to be contiguous.
     :toctree: generated
     :nosignatures:
 
-    tensorplay.nn.attention.varlen.varlen_attn
-    tensorplay.nn.attention.varlen.varlen_attn_out
+    varlen_attn
+    varlen_attn_out
 ```

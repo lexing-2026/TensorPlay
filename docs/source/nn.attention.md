@@ -55,22 +55,19 @@ backends plug in. By default no implementation is active:
     :toctree: generated
     :nosignatures:
 
-    tensorplay.nn.attention.sdpa_kernel
-    tensorplay.nn.attention.SDPBackend
-    tensorplay.nn.attention.omni_attention
-    tensorplay.nn.attention.BlockMask
-    tensorplay.nn.attention.create_block_mask
-    tensorplay.nn.attention.register_flash_attention_impl
-    tensorplay.nn.attention.activate_flash_attention_impl
-    tensorplay.nn.attention.list_flash_attention_impls
-    tensorplay.nn.attention.current_flash_attention_impl
-    tensorplay.nn.attention.restore_flash_attention_impl
-    tensorplay.nn.attention.can_use_flash_attention
-    tensorplay.nn.attention.can_use_efficient_attention
-    tensorplay.nn.attention.create_mask
-    tensorplay.nn.attention.and_masks
-    tensorplay.nn.attention.or_masks
-    tensorplay.nn.attention.noop_mask
+    sdpa_kernel
+    SDPBackend
+    BlockMask
+    create_block_mask
+    register_flash_attention_impl
+    activate_flash_attention_impl
+    list_flash_attention_impls
+    current_flash_attention_impl
+    restore_flash_attention_impl
+    create_mask
+    and_masks
+    or_masks
+    noop_mask
 ```
 
 {func}`tensorplay.nn.attention.can_use_flash_attention` and
@@ -108,9 +105,9 @@ print(mask.shape, mask.dtype)   # (1, 1, 6, 6) bool
 .. autosummary::
     :nosignatures:
 
-    tensorplay.nn.attention.omni_attention
-    tensorplay.nn.attention.bias
-    tensorplay.nn.attention.varlen
+    omni_attention
+    bias
+    varlen
 ```
 
 ```{eval-rst}

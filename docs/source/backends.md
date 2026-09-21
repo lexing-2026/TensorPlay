@@ -16,7 +16,7 @@ and `openmp`.
     :toctree: generated
     :nosignatures:
 
-    tensorplay.backends.cpu.get_cpu_capability
+    cpu.get_cpu_capability
 ```
 
 {func}`tensorplay.backends.cpu.get_cpu_capability` reports the highest SIMD capability
@@ -36,12 +36,12 @@ is what makes repeated FFTs cheap.
     :toctree: generated
     :nosignatures:
 
-    tensorplay.backends.cuda.allow_fp16_bf16_reduction_math_sdp
-    tensorplay.backends.cuda.can_use_flash_attention
-    tensorplay.backends.cuda.can_use_efficient_attention
-    tensorplay.backends.cuda.can_use_cudnn_attention
-    tensorplay.backends.cuda.cuBLASModule
-    tensorplay.backends.cuda.cuFFTPlanCache
+    cuda.allow_fp16_bf16_reduction_math_sdp
+    cuda.can_use_flash_attention
+    cuda.can_use_efficient_attention
+    cuda.can_use_cudnn_attention
+    cuda.cuBLASModule
+    cuda.cuFFTPlanCache
 ```
 
 - {func}`tensorplay.backends.cuda.allow_fp16_bf16_reduction_math_sdp` toggles whether
@@ -65,7 +65,7 @@ against a stable import path.
     :toctree: generated
     :nosignatures:
 
-    tensorplay.backends.mkl.is_available
+    mkl.is_available
 ```
 
 {func}`tensorplay.backends.mkl.is_available` reports whether the CPU math library is
@@ -78,9 +78,9 @@ linked and usable.
     :toctree: generated
     :nosignatures:
 
-    tensorplay.backends.nnpack.is_available
-    tensorplay.backends.nnpack.flags
-    tensorplay.backends.nnpack.set_flags
+    nnpack.is_available
+    nnpack.flags
+    nnpack.set_flags
 ```
 
 `nnpack` is the packing-based CPU convolution path. `flags(enabled=...)` is the
@@ -94,7 +94,7 @@ and `set_flags` changes it without a context.
     :toctree: generated
     :nosignatures:
 
-    tensorplay.backends.openmp.is_available
+    openmp.is_available
 ```
 
 {func}`tensorplay.backends.openmp.is_available` reports whether the OpenMP thread pool
