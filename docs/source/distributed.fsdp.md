@@ -110,6 +110,41 @@ selects which; the matching `*Config` classes carry the options, and
 {func}`~tensorplay.distributed.fsdp.FullyShardedDataParallel.optim_state_dict`
 / `sharded_optim_state_dict` / `full_optim_state_dict` read and write them.
 
+## Mixed precision
+
+```{eval-rst}
+.. autosummary::
+    :toctree: generated
+    :nosignatures:
+
+    tensorplay.distributed.fsdp.sharded_grad_scaler.ShardedGradScaler
+```
+
+{class}`~tensorplay.distributed.fsdp.sharded_grad_scaler.ShardedGradScaler`
+is the AMP gradient scaler adapted to sharded optimizers. A plain
+`GradScaler` checks for inf/NaN gradients on the tensors it can see — but
+with FSDP each rank only unscales its own parameter shard, so a rank whose
+shard is healthy would step while another rank's shard overflowed.
+`ShardedGradScaler` closes that gap in `unscale_`: after unscaling its
+shard, it all-reduces the per-device `found_inf` flags across the process
+group, so every rank sees an overflow anywhere in the world, skips the
+step, and backs off the scale together.
+
+```python
+import tensorplay as tp
+from tensorplay.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+from tensorplay.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
+
+scaler = ShardedGradScaler()
+fully_shard(model, mp_policy=MixedPrecisionPolicy(param_dtype=tp.bfloat16))
+
+for x, y in dataloader:
+    loss = model(x).sum()
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)   # skips together if any rank overflowed
+    scaler.update()
+```
+
 ## Where to go next
 
 - [distributed tensors](distributed.tensor.md) — the sharded `DTensor` type the

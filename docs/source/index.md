@@ -60,6 +60,7 @@ distributed.pipelining
 distributed.optim
 distributed.nn
 distributed.autograd
+distributed.algorithms
 distributions
 func
 profiler
