@@ -19,7 +19,12 @@ Layouts the flat emitter cannot prove contiguous (column broadcasts,
 per-row scalars, strided rows, row-broadcast widths no vector peel can
 align) switch the loop nest to a row-structured plan instead: an outer
 row loop carries per-row base pointers and hoisted per-row scalars while
-the same three loop phases run along the row.
+the same three loop phases run along the row.  Layouts the row plan
+cannot address either -- inputs whose element address is contiguous along
+the outer axis (the transposed family) -- switch to the tile plan: the
+parallel range counts row tiles of the vector width, and each such input's
+W-by-W tile is staged through a transposed buffer once per tile so the
+vector loads along the column stay contiguous.
 
 Every data pointer is ``__restrict__``-qualified and the hot loops carry
 ``#pragma GCC ivdep`` so the compiler can reorder loads and stores freely.
@@ -156,14 +161,25 @@ def _lane_offset(lane: int) -> str:
 
 # Per-input addressing modes, one per program input.
 #
-# flat    -- address is the flat output index; contiguous ``loadu`` per lane.
-# splat   -- the input has one element (any broadcast scalar); a single
-#            ``V(in[0])`` splat is hoisted out of every loop.
-# colmod  -- the input's only non-unit dim is the output's last dim of width
-#            ``S`` (a row broadcast, e.g. a bias vector): address ``i % S``.
-#            Every vector stays inside one row because ``W`` (the lane count)
-#            divides ``S`` and the induction variable is peeled to a ``W``
-#            boundary first, so each ``loadu`` is still contiguous.
+# flat       -- address is the flat output index; contiguous ``loadu`` per lane.
+# splat      -- the input has one element (any broadcast scalar); a single
+#               ``V(in[0])`` splat is hoisted out of every loop.
+# colmod     -- the input's only non-unit dim is the output's last dim of width
+#               ``S`` (a row broadcast, e.g. a bias vector): address ``i % S``.
+#               Every vector stays inside one row because ``W`` (the lane count)
+#               divides ``S`` and the induction variable is peeled to a ``W``
+#               boundary first, so each ``loadu`` is still contiguous.
+# rowstrided -- address ``a*r + c``: row-contiguous, arbitrary row stride.
+# rowscalar  -- address ``a*r``: one element per row, hoisted per row.
+# transposed -- address ``r + c*a``: contiguous along the outer axis; the tile
+#               plan stages a column-major tile into a transposed buffer so the
+#               vector loop along the column reads the buffer instead of a
+#               strided walk.
+# rowval     -- `rowscalar` reborn inside the emitted loop: the hoisted ``s``.
+# rowptr     -- `rowstrided` reborn inside the emitted loop: the per-row
+#               base pointer ``p``.
+# tbuf       -- `transposed` reborn inside the emitted loop: the per-row
+#               base pointer ``q`` into the transposed tile buffer.
 InputMode = tuple[str, int]
 
 
@@ -343,22 +359,109 @@ def analyze_input_rows(
     return tuple(modes)
 
 
+def analyze_input_tiles(
+    input_shapes: tuple[tuple[int, ...], ...],
+    input_strides: tuple[tuple[int, ...], ...],
+    out_shape: tuple[int, ...],
+) -> tuple[InputMode, ...] | None:
+    """Classify each input for the tile plan (transposed-tile staging).
+
+    The tile plan serves the layouts the row plan must reject: an input
+    whose element address is ``r + c*a`` is contiguous along the outer axis
+    (the transposed family -- e.g. a column-major view of the output).  Its
+    W-by-W tile is staged through a small transposed buffer once per tile,
+    so the vector loop along the column reads the buffer contiguously while
+    every other input is addressed the same way the row plan addresses it.
+
+    Returns one mode per input -- ``splat``/``rowscalar``/``rowstrided``
+    (as in :func:`analyze_input_rows`) or ``transposed`` -- or ``None``
+    when any input is outside that surface.
+    """
+
+    if len(input_shapes) != len(input_strides) or not input_shapes:
+        return None
+    rank = len(out_shape)
+    if rank < 2:
+        return None
+    weights = [1] * rank
+    radix = 1
+    for d in range(rank - 2, -1, -1):
+        weights[d] = radix
+        if int(out_shape[d]) != 1:
+            radix *= int(out_shape[d])
+    varying = [d for d in range(rank - 1) if int(out_shape[d]) != 1]
+
+    modes: list[InputMode] = []
+    for shape, strides in zip(input_shapes, input_strides):
+        if len(shape) != len(strides) or len(shape) > rank:
+            return None
+        pad = rank - len(shape)
+        aligned_shape = (1,) * pad + tuple(int(d) for d in shape)
+        aligned_strides = (0,) * pad + tuple(int(s) for s in strides)
+        live = {
+            d
+            for d in range(rank)
+            if aligned_shape[d] != 1 and aligned_strides[d] != 0
+        }
+        if not live:
+            modes.append(("splat", 0))
+            continue
+        if any(aligned_shape[d] != int(out_shape[d]) for d in live):
+            return None
+        live_varying = [d for d in varying if d in live]
+        row_stride: int | None = None
+        if live_varying:
+            if len(live_varying) != len(varying):
+                return None
+            for d in varying:
+                stride = aligned_strides[d]
+                weight = weights[d]
+                if stride < 0 or stride % weight != 0:
+                    return None
+                candidate = stride // weight
+                if row_stride is None:
+                    row_stride = candidate
+                elif row_stride != candidate:
+                    return None
+        else:
+            row_stride = 0
+        if rank - 1 not in live:
+            modes.append(("rowscalar", int(row_stride)))
+            continue
+        inner_stride = int(aligned_strides[rank - 1])
+        if inner_stride <= 0:
+            return None
+        if inner_stride == 1:
+            modes.append(("rowstrided", int(row_stride)))
+            continue
+        # Transposed family: the outer axis is the contiguous one.  It is
+        # only a tile-transposable layout when every varying outer dim
+        # contributes unit-per-row-step (``row_stride == 1``); anything
+        # else mixes two non-unit strides and the buffer cannot serve it.
+        if row_stride != 1:
+            return None
+        modes.append(("transposed", inner_stride))
+    return tuple(modes)
+
+
 def _classify_pinned_layouts(
     input_shapes: tuple[tuple[int, ...], ...],
     input_strides: tuple[tuple[int, ...], ...],
     out_shape: tuple[int, ...],
     lane_count: int,
-) -> tuple[tuple[InputMode, ...] | None, tuple[InputMode, ...] | None]:
+) -> tuple[tuple[InputMode, ...] | None, tuple[InputMode, ...] | None, tuple[InputMode, ...] | None]:
     """Pick the addressing plan for a pinned specialization.
 
-    Returns ``(flat_modes, row_modes)`` with at most one non-``None``.
-    Flat addressing wins whenever it can express every input -- including
-    row broadcasts through the aligned modulo path, whose generated kernels
-    stay byte-for-byte what they were.  The row-structured plan only
-    rescues layouts the flat emitter must reject (column broadcasts,
-    per-row scalars, strided rows, unaligned row-broadcast widths): there
-    it is the only correct emitter, so it is chosen for expressibility
-    rather than speed.
+    Returns ``(flat_modes, row_modes, tile_modes)``; with the plans ordered
+    by preference, at most the chosen one (and nothing after it) is
+    non-``None``.  Flat addressing wins whenever it can express every
+    input -- including row broadcasts through the aligned modulo path,
+    whose generated kernels stay byte-for-byte what they were.  The
+    row-structured plan only rescues layouts the flat emitter must reject
+    (column broadcasts, per-row scalars, strided rows, unaligned
+    row-broadcast widths); the tile plan rescues the transposed family the
+    row plan must reject (outer-axis-contiguous inputs), which no other
+    emitter can address without a pathological strided walk.
     """
 
     try:
@@ -368,14 +471,20 @@ def _classify_pinned_layouts(
     except (TypeError, ValueError):
         flat_modes = None
     if flat_modes is not None:
-        return flat_modes, None
+        return flat_modes, None, None
     if not _row_tiling_enabled():
-        return None, None
+        return None, None, None
     try:
         row_modes = analyze_input_rows(input_shapes, input_strides, out_shape)
     except (TypeError, ValueError):
         row_modes = None
-    return None, row_modes
+    if row_modes is not None:
+        return None, row_modes, None
+    try:
+        tile_modes = analyze_input_tiles(input_shapes, input_strides, out_shape)
+    except (TypeError, ValueError):
+        tile_modes = None
+    return None, None, tile_modes
 
 
 def layouts_addressable(
@@ -386,10 +495,10 @@ def layouts_addressable(
 ) -> bool:
     """Whether the CPU generators can address these exact input layouts."""
 
-    flat_modes, row_modes = _classify_pinned_layouts(
+    flat_modes, row_modes, tile_modes = _classify_pinned_layouts(
         input_shapes, input_strides, out_shape, lane_count
     )
-    return flat_modes is not None or row_modes is not None
+    return flat_modes is not None or row_modes is not None or tile_modes is not None
 
 
 def _check_ref(
@@ -690,6 +799,11 @@ def emit_value_program(
             address = f"in{ref} + (({offset}) % {width})"
         elif mode == "rowptr":
             address = f"p{ref} + ({offset})"
+        elif mode == "tbuf":
+            # ``tbuf`` inputs arrive pre-transposed into a W-by-W buffer; the
+            # per-row base pointer ``q{width}`` (slot = ref) starts at the
+            # tile row, so the offset here is the within-row column.
+            address = f"q{width} + ({offset})"
         else:
             address = f"in{ref} + ({offset})"
         lines.append(f"{indent}V {name(ref)} = V::loadu({address}, {count_expr});")
@@ -750,11 +864,13 @@ def render_kernel_source(
     plan instead: an outer row loop carries per-row base pointers and
     hoisted per-row scalars while the same vector lanes run along the row,
     which also covers column broadcasts, strided rows, and row-broadcast
-    widths no vector peel can align.  Layouts neither plan can address
-    raise, so the caller declines instead of trusting flat addresses
-    against differently shaped buffers.  Passing them without
-    ``out_shape`` has no effect -- the modes are only valid for a pinned
-    specialization.
+    widths no vector peel can align.  Layouts even the row plan must reject
+    (outer-axis-contiguous inputs) switch to the tile plan: row tiles of the
+    vector width carry transposed W-by-W buffers staged before the vector
+    loop.  Layouts no plan can address raise, so the caller declines instead
+    of trusting flat addresses against differently shaped buffers.  Passing
+    them without ``out_shape`` has no effect -- the modes are only valid for
+    a pinned specialization.
     """
 
     used_inputs = _analyze_instructions(
@@ -783,20 +899,31 @@ def render_kernel_source(
     )
     input_modes: tuple[InputMode, ...] | None = None
     row_modes: tuple[InputMode, ...] | None = None
+    tile_modes: tuple[InputMode, ...] | None = None
     if layouts_given:
         pinned_out_shape = tuple(int(d) for d in out_shape)
-        input_modes, row_modes = _classify_pinned_layouts(
+        input_modes, row_modes, tile_modes = _classify_pinned_layouts(
             input_shapes, input_strides, pinned_out_shape, tier_width
         )
-        if input_modes is None and row_modes is None:
+        if (
+            input_modes is None
+            and row_modes is None
+            and tile_modes is None
+        ):
             # The pinned route trusts these layouts: an input outside the
             # generators' addressing surface must decline the kernel here
             # instead of emitting flat addresses into a differently shaped
             # buffer.
             raise _ProgramError("input layouts outside the CPU addressing surface")
-    if input_modes is None and row_modes is None:
+    if input_modes is None and row_modes is None and tile_modes is None:
         input_modes = (("flat", 0),) * input_count
-    active_modes = row_modes if row_modes is not None else input_modes
+    active_modes = (
+        row_modes
+        if row_modes is not None
+        else tile_modes
+        if tile_modes is not None
+        else input_modes
+    )
     splat_refs = [
         ref for ref in sorted(used_inputs) if active_modes[ref][0] == "splat"
     ]
@@ -827,6 +954,14 @@ def render_kernel_source(
     splat_hoists = ""
     if splat_refs:
         splat_hoists = f"{splat_decls}\n"
+
+    # Tile-plan defaults: the transpose helper, the W-by-W buffers and the
+    # constexpr ``W`` only appear when the tile plan is actually used; the
+    # other plans keep their byte-identical templates.
+    tile_helper = ""
+    buffer_decls = ""
+    w_decl = "const long W = V::size();"
+    body_fn = "tp_body"
 
     if row_modes is not None:
         # Row-structured plan: the parallel range counts rows, each row's
@@ -919,6 +1054,120 @@ def render_kernel_source(
             f"        tp_body(&ctx, 0, {row_count}LL);\n"
             "    } else {\n"
             f"        tp_parallel_for_c(0, {row_count}LL, {grain_rows}LL, tp_body, &ctx);\n"
+            "    }"
+        )
+    elif tile_modes is not None:
+        # Tile plan: the parallel range counts row tiles of W rows; each
+        # tile row runs one vector along the column, and transposed inputs
+        # are staged into W-by-W transposed buffers once per tile so the
+        # vector loads along the column stay contiguous.  A full tile gives
+        # every row exactly W lanes; a partial tile trims the same bodies
+        # with a runtime lane count, so there is no scalar fallback.
+        body_range_params = "long long tb, long long te"
+        element_count = 1
+        for d in out_shape:
+            element_count *= int(d)
+        cols = int(out_shape[-1])
+        row_count = element_count // cols if cols else 0
+        tile_w = lane_count if lane_count is not None else 16
+        row_tiles = (row_count + tile_w - 1) // tile_w
+        emit_modes = tuple(
+            ("splat", 0)
+            if mode == "splat"
+            else ("rowval", ref)
+            if mode == "rowscalar"
+            else ("rowptr", 0)
+            if mode == "rowstrided"
+            else ("tbuf", ref)
+            for ref, (mode, _param) in enumerate(tile_modes)
+        )
+        transposed = [
+            (ref, param)
+            for ref, (mode, param) in enumerate(tile_modes)
+            if mode == "transposed"
+        ]
+        buffer_decls = "\n".join(
+            f"        alignas(16) float buf{ref}[W * W];\n"
+            for ref, _param in transposed
+        )
+        preloads = "\n".join(
+            f"            tp_transpose_mxn<float>(in{ref} + mt + nt * {param}LL, "
+            f"{param}LL, buf{ref}, W, cols_t, rows_t);\n"
+            for ref, param in transposed
+        )
+        tile_row, tile_result = emit_value_program(
+            instructions,
+            constants,
+            input_count,
+            output_ref,
+            used_inputs,
+            indent="                ",
+            offset="0",
+            count_expr="cols_t",
+            suffix="",
+            input_modes=emit_modes,
+        )
+        tile_row_text = "\n".join(tile_row) + "\n" + (
+            f"                {tile_result}.store(orow, cols_t);"
+        )
+
+        row_preamble_lines: list[str] = []
+        for ref in sorted(used_inputs):
+            mode, param = tile_modes[ref]
+            if mode == "rowstrided":
+                row_preamble_lines.append(
+                    f"                const float* __restrict__ p{ref} = "
+                    f"in{ref} + row * {param}LL + nt;"
+                )
+            elif mode == "rowscalar":
+                row_preamble_lines.append(
+                    f"                const V s{ref} = V(in{ref}[row * {param}LL]);"
+                )
+            elif mode == "transposed":
+                row_preamble_lines.append(
+                    f"                const float* __restrict__ q{ref} = "
+                    f"buf{ref} + br * W;"
+                )
+        row_preamble_lines.append(
+            f"                float* __restrict__ orow = out + row * {cols}LL + nt;"
+        )
+        row_preamble = "\n".join(row_preamble_lines) + "\n"
+
+        tile_grain = max(1, min_chunk // max(1, tile_w * cols))
+        body_loops = (
+            "    for (long long mt = tb * W; mt < te * W; mt += W) {\n"
+            f"        const long rows_t = ({row_count}LL - mt < (long long)W)\n"
+            f"            ? (long)({row_count}LL - mt) : W;\n"
+            f"        for (long long nt = 0; nt < {cols}LL; nt += W) {{\n"
+            f"            const long cols_t = ({cols}LL - nt < (long long)W)\n"
+            f"                ? (long)({cols}LL - nt) : W;\n"
+            f"{preloads}"
+            "            for (long br = 0; br < rows_t; ++br) {\n"
+            "                const long long row = mt + br;\n"
+            f"{row_preamble}"
+            f"{tile_row_text}\n"
+            "            }\n"
+            "        }\n"
+            "    }"
+        )
+        tile_helper = (
+            "\n"
+            "template <typename T>\n"
+            "static inline void tp_transpose_mxn(\n"
+            "    const T* __restrict__ src, long ld_src,\n"
+            "    T* __restrict__ dst, long ld_dst, long M, long N) {\n"
+            "    for (long i = 0; i < M; ++i)\n"
+            "        for (long j = 0; j < N; ++j)\n"
+            "            dst[j * ld_dst + i] = src[i * ld_src + j];\n"
+            "}\n"
+        )
+        w_decl = "constexpr long W = V::size();"
+        body_fn = "tp_tile_body"
+        entry_dispatch = (
+            f"        {body_fn}(&ctx, 0, {row_tiles}LL);\n"
+            "    } else {\n"
+            f"        tp_parallel_for_c(0, {row_tiles}LL, {tile_grain}LL, "
+            f"{body_fn}, &ctx);\n"
             "    }"
         )
     else:
@@ -1110,19 +1359,21 @@ def render_kernel_source(
         'extern "C" void tp_parallel_for_c('
         "long long begin, long long end, long long grain, "
         "tp_parallel_body_c body, void* ctx);\n"
+        f"{tile_helper}"
         "\n"
         "typedef struct TP_Ctx {\n"
         f"{ctx_fields}"
         "    float* out;\n"
         "} TP_Ctx;\n"
         "\n"
-        f"static void tp_body(void* ctxp, {body_range_params}) {{\n"
+        f"static void {body_fn}(void* ctxp, {body_range_params}) {{\n"
         "    const TP_Ctx* c = (const TP_Ctx*)ctxp;\n"
         f"{ctx_loads}"
         "    float* __restrict__ out = c->out;\n"
-        "    const long W = V::size();\n"
+        f"    {w_decl}\n"
         f"{const_decls}\n"
         f"{splat_hoists}"
+        f"{buffer_decls}"
         f"{body_loops}\n"
         "}\n"
         "\n"
@@ -1426,10 +1677,12 @@ def build_cpu_native_kernel(
 
     entry_key_tiling = None
     if layout_key is not None:
-        _flat_modes, plan_rows = _classify_pinned_layouts(
+        _flat_modes, plan_rows, plan_tiles = _classify_pinned_layouts(
             input_shapes, input_strides, pinned_shape, isa.nelements()
         )
-        entry_key_tiling = "row" if plan_rows is not None else None
+        entry_key_tiling = (
+            "tile" if plan_tiles is not None else "row" if plan_rows is not None else None
+        )
 
     entry = f"tp_native_{_digest_entry_key(instructions, constants, input_count, output_ref, isa.name, version_info, pinned_shape, layout_key, entry_key_tiling)}"
     try:
