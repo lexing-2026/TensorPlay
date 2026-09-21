@@ -134,14 +134,28 @@ if (x.dtype().code != kDLFloat || x.dtype().bits != 32) {
 }
 ```
 
-Outputs follow the out-parameter convention: the caller allocates with
-`tp.empty_like` / `tp.empty` and passes the output as another view,
-which the kernel writes into — the `scale_cpu` example above does
-exactly this. Kernels can also allocate their own outputs through the
-environment allocator (`tvm::ffi::Tensor::FromEnvAlloc` with
-`TVMFFIEnvTensorAlloc`); that path requires the host to have installed
-an allocator, so under TensorPlay the out-parameter form is the
-reliable one.
+Outputs can follow either of two conventions. The *out-parameter* form
+has the caller allocate with `tp.empty_like` / `tp.empty` and pass the
+output as another view, which the kernel writes into — the `scale_cpu`
+example above does exactly this. Kernels can also allocate their own
+outputs through the environment allocator; `cpp_jit` installs
+TensorPlay's allocator automatically on first engine use (an
+already-installed host allocator takes precedence), so the request is
+fulfilled by an ordinary TensorPlay allocation:
+
+```cpp
+tvm::ffi::Tensor doubled(tvm::ffi::TensorView x) {
+  tvm::ffi::Tensor y = tvm::ffi::Tensor::FromEnvAlloc(
+      TVMFFIEnvTensorAlloc, x.shape(), x.dtype(), x.device());
+  tvm::ffi::TensorView yv(y);
+  // write into yv ...
+  return y;
+}
+```
+
+The returned tensor arrives as the engine's tensor wrapper; bring it
+back zero-copy with `tp.from_dlpack(mod.doubled(x))`. The out-parameter
+form skips one wrapper hop and stays the cheaper option.
 
 Repeated calls with the same `name` reuse the cached build, and passing
 `cuda_sources=` compiles CUDA sources into the same library. The engine
@@ -149,13 +163,13 @@ is an optional dependency: `cpp_jit.is_available()` reports whether it is
 importable, and the loading entry points raise an error with install
 instructions when it is not.
 
-An FFI kernel by itself is an opaque callable — it allocates nothing,
-records no autograd node, and stays invisible to `tensorplay.compile`
-until wrapped. Combine it with `tensorplay.library.custom_op` as in the
-previous section: the operator body allocates outputs and calls the
-kernel, `register_fake` propagates shapes, and `register_autograd`
-attaches the derivative. Under `tensorplay.compile` the whole operator is
-captured as one opaque node, so the kernel boundary survives compilation.
+An FFI kernel by itself is an opaque callable — it records no autograd
+node and stays invisible to `tensorplay.compile` until wrapped. Combine
+it with `tensorplay.library.custom_op` as in the previous section: the
+operator body allocates outputs and calls the kernel, `register_fake`
+propagates shapes, and `register_autograd` attaches the derivative.
+Under `tensorplay.compile` the whole operator is captured as one opaque
+node, so the kernel boundary survives compilation.
 
 To ship a kernel to machines without a compiler, build it ahead of time
 and load the artifact by path:
