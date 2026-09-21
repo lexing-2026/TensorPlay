@@ -467,7 +467,7 @@ class TestReductionsOnMaskedTensor:
         mt = make_mt(tp.tensor(DATA), tp.tensor(MASK))
         r = mt.sum((0, 1))
         assert r.get_data().item() == -4.0
-        assert r.get_mask().item() is True or r.get_mask().item() == True
+        assert r.get_mask().item() is True
 
 
 class TestDocstrings:
