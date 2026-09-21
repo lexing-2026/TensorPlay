@@ -632,7 +632,7 @@ Tensor sgn_cpu(const Tensor& self) {
         return complex_unary_op_kernel(self, [](auto z) -> decltype(z) {
             using T = decltype(z);
             if (z == T(0, 0)) return T(0, 0);
-            return z / abs(z);
+            return z / std::hypot(z.real(), z.imag());
         });
     }
     return dtype_unary_kernel(self, [](auto x) -> decltype(x) {
