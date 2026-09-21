@@ -991,7 +991,7 @@ def _lower_cpu_fused_pointwise(
     if _broadcast_shape(input_shapes) != output_shape:
         return None
     try:
-        from .codegen.cpp import analyze_input_modes
+        from .codegen.cpp import analyze_input_modes, layouts_addressable
 
         input_modes = analyze_input_modes(
             input_shapes, input_strides, output_shape, lane_count=16
@@ -999,12 +999,24 @@ def _lower_cpu_fused_pointwise(
     except (TypeError, ValueError):
         return None
     if input_modes is None:
-        return None
+        # Row-structured addressing widens the accepted surface: column
+        # broadcasts, per-row scalars, and strided rows compile as a row
+        # loop instead of losing the fused route.
+        try:
+            row_accepted = layouts_addressable(
+                input_shapes, input_strides, output_shape, lane_count=16
+            )
+        except (TypeError, ValueError):
+            return None
+        if not row_accepted:
+            return None
     # Legacy surface (every input flat) keeps the program-interpreter
     # fallback; anything else requires the compiled kernel, whose generated
     # addressing is only valid for these exact layouts, and a grad-free
     # graph (the fused backward program assumes flat inputs).
-    layouts_only = any(mode != "flat" for mode, _ in input_modes)
+    layouts_only = input_modes is None or any(
+        mode != "flat" for mode, _ in input_modes
+    )
     if layouts_only and any(
         value.requires_grad for value in example_inputs
     ):
