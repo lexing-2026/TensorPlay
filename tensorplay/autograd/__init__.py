@@ -18,6 +18,7 @@ from .grad_mode import (
     no_grad,
     set_grad_enabled,
     is_grad_enabled,
+    _unsafe_preserve_version_counter,
 )
 
 from .function import Function, NestedIOFunction

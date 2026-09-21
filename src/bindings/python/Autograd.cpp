@@ -1804,6 +1804,22 @@ void init_autograd(py::module_& m) {
     autograd.def("is_grad_enabled", &tensorplay::tpx::GradMode::is_enabled);
     autograd.def("set_grad_enabled", &tensorplay::tpx::GradMode::set_enabled);
 
+    // Restores each tensor's version counter to a previously observed value.
+    // Used by the Python context manager of the same purpose so a tensor whose
+    // storage is freed and re-populated (sharded-parameter recycling) stays
+    // valid for saved-tensor mutation checks.
+    autograd.def(
+        "_unsafe_set_version_counter",
+        [](const std::vector<Tensor>& tensors, const std::vector<int64_t>& versions) {
+            if (tensors.size() != versions.size()) {
+                throw std::runtime_error(
+                    "tensors and versions must have the same length");
+            }
+            for (size_t i = 0; i < tensors.size(); ++i) {
+                tensors[i].unsafeGetTensorImpl()->set_version(versions[i]);
+            }
+        });
+
     // Python wrapper drives through __enter__/__exit__. Entering disables
     // autograd recording and freezes version counters; exit restores the
     struct PyInferenceMode {
