@@ -1,4 +1,4 @@
-"""M5c training-state segmented VJP (multi-kernel backward chaining).
+"""Training-state segmented VJP (multi-kernel backward chaining).
 
 The orchestration contract is verified locally with fake launches that
 execute the true per-segment math eagerly: forward chaining, tangent
@@ -231,7 +231,7 @@ def test_multi_segment_training_matches_eager_gpu():
         assert tp.abs(got.grad.cpu() - want.grad.cpu()).max().item() < 1e-5
 
 
-# --- extern-segment analytic VJP rules (M5f) ---------------------------------------
+# --- extern-segment analytic VJP rules ---------------------------------------
 
 
 def _vjp_rule(target, kwargs=None, args_after=()):
@@ -513,7 +513,7 @@ def test_extern_engine_vjp_trainable_between_fused_kernels(monkeypatch):
         assert tp.abs(g.grad.cpu() - want.grad.cpu()).max().item() < 1e-4
 
 
-# --- M5f: broadcast operands train through sum-to-shape ---------------------------
+# --- broadcast operands train through sum-to-shape ---------------------------
 
 
 def test_broadcast_operand_single_segment_trains(monkeypatch):

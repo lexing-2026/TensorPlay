@@ -1,4 +1,4 @@
-"""L5-M3: CUDA graph orchestration logic (fake native surface, no CUDA needed)."""
+"""CUDA graph orchestration logic (fake native surface, no CUDA needed)."""
 
 import pytest
 

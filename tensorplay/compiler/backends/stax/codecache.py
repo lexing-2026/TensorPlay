@@ -1,4 +1,4 @@
-"""Kernel code-generation cache (L5-M1).
+"""Kernel code-generation cache.
 
 The lowering backend (stax/Triton/AVX) supplies the compiled artifact
 generated ``source`` plus its compile callable; this module owns key

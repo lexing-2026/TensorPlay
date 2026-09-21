@@ -1,4 +1,4 @@
-"""CUDA graphs orchestration (L5-M3).
+"""CUDA graphs orchestration.
 
 (capture once, replay against the captured inputs), driven entirely by the
 native :class:`tensorplay._C.CUDAGraph` class:

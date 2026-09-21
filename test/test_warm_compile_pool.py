@@ -1,4 +1,4 @@
-"""L5-M6 warm-compile helper pool for the Triton autotuner.
+"""Warm-compile helper pool for the Triton autotuner.
 
 Gate plumbing and the worker's source/launch mechanics are tested
 everywhere; the checks that push compiles through the real helper pool

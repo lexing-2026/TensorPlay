@@ -189,7 +189,7 @@ def test_gemm_decision_replay_skips_benchmarking_with_tf32(cache_root, monkeypat
     assert tp.allclose(second(x), fn(x), rtol=2e-2, atol=2e-2)
 
 
-# --- epilogue-fused tiles (M5e) -------------------------------------------------
+# --- epilogue-fused tiles -------------------------------------------------
 
 
 @pytest.mark.skipif(

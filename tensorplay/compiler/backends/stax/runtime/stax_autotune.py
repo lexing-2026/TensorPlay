@@ -1,4 +1,4 @@
-"""Compile-time autotuner for Stax Triton kernels (L5-M2).
+"""Compile-time autotuner for Stax Triton kernels.
 
 Instead of emitting ``@triton.autotune`` — which benchmarks candidate configs
 at every new runtime key with per-launch overhead and keeps no persistent

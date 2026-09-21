@@ -1,4 +1,4 @@
-"""L5-M1/M2: kernel codecache wiring + compile-time autotune logic."""
+"""Kernel codecache wiring + compile-time autotune logic."""
 
 import json
 from types import SimpleNamespace
@@ -339,7 +339,7 @@ def test_triton_backward_still_works_through_autotune_path(tmp_path, monkeypatch
     assert tp.abs(got - expected).max().item() < 1e-6
 
 
-# --- M5d: axis-reduction autotune -------------------------------------------------
+# --- axis-reduction autotune -------------------------------------------------
 
 
 def test_dims_autotune_persists_and_reuses_decision(cache_root, monkeypatch):

@@ -60,7 +60,7 @@ from ..backend import (
 )
 from ..runtime.stax_autotune import disabled as disabled_autotune
 
-# Process-level memo of exec'd launch callables (L5-M1), keyed by
+# Process-level memo of exec'd launch callables, keyed by
 # "<digest>:<fixed_config>".
 _launch_memo: dict[str, Any] = {}
 
@@ -153,7 +153,7 @@ def _single_block_config(numel: int) -> tuple[int, int]:
 
 
 # Per-chunk accumulator update emitted inside the axis-reduction r-loop
-# (M5b): ``chunk`` is the RBLOCK-folded partial for the current tile row.
+# ``chunk`` is the RBLOCK-folded partial for the current tile row.
 _ACC_UPDATE = {
     "sum": "acc + chunk",
     "mean": "acc + chunk",
@@ -163,7 +163,7 @@ _ACC_UPDATE = {
     "min": "tl.minimum(acc, chunk)",
 }
 
-# Value-stream dtype for index reductions (M5b dual-stream skeleton).  The
+# Value-stream dtype for index reductions (dual-stream skeleton).  The
 # accumulator must match the loaded tile dtype or tl.where/tl.argmax promote
 # unpredictably; only types with verified numerics are foldable.  Keys are
 # ``str(tp_dtype)`` spellings.
@@ -179,7 +179,7 @@ def _dim_reduction_config(
     """Deterministic (XBLOCK, num_warps, RBLOCK, num_stages) for an axis reduction.
 
     The static default sits mid-table; ``_autotune_dims_launch`` benchmarks
-    the full candidate set when tuning is enabled (M5d).
+    the full candidate set when tuning is enabled.
     """
 
     rank = len(reference_shape)
@@ -239,7 +239,7 @@ _PERSISTENT_RNUMEL_MAX = 512
 
 
 class ReductionSpec:
-    """Structured description of a reduction epilogue (L5-M5b).
+    """Structured description of a reduction epilogue.
 
     ``op``    : "sum" | "mean" | "amax" | "amin" | "max" | "min" | "argmax"
                 | "var" | "std"
@@ -793,16 +793,16 @@ class TritonProgramCodegen:
         Pointwise programs keep the historic shapes: ``fixed_config=None``
         emits the runtime ``@triton.autotune`` decorator (fallback behaviour),
         while a ``(xblock, num_warps)`` pair drops the decorator and pins the
-        winning autotuned config explicitly (L5-M2).
+        winning autotuned config explicitly.
 
         Full-reduction epilogues are always pinned: a reference input within
         one block takes the single-kernel direct-store form, anything larger
         takes the two-stage split — per-program partial results into a
         workspace plus a tiny finalize kernel — using multilayer split
         reduction in miniature.  Axis reductions (the
-        ``sum(dim)`` family, M5b) emit an output-space kernel whose inner
+        ``sum(dim)`` family) emit an output-space kernel whose inner
         ``tl.range`` loop folds RBLOCK-sized chunks of the reduction space;
-        their configs are deterministic in v1 (tuning lands with M5d).
+        their configs are deterministic in v1 (tuning lands later).
         """
 
         spec = self.reduction_spec
@@ -1880,7 +1880,7 @@ def _program_digest(
     epilogue,
     reduction_outputs,
 ) -> str:
-    """Content hash of a program specialization (M6).
+    """Content hash of a program specialization.
 
     Covers the emitter generation, the program, the reduction/epilogue
     payload and the example inputs' shapes/dtypes/devices -- the last
@@ -1924,7 +1924,7 @@ def _program_source(
     epilogue=None,
     reduction_outputs=None,
 ) -> tuple[str, str]:
-    """Generate one candidate's kernel source without exec'ing it (M6).
+    """Generate one candidate's kernel source without exec'ing it.
 
     Source generation is cheap string assembly; the expensive Triton
     compile only happens when the launch callable first runs.  Splitting
@@ -1957,7 +1957,7 @@ def _program_source(
 
 
 def _warm_compile_candidates(candidates, example_inputs, source_for) -> None:
-    """Pre-compile every candidate in helper processes before benching (M6).
+    """Pre-compile every candidate in helper processes before benching.
 
     ``source_for(config)`` returns ``(source, filename)`` for a candidate.
     Helpers drive one launch each against placeholder inputs matching the
@@ -2065,7 +2065,7 @@ def _dims_decision_key(
     tier: str = "table",
     outputs_repr: str = "",
 ) -> str:
-    """Persisted-decision key for the axis-reduction family (M5d).
+    """Persisted-decision key for the axis-reduction family.
 
     Covers codegen generation, tuning salt, program content, reduction spec,
     output-port kinds, shape buckets, device, value dtype and epilogue so a
@@ -2446,7 +2446,7 @@ def _autotune_launch(
     max_autotune: bool = False,
     coordinate_descent_tuning: bool = False,
 ):
-    """Compile a program, autotuning the launch config when possible (M2).
+    """Compile a program, autotuning the launch config when possible.
 
     Benchmark candidate configs once at compile time and emit a
     fixed-config kernel; persist the decision so later processes skip
@@ -2485,7 +2485,7 @@ def _autotune_launch(
         return build(_single_block_config(_prod(reference_shape)))
     if spec is not None and not spec.is_full:
         # Axis reductions (incl. argmax): benchmark the candidate table once,
-        # persist the decision (M5d).
+        # persist the decision.
         return _autotune_dims_program(
             role,
             program,
@@ -2614,7 +2614,7 @@ _REDUCTION_PAIR_TAILS = frozenset({"max", "min"})
 _REDUCTION_INDEX_TAILS = frozenset({"argmax"})
 _REDUCTION_TAIL_OPS = _REDUCTION_SCALAR_TAILS | _REDUCTION_PAIR_TAILS | _REDUCTION_INDEX_TAILS
 # Extremum reductions: the tangent selects the positions attaining the
-# extremum instead of distributing uniformly (M5f select-mask VJP).
+# extremum instead of distributing uniformly (select-mask VJP).
 _MASK_REDUCTION_OPS = frozenset({"amax", "amin", "max", "min"})
 # Variance family: correction is parsed and carried into the spec.
 _VARIANCE_TAIL_OPS = frozenset({"var", "std"})
@@ -2769,7 +2769,7 @@ def _reduction_spec_from_node(node: Node) -> ReductionSpec | None:
 def _split_reduction_epilogue(
     graph_module: GraphModule,
 ):
-    """Detect a reduction tail over a pointwise chain (L5-M5b).
+    """Detect a reduction tail over a pointwise chain.
 
     Returns ``(tail_node, producer, ReductionSpec)`` when the graph's single
     output is a supported ``chain_result.sum()/mean()/amax()/max()`` and
@@ -3498,7 +3498,7 @@ def _reduction_tangent_plan(
     the reduction input (expand + divide-by-rnumel), so the segment's
     existing elementwise VJP program can be seeded with the expanded
     tangent.  ``amax``/``max``/``argmax`` route gradients to extremum
-    positions only and stay M5f.
+    positions only via the select-mask VJP.
     """
 
     if spec.op not in ("sum", "mean"):
@@ -3546,7 +3546,7 @@ def _sum_to_shape(grad: Any, target_shape: tuple[int, ...]) -> Any:
 
 
 def _reduction_mask_vjp(spec: ReductionSpec, input_position: int):
-    """Select-mask VJP for a bare extremum reduction (M5f).
+    """Select-mask VJP for a bare extremum reduction.
 
     The export tangent flows to every position attaining the extremum,
     splitting ties evenly: ``expand(t) * (x == y) / tie_count`` per
@@ -3731,7 +3731,7 @@ def compile_graph_module(
             else None
         )
 
-    # M5c/M5e: the scheduler is the single source of fusion truth.  Any
+    # The scheduler is the single source of fusion truth.  Any
     # number of validated segments lowers through per-segment emission;
     # each segment's externals must be graph placeholders or the exported
     # tail of an earlier segment.
@@ -3781,7 +3781,7 @@ def compile_graph_module(
     # elementwise partial comes back at the fused iteration space and is
     # summed to the operand's own shape before accumulation.
 
-    # --- acceptance gate for runtime wiring (M5c per-segment emission) ----
+    # --- acceptance gate for runtime wiring (per-segment emission) ----
     output_values = [
         value
         for out_node in graph_module.graph.outputs
@@ -4025,7 +4025,7 @@ def compile_graph_module(
                 pointwise
             )
         output_refs = (output_ref, *extra_refs)
-        # M5e: red→pw store epilogue — the post-reduction pointwise chain
+        # red→pw store epilogue — the post-reduction pointwise chain
         # runs on the accumulator registers inside the same kernel.
         epilogue_payload = None
         if seg.epilogue:
@@ -4180,7 +4180,7 @@ def compile_graph_module(
         return None
     final_port = last_exports.index(final_value)
     if any(value.requires_grad for value in example_inputs):
-        # M5c training: chain one local VJP program per segment.  The
+        # Training: chain one local VJP program per segment.  The
         # reverse sweep feeds each segment's export-gradient through its
         # own fused backward kernel and accumulates contributions into
         # segment boundaries / placeholders (fan-out sums).  Gradients are

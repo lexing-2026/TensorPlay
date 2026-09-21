@@ -1,4 +1,4 @@
-"""Operator decomposition pass (L5-M4).
+"""Operator decomposition pass.
 
 operators into the primitive set *before* AOT, so the derivative registry
 only has to cover primitives. Every expansion below uses ops that already
