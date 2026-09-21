@@ -136,7 +136,8 @@ def _gen_tpx_ops(ctx: CodegenContext) -> None:
                                  derivatives=ctx.derivatives))
     ctx.write("TPXOpsGenerated.cpp",
               generate_tpx_ops_cpp(ctx.funcs, autocast_ops=ctx.autocast_ops,
-                                   derivatives=ctx.derivatives))
+                                   derivatives=ctx.derivatives,
+                                   native_op_names={f.cpp_name for f in ctx.funcs}))
 
 
 @register_generator("AutogradRegistration")
