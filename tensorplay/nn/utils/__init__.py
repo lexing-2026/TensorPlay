@@ -1,4 +1,15 @@
 from . import stateless as stateless
+from . import parametrizations as parametrizations
+from . import parametrize as parametrize
+from .parametrize import (
+    ParametrizationList as ParametrizationList,
+    cached as cached,
+    is_parametrized as is_parametrized,
+    register_parametrization as register_parametrization,
+    remove_parametrizations as remove_parametrizations,
+    type_before_parametrizations as type_before_parametrizations,
+    transfer_parametrizations_and_params as transfer_parametrizations_and_params,
+)
 from .rnn import (
     PackedSequence as PackedSequence,
     invert_permutation as invert_permutation,
