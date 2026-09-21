@@ -14,7 +14,9 @@ struct P10_API VersionCounter {
     std::atomic<uint32_t> version_{0};
 
     void bump() noexcept { version_.fetch_add(1, std::memory_order_relaxed); }
-    uint32_t current_version() const noexcept { version_.load(std::memory_order_relaxed); }
+    uint32_t current_version() const noexcept {
+        return version_.load(std::memory_order_relaxed);
+    }
     void set_version(uint32_t version) noexcept {
         version_.store(version, std::memory_order_relaxed);
     }
