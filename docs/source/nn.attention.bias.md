@@ -58,10 +58,16 @@ routing questions can be answered in one place:
     :toctree: generated
     :nosignatures:
 
-    tensorplay.nn.attention.bias.CausalBias
-    tensorplay.nn.attention.bias.CausalVariant
-    tensorplay.nn.attention.bias.causal_upper_left
-    tensorplay.nn.attention.bias.causal_lower_right
+    CausalBias
+    CausalVariant
+    causal_upper_left
+    causal_lower_right
+```
+
+```{eval-rst}
+.. autosummary::
+    :nosignatures:
+
     tensorplay.backends.cuda.is_flash_attention_available
     tensorplay.backends.cuda.can_use_flash_attention
     tensorplay.backends.cuda.can_use_efficient_attention

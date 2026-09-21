@@ -108,5 +108,5 @@ call to your implementation.
     :toctree: generated
     :nosignatures:
 
-    tensorplay.overrides.TensorPlayFunctionMode
+    TensorPlayFunctionMode
 ```

@@ -90,10 +90,9 @@ backward pass reuses, as an `AuxOutput`.
 
 ```{eval-rst}
 .. autosummary::
-    :toctree: generated
     :nosignatures:
 
-    tensorplay.nn.attention.omni_attention
+    omni_attention
     tensorplay.nn.attention.BlockMask
     tensorplay.nn.attention.create_block_mask
     tensorplay.nn.attention.create_mask

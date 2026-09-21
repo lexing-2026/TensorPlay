@@ -50,7 +50,7 @@ compute from the gradient alone.
 
 Choosing the mutation and aliasing contract (functional, in-place, `out=`,
 or general mutation) is a schema-level decision described in detail on the
-{doc}`library reference page <library>`. For kernels written in Triton or
+{doc}`library reference page </library>`. For kernels written in Triton or
 TileLang, `tensorplay.library.triton_op` /
 `tensorplay.library.tile_lang_op` wrap the kernel launch with the same
 operator machinery. New operators can be validated with
