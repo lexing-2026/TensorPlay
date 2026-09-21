@@ -488,8 +488,8 @@ def trace_omni_attention(
     )
 
 
-@omni_attention.py_impl("ProxyTorchDispatchMode")
-def omni_attention_proxy_torch_dispatch_mode(
+@omni_attention.py_impl("ProxyDispatchMode")
+def omni_attention_proxy_dispatch_mode(
     mode: Any,
     query: Tensor,
     key: Tensor,
@@ -1322,8 +1322,8 @@ def trace_omni_attention_backward(
     )
 
 
-@omni_attention_backward.py_impl("ProxyTorchDispatchMode")
-def omni_attention_backward_proxy_torch_dispatch_mode(
+@omni_attention_backward.py_impl("ProxyDispatchMode")
+def omni_attention_backward_proxy_dispatch_mode(
     mode: Any,
     query: Tensor,
     key: Tensor,

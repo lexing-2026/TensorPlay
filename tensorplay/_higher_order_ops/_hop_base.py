@@ -69,7 +69,7 @@ class HigherOrderOperator:
 
     Registrations are keyed by dispatch role.  A role is either a string
     (``"CompositeExplicitAutograd"``, ``"Autograd"``, ``"AutocastCUDA"``,
-    ``"AutocastCPU"``, ``"ProxyTorchDispatchMode"``, ``"Functionalize"``,
+    ``"AutocastCPU"``, ``"ProxyDispatchMode"``, ``"Functionalize"``,
     ``"PyAutograd"``, ...) or a mode class.  Calling the instance resolves the
     most specific registered implementation for the runtime state and invokes
     it with the original arguments.
@@ -141,12 +141,12 @@ class HigherOrderOperator:
         # Positional-only receiver: operator arguments may be named ``self``.
         # A running proxy capture sees every call first so it can record the
         # operator node instead of executing the eager implementation.
-        if "ProxyTorchDispatchMode" in self._impls:
+        if "ProxyDispatchMode" in self._impls:
             from tensorplay.graph.experimental.proxy_tensor import get_proxy_mode
 
             mode = get_proxy_mode()
             if mode is not None:
-                return self._impls["ProxyTorchDispatchMode"](mode, *args, **kwargs)
+                return self._impls["ProxyDispatchMode"](mode, *args, **kwargs)
 
         # The Autograd layer sits above autocast and the composite one: route
         # to it while gradients are being tracked and no formula is
