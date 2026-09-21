@@ -46,7 +46,7 @@ from ..scheduler import segment_graph
 # EMITTER changes semantics (masking, NaN handling, launcher allocation,
 # load cache annotations, new fused opcodes) so stale generated sources
 # cannot be replayed against a new compiler.
-_CODEGEN_VERSION = "m10-2026-09-20-loop-pass-pair"
+_CODEGEN_VERSION = "m10-2026-09-21-variance-moments"
 from ..backend import (
     _CPU_FUSED_AUTOGRAD_OPS,
     _CPU_FUSED_OPS,
@@ -242,18 +242,22 @@ class ReductionSpec:
     """Structured description of a reduction epilogue (L5-M5b).
 
     ``op``    : "sum" | "mean" | "amax" | "amin" | "max" | "min" | "argmax"
+                | "var" | "std"
     ``dims``  : reduction axes, ascending; empty tuple = full reduction
     ``keepdim``: whether reduced axes stay as size-1 dimensions
+    ``correction``: degrees-of-freedom correction of the variance family
 
     ``argmax`` is an *index* reduction: the kernel carries a value stream and
     an index stream side by side and stores the index stream only; it
     requires explicit dims and float32/float64 inputs.  ``max``/``min`` WITH
     an axis are *pair* reductions (``is_pair``): the same dual-stream kernel
     stores one output per consumed projection — "values", "indices" — as the
-    segment's exports.
+    segment's exports.  ``var``/``std`` with an axis are *moments*
+    reductions: the kernel carries sum and sum-of-squares accumulators and
+    folds the correction into the finalize.
     """
 
-    __slots__ = ("op", "dims", "keepdim")
+    __slots__ = ("op", "dims", "keepdim", "correction")
 
     # kernel-side combine/finalize/neutral per op
     _FINAL = {
@@ -280,10 +284,23 @@ class ReductionSpec:
         "amin": "float('inf')",
         "min": "float('inf')",
         "argmax": "float('-inf')",
+        "var": "0.0",
+        "std": "0.0",
     }
 
-    def __init__(self, op: str, dims: tuple[int, ...] = (), *, keepdim: bool = False) -> None:
-        if op not in self._FINAL and op != "argmax":
+    def __init__(
+        self,
+        op: str,
+        dims: tuple[int, ...] = (),
+        *,
+        keepdim: bool = False,
+        correction: int = 1,
+    ) -> None:
+        if (
+            op not in self._FINAL
+            and op != "argmax"
+            and op not in ("var", "std")
+        ):
             raise ValueError(f"unsupported reduction op: {op}")
         if op == "argmax":
             if not dims:
@@ -295,6 +312,7 @@ class ReductionSpec:
         self.op = op
         self.dims = tuple(sorted(int(dim) for dim in dims))
         self.keepdim = bool(keepdim)
+        self.correction = int(correction)
 
     @property
     def tracks_indices(self) -> bool:
@@ -305,6 +323,12 @@ class ReductionSpec:
         """True for ``max(dim)``/``min(dim)``: value+index pair output."""
 
         return self.op in ("max", "min") and bool(self.dims)
+
+    @property
+    def is_moments(self) -> bool:
+        """True for the variance family: sum + sum-of-squares accumulators."""
+
+        return self.op in ("var", "std") and bool(self.dims)
 
     @property
     def is_full(self) -> bool:
@@ -349,10 +373,13 @@ class ReductionSpec:
         ) if self.dims else _prod(reference_shape)
 
     def __repr__(self) -> str:
-        return f"ReductionSpec({self.op!r}, {self.dims!r}, keepdim={self.keepdim})"
+        return (
+            f"ReductionSpec({self.op!r}, {self.dims!r}, "
+            f"keepdim={self.keepdim}, correction={self.correction})"
+        )
 
     def digest_key(self) -> tuple[Any, ...]:
-        return ("reduction", self.op, self.dims, self.keepdim)
+        return ("reduction", self.op, self.dims, self.keepdim, self.correction)
 
 
 _runtime_probe_done = False
@@ -1011,6 +1038,12 @@ class TritonProgramCodegen:
                 # Index stream: the running winner in flat reduced-space
                 # coordinates (same order the r-loop enumerates).
                 body.append("acci = tl.zeros([XBLOCK], dtype=tl.int64)")
+            elif spec.is_moments:
+                # Variance family: sum and sum-of-squares accumulators; the
+                # masked tail pads with zero and the real count is the
+                # exact rnumel literal, so both sums stay unbiased.
+                body.append("acc = tl.zeros([XBLOCK], dtype=tl.float32)")
+                body.append("accq = tl.zeros([XBLOCK], dtype=tl.float32)")
             else:
                 body.append(
                     f"acc = tl.full([XBLOCK], {spec.neutral()}, dtype=tl.float32)"
@@ -1108,10 +1141,21 @@ class TritonProgramCodegen:
                         f"float('nan'), tl.where((cval {cmp} acc) & live, cval, acc))"
                     )
                 else:
-                    body.append(
-                        f"{indent}chunk = {spec.finalize_call(last_masked + ', axis=1')}"
-                    )
-                    body.append(f"{indent}acc = {_ACC_UPDATE[spec.op]}")
+                    if spec.is_moments:
+                        body.append(
+                            f"{indent}chunk = tl.sum({last_masked}, axis=1)"
+                        )
+                        body.append(
+                            f"{indent}chunkq = tl.sum({last_masked} * "
+                            f"{last_masked}, axis=1)"
+                        )
+                        body.append(f"{indent}acc = acc + chunk")
+                        body.append(f"{indent}accq = accq + chunkq")
+                    else:
+                        body.append(
+                            f"{indent}chunk = {spec.finalize_call(last_masked + ', axis=1')}"
+                        )
+                        body.append(f"{indent}acc = {_ACC_UPDATE[spec.op]}")
 
             if persistent:
                 emit_r_tile("0", div_r, "")
@@ -1136,7 +1180,26 @@ class TritonProgramCodegen:
                         f"{range_kwargs}):"
                     )
                     emit_r_tile("roffset", div_r, "    ")
-            if spec.op == "mean":
+            if spec.is_moments:
+                # var = (Q/n - mean^2) * n/(n-corr); std is its root.  The
+                # correction scale reproduces the eager envelope: n == corr
+                # yields 0 * inf = NaN (a single unbiased sample), n < corr
+                # yields a negative variance, and std of a negative variance
+                # is NaN.
+                n = rnumel
+                corr = spec.correction
+                inv = repr(1.0 / n)
+                if n == corr:
+                    scale = "float('inf')"
+                else:
+                    scale = f"({n}.0 / {n - corr}.0)"
+                body.append(f"meanv = acc * {inv}")
+                body.append(
+                    f"acc = (accq * {inv} - meanv * meanv) * {scale}"
+                )
+                if spec.op == "std":
+                    body.append("acc = tl.sqrt(acc)")
+            elif spec.op == "mean":
                 body.append(f"acc = acc * {repr(1.0 / rnumel)}")
             if dual_stream:
                 out_kinds = self.reduction_outputs
@@ -2397,14 +2460,96 @@ def _autotune_launch(
 
 # Reduction-tail op families: scalar value tails (no axes for min/max —
 # with an axis they become pair tails), pair tails (min/max over one axis,
-# values+indices), and the index reduction.
-_REDUCTION_SCALAR_TAILS = frozenset({"sum", "mean", "amax", "amin", "max", "min"})
+# values+indices), and the index reduction.  The variance family shares the
+# scalar-tail shape but only folds WITH an axis (the full-reduction split
+# machinery is value-only); an axis-free ``var()``/``std()`` stays eager.
+_REDUCTION_SCALAR_TAILS = frozenset(
+    {"sum", "mean", "amax", "amin", "max", "min", "var", "std"}
+)
 _REDUCTION_PAIR_TAILS = frozenset({"max", "min"})
 _REDUCTION_INDEX_TAILS = frozenset({"argmax"})
 _REDUCTION_TAIL_OPS = _REDUCTION_SCALAR_TAILS | _REDUCTION_PAIR_TAILS | _REDUCTION_INDEX_TAILS
 # Extremum reductions: the tangent selects the positions attaining the
 # extremum instead of distributing uniformly (M5f select-mask VJP).
 _MASK_REDUCTION_OPS = frozenset({"amax", "amin", "max", "min"})
+# Variance family: correction is parsed and carried into the spec.
+_VARIANCE_TAIL_OPS = frozenset({"var", "std"})
+
+
+def _parse_variance_tail(node: Node) -> ReductionSpec | None:
+    """Parse a ``var``/``std`` call_method node (axis forms only).
+
+    The tensor method spells its trailing arguments
+    ``(dim, correction, keepdim)``; each is also accepted by keyword.  The
+    axis-free form is declined — the split full-reduction machinery is
+    value-only, so it stays on the eager path.
+    """
+
+    kwargs = dict(node.kwargs)
+    if "dim" in kwargs:
+        dim_value = kwargs.pop("dim")
+    else:
+        dim_value = None
+    if "correction" in kwargs:
+        correction = kwargs.pop("correction")
+        correction_given = True
+    else:
+        correction = 1
+        correction_given = False
+    keepdim = kwargs.pop("keepdim", False)
+    if kwargs:
+        return None
+    if not isinstance(keepdim, bool):
+        return None
+    if isinstance(correction, bool) or not isinstance(correction, int):
+        return None
+
+    positional = [
+        value
+        for value in node.args[1:]
+        if isinstance(value, (int, float, str, bool, tuple, list))
+    ]
+    p = list(positional)
+    if dim_value is None:
+        if not p:
+            return None
+        dim_value = p.pop(0)
+    elif p:
+        # dim already came by keyword; a positional slot would duplicate it.
+        return None
+    if not correction_given:
+        if p:
+            correction = p.pop(0)
+            if isinstance(correction, bool) or not isinstance(correction, int):
+                return None
+    elif p:
+        return None
+    if p:
+        keepdim_extra = p.pop(0)
+        if not isinstance(keepdim_extra, bool):
+            return None
+        keepdim = keepdim_extra
+    if p:
+        return None
+
+    if isinstance(dim_value, bool):
+        return None
+    if isinstance(dim_value, int):
+        dims = (dim_value,)
+    elif (
+        isinstance(dim_value, (tuple, list))
+        and dim_value
+        and all(
+            isinstance(item, int) and not isinstance(item, bool)
+            for item in dim_value
+        )
+    ):
+        dims = tuple(dim_value)
+    else:
+        return None
+    return ReductionSpec(
+        _target_name(node.target), dims, keepdim=keepdim, correction=correction
+    )
 
 
 def _reduction_spec_from_node(node: Node) -> ReductionSpec | None:
@@ -2418,6 +2563,8 @@ def _reduction_spec_from_node(node: Node) -> ReductionSpec | None:
     op = _target_name(node.target)
     if op not in _REDUCTION_TAIL_OPS:
         return None
+    if op in _VARIANCE_TAIL_OPS:
+        return _parse_variance_tail(node)
     # call_method nodes carry the receiver as args[0]; parse only the rest.
     args = [
         value
