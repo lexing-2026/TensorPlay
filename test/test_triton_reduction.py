@@ -393,6 +393,124 @@ def test_axis_mean_and_amax_match_eager():
     _run_reference(amax_fn, (x,))
 
 
+# --- M5g: variance family (var/std over dims) -------------------------------------
+
+
+def test_variance_detection():
+    x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+    detected = _split_reduction_epilogue(
+        _trace(lambda t: (t * 2.0).var(dim=1), x)
+    )
+    assert detected is not None
+    _, _, spec = detected
+    assert spec.op == "var" and spec.dims == (1,)
+    assert spec.correction == 1 and not spec.keepdim
+    assert spec.is_moments
+
+    detected = _split_reduction_epilogue(
+        _trace(lambda t: (t * 2.0).std(dim=0, correction=0, keepdim=True), x)
+    )
+    assert detected is not None
+    _, _, spec = detected
+    assert (spec.op, spec.correction, spec.keepdim) == ("std", 0, True)
+
+    detected = _split_reduction_epilogue(
+        _trace(lambda t: (t * 2.0).var(1, 0, False), x)
+    )
+    assert detected is not None
+    assert detected[2].correction == 0
+
+    # Axis-free variance stays eager: the split machinery is value-only.
+    assert _split_reduction_epilogue(_trace(lambda t: t.var(), x)) is None
+    assert _split_reduction_epilogue(_trace(lambda t: t.std(), x)) is None
+
+
+def test_variance_codegen_structure():
+    codegen = TritonProgramCodegen(
+        [3, 0, -1], [2.0], (1,), 1,
+        reduction=ReductionSpec("var", (1,)),
+        reference_shape=(32, 64),
+    )
+    src = codegen.generate("k", fixed_config=(32, 4))
+    # sum and sum-of-squares accumulators, folded per chunk
+    assert "acc = tl.zeros([XBLOCK], dtype=tl.float32)" in src
+    assert "accq = tl.zeros([XBLOCK], dtype=tl.float32)" in src
+    assert "chunk = tl.sum(tmp0, axis=1)" in src
+    assert "chunkq = tl.sum(tmp0 * tmp0, axis=1)" in src
+    assert "acc = acc + chunk" in src and "accq = accq + chunkq" in src
+    # finalize: mean then E[x^2]-mean^2 with the correction scale
+    assert "meanv = acc * 0.015625" in src
+    assert "acc = (accq * 0.015625 - meanv * meanv) * (64.0 / 63.0)" in src
+
+    std = TritonProgramCodegen(
+        [3, 0, -1], [2.0], (1,), 1,
+        reduction=ReductionSpec("std", (1,)),
+        reference_shape=(32, 64),
+    )
+    ssrc = std.generate("k", fixed_config=(32, 4))
+    assert "acc = tl.sqrt(acc)" in ssrc
+
+
+def test_variance_masked_tail_pads_with_zero():
+    # 1023 % 512 != 0 (RBLOCK capped at 512): the masked tail must pad with
+    # the sums' neutral zero so both accumulators stay unbiased.
+    codegen = TritonProgramCodegen(
+        [3, 0, -1], [2.0], (1,), 1,
+        reduction=ReductionSpec("var", (1,)),
+        reference_shape=(17, 1023),
+    )
+    src = codegen.generate("k", fixed_config=(16, 4))
+    assert "tl.where(rmask[None, :], tmp0, 0.0)" in src
+    assert "tl.where(rmask[None, :], tmp0, 0.0) * " in src
+
+
+@pytest.mark.skipif(not runtime_available(), reason="Triton/CUDA unavailable")
+def test_variance_matches_eager():
+    x = tp.rand(256, 1024, device="cuda")
+
+    def var_fn(t):
+        return t.var(dim=1)
+
+    def std_fn(t):
+        return t.std(dim=1)
+
+    def var_unbiased_fn(t):
+        return t.var(dim=1, correction=0)
+
+    def keepdim_fn(t):
+        return t.var(dim=1, keepdim=True)
+
+    _run_reference(var_fn, (x,))
+    _run_reference(std_fn, (x,))
+    _run_reference(var_unbiased_fn, (x,))
+    _run_reference(keepdim_fn, (x,))
+
+
+@pytest.mark.skipif(not runtime_available(), reason="Triton/CUDA unavailable")
+def test_variance_over_fused_chain_matches_eager():
+    x = tp.rand(128, 256, device="cuda")
+
+    def chain_fn(t):
+        return (t * 2.0).tanh().var(dim=1)
+
+    def std0_fn(t):
+        return t.exp().std(dim=0)
+
+    _run_reference(chain_fn, (x,))
+    _run_reference(std0_fn, (x,))
+
+
+@pytest.mark.skipif(not runtime_available(), reason="Triton/CUDA unavailable")
+def test_variance_odd_reduction_space_matches_eager():
+    x = tp.rand(17, 1023, device="cuda")
+
+    def var_fn(t):
+        return t.var(dim=1)
+
+    _run_reference(var_fn, (x,))
+
+
 # --- M5b closure: argmax dual-stream index reduction ------------------------------
 
 
