@@ -2,10 +2,10 @@
 
 from typing import Any
 
-__all__ = ["_annotate_modules_for_dynamo"]
+__all__ = ["_annotate_modules_for_compile"]
 
 
-def _annotate_modules_for_dynamo(
+def _annotate_modules_for_compile(
     module: Any,
     ignored_modules: set[Any] | None = None,
     use_orig_params: bool = False,

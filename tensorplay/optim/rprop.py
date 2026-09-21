@@ -9,7 +9,7 @@ from ._utils import (
 from .optimizer import (
     Optimizer,
     _default_to_fused_or_foreach,
-    _disable_dynamo_if_unsupported,
+    _disable_capture_if_unsupported,
     _get_capturable_supported_devices,
     _get_scalar_dtype,
     _use_grad_for_differentiable,
@@ -247,7 +247,7 @@ def _multi_tensor_rprop(
         )
 
 
-@_disable_dynamo_if_unsupported(single_tensor_fn=_single_tensor_rprop)
+@_disable_capture_if_unsupported(single_tensor_fn=_single_tensor_rprop)
 def rprop(
     params, grads, prevs, step_sizes, state_steps, foreach=None,
     capturable=False, maximize=False, differentiable=False, has_complex=False,

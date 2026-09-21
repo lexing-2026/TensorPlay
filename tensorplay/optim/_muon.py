@@ -9,7 +9,7 @@ import tensorplay as tp
 from tensorplay import Tensor
 
 from .optimizer import (
-    _disable_dynamo_if_unsupported,
+    _disable_capture_if_unsupported,
     _to_scalar,
     Optimizer,
 )
@@ -540,7 +540,7 @@ def _single_tensor_muon(
         param.add_(update, alpha=-adjusted_lr)
 
 
-@_disable_dynamo_if_unsupported(single_tensor_fn=_single_tensor_muon)
+@_disable_capture_if_unsupported(single_tensor_fn=_single_tensor_muon)
 def muon(
     params: list[Tensor],
     grads: list[Tensor],

@@ -32,7 +32,7 @@ from ._fsdp_common import (
     TrainingState,
     _disable_functorch_if_active,
     _cast_fp_tensor,
-    _dynamo_disable,
+    _disable_capture,
     is_bw,
 )
 from ._fsdp_param import FSDPParam, ParamModuleInfo, ShardedState
@@ -522,7 +522,7 @@ class FSDPParamGroup:
         self._post_forward_indices.append(post_forward_index)
         self._post_forward_recorded = True
 
-    @_dynamo_disable
+    @_disable_capture
     def pre_backward(self, default_prefetch: Any, *unused: Any) -> None:
         if self._training_state == TrainingState.PRE_BACKWARD:
             return
@@ -533,7 +533,7 @@ class FSDPParamGroup:
         if default_prefetch:
             self._backward_prefetch()
 
-    @_dynamo_disable
+    @_disable_capture
     def post_backward(self, *unused: Any) -> None:
         del unused
         if self._post_backward_done:

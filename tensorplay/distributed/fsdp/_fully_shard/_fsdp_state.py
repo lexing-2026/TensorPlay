@@ -11,7 +11,7 @@ from tensorplay.autograd import Function, Variable
 from .._common_utils import TrainingState, collect_grad_tensors
 from ...device_mesh import DeviceMesh
 from ...utils import _apply_to_tensors, _to_kwargs
-from ._fsdp_common import DataParallelMeshInfo, _cast_fp_tensor, _dynamo_disable
+from ._fsdp_common import DataParallelMeshInfo, _cast_fp_tensor, _disable_capture
 from ._fsdp_collectives import _current_stream, _wait_event, _wait_stream
 from ._fsdp_init import _init_default_mesh, _init_param_group
 from ._fsdp_param import FSDPParam, ParamModuleInfo
@@ -363,7 +363,7 @@ class FSDPState:
             for param in group.params
         ]
 
-    @_dynamo_disable
+    @_disable_capture
     def _pre_forward(self, module: Any, args: Any, kwargs: Any) -> tuple[Any, Any]:
         if self._training_state == TrainingState.PRE_BACKWARD:
             for group in self._all_param_groups():
@@ -384,7 +384,7 @@ class FSDPState:
                     group._prefetch_unshard(group, "forward")
         return args, kwargs
 
-    @_dynamo_disable
+    @_disable_capture
     def _post_forward(self, module: Any, input: Any, output: Any) -> Any:
         if self._training_state == TrainingState.PRE_BACKWARD:
             return self._cast_output_dtype(output)
@@ -439,7 +439,7 @@ class FSDPState:
             state._modules_to_run_forward.clear()
         return output
 
-    @_dynamo_disable
+    @_disable_capture
     def _pre_backward(self, grad: Any) -> Any:
         if self._training_state == TrainingState.PRE_BACKWARD:
             return grad
@@ -454,7 +454,7 @@ class FSDPState:
                     group.unshard(group.unshard_async_op)
         return grad
 
-    @_dynamo_disable
+    @_disable_capture
     def _root_post_backward_final_callback(self) -> None:
         state_ctx = self._state_ctx
         state_ctx.iter_forward_root = None
@@ -577,7 +577,7 @@ def _register_group_forward_hooks(
     modules_set = set(modules)
     modules_to_run = modules_to_run if modules_to_run is not None else set()
 
-    @_dynamo_disable
+    @_disable_capture
     @functools.wraps(pre_hook)
     def wrapped_pre_hook(module: Any, args: Any, kwargs: Any) -> Any:
         if not modules_to_run:
@@ -585,7 +585,7 @@ def _register_group_forward_hooks(
         return pre_hook(module, args, kwargs)
 
     def get_wrapped_post_hook(module: Any) -> Any:
-        @_dynamo_disable
+        @_disable_capture
         @functools.wraps(post_hook)
         def wrapped_post_hook(
             hook_module: Any, input: Any, kwargs: Any, output: Any

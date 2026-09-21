@@ -27,7 +27,7 @@ from .vmap import (
 __all__ = ["vmap", "chunk_vmap", "grad", "grad_and_value"]
 
 
-def _wraps_without_dynamo_attrs(func: Callable) -> Callable:
+def _wraps_without_compile_attrs(func: Callable) -> Callable:
     """Copies callable metadata without leaking compiler-only attributes."""
 
     def decorator(wrapper: Callable) -> Callable:
@@ -87,7 +87,7 @@ def vmap(
             f"vmap: chunk_size should be None or greater than 0. Got {chunk_size}"
         )
 
-    @_wraps_without_dynamo_attrs(func)
+    @_wraps_without_compile_attrs(func)
     def wrapped(*args, **kwargs):
         return vmap_impl(func, in_dims, out_dims, randomness, chunk_size, *args, **kwargs)
 
@@ -113,7 +113,7 @@ def chunk_vmap(
     if chunks == 1:
         return vmap(func, in_dims=in_dims, out_dims=out_dims, randomness=randomness)
 
-    @_wraps_without_dynamo_attrs(func)
+    @_wraps_without_compile_attrs(func)
     def wrapped_with_chunks(*args, **kwargs):
         _check_out_dims_is_int_or_int_pytree(out_dims, func)
         batch_size, flat_in_dims, flat_args, args_spec = _process_batched_inputs(
@@ -157,7 +157,7 @@ def grad(
     if not callable(func):
         raise TypeError(f"grad expected a callable, got {type(func)!r}")
 
-    @_wraps_without_dynamo_attrs(func)
+    @_wraps_without_compile_attrs(func)
     def wrapper(*args, **kwargs):
         return grad_impl(func, argnums, has_aux, args, kwargs)
 
@@ -179,7 +179,7 @@ def grad_and_value(
     if not callable(func):
         raise TypeError(f"grad_and_value expected a callable, got {type(func)!r}")
 
-    @_wraps_without_dynamo_attrs(func)
+    @_wraps_without_compile_attrs(func)
     def wrapper(*args, **kwargs):
         return grad_and_value_impl(func, argnums, has_aux, args, kwargs)
 
