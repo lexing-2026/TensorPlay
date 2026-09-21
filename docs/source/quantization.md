@@ -157,16 +157,31 @@ mark where activations enter and leave the quantized region.
 The static workflow composes these:
 
 ```python
-from tensorplay.ao.quantization import prepare, convert
+import tensorplay as tp
+from tensorplay.ao.quantization import (
+    QuantStub, DeQuantStub, prepare, convert, default_per_channel_qconfig,
+)
 
-model.train()
-m = prepare(model)               # inserts observers at the stubs
+model = tp.nn.Sequential(
+    QuantStub(),
+    tp.nn.Linear(128, 64),
+    tp.nn.ReLU(),
+    tp.nn.Linear(64, 10),
+    DeQuantStub(),
+)
+model.qconfig = default_per_channel_qconfig   # which observers to attach
+
+m = prepare(model)               # attaches observers to the stubs and layers
 for x, _ in calibration_data:    # run representative data through
     m(x)
 model = convert(m)               # observers become scale constants,
                                  # float layers become quantized layers
 ```
 
+Only submodules carrying a `qconfig` are quantized, and the model must
+enter and leave its quantized region through `QuantStub` / `DeQuantStub`
+— after conversion the stubs become the real `Quantize` / `DeQuantize`
+modules and the interior runs on quantized tensors end to end.
 {func}`~tensorplay.ao.quantization.quantize` runs
 prepare→calibrate (`run_fn`)→convert in one call for eager models;
 {func}`~tensorplay.ao.quantization.quantize_dynamic` needs no calibration
@@ -237,15 +252,48 @@ had two or three layers.
 
 ## Quantization-aware training modules
 
+```{eval-rst}
+.. autosummary::
+    :toctree: generated
+    :nosignatures:
+
+    tensorplay.ao.nn.qat.Linear
+    tensorplay.ao.nn.qat.Conv1d
+    tensorplay.ao.nn.qat.Conv2d
+    tensorplay.ao.nn.qat.Conv3d
+```
+
 For QAT, `tensorplay.ao.nn.qat` provides the float modules with fake
-quantize built in — `ao.nn.qat.Linear` and `ao.nn.qat.Conv1d`/`Conv2d`/
-`Conv3d` — which expose their weight and activation fake-quantize modules
-as `weight_fake_quant` and `activation_post_process`. Under the QAT
-workflow, `prepare` (in QAT mode) swaps the model's Linear and Conv layers
-for these, training proceeds with quantization noise simulated in the
-forward pass, and `convert` then turns them into the true quantized
-modules. Access them through the `tensorplay.ao.nn.qat` namespace after
-`tensorplay.ao.quantization` is imported.
+quantize built in: `ao.nn.qat.Linear` and `ao.nn.qat.Conv1d`/`Conv2d`/
+`Conv3d` quantize their weights on the fly through a
+`weight_fake_quant` module (a per-output-channel `PerChannelFakeQuantize`,
+or whatever `qconfig.weight()` produces), so training optimizes against
+the quantized grid while the parameters stay float. The fused variants
+(`ao.nn.intrinsic.qat.LinearReLU`, `ConvReLU1d/2d/3d`) add a rectifier on
+top.
+
+A QAT round trip: swap the float layer for its QAT twin, let `prepare`
+attach the activation observers, train, then `convert` — the quantized
+module that comes out bakes in exactly the grid the training loop
+converged on:
+
+```python
+import tensorplay as tp
+from tensorplay.ao.nn.qat import Linear as QATLinear
+from tensorplay.ao.quantization import (
+    prepare, convert, default_per_channel_qconfig,
+)
+
+float_linear.qconfig = default_per_channel_qconfig
+qat_linear = QATLinear.from_float(float_linear)
+qat_linear.qconfig = default_per_channel_qconfig
+
+qat_linear = prepare(qat_linear)     # observers now record activations
+for x, _ in train_loader:             # ordinary training loop; the forward
+    loss = loss_fn(qat_linear(x), y)  # pass runs through weight_fake_quant
+    loss.backward()
+q_linear = convert(qat_linear)        # QuantizedLinear with the trained grid
+```
 
 ## Numeric comparison utilities
 
