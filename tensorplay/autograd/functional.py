@@ -340,7 +340,7 @@ def vjp(func, inputs, v=None, create_graph=False, strict=False):
     )
 
 
-def jvp(func, inputs, v=None, create_graph=False, strict=False, mode="reversed"):
+def jvp(func, inputs, v=None, create_graph=False, strict=False, mode="forward"):
     r"""Compute the dot product between the Jacobian of the given function at the point given by the inputs and a vector ``v``.
 
     Args:
@@ -369,11 +369,6 @@ def jvp(func, inputs, v=None, create_graph=False, strict=False, mode="reversed")
             jvp (tuple of Tensors or Tensor): result of the dot product with
             the same shape as the output.
 
-    Note:
-        ``autograd.functional.jvp`` computes the jvp by using the backward of
-        the backward (sometimes called the double backwards trick). This is not
-        the most performant way of computing the jvp.
-
     Example:
 
         >>> def exp_reducer(x):
@@ -392,17 +387,20 @@ def jvp(func, inputs, v=None, create_graph=False, strict=False, mode="reversed")
         (tensor([2.2399, 2.5005]),
          tensor([5., 5.]))
 
-    mode (str, optional): "reversed" computes the jvp via the double
-        backwards trick; "forward" uses native forward-mode AD kernels and
-        propagates tangents in a single pass per op (requires ``func`` to be
-        written with operators/methods supported by forward-mode, see
-        ``tensorplay.autograd._forward``).  Defaults to "reversed".
+    mode (str, optional): "forward" runs func once with the dual-tensor
+        engine and propagates tangents op by op (the default; ``func`` must
+        be written with operators supported by forward-mode).  "reversed"
+        computes the jvp via the double backwards trick and works for any
+        twice-differentiable ``func``.
 
     """
-    if mode == "forward":
+    if mode not in ("forward", "reversed"):
+        raise ValueError(
+            f"jvp(): mode must be 'reversed' or 'forward', got {mode!r}")
+
+    if mode == "forward" and not create_graph:
         # True forward mode: tangents propagate through the forward-AD
-        # engine in a single pass over func.  create_graph does not apply;
-        # the tangents themselves require grad only when the inputs do.
+        # engine in a single pass over func.
         from tensorplay._transforms.eager_transforms import _jvp_with_argnums
 
         inputs_t = (inputs,) if isinstance(inputs, tensorplay.Tensor) \
@@ -415,9 +413,10 @@ def jvp(func, inputs, v=None, create_graph=False, strict=False, mode="reversed")
             raise ValueError("jvp: v must match inputs element-for-element")
         return _jvp_with_argnums(
             func, *inputs_t, tangents=v_t, strict=strict)
-    elif mode != "reversed":
-        raise ValueError(
-            f"jvp(): mode must be 'reversed' or 'forward', got {mode!r}")
+
+    # The reversed path also serves mode="forward" with create_graph=True:
+    # the dual-tensor engine rejects nested forward mode, so graph-carrying
+    # tangents can only come from the double-backward trick.
 
     with tensorplay.enable_grad():
         is_inputs_tuple, inputs = _as_tuple(inputs, "inputs", "jvp")
