@@ -82,7 +82,14 @@ def get_tensorplay_version(sha: str | None = None) -> str:
         build_number = int(raw_build_number) if raw_build_number else 1
         version = os.getenv("TENSORPLAY_BUILD_VERSION", "")
         if build_number > 1:
-            version += ".post" + str(build_number)
+            # A post segment must precede the dev segment to stay valid under
+            # PEP 440: "1.1.0.dev20260921.post2" is rejected by version
+            # parsers, "1.1.0.post2.dev20260921" is not.
+            if ".dev" in version:
+                head, dev = version.split(".dev", 1)
+                version = f"{head}.post{build_number}.dev{dev}"
+            else:
+                version += ".post" + str(build_number)
         origin = "TENSORPLAY_BUILD_{VERSION,NUMBER} env variables"
     elif sdist_version:
         version = sdist_version
