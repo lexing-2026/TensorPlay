@@ -11,11 +11,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <mutex>
 #include <sstream>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -73,6 +75,48 @@ std::string formatTime(double ms) {
     return ss.str();
 }
 
+// Boolean configuration values read from the process environment accept the
+// spellings below; anything else is reported and ignored.
+bool envFlag(const char* name, bool* out) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr) {
+        return false;
+    }
+    std::string value;
+    for (const char* p = raw; *p != '\0'; ++p) {
+        value.push_back(static_cast<char>(
+            std::tolower(static_cast<unsigned char>(*p))));
+    }
+    if (value == "1" || value == "true" || value == "on") {
+        *out = true;
+        return true;
+    }
+    if (value == "0" || value == "false" || value == "off") {
+        *out = false;
+        return true;
+    }
+    TP_WARN("ignoring non-boolean value '", raw, "' for tunable variable ",
+            name);
+    return false;
+}
+
+// Integer configuration values read from the process environment; a value
+// that does not parse as an integer is reported and ignored.
+bool envInt(const char* name, int* out) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr) {
+        return false;
+    }
+    try {
+        *out = std::stoi(raw);
+        return true;
+    } catch (const std::exception&) {
+        TP_WARN("ignoring non-integer value '", raw,
+                "' for tunable variable ", name);
+        return false;
+    }
+}
+
 }  // namespace
 
 struct TuningContext::Impl {
@@ -109,6 +153,42 @@ namespace {
 void logLine(const TuningContext::Impl& impl, const std::string& message) {
     if (impl.verbose.load(std::memory_order_relaxed)) {
         std::fprintf(stderr, "[tensorplay.cuda.tunable] %s\n", message.c_str());
+    }
+}
+
+// Initial switch and budget values may be injected through the process
+// environment; they are read exactly once, when the context is first
+// touched, and every later API call overrides whatever landed here.
+void seedFromEnvironment(TuningContext::Impl& impl) {
+    bool flag = false;
+    if (envFlag("TP_TUNABLEOP_ENABLED", &flag)) {
+        impl.enabled.store(flag, std::memory_order_relaxed);
+    }
+    if (envFlag("TP_TUNABLEOP_TUNING", &flag)) {
+        impl.tuning_enabled.store(flag, std::memory_order_relaxed);
+    }
+    if (envFlag("TP_TUNABLEOP_RECORD_UNTUNED", &flag)) {
+        impl.record_untuned.store(flag, std::memory_order_relaxed);
+    }
+    if (envFlag("TP_TUNABLEOP_VERBOSE", &flag)) {
+        impl.verbose.store(flag, std::memory_order_relaxed);
+    }
+    int value = 0;
+    if (envInt("TP_TUNABLEOP_MAX_TUNING_DURATION_MS", &value)) {
+        impl.max_duration_ms.store(value < 0 ? 0 : value,
+                                   std::memory_order_relaxed);
+    }
+    if (envInt("TP_TUNABLEOP_MAX_TUNING_SAMPLES", &value)) {
+        impl.max_samples.store(value < 0 ? 0 : value,
+                               std::memory_order_relaxed);
+    }
+    const char* filename = std::getenv("TP_TUNABLEOP_FILENAME");
+    if (filename != nullptr && filename[0] != '\0') {
+        // Treated like an explicit filename choice: the device ordinal is
+        // embedded so per-device processes keep separate databases.
+        std::lock_guard<std::mutex> guard(impl.lock);
+        impl.filename = insertOrdinal(filename, currentDevice());
+        impl.filename_set = true;
     }
 }
 
@@ -181,6 +261,32 @@ void appendResultLocked(TuningContext::Impl& impl, const std::string& op,
     impl.append_stream.flush();
 }
 
+// Rewrites the whole results file from the in-memory database. Caller holds
+// impl.lock. Returns the path written, or empty when nothing was written.
+std::string writeFileLocked(TuningContext::Impl& impl) {
+    ensureValidatorsLocked(impl);
+    const std::string target = outputFilenameLocked(impl);
+    if (target.empty()) {
+        TP_WARN("no results filename configured; nothing to write");
+        return {};
+    }
+    std::ofstream out(target, std::ios::out | std::ios::trunc);
+    if (!out) {
+        TP_WARN("could not open '", target, "' for writing tuning results");
+        return {};
+    }
+    for (const auto& [key, value] : impl.validators) {
+        out << "Validator," << key << ',' << value << '\n';
+    }
+    for (const auto& [op, kernel_map] : impl.results) {
+        for (const auto& [params, result] : kernel_map) {
+            out << op << ',' << params << ',' << result.kernel << ','
+                << formatTime(result.time_ms) << '\n';
+        }
+    }
+    return target;
+}
+
 // A file is acceptable when its validator key set matches ours exactly and
 // every value agrees; anything else means the file was written by another
 // build or machine.
@@ -210,7 +316,9 @@ bool validatorsMatchLocked(TuningContext::Impl& impl,
 
 }  // namespace
 
-TuningContext::TuningContext() : impl_(new Impl()) {}
+TuningContext::TuningContext() : impl_(new Impl()) {
+    seedFromEnvironment(*impl_);
+}
 
 TuningContext& TuningContext::get() {
     static TuningContext* context = new TuningContext();
@@ -297,26 +405,40 @@ bool TuningContext::lookup(const std::string& op, const std::string& params,
 void TuningContext::record(const std::string& op, const std::string& params,
                            const TuningResult& result) {
     bool is_new = false;
+    bool replaced = false;
     {
         std::lock_guard<std::mutex> guard(impl_->lock);
         auto& kernel_map = impl_->results[op];
-        is_new = kernel_map.find(params) == kernel_map.end();
+        auto it = kernel_map.find(params);
+        is_new = it == kernel_map.end();
         if (is_new) {
             kernel_map.emplace(params, result);
+        } else if (it->second.kernel != result.kernel) {
+            // A re-measured winner for a key that already holds a choice
+            // (a stale one whose configuration no longer runs): the stored
+            // entry is replaced so later lookups see the fresh winner.
+            it->second = result;
+            replaced = true;
         }
     }
-    if (!is_new) {
+    if (!is_new && !replaced) {
         return;
     }
-    logLine(*impl_, "new winner " + op + "(" + params + ") -> " + result.kernel +
-                        " " + formatTime(result.time_ms) + " ms");
+    logLine(*impl_, std::string(replaced ? "updated winner " : "new winner ") +
+                        op + "(" + params + ") -> " + result.kernel + " " +
+                        formatTime(result.time_ms) + " ms");
     // Real-time persistence: entries land in the results file the moment
     // they are measured, unless the run is collecting untuned signatures
-    // instead of tuning.
+    // instead of tuning. A replaced entry rewrites the file, because an
+    // appended line would sit behind the stale one and lose on read.
     if (impl_->tuning_enabled.load(std::memory_order_relaxed) &&
         !impl_->record_untuned.load(std::memory_order_relaxed)) {
         std::lock_guard<std::mutex> guard(impl_->lock);
-        appendResultLocked(*impl_, op, params, result);
+        if (replaced) {
+            writeFileLocked(*impl_);
+        } else {
+            appendResultLocked(*impl_, op, params, result);
+        }
     }
 }
 
@@ -430,28 +552,11 @@ void TuningContext::writeFile() {
     std::string target;
     {
         std::lock_guard<std::mutex> guard(impl_->lock);
-        ensureValidatorsLocked(*impl_);
-        target = outputFilenameLocked(*impl_);
-        if (target.empty()) {
-            TP_WARN("no results filename configured; nothing to write");
-            return;
-        }
-        std::ofstream out(target, std::ios::out | std::ios::trunc);
-        if (!out) {
-            TP_WARN("could not open '", target, "' for writing tuning results");
-            return;
-        }
-        for (const auto& [key, value] : impl_->validators) {
-            out << "Validator," << key << ',' << value << '\n';
-        }
-        for (const auto& [op, kernel_map] : impl_->results) {
-            for (const auto& [params, result] : kernel_map) {
-                out << op << ',' << params << ',' << result.kernel << ','
-                    << formatTime(result.time_ms) << '\n';
-            }
-        }
+        target = writeFileLocked(*impl_);
     }
-    logLine(*impl_, "wrote tuning results to '" + target + "'");
+    if (!target.empty()) {
+        logLine(*impl_, "wrote tuning results to '" + target + "'");
+    }
 }
 
 size_t TuningContext::resultsSize() const {

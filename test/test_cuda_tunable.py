@@ -7,6 +7,7 @@ an empty start.
 """
 
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -201,6 +202,83 @@ class TestCudaTunable(unittest.TestCase):
         # Collection mode tunes nothing and persists no results.
         self.assertFalse(os.path.exists(self.results_path))
         self.assertEqual(tunable.get_results(), before)
+
+    def test_stale_entry_is_retuned_and_replaced(self):
+        # A recorded winner whose serialized configuration cannot run on
+        # this build must be re-measured, and the file rewritten without
+        # the stale line (an appended correction would lose on read).
+        a, b, _ = self._tuned_matmul(52, 44, 38)
+        with open(self.results_path) as f:
+            validator_lines = [ln for ln in f.read().splitlines()
+                               if ln.startswith("Validator,")]
+
+        m, k, n = 116, 88, 74
+        stale = "lt_id4095_tile99_stages9_splitk9_red9_swizzle9_custom9"
+        with open(self.results_path, "w") as f:
+            for line in validator_lines:
+                f.write(line + "\n")
+            f.write(f"GemmTunableOp_Float32,"
+                    f"taN_m{m}_n{n}_k{k}_bias0_dev{self.dev},{stale},0.01\n")
+        self.assertTrue(tunable.read_file(self.results_path))
+
+        a = tp.randn(m, k, device="cuda")
+        b = tp.randn(k, n, device="cuda")
+        tunable.set_max_tuning_samples(2)
+        tunable.set_max_tuning_duration(50)
+        tunable.enable()
+        c = a @ b
+
+        tunable.disable()
+        self.assertTrue(tp.allclose(c, a @ b, rtol=1e-4, atol=1e-4))
+        matching = [r for r in tunable.get_results()
+                    if f"taN_m{m}_n{n}_k{k}_bias0" in r[1]]
+        self.assertEqual(len(matching), 1)
+        self.assertNotEqual(matching[0][2], stale)
+        self.assertTrue(matching[0][2] == "Default" or
+                        matching[0][2].startswith("lt_"))
+        with open(self.results_path) as f:
+            content = f.read()
+        self.assertNotIn(stale, content)
+        self.assertIn("Validator,TP_TUNABLEOP_FORMAT", content)
+
+    def test_environment_seeding(self):
+        # The environment is sampled once, when the tuning context is
+        # first touched; the assertions therefore run in a fresh process.
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        db = os.path.join(self.tmp.name, "envdb.csv")
+        child = (
+            "import sys\n"
+            "repo, expected = sys.argv[1], sys.argv[2]\n"
+            "sys.path.insert(0, repo)\n"
+            "import tensorplay as tp\n"
+            "from tensorplay.cuda import tunable\n"
+            "assert tunable.is_enabled()\n"
+            "assert not tunable.tuning_is_enabled()\n"
+            "assert tunable.record_untuned_is_enabled()\n"
+            "assert tunable.is_verbose()\n"
+            "assert tunable.get_max_tuning_duration() == 33\n"
+            "assert tunable.get_max_tuning_samples() == 7\n"
+            "assert tunable.get_filename() == expected\n"
+            "tunable.disable()\n"
+            "assert not tunable.is_enabled()\n"
+            "print('ok')\n"
+        )
+        env = dict(os.environ)
+        env.update({
+            "TP_TUNABLEOP_ENABLED": "1",
+            "TP_TUNABLEOP_TUNING": "0",
+            "TP_TUNABLEOP_RECORD_UNTUNED": "1",
+            "TP_TUNABLEOP_VERBOSE": "true",
+            "TP_TUNABLEOP_MAX_TUNING_DURATION_MS": "33",
+            "TP_TUNABLEOP_MAX_TUNING_SAMPLES": "7",
+            "TP_TUNABLEOP_FILENAME": db,
+        })
+        expected_db = os.path.join(self.tmp.name, f"envdb{self.dev}.csv")
+        out = subprocess.run(
+            [sys.executable, "-c", child, repo, expected_db],
+            env=env, cwd=self.tmp.name, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, msg=out.stderr)
+        self.assertIn("ok", out.stdout)
 
 
 class TestCudaTunableWithoutCuda(unittest.TestCase):

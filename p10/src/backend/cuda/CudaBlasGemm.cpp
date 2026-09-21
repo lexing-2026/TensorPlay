@@ -439,13 +439,14 @@ double timeLtCandidate(const Exec& exec, const cublasLtMatmulAlgo_t& algo,
 //
 // Resolution order: a winner recorded in the results database (rebuilt from
 // its serialized configuration and validated against the plan), and, when
-// none is recorded, a bounded measurement pass over the plan's heuristic
-// candidates whose winner is recorded for later runs. Under an active graph
-// capture nothing is measured and the heuristic top choice is pinned for
-// the process, keeping eager reruns bit-identical to the captured replay.
-// With tuning switched off, an untuned shape runs the heuristic top choice
-// for this call only (so tuning can still be enabled later) and is
-// optionally logged to the untuned file.
+// none is recorded — or the recorded configuration no longer runs on the
+// plan — a bounded measurement pass over the plan's heuristic candidates
+// whose winner is recorded for later runs, replacing a stale entry. Under
+// an active graph capture nothing is measured and the heuristic top choice
+// is pinned for the process, keeping eager reruns bit-identical to the
+// captured replay. With tuning switched off, an untuned shape runs the
+// heuristic top choice for this call only (so tuning can still be enabled
+// later) and is optionally logged to the untuned file.
 //
 // Returns nullptr when the plan's top heuristic candidate should run (the
 // "Default" choice). The measurement pass executes with the caller-provided
@@ -466,27 +467,11 @@ const cublasLtMatmulAlgo_t* tunable_select(GemmPlan& plan, DType dtype,
 
     if (plan.tunable_choice == GemmPlan::TunableChoice::Unresolved ||
         plan.tunable_epoch != ctx.epoch()) {
-        tunable::TuningResult hit;
-        if (ctx.lookup(op, params, &hit)) {
-            plan.tunable_choice = GemmPlan::TunableChoice::UseDefault;
-            LtAlgoConfig config;
-            if (hit.kernel != "Default" && parseLtAlgoConfig(hit.kernel, &config) &&
-                initLtAlgoFromConfig(config, to_compute_type(dtype),
-                                     to_scale_type(dtype), to_cublas_type(dtype),
-                                     &plan.tunable_algo) &&
-                algoRunsOnPlan(plan, plan.tunable_algo)) {
-                plan.tunable_choice = GemmPlan::TunableChoice::UseAlgo;
-            }
-            plan.tunable_epoch = ctx.epoch();
-        } else if (tensorplay::cuda::isCapturing()) {
-            if (ctx.isRecordUntunedEnabled()) {
-                ctx.recordUntuned(op, params);
-            }
-            plan.tunable_choice = GemmPlan::TunableChoice::UseDefault;
-            plan.tunable_epoch = ctx.epoch();
-        } else if (ctx.isTuningEnabled()) {
-            // Trials write the product into `result` with beta = 0; keep the
-            // caller's accumulation out of the way while they run.
+        // Bounded measurement over the plan's heuristic candidates; the
+        // winner is recorded, replacing a stale entry when one exists.
+        auto measure_and_record = [&]() {
+            // Trials write the product into `result` with beta = 0; keep
+            // the caller's accumulation out of the way while they run.
             Tensor saved_result;
             if (beta != 0.0) {
                 saved_result = result.clone();
@@ -549,6 +534,39 @@ const cublasLtMatmulAlgo_t* tunable_select(GemmPlan& plan, DType dtype,
             }
             ctx.record(op, params, entry);
             plan.tunable_epoch = ctx.epoch();
+        };
+
+        tunable::TuningResult hit;
+        if (ctx.lookup(op, params, &hit)) {
+            plan.tunable_choice = GemmPlan::TunableChoice::UseDefault;
+            LtAlgoConfig config;
+            if (hit.kernel == "Default") {
+                plan.tunable_epoch = ctx.epoch();
+            } else if (parseLtAlgoConfig(hit.kernel, &config) &&
+                       initLtAlgoFromConfig(config, to_compute_type(dtype),
+                                            to_scale_type(dtype),
+                                            to_cublas_type(dtype),
+                                            &plan.tunable_algo) &&
+                       algoRunsOnPlan(plan, plan.tunable_algo)) {
+                plan.tunable_choice = GemmPlan::TunableChoice::UseAlgo;
+                plan.tunable_epoch = ctx.epoch();
+            } else if (!tensorplay::cuda::isCapturing() &&
+                       ctx.isTuningEnabled()) {
+                // The recorded configuration no longer runs on this plan;
+                // measure again so the database heals instead of pinning a
+                // choice nobody can execute.
+                measure_and_record();
+            } else {
+                plan.tunable_epoch = ctx.epoch();
+            }
+        } else if (tensorplay::cuda::isCapturing()) {
+            if (ctx.isRecordUntunedEnabled()) {
+                ctx.recordUntuned(op, params);
+            }
+            plan.tunable_choice = GemmPlan::TunableChoice::UseDefault;
+            plan.tunable_epoch = ctx.epoch();
+        } else if (ctx.isTuningEnabled()) {
+            measure_and_record();
         } else if (ctx.isRecordUntunedEnabled()) {
             ctx.recordUntuned(op, params);
             // Left unresolved on purpose: enabling tuning later in this
