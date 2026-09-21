@@ -1,4 +1,5 @@
 import copyreg
+import importlib
 import weakref
 
 import tensorplay
@@ -48,10 +49,9 @@ def swap_tensors(first, second):
     tensorplay._C._swap_tensor_impl(first, second)
 
 def __getattr__(name):
-    if name == "viz":
-        from . import viz
-        return viz
-    if name == "tensorboard":
-        from . import tensorboard
-        return tensorboard
+    # import_module, not ``from . import``: a from-import probes the parent
+    # with hasattr, which re-enters this hook before the submodule lands and
+    # recurses without bound.
+    if name in ("viz", "tensorboard", "cpp_jit"):
+        return importlib.import_module(f".{name}", __name__)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
