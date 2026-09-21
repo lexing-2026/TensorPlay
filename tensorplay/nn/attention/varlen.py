@@ -773,7 +773,7 @@ def _backward(
 
 _varlen_attn.register_autograd(_backward, setup_context=_setup_context)
 
-tensorplay._dynamo.disallow_in_graph(
+tensorplay.compiler.disallow_in_graph(
     tensorplay.ops.tp._flash_attention_forward_no_dropout_inplace
 )
 

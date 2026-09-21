@@ -85,18 +85,19 @@ __all__ = [
     "allow_in_graph",
     "compile",
     "config",
+    "disallow_in_graph",
     "disable",
     "disable_capture",
     "export",
     "get_default_backend",
     "InvalidBackend",
     "is_compiling",
-    "is_dynamo_compiling",
     "is_exporting",
     "isinstance",
     "list_backends",
     "list_mode_options",
     "lookup_backend",
+    "mark_static",
     "NestedCompileRegionOptions",
     "nested_compile_region",
     "nonstrict_trace",
@@ -116,16 +117,6 @@ def is_compiling() -> bool:
     """Return whether the current Python frame is being captured."""
 
     return _compiling.get() and not _capture_disabled.get()
-
-
-def is_dynamo_compiling() -> bool:
-    """Return whether a graph trace of higher-order ops is in progress.
-
-    Same state as :func:`is_compiling`: the tracer raises the flag for the
-    whole capture, and no other entry point distinguishes a trace of a
-    higher-order operator from any other capture.
-    """
-    return is_compiling()
 
 
 def is_exporting() -> bool:
@@ -698,6 +689,33 @@ def allow_in_graph(fn: Any) -> Any:
         raise AssertionError("allow_in_graph expects a callable")
     _register_record(fn, "allow")
     return fn
+
+
+def disallow_in_graph(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Declare that a callable must not be absorbed into a captured graph.
+
+    The tracer is meant to treat calls to ``fn`` as region boundaries: the
+    surrounding pieces are captured as separate graphs and ``fn`` itself
+    runs eagerly between them.  Under eager execution the marker is inert
+    metadata, so the callable is returned unchanged.
+    """
+
+    if not callable(fn):
+        raise AssertionError("disallow_in_graph expects a callable")
+    return fn
+
+
+def mark_static(tensor: Any, dim: int | None = None) -> Any:
+    """Mark a tensor (or one dimension of it) as fixed for shape policies.
+
+    A marked dimension is meant to be treated as a compile-time constant
+    rather than a symbolic size.  Eager execution has no dynamic shape
+    environment, so the marker records nothing here and the input is
+    returned unchanged; it matters only to a capture that resolves
+    symbolic sizes.
+    """
+
+    return tensor
 
 
 def nonstrict_trace(traceable_fn: Callable[_P, _R]) -> Callable[_P, _R]:
