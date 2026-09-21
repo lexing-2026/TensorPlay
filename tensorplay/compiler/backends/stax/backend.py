@@ -1980,12 +1980,51 @@ def _segment_externals(nodes: tuple[Node, ...]) -> list[Node]:
     return externals
 
 
-def _build_segment_kernel(
+class _SegmentKernelPlan:
+    """Planned translation unit for one fusible segment, before building.
+
+    Holds everything the build call needs — program instructions, layouts,
+    reduction spec — so the planning walk stays on the calling thread while
+    the builds themselves can run concurrently.
+    """
+
+    __slots__ = (
+        "externals",
+        "input_shapes",
+        "input_strides",
+        "instructions",
+        "constants",
+        "output_ref",
+        "source_layout",
+        "reduction",
+    )
+
+    def __init__(
+        self,
+        externals,
+        input_shapes,
+        input_strides,
+        instructions,
+        constants,
+        output_ref,
+        source_layout,
+        reduction,
+    ) -> None:
+        self.externals = externals
+        self.input_shapes = input_shapes
+        self.input_strides = input_strides
+        self.instructions = instructions
+        self.constants = constants
+        self.output_ref = output_ref
+        self.source_layout = source_layout
+        self.reduction = reduction
+
+
+def _plan_segment_kernel(
     graph_module: GraphModule,
     segment: Any,
-    device: Any,
-) -> tuple[list[Node], Any] | None:
-    """Compile one fusible segment; return its inputs and callable runner."""
+) -> _SegmentKernelPlan | None:
+    """Plan one fusible segment's kernel; ``None`` when it is not expressible."""
 
     externals = _segment_externals(segment.nodes)
     if not externals or len(externals) > 16:
@@ -2021,53 +2060,67 @@ def _build_segment_kernel(
         return None
     _external, _encoded, constants, instructions, output_ref = program
 
-    if reduce_node is None:
-        layout = _tensor_layout(_traced_value(graph_module, source))
-        if layout is None:
-            return None
-        out_shape = layout[0]
+    layout = _tensor_layout(_traced_value(graph_module, source))
+    if layout is None:
+        return None
+    return _SegmentKernelPlan(
+        externals=externals,
+        input_shapes=input_shapes,
+        input_strides=input_strides,
+        instructions=instructions,
+        constants=constants,
+        output_ref=output_ref,
+        source_layout=layout,
+        reduction=segment.reduction if reduce_node is not None else None,
+    )
+
+
+def _compile_segment_kernel(
+    plan: _SegmentKernelPlan,
+    device: Any,
+) -> tuple[list[Node], Any] | None:
+    """Build one planned segment; return its inputs and callable runner."""
+
+    if plan.reduction is None:
         try:
             from .codegen.cpp import build_cpu_native_kernel
 
             built = build_cpu_native_kernel(
-                instructions,
-                constants,
-                len(externals),
-                output_ref,
-                shape=out_shape,
+                plan.instructions,
+                plan.constants,
+                len(plan.externals),
+                plan.output_ref,
+                shape=plan.source_layout[0],
                 device=device,
-                input_shapes=input_shapes,
-                input_strides=input_strides,
+                input_shapes=plan.input_shapes,
+                input_strides=plan.input_strides,
             )
         except Exception:
             return None
         if built is None:
             return None
         runner = built[0] if isinstance(built, tuple) else built
-        return externals, runner
+        return plan.externals, runner
 
-    layout = _tensor_layout(_traced_value(graph_module, source))
-    if layout is None:
-        return None
     try:
         from .codegen.cpp_reduction import build_cpu_reduction_kernel
 
         built = build_cpu_reduction_kernel(
-            instructions,
-            constants,
-            len(externals),
-            output_ref,
-            segment.reduction,
-            in_shape=layout[0],
+            plan.instructions,
+            plan.constants,
+            len(plan.externals),
+            plan.output_ref,
+            plan.reduction,
+            in_shape=plan.source_layout[0],
             device=device,
-            input_shapes=input_shapes,
-            input_strides=input_strides,
+            input_shapes=plan.input_shapes,
+            input_strides=plan.input_strides,
         )
     except Exception:
         return None
     if built is None:
         return None
-    return externals, built[0]
+    return plan.externals, built[0]
 
 
 def _kernel_step(runner: Any, sources: tuple[int, ...]):
@@ -2370,10 +2423,32 @@ def _lower_cpu_segmented(
         steps.append((extern_step(node), slots[node], sources))
         return True
 
+    # Planning and building are separate walks: the plans fix every
+    # segment's expressibility on the calling thread, the builds overlap on
+    # the build pool, and the wiring below replays the same per-segment
+    # decisions — kernel step versus individual operators — with the same
+    # slot order a one-kernel-at-a-time walk would have produced.
+    plans = [
+        _plan_segment_kernel(graph_module, segment)
+        if segment.kind != "extern"
+        else None
+        for segment in segments
+    ]
+    from .parallel_compile import run_builds
+
+    builds = run_builds(
+        [
+            lambda plan=plan: _compile_segment_kernel(plan, first.device)
+            for plan in plans
+            if plan is not None
+        ]
+    )
+    build_results = iter(builds)
+
     compiled_count = 0
-    for segment in segments:
-        if segment.kind != "extern":
-            built = _build_segment_kernel(graph_module, segment, first.device)
+    for segment, plan in zip(segments, plans):
+        if plan is not None:
+            built = next(build_results)
             if built is not None:
                 externals, runner = built
                 sources = []

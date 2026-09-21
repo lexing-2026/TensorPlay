@@ -15,6 +15,7 @@ __all__ = [
     "assume_static_by_default",
     "recompile_limit",
     "accumulated_recompile_limit",
+    "compile_threads",
     "verbose",
     "fail_on_recompile_limit_hit",
     "force_disable_caches",
@@ -97,4 +98,14 @@ force_disable_caches: bool = False
 
 Every invocation goes through capture and backend compilation while this is
 true.  Artifacts are not read from or written to the process or disk cache.
+"""
+
+
+compile_threads: int | None = None
+"""Worker count for overlapping generated-kernel builds.
+
+``None`` resolves lazily: the ``TP_COMPILE_THREADS`` environment variable
+first, then the machine's CPU count capped at a small bound.  ``1`` keeps
+every build on the calling thread, which keeps debugger stepping intact.
+Values below one are rejected at resolution time.
 """
