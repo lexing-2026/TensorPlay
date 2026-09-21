@@ -35,16 +35,16 @@ def broadcast_all(*values: Tensor | Number) -> tuple[Tensor, ...]:
       values are scalars, then they are upcasted to scalar Tensors.
 
     Args:
-        values (list of `Number`, `.*Tensor` or objects implementing __torch_function__)
+        values (list of `Number`, `.*Tensor` or objects implementing __tensorplay_function__)
 
     Raises:
         ValueError: if any of the values is not a `Number` instance,
-            a `.*Tensor` instance, or an instance implementing __torch_function__
+            a `.*Tensor` instance, or an instance implementing __tensorplay_function__
     """
     if not all(is_tensor_like(v) or isinstance(v, _Number) for v in values):
         raise ValueError(
             "Input arguments must all be instances of Number, "
-            "tensorplay.Tensor or objects implementing __torch_function__."
+            "tensorplay.Tensor or objects implementing __tensorplay_function__."
         )
     if not all(is_tensor_like(v) for v in values):
         options: dict[str, Any] = dict(dtype=tensorplay.get_default_dtype())

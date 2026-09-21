@@ -306,7 +306,7 @@ def redirect_to_mode(hop: Any, mode: Any):
 
     @hop.py_impl(mode)
     def impl(mode, *args, **kwargs):
-        return mode.__torch_dispatch__(hop, [], args, kwargs)
+        return mode.__tensorplay_dispatch__(hop, [], args, kwargs)
 
     return impl
 
