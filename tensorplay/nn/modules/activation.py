@@ -26,6 +26,7 @@ __all__ = [
     "CELU",
     "Softplus",
     "Softmax",
+    "Softmax2d",
     "LogSoftmax",
     "LogSigmoid",
     "Hardtanh",
@@ -518,6 +519,36 @@ class Softmax(Module):
 
     def extra_repr(self) -> str:
         return f"dim={self.dim}"
+
+
+class Softmax2d(Module):
+    r"""Applies SoftMax over features to each spatial location.
+
+    When given an image of ``Channels x Height x Width``, it will
+    apply `Softmax` to each location :math:`(Channels, h_i, w_j)`
+
+    Shape:
+        - Input: :math:`(N, C, H, W)` or :math:`(C, H, W)`.
+        - Output: :math:`(N, C, H, W)` or :math:`(C, H, W)` (same shape as input)
+
+    Returns:
+        a Tensor of the same dimension and shape as the input with
+        values in the range [0, 1]
+
+    Examples::
+
+        >>> m = nn.Softmax2d()
+        >>> # you softmax over the 2nd dimension
+        >>> input = tensorplay.randn(2, 3, 12, 13)
+        >>> output = m(input)
+    """
+
+    def forward(self, input: Tensor) -> Tensor:
+        if input.dim() not in (3, 4):
+            raise ValueError(
+                f"Softmax2d: expected input to be 3D or 4D, got {input.dim()}D instead"
+            )
+        return tensorplay.softmax(input, -3)
 
 
 class LogSoftmax(Module):

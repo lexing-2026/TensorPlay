@@ -403,7 +403,6 @@ channels_last_3d = MemoryFormat.CHANNELS_LAST_3D
 # The enum class under its lowercase alias, plus the historical name for the
 # contiguous format kept for source compatibility.
 memory_format = MemoryFormat
-legacy_contiguous_format = contiguous_format
 
 # Link-time capabilities of the compiled backend.
 has_lapack = True
@@ -416,7 +415,7 @@ __all__ = [
     "sym_float", "sym_int", "sym_not", "sym_min", "sym_max", "sym_ite", "sym_sum",
     "DeviceType", "device", "dtype", "Size",
     "MemoryFormat", "contiguous_format", "preserve_format", "channels_last", "channels_last_3d",
-    "memory_format", "legacy_contiguous_format",
+    "memory_format",
     "has_lapack", "has_spectral", "compiled_with_cxx11_abi",
     "Layout", "sparse_coo", "sparse_csr", "sparse_csc", "sparse_bsr", "sparse_bsc", "strided",
     "uint8", "int8", "int16", "uint16", "uint32", "uint64", "int32", "int64",
@@ -1253,85 +1252,6 @@ def median(input, *args, **kwargs):
     if not isinstance(result, tuple):
         return result
     return _median_return_type(*result)
-
-
-# ---------------------------------------------------------------------------
-# Legacy linear-algebra faces. The removed functions keep their exact
-# migration text; lu/qr stay functional behind a deprecation warning.
-# ---------------------------------------------------------------------------
-from ._linalg_utils import (  # noqa: E402
-    eig as eig,
-    lstsq as lstsq,
-    matrix_rank as matrix_rank,
-    solve as solve,
-    _symeig as symeig,
-)
-
-
-def lu(A, pivot=True, get_infos=False, out=None):
-    """Computes a LU factorization of ``A``.
-
-    .. deprecated::
-        Use :func:`tensorplay.linalg.lu_factor` instead.
-    """
-    import warnings as _warnings
-    _warnings.warn(
-        "tensorplay.lu is deprecated in favor of tensorplay.linalg.lu_factor / "
-        "tensorplay.linalg.lu_factor_ex and will be removed in a future release.\n"
-        "LU, pivots = tensorplay.lu(A, compute_pivots)\n"
-        "should be replaced with\n"
-        "LU, pivots = tensorplay.linalg.lu_factor(A, compute_pivots)\n"
-        "and\n"
-        "LU, pivots, info = tensorplay.lu(A, compute_pivots, get_infos=True)\n"
-        "should be replaced with\n"
-        "LU, pivots, info = tensorplay.linalg.lu_factor_ex(A, compute_pivots)",
-        stacklevel=2,
-    )
-    from tensorplay import linalg as _linalg
-    if get_infos:
-        LU, pivots, info = _linalg.lu_factor_ex(A, pivot=pivot, check_errors=False)
-        result = (LU, pivots, info)
-    else:
-        LU, pivots = _linalg.lu_factor(A, pivot=pivot)
-        result = (LU, pivots)
-    if out is not None:
-        if len(out) != len(result):
-            raise TypeError(
-                f"expected tuple of {len(result)} elements but got {len(out)}"
-            )
-        for i in builtins.range(len(result)):
-            out[i].resize_as_(result[i]).copy_(result[i])
-        return out
-    return result
-
-
-def qr(A, mode="reduced", *, out=None):
-    """Computes the QR decomposition of ``A``.
-
-    .. deprecated::
-        Use :func:`tensorplay.linalg.qr` instead; the boolean ``some``
-        parameter is now the string ``mode``.
-    """
-    import warnings as _warnings
-    _warnings.warn(
-        "tensorplay.qr is deprecated in favor of tensorplay.linalg.qr and will "
-        "be removed in a future release.\n"
-        "The boolean parameter 'some' has been replaced with a string "
-        "parameter 'mode'.\n"
-        "Q, R = tensorplay.qr(A, some)\n"
-        "should be replaced with\n"
-        "Q, R = tensorplay.linalg.qr(A, 'reduced' if some else 'complete')",
-        stacklevel=2,
-    )
-    from tensorplay import linalg as _linalg
-    result = _linalg.qr(A, mode=mode)
-    if out is not None:
-        if len(out) != 2:
-            raise TypeError(f"expected tuple of 2 elements but got {len(out)}")
-        for i in builtins.range(2):
-            out[i].resize_as_(result[i]).copy_(result[i])
-        return out
-    return result
 
 
 # ---------------------------------------------------------------------------
