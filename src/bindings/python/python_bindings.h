@@ -65,6 +65,7 @@ void init_distributed(py::module_& m);
 #endif
 void init_cuda_graph(py::module_& m);
 void init_cuda_jiterator(py::module_& m);
+void init_forward_ad(py::module_& m);
 void init_futures(py::module_& m);
 #ifdef TP_USE_RPC
 void init_rpc(py::module_& m);

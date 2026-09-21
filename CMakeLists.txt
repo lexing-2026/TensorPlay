@@ -1411,6 +1411,7 @@ set(TP_C_SOURCES
     src/bindings/python/Futures.cpp
     src/bindings/python/CudaGraph.cpp
     src/bindings/python/CudaJiterator.cpp
+    src/bindings/python/ForwardAd.cpp
      src/bindings/python/FileCheck.cpp
      src/Version.cpp
     src/bindings/python/StaxStaticLauncher.cpp
