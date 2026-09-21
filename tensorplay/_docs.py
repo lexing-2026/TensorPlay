@@ -363,7 +363,7 @@ Adds :attr:`other`, scaled by :attr:`alpha`, to :attr:`input`.
     + r"""
 
 Supports :ref:`broadcasting to a common shape <broadcasting-semantics>`,
-:ref:`type promotion <type-promotion-doc>`, and integer, float, and complex inputs.
+type promotion, and integer, float, and complex inputs.
 
 Args:
     {input}
@@ -568,7 +568,7 @@ it will not be propagated.
 For inputs of type `FloatTensor` or `DoubleTensor`, arguments :attr:`beta` and
 :attr:`alpha` must be real numbers, otherwise they should be integers.
 
-This operation has support for arguments with :ref:`sparse layouts<sparse-docs>`. If
+This operation has support for arguments with sparse layouts. If
 :attr:`input` is sparse the result will have the same layout and if :attr:`out`
 is provided it must have the same layout as :attr:`input`.
 
@@ -1645,7 +1645,7 @@ bitwise_left_shift(input, other, *, out=None) -> Tensor
 Computes the left arithmetic shift of :attr:`input` by :attr:`other` bits.
 The input tensor must be of integral type. This operator supports
 :ref:`broadcasting to a common shape <broadcasting-semantics>` and
-:ref:`type promotion <type-promotion-doc>`.
+type promotion.
 
 The operation applied is:
 
@@ -1674,7 +1674,7 @@ bitwise_right_shift(input, other, *, out=None) -> Tensor
 Computes the right arithmetic shift of :attr:`input` by :attr:`other` bits.
 The input tensor must be of integral type. This operator supports
 :ref:`broadcasting to a common shape <broadcasting-semantics>` and
-:ref:`type promotion <type-promotion-doc>`.
+type promotion.
 In any case, if the value of the right operand is negative or is greater
 or equal to the number of bits in the promoted left operand, the behavior is undefined.
 
@@ -2182,7 +2182,7 @@ add_docstr(
     r"""
 can_cast(from_, to) -> bool
 
-described in the type promotion :ref:`documentation <type-promotion-doc>`.
+described in the type promotion documentation.
 
 Args:
     from\_ (dtype): The original :class:`tensorplay.dtype`.
@@ -2543,7 +2543,7 @@ Returns a new tensor with the reciprocal of the elements of :attr:`input`
 
 .. note::
     Unlike NumPy's reciprocal, tensorplay.reciprocal supports integral inputs. Integral
-    inputs to reciprocal are automatically :ref:`promoted <type-promotion-doc>` to
+    inputs to reciprocal are automatically promoted to
     the default scalar type.
 """
     + r"""
@@ -3888,7 +3888,7 @@ Divides each element of the input ``input`` by the corresponding element of
     See the :attr:`rounding_mode` argument for floor division.
 
 Supports :ref:`broadcasting to a common shape <broadcasting-semantics>`,
-:ref:`type promotion <type-promotion-doc>`, and integer, float, and complex inputs.
+type promotion, and integer, float, and complex inputs.
 Always promotes integer types to the default scalar type.
 
 Args:
@@ -4266,7 +4266,7 @@ This function may be defined in terms of :func:`tensorplay.div` as
     tensorplay.fmod(a, b) == a - a.div(b, rounding_mode="trunc") * b
 
 Supports :ref:`broadcasting to a common shape <broadcasting-semantics>`,
-:ref:`type promotion <type-promotion-doc>`, and integer and float inputs.
+type promotion, and integer and float inputs.
 
 .. note::
 
@@ -6711,7 +6711,7 @@ Only if both elements are NaN is NaN propagated.
 This function is a wrapper around C++'s ``std::fmax`` and is similar to NumPy's ``fmax`` function.
 
 Supports :ref:`broadcasting to a common shape <broadcasting-semantics>`,
-:ref:`type promotion <type-promotion-doc>`, and integer and floating-point inputs.
+type promotion, and integer and floating-point inputs.
 
 Args:
     {input}
@@ -7335,7 +7335,7 @@ Only if both elements are NaN is NaN propagated.
 This function is a wrapper around C++'s ``std::fmin`` and is similar to NumPy's ``fmin`` function.
 
 Supports :ref:`broadcasting to a common shape <broadcasting-semantics>`,
-:ref:`type promotion <type-promotion-doc>`, and integer and floating-point inputs.
+type promotion, and integer and floating-point inputs.
 
 Args:
     {input}
@@ -7513,7 +7513,7 @@ If :attr:`input` is a :math:`(n \times m)` tensor, :attr:`mat2` is a
 Supports strided and sparse 2-D tensors as inputs, autograd with
 respect to strided inputs.
 
-This operation has support for arguments with :ref:`sparse layouts<sparse-docs>`.
+This operation has support for arguments with sparse layouts.
 If :attr:`out` is provided its layout will be used. Otherwise, the result
 layout will be deduced from that of :attr:`input`.
 
@@ -7594,7 +7594,7 @@ The behavior depends on the dimensionality of the tensors as follows:
   and the matrix dimensions are :math:`(n \times m)` and :math:`(m \times p)`.
   :attr:`out` will be a :math:`(j \times k \times n \times p)` tensor.
 
-This operation has support for arguments with :ref:`sparse layouts<sparse-docs>`. In particular the
+This operation has support for arguments with sparse layouts. In particular the
 matrix-matrix (both arguments 2-dimensional) supports sparse arguments with the same restrictions
 as :func:`tensorplay.mm`
 
@@ -7701,7 +7701,7 @@ Multiplies :attr:`input` by :attr:`other`.
     + r"""
 
 Supports :ref:`broadcasting to a common shape <broadcasting-semantics>`,
-:ref:`type promotion <type-promotion-doc>`, and integer, float, and complex inputs.
+type promotion, and integer, float, and complex inputs.
 
 Args:
     {input}
@@ -8409,7 +8409,7 @@ Example::
 add_docstr(
     tensorplay.ones,
     r"""
-ones(*size, *, out=None, dtype=None, layout=tensorplay.strided, device=None, requires_grad=False) -> Tensor
+ones(\*size, \*, out=None, dtype=None, layout=tensorplay.strided, device=None, requires_grad=False) -> Tensor
 
 Returns a tensor filled with the scalar value `1`, with the shape defined
 by the variable argument :attr:`size`.
@@ -8692,7 +8692,7 @@ and if one or more inputs is complex returns a ``tensorplay.complex128`` tensor.
 
 .. note::
     This function always computes in double precision, unlike :func:`tensorplay.pow`,
-    which implements more typical :ref:`type promotion <type-promotion-doc>`.
+    which implements more typical type promotion.
     This is useful when the computation needs to be performed in a wider or more precise dtype,
     or the results of the computation may contain fractional values not representable in the input dtypes,
     like when an integer base is raised to a negative integer exponent.
@@ -8780,7 +8780,7 @@ promote_types(type1, type2) -> dtype
 
 Returns the :class:`tensorplay.dtype` with the smallest size and scalar kind that is
 not smaller nor of lower kind than either `type1` or `type2`. See type promotion
-:ref:`documentation <type-promotion-doc>` for more information on the type
+documentation for more information on the type
 promotion logic.
 
 Args:
@@ -8969,8 +8969,8 @@ Example::
 
 add_docstr(
     tensorplay.rand,
-    """
-rand(*size, *, generator=None, out=None, dtype=None, layout=tensorplay.strided, device=None, \
+    r"""
+rand(\*size, \*, generator=None, out=None, dtype=None, layout=tensorplay.strided, device=None, \
 requires_grad=False, pin_memory=False) -> Tensor
 """
     + r"""
@@ -9104,8 +9104,8 @@ Keyword args:
 
 add_docstr(
     tensorplay.randn,
-    """
-randn(*size, *, generator=None, out=None, dtype=None, layout=tensorplay.strided, device=None, requires_grad=False, \
+    r"""
+randn(\*size, \*, generator=None, out=None, dtype=None, layout=tensorplay.strided, device=None, requires_grad=False, \
 pin_memory=False) -> Tensor
 """
     + r"""
@@ -9395,7 +9395,7 @@ It may also be defined in terms of :func:`tensorplay.div` as
     tensorplay.remainder(a, b) == a - a.div(b, rounding_mode="floor") * b
 
 Supports :ref:`broadcasting to a common shape <broadcasting-semantics>`,
-:ref:`type promotion <type-promotion-doc>`, and integer and float inputs.
+type promotion, and integer and float inputs.
 
 .. note::
     Complex inputs are not supported. In some cases, it is not mathematically
@@ -9500,7 +9500,7 @@ add_docstr(
 result_type(tensor1, tensor2) -> dtype
 
 Returns the :class:`tensorplay.dtype` that would result from performing an arithmetic
-operation on the provided input tensors. See type promotion :ref:`documentation <type-promotion-doc>`
+operation on the provided input tensors. See type promotion documentation
 for more information on the type promotion logic.
 
 Args:
@@ -10789,7 +10789,7 @@ Subtracts :attr:`other`, scaled by :attr:`alpha`, from :attr:`input`.
     + r"""
 
 Supports :ref:`broadcasting to a common shape <broadcasting-semantics>`,
-:ref:`type promotion <type-promotion-doc>`, and integer, float, and complex inputs.
+type promotion, and integer, float, and complex inputs.
 
 Args:
     {input}
@@ -11486,11 +11486,11 @@ If :attr:`input` is a strided tensor then the resulting :attr:`out`
 tensor shares its underlying storage with the :attr:`input` tensor, so
 changing the content of one would change the content of the other.
 
-If :attr:`input` is a :ref:`sparse tensor <sparse-docs>` then the
+If :attr:`input` is a the relevant documentation then the
 resulting :attr:`out` tensor *does not* share the underlying storage
 with the :attr:`input` tensor.
 
-If :attr:`input` is a :ref:`sparse tensor <sparse-docs>` with compressed
+If :attr:`input` is a the relevant documentation with compressed
 layout (SparseCSR, SparseBSR, SparseCSC or SparseBSC) the arguments
 :attr:`dim0` and :attr:`dim1` must be both batch dimensions, or must
 both be sparse dimensions. The batch dimensions of a sparse tensor are the
@@ -12124,7 +12124,7 @@ Example:
 add_docstr(
     tensorplay.zeros,
     r"""
-zeros(*size, *, out=None, dtype=None, layout=tensorplay.strided, device=None, requires_grad=False) -> Tensor
+zeros(\*size, \*, out=None, dtype=None, layout=tensorplay.strided, device=None, requires_grad=False) -> Tensor
 
 Returns a tensor filled with the scalar value `0`, with the shape defined
 by the variable argument :attr:`size`.
@@ -12186,8 +12186,8 @@ Example::
 
 add_docstr(
     tensorplay.empty,
-    """
-empty(*size, *, out=None, dtype=None, layout=tensorplay.strided, device=None, requires_grad=False, pin_memory=False, \
+    r"""
+empty(\*size, \*, out=None, dtype=None, layout=tensorplay.strided, device=None, requires_grad=False, pin_memory=False, \
 memory_format=tensorplay.contiguous_format) -> Tensor
 
 Returns a tensor filled with uninitialized data. The shape of the tensor is
@@ -12363,7 +12363,7 @@ Examples:
 add_docstr(
     tensorplay.full,
     r"""
-full(size, fill_value, *, out=None, dtype=None, layout=tensorplay.strided, device=None, requires_grad=False) -> Tensor
+full(size, fill_value, \*, out=None, dtype=None, layout=tensorplay.strided, device=None, requires_grad=False) -> Tensor
 
 Creates a tensor of size :attr:`size` filled with :attr:`fill_value`. The
 tensor's dtype is inferred from :attr:`fill_value`.
@@ -13539,7 +13539,7 @@ on the exact semantic that applies to all devices.
 
 Arguments:
     device (:class:`tensorplay.device`, optional): the desired device for the Stream.
-        If not given, the current :ref:`accelerator<accelerators>` type will be used.
+        If not given, the current the relevant documentation type will be used.
     priority (int, optional): priority of the stream, should be 0 or negative, where negative
         numbers indicate higher priority. By default, streams have priority 0.
 
@@ -13660,7 +13660,7 @@ Query and record Stream status to identify or control dependencies across Stream
 
 Arguments:
     device (:class:`tensorplay.device`, optional): the desired device for the Event.
-        If not given, the current :ref:`accelerator<accelerators>` type will be used.
+        If not given, the current the relevant documentation type will be used.
     enable_timing (bool, optional): indicates if the event should measure time (default: ``False``)
     blocking (bool, optional): if ``True``, :meth:`wait` will be blocking (default: ``False``)
     interprocess (bool): if ``True``, the event can be shared between processes (default: ``False``)
@@ -13788,7 +13788,7 @@ add_docstr(
 Generator(device='cpu') -> Generator
 
 Creates and returns a generator object that manages the state of the algorithm which
-produces pseudo random numbers. Used as a keyword argument in many :ref:`inplace-random-sampling`
+produces pseudo random numbers. Used as a keyword argument in many in-place random sampling
 functions.
 
 Arguments:
@@ -14501,7 +14501,7 @@ See :func:`tensorplay.tensor_split`
 add_docstr(
     tensorplay.linalg_diagonal,
     r"""
-linalg_diagonal(A, *, offset=0, dim1=-2, dim2=-1) -> Tensor
+linalg_diagonal(A, \*, offset=0, dim1=-2, dim2=-1) -> Tensor
 
 Returns a view of the diagonals of :attr:`A`: the two dimensions selected by
 :attr:`dim1` and :attr:`dim2` are collapsed into the trailing axis of the
