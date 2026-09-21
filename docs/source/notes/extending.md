@@ -140,8 +140,10 @@ output as another view, which the kernel writes into — the `scale_cpu`
 example above does exactly this. Kernels can also allocate their own
 outputs through the environment allocator; `cpp_jit` installs
 TensorPlay's allocator automatically on first engine use (an
-already-installed host allocator takes precedence), so the request is
-fulfilled by an ordinary TensorPlay allocation:
+already-installed host allocator takes precedence), and the request is
+served natively inside the compiled extension — no interpreter lock is
+involved, so allocations from kernels running on worker threads do not
+serialize with Python:
 
 ```cpp
 tvm::ffi::Tensor doubled(tvm::ffi::TensorView x) {
