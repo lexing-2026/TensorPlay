@@ -16,6 +16,10 @@ except ModuleNotFoundError:
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
     import tensorplay  # noqa: E402,F401
 
+# The API prose docstrings are attached lazily by this module; autodoc reads
+# __doc__ attributes during the build, so the attachments must run first.
+import tensorplay._docs  # noqa: E402,F401
+
 # -- Project information -----------------------------------------------------
 
 project = "TensorPlay"
