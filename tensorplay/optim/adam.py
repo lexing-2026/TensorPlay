@@ -5,7 +5,7 @@ from .optimizer import (
     DeviceDict,
     Optimizer,
     _default_to_fused_or_foreach,
-    _disable_dynamo_if_unsupported,
+    _disable_capture_if_unsupported,
     _get_capturable_supported_devices,
     _get_value,
     _stack_if_compiling,
@@ -778,7 +778,7 @@ def _fused_adam(
             )
 
 
-@_disable_dynamo_if_unsupported(single_tensor_fn=_single_tensor_adam)
+@_disable_capture_if_unsupported(single_tensor_fn=_single_tensor_adam)
 def adam(
         params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps,
         foreach=None, capturable=False, differentiable=False, fused=None,

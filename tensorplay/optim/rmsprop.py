@@ -8,7 +8,7 @@ from ._utils import (
 from .optimizer import (
     Optimizer,
     _default_to_fused_or_foreach,
-    _disable_dynamo_if_unsupported,
+    _disable_capture_if_unsupported,
     _get_capturable_supported_devices,
     _get_scalar_dtype,
     _to_scalar,
@@ -305,7 +305,7 @@ def _multi_tensor_rmsprop(
             )
 
 
-@_disable_dynamo_if_unsupported(single_tensor_fn=_single_tensor_rmsprop)
+@_disable_capture_if_unsupported(single_tensor_fn=_single_tensor_rmsprop)
 def rmsprop(
     params, grads, square_avgs, grad_avgs, momentum_buffer_list, state_steps,
     foreach=None, maximize=False, differentiable=False, capturable=False,

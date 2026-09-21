@@ -21,7 +21,7 @@ __all__ = [
 ]
 
 
-def _dynamo_disable(function: Callable[..., Any]) -> Callable[..., Any]:
+def _disable_capture(function: Callable[..., Any]) -> Callable[..., Any]:
     disabled = tp.compiler.disable(
         function,
         recursive=True,

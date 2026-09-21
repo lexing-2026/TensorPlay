@@ -6,7 +6,7 @@ import tensorplay as tp
 from tensorplay import Tensor
 
 from .optimizer import (
-    _disable_dynamo_if_unsupported,
+    _disable_capture_if_unsupported,
     _get_scalar_dtype,
     _to_scalar,
     Optimizer,
@@ -617,7 +617,7 @@ def _multi_tensor_adafactor(
         tp._foreach_add_(device_params, updates)
 
 
-@_disable_dynamo_if_unsupported(single_tensor_fn=_single_tensor_adafactor)
+@_disable_capture_if_unsupported(single_tensor_fn=_single_tensor_adafactor)
 def adafactor(
     params: list[Tensor],
     grads: list[Tensor],

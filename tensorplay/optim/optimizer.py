@@ -124,7 +124,7 @@ def _stack_if_compiling(value):
     return value
 
 
-def _disable_dynamo(func):
+def _disable_capture(func):
     """Keep a stateful optimizer helper outside the active capture."""
 
     @functools.wraps(func)
@@ -136,13 +136,13 @@ def _disable_dynamo(func):
     return disabled
 
 
-def _disable_dynamo_if_unsupported(single_tensor_fn=None):
+def _disable_capture_if_unsupported(single_tensor_fn=None):
     # compatible callers that still inspect this decorator's closure.
     if single_tensor_fn is not None:
         globals()[single_tensor_fn.__name__] = single_tensor_fn
 
     def decorator(func):
-        disabled_func = _disable_dynamo(func)
+        disabled_func = _disable_capture(func)
         parameters = inspect.signature(func).parameters
         has_state_steps = True
         try:
@@ -331,7 +331,7 @@ class Optimizer:
             self.add_param_group(param_group)
         self._warned_capturable_if_run_uncaptured = True
 
-    @_disable_dynamo
+    @_disable_capture
     def add_param_group(self, param_group):
         if not isinstance(param_group, dict):
             raise TypeError(f"param_group must be a dict, but got {type(param_group)}")
@@ -442,7 +442,7 @@ class Optimizer:
             self._optimizer_load_state_dict_post_hooks.move_to_end(hook_id, last=False)
         return self._new_handle(self._optimizer_load_state_dict_post_hooks, hook_id)
 
-    @_disable_dynamo
+    @_disable_capture
     def zero_grad(self, set_to_none=True):
         foreach = bool(
             self.defaults.get("foreach", False)
@@ -472,7 +472,7 @@ class Optimizer:
     def step(self, closure=None):
         raise NotImplementedError
 
-    @_disable_dynamo
+    @_disable_capture
     def state_dict(self):
         for hook in self._optimizer_state_dict_pre_hooks.values():
             hook(self)
@@ -514,7 +514,7 @@ class Optimizer:
                 state_dict = result
         return state_dict
 
-    @_disable_dynamo
+    @_disable_capture
     def load_state_dict(self, state_dict):
         # Shallow copy to avoid modifying the input
         state_dict = state_dict.copy()

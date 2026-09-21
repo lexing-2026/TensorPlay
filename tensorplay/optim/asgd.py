@@ -14,7 +14,7 @@ from ._utils import (
 from .optimizer import (
     Optimizer,
     _default_to_fused_or_foreach,
-    _disable_dynamo_if_unsupported,
+    _disable_capture_if_unsupported,
     _get_capturable_supported_devices,
     _get_scalar_dtype,
     _get_value,
@@ -353,7 +353,7 @@ def _multi_tensor_asgd(
             tp._foreach_copy_(grouped_mus, new_mus)
 
 
-@_disable_dynamo_if_unsupported(single_tensor_fn=_single_tensor_asgd)
+@_disable_capture_if_unsupported(single_tensor_fn=_single_tensor_asgd)
 def asgd(
     params,
     grads,
