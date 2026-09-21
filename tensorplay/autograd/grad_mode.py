@@ -15,6 +15,7 @@ __all__ = [
     "set_grad_enabled",
     "inference_mode",
     "is_grad_enabled",
+    "_unsafe_preserve_version_counter",
 ]
 
 
@@ -302,3 +303,30 @@ def _enter_inference_mode(mode):
 
 def _exit_inference_mode(mode):
     mode.__exit__(None, None, None)
+
+
+class _unsafe_preserve_version_counter(_DecoratorContextManager):
+    """Do not use unless the mutation being hidden is provably value-neutral.
+
+    Autograd tracks in-place tensor mutations through the ``._version``
+    counter so a tensor saved for backward whose values changed mid-flight is
+    detected instead of silently producing wrong gradients.  The one sanctioned
+    use is memory recycling: a large tensor's storage is freed after forward
+    and re-populated with identical values right before backward needs it.
+    Inside this context manager such a re-population leaves ``._version``
+    at the value observed on entry.
+
+    Args:
+        tensors: a tensor, or a tuple of tensors, whose version counters
+            should be restored on exit.
+    """
+
+    def __init__(self, tensors: Union[Any, tuple]) -> None:
+        self.tensors = (tensors,) if not isinstance(tensors, tuple) else tensors
+        self.prev_versions = tuple(t._version for t in self.tensors)
+
+    def __enter__(self) -> None:
+        pass
+
+    def __exit__(self, *args: Any) -> None:
+        _autograd._unsafe_set_version_counter(self.tensors, self.prev_versions)

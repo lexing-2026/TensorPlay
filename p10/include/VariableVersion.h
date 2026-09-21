@@ -14,7 +14,10 @@ struct P10_API VersionCounter {
     std::atomic<uint32_t> version_{0};
 
     void bump() noexcept { version_.fetch_add(1, std::memory_order_relaxed); }
-    uint32_t current_version() const noexcept { return version_.load(std::memory_order_relaxed); }
+    uint32_t current_version() const noexcept { version_.load(std::memory_order_relaxed); }
+    void set_version(uint32_t version) noexcept {
+        version_.store(version, std::memory_order_relaxed);
+    }
 };
 
 // Handle to a VersionCounter: the counter is
@@ -49,6 +52,18 @@ public:
     // Reset version
     void reset() {
         if (counter_) counter_->version_.store(0, std::memory_order_relaxed);
+    }
+
+    // Force the counter to a given value. Internal escape hatch for memory
+    // recycling (a tensor's storage is freed and later re-populated with the
+    // same values right before autograd needs it): restoring the saved value
+    // hides the re-population from saved-tensor mutation checks.
+    void set_version(uint32_t version) {
+        if (!enabled_) {
+            throw std::runtime_error(
+                "Cannot set the version counter of an inference tensor.");
+        }
+        counter_->set_version(version);
     }
 
     // Whether this handle and `other` track the same counter (i.e. the two

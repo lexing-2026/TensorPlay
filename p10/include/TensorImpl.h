@@ -384,6 +384,14 @@ public:
     // Zero the counter (used when a fresh tensor is materialized by an
     // internal copy such as clone(), so the result starts unmutated).
     void reset_version() { version_counter_.reset(); }
+    // Force the counter to a value (memory-recycling escape hatch; restores a
+    // previously observed version so saved-tensor checks keep passing).
+    void set_version(int64_t version) {
+        if (version < 0) {
+            throw std::runtime_error("version cannot be negative");
+        }
+        version_counter_.set_version(static_cast<uint32_t>(version));
+    }
     void set_version_counter(const VariableVersion& vc) {
         if (inference_tensor_ && vc.is_enabled()) {
             throw std::runtime_error("Cannot set a version counter on an inference tensor.");
