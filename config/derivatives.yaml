@@ -40,9 +40,20 @@
 # views, so higher-order optimizer differentiation does not insert a copy.
 - name: view_as_real(Tensor self) -> Tensor
   self: tensorplay::tpx::ops::view_as_complex(grad)
+  result: view_as_real(self_t)
 
 - name: view_as_complex(Tensor self) -> Tensor
   self: tensorplay::tpx::ops::view_as_real(grad)
+
+# The part extractors place the cotangent in the extracted slot; the
+# complementary slot contributes nothing.
+- name: real(Tensor self) -> Tensor
+  self: complex(grad, zeros_like(grad))
+  result: real(self_t)
+
+- name: imag(Tensor self) -> Tensor
+  self: complex(zeros_like(grad), grad)
+  result: imag(self_t)
 
 # backward node and the scale folds in here. F.dropout rejects p == 1
 # the denominator is never zero, so 1 - p is never zero.
@@ -1351,7 +1362,7 @@
   self: grad * (-(1 + log(self)))
 
 - name: sgn(Tensor self) -> Tensor
-  self: zeros_like(self)
+  self: where(eq(self.abs(), 0), zeros_like(grad), (grad - (result * result) * grad.conj()) / (2 * self.abs()))
 
 - name: nextafter(Tensor self, Tensor other) -> Tensor
   self: where(ne(self, other), grad, zeros_like(grad))
