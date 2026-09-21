@@ -48,6 +48,23 @@ def get_tag(tensorplay_root: str | Path) -> str:
         return UNKNOWN
 
 
+def append_build_number(version: str, build_number: int) -> str:
+    """Insert the post segment at its position under PEP 440.
+
+    A post release must precede the dev segment: "1.1.0.dev20260921.post2"
+    is rejected by version parsers, while "1.1.0.post2.dev20260921" parses
+    and sorts above the same-day first build. A version that already carries
+    a post segment — a caller-composed nightly version — is returned
+    unchanged, so composing twice stays harmless.
+    """
+    if build_number <= 1 or re.search(r"\.post\d+", version):
+        return version
+    if ".dev" in version:
+        head, dev = version.split(".dev", 1)
+        return f"{head}.post{build_number}.dev{dev}"
+    return version + ".post" + str(build_number)
+
+
 def get_tensorplay_version(sha: str | None = None) -> str:
     """Determine the tensorplay version string.
 
@@ -81,15 +98,7 @@ def get_tensorplay_version(sha: str | None = None) -> str:
         raw_build_number = os.getenv("TENSORPLAY_BUILD_NUMBER", "").strip()
         build_number = int(raw_build_number) if raw_build_number else 1
         version = os.getenv("TENSORPLAY_BUILD_VERSION", "")
-        if build_number > 1:
-            # A post segment must precede the dev segment to stay valid under
-            # PEP 440: "1.1.0.dev20260921.post2" is rejected by version
-            # parsers, "1.1.0.post2.dev20260921" is not.
-            if ".dev" in version:
-                head, dev = version.split(".dev", 1)
-                version = f"{head}.post{build_number}.dev{dev}"
-            else:
-                version += ".post" + str(build_number)
+        version = append_build_number(version, build_number)
         origin = "TENSORPLAY_BUILD_{VERSION,NUMBER} env variables"
     elif sdist_version:
         version = sdist_version
@@ -120,19 +129,20 @@ def get_tensorplay_version(sha: str | None = None) -> str:
     return version
 
 
-def compute_nightly_version(today: str | None = None) -> str:
+def compute_nightly_version(today: str | None = None, build_number: int = 1) -> str:
     """Compute the nightly base version from version.txt.
 
     the prerelease suffix is stripped from version.txt ("1.0.0a0" -> "1.0.0")
     and a calendar dev segment is appended, e.g. "1.0.0.dev20260828". Variant
     local labels such as "+cu124" or "+cpu" are appended by the packaging
-    layer, not here.
+    layer, not here. A build number above 1 inserts the PEP 440 post segment
+    so a same-day republish ships under a distinct, higher version.
     """
     tensorplay_root = Path(__file__).absolute().parent.parent
     base = Path(tensorplay_root / "version.txt").read_text().strip().partition("a")[0]
     if today is None:
         today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
-    version = f"{base}.dev{today}"
+    version = append_build_number(f"{base}.dev{today}", build_number)
     # Validate that the version is PEP 440 compliant
     Version(version)
     return version

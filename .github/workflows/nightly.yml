@@ -222,15 +222,16 @@ jobs:
           INPUT_BUILD_NUMBER: ${{ inputs.build_number }}
         run: |
           set -euo pipefail
-          if [[ -n "$INPUT_VERSION" ]]; then
-            version="$INPUT_VERSION"
-          else
-            version="$(python -c 'from tools.generate_tensorplay_version import compute_nightly_version; print(compute_nightly_version())')"
-          fi
           # The dispatch default applies only to workflow_dispatch; on other
           # events the input context yields an empty string, which the
           # wheel build must never see (an empty build number is invalid).
           build_number="${INPUT_BUILD_NUMBER:-1}"
+          # A build number above 1 must land in the computed version itself:
+          # the publish-skip step matches asset names against this version,
+          # and an unchanged version would drop every leg as already built.
+          version="$(TP_BUILD_NUMBER="$build_number" \
+            TP_INPUT_VERSION="$INPUT_VERSION" \
+            python .github/scripts/nightly_version.py)"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "build_number=${build_number}" >> "$GITHUB_OUTPUT"
           echo "Nightly base version: ${version} (build number ${build_number})"
