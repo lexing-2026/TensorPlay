@@ -223,5 +223,73 @@ class CppJitAuthoringContractTest(unittest.TestCase):
         self.assertIn("42", str(ctx.exception))
 
 
+# Kernel-side allocation through the environment allocator: the request
+# is fulfilled by an ordinary tensorplay allocation.
+_ENV_ALLOC_SOURCE = r"""
+tvm::ffi::Tensor doubled_env(tvm::ffi::TensorView x) {
+  tvm::ffi::Tensor y = tvm::ffi::Tensor::FromEnvAlloc(
+      TVMFFIEnvTensorAlloc, x.shape(), x.dtype(), x.device());
+  tvm::ffi::TensorView yv(y);
+  for (int64_t i = 0; i < x.numel(); ++i)
+    static_cast<float*>(yv.data_ptr())[i] =
+        static_cast<float*>(x.data_ptr())[i] * 2.0f;
+  return y;
+}
+"""
+
+_BAD_DTYPE_SOURCE = r"""
+tvm::ffi::Tensor bad_env_alloc(tvm::ffi::TensorView x) {
+  DLDataType weird{};
+  weird.code = 99; weird.bits = 7; weird.lanes = 1;
+  return tvm::ffi::Tensor::FromEnvAlloc(
+      TVMFFIEnvTensorAlloc, x.shape(), weird, x.device());
+}
+"""
+
+
+@unittest.skipUnless(cpp_jit.is_available(), "compile engine is not installed")
+class CppJitEnvAllocatorTest(unittest.TestCase):
+    """Kernel-side allocation fulfilled by the TensorPlay allocator."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._mod = cpp_jit.load_inline(
+            name="tp_cppjit_envalloc",
+            cpp_sources=_ENV_ALLOC_SOURCE,
+            functions=["doubled_env"],
+        )
+
+    def test_allocation_roundtrip(self):
+        x = tp.tensor([1.0, 2.0, 3.0])
+        back = tp.from_dlpack(self._mod.doubled_env(x))
+        self.assertIsInstance(back, tp.Tensor)
+        self.assertEqual(back.tolist(), [2.0, 4.0, 6.0])
+        self.assertEqual(back.dtype, tp.float32)
+        self.assertEqual(tuple(back.shape), (3,))
+
+    def test_repeated_allocation_does_not_leak_references(self):
+        import gc
+
+        x = tp.tensor([1.0, 2.0, 3.0])
+        for _ in range(500):
+            back = tp.from_dlpack(self._mod.doubled_env(x))
+            self.assertEqual(back.tolist(), [2.0, 4.0, 6.0])
+            del back
+        gc.collect()
+        # still functional after the churn
+        self.assertEqual(
+            tp.from_dlpack(self._mod.doubled_env(x)).tolist(), [2.0, 4.0, 6.0])
+
+    def test_unsupported_dtype_is_a_clean_error(self):
+        mod = cpp_jit.load_inline(
+            name="tp_cppjit_envalloc_err",
+            cpp_sources=_BAD_DTYPE_SOURCE,
+            functions=["bad_env_alloc"],
+        )
+        with self.assertRaises((ValueError, RuntimeError)) as ctx:
+            mod.bad_env_alloc(tp.tensor([1.0]))
+        self.assertIn("unsupported dtype", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
