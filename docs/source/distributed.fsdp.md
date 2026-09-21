@@ -1,11 +1,13 @@
 # tensorplay.distributed.fsdp
 
 Fully sharded data parallelism (FSDP) shrinks a model's peak GPU memory by
-sharding its parameters across the ranks of a process group. The parameters
-of each submodule are flattened into a single buffer and split; only the shard
-needed for the current operation is gathered into memory, then freed again
-after the forward (depending on `reshard_after_forward`). The two public entry
-points differ in how much they hide:
+sharding its parameters across the ranks of a process group. The classic
+wrapper flattens a group of parameters into a single buffer and splits it,
+while `fully_shard` shards each parameter individually along dim 0; either
+way, only the shard needed for the current operation is gathered into
+memory, then freed again after the forward (depending on
+`reshard_after_forward`). The two public entry points differ in how much
+they hide:
 
 - {func}`~tensorplay.distributed.fsdp.FullyShardedDataParallel` wraps a whole
   module in one call, the classic drop-in style that replaces
@@ -16,47 +18,38 @@ points differ in how much they hide:
   shard policy per module.
 
 ```python
-from tensorplay.distributed.fsdp import (
-    FullyShardedDataParallel, ShardingStrategy,
-)
+import tensorplay as tp
+import tensorplay.nn as nn
+from tensorplay.distributed.fsdp import FullyShardedDataParallel, ShardingStrategy
 
-# requires an initialized process group and a CUDA device per rank
-model = FullyShardedDataParallel(model, sharding_strategy=ShardingStrategy.FULL_SHARD)
+# without an initialized process group the wrapper falls back to a
+# one-rank world; multi-rank training requires one
+model = FullyShardedDataParallel(
+    nn.Linear(64, 64), sharding_strategy=ShardingStrategy.FULL_SHARD
+)
+print(type(model).__name__)
 ```
 
 ## Composable `fully_shard` API
 
-```{eval-rst}
-.. autosummary::
-    :toctree: generated
-    :nosignatures:
+`fully_shard` shards each parameter of a module individually along dim 0,
+modifying the module in place — its type becomes a subclass of both the
+original class and {class}`~tensorplay.distributed.fsdp.FSDPModule` —
+instead of wrapping it. Fully qualified names are unchanged, the optimizer
+steps on the local shards, and each `fully_shard` call forms one
+all-gather group, so the sharding boundaries are chosen by which modules
+you apply it to, bottom-up.
 
-    tensorplay.distributed.fsdp.fully_shard
-    tensorplay.distributed.fsdp.FSDPModule
-    tensorplay.distributed.fsdp.MixedPrecisionPolicy
-    tensorplay.distributed.fsdp.CPUOffloadPolicy
-    tensorplay.distributed.fsdp.OffloadPolicy
-    tensorplay.distributed.fsdp.UnshardHandle
-    tensorplay.distributed.fsdp.register_fsdp_forward_method
-    tensorplay.distributed.fsdp.share_comm_ctx
+Its own page covers the verified user contract, the communication
+grouping, and the policies:
+
+```{eval-rst}
+.. toctree::
+    :hidden:
+
+    distributed.fsdp.fully_shard
 ```
 
-- {func}`~tensorplay.distributed.fsdp.fully_shard` applies FSDP to one module
-  in place. It accepts an optional device `mesh` (the same mesh a
-  [distributed tensor](distributed.tensor.md) runs on), a `reshard_after_forward`
-  policy for when to free the gathered shards, a `shard_placement_fn` to decide
-  how each parameter is split, and the {class}`~tensorplay.distributed.fsdp.MixedPrecisionPolicy`
-  / {class}`~tensorplay.distributed.fsdp.CPUOffloadPolicy` policies.
-- {class}`~tensorplay.distributed.fsdp.FSDPModule` is the wrapper type that
-  `fully_shard` returns; it exposes the sharded state and the
-  {class}`~tensorplay.distributed.fsdp.UnshardHandle` to manage the gathered
-  shards manually. The module's parameters are concatenated into a single
-  `FlatParameter` (a parameter that holds the flattened collection), which is
-  what gets sharded across the ranks.
-- {class}`~tensorplay.distributed.fsdp.MixedPrecisionPolicy` chooses the data
-  types used for the parameters, the reduction, and the module output.
-  {class}`~tensorplay.distributed.fsdp.CPUOffloadPolicy` offloads the shards
-  to pinned host memory.
 
 ## Classic `FullyShardedDataParallel` API
 
@@ -132,17 +125,21 @@ step, and backs off the scale together.
 
 ```python
 import tensorplay as tp
-from tensorplay.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+import tensorplay.nn as nn
+from tensorplay.distributed.fsdp import fully_shard
 from tensorplay.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 
+model = nn.Linear(64, 64)
+fully_shard(model)
 scaler = ShardedGradScaler()
-fully_shard(model, mp_policy=MixedPrecisionPolicy(param_dtype=tp.bfloat16))
+optimizer = tp.optim.SGD(model.parameters(), lr=0.1)
 
-for x, y in dataloader:
+for x in (tp.randn(8, 64) for _ in range(2)):
     loss = model(x).sum()
     scaler.scale(loss).backward()
     scaler.step(optimizer)   # skips together if any rank overflowed
     scaler.update()
+    model.zero_grad()
 ```
 
 ## Where to go next
