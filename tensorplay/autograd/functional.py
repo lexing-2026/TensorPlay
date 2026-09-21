@@ -400,11 +400,21 @@ def jvp(func, inputs, v=None, create_graph=False, strict=False, mode="reversed")
 
     """
     if mode == "forward":
-        # Native forward-mode: tangents propagate through fused forward_*
-        # kernels with no backward graph.  create_graph/strict semantics do
-        # not apply (the result is exact and graph-free).
-        from tensorplay.autograd._forward import forward_jvp
-        return forward_jvp(func, inputs, v)
+        # True forward mode: tangents propagate through the forward-AD
+        # engine in a single pass over func.  create_graph does not apply;
+        # the tangents themselves require grad only when the inputs do.
+        from tensorplay._transforms.eager_transforms import _jvp_with_argnums
+
+        inputs_t = (inputs,) if isinstance(inputs, tensorplay.Tensor) \
+            else tuple(inputs)
+        if v is None:
+            v_t = tuple(tensorplay.ones_like(x) for x in inputs_t)
+        else:
+            v_t = (v,) if isinstance(v, tensorplay.Tensor) else tuple(v)
+        if len(v_t) != len(inputs_t):
+            raise ValueError("jvp: v must match inputs element-for-element")
+        return _jvp_with_argnums(
+            func, *inputs_t, tangents=v_t, strict=strict)
     elif mode != "reversed":
         raise ValueError(
             f"jvp(): mode must be 'reversed' or 'forward', got {mode!r}")
@@ -464,13 +474,67 @@ def jvp(func, inputs, v=None, create_graph=False, strict=False, mode="reversed")
 def jacfwd(func, inputs):
     r"""Compute the Jacobian of ``func`` using native forward-mode AD.
 
-    Column-scan over the inputs through :class:`~tensorplay.autograd._forward.
-    DualTensor`; no backward graph is built.  Returns one Jacobian block per
+    Column-scan over the inputs through the forward-AD engine's dual
+    tensors; no backward graph is built.  Returns one Jacobian block per
     input with shape ``out_shape + in_shape`` (tuple-of-tuples when ``func``
     returns multiple outputs).
     """
-    from tensorplay.autograd._forward import jacfwd as _jacfwd
-    return _jacfwd(func, inputs)
+    from tensorplay._transforms.eager_transforms import _jvp_with_argnums
+
+    def _plain(x):
+        return tuple(x) if isinstance(x, list) else x
+
+    single = isinstance(inputs, tensorplay.Tensor)
+    ins = (inputs,) if single else tuple(inputs)
+
+    primals = func(*ins)
+    primal_tuple = _plain(primals) if isinstance(primals, (tuple, list)) \
+        else (primals,)
+    for p in primal_tuple:
+        if not isinstance(p, tensorplay.Tensor):
+            raise ValueError(
+                "jacfwd: outputs must be tensors (or tuples of tensors)")
+
+    jacobian_blocks = [[None] * len(ins) for _ in primal_tuple]
+    for i, x in enumerate(ins):
+        flat_x = x.reshape(-1)
+        in_numel = flat_x.numel()
+        for o, primal in enumerate(primal_tuple):
+            out_shape = tuple(primal.shape)
+            columns = []
+            for k in range(in_numel):
+                tangent = tensorplay.zeros_like(flat_x)
+                tangent[k] = 1.0
+                directions = (
+                    tuple(tensorplay.zeros_like(t) for t in ins[:i])
+                    + (tangent.reshape(x.shape),)
+                    + tuple(tensorplay.zeros_like(t) for t in ins[i + 1:])
+                )
+                _, js = _jvp_with_argnums(func, *ins, tangents=directions)
+                jt = _plain(js) if isinstance(js, (tuple, list)) else (js,)
+                # Column k of the Jacobian: d(output_e)/d(input_k).
+                columns.append(jt[o].reshape(-1))
+            if columns:
+                j_flat = tensorplay.stack(columns, dim=1)
+                jacobian_blocks[o][i] = j_flat.reshape(out_shape +
+                                                       tuple(x.shape))
+            else:
+                jacobian_blocks[o][i] = tensorplay.zeros(out_shape +
+                                                         tuple(x.shape))
+
+    #   single in/out            -> Tensor
+    #   one side a tuple         -> tuple of Tensors
+    #   both sides tuples        -> tuple of tuples (Jacobian[i][j])
+    multi_out = len(jacobian_blocks) > 1
+    multi_in = len(ins) > 1
+    if not multi_out and not multi_in:
+        return jacobian_blocks[0][0]
+    if not multi_in:
+        return tuple(jacobian_blocks[o][0] for o in range(len(jacobian_blocks)))
+    if not multi_out:
+        return tuple(jacobian_blocks[0][i] for i in range(len(ins)))
+    return tuple(tuple(jacobian_blocks[o][i] for i in range(len(ins)))
+                 for o in range(len(jacobian_blocks)))
 
 
 def jacobian(
