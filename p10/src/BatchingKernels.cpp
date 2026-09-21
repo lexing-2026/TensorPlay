@@ -931,15 +931,36 @@ Tensor matmul(const Tensor& left, const Tensor& right) {
             result = call_next<Tensor, const Tensor&, int64_t>(
                 "squeeze.dim", first, first, -1);
         } else {
-            Tensor b_transposed = call_next<Tensor, const Tensor&, int64_t,
-                                            int64_t>(
-                "transpose", values.second, values.second, 0, 1);
-            result = call_next<Tensor, const Tensor&, const Tensor&>(
-                "matmul", values.first, values.first, b_transposed);
+            // Exactly one operand is mapped.  The mapped 1-D operand acts as
+            // a matrix whose leading dim is the batch: contract the plain
+            // 1-D operand against it.
+            if (b.bdim.has_value()) {
+                Tensor b_mat = call_next<Tensor, const Tensor&, int64_t,
+                                         int64_t>(
+                    "transpose", values.second, values.second, 0, 1);
+                result = call_next<Tensor, const Tensor&, const Tensor&>(
+                    "matmul", values.first, values.first, b_mat);
+            } else {
+                result = call_next<Tensor, const Tensor&, const Tensor&>(
+                    "matmul", values.first, values.first, values.second);
+            }
         }
         return make_batched(result, 0, level);
     }
     auto values = matmul_values(left, right, a, b);
+    // A mapped 1-D right operand contracts as a per-batch mat-vec against a
+    // plain 2-D left operand: reshape to a matrix product over the
+    // transposed batch, then lead the result with the batch dim.
+    if (right_ndim == 1 && b.bdim.has_value() && !a.bdim.has_value() &&
+        left_ndim == 2) {
+        Tensor b_mat = call_next<Tensor, const Tensor&, int64_t, int64_t>(
+            "transpose", values.second, values.second, 0, 1);
+        Tensor product = call_next<Tensor, const Tensor&, const Tensor&>(
+            "matmul", values.first, values.first, b_mat);
+        Tensor result = call_next<Tensor, const Tensor&, int64_t, int64_t>(
+            "transpose", product, product, 0, 1);
+        return make_batched(result, 0, level);
+    }
     Tensor result = call_next<Tensor, const Tensor&, const Tensor&>(
         "matmul", values.first, values.first, values.second);
     return make_batched(result, 0, level);
@@ -1952,6 +1973,69 @@ void register_batch_rule(tensorplay::Library& library, const char* name) {
     }
 }
 
+// Forward-AD ops compose with vmap by aligning the primal's and tangent's
+// batch dimensions and attaching the tangent to the physical payload; the
+// tangent arithmetic then runs per-batch inside the regular kernels.
+Tensor batch_make_dual(const Tensor& primal, const Tensor& tangent, int64_t level) {
+    Operand p = unwrap_operand(primal);
+    Operand t = unwrap_operand(tangent);
+    Tensor pval = p.value;
+    Tensor tval = t.value;
+    if (p.bdim.has_value()) {
+        pval = move_to_front(pval, *p.bdim);
+        tval = t.bdim.has_value()
+            ? move_to_front(tval, *t.bdim)
+            : expand_unbatched(tval, pval.size(0),
+                               static_cast<std::vector<int64_t>>(tval.shape()));
+        Tensor out = call_next<Tensor, const Tensor&, const Tensor&, int64_t>(
+            "_make_dual", pval, pval, tval, level);
+        return make_batched(out, 0, p.level);
+    }
+    if (t.bdim.has_value()) {
+        // Primal constant across the batch: the dual payload grows a batch
+        // dim so every batch element pairs with its tangent.
+        tval = move_to_front(tval, *t.bdim);
+        pval = expand_unbatched(pval, tval.size(0),
+                                static_cast<std::vector<int64_t>>(pval.shape()));
+        Tensor out = call_next<Tensor, const Tensor&, const Tensor&, int64_t>(
+            "_make_dual", pval, pval, tval, level);
+        return make_batched(out, 0, t.level);
+    }
+    return call_next<Tensor, const Tensor&, const Tensor&, int64_t>(
+        "_make_dual", pval, pval, tval, level);
+}
+
+Tensor batch_fw_primal(const Tensor& self, int64_t level) {
+    Operand s = unwrap_operand(self);
+    if (s.bdim.has_value()) {
+        Tensor sv = move_to_front(s.value, *s.bdim);
+        Tensor out = call_next<Tensor, const Tensor&, int64_t>(
+            "_fw_primal", sv, sv, level);
+        return make_batched(out, 0, s.level);
+    }
+    return call_next<Tensor, const Tensor&, int64_t>("_fw_primal", s.value,
+                                                     s.value, level);
+}
+
+std::tuple<Tensor, Tensor> batch_unpack_dual(const Tensor& dual, int64_t level) {
+    Operand s = unwrap_operand(dual);
+    if (!s.bdim.has_value()) {
+        return call_next<std::tuple<Tensor, Tensor>, const Tensor&, int64_t>(
+            "_unpack_dual", s.value, s.value, level);
+    }
+    Tensor sv = move_to_front(s.value, *s.bdim);
+    auto out = call_next<std::tuple<Tensor, Tensor>, const Tensor&, int64_t>(
+        "_unpack_dual", sv, sv, level);
+    // The tangent may be undefined when the dual carries none; it is passed
+    // through unwrapped so the caller sees the absent tangent.
+    Tensor tangent = std::get<1>(out);
+    if (tangent.defined()) {
+        tangent = make_batched(tangent, 0, s.level);
+    }
+    return std::make_tuple(
+        make_batched(std::get<0>(out), 0, s.level), tangent);
+}
+
 void register_batch_rules(tensorplay::Library& library) {
     register_batch_rule<&batch_neg>(library, "neg");
     register_batch_rule<&batch_negative>(library, "negative");
@@ -2074,6 +2158,9 @@ void register_batch_rules(tensorplay::Library& library) {
     register_batch_rule<&batch_copy_>(library, "copy_");
     register_batch_rule<&batch_index>(library, "index.Tensor");
     register_batch_rule<&batch_index_put_>(library, "index_put_");
+    register_batch_rule<&batch_make_dual>(library, "_make_dual");
+    register_batch_rule<&batch_fw_primal>(library, "_fw_primal");
+    register_batch_rule<&batch_unpack_dual>(library, "_unpack_dual");
 }
 
 } // namespace

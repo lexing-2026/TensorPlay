@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AutogradMetaBase.h"
+#include "ForwardGrad.h"
 #include "Tensor.h"
 #include "Macros.h"
 #include <memory>
@@ -46,8 +47,14 @@ private:
     std::function<tensorplay::Tensor(const tensorplay::Tensor&)> view_fn_;
     mutable std::mutex view_mutex_;
 
+    // Forward-mode tangent storage; lazily allocated on the first tangent,
+    // cleared by the destructor so levels drop their references.
+    mutable std::shared_ptr<ForwardGrad> fw_grad_;
+    mutable std::mutex fw_mutex_;
+
 public:
     explicit AutogradMeta(bool requires_grad = false) : requires_grad_(requires_grad) {}
+    ~AutogradMeta() override;
 
     bool requires_grad() const override {
         return requires_grad_ || grad_fn_ != nullptr ||
@@ -101,6 +108,13 @@ public:
     }
     bool has_view_fn() const { return static_cast<bool>(view_fn_); }
     std::mutex& view_mutex() const { return view_mutex_; }
+
+    // Forward-mode AD tangent accessors.  ``self`` is the tensor owning this
+    // metadata; it is needed to replay views when a tangent must be read
+    // through the view's base.
+    void set_fw_grad(const tensorplay::Tensor& new_grad, const tensorplay::Tensor& self,
+                     uint64_t level, bool is_inplace_op);
+    const tensorplay::Tensor& fw_grad(uint64_t level, const tensorplay::Tensor& self) const;
 
     // Accumulate a gradient into grad_, reusing storage when it is safe to do
     // so in-place (gradient tracking disabled and the buffer is uniquely held).

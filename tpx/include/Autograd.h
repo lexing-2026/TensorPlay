@@ -84,6 +84,26 @@ inline bool is_leaf(const Tensor& t) {
 // (its grad_fn chain walks through view nodes down to an AccumulateGrad).
 TENSORPLAY_API bool is_view_of_leaf(const Tensor& t);
 
+// Forward-mode AD tangent accessors.  Tangents live on the autograd metadata
+// keyed by the active forward level.
+TENSORPLAY_API Tensor fw_grad(const Tensor& t, uint64_t level);
+TENSORPLAY_API void set_fw_grad(const Tensor& t, const Tensor& new_grad,
+                                uint64_t level, bool is_inplace_op);
+
+inline bool is_fw_grad_defined(const Tensor& t, uint64_t level) {
+    return t.defined() && fw_grad(t, level).defined();
+}
+
+inline bool is_fw_grad_defined(const std::optional<Tensor>& t, uint64_t level) {
+    return t.has_value() && is_fw_grad_defined(*t, level);
+}
+
+// Tangent/primal extraction used by the generated forward-derivative
+// formulas.  The returned primal carries no tangent so formula arithmetic
+// does not re-enter forward propagation; wrapped numbers are returned as-is.
+TENSORPLAY_API Tensor to_non_opt_fw_grad(const Tensor& t);
+TENSORPLAY_API Tensor to_non_opt_primal(const Tensor& t);
+
 } // namespace impl
 
 // Helper to collect next edges for autograd

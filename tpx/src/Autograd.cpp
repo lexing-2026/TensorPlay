@@ -174,6 +174,58 @@ void rebase_history(const Tensor& self, std::shared_ptr<Node> grad_fn) {
     (void)impl::grad_fn(self);
 }
 
+Tensor fw_grad(const Tensor& t, uint64_t level) {
+    if (!t.defined()) return ForwardGrad::undef_grad();
+    auto* meta = get_autograd_meta(t);
+    if (!meta) return ForwardGrad::undef_grad();
+    return meta->fw_grad(level, t);
+}
+
+void set_fw_grad(const Tensor& t, const Tensor& new_grad, uint64_t level,
+                 bool is_inplace_op) {
+    auto* meta = get_or_create_autograd_meta(t);
+    TP_CHECK(meta != nullptr, "cannot attach a forward gradient to this tensor");
+    meta->set_fw_grad(new_grad, t, level, is_inplace_op);
+}
+
+Tensor to_non_opt_fw_grad(const Tensor& t) {
+    return t.defined() ? fw_grad(t, 0) : Tensor();
+}
+
+Tensor to_non_opt_primal(const Tensor& t) {
+    if (t.defined()) {
+        if (t.unsafeGetTensorImpl()->is_wrapped_number()) {
+            return t;
+        }
+        return ops::_fw_primal(t, 0);
+    }
+    return Tensor();
+}
+
+// Checks whether the tangent has the same layout (sizes, strides, storage
+// offset) as the primal; a mismatch is repaired with a fresh zero buffer so
+// in-place tangent updates stay valid.
+bool has_same_fw_meta(const Tensor& base, const Tensor& other) {
+    if (!base.defined() || !other.defined()) return false;
+    if (base.dim() != other.dim()) return false;
+    if (base.shape() != other.shape()) return false;
+    if (base.numel() == 0 && other.numel() == 0) return true;
+    if (base.unsafeGetTensorImpl()->storage_offset() !=
+        other.unsafeGetTensorImpl()->storage_offset()) {
+        return false;
+    }
+    const auto& base_strides = base.strides();
+    const auto& other_strides = other.strides();
+    const auto& base_sizes = base.shape();
+    for (size_t i = 0; i < base_strides.size(); ++i) {
+        if (base_strides[i] != other_strides[i] && base_sizes[i] != 1 &&
+            base_sizes[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace impl
 
 void AutogradMeta::accum_grad(const tensorplay::Tensor& grad) {
@@ -186,6 +238,141 @@ void AutogradMeta::accum_grad(const tensorplay::Tensor& grad) {
         // Accumulate gradient
         grad_ = grad_ + grad;
     }
+}
+
+AutogradMeta::~AutogradMeta() {
+    if (fw_grad_) {
+        fw_grad_->clear();
+    }
+}
+
+void AutogradMeta::set_fw_grad(
+    const tensorplay::Tensor& new_grad_base,
+    const tensorplay::Tensor& self_base,
+    uint64_t level,
+    bool is_inplace_op) {
+    TP_CHECK(
+        !impl::fw_grad(new_grad_base, level).defined(),
+        "Setting a forward grad that itself has a forward gradient at the "
+        "same level is not supported.");
+    TP_CHECK(
+        isFloatingOrComplexType(new_grad_base.dtype()) &&
+            isFloatingOrComplexType(self_base.dtype()),
+        "Expected both tensor and its forward grad to be floating point or complex");
+    // Lazy initialization
+    {
+        std::lock_guard<std::mutex> lock(fw_mutex_);
+        if (!fw_grad_) {
+            fw_grad_ = std::make_shared<ForwardGrad>();
+        }
+    }
+    if (fw_grad_->contains(level)) {
+        // Setting the forward grad again is only allowed if it is a no-op.
+        // In-place ops may re-set it so their code generation stays simple.
+        TP_CHECK(
+            new_grad_base.defined(),
+            "Cannot set a forward grad that is an undefined Tensor. Use "
+            "_fw_primal(level) to get a new Tensor with this forward grad unset.");
+        TP_CHECK(
+            is_inplace_op,
+            "Only inplace operations can re-set the forward grad of a Tensor "
+            "that already has one.");
+        TP_CHECK(
+            fw_grad_->value(level).unsafeGetTensorImpl() ==
+                new_grad_base.unsafeGetTensorImpl(),
+            "Cannot set a value of a forward grad if it already exists. "
+            "Inplace operations should modify it inplace.");
+    } else {
+        Tensor new_grad = new_grad_base;
+
+        TP_CHECK(
+            self_base.shape() == new_grad.shape(),
+            "Trying to set a forward gradient that has a different size than "
+            "that of the original Tensor, this is not supported.");
+
+        if (is_inplace_op && has_view_info_ && view_base_.defined()) {
+            // In-place op on a view without a prior tangent: propagate the
+            // tangent to the base and make this tensor's tangent a view of
+            // the base's tangent, keeping the view relation consistent.
+            const Tensor& base = view_base_;
+            if (!impl::fw_grad(base, level).defined()) {
+                Tensor new_base_fw_grad;
+                if (impl::has_same_fw_meta(new_grad, base) &&
+                    impl::has_same_fw_meta(new_grad, self_base)) {
+                    new_base_fw_grad = new_grad;
+                } else {
+                    new_base_fw_grad =
+                        ops::_new_zeros_with_same_feature_meta(new_grad, base);
+
+                    Tensor new_fw_grad_value;
+                    if (has_view_fn()) {
+                        new_fw_grad_value = view_fn()(new_base_fw_grad);
+                    } else {
+                        new_fw_grad_value = new_base_fw_grad.as_strided(
+                            self_base.shape(), self_base.strides(),
+                            static_cast<int64_t>(
+                                self_base.unsafeGetTensorImpl()->storage_offset()));
+                    }
+
+                    new_fw_grad_value.copy_(new_grad);
+                    new_grad = std::move(new_fw_grad_value);
+                }
+                impl::set_fw_grad(base, new_base_fw_grad, level,
+                                  /* is_inplace_op */ false);
+            }
+        }
+
+        // Enforce the basic layout constraint: the tangent must share the
+        // primal's shape so in-place tangent updates stay valid.  The fresh
+        // buffer is contiguous -- reproducing a degenerate primal layout
+        // (e.g. stride-0 broadcast dims) would make the copy collapse.
+        if (!impl::has_same_fw_meta(new_grad, self_base)) {
+            auto res = ops::zeros(
+                static_cast<std::vector<int64_t>>(new_grad.shape()),
+                new_grad.dtype(), new_grad.device());
+            res.copy_(new_grad);
+            new_grad = std::move(res);
+        }
+
+        fw_grad_->set_value(std::move(new_grad), level);
+    }
+}
+
+const tensorplay::Tensor& AutogradMeta::fw_grad(
+    uint64_t level,
+    const tensorplay::Tensor& self) const {
+    if (!FwGradMode::is_enabled()) {
+        return ForwardGrad::undef_grad();
+    }
+
+    std::lock_guard<std::mutex> lock(fw_mutex_);
+
+    const Tensor& direct_fw_grad =
+        fw_grad_ ? fw_grad_->value(level) : ForwardGrad::undef_grad();
+
+    if (!direct_fw_grad.defined() && has_view_info_ && view_base_.defined()) {
+        // A view without its own tangent reads the base's tangent through the
+        // view relation; the value is cached so later reads are direct.
+        const Tensor& base = view_base_;
+        const Tensor& base_val = impl::fw_grad(base, level);
+        if (base_val.defined()) {
+            fw_grad_ = std::make_shared<ForwardGrad>();
+
+            Tensor new_val;
+            if (has_view_fn()) {
+                new_val = view_fn()(base_val);
+            } else {
+                new_val = base_val.as_strided(
+                    self.shape(), self.strides(),
+                    static_cast<int64_t>(
+                        self.unsafeGetTensorImpl()->storage_offset()));
+            }
+
+            fw_grad_->set_value(std::move(new_val), level);
+            return fw_grad_->value(level);
+        }
+    }
+    return direct_fw_grad;
 }
 
 std::vector<Edge> collect_next_edges(const Tensor& t) {

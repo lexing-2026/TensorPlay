@@ -7,6 +7,8 @@ set(TPX_SOURCES
     src/AnomalyMode.cpp
     src/autocast_mode.cpp
     src/Engine.cpp
+    src/ForwardAdOps.cpp
+    src/ForwardGrad.cpp
     src/SavedVariable.cpp
     ${GEN_TPX_OPS_CPP}
     ${GEN_TPX_AUTOGRAD_REG_CPP}
