@@ -18,7 +18,7 @@ from .api_types import (
     tuple_element_cpp_types,
     tuple_element_names,
 )
-from .gen_autograd import OpDerivatives
+from .gen_autograd import OpDerivatives, render_formula
 from .model import NativeFunction, redispatch_name as _redispatch_name
 
 _H = [
@@ -84,6 +84,9 @@ def _inline_forward_lines(f: NativeFunction, autocast_ops: set[str],
     """
     if _has_autograd(f, derivatives):
         return None
+    _dv_inline = derivatives.get(f.func_name)
+    if _dv_inline is not None and _dv_inline.fw_formulas:
+        return None                       # forward-AD block needs the body
     _self_lv = f.self_arg()
     if (f.cpp_return_kind == 'list' and _self_lv is not None
             and f.returns_view_of_input
@@ -340,9 +343,62 @@ def _view_replay_lambda(f: NativeFunction) -> str:
 _DTYPE_GLOBAL_DEFAULT_OPS = {"rand", "randn", "empty", "zeros", "ones"}
 
 
+def _emit_fw_derivative_block(lines, f, dv, native_op_names):
+    """Forward-mode AD: compute the output tangent from the input tangents.
+
+    Emitted after the core call (the formulas may read the op's own output)
+    and before backward bookkeeping; the matching setter runs once the
+    output's backward history is attached.  The block is guarded so it only
+    computes when at least one required input actually carries a tangent;
+    inputs without one are zero-filled so the formula stays uniform.
+    """
+    outs = list(dv.fw_formulas)
+    if outs != ["result"] or f.cpp_return_kind != 'value' \
+            or cpp_return_type(f) != 'Tensor':
+        raise ValueError(
+            f"forward derivative for {f.func_name} requires a single Tensor "
+            "result")
+    required_inputs: list[str] = []
+    for a in f.args:
+        if a.name in dv.fw_required_tangent or a.name in dv.fw_required_primal:
+            if a.type.is_opt or not a.type.is_tensor_like or a.type.is_list:
+                raise ValueError(
+                    f"forward derivative for {f.func_name} reads {a.name!r} "
+                    "which must be a plain Tensor argument")
+            required_inputs.append(a.name)
+    lines.append(
+        '    std::optional<Tensor> result_new_fw_grad_opt = std::nullopt;')
+    cond = ' || '.join(
+        f'tensorplay::tpx::impl::is_fw_grad_defined({n}, /* level */ 0)'
+        for n in required_inputs)
+    lines.append(f'    if ({cond}) {{')
+    for n in dv.fw_required_tangent:
+        lines.append(
+            f'        auto {n}_t_raw = '
+            'tensorplay::tpx::impl::to_non_opt_fw_grad('
+            f'{n});')
+        lines.append(
+            f'        auto {n}_t = ({n}_t_raw.defined() || !{n}.defined()) '
+            f'? {n}_t_raw : tensorplay::tpx::ops::zeros_like({n});')
+    for n in dv.fw_required_primal:
+        lines.append(
+            f'        auto {n}_p = '
+            'tensorplay::tpx::impl::to_non_opt_primal('
+            f'{n});')
+    tensor_syms = {a.name for a in f.args if a.type.is_tensor_like}
+    tensor_syms |= {f'{n}_t' for n in dv.fw_required_tangent}
+    tensor_syms |= {f'{n}_p' for n in dv.fw_required_primal}
+    tensor_syms.add('result')
+    rendered = render_formula(dv.fw_formulas['result'], tensor_syms, set(),
+                              frozenset(), native_op_names)
+    lines.append(f'        result_new_fw_grad_opt = {rendered};')
+    lines.append('    }')
+
+
 def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
                          autocast_ops: set[str],
-                         derivatives: dict[str, OpDerivatives]) -> str:
+                         derivatives: dict[str, OpDerivatives],
+                         native_op_names: set[str] = frozenset()) -> str:
     lines = [_CPP_INCLUDES.rstrip('\n'), '',
              'namespace tensorplay {', 'namespace tpx {', 'namespace ops {', '']
 
@@ -470,6 +526,11 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
                 lines.append('        }')
             lines.append('    }')
 
+        # ---- forward-AD propagation -----------------------------------------
+        _dv_fw = derivatives.get(f.func_name)
+        if _dv_fw is not None and _dv_fw.fw_formulas:
+            _emit_fw_derivative_block(lines, f, _dv_fw, native_op_names)
+
         # ---- backward node --------------------------------------------------
         dv_nd = derivatives.get(f.func_name)
         _non_diff = dv_nd is not None and dv_nd.non_differentiable_output
@@ -531,6 +592,11 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
                 lines.append('    if (requires_grad) tensorplay::tpx::impl::set_requires_grad(result, true);')
                 lines.append('    if (requires_grad && result.defined()) {')
                 lines.append('        tensorplay::tpx::impl::set_grad_fn(result, grad_fn);')
+                lines.append('    }')
+            if _dv_fw is not None and _dv_fw.fw_formulas:
+                lines.append('    if (result_new_fw_grad_opt.has_value() && result_new_fw_grad_opt.value().defined() && result.defined()) {')
+                lines.append('        // The hardcoded 0 here tracks the single supported forward level.')
+                lines.append('        tensorplay::tpx::impl::set_fw_grad(result, result_new_fw_grad_opt.value(), /* level */ 0, /* is_inplace_op */ false);')
                 lines.append('    }')
             lines.append('    return result;')
         elif kind == 'list':

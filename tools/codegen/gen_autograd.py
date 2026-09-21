@@ -287,7 +287,7 @@ TENSOR_METHODS = {
     "sign": "sign", "mul": "mul", "add": "add", "sub": "sub", "div": "div",
     "atan2": "atan2", "clamp": "clamp", "lerp": "lerp", "clone": "clone",
     "detach": "detach", "contiguous": "contiguous", "select": "select",
-    "slice": "slice", "t_": "t_",
+    "slice": "slice", "t_": "t_", "conj": "conj",
 }
 
 _GRAD_SYMBOLS = {"grad", "grad_output"}
@@ -471,6 +471,73 @@ class OpDerivatives:
     # still registers (so the dispatch chain resolves) but builds no backward
     # node and leaves the outputs detached.
     non_differentiable_output: bool = False
+    # Forward-mode derivatives: output name -> jvp formula over each
+    # argument's primal value "{arg}_p" and tangent "{arg}_t".
+    fw_formulas: dict[str, Expr] = field(default_factory=dict)
+    # Arguments whose tangent / primal value the jvp formula reads; drives
+    # the local declarations and the any-tangent-defined guard emitted into
+    # the generated wrapper.
+    fw_required_tangent: list[str] = field(default_factory=list)
+    fw_required_primal: list[str] = field(default_factory=list)
+
+
+_IDENT_BOUNDARY = r"(?<![\w.]){name}(?![\w])"
+
+
+def _fw_requirements(expr: Expr, arg_names: set[str]) -> tuple[list[str], list[str]]:
+    """Names whose tangent / primal the formula reads, in schema order."""
+    used: set[str] = set()
+    collect_vars(expr, used)
+    tangent = {v[:-2] for v in used if v.endswith("_t") and v[:-2] in arg_names}
+    primal = {v[:-2] for v in used if v.endswith("_p") and v[:-2] in arg_names}
+    return tangent, primal
+
+
+def _expand_fw_formula(func: NativeFunction, out_name: str, formula: str,
+                       raw_formulas: dict[str, str]) -> tuple[Expr, list[str], list[str]]:
+    """Resolve one forward-derivative formula.
+
+    ``auto_linear`` re-evaluates the op on the tangents of every
+    differentiable argument (valid because the Jacobian of a linear map is
+    the map itself); ``auto_element_wise`` reuses the backward formula with
+    ``grad`` replaced by the conjugated tangent and the input by its primal
+    (valid for single-input element-wise maps, where the Jacobian is
+    diagonal).  Both yield the conjugate-wrapped result required for
+    complex-valued inputs.
+    """
+    arg_names = {a.name for a in func.args}
+    diff_args = [a.name for a in func.args if a.name in raw_formulas]
+    if formula == "auto_linear":
+        if out_name != "result":
+            raise ValueError(
+                f"auto_linear forward derivative of {func.func_name} requires "
+                "a single 'result' output")
+        if not diff_args:
+            raise ValueError(
+                f"auto_linear forward derivative of {func.func_name} needs at "
+                "least one differentiable argument")
+        new_args = [a.name + "_t" if a.name in diff_args else a.name
+                    for a in func.args]
+        return parse_expr(f"{func.base_name}({', '.join(new_args)})"), \
+            list(diff_args), []
+    if formula == "auto_element_wise":
+        if len(diff_args) != 1 or out_name != "result":
+            raise ValueError(
+                f"auto_element_wise forward derivative of {func.func_name} "
+                "requires a single differentiable argument and a single result")
+        inp = diff_args[0]
+        backward = raw_formulas.get(inp)
+        if backward is None:
+            raise ValueError(
+                f"auto_element_wise forward derivative of {func.func_name} "
+                f"requires a backward formula for {inp!r}")
+        fw = re.sub(_IDENT_BOUNDARY.format(name="grad"),
+                    f"{inp}_t.conj()", backward)
+        fw = re.sub(_IDENT_BOUNDARY.format(name=inp), f"{inp}_p", fw)
+        return parse_expr(f"({fw}).conj()"), [inp], [inp]
+    expr = parse_expr(formula)
+    tangent, primal = _fw_requirements(expr, arg_names)
+    return expr, list(tangent), list(primal)
 
 
 # Backwards that cannot be written in the formula DSL because they map over a
@@ -516,7 +583,8 @@ EXTERNAL_NODES: set[str] = set()
 
 
 def compute_op_derivatives(func: NativeFunction, raw_formulas: dict[str, str],
-                           node_name: str | None = None) -> OpDerivatives:
+                           node_name: str | None = None,
+                           fw_raw: dict[str, str] | None = None) -> OpDerivatives:
     """Analyze one op's derivative formulas into node layout + call info."""
     node_name = node_name or autograd_node_name(func.func_name)
 
@@ -529,6 +597,18 @@ def compute_op_derivatives(func: NativeFunction, raw_formulas: dict[str, str],
     if func.cpp_return_kind == "tuple":
         from .api_types import tuple_element_names
         output_names.update(tuple_element_names(func))
+
+    fw_formulas: dict[str, Expr] = {}
+    fw_required_tangent: list[str] = []
+    fw_required_primal: list[str] = []
+    for out_name, formula in (fw_raw or {}).items():
+        expr, tangent, primal = _expand_fw_formula(
+            func, out_name, formula, raw_formulas)
+        fw_formulas[out_name] = expr
+        fw_required_tangent.extend(n for n in tangent
+                                   if n not in fw_required_tangent)
+        fw_required_primal.extend(n for n in primal
+                                  if n not in fw_required_primal)
 
     used: set[str] = set()
     for e in parsed.values():
@@ -557,6 +637,9 @@ def compute_op_derivatives(func: NativeFunction, raw_formulas: dict[str, str],
         grad_slots=grad_slots, members=members,
         used_input_names={m for m, _ in members} & arg_names,
         used_output_names={m for m, _ in members} & output_names,
+        fw_formulas=fw_formulas,
+        fw_required_tangent=fw_required_tangent,
+        fw_required_primal=fw_required_primal,
     )
 
 
@@ -574,15 +657,28 @@ def load_derivatives(path: str, native_by_opname: dict[str, NativeFunction]) \
             continue
         if op in EXTERNAL_NODES:
             continue
-        raw = {}
-        for key in ("self", "result") + tuple(a.name for a in native.args):
-            if key in item:
-                raw[key] = _normalize_comparisons(item[key])
-        for decl in native.returns:
-            if decl.name and decl.name in item:
-                raw[decl.name] = item[decl.name]
-        if raw:
-            out[op] = compute_op_derivatives(native, raw)
+        # Keys naming a forward output define the forward-mode (jvp)
+        # derivative; every other key is a backward gradient slot.  Named
+        # tuple-element keys are backward slots when the op's backward uses
+        # them and forward slots when the schema output carries the formula,
+        # so outputs with a declared name always route forward.
+        output_keys = {"result"}
+        output_keys.update(d.name for d in native.returns if d.name)
+        raw: dict[str, str] = {}
+        fw_raw: dict[str, str] = {}
+        for key, value in item.items():
+            if key in ("name", "dispatch", "output_differentiability") \
+                    or not isinstance(value, str):
+                continue
+            if key in output_keys and key not in {a.name for a in native.args}:
+                fw_raw[key] = _normalize_comparisons(value)
+            elif key == "self" or key in {a.name for a in native.args}:
+                raw[key] = _normalize_comparisons(value)
+            # Keys spelled with the schema's original arg spelling (e.g.
+            # ``abs_`` normalized to ``abs`` at parse time) do not match any
+            # parsed arg name and are ignored, as they always have been.
+        if raw or fw_raw:
+            out[op] = compute_op_derivatives(native, raw, fw_raw=fw_raw or None)
         elif item.get("output_differentiability") == [False]:
             # Non-differentiable output: register the autograd wrapper so the
             # dispatch chain resolves above the backend key, but emit no
@@ -599,7 +695,9 @@ def load_derivatives(path: str, native_by_opname: dict[str, NativeFunction]) \
             )
 
     # Manual (hand-written) backwards: register their saved-state layout so
-    # wrapper generation treats them uniformly.
+    # wrapper generation treats them uniformly.  Forward-mode formulas parsed
+    # from the yaml entry survive the overwrite: the hand-written node only
+    # replaces the backward side.
     for base, spec in MANUAL_DERIVATIVES.items():
         cand = [n for op, n in native_by_opname.items() if op.split(".")[0] == base]
         if not cand:
@@ -607,11 +705,15 @@ def load_derivatives(path: str, native_by_opname: dict[str, NativeFunction]) \
         native = sorted(cand, key=lambda n: len(n.overload_name))[0]
         saved = [a for a in native.args if a.name in spec["saved"]]
         members = [(a.name, node_member_type(a.type)) for a in saved]
+        prev = out.get(native.func_name)
         out[native.func_name] = OpDerivatives(
             func=native, node_name=spec.get("node", autograd_node_name(base)),
             formulas={}, grad_slots=native.tensor_args,
             members=members,
             used_input_names=set(spec["saved"]), used_output_names=set(),
+            fw_formulas=prev.fw_formulas if prev else {},
+            fw_required_tangent=prev.fw_required_tangent if prev else [],
+            fw_required_primal=prev.fw_required_primal if prev else [],
         )
     return out
 

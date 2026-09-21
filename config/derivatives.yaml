@@ -1,23 +1,40 @@
+# Each entry maps differentiable argument names to backward gradient
+# formulas.  A ``result:`` key additionally defines the forward-mode
+# derivative (jvp) of the output, written over each argument's primal
+# value "{arg}_p" and tangent "{arg}_t".  The two shortcut forms:
+#   auto_linear        - re-evaluate the op on the tangents of every
+#                        differentiable argument (linear ops);
+#   auto_element_wise  - reuse the backward formula with grad replaced
+#                        by the conjugated tangent and the argument by
+#                        its primal, conjugate-wrapped (single-input
+#                        element-wise ops).
 - name: permute(Tensor self, int[] dims) -> Tensor
   self: tensorplay::tpx::ops::permute_backward(grad, self, dims)
+  result: auto_linear
 
 - name: squeeze(Tensor self) -> Tensor
   self: tensorplay::tpx::ops::squeeze_backward(grad, self)
+  result: auto_linear
 
 - name: squeeze.dim(Tensor self, int dim) -> Tensor
   self: unsqueeze_to(grad, {dim}, self.shape())
+  result: auto_linear
 
 - name: squeeze.dims(Tensor self, int[] dim) -> Tensor
   self: unsqueeze_to(grad, dim, self.shape())
+  result: auto_linear
 
 - name: unsqueeze(Tensor self, int dim) -> Tensor
   self: grad.squeeze(dim)
+  result: auto_linear
 
 - name: transpose(Tensor self, int dim0, int dim1) -> Tensor
   self: grad.transpose(dim0, dim1)
+  result: auto_linear
 
 - name: t(Tensor self) -> Tensor
   self: grad.t()
+  result: auto_linear
 
 # The complex optimizer path uses the same storage-reinterpretation views as
 # views, so higher-order optimizer differentiation does not insert a copy.
@@ -44,6 +61,7 @@
 - name: add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
   self: grad
   other: maybe_multiply(grad, alpha)
+  result: self_t + maybe_multiply(other_t, alpha)
 
 # implementations.  Keep the same backward formulas as the functional
 # overloads; the generated wrapper attaches the new history to the mutated
@@ -76,6 +94,7 @@
 - name: sub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
   self: grad
   other: maybe_multiply(grad.neg(), alpha)
+  result: self_t - maybe_multiply(other_t, alpha)
 
 - name: sub_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)
   self: grad
@@ -87,6 +106,7 @@
 - name: mul.Tensor(Tensor self, Tensor other) -> Tensor
   self: mul_tensor_backward(grad, other, self.dtype())
   other: mul_tensor_backward(grad, self, other.dtype())
+  result: other_t * self_p + self_t * other_p
 
 - name: mul_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
   self: grad * ops::conj(other)
@@ -98,6 +118,7 @@
 - name: div.Tensor(Tensor self, Tensor other) -> Tensor
   self: div_tensor_self_backward(grad, other, self.dtype())
   other: div_tensor_other_backward(grad, self, other)
+  result: (self_t - other_t * result) / other_p
 
 - name: div_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
   self: grad / ops::conj(other)
@@ -154,9 +175,11 @@
 
 - name: neg(Tensor self) -> Tensor
   self: grad.neg()
+  result: auto_element_wise
 
 - name: add.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor
   self: grad
+  result: self_t.clone()
 
 - name: clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor
   self: clamp_backward(grad, self, min, max)
@@ -176,12 +199,15 @@
 
 - name: sub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor
   self: grad
+  result: auto_element_wise
 
 - name: mul.Scalar(Tensor self, Scalar other) -> Tensor
   self: grad * scalar_conj_if_complex(other)
+  result: self_t * other
 
 - name: div.Scalar(Tensor self, Scalar other) -> Tensor
   self: grad / scalar_conj_if_complex(other)
+  result: self_t / other
 
 - name: embedding(Tensor weight, Tensor indices, int padding_idx=-1, bool scale_grad_by_freq=false, bool sparse=false) -> Tensor
   weight: tensorplay::tpx::ops::embedding_dense_backward(grad, indices, weight.size(0), padding_idx, scale_grad_by_freq)
@@ -199,9 +225,11 @@
 
 - name: select.int(Tensor self, int dim, SymInt index) -> Tensor
   self: tensorplay::tpx::ops::select_backward(grad, self, dim, index)
+  result: auto_linear
 
 - name: slice.Tensor(Tensor self, int dim=0, SymInt? start=None, SymInt? end=None, SymInt step=1) -> Tensor
   self: tensorplay::tpx::ops::slice_backward(grad, self, dim, start, end, step)
+  result: auto_linear
 
 # The two scatter-back ops above are linear in grad_output, and their own
 # derivative is the gather they undo.  Without these entries the chain stops
@@ -236,6 +264,12 @@
 - name: mm(Tensor self, Tensor mat2) -> Tensor
   self: grad.mm(mat2.t())
   mat2: self.t().mm(grad)
+  result: mm(self_t, mat2_p) + mm(self_p, mat2_t)
+
+# matmul is bilinear, so the jvp is the two-sided product rule (matmul
+# broadcasts across vector/matrix/batch forms, which keeps each term valid).
+- name: matmul(Tensor self, Tensor other) -> Tensor
+  result: matmul(self_t, other_p) + matmul(self_p, other_t)
 
 # Native F.linear (CPU kernel; other backends fall through to the composite).
 # Per-slot compositions keep double-backward alive.
@@ -272,6 +306,7 @@
 - name: bmm(Tensor self, Tensor mat2) -> Tensor
   self: grad.matmul(mat2.transpose(-2, -1))
   mat2: self.transpose(-2, -1).matmul(grad)
+  result: bmm(self_t, mat2_p) + bmm(self_p, mat2_t)
 
 - name: baddbmm(Tensor self, Tensor batch1, Tensor batch2, *, Scalar beta=1, Scalar alpha=1) -> Tensor
   self: maybe_multiply(grad, beta)
@@ -281,6 +316,7 @@
 - name: mv(Tensor self, Tensor vec) -> Tensor
   self: grad.outer(vec)
   vec: self.t().mv(grad)
+  result: mv(self_t, vec_p) + mv(self_p, vec_t)
 
 - name: dot(Tensor self, Tensor tensor) -> Tensor
   self: grad * tensor
@@ -302,14 +338,17 @@
 
 - name: sin(Tensor self) -> Tensor
   self: grad * self.cos().conj()
+  result: auto_element_wise
 
 - name: cos(Tensor self) -> Tensor
   self: grad * -self.sin().conj()
+  result: auto_element_wise
 
 - name: abs(Tensor self) -> Tensor
   # |z| maps C->R; conj(conj(z)/|z|) == z/|z| == sgn(z), so the plain sgn form
   # already carries the conjugated Jacobian.
   self: grad * self.sign()
+  result: auto_element_wise
 
 # Rounding ops are piecewise-constant: zero gradient, but the entry keeps the
 # graph connected so consumers (e.g. grid_sample nearest d/dgrid) still get a
@@ -329,24 +368,29 @@
 
 - name: pow.Tensor_Scalar(Tensor self, Scalar exponent) -> Tensor
   self: pow_backward(grad, self, exponent)
+  result: auto_element_wise
 
 - name: exp(Tensor self) -> Tensor
   self: grad * result.conj()
+  result: auto_element_wise
 
 - name: log(Tensor self) -> Tensor
   self: grad / self.conj()
+  result: auto_element_wise
 
 - name: square(Tensor self) -> Tensor
   self: grad * 2 * self.conj()
 
 - name: sqrt(Tensor self) -> Tensor
   self: grad / (2 * result.conj())
+  result: auto_element_wise
 
 - name: rsqrt(Tensor self) -> Tensor
   self: -0.5 * grad * result.pow(3).conj()
 
 - name: sum(Tensor self, *, ScalarType dtype=Undefined) -> Tensor
   self: expand(grad, self.shape())
+  result: auto_linear
 
 - name: mean(Tensor self, *, ScalarType dtype=Undefined) -> Tensor
   # grad.expand(...) / N is equivalent; scalar div keeps broadcasting and
@@ -369,6 +413,7 @@
 
 - name: sum.dim_IntList(Tensor self, int[] dim, bool keepdim=false, *, ScalarType dtype=Undefined) -> Tensor
   self: _sum_dim_backward(grad, self, dim, keepdim)
+  result: auto_linear
 
 - name: reshape(Tensor self, int[] shape) -> Tensor
   self: grad.reshape(self.shape())
@@ -404,6 +449,7 @@
 
 - name: relu(Tensor self) -> Tensor
   self: threshold_backward(grad, result, 0)
+  result: auto_element_wise
 
 # max_pool2d / max_pool3d are Composite over *_with_indices (see the schema);
 # autograd records the with_indices node and uses its
@@ -566,12 +612,14 @@
 
 - name: sigmoid(Tensor self) -> Tensor
   self: sigmoid_backward(grad, result)
+  result: auto_element_wise
 
 - name: silu(Tensor self) -> Tensor
   self: silu_backward(grad, self)
 
 - name: tanh(Tensor self) -> Tensor
   self: tanh_backward(grad, result)
+  result: auto_element_wise
 
 - name: atan2(Tensor self, Tensor other) -> Tensor
   self: grad * other / (self * self + other * other)
@@ -1137,6 +1185,7 @@
 
 - name: expand(Tensor self, int[] size, *, bool implicit=False) -> Tensor
   self: sum_to_size(grad, self.shape())
+  result: auto_linear
 
 - name: repeat(Tensor self, int[] repeats) -> Tensor
   self: repeat_backward(grad, repeats, self.shape())
@@ -1531,3 +1580,9 @@
 
 - name: hash_tensor(Tensor self, int[1] dim=[], *, bool keepdim=False, int mode=0) -> Tensor
   output_differentiability: [False]
+
+# Dual-tensor creation for forward-mode AD: the dual aliases the primal, so
+# the backward node forwards the gradient to the primal unchanged.  The
+# tangent attachment itself happens in the native kernel.
+- name: _make_dual(Tensor(a) primal, Tensor tangent, int level) -> Tensor(a)
+  primal: grad
