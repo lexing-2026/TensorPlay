@@ -46,6 +46,7 @@
     :nosignatures:
 
     tensorplay.export.default_decompositions
+    tensorplay.export.dims
     tensorplay.export.draft_export
     tensorplay.export.export
     tensorplay.export.export_for_training

@@ -8,6 +8,7 @@
     :nosignatures:
 
     tensorplay.compiler.GraphCaptureError
+    tensorplay.compiler.InvalidBackend
     tensorplay.compiler.NestedCompileRegionOptions
 ```
 
