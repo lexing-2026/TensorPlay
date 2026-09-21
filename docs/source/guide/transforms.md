@@ -51,6 +51,77 @@ print(out.shape)   # (3, 28, 28)
 - **Type and range** — `Normalize` (center and scale each channel), `ConvertImageDtype`,
   `ToTensor` (convert a PIL or NumPy image into an int tensor in the `[0, 1]` range).
 
+## Random combinators
+
+Three wrappers turn plain transforms into randomized *policies*:
+
+- `RandomApply([t, ...], p)` — run the whole list with probability `p`, pass through
+  otherwise.
+- `RandomChoice([t1, t2, ...])` — pick one transform at random each call.
+- `RandomOrder([t1, t2, ...])` — run all of them, in a fresh random order each call.
+
+```python
+augment = T.RandomApply([T.ColorJitter(0.4, 0.4, 0.4)], p=0.5)
+img = tp.randn(3, 32, 32)
+print(augment(img).shape)     # (3, 32, 32) — either jittered or untouched
+
+policy = T.RandomChoice([T.Resize((16, 16)), T.Resize((8, 8))])
+print(policy(img).shape)      # (3, 16, 16) or (3, 8, 8), decided per call
+```
+
+Combinators nest: `T.RandomApply([T.RandomOrder([...]), ...])` composes the same way
+`Compose` does.
+
+## Reproducibility
+
+Random transforms draw from TensorPlay's global RNG, so seeding makes a pipeline
+reproducible:
+
+```python
+tp.manual_seed(42)
+a = T.RandomCrop(4)(tp.randn(3, 8, 8))
+
+tp.manual_seed(42)
+b = T.RandomCrop(4)(tp.randn(3, 8, 8))
+print(tp.equal(a, b))     # True — same seed, same input, same crop
+```
+
+In a multi-worker `DataLoader`, each worker's RNG is seeded deterministically from the
+base seed plus the worker id, so augmentations stay random *within* a run but reproducible
+*across* runs. See the [randomness note](../notes/randomness.md) for the details.
+
+## Transforms on batches
+
+Geometry transforms such as `Resize` accept a batched `(N, C, H, W)` tensor and map the
+same geometry over every image — handy for augmenting a whole batch in one call:
+
+```python
+batch = tp.randn(4, 3, 32, 32)
+print(T.Resize((16, 16))(batch).shape)    # (4, 3, 16, 16)
+```
+
+Random transforms applied to a batch still roll *one* random draw per call, so the whole
+batch gets the same flip or crop. If every image should get its own coin flip, apply the
+transform per-image inside `__getitem__` — which is the common pattern anyway.
+
+## The functional API
+
+Every transform is a thin object wrapper around a plain function in
+`tensorplay.vision.transforms.functional` — `Resize` calls `functional.resize`,
+`RandomHorizontalFlip` calls `functional.hflip`, and so on. Use the functions directly when
+you want the operation without the randomness or the class machinery:
+
+```python
+from tensorplay.vision.transforms import functional as F
+
+img = tp.randn(3, 32, 32)
+print(F.resize(img, [16, 16]).shape)     # (3, 16, 16)
+```
+
+The functional namespace is also where photometric operations such as `adjust_brightness`,
+`adjust_contrast`, `adjust_saturation`, `adjust_hue`, and `autocontrast` live, and where
+`InterpolationMode` (the `nearest`/`bilinear`/`bicubic` choice for resizing) is defined.
+
 ## Using a transform in a data pipeline
 
 Transforms are usually applied inside a dataset's `__getitem__` so every sample is preprocessed

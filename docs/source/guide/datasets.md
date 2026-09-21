@@ -64,6 +64,133 @@ need:
 - `pin_memory=True` — useful when you are training on a GPU; ask your data loader to put batches
   into pinned memory for faster transfer.
 
+## Choosing which samples to use: samplers
+
+`shuffle=True` randomizes order, but for anything more specific — a fixed random subset,
+weighted draws for imbalanced classes — pass a *sampler* instead. A sampler is an iterable of
+indices; the loader draws batches from it:
+
+```python
+from tensorplay.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
+
+data = TensorDataset(tp.arange(6))
+
+# draw 4 indices, with the first two classes excluded entirely (weight 0)
+weights = [0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+sampler = WeightedRandomSampler(weights, num_samples=4, replacement=True)
+loader = DataLoader(data, sampler=sampler)
+for (batch,) in loader:
+    print(batch)      # single-sample batches drawn from indices 2..5
+```
+
+The commonly used ones:
+
+- `RandomSampler(dataset)` — what `shuffle=True` does internally.
+- `SequentialSampler(dataset)` — indices `0..n-1` in order.
+- `SubsetRandomSampler(indices)` — shuffle within a fixed subset; the classic
+  train/validation split.
+- `WeightedRandomSampler(weights, num_samples)` — oversample rare classes.
+- `DistributedSampler(dataset)` — one shard per process; see the [DDP note](../notes/ddp.md).
+
+`sampler` and `shuffle` are mutually exclusive — passing both raises a `ValueError`. If you
+need full control over batch *composition*, `batch_sampler` takes an iterable of index lists,
+one per batch.
+
+## Building datasets out of datasets
+
+Four helpers turn existing datasets into new ones without copying data:
+
+```python
+from tensorplay.utils.data import ConcatDataset, StackDataset, Subset, TensorDataset
+
+ds = TensorDataset(tp.arange(10), tp.arange(10) * 10)
+
+sub = Subset(ds, [3, 1, 4])       # a view of three chosen indices
+print(sub[0])                     # the (3, 30) sample
+
+merged = ConcatDataset([ds, ds])  # end-to-end, length 20
+print(len(merged))
+
+paired = StackDataset(tp.arange(5), tp.arange(5) * 2)   # zip two equal-length tensors
+print(paired[2])                  # the (2, 4) sample
+```
+
+`Subset` is also how you carve a validation set out of one dataset:
+
+```python
+from tensorplay.utils.data import Subset
+
+n = len(ds)
+train_ds = Subset(ds, range(0, int(n * 0.8)))
+val_ds = Subset(ds, range(int(n * 0.8), n))
+```
+
+## Streaming data: `IterableDataset`
+
+When the data does not have a known length — a log file that keeps growing, a message queue,
+a generator — implement `IterableDataset` and define `__iter__` instead of `__len__` and
+`__getitem__`:
+
+```python
+from tensorplay.utils.data import DataLoader, IterableDataset
+
+class Countdown(IterableDataset):
+    def __iter__(self):
+        for i in range(10):
+            yield i
+
+loader = DataLoader(Countdown(), batch_size=4)
+print([batch.tolist() for batch in loader])
+# [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9]]
+```
+
+Iterable-style loaders cannot `shuffle` (there are no indices to permute); if you need
+randomization, shuffle inside `__iter__` yourself. Multi-worker loading needs care: each
+worker gets its own copy of the dataset and iterates *the whole stream*, so with
+`num_workers=2` every sample would arrive twice. Shard the stream by worker instead:
+
+```python
+from tensorplay.utils.data import DataLoader, IterableDataset, get_worker_info
+
+class Sharded(IterableDataset):
+    def __iter__(self):
+        info = get_worker_info()
+        start = 0 if info is None else info.id
+        step = 1 if info is None else info.num_workers
+        for i in range(start, 10, step):     # worker 0: 0,2,4,...; worker 1: 1,3,5,...
+            yield i
+
+loader = DataLoader(Sharded(), batch_size=4, num_workers=2)
+print(sorted(x for batch in loader for x in batch.tolist()))
+# [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] — every element exactly once
+```
+
+`get_worker_info()` returns `None` in the main process, which is why the single-process path
+falls back to a step of 1.
+
+## Custom collation
+
+Collation is the step that turns a list of samples into one batch. The default collate stacks
+tensors and passes numbers through, which covers most cases. When your samples do not fit
+that shape — variable-length sequences, nested dicts, PIL images — pass `collate_fn`:
+
+```python
+from tensorplay.utils.data import DataLoader, Dataset
+
+class Squares(Dataset):
+    def __len__(self):
+        return 8
+    def __getitem__(self, i):
+        return i
+
+loader = DataLoader(Squares(), batch_size=4, collate_fn=lambda batch: tp.tensor(batch) * 10)
+print([b.tolist() for b in loader])
+# [[0, 10, 20, 30], [40, 50, 60, 70]]
+```
+
+A collate function receives the *list* of samples for one batch and returns anything the
+training loop can consume — a tensor, a dict of tensors, a tuple of padded sequences.
+
 ## Loading images
 
 For image datasets, `tensorplay.vision.datasets` provides ready-made datasets such as `MNIST`

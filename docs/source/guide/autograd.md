@@ -90,6 +90,104 @@ loss.backward()   # loss is a scalar, fine
 
 If you backpropagate from a non-scalar tensor, pass a `gradient` argument of matching shape.
 
+```python
+x = tp.tensor([1.0, 2.0, 3.0], requires_grad=True)
+z = x * x                      # shape (3,) — not a scalar
+z.backward(tp.ones_like(z))     # tell backward the weights of each entry
+print(x.grad)                  # tensor([2., 4., 6.])
+```
+
+The `gradient` argument is the vector in the vector-Jacobian product: `.backward()` computes
+`grad_output @ J` where `J` is the Jacobian of the output with respect to the inputs. For a
+scalar loss the implicit vector is `1`, which is why plain `loss.backward()` needs nothing.
+
+## `tp.autograd.grad`: gradients without storing them
+
+`.backward()` writes into `.grad` as a side effect. When you want gradients as *values* —
+inside a computation, without touching any `.grad` field — use `tp.autograd.grad`:
+
+```python
+x = tp.tensor([1.0, 2.0], requires_grad=True)
+y = (x * x).sum()
+(g,) = tp.autograd.grad(y, x)
+print(g)          # tensor([2., 4.])
+print(x.grad)     # None — nothing was written
+```
+
+It takes the outputs, the inputs to differentiate with respect to, and returns one gradient
+per input.
+
+## Accumulation, and reusing the graph
+
+Gradients accumulate: each `.backward()` *adds* into `.grad`, which is what makes gradient
+accumulation over several small batches work — but it also means a stale `.grad` silently
+pollutes the next step, hence the `opt.zero_grad()` in every training loop.
+
+```python
+x = tp.tensor([3.0], requires_grad=True)
+y = x ** 3
+y.backward(retain_graph=True)
+print(x.grad)     # tensor([27.])
+y.backward(retain_graph=True)
+print(x.grad)     # tensor([54.]) — the two runs added up
+```
+
+By default the graph is freed once `backward()` has walked it. A second `backward()` on the
+same output is accepted but does nothing — there is no graph left to walk, so `.grad` keeps
+whatever the first run left there. Pass `retain_graph=True` when you need to differentiate
+the same computation more than once — gradient penalties, comparing loss weightings — and
+reset `x.grad` between runs if the accumulation is not wanted.
+
+## Second-order gradients
+
+`backward()` and `autograd.grad` accept `create_graph=True`, which builds the graph *for the
+gradient computation itself*. Differentiating that again gives you second derivatives:
+
+```python
+x = tp.tensor([3.0], requires_grad=True)
+y = x ** 3
+(dy_dx,) = tp.autograd.grad(y, x, create_graph=True)   # 3x², itself differentiable
+dy_dx.backward()
+print(x.grad)     # tensor([18.]) — d²y/dx² = 6x
+```
+
+This is the machinery behind gradient penalty regularization and some meta-learning methods;
+it costs roughly another level of graph, so use it where the math actually needs it.
+
+## Hooks: inspecting or rewriting gradients in flight
+
+`tensor.register_hook(fn)` calls `fn(grad)` with the gradient as it flows past that tensor
+during `backward()`. The hook's return value replaces the gradient, so you can debug (print,
+assert finiteness) or modify (scale, clip, zero out) on the fly:
+
+```python
+x = tp.tensor([2.0], requires_grad=True)
+y = x * 2
+y.register_hook(lambda grad: grad * 10)
+y.backward()
+print(x.grad)     # tensor([20.]) — the hook scaled the gradient tenfold
+```
+
+Hooks fire only during backward, in reverse order of the forward computation, and only for
+tensors that require grad.
+
+## `inference_mode`
+
+`no_grad` has a stricter sibling. Inside `tp.inference_mode()`, operations also skip
+version-counter bookkeeping, which makes the forward pass marginally cheaper still — the
+trade-off is that tensors produced there can never be used in autograd later, even after the
+block exits:
+
+```python
+x = tp.tensor([1.0], requires_grad=True)
+with tp.inference_mode():
+    y = x * 2
+print(y.requires_grad)    # False
+```
+
+Use `no_grad` when the values might feed back into training (e.g. target computation); use
+`inference_mode` for pure inference or data preprocessing at the edge of your program.
+
 ## A manual chain-rule check
 
 To see the graph rather than trust it, you can compute a gradient by hand and compare:

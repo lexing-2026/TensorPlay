@@ -84,6 +84,100 @@ print(f"accuracy: {correct / len(features):.2f}")
 stable. Add `nn.Sigmoid` after the last layer only when you want a probability, not when you
 are computing this loss.
 
+## A validation split
+
+Accuracy on training data flatters the model. Carve out a slice of the data, evaluate on it
+each epoch with the model switched to eval mode, and you will see whether the model is
+learning or memorizing:
+
+```python
+from tensorplay.utils.data import DataLoader, Subset, TensorDataset
+
+n_train = int(len(dataset) * 0.8)
+train_ds = Subset(dataset, range(0, n_train))
+val_ds = Subset(dataset, range(n_train, len(dataset)))
+train_loader = DataLoader(train_ds, batch_size=16, shuffle=True)
+val_loader = DataLoader(val_ds, batch_size=32)
+
+def evaluate(model, loader):
+    model.eval()                       # freeze dropout / batch statistics
+    correct = 0
+    with tp.no_grad():                 # no graph, no gradients
+        for batch_x, batch_y in loader:
+            pred = (model(batch_x) > 0).to(tp.int64)
+            correct += pred.eq(batch_y).sum().item()
+    model.train()                      # back to training mode
+    return correct / len(loader.dataset)
+
+print(f"val accuracy: {evaluate(model, val_loader):.2f}")
+```
+
+The two mode switches are the part people forget: `model.eval()` before measuring,
+`model.train()` before the next epoch. The `Subset`/`DataLoader` split shown here is the
+whole recipe — no separate framework machinery needed.
+
+## Learning-rate schedules
+
+Almost every optimizer benefits from a learning rate that changes over training — large
+early, small late. `tensorplay.optim.lr_scheduler` holds the standard shapes. A scheduler
+wraps an optimizer and mutates its learning rate each time you step it:
+
+```python
+import tensorplay.optim as optim
+
+opt = optim.Adam(model.parameters(), lr=0.02)
+scheduler = optim.lr_scheduler.StepLR(opt, step_size=2, gamma=0.5)
+
+for epoch in range(6):
+    print(epoch, opt.param_groups[0]['lr'])   # what this epoch will use
+    for batch_x, batch_y in train_loader:
+        opt.zero_grad()
+        loss = loss_fn(model(batch_x), batch_y)
+        loss.backward()
+        opt.step()
+    scheduler.step()    # after the epoch's optimizer steps
+```
+
+The learning rates across the six epochs are `0.02, 0.02, 0.01, 0.01, 0.005, 0.005` —
+halved every two epochs. The rule for ordering: call `scheduler.step()` *after*
+`opt.step()`, once per epoch for epoch-schedulers like these. Also available:
+`MultiStepLR` (drop at named epochs), `ExponentialLR` (decay every step), `CosineAnnealingLR`
+(smooth cosine decay, a modern default), `OneCycleLR` (warm up then anneal, stepped per
+*batch*), `LambdaLR` (your own function), `ReduceLROnPlateau` (drop when a metric stops
+improving — the one scheduler that takes the metric, `scheduler.step(val_loss)`), and
+combinators `SequentialLR`/`ChainedScheduler`.
+
+## Gradient clipping
+
+Recurrent models and unstable configurations can produce a batch with an enormous gradient,
+and one wild step can throw the weights somewhere the optimizer never recovers from.
+`clip_grad_norm_` rescales the gradient vector to a maximum length, *between* `backward()`
+and `opt.step()`:
+
+```python
+from tensorplay.nn.utils import clip_grad_norm_
+
+x = tp.tensor([3.0, 4.0], requires_grad=True)
+loss = (x * x).sum()
+loss.backward()
+total = clip_grad_norm_(x, max_norm=1.0)
+print(total.item())    # 10.0 — the norm before clipping
+print(x.grad)          # [0.6, 0.8] — rescaled to length 1
+```
+
+The returned value is the pre-clip total norm, which is worth logging: a steadily growing
+norm is an early warning of divergence. `clip_grad_value_` is the cruder sibling that cuts
+each element into a fixed range instead of scaling the whole vector.
+
+A training loop with both additions looks like:
+
+```python
+loss.backward()
+clip_grad_norm_(model.parameters(), max_norm=1.0)
+opt.step()
+scheduler.step()
+```
+
 ## Move to a device
 
 Inputs, targets, and the model should all live on the same device. `.to(device)` moves a
