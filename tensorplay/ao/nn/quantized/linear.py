@@ -21,10 +21,16 @@ __all__ = ["QuantizedLinear"]
 class QuantizedLinear(nn.Module):
     """Applies a linear transformation on a quantized input with QInt8 weights.
 
-    out_q[m, n] = requantize( input_scale * weight_scales[n] *
-                sum_k (x_q[m,k] - input_zero_point) *
-                      (w_q[n,k] - weight_zero_points[n]) + bias[n] )
-    under (out_scale, out_zero_point).
+    The fused computation is::
+
+        out_q[m, n] = requantize(
+            input_scale * weight_scales[n]
+            * sum_k (x_q[m,k] - input_zero_point)
+            * (w_q[n,k] - weight_zero_points[n])
+            + bias[n]
+        )
+
+    under the output affine parameters (out_scale, out_zero_point).
     """
 
     def __init__(self, in_features, out_features, input_scale,

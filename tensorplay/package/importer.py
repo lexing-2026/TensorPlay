@@ -61,19 +61,20 @@ class Importer(ABC):
 
         Args:
             obj: An object to get the module-environment-relative name for.
-            name: If set, use this name instead of looking up __name__ or __qualname__ on `obj`.
-                This is only here to match how Pickler handles __reduce__ functions that return a string,
+            name: If set, use this name instead of looking up ``__name__`` or
+                ``__qualname__`` on ``obj``. This is only here to match how
+                Pickler handles ``__reduce__`` functions that return a string,
                 don't use otherwise.
         Returns:
-            A tuple (parent_module_name, attr_name) that can be used to retrieve `obj` from this environment.
-            To use it::
+            A tuple (parent_module_name, attr_name) that can be used to retrieve
+            ``obj`` from this environment. To use it::
 
                 mod = importer.import_module(parent_module_name)
                 obj = getattr(mod, attr_name)
 
         Raises:
-            ObjNotFoundError: we couldn't retrieve `obj` by name.
-            ObjMisMatchError: we found a different object with the same name as `obj`.
+            ObjNotFoundError: we couldn't retrieve ``obj`` by name.
+            ObjMisMatchError: we found a different object with the same name as ``obj``.
         """
         if name is None and obj and _Pickler.dispatch.get(type(obj)) is None:
             # Honor the string return variant of __reduce__, which will give us

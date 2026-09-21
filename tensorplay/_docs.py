@@ -14359,3 +14359,155 @@ Apply :func:`tensorplay.{unary_base_func_name}` to each Tensor of the input list
 Apply :func:`tensorplay.{unary_base_func_name}` to each Tensor of the input list.
         """,
         )
+
+
+add_docstr(
+    tensorplay.Tensor.add_,
+    r"""
+add_(other, *, alpha=1) -> Tensor
+
+In-place version of :meth:`tensorplay.Tensor.add`
+""",
+)
+
+add_docstr(
+    tensorplay.Tensor.sub_,
+    r"""
+sub_(other, *, alpha=1) -> Tensor
+
+In-place version of :meth:`tensorplay.Tensor.sub`
+""",
+)
+
+add_docstr(
+    tensorplay.Tensor.subtract_,
+    r"""
+subtract_(other, *, alpha=1) -> Tensor
+
+In-place version of :meth:`tensorplay.Tensor.subtract`
+""",
+)
+
+add_docstr(
+    tensorplay.Tensor.div_,
+    r"""
+div_(value, *, rounding_mode=None) -> Tensor
+
+In-place version of :meth:`tensorplay.Tensor.div`
+""",
+)
+
+add_docstr(
+    tensorplay.Tensor.divide_,
+    r"""
+divide_(value, *, rounding_mode=None) -> Tensor
+
+In-place version of :meth:`tensorplay.Tensor.divide`
+""",
+)
+
+add_docstr(
+    tensorplay.Tensor.scatter_,
+    r"""
+scatter_(dim, index, src=None, *, value=None, reduce=None) -> Tensor
+
+Writes values from :attr:`src` (or the scalar :attr:`value`) into this tensor
+at the positions picked by :attr:`index` along :attr:`dim`; the remaining
+coordinates of each written element come from its position inside
+:attr:`index`. With :attr:`reduce` set to ``"add"`` or ``"multiply"``
+(:obj:`None` by default), a destination that receives several values
+accumulates them instead of keeping the last one. Returns :attr:`self`.
+""",
+)
+
+add_docstr(
+    tensorplay.Tensor.scatter_reduce_,
+    r"""
+scatter_reduce_(dim, index, src, reduce, *, include_self=True) -> Tensor
+
+Reduces the values of :attr:`src` into this tensor at the positions picked by
+:attr:`index` along :attr:`dim`, applying the reduction named by
+:attr:`reduce`: ``"sum"``, ``"prod"``, ``"mean"``, ``"amax"`` or ``"amin"``.
+When :attr:`include_self` is False, the original value of each destination
+element takes no part in the reduction. Returns :attr:`self`.
+""",
+)
+
+add_docstr(
+    tensorplay.Tensor.bernoulli_,
+    r"""
+bernoulli_(p=0.5, *, generator=None) -> Tensor
+
+Fills each element of this tensor with an independent sample from the
+Bernoulli distribution with success probability :attr:`p`, which may be a
+scalar or a tensor of per-element probabilities. The tensor may hold an
+integral dtype; each sample is written as 0 or 1.
+""",
+)
+
+add_docstr(
+    tensorplay.Tensor.dsplit,
+    r"""
+dsplit(split_size_or_sections) -> List of Tensors
+
+Splits a tensor of at least three dimensions into views along the third
+axis. :attr:`split_size_or_sections` is either the number of equal sections
+or the list of sizes of each section.
+
+See :func:`tensorplay.dsplit`
+""",
+)
+
+add_docstr(
+    tensorplay.Tensor.hsplit,
+    r"""
+hsplit(split_size_or_sections) -> List of Tensors
+
+Splits a tensor of at least two dimensions into views along the second
+axis. :attr:`split_size_or_sections` is either the number of equal sections
+or the list of sizes of each section.
+
+See :func:`tensorplay.hsplit`
+""",
+)
+
+add_docstr(
+    tensorplay.Tensor.vsplit,
+    r"""
+vsplit(split_size_or_sections) -> List of Tensors
+
+Splits a tensor of at least two dimensions into views along the first
+axis. :attr:`split_size_or_sections` is either the number of equal sections
+or the list of sizes of each section.
+
+See :func:`tensorplay.vsplit`
+""",
+)
+
+add_docstr(
+    tensorplay.Tensor.tensor_split,
+    r"""
+tensor_split(indices_or_sections, dim=0) -> List of Tensors
+
+Splits this tensor into several views along :attr:`dim`.
+:attr:`indices_or_sections` is either the number of equal sections, the list
+of boundary indices at which the split happens, or a 0-dimensional integer
+tensor holding those boundaries.
+
+See :func:`tensorplay.tensor_split`
+""",
+)
+
+add_docstr(
+    tensorplay.linalg_diagonal,
+    r"""
+linalg_diagonal(A, *, offset=0, dim1=-2, dim2=-1) -> Tensor
+
+Returns a view of the diagonals of :attr:`A`: the two dimensions selected by
+:attr:`dim1` and :attr:`dim2` are collapsed into the trailing axis of the
+output, holding the entries of the diagonal shifted by :attr:`offset`
+(positive shifts above, negative below the main diagonal).
+
+See :func:`tensorplay.diagonal`
+""",
+)
