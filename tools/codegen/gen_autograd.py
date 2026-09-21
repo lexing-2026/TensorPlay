@@ -664,19 +664,46 @@ def load_derivatives(path: str, native_by_opname: dict[str, NativeFunction]) \
         # so outputs with a declared name always route forward.
         output_keys = {"result"}
         output_keys.update(d.name for d in native.returns if d.name)
+        arg_names = {a.name for a in native.args}
         raw: dict[str, str] = {}
         fw_raw: dict[str, str] = {}
+
+        def split_names(raw_names: str) -> tuple[str, ...]:
+            """Given "foo, bar", return ("foo", "bar")."""
+            return tuple(x.strip() for x in raw_names.split(","))
+
         for key, value in item.items():
             if key in ("name", "dispatch", "output_differentiability") \
                     or not isinstance(value, str):
                 continue
-            if key in output_keys and key not in {a.name for a in native.args}:
-                fw_raw[key] = _normalize_comparisons(value)
-            elif key == "self" or key in {a.name for a in native.args}:
-                raw[key] = _normalize_comparisons(value)
-            # Keys spelled with the schema's original arg spelling (e.g.
-            # ``abs_`` normalized to ``abs`` at parse time) do not match any
-            # parsed arg name and are ignored, as they always have been.
+            names = split_names(key)
+            formula = _normalize_comparisons(value)
+            for name in names:
+                if name in arg_names and name in output_keys:
+                    raise ValueError(
+                        f"Derivative key '{name}' for '{op}' names both a "
+                        f"schema argument and an output")
+            # A key naming schema arguments assigns the backward gradient
+            # slots; any other key defines the forward-mode (jvp) derivative
+            # and must name declared outputs.  An unmatchable key is a stale
+            # schema spelling and fails the generation instead of silently
+            # dropping that gradient.
+            if names[0] in arg_names:
+                for name in names:
+                    if name not in arg_names:
+                        raise ValueError(
+                            f"Derivative key '{key}' for '{op}' mixes the "
+                            f"argument '{names[0]}' with the unknown name "
+                            f"'{name}'")
+                    raw[name] = formula
+            else:
+                for name in names:
+                    if name not in output_keys:
+                        raise ValueError(
+                            f"Unknown derivative key '{key}' for '{op}': "
+                            f"'{name}' is neither a schema argument "
+                            f"{sorted(arg_names)} nor a declared output")
+                    fw_raw[name] = formula
         if raw or fw_raw:
             out[op] = compute_op_derivatives(native, raw, fw_raw=fw_raw or None)
         elif item.get("output_differentiability") == [False]:

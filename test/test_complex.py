@@ -364,6 +364,42 @@ class TestAutograd(unittest.TestCase):
         self.assertFalse(c is r)
         np.testing.assert_allclose(c.numpy(), r.numpy())
 
+    def test_polar_grads_match_torch(self):
+        # Both parameter gradients must be produced (a stale schema spelling
+        # used to leave the magnitude gradient unregistered) and both must be
+        # real, matching the conjugated-cotangent adjoint of r*exp(i*theta).
+        rng = np.random.RandomState(31)
+        rho = tp.tensor(rng.rand(6).astype(np.float32) + 0.5, requires_grad=True)
+        theta = tp.tensor(rng.rand(6).astype(np.float32) - 0.5, requires_grad=True)
+        c = _cplx(6, 32)
+        g_rho, g_theta = tp.autograd.grad(tp.polar(rho, theta), [rho, theta],
+                                          grad_outputs=_to_tp(c))
+        self.assertFalse(g_rho.dtype.is_complex)
+        self.assertFalse(g_theta.dtype.is_complex)
+        rho_t = _to_th(rho.detach().numpy()).requires_grad_(True)
+        theta_t = _to_th(theta.detach().numpy()).requires_grad_(True)
+        g_rho_t, g_theta_t = torch.autograd.grad(
+            torch.polar(rho_t, theta_t), [rho_t, theta_t], grad_outputs=_to_th(c))
+        _assert_np_close(self, g_rho.numpy(), g_rho_t.numpy(), atol=1e-5)
+        _assert_np_close(self, g_theta.numpy(), g_theta_t.numpy(), atol=1e-5)
+
+    def test_polar_forward_jvp_matches_torch(self):
+        from tensorplay.autograd.functional import jvp as functional_jvp
+        rng = np.random.RandomState(33)
+        rho = tp.tensor(rng.rand(4).astype(np.float32) + 0.5)
+        theta = tp.tensor(rng.rand(4).astype(np.float32) - 0.5)
+        dr = tp.tensor(rng.randn(4).astype(np.float32) * 0.3)
+        dtheta = tp.tensor(rng.randn(4).astype(np.float32) * 0.3)
+        out, tang = functional_jvp(lambda a, b: tp.polar(a, b), (rho, theta),
+                                   (dr, dtheta), mode="forward")
+        out_t, tang_t = torch.autograd.functional.jvp(
+            lambda a, b: torch.polar(a, b),
+            (_to_th(rho.numpy()), _to_th(theta.numpy())),
+            (_to_th(dr.numpy()), _to_th(dtheta.numpy())))
+        _assert_np_close(self, out.detach().numpy(), out_t.numpy(), atol=1e-5)
+        _assert_np_close(self, tang.detach().numpy(),
+                         tang_t.resolve_conj().numpy(), atol=1e-5)
+
 
 class TestDtypePromotions(unittest.TestCase):
     def test_promotion_rules(self):

@@ -997,10 +997,12 @@
 - name: adjoint(Tensor self) -> Tensor
   self: grad.adjoint()
 
-# polar(r, theta) = r * exp(i*theta): dr = cos(theta)*grad; dtheta = -r*sin(theta)*grad
-- name: polar(Tensor abs_, Tensor angle) -> Tensor
-  abs_: grad * cos(angle)
-  angle: -(abs_ * grad * sin(angle))
+# polar(r, theta) = r * exp(i*theta).  For real perturbations d(r, theta) the
+# differential is dr*(cos(theta) + i*sin(theta)) + dtheta*r*(-sin(theta) + i*cos(theta)).
+- name: polar(Tensor abs, Tensor angle) -> Tensor
+  abs: real(grad.conj() * (result / result.abs()))
+  angle: -imag(grad.conj() * result)
+  result: complex(abs_t * cos(angle) - angle_t * abs_p * sin(angle), abs_t * sin(angle) + angle_t * abs_p * cos(angle))
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
