@@ -465,6 +465,7 @@ PYBIND11_MODULE(_C, m) {
 #endif
     init_filecheck(m);
     init_cuda_graph(m);
+    init_cuda_jiterator(m);
 
     m.def("_DTensor_compute_global_tensor_info",
           &dtensor_compute_global_tensor_info,

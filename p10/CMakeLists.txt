@@ -181,6 +181,8 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/CUDAGenerator.cpp
         src/backend/cuda/CUDARuntime.cpp
         src/backend/cuda/CUDAGraph.cpp
+        src/backend/cuda/JitUtils.cpp
+        src/backend/cuda/Jiterator.cpp
         src/backend/cuda/CuFFTPlanCache.cpp
         src/backend/cuda/CUDAGraphKernels.cu
         src/backend/cuda/CUDARuntimeKernels.cu
@@ -855,7 +857,7 @@ if(USE_VULKAN)
     add_dependencies(p10 vulkan_spv_gen)
 endif()
 if(USE_CUDA)
-    target_link_libraries(p10 PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cufft CUDA::cusolver)
+    target_link_libraries(p10 PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cufft CUDA::cusolver CUDA::nvrtc CUDA::cuda_driver)
     # CUPTI headers live in the toolkit's extras/CUPTI/include, which the
     # plain toolkit include dirs do not cover; the imported target does.
     if(TARGET CUDA::cupti)
