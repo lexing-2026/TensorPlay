@@ -52,6 +52,32 @@ results (or the heuristic default where none are recorded) and performs no
 measurement — the right mode for production replay. Turning tuning on as
 well makes the first run double as the measurement pass.
 
+## Environment variables
+
+Launch-time configuration is available for runs whose code cannot call the
+API. The variables are read once, when the tuning context is first touched
+(the first API call or the first GEMM that consults it), and set the
+initial state; any later API call overrides them.
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `TP_TUNABLEOP_ENABLED` | initial state of the master switch | off |
+| `TP_TUNABLEOP_TUNING` | initial state of the measurement switch | on |
+| `TP_TUNABLEOP_RECORD_UNTUNED` | initial state of untuned logging | off |
+| `TP_TUNABLEOP_VERBOSE` | initial state of diagnostic logging | off |
+| `TP_TUNABLEOP_MAX_TUNING_DURATION_MS` | per-candidate time budget | `30` |
+| `TP_TUNABLEOP_MAX_TUNING_SAMPLES` | per-candidate sample budget | `100` |
+| `TP_TUNABLEOP_FILENAME` | results file; the device ordinal is embedded as with an explicit `set_filename` call | `tunableop_results<device>.csv` |
+
+Boolean values accept `1`/`true`/`on` and `0`/`false`/`off`
+(case-insensitive); a value that does not parse is reported with a warning
+and ignored. A typical production deployment sets two variables and nothing
+else:
+
+```bash
+TP_TUNABLEOP_ENABLED=1 TP_TUNABLEOP_FILENAME=/shared/tunableop_results.csv python train.py
+```
+
 ## File input and output
 
 The first time a GEMM consults the context, the results database is
@@ -79,6 +105,14 @@ The "Validator" lines record the file format generation, the device and the
 cuBLASLt build a winner was measured on. `read_file` rejects a file whose
 validators do not match the current build and device, since its entries
 would no longer describe runnable choices.
+
+A recorded winner whose configuration no longer runs on the current build
+is not treated as authoritative either: with tuning enabled the shape is
+measured again and the stale entry is replaced in the database and
+rewritten in the file, so the file heals on the next run instead of
+accumulating dead lines. With tuning disabled, or under a CUDA graph
+capture, the library heuristic's top choice runs instead. Verbose logging
+reports every such rejection.
 
 Each result line consists of four comma-separated fields: operator name,
 operator parameters, kernel identifier and average execution time. The file
@@ -126,6 +160,34 @@ capture runs the library heuristic's top choice, pinned for the process, so
 eager reruns stay bit-identical to the captured replay. A signature with a
 recorded winner keeps using it under capture, since that choice is already
 fixed.
+
+## Measured effect
+
+`benchmark/bench_cuda_tunable.py` compares, per shape, the default dispatch
+(in-process selection), a tuning run and a replay run, each in a fresh
+process. On a GeForce RTX 3090 the recorded winners replay with no
+steady-state penalty, and the per-shape first-call cost collapses because
+the candidate measurement is skipped entirely:
+
+| Shape (m×n×k, dtype) | Default first call | Replay first call |
+| --- | --- | --- |
+| 4096×4096×4096 float32 | 278 ms | 5.9 ms |
+| 8192×4096×4096 float32 + bias | 464 ms | 12 ms |
+| 4096×11008×4096 float16 + bias | 221 ms | 102 ms |
+| 512×4096×4096 float16 + bias | 111 ms | 104 ms |
+| 256×256×256 float64 + bias | 21 ms | 23 ms |
+
+First-call times exclude one-time CUDA and library initialization. The
+remaining first-call cost of the half-precision shapes is dominated by
+loading that precision's kernels, which every mode pays once.
+
+Steady-state throughput is unchanged on these shapes: the replay process
+matches the default's per-iteration time, because the in-process selection
+already lands on nearly the same algorithm as the larger tuning budget.
+TunableOp's value here is the removed startup measurement and the
+cross-process reuse, not a faster kernel. The tuning pass itself is the
+most expensive first call — the default budget allows up to 30 ms of
+measurement per candidate — and is paid once per shape per machine.
 
 ## API
 
