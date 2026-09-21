@@ -273,7 +273,7 @@ else:
                 f"parallel work has started")
 from .serialization import save, load, inspect_checkpoint
 from .serialization import archive as _serialization_archive
-from .random import fork_rng
+from .random import fork_rng, thread_safe_generator
 
 # -------------------------------------------------------------------------
 # DType Aliases
@@ -400,12 +400,24 @@ preserve_format = MemoryFormat.PRESERVE
 channels_last = MemoryFormat.CHANNELS_LAST
 channels_last_3d = MemoryFormat.CHANNELS_LAST_3D
 
+# The enum class under its lowercase alias, plus the historical name for the
+# contiguous format kept for source compatibility.
+memory_format = MemoryFormat
+legacy_contiguous_format = contiguous_format
+
+# Link-time capabilities of the compiled backend.
+has_lapack = True
+has_spectral = True
+compiled_with_cxx11_abi = True
+
 
 __all__ = [
     "Tensor", "tensor", "from_dlpack", "Scalar", "SymInt", "SymBool", "SymFloat",
     "sym_float", "sym_int", "sym_not", "sym_min", "sym_max", "sym_ite", "sym_sum",
     "DeviceType", "device", "dtype", "Size",
     "MemoryFormat", "contiguous_format", "preserve_format", "channels_last", "channels_last_3d",
+    "memory_format", "legacy_contiguous_format",
+    "has_lapack", "has_spectral", "compiled_with_cxx11_abi",
     "Layout", "sparse_coo", "sparse_csr", "sparse_csc", "sparse_bsr", "sparse_bsc", "strided",
     "uint8", "int8", "int16", "uint16", "uint32", "uint64", "int32", "int64",
     "float16", "bfloat16", "float32", "float64", "complex32", "complex64", "complex128", "bcomplex32", "bool",
@@ -423,7 +435,7 @@ __all__ = [
     "default_generator", "manual_seed", "seed", "initial_seed", "Generator",
     "UntypedStorage",
     "is_storage",
-    "get_rng_state", "set_rng_state", "fork_rng",
+    "get_rng_state", "set_rng_state", "fork_rng", "thread_safe_generator",
     "DeviceMismatchError",
     "__config__",
 ]
@@ -1145,20 +1157,32 @@ import collections as _collections
 
 _max_return_type = _collections.namedtuple("max_return_type", ["values", "indices"])
 _min_return_type = _collections.namedtuple("min_return_type", ["values", "indices"])
+_cummax_return_type = _collections.namedtuple("cummax_return_type", ["values", "indices"])
+_cummin_return_type = _collections.namedtuple("cummin_return_type", ["values", "indices"])
+_kthvalue_return_type = _collections.namedtuple("kthvalue_return_type", ["values", "indices"])
+_median_return_type = _collections.namedtuple("median_return_type", ["values", "indices"])
+_mode_return_type = _collections.namedtuple("mode_return_type", ["values", "indices"])
+_nanmedian_return_type = _collections.namedtuple("nanmedian_return_type", ["values", "indices"])
+_sort_return_type = _collections.namedtuple("sort_return_type", ["values", "indices"])
+_topk_return_type = _collections.namedtuple("topk_return_type", ["values", "indices"])
+_aminmax_return_type = _collections.namedtuple("aminmax_return_type", ["min", "max"])
 
 
 def max(input, *args, dim=None, keepdim=False):
     # ``args`` carries the elementwise partner of the two-argument form, or
     # the ``(dim, keepdim)`` pair when a recorded graph replays the native
     # call form.  ``dim``/``keepdim`` stay keyword-only for the public API.
+    # A bare integer in the second slot is the reduction dimension.
     if len(args) == 2:
         result = _C.max(input, args[0], args[1])
         if not isinstance(result, tuple):
             return result
         return _max_return_type(*result)
     other = args[0] if args else None
-    if other is not None:
+    if other is not None and not isinstance(other, builtins.int):
         return _C.maximum(input, other)
+    if other is not None:
+        dim = other
     if dim is not None:
         result = _C.max(input, dim, keepdim)
         # A graph value stands for the whole multi-output call: consumers
@@ -1178,14 +1202,254 @@ def min(input, *args, dim=None, keepdim=False):
             return result
         return _min_return_type(*result)
     other = args[0] if args else None
-    if other is not None:
+    if other is not None and not isinstance(other, builtins.int):
         return _C.minimum(input, other)
+    if other is not None:
+        dim = other
     if dim is not None:
         result = _C.min(input, dim, keepdim)
         if not isinstance(result, tuple):
             return result
         return _min_return_type(*result)
     return functional.min(input)
+
+
+def _wrap_multi_output(type_factory, positional_dims=1):
+    """Rebuild a multi-output native call so eager results carry field names.
+
+    Graph values stand for the whole multi-output call and are returned
+    untouched, mirroring the max/min convention above.
+    """
+    def wrapper(input, *args, **kwargs):
+        result = getattr(functional, wrapper.__name__)(input, *args, **kwargs)
+        if not isinstance(result, tuple):
+            return result
+        return type_factory(*result)
+    wrapper.__name__ = type_factory.__name__.removesuffix("_return_type")
+    wrapper.__qualname__ = wrapper.__name__
+    return wrapper
+
+
+cummax = _wrap_multi_output(_cummax_return_type)
+cummin = _wrap_multi_output(_cummin_return_type)
+kthvalue = _wrap_multi_output(_kthvalue_return_type)
+mode = _wrap_multi_output(_mode_return_type)
+sort = _wrap_multi_output(_sort_return_type)
+topk = _wrap_multi_output(_topk_return_type)
+nanmedian = _wrap_multi_output(_nanmedian_return_type)
+
+
+def aminmax(input, *args, **kwargs):
+    result = functional.aminmax(input, *args, **kwargs)
+    if not isinstance(result, tuple):
+        return result
+    return _aminmax_return_type(*result)
+
+
+def median(input, *args, **kwargs):
+    # Without a dimension the reduction collapses to a single value; the
+    # dimension form returns the (values, indices) pair.
+    result = functional.median(input, *args, **kwargs)
+    if not isinstance(result, tuple):
+        return result
+    return _median_return_type(*result)
+
+
+# ---------------------------------------------------------------------------
+# Legacy linear-algebra faces. The removed functions keep their exact
+# migration text; lu/qr stay functional behind a deprecation warning.
+# ---------------------------------------------------------------------------
+from ._linalg_utils import (  # noqa: E402
+    eig as eig,
+    lstsq as lstsq,
+    matrix_rank as matrix_rank,
+    solve as solve,
+    _symeig as symeig,
+)
+
+
+def lu(A, pivot=True, get_infos=False, out=None):
+    """Computes a LU factorization of ``A``.
+
+    .. deprecated::
+        Use :func:`tensorplay.linalg.lu_factor` instead.
+    """
+    import warnings as _warnings
+    _warnings.warn(
+        "tensorplay.lu is deprecated in favor of tensorplay.linalg.lu_factor / "
+        "tensorplay.linalg.lu_factor_ex and will be removed in a future release.\n"
+        "LU, pivots = tensorplay.lu(A, compute_pivots)\n"
+        "should be replaced with\n"
+        "LU, pivots = tensorplay.linalg.lu_factor(A, compute_pivots)\n"
+        "and\n"
+        "LU, pivots, info = tensorplay.lu(A, compute_pivots, get_infos=True)\n"
+        "should be replaced with\n"
+        "LU, pivots, info = tensorplay.linalg.lu_factor_ex(A, compute_pivots)",
+        stacklevel=2,
+    )
+    from tensorplay import linalg as _linalg
+    if get_infos:
+        LU, pivots, info = _linalg.lu_factor_ex(A, pivot=pivot, check_errors=False)
+        result = (LU, pivots, info)
+    else:
+        LU, pivots = _linalg.lu_factor(A, pivot=pivot)
+        result = (LU, pivots)
+    if out is not None:
+        if len(out) != len(result):
+            raise TypeError(
+                f"expected tuple of {len(result)} elements but got {len(out)}"
+            )
+        for i in builtins.range(len(result)):
+            out[i].resize_as_(result[i]).copy_(result[i])
+        return out
+    return result
+
+
+def qr(A, mode="reduced", *, out=None):
+    """Computes the QR decomposition of ``A``.
+
+    .. deprecated::
+        Use :func:`tensorplay.linalg.qr` instead; the boolean ``some``
+        parameter is now the string ``mode``.
+    """
+    import warnings as _warnings
+    _warnings.warn(
+        "tensorplay.qr is deprecated in favor of tensorplay.linalg.qr and will "
+        "be removed in a future release.\n"
+        "The boolean parameter 'some' has been replaced with a string "
+        "parameter 'mode'.\n"
+        "Q, R = tensorplay.qr(A, some)\n"
+        "should be replaced with\n"
+        "Q, R = tensorplay.linalg.qr(A, 'reduced' if some else 'complete')",
+        stacklevel=2,
+    )
+    from tensorplay import linalg as _linalg
+    result = _linalg.qr(A, mode=mode)
+    if out is not None:
+        if len(out) != 2:
+            raise TypeError(f"expected tuple of 2 elements but got {len(out)}")
+        for i in builtins.range(2):
+            out[i].resize_as_(result[i]).copy_(result[i])
+        return out
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Sparse legacy matmuls: each is a thin routing over the sparse namespace.
+# ---------------------------------------------------------------------------
+def spmm(mat1, mat2):
+    """Matrix product of a sparse COO/CSR matrix ``mat1`` with dense ``mat2``."""
+    from tensorplay import sparse as _sparse
+    return _sparse.mm(mat1, mat2)
+
+
+def dsmm(mat1, mat2):
+    """Matrix product of a dense matrix ``mat1`` with sparse ``mat2``.
+
+    The sparse backend has no transposed product yet, so ``mat2`` is
+    materialized for this legacy face; prefer the ``@`` operator or the
+    sparse namespace for large operands.
+    """
+    return mat1 @ mat2.to_dense()
+
+
+def hsmm(mat1, mat2):
+    """Hybrid matrix product: dense ``mat1`` by sparse ``mat2``, dense result."""
+    return dsmm(mat1, mat2)
+
+
+def saddmm(input, mat1, mat2, *, beta=1, alpha=1, out=None):
+    """``beta * input + alpha * (mat1 @ mat2)`` with sparse ``mat1`` and dense
+    ``mat2``; ``input`` is a sparse matrix.
+
+    A zero ``beta`` drops ``input`` entirely, so the sparse operand never goes
+    through a dense copy on that path.
+    """
+    from tensorplay import sparse as _sparse
+    if beta == 0:
+        result = _sparse.mm(mat1, mat2)
+        if alpha != 1:
+            result = result * alpha
+    else:
+        result = _sparse.addmm(input.to_dense(), mat1, mat2, beta=beta, alpha=alpha)
+    if out is not None:
+        out.resize_as_(result).copy_(result)
+        return out
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Autocast state queries/setters that round out the public surface.
+# ---------------------------------------------------------------------------
+def is_autocast_cpu_enabled() -> builtins.bool:
+    r"""Reports whether autocast is enabled on CPU."""
+    return _C.is_autocast_enabled("cpu")
+
+
+def set_autocast_cpu_enabled(enabled: builtins.bool) -> None:
+    r""" Enables or disables autocast for the CPU. """
+    _C.set_autocast_enabled("cpu", enabled)
+
+
+def set_autocast_cpu_dtype(dtype) -> None:
+    r"""Sets the autocast dtype for the CPU to ``dtype``."""
+    if dtype not in (bfloat16, float16):
+        raise ValueError(
+            "Supported CPU autocast dtypes are bfloat16 and float16; "
+            f"got {dtype}"
+        )
+    _C.set_autocast_dtype("cpu", dtype)
+
+
+def set_autocast_gpu_dtype(dtype) -> None:
+    r"""Sets the autocast dtype for CUDA to ``dtype``."""
+    if dtype not in (bfloat16, float16):
+        raise ValueError(
+            "Supported CUDA autocast dtypes are bfloat16 and float16; "
+            f"got {dtype}"
+        )
+    _C.set_autocast_dtype("cuda", dtype)
+
+
+# ---------------------------------------------------------------------------
+# Futures and device-module helpers.
+# ---------------------------------------------------------------------------
+def wait(future):
+    """Waits on the future and returns its value when it completes."""
+    return future.wait()
+
+
+@functools.cache
+def get_device_module(device=None):
+    """Returns the module associated with a given device
+    (e.g. ``tensorplay.device('cuda')``, ``"cpu"``).
+
+    If no device is given, return the module for the current accelerator, or
+    CPU if no accelerator is present.
+    """
+    if isinstance(device, Device):
+        device_module_name = device.type
+    elif isinstance(device, str):
+        device_module_name = Device(device).type
+    elif device is None:
+        from . import accelerator as _accelerator
+        device_module_name = _accelerator.current_accelerator().type
+    else:
+        raise RuntimeError(
+            f"Invalid value of device '{device}', expect tensorplay.device, str, or None"
+        )
+    device_module = globals().get(device_module_name, None)
+    if device_module is None:
+        try:
+            device_module = importlib.import_module(f".{device_module_name}", __name__)
+        except ModuleNotFoundError:
+            device_module = None
+    if device_module is None:
+        raise RuntimeError(
+            f"Device '{device_module_name}' does not have a corresponding module "
+            f"registered as 'tensorplay.{device_module_name}'."
+        )
+    return device_module
 
 
 def gradient(input, *, spacing=None, dim=None, edge_order=1):
@@ -1258,23 +1522,39 @@ else:
         "_dynamo",
         "accelerator",
         "audio",
+        "cpu",
         "export",
         "func",
+        "distributions",
         "fft",
         "linalg",
         "ao",
         "contrib",
+        "masked",
         "monitor",
         "nested",
+        "package",
+        "return_types",
+        "signal",
         "sparse",
         "special",
+        "testing",
         "vision",
+    }
+
+    # Public single names that live inside a lazily loaded module.
+    _lazy_attrs = {
+        "vmap": ("func", "vmap"),
+        "OutOfMemoryError": ("cuda", "OutOfMemoryError"),
     }
 
     def __getattr__(name):
         # Lazy modules
         if name in _lazy_modules:
             return importlib.import_module(f".{name}", __name__)
+        if name in _lazy_attrs:
+            module, attr = _lazy_attrs[name]
+            return getattr(importlib.import_module(f".{module}", __name__), attr)
         raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
