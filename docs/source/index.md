@@ -74,6 +74,7 @@ package
 export
 compiler
 quantization
+pruning
 notes/index
 _stax
 stax
