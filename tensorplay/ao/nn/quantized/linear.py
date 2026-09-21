@@ -120,17 +120,28 @@ class QuantizedLinear(nn.Module):
         input_zero_point = int(input_zero_point)
         weight = float_module.weight.detach()
         out_features, in_features = weight.shape
-        min_vals, max_vals = tensorplay.aminmax(weight, dim=list(range(1, weight.dim())), keepdim=False)
-        # Per-output-channel affine params from each row's observed range.
-        scales = []
-        zero_points = []
-        for n in range(out_features):
-            s, z = ObserverBase._calculate_qparams(float(min_vals[n]),
-                                                   float(max_vals[n]))
-            scales.append(s)
-            zero_points.append(z)
-        scales_t = tensorplay.as_tensor(scales, dtype=tensorplay.float32)
-        zero_points_t = tensorplay.as_tensor(zero_points, dtype=tensorplay.int64)
+        fake_quant = getattr(float_module, "weight_fake_quant", None)
+        if fake_quant is not None:
+            # A QAT module was trained against its fake-quantize grid; bake
+            # that exact grid in instead of re-deriving one from the weight.
+            # The extra call warms the observer in case the module never ran.
+            fake_quant(weight)
+            scales_t, zero_points_t = fake_quant.calculate_qparams()
+            scales_t = tensorplay.as_tensor(scales_t, dtype=tensorplay.float32)
+            zero_points_t = tensorplay.as_tensor(zero_points_t,
+                                                 dtype=tensorplay.int64)
+        else:
+            min_vals, max_vals = tensorplay.aminmax(weight, dim=list(range(1, weight.dim())), keepdim=False)
+            # Per-output-channel affine params from each row's observed range.
+            scales = []
+            zero_points = []
+            for n in range(out_features):
+                s, z = ObserverBase._calculate_qparams(float(min_vals[n]),
+                                                       float(max_vals[n]))
+                scales.append(s)
+                zero_points.append(z)
+            scales_t = tensorplay.as_tensor(scales, dtype=tensorplay.float32)
+            zero_points_t = tensorplay.as_tensor(zero_points, dtype=tensorplay.int64)
         # Kernel operands must live on the weights' device.
         scales_t = scales_t.to(weight.device)
         zero_points_t = zero_points_t.to(weight.device)
