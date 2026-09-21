@@ -1054,6 +1054,24 @@ static std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cpu_impl(
         ? weight_opt->dtype() : stats_dtype_for(input.dtype());
     if (want_bias) grad_bias = Tensor::empty({C}, grad_param_dtype, input.device());
 
+    // The backward helpers address elements by linear offset, so the input
+    // and the incoming gradient must be materialized in the memory layout the
+    // chosen kernel expects. A broadcast/expanded gradient (as produced by a
+    // reduction's backward) would otherwise be read with contiguous indexing
+    // and yield garbage parameter gradients.
+    Tensor grad_out_c, input_c;
+    if (is_channels_last(input)) {
+        const int64_t cl_format =
+            input.dim() == 4
+                ? static_cast<int64_t>(MemoryFormat::ChannelsLast)
+                : static_cast<int64_t>(MemoryFormat::ChannelsLast3d);
+        grad_out_c = grad_output.contiguous(cl_format);
+        input_c = input.contiguous(cl_format);
+    } else {
+        grad_out_c = grad_output.contiguous();
+        input_c = input.contiguous();
+    }
+
     // Resolve mean/invstd (recompute in training mode, running stats in eval).
     std::vector<double> mean(C), invstd(C);
     if (save_mean_opt) {
@@ -1063,8 +1081,8 @@ static std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cpu_impl(
         }
     } else if (training) {
         std::vector<double> var(C);
-        if (is_channels_last(input)) bn_stats_channels_last(input, mean, var);
-        else bn_stats_contiguous(input, mean, var);
+        if (is_channels_last(input_c)) bn_stats_channels_last(input_c, mean, var);
+        else bn_stats_contiguous(input_c, mean, var);
         for (int64_t c = 0; c < C; ++c) invstd[c] = 1.0 / std::sqrt(var[c] + eps);
     } else {
         for (int64_t c = 0; c < C; ++c) {
@@ -1076,11 +1094,11 @@ static std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cpu_impl(
         }
     }
 
-    if (is_channels_last(input))
-        bn_backward_channels_last(grad_output, input, weight_opt, mean, invstd,
+    if (is_channels_last(input_c))
+        bn_backward_channels_last(grad_out_c, input_c, weight_opt, mean, invstd,
                                   training, grad_input, grad_weight, grad_bias);
     else
-        bn_backward_contiguous(grad_output, input, weight_opt, running_mean_opt,
+        bn_backward_contiguous(grad_out_c, input_c, weight_opt, running_mean_opt,
                                running_var_opt, mean, invstd, training,
                                grad_input, grad_weight, grad_bias);
 
