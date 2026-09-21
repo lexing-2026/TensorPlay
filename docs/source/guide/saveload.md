@@ -28,6 +28,58 @@ is the learned values. A `.mega` file stores tensors and JSON primitives, so it 
 hold `state_dict`s rather than whole module objects — you always rebuild the architecture and
 load the weights into it.
 
+## What `state_dict` contains
+
+Parameters, plus every *persistent* buffer. A buffer is module state that is tracked and
+moved with the model but not learned — BatchNorm's running statistics are the standard
+example. Buffers registered with `persistent=False` are deliberately excluded:
+
+```python
+class Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(4, 2)
+        self.register_buffer("running", tp.zeros(3))                    # saved
+        self.register_buffer("scratch", tp.zeros(3), persistent=False)  # not saved
+
+net = Net()
+print(list(net.state_dict().keys()))
+# ['running', 'fc.weight', 'fc.bias']
+```
+
+So a checkpoint restores everything the architecture itself does not reconstruct: learned
+weights *and* accumulated statistics. See [Models](models.md) for buffers in general.
+
+## Loading part of a model
+
+`load_state_dict` is strict by default: the keys must match exactly, and a mismatch raises
+with a report of what is missing and what is unexpected. `strict=False` relaxes that, which
+is exactly what transfer learning needs — keep the pretrained backbone's weights, let a new
+head keep its fresh initialization:
+
+```python
+backbone = nn.Sequential(nn.Linear(784, 128), nn.ReLU())
+head = nn.Linear(128, 10)
+model = nn.Sequential(backbone, head)
+
+# a checkpoint holding only the backbone's weights
+result = backbone.load_state_dict(backbone.state_dict(), strict=False)
+print(result.missing_keys, result.unexpected_keys)   # [] []
+
+# going the other way: keys in the file that no module wants are skipped
+dst = nn.Linear(4, 2)
+src_sd = dict(nn.Linear(4, 2).state_dict())
+src_sd["extra"] = tp.zeros(1)
+result = dst.load_state_dict(src_sd, strict=False)
+print(result.unexpected_keys)   # ['extra']
+print(result.missing_keys)      # [] — everything else loaded
+```
+
+`load_state_dict` never raises on mismatch under `strict=False`; it returns an
+`_IncompatibleKeys` object so you can inspect `missing_keys` and `unexpected_keys` yourself.
+If keys went missing that you *expected* to load, the architecture does not line up with the
+checkpoint — fix that first, because silently re-initialized layers train from scratch.
+
 ## What the `.mega` file holds
 
 `tp.save` writes a `.mega` file that can store tensors, and plain Python values (numbers,
