@@ -910,7 +910,10 @@ class FSDPParam:
                 for index in range(count)
             ]
             rank = int(mesh_info.mesh.get_local_rank(mesh_dim))
-            pieces[rank] = local
+            # Detached so no backward edge leads from the unsharded parameter
+            # back into the local shard; gradients are captured and reduced
+            # centrally instead of deposited raw by the graph.
+            pieces[rank] = local.detach()
             return tp.cat(tuple(pieces), dim=0)
         local_shape = tuple(int(value) for value in local.shape)
         if local_shape != padded_size:
@@ -928,7 +931,13 @@ class FSDPParam:
             for index in range(count)
         ]
         rank = int(mesh_info.mesh.get_local_rank(mesh_dim))
-        pieces[rank] = local
+        # The local piece must enter the gathered result detached: keeping it
+        # graph-connected would let backward deposit a raw, un-reduced slice
+        # of the unsharded gradient straight onto the sharded parameter,
+        # bypassing (and corrupting) the reduce-scatter that owns gradient
+        # reduction.  The unsharded gradient is captured by the registered
+        # hook and reduced centrally instead.
+        pieces[rank] = local.detach()
         return tp.cat(tuple(pieces), dim=shard_dim)
 
     def to_sharded(self) -> None:
@@ -951,7 +960,12 @@ class FSDPParam:
             raise RuntimeError("unsharded parameter storage is unavailable")
         if isinstance(full_tensor, DTensor):
             full_tensor = full_tensor.to_local()
-        self._make_sharded_storage(full_tensor.detach(), self.mesh_info)
+        # Copy this rank's slice of the unsharded values back into the
+        # persistent sharded storage.  The sharded parameter object itself
+        # must stay the same instance every cycle: optimizers and other
+        # holders capture it once, so re-creating it would leave them
+        # stepping orphaned tensors with no gradients.
+        self._copy_unsharded_into_sharded_storage(full_tensor.detach())
         self._unsharded_param = None
         self._full_tensor = None
         self._sharded_post_forward_tensor = None
@@ -959,6 +973,31 @@ class FSDPParam:
         self._sharded_post_forward_param = None
         self._setattr_on_modules(self.sharded_param)
         self._state = ShardedState.SHARDED
+
+    def _copy_unsharded_into_sharded_storage(self, param_data: Any) -> None:
+        shard_dim = int(self._placement.dim) if isinstance(self._placement, Shard) else 0
+        world_size, rank = self._shard_count_and_rank(self.mesh_info)
+        if not hasattr(self, "_sharded_param_data") or self._sharded_param_data is None:
+            self._make_sharded_storage(param_data, self.mesh_info)
+            return
+        chunks = _chunk_with_empty(param_data, world_size, dim=shard_dim)
+        selected = chunks[rank]
+        padded_size = tuple(int(value) for value in self.padded_sharded_param_size)
+        padded = self._sharded_param_data.view(padded_size)
+        if getattr(padded, "device", None) is not None and str(
+            getattr(padded, "device", "")
+        ) != str(getattr(param_data, "device", "")):
+            param_data = param_data.to(padded.device)
+            chunks = _chunk_with_empty(param_data, world_size, dim=shard_dim)
+            selected = chunks[rank]
+        # Storage recycling: the copy writes the values that were just
+        # gathered (or deliberately modified under a full-parameter summon)
+        # back where they live, which must not advance the mutation counter
+        # saved-tensor checks compare against.
+        with tp.autograd._unsafe_preserve_version_counter(self.sharded_param):
+            if int(selected.numel()) > 0:
+                length = int(selected.shape[shard_dim])
+                padded.narrow(shard_dim, 0, length).copy_(selected)
 
     def to_sharded_post_forward(self) -> None:
         if self.post_forward_mesh_info is None:
@@ -1141,7 +1180,10 @@ class FSDPParam:
             for _ in range(count)
         ]
         dist.all_gather(outputs, padded_local.detach(), group=group)
-        outputs[local_rank] = padded_local
+        # Detached for the same reason as in the all-gather attach path: the
+        # gradient of the unsharded parameter is captured and reduced
+        # centrally, so no graph edge may lead back into the local shard.
+        outputs[local_rank] = padded_local.detach()
         result = tp.cat(tuple(outputs), dim=dim)
         total_padding = count * width - logical_size
         return unpad_tensor(result, dim, total_padding)

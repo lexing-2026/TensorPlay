@@ -592,7 +592,9 @@ class FullyShardedDataParallel(Module):
         else:
             source = optim_state_dict
         wrappers = FullyShardedDataParallel.fsdp_modules(model)
-        use_orig_params = bool(getattr(wrappers[0], "use_orig_params", False)) if wrappers else False
+        use_orig_params = FullyShardedDataParallel._engine_keeps_orig_params(
+            wrappers
+        )
         flattened = _flatten_optim_state_dict(
             source,
             model=model,
@@ -609,6 +611,27 @@ class FullyShardedDataParallel(Module):
             using_optim_input,
             is_named_optimizer,
         )
+
+    @staticmethod
+    def _engine_keeps_orig_params(wrappers: list[Module]) -> bool:
+        """Whether the sharding engine manages parameters individually.
+
+        The per-parameter engine keeps every original parameter (so optimizer
+        state stays per-parameter); only a flat-parameter engine needs the
+        merged single-key state format.
+        """
+        if not wrappers:
+            return False
+        for wrapper in wrappers:
+            if bool(getattr(wrapper, "use_orig_params", False)):
+                return True
+            state = getattr(wrapper, "_fsdp_state", None)
+            if state is None:
+                getter = getattr(wrapper, "_get_fsdp_state", None)
+                state = getter() if callable(getter) else None
+            if getattr(state, "_fsdp_param_groups", None) is not None:
+                return True
+        return False
 
     @staticmethod
     def set_state_dict_type(module: Module, state_dict_type: StateDictType, state_dict_config: StateDictConfig | None = None, optim_state_dict_config: OptimStateDictConfig | None = None) -> StateDictSettings:

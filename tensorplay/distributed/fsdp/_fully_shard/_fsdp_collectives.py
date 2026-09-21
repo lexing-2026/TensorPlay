@@ -429,7 +429,11 @@ def foreach_all_gather_copy_out(all_gather_result: AllGatherResult, fsdp_params:
         end = offset + width
         if end > int(output_rows.shape[1]):
             raise ValueError("all-gather output is smaller than the parameter outputs")
-        target_view.view(world_size, -1).copy_(output_rows[:, offset:end])
+        # Copy into the recycled all-gather output storages: the version
+        # counters must stay at the value autograd saved with the previous
+        # unshard cycle's views, so wrap the copy.
+        with tp.autograd._unsafe_preserve_version_counter(tuple(all_gather_outputs)):
+            target_view.view(world_size, -1).copy_(output_rows[:, offset:end])
         offset = end
     if offset != int(output_rows.shape[1]):
         raise ValueError("all-gather output has unused elements")
@@ -458,7 +462,12 @@ def foreach_all_gather_copy_out(all_gather_result: AllGatherResult, fsdp_params:
         post_size[shard_dim] *= world_size
         for source, target in zip(param_outputs, param.all_gather_outputs):
             chunks = source.view(tuple(pre_size)).chunk(world_size, dim=0)
-            target.view(tuple(post_size)).copy_(tp.cat(tuple(chunks), dim=shard_dim))
+            with tp.autograd._unsafe_preserve_version_counter(
+                tuple(param.all_gather_outputs)
+            ):
+                target.view(tuple(post_size)).copy_(
+                    tp.cat(tuple(chunks), dim=shard_dim)
+                )
 
 
 def foreach_reduce(
@@ -636,8 +645,15 @@ def foreach_reduce(
                 ),
                 storage_offset=flat_grad_offset,
             )
+            # Accumulate only into a gradient the caller has not consumed yet
+            # (gradient accumulation across microbatches).  The check must
+            # read the parameter's ``.grad`` and not a framework-private
+            # copy: a stale private copy would silently add the previous
+            # step's already-consumed gradient into every later step.
+            to_accumulate_grad = (
+                getattr(fsdp_param._sharded_local_tensor(), "grad", None) is not None
+            )
             if getattr(fsdp_param, "offload_to_cpu", False):
-                old_grad = getattr(fsdp_param, "_sharded_grad", None)
                 has_post_accumulate_grad_hook = bool(
                     getattr(
                         fsdp_param._sharded_local_tensor(),
@@ -647,7 +663,7 @@ def foreach_reduce(
                 )
                 non_blocking = bool(
                     getattr(fsdp_param, "pin_memory", False)
-                    and old_grad is None
+                    and not to_accumulate_grad
                     and not has_post_accumulate_grad_hook
                 )
                 new_sharded_grad = new_sharded_grad.to(
@@ -655,10 +671,10 @@ def foreach_reduce(
                 )
                 if non_blocking:
                     fsdp_param.grad_offload_event = _record_event(post_reduce_stream)
-            else:
-                old_grad = getattr(fsdp_param, "_sharded_grad", None)
-            if old_grad is not None:
-                new_sharded_grad = old_grad + new_sharded_grad
+            if to_accumulate_grad:
+                new_sharded_grad = (
+                    fsdp_param._sharded_local_tensor().grad + new_sharded_grad
+                )
             fsdp_param._set_sharded_grad(new_sharded_grad)
             flat_grad_offset += math.prod(padded_size) // world_size
         post_reduce_event = _record_event(post_reduce_stream)

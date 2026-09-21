@@ -317,7 +317,12 @@ class FSDPParamGroup:
                 )
                 param.alloc_all_gather_outputs()
                 output = param.all_gather_outputs[0]
-                output.copy_(value)
+                # The all-gather output tensor is recycled across unshard
+                # cycles while autograd may still hold the unsharded view that
+                # aliases it, so the re-population must not advance the
+                # version counter saved-tensor checks compare against.
+                with tp.autograd._unsafe_preserve_version_counter(output):
+                    output.copy_(value)
                 results.append(
                     AllGatherResult(output, _record_event(_current_stream(self.device)))
                 )
@@ -405,12 +410,10 @@ class FSDPParamGroup:
             old_local = param._gradient_hook_param
             old_grad = getattr(old_local, "grad", None)
             param.to_sharded()
-            from tensorplay.nn.parameter import Parameter
-
-            local = Parameter(
-                param._sharded_local_tensor(),
-                requires_grad=param.param.requires_grad,
-            )
+            # Reuse the persistent sharded parameter instance instead of
+            # wrapping a fresh one: holders (optimizers, hooks) captured it
+            # once and must keep seeing gradients and steps.
+            local = param.sharded_param
             if old_grad is not None and tuple(old_grad.shape) == tuple(local.shape):
                 local.grad = old_grad.detach().clone()
             param.bind_local_param(local)
