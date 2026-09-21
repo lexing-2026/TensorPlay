@@ -48,6 +48,17 @@ reductions never execute a promotion at all.  ``max``/``min`` propagate NaN in
 both the vector and the cross-lane step, and ``mean`` divides the completed
 sum by the reduced element count.
 
+The variance family (``var``/``std``) accumulates online moments: every
+accumulator carries ``(mean, m2, weight)``, so a partial over any sub-range
+merges with any other by the parallel-moments formula instead of
+re-deriving either side's mean.  Vector lanes, cascade levels, and split
+worker slots all hold such triples, and each merge level is pairwise, giving
+the same ``O(log n)`` error shape the sum cascade has.  The Bessel-style
+``correction`` is subtracted from the completed weight once, at the end:
+``m2 / (weight - correction)``, which reproduces the reference edge cases
+(a single element with correction one divides by zero and yields NaN).
+``std`` takes the square root of that quotient.
+
 Parallelism
 -----------
 
@@ -102,7 +113,7 @@ _LEVELS = 4
 _MAX_LANES = 16
 
 # Reduction spellings the float program can express.
-_REDUCE_OPS = ("sum", "mean", "max", "min", "amax", "amin", "prod")
+_REDUCE_OPS = ("sum", "mean", "prod", "max", "min", "amax", "amin", "var", "std")
 
 _VEC_COMBINE = {
     "sum": "({a} + {b})",
@@ -140,6 +151,8 @@ def _family(op: str) -> str:
         return "min"
     if op in ("sum", "mean"):
         return "sum"
+    if op in ("var", "std"):
+        return "moments"
     return op
 
 
@@ -158,7 +171,13 @@ def _identity(op: str) -> str:
 def _cascades(op: str) -> bool:
     """Whether this reduction accumulates through the cascade stack."""
 
-    return _family(op) == "sum"
+    return _family(op) in ("sum", "moments")
+
+
+def _is_moments(op: str) -> bool:
+    """Whether this reduction accumulates online (mean, m2, weight) triples."""
+
+    return _family(op) == "moments"
 
 
 def _finalize_scalar(op: str, value: str, red: int) -> str:
@@ -171,13 +190,35 @@ def _finalize_vector(op: str, value: str, red: int) -> str:
     return f"({value} / V((float){red}L))" if op == "mean" else value
 
 
+def _moments_denominator(correction: int) -> str:
+    # The correction subtracts from the completed weight once; a quotient of
+    # zero over zero (single element, correction one) stays NaN, matching the
+    # reference reduction's arithmetic rather than clamping it.
+    return f"(float)({int(correction)}LL)"
+
+
+def _moments_final_scalar(op: str, m2: str, weight: str, correction: int) -> str:
+    value = f"({m2} / ({weight} - {_moments_denominator(correction)}))"
+    return f"std::sqrt({value})" if op == "std" else value
+
+
+def _moments_final_vector(op: str, m2: str, weight: str, correction: int) -> str:
+    value = f"({m2} / ({weight} - V({_moments_denominator(correction)})))"
+    return f"({value}).sqrt()" if op == "std" else value
+
+
 @dataclass(frozen=True)
 class ReduceSpec:
-    """One reduction: an operation, the reduced axes, and the output rank."""
+    """One reduction: an operation, the reduced axes, and the output rank.
+
+    ``correction`` is the variance family's Bessel-style degrees-of-freedom
+    subtraction; every other family ignores it.
+    """
 
     op: str
     dims: tuple[int, ...]
     keepdim: bool
+    correction: int = 0
 
     def normalized(self, rank: int) -> "ReduceSpec | None":
         """Resolve negative axes; reject duplicates and out-of-range axes."""
@@ -192,7 +233,9 @@ class ReduceSpec:
             if value < 0 or value >= rank or value in resolved:
                 return None
             resolved.append(value)
-        return ReduceSpec(self.op, tuple(sorted(resolved)), self.keepdim)
+        return ReduceSpec(
+            self.op, tuple(sorted(resolved)), self.keepdim, int(self.correction)
+        )
 
 
 @dataclass(frozen=True)
@@ -377,6 +420,115 @@ def _cascade_flush(op: str, indent: str, groups: int) -> list[str]:
     ]
 
 
+def _moments_decl(indent: str, groups: int) -> list[str]:
+    """Declare one online-moments accumulator per group."""
+
+    lines: list[str] = []
+    for group in range(groups):
+        lines.append(f"{indent}V mmean{group} = V(0.0f);")
+        lines.append(f"{indent}V mm2_{group} = V(0.0f);")
+        lines.append(f"{indent}V mw_{group} = V(0.0f);")
+        lines.append(f"{indent}long mn{group} = 0;")
+    return lines
+
+
+def _moments_setup(op: str, blocks_expr: str, indent: str, groups: int) -> list[str]:
+    """Declare the moments cascade stack and its promotion period."""
+
+    if not _is_moments(op):
+        return []
+    depth = (_LEVELS - 1) * groups
+    return [
+        f"{indent}long lp_ = tp_ceil_log2({blocks_expr}) / {_LEVELS}L;",
+        f"{indent}if (lp_ < 4L) lp_ = 4L;",
+        f"{indent}const long level_power = lp_;",
+        f"{indent}const long level_mask = (1L << level_power) - 1L;",
+        f"{indent}long blk_ = 0;",
+        f"{indent}V mlv_m_[{depth}];",
+        f"{indent}V mlv_s_[{depth}];",
+        f"{indent}V mlv_w_[{depth}];",
+        f"{indent}long mlv_n_[{depth}];",
+        f"{indent}for (int li_ = 0; li_ < {depth}; ++li_) {{",
+        f"{indent}    mlv_m_[li_] = V(0.0f); mlv_s_[li_] = V(0.0f);"
+        " mlv_w_[li_] = V(0.0f);",
+        f"{indent}    mlv_n_[li_] = 0;",
+        f"{indent}}}",
+    ]
+
+
+def _moments_step(indent: str, group: int, value: str) -> list[str]:
+    """Fold one full vector into a group's accumulator.
+
+    With the incoming point at weight one, the parallel-moments merge
+    collapses to ``mean += delta / (n + 1)`` and
+    ``m2 += delta^2 * n / (n + 1)``, one scalar reciprocal per vector.
+    """
+
+    return [
+        f"{indent}++mn{group};",
+        f"{indent}const V mr{group} = V(1.0f / (float)mn{group});",
+        f"{indent}const V md{group} = {value} - mmean{group};",
+        f"{indent}mmean{group} = mmean{group} + md{group} * mr{group};",
+        f"{indent}mm2_{group} = mm2_{group}"
+        f" + md{group} * md{group} * (V(1.0f) - mr{group});",
+        f"{indent}mw_{group} = mw_{group} + V(1.0f);",
+    ]
+
+
+def _moments_tick(op: str, indent: str, groups: int) -> list[str]:
+    """Promote finished chunks up the moments cascade stack."""
+
+    if not _is_moments(op):
+        return []
+    accs_m = ", ".join(f"mmean{group}" for group in range(groups))
+    accs_s = ", ".join(f"mm2_{group}" for group in range(groups))
+    accs_w = ", ".join(f"mw_{group}" for group in range(groups))
+    lines = [
+        f"{indent}++blk_;",
+        f"{indent}if ((blk_ & level_mask) == 0) {{",
+        f"{indent}    const V maccs_m_[{groups}] = {{{accs_m}}};",
+        f"{indent}    const V maccs_s_[{groups}] = {{{accs_s}}};",
+        f"{indent}    const V maccs_w_[{groups}] = {{{accs_w}}};",
+        f"{indent}    tp_moments_promote<{groups}>("
+        "mlv_m_, mlv_s_, mlv_w_, mlv_n_, maccs_m_, maccs_s_, maccs_w_,"
+        " mn0, blk_, level_power, level_mask);",
+    ]
+    for group in range(groups):
+        lines.append(
+            f"{indent}    mmean{group} = V(0.0f); mm2_{group} = V(0.0f);"
+            f" mw_{group} = V(0.0f); mn{group} = 0;"
+        )
+    lines.append(f"{indent}}}")
+    return lines
+
+
+def _moments_flush(op: str, indent: str, groups: int) -> list[str]:
+    """Fold the moments cascade stack back into the accumulators."""
+
+    if not _is_moments(op):
+        return []
+    lines: list[str] = []
+    for level in range(_LEVELS - 1):
+        base = level * groups
+        lines.append(f"{indent}if (mlv_n_[{base}] != 0L) {{")
+        for group in range(groups):
+            idx = base + group
+            lines.append(
+                f"{indent}    const TP_MomentsV mf{level}_{group}_ ="
+                " tp_moments_v("
+                f"TP_MomentsV{{mmean{group}, mm2_{group}, mw_{group}}},"
+                f" TP_MomentsV{{mlv_m_[{idx}], mlv_s_[{idx}],"
+                f" mlv_w_[{idx}]}});"
+            )
+            lines.append(
+                f"{indent}    mmean{group} = mf{level}_{group}_.mean;"
+                f" mm2_{group} = mf{level}_{group}_.m2;"
+                f" mw_{group} = mf{level}_{group}_.w;"
+            )
+        lines.append(f"{indent}}}")
+    return lines
+
+
 def _open_reduced_nest(
     dims: tuple[tuple[int, int], ...],
     indent: str,
@@ -450,6 +602,17 @@ def _emit_horizontal(
     a chunk of the reduction.
     """
 
+    if _is_moments(op):
+        return _emit_moments_horizontal(
+            plan,
+            op,
+            program,
+            indent,
+            inner_range=inner_range,
+            outer_range=outer_range,
+            blocks_expr=blocks_expr,
+        )
+
     outer_dims = plan.red_dims[:-1]
     lines: list[str] = []
     for group in range(_ILP):
@@ -510,6 +673,98 @@ def _emit_horizontal(
     return lines
 
 
+def _emit_moments_horizontal(
+    plan: LoopPlan,
+    op: str,
+    program: dict[str, Any],
+    indent: str,
+    *,
+    inner_range: tuple[str, str],
+    outer_range: tuple[str, str] | None,
+    blocks_expr: str,
+) -> list[str]:
+    """Accumulate one row's online moments; leave them in ``accw_``.
+
+    Group weights drift apart whenever the single-vector or tail stages ran,
+    and tail lanes carry no weight at all, so the cross-group and cross-lane
+    folds run scalar-wise through the guarded combine: idle lanes merge as
+    the identity instead of dividing zero by zero.
+    """
+
+    outer_dims = plan.red_dims[:-1]
+    lines: list[str] = []
+    lines.extend(_moments_decl(indent, _ILP))
+    lines.extend(_moments_setup(op, blocks_expr, indent, _ILP))
+
+    open_lines, offset, body = _open_reduced_nest(
+        outer_dims, indent, outer_range if outer_dims else None
+    )
+    lines.extend(open_lines)
+
+    start, end = inner_range
+    lines.append(f"{body}long i = {start};")
+    lines.append(f"{body}for (; i + {_ILP}L * W <= {end}; i += {_ILP}L * W) {{")
+    lane = body + "    "
+    results: list[str] = []
+    for group in range(_ILP):
+        lane_offset = (
+            f"{offset} + i" if group == 0 else f"{offset} + i + {group}L * W"
+        )
+        group_lines, result = _emit_program(
+            program, lane, lane_offset, "W", f"_l{group}"
+        )
+        lines.extend(group_lines)
+        results.append(result)
+    for group, result in enumerate(results):
+        lines.extend(_moments_step(lane, group, result))
+    lines.extend(_moments_tick(op, lane, _ILP))
+    lines.append(f"{body}}}")
+
+    lines.append(f"{body}for (; i + W <= {end}; i += W) {{")
+    step_lines, result = _emit_program(program, lane, f"{offset} + i", "W", "_s")
+    lines.extend(step_lines)
+    lines.extend(_moments_step(lane, 0, result))
+    lines.append(f"{body}}}")
+
+    lines.append(f"{body}if (i < {end}) {{")
+    lines.append(f"{lane}const long count = ({end}) - i;")
+    tail_lines, result = _emit_program(
+        program, lane, f"{offset} + i", "count", "_p"
+    )
+    lines.extend(tail_lines)
+    # A partial vector enters as a weight-one point per active lane; lanes
+    # past ``count`` keep the accumulator's own values.
+    lines.append(
+        f"{lane}const TP_MomentsV mtail_ = tp_moments_v("
+        f"TP_MomentsV{{mmean0, mm2_0, mw_0}},"
+        f" TP_MomentsV{{{result}, V(0.0f), V(1.0f)}});"
+    )
+    lines.append(f"{lane}mmean0 = V::set(mmean0, mtail_.mean, count);")
+    lines.append(f"{lane}mm2_0 = V::set(mm2_0, mtail_.m2, count);")
+    lines.append(f"{lane}mw_0 = V::set(mw_0, mtail_.w, count);")
+    lines.append(f"{body}}}")
+
+    lines.extend(_close_reduced_nest(len(outer_dims), indent))
+    lines.extend(_moments_flush(op, indent, _ILP))
+
+    staging = _ILP * _MAX_LANES
+    lines.append(f"{indent}float mln_m_[{staging}];")
+    lines.append(f"{indent}float mln_s_[{staging}];")
+    lines.append(f"{indent}float mln_w_[{staging}];")
+    for group in range(_ILP):
+        base = f"{group}L * W"
+        lines.append(f"{indent}mmean{group}.store(mln_m_ + {base});")
+        lines.append(f"{indent}mm2_{group}.store(mln_s_ + {base});")
+        lines.append(f"{indent}mw_{group}.store(mln_w_ + {base});")
+    lines.append(f"{indent}TP_Moments accw_ = TP_Moments{{0.0f, 0.0f, 0.0f}};")
+    lines.append(f"{indent}for (long k_ = 0; k_ < {_ILP}L * W; ++k_)")
+    lines.append(
+        f"{indent}    accw_ = tp_moments_s(accw_,"
+        f" TP_Moments{{mln_m_[k_], mln_s_[k_], mln_w_[k_]}});"
+    )
+    return lines
+
+
 def _emit_vertical(
     plan: LoopPlan,
     op: str,
@@ -521,11 +776,15 @@ def _emit_vertical(
     blocks_expr: str,
     accumulate_into_out: bool,
     red_for_mean: int,
+    correction: int = 0,
+    moment_ptrs: tuple[str, str, str] | None = None,
 ) -> list[str]:
     """Accumulate one row along the kept trailing run and store it.
 
     ``accumulate_into_out`` folds into the destination instead of overwriting
-    it, which is how a split chunk contributes to its worker slot.
+    it, which is how a split chunk contributes to its worker slot.  The
+    moments family folds into a (mean, m2, weight) slot triple instead, named
+    by ``moment_ptrs``.
     """
 
     post = plan.post
@@ -533,6 +792,102 @@ def _emit_vertical(
 
     def group_body(group_indent: str, groups: int, count_expr: str) -> list[str]:
         out: list[str] = []
+        if _is_moments(op):
+            out.extend(_moments_decl(group_indent, groups))
+            out.extend(_moments_setup(op, blocks_expr, group_indent, groups))
+            open_lines, offset, body = _open_reduced_nest(
+                plan.red_dims, group_indent, outer_range
+            )
+            out.extend(open_lines)
+            results: list[str] = []
+            for group in range(groups):
+                lane_offset = (
+                    f"{offset} + p" if group == 0 else f"{offset} + p + {group}L * W"
+                )
+                group_lines, result = _emit_program(
+                    program, body, lane_offset, count_expr, f"_v{group}"
+                )
+                out.extend(group_lines)
+                results.append(result)
+            for group, result in enumerate(results):
+                if count_expr == "W":
+                    out.extend(_moments_step(body, group, result))
+                else:
+                    # Masked output tail: the point merge runs on every lane
+                    # and the lanes past ``count`` keep their own values.
+                    # ``mn`` still counts the steps an active lane carries,
+                    # which is the weight the next promotion books.
+                    out.append(f"{body}++mn{group};")
+                    out.append(
+                        f"{body}const TP_MomentsV mv{group}_ = tp_moments_v("
+                        f"TP_MomentsV{{mmean{group}, mm2_{group}, mw_{group}}},"
+                        f" TP_MomentsV{{{result}, V(0.0f), V(1.0f)}});"
+                    )
+                    out.append(
+                        f"{body}mmean{group} = V::set(mmean{group},"
+                        f" mv{group}_.mean, {count_expr});"
+                    )
+                    out.append(
+                        f"{body}mm2_{group} = V::set(mm2_{group},"
+                        f" mv{group}_.m2, {count_expr});"
+                    )
+                    out.append(
+                        f"{body}mw_{group} = V::set(mw_{group},"
+                        f" mv{group}_.w, {count_expr});"
+                    )
+            out.extend(_moments_tick(op, body, groups))
+            out.extend(_close_reduced_nest(len(plan.red_dims), group_indent))
+            out.extend(_moments_flush(op, group_indent, groups))
+            for group in range(groups):
+                lane = (
+                    "" if group == 0 else f" + {group}L * W"
+                )
+                if moment_ptrs is not None:
+                    ptr_m = f"{moment_ptrs[0]} + p{lane}"
+                    ptr_s = f"{moment_ptrs[1]} + p{lane}"
+                    ptr_w = f"{moment_ptrs[2]} + p{lane}"
+                    out.append(
+                        f"{group_indent}const V pm{group}_ ="
+                        f" V::loadu({ptr_m}, {count_expr});"
+                    )
+                    out.append(
+                        f"{group_indent}const V ps{group}_ ="
+                        f" V::loadu({ptr_s}, {count_expr});"
+                    )
+                    out.append(
+                        f"{group_indent}const V pw{group}_ ="
+                        f" V::loadu({ptr_w}, {count_expr});"
+                    )
+                    out.append(
+                        f"{group_indent}const TP_MomentsV mc{group}_ ="
+                        f" tp_moments_v(TP_MomentsV{{pm{group}_, ps{group}_,"
+                        f" pw{group}_}}, TP_MomentsV{{mmean{group},"
+                        f" mm2_{group}, mw_{group}}});"
+                    )
+                    out.append(
+                        f"{group_indent}mc{group}_.mean.store({ptr_m},"
+                        f" {count_expr});"
+                    )
+                    out.append(
+                        f"{group_indent}mc{group}_.m2.store({ptr_s},"
+                        f" {count_expr});"
+                    )
+                    out.append(
+                        f"{group_indent}mc{group}_.w.store({ptr_w},"
+                        f" {count_expr});"
+                    )
+                else:
+                    value = _moments_final_vector(
+                        op, f"mm2_{group}", f"mw_{group}", correction
+                    )
+                    out.append(
+                        f"{group_indent}const V mres{group}_ = {value};"
+                    )
+                    out.append(
+                        f"{group_indent}mres{group}_.store({out_ptr} + p{lane},"
+                        f" {count_expr});"
+                    )
+            return out
         for group in range(groups):
             out.append(f"{group_indent}V a{group} = V({_identity(op)});")
         out.extend(_cascade_setup(op, blocks_expr, group_indent, groups))
@@ -595,7 +950,7 @@ def _emit_vertical(
     return lines
 
 
-def _select_strategy(plan: LoopPlan, threads: int) -> str:
+def _select_strategy(plan: LoopPlan, threads: int, slot_floats: int = 1) -> str:
     """Choose the worksharing strategy from the pinned extents."""
 
     work = plan.rows * plan.post * plan.red
@@ -608,7 +963,7 @@ def _select_strategy(plan: LoopPlan, threads: int) -> str:
     # the split axis has enough extent to hand each worker real work.
     out_elements = plan.rows * plan.post
     if (
-        threads * out_elements * 4 <= _SPLIT_SLOT_BYTES
+        threads * out_elements * slot_floats * 4 <= _SPLIT_SLOT_BYTES
         and plan.red_dims[0][0] >= 2 * threads
     ):
         return "split"
@@ -657,14 +1012,77 @@ def _prologue() -> str:
         "        }\n"
         "    }\n"
         "}\n"
-        "static inline long tp_ceil_log2(long value) {\n"
-        "    if (value <= 2L) return 1L;\n"
-        "    unsigned long remaining = (unsigned long)(value - 1L);\n"
-        "    long result = 0;\n"
-        "    while (remaining != 0UL) { ++result; remaining >>= 1; }\n"
-        "    return result;\n"
-        "}\n"
-        "\n"
+"static inline long tp_ceil_log2(long value) {\n"
+"    if (value <= 2L) return 1L;\n"
+"    unsigned long remaining = (unsigned long)(value - 1L);\n"
+"    long result = 0;\n"
+"    while (remaining != 0UL) { ++result; remaining >>= 1; }\n"
+"    return result;\n"
+"}\n"
+"\n"
+"// Online moments: (mean, m2, weight) triples merge by the parallel-moments\n"
+"// formula, so any partial -- a vector lane, a cascade level, a worker slot\n"
+"// -- folds into any other without re-deriving either side's mean.  The\n"
+"// scalar form guards the empty-empty merge (both weights zero), which the\n"
+"// lane fold relies on: idle lanes hold no weight and must stay neutral.\n"
+"struct TP_Moments { float mean; float m2; float w; };\n"
+"static inline TP_Moments tp_moments_s(TP_Moments a, TP_Moments b) {\n"
+"    const float w = a.w + b.w;\n"
+"    if (w == 0.0f) return TP_Moments{0.0f, 0.0f, 0.0f};\n"
+"    const float delta = b.mean - a.mean;\n"
+"    const float r = b.w / w;\n"
+"    return TP_Moments{a.mean + delta * r,\n"
+"                      a.m2 + b.m2 + delta * delta * a.w * r, w};\n"
+"}\n"
+"struct TP_MomentsV { V mean; V m2; V w; };\n"
+"// The vector form divides by the merged weight without a zero guard, so a\n"
+"// caller must keep at least one side carrying weight on every lane it\n"
+"// observes; lanes where both sides are empty produce values that only\n"
+"// masked stores ever see.\n"
+"static inline TP_MomentsV tp_moments_v(TP_MomentsV a, TP_MomentsV b) {\n"
+"    const V w = a.w + b.w;\n"
+"    const V r = b.w / w;\n"
+"    const V delta = b.mean - a.mean;\n"
+"    return TP_MomentsV{a.mean + delta * r,\n"
+"                       a.m2 + b.m2 + delta * delta * (a.w * r), w};\n"
+"}\n"
+"// Cascade promotion for the moments family, kept out of line like the sum\n"
+"// version: the level stacks stay in memory, the accumulators in registers.\n"
+"// The per-level element counts (mlv_n) track which levels hold data; the\n"
+"// flush skips the empty ones, which is what keeps every vector merge it\n"
+"// emits on the non-empty side of that contract.\n"
+f"template <int G>\n"
+"__attribute__((noinline)) static void tp_moments_promote(\n"
+"    V* lvl_m, V* lvl_s, V* lvl_w, long* lvl_n,\n"
+"    const V* accs_m, const V* accs_s, const V* accs_w, long chunk_n,\n"
+"    long blk, long level_power, long level_mask) {\n"
+"    for (int g = 0; g < G; ++g) {\n"
+"        const TP_MomentsV merged = tp_moments_v(\n"
+"            TP_MomentsV{lvl_m[g], lvl_s[g], lvl_w[g]},\n"
+"            TP_MomentsV{accs_m[g], accs_s[g], accs_w[g]});\n"
+"        lvl_m[g] = merged.mean; lvl_s[g] = merged.m2; lvl_w[g] = merged.w;\n"
+"        lvl_n[g] += chunk_n;\n"
+"    }\n"
+f"    for (long j = 1; j < {_LEVELS - 1}L; ++j) {{\n"
+"        if ((blk & (level_mask << (j * level_power))) != 0) return;\n"
+"        for (int g = 0; g < G; ++g) {\n"
+"            const TP_MomentsV merged = tp_moments_v(\n"
+"                TP_MomentsV{lvl_m[j * G + g], lvl_s[j * G + g],"
+" lvl_w[j * G + g]},\n"
+"                TP_MomentsV{lvl_m[(j - 1) * G + g], lvl_s[(j - 1) * G + g],"
+" lvl_w[(j - 1) * G + g]});\n"
+"            lvl_m[j * G + g] = merged.mean;\n"
+"            lvl_s[j * G + g] = merged.m2;\n"
+"            lvl_w[j * G + g] = merged.w;\n"
+"            lvl_m[(j - 1) * G + g] = V(0.0f);\n"
+"            lvl_s[(j - 1) * G + g] = V(0.0f);\n"
+"            lvl_w[(j - 1) * G + g] = V(0.0f);\n"
+"            lvl_n[j * G + g] += lvl_n[(j - 1) * G + g];\n"
+"            lvl_n[(j - 1) * G + g] = 0;\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
         "typedef void (*tp_parallel_body_c)(void* ctx, long long b, long long e);\n"
         'extern "C" void tp_parallel_for_c('
         "long long begin, long long end, long long grain, "
@@ -720,8 +1138,10 @@ def render_reduction_source(
     }
 
     op = spec.op
+    moments = _is_moments(op)
+    correction = int(getattr(spec, "correction", 0) or 0)
     threads = _pool_threads()
-    strategy = _select_strategy(plan, threads)
+    strategy = _select_strategy(plan, threads, 3 if moments else 1)
     out_elements = plan.rows * plan.post
 
     const_decls = "\n".join(
@@ -737,7 +1157,13 @@ def render_reduction_source(
     ctx_fields = "".join(f"    const float* in{i};\n" for i in range(input_count))
     ctx_fields += "    float* out;\n"
     if strategy == "split":
-        ctx_fields += "    float* slots;\n    long grain;\n"
+        if moments:
+            ctx_fields += (
+                "    float* slots_m;\n    float* slots_s;\n"
+                "    float* slots_w;\n    long grain;\n"
+            )
+        else:
+            ctx_fields += "    float* slots;\n    long grain;\n"
     ctx_loads = "".join(
         f"    const float* __restrict__ in{i} = c->in{i};\n"
         for i in range(input_count)
@@ -750,9 +1176,23 @@ def render_reduction_source(
         # advances chunk starts by at least the requested grain, so the slot
         # index derived from the start is unique per chunk.
         body_lines.append("    const long slot = b / c->grain;")
-        body_lines.append(
-            f"    float* __restrict__ out = c->slots + slot * {out_elements}L;"
-        )
+        if moments:
+            body_lines.append(
+                f"    float* __restrict__ om = c->slots_m"
+                f" + slot * {out_elements}L;"
+            )
+            body_lines.append(
+                f"    float* __restrict__ os = c->slots_s"
+                f" + slot * {out_elements}L;"
+            )
+            body_lines.append(
+                f"    float* __restrict__ ow = c->slots_w"
+                f" + slot * {out_elements}L;"
+            )
+        else:
+            body_lines.append(
+                f"    float* __restrict__ out = c->slots + slot * {out_elements}L;"
+            )
         outer_range = ("b", "e")
     else:
         body_lines.append("    float* __restrict__ out = c->out;")
@@ -769,22 +1209,52 @@ def render_reduction_source(
             if strategy == "split"
             else f"{plan.red}L"
         )
-        body_lines.append(
-            f"        float* __restrict__ orow = out + row * {plan.post}L;"
-        )
-        body_lines.extend(
-            _emit_vertical(
-                plan,
-                op,
-                program,
-                "        ",
-                out_ptr="orow",
-                outer_range=outer_range,
-                blocks_expr=blocks,
-                accumulate_into_out=(strategy == "split"),
-                red_for_mean=plan.red,
+        if moments and strategy == "split":
+            # The split slot holds one (mean, m2, weight) triple per output
+            # element; the chunk folds into it under the same merge the
+            # serial path uses across its cascade levels.
+            body_lines.append(
+                f"        float* __restrict__ omr = om + row * {plan.post}L;"
             )
-        )
+            body_lines.append(
+                f"        float* __restrict__ osr = os + row * {plan.post}L;"
+            )
+            body_lines.append(
+                f"        float* __restrict__ owr = ow + row * {plan.post}L;"
+            )
+            body_lines.extend(
+                _emit_vertical(
+                    plan,
+                    op,
+                    program,
+                    "        ",
+                    out_ptr="orow",
+                    outer_range=outer_range,
+                    blocks_expr=blocks,
+                    accumulate_into_out=True,
+                    red_for_mean=plan.red,
+                    correction=correction,
+                    moment_ptrs=("omr", "osr", "owr"),
+                )
+            )
+        else:
+            body_lines.append(
+                f"        float* __restrict__ orow = out + row * {plan.post}L;"
+            )
+            body_lines.extend(
+                _emit_vertical(
+                    plan,
+                    op,
+                    program,
+                    "        ",
+                    out_ptr="orow",
+                    outer_range=outer_range,
+                    blocks_expr=blocks,
+                    accumulate_into_out=(strategy == "split"),
+                    red_for_mean=plan.red,
+                    correction=correction,
+                )
+            )
     else:
         inner_extent_expr = f"{plan.red_dims[-1][0]}L"
         inner_range = ("0L", inner_extent_expr)
@@ -811,8 +1281,22 @@ def render_reduction_source(
             )
         )
         if strategy == "split":
+            if moments:
+                body_lines.append(
+                    "        const TP_Moments mslot_ = tp_moments_s("
+                    "TP_Moments{om[row], os[row], ow[row]}, accw_);"
+                )
+                body_lines.append(
+                    "        om[row] = mslot_.mean; os[row] = mslot_.m2;"
+                    " ow[row] = mslot_.w;"
+                )
+            else:
+                body_lines.append(
+                    f"        out[row] = {_scombine(op, 'out[row]', 'acc_')};"
+                )
+        elif moments:
             body_lines.append(
-                f"        out[row] = {_scombine(op, 'out[row]', 'acc_')};"
+                f"        out[row] = {_moments_final_scalar(op, 'accw_.m2', 'accw_.w', correction)};"
             )
         else:
             body_lines.append(
@@ -837,26 +1321,66 @@ def render_reduction_source(
         entry_lines.append(
             f"    const long nslots = ({outer_extent}L + grain - 1L) / grain;"
         )
-        entry_lines.append(f"    float slot_buf[{threads}L * {out_elements}L];")
-        entry_lines.append(
-            f"    for (long s = 0; s < nslots * {out_elements}L; ++s)"
-        )
-        entry_lines.append(f"        slot_buf[s] = {_identity(op)};")
-        entry_lines.append(f"    TP_Ctx ctx{{{ctx_init}, slot_buf, grain}};")
+        if moments:
+            # Three slot planes (mean, m2, weight) per output element; a
+            # zeroed plane reads as the identity triple, which the guarded
+            # scalar merge folds away.
+            entry_lines.append(
+                f"    float mbuf_m[{threads}L * {out_elements}L];"
+            )
+            entry_lines.append(
+                f"    float mbuf_s[{threads}L * {out_elements}L];"
+            )
+            entry_lines.append(
+                f"    float mbuf_w[{threads}L * {out_elements}L];"
+            )
+            entry_lines.append(
+                f"    for (long s = 0; s < nslots * {out_elements}L; ++s) {{"
+            )
+            entry_lines.append(
+                "        mbuf_m[s] = 0.0f; mbuf_s[s] = 0.0f; mbuf_w[s] = 0.0f;"
+            )
+            entry_lines.append("    }")
+            entry_lines.append(
+                f"    TP_Ctx ctx{{{ctx_init}, mbuf_m, mbuf_s, mbuf_w, grain}};"
+            )
+        else:
+            entry_lines.append(f"    float slot_buf[{threads}L * {out_elements}L];")
+            entry_lines.append(
+                f"    for (long s = 0; s < nslots * {out_elements}L; ++s)"
+            )
+            entry_lines.append(f"        slot_buf[s] = {_identity(op)};")
+            entry_lines.append(f"    TP_Ctx ctx{{{ctx_init}, slot_buf, grain}};")
         entry_lines.append(
             f"    tp_parallel_for_c(0, {outer_extent}L, grain, tp_body, &ctx);"
         )
         entry_lines.append(f"    for (long j = 0; j < {out_elements}L; ++j) {{")
-        entry_lines.append("        float acc = slot_buf[j];")
-        entry_lines.append("        for (long s = 1; s < nslots; ++s)")
-        entry_lines.append(
-            "            acc = "
-            + _scombine(op, "acc", f"slot_buf[s * {out_elements}L + j]")
-            + ";"
-        )
-        entry_lines.append(
-            f"        out[j] = {_finalize_scalar(op, 'acc', plan.red)};"
-        )
+        if moments:
+            entry_lines.append(
+                "        TP_Moments macc_ ="
+                " TP_Moments{mbuf_m[j], mbuf_s[j], mbuf_w[j]};"
+            )
+            entry_lines.append("        for (long s = 1; s < nslots; ++s)")
+            entry_lines.append(
+                "            macc_ = tp_moments_s(macc_,"
+                f" TP_Moments{{mbuf_m[s * {out_elements}L + j],"
+                f" mbuf_s[s * {out_elements}L + j],"
+                f" mbuf_w[s * {out_elements}L + j]}});"
+            )
+            entry_lines.append(
+                f"        out[j] = {_moments_final_scalar(op, 'macc_.m2', 'macc_.w', correction)};"
+            )
+        else:
+            entry_lines.append("        float acc = slot_buf[j];")
+            entry_lines.append("        for (long s = 1; s < nslots; ++s)")
+            entry_lines.append(
+                "            acc = "
+                + _scombine(op, "acc", f"slot_buf[s * {out_elements}L + j]")
+                + ";"
+            )
+            entry_lines.append(
+                f"        out[j] = {_finalize_scalar(op, 'acc', plan.red)};"
+            )
         entry_lines.append("    }")
     elif strategy == "rows":
         per_row = max(1, plan.post * plan.red)
@@ -1029,7 +1553,7 @@ def build_cpu_reduction_kernel(
         tuple(constants),
         input_count,
         output_ref,
-        (spec.op, spec.dims, spec.keepdim),
+        (spec.op, spec.dims, spec.keepdim, int(getattr(spec, "correction", 0) or 0)),
         tuple(int(dim) for dim in in_shape),
         layout_key,
         out_device,
