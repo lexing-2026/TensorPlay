@@ -23,6 +23,8 @@ guide/index
 tensorplay
 tensor_attributes
 tensor_view
+meta
+storage
 type_info
 size
 deterministic
@@ -32,8 +34,12 @@ autograd
 nn
 nn.functional
 nn.init
+nn.attention
 optim
+foreach
 cuda
+backends
+cuda.tunable
 accelerator
 amp
 linalg
@@ -48,6 +54,7 @@ futures
 hub
 multiprocessing
 library
+overrides
 distributed
 distributed.device_mesh
 distributed.tensor
@@ -61,6 +68,7 @@ distributed.optim
 distributed.nn
 distributed.autograd
 distributed.algorithms
+ddp_comm_hooks
 distributions
 func
 profiler
