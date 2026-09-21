@@ -1219,13 +1219,16 @@ PYBIND11_MODULE(_C, m) {
          if (obj.is_none()) {
               return py::none();
          }
-         // The stored strings must outlive this call: C-level descriptors keep
-         // only a pointer to the docstring text.
-         static std::vector<std::string> owned_docs;
-         owned_docs.push_back(doc);
-         const char* doc_str = owned_docs.back().c_str();
+         // C-level descriptors keep only a pointer to the docstring text, and
+         // the text must outlive every reallocation of this call's storage:
+         // park each string in its own never-freed heap block instead of a
+         // reallocating container.
+         char* doc_str = static_cast<char*>(std::malloc(doc.size() + 1));
+         if (doc_str != nullptr) {
+              std::memcpy(doc_str, doc.c_str(), doc.size() + 1);
+         }
          PyTypeObject* obj_type = Py_TYPE(obj.ptr());
-         if (obj_type == &PyCFunction_Type) {
+         if (doc_str != nullptr && obj_type == &PyCFunction_Type) {
               // Builtins expose __doc__ as read-only; write the underlying
               // method-table record instead.
               auto* f = reinterpret_cast<PyCFunctionObject*>(obj.ptr());
@@ -1236,7 +1239,7 @@ PYBIND11_MODULE(_C, m) {
          } else if (std::strcmp(obj_type->tp_name, "getset_descriptor") == 0) {
               auto* descr = reinterpret_cast<PyGetSetDescrObject*>(obj.ptr());
               descr->d_getset->doc = doc_str;
-         } else {
+         } else if (doc_str != nullptr) {
               try {
                   if (py::hasattr(obj, "__doc__")) {
                        py::setattr(obj, "__doc__", py::str(doc_str));
