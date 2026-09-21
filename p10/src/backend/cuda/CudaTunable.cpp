@@ -369,6 +369,10 @@ bool TuningContext::isVerbose() const {
     return impl_->verbose.load(std::memory_order_relaxed);
 }
 
+void TuningContext::logVerbose(const std::string& message) const {
+    logLine(*impl_, message);
+}
+
 void TuningContext::setMaxTuningDurationMs(int value) {
     impl_->max_duration_ms.store(value < 0 ? 0 : value, std::memory_order_relaxed);
 }

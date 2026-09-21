@@ -59,6 +59,10 @@ public:
     void setVerbose(bool value);
     bool isVerbose() const;
 
+    // Emits one diagnostic line when verbose logging is on; the GEMM path
+    // uses it to report why a recorded winner was or was not applied.
+    void logVerbose(const std::string& message) const;
+
     // Measurement budget per candidate kernel, applied while tuning.
     // Zero disables a limit; a search always runs at least one timed
     // sample; when both limits are set the smaller one wins.
