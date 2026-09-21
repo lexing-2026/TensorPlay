@@ -27,13 +27,20 @@ build:
   evaluated once, the batch statistics differentiate normally. The
   running-stat buffers are mutated as a side effect — once per evaluation
   of the transformed function.
+- {func}`jacrev` through a batch norm module also works: the per-sample
+  Jacobians are computed from the batch statistics of each evaluation and
+  come out finite and correct. Because the running-stat buffers mutate on
+  each pass, the values you get depend on how many times the transformed
+  function ran before the call — use the helpers below when the model
+  doubles as an inference network.
 
 :::{warning}
-The Jacobian transforms do not fail loudly on batch norm.
-{func}`jacrev` through a batch norm module returns garbage values (entries
-of order 1e33; NaN once running stats are disabled). Do not transform
-through normalization layers — check a model for norm modules before
-differentiating it more than once.
+The Jacobian transforms evaluate the module once per output entry, so a
+batch norm's running statistics move between evaluations. That drift does
+not corrupt the transform itself — the batch statistics of each call are
+what get differentiated — but it does mean the module's buffers are
+unpredictable afterwards. Patch the norm out first if the model must stay
+state-free.
 :::
 
 ## The helpers
@@ -70,7 +77,10 @@ one.
   {func}`vjp`): patching makes the evaluation free of hidden state — the
   same input always produces the same output, which is what you want when
   differentiating.
-- Under {func}`vmap` and the Jacobian transforms: normalization layers are
-  not transformable today regardless of the running-stats setting. Strip
-  or replace them before mapping; the helpers keep the module ready for
-  when the rules land.
+- Under {func}`vmap`: normalization layers are not transformable today
+  regardless of the running-stats setting. Strip or replace them before
+  mapping; the helpers keep the module ready for when the rules land.
+- Under the Jacobian transforms: {func}`jacrev` works but leaves the
+  running-stat buffers mid-stream, and {func}`jacfwd` is still covered by
+  the general limitation above — patch the norm out to keep the
+  transformed model state-free.
