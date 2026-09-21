@@ -27,10 +27,19 @@ not the TensorPlay object model, so they cannot call back into the
 dispatcher or register operators.  Wrap a call in
 :func:`tensorplay.library.custom_op` (with an explicit schema, fake
 kernel and autograd formula) to make the kernel a first-class operator.
+
+The frontend also installs a process-wide *environment allocator* on
+first engine use (only when no host allocator is already present), so
+kernels can allocate TensorPlay tensors directly through
+``TVMFFIEnvTensorAlloc`` / ``Tensor::FromEnvAlloc``.  The allocated
+tensor returns to Python as the engine's tensor wrapper; convert it
+with :func:`tensorplay.from_dlpack`.
 """
 
 from __future__ import annotations
 
+import ctypes
+import threading
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -65,7 +74,172 @@ def _engine() -> Any:
         import tvm_ffi.cpp
     except ImportError as exc:
         raise RuntimeError(_INSTALL_HINT) from exc
+    _ensure_env_allocator(tvm_ffi)
     return tvm_ffi
+
+
+# ---------------------------------------------------------------------------
+# Environment allocator
+#
+# FFI kernels allocate host tensors through TVMFFIEnvTensorAlloc (see
+# Tensor::FromEnvAlloc in kernel code).  The trampoline below fulfills
+# those requests with ordinary TensorPlay allocations, crossing the
+# boundary as DLPack:
+#
+#   tp.empty -> __dlpack__ capsule -> engine Tensor object
+#     -> versioned DLPack wrapper handed to the caller
+#
+# Ownership is a chain of DLPack deleters: when the engine-side tensor
+# dies it releases the versioned wrapper, which releases the engine
+# object, which releases the capsule's managed tensor, whose deleter
+# drops the Python-side reference and recycles the pooled wrapper.  The
+# allocator is installed once, on first engine use, and only when no
+# host allocator is present (an already-installed allocator wins).
+
+_ALLOCATOR_LOCK = threading.Lock()
+_ALLOCATOR_STATE = 0  # 0 = not tried, 1 = installed, 2 = foreign or absent
+_ALLOCATOR_CB: Any = None  # trampoline keep-alive
+_ENGINE_LIB: Any = None
+_DTYPE_TABLE: dict | None = None
+
+
+class _DLDevice(ctypes.Structure):
+    _fields_ = [("device_type", ctypes.c_int32), ("device_id", ctypes.c_int32)]
+
+
+class _DLDataType(ctypes.Structure):
+    _fields_ = [("code", ctypes.c_uint8), ("bits", ctypes.c_uint8),
+                ("lanes", ctypes.c_uint16)]
+
+
+class _DLTensor(ctypes.Structure):
+    _fields_ = [("data", ctypes.c_void_p), ("device", _DLDevice),
+                ("ndim", ctypes.c_int32), ("dtype", _DLDataType),
+                ("shape", ctypes.POINTER(ctypes.c_int64)),
+                ("strides", ctypes.POINTER(ctypes.c_int64)),
+                ("byte_offset", ctypes.c_uint64)]
+
+
+_SET_ERROR_FUNC = ctypes.CFUNCTYPE(
+    None, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p)
+_ALLOCATOR_FUNC = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.POINTER(_DLTensor),
+    ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, _SET_ERROR_FUNC)
+
+# capsule accessors on a private pythonapi handle: restype must be a
+# real pointer width, and the prototype must not leak onto the shared
+# ctypes.pythonapi function objects
+_PYAPI = ctypes.PyDLL(None)
+_PYAPI.PyCapsule_GetPointer.restype = ctypes.c_void_p
+_PYAPI.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+_PYAPI.PyCapsule_SetName.restype = ctypes.c_int
+_PYAPI.PyCapsule_SetName.argtypes = [ctypes.py_object, ctypes.c_char_p]
+
+_KDL_INT, _KDL_UINT, _KDL_FLOAT, _KDL_BFLOAT, _KDL_COMPLEX, _KDL_BOOL = 0, 1, 2, 4, 5, 6
+_DEVICE_NAMES = {1: "cpu", 2: "cuda"}
+
+
+def _dl_dtype_table() -> dict:
+    global _DTYPE_TABLE
+    if _DTYPE_TABLE is None:
+        import tensorplay as tp
+
+        _DTYPE_TABLE = {
+            (_KDL_FLOAT, 16): tp.float16, (_KDL_FLOAT, 32): tp.float32,
+            (_KDL_FLOAT, 64): tp.float64, (_KDL_BFLOAT, 16): tp.bfloat16,
+            (_KDL_INT, 8): tp.int8, (_KDL_INT, 16): tp.int16,
+            (_KDL_INT, 32): tp.int32, (_KDL_INT, 64): tp.int64,
+            (_KDL_UINT, 8): tp.uint8, (_KDL_UINT, 16): tp.uint16,
+            (_KDL_UINT, 32): tp.uint32, (_KDL_UINT, 64): tp.uint64,
+            (_KDL_COMPLEX, 64): tp.complex64,
+            (_KDL_COMPLEX, 128): tp.complex128,
+            (_KDL_BOOL, 8): tp.bool,
+        }
+    return _DTYPE_TABLE
+
+
+def _tp_env_alloc(prototype, out, error_ctx, set_error):
+    """Fulfill a kernel-side allocation request with a TensorPlay tensor."""
+    try:
+        import tensorplay as tp
+
+        request = prototype.contents
+        if request.dtype.lanes != 1:
+            raise ValueError("vector dtypes are not supported")
+        dtype = _dl_dtype_table().get((request.dtype.code, request.dtype.bits))
+        if dtype is None:
+            raise ValueError(
+                f"unsupported dtype code={request.dtype.code} "
+                f"bits={request.dtype.bits}")
+        device = _DEVICE_NAMES.get(request.device.device_type)
+        if device is None:
+            raise ValueError(
+                f"unsupported device type {request.device.device_type}")
+        shape = [request.shape[i] for i in range(request.ndim)]
+        tensor = tp.empty(
+            shape, dtype=dtype,
+            device=tp.device(device, request.device.device_id))
+
+        capsule = tensor.__dlpack__()
+        managed = _PYAPI.PyCapsule_GetPointer(capsule, b"dltensor")
+        obj = ctypes.c_void_p()
+        if _ENGINE_LIB.TVMFFITensorFromDLPack(
+                managed, 0, 0, ctypes.byref(obj)) != 0:
+            raise RuntimeError("wrapping the allocated tensor failed")
+        # the engine object owns the unversioned wrapper from here on;
+        # mark the capsule consumed so its destructor stays inert
+        _PYAPI.PyCapsule_SetName(capsule, b"used_dltensor")
+
+        versioned = ctypes.c_void_p()
+        if _ENGINE_LIB.TVMFFITensorToDLPackVersioned(
+                obj, ctypes.byref(versioned)) != 0:
+            raise RuntimeError("producing the versioned wrapper failed")
+        # the versioned wrapper holds its own reference to the object
+        _ENGINE_LIB.TVMFFIObjectDecRef(obj)
+        out[0] = versioned
+        return 0
+    except Exception as exc:  # noqa: BLE001 - reported through SetError
+        kind = type(exc).__name__ if isinstance(exc, ValueError) else "RuntimeError"
+        set_error(error_ctx, kind.encode(), str(exc).encode())
+        return -1
+
+
+def _ensure_env_allocator(engine: Any) -> None:
+    """Install the TensorPlay env allocator, once, if none is present."""
+    global _ALLOCATOR_STATE, _ALLOCATOR_CB, _ENGINE_LIB
+    if _ALLOCATOR_STATE:
+        return
+    with _ALLOCATOR_LOCK:
+        if _ALLOCATOR_STATE:
+            return
+        try:
+            lib = ctypes.CDLL(engine.LIB._name)
+        except AttributeError:
+            lib = engine.LIB
+        lib.TVMFFIEnvGetDLPackManagedTensorAllocator.restype = ctypes.c_void_p
+        lib.TVMFFIEnvGetDLPackManagedTensorAllocator.argtypes = []
+        if lib.TVMFFIEnvGetDLPackManagedTensorAllocator():
+            _ALLOCATOR_STATE = 2
+            return
+        lib.TVMFFITensorFromDLPack.restype = ctypes.c_int
+        lib.TVMFFITensorFromDLPack.argtypes = [
+            ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
+            ctypes.POINTER(ctypes.c_void_p)]
+        lib.TVMFFITensorToDLPackVersioned.restype = ctypes.c_int
+        lib.TVMFFITensorToDLPackVersioned.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        lib.TVMFFIObjectDecRef.restype = ctypes.c_int
+        lib.TVMFFIObjectDecRef.argtypes = [ctypes.c_void_p]
+        lib.TVMFFIEnvSetDLPackManagedTensorAllocator.restype = ctypes.c_int
+        lib.TVMFFIEnvSetDLPackManagedTensorAllocator.argtypes = [
+            _ALLOCATOR_FUNC, ctypes.c_int, ctypes.POINTER(_ALLOCATOR_FUNC)]
+
+        _ENGINE_LIB = lib
+        _ALLOCATOR_CB = _ALLOCATOR_FUNC(_tp_env_alloc)
+        if lib.TVMFFIEnvSetDLPackManagedTensorAllocator(
+                _ALLOCATOR_CB, 1, None) != 0:
+            raise RuntimeError("installing the env tensor allocator failed")
+        _ALLOCATOR_STATE = 1
 
 
 def load_inline(
