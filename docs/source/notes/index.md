@@ -11,6 +11,7 @@ autograd
 broadcasting
 cuda
 ddp
+extending
 faq
 gradcheck
 modules

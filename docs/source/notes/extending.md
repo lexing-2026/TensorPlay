@@ -1,0 +1,240 @@
+(extending-tensorplay)=
+
+# Extending TensorPlay
+
+TensorPlay's built-in operator set and modules cover most workloads, but a
+few situations call for adding your own: an operation autograd cannot
+record automatically, a computation that leaves the framework (a native
+library, a GPU kernel written by hand), or a type that should behave like
+a tensor inside TensorPlay operations. This note walks through the three
+extension points and when to reach for each.
+
+## Adding new operators
+
+The recommended path is {func}`tensorplay.library.custom_op`, which takes
+a schema-annotated Python function plus an explicit mutation contract and
+produces a real registered operator — visible to the dispatcher, the
+compiler, and the testing utilities:
+
+```python
+import tensorplay as tp
+from tensorplay.library import custom_op, register_fake, register_autograd
+
+
+@custom_op("mylib::square_op", mutates_args=())
+def square_op(x: tp.Tensor) -> tp.Tensor:
+    return x * x
+
+
+register_fake("mylib::square_op", lambda x: x.new_empty(x.shape))
+
+
+def square_backward(ctx, grad):
+    x, = ctx.saved_tensors
+    return 2 * x * grad
+
+
+register_autograd(
+    "mylib::square_op",
+    square_backward,
+    setup_context=lambda ctx, inputs, output: ctx.save_for_backward(*inputs),
+)
+```
+
+The operator now carries its own autograd formula: calling
+`square_op(x)` on a tensor with `requires_grad=True` and back-propagating
+yields exactly `2 * x`. The `setup_context` callback receives
+`(ctx, inputs, output)` and is where tensors get saved for the backward
+pass; when it is omitted the context stays empty and the backward must
+compute from the gradient alone.
+
+Choosing the mutation and aliasing contract (functional, in-place, `out=`,
+or general mutation) is a schema-level decision described in detail on
+the {doc}`library reference page <library>`. For kernels written in
+Triton or TileLang, `tensorplay.library.triton_op` /
+`tensorplay.library.tile_lang_op` wrap the kernel launch with the same
+operator machinery. New operators can be validated with
+{func}`tensorplay.library.opcheck`, and their gradients with
+{func}`tensorplay.autograd.gradcheck.gradcheck`.
+
+## Extending autograd
+
+```{currentmodule} tensorplay.autograd
+```
+
+Operations that autograd cannot record — anything that runs outside the
+framework, or whose derivative you want to hand-write — become part of the
+graph by subclassing {class}`~tensorplay.autograd.function.Function`. Functions are
+how autograd encodes the operation history: `apply` runs the forward and
+installs a node that calls your `backward` during the backward pass.
+
+### When to use
+
+Implement a custom function when the computation is not differentiable as
+written (argmax-style operations, numerically unstable expressions you
+want to stabilize in the derivative), when it leaves the framework (a
+native library call), or when fusing several operations lets you save
+fewer buffers for backward than the un-fused graph would.
+
+### When not to use
+
+If the function can be written with built-in operations, autograd already
+records it — write a plain Python function. If you need trainable state,
+write a module instead. If you only want to observe or modify gradients,
+a tensor hook or a module hook is the lighter tool.
+
+### How to use
+
+There are two styles. The *combined* style takes `ctx` as the first
+argument of `forward` and saves onto it directly:
+
+```python
+import tensorplay as tp
+from tensorplay.autograd import Function, gradcheck
+
+
+class Exp(Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return x.exp()
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, = ctx.saved_tensors
+        return grad_out * x.exp()
+
+
+x = tp.randn(5, dtype=tp.float64, requires_grad=True)
+out = Exp.apply(x)
+```
+
+The *separate* style keeps `forward` free of framework plumbing, which
+lets it be called directly and reused; the context is filled in a
+dedicated `setup_context` classmethod receiving `(ctx, inputs, output)`:
+
+```python
+class Mul(Function):
+    @staticmethod
+    def forward(a, b):
+        return a * b
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        a, b = inputs
+        ctx.save_for_backward(a, b)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        a, b = ctx.saved_tensors
+        return grad_out * b, grad_out * a
+```
+
+Either way, one backward argument is returned per forward input, `None`
+for inputs that need no gradient. `ctx.needs_input_grad` is a tuple of
+booleans saying which inputs actually require gradients, so the backward
+can skip work (and avoid building graphs for tensors nobody will
+differentiate against).
+
+The saved context gives you more than storage:
+
+- `ctx.save_for_backward(*tensors)` saves inputs or outputs without
+  extending their lifetime in the forward graph; they come back as
+  `ctx.saved_tensors`.
+- `ctx.mark_non_differentiable(*tensors)` declares outputs that carry no
+  gradient — backward through them is an error instead of a silent zero.
+- `ctx.mark_dirty(*tensors)` marks in-place-modified inputs so autograd
+  can detect version mismatches.
+- `ctx.set_materialize_grads(False)` opts out of receiving zero-filled
+  gradients for outputs whose gradient was not produced.
+
+Because the backward itself runs under autograd, higher-order derivatives
+come for free as long as the backward formula is written in
+differentiable operations. The `Exp` above supports double backward: the
+saved `x` flows through `x.exp()` again in the second pass. Verify both
+orders with {func}`tensorplay.autograd.gradcheck.gradcheck`:
+
+```python
+a = tp.randn(5, dtype=tp.float64, requires_grad=True)
+b = tp.randn(5, dtype=tp.float64, requires_grad=True)
+assert gradcheck(Mul.apply, (a, b))
+```
+
+:::{note}
+Forward-mode AD ({func}`tensorplay.autograd.jvp`) works for built-in
+operations, but a custom `Function` cannot define a `jvp` yet — the
+method exists for API compatibility and raises when the engine reaches
+it. Custom functions are backward-mode only for now.
+:::
+
+### Function or custom_op?
+
+Both attach a hand-written derivative to a computation. Use a
+`Function` for a one-off differentiable step inside your own code: it is
+local, takes no schema, and cannot be registered per-backend. Use
+`custom_op` when the operation should behave like a real operator —
+named, callable from compiled graphs, registrable per device type, with
+a fake kernel for shape propagation — and register its autograd formula
+with `register_autograd` as shown above.
+
+## Extending the Python API
+
+Operations dispatch through the `__tensorplay_function__` protocol when
+any argument overrides it. A wrapper type that implements the protocol
+participates in TensorPlay operations without subclassing `Tensor`:
+
+```python
+import tensorplay as tp
+from tensorplay.overrides import (
+    handle_tensorplay_function,
+    has_tensorplay_function,
+)
+
+
+class MyArray:
+    def __init__(self, tensor):
+        self.tensor = tensor
+
+    def __tensorplay_function__(self, func, types, args, kwargs):
+        if func is tp.add:
+            return MyArray(tp.add(args[0].tensor, args[1].tensor))
+        return NotImplemented
+
+
+m1, m2 = MyArray(tp.ones(2)), MyArray(tp.ones(2))
+assert has_tensorplay_function((m1, m2))
+result = handle_tensorplay_function(tp.add, (m1, m2), m1, m2)
+```
+
+The handler receives the public operation, the tuple of overridable
+arguments, and the original call arguments; the method itself gets the
+operation, the types of the overridable arguments, and the call
+arguments. Returning `NotImplemented` defers to the remaining
+overridable arguments, and if none handles the call, the operation
+fails with a "no implementation found" error. Implement the method on
+the class; the machinery discovers it per argument.
+
+For a cross-cutting change of behavior — logging every operation,
+swapping one implementation for another, enforcing a policy — use a mode
+instead of editing types. `tensorplay.overrides.TensorPlayFunctionMode`
+subclasses of it enter the dispatch path for all operations inside their
+context:
+
+```python
+from tensorplay.overrides import TensorPlayFunctionMode
+
+
+class DoubleInputsMode(TensorPlayFunctionMode):
+    def __tensorplay_function__(self, func, types, args, kwargs):
+        if func is tp.add:
+            return tp.add(args[0] * 2, args[1] * 2)
+        return super().__tensorplay_function__(func, types, args, kwargs)
+
+
+with DoubleInputsMode():
+    tp.add(tp.ones(2), tp.ones(2))   # -> tensor([4., 4.])
+tp.add(tp.ones(2), tp.ones(2))       # -> tensor([2., 2.])
+```
+
+Modes stack (the innermost sees calls first) and restore the previous
+behavior when the context exits.
