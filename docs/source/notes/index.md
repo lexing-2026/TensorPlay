@@ -12,6 +12,7 @@ broadcasting
 faq
 gradcheck
 modules
+multiprocessing
 numerical_accuracy
 out
 randomness
