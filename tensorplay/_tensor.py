@@ -376,6 +376,8 @@ _DTYPE_SHORTCUTS = {
     "short": "int16",
     "half": "float16",
     "bfloat16": "bfloat16",
+    "cfloat": "complex64",
+    "cdouble": "complex128",
 }
 
 
@@ -699,3 +701,195 @@ def xpu(self, device=None):
 
 
 Tensor.xpu = xpu
+
+
+# ---------------------------------------------------------------------------
+# Element-count alias, equality predicate, and the complex/istft/sparse
+# conversion method faces routed through the package functions.
+# ---------------------------------------------------------------------------
+def nelement(self) -> builtins_int:
+    """Alias of numel()."""
+    return self.numel()
+
+
+def equal(self, other) -> _builtins.bool:
+    """True if two tensors have the same size and elements, False otherwise."""
+    from .functional import equal as _equal
+    return _equal(self, other)
+
+
+def istft(self, *args, **kwargs):
+    from .functional import istft as _istft
+    return _istft(self, *args, **kwargs)
+
+
+def to_sparse_coo(self):
+    """Convert a tensor to :ref:`coordinate format <sparse-coo-docs>`."""
+    return self.to_sparse()
+
+
+def module_load(self, other, assign=False):
+    """Defines how ``other`` is remapped before being swapped with ``self``
+    when a state dictionary is loaded into the owning module.
+
+    Returns a new object that is neither ``self`` nor ``other``: the default
+    is ``self.copy_(other).detach()`` unless ``assign`` selects the
+    detached source directly.
+    """
+    if assign:
+        return other.detach()
+    return self.copy_(other).detach()
+
+
+Tensor.nelement = nelement
+Tensor.equal = equal
+Tensor.istft = istft
+Tensor.to_sparse_coo = to_sparse_coo
+Tensor.module_load = module_load
+del nelement, equal, istft, to_sparse_coo, module_load
+
+
+# ---------------------------------------------------------------------------
+# Dunder faces: legacy division spellings, sequence protocols, numpy
+# interop, deepcopy, and the CUDA array view.
+# ---------------------------------------------------------------------------
+Tensor.__div__ = Tensor.__truediv__
+Tensor.__rdiv__ = Tensor.__rtruediv__
+Tensor.__idiv__ = Tensor.__itruediv__
+Tensor.__long__ = Tensor.long
+Tensor.__nonzero__ = Tensor.__bool__
+
+
+def __reversed__(self):
+    return self.flip(0)
+
+
+def __contains__(self, element) -> _builtins.bool:
+    """Check if `element` is present in tensor.
+
+    Args:
+        element (Tensor or scalar): element to be checked
+            for presence in current tensor"
+    """
+    if isinstance(element, (Tensor, builtins_int, _builtins.float, _builtins.complex, _builtins.bool)):
+        return bool((element == self).any().item())
+    raise RuntimeError(
+        f"Tensor.__contains__ only supports Tensor or scalar, but you passed in a {_builtins.type(element)}."
+    )
+
+
+def __rmatmul__(self, other):
+    return _as_tensor(other, device=self.device).matmul(self)
+
+
+def __deepcopy__(self, memo):
+    if not self.is_leaf:
+        raise RuntimeError(
+            "Only Tensors created explicitly by the user "
+            "(graph leaves) support the deepcopy protocol at the moment.  "
+            "If you were attempting to deepcopy a module, this may be because "
+            "of a tensorplay.nn.utils.weight_norm usage"
+        )
+    if id(self) in memo:
+        return memo[id(self)]
+    from .autograd import no_grad as _no_grad
+    with _no_grad():
+        new_tensor = self.clone()
+        if self.is_conj():
+            new_tensor = new_tensor.conj_physical()
+        if self.is_neg():
+            new_tensor = new_tensor.neg()
+    if self.requires_grad:
+        new_tensor.requires_grad_()
+    if self.grad is not None:
+        new_tensor.grad = self.grad.__deepcopy__(memo)
+    memo[id(self)] = new_tensor
+    return new_tensor
+
+
+def __delitem__(self, key):
+    raise TypeError("Tensor does not support deleting items")
+
+
+def __array_wrap__(self, array):
+    if array.dtype == _builtins.bool:
+        # Workaround, torch has no built-in bool tensor
+        array = array.astype("uint8")
+    return _C.from_numpy(array)
+
+
+Tensor.__reversed__ = __reversed__
+Tensor.__contains__ = __contains__
+Tensor.__rmatmul__ = __rmatmul__
+Tensor.__deepcopy__ = __deepcopy__
+Tensor.__delitem__ = __delitem__
+Tensor.__array_wrap__ = __array_wrap__
+del __reversed__, __contains__, __rmatmul__, __deepcopy__, __delitem__, __array_wrap__
+
+# Prefer tensor ops over numpy ones when numpy probes for a protocol winner.
+Tensor.__array_priority__ = 1000
+
+# CUDA devices are little-endian and tensors are stored in native byte
+# order. 1-byte entries are endian-agnostic.
+_DTYPE_TO_TYPESTR = {
+    _C.complex64: "<c8",
+    _C.complex128: "<c16",
+    _C.bfloat16: "<V2",
+    _C.float16: "<f2",
+    _C.float32: "<f4",
+    _C.float64: "<f8",
+    _C.uint8: "|u1",
+    _C.int8: "|i1",
+    _C.uint16: "<u2",
+    _C.int16: "<i2",
+    _C.uint32: "<u4",
+    _C.int32: "<i4",
+    _C.uint64: "<u8",
+    _C.int64: "<i8",
+    _C.bool: "|b1",
+}
+
+
+def _cuda_array_interface(self):
+    """Array view description for cuda tensors.
+
+    See:
+    https://numba.pydata.org/numba-doc/dev/cuda/cuda_array_interface.html
+    """
+    # raise AttributeError for unsupported tensors, so that
+    # hasattr(cpu_tensor, "__cuda_array_interface__") is False.
+    if not self.is_cuda:
+        raise AttributeError(
+            f"Can't get __cuda_array_interface__ on non-CUDA tensor type: {self.type()} "
+            "If CUDA data is required use tensor.cuda() to copy tensor to device memory."
+        )
+
+    if self.is_sparse:
+        raise AttributeError(
+            f"Can't get __cuda_array_interface__ on sparse type: {self.type()} "
+            "Use Tensor.to_dense() to convert to a dense tensor first."
+        )
+
+    # RuntimeError, matching tensor.__array__() behavior.
+    if self.requires_grad:
+        raise RuntimeError(
+            "Can't get __cuda_array_interface__ on Variable that requires grad. "
+            "If gradients aren't required, use var.detach() to get Variable that doesn't require grad."
+        )
+
+    typestr = _DTYPE_TO_TYPESTR[self.dtype]
+    itemsize = self.element_size()
+    shape = tuple(self.shape)
+    if self.is_contiguous():
+        # __cuda_array_interface__ v2 requires the strides to be omitted
+        # (either not set or set to None) for C-contiguous arrays.
+        strides = None
+    else:
+        strides = tuple(s * itemsize for s in self.stride())
+    data_ptr = self.data_ptr() if self.numel() > 0 else 0
+    data = (data_ptr, False)  # read-only is false
+
+    return dict(typestr=typestr, shape=shape, strides=strides, data=data, version=2)
+
+
+Tensor.__cuda_array_interface__ = property(_cuda_array_interface)

@@ -1154,17 +1154,19 @@ del _foreach_name
 # -------------------------------------------------------------------------
 import collections as _collections
 
-_max_return_type = _collections.namedtuple("max_return_type", ["values", "indices"])
-_min_return_type = _collections.namedtuple("min_return_type", ["values", "indices"])
-_cummax_return_type = _collections.namedtuple("cummax_return_type", ["values", "indices"])
-_cummin_return_type = _collections.namedtuple("cummin_return_type", ["values", "indices"])
-_kthvalue_return_type = _collections.namedtuple("kthvalue_return_type", ["values", "indices"])
-_median_return_type = _collections.namedtuple("median_return_type", ["values", "indices"])
-_mode_return_type = _collections.namedtuple("mode_return_type", ["values", "indices"])
-_nanmedian_return_type = _collections.namedtuple("nanmedian_return_type", ["values", "indices"])
-_sort_return_type = _collections.namedtuple("sort_return_type", ["values", "indices"])
-_topk_return_type = _collections.namedtuple("topk_return_type", ["values", "indices"])
-_aminmax_return_type = _collections.namedtuple("aminmax_return_type", ["min", "max"])
+from ._return_types import (  # noqa: E402
+    aminmax_return_type as _aminmax_return_type,
+    cummax_return_type as _cummax_return_type,
+    cummin_return_type as _cummin_return_type,
+    kthvalue_return_type as _kthvalue_return_type,
+    max_return_type as _max_return_type,
+    median_return_type as _median_return_type,
+    min_return_type as _min_return_type,
+    mode_return_type as _mode_return_type,
+    nanmedian_return_type as _nanmedian_return_type,
+    sort_return_type as _sort_return_type,
+    topk_return_type as _topk_return_type,
+)
 
 
 def max(input, *args, dim=None, keepdim=False):
