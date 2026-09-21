@@ -1,4 +1,4 @@
-"""L5-M1: content-addressed kernel cache behaviour."""
+"""Content-addressed kernel cache behaviour."""
 
 import os
 

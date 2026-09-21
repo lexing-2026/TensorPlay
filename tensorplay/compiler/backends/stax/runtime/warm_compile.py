@@ -1,4 +1,4 @@
-"""Process-pool warm compilation for Stax Triton autotuning (L5-M6).
+"""Process-pool warm compilation for Stax Triton autotuning.
 
 Benchmarking a candidate table pays one Triton compile per candidate --
 MLIR -> PTX -> cubin, a few hundred milliseconds each -- serially, before

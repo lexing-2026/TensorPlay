@@ -1,4 +1,4 @@
-"""L5-M5c static fusion segmentation semantics."""
+"""Static fusion segmentation semantics."""
 
 import tensorplay as tp
 from tensorplay._stax.codegen.triton import _reduction_spec_from_node
@@ -64,7 +64,7 @@ def test_pointwise_then_full_sum_fuses_vertically():
 
 
 def test_reduction_then_pointwise_fuses_into_epilogue():
-    """M5e: relu(sum) runs INSIDE the reduction kernel as a store epilogue."""
+    """relu(sum) runs INSIDE the reduction kernel as a store epilogue."""
 
     x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
     _, segs = _segments(lambda t: ((t * 2.0).sum(dim=1)).relu(), x)
@@ -128,7 +128,7 @@ def test_mixed_graph_interleaves_fused_and_eager():
 
 
 def test_interior_value_across_barrier_gains_extra_export():
-    """M5g horizontal fusion: a later segment reading an interior value
+    """Horizontal fusion: a later segment reading an interior value
     makes the producer store it as an extra export, not a fallback."""
 
     x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
@@ -207,7 +207,7 @@ def test_annotate_records_plan_in_meta():
     ]
 
 
-# --- M5c per-segment emission wiring ---------------------------------------------
+# --- per-segment emission wiring ---------------------------------------------
 
 
 def _plan_harness(fn, *args):
@@ -256,7 +256,7 @@ def _plan_harness(fn, *args):
 
 
 def test_pw_red_pw_fuses_to_single_segment_with_epilogue_program():
-    """M5e: pw→red→pw lowers as ONE segment; epilogue builds its own program."""
+    """pw→red→pw lowers as ONE segment; epilogue builds its own program."""
 
     x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
 
@@ -397,7 +397,7 @@ def test_min_dim_is_pair_amax_is_not():
     assert not segs2[0].reduction.is_pair
 
 
-# --- extern store-time epilogue (M5e) ------------------------------------------
+# --- extern store-time epilogue ------------------------------------------
 
 
 def test_extern_pointwise_tail_attaches_as_epilogue():

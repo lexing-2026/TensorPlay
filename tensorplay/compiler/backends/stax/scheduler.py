@@ -1,4 +1,4 @@
-"""Static fusion segmentation for the Stax backend (L5-M5c/M5g).
+"""Static fusion segmentation for the Stax backend.
 
 Splits a captured graph into an ordered list of fusion segments:
 
@@ -19,7 +19,7 @@ Splits a captured graph into an ordered list of fusion segments:
   may interleave compiled pointwise/reduction segments with unsupported
   operators instead of falling back as a whole.
 
-Horizontal fusion (M5g): a later segment may read a value that is interior
+Horizontal fusion: a later segment may read a value that is interior
 to an earlier kernel.  Instead of giving the region up, the read is routed
 into an EXTRA export of the producing segment — a pure-pointwise kernel
 gains one additional store (``Segment.exports``) and the consumer wires

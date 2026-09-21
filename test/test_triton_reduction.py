@@ -1,4 +1,4 @@
-"""L5-M5a Triton reduction-epilogue emission and minimal broadcast support.
+"""Triton reduction-epilogue emission and minimal broadcast support.
 
 Structure/source tests run everywhere (pure string generation).  Numeric
 Numeric checks are gated on ``runtime_available()`` because Triton needs a
@@ -223,7 +223,7 @@ def test_sum_epilogue_over_broadcast_chain_matches_eager():
     _run_reference(fn, (x, b))
 
 
-# --- M5b: axis reductions (sum/mean/amax over dims) ------------------------------
+# --- axis reductions (sum/mean/amax over dims) ------------------------------
 
 
 def _trace(fn, *args):
@@ -393,7 +393,7 @@ def test_axis_mean_and_amax_match_eager():
     _run_reference(amax_fn, (x,))
 
 
-# --- M5g: variance family (var/std over dims) -------------------------------------
+# --- variance family (var/std over dims) ------------------------------------------
 
 
 def test_variance_detection():
@@ -511,7 +511,7 @@ def test_variance_odd_reduction_space_matches_eager():
     _run_reference(var_fn, (x,))
 
 
-# --- M5b closure: argmax dual-stream index reduction ------------------------------
+# --- argmax dual-stream index reduction, closing the axis family ------------------------------
 
 
 def test_argmax_detection():
@@ -627,9 +627,9 @@ def test_axis_argmax_keepdim_and_ties_match_eager():
 
     _run_reference(keepdim_fn, (x,))
     # A broadcast producer feeding an AXIS reduction needs generalized
-    # tile addressing (scheduler gate #19, M5d+); until then the whole
+    # tile addressing (scheduler gate #19); until then the whole
     # graph falls back to eager, which the check cannot attribute to Triton.
-    pytest.xfail("broadcast producer + axis argmax waits for M5d indexing")
+    pytest.xfail("broadcast producer + axis argmax waits for tile indexing")
     _run_reference(tie_fn, (x, b))
 
 
@@ -647,7 +647,7 @@ def test_axis_argmax_nan_matches_eager():
 
 @pytest.mark.skipif(not runtime_available(), reason="Triton/CUDA unavailable")
 def test_two_segment_graph_matches_eager():
-    """pw -> sum(dim) -> pw compiles as TWO kernels (M5c per-segment)."""
+    """pw -> sum(dim) -> pw compiles as TWO kernels (per-segment)."""
 
     x = tp.rand(32, 64, device="cuda")
 
@@ -667,7 +667,7 @@ def test_scalar_chain_segments_match_eager():
     _run_reference(fn, (x,))
 
 
-# --- M5e: red->pw store epilogue ---------------------------------------------------
+# --- red->pw store epilogue ---------------------------------------------------
 
 
 def _epilogue_codegen(reference_shape, op="sum", eprog=(17, 0, -1)):
@@ -764,7 +764,7 @@ def test_epilogue_rejected_for_index_reductions():
 
 @pytest.mark.skipif(not runtime_available(), reason="Triton/CUDA unavailable")
 def test_pw_red_pw_single_kernel_epilogue():
-    """M5e: pw->red->pw lowers to ONE kernel with an in-kernel epilogue."""
+    """pw->red->pw lowers to ONE kernel with an in-kernel epilogue."""
 
     x = tp.rand(32, 64, device="cuda")
 

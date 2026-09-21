@@ -1,4 +1,4 @@
-"""L5-M4: decomposition pass rewrites composites into differentiable primitives."""
+"""Decomposition pass rewrites composites into differentiable primitives."""
 
 import operator
 
@@ -93,7 +93,7 @@ def test_decomposed_op_compiles_to_native_graph(name):
     """每个新分解条目都必须落进原生图——覆盖面倍增的直接证明。
 
     （仅推理：compile 训练路径依赖 AOT 分解，被 tools/codegen 重构暂时
-    阻断，见 alignment plan L5-M4 遗留项。）
+    阻断，见 alignment plan 遗留项。）
     """
     fn, _ = _CASES[name]
     x = tp.tensor([0.7])
