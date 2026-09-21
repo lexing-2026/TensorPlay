@@ -10,6 +10,7 @@ amp_examples
 autograd
 broadcasting
 cuda
+ddp
 faq
 gradcheck
 modules
