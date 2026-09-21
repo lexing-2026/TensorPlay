@@ -297,3 +297,237 @@ def test_generated_source_splits_a_single_row_reduction():
     # reduction itself is split into per-worker slots.
     assert "slot_buf" in source
     assert "tp_cascade_promote" in source
+
+
+# ---------------------------------------------------------------------------
+# variance family
+
+
+def test_parse_variance_spellings():
+    assert _spec(lambda x: tensorplay.var(x, dim=1)) == red.ReduceSpec(
+        "var", (1,), False, 1
+    )
+    assert _spec(lambda x: tensorplay.var(x, 0, 1)) == red.ReduceSpec(
+        "var", (1,), False, 0
+    )
+    assert _spec(lambda x: tensorplay.std(x, dim=(1, 2), keepdim=True)) == (
+        red.ReduceSpec("std", (1, 2), True, 1)
+    )
+    assert _spec(lambda x: x.var(dim=1)) == red.ReduceSpec("var", (1,), False, 1)
+    assert _spec(lambda x: x.var(1, 0, True)) == red.ReduceSpec(
+        "var", (1,), True, 0
+    )
+    assert _spec(lambda x: x.std(dim=-1)) == red.ReduceSpec("std", (-1,), False, 1)
+    assert _spec(lambda x: tensorplay.var(x)) == red.ReduceSpec(
+        "var", (0, 1), False, 1
+    )
+
+
+def test_parse_variance_rejects_unsupported_forms():
+    # Non-integer corrections and the pair-returning moment reductions stay
+    # off this lowering; slot-duplicating spellings never trace, the eager
+    # call itself rejects them first.
+    assert _spec(lambda x: tensorplay.var(x, 1.5, dim=1)) is None
+    assert _spec(lambda x: tensorplay.var_mean(x, dim=1)) is None
+
+
+VARIANCE_CASES = [
+    ("row-var", (16, 129), lambda v: tensorplay.var(v, dim=1)),
+    ("col-var", (33, 65), lambda v: tensorplay.var(v, dim=0)),
+    ("row-std", (16, 129), lambda v: tensorplay.std(v, dim=1)),
+    ("full-var", (13, 17), lambda v: tensorplay.var(v)),
+    ("full-std", (13, 17), lambda v: tensorplay.std(v)),
+    ("row-var-keepdim", (7, 40), lambda v: tensorplay.var(v, dim=1, keepdim=True)),
+    ("col-std-keepdim", (7, 40), lambda v: tensorplay.std(v, dim=0, keepdim=True)),
+    ("row-var-biased", (9, 31), lambda v: tensorplay.var(v, 0, 1)),
+    ("multi-axis-var", (3, 5, 7), lambda v: tensorplay.var(v, dim=(1, 2))),
+    ("method-var", (11, 23), lambda v: v.var(dim=-1)),
+    ("fused-chain-var", (16, 100), lambda v: (v * 2).tanh().var(dim=1)),
+    ("fused-square-std", (16, 100), lambda v: (v * v).std(dim=1)),
+]
+
+
+@pytest.mark.parametrize(
+    "name,shape,fn", VARIANCE_CASES, ids=[case[0] for case in VARIANCE_CASES]
+)
+def test_variance_matches_reference(name, shape, fn):
+    tensorplay.manual_seed(4)
+    value = tensorplay.randn(*shape)
+    compiled = tensorplay.compile(fn)
+    _close(compiled(value), fn(value))
+
+
+@pytest.mark.parametrize("shape", [(3, 4, 5), (2, 3, 4, 5)])
+@pytest.mark.parametrize("dims", [(0,), (1,), (-1,), (0, 2), (1, 2)])
+def test_variance_over_axis_subsets(shape, dims):
+    if any(dim >= len(shape) for dim in dims):
+        pytest.skip("axis outside this rank")
+    tensorplay.manual_seed(5)
+    value = tensorplay.randn(*shape)
+    fn = lambda v: tensorplay.var(v, dim=dims)  # noqa: E731
+    _close(tensorplay.compile(fn)(value), fn(value))
+
+
+@pytest.mark.parametrize("correction", [0, 1, 2])
+def test_variance_correction_semantics(correction):
+    tensorplay.manual_seed(6)
+    value = tensorplay.randn(8, 33)
+    fn = lambda v: tensorplay.var(v, correction, 1)  # noqa: E731
+    _close(tensorplay.compile(fn)(value), fn(value))
+
+
+def test_variance_shapes_around_the_vector_tail():
+    # Widths that land exactly on, just below, and just above whole vectors
+    # exercise the full, single-vector, and masked-tail loops.  Width one
+    # reduces a single element, so the unbiased quotient is NaN on both
+    # sides by design.
+    for width in (1, 3, 7, 8, 9, 15, 16, 17, 31, 33, 64, 65):
+        value = tensorplay.randn(3, width)
+        fn = lambda v: tensorplay.var(v, dim=1)  # noqa: E731
+        got = tensorplay.compile(fn)(value)
+        if width == 1:
+            assert all(math.isnan(item) for item in got.tolist())
+            assert all(math.isnan(item) for item in fn(value).tolist())
+            continue
+        _close(got, fn(value), rel=5e-5)
+
+
+def test_variance_edge_semantics_match_the_reference():
+    single = tensorplay.tensor([[2.0]], dtype=tensorplay.float32)
+    compiled = tensorplay.compile(lambda v: v.var(dim=0))
+    # One element with the default correction divides zero by zero.
+    assert math.isnan(compiled(single).item())
+    assert math.isnan(tensorplay.compile(lambda v: v.std(dim=0))(single).item())
+
+    pair = tensorplay.tensor([[1.0, 3.0]], dtype=tensorplay.float32)
+    fn = lambda v: tensorplay.var(v, 3, 1)  # noqa: E731
+    # A correction past the element count keeps the raw quotient's sign.
+    assert tensorplay.compile(fn)(pair).item() == fn(pair).item() == -2.0
+
+    constant = tensorplay.full((8, 100), 5.0)
+    var_fn = lambda v: tensorplay.var(v, dim=1)  # noqa: E731
+    assert tensorplay.compile(var_fn)(constant).abs().max().item() == 0.0
+
+
+def test_variance_long_runs_stay_accurate():
+    # A million well-conditioned values per row: the pairwise moment merges
+    # have to keep the variance close to the float64 reference.
+    tensorplay.manual_seed(7)
+    value = tensorplay.randn(8, 1 << 20)
+    got = tensorplay.compile(lambda v: tensorplay.var(v, dim=1))(value)
+    ref = value.numpy().astype(np.float64).var(axis=1)
+    assert float(np.max(np.abs(got.numpy() - ref) / ref)) < 1e-5
+
+
+def test_variance_offset_precision_envelope():
+    # Online float32 moments subtract values near the running mean, so a
+    # large offset costs low-order bits of that difference.  The compiled
+    # path stays within the envelope this implies; the double-accumulated
+    # reference is far tighter, which is the documented trade for one pass.
+    tensorplay.manual_seed(8)
+    value = tensorplay.randn(64, 4096) + 1e4
+    got = tensorplay.compile(lambda v: tensorplay.var(v, dim=1))(value)
+    ref = value.numpy().astype(np.float64).var(axis=1)
+    assert float(np.max(np.abs(got.numpy() - ref) / ref)) < 5e-3
+
+
+def test_variance_nan_input_propagates():
+    value = tensorplay.tensor(
+        [[1.0, float("nan"), 3.0], [4.0, 5.0, 6.0]], dtype=tensorplay.float32
+    )
+    for fn in (
+        lambda v: tensorplay.var(v, dim=1),
+        lambda v: tensorplay.std(v, dim=0),
+    ):
+        got = tensorplay.compile(fn)(value).tolist()
+        ref = fn(value).tolist()
+        assert [math.isnan(item) for item in got] == [
+            math.isnan(item) for item in ref
+        ]
+
+
+def test_variance_mid_graph_keeps_a_correct_route():
+    # A variance feeding later elementwise work is not a trailing reduction;
+    # the row-fusion path declines it and the region still computes it.
+    tensorplay.manual_seed(9)
+    value = tensorplay.randn(32, 64)
+    fn = lambda v: (v - v.var(dim=1, keepdim=True)) * 2.0  # noqa: E731
+    _close(tensorplay.compile(fn)(value), fn(value))
+
+
+def test_variance_after_reshape_runs_segmented():
+    tensorplay.manual_seed(10)
+    value = tensorplay.randn(8, 100)
+    fn = lambda v: (v * 2.0).tanh().reshape(-1).var(dim=0)  # noqa: E731
+    _close(tensorplay.compile(fn)(value), fn(value))
+
+
+def test_variance_result_is_reusable_across_calls():
+    tensorplay.manual_seed(11)
+    fn = lambda v: (v * 3).std(dim=1)  # noqa: E731
+    compiled = tensorplay.compile(fn)
+    first = tensorplay.randn(6, 48)
+    second = tensorplay.randn(6, 48)
+    _close(compiled(first), fn(first))
+    _close(compiled(second), fn(second))
+
+
+def test_variance_grad_inputs_keep_the_uncompiled_route():
+    value = tensorplay.randn(4, 8, requires_grad=True)
+    fn = lambda v: (v * 2).var(dim=1)  # noqa: E731
+    result = tensorplay.compile(fn)(value)
+    result.backward(tensorplay.ones_like(result))
+    assert value.grad is not None
+
+
+def test_generated_source_emits_moment_merges():
+    spec = red.ReduceSpec("var", (0, 1), False, 1)
+    plan = red.plan_reduction((1024, 1024), spec)
+    source = red.render_reduction_source(
+        [],
+        [],
+        1,
+        0,
+        spec,
+        plan,
+        "tp_probe_moments",
+        out_device=(0, -1),
+        input_shapes=((1024, 1024),),
+        input_strides=((1024, 1),),
+        in_shape=(1024, 1024),
+        lane_count=8,
+    )
+    assert "tp_moments_s" in source
+    assert "tp_moments_v" in source
+    assert "tp_moments_promote" in source
+    # One output element: the reduction splits, and the split folds through
+    # three slot planes instead of one plain buffer.
+    assert "mbuf_m" in source and "mbuf_s" in source and "mbuf_w" in source
+    assert "slot_buf" not in source
+    # The default correction appears in the final quotient.
+    assert "(float)(1LL)" in source
+
+
+def test_generated_source_moments_rows_strategy_keeps_one_buffer():
+    spec = red.ReduceSpec("std", (1,), False, 0)
+    plan = red.plan_reduction((1024, 1024), spec)
+    source = red.render_reduction_source(
+        [],
+        [],
+        1,
+        0,
+        spec,
+        plan,
+        "tp_probe_moments_rows",
+        out_device=(0, -1),
+        input_shapes=((1024, 1024),),
+        input_strides=((1024, 1),),
+        in_shape=(1024, 1024),
+        lane_count=8,
+    )
+    # Many independent rows: the row loop is split, no slot planes exist.
+    assert "mbuf_m" not in source
+    assert "tp_parallel_for_c" in source
+    # The horizontal schedule finalizes each row as a scalar quotient.
+    assert "std::sqrt(" in source
+    assert "(float)(0LL)" in source

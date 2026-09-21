@@ -1134,10 +1134,13 @@ def _lower_cpu_fused_pointwise(
 # are accepted only in their whole-tensor form: with a dimension they return a
 # value/index pair, which is a different lowering contract.
 _REDUCTION_METHODS = frozenset(
-    {"sum", "mean", "prod", "max", "min", "amax", "amin"}
+    {"sum", "mean", "prod", "max", "min", "amax", "amin", "var", "std"}
 )
 _DIMLESS_ONLY_REDUCTIONS = frozenset({"max", "min"})
 _DIM_ONLY_REDUCTIONS = frozenset({"amax", "amin"})
+# The variance family carries a degrees-of-freedom correction and spells its
+# trailing arguments differently from the plain value reductions.
+_VARIANCE_REDUCTIONS = frozenset({"var", "std"})
 
 
 def _reduction_dtype_ok(value: Any) -> bool:
@@ -1152,6 +1155,65 @@ def _reduction_dtype_ok(value: Any) -> bool:
     # The captured call carries the sentinel that means "keep the input
     # dtype"; the route already pinned float32 inputs.
     return str(value).rsplit(".", 1)[-1].lower() == "undefined"
+
+
+def _parse_variance_reduction(
+    name: str, node: Node, rank: int
+) -> Any:
+    """Read one variance-family node into a :class:`ReduceSpec`.
+
+    The free function spells its trailing arguments
+    ``(correction, dim, keepdim)`` while the tensor method spells them
+    ``(dim, correction, keepdim)``; both accept the same keywords.  The
+    default correction is one everywhere, matching the eager surface.
+    """
+
+    from .codegen.cpp_reduction import ReduceSpec
+
+    rest = list(node.args[1:])
+    if len(rest) > 3:
+        return None
+    kwargs = dict(node.kwargs or {})
+    if set(kwargs) - {"dim", "correction", "keepdim"}:
+        return None
+    if node.op == "call_function":
+        positional = ("correction", "dim", "keepdim")
+    else:
+        positional = ("dim", "correction", "keepdim")
+    values: dict[str, Any] = {
+        "correction": 1,
+        "dim": None,
+        "keepdim": False,
+    }
+    for index, key in enumerate(positional):
+        if index < len(rest):
+            values[key] = rest[index]
+    for key, value in kwargs.items():
+        if key in positional[: len(rest)]:
+            # A keyword duplicating a positional slot is ambiguous.
+            return None
+        values[key] = value
+
+    correction = values["correction"]
+    keepdim = values["keepdim"]
+    if isinstance(correction, bool) or not isinstance(correction, int):
+        return None
+    if not isinstance(keepdim, bool):
+        return None
+    dim = values["dim"]
+    if dim is None:
+        return ReduceSpec(name, tuple(range(rank)), False, correction)
+    if isinstance(dim, bool):
+        return None
+    if isinstance(dim, int):
+        dims: tuple[int, ...] = (int(dim),)
+    elif isinstance(dim, (tuple, list)) and dim and all(
+        isinstance(item, int) and not isinstance(item, bool) for item in dim
+    ):
+        dims = tuple(int(item) for item in dim)
+    else:
+        return None
+    return ReduceSpec(name, dims, keepdim, correction)
 
 
 def _parse_reduction(node: Node, rank: int) -> Any:
@@ -1172,6 +1234,8 @@ def _parse_reduction(node: Node, rank: int) -> Any:
     args = list(node.args)
     if not args or not isinstance(args[0], Node):
         return None
+    if name in _VARIANCE_REDUCTIONS:
+        return _parse_variance_reduction(name, node, rank)
     rest = args[1:]
     kwargs = dict(node.kwargs or {})
     if len(rest) > 3:
@@ -1514,6 +1578,10 @@ def _plan_row_fusion(
             return None
         spec = _parse_reduction(node, rank)
         if spec is not None:
+            if spec.op in _VARIANCE_REDUCTIONS:
+                # Row fusion folds plain values; the variance family carries
+                # moment accumulators its combine cannot express.
+                return None
             normalized = spec.normalized(rank)
             if normalized is None or normalized.dims != (rank - 1,):
                 return None
