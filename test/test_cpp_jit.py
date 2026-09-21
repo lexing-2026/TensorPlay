@@ -37,6 +37,33 @@ void scale_file_cpu(tvm::ffi::TensorView x, tvm::ffi::TensorView y) {
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(scale_file_cpu, scale_file_cpu);
 """
 
+# The authoring contract: typed signature enforcement at the boundary,
+# scalar crossing, the kernel-side dtype responsibility and error
+# translation. The string entry points prepend the common headers, so
+# only <string> is included explicitly.
+_AUTHORING_SOURCE = r"""
+#include <string>
+
+double weighted_sum(tvm::ffi::TensorView x, double factor, int64_t offset,
+                    const std::string& tag) {
+  double s = static_cast<double>(offset);
+  for (int64_t i = 0; i < x.numel(); ++i)
+    s += static_cast<float*>(x.data_ptr())[i];
+  return s * factor + tag.size();
+}
+
+void require_f32(tvm::ffi::TensorView x) {
+  if (x.dtype().code != kDLFloat || x.dtype().bits != 32) {
+    TVM_FFI_THROW(TypeError) << "require_f32: expected float32, got dtype with "
+        << static_cast<int>(x.dtype().bits) << " bits";
+  }
+}
+
+void boom(int64_t code) {
+  TVM_FFI_THROW(RuntimeError) << "boom with code " << code;
+}
+"""
+
 
 class AvailabilityTest(unittest.TestCase):
     def test_is_available_matches_engine(self):
@@ -162,6 +189,38 @@ class CppJitFrontendTest(unittest.TestCase):
 
         compiled = tp.compile(lambda a: tp.mul(triple(a), 2.0))
         self.assertEqual(compiled(tp.tensor([1.0, 2.0])).tolist(), [6.0, 12.0])
+
+
+@unittest.skipUnless(cpp_jit.is_available(), "compile engine is not installed")
+class CppJitAuthoringContractTest(unittest.TestCase):
+    """The kernel authoring contract documented in the extending note."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._mod = cpp_jit.load_inline(
+            name="tp_cppjit_authoring",
+            cpp_sources=_AUTHORING_SOURCE,
+            functions=["weighted_sum", "require_f32", "boom"],
+        )
+
+    def test_scalar_arguments_and_return_value(self):
+        x = tp.tensor([1.0, 2.0, 3.0])
+        # (5 + 1+2+3) * 10 + len("abcd") == 114.0
+        self.assertEqual(
+            self._mod.weighted_sum(x, 10.0, 5, "abcd"), 114.0)
+
+    def test_void_kernel_returns_none(self):
+        self.assertIsNone(self._mod.require_f32(tp.tensor([1.0])))
+
+    def test_dtype_guard_raises_type_error(self):
+        with self.assertRaises(TypeError) as ctx:
+            self._mod.require_f32(tp.zeros(3, dtype=tp.float64))
+        self.assertIn("float32", str(ctx.exception))
+
+    def test_throw_translates_to_runtime_error(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self._mod.boom(42)
+        self.assertIn("42", str(ctx.exception))
 
 
 if __name__ == "__main__":
