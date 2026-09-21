@@ -16,6 +16,8 @@ import copy
 
 from tensorplay import nn
 
+from .fake_quantize import FakeQuantize
+from .observer import ObserverBase
 from .quantization_mappings import (
     get_default_dynamic_quant_module_mappings,
     get_default_static_quant_module_mappings,
@@ -74,6 +76,13 @@ def _observer_forward_pre_hook(module, input):
     return input
 
 
+def _is_observer_machinery(child) -> bool:
+    """Whether ``child`` is an embedded calibration module rather than a
+    real submodule.  A wrapper carrying only such modules (for example a
+    stub with its inner fake-quantize) still qualifies as a leaf."""
+    return isinstance(child, (FakeQuantize, ObserverBase))
+
+
 def _add_observer_(module, qconfig_spec=None):
     """Instantiate observers on each quantizable leaf module.
 
@@ -81,7 +90,14 @@ def _add_observer_(module, qconfig_spec=None):
     ``input_activation_post_process`` records the incoming activations and
     ``weight_observer`` calibrates on the module's own weight.
     """
-    is_leaf = len(list(module.children())) == 0
+    # The dequantize boundary is swapped out at conversion and carries no
+    # calibration of its own.
+    if isinstance(module, DeQuantStub):
+        return
+    if getattr(module, "activation_post_process", None) is not None:
+        # Already prepared; attaching again would duplicate the hooks.
+        return
+    is_leaf = all(_is_observer_machinery(child) for child in module.children())
     if is_leaf and getattr(module, "qconfig", None) is not None:
         if qconfig_spec is not None and not any(
             _matches(module, spec) for spec in qconfig_spec
@@ -159,6 +175,19 @@ def _convert(module, mapping):
 def _remove_qconfig(module):
     if hasattr(module, "qconfig"):
         del module.qconfig
+    # Modules that survive conversion run in the quantized regime from here
+    # on; their float-era observer hooks would feed quantized tensors into
+    # the calibration observers, so strip the whole attachment.
+    for attr in ("activation_post_process", "input_activation_post_process",
+                 "weight_observer"):
+        if hasattr(module, attr):
+            delattr(module, attr)
+    for hook_id, hook in list(module._forward_pre_hooks.items()):
+        if hook is _observer_forward_pre_hook:
+            del module._forward_pre_hooks[hook_id]
+    for hook_id, hook in list(module._forward_hooks.items()):
+        if hook is _observer_forward_hook:
+            del module._forward_hooks[hook_id]
     for child in module.children():
         _remove_qconfig(child)
 

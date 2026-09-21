@@ -58,9 +58,10 @@ class DeQuantStub(nn.Module):
             # Native path: the tensor carries its own affine parameters.
             return x.dequantize()
         if x.dtype != tensorplay.int8:
-            raise TypeError(
-                "DeQuantStub expects a quantized (or raw Int8 code) tensor; "
-                "convert float inputs through a QuantStub first")
+            # Before conversion the surrounding model still runs in float, so
+            # the stub stays an identity until it is swapped for a real
+            # dequantizer.
+            return x
         scale = 1.0 if self.scale is None else float(self.scale)
         zero_point = 0 if self.zero_point is None else int(self.zero_point)
         q = _make_per_tensor_quantized_tensor(x, scale, zero_point)
