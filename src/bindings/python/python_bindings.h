@@ -58,6 +58,7 @@ void init_scalar(py::module_& m);
 void init_symint(py::module_& m);
 void init_stax(py::module_& m);
 void init_parallel(py::module_& m);
+void init_env_allocator(py::module_& m);
 #ifdef TP_USE_DISTRIBUTED
 void init_distributed(py::module_& m);
 #endif

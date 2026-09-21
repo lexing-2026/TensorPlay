@@ -4,6 +4,7 @@
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include "PythonUtils.h"
 #include "dlpack_types.h"
+#include "DLPackConvert.h"
 #include "TensorImpl.h" // For unsafeGetTensorImpl
 #include "Autograd.h" // tpx autograd helpers; Tensor is the p10 tensor type
 #include "Storage.h"
@@ -60,8 +61,10 @@ std::string tensor_repr(const Tensor& self) {
 }
 
 // --- DLPack Helpers ---
+// The four conversion functions are shared with the environment
+// allocator via DLPackConvert.h.
 
-static DLDataType to_dlpack_dtype(DType dtype) {
+DLDataType to_dlpack_dtype(DType dtype) {
     DLDataType dt;
     dt.lanes = 1;
     switch (dtype) {
@@ -90,7 +93,7 @@ static DLDataType to_dlpack_dtype(DType dtype) {
     return dt;
 }
 
-static DType from_dlpack_dtype(DLDataType dt) {
+DType from_dlpack_dtype(DLDataType dt) {
     if (dt.lanes != 1) TP_THROW(RuntimeError, "DLPack: Unsupported lanes != 1");
     if (dt.code == kDLFloat) {
         if (dt.bits == 32) return DType::Float32;
@@ -118,7 +121,7 @@ static DType from_dlpack_dtype(DLDataType dt) {
     TP_THROW(RuntimeError, "Unsupported DLPack dtype");
 }
 
-static DLDevice to_dlpack_device(Device device) {
+DLDevice to_dlpack_device(Device device) {
     DLDevice d;
     // resolves "current device" (-1) the same way.
     int64_t index = device.index();
@@ -132,7 +135,7 @@ static DLDevice to_dlpack_device(Device device) {
     return d;
 }
 
-static Device from_dlpack_device(DLDevice d) {
+Device from_dlpack_device(DLDevice d) {
     DeviceType type;
     switch (d.device_type) {
         case kDLCPU: type = DeviceType::CPU; break;

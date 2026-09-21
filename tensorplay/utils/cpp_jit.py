@@ -31,9 +31,12 @@ kernel and autograd formula) to make the kernel a first-class operator.
 The frontend also installs a process-wide *environment allocator* on
 first engine use (only when no host allocator is already present), so
 kernels can allocate TensorPlay tensors directly through
-``TVMFFIEnvTensorAlloc`` / ``Tensor::FromEnvAlloc``.  The allocated
-tensor returns to Python as the engine's tensor wrapper; convert it
-with :func:`tensorplay.from_dlpack`.
+``TVMFFIEnvTensorAlloc`` / ``Tensor::FromEnvAlloc``.  The request is
+served natively by the compiled extension — no interpreter lock is
+involved — with a ctypes trampoline as the fallback for extension
+builds that predate it.  The allocated tensor returns to Python as the
+engine's tensor wrapper; convert it with
+:func:`tensorplay.from_dlpack`.
 """
 
 from __future__ import annotations
@@ -82,9 +85,14 @@ def _engine() -> Any:
 # Environment allocator
 #
 # FFI kernels allocate host tensors through TVMFFIEnvTensorAlloc (see
-# Tensor::FromEnvAlloc in kernel code).  The trampoline below fulfills
-# those requests with ordinary TensorPlay allocations, crossing the
-# boundary as DLPack:
+# Tensor::FromEnvAlloc in kernel code).  Requests are served by the
+# native allocator in the compiled extension (EnvAllocator.cpp), which
+# allocates directly and involves no Python state, so it works from any
+# thread without the interpreter lock.
+#
+# The ctypes trampoline below is the fallback for extension builds that
+# predate it.  It fulfills the same requests with ordinary TensorPlay
+# allocations, crossing the boundary as DLPack:
 #
 #   tp.empty -> __dlpack__ capsule -> engine Tensor object
 #     -> versioned DLPack wrapper handed to the caller
@@ -98,6 +106,7 @@ def _engine() -> Any:
 
 _ALLOCATOR_LOCK = threading.Lock()
 _ALLOCATOR_STATE = 0  # 0 = not tried, 1 = installed, 2 = foreign or absent
+_ALLOCATOR_NATIVE = False  # served by the compiled extension, not ctypes
 _ALLOCATOR_CB: Any = None  # trampoline keep-alive
 _ENGINE_LIB: Any = None
 _DTYPE_TABLE: dict | None = None
@@ -205,41 +214,72 @@ def _tp_env_alloc(prototype, out, error_ctx, set_error):
 
 
 def _ensure_env_allocator(engine: Any) -> None:
-    """Install the TensorPlay env allocator, once, if none is present."""
-    global _ALLOCATOR_STATE, _ALLOCATOR_CB, _ENGINE_LIB
+    """Install the env allocator, once, if none is present.
+
+    The native allocator from the compiled extension is preferred: it
+    serves requests from any thread without the interpreter lock.  The
+    ctypes trampoline below is the fallback for extension builds that
+    predate it.
+    """
     if _ALLOCATOR_STATE:
         return
     with _ALLOCATOR_LOCK:
         if _ALLOCATOR_STATE:
             return
-        try:
-            lib = ctypes.CDLL(engine.LIB._name)
-        except AttributeError:
-            lib = engine.LIB
-        lib.TVMFFIEnvGetDLPackManagedTensorAllocator.restype = ctypes.c_void_p
-        lib.TVMFFIEnvGetDLPackManagedTensorAllocator.argtypes = []
-        if lib.TVMFFIEnvGetDLPackManagedTensorAllocator():
-            _ALLOCATOR_STATE = 2
-            return
-        lib.TVMFFITensorFromDLPack.restype = ctypes.c_int
-        lib.TVMFFITensorFromDLPack.argtypes = [
-            ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
-            ctypes.POINTER(ctypes.c_void_p)]
-        lib.TVMFFITensorToDLPackVersioned.restype = ctypes.c_int
-        lib.TVMFFITensorToDLPackVersioned.argtypes = [
-            ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
-        lib.TVMFFIObjectDecRef.restype = ctypes.c_int
-        lib.TVMFFIObjectDecRef.argtypes = [ctypes.c_void_p]
-        lib.TVMFFIEnvSetDLPackManagedTensorAllocator.restype = ctypes.c_int
-        lib.TVMFFIEnvSetDLPackManagedTensorAllocator.argtypes = [
-            _ALLOCATOR_FUNC, ctypes.c_int, ctypes.POINTER(_ALLOCATOR_FUNC)]
+        if not _install_native_allocator(engine):
+            _install_ctypes_allocator(engine)
 
-        _ENGINE_LIB = lib
-        _ALLOCATOR_CB = _ALLOCATOR_FUNC(_tp_env_alloc)
-        if lib.TVMFFIEnvSetDLPackManagedTensorAllocator(
-                _ALLOCATOR_CB, 1, None) != 0:
-            raise RuntimeError("installing the env tensor allocator failed")
+
+def _install_native_allocator(engine: Any) -> bool:
+    """Try the native allocator; return True when no fallback is needed."""
+    global _ALLOCATOR_STATE, _ALLOCATOR_NATIVE
+    try:
+        import tensorplay._C as tp_c
+
+        status = tp_c._install_ffi_env_allocator(engine.LIB._name)
+    except (AttributeError, ImportError):
+        return False  # extension predates the native allocator
+    if status == 0:
+        _ALLOCATOR_NATIVE = True
         _ALLOCATOR_STATE = 1
+        return True
+    if status == 1:
+        _ALLOCATOR_STATE = 2  # a host allocator is already present
+        return True
+    return False
+
+
+def _install_ctypes_allocator(engine: Any) -> None:
+    """Install the ctypes-trampoline allocator (fallback path)."""
+    global _ALLOCATOR_STATE, _ALLOCATOR_CB, _ENGINE_LIB
+    try:
+        lib = ctypes.CDLL(engine.LIB._name)
+    except AttributeError:
+        lib = engine.LIB
+    lib.TVMFFIEnvGetDLPackManagedTensorAllocator.restype = ctypes.c_void_p
+    lib.TVMFFIEnvGetDLPackManagedTensorAllocator.argtypes = []
+    if lib.TVMFFIEnvGetDLPackManagedTensorAllocator():
+        _ALLOCATOR_STATE = 2
+        return
+    lib.TVMFFITensorFromDLPack.restype = ctypes.c_int
+    lib.TVMFFITensorFromDLPack.argtypes = [
+        ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_void_p)]
+    lib.TVMFFITensorToDLPackVersioned.restype = ctypes.c_int
+    lib.TVMFFITensorToDLPackVersioned.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    lib.TVMFFIObjectDecRef.restype = ctypes.c_int
+    lib.TVMFFIObjectDecRef.argtypes = [ctypes.c_void_p]
+    lib.TVMFFIEnvSetDLPackManagedTensorAllocator.restype = ctypes.c_int
+    lib.TVMFFIEnvSetDLPackManagedTensorAllocator.argtypes = [
+        _ALLOCATOR_FUNC, ctypes.c_int, ctypes.POINTER(_ALLOCATOR_FUNC)]
+
+    _ENGINE_LIB = lib
+    _ALLOCATOR_CB = _ALLOCATOR_FUNC(_tp_env_alloc)
+    if lib.TVMFFIEnvSetDLPackManagedTensorAllocator(
+            _ALLOCATOR_CB, 1, None) != 0:
+        raise RuntimeError("installing the env tensor allocator failed")
+    _ALLOCATOR_STATE = 1
 
 
 def load_inline(

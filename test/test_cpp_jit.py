@@ -280,6 +280,43 @@ class CppJitEnvAllocatorTest(unittest.TestCase):
         self.assertEqual(
             tp.from_dlpack(self._mod.doubled_env(x)).tolist(), [2.0, 4.0, 6.0])
 
+    def test_allocation_from_multiple_threads(self):
+        import threading
+
+        x = tp.tensor([1.0, 2.0, 3.0])
+        results = []
+        errors = []
+
+        def worker():
+            try:
+                for _ in range(200):
+                    results.append(
+                        tp.from_dlpack(self._mod.doubled_env(x)).tolist())
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 4 * 200)
+        self.assertTrue(all(r == [2.0, 4.0, 6.0] for r in results))
+
+    def test_native_allocator_is_preferred(self):
+        try:
+            import tensorplay._C as tp_c
+
+            has_native = hasattr(tp_c, "_install_ffi_env_allocator")
+        except ImportError:
+            has_native = False
+        if not has_native:
+            self.skipTest("extension predates the native allocator")
+        self.assertEqual(cpp_jit._ALLOCATOR_STATE, 1)
+        self.assertTrue(cpp_jit._ALLOCATOR_NATIVE)
+
     def test_unsupported_dtype_is_a_clean_error(self):
         mod = cpp_jit.load_inline(
             name="tp_cppjit_envalloc_err",
@@ -288,7 +325,7 @@ class CppJitEnvAllocatorTest(unittest.TestCase):
         )
         with self.assertRaises((ValueError, RuntimeError)) as ctx:
             mod.bad_env_alloc(tp.tensor([1.0]))
-        self.assertIn("unsupported dtype", str(ctx.exception))
+        self.assertIn("dlpack dtype", str(ctx.exception).lower())
 
 
 if __name__ == "__main__":

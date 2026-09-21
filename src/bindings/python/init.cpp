@@ -454,6 +454,7 @@ PYBIND11_MODULE(_C, m) {
     });
     init_stax(m);
     init_parallel(m);
+    init_env_allocator(m);
 #ifdef TP_USE_DISTRIBUTED
     init_distributed(m);
 #endif

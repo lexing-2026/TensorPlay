@@ -65,6 +65,33 @@ typedef struct DLManagedTensor {
   void (*deleter)(struct DLManagedTensor* self);
 } DLManagedTensor;
 
+/* Version tag carried by DLManagedTensorVersioned. A consumer that
+ * disagrees with the major version must release the tensor via the
+ * deleter without touching any other field. */
+typedef struct {
+  uint32_t major;
+  uint32_t minor;
+} DLPackVersion;
+
+/* Versioned exchange wrapper: the flags field adds read-only and
+ * copy semantics on top of the plain managed tensor. */
+typedef struct DLManagedTensorVersioned {
+  DLPackVersion version;
+  void* manager_ctx;
+  void (*deleter)(struct DLManagedTensorVersioned* self);
+  uint64_t flags;
+  DLTensor dl_tensor;
+} DLManagedTensorVersioned;
+
+/* Allocation callback contract used by exchange consumers that let a
+ * foreign kernel request a tensor from the host environment: the
+ * prototype carries dtype, ndim, shape and device; the callee either
+ * stores a versioned wrapper in *out and returns 0, or reports through
+ * set_error and returns nonzero. */
+typedef int (*DLPackManagedTensorAllocatorFunction)(
+    DLTensor* prototype, DLManagedTensorVersioned** out, void* error_ctx,
+    void (*set_error)(void* error_ctx, const char* kind, const char* message));
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif
