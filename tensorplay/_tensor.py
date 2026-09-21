@@ -678,16 +678,12 @@ def _is_cuda(self):
 
 
 def _is_meta(self):
-    dt = getattr(_C.DeviceType, "META", None)
-    return dt is not None and str(self.device.type) == str(dt)
+    return str(self.device.type) == "meta"
 
 
 Tensor.is_cpu = property(_is_cpu)
 Tensor.is_cuda = property(_is_cuda)
-if hasattr(_C.DeviceType, "META"):
-    Tensor.is_meta = property(_is_meta)
-else:
-    Tensor.is_meta = property(lambda self: False)
+Tensor.is_meta = property(_is_meta)
 del _is_cpu, _is_cuda
 
 

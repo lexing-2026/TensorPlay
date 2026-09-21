@@ -148,6 +148,7 @@ set(P10_SOURCES
     src/backend/composite/WeightNorm.cpp
     src/backend/composite/Pointwise.cpp
     src/backend/composite/Reduction.cpp
+    src/backend/meta/MetaKernels.cpp
     src/backend/composite/RNN.cpp
     src/backend/composite/TensorAdvancedIndexing.cpp
     src/backend/composite/TensorCompare.cpp

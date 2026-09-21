@@ -626,7 +626,7 @@ def generate_autograd_registration(funcs: list[NativeFunction], *,
         body = f'::tensorplay::tpx::ops::{f.cpp_name}({args})'
         adapters.append(f'{ret} {kernel}({params}) {{ '
                         f'{"return " if ret != "void" else ""}{body}; }}')
-        for key in ('AutogradCPU', 'AutogradCUDA', 'AutogradVulkan'):
+        for key in ('AutogradCPU', 'AutogradCUDA', 'AutogradVulkan', 'AutogradMeta'):
             registrations.append(f'        D.registerKernel("{f.func_name}", DispatchKey::{key}, &{kernel});')
     struct_at = lines.index('struct RegisterTPXAutogradKernels {')
     lines[struct_at:struct_at] = adapters + ['']

@@ -22,6 +22,7 @@ void init_device(py::module_& m) {
         .value("CPU", DeviceType::CPU)
         .value("CUDA", DeviceType::CUDA)
         .value("Vulkan", DeviceType::Vulkan)
+        .value("META", DeviceType::Meta)
         .value("Unknown", DeviceType::Unknown);
 
     py::class_<Device>(m, "Device")
@@ -99,6 +100,7 @@ void init_device(py::module_& m) {
         .def("is_cpu", &Device::is_cpu)
         .def("is_cuda", &Device::is_cuda)
         .def("is_vulkan", &Device::is_vulkan)
+        .def("is_meta", &Device::is_meta)
         .def("__repr__", &Device::toString)
         .def("__str__", &Device::toString)
         .def(py::self == py::self)

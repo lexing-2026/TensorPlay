@@ -128,6 +128,25 @@ public:
 
 } // namespace
 
+// The meta device never owns memory. Allocation still records the requested
+// byte count on the storage so size queries stay truthful, but the data
+// pointer stays null and releasing it is a no-op.
+class MetaAllocator final : public Allocator {
+public:
+    DataPtr allocate(size_t nbytes) const override {
+        return DataPtr(nullptr, deleteNothing, Device(DeviceType::Meta));
+    }
+
+    DataPtr allocate(size_t nbytes, const Device& device) const override {
+        return DataPtr(nullptr, deleteNothing, Device(DeviceType::Meta));
+    }
+};
+
+Allocator* getMetaAllocator() {
+    static MetaAllocator inst;
+    return &inst;
+}
+
 Allocator* getCPUAllocator() {
     return CachingAllocator::instance();
 }
@@ -186,6 +205,9 @@ Allocator* getVulkanAllocator();
 Allocator* getAllocator(DeviceType t) {
     if (t == DeviceType::CPU) {
         return getCPUAllocator();
+    }
+    if (t == DeviceType::Meta) {
+        return getMetaAllocator();
     }
 #ifdef USE_CUDA
     if (t == DeviceType::CUDA) {

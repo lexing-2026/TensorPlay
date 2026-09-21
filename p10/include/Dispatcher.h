@@ -45,6 +45,7 @@ inline bool dispatch_enabled(DispatchKey autocast_key) {
 inline DispatchKey computeDispatchKey(const Device& device) {
     if (device.is_cuda()) return DispatchKey::CUDA;
     if (device.is_vulkan()) return DispatchKey::Vulkan;
+    if (device.is_meta()) return DispatchKey::Meta;
     return DispatchKey::CPU;
 }
 

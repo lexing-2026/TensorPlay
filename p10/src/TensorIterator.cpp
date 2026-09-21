@@ -694,6 +694,15 @@ void TensorIteratorBase::serial_for_each(loop2d_t loop, Range range) const {
   if (range.size() == 0) {
     return;
   }
+  // Running the loop body dereferences operand storage. A meta tensor has no
+  // storage to dereference, so a composite or backend kernel that reaches
+  // here on meta operands is missing a shape-only kernel for its op; fail
+  // loudly instead of walking a null data pointer.
+  if (common_device_.is_meta()) {
+    TP_THROW(NotImplementedError,
+             "an operator on meta tensors tried to access element data; "
+             "it needs a shape-only kernel for this device");
+  }
 
   const auto ntensors = this->ntensors();
   const auto ndim = this->ndim();

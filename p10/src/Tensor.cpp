@@ -848,6 +848,18 @@ std::string Tensor::toString() const {
 
     std::stringstream ss;
 
+    // The meta device owns no elements, so printing stays metadata-only.
+    if (device().is_meta()) {
+        ss << "tensor(..., device='meta', size=(";
+        const auto sizes = static_cast<std::vector<int64_t>>(shape());
+        for (size_t i = 0; i < sizes.size(); ++i) {
+            if (i) ss << ", ";
+            ss << sizes[i];
+        }
+        ss << "))";
+        return ss.str();
+    }
+
     // 为了支持非CPU张量的打印（如CUDA），我们需要将其拷贝到CPU
     Tensor tensor_to_print = *this;
     if (device().type() != DeviceType::CPU) {
