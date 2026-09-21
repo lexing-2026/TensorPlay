@@ -130,8 +130,11 @@ def test_flat_layouts_keep_the_flat_kernel():
 
 
 def test_unaddressable_layouts_raise_instead_of_flat_fallback():
+    # Mixed non-unit strides (outer stride != 1 AND inner stride != 1) are
+    # outside every plan; the transposed family itself moved to the tile
+    # plan (test_cpu_tile_codegen).
     with pytest.raises(cpu_cpp._ProgramError):
-        _render((64, 48), [((64, 48), (48, 1)), ((64, 48), (1, 64))])
+        _render((64, 48), [((64, 48), (48, 1)), ((64, 48), (96, 2))])
 
 
 def test_build_declines_unaddressable_layouts():
@@ -144,7 +147,7 @@ def test_build_declines_unaddressable_layouts():
         shape=(64, 48),
         device=probe.device,
         input_shapes=((64, 48), (64, 48)),
-        input_strides=((48, 1), (1, 64)),
+        input_strides=((48, 1), (96, 2)),
     )
     assert built is None
 
