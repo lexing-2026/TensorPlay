@@ -720,7 +720,8 @@ def broadcast_to(array: ArrayLike, shape, subok: NotImplementedType = False):
 
 
 # This is a function from tuples to tuples, so we just reuse it.  However,
-# dynamo expects its __module__ to be tensorplay._numpy
+# the graph tracer resolves it by its __module__, which must stay
+# tensorplay._numpy
 def broadcast_shapes(*args):
     return tensorplay.broadcast_shapes(*args)
 

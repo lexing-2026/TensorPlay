@@ -554,8 +554,8 @@ def benchmark_compiled_inference(
                 model,
                 backend=tensorplay_backend,
                 mode=compile_mode,
-                # Python is only the capture frontend (as with Dynamo/FX).
-                # The benchmark must reject a Python GraphModule fallback so
+                # Python is only the capture frontend here; the benchmark
+                # must reject a Python GraphModule fallback so
                 # the compiled comparison measures a native executor.
                 fullgraph=True,
                 strict_native=True,

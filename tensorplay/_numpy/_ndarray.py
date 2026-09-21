@@ -754,7 +754,8 @@ def array(
     if isinstance(obj, (list, tuple)):
         # FIXME and they have the same dtype, device, etc
         if obj and all(isinstance(x, tensorplay.Tensor) for x in obj):
-            # list of arrays: *under tensorplay.Dynamo* these are FakeTensors
+            # list of arrays: during a graph capture these arrive as fake
+            # tensors, which stack handles uniformly
             obj = tensorplay.stack(obj)
         else:
             # XXX: remove tolist

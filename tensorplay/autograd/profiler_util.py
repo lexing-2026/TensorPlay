@@ -1616,8 +1616,9 @@ def _canonicalize_profiler_events(events):
         # Get the last non-empty line of the stack trace that is actual source,
         # not a caret-marker line. Python 3.11+ appends "^^^^"/"~~~~" indicator
         # lines below the source when a FrameSummary has colno/end_colno set
-        # (e.g. dynamo-generated stack traces); those lines must be skipped so
-        # we still surface the source code line in canonicalized output.
+        # (e.g. traces synthesized for compiled wrappers); those lines must be
+        # skipped so we still surface the source code line in canonicalized
+        # output.
         lines = [s.strip() for s in stack_trace.split("\n") if s.strip()]
         source_lines = [s for s in lines if not set(s).issubset({"^", "~", " "})]
         stack_trace = source_lines[-1] if source_lines else ""

@@ -839,7 +839,6 @@ class NativeFunctionRecord:
         "autogen",
         "overwrite_package",
         "only_register_dispatcher",
-        "skip_dynamo",
     )
 
     def __init__(self, func: FunctionSchema, item: dict,
