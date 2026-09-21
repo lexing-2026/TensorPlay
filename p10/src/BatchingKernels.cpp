@@ -452,6 +452,11 @@ Tensor sum_all(const Tensor& input, DType dtype) {
     for (int64_t dim = 0; dim < ndim; ++dim) {
         if (dim != actual_bdim) dims.push_back(dim);
     }
+    if (dims.empty()) {
+        // The per-sample value is 0-d (the only physical dim is the batch
+        // dim), so summing it leaves the batched value unchanged.
+        return input;
+    }
     Tensor result = call_next<Tensor, const Tensor&, const std::vector<int64_t>&,
                                  bool, DType>(
         "sum.dim_IntList", operand.value, operand.value, dims, false, dtype);
