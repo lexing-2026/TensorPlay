@@ -19,6 +19,13 @@ void TensorIteratorBase::parallel_reduce(loop2d_t loop) {
   TP_CHECK(
       ntensors() == 2,
       "parallel_reduce only supports one input and one output");
+  // Same contract as serial_for_each: reduction bodies dereference storage,
+  // which meta tensors do not have. Shape-only kernels never get here.
+  if (common_device_.is_meta()) {
+    TP_THROW(NotImplementedError,
+             "an operator on meta tensors tried to access element data; "
+             "it needs a shape-only kernel for this device");
+  }
   int64_t numel = this->numel();
   if (numel < parallel::GRAIN_SIZE || parallel::get_num_threads() == 1 ||
       parallel::in_parallel_region()) {

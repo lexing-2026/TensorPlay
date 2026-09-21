@@ -1931,6 +1931,7 @@ void init_tensor(py::module_& m) {
             return self.to(other.dtype());
         }, py::arg("other"))
         .def_property_readonly("is_cuda", [](const Tensor& self) { return self.device().type() == DeviceType::CUDA; })
+        .def_property_readonly("is_meta", [](const Tensor& self) { return self.device().type() == DeviceType::Meta; })
         .def("pin_memory", [](const Tensor& self) {
              Tensor result(self.pin_memory());
              tensorplay::tpx::impl::set_requires_grad(result, self.requires_grad());

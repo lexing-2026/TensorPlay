@@ -19,6 +19,7 @@ namespace tensorplay {
     _(HPU)                                \
     _(PrivateUse1)                        \
     _(Vulkan)                             \
+    _(Meta)                               \
     _(Unknown)
 
 // Device types supported by TensorPlay
@@ -47,6 +48,9 @@ public:
     bool is_cpu() const { return type_ == DeviceType::CPU; }
     bool is_cuda() const { return type_ == DeviceType::CUDA; }
     bool is_vulkan() const { return type_ == DeviceType::Vulkan; }
+    // The meta device models shape and dtype only; it never owns or aliases
+    // real memory, so its storage hands out a null data pointer.
+    bool is_meta() const { return type_ == DeviceType::Meta; }
 
     // Convert device to string representation using macro-based mapping
     std::string toString() const {

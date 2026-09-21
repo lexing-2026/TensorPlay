@@ -40,6 +40,8 @@ inline constexpr DispatchKey get_autocast_dispatch_key_from_device_type(
             return DispatchKey::AutocastCUDA;
         case DeviceType::Vulkan:
             return DispatchKey::AutocastVulkan;
+        case DeviceType::Meta:
+            return DispatchKey::AutocastMeta;
         default:
             TP_THROW(NotImplementedError,
                 "unknown device type for autocast in get_autocast_dispatch_key_from_device_type");
@@ -54,6 +56,10 @@ inline constexpr DeviceType get_device_type_from_autocast_key(DispatchKey key) {
             return DeviceType::CUDA;
         case DispatchKey::AutocastVulkan:
             return DeviceType::Vulkan;
+        case DispatchKey::AutocastMeta:
+            // The meta device owns no data, so autocast is never enabled
+            // for it; the key still maps so state queries stay total.
+            return DeviceType::Meta;
         default:
             TP_THROW(NotImplementedError,
                 "unknown autocast dispatch key in get_device_type_from_autocast_key");

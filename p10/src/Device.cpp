@@ -47,6 +47,13 @@ Device::Device(const std::string& device_str) : type_(DeviceType::CPU), index_(-
         } else {
             index_ = 0;
         }
+    } else if (s.rfind("meta", 0) == 0) {
+        // The meta device is unindexed: it holds shapes only, so there is no
+        // physical slot a ":n" suffix could name.
+        if (s.find(':') != std::string::npos) {
+            TP_THROW(ValueError, "Invalid device string: " + device_str);
+        }
+        type_ = DeviceType::Meta;
     } else {
         TP_THROW(ValueError, "Invalid device string: " + device_str);
     }
@@ -62,6 +69,8 @@ Device::Device(const std::string& type_str, int64_t index) : index_(index) {
         type_ = DeviceType::CUDA;
     } else if (s == "vulkan" || s == "vk") {
         type_ = DeviceType::Vulkan;
+    } else if (s == "meta") {
+        type_ = DeviceType::Meta;
     } else {
         TP_THROW(ValueError, "Invalid device type: " + type_str);
     }
