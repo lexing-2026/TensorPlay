@@ -9,6 +9,7 @@
 #include "CUDAContext.h"
 #include "CUDAGraph.h"
 #include "CUDARuntime.h"
+#include "CudaTunable.h"
 #include "Context.h"
 #include "Exception.h"
 #include "LinearAlgebraNames.h"
@@ -18,9 +19,11 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <sstream>
 #include <unordered_map>
 #include <vector>
 
@@ -107,6 +110,13 @@ struct GemmPlan {
     bool autotuned = false;
     size_t workspace_size = 0;
     // Scratch storage is resolved per matmul call from shared_workspace().
+
+    // Tuning-context resolution for this plan, valid for the database
+    // generation recorded in tunable_epoch (0 = never resolved).
+    enum class TunableChoice { Unresolved, UseDefault, UseAlgo };
+    TunableChoice tunable_choice = TunableChoice::Unresolved;
+    uint64_t tunable_epoch = 0;
+    cublasLtMatmulAlgo_t tunable_algo{};
 
     ~GemmPlan() {
         if (pref) cublasLtMatmulPreferenceDestroy(pref);
@@ -280,7 +290,276 @@ std::shared_ptr<GemmPlan> get_gemm_plan(DType dtype, int64_t M, int64_t N, int64
     return plan;
 }
 
+// ---------------------------------------------------------------------------
+// TunableOp support: serialize, reconstruct and validate cuBLASLt algorithms
+// so a measured winner survives the process that measured it.
+// ---------------------------------------------------------------------------
+
+// The configuration fields that identify one cuBLASLt algorithm. The
+// serialized name is the persistence key recorded in the results file.
+struct LtAlgoConfig {
+    int id = 0;
+    uint32_t tile = 0;
+    uint32_t stages = 0;
+    int32_t splitk = 0;
+    uint32_t reduction = 0;
+    uint32_t swizzle = 0;
+    uint32_t custom = 0;
+    uint16_t inner_shape = 0;
+    uint16_t cluster_shape = 0;
+};
+
+bool getLtAlgoConfig(const cublasLtMatmulAlgo_t& algo, LtAlgoConfig* out) {
+    auto read = [&](cublasLtMatmulAlgoConfigAttributes_t attr, void* value,
+                    size_t size) {
+        size_t written = 0;
+        return cublasLtMatmulAlgoConfigGetAttribute(&algo, attr, value, size,
+                                                    &written) == CUBLAS_STATUS_SUCCESS;
+    };
+    bool ok = read(CUBLASLT_ALGO_CONFIG_ID, &out->id, sizeof(out->id)) &&
+              read(CUBLASLT_ALGO_CONFIG_TILE_ID, &out->tile, sizeof(out->tile)) &&
+              read(CUBLASLT_ALGO_CONFIG_STAGES_ID, &out->stages, sizeof(out->stages)) &&
+              read(CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &out->splitk, sizeof(out->splitk)) &&
+              read(CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &out->reduction,
+                   sizeof(out->reduction)) &&
+              read(CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, &out->swizzle, sizeof(out->swizzle)) &&
+              read(CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, &out->custom, sizeof(out->custom));
+#if defined(CUBLAS_VERSION) && CUBLAS_VERSION >= 12000
+    ok = ok && read(CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID, &out->inner_shape,
+                    sizeof(out->inner_shape)) &&
+          read(CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID, &out->cluster_shape,
+               sizeof(out->cluster_shape));
+#endif
+    return ok;
+}
+
+std::string ltAlgoConfigName(const LtAlgoConfig& c) {
+    std::ostringstream ss;
+    ss << "lt_id" << c.id << "_tile" << c.tile << "_stages" << c.stages
+       << "_splitk" << c.splitk << "_red" << c.reduction << "_swizzle" << c.swizzle
+       << "_custom" << c.custom;
+#if defined(CUBLAS_VERSION) && CUBLAS_VERSION >= 12000
+    ss << "_inner" << c.inner_shape << "_cluster" << c.cluster_shape;
+#endif
+    return ss.str();
+}
+
+bool parseLtAlgoConfig(const std::string& name, LtAlgoConfig* out) {
+#if defined(CUBLAS_VERSION) && CUBLAS_VERSION >= 12000
+    const int matched = std::sscanf(
+        name.c_str(),
+        "lt_id%d_tile%u_stages%u_splitk%d_red%u_swizzle%u_custom%u_inner%hu_cluster%hu",
+        &out->id, &out->tile, &out->stages, &out->splitk, &out->reduction,
+        &out->swizzle, &out->custom, &out->inner_shape, &out->cluster_shape);
+    return matched == 9;
+#else
+    const int matched = std::sscanf(
+        name.c_str(), "lt_id%d_tile%u_stages%u_splitk%d_red%u_swizzle%u_custom%u",
+        &out->id, &out->tile, &out->stages, &out->splitk, &out->reduction,
+        &out->swizzle, &out->custom);
+    return matched == 7;
+#endif
+}
+
+// Rebuilds an algorithm from its serialized configuration. The tile and
+// schedule fields are what the heuristic search actually chose, so writing
+// them back onto an initialized algorithm of the same id reproduces it.
+bool initLtAlgoFromConfig(const LtAlgoConfig& c, cublasComputeType_t compute,
+                          cudaDataType_t scale, cudaDataType_t type,
+                          cublasLtMatmulAlgo_t* algo) {
+    if (cublasLtMatmulAlgoInit(CUDAContext::getCublasLtHandle(), compute, scale,
+                               type, type, type, type, c.id,
+                               algo) != CUBLAS_STATUS_SUCCESS) {
+        return false;
+    }
+    auto write = [&](cublasLtMatmulAlgoConfigAttributes_t attr, const void* value,
+                     size_t size) {
+        return cublasLtMatmulAlgoConfigSetAttribute(algo, attr, value,
+                                                    size) == CUBLAS_STATUS_SUCCESS;
+    };
+    bool ok = write(CUBLASLT_ALGO_CONFIG_ID, &c.id, sizeof(c.id)) &&
+              write(CUBLASLT_ALGO_CONFIG_TILE_ID, &c.tile, sizeof(c.tile)) &&
+              write(CUBLASLT_ALGO_CONFIG_STAGES_ID, &c.stages, sizeof(c.stages)) &&
+              write(CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &c.splitk, sizeof(c.splitk)) &&
+              write(CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &c.reduction,
+                    sizeof(c.reduction)) &&
+              write(CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, &c.swizzle, sizeof(c.swizzle)) &&
+              write(CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, &c.custom, sizeof(c.custom));
+#if defined(CUBLAS_VERSION) && CUBLAS_VERSION >= 12000
+    ok = ok && write(CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID, &c.inner_shape,
+                     sizeof(c.inner_shape)) &&
+          write(CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID, &c.cluster_shape,
+                sizeof(c.cluster_shape));
+#endif
+    return ok;
+}
+
+// A reconstructed algorithm is only usable when the library confirms it can
+// run for this plan's descriptors on the current device.
+bool algoRunsOnPlan(const GemmPlan& plan, const cublasLtMatmulAlgo_t& algo) {
+    cublasLtMatmulHeuristicResult_t result{};
+    return cublasLtMatmulAlgoCheck(CUDAContext::getCublasLtHandle(),
+                                   plan.matmul_desc, plan.a_desc, plan.b_desc,
+                                   plan.c_desc, plan.c_desc, &algo,
+                                   &result) == CUBLAS_STATUS_SUCCESS &&
+           result.state == CUBLAS_STATUS_SUCCESS;
+}
+
+// Times `samples` back-to-back executions of one candidate after a single
+// untimed warm-up that doubles as the support probe. Returns the average
+// milliseconds per execution, or a negative value when the candidate failed
+// to run at all.
+template <typename Exec>
+double timeLtCandidate(const Exec& exec, const cublasLtMatmulAlgo_t& algo,
+                       int samples, cudaStream_t stream) {
+    cudaEvent_t ev_start = nullptr, ev_end = nullptr;
+    cudaEventCreate(&ev_start);
+    cudaEventCreate(&ev_end);
+    if (exec(algo) != CUBLAS_STATUS_SUCCESS) {
+        cudaEventDestroy(ev_start);
+        cudaEventDestroy(ev_end);
+        return -1.0;
+    }
+    cudaEventRecord(ev_start, stream);
+    for (int t = 0; t < samples; ++t) {
+        exec(algo);
+    }
+    cudaEventRecord(ev_end, stream);
+    cudaEventSynchronize(ev_end);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, ev_start, ev_end);
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_end);
+    return static_cast<double>(ms) / samples;
+}
+
 } // namespace
+
+// Chooses the cuBLASLt algorithm for `plan` under the tuning context.
+//
+// Resolution order: a winner recorded in the results database (rebuilt from
+// its serialized configuration and validated against the plan), and, when
+// none is recorded, a bounded measurement pass over the plan's heuristic
+// candidates whose winner is recorded for later runs. Under an active graph
+// capture nothing is measured and the heuristic top choice is pinned for
+// the process, keeping eager reruns bit-identical to the captured replay.
+// With tuning switched off, an untuned shape runs the heuristic top choice
+// for this call only (so tuning can still be enabled later) and is
+// optionally logged to the untuned file.
+//
+// Returns nullptr when the plan's top heuristic candidate should run (the
+// "Default" choice). The measurement pass executes with the caller-provided
+// beta = 0 scale slot and preserves `result` around its trials.
+const cublasLtMatmulAlgo_t* tunable_select(GemmPlan& plan, DType dtype,
+                                           int64_t M, int64_t N, int64_t K,
+                                           bool has_bias, bool other_transposed,
+                                           const void* a_ptr, const void* b_ptr,
+                                           Tensor& result, void* alpha_ptr,
+                                           void* beta_ptr, double beta) {
+    auto& ctx = tunable::TuningContext::get();
+    ctx.ensureInitialized();
+
+    const bool tf32 = dtype == DType::Float32 && globalContext().allowTF32CuBLAS();
+    const std::string op = tunable::gemmOpSignature(dtype, tf32);
+    const std::string params =
+        tunable::gemmParamsSignature(M, N, K, has_bias, other_transposed, plan.device);
+
+    if (plan.tunable_choice == GemmPlan::TunableChoice::Unresolved ||
+        plan.tunable_epoch != ctx.epoch()) {
+        tunable::TuningResult hit;
+        if (ctx.lookup(op, params, &hit)) {
+            plan.tunable_choice = GemmPlan::TunableChoice::UseDefault;
+            LtAlgoConfig config;
+            if (hit.kernel != "Default" && parseLtAlgoConfig(hit.kernel, &config) &&
+                initLtAlgoFromConfig(config, to_compute_type(dtype),
+                                     to_scale_type(dtype), to_cublas_type(dtype),
+                                     &plan.tunable_algo) &&
+                algoRunsOnPlan(plan, plan.tunable_algo)) {
+                plan.tunable_choice = GemmPlan::TunableChoice::UseAlgo;
+            }
+            plan.tunable_epoch = ctx.epoch();
+        } else if (tensorplay::cuda::isCapturing()) {
+            if (ctx.isRecordUntunedEnabled()) {
+                ctx.recordUntuned(op, params);
+            }
+            plan.tunable_choice = GemmPlan::TunableChoice::UseDefault;
+            plan.tunable_epoch = ctx.epoch();
+        } else if (ctx.isTuningEnabled()) {
+            // Trials write the product into `result` with beta = 0; keep the
+            // caller's accumulation out of the way while they run.
+            Tensor saved_result;
+            if (beta != 0.0) {
+                saved_result = result.clone();
+            }
+
+            cudaStream_t stream = getCurrentCUDAStream().stream();
+            auto exec_with_algo = [&](const cublasLtMatmulAlgo_t& algo) {
+                return cublasLtMatmul(
+                    CUDAContext::getCublasLtHandle(), plan.matmul_desc, alpha_ptr,
+                    a_ptr, plan.a_desc, b_ptr, plan.b_desc, beta_ptr,
+                    result.data_ptr(), plan.c_desc, result.data_ptr(), plan.c_desc,
+                    &algo, shared_workspace(plan.device, plan.workspace_size),
+                    plan.workspace_size, stream);
+            };
+
+            // Sample budget per candidate: the knob values, with the
+            // duration limit converted to a call count through the probe's
+            // per-call cost. Unbounded knobs fall back to a fixed count.
+            constexpr int kFallbackSamples = 100;
+            const int max_samples = ctx.maxTuningSamples();
+            const int max_ms = ctx.maxTuningDurationMs();
+            int best = -1;
+            double best_ms = std::numeric_limits<double>::infinity();
+            for (size_t c = 0; c < plan.candidates.size(); ++c) {
+                const double probe = timeLtCandidate(exec_with_algo,
+                                                     plan.candidates[c].algo, 1, stream);
+                if (probe < 0.0) {
+                    continue;
+                }
+                int samples = max_samples > 0 ? max_samples : kFallbackSamples;
+                if (max_ms > 0 && probe > 0.0) {
+                    samples = std::min(
+                        samples, std::max(1, static_cast<int>(max_ms / probe)));
+                }
+                samples = std::max(1, samples);
+                const double avg =
+                    timeLtCandidate(exec_with_algo, plan.candidates[c].algo,
+                                    samples, stream);
+                if (avg >= 0.0 && avg < best_ms) {
+                    best_ms = avg;
+                    best = static_cast<int>(c);
+                }
+            }
+
+            if (beta != 0.0) {
+                result.copy_(saved_result);
+            }
+
+            tunable::TuningResult entry;
+            if (best >= 0) {
+                plan.tunable_algo = plan.candidates[static_cast<size_t>(best)].algo;
+                plan.tunable_choice = GemmPlan::TunableChoice::UseAlgo;
+                LtAlgoConfig config;
+                getLtAlgoConfig(plan.tunable_algo, &config);
+                entry.kernel = ltAlgoConfigName(config);
+                entry.time_ms = best_ms;
+            } else {
+                plan.tunable_choice = GemmPlan::TunableChoice::UseDefault;
+                entry.kernel = "Default";
+            }
+            ctx.record(op, params, entry);
+            plan.tunable_epoch = ctx.epoch();
+        } else if (ctx.isRecordUntunedEnabled()) {
+            ctx.recordUntuned(op, params);
+            // Left unresolved on purpose: enabling tuning later in this
+            // process must still be able to measure the shape.
+        }
+    }
+
+    return plan.tunable_choice == GemmPlan::TunableChoice::UseAlgo
+               ? &plan.tunable_algo
+               : nullptr;
+}
 
 void check_cublas_gemm_dtype(DType t) {
     switch (t) {
@@ -462,9 +741,10 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
     std::lock_guard<std::mutex> execution_lock(plan->execution_mutex);
 
     void* alpha_ptr = to_scalar_ptr(alpha, dtype, 0);
-    // Autotune trials must not read/accumulate into C, so they run with
-    // beta = 0; the caller's beta is written into the same scale slot after
-    // tuning and used for the final execution below.
+    // Measurement passes (the in-process autotune or a tuning search) must
+    // not read/accumulate into C, so they run with beta = 0; the caller's
+    // beta is written into the same scale slot after the pass and used for
+    // the final execution below.
     void* beta_ptr = to_scalar_ptr(0.0, dtype, 1);
 
     // Bias pointer for the bias epilogue (CUDA 11-style API: desc attribute).
@@ -474,89 +754,83 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
                                                        &bias_ptr, sizeof(void*)));
     }
 
-    const bool run_autotune = !plan->autotuned && !tensorplay::cuda::isCapturing();
+    const bool tunable_on = tunable::TuningContext::get().isEnabled();
+    // The tuning-context winner, when it selected a concrete algorithm;
+    // null means the plan's top heuristic candidate runs.
+    const cublasLtMatmulAlgo_t* chosen_algo = nullptr;
 
-    // Autotune trials write D in place.  Preserve the caller's C only while
-    // those trials run and beta is non-zero, so the real beta*C + alpha*A*B
-    // execution below still sees the original accumulation buffer.  Without
-    // this, the trials' beta=0 output is fed into the final beta=1 call and
-    // the first GEMM using a broadcast addmm bias returns (roughly) 2*AB.
-    Tensor saved_result;
-    if (run_autotune && beta != 0.0) {
-        saved_result = result.clone();
-    }
+    if (tunable_on) {
+        // tunable_select runs its own measurement pass and preserves the
+        // caller's accumulation around it.
+        chosen_algo = tunable_select(*plan, dtype, M, N, K, has_bias,
+                                     other_transposed, a_ptr, b_ptr, result,
+                                     alpha_ptr, beta_ptr, beta);
+    } else {
+        const bool run_autotune = !plan->autotuned && !tensorplay::cuda::isCapturing();
 
-    // One-time micro-autotune: time every heuristic candidate and keep the
-    // measured winner at index 0.  cuBLASLt's top-1 estimate is not always
-    // the fastest kernel for a given arch; this makes the choice empirical
-    // while paying the cost only on the first call per (shape, dtype) key.
-    //
-    // Skipped while a CUDA graph capture is live: the trials record events
-    // on the capturing stream, which aborts capture.  The plan is then
-    // PINNED to heuristic candidate 0 so captured and eager executions use
-    // bit-identical algorithms (mixing algorithms shows up as ulp-level
-    // divergence between replay and eager recompute).
-    if (run_autotune) {
-        int best = 0;
-        float best_ms = std::numeric_limits<float>::max();
-        for (size_t c = 0; c < plan->candidates.size(); ++c) {
-            cudaEvent_t ev_start, ev_end;
-            cudaEventCreate(&ev_start);
-            cudaEventCreate(&ev_end);
-            // Warm up this algorithm once (also validates it really runs).
-            cublasStatus_t st = cublasLtMatmul(
-                CUDAContext::getCublasLtHandle(), plan->matmul_desc, alpha_ptr,
-                a_ptr, plan->a_desc,
-                b_ptr, plan->b_desc,
-                beta_ptr,
-                result.data_ptr(), plan->c_desc,
-                result.data_ptr(), plan->c_desc,
-                &plan->candidates[c].algo, shared_workspace(plan->device, plan->workspace_size), plan->workspace_size,
-                getCurrentCUDAStream().stream());
-            if (st != CUBLAS_STATUS_SUCCESS) {
-                cudaEventDestroy(ev_start);
-                cudaEventDestroy(ev_end);
-                continue;
-            }
-            constexpr int kTrials = 3;
-            cudaEventRecord(ev_start, getCurrentCUDAStream().stream());
-            for (int t = 0; t < kTrials; ++t) {
-                cublasLtMatmul(
+        // Autotune trials write D in place.  Preserve the caller's C only
+        // while those trials run and beta is non-zero, so the real
+        // beta*C + alpha*A*B execution below still sees the original
+        // accumulation buffer.  Without this, the trials' beta=0 output is
+        // fed into the final beta=1 call and the first GEMM using a
+        // broadcast addmm bias returns (roughly) 2*AB.
+        Tensor saved_result;
+        if (run_autotune && beta != 0.0) {
+            saved_result = result.clone();
+        }
+
+        // One-time micro-autotune: time every heuristic candidate and keep
+        // the measured winner at index 0.  cuBLASLt's top-1 estimate is not
+        // always the fastest kernel for a given arch; this makes the choice
+        // empirical while paying the cost only on the first call per
+        // (shape, dtype) key.
+        //
+        // Skipped while a CUDA graph capture is live: the trials record
+        // events on the capturing stream, which aborts capture.  The plan
+        // is then PINNED to heuristic candidate 0 so captured and eager
+        // executions use bit-identical algorithms (mixing algorithms shows
+        // up as ulp-level divergence between replay and eager recompute).
+        if (run_autotune) {
+            auto exec_with_algo = [&](const cublasLtMatmulAlgo_t& algo) {
+                return cublasLtMatmul(
                     CUDAContext::getCublasLtHandle(), plan->matmul_desc, alpha_ptr,
                     a_ptr, plan->a_desc,
                     b_ptr, plan->b_desc,
                     beta_ptr,
                     result.data_ptr(), plan->c_desc,
                     result.data_ptr(), plan->c_desc,
-                    &plan->candidates[c].algo, shared_workspace(plan->device, plan->workspace_size), plan->workspace_size,
+                    &algo, shared_workspace(plan->device, plan->workspace_size), plan->workspace_size,
                     getCurrentCUDAStream().stream());
+            };
+            cudaStream_t stream = getCurrentCUDAStream().stream();
+            constexpr int kTrials = 3;
+            int best = 0;
+            double best_ms = std::numeric_limits<double>::infinity();
+            for (size_t c = 0; c < plan->candidates.size(); ++c) {
+                const double avg = timeLtCandidate(exec_with_algo,
+                                                   plan->candidates[c].algo,
+                                                   kTrials, stream);
+                if (avg >= 0.0 && avg < best_ms) {
+                    best_ms = avg;
+                    best = static_cast<int>(c);
+                }
             }
-            cudaEventRecord(ev_end, getCurrentCUDAStream().stream());
-            cudaEventSynchronize(ev_end);
-            float ms = 0;
-            cudaEventElapsedTime(&ms, ev_start, ev_end);
-            cudaEventDestroy(ev_start);
-            cudaEventDestroy(ev_end);
-            if (ms < best_ms) {
-                best_ms = ms;
-                best = static_cast<int>(c);
+            if (best != 0) {
+                std::swap(plan->candidates[0], plan->candidates[static_cast<size_t>(best)]);
             }
+            plan->autotuned = true;
+        } else if (!plan->autotuned) {
+            // First use happened under capture: pin heuristic candidate 0.
+            plan->autotuned = true;
         }
-        if (best != 0) {
-            std::swap(plan->candidates[0], plan->candidates[static_cast<size_t>(best)]);
+
+        if (run_autotune && beta != 0.0) {
+            result.copy_(saved_result);
         }
-        plan->autotuned = true;
-    } else if (!plan->autotuned) {
-        // First use happened under capture: pin heuristic candidate 0.
-        plan->autotuned = true;
     }
 
     // Restore the caller's beta for the real execution.
     beta_ptr = to_scalar_ptr(beta, dtype, 1);
-
-    if (run_autotune && beta != 0.0) {
-        result.copy_(saved_result);
-    }
 
     CUBLASLT_CHECK(cublasLtMatmul(
         CUDAContext::getCublasLtHandle(), plan->matmul_desc, alpha_ptr,
@@ -565,7 +839,8 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
         beta_ptr,
         result.data_ptr(), plan->c_desc,
         result.data_ptr(), plan->c_desc,
-        &plan->candidates[0].algo, shared_workspace(plan->device, plan->workspace_size), plan->workspace_size,
+        chosen_algo ? chosen_algo : &plan->candidates[0].algo,
+        shared_workspace(plan->device, plan->workspace_size), plan->workspace_size,
         getCurrentCUDAStream().stream()));
 }
 
