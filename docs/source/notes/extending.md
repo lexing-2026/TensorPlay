@@ -6,7 +6,7 @@ TensorPlay's built-in operator set and modules cover most workloads, but a
 few situations call for adding your own: an operation autograd cannot
 record automatically, a computation that leaves the framework (a native
 library, a GPU kernel written by hand), or a type that should behave like
-a tensor inside TensorPlay operations. This note walks through the three
+a tensor inside TensorPlay operations. This note walks through the four
 extension points and when to reach for each.
 
 ## Adding new operators
@@ -49,13 +49,92 @@ pass; when it is omitted the context stays empty and the backward must
 compute from the gradient alone.
 
 Choosing the mutation and aliasing contract (functional, in-place, `out=`,
-or general mutation) is a schema-level decision described in detail on
-the {doc}`library reference page <library>`. For kernels written in
-Triton or TileLang, `tensorplay.library.triton_op` /
+or general mutation) is a schema-level decision described in detail on the
+{doc}`library reference page <library>`. For kernels written in Triton or
+TileLang, `tensorplay.library.triton_op` /
 `tensorplay.library.tile_lang_op` wrap the kernel launch with the same
 operator machinery. New operators can be validated with
 {func}`tensorplay.library.opcheck`, and their gradients with
 {func}`tensorplay.autograd.gradcheck.gradcheck`.
+
+## C and C++ kernels (JIT)
+
+Kernels written in C++ or CUDA enter through
+{mod}`tensorplay.utils.cpp_jit`, a thin frontend over the `tvm-ffi`
+compile engine. String sources are compiled into a shared library whose
+exported functions accept any DLPack-compatible tensor; because
+`tensorplay.Tensor` implements the DLPack protocol, tensors cross the
+boundary zero-copy — the kernel sees a plain view (data pointer, shape,
+strides, dtype, device) and no adapter layer is involved:
+
+```python
+import tensorplay as tp
+from tensorplay.utils import cpp_jit
+
+mod = cpp_jit.load_inline(
+    name="myext",
+    cpp_sources=r"""
+    void scale_cpu(tvm::ffi::TensorView x, tvm::ffi::TensorView y) {
+      for (int64_t i = 0; i < x.size(0); ++i) {
+        static_cast<float*>(y.data_ptr())[i] =
+            static_cast<float*>(x.data_ptr())[i] * 3.0f;
+      }
+    }
+    """,
+    functions=["scale_cpu"],
+)
+
+x = tp.tensor([1.0, 2.0, 3.0])
+y = tp.empty_like(x)
+mod.scale_cpu(x, y)          # y == 3 * x, no copies
+```
+
+Repeated calls with the same `name` reuse the cached build, and passing
+`cuda_sources=` compiles CUDA sources into the same library. The engine
+is an optional dependency: `cpp_jit.is_available()` reports whether it is
+importable, and the loading entry points raise an error with install
+instructions when it is not.
+
+An FFI kernel by itself is an opaque callable — it allocates nothing,
+records no autograd node, and stays invisible to `tensorplay.compile`
+until wrapped. Combine it with `tensorplay.library.custom_op` as in the
+previous section: the operator body allocates outputs and calls the
+kernel, `register_fake` propagates shapes, and `register_autograd`
+attaches the derivative. Under `tensorplay.compile` the whole operator is
+captured as one opaque node, so the kernel boundary survives compilation.
+
+To ship a kernel to machines without a compiler, build it ahead of time
+and load the artifact by path:
+
+```python
+lib = cpp_jit.build_inline(
+    name="myext", cpp_sources=..., functions=["scale_cpu"])
+# later, possibly in another process:
+mod = cpp_jit.load_module(lib)
+```
+
+For real source trees, `cpp_jit.build` and `cpp_jit.load` take source
+*files* instead of strings. Nothing is generated on the files' behalf:
+each kernel that should be reachable must carry its own export macro
+(`TVM_FFI_DLL_EXPORT_TYPED_FUNC`) in the source. Kernels linked straight
+into the process — compiled into the executable rather than loaded from
+an artifact — are reached through `cpp_jit.system_lib()` without dynamic
+loading.
+
+An artifact carries the kernels and nothing else. The operator wrapper —
+schema, fake kernel, autograd formula — is Python and is re-declared on
+the target machine with `custom_op`, exactly as in the JIT flow above;
+only the compilation step is skipped. When the full operator definition
+itself must ride with the artifact (registered kernels, no Python
+re-declaration), build a compile-time op module instead: a yaml schema
+processed by the repository's code generator into an op library linked
+against the core. The two AOT forms are complementary: `cpp_jit` ships
+kernels cheaply, the compile-time path ships whole operators.
+
+FFI kernels see DLPack views, not the TensorPlay object model: they
+cannot call back into the dispatcher or register operators themselves.
+The same division applies — iteration and kernel shipping through
+`cpp_jit`, deep framework integration through the compile-time path.
 
 ## Extending autograd
 
