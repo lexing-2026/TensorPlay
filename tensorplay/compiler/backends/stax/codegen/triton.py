@@ -1871,27 +1871,23 @@ def emit_tile_epilogue_lines(
     return emitter._epilogue_lines(source_reg)
 
 
-def _compile_program(
+def _program_digest(
     program: list[int],
     constants: list[float],
     output_refs: tuple[int, ...],
     example_inputs: list[Any],
-    *,
-    fixed_config: tuple[int, int] | None = None,
-    reduction: str | None = None,
-    input_shapes: tuple[tuple[int, ...], ...] | None = None,
-    reference_shape: tuple[int, ...] | None = None,
-    value_dtype: str | None = None,
-    epilogue: tuple[list[int], list[float], int] | None = None,
-    reduction_outputs: tuple[str, ...] | None = None,
-):
-    if not HAS_TRITON:
-        raise RuntimeError("Triton is not installed")
-    if not _supports_runtime_inputs(
-        example_inputs, allow_grad=True, reference_shape=reference_shape
-    ):
-        raise NotImplementedError("Triton requires matching contiguous CUDA tensors")
-    digest = hashlib.sha256(
+    reduction,
+    epilogue,
+    reduction_outputs,
+) -> str:
+    """Content hash of a program specialization (M6).
+
+    Covers the emitter generation, the program, the reduction/epilogue
+    payload and the example inputs' shapes/dtypes/devices -- the last
+    because the kernel name and the baked geometry follow from them.
+    """
+
+    return hashlib.sha256(
         (
             repr(
                 (
@@ -1912,12 +1908,41 @@ def _compile_program(
             )
         ).encode()
     ).hexdigest()[:16]
-    # is content-addressed and persisted; a process-level memo keeps the
-    # exec'd launch callable so repeated compile() calls skip regeneration.
-    memo_key = f"{digest}:{fixed_config}"
-    cached_launch = _launch_memo.get(memo_key)
-    if cached_launch is not None:
-        return cached_launch
+
+
+def _program_source(
+    program: list[int],
+    constants: list[float],
+    output_refs: tuple[int, ...],
+    example_inputs: list[Any],
+    *,
+    fixed_config: tuple[int, int] | None = None,
+    reduction=None,
+    input_shapes=None,
+    reference_shape=None,
+    value_dtype: str | None = None,
+    epilogue=None,
+    reduction_outputs=None,
+) -> tuple[str, str]:
+    """Generate one candidate's kernel source without exec'ing it (M6).
+
+    Source generation is cheap string assembly; the expensive Triton
+    compile only happens when the launch callable first runs.  Splitting
+    the two lets the warm-compile pool ship the text to helper processes,
+    which compile it into the shared on-disk cache while the parent goes
+    straight to benchmarking.  Returns ``(source, source_filename)``; the
+    filename keys the linecache entry the exec path installs.
+    """
+
+    digest = _program_digest(
+        program,
+        constants,
+        output_refs,
+        example_inputs,
+        reduction,
+        epilogue,
+        reduction_outputs,
+    )
     kernel_name = f"stax_triton_program_{digest}"
     source = TritonProgramCodegen(
         program, constants, output_refs, len(example_inputs),
@@ -1928,6 +1953,84 @@ def _compile_program(
         epilogue=epilogue,
         reduction_outputs=reduction_outputs,
     ).generate(kernel_name, fixed_config=fixed_config)
+    return source, f"<tensorplay-stax-triton-program-{digest}>"
+
+
+def _warm_compile_candidates(candidates, example_inputs, source_for) -> None:
+    """Pre-compile every candidate in helper processes before benching (M6).
+
+    ``source_for(config)`` returns ``(source, filename)`` for a candidate.
+    Helpers drive one launch each against placeholder inputs matching the
+    examples, landing the binaries in the shared on-disk cache, so the
+    benchmark rounds start with warm kernels instead of paying every
+    candidate's serial compile.  Entirely best-effort: any failure leaves
+    the lazy per-candidate compile in place.
+    """
+
+    from ..runtime import warm_compile
+
+    if not warm_compile.enabled():
+        return
+    try:
+        meta = tuple(
+            (
+                tuple(int(size) for size in value.shape),
+                repr(value.dtype),
+                str(value.device),
+            )
+            for value in example_inputs
+        )
+        tasks = [
+            (source, fake_file, meta)
+            for source, fake_file in (
+                source_for(config) for config in candidates
+            )
+        ]
+    except Exception:  # noqa: BLE001 - warm is best-effort
+        return
+    warm_compile.warm_sources(tasks)
+
+
+def _compile_program(
+    program: list[int],
+    constants: list[float],
+    output_refs: tuple[int, ...],
+    example_inputs: list[Any],
+    *,
+    fixed_config: tuple[int, int] | None = None,
+    reduction: str | None = None,
+    input_shapes: tuple[tuple[int, ...], ...] | None = None,
+    reference_shape: tuple[int, ...] | None = None,
+    value_dtype: str | None = None,
+    epilogue: tuple[list[int], list[float], int] | None = None,
+    reduction_outputs: tuple[str, ...] | None = None,
+):
+    if not HAS_TRITON:
+        raise RuntimeError("Triton is not installed")
+    if not _supports_runtime_inputs(
+        example_inputs, allow_grad=True, reference_shape=reference_shape
+    ):
+        raise NotImplementedError("Triton requires matching contiguous CUDA tensors")
+    digest = _program_digest(
+        program, constants, output_refs, example_inputs,
+        reduction, epilogue, reduction_outputs,
+    )
+    # is content-addressed and persisted; a process-level memo keeps the
+    # exec'd launch callable so repeated compile() calls skip regeneration.
+    memo_key = f"{digest}:{fixed_config}"
+    cached_launch = _launch_memo.get(memo_key)
+    if cached_launch is not None:
+        return cached_launch
+    source, fake_file = _program_source(
+        program, constants, output_refs, example_inputs,
+        fixed_config=fixed_config,
+        reduction=reduction,
+        input_shapes=input_shapes,
+        reference_shape=reference_shape,
+        value_dtype=value_dtype,
+        epilogue=epilogue,
+        reduction_outputs=reduction_outputs,
+    )
     try:
         from ..codecache import default_cache
 
@@ -2089,6 +2192,20 @@ def _autotune_dims_program(
         candidates = loop_pass.dims_loop_candidates(
             rnumel, candidates
         )
+    _warm_compile_candidates(
+        candidates,
+        example_inputs,
+        lambda config: _program_source(
+            program, constants, output_refs, example_inputs,
+            fixed_config=config,
+            reduction=reduction,
+            input_shapes=input_shapes,
+            reference_shape=reference_shape,
+            value_dtype=value_dtype,
+            epilogue=epilogue,
+            reduction_outputs=reduction_outputs,
+        ),
+    )
     best_config, best_launch, best_time = stax_autotune.bench_candidates(
         build, candidates, list(example_inputs)
     )
@@ -2273,6 +2390,19 @@ def _autotune_split_program(
     if disabled_autotune():
         return build(_STATIC_REDUCTION_CONFIG)
 
+    _warm_compile_candidates(
+        _SPLIT_CANDIDATES,
+        example_inputs,
+        lambda config: _program_source(
+            program, constants, output_refs, example_inputs,
+            fixed_config=config,
+            reduction=reduction,
+            input_shapes=input_shapes,
+            reference_shape=reference_shape,
+            value_dtype=value_dtype,
+            epilogue=epilogue,
+        ),
+    )
     best_cfg, best_launch, best_time = stax_autotune.bench_candidates(
         build, _SPLIT_CANDIDATES, list(example_inputs)
     )
@@ -2424,6 +2554,20 @@ def _autotune_launch(
                 itemsize,
                 stax_autotune.EXHAUSTIVE_CANDIDATE_CONFIGS,
             )
+        _warm_compile_candidates(
+            pointwise_candidates or stax_autotune.CANDIDATE_CONFIGS,
+            example_inputs,
+            lambda config: _program_source(
+                program, constants, output_refs, example_inputs,
+                fixed_config=config,
+                reduction=reduction,
+                input_shapes=input_shapes,
+                reference_shape=reference_shape,
+                value_dtype=value_dtype,
+                epilogue=epilogue,
+                reduction_outputs=reduction_outputs,
+            ),
+        )
 
         # Key on the bare program digest: load_decision() consumers key the
         # same way, and role namespacing is redundant given bucket+device.
