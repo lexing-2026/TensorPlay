@@ -44,7 +44,7 @@ jobs:
     # version and is skipped — trunk pushes already publish latest docs.
     if: ${{ github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
