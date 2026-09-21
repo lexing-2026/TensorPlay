@@ -89,6 +89,60 @@ y = tp.empty_like(x)
 mod.scale_cpu(x, y)          # y == 3 * x, no copies
 ```
 
+### Writing the kernel
+
+A kernel is an ordinary typed C++ function. The FFI enforces the
+declared signature at the boundary — a call with mismatched argument
+types fails before the kernel runs — and the string entry points
+prepend the common headers (tensor view, dtype, error, function, env
+API), so only extras like `<string>` need explicit inclusion.
+
+Tensors arrive as `tvm::ffi::TensorView`, a non-owning view over the
+caller's memory exposing `data_ptr()`, `shape()`, `strides()`,
+`numel()`, `size(i)`, `ndim()`, `dtype()` and `device()`. Scalars pass
+as plain C++ types — `double`, `int64_t`, `bool`, `std::string` — by
+value or const reference, and any convertible type may be returned (a
+`void` kernel returns `None`):
+
+```python
+mod = cpp_jit.load_inline(
+    name="myext2",
+    cpp_sources=r"""
+    #include <string>
+
+    double weighted_sum(tvm::ffi::TensorView x, double factor,
+                        int64_t offset, const std::string& tag) {
+      double s = static_cast<double>(offset);
+      for (int64_t i = 0; i < x.numel(); ++i)
+        s += static_cast<float*>(x.data_ptr())[i];
+      return s * factor + tag.size();
+    }
+    """,
+    functions=["weighted_sum"],
+)
+mod.weighted_sum(tp.tensor([1.0, 2.0, 3.0]), 10.0, 5, "abcd")  # -> 114.0
+```
+
+The view is untyped memory: nothing checks that a `float*` cast matches
+the tensor's dtype, so validating `dtype()` and `device()` is the
+kernel's responsibility. Raise through `TVM_FFI_THROW`, which crosses
+the boundary as the matching Python exception:
+
+```cpp
+if (x.dtype().code != kDLFloat || x.dtype().bits != 32) {
+  TVM_FFI_THROW(TypeError) << "expected float32";
+}
+```
+
+Outputs follow the out-parameter convention: the caller allocates with
+`tp.empty_like` / `tp.empty` and passes the output as another view,
+which the kernel writes into — the `scale_cpu` example above does
+exactly this. Kernels can also allocate their own outputs through the
+environment allocator (`tvm::ffi::Tensor::FromEnvAlloc` with
+`TVMFFIEnvTensorAlloc`); that path requires the host to have installed
+an allocator, so under TensorPlay the out-parameter form is the
+reliable one.
+
 Repeated calls with the same `name` reuse the cached build, and passing
 `cuda_sources=` compiles CUDA sources into the same library. The engine
 is an optional dependency: `cpp_jit.is_available()` reports whether it is
@@ -115,10 +169,10 @@ mod = cpp_jit.load_module(lib)
 
 For real source trees, `cpp_jit.build` and `cpp_jit.load` take source
 *files* instead of strings. Nothing is generated on the files' behalf:
-each kernel that should be reachable must carry its own export macro
-(`TVM_FFI_DLL_EXPORT_TYPED_FUNC`) in the source. Kernels linked straight
-into the process — compiled into the executable rather than loaded from
-an artifact — are reached through `cpp_jit.system_lib()` without dynamic
+they must carry their own header preamble and export macros
+(`TVM_FFI_DLL_EXPORT_TYPED_FUNC`). Kernels linked straight into the
+process — compiled into the executable rather than loaded from an
+artifact — are reached through `cpp_jit.system_lib()` without dynamic
 loading.
 
 An artifact carries the kernels and nothing else. The operator wrapper —
