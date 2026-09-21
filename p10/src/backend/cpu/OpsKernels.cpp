@@ -626,6 +626,15 @@ Tensor reciprocal_cpu(const Tensor& self) {
     return float_math_kernel(self, [](double x) { return 1.0 / x; }, "reciprocal");
 }
 Tensor sgn_cpu(const Tensor& self) {
+    if (isComplexType(self.dtype())) {
+        // z/|z| for nonzero z, zero at the origin; NaN flows through the
+        // division untouched.
+        return complex_unary_op_kernel(self, [](auto z) -> decltype(z) {
+            using T = decltype(z);
+            if (z == T(0, 0)) return T(0, 0);
+            return z / abs(z);
+        });
+    }
     return dtype_unary_kernel(self, [](auto x) -> decltype(x) {
         using T = decltype(x);
         double d = static_cast<double>(x);
