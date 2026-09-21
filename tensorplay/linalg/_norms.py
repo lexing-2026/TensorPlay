@@ -142,7 +142,26 @@ def norm(input, ord=None, dim=None, keepdim=False):
 
 
 def matrix_rank(A, *, atol=None, rtol=None, hermitian=False):
-    """matrix_rank(A, *, atol=None, rtol=None, hermitian=False) -> Tensor"""
+    """Computes the numerical rank of each matrix in ``A``.
+
+    A singular value counts towards the rank when it exceeds the sum of an
+    absolute tolerance and a relative tolerance scaled by the largest
+    singular value of its matrix.
+
+    Args:
+        A (Tensor): tensor of shape ``(..., m, n)`` holding the matrices.
+        atol (float, Tensor, optional): absolute threshold applied to the
+            singular values. Defaults to 0.
+        rtol (float, Tensor, optional): relative threshold applied to the
+            largest singular value. Defaults to ``max(m, n)`` times the
+            machine epsilon of ``A``'s dtype.
+        hermitian (bool): when True, ``A`` is treated as Hermitian and its
+            rank is derived from eigenvalues instead of singular values.
+
+    Returns:
+        Tensor: integer tensor with the rank of each matrix, with the batch
+        dimensions of ``A``.
+    """
     check_floating(A, "matrix_rank")
     if A.dim() < 2:
         raise ValueError("linalg.matrix_rank: input must contain matrices")
