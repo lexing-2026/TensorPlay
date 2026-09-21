@@ -624,6 +624,12 @@ Scalar Tensor::item() const {
     if (impl_ && impl::python_dispatch_active()) {
         return detail::redispatch_item_method(*this);
     }
+    if (is_batched()) {
+        TP_THROW(RuntimeError,
+                 "item() is not supported on a vmap-batched tensor; data-dependent "
+                 "control flow cannot see per-batch values. Use where() or move the "
+                 "condition outside the transform.");
+    }
     if (is_sparse()) {
         TP_THROW(RuntimeError, "item() is not supported for sparse tensors");
     }
