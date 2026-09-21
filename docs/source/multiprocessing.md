@@ -17,83 +17,51 @@ to you.
 
 ## Strategy management
 
+```{eval-rst}
+.. autosummary::
+    :toctree: generated
+    :nosignatures:
+
+    tensorplay.multiprocessing.set_sharing_strategy
+    tensorplay.multiprocessing.get_sharing_strategy
+    tensorplay.multiprocessing.get_all_sharing_strategies
+```
+
 (multiprocessing-cuda-note)=
 
-(multiprocessing-cuda-sharing-details)=
+## CUDA in multiprocessing
 
-## Sharing CUDA tensors
+Cross-process sharing is implemented for CPU tensors only: pickling a tensor
+on any other device raises a `RuntimeError`, so move tensors to the CPU
+before sending them through a queue, and move them back on the device in the
+receiving process.
 
-Sharing CUDA tensors between processes is supported only in Python 3, using
-a `spawn` or `forkserver` start methods.
-Unlike CPU tensors, the sending process is required to keep the original tensor
-as long as the receiving process retains a copy of the tensor. The refcounting is
-implemented under the hood but requires users to follow the next best practices.
-:::{warning}
-If the consumer process dies abnormally to a fatal signal, the shared tensor
-could be forever kept in memory as long as the sending process is running.
-:::
-1. Release memory ASAP in the consumer.
-```
-## Good
-x = queue.get()
-# do somethings with x
-del x
-```
-```
-## Bad
-x = queue.get()
-# do somethings with x
-# do everything else (producer have to keep x in memory)
-```
-2. Keep producer process running until all consumers exits. This will prevent
-the situation when the producer process releasing memory which is still in use
-by the consumer.
-```
-## producer
-# send tensors, do something
-event.wait()
-```
-```
-## consumer
-# receive tensors and use them
-event.set()
-```
-3. Don't pass received tensors.
-```
-# not going to work
-x = queue.get()
-queue_2.put(x)
-```
-```
-# you need to create a process-local copy
-x = queue.get()
-x_clone = x.clone()
-queue_2.put(x_clone)
-```
-```
-# putting and getting from the same queue in the same process will likely end up with segfault
-queue.put(tensor)
-x = queue.get()
-```
+Using CUDA inside subprocesses additionally requires the `spawn` or
+`forkserver` start method. The runtime cannot be re-initialized in a process
+that was forked after initialization; such a child fails with
+`RuntimeError: Cannot re-initialize CUDA in forked subprocess. To use CUDA
+with multiprocessing, you must use the 'spawn' start method`.
 
 ## Sharing strategies
 
 This section provides a brief overview into how different sharing strategies
-work. Note that it applies only to CPU tensor - CUDA tensors will always use
-the CUDA API, as that's the only way they can be shared.
+work. They apply to CPU tensors only; tensors on other devices cannot be
+shared between processes.
 
 ### File descriptor - `file_descriptor`
 
 :::{note}
-This is the default strategy (except for macOS and OS X where it's not
+This is the default strategy (except for macOS and Windows where it's not
 supported).
 :::
-This strategy will use file descriptors as shared memory handles. Whenever a
-storage is moved to shared memory, a file descriptor obtained from `shm_open`
-is cached with the object, and when it's going to be sent to other processes,
-the file descriptor will be transferred (e.g. via UNIX sockets) to it. The
-receiver will also cache the file descriptor and `mmap` it, to obtain a shared
-view onto the storage data.
+This strategy passes an anonymous memory segment to the receiving process as
+a duplicated file descriptor. When a tensor is put on a queue, the sender
+copies the data into a private memory-backed segment created with
+`memfd_create` and transfers the descriptor; the receiver maps it and
+rebuilds a tensor aliasing those pages. The sending tensor keeps its
+original (private) storage, so the two sides are connected only through the
+snapshot taken at send time. Tensors that already live in shared memory skip
+this path and are re-sent by name instead.
 Note that if there will be a lot of tensors shared, this strategy will keep a
 large number of file descriptors open most of the time. If your system has low
 limits for the number of open file descriptors, and you can't raise them, you
@@ -102,8 +70,10 @@ should use the `file_system` strategy.
 ### File system - `file_system`
 
 This strategy will use file names given to `shm_open` to identify the shared
-memory regions. This has a benefit of not requiring the implementation to cache
-the file descriptors obtained from it, but at the same time is prone to shared
+memory regions. When a tensor is sent, its storage is moved into a named
+shared segment in place, and only the name travels to the receiving process.
+This has a benefit of not requiring the implementation to cache
+the file descriptors, but at the same time is prone to shared
 memory leaks. The file can't be deleted right after its creation, because other
 processes need to access it to open their views. If the processes fatally
 crash, or are killed, and don't call the storage destructors, the files will
@@ -132,7 +102,7 @@ facilities for error propagation.
 The `spawn` function below addresses these concerns and takes care
 of error propagation, out of order termination, and will actively
 terminate processes upon detecting an error in one of them.
-A `SpawnContext` is returned by `spawn` when called with `join=False`.
+A `ProcessContext` is returned by `spawn` when called with `join=False`.
 % This module needs to be documented. Adding here in the meantime
 % for tracking purposes
 
