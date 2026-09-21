@@ -6,7 +6,8 @@
 // requests are served from any thread without the interpreter lock.
 //
 // The engine is an optional runtime dependency: its C entry points are
-// resolved with dlopen on demand and nothing links against it.
+// resolved dynamically on demand (dlopen on POSIX, LoadLibrary on
+// Windows) and nothing links against it.
 
 #include "python_bindings.h"
 #include "dlpack_types.h"
@@ -14,11 +15,14 @@
 
 #ifndef _WIN32
 #include <dlfcn.h>
+#else
+#include <windows.h>
 #endif
 
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -79,7 +83,31 @@ int env_allocate(DLTensor* prototype, DLManagedTensorVersioned** out,
     }
 }
 
-#ifndef _WIN32
+// The engine library is already loaded by the host; opening it here
+// only bumps its reference count, and the handle is held for the
+// process lifetime (no close: the allocator stays installed forever).
+void* open_engine_library(const char* path) {
+#ifdef _WIN32
+    // The path arrives as UTF-8; widen it so non-ASCII install paths
+    // survive the ANSI code page.
+    int wide_len = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
+    if (wide_len <= 0) return nullptr;
+    std::wstring wide(static_cast<size_t>(wide_len), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wide.data(), wide_len);
+    return static_cast<void*>(LoadLibraryW(wide.c_str()));
+#else
+    return dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+#endif
+}
+
+void* engine_symbol(void* library, const char* name) {
+#ifdef _WIN32
+    return reinterpret_cast<void*>(
+        GetProcAddress(static_cast<HMODULE>(library), name));
+#else
+    return dlsym(library, name);
+#endif
+}
 
 // Install status: 0 = installed, 1 = a host allocator was already
 // present (it wins), 2 = the engine could not be used.
@@ -87,10 +115,12 @@ int install_ffi_env_allocator(const char* engine_library_path) {
     static std::once_flag once;
     static int status = 2;
     std::call_once(once, [&] {
-        void* lib = dlopen(engine_library_path, RTLD_LAZY | RTLD_LOCAL);
+        void* lib = open_engine_library(engine_library_path);
         if (lib == nullptr) return;
-        void* set_sym = dlsym(lib, "TVMFFIEnvSetDLPackManagedTensorAllocator");
-        void* get_sym = dlsym(lib, "TVMFFIEnvGetDLPackManagedTensorAllocator");
+        void* set_sym = engine_symbol(
+            lib, "TVMFFIEnvSetDLPackManagedTensorAllocator");
+        void* get_sym = engine_symbol(
+            lib, "TVMFFIEnvGetDLPackManagedTensorAllocator");
         if (set_sym == nullptr || get_sym == nullptr) return;
         auto get = reinterpret_cast<GetAllocatorFn>(get_sym);
         if (get() != nullptr) {
@@ -103,15 +133,6 @@ int install_ffi_env_allocator(const char* engine_library_path) {
     });
     return status;
 }
-
-#else
-
-int install_ffi_env_allocator(const char* engine_library_path) {
-    (void)engine_library_path;
-    return 2;  // dynamic engine loading is not supported on this platform
-}
-
-#endif
 
 }  // namespace
 
