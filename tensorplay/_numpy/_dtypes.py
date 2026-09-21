@@ -447,8 +447,8 @@ def issubclass_(arg: object, klass: type[_T]) -> TypeGuard[type[_T]]:
 def issubdtype(arg1: object, arg2: object) -> bool:
     # cf https://github.com/numpy/numpy/blob/v1.24.0/numpy/core/numerictypes.py#L356-L420
 
-    # We also accept strings even if NumPy doesn't as dtypes are serialized as their
-    # string representation in dynamo's graph
+    # We also accept strings even if NumPy doesn't as dtypes are serialized as
+    # their string representation inside a captured graph
     def str_to_abstract(t: object) -> object:
         if isinstance(t, str) and t in _abstract_dtypes:
             return globals()[t]

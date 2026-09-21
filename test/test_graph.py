@@ -276,7 +276,7 @@ class LeafOnlyTracer(Tracer):
         return next(module.named_children(), None) is None
 
 
-def test_default_tracer_inlines_children_like_dynamo():
+def test_default_tracer_inlines_all_child_modules():
     gm = Tracer().trace(TinyBlock())
     ops = {node.op for node in gm.graph.nodes}
     assert "call_module" not in ops

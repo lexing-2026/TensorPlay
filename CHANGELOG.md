@@ -437,7 +437,7 @@ backward 腿 13.5µs；apply 层 16.9µs。
     此前 `_interpret` 取首个 output 而 `recompile` 取末个,可能返回不同值;
   - `lint()` 增加跨图引用与多 output 校验。
 - **Tracer**:
-  - `is_leaf_module(module, qualified_name)` 钩子(默认 False 保持 Dynamo 式内联,
+  - `is_leaf_module(module, qualified_name)` 钩子(默认 False 保持子模块整体内联,
     `tp.compile` 行为不变);返回 True 的子模块产出 `call_module` 节点;
   - `Tracer.node_to_qualname`:每个 call_module 节点记录限定模块路径,共享模块多次执行
     得到 `path_0/path_1` 消歧;叶子子树参数不再产生
