@@ -858,7 +858,6 @@
     alias
     arctan2_
     atan2_
-    audio_to_tensor
     autocast
     avg_pool2d
     avg_pool3d
@@ -1331,7 +1330,6 @@
     values
     view
     view_as
-    vision_to_tensor
     xlog1py
     xlog1py_
     zeta

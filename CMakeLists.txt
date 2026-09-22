@@ -1523,6 +1523,48 @@ if(TP_CUDA_ENABLED)
     target_link_libraries(_C PRIVATE CUDA::cudart)
 endif()
 
+# --- Native codec detection for the image/audio IO bindings ---
+# Version-agnostic: codec libraries are located through the regular
+# include/lib search plus the already-detected CUDA toolkit (via its
+# discovered directories, never a hardcoded toolkit version or path).
+find_path(TP_JPEG_INCLUDE_DIR jpeglib.h)
+find_library(TP_JPEG_LIBRARY NAMES jpeg libjpeg)
+if(TP_JPEG_INCLUDE_DIR AND TP_JPEG_LIBRARY)
+    set(TP_USE_LIBJPEG 1)
+    message(STATUS "JPEG codec (io bindings): ${TP_JPEG_LIBRARY}")
+endif()
+find_path(TP_PNG_INCLUDE_DIR png.h)
+find_library(TP_PNG_LIBRARY NAMES png libpng16 png16)
+if(TP_PNG_INCLUDE_DIR AND TP_PNG_LIBRARY)
+    set(TP_USE_LIBPNG 1)
+    message(STATUS "PNG codec (io bindings): ${TP_PNG_LIBRARY}")
+endif()
+if(TP_CUDA_ENABLED)
+    find_path(TP_NVJPEG_INCLUDE_DIR nvjpeg.h
+              HINTS ${CUDAToolkit_INCLUDE_DIRS})
+    find_library(TP_NVJPEG_LIBRARY NAMES nvjpeg
+                 HINTS ${CUDAToolkit_LIBRARY_DIR})
+    if(TP_NVJPEG_INCLUDE_DIR AND TP_NVJPEG_LIBRARY)
+        set(TP_USE_NVJPEG 1)
+        message(STATUS "JPEG hardware decoder (io bindings): ${TP_NVJPEG_LIBRARY}")
+    endif()
+endif()
+if(TP_USE_LIBJPEG)
+    target_compile_definitions(_C PRIVATE TP_USE_LIBJPEG)
+    target_include_directories(_C PRIVATE ${TP_JPEG_INCLUDE_DIR})
+    target_link_libraries(_C PRIVATE ${TP_JPEG_LIBRARY})
+endif()
+if(TP_USE_LIBPNG)
+    target_compile_definitions(_C PRIVATE TP_USE_LIBPNG)
+    target_include_directories(_C PRIVATE ${TP_PNG_INCLUDE_DIR})
+    target_link_libraries(_C PRIVATE ${TP_PNG_LIBRARY})
+endif()
+if(TP_USE_NVJPEG)
+    target_compile_definitions(_C PRIVATE TP_USE_NVJPEG)
+    target_include_directories(_C PRIVATE ${TP_NVJPEG_INCLUDE_DIR})
+    target_link_libraries(_C PRIVATE ${TP_NVJPEG_LIBRARY})
+endif()
+
 if(MSVC)
     # Retain registration-only objects from the static backend archives.
     target_link_options(_C PRIVATE

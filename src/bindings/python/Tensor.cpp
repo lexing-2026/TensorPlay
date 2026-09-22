@@ -1605,11 +1605,51 @@ void init_tensor(py::module_& m) {
     m.def("as_tensor", &as_tensor, "data"_a, "dtype"_a = py::none(), "device"_a = py::none(),
           "Converts data into a tensor, sharing data and preserving autograd history if possible.");
 
-    // Expose vision optimization
-    m.def("vision_to_tensor", &vision_to_tensor, "image"_a, "Optimized conversion from HWC uint8 image to CHW float32 tensor (div 255)");
+    // Native codec adapters (io.cpp), grouped in their own ``io`` submodule
+    // so the top-level module stays free of codec surface.  Only the codecs
+    // that were found at configure time are registered, so the Python layer
+    // can probe the attributes and keep a fallback where a codec library is
+    // missing.
+    py::module_ iom = m.def_submodule("io", "Native image/audio codec adapters (io.cpp)");
+#ifdef TP_USE_LIBJPEG
+    iom.def("decode_jpeg", &decode_jpeg, "data"_a, "mode"_a = 0,
+            "Decodes JPEG bytes into a uint8 CHW tensor (native decoder)");
+    iom.def("encode_jpeg", &encode_jpeg, "data"_a, "quality"_a = 75,
+            "Encodes a uint8 CHW tensor into JPEG bytes (native encoder)");
+#endif
+#ifdef TP_USE_LIBPNG
+    iom.def("decode_png", &decode_png, "data"_a, "mode"_a = 0,
+            "Decodes PNG bytes into a uint8 CHW tensor (native decoder)");
+    iom.def("encode_png", &encode_png, "data"_a, "compression_level"_a = 6,
+            "Encodes a uint8 CHW tensor into PNG bytes (native encoder)");
+#endif
+#ifdef TP_USE_NVJPEG
+    iom.def("decode_jpeg_cuda", &decode_jpeg_cuda, "data"_a, "mode"_a = 0,
+            "Decodes JPEG bytes into a uint8 CHW CUDA tensor (hardware decoder)");
+#endif
+#if defined(TP_USE_LIBJPEG) || defined(TP_USE_NVJPEG)
+    iom.def("decode_jpeg_batch", &decode_jpeg_batch, "data"_a, "mode"_a = 0,
+            "device"_a = "cpu",
+            "Decodes a list of JPEG byte tensors in parallel ('cpu') or with "
+            "the hardware batch decoder ('cuda')");
+#endif
+    // Native WAV codec: RIFF/WAVE parsing, no third-party dependency, so
+    // playable clips decode without any backend package.  Partial reads seek
+    // by byte arithmetic and batch decode runs on the shared thread pool.
+    iom.def("decode_wav", &decode_wav, "data"_a, "frame_offset"_a = 0,
+            "num_frames"_a = -1,
+            "Decodes WAV bytes into (waveform [channels, time] float32, sample rate)");
+    iom.def("decode_wav_batch", &decode_wav_batch, "data"_a,
+            "frame_offset"_a = 0, "num_frames"_a = -1,
+            "Decodes a list of WAV byte tensors in parallel");
+    iom.def("encode_wav", &encode_wav, "data"_a, "sample_rate"_a, "bits"_a = 16,
+            "Encodes a float32 (channels, time) tensor into WAV bytes (PCM)");
+    iom.def("wav_info", &wav_info, "data"_a,
+            "Returns (sample_rate, frames, channels, bits, encoding) for WAV bytes");
 
-    // Expose audio optimization
-    m.def("audio_to_tensor", &audio_to_tensor, "audio"_a, "Optimized conversion for audio: (Time, Channels) -> (Channels, Time) with normalization");
+    // numpy -> (Channels, Time) float32 adapter with normalization; lives in
+    // the io submodule together with the native WAV codec that supersedes it.
+    iom.def("audio_to_tensor", &audio_to_tensor, "audio"_a, "Optimized conversion for audio: (Time, Channels) -> (Channels, Time) with normalization");
 
     py::class_<Tensor> tensor(m, "TensorBase", py::dynamic_attr());
     tensor.attr("__module__") = "tensorplay._C";
