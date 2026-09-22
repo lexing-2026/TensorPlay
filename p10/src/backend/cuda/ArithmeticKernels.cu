@@ -570,6 +570,12 @@ inline bool try_binary_row_broadcast(
     const int64_t inner = y.dim() > 0 ? y.size(y.dim() - 1) : 1;
     if (inner <= 0 || n % inner != 0) return false;
     const int64_t rows = n / inner;
+    // The per-row kernels dedicate one block to a column slice of one row;
+    // short inner rows starve most lanes (only `inner` of 256 threads fire)
+    // and the block scheduler pays a full wave per row-slice.  Those shapes
+    // are better served by the generic iterator path, which walks the whole
+    // element range with dense vectorized accesses.
+    if (inner < 256 && rows > 4096) return false;
     if (y.dim() > CUDA_BROADCAST_MAX_DIMS || a.dim() > static_cast<int>(y.dim()) ||
         b.dim() > static_cast<int>(y.dim())) {
         return false;
