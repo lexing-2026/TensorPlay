@@ -9,6 +9,7 @@ from ``utils``.  The legacy module-level helpers ``from_file`` and
 from . import datasets
 from . import transforms
 from . import models
+from . import ops
 from . import io as io  # noqa: F401
 from .backend import set_backend, get_backend
 from .transforms.functional import to_tensor, from_image, from_file  # legacy names
@@ -18,6 +19,7 @@ __all__ = [
     "datasets",
     "transforms",
     "models",
+    "ops",
     "io",
     "set_backend",
     "get_backend",

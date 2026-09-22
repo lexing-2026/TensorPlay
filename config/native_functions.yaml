@@ -3746,6 +3746,82 @@
     CPU: channel_shuffle_cpu
     CUDA: channel_shuffle_cuda
 
+# --- ROI / detection operators -------------------------------------------------
+# rois are (R, 5) float tensors in [batch_index, x1, y1, x2, y2] layout and are
+# expressed in input coordinates before spatial_scale is applied.
+
+- func: roi_align(Tensor input, Tensor rois, float spatial_scale, int pooled_height, int pooled_width, int sampling_ratio, bool aligned) -> Tensor
+  variants: function
+  dispatch:
+    CPU: roi_align_cpu
+    CUDA: roi_align_cuda
+
+- func: roi_align_backward(Tensor grad_output, Tensor rois, float spatial_scale, int pooled_height, int pooled_width, int sampling_ratio, bool aligned, int[] input_size) -> Tensor
+  variants: function
+  dispatch:
+    CPU: roi_align_backward_cpu
+    CUDA: roi_align_backward_cuda
+
+- func: roi_pool(Tensor input, Tensor rois, float spatial_scale, int pooled_height, int pooled_width) -> Tensor
+  variants: function
+  dispatch:
+    CPU: roi_pool_cpu
+    CUDA: roi_pool_cuda
+
+- func: roi_pool_backward(Tensor grad_output, Tensor input, Tensor rois, float spatial_scale, int pooled_height, int pooled_width) -> Tensor
+  variants: function
+  dispatch:
+    CPU: roi_pool_backward_cpu
+    CUDA: roi_pool_backward_cuda
+
+- func: ps_roi_align(Tensor input, Tensor rois, float spatial_scale, int pooled_height, int pooled_width, int sampling_ratio) -> Tensor
+  variants: function
+  dispatch:
+    CPU: ps_roi_align_cpu
+    CUDA: ps_roi_align_cuda
+
+- func: ps_roi_align_backward(Tensor grad_output, Tensor rois, float spatial_scale, int pooled_height, int pooled_width, int sampling_ratio, int[] input_size) -> Tensor
+  variants: function
+  dispatch:
+    CPU: ps_roi_align_backward_cpu
+    CUDA: ps_roi_align_backward_cuda
+
+- func: ps_roi_pool(Tensor input, Tensor rois, float spatial_scale, int pooled_height, int pooled_width) -> Tensor
+  variants: function
+  dispatch:
+    CPU: ps_roi_pool_cpu
+    CUDA: ps_roi_pool_cuda
+
+- func: ps_roi_pool_backward(Tensor grad_output, Tensor rois, float spatial_scale, int pooled_height, int pooled_width, int[] input_size) -> Tensor
+  variants: function
+  dispatch:
+    CPU: ps_roi_pool_backward_cpu
+    CUDA: ps_roi_pool_backward_cuda
+
+- func: nms(Tensor boxes, Tensor scores, float iou_threshold) -> Tensor
+  variants: function
+  dispatch:
+    CPU: nms_cpu
+    CUDA: nms_cuda
+
+- func: box_iou(Tensor boxes1, Tensor boxes2) -> Tensor
+  variants: function
+  dispatch:
+    CPU: box_iou_cpu
+    CUDA: box_iou_cuda
+
+- func: deform_conv2d(Tensor input, Tensor weight, Tensor offset, Tensor mask, Tensor? bias, int[2] stride, int[2] padding, int[2] dilation, int groups, int offset_groups, bool use_mask) -> Tensor
+  variants: function
+  dispatch:
+    CPU: deform_conv2d_cpu
+    CUDA: deform_conv2d_cuda
+
+- func: deform_conv2d_backward(Tensor grad_output, Tensor input, Tensor weight, Tensor offset, Tensor mask, Tensor? bias, int[2] stride, int[2] padding, int[2] dilation, int groups, int offset_groups, bool use_mask, bool[5] output_mask) -> (Tensor, Tensor, Tensor, Tensor, Tensor)
+  variants: function
+  dispatch:
+    CPU: deform_conv2d_backward_cpu
+    CUDA: deform_conv2d_backward_cuda
+
 - func: cholesky(Tensor self, bool upper=False) -> Tensor
   variants: function, method
   dispatch:
