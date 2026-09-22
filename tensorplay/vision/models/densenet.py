@@ -256,7 +256,6 @@ def _densenet(
 _COMMON_META = {
     "min_size": (29, 29),
     "categories": _IMAGENET_CATEGORIES,
-    "recipe": "https://github.com/tensorplay/vision/pull/116",
     "_docs": """Pretrained weights.""",
 }
 
@@ -355,8 +354,7 @@ def densenet121(*, weights: Optional[DenseNet121_Weights] = None, progress: bool
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.densenet.DenseNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/densenet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.DenseNet121_Weights
@@ -381,8 +379,7 @@ def densenet161(*, weights: Optional[DenseNet161_Weights] = None, progress: bool
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.densenet.DenseNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/densenet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.DenseNet161_Weights
@@ -407,8 +404,7 @@ def densenet169(*, weights: Optional[DenseNet169_Weights] = None, progress: bool
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.densenet.DenseNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/densenet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.DenseNet169_Weights
@@ -433,8 +429,7 @@ def densenet201(*, weights: Optional[DenseNet201_Weights] = None, progress: bool
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.densenet.DenseNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/densenet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.DenseNet201_Weights

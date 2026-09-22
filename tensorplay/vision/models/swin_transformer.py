@@ -273,7 +273,7 @@ class ShiftedWindowAttention(nn.Module):
         # get pair-wise relative position index for each token inside the window
         coords_h = tensorplay.arange(self.window_size[0])
         coords_w = tensorplay.arange(self.window_size[1])
-        coords = tensorplay.stack(tensorplay.meshgrid(coords_h, coords_w, indexing="ij"))  # 2, Wh, Ww
+        coords = tensorplay.stack(tensorplay.meshgrid([coords_h, coords_w], indexing="ij"))  # 2, Wh, Ww
         coords_flatten = tensorplay.flatten(coords, 1)  # 2, Wh*Ww
         relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
         relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
@@ -659,7 +659,6 @@ class Swin_T_Weights(WeightsEnum):
             **_COMMON_META,
             "num_params": 28288354,
             "min_size": (224, 224),
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#swintransformer",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 81.474,
@@ -684,7 +683,6 @@ class Swin_S_Weights(WeightsEnum):
             **_COMMON_META,
             "num_params": 49606258,
             "min_size": (224, 224),
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#swintransformer",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 83.196,
@@ -709,7 +707,6 @@ class Swin_B_Weights(WeightsEnum):
             **_COMMON_META,
             "num_params": 87768224,
             "min_size": (224, 224),
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#swintransformer",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 83.582,
@@ -734,7 +731,6 @@ class Swin_V2_T_Weights(WeightsEnum):
             **_COMMON_META,
             "num_params": 28351570,
             "min_size": (256, 256),
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#swintransformer-v2",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 82.072,
@@ -759,7 +755,6 @@ class Swin_V2_S_Weights(WeightsEnum):
             **_COMMON_META,
             "num_params": 49737442,
             "min_size": (256, 256),
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#swintransformer-v2",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 83.712,
@@ -784,7 +779,6 @@ class Swin_V2_B_Weights(WeightsEnum):
             **_COMMON_META,
             "num_params": 87930848,
             "min_size": (256, 256),
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#swintransformer-v2",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 84.112,
@@ -815,8 +809,7 @@ def swin_t(*, weights: Optional[Swin_T_Weights] = None, progress: bool = True, *
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.swin_transformer.SwinTransformer``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/swin_transformer.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.Swin_T_Weights
@@ -853,8 +846,7 @@ def swin_s(*, weights: Optional[Swin_S_Weights] = None, progress: bool = True, *
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.swin_transformer.SwinTransformer``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/swin_transformer.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.Swin_S_Weights
@@ -891,8 +883,7 @@ def swin_b(*, weights: Optional[Swin_B_Weights] = None, progress: bool = True, *
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.swin_transformer.SwinTransformer``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/swin_transformer.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.Swin_B_Weights
@@ -929,8 +920,7 @@ def swin_v2_t(*, weights: Optional[Swin_V2_T_Weights] = None, progress: bool = T
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.swin_transformer.SwinTransformer``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/swin_transformer.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.Swin_V2_T_Weights
@@ -969,8 +959,7 @@ def swin_v2_s(*, weights: Optional[Swin_V2_S_Weights] = None, progress: bool = T
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.swin_transformer.SwinTransformer``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/swin_transformer.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.Swin_V2_S_Weights
@@ -1009,8 +998,7 @@ def swin_v2_b(*, weights: Optional[Swin_V2_B_Weights] = None, progress: bool = T
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.swin_transformer.SwinTransformer``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/swin_transformer.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.Swin_V2_B_Weights

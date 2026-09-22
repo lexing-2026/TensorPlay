@@ -378,8 +378,9 @@ def wrap_tensorplay_function(
 
 
 def is_tensor_like(inp: Any) -> bool:
-    """Return whether ``inp`` is a Tensor or implements a dispatch hook."""
-    return _is_base_tensor(inp) or _has_hook(type(inp))
+    """Return whether ``inp`` is a Tensor (any subclass included) or implements a dispatch hook."""
+    tensor = getattr(_tensorplay(), "Tensor", None)
+    return (tensor is not None and isinstance(inp, tensor)) or _has_hook(type(inp))
 
 
 def _namespace_entries() -> list[tuple[str, Any, Iterable[str]]]:

@@ -190,13 +190,33 @@ class TestScalarTensorOps(unittest.TestCase):
             expected = [2, 4, 6]
             self.assertEqual(res.cpu().numpy().tolist(), expected, f"int t * 2 failed on {device}")
             
-            # TP implementation of div depends on kernel. 
+            # TP implementation of div depends on kernel.
             # Let's check logic.
             res = t / 2
             # Our current implementation might promote or use integer division.
             # Let's verify what it does.
             print(f"    Int div result type: {res.dtype}")
             # If it returns float, good. If int (floor), also okay if consistent.
-            
+
+    def test_rpow_scalar_base_dtype(self):
+        # A Python float raised to a tensor power keeps the tensor's dtype;
+        # only a float scalar over an integer tensor promotes to float32.
+        for device in self.devices:
+            x = tp.linspace(1.0, 4.0, 8, device=device)
+            self.assertEqual((2.0 ** x).dtype, tp.float32, f"2.0 ** f32 on {device}")
+            self.assertTrue(
+                tp.allclose((2.0 ** x).cpu(), tp.tensor([2.0 ** v for v in [1.0 + 3.0 * i / 7 for i in range(8)]])),
+                f"2.0 ** f32 values on {device}",
+            )
+            x64 = x.to(tp.float64)
+            self.assertEqual((2.0 ** x64).dtype, tp.float64, f"2.0 ** f64 on {device}")
+            xi = tp.arange(1, 5, device=device)
+            self.assertEqual((2.0 ** xi).dtype, tp.float32, f"2.0 ** int on {device}")
+            xh = x.to(tp.float16)
+            self.assertEqual((2.0 ** xh).dtype, tp.float16, f"2.0 ** f16 on {device}")
+            # exponent tensor stays broadcastable: 0-dim base, 1-dim exponent
+            base = tp.full((), 2.0, dtype=tp.float32, device=device)
+            self.assertEqual(tp.pow(base, x).dtype, tp.float32, f"0-dim pow on {device}")
+
 if __name__ == '__main__':
     unittest.main()

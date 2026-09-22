@@ -198,7 +198,6 @@ def _convnext(
 _COMMON_META = {
     "min_size": (32, 32),
     "categories": _IMAGENET_CATEGORIES,
-    "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#convnext",
     "_docs": """
         These weights improve upon the results of the original paper by using a modified version of TensorPlay Vision's
         `new training recipe
@@ -299,8 +298,7 @@ def convnext_tiny(*, weights: Optional[ConvNeXt_Tiny_Weights] = None, progress: 
             below for more details and possible values. By default, no pre-trained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.convnext.ConvNext``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/convnext.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.ConvNeXt_Tiny_Weights
@@ -332,8 +330,7 @@ def convnext_small(
             below for more details and possible values. By default, no pre-trained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.convnext.ConvNext``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/convnext.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.ConvNeXt_Small_Weights
@@ -363,8 +360,7 @@ def convnext_base(*, weights: Optional[ConvNeXt_Base_Weights] = None, progress: 
             below for more details and possible values. By default, no pre-trained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.convnext.ConvNext``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/convnext.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.ConvNeXt_Base_Weights
@@ -396,8 +392,7 @@ def convnext_large(
             below for more details and possible values. By default, no pre-trained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.convnext.ConvNext``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/convnext.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.ConvNeXt_Large_Weights

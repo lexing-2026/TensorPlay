@@ -859,6 +859,7 @@ Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
     }
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_ISEL_CASE)
+        TENSORPLAY_FORALL_COMPLEX_TYPES(TP_ISEL_CASE)
         default: TP_THROW(TypeError, "index_select: unsupported dtype");
     }
 #undef TP_ISEL_CASE

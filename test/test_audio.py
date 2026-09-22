@@ -350,7 +350,9 @@ def test_io_save_load_roundtrip(tmp_path):
     y, sr2 = ta.load(str(path))
     assert sr2 == sr
     got = to_torch(y).numpy()
-    np.testing.assert_allclose(got, x, atol=1e-5)
+    # save writes the backend default WAV subtype (PCM_16), so the roundtrip
+    # carries 1/32768 quantization
+    np.testing.assert_allclose(got, x, atol=4e-5)
 
 
 def test_load_channels_first_flag(tmp_path):
@@ -367,6 +369,30 @@ def test_load_channels_first_flag(tmp_path):
 def test_audio_meta_type():
     assert ta.AudioMetaData._fields == (
         "sample_rate", "num_frames", "num_channels", "bits_per_sample", "encoding")
+
+
+def test_scipy_load_int16_bitexact(tmp_path):
+    wavfile = pytest.importorskip("scipy.io.wavfile")
+    ta_module = pytest.importorskip("tensorplay.audio")
+    prev = ta.get_audio_backend()
+    ta.set_audio_backend("scipy")
+    try:
+        rng = np.random.RandomState(0)
+        raw = (rng.randn(8000, 2) * 8000).astype(np.int16)
+        path = tmp_path / "i16.wav"
+        wavfile.write(str(path), 8000, raw)
+        y, sr = ta.load(str(path))
+        assert sr == 8000
+        got = to_torch(y).numpy()
+        assert got.dtype == np.float32 and got.shape == (2, 8000)
+        ref = (raw.astype(np.float32) / 32768.0).T
+        np.testing.assert_array_equal(got, ref)
+        # partial read honors the frame window
+        y2, _ = ta.load(str(path), frame_offset=10, num_frames=100)
+        assert to_torch(y2).shape == (2, 100)
+        np.testing.assert_array_equal(to_torch(y2).numpy(), ref[:, 10:110])
+    finally:
+        ta.set_audio_backend(prev)
 
 
 # ---------------------------------------------------------------------------
@@ -441,3 +467,95 @@ def test_cuda_stft_matches_cpu():
     gpu = to_torch(tp.stft(to_tp(wav.cuda()), 256, 64, None,
                            to_tp(w.cuda()), True, "reflect", False, True, True).cpu())
     np.testing.assert_allclose(cpu.numpy(), gpu.numpy(), rtol=1e-8, atol=1e-8)
+
+
+# ---------------------------------------------------------------------------
+# regressions: float32 mel pipeline, complex phase stretching, VAD, window
+# device placement, weak-scalar pow, complex index_select
+# ---------------------------------------------------------------------------
+
+def test_melscale_fbanks_default_dtype():
+    fb = to_torch(ta.functional.melscale_fbanks(201, 0.0, 8000.0, 32, 16000))
+    assert fb.dtype == torch.float32
+
+
+def test_melspectrogram_default_float32():
+    torch.manual_seed(7)
+    wav = torch.randn(1, 4000).abs()
+    m = ta.transforms.MelSpectrogram(sample_rate=16000, n_fft=400,
+                                     hop_length=200, n_mels=32)
+    got = to_torch(m(to_tp(wav)))
+    spec = torch.stft(wav, 400, hop_length=200,
+                      window=torch.hann_window(400), center=True,
+                      onesided=True, return_complex=True)
+    fb = to_torch(ta.functional.melscale_fbanks(201, 0.0, 8000.0, 32, 16000))
+    ref = (spec.abs() ** 2).transpose(-1, -2) @ fb
+    np.testing.assert_allclose(got.numpy(), ref.transpose(-1, -2).numpy(),
+                               rtol=1e-4, atol=1e-6)
+
+
+def test_time_stretch_complex_specgram():
+    torch.manual_seed(11)
+    spec = torch.randn(2, 201, 50, dtype=torch.cfloat)
+    out = to_torch(ta.transforms.TimeStretch(fixed_rate=1.2)(to_tp(spec)))
+    assert out.dtype == torch.cfloat
+    assert out.shape == (2, 201, math.ceil(50 / 1.2))
+
+
+def test_pitch_shift_runs():
+    torch.manual_seed(13)
+    wav = torch.randn(1, 8000)
+    out = to_torch(ta.transforms.PitchShift(sample_rate=8000, n_steps=2)(to_tp(wav)))
+    assert out.dtype == torch.float32 and out.shape[-1] > 0
+
+
+def test_vad_transform_runs():
+    torch.manual_seed(17)
+    sr = 16000
+    # near-silence, a loud burst, then near-silence again: VAD trims some of
+    # the leading quiet while keeping the burst
+    quiet = torch.randn(1, sr // 2) * 0.005
+    burst = torch.sin(torch.linspace(0, 2 * math.pi * 440, sr)) * 0.9
+    wav = torch.cat([quiet, burst[None], quiet], dim=-1)
+    out = to_torch(ta.transforms.Vad(sample_rate=sr)(to_tp(wav)))
+    assert out.ndim == 2 and out.shape[0] == 1
+    assert 0 < out.shape[1] < wav.shape[-1]
+    assert out.shape[1] >= sr
+
+
+@pytest.mark.parametrize("fn,kw", [
+    ("hann_window", {}),
+    ("hamming_window", {"alpha": 0.6, "beta": 0.4}),
+    ("bartlett_window", {}),
+    ("blackman_window", {}),
+])
+def test_window_factory_device_kwarg(fn, kw):
+    plain = to_torch(getattr(tp, fn)(16, **kw))
+    placed = to_torch(getattr(tp, fn)(16, device=tp.device("cpu"),
+                                      layout=tp.strided, **kw))
+    np.testing.assert_allclose(plain.numpy(), placed.numpy(), rtol=1e-6, atol=1e-6)
+    if tp.cuda.is_available():
+        gpu = getattr(tp, fn)(16, device=tp.device("cuda"), **kw)
+        assert "cuda" in str(gpu.device)
+        np.testing.assert_allclose(to_torch(gpu.cpu()).numpy(), plain.numpy(),
+                                   rtol=1e-6, atol=1e-6)
+
+
+def test_rpow_scalar_base_matches_torch():
+    x = torch.linspace(1.0, 4.0, 8)
+    got = to_torch(2.0 ** to_tp(x))
+    ref = 2.0 ** x
+    assert got.dtype == ref.dtype == torch.float32
+    np.testing.assert_allclose(got.numpy(), ref.numpy(), rtol=1e-6, atol=1e-7)
+    assert to_torch(2.0 ** to_tp(x.double())).dtype == torch.float64
+    assert to_torch(2.0 ** to_tp(torch.arange(1, 5))).dtype == torch.float32
+
+
+def test_index_select_complex_cpu():
+    torch.manual_seed(19)
+    z = torch.randn(3, 8, dtype=torch.cfloat)
+    idx = torch.tensor([0, 2, 2, 5])
+    got = to_torch(tp.index_select(to_tp(z), -1, to_tp(idx)))
+    ref = z.index_select(-1, idx)
+    np.testing.assert_allclose(got.numpy().real, ref.numpy().real, rtol=1e-6)
+    np.testing.assert_allclose(got.numpy().imag, ref.numpy().imag, rtol=1e-6)

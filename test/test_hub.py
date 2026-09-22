@@ -131,6 +131,22 @@ def test_cache_and_force_reload(monkeypatch, tmp_path):
     assert calls["n"] == 2  # force_reload re-downloads
 
 
+def test_collect_weight_paths_prefers_mega_index(tmp_path):
+    (tmp_path / "model-00001-of-00001.mega").write_bytes(b"x")
+    (tmp_path / "model.mega.index.json").write_text("{}")
+    (tmp_path / "README.md").write_text("x")
+    paths = hub._collect_weight_paths(tmp_path)
+    assert paths == [tmp_path / "model.mega.index.json"]
+
+
+def test_collect_weight_paths_extensions(tmp_path):
+    (tmp_path / "w.safetensors").write_bytes(b"x")
+    (tmp_path / "w.bin").write_bytes(b"x")
+    (tmp_path / "note.txt").write_text("x")
+    paths = hub._collect_weight_paths(tmp_path)
+    assert sorted(p.name for p in paths) == ["w.bin", "w.safetensors"]
+
+
 def test_load_state_dict_from_url(monkeypatch, tmp_path):
     source = tmp_path / "src.pth"
     tensorplay.save({"w": tensorplay.tensor([1.0, 2.0])}, source)
@@ -149,3 +165,78 @@ def test_load_state_dict_from_url(monkeypatch, tmp_path):
     )
     assert (model_dir / "custom.pth").exists()
     assert "w" in loaded
+
+
+# ---------------------------------------------------------------------------
+# Foreign-hubconf compatibility: hubconf files written against foreign module
+# names load on top of the native packages.
+# ---------------------------------------------------------------------------
+
+_FOREIGN_HUBCONF = """\
+dependencies = ["torch"]
+
+from torch import Tensor
+import torch.nn as nn
+from torch.hub import load_state_dict_from_url
+from torchvision.extension import _HAS_OPS
+from torchvision.models import get_model_weights
+from torchvision.models.alexnet import alexnet
+from torchvision.models.optical_flow import Raft_Large_Weights
+
+
+def build_alexnet():
+    return alexnet()
+
+
+def nested_import():
+    from torchvision.models.resnet import resnet18
+    return resnet18
+
+
+def uses_tensor():
+    return Tensor([1.0]).sum().item()
+
+
+def ops_available():
+    return bool(_HAS_OPS)
+"""
+
+
+@pytest.fixture
+def foreign_repo(tmp_path):
+    (tmp_path / "hubconf.py").write_text(_FOREIGN_HUBCONF)
+    return tmp_path
+
+
+def test_foreign_dependencies_satisfied(foreign_repo):
+    # "torch" resolves through the compat mapping, so the dependency check passes
+    # even without that package installed.
+    assert hub.load(str(foreign_repo), "ops_available", source="local") is True
+
+
+def test_foreign_imports_map_to_native_modules(foreign_repo):
+    model = hub.load(str(foreign_repo), "build_alexnet", source="local")
+    assert type(model).__module__ == "tensorplay.vision.models.alexnet"
+
+
+def test_foreign_nested_import_at_entry_time(foreign_repo):
+    resnet18 = hub.load(str(foreign_repo), "nested_import", source="local")()
+    assert type(resnet18).__module__ == "tensorplay.vision.models.resnet"
+
+
+def test_foreign_tensor_identity(foreign_repo):
+    assert hub.load(str(foreign_repo), "uses_tensor", source="local") == 1.0
+
+
+def test_foreign_aliases_point_at_native_modules(foreign_repo):
+    import sys
+
+    hub.load(str(foreign_repo), "build_alexnet", source="local")
+    alias_keys = [
+        k for k in sys.modules if k == "torch" or k.startswith(("torch.", "torchvision"))
+    ]
+    assert "torch" in alias_keys and "torchvision.models.alexnet" in alias_keys
+    for key in alias_keys:
+        # Aliased entries are the native modules themselves, never a foreign
+        # package installed in the environment.
+        assert sys.modules[key].__name__.startswith("tensorplay"), key

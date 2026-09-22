@@ -421,7 +421,6 @@ class RegNet_Y_400MF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 4344144,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#small-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 74.046,
@@ -439,7 +438,6 @@ class RegNet_Y_400MF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 4344144,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 75.804,
@@ -465,7 +463,6 @@ class RegNet_Y_800MF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 6432512,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#small-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 76.420,
@@ -483,7 +480,6 @@ class RegNet_Y_800MF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 6432512,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 78.828,
@@ -509,7 +505,6 @@ class RegNet_Y_1_6GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 11202430,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#small-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 77.950,
@@ -527,7 +522,6 @@ class RegNet_Y_1_6GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 11202430,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 80.876,
@@ -553,7 +547,6 @@ class RegNet_Y_3_2GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 19436338,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#medium-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 78.948,
@@ -571,7 +564,6 @@ class RegNet_Y_3_2GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 19436338,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 81.982,
@@ -597,7 +589,6 @@ class RegNet_Y_8GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 39381472,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#medium-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 80.032,
@@ -615,7 +606,6 @@ class RegNet_Y_8GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 39381472,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 82.828,
@@ -641,7 +631,6 @@ class RegNet_Y_16GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 83590140,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#large-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 80.424,
@@ -659,7 +648,6 @@ class RegNet_Y_16GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 83590140,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 82.886,
@@ -704,7 +692,6 @@ class RegNet_Y_16GF_Weights(WeightsEnum):
         ),
         meta={
             **_COMMON_SWAG_META,
-            "recipe": "https://github.com/tensorplay/vision/pull/5793",
             "num_params": 83590140,
             "_metrics": {
                 "ImageNet-1K": {
@@ -730,7 +717,6 @@ class RegNet_Y_32GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 145046770,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#large-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 80.878,
@@ -748,7 +734,6 @@ class RegNet_Y_32GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 145046770,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 83.368,
@@ -793,7 +778,6 @@ class RegNet_Y_32GF_Weights(WeightsEnum):
         ),
         meta={
             **_COMMON_SWAG_META,
-            "recipe": "https://github.com/tensorplay/vision/pull/5793",
             "num_params": 145046770,
             "_metrics": {
                 "ImageNet-1K": {
@@ -842,7 +826,6 @@ class RegNet_Y_128GF_Weights(WeightsEnum):
         ),
         meta={
             **_COMMON_SWAG_META,
-            "recipe": "https://github.com/tensorplay/vision/pull/5793",
             "num_params": 644812894,
             "_metrics": {
                 "ImageNet-1K": {
@@ -868,7 +851,6 @@ class RegNet_X_400MF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 5495976,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#small-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 72.834,
@@ -886,7 +868,6 @@ class RegNet_X_400MF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 5495976,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe-with-fixres",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 74.864,
@@ -912,7 +893,6 @@ class RegNet_X_800MF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 7259656,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#small-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 75.212,
@@ -930,7 +910,6 @@ class RegNet_X_800MF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 7259656,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe-with-fixres",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 77.522,
@@ -956,7 +935,6 @@ class RegNet_X_1_6GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 9190136,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#small-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 77.040,
@@ -974,7 +952,6 @@ class RegNet_X_1_6GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 9190136,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe-with-fixres",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 79.668,
@@ -1000,7 +977,6 @@ class RegNet_X_3_2GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 15296552,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#medium-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 78.364,
@@ -1018,7 +994,6 @@ class RegNet_X_3_2GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 15296552,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 81.196,
@@ -1044,7 +1019,6 @@ class RegNet_X_8GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 39572648,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#medium-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 79.344,
@@ -1062,7 +1036,6 @@ class RegNet_X_8GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 39572648,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 81.682,
@@ -1088,7 +1061,6 @@ class RegNet_X_16GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 54278536,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#medium-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 80.058,
@@ -1106,7 +1078,6 @@ class RegNet_X_16GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 54278536,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 82.716,
@@ -1132,7 +1103,6 @@ class RegNet_X_32GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 107811560,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#large-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 80.622,
@@ -1150,7 +1120,6 @@ class RegNet_X_32GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 107811560,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 83.014,
@@ -1182,8 +1151,7 @@ def regnet_y_400mf(*, weights: Optional[RegNet_Y_400MF_Weights] = None, progress
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
-            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the source code
             for more detail about the classes.
 
     .. autoclass:: tensorplay.vision.models.RegNet_Y_400MF_Weights
@@ -1208,8 +1176,7 @@ def regnet_y_800mf(*, weights: Optional[RegNet_Y_800MF_Weights] = None, progress
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
-            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the source code
             for more detail about the classes.
 
     .. autoclass:: tensorplay.vision.models.RegNet_Y_800MF_Weights
@@ -1234,8 +1201,7 @@ def regnet_y_1_6gf(*, weights: Optional[RegNet_Y_1_6GF_Weights] = None, progress
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
-            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the source code
             for more detail about the classes.
 
     .. autoclass:: tensorplay.vision.models.RegNet_Y_1_6GF_Weights
@@ -1262,8 +1228,7 @@ def regnet_y_3_2gf(*, weights: Optional[RegNet_Y_3_2GF_Weights] = None, progress
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
-            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the source code
             for more detail about the classes.
 
     .. autoclass:: tensorplay.vision.models.RegNet_Y_3_2GF_Weights
@@ -1290,8 +1255,7 @@ def regnet_y_8gf(*, weights: Optional[RegNet_Y_8GF_Weights] = None, progress: bo
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
-            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the source code
             for more detail about the classes.
 
     .. autoclass:: tensorplay.vision.models.RegNet_Y_8GF_Weights
@@ -1318,8 +1282,7 @@ def regnet_y_16gf(*, weights: Optional[RegNet_Y_16GF_Weights] = None, progress: 
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
-            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the source code
             for more detail about the classes.
 
     .. autoclass:: tensorplay.vision.models.RegNet_Y_16GF_Weights
@@ -1346,8 +1309,7 @@ def regnet_y_32gf(*, weights: Optional[RegNet_Y_32GF_Weights] = None, progress: 
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
-            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the source code
             for more detail about the classes.
 
     .. autoclass:: tensorplay.vision.models.RegNet_Y_32GF_Weights
@@ -1374,8 +1336,7 @@ def regnet_y_128gf(*, weights: Optional[RegNet_Y_128GF_Weights] = None, progress
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
-            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the source code
             for more detail about the classes.
 
     .. autoclass:: tensorplay.vision.models.RegNet_Y_128GF_Weights
@@ -1402,8 +1363,7 @@ def regnet_x_400mf(*, weights: Optional[RegNet_X_400MF_Weights] = None, progress
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
-            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the source code
             for more detail about the classes.
 
     .. autoclass:: tensorplay.vision.models.RegNet_X_400MF_Weights
@@ -1428,8 +1388,7 @@ def regnet_x_800mf(*, weights: Optional[RegNet_X_800MF_Weights] = None, progress
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
-            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the source code
             for more detail about the classes.
 
     .. autoclass:: tensorplay.vision.models.RegNet_X_800MF_Weights
@@ -1454,8 +1413,7 @@ def regnet_x_1_6gf(*, weights: Optional[RegNet_X_1_6GF_Weights] = None, progress
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
-            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the source code
             for more detail about the classes.
 
     .. autoclass:: tensorplay.vision.models.RegNet_X_1_6GF_Weights
@@ -1480,8 +1438,7 @@ def regnet_x_3_2gf(*, weights: Optional[RegNet_X_3_2GF_Weights] = None, progress
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
-            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the source code
             for more detail about the classes.
 
     .. autoclass:: tensorplay.vision.models.RegNet_X_3_2GF_Weights
@@ -1506,8 +1463,7 @@ def regnet_x_8gf(*, weights: Optional[RegNet_X_8GF_Weights] = None, progress: bo
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
-            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the source code
             for more detail about the classes.
 
     .. autoclass:: tensorplay.vision.models.RegNet_X_8GF_Weights
@@ -1532,8 +1488,7 @@ def regnet_x_16gf(*, weights: Optional[RegNet_X_16GF_Weights] = None, progress: 
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
-            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the source code
             for more detail about the classes.
 
     .. autoclass:: tensorplay.vision.models.RegNet_X_16GF_Weights
@@ -1558,8 +1513,7 @@ def regnet_x_32gf(*, weights: Optional[RegNet_X_32GF_Weights] = None, progress: 
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
-            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the source code
             for more detail about the classes.
 
     .. autoclass:: tensorplay.vision.models.RegNet_X_32GF_Weights

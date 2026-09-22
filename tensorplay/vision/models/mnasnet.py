@@ -244,7 +244,6 @@ class MNASNet0_75_Weights(WeightsEnum):
         transforms=partial(ImageClassification, crop_size=224, resize_size=232),
         meta={
             **_COMMON_META,
-            "recipe": "https://github.com/tensorplay/vision/pull/6019",
             "num_params": 3170208,
             "_metrics": {
                 "ImageNet-1K": {
@@ -290,7 +289,6 @@ class MNASNet1_3_Weights(WeightsEnum):
         transforms=partial(ImageClassification, crop_size=224, resize_size=232),
         meta={
             **_COMMON_META,
-            "recipe": "https://github.com/tensorplay/vision/pull/6019",
             "num_params": 6282256,
             "_metrics": {
                 "ImageNet-1K": {
@@ -337,8 +335,7 @@ def mnasnet0_5(*, weights: Optional[MNASNet0_5_Weights] = None, progress: bool =
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.mnasnet.MNASNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/mnasnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.MNASNet0_5_Weights
@@ -365,8 +362,7 @@ def mnasnet0_75(*, weights: Optional[MNASNet0_75_Weights] = None, progress: bool
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.mnasnet.MNASNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/mnasnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.MNASNet0_75_Weights
@@ -393,8 +389,7 @@ def mnasnet1_0(*, weights: Optional[MNASNet1_0_Weights] = None, progress: bool =
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.mnasnet.MNASNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/mnasnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.MNASNet1_0_Weights
@@ -421,8 +416,7 @@ def mnasnet1_3(*, weights: Optional[MNASNet1_3_Weights] = None, progress: bool =
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.mnasnet.MNASNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/mnasnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.MNASNet1_3_Weights

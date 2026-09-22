@@ -236,7 +236,6 @@ class ShuffleNet_V2_X1_5_Weights(WeightsEnum):
         transforms=partial(ImageClassification, crop_size=224, resize_size=232),
         meta={
             **_COMMON_META,
-            "recipe": "https://github.com/tensorplay/vision/pull/5906",
             "num_params": 3503624,
             "_metrics": {
                 "ImageNet-1K": {
@@ -261,7 +260,6 @@ class ShuffleNet_V2_X2_0_Weights(WeightsEnum):
         transforms=partial(ImageClassification, crop_size=224, resize_size=232),
         meta={
             **_COMMON_META,
-            "recipe": "https://github.com/tensorplay/vision/pull/5906",
             "num_params": 7393996,
             "_metrics": {
                 "ImageNet-1K": {
@@ -299,8 +297,7 @@ def shufflenet_v2_x0_5(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.shufflenetv2.ShuffleNetV2``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/shufflenetv2.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.ShuffleNet_V2_X0_5_Weights
@@ -330,8 +327,7 @@ def shufflenet_v2_x1_0(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.shufflenetv2.ShuffleNetV2``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/shufflenetv2.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.ShuffleNet_V2_X1_0_Weights
@@ -361,8 +357,7 @@ def shufflenet_v2_x1_5(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.shufflenetv2.ShuffleNetV2``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/shufflenetv2.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.ShuffleNet_V2_X1_5_Weights
@@ -392,8 +387,7 @@ def shufflenet_v2_x2_0(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.shufflenetv2.ShuffleNetV2``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/shufflenetv2.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.ShuffleNet_V2_X2_0_Weights
