@@ -47,6 +47,11 @@ std::tuple<Tensor, Tensor, Tensor> convolution_backward_cuda(
     const convolution::GradRequest want = convolution::decode_mask(output_mask);
     if (want.bias) convolution::check_bias_sizes(bias_sizes, grad_output.size(1));
 
+    if (!transposed) {
+        convolution::check_conv_geometry(input, weight, stride, padding,
+                                         dilation, "convolution_backward");
+    }
+
     // Slots the caller did not ask for stay undefined; that is the signal the
     // autograd engine reads for "no gradient flows to this input".
     Tensor grad_input;
