@@ -931,10 +931,12 @@ def _mega_client(endpoint=None, token=None):
     return MegaHubClient(endpoint=endpoint, token=token)
 
 
-def _mega_load_state_dict(paths, device, load_kwargs):
+def _mega_load_state_dict(paths, device, load_kwargs, trust_policy=None):
     import megatensors
 
     kwargs = {"framework": "tensorplay", "device": device}
+    if trust_policy is not None:
+        kwargs["trust_policy"] = trust_policy
     kwargs.update(load_kwargs)
     return megatensors.load_state_dict([str(p) for p in paths], **kwargs)
 
@@ -975,18 +977,26 @@ def load_state_dict(
     endpoint=None,
     token=None,
     ref: str | None = None,
+    trust_policy=None,
     **load_kwargs,
 ) -> dict:
     """Loads weights from MEGA, a GitHub checkpoint URL, or a github repo.
 
     ``source='auto'`` inspects the argument: an http(s) URL uses the github
     checkpoint path, anything else is treated as a MEGA ``repo_id``.
+
+    ``trust_policy`` (a megatensors ``TrustPolicy``) is MEGA-only: it makes the
+    loader verify the signature provenance of every served artifact before any
+    tensor is read. GitHub sources have no artifact signing; the trust question
+    there is about executing repo code and is governed by ``trust_repo``.
     """
     src = source
     if src == "auto":
         src = "github" if _WEIGHT_URL_RE.match(repo_or_url) else "mega"
 
     if src == "github":
+        if trust_policy is not None:
+            raise ValueError("trust_policy applies to MEGA artifacts; GitHub sources are governed by trust_repo")
         if _WEIGHT_URL_RE.match(repo_or_url):
             return load_state_dict_from_url(repo_or_url)
         # github repo holding a bare state-dict entrypoint is rare; route
@@ -999,13 +1009,13 @@ def load_state_dict(
     cache_root = get_dir() / "mega" / repo_or_url
     if filename is not None:
         path = client.download_file(repo_or_url, filename, local_dir=cache_root, revision=revision)
-        return _mega_load_state_dict([path], device, load_kwargs)
+        return _mega_load_state_dict([path], device, load_kwargs, trust_policy=trust_policy)
 
     local_dir = client.snapshot_download(repo_or_url, local_dir=cache_root, revision=revision)
     paths = _collect_weight_paths(local_dir)
     if not paths:
         raise RuntimeError(f"No weight files found in MEGA repo '{repo_or_url}' (revision={revision})")
-    return _mega_load_state_dict(paths, device, load_kwargs)
+    return _mega_load_state_dict(paths, device, load_kwargs, trust_policy=trust_policy)
 
 
 def load_model(
@@ -1023,6 +1033,7 @@ def load_model(
     model_kwargs: dict | None = None,
     strict: bool = True,
     assign: bool = False,
+    trust_policy=None,
     **load_kwargs,
 ):
     """Loads weights and returns a ready-to-run model (mega or github).
@@ -1030,12 +1041,18 @@ def load_model(
     Architecture resolution (mega backend): ``model`` instance >
     ``model_class`` callable/dotted-path > repository metadata
     (``model.class`` / ``model.init.*`` via megatensors).
+
+    ``trust_policy`` (a megatensors ``TrustPolicy``) makes the MEGA loader
+    verify artifact signature provenance before reading tensors; it is not
+    applicable to GitHub sources (see ``load_state_dict``).
     """
     src = source
     if src == "auto":
         src = "github" if (_WEIGHT_URL_RE.match(repo_or_url) or "/" in repo_or_url and filename is None) else "mega"
 
     if src == "github":
+        if trust_policy is not None:
+            raise ValueError("trust_policy applies to MEGA artifacts; GitHub sources are governed by trust_repo")
         if model is not None or model_class is not None or model_kwargs is not None:
             raise ValueError("github source resolves architecture via the repo entrypoint")
         entry = filename if filename is not None else repo_or_url.rsplit("/", 1)[-1]
@@ -1048,7 +1065,7 @@ def load_model(
     if model is not None:
         sd = load_state_dict(
             repo_or_url, filename, source="mega", device=device, revision=revision,
-            endpoint=endpoint, token=token, **load_kwargs,
+            endpoint=endpoint, token=token, trust_policy=trust_policy, **load_kwargs,
         )
         try:
             model.load_state_dict(sd, strict=strict, assign=assign)
@@ -1074,5 +1091,6 @@ def load_model(
         model_kwargs=model_kwargs,
         strict=strict,
         assign=assign,
+        trust_policy=trust_policy,
         **load_kwargs,
     )

@@ -128,6 +128,32 @@ and first-time downloads from unknown owners prompt for acknowledgement. Pass
 `trust_repo=True` to skip the prompt, or `skip_validation=True` to skip the ref
 check (needed e.g. for refs that only exist on a fork).
 
+### MEGA backend
+
+Weights can also be served from the MEGA hub (`mega.tensorplay.cn`, via the
+optional `megatensors` package). MEGA repos are artifact repositories: no
+`hubconf.py` is executed, downloads are revision-resolved, resumable, and
+integrity-checked by the SDK.
+
+```python
+import tensorplay
+
+# full snapshot into the hub cache
+tensorplay.hub.snapshot_download("org/model", source="mega", revision="main")
+
+# state dict from a MEGA repo (revision-pinned)
+state_dict = tensorplay.hub.load_state_dict("org/model", device="cpu")
+
+# or straight to a ready-to-run model
+model = tensorplay.hub.load_model("org/model", model_class=MyNet)
+```
+
+`trust_policy` accepts a megatensors `TrustPolicy` on `load_state_dict` and
+`load_model`: the loader then verifies the signature provenance of every
+served artifact before reading tensors. Unsigned or wrongly signed artifacts
+are rejected (or warn, with `strict=False`). This is MEGA-only; GitHub
+sources are governed by `trust_repo` instead.
+
 ### Known limitations:
 
 The hub works by importing the package as if it was installed. There are some side effects

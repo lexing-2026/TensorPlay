@@ -404,3 +404,69 @@ def test_cache_uses_unresolvable_ref_offline(monkeypatch, tmp_path):
     # Offline again later: the cache is still usable.
     again = hub._get_cache_or_reload("owner/repo:main", force_reload=False, trust_repo=True)
     assert again == repo_dir
+
+
+class _FakeMegaClient:
+    """Stands in for MegaHubClient: snapshot_download yields a prepared dir."""
+
+    def __init__(self, local_dir):
+        self._local_dir = local_dir
+
+    def snapshot_download(self, repo_id, local_dir=None, revision=None, include=None, exclude=None):
+        return self._local_dir
+
+    def download_file(self, repo_id, filename, local_dir=None, revision=None):
+        return self._local_dir / filename
+
+
+def _make_mega_repo(tmp_path):
+    local_dir = tmp_path / "mega" / "org" / "model"
+    local_dir.mkdir(parents=True, exist_ok=True)
+    (local_dir / "weights.mega").write_bytes(b"mega-artifact")
+    return local_dir
+
+
+def test_load_state_dict_forwards_trust_policy(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_load_state_dict(filenames, **kwargs):
+        captured.update(kwargs)
+        return {"w": tensorplay.tensor([1.0])}
+
+    monkeypatch.setattr("megatensors.load_state_dict", fake_load_state_dict)
+    mega_repo = _make_mega_repo(tmp_path)
+    monkeypatch.setattr(hub, "_mega_client", lambda *a, **k: _FakeMegaClient(mega_repo))
+
+    hub.load_state_dict("org/model", source="mega", trust_policy="POLICY", device="cuda")
+    assert captured["trust_policy"] == "POLICY"
+    assert captured["framework"] == "tensorplay"
+    assert captured["device"] == "cuda"
+
+    # Absent policy: the loader default applies (no key forwarded).
+    captured.clear()
+    hub.load_state_dict("org/model", source="mega")
+    assert "trust_policy" not in captured
+
+
+def test_load_model_forwards_trust_policy(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_load_model(filenames, **kwargs):
+        captured.update(kwargs)
+        return "model"
+
+    monkeypatch.setattr("megatensors.load_model", fake_load_model)
+    mega_repo = _make_mega_repo(tmp_path)
+    monkeypatch.setattr(hub, "_mega_client", lambda *a, **k: _FakeMegaClient(mega_repo))
+
+    hub.load_model("org/model", source="mega", trust_policy="POLICY")
+    assert captured["trust_policy"] == "POLICY"
+    assert captured["framework"] == "tensorplay"
+
+
+def test_github_sources_reject_trust_policy():
+    url = "https://example.com/weights-0123456789abcdef.pth"
+    with pytest.raises(ValueError, match="trust_policy applies to MEGA"):
+        hub.load_state_dict(url, trust_policy="POLICY")
+    with pytest.raises(ValueError, match="trust_policy applies to MEGA"):
+        hub.load_model(url, trust_policy="POLICY")
