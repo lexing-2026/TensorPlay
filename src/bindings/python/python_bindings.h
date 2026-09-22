@@ -11,6 +11,11 @@
 #include <pybind11/functional.h>
 #include <pybind11/complex.h>
 
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
+
 #include "Autograd.h"
 #include "Device.h"
 #include "DType.h"
@@ -40,9 +45,25 @@ using Tensor = tensorplay::Tensor;
 
 void init_tensor(py::module_& m);
 
-// numpy-to-tensor load adapters (io.cpp): fused layout conversion +
-// normalization kernels backing tensorplay.vision / tensorplay.audio.
-Tensor vision_to_tensor(py::array_t<uint8_t, py::array::c_style | py::array::forcecast> img);
+// numpy-to-tensor load adapters and native codec entry points (io.cpp):
+// fused layout conversion + normalization kernels backing
+// tensorplay.vision / tensorplay.audio, plus the native image/audio codecs.
+// Codec functions are declared unconditionally; the module init registers
+// only the ones whose codec library was found at configure time, so the
+// Python layer can probe the extension attributes to pick a fallback.
+Tensor decode_jpeg(Tensor data, int64_t mode);
+Tensor encode_jpeg(Tensor data, int64_t quality);
+Tensor decode_png(Tensor data, int64_t mode);
+Tensor encode_png(Tensor data, int64_t compression_level);
+Tensor decode_jpeg_cuda(Tensor data, int64_t mode);
+std::vector<Tensor> decode_jpeg_batch(std::vector<Tensor> data, int64_t mode,
+                                      const std::string& device);
+std::pair<Tensor, int64_t> decode_wav(Tensor data, int64_t frame_offset, int64_t num_frames);
+std::vector<std::pair<Tensor, int64_t>> decode_wav_batch(std::vector<Tensor> data,
+                                                         int64_t frame_offset,
+                                                         int64_t num_frames);
+Tensor encode_wav(Tensor data, int64_t sample_rate, int64_t bits);
+std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t> wav_info(Tensor data);
 Tensor audio_to_tensor(py::object obj);
 void init_device(py::module_& m);
 void init_dtype(py::module_& m);

@@ -559,3 +559,107 @@ def test_index_select_complex_cpu():
     ref = z.index_select(-1, idx)
     np.testing.assert_allclose(got.numpy().real, ref.numpy().real, rtol=1e-6)
     np.testing.assert_allclose(got.numpy().imag, ref.numpy().imag, rtol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Multiformat loading: native RIFF/WAVE codec and the FFmpeg (PyAV) fallback
+# ---------------------------------------------------------------------------
+
+def test_native_wav_subtypes_match_libsndfile(tmp_path):
+    sf = pytest.importorskip("soundfile")
+    sr = 16000
+    sig = (np.random.default_rng(7).standard_normal((sr // 2, 2)) * 4000).astype(np.int16)
+    for sub in ("PCM_16", "PCM_24", "PCM_32", "FLOAT", "DOUBLE",
+                "PCM_U8", "ULAW", "ALAW"):
+        path = str(tmp_path / f"t_{sub}.wav")
+        sf.write(path, sig, sr, subtype=sub)
+        w, sr2 = ta.load(path)
+        assert sr2 == sr
+        ref, _ = sf.read(path, dtype="float32", always_2d=True)
+        got = to_torch(w).numpy().T
+        assert got.shape == ref.shape
+        # Every subtype the native codec covers must decode bit-identically
+        # to the reference library, including the companded G.711 forms.
+        np.testing.assert_array_equal(got, ref)
+        meta = ta.info(path)
+        assert meta.sample_rate == sr
+        assert meta.num_frames == sig.shape[0]
+        assert meta.num_channels == 2
+
+
+def test_native_wav_partial_reads_match_soundfile(tmp_path):
+    sf = pytest.importorskip("soundfile")
+    sr = 16000
+    sig = (np.random.default_rng(3).standard_normal((sr, 2)) * 4000).astype(np.int16)
+    path = str(tmp_path / "t.wav")
+    sf.write(path, sig, sr, subtype="PCM_16")
+    n = sig.shape[0]
+    for off, nf in ((0, -1), (7, 33), (1000, 500), (n - 10, -1), (n + 100, -1), (5, 0)):
+        ref, _ = sf.read(path, dtype="float32", start=off,
+                         frames=nf if nf >= 0 else -1, always_2d=True)
+        w, _ = ta.load(path, frame_offset=off, num_frames=nf)
+        got = to_torch(w).numpy().T
+        assert got.shape == ref.shape
+        np.testing.assert_array_equal(got, ref)
+
+
+def test_native_wav_save_roundtrip(tmp_path):
+    x = (np.random.default_rng(5).standard_normal((2, 8000)) * 0.2).astype(np.float32)
+    path = str(tmp_path / "rt.wav")
+    ta.save(path, to_tp(torch.from_numpy(x)), 16000, channels_first=True)
+    w, sr = ta.load(path)
+    assert sr == 16000
+    got = to_torch(w).numpy()
+    assert got.shape == x.shape
+    # PCM_16 quantization: one LSB of the 16-bit domain is 1/32768.
+    assert np.abs(got - x).max() <= 3.1e-5
+
+
+def _encode_av(path, fmt, codec, rate=44100, seconds=0.3, ch=2):
+    import av
+    n = int(rate * seconds)
+    t = np.arange(n)
+    s = (0.3 * np.sin(2 * math.pi * 440 * t / rate)).astype(np.float32)
+    inter = np.stack([s] * ch, axis=1)
+    layout = "stereo" if ch == 2 else "mono"
+    c = av.open(str(path), "w", format=fmt)
+    st = c.add_stream(codec, rate=rate, layout=layout)
+    pts = 0
+    for i in range(0, n, 1024):
+        chunk = inter[i:i + 1024]
+        f = av.AudioFrame.from_ndarray(np.ascontiguousarray(chunk.T),
+                                       format="fltp", layout=layout)
+        f.sample_rate = rate
+        f.pts = pts
+        pts += chunk.shape[0]
+        for pk in st.encode(f):
+            c.mux(pk)
+    for pk in st.encode(None):
+        c.mux(pk)
+    c.close()
+
+
+@pytest.mark.parametrize("ext,fmt,codec", [("m4a", "ipod", "aac"),
+                                           ("mp3", "mp3", "libmp3lame")])
+def test_av_fallback_containers(tmp_path, ext, fmt, codec):
+    pytest.importorskip("av")
+    import av.codec as ac
+    try:
+        ac.Codec(codec, "w")
+    except Exception:
+        pytest.skip(f"{codec} encoder unavailable in this PyAV build")
+    path = str(tmp_path / f"t.{ext}")
+    _encode_av(path, fmt, codec)
+    w, sr = ta.load(path)
+    assert sr == 44100
+    full = to_torch(w).numpy()
+    assert full.shape[0] == 2
+    rms = float(np.sqrt((full ** 2).mean()))
+    assert abs(rms - 0.21) < 0.05  # sine amplitude 0.3
+    meta = ta.info(path)
+    assert meta.sample_rate == 44100
+    assert meta.num_channels == 2
+    # Windowed load must equal a slice of the full decode: the container has
+    # no frame-addressable seeks, so both paths share one deterministic decode.
+    w2, _ = ta.load(path, frame_offset=100, num_frames=555)
+    np.testing.assert_array_equal(to_torch(w2).numpy(), full[:, 100:655])

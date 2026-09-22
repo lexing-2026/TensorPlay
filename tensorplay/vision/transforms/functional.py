@@ -1600,9 +1600,6 @@ def from_image(img):
     if arr.ndim == 2:
         arr = arr[:, :, None]
 
-    if arr.dtype == _np.uint8 and hasattr(tensorplay, "vision_to_tensor"):
-        return tensorplay.vision_to_tensor(_np.ascontiguousarray(arr))
-
     arr = _np.ascontiguousarray(arr.transpose((2, 0, 1)))
     t = tensorplay.tensor(arr)
     if t.dtype == tensorplay.uint8:
