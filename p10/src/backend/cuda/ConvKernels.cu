@@ -639,6 +639,8 @@ static Tensor conv2d_cudnn_legacy(
 #endif
 
 static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const Tensor& bias, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups, bool fused_relu) {
+    convolution::check_conv_geometry(input, weight, stride_arg, padding_arg,
+                                     dilation_arg, "conv2d");
 #if defined(USE_ROCM)
     // The DNN surface has no usable double-precision convolution on every
     // supported AMD target (fp64 code-object builds can fail at run time),
@@ -1402,6 +1404,8 @@ Tensor conv1d_grad_bias_cuda(const Tensor& grad_output, const Tensor& input, con
 Tensor conv3d_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias,
                    const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg,
                    const std::vector<int64_t>& dilation_arg, int64_t groups) {
+    convolution::check_conv_geometry(input, weight, stride_arg, padding_arg,
+                                     dilation_arg, "conv3d");
 #ifdef USE_CUDNN
     auto stride = expand_param_if_needed(stride_arg, 3, 1);
     auto padding = expand_param_if_needed(padding_arg, 3, 0);

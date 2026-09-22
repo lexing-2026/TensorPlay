@@ -2634,8 +2634,10 @@ static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg,
     auto padding = expand_param(padding_arg, 2, "padding");
     auto dilation = expand_param(dilation_arg, 2, "dilation");
 
+    convolution::check_conv_geometry(input, weight, stride, padding, dilation, "conv2d");
+
     int64_t sH = stride[0]; int64_t sW = stride[1];
-    
+
     // Support asymmetric padding
     int64_t pH_top, pH_bottom, pW_left, pW_right;
     if (padding.size() == 2) {
@@ -2936,11 +2938,13 @@ Tensor conv3d_cpu(const Tensor& input_arg, const Tensor& weight_arg, const Tenso
     auto stride = expand_param(stride_arg, 3, "stride");
     auto padding = expand_param(padding_arg, 3, "padding");
     auto dilation = expand_param(dilation_arg, 3, "dilation");
-    
+
+    convolution::check_conv_geometry(input, weight, stride, padding, dilation, "conv3d");
+
     int64_t sD = stride[0]; int64_t sH = stride[1]; int64_t sW = stride[2];
     int64_t pD = padding[0]; int64_t pH = padding[1]; int64_t pW = padding[2];
     int64_t dD = dilation[0]; int64_t dH = dilation[1]; int64_t dW = dilation[2];
-    
+
     int64_t D_out = (D_in + 2 * pD - dD * (kD - 1) - 1) / sD + 1;
     int64_t H_out = (H_in + 2 * pH - dH * (kH - 1) - 1) / sH + 1;
     int64_t W_out = (W_in + 2 * pW - dW * (kW - 1) - 1) / sW + 1;

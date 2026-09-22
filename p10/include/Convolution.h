@@ -183,5 +183,24 @@ inline GradRequest decode_mask(const std::vector<bool>& output_mask) {
 P10_API void check_bias_sizes(const std::optional<std::vector<int64_t>>& bias_sizes,
                               int64_t out_channels);
 
+// Validates the geometry of a direct (non-transposed) convolution before any
+// output size is derived: padding must be non-negative, stride and dilation
+// must be positive, and in every spatial dimension the padded input extent
+// must leave room for at least one kernel placement, that is
+//
+//     input_size + 2 * padding >= dilation * (kernel_size - 1) + 1
+//
+// (for per-side padding vectors the two sides of a dimension are summed).
+// The last rule matters because the output-extent formula divides by the
+// stride: with a stride above one, truncation can pull a negative quotient
+// back up to a non-negative size, and the kernels would silently compute a
+// partial convolution whose out-of-range taps read as zero.  Raises
+// RuntimeError when any rule is violated.
+P10_API void check_conv_geometry(const Tensor& input, const Tensor& weight,
+                                 const std::vector<int64_t>& stride,
+                                 const std::vector<int64_t>& padding,
+                                 const std::vector<int64_t>& dilation,
+                                 const char* name);
+
 } // namespace convolution
 } // namespace tensorplay

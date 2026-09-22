@@ -117,6 +117,72 @@ class TestConvolutionForward:
                            [0, 0], 1)
 
 
+# Geometry where the dilated kernel no longer fits into the padded input.
+# A stride above one can truncate the negative output extent back up to a
+# positive size, so these configurations must be rejected up front instead of
+# silently computing a partial convolution whose out-of-range taps read as
+# zero.  All of them sit on inputs no larger than four pixels per side.
+REJECTED_GEOMETRY_CASES = [
+    # (input shape, weight shape, stride, padding, dilation)
+    ((1, 1, 4, 4), (1, 1, 3, 3), [1, 1], [0, 0], [3, 3]),
+    ((1, 1, 1, 1), (1, 1, 2, 2), [2, 2], [0, 0], [1, 1]),
+    ((1, 1, 2, 2), (1, 1, 2, 2), [4, 4], [0, 0], [2, 2]),
+    ((1, 2, 3, 4), (2, 2, 3, 3), [2, 2], [1, 1], [4, 4]),
+    ((1, 3, 4, 4), (3, 1, 3, 3), [2, 2], [0, 0], [3, 3]),
+    ((1, 2, 4), (2, 2, 5), [2], [0], [2]),
+]
+
+
+class TestConvolutionGeometry:
+    @pytest.mark.parametrize("case", REJECTED_GEOMETRY_CASES)
+    def test_kernel_larger_than_padded_input_raises(self, case):
+        xs, ws, stride, padding, dilation = case
+        x, w = _rand(xs, 31), _rand(ws, 32)
+        with pytest.raises(RuntimeError):
+            _C.convolution(_mk(x), _mk(w), None, stride, padding, dilation,
+                           False, [0] * (len(xs) - 2), 1)
+        # The reference framework rejects the same configurations.
+        with pytest.raises(RuntimeError):
+            _torch_forward(x, w, None, stride, padding, dilation, False,
+                           [0] * (len(xs) - 2), 1)
+
+    def test_rejects_non_positive_stride(self):
+        x, w = _rand((1, 1, 4, 4), 33), _rand((1, 1, 3, 3), 34)
+        with pytest.raises(RuntimeError):
+            _C.convolution(_mk(x), _mk(w), None, [0, 0], [0, 0], [1, 1],
+                           False, [0, 0], 1)
+
+    def test_rejects_non_positive_dilation(self):
+        x, w = _rand((1, 1, 4, 4), 35), _rand((1, 1, 3, 3), 36)
+        with pytest.raises(RuntimeError):
+            _C.convolution(_mk(x), _mk(w), None, [1, 1], [0, 0], [0, 0],
+                           False, [0, 0], 1)
+
+    def test_rejects_negative_padding(self):
+        x, w = _rand((1, 1, 4, 4), 37), _rand((1, 1, 3, 3), 38)
+        with pytest.raises(RuntimeError):
+            _C.convolution(_mk(x), _mk(w), None, [1, 1], [-1, 0], [1, 1],
+                           False, [0, 0], 1)
+
+    def test_backward_rejects_kernel_larger_than_padded_input(self):
+        x, w = _rand((1, 2, 4, 4), 39), _rand((2, 2, 3, 3), 40)
+        grad = _rand((1, 2, 1, 1), 41)
+        with pytest.raises(RuntimeError):
+            _C.convolution_backward(_mk(grad), _mk(x), _mk(w), None,
+                                    [1, 1], [0, 0], [3, 3], False, [0, 0], 1,
+                                    [True, True, True])
+
+    def test_boundary_fit_matches_reference(self):
+        # The padded input exactly equals the dilated kernel: a single kernel
+        # placement fits, and the output extent rounds back up to one.
+        x, w = _rand((1, 1, 4, 4), 42), _rand((1, 1, 2, 2), 43)
+        got = _C.convolution(_mk(x), _mk(w), None, [2, 2], [0, 0], [3, 3],
+                             False, [0, 0], 1)
+        want = _torch_forward(x, w, None, [2, 2], [0, 0], [3, 3], False,
+                              [0, 0], 1)
+        _close(got, want.detach().numpy(), msg="convolution boundary fit")
+
+
 def _torch_backward(x, w, b, stride, padding, dilation, transposed,
                     output_padding, groups):
     tx = torch.tensor(x, requires_grad=True)
