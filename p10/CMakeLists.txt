@@ -857,7 +857,7 @@ if(USE_VULKAN)
     add_dependencies(p10 vulkan_spv_gen)
 endif()
 if(USE_CUDA)
-    target_link_libraries(p10 PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cufft CUDA::cusolver CUDA::nvrtc CUDA::cuda_driver)
+    target_link_libraries(p10 PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cufft CUDA::cusolver CUDA::nvrtc)
     # CUPTI headers live in the toolkit's extras/CUPTI/include, which the
     # plain toolkit include dirs do not cover; the imported target does.
     if(TARGET CUDA::cupti)

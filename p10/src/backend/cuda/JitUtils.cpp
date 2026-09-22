@@ -3,6 +3,8 @@
 #include <cuda_runtime.h>
 #include <nvrtc.h>
 
+#include "backend/cuda/DriverApi.h"
+
 #include <cstdlib>
 #include <sstream>
 #include <unordered_map>
@@ -248,6 +250,48 @@ __device__ __forceinline__ void jit_store(char* base, int idx, T value) {
     return kernel.str();
 }
 
+namespace {
+
+using CuModuleLoadDataExFn = CUresult (*)(CUmodule*, const void*, unsigned int,
+                                          const CUjit_option*, void**);
+using CuModuleGetFunctionFn = CUresult (*)(CUfunction*, CUmodule, const char*);
+using CuLaunchKernelFn =
+    CUresult (*)(CUfunction, unsigned int, unsigned int, unsigned int,
+                 unsigned int, unsigned int, unsigned int, unsigned int,
+                 CUstream, void**, void**);
+
+// Driver entry points are resolved lazily so the wheel imports on machines
+// without the driver; the JIT path needs them, so a missing driver surfaces
+// here with a clear error instead of at module load.
+CuModuleLoadDataExFn cu_module_load_data_ex() {
+    static const CuModuleLoadDataExFn fn =
+        driver::resolve_symbol<CuModuleLoadDataExFn>("cuModuleLoadDataEx");
+    if (fn == nullptr) {
+        TP_THROW(RuntimeError, "the CUDA driver is not available");
+    }
+    return fn;
+}
+
+CuModuleGetFunctionFn cu_module_get_function() {
+    static const CuModuleGetFunctionFn fn =
+        driver::resolve_symbol<CuModuleGetFunctionFn>("cuModuleGetFunction");
+    if (fn == nullptr) {
+        TP_THROW(RuntimeError, "the CUDA driver is not available");
+    }
+    return fn;
+}
+
+CuLaunchKernelFn cu_launch_kernel() {
+    static const CuLaunchKernelFn fn =
+        driver::resolve_symbol<CuLaunchKernelFn>("cuLaunchKernel");
+    if (fn == nullptr) {
+        TP_THROW(RuntimeError, "the CUDA driver is not available");
+    }
+    return fn;
+}
+
+}  // namespace
+
 NvrtcFunction jit_pwise_function(const std::string& code,
                                  const std::string& kernel_name) {
     nvrtcProgram program;
@@ -285,12 +329,12 @@ NvrtcFunction jit_pwise_function(const std::string& code,
     nvrtcDestroyProgram(&program);
 
     NvrtcFunction fn;
-    if (cuModuleLoadDataEx(&fn.module, ptx.c_str(), 0, nullptr, nullptr) !=
+    if (cu_module_load_data_ex()(&fn.module, ptx.c_str(), 0, nullptr, nullptr) !=
         CUDA_SUCCESS) {
         TP_THROW(RuntimeError, "failed to load the jiterator kernel module");
     }
     const std::string symbol = kernel_name + "_kernel";
-    if (cuModuleGetFunction(&fn.function, fn.module, symbol.c_str()) !=
+    if (cu_module_get_function()(&fn.function, fn.module, symbol.c_str()) !=
         CUDA_SUCCESS) {
         TP_THROW(RuntimeError,
                  std::string("kernel ") + symbol +
@@ -305,7 +349,7 @@ void launch_jitted_pwise_function(NvrtcFunction function, const void* args[],
     uint32_t grid_x = nBlocks.x;
     uint32_t grid_y = nBlocks.y;
     uint32_t grid_z = nBlocks.z;
-    CUresult result = cuLaunchKernel(
+    CUresult result = cu_launch_kernel()(
         function.function, grid_x, grid_y, grid_z, kBlockSize.x, kBlockSize.y,
         kBlockSize.z, smem, getCurrentCUDAStream().stream(),
         const_cast<void**>(args), nullptr);
