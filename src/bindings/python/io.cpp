@@ -302,11 +302,11 @@ Tensor decode_png_cpu(const uint8_t* data, size_t size, int64_t mode) {
         case 0:  // unchanged: keep the file's gray/rgb and alpha presence
             break;
         case 1:  // gray: collapse color, drop alpha
-            if (color_type & PNG_COLOR_MASK_COLOR) png_set_rgb_to_gray(png, 1, 29900, 58700);
+            if (color_type & PNG_COLOR_MASK_COLOR) png_set_rgb_to_gray(png, 1, 0.299, 0.587);
             png_set_strip_alpha(png);
             break;
         case 2:  // gray + alpha
-            if (color_type & PNG_COLOR_MASK_COLOR) png_set_rgb_to_gray(png, 1, 29900, 58700);
+            if (color_type & PNG_COLOR_MASK_COLOR) png_set_rgb_to_gray(png, 1, 0.299, 0.587);
             if (!has_alpha) png_set_add_alpha(png, 255, PNG_FILLER_AFTER);
             break;
         case 3:  // rgb
