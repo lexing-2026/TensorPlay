@@ -193,7 +193,8 @@ class EncodeRoundtripTest(unittest.TestCase):
         self.assertEqual(tuple(decoded.shape), (1,) + g.shape)
 
     def test_write_jpeg_write_png_files(self):
-        import tempfile, os
+        import tempfile
+        import os
         rgb = _rgb(seed=10)
         t = tp.tensor(np.ascontiguousarray(rgb.transpose(2, 0, 1)))
         with tempfile.TemporaryDirectory() as d:
@@ -224,7 +225,8 @@ class ImageApiTest(unittest.TestCase):
         rgb = _rgb(seed=12)
         raw = _png_bytes(rgb)
         a = tp_io.decode_image(_bytes_tensor(raw))
-        import tempfile, os
+        import tempfile
+        import os
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "x.png")
             with open(p, "wb") as f:
@@ -233,7 +235,8 @@ class ImageApiTest(unittest.TestCase):
         np.testing.assert_array_equal(a.numpy(), b.numpy())
 
     def test_read_file_write_file(self):
-        import tempfile, os
+        import tempfile
+        import os
         data = np.arange(256, dtype=np.uint8)
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "bytes.bin")
