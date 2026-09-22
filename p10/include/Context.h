@@ -91,8 +91,18 @@ public:
     bool allowTF32CuDNN() const { return allow_tf32_cudnn_; }
     void setAllowTF32CuDNN(bool b) { allow_tf32_cudnn_ = b; }
 
-    // algorithm selection times the candidate algorithms on first use of a
-    // shape and caches the fastest (instead of trusting the heuristic).
+    // Half-precision GEMM accumulation: when true (default), float16 inputs
+    // accumulate in float16 (compute type 16F) on tensor cores; when false,
+    // accumulation stays in float32.  BFloat16 is unaffected (cuBLAS has no
+    // 16BF compute type and always accumulates in float32).
+    bool allowFP16AccumulationCuBLAS() const { return allow_fp16_acc_cublas_; }
+    void setAllowFP16AccumulationCuBLAS(bool b) { allow_fp16_acc_cublas_ = b; }
+
+    // Benchmark mode times the candidate engine configs on first use of a
+    // shape and caches the fastest, instead of trusting the inline
+    // heuristic pick (which can choose notably slower engines for small
+    // fp16 convolutions).  The deterministic-algorithms flag still turns
+    // the benchmark off and restores pure heuristic selection.
     bool cudnnBenchmark() const { return cudnn_benchmark_; }
     void setCudnnBenchmark(bool b) { cudnn_benchmark_ = b; }
 
@@ -170,7 +180,8 @@ private:
     bool deterministic_algorithms_warn_only_ = false;
     Float32MatmulPrecision float32_matmul_precision_ = Float32MatmulPrecision::HIGHEST;
     bool allow_tf32_cudnn_ = true;
-    bool cudnn_benchmark_ = false;
+    bool allow_fp16_acc_cublas_ = true;
+    bool cudnn_benchmark_ = true;
     bool enabled_mkldnn_ = true;
     bool enabled_nnpack_ = true;
     LinalgBackend linalg_preferred_backend_ = LinalgBackend::Default;

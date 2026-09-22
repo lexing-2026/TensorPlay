@@ -16,6 +16,7 @@
 
 #include <cublas_v2.h>
 #include <cublasLt.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -73,11 +74,13 @@ struct GemmKey {
     // the plan bakes the compute type into its descriptor; a precision
     // switch must not reuse a plan built under the other mode
     bool tf32;
+    bool fp16acc;
 
     bool operator==(const GemmKey& o) const {
         return dtype == o.dtype && m == o.m && n == o.n && k == o.k &&
                device == o.device && has_bias == o.has_bias &&
-               other_transposed == o.other_transposed && tf32 == o.tf32;
+               other_transposed == o.other_transposed && tf32 == o.tf32 &&
+               fp16acc == o.fp16acc;
     }
 };
 
@@ -91,6 +94,7 @@ struct GemmKeyHash {
         h ^= std::hash<bool>()(k.has_bias) + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= std::hash<bool>()(k.other_transposed) + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= std::hash<bool>()(k.tf32) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<bool>()(k.fp16acc) + 0x9e3779b9 + (h << 6) + (h >> 2);
         return h;
     }
 };
@@ -176,17 +180,47 @@ cudaDataType_t to_cublas_type(DType t) {
     }
 }
 
+// Device compute capability major, fetched once per device.  Querying
+// cudaGetDeviceProperties on every GEMM call is measurable (~1 ms in the
+// Muon loop), so the attribute is cached per (thread, device).
+int current_device_major() {
+    static thread_local int major = -1;
+    static thread_local int cached_device = -1;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return 0;
+    if (major < 0 || device != cached_device) {
+        cudaDeviceProp prop{};
+        major = (cudaGetDeviceProperties(&prop, device) == cudaSuccess) ? prop.major : 0;
+        cached_device = device;
+    }
+    return major;
+}
+
+// True when float16 GEMMs accumulate in float16 on tensor cores (compute
+// capability 7+ and the accumulation switch enabled).  BFloat16 has no
+// reduced-precision compute type in cuBLAS and always accumulates in fp32.
+bool fp16_accumulation_enabled() {
+    return globalContext().allowFP16AccumulationCuBLAS() &&
+           current_device_major() >= 7;
+}
+
+cublasComputeType_t compute_fp16_case() {
+    return fp16_accumulation_enabled() ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F;
+}
+
 cublasComputeType_t to_compute_type(DType t) {
     switch (t) {
-        // (float32_matmul_precision == "highest"), and its CUDABlas helpers
-        // accumulate Half/BFloat16 in FP32 with float alpha/beta.  Preserve
-        // that contract; "high"/"medium" enable TF32 compute for Float32,
-        // matching Context::allowTF32CuBLAS.
+        // Float32 keeps the plain fp32 or fast-TF32 compute type selected by
+        // Context::allowTF32CuBLAS.  Float16 accumulates in fp16 on tensor
+        // cores when Context::allowFP16AccumulationCuBLAS is enabled (and
+        // the device supports it), falling back to fp32 accumulation for
+        // maximum precision.  BFloat16 has no reduced-precision compute type
+        // in cuBLAS and always accumulates in fp32.
         case DType::Float32:
             if (globalContext().allowTF32CuBLAS()) return CUBLAS_COMPUTE_32F_FAST_TF32;
             return CUBLAS_COMPUTE_32F;
         case DType::Float64: return CUBLAS_COMPUTE_64F;
-        case DType::Float16: return CUBLAS_COMPUTE_32F;
+        case DType::Float16: return compute_fp16_case();
         case DType::BFloat16: return CUBLAS_COMPUTE_32F;
         case DType::ComplexFloat: return CUBLAS_COMPUTE_32F;
         case DType::ComplexDouble: return CUBLAS_COMPUTE_64F;
@@ -198,8 +232,9 @@ cudaDataType_t to_scale_type(DType t) {
     switch (t) {
         case DType::Float32: return CUDA_R_32F;
         case DType::Float64: return CUDA_R_64F;
-        // FP32 compute for reduced-precision inputs: scale in FP32.
-        case DType::Float16: return CUDA_R_32F;
+        // FP32 compute for reduced-precision inputs: scale in FP32.  The
+        // fp16 accumulate mode (16F) scales in FP16, matching cuBLAS.
+        case DType::Float16: return fp16_accumulation_enabled() ? CUDA_R_16F : CUDA_R_32F;
         case DType::BFloat16: return CUDA_R_32F;
         case DType::ComplexFloat: return CUDA_C_32F;
         case DType::ComplexDouble: return CUDA_C_64F;
@@ -212,12 +247,18 @@ cudaDataType_t to_scale_type(DType t) {
 void* to_scalar_ptr(double v, DType t, int slot) {
     static thread_local float f32[2];
     static thread_local double f64[2];
+    static thread_local __half f16[2];
     static thread_local cuFloatComplex c32[2];
     static thread_local cuDoubleComplex c64[2];
     switch (t) {
         case DType::Float32: f32[slot] = static_cast<float>(v); return &f32[slot];
         case DType::Float64: f64[slot] = v; return &f64[slot];
-        case DType::Float16: f32[slot] = static_cast<float>(v); return &f32[slot];
+        case DType::Float16:
+            if (fp16_accumulation_enabled()) {
+                f16[slot] = __float2half(static_cast<float>(v));
+                return &f16[slot];
+            }
+            f32[slot] = static_cast<float>(v); return &f32[slot];
         case DType::BFloat16: f32[slot] = static_cast<float>(v); return &f32[slot];
         case DType::ComplexFloat: c32[slot] = make_cuFloatComplex(static_cast<float>(v), 0.0f); return &c32[slot];
         case DType::ComplexDouble: c64[slot] = make_cuDoubleComplex(v, 0.0); return &c64[slot];
@@ -229,7 +270,8 @@ std::shared_ptr<GemmPlan> get_gemm_plan(DType dtype, int64_t M, int64_t N, int64
                                         bool has_bias, bool other_transposed) {
     const int device = currentDevice();
     const bool tf32 = dtype == DType::Float32 && globalContext().allowTF32CuBLAS();
-    GemmKey key{dtype, M, N, K, device, has_bias, other_transposed, tf32};
+    const bool fp16acc = dtype == DType::Float16 && fp16_accumulation_enabled();
+    GemmKey key{dtype, M, N, K, device, has_bias, other_transposed, tf32, fp16acc};
     std::lock_guard<std::mutex> lock(plan_mutex());
     auto& cache = plan_cache();
     auto it = cache.find(key);
