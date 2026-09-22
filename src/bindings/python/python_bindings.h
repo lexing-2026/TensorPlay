@@ -39,6 +39,11 @@ using Tensor = tensorplay::Tensor;
 // using namespace tensorplay;
 
 void init_tensor(py::module_& m);
+
+// numpy-to-tensor load adapters (io.cpp): fused layout conversion +
+// normalization kernels backing tensorplay.vision / tensorplay.audio.
+Tensor vision_to_tensor(py::array_t<uint8_t, py::array::c_style | py::array::forcecast> img);
+Tensor audio_to_tensor(py::object obj);
 void init_device(py::module_& m);
 void init_dtype(py::module_& m);
 void init_size(py::module_& m);

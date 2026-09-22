@@ -232,9 +232,28 @@ struct CxPowBase {
         return tensorplay_complex_math::pow(base_value, exponent);
     }
 };
+// Dtype for an elementwise op between a tensor and a 0-dim operand created
+// from a Python scalar: the placeholder side does not widen the result, it
+// adopts the tensor side's dtype. A floating scalar acting on an integer
+// tensor still promotes to Float32, a complex scalar to ComplexFloat.
+inline DType wrapped_scalar_pair_dtype(DType tensor_dtype, DType scalar_dtype) {
+    if (isFloatingOrComplexType(tensor_dtype)) return tensor_dtype;
+    if (isComplexType(scalar_dtype)) return DType::ComplexFloat;
+    if (isFloatingType(scalar_dtype)) return DType::Float32;
+    return tensor_dtype;
+}
 Tensor pow_kernel_cuda(const Tensor& self, const Tensor& other) {
-    if (isComplexType(promoteTypes(self.dtype(), other.dtype()))) {
-        DType rd = promoteTypes(self.dtype(), other.dtype());
+    const bool self_wrapped =
+        self.dim() == 0 && self.unsafeGetTensorImpl()->is_wrapped_number();
+    const bool other_wrapped =
+        other.dim() == 0 && other.unsafeGetTensorImpl()->is_wrapped_number();
+    DType rd = promoteTypes(self.dtype(), other.dtype());
+    if (self_wrapped != other_wrapped) {
+        rd = self_wrapped
+            ? wrapped_scalar_pair_dtype(other.dtype(), self.dtype())
+            : wrapped_scalar_pair_dtype(self.dtype(), other.dtype());
+    }
+    if (isComplexType(rd)) {
         std::vector<int64_t> out_shape = broadcast_shapes(
             static_cast<std::vector<int64_t>>(self.shape()),
             static_cast<std::vector<int64_t>>(other.shape()));
@@ -288,7 +307,21 @@ Tensor pow_kernel_cuda(const Tensor& self, const Tensor& other) {
         }
         return result;
     }
-    return binary_float_op_kernel_v2(self, other, PowFunctor());
+    // Same-dtype elementwise path: cast both sides to the result dtype and
+    // stretch a lower-rank operand to the common shape, since the shared
+    // binary kernel requires matching shapes.
+    Tensor a = self.dtype() == rd ? self : self.to(rd);
+    Tensor b = other.dtype() == rd ? other : other.to(rd);
+    std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(other.shape()));
+    if (static_cast<std::vector<int64_t>>(a.shape()) != out_shape) {
+        a = a.expand(out_shape);
+    }
+    if (static_cast<std::vector<int64_t>>(b.shape()) != out_shape) {
+        b = b.expand(out_shape);
+    }
+    return binary_float_op_kernel_v2(a, b, PowFunctor());
 }
 Tensor pow_scalar_kernel_cuda(const Tensor& self, const Scalar& exponent) {
     if (!isComplexType(self.dtype()) && !exponent.isComplex() &&

@@ -415,7 +415,6 @@ class Inception_V3_Weights(WeightsEnum):
             "num_params": 27161264,
             "min_size": (75, 75),
             "categories": _IMAGENET_CATEGORIES,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#inception-v3",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 77.294,
@@ -450,8 +449,7 @@ def inception_v3(*, weights: Optional[Inception_V3_Weights] = None, progress: bo
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.Inception3``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/inception.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.Inception_V3_Weights

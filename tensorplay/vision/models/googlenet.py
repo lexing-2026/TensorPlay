@@ -282,7 +282,6 @@ class GoogLeNet_Weights(WeightsEnum):
             "num_params": 6624904,
             "min_size": (15, 15),
             "categories": _IMAGENET_CATEGORIES,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#googlenet",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 69.778,
@@ -312,8 +311,7 @@ def googlenet(*, weights: Optional[GoogLeNet_Weights] = None, progress: bool = T
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.GoogLeNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/googlenet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
     .. autoclass:: tensorplay.vision.models.GoogLeNet_Weights
         :members:

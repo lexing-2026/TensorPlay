@@ -1404,6 +1404,7 @@ set(TP_C_SOURCES
     src/bindings/python/PythonDispatch.cpp
     ${GEN_PYTHON_DISPATCH_CPP}
     src/bindings/python/Tensor.cpp
+    src/bindings/python/io.cpp
     src/bindings/python/EnvAllocator.cpp
     src/bindings/python/Stax.cpp
     src/bindings/python/Parallel.cpp

@@ -50,15 +50,33 @@ def load(filepath, frame_offset=0, num_frames=-1, normalize=True,
 
     if backend == "soundfile":
         import soundfile as sf
-        dtype = "float32" if normalize else None
         start = int(frame_offset)
         count = int(num_frames)
-        if num_frames == -1:
-            audio_np, sr = sf.read(filepath, dtype=dtype, start=start,
-                                   always_2d=True)
-        else:
-            audio_np, sr = sf.read(filepath, dtype=dtype, start=start,
-                                   frames=count, always_2d=True)
+        # Integer-PCM subtypes are read at their native width so the
+        # conversion kernel below folds scaling and the (Time, Channels) ->
+        # (Channels, Time) transpose into a single pass. For PCM_16/PCM_24/
+        # PCM_32 the native-width read is bit-identical to the float32 decode;
+        # encodings without an integer read (FLOAT, ULAW, ...) stay on it.
+        read_dtype = "float32" if normalize else None
+        handle = sf.SoundFile(filepath)
+        try:
+            if normalize:
+                if handle.subtype == "PCM_16":
+                    read_dtype = "int16"
+                elif handle.subtype in ("PCM_24", "PCM_32"):
+                    read_dtype = "int32"
+            sr = handle.samplerate
+            # Slice-style bounds, as soundfile's own read() applies them:
+            # a negative offset counts from the end and an offset past the
+            # last frame clamps to EOF (yielding an empty read) instead of
+            # failing the seek.
+            start, stop, _ = slice(int(frame_offset), None).indices(handle.frames)
+            if count < 0:
+                count = stop - start
+            handle.seek(start)
+            audio_np = handle.read(count, dtype=read_dtype, always_2d=True)
+        finally:
+            handle.close()
 
     elif backend == "scipy":
         from scipy.io import wavfile
@@ -70,13 +88,10 @@ def load(filepath, frame_offset=0, num_frames=-1, normalize=True,
         start = max(0, int(frame_offset))
         stop = raw.shape[0] if num_frames == -1 else min(raw.shape[0], start + int(num_frames))
         audio_np = raw[start:stop]
-        if normalize:
-            if raw.dtype == np.int16:
-                audio_np = audio_np.astype(np.float32) / 32768.0
-            elif raw.dtype == np.int32:
-                audio_np = audio_np.astype(np.float32) / 2147483648.0
-            elif raw.dtype == np.uint8:
-                audio_np = (audio_np.astype(np.float32) - 128.0) / 128.0
+        # For int16/int32/uint8 with normalize=True, normalization and the
+        # (Time, Channels) -> (Channels, Time) transpose both fold into the
+        # native conversion gated below; other encodings pass through
+        # untouched, as before.
 
     if audio_np is None:
         raise RuntimeError(f"Failed to load audio file: {filepath}")
@@ -93,7 +108,10 @@ def load(filepath, frame_offset=0, num_frames=-1, normalize=True,
         and audio_np.dtype in (np.int16, np.int32, np.uint8, np.float32)
     )
     if use_cpp:
-        tensor = tp.audio_to_tensor(audio_np.astype(np.float32))
+        # Pass the native encoding through: the kernel normalizes int16/int32/
+        # uint8 and transposes in one pass. Casting to float32 here would
+        # disable its normalization branches.
+        tensor = tp.audio_to_tensor(np.ascontiguousarray(audio_np))
     else:
         tensor = tp.tensor(audio_np.T.copy() if channels_first else audio_np.copy())
         return tensor, sr

@@ -552,9 +552,83 @@ def _import_module(name: str, path: str):
     return module
 
 
+# ---------------------------------------------------------------------------
+# Foreign-module compatibility for third-party hubconf files
+# ---------------------------------------------------------------------------
+
+# Root-level module names that third-party hubconf files commonly import,
+# mapped to the native packages exposing the equivalent API. These strings are
+# functional interop identifiers of external ecosystems.
+_COMPAT_ROOTS: dict[str, str] = {
+    "torch": "tensorplay",
+    "torchvision": "tensorplay.vision",
+}
+
+
+def _compat_target_name(name: str) -> Optional[str]:
+    """Return the native module name mapped to a foreign module name, or None."""
+    for foreign, real in _COMPAT_ROOTS.items():
+        if name == foreign or name.startswith(foreign + "."):
+            return real + name[len(foreign) :]
+    return None
+
+
+class _AliasLoader:
+    """Loader re-exporting an already-initialized module under an alias name."""
+
+    def __init__(self, module):
+        self._module = module
+
+    def create_module(self, spec):
+        return self._module
+
+    def exec_module(self, module):
+        pass
+
+
+class _CompatFinder:
+    """Meta-path finder resolving foreign module names to native equivalents.
+
+    The aliased module is the real native module object, so classes imported
+    through either name share one identity (isinstance and pickle included).
+    """
+
+    def find_spec(self, fullname, path=None, target=None):
+        import importlib
+
+        mapped = _compat_target_name(fullname)
+        if mapped is None or fullname in sys.modules:
+            return None
+        try:
+            module = importlib.import_module(mapped)
+        except Exception:
+            # Not a native module either: fall through so the interpreter
+            # reports ModuleNotFoundError for the originally requested name.
+            return None
+        return importlib.util.spec_from_loader(fullname, _AliasLoader(module), origin=module.__file__)
+
+
+@contextlib.contextmanager
+def _foreign_framework_compat():
+    """Enable foreign-name resolution while importing/running a hubconf entry."""
+    finder = _CompatFinder()
+    sys.meta_path.insert(0, finder)
+    try:
+        yield
+    finally:
+        sys.meta_path.remove(finder)
+
+
 def _check_module_exists(name: str) -> bool:
     import importlib.util
 
+    mapped = _compat_target_name(name)
+    if mapped is not None:
+        try:
+            if importlib.util.find_spec(mapped) is not None:
+                return True
+        except (ImportError, ValueError):
+            pass
     return importlib.util.find_spec(name) is not None
 
 
@@ -577,8 +651,11 @@ def _load_entry_from_hubconf(m, model):
 
 
 def _load_hub_module(repo_dir: Path):
-    with _add_to_sys_path(repo_dir):
-        return _import_module(MODULE_HUBCONF, str(repo_dir / MODULE_HUBCONF))
+    conf = repo_dir / MODULE_HUBCONF
+    if not conf.exists():
+        raise RuntimeError(f"{repo_dir} has no {MODULE_HUBCONF}")
+    with _add_to_sys_path(repo_dir), _foreign_framework_compat():
+        return _import_module(MODULE_HUBCONF, str(conf))
 
 
 # ---------------------------------------------------------------------------
@@ -679,7 +756,8 @@ def load(
 def _load_local(hubconf_dir, model, *args, **kwargs):
     hub_module = _load_hub_module(Path(hubconf_dir))
     entry = _load_entry_from_hubconf(hub_module, model)
-    return entry(*args, **kwargs)
+    with _foreign_framework_compat():
+        return entry(*args, **kwargs)
 
 
 def list_entrypoints(repo_id: str, ref: str | None = None, force_reload: bool = False,
@@ -736,7 +814,23 @@ def load_state_dict_from_url(
 # MEGA backend (megatensors SDK, imported lazily)
 # ---------------------------------------------------------------------------
 
-_WEIGHT_EXTS = (".safetensors", ".mst", ".pt", ".pth", ".bin")
+_WEIGHT_EXTS = (".safetensors", ".mst", ".pt", ".pth", ".bin", ".mega")
+_MEGA_INDEX_SUFFIX = ".mega.index.json"
+
+
+def _collect_weight_paths(local_dir: Path) -> list[Path]:
+    """Weight entry points inside a downloaded repo snapshot.
+
+    A ``*.mega.index.json`` index alone describes the MEGA shards it references,
+    so when one is present it is the only path handed to the loader.
+    """
+    indexes = sorted(p for p in local_dir.rglob(f"*{_MEGA_INDEX_SUFFIX}") if p.is_file())
+    if indexes:
+        return indexes
+    return sorted(
+        p for p in local_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() in _WEIGHT_EXTS
+    )
 
 
 def _mega_client(endpoint=None, token=None):
@@ -821,7 +915,7 @@ def load_state_dict(
         return _mega_load_state_dict([path], device, load_kwargs)
 
     local_dir = client.snapshot_download(repo_or_url, local_dir=cache_root, revision=revision)
-    paths = sorted(p for p in local_dir.rglob("*") if p.is_file() and p.suffix.lower() in _WEIGHT_EXTS)
+    paths = _collect_weight_paths(local_dir)
     if not paths:
         raise RuntimeError(f"No weight files found in MEGA repo '{repo_or_url}' (revision={revision})")
     return _mega_load_state_dict(paths, device, load_kwargs)
@@ -881,10 +975,7 @@ def load_model(
         paths = [client.download_file(repo_or_url, filename, local_dir=cache_root, revision=revision)]
     else:
         local_dir = client.snapshot_download(repo_or_url, local_dir=cache_root, revision=revision)
-        index = local_dir / ".mega.index.json"
-        paths = sorted(p for p in local_dir.rglob("*") if p.is_file() and p.suffix.lower() in _WEIGHT_EXTS)
-        if index.exists():
-            paths = [index] + paths
+        paths = _collect_weight_paths(local_dir)
     if not paths:
         raise RuntimeError(f"No weight files found in MEGA repo '{repo_or_url}' (revision={revision})")
 

@@ -35,7 +35,7 @@ class CelebA(VisionDataset):
                       dataset. As a result, the coordinates will not match and may fall
                       outside the image boundaries.
 
-                      See `Issue #9008 <https://github.com/tensorplay/vision/issues/9008>`_ for
+                      See `Issue #9008 the project issue tracker`_ for
                       details and potential workarounds.
 
                 - ``landmarks`` (Tensor shape=(10,) dtype=int): landmark points (lefteye_x, lefteye_y, righteye_x,

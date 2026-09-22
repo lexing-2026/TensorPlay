@@ -60,7 +60,6 @@ class AlexNet_Weights(WeightsEnum):
             "num_params": 61100840,
             "min_size": (63, 63),
             "categories": _IMAGENET_CATEGORIES,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#alexnet-and-vgg",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 56.522,
@@ -98,8 +97,7 @@ def alexnet(*, weights: Optional[AlexNet_Weights] = None, progress: bool = True,
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.squeezenet.AlexNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/alexnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.AlexNet_Weights

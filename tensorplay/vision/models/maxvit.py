@@ -780,7 +780,6 @@ class MaxVit_T_Weights(WeightsEnum):
             "categories": _IMAGENET_CATEGORIES,
             "num_params": 30919624,
             "min_size": (224, 224),
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#maxvit",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 83.700,
@@ -812,8 +811,7 @@ def maxvit_t(*, weights: Optional[MaxVit_T_Weights] = None, progress: bool = Tru
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.maxvit.MaxVit``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/maxvit.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.MaxVit_T_Weights

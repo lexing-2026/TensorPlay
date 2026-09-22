@@ -2123,10 +2123,30 @@ Tensor log_softmax_kernel(const Tensor& self, int64_t dim, DType dtype) {
     return softmax_fused_kernel_impl<true>(self, dim, out_dtype);
 }
 
+// Dtype for an elementwise op between a tensor and a 0-dim operand created
+// from a Python scalar: the placeholder side does not widen the result, it
+// adopts the tensor side's dtype. A floating scalar acting on an integer
+// tensor still promotes to Float32, a complex scalar to ComplexFloat.
+inline DType wrapped_scalar_pair_dtype(DType tensor_dtype, DType scalar_dtype) {
+    if (isFloatingOrComplexType(tensor_dtype)) return tensor_dtype;
+    if (isComplexType(scalar_dtype)) return DType::ComplexFloat;
+    if (isFloatingType(scalar_dtype)) return DType::Float32;
+    return tensor_dtype;
+}
+
 // Helper for pow (Tensor, Tensor)
 Tensor pow_tensor_tensor_kernel(const Tensor& self, const Tensor& exponent) {
     std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(exponent.shape()));
+    const bool self_wrapped =
+        self.dim() == 0 && self.unsafeGetTensorImpl()->is_wrapped_number();
+    const bool exp_wrapped =
+        exponent.dim() == 0 && exponent.unsafeGetTensorImpl()->is_wrapped_number();
     DType result_dtype = promoteTypes(self.dtype(), exponent.dtype());
+    if (self_wrapped != exp_wrapped) {
+        result_dtype = self_wrapped
+            ? wrapped_scalar_pair_dtype(exponent.dtype(), self.dtype())
+            : wrapped_scalar_pair_dtype(self.dtype(), exponent.dtype());
+    }
 
     Tensor result = Tensor::empty(out_shape, result_dtype, self.device());
 

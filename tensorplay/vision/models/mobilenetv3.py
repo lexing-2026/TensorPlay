@@ -301,7 +301,6 @@ class MobileNet_V3_Large_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 5483032,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#mobilenetv3-large--small",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 74.042,
@@ -319,7 +318,6 @@ class MobileNet_V3_Large_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 5483032,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe-with-reg-tuning",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 75.274,
@@ -345,7 +343,6 @@ class MobileNet_V3_Small_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 2542856,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#mobilenetv3-large--small",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 67.668,
@@ -365,7 +362,11 @@ class MobileNet_V3_Small_Weights(WeightsEnum):
 @register_model()
 @handle_legacy_interface(weights=("pretrained", MobileNet_V3_Large_Weights.IMAGENET1K_V1))
 def mobilenet_v3_large(
-    *, weights: Optional[MobileNet_V3_Large_Weights] = None, progress: bool = True, **kwargs: Any
+    *,
+    weights: Optional[MobileNet_V3_Large_Weights] = None,
+    progress: bool = True,
+    dilated: bool = False,
+    **kwargs: Any
 ) -> MobileNetV3:
     """
     Constructs a large MobileNetV3 architecture from
@@ -380,8 +381,7 @@ def mobilenet_v3_large(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.mobilenet.MobileNetV3``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/mobilenetv3.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.MobileNet_V3_Large_Weights
@@ -389,7 +389,7 @@ def mobilenet_v3_large(
     """
     weights = MobileNet_V3_Large_Weights.verify(weights)
 
-    inverted_residual_setting, last_channel = _mobilenet_v3_conf("mobilenet_v3_large", **kwargs)
+    inverted_residual_setting, last_channel = _mobilenet_v3_conf("mobilenet_v3_large", dilated=dilated, **kwargs)
     return _mobilenet_v3(inverted_residual_setting, last_channel, weights, progress, **kwargs)
 
 
@@ -411,8 +411,7 @@ def mobilenet_v3_small(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.mobilenet.MobileNetV3``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/mobilenetv3.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.MobileNet_V3_Small_Weights

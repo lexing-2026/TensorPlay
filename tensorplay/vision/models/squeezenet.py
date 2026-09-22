@@ -116,7 +116,6 @@ def _squeezenet(
 
 _COMMON_META = {
     "categories": _IMAGENET_CATEGORIES,
-    "recipe": "https://github.com/tensorplay/vision/pull/49#issuecomment-277560717",
     "_docs": """These weights reproduce closely the results of the paper using a simple training recipe.""",
 }
 
@@ -181,8 +180,7 @@ def squeezenet1_0(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.squeezenet.SqueezeNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/squeezenet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.SqueezeNet1_0_Weights
@@ -212,8 +210,7 @@ def squeezenet1_1(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.squeezenet.SqueezeNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/squeezenet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.SqueezeNet1_1_Weights

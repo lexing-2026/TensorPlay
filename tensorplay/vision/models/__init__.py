@@ -1,7 +1,7 @@
-"""Classification models exposed by the vision package.
+"""Classification and task-specific models exposed by the vision package.
 
-The detection / optical_flow / quantization / segmentation / video
-subpackages are not included; everything else follows tensorplay.vision.
+The detection / quantization subpackages are not included; everything else
+follows tensorplay.vision.
 """
 
 from .alexnet import *
@@ -21,6 +21,9 @@ from .vgg import *
 from .vision_transformer import *
 from .swin_transformer import *
 from .maxvit import *
+from .optical_flow import *
+from .segmentation import *
+from .video import *
 
 # The Weights and WeightsEnum are developer-facing utils that we make public
 from ._api import (

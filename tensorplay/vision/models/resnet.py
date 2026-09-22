@@ -313,7 +313,6 @@ class ResNet18_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 11689512,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#resnet",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 69.758,
@@ -335,7 +334,6 @@ class ResNet34_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 21797672,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#resnet",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 73.314,
@@ -357,7 +355,6 @@ class ResNet50_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 25557032,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#resnet",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 76.130,
@@ -375,7 +372,6 @@ class ResNet50_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 25557032,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#issuecomment-1013906621",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 80.858,
@@ -400,7 +396,6 @@ class ResNet101_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 44549160,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#resnet",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 77.374,
@@ -418,7 +413,6 @@ class ResNet101_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 44549160,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 81.886,
@@ -443,7 +437,6 @@ class ResNet152_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 60192808,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#resnet",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 78.312,
@@ -461,7 +454,6 @@ class ResNet152_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 60192808,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 82.284,
@@ -486,7 +478,6 @@ class ResNeXt50_32X4D_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 25028904,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#resnext",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 77.618,
@@ -504,7 +495,6 @@ class ResNeXt50_32X4D_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 25028904,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 81.198,
@@ -529,7 +519,6 @@ class ResNeXt101_32X8D_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 88791336,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#resnext",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 79.312,
@@ -547,7 +536,6 @@ class ResNeXt101_32X8D_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 88791336,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe-with-fixres",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 82.834,
@@ -572,7 +560,6 @@ class ResNeXt101_64X4D_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 83455272,
-            "recipe": "https://github.com/tensorplay/vision/pull/5935",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 83.246,
@@ -597,7 +584,6 @@ class Wide_ResNet50_2_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 68883240,
-            "recipe": "https://github.com/tensorplay/vision/pull/912#issue-445437439",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 78.468,
@@ -615,7 +601,6 @@ class Wide_ResNet50_2_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 68883240,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe-with-fixres",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 81.602,
@@ -640,7 +625,6 @@ class Wide_ResNet101_2_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 126886696,
-            "recipe": "https://github.com/tensorplay/vision/pull/912#issue-445437439",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 78.848,
@@ -658,7 +642,6 @@ class Wide_ResNet101_2_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 126886696,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 82.510,
@@ -690,8 +673,7 @@ def resnet18(*, weights: Optional[ResNet18_Weights] = None, progress: bool = Tru
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.resnet.ResNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/resnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.ResNet18_Weights
@@ -716,8 +698,7 @@ def resnet34(*, weights: Optional[ResNet34_Weights] = None, progress: bool = Tru
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.resnet.ResNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/resnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.ResNet34_Weights
@@ -748,8 +729,7 @@ def resnet50(*, weights: Optional[ResNet50_Weights] = None, progress: bool = Tru
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.resnet.ResNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/resnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.ResNet50_Weights
@@ -780,8 +760,7 @@ def resnet101(*, weights: Optional[ResNet101_Weights] = None, progress: bool = T
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.resnet.ResNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/resnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.ResNet101_Weights
@@ -812,8 +791,7 @@ def resnet152(*, weights: Optional[ResNet152_Weights] = None, progress: bool = T
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.resnet.ResNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/resnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.ResNet152_Weights
@@ -841,8 +819,7 @@ def resnext50_32x4d(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.resnet.ResNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/resnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
     .. autoclass:: tensorplay.vision.models.ResNeXt50_32X4D_Weights
         :members:
@@ -871,8 +848,7 @@ def resnext101_32x8d(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.resnet.ResNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/resnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
     .. autoclass:: tensorplay.vision.models.ResNeXt101_32X8D_Weights
         :members:
@@ -901,8 +877,7 @@ def resnext101_64x4d(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.resnet.ResNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/resnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
     .. autoclass:: tensorplay.vision.models.ResNeXt101_64X4D_Weights
         :members:
@@ -936,8 +911,7 @@ def wide_resnet50_2(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.resnet.ResNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/resnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
     .. autoclass:: tensorplay.vision.models.Wide_ResNet50_2_Weights
         :members:
@@ -970,8 +944,7 @@ def wide_resnet101_2(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.resnet.ResNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/resnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
     .. autoclass:: tensorplay.vision.models.Wide_ResNet101_2_Weights
         :members:

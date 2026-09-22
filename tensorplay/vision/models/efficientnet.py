@@ -426,14 +426,12 @@ _COMMON_META: dict[str, Any] = {
 _COMMON_META_V1 = {
     **_COMMON_META,
     "min_size": (1, 1),
-    "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#efficientnet-v1",
 }
 
 
 _COMMON_META_V2 = {
     **_COMMON_META,
     "min_size": (33, 33),
-    "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#efficientnet-v2",
 }
 
 
@@ -488,7 +486,6 @@ class EfficientNet_B1_Weights(WeightsEnum):
         meta={
             **_COMMON_META_V1,
             "num_params": 7794184,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe-with-lr-wd-crop-tuning",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 79.838,
@@ -751,8 +748,7 @@ def efficientnet_b0(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
     .. autoclass:: tensorplay.vision.models.EfficientNet_B0_Weights
         :members:
@@ -782,8 +778,7 @@ def efficientnet_b1(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
     .. autoclass:: tensorplay.vision.models.EfficientNet_B1_Weights
         :members:
@@ -813,8 +808,7 @@ def efficientnet_b2(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
     .. autoclass:: tensorplay.vision.models.EfficientNet_B2_Weights
         :members:
@@ -844,8 +838,7 @@ def efficientnet_b3(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
     .. autoclass:: tensorplay.vision.models.EfficientNet_B3_Weights
         :members:
@@ -880,8 +873,7 @@ def efficientnet_b4(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
     .. autoclass:: tensorplay.vision.models.EfficientNet_B4_Weights
         :members:
@@ -916,8 +908,7 @@ def efficientnet_b5(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
     .. autoclass:: tensorplay.vision.models.EfficientNet_B5_Weights
         :members:
@@ -953,8 +944,7 @@ def efficientnet_b6(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
     .. autoclass:: tensorplay.vision.models.EfficientNet_B6_Weights
         :members:
@@ -990,8 +980,7 @@ def efficientnet_b7(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
     .. autoclass:: tensorplay.vision.models.EfficientNet_B7_Weights
         :members:
@@ -1028,8 +1017,7 @@ def efficientnet_v2_s(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
     .. autoclass:: tensorplay.vision.models.EfficientNet_V2_S_Weights
         :members:
@@ -1066,8 +1054,7 @@ def efficientnet_v2_m(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
     .. autoclass:: tensorplay.vision.models.EfficientNet_V2_M_Weights
         :members:
@@ -1104,8 +1091,7 @@ def efficientnet_v2_l(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
+            base class. Please refer to the source code
             for more details about this class.
     .. autoclass:: tensorplay.vision.models.EfficientNet_V2_L_Weights
         :members:

@@ -186,7 +186,6 @@ class MobileNet_V2_Weights(WeightsEnum):
         transforms=partial(ImageClassification, crop_size=224),
         meta={
             **_COMMON_META,
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#mobilenetv2",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 71.878,
@@ -203,7 +202,6 @@ class MobileNet_V2_Weights(WeightsEnum):
         transforms=partial(ImageClassification, crop_size=224, resize_size=232),
         meta={
             **_COMMON_META,
-            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe-with-reg-tuning",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 72.154,
@@ -239,8 +237,7 @@ def mobilenet_v2(
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.mobilenetv2.MobileNetV2``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/mobilenetv2.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.MobileNet_V2_Weights

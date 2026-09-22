@@ -355,7 +355,6 @@ class ViT_B_16_Weights(WeightsEnum):
             **_COMMON_META,
             "num_params": 86567656,
             "min_size": (224, 224),
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#vit_b_16",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 81.072,
@@ -406,7 +405,6 @@ class ViT_B_16_Weights(WeightsEnum):
         ),
         meta={
             **_COMMON_SWAG_META,
-            "recipe": "https://github.com/tensorplay/vision/pull/5793",
             "num_params": 86567656,
             "min_size": (224, 224),
             "_metrics": {
@@ -434,7 +432,6 @@ class ViT_B_32_Weights(WeightsEnum):
             **_COMMON_META,
             "num_params": 88224232,
             "min_size": (224, 224),
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#vit_b_32",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 75.912,
@@ -460,7 +457,6 @@ class ViT_L_16_Weights(WeightsEnum):
             **_COMMON_META,
             "num_params": 304326632,
             "min_size": (224, 224),
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#vit_l_16",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 79.662,
@@ -512,7 +508,6 @@ class ViT_L_16_Weights(WeightsEnum):
         ),
         meta={
             **_COMMON_SWAG_META,
-            "recipe": "https://github.com/tensorplay/vision/pull/5793",
             "num_params": 304326632,
             "min_size": (224, 224),
             "_metrics": {
@@ -540,7 +535,6 @@ class ViT_L_32_Weights(WeightsEnum):
             **_COMMON_META,
             "num_params": 306535400,
             "min_size": (224, 224),
-            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#vit_l_32",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 76.972,
@@ -595,7 +589,6 @@ class ViT_H_14_Weights(WeightsEnum):
         ),
         meta={
             **_COMMON_SWAG_META,
-            "recipe": "https://github.com/tensorplay/vision/pull/5793",
             "num_params": 632045800,
             "min_size": (224, 224),
             "_metrics": {
@@ -628,8 +621,7 @@ def vit_b_16(*, weights: Optional[ViT_B_16_Weights] = None, progress: bool = Tru
             below for more details and possible values. By default, no pre-trained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.vision_transformer.VisionTransformer``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/vision_transformer.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.ViT_B_16_Weights
@@ -662,8 +654,7 @@ def vit_b_32(*, weights: Optional[ViT_B_32_Weights] = None, progress: bool = Tru
             below for more details and possible values. By default, no pre-trained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.vision_transformer.VisionTransformer``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/vision_transformer.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.ViT_B_32_Weights
@@ -696,8 +687,7 @@ def vit_l_16(*, weights: Optional[ViT_L_16_Weights] = None, progress: bool = Tru
             below for more details and possible values. By default, no pre-trained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.vision_transformer.VisionTransformer``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/vision_transformer.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.ViT_L_16_Weights
@@ -730,8 +720,7 @@ def vit_l_32(*, weights: Optional[ViT_L_32_Weights] = None, progress: bool = Tru
             below for more details and possible values. By default, no pre-trained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.vision_transformer.VisionTransformer``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/vision_transformer.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.ViT_L_32_Weights
@@ -764,8 +753,7 @@ def vit_h_14(*, weights: Optional[ViT_H_14_Weights] = None, progress: bool = Tru
             below for more details and possible values. By default, no pre-trained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
         **kwargs: parameters passed to the ``tensorplay.vision.models.vision_transformer.VisionTransformer``
-            base class. Please refer to the `source code
-            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/vision_transformer.py>`_
+            base class. Please refer to the source code
             for more details about this class.
 
     .. autoclass:: tensorplay.vision.models.ViT_H_14_Weights
