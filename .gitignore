@@ -8,6 +8,7 @@ release_site/
 .idea/
 .trae/
 .pytest_cache/
+.zcode/
 data_torch/
 logs_*/
 
