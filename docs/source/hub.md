@@ -108,6 +108,17 @@ Users can force a reload by calling `hub.load(..., force_reload=True)`. This wil
 the existing GitHub folder and downloaded weights, reinitialize a fresh download. This is useful
 when updates are published to the same branch, users can keep up with the latest release.
 
+For GitHub sources the cache records a `.commit` pin: the exact commit the
+snapshot was fetched at. On subsequent loads the ref's current commit is
+checked (one API call; set `GITHUB_TOKEN` to raise the rate limit) — an
+unchanged ref reuses the cache, a moved ref refreshes it, and when the API is
+unreachable the cache is used as-is. Pass `skip_validation=True` to skip the
+check entirely and never contact the API on a cache hit.
+
+Downloads are resumable: an interrupted transfer leaves a `<file>.part` file
+that the next attempt continues from, and a completed download writes a
+`<file>.sha256` sidecar used to verify the file on later cache hits.
+
 ### Trust and validation
 
 Loading a repository executes its `hubconf.py`, so the code must be treated as

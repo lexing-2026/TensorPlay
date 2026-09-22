@@ -9,7 +9,6 @@ import logging
 import shutil
 import sys
 import time
-import uuid
 import warnings
 import zipfile
 from pathlib import Path
@@ -49,6 +48,7 @@ ENV_GITHUB_TOKEN = "GITHUB_TOKEN"
 VAR_DEPENDENCY = "dependencies"
 MODULE_HUBCONF = "hubconf.py"
 HASH_REGEX = re.compile(r"-([a-f0-9]*)\.")
+COMMIT_PIN_NAME = ".commit"
 
 # Matches checkpoint URLs pointing directly at a weight file.
 _WEIGHT_URL_RE = re.compile(r"^https?://.*\.(pth|pt|ckpt|safetensors|mst)([?#].*)?$", re.I)
@@ -106,6 +106,14 @@ def _human_readable_size(size: float) -> str:
         size /= 1024.0
     return f"{size:.1f} PB"
 
+def _sha256_file(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(READ_DATA_CHUNK):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
 def download_url_to_file(
         url: str,
         dst: Union[str, Path],
@@ -123,8 +131,12 @@ def download_url_to_file(
     Features:
     - First download to a temp file, then move to the destination path to avoid corrupting the destination file.
     - Support SHA256 hash prefix check to ensure file integrity.
+    - Record a full-file sha256 sidecar (``<dst>.sha256``); cache hits verify
+      against it and redownload on mismatch.
     - Show download progress bar (disable with progress=False).
     - Support network timeout and retry mechanism for stability.
+    - Resume interrupted downloads from a deterministic ``<dst>.part`` file
+      when the server supports range requests.
     - Automatically create parent directories for the destination path.
 
     Args:
@@ -155,6 +167,7 @@ def download_url_to_file(
 
     dst_path = Path(dst).resolve()
     dst_parent = dst_path.parent
+    sidecar = dst_path.with_name(dst_path.name + ".sha256")
 
     try:
         dst_parent.mkdir(parents=True, exist_ok=True)
@@ -164,39 +177,51 @@ def download_url_to_file(
     if dst_path.exists():
         if overwrite:
             dst_path.unlink(missing_ok=True)
+            sidecar.unlink(missing_ok=True)
         else:
-            # If hash check is required and file exists, verify it
             if hash_prefix:
-                hasher = hash_algo()
+                prefix_hasher = hash_algo()
                 with open(dst_path, "rb") as f:
                     while chunk := f.read(READ_DATA_CHUNK):
-                        hasher.update(chunk)
-                if hasher.hexdigest().startswith(hash_prefix.lower()):
+                        prefix_hasher.update(chunk)
+                if prefix_hasher.hexdigest().startswith(hash_prefix.lower()):
                     logger.info(f"Target file {dst_path} already exists and hash matches, skip downloading.")
                     return
-                else:
-                    logger.warning(f"Target file {dst_path} exists but hash mismatch. Redownloading.")
-                    dst_path.unlink()
+                logger.warning(f"Target file {dst_path} exists but hash mismatch. Redownloading.")
+                dst_path.unlink()
+            elif sidecar.exists():
+                try:
+                    recorded = sidecar.read_text().strip()
+                except OSError:
+                    recorded = ""
+                if len(recorded) == 64 and recorded == _sha256_file(dst_path):
+                    logger.info(f"Target file {dst_path} already exists and sidecar hash matches, skip downloading.")
+                    return
+                logger.warning(f"Target file {dst_path} exists but sidecar hash mismatch. Redownloading.")
+                dst_path.unlink()
+                sidecar.unlink(missing_ok=True)
             else:
                 logger.info(f"Target file {dst_path} already exists, skip downloading.")
                 return
 
-    tmp_suffix = f".partial.{uuid.uuid4().hex}"
-    tmp_dst = dst_path.with_suffix(f"{dst_path.suffix}{tmp_suffix}")
+    # Deterministic partial-file name so a later call (or process) can resume.
+    tmp_dst = dst_path.with_name(dst_path.name + ".part")
     downloaded_size = 0
-    hasher = hash_algo() if hash_prefix else None
+    hasher = hashlib.sha256()
+    prefix_hasher = hash_algo() if hash_prefix else None
 
     if allow_resume and tmp_dst.exists():
         try:
             downloaded_size = tmp_dst.stat().st_size
             if downloaded_size > 0:
-                if hasher:
-                    with open(tmp_dst, "rb") as f:
-                        while chunk := f.read(READ_DATA_CHUNK):
-                            hasher.update(chunk)
+                with open(tmp_dst, "rb") as f:
+                    while chunk := f.read(READ_DATA_CHUNK):
+                        hasher.update(chunk)
+                        if prefix_hasher:
+                            prefix_hasher.update(chunk)
             else:
                 tmp_dst.unlink(missing_ok=True)
-        except Exception as e:
+        except Exception:
             tmp_dst.unlink(missing_ok=True)
             downloaded_size = 0
 
@@ -218,8 +243,9 @@ def download_url_to_file(
                         # Server ignored Range header, restart download
                         downloaded_size = 0
                         tmp_dst.unlink(missing_ok=True)
-                        if hasher:
-                             hasher = hash_algo()
+                        hasher = hashlib.sha256()
+                        if prefix_hasher:
+                            prefix_hasher = hash_algo()
                 elif status_code == 206 and allow_resume and downloaded_size > 0:
                     remaining_size = int(u.headers.get("Content-Length", 0)) if u.headers.get("Content-Length", "").isdigit() else None
                     total_size = downloaded_size + remaining_size if remaining_size is not None else None
@@ -268,8 +294,9 @@ def download_url_to_file(
                             if not buffer:
                                 break
                             f.write(buffer)
-                            if hasher:
-                                hasher.update(buffer)
+                            hasher.update(buffer)
+                            if prefix_hasher:
+                                prefix_hasher.update(buffer)
                             if pbar:
                                 pbar.update(len(buffer))
                 finally:
@@ -277,8 +304,8 @@ def download_url_to_file(
                         pbar.close()
 
                 if hash_prefix:
-                    assert hasher is not None, "Hash checker is not initialized"
-                    digest = hasher.hexdigest()
+                    assert prefix_hasher is not None, "Hash checker is not initialized"
+                    digest = prefix_hasher.hexdigest()
                     if not digest.startswith(hash_prefix.lower()):
                         tmp_dst.unlink(missing_ok=True)
                         raise RuntimeError(
@@ -295,6 +322,11 @@ def download_url_to_file(
                     shutil.move(str(tmp_dst), str(dst_path))
                 except Exception as e:
                     raise RuntimeError(f"Failed to move temp file to final destination: {e}") from e
+
+                try:
+                    sidecar.write_text(hasher.hexdigest() + "\n")
+                except OSError as e:
+                    logger.warning(f"Could not write sha256 sidecar for {dst_path}: {e}")
 
                 return
 
@@ -404,6 +436,25 @@ def _validate_ref(repo_owner: str, repo_name: str, ref: str) -> None:
         )
 
 
+def _resolve_ref_sha(repo_owner: str, repo_name: str, ref: str) -> Optional[str]:
+    """Commit sha the ref currently points at, or None when it cannot be resolved.
+
+    A successful resolution also proves the ref exists in this repository, so
+    callers may skip a separate ref-existence check.
+    """
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    token = os.environ.get(ENV_GITHUB_TOKEN)
+    if token is not None:
+        headers["Authorization"] = f"token {token}"
+    url = Request(f"https://api.github.com/repos/{repo_owner}/{repo_name}/commits/{ref}", headers=headers)
+    try:
+        data = json.loads(_read_url(url))
+    except (HTTPError, URLError, ValueError, OSError):
+        return None
+    sha = data.get("sha") if isinstance(data, dict) else None
+    return sha if isinstance(sha, str) else None
+
+
 def _check_repo_is_trusted(repo_owner: str, repo_name: str, owner_name_branch: str,
                            trust_repo) -> None:
     hub_dir = get_dir()
@@ -471,21 +522,51 @@ def _get_cache_or_reload(
     verbose: bool = True,
     skip_validation: bool = False,
 ) -> Path:
-    """Download (or reuse) the repo under the hub cache and return its directory."""
+    """Download (or reuse) the repo under the hub cache and return its directory.
+
+    The cache directory keeps the ref name for readability, and a ``.commit``
+    pin records the exact commit it was fetched at. Unless validation is
+    skipped, cache hits re-check the ref's current commit: an unchanged ref is
+    reused as-is, a moved ref triggers a refresh, and an unresolvable one
+    (offline, rate limited) falls back to using the cache.
+    """
     hub_dir = get_dir()
     hub_dir.mkdir(parents=True, exist_ok=True)
     repo_owner, repo_name, ref = _parse_repo_info(github)
     normalized_br = ref.replace("/", "_")
     repo_dir = hub_dir / "_".join([repo_owner, repo_name, normalized_br])
+    pin_path = repo_dir / COMMIT_PIN_NAME
 
     _check_repo_is_trusted(repo_owner, repo_name, repo_dir.name, trust_repo)
 
-    if (not force_reload) and repo_dir.exists():
-        if verbose:
-            print(f"Using cache found in {repo_dir}", file=sys.stderr)
-        return repo_dir
-
+    sha = None
     if not skip_validation:
+        sha = _resolve_ref_sha(repo_owner, repo_name, ref)
+
+    if (not force_reload) and repo_dir.exists():
+        if sha is not None:
+            pinned = pin_path.read_text().strip() if pin_path.exists() else ""
+            if pinned == sha:
+                if verbose:
+                    print(f"Using cache found in {repo_dir}", file=sys.stderr)
+                return repo_dir
+            if not pinned:
+                # Cache fetched before pinning existed; adopt the current commit.
+                try:
+                    pin_path.write_text(sha + "\n")
+                except OSError:
+                    pass
+                if verbose:
+                    print(f"Using cache found in {repo_dir}", file=sys.stderr)
+                return repo_dir
+            if verbose:
+                print(f"Refreshing stale cache in {repo_dir} ({pinned[:12]} -> {sha[:12]})", file=sys.stderr)
+        else:
+            if verbose:
+                print(f"Using cache found in {repo_dir}", file=sys.stderr)
+            return repo_dir
+
+    if sha is None and not skip_validation:
         _validate_ref(repo_owner, repo_name, ref)
 
     cached_file = hub_dir / f"{normalized_br}.zip"
@@ -522,6 +603,12 @@ def _get_cache_or_reload(
         if repo_dir.exists():
             shutil.rmtree(repo_dir)
         shutil.move(str(extracted_repo), str(repo_dir))
+
+    if sha is not None:
+        try:
+            pin_path.write_text(sha + "\n")
+        except OSError:
+            pass
     return repo_dir
 
 

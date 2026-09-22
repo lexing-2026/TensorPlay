@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 import shutil
 import zipfile
@@ -114,6 +115,7 @@ def test_cache_and_force_reload(monkeypatch, tmp_path):
 
     monkeypatch.setattr(hub, "download_url_to_file", fake_download)
     monkeypatch.setattr(hub, "_validate_ref", lambda *a: None)
+    monkeypatch.setattr(hub, "_resolve_ref_sha", lambda *a, **k: None)
 
     repo_dir = hub._get_cache_or_reload(
         "owner/repo:main", force_reload=True, trust_repo=True
@@ -248,3 +250,157 @@ def test_foreign_aliases_point_at_native_modules(foreign_repo):
         assert module.__name__ == native, (foreign, module.__name__)
 
     hub.load(str(foreign_repo), "build_alexnet", source="local")
+
+
+class _FakeResponse:
+    """Minimal urlopen stand-in: context manager, headers, read()."""
+
+    def __init__(self, data=b"", status=200):
+        self._data = data
+        self.status = status
+        self.headers = _FakeHeaders()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            data, self._data = self._data, b""
+        else:
+            data, self._data = self._data[:size], self._data[size:]
+        return data
+
+
+class _FakeHeaders:
+    def __init__(self, values=None):
+        self._values = values or {}
+
+    def get(self, key, default=None):
+        return self._values.get(key.lower(), default)
+
+    def get_content_charset(self, default=None):
+        return default or "utf-8"
+
+
+def test_download_url_to_file_resumes_partial_download(monkeypatch, tmp_path):
+    payload = bytes(range(256)) * 4
+    dst = tmp_path / "weights.bin"
+    part = dst.with_name(dst.name + ".part")
+    part.write_bytes(payload[: len(payload) // 2])
+
+    requests = []
+
+    def fake_urlopen(req, timeout=None):
+        requests.append(req)
+        rng = req.headers.get("Range")
+        if rng:
+            start = int(rng.split("=")[1].split("-")[0])
+            assert start == len(payload) // 2
+            return _FakeResponse(payload[start:], status=206)
+        return _FakeResponse(payload, status=200)
+
+    monkeypatch.setattr(hub, "urlopen", fake_urlopen)
+    hub.download_url_to_file("https://example.com/weights.bin", dst, progress=False)
+
+    assert dst.read_bytes() == payload
+    assert not part.exists()
+    assert len(requests) == 1
+
+
+def test_download_url_to_file_writes_and_honors_sha256_sidecar(monkeypatch, tmp_path):
+    import hashlib
+
+    payload = b"checkpoint-bytes" * 8
+    dst = tmp_path / "model.pth"
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        return _FakeResponse(payload)
+
+    monkeypatch.setattr(hub, "urlopen", fake_urlopen)
+    hub.download_url_to_file("https://example.com/model.pth", dst, progress=False)
+    sidecar = dst.with_name(dst.name + ".sha256")
+    assert sidecar.read_text().strip() == hashlib.sha256(payload).hexdigest()
+
+    # Intact file: sidecar verification avoids the network.
+    hub.download_url_to_file("https://example.com/model.pth", dst, progress=False)
+    assert calls["n"] == 1
+
+    # Corrupted file: sidecar mismatch triggers a redownload.
+    dst.write_bytes(b"corrupted")
+    hub.download_url_to_file("https://example.com/model.pth", dst, progress=False)
+    assert calls["n"] == 2
+    assert dst.read_bytes() == payload
+
+
+def test_cache_pins_resolved_commit_sha(monkeypatch, tmp_path):
+    import io
+
+    hub.set_dir(tmp_path / "hub")
+    sha = {"v": "a" * 40}
+    calls = {"zip": 0, "api": 0, "validate": 0}
+
+    def make_zip():
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("repo-abc/hubconf.py", "x = 1")
+        return buf.getvalue()
+
+    def fake_urlopen(req, timeout=None):
+        url = req.full_url
+        if "/commits/" in url:
+            calls["api"] += 1
+            return _FakeResponse(json.dumps({"sha": sha["v"]}).encode())
+        assert url.endswith("/zipball/main")
+        calls["zip"] += 1
+        return _FakeResponse(make_zip())
+
+    monkeypatch.setattr(hub, "urlopen", fake_urlopen)
+    monkeypatch.setattr(hub, "_validate_ref", lambda *a: calls.__setitem__("validate", calls["validate"] + 1))
+
+    repo_dir = hub._get_cache_or_reload("owner/repo:main", force_reload=False, trust_repo=True)
+    assert (repo_dir / "hubconf.py").exists()
+    assert (repo_dir / hub.COMMIT_PIN_NAME).read_text().strip() == sha["v"]
+    assert calls["zip"] == 1
+    assert calls["validate"] == 0  # resolving the sha proves the ref exists
+
+    # Same commit: cache hit, no second download.
+    hub._get_cache_or_reload("owner/repo:main", force_reload=False, trust_repo=True)
+    assert calls["zip"] == 1
+
+    # Ref advanced on the remote: the stale cache is refreshed and re-pinned.
+    sha["v"] = "b" * 40
+    hub._get_cache_or_reload("owner/repo:main", force_reload=False, trust_repo=True)
+    assert calls["zip"] == 2
+    assert (repo_dir / hub.COMMIT_PIN_NAME).read_text().strip() == sha["v"]
+
+    # skip_validation trusts the pin: no API call, no download even after a move.
+    before_api = calls["api"]
+    sha["v"] = "c" * 40
+    hub._get_cache_or_reload("owner/repo:main", force_reload=False, trust_repo=True, skip_validation=True)
+    assert calls["zip"] == 2
+    assert calls["api"] == before_api
+
+
+def test_cache_uses_unresolvable_ref_offline(monkeypatch, tmp_path):
+    hub.set_dir(tmp_path / "hub")
+
+    def fake_download(url, dst, **kwargs):
+        with zipfile.ZipFile(dst, "w") as zf:
+            zf.writestr("repo-abc/hubconf.py", "x = 1")
+
+    monkeypatch.setattr(hub, "download_url_to_file", fake_download)
+    monkeypatch.setattr(hub, "_resolve_ref_sha", lambda *a, **k: None)
+    monkeypatch.setattr(hub, "_validate_ref", lambda *a: None)
+
+    repo_dir = hub._get_cache_or_reload("owner/repo:main", force_reload=False, trust_repo=True)
+    assert (repo_dir / "hubconf.py").exists()
+    assert not (repo_dir / hub.COMMIT_PIN_NAME).exists()
+
+    # Offline again later: the cache is still usable.
+    again = hub._get_cache_or_reload("owner/repo:main", force_reload=False, trust_repo=True)
+    assert again == repo_dir
