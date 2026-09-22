@@ -688,37 +688,126 @@ void im2col(const T* data_im, int64_t channels, int64_t height, int64_t width,
 
 // Col2Im implementation
 template <typename T>
+void col2im_slice(const T* data_col, int64_t channels, int64_t height, int64_t width,
+                  int64_t output_height, int64_t output_width,
+                  int64_t kernel_h, int64_t kernel_w, int64_t pad_h, int64_t pad_w,
+                  int64_t stride_h, int64_t stride_w, int64_t dilation_h, int64_t dilation_w,
+                  T* data_im) {
+    const int64_t col_size = output_height * output_width;
+
+    // Tiles that cover the output without overlap can write each pixel once:
+    // 2x2 kernels at stride 2 with no padding or dilation.
+    if (kernel_h == 2 && kernel_w == 2 && stride_h == 2 && stride_w == 2 &&
+        dilation_h == 1 && dilation_w == 1 && pad_h == 0 && pad_w == 0 &&
+        height % 2 == 0 && width % 2 == 0 &&
+        output_height == height / 2 && output_width == width / 2) {
+        for (int64_t c = 0; c < channels; ++c) {
+            for (int64_t h = 0; h < output_height; ++h) {
+                const T* src = data_col + c * 4 * col_size + h * output_width;
+                T* dst = data_im + c * height * width + h * 2 * width;
+                for (int64_t w = 0; w < output_width; ++w) {
+                    // Accumulate into a zeroed pixel keeps signed-zero behavior.
+                    dst[2 * w] = T(0) + src[w];
+                    dst[2 * w + 1] = T(0) + src[col_size + w];
+                    dst[width + 2 * w] = T(0) + src[2 * col_size + w];
+                    dst[width + 2 * w + 1] = T(0) + src[3 * col_size + w];
+                }
+            }
+        }
+        return;
+    }
+
+    // General non-overlapping tiles: stride == kernel, no padding/dilation,
+    // image divisible by the kernel.
+    if (dilation_h == 1 && dilation_w == 1 && stride_h == kernel_h &&
+        stride_w == kernel_w && pad_h == 0 && pad_w == 0 &&
+        height % kernel_h == 0 && width % kernel_w == 0 &&
+        output_height == height / kernel_h && output_width == width / kernel_w) {
+        if (kernel_h == 1 && kernel_w == 1) {
+            for (int64_t i = 0; i < channels * height * width; ++i)
+                data_im[i] = T(0) + data_col[i];
+            return;
+        }
+        for (int64_t c_col = 0; c_col < channels * kernel_h * kernel_w; ++c_col) {
+            const int64_t w_offset = c_col % kernel_w;
+            const int64_t h_offset = (c_col / kernel_w) % kernel_h;
+            const int64_t c_im = c_col / kernel_h / kernel_w;
+            for (int64_t h_col = 0; h_col < output_height; ++h_col) {
+                T* dst = data_im +
+                    (c_im * height + h_col * kernel_h + h_offset) * width + w_offset;
+                const T* src = data_col +
+                    (c_col * output_height + h_col) * output_width;
+                for (int64_t w_col = 0; w_col < output_width; ++w_col)
+                    dst[w_col * kernel_w] = T(0) + src[w_col];
+            }
+        }
+        return;
+    }
+
+    std::memset(data_im, 0, height * width * channels * sizeof(T));
+
+    const int64_t height_col = output_height;
+    const int64_t width_col = output_width;
+    for (int64_t c_col = 0; c_col < channels * kernel_h * kernel_w; ++c_col) {
+        const int64_t w_offset = c_col % kernel_w;
+        const int64_t h_offset = (c_col / kernel_w) % kernel_h;
+        const int64_t c_im = c_col / kernel_h / kernel_w;
+
+        // Each (kernel position, column) pair writes a strided run of output
+        // columns; compute the run bounds once instead of testing every pixel.
+        const int64_t first_w = w_offset * dilation_w - pad_w;
+        const int64_t first_col = first_w < 0
+            ? std::min<int64_t>(width_col, -(first_w + 1) / stride_w + 1)
+            : 0;
+        if (first_col == width_col) continue;
+        const int64_t start_w = first_w < 0
+            ? stride_w - 1 - (-(first_w + 1) % stride_w)
+            : first_w;
+        if (start_w >= width) continue;
+        const int64_t count = std::min<int64_t>(
+            width_col - first_col, (width - 1 - start_w) / stride_w + 1);
+        for (int64_t h_col = 0; h_col < height_col; ++h_col) {
+            const int64_t h_im = h_col * stride_h - pad_h + h_offset * dilation_h;
+            if (h_im >= 0 && h_im < height) {
+                T* dst = data_im + (c_im * height + h_im) * width + start_w;
+                const T* src = data_col +
+                    (c_col * height_col + h_col) * width_col + first_col;
+                for (int64_t w = 0; w < count; ++w)
+                    dst[w * stride_w] += src[w];
+            }
+        }
+    }
+}
+
+template <typename T>
 void col2im(const T* data_col, int64_t channels, int64_t height, int64_t width,
             int64_t kernel_h, int64_t kernel_w, int64_t pad_h, int64_t pad_w,
             int64_t stride_h, int64_t stride_w, int64_t dilation_h, int64_t dilation_w,
             T* data_im) {
-    std::memset(data_im, 0, height * width * channels * sizeof(T));
-    
-    int64_t height_col = (height + 2 * pad_h - (dilation_h * (kernel_h - 1) + 1)) / stride_h + 1;
-    int64_t width_col = (width + 2 * pad_w - (dilation_w * (kernel_w - 1) + 1)) / stride_w + 1;
-    
-    parallel_for(0, channels, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-    for (int64_t c_im = begin; c_im < end; ++c_im) {
-        for (int64_t kh = 0; kh < kernel_h; ++kh) {
-            for (int64_t kw = 0; kw < kernel_w; ++kw) {
-                int64_t c = (c_im * kernel_h + kh) * kernel_w + kw;
-                int64_t h_offset = kh;
-                int64_t w_offset = kw;
-                
-                for (int64_t h = 0; h < height_col; ++h) {
-                    for (int64_t w = 0; w < width_col; ++w) {
-                        int64_t h_pad = h * stride_h - pad_h + h_offset * dilation_h;
-                        int64_t w_pad = w * stride_w - pad_w + w_offset * dilation_w;
-                        
-                        if (h_pad >= 0 && h_pad < height && w_pad >= 0 && w_pad < width)
-                            data_im[(c_im * height + h_pad) * width + w_pad] +=
-                                data_col[(c * height_col + h) * width_col + w];
-                    }
-                }
-            }
-        }
+    const int64_t output_height =
+        (height + 2 * pad_h - (dilation_h * (kernel_h - 1) + 1)) / stride_h + 1;
+    const int64_t output_width =
+        (width + 2 * pad_w - (dilation_w * (kernel_w - 1) + 1)) / stride_w + 1;
+    const int64_t image_size = height * width;
+    const int64_t col_size = kernel_h * kernel_w * output_height * output_width;
+    const auto run = [&](int64_t begin, int64_t end) {
+        col2im_slice(
+            data_col + begin * col_size, end - begin, height, width,
+            output_height, output_width, kernel_h, kernel_w, pad_h, pad_w,
+            stride_h, stride_w, dilation_h, dilation_w,
+            data_im + begin * image_size);
+    };
+    // Cap the estimate when most columns contain padding so the grain stays
+    // meaningful for thin images.
+    const int64_t work_size = std::max(
+        image_size,
+        std::min<int64_t>(image_size, output_height * output_width) *
+            kernel_h * kernel_w);
+    if (channels > 1 && work_size * channels > GRAIN_SIZE) {
+        parallel_for(0, channels, std::max<int64_t>(1, GRAIN_SIZE / work_size), run);
+    } else {
+        run(0, channels);
     }
-    });
 }
 
 // Im2Col 3D implementation
@@ -5520,47 +5609,40 @@ Tensor col2im_cpu(const Tensor& self, const std::vector<int64_t>& output_size,
     bool batched;
     col2im_compute(input, output_size, kernel_size, dilation, padding, stride,
                    out, N, C, H, W, batched);
-    const int64_t CP = C * kernel_size[0] * kernel_size[1];
-    const int64_t in_frame = input.numel() / N;
+    // Input and output are both contiguous, so the batch can be folded into
+    // the channel range and the kernel partitions all of it.
+    const int64_t channels = C * N;
     switch (input.dtype()) {
         case DType::Float32: {
             const float* in_p = input.data_ptr<float>();
             float* out_p = out.data_ptr<float>();
-            parallel_for(0, N, 1, [&](int64_t begin, int64_t end) {
-                for (int64_t n = begin; n < end; ++n)
-                    col2im<float>(in_p + n * in_frame, C, H, W, kernel_size[0], kernel_size[1],
-                                  padding[0], padding[1], stride[0], stride[1],
-                                  dilation[0], dilation[1], out_p + n * C * H * W);
-            });
+            col2im<float>(in_p, channels, H, W, kernel_size[0], kernel_size[1],
+                          padding[0], padding[1], stride[0], stride[1],
+                          dilation[0], dilation[1], out_p);
             break;
         }
         case DType::Float64: {
             const double* in_p = input.data_ptr<double>();
             double* out_p = out.data_ptr<double>();
-            parallel_for(0, N, 1, [&](int64_t begin, int64_t end) {
-                for (int64_t n = begin; n < end; ++n)
-                    col2im<double>(in_p + n * in_frame, C, H, W, kernel_size[0], kernel_size[1],
-                                   padding[0], padding[1], stride[0], stride[1],
-                                   dilation[0], dilation[1], out_p + n * C * H * W);
-            });
+            col2im<double>(in_p, channels, H, W, kernel_size[0], kernel_size[1],
+                           padding[0], padding[1], stride[0], stride[1],
+                           dilation[0], dilation[1], out_p);
             break;
         }
         case DType::Float16: {
             const Half* in_p = input.data_ptr<Half>();
             Half* out_p = out.data_ptr<Half>();
-            for (int64_t n = 0; n < N; ++n)
-                col2im<Half>(in_p + n * in_frame, C, H, W, kernel_size[0], kernel_size[1],
-                             padding[0], padding[1], stride[0], stride[1],
-                             dilation[0], dilation[1], out_p + n * C * H * W);
+            col2im<Half>(in_p, channels, H, W, kernel_size[0], kernel_size[1],
+                         padding[0], padding[1], stride[0], stride[1],
+                         dilation[0], dilation[1], out_p);
             break;
         }
         case DType::BFloat16: {
             const BFloat16* in_p = input.data_ptr<BFloat16>();
             BFloat16* out_p = out.data_ptr<BFloat16>();
-            for (int64_t n = 0; n < N; ++n)
-                col2im<BFloat16>(in_p + n * in_frame, C, H, W, kernel_size[0], kernel_size[1],
-                                 padding[0], padding[1], stride[0], stride[1],
-                                 dilation[0], dilation[1], out_p + n * C * H * W);
+            col2im<BFloat16>(in_p, channels, H, W, kernel_size[0], kernel_size[1],
+                             padding[0], padding[1], stride[0], stride[1],
+                             dilation[0], dilation[1], out_p);
             break;
         }
         default:
