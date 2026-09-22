@@ -189,15 +189,15 @@ def _schema_tag(f, variant: str, ordinal: int) -> str:
 
 
 def _schema_fallback_doc(schemas: list[str]) -> str:
-    """Render the schema-only fallback docstring as an RST literal block.
+    """Render the schema-only fallback docstring as inline literals.
 
     Schema text carries trailing-underscore overload names and bare stars;
     once a method without a dedicated docstring reaches a documentation
-    renderer, those parse as links and emphasis. A literal block keeps the
-    signatures verbatim and parse-neutral.
+    renderer, every summary and body pass parses it as links and emphasis.
+    One double-backtick literal per overload is parse-neutral everywhere:
+    inline literals suppress both, and a truncated summary still renders.
     """
-    body = "\\n".join("    " + s for s in schemas)
-    return f"::\\n\\n{body}"
+    return "\\n".join("``" + s + "``" for s in schemas)
 
 
 def _pack_expr(cpp_type: str, value: str) -> str | None:
