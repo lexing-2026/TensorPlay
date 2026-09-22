@@ -16,7 +16,7 @@ from PIL import Image
 
 import tensorplay as tp
 from tensorplay.vision import io as tp_io
-from tensorplay.audio import decode_wav, decode_wav_batch, encode_wav
+from tensorplay.audio import decode_wav, decode_wav_batch, encode_wav, encode_wav_batch
 
 try:
     import torch
@@ -114,36 +114,48 @@ def bench_jpeg():
 
     print("JPEG encode (same images)")
     chws = list(chunks())
+    tensors = [tp.tensor(c) for c in chws]
     sec = _best_of(lambda: [tp_io.encode_jpeg(tp.tensor(c), quality=90) for c in chws])
     _row("native encode (loop)", sec, n, "img")
+    sec = _best_of(lambda: tp_io.encode_jpeg_batch(tensors, quality=90))
+    _row("native encode batch", sec, n, "img")
     sec = _best_of(lambda: [Image.fromarray(img).save(
         _io.BytesIO(), format="JPEG", quality=90) for img in imgs])
     _row("PIL encode (loop)", sec, n, "img")
 
 
 def bench_png():
-    img = _imgs(seed=7, n=1)[0]
-    chw = np.ascontiguousarray(img.transpose(2, 0, 1))
-    buf = _io.BytesIO()
-    Image.fromarray(img).save(buf, format="PNG")
-    blob = buf.getvalue()
-    size = len(blob)
-    print(f"\nPNG decode  {_IMG_W}x{_IMG_H} RGB ({size / 1e6:.1f} MB file)")
-    sec = _best_of(lambda: tp_io.decode_png(_bytes_tensor(blob)))
+    imgs = _imgs(seed=7, n=8)
+    chws = [np.ascontiguousarray(img.transpose(2, 0, 1)) for img in imgs]
+    blobs = []
+    for img in imgs:
+        buf = _io.BytesIO()
+        Image.fromarray(img).save(buf, format="PNG")
+        blobs.append(buf.getvalue())
+    n = len(imgs)
+    size = len(blobs[0])
+    print(f"\nPNG decode  {_IMG_W}x{_IMG_H} RGB x{n} ({size / 1e6:.1f} MB each)")
+    sec = _best_of(lambda: tp_io.decode_png(_bytes_tensor(blobs[0])))
     _row("native single", sec, 1, "img", size)
     if tv_io is not None:
         sec = _best_of(lambda: tv_io.decode_png(torch.from_numpy(
-            np.frombuffer(blob, dtype=np.uint8).copy())))
+            np.frombuffer(blobs[0], dtype=np.uint8).copy())))
         _row("torchvision single", sec, 1, "img", size)
-    sec = _best_of(lambda: np.asarray(Image.open(_io.BytesIO(blob)).convert("RGB")))
+    sec = _best_of(lambda: np.asarray(Image.open(_io.BytesIO(blobs[0])).convert("RGB")))
     _row("PIL single", sec, 1, "img", size)
+    sec = _best_of(lambda: tp_io.decode_png_batch([_bytes_tensor(b) for b in blobs]))
+    _row("native CPU batch", sec, n, "img", size * n)
 
     print("PNG encode")
-    t = tp.tensor(chw)
-    sec = _best_of(lambda: tp_io.encode_png(t))
-    _row("native encode", sec, 1, "img", chw.nbytes)
-    sec = _best_of(lambda: Image.fromarray(img).save(_io.BytesIO(), format="PNG"))
-    _row("PIL encode", sec, 1, "img", chw.nbytes)
+    tensors = [tp.tensor(c) for c in chws]
+    mb = chws[0].nbytes
+    sec = _best_of(lambda: tp_io.encode_png(tensors[0]))
+    _row("native single", sec, 1, "img", mb)
+    sec = _best_of(lambda: tp_io.encode_png_batch(tensors))
+    _row("native encode batch", sec, n, "img", mb * n)
+    sec = _best_of(lambda: [Image.fromarray(img).save(_io.BytesIO(), format="PNG")
+                            for img in imgs])
+    _row("PIL encode (loop)", sec, n, "img", mb * n)
 
 
 def bench_wav():
@@ -175,6 +187,8 @@ def bench_wav():
     i16 = (np.clip(stereo, -1.0, 1.0) * 32767).astype(np.int16)
     sec = _best_of(lambda: encode_wav(t_wav, sr, bits=16))
     _row("native encode (single call)", sec, 1, "file", stereo.nbytes)
+    sec = _best_of(lambda: encode_wav_batch([t_wav] * n, sr, bits=16))
+    _row("native encode batch", sec, n, "file", stereo.nbytes * n)
     sec = _best_of(lambda: [wavfile.write(_io.BytesIO(), sr, i16.T) for _ in range(n)])
     _row("scipy encode (loop)", sec, n, "file", stereo.nbytes * n)
     sec = _best_of(lambda: [sf.write(
