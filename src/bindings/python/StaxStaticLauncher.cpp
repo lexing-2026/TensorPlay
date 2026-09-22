@@ -48,6 +48,7 @@
 #include <cuda.h>
 
 #include "CPythonBridge.h"
+#include "backend/cuda/DriverApi.h"
 
 namespace {
 
@@ -126,6 +127,54 @@ uint64_t as_uint64(PyObject* obj) {
 // args layout: [grid_x, grid_y, grid_z, stream, function_handle,
 // packed_metadata, launch_metadata, enter_hook, exit_hook, *kernel_args];
 // slots 4..8 duplicate what the object pre-binds and are ignored.
+
+namespace {
+
+using CuCtxGetCurrentFn = CUresult (*)(CUcontext*);
+using CuInitFn = CUresult (*)(unsigned int);
+using CuDeviceGetFn = CUresult (*)(CUdevice*, int);
+using CuDevicePrimaryCtxRetainFn = CUresult (*)(CUcontext*, CUdevice);
+using CuCtxSetCurrentFn = CUresult (*)(CUcontext);
+using CuLaunchKernelFn =
+    CUresult (*)(CUfunction, unsigned int, unsigned int, unsigned int,
+                 unsigned int, unsigned int, unsigned int, unsigned int,
+                 CUstream, void**, void**);
+
+// Driver entry points are resolved lazily so the wheel imports on machines
+// without the driver; the launcher reports a missing driver at call time.
+struct StaxDriverApi {
+    StaxDriverApi() {
+        cu_ctx_get_current = tensorplay::cuda::driver::resolve_symbol<
+            CuCtxGetCurrentFn>("cuCtxGetCurrent");
+        cu_init = tensorplay::cuda::driver::resolve_symbol<CuInitFn>("cuInit");
+        cu_device_get =
+            tensorplay::cuda::driver::resolve_symbol<CuDeviceGetFn>(
+                "cuDeviceGet");
+        cu_device_primary_ctx_retain =
+            tensorplay::cuda::driver::resolve_symbol<
+                CuDevicePrimaryCtxRetainFn>("cuDevicePrimaryCtxRetain");
+        cu_ctx_set_current =
+            tensorplay::cuda::driver::resolve_symbol<CuCtxSetCurrentFn>(
+                "cuCtxSetCurrent");
+        cu_launch_kernel =
+            tensorplay::cuda::driver::resolve_symbol<CuLaunchKernelFn>(
+                "cuLaunchKernel");
+    }
+    CuCtxGetCurrentFn cu_ctx_get_current;
+    CuInitFn cu_init;
+    CuDeviceGetFn cu_device_get;
+    CuDevicePrimaryCtxRetainFn cu_device_primary_ctx_retain;
+    CuCtxSetCurrentFn cu_ctx_set_current;
+    CuLaunchKernelFn cu_launch_kernel;
+};
+
+StaxDriverApi& stax_driver_api() {
+    static StaxDriverApi api;
+    return api;
+}
+
+}  // namespace
+
 PyObject* stax_fast_launcher_vectorcall(
     PyObject* callable,
     PyObject* const* args,
@@ -220,18 +269,28 @@ PyObject* stax_fast_launcher_vectorcall(
         }
     }
 
+    StaxDriverApi& driver_api = stax_driver_api();
+    if (driver_api.cu_ctx_get_current == nullptr ||
+        driver_api.cu_init == nullptr || driver_api.cu_device_get == nullptr ||
+        driver_api.cu_device_primary_ctx_retain == nullptr ||
+        driver_api.cu_ctx_set_current == nullptr ||
+        driver_api.cu_launch_kernel == nullptr) {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "_StaxFastLauncher: the CUDA driver is not available");
+        return nullptr;
+    }
     // Kernel handles are initialized on the current context; a process that
     // never touched CUDA before starts from cuInit, then acquires the
     // device's primary context.
     CUcontext context = nullptr;
-    CUresult context_result = cuCtxGetCurrent(&context);
+    CUresult context_result = driver_api.cu_ctx_get_current(&context);
     if (context_result == CUDA_ERROR_NOT_INITIALIZED) {
-        if (cuInit(0) != CUDA_SUCCESS) {
+        if (driver_api.cu_init(0) != CUDA_SUCCESS) {
             PyErr_SetString(PyExc_RuntimeError,
                             "_StaxFastLauncher: cuInit failed");
             return nullptr;
         }
-        context_result = cuCtxGetCurrent(&context);
+        context_result = driver_api.cu_ctx_get_current(&context);
     }
     if (context_result != CUDA_SUCCESS) {
         PyErr_SetString(PyExc_RuntimeError,
@@ -240,16 +299,17 @@ PyObject* stax_fast_launcher_vectorcall(
     }
     if (context == nullptr) {
         CUdevice device = 0;
-        if (cuDeviceGet(&device, 0) != CUDA_SUCCESS ||
-            cuDevicePrimaryCtxRetain(&context, device) != CUDA_SUCCESS ||
-            cuCtxSetCurrent(context) != CUDA_SUCCESS) {
+        if (driver_api.cu_device_get(&device, 0) != CUDA_SUCCESS ||
+            driver_api.cu_device_primary_ctx_retain(&context, device) !=
+                CUDA_SUCCESS ||
+            driver_api.cu_ctx_set_current(context) != CUDA_SUCCESS) {
             PyErr_SetString(PyExc_RuntimeError,
                             "_StaxFastLauncher: failed to acquire a CUDA"
                             " context");
             return nullptr;
         }
     }
-    CUresult result = cuLaunchKernel(
+    CUresult result = driver_api.cu_launch_kernel(
         self->function,
         static_cast<uint32_t>(grid_x),
         static_cast<uint32_t>(grid_y),

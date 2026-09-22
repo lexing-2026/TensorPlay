@@ -1519,7 +1519,7 @@ if(TP_CUDA_ENABLED)
 endif()
 
 if(TP_CUDA_ENABLED)
-    target_link_libraries(_C PRIVATE CUDA::cudart CUDA::cuda_driver)
+    target_link_libraries(_C PRIVATE CUDA::cudart)
 endif()
 
 if(MSVC)
