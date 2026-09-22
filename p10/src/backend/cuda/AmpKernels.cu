@@ -47,7 +47,7 @@ private:
 template <typename scalar_t>
 __global__ void amp_non_finite_check_and_unscale_kernel(
     scalar_t* const* grads, const int64_t* numels, float* found_inf,
-    float inv_scale) {
+    const float* inv_scale) {
     const int64_t tensor_id = blockIdx.x;
     scalar_t* g = grads[tensor_id];
     const int64_t n = numels[tensor_id];
@@ -70,17 +70,19 @@ __global__ void amp_non_finite_check_and_unscale_kernel(
         if (threadIdx.x == 0) atomicExch(found_inf, 1.0f);
         return;
     }
+    // Every thread reads the device scalar; it stays in cache.
+    const float inv_scale_val = *inv_scale;
     for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
-        g[i] = static_cast<scalar_t>(static_cast<float>(g[i]) * inv_scale);
+        g[i] = static_cast<scalar_t>(static_cast<float>(g[i]) * inv_scale_val);
     }
 }
 
 __global__ void amp_update_scale_kernel(
-    float* scale, int32_t* growth_tracker, float found_inf,
+    float* scale, int32_t* growth_tracker, const float* found_inf,
     float growth_factor, float backoff_factor, int growth_interval) {
     // Single-element tensors: a single thread performs the update.
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-        if (found_inf > 0) {
+        if (*found_inf > 0) {
             scale[0] = scale[0] * backoff_factor;
             growth_tracker[0] = 0;
         } else {
@@ -99,7 +101,6 @@ void _amp_foreach_non_finite_check_and_unscale_cuda(
     std::vector<Tensor> self, Tensor& found_inf, const Tensor& inv_scale) {
     if (self.empty()) return;
     const auto stream = getCurrentCUDAStream().stream();
-    const float inv_scale_val = inv_scale.data_ptr<float>()[0];
     const int64_t count = static_cast<int64_t>(self.size());
 
     auto launch = [&](auto type_tag) {
@@ -118,7 +119,7 @@ void _amp_foreach_non_finite_check_and_unscale_cuda(
         amp_non_finite_check_and_unscale_kernel<scalar_t>
             <<<static_cast<unsigned int>(count), 256, 0, stream>>>(
                 d_grads.data(), d_numels.data(),
-                found_inf.data_ptr<float>(), inv_scale_val);
+                found_inf.data_ptr<float>(), inv_scale.data_ptr<float>());
         checkCuda(cudaGetLastError(),
                   "_amp_foreach_non_finite_check_and_unscale_ kernel launch");
     };
@@ -140,7 +141,7 @@ Tensor& _amp_update_scale_cuda(
     const auto stream = getCurrentCUDAStream().stream();
     amp_update_scale_kernel<<<1, 1, 0, stream>>>(
         self.data_ptr<float>(), growth_tracker.data_ptr<int32_t>(),
-        found_inf.data_ptr<float>()[0], static_cast<float>(scale_growth_factor),
+        found_inf.data_ptr<float>(), static_cast<float>(scale_growth_factor),
         static_cast<float>(scale_backoff_factor), static_cast<int>(growth_interval));
     checkCuda(cudaGetLastError(), "_amp_update_scale_ kernel launch");
     return self;
