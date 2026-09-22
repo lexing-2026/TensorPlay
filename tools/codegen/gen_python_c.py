@@ -188,6 +188,18 @@ def _schema_tag(f, variant: str, ordinal: int) -> str:
     return _hashlib.sha1(payload).hexdigest()[:10]
 
 
+def _schema_fallback_doc(schemas: list[str]) -> str:
+    """Render the schema-only fallback docstring as an RST literal block.
+
+    Schema text carries trailing-underscore overload names and bare stars;
+    once a method without a dedicated docstring reaches a documentation
+    renderer, those parse as links and emphasis. A literal block keeps the
+    signatures verbatim and parse-neutral.
+    """
+    body = "\\n".join("    " + s for s in schemas)
+    return f"::\\n\\n{body}"
+
+
 def _pack_expr(cpp_type: str, value: str) -> str | None:
     """Return the native Python-object packer for one result value."""
     if cpp_type == "Tensor":
@@ -873,7 +885,7 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
         # parse/unpack) fall through -- kernel failures convert immediately,
         # used by the argument parser.
         if multi:
-            doc = " | ".join(docs)
+            doc = _schema_fallback_doc(docs)
             probes = [_probe_info(f, variant) for f in fs]
             out.append(
                 f"static PyObject* {base}(PyObject* self, PyObject* const* args,"
@@ -986,7 +998,7 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
             entry_fn = base
         else:
             entry_fn = ovfns[0]
-            doc = docs[0]
+            doc = _schema_fallback_doc(docs)
         entry_line = (
             f'    {{"{cname}", (PyCFunction)(void*){entry_fn},'
             f' METH_FASTCALL | METH_KEYWORDS, "{doc}"}},')
