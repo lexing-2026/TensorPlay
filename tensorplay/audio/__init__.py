@@ -17,7 +17,8 @@ from .backend import (
     _SOUNDFILE_AVAILABLE,
     _SCIPY_AVAILABLE,
 )
-from .io import AudioMetaData, decode_wav, decode_wav_batch, encode_wav, wav_info, info, load, save
+from .io import (AudioMetaData, decode_wav, decode_wav_batch, encode_wav,
+                 encode_wav_batch, wav_info, info, load, save)
 from . import compliance
 from . import datasets
 from . import functional
@@ -37,6 +38,7 @@ __all__ = [
     "decode_wav",
     "decode_wav_batch",
     "encode_wav",
+    "encode_wav_batch",
     "wav_info",
     "compliance",
     "datasets",

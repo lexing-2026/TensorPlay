@@ -1633,6 +1633,17 @@ void init_tensor(py::module_& m) {
             "Decodes a list of JPEG byte tensors in parallel ('cpu') or with "
             "the hardware batch decoder ('cuda')");
 #endif
+#ifdef TP_USE_LIBJPEG
+    iom.def("encode_jpeg_batch", &encode_jpeg_batch, "data"_a, "quality"_a = 75,
+            "Encodes a list of CHW image tensors into JPEG bytes in parallel");
+#endif
+#ifdef TP_USE_LIBPNG
+    iom.def("decode_png_batch", &decode_png_batch, "data"_a, "mode"_a = 0,
+            "Decodes a list of PNG byte tensors in parallel");
+    iom.def("encode_png_batch", &encode_png_batch, "data"_a,
+            "compression_level"_a = 6,
+            "Encodes a list of CHW image tensors into PNG bytes in parallel");
+#endif
     // Native WAV codec: RIFF/WAVE parsing, no third-party dependency, so
     // playable clips decode without any backend package.  Partial reads seek
     // by byte arithmetic and batch decode runs on the shared thread pool.
@@ -1644,6 +1655,8 @@ void init_tensor(py::module_& m) {
             "Decodes a list of WAV byte tensors in parallel");
     iom.def("encode_wav", &encode_wav, "data"_a, "sample_rate"_a, "bits"_a = 16,
             "Encodes a float32 (channels, time) tensor into WAV bytes (PCM)");
+    iom.def("encode_wav_batch", &encode_wav_batch, "data"_a, "sample_rate"_a,
+            "bits"_a = 16, "Encodes a list of float32 tensors into WAV bytes in parallel");
     iom.def("wav_info", &wav_info, "data"_a,
             "Returns (sample_rate, frames, channels, bits, encoding) for WAV bytes");
 
