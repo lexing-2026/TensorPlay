@@ -594,6 +594,27 @@
 - name: col2im(Tensor self, int[] output_size, int[] kernel_size, int[] dilation, int[] padding, int[] stride) -> Tensor
   self: col2im_backward(grad, self.shape(), output_size, kernel_size, dilation, padding, stride)
 
+# Vision ROI / deformable operators. nms and box_iou are intentionally
+# non-differentiable and therefore have no entries here.
+- name: roi_align(Tensor input, Tensor rois, float spatial_scale, int pooled_height, int pooled_width, int sampling_ratio, bool aligned) -> Tensor
+  input: roi_align_backward(grad, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio, aligned, input.shape())
+
+- name: roi_pool(Tensor input, Tensor rois, float spatial_scale, int pooled_height, int pooled_width) -> Tensor
+  input: roi_pool_backward(grad, input, rois, spatial_scale, pooled_height, pooled_width)
+
+- name: ps_roi_align(Tensor input, Tensor rois, float spatial_scale, int pooled_height, int pooled_width, int sampling_ratio) -> Tensor
+  input: ps_roi_align_backward(grad, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio, input.shape())
+
+- name: ps_roi_pool(Tensor input, Tensor rois, float spatial_scale, int pooled_height, int pooled_width) -> Tensor
+  input: ps_roi_pool_backward(grad, rois, spatial_scale, pooled_height, pooled_width, input.shape())
+
+- name: deform_conv2d(Tensor input, Tensor weight, Tensor offset, Tensor mask, Tensor? bias, int[2] stride, int[2] padding, int[2] dilation, int groups, int offset_groups, bool use_mask) -> Tensor
+  input: std::get<0>(deform_conv2d_backward(grad, input, weight, offset, mask, bias, stride, padding, dilation, groups, offset_groups, use_mask, {true, false, false, false, false}))
+  weight: std::get<1>(deform_conv2d_backward(grad, input, weight, offset, mask, bias, stride, padding, dilation, groups, offset_groups, use_mask, {false, true, false, false, false}))
+  offset: std::get<2>(deform_conv2d_backward(grad, input, weight, offset, mask, bias, stride, padding, dilation, groups, offset_groups, use_mask, {false, false, true, false, false}))
+  mask: std::get<3>(deform_conv2d_backward(grad, input, weight, offset, mask, bias, stride, padding, dilation, groups, offset_groups, use_mask, {false, false, false, true, false}))
+  bias: std::get<4>(deform_conv2d_backward(grad, input, weight, offset, mask, bias, stride, padding, dilation, groups, offset_groups, use_mask, {false, false, false, false, true}))
+
 - name: reflection_pad_nd(Tensor self, int[] pad) -> Tensor
   self: reflection_pad_nd_backward(grad, self, pad)
 

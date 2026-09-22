@@ -3660,41 +3660,61 @@ def fft_irfft_backward(grad, input, dim, norm):
             return _captured
     return _C.fft_irfft_backward(grad, input, dim, norm)
 
-def hann_window(window_length, periodic=True, dtype=None):
+def hann_window(window_length, periodic=True, dtype=None, *, layout=None, device=None, pin_memory=None):
     if _capturing():
-        _captured = _capture_call(hann_window, (window_length, periodic, dtype), {})
+        _captured = _capture_call(hann_window, (window_length, periodic, dtype), {'layout': layout, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
-    if dtype is None:
+    if layout is None and device is None and pin_memory is None:
+        if dtype is None:
             dtype = DType.undefined
-    return _C.hann_window(window_length, periodic, dtype)
+        return _C.hann_window(window_length, periodic, dtype)
+    if layout is not None:
+        layout = int(layout)
+    dtype_arg = dtype if dtype is not None and dtype != DType.undefined else None
+    return _C.hann_window(window_length, periodic, dtype=dtype_arg, layout=layout, device=device, pin_memory=pin_memory)
 
-def hamming_window(window_length, periodic=True, alpha=0.54, beta=0.46, dtype=None):
+def hamming_window(window_length, periodic=True, alpha=0.54, beta=0.46, dtype=None, *, layout=None, device=None, pin_memory=None):
     if _capturing():
-        _captured = _capture_call(hamming_window, (window_length, periodic, alpha, beta, dtype), {})
+        _captured = _capture_call(hamming_window, (window_length, periodic, alpha, beta, dtype), {'layout': layout, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
-    if dtype is None:
+    if layout is None and device is None and pin_memory is None:
+        if dtype is None:
             dtype = DType.undefined
-    return _C.hamming_window(window_length, periodic, alpha, beta, dtype)
+        return _C.hamming_window(window_length, periodic, alpha, beta, dtype)
+    if layout is not None:
+        layout = int(layout)
+    dtype_arg = dtype if dtype is not None and dtype != DType.undefined else None
+    return _C.hamming_window(window_length, periodic, alpha, beta, dtype=dtype_arg, layout=layout, device=device, pin_memory=pin_memory)
 
-def bartlett_window(window_length, periodic=True, dtype=None):
+def bartlett_window(window_length, periodic=True, dtype=None, *, layout=None, device=None, pin_memory=None):
     if _capturing():
-        _captured = _capture_call(bartlett_window, (window_length, periodic, dtype), {})
+        _captured = _capture_call(bartlett_window, (window_length, periodic, dtype), {'layout': layout, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
-    if dtype is None:
+    if layout is None and device is None and pin_memory is None:
+        if dtype is None:
             dtype = DType.undefined
-    return _C.bartlett_window(window_length, periodic, dtype)
+        return _C.bartlett_window(window_length, periodic, dtype)
+    if layout is not None:
+        layout = int(layout)
+    dtype_arg = dtype if dtype is not None and dtype != DType.undefined else None
+    return _C.bartlett_window(window_length, periodic, dtype=dtype_arg, layout=layout, device=device, pin_memory=pin_memory)
 
-def blackman_window(window_length, periodic=True, dtype=None):
+def blackman_window(window_length, periodic=True, dtype=None, *, layout=None, device=None, pin_memory=None):
     if _capturing():
-        _captured = _capture_call(blackman_window, (window_length, periodic, dtype), {})
+        _captured = _capture_call(blackman_window, (window_length, periodic, dtype), {'layout': layout, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
-    if dtype is None:
+    if layout is None and device is None and pin_memory is None:
+        if dtype is None:
             dtype = DType.undefined
-    return _C.blackman_window(window_length, periodic, dtype)
+        return _C.blackman_window(window_length, periodic, dtype)
+    if layout is not None:
+        layout = int(layout)
+    dtype_arg = dtype if dtype is not None and dtype != DType.undefined else None
+    return _C.blackman_window(window_length, periodic, dtype=dtype_arg, layout=layout, device=device, pin_memory=pin_memory)
 
 def stft(input, n_fft, hop_length=None, win_length=None, window=None, center=True, pad_mode='reflect', normalized=False, onesided=True, return_complex=True):
     if _capturing():
@@ -4796,6 +4816,108 @@ def channel_shuffle(input, groups):
         if _captured is not None:
             return _captured
     return _C.channel_shuffle(input, groups)
+
+def roi_align(input, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio, aligned):
+    if _capturing():
+        _captured = _capture_call(roi_align, (input, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio, aligned), {})
+        if _captured is not None:
+            return _captured
+    return _C.roi_align(input, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio, aligned)
+
+def roi_align_backward(grad_output, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio, aligned, input_size):
+    if _capturing():
+        _captured = _capture_call(roi_align_backward, (grad_output, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio, aligned, input_size), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(input_size, int) and not isinstance(input_size, bool):
+        input_size = [input_size]
+    return _C.roi_align_backward(grad_output, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio, aligned, input_size)
+
+def roi_pool(input, rois, spatial_scale, pooled_height, pooled_width):
+    if _capturing():
+        _captured = _capture_call(roi_pool, (input, rois, spatial_scale, pooled_height, pooled_width), {})
+        if _captured is not None:
+            return _captured
+    return _C.roi_pool(input, rois, spatial_scale, pooled_height, pooled_width)
+
+def roi_pool_backward(grad_output, input, rois, spatial_scale, pooled_height, pooled_width):
+    if _capturing():
+        _captured = _capture_call(roi_pool_backward, (grad_output, input, rois, spatial_scale, pooled_height, pooled_width), {})
+        if _captured is not None:
+            return _captured
+    return _C.roi_pool_backward(grad_output, input, rois, spatial_scale, pooled_height, pooled_width)
+
+def ps_roi_align(input, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio):
+    if _capturing():
+        _captured = _capture_call(ps_roi_align, (input, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio), {})
+        if _captured is not None:
+            return _captured
+    return _C.ps_roi_align(input, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio)
+
+def ps_roi_align_backward(grad_output, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio, input_size):
+    if _capturing():
+        _captured = _capture_call(ps_roi_align_backward, (grad_output, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio, input_size), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(input_size, int) and not isinstance(input_size, bool):
+        input_size = [input_size]
+    return _C.ps_roi_align_backward(grad_output, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio, input_size)
+
+def ps_roi_pool(input, rois, spatial_scale, pooled_height, pooled_width):
+    if _capturing():
+        _captured = _capture_call(ps_roi_pool, (input, rois, spatial_scale, pooled_height, pooled_width), {})
+        if _captured is not None:
+            return _captured
+    return _C.ps_roi_pool(input, rois, spatial_scale, pooled_height, pooled_width)
+
+def ps_roi_pool_backward(grad_output, rois, spatial_scale, pooled_height, pooled_width, input_size):
+    if _capturing():
+        _captured = _capture_call(ps_roi_pool_backward, (grad_output, rois, spatial_scale, pooled_height, pooled_width, input_size), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(input_size, int) and not isinstance(input_size, bool):
+        input_size = [input_size]
+    return _C.ps_roi_pool_backward(grad_output, rois, spatial_scale, pooled_height, pooled_width, input_size)
+
+def nms(boxes, scores, iou_threshold):
+    if _capturing():
+        _captured = _capture_call(nms, (boxes, scores, iou_threshold), {})
+        if _captured is not None:
+            return _captured
+    return _C.nms(boxes, scores, iou_threshold)
+
+def box_iou(boxes1, boxes2):
+    if _capturing():
+        _captured = _capture_call(box_iou, (boxes1, boxes2), {})
+        if _captured is not None:
+            return _captured
+    return _C.box_iou(boxes1, boxes2)
+
+def deform_conv2d(input, weight, offset, mask, bias, stride, padding, dilation, groups, offset_groups, use_mask):
+    if _capturing():
+        _captured = _capture_call(deform_conv2d, (input, weight, offset, mask, bias, stride, padding, dilation, groups, offset_groups, use_mask), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.deform_conv2d(input, weight, offset, mask, bias, stride, padding, dilation, groups, offset_groups, use_mask)
+
+def deform_conv2d_backward(grad_output, input, weight, offset, mask, bias, stride, padding, dilation, groups, offset_groups, use_mask, output_mask):
+    if _capturing():
+        _captured = _capture_call(deform_conv2d_backward, (grad_output, input, weight, offset, mask, bias, stride, padding, dilation, groups, offset_groups, use_mask, output_mask), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.deform_conv2d_backward(grad_output, input, weight, offset, mask, bias, stride, padding, dilation, groups, offset_groups, use_mask, output_mask)
 
 def cholesky(input, upper=False):
     if _capturing():
@@ -8892,7 +9014,7 @@ def igammac(input, other, *, out=None):
             return _captured
     return _C.igammac(self=input, other=other)
 
-def empty_strided(size, stride, dtype=None, device=None, pin_memory=False, requires_grad=False):
+def empty_strided(size, stride, dtype=None, device=None, pin_memory=False):
     if _capturing():
         _captured = _capture_call(empty_strided, (size, stride, dtype, device, pin_memory), {})
         if _captured is not None:
@@ -8903,10 +9025,7 @@ def empty_strided(size, stride, dtype=None, device=None, pin_memory=False, requi
         stride = [stride]
     if dtype is None:
             dtype = DType.undefined
-    out = _C.empty_strided(size, stride, dtype=dtype, device=_ensure_device(device), pin_memory=pin_memory)
-    if requires_grad:
-        out.requires_grad_(True)
-    return out
+    return _C.empty_strided(size, stride, dtype=dtype, device=_ensure_device(device), pin_memory=pin_memory)
 
 def _cast_Byte(input, non_blocking=False):
     if _capturing():

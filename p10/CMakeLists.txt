@@ -38,8 +38,13 @@ set(P10_SOURCES
     src/backend/cpu/ConvKernels.cpp
     src/backend/cpu/Convolution.cpp
     src/backend/cpu/CopyKernels.cpp
+    src/backend/cpu/DeformConvKernels.cpp
     src/backend/cpu/EmbeddingBagKernels.cpp
     src/backend/cpu/Cross.cpp
+    src/backend/cpu/NmsKernels.cpp
+    src/backend/cpu/PsRoiAlignKernels.cpp
+    src/backend/cpu/RoiAlignKernels.cpp
+    src/backend/cpu/RoiPoolKernels.cpp
     src/backend/cpu/SparseKernels.cpp
     src/backend/cpu/SemiStructuredKernels.cpp
     src/backend/cpu/QuantKernels.cpp
@@ -230,8 +235,13 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/ConvKernels.cu
         src/backend/cuda/ConvFp64Kernels.cu
         src/backend/cuda/Convolution.cu
+        src/backend/cuda/DeformConvKernels.cu
+        src/backend/cuda/NmsKernels.cu
         src/backend/cuda/PadKernels.cu
         src/backend/cuda/PoolingKernels.cu
+        src/backend/cuda/PsRoiAlignKernels.cu
+        src/backend/cuda/RoiAlignKernels.cu
+        src/backend/cuda/RoiPoolKernels.cu
         src/backend/cuda/GridSamplerKernels.cu
         src/backend/cuda/FractionalMaxPoolKernels.cu
         src/backend/cuda/MaxUnpoolKernels.cu
