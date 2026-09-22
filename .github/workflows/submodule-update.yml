@@ -1,0 +1,63 @@
+name: submodule-update
+
+# Weekly bot that compares every third_party submodule against its upstream
+# default branch and opens one Conventional-Commit PR per outdated submodule
+# (see tools/submodule_updater.py).
+#
+# PRs are created through gh.  Pull requests opened with the default
+# GITHUB_TOKEN do not trigger repository workflows, so to let the bump PRs run
+# the lint/smoke-build gates automatically, provide a GitHub App or PAT token
+# in the SUBMODULE_UPDATE_PAT secret; it is used instead of GITHUB_TOKEN.
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+    inputs:
+      submodule:
+        description: "Only bump this submodule path, e.g. third_party/cutlass"
+        required: false
+        type: string
+      dry_run:
+        description: "Report drift without opening branches or PRs"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: submodule-update
+  cancel-in-progress: false
+
+jobs:
+  update-submodules:
+    name: update-submodules
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: false
+          show-progress: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Run submodule updater
+        env:
+          GH_TOKEN: ${{ secrets.SUBMODULE_UPDATE_PAT || secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          args=()
+          if [[ -n "${{ github.event.inputs.submodule }}" ]]; then
+            args+=(--submodule "${{ github.event.inputs.submodule }}")
+          fi
+          if [[ "${{ github.event.inputs.dry_run }}" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          python tools/submodule_updater.py "${args[@]}" | tee -a "${GITHUB_STEP_SUMMARY}"
