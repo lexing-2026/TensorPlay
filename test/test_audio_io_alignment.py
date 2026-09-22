@@ -1,4 +1,4 @@
-"""Native WAV codec alignment and batch tests.
+"""Native WAV codec and batch tests.
 
 The native RIFF/WAVE codec in ``tensorplay._C.io`` is checked against the
 reference implementations installed in the environment (scipy's ``wavfile``
@@ -110,11 +110,13 @@ class WavExternalTest(unittest.TestCase):
         x, sr = _tone(C=1, T=3000, seed=11)
         with tempfile.TemporaryDirectory() as d:
             p = f"{d}/d.wav"
-            sf.write(p, x, sr, subtype="DOUBLE")
+            # mono clips are written 1-D; a (1, T) 2-D array would be
+            # interpreted as T channels by the reference writer.
+            sf.write(p, x[0], sr, subtype="DOUBLE")
             with open(p, "rb") as f:
                 data = _bytes_tensor(f.read())
         wav, _ = decode_wav(data)
-        np.testing.assert_array_equal(wav.numpy(), x.astype(np.float32))
+        np.testing.assert_array_equal(wav.numpy()[0], x[0].astype(np.float32))
 
     @unittest.skipUnless(_HAS_SOUNDFILE, "soundfile not installed")
     def test_ulaw_matches_reference(self):
