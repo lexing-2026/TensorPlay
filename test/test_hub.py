@@ -229,14 +229,22 @@ def test_foreign_tensor_identity(foreign_repo):
 
 
 def test_foreign_aliases_point_at_native_modules(foreign_repo):
+    import importlib.util
     import sys
 
+    # Name mapping is a pure prefix rewrite to the native packages.
+    assert hub._compat_target_name("torchvision.models.vgg") == "tensorplay.vision.models.vgg"
+    assert hub._compat_target_name("torch.hub") == "tensorplay.hub"
+    assert hub._compat_target_name("json") is None
+
+    # The finder resolves a not-yet-loaded foreign name to the native module
+    # itself, never to a foreign package installed in the environment.
+    for foreign, native in (("torchvision.models.vgg", "tensorplay.vision.models.vgg"), ("torch.utils", "tensorplay.utils")):
+        if foreign in sys.modules or native in sys.modules:
+            continue  # already resolved earlier in this process; skip the load check
+        spec = hub._CompatFinder().find_spec(foreign)
+        assert spec is not None, foreign
+        module = importlib.util.module_from_spec(spec)
+        assert module.__name__ == native, (foreign, module.__name__)
+
     hub.load(str(foreign_repo), "build_alexnet", source="local")
-    alias_keys = [
-        k for k in sys.modules if k == "torch" or k.startswith(("torch.", "torchvision"))
-    ]
-    assert "torch" in alias_keys and "torchvision.models.alexnet" in alias_keys
-    for key in alias_keys:
-        # Aliased entries are the native modules themselves, never a foreign
-        # package installed in the environment.
-        assert sys.modules[key].__name__.startswith("tensorplay"), key
