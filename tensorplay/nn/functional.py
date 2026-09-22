@@ -1939,11 +1939,42 @@ def feature_alpha_dropout(
 # -----------------------------------------------------------------------------
 
 
+_COSINE_FLOATING_DTYPES = frozenset(
+    (
+        tensorplay.float16,
+        tensorplay.bfloat16,
+        tensorplay.float32,
+        tensorplay.float64,
+    )
+)
+
+
 def cosine_similarity(x1: Tensor, x2: Tensor, dim: int = 1, eps: float = 1e-8) -> Tensor:
-    r"""Returns cosine similarity between x1 and x2, computed along dim."""
-    denom = x1.norm([dim]).mul(x2.norm([dim]))
-    denom = tensorplay.clamp(denom, min=eps)
-    return (x1 * x2).sum(dim) / denom
+    r"""Returns cosine similarity between x1 and x2, computed along dim.
+
+    The inputs are normalized before the dot product, and the per-row norms
+    are accumulated in a wider dtype (float32 for half-precision inputs,
+    float64 for float32), so that squaring large values cannot overflow the
+    accumulator and turn the result into NaN.
+    """
+    common = tensorplay.promote_types(x1.dtype, x2.dtype)
+    if common not in _COSINE_FLOATING_DTYPES:
+        raise RuntimeError(
+            f"expected common dtype to be floating point, yet common dtype is {common}"
+        )
+    if x1.dtype != common:
+        x1 = x1.to(common)
+    if x2.dtype != common:
+        x2 = x2.to(common)
+    x1, x2 = tensorplay.broadcast_tensors(x1, x2)
+    acc = (
+        tensorplay.float32
+        if common in (tensorplay.float16, tensorplay.bfloat16)
+        else tensorplay.float64
+    )
+    n1 = x1.to(acc).norm(dim=dim, keepdim=True).clamp_min(eps).to(common)
+    n2 = x2.to(acc).norm(dim=dim, keepdim=True).clamp_min(eps).to(common)
+    return ((x1 / n1) * (x2 / n2)).sum(dim)
 
 
 # -----------------------------------------------------------------------------
