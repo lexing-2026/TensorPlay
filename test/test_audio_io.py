@@ -14,7 +14,8 @@ import numpy as np
 from scipy.io import wavfile
 
 import tensorplay as tp
-from tensorplay.audio import decode_wav, decode_wav_batch, encode_wav, wav_info
+from tensorplay.audio import (decode_wav, decode_wav_batch, encode_wav,
+                              encode_wav_batch, wav_info)
 from tensorplay.audio import io as tp_audio_io
 
 try:
@@ -235,8 +236,25 @@ class AudioIoTest(unittest.TestCase):
         np.testing.assert_allclose(out.numpy(), expected, rtol=0, atol=1e-12)
 
 
+class BatchEncodeTest(unittest.TestCase):
+    """Batch WAV encode returns byte-identical payloads to single calls."""
+
+    def test_encode_wav_batch_matches_single(self):
+        rng = np.random.default_rng(21)
+        clips = [rng.standard_normal((2, 8000)).astype(np.float32) * 0.2 for _ in range(4)]
+        tensors = [tp.tensor(np.ascontiguousarray(c)) for c in clips]
+        got = encode_wav_batch(tensors, 16000)
+        ref = [encode_wav(t, 16000) for t in tensors]
+        self.assertEqual(len(got), len(tensors))
+        for g, r in zip(got, ref):
+            np.testing.assert_array_equal(g.numpy(), r.numpy())
+        out = decode_wav_batch(got)
+        for w, sr in out:
+            self.assertEqual(sr, 16000)
+            self.assertEqual(tuple(w.shape), (2, 8000))
+
+
 class WavPerfProbeTest(unittest.TestCase):
-    """Reports the batch speedup; informational, never asserted."""
 
     def test_batch_speedup_report(self):
         import time

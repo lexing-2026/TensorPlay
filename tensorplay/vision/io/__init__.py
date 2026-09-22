@@ -33,8 +33,11 @@ __all__ = [
     "decode_jpeg",
     "decode_png",
     "decode_jpeg_batch",
+    "decode_png_batch",
     "encode_jpeg",
     "encode_png",
+    "encode_jpeg_batch",
+    "encode_png_batch",
     "write_jpeg",
     "write_png",
 ]
@@ -213,6 +216,44 @@ def encode_png(img: tensorplay.Tensor, compression_level: int = 6) -> tensorplay
     buf = _io.BytesIO()
     Image.fromarray(arr).save(buf, format="PNG", compress_level=int(compression_level))
     return tensorplay.tensor(np.frombuffer(buf.getvalue(), dtype=np.uint8).copy())
+
+
+def decode_png_batch(data: list, mode: int = ImageReadMode.UNCHANGED.value):
+    """Decodes a sequence of PNG byte tensors.
+
+    Runs single-image decodes across the shared thread pool; returns a list
+    of uint8 CHW tensors in input order.
+    """
+    native = _native_io()
+    if native is not None and hasattr(native, "decode_png_batch"):
+        return native.decode_png_batch(list(data), int(mode))
+    return [decode_png(d, mode) for d in data]
+
+
+def encode_jpeg_batch(imgs: list, quality: int = 75) -> list:
+    """Encodes a sequence of CHW image tensors into JPEG byte tensors.
+
+    Accepts float32 [0, 1] or uint8 [0, 255] per image; encodes in parallel
+    on the shared thread pool.
+    """
+    native = _native_io()
+    imgs = [_as_uint8_chw(i) for i in imgs]
+    if native is not None and hasattr(native, "encode_jpeg_batch"):
+        return native.encode_jpeg_batch(imgs, int(quality))
+    return [encode_jpeg(i, quality) for i in imgs]
+
+
+def encode_png_batch(imgs: list, compression_level: int = 6) -> list:
+    """Encodes a sequence of CHW image tensors into PNG byte tensors.
+
+    Accepts float32 [0, 1] or uint8 [0, 255] per image; encodes in parallel
+    on the shared thread pool.
+    """
+    native = _native_io()
+    imgs = [_as_uint8_chw(i) for i in imgs]
+    if native is not None and hasattr(native, "encode_png_batch"):
+        return native.encode_png_batch(imgs, int(compression_level))
+    return [encode_png(i, compression_level) for i in imgs]
 
 
 def write_jpeg(img: tensorplay.Tensor, filename: str, quality: int = 75) -> None:

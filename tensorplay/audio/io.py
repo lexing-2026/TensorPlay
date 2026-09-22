@@ -400,6 +400,19 @@ def encode_wav(data, sample_rate, bits=16):
     return encoder(data, int(sample_rate), int(bits))
 
 
+def encode_wav_batch(data, sample_rate, bits=16):
+    """Encodes a sequence of float32 tensors into WAV bytes in parallel.
+
+    Each tensor is (channels, time) or 1-D mono; ``bits`` may be 8, 16, 24 or
+    32 (PCM).  Returns a list of uint8 1-D tensors in input order.
+    """
+    native = _native_io()
+    encoder = getattr(native, "encode_wav_batch", None) if native else None
+    if encoder is not None:
+        return encoder(list(data), int(sample_rate), int(bits))
+    return [encode_wav(d, sample_rate, bits) for d in data]
+
+
 def wav_info(data):
     """Returns metadata for WAV bytes: (sample_rate, frames, channels, bits, encoding).
 

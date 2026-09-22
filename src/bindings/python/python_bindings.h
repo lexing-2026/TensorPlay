@@ -58,11 +58,16 @@ Tensor encode_png(Tensor data, int64_t compression_level);
 Tensor decode_jpeg_cuda(Tensor data, int64_t mode);
 std::vector<Tensor> decode_jpeg_batch(std::vector<Tensor> data, int64_t mode,
                                       const std::string& device);
+std::vector<Tensor> decode_png_batch(std::vector<Tensor> data, int64_t mode);
+std::vector<Tensor> encode_jpeg_batch(std::vector<Tensor> data, int64_t quality);
+std::vector<Tensor> encode_png_batch(std::vector<Tensor> data, int64_t compression_level);
 std::pair<Tensor, int64_t> decode_wav(Tensor data, int64_t frame_offset, int64_t num_frames);
 std::vector<std::pair<Tensor, int64_t>> decode_wav_batch(std::vector<Tensor> data,
                                                          int64_t frame_offset,
                                                          int64_t num_frames);
 Tensor encode_wav(Tensor data, int64_t sample_rate, int64_t bits);
+std::vector<Tensor> encode_wav_batch(std::vector<Tensor> data, int64_t sample_rate,
+                                     int64_t bits);
 std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t> wav_info(Tensor data);
 Tensor audio_to_tensor(py::object obj);
 void init_device(py::module_& m);

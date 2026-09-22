@@ -310,6 +310,36 @@ class JpegGpuTest(unittest.TestCase):
             self.assertLessEqual(d.max(), 8, f"max diff {d.max()}")
 
 
+class BatchIoTest(unittest.TestCase):
+    """Batch entry points return byte-identical results to single calls."""
+
+    def test_png_batch_decode_matches_single(self):
+        raw = [_bytes_tensor(_png_bytes(_rgb(seed=50 + i))) for i in range(4)]
+        got = tp_io.decode_png_batch(raw)
+        ref = [tp_io.decode_png(t) for t in raw]
+        self.assertEqual(len(got), len(raw))
+        for g, r in zip(got, ref):
+            np.testing.assert_array_equal(g.numpy(), r.numpy())
+
+    def test_encode_jpeg_batch_matches_single(self):
+        imgs = [tp.tensor(np.ascontiguousarray(_rgb(seed=60 + i).transpose(2, 0, 1)))
+                for i in range(4)]
+        got = tp_io.encode_jpeg_batch(imgs, quality=85)
+        ref = [tp_io.encode_jpeg(i, quality=85) for i in imgs]
+        self.assertEqual(len(got), len(imgs))
+        for g, r in zip(got, ref):
+            np.testing.assert_array_equal(g.numpy(), r.numpy())
+
+    def test_encode_png_batch_matches_single(self):
+        imgs = [tp.tensor(np.ascontiguousarray(_rgb(seed=70 + i).transpose(2, 0, 1)))
+                for i in range(4)]
+        got = tp_io.encode_png_batch(imgs)
+        ref = [tp_io.encode_png(i) for i in imgs]
+        self.assertEqual(len(got), len(imgs))
+        for g, r in zip(got, ref):
+            np.testing.assert_array_equal(g.numpy(), r.numpy())
+
+
 class PerfProbeTest(unittest.TestCase):
     """Reports the batch speedup; informational, never asserted."""
 

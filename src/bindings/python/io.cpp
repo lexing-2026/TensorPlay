@@ -1216,6 +1216,77 @@ std::vector<Tensor> decode_jpeg_batch(std::vector<Tensor> data, int64_t mode,
 
 #endif
 
+#ifdef TP_USE_LIBPNG
+
+// Batch decode/encode on the shared thread pool; each worker funnels through
+// the same single-image entry points above, so validation and error messages
+// are identical between the batch and single paths.
+std::vector<Tensor> decode_png_batch(std::vector<Tensor> data, int64_t mode) {
+    const int64_t N = static_cast<int64_t>(data.size());
+    if (N == 0) return {};
+    std::vector<Tensor> out(N);
+    std::exception_ptr error;
+    std::mutex error_mutex;
+    tensorplay::parallel::parallel_for(0, N, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            try {
+                out[i] = decode_png(data[i], mode);
+            } catch (...) {
+                std::lock_guard<std::mutex> guard(error_mutex);
+                if (!error) error = std::current_exception();
+            }
+        }
+    });
+    if (error) std::rethrow_exception(error);
+    return out;
+}
+
+std::vector<Tensor> encode_png_batch(std::vector<Tensor> data, int64_t compression_level) {
+    const int64_t N = static_cast<int64_t>(data.size());
+    if (N == 0) return {};
+    std::vector<Tensor> out(N);
+    std::exception_ptr error;
+    std::mutex error_mutex;
+    tensorplay::parallel::parallel_for(0, N, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            try {
+                out[i] = encode_png(data[i], compression_level);
+            } catch (...) {
+                std::lock_guard<std::mutex> guard(error_mutex);
+                if (!error) error = std::current_exception();
+            }
+        }
+    });
+    if (error) std::rethrow_exception(error);
+    return out;
+}
+
+#endif // TP_USE_LIBPNG
+
+#ifdef TP_USE_LIBJPEG
+
+std::vector<Tensor> encode_jpeg_batch(std::vector<Tensor> data, int64_t quality) {
+    const int64_t N = static_cast<int64_t>(data.size());
+    if (N == 0) return {};
+    std::vector<Tensor> out(N);
+    std::exception_ptr error;
+    std::mutex error_mutex;
+    tensorplay::parallel::parallel_for(0, N, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            try {
+                out[i] = encode_jpeg(data[i], quality);
+            } catch (...) {
+                std::lock_guard<std::mutex> guard(error_mutex);
+                if (!error) error = std::current_exception();
+            }
+        }
+    });
+    if (error) std::rethrow_exception(error);
+    return out;
+}
+
+#endif // TP_USE_LIBJPEG
+
 std::pair<Tensor, int64_t> decode_wav(Tensor data, int64_t frame_offset, int64_t num_frames) {
     require_cpu_uint8(data, "decode_wav", 1, "a 1-D uint8 tensor");
     Tensor waveform = decode_wav_impl(data.data_ptr<uint8_t>(),
@@ -1284,6 +1355,27 @@ Tensor encode_wav(Tensor data, int64_t sample_rate, int64_t bits) {
     }
     return encode_wav_impl(data.data_ptr<float>(), C, T,
                            static_cast<uint32_t>(sample_rate), bits);
+}
+
+std::vector<Tensor> encode_wav_batch(std::vector<Tensor> data, int64_t sample_rate,
+                                     int64_t bits) {
+    const int64_t N = static_cast<int64_t>(data.size());
+    if (N == 0) return {};
+    std::vector<Tensor> out(N);
+    std::exception_ptr error;
+    std::mutex error_mutex;
+    tensorplay::parallel::parallel_for(0, N, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            try {
+                out[i] = encode_wav(data[i], sample_rate, bits);
+            } catch (...) {
+                std::lock_guard<std::mutex> guard(error_mutex);
+                if (!error) error = std::current_exception();
+            }
+        }
+    });
+    if (error) std::rethrow_exception(error);
+    return out;
 }
 
 std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t> wav_info(Tensor data) {
