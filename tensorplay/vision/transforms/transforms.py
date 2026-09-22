@@ -117,9 +117,7 @@ class ToTensor:
 
     .. note::
         Because the input image is scaled to [0.0, 1.0], this transformation should not be used when
-        transforming target image masks. See the `references`_ for implementing the transforms for image masks.
-
-    .. _references: https://github.com/tensorplay/vision/tree/main/references/segmentation
+        transforming target image masks.
     """
 
     def __init__(self) -> None:
