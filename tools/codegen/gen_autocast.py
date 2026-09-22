@@ -16,7 +16,7 @@ from .model import NativeFunction, Type
 
 # Generic lower-precision policy group.
 AT_FORALL_LOWER_PRECISION_FP = [
-    'mm', 'matmul', 'addmm', 'bmm', 'baddbmm',
+    'mm', 'matmul', 'addmm', 'bmm', 'baddbmm', 'linear',
     'conv1d', 'conv2d', 'conv3d',
     'conv_transpose2d', 'conv_transpose3d',
     'einsum', 'mv', 'scaled_dot_product_attention',
