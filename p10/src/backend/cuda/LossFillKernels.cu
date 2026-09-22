@@ -41,7 +41,8 @@ inline std::vector<int64_t> shape_of(const Tensor& t) {
     return static_cast<std::vector<int64_t>>(t.shape());
 }
 
-__global__ void atomic_sum_kernel(int64_t n, const double* in, double* total) {
+template <typename T>
+__global__ void atomic_sum_kernel_t(int64_t n, const T* in, T* total) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += stride) atomicAdd(total, in[i]);
@@ -55,10 +56,20 @@ __global__ void atomic_sum_kernel(int64_t n, const double* in, double* total) {
     } \
   } while (0)
 
+// Device-side finalize for reduced losses: writes total * scale into a
+// 0-dim result so the scalar never crosses the PCIe bus in the training
+// loop (`loss.backward()` does not need the host-side value).
+template <typename T>
+__global__ void finalize_loss_scalar_kernel(const T* total, T* out, double scale) {
+    out[0] = static_cast<T>(total[0] * scale);
+}
+
+// Host-side reduction for the loss families that still derive their scalar
+// on the CPU (kept for the smooth_l1 / huber / bce rows).
 double host_sum_f64(const Tensor& elems, int64_t n) {
     Tensor total = Tensor::zeros({1}, DType::Float64, elems.device());
     if (n > 0) {
-        atomic_sum_kernel<<<loss_grid(n), kThreads, 0,
+        atomic_sum_kernel_t<double><<<loss_grid(n), kThreads, 0,
                             getCurrentCUDAStream().stream()>>>(
             n, elems.data_ptr<double>(), total.data_ptr<double>());
         CUDA_CHECK(cudaGetLastError());
@@ -69,7 +80,16 @@ double host_sum_f64(const Tensor& elems, int64_t n) {
     return h;
 }
 
-std::pair<Tensor, Tensor> pair_f64_dev(const Tensor& a, const Tensor& b) {
+// Reduction carry type for a loss input: half/float accumulate in float,
+// everything else (double, integer inputs) keeps its existing double path.
+inline DType loss_accumulate_dtype(DType t) {
+    return (t == DType::Float32 || t == DType::Float16 || t == DType::BFloat16)
+        ? DType::Float32
+        : DType::Float64;
+}
+
+std::pair<Tensor, Tensor> pair_dev(const Tensor& a, const Tensor& b,
+                                   DType target) {
     const Tensor ac = a.is_contiguous() ? a : a.contiguous();
     const Tensor bc = b.is_contiguous() ? b : b.contiguous();
     Tensor ae = ac;
@@ -89,19 +109,24 @@ std::pair<Tensor, Tensor> pair_f64_dev(const Tensor& a, const Tensor& b) {
         ae = ac.expand(bs).contiguous();
         be = bc.expand(bs).contiguous();
     }
-    return {ae.to(DType::Float64), be.to(DType::Float64)};
+    return {ae.to(target), be.to(target)};
+}
+
+std::pair<Tensor, Tensor> pair_f64_dev(const Tensor& a, const Tensor& b) {
+    return pair_dev(a, b, DType::Float64);
 }
 
 // ---------------------------------------------------------------------------
 // elementwise loss / gradient kernels
 // ---------------------------------------------------------------------------
 
-__global__ void mse_grad_kernel(int64_t n, const double* x, const double* t,
-                                const double* g, double norm, double* o) {
+template <typename T>
+__global__ void mse_grad_kernel_t(int64_t n, const T* x, const T* t,
+                                  const T* g, T norm, T* o) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += st) {
-        const double d = x[i] - t[i];
+        const T d = x[i] - t[i];
         o[i] = norm * 2.0 * d * g[i];
     }
 }
@@ -302,9 +327,9 @@ Tensor mse_loss_cuda(const Tensor& input, const Tensor& target,
     if (reduction != 0 && reduction != 1 && reduction != 2) {
         TP_THROW(ValueError, "Invalid reduction mode");
     }
-    auto pr = pair_f64_dev(input, target);
-    Tensor elems = Tensor::empty(shape_of(pr.first), DType::Float64,
-                                  input.device());
+    const DType acc = loss_accumulate_dtype(input.dtype());
+    auto pr = pair_dev(input, target, acc);
+    Tensor elems = Tensor::empty(shape_of(pr.first), acc, input.device());
     const int64_t n = elems.numel();
     if (n) {
         TensorIterator iter = TensorIteratorConfig()
@@ -313,40 +338,81 @@ Tensor mse_loss_cuda(const Tensor& input, const Tensor& target,
             .add_const_input(pr.first)
             .add_const_input(pr.second)
             .build();
-        gpu_kernel(iter, [] __host__ __device__(double x, double t) -> double {
-            const double d = x - t;
-            return d * d;
-        });
+        if (acc == DType::Float64) {
+            gpu_kernel(iter, [] __host__ __device__(double x, double t) -> double {
+                const double d = x - t;
+                return d * d;
+            });
+        } else {
+            gpu_kernel(iter, [] __host__ __device__(float x, float t) -> float {
+                const float d = x - t;
+                return d * d;
+            });
+        }
         CUDA_CHECK(cudaGetLastError());
     }
     if (reduction == 0) {
-        return elems.to(input.dtype() == DType::Float64 ? DType::Float64
-                                                       : DType::Float32)
-            .to(input.dtype());
+        return elems.to(input.dtype());
     }
-    const double total = host_sum_f64(elems, n);
-    const double v = reduction == 1 && n ? total / n : total;
-    return Tensor::full({}, Scalar(v), out_scalar_dtype(input.dtype()),
-                         input.device())
-        .to(input.dtype());
+    // Reduce and finalize on device; no device-to-host transfer.
+    Tensor total = Tensor::zeros({1}, acc, input.device());
+    if (n) {
+        if (acc == DType::Float64) {
+            atomic_sum_kernel_t<double><<<loss_grid(n), kThreads, 0,
+                                         getCurrentCUDAStream().stream()>>>(
+                n, elems.data_ptr<double>(), total.data_ptr<double>());
+        } else {
+            atomic_sum_kernel_t<float><<<loss_grid(n), kThreads, 0,
+                                        getCurrentCUDAStream().stream()>>>(
+                n, elems.data_ptr<float>(), total.data_ptr<float>());
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+    const double scale =
+        (reduction == 1 && n) ? 1.0 / static_cast<double>(n) : 1.0;
+    Tensor result = Tensor::empty({}, acc, input.device());
+    if (acc == DType::Float64) {
+        finalize_loss_scalar_kernel<double><<<1, 1, 0,
+                                              getCurrentCUDAStream().stream()>>>(
+            total.data_ptr<double>(), result.data_ptr<double>(), scale);
+    } else {
+        finalize_loss_scalar_kernel<float><<<1, 1, 0,
+                                           getCurrentCUDAStream().stream()>>>(
+            total.data_ptr<float>(), result.data_ptr<float>(), scale);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return result.to(input.dtype());
 }
 
 Tensor mse_loss_backward_cuda(const Tensor& grad_output, const Tensor& input,
                               const Tensor& target, int64_t reduction) {
-    auto pr = pair_f64_dev(input, target);
-    // The kernels read grad linearly: materialize its broadcast.
-    const Tensor g = grad_output.shape() == pr.first.shape()
-        ? f64_dev(grad_output)
-        : f64_dev(grad_output.expand(shape_of(pr.first)));
-    Tensor out = Tensor::empty(shape_of(pr.first), DType::Float64,
-                                input.device());
+    const DType acc = loss_accumulate_dtype(input.dtype());
+    auto pr = pair_dev(input, target, acc);
+    // The kernels read grad linearly: materialize its broadcast (the
+    // incoming grad may be a stride-0 expand view from the autograd graph).
+    const Tensor g = (grad_output.shape() == pr.first.shape()
+                          ? grad_output
+                          : grad_output.expand(shape_of(pr.first)))
+        .contiguous()
+        .to(acc);
+    Tensor out = Tensor::empty(shape_of(pr.first), acc, input.device());
     const int64_t n = out.numel();
     if (n) {
-        const double norm = reduction == 1 ? 1.0 / static_cast<double>(n) : 1.0;
-        mse_grad_kernel<<<loss_grid(n), kThreads, 0,
-                          getCurrentCUDAStream().stream()>>>(
-            n, pr.first.data_ptr<double>(), pr.second.data_ptr<double>(),
-            g.data_ptr<double>(), norm, out.data_ptr<double>());
+        if (acc == DType::Float64) {
+            const double norm =
+                reduction == 1 ? 1.0 / static_cast<double>(n) : 1.0;
+            mse_grad_kernel_t<double><<<loss_grid(n), kThreads, 0,
+                                      getCurrentCUDAStream().stream()>>>(
+                n, pr.first.data_ptr<double>(), pr.second.data_ptr<double>(),
+                g.data_ptr<double>(), norm, out.data_ptr<double>());
+        } else {
+            const float norm =
+                reduction == 1 ? 1.0f / static_cast<float>(n) : 1.0f;
+            mse_grad_kernel_t<float><<<loss_grid(n), kThreads, 0,
+                                     getCurrentCUDAStream().stream()>>>(
+                n, pr.first.data_ptr<float>(), pr.second.data_ptr<float>(),
+                g.data_ptr<float>(), norm, out.data_ptr<float>());
+        }
         CUDA_CHECK(cudaGetLastError());
     }
     return out.to(input.dtype());

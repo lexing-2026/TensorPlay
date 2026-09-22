@@ -210,6 +210,112 @@ struct ConvFwdAlgo {
     size_t workspace_size;
 };
 
+// ---------------------------------------------------------------------------
+// Cached legacy cuDNN descriptors
+//
+// The backward convolution paths configure the same 4-D NCHW tensor/filter
+// and 2-D convolution descriptors on every call; creating and setting them
+// costs a driver round-trip each time while the shapes are stable across
+// training iterations.  Each cache entry is keyed by the exact tuple the
+// setters read, and entries are never mutated after construction, so cached
+// handles can be shared across calls without synchronization beyond the
+// lookup lock.
+// ---------------------------------------------------------------------------
+
+struct CachedTensorDesc {
+    cudnnTensorDescriptor_t desc = nullptr;
+    ~CachedTensorDesc() { cudnnDestroyTensorDescriptor(desc); }
+    operator cudnnTensorDescriptor_t() const { return desc; }
+};
+
+struct CachedFilterDesc {
+    cudnnFilterDescriptor_t desc = nullptr;
+    ~CachedFilterDesc() { cudnnDestroyFilterDescriptor(desc); }
+    operator cudnnFilterDescriptor_t() const { return desc; }
+};
+
+struct CachedConvDesc {
+    cudnnConvolutionDescriptor_t desc = nullptr;
+    ~CachedConvDesc() { cudnnDestroyConvolutionDescriptor(desc); }
+    operator cudnnConvolutionDescriptor_t() const { return desc; }
+};
+
+static std::mutex g_conv_desc_cache_mutex;
+static std::unordered_map<std::string, std::shared_ptr<CachedTensorDesc>>
+    g_tensor_desc_cache;
+static std::unordered_map<std::string, std::shared_ptr<CachedFilterDesc>>
+    g_filter_desc_cache;
+static std::unordered_map<std::string, std::shared_ptr<CachedConvDesc>>
+    g_conv_desc_cache;
+
+std::shared_ptr<CachedTensorDesc> get_cached_tensor_desc(const Tensor& t) {
+    std::string key = std::to_string(static_cast<int>(t.dtype()));
+    for (int64_t dim : {t.size(0), t.size(1), t.size(2), t.size(3)}) {
+        key += ":" + std::to_string(dim);
+    }
+    std::lock_guard<std::mutex> lock(g_conv_desc_cache_mutex);
+    auto it = g_tensor_desc_cache.find(key);
+    if (it != g_tensor_desc_cache.end()) return it->second;
+    cudnnTensorDescriptor_t desc;
+    CUDNN_CHECK(cudnnCreateTensorDescriptor(&desc));
+    CUDNN_CHECK(cudnnSetTensor4dDescriptor(
+        desc, CUDNN_TENSOR_NCHW, to_cudnn_data_type(t.dtype()),
+        static_cast<int>(t.size(0)), static_cast<int>(t.size(1)),
+        static_cast<int>(t.size(2)), static_cast<int>(t.size(3))));
+    auto holder = std::make_shared<CachedTensorDesc>();
+    holder->desc = desc;
+    g_tensor_desc_cache.emplace(key, holder);
+    return holder;
+}
+
+std::shared_ptr<CachedFilterDesc> get_cached_filter_desc(const Tensor& t) {
+    std::string key = std::to_string(static_cast<int>(t.dtype()));
+    for (int64_t dim : {t.size(0), t.size(1), t.size(2), t.size(3)}) {
+        key += ":" + std::to_string(dim);
+    }
+    std::lock_guard<std::mutex> lock(g_conv_desc_cache_mutex);
+    auto it = g_filter_desc_cache.find(key);
+    if (it != g_filter_desc_cache.end()) return it->second;
+    cudnnFilterDescriptor_t desc;
+    CUDNN_CHECK(cudnnCreateFilterDescriptor(&desc));
+    CUDNN_CHECK(cudnnSetFilter4dDescriptor(
+        desc, to_cudnn_data_type(t.dtype()), CUDNN_TENSOR_NCHW,
+        static_cast<int>(t.size(0)), static_cast<int>(t.size(1)),
+        static_cast<int>(t.size(2)), static_cast<int>(t.size(3))));
+    auto holder = std::make_shared<CachedFilterDesc>();
+    holder->desc = desc;
+    g_filter_desc_cache.emplace(key, holder);
+    return holder;
+}
+
+std::shared_ptr<CachedConvDesc> get_cached_conv_desc(
+    int pad_h, int pad_w, int str_h, int str_w, int dil_h, int dil_w,
+    int groups, DType dtype) {
+    std::string key = std::to_string(static_cast<int>(dtype)) + ":" +
+        std::to_string(pad_h) + ":" + std::to_string(pad_w) + ":" +
+        std::to_string(str_h) + ":" + std::to_string(str_w) + ":" +
+        std::to_string(dil_h) + ":" + std::to_string(dil_w) + ":" +
+        std::to_string(groups);
+    std::lock_guard<std::mutex> lock(g_conv_desc_cache_mutex);
+    auto it = g_conv_desc_cache.find(key);
+    if (it != g_conv_desc_cache.end()) return it->second;
+    cudnnConvolutionDescriptor_t desc;
+    CUDNN_CHECK(cudnnCreateConvolutionDescriptor(&desc));
+    CUDNN_CHECK(cudnnSetConvolution2dDescriptor(
+        desc, pad_h, pad_w, str_h, str_w, dil_h, dil_w, CUDNN_CROSS_CORRELATION,
+        to_cudnn_compute_type(dtype)));
+    CUDNN_CHECK(cudnnSetConvolutionGroupCount(desc, groups));
+    cudnnMathType_t math_type = CUDNN_DEFAULT_MATH;
+    if (dtype == DType::Float32 && tensorplay::globalContext().allowTF32CuDNN()) {
+        math_type = CUDNN_TENSOR_OP_MATH;
+    }
+    CUDNN_CHECK(cudnnSetConvolutionMathType(desc, math_type));
+    auto holder = std::make_shared<CachedConvDesc>();
+    holder->desc = desc;
+    g_conv_desc_cache.emplace(key, holder);
+    return holder;
+}
+
 static std::unordered_map<std::string, ConvFwdAlgo> g_conv_fwd_algo_cache;
 static std::mutex g_conv_fwd_cache_mutex;
 
@@ -1051,12 +1157,13 @@ Tensor conv2d_grad_input_cuda(const Tensor& grad_output, const Tensor& input, co
 
     cudnnHandle_t handle = CUDAContext::getCudnnHandle();
 
-    TensorDesc dx_desc; dx_desc.set(input_c); // gradient of input has same shape as input
-    FilterDesc w_desc; w_desc.set(weight_c);
-    TensorDesc dy_desc; dy_desc.set(grad_output_c);
+    auto dx_desc = get_cached_tensor_desc(input_c); // gradient of input has same shape as input
+    auto w_desc = get_cached_filter_desc(weight_c);
+    auto dy_desc = get_cached_tensor_desc(grad_output_c);
     
-    ConvDesc conv_desc;
-    conv_desc.set((int)padding[0], (int)padding[1], (int)stride[0], (int)stride[1], (int)dilation[0], (int)dilation[1], (int)groups, input_c.dtype());
+    auto conv_desc = get_cached_conv_desc(
+        (int)padding[0], (int)padding[1], (int)stride[0], (int)stride[1],
+        (int)dilation[0], (int)dilation[1], (int)groups, input_c.dtype());
     
     Tensor grad_input = Tensor::empty_like(input_c, DType::Undefined, input_c.device());
     
@@ -1078,21 +1185,21 @@ Tensor conv2d_grad_input_cuda(const Tensor& grad_output, const Tensor& input, co
         if (!have) {
             ConvBwdAlgo entry;
             if (conv_autotune_enabled()) {
-                entry = autotune_conv_bwd_data(handle, w_desc, weight_c.data_ptr(),
-                                               dy_desc, grad_output_c.data_ptr(), conv_desc,
-                                               dx_desc, grad_input.data_ptr(), input_c.device());
+                entry = autotune_conv_bwd_data(handle, *w_desc, weight_c.data_ptr(),
+                                               *dy_desc, grad_output_c.data_ptr(), *conv_desc,
+                                               *dx_desc, grad_input.data_ptr(), input_c.device());
             } else {
                 cudnnConvolutionBwdDataAlgoPerf_t perf_results;
                 int returned_algo_count = 0;
                 CUDNN_CHECK(cudnnGetConvolutionBackwardDataAlgorithm_v7(
-                    handle, w_desc, dy_desc, conv_desc, dx_desc,
+                    handle, *w_desc, *dy_desc, *conv_desc, *dx_desc,
                     1, &returned_algo_count, &perf_results));
                 if (returned_algo_count == 0) {
                     TP_THROW(RuntimeError, "cuDNN: no backward-data convolution algorithm");
                 }
                 size_t ws_size = 0;
                 CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(
-                    handle, w_desc, dy_desc, conv_desc, dx_desc, perf_results.algo, &ws_size));
+                    handle, *w_desc, *dy_desc, *conv_desc, *dx_desc, perf_results.algo, &ws_size));
                 entry = ConvBwdAlgo{static_cast<int>(perf_results.algo), ws_size};
             }
             {
@@ -1114,7 +1221,7 @@ Tensor conv2d_grad_input_cuda(const Tensor& grad_output, const Tensor& input, co
         alpha_p = &alpha_d; beta_p = &beta_d;
     }
     
-    CUDNN_CHECK(cudnnConvolutionBackwardData(handle, alpha_p, w_desc, weight_c.data_ptr(), dy_desc, grad_output_c.data_ptr(), conv_desc, algo, workspace.get(), workspace_size, beta_p, dx_desc, grad_input.data_ptr()));
+    CUDNN_CHECK(cudnnConvolutionBackwardData(handle, alpha_p, *w_desc, weight_c.data_ptr(), *dy_desc, grad_output_c.data_ptr(), *conv_desc, algo, workspace.get(), workspace_size, beta_p, *dx_desc, grad_input.data_ptr()));
     
     return grad_input;
 #else
@@ -1140,12 +1247,13 @@ Tensor conv2d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input, c
     
     cudnnHandle_t handle = CUDAContext::getCudnnHandle();
     
-    TensorDesc x_desc; x_desc.set(input_c);
-    TensorDesc dy_desc; dy_desc.set(grad_output_c);
-    FilterDesc dw_desc; dw_desc.set(weight_c); // grad_weight has same shape as weight
+    auto x_desc = get_cached_tensor_desc(input_c);
+    auto dy_desc = get_cached_tensor_desc(grad_output_c);
+    auto dw_desc = get_cached_filter_desc(weight_c); // grad_weight has same shape as weight
     
-    ConvDesc conv_desc;
-    conv_desc.set((int)padding[0], (int)padding[1], (int)stride[0], (int)stride[1], (int)dilation[0], (int)dilation[1], (int)groups, input_c.dtype());
+    auto conv_desc = get_cached_conv_desc(
+        (int)padding[0], (int)padding[1], (int)stride[0], (int)stride[1],
+        (int)dilation[0], (int)dilation[1], (int)groups, input_c.dtype());
     
     Tensor grad_weight = Tensor::empty_like(weight_c, DType::Undefined, weight_c.device());
     
@@ -1167,21 +1275,21 @@ Tensor conv2d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input, c
         if (!have) {
             ConvBwdAlgo entry;
             if (conv_autotune_enabled()) {
-                entry = autotune_conv_bwd_filter(handle, x_desc, input_c.data_ptr(),
-                                                 dy_desc, grad_output_c.data_ptr(), conv_desc,
-                                                 dw_desc, grad_weight.data_ptr(), input_c.device());
+                entry = autotune_conv_bwd_filter(handle, *x_desc, input_c.data_ptr(),
+                                                 *dy_desc, grad_output_c.data_ptr(), *conv_desc,
+                                                 *dw_desc, grad_weight.data_ptr(), input_c.device());
             } else {
                 cudnnConvolutionBwdFilterAlgoPerf_t perf_results;
                 int returned_algo_count = 0;
                 CUDNN_CHECK(cudnnGetConvolutionBackwardFilterAlgorithm_v7(
-                    handle, x_desc, dy_desc, conv_desc, dw_desc,
+                    handle, *x_desc, *dy_desc, *conv_desc, *dw_desc,
                     1, &returned_algo_count, &perf_results));
                 if (returned_algo_count == 0) {
                     TP_THROW(RuntimeError, "cuDNN: no backward-filter convolution algorithm");
                 }
                 size_t ws_size = 0;
                 CUDNN_CHECK(cudnnGetConvolutionBackwardFilterWorkspaceSize(
-                    handle, x_desc, dy_desc, conv_desc, dw_desc, perf_results.algo, &ws_size));
+                    handle, *x_desc, *dy_desc, *conv_desc, *dw_desc, perf_results.algo, &ws_size));
                 entry = ConvBwdAlgo{static_cast<int>(perf_results.algo), ws_size};
             }
             {
@@ -1203,7 +1311,7 @@ Tensor conv2d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input, c
         alpha_p = &alpha_d; beta_p = &beta_d;
     }
     
-    CUDNN_CHECK(cudnnConvolutionBackwardFilter(handle, alpha_p, x_desc, input_c.data_ptr(), dy_desc, grad_output_c.data_ptr(), conv_desc, algo, workspace.get(), workspace_size, beta_p, dw_desc, grad_weight.data_ptr()));
+    CUDNN_CHECK(cudnnConvolutionBackwardFilter(handle, alpha_p, *x_desc, input_c.data_ptr(), *dy_desc, grad_output_c.data_ptr(), *conv_desc, algo, workspace.get(), workspace_size, beta_p, *dw_desc, grad_weight.data_ptr()));
     
     return grad_weight;
 #else
@@ -1223,13 +1331,12 @@ Tensor conv2d_grad_bias_cuda(const Tensor& grad_output, const Tensor& input, con
     
     Tensor grad_output_c = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     
-    TensorDesc dy_desc; dy_desc.set(grad_output_c);
+    auto dy_desc = get_cached_tensor_desc(grad_output_c);
     
     Tensor grad_bias = Tensor::empty({grad_output_c.size(1)}, grad_output_c.dtype(), grad_output_c.device());
     
-    TensorDesc db_desc;
     Tensor grad_bias_reshaped = grad_bias.reshape({1, grad_bias.size(0), 1, 1});
-    db_desc.set(grad_bias_reshaped);
+    auto db_desc = get_cached_tensor_desc(grad_bias_reshaped);
     
     float alpha = 1.0f, beta = 0.0f;
     double alpha_d = 1.0, beta_d = 0.0;
@@ -1238,7 +1345,7 @@ Tensor conv2d_grad_bias_cuda(const Tensor& grad_output, const Tensor& input, con
         alpha_p = &alpha_d; beta_p = &beta_d;
     }
     
-    CUDNN_CHECK(cudnnConvolutionBackwardBias(handle, alpha_p, dy_desc, grad_output_c.data_ptr(), beta_p, db_desc, grad_bias.data_ptr()));
+    CUDNN_CHECK(cudnnConvolutionBackwardBias(handle, alpha_p, *dy_desc, grad_output_c.data_ptr(), beta_p, *db_desc, grad_bias.data_ptr()));
     
     return grad_bias;
 #else
