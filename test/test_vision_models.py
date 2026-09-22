@@ -49,7 +49,7 @@ def test_s3d():
 def test_mvit_models(name):
     # Fixed-size positional encoding: the builder's spatial/temporal sizes must
     # match the forwarded clip.
-    model = _video_builder(name)(spatial_size=(56, 56), temporal_size=4)().eval()
+    model = _video_builder(name)(spatial_size=(56, 56), temporal_size=4).eval()
     out = model(tensorplay.randn(1, 3, 4, 56, 56))
     assert tuple(out.shape) == (1, 400)
 
