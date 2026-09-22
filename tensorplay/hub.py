@@ -1,15 +1,22 @@
+from __future__ import annotations
+
+import contextlib
 import hashlib
+import json
 import os
 import re
-from types import ModuleType
 import logging
 import shutil
 import sys
 import time
 import uuid
+import warnings
+import zipfile
 from pathlib import Path
+from types import ModuleType
 from typing import Optional, Union
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 try:
@@ -17,40 +24,58 @@ try:
 except ImportError:
     tqdm = None
 
-__all__ = ["get_dir", "set_dir", "download_url_to_file"]
+__all__ = [
+    "download_url_to_file",
+    "get_dir",
+    "help",
+    "list",
+    "load",
+    "load_state_dict",
+    "load_state_dict_from_url",
+    "load_model",
+    "set_dir",
+    "snapshot_download",
+    "list_entrypoints",
+]
 
 logger = logging.getLogger(__name__)
 
-# Cache Directory Management
-DEFAULT_CACHE_DIR: Path = Path.home() / ".cache" / "tensorplay"
-if not DEFAULT_CACHE_DIR.exists():
-    try:
-        DEFAULT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        # Fallback to a local directory if home is not writable
-        DEFAULT_CACHE_DIR = Path("utils").resolve() / ".tensorplay_cache"
-        DEFAULT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# Cache directory resolution: the hub tree lives under $TENSORPLAY_HOME, or
+# under $XDG_CACHE_HOME/tensorplay, or ~/.cache/tensorplay when neither is set.
+ENV_HOME = "TENSORPLAY_HOME"
+ENV_XDG_CACHE_HOME = "XDG_CACHE_HOME"
+ENV_GITHUB_TOKEN = "GITHUB_TOKEN"
+
+VAR_DEPENDENCY = "dependencies"
+MODULE_HUBCONF = "hubconf.py"
+HASH_REGEX = re.compile(r"-([a-f0-9]*)\.")
+
+# Matches checkpoint URLs pointing directly at a weight file.
+_WEIGHT_URL_RE = re.compile(r"^https?://.*\.(pth|pt|ckpt|safetensors|mst)([?#].*)?$", re.I)
+
+# Repositories owned by these accounts are trusted without prompting. Any other
+# owner needs explicit acknowledgement on first download.
+_TRUSTED_REPO_OWNERS: tuple[str, ...] = ()
 
 _hub_dir: Optional[Path] = None
 
-# Home of the cache tree: $TENSORPLAY_HOME, falling back to
-# $XDG_CACHE_HOME/tensorplay, then ~/.cache/tensorplay.
-_ENV_HOME = "TENSORPLAY_HOME"
-_ENV_XDG_CACHE_HOME = "XDG_CACHE_HOME"
-
-def _get_torch_home() -> Path:
-    env_val = os.getenv(_ENV_HOME)
-    if env_val:
-        return Path(env_val).expanduser().resolve()
-    xdg = os.getenv(_ENV_XDG_CACHE_HOME)
-    base = Path(xdg).expanduser() if xdg else Path.home() / ".cache"
-    return base / "tensorplay"
 
 def get_dir() -> Path:
     """Get the TensorPlay Hub cache directory used for storing downloaded models & weights."""
     if _hub_dir is not None:
         return _hub_dir
-    return DEFAULT_CACHE_DIR / "hub"
+    env_home = os.getenv(ENV_HOME)
+    if env_home:
+        base = Path(env_home).expanduser()
+    else:
+        xdg = os.getenv(ENV_XDG_CACHE_HOME)
+        base = (
+            Path(xdg).expanduser() / "tensorplay"
+            if xdg
+            else Path.home() / ".cache" / "tensorplay"
+        )
+    return base / "hub"
+
 
 def set_dir(d: Union[str, Path]) -> None:
     r"""
@@ -62,8 +87,7 @@ def set_dir(d: Union[str, Path]) -> None:
     if not isinstance(d, (str, Path)):
         raise TypeError(f"Expected directory path to be str or Path, but got {type(d).__name__}.")
     global _hub_dir
-    _hub_dir = Path(d).expanduser().resolve()
-    _hub_dir.mkdir(parents=True, exist_ok=True)
+    _hub_dir = Path(d).expanduser()
 
 # Download Utility
 DEFAULT_RETRY_DELAY : float = 1.0
@@ -300,195 +324,412 @@ def download_url_to_file(
 
 
 # ---------------------------------------------------------------------------
-#
-#   tp.hub.load_state_dict("org/model", "weights.mst")                 # mega
-#   tp.hub.load_model("org/model", model_class="...resnet50")          # mega
-#   sd = tp.hub.load_state_dict(
-#       source="github")                                               # url
-#
-# then invoke the requested entrypoint.
+# Repository resolution, caching, trust and hubconf loading
 # ---------------------------------------------------------------------------
 
-__all__ += [
-    "load_state_dict",
-    "load_model",
-    "snapshot_download",
-    "load",
-    "list_entrypoints",
-    "load_state_dict_from_url",
-]
 
-_WEIGHT_URL_RE = re.compile(r"^https?://.*\.(pth|pt|ckpt|safetensors|mst)([?#].*)?$", re.I)
+def _parse_repo_info(github: str) -> tuple[str, str, str | None]:
+    """Split 'owner/name[:ref]' into its parts, defaulting the ref to main/master."""
+    if ":" in github:
+        repo_info, ref = github.split(":", 1)
+    else:
+        repo_info, ref = github, None
+    if "/" not in repo_info:
+        raise ValueError(f"Invalid repo identifier {github!r}; expected 'owner/name[:ref]'")
+    repo_owner, repo_name = repo_info.split("/", 1)
 
-
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-
-class _LazyAlias(ModuleType):
-    """Module placeholder whose attribute access proxies to ``target``."""
-
-    def __init__(self, name: str, target):
-        super().__init__(name)
-        self._target = target
-
-    def __getattr__(self, item):
-        return getattr(self._target, item)
-
-
-class torch_hub_alias:
-    """
-
-    Restores the previous ``sys.modules`` entries on exit.
-    """
-
-    def __init__(self):
-        self._saved = {}
-
-    def _aliases(self) -> dict:
-        import tensorplay
-        import tensorplay.nn
-
-        hub_shim = ModuleType("tensorplay.hub.shim")
-        hub_shim.download_url_to_file = download_url_to_file
-        hub_shim.get_dir = get_dir
-        hub_shim.set_dir = set_dir
-        hub_shim._get_torch_home = lambda: str(get_dir())
-
-        utils_shim = ModuleType("tensorplay.utils.shim")
-        from tensorplay.utils import checkpoint as _cp  # noqa: F401
-        utils_shim.checkpoint = _cp
-
-        graph_mod = _import_optional("tensorplay.graph")
-
-        return {
-            "torch": tensorplay,
-            "torch.nn": tensorplay.nn,
-            "torch.nn.functional": tensorplay.nn.functional,
-            "torch.nn.init": tensorplay.nn.init,
-            "torch.Tensor": type(tensorplay.Tensor([0.0])) if False else None,
-            "torch.hub": hub_shim,
-            "torch.utils": utils_shim,
-            "torch.utils.checkpoint": _cp,
-            "torch.fx": graph_mod,
-            "torchvision": _import_optional("tensorplay.vision"),
-            "torchvision.models": _import_optional("tensorplay.vision.models"),
-            "torchvision.transforms": _import_optional("tensorplay.vision.transforms"),
-            "torchvision.datasets": _import_optional("tensorplay.vision.datasets"),
-            "torchvision.io": _import_optional("tensorplay.vision.io"),
-        }
-
-    def __enter__(self):
-        for name, target in self._aliases().items():
-            if target is None:
-                continue
-            self._saved[name] = sys.modules.get(name)
-            if isinstance(target, ModuleType):
-                sys.modules[name] = target
-            else:
-                sys.modules[name] = _LazyAlias(name, target)
-        return self
-
-    def __exit__(self, *exc):
-        for name, prev in self._saved.items():
-            if prev is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = prev
-        return False
+    if ref is None:
+        # Default branch: main when it exists, otherwise master.
+        try:
+            with urlopen(f"https://github.com/{repo_owner}/{repo_name}/tree/main/"):
+                ref = "main"
+        except HTTPError as e:
+            if e.code != 404:
+                raise
+            ref = "master"
+        except URLError as e:
+            # Offline: fall back to whatever branch is already in the cache.
+            for possible_ref in ("main", "master"):
+                if (get_dir() / f"{repo_owner}_{repo_name}_{possible_ref}").exists():
+                    ref = possible_ref
+                    break
+            if ref is None:
+                raise RuntimeError(
+                    "No internet connection and the repo was not found in the "
+                    f"cache ({get_dir()})"
+                ) from e
+    return repo_owner, repo_name, ref
 
 
-def _import_optional(name: str):
-    import importlib
+def _read_url(request: Request) -> str:
+    with urlopen(request) as r:
+        return r.read().decode(r.headers.get_content_charset("utf-8"))
 
+
+def _ref_exists_in_repo(repo_owner: str, repo_name: str, ref: str) -> bool:
+    # The ref must belong to the repository owner; a fork could otherwise smuggle
+    # code in under a trusted owner's ref.
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    token = os.environ.get(ENV_GITHUB_TOKEN)
+    if token is not None:
+        headers["Authorization"] = f"token {token}"
+    for url_prefix in (
+        f"https://api.github.com/repos/{repo_owner}/{repo_name}/branches",
+        f"https://api.github.com/repos/{repo_owner}/{repo_name}/tags",
+    ):
+        page = 0
+        while True:
+            page += 1
+            url = Request(f"{url_prefix}?per_page=100&page={page}", headers=headers)
+            try:
+                response = json.loads(_read_url(url))
+            except HTTPError:
+                # The token may simply lack permissions; retry without it.
+                headers.pop("Authorization", None)
+                response = json.loads(_read_url(url))
+            if not response:
+                break
+            for br in response:
+                if br["name"] == ref or br["commit"]["sha"].startswith(ref):
+                    return True
+    return False
+
+
+def _validate_ref(repo_owner: str, repo_name: str, ref: str) -> None:
+    if not _ref_exists_in_repo(repo_owner, repo_name, ref):
+        raise ValueError(
+            f"Cannot find {ref} in https://github.com/{repo_owner}/{repo_name}. "
+            "If it is a commit from a forked repo, call load() with the fork directly "
+            "and pass skip_validation=True."
+        )
+
+
+def _check_repo_is_trusted(repo_owner: str, repo_name: str, owner_name_branch: str,
+                           trust_repo) -> None:
+    hub_dir = get_dir()
+    filepath = hub_dir / "trusted_list"
+
+    if not filepath.exists():
+        filepath.touch()
+    trusted_repos = tuple(line.strip() for line in filepath.read_text().splitlines())
+
+    # Repos already present in the cache count as trusted: they were downloaded
+    # on purpose previously.
+    trusted_legacy = {d.name for d in hub_dir.iterdir() if d.is_dir()}
+
+    owner_name = f"{repo_owner}_{repo_name}"
+    is_trusted = (
+        owner_name in trusted_repos
+        or owner_name_branch in trusted_legacy
+        or repo_owner in _TRUSTED_REPO_OWNERS
+    )
+
+    if (trust_repo is False) or (trust_repo == "check" and not is_trusted):
+        response = input(
+            f"The repository {owner_name} is not on the trusted list and cannot be "
+            "downloaded. Do you trust this repository and wish to add it to the "
+            "trusted list of repositories (y/N)?"
+        )
+        if response.lower() not in ("y", "yes"):
+            raise RuntimeError("Untrusted repository.")
+        is_trusted = True
+
+    if trust_repo is True and not is_trusted:
+        with open(filepath, "a") as f:
+            f.write(owner_name + "\n")
+
+
+def _git_archive_link(repo_owner: str, repo_name: str, ref: str) -> str:
+    return f"https://github.com/{repo_owner}/{repo_name}/zipball/{ref}"
+
+
+def _safe_extract_zip(zip_file, extract_to):
+    """Extract an archive, rejecting entries that escape the target directory."""
+    extract_to = Path(extract_to).resolve(strict=False)
+
+    for member in zip_file.infolist():
+        filename = os.path.normpath(member.filename)
+
+        if filename.startswith(("/", "\\")):
+            raise ValueError(f"Archive entry has absolute path: {member.filename}")
+        if len(filename) >= 2 and filename[1] == ":" and filename[0].isalpha():
+            raise ValueError(f"Archive entry has absolute path: {member.filename}")
+        if ".." in re.split(r"[/\\]", filename):
+            raise ValueError(f"Archive entry contains directory traversal: {member.filename}")
+
+        out = (extract_to / filename).resolve(strict=False)
+        if not out.is_relative_to(extract_to):
+            raise ValueError(f"Archive entry escapes target directory: {member.filename}")
+
+        zip_file.extract(member, extract_to)
+
+
+def _get_cache_or_reload(
+    github: str,
+    force_reload: bool,
+    trust_repo,
+    verbose: bool = True,
+    skip_validation: bool = False,
+) -> Path:
+    """Download (or reuse) the repo under the hub cache and return its directory."""
+    hub_dir = get_dir()
+    hub_dir.mkdir(parents=True, exist_ok=True)
+    repo_owner, repo_name, ref = _parse_repo_info(github)
+    normalized_br = ref.replace("/", "_")
+    repo_dir = hub_dir / "_".join([repo_owner, repo_name, normalized_br])
+
+    _check_repo_is_trusted(repo_owner, repo_name, repo_dir.name, trust_repo)
+
+    if (not force_reload) and repo_dir.exists():
+        if verbose:
+            print(f"Using cache found in {repo_dir}", file=sys.stderr)
+        return repo_dir
+
+    if not skip_validation:
+        _validate_ref(repo_owner, repo_name, ref)
+
+    cached_file = hub_dir / f"{normalized_br}.zip"
+    cached_file.unlink(missing_ok=True)
+
+    url = _git_archive_link(repo_owner, repo_name, ref)
     try:
-        return importlib.import_module(name)
-    except ImportError:
-        mod = ModuleType(name)
-        return mod
+        print(f'Downloading: "{url}" to {cached_file}')
+        download_url_to_file(url, str(cached_file), progress=False)
+    except HTTPError as err:
+        if err.code != 300:
+            raise
+        # A 300 (Multiple Choices) usually means the ref names both a tag and a
+        # branch. Follow git's convention: assume the branch.
+        warnings.warn(
+            f"The ref {ref} is ambiguous: it may be both a tag and a branch. "
+            "Assuming it is a branch; pass refs/heads/<ref> or refs/tags/<ref> "
+            "to be explicit (may require skip_validation=True).",
+            stacklevel=2,
+        )
+        url = _git_archive_link(repo_owner, repo_name, f"refs/heads/{ref}")
+        download_url_to_file(url, str(cached_file), progress=False)
+
+    with zipfile.ZipFile(cached_file) as zf:
+        # The archive's first entry is the top-level directory (typically
+        # 'repo-<sha>/'); derive it from the first path component so archives
+        # without an explicit directory entry also work.
+        extracted_name = zf.infolist()[0].filename.split("/", 1)[0]
+        _safe_extract_zip(zf, hub_dir)
+    cached_file.unlink(missing_ok=True)
+
+    extracted_repo = hub_dir / extracted_name
+    if extracted_repo != repo_dir:
+        if repo_dir.exists():
+            shutil.rmtree(repo_dir)
+        shutil.move(str(extracted_repo), str(repo_dir))
+    return repo_dir
 
 
 # ---------------------------------------------------------------------------
-# GitHub backend
+# hubconf discovery, dependency checks and entrypoint loading
 # ---------------------------------------------------------------------------
 
-def _github_repo_dir(repo_id: str, ref: str | None = None) -> Path:
-    name = repo_id.split("/")[-1]
-    base = get_dir() / "github" / repo_id.replace("/", "_")
-    if base.exists():
-        return base
-    base.mkdir(parents=True, exist_ok=True)
-    cmd = ["git", "clone", "--depth", "1"]
-    url = f"https://github.com/{repo_id}.git"
-    if ref:
-        cmd += ["--branch", ref]
-    cmd += [url, str(base)]
-    import subprocess
 
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"git clone failed for {url}: {proc.stderr.strip()}")
-    return base
+@contextlib.contextmanager
+def _add_to_sys_path(path):
+    sys.path.insert(0, str(path))
+    try:
+        yield
+    finally:
+        sys.path.remove(str(path))
 
 
-def _exec_hubconf(repo_dir: Path):
+def _import_module(name: str, path: str):
     import importlib.util
 
-    conf = repo_dir / "hubconf.py"
-    if not conf.exists():
-        raise RuntimeError(f"{repo_dir} has no hubconf.py")
-    spec = importlib.util.spec_from_file_location("_tensorplay_foreign_hubconf", conf)
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None:
+        raise AssertionError(f"failed to load spec from {path}")
     module = importlib.util.module_from_spec(spec)
-    with torch_hub_alias():
-        spec.loader.exec_module(module)
+    if spec.loader is None:
+        raise AssertionError(f"no loader for {path}")
+    spec.loader.exec_module(module)
     return module
 
 
-def list_entrypoints(repo_id: str, ref: str | None = None) -> list[str]:
-    repo_dir = _github_repo_dir(repo_id, ref)
-    module = _exec_hubconf(repo_dir)
-    deps = {"dependencies", "verbose"}
-    return sorted(n for n in dir(module)
-                  if not n.startswith("_") and n not in deps and callable(getattr(module, n)))
+def _check_module_exists(name: str) -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec(name) is not None
 
 
-def load(repo_id: str, model: str | None = None, *args, ref: str | None = None, **kwargs):
-    """Unified model loader.
+def _check_dependencies(m) -> None:
+    dependencies = getattr(m, VAR_DEPENDENCY, None)
+    if dependencies is not None:
+        missing = [pkg for pkg in dependencies if not _check_module_exists(pkg)]
+        if missing:
+            raise RuntimeError(f"Missing dependencies: {', '.join(missing)}")
 
-    mega:    tp.hub.load("org/repo", filename="weights.mst", model_class=...)
 
-    Dispatches on ``source`` exactly like :func:`load_model`; the two-argument
+def _load_entry_from_hubconf(m, model):
+    if not isinstance(model, str):
+        raise ValueError("Invalid input: model should be a string of function name")
+    _check_dependencies(m)
+    fn = getattr(m, model, None)
+    if fn is None or not callable(fn):
+        raise RuntimeError(f"Cannot find callable {model} in hubconf")
+    return fn
+
+
+def _load_hub_module(repo_dir: Path):
+    with _add_to_sys_path(repo_dir):
+        return _import_module(MODULE_HUBCONF, str(repo_dir / MODULE_HUBCONF))
+
+
+# ---------------------------------------------------------------------------
+# Public entrypoints
+# ---------------------------------------------------------------------------
+
+
+def list(
+    github,
+    force_reload=False,
+    skip_validation=False,
+    trust_repo="check",
+    verbose=True,
+):
+    """List all callable entrypoints available in the repo specified by ``github``.
+
+    Args:
+        github (str): 'owner/name[:ref]' with an optional ref (tag or branch).
+            If the ref is omitted, the default branch is used (``main`` if it
+            exists, otherwise ``master``).
+        force_reload (bool): discard the cache and force a fresh download.
+        skip_validation (bool): skip the check that the ref belongs to the
+            repository owner.
+        trust_repo (bool or str): ``"check"``, ``True`` or ``False``; how to
+            treat repositories that are not on the trusted list.
+        verbose (bool): mute messages about hitting local caches.
     """
-    repo_dir = _github_repo_dir(repo_id, ref)
-    module = _exec_hubconf(repo_dir)
-    fn = getattr(module, model, None)
-    if fn is None:
-        raise RuntimeError(f"'{model}' is not an entrypoint of {repo_id}; "
-                           f"available: {list_entrypoints(repo_id, ref)}")
-    with torch_hub_alias():
-        return fn(*args, **kwargs)
+    repo_dir = _get_cache_or_reload(
+        github, force_reload, trust_repo, verbose=verbose, skip_validation=skip_validation
+    )
+    hub_module = _load_hub_module(repo_dir)
+    return [
+        f
+        for f in dir(hub_module)
+        if callable(getattr(hub_module, f)) and not f.startswith("_")
+    ]
 
 
-def load_state_dict_from_url(url: str, progress: bool = True, check_hash: bool = False,
-                             map_location=None, **kwargs) -> dict:
-    parts = url.rstrip("/").split("/")
-    cached = get_dir() / "checkpoints" / parts[-1]
-    cached.parent.mkdir(parents=True, exist_ok=True)
-    hash_prefix = None
-    if check_hash:
-        m = re.search(r"-([a-f0-9]{8,})\.", parts[-1])
-        hash_prefix = m.group(1) if m else None
-    if not cached.exists():
-        download_url_to_file(url, str(cached), hash_prefix=hash_prefix, progress=progress)
+def help(github, model, force_reload=False, skip_validation=False, trust_repo="check"):
+    """Show the docstring of entrypoint ``model``."""
+    repo_dir = _get_cache_or_reload(
+        github, force_reload, trust_repo, verbose=True, skip_validation=skip_validation
+    )
+    hub_module = _load_hub_module(repo_dir)
+    entry = _load_entry_from_hubconf(hub_module, model)
+    return entry.__doc__
 
-    try:
-        from tensorplay.serialization import archive as ser_torch
-    except ImportError:
-        ser_torch = None
+
+def load(
+    repo_or_dir,
+    model,
+    *args,
+    source="github",
+    trust_repo="check",
+    force_reload=False,
+    verbose=True,
+    skip_validation=False,
+    ref=None,
+    **kwargs,
+):
+    """Load an entrypoint from a GitHub repo or a local directory.
+
+    Args:
+        repo_or_dir (str): with ``source='github'``, 'owner/name[:ref]'; with
+            ``source='local'``, a path to a directory containing ``hubconf.py``.
+        model (str): name of a callable (entrypoint) defined in ``hubconf.py``.
+        source (str): 'github' or 'local'.
+        trust_repo (bool or str): ``"check"``, ``True`` or ``False``; how to
+            treat repositories that are not on the trusted list.
+        force_reload (bool): discard the cache and force a fresh download
+            (no effect with ``source='local'``).
+        verbose (bool): mute messages about hitting local caches.
+        skip_validation (bool): skip the check that the ref belongs to the
+            repository owner.
+        ref (str): optional tag or branch; equivalent to appending ``:ref`` to
+            ``repo_or_dir``.
+    """
+    source = source.lower()
+    if source not in ("github", "local"):
+        raise ValueError(f'Unknown source: "{source}". Allowed values: "github" | "local".')
+
+    if ref is not None:
+        if ":" in repo_or_dir:
+            raise ValueError("ref must not be given when repo_or_dir already contains ':'")
+        repo_or_dir = f"{repo_or_dir}:{ref}"
+
+    if source == "github":
+        repo_or_dir = _get_cache_or_reload(
+            repo_or_dir,
+            force_reload,
+            trust_repo,
+            verbose=verbose,
+            skip_validation=skip_validation,
+        )
+    return _load_local(repo_or_dir, model, *args, **kwargs)
+
+
+def _load_local(hubconf_dir, model, *args, **kwargs):
+    hub_module = _load_hub_module(Path(hubconf_dir))
+    entry = _load_entry_from_hubconf(hub_module, model)
+    return entry(*args, **kwargs)
+
+
+def list_entrypoints(repo_id: str, ref: str | None = None, force_reload: bool = False,
+                     **kwargs) -> list[str]:
+    """Compatibility variant of :func:`list` taking the ref as a separate argument."""
+    github = f"{repo_id}:{ref}" if ref else repo_id
+    return list(github, force_reload=force_reload, **kwargs)
+
+
+def load_state_dict_from_url(
+    url: str,
+    model_dir: Union[str, Path, None] = None,
+    map_location=None,
+    progress: bool = True,
+    check_hash: bool = False,
+    file_name: Optional[str] = None,
+    weights_only: bool = True,
+) -> dict:
+    """Load a serialized object from the given URL, caching it under ``model_dir``.
+
+    Args:
+        url (str): URL of the object to download.
+        model_dir (str | Path | None): directory to cache in; defaults to
+            ``<get_dir()>/checkpoints``.
+        map_location: storage remapping passed to the loader.
+        progress (bool): whether to display a progress bar.
+        check_hash (bool): require the filename to carry a ``-<sha256-prefix>``
+            suffix and verify the file against it.
+        file_name (str | None): destination file name; taken from the URL when
+            not given.
+        weights_only (bool): restrict loading to registered data types; safer
+            for untrusted sources (see ``tensorplay.load``).
+    """
+    if model_dir is None:
+        model_dir = get_dir() / "checkpoints"
+    model_dir = Path(model_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = file_name or os.path.basename(urlparse(url).path)
+    cached_file = model_dir / filename
+    if not cached_file.exists():
+        print(f'Downloading: "{url}" to {cached_file}')
+        hash_prefix = None
+        if check_hash:
+            m = HASH_REGEX.search(filename)
+            hash_prefix = m.group(1) if m else None
+        download_url_to_file(url, str(cached_file), hash_prefix=hash_prefix, progress=progress)
+
     import tensorplay as tp
-
-    if ser_torch is not None:
-        return ser_torch.load(str(cached), map_location=map_location)
-    return tp.load(str(cached), map_location=map_location)
+    return tp.load(str(cached_file), map_location=map_location, weights_only=weights_only)
 
 
 # ---------------------------------------------------------------------------
@@ -536,7 +777,10 @@ def snapshot_download(
             repo_id, local_dir=local_dir, revision=revision, include=include, exclude=exclude
         )
     elif source == "github":
-        return _github_repo_dir(repo_id, ref or revision)
+        github = f"{repo_id}:{ref or revision}" if (ref or revision) else repo_id
+        return _get_cache_or_reload(
+            github, force_reload=False, trust_repo=True, verbose=False, skip_validation=True
+        )
     raise ValueError(f"unknown source '{source}' (expected 'mega' or 'github')")
 
 
@@ -567,8 +811,7 @@ def load_state_dict(
         # github repo holding a bare state-dict entrypoint is rare; route
         # through the entrypoint loader when a filename/entrypoint is given.
         if filename is not None:
-            obj = load(repo_or_url, filename, ref=ref, **load_kwargs)
-            return obj
+            return load(repo_or_url, filename, ref=ref, trust_repo=True, **load_kwargs)
         raise ValueError("github source needs a full checkpoint URL or an entrypoint name")
 
     client = _mega_client(endpoint, token)
@@ -615,7 +858,7 @@ def load_model(
         if model is not None or model_class is not None or model_kwargs is not None:
             raise ValueError("github source resolves architecture via the repo entrypoint")
         entry = filename if filename is not None else repo_or_url.rsplit("/", 1)[-1]
-        return load(repo_or_url, entry, ref=ref, **load_kwargs)
+        return load(repo_or_url, entry, ref=ref, trust_repo=True, **load_kwargs)
 
     client = _mega_client(endpoint, token)
     cache_root = get_dir() / "mega" / repo_or_url

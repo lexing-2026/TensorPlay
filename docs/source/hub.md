@@ -9,7 +9,7 @@ TensorPlay Hub is a pre-trained model repository designed to facilitate research
 
 ## Publishing models
 
-TensorPlay Hub supports publishing pre-trained models(model definitions and pre-trained weights)
+TensorPlay Hub supports publishing pre-trained models (model definitions and pre-trained weights)
 to a GitHub repository by adding a simple `hubconf.py` file;
 `hubconf.py` can have multiple entrypoints. Each entrypoint is defined as a python function
 (example: a pre-trained model you want to publish).
@@ -21,24 +21,22 @@ to a GitHub repository by adding a simple `hubconf.py` file;
 
 ### How to implement an entrypoint?
 
-Here is a code snippet specifies an entrypoint for `resnet18` model if we expand
+Here is a code snippet specifies an entrypoint for `alexnet` model if we expand
 the implementation in `tensorplay/vision/hubconf.py`.
 In most case importing the right function in `hubconf.py` is sufficient. Here we
 just want to use the expanded version as an example to show how it works.
-You can see the full script in
-[tensorplay/vision repo](https://github.com/tensorplay/vision/blob/master/hubconf.py)
 ```python
   dependencies = ['tensorplay']
-  from tensorplay.vision.models.resnet import resnet18 as _resnet18
+  from tensorplay.vision.models.alexnet import alexnet as _alexnet
 
-  # resnet18 is the name of entrypoint
-  def resnet18(pretrained=False, **kwargs):
+  # alexnet is the name of entrypoint
+  def alexnet(pretrained=False, **kwargs):
       """ # This docstring shows up in hub.help()
-      Resnet18 model
+      Alexnet model
       pretrained (bool): kwargs, load pretrained weights into the model
       """
       # Call the model, load pretrained weights
-      model = _resnet18(pretrained=pretrained, **kwargs)
+      model = _alexnet(pretrained=pretrained, **kwargs)
       return model
 ```
 - `dependencies` variable is a **list** of package names required to **load** the model. Note this might
@@ -51,7 +49,7 @@ You can see the full script in
 - Pretrained weights can either be stored locally in the GitHub repo, or loadable by
   {func}`tensorplay.hub.load_state_dict_from_url()`. If less than 2GB, it's recommended to attach it to a [project release](https://help.github.com/en/articles/distributing-large-binaries)
   and use the url from the release.
-  In the example above `tensorplay.vision.models.resnet.resnet18` handles `pretrained`, alternatively you can put the following logic in the entrypoint definition.
+  In the example above `tensorplay.vision.models.alexnet.alexnet` handles `pretrained`, alternatively you can put the following logic in the entrypoint definition.
 ```python
   if pretrained:
       # For checkpoint saved in local GitHub repo, e.g. <RELATIVE_PATH_TO_CHECKPOINT>=weights/save.pth
@@ -61,7 +59,7 @@ You can see the full script in
       model.load_state_dict(state_dict)
 
       # For checkpoint saved elsewhere
-      checkpoint = 'https://download.tensorplay.cn/models/resnet18-5c106cde.pth'
+      checkpoint = 'https://download.tensorplay.cn/models/alexnet-owt-7be5be79.pth'
       model.load_state_dict(tensorplay.hub.load_state_dict_from_url(checkpoint, progress=False))
 ```
 
@@ -88,11 +86,17 @@ To help users explore without referring to documentation back and forth, we stro
 recommend repo owners make function help messages clear and succinct. It's also helpful
 to include a minimal working example.
 
+### Loading from a local directory
+
+Besides downloading from GitHub, {func}`tensorplay.hub.load()` accepts
+`source='local'` to load an entrypoint from a directory on disk that contains a
+`hubconf.py`, which is handy while developing a hub repository.
+
 ### Where are my downloaded models saved?
 
 The locations are used in the order of
 - Calling `hub.set_dir(<PATH_TO_HUB_DIR>)`
-- `$TORCH_HOME/hub`, if environment variable `TORCH_HOME` is set.
+- `$TENSORPLAY_HOME/hub`, if environment variable `TENSORPLAY_HOME` is set.
 - `$XDG_CACHE_HOME/tensorplay/hub`, if environment variable `XDG_CACHE_HOME` is set.
 - `~/.cache/tensorplay/hub`
 
@@ -104,6 +108,15 @@ Users can force a reload by calling `hub.load(..., force_reload=True)`. This wil
 the existing GitHub folder and downloaded weights, reinitialize a fresh download. This is useful
 when updates are published to the same branch, users can keep up with the latest release.
 
+### Trust and validation
+
+Loading a repository executes its `hubconf.py`, so the code must be treated as
+untrusted. By default the ref (branch/tag) is checked against the branches and
+tags of the repository owner (set `GITHUB_TOKEN` to raise the API rate limit),
+and first-time downloads from unknown owners prompt for acknowledgement. Pass
+`trust_repo=True` to skip the prompt, or `skip_validation=True` to skip the ref
+check (needed e.g. for refs that only exist on a fork).
+
 ### Known limitations:
 
 The hub works by importing the package as if it was installed. There are some side effects
@@ -112,10 +125,6 @@ introduced by importing in Python. For example, you can see new items in Python 
 This also means that you may have import errors when importing different models
 from different repos, if the repos have the same sub-package names (typically, a
 `model` subpackage). A workaround for these kinds of import errors is to
-remove the offending sub-package from the `sys.modules` dict; more details can
-be found in [this GitHub issue](https://github.com/tensorplay/hub/issues/243#issuecomment-942403391).
-A known limitation that is worth mentioning here: users **CANNOT** load two different branches of
-the same repo in the **same python process**. It's just like installing two packages with the
-same name in Python, which is not good. Cache might join the party and give you surprises if you
-actually try that. Of course it's totally fine to load them in separate processes.
-
+remove the offending sub-package from the `sys.modules` dict. Loading two repos
+in the same python process is fine as long as their sub-package names do not
+collide; separate processes are always safe.
