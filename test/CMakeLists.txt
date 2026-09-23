@@ -2,6 +2,12 @@
 find_package(GTest REQUIRED)
 find_package(Threads REQUIRED)
 
+add_executable(test_intrusive_ptr
+    cpp/test_intrusive_ptr.cpp)
+target_link_libraries(test_intrusive_ptr
+    PRIVATE p10 GTest::gtest Threads::Threads)
+add_test(NAME test_intrusive_ptr COMMAND test_intrusive_ptr)
+
 add_executable(test_process_group_gloo
     cpp/distributed/test_process_group_gloo.cpp)
 target_compile_definitions(test_process_group_gloo

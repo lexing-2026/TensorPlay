@@ -129,7 +129,7 @@ private:
 // fp32 source invalidates its cached low-precision copy (this is what makes
 // ------------------------------------------------------------------
 
-using val_type = std::pair<std::weak_ptr<TensorImpl>, Tensor>;
+using val_type = std::pair<weak_intrusive_ptr<TensorImpl>, Tensor>;
 
 P10_API Tensor cache_lookup(const TensorImpl* key);
 P10_API void cache_store(TensorImpl* key, const Tensor& source, const Tensor& casted);

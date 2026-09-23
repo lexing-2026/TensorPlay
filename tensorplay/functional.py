@@ -3660,61 +3660,41 @@ def fft_irfft_backward(grad, input, dim, norm):
             return _captured
     return _C.fft_irfft_backward(grad, input, dim, norm)
 
-def hann_window(window_length, periodic=True, dtype=None, *, layout=None, device=None, pin_memory=None):
+def hann_window(window_length, periodic=True, dtype=None):
     if _capturing():
-        _captured = _capture_call(hann_window, (window_length, periodic, dtype), {'layout': layout, 'device': device, 'pin_memory': pin_memory})
+        _captured = _capture_call(hann_window, (window_length, periodic, dtype), {})
         if _captured is not None:
             return _captured
-    if layout is None and device is None and pin_memory is None:
-        if dtype is None:
+    if dtype is None:
             dtype = DType.undefined
-        return _C.hann_window(window_length, periodic, dtype)
-    if layout is not None:
-        layout = int(layout)
-    dtype_arg = dtype if dtype is not None and dtype != DType.undefined else None
-    return _C.hann_window(window_length, periodic, dtype=dtype_arg, layout=layout, device=device, pin_memory=pin_memory)
+    return _C.hann_window(window_length, periodic, dtype)
 
-def hamming_window(window_length, periodic=True, alpha=0.54, beta=0.46, dtype=None, *, layout=None, device=None, pin_memory=None):
+def hamming_window(window_length, periodic=True, alpha=0.54, beta=0.46, dtype=None):
     if _capturing():
-        _captured = _capture_call(hamming_window, (window_length, periodic, alpha, beta, dtype), {'layout': layout, 'device': device, 'pin_memory': pin_memory})
+        _captured = _capture_call(hamming_window, (window_length, periodic, alpha, beta, dtype), {})
         if _captured is not None:
             return _captured
-    if layout is None and device is None and pin_memory is None:
-        if dtype is None:
+    if dtype is None:
             dtype = DType.undefined
-        return _C.hamming_window(window_length, periodic, alpha, beta, dtype)
-    if layout is not None:
-        layout = int(layout)
-    dtype_arg = dtype if dtype is not None and dtype != DType.undefined else None
-    return _C.hamming_window(window_length, periodic, alpha, beta, dtype=dtype_arg, layout=layout, device=device, pin_memory=pin_memory)
+    return _C.hamming_window(window_length, periodic, alpha, beta, dtype)
 
-def bartlett_window(window_length, periodic=True, dtype=None, *, layout=None, device=None, pin_memory=None):
+def bartlett_window(window_length, periodic=True, dtype=None):
     if _capturing():
-        _captured = _capture_call(bartlett_window, (window_length, periodic, dtype), {'layout': layout, 'device': device, 'pin_memory': pin_memory})
+        _captured = _capture_call(bartlett_window, (window_length, periodic, dtype), {})
         if _captured is not None:
             return _captured
-    if layout is None and device is None and pin_memory is None:
-        if dtype is None:
+    if dtype is None:
             dtype = DType.undefined
-        return _C.bartlett_window(window_length, periodic, dtype)
-    if layout is not None:
-        layout = int(layout)
-    dtype_arg = dtype if dtype is not None and dtype != DType.undefined else None
-    return _C.bartlett_window(window_length, periodic, dtype=dtype_arg, layout=layout, device=device, pin_memory=pin_memory)
+    return _C.bartlett_window(window_length, periodic, dtype)
 
-def blackman_window(window_length, periodic=True, dtype=None, *, layout=None, device=None, pin_memory=None):
+def blackman_window(window_length, periodic=True, dtype=None):
     if _capturing():
-        _captured = _capture_call(blackman_window, (window_length, periodic, dtype), {'layout': layout, 'device': device, 'pin_memory': pin_memory})
+        _captured = _capture_call(blackman_window, (window_length, periodic, dtype), {})
         if _captured is not None:
             return _captured
-    if layout is None and device is None and pin_memory is None:
-        if dtype is None:
+    if dtype is None:
             dtype = DType.undefined
-        return _C.blackman_window(window_length, periodic, dtype)
-    if layout is not None:
-        layout = int(layout)
-    dtype_arg = dtype if dtype is not None and dtype != DType.undefined else None
-    return _C.blackman_window(window_length, periodic, dtype=dtype_arg, layout=layout, device=device, pin_memory=pin_memory)
+    return _C.blackman_window(window_length, periodic, dtype)
 
 def stft(input, n_fft, hop_length=None, win_length=None, window=None, center=True, pad_mode='reflect', normalized=False, onesided=True, return_complex=True):
     if _capturing():

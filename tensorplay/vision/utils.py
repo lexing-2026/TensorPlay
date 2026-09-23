@@ -5,6 +5,7 @@ conversion helper wraps the required PIL interoperation.
 """
 
 import logging
+import math
 import pathlib
 from types import FunctionType
 from typing import Any, BinaryIO, Optional, Union

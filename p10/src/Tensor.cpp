@@ -109,19 +109,19 @@ std::ostream& operator<<(std::ostream& os, const Size& s) {
 }
 
 Tensor::Tensor(const std::vector<int64_t>& sizes, DType dtype, const Device& device) {
-    impl_ = std::make_shared<TensorImpl>(sizes, dtype, device);
+    impl_ = make_intrusive<TensorImpl>(sizes, dtype, device);
 }
 
 Tensor::Tensor(Storage storage, const std::vector<int64_t>& sizes, DType dtype) {
-    impl_ = std::make_shared<TensorImpl>(storage, sizes, dtype);
+    impl_ = make_intrusive<TensorImpl>(storage, sizes, dtype);
 }
 
 Tensor::Tensor(Storage storage, const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides, DType dtype, size_t storage_offset) {
-    impl_ = std::make_shared<TensorImpl>(storage, sizes, strides, dtype, storage_offset);
+    impl_ = make_intrusive<TensorImpl>(storage, sizes, strides, dtype, storage_offset);
 }
 
 Tensor::Tensor(const std::vector<int64_t>& sizes, Scalar fill_value, const Device& device) {
-    impl_ = std::make_shared<TensorImpl>(sizes, fill_value.dtype(), device);
+    impl_ = make_intrusive<TensorImpl>(sizes, fill_value.dtype(), device);
     fill_(fill_value);
 }
 
@@ -176,7 +176,7 @@ Tensor Tensor::make_sparse_coo_tensor(const Tensor& indices,
     // Construct only the logical TensorImpl.  A sparse tensor must not first
     // allocate storage for its full logical dense shape; large embeddings
     // would otherwise briefly materialize the entire parameter.
-    Tensor result(std::make_shared<TensorImpl>(
+    Tensor result(make_intrusive<TensorImpl>(
         size, values.dtype(), values.device(), /*allocate_storage=*/false));
     result.unsafeGetTensorImpl()->set_sparse_state(
         canonical_indices.unsafeGetTensorImpl(),
@@ -315,7 +315,7 @@ Tensor Tensor::make_sparse_compressed_tensor(
     }
 
     // Same rationale as the COO constructor: install logical metadata only.
-    Tensor result(std::make_shared<TensorImpl>(
+    Tensor result(make_intrusive<TensorImpl>(
         size, values.dtype(), values.device(), /*allocate_storage=*/false));
     result.unsafeGetTensorImpl()->set_sparse_compressed_state(
         crow.unsafeGetTensorImpl(),
@@ -378,6 +378,14 @@ Size Tensor::shape() const {
                  "dense size does not exist (use _nested_tensor_size())");
     }
     return impl_ ? Size(impl_->sizes()) : Size();
+}
+IntArrayRef Tensor::sizes() const {
+    if (impl_ && impl_->is_nested()) {
+        TP_THROW(RuntimeError,
+                 "nested tensors carry a size per constituent; a single "
+                 "dense size does not exist (use _nested_tensor_size())");
+    }
+    return impl_ ? impl_->sizes() : IntArrayRef();
 }
 std::vector<int64_t> Tensor::strides() const {
     if (impl_ && impl_->is_nested()) {
@@ -462,7 +470,7 @@ Tensor Tensor::detach() const {
         return detail::redispatch_detach_method(*this);
     }
     if (!impl_) return Tensor();
-    return Tensor(std::make_shared<TensorImpl>(*impl_));
+    return Tensor(make_intrusive<TensorImpl>(*impl_));
 }
 
 bool Tensor::is_pinned() const {
@@ -1285,7 +1293,7 @@ Tensor clone_impl(const Tensor& self, std::optional<MemoryFormat> memory_format)
     }
     Storage storage(static_cast<size_t>(self.numel()) * self.itemsize(),
                     getAllocator(self.device().type()), self.device());
-    auto out_impl = std::make_shared<TensorImpl>(storage, sizes_v, strides, self.dtype(), 0);
+    auto out_impl = make_intrusive<TensorImpl>(storage, sizes_v, strides, self.dtype(), 0);
     if (format == MemoryFormat::Preserve) {
         // Apply TensorImpl::set_sizes_and_strides layout tagging so a
         // preserved channels-last input clones into a channels-last tensor.
@@ -1347,7 +1355,7 @@ Tensor contiguous_impl(const Tensor& self, int64_t memory_format_raw) {
     std::vector<int64_t> strides = get_strides_for(sizes_v, format);
     Storage storage(static_cast<size_t>(self.numel()) * self.itemsize(),
                     getAllocator(self.device().type()), self.device());
-    auto out_impl = std::make_shared<TensorImpl>(storage, sizes_v, strides, self.dtype(), 0);
+    auto out_impl = make_intrusive<TensorImpl>(storage, sizes_v, strides, self.dtype(), 0);
     out_impl->set_memory_format(format);
     if (self.unsafeGetTensorImpl()->has_quantizer()) {
         out_impl->set_quantizer(self.unsafeGetTensorImpl()->quantizer());

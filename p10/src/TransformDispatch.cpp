@@ -180,7 +180,7 @@ Tensor make_batched(const Tensor& value, int64_t dim, int64_t level) {
         logical_sizes.push_back(sizes[static_cast<size_t>(d)]);
         logical_strides.push_back(strides[static_cast<size_t>(d)]);
     }
-    auto impl = std::make_shared<TensorImpl>(value.unsafeGetTensorImpl(),
+    auto impl = make_intrusive<TensorImpl>(value.unsafeGetTensorImpl(),
                                              logical_sizes,
                                              logical_strides);
     impl->set_transform_value(value.unsafeGetTensorImpl(), bdim, level);

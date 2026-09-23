@@ -332,7 +332,7 @@ static Tensor from_dlpack(py::object o) {
     tensorplay::Storage storage(std::move(ptr), nbytes); // Using wrapper constructor
     
     // Create Tensor directly with strides (Optimization: Avoid as_strided overhead)
-    auto impl = std::make_shared<tensorplay::TensorImpl>(storage, shape, strides, dtype);
+    auto impl = make_intrusive<tensorplay::TensorImpl>(storage, shape, strides, dtype);
     return Tensor(impl);
 }
 
@@ -419,7 +419,7 @@ Tensor create_tensor(py::object data, std::optional<DType> dtype, std::optional<
              tensorplay::Storage storage(std::move(ptr), nbytes);
              
              // Create Tensor with specific strides directly (Optimization: Avoid as_strided overhead)
-            auto impl = std::make_shared<tensorplay::TensorImpl>(storage, shape, strides, final_dtype);
+            auto impl = make_intrusive<tensorplay::TensorImpl>(storage, shape, strides, final_dtype);
             t = Tensor(impl);
             
         } else {
@@ -1282,7 +1282,7 @@ Tensor tensor_from_buffer(py::object buffer, DType dtype, int64_t count,
 
     std::vector<int64_t> shape{static_cast<int64_t>(actual_count)};
     std::vector<int64_t> strides{1};
-    auto impl = std::make_shared<tensorplay::TensorImpl>(storage, shape, strides, dtype);
+    auto impl = make_intrusive<tensorplay::TensorImpl>(storage, shape, strides, dtype);
     return Tensor(impl);
 }
 

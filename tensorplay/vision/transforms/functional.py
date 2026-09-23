@@ -151,7 +151,7 @@ def to_tensor(pic: Union[PILImage, np.ndarray]) -> Tensor:
 
         img = tensorplay.from_numpy(pic.transpose((2, 0, 1))).contiguous()
         # backward compatibility
-        if isinstance(img, tensorplay.ByteTensor):
+        if img.dtype == tensorplay.uint8:
             return img.to(dtype=default_float_dtype).div(255)
         else:
             return img
@@ -170,7 +170,7 @@ def to_tensor(pic: Union[PILImage, np.ndarray]) -> Tensor:
     img = img.view(pic.size[1], pic.size[0], F_pil.get_image_num_channels(pic))
     # put it from HWC to CHW format
     img = img.permute((2, 0, 1)).contiguous()
-    if isinstance(img, tensorplay.ByteTensor):
+    if img.dtype == tensorplay.uint8:
         return img.to(dtype=default_float_dtype).div(255)
     else:
         return img

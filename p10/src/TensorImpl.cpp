@@ -62,7 +62,7 @@ TensorImpl::TensorImpl(Storage storage, const std::vector<int64_t>& sizes, const
     is_contiguous_ = sizes_and_strides_.is_contiguous();
 }
 
-TensorImpl::TensorImpl(std::shared_ptr<TensorImpl> transform_value,
+TensorImpl::TensorImpl(intrusive_ptr<TensorImpl> transform_value,
                        const std::vector<int64_t>& sizes,
                        const std::vector<int64_t>& strides)
     : storage_offset_(0), sizes_and_strides_(sizes, strides),

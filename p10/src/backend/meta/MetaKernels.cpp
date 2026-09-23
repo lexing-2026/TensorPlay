@@ -38,7 +38,7 @@ namespace {
 // Allocation that bypasses the dispatcher: the Tensor factory methods
 // redispatch to the "empty" operator, which resolves back to this backend.
 Tensor empty_meta(std::vector<int64_t> size, DType dtype, const Device& device) {
-    return Tensor(std::make_shared<TensorImpl>(size, dtype, device));
+    return Tensor(make_intrusive<TensorImpl>(size, dtype, device));
 }
 
 Device resolve_device(const std::optional<Device>& device) {

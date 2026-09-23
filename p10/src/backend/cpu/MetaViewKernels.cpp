@@ -31,7 +31,7 @@ Scalar item_cpu(const Tensor& self) {
     if (!self.defined()) {
         TP_THROW(RuntimeError, "Tensor not defined");
     }
-    std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
+    intrusive_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
     if (impl->is_sparse()) {
         TP_THROW(RuntimeError, "item() is not supported for sparse tensors");
     }
@@ -88,7 +88,7 @@ Tensor coalesce_cpu(const Tensor& self) {
         TP_THROW(RuntimeError,
                  "coalesce() is only defined for sparse COO tensors");
     }
-    std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
+    intrusive_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
     if (!impl->is_sparse() || impl->is_sparse_compressed()) {
         TP_THROW(RuntimeError,
                  "coalesce() is only defined for sparse COO tensors");

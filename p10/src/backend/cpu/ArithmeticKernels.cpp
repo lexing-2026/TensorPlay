@@ -446,7 +446,7 @@ template<typename Op, typename MklOp>
 Tensor binary_op_kernel_impl(const Tensor& self, const Tensor& other, Op op, MklOp mkl_op, bool use_mkl_op = false, bool force_float = false) {
     std::vector<int64_t> out_shape;
     try {
-        out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
+        out_shape = broadcast_shapes(self.sizes(), other.sizes());
     } catch (const std::exception& e) {
         std::cout << "DEBUG: broadcast_shapes failed in binary_op_kernel_impl: " << e.what() << std::endl;
         std::cout << "Self shape: ";
@@ -724,7 +724,7 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) 
                  
                  std::vector<int64_t> out_shape;
                  try {
-                     out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
+                     out_shape = broadcast_shapes(self.sizes(), other.sizes());
                  } catch (const std::exception& e) {
                      std::cout << "DEBUG: broadcast_shapes failed in add_kernel (OneDNN): " << e.what() << std::endl;
                      std::cout << "Self shape: ";
@@ -874,7 +874,7 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) 
     }
     #endif
 
-    std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
+    std::vector<int64_t> out_shape = broadcast_shapes(self.sizes(), other.sizes());
     DType result_dtype = native::result_type(self, other);
     if (alpha.isFloatingPoint() && !isFloatingType(result_dtype)) {
         result_dtype = promoteTypes(result_dtype, DType::Float32);
@@ -1297,7 +1297,7 @@ Tensor mul_kernel(const Tensor& self, const Tensor& other) {
 
             if (match) {
                  auto md = std::static_pointer_cast<dnnl::memory::desc>(self_impl->get_onednn_md());
-                 std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
+                 std::vector<int64_t> out_shape = broadcast_shapes(self.sizes(), other.sizes());
                  DType result_dtype = promoteTypes(self.dtype(), other.dtype());
                  Tensor result = Tensor::empty(out_shape, result_dtype, self.device());
 
@@ -1459,7 +1459,7 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
 
             if (match) {
                  auto md = std::static_pointer_cast<dnnl::memory::desc>(self_impl->get_onednn_md());
-                 std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
+                 std::vector<int64_t> out_shape = broadcast_shapes(self.sizes(), other.sizes());
                  DType result_dtype = promoteTypes(self.dtype(), other.dtype());
                  if (result_dtype != DType::Float32) result_dtype = DType::Float32; // Div always produces float
                  Tensor result = Tensor::empty(out_shape, result_dtype, self.device());
@@ -1675,7 +1675,7 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, const Scalar& alph
     }
     std::vector<int64_t> out_shape;
     try {
-        out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
+        out_shape = broadcast_shapes(self.sizes(), other.sizes());
     } catch (const std::exception& e) {
         std::cout << "DEBUG: broadcast_shapes failed in add_inplace_kernel: " << e.what() << std::endl;
         std::cout << "Self shape: ";
@@ -2072,7 +2072,7 @@ Tensor& sub_inplace_kernel(Tensor& self, const Tensor& other, const Scalar& alph
 }
 
 Tensor& mul_inplace_kernel(Tensor& self, const Tensor& other) {
-    std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
+    std::vector<int64_t> out_shape = broadcast_shapes(self.sizes(), other.sizes());
     if (static_cast<std::vector<int64_t>>(self.shape()) != out_shape) TP_THROW(RuntimeError, "mul_: shape mismatch");
 
     #ifdef USE_ONEDNN
@@ -2193,7 +2193,7 @@ Tensor& mul_inplace_kernel(Tensor& self, const Tensor& other) {
 }
 
 Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
-    std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
+    std::vector<int64_t> out_shape = broadcast_shapes(self.sizes(), other.sizes());
     if (static_cast<std::vector<int64_t>>(self.shape()) != out_shape) TP_THROW(RuntimeError, "div_: shape mismatch");
 
 #if defined(__x86_64__)

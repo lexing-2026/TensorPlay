@@ -28,7 +28,7 @@ api::vTensor ParamTextureCache::get_or_create(
     api::GPUMemoryLayout layout,
     uint32_t tag,
     const std::function<api::vTensor()>& build) {
-  const std::shared_ptr<TensorImpl>& impl = param.impl();
+  const intrusive_ptr<TensorImpl>& impl = param.impl();
   TP_CHECK(
       impl->is_contiguous(), "Parameter texture cache expects dense tensors");
 

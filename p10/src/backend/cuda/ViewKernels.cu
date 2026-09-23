@@ -190,7 +190,7 @@ Tensor view_kernel_cuda(const Tensor& self, const std::vector<int64_t>& shape) {
     if (!self.defined()) {
         TP_THROW(RuntimeError, "Tensor not defined");
     }
-    std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
+    intrusive_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
     const std::vector<int64_t> inferred =
         SizesAndStrides::infer_size(shape, impl->numel());
     auto stride = SizesAndStrides::compute_view_strides(

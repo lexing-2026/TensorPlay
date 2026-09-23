@@ -79,13 +79,13 @@ inline Target cast_value(const Source& src) {
  
 class P10_API Tensor {
 private:
-    std::shared_ptr<TensorImpl> impl_;
+    intrusive_ptr<TensorImpl> impl_;
 
 public:
     // Constructors
     Tensor() = default;
-    
-    explicit Tensor(std::shared_ptr<TensorImpl> impl) : impl_(std::move(impl)) {}
+
+    explicit Tensor(intrusive_ptr<TensorImpl> impl) : impl_(std::move(impl)) {}
     
     Tensor(const std::vector<int64_t>& sizes, DType dtype, const Device& device = Device());
     
@@ -95,7 +95,7 @@ public:
 
     // Utils
     bool defined() const { return impl_ != nullptr; }
-    std::shared_ptr<TensorImpl> impl() const { return impl_; }
+    const intrusive_ptr<TensorImpl>& impl() const { return impl_; }
     void swap_impl(Tensor& other) noexcept { impl_.swap(other.impl_); }
     
     // Constructor with Scalar fill value
@@ -152,6 +152,10 @@ public:
     int64_t numel() const;
     Size shape() const;
     std::vector<int64_t> strides() const;
+    // Zero-copy view of the internal sizes (no vector materialization).
+    // Hot shape checks / broadcast rewrites use this; shape() stays for
+    // callers that need an owning copy.
+    IntArrayRef sizes() const;
     int64_t size(int64_t dim) const;
     int64_t stride(int64_t dim) const;
     
@@ -242,7 +246,8 @@ public:
     
     void* data_ptr() const;
     
-    std::shared_ptr<TensorImpl> unsafeGetTensorImpl() const { return impl_; }
+    // Borrows the implementation handle; the Tensor keeps ownership.
+    const intrusive_ptr<TensorImpl>& unsafeGetTensorImpl() const { return impl_; }
 
     // Operators / Methods
     std::string toString() const;

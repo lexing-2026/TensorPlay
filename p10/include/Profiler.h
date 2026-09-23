@@ -256,6 +256,16 @@ TENSORPLAY_API void gpu_drain_pool();
 // All CUPTI entry points are runtime-loaded; unavailable libraries degrade
 // to cupti_available() == false and no GPU rows.
 TENSORPLAY_API extern std::atomic<bool> g_gpu_trace;
+// Session falls back to explicit external-correlation ids when the
+// CUPTI record timebase failed the start-time consistency check.
+TENSORPLAY_API extern std::atomic<bool> g_ext_corr_mode;
+// Count of CUDA-op dispatches since the tracing session began.  The first
+// kExtWarmupOps of a session push external-correlation ids: the record
+// timebase is unreliable exactly there (lazy device-activity setup can
+// stretch or rebase early record timestamps by milliseconds), so those ops
+// are pinned exactly, and their launch records later calibrate the constant
+// offset used for the bulk of the session.
+TENSORPLAY_API extern std::atomic<uint32_t> g_ext_warmup;
 TENSORPLAY_API bool cupti_available();
 // Human-readable dlopen/init failure reason ("" when healthy).
 TENSORPLAY_API std::string cupti_last_error();

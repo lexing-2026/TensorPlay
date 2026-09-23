@@ -127,8 +127,8 @@ class profile:
         with_flops=False,
         with_modules=False,
         use_device=None,
-        gpu_timing=False,
-        gpu_trace=False,
+        gpu_timing=None,
+        gpu_trace=None,
         with_samples=False,
     ):
         self.enabled = bool(enabled)
@@ -143,17 +143,27 @@ class profile:
             self.record_shapes = True
         self.with_modules = bool(with_modules)
         self.use_device = use_device
-        self.gpu_trace = bool(gpu_trace)
         self.with_samples = bool(with_samples)
         self.schedule = schedule
         self.on_trace_ready = on_trace_ready
 
         activity_names = {_activity_name(activity) for activity in self.activities or ()}
+        cuda_requested = (
+            "cuda" in activity_names
+            or (use_device is not None and _activity_name(use_device) == "cuda")
+        )
+        # GPU durations come from the CUPTI activity stream by default: it
+        # collects kernel/memcpy records asynchronously on its own thread,
+        # so the dispatch hot path pays no per-op driver calls.  An explicit
+        # gpu_timing=True request keeps the legacy event-pair timing (it can
+        # coexist with gpu_trace for exact per-op times); the session start
+        # falls back to event pairs automatically when the CUPTI runtime
+        # cannot load.
         self.gpu_timing = bool(gpu_timing)
-        if "cuda" in activity_names:
-            self.gpu_timing = True
-        if use_device is not None and _activity_name(use_device) == "cuda":
-            self.gpu_timing = True
+        if gpu_trace is None:
+            self.gpu_trace = cuda_requested and gpu_timing is None
+        else:
+            self.gpu_trace = bool(gpu_trace)
 
         self.step_num = 0
         self.events = None

@@ -42,7 +42,7 @@ Tensor as_strided_kernel(const Tensor& self,
     if (!self.defined()) {
         TP_THROW(RuntimeError, "Tensor not defined");
     }
-    std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
+    intrusive_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
     if (size.size() != stride.size()) {
         TP_THROW(ValueError,
                  "as_strided(): sizes and strides must have the same length");
@@ -77,7 +77,7 @@ Tensor& as_strided__kernel(Tensor& self,
     if (!self.defined()) {
         TP_THROW(RuntimeError, "Tensor not defined");
     }
-    std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
+    intrusive_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
     if (size.size() != stride.size()) {
         TP_THROW(ValueError,
                  "as_strided(): sizes and strides must have the same length");
@@ -109,7 +109,7 @@ Tensor detach_kernel(const Tensor& self) {
     if (!self.defined()) {
         return Tensor();
     }
-    return Tensor(std::make_shared<TensorImpl>(*self.unsafeGetTensorImpl()));
+    return Tensor(make_intrusive<TensorImpl>(*self.unsafeGetTensorImpl()));
 }
 
 // -----------------------------------------------------------------------------
@@ -120,7 +120,7 @@ Tensor view_kernel(const Tensor& self, const std::vector<int64_t>& shape) {
     if (!self.defined()) {
         TP_THROW(RuntimeError, "Tensor not defined");
     }
-    std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
+    intrusive_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
     const std::vector<int64_t> inferred =
         SizesAndStrides::infer_size(shape, impl->numel());
     auto stride = SizesAndStrides::compute_view_strides(
@@ -188,7 +188,7 @@ bool is_pinned_kernel(const Tensor& self, std::optional<Device> device) {
         return false;
     }
 #ifdef USE_CUDA
-    std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
+    intrusive_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
     return impl->device().is_cpu() && impl->has_storage() &&
            impl->storage().allocator() == getPinnedMemoryAllocator();
 #else
@@ -233,7 +233,7 @@ bool is_coalesced_kernel(const Tensor& self) {
         TP_THROW(RuntimeError,
                  "is_coalesced expected sparse coordinate tensor layout");
     }
-    std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
+    intrusive_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
     if (!impl->is_sparse() || impl->is_sparse_compressed()) {
         TP_THROW(RuntimeError,
                  "is_coalesced expected sparse coordinate tensor layout");
@@ -248,7 +248,7 @@ int64_t sparse_dim_kernel(const Tensor& self) {
                  self.defined() ? self.toString() : std::string("undefined"),
                  " tensor");
     }
-    std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
+    intrusive_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
     if (impl->is_sparse_compressed()) {
         // Compressed layouts span exactly two sparse dimensions
         // (compressed + plain).
@@ -262,7 +262,7 @@ int64_t sparse_dim_kernel(const Tensor& self) {
 }
 
 int64_t dense_dim_kernel(const Tensor& self) {
-    std::shared_ptr<TensorImpl> impl =
+    intrusive_ptr<TensorImpl> impl =
         self.defined() ? self.unsafeGetTensorImpl() : nullptr;
     if (!impl || !impl->is_sparse()) {
         TP_THROW(RuntimeError,
@@ -290,7 +290,7 @@ Tensor indices_kernel(const Tensor& self) {
         TP_THROW(RuntimeError,
                  "_indices() is only defined for sparse COO tensors");
     }
-    std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
+    intrusive_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
     auto indices = impl->sparse_indices_impl();
     if (!indices) {
         TP_THROW(RuntimeError,
@@ -304,7 +304,7 @@ Tensor values_kernel(const Tensor& self) {
         TP_THROW(RuntimeError,
                  "_values() is only defined for sparse tensors");
     }
-    std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
+    intrusive_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
     auto values = impl->sparse_values_impl();
     if (!values) {
         TP_THROW(RuntimeError,
@@ -318,7 +318,7 @@ Tensor crow_indices_kernel(const Tensor& self) {
         TP_THROW(RuntimeError,
                  "crow_indices expected sparse row compressed tensor layout");
     }
-    std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
+    intrusive_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
     if (!impl->is_sparse_row_compressed()) {
         TP_THROW(RuntimeError,
                  "crow_indices expected sparse row compressed tensor layout");
@@ -336,7 +336,7 @@ Tensor col_indices_kernel(const Tensor& self) {
         TP_THROW(RuntimeError,
                  "col_indices expected sparse row compressed tensor layout");
     }
-    std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
+    intrusive_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
     if (!impl->is_sparse_row_compressed()) {
         TP_THROW(RuntimeError,
                  "col_indices expected sparse row compressed tensor layout");

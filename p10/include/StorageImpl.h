@@ -5,12 +5,13 @@
 #include <algorithm>
 #include "DataPtr.h"
 #include "Allocator.h"
+#include "IntrusivePtr.h"
 #include "Macros.h"
 #include "Exception.h"
 
 namespace tensorplay {
 
-struct P10_API StorageImpl {
+struct P10_API StorageImpl : public IntrusivePtrTarget {
     DataPtr data_ptr;
     size_t nbytes;
     Allocator* allocator;
@@ -57,6 +58,14 @@ struct P10_API StorageImpl {
         
         data_ptr = std::move(new_data);
         nbytes = new_nbytes;
+    }
+
+protected:
+    // Weak observers keep the header alive after the last strong reference;
+    // hand back the byte buffer at that point instead of at destruction.
+    void release_resources() override {
+        data_ptr = DataPtr();
+        nbytes = 0;
     }
 };
 

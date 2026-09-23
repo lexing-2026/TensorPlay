@@ -184,9 +184,11 @@ struct ConvDesc {
     void set(int pad_h, int pad_w, int str_h, int str_w, int dil_h, int dil_w, int groups, DType dtype) {
         CUDNN_CHECK(cudnnSetConvolution2dDescriptor(desc, pad_h, pad_w, str_h, str_w, dil_h, dil_w, CUDNN_CROSS_CORRELATION, to_cudnn_compute_type(dtype)));
         CUDNN_CHECK(cudnnSetConvolutionGroupCount(desc, groups));
-        // Float32 convolutions.
+        // Half convolutions map to tensor-op kernels regardless of any
+        // global TF32 switch; float32 follows the context's TF32 switch.
         cudnnMathType_t math_type = CUDNN_DEFAULT_MATH;
-        if (dtype == DType::Float32 && tensorplay::globalContext().allowTF32CuDNN()) {
+        if (dtype == DType::Float16 ||
+            (dtype == DType::Float32 && tensorplay::globalContext().allowTF32CuDNN())) {
             math_type = CUDNN_TENSOR_OP_MATH;
         }
         CUDNN_CHECK(cudnnSetConvolutionMathType(desc, math_type));
@@ -305,8 +307,10 @@ std::shared_ptr<CachedConvDesc> get_cached_conv_desc(
         desc, pad_h, pad_w, str_h, str_w, dil_h, dil_w, CUDNN_CROSS_CORRELATION,
         to_cudnn_compute_type(dtype)));
     CUDNN_CHECK(cudnnSetConvolutionGroupCount(desc, groups));
+    // Same math-type policy as the per-call descriptor above.
     cudnnMathType_t math_type = CUDNN_DEFAULT_MATH;
-    if (dtype == DType::Float32 && tensorplay::globalContext().allowTF32CuDNN()) {
+    if (dtype == DType::Float16 ||
+        (dtype == DType::Float32 && tensorplay::globalContext().allowTF32CuDNN())) {
         math_type = CUDNN_TENSOR_OP_MATH;
     }
     CUDNN_CHECK(cudnnSetConvolutionMathType(desc, math_type));
@@ -589,15 +593,26 @@ static Tensor conv2d_relu_cudnn(
         std::lock_guard<std::mutex> lock(g_conv_fwd_cache_mutex);
         auto it = g_conv_fwd_algo_cache.find(cache_key);
         if (it == g_conv_fwd_algo_cache.end()) {
-            cudnnConvolutionFwdAlgoPerf_t perf_results;
+            cudnnConvolutionFwdAlgoPerf_t perf_results[CUDNN_CONVOLUTION_FWD_ALGO_COUNT];
             int returned_algo_count = 0;
             CUDNN_CHECK(cudnnGetConvolutionForwardAlgorithm_v7(
                 handle, x_desc, w_desc, conv_desc, y_desc,
-                1, &returned_algo_count, &perf_results));
-            if (returned_algo_count == 0) {
+                CUDNN_CONVOLUTION_FWD_ALGO_COUNT, &returned_algo_count,
+                perf_results));
+            // The heuristic order is the preference order; entries without
+            // a successful status are not executable on this hardware, so
+            // skip them instead of failing at run time.
+            int chosen = -1;
+            for (int i = 0; i < returned_algo_count; ++i) {
+                if (perf_results[i].status == CUDNN_STATUS_SUCCESS) {
+                    chosen = i;
+                    break;
+                }
+            }
+            if (chosen < 0) {
                 TP_THROW(RuntimeError, "cuDNN: no fused forward convolution algorithm");
             }
-            algorithm = perf_results.algo;
+            algorithm = perf_results[chosen].algo;
             CUDNN_CHECK(cudnnGetConvolutionForwardWorkspaceSize(
                 handle, x_desc, w_desc, conv_desc, y_desc,
                 algorithm, &workspace_size));
@@ -692,15 +707,24 @@ static Tensor conv2d_cudnn_legacy(
         std::lock_guard<std::mutex> lock(g_conv_fwd_cache_mutex);
         auto it = g_conv_fwd_algo_cache.find(cache_key);
         if (it == g_conv_fwd_algo_cache.end()) {
-            cudnnConvolutionFwdAlgoPerf_t perf_results;
+            cudnnConvolutionFwdAlgoPerf_t perf_results[CUDNN_CONVOLUTION_FWD_ALGO_COUNT];
             int returned_algo_count = 0;
             CUDNN_CHECK(cudnnGetConvolutionForwardAlgorithm_v7(
                 handle, x_desc, w_desc, conv_desc, y_desc,
-                1, &returned_algo_count, &perf_results));
-            if (returned_algo_count == 0) {
+                CUDNN_CONVOLUTION_FWD_ALGO_COUNT, &returned_algo_count,
+                perf_results));
+            // Same skip-unexecutable rule as the fused path.
+            int chosen = -1;
+            for (int i = 0; i < returned_algo_count; ++i) {
+                if (perf_results[i].status == CUDNN_STATUS_SUCCESS) {
+                    chosen = i;
+                    break;
+                }
+            }
+            if (chosen < 0) {
                 TP_THROW(RuntimeError, "cuDNN: no forward convolution algorithm");
             }
-            algorithm = perf_results.algo;
+            algorithm = perf_results[chosen].algo;
             CUDNN_CHECK(cudnnGetConvolutionForwardWorkspaceSize(
                 handle, x_desc, w_desc, conv_desc, y_desc,
                 algorithm, &workspace_size));
@@ -1189,18 +1213,26 @@ Tensor conv2d_grad_input_cuda(const Tensor& grad_output, const Tensor& input, co
                                                *dy_desc, grad_output_c.data_ptr(), *conv_desc,
                                                *dx_desc, grad_input.data_ptr(), input_c.device());
             } else {
-                cudnnConvolutionBwdDataAlgoPerf_t perf_results;
+                cudnnConvolutionBwdDataAlgoPerf_t perf_results[CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT];
                 int returned_algo_count = 0;
                 CUDNN_CHECK(cudnnGetConvolutionBackwardDataAlgorithm_v7(
                     handle, *w_desc, *dy_desc, *conv_desc, *dx_desc,
-                    1, &returned_algo_count, &perf_results));
-                if (returned_algo_count == 0) {
+                    CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT, &returned_algo_count,
+                    perf_results));
+                int chosen = -1;
+                for (int i = 0; i < returned_algo_count; ++i) {
+                    if (perf_results[i].status == CUDNN_STATUS_SUCCESS) {
+                        chosen = i;
+                        break;
+                    }
+                }
+                if (chosen < 0) {
                     TP_THROW(RuntimeError, "cuDNN: no backward-data convolution algorithm");
                 }
                 size_t ws_size = 0;
                 CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(
-                    handle, *w_desc, *dy_desc, *conv_desc, *dx_desc, perf_results.algo, &ws_size));
-                entry = ConvBwdAlgo{static_cast<int>(perf_results.algo), ws_size};
+                    handle, *w_desc, *dy_desc, *conv_desc, *dx_desc, perf_results[chosen].algo, &ws_size));
+                entry = ConvBwdAlgo{static_cast<int>(perf_results[chosen].algo), ws_size};
             }
             {
                 std::lock_guard<std::mutex> lock(g_conv_bwd_cache_mutex);
@@ -1417,10 +1449,11 @@ struct ConvDescNd {
                                                     CUDNN_CROSS_CORRELATION,
                                                     to_cudnn_compute_type(dtype)));
         CUDNN_CHECK(cudnnSetConvolutionGroupCount(desc, static_cast<int>(groups)));
-        // sets this too -- without it conv3d/conv_transpose3d fp32 would
-        // silently skip tensor-op math.
+        // Same math-type policy as the 2D descriptor: half runs tensor-op
+        // math; float32 follows the context's TF32 switch.
         cudnnMathType_t math_type = CUDNN_DEFAULT_MATH;
-        if (dtype == DType::Float32 && tensorplay::globalContext().allowTF32CuDNN()) {
+        if (dtype == DType::Float16 ||
+            (dtype == DType::Float32 && tensorplay::globalContext().allowTF32CuDNN())) {
             math_type = CUDNN_TENSOR_OP_MATH;
         }
         CUDNN_CHECK(cudnnSetConvolutionMathType(desc, math_type));

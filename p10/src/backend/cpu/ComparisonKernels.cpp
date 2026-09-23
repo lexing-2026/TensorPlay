@@ -96,7 +96,7 @@ Tensor comparison_kernel_impl(const Tensor& self, const Tensor& other, Op op) {
         Tensor other_f = isQuantizedType(other.dtype()) ? dequantize_self_cpu(other) : other;
         return comparison_kernel_impl<kEquality>(self_f, other_f, op);
     }
-    std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
+    std::vector<int64_t> out_shape = broadcast_shapes(self.sizes(), other.sizes());
 
     // Result is always Bool
     Tensor result = Tensor::empty(out_shape, DType::Bool, self.device());
@@ -170,10 +170,7 @@ Tensor where_kernel_impl(const Tensor& condition, const Tensor& self,
     if (condition.dtype() != DType::Bool) {
         TP_THROW(TypeError, "where condition must be a boolean tensor");
     }
-    std::vector<int64_t> out_shape = broadcast_shapes(
-        static_cast<std::vector<int64_t>>(condition.shape()),
-        static_cast<std::vector<int64_t>>(self.shape()),
-        static_cast<std::vector<int64_t>>(other.shape()));
+    std::vector<int64_t> out_shape = broadcast_shapes(condition.sizes(), self.sizes(), other.sizes());
     DType common_dtype = promoteTypes(self.dtype(), other.dtype());
     Tensor result = Tensor::empty(out_shape, common_dtype, self.device());
     Tensor self_casted = self.dtype() == common_dtype ? self : self.to(common_dtype);
@@ -302,9 +299,7 @@ Tensor where_scalar_scalar_cpu(const Tensor& condition, const Scalar& self, cons
 
 template <typename Op>
 Tensor maximum_minimum_kernel_impl(const Tensor& self, const Tensor& other, Op op) {
-    std::vector<int64_t> out_shape = broadcast_shapes(
-        static_cast<std::vector<int64_t>>(self.shape()),
-        static_cast<std::vector<int64_t>>(other.shape()));
+    std::vector<int64_t> out_shape = broadcast_shapes(self.sizes(), other.sizes());
     DType common_dtype = promoteTypes(self.dtype(), other.dtype());
     if (isComplexType(common_dtype)) {
         TP_THROW(RuntimeError, "maximum/minimum is not implemented for complex tensors");

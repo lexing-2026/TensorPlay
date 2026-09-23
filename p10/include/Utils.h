@@ -30,11 +30,41 @@ inline std::vector<int64_t> broadcast_shapes(const std::vector<int64_t>& shape1,
     return result_shape;
 }
 
+// View-based broadcast: same rules, but reads the input shapes without
+// materializing them (callers pass tensor.sizes()).  The returned shape is
+// still an owning vector -- kernels consume it as a plain shape.
+inline std::vector<int64_t> broadcast_shapes(IntArrayRef shape1, IntArrayRef shape2) {
+    const int64_t ndim1 = static_cast<int64_t>(shape1.size());
+    const int64_t ndim2 = static_cast<int64_t>(shape2.size());
+    const int64_t ndim = std::max(ndim1, ndim2);
+    std::vector<int64_t> result_shape(static_cast<size_t>(ndim));
+
+    for (int64_t i = 0; i < ndim; ++i) {
+        const int64_t dim1 = (i < ndim - ndim1) ? 1 : shape1[i - (ndim - ndim1)];
+        const int64_t dim2 = (i < ndim - ndim2) ? 1 : shape2[i - (ndim - ndim2)];
+
+        if (dim1 == 1) result_shape[static_cast<size_t>(i)] = dim2;
+        else if (dim2 == 1) result_shape[static_cast<size_t>(i)] = dim1;
+        else if (dim1 == dim2) result_shape[static_cast<size_t>(i)] = dim1;
+        else TP_THROW(RuntimeError,
+               "The size of tensor a (", dim1,
+               ") must match the size of tensor b (", dim2,
+               ") at non-singleton dimension ", i);
+    }
+    return result_shape;
+}
+
 inline std::vector<int64_t> broadcast_shapes(
     const std::vector<int64_t>& shape1,
     const std::vector<int64_t>& shape2,
     const std::vector<int64_t>& shape3) {
     return broadcast_shapes(broadcast_shapes(shape1, shape2), shape3);
+}
+
+inline std::vector<int64_t> broadcast_shapes(
+    IntArrayRef shape1, IntArrayRef shape2, IntArrayRef shape3) {
+    std::vector<int64_t> merged = broadcast_shapes(shape1, shape2);
+    return broadcast_shapes(IntArrayRef(merged), shape3);
 }
 
 // Align an input's strides to an already-computed broadcast output shape.

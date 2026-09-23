@@ -24,6 +24,7 @@
 #ifdef USE_CUDA
 
 #include <cupti.h>
+#include <cuda_runtime.h>
 
 // ---- Activity-record revisions ---------------------------------------------
 // Toolkit headers ship a subset of record revisions: 12.8+ headers replace
@@ -200,7 +201,6 @@ std::mutex g_cupti_mutex;      // guards everything below (session scope)
 CuptiFns* g_fns = nullptr;     // resolved entry points (null until start)
 DlHandle g_cupti_lib = nullptr;  // runtime handle (kept for the process life)
 std::string g_last_error;      // loader/init diagnostic for the binding
-bool g_callbacks_registered = false;
 bool g_kinds_enabled = false;
 int64_t g_time_offset_ns = 0;  // steady_ns ~= cupti_ns + offset
 
@@ -450,6 +450,14 @@ void disable_kinds_locked() {
 } // namespace
 
 TENSORPLAY_API std::atomic<bool> g_gpu_trace{false};
+// Per-session flag: the record timebase failed the start-time sanity check
+// (another in-process profiler reconfigured CUPTI and left the timestamp
+// domain inconsistent), so kernel-to-op attribution must use explicit
+// external-correlation ids instead of launch-time containment.
+TENSORPLAY_API std::atomic<bool> g_ext_corr_mode{false};
+// The timebase implied by cuptiGetTimestamp at session start, kept for the
+// consistency check against the record-domain anchor.
+int64_t g_start_offset_estimate = 0;
 
 // Candidate runtime names, newest major line first; produced by the
 // per-platform collector inside the loader shim above.
@@ -518,12 +526,13 @@ TENSORPLAY_API uint32_t cupti_version() {
 }
 
 TENSORPLAY_API bool cupti_start() {
-    std::lock_guard<std::mutex> lock(g_cupti_mutex);
-    ensure_state_locked();
-    reset_session_locked();
-    g_last_error.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_cupti_mutex);
+        ensure_state_locked();
+        reset_session_locked();
+        g_last_error.clear();
 
-    if (g_fns == nullptr) {
+        if (g_fns == nullptr) {
         if (g_cupti_lib == nullptr) {
             std::vector<DllCandidate> candidates;
             collect_dll_candidates(candidates);
@@ -570,20 +579,40 @@ TENSORPLAY_API bool cupti_start() {
 
     // Calibrate the CUPTI/steady timebase once per start; activity
     // timestamps share cuptiGetTimestamp's epoch, so a single offset maps
-    // every record onto the op timeline's clock.
-    uint64_t cupti_now = 0;
-    if (g_fns->GetTimestamp(&cupti_now) == CUPTI_SUCCESS) {
-        g_time_offset_ns = static_cast<int64_t>(steady_now_ns()) -
-                           static_cast<int64_t>(cupti_now);
-    }
-
-    if (!g_callbacks_registered) {
-        if (g_fns->RegisterCallbacks(buffer_requested, buffer_completed) !=
-            CUPTI_SUCCESS) {
-            g_last_error = "cuptiActivityRegisterCallbacks failed";
-            return false;
+    // every record onto the op timeline's clock.  The two clocks are read
+    // as a bracketed pair (steady, cupti, steady) and the best of several
+    // samples wins: the pair with the narrowest bracket bounds the offset
+    // error by half its width, which keeps launch records inside the op
+    // spans they belong to even when spans are only a few microseconds.
+    int64_t best_offset = INT64_MAX;
+    uint64_t best_width = UINT64_MAX;
+    for (int sample = 0; sample < 8; ++sample) {
+        const uint64_t s1 = steady_now_ns();
+        uint64_t cupti_now = 0;
+        if (g_fns->GetTimestamp(&cupti_now) != CUPTI_SUCCESS) break;
+        const uint64_t s2 = steady_now_ns();
+        const uint64_t width = s2 - s1;
+        if (width < best_width) {
+            best_width = width;
+            best_offset = static_cast<int64_t>(cupti_now) -
+                          static_cast<int64_t>((s1 + s2) / 2);
         }
-        g_callbacks_registered = true;
+    }
+    if (best_width != UINT64_MAX) {
+        g_time_offset_ns = -best_offset;
+    }
+    g_start_offset_estimate = g_time_offset_ns;
+    g_ext_corr_mode.store(false, std::memory_order_release);
+
+    // The activity callback slot is process-global and the registration is
+    // last-writer-wins: another in-process framework profiling through the
+    // same CUPTI interface replaces the buffer handlers when it starts.  Do
+    // not treat registration as once-per-process -- re-register on every
+    // start so this session receives buffers again.
+    if (g_fns->RegisterCallbacks(buffer_requested, buffer_completed) !=
+        CUPTI_SUCCESS) {
+        g_last_error = "cuptiActivityRegisterCallbacks failed";
+        return false;
     }
 
     static const CUpti_ActivityKind kinds[] = {
@@ -591,6 +620,9 @@ TENSORPLAY_API bool cupti_start() {
         CUPTI_ACTIVITY_KIND_MEMSET,
         CUPTI_ACTIVITY_KIND_RUNTIME,
         CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL,
+        // Warmup and degraded-timebase sessions pin ops with external
+        // correlation ids; enabling the kind costs nothing when no id is
+        // pushed (steady-state bulk ops push none).
         CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION,
     };
     CUptiResult rc = CUPTI_SUCCESS;
@@ -605,6 +637,50 @@ TENSORPLAY_API bool cupti_start() {
         }
     }
     g_kinds_enabled = true;
+    }
+
+    // Refine the timebase offset against the record domain itself.  The
+    // cuptiGetTimestamp epoch is not guaranteed to match the timestamps
+    // written into activity records when another in-process framework has
+    // reconfigured CUPTI earlier in the process lifetime, so anchor on a
+    // runtime-API call read against the steady clock: the record's
+    // start_ns marks the intercepted call's entry, which the preceding
+    // clock read precedes by only the interception preamble (well under a
+    // microsecond), so the record-domain clock is pinned to the op
+    // timeline at preamble scale.  Aligning to the midpoint of a bracket
+    // around the call would instead inherit half the call duration as
+    // error, and driver calls can run tens of microseconds when the
+    // process is busy.  This runs with g_cupti_mutex released: FlushAll
+    // delivery re-enters the parse path, which takes that mutex.
+    {
+        uint64_t s1 = steady_now_ns();
+        int anchored_device = -1;
+        (void)cudaGetDevice(&anchored_device);
+        (void)g_fns->FlushAll(0);
+        std::lock_guard<std::mutex> lock(g_cupti_mutex);
+        if (g_api_acts != nullptr) {
+            const int64_t call_entry = static_cast<int64_t>(s1);
+            for (auto it = g_api_acts->rbegin(); it != g_api_acts->rend();
+                 ++it) {
+                if (it->cbid != CUPTI_RUNTIME_TRACE_CBID_cudaGetDevice_v3020) {
+                    continue;
+                }
+                const int64_t raw =
+                    static_cast<int64_t>(it->start_ns) - g_time_offset_ns;
+                const int64_t anchored = call_entry - raw;
+                // Sanity check against the GetTimestamp estimate: sub-
+                // millisecond disagreement is normal calibration jitter;
+                // anything larger means the record domain is not the
+                // GetTimestamp domain and containment cannot be trusted.
+                const int64_t drift = anchored - g_start_offset_estimate;
+                if (drift < -10000000 || drift > 10000000) {
+                    g_ext_corr_mode.store(true, std::memory_order_release);
+                }
+                g_time_offset_ns = anchored;
+                break;
+            }
+        }
+    }
     return true;
 }
 
@@ -682,6 +758,7 @@ namespace prof {
 
 // CPU builds: keep the symbols so the binding links without ifdef noise.
 TENSORPLAY_API std::atomic<bool> g_gpu_trace{false};
+TENSORPLAY_API std::atomic<bool> g_ext_corr_mode{false};
 TENSORPLAY_API bool cupti_available() { return false; }
 TENSORPLAY_API std::string cupti_last_error() {
     return "TensorPlay built without CUDA";

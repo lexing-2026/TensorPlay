@@ -1,4 +1,6 @@
 #include "python_bindings.h"
+#include <algorithm>
+#include <queue>
 #include <unordered_map>
 #include <vector>
 #include "PyNewRef.h"
@@ -1046,19 +1048,29 @@ PYBIND11_MODULE(_C, m) {
         // This is a session option, not a process-global sticky mode.  In
         // particular, a later CPU profile must not arm CUDA events for CPU
         // redispatches after a timed CUDA profile has finished.
-        tensorplay::prof::g_gpu_timing.store(
-            gpu_timing, std::memory_order_release);
         tensorplay::prof::g_mem_capture.store(
             mem_capture, std::memory_order_release);
+        tensorplay::prof::g_ext_warmup.store(0, std::memory_order_release);
         if (gpu_trace) {
-            // Arm CUPTI before the first op so no kernel is missed; flag is
-            // stored first because GpuTimerPair::arm consults it from the
-            // very first redispatch of the session.
-            tensorplay::prof::g_gpu_trace.store(true,
-                                                std::memory_order_release);
+            // CUPTI owns per-op GPU timing unless the caller explicitly
+            // requested event pairs as well (coexist): kernel/memcpy
+            // durations arrive asynchronously and join back to ops after
+            // the session, so the dispatch hot path records no cudaEvent
+            // pair at all.  Clearing the event-pair flag first keeps the
+            // two timing sources from overlapping on auto sessions (the
+            // stop path would otherwise double-count gpu_ms).
+            if (!gpu_timing) {
+                tensorplay::prof::g_gpu_timing.store(
+                    false, std::memory_order_release);
+            }
+            tensorplay::prof::g_gpu_trace.store(
+                true, std::memory_order_release);
             if (!tensorplay::prof::cupti_start()) {
                 tensorplay::prof::g_gpu_trace.store(
                     false, std::memory_order_release);
+                // No activity stream: fall back to event-pair timing so a
+                // CUDA-activity session still reports per-op gpu_ms.
+                if (!gpu_timing) gpu_timing = true;
                 const std::string reason =
                     tensorplay::prof::cupti_last_error();
                 PyErr_WarnEx(PyExc_RuntimeWarning,
@@ -1066,6 +1078,8 @@ PYBIND11_MODULE(_C, m) {
                              1);
             }
         }
+        tensorplay::prof::g_gpu_timing.store(
+            gpu_timing, std::memory_order_release);
         if (with_stack) {
             tensorplay::prof::profiler_start_full();
         } else if (capture_shapes) {
@@ -1090,8 +1104,9 @@ PYBIND11_MODULE(_C, m) {
         // Resolve GPU pairs with bounded waits on the recorded stream tails;
         // this deliberately avoids a device-wide synchronize and writes
         // gpu_ms into the events.
+        size_t pairs_resolved = 0;
         tensorplay::prof::gpu_resolve_all(
-            events, [](Event&, float) {});
+            events, [&](tensorplay::prof::Event&, float) { ++pairs_resolved; });
         tensorplay::prof::g_gpu_timing.store(false,
                                              std::memory_order_release);
         const bool trace_on =
@@ -1100,19 +1115,289 @@ PYBIND11_MODULE(_C, m) {
         std::vector<tensorplay::prof::GpuActivity> gpu_acts;
         if (trace_on) {
             tensorplay::prof::cupti_stop_and_collect(gpu_acts);
-            // Correlate GPU activity back to the op that launched it via
-            // the external-correlation id (the OpRecord slot).
-            for (auto& a : gpu_acts) {
-                if (a.kind == 'r' || a.kind == 'd') continue;
-                if (a.external_id == tensorplay::prof::GpuActivity::kNoExt ||
-                    a.external_id >= events.size()) {
+             // Kernel records join back to ops after the session: a record's
+            // launch time comes from its runtime-API record (shared
+            // correlation id), and the launch is attributed to
+            // the innermost op span alive at that time (minimum end).  No
+            // per-op correlation ids exist on the dispatch hot path.
+            //
+            // CUPTI does not guarantee one fixed epoch between the record
+            // stream and the host clock the op spans use -- lazy kernel-
+            // tracing setup can rebase the domain mid-session.  The mapping
+            // is therefore recovered from the data: a constant shift is
+            // searched so that as many launch records as possible fall
+            // inside op spans (launches always happen inside the op that
+            // issued them).  One-time cost at session stop.
+            std::unordered_map<uint32_t, uint64_t> corr_launch;
+            corr_launch.reserve(gpu_acts.size());
+            std::unordered_map<uint32_t, uint32_t> corr_kind_count;
+            for (const auto& a : gpu_acts) {
+                if (a.kind == 'r' || a.kind == 'd') {
+                    corr_launch.emplace(a.correlation, a.start_ns);
+                } else {
+                    corr_kind_count[a.correlation] += 1;
+                }
+            }
+            // Probe set: host-side records of calls that launched device
+            // work -- those always execute inside an op span.  Records that
+            // already carry an external-correlation id are excluded: they
+            // are pinned exactly (and their timestamps are precisely the
+            // unreliable ones the warmup window exists for).
+            std::vector<int64_t> probes;
+            probes.reserve(corr_kind_count.size());
+            // Warmup-calibrated offset candidates: each pinned launch record
+            // votes for the shift that places its launch at its op's start.
+            std::vector<int64_t> warm_seeds;
+            for (const auto& a : gpu_acts) {
+                if (a.kind != 'r' && a.kind != 'd') continue;
+                if (corr_kind_count.count(a.correlation) == 0) continue;
+                if (a.external_id !=
+                    tensorplay::prof::GpuActivity::kNoExt) {
+                    if (a.external_id < events.size()) {
+                        warm_seeds.push_back(
+                            static_cast<int64_t>(
+                                events[a.external_id].start_ns) -
+                            static_cast<int64_t>(a.start_ns));
+                    }
                     continue;
                 }
-                auto& op = events[a.external_id];
+                probes.push_back(static_cast<int64_t>(a.start_ns));
+            }
+            // Only the tail votes: later warmup ops are the most settled.
+            if (warm_seeds.size() > 16) {
+                warm_seeds.erase(warm_seeds.begin(),
+                                 warm_seeds.end() - 16);
+            }
+            struct Span { int64_t start; int64_t end; size_t slot; };
+            std::vector<Span> spans;
+            spans.reserve(events.size());
+            for (size_t i = 0; i < events.size(); ++i) {
+                const auto& e = events[i];
+                if ((e.kind == tensorplay::prof::EventKind::kOp ||
+                     e.kind == tensorplay::prof::EventKind::kUser) &&
+                    e.end_ns > e.start_ns) {
+                    spans.push_back({static_cast<int64_t>(e.start_ns),
+                                     static_cast<int64_t>(e.end_ns), i});
+                }
+            }
+            std::sort(spans.begin(), spans.end(),
+                      [](const Span& x, const Span& y) {
+                          return x.start < y.start;
+                      });
+            int64_t best_shift = 0;
+            if (!probes.empty() && !spans.empty()) {
+                std::sort(probes.begin(), probes.end());
+                const size_t total = probes.size();
+                auto contained = [&](int64_t shift) {
+                    // Count probes that land inside some span under shift;
+                    // sweep span starts with a min-heap of active ends.
+                    using HeapItem = std::pair<int64_t, size_t>;
+                    std::priority_queue<HeapItem, std::vector<HeapItem>,
+                                        std::greater<HeapItem>> active;
+                    size_t si = 0, cnt = 0;
+                    for (const int64_t t : probes) {
+                        const int64_t tt = t + shift;
+                        while (si < spans.size() && spans[si].start <= tt) {
+                            active.push({spans[si].end, si});
+                            ++si;
+                        }
+                        while (!active.empty() && active.top().first <= tt) {
+                            active.pop();
+                        }
+                        if (!active.empty()) ++cnt;
+                    }
+                    return cnt;
+                };
+                const int64_t kWindow = 4000000000LL;  // +/- 4 s
+                size_t score = contained(0);
+                int64_t d = 0;
+                // Fast path: the start-time anchor already places nearly
+                // every launch inside an op span; skip the search.
+                if (score * 10 < total * 9) {
+                    // The containment score is a comb of span-width spikes,
+                    // so climbing from a zero plateau can never move.  Seed
+                    // from the data first: warmup-pinned launch records vote
+                    // for the offset that realigns their ops, and rank-
+                    // paired probe/span starts vote similarly; those seeds
+                    // survive even when the record domain jumped mid-session.
+                    // Then scan a coarse grid and descend from the best
+                    // point decade by decade to microsecond scale.
+                    const size_t nseeds = std::min<size_t>(total, 64);
+                    auto try_seed = [&](int64_t cand) {
+                        if (cand < -kWindow || cand > kWindow) return;
+                        const size_t s = contained(cand);
+                        if (s > score) {
+                            score = s;
+                            d = cand;
+                        }
+                    };
+                    for (const int64_t cand : warm_seeds) try_seed(cand);
+                    for (size_t j = 0; j < nseeds; ++j) {
+                        try_seed(
+                            static_cast<int64_t>(
+                                spans[j * spans.size() / nseeds].start) -
+                            static_cast<int64_t>(
+                                probes[j * total / nseeds]));
+                    }
+                    for (int64_t cand = -kWindow; cand <= kWindow;
+                         cand += 50000000) {
+                        const size_t s = contained(cand);
+                        if (s > score) {
+                            score = s;
+                            d = cand;
+                        }
+                    }
+                    for (int64_t step = 5000000; step >= 1000; step /= 10) {
+                        bool improved = true;
+                        while (improved) {
+                            improved = false;
+                            for (const int64_t cand : {d - step, d + step}) {
+                                if (cand < -kWindow || cand > kWindow) continue;
+                                const size_t s = contained(cand);
+                                if (s > score) {
+                                    score = s;
+                                    d = cand;
+                                    improved = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Accept only if the alignment actually explains the data.
+                if (score * 10 < total * 9) {
+                    d = 0;  // degraded; keep the parse-time mapping
+                }
+                best_shift = d;
+                // Apply the recovered mapping to every device-side record so
+                // attribution and trace export share one timeline.
+                for (auto& a : gpu_acts) {
+                    a.start_ns = static_cast<uint64_t>(
+                        static_cast<int64_t>(a.start_ns) + best_shift);
+                    a.end_ns = static_cast<uint64_t>(
+                        static_cast<int64_t>(a.end_ns) + best_shift);
+                }
+                for (auto& kv : corr_launch) {
+                    kv.second = static_cast<uint64_t>(
+                        static_cast<int64_t>(kv.second) + best_shift);
+                }
+            }
+            std::vector<size_t> dev_records;
+            dev_records.reserve(gpu_acts.size());
+            for (size_t i = 0; i < gpu_acts.size(); ++i) {
+                const auto& a = gpu_acts[i];
+                if (a.kind == 'r' || a.kind == 'd') continue;
+                if (a.correlation != 0 &&
+                    corr_launch.count(a.correlation) != 0) {
+                    dev_records.push_back(i);
+                }
+            }
+            std::sort(dev_records.begin(), dev_records.end(),
+                      [&](size_t x, size_t y) {
+                          return corr_launch[gpu_acts[x].correlation] <
+                                 corr_launch[gpu_acts[y].correlation];
+                      });
+            // Sweep launch times against span starts; a min-heap of active
+            // span ends answers the innermost-containing-span query in
+            // O(log n).  Spans from parallel launch threads may overlap
+            // without nesting; the min-end pick then attributes to the
+            // shorter span, which keeps durations correct and only affects
+            // which row of the report carries them.
+            using HeapItem = std::pair<int64_t, size_t>;
+            std::priority_queue<HeapItem, std::vector<HeapItem>,
+                                std::greater<HeapItem>> active;
+            std::vector<size_t> unattributed;
+            size_t si = 0;
+            for (size_t qi : dev_records) {
+                auto& a = gpu_acts[qi];
                 const double ms =
                     static_cast<double>(a.end_ns - a.start_ns) / 1e6;
-                op.gpu_ms = (op.gpu_ms < 0.f ? 0.f : op.gpu_ms) +
-                            static_cast<float>(ms);
+                // Exact slot attribution wins when a record carries an
+                // external-correlation id (warmup ops and degraded-timebase
+                // sessions).
+                if (a.external_id != tensorplay::prof::GpuActivity::kNoExt) {
+                    if (a.external_id < events.size()) {
+                        auto& op = events[a.external_id];
+                        // Event-pair timing already wrote gpu_ms when both
+                        // modes ran together; keep only the kernel count.
+                        if (pairs_resolved == 0) {
+                            op.gpu_ms = (op.gpu_ms < 0.f ? 0.f : op.gpu_ms) +
+                                        static_cast<float>(ms);
+                        }
+                        op.kernel_count += 1;
+                    }
+                    continue;
+                }
+                const int64_t t =
+                    static_cast<int64_t>(corr_launch[a.correlation]);
+                while (si < spans.size() && spans[si].start <= t) {
+                    active.push({spans[si].end, si});
+                    ++si;
+                }
+                while (!active.empty() && active.top().first <= t) {
+                    active.pop();
+                }
+                if (active.empty()) {
+                    unattributed.push_back(qi);
+                    continue;
+                }
+                const size_t slot = spans[active.top().second].slot;
+                // Publish the resolved span so trace export draws the
+                // op -> kernel flow arrows exactly as with explicit
+                // external-correlation ids.
+                a.external_id = static_cast<uint64_t>(slot);
+                auto& op = events[slot];
+                if (pairs_resolved == 0) {
+                    op.gpu_ms = (op.gpu_ms < 0.f ? 0.f : op.gpu_ms) +
+                                static_cast<float>(ms);
+                }
+                op.kernel_count += 1;
+            }
+            // Second pass for launches the strict containment sweep missed:
+            // a few microseconds of timebase-bridging error can push a
+            // record just outside a very short op span.  Attach to the
+            // nearest span within a small slack window instead of dropping
+            // the duration.
+            constexpr int64_t kLaunchSlackNs = 20000;  // 20 us
+            for (size_t qi : unattributed) {
+                auto& a = gpu_acts[qi];
+                const int64_t t =
+                    static_cast<int64_t>(corr_launch[a.correlation]);
+                const Span* best = nullptr;
+                int64_t best_gap = INT64_MAX;
+                for (const auto& sp : spans) {
+                    if (sp.start > t) {
+                        // Spans are sorted by start: every later span is at
+                        // least as far ahead, so past the slack we stop.
+                        const uint64_t gap = sp.start - t;
+                        if (gap > kLaunchSlackNs) break;
+                        if (gap < best_gap) {
+                            best_gap = gap;
+                            best = &sp;
+                        }
+                    } else if (sp.end <= t) {
+                        // Ends are unsorted; keep scanning.
+                        const uint64_t gap = t - sp.end;
+                        if (gap <= kLaunchSlackNs && gap < best_gap) {
+                            best_gap = gap;
+                            best = &sp;
+                        }
+                    } else {
+                        // Contained spans are always found by the sweep;
+                        // treat defensively as an exact hit.
+                        best_gap = 0;
+                        best = &sp;
+                        break;
+                    }
+                }
+                if (best == nullptr) continue;
+                a.external_id = static_cast<uint64_t>(best->slot);
+                auto& op = events[best->slot];
+                const double ms =
+                    static_cast<double>(a.end_ns - a.start_ns) / 1e6;
+                if (pairs_resolved == 0) {
+                    op.gpu_ms = (op.gpu_ms < 0.f ? 0.f : op.gpu_ms) +
+                                static_cast<float>(ms);
+                }
                 op.kernel_count += 1;
             }
         }

@@ -2136,7 +2136,7 @@ inline DType wrapped_scalar_pair_dtype(DType tensor_dtype, DType scalar_dtype) {
 
 // Helper for pow (Tensor, Tensor)
 Tensor pow_tensor_tensor_kernel(const Tensor& self, const Tensor& exponent) {
-    std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(exponent.shape()));
+    std::vector<int64_t> out_shape = broadcast_shapes(self.sizes(), exponent.sizes());
     const bool self_wrapped =
         self.dim() == 0 && self.unsafeGetTensorImpl()->is_wrapped_number();
     const bool exp_wrapped =

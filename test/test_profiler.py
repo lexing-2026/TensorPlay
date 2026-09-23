@@ -23,27 +23,6 @@ def torch_op_names(trace_path):
 
 
 class TestCaptureReference:
-    def test_forward_ops_match_torch(self):
-        # Same tiny workload on both frameworks; compare forward op sets.
-        with torch.profiler.profile() as tprof:
-            xt = torch.randn(8, 16)
-            wt = torch.randn(16, 8, requires_grad=True)
-            yt = xt.matmul(wt)
-            lt = yt.relu().sum()
-
-        with tp_prof.profile() as pprof:
-            x = tp.randn([8, 16])
-            w = tp.randn([16, 8], requires_grad=True)
-            y = x.matmul(w)
-            l = y.relu().sum()
-
-        tp_names = {name for name, *_ in pprof.events}
-        assert {"matmul", "relu", "sum", "randn"} <= tp_names
-        tnames = {e.key for e in tprof.key_averages()}
-        joined = " ".join(tnames)
-        assert any(k in joined for k in ("mm", "matmul"))
-        assert any("relu" in n for n in tnames)
-        assert any("sum" in n for n in tnames)
 
     def test_backward_ops_and_engine_span(self):
         x = tp.randn([4, 4], requires_grad=True)
@@ -869,3 +848,31 @@ class TestKeyAveragesGpuColumns:
         # unknown keys still raise; cuda keys parse without GPU data
         rows = prof.key_averages(sort_by="cuda_time").rows
         assert rows
+
+
+class TestTorchCrossReference:
+    """Runs a real profiler session; kept last so its CUPTI
+    reconfiguration cannot disturb the GPU-timing expectations of
+    earlier tests in this process."""
+
+    def test_forward_ops_match_torch(self):
+        # Same tiny workload on both frameworks; compare forward op sets.
+        with torch.profiler.profile() as tprof:
+            xt = torch.randn(8, 16)
+            wt = torch.randn(16, 8, requires_grad=True)
+            yt = xt.matmul(wt)
+            lt = yt.relu().sum()
+
+        with tp_prof.profile() as pprof:
+            x = tp.randn([8, 16])
+            w = tp.randn([16, 8], requires_grad=True)
+            y = x.matmul(w)
+            l = y.relu().sum()
+
+        tp_names = {name for name, *_ in pprof.events}
+        assert {"matmul", "relu", "sum", "randn"} <= tp_names
+        tnames = {e.key for e in tprof.key_averages()}
+        joined = " ".join(tnames)
+        assert any(k in joined for k in ("mm", "matmul"))
+        assert any("relu" in n for n in tnames)
+        assert any("sum" in n for n in tnames)

@@ -133,6 +133,11 @@ void destroy_event_pair(const LivePair& pair, int* current) {
 // Global (not TLS): backward node applies run on device worker threads whose
 // TLS never saw the session start.
 TENSORPLAY_API std::atomic<bool> g_gpu_timing{false};
+// CUDA-op dispatch count of the current tracing session (see Profiler.h).
+TENSORPLAY_API std::atomic<uint32_t> g_ext_warmup{0};
+// Warmup ops carry exact external-correlation ids; the record timebase is
+// only trustworthy after the device-activity machinery has warmed up.
+constexpr uint32_t kExtWarmupOps = 32;
 
 GpuTimerPair::~GpuTimerPair() {
     if (!armed_) return;
@@ -141,13 +146,20 @@ GpuTimerPair::~GpuTimerPair() {
 
 void GpuTimerPair::arm(const Device& device) {
     if (!rec_.live_ || !device.is_cuda()) return;
-    // gpu_trace mode (CUPTI): bracket the dispatch with the op's slot as an
-    // external correlation id, so every kernel this op launches carries the
-    // id and joins back to the op (op -> runtime API -> kernel).  Push/pop
-    // is CUPTI's per-thread stack, so composite inner ops nest correctly.
+    // Two attribution regimes coexist.  Warmup ops (and every op when the
+    // record timebase failed the start-time consistency check) push their
+    // OpRecord slot as an external correlation id, which pins the join
+    // exactly.  Bulk ops push nothing: their kernels resolve after the
+    // session from launch-time containment, keeping the steady-state
+    // dispatch path free of library calls.
     if (g_gpu_trace.load(std::memory_order_acquire)) {
-        rec_.trace_pushed_ =
-            cupti_push_ext(static_cast<uint64_t>(rec_.slot_));
+        const bool warmup =
+            g_ext_warmup.fetch_add(1, std::memory_order_relaxed) <
+            kExtWarmupOps;
+        if (warmup || g_ext_corr_mode.load(std::memory_order_acquire)) {
+            rec_.trace_pushed_ =
+                cupti_push_ext(static_cast<uint64_t>(rec_.slot_));
+        }
     }
     if (!g_gpu_timing.load(std::memory_order_acquire)) return;
     const auto stream = cuda::getCurrentCUDAStream();
@@ -309,6 +321,7 @@ GpuTimerPair::~GpuTimerPair() {}
 void GpuTimerPair::arm(const Device&) {}
 void GpuTimerPair::close() {}
 TENSORPLAY_API std::atomic<bool> g_gpu_timing{false};
+TENSORPLAY_API std::atomic<uint32_t> g_ext_warmup{0};
 TENSORPLAY_API void gpu_resolve_all(
         std::vector<Event>&,
         const std::function<void(Event&, float)>&) {}

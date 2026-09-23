@@ -15,6 +15,7 @@
 #include "DispatchKey.h"
 #include "Dispatcher.h"
 #include "InferenceMode.h"
+#include "IntrusivePtr.h"
 #include "MemoryFormat.h"
 #include "VariableVersion.h"
 #include "Storage.h"
@@ -26,7 +27,7 @@ namespace tensorplay {
 class Tensor;
 class Quantizer;
 
-class P10_API TensorImpl {
+class P10_API TensorImpl : public IntrusivePtrTarget {
 private:
     size_t storage_offset_;
     SizesAndStrides sizes_and_strides_;
@@ -78,10 +79,10 @@ private:
     struct SparseState {
         int layout = 0;  // 0 = SparseCOO, 1 = SparseCSR, 2 = SparseCSC,
                          // 3 = SparseBSR, 4 = SparseBSC
-        std::shared_ptr<TensorImpl> indices;
-        std::shared_ptr<TensorImpl> values;
-        std::shared_ptr<TensorImpl> crow;
-        std::shared_ptr<TensorImpl> col;
+        intrusive_ptr<TensorImpl> indices;
+        intrusive_ptr<TensorImpl> values;
+        intrusive_ptr<TensorImpl> crow;
+        intrusive_ptr<TensorImpl> col;
         std::array<int64_t, 2> blocksize = {0, 0};
         std::vector<int64_t> sparse_sizes;
         bool coalesced = false;
@@ -95,16 +96,16 @@ private:
     // buffer.  A nested tensor reports dim() == R + 1 and numel() equal to
     // the sum of the row volumes; a single dense size does not exist.
     struct NestedState {
-        std::shared_ptr<TensorImpl> nested_sizes;
-        std::shared_ptr<TensorImpl> nested_strides;
-        std::shared_ptr<TensorImpl> storage_offsets;
+        intrusive_ptr<TensorImpl> nested_sizes;
+        intrusive_ptr<TensorImpl> nested_strides;
+        intrusive_ptr<TensorImpl> storage_offsets;
     };
     std::shared_ptr<NestedState> nested_state_;
 
     // A transform wrapper keeps the physical value separate from its public
     // logical metadata. The wrapper is immutable with respect to storage;
     // batching rules create a new wrapper for each result.
-    std::shared_ptr<TensorImpl> transform_value_;
+    intrusive_ptr<TensorImpl> transform_value_;
     int64_t transform_batch_dim_ = -1;
     int64_t transform_level_ = -1;
 
@@ -112,6 +113,16 @@ private:
     // zero point, per-channel tables) in an immutable, shared quantizer.
     // Plain integer tensors over the same storage keep this null.
     std::shared_ptr<Quantizer> quantizer_;
+
+protected:
+    // Frees the byte buffer and lightweight metadata when only weak
+    // references remain, so device memory is not pinned by an observer.
+    void release_resources() override {
+        clear_storage();
+        sparse_state_.reset();
+        nested_state_.reset();
+        transform_value_.reset();
+    }
 
 public:
     static constexpr int kSparseCOOLayout = 0;
@@ -128,7 +139,7 @@ public:
     TensorImpl(const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides, DType dtype, const Device& device = Device());
     TensorImpl(Storage storage, const std::vector<int64_t>& sizes, DType dtype, size_t storage_offset = 0);
     TensorImpl(Storage storage, const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides, DType dtype, size_t storage_offset = 0);
-    TensorImpl(std::shared_ptr<TensorImpl> transform_value,
+    TensorImpl(intrusive_ptr<TensorImpl> transform_value,
                const std::vector<int64_t>& sizes,
                const std::vector<int64_t>& strides);
     
@@ -187,9 +198,9 @@ public:
     }
     // Mounts per-constituent metadata (all three tables Int64 on the buffer
     // device) onto a flat buffer impl.
-    void set_nested_state(std::shared_ptr<TensorImpl> sizes,
-                          std::shared_ptr<TensorImpl> strides,
-                          std::shared_ptr<TensorImpl> offsets) {
+    void set_nested_state(intrusive_ptr<TensorImpl> sizes,
+                          intrusive_ptr<TensorImpl> strides,
+                          intrusive_ptr<TensorImpl> offsets) {
         auto state = std::make_shared<NestedState>();
         state->nested_sizes = std::move(sizes);
         state->nested_strides = std::move(strides);
@@ -203,8 +214,8 @@ public:
     int64_t batch_size() const {
         return is_batched() ? transform_value_->size(static_cast<size_t>(transform_batch_dim_)) : 0;
     }
-    std::shared_ptr<TensorImpl> transform_value_impl() const { return transform_value_; }
-    void set_transform_value(std::shared_ptr<TensorImpl> value,
+    intrusive_ptr<TensorImpl> transform_value_impl() const { return transform_value_; }
+    void set_transform_value(intrusive_ptr<TensorImpl> value,
                              int64_t batch_dim,
                              int64_t level) {
         transform_value_ = std::move(value);
@@ -291,20 +302,20 @@ public:
                              : std::array<int64_t, 2>{0, 0};
     }
     bool is_coalesced() const { return sparse_state_ && sparse_state_->coalesced; }
-    std::shared_ptr<TensorImpl> sparse_indices_impl() const {
+    intrusive_ptr<TensorImpl> sparse_indices_impl() const {
         return (sparse_state_ && sparse_state_->layout == kSparseCOOLayout)
                    ? sparse_state_->indices : nullptr;
     }
-    std::shared_ptr<TensorImpl> sparse_values_impl() const {
+    intrusive_ptr<TensorImpl> sparse_values_impl() const {
         return sparse_state_ ? sparse_state_->values : nullptr;
     }
     // Compressed-axis pointers (crow for CSR/BSR, ccol for CSC/BSC).
-    std::shared_ptr<TensorImpl> sparse_crow_impl() const {
+    intrusive_ptr<TensorImpl> sparse_crow_impl() const {
         return (sparse_state_ && sparse_state_->layout != kSparseCOOLayout)
                    ? sparse_state_->crow : nullptr;
     }
     // Plain-axis coordinates (col for CSR/BSR, row for CSC/BSC).
-    std::shared_ptr<TensorImpl> sparse_col_impl() const {
+    intrusive_ptr<TensorImpl> sparse_col_impl() const {
         return (sparse_state_ && sparse_state_->layout != kSparseCOOLayout)
                    ? sparse_state_->col : nullptr;
     }
@@ -312,8 +323,8 @@ public:
         static const std::vector<int64_t> empty;
         return sparse_state_ ? sparse_state_->sparse_sizes : empty;
     }
-    void set_sparse_state(std::shared_ptr<TensorImpl> indices,
-                          std::shared_ptr<TensorImpl> values,
+    void set_sparse_state(intrusive_ptr<TensorImpl> indices,
+                          intrusive_ptr<TensorImpl> values,
                           std::vector<int64_t> sparse_sizes,
                           bool coalesced) {
         sparse_state_ = std::make_shared<SparseState>();
@@ -329,9 +340,9 @@ public:
 
     // CSR layout constructor (2D only): `crow` has rows+1 entries, `col` and
     // `values` have one entry per stored element.
-    void set_sparse_csr_state(std::shared_ptr<TensorImpl> crow,
-                              std::shared_ptr<TensorImpl> col,
-                              std::shared_ptr<TensorImpl> values,
+    void set_sparse_csr_state(intrusive_ptr<TensorImpl> crow,
+                              intrusive_ptr<TensorImpl> col,
+                              intrusive_ptr<TensorImpl> values,
                               std::vector<int64_t> dense_sizes) {
         set_sparse_compressed_state(std::move(crow), std::move(col),
                                     std::move(values), std::move(dense_sizes),
@@ -341,9 +352,9 @@ public:
     // Generic compressed-layout constructor (CSR/CSC/BSR/BSC).  `crow`
     // receives the compressed-axis pointers, `col` the plain-axis
     // coordinates; `blocksize` is meaningful for the blocked layouts.
-    void set_sparse_compressed_state(std::shared_ptr<TensorImpl> crow,
-                                     std::shared_ptr<TensorImpl> col,
-                                     std::shared_ptr<TensorImpl> values,
+    void set_sparse_compressed_state(intrusive_ptr<TensorImpl> crow,
+                                     intrusive_ptr<TensorImpl> col,
+                                     intrusive_ptr<TensorImpl> values,
                                      std::vector<int64_t> dense_sizes,
                                      int layout,
                                      std::array<int64_t, 2> blocksize) {

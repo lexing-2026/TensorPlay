@@ -1082,7 +1082,7 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
             // recycled; without it a recycled impl/data address and a zeroed
             // version counter falsely match and the conv silently runs with
             // a dead tensor's reordered weights.
-            std::weak_ptr<TensorImpl> owner;
+            weak_intrusive_ptr<TensorImpl> owner;
             const void* data;
             uint32_t version;
             memory::desc source_md;
@@ -1090,7 +1090,7 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
             Storage storage;
 
             CachedWeight(
-                std::weak_ptr<TensorImpl> owner_,
+                weak_intrusive_ptr<TensorImpl> owner_,
                 const void* data_,
                 uint32_t version_,
                 const memory::desc& source_md_,

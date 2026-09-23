@@ -409,10 +409,7 @@ std::tuple<Tensor, Tensor> _prelu_kernel_backward_cpu(const Tensor& grad_output,
              "_prelu_kernel_backward: input, weight and grad_output must share "
              "one dtype");
 
-    const std::vector<int64_t> out_shape = broadcast_shapes(
-        static_cast<std::vector<int64_t>>(self.shape()),
-        static_cast<std::vector<int64_t>>(weight.shape()),
-        static_cast<std::vector<int64_t>>(grad_output.shape()));
+    const std::vector<int64_t> out_shape = broadcast_shapes(self.sizes(), weight.sizes(), grad_output.sizes());
     Tensor grad_self = Tensor::empty(out_shape, self.dtype(), self.device());
     Tensor grad_weight = Tensor::empty(out_shape, weight.dtype(), weight.device());
     if (grad_self.numel() == 0) {

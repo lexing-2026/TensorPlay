@@ -71,12 +71,11 @@ DimVector infer_size(const DimVector& a, const DimVector& b) {
 }
 
 bool same_sizes(const Tensor& a, const Tensor& b) {
-  return static_cast<std::vector<int64_t>>(a.shape())
-      == static_cast<std::vector<int64_t>>(b.shape());
+  return a.sizes() == b.sizes();
 }
 
 bool same_sizes(const Tensor& a, const DimVector& sizes) {
-  return static_cast<std::vector<int64_t>>(a.shape()) == sizes;
+  return a.sizes() == sizes;
 }
 
 bool tensors_share_storage(const Tensor& a, const Tensor& b) {

@@ -244,7 +244,7 @@ void set_data_native(Tensor& self, const Tensor& new_data) {
     reject_active_transform(self, "set_data");
     TP_CHECK(new_data.defined(), "set_data expected a defined tensor");
     self = Tensor(
-        std::make_shared<TensorImpl>(*new_data.unsafeGetTensorImpl()));
+        make_intrusive<TensorImpl>(*new_data.unsafeGetTensorImpl()));
 }
 
 // Single-output materialization: this build does not number op outputs, so

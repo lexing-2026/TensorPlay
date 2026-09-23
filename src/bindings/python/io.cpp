@@ -1453,6 +1453,6 @@ Tensor audio_to_tensor(py::object obj) {
     tensorplay::DataPtr ptr(data, deleter, Device(DeviceType::CPU, 0));
     tensorplay::Storage storage(std::move(ptr), numel * sizeof(float));
 
-    auto impl = std::make_shared<tensorplay::TensorImpl>(storage, out_shape, out_strides, DType::Float32);
+    auto impl = make_intrusive<tensorplay::TensorImpl>(storage, out_shape, out_strides, DType::Float32);
     return Tensor(impl);
 }

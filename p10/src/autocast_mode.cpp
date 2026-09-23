@@ -50,7 +50,7 @@ thread_local std::array<bool, kNumDeviceTypes> autocast_enabled = {
 namespace {
 
 struct CacheEntry {
-    std::weak_ptr<TensorImpl> source;
+    weak_intrusive_ptr<TensorImpl> source;
     Tensor casted;
     uint32_t version;
 };
@@ -144,7 +144,7 @@ void cache_store(TensorImpl* key, const Tensor& source, const Tensor& casted) {
     }
     cache.insert_or_assign(
         key,
-        CacheEntry{std::weak_ptr<TensorImpl>(source.impl()), casted,
+        CacheEntry{weak_intrusive_ptr<TensorImpl>(source.impl()), casted,
                    source.unsafeGetTensorImpl()->version()});
 }
 
