@@ -16,6 +16,7 @@
 #include <string>
 #include <mutex>
 #include <memory>
+#include <cstdint>
 
 #ifdef USE_CUDNN
 #include <cudnn.h>
@@ -29,6 +30,170 @@ namespace fe = cudnn_frontend;
 
 namespace tensorplay {
 namespace cuda {
+
+template <typename InputT, typename AccT, typename OutputT>
+__global__ void conv2d_grad_bias_reduce_kernel(
+    const InputT* __restrict__ grad_output, int64_t batch, int64_t channels,
+    int64_t spatial, OutputT* __restrict__ grad_bias) {
+    const int64_t channel = static_cast<int64_t>(blockIdx.x);
+    if (channel >= channels) return;
+
+    const int64_t channel_stride = channels * spatial;
+    AccT value = AccT(0);
+    for (int64_t n = 0; n < batch; ++n) {
+        const InputT* row = grad_output + n * channel_stride + channel * spatial;
+        for (int64_t offset = threadIdx.x; offset < spatial;
+             offset += static_cast<int64_t>(blockDim.x)) {
+            value += static_cast<AccT>(row[offset]);
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    __shared__ AccT warp_values[32];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_values[warp] = value;
+    __syncthreads();
+
+    if (warp == 0) {
+        const int warp_count = (blockDim.x + 31) / 32;
+        value = lane < warp_count ? warp_values[lane] : AccT(0);
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        }
+        if (lane == 0) grad_bias[channel] = static_cast<OutputT>(value);
+    }
+}
+
+template <typename OutputT>
+__global__ void conv2d_grad_bias_vec_half_kernel(
+    const Half* __restrict__ grad_output, int64_t batch, int64_t channels,
+    int64_t spatial, OutputT* __restrict__ grad_bias) {
+    const int64_t channel = static_cast<int64_t>(blockIdx.x);
+    if (channel >= channels) return;
+
+    const int64_t channel_stride = channels * spatial;
+    const int64_t vector_count = spatial / 8;
+    float value = 0.0f;
+    for (int64_t n = 0; n < batch; ++n) {
+        const Half* row = grad_output + n * channel_stride + channel * spatial;
+        const float4* row_vec = reinterpret_cast<const float4*>(row);
+        for (int64_t offset = threadIdx.x; offset < vector_count;
+             offset += static_cast<int64_t>(blockDim.x)) {
+            const float4 packed = row_vec[offset];
+            const __half2 h0 = *reinterpret_cast<const __half2*>(&packed.x);
+            const __half2 h1 = *reinterpret_cast<const __half2*>(&packed.y);
+            const __half2 h2 = *reinterpret_cast<const __half2*>(&packed.z);
+            const __half2 h3 = *reinterpret_cast<const __half2*>(&packed.w);
+            value += __half2float(h0.x) + __half2float(h0.y) +
+                     __half2float(h1.x) + __half2float(h1.y) +
+                     __half2float(h2.x) + __half2float(h2.y) +
+                     __half2float(h3.x) + __half2float(h3.y);
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    __shared__ float warp_values[32];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_values[warp] = value;
+    __syncthreads();
+
+    if (warp == 0) {
+        const int warp_count = (blockDim.x + 31) / 32;
+        value = lane < warp_count ? warp_values[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        }
+        if (lane == 0) grad_bias[channel] = static_cast<OutputT>(value);
+    }
+}
+
+template <typename OutputT>
+__global__ void conv2d_grad_bias_half2_kernel(
+    const Half* __restrict__ grad_output, int64_t batch, int64_t channels,
+    int64_t spatial, OutputT* __restrict__ grad_bias) {
+    const int64_t channel = static_cast<int64_t>(blockIdx.x);
+    if (channel >= channels) return;
+
+    const int64_t channel_stride = channels * spatial;
+    const int64_t pair_count = spatial / 2;
+    float value = 0.0f;
+    for (int64_t n = 0; n < batch; ++n) {
+        const Half* row = grad_output + n * channel_stride + channel * spatial;
+        const __half2* row_vec = reinterpret_cast<const __half2*>(row);
+        for (int64_t offset = threadIdx.x; offset < pair_count;
+             offset += static_cast<int64_t>(blockDim.x)) {
+            const __half2 pair = row_vec[offset];
+            value += __half2float(pair.x) + __half2float(pair.y);
+        }
+        if ((spatial & 1) != 0 && threadIdx.x == 0) {
+            value += static_cast<float>(row[spatial - 1]);
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    __shared__ float warp_values[32];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_values[warp] = value;
+    __syncthreads();
+
+    if (warp == 0) {
+        const int warp_count = (blockDim.x + 31) / 32;
+        value = lane < warp_count ? warp_values[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        }
+        if (lane == 0) grad_bias[channel] = static_cast<OutputT>(value);
+    }
+}
+
+template <typename InputT, typename AccT, typename OutputT>
+__global__ void conv2d_grad_bias_strided_kernel(
+    const InputT* __restrict__ grad_output, int64_t batch, int64_t channels,
+    int64_t height, int64_t width, int64_t stride_n, int64_t stride_c,
+    int64_t stride_h, int64_t stride_w, OutputT* __restrict__ grad_bias) {
+    const int64_t channel = static_cast<int64_t>(blockIdx.x);
+    if (channel >= channels) return;
+
+    const int64_t spatial = height * width;
+    const int64_t samples = batch * spatial;
+    AccT value = AccT(0);
+    for (int64_t sample = threadIdx.x; sample < samples;
+         sample += static_cast<int64_t>(blockDim.x)) {
+        const int64_t n = sample / spatial;
+        const int64_t position = sample - n * spatial;
+        const int64_t h = position / width;
+        const int64_t w = position - h * width;
+        value += static_cast<AccT>(grad_output[
+            n * stride_n + channel * stride_c + h * stride_h + w * stride_w]);
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    __shared__ AccT warp_values[32];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_values[warp] = value;
+    __syncthreads();
+
+    if (warp == 0) {
+        const int warp_count = (blockDim.x + 31) / 32;
+        value = lane < warp_count ? warp_values[lane] : AccT(0);
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        }
+        if (lane == 0) grad_bias[channel] = static_cast<OutputT>(value);
+    }
+}
 
 #ifdef USE_CUDNN
 Tensor& relu_inplace_kernel_cudnn(Tensor& self);
@@ -855,6 +1020,10 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
     static std::mutex g_conv_cache_mutex;
 
     const bool use_channels_last = is_channels_last_4d(input);
+    const bool post_bias_add =
+        bias.defined() && bias.numel() != 0 && !fused_relu &&
+        !use_channels_last &&
+        (input.dtype() == DType::Float16 || input.dtype() == DType::BFloat16);
     const std::array<int64_t, 4> x_stride{
         input.stride(0), input.stride(1), input.stride(2), input.stride(3)};
     const std::array<int64_t, 4> w_stride{
@@ -868,7 +1037,7 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
     ConvKey key{dtype, N, C, H, W, K, R, S, groups,
                 padding[0], padding[1], stride[0], stride[1], dilation[0], dilation[1],
                 static_cast<int>(input.device().index()),
-                bias.defined(), fused_relu, conv_autotune_enabled(),
+                bias.defined() && !post_bias_add, fused_relu, conv_autotune_enabled(),
                 x_stride, w_stride, y_stride};
 
     cudnnHandle_t handle = CUDAContext::getCudnnHandle();
@@ -1134,6 +1303,18 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
 
     run_plan(*plan, workspace.get(), workspace_size);
 
+    if (post_bias_add) {
+        Tensor bias_c = bias.is_contiguous() ? bias : bias.contiguous();
+        Tensor bias_4d = bias_c.reshape({1, K, 1, 1});
+        auto bias_desc = get_cached_tensor_desc(bias_4d);
+        auto out_desc = get_cached_tensor_desc(out);
+        float alpha = 1.0f;
+        float beta = 1.0f;
+        CUDNN_CHECK(cudnnAddTensor(
+            handle, &alpha, *bias_desc, bias_4d.data_ptr(), &beta,
+            *out_desc, out.data_ptr()));
+    }
+
     return out;
 #else
     return conv2d_cudnn_legacy(
@@ -1175,9 +1356,15 @@ Tensor conv2d_grad_input_cuda(const Tensor& grad_output, const Tensor& input, co
 
     // Backward grads can arrive as broadcast views (e.g. after .sum()); cuDNN
     // needs contiguous NCHW.
+    const DType result_dtype = input.dtype();
     Tensor grad_output_c = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor input_c = input.is_contiguous() ? input : input.contiguous();
     Tensor weight_c = weight.is_contiguous() ? weight : weight.contiguous();
+    const DType compute_dtype = weight_c.dtype();
+    if (input_c.dtype() != compute_dtype) input_c = input_c.to(compute_dtype);
+    if (grad_output_c.dtype() != compute_dtype) {
+        grad_output_c = grad_output_c.to(compute_dtype);
+    }
 
     cudnnHandle_t handle = CUDAContext::getCudnnHandle();
 
@@ -1255,7 +1442,7 @@ Tensor conv2d_grad_input_cuda(const Tensor& grad_output, const Tensor& input, co
     
     CUDNN_CHECK(cudnnConvolutionBackwardData(handle, alpha_p, *w_desc, weight_c.data_ptr(), *dy_desc, grad_output_c.data_ptr(), *conv_desc, algo, workspace.get(), workspace_size, beta_p, *dx_desc, grad_input.data_ptr()));
     
-    return grad_input;
+    return grad_input.dtype() == result_dtype ? grad_input : grad_input.to(result_dtype);
 #else
     TP_THROW(NotImplementedError, "conv2d_grad_input_cuda requires cuDNN");
 #endif
@@ -1276,18 +1463,24 @@ Tensor conv2d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input, c
     Tensor grad_output_c = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor input_c = input.is_contiguous() ? input : input.contiguous();
     Tensor weight_c = weight.is_contiguous() ? weight : weight.contiguous();
+    const DType compute_dtype = weight_c.dtype();
+    if (input_c.dtype() != compute_dtype) input_c = input_c.to(compute_dtype);
+    if (grad_output_c.dtype() != compute_dtype) {
+        grad_output_c = grad_output_c.to(compute_dtype);
+    }
     
     cudnnHandle_t handle = CUDAContext::getCudnnHandle();
     
     auto x_desc = get_cached_tensor_desc(input_c);
     auto dy_desc = get_cached_tensor_desc(grad_output_c);
-    auto dw_desc = get_cached_filter_desc(weight_c); // grad_weight has same shape as weight
     
     auto conv_desc = get_cached_conv_desc(
         (int)padding[0], (int)padding[1], (int)stride[0], (int)stride[1],
         (int)dilation[0], (int)dilation[1], (int)groups, input_c.dtype());
     
-    Tensor grad_weight = Tensor::empty_like(weight_c, DType::Undefined, weight_c.device());
+    Tensor grad_weight_compute = Tensor::empty_like(
+        weight_c, compute_dtype, weight_c.device());
+    auto dw_desc = get_cached_filter_desc(grad_weight_compute);
     
     ConvBwdKey cache_key = make_conv_bwd_key(
         1, input_c, weight_c, grad_output_c, stride, padding, dilation, groups);
@@ -1309,7 +1502,7 @@ Tensor conv2d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input, c
             if (conv_autotune_enabled()) {
                 entry = autotune_conv_bwd_filter(handle, *x_desc, input_c.data_ptr(),
                                                  *dy_desc, grad_output_c.data_ptr(), *conv_desc,
-                                                 *dw_desc, grad_weight.data_ptr(), input_c.device());
+                                                 *dw_desc, grad_weight_compute.data_ptr(), input_c.device());
             } else {
                 cudnnConvolutionBwdFilterAlgoPerf_t perf_results;
                 int returned_algo_count = 0;
@@ -1343,9 +1536,12 @@ Tensor conv2d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input, c
         alpha_p = &alpha_d; beta_p = &beta_d;
     }
     
-    CUDNN_CHECK(cudnnConvolutionBackwardFilter(handle, alpha_p, *x_desc, input_c.data_ptr(), *dy_desc, grad_output_c.data_ptr(), *conv_desc, algo, workspace.get(), workspace_size, beta_p, *dw_desc, grad_weight.data_ptr()));
+    CUDNN_CHECK(cudnnConvolutionBackwardFilter(handle, alpha_p, *x_desc, input_c.data_ptr(), *dy_desc, grad_output_c.data_ptr(), *conv_desc, algo, workspace.get(), workspace_size, beta_p, *dw_desc, grad_weight_compute.data_ptr()));
     
-    return grad_weight;
+    const DType result_dtype = weight.dtype();
+    return grad_weight_compute.dtype() == result_dtype
+        ? grad_weight_compute
+        : grad_weight_compute.to(result_dtype);
 #else
     TP_THROW(NotImplementedError, "conv2d_grad_weight_cuda requires cuDNN");
 #endif
@@ -1359,26 +1555,161 @@ Tensor conv2d_grad_bias_cuda(const Tensor& grad_output, const Tensor& input, con
     }
 #endif
 #ifdef USE_CUDNN
-    Tensor grad_output_c = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
-
-    cudnnHandle_t handle = CUDAContext::getCudnnHandle();
-
-    auto dy_desc = get_cached_tensor_desc(grad_output_c);
-
-    Tensor grad_bias = Tensor::empty({grad_output_c.size(1)}, grad_output_c.dtype(), grad_output_c.device());
-
-    Tensor grad_bias_reshaped = grad_bias.reshape({1, grad_bias.size(0), 1, 1});
-    auto db_desc = get_cached_tensor_desc(grad_bias_reshaped);
-
-    float alpha = 1.0f, beta = 0.0f;
-    double alpha_d = 1.0, beta_d = 0.0;
-    void *alpha_p = &alpha, *beta_p = &beta;
-    if (grad_output_c.dtype() == DType::Float64) {
-        alpha_p = &alpha_d; beta_p = &beta_d;
+    Tensor grad_output_c = grad_output;
+    const DType result_dtype = weight.dtype();
+    const bool preserve_half =
+        grad_output_c.dtype() == DType::Float16 &&
+        (result_dtype == DType::Float16 || result_dtype == DType::Float32);
+    if (!preserve_half && grad_output_c.dtype() != result_dtype) {
+        grad_output_c = grad_output_c.to(result_dtype);
     }
-
-    CUDNN_CHECK(cudnnConvolutionBackwardBias(handle, alpha_p, *dy_desc, grad_output_c.data_ptr(), beta_p, *db_desc, grad_bias.data_ptr()));
-
+    const int64_t batch = grad_output_c.size(0);
+    const int64_t channels = grad_output_c.size(1);
+    const int64_t height = grad_output_c.size(2);
+    const int64_t width = grad_output_c.size(3);
+    const int64_t spatial = height * width;
+    int threads = 32;
+    while (threads < spatial && threads < 512) threads <<= 1;
+    Tensor grad_bias = Tensor::empty({channels}, result_dtype, grad_output_c.device());
+    const auto stream = getCurrentCUDAStream().stream();
+    const bool strided = !grad_output_c.is_contiguous();
+    if (strided && grad_output_c.dim() == 4) {
+        const int64_t stride_n = grad_output_c.stride(0);
+        const int64_t stride_c = grad_output_c.stride(1);
+        const int64_t stride_h = grad_output_c.stride(2);
+        const int64_t stride_w = grad_output_c.stride(3);
+        switch (grad_output_c.dtype()) {
+            case DType::Float16:
+                if (result_dtype == DType::Float32) {
+                    conv2d_grad_bias_strided_kernel<Half, float, float>
+                        <<<static_cast<unsigned>(channels), threads, 0, stream>>>(
+                            grad_output_c.data_ptr<Half>(), batch, channels, height, width,
+                            stride_n, stride_c, stride_h, stride_w,
+                            grad_bias.data_ptr<float>());
+                } else {
+                    conv2d_grad_bias_strided_kernel<Half, float, Half>
+                        <<<static_cast<unsigned>(channels), threads, 0, stream>>>(
+                            grad_output_c.data_ptr<Half>(), batch, channels, height, width,
+                            stride_n, stride_c, stride_h, stride_w,
+                            grad_bias.data_ptr<Half>());
+                }
+                break;
+            case DType::BFloat16:
+                conv2d_grad_bias_strided_kernel<BFloat16, float, BFloat16>
+                    <<<static_cast<unsigned>(channels), threads, 0, stream>>>(
+                        grad_output_c.data_ptr<BFloat16>(), batch, channels, height, width,
+                        stride_n, stride_c, stride_h, stride_w,
+                        grad_bias.data_ptr<BFloat16>());
+                break;
+            case DType::Float32:
+                conv2d_grad_bias_strided_kernel<float, float, float>
+                    <<<static_cast<unsigned>(channels), threads, 0, stream>>>(
+                        grad_output_c.data_ptr<float>(), batch, channels, height, width,
+                        stride_n, stride_c, stride_h, stride_w,
+                        grad_bias.data_ptr<float>());
+                break;
+            case DType::Float64:
+                conv2d_grad_bias_strided_kernel<double, double, double>
+                    <<<static_cast<unsigned>(channels), threads, 0, stream>>>(
+                        grad_output_c.data_ptr<double>(), batch, channels, height, width,
+                        stride_n, stride_c, stride_h, stride_w,
+                        grad_bias.data_ptr<double>());
+                break;
+            default:
+                TP_THROW(NotImplementedError, "conv2d_grad_bias_cuda: unsupported dtype");
+        }
+        TP_CONV_CUDA_CHECK(cudaGetLastError());
+        return grad_bias;
+    }
+    if (!grad_output_c.is_contiguous()) grad_output_c = grad_output_c.contiguous();
+    switch (grad_output_c.dtype()) {
+        case DType::Float16:
+            if (result_dtype == DType::Float32) {
+                const bool vectorizable =
+                    (spatial % 8) == 0 &&
+                    (reinterpret_cast<uintptr_t>(grad_output_c.data_ptr()) & 15u) == 0;
+                if (vectorizable) {
+                    const int64_t vector_count = spatial / 8;
+                    int vector_threads = 32;
+                    while (vector_threads < vector_count && vector_threads < 512) {
+                        vector_threads <<= 1;
+                    }
+                    conv2d_grad_bias_vec_half_kernel<float>
+                        <<<static_cast<unsigned>(channels), vector_threads, 0, stream>>>(
+                            grad_output_c.data_ptr<Half>(), batch, channels, spatial,
+                            grad_bias.data_ptr<float>());
+                } else if ((spatial & 1) == 0 &&
+                           (reinterpret_cast<uintptr_t>(grad_output_c.data_ptr()) & 3u) == 0) {
+                    const int64_t pair_count = spatial / 2;
+                    int pair_threads = 32;
+                    while (pair_threads < pair_count && pair_threads < 512) {
+                        pair_threads <<= 1;
+                    }
+                    conv2d_grad_bias_half2_kernel<float>
+                        <<<static_cast<unsigned>(channels), pair_threads, 0, stream>>>(
+                            grad_output_c.data_ptr<Half>(), batch, channels, spatial,
+                            grad_bias.data_ptr<float>());
+                } else {
+                    conv2d_grad_bias_reduce_kernel<Half, float, float>
+                        <<<static_cast<unsigned>(channels), threads, 0, stream>>>(
+                            grad_output_c.data_ptr<Half>(), batch, channels, spatial,
+                            grad_bias.data_ptr<float>());
+                }
+            } else {
+                const bool vectorizable =
+                    (spatial % 8) == 0 &&
+                    (reinterpret_cast<uintptr_t>(grad_output_c.data_ptr()) & 15u) == 0;
+                if (vectorizable) {
+                    const int64_t vector_count = spatial / 8;
+                    int vector_threads = 32;
+                    while (vector_threads < vector_count && vector_threads < 512) {
+                        vector_threads <<= 1;
+                    }
+                    conv2d_grad_bias_vec_half_kernel<Half>
+                        <<<static_cast<unsigned>(channels), vector_threads, 0, stream>>>(
+                            grad_output_c.data_ptr<Half>(), batch, channels, spatial,
+                            grad_bias.data_ptr<Half>());
+                } else if ((spatial & 1) == 0 &&
+                           (reinterpret_cast<uintptr_t>(grad_output_c.data_ptr()) & 3u) == 0) {
+                    const int64_t pair_count = spatial / 2;
+                    int pair_threads = 32;
+                    while (pair_threads < pair_count && pair_threads < 512) {
+                        pair_threads <<= 1;
+                    }
+                    conv2d_grad_bias_half2_kernel<Half>
+                        <<<static_cast<unsigned>(channels), pair_threads, 0, stream>>>(
+                            grad_output_c.data_ptr<Half>(), batch, channels, spatial,
+                            grad_bias.data_ptr<Half>());
+                } else {
+                    conv2d_grad_bias_reduce_kernel<Half, float, Half>
+                        <<<static_cast<unsigned>(channels), threads, 0, stream>>>(
+                            grad_output_c.data_ptr<Half>(), batch, channels, spatial,
+                            grad_bias.data_ptr<Half>());
+                }
+            }
+            break;
+        case DType::BFloat16:
+            conv2d_grad_bias_reduce_kernel<BFloat16, float, BFloat16>
+                <<<static_cast<unsigned>(channels), threads, 0, stream>>>(
+                    grad_output_c.data_ptr<BFloat16>(), batch, channels, spatial,
+                    grad_bias.data_ptr<BFloat16>());
+            break;
+        case DType::Float32:
+            conv2d_grad_bias_reduce_kernel<float, float, float>
+                <<<static_cast<unsigned>(channels), threads, 0, stream>>>(
+                    grad_output_c.data_ptr<float>(), batch, channels, spatial,
+                    grad_bias.data_ptr<float>());
+            break;
+        case DType::Float64:
+            conv2d_grad_bias_reduce_kernel<double, double, double>
+                <<<static_cast<unsigned>(channels), threads, 0, stream>>>(
+                    grad_output_c.data_ptr<double>(), batch, channels, spatial,
+                    grad_bias.data_ptr<double>());
+            break;
+        default:
+            TP_THROW(NotImplementedError, "conv2d_grad_bias_cuda: unsupported dtype");
+    }
+    TP_CONV_CUDA_CHECK(cudaGetLastError());
     return grad_bias;
 #else
     TP_THROW(NotImplementedError, "conv2d_grad_bias_cuda requires cuDNN");
