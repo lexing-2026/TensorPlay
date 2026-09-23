@@ -1359,26 +1359,26 @@ Tensor conv2d_grad_bias_cuda(const Tensor& grad_output, const Tensor& input, con
     }
 #endif
 #ifdef USE_CUDNN
-    cudnnHandle_t handle = CUDAContext::getCudnnHandle();
-    
     Tensor grad_output_c = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
-    
+
+    cudnnHandle_t handle = CUDAContext::getCudnnHandle();
+
     auto dy_desc = get_cached_tensor_desc(grad_output_c);
-    
+
     Tensor grad_bias = Tensor::empty({grad_output_c.size(1)}, grad_output_c.dtype(), grad_output_c.device());
-    
+
     Tensor grad_bias_reshaped = grad_bias.reshape({1, grad_bias.size(0), 1, 1});
     auto db_desc = get_cached_tensor_desc(grad_bias_reshaped);
-    
+
     float alpha = 1.0f, beta = 0.0f;
     double alpha_d = 1.0, beta_d = 0.0;
     void *alpha_p = &alpha, *beta_p = &beta;
     if (grad_output_c.dtype() == DType::Float64) {
         alpha_p = &alpha_d; beta_p = &beta_d;
     }
-    
+
     CUDNN_CHECK(cudnnConvolutionBackwardBias(handle, alpha_p, *dy_desc, grad_output_c.data_ptr(), beta_p, *db_desc, grad_bias.data_ptr()));
-    
+
     return grad_bias;
 #else
     TP_THROW(NotImplementedError, "conv2d_grad_bias_cuda requires cuDNN");
