@@ -1184,9 +1184,14 @@ public:
     }
 
     tensorplay::tpx::variable_list apply(tensorplay::tpx::variable_list&& inputs) override {
-        if (std::getenv("TP_ENGINE_TRACE")) fprintf(stderr, "[tp-engine] PyNode: acquiring GIL\n");
+        // One static probe instead of a getenv call per backward evaluation.
+        static const bool kTrace = [] {
+            const char* e = std::getenv("TP_ENGINE_TRACE");
+            return e && e[0] != '\0';
+        }();
+        if (kTrace) fprintf(stderr, "[tp-engine] PyNode: acquiring GIL\n");
         py::gil_scoped_acquire gil;
-        if (std::getenv("TP_ENGINE_TRACE")) fprintf(stderr, "[tp-engine] PyNode: GIL acquired, calling backward\n");
+        if (kTrace) fprintf(stderr, "[tp-engine] PyNode: GIL acquired, calling backward\n");
 
         // Convert C++ grads to a positional args TUPLE directly (no
         // intermediate py::list): one allocation, PyTuple_SET_ITEM fills.
@@ -1201,12 +1206,16 @@ public:
         }
         inputs.clear();
 
-        // Call backward on the context object
-        if (!py::hasattr(py_ctx_, "backward")) {
-             throw std::runtime_error("PyNode context object has no 'backward' method");
+        // Call backward on the context object.  One lookup covers both the
+        // presence check and the invocation (a missing attribute is turned
+        // into the runtime error below, matching the previous hasattr gate).
+        py::object backward_fn;
+        try {
+            backward_fn = py_ctx_.attr("backward");
+        } catch (const py::error_already_set&) {
+            throw std::runtime_error("PyNode context object has no 'backward' method");
         }
-
-        py::object result_obj = py_ctx_.attr("backward")(*py_inputs);
+        py::object result_obj = backward_fn(*py_inputs);
         if (std::getenv("TP_ENGINE_TRACE")) fprintf(stderr, "[tp-engine] PyNode: backward returned\n");
 
         tensorplay::tpx::variable_list results;
@@ -1739,13 +1748,23 @@ void init_autograd(py::module_& m) {
                 } else if (py::isinstance<py::sequence>(output)) {
                     for (auto item : output.cast<py::sequence>()) mark(item);
                 }
-                ctx.attr("_outputs") = py::isinstance<py::tuple>(output)
-                    ? output
-                    : (py::isinstance<py::list>(output)
-                           ? py::tuple(output.cast<py::sequence>())
-                           : py::make_tuple(output));
-                ctx.attr("requires_grad") = true;
-                ctx.attr("backward_fn") = py::none();  // set by Python later
+                // The engine zero-fills missing gradients from the per-output
+                // metadata recorded above, so the raw output tensors never
+                // need to be held on ctx here.  Retaining them would close a
+                // reference cycle (ctx -> output -> grad_fn -> ctx) that
+                // Python's collector cannot see through the C++ node.  Only
+                // users who opt out of engine materialization keep the
+                // outputs for the Python fallback that fills None grads from
+                // their shapes.  The other attrs the Python layer reads are
+                // all assigned there after this call returns.
+                ctx.attr("_n_outputs") = idx;
+                if (!py::cast<bool>(ctx.attr("materialize_grads"))) {
+                    ctx.attr("_outputs") = py::isinstance<py::tuple>(output)
+                        ? output
+                        : (py::isinstance<py::list>(output)
+                               ? py::tuple(output.cast<py::sequence>())
+                               : py::make_tuple(output));
+                }
             }
             return py::make_tuple(output, ctx, needs, executable,
                                    node);

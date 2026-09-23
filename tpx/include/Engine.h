@@ -7,6 +7,7 @@
 #include <functional>
 #include <thread>
 #include <optional>
+#include <atomic>
 #include <unordered_map>
 #include <cstdint>
 #include "Macros.h"
@@ -40,10 +41,16 @@ public:
         }
     };
 
+    // Pre-reserving the heap keeps the first graph's task churn from growing
+    // the bucket repeatedly; queues are process-lifetime so the capacity
+    // persists across all executions.
+    void reserve(size_t n) { heap_.reserve(n); }
+
     void push(NodeTask task) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            heap_.push(std::move(task));
+            heap_.push_back(std::move(task));
+            sift_up(heap_.size() - 1);
         }
         cv_.notify_one();
     }
@@ -56,8 +63,15 @@ public:
         std::unique_lock<std::mutex> lock(mutex_);
         for (;;) {
             if (!heap_.empty()) {
-                auto task = std::move(const_cast<NodeTask&>(heap_.top()));
-                heap_.pop();
+                // Take the last element; when it is the root (size == 1) no
+                // reheapify is needed.  Swapping rather than assigning keeps
+                // self-move out of the picture (front == back at size 1).
+                NodeTask task = std::move(heap_.back());
+                heap_.pop_back();
+                if (!heap_.empty()) {
+                    std::swap(heap_.front(), task);
+                    sift_down(0);
+                }
                 return task;
             }
             if (stop()) return std::nullopt;
@@ -78,9 +92,35 @@ public:
     }
 
 private:
+    // Flat binary max-heap over a vector (ordering by sequence_nr, max at
+    // root).  The vector is reserved at construction, so steady-state
+    // push/pop never allocates; a single mutex still guards it.
+    void sift_up(size_t idx) {
+        while (idx > 0) {
+            size_t parent = (idx - 1) / 2;
+            if (!(heap_[parent] < heap_[idx])) break;
+            std::swap(heap_[parent], heap_[idx]);
+            idx = parent;
+        }
+    }
+
+    void sift_down(size_t idx) {
+        const size_t n = heap_.size();
+        for (;;) {
+            size_t largest = idx;
+            size_t l = 2 * idx + 1;
+            size_t r = l + 1;
+            if (l < n && heap_[largest] < heap_[l]) largest = l;
+            if (r < n && heap_[largest] < heap_[r]) largest = r;
+            if (largest == idx) break;
+            std::swap(heap_[idx], heap_[largest]);
+            idx = largest;
+        }
+    }
+
     std::mutex mutex_;
     std::condition_variable cv_;
-    std::priority_queue<NodeTask> heap_;
+    std::vector<NodeTask> heap_;
 };
 
 class TENSORPLAY_API Engine {
@@ -131,6 +171,10 @@ private:
     // (the engine is a process-lifetime singleton; workers may outlive users).
     std::unordered_map<int, ReadyQueue*> ready_queues_;
     std::unordered_map<int, std::thread> device_threads_;
+    // Cached pointer to the CPU queue (device index -1).  The queue is
+    // process-lifetime and never replaced, so the hot path reads this instead
+    // of taking queues_mutex_ on every node/edge completion.
+    std::atomic<ReadyQueue*> cpu_queue_cache_{nullptr};
 
     // Depth of nested execute() calls on this thread. Backed by a
     // file-local thread_local in Engine.cpp: MSVC forbids thread storage

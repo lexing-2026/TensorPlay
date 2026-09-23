@@ -163,16 +163,25 @@ Engine& Engine::get_default_engine() {
 }
 
 ReadyQueue* Engine::queue_for_device(int device_index) {
+    if (device_index == -1) {
+        // CPU queue is created on first use and never replaced.
+        if (ReadyQueue* cached = cpu_queue_cache_.load(std::memory_order_acquire)) {
+            return cached;
+        }
+    }
     std::lock_guard<std::mutex> lock(queues_mutex_);
     auto it = ready_queues_.find(device_index);
     if (it != ready_queues_.end()) return it->second;
 
     auto* queue = new ReadyQueue();
+    queue->reserve(64);
     ready_queues_[device_index] = queue;
     if (device_index >= 0) {
         // Spawn one persistent worker per CUDA device on first use, matching
         device_threads_.emplace(
             device_index, std::thread([this, queue] { worker_main(*queue); }));
+    } else {
+        cpu_queue_cache_.store(queue, std::memory_order_release);
     }
     return queue;
 }
@@ -192,7 +201,13 @@ void Engine::execute_task(ReadyQueue::NodeTask&& task, ReadyQueue& cpu_queue,
     if (engine_trace_enabled()) fprintf(stderr, "[tp-engine] exec node %s\n", task.fn_->name().c_str());
     try {
         GraphTaskGuard graph_guard(&graph);
-        ::tensorplay::impl::DispatchModeStateGuard modes_guard(graph.dispatch_modes_);
+        // The dispatch-mode snapshot is empty in the common case (no Python
+        // dispatch modes active); skip installing a guard so the per-node
+        // execution avoids copying an (empty) vector.
+        std::optional<::tensorplay::impl::DispatchModeStateGuard> modes_guard;
+        if (!graph.dispatch_modes_.stack.empty()) {
+            modes_guard.emplace(graph.dispatch_modes_);
+        }
         evaluate_function(graph, task.fn_.get(), task.input_buffer_, cpu_queue, local_queue);
     } catch (...) {
         // A failing node must not hang the whole backward: record the error
@@ -215,7 +230,7 @@ void Engine::queue_callback(std::function<void()> callback) {
 void Engine::compute_dependencies(Node* root, GraphTask& task, uint64_t min_topo_nr) {
     // Computes the number of dependencies for each function which requires grad
     std::vector<Node*> queue{root};
-    auto& dependencies = task.dependencies_;
+    auto& states = task.not_ready_;
     auto& nodes_in_graph = task.nodes_in_graph_;
     while (!queue.empty()) {
         auto fn = queue.back();
@@ -226,14 +241,14 @@ void Engine::compute_dependencies(Node* root, GraphTask& task, uint64_t min_topo
         }
         for (const auto& edge : fn->next_edges()) {
             if (auto next_ptr = edge.function.get()) {
-                dependencies[next_ptr] += 1;
+                states[next_ptr].remaining_deps += 1;
                 if (EngineTrace::level() >= 2) {
                     char from[128], to[128];
                     EngineTrace::node_label(from, sizeof(from), fn);
                     EngineTrace::node_label(to, sizeof(to), next_ptr);
                     EngineTrace::emit(
                         task.trace_id_, "dep  %s -> %s (count=%d)",
-                        from, to, dependencies[next_ptr]);
+                        from, to, states[next_ptr].remaining_deps);
                 }
                 const bool was_inserted = nodes_in_graph.insert(next_ptr).second;
                 if (was_inserted) {
@@ -550,50 +565,40 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
         // counters and not_ready buffers are shared across workers, so all
         // bookkeeping happens under the task mutex.
         bool is_ready = false;
-        bool enqueue_now = false;
-        ReadyQueue::NodeTask pending(nullptr, InputBuffer(), &task);
+        std::optional<ReadyQueue::NodeTask> pending;
         {
             std::lock_guard<std::mutex> lock(task.mutex_);
-            auto& dependencies = task.dependencies_;
-            auto it = dependencies.find(next.function.get());
-            if (it == dependencies.end()) {
+            auto it = task.not_ready_.find(next.function.get());
+            if (it == task.not_ready_.end()) {
                 TP_THROW(RuntimeError, "dependency not found for node ", func->sequence_nr());
-            } else if (--it->second == 0) {
-                dependencies.erase(it);
+            }
+            auto& state = it->second;
+            if (--state.remaining_deps == 0) {
                 is_ready = true;
             }
 
-            auto& not_ready = task.not_ready_;
-            auto not_ready_it = not_ready.find(next.function.get());
-            if (not_ready_it == not_ready.end()) {
-                // Skip functions that aren't supposed to be executed
+            // Skip functions that aren't supposed to be executed.  The
+            // check runs on the first delivery only: a skipped node never
+            // receives a buffer, so later deliveries mirror this decision.
+            if (state.buffer.buffer.empty()) {
                 if (!exec_info_.empty()) {
                     auto it2 = exec_info_.find(next.function.get());
                     if (it2 == exec_info_.end() || !it2->second.should_execute()) {
                         continue;
                     }
                 }
-                // No buffers have been allocated for the function
-                InputBuffer input_buffer(next.function->num_inputs());
-                input_buffer.add(next.input_nr, std::move(output), task.grad_mode_);
-                if (is_ready) {
-                    pending = ReadyQueue::NodeTask(next.function, std::move(input_buffer), &task);
-                    enqueue_now = true;
-                } else {
-                    not_ready.emplace(next.function.get(), std::move(input_buffer));
-                }
-            } else {
-                // The function already has a buffer
-                auto& input_buffer = not_ready_it->second;
-                input_buffer.add(next.input_nr, std::move(output), task.grad_mode_);
-                if (is_ready) {
-                    pending = ReadyQueue::NodeTask(next.function, std::move(input_buffer), &task);
-                    enqueue_now = true;
-                    not_ready.erase(not_ready_it);
-                }
+                // First gradient for this function: size the buffer to the
+                // node's input arity so apply() always sees exactly that many
+                // slots even when some arrivals are undefined.
+                state.buffer = InputBuffer(next.function->num_inputs());
+            }
+            state.buffer.add(next.input_nr, std::move(output), task.grad_mode_);
+            if (is_ready) {
+                pending.emplace(next.function, std::move(state.buffer), &task);
+                task.not_ready_.erase(it);
             }
         }
-        if (enqueue_now) {
+        if (pending.has_value()) {
             if (EngineTrace::level() >= 2) {
                 char from[128], to[128];
                 EngineTrace::node_label(from, sizeof(from), func);
@@ -603,7 +608,7 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
                                   from, to,
                                   static_cast<size_t>(next.input_nr));
             }
-            enqueue_task(task, std::move(pending), cpu_queue, local_queue);
+            enqueue_task(task, std::move(*pending), cpu_queue, local_queue);
         } else if (EngineTrace::level() >= 2 && next.is_valid()) {
             char from[128], to[128];
             EngineTrace::node_label(from, sizeof(from), func);

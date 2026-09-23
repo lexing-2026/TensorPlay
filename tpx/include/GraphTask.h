@@ -45,9 +45,16 @@ struct GraphTask {
     // nested graphs. Zero cost when tracing is off.
     uint64_t trace_id_ = 0;
 
+    // Per-node execution state.  Dependencies and the partial input buffer
+    // live in one entry so a single hash lookup covers both.  `buffer` is
+    // only populated once the node receives its first gradient.
+    struct NodeState {
+        int remaining_deps = 0;
+        InputBuffer buffer;
+    };
+
     // --- Shared state (guarded by mutex_ once execution starts) ---
-    std::unordered_map<Node*, InputBuffer> not_ready_;
-    std::unordered_map<Node*, int> dependencies_;
+    std::unordered_map<Node*, NodeState> not_ready_;
     std::unordered_set<Node*> nodes_in_graph_;
     // Empty -> execute everything (backward()). Non-empty -> only execute
     // nodes with should_execute() == true (grad()).
@@ -63,21 +70,29 @@ struct GraphTask {
     // --- Completion tracking ---
     std::mutex mutex_;
     std::condition_variable cv_;
-    // Number of NodeTasks enqueued but not yet fully evaluated.
-    uint64_t outstanding_tasks_ = 0;
-    bool completed_ = false;
+    // Number of NodeTasks enqueued but not yet fully evaluated.  Atomic so
+    // enqueue/complete accounting never takes mutex_ -- the hot path executes
+    // this twice per node.
+    std::atomic<uint64_t> outstanding_tasks_{0};
+    std::atomic<bool> completed_{false};
     // First error raised by any node; rethrown by the initiating thread.
+    // Guarded by mutex_ (only written/read on error paths).
     std::exception_ptr exception_;
 
     explicit GraphTask(bool keep_graph, bool grad_mode)
-        : keep_graph_(keep_graph), grad_mode_(grad_mode) {}
+        : keep_graph_(keep_graph), grad_mode_(grad_mode) {
+        // A fresh GraphTask is built per backward()/grad() call; pre-sizing
+        // the shared maps avoids repeated bucket rehashing while the few
+        // per-node entries are inserted.
+        not_ready_.reserve(16);
+        nodes_in_graph_.reserve(16);
+    }
 
     void init_to_execute(Node& graph_root, const edge_list& outputs, bool accumulate_grad, uint64_t min_topo_nr);
 
     // Enqueue accounting: called with mutex_ NOT held.
     void task_enqueued() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        ++outstanding_tasks_;
+        outstanding_tasks_.fetch_add(1, std::memory_order_release);
     }
 
     // Mark one dequeued task as fully evaluated; wakes the initiator when the
@@ -85,10 +100,8 @@ struct GraphTask {
     // completed, so the caller can wake the initiating thread's queue (which
     // blocks on its own CV, not on cv_).
     bool task_completed() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        --outstanding_tasks_;
-        if (outstanding_tasks_ == 0) {
-            completed_ = true;
+        if (outstanding_tasks_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            completed_.store(true, std::memory_order_release);
             cv_.notify_all();
             return true;
         }
@@ -120,14 +133,13 @@ struct GraphTask {
     }
 
     bool is_completed() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return completed_;
+        return completed_.load(std::memory_order_acquire);
     }
 
     // Block until every enqueued task has been evaluated.
     void wait_for_completion() {
         std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [this] { return completed_; });
+        cv_.wait(lock, [this] { return completed_.load(std::memory_order_acquire); });
     }
 
     // Wake every worker blocked on this task's queues (used on completion so

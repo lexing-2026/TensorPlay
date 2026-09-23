@@ -208,15 +208,15 @@ Tensor to_non_opt_primal(const Tensor& t) {
 bool has_same_fw_meta(const Tensor& base, const Tensor& other) {
     if (!base.defined() || !other.defined()) return false;
     if (base.dim() != other.dim()) return false;
-    if (base.shape() != other.shape()) return false;
+    if (base.sizes() != other.sizes()) return false;
     if (base.numel() == 0 && other.numel() == 0) return true;
     if (base.unsafeGetTensorImpl()->storage_offset() !=
         other.unsafeGetTensorImpl()->storage_offset()) {
         return false;
     }
-    const auto& base_strides = base.strides();
-    const auto& other_strides = other.strides();
-    const auto& base_sizes = base.shape();
+    const auto base_strides = base.unsafeGetTensorImpl()->strides();
+    const auto other_strides = other.unsafeGetTensorImpl()->strides();
+    const auto base_sizes = base.sizes();
     for (size_t i = 0; i < base_strides.size(); ++i) {
         if (base_strides[i] != other_strides[i] && base_sizes[i] != 1 &&
             base_sizes[i] != 0) {
@@ -286,7 +286,7 @@ void AutogradMeta::set_fw_grad(
         Tensor new_grad = new_grad_base;
 
         TP_CHECK(
-            self_base.shape() == new_grad.shape(),
+            self_base.sizes() == new_grad.sizes(),
             "Trying to set a forward gradient that has a different size than "
             "that of the original Tensor, this is not supported.");
 

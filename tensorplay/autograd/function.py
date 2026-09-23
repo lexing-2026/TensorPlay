@@ -48,7 +48,7 @@ def _collect_edges(t):
 
 def _materialize(ctx, grads):
     """Zero-fill missing output gradients using lazily captured outputs."""
-    outputs = ctx._outputs
+    outputs = getattr(ctx, "_outputs", None)
     out = []
     metas = ctx._output_grad_metas
     for i, g in enumerate(grads):
@@ -58,7 +58,7 @@ def _materialize(ctx, grads):
         if i < len(metas):
             shape, dtype, device = metas[i]
             out.append(tensorplay.zeros(shape, dtype=dtype, device=device))
-        elif i < len(outputs) and outputs[i] is not None:
+        elif outputs is not None and i < len(outputs) and outputs[i] is not None:
             o = outputs[i]
             meta = (tuple(o.shape), o.dtype, o.device)
             while len(metas) <= i:
@@ -85,8 +85,12 @@ def _make_backward(ctx, cls):
     materialize_default = getattr(ctx, "materialize_grads", True) and not engine_materializes
     backward_fn = ctx.backward_fn
     n_in = len(ctx.needs_input_grad)
-    # CustomFunctionNode semantics); unused outputs arrive absent/None.
-    n_out = len(getattr(ctx, "_outputs", ()))
+    # Output count is provided by the C++ fast path (which no longer stores
+    # the output tensors on ctx); fall back to the stored tuple for the slow
+    # path / materialize_grads=False case.
+    n_out = getattr(ctx, "_n_outputs", None)
+    if n_out is None:
+        n_out = len(getattr(ctx, "_outputs", ()))
     if n_out == 0:
         n_out = 1
 
@@ -576,11 +580,26 @@ class Function(metaclass=FunctionMeta):
 
         # ---- _wrap_outputs path: mark + attach in one pass ----
         if isinstance(output, tuple):
-            ctx._outputs = output
+            n_out = len(output)
         elif isinstance(output, list):
-            ctx._outputs = tuple(output)
+            n_out = len(output)
         else:
-            ctx._outputs = (output,)
+            n_out = 1
+        ctx._n_outputs = n_out
+        # The output tensors are only retained when Python-side
+        # materialization can run (materialize_grads=False).  Otherwise the
+        # engine zero-fills missing gradients itself from the recorded
+        # metadata, and keeping the tensors on ctx would close a reference
+        # cycle the Python collector cannot see through the C++ node.
+        if not bool(ctx.materialize_grads):
+            if isinstance(output, tuple):
+                ctx._outputs = output
+            elif isinstance(output, list):
+                ctx._outputs = tuple(output)
+            else:
+                ctx._outputs = (output,)
+        else:
+            ctx._outputs = None
         # The fused attach assumes edges were already wired by the fused
         # setup above; never mix fast-attach with slow wiring (or vice
         # versa) or the node reaches the engine with a wrong input arity.
