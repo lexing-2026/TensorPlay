@@ -79,21 +79,20 @@ def _reference(case, np_dtype, seed=0):
 
 
 class TestCol2ImCpu(unittest.TestCase):
-    def _run(self, case, np_dtype, threads=1, seed=0):
+    # The intra-op thread count is process-wide and can only be set once
+    # (later calls with a different value are rejected with a warning), so
+    # these cases run at whatever count the process was initialized with;
+    # fold numerics must not depend on it either way.
+    def _run(self, case, np_dtype, seed=0):
         expected, ints = _reference(case, np_dtype, seed)
         cols = tp.tensor(ints.astype(np_dtype))
-        old = tp.get_num_threads()
-        tp.set_num_threads(threads)
-        try:
-            got = F.fold(cols, output_size=case[2], kernel_size=case[3],
-                 dilation=case[6], padding=case[5], stride=case[4])
-        finally:
-            tp.set_num_threads(old)
+        got = F.fold(cols, output_size=case[2], kernel_size=case[3],
+                     dilation=case[6], padding=case[5], stride=case[4])
         got_np = np.array(got.numpy()).astype(np_dtype)
         maxdiff = float(np.abs(got_np - expected).max(initial=0.0))
         self.assertTrue(
             np.array_equal(got_np, expected),
-            f"case={case} dtype={np_dtype} threads={threads} maxdiff={maxdiff:.3g}",
+            f"case={case} dtype={np_dtype} maxdiff={maxdiff:.3g}",
         )
 
     def test_fold_reference_cases(self):
@@ -118,11 +117,6 @@ class TestCol2ImCpu(unittest.TestCase):
                 np.array_equal(got_np, expected),
                 f"case={case} maxdiff={float(np.abs(got_np - expected).max()):.3g}",
             )
-
-    def test_fold_threads(self):
-        for case in CASES[:4]:
-            for threads in (1, 4):
-                self._run(case, np.float32, threads=threads)
 
     def test_fold_noncontiguous_input(self):
         case = CASES[0]

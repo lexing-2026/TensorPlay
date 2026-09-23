@@ -20,6 +20,25 @@ print(dev)                      # e.g. 'cuda:0', or None on a CPU-only machine
     :nosignatures:
 
     tensorplay.accelerator.current_accelerator
+    tensorplay.accelerator.device_count
+    tensorplay.accelerator.is_available
+    tensorplay.accelerator.current_device_index
+    tensorplay.accelerator.set_device_index
+    tensorplay.accelerator.get_device_capability
+    tensorplay.accelerator.synchronize
+    tensorplay.accelerator.Graph
+```
+
+## Submodules
+
+```{eval-rst}
+.. autosummary::
+    :toctree: generated
+    :nosignatures:
+
+    tensorplay.accelerator.memory
+    tensorplay.accelerator.random
+    tensorplay.accelerator.graphs
 ```
 
 ## Where to go next

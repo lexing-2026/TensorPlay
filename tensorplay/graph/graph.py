@@ -1272,11 +1272,10 @@ class Graph:
             copied = graph.node_copy(node, lambda value: val_map[value])
             val_map[node] = copied
             memo[id(node)] = copied
-            copied.meta = copy.deepcopy(node.meta, memo)
         for node in self.nodes:
             if node.op == "output":
                 output = graph.output(map_arg(node.args[0], lambda value: val_map[value]), node.type)
-                output.meta = copy.deepcopy(node.meta, memo)
+                output.meta = copy.copy(node.meta)
                 memo[id(node)] = output
         graph._codegen = copy.deepcopy(self._codegen, memo)
         graph._co_fields = copy.deepcopy(self._co_fields, memo)

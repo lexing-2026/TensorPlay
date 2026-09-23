@@ -5,6 +5,11 @@
 namespace tensorplay {
 namespace cuda {
 
+// Reused from ArithmeticKernels.cu so the binary kernel below keeps
+// broadcasting, promotion and complex support without a second loop.
+Tensor sub_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha);
+Tensor mul_kernel(const Tensor& self, const Tensor& other);
+
 Tensor relu_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, ReluFunctor()); }
 Tensor gelu_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, GeluFunctor()); }
 Tensor silu_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, SiluFunctor()); }
@@ -91,6 +96,26 @@ struct HardswishFunctor {
         T v = x + static_cast<T>(3);
         v = v < static_cast<T>(0) ? static_cast<T>(0) : (v > static_cast<T>(6) ? static_cast<T>(6) : v);
         return x * v / static_cast<T>(6);
+    }
+};
+struct SecFunctor {
+    template<typename T> __device__ T operator()(T x) const {
+        return static_cast<T>(1) / ::cos(x);
+    }
+};
+struct CscFunctor {
+    template<typename T> __device__ T operator()(T x) const {
+        return static_cast<T>(1) / ::sin(x);
+    }
+};
+struct CotFunctor {
+    template<typename T> __device__ T operator()(T x) const {
+        return static_cast<T>(1) / ::tan(x);
+    }
+};
+struct TanhshrinkFunctor {
+    template<typename T> __device__ T operator()(T x) const {
+        return x - ::tanh(x);
     }
 };
 struct HardswishBackwardFunctor {
@@ -255,6 +280,14 @@ Tensor hardtanh_backward_kernel_cuda(const Tensor& grad_output, const Tensor& se
 }
 Tensor relu6_kernel_cuda(const Tensor& self) { return hardtanh_kernel_cuda(self, Scalar(0.0), Scalar(6.0)); }
 Tensor hardswish_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, HardswishFunctor()); }
+Tensor sec_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, SecFunctor()); }
+Tensor csc_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, CscFunctor()); }
+Tensor cot_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, CotFunctor()); }
+Tensor tanhshrink_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, TanhshrinkFunctor()); }
+Tensor squared_difference_kernel_cuda(const Tensor& self, const Tensor& other) {
+    Tensor d = sub_kernel(self, other, Scalar(1));
+    return mul_kernel(d, d);
+}
 Tensor hardswish_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self) {
     return activation_backward_kernel_cuda(grad_output, self, HardswishBackwardFunctor());
 }
@@ -432,6 +465,12 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, PointwiseKernels) {
     m.impl("relu6", relu6_kernel_cuda);
     m.impl("hardswish", hardswish_kernel_cuda);
     m.impl("hardswish_backward", hardswish_backward_kernel_cuda);
+    m.impl("sec", sec_kernel_cuda);
+    m.impl("csc", csc_kernel_cuda);
+    m.impl("cot", cot_kernel_cuda);
+    m.impl("tanhshrink", tanhshrink_kernel_cuda);
+    m.impl("squared_difference", squared_difference_kernel_cuda);
+    m.impl("swish", silu_kernel_cuda);
     m.impl("hardsigmoid", hardsigmoid_kernel_cuda);
     m.impl("hardsigmoid_backward", hardsigmoid_backward_kernel_cuda);
     m.impl("leaky_relu", leaky_relu_kernel_cuda);

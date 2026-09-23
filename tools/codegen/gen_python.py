@@ -519,6 +519,43 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
             ]
             continue
 
+        # Window factories pair a lean default schema (window_length,
+        # periodic, dtype) with extended overloads that carry layout,
+        # device, and pin_memory.  Placement kwargs ride as keywords so
+        # the binding selects the extended overload; the all-defaulted
+        # call stays on the positional fast path.
+        window_factories = {
+            # name: (public params, forwarded positional args)
+            'hann_window': ('window_length, periodic=True, dtype=None',
+                            'window_length, periodic'),
+            'hamming_window': ('window_length, periodic=True, alpha=0.54, '
+                               'beta=0.46, dtype=None',
+                               'window_length, periodic, alpha, beta'),
+            'bartlett_window': ('window_length, periodic=True, dtype=None',
+                                'window_length, periodic'),
+            'blackman_window': ('window_length, periodic=True, dtype=None',
+                                'window_length, periodic'),
+        }
+        if name in window_factories and 'function' in f.variants:
+            seen.add(name)
+            sig, fwd = window_factories[name]
+            lines += [
+                f'def {name}({sig}, *, device=None, layout=None, pin_memory=None):',
+                '    if _capturing():',
+                f'        _captured = _capture_call({name}, ({fwd}, dtype), '
+                "{'device': device, 'layout': layout, 'pin_memory': pin_memory})",
+                '        if _captured is not None:',
+                '            return _captured',
+                '    if device is None and layout is None and pin_memory is None:',
+                '        if dtype is None:',
+                '            dtype = DType.undefined',
+                f'        return _C.{name}({fwd}, dtype)',
+                f'    return _C.{name}({fwd}, dtype=dtype, layout=layout, '
+                'device=_ensure_device(device), pin_memory=pin_memory)',
+                '',
+            ]
+            continue
+
         if name == 'kaiser_window' and 'function' in f.variants:
             seen.add(name)
             # .beta overloads: kaiser_window(window_length, periodic=True,

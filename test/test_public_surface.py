@@ -29,7 +29,7 @@ class TestNamespaceWiring(unittest.TestCase):
     def test_orphan_modules_reachable(self):
         for name in (
             "signal", "distributions", "masked", "package", "testing",
-            "return_types", "cpu",
+            "return_types", "cpu", "storage",
         ):
             self.assertTrue(hasattr(tp, name), name)
             import importlib
@@ -59,15 +59,20 @@ class TestNamespaceWiring(unittest.TestCase):
         self.assertIsInstance(tp.compiled_with_cxx11_abi, bool)
 
     def test_cpu_module(self):
+        from collections.abc import Mapping
+
         self.assertTrue(tp.cpu.is_available())
         self.assertTrue(tp.cpu.is_initialized())
         self.assertEqual(tp.cpu.device_count(), 1)
-        self.assertEqual(tp.cpu.current_device(), 0)
+        self.assertEqual(tp.cpu.current_device(), "cpu")
         tp.cpu.synchronize()
         tp.cpu.set_device(0)
         caps = tp.cpu.get_capabilities()
-        self.assertIsInstance(caps, dict)
-        self.assertIn("isa", caps)
+        self.assertIsInstance(caps, Mapping)
+        self.assertIn("architecture", caps)
+        tp.cpu.current_stream()
+        with tp.cpu.stream(tp.cpu.Stream()):
+            pass
 
     def test_get_device_module(self):
         self.assertIs(tp.get_device_module("cpu"), tp.cpu)

@@ -1082,6 +1082,8 @@ __all__.extend([
     "get_deterministic_debug_mode",
     "get_float32_matmul_precision",
     "set_float32_matmul_precision",
+    "get_printoptions",
+    "printoptions",
 ])
 
 newaxis: None = None
@@ -1131,6 +1133,11 @@ from ._composite_funcs import quantile as quantile
 from ._composite_funcs import nanquantile as nanquantile
 from ._composite_funcs import histogram as histogram
 from ._finfo import finfo, iinfo
+from ._tensor_str import (
+    get_printoptions as get_printoptions,
+    printoptions as printoptions,
+    set_printoptions as set_printoptions,
+)
 # Python's ``import *`` intentionally omits underscore-prefixed names, but
 # only generated ``_foreach_*`` wrappers; their implementation is still the
 # native dispatcher/backend and this block does not introduce a Python
@@ -1355,7 +1362,8 @@ def get_device_module(device=None):
         device_module_name = Device(device).type
     elif device is None:
         from . import accelerator as _accelerator
-        device_module_name = _accelerator.current_accelerator().type
+        _acc = _accelerator.current_accelerator()
+        device_module_name = _acc.type if _acc is not None else "cpu"
     else:
         raise RuntimeError(
             f"Invalid value of device '{device}', expect tensorplay.device, str, or None"
@@ -1459,6 +1467,7 @@ else:
         "signal",
         "sparse",
         "special",
+        "storage",
         "testing",
         "vision",
     }

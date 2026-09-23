@@ -697,13 +697,29 @@ class _CompatFinder:
 
 @contextlib.contextmanager
 def _foreign_framework_compat():
-    """Enable foreign-name resolution while importing/running a hubconf entry."""
+    """Enable foreign-name resolution while importing/running a hubconf entry.
+
+    Entries already resident in sys.modules bypass meta-path finders, so any
+    foreign root loaded earlier in the process would shadow the mapping.  The
+    window temporarily evicts those entries; they are restored on exit, after
+    alias entries created inside the window are dropped so the module table
+    ends up exactly as it entered.
+    """
     finder = _CompatFinder()
+    saved: dict[str, object] = {}
+    for foreign in _COMPAT_ROOTS:
+        for name in [k for k in sys.modules if k == foreign or k.startswith(foreign + ".")]:
+            saved[name] = sys.modules.pop(name)
     sys.meta_path.insert(0, finder)
     try:
         yield
     finally:
         sys.meta_path.remove(finder)
+        for foreign in _COMPAT_ROOTS:
+            for name in [k for k in sys.modules if k == foreign or k.startswith(foreign + ".")]:
+                if name not in saved:
+                    del sys.modules[name]
+        sys.modules.update(saved)
 
 
 def _check_module_exists(name: str) -> bool:

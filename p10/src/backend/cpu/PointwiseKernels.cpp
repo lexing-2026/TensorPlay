@@ -51,6 +51,11 @@ using namespace tensorplay::parallel;
 
 namespace ops = tensorplay::tpx::ops;
 
+// Reused from ArithmeticKernels.cpp so the binary kernel below keeps
+// broadcasting, promotion and complex support without a second loop.
+Tensor sub_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha);
+Tensor mul_kernel(const Tensor& self, const Tensor& other);
+
 // --- Unary Kernels ---
 
 #ifdef USE_ONEDNN
@@ -523,6 +528,39 @@ Tensor tanh_kernel(const Tensor& self) {
         return cplx_unary_vec(self, veccomplex::Op::Tanh,
                               [](auto x) { return tensorplay::tanh(x);  });
     return unary_float_op_kernel(self, [](auto x) { return std::tanh(x); }, vecunary::VOp::Tanh);
+}
+Tensor sec_kernel_impl(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return complex_unary_op_kernel(self, [](auto x) {
+            using T = decltype(x);
+            return static_cast<T>(1) / tensorplay::cos(x);
+        });
+    return unary_float_op_kernel(self, [](auto x) { return 1 / std::cos(x); });
+}
+Tensor csc_kernel_impl(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return complex_unary_op_kernel(self, [](auto x) {
+            using T = decltype(x);
+            return static_cast<T>(1) / tensorplay::sin(x);
+        });
+    return unary_float_op_kernel(self, [](auto x) { return 1 / std::sin(x); });
+}
+Tensor cot_kernel_impl(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return complex_unary_op_kernel(self, [](auto x) {
+            using T = decltype(x);
+            return static_cast<T>(1) / tensorplay::tan(x);
+        });
+    return unary_float_op_kernel(self, [](auto x) { return 1 / std::tan(x); });
+}
+Tensor tanhshrink_kernel_impl(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return complex_unary_op_kernel(self, [](auto x) { return x - tensorplay::tanh(x); });
+    return unary_float_op_kernel(self, [](auto x) { return x - std::tanh(x); });
+}
+Tensor squared_difference_kernel_impl(const Tensor& self, const Tensor& other) {
+    Tensor d = sub_kernel(self, other, Scalar(1));
+    return mul_kernel(d, d);
 }
 Tensor exp_kernel(const Tensor& self) {
     if (isComplexType(self.dtype()))
@@ -2521,6 +2559,12 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("relu6", relu6_kernel_impl);
     m.impl("hardswish", hardswish_kernel_impl);
     m.impl("hardswish_backward", hardswish_backward_kernel_impl);
+    m.impl("sec", sec_kernel_impl);
+    m.impl("csc", csc_kernel_impl);
+    m.impl("cot", cot_kernel_impl);
+    m.impl("tanhshrink", tanhshrink_kernel_impl);
+    m.impl("squared_difference", squared_difference_kernel_impl);
+    m.impl("swish", silu_kernel);
     m.impl("hardsigmoid", hardsigmoid_kernel_impl);
     m.impl("hardsigmoid_backward", hardsigmoid_backward_kernel_impl);
     m.impl("leaky_relu", leaky_relu_kernel_impl);

@@ -2,6 +2,14 @@
 #include "tensorplay/ops/Config.h"
 #include "Context.h"
 #include "Device.h" // For Device class and cuda namespace declarations
+#include "cpu/vec/intrinsics.h"
+
+#include <optional>
+
+#if defined(__linux__) && defined(__x86_64__) && !defined(__ANDROID__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 #ifdef USE_CUDA
 #include "CUDARuntime.h"
@@ -482,4 +490,227 @@ void init_device(py::module_& m) {
 
     cuda.def("_sleep", &tensorplay::cuda::sleep, "cycles"_a);
 #endif
+
+    py::module_ cpu = m.def_submodule("_cpu", "Host computation backend");
+    cpu.def("_get_cpu_capability", []() {
+        py::dict out;
+#if defined(__x86_64__) || defined(_M_X64)
+        out["architecture"] = "x86_64";
+#elif defined(__aarch64__) || defined(_M_ARM64)
+        out["architecture"] = "arm64";
+#elif defined(__powerpc64__) || defined(__PPC64__)
+        out["architecture"] = "ppc64";
+#elif defined(__s390x__)
+        out["architecture"] = "s390x";
+#elif defined(__riscv) && (__riscv_xlen == 64)
+        out["architecture"] = "riscv64";
+#else
+        out["architecture"] = "unknown";
+#endif
+#if (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__GNUC__) || defined(__clang__))
+        // The probe below only accepts string literals, so each feature
+        // is queried at its own call site.
+        out["sse"] = __builtin_cpu_supports("sse") != 0;
+        out["sse2"] = __builtin_cpu_supports("sse2") != 0;
+        out["sse3"] = __builtin_cpu_supports("sse3") != 0;
+        out["ssse3"] = __builtin_cpu_supports("ssse3") != 0;
+        out["sse4_1"] = __builtin_cpu_supports("sse4.1") != 0;
+        out["sse4_2"] = __builtin_cpu_supports("sse4.2") != 0;
+        out["avx"] = __builtin_cpu_supports("avx") != 0;
+        out["avx2"] = __builtin_cpu_supports("avx2") != 0;
+        out["avx512_f"] = __builtin_cpu_supports("avx512f") != 0;
+        out["avx512_cd"] = __builtin_cpu_supports("avx512cd") != 0;
+        out["avx512_dq"] = __builtin_cpu_supports("avx512dq") != 0;
+        out["avx512_bw"] = __builtin_cpu_supports("avx512bw") != 0;
+        out["avx512_vl"] = __builtin_cpu_supports("avx512vl") != 0;
+        out["avx512_vnni"] = __builtin_cpu_supports("avx512vnni") != 0;
+        out["avx512_bf16"] = __builtin_cpu_supports("avx512bf16") != 0;
+        out["amx_bf16"] = __builtin_cpu_supports("amx-bf16") != 0;
+        out["amx_tile"] = __builtin_cpu_supports("amx-tile") != 0;
+        out["amx_int8"] = __builtin_cpu_supports("amx-int8") != 0;
+        out["fma3"] = __builtin_cpu_supports("fma") != 0;
+        out["aes"] = __builtin_cpu_supports("aes") != 0;
+        out["sha"] = __builtin_cpu_supports("sha") != 0;
+        out["f16c"] = __builtin_cpu_supports("f16c") != 0;
+        out["bmi"] = __builtin_cpu_supports("bmi") != 0;
+        out["bmi2"] = __builtin_cpu_supports("bmi2") != 0;
+        out["popcnt"] = __builtin_cpu_supports("popcnt") != 0;
+#elif defined(__aarch64__)
+        out["neon"] = true;
+        const bool sve_bf16 = tensorplay::cpu::tp_cpu_has_arm_sve_bf16();
+        out["sve"] = sve_bf16;
+        out["sve_bf16"] = sve_bf16;
+        const int sve_bits = tensorplay::cpu::tp_cpu_sve_vector_length_bits();
+        if (sve_bits > 0) {
+            out["sve_max_length"] = sve_bits;
+        }
+#endif
+        return out;
+    });
+    cpu.def("_init_amx", []() {
+#if defined(__linux__) && defined(__x86_64__) && !defined(__ANDROID__) && \
+    (defined(__GNUC__) || defined(__clang__))
+        if (__builtin_cpu_supports("amx-tile") == 0) {
+            return false;
+        }
+        constexpr unsigned long kTileCfg = 17;
+        constexpr unsigned long kTileData = 18;
+        constexpr int kGetPerm = 0x1022;
+        constexpr int kReqPerm = 0x1023;
+        if (syscall(SYS_arch_prctl, kReqPerm, kTileData) != 0) {
+            return false;
+        }
+        unsigned long bitmask = 0;
+        if (syscall(SYS_arch_prctl, kGetPerm, &bitmask) != 0) {
+            return false;
+        }
+        return (bitmask & ((1UL << kTileCfg) | (1UL << kTileData))) != 0;
+#else
+        return false;
+#endif
+    });
+
+    m.def("_accelerator_getAccelerator", []() -> py::object {
+#ifdef USE_CUDA
+        return py::cast(Device(DeviceType::CUDA));
+#else
+        return py::none();
+#endif
+    });
+    m.def("_accelerator_getDeviceIndex", []() {
+#ifdef USE_CUDA
+        int device = 0;
+        cudaError_t err = cudaGetDevice(&device);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("cudaGetDevice failed: ") +
+                cudaGetErrorString(err));
+        }
+        return device;
+#else
+        throw std::runtime_error("No accelerator device in this build");
+#endif
+    });
+    m.def("_accelerator_setDeviceIndex", [](int64_t index) {
+        if (index < 0) {
+            return;
+        }
+#ifdef USE_CUDA
+        cudaError_t err = cudaSetDevice(static_cast<int>(index));
+        if (err != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("cudaSetDevice failed: ") +
+                cudaGetErrorString(err));
+        }
+#else
+        throw std::runtime_error("No accelerator device in this build");
+#endif
+    });
+    m.def("_accelerator_exchangeDevice", [](int64_t index) {
+#ifdef USE_CUDA
+        int current = 0;
+        cudaError_t err = cudaGetDevice(&current);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("cudaGetDevice failed: ") +
+                cudaGetErrorString(err));
+        }
+        if (index >= 0 && static_cast<int>(index) != current) {
+            err = cudaSetDevice(static_cast<int>(index));
+            if (err != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("cudaSetDevice failed: ") +
+                    cudaGetErrorString(err));
+            }
+        }
+        return current;
+#else
+        (void)index;
+        throw std::runtime_error("No accelerator device in this build");
+#endif
+    });
+    m.def("_accelerator_maybeExchangeDevice", [](int64_t index) {
+#ifdef USE_CUDA
+        int current = 0;
+        cudaError_t err = cudaGetDevice(&current);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("cudaGetDevice failed: ") +
+                cudaGetErrorString(err));
+        }
+        if (index >= 0 && static_cast<int>(index) != current) {
+            err = cudaSetDevice(static_cast<int>(index));
+            if (err != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("cudaSetDevice failed: ") +
+                    cudaGetErrorString(err));
+            }
+        }
+        return current;
+#else
+        (void)index;
+        return -1;
+#endif
+    });
+    m.def(
+        "_accelerator_synchronizeDevice",
+        [](int64_t index) {
+#ifdef USE_CUDA
+            tensorplay::cuda::CUDAGuard guard(static_cast<int>(index));
+            tensorplay::cuda::checkCuda(
+                cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+#else
+            (void)index;
+#endif
+        },
+        "device_index"_a = -1);
+    m.def(
+        "_accelerator_getMemoryInfo",
+        [](int64_t index) {
+#ifdef USE_CUDA
+            int device = static_cast<int>(index);
+            if (device < 0) {
+                cudaError_t err = cudaGetDevice(&device);
+                if (err != cudaSuccess) {
+                    throw std::runtime_error(
+                        std::string("cudaGetDevice failed: ") +
+                        cudaGetErrorString(err));
+                }
+            }
+            tensorplay::cuda::CUDAGuard guard(device);
+            size_t free = 0;
+            size_t total = 0;
+            tensorplay::cuda::checkCuda(
+                cudaMemGetInfo(&free, &total), "cudaMemGetInfo");
+            return std::make_pair(free, total);
+#else
+            (void)index;
+            throw std::runtime_error("No accelerator device in this build");
+#endif
+        },
+        "device_index"_a = -1);
+    m.def(
+        "_accelerator_getDeviceCapability",
+        [](int64_t index) {
+            (void)index;
+            py::dict out;
+            py::set supported;
+            supported.add(py::cast(DType::UInt8));
+            supported.add(py::cast(DType::Int8));
+            supported.add(py::cast(DType::Int16));
+            supported.add(py::cast(DType::Int32));
+            supported.add(py::cast(DType::Int64));
+            supported.add(py::cast(DType::UInt16));
+            supported.add(py::cast(DType::Bool));
+            supported.add(py::cast(DType::Float16));
+            supported.add(py::cast(DType::BFloat16));
+            supported.add(py::cast(DType::Float32));
+            supported.add(py::cast(DType::Float64));
+            supported.add(py::cast(DType::ComplexFloat));
+            supported.add(py::cast(DType::ComplexDouble));
+            out["supported_dtypes"] = std::move(supported);
+            return out;
+        },
+        "device_index"_a = -1);
 }

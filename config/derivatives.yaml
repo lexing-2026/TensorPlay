@@ -701,6 +701,29 @@
 - name: hardswish(Tensor self) -> Tensor
   self: hardswish_backward(grad, self)
 
+- name: sec(Tensor self) -> Tensor
+  self: grad * self.sec().conj() * self.tan().conj()
+  result: auto_element_wise
+
+- name: csc(Tensor self) -> Tensor
+  self: grad * -self.csc().conj() * self.cot().conj()
+  result: auto_element_wise
+
+- name: cot(Tensor self) -> Tensor
+  self: grad * -self.csc().conj() * self.csc().conj()
+  result: auto_element_wise
+
+- name: tanhshrink(Tensor self) -> Tensor
+  self: grad * self.tanh().conj() * self.tanh().conj()
+  result: auto_element_wise
+
+- name: squared_difference(Tensor self, Tensor other) -> Tensor
+  self: grad * 2 * (self - other).conj()
+  other: grad * -2 * (self - other).conj()
+
+- name: swish(Tensor self) -> Tensor
+  self: silu_backward(grad, self)
+
 - name: hardsigmoid(Tensor self) -> Tensor
   self: hardsigmoid_backward(grad, self)
 

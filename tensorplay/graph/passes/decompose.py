@@ -36,8 +36,9 @@ _DECOMP_METHODS: Dict[str, Callable[[Graph, Node], Node]] = {}
 
 
 def _method(name: str):
-    def register(fn: Callable[[Graph, Node], Node]) -> None:
+    def register(fn: Callable[[Graph, Node], Node]) -> Callable[[Graph, Node], Node]:
         _DECOMP_METHODS[name] = fn
+        return fn
 
     return register
 

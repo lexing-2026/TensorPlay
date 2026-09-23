@@ -15,6 +15,8 @@ import tensorplay._C
 from tensorplay._C import Device
 from tensorplay._C import _cuda as _lcuda
 
+from tensorplay._streambase import EventBase, StreamBase
+
 from ._utils import _dummy_type, _get_device_index
 
 
@@ -29,7 +31,7 @@ else:
     _has_core = True
 
 
-class Stream:
+class Stream(StreamBase):
     r"""Wrapper around a CUDA stream.
 
     A CUDA stream is a linear sequence of execution that belongs to a specific
@@ -164,7 +166,7 @@ class ExternalStream(Stream):
         )
 
 
-class Event:
+class Event(EventBase):
     r"""Wrapper around a CUDA event.
 
     CUDA events are synchronization markers that can be used to monitor the

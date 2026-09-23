@@ -63,9 +63,8 @@ import math
 from tensorplay._stax.stax import stax
 
 
-# sec/csc/cot/tanhshrink/squared_difference/swish 的表层包装尚未生成
-# （当前 schema 尚缺条目，分解规则保留）；
-# 测试仅覆盖当前已暴露的算子面。
+# sec/csc/cot/tanhshrink/squared_difference/swish 的 schema、核与表层包装
+# 均已落地；以下用例直接覆盖其前向数值与原生图编译。
 _CASES = {
     "softplus": (lambda x: tp.softplus(x), math.log1p(math.exp(0.7))),
     "mish": (lambda x: tp.mish(x), 0.7 * math.tanh(math.log1p(math.exp(0.7)))),
@@ -76,6 +75,12 @@ _CASES = {
     "cosh": (lambda x: tp.cosh(x), math.cosh(0.7)),
     "asinh": (lambda x: tp.asinh(x), math.asinh(0.7)),
     "atanh": (lambda x: tp.atanh(x), math.atanh(0.7)),
+    "sec": (lambda x: tp.sec(x), 1.0 / math.cos(0.7)),
+    "csc": (lambda x: tp.csc(x), 1.0 / math.sin(0.7)),
+    "cot": (lambda x: tp.cot(x), 1.0 / math.tan(0.7)),
+    "tanhshrink": (lambda x: tp.tanhshrink(x), 0.7 - math.tanh(0.7)),
+    "squared_difference": (lambda x: tp.squared_difference(x, x), 0.0),
+    "swish": (lambda x: tp.swish(x), 0.7 / (1.0 + math.exp(-0.7))),
 
 }
 

@@ -3360,6 +3360,48 @@
     CPU: hardswish_backward_kernel_impl
     CUDA: hardswish_backward_kernel_cuda
 
+- func: sec(Tensor self) -> Tensor
+  device_check: NoCheck
+  variants: function, method
+  dispatch:
+    CPU: sec_kernel_impl
+    CUDA: sec_kernel_cuda
+
+- func: csc(Tensor self) -> Tensor
+  device_check: NoCheck
+  variants: function, method
+  dispatch:
+    CPU: csc_kernel_impl
+    CUDA: csc_kernel_cuda
+
+- func: cot(Tensor self) -> Tensor
+  device_check: NoCheck
+  variants: function, method
+  dispatch:
+    CPU: cot_kernel_impl
+    CUDA: cot_kernel_cuda
+
+- func: tanhshrink(Tensor self) -> Tensor
+  device_check: NoCheck
+  variants: function, method
+  dispatch:
+    CPU: tanhshrink_kernel_impl
+    CUDA: tanhshrink_kernel_cuda
+
+- func: squared_difference(Tensor self, Tensor other) -> Tensor
+  device_check: NoCheck
+  variants: function, method
+  dispatch:
+    CPU: squared_difference_kernel_impl
+    CUDA: squared_difference_kernel_cuda
+
+- func: swish(Tensor self) -> Tensor
+  device_check: NoCheck
+  variants: function, method
+  dispatch:
+    CPU: silu_kernel
+    CUDA: silu_kernel_cuda
+
 - func: hardsigmoid(Tensor self) -> Tensor
   device_check: NoCheck
   variants: function, method

@@ -3660,41 +3660,49 @@ def fft_irfft_backward(grad, input, dim, norm):
             return _captured
     return _C.fft_irfft_backward(grad, input, dim, norm)
 
-def hann_window(window_length, periodic=True, dtype=None):
+def hann_window(window_length, periodic=True, dtype=None, *, device=None, layout=None, pin_memory=None):
     if _capturing():
-        _captured = _capture_call(hann_window, (window_length, periodic, dtype), {})
+        _captured = _capture_call(hann_window, (window_length, periodic, dtype), {'device': device, 'layout': layout, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
-    if dtype is None:
+    if device is None and layout is None and pin_memory is None:
+        if dtype is None:
             dtype = DType.undefined
-    return _C.hann_window(window_length, periodic, dtype)
+        return _C.hann_window(window_length, periodic, dtype)
+    return _C.hann_window(window_length, periodic, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory)
 
-def hamming_window(window_length, periodic=True, alpha=0.54, beta=0.46, dtype=None):
+def hamming_window(window_length, periodic=True, alpha=0.54, beta=0.46, dtype=None, *, device=None, layout=None, pin_memory=None):
     if _capturing():
-        _captured = _capture_call(hamming_window, (window_length, periodic, alpha, beta, dtype), {})
+        _captured = _capture_call(hamming_window, (window_length, periodic, alpha, beta, dtype), {'device': device, 'layout': layout, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
-    if dtype is None:
+    if device is None and layout is None and pin_memory is None:
+        if dtype is None:
             dtype = DType.undefined
-    return _C.hamming_window(window_length, periodic, alpha, beta, dtype)
+        return _C.hamming_window(window_length, periodic, alpha, beta, dtype)
+    return _C.hamming_window(window_length, periodic, alpha, beta, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory)
 
-def bartlett_window(window_length, periodic=True, dtype=None):
+def bartlett_window(window_length, periodic=True, dtype=None, *, device=None, layout=None, pin_memory=None):
     if _capturing():
-        _captured = _capture_call(bartlett_window, (window_length, periodic, dtype), {})
+        _captured = _capture_call(bartlett_window, (window_length, periodic, dtype), {'device': device, 'layout': layout, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
-    if dtype is None:
+    if device is None and layout is None and pin_memory is None:
+        if dtype is None:
             dtype = DType.undefined
-    return _C.bartlett_window(window_length, periodic, dtype)
+        return _C.bartlett_window(window_length, periodic, dtype)
+    return _C.bartlett_window(window_length, periodic, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory)
 
-def blackman_window(window_length, periodic=True, dtype=None):
+def blackman_window(window_length, periodic=True, dtype=None, *, device=None, layout=None, pin_memory=None):
     if _capturing():
-        _captured = _capture_call(blackman_window, (window_length, periodic, dtype), {})
+        _captured = _capture_call(blackman_window, (window_length, periodic, dtype), {'device': device, 'layout': layout, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
-    if dtype is None:
+    if device is None and layout is None and pin_memory is None:
+        if dtype is None:
             dtype = DType.undefined
-    return _C.blackman_window(window_length, periodic, dtype)
+        return _C.blackman_window(window_length, periodic, dtype)
+    return _C.blackman_window(window_length, periodic, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory)
 
 def stft(input, n_fft, hop_length=None, win_length=None, window=None, center=True, pad_mode='reflect', normalized=False, onesided=True, return_complex=True):
     if _capturing():
@@ -4087,6 +4095,48 @@ def hardswish_backward(grad_output, input):
         if _captured is not None:
             return _captured
     return _C.hardswish_backward(grad_output, input)
+
+def sec(input):
+    if _capturing():
+        _captured = _capture_call(sec, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.sec(input)
+
+def csc(input):
+    if _capturing():
+        _captured = _capture_call(csc, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.csc(input)
+
+def cot(input):
+    if _capturing():
+        _captured = _capture_call(cot, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.cot(input)
+
+def tanhshrink(input):
+    if _capturing():
+        _captured = _capture_call(tanhshrink, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.tanhshrink(input)
+
+def squared_difference(input, other):
+    if _capturing():
+        _captured = _capture_call(squared_difference, (input, other), {})
+        if _captured is not None:
+            return _captured
+    return _C.squared_difference(input, other)
+
+def swish(input):
+    if _capturing():
+        _captured = _capture_call(swish, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.swish(input)
 
 def hardsigmoid(input, *, out=None):
     if out is not None:
