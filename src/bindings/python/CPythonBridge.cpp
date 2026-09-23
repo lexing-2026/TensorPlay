@@ -4,6 +4,7 @@
 // generated METH_FASTCALL layer (TensorCPythonGenerated.h) calls these
 // helpers and therefore never touches pybind11 dispatch itself.
 #include "CPythonBridge.h"
+#include "PythonRuntime.h"
 
 #include <pybind11/pybind11.h>
 // List/optional packers below cast standard containers.
@@ -99,9 +100,12 @@ struct PythonDispatchTLS {
     std::vector<std::pair<std::string, PyTypeObject*>> active_hooks;
 
     ~PythonDispatchTLS() {
+        if (!python_c::interpreter_active()) return;
+        PyGILState_STATE gil = PyGILState_Ensure();
         for (PyObject* mode : function_modes) {
             Py_XDECREF(mode);
         }
+        PyGILState_Release(gil);
     }
 };
 
@@ -1781,6 +1785,7 @@ PythonError::PythonError() {
 
 PythonError::PythonError(const PythonError& other)
     : std::exception(other), message_(other.message_) {
+    if (!python_c::interpreter_active()) return;
     PyGILState_STATE gil = PyGILState_Ensure();
     type_ = Py_XNewRef(other.type_);
     value_ = Py_XNewRef(other.value_);
@@ -1789,7 +1794,7 @@ PythonError::PythonError(const PythonError& other)
 }
 
 PythonError::~PythonError() {
-    if ((type_ || value_ || traceback_) && Py_IsInitialized()) {
+    if ((type_ || value_ || traceback_) && python_c::interpreter_active()) {
         PyGILState_STATE gil = PyGILState_Ensure();
         Py_XDECREF(type_);
         Py_XDECREF(value_);

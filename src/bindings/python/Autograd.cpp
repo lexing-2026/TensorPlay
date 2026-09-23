@@ -1,4 +1,5 @@
 #include "python_bindings.h"
+#include "PythonRuntime.h"
 #include "Node.h"
 #include "AccumulateGrad.h"
 #include "Autograd.h"
@@ -39,7 +40,7 @@ PyObjectRef retain_pyobject(py::handle object) {
     PyObject* ptr = object.ptr();
     Py_XINCREF(ptr);
     return PyObjectRef(ptr, [](PyObject* value) noexcept {
-        if (!value || !Py_IsInitialized()) return;
+        if (!value || !tensorplay::python_c::interpreter_active()) return;
         if (PyGILState_Check()) {
             Py_DECREF(value);
             return;
@@ -324,7 +325,11 @@ public:
     }
 
     ~PyContextScope() {
-        if (!active_ || !Py_IsInitialized()) return;
+        if (!tensorplay::python_c::interpreter_active()) {
+            context_.release();
+            return;
+        }
+        if (!active_) return;
         try {
             close();
         } catch (...) {
@@ -1789,6 +1794,7 @@ void init_autograd(py::module_& m) {
         std::shared_ptr<PyObject> callback_ref(
             raw_callback,
             [](PyObject* object) {
+                if (!tensorplay::python_c::interpreter_active()) return;
                 py::gil_scoped_acquire gil;
                 Py_DECREF(object);
             });
@@ -1884,10 +1890,10 @@ void init_autograd(py::module_& m) {
     // Install the anomaly-mode stack capturer: records the Python traceback
     // overrides the C++ backtrace default for the Python engine).
     tensorplay::tpx::set_anomaly_stack_capture([]() -> std::string {
-        if (!Py_IsInitialized()) return {};
+        if (!tensorplay::python_c::interpreter_active()) return {};
         try {
             py::gil_scoped_acquire gil;
-            if (!Py_IsInitialized()) return {};
+            if (!tensorplay::python_c::interpreter_active()) return {};
             auto traceback = py::module_::import("traceback");
             auto stack = traceback.attr("format_stack")();
             std::string out = py::str(stack).cast<std::string>();

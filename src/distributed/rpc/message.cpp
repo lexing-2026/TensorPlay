@@ -1,4 +1,5 @@
 #include "message.h"
+#include "../../bindings/python/PythonRuntime.h"
 
 #include <utility>
 
@@ -33,7 +34,14 @@ Message& Message::operator=(Message&& other) noexcept {
 }
 
 Message::~Message() {
-    if (!tensors_.empty() && Py_IsInitialized()) {
+    if (!tensorplay::python_c::interpreter_active()) {
+        for (auto& tensor : tensors_) {
+            tensor.release();
+        }
+        tensors_.clear();
+        return;
+    }
+    if (!tensors_.empty()) {
         py::gil_scoped_acquire gil;
         tensors_.clear();
     }

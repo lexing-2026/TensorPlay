@@ -1,10 +1,12 @@
 #include "python_bindings.h"
+#include "PythonRuntime.h"
 
 #include <condition_variable>
 #include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -57,6 +59,19 @@ class NativeFuture : public std::enable_shared_from_this<NativeFuture> {
         explicit State(std::vector<Device> devices_) : devices(std::move(devices_)) {}
 
         ~State() {
+            if (!tensorplay::python_c::interpreter_active()) {
+                result.release();
+                exception.release();
+                completer.release();
+                unwrap_func.release();
+                auto* callbacks_to_leak =
+                    new (std::nothrow) std::vector<Callback>(std::move(callbacks));
+                auto* completer_to_leak =
+                    new (std::nothrow) std::function<void()>(std::move(native_completer));
+                (void)callbacks_to_leak;
+                (void)completer_to_leak;
+                return;
+            }
             py::gil_scoped_acquire gil;
             callbacks.clear();
             native_completer = nullptr;
@@ -439,6 +454,12 @@ struct CollectContext {
           remaining(sources.size()) {}
 
     ~CollectContext() {
+        if (!tensorplay::python_c::interpreter_active()) {
+            originals.release();
+            sources.clear();
+            combined.reset();
+            return;
+        }
         py::gil_scoped_acquire gil;
         originals = py::object();
         sources.clear();

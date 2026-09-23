@@ -6,13 +6,14 @@
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "python_bindings.h"
+#include "PythonRuntime.h"
 
 namespace tensorplay {
 namespace python_dispatch {
 namespace {
 
 void release_pyobject(void* object) {
-    if (object == nullptr || !Py_IsInitialized()) return;
+    if (object == nullptr || !python_c::interpreter_active()) return;
     PyGILState_STATE gil = PyGILState_Ensure();
     Py_DECREF(static_cast<PyObject*>(object));
     PyGILState_Release(gil);

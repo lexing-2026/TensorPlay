@@ -1,4 +1,5 @@
 #include "rref_context.h"
+#include "../../bindings/python/PythonRuntime.h"
 
 #include <chrono>
 #include <limits>
@@ -7,7 +8,9 @@
 namespace tensorplay::distributed::rpc {
 
 RRefState::~RRefState() {
-    if (!Py_IsInitialized()) {
+    if (!tensorplay::python_c::interpreter_active()) {
+        value.release();
+        error.release();
         return;
     }
     py::gil_scoped_acquire gil;

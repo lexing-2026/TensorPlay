@@ -1,6 +1,8 @@
 #include "future.h"
+#include "../../bindings/python/PythonRuntime.h"
 
 #include <stdexcept>
+#include <new>
 #include <utility>
 
 namespace tensorplay::distributed::rpc {
@@ -40,7 +42,13 @@ struct RpcFuture::State {
     std::vector<std::function<void(py::object)>> callbacks;
 
     ~State() {
-        if (!Py_IsInitialized()) {
+        if (!tensorplay::python_c::interpreter_active()) {
+            result.release();
+            error.release();
+            auto* callbacks_to_leak =
+                new (std::nothrow) std::vector<std::function<void(py::object)>>(
+                    std::move(callbacks));
+            (void)callbacks_to_leak;
             return;
         }
         py::gil_scoped_acquire gil;

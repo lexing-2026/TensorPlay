@@ -3,6 +3,7 @@
 #include "tensorplay/ops/TensorCPythonGenerated.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include "PythonUtils.h"
+#include "PythonRuntime.h"
 #include "dlpack_types.h"
 #include "DLPackConvert.h"
 #include "TensorImpl.h" // For unsafeGetTensorImpl
@@ -185,7 +186,7 @@ static void dlpack_deleter(DLManagedTensor* tensor) {
 
 // Optimized deleter for PyObject-managed DLPack
 static void dlpack_pyobject_deleter(DLManagedTensor* managed) {
-    if (managed->manager_ctx) {
+    if (managed->manager_ctx && tensorplay::python_c::interpreter_active()) {
         py::gil_scoped_acquire gil;
         Py_DECREF(static_cast<PyObject*>(managed->manager_ctx));
     }
@@ -243,7 +244,7 @@ static py::capsule to_dlpack(py::object self_obj, std::optional<int64_t> stream 
 // (zero-copy NumPy wraps, shared-memory handles). Acquires the GIL because
 // it may run on any thread during teardown.
 static void pyobject_deleter(void* ctx) {
-    if (!ctx) return;
+    if (!ctx || !tensorplay::python_c::interpreter_active()) return;
     py::gil_scoped_acquire gil;
     Py_DECREF(static_cast<PyObject*>(ctx));
 }
