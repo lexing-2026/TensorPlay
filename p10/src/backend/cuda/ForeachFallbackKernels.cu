@@ -50,6 +50,23 @@ std::vector<Tensor> foreach_map_pair_inplace(std::vector<Tensor> self,
     return self;
 }
 
+bool foreach_tensor_scalar_mta_ready(const std::vector<Tensor>& self,
+                                     const Tensor& other) {
+    if (!foreach_mta::eligible_list(self) || !other.defined() ||
+        other.is_sparse() || other.dim() != 0 || other.numel() != 1 ||
+        !other.is_contiguous() || other.dtype() != self.front().dtype() ||
+        other.device() != self.front().device()) {
+        return false;
+    }
+    return true;
+}
+
+void foreach_bump_versions(std::vector<Tensor>& self) {
+    for (Tensor& value : self) {
+        value.unsafeGetTensorImpl()->bump_version();
+    }
+}
+
 template <typename F>
 std::vector<Tensor> foreach_map_scalars(const std::vector<Tensor>& self,
                                         const std::vector<Scalar>& scalars, F&& fn) {
@@ -211,7 +228,7 @@ void foreach_add_tensor_inplace_cuda(std::vector<Tensor> self, const Tensor& oth
     foreach_map_inplace(self, [&](Tensor& value) { value.add_(other, alpha); });
 }
 
-#define DEFINE_FOREACH_MUL_DIV(NAME, METHOD) \
+#define DEFINE_FOREACH_MUL_DIV(NAME, METHOD, FUNCTOR) \
 std::vector<Tensor> foreach_##NAME##_scalar_cuda(const std::vector<Tensor>& self, const Scalar& scalar) { \
     return foreach_map(self, [&](const Tensor& value) { return value.METHOD(scalar); }); \
 } \
@@ -222,6 +239,19 @@ std::vector<Tensor> foreach_##NAME##_scalar_list_cuda(const std::vector<Tensor>&
     return foreach_map_scalars(self, scalars, [&](const Tensor& value, const Scalar& scalar) { return value.METHOD(scalar); }); \
 } \
 std::vector<Tensor> foreach_##NAME##_tensor_cuda(const std::vector<Tensor>& self, const Tensor& other) { \
+    if (foreach_tensor_scalar_mta_ready(self, other)) { \
+        std::vector<Tensor> out; \
+        out.reserve(self.size()); \
+        for (const Tensor& value : self) out.push_back(Tensor::empty_like(value)); \
+        const bool launched = foreach_mta::dispatch_dtype( \
+            self[0].dtype(), [&]<typename T, typename M>() { \
+                foreach_mta::launch<2, 1, T, M>( \
+                    std::array<const std::vector<Tensor>*, 2>{&self, &out}, \
+                    FUNCTOR<T, M>{other.data_ptr<T>()}, \
+                    "_foreach_" #NAME ".Tensor.cuda"); \
+            }); \
+        if (launched) return out; \
+    } \
     return foreach_map(self, [&](const Tensor& value) { return value.METHOD(other); }); \
 } \
 void foreach_##NAME##_scalar_inplace_cuda(std::vector<Tensor> self, const Scalar& scalar) { \
@@ -234,11 +264,24 @@ void foreach_##NAME##_scalar_list_inplace_cuda(std::vector<Tensor> self, const s
     foreach_map_scalars_inplace(self, scalars, [&](Tensor& value, const Scalar& scalar) { value.METHOD##_(scalar); }); \
 } \
 void foreach_##NAME##_tensor_inplace_cuda(std::vector<Tensor> self, const Tensor& other) { \
+    if (foreach_tensor_scalar_mta_ready(self, other)) { \
+        const bool launched = foreach_mta::dispatch_dtype( \
+            self[0].dtype(), [&]<typename T, typename M>() { \
+                foreach_mta::launch<1, 0, T, M>( \
+                    std::array<const std::vector<Tensor>*, 1>{&self}, \
+                    FUNCTOR<T, M>{other.data_ptr<T>()}, \
+                    "_foreach_" #NAME "_.Tensor.cuda"); \
+            }); \
+        if (launched) { \
+            foreach_bump_versions(self); \
+            return; \
+        } \
+    } \
     foreach_map_inplace(self, [&](Tensor& value) { value.METHOD##_(other); }); \
 }
 
-DEFINE_FOREACH_MUL_DIV(mul, mul)
-DEFINE_FOREACH_MUL_DIV(div, div)
+DEFINE_FOREACH_MUL_DIV(mul, mul, foreach_mta::BinaryMulTensor)
+DEFINE_FOREACH_MUL_DIV(div, div, foreach_mta::BinaryDivTensor)
 #undef DEFINE_FOREACH_MUL_DIV
 
 #define DEFINE_FOREACH_UNARY(NAME, METHOD) \
