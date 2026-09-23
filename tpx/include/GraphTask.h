@@ -14,6 +14,9 @@
 #include "Node.h"
 #include "InputBuffer.h"
 #include "PythonDispatchModeTLS.h"
+#ifdef USE_CUDA
+#include "CUDARuntime.h"
+#endif
 
 namespace tensorplay {
 namespace tpx {
@@ -79,6 +82,20 @@ struct GraphTask {
     // Guarded by mutex_ (only written/read on error paths).
     std::exception_ptr exception_;
 
+    // Saved tensors must stay alive until device work issued by this graph has
+    // completed. Releasing them from a worker immediately after enqueueing a
+    // kernel lets the allocator reuse their storage while the kernel is still
+    // reading it.
+    std::unordered_set<Node*> deferred_release_set_;
+    std::vector<std::shared_ptr<Node>> deferred_releases_;
+
+#ifdef USE_CUDA
+    // CUDA work is issued by device workers, while the caller may immediately
+    // submit more work from a different host thread. Keep the streams touched
+    // by this graph so its completion can be published before callbacks run.
+    std::vector<cuda::CUDAStream> cuda_streams_;
+#endif
+
     explicit GraphTask(bool keep_graph, bool grad_mode)
         : keep_graph_(keep_graph), grad_mode_(grad_mode) {
         // A fresh GraphTask is built per backward()/grad() call; pre-sizing
@@ -114,6 +131,27 @@ struct GraphTask {
         if (!exception_) exception_ = std::move(exc);
     }
 
+    void defer_release(Node* node) {
+        if (!node) return;
+        auto owner = node->shared_from_this();
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (deferred_release_set_.insert(node).second) {
+            deferred_releases_.push_back(std::move(owner));
+        }
+    }
+
+    void release_deferred_nodes() {
+        std::vector<std::shared_ptr<Node>> nodes;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            nodes.swap(deferred_releases_);
+            deferred_release_set_.clear();
+        }
+        for (const auto& node : nodes) {
+            node->release_variables();
+        }
+    }
+
     void add_final_callback(std::function<void()> callback) {
         std::lock_guard<std::mutex> lock(final_callbacks_mutex_);
         final_callbacks_.emplace_back(std::move(callback));
@@ -131,6 +169,32 @@ struct GraphTask {
             callback();
         }
     }
+
+#ifdef USE_CUDA
+    void note_cuda_stream(const cuda::CUDAStream& stream) {
+        if (stream.device_index() < 0) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& current : cuda_streams_) {
+            if (current == stream) return;
+        }
+        cuda_streams_.push_back(stream);
+    }
+
+    void synchronize_cuda_streams() {
+        std::vector<cuda::CUDAStream> streams;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            streams = cuda_streams_;
+        }
+        for (const auto& stream : streams) {
+            cuda::CUDAEvent event;
+            event.record(stream);
+            event.synchronize();
+        }
+    }
+#else
+    void synchronize_cuda_streams() {}
+#endif
 
     bool is_completed() {
         return completed_.load(std::memory_order_acquire);

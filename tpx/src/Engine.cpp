@@ -198,6 +198,9 @@ void Engine::worker_main(ReadyQueue& queue) {
 void Engine::execute_task(ReadyQueue::NodeTask&& task, ReadyQueue& cpu_queue,
                           ReadyQueue* local_queue) {
     GraphTask& graph = *task.graph_;
+#ifdef USE_CUDA
+    const int task_device = task.input_buffer_.device_index();
+#endif
     if (engine_trace_enabled()) fprintf(stderr, "[tp-engine] exec node %s\n", task.fn_->name().c_str());
     try {
         GraphTaskGuard graph_guard(&graph);
@@ -209,6 +212,11 @@ void Engine::execute_task(ReadyQueue::NodeTask&& task, ReadyQueue& cpu_queue,
             modes_guard.emplace(graph.dispatch_modes_);
         }
         evaluate_function(graph, task.fn_.get(), task.input_buffer_, cpu_queue, local_queue);
+#ifdef USE_CUDA
+        if (task_device >= 0) {
+            graph.note_cuda_stream(cuda::getCurrentCUDAStream(task_device));
+        }
+#endif
     } catch (...) {
         // A failing node must not hang the whole backward: record the error
         // and account for this task so the graph still drains naturally; the
@@ -552,7 +560,7 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
 
     auto num_outputs = outputs.size();
 
-    // Propagate BEFORE release_variables() (which clears next_edges_).
+    // Propagate before deferring release (which clears next_edges_).
     const auto& edges = func->next_edges();
     for (size_t i = 0; i < num_outputs; ++i) {
         if (i >= edges.size()) break;
@@ -620,7 +628,7 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
     }
 
     if (!task.keep_graph_) {
-        func->release_variables();
+        task.defer_release(func);
     }
 
     if (task.task_completed()) {
@@ -729,6 +737,9 @@ variable_list Engine::execute(const edge_list& root_edges, const variable_list& 
         }
         graph_task.wait_for_completion();
     }
+
+    graph_task.synchronize_cuda_streams();
+    graph_task.release_deferred_nodes();
 
     TP_ENGINE_TRACE("execute done");
     {
