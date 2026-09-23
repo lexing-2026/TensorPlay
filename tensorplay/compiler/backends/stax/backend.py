@@ -4342,7 +4342,29 @@ def _build_aot_backward(
             return None
         parsed, formulas = schema
         if node.op == "call_method":
-            arg_values = (node.args[0],) if node.args else ()
+            schema_args = tuple(parsed.args)
+            if len(node.args) > len(schema_args):
+                return None
+            bound_args: dict[str, Any] = {}
+            for arg, value in zip(schema_args, node.args):
+                if arg.kwonly:
+                    return None
+                bound_args[arg.name] = value
+            schema_names = {arg.name for arg in schema_args}
+            for name, value in (node.kwargs or {}).items():
+                if name not in schema_names or name in bound_args:
+                    return None
+                bound_args[name] = value
+            if any(
+                arg.name not in bound_args and arg.default is None
+                for arg in schema_args
+            ):
+                return None
+            arg_values = tuple(
+                (arg.name, bound_args[arg.name])
+                for arg in schema_args
+                if arg.name in bound_args
+            )
         elif op_name == "batch_norm":
             names = (
                 "input", "running_mean", "running_var", "weight", "bias",
