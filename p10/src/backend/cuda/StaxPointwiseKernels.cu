@@ -486,15 +486,37 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
     }
 
     const auto stream = getCurrentCUDAStream().stream();
-    Tensor instr_buf = byte_buffer(
-        static_cast<int64_t>(sizeof(Instruction) * instruction_count),
-        inputs.front());
-    Tensor const_buf = byte_buffer(
-        static_cast<int64_t>(sizeof(compute_t) * constants.size()),
-        inputs.front());
-    Tensor inptr_buf = byte_buffer(
-        static_cast<int64_t>(sizeof(const io_t*) * input_count),
-        inputs.front());
+    const int64_t instruction_bytes =
+        static_cast<int64_t>(sizeof(Instruction) * instruction_count);
+    const int64_t constants_bytes =
+        static_cast<int64_t>(sizeof(compute_t) * constants.size());
+    const int64_t input_pointer_bytes =
+        static_cast<int64_t>(sizeof(io_t*) * input_count);
+    const auto align_program_offset = [](int64_t value) {
+        return (value + 15) & ~int64_t(15);
+    };
+    const int64_t constants_offset = align_program_offset(instruction_bytes);
+    const int64_t input_pointer_offset =
+        align_program_offset(constants_offset + constants_bytes);
+    const int64_t program_bytes = input_pointer_offset + input_pointer_bytes;
+    Tensor program_buf = byte_buffer(program_bytes, inputs.front());
+    std::vector<uint8_t> host_program(static_cast<size_t>(program_bytes), 0);
+    if (instruction_bytes > 0) {
+        std::memcpy(host_program.data(), host_instructions.data(), instruction_bytes);
+    }
+    if (constants_bytes > 0) {
+        std::memcpy(host_program.data() + constants_offset,
+                    host_constants.data(), constants_bytes);
+    }
+    if (input_pointer_bytes > 0) {
+        std::memcpy(host_program.data() + input_pointer_offset,
+                    host_input_ptrs.data(), input_pointer_bytes);
+    }
+    checkCuda(cudaMemcpyAsync(program_buf.data_ptr(), host_program.data(),
+                               program_bytes, cudaMemcpyHostToDevice, stream),
+               "stax fused pointwise program upload");
+    const uint8_t* program_ptr =
+        reinterpret_cast<const uint8_t*>(program_buf.data_ptr());
     Tensor metadata_buf;
     int64_t input_size_offset = 0;
     int64_t input_stride_offset = 0;
@@ -539,20 +561,7 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
                                    metadata_bytes, cudaMemcpyHostToDevice, stream),
                    "stax fused pointwise layout upload");
     }
-    checkCuda(cudaMemcpyAsync(instr_buf.data_ptr(), host_instructions.data(),
-                               sizeof(Instruction) * instruction_count,
-                               cudaMemcpyHostToDevice, stream),
-               "stax fused pointwise program upload");
-    if (!constants.empty()) {
-        checkCuda(cudaMemcpyAsync(const_buf.data_ptr(), host_constants.data(),
-                                   sizeof(compute_t) * constants.size(),
-                                   cudaMemcpyHostToDevice, stream),
-                   "stax fused pointwise constants upload");
-    }
-    checkCuda(cudaMemcpyAsync(inptr_buf.data_ptr(), host_input_ptrs.data(),
-                               sizeof(const io_t*) * input_count,
-                               cudaMemcpyHostToDevice, stream),
-               "stax fused pointwise input pointer table upload");
+
     io_t* output = nullptr;
     io_t* const* output_ptrs = nullptr;
     const int64_t* output_ref_ptr = nullptr;
@@ -582,10 +591,10 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
     if (flat_inputs) {
         ProgramState<io_t, compute_t, true> state;
         state.instructions =
-            reinterpret_cast<const Instruction*>(instr_buf.data_ptr());
-        state.constants = reinterpret_cast<const compute_t*>(const_buf.data_ptr());
+            reinterpret_cast<const Instruction*>(program_ptr);
+        state.constants = reinterpret_cast<const compute_t*>(program_ptr + constants_offset);
         state.input_ptrs =
-            reinterpret_cast<const io_t* const*>(inptr_buf.data_ptr());
+            reinterpret_cast<const io_t* const*>(program_ptr + input_pointer_offset);
         state.input_sizes = nullptr;
         state.input_strides = nullptr;
         state.output_sizes = nullptr;
@@ -600,10 +609,10 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
     } else {
         ProgramState<io_t, compute_t, false> state;
         state.instructions =
-            reinterpret_cast<const Instruction*>(instr_buf.data_ptr());
-        state.constants = reinterpret_cast<const compute_t*>(const_buf.data_ptr());
+            reinterpret_cast<const Instruction*>(program_ptr);
+        state.constants = reinterpret_cast<const compute_t*>(program_ptr + constants_offset);
         state.input_ptrs =
-            reinterpret_cast<const io_t* const*>(inptr_buf.data_ptr());
+            reinterpret_cast<const io_t* const*>(program_ptr + input_pointer_offset);
         const uint8_t* metadata_ptr =
             reinterpret_cast<const uint8_t*>(metadata_buf.data_ptr());
         state.input_sizes = reinterpret_cast<const int64_t*>(
