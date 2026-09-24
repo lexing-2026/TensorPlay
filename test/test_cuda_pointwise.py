@@ -142,6 +142,100 @@ class TestCUDAPointwise(unittest.TestCase):
         expected = [1.0, 4.0]
         self.assertTrue(tp.allclose(res.cpu(), tp.tensor(expected)), "Lerp tensor failed")
 
+    def test_channel_broadcast_binary_ops(self):
+        rng = np.random.default_rng(1234)
+        for dtype, tolerance in (
+            (tp.float16, 3e-3),
+            (tp.bfloat16, 2e-2),
+        ):
+            for batch, channels, height, width, broad_batch in (
+                (2, 8, 7, 7, 2),
+                (2, 16, 4, 4, 1),
+                (3, 36, 4, 4, 3),
+            ):
+                full_np = rng.standard_normal((batch, channels, height, width)).astype(np.float32)
+                broad_np = rng.standard_normal((broad_batch, channels, 1, 1)).astype(np.float32)
+                grad_np = rng.standard_normal(full_np.shape).astype(np.float32)
+                for operation in ("add", "mul"):
+                    for broad_on_left in (False, True):
+                        full = tp.tensor(full_np, device=self.device).requires_grad_()
+                        broad = tp.tensor(
+                            broad_np, device=self.device, dtype=dtype
+                        ).requires_grad_()
+                        left, right = (broad, full) if broad_on_left else (full, broad)
+                        output = left + right if operation == "add" else left * right
+                        output.backward(tp.tensor(grad_np, device=self.device))
+
+                        expected_full = (
+                            grad_np
+                            if operation == "add"
+                            else grad_np * broad_np
+                        )
+                        axes = (2, 3) if broad_batch == batch else (0, 2, 3)
+                        expected_broad = (
+                            np.sum(grad_np, axis=axes)
+                            if operation == "add"
+                            else np.sum(grad_np * full_np, axis=axes)
+                        ).reshape(broad_np.shape)
+                        np.testing.assert_allclose(
+                            full.grad.float().cpu().numpy(),
+                            expected_full,
+                            rtol=tolerance,
+                            atol=tolerance,
+                        )
+                        np.testing.assert_allclose(
+                            broad.grad.float().cpu().numpy(),
+                            expected_broad,
+                            rtol=tolerance,
+                            atol=tolerance,
+                        )
+
+                strided_np = rng.standard_normal(
+                    (batch, channels * 2, 1, 1)
+                ).astype(np.float32)
+                full = tp.tensor(full_np, device=self.device)
+                strided = tp.tensor(
+                    strided_np, device=self.device, dtype=dtype
+                ).chunk(2, dim=1)[1]
+                self.assertEqual(strided.stride(1), 1)
+                self.assertFalse(strided.is_contiguous())
+                actual = (full + strided).float().cpu().numpy()
+                expected = full_np + strided_np[:, channels:]
+                np.testing.assert_allclose(
+                    actual, expected, rtol=tolerance, atol=tolerance
+                )
+                expanded = tp.tensor(
+                    broad_np[:1], device=self.device, dtype=dtype
+                ).expand((batch, channels, 1, 1))
+                self.assertEqual(expanded.stride(0), 0)
+                expanded_add = (full + expanded).float().cpu().numpy()
+                expanded_mul = (full * expanded).float().cpu().numpy()
+                np.testing.assert_allclose(
+                    expanded_add,
+                    full_np + broad_np[:1],
+                    rtol=tolerance,
+                    atol=tolerance,
+                )
+                np.testing.assert_allclose(
+                    expanded_mul,
+                    full_np * broad_np[:1],
+                    rtol=tolerance,
+                    atol=tolerance,
+                )
+                alpha_actual = tp.add(
+                    full,
+                    tp.tensor(strided_np, device=self.device, dtype=dtype).chunk(
+                        2, dim=1
+                    )[1],
+                    alpha=2,
+                ).float().cpu().numpy()
+                np.testing.assert_allclose(
+                    alpha_actual,
+                    full_np + 2 * strided_np[:, channels:],
+                    rtol=tolerance,
+                    atol=tolerance,
+                )
+
     def test_masked_select(self):
         print("\nTesting CUDA masked_select... (Skipped due to known issue)")
         return
