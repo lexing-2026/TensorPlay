@@ -1282,10 +1282,28 @@ __global__ void group_norm_internal_grads_mixed_impl(
     const float* dy = dY + nc * spatial;
     const T* x = X + nc * spatial;
     float s1 = 0.0f, s2 = 0.0f;
-    for (int64_t j = threadIdx.x; j < spatial; j += blockDim.x) {
-        const float d = dy[j];
-        s1 += d * static_cast<float>(x[j]);
-        s2 += d;
+    const int64_t block_size = blockDim.x;
+    for (int64_t base = 0; base < spatial; base += 2 * block_size) {
+        const int64_t j0 = base + threadIdx.x;
+        const int64_t j1 = j0 + block_size;
+        float d0 = 0.0f, d1 = 0.0f;
+        float x0 = 0.0f, x1 = 0.0f;
+        if (j0 < spatial) {
+            d0 = dy[j0];
+            x0 = static_cast<float>(x[j0]);
+        }
+        if (j1 < spatial) {
+            d1 = dy[j1];
+            x1 = static_cast<float>(x[j1]);
+        }
+        if (j0 < spatial) {
+            s1 += d0 * x0;
+            s2 += d0;
+        }
+        if (j1 < spatial) {
+            s1 += d1 * x1;
+            s2 += d1;
+        }
     }
     layer_norm::ln_block_reduce2(s1, s2, smem0, smem1);
     if (threadIdx.x == 0) {
@@ -1426,7 +1444,7 @@ __global__ void group_norm_dx_fused_vec_impl(
     }
 }
 
-template <typename T, int V>
+template <typename T, int V, bool ChannelPacked>
 __global__ void group_norm_dx_fused_mixed_vec_impl(
     int64_t inner, int64_t spatial, int64_t cpg, int64_t num_groups,
     const float* __restrict__ dY, const T* __restrict__ X,
@@ -1459,12 +1477,23 @@ __global__ void group_norm_dx_fused_mixed_vec_impl(
         const GNVec<float, V> d = dyv[j];
         const GNVec<T, V> x = xv[j];
         GNVec<T, V> out;
-        const int64_t channel = g * cpg + j / (spatial / V);
-        const float c1 = r * (gamma ? gamma[channel] : 1.0f);
+        if constexpr (ChannelPacked) {
+            const int64_t channel = g * cpg + j / (spatial / V);
+            const float c1 = r * (gamma ? gamma[channel] : 1.0f);
 #pragma unroll
-        for (int k = 0; k < V; ++k) {
-            out.v[k] = static_cast<T>(
-                c1 * d.v[k] + a2 * static_cast<float>(x.v[k]) + a3);
+            for (int k = 0; k < V; ++k) {
+                out.v[k] = static_cast<T>(
+                    c1 * d.v[k] + a2 * static_cast<float>(x.v[k]) + a3);
+            }
+        } else {
+#pragma unroll
+            for (int k = 0; k < V; ++k) {
+                const int64_t idx = j * V + k;
+                const int64_t channel = g * cpg + idx / spatial;
+                const float c1 = r * (gamma ? gamma[channel] : 1.0f);
+                out.v[k] = static_cast<T>(
+                    c1 * d.v[k] + a2 * static_cast<float>(x.v[k]) + a3);
+            }
         }
         dxv[j] = out;
     }
@@ -1971,13 +2000,22 @@ static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_mixed_cuda_impl(
         ? weight_contig->data_ptr<float>() : nullptr;
     if (need_dx) {
         T* dx_p = grad_input.data_ptr<T>();
-        const bool dx_vec_ok = vec_ok &&
+        const bool dx_vec_ok = inner % kVec == 0 &&
+            reinterpret_cast<uintptr_t>(x_p) % (sizeof(T) * kVec) == 0 &&
+            reinterpret_cast<uintptr_t>(dy_p) % (sizeof(float) * kVec) == 0 &&
             reinterpret_cast<uintptr_t>(dx_p) % (sizeof(T) * kVec) == 0;
         if (dx_vec_ok) {
-            group_norm_dx_fused_mixed_vec_impl<T, kVec>
-                <<<N * num_groups, group_norm_threads_for(inner), 0, stream>>>(
-                    inner, spatial, cpg, num_groups, dy_p, x_p, mean_p, rstd_p,
-                    gamma, ds_p, db_p, dx_p);
+            if (spatial % kVec == 0) {
+                group_norm_dx_fused_mixed_vec_impl<T, kVec, true>
+                    <<<N * num_groups, group_norm_threads_for(inner), 0, stream>>>(
+                        inner, spatial, cpg, num_groups, dy_p, x_p, mean_p, rstd_p,
+                        gamma, ds_p, db_p, dx_p);
+            } else {
+                group_norm_dx_fused_mixed_vec_impl<T, kVec, false>
+                    <<<N * num_groups, group_norm_threads_for(inner), 0, stream>>>(
+                        inner, spatial, cpg, num_groups, dy_p, x_p, mean_p, rstd_p,
+                        gamma, ds_p, db_p, dx_p);
+            }
         } else {
             group_norm_dx_fused_mixed_impl<T>
                 <<<N * num_groups, group_norm_threads_for(inner), 0, stream>>>(
