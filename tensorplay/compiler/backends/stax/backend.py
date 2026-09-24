@@ -6875,6 +6875,92 @@ def _build_aot_formula_env(
         tuple_op_cache[key] = result
         return result
 
+    def _conv_axis_gradient(slot: int, transposed: bool):
+        # The captured conv spellings carry their own derivative formulas,
+        # each asking for one gradient of the same convolution.  Every one of
+        # these names funnels into a masked slot of the shared convolution
+        # backward, so one tuple node serves all requested slots.
+        def axis_gradient(
+            grad,
+            input_value,
+            weight,
+            stride,
+            padding,
+            dilation,
+            groups,
+            output_padding=(0, 0),
+        ):
+            shape = getattr(input_value, "shape", ())
+            rank = max(len(tuple(shape)) - 2, 1) if shape else 2
+
+            def pair(value: Any) -> tuple[int, ...]:
+                if isinstance(value, (tuple, list)):
+                    return tuple(int(item) for item in value)
+                return (int(value),) * rank
+
+            mask = tuple(slot == index for index in range(3))
+            return get_tuple(
+                slot,
+                convolution_backward(
+                    grad,
+                    input_value,
+                    weight,
+                    None,
+                    pair(stride),
+                    pair(padding),
+                    pair(dilation),
+                    transposed,
+                    pair(output_padding),
+                    groups,
+                    mask,
+                ),
+            )
+
+        return axis_gradient
+
+    def _conv_transpose_axis_gradient(slot: int):
+        def axis_gradient(
+            grad,
+            input_value,
+            weight,
+            stride,
+            padding,
+            output_padding,
+            groups,
+            dilation,
+        ):
+            return _conv_axis_gradient(slot, True)(
+                grad,
+                input_value,
+                weight,
+                stride,
+                padding,
+                dilation,
+                groups,
+                output_padding,
+            )
+
+        return axis_gradient
+
+    conv1d_grad_input = _conv_axis_gradient(0, False)
+    conv1d_grad_weight = _conv_axis_gradient(1, False)
+    conv1d_grad_bias = _conv_axis_gradient(2, False)
+    conv2d_grad_input = _conv_axis_gradient(0, False)
+    conv2d_grad_weight = _conv_axis_gradient(1, False)
+    conv2d_grad_bias = _conv_axis_gradient(2, False)
+    conv3d_grad_input = _conv_axis_gradient(0, False)
+    conv3d_grad_weight = _conv_axis_gradient(1, False)
+    conv3d_grad_bias = _conv_axis_gradient(2, False)
+    conv_transpose1d_grad_input = _conv_transpose_axis_gradient(0)
+    conv_transpose1d_grad_weight = _conv_transpose_axis_gradient(1)
+    conv_transpose1d_grad_bias = _conv_transpose_axis_gradient(2)
+    conv_transpose2d_grad_input = _conv_transpose_axis_gradient(0)
+    conv_transpose2d_grad_weight = _conv_transpose_axis_gradient(1)
+    conv_transpose2d_grad_bias = _conv_transpose_axis_gradient(2)
+    conv_transpose3d_grad_input = _conv_transpose_axis_gradient(0)
+    conv_transpose3d_grad_weight = _conv_transpose_axis_gradient(1)
+    conv_transpose3d_grad_bias = _conv_transpose_axis_gradient(2)
+
     def max_pool_backward(grad, input_value, kernel_size, stride, padding, dilation, ceil_mode):
         values = tuple(kernel_size) if isinstance(kernel_size, (tuple, list)) else (kernel_size,)
         # Spatial rank follows the pooling input: a scalar or single-entry
@@ -7092,6 +7178,24 @@ def _build_aot_formula_env(
         "group_norm_backward": group_norm_backward,
         "scaled_dot_product_attention_backward": scaled_dot_product_attention_backward,
         "convolution_backward": convolution_backward,
+        "conv1d_grad_input": conv1d_grad_input,
+        "conv1d_grad_weight": conv1d_grad_weight,
+        "conv1d_grad_bias": conv1d_grad_bias,
+        "conv2d_grad_input": conv2d_grad_input,
+        "conv2d_grad_weight": conv2d_grad_weight,
+        "conv2d_grad_bias": conv2d_grad_bias,
+        "conv3d_grad_input": conv3d_grad_input,
+        "conv3d_grad_weight": conv3d_grad_weight,
+        "conv3d_grad_bias": conv3d_grad_bias,
+        "conv_transpose1d_grad_input": conv_transpose1d_grad_input,
+        "conv_transpose1d_grad_weight": conv_transpose1d_grad_weight,
+        "conv_transpose1d_grad_bias": conv_transpose1d_grad_bias,
+        "conv_transpose2d_grad_input": conv_transpose2d_grad_input,
+        "conv_transpose2d_grad_weight": conv_transpose2d_grad_weight,
+        "conv_transpose2d_grad_bias": conv_transpose2d_grad_bias,
+        "conv_transpose3d_grad_input": conv_transpose3d_grad_input,
+        "conv_transpose3d_grad_weight": conv_transpose3d_grad_weight,
+        "conv_transpose3d_grad_bias": conv_transpose3d_grad_bias,
         "max_pool2d_backward": max_pool_backward,
         "max_pool1d_backward": max_pool_backward,
         "max_pool3d_backward": max_pool_backward,
