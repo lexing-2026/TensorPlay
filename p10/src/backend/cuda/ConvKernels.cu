@@ -1568,6 +1568,14 @@ Tensor conv2d_grad_bias_cuda(const Tensor& grad_output, const Tensor& input, con
     const int64_t height = grad_output_c.size(2);
     const int64_t width = grad_output_c.size(3);
     const int64_t spatial = height * width;
+    // The bias gradient reduces over batch and spatial positions. The generic
+    // reduction engine handles the strided layouts and the vectorization and
+    // split decisions, so the dedicated kernels below only serve the
+    // half-in/float-out mixed-width combination, which a same-width sum
+    // cannot express without an extra full-tensor conversion.
+    if (grad_output_c.dtype() == result_dtype) {
+        return grad_output_c.sum(std::vector<int64_t>{0, 2, 3});
+    }
     int threads = 32;
     while (threads < spatial && threads < 512) threads <<= 1;
     Tensor grad_bias = Tensor::empty({channels}, result_dtype, grad_output_c.device());
