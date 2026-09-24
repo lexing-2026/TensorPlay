@@ -47,7 +47,7 @@ struct Instruction {
 // temporary pool (instruction results); constants ride a flat buffer.
 // `io_t` selects the storage format, `compute_t` the arithmetic type; the
 // only supported widening is half/bfloat16 storage with float arithmetic.
-template <typename io_t, typename compute_t>
+template <typename io_t, typename compute_t, bool Flat>
 struct ProgramState {
     const Instruction* instructions;
     const compute_t* constants;
@@ -73,21 +73,25 @@ struct ProgramState {
                                  int64_t element) const {
         if (ref >= 0) {
             if (ref < input_count) {
-                int64_t offset = element;
-                if (!input_flat[ref]) {
-                    offset = 0;
-                    for (int64_t dim = 0; dim < rank; ++dim) {
-                        const int64_t input_extent =
-                            input_sizes[ref * rank + dim];
-                        if (input_extent != 1) {
-                            const int64_t coordinate =
-                                (element / output_strides[dim]) % output_sizes[dim];
-                            offset += coordinate *
-                                input_strides[ref * rank + dim];
+                if constexpr (Flat) {
+                    return load_io(input_ptrs[ref][element]);
+                } else {
+                    int64_t offset = element;
+                    if (!input_flat[ref]) {
+                        offset = 0;
+                        for (int64_t dim = 0; dim < rank; ++dim) {
+                            const int64_t input_extent =
+                                input_sizes[ref * rank + dim];
+                            if (input_extent != 1) {
+                                const int64_t coordinate =
+                                    (element / output_strides[dim]) % output_sizes[dim];
+                                offset += coordinate *
+                                    input_strides[ref * rank + dim];
+                            }
                         }
                     }
+                    return load_io(input_ptrs[ref][offset]);
                 }
-                return load_io(input_ptrs[ref][offset]);
             }
             return local_temps[ref - input_count];
         }
@@ -210,9 +214,9 @@ struct ProgramState {
     }
 };
 
-template <typename io_t, typename compute_t, int kTemps>
+template <typename io_t, typename compute_t, bool Flat, int kTemps>
 __global__ void stax_fused_pointwise_kernel(
-    ProgramState<io_t, compute_t> state,
+    ProgramState<io_t, compute_t, Flat> state,
     io_t* output,
     int64_t count) {
     compute_t temps[kTemps];
@@ -226,9 +230,9 @@ __global__ void stax_fused_pointwise_kernel(
     }
 }
 
-template <typename io_t, typename compute_t, int kTemps>
+template <typename io_t, typename compute_t, bool Flat, int kTemps>
 __global__ void stax_fused_pointwise_multi_kernel(
-    ProgramState<io_t, compute_t> state,
+    ProgramState<io_t, compute_t, Flat> state,
     io_t* const* temp_outputs,
     const int64_t* temp_refs,
     int64_t temp_output_count,
@@ -246,9 +250,9 @@ __global__ void stax_fused_pointwise_multi_kernel(
     }
 }
 
-template <int kTemps, typename io_t, typename compute_t>
+template <int kTemps, typename io_t, typename compute_t, bool Flat>
 void launch_program(
-    const ProgramState<io_t, compute_t>& state,
+    const ProgramState<io_t, compute_t, Flat>& state,
     io_t* output,
     io_t* const* temp_outputs,
     const int64_t* temp_refs,
@@ -258,14 +262,58 @@ void launch_program(
     const int threads = 256;
     const int blocks = static_cast<int>((count + threads - 1) / threads);
     if (output != nullptr) {
-        stax_fused_pointwise_kernel<io_t, compute_t, kTemps>
+        stax_fused_pointwise_kernel<io_t, compute_t, Flat, kTemps>
             <<<blocks, threads, 0, stream>>>(state, output, count);
     } else {
-        stax_fused_pointwise_multi_kernel<io_t, compute_t, kTemps>
+        stax_fused_pointwise_multi_kernel<io_t, compute_t, Flat, kTemps>
             <<<blocks, threads, 0, stream>>>(
                 state, temp_outputs, temp_refs, temp_output_count, count);
     }
     checkCuda(cudaGetLastError(), "stax fused pointwise launch");
+}
+
+template <typename io_t, typename compute_t, bool Flat>
+void dispatch_program_launch(
+    const ProgramState<io_t, compute_t, Flat>& state,
+    io_t* output,
+    io_t* const* temp_outputs,
+    const int64_t* temp_refs,
+    int64_t temp_output_count,
+    int64_t count,
+    cudaStream_t stream) {
+    if (output != nullptr) {
+        if (state.instruction_count <= 8) {
+            launch_program<8, io_t, compute_t, Flat>(
+                state, output, nullptr, nullptr, 0, count, stream);
+        } else if (state.instruction_count <= 16) {
+            launch_program<16, io_t, compute_t, Flat>(
+                state, output, nullptr, nullptr, 0, count, stream);
+        } else if (state.instruction_count <= 32) {
+            launch_program<32, io_t, compute_t, Flat>(
+                state, output, nullptr, nullptr, 0, count, stream);
+        } else {
+            launch_program<64, io_t, compute_t, Flat>(
+                state, output, nullptr, nullptr, 0, count, stream);
+        }
+        return;
+    }
+    if (state.instruction_count <= 8) {
+        launch_program<8, io_t, compute_t, Flat>(
+            state, nullptr, temp_outputs, temp_refs, temp_output_count,
+            count, stream);
+    } else if (state.instruction_count <= 16) {
+        launch_program<16, io_t, compute_t, Flat>(
+            state, nullptr, temp_outputs, temp_refs, temp_output_count,
+            count, stream);
+    } else if (state.instruction_count <= 32) {
+        launch_program<32, io_t, compute_t, Flat>(
+            state, nullptr, temp_outputs, temp_refs, temp_output_count,
+            count, stream);
+    } else {
+        launch_program<64, io_t, compute_t, Flat>(
+            state, nullptr, temp_outputs, temp_refs, temp_output_count,
+            count, stream);
+    }
 }
 
 
@@ -335,6 +383,13 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
     int64_t count = 1;
     for (int64_t extent : output_shape) count *= extent;
     const int64_t rank = static_cast<int64_t>(output_shape.size());
+    bool flat_inputs = true;
+    for (const Tensor& input : inputs) {
+        if (input.shape() != output_shape || !input.is_contiguous()) {
+            flat_inputs = false;
+            break;
+        }
+    }
 
     // Outputs: a ref pointing at an input aliases that input; refs into the
     // temporary pool allocate fresh storage and are written by the kernel.
@@ -386,31 +441,33 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
     for (const Tensor& input : inputs) {
         host_input_ptrs.push_back(input.data_ptr<io_t>());
     }
-    std::vector<int64_t> host_input_sizes(
-        static_cast<size_t>(input_count * rank), 1);
-    std::vector<int64_t> host_input_strides(
-        static_cast<size_t>(input_count * rank), 0);
-    std::vector<uint8_t> host_input_flat(
-        static_cast<size_t>(input_count), 1);
-    for (int64_t input_index = 0; input_index < input_count; ++input_index) {
-        const Tensor& input = inputs[static_cast<size_t>(input_index)];
-        const int64_t offset = rank - input.dim();
-        if (input.shape() != output_shape || !input.is_contiguous()) {
-            host_input_flat[static_cast<size_t>(input_index)] = 0;
+    std::vector<int64_t> host_input_sizes;
+    std::vector<int64_t> host_input_strides;
+    std::vector<uint8_t> host_input_flat;
+    std::vector<int64_t> host_output_strides;
+    if (!flat_inputs) {
+        host_input_sizes.assign(static_cast<size_t>(input_count * rank), 1);
+        host_input_strides.assign(static_cast<size_t>(input_count * rank), 0);
+        host_input_flat.assign(static_cast<size_t>(input_count), 1);
+        for (int64_t input_index = 0; input_index < input_count; ++input_index) {
+            const Tensor& input = inputs[static_cast<size_t>(input_index)];
+            const int64_t offset = rank - input.dim();
+            if (input.shape() != output_shape || !input.is_contiguous()) {
+                host_input_flat[static_cast<size_t>(input_index)] = 0;
+            }
+            for (int64_t dim = 0; dim < input.dim(); ++dim) {
+                const size_t slot = static_cast<size_t>(
+                    input_index * rank + offset + dim);
+                host_input_sizes[slot] = input.size(dim);
+                host_input_strides[slot] = input.stride(dim);
+            }
         }
-        for (int64_t dim = 0; dim < input.dim(); ++dim) {
-            const size_t slot = static_cast<size_t>(
-                input_index * rank + offset + dim);
-            host_input_sizes[slot] = input.size(dim);
-            host_input_strides[slot] = input.stride(dim);
+        host_output_strides.assign(static_cast<size_t>(rank), 1);
+        int64_t inner = 1;
+        for (int64_t dim = rank - 1; dim >= 0; --dim) {
+            host_output_strides[static_cast<size_t>(dim)] = inner;
+            inner *= output_shape[static_cast<size_t>(dim)];
         }
-    }
-    std::vector<int64_t> host_output_strides(
-        static_cast<size_t>(rank), 1);
-    int64_t inner = 1;
-    for (int64_t dim = rank - 1; dim >= 0; --dim) {
-        host_output_strides[static_cast<size_t>(dim)] = inner;
-        inner *= output_shape[static_cast<size_t>(dim)];
     }
     std::vector<io_t*> host_output_ptrs;
     host_output_ptrs.reserve(temp_tensors.size());
@@ -437,21 +494,28 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
     Tensor inptr_buf = byte_buffer(
         static_cast<int64_t>(sizeof(const io_t*) * input_count),
         inputs.front());
-    Tensor size_buf = byte_buffer(
-        static_cast<int64_t>(sizeof(int64_t) * host_input_sizes.size()),
-        inputs.front());
-    Tensor stride_buf = byte_buffer(
-        static_cast<int64_t>(sizeof(int64_t) * host_input_strides.size()),
-        inputs.front());
-    Tensor output_size_buf = byte_buffer(
-        static_cast<int64_t>(sizeof(int64_t) * output_shape.size()),
-        inputs.front());
-    Tensor output_stride_buf = byte_buffer(
-        static_cast<int64_t>(sizeof(int64_t) * host_output_strides.size()),
-        inputs.front());
-    Tensor input_flat_buf = byte_buffer(
-        static_cast<int64_t>(sizeof(uint8_t) * host_input_flat.size()),
-        inputs.front());
+    Tensor size_buf;
+    Tensor stride_buf;
+    Tensor output_size_buf;
+    Tensor output_stride_buf;
+    Tensor input_flat_buf;
+    if (!flat_inputs) {
+        size_buf = byte_buffer(
+            static_cast<int64_t>(sizeof(int64_t) * host_input_sizes.size()),
+            inputs.front());
+        stride_buf = byte_buffer(
+            static_cast<int64_t>(sizeof(int64_t) * host_input_strides.size()),
+            inputs.front());
+        output_size_buf = byte_buffer(
+            static_cast<int64_t>(sizeof(int64_t) * output_shape.size()),
+            inputs.front());
+        output_stride_buf = byte_buffer(
+            static_cast<int64_t>(sizeof(int64_t) * host_output_strides.size()),
+            inputs.front());
+        input_flat_buf = byte_buffer(
+            static_cast<int64_t>(sizeof(uint8_t) * host_input_flat.size()),
+            inputs.front());
+    }
     checkCuda(cudaMemcpyAsync(instr_buf.data_ptr(), host_instructions.data(),
                                sizeof(Instruction) * instruction_count,
                                cudaMemcpyHostToDevice, stream),
@@ -466,7 +530,7 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
                                sizeof(const io_t*) * input_count,
                                cudaMemcpyHostToDevice, stream),
                "stax fused pointwise input pointer table upload");
-    if (!host_input_sizes.empty()) {
+    if (!flat_inputs) {
         checkCuda(cudaMemcpyAsync(
                       size_buf.data_ptr(), host_input_sizes.data(),
                       sizeof(int64_t) * host_input_sizes.size(),
@@ -477,8 +541,6 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
                       sizeof(int64_t) * host_input_strides.size(),
                       cudaMemcpyHostToDevice, stream),
                   "stax fused pointwise input stride upload");
-    }
-    if (!output_shape.empty()) {
         checkCuda(cudaMemcpyAsync(
                       output_size_buf.data_ptr(), output_shape.data(),
                       sizeof(int64_t) * output_shape.size(),
@@ -489,76 +551,77 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
                       sizeof(int64_t) * host_output_strides.size(),
                       cudaMemcpyHostToDevice, stream),
                   "stax fused pointwise output stride upload");
+        checkCuda(cudaMemcpyAsync(
+                      input_flat_buf.data_ptr(), host_input_flat.data(),
+                      sizeof(uint8_t) * host_input_flat.size(),
+                      cudaMemcpyHostToDevice, stream),
+                  "stax fused pointwise input layout upload");
     }
-    checkCuda(cudaMemcpyAsync(
-                  input_flat_buf.data_ptr(), host_input_flat.data(),
-                  sizeof(uint8_t) * host_input_flat.size(),
-                  cudaMemcpyHostToDevice, stream),
-              "stax fused pointwise input layout upload");
 
-    ProgramState<io_t, compute_t> state;
-    state.instructions = reinterpret_cast<const Instruction*>(instr_buf.data_ptr());
-    state.constants = reinterpret_cast<const compute_t*>(const_buf.data_ptr());
-    state.input_ptrs = reinterpret_cast<const io_t* const*>(inptr_buf.data_ptr());
-    state.input_sizes = reinterpret_cast<const int64_t*>(size_buf.data_ptr());
-    state.input_strides = reinterpret_cast<const int64_t*>(stride_buf.data_ptr());
-    state.output_sizes = reinterpret_cast<const int64_t*>(output_size_buf.data_ptr());
-    state.output_strides = reinterpret_cast<const int64_t*>(output_stride_buf.data_ptr());
-    state.input_flat = reinterpret_cast<const uint8_t*>(input_flat_buf.data_ptr());
-    state.input_count = input_count;
-    state.instruction_count = instruction_count;
-    state.rank = rank;
-
+    io_t* output = nullptr;
+    io_t* const* output_ptrs = nullptr;
+    const int64_t* output_ref_ptr = nullptr;
+    Tensor outptr_buf;
+    Tensor ref_buf;
     if (output_refs == nullptr) {
-        io_t* out_ptr = temp_tensors[0].data_ptr<io_t>();
-        if (instruction_count <= 8) {
-            launch_program<8, io_t, compute_t>(
-                state, out_ptr, nullptr, nullptr, 0, count, stream);
-        } else if (instruction_count <= 16) {
-            launch_program<16, io_t, compute_t>(
-                state, out_ptr, nullptr, nullptr, 0, count, stream);
-        } else if (instruction_count <= 32) {
-            launch_program<32, io_t, compute_t>(
-                state, out_ptr, nullptr, nullptr, 0, count, stream);
-        } else {
-            launch_program<64, io_t, compute_t>(
-                state, out_ptr, nullptr, nullptr, 0, count, stream);
-        }
-        return outs;
+        output = temp_tensors[0].data_ptr<io_t>();
+    } else {
+        outptr_buf = byte_buffer(
+            static_cast<int64_t>(sizeof(io_t*) * host_output_ptrs.size()),
+            inputs.front());
+        ref_buf = byte_buffer(
+            static_cast<int64_t>(sizeof(int64_t) * temp_refs.size()),
+            inputs.front());
+        checkCuda(cudaMemcpyAsync(outptr_buf.data_ptr(), host_output_ptrs.data(),
+                                   sizeof(io_t*) * host_output_ptrs.size(),
+                                   cudaMemcpyHostToDevice, stream),
+                   "stax fused pointwise output pointer table upload");
+        checkCuda(cudaMemcpyAsync(ref_buf.data_ptr(), temp_refs.data(),
+                                   sizeof(int64_t) * temp_refs.size(),
+                                   cudaMemcpyHostToDevice, stream),
+                   "stax fused pointwise output refs upload");
+        output_ptrs = reinterpret_cast<io_t* const*>(outptr_buf.data_ptr());
+        output_ref_ptr = reinterpret_cast<const int64_t*>(ref_buf.data_ptr());
     }
-    Tensor outptr_buf = byte_buffer(
-        static_cast<int64_t>(sizeof(io_t*) * host_output_ptrs.size()),
-        inputs.front());
-    Tensor ref_buf = byte_buffer(
-        static_cast<int64_t>(sizeof(int64_t) * temp_refs.size()),
-        inputs.front());
-    checkCuda(cudaMemcpyAsync(outptr_buf.data_ptr(), host_output_ptrs.data(),
-                               sizeof(io_t*) * host_output_ptrs.size(),
-                               cudaMemcpyHostToDevice, stream),
-               "stax fused pointwise output pointer table upload");
-    checkCuda(cudaMemcpyAsync(ref_buf.data_ptr(), temp_refs.data(),
-                               sizeof(int64_t) * temp_refs.size(),
-                               cudaMemcpyHostToDevice, stream),
-               "stax fused pointwise output refs upload");
-    io_t* const* output_ptrs =
-        reinterpret_cast<io_t* const*>(outptr_buf.data_ptr());
-    const int64_t* output_ref_ptr =
-        reinterpret_cast<const int64_t*>(ref_buf.data_ptr());
-    if (instruction_count <= 8) {
-        launch_program<8, io_t, compute_t>(
-            state, nullptr, output_ptrs, output_ref_ptr,
-            static_cast<int64_t>(temp_refs.size()), count, stream);
-    } else if (instruction_count <= 16) {
-        launch_program<16, io_t, compute_t>(
-            state, nullptr, output_ptrs, output_ref_ptr,
-            static_cast<int64_t>(temp_refs.size()), count, stream);
-    } else if (instruction_count <= 32) {
-        launch_program<32, io_t, compute_t>(
-            state, nullptr, output_ptrs, output_ref_ptr,
+
+    if (flat_inputs) {
+        ProgramState<io_t, compute_t, true> state;
+        state.instructions =
+            reinterpret_cast<const Instruction*>(instr_buf.data_ptr());
+        state.constants = reinterpret_cast<const compute_t*>(const_buf.data_ptr());
+        state.input_ptrs =
+            reinterpret_cast<const io_t* const*>(inptr_buf.data_ptr());
+        state.input_sizes = nullptr;
+        state.input_strides = nullptr;
+        state.output_sizes = nullptr;
+        state.output_strides = nullptr;
+        state.input_flat = nullptr;
+        state.input_count = input_count;
+        state.instruction_count = instruction_count;
+        state.rank = 0;
+        dispatch_program_launch(
+            state, output, output_ptrs, output_ref_ptr,
             static_cast<int64_t>(temp_refs.size()), count, stream);
     } else {
-        launch_program<64, io_t, compute_t>(
-            state, nullptr, output_ptrs, output_ref_ptr,
+        ProgramState<io_t, compute_t, false> state;
+        state.instructions =
+            reinterpret_cast<const Instruction*>(instr_buf.data_ptr());
+        state.constants = reinterpret_cast<const compute_t*>(const_buf.data_ptr());
+        state.input_ptrs =
+            reinterpret_cast<const io_t* const*>(inptr_buf.data_ptr());
+        state.input_sizes = reinterpret_cast<const int64_t*>(size_buf.data_ptr());
+        state.input_strides = reinterpret_cast<const int64_t*>(stride_buf.data_ptr());
+        state.output_sizes =
+            reinterpret_cast<const int64_t*>(output_size_buf.data_ptr());
+        state.output_strides =
+            reinterpret_cast<const int64_t*>(output_stride_buf.data_ptr());
+        state.input_flat =
+            reinterpret_cast<const uint8_t*>(input_flat_buf.data_ptr());
+        state.input_count = input_count;
+        state.instruction_count = instruction_count;
+        state.rank = rank;
+        dispatch_program_launch(
+            state, output, output_ptrs, output_ref_ptr,
             static_cast<int64_t>(temp_refs.size()), count, stream);
     }
     return outs;
