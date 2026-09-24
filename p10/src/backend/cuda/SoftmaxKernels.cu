@@ -27,6 +27,12 @@ namespace cuda {
 
 Tensor softmax_native_impl(const Tensor& self, int64_t dim, bool log_mode);
 
+// Defined after the native kernels: runs the wave/register tiers for a
+// contiguous row along the fast dimension and reports whether one applied.
+bool softmax_native_fast_path(const Tensor& self, Tensor& result,
+                              int64_t outer_size, int64_t softmax_size,
+                              int64_t inner_size, bool log_mode);
+
 Tensor cudnn_softmax(const Tensor& self, int64_t dim, bool log) {
     int64_t ndim = self.dim();
     if (dim < 0) dim += ndim;
@@ -49,6 +55,13 @@ Tensor cudnn_softmax(const Tensor& self, int64_t dim, bool log) {
     for(int i=dim+1; i<ndim; ++i) inner_size *= input.size(i);
 
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(input.shape()), input.dtype(), input.device());
+
+    // A contiguous row along the fast dimension is a single-pass kernel in
+    // this unit; the DNN library path stays for strided/spatial layouts.
+    if (softmax_native_fast_path(input, result, outer_size, softmax_size,
+                                 inner_size, log)) {
+        return result;
+    }
 
     cudnnHandle_t handle = CUDAContext::getCudnnHandle();
 
@@ -336,6 +349,306 @@ bool try_wave_softmax(const Tensor& self, Tensor& result, int64_t softmax_size,
   return true;
 }
 
+// --- Register-resident row softmax for long rows ---
+//
+// One block owns one row and holds its whole slice in registers, so global
+// memory sees exactly one read pass and one write pass no matter how long
+// the row is.  When the row length divides the packet width and both base
+// pointers are 16-byte aligned, every slot moves a vector packet; otherwise
+// a scalar-slot variant keeps the same single-pass residency for odd rows.
+// Padding slots carry the max identity, which contributes zero to the
+// exponential sum and is masked out of the store.
+
+template <typename T, int V>
+struct alignas(sizeof(T) * V) SoftmaxPack {
+  T v[V];
+};
+
+// Row data moves exactly once in each direction and is never revisited, so
+// the streaming hints keep it out of the L2 working set of other blocks.
+template <typename T, int V>
+__device__ __forceinline__ SoftmaxPack<T, V> softmax_load_stream(
+    const SoftmaxPack<T, V>* p) {
+  SoftmaxPack<T, V> r;
+  *reinterpret_cast<uint4*>(&r) = __ldcs(reinterpret_cast<const uint4*>(p));
+  return r;
+}
+
+template <typename T, int V>
+__device__ __forceinline__ void softmax_store_stream(SoftmaxPack<T, V>* p,
+                                                     const SoftmaxPack<T, V>& r) {
+  __stcs(reinterpret_cast<uint4*>(p), *reinterpret_cast<const uint4*>(&r));
+}
+
+template <typename compute_t, bool kIsMax>
+__device__ __forceinline__ compute_t softmax_block_reduce(
+    compute_t value, compute_t* scratch) {
+  constexpr int kWave = 32;
+  const unsigned mask = 0xffffffffu;
+  const int lane = static_cast<int>(threadIdx.x) % kWave;
+  const int warp = static_cast<int>(threadIdx.x) / kWave;
+#pragma unroll
+  for (int offset = kWave / 2; offset > 0; offset /= 2) {
+    const compute_t other = __shfl_xor_sync(mask, value, offset, kWave);
+    value = kIsMax ? (other > value ? other : value) : (value + other);
+  }
+  const int warps = static_cast<int>(blockDim.x) / kWave;
+  if (lane == 0) scratch[warp] = value;
+  __syncthreads();
+  if (warp == 0) {
+    value = lane < warps
+        ? scratch[lane]
+        : (kIsMax ? -std::numeric_limits<compute_t>::infinity()
+                  : compute_t(0));
+#pragma unroll
+    for (int offset = kWave / 2; offset > 0; offset /= 2) {
+      const compute_t other = __shfl_xor_sync(mask, value, offset, kWave);
+      value = kIsMax ? (other > value ? other : value) : (value + other);
+    }
+    if (lane == 0) scratch[0] = value;
+  }
+  __syncthreads();
+  return scratch[0];
+}
+
+// Online (max, sum-of-exponentials) pair: combining two partials rescales
+// the sums onto the merged max, so a single tree reduction yields the row
+// statistics that a separate max pass followed by a sum pass would produce.
+template <typename compute_t>
+struct SoftmaxMS {
+  compute_t m;
+  compute_t s;
+};
+
+template <typename compute_t>
+__device__ __forceinline__ SoftmaxMS<compute_t> softmax_ms_combine(
+    SoftmaxMS<compute_t> a, SoftmaxMS<compute_t> b) {
+  const compute_t m = a.m > b.m ? a.m : b.m;
+  if (m == -std::numeric_limits<compute_t>::infinity()) {
+    // Both partials are empty: the sums are already zero, and the max
+    // difference would turn inf - inf into NaN.
+    return SoftmaxMS<compute_t>{m, a.s + b.s};
+  }
+  const compute_t sa = a.s * std::exp(a.m - m);
+  const compute_t sb = b.s * std::exp(b.m - m);
+  return SoftmaxMS<compute_t>{m, sa + sb};
+}
+
+template <typename compute_t>
+__device__ __forceinline__ SoftmaxMS<compute_t> softmax_block_reduce_ms(
+    SoftmaxMS<compute_t> value, SoftmaxMS<compute_t>* scratch) {
+  constexpr int kWave = 32;
+  const unsigned mask = 0xffffffffu;
+  const int lane = static_cast<int>(threadIdx.x) % kWave;
+  const int warp = static_cast<int>(threadIdx.x) / kWave;
+#pragma unroll
+  for (int offset = kWave / 2; offset > 0; offset /= 2) {
+    const SoftmaxMS<compute_t> other{
+        __shfl_xor_sync(mask, value.m, offset, kWave),
+        __shfl_xor_sync(mask, value.s, offset, kWave)};
+    value = softmax_ms_combine(value, other);
+  }
+  const int warps = static_cast<int>(blockDim.x) / kWave;
+  if (lane == 0) scratch[warp] = value;
+  __syncthreads();
+  if (warp == 0) {
+    value = lane < warps
+        ? scratch[lane]
+        : SoftmaxMS<compute_t>{-std::numeric_limits<compute_t>::infinity(),
+                               compute_t(0)};
+#pragma unroll
+    for (int offset = kWave / 2; offset > 0; offset /= 2) {
+      const SoftmaxMS<compute_t> other{
+          __shfl_xor_sync(mask, value.m, offset, kWave),
+          __shfl_xor_sync(mask, value.s, offset, kWave)};
+      value = softmax_ms_combine(value, other);
+    }
+    if (lane == 0) scratch[0] = value;
+  }
+  __syncthreads();
+  return scratch[0];
+}
+
+template <typename scalar_t, typename compute_t, int PACKS, bool LOG_MODE>
+__global__ void softmax_reg_packed_kernel(scalar_t* __restrict__ out,
+                                          const scalar_t* __restrict__ in,
+                                          int classes, int packets) {
+  constexpr int kPack = 16 / static_cast<int>(sizeof(scalar_t));
+  constexpr int kWave = 32;
+  __shared__ SoftmaxMS<compute_t> reduce_ms[kWave];
+  const int tid = static_cast<int>(threadIdx.x);
+  const scalar_t* row = in + static_cast<int64_t>(blockIdx.x) * classes;
+  scalar_t* row_out = out + static_cast<int64_t>(blockIdx.x) * classes;
+
+  SoftmaxPack<scalar_t, kPack> v[PACKS];
+  const SoftmaxPack<scalar_t, kPack>* src =
+      reinterpret_cast<const SoftmaxPack<scalar_t, kPack>*>(row);
+#pragma unroll
+  for (int i = 0; i < PACKS; ++i) {
+    const int slot = tid + i * static_cast<int>(blockDim.x);
+    if (slot < packets) {
+      v[i] = softmax_load_stream(src + slot);
+    } else {
+#pragma unroll
+      for (int k = 0; k < kPack; ++k) {
+        v[i].v[k] = -std::numeric_limits<scalar_t>::infinity();
+      }
+    }
+  }
+
+  // Thread-local moments, then one online pair reduction: every thread's
+  // partial sum is rescaled onto the merged max inside the combine, so a
+  // single tree walk yields the same (max, sum) a two-pass flow would.
+  compute_t thread_max = -std::numeric_limits<compute_t>::infinity();
+#pragma unroll
+  for (int i = 0; i < PACKS; ++i) {
+#pragma unroll
+    for (int k = 0; k < kPack; ++k) {
+      const compute_t x = static_cast<compute_t>(v[i].v[k]);
+      thread_max = x > thread_max ? x : thread_max;
+    }
+  }
+  compute_t thread_sum = compute_t(0);
+#pragma unroll
+  for (int i = 0; i < PACKS; ++i) {
+#pragma unroll
+    for (int k = 0; k < kPack; ++k) {
+      thread_sum += std::exp(static_cast<compute_t>(v[i].v[k]) - thread_max);
+    }
+  }
+  const SoftmaxMS<compute_t> ms =
+      softmax_block_reduce_ms<compute_t>(
+          SoftmaxMS<compute_t>{thread_max, thread_sum}, reduce_ms);
+  const compute_t norm = LOG_MODE ? std::log(ms.s) : compute_t(1) / ms.s;
+
+  SoftmaxPack<scalar_t, kPack>* dst =
+      reinterpret_cast<SoftmaxPack<scalar_t, kPack>*>(row_out);
+#pragma unroll
+  for (int i = 0; i < PACKS; ++i) {
+    const int slot = tid + i * static_cast<int>(blockDim.x);
+    if (slot < packets) {
+      SoftmaxPack<scalar_t, kPack> r;
+#pragma unroll
+      for (int k = 0; k < kPack; ++k) {
+        const compute_t x = static_cast<compute_t>(v[i].v[k]) - ms.m;
+        r.v[k] = static_cast<scalar_t>(LOG_MODE ? x - norm : std::exp(x) * norm);
+      }
+      softmax_store_stream(dst + slot, r);
+    }
+  }
+}
+
+template <typename scalar_t, typename compute_t, int REG, bool LOG_MODE>
+__global__ void softmax_reg_scalar_kernel(scalar_t* __restrict__ out,
+                                          const scalar_t* __restrict__ in,
+                                          int classes) {
+  constexpr int kWave = 32;
+  __shared__ compute_t reduce_max[kWave];
+  __shared__ compute_t reduce_sum[kWave];
+  const int tid = static_cast<int>(threadIdx.x);
+  const scalar_t* row = in + static_cast<int64_t>(blockIdx.x) * classes;
+  scalar_t* row_out = out + static_cast<int64_t>(blockIdx.x) * classes;
+
+  scalar_t v[REG];
+#pragma unroll
+  for (int i = 0; i < REG; ++i) {
+    const int slot = tid + i * static_cast<int>(blockDim.x);
+    v[i] = slot < classes
+        ? row[slot]
+        : -std::numeric_limits<scalar_t>::infinity();
+  }
+
+  compute_t thread_max = -std::numeric_limits<compute_t>::infinity();
+#pragma unroll
+  for (int i = 0; i < REG; ++i) {
+    const compute_t x = static_cast<compute_t>(v[i]);
+    thread_max = x > thread_max ? x : thread_max;
+  }
+  thread_max = softmax_block_reduce<compute_t, true>(thread_max, reduce_max);
+
+  compute_t thread_sum = compute_t(0);
+#pragma unroll
+  for (int i = 0; i < REG; ++i) {
+    thread_sum += std::exp(static_cast<compute_t>(v[i]) - thread_max);
+  }
+  thread_sum = softmax_block_reduce<compute_t, false>(thread_sum, reduce_sum);
+  const compute_t norm =
+      LOG_MODE ? std::log(thread_sum) : compute_t(1) / thread_sum;
+
+#pragma unroll
+  for (int i = 0; i < REG; ++i) {
+    const int slot = tid + i * static_cast<int>(blockDim.x);
+    if (slot < classes) {
+      const compute_t x = static_cast<compute_t>(v[i]) - thread_max;
+      row_out[slot] =
+          static_cast<scalar_t>(LOG_MODE ? x - norm : std::exp(x) * norm);
+    }
+  }
+}
+
+template <typename scalar_t, typename compute_t, bool LOG_MODE>
+bool try_reg_softmax(const Tensor& self, Tensor& result,
+                     int64_t softmax_size, int64_t rows) {
+  constexpr int kPack = 16 / static_cast<int>(sizeof(scalar_t));
+  if (softmax_size < 2049 || rows > INT32_MAX) return false;
+  if (!self.is_contiguous() || !result.is_contiguous()) return false;
+  const scalar_t* in = self.data_ptr<scalar_t>();
+  scalar_t* out = result.data_ptr<scalar_t>();
+  const bool aligned =
+      (reinterpret_cast<uintptr_t>(in) % 16 == 0) &&
+      (reinterpret_cast<uintptr_t>(out) % 16 == 0);
+  const auto stream = getCurrentCUDAStream().stream();
+  const auto wave_round = [](int64_t n) {
+    return (n + 31) / 32 * 32;
+  };
+  const auto grid = static_cast<unsigned>(rows);
+
+  if (aligned && softmax_size % kPack == 0) {
+    // Prefer a few hundred threads with several register slots each: the
+    // row fits in registers either way, and smaller blocks raise the
+    // resident-block count, which is what saturates these pure streams.
+    const int packets = static_cast<int>(softmax_size / kPack);
+    if (packets <= 256) {
+      const int threads = static_cast<int>(wave_round(packets));
+      softmax_reg_packed_kernel<scalar_t, compute_t, 1, LOG_MODE>
+          <<<grid, threads, 0, stream>>>(out, in,
+                                         static_cast<int>(softmax_size),
+                                         packets);
+    } else if (packets <= 512) {
+      const int threads = static_cast<int>(wave_round((packets + 1) / 2));
+      softmax_reg_packed_kernel<scalar_t, compute_t, 2, LOG_MODE>
+          <<<grid, threads, 0, stream>>>(out, in,
+                                         static_cast<int>(softmax_size),
+                                         packets);
+    } else if (packets <= 2048) {
+      const int threads = static_cast<int>(wave_round((packets + 3) / 4));
+      softmax_reg_packed_kernel<scalar_t, compute_t, 4, LOG_MODE>
+          <<<grid, threads, 0, stream>>>(out, in,
+                                         static_cast<int>(softmax_size),
+                                         packets);
+    } else if (packets <= 8192) {
+      const int threads = static_cast<int>(wave_round((packets + 7) / 8));
+      softmax_reg_packed_kernel<scalar_t, compute_t, 8, LOG_MODE>
+          <<<grid, threads, 0, stream>>>(out, in,
+                                         static_cast<int>(softmax_size),
+                                         packets);
+    } else {
+      return false;
+    }
+  } else {
+    // Scalar slots cover any row length and alignment with the same
+    // small-block shape.
+    if (softmax_size > 16384) return false;
+    const int threads = static_cast<int>(
+        wave_round((softmax_size + 15) / 16));
+    softmax_reg_scalar_kernel<scalar_t, compute_t, 16, LOG_MODE>
+        <<<grid, threads, 0, stream>>>(out, in,
+                                       static_cast<int>(softmax_size));
+  }
+  CUDA_CHECK(cudaGetLastError());
+  return true;
+}
+
 }  // namespace
 
 template <typename scalar_t, typename compute_t>
@@ -356,6 +669,14 @@ void softmax_dim_dispatch(const Tensor& self, Tensor& result, int64_t dim,
         : try_wave_softmax<scalar_t, compute_t, false>(self, result,
                                                        softmax_size, rows);
     if (wave) return;
+    // Longer contiguous rows keep the whole slice in registers: one read
+    // pass and one write pass regardless of row length.
+    const bool reg = log_mode
+        ? try_reg_softmax<scalar_t, compute_t, true>(self, result,
+                                                     softmax_size, rows)
+        : try_reg_softmax<scalar_t, compute_t, false>(self, result,
+                                                      softmax_size, rows);
+    if (reg) return;
   }
   constexpr int kThreads = 256;
   softmax_dim_kernel<scalar_t, compute_t>
@@ -365,6 +686,44 @@ void softmax_dim_dispatch(const Tensor& self, Tensor& result, int64_t dim,
           rows * inner_size, softmax_size, inner_size, log_mode);
   CUDA_CHECK(cudaGetLastError());
 }
+
+bool softmax_native_fast_path(const Tensor& self, Tensor& result,
+                              int64_t outer_size, int64_t softmax_size,
+                              int64_t inner_size, bool log_mode) {
+  if (inner_size != 1 || outer_size == 0 || softmax_size <= 0) return false;
+  switch (self.dtype()) {
+    case DType::Float32: {
+      if (log_mode) {
+        return try_wave_softmax<float, float, true>(self, result, softmax_size,
+                                                    outer_size) ||
+               try_reg_softmax<float, float, true>(self, result, softmax_size,
+                                                   outer_size);
+      }
+      return try_wave_softmax<float, float, false>(self, result, softmax_size,
+                                                   outer_size) ||
+             try_reg_softmax<float, float, false>(self, result, softmax_size,
+                                                  outer_size);
+    }
+    case DType::Float64: {
+      if (log_mode) {
+        return try_wave_softmax<double, double, true>(self, result,
+                                                      softmax_size,
+                                                      outer_size) ||
+               try_reg_softmax<double, double, true>(self, result,
+                                                     softmax_size,
+                                                     outer_size);
+      }
+      return try_wave_softmax<double, double, false>(self, result,
+                                                     softmax_size,
+                                                     outer_size) ||
+             try_reg_softmax<double, double, false>(self, result,
+                                                    softmax_size, outer_size);
+    }
+    default:
+      return false;
+  }
+}
+
 
 Tensor softmax_native_impl(const Tensor& self, int64_t dim, bool log_mode) {
   int64_t dim_idx = dim < 0 ? dim + self.dim() : dim;
