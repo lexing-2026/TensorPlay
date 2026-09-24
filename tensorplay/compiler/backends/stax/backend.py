@@ -6651,9 +6651,14 @@ def _build_aot_formula_env(
 
     def conv_grad(name: str):
         def invoke(grad, input_value, weight, stride, padding, dilation, groups):
-            return builder.helper(
+            # Bias accumulation keeps the parameter dtype while consuming
+            # reduced precision activations.  The CUDA reduction already
+            # supports this mixed-width path, so do not materialize a reduced
+            # bias result only to widen it at the adjoint boundary.
+            weight_arg = weight if name.endswith("bias") else _narrow(weight)
+            result = builder.helper(
                 name,
-                (_narrow(grad), _narrow(input_value), _narrow(weight)),
+                (_narrow(grad), _narrow(input_value), weight_arg),
                 attrs={
                     "stride": tuple(stride),
                     "padding": tuple(padding),
@@ -6668,6 +6673,9 @@ def _build_aot_formula_env(
                     else (grad.shape[1],)
                 ),
             )
+            if name.endswith("bias") and isinstance(result, _AotNativeSymbol):
+                result.dtype = weight.dtype
+            return result
 
         return invoke
 
