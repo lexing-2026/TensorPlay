@@ -85,6 +85,57 @@ __device__ void store_typed(uint8_t kind, void* ptr, int64_t index,
     }
 }
 
+// Stores four consecutive lanes of one output.  Aligned uniform-width
+// outputs move in one wide transaction; narrower element types pack into
+// their 16-bit patterns first.  Misaligned or unhandled forms fall back to
+// the scalar store, so correctness never depends on the wide path firing.
+template <typename compute_t>
+__device__ void store_group_typed(uint8_t kind, void* ptr, int64_t base,
+                                  const compute_t (&lanes)[4]) {
+    const bool aligned =
+        (reinterpret_cast<uintptr_t>(ptr) & 15) == 0 && (base & 3) == 0;
+    if (aligned && kind == kOutF32) {
+        const float4 v{static_cast<float>(lanes[0]),
+                       static_cast<float>(lanes[1]),
+                       static_cast<float>(lanes[2]),
+                       static_cast<float>(lanes[3])};
+        *reinterpret_cast<float4*>(static_cast<float*>(ptr) + base) = v;
+        return;
+    }
+    if (aligned && kind == kOutF64) {
+        double* typed = static_cast<double*>(ptr) + base;
+        *reinterpret_cast<double2*>(typed) =
+            double2{static_cast<double>(lanes[0]), static_cast<double>(lanes[1])};
+        *reinterpret_cast<double2*>(typed + 2) =
+            double2{static_cast<double>(lanes[2]), static_cast<double>(lanes[3])};
+        return;
+    }
+    if (aligned && (kind == kOutF16 || kind == kOutBF16)) {
+        uint16_t bits[4];
+        #pragma unroll
+        for (int lane = 0; lane < 4; ++lane) {
+            bits[lane] = kind == kOutF16
+                ? static_cast<tensorplay::Half>(lanes[lane]).x
+                : static_cast<tensorplay::BFloat16>(lanes[lane]).x;
+        }
+        const uint2 w{
+            static_cast<unsigned int>(bits[0]) |
+                (static_cast<unsigned int>(bits[1]) << 16),
+            static_cast<unsigned int>(bits[2]) |
+                (static_cast<unsigned int>(bits[3]) << 16)};
+        if (kind == kOutF16) {
+            *reinterpret_cast<uint2*>(static_cast<tensorplay::Half*>(ptr) + base) = w;
+        } else {
+            *reinterpret_cast<uint2*>(static_cast<tensorplay::BFloat16*>(ptr) + base) = w;
+        }
+        return;
+    }
+    #pragma unroll
+    for (int lane = 0; lane < 4; ++lane) {
+        store_typed(kind, ptr, base + lane, lanes[lane]);
+    }
+}
+
 // One thread evaluates the full program for one element.  Operands resolve
 // through a device-resident pointer table (inputs) and a per-thread
 // temporary pool (instruction results); constants ride a flat buffer.
@@ -92,8 +143,7 @@ __device__ void store_typed(uint8_t kind, void* ptr, int64_t index,
 // load, so a single program can mix element widths without a separate
 // conversion pass.
 template <typename compute_t, bool Flat>
-struct ProgramState {
-    const Instruction* instructions;
+struct ProgramState {    const Instruction* instructions;
     const compute_t* constants;
     const void* const* input_ptrs;
     const uint8_t* input_kinds;
@@ -293,6 +343,281 @@ struct ProgramState {
             local_temps[i] = value;
         }
     }
+
+    // --- Group execution (four consecutive elements per thread) ---------
+    // Flat programs address every operand with the same base index, so a
+    // group of four lanes is four contiguous values per uniform-width
+    // input: one wide transaction instead of four scalar reads.  Mixed
+    // kinds and misaligned pointers drop to the scalar load per lane.
+    __device__ void load_input_group(int64_t ref, int64_t base,
+                                     compute_t (&out)[4]) const {
+        const void* ptr = input_ptrs[ref];
+        const bool aligned = (reinterpret_cast<uintptr_t>(ptr) & 15) == 0;
+        if (aligned && uniform_kind == kOutF32) {
+            const float4 v =
+                *reinterpret_cast<const float4*>(static_cast<const float*>(ptr) + base);
+            out[0] = static_cast<compute_t>(v.x);
+            out[1] = static_cast<compute_t>(v.y);
+            out[2] = static_cast<compute_t>(v.z);
+            out[3] = static_cast<compute_t>(v.w);
+            return;
+        }
+        if (aligned && uniform_kind == kOutF64) {
+            const double* typed = static_cast<const double*>(ptr) + base;
+            const double2 a = *reinterpret_cast<const double2*>(typed);
+            const double2 b = *reinterpret_cast<const double2*>(typed + 2);
+            out[0] = static_cast<compute_t>(a.x);
+            out[1] = static_cast<compute_t>(a.y);
+            out[2] = static_cast<compute_t>(b.x);
+            out[3] = static_cast<compute_t>(b.y);
+            return;
+        }
+        if (aligned && (uniform_kind == kOutF16 || uniform_kind == kOutBF16)) {
+            const uint2 w = uniform_kind == kOutF16
+                ? *reinterpret_cast<const uint2*>(static_cast<const tensorplay::Half*>(ptr) + base)
+                : *reinterpret_cast<const uint2*>(static_cast<const tensorplay::BFloat16*>(ptr) + base);
+            const uint16_t bits[4] = {
+                static_cast<uint16_t>(w.x & 0xFFFFu),
+                static_cast<uint16_t>(w.x >> 16),
+                static_cast<uint16_t>(w.y & 0xFFFFu),
+                static_cast<uint16_t>(w.y >> 16),
+            };
+            #pragma unroll
+            for (int lane = 0; lane < 4; ++lane) {
+                out[lane] = uniform_kind == kOutF16
+                    ? static_cast<compute_t>(tensorplay::Half(
+                          bits[lane], tensorplay::Half::from_bits()))
+                    : static_cast<compute_t>(tensorplay::BFloat16(
+                          bits[lane], tensorplay::BFloat16::from_bits()));
+            }
+            return;
+        }
+        #pragma unroll
+        for (int lane = 0; lane < 4; ++lane) {
+            out[lane] = load_input(ref, base + lane);
+        }
+    }
+
+    __device__ void resolve_group(int64_t ref,
+                                  const compute_t (*local_temps)[4],
+                                  compute_t (&out)[4], int64_t base) const {
+        if (ref >= 0) {
+            if (ref < input_count) {
+                load_input_group(ref, base, out);
+                return;
+            }
+            const compute_t* slot = local_temps[ref - input_count];
+            #pragma unroll
+            for (int lane = 0; lane < 4; ++lane) {
+                out[lane] = slot[lane];
+            }
+            return;
+        }
+        const compute_t c = constants[-ref - 1];
+        #pragma unroll
+        for (int lane = 0; lane < 4; ++lane) {
+            out[lane] = c;
+        }
+    }
+
+    __device__ void evaluate_group(compute_t (*local_temps)[4],
+                                   int64_t* pending_where,
+                                   int64_t base) const {
+        for (int64_t i = 0; i < instruction_count; ++i) {
+            const Instruction& inst = instructions[i];
+            const int64_t op = inst.op;
+            if (op == static_cast<int64_t>(StaxOp::Where)) {
+                pending_where[0] = inst.lhs;
+                pending_where[1] = inst.rhs;
+                pending_where[2] = 1;
+                #pragma unroll
+                for (int lane = 0; lane < 4; ++lane) local_temps[i][lane] = compute_t(0);
+                continue;
+            }
+            if (op == static_cast<int64_t>(StaxOp::WhereRest)) {
+                if (pending_where[2] == 1) {
+                    compute_t cond[4], then_v[4], else_v[4];
+                    resolve_group(pending_where[0], local_temps, cond, base);
+                    resolve_group(pending_where[1], local_temps, then_v, base);
+                    resolve_group(inst.rhs, local_temps, else_v, base);
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane) {
+                        local_temps[i][lane] =
+                            cond[lane] != compute_t(0) ? then_v[lane] : else_v[lane];
+                    }
+                    pending_where[2] = 0;
+                } else {
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane) local_temps[i][lane] = compute_t(0);
+                }
+                continue;
+            }
+            compute_t lhs[4], rhs[4], value[4];
+            resolve_group(inst.lhs, local_temps, lhs, base);
+            resolve_group(inst.rhs, local_temps, rhs, base);
+            switch (op) {
+                case static_cast<int64_t>(StaxOp::Add):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane) value[lane] = lhs[lane] + rhs[lane];
+                    break;
+                case static_cast<int64_t>(StaxOp::Sub):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane) value[lane] = lhs[lane] - rhs[lane];
+                    break;
+                case static_cast<int64_t>(StaxOp::Mul):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane) value[lane] = lhs[lane] * rhs[lane];
+                    break;
+                case static_cast<int64_t>(StaxOp::Div):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane) value[lane] = lhs[lane] / rhs[lane];
+                    break;
+                case static_cast<int64_t>(StaxOp::Pow):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane)
+                        value[lane] = ::pow(static_cast<double>(lhs[lane]),
+                                            static_cast<double>(rhs[lane]));
+                    break;
+                case static_cast<int64_t>(StaxOp::Neg):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane) value[lane] = -lhs[lane];
+                    break;
+                case static_cast<int64_t>(StaxOp::Pos):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane) value[lane] = lhs[lane];
+                    break;
+                case static_cast<int64_t>(StaxOp::Abs):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane) value[lane] = ::fabs(lhs[lane]);
+                    break;
+                case static_cast<int64_t>(StaxOp::Sin):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane) value[lane] = ::sin(lhs[lane]);
+                    break;
+                case static_cast<int64_t>(StaxOp::Cos):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane) value[lane] = ::cos(lhs[lane]);
+                    break;
+                case static_cast<int64_t>(StaxOp::Exp):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane) value[lane] = ::exp(lhs[lane]);
+                    break;
+                case static_cast<int64_t>(StaxOp::Log):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane) value[lane] = ::log(lhs[lane]);
+                    break;
+                case static_cast<int64_t>(StaxOp::Sigmoid):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane)
+                        value[lane] = compute_t(1) / (compute_t(1) + ::exp(-lhs[lane]));
+                    break;
+                case static_cast<int64_t>(StaxOp::Sqrt):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane) value[lane] = ::sqrt(lhs[lane]);
+                    break;
+                case static_cast<int64_t>(StaxOp::Square):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane) value[lane] = lhs[lane] * lhs[lane];
+                    break;
+                case static_cast<int64_t>(StaxOp::Tanh):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane) value[lane] = ::tanh(lhs[lane]);
+                    break;
+                case static_cast<int64_t>(StaxOp::Relu):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane)
+                        value[lane] = lhs[lane] > compute_t(0) ? lhs[lane] : compute_t(0);
+                    break;
+                case static_cast<int64_t>(StaxOp::ReluGrad):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane)
+                        value[lane] = lhs[lane] > compute_t(0) ? compute_t(1) : compute_t(0);
+                    break;
+                case static_cast<int64_t>(StaxOp::AbsGrad):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane)
+                        value[lane] =
+                            (lhs[lane] > compute_t(0) ? compute_t(1) : compute_t(0)) -
+                            (lhs[lane] < compute_t(0) ? compute_t(1) : compute_t(0));
+                    break;
+                case static_cast<int64_t>(StaxOp::Lt):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane)
+                        value[lane] = lhs[lane] < rhs[lane] ? compute_t(1) : compute_t(0);
+                    break;
+                case static_cast<int64_t>(StaxOp::Le):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane)
+                        value[lane] = lhs[lane] <= rhs[lane] ? compute_t(1) : compute_t(0);
+                    break;
+                case static_cast<int64_t>(StaxOp::Gt):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane)
+                        value[lane] = lhs[lane] > rhs[lane] ? compute_t(1) : compute_t(0);
+                    break;
+                case static_cast<int64_t>(StaxOp::Ge):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane)
+                        value[lane] = lhs[lane] >= rhs[lane] ? compute_t(1) : compute_t(0);
+                    break;
+                case static_cast<int64_t>(StaxOp::Eq):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane)
+                        value[lane] = lhs[lane] == rhs[lane] ? compute_t(1) : compute_t(0);
+                    break;
+                case static_cast<int64_t>(StaxOp::Ne):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane)
+                        value[lane] = lhs[lane] != rhs[lane] ? compute_t(1) : compute_t(0);
+                    break;
+                case static_cast<int64_t>(StaxOp::Minimum):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane)
+                        value[lane] = lhs[lane] < rhs[lane] ? lhs[lane] : rhs[lane];
+                    break;
+                case static_cast<int64_t>(StaxOp::Maximum):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane)
+                        value[lane] = lhs[lane] > rhs[lane] ? lhs[lane] : rhs[lane];
+                    break;
+                case static_cast<int64_t>(StaxOp::ClampMin):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane)
+                        value[lane] = lhs[lane] < rhs[lane] ? rhs[lane] : lhs[lane];
+                    break;
+                case static_cast<int64_t>(StaxOp::ClampMax):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane)
+                        value[lane] = lhs[lane] > rhs[lane] ? rhs[lane] : lhs[lane];
+                    break;
+                case static_cast<int64_t>(StaxOp::Rsqrt):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane)
+                        value[lane] = compute_t(1) / ::sqrt(lhs[lane]);
+                    break;
+                case static_cast<int64_t>(StaxOp::Exp2):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane) value[lane] = ::exp2(lhs[lane]);
+                    break;
+                case static_cast<int64_t>(StaxOp::Erf):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane) value[lane] = ::erf(lhs[lane]);
+                    break;
+                case static_cast<int64_t>(StaxOp::Cast):
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane) value[lane] = lhs[lane];
+                    break;
+                default:
+                    #pragma unroll
+                    for (int lane = 0; lane < 4; ++lane) value[lane] = compute_t(0);
+                    break;
+            }
+            #pragma unroll
+            for (int lane = 0; lane < 4; ++lane) {
+                local_temps[i][lane] = value[lane];
+            }
+        }
+    }
 };
 
 template <typename compute_t, bool Flat, int kTemps>
@@ -333,6 +658,39 @@ __global__ void stax_fused_pointwise_multi_kernel(
     }
 }
 
+// Vectorized flat program: each thread walks groups of four consecutive
+// elements, so aligned uniform-width traffic moves in wide transactions and
+// the interpreter's per-instruction switch dispatch amortizes across the
+// group.  Group-strided tiles keep every wide access in bounds; the
+// trailing partial group re-enters the scalar path.
+template <typename compute_t, int kTemps>
+__global__ void stax_fused_pointwise_vec_kernel(
+    ProgramState<compute_t, true> state,
+    void* output,
+    uint8_t out_kind,
+    int64_t count) {
+    compute_t temps[kTemps][4];
+    int64_t pending_where[3] = {0, 0, 0};
+    const int64_t groups = (count + 3) / 4;
+    int64_t group = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    for (; group < groups; group += stride) {
+        const int64_t base = group * 4;
+        if (base + 4 <= count) {
+            state.evaluate_group(temps, pending_where, base);
+            store_group_typed(out_kind, output, base,
+                              temps[state.instruction_count - 1]);
+        } else {
+            compute_t scalar_temps[kTemps];
+            for (int64_t element = base; element < count; ++element) {
+                state.evaluate(scalar_temps, pending_where, element);
+                store_typed(out_kind, output, element,
+                            scalar_temps[state.instruction_count - 1]);
+            }
+        }
+    }
+}
+
 template <int kTemps, typename compute_t, bool Flat>
 void launch_program(
     const ProgramState<compute_t, Flat>& state,
@@ -345,6 +703,20 @@ void launch_program(
     int64_t count,
     cudaStream_t stream) {
     const int threads = 256;
+    // Wide-path eligibility: flat single-output programs over enough
+    // elements to amortize the wider register footprint.  Per-pointer
+    // alignment is checked on the device, so a misaligned view silently
+    // takes the scalar load instead of failing the launch.
+    if constexpr (Flat && kTemps <= 16) {
+        if (output != nullptr && count >= 2048) {
+            const int64_t groups = (count + 3) / 4;
+            const int blocks = static_cast<int>((groups + threads - 1) / threads);
+            stax_fused_pointwise_vec_kernel<compute_t, kTemps>
+                <<<blocks, threads, 0, stream>>>(state, output, out_kind, count);
+            checkCuda(cudaGetLastError(), "stax fused pointwise vector launch");
+            return;
+        }
+    }
     const int blocks = static_cast<int>((count + threads - 1) / threads);
     if (output != nullptr) {
         stax_fused_pointwise_kernel<compute_t, Flat, kTemps>
