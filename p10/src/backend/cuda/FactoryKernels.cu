@@ -190,8 +190,9 @@ Tensor empty_like_kernel(const Tensor& self, DType dtype, std::optional<Device> 
         const int64_t c = shape[1];
         const int64_t h = shape[2];
         const int64_t w = shape[3];
-        Tensor out = result.as_strided(shape, {c * h * w, 1, w * c, c});
-        out.unsafeGetTensorImpl()->set_memory_format(MemoryFormat::ChannelsLast);
+        const std::vector<int64_t> strides{c * h * w, 1, w * c, c};
+        Tensor out = result.as_strided(shape, strides);
+        out.unsafeGetTensorImpl()->set_sizes_and_strides(shape, strides);
         return out;
     }
     if (self.dim() == 5 && self.is_channels_last_3d()) {
@@ -199,9 +200,9 @@ Tensor empty_like_kernel(const Tensor& self, DType dtype, std::optional<Device> 
         const int64_t d = shape[2];
         const int64_t h = shape[3];
         const int64_t w = shape[4];
-        Tensor out = result.as_strided(
-            shape, {c * d * h * w, 1, h * w * c, w * c, c});
-        out.unsafeGetTensorImpl()->set_memory_format(MemoryFormat::ChannelsLast3d);
+        const std::vector<int64_t> strides{c * d * h * w, 1, h * w * c, w * c, c};
+        Tensor out = result.as_strided(shape, strides);
+        out.unsafeGetTensorImpl()->set_sizes_and_strides(shape, strides);
         return out;
     }
     return result;
