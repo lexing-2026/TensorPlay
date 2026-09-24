@@ -969,6 +969,73 @@ __global__ void softmax_backward_data_kernel(
   }
 }
 
+// Register-resident backward for whole contiguous rows: the gradient and the
+// saved output live in registers, so each operand is read once and the result
+// written once.  The strided streaming kernel instead re-reads both operands
+// for its write pass, costing two extra passes over the row.
+template <typename scalar_t, typename compute_t, int REG, bool LOG_MODE>
+__global__ void softmax_bwd_reg_kernel(scalar_t* grad_in,
+                                       const scalar_t* grad,
+                                       const scalar_t* out, int classes) {
+  constexpr int kWave = 32;
+  __shared__ compute_t reduce[kWave];
+  const int tid = static_cast<int>(threadIdx.x);
+  const int64_t base = static_cast<int64_t>(blockIdx.x) * classes;
+
+  scalar_t vg[REG], vo[REG];
+#pragma unroll
+  for (int i = 0; i < REG; ++i) {
+    const int slot = tid + i * static_cast<int>(blockDim.x);
+    // Zero padding keeps the factor reduction clean; padded slots are
+    // skipped on the write pass.
+    vg[i] = slot < classes ? grad[base + slot] : scalar_t(0);
+    vo[i] = slot < classes ? out[base + slot] : scalar_t(0);
+  }
+
+  compute_t thread_sum = compute_t(0);
+#pragma unroll
+  for (int i = 0; i < REG; ++i) {
+    thread_sum += static_cast<compute_t>(vg[i]) *
+        (LOG_MODE ? compute_t(1) : static_cast<compute_t>(vo[i]));
+  }
+  thread_sum = softmax_block_reduce<compute_t, false>(thread_sum, reduce);
+  const compute_t factor = thread_sum;
+
+#pragma unroll
+  for (int i = 0; i < REG; ++i) {
+    const int slot = tid + i * static_cast<int>(blockDim.x);
+    if (slot < classes) {
+      const compute_t g = static_cast<compute_t>(vg[i]);
+      const compute_t o = static_cast<compute_t>(vo[i]);
+      grad_in[base + slot] = static_cast<scalar_t>(
+          LOG_MODE ? g - std::exp(o) * factor : o * (g - factor));
+    }
+  }
+}
+
+template <typename scalar_t, typename compute_t>
+bool try_softmax_bwd_reg(scalar_t* grad_in, const scalar_t* grad,
+                         const scalar_t* out, int64_t classes, int64_t rows,
+                         bool log_mode, cudaStream_t stream) {
+  // REG = 16 slots per thread caps the block at 512 threads for a 8192-wide
+  // row; longer rows take the strided kernel.
+  constexpr int kReg = 16;
+  if (classes < 1 || classes > kReg * 512 || rows > INT32_MAX) return false;
+  const int threads = static_cast<int>(
+      ((classes + kReg - 1) / kReg + 31) / 32 * 32);
+  if (log_mode) {
+    softmax_bwd_reg_kernel<scalar_t, compute_t, kReg, true>
+        <<<static_cast<unsigned>(rows), threads, 0, stream>>>(
+            grad_in, grad, out, static_cast<int>(classes));
+  } else {
+    softmax_bwd_reg_kernel<scalar_t, compute_t, kReg, false>
+        <<<static_cast<unsigned>(rows), threads, 0, stream>>>(
+            grad_in, grad, out, static_cast<int>(classes));
+  }
+  CUDA_CHECK(cudaGetLastError());
+  return true;
+}
+
 // grad_output drives the result dtype; reduced-width inputs accumulate and
 // compute in float.  grad_output may carry float32 for a half input (the
 // half_to_float forward path), in which case the result casts back to the
@@ -1013,6 +1080,44 @@ Tensor softmax_backward_native_impl(const Tensor& grad_output,
   const int64_t dim_size = gc.size(d);
   const int64_t rows = outer * inner;
   const int threads = dim_size < 256 ? 32 : 256;
+
+  // Whole contiguous rows along the fast dimension fit the register tier:
+  // one read of each operand and one write of the result.
+  if (inner == 1 && gc.is_contiguous() && oc.is_contiguous() &&
+      result_work.is_contiguous() && rows > 0) {
+    const auto stream = getCurrentCUDAStream().stream();
+    bool reg_done = false;
+    switch (gc.dtype()) {
+      case DType::Float32:
+        reg_done = try_softmax_bwd_reg<float, float>(
+            result_work.data_ptr<float>(), gc.data_ptr<float>(),
+            oc.data_ptr<float>(), dim_size, rows, log_mode, stream);
+        break;
+      case DType::Float64:
+        reg_done = try_softmax_bwd_reg<double, double>(
+            result_work.data_ptr<double>(), gc.data_ptr<double>(),
+            oc.data_ptr<double>(), dim_size, rows, log_mode, stream);
+        break;
+      case DType::Float16:
+        reg_done = try_softmax_bwd_reg<Half, float>(
+            result_work.data_ptr<Half>(), gc.data_ptr<Half>(),
+            oc.data_ptr<Half>(), dim_size, rows, log_mode, stream);
+        break;
+      case DType::BFloat16:
+        reg_done = try_softmax_bwd_reg<BFloat16, float>(
+            result_work.data_ptr<BFloat16>(), gc.data_ptr<BFloat16>(),
+            oc.data_ptr<BFloat16>(), dim_size, rows, log_mode, stream);
+        break;
+      default:
+        break;
+    }
+    if (reg_done) {
+      if (result_work.data_ptr() != result.data_ptr()) {
+        result.copy_(result_work);
+      }
+      return result;
+    }
+  }
 
   #define TP_SOFTMAX_BWD_LAUNCH(ctype, acc)                                \
   if (log_mode) {                                                          \
