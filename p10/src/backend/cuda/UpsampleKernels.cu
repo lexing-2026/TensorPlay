@@ -160,6 +160,27 @@ __global__ void upsample_nearest1d_out_frame(
     odata[index] = idata[n_c * width1 + w1];
 }
 
+template <typename scalar_t, int ScaleH, int ScaleW>
+__global__ void upsample_nearest2d_integer_scale_kernel(
+    const scalar_t* __restrict__ idata, scalar_t* __restrict__ odata,
+    const int64_t nc, const int64_t height1, const int64_t width1,
+    const int64_t height2, const int64_t width2) {
+    const int64_t w2 = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * ScaleW;
+    const int64_t h2 = static_cast<int64_t>(blockIdx.y) * blockDim.y + threadIdx.y;
+    if (w2 >= width2 || h2 >= height2) return;
+    const int64_t nc_start = static_cast<int64_t>(blockIdx.z) * blockDim.z + threadIdx.z;
+    const int64_t nc_stride = static_cast<int64_t>(blockDim.z) * gridDim.z;
+    const int64_t h1 = h2 / ScaleH;
+    const int64_t w1 = w2 / ScaleW;
+    for (int64_t n_c = nc_start; n_c < nc; n_c += nc_stride) {
+        const scalar_t value = idata[(n_c * height1 + h1) * width1 + w1];
+#pragma unroll
+        for (int k = 0; k < ScaleW; ++k) {
+            odata[(n_c * height2 + h2) * width2 + w2 + k] = value;
+        }
+    }
+}
+
 template <typename scalar_t>
 __global__ void upsample_nearest2d_out_frame(
     const scalar_t* idata, scalar_t* odata,
@@ -703,6 +724,46 @@ Tensor upsample_nearest2d_cuda(const Tensor& self, const std::vector<int64_t>& o
         return result;
     }
     UP_NEAREST_DISPATCH(in, {
+        const int64_t scale_h = H2 / H1;
+        const int64_t scale_w = W2 / W1;
+        if (H2 % H1 == 0 && W2 % W1 == 0 &&
+            scale_h >= 2 && scale_h <= 4 && scale_w >= 2 && scale_w <= 4) {
+            auto launch_integer = [&]<int ScaleH, int ScaleW>() {
+                const unsigned block_x = static_cast<unsigned>(std::min<int64_t>(
+                    32, std::max<int64_t>(1, W2 / ScaleW)));
+                const unsigned block_y = static_cast<unsigned>(std::min<int64_t>(
+                    8, std::max<int64_t>(1, H2)));
+                const unsigned grid_x = static_cast<unsigned>(
+                    (W2 / ScaleW + block_x - 1) / block_x);
+                const unsigned grid_y = static_cast<unsigned>(
+                    (H2 + block_y - 1) / block_y);
+                const unsigned grid_z = static_cast<unsigned>(std::min<int64_t>(
+                    65535, N * C));
+                dim3 block(block_x, block_y, 1);
+                dim3 grid(grid_x, grid_y, grid_z);
+                upsample_nearest2d_integer_scale_kernel<scalar_t, ScaleH, ScaleW>
+                    <<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+                        in.data_ptr<scalar_t>(), result.data_ptr<scalar_t>(),
+                        N * C, H1, W1, H2, W2);
+            };
+            bool launched = true;
+            switch (scale_h * 10 + scale_w) {
+                case 22: launch_integer.template operator()<2, 2>(); break;
+                case 23: launch_integer.template operator()<2, 3>(); break;
+                case 24: launch_integer.template operator()<2, 4>(); break;
+                case 32: launch_integer.template operator()<3, 2>(); break;
+                case 33: launch_integer.template operator()<3, 3>(); break;
+                case 34: launch_integer.template operator()<3, 4>(); break;
+                case 42: launch_integer.template operator()<4, 2>(); break;
+                case 43: launch_integer.template operator()<4, 3>(); break;
+                case 44: launch_integer.template operator()<4, 4>(); break;
+                default: launched = false; break;
+            }
+            if (launched) {
+                CUDA_CHECK(cudaGetLastError());
+                return result;
+            }
+        }
         const unsigned block_x = static_cast<unsigned>(
             std::min<int64_t>(32, std::max<int64_t>(1, W2)));
         const unsigned block_y = static_cast<unsigned>(
