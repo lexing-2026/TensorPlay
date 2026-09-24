@@ -183,5 +183,99 @@ class TestCUDAOps(unittest.TestCase):
         expected = [-2.0/(1+np.exp(2)), -1.0/(1+np.exp(1)), 0.0, 1.0/(1+np.exp(-1)), 2.0/(1+np.exp(-2))]
         self.assertTrue(tp.allclose(res.cpu(), tp.tensor(expected, dtype=tp.float32), atol=1e-5), "SiLU failed")
 
+    def test_nearest_upsample_low_precision(self):
+        rng = np.random.default_rng(123)
+        cases = (
+            ((2, 3, 5), (8,)),
+            ((2, 3, 4, 5), (7, 9)),
+            ((2, 3, 4, 5), (2, 3)),
+            ((1, 2, 3, 4, 5), (5, 6, 7)),
+        )
+        for dtype, tolerance in ((tp.float16, 3e-3), (tp.bfloat16, 2e-2)):
+            for input_shape, output_shape in cases:
+                input_np = rng.standard_normal(input_shape).astype(np.float32)
+                output_grad_np = rng.standard_normal(
+                    (input_shape[0], input_shape[1], *output_shape)
+                ).astype(np.float32)
+                source_indices = [
+                    np.minimum(
+                        np.floor(
+                            np.arange(output_size) * input_size / output_size
+                        ).astype(np.int64),
+                        input_size - 1,
+                    )
+                    for input_size, output_size in zip(
+                        input_shape[2:], output_shape
+                    )
+                ]
+                if len(output_shape) == 1:
+                    expected_np = input_np[:, :, source_indices[0]]
+                    expected_grad_np = np.zeros_like(input_np)
+                    np.add.at(
+                        expected_grad_np,
+                        (slice(None), slice(None), source_indices[0]),
+                        output_grad_np,
+                    )
+                elif len(output_shape) == 2:
+                    expected_np = input_np[
+                        :, :, source_indices[0][:, None], source_indices[1][None, :]
+                    ]
+                    expected_grad_np = np.zeros_like(input_np)
+                    np.add.at(
+                        expected_grad_np,
+                        (
+                            slice(None),
+                            slice(None),
+                            source_indices[0][:, None],
+                            source_indices[1][None, :],
+                        ),
+                        output_grad_np,
+                    )
+                else:
+                    expected_np = input_np[
+                        :,
+                        :,
+                        source_indices[0][:, None, None],
+                        source_indices[1][None, :, None],
+                        source_indices[2][None, None, :],
+                    ]
+                    expected_grad_np = np.zeros_like(input_np)
+                    np.add.at(
+                        expected_grad_np,
+                        (
+                            slice(None),
+                            slice(None),
+                            source_indices[0][:, None, None],
+                            source_indices[1][None, :, None],
+                            source_indices[2][None, None, :],
+                        ),
+                        output_grad_np,
+                    )
+
+                input_tensor = tp.tensor(
+                    input_np, device=self.device, dtype=dtype
+                ).requires_grad_()
+                output = tp.nn.functional.interpolate(
+                    input_tensor, size=output_shape, mode="nearest"
+                )
+                output.backward(
+                    tp.tensor(
+                        output_grad_np, device=self.device, dtype=dtype
+                    )
+                )
+                self.assertEqual(output.dtype, dtype)
+                np.testing.assert_allclose(
+                    output.detach().float().cpu().numpy(),
+                    expected_np,
+                    rtol=tolerance,
+                    atol=tolerance,
+                )
+                np.testing.assert_allclose(
+                    input_tensor.grad.float().cpu().numpy(),
+                    expected_grad_np,
+                    rtol=tolerance,
+                    atol=tolerance,
+                )
+
 if __name__ == "__main__":
     unittest.main()

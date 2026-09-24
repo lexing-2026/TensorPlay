@@ -133,6 +133,15 @@ inline void launch_dims(int64_t total, dim3& block, dim3& grid) {
         default: TP_THROW(NotImplementedError, "cuda upsample only supports Float32/Float64"); \
     }
 
+#define UP_NEAREST_DISPATCH(t, ...) \
+    switch ((t).dtype()) { \
+        case DType::Float32: { using scalar_t = float; using accscalar_t = float; __VA_ARGS__; break; } \
+        case DType::Float64: { using scalar_t = double; using accscalar_t = double; __VA_ARGS__; break; } \
+        case DType::Float16: { using scalar_t = Half; using accscalar_t = float; __VA_ARGS__; break; } \
+        case DType::BFloat16: { using scalar_t = BFloat16; using accscalar_t = float; __VA_ARGS__; break; } \
+        default: TP_THROW(NotImplementedError, "cuda nearest upsample does not support this dtype"); \
+    }
+
 } // anonymous namespace
 
 // ===========================================================================
@@ -210,7 +219,7 @@ template <typename accscalar_t, typename scalar_t>
 __global__ void upsample_nearest1d_backward_out_frame(
     const scalar_t* grad_o, const int64_t dim_b, const int64_t dim_c,
     const int64_t src_dim_w, const int64_t dst_dim_w,
-    accscalar_t* grad_i, float width_scale) {
+    scalar_t* grad_i, float width_scale) {
     const int64_t dst_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (dst_idx >= dim_c * dst_dim_w) return;
     const int64_t c = dst_idx / dst_dim_w;
@@ -224,7 +233,7 @@ __global__ void upsample_nearest1d_backward_out_frame(
         for (int x = src_x; x < src_x_up; ++x) {
             grad += grad_o[b * dim_c * src_dim_w + c * src_dim_w + x];
         }
-        grad_i[b * dim_c * dst_dim_w + dst_idx] = grad;
+        grad_i[b * dim_c * dst_dim_w + dst_idx] = static_cast<scalar_t>(grad);
     }
 }
 
@@ -233,7 +242,7 @@ __global__ void upsample_nearest2d_backward_out_frame(
     const scalar_t* grad_o, const int64_t dim_b, const int64_t dim_c,
     const int64_t src_dim_h, const int64_t src_dim_w,
     const int64_t dst_dim_h, const int64_t dst_dim_w,
-    accscalar_t* grad_i, float height_scale, float width_scale) {
+    scalar_t* grad_i, float height_scale, float width_scale) {
     const int64_t dst_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (dst_idx >= dim_c * dst_dim_h * dst_dim_w) return;
 
@@ -256,7 +265,7 @@ __global__ void upsample_nearest2d_backward_out_frame(
                 grad += grad_o[b * dim_c * src_c_stride + c * src_c_stride + y * src_dim_w + x];
             }
         }
-        grad_i[dst_idx + b * dim_c * dst_c_stride] = grad;
+        grad_i[dst_idx + b * dim_c * dst_c_stride] = static_cast<scalar_t>(grad);
     }
 }
 
@@ -265,12 +274,11 @@ __global__ void upsample_nearest3d_backward_out_frame(
     const scalar_t* grad_o, const int64_t dim_b, const int64_t dim_c,
     const int64_t src_dim_d, const int64_t src_dim_h, const int64_t src_dim_w,
     const int64_t dst_dim_d, const int64_t dst_dim_h, const int64_t dst_dim_w,
-    accscalar_t* grad_i, float depth_scale, float height_scale, float width_scale) {
+    scalar_t* grad_i, float depth_scale, float height_scale, float width_scale) {
     const int64_t dst_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (dst_idx >= dim_c * dst_dim_d * dst_dim_h * dst_dim_w) return;
 
     const int64_t dst_c_stride = dst_dim_d * dst_dim_h * dst_dim_w;
-    const int64_t src_c_stride = src_dim_d * src_dim_h * src_dim_w;
     const int64_t c = (dst_idx / dst_c_stride) % dim_c;
     const int dst_t = static_cast<int>((dst_idx / (dst_dim_h * dst_dim_w)) % dst_dim_d);
     const int dst_y = static_cast<int>((dst_idx / dst_dim_w) % dst_dim_h);
@@ -292,7 +300,7 @@ __global__ void upsample_nearest3d_backward_out_frame(
                 }
             }
         }
-        grad_i[dst_idx + b * dim_c * dst_c_stride] = grad;
+        grad_i[dst_idx + b * dim_c * dst_c_stride] = static_cast<scalar_t>(grad);
     }
 }
 
@@ -672,7 +680,7 @@ Tensor upsample_nearest1d_cuda(const Tensor& self, const std::vector<int64_t>& o
     const int64_t N = in.size(0), C = in.size(1);
     const int64_t W1 = in.size(2), W2 = output_size[0];
     if (in.numel() == 0 || W2 == 0) return result;
-    UP_DISPATCH(in, {
+    UP_NEAREST_DISPATCH(in, {
         dim3 block, grid;
         launch_dims(N * C * W2, block, grid);
         upsample_nearest1d_out_frame<scalar_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
@@ -694,7 +702,7 @@ Tensor upsample_nearest2d_cuda(const Tensor& self, const std::vector<int64_t>& o
         result.copy_(in);
         return result;
     }
-    UP_DISPATCH(in, {
+    UP_NEAREST_DISPATCH(in, {
         const unsigned block_x = static_cast<unsigned>(
             std::min<int64_t>(32, std::max<int64_t>(1, W2)));
         const unsigned block_y = static_cast<unsigned>(
@@ -720,7 +728,7 @@ Tensor upsample_nearest3d_cuda(const Tensor& self, const std::vector<int64_t>& o
     const int64_t D1 = in.size(2), H1 = in.size(3), W1 = in.size(4);
     const int64_t D2 = output_size[0], H2 = output_size[1], W2 = output_size[2];
     if (in.numel() == 0) return result;
-    UP_DISPATCH(in, {
+    UP_NEAREST_DISPATCH(in, {
         dim3 block, grid;
         launch_dims(N * C * D2 * H2 * W2, block, grid);
         upsample_nearest3d_out_frame<scalar_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
@@ -738,14 +746,14 @@ Tensor upsample_nearest1d_backward_cuda(const Tensor& grad_output, const std::ve
     const int64_t dim_b = go.size(0), dim_c = go.size(1);
     const int64_t W2 = output_size[0], W1 = input_size[2];
     if (go.numel() == 0 || W2 == 0 || W1 == 0) return grad_input;
-    UP_DISPATCH(go, {
+    UP_NEAREST_DISPATCH(go, {
         // zeroed buffer is already scalar_t so accumulate via an accscalar
         // staging is unnecessary for f32/f64 (accscalar_t == scalar_t).
         dim3 block, grid;
         launch_dims(dim_c * W1, block, grid);
         upsample_nearest1d_backward_out_frame<accscalar_t, scalar_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
             go.data_ptr<scalar_t>(), dim_b, dim_c, W2, W1,
-            reinterpret_cast<accscalar_t*>(grad_input.data_ptr<scalar_t>()),
+            grad_input.data_ptr<scalar_t>(),
             compute_scales_value_backwards_h(scales, W2, W1));
     });
     CUDA_CHECK(cudaGetLastError());
@@ -759,12 +767,12 @@ Tensor upsample_nearest2d_backward_cuda(const Tensor& grad_output, const std::ve
     const int64_t H2 = output_size[0], W2 = output_size[1];
     const int64_t H1 = input_size[2], W1 = input_size[3];
     if (go.numel() == 0 || H2 * W2 == 0 || H1 * W1 == 0) return grad_input;
-    UP_DISPATCH(go, {
+    UP_NEAREST_DISPATCH(go, {
         dim3 block, grid;
         launch_dims(dim_c * H1 * W1, block, grid);
         upsample_nearest2d_backward_out_frame<accscalar_t, scalar_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
             go.data_ptr<scalar_t>(), dim_b, dim_c, H2, W2, H1, W1,
-            reinterpret_cast<accscalar_t*>(grad_input.data_ptr<scalar_t>()),
+            grad_input.data_ptr<scalar_t>(),
             compute_scales_value_backwards_h(scales_h, H2, H1), compute_scales_value_backwards_h(scales_w, W2, W1));
     });
     CUDA_CHECK(cudaGetLastError());
@@ -778,12 +786,12 @@ Tensor upsample_nearest3d_backward_cuda(const Tensor& grad_output, const std::ve
     const int64_t D2 = output_size[0], H2 = output_size[1], W2 = output_size[2];
     const int64_t D1 = input_size[2], H1 = input_size[3], W1 = input_size[4];
     if (go.numel() == 0) return grad_input;
-    UP_DISPATCH(go, {
+    UP_NEAREST_DISPATCH(go, {
         dim3 block, grid;
         launch_dims(dim_c * D1 * H1 * W1, block, grid);
         upsample_nearest3d_backward_out_frame<accscalar_t, scalar_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
             go.data_ptr<scalar_t>(), dim_b, dim_c, D2, H2, W2, D1, H1, W1,
-            reinterpret_cast<accscalar_t*>(grad_input.data_ptr<scalar_t>()),
+            grad_input.data_ptr<scalar_t>(),
             compute_scales_value_backwards_h(scales_d, D2, D1), compute_scales_value_backwards_h(scales_h, H2, H1),
             compute_scales_value_backwards_h(scales_w, W2, W1));
     });
