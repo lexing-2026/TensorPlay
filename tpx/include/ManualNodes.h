@@ -557,6 +557,10 @@ struct CatBackward : public Node {
         for (auto& t : tensors) tensors_.emplace_back(std::move(t));
     }
 
+    // cat is single-output, so upstream grads always arrive at slot 0; sizing
+    // the input buffer by next_edges would pad phantom slots per cat input.
+    size_t num_inputs() const override { return 1; }
+
     variable_list apply(variable_list&& inputs) override {
         if (inputs.empty() || !inputs[0].defined()) {
             return variable_list(tensors_.size(), Tensor());

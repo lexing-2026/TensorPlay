@@ -716,7 +716,7 @@ Tensor upsample_nearest3d_cuda(const Tensor& self, const std::vector<int64_t>& o
 
 Tensor upsample_nearest1d_backward_cuda(const Tensor& grad_output, const std::vector<int64_t>& output_size, const std::vector<int64_t>& input_size, std::optional<double> scales) {
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
-    Tensor grad_input = Tensor::zeros(grad_input_shape(go, input_size), go.dtype(), go.device());
+    Tensor grad_input = Tensor::empty(grad_input_shape(go, input_size), go.dtype(), go.device());
     const int64_t dim_b = go.size(0), dim_c = go.size(1);
     const int64_t W2 = output_size[0], W1 = input_size[2];
     if (go.numel() == 0 || W2 == 0 || W1 == 0) return grad_input;
@@ -736,7 +736,7 @@ Tensor upsample_nearest1d_backward_cuda(const Tensor& grad_output, const std::ve
 
 Tensor upsample_nearest2d_backward_cuda(const Tensor& grad_output, const std::vector<int64_t>& output_size, const std::vector<int64_t>& input_size, std::optional<double> scales_h, std::optional<double> scales_w) {
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
-    Tensor grad_input = Tensor::zeros(grad_input_shape(go, input_size), go.dtype(), go.device());
+    Tensor grad_input = Tensor::empty(grad_input_shape(go, input_size), go.dtype(), go.device());
     const int64_t dim_b = go.size(0), dim_c = go.size(1);
     const int64_t H2 = output_size[0], W2 = output_size[1];
     const int64_t H1 = input_size[2], W1 = input_size[3];
@@ -755,7 +755,7 @@ Tensor upsample_nearest2d_backward_cuda(const Tensor& grad_output, const std::ve
 
 Tensor upsample_nearest3d_backward_cuda(const Tensor& grad_output, const std::vector<int64_t>& output_size, const std::vector<int64_t>& input_size, std::optional<double> scales_d, std::optional<double> scales_h, std::optional<double> scales_w) {
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
-    Tensor grad_input = Tensor::zeros(grad_input_shape(go, input_size), go.dtype(), go.device());
+    Tensor grad_input = Tensor::empty(grad_input_shape(go, input_size), go.dtype(), go.device());
     const int64_t dim_b = go.size(0), dim_c = go.size(1);
     const int64_t D2 = output_size[0], H2 = output_size[1], W2 = output_size[2];
     const int64_t D1 = input_size[2], H1 = input_size[3], W1 = input_size[4];

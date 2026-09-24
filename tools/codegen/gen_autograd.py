@@ -810,6 +810,13 @@ def generate_autograd_nodes(
         else:
             lines.append("        {}")
         lines.append("")
+        # Single-grad-input contract: the forward op is single-output, so
+        # upstream grads always arrive at slot 0. Sizing the engine's input
+        # buffer by next_edges would pad phantom slots that apply() never
+        # reads, and the engine's grad materialization would allocate and
+        # fill zeros for each of them on every backward pass.
+        lines.append("    size_t num_inputs() const override { return 1; }")
+        lines.append("")
         lines.append("    variable_list apply(variable_list&& inputs) override {")
 
         n_slots = len(dv.grad_slots)
