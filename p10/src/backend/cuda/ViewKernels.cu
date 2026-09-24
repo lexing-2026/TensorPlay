@@ -3,6 +3,8 @@
 #include "CUDAContext.h"
 #include "TypePromotion.h"
 #include "ForeachMultiTensor.cuh"
+#include "CUDARuntime.h"
+#include <cstdint>
 #include <vector>
 #include <algorithm>
 #include <numeric>
@@ -368,6 +370,188 @@ Tensor unsqueeze_kernel_cuda(const Tensor& self, int64_t dim) {
     return self.as_strided(new_sizes, new_strides);
 }
 
+template <typename T, int V>
+struct alignas(sizeof(T) * V) CatVec {
+    T v[V];
+};
+
+template <typename T, int V>
+__global__ void cat2_nchw_vec_kernel(
+    T* __restrict__ output, const T* __restrict__ first,
+    const T* __restrict__ second, int64_t batch, int64_t first_channels,
+    int64_t second_channels, int64_t spatial) {
+    const int64_t spatial_units = spatial / V;
+    const int64_t units = batch * (first_channels + second_channels) * spatial_units;
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < units; index += stride) {
+        const int64_t n = index / ((first_channels + second_channels) * spatial_units);
+        const int64_t channel = (index / spatial_units) % (first_channels + second_channels);
+        const int64_t spatial_index = index % spatial_units;
+        const bool use_first = channel < first_channels;
+        const int64_t source_channel = use_first ? channel : channel - first_channels;
+        const int64_t source_channels = use_first ? first_channels : second_channels;
+        const int64_t source_index =
+            (n * source_channels + source_channel) * spatial + spatial_index * V;
+        const CatVec<T, V> value = *reinterpret_cast<const CatVec<T, V>*>(
+            (use_first ? first : second) + source_index);
+        *reinterpret_cast<CatVec<T, V>*>(output + index * V) = value;
+    }
+}
+
+template <typename Out, typename In1, typename In2, int V>
+__global__ void cat2_nchw_mixed_vec_kernel(
+    Out* __restrict__ output, const In1* __restrict__ first,
+    const In2* __restrict__ second, int64_t batch, int64_t first_channels,
+    int64_t second_channels, int64_t spatial) {
+    const int64_t spatial_units = spatial / V;
+    const int64_t units = batch * (first_channels + second_channels) * spatial_units;
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < units; index += stride) {
+        const int64_t n = index / ((first_channels + second_channels) * spatial_units);
+        const int64_t channel = (index / spatial_units) % (first_channels + second_channels);
+        const int64_t spatial_index = index % spatial_units;
+        const bool use_first = channel < first_channels;
+        const int64_t source_channel = use_first ? channel : channel - first_channels;
+        const int64_t source_channels = use_first ? first_channels : second_channels;
+        const int64_t source_index =
+            (n * source_channels + source_channel) * spatial + spatial_index * V;
+        CatVec<Out, V> result;
+        if (use_first) {
+            const CatVec<In1, V> value = *reinterpret_cast<const CatVec<In1, V>*>(
+                first + source_index);
+#pragma unroll
+            for (int i = 0; i < V; ++i) result.v[i] = static_cast<Out>(value.v[i]);
+        } else {
+            const CatVec<In2, V> value = *reinterpret_cast<const CatVec<In2, V>*>(
+                second + source_index);
+#pragma unroll
+            for (int i = 0; i < V; ++i) result.v[i] = static_cast<Out>(value.v[i]);
+        }
+        *reinterpret_cast<CatVec<Out, V>*>(output + index * V) = result;
+    }
+}
+
+template <typename T>
+bool try_cat2_nchw(const std::vector<Tensor>& tensors, int64_t dim, Tensor& out) {
+    if (dim != 1 || tensors.size() != 2 || out.dim() != 4) return false;
+    const Tensor& first = tensors[0];
+    const Tensor& second = tensors[1];
+    if (first.dim() != 4 || second.dim() != 4 ||
+        first.dtype() != second.dtype() || first.dtype() != out.dtype() ||
+        first.device() != second.device() || first.device() != out.device() ||
+        !first.is_contiguous() || !second.is_contiguous() || !out.is_contiguous() ||
+        first.size(0) != second.size(0) || first.size(0) != out.size(0) ||
+        first.size(2) != second.size(2) || first.size(2) != out.size(2) ||
+        first.size(3) != second.size(3) || first.size(3) != out.size(3) ||
+        first.size(1) <= 0 || second.size(1) <= 0 || out.size(1) !=
+            first.size(1) + second.size(1)) {
+        return false;
+    }
+    const int64_t batch = out.size(0);
+    const int64_t spatial = out.size(2) * out.size(3);
+    const int64_t total = out.numel();
+    if (total == 0) return true;
+    auto stream = getCurrentCUDAStream().stream();
+    const uintptr_t output_address = reinterpret_cast<uintptr_t>(out.data_ptr());
+    const uintptr_t first_address = reinterpret_cast<uintptr_t>(first.data_ptr());
+    const uintptr_t second_address = reinterpret_cast<uintptr_t>(second.data_ptr());
+    auto launch = [&]<int V>() {
+        const int64_t units = total / V;
+        const int threads = 256;
+        const int blocks = static_cast<int>(std::min<int64_t>(
+            65535, (units + threads - 1) / threads));
+        cat2_nchw_vec_kernel<T, V><<<blocks, threads, 0, stream>>>(
+            out.data_ptr<T>(), first.data_ptr<T>(), second.data_ptr<T>(),
+            batch, first.size(1), second.size(1), spatial);
+        checkCuda(cudaGetLastError(), "CUDA vectorized cat copy");
+    };
+    const uintptr_t address_mask = output_address | first_address | second_address;
+    if (spatial % 8 == 0 && (address_mask % (sizeof(T) * 8)) == 0) {
+        launch.template operator()<8>();
+        return true;
+    }
+    if (spatial % 4 == 0 && (address_mask % (sizeof(T) * 4)) == 0) {
+        launch.template operator()<4>();
+        return true;
+    }
+    return false;
+}
+
+template <typename Out, typename In1, typename In2>
+bool try_cat2_nchw_mixed(const std::vector<Tensor>& tensors, int64_t dim, Tensor& out) {
+    if (dim != 1 || tensors.size() != 2 || out.dim() != 4) return false;
+    const Tensor& first = tensors[0];
+    const Tensor& second = tensors[1];
+    if (first.dim() != 4 || second.dim() != 4 ||
+        first.dtype() == second.dtype() || first.device() != second.device() ||
+        first.device() != out.device() || !first.is_contiguous() ||
+        !second.is_contiguous() || !out.is_contiguous() ||
+        first.size(0) != second.size(0) || first.size(0) != out.size(0) ||
+        first.size(2) != second.size(2) || first.size(2) != out.size(2) ||
+        first.size(3) != second.size(3) || first.size(3) != out.size(3) ||
+        first.size(1) <= 0 || second.size(1) <= 0 ||
+        out.size(1) != first.size(1) + second.size(1)) {
+        return false;
+    }
+    const int64_t batch = out.size(0);
+    const int64_t spatial = out.size(2) * out.size(3);
+    const int64_t total = out.numel();
+    if (total == 0) return true;
+    auto stream = getCurrentCUDAStream().stream();
+    const uintptr_t output_address = reinterpret_cast<uintptr_t>(out.data_ptr());
+    const uintptr_t first_address = reinterpret_cast<uintptr_t>(first.data_ptr());
+    const uintptr_t second_address = reinterpret_cast<uintptr_t>(second.data_ptr());
+    auto launch = [&]<int V>() {
+        const int64_t units = total / V;
+        const int threads = 256;
+        const int blocks = static_cast<int>(std::min<int64_t>(
+            65535, (units + threads - 1) / threads));
+        cat2_nchw_mixed_vec_kernel<Out, In1, In2, V><<<blocks, threads, 0, stream>>>(
+            out.data_ptr<Out>(), first.data_ptr<In1>(), second.data_ptr<In2>(),
+            batch, first.size(1), second.size(1), spatial);
+        checkCuda(cudaGetLastError(), "CUDA mixed vectorized cat copy");
+    };
+    const uintptr_t first_mask = output_address | first_address;
+    const uintptr_t second_mask = output_address | second_address;
+    if (spatial % 8 == 0 &&
+        (first_mask % (sizeof(Out) * 8)) == 0 &&
+        (second_mask % (sizeof(In2) * 8)) == 0 &&
+        (first_address % (sizeof(In1) * 8)) == 0) {
+        launch.template operator()<8>();
+        return true;
+    }
+    if (spatial % 4 == 0 &&
+        (first_mask % (sizeof(Out) * 4)) == 0 &&
+        (second_mask % (sizeof(In2) * 4)) == 0 &&
+        (first_address % (sizeof(In1) * 4)) == 0) {
+        launch.template operator()<4>();
+        return true;
+    }
+    return false;
+}
+
+template <typename Out>
+bool try_cat2_nchw_promoted_float(const std::vector<Tensor>& tensors, int64_t dim, Tensor& out) {
+    if (tensors.size() != 2 || out.dtype() != DType::Float32) return false;
+    const DType first_dtype = tensors[0].dtype();
+    const DType second_dtype = tensors[1].dtype();
+    if (first_dtype == DType::Float32 && second_dtype == DType::Float16)
+        return try_cat2_nchw_mixed<Out, float, tensorplay::Half>(tensors, dim, out);
+    if (first_dtype == DType::Float16 && second_dtype == DType::Float32)
+        return try_cat2_nchw_mixed<Out, tensorplay::Half, float>(tensors, dim, out);
+    if (first_dtype == DType::Float32 && second_dtype == DType::BFloat16)
+        return try_cat2_nchw_mixed<Out, float, tensorplay::BFloat16>(tensors, dim, out);
+    if (first_dtype == DType::BFloat16 && second_dtype == DType::Float32)
+        return try_cat2_nchw_mixed<Out, tensorplay::BFloat16, float>(tensors, dim, out);
+    if (first_dtype == DType::Float16 && second_dtype == DType::BFloat16)
+        return try_cat2_nchw_mixed<Out, tensorplay::Half, tensorplay::BFloat16>(tensors, dim, out);
+    if (first_dtype == DType::BFloat16 && second_dtype == DType::Float16)
+        return try_cat2_nchw_mixed<Out, tensorplay::BFloat16, tensorplay::Half>(tensors, dim, out);
+    return false;
+}
+
 // Tensor-list view operators need an explicit CUDA registration.  The actual
 // copies are delegated to copy_ so they inherit the stream-aware CUDA allocator
 // and non-blocking copy semantics; this keeps the implementation correct for
@@ -435,6 +619,24 @@ Tensor cat_kernel_cuda(const std::vector<Tensor>& tensors, int64_t dim) {
     }
 
     Tensor out = Tensor::empty(out_shape, out_dtype, tensors[0].device());
+
+    switch (out_dtype) {
+        case DType::Float16:
+            if (try_cat2_nchw<Half>(tensors, dim, out)) return out;
+            break;
+        case DType::BFloat16:
+            if (try_cat2_nchw<BFloat16>(tensors, dim, out)) return out;
+            break;
+        case DType::Float32:
+            if (try_cat2_nchw<float>(tensors, dim, out)) return out;
+            if (try_cat2_nchw_promoted_float<float>(tensors, dim, out)) return out;
+            break;
+        case DType::Float64:
+            if (try_cat2_nchw<double>(tensors, dim, out)) return out;
+            break;
+        default:
+            break;
+    }
 
     int64_t offset = 0;
     for (const auto& t : tensors) {
