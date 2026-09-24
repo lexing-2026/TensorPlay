@@ -189,12 +189,12 @@ struct ProgramState {
     }
 };
 
-template <typename io_t, typename compute_t>
+template <typename io_t, typename compute_t, int kTemps>
 __global__ void stax_fused_pointwise_kernel(
     ProgramState<io_t, compute_t> state,
     io_t* output,
     int64_t count) {
-    compute_t temps[kMaxProgramInstructions];
+    compute_t temps[kTemps];
     int64_t pending_where[3] = {0, 0, 0};
     int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
@@ -205,14 +205,14 @@ __global__ void stax_fused_pointwise_kernel(
     }
 }
 
-template <typename io_t, typename compute_t>
+template <typename io_t, typename compute_t, int kTemps>
 __global__ void stax_fused_pointwise_multi_kernel(
     ProgramState<io_t, compute_t> state,
     io_t* const* temp_outputs,
     const int64_t* temp_refs,
     int64_t temp_output_count,
     int64_t count) {
-    compute_t temps[kMaxProgramInstructions];
+    compute_t temps[kTemps];
     int64_t pending_where[3] = {0, 0, 0};
     int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
@@ -224,6 +224,29 @@ __global__ void stax_fused_pointwise_multi_kernel(
         }
     }
 }
+
+template <int kTemps, typename io_t, typename compute_t>
+void launch_program(
+    const ProgramState<io_t, compute_t>& state,
+    io_t* output,
+    io_t* const* temp_outputs,
+    const int64_t* temp_refs,
+    int64_t temp_output_count,
+    int64_t count,
+    cudaStream_t stream) {
+    const int threads = 256;
+    const int blocks = static_cast<int>((count + threads - 1) / threads);
+    if (output != nullptr) {
+        stax_fused_pointwise_kernel<io_t, compute_t, kTemps>
+            <<<blocks, threads, 0, stream>>>(state, output, count);
+    } else {
+        stax_fused_pointwise_multi_kernel<io_t, compute_t, kTemps>
+            <<<blocks, threads, 0, stream>>>(
+                state, temp_outputs, temp_refs, temp_output_count, count);
+    }
+    checkCuda(cudaGetLastError(), "stax fused pointwise launch");
+}
+
 
 void check_program_shape(const std::vector<Tensor>& inputs,
                          const std::vector<int64_t>& program,
@@ -382,13 +405,21 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
     state.input_count = input_count;
     state.instruction_count = instruction_count;
 
-    const int threads = 256;
-    const int blocks = static_cast<int>((count + threads - 1) / threads);
     if (output_refs == nullptr) {
         io_t* out_ptr = temp_tensors[0].data_ptr<io_t>();
-        stax_fused_pointwise_kernel<io_t, compute_t>
-            <<<blocks, threads, 0, stream>>>(state, out_ptr, count);
-        checkCuda(cudaGetLastError(), "stax fused pointwise launch");
+        if (instruction_count <= 8) {
+            launch_program<8, io_t, compute_t>(
+                state, out_ptr, nullptr, nullptr, 0, count, stream);
+        } else if (instruction_count <= 16) {
+            launch_program<16, io_t, compute_t>(
+                state, out_ptr, nullptr, nullptr, 0, count, stream);
+        } else if (instruction_count <= 32) {
+            launch_program<32, io_t, compute_t>(
+                state, out_ptr, nullptr, nullptr, 0, count, stream);
+        } else {
+            launch_program<64, io_t, compute_t>(
+                state, out_ptr, nullptr, nullptr, 0, count, stream);
+        }
         return outs;
     }
     Tensor outptr_buf = byte_buffer(
@@ -405,13 +436,27 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
                                sizeof(int64_t) * temp_refs.size(),
                                cudaMemcpyHostToDevice, stream),
                "stax fused pointwise output refs upload");
-    stax_fused_pointwise_multi_kernel<io_t, compute_t>
-        <<<blocks, threads, 0, stream>>>(
-            state,
-            reinterpret_cast<io_t* const*>(outptr_buf.data_ptr()),
-            reinterpret_cast<const int64_t*>(ref_buf.data_ptr()),
-            static_cast<int64_t>(temp_refs.size()), count);
-    checkCuda(cudaGetLastError(), "stax fused pointwise multi launch");
+    io_t* const* output_ptrs =
+        reinterpret_cast<io_t* const*>(outptr_buf.data_ptr());
+    const int64_t* output_ref_ptr =
+        reinterpret_cast<const int64_t*>(ref_buf.data_ptr());
+    if (instruction_count <= 8) {
+        launch_program<8, io_t, compute_t>(
+            state, nullptr, output_ptrs, output_ref_ptr,
+            static_cast<int64_t>(temp_refs.size()), count, stream);
+    } else if (instruction_count <= 16) {
+        launch_program<16, io_t, compute_t>(
+            state, nullptr, output_ptrs, output_ref_ptr,
+            static_cast<int64_t>(temp_refs.size()), count, stream);
+    } else if (instruction_count <= 32) {
+        launch_program<32, io_t, compute_t>(
+            state, nullptr, output_ptrs, output_ref_ptr,
+            static_cast<int64_t>(temp_refs.size()), count, stream);
+    } else {
+        launch_program<64, io_t, compute_t>(
+            state, nullptr, output_ptrs, output_ref_ptr,
+            static_cast<int64_t>(temp_refs.size()), count, stream);
+    }
     return outs;
 }
 

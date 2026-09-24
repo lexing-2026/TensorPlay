@@ -327,6 +327,9 @@ _CAST_DTYPE_IDS = {
     "tensorplay.float64": 4,
 }
 
+_STAX_CUDA_OP_COUNTER = 0
+_STAX_CUDA_OP_CACHE: dict[Any, str] = {}
+
 # Backward-compatibility alias: the autograd gate keeps covering exactly the
 # ops whose elementwise VJP rules exist (the CPU interpreter's surface minus
 # pow).  Triton-only opcodes stay out, so training graphs using them fall
@@ -863,7 +866,7 @@ def _lower_cuda_fused_pointwise(
         tensor_type = tensorplay.Tensor
     except (AttributeError, ImportError):
         return None
-    if not example_inputs or len(example_inputs) > 8:
+    if not example_inputs or len(example_inputs) > 32:
         return None
     if any(not isinstance(value, tensor_type) for value in example_inputs):
         return None
@@ -1151,6 +1154,8 @@ def _build_pointwise_program(
             for value in _nodes(output.args)
         ]
     )
+    if output_override is not None and extra_outputs is not None:
+        output_values.extend(extra_outputs)
     expected_outputs = 1 if extra_outputs is None else 1 + len(extra_outputs)
     if (not program and not allow_empty) or len(output_values) != expected_outputs or (
         output_values[0] not in refs
@@ -3219,6 +3224,514 @@ def _native_runs_linear() -> bool:
     return supported
 
 
+def _register_stax_cuda_pointwise_op(
+    program: list[int],
+    constants: list[float],
+    output_refs: tuple[int, ...],
+    input_count: int,
+    example_values: list[Any],
+) -> str | None:
+    global _STAX_CUDA_OP_COUNTER
+    key = (
+        tuple(program),
+        tuple(constants),
+        output_refs,
+        input_count,
+        tuple(
+            (
+                tuple(int(item) for item in value.shape),
+                str(value.dtype),
+                str(value.device),
+            )
+            for value in example_values
+        ),
+    )
+    cached = _STAX_CUDA_OP_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        from .codegen.cuda import compile_program
+        from ....library import _define_or_get
+
+        runner = compile_program(
+            program,
+            constants,
+            output_refs,
+            input_count,
+            example_values,
+        )
+        if example_values:
+            runner(example_values)
+        name = f"tp_stax::pointwise_{_STAX_CUDA_OP_COUNTER}"
+        _STAX_CUDA_OP_COUNTER += 1
+        op = _define_or_get(name, None)
+
+        def kernel(*inputs: Any, _runner: Any = runner) -> Any:
+            return _runner(list(inputs))
+
+        op.register_kernel("cuda")(kernel)
+    except (AssertionError, RuntimeError, TypeError, ValueError):
+        return None
+    _STAX_CUDA_OP_CACHE[key] = name
+    return name
+
+
+def _native_fused_pointwise_plans(
+    graph_module: GraphModule,
+    required_nodes: set[Node],
+) -> dict[Node, tuple[Any, ...]]:
+    try:
+        import tensorplay
+
+        from .scheduler import segment_graph
+    except (AttributeError, ImportError):
+        return {}
+    if not tensorplay.is_grad_enabled():
+        return {}
+
+    def is_pointwise(node: Node) -> bool:
+        if node.op not in {"call_function", "call_method"}:
+            return False
+        return _target_name(node.target) in _CPU_FUSED_OPS
+
+    segments = segment_graph(
+        graph_module,
+        is_pointwise=is_pointwise,
+        classify_reduction=lambda node: None,
+        allow_epilogue=False,
+    )
+    if segments is None:
+        return {}
+
+    def make_plan(nodes: tuple[Node, ...]):
+        if len(nodes) < 2:
+            return None
+        inside = set(nodes)
+        exports = [
+            node
+            for node in nodes
+            if node in required_nodes
+            or any(user not in inside for user in node.users)
+        ]
+        if not exports:
+            exports = [nodes[-1]]
+        externals = _segment_externals(nodes)
+        if not 1 <= len(externals) <= 32:
+            return None
+        external_values = [_traced_value(graph_module, node) for node in externals]
+        if any(
+            not isinstance(value, tensorplay.Tensor)
+            or not value.device.is_cuda()
+            for value in external_values
+        ):
+            return None
+        input_shapes = [
+            tuple(int(item) for item in value.shape) for value in external_values
+        ]
+        output_shape = _broadcast_shape(input_shapes)
+        if output_shape is None or not output_shape:
+            return None
+        export_values = [_traced_value(graph_module, node) for node in exports]
+        if any(
+            not isinstance(value, tensorplay.Tensor)
+            or tuple(int(item) for item in value.shape) != output_shape
+            for value in export_values
+        ):
+            return None
+        output_dtypes = {value.dtype for value in export_values}
+        if len(output_dtypes) != 1:
+            return None
+        output_dtype = next(iter(output_dtypes))
+        try:
+            built = _build_pointwise_program(
+                graph_module,
+                output_override=exports[0],
+                extra_outputs=exports[1:],
+                opcodes=_TRITON_OPCODES,
+                nodes=nodes,
+                extra_refs={node: index for index, node in enumerate(externals)},
+                input_slots=len(externals),
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return None
+        if built is None:
+            return None
+        _external, program, constants, _instructions, output_ref, *extra_refs = built
+        output_refs = (output_ref, *tuple(extra_refs[0])) if extra_refs else (output_ref,)
+        instruction_count = len(program) // 3
+        if not 1 <= instruction_count <= 128 or len(constants) > 4096:
+            return None
+        if len(output_refs) != len(exports) or len(output_refs) > 32:
+            return None
+        if len(output_refs) == 1 and output_ref != len(externals) + instruction_count - 1:
+            if _register_stax_cuda_pointwise_op(
+                program, constants, output_refs, len(externals), []
+            ) is None:
+                return None
+        direct_examples = (
+            external_values
+            if all(
+                tuple(int(item) for item in value.shape) == output_shape
+                and value.dtype == output_dtype
+                for value in external_values
+            )
+            else []
+        )
+        op_name = _register_stax_cuda_pointwise_op(
+            program,
+            constants,
+            output_refs,
+            len(externals),
+            direct_examples,
+        )
+        if op_name is None and output_ref != len(externals) + instruction_count - 1:
+            return None
+        return (
+            frozenset(nodes),
+            tuple(externals),
+            program,
+            constants,
+            output_refs,
+            tuple(exports),
+            op_name,
+        )
+
+    plans: dict[Node, tuple[Any, ...]] = {}
+    for segment in segments:
+        if segment.kind != "pw":
+            continue
+        cursor = 0
+        while cursor < len(segment.nodes):
+            best = None
+            for end in range(cursor + 2, len(segment.nodes) + 1):
+                plan = make_plan(segment.nodes[cursor:end])
+                if plan is not None:
+                    best = (end, plan)
+            if best is None:
+                cursor += 1
+                continue
+            end, plan = best
+            for node in segment.nodes[cursor:end]:
+                plans[node] = plan
+            cursor = end
+    return plans
+
+
+_FUSED_FWD_BINARY_OPS = frozenset({"add", "sub", "mul", "div"})
+_FUSED_FWD_UNARY_OPS = frozenset(
+    {
+        "neg",
+        "pos",
+        "abs",
+        "sin",
+        "cos",
+        "exp",
+        "log",
+        "sigmoid",
+        "sqrt",
+        "square",
+        "tanh",
+        "relu",
+    }
+)
+_FUSED_FWD_MAX_INSTRUCTIONS = 64
+_FUSED_FWD_CUDA_DTYPES = frozenset({"float16", "bfloat16", "float32", "float64"})
+_FUSED_FWD_CPU_DTYPES = frozenset({"float32"})
+
+
+class _ForwardFusedProgram:
+    """A frozen pointwise program kept alive until every spilled temp is read."""
+
+    __slots__ = ("ops", "temps", "positions")
+
+    def __init__(self, ops, temps):
+        self.ops = ops
+        self.temps = temps
+        self.positions = {node: index for index, node in enumerate(temps)}
+
+
+class _ForwardPointwiseFuser:
+    """Buffers same-shape pointwise ops and emits each buffer as one node.
+
+    Lowering walks the graph in order.  An absorbable pointwise op joins the
+    program buffer instead of creating its own native node.  The buffer is
+    emitted lazily, when a non-pointwise consumer needs one of the buffered
+    results: only the results some outside node actually reads become node
+    outputs, and a single-result emit keeps just the dependency closure of
+    that result, with the result last in the program (the one-output
+    evaluator returns the final temp).  Dead intermediates therefore never
+    reach memory -- one chain costs one kernel launch and one write per live
+    result instead of one round trip per op.
+
+    Programs are immutable once flushed.  A spilled (not yet emitted) temp
+    remembers its program and is re-emitted on demand when a later consumer
+    reads it; re-emission rebuilds the same arithmetic over a narrower
+    closure, so each consumer pays only for what it uses.
+    """
+
+    def __init__(self, graph, values, sample_of, blocked):
+        self._graph = graph
+        self._values = values
+        self._sample_of = sample_of
+        self._blocked = blocked
+        self._ops: list[tuple[int, tuple[str, Any], tuple[str, Any]]] = []
+        self._temps: dict[Any, int] = {}
+        self._order: list[Any] = []
+        self._shape: tuple[int, ...] | None = None
+        self._dtype: str | None = None
+        self._is_cuda: bool | None = None
+        self._pending: dict[Any, tuple[_ForwardFusedProgram, int]] = {}
+
+    @staticmethod
+    def _allowed_dtypes(is_cuda: bool) -> frozenset:
+        return _FUSED_FWD_CUDA_DTYPES if is_cuda else _FUSED_FWD_CPU_DTYPES
+
+    def _reset(self) -> None:
+        self._ops = []
+        self._temps = {}
+        self._order = []
+        self._shape = None
+        self._dtype = None
+        self._is_cuda = None
+
+    def _describe(self, sample: Any) -> tuple[tuple[int, ...], str, bool] | None:
+        try:
+            shape = tuple(int(item) for item in sample.shape)
+            if not sample.is_contiguous():
+                return None
+            name = str(sample.dtype).rsplit(".", 1)[-1]
+            is_cuda = bool(sample.device.is_cuda())
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+        return shape, name, is_cuda
+
+    def _bind_layout(self, shape: tuple[int, ...], name: str, is_cuda: bool) -> bool:
+        if name not in self._allowed_dtypes(is_cuda):
+            return False
+        if self._shape is None:
+            self._shape = shape
+            self._dtype = name
+            self._is_cuda = is_cuda
+            return True
+        return shape == self._shape and name == self._dtype and is_cuda == self._is_cuda
+
+    def _operand(self, value: Any) -> tuple[str, Any] | None:
+        if isinstance(value, Node):
+            if value in self._temps:
+                return ("sym", value)
+            if value in self._pending:
+                if not self._reemit(value):
+                    return None
+                return ("sym", value)
+            native = self._values.get(value)
+            if native is None or isinstance(native, (list, tuple)):
+                return None
+            sample = self._sample_of(value)
+            if sample is None:
+                return None
+            described = self._describe(sample)
+            if described is None:
+                return None
+            if not self._bind_layout(*described):
+                return None
+            return ("sym", value)
+        if _is_scalar(value):
+            return ("const", float(value))
+        return None
+
+    def absorb(self, node: Node) -> bool:
+        """Join a pointwise op into the buffer; False leaves the graph untouched."""
+        if node in self._blocked:
+            return False
+        op_name = _target_name(node.target)
+        if op_name in _FUSED_FWD_BINARY_OPS:
+            if len(node.args) != 2 or node.kwargs:
+                return False
+            lhs = self._operand(node.args[0])
+            rhs = self._operand(node.args[1])
+            if lhs is None or rhs is None or (lhs[0] == "const" and rhs[0] == "const"):
+                return False
+            operands = (lhs, rhs)
+        elif op_name in _FUSED_FWD_UNARY_OPS:
+            if len(node.args) != 1:
+                return False
+            if node.kwargs and node.kwargs != {"inplace": False}:
+                return False
+            lhs = self._operand(node.args[0])
+            if lhs is None or lhs[0] == "const":
+                return False
+            operands = (lhs, ("const", 0.0))
+        else:
+            return False
+        if len(self._ops) >= _FUSED_FWD_MAX_INSTRUCTIONS:
+            return False
+        return self._append(node, _FUSED_PROGRAM_OPCODES[op_name], operands)
+
+    def _append(self, node: Node, opcode: int, operands) -> bool:
+        sample = self._sample_of(node)
+        if sample is None:
+            return False
+        described = self._describe(sample)
+        if described is None or not self._bind_layout(*described):
+            return False
+        index = len(self._ops)
+        self._ops.append((opcode, operands[0], operands[1]))
+        self._temps[node] = index
+        self._order.append(node)
+        return True
+
+    def _reemit(self, node: Node) -> bool:
+        spec, index = self._pending.pop(node)
+        return self._emit(spec, (index,))
+
+    def ensure_for(self, consumer: Node) -> bool:
+        """Materialize spilled temps this consumer reads."""
+        if not self._pending:
+            return True
+        groups: dict[int, tuple[_ForwardFusedProgram, list[int]]] = {}
+        for value in (*consumer.args, *consumer.kwargs.values()):
+            if not isinstance(value, Node):
+                continue
+            entry = self._pending.get(value)
+            if entry is None:
+                continue
+            spec, index = entry
+            key = id(spec)
+            group = groups.get(key)
+            if group is None:
+                group = (spec, [])
+                groups[key] = group
+            group[1].append(index)
+        for spec, indices in groups.values():
+            for index in indices:
+                del self._pending[spec.temps[index]]
+            if not self._emit(spec, tuple(indices)):
+                return False
+        return True
+
+    def flush_for(self, consumer: Node) -> bool:
+        """Emit the buffer before a non-absorbable consumer is lowered."""
+        if not self._ops:
+            return True
+        wanted = [
+            self._temps[value]
+            for value in (*consumer.args, *consumer.kwargs.values())
+            if isinstance(value, Node) and value in self._temps
+        ]
+        spec = _ForwardFusedProgram(tuple(self._ops), tuple(self._order))
+        self._reset()
+        wanted_set = set(wanted)
+        for index, temp in enumerate(spec.temps):
+            if index not in wanted_set:
+                self._pending[temp] = (spec, index)
+        if not wanted:
+            return True
+        return self._emit(spec, tuple(wanted))
+
+    def _emit(self, spec: _ForwardFusedProgram, indices: tuple[int, ...]) -> bool:
+        temps = spec.temps
+        wanted = {temps[index] for index in indices}
+        closure: set[int] = set()
+        stack = list(indices)
+        while stack:
+            index = stack.pop()
+            if index in closure:
+                continue
+            closure.add(index)
+            for kind, value in spec.ops[index][1:]:
+                if kind == "sym":
+                    position = spec.positions.get(value)
+                    if position is not None:
+                        stack.append(position)
+        sequence = sorted(closure)
+        if len(indices) == 1:
+            # The one-output evaluator returns the final temp of the program.
+            sequence.remove(indices[0])
+            sequence.append(indices[0])
+        mapping = {index: position for position, index in enumerate(sequence)}
+
+        inputs: list[Any] = []
+        input_samples: list[Any] = []
+        input_pos: dict[int, int] = {}
+        constants: list[float] = []
+        const_pos: dict[float, int] = {}
+        for index in sequence:
+            for kind, value in spec.ops[index][1:]:
+                if kind == "const" or not isinstance(value, Node):
+                    if value not in const_pos:
+                        const_pos[value] = len(constants)
+                        constants.append(value)
+                    continue
+                if value in spec.positions:
+                    continue
+                key = id(value)
+                if key not in input_pos:
+                    native = self._values.get(value)
+                    if native is None or isinstance(native, (list, tuple)):
+                        return False
+                    input_pos[key] = len(inputs)
+                    inputs.append(native)
+                    input_samples.append(self._sample_of(value))
+        input_count = len(inputs)
+        program: list[int] = []
+        for index in sequence:
+            opcode, lhs, rhs = spec.ops[index]
+            program.append(opcode)
+            for kind, value in (lhs, rhs):
+                if kind == "const" or not isinstance(value, Node):
+                    program.append(-const_pos[value] - 1)
+                elif value in spec.positions:
+                    program.append(input_count + mapping[spec.positions[value]])
+                else:
+                    program.append(input_pos[id(value)])
+        output_refs = [input_count + mapping[index] for index in indices]
+        op_name = None
+        if 1 <= input_count <= 32 and len(indices) <= 32:
+            examples = (
+                input_samples
+                if all(
+                    value is not None and hasattr(value, "device")
+                    for value in input_samples
+                )
+                else []
+            )
+            op_name = _register_stax_cuda_pointwise_op(
+                program, constants, tuple(output_refs), input_count, examples
+            )
+        node = self._graph.create_node(
+            "custom_op" if op_name is not None else "fused_pointwise",
+            f"fused_pw_{len(self._graph.nodes)}",
+        )
+        for value in inputs:
+            node.add_input(value)
+        if op_name is None:
+            node.set_int_attr("input_count", input_count)
+            node.set_ints_attr("program", program)
+            node.set_floats_attr("constants", constants)
+            if len(indices) > 1:
+                node.set_ints_attr("output_refs", output_refs)
+        else:
+            node.set_str_attr("op_name", op_name)
+        for index in indices:
+            self._values[temps[index]] = node.add_output()
+        return True
+
+    def finish(self, required: set[Node]) -> None:
+        """Materialize every buffered or spilled result the outputs need."""
+        if self._ops:
+            wanted = [
+                self._temps[temp] for temp in self._order if temp in required
+            ]
+            spec = _ForwardFusedProgram(tuple(self._ops), tuple(self._order))
+            self._reset()
+            if wanted:
+                self._emit(spec, tuple(wanted))
+        for temp, (spec, index) in list(self._pending.items()):
+            if temp in required:
+                del self._pending[temp]
+                self._emit(spec, (index,))
+
+
 def _lower_native(
     graph_module: GraphModule,
     example_inputs: list[Any],
@@ -3257,6 +3770,18 @@ def _lower_native(
     literal_values: dict[int, Any] = {}
     attribute_targets: list[str] = []
     constant_values: list[Any] = []
+    required_nodes = {
+        value
+        for output in graph_module.graph.outputs
+        for value in _nodes(output.args)
+    }
+    required_nodes.update(extra_output_nodes or [])
+    fused_pointwise_plans = (
+        _native_fused_pointwise_plans(graph_module, required_nodes)
+        if use_fusion and extra_output_nodes is not None
+        else {}
+    )
+    emitted_fused_pointwise_nodes: set[Node] = set()
     folded_convs = _fold_eval_conv_batch_norm(graph_module, example_inputs)
     # convolution inputs, weights, and outputs.  Its generated wrapper uses
     # ``empty_strided`` tensors with the channels-last strides and the current
@@ -3442,11 +3967,83 @@ def _lower_native(
         folded_native_inputs[node] = (native_weight, native_bias)
         constant_values.extend((folded_weight, folded_bias))
 
+    def fuser_sample(node: Node) -> Any:
+        sample = _traced_value(graph_module, node)
+        if sample is not None:
+            return sample
+        if node.op == "placeholder":
+            try:
+                return example_inputs[graph_module.graph.placeholders.index(node)]
+            except (ValueError, IndexError):
+                return None
+        if node.op == "get_attr":
+            try:
+                return graph_module._get_attr(node.target)
+            except (AttributeError, KeyError, RuntimeError):
+                return None
+        return None
+
+    fuser = _ForwardPointwiseFuser(
+        graph,
+        values,
+        fuser_sample,
+        set(fused_pointwise_plans)
+        | fused_relu_nodes
+        | set(fused_add_relus)
+        | set(fused_add_relus.values()),
+    )
+
     for node in graph_module.graph.nodes:
         if node.op in {"placeholder", "output", "get_attr"}:
             continue
         if node.op not in {"call_function", "call_method"}:
             return None
+        try:
+            if not fuser.ensure_for(node):
+                return None
+            if node not in emitted_fused_pointwise_nodes and fuser.absorb(node):
+                continue
+            if not fuser.flush_for(node):
+                return None
+        except (KeyError, RuntimeError, TypeError, ValueError):
+            return None
+        if node in emitted_fused_pointwise_nodes:
+            continue
+        pointwise_plan = fused_pointwise_plans.get(node)
+        if pointwise_plan is not None:
+            (
+                plan_nodes,
+                externals,
+                program,
+                constants,
+                output_refs,
+                exports,
+                op_name,
+            ) = pointwise_plan
+            if any(values.get(external) is None for external in externals):
+                return None
+            native_node = graph.create_node(
+                "custom_op" if op_name is not None else "fused_pointwise",
+                f"{node.name}_fused",
+            )
+            if op_name is not None:
+                native_node.set_str_attr("op_name", op_name)
+            else:
+                native_node.set_int_attr("input_count", len(externals))
+                native_node.set_ints_attr("program", program)
+                native_node.set_floats_attr("constants", constants)
+            for external in externals:
+                native_node.add_input(values[external])
+            native_outputs = {
+                exported: native_node.add_output() for exported in exports
+            }
+            if op_name is None and len(exports) > 1:
+                native_node.set_ints_attr("output_refs", output_refs)
+            for exported, native_output in native_outputs.items():
+                values[exported] = native_output
+                layout_values[exported] = False
+            emitted_fused_pointwise_nodes.update(plan_nodes)
+            continue
         if (
             node.op == "call_function"
             and node.target is operator.getitem
@@ -4942,6 +5539,11 @@ def _lower_native(
         layout_values[node] = False
 
     try:
+        fuser.finish(required_nodes)
+    except (KeyError, RuntimeError, TypeError, ValueError):
+        return None
+
+    try:
         output_arg = graph_module.graph.output_node.args[0]
         output_values = _native_value_leaves(output_arg, values)
         output_spec = _native_output_spec(output_arg, values)
@@ -5153,6 +5755,7 @@ class _AotNativeGraphBuilder:
         self._fused_temp_symbols: dict[int, _AotNativeSymbol] = {}
         self._fused_shape: tuple[int, ...] | None = None
         self._fused_dtype: Any = None
+        self._cuda_examples: dict[Any, Any] = {}
         self._cast_memo: dict[tuple[int, Any], tuple[_AotNativeSymbol, _AotNativeSymbol]] = {}
 
     @staticmethod
@@ -5168,6 +5771,11 @@ class _AotNativeGraphBuilder:
         dtype = getattr(example_value, "dtype", None)
         if dtype is not None:
             symbol.dtype = dtype
+        try:
+            if example_value.device.is_cuda():
+                self._cuda_examples.setdefault(dtype, example_value)
+        except (AttributeError, RuntimeError, TypeError):
+            pass
         return symbol
 
     def literal(self, value: Any) -> _AotNativeSymbol:
@@ -5316,24 +5924,55 @@ class _AotNativeGraphBuilder:
                 (opcode, ref_for(lhs, input_count), ref_for(rhs, input_count))
             )
 
+        emitted = list(range(len(ops))) if materialize_all else [len(ops) - 1]
+        output_refs = [input_count + index for index in emitted]
+        op_name = None
+        if 1 <= input_count <= 32 and len(emitted) <= 32:
+            first_shape = tuple(input_symbols[0].shape)
+            first_dtype = input_symbols[0].dtype
+            uniform = all(
+                tuple(symbol.shape) == first_shape
+                and symbol.dtype == first_dtype
+                for symbol in input_symbols
+            )
+            if uniform:
+                example = self._cuda_examples.get(first_dtype)
+                if (
+                    example is not None
+                    and tuple(int(item) for item in example.shape) == first_shape
+                    and example.dtype == first_dtype
+                ):
+                    op_name = _register_stax_cuda_pointwise_op(
+                        program,
+                        constants,
+                        tuple(output_refs),
+                        input_count,
+                        [example] * input_count,
+                    )
+                else:
+                    op_name = _register_stax_cuda_pointwise_op(
+                        program,
+                        constants,
+                        tuple(output_refs),
+                        input_count,
+                        [],
+                    )
         node = self.graph.create_node(
-            "fused_pointwise", f"aot_fused_pointwise_{len(self.graph.nodes)}"
+            "custom_op" if op_name is not None else "fused_pointwise",
+            f"aot_fused_pointwise_{len(self.graph.nodes)}",
         )
         for symbol in input_symbols:
             node.add_input(symbol.value)
-        node.set_int_attr("input_count", input_count)
-        node.set_ints_attr("program", program)
-        node.set_floats_attr("constants", constants)
+        if op_name is None:
+            node.set_int_attr("input_count", input_count)
+            node.set_ints_attr("program", program)
+            node.set_floats_attr("constants", constants)
+            node.set_ints_attr("output_refs", output_refs)
+        else:
+            node.set_str_attr("op_name", op_name)
 
-        emitted = list(range(len(ops))) if materialize_all else [len(ops) - 1]
         outputs = [node.add_output() for _ in emitted]
         node_to_output = dict(zip(emitted, outputs))
-        if not materialize_all:
-            node.set_ints_attr("output_refs", [input_count + emitted[0]])
-        else:
-            node.set_ints_attr(
-                "output_refs", [input_count + index for index in emitted]
-            )
         for temp_id, position in temp_pos.items():
             output = node_to_output.get(position)
             if output is not None:
@@ -6861,6 +7500,8 @@ class _AotNativeLowering:
 def _lower_aot_native(
     graph_module: GraphModule,
     example_inputs: list[Any],
+    *,
+    use_fusion: bool = True,
 ) -> _AotNativeLowering | None:
     """Build separate native forward/backward graphs at the AOT boundary."""
 
@@ -6904,7 +7545,7 @@ def _lower_aot_native(
     forward_lowering = _lower_native(
         graph_module,
         example_inputs,
-        use_fusion=False,
+        use_fusion=use_fusion,
         extra_output_nodes=saved_nodes,
     )
     if forward_lowering is None:
@@ -6965,7 +7606,7 @@ def _lower_aot_native(
     forward_lowering = _lower_native(
         graph_module,
         example_inputs,
-        use_fusion=False,
+        use_fusion=use_fusion,
         extra_output_nodes=needed_saved_nodes,
     )
     if forward_lowering is None:
@@ -7237,7 +7878,9 @@ def _lower_stax_region(
             graph_module._stax_codegen = "stax-cuda"
             return fused_cuda_graph
     if use_native and getattr(graph_module.root, "training", False):
-        aot_graph = _lower_aot_native(graph_module, example_inputs)
+        aot_graph = _lower_aot_native(
+            graph_module, example_inputs, use_fusion=use_fusion
+        )
         if aot_graph is not None:
             graph_module._stax_native_graph = aot_graph.forward_graph
             return aot_graph

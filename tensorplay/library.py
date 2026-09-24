@@ -691,7 +691,9 @@ class CustomOpDef:
             end = tensorplay._C._profiler_user_end
             begin(self._name)
             try:
-                return self._kernel_for(args, key)(*args, **kwargs)
+                return (self._kernel_for(args) if key is None else self._kernel_for(args, key))(
+                    *args, **kwargs
+                )
             finally:
                 end()
         if key is None:

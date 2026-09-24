@@ -85,9 +85,9 @@ class _JiteratorFunction:
                 "Jiterator is only supported on CUDA GPUs, none are available."
             )
 
-        if len(tensors) > 8:
+        if len(tensors) > 32:
             raise AssertionError(
-                f"jiterator only supports up to 8 tensor inputs, got {len(tensors)}"
+                f"jiterator only supports up to 32 tensor inputs, got {len(tensors)}"
             )
 
         expanded_kwargs = self.kwargs_dict.copy()
