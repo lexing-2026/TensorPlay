@@ -51,6 +51,38 @@ __global__ void transpose_tiled_kernel(
     }
 }
 
+template <typename T>
+__global__ void transpose_strided_outer_kernel(
+    T* __restrict__ dst, const T* __restrict__ src,
+    int64_t rows, int64_t cols, int64_t outer_count, int64_t heads,
+    int64_t src_batch_stride, int64_t src_head_stride, int64_t src_col_stride,
+    int64_t dst_batch_stride, int64_t dst_head_stride) {
+    __shared__ T tile[kTransTile][kTransTile + 1];
+    const int64_t outer = blockIdx.z;
+    if (outer >= outer_count) return;
+    const int64_t batch = outer / heads;
+    const int64_t head = outer - batch * heads;
+    const int64_t r_base = static_cast<int64_t>(blockIdx.x) * kTransTile;
+    const int64_t c_base = static_cast<int64_t>(blockIdx.y) * kTransTile;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const T* src_slice = src + batch * src_batch_stride + head * src_head_stride;
+    T* dst_slice = dst + batch * dst_batch_stride + head * dst_head_stride;
+    const int64_t r = r_base + tx;
+    const int64_t c = c_base + ty;
+    for (int j = 0; j < kTransTile; j += kTransBlockRows) {
+        if (r < rows && c + j < cols)
+            tile[ty + j][tx] = src_slice[r + (c + j) * src_col_stride];
+    }
+    __syncthreads();
+    const int64_t r2 = r_base + ty;
+    const int64_t c2 = c_base + tx;
+    for (int j = 0; j < kTransTile; j += kTransBlockRows) {
+        if (r2 + j < rows && c2 < cols)
+            dst_slice[(r2 + j) * cols + c2] = tile[tx][ty + j];
+    }
+}
+
 // Vectorized rectangular transpose: a 64x64 tile staged by 256 threads, each
 // moving one 16-byte packet per stripe on both the read and the write pass.
 // Every global transaction therefore spans 512 contiguous bytes instead of
@@ -396,6 +428,19 @@ bool transpose_layout_is_tiled_copy_vec3(const Tensor& self, const Tensor& src) 
     return true;
 }
 
+bool transpose_layout_is_strided_outer_4d(const Tensor& self, const Tensor& src) {
+    if (self.dim() != 4 || src.dim() != 4 || self.dtype() != src.dtype())
+        return false;
+    if (!self.is_contiguous()) return false;
+    for (int64_t dim = 0; dim < 4; ++dim) {
+        if (self.size(dim) != src.size(dim)) return false;
+    }
+    if (src.stride(2) != 1 || src.stride(3) <= 1) return false;
+    if (src.stride(0) <= 0 || src.stride(1) <= 0) return false;
+    const int64_t outer_count = self.size(0) * self.size(1);
+    return outer_count <= 65535 && self.numel() > 0;
+}
+
 }  // namespace
 
 Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
@@ -462,6 +507,47 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
                                   cudaMemcpyDeviceToDevice, stream.stream()),
                   "cudaMemcpyAsync (transposed identity)");
         return self;
+    }
+    if (src_cuda && transpose_layout_is_strided_outer_4d(self, src)) {
+        const int64_t rows = self.size(2);
+        const int64_t cols = self.size(3);
+        const int64_t outer_count = self.size(0) * self.size(1);
+        dim3 block(kTransTile, kTransBlockRows, 1);
+        dim3 grid(static_cast<unsigned>((rows + kTransTile - 1) / kTransTile),
+                  static_cast<unsigned>((cols + kTransTile - 1) / kTransTile),
+                  static_cast<unsigned>(outer_count));
+        switch (self.itemsize()) {
+            case 2:
+                transpose_strided_outer_kernel<uint16_t><<<grid, block, 0, stream.stream()>>>(
+                    static_cast<uint16_t*>(self.data_ptr()),
+                    static_cast<const uint16_t*>(src.data_ptr()),
+                    rows, cols, outer_count, self.size(1),
+                    src.stride(0), src.stride(1), src.stride(3),
+                    self.size(1) * rows * cols, rows * cols);
+                break;
+            case 4:
+                transpose_strided_outer_kernel<float><<<grid, block, 0, stream.stream()>>>(
+                    static_cast<float*>(self.data_ptr()),
+                    static_cast<const float*>(src.data_ptr()),
+                    rows, cols, outer_count, self.size(1),
+                    src.stride(0), src.stride(1), src.stride(3),
+                    self.size(1) * rows * cols, rows * cols);
+                break;
+            case 8:
+                transpose_strided_outer_kernel<double><<<grid, block, 0, stream.stream()>>>(
+                    static_cast<double*>(self.data_ptr()),
+                    static_cast<const double*>(src.data_ptr()),
+                    rows, cols, outer_count, self.size(1),
+                    src.stride(0), src.stride(1), src.stride(3),
+                    self.size(1) * rows * cols, rows * cols);
+                break;
+            default:
+                break;
+        }
+        if (self.itemsize() == 2 || self.itemsize() == 4 || self.itemsize() == 8) {
+            checkCuda(cudaGetLastError(), "CUDA strided outer transpose copy");
+            return self;
+        }
     }
     if (src_cuda && transpose_layout_is_tiled_copy_vec(self, src)) {
         const int64_t rows = self.size(0);
