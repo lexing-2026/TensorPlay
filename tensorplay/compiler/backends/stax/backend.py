@@ -6683,6 +6683,24 @@ def _build_aot_formula_env(
     def unary(name: str):
         return lambda value: builder.unary(name, value)
 
+    def _sum_dim_backward_env(grad, self_value, dim, keepdim):
+        dims = dim if isinstance(dim, (list, tuple)) else [dim]
+        normalized = sorted(int(item) for item in dims)
+        if not keepdim:
+            for item in normalized:
+                grad = builder.unsqueeze(grad, item)
+        return builder.expand(
+            grad, tuple(int(item) for item in self_value.shape)
+        )
+
+    def tanh_backward_env(grad, output_value):
+        # grad * (1 - output^2).conj(): identical to the decomposition the
+        # dispatcher uses, restated over builder primitives.
+        inner = builder.binary("mul", output_value, output_value)
+        return builder.binary(
+            "mul", grad, builder.unary("conj", builder.binary("sub", 1, inner))
+        )
+
     def get_tuple(index: int, value: _AotNativeTuple):
         return value.values[int(index)]
 
@@ -7048,12 +7066,20 @@ def _build_aot_formula_env(
         "sub": binary("sub"),
         "mul": binary("mul"),
         "div": binary("div"),
+        # The dim-variety sum backward restates the reduction's broadcast
+        # inverse: reinsert the singleton axes the reduction removed, then
+        # broadcast the tangent to the input extent.  The generated C++
+        # autograd resolves the same-named helper at link time; this entry
+        # serves the interpreted reverse-graph builder only.
+        "_sum_dim_backward": _sum_dim_backward_env,
+        "tanh_backward": tanh_backward_env,
         "matmul": matmul_binary("matmul"),
         "mm": matmul_binary("mm"),
         "neg": unary("neg"),
         "pos": unary("pos"),
         "t": unary("t"),
         "reshape": builder.reshape,
+        "expand": builder.expand,
         "squeeze": builder.squeeze,
         "sum": builder.sum,
         "get_tuple": get_tuple,
@@ -7211,7 +7237,12 @@ def _build_aot_backward(
     def sum_to_shape(value: _AotNativeSymbol, target_shape: tuple[int, ...]) -> _AotNativeSymbol | None:
         current_shape = tuple(int(item) for item in value.shape)
         if len(current_shape) < len(target_shape):
-            return None
+            # An under-shaped contribution (a formula leaning on scalar
+            # broadcast, e.g. a mean gradient divided by numel) grows by
+            # prepending singleton axes; the expand below sizes the rest.
+            for _ in range(len(target_shape) - len(current_shape)):
+                value = builder.unsqueeze(value, 0)
+            current_shape = tuple(int(item) for item in value.shape)
         leading = len(current_shape) - len(target_shape)
         reduce_dims = list(range(leading))
         for index, target_dim in enumerate(target_shape):
@@ -7219,11 +7250,14 @@ def _build_aot_backward(
             current_dim = current_shape[current_index]
             if target_dim == 1 and current_dim != 1:
                 reduce_dims.append(current_index)
-            elif target_dim != current_dim:
+            elif target_dim != current_dim and current_dim != 1:
                 return None
         reduced = builder.sum(value, tuple(reduce_dims), keepdim=True) if reduce_dims else value
         if tuple(reduced.shape) != tuple(target_shape):
-            reduced = builder.reshape(reduced, target_shape)
+            if len(tuple(reduced.shape)) > len(target_shape):
+                reduced = builder.reshape(reduced, target_shape)
+            else:
+                reduced = builder.expand(reduced, target_shape)
         return reduced
 
     def add_adjoint(target: Any, contribution: Any) -> bool:
@@ -7710,7 +7744,19 @@ def _build_aot_backward(
                 return None
             continue
 
-        schema = _aot_schema_for(specs, op_name)
+        # A captured call_method carries no overload suffix: ``sum(dim=...)``
+        # lands here spelled ``sum``, whose whole-tensor schema has no ``dim``
+        # parameter.  Route calls that pass a dimension to the dim-variety
+        # schema when one exists; every other spelling keeps the base schema.
+        node_kwargs = dict(node.kwargs or {})
+        has_dim_arg = "dim" in node_kwargs or (
+            len(node.args) > 1 and isinstance(node.args[1], (int, list, tuple))
+        )
+        schema = None
+        if has_dim_arg:
+            schema = _aot_schema_for(specs, f"{op_name}.dim_IntList")
+        if schema is None:
+            schema = _aot_schema_for(specs, op_name)
         if schema is None:
             return None
         parsed, formulas = schema
@@ -7762,6 +7808,26 @@ def _build_aot_backward(
             name for name, value in context.items() if isinstance(value, Node)
         }
         env = dict(formula_env)
+        # A derivative formula may read a saved tensor only for metadata
+        # (e.g. the reduction backward re-expands the tangent to the input
+        # shape) and never touch its value.  The rebuilt forward graph drops
+        # every activation whose value no backward op consumes, so such
+        # inputs resolve to no symbol here.  Rebuild one from the traced
+        # shape/dtype instead: metadata reads succeed without re-saving the
+        # activation, while a formula that emits an operation on the value
+        # still fails the eval below and keeps the graph off the AOT route.
+        for name, value in context.items():
+            if not isinstance(value, Node) or value in forward_symbols:
+                continue
+            traced = _traced_value(graph_module, value)
+            if traced is None or not hasattr(traced, "shape"):
+                continue
+            forward_symbols[value] = _AotNativeSymbol(
+                builder,
+                None,
+                tuple(int(item) for item in traced.shape),
+                getattr(traced, "dtype", None),
+            )
         env.update(
             {
                 name: forward_symbols.get(value) if isinstance(value, Node) else value
@@ -8281,7 +8347,17 @@ def _lower_stax_region(
         if fused_cuda_graph is not None:
             graph_module._stax_codegen = "stax-cuda"
             return fused_cuda_graph
-    if use_native and getattr(graph_module.root, "training", False):
+    # The AOT boundary is a property of the graph's gradient surface, not of
+    # the callable's shape: bare functions carry no training flag, so a
+    # grad-carrying input list must select the split forward/backward route
+    # exactly as a training module does.  The builder re-checks grad mode and
+    # returns None for inference calls, leaving the routes below untouched.
+    if use_native and (
+        getattr(graph_module.root, "training", False)
+        or any(
+            getattr(value, "requires_grad", False) for value in example_inputs
+        )
+    ):
         aot_graph = _lower_aot_native(
             graph_module, example_inputs, use_fusion=use_fusion
         )
