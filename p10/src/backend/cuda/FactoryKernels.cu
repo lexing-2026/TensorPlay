@@ -184,7 +184,23 @@ Tensor ones_like_kernel(const Tensor& self, DType dtype, std::optional<Device> d
 Tensor empty_like_kernel(const Tensor& self, DType dtype, std::optional<Device> device) {
     if (dtype == DType::Undefined) dtype = self.dtype();
     Device dev = device.has_value() ? *device : self.device();
-    return empty_kernel(static_cast<std::vector<int64_t>>(self.shape()), dtype, dev, false);
+    const auto shape = static_cast<std::vector<int64_t>>(self.shape());
+    Tensor result = empty_kernel(shape, dtype, dev, false);
+    if (self.dim() == 4 && self.is_channels_last()) {
+        const int64_t c = shape[1];
+        const int64_t h = shape[2];
+        const int64_t w = shape[3];
+        return result.as_strided(shape, {c * h * w, 1, w * c, c});
+    }
+    if (self.dim() == 5 && self.is_channels_last_3d()) {
+        const int64_t c = shape[1];
+        const int64_t d = shape[2];
+        const int64_t h = shape[3];
+        const int64_t w = shape[4];
+        return result.as_strided(
+            shape, {c * d * h * w, 1, w * c * d, h * c * d, d * c * h});
+    }
+    return result;
 }
 
 Tensor full_like_kernel(const Tensor& self, const Scalar& fill_value, DType dtype, std::optional<Device> device) {
