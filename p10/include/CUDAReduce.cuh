@@ -35,7 +35,7 @@ constexpr int kDefaultValuesPerThread = 4;
 constexpr int kMaxCachedReduceDevices = 64;
 // Bump when the header-only launch path changes; this also keeps generated
 // CUDA objects from silently reusing an older reduction implementation.
-constexpr int kReductionEngineRevision = 4;
+constexpr int kReductionEngineRevision = 5;
 
 // Per-device launch geometry, queried once via cudaDeviceGetAttribute and
 // cached: cudaGetDeviceProperties costs ~1ms per call on the target GPU and
@@ -260,6 +260,10 @@ struct ReduceConfig {
     int num_threads = kWarpSize;
     int input_vec_size = 1;
     bool vectorize_input = false;
+    // Vec loads stay inside the fastest reduced chunk (no crossing of the
+    // outer reduced dims' holes), so units need a coordinate decomposition.
+    bool vectorize_chunked = false;
+    bool index32 = false;
     bool global_reduce = false;
     int ctas_per_output = 1;
 
@@ -296,26 +300,65 @@ struct ReduceConfig {
     }
 
     __device__ __forceinline__ int64_t input_base_offset(int64_t output) const {
+        // Fastest-moving dimension last after reorder; decode in that order.
+        // The dim count is fixed per launch, so dispatch on it and keep every
+        // case at a fixed trip count: the compiler can then hold the extent /
+        // stride loads in registers and drop the per-element div/mod chains
+        // that a dynamic loop forces through local memory.
+        const int out_dims = ndim - num_reduce_dims;
+        if (out_dims <= 0) return 0;
+        if (index32) {
+            uint32_t off = 0, remainder = static_cast<uint32_t>(output);
+            switch (out_dims) {
+                case 1:
+                    off = remainder * static_cast<uint32_t>(input_strides[num_reduce_dims]);
+                    return off;
+                case 2: {
+                    const uint32_t e0 = static_cast<uint32_t>(shape[num_reduce_dims]);
+                    off = (remainder % e0) * static_cast<uint32_t>(input_strides[num_reduce_dims]);
+                    remainder /= e0;
+                    off += remainder * static_cast<uint32_t>(input_strides[num_reduce_dims + 1]);
+                    return off;
+                }
+                default: break;
+            }
+        }
         int64_t offset = 0;
-        int64_t remainder = output;
-        // Dimension zero is the fastest-moving dimension after TensorIterator
-        // reorders dimensions. Decode in that order.
+        int64_t rest = output;
         for (int dim = num_reduce_dims; dim < ndim; ++dim) {
             const int64_t extent = shape[dim];
-            const int64_t coordinate = extent > 0 ? remainder % extent : 0;
-            remainder = extent > 0 ? remainder / extent : 0;
+            const int64_t coordinate = extent > 0 ? rest % extent : 0;
+            rest = extent > 0 ? rest / extent : 0;
             offset += coordinate * input_strides[dim];
         }
         return offset;
     }
 
     __device__ __forceinline__ int64_t output_offset(int64_t output) const {
+        const int out_dims = ndim - num_reduce_dims;
+        if (out_dims <= 0) return 0;
+        if (index32) {
+            uint32_t off = 0, remainder = static_cast<uint32_t>(output);
+            switch (out_dims) {
+                case 1:
+                    off = remainder * static_cast<uint32_t>(output_strides[num_reduce_dims]);
+                    return off;
+                case 2: {
+                    const uint32_t e0 = static_cast<uint32_t>(shape[num_reduce_dims]);
+                    off = (remainder % e0) * static_cast<uint32_t>(output_strides[num_reduce_dims]);
+                    remainder /= e0;
+                    off += remainder * static_cast<uint32_t>(output_strides[num_reduce_dims + 1]);
+                    return off;
+                }
+                default: break;
+            }
+        }
         int64_t offset = 0;
-        int64_t remainder = output;
+        int64_t rest = output;
         for (int dim = num_reduce_dims; dim < ndim; ++dim) {
             const int64_t extent = shape[dim];
-            const int64_t coordinate = extent > 0 ? remainder % extent : 0;
-            remainder = extent > 0 ? remainder / extent : 0;
+            const int64_t coordinate = extent > 0 ? rest % extent : 0;
+            rest = extent > 0 ? rest / extent : 0;
             offset += coordinate * output_strides[dim];
         }
         return offset;
@@ -324,7 +367,39 @@ struct ReduceConfig {
     __device__ __forceinline__ int64_t input_offset(int64_t index) const {
         if (num_reduce_dims == 0) return 0;
         if (num_reduce_dims == 1) return index * input_strides[0];
-
+        if (index32) {
+            uint32_t off, r = static_cast<uint32_t>(index);
+            switch (num_reduce_dims) {
+                case 2:
+                    off  = (r % static_cast<uint32_t>(shape[0])) *
+                           static_cast<uint32_t>(input_strides[0]);
+                    r /= static_cast<uint32_t>(shape[0]);
+                    off += r * static_cast<uint32_t>(input_strides[1]);
+                    return off;
+                case 3:
+                    off  = (r % static_cast<uint32_t>(shape[0])) *
+                           static_cast<uint32_t>(input_strides[0]);
+                    r /= static_cast<uint32_t>(shape[0]);
+                    off += (r % static_cast<uint32_t>(shape[1])) *
+                           static_cast<uint32_t>(input_strides[1]);
+                    r /= static_cast<uint32_t>(shape[1]);
+                    off += r * static_cast<uint32_t>(input_strides[2]);
+                    return off;
+                case 4:
+                    off  = (r % static_cast<uint32_t>(shape[0])) *
+                           static_cast<uint32_t>(input_strides[0]);
+                    r /= static_cast<uint32_t>(shape[0]);
+                    off += (r % static_cast<uint32_t>(shape[1])) *
+                           static_cast<uint32_t>(input_strides[1]);
+                    r /= static_cast<uint32_t>(shape[1]);
+                    off += (r % static_cast<uint32_t>(shape[2])) *
+                           static_cast<uint32_t>(input_strides[2]);
+                    r /= static_cast<uint32_t>(shape[2]);
+                    off += r * static_cast<uint32_t>(input_strides[3]);
+                    return off;
+                default: break;
+            }
+        }
         int64_t offset = 0;
         int64_t remainder = index;
         for (int dim = 0; dim < num_reduce_dims; ++dim) {
@@ -334,6 +409,31 @@ struct ReduceConfig {
             offset += coordinate * input_strides[dim];
         }
         return offset;
+    }
+
+    // Compile-time specialized variant for the per-element hot loop: the
+    // reduced-dim count is folded at the per-thread dispatch, so the offset
+    // math is straight-line and the group's loads can be hoisted together.
+    // A runtime branch wrapping each load (as in input_offset) blocks that
+    // hoisting and roughly triples the small-chunk kernel time.
+    // NRED >= 2 assumes 32-bit indices: launch_reduce rejects iterators that
+    // cannot use 32-bit indexing, so the u32 decomposition below is exact.
+    template <int NRED>
+    __device__ __forceinline__ int64_t input_offset_nt(int64_t index) const {
+        if constexpr (NRED == 0) {
+            return input_offset(index);
+        } else if constexpr (NRED == 1) {
+            return index * input_strides[0];
+        } else {
+            uint32_t off = 0, r = static_cast<uint32_t>(index);
+            #pragma unroll
+            for (int dim = 0; dim < NRED; ++dim) {
+                off += (r % static_cast<uint32_t>(shape[dim])) *
+                       static_cast<uint32_t>(input_strides[dim]);
+                r /= static_cast<uint32_t>(shape[dim]);
+            }
+            return off;
+        }
     }
 
     __host__ __device__ bool should_store(int64_t output) const {
@@ -399,28 +499,63 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
         (config.num_reduce_dims > 0 &&
          iter.strides(1)[0] < iter.strides(1)[config.num_reduce_dims]);
 
+    config.index32 = iter.can_use_32bit_indexing();
+
     int64_t dim0 = reduction_on_fastest_dimension
         ? config.num_inputs : config.num_outputs;
     int64_t dim1 = reduction_on_fastest_dimension
         ? config.num_outputs : config.num_inputs;
 
-    if (reduction_on_fastest_dimension && config.num_reduce_dims == 1 &&
+    if (reduction_on_fastest_dimension &&
         config.input_strides[0] == 1 && config.num_inputs >= 128) {
         // vec=8 instantiations triple reduce_kernel PTX for negligible gain.
         config.input_vec_size = 4;
         const size_t vector_bytes = sizeof(InputT) * static_cast<size_t>(config.input_vec_size);
-        bool aligned = reduction_pointer_aligned(iter, vector_bytes);
+        const bool aligned = reduction_pointer_aligned(iter, vector_bytes);
+        // The per-output row base is the sum over non-reduced dims of
+        // coordinate * stride, so those strides must keep every row start on
+        // a vector boundary, not just the storage pointer.
+        bool rows_aligned = aligned;
         for (int dim = config.num_reduce_dims; dim < config.ndim; ++dim) {
-            aligned = aligned &&
+            rows_aligned = rows_aligned &&
                 (config.input_strides[dim] % config.input_vec_size == 0);
         }
-        if (aligned) {
-            config.vectorize_input = true;
-            config.num_input_units =
-                (config.num_inputs + config.input_vec_size - 1) / config.input_vec_size;
-            dim0 = config.num_input_units;
+        // A unit of InputVecSize logical elements must map to InputVecSize
+        // consecutive physical elements. With one reduced dim the whole row
+        // is one physical run, so a ragged extent is fine (bounds-checked
+        // units plus a scalar tail). With several reduced dims the outer
+        // chunks leave holes in the row, so every unit must stay inside the
+        // fastest chunk: chunk-multiple extent and vector-multiple strides
+        // everywhere else make the per-unit decomposition exact and keep the
+        // vec address aligned.
+        if (config.num_reduce_dims == 1) {
+            if (rows_aligned) {
+                config.vectorize_input = true;
+                config.num_input_units =
+                    (config.num_inputs + config.input_vec_size - 1) / config.input_vec_size;
+                dim0 = config.num_input_units;
+            } else {
+                config.input_vec_size = 1;
+            }
         } else {
-            config.input_vec_size = 1;
+            bool chunkable = config.index32 && aligned &&
+                (config.shape[0] % config.input_vec_size) == 0;
+            for (int dim = 1; dim < config.num_reduce_dims && chunkable; ++dim) {
+                chunkable = chunkable &&
+                    (config.input_strides[dim] % config.input_vec_size == 0);
+            }
+            for (int dim = config.num_reduce_dims; dim < config.ndim; ++dim) {
+                chunkable = chunkable &&
+                    (config.input_strides[dim] % config.input_vec_size == 0);
+            }
+            if (chunkable) {
+                config.vectorize_input = true;
+                config.vectorize_chunked = true;
+                config.num_input_units = config.num_inputs / config.input_vec_size;
+                dim0 = config.num_input_units;
+            } else {
+                config.input_vec_size = 1;
+            }
         }
     }
 
@@ -449,8 +584,12 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
         config.output_mult[0] = config.split_output(config.block_width);
     }
 
+    // Parallelism thresholds are element-based: vectorized units each cover
+    // InputVecSize elements, so a unit count would under-report the work per
+    // thread by that factor and wrongly suppress the splits below.
     const int64_t values_per_thread =
-        (config.num_input_units + config.step_input - 1) / config.step_input;
+        ((config.num_input_units + config.step_input - 1) / config.step_input) *
+        config.input_vec_size;
     const int64_t warp_split_threshold =
         std::min<int64_t>(static_cast<int64_t>(config.block_height) * 16, 256);
     const bool split_across_warps = config.block_height > 1 &&
@@ -472,11 +611,12 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
     if (reduction_on_fastest_dimension &&
         config.output_mult[0] == 0 && config.output_mult[1] == 0 &&
         config.num_outputs > 0) {
-        // (= div_up(num_inputs, step_input) in elements): num_input_units
-        // counts vectorized units, so a unit-based count would under-report
-        // by InputVecSize for vectorized loads.
+        // Elements still to be consumed per thread after the lane and warp
+        // splits: num_inputs spread over step_input units of InputVecSize
+        // elements each.
         const int64_t values_per_thread_elems =
-            (config.num_inputs + config.step_input - 1) / config.step_input;
+            (config.num_inputs + config.step_input * config.input_vec_size - 1) /
+            (config.step_input * config.input_vec_size);
         if (values_per_thread_elems >= 256) {
             int device = -1;
             checkCuda(cudaGetDevice(&device), "cudaGetDevice");
@@ -570,11 +710,13 @@ struct ReduceOp {
     AccT identity;
     Ops ops;
 
+    template <int NRED>
     __device__ __forceinline__ AccT reduce_unit(
             AccT value, const InputT* row, int64_t unit, int64_t logical_base) const {
         if constexpr (InputVecSize == 1) {
             if (logical_base < config.num_inputs) {
-                value = ops.reduce(value, row[config.input_offset(logical_base)], logical_base);
+                value = ops.reduce(value,
+                    row[config.template input_offset_nt<NRED>(logical_base)], logical_base);
             }
         } else if (logical_base + InputVecSize <= config.num_inputs &&
                    config.input_strides[0] == 1 && config.vectorize_input) {
@@ -588,7 +730,8 @@ struct ReduceOp {
             for (int i = 0; i < InputVecSize; ++i) {
                 const int64_t logical = logical_base + i;
                 if (logical < config.num_inputs) {
-                    value = ops.reduce(value, row[config.input_offset(logical)], logical);
+                    value = ops.reduce(value,
+                        row[config.template input_offset_nt<NRED>(logical)], logical);
                 }
             }
         }
@@ -596,10 +739,12 @@ struct ReduceOp {
         return value;
     }
 
-    // thread with loop-invariant state and purely affine addressing, so the
-    // multi-dim div/mod offset decomposition never lands inside an unrolled
-    // region. Only the rare ragged tail goes through input_offset.
-    __device__ __forceinline__ AccT thread_reduce(int64_t output_index) const {
+    // Fixed-shape offset decomposition: the per-launch dim count lets every
+    // unit resolve its address through a compile-time-unrolled chain, so the
+    // div/mod work rides in registers alongside the loads instead of forcing
+    // a dynamic loop through local memory.
+    template <int NRED>
+    __device__ __forceinline__ AccT thread_reduce_nt(int64_t output_index) const {
         AccT values[ValuesPerThread];
         #pragma unroll
         for (int i = 0; i < ValuesPerThread; ++i) values[i] = identity;
@@ -617,8 +762,39 @@ struct ReduceOp {
         const bool can_vec = InputVecSize > 1 &&
             config.input_strides[0] == 1 && config.vectorize_input;
         const bool can_vec_full = can_vec && config.num_inputs % InputVecSize == 0;
+        // Multi-dim reduction rows contain holes between the outer chunks;
+        // units are still chunk-aligned (host-side gate), so each unit is one
+        // vec load whose row-relative address comes from the per-unit
+        // offset decomposition.
+        const bool can_vec_chunked = can_vec && config.vectorize_chunked;
 
-        if (can_vec_full) {
+        if (can_vec_chunked) {
+            int64_t unit = start;
+            while (unit + static_cast<int64_t>(ValuesPerThread - 1) * step < end) {
+                #pragma unroll
+                for (int i = 0; i < ValuesPerThread; ++i) {
+                    const int64_t logical_base =
+                        (unit + static_cast<int64_t>(i) * step) * InputVecSize;
+                    const Vec loaded = *reinterpret_cast<const Vec*>(
+                        row + config.template input_offset_nt<NRED>(logical_base));
+                    #pragma unroll
+                    for (int j = 0; j < InputVecSize; ++j) {
+                        values[i] = ops.reduce(values[i], loaded.val[j], logical_base + j);
+                    }
+                }
+                unit += step * ValuesPerThread;
+            }
+            while (unit < end) {
+                const int64_t logical_base = unit * InputVecSize;
+                const Vec loaded = *reinterpret_cast<const Vec*>(
+                    row + config.template input_offset_nt<NRED>(logical_base));
+                #pragma unroll
+                for (int j = 0; j < InputVecSize; ++j) {
+                    values[0] = ops.reduce(values[0], loaded.val[j], logical_base + j);
+                }
+                unit += step;
+            }
+        } else if (can_vec_full) {
             int64_t unit = start;
             while (unit + static_cast<int64_t>(ValuesPerThread - 1) * step < end) {
                 #pragma unroll
@@ -644,31 +820,46 @@ struct ReduceOp {
             }
         } else {
             int64_t unit = start;
-            while (unit + static_cast<int64_t>(ValuesPerThread - 1) * step < end) {
-                #pragma unroll
-                for (int i = 0; i < ValuesPerThread; ++i) {
-                    const int64_t current = unit + static_cast<int64_t>(i) * step;
-                    const int64_t logical_base = current * InputVecSize;
-                    if (can_vec && logical_base + InputVecSize <= config.num_inputs) {
-                        const Vec loaded = *reinterpret_cast<const Vec*>(row + logical_base);
+            if constexpr (InputVecSize == 1) {
+                // Scalar main loop: the while condition bounds every unit of
+                // the group (unit + (ValuesPerThread-1)*step < end), so
+                // per-element guards would be redundant — and measurably
+                // double the runtime on small chunks by blocking load
+                // hoisting.
+                while (unit + static_cast<int64_t>(ValuesPerThread - 1) * step < end) {
+                    #pragma unroll
+                    for (int i = 0; i < ValuesPerThread; ++i) {
+                        const int64_t logical = unit + static_cast<int64_t>(i) * step;
+                        values[i] = ops.reduce(values[i], row[config.template input_offset_nt<NRED>(logical)], logical);
+                    }
+                    unit += step * ValuesPerThread;
+                }
+            } else {
+                // Vector units with a ragged final chunk (num_inputs not
+                // divisible by InputVecSize): bound the main loop by the
+                // full-unit count so no vec load can overrun the row; the
+                // checked tail below consumes the remainder. For
+                // InputVecSize > 1 the host only enables vectorization when
+                // the fastest row is contiguous, so unit*InputVecSize is the
+                // exact element base of each unit.
+                const int64_t full_units = config.num_inputs / InputVecSize;
+                while (unit + static_cast<int64_t>(ValuesPerThread - 1) * step < full_units) {
+                    #pragma unroll
+                    for (int i = 0; i < ValuesPerThread; ++i) {
+                        const int64_t logical_base =
+                            (unit + static_cast<int64_t>(i) * step) * InputVecSize;
+                        const Vec loaded = *reinterpret_cast<const Vec*>(
+                            row + config.template input_offset_nt<NRED>(logical_base));
                         #pragma unroll
                         for (int j = 0; j < InputVecSize; ++j) {
                             values[i] = ops.reduce(values[i], loaded.val[j], logical_base + j);
                         }
-                    } else {
-                        for (int j = 0; j < InputVecSize; ++j) {
-                            const int64_t logical = logical_base + j;
-                            if (logical < config.num_inputs) {
-                                values[i] = ops.reduce(
-                                    values[i], row[config.input_offset(logical)], logical);
-                            }
-                        }
                     }
+                    unit += step * ValuesPerThread;
                 }
-                unit += step * ValuesPerThread;
             }
             while (unit < end) {
-                values[0] = reduce_unit(values[0], row, unit, unit * InputVecSize);
+                values[0] = reduce_unit<NRED>(values[0], row, unit, unit * InputVecSize);
                 // Threads stride by step_input; a plain ++unit makes every lane
                 // walk into its neighbours' units (each element counted
                 // (num_inputs - lane) times -> triangular sums).
@@ -681,6 +872,19 @@ struct ReduceOp {
             values[0] = ops.combine(values[0], values[i]);
         }
         return values[0];
+    }
+
+    __device__ __forceinline__ AccT thread_reduce(int64_t output_index) const {
+        // One uniform branch per thread (not per element): the per-element
+        // offset math becomes compile-time straight-line for the common dim
+        // counts, which lets the unrolled loads hoist together.
+        switch (config.num_reduce_dims) {
+            case 1: return thread_reduce_nt<1>(output_index);
+            case 2: return thread_reduce_nt<2>(output_index);
+            case 3: return thread_reduce_nt<3>(output_index);
+            case 4: return thread_reduce_nt<4>(output_index);
+            default: return thread_reduce_nt<0>(output_index);
+        }
     }
 
     __device__ __forceinline__ void run() {
