@@ -10,6 +10,7 @@
 #include <cudnn.h>
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <optional>
@@ -343,6 +344,31 @@ inline unsigned ln_threads_for(int64_t N) {
     return 64;
 }
 
+// Backward needs more warps in flight than the forward: each block stalls on
+// three block reductions per row, and wider blocks keep the memory pipe busy
+// across those stalls.
+inline unsigned ln_bwd_threads_for(int64_t N) {
+    if (N >= 512) return kLNThreads;
+    if (N >= 128) return 128;
+    return 64;
+}
+
+// Store with an evict-first hint: the grad-input output is not re-read inside
+// the backward pass, so keeping it out of L2 preserves row data for the
+// column-gradient kernel that follows.
+template <typename V>
+__device__ inline void ln_stream_store(V* dst, const V& v) {
+    if constexpr (sizeof(V) == 16) {
+        __stcs(reinterpret_cast<uint4*>(dst),
+               *reinterpret_cast<const uint4*>(&v));
+    } else if constexpr (sizeof(V) == 8) {
+        __stcs(reinterpret_cast<uint2*>(dst),
+               *reinterpret_cast<const uint2*>(&v));
+    } else {
+        *dst = v;
+    }
+}
+
 template <typename T, int VecSize>
 struct alignas(sizeof(T) * VecSize) LNAlignedVec {
     T val[VecSize];
@@ -410,8 +436,11 @@ __device__ inline LNWelford<ACC> ln_block_reduce(LNWelford<ACC> val, LNWelford<A
     return smem[0];
 }
 
-// Two-sum block reduction (warp shuffles, then shared memory across warps).
-// On return smem0[0]/smem1[0] hold the sums and every thread is in sync.
+// Two-sum block reduction.  Warp partials land in smem0/smem1; after a
+// single barrier every warp folds all partials redundantly, so each caller
+// controls barrier placement.  A caller that reduces again afterwards must
+// hand this a buffer pair whose previous contents are no longer being read
+// (rotate buffers across consecutive reductions).
 template <typename ACC>
 __device__ inline void ln_block_reduce2(ACC& v0, ACC& v1, ACC* smem0, ACC* smem1) {
     const int lane = static_cast<int>(threadIdx.x) & 31;
@@ -423,19 +452,16 @@ __device__ inline void ln_block_reduce2(ACC& v0, ACC& v1, ACC* smem0, ACC* smem1
     }
     if (lane == 0) { smem0[wid] = v0; smem1[wid] = v1; }
     __syncthreads();
-    v0 = (lane < static_cast<int>(blockDim.x >> 5)) ? smem0[lane] : ACC(0);
-    v1 = (lane < static_cast<int>(blockDim.x >> 5)) ? smem1[lane] : ACC(0);
-    if (wid == 0) {
+    const int nw = static_cast<int>(blockDim.x >> 5);
+    v0 = (lane < nw) ? smem0[lane] : ACC(0);
+    v1 = (lane < nw) ? smem1[lane] : ACC(0);
 #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            v0 += __shfl_down_sync(0xffffffffffffffffull, v0, offset);
-            v1 += __shfl_down_sync(0xffffffffffffffffull, v1, offset);
-        }
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        v0 += __shfl_down_sync(0xffffffffffffffffull, v0, offset);
+        v1 += __shfl_down_sync(0xffffffffffffffffull, v1, offset);
     }
-    if (threadIdx.x == 0) { smem0[0] = v0; smem1[0] = v1; }
-    __syncthreads();
-    v0 = smem0[0];
-    v1 = smem1[0];
+    v0 = __shfl_sync(0xffffffffffffffffull, v0, 0);
+    v1 = __shfl_sync(0xffffffffffffffffull, v1, 0);
 }
 
 // Fused forward: one block per row, Welford stats + normalize in one launch.
@@ -573,27 +599,423 @@ __global__ void layer_norm_grad_input_kernel(
     }
 }
 
-// grad_weight/grad_bias: column-parallel deterministic reduction (no atomics).
-template <typename T, typename ACC>
-__global__ void layer_norm_gamma_beta_kernel(
+// Single-value block reduction.  Same single-barrier scheme as the two-sum
+// variant: warp partials land in `smem`, one barrier, then every warp folds
+// them redundantly.  Rotate buffers across consecutive reductions.
+template <typename ACC>
+__device__ inline void ln_block_reduce1(ACC& v, ACC* smem) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int wid = static_cast<int>(threadIdx.x) >> 5;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        v += __shfl_down_sync(0xffffffffffffffffull, v, offset);
+    if (lane == 0) smem[wid] = v;
+    __syncthreads();
+    const int nw = static_cast<int>(blockDim.x >> 5);
+    v = (lane < nw) ? smem[lane] : ACC(0);
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1)
+        v += __shfl_down_sync(0xffffffffffffffffull, v, offset);
+    v = __shfl_sync(0xffffffffffffffffull, v, 0);
+}
+
+// grad_input fast path: one block per row and the whole row lives in
+// registers between the stats pass and the write pass, so dY and X are each
+// read exactly once.  Moments are recomputed here (two accumulated passes
+// over the registers keep the variance free of cancellation) and, when a
+// column-gradient kernel follows, are also written out for it to reuse.
+//   dx = rstd/N * (N * dy * gamma - sum(dy * gamma) - x_hat * sum(dy * gamma * x_hat))
+template <typename T, typename ACC, int UNROLL>
+__global__ void layer_norm_grad_input_reg_kernel(
+    int64_t N, ACC eps,
+    const T* __restrict__ dY,
+    const T* __restrict__ X,
+    const T* __restrict__ gamma,
+    ACC* __restrict__ mean_out,
+    ACC* __restrict__ rstd_out,
+    T* __restrict__ dX) {
+    constexpr int VEC = 4;
+    constexpr int SLOTS = UNROLL * VEC;
+    using vec_t = LNAlignedVec<T, VEC>;
+    __shared__ ACC smem[kLNThreads / 32];
+    __shared__ ACC smem0[kLNThreads / 32];
+    __shared__ ACC smem1[kLNThreads / 32];
+    __shared__ ACC smem2[kLNThreads / 32];
+    const int64_t row = blockIdx.x;
+    const int64_t off = row * N;
+    const int64_t nvec = N / VEC;
+    const vec_t* dyv = reinterpret_cast<const vec_t*>(dY + off);
+    const vec_t* xv = reinterpret_cast<const vec_t*>(X + off);
+    const vec_t* gv = gamma ? reinterpret_cast<const vec_t*>(gamma) : nullptr;
+    vec_t* dxv = reinterpret_cast<vec_t*>(dX + off);
+    const ACC inv_N = ACC(1) / static_cast<ACC>(N);
+
+    vec_t dy_r[UNROLL], x_r[UNROLL];
+    bool has[UNROLL];
+#pragma unroll
+    for (int k = 0; k < UNROLL; ++k) {
+        const int64_t j = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+        has[k] = j < nvec;
+        if (has[k]) {
+            dy_r[k] = dyv[j];
+            x_r[k] = xv[j];
+        }
+    }
+
+    // Step 1: sum(x) and sum(dy*gamma); the latter needs no moments.
+    // dy*gamma is stashed so the write step never re-loads gamma.
+    ACC sx = ACC(0), s_dy = ACC(0);
+    ACC wg_r[SLOTS];
+#pragma unroll
+    for (int k = 0; k < UNROLL; ++k) {
+        const int64_t j = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+        if (has[k]) {
+#pragma unroll
+            for (int e = 0; e < VEC; ++e) {
+                const ACC g = gv ? static_cast<ACC>(gv[j].val[e]) : ACC(1);
+                const ACC wg = static_cast<ACC>(dy_r[k].val[e]) * g;
+                sx += static_cast<ACC>(x_r[k].val[e]);
+                wg_r[k * VEC + e] = wg;
+                s_dy += wg;
+            }
+        }
+    }
+    ln_block_reduce2(sx, s_dy, smem, smem0);
+    const ACC mean = sx * inv_N;
+
+    // Step 2: sum((x-mean)^2) and the un-scaled sum(dy*gamma*(x-mean)).
+    ACC sxx = ACC(0), sdyx = ACC(0);
+#pragma unroll
+    for (int k = 0; k < UNROLL; ++k) {
+        if (has[k]) {
+#pragma unroll
+            for (int e = 0; e < VEC; ++e) {
+                const ACC d = static_cast<ACC>(x_r[k].val[e]) - mean;
+                sxx += d * d;
+                sdyx += wg_r[k * VEC + e] * d;
+            }
+        }
+    }
+    ln_block_reduce2(sxx, sdyx, smem1, smem2);
+    const ACC rstd = ln_rsqrt(sxx * inv_N + eps);
+    const ACC s_dy_xhat = sdyx * rstd;
+    if (mean_out != nullptr && threadIdx.x == 0) {
+        mean_out[row] = mean;
+        rstd_out[row] = rstd;
+    }
+
+    const ACC fH = static_cast<ACC>(N);
+    const ACC term1 = rstd * inv_N;
+#pragma unroll
+    for (int k = 0; k < UNROLL; ++k) {
+        const int64_t j = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+        if (has[k]) {
+            vec_t out;
+#pragma unroll
+            for (int e = 0; e < VEC; ++e) {
+                const ACC dy_s = static_cast<ACC>(dy_r[k].val[e]);
+                const ACC xh =
+                    (static_cast<ACC>(x_r[k].val[e]) - mean) * rstd;
+                out.val[e] = static_cast<T>(
+                    term1 * (fH * wg_r[k * VEC + e] - s_dy - xh * s_dy_xhat));
+            }
+            ln_stream_store(&dxv[j], out);
+        }
+    }
+}
+
+// Fused backward for wide rows: each block owns a run of rows and keeps one
+// row in registers at a time, so dY and X are read exactly once for all
+// three gradients.  The per-row work folds into two barrier-separated steps:
+// the first reduces sum(x) together with sum(dy*gamma) (the latter does not
+// depend on the moments, and dy*gamma is stashed for the write step), the
+// second reduces sum((x-mean)^2) together with the un-scaled
+// sum(dy*gamma*(x-mean)), scaled by rstd once per row afterwards.  Buffer
+// pairs alternate between the two reduces, so no spacing barrier is needed
+// before the next row.  dX is written straight from the registers; the
+// dgamma/dbeta contributions accumulate in each thread's registers (every
+// thread owns fixed vec4 columns across the whole row run) and land in one
+// partials row that a small follow-up kernel folds.  Traversal order is
+// fixed and no atomics are used, so results are deterministic.
+//   dgamma_c = sum_rows dy * x_hat     dbeta_c = sum_rows dy
+//   dx = rstd/N * (N * dy * gamma - sum(dy * gamma) - x_hat * sum(dy * gamma * x_hat))
+template <typename T, typename ACC, int UNROLL>
+__global__ void layer_norm_bwd_fused_kernel(
+    int64_t M, int64_t N, ACC eps, int64_t rows_per_block,
+    const T* __restrict__ dY,
+    const T* __restrict__ X,
+    const T* __restrict__ gamma,
+    T* __restrict__ dX,
+    ACC* __restrict__ part_dg,
+    ACC* __restrict__ part_db) {
+    constexpr int VEC = 4;
+    constexpr int SLOTS = UNROLL * VEC;
+    using vec_t = LNAlignedVec<T, VEC>;
+    using acc_vec_t = LNAlignedVec<ACC, VEC>;
+    __shared__ ACC smem[kLNThreads / 32];
+    __shared__ ACC smem0[kLNThreads / 32];
+    __shared__ ACC smem1[kLNThreads / 32];
+    __shared__ ACC smem2[kLNThreads / 32];
+
+    const int64_t r0 = static_cast<int64_t>(blockIdx.x) * rows_per_block;
+    int64_t r1 = r0 + rows_per_block;
+    if (r1 > M) r1 = M;
+    const int64_t nvec = N / VEC;
+    const vec_t* dyv = reinterpret_cast<const vec_t*>(dY);
+    const vec_t* xv = reinterpret_cast<const vec_t*>(X);
+    const vec_t* gv = gamma ? reinterpret_cast<const vec_t*>(gamma) : nullptr;
+    vec_t* dxv = reinterpret_cast<vec_t*>(dX);
+    const ACC inv_N = ACC(1) / static_cast<ACC>(N);
+
+    ACC dg_acc[SLOTS], db_acc[SLOTS];
+#pragma unroll
+    for (int s = 0; s < SLOTS; ++s) {
+        dg_acc[s] = ACC(0);
+        db_acc[s] = ACC(0);
+    }
+
+    for (int64_t r = r0; r < r1; ++r) {
+        const int64_t off = r * nvec;
+        vec_t dy_r[UNROLL], x_r[UNROLL];
+        bool has[UNROLL];
+#pragma unroll
+        for (int k = 0; k < UNROLL; ++k) {
+            const int64_t j = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+            has[k] = j < nvec;
+            if (has[k]) {
+                dy_r[k] = dyv[off + j];
+                x_r[k] = xv[off + j];
+            }
+        }
+
+        // Step 1: sum(x) and sum(dy*gamma); the latter needs no moments.
+        // dy*gamma is stashed so the write step never re-loads gamma.
+        ACC sx = ACC(0), s_dy = ACC(0);
+        ACC wg_r[SLOTS];
+#pragma unroll
+        for (int k = 0; k < UNROLL; ++k) {
+            const int64_t j = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+            if (has[k]) {
+#pragma unroll
+                for (int e = 0; e < VEC; ++e) {
+                    const ACC g =
+                        gv ? static_cast<ACC>(gv[j].val[e]) : ACC(1);
+                    const ACC wg =
+                        static_cast<ACC>(dy_r[k].val[e]) * g;
+                    sx += static_cast<ACC>(x_r[k].val[e]);
+                    wg_r[k * VEC + e] = wg;
+                    s_dy += wg;
+                }
+            }
+        }
+        ln_block_reduce2(sx, s_dy, smem, smem0);
+        const ACC mean = sx * inv_N;
+
+        // Step 2: sum((x-mean)^2) and the un-scaled sum(dy*gamma*(x-mean)).
+        ACC sxx = ACC(0), sdyx = ACC(0);
+#pragma unroll
+        for (int k = 0; k < UNROLL; ++k) {
+            if (has[k]) {
+#pragma unroll
+                for (int e = 0; e < VEC; ++e) {
+                    const ACC d =
+                        static_cast<ACC>(x_r[k].val[e]) - mean;
+                    sxx += d * d;
+                    sdyx += wg_r[k * VEC + e] * d;
+                }
+            }
+        }
+        ln_block_reduce2(sxx, sdyx, smem1, smem2);
+        const ACC rstd = ln_rsqrt(sxx * inv_N + eps);
+        const ACC s_dy_xhat = sdyx * rstd;
+
+        const ACC term1 = rstd * inv_N;
+        const ACC fH = static_cast<ACC>(N);
+#pragma unroll
+        for (int k = 0; k < UNROLL; ++k) {
+            const int64_t j = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+            if (has[k]) {
+                vec_t out;
+#pragma unroll
+                for (int e = 0; e < VEC; ++e) {
+                    const ACC dy_s = static_cast<ACC>(dy_r[k].val[e]);
+                    const ACC xh =
+                        (static_cast<ACC>(x_r[k].val[e]) - mean) * rstd;
+                    dg_acc[k * VEC + e] += dy_s * xh;
+                    db_acc[k * VEC + e] += dy_s;
+                    out.val[e] = static_cast<T>(
+                        term1 * (fH * wg_r[k * VEC + e] - s_dy - xh * s_dy_xhat));
+                }
+                ln_stream_store(&dxv[off + j], out);
+            }
+        }
+    }
+
+    if (part_dg != nullptr) {
+        acc_vec_t* dgv = reinterpret_cast<acc_vec_t*>(part_dg) +
+                         static_cast<int64_t>(blockIdx.x) * nvec;
+        acc_vec_t* dbv = reinterpret_cast<acc_vec_t*>(part_db) +
+                         static_cast<int64_t>(blockIdx.x) * nvec;
+#pragma unroll
+        for (int k = 0; k < UNROLL; ++k) {
+            const int64_t j = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+            if (j < nvec) {
+                acc_vec_t pd, pb;
+#pragma unroll
+                for (int e = 0; e < VEC; ++e) {
+                    pd.val[e] = dg_acc[k * VEC + e];
+                    pb.val[e] = db_acc[k * VEC + e];
+                }
+                dgv[j] = pd;
+                dbv[j] = pb;
+            }
+        }
+    }
+}
+
+// Column gradients (dgamma = sum_rows dy * x_hat, dbeta = sum_rows dy).
+// A 2D tile strides the rows: each thread streams a fixed column and holds
+// no more than one row's worth of live values, warp lanes share the per-row
+// moments through shuffles, and one shared-memory transpose reduces the tile
+// once at the end.  Fixed traversal order and no atomics, so results are
+// deterministic.  When gridDim.y > 1 (very tall, narrow inputs) each y slice
+// lands in a partials row and a follow-up kernel folds them.
+template <typename T, typename ACC, int BDY>
+__global__ void layer_norm_grad_cols_kernel(
     int64_t M, int64_t N,
     const T* __restrict__ dY,
     const T* __restrict__ X,
     const ACC* __restrict__ mean,
     const ACC* __restrict__ rstd,
     T* __restrict__ dGamma,
-    T* __restrict__ dBeta) {
-    const int64_t c = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (c >= N) return;
-    ACC gw = 0, gb = 0;
-    for (int64_t i = 0; i < M; ++i) {
-        const int64_t idx = i * N + c;
-        const ACC dy = static_cast<ACC>(dY[idx]);
-        gb += dy;
-        gw += dy * ((static_cast<ACC>(X[idx]) - mean[i]) * rstd[i]);
+    T* __restrict__ dBeta,
+    ACC* __restrict__ part_dg,
+    ACC* __restrict__ part_db) {
+    constexpr int ROWS_PER_THREAD = 8;
+    constexpr int RPB = BDY * ROWS_PER_THREAD;
+    const int tx = static_cast<int>(threadIdx.x);
+    const int ty = static_cast<int>(threadIdx.y);
+    const int64_t col = static_cast<int64_t>(blockIdx.x) * 32 + tx;
+    const bool col_ok = col < N;
+
+    ACC dg_sum = ACC(0), db_sum = ACC(0);
+    for (int64_t m0 = static_cast<int64_t>(blockIdx.y) * RPB; m0 < M;
+         m0 += static_cast<int64_t>(RPB) * gridDim.y) {
+        // Lanes 0..7 of the warp fetch this row group's moments; the shuffles
+        // below hand each row's values to every lane.  A null mean pointer
+        // means no gamma gradient was requested, so the moments stay zero.
+        ACC warp_mean = ACC(0), warp_rstd = ACC(0);
+        const int64_t stat_row = m0 + ty * ROWS_PER_THREAD + tx;
+        if (tx < ROWS_PER_THREAD && mean != nullptr && stat_row < M) {
+            warp_mean = mean[stat_row];
+            warp_rstd = rstd[stat_row];
+        }
+        __syncwarp();
+#pragma unroll
+        for (int i = 0; i < ROWS_PER_THREAD; ++i) {
+            const ACC mn = __shfl_sync(0xffffffffu, warp_mean, i);
+            const ACC rd = __shfl_sync(0xffffffffu, warp_rstd, i);
+            const int64_t r = m0 + ty * ROWS_PER_THREAD + i;
+            if (r < M && col_ok) {
+                const ACC dy = static_cast<ACC>(dY[r * N + col]);
+                const ACC xv = static_cast<ACC>(X[r * N + col]);
+                db_sum += dy;
+                dg_sum += dy * (xv - mn) * rd;
+            }
+        }
     }
-    if (dGamma) dGamma[c] = static_cast<T>(gw);
-    if (dBeta) dBeta[c] = static_cast<T>(gb);
+
+    if (BDY > 1) {
+        __shared__ ACC s_dg[BDY][33];
+        __shared__ ACC s_db[BDY][33];
+        s_dg[ty][tx] = dg_sum;
+        s_db[ty][tx] = db_sum;
+        __syncthreads();
+        // Transposed read: warp ty folds column ty (and its stride) over the
+        // y dimension held in the lanes.
+        for (int i = ty; i < 32; i += BDY) {
+            ACC rdg = ACC(0), rdb = ACC(0);
+            if (tx < BDY) {
+                rdg = s_dg[tx][i];
+                rdb = s_db[tx][i];
+            }
+#pragma unroll
+            for (int delta = BDY / 2; delta > 0; delta >>= 1) {
+                rdg += __shfl_xor_sync(0xffffffffu, rdg, delta);
+                rdb += __shfl_xor_sync(0xffffffffu, rdb, delta);
+            }
+            const int64_t out_col =
+                static_cast<int64_t>(blockIdx.x) * 32 + i;
+            if (tx == 0 && out_col < N) {
+                if (part_dg != nullptr)
+                    part_dg[static_cast<int64_t>(blockIdx.y) * N + out_col] = rdg;
+                else if (dGamma != nullptr)
+                    dGamma[out_col] = static_cast<T>(rdg);
+                if (part_db != nullptr)
+                    part_db[static_cast<int64_t>(blockIdx.y) * N + out_col] = rdb;
+                else if (dBeta != nullptr)
+                    dBeta[out_col] = static_cast<T>(rdb);
+            }
+        }
+    } else if (col_ok) {
+        if (part_dg != nullptr)
+            part_dg[static_cast<int64_t>(blockIdx.y) * N + col] = dg_sum;
+        else if (dGamma != nullptr)
+            dGamma[col] = static_cast<T>(dg_sum);
+        if (part_db != nullptr)
+            part_db[static_cast<int64_t>(blockIdx.y) * N + col] = db_sum;
+        else if (dBeta != nullptr)
+            dBeta[col] = static_cast<T>(db_sum);
+    }
+}
+
+// Fold the per-block partial rows produced by the fused backward kernel and
+// the tall-skinny launch of the column kernel.  A block tiles 32 columns by
+// 8 row groups: loads stay warp-coalesced along the columns while the eight
+// group accumulators cover a partial stack eight rows deep, then shared
+// memory folds the groups with a fixed tree.  Deterministic.
+template <typename T, typename ACC>
+__global__ void layer_norm_grad_cols_finalize_kernel(
+    int64_t N, int64_t gy,
+    const ACC* __restrict__ part,
+    T* __restrict__ dGamma, T* __restrict__ dBeta) {
+    __shared__ ACC s_dg[8][33];
+    __shared__ ACC s_db[8][33];
+    const int cx = static_cast<int>(threadIdx.x) & 31;
+    const int cy = static_cast<int>(threadIdx.x) >> 5;
+    const int64_t col = static_cast<int64_t>(blockIdx.x) * 32 + cx;
+    const bool col_ok = col < N;
+    ACC sd = ACC(0), sb = ACC(0);
+    if (col_ok) {
+        if (dGamma != nullptr) {
+            for (int64_t g = cy; g < gy; g += 8) sd += part[g * N + col];
+        }
+        if (dBeta != nullptr) {
+            for (int64_t g = cy; g < gy; g += 8)
+                sb += part[(gy + g) * N + col];
+        }
+    }
+    s_dg[cy][cx] = sd;
+    s_db[cy][cx] = sb;
+    __syncthreads();
+    if (cy == 0 && col_ok) {
+        if (dGamma != nullptr) {
+            const ACC a0 = s_dg[0][cx], a1 = s_dg[1][cx];
+            const ACC a2 = s_dg[2][cx], a3 = s_dg[3][cx];
+            const ACC a4 = s_dg[4][cx], a5 = s_dg[5][cx];
+            const ACC a6 = s_dg[6][cx], a7 = s_dg[7][cx];
+            dGamma[col] =
+                static_cast<T>(((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7)));
+        }
+        if (dBeta != nullptr) {
+            const ACC b0 = s_db[0][cx], b1 = s_db[1][cx];
+            const ACC b2 = s_db[2][cx], b3 = s_db[3][cx];
+            const ACC b4 = s_db[4][cx], b5 = s_db[5][cx];
+            const ACC b6 = s_db[6][cx], b7 = s_db[7][cx];
+            dBeta[col] =
+                static_cast<T>(((b0 + b1) + (b2 + b3)) + ((b4 + b5) + (b6 + b7)));
+        }
+    }
 }
 
 inline bool ln_ptr_aligned(const void* p) {
@@ -622,30 +1044,162 @@ void launch_layer_norm_backward(
     const T* dY, const T* X, const T* gamma, T* dX,
     T* dGamma, T* dBeta) {
     const auto stream = getCurrentCUDAStream().stream();
-    // One contiguous [2, M] buffer: mean at offset 0, rstd at offset M.
-    Tensor stats = Tensor::empty(
-        std::vector<int64_t>{2 * M},
-        (std::is_same<ACC, double>::value ? DType::Float64 : DType::Float32),
-        Device(DeviceType::CUDA));
-    ACC* mean = stats.data_ptr<ACC>();
-    ACC* rstd = stats.data_ptr<ACC>() + M;
+    const ACC eps_acc = static_cast<ACC>(eps);
 
-    const bool vec_ok = (N % 4 == 0) && ln_ptr_aligned(X);
+    Tensor stats;
+    ACC* mean_p = nullptr;
+    ACC* rstd_p = nullptr;
+    auto ensure_stats = [&]() {
+        if (!stats.defined()) {
+            // One contiguous [2, M] buffer: mean at offset 0, rstd at offset M.
+            stats = Tensor::empty(
+                std::vector<int64_t>{2 * M},
+                (std::is_same<ACC, double>::value ? DType::Float64
+                                                  : DType::Float32),
+                Device(DeviceType::CUDA));
+            mean_p = stats.data_ptr<ACC>();
+            rstd_p = mean_p + M;
+        }
+    };
+
+    // Fast paths (16-byte aligned rows, width a multiple of 4, up to
+    // threads * 4 packets * 4 registers deep).  Wide rows with enough batch
+    // take the fused kernel, which reads dY and X once for all three
+    // gradients; anything else splits into the row-register grad-input
+    // kernel plus the column kernel.
+    bool fast = false;
+    bool fused = false;
+    const bool vec_ok = (N % 4 == 0) && ln_ptr_aligned(dY) && ln_ptr_aligned(X) &&
+        ln_ptr_aligned(dX) && (!gamma || ln_ptr_aligned(gamma));
     if (vec_ok) {
-        layer_norm_moments_kernel<T, ACC, 4><<<static_cast<unsigned>(M), kLNThreads, 0, stream>>>(
-            N, static_cast<ACC>(eps), X, mean, rstd);
-    } else {
-        layer_norm_moments_kernel<T, ACC, 1><<<static_cast<unsigned>(M), kLNThreads, 0, stream>>>(
-            N, static_cast<ACC>(eps), X, mean, rstd);
+        const unsigned threads = ln_bwd_threads_for(N);
+        const int64_t slots =
+            (N / 4 + static_cast<int64_t>(threads) - 1) / static_cast<int64_t>(threads);
+        if (slots <= 4) {
+            fast = true;
+            if (N >= 1024 && M >= 512) {
+                fused = true;
+                // Bound the partials volume (~8 MB per direction) while
+                // keeping at least four rows per block for load depth.
+                int64_t rpb = (M + 1023) / 1024;
+                const int64_t by_volume =
+                    (M * N + ((1 << 21) - 1)) / (1 << 21);
+                if (by_volume > rpb) rpb = by_volume;
+                if (rpb < 4) rpb = 4;
+                const int64_t grid = (M + rpb - 1) / rpb;
+                ACC* part = nullptr;
+                Tensor partials;
+                if (dGamma != nullptr || dBeta != nullptr) {
+                    partials = Tensor::empty(
+                        std::vector<int64_t>{2 * grid * N},
+                        (std::is_same<ACC, double>::value ? DType::Float64
+                                                          : DType::Float32),
+                        Device(DeviceType::CUDA));
+                    part = partials.data_ptr<ACC>();
+                }
+#define LN_BWD_FUSED_LAUNCH(U)                                                 \
+                layer_norm_bwd_fused_kernel<T, ACC, U>                         \
+                    <<<static_cast<unsigned>(grid), threads, 0, stream>>>(     \
+                        M, N, eps_acc, rpb, dY, X, gamma, dX, part,            \
+                        part != nullptr ? part + grid * N : nullptr)
+                if (slots <= 1) {
+                    LN_BWD_FUSED_LAUNCH(1);
+                } else if (slots <= 2) {
+                    LN_BWD_FUSED_LAUNCH(2);
+                } else {
+                    LN_BWD_FUSED_LAUNCH(4);
+                }
+#undef LN_BWD_FUSED_LAUNCH
+                if (part != nullptr) {
+                    layer_norm_grad_cols_finalize_kernel<T, ACC>
+                        <<<static_cast<unsigned>((N + 31) / 32), 256, 0,
+                           stream>>>(N, grid, part, dGamma, dBeta);
+                }
+            } else {
+                if (dGamma != nullptr) ensure_stats();
+#define LN_BWD_REG_LAUNCH(U)                                                   \
+            layer_norm_grad_input_reg_kernel<T, ACC, U>                        \
+                <<<static_cast<unsigned>(M), threads, 0, stream>>>(            \
+                    N, eps_acc, dY, X, gamma, mean_p, rstd_p, dX)
+                if (slots <= 1) {
+                    LN_BWD_REG_LAUNCH(1);
+                } else if (slots <= 2) {
+                    LN_BWD_REG_LAUNCH(2);
+                } else {
+                    LN_BWD_REG_LAUNCH(4);
+                }
+#undef LN_BWD_REG_LAUNCH
+            }
+        }
+    }
+    if (!fast) {
+        // Generic path: a separate moments pass feeds the streaming
+        // grad-input kernel (which re-reads dY and X for the write pass).
+        ensure_stats();
+        const bool mom_vec = (N % 4 == 0) && ln_ptr_aligned(X);
+        if (mom_vec) {
+            layer_norm_moments_kernel<T, ACC, 4>
+                <<<static_cast<unsigned>(M), kLNThreads, 0, stream>>>(
+                    N, eps_acc, X, mean_p, rstd_p);
+        } else {
+            layer_norm_moments_kernel<T, ACC, 1>
+                <<<static_cast<unsigned>(M), kLNThreads, 0, stream>>>(
+                    N, eps_acc, X, mean_p, rstd_p);
+        }
+        layer_norm_grad_input_kernel<T, ACC>
+            <<<static_cast<unsigned>(M), kLNThreads, 0, stream>>>(
+                N, dY, X, mean_p, rstd_p, gamma, dX);
     }
 
-    layer_norm_grad_input_kernel<T, ACC><<<static_cast<unsigned>(M), kLNThreads, 0, stream>>>(
-        N, dY, X, mean, rstd, gamma, dX);
-
-    const unsigned gthreads = 256;
-    const unsigned gblocks = static_cast<unsigned>((N + gthreads - 1) / gthreads);
-    layer_norm_gamma_beta_kernel<T, ACC><<<gblocks, gthreads, 0, stream>>>(
-        M, N, dY, X, mean, rstd, dGamma, dBeta);
+    if ((dGamma != nullptr || dBeta != nullptr) && !fused) {
+        const unsigned bx = static_cast<unsigned>((N + 31) / 32);
+        int dev = 0;
+        cudaGetDevice(&dev);
+        int sm_count = 0;
+        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev);
+        // Spread rows over enough y slices to fill the device when the
+        // column grid alone cannot (narrow N), keeping every slice >= one
+        // 256-row tile so the tall-slice kernel stays fully tiled.
+        int64_t gy = 1;
+        if (M >= 256) {
+            const int64_t want =
+                (static_cast<int64_t>(sm_count) * 2 + bx - 1) / bx;
+            gy = std::min<int64_t>(
+                std::min<int64_t>((M + 255) / 256, 2048),
+                std::max<int64_t>(1, want));
+        }
+        if (dGamma != nullptr) ensure_stats();
+        if (gy > 1) {
+            Tensor partials = Tensor::empty(
+                std::vector<int64_t>{2 * gy * N},
+                (std::is_same<ACC, double>::value ? DType::Float64
+                                                  : DType::Float32),
+                Device(DeviceType::CUDA));
+            ACC* part = partials.data_ptr<ACC>();
+            layer_norm_grad_cols_kernel<T, ACC, 32>
+                <<<dim3(bx, static_cast<unsigned>(gy)), dim3(32, 32), 0, stream>>>(
+                    M, N, dY, X, mean_p, rstd_p, nullptr, nullptr,
+                    part, part + gy * N);
+            layer_norm_grad_cols_finalize_kernel<T, ACC>
+                <<<static_cast<unsigned>((N + 31) / 32), 256, 0, stream>>>(
+                    N, gy, part, dGamma, dBeta);
+        } else {
+            const int bdy = M < 64 ? 1 : (M < 128 ? 8 : 32);
+            dim3 threads(32, static_cast<unsigned>(bdy));
+#define LN_BWD_COLS_LAUNCH(B)                                                  \
+            layer_norm_grad_cols_kernel<T, ACC, B>                             \
+                <<<bx, threads, 0, stream>>>(                                  \
+                    M, N, dY, X, mean_p, rstd_p, dGamma, dBeta, nullptr, nullptr)
+            if (bdy == 1) {
+                LN_BWD_COLS_LAUNCH(1);
+            } else if (bdy == 8) {
+                LN_BWD_COLS_LAUNCH(8);
+            } else {
+                LN_BWD_COLS_LAUNCH(32);
+            }
+#undef LN_BWD_COLS_LAUNCH
+        }
+    }
 }
 
 } // namespace layer_norm
