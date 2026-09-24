@@ -529,7 +529,8 @@ bool try_cat2_nchw_mixed(const std::vector<Tensor>& tensors, int64_t dim, Tensor
         launch.template operator()<4>();
         return true;
     }
-    return false;
+    launch.template operator()<1>();
+    return true;
 }
 
 template <typename Out>
