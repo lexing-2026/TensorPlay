@@ -29,7 +29,7 @@ AT_FORALL_LOWER_PRECISION_FP = [
 AT_FORALL_FP32 = [
     'acos', 'asin', 'cosh', 'sinh', 'tan',
     'exp', 'expm1', 'log', 'log10', 'log1p', 'log2', 'rsqrt',
-    'layer_norm', 'group_norm', 'native_group_norm', 'nll_loss', 'mse_loss',
+    'layer_norm', 'nll_loss', 'mse_loss',
     # Additional transcendental, distance, and loss entries.
     'erfinv', 'reciprocal', 'pow.Tensor_Scalar', 'pow.Tensor_Tensor',
     'softplus', 'renorm', 'logsumexp', 'dist', 'pdist',
@@ -102,6 +102,11 @@ CPU_PROMOTE = ['stack', 'cat', 'index_copy']
 # extra dtype argument.
 NORM_APPEND_DTYPE = ['norm', 'norm.dim']
 
+# GroupNorm consumes reduced-precision activations with full-precision
+# parameters and produces full-precision output. CUDA handles the conversion
+# while it reads the activation, so the wrapper does not materialize casts.
+CUDA_MIXED_FP32 = {'group_norm', 'native_group_norm'}
+
 
 # ===========================================================================
 # Per-backend policy resolution. The CPU and CUDA tables intentionally use
@@ -114,6 +119,7 @@ _CUDA_POLICIES: dict[str, set[str]] = {
     'fp32': set(AT_FORALL_FP32) | set(NORM_APPEND_DTYPE),
     'fp32_set_opt_dtype': set(AT_FORALL_FP32_SET_OPT_DTYPE),
     'promote': set(AT_FORALL_PROMOTE),
+    'mixed_fp32': set(CUDA_MIXED_FP32),
     'banned': {'binary_cross_entropy'},
 }
 
@@ -154,6 +160,8 @@ def autocast_registered_ops() -> set[str]:
 def _arg_expr(policy: str, a) -> str:
     if policy in ('lower_precision_fp', 'fp32', 'promote'):
         return f'::tensorplay::autocast::cached_cast(__to_type, {a.name}, __device_type)'
+    if policy == 'mixed_fp32':
+        return a.name
     if policy == 'fp32_set_opt_dtype':
         if a.type.kind == 'DType':
             return f'::tensorplay::autocast::set_opt_dtype(DType::Float32, {a.name})'
@@ -232,6 +240,9 @@ def generate_autocast_registration(funcs: list[NativeFunction]) -> str:
                         'get_lower_precision_fp_from_device_type(__device_type);')
                 else:
                     lines.append('    const DType __to_type = DType::Float32;')
+                lines.append(f'    return {call}({call_str});' if not ret_void
+                             else f'    {call}({call_str});')
+            elif policy == 'mixed_fp32':
                 lines.append(f'    return {call}({call_str});' if not ret_void
                              else f'    {call}({call_str});')
             elif policy == 'fp32_set_opt_dtype':

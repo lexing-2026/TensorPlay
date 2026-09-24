@@ -839,6 +839,104 @@ __global__ void group_norm_forward_impl(int64_t inner, int64_t spatial,
     }
 }
 
+template <typename T, int V>
+struct alignas(sizeof(T) * V) GNVec {
+    T v[V];
+};
+
+template <typename T, typename ACC, int V, bool ChannelPacked>
+__global__ void group_norm_forward_mixed_vec_impl(
+    int64_t inner, int64_t spatial, int64_t cpg, int64_t num_groups,
+    ACC eps, const T* __restrict__ X, const float* __restrict__ gamma,
+    const float* __restrict__ beta, float* __restrict__ Y,
+    ACC* __restrict__ mean_out, ACC* __restrict__ rstd_out) {
+    __shared__ ACC smem0[layer_norm::kLNThreads / 32];
+    __shared__ ACC smem1[layer_norm::kLNThreads / 32];
+    const int64_t row = blockIdx.x;
+    const int64_t g = row % num_groups;
+    const GNVec<T, V>* xv = reinterpret_cast<const GNVec<T, V>*>(X + row * inner);
+    const int64_t nv = inner / V;
+    ACC sum = ACC(0), sum_sq = ACC(0);
+    for (int64_t j = threadIdx.x; j < nv; j += blockDim.x) {
+        const GNVec<T, V> pack = xv[j];
+#pragma unroll
+        for (int k = 0; k < V; ++k) {
+            const ACC value = static_cast<ACC>(pack.v[k]);
+            sum += value;
+            sum_sq += value * value;
+        }
+    }
+    layer_norm::ln_block_reduce2(sum, sum_sq, smem0, smem1);
+    const ACC mean = smem0[0] / static_cast<ACC>(inner);
+    const ACC variance = smem1[0] / static_cast<ACC>(inner) - mean * mean;
+    const ACC rstd = layer_norm::ln_rsqrt(variance + eps);
+    if (threadIdx.x == 0) {
+        mean_out[row] = mean;
+        rstd_out[row] = rstd;
+    }
+    GNVec<float, V>* yv = reinterpret_cast<GNVec<float, V>*>(Y + row * inner);
+    for (int64_t j = threadIdx.x; j < nv; j += blockDim.x) {
+        const GNVec<T, V> pack = xv[j];
+        GNVec<float, V> out;
+        if constexpr (ChannelPacked) {
+            const int64_t channel = g * cpg + j / (spatial / V);
+            const ACC weight = gamma ? static_cast<ACC>(gamma[channel]) : ACC(1);
+            const ACC bias = beta ? static_cast<ACC>(beta[channel]) : ACC(0);
+#pragma unroll
+            for (int k = 0; k < V; ++k) {
+                out.v[k] = static_cast<float>(
+                    (static_cast<ACC>(pack.v[k]) - mean) * rstd * weight + bias);
+            }
+        } else {
+#pragma unroll
+            for (int k = 0; k < V; ++k) {
+                const int64_t idx = j * V + k;
+                const int64_t channel = g * cpg + idx / spatial;
+                const ACC weight = gamma ? static_cast<ACC>(gamma[channel]) : ACC(1);
+                const ACC bias = beta ? static_cast<ACC>(beta[channel]) : ACC(0);
+                out.v[k] = static_cast<float>(
+                    (static_cast<ACC>(pack.v[k]) - mean) * rstd * weight + bias);
+            }
+        }
+        yv[j] = out;
+    }
+}
+
+template <typename T, typename ACC>
+__global__ void group_norm_forward_mixed_impl(
+    int64_t inner, int64_t spatial, int64_t cpg, int64_t num_groups,
+    ACC eps, const T* __restrict__ X, const float* __restrict__ gamma,
+    const float* __restrict__ beta, float* __restrict__ Y,
+    ACC* __restrict__ mean_out, ACC* __restrict__ rstd_out) {
+    __shared__ ACC smem0[layer_norm::kLNThreads / 32];
+    __shared__ ACC smem1[layer_norm::kLNThreads / 32];
+    const int64_t row = blockIdx.x;
+    const int64_t g = row % num_groups;
+    const T* x = X + row * inner;
+    float* y = Y + row * inner;
+    ACC sum = ACC(0), sum_sq = ACC(0);
+    for (int64_t j = threadIdx.x; j < inner; j += blockDim.x) {
+        const ACC value = static_cast<ACC>(x[j]);
+        sum += value;
+        sum_sq += value * value;
+    }
+    layer_norm::ln_block_reduce2(sum, sum_sq, smem0, smem1);
+    const ACC mean = smem0[0] / static_cast<ACC>(inner);
+    const ACC variance = smem1[0] / static_cast<ACC>(inner) - mean * mean;
+    const ACC rstd = layer_norm::ln_rsqrt(variance + eps);
+    if (threadIdx.x == 0) {
+        mean_out[row] = mean;
+        rstd_out[row] = rstd;
+    }
+    for (int64_t j = threadIdx.x; j < inner; j += blockDim.x) {
+        const int64_t channel = g * cpg + j / spatial;
+        const ACC weight = gamma ? static_cast<ACC>(gamma[channel]) : ACC(1);
+        const ACC bias = beta ? static_cast<ACC>(beta[channel]) : ACC(0);
+        y[j] = static_cast<float>(
+            (static_cast<ACC>(x[j]) - mean) * rstd * weight + bias);
+    }
+}
+
 // grad_input: dx = rstd/inner * (inner*dy - sum(dy) - xhat*sum(dy*xhat)).
 template <typename T, typename ACC>
 __global__ void group_norm_grad_input_impl(int64_t inner, int64_t spatial,
@@ -944,11 +1042,6 @@ __global__ void group_norm_gamma_beta_impl(int64_t N, int64_t C, int64_t spatial
 // per-group fused-parameters pass, then an elementwise apply whose work per
 // element is two multiply-adds on values already in registers.
 // ===========================================================================
-
-template <typename T, int V>
-struct alignas(sizeof(T) * V) GNVec {
-    T v[V];
-};
 
 // Moments only (no normalized output write): shared by the forward pass and
 // the backward pass's stats recomputation.
@@ -1151,6 +1244,56 @@ __global__ void group_norm_internal_grads_impl(int64_t spatial,
     }
 }
 
+template <typename T, int V>
+__global__ void group_norm_internal_grads_mixed_vec_impl(
+    int64_t spatial, const float* __restrict__ dY, const T* __restrict__ X,
+    float* __restrict__ ds_out, float* __restrict__ db_out) {
+    __shared__ float smem0[layer_norm::kLNThreads / 32];
+    __shared__ float smem1[layer_norm::kLNThreads / 32];
+    const int64_t nc = blockIdx.x;
+    const GNVec<float, V>* dyv =
+        reinterpret_cast<const GNVec<float, V>*>(dY + nc * spatial);
+    const GNVec<T, V>* xv = reinterpret_cast<const GNVec<T, V>*>(X + nc * spatial);
+    const int64_t nv = spatial / V;
+    float s1 = 0.0f, s2 = 0.0f;
+    for (int64_t j = threadIdx.x; j < nv; j += blockDim.x) {
+        const GNVec<float, V> d = dyv[j];
+        const GNVec<T, V> x = xv[j];
+#pragma unroll
+        for (int k = 0; k < V; ++k) {
+            s1 += d.v[k] * static_cast<float>(x.v[k]);
+            s2 += d.v[k];
+        }
+    }
+    layer_norm::ln_block_reduce2(s1, s2, smem0, smem1);
+    if (threadIdx.x == 0) {
+        ds_out[nc] = smem0[0];
+        db_out[nc] = smem1[0];
+    }
+}
+
+template <typename T>
+__global__ void group_norm_internal_grads_mixed_impl(
+    int64_t spatial, const float* __restrict__ dY, const T* __restrict__ X,
+    float* __restrict__ ds_out, float* __restrict__ db_out) {
+    __shared__ float smem0[layer_norm::kLNThreads / 32];
+    __shared__ float smem1[layer_norm::kLNThreads / 32];
+    const int64_t nc = blockIdx.x;
+    const float* dy = dY + nc * spatial;
+    const T* x = X + nc * spatial;
+    float s1 = 0.0f, s2 = 0.0f;
+    for (int64_t j = threadIdx.x; j < spatial; j += blockDim.x) {
+        const float d = dy[j];
+        s1 += d * static_cast<float>(x[j]);
+        s2 += d;
+    }
+    layer_norm::ln_block_reduce2(s1, s2, smem0, smem1);
+    if (threadIdx.x == 0) {
+        ds_out[nc] = smem0[0];
+        db_out[nc] = smem1[0];
+    }
+}
+
 // Per-group fused backward coefficients from the channel sums.  With
 // sum1 = sum_c ds[c]*gamma[c], sum2 = sum_c db[c]*gamma[c] and s = 1/inner:
 //   c2 = (sum2*mean - sum1) * rstd^3 * s
@@ -1283,6 +1426,84 @@ __global__ void group_norm_dx_fused_vec_impl(
     }
 }
 
+template <typename T, int V>
+__global__ void group_norm_dx_fused_mixed_vec_impl(
+    int64_t inner, int64_t spatial, int64_t cpg, int64_t num_groups,
+    const float* __restrict__ dY, const T* __restrict__ X,
+    const float* __restrict__ mean, const float* __restrict__ rstd,
+    const float* __restrict__ gamma, const float* __restrict__ ds,
+    const float* __restrict__ db, T* __restrict__ dX) {
+    __shared__ float smem0[layer_norm::kLNThreads / 32];
+    __shared__ float smem1[layer_norm::kLNThreads / 32];
+    const int64_t row = blockIdx.x;
+    const int64_t g = row % num_groups;
+    float s1 = 0.0f, s2 = 0.0f;
+    for (int64_t i = threadIdx.x; i < cpg; i += blockDim.x) {
+        const int64_t c = g * cpg + i;
+        const float gv = gamma ? gamma[c] : 1.0f;
+        s1 += ds[row * cpg + i] * gv;
+        s2 += db[row * cpg + i] * gv;
+    }
+    layer_norm::ln_block_reduce2(s1, s2, smem0, smem1);
+    const float m = mean[row];
+    const float r = rstd[row];
+    const float scale = 1.0f / static_cast<float>(inner);
+    const float a2 = (smem1[0] * m - smem0[0]) * r * r * r * scale;
+    const float a3 = -a2 * m - smem1[0] * r * scale;
+    const GNVec<float, V>* dyv =
+        reinterpret_cast<const GNVec<float, V>*>(dY + row * inner);
+    const GNVec<T, V>* xv = reinterpret_cast<const GNVec<T, V>*>(X + row * inner);
+    GNVec<T, V>* dxv = reinterpret_cast<GNVec<T, V>*>(dX + row * inner);
+    const int64_t nv = inner / V;
+    for (int64_t j = threadIdx.x; j < nv; j += blockDim.x) {
+        const GNVec<float, V> d = dyv[j];
+        const GNVec<T, V> x = xv[j];
+        GNVec<T, V> out;
+        const int64_t channel = g * cpg + j / (spatial / V);
+        const float c1 = r * (gamma ? gamma[channel] : 1.0f);
+#pragma unroll
+        for (int k = 0; k < V; ++k) {
+            out.v[k] = static_cast<T>(
+                c1 * d.v[k] + a2 * static_cast<float>(x.v[k]) + a3);
+        }
+        dxv[j] = out;
+    }
+}
+
+template <typename T>
+__global__ void group_norm_dx_fused_mixed_impl(
+    int64_t inner, int64_t spatial, int64_t cpg, int64_t num_groups,
+    const float* __restrict__ dY, const T* __restrict__ X,
+    const float* __restrict__ mean, const float* __restrict__ rstd,
+    const float* __restrict__ gamma, const float* __restrict__ ds,
+    const float* __restrict__ db, T* __restrict__ dX) {
+    __shared__ float smem0[layer_norm::kLNThreads / 32];
+    __shared__ float smem1[layer_norm::kLNThreads / 32];
+    const int64_t row = blockIdx.x;
+    const int64_t g = row % num_groups;
+    float s1 = 0.0f, s2 = 0.0f;
+    for (int64_t i = threadIdx.x; i < cpg; i += blockDim.x) {
+        const int64_t c = g * cpg + i;
+        const float gv = gamma ? gamma[c] : 1.0f;
+        s1 += ds[row * cpg + i] * gv;
+        s2 += db[row * cpg + i] * gv;
+    }
+    layer_norm::ln_block_reduce2(s1, s2, smem0, smem1);
+    const float m = mean[row];
+    const float r = rstd[row];
+    const float scale = 1.0f / static_cast<float>(inner);
+    const float a2 = (smem1[0] * m - smem0[0]) * r * r * r * scale;
+    const float a3 = -a2 * m - smem1[0] * r * scale;
+    const T* x = X + row * inner;
+    T* dx = dX + row * inner;
+    for (int64_t j = threadIdx.x; j < inner; j += blockDim.x) {
+        const int64_t channel = g * cpg + j / spatial;
+        const float c1 = r * (gamma ? gamma[channel] : 1.0f);
+        dx[j] = static_cast<T>(
+            c1 * dY[row * inner + j] + a2 * static_cast<float>(x[j]) + a3);
+    }
+}
+
 // dgamma/dbeta from the per-channel sums; dY and X are not re-read.
 template <typename ACC>
 __global__ void group_norm_gamma_beta_sums_impl(int64_t N, int64_t C,
@@ -1293,18 +1514,44 @@ __global__ void group_norm_gamma_beta_sums_impl(int64_t N, int64_t C,
                                                 const ACC* __restrict__ db,
                                                 ACC* __restrict__ dgamma,
                                                 ACC* __restrict__ dbeta) {
-    const int64_t c = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (c >= C) return;
-    const int64_t g = c / cpg;
-    ACC sg = ACC(0), sb = ACC(0);
-    for (int64_t n = 0; n < N; ++n) {
-        const int64_t nc = n * C + c;
-        const int64_t ng = n * num_groups + g;
-        sg += (ds[nc] - db[nc] * mean[ng]) * rstd[ng];
-        sb += db[nc];
+    constexpr int kThreadsX = 32;
+    constexpr int kThreadsY = 16;
+    __shared__ ACC gamma_sums[2 * kThreadsY][kThreadsX + 1];
+    __shared__ ACC beta_sums[2 * kThreadsY][kThreadsX + 1];
+    const int64_t c = static_cast<int64_t>(blockIdx.x) * kThreadsX + threadIdx.x;
+    ACC gamma0 = ACC(0), gamma1 = ACC(0);
+    ACC beta0 = ACC(0), beta1 = ACC(0);
+    if (c < C) {
+        const int64_t g = c / cpg;
+        for (int64_t n = threadIdx.y; n < N; n += 2 * kThreadsY) {
+            const int64_t nc = n * C + c;
+            const int64_t ng = n * num_groups + g;
+            gamma0 += (ds[nc] - db[nc] * mean[ng]) * rstd[ng];
+            beta0 += db[nc];
+            const int64_t n1 = n + kThreadsY;
+            if (n1 < N) {
+                const int64_t nc1 = n1 * C + c;
+                const int64_t ng1 = n1 * num_groups + g;
+                gamma1 += (ds[nc1] - db[nc1] * mean[ng1]) * rstd[ng1];
+                beta1 += db[nc1];
+            }
+        }
     }
-    if (dgamma) dgamma[c] = sg;
-    if (dbeta) dbeta[c] = sb;
+    gamma_sums[threadIdx.y][threadIdx.x] = gamma0;
+    gamma_sums[kThreadsY + threadIdx.y][threadIdx.x] = gamma1;
+    beta_sums[threadIdx.y][threadIdx.x] = beta0;
+    beta_sums[kThreadsY + threadIdx.y][threadIdx.x] = beta1;
+    __syncthreads();
+    if (threadIdx.y == 0 && c < C) {
+        ACC gamma_total = ACC(0), beta_total = ACC(0);
+#pragma unroll
+        for (int y = 0; y < 2 * kThreadsY; ++y) {
+            gamma_total += gamma_sums[y][threadIdx.x];
+            beta_total += beta_sums[y][threadIdx.x];
+        }
+        if (dgamma) dgamma[c] = gamma_total;
+        if (dbeta) dbeta[c] = beta_total;
+    }
 }
 
 // Running-statistics update for InstanceNorm training mode.  The stats
@@ -1401,6 +1648,73 @@ std::tuple<Tensor, Tensor, Tensor> group_norm_forward_dispatch(
     return {out, mean, rstd};
 }
 
+template <typename T>
+std::tuple<Tensor, Tensor, Tensor> group_norm_forward_mixed_dispatch(
+    const Tensor& input, int64_t num_groups,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& bias_opt, double eps) {
+    using ACC = float;
+    const int64_t N = input.size(0);
+    const int64_t C = input.size(1);
+    const int64_t cpg = C / num_groups;
+    int64_t spatial = 1;
+    for (int64_t dim = 2; dim < input.dim(); ++dim) {
+        spatial *= input.size(dim);
+    }
+    const int64_t inner = cpg * spatial;
+    Tensor out = Tensor::empty(static_cast<std::vector<int64_t>>(input.shape()),
+                               DType::Float32, input.device());
+    Tensor mean = Tensor::empty({N, num_groups}, DType::Float32, input.device());
+    Tensor rstd = Tensor::empty({N, num_groups}, DType::Float32, input.device());
+    if (N == 0) return {out, mean, rstd};
+
+    const float* gamma = nullptr;
+    const float* beta = nullptr;
+    if (weight_opt.has_value() && weight_opt->defined()) {
+        if (weight_opt->dtype() != DType::Float32) {
+            TP_THROW(RuntimeError, "mixed group_norm weight must be Float32");
+        }
+        gamma = weight_opt->data_ptr<float>();
+    }
+    if (bias_opt.has_value() && bias_opt->defined()) {
+        if (bias_opt->dtype() != DType::Float32) {
+            TP_THROW(RuntimeError, "mixed group_norm bias must be Float32");
+        }
+        beta = bias_opt->data_ptr<float>();
+    }
+    const auto stream = getCurrentCUDAStream().stream();
+    constexpr int kVec = sizeof(T) <= 4 ? 4 : 2;
+    const unsigned threads = group_norm_threads_for(inner);
+    const T* x_p = input.data_ptr<T>();
+    float* y_p = out.data_ptr<float>();
+    const bool vec_ok =
+        inner % kVec == 0 &&
+        reinterpret_cast<uintptr_t>(x_p) % (sizeof(T) * kVec) == 0 &&
+        reinterpret_cast<uintptr_t>(y_p) % (sizeof(float) * kVec) == 0;
+    if (vec_ok) {
+        if (spatial % kVec == 0) {
+            group_norm_forward_mixed_vec_impl<T, ACC, kVec, true>
+                <<<N * num_groups, threads, 0, stream>>>(
+                    inner, spatial, cpg, num_groups, static_cast<ACC>(eps),
+                    x_p, gamma, beta, y_p, mean.data_ptr<ACC>(),
+                    rstd.data_ptr<ACC>());
+        } else {
+            group_norm_forward_mixed_vec_impl<T, ACC, kVec, false>
+                <<<N * num_groups, threads, 0, stream>>>(
+                    inner, spatial, cpg, num_groups, static_cast<ACC>(eps),
+                    x_p, gamma, beta, y_p, mean.data_ptr<ACC>(),
+                    rstd.data_ptr<ACC>());
+        }
+    } else {
+        group_norm_forward_mixed_impl<T, ACC>
+            <<<N * num_groups, threads, 0, stream>>>(
+                inner, spatial, cpg, num_groups, static_cast<ACC>(eps),
+                x_p, gamma, beta, y_p, mean.data_ptr<ACC>(), rstd.data_ptr<ACC>());
+    }
+    check_normalization_cuda_launch("group_norm mixed forward");
+    return {out, mean, rstd};
+}
+
 } // namespace
 
 Tensor group_norm_cuda(const Tensor& input, int64_t num_groups,
@@ -1421,6 +1735,26 @@ Tensor group_norm_cuda(const Tensor& input, int64_t num_groups,
         }
     }
     Tensor x = input.contiguous();
+
+    std::optional<Tensor> mixed_weight = weight_opt;
+    std::optional<Tensor> mixed_bias = bias_opt;
+    if (mixed_weight.has_value() && mixed_weight->defined() &&
+        !mixed_weight->is_contiguous()) {
+        mixed_weight = mixed_weight->contiguous();
+    }
+    if (mixed_bias.has_value() && mixed_bias->defined() &&
+        !mixed_bias->is_contiguous()) {
+        mixed_bias = mixed_bias->contiguous();
+    }
+
+    if (x.dtype() == DType::Float16) {
+        return std::get<0>(group_norm_forward_mixed_dispatch<Half>(
+            x, num_groups, mixed_weight, mixed_bias, eps));
+    }
+    if (x.dtype() == DType::BFloat16) {
+        return std::get<0>(group_norm_forward_mixed_dispatch<BFloat16>(
+            x, num_groups, mixed_weight, mixed_bias, eps));
+    }
 
     if (x.dtype() == DType::Float32) {
         return std::get<0>(group_norm_forward_dispatch<float>(
@@ -1470,6 +1804,14 @@ std::tuple<Tensor, Tensor, Tensor> native_group_norm_cuda(
     if (bias.has_value() && bias->defined() && !bias->is_contiguous()) {
         bias = bias->contiguous();
     }
+    if (x.dtype() == DType::Float16) {
+        return group_norm_forward_mixed_dispatch<Half>(
+            x, num_groups, weight, bias, eps);
+    }
+    if (x.dtype() == DType::BFloat16) {
+        return group_norm_forward_mixed_dispatch<BFloat16>(
+            x, num_groups, weight, bias, eps);
+    }
     if (x.dtype() == DType::Float32) {
         return group_norm_forward_dispatch<float>(x, num_groups, weight, bias,
                                                   eps);
@@ -1482,12 +1824,197 @@ std::tuple<Tensor, Tensor, Tensor> native_group_norm_cuda(
              "native_group_norm only supports Float32/Float64 on CUDA");
 }
 
+template <typename T>
+static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_mixed_cuda_impl(
+    const Tensor& grad_output, const Tensor& input, int64_t num_groups,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& bias_opt, double eps,
+    const Tensor* mean_saved, const Tensor* rstd_saved,
+    const std::vector<bool>* output_mask) {
+    if (grad_output.dtype() != DType::Float32) {
+        TP_THROW(NotImplementedError,
+                 "mixed group_norm_backward requires a Float32 gradient");
+    }
+    if (input.dim() < 2 || input.size(1) <= 0 || num_groups <= 0 ||
+        input.size(1) % num_groups != 0) {
+        TP_THROW(RuntimeError, "group_norm_backward has invalid group dimensions");
+    }
+    if (grad_output.dim() != input.dim()) {
+        TP_THROW(RuntimeError,
+                 "group_norm_backward gradient shape does not match input");
+    }
+    for (int64_t dim = 0; dim < input.dim(); ++dim) {
+        if (grad_output.size(dim) != input.size(dim)) {
+            TP_THROW(RuntimeError,
+                     "group_norm_backward gradient shape does not match input");
+        }
+    }
+    const int64_t N = input.size(0);
+    const int64_t C = input.size(1);
+    const int64_t cpg = C / num_groups;
+    int64_t spatial = 1;
+    for (int64_t dim = 2; dim < input.dim(); ++dim) {
+        spatial *= input.size(dim);
+    }
+    if (spatial <= 0) {
+        TP_THROW(RuntimeError, "group_norm_backward requires non-empty spatial dimensions");
+    }
+    const int64_t inner = cpg * spatial;
+    const bool need_dx = !output_mask ||
+        (!output_mask->empty() && (*output_mask)[0]);
+    const bool need_dw = output_mask
+        ? (output_mask->size() > 1 && (*output_mask)[1])
+        : (weight_opt.has_value() && weight_opt->defined());
+    const bool need_db = output_mask
+        ? (output_mask->size() > 2 && (*output_mask)[2])
+        : (bias_opt.has_value() && bias_opt->defined());
+
+    Tensor grad_output_contig = grad_output.is_contiguous()
+        ? grad_output : grad_output.contiguous();
+    Tensor input_contig = input.is_contiguous() ? input : input.contiguous();
+    Tensor grad_input = need_dx ? Tensor::empty_like(input_contig) : Tensor();
+    Tensor grad_weight = need_dw
+        ? Tensor::empty({C}, DType::Float32, input.device()) : Tensor();
+    Tensor grad_bias = need_db
+        ? Tensor::empty({C}, DType::Float32, input.device()) : Tensor();
+    std::optional<Tensor> weight_contig = weight_opt;
+    if (weight_contig.has_value() && weight_contig->defined()) {
+        if (weight_contig->dtype() != DType::Float32) {
+            TP_THROW(RuntimeError, "mixed group_norm weight must be Float32");
+        }
+        if (!weight_contig->is_contiguous()) {
+            weight_contig = weight_contig->contiguous();
+        }
+    }
+    if (bias_opt.has_value() && bias_opt->defined() &&
+        bias_opt->dtype() != DType::Float32) {
+        TP_THROW(RuntimeError, "mixed group_norm bias must be Float32");
+    }
+
+    const auto stream = getCurrentCUDAStream().stream();
+    if (N == 0) {
+        if (grad_weight.defined()) {
+            check_normalization_cuda_status(
+                cudaMemsetAsync(grad_weight.data_ptr(), 0,
+                                C * sizeof(float), stream),
+                "group_norm mixed backward weight initialization");
+        }
+        if (grad_bias.defined()) {
+            check_normalization_cuda_status(
+                cudaMemsetAsync(grad_bias.data_ptr(), 0,
+                                C * sizeof(float), stream),
+                "group_norm mixed backward bias initialization");
+        }
+        return {grad_input, grad_weight, grad_bias};
+    }
+
+    Tensor mean_saved_contig;
+    Tensor rstd_saved_contig;
+    if (mean_saved && mean_saved->defined()) {
+        if (mean_saved->dtype() != DType::Float32) {
+            TP_THROW(RuntimeError, "mixed group_norm mean must be Float32");
+        }
+        mean_saved_contig = mean_saved->is_contiguous()
+            ? *mean_saved : mean_saved->contiguous();
+    }
+    if (rstd_saved && rstd_saved->defined()) {
+        if (rstd_saved->dtype() != DType::Float32) {
+            TP_THROW(RuntimeError, "mixed group_norm rstd must be Float32");
+        }
+        rstd_saved_contig = rstd_saved->is_contiguous()
+            ? *rstd_saved : rstd_saved->contiguous();
+    }
+    if (mean_saved_contig.defined() != rstd_saved_contig.defined()) {
+        TP_THROW(RuntimeError, "group_norm_backward requires both saved statistics");
+    }
+
+    Tensor computed_stats;
+    float* mean_p = nullptr;
+    float* rstd_p = nullptr;
+    if (mean_saved_contig.defined()) {
+        mean_p = mean_saved_contig.data_ptr<float>();
+        rstd_p = rstd_saved_contig.data_ptr<float>();
+    } else {
+        computed_stats = Tensor::empty({N * num_groups * 2}, DType::Float32,
+                                        input.device());
+        mean_p = computed_stats.data_ptr<float>();
+        rstd_p = mean_p + N * num_groups;
+        group_norm_moments_impl<T, float>
+            <<<N * num_groups, group_norm_threads_for(inner), 0, stream>>>(
+                inner, static_cast<float>(eps), input_contig.data_ptr<T>(),
+                mean_p, rstd_p);
+        check_normalization_cuda_launch("group_norm mixed backward moments");
+    }
+
+    Tensor sums = Tensor::empty({N * C * 2}, DType::Float32, input.device());
+    float* ds_p = sums.data_ptr<float>();
+    float* db_p = ds_p + N * C;
+    constexpr int kVec = sizeof(T) <= 4 ? 4 : 2;
+    const T* x_p = input_contig.data_ptr<T>();
+    const float* dy_p = grad_output_contig.data_ptr<float>();
+    const bool vec_ok =
+        spatial % kVec == 0 &&
+        reinterpret_cast<uintptr_t>(x_p) % (sizeof(T) * kVec) == 0 &&
+        reinterpret_cast<uintptr_t>(dy_p) % (sizeof(float) * kVec) == 0;
+    if (vec_ok) {
+        group_norm_internal_grads_mixed_vec_impl<T, kVec>
+            <<<N * C, group_norm_threads_for(spatial), 0, stream>>>(
+                spatial, dy_p, x_p, ds_p, db_p);
+    } else {
+        group_norm_internal_grads_mixed_impl<T>
+            <<<N * C, group_norm_threads_for(spatial), 0, stream>>>(
+                spatial, dy_p, x_p, ds_p, db_p);
+    }
+    check_normalization_cuda_launch("group_norm mixed backward sums");
+
+    const float* gamma = weight_contig.has_value() && weight_contig->defined()
+        ? weight_contig->data_ptr<float>() : nullptr;
+    if (need_dx) {
+        T* dx_p = grad_input.data_ptr<T>();
+        const bool dx_vec_ok = vec_ok &&
+            reinterpret_cast<uintptr_t>(dx_p) % (sizeof(T) * kVec) == 0;
+        if (dx_vec_ok) {
+            group_norm_dx_fused_mixed_vec_impl<T, kVec>
+                <<<N * num_groups, group_norm_threads_for(inner), 0, stream>>>(
+                    inner, spatial, cpg, num_groups, dy_p, x_p, mean_p, rstd_p,
+                    gamma, ds_p, db_p, dx_p);
+        } else {
+            group_norm_dx_fused_mixed_impl<T>
+                <<<N * num_groups, group_norm_threads_for(inner), 0, stream>>>(
+                    inner, spatial, cpg, num_groups, dy_p, x_p, mean_p, rstd_p,
+                    gamma, ds_p, db_p, dx_p);
+        }
+        check_normalization_cuda_launch("group_norm mixed backward input");
+    }
+    if (need_dw || need_db) {
+        group_norm_gamma_beta_sums_impl<float>
+            <<<(C + 31) / 32, dim3(32, 16), 0, stream>>>(
+                N, C, num_groups, cpg, mean_p, rstd_p, ds_p, db_p,
+                need_dw ? grad_weight.data_ptr<float>() : nullptr,
+                need_db ? grad_bias.data_ptr<float>() : nullptr);
+        check_normalization_cuda_launch("group_norm mixed backward parameters");
+    }
+    return {grad_input, grad_weight, grad_bias};
+}
+
 static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cuda_impl(
     const Tensor& grad_output, const Tensor& input, int64_t num_groups,
     const std::optional<Tensor>& weight_opt,
     const std::optional<Tensor>& bias_opt, double eps,
     const Tensor* mean_saved, const Tensor* rstd_saved,
     const std::vector<bool>* output_mask) {
+    if ((input.dtype() == DType::Float16 ||
+         input.dtype() == DType::BFloat16) &&
+        grad_output.dtype() == DType::Float32) {
+        if (input.dtype() == DType::Float16) {
+            return group_norm_backward_mixed_cuda_impl<Half>(
+                grad_output, input, num_groups, weight_opt, bias_opt, eps,
+                mean_saved, rstd_saved, output_mask);
+        }
+        return group_norm_backward_mixed_cuda_impl<BFloat16>(
+            grad_output, input, num_groups, weight_opt, bias_opt, eps,
+            mean_saved, rstd_saved, output_mask);
+    }
     if (input.dim() < 2 || input.size(1) <= 0 || num_groups <= 0 ||
         input.size(1) % num_groups != 0) {
         TP_THROW(RuntimeError, "group_norm_backward has invalid group dimensions");
@@ -1495,7 +2022,7 @@ static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cuda_impl(
     if (input.dtype() != grad_output.dtype() ||
         (input.dtype() != DType::Float32 && input.dtype() != DType::Float64)) {
         TP_THROW(NotImplementedError,
-                 "group_norm_backward only supports matching Float32/Float64 inputs");
+                 "group_norm_backward supports matching Float32/Float64 or mixed Float16/BFloat16 input with Float32 gradient");
     }
     if (grad_output.dim() != input.dim()) {
         TP_THROW(RuntimeError,
@@ -1648,7 +2175,7 @@ static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cuda_impl(
                 acc_t* gbv_p = need_db ? grad_bias.data_ptr<acc_t>()           \
                                        : nullptr;                               \
                 group_norm_gamma_beta_sums_impl<acc_t>                          \
-                    <<<(C + 255) / 256, 256, 0, stream>>>(                       \
+                    <<<(C + 31) / 32, dim3(32, 16), 0, stream>>>(                       \
                         N, C, num_groups, cpg, mean_p, rstd_p,                 \
                         ds_p, db_p, gwv_p, gbv_p);                              \
                 check_normalization_cuda_launch("group_norm backward parameters"); \
@@ -1687,7 +2214,7 @@ static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cuda_impl(
             }                                                                   \
             if (need_dw || need_db) {                                           \
                 group_norm_gamma_beta_sums_impl<acc_t>                           \
-                    <<<(C + 255) / 256, 256, 0, stream>>>(                       \
+                    <<<(C + 31) / 32, dim3(32, 16), 0, stream>>>(                       \
                         N, C, num_groups, cpg, mean_p, rstd_p,                  \
                         ds_p, db_p,                                             \
                         need_dw ? grad_weight.data_ptr<acc_t>() : nullptr,      \
@@ -1704,7 +2231,7 @@ static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cuda_impl(
         GN_BACKWARD_CASE(double, double, Float64)
     } else {
         TP_THROW(NotImplementedError,
-                 "group_norm_backward only supports Float32/Float64 on CUDA");
+                 "group_norm_backward supports Float32, Float64, and mixed Float16/BFloat16 on CUDA");
     }
     #undef GN_BACKWARD_CASE
 
@@ -1779,7 +2306,7 @@ Tensor instance_norm_cuda(const Tensor& input, const std::optional<Tensor>& weig
                 mean_p, rstd_p);                                                \
             check_normalization_cuda_launch("instance_norm moments");         \
             instance_running_stats_impl<acc_t>                                  \
-                <<<(C + 255) / 256, 256, 0, stream>>>(                          \
+                <<<(C + 255) / 256, 256, 0, stream>>>(                       \
                 N, C, spatial, momentum, eps, mean_p, rstd_p,                   \
                 running_mean_opt->data_ptr<acc_t>(),                            \
                 running_var_opt->data_ptr<acc_t>());                            \
