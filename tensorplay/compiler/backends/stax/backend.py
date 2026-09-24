@@ -490,6 +490,7 @@ class _NativeLowering:
         output_spec: Any = None,
         public_output_count: int | None = None,
         mutations: list[tuple[int, int]] | None = None,
+        autocast_outputs: list[tuple[Node, Any]] | None = None,
     ) -> None:
         self.graph_module = graph_module
         self.graph = graph
@@ -506,6 +507,7 @@ class _NativeLowering:
         # result back into the source input after every execution.
         self._mutations = list(mutations or [])
         self.native_values = dict(native_values or {})
+        self.autocast_outputs = list(autocast_outputs or [])
         self._tensorplay_codegen = "stax-native"
         # (id, _version) memo of the last resolved input vector; attributes
         # and constants appended by _bind_inputs are process-stable.
@@ -3807,6 +3809,7 @@ def _lower_native(
     *,
     use_fusion: bool = True,
     extra_output_nodes: list[Node] | None = None,
+    save_autocast_inputs: bool = False,
 ) -> _NativeLowering | None:
     """Lower the canonical graph into the native Stax IR when possible."""
 
@@ -3936,8 +3939,14 @@ def _lower_native(
     fused_relu_nodes: set[Node] = set()
     layout_values: dict[Node, bool] = {}
     channels_last_values: dict[Node, Any] = {}
+    autocast_values: dict[tuple[Node, Any], Any] = {}
     mutations: list[tuple[int, Any]] = []
     peel_conv_bias = bool(example_inputs and example_inputs[0].device.is_cuda())
+    autocast_dtype = (
+        tensorplay.get_autocast_dtype("cuda")
+        if save_autocast_inputs and tensorplay.is_autocast_enabled("cuda")
+        else None
+    )
     # This is the same producer/sole-consumer legality check used by
     # training graph because add_relu has a generated autograd formula; the
     # Conv->ReLU and Conv+BN folding paths remain inference-only.
@@ -4009,6 +4018,23 @@ def _lower_native(
         reorder.add_input(values[node])
         converted = reorder.add_output()
         channels_last_values[node] = converted
+        return converted
+
+    def saved_autocast_value(node: Node, value: Any) -> Any:
+        if autocast_dtype is None:
+            return value
+        sample = _traced_value(graph_module, node)
+        if getattr(sample, "dtype", None) != tensorplay.float32:
+            return value
+        key = (node, autocast_dtype)
+        cached = autocast_values.get(key)
+        if cached is not None:
+            return cached
+        cast = graph.create_node("cast", f"{node.name}_autocast")
+        cast.add_input(value)
+        cast.set_str_attr("dtype", str(autocast_dtype).rsplit(".", 1)[-1])
+        converted = cast.add_output()
+        autocast_values[key] = converted
         return converted
 
     # Register all live module attributes before synthetic folded weights so
@@ -4938,10 +4964,15 @@ def _lower_native(
             is_causal = options.get("is_causal", False)
             if not isinstance(is_causal, bool):
                 return None
+            attention_inputs = []
+            for input_node in (query, key, value_node):
+                input_value = values[input_node]
+                if autocast_dtype is not None and getattr(node.meta.get("val"), "dtype", None) == autocast_dtype:
+                    input_value = saved_autocast_value(input_node, input_value)
+                attention_inputs.append(input_value)
             native_node = graph.create_node("scaled_dot_product_attention", node.name)
-            native_node.add_input(values[query])
-            native_node.add_input(values[key])
-            native_node.add_input(values[value_node])
+            for input_value in attention_inputs:
+                native_node.add_input(input_value)
             native_node.set_int_attr("is_causal", int(is_causal))
             native_node.set_int_attr("impl", 0)
             values[node] = native_node.add_output()
@@ -5014,6 +5045,8 @@ def _lower_native(
             conv_input = channels_last_value(input_node)
             if conv_input is None:
                 return None
+            if autocast_dtype is not None:
+                conv_input = saved_autocast_value(input_node, conv_input)
             folded_inputs = folded_native_inputs.get(node)
             bias_input = None
             bias_tensor = None
@@ -5026,6 +5059,8 @@ def _lower_native(
                 weight_input = channels_last_value(weight_node)
                 if weight_input is None:
                     return None
+                if autocast_dtype is not None:
+                    weight_input = saved_autocast_value(weight_node, weight_input)
                 if bias_node is not None:
                     bias_input = node_value(bias_node)
                     if bias_input is None:
@@ -5527,9 +5562,14 @@ def _lower_native(
             # bias belongs in the product's epilogue, and adding it back
             # separately costs a whole pass over the output.
             if _native_runs_linear():
+                linear_input = values[input_node]
+                linear_weight = values[weight_node]
+                if autocast_dtype is not None and getattr(node.meta.get("val"), "dtype", None) == autocast_dtype:
+                    linear_input = saved_autocast_value(input_node, linear_input)
+                    linear_weight = saved_autocast_value(weight_node, linear_weight)
                 fused = graph.create_node("linear", node.name)
-                fused.add_input(values[input_node])
-                fused.add_input(values[weight_node])
+                fused.add_input(linear_input)
+                fused.add_input(linear_weight)
                 if bias_node is not None:
                     fused.add_input(values[bias_node])
                 values[node] = fused.add_output()
@@ -5642,6 +5682,10 @@ def _lower_native(
             graph.register_output(extra_values)
             registered_extra_outputs += 1
 
+    for converted in autocast_values.values():
+        graph.register_output(converted)
+        registered_extra_outputs += 1
+
     # Buffer updates run last: each registered mutation output pairs with an
     # input position, and the wrapper copies it back after execution.
     mutation_outputs: list[tuple[int, int]] = []
@@ -5663,6 +5707,7 @@ def _lower_native(
         output_spec=output_spec,
         public_output_count=public_output_count,
         mutations=mutation_outputs,
+        autocast_outputs=list(autocast_values),
     )
 
 
@@ -6917,6 +6962,7 @@ def _build_aot_backward(
     forward_lowering: _NativeLowering,
     saved_nodes: list[Node],
     runtime_values: dict[Node, Any],
+    runtime_cast_values: dict[tuple[Node, Any], Any],
     runtime_inputs: list[Any],
     public_node: Node,
 ) -> tuple[Any, list[int]] | None:
@@ -6949,6 +6995,22 @@ def _build_aot_backward(
         symbol = builder.input(actual)
         saved_symbols.append(symbol)
         forward_symbols[node] = symbol
+    for key in forward_lowering.autocast_outputs:
+        source_node, dtype = key
+        source = forward_symbols.get(source_node)
+        actual = runtime_cast_values.get(key)
+        if actual is None:
+            return None
+        if source is None:
+            traced = _traced_value(graph_module, source_node)
+            if traced is None:
+                return None
+            source = _AotNativeSymbol(
+                builder, None, tuple(int(item) for item in traced.shape), traced.dtype
+            )
+            forward_symbols[source_node] = source
+        converted = builder.input(actual)
+        builder._cast_memo[(id(source), dtype)] = (source, converted)
     tangent = builder.input(runtime_values[public_node])
     adjoints: dict[Node, _AotNativeSymbol] = {public_node: tangent}
     view_adjoints: dict[Node, dict[int, _AotNativeSymbol]] = {}
@@ -7690,6 +7752,7 @@ def _lower_aot_native(
         example_inputs,
         use_fusion=use_fusion,
         extra_output_nodes=saved_nodes,
+        save_autocast_inputs=True,
     )
     if forward_lowering is None:
         return None
@@ -7725,11 +7788,16 @@ def _lower_aot_native(
                 for value, snapshot in snapshots:
                     value.copy_(snapshot)
 
-    if len(forward_outputs) != 1 + len(saved_nodes) + len(forward_lowering._mutations):
+    cast_count = len(forward_lowering.autocast_outputs)
+    if len(forward_outputs) != 1 + len(saved_nodes) + cast_count + len(forward_lowering._mutations):
         return None
     runtime_values: dict[Node, Any] = {public_node: forward_outputs[0]}
     for index, node in enumerate(saved_nodes, start=1):
         runtime_values[node] = forward_outputs[index]
+    runtime_cast_values = dict(zip(
+        forward_lowering.autocast_outputs,
+        forward_outputs[1 + len(saved_nodes) : 1 + len(saved_nodes) + cast_count],
+    ))
 
     built = _build_aot_backward(
         graph_module,
@@ -7737,6 +7805,7 @@ def _lower_aot_native(
         forward_lowering,
         saved_nodes,
         runtime_values,
+        runtime_cast_values,
         runtime_inputs,
         public_node,
     )
@@ -7751,8 +7820,9 @@ def _lower_aot_native(
         example_inputs,
         use_fusion=use_fusion,
         extra_output_nodes=needed_saved_nodes,
+        save_autocast_inputs=True,
     )
-    if forward_lowering is None:
+    if forward_lowering is None or forward_lowering.autocast_outputs != list(runtime_cast_values):
         return None
     rebuilt = _build_aot_backward(
         graph_module,
@@ -7760,6 +7830,7 @@ def _lower_aot_native(
         forward_lowering,
         needed_saved_nodes,
         runtime_values,
+        runtime_cast_values,
         runtime_inputs,
         public_node,
     )
