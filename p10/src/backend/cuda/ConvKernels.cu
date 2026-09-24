@@ -31,6 +31,8 @@ namespace fe = cudnn_frontend;
 namespace tensorplay {
 namespace cuda {
 
+bool add_channel_broadcast_inplace_cuda(Tensor& self, const Tensor& other);
+
 template <typename InputT, typename AccT, typename OutputT>
 __global__ void conv2d_grad_bias_reduce_kernel(
     const InputT* __restrict__ grad_output, int64_t batch, int64_t channels,
@@ -1306,13 +1308,22 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
     if (post_bias_add) {
         Tensor bias_c = bias.is_contiguous() ? bias : bias.contiguous();
         Tensor bias_4d = bias_c.reshape({1, K, 1, 1});
-        auto bias_desc = get_cached_tensor_desc(bias_4d);
-        auto out_desc = get_cached_tensor_desc(out);
-        float alpha = 1.0f;
-        float beta = 1.0f;
-        CUDNN_CHECK(cudnnAddTensor(
-            handle, &alpha, *bias_desc, bias_4d.data_ptr(), &beta,
-            *out_desc, out.data_ptr()));
+        bool added = false;
+        if ((out.dtype() == DType::Float16 || out.dtype() == DType::BFloat16) &&
+            (bias_c.dtype() == DType::Float32 ||
+             bias_c.dtype() == DType::Float16 ||
+             bias_c.dtype() == DType::BFloat16)) {
+            added = add_channel_broadcast_inplace_cuda(out, bias_4d);
+        }
+        if (!added) {
+            auto bias_desc = get_cached_tensor_desc(bias_4d);
+            auto out_desc = get_cached_tensor_desc(out);
+            float alpha = 1.0f;
+            float beta = 1.0f;
+            CUDNN_CHECK(cudnnAddTensor(
+                handle, &alpha, *bias_desc, bias_4d.data_ptr(), &beta,
+                *out_desc, out.data_ptr()));
+        }
     }
 
     return out;

@@ -314,6 +314,80 @@ __global__ void binary_channel_broadcast_vec4_kernel(
     }
 }
 
+template <typename T, typename B, bool BroadcastFirst, typename Op>
+__global__ void binary_channel_broadcast_mixed_vec4_kernel(
+    int64_t inner, int64_t rows, int64_t channels,
+    int64_t batch_stride, int64_t channel_stride, bool batch_repeated,
+    const B* __restrict__ broadcast, const T* __restrict__ full,
+    T* __restrict__ result, float alpha, Op op) {
+    using M = typename BinaryOpMath<T>::type;
+    const int64_t col = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
+    if (col >= inner) return;
+    for (int64_t row = blockIdx.y; row < rows; row += gridDim.y) {
+        const int64_t channel = row % channels;
+        const int64_t batch = batch_repeated ? 0 : row / channels;
+        const M b = static_cast<M>(
+            broadcast[batch * batch_stride + channel * channel_stride]);
+        const int64_t offset = row * inner + col;
+        const TPVecPack<T, 4> value =
+            *reinterpret_cast<const TPVecPack<T, 4>*>(full + offset);
+        TPVecPack<T, 4> output;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            output.v[i] = static_cast<T>(BroadcastFirst
+                ? op(b, static_cast<M>(value.v[i]), alpha)
+                : op(static_cast<M>(value.v[i]), b, alpha));
+        }
+        *reinterpret_cast<TPVecPack<T, 4>*>(result + offset) = output;
+    }
+}
+
+template <typename T, typename B, bool BroadcastFirst, typename Op>
+bool try_binary_channel_broadcast_mixed_pair(
+    const Tensor& full, const Tensor& broadcast, Tensor& result,
+    float alpha, Op op) {
+    if (full.dim() != 4 || broadcast.dim() != 4 || result.dim() != 4) return false;
+    if (full.shape() != result.shape() || full.dtype() != result.dtype()) return false;
+    if (broadcast.size(0) != result.size(0) && broadcast.size(0) != 1) return false;
+    if (broadcast.size(1) != result.size(1) || broadcast.size(2) != 1 ||
+        broadcast.size(3) != 1) {
+        return false;
+    }
+    if (!full.device().is_cuda() || !broadcast.device().is_cuda() ||
+        !result.device().is_cuda() || !full.is_contiguous() ||
+        !result.is_contiguous() || broadcast.stride(1) != 1 ||
+        (broadcast.size(0) == result.size(0) && broadcast.stride(0) < 0)) {
+        return false;
+    }
+    const int64_t channels = result.size(1);
+    const int64_t rows = result.size(0) * channels;
+    const int64_t inner = result.size(2) * result.size(3);
+    const bool batch_repeated = broadcast.size(0) != result.size(0);
+    const int64_t batch_stride = broadcast.stride(0);
+    const int64_t channel_stride = broadcast.stride(1);
+    const auto stream = getCurrentCUDAStream().stream();
+    constexpr int kVec = 4;
+    const bool vectorized = inner % kVec == 0 &&
+        (reinterpret_cast<uintptr_t>(full.data_ptr()) |
+         reinterpret_cast<uintptr_t>(result.data_ptr())) %
+            (sizeof(T) * kVec) == 0;
+    if (!vectorized) return false;
+    const int64_t groups = inner / kVec;
+    const int threads = std::min<int64_t>(
+        128, std::max<int64_t>(32, ((groups + 31) / 32) * 32));
+    dim3 block(static_cast<unsigned>(threads));
+    dim3 grid(
+        static_cast<unsigned>((groups + threads - 1) / threads),
+        static_cast<unsigned>(std::min<int64_t>(rows, 65535)));
+    binary_channel_broadcast_mixed_vec4_kernel<T, B, BroadcastFirst, Op>
+        <<<grid, block, 0, stream>>>(
+            inner, rows, channels, batch_stride, channel_stride,
+            batch_repeated, broadcast.data_ptr<B>(), full.data_ptr<T>(),
+            result.data_ptr<T>(), alpha, op);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 template <typename B, bool BroadcastFirst, typename Op>
 bool try_binary_channel_broadcast_pair(
     const Tensor& full, const Tensor& broadcast, Tensor& result,
@@ -373,6 +447,20 @@ bool try_binary_channel_broadcast(
     const Tensor& full = left_full ? left : right;
     const Tensor& broadcast = left_full ? right : left;
     if (broadcast.dtype() == DType::Float32) {
+        if (full.dtype() == DType::Float16 && result.dtype() == DType::Float16) {
+            return left_full
+                ? try_binary_channel_broadcast_mixed_pair<tensorplay::Half, float, false, Op>(
+                    full, broadcast, result, alpha, op)
+                : try_binary_channel_broadcast_mixed_pair<tensorplay::Half, float, true, Op>(
+                    full, broadcast, result, alpha, op);
+        }
+        if (full.dtype() == DType::BFloat16 && result.dtype() == DType::BFloat16) {
+            return left_full
+                ? try_binary_channel_broadcast_mixed_pair<tensorplay::BFloat16, float, false, Op>(
+                    full, broadcast, result, alpha, op)
+                : try_binary_channel_broadcast_mixed_pair<tensorplay::BFloat16, float, true, Op>(
+                    full, broadcast, result, alpha, op);
+        }
         return left_full
             ? try_binary_channel_broadcast_pair<float, false, Op>(
                 full, broadcast, result, alpha, op)
@@ -380,6 +468,13 @@ bool try_binary_channel_broadcast(
                 full, broadcast, result, alpha, op);
     }
     if (broadcast.dtype() == DType::Float16) {
+        if (full.dtype() == DType::Float16 && result.dtype() == DType::Float16) {
+            return left_full
+                ? try_binary_channel_broadcast_mixed_pair<tensorplay::Half, tensorplay::Half, false, Op>(
+                    full, broadcast, result, alpha, op)
+                : try_binary_channel_broadcast_mixed_pair<tensorplay::Half, tensorplay::Half, true, Op>(
+                    full, broadcast, result, alpha, op);
+        }
         return left_full
             ? try_binary_channel_broadcast_pair<tensorplay::Half, false, Op>(
                 full, broadcast, result, alpha, op)
@@ -387,6 +482,13 @@ bool try_binary_channel_broadcast(
                 full, broadcast, result, alpha, op);
     }
     if (broadcast.dtype() == DType::BFloat16) {
+        if (full.dtype() == DType::BFloat16 && result.dtype() == DType::BFloat16) {
+            return left_full
+                ? try_binary_channel_broadcast_mixed_pair<tensorplay::BFloat16, tensorplay::BFloat16, false, Op>(
+                    full, broadcast, result, alpha, op)
+                : try_binary_channel_broadcast_mixed_pair<tensorplay::BFloat16, tensorplay::BFloat16, true, Op>(
+                    full, broadcast, result, alpha, op);
+        }
         return left_full
             ? try_binary_channel_broadcast_pair<tensorplay::BFloat16, false, Op>(
                 full, broadcast, result, alpha, op)
@@ -1144,6 +1246,11 @@ Tensor& add_out_kernel(const Tensor& self, const Tensor& other, const Scalar& al
     const std::vector<int64_t> out_shape = broadcast_shapes(
         static_cast<std::vector<int64_t>>(self.shape()),
         static_cast<std::vector<int64_t>>(other.shape()));
+    if (alpha.to<double>() == 1.0 &&
+        try_binary_channel_broadcast(
+            self, other, out, alpha.to<float>(), BinaryAddVecOp{})) {
+        return out;
+    }
     if (try_add_out_direct(self, other, alpha, out_shape, result_dtype, out)) {
         return out;
     }
@@ -1246,6 +1353,11 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, const Scalar& alph
     if (n == 0) return self;
 
     if (other.device().type() == DeviceType::CUDA) {
+        if (alpha.to<double>() == 1.0 &&
+            try_binary_channel_broadcast(
+                self, other, self, alpha.to<float>(), BinaryAddVecOp{})) {
+            return self;
+        }
         // For inplace, we cast other to self.dtype()
         Tensor b = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
 
@@ -1282,6 +1394,12 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, const Scalar& alph
         CUDA_CHECK(cudaGetLastError());
     }
     return self;
+}
+
+bool add_channel_broadcast_inplace_cuda(Tensor& self, const Tensor& other) {
+    return self.device().is_cuda() && other.device().is_cuda() &&
+           try_binary_channel_broadcast(
+               self, other, self, 1.0f, BinaryAddVecOp{});
 }
 
 // SUB
