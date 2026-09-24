@@ -157,19 +157,25 @@ __global__ void upsample_nearest2d_out_frame(
     const int64_t nc, const int64_t height1, const int64_t width1,
     const int64_t height2, const int64_t width2,
     float height_scale, float width_scale) {
-    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index >= nc * height2 * width2) return;
+    const int64_t w2 = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t h2 = static_cast<int64_t>(blockIdx.y) * blockDim.y + threadIdx.y;
+    if (w2 >= width2 || h2 >= height2) return;
 
-    const int64_t w2 = index % width2;
-    const int64_t h2 = (index / width2) % height2;
-    const int64_t n_c = index / (height2 * width2);
-
-    const int h1 = height1 == height2 ? static_cast<int>(h2)
-                                      : nearest_neighbor_compute_source_index(height_scale, static_cast<int>(h2), static_cast<int>(height1));
-    const int w1 = width1 == width2 ? static_cast<int>(w2)
-                                    : nearest_neighbor_compute_source_index(width_scale, static_cast<int>(w2), static_cast<int>(width1));
-
-    odata[index] = idata[(n_c * height1 + h1) * width1 + w1];
+    const int h1 = height1 == height2
+        ? static_cast<int>(h2)
+        : nearest_neighbor_compute_source_index(
+              height_scale, static_cast<int>(h2), static_cast<int>(height1));
+    const int w1 = width1 == width2
+        ? static_cast<int>(w2)
+        : nearest_neighbor_compute_source_index(
+              width_scale, static_cast<int>(w2), static_cast<int>(width1));
+    const int64_t nc_start =
+        static_cast<int64_t>(blockIdx.z) * blockDim.z + threadIdx.z;
+    const int64_t nc_stride = static_cast<int64_t>(blockDim.z) * gridDim.z;
+    for (int64_t n_c = nc_start; n_c < nc; n_c += nc_stride) {
+        odata[(n_c * height2 + h2) * width2 + w2] =
+            idata[(n_c * height1 + h1) * width1 + w1];
+    }
 }
 
 template <typename scalar_t>
@@ -684,9 +690,21 @@ Tensor upsample_nearest2d_cuda(const Tensor& self, const std::vector<int64_t>& o
     const int64_t H1 = in.size(2), W1 = in.size(3);
     const int64_t H2 = output_size[0], W2 = output_size[1];
     if (in.numel() == 0 || H2 == 0 || W2 == 0) return result;
+    if (H1 == H2 && W1 == W2) {
+        result.copy_(in);
+        return result;
+    }
     UP_DISPATCH(in, {
-        dim3 block, grid;
-        launch_dims(N * C * H2 * W2, block, grid);
+        const unsigned block_x = static_cast<unsigned>(
+            std::min<int64_t>(32, std::max<int64_t>(1, W2)));
+        const unsigned block_y = static_cast<unsigned>(
+            std::min<int64_t>(8, std::max<int64_t>(1, H2)));
+        const unsigned grid_x = static_cast<unsigned>((W2 + block_x - 1) / block_x);
+        const unsigned grid_y = static_cast<unsigned>((H2 + block_y - 1) / block_y);
+        const unsigned grid_z = static_cast<unsigned>(std::min<int64_t>(
+            65535, N * C));
+        dim3 block(block_x, block_y, 1);
+        dim3 grid(grid_x, grid_y, grid_z);
         upsample_nearest2d_out_frame<scalar_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
             in.data_ptr<scalar_t>(), result.data_ptr<scalar_t>(), N * C, H1, W1, H2, W2,
             compute_scales_value_h(scales_h, H1, H2), compute_scales_value_h(scales_w, W1, W2));
