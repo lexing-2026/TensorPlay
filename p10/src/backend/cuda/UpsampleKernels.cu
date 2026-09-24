@@ -214,6 +214,34 @@ __global__ void upsample_nearest2d_integer_scale_backward_out_frame(
     grad_i[index] = static_cast<scalar_t>(grad);
 }
 
+template <typename accscalar_t, typename scalar_t>
+__global__ void upsample_nearest2d_rational_backward_out_frame(
+    const scalar_t* __restrict__ grad_o, const int64_t dim_b, const int64_t dim_c,
+    const int64_t src_dim_h, const int64_t src_dim_w,
+    const int64_t dst_dim_h, const int64_t dst_dim_w,
+    scalar_t* __restrict__ grad_i) {
+    const int64_t spatial = src_dim_h * src_dim_w;
+    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= dim_b * dim_c * spatial) return;
+    const int64_t nc = index / spatial;
+    const int64_t rem = index % spatial;
+    const int64_t src_h = rem / src_dim_w;
+    const int64_t src_w = rem % src_dim_w;
+    const int64_t dst_h_begin = (src_h * dst_dim_h + src_dim_h - 1) / src_dim_h;
+    const int64_t dst_h_end = std::min(
+        dst_dim_h, ((src_h + 1) * dst_dim_h + src_dim_h - 1) / src_dim_h);
+    const int64_t dst_w_begin = (src_w * dst_dim_w + src_dim_w - 1) / src_dim_w;
+    const int64_t dst_w_end = std::min(
+        dst_dim_w, ((src_w + 1) * dst_dim_w + src_dim_w - 1) / src_dim_w);
+    accscalar_t grad = 0;
+    for (int64_t dst_h = dst_h_begin; dst_h < dst_h_end; ++dst_h) {
+        for (int64_t dst_w = dst_w_begin; dst_w < dst_w_end; ++dst_w) {
+            grad += grad_o[(nc * dst_dim_h + dst_h) * dst_dim_w + dst_w];
+        }
+    }
+    grad_i[index] = static_cast<scalar_t>(grad);
+}
+
 template <typename scalar_t>
 __global__ void upsample_nearest2d_out_frame(
     const scalar_t* idata, scalar_t* odata,
@@ -895,6 +923,19 @@ Tensor upsample_nearest2d_backward_cuda(const Tensor& grad_output, const std::ve
                 CUDA_CHECK(cudaGetLastError());
                 return grad_input;
             }
+        }
+        if (H2 >= H1 && W2 >= W1 &&
+            integer_scale_matches(scales_h, H1, H2) &&
+            integer_scale_matches(scales_w, W1, W2) &&
+            (H2 > H1 || W2 > W1)) {
+            dim3 block, grid;
+            launch_dims(dim_b * dim_c * H1 * W1, block, grid);
+            upsample_nearest2d_rational_backward_out_frame<accscalar_t, scalar_t>
+                <<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+                    go.data_ptr<scalar_t>(), dim_b, dim_c, H1, W1, H2, W2,
+                    grad_input.data_ptr<scalar_t>());
+            CUDA_CHECK(cudaGetLastError());
+            return grad_input;
         }
         dim3 block, grid;
         launch_dims(dim_c * H1 * W1, block, grid);
