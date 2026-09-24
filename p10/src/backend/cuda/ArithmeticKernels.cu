@@ -372,6 +372,13 @@ bool try_binary_channel_broadcast(
     if (left_full == right_full) return false;
     const Tensor& full = left_full ? left : right;
     const Tensor& broadcast = left_full ? right : left;
+    if (broadcast.dtype() == DType::Float32) {
+        return left_full
+            ? try_binary_channel_broadcast_pair<float, false, Op>(
+                full, broadcast, result, alpha, op)
+            : try_binary_channel_broadcast_pair<float, true, Op>(
+                full, broadcast, result, alpha, op);
+    }
     if (broadcast.dtype() == DType::Float16) {
         return left_full
             ? try_binary_channel_broadcast_pair<tensorplay::Half, false, Op>(
@@ -531,7 +538,7 @@ template <typename T, typename Op>
 inline bool launch_binary_vec(
     int64_t n, const Tensor& a, const Tensor& b, Tensor& y,
     typename BinaryOpMath<T>::type alpha, Op op, cudaStream_t stream) {
-    constexpr int kVec = 4;
+    constexpr int kVec = 8;
     const T* pa = a.data_ptr<T>();
     const T* pb = b.data_ptr<T>();
     T* py = y.data_ptr<T>();
