@@ -117,17 +117,33 @@ Tensor execute_fused_pointwise_cpu(
         }
     }
     // Route by operand device: the program semantics are identical on both
-    // sides; only the evaluator differs.  The CUDA evaluator stores the
-    // converted value inside the kernel; the CPU evaluator is float-only,
-    // so a requested override converts after the run.
+    // sides; only the evaluator differs.  The CUDA evaluator loads each
+    // input at its own element width and stores the converted value inside
+    // the kernel; the CPU evaluator is float-only, so operands narrower or
+    // wider than float32 are widened once up front and a requested output
+    // override converts after the run.
     if (operands.front().device().is_cuda()) {
         return cuda::stax_fused_pointwise_cuda(operands, *program_ptr,
                                                *constants_ptr, out_dtype);
     }
-    Tensor out = cpu::stax_fused_pointwise_cpu(operands, *program_ptr,
-                                               *constants_ptr);
-    if (out_dtype >= 0 &&
-        static_cast<DType>(out_dtype) != operands.front().dtype()) {
+    std::vector<Tensor> float_operands;
+    const std::vector<Tensor>* evaluator_operands = &operands;
+    for (const Tensor& operand : operands) {
+        if (operand.dtype() != DType::Float32) {
+            float_operands.reserve(operands.size());
+            for (const Tensor& item : operands) {
+                float_operands.push_back(
+                    item.dtype() == DType::Float32
+                        ? item
+                        : item.to(DType::Float32));
+            }
+            evaluator_operands = &float_operands;
+            break;
+        }
+    }
+    Tensor out = cpu::stax_fused_pointwise_cpu(*evaluator_operands,
+                                               *program_ptr, *constants_ptr);
+    if (out_dtype >= 0 && static_cast<DType>(out_dtype) != DType::Float32) {
         out = out.to(static_cast<DType>(out_dtype));
     }
     return out;
@@ -1098,6 +1114,33 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                 value(node.inputs[0]),
                 value(node.inputs[1]),
                 *scalar_attr(node, "threshold"));
+        } else if (node.op_type == "convolution_backward") {
+            if (node.inputs.size() != 3 || node.outputs.size() != 3) {
+                throw std::runtime_error(
+                    "Stax convolution_backward expects three inputs and outputs");
+            }
+            const auto mask = required_int_list_attr(node, "output_mask");
+            if (mask.size() != 3) {
+                throw std::runtime_error(
+                    "Stax convolution_backward output_mask must have three entries");
+            }
+            std::vector<bool> output_mask;
+            output_mask.reserve(mask.size());
+            for (int64_t item : mask) output_mask.push_back(item != 0);
+            const auto stride = required_int_list_attr(node, "stride");
+            const auto padding = required_int_list_attr(node, "padding");
+            const auto dilation = required_int_list_attr(node, "dilation");
+            const auto output_padding = required_int_list_attr(node, "output_padding");
+            const bool transposed = required_int_attr(node, "transposed") != 0;
+            const int64_t groups = required_int_attr(node, "groups");
+            auto backward = tpx::ops::convolution_backward(
+                value(node.inputs[0]), value(node.inputs[1]), value(node.inputs[2]),
+                std::nullopt, stride, padding, dilation, transposed, output_padding,
+                groups, output_mask);
+            env[node.outputs[0]->id] = std::get<0>(backward);
+            env[node.outputs[1]->id] = std::get<1>(backward);
+            env[node.outputs[2]->id] = std::get<2>(backward);
+            return;
         } else if (node.op_type == "conv2d_grad_input" ||
                    node.op_type == "conv2d_grad_weight" ||
                    node.op_type == "conv2d_grad_bias") {
@@ -1585,17 +1628,33 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                         operands, *program_ptr, *constants_ptr, *refs_ptr,
                         dtypes_ptr == nullptr ? empty_dtypes : *dtypes_ptr);
                 } else {
+                    // The CPU evaluator is float-only: widen mixed-width
+                    // operands up front and apply any requested output dtype
+                    // after the run so both devices agree on the element
+                    // type of every result.
+                    std::vector<Tensor> float_operands;
+                    const std::vector<Tensor>* evaluator_operands = &operands;
+                    for (const Tensor& operand : operands) {
+                        if (operand.dtype() != DType::Float32) {
+                            float_operands.reserve(operands.size());
+                            for (const Tensor& item : operands) {
+                                float_operands.push_back(
+                                    item.dtype() == DType::Float32
+                                        ? item
+                                        : item.to(DType::Float32));
+                            }
+                            evaluator_operands = &float_operands;
+                            break;
+                        }
+                    }
                     results = cpu::stax_fused_pointwise_cpu_multi(
-                        operands, *program_ptr, *constants_ptr, *refs_ptr);
-                    // The CPU evaluator is float-only: apply any requested
-                    // output dtype after the run so both devices agree on
-                    // the element type of every result.
+                        *evaluator_operands, *program_ptr, *constants_ptr,
+                        *refs_ptr);
                     if (dtypes_ptr != nullptr) {
-                        const DType input_dtype = operands.front().dtype();
                         for (size_t o = 0; o < results.size(); ++o) {
                             const int64_t code = (*dtypes_ptr)[o];
                             if (code >= 0 &&
-                                static_cast<DType>(code) != input_dtype) {
+                                static_cast<DType>(code) != DType::Float32) {
                                 results[o] =
                                     results[o].to(static_cast<DType>(code));
                             }

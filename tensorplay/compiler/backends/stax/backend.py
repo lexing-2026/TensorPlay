@@ -5815,10 +5815,12 @@ class _AotNativeSymbol:
 
 
 class _AotNativeTuple:
-    __slots__ = ("values",)
+    __slots__ = ("values", "node", "mask")
 
     def __init__(self, values: tuple[_AotNativeSymbol, ...]):
         self.values = values
+        self.node = None
+        self.mask = None
 
 
 # Opcodes the elementwise program buffer can absorb, sharing the numeric
@@ -5869,6 +5871,34 @@ _AUTOCAST_GEMM_OPS = {
 # its float-domain value independently of the program inputs, and a type
 # edge rides the producer kernel instead of a separate pass.
 _FUSED_OUT_DTYPE_CODES = {"float32": 8, "float64": 9, "float16": 10, "bfloat16": 11}
+
+_DTYPE_WIDTHS = {"float16": 2, "bfloat16": 2, "float32": 4, "float64": 8}
+
+
+def _dtype_width(dtype: Any) -> int:
+    """Byte width of a floating element type; unknown types rank as float32."""
+    return _DTYPE_WIDTHS.get(str(dtype).rsplit(".", 1)[-1].lower(), 4)
+
+
+# Pointwise compute nodes whose derivative expressions are pure arithmetic:
+# a gradient edge towards one of them that only widens its element type can
+# stay narrow, because the consuming formulas widen operands to a common
+# arithmetic width themselves and no separate conversion pass is needed.
+_DEFERRABLE_PROMOTION_OPS = frozenset({
+    "add", "sub", "mul", "div", "truediv", "neg", "pos", "exp", "log",
+    "sqrt", "rsqrt", "exp2", "erf", "square", "abs", "sigmoid", "tanh",
+    "relu", "silu", "pow", "clamp", "minimum", "maximum", "dropout",
+    "where", "lt", "le", "gt", "ge", "eq", "ne",
+})
+
+
+def _adjoint_promotion_deferrable(target: Node, from_dtype: Any,
+                                  to_dtype: Any) -> bool:
+    if target.op != "call_function":
+        return False
+    if _target_name(target.target) not in _DEFERRABLE_PROMOTION_OPS:
+        return False
+    return _dtype_width(from_dtype) < _dtype_width(to_dtype)
 
 
 class _AotFusedSpec:
@@ -5972,9 +6002,23 @@ class _AotNativeGraphBuilder:
         if entry is not None:
             spec, index = entry
             del self._fused_pending[id(symbol)]
-            self._emit_program(spec.ops, spec.temps, [index])
+            self._emit_program(spec.ops, spec.temps, [index], spec.out_dtypes)
             return
         raise RuntimeError("AOT elementwise buffer lost a temporary symbol")
+
+    def _promote_fused_dtype(self, dtype: Any) -> None:
+        """Widen the program's result element type to a wider operand.
+
+        Buffered results already carry the previous width in their symbols;
+        they hold no data yet, so retargeting the symbols keeps every later
+        consumer reading the true stored type.  Results an explicit store
+        override has claimed keep their claimed width.
+        """
+        previous = self._fused_dtype
+        self._fused_dtype = dtype
+        for symbol in self._fused_temp_symbols.values():
+            if symbol.dtype == previous:
+                symbol.dtype = dtype
 
     def _fused_append(
         self, opcode: int, lhs: tuple[str, Any], rhs: tuple[str, Any]
@@ -6030,15 +6074,23 @@ class _AotNativeGraphBuilder:
                 # A spilled temp can join this buffer once it is revived as
                 # a real input value.
                 self._materialize(value)
-        # The fused evaluators read one uniform input block: a symbol whose
-        # element type differs from the buffered program stays on the native
-        # path, which promotes per element type.
+        # The fused evaluator widens every input to one arithmetic width on
+        # load, so operands of different storage sizes share a program as
+        # long as they stay in the same precision family; float64 runs its
+        # own family because the arithmetic width follows the widest operand.
+        # A wider operand promotes the element type of every program result.
         for kind, value in operands:
             if kind == "sym" and value.dtype is not None:
                 if self._fused_dtype is None:
                     self._fused_dtype = value.dtype
-                elif value.dtype != self._fused_dtype:
-                    return None
+                else:
+                    names = {str(value.dtype), str(self._fused_dtype)}
+                    if sum("float64" in name for name in names) == 1:
+                        return None
+                    if _dtype_width(value.dtype) > _dtype_width(
+                        self._fused_dtype
+                    ):
+                        self._promote_fused_dtype(value.dtype)
         if self._fused_shape is None:
             self._fused_shape = shape
         elif shape != self._fused_shape:
@@ -6060,6 +6112,7 @@ class _AotNativeGraphBuilder:
         ops = self._fused_ops
         temp_pos = self._fused_temp_pos
         temp_symbols = self._fused_temp_symbols
+        promoted = self._fused_dtype
         self._fused_ops = []
         self._fused_temp_pos = {}
         self._fused_temp_symbols = {}
@@ -6070,10 +6123,12 @@ class _AotNativeGraphBuilder:
             temp_symbols[temp_id]
             for temp_id, _ in sorted(temp_pos.items(), key=lambda kv: kv[1])
         )
+        # Every result names its stored element type: unclaimed temps take
+        # the program's promoted width, so a program mixing input widths
+        # never depends on the first input's storage type as a default.
         out_dtypes = {
-            temp_pos[temp_id]: dtype
-            for temp_id, dtype in self._fused_out_dtypes.items()
-            if temp_id in temp_pos
+            temp_pos[temp_id]: self._fused_out_dtypes.get(temp_id, promoted)
+            for temp_id in temp_pos
         }
         self._fused_out_dtypes = {}
         spec = _AotFusedSpec(tuple(ops), temps, out_dtypes)
@@ -6320,7 +6375,7 @@ class _AotNativeGraphBuilder:
             )
             result.dtype = args[0].dtype if args else None
             return result
-        return _AotNativeTuple(
+        result = _AotNativeTuple(
             tuple(
                 _AotNativeSymbol(
                     self,
@@ -6333,6 +6388,8 @@ class _AotNativeGraphBuilder:
                 for index in range(outputs)
             )
         )
+        result.node = native_node
+        return result
 
     def reshape(self, value: _AotNativeSymbol, shape: Any) -> _AotNativeSymbol:
         normalized = tuple(int(item) for item in shape)
@@ -6359,7 +6416,7 @@ class _AotNativeGraphBuilder:
             # storage type can still be retargeted, so the producer stores
             # the converted value directly and no conversion node exists.
             if index is not None:
-                current = self._fused_out_dtypes.get(id(value))
+                current = self._fused_out_dtypes.get(id(value), value.dtype)
             else:
                 spec, index = pending
                 current = spec.out_dtypes.get(index)
@@ -6538,6 +6595,10 @@ def _aot_formula_python(formula: str, tensor_params: set[str]) -> str:
         if isinstance(expr, StrLit):
             return expr.text
         if isinstance(expr, Var):
+            if expr.name in {"true", "false"}:
+                return "True" if expr.name == "true" else "False"
+            if expr.name in {"std::nullopt", "c10::nullopt"}:
+                return "None"
             return expr.name
         if isinstance(expr, Neg):
             inner = emit(expr.value)
@@ -6554,6 +6615,8 @@ def _aot_formula_python(formula: str, tensor_params: set[str]) -> str:
             get = re.fullmatch(r"std::get<(\d+)>", expr.callee)
             if get:
                 return f"get_tuple({get.group(1)}, {args})"
+            if expr.callee in {"std::nullopt", "c10::nullopt"}:
+                return "None"
             callee = expr.callee.split("::")[-1]
             return f"{callee}({args})"
         if isinstance(expr, Method):
@@ -6595,6 +6658,8 @@ def _build_aot_formula_env(
     tuple_op_cache: dict[tuple[int, ...], _AotNativeTuple],
     autocast_state: dict[str, Any],
 ) -> dict[str, Any]:
+    import tensorplay
+
     def binary(name: str):
         return lambda lhs, rhs: builder.binary(name, lhs, rhs)
 
@@ -6659,6 +6724,13 @@ def _build_aot_formula_env(
     def group_norm_backward(
         grad, input_value, num_groups, weight=None, bias=None, eps=1e-5
     ):
+        # The kernel accumulates in float32 and reads a float32 gradient;
+        # a narrower gradient widens once at this kernel boundary instead of
+        # on every upstream gradient edge.
+        if grad.dtype is not None and _dtype_width(grad.dtype) < _dtype_width(
+            tensorplay.float32
+        ):
+            grad = builder.cast(grad, tensorplay.float32)
         tensor_args = [grad, input_value]
         has_weight = weight is not None
         has_bias = bias is not None
@@ -6715,35 +6787,75 @@ def _build_aot_formula_env(
         tuple_op_cache[key_tuple] = result
         return result
 
-    def conv_grad(name: str):
-        def invoke(grad, input_value, weight, stride, padding, dilation, groups):
-            # Bias accumulation keeps the parameter dtype while consuming
-            # reduced precision activations.  The CUDA reduction already
-            # supports this mixed-width path, so do not materialize a reduced
-            # bias result only to widen it at the adjoint boundary.
-            weight_arg = weight if name.endswith("bias") else _narrow(weight)
-            result = builder.helper(
-                name,
-                (_narrow(grad), _narrow(input_value), weight_arg),
-                attrs={
-                    "stride": tuple(stride),
-                    "padding": tuple(padding),
-                    "dilation": tuple(dilation),
-                    "groups": int(groups),
-                },
-                shape=(
-                    input_value.shape
-                    if name.endswith("input")
-                    else weight.shape
-                    if name.endswith("weight")
-                    else (grad.shape[1],)
-                ),
+    def convolution_backward(
+        grad,
+        input_value,
+        weight,
+        bias_sizes,
+        stride,
+        padding,
+        dilation,
+        transposed,
+        output_padding,
+        groups,
+        output_mask,
+    ):
+        del bias_sizes
+        mask = tuple(bool(item) for item in output_mask)
+        if len(mask) != 3:
+            raise ValueError("convolution_backward output_mask must have three entries")
+        key = _shared_tuple_key(
+            (
+                grad,
+                input_value,
+                weight,
+                tuple(stride),
+                tuple(padding),
+                tuple(dilation),
+                bool(transposed),
+                tuple(output_padding),
+                int(groups),
             )
-            if name.endswith("bias") and isinstance(result, _AotNativeSymbol):
-                result.dtype = weight.dtype
-            return result
-
-        return invoke
+        )
+        cached = tuple_op_cache.get(key)
+        if cached is not None:
+            if cached.node is not None and cached.mask is not None:
+                merged = tuple(left or right for left, right in zip(cached.mask, mask))
+                if merged != cached.mask:
+                    cached.node.set_ints_attr("output_mask", [int(item) for item in merged])
+                    cached.mask = merged
+            return cached
+        narrowed = (_narrow(grad), _narrow(input_value), _narrow(weight))
+        bias_shape = (
+            (int(weight.shape[1]) * int(groups),)
+            if bool(transposed)
+            else (int(weight.shape[0]),)
+        )
+        result = builder.helper(
+            "convolution_backward",
+            narrowed,
+            attrs={
+                "stride": tuple(int(item) for item in stride),
+                "padding": tuple(int(item) for item in padding),
+                "dilation": tuple(int(item) for item in dilation),
+                "transposed": bool(transposed),
+                "output_padding": tuple(int(item) for item in output_padding),
+                "groups": int(groups),
+                "output_mask": tuple(int(item) for item in mask),
+            },
+            shape=input_value.shape,
+            outputs=3,
+            output_shapes=(
+                tuple(input_value.shape),
+                tuple(weight.shape),
+                bias_shape,
+            ),
+        )
+        if not isinstance(result, _AotNativeTuple):
+            raise TypeError("convolution_backward did not produce three outputs")
+        result.mask = mask
+        tuple_op_cache[key] = result
+        return result
 
     def max_pool_backward(grad, input_value, kernel_size, stride, padding, dilation, ceil_mode):
         values = tuple(kernel_size) if isinstance(kernel_size, (tuple, list)) else (kernel_size,)
@@ -6953,9 +7065,7 @@ def _build_aot_formula_env(
         "batch_norm_backward": batch_norm_backward,
         "group_norm_backward": group_norm_backward,
         "scaled_dot_product_attention_backward": scaled_dot_product_attention_backward,
-        "conv2d_grad_input": conv_grad("conv2d_grad_input"),
-        "conv2d_grad_weight": conv_grad("conv2d_grad_weight"),
-        "conv2d_grad_bias": conv_grad("conv2d_grad_bias"),
+        "convolution_backward": convolution_backward,
         "max_pool2d_backward": max_pool_backward,
         "max_pool1d_backward": max_pool_backward,
         "max_pool3d_backward": max_pool_backward,
@@ -7134,7 +7244,10 @@ def _build_aot_backward(
         # Gradient edges carry the forward output's element type: a formula
         # contribution computed in a promoted type is narrowed here so the
         # consuming formulas see the same element widths the captured graph
-        # executed with.
+        # executed with.  A pure widening on a pointwise edge is exempt: the
+        # consuming formulas widen operands to one arithmetic width anyway,
+        # so keeping the narrower storage skips a conversion pass without
+        # changing any computed value.
         target_dtype = None
         if target_value is not None and hasattr(target_value, "dtype"):
             target_dtype = target_value.dtype
@@ -7153,6 +7266,9 @@ def _build_aot_backward(
             target_dtype is not None
             and contribution.dtype is not None
             and contribution.dtype != target_dtype
+            and not _adjoint_promotion_deferrable(
+                target, contribution.dtype, target_dtype
+            )
         ):
             contribution = builder.cast(contribution, target_dtype)
         return _aot_add_adjoint(builder, adjoints, target, contribution)

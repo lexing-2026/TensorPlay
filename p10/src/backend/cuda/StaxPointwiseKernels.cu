@@ -88,13 +88,15 @@ __device__ void store_typed(uint8_t kind, void* ptr, int64_t index,
 // One thread evaluates the full program for one element.  Operands resolve
 // through a device-resident pointer table (inputs) and a per-thread
 // temporary pool (instruction results); constants ride a flat buffer.
-// `io_t` selects the storage format, `compute_t` the arithmetic type; the
-// only supported widening is half/bfloat16 storage with float arithmetic.
-template <typename io_t, typename compute_t, bool Flat>
+// Each input carries its own storage kind and widens to `compute_t` on
+// load, so a single program can mix element widths without a separate
+// conversion pass.
+template <typename compute_t, bool Flat>
 struct ProgramState {
     const Instruction* instructions;
     const compute_t* constants;
-    const io_t* const* input_ptrs;
+    const void* const* input_ptrs;
+    const uint8_t* input_kinds;
     const int64_t* input_sizes;
     const int64_t* input_strides;
     const int64_t* output_sizes;
@@ -104,8 +106,23 @@ struct ProgramState {
     int64_t instruction_count;
     int64_t rank;
 
-    __device__ compute_t load_io(const io_t& v) const {
-        return static_cast<compute_t>(v);
+    __device__ compute_t load_typed(uint8_t kind, const void* ptr,
+                                    int64_t index) const {
+        switch (kind) {
+            case kOutF32:
+                return static_cast<compute_t>(
+                    static_cast<const float*>(ptr)[index]);
+            case kOutF64:
+                return static_cast<compute_t>(
+                    static_cast<const double*>(ptr)[index]);
+            case kOutF16:
+                return static_cast<compute_t>(
+                    static_cast<const tensorplay::Half*>(ptr)[index]);
+            case kOutBF16:
+                return static_cast<compute_t>(
+                    static_cast<const tensorplay::BFloat16*>(ptr)[index]);
+        }
+        return compute_t(0);
     }
 
     __device__ compute_t resolve(int64_t ref, const compute_t* local_temps,
@@ -113,7 +130,8 @@ struct ProgramState {
         if (ref >= 0) {
             if (ref < input_count) {
                 if constexpr (Flat) {
-                    return load_io(input_ptrs[ref][element]);
+                    return load_typed(input_kinds[ref], input_ptrs[ref],
+                                      element);
                 } else {
                     int64_t offset = element;
                     if (!input_flat[ref]) {
@@ -129,7 +147,8 @@ struct ProgramState {
                             }
                         }
                     }
-                    return load_io(input_ptrs[ref][offset]);
+                    return load_typed(input_kinds[ref], input_ptrs[ref],
+                                      offset);
                 }
             }
             return local_temps[ref - input_count];
@@ -253,9 +272,9 @@ struct ProgramState {
     }
 };
 
-template <typename io_t, typename compute_t, bool Flat, int kTemps>
+template <typename compute_t, bool Flat, int kTemps>
 __global__ void stax_fused_pointwise_kernel(
-    ProgramState<io_t, compute_t, Flat> state,
+    ProgramState<compute_t, Flat> state,
     void* output,
     uint8_t out_kind,
     int64_t count) {
@@ -270,9 +289,9 @@ __global__ void stax_fused_pointwise_kernel(
     }
 }
 
-template <typename io_t, typename compute_t, bool Flat, int kTemps>
+template <typename compute_t, bool Flat, int kTemps>
 __global__ void stax_fused_pointwise_multi_kernel(
-    ProgramState<io_t, compute_t, Flat> state,
+    ProgramState<compute_t, Flat> state,
     void* const* temp_outputs,
     const uint8_t* out_kinds,
     const int64_t* temp_refs,
@@ -291,9 +310,9 @@ __global__ void stax_fused_pointwise_multi_kernel(
     }
 }
 
-template <int kTemps, typename io_t, typename compute_t, bool Flat>
+template <int kTemps, typename compute_t, bool Flat>
 void launch_program(
-    const ProgramState<io_t, compute_t, Flat>& state,
+    const ProgramState<compute_t, Flat>& state,
     void* output,
     uint8_t out_kind,
     void* const* temp_outputs,
@@ -305,10 +324,10 @@ void launch_program(
     const int threads = 256;
     const int blocks = static_cast<int>((count + threads - 1) / threads);
     if (output != nullptr) {
-        stax_fused_pointwise_kernel<io_t, compute_t, Flat, kTemps>
+        stax_fused_pointwise_kernel<compute_t, Flat, kTemps>
             <<<blocks, threads, 0, stream>>>(state, output, out_kind, count);
     } else {
-        stax_fused_pointwise_multi_kernel<io_t, compute_t, Flat, kTemps>
+        stax_fused_pointwise_multi_kernel<compute_t, Flat, kTemps>
             <<<blocks, threads, 0, stream>>>(
                 state, temp_outputs, out_kinds, temp_refs, temp_output_count,
                 count);
@@ -316,9 +335,9 @@ void launch_program(
     checkCuda(cudaGetLastError(), "stax fused pointwise launch");
 }
 
-template <typename io_t, typename compute_t, bool Flat>
+template <typename compute_t, bool Flat>
 void dispatch_program_launch(
-    const ProgramState<io_t, compute_t, Flat>& state,
+    const ProgramState<compute_t, Flat>& state,
     void* output,
     uint8_t out_kind,
     void* const* temp_outputs,
@@ -329,38 +348,38 @@ void dispatch_program_launch(
     cudaStream_t stream) {
     if (output != nullptr) {
         if (state.instruction_count <= 8) {
-            launch_program<8, io_t, compute_t, Flat>(
+            launch_program<8, compute_t, Flat>(
                 state, output, out_kind, nullptr, nullptr, nullptr, 0, count,
                 stream);
         } else if (state.instruction_count <= 16) {
-            launch_program<16, io_t, compute_t, Flat>(
+            launch_program<16, compute_t, Flat>(
                 state, output, out_kind, nullptr, nullptr, nullptr, 0, count,
                 stream);
         } else if (state.instruction_count <= 32) {
-            launch_program<32, io_t, compute_t, Flat>(
+            launch_program<32, compute_t, Flat>(
                 state, output, out_kind, nullptr, nullptr, nullptr, 0, count,
                 stream);
         } else {
-            launch_program<64, io_t, compute_t, Flat>(
+            launch_program<64, compute_t, Flat>(
                 state, output, out_kind, nullptr, nullptr, nullptr, 0, count,
                 stream);
         }
         return;
     }
     if (state.instruction_count <= 8) {
-        launch_program<8, io_t, compute_t, Flat>(
+        launch_program<8, compute_t, Flat>(
             state, nullptr, out_kind, temp_outputs, out_kinds, temp_refs,
             temp_output_count, count, stream);
     } else if (state.instruction_count <= 16) {
-        launch_program<16, io_t, compute_t, Flat>(
+        launch_program<16, compute_t, Flat>(
             state, nullptr, out_kind, temp_outputs, out_kinds, temp_refs,
             temp_output_count, count, stream);
     } else if (state.instruction_count <= 32) {
-        launch_program<32, io_t, compute_t, Flat>(
+        launch_program<32, compute_t, Flat>(
             state, nullptr, out_kind, temp_outputs, out_kinds, temp_refs,
             temp_output_count, count, stream);
     } else {
-        launch_program<64, io_t, compute_t, Flat>(
+        launch_program<64, compute_t, Flat>(
             state, nullptr, out_kind, temp_outputs, out_kinds, temp_refs,
             temp_output_count, count, stream);
     }
@@ -405,14 +424,20 @@ void check_program_shape(const std::vector<Tensor>& inputs,
         throw std::runtime_error(
             "Stax CUDA fused pointwise requires defined CUDA tensors");
     }
+    // Inputs may mix element widths within one precision family; float64
+    // runs its own family because the arithmetic width follows the widest
+    // operand and half storage cannot feed double arithmetic here.
+    const bool wide_family = first.dtype() == DType::Float64;
     for (const Tensor& input : inputs) {
         if (!input.defined() || !input.device().is_cuda()) {
             throw std::runtime_error(
                 "Stax CUDA fused pointwise requires defined CUDA tensors");
         }
-        if (input.dtype() != first.dtype()) {
+        const bool input_wide = input.dtype() == DType::Float64;
+        if (input_wide != wide_family) {
             throw std::runtime_error(
-                "Stax CUDA fused pointwise inputs must share one dtype");
+                "Stax CUDA fused pointwise inputs cannot mix float64 with "
+                "narrower element types");
         }
     }
     static_cast<void>(broadcast_shape(inputs));
@@ -422,7 +447,7 @@ Tensor byte_buffer(int64_t bytes, const Tensor& like) {
     return Tensor::empty({bytes > 0 ? bytes : 1}, DType::UInt8, like.device());
 }
 
-template <typename io_t, typename compute_t>
+template <typename compute_t>
 std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
                                 const std::vector<int64_t>& program,
                                 const std::vector<double>& constants,
@@ -485,10 +510,15 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
     }
     const auto out_dtype_at = [&](size_t temp_slot) -> DType {
         if (temp_to_out.empty()) {
+            if (out_dtypes != nullptr && !out_dtypes->empty() &&
+                (*out_dtypes)[0] >= 0) {
+                return static_cast<DType>((*out_dtypes)[0]);
+            }
             return in_dtype;
         }
-        return static_cast<DType>(
-            (*out_dtypes)[temp_to_out[static_cast<size_t>(temp_slot)]]);
+        const int64_t code =
+            (*out_dtypes)[temp_to_out[static_cast<size_t>(temp_slot)]];
+        return code >= 0 ? static_cast<DType>(code) : in_dtype;
     };
     for (size_t i = 0; i < temp_refs.size(); ++i) {
         temp_tensors.push_back(Tensor::empty(
@@ -508,10 +538,13 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
 
     // Device staging: pointer tables and program metadata are tiny; tensor
     // data itself is never copied.
-    std::vector<const io_t*> host_input_ptrs;
+    std::vector<const void*> host_input_ptrs;
+    std::vector<uint8_t> host_input_kinds;
     host_input_ptrs.reserve(inputs.size());
+    host_input_kinds.reserve(inputs.size());
     for (const Tensor& input : inputs) {
-        host_input_ptrs.push_back(input.data_ptr<io_t>());
+        host_input_ptrs.push_back(input.data_ptr());
+        host_input_kinds.push_back(encode_out_kind(input.dtype()));
     }
     std::vector<int64_t> host_input_sizes;
     std::vector<int64_t> host_input_strides;
@@ -565,14 +598,18 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
     const int64_t constants_bytes =
         static_cast<int64_t>(sizeof(compute_t) * constants.size());
     const int64_t input_pointer_bytes =
-        static_cast<int64_t>(sizeof(io_t*) * input_count);
+        static_cast<int64_t>(sizeof(void*) * input_count);
+    const int64_t input_kind_bytes =
+        static_cast<int64_t>(sizeof(uint8_t) * host_input_kinds.size());
     const auto align_program_offset = [](int64_t value) {
         return (value + 15) & ~int64_t(15);
     };
     const int64_t constants_offset = align_program_offset(instruction_bytes);
     const int64_t input_pointer_offset =
         align_program_offset(constants_offset + constants_bytes);
-    const int64_t program_bytes = input_pointer_offset + input_pointer_bytes;
+    const int64_t input_kinds_offset =
+        align_program_offset(input_pointer_offset + input_pointer_bytes);
+    const int64_t program_bytes = input_kinds_offset + input_kind_bytes;
     Tensor program_buf = byte_buffer(program_bytes, inputs.front());
     std::vector<uint8_t> host_program(static_cast<size_t>(program_bytes), 0);
     if (instruction_bytes > 0) {
@@ -585,6 +622,10 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
     if (input_pointer_bytes > 0) {
         std::memcpy(host_program.data() + input_pointer_offset,
                     host_input_ptrs.data(), input_pointer_bytes);
+    }
+    if (input_kind_bytes > 0) {
+        std::memcpy(host_program.data() + input_kinds_offset,
+                    host_input_kinds.data(), input_kind_bytes);
     }
     checkCuda(cudaMemcpyAsync(program_buf.data_ptr(), host_program.data(),
                                program_bytes, cudaMemcpyHostToDevice, stream),
@@ -676,12 +717,14 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
     }
 
     if (flat_inputs) {
-        ProgramState<io_t, compute_t, true> state;
+        ProgramState<compute_t, true> state;
         state.instructions =
             reinterpret_cast<const Instruction*>(program_ptr);
         state.constants = reinterpret_cast<const compute_t*>(program_ptr + constants_offset);
         state.input_ptrs =
-            reinterpret_cast<const io_t* const*>(program_ptr + input_pointer_offset);
+            reinterpret_cast<const void* const*>(program_ptr + input_pointer_offset);
+        state.input_kinds =
+            reinterpret_cast<const uint8_t*>(program_ptr + input_kinds_offset);
         state.input_sizes = nullptr;
         state.input_strides = nullptr;
         state.output_sizes = nullptr;
@@ -695,12 +738,14 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
             output_ref_ptr, static_cast<int64_t>(temp_refs.size()), count,
             stream);
     } else {
-        ProgramState<io_t, compute_t, false> state;
+        ProgramState<compute_t, false> state;
         state.instructions =
             reinterpret_cast<const Instruction*>(program_ptr);
         state.constants = reinterpret_cast<const compute_t*>(program_ptr + constants_offset);
         state.input_ptrs =
-            reinterpret_cast<const io_t* const*>(program_ptr + input_pointer_offset);
+            reinterpret_cast<const void* const*>(program_ptr + input_pointer_offset);
+        state.input_kinds =
+            reinterpret_cast<const uint8_t*>(program_ptr + input_kinds_offset);
         const uint8_t* metadata_ptr =
             reinterpret_cast<const uint8_t*>(metadata_buf.data_ptr());
         state.input_sizes = reinterpret_cast<const int64_t*>(
@@ -741,19 +786,19 @@ Tensor stax_fused_pointwise_cuda(
         kinds.push_back(out_dtype);
     }
     if (dt == DType::Float32) {
-        return run_program<float, float>(inputs, program, constants, nullptr,
+        return run_program<float>(inputs, program, constants, nullptr,
                                          kinds.empty() ? nullptr : &kinds)[0];
     }
     if (dt == DType::Float64) {
-        return run_program<double, double>(inputs, program, constants, nullptr,
+        return run_program<double>(inputs, program, constants, nullptr,
                                            kinds.empty() ? nullptr : &kinds)[0];
     }
     if (dt == DType::Float16) {
-        return run_program<tensorplay::Half, float>(inputs, program, constants, nullptr,
+        return run_program<float>(inputs, program, constants, nullptr,
                                                     kinds.empty() ? nullptr : &kinds)[0];
     }
     if (dt == DType::BFloat16) {
-        return run_program<tensorplay::BFloat16, float>(inputs, program, constants, nullptr,
+        return run_program<float>(inputs, program, constants, nullptr,
                                                         kinds.empty() ? nullptr : &kinds)[0];
     }
     throw std::runtime_error(
@@ -776,16 +821,16 @@ std::vector<Tensor> stax_fused_pointwise_cuda_multi(
     const std::vector<int64_t>* kinds =
         out_dtypes.empty() ? nullptr : &out_dtypes;
     if (dt == DType::Float32) {
-        return run_program<float, float>(inputs, program, constants, &output_refs, kinds);
+        return run_program<float>(inputs, program, constants, &output_refs, kinds);
     }
     if (dt == DType::Float64) {
-        return run_program<double, double>(inputs, program, constants, &output_refs, kinds);
+        return run_program<double>(inputs, program, constants, &output_refs, kinds);
     }
     if (dt == DType::Float16) {
-        return run_program<tensorplay::Half, float>(inputs, program, constants, &output_refs, kinds);
+        return run_program<float>(inputs, program, constants, &output_refs, kinds);
     }
     if (dt == DType::BFloat16) {
-        return run_program<tensorplay::BFloat16, float>(inputs, program, constants, &output_refs, kinds);
+        return run_program<float>(inputs, program, constants, &output_refs, kinds);
     }
     throw std::runtime_error(
         "Stax CUDA fused pointwise multi supports float16/bfloat16/float32/float64");
