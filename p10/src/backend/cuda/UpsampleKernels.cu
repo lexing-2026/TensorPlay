@@ -12,6 +12,7 @@
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include "Atomic.cuh"
 #include "OutWrite.h"
+#include <cmath>
 
 namespace tensorplay {
 namespace cuda {
@@ -43,6 +44,14 @@ inline float compute_scales_value_backwards_h(const std::optional<double>& scale
     return (scale.has_value() && scale.value() > 0.)
         ? static_cast<float>(scale.value())
         : static_cast<float>(static_cast<double>(src_size) / dst_size);
+}
+
+inline bool integer_scale_matches(const std::optional<double>& scale,
+                                  int64_t input_size, int64_t output_size) {
+    if (!scale.has_value() || output_size == 0) return true;
+    const double expected = static_cast<double>(input_size) / output_size;
+    return std::abs(scale.value() - expected) <=
+        1e-6 * std::max(1.0, std::abs(expected));
 }
 
 inline float area_pixel_compute_scale_h(int64_t input_size, int64_t output_size,
@@ -179,6 +188,30 @@ __global__ void upsample_nearest2d_integer_scale_kernel(
             odata[(n_c * height2 + h2) * width2 + w2 + k] = value;
         }
     }
+}
+
+template <typename accscalar_t, typename scalar_t, int ScaleH, int ScaleW>
+__global__ void upsample_nearest2d_integer_scale_backward_out_frame(
+    const scalar_t* __restrict__ grad_o, const int64_t dim_b, const int64_t dim_c,
+    const int64_t src_dim_h, const int64_t src_dim_w,
+    const int64_t dst_dim_h, const int64_t dst_dim_w,
+    scalar_t* __restrict__ grad_i) {
+    const int64_t spatial = src_dim_h * src_dim_w;
+    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= dim_b * dim_c * spatial) return;
+    const int64_t nc = index / spatial;
+    const int64_t rem = index % spatial;
+    const int64_t src_h = rem / src_dim_w;
+    const int64_t src_w = rem % src_dim_w;
+    accscalar_t grad = 0;
+    for (int64_t dh = 0; dh < ScaleH; ++dh) {
+        for (int64_t dw = 0; dw < ScaleW; ++dw) {
+            const int64_t dst_h = src_h * ScaleH + dh;
+            const int64_t dst_w = src_w * ScaleW + dw;
+            grad += grad_o[(nc * dst_dim_h + dst_h) * dst_dim_w + dst_w];
+        }
+    }
+    grad_i[index] = static_cast<scalar_t>(grad);
 }
 
 template <typename scalar_t>
@@ -727,6 +760,8 @@ Tensor upsample_nearest2d_cuda(const Tensor& self, const std::vector<int64_t>& o
         const int64_t scale_h = H2 / H1;
         const int64_t scale_w = W2 / W1;
         if (H2 % H1 == 0 && W2 % W1 == 0 &&
+            integer_scale_matches(scales_h, H1, H2) &&
+            integer_scale_matches(scales_w, W1, W2) &&
             scale_h >= 2 && scale_h <= 4 && scale_w >= 2 && scale_w <= 4) {
             auto launch_integer = [&]<int ScaleH, int ScaleW>() {
                 const unsigned block_x = static_cast<unsigned>(std::min<int64_t>(
@@ -829,6 +864,38 @@ Tensor upsample_nearest2d_backward_cuda(const Tensor& grad_output, const std::ve
     const int64_t H1 = input_size[2], W1 = input_size[3];
     if (go.numel() == 0 || H2 * W2 == 0 || H1 * W1 == 0) return grad_input;
     UP_NEAREST_DISPATCH(go, {
+        const int64_t scale_h = H2 / H1;
+        const int64_t scale_w = W2 / W1;
+        if (H2 % H1 == 0 && W2 % W1 == 0 &&
+            integer_scale_matches(scales_h, H1, H2) &&
+            integer_scale_matches(scales_w, W1, W2) &&
+            scale_h >= 2 && scale_h <= 4 && scale_w >= 2 && scale_w <= 4) {
+            auto launch_integer = [&]<int ScaleH, int ScaleW>() {
+                dim3 block, grid;
+                launch_dims(dim_b * dim_c * H1 * W1, block, grid);
+                upsample_nearest2d_integer_scale_backward_out_frame<accscalar_t, scalar_t, ScaleH, ScaleW>
+                    <<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+                        go.data_ptr<scalar_t>(), dim_b, dim_c, H1, W1, H2, W2,
+                        grad_input.data_ptr<scalar_t>());
+            };
+            bool launched = true;
+            switch (scale_h * 10 + scale_w) {
+                case 22: launch_integer.template operator()<2, 2>(); break;
+                case 23: launch_integer.template operator()<2, 3>(); break;
+                case 24: launch_integer.template operator()<2, 4>(); break;
+                case 32: launch_integer.template operator()<3, 2>(); break;
+                case 33: launch_integer.template operator()<3, 3>(); break;
+                case 34: launch_integer.template operator()<3, 4>(); break;
+                case 42: launch_integer.template operator()<4, 2>(); break;
+                case 43: launch_integer.template operator()<4, 3>(); break;
+                case 44: launch_integer.template operator()<4, 4>(); break;
+                default: launched = false; break;
+            }
+            if (launched) {
+                CUDA_CHECK(cudaGetLastError());
+                return grad_input;
+            }
+        }
         dim3 block, grid;
         launch_dims(dim_c * H1 * W1, block, grid);
         upsample_nearest2d_backward_out_frame<accscalar_t, scalar_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
