@@ -287,13 +287,13 @@ struct BinarySubVecOp { template <typename M> __device__ M operator()(M x, M y, 
 struct BinaryMulVecOp { template <typename M> __device__ M operator()(M x, M y, M) const { return x * y; } };
 struct BinaryDivVecOp { template <typename M> __device__ M operator()(M x, M y, M) const { return x / y; } };
 
-template <typename B, bool BroadcastFirst, typename Op>
-__global__ void binary_channel_broadcast_vec4_kernel(
+template <typename B, bool BroadcastFirst, typename Op, int VecSize>
+__global__ void binary_channel_broadcast_vec_kernel(
     int64_t inner, int64_t rows, int64_t channels,
     int64_t batch_stride, int64_t channel_stride, bool batch_repeated,
     const B* __restrict__ broadcast, const float* __restrict__ full,
     float* __restrict__ result, float alpha, Op op) {
-    const int64_t col = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
+    const int64_t col = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * VecSize;
     if (col >= inner) return;
     for (int64_t row = blockIdx.y; row < rows; row += gridDim.y) {
         const int64_t channel = row % channels;
@@ -301,27 +301,27 @@ __global__ void binary_channel_broadcast_vec4_kernel(
         const float b = static_cast<float>(
             broadcast[batch * batch_stride + channel * channel_stride]);
         const int64_t offset = row * inner + col;
-        const TPVecPack<float, 4> value =
-            *reinterpret_cast<const TPVecPack<float, 4>*>(full + offset);
-        TPVecPack<float, 4> output;
+        const TPVecPack<float, VecSize> value =
+            *reinterpret_cast<const TPVecPack<float, VecSize>*>(full + offset);
+        TPVecPack<float, VecSize> output;
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < VecSize; ++i) {
             output.v[i] = BroadcastFirst
                 ? op(b, value.v[i], alpha)
                 : op(value.v[i], b, alpha);
         }
-        *reinterpret_cast<TPVecPack<float, 4>*>(result + offset) = output;
+        *reinterpret_cast<TPVecPack<float, VecSize>*>(result + offset) = output;
     }
 }
 
-template <typename T, typename B, bool BroadcastFirst, typename Op>
-__global__ void binary_channel_broadcast_mixed_vec4_kernel(
+template <typename T, typename B, bool BroadcastFirst, typename Op, int VecSize>
+__global__ void binary_channel_broadcast_mixed_vec_kernel(
     int64_t inner, int64_t rows, int64_t channels,
     int64_t batch_stride, int64_t channel_stride, bool batch_repeated,
     const B* __restrict__ broadcast, const T* __restrict__ full,
     T* __restrict__ result, float alpha, Op op) {
     using M = typename BinaryOpMath<T>::type;
-    const int64_t col = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
+    const int64_t col = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * VecSize;
     if (col >= inner) return;
     for (int64_t row = blockIdx.y; row < rows; row += gridDim.y) {
         const int64_t channel = row % channels;
@@ -329,16 +329,16 @@ __global__ void binary_channel_broadcast_mixed_vec4_kernel(
         const M b = static_cast<M>(
             broadcast[batch * batch_stride + channel * channel_stride]);
         const int64_t offset = row * inner + col;
-        const TPVecPack<T, 4> value =
-            *reinterpret_cast<const TPVecPack<T, 4>*>(full + offset);
-        TPVecPack<T, 4> output;
+        const TPVecPack<T, VecSize> value =
+            *reinterpret_cast<const TPVecPack<T, VecSize>*>(full + offset);
+        TPVecPack<T, VecSize> output;
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < VecSize; ++i) {
             output.v[i] = static_cast<T>(BroadcastFirst
                 ? op(b, static_cast<M>(value.v[i]), alpha)
                 : op(static_cast<M>(value.v[i]), b, alpha));
         }
-        *reinterpret_cast<TPVecPack<T, 4>*>(result + offset) = output;
+        *reinterpret_cast<TPVecPack<T, VecSize>*>(result + offset) = output;
     }
 }
 
@@ -366,26 +366,34 @@ bool try_binary_channel_broadcast_mixed_pair(
     const int64_t batch_stride = broadcast.stride(0);
     const int64_t channel_stride = broadcast.stride(1);
     const auto stream = getCurrentCUDAStream().stream();
-    constexpr int kVec = 4;
-    const bool vectorized = inner % kVec == 0 &&
-        (reinterpret_cast<uintptr_t>(full.data_ptr()) |
-         reinterpret_cast<uintptr_t>(result.data_ptr())) %
-            (sizeof(T) * kVec) == 0;
-    if (!vectorized) return false;
-    const int64_t groups = inner / kVec;
-    const int threads = std::min<int64_t>(
-        128, std::max<int64_t>(32, ((groups + 31) / 32) * 32));
-    dim3 block(static_cast<unsigned>(threads));
-    dim3 grid(
-        static_cast<unsigned>((groups + threads - 1) / threads),
-        static_cast<unsigned>(std::min<int64_t>(rows, 65535)));
-    binary_channel_broadcast_mixed_vec4_kernel<T, B, BroadcastFirst, Op>
-        <<<grid, block, 0, stream>>>(
-            inner, rows, channels, batch_stride, channel_stride,
-            batch_repeated, broadcast.data_ptr<B>(), full.data_ptr<T>(),
-            result.data_ptr<T>(), alpha, op);
-    CUDA_CHECK(cudaGetLastError());
-    return true;
+    const auto launch = [&]<int VecSize>() {
+        const int64_t groups = inner / VecSize;
+        const int threads = std::min<int64_t>(
+            128, std::max<int64_t>(32, ((groups + 31) / 32) * 32));
+        dim3 block(static_cast<unsigned>(threads));
+        dim3 grid(
+            static_cast<unsigned>((groups + threads - 1) / threads),
+            static_cast<unsigned>(std::min<int64_t>(rows, 65535)));
+        binary_channel_broadcast_mixed_vec_kernel<T, B, BroadcastFirst, Op, VecSize>
+            <<<grid, block, 0, stream>>>(
+                inner, rows, channels, batch_stride, channel_stride,
+                batch_repeated, broadcast.data_ptr<B>(), full.data_ptr<T>(),
+                result.data_ptr<T>(), alpha, op);
+        CUDA_CHECK(cudaGetLastError());
+    };
+    const uintptr_t full_address = reinterpret_cast<uintptr_t>(full.data_ptr());
+    const uintptr_t result_address = reinterpret_cast<uintptr_t>(result.data_ptr());
+    if (inner % 8 == 0 &&
+        ((full_address | result_address) % (sizeof(T) * 8)) == 0) {
+        launch.template operator()<8>();
+        return true;
+    }
+    if (inner % 4 == 0 &&
+        ((full_address | result_address) % (sizeof(T) * 4)) == 0) {
+        launch.template operator()<4>();
+        return true;
+    }
+    return false;
 }
 
 template <typename B, bool BroadcastFirst, typename Op>
@@ -415,26 +423,34 @@ bool try_binary_channel_broadcast_pair(
     const int64_t batch_stride = broadcast.stride(0);
     const int64_t channel_stride = broadcast.stride(1);
     const auto stream = getCurrentCUDAStream().stream();
-    constexpr int kVec = 4;
-    const bool vectorized = inner % kVec == 0 &&
-        (reinterpret_cast<uintptr_t>(full.data_ptr()) |
-         reinterpret_cast<uintptr_t>(result.data_ptr())) %
-            (sizeof(float) * kVec) == 0;
-    if (!vectorized) return false;
-    const int64_t groups = inner / kVec;
-    const int threads = std::min<int64_t>(
-        128, std::max<int64_t>(32, ((groups + 31) / 32) * 32));
-    dim3 block(static_cast<unsigned>(threads));
-    dim3 grid(
-        static_cast<unsigned>((groups + threads - 1) / threads),
-        static_cast<unsigned>(std::min<int64_t>(rows, 65535)));
-    binary_channel_broadcast_vec4_kernel<B, BroadcastFirst, Op>
-        <<<grid, block, 0, stream>>>(
-            inner, rows, channels, batch_stride, channel_stride,
-            batch_repeated, broadcast.data_ptr<B>(), full.data_ptr<float>(),
-            result.data_ptr<float>(), alpha, op);
-    CUDA_CHECK(cudaGetLastError());
-    return true;
+    const auto launch = [&]<int VecSize>() {
+        const int64_t groups = inner / VecSize;
+        const int threads = std::min<int64_t>(
+            128, std::max<int64_t>(32, ((groups + 31) / 32) * 32));
+        dim3 block(static_cast<unsigned>(threads));
+        dim3 grid(
+            static_cast<unsigned>((groups + threads - 1) / threads),
+            static_cast<unsigned>(std::min<int64_t>(rows, 65535)));
+        binary_channel_broadcast_vec_kernel<B, BroadcastFirst, Op, VecSize>
+            <<<grid, block, 0, stream>>>(
+                inner, rows, channels, batch_stride, channel_stride,
+                batch_repeated, broadcast.data_ptr<B>(), full.data_ptr<float>(),
+                result.data_ptr<float>(), alpha, op);
+        CUDA_CHECK(cudaGetLastError());
+    };
+    const uintptr_t full_address = reinterpret_cast<uintptr_t>(full.data_ptr());
+    const uintptr_t result_address = reinterpret_cast<uintptr_t>(result.data_ptr());
+    if (inner % 8 == 0 &&
+        ((full_address | result_address) % (sizeof(float) * 8)) == 0) {
+        launch.template operator()<8>();
+        return true;
+    }
+    if (inner % 4 == 0 &&
+        ((full_address | result_address) % (sizeof(float) * 4)) == 0) {
+        launch.template operator()<4>();
+        return true;
+    }
+    return false;
 }
 
 template <typename Op>
