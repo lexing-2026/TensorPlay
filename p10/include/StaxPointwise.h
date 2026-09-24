@@ -47,13 +47,15 @@ namespace cuda {
 P10_API Tensor stax_fused_pointwise_cuda(
     const std::vector<Tensor>& inputs,
     const std::vector<int64_t>& program,
-    const std::vector<double>& constants);
+    const std::vector<double>& constants,
+    int64_t out_dtype = -1);
 
 P10_API std::vector<Tensor> stax_fused_pointwise_cuda_multi(
     const std::vector<Tensor>& inputs,
     const std::vector<int64_t>& program,
     const std::vector<double>& constants,
-    const std::vector<int64_t>& output_refs);
+    const std::vector<int64_t>& output_refs,
+    const std::vector<int64_t>& out_dtypes = {});
 
 } // namespace cuda
 

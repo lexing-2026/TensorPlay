@@ -3563,31 +3563,39 @@ class _ForwardPointwiseFuser:
 
     def absorb(self, node: Node) -> bool:
         """Join a pointwise op into the buffer; False leaves the graph untouched."""
-        if node in self._blocked:
+        saved_layout = (self._shape, self._dtype, self._is_cuda)
+
+        def reject() -> bool:
+            self._shape, self._dtype, self._is_cuda = saved_layout
             return False
+
+        if node in self._blocked:
+            return reject()
         op_name = _target_name(node.target)
         if op_name in _FUSED_FWD_BINARY_OPS:
             if len(node.args) != 2 or node.kwargs:
-                return False
+                return reject()
             lhs = self._operand(node.args[0])
             rhs = self._operand(node.args[1])
             if lhs is None or rhs is None or (lhs[0] == "const" and rhs[0] == "const"):
-                return False
+                return reject()
             operands = (lhs, rhs)
         elif op_name in _FUSED_FWD_UNARY_OPS:
             if len(node.args) != 1:
-                return False
+                return reject()
             if node.kwargs and node.kwargs != {"inplace": False}:
-                return False
+                return reject()
             lhs = self._operand(node.args[0])
             if lhs is None or lhs[0] == "const":
-                return False
+                return reject()
             operands = (lhs, ("const", 0.0))
         else:
-            return False
+            return reject()
         if len(self._ops) >= _FUSED_FWD_MAX_INSTRUCTIONS:
-            return False
-        return self._append(node, _FUSED_PROGRAM_OPCODES[op_name], operands)
+            return reject()
+        if self._append(node, _FUSED_PROGRAM_OPCODES[op_name], operands):
+            return True
+        return reject()
 
     def _append(self, node: Node, opcode: int, operands) -> bool:
         sample = self._sample_of(node)
@@ -3941,7 +3949,14 @@ def _lower_native(
     channels_last_values: dict[Node, Any] = {}
     autocast_values: dict[tuple[Node, Any], Any] = {}
     mutations: list[tuple[int, Any]] = []
-    peel_conv_bias = bool(example_inputs and example_inputs[0].device.is_cuda())
+    # Keep bias in the convolution during training so the backend can place
+    # it in the same execution plan as the convolution.  The inference path
+    # retains the specialized post-convolution handling.
+    peel_conv_bias = bool(
+        example_inputs
+        and example_inputs[0].device.is_cuda()
+        and not tensorplay.is_grad_enabled()
+    )
     autocast_dtype = (
         tensorplay.get_autocast_dtype("cuda")
         if save_autocast_inputs and tensorplay.is_autocast_enabled("cuda")
@@ -5849,14 +5864,22 @@ _AUTOCAST_GEMM_OPS = {
 }
 
 
+# Output storage tags carried in the graph attribute: these are the scalar
+# type codes the evaluators decode, so an emitted result may narrow or widen
+# its float-domain value independently of the program inputs, and a type
+# edge rides the producer kernel instead of a separate pass.
+_FUSED_OUT_DTYPE_CODES = {"float32": 8, "float64": 9, "float16": 10, "bfloat16": 11}
+
+
 class _AotFusedSpec:
     """A frozen elementwise program kept until every spilled temp is read."""
 
-    __slots__ = ("ops", "temps")
+    __slots__ = ("ops", "temps", "out_dtypes")
 
-    def __init__(self, ops, temps):
+    def __init__(self, ops, temps, out_dtypes):
         self.ops = ops
         self.temps = temps
+        self.out_dtypes = out_dtypes
 
 
 class _AotNativeGraphBuilder:
@@ -5881,6 +5904,10 @@ class _AotNativeGraphBuilder:
         self._fused_shape: tuple[int, ...] | None = None
         self._fused_dtype: Any = None
         self._fused_pending: dict[int, tuple[_AotFusedSpec, int]] = {}
+        # Element type overrides for buffered results: a conversion edge
+        # consumed only by a kernel that wants another width rides the
+        # producer's store instead of a standalone conversion node.
+        self._fused_out_dtypes: dict[int, Any] = {}
         self._cuda_examples: dict[Any, Any] = {}
         self._cast_memo: dict[tuple[int, Any], tuple[_AotNativeSymbol, _AotNativeSymbol]] = {}
 
@@ -6043,19 +6070,26 @@ class _AotNativeGraphBuilder:
             temp_symbols[temp_id]
             for temp_id, _ in sorted(temp_pos.items(), key=lambda kv: kv[1])
         )
-        spec = _AotFusedSpec(tuple(ops), temps)
+        out_dtypes = {
+            temp_pos[temp_id]: dtype
+            for temp_id, dtype in self._fused_out_dtypes.items()
+            if temp_id in temp_pos
+        }
+        self._fused_out_dtypes = {}
+        spec = _AotFusedSpec(tuple(ops), temps, out_dtypes)
         emitted = list(range(len(ops))) if wanted is None else list(wanted)
         for index, symbol in enumerate(temps):
             if index not in emitted:
                 self._fused_pending[id(symbol)] = (spec, index)
         if emitted:
-            self._emit_program(spec.ops, temps, emitted)
+            self._emit_program(spec.ops, temps, emitted, spec.out_dtypes)
 
     def _emit_program(
         self,
         ops: tuple[tuple[int, Any, Any], ...],
         temps: tuple[_AotNativeSymbol, ...],
         wanted: list[int],
+        out_dtypes: dict[int, Any] | None = None,
     ) -> None:
         temp_pos = {id(symbol): index for index, symbol in enumerate(temps)}
         # Dependency closure of the requested results, in program order; the
@@ -6114,7 +6148,7 @@ class _AotNativeGraphBuilder:
         emitted = list(wanted)
         output_refs = [input_count + mapping[index] for index in emitted]
         op_name = None
-        if 1 <= input_count <= 32 and len(emitted) <= 32:
+        if not out_dtypes and 1 <= input_count <= 32 and len(emitted) <= 32:
             first_shape = tuple(input_symbols[0].shape)
             first_dtype = input_symbols[0].dtype
             uniform = all(
@@ -6159,6 +6193,16 @@ class _AotNativeGraphBuilder:
             node.set_str_attr("op_name", op_name)
 
         outputs = [node.add_output() for _ in emitted]
+        if out_dtypes:
+            codes = []
+            for index in emitted:
+                dtype = out_dtypes.get(index)
+                name = (
+                    str(dtype).rsplit(".", 1)[-1] if dtype is not None else None
+                )
+                codes.append(_FUSED_OUT_DTYPE_CODES.get(name, -1))
+            if any(code >= 0 for code in codes):
+                node.set_ints_attr("output_dtypes", codes)
         node_to_output = dict(zip(emitted, outputs))
         for position, output in node_to_output.items():
             temps[position].value = output
@@ -6308,6 +6352,28 @@ class _AotNativeGraphBuilder:
         memo = self._cast_memo.get(memo_key)
         if memo is not None:
             return memo[1]
+        index = self._fused_temp_pos.get(id(value))
+        pending = None if index is not None else self._fused_pending.get(id(value))
+        if index is not None or pending is not None:
+            # The buffered or spilled result has not been emitted yet: its
+            # storage type can still be retargeted, so the producer stores
+            # the converted value directly and no conversion node exists.
+            if index is not None:
+                current = self._fused_out_dtypes.get(id(value))
+            else:
+                spec, index = pending
+                current = spec.out_dtypes.get(index)
+            if current is None or current == dtype:
+                if index is not None:
+                    self._fused_out_dtypes[id(value)] = dtype
+                else:
+                    pending[0].out_dtypes[index] = dtype
+                value.dtype = dtype
+                self._cast_memo[memo_key] = (value, value)
+                return value
+            # A different width was already claimed for this result: fall
+            # through to a standalone conversion after materializing.
+            self._materialize(value)
         name = str(dtype).rsplit(".", 1)[-1]
         result = self.helper("cast", (value,), attrs={"dtype": name}, shape=value.shape)
         if isinstance(result, _AotNativeSymbol):

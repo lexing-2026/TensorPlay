@@ -101,12 +101,36 @@ Tensor execute_fused_pointwise_cpu(
     }
     const auto* program_ptr = int_list_attr(node, "program");
     const auto* constants_ptr = float_list_attr(node, "constants");
-    // Route by operand device: the program semantics are identical on both
-    // sides; only the evaluator differs.
-    if (operands.front().device().is_cuda()) {
-        return cuda::stax_fused_pointwise_cuda(operands, *program_ptr, *constants_ptr);
+    // An entry overrides the element type this output is stored as; -1 keeps
+    // the input storage type.  The evaluator writes the converted value
+    // directly, so a narrowing/widening edge costs no separate pass.
+    int64_t out_dtype = -1;
+    auto dtype_it = node.attrs.find("output_dtypes");
+    if (dtype_it != node.attrs.end()) {
+        if (!std::holds_alternative<std::vector<int64_t>>(dtype_it->second)) {
+            throw std::runtime_error(
+                "Stax fused pointwise output_dtypes has an invalid type");
+        }
+        const auto& dtypes = std::get<std::vector<int64_t>>(dtype_it->second);
+        if (!dtypes.empty()) {
+            out_dtype = dtypes.front();
+        }
     }
-    return cpu::stax_fused_pointwise_cpu(operands, *program_ptr, *constants_ptr);
+    // Route by operand device: the program semantics are identical on both
+    // sides; only the evaluator differs.  The CUDA evaluator stores the
+    // converted value inside the kernel; the CPU evaluator is float-only,
+    // so a requested override converts after the run.
+    if (operands.front().device().is_cuda()) {
+        return cuda::stax_fused_pointwise_cuda(operands, *program_ptr,
+                                               *constants_ptr, out_dtype);
+    }
+    Tensor out = cpu::stax_fused_pointwise_cpu(operands, *program_ptr,
+                                               *constants_ptr);
+    if (out_dtype >= 0 &&
+        static_cast<DType>(out_dtype) != operands.front().dtype()) {
+        out = out.to(static_cast<DType>(out_dtype));
+    }
+    return out;
 }
 
 } // namespace
@@ -1541,13 +1565,42 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                 const auto* program_ptr = int_list_attr(node, "program");
                 const auto* constants_ptr = float_list_attr(node, "constants");
                 const auto* refs_ptr = &required_int_list_attr(node, "output_refs");
+                const std::vector<int64_t> empty_dtypes;
+                const std::vector<int64_t>* dtypes_ptr = nullptr;
+                auto dtype_it = node.attrs.find("output_dtypes");
+                if (dtype_it != node.attrs.end()) {
+                    if (!std::holds_alternative<std::vector<int64_t>>(dtype_it->second)) {
+                        throw std::runtime_error(
+                            "Stax fused pointwise output_dtypes has an invalid type");
+                    }
+                    dtypes_ptr = &std::get<std::vector<int64_t>>(dtype_it->second);
+                }
+                if (dtypes_ptr != nullptr && dtypes_ptr->size() != node.outputs.size()) {
+                    throw std::runtime_error(
+                        "Stax fused pointwise output dtype count mismatch");
+                }
                 std::vector<Tensor> results;
                 if (operands.front().device().is_cuda()) {
                     results = cuda::stax_fused_pointwise_cuda_multi(
-                        operands, *program_ptr, *constants_ptr, *refs_ptr);
+                        operands, *program_ptr, *constants_ptr, *refs_ptr,
+                        dtypes_ptr == nullptr ? empty_dtypes : *dtypes_ptr);
                 } else {
                     results = cpu::stax_fused_pointwise_cpu_multi(
                         operands, *program_ptr, *constants_ptr, *refs_ptr);
+                    // The CPU evaluator is float-only: apply any requested
+                    // output dtype after the run so both devices agree on
+                    // the element type of every result.
+                    if (dtypes_ptr != nullptr) {
+                        const DType input_dtype = operands.front().dtype();
+                        for (size_t o = 0; o < results.size(); ++o) {
+                            const int64_t code = (*dtypes_ptr)[o];
+                            if (code >= 0 &&
+                                static_cast<DType>(code) != input_dtype) {
+                                results[o] =
+                                    results[o].to(static_cast<DType>(code));
+                            }
+                        }
+                    }
                 }
                 if (results.size() != node.outputs.size()) {
                     throw std::runtime_error(
