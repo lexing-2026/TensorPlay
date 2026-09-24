@@ -229,6 +229,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/CudaBlasGemm.cpp
         src/backend/cuda/CudaTunable.cpp
         src/backend/cuda/ActivationKernels.cu
+        src/backend/cuda/SoftmaxKernels.cu
         src/backend/cuda/NormalizationKernels.cu
         src/backend/cuda/LossFillKernels.cu
         src/backend/cuda/LossCTC.cu
