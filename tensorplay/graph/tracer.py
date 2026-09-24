@@ -243,6 +243,11 @@ class Tracer:
             # Advisory: an op that fails eagerly simply stays symbolic.
             return
         self._node_samples[node.name] = value
+        # Keep container results available to lowering passes.  Tensor
+        # metadata is reconstructed from shapes, but tuple-valued operators
+        # need their arity and per-item shapes to allocate native outputs.
+        if isinstance(value, (tuple, list)):
+            node.meta["val"] = value
 
     def create_proxy(
         self,
@@ -567,6 +572,27 @@ class Tracer:
         missing = object()
         patches: list[tuple[Any, str, Any]] = []
 
+        class _InlineChild:
+            """Callable module view that also preserves container access."""
+
+            def __init__(self, child: Any) -> None:
+                self._child = child
+
+            def __call__(self, *args: Any, **kwargs: Any) -> Any:
+                return self._child.forward(*args, **kwargs)
+
+            def __getitem__(self, key: Any) -> Any:
+                return _InlineChild(self._child[key])
+
+            def __iter__(self):
+                return iter(_InlineChild(item) for item in self._child)
+
+            def __len__(self) -> int:
+                return len(self._child)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._child, name)
+
         def patch_attribute(module: Any, name: str, value: Any) -> None:
             previous = module.__dict__.get(name, missing)
             module.__dict__[name] = value
@@ -602,12 +628,7 @@ class Tracer:
 
                         patch_attribute(module, child_name, call_module_child)
                     else:
-                        def inline_child(
-                            *args: Any, _child: Any = child, **kwargs: Any
-                        ) -> Any:
-                            return _child.forward(*args, **kwargs)
-
-                        patch_attribute(module, child_name, inline_child)
+                        patch_attribute(module, child_name, _InlineChild(child))
 
             def under_leaf(module_qualname: str) -> bool:
                 parts = module_qualname.split(".")

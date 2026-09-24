@@ -1,8 +1,12 @@
 #include "Exception.h"
 #include "ForeachKernels.h"
+#include "CUDARuntime.h"
+#include "ForeachMultiTensor.cuh"
 
+#include <algorithm>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -107,11 +111,157 @@ std::vector<Tensor> foreach_mm_cuda(const std::vector<Tensor>& self,
     return out;
 }
 
+namespace {
+
+constexpr int kNormMaxTensors = 128;
+constexpr int kNormThreads = 256;
+constexpr int64_t kNormChunkSize = 65536;
+constexpr int64_t kNormMaxGridY = 65535;
+
+__host__ __device__ inline int64_t foreach_norm_chunk_count(int64_t numel) {
+    return numel / kNormChunkSize + (numel % kNormChunkSize != 0);
+}
+
+template <typename T, typename M>
+struct ForeachNormMetadata {
+    const T* inputs[kNormMaxTensors]{};
+    T* outputs[kNormMaxTensors]{};
+    int64_t numels[kNormMaxTensors]{};
+    M* partials = nullptr;
+    int32_t tensor_count = 0;
+    int32_t max_chunks = 0;
+};
+
+template <typename T, typename M>
+__global__ void foreach_norm_partial_kernel(
+        ForeachNormMetadata<T, M> metadata) {
+    const int32_t tensor = static_cast<int32_t>(blockIdx.x);
+    const int32_t chunk = static_cast<int32_t>(blockIdx.y);
+    if (tensor >= metadata.tensor_count || chunk >= metadata.max_chunks) return;
+
+    const int64_t begin = static_cast<int64_t>(chunk) * kNormChunkSize;
+    const int64_t count = metadata.numels[tensor];
+    if (begin >= count) return;
+    int64_t end = begin + kNormChunkSize;
+    if (end > count) end = count;
+
+    M value = M(0);
+    for (int64_t i = begin + threadIdx.x; i < end; i += blockDim.x) {
+        const M x = static_cast<M>(metadata.inputs[tensor][i]);
+        value += x * x;
+    }
+
+    __shared__ M values[kNormThreads];
+    values[threadIdx.x] = value;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) values[threadIdx.x] += values[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        metadata.partials[static_cast<int64_t>(tensor) * metadata.max_chunks + chunk] =
+            values[0];
+    }
+}
+
+template <typename T, typename M>
+__global__ void foreach_norm_finalize_kernel(
+        ForeachNormMetadata<T, M> metadata) {
+    const int32_t tensor = static_cast<int32_t>(blockIdx.x);
+    if (tensor >= metadata.tensor_count) return;
+
+    const int64_t count = metadata.numels[tensor];
+    const int32_t chunks = static_cast<int32_t>(foreach_norm_chunk_count(count));
+    M value = M(0);
+    for (int32_t chunk = threadIdx.x; chunk < chunks; chunk += blockDim.x) {
+        value += metadata.partials[
+            static_cast<int64_t>(tensor) * metadata.max_chunks + chunk];
+    }
+
+    __shared__ M values[kNormThreads];
+    values[threadIdx.x] = value;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) values[threadIdx.x] += values[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const M result = std::is_same_v<M, float>
+            ? static_cast<M>(sqrtf(static_cast<float>(values[0])))
+            : static_cast<M>(::sqrt(static_cast<double>(values[0])));
+        metadata.outputs[tensor][0] = static_cast<T>(result);
+    }
+}
+
+template <typename T, typename M>
+void launch_foreach_norm(const std::vector<Tensor>& self,
+                         std::vector<Tensor>& out) {
+    const int64_t tensor_count = static_cast<int64_t>(self.size());
+    const DType partial_dtype = self[0].dtype() == DType::Float64
+        ? DType::Float64 : DType::Float32;
+    OptionalCUDAGuard device_guard(self[0].device());
+    const auto stream = getCurrentCUDAStream().stream();
+
+    for (int64_t base = 0; base < tensor_count; base += kNormMaxTensors) {
+        const int32_t count = static_cast<int32_t>(
+            std::min<int64_t>(kNormMaxTensors, tensor_count - base));
+        int32_t max_chunks = 1;
+        for (int32_t i = 0; i < count; ++i) {
+            const int64_t numel = self[base + i].numel();
+            const int64_t chunks = foreach_norm_chunk_count(numel);
+            max_chunks = std::max<int32_t>(max_chunks, static_cast<int32_t>(chunks));
+        }
+
+        Tensor partials = Tensor::empty(
+            {static_cast<int64_t>(count) * max_chunks}, partial_dtype,
+            self[base].device());
+        ForeachNormMetadata<T, M> metadata{};
+        metadata.partials = partials.data_ptr<M>();
+        metadata.tensor_count = count;
+        metadata.max_chunks = max_chunks;
+        for (int32_t i = 0; i < count; ++i) {
+            metadata.inputs[i] = self[base + i].data_ptr<T>();
+            metadata.outputs[i] = out[base + i].data_ptr<T>();
+            metadata.numels[i] = self[base + i].numel();
+        }
+
+        foreach_norm_partial_kernel<T, M><<<
+            dim3(static_cast<unsigned>(count), static_cast<unsigned>(max_chunks)),
+            kNormThreads, 0, stream>>>(metadata);
+        checkCuda(cudaGetLastError(), "foreach norm partial kernel launch");
+        foreach_norm_finalize_kernel<T, M><<<
+            static_cast<unsigned>(count), kNormThreads, 0, stream>>>(metadata);
+        checkCuda(cudaGetLastError(), "foreach norm finalize kernel launch");
+    }
+}
+
+} // namespace
+
 std::vector<Tensor> foreach_norm_cuda(const std::vector<Tensor>& self,
                                       const Scalar& ord,
                                       std::optional<DType> dtype) {
     std::vector<Tensor> out;
     out.reserve(self.size());
+    bool fast_l2 = !self.empty() && !dtype.has_value() &&
+        ord.toDouble() == 2.0 && foreach_mta::eligible_list(self);
+    if (fast_l2) {
+        for (const auto& value : self) {
+            if (value.requires_grad() || value.numel() == 0 ||
+                foreach_norm_chunk_count(value.numel()) > kNormMaxGridY) {
+                fast_l2 = false;
+                break;
+            }
+        }
+    }
+    if (fast_l2) {
+        for (const auto& value : self) {
+            out.push_back(Tensor::empty({}, value.dtype(), value.device()));
+        }
+        foreach_mta::dispatch_dtype(self[0].dtype(), [&]<typename T, typename M>() {
+            launch_foreach_norm<T, M>(self, out);
+        });
+        return out;
+    }
     for (const auto& value : self) {
         Tensor input = dtype.has_value() ? value.to(*dtype) : value;
         out.push_back(input.norm(ord.toDouble()));

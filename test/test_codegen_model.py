@@ -1,6 +1,8 @@
 from pathlib import Path
 
 from tools.codegen.gen_structured import _render_header, validate_structured
+from tools.codegen.gen_autograd import generate_autograd_nodes, load_derivatives
+from tools.codegen.gen_tpx import generate_tpx_ops_cpp
 from tools.codegen.gen_python_c import _is_variadic_shape_list
 from tools.codegen.model import parse_native_yaml, parse_schema
 
@@ -107,3 +109,32 @@ def test_python_bridge_only_expands_shape_lists():
     assert _is_variadic_shape_list(reshape, "function")
     assert not _is_variadic_shape_list(sparse_size, "function")
     assert not _is_variadic_shape_list(as_strided, "function")
+
+
+def test_group_norm_codegen_shares_backward_and_marks_saved_statistics():
+    funcs = parse_native_yaml(str(ROOT / "config" / "native_functions.yaml"))
+    derivatives = load_derivatives(
+        str(ROOT / "config" / "derivatives.yaml"),
+        {function.func_name: function for function in funcs},
+    )
+    node = generate_autograd_nodes(
+        derivatives, native_op_names={function.cpp_name for function in funcs}
+    )
+    group_norm_node = node.split(
+        "struct NativeGroupNormBackward : public Node {", 1
+    )[1].split("struct InstanceNormBackward : public Node {", 1)[0]
+    assert group_norm_node.count("ops::native_group_norm_backward(") == 1
+    assert "grad_input_mask.push_back(next_edges()[0].is_valid())" in group_norm_node
+    assert "grad_input_mask.push_back(next_edges()[1].is_valid())" in group_norm_node
+    assert "grad_input_mask.push_back(next_edges()[2].is_valid())" in group_norm_node
+
+    wrappers = generate_tpx_ops_cpp(
+        funcs, autocast_ops=set(), derivatives=derivatives,
+        native_op_names={function.cpp_name for function in funcs},
+    )
+    group_norm_wrapper = wrappers.split(
+        "std::tuple<Tensor, Tensor, Tensor> native_group_norm(", 1
+    )[1].split("Tensor index(", 1)[0]
+    assert "set_grad_fn(std::get<0>(__tp_wrapped_result)" in group_norm_wrapper
+    assert "set_grad_fn(std::get<1>(__tp_wrapped_result)" not in group_norm_wrapper
+    assert "set_grad_fn(std::get<2>(__tp_wrapped_result)" not in group_norm_wrapper

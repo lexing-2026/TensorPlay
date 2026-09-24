@@ -1,6 +1,7 @@
 
 #include "Graph.h"
 #include "StaxPointwise.h"
+#include "GradMode.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include <algorithm>
 #include <iostream>
@@ -24,6 +25,16 @@ namespace stax {
 namespace {
 
 thread_local CaptureState capture_state;
+
+struct GradModeGuard {
+    explicit GradModeGuard(bool enabled) : previous(GradMode::is_enabled()) {
+        GradMode::set_enabled(enabled);
+    }
+
+    ~GradModeGuard() { GradMode::set_enabled(previous); }
+
+    bool previous;
+};
 
 const std::vector<int64_t>* int_list_attr(
     const OpNode& node,
@@ -269,6 +280,7 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
         }
 
         Tensor result;
+        std::vector<Tensor> multi_result;
         bool handled_by_custom_op = false;
         if (node.op_type == "channels_last") {
             // tensor with NHWC physical storage (see
@@ -309,7 +321,10 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
             }
             result = tpx::ops::add_relu(value(node.inputs[0]), value(node.inputs[1]));
         } else if (node.op_type == "add" || node.op_type == "sub" ||
-                   node.op_type == "mul" || node.op_type == "div") {
+                   node.op_type == "mul" || node.op_type == "div" ||
+                   node.op_type == "eq" || node.op_type == "ne" ||
+                   node.op_type == "lt" || node.op_type == "le" ||
+                   node.op_type == "gt" || node.op_type == "ge") {
             auto scalar = scalar_attr(node, "scalar_value");
             if (scalar.has_value()) {
                 if (node.inputs.size() != 1) {
@@ -326,11 +341,27 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                         : tpx::ops::sub(tensor, *scalar);
                 } else if (node.op_type == "mul") {
                     result = tpx::ops::mul(tensor, *scalar);
-                } else {
+                } else if (node.op_type == "div") {
                     result = scalar_first
                         ? tpx::ops::div(
                             tpx::ops::full({}, *scalar, tensor.dtype(), tensor.device()), tensor)
                         : tpx::ops::div(tensor, *scalar);
+                } else if (node.op_type == "eq") {
+                    result = tpx::ops::eq(tensor, *scalar);
+                } else if (node.op_type == "ne") {
+                    result = tpx::ops::ne(tensor, *scalar);
+                } else if (node.op_type == "lt") {
+                    result = scalar_first ? tpx::ops::gt(tensor, *scalar)
+                                          : tpx::ops::lt(tensor, *scalar);
+                } else if (node.op_type == "le") {
+                    result = scalar_first ? tpx::ops::ge(tensor, *scalar)
+                                          : tpx::ops::le(tensor, *scalar);
+                } else if (node.op_type == "gt") {
+                    result = scalar_first ? tpx::ops::lt(tensor, *scalar)
+                                          : tpx::ops::gt(tensor, *scalar);
+                } else {
+                    result = scalar_first ? tpx::ops::le(tensor, *scalar)
+                                          : tpx::ops::ge(tensor, *scalar);
                 }
             } else {
                 if (node.inputs.size() != 2) {
@@ -342,16 +373,158 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                     result = tpx::ops::sub(value(node.inputs[0]), value(node.inputs[1]));
                 } else if (node.op_type == "mul") {
                     result = tpx::ops::mul(value(node.inputs[0]), value(node.inputs[1]));
-                } else {
+                } else if (node.op_type == "div") {
                     result = tpx::ops::div(value(node.inputs[0]), value(node.inputs[1]));
+                } else if (node.op_type == "eq") {
+                    result = tpx::ops::eq(value(node.inputs[0]), value(node.inputs[1]));
+                } else if (node.op_type == "ne") {
+                    result = tpx::ops::ne(value(node.inputs[0]), value(node.inputs[1]));
+                } else if (node.op_type == "lt") {
+                    result = tpx::ops::lt(value(node.inputs[0]), value(node.inputs[1]));
+                } else if (node.op_type == "le") {
+                    result = tpx::ops::le(value(node.inputs[0]), value(node.inputs[1]));
+                } else if (node.op_type == "gt") {
+                    result = tpx::ops::gt(value(node.inputs[0]), value(node.inputs[1]));
+                } else {
+                    result = tpx::ops::ge(value(node.inputs[0]), value(node.inputs[1]));
                 }
             }
+        } else if (node.op_type == "where") {
+            if (node.inputs.empty() || node.inputs.size() > 3) {
+                throw std::runtime_error("Stax where has invalid inputs");
+            }
+            auto self_scalar = scalar_attr(node, "self_scalar");
+            auto other_scalar = scalar_attr(node, "other_scalar");
+            const Tensor& condition = value(node.inputs[0]);
+            if (self_scalar.has_value() && other_scalar.has_value()) {
+                result = tpx::ops::where(condition, *self_scalar, *other_scalar);
+            } else if (self_scalar.has_value()) {
+                if (node.inputs.size() != 2) {
+                    throw std::runtime_error("Stax where self input is missing");
+                }
+                result = tpx::ops::where(
+                    condition, *self_scalar, value(node.inputs[1]));
+            } else if (other_scalar.has_value()) {
+                if (node.inputs.size() != 2) {
+                    throw std::runtime_error("Stax where other input is missing");
+                }
+                result = tpx::ops::where(
+                    condition, value(node.inputs[1]), *other_scalar);
+            } else {
+                if (node.inputs.size() != 3) {
+                    throw std::runtime_error("Stax where tensor inputs are missing");
+                }
+                result = tpx::ops::where(
+                    condition, value(node.inputs[1]), value(node.inputs[2]));
+            }
+        } else if (node.op_type == "clamp" || node.op_type == "clamp_min" ||
+                   node.op_type == "clamp_max") {
+            if (node.inputs.empty() || node.inputs.size() > 3) {
+                throw std::runtime_error("Stax clamp has invalid inputs");
+            }
+            const Tensor& input = value(node.inputs[0]);
+            auto min_scalar = scalar_attr(node, "min_scalar");
+            auto max_scalar = scalar_attr(node, "max_scalar");
+            const bool min_tensor = required_int_attr(node, "min_tensor") != 0;
+            const bool max_tensor = required_int_attr(node, "max_tensor") != 0;
+            size_t input_index = 1;
+            std::optional<Tensor> min_value;
+            std::optional<Tensor> max_value;
+            if (min_tensor) {
+                if (input_index >= node.inputs.size()) {
+                    throw std::runtime_error("Stax clamp minimum input is missing");
+                }
+                min_value = value(node.inputs[input_index++]);
+            }
+            if (max_tensor) {
+                if (input_index >= node.inputs.size()) {
+                    throw std::runtime_error("Stax clamp maximum input is missing");
+                }
+                max_value = value(node.inputs[input_index++]);
+            }
+            if (input_index != node.inputs.size()) {
+                throw std::runtime_error("Stax clamp has unexpected inputs");
+            }
+            if (node.op_type == "clamp_min") {
+                result = min_tensor ? tpx::ops::clamp_min(input, *min_value)
+                                     : tpx::ops::clamp_min(input, *min_scalar);
+            } else if (node.op_type == "clamp_max") {
+                result = max_tensor ? tpx::ops::clamp_max(input, *max_value)
+                                     : tpx::ops::clamp_max(input, *max_scalar);
+            } else if (min_tensor || max_tensor) {
+                result = tpx::ops::clamp(input, min_value, max_value);
+            } else {
+                result = tpx::ops::clamp(input, min_scalar, max_scalar);
+            }
+        } else if (node.op_type == "gelu") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax gelu expects one tensor input");
+            }
+            const auto approximate_it = node.attrs.find("approximate");
+            const std::string approximate = approximate_it == node.attrs.end()
+                ? "none"
+                : node.getAttr<std::string>("approximate");
+            result = tpx::ops::gelu(value(node.inputs[0]), approximate);
+        } else if (node.op_type == "softmax" || node.op_type == "log_softmax") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax softmax expects one tensor input");
+            }
+            const auto dtype_it = node.attrs.find("dtype");
+            const DType dtype = dtype_it == node.attrs.end()
+                ? DType::Undefined
+                : static_cast<DType>(required_int_attr(node, "dtype"));
+            result = node.op_type == "softmax"
+                ? tpx::ops::softmax(value(node.inputs[0]), required_int_attr(node, "dim"), dtype)
+                : tpx::ops::log_softmax(value(node.inputs[0]), required_int_attr(node, "dim"), dtype);
+        } else if (node.op_type == "layer_norm") {
+            if (node.inputs.empty() || node.inputs.size() > 3) {
+                throw std::runtime_error("Stax layer_norm has invalid inputs");
+            }
+            size_t input_index = 1;
+            std::optional<Tensor> weight;
+            std::optional<Tensor> bias;
+            if (required_int_attr(node, "has_weight") != 0) {
+                if (input_index >= node.inputs.size()) {
+                    throw std::runtime_error("Stax layer_norm weight is missing");
+                }
+                weight = value(node.inputs[input_index++]);
+            }
+            if (required_int_attr(node, "has_bias") != 0) {
+                if (input_index >= node.inputs.size()) {
+                    throw std::runtime_error("Stax layer_norm bias is missing");
+                }
+                bias = value(node.inputs[input_index++]);
+            }
+            if (input_index != node.inputs.size()) {
+                throw std::runtime_error("Stax layer_norm has unexpected inputs");
+            }
+            result = tpx::ops::layer_norm(
+                value(node.inputs[0]),
+                required_int_list_attr(node, "normalized_shape"),
+                weight,
+                bias,
+                required_float_attr(node, "eps"));
         } else if (node.op_type == "neg" || node.op_type == "pos" ||
                    node.op_type == "abs" || node.op_type == "sin" ||
                    node.op_type == "cos" || node.op_type == "exp" ||
                    node.op_type == "log" || node.op_type == "sigmoid" ||
                    node.op_type == "sqrt" || node.op_type == "square" ||
-                   node.op_type == "tanh" || node.op_type == "relu") {
+                   node.op_type == "tanh" || node.op_type == "relu" ||
+                   node.op_type == "conj" || node.op_type == "rsqrt" ||
+                   node.op_type == "sign" || node.op_type == "silu" ||
+                   node.op_type == "acos" || node.op_type == "acosh" ||
+                   node.op_type == "asin" || node.op_type == "asinh" ||
+                   node.op_type == "atan" || node.op_type == "atanh" ||
+                   node.op_type == "ceil" || node.op_type == "cosh" ||
+                   node.op_type == "erf" || node.op_type == "erfc" ||
+                   node.op_type == "exp2" || node.op_type == "expm1" ||
+                   node.op_type == "floor" || node.op_type == "log1p" ||
+                   node.op_type == "log2" || node.op_type == "reciprocal" ||
+                   node.op_type == "round" || node.op_type == "sinh" ||
+                   node.op_type == "tan" || node.op_type == "trunc" ||
+                   node.op_type == "erfinv" || node.op_type == "erfcx" ||
+                   node.op_type == "lgamma" || node.op_type == "i0" ||
+                   node.op_type == "tanhshrink") {
             if (node.inputs.size() != 1) {
                 throw std::runtime_error("Stax unary op expects one tensor input");
             }
@@ -378,6 +551,64 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                 result = tpx::ops::square(input);
             } else if (node.op_type == "tanh") {
                 result = tpx::ops::tanh(input);
+            } else if (node.op_type == "silu") {
+                result = tpx::ops::silu(input);
+            } else if (node.op_type == "conj") {
+                result = tpx::ops::conj(input);
+            } else if (node.op_type == "rsqrt") {
+                result = tpx::ops::rsqrt(input);
+            } else if (node.op_type == "sign") {
+                result = tpx::ops::sign(input);
+            } else if (node.op_type == "acos") {
+                result = tpx::ops::acos(input);
+            } else if (node.op_type == "acosh") {
+                result = tpx::ops::acosh(input);
+            } else if (node.op_type == "asin") {
+                result = tpx::ops::asin(input);
+            } else if (node.op_type == "asinh") {
+                result = tpx::ops::asinh(input);
+            } else if (node.op_type == "atan") {
+                result = tpx::ops::atan(input);
+            } else if (node.op_type == "atanh") {
+                result = tpx::ops::atanh(input);
+            } else if (node.op_type == "ceil") {
+                result = tpx::ops::ceil(input);
+            } else if (node.op_type == "cosh") {
+                result = tpx::ops::cosh(input);
+            } else if (node.op_type == "erf") {
+                result = tpx::ops::erf(input);
+            } else if (node.op_type == "erfc") {
+                result = tpx::ops::erfc(input);
+            } else if (node.op_type == "exp2") {
+                result = tpx::ops::exp2(input);
+            } else if (node.op_type == "expm1") {
+                result = tpx::ops::expm1(input);
+            } else if (node.op_type == "floor") {
+                result = tpx::ops::floor(input);
+            } else if (node.op_type == "log1p") {
+                result = tpx::ops::log1p(input);
+            } else if (node.op_type == "log2") {
+                result = tpx::ops::log2(input);
+            } else if (node.op_type == "reciprocal") {
+                result = tpx::ops::reciprocal(input);
+            } else if (node.op_type == "round") {
+                result = tpx::ops::round(input);
+            } else if (node.op_type == "sinh") {
+                result = tpx::ops::sinh(input);
+            } else if (node.op_type == "tan") {
+                result = tpx::ops::tan(input);
+            } else if (node.op_type == "trunc") {
+                result = tpx::ops::trunc(input);
+            } else if (node.op_type == "erfinv") {
+                result = tpx::ops::erfinv(input);
+            } else if (node.op_type == "erfcx") {
+                result = tpx::ops::erfcx(input);
+            } else if (node.op_type == "lgamma") {
+                result = tpx::ops::lgamma(input);
+            } else if (node.op_type == "i0") {
+                result = tpx::ops::i0(input);
+            } else if (node.op_type == "tanhshrink") {
+                result = tpx::ops::tanhshrink(input);
             } else {
                 // The functional schema is authoritative: a plain relu must
                 // not mutate its input merely because the value has one
@@ -406,7 +637,10 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                 if (node.inputs.size() != 1) {
                     throw std::runtime_error("Stax scalar pow expects one tensor input");
                 }
-                result = tpx::ops::pow(value(node.inputs[0]), *scalar);
+                const bool scalar_first = scalar_position(node, "scalar_position") == 0;
+                result = scalar_first
+                    ? tpx::ops::pow(*scalar, value(node.inputs[0]))
+                    : tpx::ops::pow(value(node.inputs[0]), *scalar);
             } else {
                 if (node.inputs.size() != 2) {
                     throw std::runtime_error("Stax tensor pow expects two tensor inputs");
@@ -437,11 +671,140 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
             }
             result = tpx::ops::linear(
                 value(node.inputs[0]), value(node.inputs[1]), bias);
+        } else if (node.op_type == "linear_backward") {
+            if (node.inputs.size() != 3 || node.outputs.size() != 3) {
+                throw std::runtime_error(
+                    "Stax linear_backward expects input, grad, weight and three outputs");
+            }
+            const auto mask = required_int_list_attr(node, "output_mask");
+            if (mask.size() != 3) {
+                throw std::runtime_error(
+                    "Stax linear_backward output_mask must have three entries");
+            }
+            std::vector<bool> output_mask;
+            output_mask.reserve(mask.size());
+            for (int64_t item : mask) {
+                output_mask.push_back(item != 0);
+            }
+            auto backward = tpx::ops::linear_backward(
+                value(node.inputs[0]),
+                value(node.inputs[1]),
+                value(node.inputs[2]),
+                output_mask);
+            env[node.outputs[0]->id] = std::get<0>(backward);
+            env[node.outputs[1]->id] = std::get<1>(backward);
+            env[node.outputs[2]->id] = std::get<2>(backward);
+            return;
         } else if (node.op_type == "t") {
             if (node.inputs.size() != 1) {
                 throw std::runtime_error("Stax t expects one tensor input");
             }
             result = tpx::ops::t(value(node.inputs[0]));
+        } else if (node.op_type == "transpose") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax transpose expects one tensor input");
+            }
+            result = tpx::ops::transpose(
+                value(node.inputs[0]),
+                required_int_attr(node, "dim0"),
+                required_int_attr(node, "dim1"));
+        } else if (node.op_type == "select") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax select expects one tensor input");
+            }
+            result = tpx::ops::select(
+                value(node.inputs[0]),
+                required_int_attr(node, "dim"),
+                required_int_attr(node, "index"));
+        } else if (node.op_type == "slice") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax slice expects one tensor input");
+            }
+            const auto start_it = node.attrs.find("has_start");
+            const auto end_it = node.attrs.find("has_end");
+            const bool has_start = start_it != node.attrs.end() &&
+                std::holds_alternative<int64_t>(start_it->second) &&
+                std::get<int64_t>(start_it->second) != 0;
+            const bool has_end = end_it != node.attrs.end() &&
+                std::holds_alternative<int64_t>(end_it->second) &&
+                std::get<int64_t>(end_it->second) != 0;
+            std::optional<int64_t> start;
+            std::optional<int64_t> end;
+            if (has_start) start = required_int_attr(node, "start");
+            if (has_end) end = required_int_attr(node, "end");
+            result = tpx::ops::slice(
+                value(node.inputs[0]),
+                required_int_attr(node, "dim"),
+                start,
+                end,
+                required_int_attr(node, "step"));
+        } else if (node.op_type == "stack") {
+            if (node.inputs.empty()) {
+                throw std::runtime_error("Stax stack expects tensor inputs");
+            }
+            std::vector<Tensor> tensors;
+            tensors.reserve(node.inputs.size());
+            for (const ValueNode* input : node.inputs) {
+                tensors.push_back(value(input));
+            }
+            result = tpx::ops::stack(tensors, required_int_attr(node, "dim"));
+        } else if (node.op_type == "repeat") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax repeat expects one tensor input");
+            }
+            result = tpx::ops::repeat(
+                value(node.inputs[0]), required_int_list_attr(node, "repeats"));
+        } else if (node.op_type == "index_select") {
+            if (node.inputs.size() != 2) {
+                throw std::runtime_error("Stax index_select expects tensor and index");
+            }
+            result = tpx::ops::index_select(
+                value(node.inputs[0]), required_int_attr(node, "dim"), value(node.inputs[1]));
+        } else if (node.op_type == "index_select_backward") {
+            if (node.inputs.size() != 2) {
+                throw std::runtime_error(
+                    "Stax index_select_backward expects gradient and index");
+            }
+            result = tpx::ops::index_select_backward(
+                value(node.inputs[0]),
+                required_int_list_attr(node, "self_sizes"),
+                required_int_attr(node, "dim"),
+                value(node.inputs[1]));
+        } else if (node.op_type == "gather") {
+            if (node.inputs.size() != 2) {
+                throw std::runtime_error("Stax gather expects tensor and index");
+            }
+            result = tpx::ops::gather(
+                value(node.inputs[0]), required_int_attr(node, "dim"), value(node.inputs[1]));
+        } else if (node.op_type == "gather_backward") {
+            if (node.inputs.size() != 3) {
+                throw std::runtime_error(
+                    "Stax gather_backward expects gradient, input, and index");
+            }
+            result = tpx::ops::gather_backward(
+                value(node.inputs[0]),
+                value(node.inputs[1]),
+                required_int_attr(node, "dim"),
+                value(node.inputs[2]),
+                required_int_attr(node, "sparse_grad") != 0);
+        } else if (node.op_type == "embedding") {
+            if (node.inputs.size() != 2) {
+                throw std::runtime_error("Stax embedding expects weight and indices");
+            }
+            result = tpx::ops::embedding(
+                value(node.inputs[0]),
+                value(node.inputs[1]),
+                required_int_attr(node, "padding_idx"),
+                required_int_attr(node, "scale_grad_by_freq") != 0,
+                required_int_attr(node, "sparse") != 0);
+        } else if (node.op_type == "constant_pad_nd") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax constant_pad_nd expects one tensor input");
+            }
+            result = tpx::ops::constant_pad_nd(
+                value(node.inputs[0]),
+                required_int_list_attr(node, "pad"),
+                *scalar_attr(node, "value"));
         } else if (node.op_type == "conv2d") {
             if (node.inputs.size() != 2 && node.inputs.size() != 3) {
                 throw std::runtime_error(
@@ -520,24 +883,184 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                 required_int_attr(node, "training") != 0,
                 required_float_attr(node, "momentum"),
                 required_float_attr(node, "eps"));
-        } else if (node.op_type == "max_pool2d") {
-            if (node.inputs.size() != 1) {
-                throw std::runtime_error("Stax max_pool2d expects one input");
+        } else if (node.op_type == "max_pool1d_with_indices" ||
+                   node.op_type == "max_pool2d_with_indices" ||
+                   node.op_type == "max_pool3d_with_indices") {
+            if (node.inputs.size() != 1 || node.outputs.size() != 2) {
+                throw std::runtime_error(
+                    "Stax max_pool_with_indices expects one input and two outputs");
             }
-            result = tpx::ops::max_pool2d(
-                value(node.inputs[0]),
-                required_int_list_attr(node, "kernel_size"),
-                required_int_list_attr(node, "stride"),
-                required_int_list_attr(node, "padding"),
-                required_int_list_attr(node, "dilation"),
-                required_int_attr(node, "ceil_mode") != 0);
-        } else if (node.op_type == "adaptive_avg_pool2d") {
-            if (node.inputs.size() != 1) {
-                throw std::runtime_error("Stax adaptive_avg_pool2d expects one input");
+            const auto& input = value(node.inputs[0]);
+            const auto kernel = required_int_list_attr(node, "kernel_size");
+            const auto stride = required_int_list_attr(node, "stride");
+            const auto padding = required_int_list_attr(node, "padding");
+            const auto dilation = required_int_list_attr(node, "dilation");
+            const bool ceil_mode = required_int_attr(node, "ceil_mode") != 0;
+            std::tuple<Tensor, Tensor> pooled;
+            if (node.op_type == "max_pool1d_with_indices") {
+                pooled = tpx::ops::max_pool1d_with_indices(
+                    input, kernel, stride, padding, dilation, ceil_mode);
+            } else if (node.op_type == "max_pool2d_with_indices") {
+                pooled = tpx::ops::max_pool2d_with_indices(
+                    input, kernel, stride, padding, dilation, ceil_mode);
+            } else {
+                pooled = tpx::ops::max_pool3d_with_indices(
+                    input, kernel, stride, padding, dilation, ceil_mode);
             }
-            result = tpx::ops::adaptive_avg_pool2d(
+            env[node.outputs[0]->id] = std::get<0>(pooled);
+            env[node.outputs[1]->id] = std::get<1>(pooled);
+            return;
+        } else if (node.op_type == "adaptive_max_pool1d" ||
+                   node.op_type == "adaptive_max_pool2d" ||
+                   node.op_type == "adaptive_max_pool3d") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax adaptive_max_pool expects one input");
+            }
+            const auto output_size = required_int_list_attr(node, "output_size");
+            if (node.op_type == "adaptive_max_pool1d") {
+                auto pooled = tpx::ops::adaptive_max_pool1d(
+                    value(node.inputs[0]), output_size);
+                result = std::get<0>(pooled);
+            } else if (node.op_type == "adaptive_max_pool2d") {
+                result = tpx::ops::adaptive_max_pool2d(
+                    value(node.inputs[0]), output_size);
+            } else {
+                result = tpx::ops::adaptive_max_pool3d(
+                    value(node.inputs[0]), output_size);
+            }
+        } else if (node.op_type == "max_pool1d" ||
+                   node.op_type == "max_pool2d" ||
+                   node.op_type == "max_pool3d") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax max_pool expects one input");
+            }
+            const auto& input = value(node.inputs[0]);
+            const auto kernel = required_int_list_attr(node, "kernel_size");
+            const auto stride = required_int_list_attr(node, "stride");
+            const auto padding = required_int_list_attr(node, "padding");
+            const auto dilation = required_int_list_attr(node, "dilation");
+            const bool ceil_mode = required_int_attr(node, "ceil_mode") != 0;
+            if (node.op_type == "max_pool1d") {
+                result = tpx::ops::max_pool1d(input, kernel, stride, padding, dilation, ceil_mode);
+            } else if (node.op_type == "max_pool2d") {
+                result = tpx::ops::max_pool2d(input, kernel, stride, padding, dilation, ceil_mode);
+            } else {
+                result = tpx::ops::max_pool3d(input, kernel, stride, padding, dilation, ceil_mode);
+            }
+        } else if (node.op_type == "adaptive_avg_pool1d" ||
+                   node.op_type == "adaptive_avg_pool2d" ||
+                   node.op_type == "adaptive_avg_pool3d") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax adaptive_avg_pool expects one input");
+            }
+            const auto& input = value(node.inputs[0]);
+            const auto output_size = required_int_list_attr(node, "output_size");
+            if (node.op_type == "adaptive_avg_pool1d") {
+                result = tpx::ops::adaptive_avg_pool1d(input, output_size);
+            } else if (node.op_type == "adaptive_avg_pool2d") {
+                result = tpx::ops::adaptive_avg_pool2d(input, output_size);
+            } else {
+                result = tpx::ops::adaptive_avg_pool3d(input, output_size);
+            }
+        } else if (node.op_type == "avg_pool1d" ||
+                   node.op_type == "avg_pool2d" ||
+                   node.op_type == "avg_pool3d") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax avg_pool expects one input");
+            }
+            std::optional<int64_t> divisor_override;
+            const auto divisor_it = node.attrs.find("divisor_override");
+            if (divisor_it != node.attrs.end()) {
+                if (!std::holds_alternative<int64_t>(divisor_it->second)) {
+                    throw std::runtime_error(
+                        "Stax avg_pool2d divisor_override has an invalid type");
+                }
+                divisor_override = std::get<int64_t>(divisor_it->second);
+            }
+            const auto& input = value(node.inputs[0]);
+            const auto kernel = required_int_list_attr(node, "kernel_size");
+            const auto stride = required_int_list_attr(node, "stride");
+            const auto padding = required_int_list_attr(node, "padding");
+            const bool ceil_mode = required_int_attr(node, "ceil_mode") != 0;
+            const bool count_include_pad = required_int_attr(node, "count_include_pad") != 0;
+            if (node.op_type == "avg_pool1d") {
+                result = tpx::ops::avg_pool1d(
+                    input, kernel, stride, padding, ceil_mode, count_include_pad);
+            } else if (node.op_type == "avg_pool2d") {
+                result = tpx::ops::avg_pool2d(
+                    input, kernel, stride, padding, ceil_mode, count_include_pad,
+                    divisor_override);
+            } else {
+                result = tpx::ops::avg_pool3d(
+                    input, kernel, stride, padding, ceil_mode, count_include_pad,
+                    divisor_override);
+            }
+        } else if (node.op_type == "interpolate") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax interpolate expects one input");
+            }
+            const auto& input = value(node.inputs[0]);
+            const auto output_size = required_int_list_attr(node, "output_size");
+            const auto rank_it = node.attrs.find("spatial_rank");
+            const int64_t spatial_rank = rank_it == node.attrs.end()
+                ? input.dim() - 2
+                : required_int_attr(node, "spatial_rank");
+            if (spatial_rank == 1) {
+                result = tpx::ops::upsample_nearest1d(input, output_size);
+            } else if (spatial_rank == 2) {
+                result = tpx::ops::upsample_nearest2d(input, output_size);
+            } else if (spatial_rank == 3) {
+                result = tpx::ops::upsample_nearest3d(input, output_size);
+            } else {
+                throw std::runtime_error("Stax interpolate expects one to three spatial dimensions");
+            }
+        } else if (node.op_type == "group_norm") {
+            if (node.inputs.empty() || node.inputs.size() > 3) {
+                throw std::runtime_error("Stax group_norm has invalid inputs");
+            }
+            size_t input_index = 1;
+            std::optional<Tensor> weight;
+            std::optional<Tensor> bias;
+            if (required_int_attr(node, "has_weight") != 0) {
+                if (input_index >= node.inputs.size()) {
+                    throw std::runtime_error("Stax group_norm weight is missing");
+                }
+                weight = value(node.inputs[input_index++]);
+            }
+            if (required_int_attr(node, "has_bias") != 0) {
+                if (input_index >= node.inputs.size()) {
+                    throw std::runtime_error("Stax group_norm bias is missing");
+                }
+                bias = value(node.inputs[input_index++]);
+            }
+            if (input_index != node.inputs.size()) {
+                throw std::runtime_error("Stax group_norm has unexpected inputs");
+            }
+            result = tpx::ops::group_norm(
                 value(node.inputs[0]),
-                required_int_list_attr(node, "output_size"));
+                required_int_attr(node, "num_groups"),
+                weight,
+                bias,
+                required_float_attr(node, "eps"));
+        } else if (node.op_type == "dropout") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax dropout expects one input");
+            }
+            result = tpx::ops::dropout(
+                value(node.inputs[0]),
+                required_float_attr(node, "p"),
+                required_int_attr(node, "training") != 0);
+        } else if (node.op_type == "scaled_dot_product_attention") {
+            if (node.inputs.size() != 3) {
+                throw std::runtime_error(
+                    "Stax scaled_dot_product_attention expects query, key, and value");
+            }
+            result = tpx::ops::scaled_dot_product_attention(
+                value(node.inputs[0]),
+                value(node.inputs[1]),
+                value(node.inputs[2]),
+                required_int_attr(node, "is_causal") != 0,
+                required_int_attr(node, "impl"));
         } else if (node.op_type == "threshold_backward") {
             if (node.inputs.size() != 2) {
                 throw std::runtime_error("Stax threshold_backward expects grad and output");
@@ -583,25 +1106,168 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                 result = tpx::ops::matmul_backward_other(
                     value(node.inputs[0]), value(node.inputs[1]), value(node.inputs[2]));
             }
-        } else if (node.op_type == "max_pool2d_backward") {
+        } else if (node.op_type == "max_pool1d_backward" ||
+                   node.op_type == "max_pool2d_backward" ||
+                   node.op_type == "max_pool3d_backward") {
             if (node.inputs.size() != 2) {
-                throw std::runtime_error("Stax max_pool2d_backward expects grad and input");
+                throw std::runtime_error("Stax max_pool backward expects grad and input");
             }
-            result = tpx::ops::max_pool2d_backward(
+            const auto& grad = value(node.inputs[0]);
+            const auto& input = value(node.inputs[1]);
+            const auto kernel = required_int_list_attr(node, "kernel_size");
+            const auto stride = required_int_list_attr(node, "stride");
+            const auto padding = required_int_list_attr(node, "padding");
+            const auto dilation = required_int_list_attr(node, "dilation");
+            const bool ceil_mode = required_int_attr(node, "ceil_mode") != 0;
+            if (node.op_type == "max_pool1d_backward") {
+                if (kernel.size() != 1 || stride.size() != 1 ||
+                    padding.size() != 1 || dilation.size() != 1) {
+                    throw std::runtime_error("Stax max_pool1d backward expects one-value spatial attributes");
+                }
+                result = tpx::ops::max_pool2d_backward(
+                    tpx::ops::unsqueeze(grad, -2),
+                    tpx::ops::unsqueeze(input, -2),
+                    {1, kernel[0]}, {1, stride[0]}, {0, padding[0]},
+                    {1, dilation[0]}, ceil_mode);
+                result = tpx::ops::squeeze(result, -2);
+            } else if (node.op_type == "max_pool2d_backward") {
+                result = tpx::ops::max_pool2d_backward(
+                    grad, input, kernel, stride, padding, dilation, ceil_mode);
+            } else {
+                result = tpx::ops::max_pool3d_backward(
+                    grad, input, kernel, stride, padding, dilation, ceil_mode);
+            }
+        } else if (node.op_type == "adaptive_avg_pool1d_backward" ||
+                   node.op_type == "adaptive_avg_pool2d_backward" ||
+                   node.op_type == "adaptive_avg_pool3d_backward") {
+            if (node.inputs.size() != 2) {
+                throw std::runtime_error("Stax adaptive_avg_pool backward expects grad and input");
+            }
+            if (node.op_type == "adaptive_avg_pool1d_backward") {
+                result = tpx::ops::adaptive_avg_pool2d_backward(
+                    tpx::ops::unsqueeze(value(node.inputs[0]), -2),
+                    tpx::ops::unsqueeze(value(node.inputs[1]), -2));
+                result = tpx::ops::squeeze(result, -2);
+            } else if (node.op_type == "adaptive_avg_pool2d_backward") {
+                result = tpx::ops::adaptive_avg_pool2d_backward(
+                    value(node.inputs[0]), value(node.inputs[1]));
+            } else {
+                result = tpx::ops::adaptive_avg_pool3d_backward(
+                    value(node.inputs[0]), value(node.inputs[1]));
+            }
+        } else if (node.op_type == "avg_pool1d_backward" ||
+                   node.op_type == "avg_pool2d_backward" ||
+                   node.op_type == "avg_pool3d_backward") {
+            if (node.inputs.size() != 2) {
+                throw std::runtime_error("Stax avg_pool backward expects grad and input");
+            }
+            std::optional<int64_t> divisor_override;
+            const auto divisor_it = node.attrs.find("divisor_override");
+            if (divisor_it != node.attrs.end()) {
+                if (!std::holds_alternative<int64_t>(divisor_it->second)) {
+                    throw std::runtime_error(
+                        "Stax avg_pool2d_backward divisor_override has an invalid type");
+                }
+                divisor_override = std::get<int64_t>(divisor_it->second);
+            }
+            const auto& grad = value(node.inputs[0]);
+            const auto& input = value(node.inputs[1]);
+            const auto kernel = required_int_list_attr(node, "kernel_size");
+            const auto stride = required_int_list_attr(node, "stride");
+            const auto padding = required_int_list_attr(node, "padding");
+            const bool ceil_mode = required_int_attr(node, "ceil_mode") != 0;
+            const bool count_include_pad = required_int_attr(node, "count_include_pad") != 0;
+            if (node.op_type == "avg_pool1d_backward") {
+                if (kernel.size() != 1 || stride.size() != 1 || padding.size() != 1) {
+                    throw std::runtime_error("Stax avg_pool1d backward expects one-value spatial attributes");
+                }
+                result = tpx::ops::avg_pool2d_backward(
+                    tpx::ops::unsqueeze(grad, -2),
+                    tpx::ops::unsqueeze(input, -2),
+                    {1, kernel[0]}, {1, stride[0]}, {0, padding[0]},
+                    ceil_mode, count_include_pad, divisor_override);
+                result = tpx::ops::squeeze(result, -2);
+            } else if (node.op_type == "avg_pool2d_backward") {
+                result = tpx::ops::avg_pool2d_backward(
+                    grad, input, kernel, stride, padding, ceil_mode, count_include_pad,
+                    divisor_override);
+            } else {
+                result = tpx::ops::avg_pool3d_backward(
+                    grad, input, kernel, stride, padding, ceil_mode, count_include_pad,
+                    divisor_override);
+            }
+        } else if (node.op_type == "upsample_nearest1d_backward" ||
+                   node.op_type == "upsample_nearest2d_backward" ||
+                   node.op_type == "upsample_nearest3d_backward") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax upsample_nearest backward expects one input");
+            }
+            const auto& grad = value(node.inputs[0]);
+            const auto output_size = required_int_list_attr(node, "output_size");
+            const auto input_size = required_int_list_attr(node, "input_size");
+            if (node.op_type == "upsample_nearest1d_backward") {
+                result = tpx::ops::upsample_nearest1d_backward(
+                    grad, output_size, input_size);
+            } else if (node.op_type == "upsample_nearest2d_backward") {
+                result = tpx::ops::upsample_nearest2d_backward(
+                    grad, output_size, input_size);
+            } else {
+                result = tpx::ops::upsample_nearest3d_backward(
+                    grad, output_size, input_size);
+            }
+        } else if (node.op_type == "group_norm_backward") {
+            if (node.inputs.size() < 2 || node.inputs.size() > 4) {
+                throw std::runtime_error(
+                    "Stax group_norm_backward has invalid inputs");
+            }
+            size_t input_index = 2;
+            std::optional<Tensor> weight;
+            std::optional<Tensor> bias;
+            if (required_int_attr(node, "has_weight") != 0) {
+                if (input_index >= node.inputs.size()) {
+                    throw std::runtime_error(
+                        "Stax group_norm_backward weight is missing");
+                }
+                weight = value(node.inputs[input_index++]);
+            }
+            if (required_int_attr(node, "has_bias") != 0) {
+                if (input_index >= node.inputs.size()) {
+                    throw std::runtime_error(
+                        "Stax group_norm_backward bias is missing");
+                }
+                bias = value(node.inputs[input_index++]);
+            }
+            if (input_index != node.inputs.size() || node.outputs.size() != 3) {
+                throw std::runtime_error(
+                    "Stax group_norm_backward has inconsistent inputs/outputs");
+            }
+            auto backward = tpx::ops::group_norm_backward(
                 value(node.inputs[0]),
                 value(node.inputs[1]),
-                required_int_list_attr(node, "kernel_size"),
-                required_int_list_attr(node, "stride"),
-                required_int_list_attr(node, "padding"),
-                required_int_list_attr(node, "dilation"),
-                required_int_attr(node, "ceil_mode") != 0);
-        } else if (node.op_type == "adaptive_avg_pool2d_backward") {
-            if (node.inputs.size() != 2) {
+                required_int_attr(node, "num_groups"),
+                weight,
+                bias,
+                required_float_attr(node, "eps"));
+            env[node.outputs[0]->id] = std::get<0>(backward);
+            env[node.outputs[1]->id] = std::get<1>(backward);
+            env[node.outputs[2]->id] = std::get<2>(backward);
+            return;
+        } else if (node.op_type == "scaled_dot_product_attention_backward") {
+            if (node.inputs.size() != 4 || node.outputs.size() != 3) {
                 throw std::runtime_error(
-                    "Stax adaptive_avg_pool2d_backward expects grad and input");
+                    "Stax scaled_dot_product_attention_backward has invalid arity");
             }
-            result = tpx::ops::adaptive_avg_pool2d_backward(
-                value(node.inputs[0]), value(node.inputs[1]));
+            auto backward = tpx::ops::scaled_dot_product_attention_backward(
+                value(node.inputs[0]),
+                value(node.inputs[1]),
+                value(node.inputs[2]),
+                value(node.inputs[3]),
+                required_int_attr(node, "is_causal") != 0,
+                required_int_attr(node, "impl"));
+            env[node.outputs[0]->id] = std::get<0>(backward);
+            env[node.outputs[1]->id] = std::get<1>(backward);
+            env[node.outputs[2]->id] = std::get<2>(backward);
+            return;
         } else if (node.op_type == "batch_norm_backward") {
             if (node.inputs.size() < 2) {
                 throw std::runtime_error("Stax batch_norm_backward is missing grad/input");
@@ -643,27 +1309,155 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
             env[node.outputs[1]->id] = std::get<1>(backward);
             env[node.outputs[2]->id] = std::get<2>(backward);
             return;
+        } else if (node.op_type == "chunk" || node.op_type == "split" ||
+                   node.op_type == "split_with_sizes" || node.op_type == "unbind") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error(
+                    "Stax view partition expects one tensor input");
+            }
+            const Tensor& input = value(node.inputs[0]);
+            const int64_t dim = required_int_attr(node, "dim");
+            if (node.op_type == "chunk") {
+                multi_result = tpx::ops::chunk(
+                    input, required_int_attr(node, "chunks"), dim);
+            } else if (node.op_type == "split") {
+                auto split_size = node.attrs.find("split_size");
+                if (split_size != node.attrs.end()) {
+                    if (!std::holds_alternative<int64_t>(split_size->second)) {
+                        throw std::runtime_error(
+                            "Stax split size has an invalid type");
+                    }
+                    multi_result = tpx::ops::split(
+                        input, std::get<int64_t>(split_size->second), dim);
+                } else {
+                    multi_result = tpx::ops::split(
+                        input, required_int_list_attr(node, "split_sizes"), dim);
+                }
+            } else if (node.op_type == "split_with_sizes") {
+                multi_result = tpx::ops::split_with_sizes(
+                    input, required_int_list_attr(node, "split_sizes"), dim);
+            } else {
+                multi_result = tpx::ops::unbind(input, dim);
+            }
+            if (multi_result.size() != node.outputs.size()) {
+                throw std::runtime_error(
+                    "Stax view partition produced an unexpected output count");
+            }
+            for (size_t index = 0; index < multi_result.size(); ++index) {
+                env[node.outputs[index]->id] = std::move(multi_result[index]);
+            }
+            return;
+        } else if (node.op_type == "cat") {
+            if (node.inputs.empty()) {
+                throw std::runtime_error("Stax cat expects tensor inputs");
+            }
+            std::vector<Tensor> tensors;
+            tensors.reserve(node.inputs.size());
+            for (const ValueNode* input : node.inputs) {
+                tensors.push_back(value(input));
+            }
+            result = tpx::ops::cat(
+                tensors, required_int_attr(node, "dim"));
+        } else if (node.op_type == "zeros_like") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax zeros_like expects one tensor input");
+            }
+            result = tpx::ops::zeros(
+                required_int_list_attr(node, "shape"),
+                value(node.inputs[0]).dtype(),
+                value(node.inputs[0]).device());
+        } else if (node.op_type == "expand") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax expand expects one tensor input");
+            }
+            const auto implicit_it = node.attrs.find("implicit");
+            const bool implicit = implicit_it != node.attrs.end() &&
+                std::holds_alternative<int64_t>(implicit_it->second) &&
+                std::get<int64_t>(implicit_it->second) != 0;
+            result = tpx::ops::expand(
+                value(node.inputs[0]),
+                required_int_list_attr(node, "shape"),
+                implicit);
+        } else if (node.op_type == "unsqueeze") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax unsqueeze expects one input");
+            }
+            result = tpx::ops::unsqueeze(
+                value(node.inputs[0]), required_int_attr(node, "dim"));
+        } else if (node.op_type == "squeeze") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax squeeze expects one input");
+            }
+            const auto dim_it = node.attrs.find("dim");
+            if (dim_it == node.attrs.end()) {
+                const auto dims_it = node.attrs.find("dims");
+                if (dims_it == node.attrs.end()) {
+                    result = tpx::ops::squeeze(value(node.inputs[0]));
+                } else {
+                    if (!std::holds_alternative<std::vector<int64_t>>(dims_it->second)) {
+                        throw std::runtime_error("Stax squeeze dimensions have an invalid type");
+                    }
+                    result = tpx::ops::squeeze(
+                        value(node.inputs[0]),
+                        std::get<std::vector<int64_t>>(dims_it->second));
+                }
+            } else {
+                if (!std::holds_alternative<int64_t>(dim_it->second)) {
+                    throw std::runtime_error("Stax squeeze dimension has an invalid type");
+                }
+                result = tpx::ops::squeeze(
+                    value(node.inputs[0]), std::get<int64_t>(dim_it->second));
+            }
+        } else if (node.op_type == "permute_backward") {
+            if (node.inputs.size() != 2) {
+                throw std::runtime_error(
+                    "Stax permute_backward expects gradient and input");
+            }
+            result = tpx::ops::permute_backward(
+                value(node.inputs[0]),
+                value(node.inputs[1]),
+                required_int_list_attr(node, "dims"));
         } else if (node.op_type == "reshape") {
             if (node.inputs.size() != 1) {
                 throw std::runtime_error("Stax reshape expects one input");
             }
             result = tpx::ops::reshape(
                 value(node.inputs[0]), required_int_list_attr(node, "shape"));
-        } else if (node.op_type == "sum") {
+        } else if (node.op_type == "permute") {
             if (node.inputs.size() != 1) {
-                throw std::runtime_error("Stax sum expects one input");
+                throw std::runtime_error("Stax permute expects one input");
+            }
+            result = tpx::ops::permute(
+                value(node.inputs[0]), required_int_list_attr(node, "dims"));
+        } else if (node.op_type == "contiguous") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax contiguous expects one input");
+            }
+            result = tpx::ops::contiguous(
+                value(node.inputs[0]), required_int_attr(node, "memory_format"));
+        } else if (node.op_type == "float") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax float expects one input");
+            }
+            result = value(node.inputs[0]).to(DType::Float32);
+        } else if (node.op_type == "sum" || node.op_type == "mean") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax reduction expects one input");
             }
             const auto dim_it = node.attrs.find("dim");
             if (dim_it == node.attrs.end()) {
-                result = tpx::ops::sum(value(node.inputs[0]));
+                result = node.op_type == "sum"
+                    ? tpx::ops::sum(value(node.inputs[0]))
+                    : tpx::ops::mean(value(node.inputs[0]));
             } else {
                 if (!std::holds_alternative<std::vector<int64_t>>(dim_it->second)) {
-                    throw std::runtime_error("Stax sum dim has an invalid type");
+                    throw std::runtime_error("Stax reduction dim has an invalid type");
                 }
-                result = tpx::ops::sum(
-                    value(node.inputs[0]),
-                    std::get<std::vector<int64_t>>(dim_it->second),
-                    required_int_attr(node, "keepdim") != 0);
+                const auto& dims = std::get<std::vector<int64_t>>(dim_it->second);
+                const bool keepdim = required_int_attr(node, "keepdim") != 0;
+                result = node.op_type == "sum"
+                    ? tpx::ops::sum(value(node.inputs[0]), dims, keepdim)
+                    : tpx::ops::mean(value(node.inputs[0]), dims, keepdim);
             }
         } else if (node.op_type == "flatten") {
             if (node.inputs.size() != 1) {
@@ -786,12 +1580,17 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
             break;
         }
     }
+    const bool has_cuda_input = std::any_of(
+        inputs.begin(), inputs.end(), [](const Tensor& input) {
+            return input.defined() && input.device().is_cuda();
+        });
 #ifdef _OPENMP
     const unsigned worker_budget = static_cast<unsigned>(omp_get_max_threads());
 #else
     const unsigned worker_budget = 1;
 #endif
-    if (nodes.size() >= 24 && !has_custom_op && worker_budget > 1) {
+    if (nodes.size() >= 24 && !has_custom_op && worker_budget > 1 &&
+        !has_cuda_input) {
         std::vector<int> producer_of(this->values.size(), -1);
         for (size_t i = 0; i < nodes.size(); ++i) {
             for (const auto& o : nodes[i]->outputs) {
@@ -826,7 +1625,9 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
         size_t completed = 0;
         bool aborted = false;
         std::exception_ptr error;
+        const bool grad_enabled = GradMode::is_enabled();
         auto worker = [&]() {
+            GradModeGuard grad_mode_guard(grad_enabled);
             for (;;) {
                 size_t idx;
                 {
@@ -842,10 +1643,22 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                 }
                 try {
                     run_node(*nodes[idx]);
+                } catch (const std::exception& error_value) {
+                    std::lock_guard<std::mutex> lock(sched_mtx);
+                    if (!error) {
+                        error = std::make_exception_ptr(std::runtime_error(
+                            "Stax node " + nodes[idx]->name + " (" +
+                            nodes[idx]->op_type + "): " + error_value.what()));
+                    }
+                    aborted = true;
+                    sched_cv.notify_all();
+                    return;
                 } catch (...) {
                     std::lock_guard<std::mutex> lock(sched_mtx);
                     if (!error) {
-                        error = std::current_exception();
+                        error = std::make_exception_ptr(std::runtime_error(
+                            "Stax node " + nodes[idx]->name + " (" +
+                            nodes[idx]->op_type + ") failed with an unknown error"));
                     }
                     aborted = true;
                     sched_cv.notify_all();
@@ -883,7 +1696,13 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
     } else {
         for (const auto& node_ptr : nodes) {
             const OpNode& node = *node_ptr;
-            run_node(node);
+            try {
+                run_node(node);
+            } catch (const std::exception& error_value) {
+                throw std::runtime_error(
+                    "Stax node " + node.name + " (" + node.op_type + "): " +
+                    error_value.what());
+            }
             release_inputs(node);
         }
     }

@@ -112,16 +112,32 @@ std::tuple<Tensor, Tensor, Tensor> linear_backward_impl(
 
     Tensor grad_input, grad_weight, grad_bias;
     if (output_mask[0]) {
-        // grad_input = grad_output @ weight, restored to the input's shape.
-        grad_input = ops::reshape(ops::mm(reshaped_grad, weight),
+        Tensor grad_for_input = reshaped_grad;
+        if (grad_for_input.dtype() != weight.dtype()) {
+            grad_for_input = grad_for_input.to(weight.dtype());
+        }
+        grad_input = ops::reshape(ops::mm(grad_for_input, weight),
                                   static_cast<std::vector<int64_t>>(self.shape()));
+        if (grad_input.dtype() != self.dtype()) {
+            grad_input = grad_input.to(self.dtype());
+        }
     }
     if (output_mask[1]) {
-        grad_weight = ops::mm(ops::t(reshaped_grad),
-                              flatten_to_2d(self, in_features));
+        Tensor input_2d = flatten_to_2d(self, in_features);
+        Tensor grad_for_weight = reshaped_grad;
+        if (grad_for_weight.dtype() != input_2d.dtype()) {
+            grad_for_weight = grad_for_weight.to(input_2d.dtype());
+        }
+        grad_weight = ops::mm(ops::t(grad_for_weight), input_2d);
+        if (grad_weight.dtype() != weight.dtype()) {
+            grad_weight = grad_weight.to(weight.dtype());
+        }
     }
     if (output_mask[2]) {
         grad_bias = ops::sum(reshaped_grad, {0}, false);
+        if (grad_bias.dtype() != weight.dtype()) {
+            grad_bias = grad_bias.to(weight.dtype());
+        }
     }
     return {grad_input, grad_weight, grad_bias};
 }
@@ -136,8 +152,18 @@ std::tuple<Tensor, Tensor> matmul_backward_impl(const Tensor& grad,
         return {Tensor(), Tensor()};
     }
     Tensor grad_self, grad_other;
-    if (mask[0]) grad_self = ops::matmul_backward_self(grad, self, other);
-    if (mask[1]) grad_other = ops::matmul_backward_other(grad, self, other);
+    if (mask[0]) {
+        Tensor grad_for_self = grad.dtype() == other.dtype()
+            ? grad : grad.to(other.dtype());
+        grad_self = ops::matmul_backward_self(grad_for_self, self, other);
+        if (grad_self.dtype() != self.dtype()) grad_self = grad_self.to(self.dtype());
+    }
+    if (mask[1]) {
+        Tensor grad_for_other = grad.dtype() == self.dtype()
+            ? grad : grad.to(self.dtype());
+        grad_other = ops::matmul_backward_other(grad_for_other, self, other);
+        if (grad_other.dtype() != other.dtype()) grad_other = grad_other.to(other.dtype());
+    }
     return {grad_self, grad_other};
 }
 

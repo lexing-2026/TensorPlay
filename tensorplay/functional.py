@@ -3379,12 +3379,26 @@ def scaled_dot_product_attention(query, key, value, is_causal=False, impl=0):
             return _captured
     return _C.scaled_dot_product_attention(query, key, value, is_causal, impl)
 
+def _scaled_dot_product_attention_with_lse(query, key, value, is_causal=False, impl=0):
+    if _capturing():
+        _captured = _capture_call(_scaled_dot_product_attention_with_lse, (query, key, value, is_causal, impl), {})
+        if _captured is not None:
+            return _captured
+    return _C._scaled_dot_product_attention_with_lse(query, key, value, is_causal, impl)
+
 def scaled_dot_product_attention_backward(grad_output, query, key, value, is_causal=False, impl=0):
     if _capturing():
         _captured = _capture_call(scaled_dot_product_attention_backward, (grad_output, query, key, value, is_causal, impl), {})
         if _captured is not None:
             return _captured
     return _C.scaled_dot_product_attention_backward(grad_output, query, key, value, is_causal, impl)
+
+def _scaled_dot_product_attention_backward_with_lse(grad_output, query, key, value, output, logsumexp, is_causal=False, impl=0):
+    if _capturing():
+        _captured = _capture_call(_scaled_dot_product_attention_backward_with_lse, (grad_output, query, key, value, output, logsumexp, is_causal, impl), {})
+        if _captured is not None:
+            return _captured
+    return _C._scaled_dot_product_attention_backward_with_lse(grad_output, query, key, value, output, logsumexp, is_causal, impl)
 
 def tp_l1_loss(input, target, reduction=1):
     if _capturing():

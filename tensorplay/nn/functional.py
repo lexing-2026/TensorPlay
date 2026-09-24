@@ -606,6 +606,13 @@ def conv_tbc(input, weight, bias=None, pad=0):
 
 
 def max_pool2d(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False, return_indices=False):
+    captured = _capture_call(
+        max_pool2d,
+        (input, kernel_size, stride, padding, dilation, ceil_mode, return_indices),
+        {},
+    )
+    if captured is not None:
+        return captured
     if return_indices:
         return max_pool2d_with_indices(
             input, kernel_size, stride=stride, padding=padding,
@@ -617,13 +624,6 @@ def max_pool2d(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode
         stride = _pair(stride)
     padding = _pair(padding)
     dilation = _pair(dilation)
-    captured = _capture_call(
-        max_pool2d,
-        (input, kernel_size, stride, padding, dilation, ceil_mode, return_indices),
-        {},
-    )
-    if captured is not None:
-        return captured
     # native kernel assumes contiguous layout; normalize views (no-op when
     return _C.max_pool2d(input.contiguous(), kernel_size, stride, padding,
                          dilation, ceil_mode)
@@ -679,7 +679,15 @@ def group_norm(input, num_groups, weight=None, bias=None, eps=1e-5):
     captured = _capture_call(group_norm, (input, num_groups, weight, bias, eps), {})
     if captured is not None:
         return captured
-    return _C.group_norm(input, num_groups, weight, bias, eps)
+    if input.dim() < 2 or input.device.type != "cuda":
+        return _C.group_norm(input, num_groups, weight, bias, eps)
+    spatial = 1
+    for dim in range(2, input.dim()):
+        spatial *= input.size(dim)
+    output, _, _ = _C.native_group_norm(
+        input, weight, bias, input.size(0), input.size(1), spatial,
+        num_groups, eps)
+    return output
 
 def instance_norm(input, running_mean=None, running_var=None, weight=None, bias=None, use_input_stats=True, momentum=0.1, eps=1e-5):
     captured = _capture_call(instance_norm, (input, running_mean, running_var, weight, bias, use_input_stats, momentum, eps), {})
@@ -3363,6 +3371,20 @@ def embedding_bag(
         per_sample_weights, include_last_offset, padding_idx)[0]
 
 
+def _plain_scaled_dot_product_attention(query, key, value, is_causal):
+    if (
+        query.device.type == "cuda"
+        and query.dim() == 4
+        and query.size(-1) == 32
+        and query.dtype in (DType.float16, DType.bfloat16)
+    ):
+        output, _ = _C._scaled_dot_product_attention_with_lse(
+            query, key, value, is_causal=is_causal)
+        return output
+    return tensorplay.scaled_dot_product_attention(
+        query, key, value, is_causal=is_causal)
+
+
 def scaled_dot_product_attention(
     query: Tensor,
     key: Tensor,
@@ -3461,8 +3483,8 @@ def scaled_dot_product_attention(
                 and not enable_gqa
             )
             if plain_case:
-                return tensorplay.scaled_dot_product_attention(
-                    query, key, value, is_causal=is_causal)
+                return _plain_scaled_dot_product_attention(
+                    query, key, value, is_causal)
             if allowed != full_set and _sdpa_attention.SDPBackend.MATH not in allowed:
                 raise RuntimeError(
                     "scaled_dot_product_attention: the requested flash backend "
@@ -3485,8 +3507,8 @@ def scaled_dot_product_attention(
                 if _plain_case and _sdpa_attention.can_use_flash_attention(params):
                     # impl=None lets the fused-kernel selection pick the
                     # fastest eligible kernel for the shape.
-                    return tensorplay.scaled_dot_product_attention(
-                        query, key, value, is_causal=is_causal)
+                    return _plain_scaled_dot_product_attention(
+                        query, key, value, is_causal)
                 _sdpa_attention._raise_kernel_warnings(params)
             elif candidate == _sdpa_attention.SDPBackend.MATH:
                 break

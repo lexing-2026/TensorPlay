@@ -389,7 +389,9 @@ uintptr_t CUDAEvent::id() const noexcept {
 
 void recordStream(void* base_ptr, const Device& device) {
     if (!base_ptr || !device.is_cuda()) return;
-    recordStream(base_ptr, getCurrentCUDAStream(static_cast<int>(device.index())));
+    const auto stream = getCurrentCUDAStream(static_cast<int>(device.index()));
+    if (stream.stream() == nullptr) return;
+    recordStream(base_ptr, stream);
 }
 
 } // namespace cuda

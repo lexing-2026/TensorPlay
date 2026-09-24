@@ -71,13 +71,16 @@ public:
     std::string name() const override { return "FusionPass"; }
     bool run(Graph& graph) override {
         bool changed = false;
-        // Implement the same logic as fuseGraph
+        auto is_graph_output = [&graph](const ValueNode* value) {
+            return std::find(graph.outputs.begin(), graph.outputs.end(), value) !=
+                graph.outputs.end();
+        };
         for (auto& node : graph.nodes) {
             if (node->op_type == "add") {
                 for (auto* input : node->inputs) {
                     if (input->producer) {
                          if (input->producer->op_type == "mul") {
-                            if (input->uses.size() == 1) {
+                            if (input->uses.size() == 1 && !is_graph_output(input)) {
                                 // Fuse
                                 node->op_type = "fused_mul_add";
                                 

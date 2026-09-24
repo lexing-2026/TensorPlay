@@ -69,6 +69,14 @@ def _ones_like(graph: Graph, value: Node) -> Node:
     return _emit(graph, "call_function", operator.add, (zero, 1))
 
 
+def _zeros_like(value: Any) -> Any:
+    # Resolve lazily so importing the AOT core does not initialize the public
+    # functional module while its graph helpers are still being loaded.
+    from tensorplay.functional import zeros_like
+
+    return zeros_like(value)
+
+
 # ---------------------------------------------------------------------------
 # Joint-graph rule emission
 # ---------------------------------------------------------------------------
@@ -145,6 +153,24 @@ def _rule_neg(b: _JointBuilder, node: Node, go: Node) -> Dict[Any, Node]:
     return {node.args[0]: b.bwd("call_function", operator.neg, (go,))}
 
 
+def _rule_index_select(b: _JointBuilder, node: Node, go: Node) -> Dict[Any, Node]:
+    self_node, dim, index = node.args
+    zeros = b.bwd("call_function", _zeros_like, (self_node,))
+    grad = b.bwd(
+        "call_method", "index_add", (zeros, dim, index, go)
+    )
+    return {self_node: b.reduce_for(grad, node, self_node)}
+
+
+def _rule_gather(b: _JointBuilder, node: Node, go: Node) -> Dict[Any, Node]:
+    self_node, dim, index = node.args[:3]
+    zeros = b.bwd("call_function", _zeros_like, (self_node,))
+    grad = b.bwd(
+        "call_method", "scatter_add", (zeros, dim, index, go)
+    )
+    return {self_node: b.reduce_for(grad, node, self_node)}
+
+
 def _method_rule(formula: Callable[[_JointBuilder, Node, Node], Node]):
     def rule(b: _JointBuilder, node: Node, go: Node) -> Dict[Any, Node]:
         inner = node.args[0]
@@ -159,6 +185,10 @@ _RULES: Dict[Tuple[str, Any], Callable] = {
     ("call_function", operator.mul): _rule_mul,
     ("call_function", operator.truediv): _rule_truediv,
     ("call_function", operator.neg): _rule_neg,
+    ("call_function", "index_select"): _rule_index_select,
+    ("call_function", "gather"): _rule_gather,
+    ("call_method", "index_select"): _rule_index_select,
+    ("call_method", "gather"): _rule_gather,
     # Method spellings of the same arithmetic (x.mul(y) traces as
     # call_method) share the operator rules: identical args layout.
     ("call_method", "add"): _rule_add,
@@ -736,6 +766,8 @@ def build_aot(
             grad_outputs.append((target, go))
             continue
         rule = _RULES.get((node.op, node.target))
+        if rule is None and node.op == "call_function":
+            rule = _RULES.get((node.op, getattr(node.target, "__name__", None)))
         if rule is None:
             raise AOTError(
                 f"no derivative registered for {node.op}[{getattr(node.target, '__name__', node.target)}]"

@@ -20,6 +20,7 @@ AT_FORALL_LOWER_PRECISION_FP = [
     'conv1d', 'conv2d', 'conv3d',
     'conv_transpose2d', 'conv_transpose3d',
     'einsum', 'mv', 'scaled_dot_product_attention',
+    '_scaled_dot_product_attention_with_lse',
     # Additional matrix and activation entries.
     'addmv', 'addr', 'addbmm', 'prelu',
 ]
@@ -28,7 +29,7 @@ AT_FORALL_LOWER_PRECISION_FP = [
 AT_FORALL_FP32 = [
     'acos', 'asin', 'cosh', 'sinh', 'tan',
     'exp', 'expm1', 'log', 'log10', 'log1p', 'log2', 'rsqrt',
-    'layer_norm', 'group_norm', 'nll_loss', 'mse_loss',
+    'layer_norm', 'group_norm', 'native_group_norm', 'nll_loss', 'mse_loss',
     # Additional transcendental, distance, and loss entries.
     'erfinv', 'reciprocal', 'pow.Tensor_Scalar', 'pow.Tensor_Tensor',
     'softplus', 'renorm', 'logsumexp', 'dist', 'pdist',

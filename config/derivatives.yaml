@@ -531,6 +531,12 @@
   weight: std::get<1>(group_norm_backward(grad, input, num_groups, weight, bias, eps))
   bias: std::get<2>(group_norm_backward(grad, input, num_groups, weight, bias, eps))
 
+- name: native_group_norm(Tensor input, Tensor? weight, Tensor? bias, SymInt N, SymInt C, SymInt HxW, int group, float eps) -> (Tensor output, Tensor mean, Tensor rstd)
+  output_differentiability: [True, False, False]
+  input: std::get<0>(native_group_norm_backward(grad, input, mean, rstd, weight, N, C, HxW, group, grad_input_mask))
+  weight: std::get<1>(native_group_norm_backward(grad, input, mean, rstd, weight, N, C, HxW, group, grad_input_mask))
+  bias: std::get<2>(native_group_norm_backward(grad, input, mean, rstd, weight, N, C, HxW, group, grad_input_mask))
+
 - name: instance_norm(Tensor input, Tensor? weight, Tensor? bias, Tensor? running_mean, Tensor? running_var, bool use_input_stats, float momentum, float eps) -> Tensor
   input: std::get<0>(instance_norm_backward(grad, input, weight, bias, running_mean, running_var, use_input_stats, eps))
   weight: std::get<1>(instance_norm_backward(grad, input, weight, bias, running_mean, running_var, use_input_stats, eps))
@@ -676,6 +682,12 @@
   query: std::get<0>(scaled_dot_product_attention_backward(grad, query, key, value, is_causal, impl))
   key: std::get<1>(scaled_dot_product_attention_backward(grad, query, key, value, is_causal, impl))
   value: std::get<2>(scaled_dot_product_attention_backward(grad, query, key, value, is_causal, impl))
+
+- name: _scaled_dot_product_attention_with_lse(Tensor query, Tensor key, Tensor value, bool is_causal=false, int impl=0) -> (Tensor output, Tensor logsumexp)
+  output_differentiability: [True, False]
+  query: std::get<0>(_scaled_dot_product_attention_backward_with_lse(grad, query, key, value, output, logsumexp, is_causal, impl))
+  key: std::get<1>(_scaled_dot_product_attention_backward_with_lse(grad, query, key, value, output, logsumexp, is_causal, impl))
+  value: std::get<2>(_scaled_dot_product_attention_backward_with_lse(grad, query, key, value, output, logsumexp, is_causal, impl))
 
 # The saved logsumexp reproduces the softmax probabilities as exp(score - lse);
 # masked/causal entries sit at -inf so their probability (and gradient) is 0.

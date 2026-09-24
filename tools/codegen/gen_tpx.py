@@ -574,10 +574,16 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
         if kind == 'tuple':
             tup_types = tuple_element_cpp_types(f)
             result_var = '__tp_wrapped_result'
+            differentiable_outputs = (
+                dv_nd.differentiable_outputs if dv_nd is not None else None)
             lines.append(f'    std::tuple<{", ".join(tup_types)}> {result_var};')
             for i, tt in enumerate(tup_types):
                 lines.append(f'    std::get<{i}>({result_var}) = std::get<{i}>(core_result);')
-                if tt == 'Tensor' and has_ag and not _non_diff:
+                output_is_differentiable = (
+                    differentiable_outputs is None
+                    or differentiable_outputs[i])
+                if (tt == 'Tensor' and has_ag and not _non_diff
+                        and output_is_differentiable):
                     lines.append(
                         f'    if (requires_grad && std::get<{i}>({result_var}).defined() '
                         f'&& tensorplay::isFloatingOrComplexType(std::get<{i}>({result_var}).dtype())) {{')

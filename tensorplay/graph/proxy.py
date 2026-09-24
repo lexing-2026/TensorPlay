@@ -612,13 +612,7 @@ class Proxy:
         sample = self._sample()
         if isinstance(sample, (tuple, list)):
             if sample and any(_is_tp_tensor(item) for item in sample):
-                custom = self.node.meta.get("custom")
-                if isinstance(custom, dict) and custom.get("nested_region_config") is not None:
-                    return (self[index] for index in range(len(sample)))
-                raise GraphCaptureError(
-                    "iterating over a tensor-valued Proxy is not supported "
-                    "during graph capture"
-                )
+                return (self[index] for index in range(len(sample)))
             self.tracer.data_specializations.append((self.node.name, "iter"))
             return iter(sample)
         frame = inspect.currentframe()

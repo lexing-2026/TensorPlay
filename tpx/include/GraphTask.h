@@ -90,6 +90,12 @@ struct GraphTask {
     std::vector<std::shared_ptr<Node>> deferred_releases_;
 
 #ifdef USE_CUDA
+    // Ambient stream per device, captured on the caller's thread before the
+    // graph runs. Worker threads evaluate nodes on that same stream in the
+    // common case, so their work is already ordered with whatever the caller
+    // enqueues next and needs no reconciliation.
+    std::unordered_map<int, cuda::CUDAStream> caller_streams_;
+
     // CUDA work is issued by device workers, while the caller may immediately
     // submit more work from a different host thread. Keep the streams touched
     // by this graph so its completion can be published before callbacks run.
@@ -171,9 +177,29 @@ struct GraphTask {
     }
 
 #ifdef USE_CUDA
+    // Records the ambient stream of the caller for one device. Called on the
+    // initiating thread before any node runs.
+    void set_caller_stream(const cuda::CUDAStream& stream) {
+        if (stream.device_index() < 0) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        caller_streams_.insert_or_assign(stream.device_index(), stream);
+    }
+
     void note_cuda_stream(const cuda::CUDAStream& stream) {
         if (stream.device_index() < 0) return;
         std::lock_guard<std::mutex> lock(mutex_);
+        // Work on the caller's own ambient stream is already ordered with
+        // everything the caller enqueues afterwards; only genuinely foreign
+        // streams need an ordering edge before the caller proceeds.
+        auto it = caller_streams_.find(stream.device_index());
+        if (it != caller_streams_.end()) {
+            if (it->second == stream) return;
+        } else {
+            // Device unseen by the caller snapshot: the first stream observed
+            // there is treated as its ambient stream.
+            caller_streams_.emplace(stream.device_index(), stream);
+            return;
+        }
         for (const auto& current : cuda_streams_) {
             if (current == stream) return;
         }
@@ -182,14 +208,22 @@ struct GraphTask {
 
     void synchronize_cuda_streams() {
         std::vector<cuda::CUDAStream> streams;
+        std::unordered_map<int, cuda::CUDAStream> callers;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             streams = cuda_streams_;
+            callers = caller_streams_;
         }
         for (const auto& stream : streams) {
             cuda::CUDAEvent event;
             event.record(stream);
-            event.synchronize();
+            auto it = callers.find(stream.device_index());
+            if (it != callers.end()) {
+                // Device-side ordering edge only; the host thread never waits.
+                event.block(it->second);
+            } else {
+                event.synchronize();
+            }
         }
     }
 #else

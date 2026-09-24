@@ -671,6 +671,17 @@ variable_list Engine::execute(const edge_list& root_edges, const variable_list& 
 
     GraphTask graph_task(keep_graph, create_graph);
     graph_task.trace_id_ = EngineTrace::next_graph_id();
+#ifdef USE_CUDA
+    // Snapshot the caller's ambient stream for every device the incoming
+    // gradients live on; worker-side nodes running on those streams need no
+    // post-graph reconciliation.
+    for (const auto& input : inputs) {
+        if (input.defined() && input.device().type() == DeviceType::CUDA) {
+            graph_task.set_caller_stream(
+                cuda::getCurrentCUDAStream(input.device().index()));
+        }
+    }
+#endif
     if (EngineTrace::level() >= 1) {
         EngineTrace::emit(graph_task.trace_id_,
                           "execute create_graph=%d keep_graph=%d "

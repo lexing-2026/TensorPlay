@@ -2757,10 +2757,21 @@
     CPU: sdpa_kernel_cpu
   tags: nondeterministic_seeded
 
+- func: _scaled_dot_product_attention_with_lse(Tensor query, Tensor key, Tensor value, bool is_causal=false, int impl=0) -> (Tensor output, Tensor logsumexp)
+  variants: function
+  dispatch:
+    CUDA: sdpa_kernel_cuda_with_lse
+  tags: nondeterministic_seeded
+
 - func: scaled_dot_product_attention_backward(Tensor grad_output, Tensor query, Tensor key, Tensor value, bool is_causal=false, int impl=0) -> (Tensor grad_query, Tensor grad_key, Tensor grad_value)
   variants: function
   dispatch:
     CPU: sdpa_backward_kernel_cpu
+
+- func: _scaled_dot_product_attention_backward_with_lse(Tensor grad_output, Tensor query, Tensor key, Tensor value, Tensor output, Tensor logsumexp, bool is_causal=false, int impl=0) -> (Tensor grad_query, Tensor grad_key, Tensor grad_value)
+  variants: function
+  dispatch:
+    CUDA: sdpa_backward_kernel_cuda_with_lse
 
 # ---------------------------------------------------------------------------
 # the enum form (0=none, 1=mean, 2=sum).
@@ -7360,7 +7371,7 @@
 - func: hamming_window.periodic_alpha_beta(int window_length, bool periodic, float alpha, float beta, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
   variants: function
   cpp_no_default_args: ['dtype', 'layout', 'device', 'pin_memory']
-- func: native_group_norm(Tensor input, Tensor? weight, Tensor? bias, SymInt N, SymInt C, SymInt HxW, int group, float eps) -> (Tensor, Tensor, Tensor)
+- func: native_group_norm(Tensor input, Tensor? weight, Tensor? bias, SymInt N, SymInt C, SymInt HxW, int group, float eps) -> (Tensor output, Tensor mean, Tensor rstd)
   variants: function
   tags: core
 - func: native_group_norm_backward(Tensor grad_out, Tensor input, Tensor mean, Tensor rstd, Tensor? weight, SymInt N, SymInt C, SymInt HxW, int group, bool[3] output_mask) -> (Tensor, Tensor, Tensor)

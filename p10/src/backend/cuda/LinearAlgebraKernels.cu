@@ -656,8 +656,12 @@ Tensor matmul_backward_self_kernel_cuda(
     const Tensor& grad_output, const Tensor& self, const Tensor& other) {
     const MatmulBackwardInputsCuda normalized =
         normalize_matmul_backward_inputs_cuda(grad_output, self, other);
+    Tensor grad_matrix = normalized.grad_matrix;
+    if (grad_matrix.dtype() != normalized.other_matrix.dtype()) {
+        grad_matrix = grad_matrix.to(normalized.other_matrix.dtype());
+    }
     Tensor grad = matmul_kernel_cuda(
-        normalized.grad_matrix,
+        grad_matrix,
         adjoint_last_two_cuda(normalized.other_matrix));
     grad = sum_to_shape_cuda(
         grad, static_cast<std::vector<int64_t>>(normalized.self_matrix.shape()));
@@ -670,9 +674,13 @@ Tensor matmul_backward_other_kernel_cuda(
     const Tensor& grad_output, const Tensor& self, const Tensor& other) {
     const MatmulBackwardInputsCuda normalized =
         normalize_matmul_backward_inputs_cuda(grad_output, self, other);
+    Tensor grad_matrix = normalized.grad_matrix;
+    if (grad_matrix.dtype() != normalized.self_matrix.dtype()) {
+        grad_matrix = grad_matrix.to(normalized.self_matrix.dtype());
+    }
     Tensor grad = matmul_kernel_cuda(
         adjoint_last_two_cuda(normalized.self_matrix),
-        normalized.grad_matrix);
+        grad_matrix);
     grad = sum_to_shape_cuda(
         grad, static_cast<std::vector<int64_t>>(normalized.other_matrix.shape()));
     if (normalized.other_vector) grad = grad.squeeze(-1);

@@ -1181,6 +1181,29 @@ class PyNode : public tensorplay::tpx::Node {
 public:
     PyNode(py::object py_ctx) : py_ctx_(std::move(py_ctx)) {}
 
+    ~PyNode() {
+        PyObject* context = py_ctx_.ptr();
+        if (context == nullptr) {
+            return;
+        }
+        if (!tensorplay::python_c::interpreter_active()) {
+            py_ctx_.release();
+            return;
+        }
+        if (PyGILState_Check()) {
+            py_ctx_.release();
+            Py_DECREF(context);
+            return;
+        }
+        if (!tensorplay::python_c::interpreter_active()) {
+            py_ctx_.release();
+            return;
+        }
+        py::gil_scoped_acquire gil;
+        py_ctx_.release();
+        Py_DECREF(context);
+    }
+
     // Backward input slots correspond to forward OUTPUTS for custom
     // this node's incoming gradient buffer by the attached output count.
     size_t num_inputs() const override {

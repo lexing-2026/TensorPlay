@@ -8,6 +8,7 @@ import tensorplay as tp
 from tensorplay.graph import Tracer
 from tensorplay.graph.passes import DecomposePass
 from tensorplay._stax import build_aot
+from tensorplay.nn import functional as F
 
 
 def _trace(fn, sample):
@@ -53,6 +54,29 @@ def test_pass_idempotent_when_no_composites():
     gm = _trace(fn, smap)
     res = DecomposePass()(gm)
     assert res.modified is False
+
+
+def test_inplace_threshold_keeps_mutation_during_decomposition():
+    def fn(value):
+        updated = value + 1.0
+        result = F.threshold(updated, 0.0, -3.0, inplace=True)
+        return updated + result
+
+    sample = tp.tensor([-2.0, 0.5, 2.0])
+    gm = _trace(fn, {"value": sample})
+    res = DecomposePass()(gm)
+    assert res.modified is False
+    threshold_nodes = [
+        node
+        for node in gm.graph.nodes
+        if getattr(node.target, "__name__", node.target) == "threshold"
+    ]
+    assert len(threshold_nodes) == 1
+    assert threshold_nodes[0].kwargs == {"inplace": True}
+
+    expected = fn(sample.clone())
+    actual = gm.recompile()(sample.clone())
+    assert tp.allclose(actual, expected)
 
 
 # ---------------------------------------------------------------------------

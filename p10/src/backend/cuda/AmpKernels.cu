@@ -2,6 +2,7 @@
 #include "Dispatcher.h"
 #include "CUDARuntime.h"
 #include "Exception.h"
+#include "ForeachMultiTensor.cuh"
 
 #include <cuda_runtime.h>
 
@@ -12,6 +13,20 @@
 namespace tensorplay {
 namespace cuda {
 namespace {
+
+template <typename M>
+struct AmpUnscale {
+    float* found_inf;
+    const float* inv_scale;
+
+    __device__ M operator()(M* values) const {
+        const M value = values[0];
+        if (isnan(value) || isinf(value)) {
+            atomicExch(found_inf, 1.0f);
+        }
+        return value * static_cast<M>(*inv_scale);
+    }
+};
 
 template <typename T>
 class DeviceArray {
@@ -100,6 +115,31 @@ __global__ void amp_update_scale_kernel(
 void _amp_foreach_non_finite_check_and_unscale_cuda(
     std::vector<Tensor> self, Tensor& found_inf, const Tensor& inv_scale) {
     if (self.empty()) return;
+
+    bool has_elements = false;
+    for (const Tensor& grad : self) {
+        has_elements = has_elements || grad.numel() > 0;
+    }
+    if (!has_elements) return;
+
+    if (self.front().device().is_cuda() &&
+        foreach_mta::eligible_list(self)) {
+        const bool launched = foreach_mta::dispatch_dtype(
+            self[0].dtype(), [&]<typename T, typename M>() {
+                foreach_mta::launch<1, 0, T, M>(
+                    std::array<const std::vector<Tensor>*, 1>{&self},
+                    AmpUnscale<M>{found_inf.data_ptr<float>(),
+                                  inv_scale.data_ptr<float>()},
+                    "_amp_foreach_non_finite_check_and_unscale_");
+            });
+        if (launched) {
+            for (const Tensor& grad : self) {
+                grad.unsafeGetTensorImpl()->bump_version();
+            }
+            return;
+        }
+    }
+
     const auto stream = getCurrentCUDAStream().stream();
     const int64_t count = static_cast<int64_t>(self.size());
 

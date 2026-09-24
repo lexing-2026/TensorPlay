@@ -93,6 +93,21 @@ def test_stax_native_lowering_handles_scalar_and_unary_pointwise_ops():
     assert compiled(x).tolist() == pytest.approx(fn(x).tolist())
 
 
+def test_stax_native_lowering_handles_direct_conv2d_relu():
+    x = tp.randn(2, 3, 8, 8)
+    weight = tp.randn(4, 3, 3, 3)
+    bias = tp.randn(4)
+
+    def fn(value, kernel, offset):
+        return tp.conv2d_relu(value, kernel, offset, padding=1)
+
+    compiled = tp.compile(fn, backend="stax", fullgraph=True)
+    actual = compiled(x, weight, bias)
+    lowering = next(iter(compiled._tensorplay_cache.values()))
+    assert getattr(lowering, "_tensorplay_codegen", None) == "stax-native"
+    assert tp.allclose(actual, fn(x, weight, bias))
+
+
 def test_stax_strict_native_never_reports_python_graph_executor_as_compiled():
     compiled = tp.compile(
         lambda value: tp.zeros(value.shape),

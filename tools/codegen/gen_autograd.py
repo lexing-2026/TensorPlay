@@ -471,6 +471,7 @@ class OpDerivatives:
     # still registers (so the dispatch chain resolves) but builds no backward
     # node and leaves the outputs detached.
     non_differentiable_output: bool = False
+    differentiable_outputs: list[bool] | None = None
     # Forward-mode derivatives: output name -> jvp formula over each
     # argument's primal value "{arg}_p" and tangent "{arg}_t".
     fw_formulas: dict[str, Expr] = field(default_factory=dict)
@@ -584,7 +585,9 @@ EXTERNAL_NODES: set[str] = set()
 
 def compute_op_derivatives(func: NativeFunction, raw_formulas: dict[str, str],
                            node_name: str | None = None,
-                           fw_raw: dict[str, str] | None = None) -> OpDerivatives:
+                           fw_raw: dict[str, str] | None = None,
+                           differentiable_outputs: list[bool] | None = None
+                           ) -> OpDerivatives:
     """Analyze one op's derivative formulas into node layout + call info."""
     node_name = node_name or autograd_node_name(func.func_name)
 
@@ -637,6 +640,7 @@ def compute_op_derivatives(func: NativeFunction, raw_formulas: dict[str, str],
         grad_slots=grad_slots, members=members,
         used_input_names={m for m, _ in members} & arg_names,
         used_output_names={m for m, _ in members} & output_names,
+        differentiable_outputs=differentiable_outputs,
         fw_formulas=fw_formulas,
         fw_required_tangent=fw_required_tangent,
         fw_required_primal=fw_required_primal,
@@ -664,6 +668,17 @@ def load_derivatives(path: str, native_by_opname: dict[str, NativeFunction]) \
         # so outputs with a declared name always route forward.
         output_keys = {"result"}
         output_keys.update(d.name for d in native.returns if d.name)
+        output_differentiability = item.get("output_differentiability")
+        if output_differentiability is not None:
+            if not isinstance(output_differentiability, list) or any(
+                    type(value) is not bool for value in output_differentiability):
+                raise ValueError(
+                    f"output_differentiability for '{op}' must be a list of booleans")
+            if len(output_differentiability) != len(native.returns):
+                raise ValueError(
+                    f"output_differentiability for '{op}' has "
+                    f"{len(output_differentiability)} entries for "
+                    f"{len(native.returns)} outputs")
         arg_names = {a.name for a in native.args}
         raw: dict[str, str] = {}
         fw_raw: dict[str, str] = {}
@@ -705,8 +720,11 @@ def load_derivatives(path: str, native_by_opname: dict[str, NativeFunction]) \
                             f"{sorted(arg_names)} nor a declared output")
                     fw_raw[name] = formula
         if raw or fw_raw:
-            out[op] = compute_op_derivatives(native, raw, fw_raw=fw_raw or None)
-        elif item.get("output_differentiability") == [False]:
+            out[op] = compute_op_derivatives(
+                native, raw, fw_raw=fw_raw or None,
+                differentiable_outputs=output_differentiability)
+        elif output_differentiability is not None and not any(
+                output_differentiability):
             # Non-differentiable output: register the autograd wrapper so the
             # dispatch chain resolves above the backend key, but emit no
             # backward node and keep the outputs detached.
@@ -719,6 +737,7 @@ def load_derivatives(path: str, native_by_opname: dict[str, NativeFunction]) \
                 used_input_names=set(),
                 used_output_names=set(),
                 non_differentiable_output=True,
+                differentiable_outputs=output_differentiability,
             )
 
     # Manual (hand-written) backwards: register their saved-state layout so
@@ -739,6 +758,8 @@ def load_derivatives(path: str, native_by_opname: dict[str, NativeFunction]) \
             members=members,
             used_input_names=set(spec["saved"]), used_output_names=set(),
             fw_formulas=prev.fw_formulas if prev else {},
+            differentiable_outputs=(
+                prev.differentiable_outputs if prev else None),
             fw_required_tangent=prev.fw_required_tangent if prev else [],
             fw_required_primal=prev.fw_required_primal if prev else [],
         )
@@ -829,8 +850,28 @@ def generate_autograd_nodes(
             for m, _t in dv.members:
                 if m in tensor_members:
                     lines.append(f"        const Tensor {m}_sv = {m}_.unpack();")
+            # A backward pass without retain_graph releases saved state once
+            # the walk finishes. Re-entering such a node must not touch the
+            # released storage: the subgraph is already consumed, so every
+            # grad slot goes out undefined and propagation stops here.
+            required = [m for m, _t in dv.members if m in tensor_members]
+            cond = " || ".join(f"!{m}_sv.defined()" for m in required)
+            lines.append(f"        if ({cond}) return {{{undef}}};")
         lines.append("")
         lines.append("        variable_list grads;")
+
+        uses_grad_input_mask = False
+        for expr in dv.formulas.values():
+            formula_vars: set[str] = set()
+            collect_vars(expr, formula_vars)
+            uses_grad_input_mask = uses_grad_input_mask or (
+                "grad_input_mask" in formula_vars)
+        if uses_grad_input_mask:
+            lines.append("        std::vector<bool> grad_input_mask;")
+            lines.append("        grad_input_mask.reserve(next_edges().size());")
+            for slot_idx in range(n_slots):
+                lines.append(
+                    f"        grad_input_mask.push_back(next_edges()[{slot_idx}].is_valid());")
 
         # Common-subexpression elimination: identical Call sub-expressions
         # shared across gradient slots are evaluated once (generalizes

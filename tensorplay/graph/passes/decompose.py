@@ -72,6 +72,8 @@ def _sigmoid(graph: Graph, node: Node) -> Node:
 @_method("silu")
 def _silu(graph: Graph, node: Node) -> Node:
     """silu(x) -> x * sigmoid(x)"""
+    if node.kwargs.get("inplace", False):
+        return node
     x = node.args[0]
     sig = _DECOMP_METHODS["sigmoid"](graph, node)
     return _binop(graph, operator.mul, x, sig)
@@ -494,6 +496,8 @@ def _softshrink(graph: Graph, node: Node) -> Node:
 def _threshold(graph: Graph, node: Node) -> Node:
     """threshold(x, t, v) -> where(x > t, x, v)"""
 
+    if node.kwargs.get("inplace", False):
+        return node
     x = node.args[0]
     level = _scalar_arg(node, 1, "threshold")
     value = _scalar_arg(node, 2, "value")

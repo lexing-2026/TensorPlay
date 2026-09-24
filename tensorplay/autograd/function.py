@@ -1,5 +1,6 @@
 import functools
 import warnings
+import weakref
 
 import tensorplay
 import tensorplay._C._autograd as _autograd
@@ -121,6 +122,20 @@ def _make_backward(ctx, cls):
             if replaced is not None:
                 results = tuple(replaced)
         return results
+
+    return backward
+
+
+def _make_direct_backward(ctx, cls):
+    """Bind a fixed custom backward without retaining its context cycle."""
+
+    context_ref = weakref.ref(ctx)
+
+    def backward(*grads):
+        context = context_ref()
+        if context is None:
+            raise RuntimeError("autograd context was released before backward")
+        return cls.backward(context, *grads)
 
     return backward
 
@@ -508,7 +523,11 @@ class Function(metaclass=FunctionMeta):
                     ctx._engine_materializes = False
                 else:
                     ctx._engine_materializes = True
-                ctx.backward = _make_backward(ctx, cls)
+                ctx.backward = (
+                    _make_direct_backward(ctx, cls)
+                    if getattr(cls, "_tensorplay_direct_backward", False)
+                    else _make_backward(ctx, cls)
+                )
                 return _maybe_process_forward_ad(cls, ctx, args, output)
             return _maybe_process_forward_ad(cls, ctx, args, output)
 
@@ -651,7 +670,11 @@ class Function(metaclass=FunctionMeta):
 
             attach_all(output)
 
-        ctx.backward = _make_backward(ctx, cls)
+        ctx.backward = (
+            _make_direct_backward(ctx, cls)
+            if getattr(cls, "_tensorplay_direct_backward", False)
+            else _make_backward(ctx, cls)
+        )
         return _maybe_process_forward_ad(cls, ctx, args, output)
 
 

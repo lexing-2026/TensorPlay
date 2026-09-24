@@ -100,12 +100,16 @@ struct PythonDispatchTLS {
     std::vector<std::pair<std::string, PyTypeObject*>> active_hooks;
 
     ~PythonDispatchTLS() {
-        if (!python_c::interpreter_active()) return;
-        PyGILState_STATE gil = PyGILState_Ensure();
+        // Thread-local state can outlive the interpreter.  Acquiring the GIL
+        // from a thread that does not already own it is unsafe once teardown
+        // has started, even when the activity probe raced with finalization.
+        // The interpreter releases these references during shutdown; a
+        // terminating native thread may therefore leave its private entries
+        // untouched.
+        if (!python_c::interpreter_active() || !PyGILState_Check()) return;
         for (PyObject* mode : function_modes) {
             Py_XDECREF(mode);
         }
-        PyGILState_Release(gil);
     }
 };
 

@@ -2,6 +2,7 @@
 #include "Dispatcher.h"
 #include "CUDAContext.h"
 #include "TypePromotion.h"
+#include "ForeachMultiTensor.cuh"
 #include <vector>
 #include <algorithm>
 #include <numeric>
@@ -42,6 +43,39 @@ inline int64_t checked_shape_add(int64_t lhs, int64_t rhs, const char* op) {
         TP_THROW(ValueError, op, ": output size is too large");
     }
     return lhs + rhs;
+}
+
+bool stack_scalar_fast_path(const std::vector<Tensor>& tensors, Tensor& out) {
+    if (tensors.empty() || tensors.front().dim() != 0 ||
+        tensors.front().is_sparse() || !tensors.front().is_contiguous() ||
+        !foreach_mta::supported_dtype(tensors.front().dtype())) {
+        return false;
+    }
+    const Tensor& first = tensors.front();
+    for (const Tensor& tensor : tensors) {
+        if (!tensor.defined() || tensor.dim() != 0 || tensor.numel() != 1 ||
+            tensor.is_sparse() || !tensor.is_contiguous() ||
+            tensor.dtype() != first.dtype() || tensor.device() != first.device()) {
+            return false;
+        }
+    }
+
+    out = Tensor::empty({static_cast<int64_t>(tensors.size())},
+                        first.dtype(), first.device());
+    std::vector<Tensor> slices;
+    slices.reserve(tensors.size());
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        slices.push_back(out.slice(0, static_cast<int64_t>(i),
+                                   static_cast<int64_t>(i + 1)));
+    }
+    const bool launched = foreach_mta::dispatch_dtype(
+        first.dtype(), [&]<typename T, typename M>() {
+            foreach_mta::launch<2, 1, T, M>(
+                std::array<const std::vector<Tensor>*, 2>{&tensors, &slices},
+                foreach_mta::BinaryMulScalar<M>{M(1)},
+                "stack scalar CUDA fast path");
+        });
+    return launched;
 }
 
 Tensor view_as_real_cuda(const Tensor& self) {
@@ -525,6 +559,10 @@ Tensor stack_kernel_cuda(const std::vector<Tensor>& tensors, int64_t dim) {
     // check_stack_inputs, then cat of unsqueezed inputs (dtype promotion
     if (tensors.empty()) {
         TP_THROW(RuntimeError, "stack expects a non-empty TensorList");
+    }
+    Tensor scalar_result;
+    if (dim == 0 && stack_scalar_fast_path(tensors, scalar_result)) {
+        return scalar_result;
     }
     const int64_t ndim = tensors[0].dim();
     dim = join_detail::wrap_dim(dim, ndim + 1);

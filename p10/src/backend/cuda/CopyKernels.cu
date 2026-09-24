@@ -624,6 +624,40 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
                               .add_output(self)
                               .add_input(src_cuda_tensor)
                               .build();
+
+    if (self.dtype() == DType::Float16 &&
+        src_cuda_tensor.dtype() == DType::Float32) {
+        gpu_kernel_nocast(iter, [] __host__ __device__(float value) {
+            return Half(value);
+        });
+        checkCuda(cudaGetLastError(), "CUDA float-to-half copy kernel");
+        return self;
+    }
+    if (self.dtype() == DType::BFloat16 &&
+        src_cuda_tensor.dtype() == DType::Float32) {
+        gpu_kernel_nocast(iter, [] __host__ __device__(float value) {
+            return BFloat16(value);
+        });
+        checkCuda(cudaGetLastError(), "CUDA float-to-bfloat16 copy kernel");
+        return self;
+    }
+    if (self.dtype() == DType::Float32 &&
+        src_cuda_tensor.dtype() == DType::Float16) {
+        gpu_kernel_nocast(iter, [] __host__ __device__(Half value) {
+            return static_cast<float>(value);
+        });
+        checkCuda(cudaGetLastError(), "CUDA half-to-float copy kernel");
+        return self;
+    }
+    if (self.dtype() == DType::Float32 &&
+        src_cuda_tensor.dtype() == DType::BFloat16) {
+        gpu_kernel_nocast(iter, [] __host__ __device__(BFloat16 value) {
+            return static_cast<float>(value);
+        });
+        checkCuda(cudaGetLastError(), "CUDA bfloat16-to-float copy kernel");
+        return self;
+    }
+
     switch (self.dtype()) {
 #define TP_COPY_CAST_CASE(ctype, name)                                     \
         case DType::name:                                                  \

@@ -26,17 +26,19 @@ inline Tensor linear_backward_input(const Tensor& grad, const Tensor& input,
     if (!grad.defined()) return Tensor();
     const bool vector_input = input.dim() <= 1;
     Tensor g = grad.dim() == 1 ? ops::reshape(grad, {1, grad.size(0)}) : grad;
+    if (g.dtype() != weight.dtype()) g = g.to(weight.dtype());
     // product of leading dims of input == rows of g either way.
     Tensor gxw = ops::matmul(g, weight);
     if (vector_input) {
         std::vector<int64_t> in_sizes(
             static_cast<std::vector<int64_t>>(input.shape()));
-        return ops::reshape(gxw, in_sizes);
+        gxw = ops::reshape(gxw, in_sizes);
+    } else {
+        auto target = static_cast<std::vector<int64_t>>(input.shape());
+        if (gxw.dim() != static_cast<int64_t>(target.size()))
+            gxw = ops::reshape(gxw, target);
     }
-    auto target = static_cast<std::vector<int64_t>>(input.shape());
-    if (gxw.dim() != static_cast<int64_t>(target.size()))
-        return ops::reshape(gxw, target);
-    return gxw;
+    return gxw.dtype() == input.dtype() ? gxw : gxw.to(input.dtype());
 }
 
 inline Tensor linear_backward_weight(const Tensor& grad, const Tensor& input,
@@ -51,7 +53,9 @@ inline Tensor linear_backward_weight(const Tensor& grad, const Tensor& input,
         : ops::reshape(input, {1, input.size(0)});
     Tensor g = grad.dim() == 1 ? ops::reshape(grad, {1, n})
                                 : ops::reshape(grad, {-1, n});
-    return ops::matmul(ops::transpose(g, -2, -1), x);
+    if (g.dtype() != x.dtype()) g = g.to(x.dtype());
+    Tensor result = ops::matmul(ops::transpose(g, -2, -1), x);
+    return result.dtype() == weight.dtype() ? result : result.to(weight.dtype());
 }
 
 inline Tensor linear_backward_bias(const Tensor& grad) {
@@ -526,13 +530,19 @@ struct MatmulBackward : public Node {
             return out;
         };
 
-        Tensor grad_self = ops::matmul(grad_m, adjoint(other_m));
+        Tensor grad_for_self = grad_m;
+        if (grad_for_self.dtype() != other_m.dtype())
+            grad_for_self = grad_for_self.to(other_m.dtype());
+        Tensor grad_self = ops::matmul(grad_for_self, adjoint(other_m));
         grad_self = reduce_to(grad_self, self_m);
         if (self_vector) grad_self = ops::squeeze(grad_self, 0);
         if (grad_self.dtype() != self.dtype())
             grad_self = grad_self.to(self.dtype());
 
-        Tensor grad_other = ops::matmul(adjoint(self_m), grad_m);
+        Tensor grad_for_other = grad_m;
+        if (grad_for_other.dtype() != self_m.dtype())
+            grad_for_other = grad_for_other.to(self_m.dtype());
+        Tensor grad_other = ops::matmul(adjoint(self_m), grad_for_other);
         grad_other = reduce_to(grad_other, other_m);
         if (other_vector) grad_other = ops::squeeze(grad_other, -1);
         if (grad_other.dtype() != other.dtype())
@@ -756,7 +766,7 @@ inline Tensor mul_tensor_backward(const Tensor& grad, const T& other,
     if constexpr (std::is_same_v<T, Scalar>) {
         scaled = grad * scalar_conj_if_complex(other);
     } else {
-        scaled = grad * ops::conj(other);
+        scaled = grad * (isComplexType(other.dtype()) ? ops::conj(other) : other);
     }
     return handle_r_to_c(self_st, std::move(scaled));
 }
@@ -769,7 +779,7 @@ inline Tensor div_tensor_self_backward(const Tensor& grad, const T& other,
     if constexpr (std::is_same_v<T, Scalar>) {
         scaled = grad / scalar_conj_if_complex(other);
     } else {
-        scaled = grad / ops::conj(other);
+        scaled = grad / (isComplexType(other.dtype()) ? ops::conj(other) : other);
     }
     return handle_r_to_c(self_st, std::move(scaled));
 }
@@ -779,6 +789,9 @@ inline Tensor div_tensor_self_backward(const Tensor& grad, const T& other,
 inline Tensor div_tensor_other_backward(const Tensor& grad,
                                         const Tensor& self,
                                         const Tensor& other) {
+    if (!isComplexType(self.dtype()) && !isComplexType(other.dtype())) {
+        return handle_r_to_c(other.dtype(), -(grad * (self / other / other)));
+    }
     return handle_r_to_c(
         other.dtype(), -(grad * ops::conj(self / other / other)));
 }

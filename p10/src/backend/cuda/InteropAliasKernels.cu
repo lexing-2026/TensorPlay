@@ -1125,46 +1125,6 @@ std::tuple<Tensor, Tensor, Tensor> interop_native_layer_norm_backward_cuda(
 }
 
 // ---------------------------------------------------------------------------
-// native_group_norm: group_norm output plus per-(batch, group) statistics.
-// ---------------------------------------------------------------------------
-
-std::tuple<Tensor, Tensor, Tensor> interop_native_group_norm_cuda(
-        const Tensor& input, const std::optional<Tensor>& weight,
-        const std::optional<Tensor>& bias, int64_t N, int64_t C, int64_t HxW,
-        int64_t group, double eps) {
-    Tensor out = dispatch_cuda<Tensor>("group_norm", input, group, weight,
-                                       bias, eps);
-    // Rows are (batch, group) pairs, each covering HxW * C/group elements.
-    const int64_t group_size = HxW * (C / (group == 0 ? 1 : group));
-    Tensor x = input.reshape({N * group, group_size});
-    Tensor mean = ops::mean(x, {1}).reshape({N, group});
-    Tensor var = ops::var(x, {1}, 0, false).reshape({N, group});
-    Tensor rstd = ops::rsqrt(ops::add(var, Scalar(eps)));
-    return std::make_tuple(out, mean, rstd);
-}
-
-std::tuple<Tensor, Tensor, Tensor> interop_native_group_norm_backward_cuda(
-        const Tensor& grad_out, const Tensor& input, const Tensor& /*mean*/,
-        const Tensor& /*rstd*/, const std::optional<Tensor>& weight, int64_t N,
-        int64_t C, int64_t HxW, int64_t group,
-        const std::vector<bool>& output_mask) {
-    (void)N;
-    (void)HxW;
-    // tp's group_norm_backward recomputes the group statistics internally;
-    // the saved mean/rstd are accepted to honor the spelling's contract.
-    auto grads = dispatch_cuda<std::tuple<Tensor, Tensor, Tensor>>(
-        "group_norm_backward", grad_out, input, group, weight,
-        std::optional<Tensor>(), 0.0);
-    Tensor gi = output_mask.size() > 0 && output_mask[0] ? std::get<0>(grads)
-                                                        : Tensor();
-    Tensor gw = output_mask.size() > 1 && output_mask[1] ? std::get<1>(grads)
-                                                        : Tensor();
-    Tensor gb = output_mask.size() > 2 && output_mask[2] ? std::get<2>(grads)
-                                                        : Tensor();
-    return std::make_tuple(gi, gw, gb);
-}
-
-// ---------------------------------------------------------------------------
 // _fft_r2c / _fft_c2r / _fft_c2c: single-dimension transform spellings of
 // the public fft kernels, which always transform the last dimension, so the
 // requested dimension is permuted there first and restored afterwards.
@@ -1914,8 +1874,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, InteropAliasKernels) {
     // layer / group normalization
     m.impl("native_layer_norm", interop_native_layer_norm_cuda);
     m.impl("native_layer_norm_backward", interop_native_layer_norm_backward_cuda);
-    m.impl("native_group_norm", interop_native_group_norm_cuda);
-    m.impl("native_group_norm_backward", interop_native_group_norm_backward_cuda);
 
     // fft spellings
     m.impl("_fft_r2c", interop__fft_r2c_cuda);

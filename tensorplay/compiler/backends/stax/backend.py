@@ -66,9 +66,12 @@ def _native_output_spec(value: Any, values: dict[Node, Any]) -> Any:
         if isinstance(native, tuple):
             custom = value.meta.get("custom")
             template = custom.get("nested_output_template") if isinstance(custom, dict) else None
-            if template is None:
-                raise RuntimeError("native multi-output node has no output template")
-            return ("nested", template)
+            if template is not None:
+                return ("nested", template)
+            # Native view operators expose a flat tuple of Tensor values.
+            # Their graph output is already the public tuple, so no custom
+            # pytree template is needed to rebuild it.
+            return ("tuple", tuple(("leaf",) for _ in native))
         if native is None:
             raise RuntimeError(f"native graph has no value for output {value.name!r}")
         return ("leaf",)
@@ -151,20 +154,108 @@ _NATIVE_OPS = {
     "log",
     "sigmoid",
     "sqrt",
+    "rsqrt",
     "square",
     "tanh",
+    "sign",
     "relu",
+    "silu",
+    "conj",
+    "acos",
+    "acosh",
+    "asin",
+    "asinh",
+    "atan",
+    "atanh",
+    "ceil",
+    "cosh",
+    "erf",
+    "erfc",
+    "exp2",
+    "expm1",
+    "floor",
+    "log1p",
+    "log2",
+    "reciprocal",
+    "round",
+    "sinh",
+    "tan",
+    "trunc",
+    "erfinv",
+    "erfcx",
+    "lgamma",
+    "i0",
+    "tanhshrink",
+    "eq",
+    "ne",
+    "lt",
+    "le",
+    "gt",
+    "ge",
+    "where",
+    "clamp",
+    "clamp_min",
+    "clamp_max",
+    "gelu",
+    "softmax",
+    "log_softmax",
+    "layer_norm",
+    "transpose",
+    "select",
+    "slice",
+    "stack",
+    "repeat",
+    "index_select",
+    "gather",
+    "embedding",
+    "constant_pad_nd",
+    "pad",
     "mm",
     # Tensor kernels used by the ResNet inference graph.  These are kept in
     # the native graph instead of falling back to the generated Python
     # executor; the latter still calls every functional wrapper through the
     # interpreter and is not a compiled path in any meaningful sense.
     "conv2d",
+    "conv2d_relu",
     "add_relu",
     "batch_norm",
+    "max_pool1d",
     "max_pool2d",
+    "max_pool3d",
+    "max_pool1d_with_indices",
+    "max_pool2d_with_indices",
+    "max_pool3d_with_indices",
+    "avg_pool1d",
+    "avg_pool3d",
     "adaptive_avg_pool2d",
+    "adaptive_avg_pool1d",
+    "adaptive_avg_pool3d",
+    "adaptive_max_pool1d",
+    "adaptive_max_pool2d",
+    "adaptive_max_pool3d",
     "flatten",
+    "view",
+    "reshape",
+    "permute",
+    "permute_backward",
+    "contiguous",
+    "unsqueeze",
+    "squeeze",
+    "zeros_like",
+    "float",
+    "group_norm",
+    "avg_pool2d",
+    "interpolate",
+    "scaled_dot_product_attention",
+    "dropout",
+    "sum",
+    "mean",
+    "cat",
+    "expand",
+    "chunk",
+    "split",
+    "split_with_sizes",
+    "unbind",
 }
 
 # The fused-op name set is shared by the graph pass and this lowering.
@@ -257,6 +348,16 @@ def _set_scalar_attr(native_node: Any, value: Any, position: int) -> None:
     native_node.set_int_attr("scalar_position", position)
 
 
+def _set_named_scalar_attr(native_node: Any, key: str, value: Any) -> bool:
+    if isinstance(value, bool) or isinstance(value, int):
+        native_node.set_int_attr(key, int(value))
+    elif isinstance(value, numbers.Real):
+        native_node.set_float_attr(key, float(value))
+    else:
+        return False
+    return True
+
+
 def _int_list(value: Any) -> list[int] | None:
     """Return a constant integer list accepted by a native Stax node."""
 
@@ -265,6 +366,28 @@ def _int_list(value: Any) -> list[int] | None:
     if any(isinstance(item, bool) or not isinstance(item, int) for item in value):
         return None
     return [int(item) for item in value]
+
+
+def _spatial_int_list(
+    value: Any,
+    *,
+    default: list[int] | None = None,
+    length: int = 2,
+) -> list[int] | None:
+    """Normalize a scalar or fixed-rank spatial argument."""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return [int(value)] * int(length)
+    if value is None:
+        return None if default is None else list(default)
+    result = _int_list(value)
+    if result == [] and default is not None:
+        return list(default)
+    if result is None or len(result) != int(length):
+        return None
+    return result
 
 
 def _set_int_list_attr(native_node: Any, key: str, value: Any) -> bool:
@@ -2990,6 +3113,7 @@ def _lower_native(
 
     graph = native_module.Graph()
     values: dict[Node, Any] = {}
+    literal_values: dict[int, Any] = {}
     attribute_targets: list[str] = []
     constant_values: list[Any] = []
     folded_convs = _fold_eval_conv_batch_norm(graph_module, example_inputs)
@@ -3187,6 +3311,24 @@ def _lower_native(
             and node.target is operator.getitem
             and len(node.args) == 2
             and isinstance(node.args[0], Node)
+            and isinstance(node.args[1], tuple)
+            and len(node.args[1]) == 2
+            and isinstance(node.args[1][0], slice)
+            and node.args[1][0] == slice(None)
+            and node.args[1][1] is None
+            and node.args[0] in values
+        ):
+            native_node = graph.create_node("unsqueeze", node.name)
+            native_node.add_input(values[node.args[0]])
+            native_node.set_int_attr("dim", 1)
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+        if (
+            node.op == "call_function"
+            and node.target is operator.getitem
+            and len(node.args) == 2
+            and isinstance(node.args[0], Node)
             and isinstance(node.args[1], int)
             and isinstance(values.get(node.args[0]), tuple)
         ):
@@ -3226,10 +3368,44 @@ def _lower_native(
         # The native kernel accepts that schema explicitly; other keyword
         # combinations are rejected by this lowering.
         if node.kwargs:
-            if (
-                op_name != "relu"
-                or node.kwargs not in ({"inplace": False}, {"inplace": True})
-            ):
+            if op_name == "relu":
+                if node.kwargs not in ({"inplace": False}, {"inplace": True}):
+                    return None
+            elif op_name == "silu":
+                # The native graph has no mutation output for SiLU. Preserve
+                # the in-place contract by using the general executor there.
+                if node.kwargs not in ({"inplace": False},):
+                    return None
+            elif op_name not in {
+                "sum",
+                "mean",
+                "add",
+                "sub",
+                "silu",
+                "gelu",
+                "softmax",
+                "log_softmax",
+                "layer_norm",
+                "where",
+                "clamp",
+                "clamp_min",
+                "clamp_max",
+                "unsqueeze",
+                "squeeze",
+                "zeros_like",
+                "permute_backward",
+                "expand",
+                "cat",
+                "chunk",
+                "split",
+                "split_with_sizes",
+                "unbind",
+                "slice",
+                "stack",
+                "repeat",
+                "embedding",
+                "scaled_dot_product_attention",
+            }:
                 return None
         if op_name in {"add_", "sub_", "mul_"}:
             # In-place updates of module state (e.g. a batch counter) have no
@@ -3281,9 +3457,35 @@ def _lower_native(
             continue
 
         def node_value(value: Any) -> Any | None:
-            if not isinstance(value, Node) or value not in values:
+            if isinstance(value, Node):
+                return values.get(value)
+            if isinstance(value, tensor_type):
+                key = id(value)
+                resolved = literal_values.get(key)
+                if resolved is None:
+                    resolved = graph.add_input()
+                    literal_values[key] = resolved
+                    constant_values.append(value)
+                return resolved
+            return None
+
+        def sample_value(value: Any) -> Any | None:
+            if not isinstance(value, Node):
                 return None
-            return values[value]
+            sample = _traced_value(graph_module, value)
+            if sample is not None:
+                return sample
+            if value.op == "placeholder":
+                try:
+                    return example_inputs[graph_module.graph.placeholders.index(value)]
+                except (ValueError, IndexError):
+                    return None
+            if value.op == "get_attr":
+                try:
+                    return graph_module._get_attr(value.target)
+                except (AttributeError, KeyError, RuntimeError):
+                    return None
+            return None
 
         def add_tensor_input(native_node: Any, value: Any) -> bool:
             resolved = node_value(value)
@@ -3292,12 +3494,713 @@ def _lower_native(
             native_node.add_input(resolved)
             return True
 
-        if op_name == "conv2d":
+        if op_name in {"eq", "ne", "lt", "le", "gt", "ge"}:
+            if len(node.args) != 2 or node.kwargs:
+                return None
+            lhs, rhs = node.args
+            lhs_is_tensor = isinstance(lhs, (Node, tensor_type))
+            rhs_is_tensor = isinstance(rhs, (Node, tensor_type))
+            if lhs_is_tensor == rhs_is_tensor:
+                if not lhs_is_tensor:
+                    return None
+            elif not lhs_is_tensor and not _is_scalar(lhs):
+                return None
+            elif not rhs_is_tensor and not _is_scalar(rhs):
+                return None
+            native_node = graph.create_node(op_name, node.name)
+            if lhs_is_tensor and not add_tensor_input(native_node, lhs):
+                return None
+            if rhs_is_tensor and not add_tensor_input(native_node, rhs):
+                return None
+            if not lhs_is_tensor:
+                _set_scalar_attr(native_node, lhs, 0)
+            elif not rhs_is_tensor:
+                _set_scalar_attr(native_node, rhs, 1)
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "where":
+            if len(node.args) != 3 or node.kwargs:
+                return None
+            condition, self_value, other_value = node.args
+            if not isinstance(condition, Node) or condition not in values:
+                return None
+            self_is_tensor = isinstance(self_value, (Node, tensor_type))
+            other_is_tensor = isinstance(other_value, (Node, tensor_type))
+            if not self_is_tensor and not _is_scalar(self_value):
+                return None
+            if not other_is_tensor and not _is_scalar(other_value):
+                return None
+            native_node = graph.create_node("where", node.name)
+            native_node.add_input(values[condition])
+            if self_is_tensor:
+                if not add_tensor_input(native_node, self_value):
+                    return None
+            elif not _set_named_scalar_attr(native_node, "self_scalar", self_value):
+                return None
+            if other_is_tensor:
+                if not add_tensor_input(native_node, other_value):
+                    return None
+            elif not _set_named_scalar_attr(native_node, "other_scalar", other_value):
+                return None
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name in {"clamp", "clamp_min", "clamp_max"}:
+            if not node.args or not isinstance(node.args[0], Node):
+                return None
+            if node.kwargs and set(node.kwargs) - {"min", "max"}:
+                return None
+            source = node.args[0]
+            if source not in values:
+                return None
+            args = list(node.args[1:])
+            kwargs = dict(node.kwargs or {})
+            if op_name == "clamp":
+                if len(args) > 2 or (args and "min" in kwargs) or (
+                    len(args) > 1 and "max" in kwargs
+                ):
+                    return None
+                lower = args[0] if args else kwargs.get("min")
+                upper = args[1] if len(args) > 1 else kwargs.get("max")
+                if lower is None and upper is None:
+                    return None
+            else:
+                if len(args) != 1 or kwargs:
+                    return None
+                lower = args[0] if op_name == "clamp_min" else None
+                upper = args[0] if op_name == "clamp_max" else None
+            native_node = graph.create_node(op_name, node.name)
+            native_node.add_input(values[source])
+            for key, bound in (("min", lower), ("max", upper)):
+                tensor_bound = isinstance(bound, (Node, tensor_type))
+                native_node.set_int_attr(
+                    "min_tensor" if key == "min" else "max_tensor",
+                    int(tensor_bound),
+                )
+                if bound is None:
+                    continue
+                if tensor_bound:
+                    if not add_tensor_input(native_node, bound):
+                        return None
+                elif not _set_named_scalar_attr(
+                    native_node, "min_scalar" if key == "min" else "max_scalar", bound
+                ):
+                    return None
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "gelu":
+            if len(node.args) != 1 or not isinstance(node.args[0], Node):
+                return None
+            approximate = node.kwargs.get("approximate", "none")
+            if not isinstance(approximate, str) or approximate not in {"none", "tanh"}:
+                return None
+            native_node = graph.create_node("gelu", node.name)
+            if not add_tensor_input(native_node, node.args[0]):
+                return None
+            native_node.set_str_attr("approximate", approximate)
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name in {"softmax", "log_softmax"}:
+            if not node.args or not isinstance(node.args[0], Node):
+                return None
+            kwargs = dict(node.kwargs or {})
+            source = node.args[0]
+            if node.op == "call_method":
+                if len(node.args) not in {2, 3} or kwargs:
+                    return None
+                dim = node.args[1]
+                dtype = node.args[2] if len(node.args) == 3 else tensorplay.undefined
+            else:
+                if len(node.args) not in {2, 3}:
+                    return None
+                dim = node.args[1]
+                dtype = node.args[2] if len(node.args) == 3 else tensorplay.undefined
+            if source not in values or isinstance(dim, bool) or not isinstance(dim, int):
+                return None
+            if dtype is None:
+                dtype = tensorplay.undefined
+            dtype_name = getattr(dtype, "name", None)
+            if dtype_name != "undefined":
+                return None
+            native_node = graph.create_node(op_name, node.name)
+            native_node.add_input(values[source])
+            native_node.set_int_attr("dim", int(dim))
+            native_node.set_int_attr("dtype", 22)
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "layer_norm":
+            if len(node.args) != 5 or node.kwargs:
+                return None
+            source, normalized_shape, weight, bias, eps = node.args
+            if not isinstance(source, Node) or source not in values:
+                return None
+            shape = _int_list(normalized_shape)
+            if shape is None or not isinstance(eps, numbers.Real):
+                return None
+            native_node = graph.create_node("layer_norm", node.name)
+            native_node.add_input(values[source])
+            native_node.set_ints_attr("normalized_shape", shape)
+            for attr_name, optional_node in (("has_weight", weight), ("has_bias", bias)):
+                if optional_node is None:
+                    native_node.set_int_attr(attr_name, 0)
+                elif add_tensor_input(native_node, optional_node):
+                    native_node.set_int_attr(attr_name, 1)
+                else:
+                    return None
+            native_node.set_float_attr("eps", float(eps))
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "transpose":
+            if len(node.args) != 3 or node.kwargs:
+                return None
+            source, dim0, dim1 = node.args
+            if not isinstance(source, Node) or source not in values:
+                return None
+            if any(isinstance(dim, bool) or not isinstance(dim, int) for dim in (dim0, dim1)):
+                return None
+            native_node = graph.create_node("transpose", node.name)
+            native_node.add_input(values[source])
+            native_node.set_int_attr("dim0", int(dim0))
+            native_node.set_int_attr("dim1", int(dim1))
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "select":
+            if len(node.args) != 3 or node.kwargs:
+                return None
+            source, dim, index = node.args
+            if not isinstance(source, Node) or source not in values:
+                return None
+            if any(isinstance(item, bool) or not isinstance(item, int) for item in (dim, index)):
+                return None
+            native_node = graph.create_node("select", node.name)
+            native_node.add_input(values[source])
+            native_node.set_int_attr("dim", int(dim))
+            native_node.set_int_attr("index", int(index))
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "slice":
+            if not node.args or not isinstance(node.args[0], Node):
+                return None
+            if node.kwargs:
+                return None
+            args = list(node.args[1:])
+            if len(args) > 4:
+                return None
+            args.extend([None] * (4 - len(args)))
+            dim, start, end, step = args
+            if not isinstance(dim, int) or isinstance(dim, bool):
+                return None
+            if step is None:
+                step = 1
+            if not isinstance(step, int) or isinstance(step, bool) or step <= 0:
+                return None
+            native_node = graph.create_node("slice", node.name)
+            native_node.add_input(values[node.args[0]])
+            native_node.set_int_attr("dim", int(dim))
+            native_node.set_int_attr("step", int(step))
+            for key, bound in (("start", start), ("end", end)):
+                if bound is None:
+                    native_node.set_int_attr("has_" + key, 0)
+                elif isinstance(bound, int) and not isinstance(bound, bool):
+                    native_node.set_int_attr("has_" + key, 1)
+                    native_node.set_int_attr(key, int(bound))
+                else:
+                    return None
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "stack":
+            if not node.args or not isinstance(node.args[0], (tuple, list)):
+                return None
+            tensors = node.args[0]
+            dim = node.args[1] if len(node.args) > 1 else 0
+            if node.kwargs or not tensors or not isinstance(dim, int):
+                return None
+            native_node = graph.create_node("stack", node.name)
+            for item in tensors:
+                if not add_tensor_input(native_node, item):
+                    return None
+            native_node.set_int_attr("dim", int(dim))
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "repeat":
+            if len(node.args) != 2 or node.kwargs or not isinstance(node.args[0], Node):
+                return None
+            repeats = _int_list(node.args[1])
+            if repeats is None or node.args[0] not in values:
+                return None
+            native_node = graph.create_node("repeat", node.name)
+            native_node.add_input(values[node.args[0]])
+            native_node.set_ints_attr("repeats", repeats)
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "index_select" or op_name == "gather":
+            kwargs = dict(node.kwargs or {})
+            if node.op == "call_method":
+                if set(kwargs) - {"dim", "index"} or not node.args:
+                    return None
+                source = node.args[0]
+                positional = list(node.args[1:])
+                if len(positional) > 2:
+                    return None
+                if positional and "dim" in kwargs:
+                    return None
+                if len(positional) > 1 and "index" in kwargs:
+                    return None
+                dim = positional[0] if positional else kwargs.get("dim")
+                index = positional[1] if len(positional) > 1 else kwargs.get("index")
+                if dim is None or index is None:
+                    return None
+            else:
+                if len(node.args) > 3 or set(kwargs) - {"dim", "index"}:
+                    return None
+                source = node.args[0]
+                if len(node.args) > 1 and "dim" in kwargs:
+                    return None
+                if len(node.args) > 2 and "index" in kwargs:
+                    return None
+                dim = node.args[1] if len(node.args) > 1 else kwargs.get("dim")
+                index = node.args[2] if len(node.args) > 2 else kwargs.get("index")
+                if dim is None or index is None:
+                    return None
+            if not isinstance(source, Node) or source not in values:
+                return None
+            if not isinstance(dim, int) or isinstance(dim, bool):
+                return None
+            if node_value(index) is None:
+                return None
+            native_node = graph.create_node(op_name, node.name)
+            native_node.add_input(values[source])
+            if not add_tensor_input(native_node, index):
+                return None
+            native_node.set_int_attr("dim", int(dim))
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "embedding":
+            if len(node.args) != 7 or node.kwargs:
+                return None
+            index_node, weight_node, padding_idx, max_norm, norm_type, scale_grad_by_freq, sparse = node.args
+            if not isinstance(index_node, Node) or not isinstance(weight_node, Node):
+                return None
+            if index_node not in values or weight_node not in values:
+                return None
+            if max_norm is not None or norm_type != 2.0:
+                return None
+            if not isinstance(padding_idx, (int, type(None))) or isinstance(padding_idx, bool):
+                return None
+            if not isinstance(scale_grad_by_freq, bool) or not isinstance(sparse, bool):
+                return None
+            native_node = graph.create_node("embedding", node.name)
+            native_node.add_input(values[weight_node])
+            native_node.add_input(values[index_node])
+            native_node.set_int_attr("padding_idx", -1 if padding_idx is None else int(padding_idx))
+            native_node.set_int_attr("scale_grad_by_freq", int(scale_grad_by_freq))
+            native_node.set_int_attr("sparse", int(sparse))
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name in {"constant_pad_nd", "pad"}:
+            if (len(node.args) != 3 and len(node.args) != 4) or node.kwargs:
+                return None
+            if len(node.args) == 4:
+                source, pad, mode, value = node.args
+                if mode != "constant":
+                    return None
+            else:
+                source, pad, value = node.args
+            if not isinstance(source, Node) or source not in values:
+                return None
+            padding = _int_list(pad)
+            if padding is None or not _is_scalar(value):
+                return None
+            native_node = graph.create_node("constant_pad_nd", node.name)
+            native_node.add_input(values[source])
+            native_node.set_ints_attr("pad", padding)
+            if not _set_named_scalar_attr(native_node, "value", value):
+                return None
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name in {"view", "reshape"}:
+            if not node.args or not isinstance(node.args[0], Node):
+                return None
+            kwargs = dict(node.kwargs or {})
+            if kwargs:
+                return None
+            shape_args = list(node.args[1:])
+            if len(shape_args) == 1 and isinstance(shape_args[0], (tuple, list)):
+                shape_args = list(shape_args[0])
+            shape = _int_list(shape_args)
+            if shape is None or node.args[0] not in values:
+                return None
+            native_node = graph.create_node("reshape", node.name)
+            native_node.add_input(values[node.args[0]])
+            native_node.set_ints_attr("shape", shape)
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "permute":
+            if not node.args or not isinstance(node.args[0], Node):
+                return None
+            if node.kwargs or node.args[0] not in values:
+                return None
+            dims_args = list(node.args[1:])
+            if len(dims_args) == 1 and isinstance(dims_args[0], (tuple, list)):
+                dims_args = list(dims_args[0])
+            dims = _int_list(dims_args)
+            if dims is None:
+                return None
+            native_node = graph.create_node("permute", node.name)
+            native_node.add_input(values[node.args[0]])
+            native_node.set_ints_attr("dims", dims)
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "contiguous":
+            if not node.args or not isinstance(node.args[0], Node):
+                return None
+            if node.args[0] not in values:
+                return None
+            kwargs = dict(node.kwargs or {})
+            if set(kwargs) - {"memory_format"} or len(node.args) > 2:
+                return None
+            memory_format = node.args[1] if len(node.args) > 1 else kwargs.get(
+                "memory_format", 0
+            )
+            if not isinstance(memory_format, int) or isinstance(memory_format, bool):
+                return None
+            native_node = graph.create_node("contiguous", node.name)
+            native_node.add_input(values[node.args[0]])
+            native_node.set_int_attr("memory_format", int(memory_format))
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "unsqueeze":
+            if len(node.args) != 2 or not isinstance(node.args[0], Node):
+                return None
+            if node.kwargs or node.args[0] not in values:
+                return None
+            dim = node.args[1]
+            if isinstance(dim, bool) or not isinstance(dim, int):
+                return None
+            native_node = graph.create_node("unsqueeze", node.name)
+            native_node.add_input(values[node.args[0]])
+            native_node.set_int_attr("dim", int(dim))
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "squeeze":
+            if not node.args or not isinstance(node.args[0], Node):
+                return None
+            kwargs = dict(node.kwargs or {})
+            if set(kwargs) - {"dim"} or len(node.args) > 2:
+                return None
+            if len(node.args) > 1 and "dim" in kwargs:
+                return None
+            dim = node.args[1] if len(node.args) > 1 else kwargs.get("dim")
+            source = node.args[0]
+            if source not in values:
+                return None
+            native_node = graph.create_node("squeeze", node.name)
+            native_node.add_input(values[source])
+            if dim is not None:
+                if isinstance(dim, bool):
+                    return None
+                if isinstance(dim, int):
+                    native_node.set_int_attr("dim", int(dim))
+                elif not _set_int_list_attr(native_node, "dims", dim):
+                    return None
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "zeros_like":
+            if not node.args or not isinstance(node.args[0], Node):
+                return None
+            if node.kwargs or len(node.args) not in {1, 4}:
+                # The native node preserves the template dtype and device.
+                # Explicit metadata changes require a typed factory node and
+                # are kept on the general lowering path.
+                return None
+            if len(node.args) == 4 and (
+                node.args[1] is not tensorplay.undefined
+                or node.args[2] is not None
+                or node.args[3] is not False
+            ):
+                return None
+            source = node.args[0]
+            if source not in values:
+                return None
+            sample = sample_value(source)
+            if sample is None:
+                sample = sample_value(node)
+            try:
+                shape = [int(item) for item in sample.shape]
+            except (AttributeError, TypeError, ValueError):
+                return None
+            native_node = graph.create_node("zeros_like", node.name)
+            native_node.add_input(values[source])
+            native_node.set_ints_attr("shape", shape)
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "permute_backward":
+            if len(node.args) != 3 or node.kwargs:
+                return None
+            grad_node, source_node, dims = node.args
+            if (
+                not isinstance(grad_node, Node)
+                or not isinstance(source_node, Node)
+                or grad_node not in values
+                or source_node not in values
+                or not _set_int_list_attr(
+                    native_node := graph.create_node("permute_backward", node.name),
+                    "dims",
+                    dims,
+                )
+            ):
+                return None
+            native_node.add_input(values[grad_node])
+            native_node.add_input(values[source_node])
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "float":
+            if len(node.args) != 1 or node.kwargs or not isinstance(node.args[0], Node):
+                return None
+            if node.args[0] not in values:
+                return None
+            native_node = graph.create_node("float", node.name)
+            native_node.add_input(values[node.args[0]])
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "group_norm":
+            if len(node.args) != 5 or node.kwargs:
+                return None
+            input_node, num_groups, weight_node, bias_node, eps = node.args
+            if (
+                not isinstance(input_node, Node)
+                or input_node not in values
+                or isinstance(num_groups, bool)
+                or not isinstance(num_groups, int)
+                or not isinstance(eps, numbers.Real)
+            ):
+                return None
+            native_node = graph.create_node("group_norm", node.name)
+            native_node.add_input(values[input_node])
+            native_node.set_int_attr("num_groups", int(num_groups))
+            native_node.set_float_attr("eps", float(eps))
+            for attr_name, optional_node in (
+                ("has_weight", weight_node),
+                ("has_bias", bias_node),
+            ):
+                if optional_node is None:
+                    native_node.set_int_attr(attr_name, 0)
+                    continue
+                if not add_tensor_input(native_node, optional_node):
+                    return None
+                native_node.set_int_attr(attr_name, 1)
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name in {"avg_pool1d", "avg_pool2d", "avg_pool3d"}:
+            if len(node.args) not in {6, 7} or node.kwargs:
+                return None
+            input_node, kernel_size, stride, padding, ceil_mode, count_include_pad = node.args[:6]
+            divisor = node.args[6] if len(node.args) == 7 else None
+            if not isinstance(input_node, Node) or input_node not in values:
+                return None
+            if not isinstance(ceil_mode, bool) or not isinstance(count_include_pad, bool):
+                return None
+            spatial_rank = int(op_name[-2])
+            kernel = _spatial_int_list(kernel_size, length=spatial_rank)
+            stride_values = _spatial_int_list(
+                stride, default=kernel, length=spatial_rank
+            )
+            padding_values = _spatial_int_list(
+                padding, default=[0] * spatial_rank, length=spatial_rank
+            )
+            if kernel is None or stride_values is None or padding_values is None:
+                return None
+            if divisor is not None and (
+                isinstance(divisor, bool) or not isinstance(divisor, int)
+            ):
+                return None
+            if op_name == "avg_pool1d" and divisor is not None:
+                return None
+            native_node = graph.create_node(op_name, node.name)
+            native_node.add_input(values[input_node])
+            native_node.set_ints_attr("kernel_size", kernel)
+            native_node.set_ints_attr("stride", stride_values)
+            native_node.set_ints_attr("padding", padding_values)
+            native_node.set_int_attr("ceil_mode", int(ceil_mode))
+            native_node.set_int_attr("count_include_pad", int(count_include_pad))
+            if divisor is not None:
+                native_node.set_int_attr("divisor_override", int(divisor))
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "interpolate":
+            if len(node.args) != 7 or node.kwargs:
+                return None
+            input_node, size, scale_factor, mode, align_corners, recompute, antialias = node.args
+            if (
+                not isinstance(input_node, Node)
+                or input_node not in values
+                or scale_factor is not None
+                or mode != "nearest"
+                or align_corners is not None
+                or recompute is not None
+                or antialias is not False
+            ):
+                return None
+            sample = sample_value(input_node)
+            try:
+                spatial_rank = int(len(sample.shape)) - 2
+            except (AttributeError, TypeError):
+                return None
+            if spatial_rank not in (1, 2, 3):
+                return None
+            output_size = _spatial_int_list(size, length=spatial_rank)
+            if output_size is None:
+                return None
+            native_node = graph.create_node("interpolate", node.name)
+            native_node.add_input(values[input_node])
+            native_node.set_ints_attr("output_size", output_size)
+            native_node.set_int_attr("spatial_rank", spatial_rank)
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "scaled_dot_product_attention":
+            if len(node.args) < 3 or len(node.args) > 8:
+                return None
+            query, key, value_node = node.args[:3]
+            if any(not isinstance(item, Node) or item not in values for item in (query, key, value_node)):
+                return None
+            names = ("attn_mask", "dropout_p", "is_causal", "scale", "enable_gqa")
+            options = dict(node.kwargs or {})
+            for index, item in enumerate(node.args[3:]):
+                if names[index] in options:
+                    return None
+                options[names[index]] = item
+            if set(options) - set(names):
+                return None
+            if options.get("attn_mask") is not None:
+                return None
+            dropout_p = options.get("dropout_p", 0.0)
+            if not isinstance(dropout_p, numbers.Real) or float(dropout_p) != 0.0:
+                return None
+            if options.get("scale") is not None or options.get("enable_gqa", False):
+                return None
+            is_causal = options.get("is_causal", False)
+            if not isinstance(is_causal, bool):
+                return None
+            native_node = graph.create_node("scaled_dot_product_attention", node.name)
+            native_node.add_input(values[query])
+            native_node.add_input(values[key])
+            native_node.add_input(values[value_node])
+            native_node.set_int_attr("is_causal", int(is_causal))
+            native_node.set_int_attr("impl", 0)
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "dropout":
+            if len(node.args) != 4 or node.kwargs or not isinstance(node.args[0], Node):
+                return None
+            input_node, probability, training, inplace = node.args
+            if input_node not in values or not isinstance(probability, numbers.Real):
+                return None
+            if not isinstance(training, bool) or not isinstance(inplace, bool):
+                return None
+            if float(probability) == 0.0 or not training:
+                values[node] = values[input_node]
+                layout_values[node] = layout_values.get(input_node, False)
+                continue
+            if inplace:
+                return None
+            native_node = graph.create_node("dropout", node.name)
+            native_node.add_input(values[input_node])
+            native_node.set_float_attr("p", float(probability))
+            native_node.set_int_attr("training", int(training))
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        alpha_form = op_name in {"add", "sub"} and (
+            len(node.args) == 3
+            or (len(node.args) == 2 and "alpha" in (node.kwargs or {}))
+        )
+        if op_name in {"add", "sub", "mul", "div", "pow", "matmul"} and not alpha_form:
+            if len(node.args) != 2 or node.kwargs:
+                return None
+            lhs, rhs = node.args
+            lhs_is_tensor = isinstance(lhs, (Node, tensor_type))
+            rhs_is_tensor = isinstance(rhs, (Node, tensor_type))
+            if not lhs_is_tensor and not _is_scalar(lhs):
+                return None
+            if not rhs_is_tensor and not _is_scalar(rhs):
+                return None
+            if not lhs_is_tensor and not rhs_is_tensor:
+                return None
+            native_node = graph.create_node(op_name, node.name)
+            if lhs_is_tensor:
+                if not add_tensor_input(native_node, lhs):
+                    return None
+            if rhs_is_tensor:
+                if not add_tensor_input(native_node, rhs):
+                    return None
+            if not lhs_is_tensor:
+                _set_scalar_attr(native_node, lhs, 0)
+            elif not rhs_is_tensor:
+                _set_scalar_attr(native_node, rhs, 1)
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name in {"conv2d", "conv2d_relu"}:
             if len(node.args) != 7:
                 return None
             input_node, weight_node, bias_node, stride, padding, dilation, groups = node.args
             fused_relu = fused_relu_convs.get(node)
-            use_conv_relu = fused_relu is not None and not peel_conv_bias
+            use_conv_relu = op_name == "conv2d_relu" or (
+                fused_relu is not None and not peel_conv_bias
+            )
             # A consumer must be created after the layout-conversion node
             # feeding it: native execution walks nodes in creation order.
             conv_input = channels_last_value(input_node)
@@ -3319,10 +4222,11 @@ def _lower_native(
                     bias_input = node_value(bias_node)
                     if bias_input is None:
                         return None
-                    try:
-                        bias_tensor = graph_module._get_attr(bias_node.target)
-                    except (AttributeError, TypeError):
-                        return None
+                    if peel_conv_bias and not use_conv_relu:
+                        try:
+                            bias_tensor = graph_module._get_attr(bias_node.target)
+                        except (AttributeError, TypeError):
+                            return None
             native_node = graph.create_node(
                 "conv2d_relu" if use_conv_relu else "conv2d",
                 node.name,
@@ -3340,15 +4244,16 @@ def _lower_native(
                 # the cuDNN call because cuDNN is slower with it.  Keep the
                 # bias as a broadcast pointwise input after the convolution.
                 native_node.set_int_attr("has_bias", 0)
-            if not all(
-                _set_int_list_attr(native_node, key, value)
-                for key, value in (
-                    ("stride", stride),
-                    ("padding", padding),
-                    ("dilation", dilation),
-                )
+            for key, value, default in (
+                ("stride", stride, [1, 1]),
+                ("padding", padding, [0, 0]),
+                ("dilation", dilation, [1, 1]),
             ):
-                return None
+                normalized = _spatial_int_list(value, default=default)
+                if normalized is None or not _set_int_list_attr(
+                    native_node, key, normalized
+                ):
+                    return None
             if isinstance(groups, bool) or not isinstance(groups, int):
                 return None
             native_node.set_int_attr("groups", int(groups))
@@ -3421,25 +4326,37 @@ def _lower_native(
             layout_values[node] = False
             continue
 
-        if op_name == "max_pool2d":
-            if len(node.args) != 7:
+        if op_name in {"max_pool1d", "max_pool2d", "max_pool3d"}:
+            if len(node.args) not in {6, 7}:
                 return None
-            input_node, kernel_size, stride, padding, dilation, ceil_mode, return_indices = node.args
-            if return_indices is not False or not isinstance(ceil_mode, bool):
+            input_node, kernel_size, stride, padding, dilation, ceil_mode = node.args[:6]
+            return_indices = node.args[6] if len(node.args) == 7 else False
+            if not isinstance(return_indices, bool) or not isinstance(ceil_mode, bool):
                 return None
-            native_node = graph.create_node("max_pool2d", node.name)
+            spatial_rank = int(op_name[-2])
+            kernel = _spatial_int_list(kernel_size, length=spatial_rank)
+            stride_values = _spatial_int_list(stride, default=kernel, length=spatial_rank)
+            padding_values = _spatial_int_list(
+                padding, default=[0] * spatial_rank, length=spatial_rank
+            )
+            dilation_values = _spatial_int_list(
+                dilation, default=[1] * spatial_rank, length=spatial_rank
+            )
+            if any(value is None for value in (kernel, stride_values, padding_values, dilation_values)):
+                return None
+            native_op = f"{op_name}_with_indices" if return_indices else op_name
+            native_node = graph.create_node(native_op, node.name)
             if not add_tensor_input(native_node, input_node):
                 return None
-            for key, value in (
-                ("kernel_size", kernel_size),
-                ("stride", stride),
-                ("padding", padding),
-                ("dilation", dilation),
-            ):
-                if not _set_int_list_attr(native_node, key, value):
-                    return None
+            native_node.set_ints_attr("kernel_size", kernel)
+            native_node.set_ints_attr("stride", stride_values)
+            native_node.set_ints_attr("padding", padding_values)
+            native_node.set_ints_attr("dilation", dilation_values)
             native_node.set_int_attr("ceil_mode", int(ceil_mode))
-            values[node] = native_node.add_output()
+            if return_indices:
+                values[node] = (native_node.add_output(), native_node.add_output())
+            else:
+                values[node] = native_node.add_output()
             # The cuDNN tensor descriptor and output follow the input layout;
             # a later convolution can therefore consume the max-pool result
             # without an NCHW round-trip.
@@ -3448,13 +4365,30 @@ def _lower_native(
             )
             continue
 
-        if op_name == "adaptive_avg_pool2d":
-            if len(node.args) != 2 or not _set_int_list_attr(
-                native_node := graph.create_node("adaptive_avg_pool2d", node.name),
-                "output_size",
-                node.args[1],
-            ):
+        if op_name in {"adaptive_avg_pool1d", "adaptive_avg_pool2d", "adaptive_avg_pool3d"}:
+            if len(node.args) != 2:
                 return None
+            spatial_rank = int(op_name[-2])
+            output_size = _spatial_int_list(node.args[1], length=spatial_rank)
+            if output_size is None:
+                return None
+            native_node = graph.create_node(op_name, node.name)
+            native_node.set_ints_attr("output_size", output_size)
+            if not add_tensor_input(native_node, node.args[0]):
+                return None
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name in {"adaptive_max_pool1d", "adaptive_max_pool2d", "adaptive_max_pool3d"}:
+            if len(node.args) != 2:
+                return None
+            spatial_rank = int(op_name[-2])
+            output_size = _spatial_int_list(node.args[1], length=spatial_rank)
+            if output_size is None:
+                return None
+            native_node = graph.create_node(op_name, node.name)
+            native_node.set_ints_attr("output_size", output_size)
             if not add_tensor_input(native_node, node.args[0]):
                 return None
             values[node] = native_node.add_output()
@@ -3479,6 +4413,202 @@ def _lower_native(
             native_node.set_int_attr("start_dim", 1)
             native_node.set_int_attr("end_dim", -1)
             values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name in {"sum", "mean"}:
+            if not node.args or not isinstance(node.args[0], Node):
+                return None
+            kwargs = dict(node.kwargs or {})
+            if set(kwargs) - {"dim", "keepdim"}:
+                return None
+            if node.op == "call_method":
+                source = node.args[0]
+                positional = list(node.args[1:])
+                if len(positional) > 2:
+                    return None
+                if positional and "dim" in kwargs:
+                    return None
+                if len(positional) > 1 and "keepdim" in kwargs:
+                    return None
+                dim = positional[0] if positional else kwargs.get("dim")
+                keepdim = positional[1] if len(positional) > 1 else kwargs.get(
+                    "keepdim", False
+                )
+            else:
+                source = node.args[0]
+                if len(node.args) > 3:
+                    return None
+                if len(node.args) > 1 and "dim" in kwargs:
+                    return None
+                if len(node.args) > 2 and "keepdim" in kwargs:
+                    return None
+                dim = node.args[1] if len(node.args) > 1 else kwargs.get("dim")
+                keepdim = (
+                    node.args[2]
+                    if len(node.args) > 2
+                    else kwargs.get("keepdim", False)
+                )
+            if source not in values or not isinstance(keepdim, bool):
+                return None
+            native_node = graph.create_node(op_name, node.name)
+            native_node.add_input(values[source])
+            if dim is not None:
+                dims = [int(dim)] if isinstance(dim, int) else _int_list(dim)
+                if dims is None:
+                    return None
+                native_node.set_ints_attr("dim", dims)
+                native_node.set_int_attr("keepdim", int(keepdim))
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "unsqueeze":
+            if not node.args or not isinstance(node.args[0], Node):
+                return None
+            kwargs = dict(node.kwargs or {})
+            if set(kwargs) - {"dim"} or len(node.args) > 2:
+                return None
+            if len(node.args) > 1 and "dim" in kwargs:
+                return None
+            dim = node.args[1] if len(node.args) > 1 else kwargs.get("dim")
+            source = node.args[0]
+            if source not in values or isinstance(dim, bool) or not isinstance(dim, int):
+                return None
+            native_node = graph.create_node("unsqueeze", node.name)
+            native_node.add_input(values[source])
+            native_node.set_int_attr("dim", int(dim))
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "expand":
+            if not node.args or not isinstance(node.args[0], Node):
+                return None
+            kwargs = dict(node.kwargs or {})
+            if set(kwargs) - {"size", "implicit"}:
+                return None
+            source = node.args[0]
+            if len(node.args) > 2 or (len(node.args) > 1 and "size" in kwargs):
+                return None
+            shape = node.args[1] if len(node.args) > 1 else kwargs.get("size")
+            if source not in values or _int_list(shape) is None:
+                return None
+            native_node = graph.create_node("expand", node.name)
+            native_node.add_input(values[source])
+            native_node.set_ints_attr("shape", _int_list(shape))
+            if "implicit" in kwargs:
+                if not isinstance(kwargs["implicit"], bool):
+                    return None
+                native_node.set_int_attr("implicit", int(kwargs["implicit"]))
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name == "cat":
+            if not node.args:
+                return None
+            kwargs = dict(node.kwargs or {})
+            if set(kwargs) - {"dim", "out"}:
+                return None
+            tensors = node.args[0]
+            if not isinstance(tensors, (tuple, list)) or not tensors:
+                return None
+            if any(not isinstance(item, Node) or item not in values for item in tensors):
+                return None
+            if len(node.args) > 2 or (len(node.args) > 1 and "dim" in kwargs):
+                return None
+            dim = node.args[1] if len(node.args) > 1 else kwargs.get("dim", 0)
+            if not isinstance(dim, int) or kwargs.get("out") is not None:
+                return None
+            native_node = graph.create_node("cat", node.name)
+            for item in tensors:
+                native_node.add_input(values[item])
+            native_node.set_int_attr("dim", int(dim))
+            values[node] = native_node.add_output()
+            layout_values[node] = False
+            continue
+
+        if op_name in {"chunk", "split", "split_with_sizes", "unbind"}:
+            if not node.args or not isinstance(node.args[0], Node):
+                return None
+            source = node.args[0]
+            if source not in values:
+                return None
+            sample = node.meta.get("val")
+            if not isinstance(sample, (tuple, list)) or not sample:
+                return None
+            native_node = graph.create_node(op_name, node.name)
+            native_node.add_input(values[source])
+            if op_name == "chunk":
+                kwargs = dict(node.kwargs or {})
+                if set(kwargs) - {"chunks", "dim"} or len(node.args) > 3:
+                    return None
+                if len(node.args) > 1 and "chunks" in kwargs:
+                    return None
+                if len(node.args) > 2 and "dim" in kwargs:
+                    return None
+                chunks = node.args[1] if len(node.args) > 1 else kwargs.get("chunks")
+                dim = node.args[2] if len(node.args) > 2 else kwargs.get("dim", 0)
+                if not isinstance(chunks, int) or not isinstance(dim, int):
+                    return None
+                chunks = int(chunks)
+                dim = int(dim)
+                if chunks <= 0:
+                    return None
+                native_node.set_int_attr("chunks", chunks)
+                native_node.set_int_attr("dim", dim)
+            elif op_name == "split":
+                kwargs = dict(node.kwargs or {})
+                if set(kwargs) - {"split_size", "split_size_or_sizes", "dim"} or len(node.args) > 3:
+                    return None
+                if len(node.args) > 1 and ("split_size" in kwargs or "split_size_or_sizes" in kwargs):
+                    return None
+                if len(node.args) > 2 and "dim" in kwargs:
+                    return None
+                split_size = node.args[1] if len(node.args) > 1 else kwargs.get(
+                    "split_size", kwargs.get("split_size_or_sizes")
+                )
+                dim = node.args[2] if len(node.args) > 2 else kwargs.get("dim", 0)
+                if not isinstance(dim, int):
+                    return None
+                if isinstance(split_size, int) and not isinstance(split_size, bool):
+                    native_node.set_int_attr("split_size", int(split_size))
+                elif _set_int_list_attr(native_node, "split_sizes", split_size):
+                    pass
+                else:
+                    return None
+                native_node.set_int_attr("dim", int(dim))
+            elif op_name == "split_with_sizes":
+                kwargs = dict(node.kwargs or {})
+                if set(kwargs) - {"split_sizes", "dim"} or len(node.args) > 3:
+                    return None
+                if len(node.args) > 1 and "split_sizes" in kwargs:
+                    return None
+                if len(node.args) > 2 and "dim" in kwargs:
+                    return None
+                split_sizes = node.args[1] if len(node.args) > 1 else kwargs.get("split_sizes")
+                if not _set_int_list_attr(native_node, "split_sizes", split_sizes):
+                    return None
+                dim = node.args[2] if len(node.args) > 2 else kwargs.get("dim", 0)
+                if not isinstance(dim, int):
+                    return None
+                native_node.set_int_attr(
+                    "dim", int(dim)
+                )
+            else:
+                kwargs = dict(node.kwargs or {})
+                if set(kwargs) - {"dim"} or len(node.args) > 2:
+                    return None
+                if len(node.args) > 1 and "dim" in kwargs:
+                    return None
+                dim = node.args[1] if len(node.args) > 1 else kwargs.get("dim", 0)
+                if not isinstance(dim, int):
+                    return None
+                native_node.set_int_attr(
+                    "dim", int(dim)
+                )
+            values[node] = tuple(native_node.add_output() for _ in sample)
             layout_values[node] = False
             continue
 
@@ -3518,6 +4648,8 @@ def _lower_native(
             len(node.args) == 3
             or (len(node.args) == 2 and "alpha" in (node.kwargs or {}))
         ):
+            if set(node.kwargs or {}) - {"alpha"}:
+                return None
             if len(node.args) == 3 and not node.kwargs:
                 input_node, other_node, alpha = node.args
             else:
@@ -3637,6 +4769,7 @@ def _lower_native(
             "square",
             "tanh",
             "relu",
+            "conj",
         }:
             if len(node.args) != 1 or len(input_nodes) != 1:
                 return None
@@ -3705,7 +4838,7 @@ def _lower_native(
             (position, public_output_count + registered_extra_outputs + len(mutation_outputs))
         )
 
-    if use_fusion and not registered_extra_outputs and not mutation_outputs:
+    if use_fusion and not mutation_outputs:
         graph.fuse()
     return _NativeLowering(
         graph_module,
@@ -3789,7 +4922,13 @@ class _AotNativeSymbol:
         return self.builder.reshape(self, shape)
 
     def expand(self, shape: Any) -> "_AotNativeSymbol":
-        raise NotImplementedError("AOT native expand lowering is not implemented")
+        return self.builder.expand(self, shape)
+
+    def unsqueeze(self, dim: int) -> "_AotNativeSymbol":
+        return self.builder.unsqueeze(self, dim)
+
+    def squeeze(self, dim: Any = None) -> "_AotNativeSymbol":
+        return self.builder.squeeze(self, dim)
 
     def sum(self, dim: Any = None, keepdim: bool = False) -> "_AotNativeSymbol":
         return self.builder.sum(self, dim, keepdim)
@@ -3799,6 +4938,9 @@ class _AotNativeSymbol:
         for item in self.shape:
             result *= item
         return result
+
+    def dtype(self) -> Any:
+        return None
 
 
 class _AotNativeTuple:
@@ -3814,6 +4956,7 @@ class _AotNativeGraphBuilder:
     def __init__(self, native_module: Any):
         self.native_module = native_module
         self.graph = native_module.Graph()
+        self._literal_symbols: dict[int, _AotNativeSymbol] = {}
 
     @staticmethod
     def _shape(value: Any) -> tuple[int, ...]:
@@ -3825,6 +4968,15 @@ class _AotNativeGraphBuilder:
 
     def input(self, example_value: Any) -> _AotNativeSymbol:
         return _AotNativeSymbol(self, self.graph.add_input(), self._shape(example_value))
+
+    def literal(self, value: Any) -> _AotNativeSymbol:
+        """Lift a captured tensor constant into the backward graph inputs."""
+        key = id(value)
+        symbol = self._literal_symbols.get(key)
+        if symbol is None:
+            symbol = self.input(value)
+            self._literal_symbols[key] = symbol
+        return symbol
 
     def _add_inputs(self, native_node: Any, args: tuple[Any, ...]) -> list[_AotNativeSymbol]:
         symbols: list[_AotNativeSymbol] = []
@@ -3849,6 +5001,10 @@ class _AotNativeGraphBuilder:
     def binary(self, op_name: str, lhs: Any, rhs: Any) -> _AotNativeSymbol:
         lhs_symbol = self._symbol(lhs)
         rhs_symbol = self._symbol(rhs)
+        if lhs_symbol is None and hasattr(lhs, "shape"):
+            lhs_symbol = self.literal(lhs)
+        if rhs_symbol is None and hasattr(rhs, "shape"):
+            rhs_symbol = self.literal(rhs)
         if lhs_symbol is None and rhs_symbol is None:
             if op_name == "add":
                 return lhs + rhs
@@ -3891,6 +5047,7 @@ class _AotNativeGraphBuilder:
         attrs: dict[str, Any] | None = None,
         shape: tuple[int, ...] | None = None,
         outputs: int = 1,
+        output_shapes: tuple[tuple[int, ...], ...] | None = None,
     ) -> _AotNativeSymbol | _AotNativeTuple:
         native_node = self.graph.create_node(op_name, f"aot_{op_name}_{len(self.graph.nodes)}")
         symbols = self._add_inputs(native_node, args)
@@ -3910,14 +5067,95 @@ class _AotNativeGraphBuilder:
             return _AotNativeSymbol(self, native_node.add_output(), shape or args[0].shape)
         return _AotNativeTuple(
             tuple(
-                _AotNativeSymbol(self, native_node.add_output(), shape or args[0].shape)
-                for _ in range(outputs)
+                _AotNativeSymbol(
+                    self,
+                    native_node.add_output(),
+                    output_shapes[index]
+                    if output_shapes is not None and index < len(output_shapes)
+                    else shape or args[0].shape,
+                )
+                for index in range(outputs)
             )
         )
 
     def reshape(self, value: _AotNativeSymbol, shape: Any) -> _AotNativeSymbol:
         normalized = tuple(int(item) for item in shape)
         return self.helper("reshape", (value,), attrs={"shape": normalized}, shape=normalized)  # type: ignore[return-value]
+
+    def zeros_like(
+        self, template: _AotNativeSymbol, shape: Any
+    ) -> _AotNativeSymbol:
+        normalized = tuple(int(item) for item in shape)
+        return self.helper(
+            "zeros_like", (template,), attrs={"shape": normalized}, shape=normalized
+        )  # type: ignore[return-value]
+
+    def expand(self, value: _AotNativeSymbol, shape: Any) -> _AotNativeSymbol:
+        normalized = tuple(int(item) for item in shape)
+        return self.helper("expand", (value,), attrs={"shape": normalized}, shape=normalized)  # type: ignore[return-value]
+
+    def unsqueeze(self, value: _AotNativeSymbol, dim: int) -> _AotNativeSymbol:
+        rank = len(value.shape)
+        normalized_dim = int(dim)
+        if normalized_dim < 0:
+            normalized_dim += rank + 1
+        if normalized_dim < 0 or normalized_dim > rank:
+            raise ValueError(
+                f"AOT unsqueeze dimension {dim} is out of range for rank {rank}"
+            )
+        shape = value.shape[:normalized_dim] + (1,) + value.shape[normalized_dim:]
+        return self.helper(
+            "unsqueeze", (value,), attrs={"dim": normalized_dim}, shape=shape
+        )  # type: ignore[return-value]
+
+    def squeeze(
+        self, value: _AotNativeSymbol, dim: Any = None
+    ) -> _AotNativeSymbol:
+        if dim is None:
+            shape = tuple(item for item in value.shape if item != 1)
+            attrs: dict[str, Any] = {}
+        else:
+            normalized_dim = int(dim)
+            if normalized_dim < 0:
+                normalized_dim += len(value.shape)
+            if (
+                normalized_dim < 0
+                or normalized_dim >= len(value.shape)
+                or value.shape[normalized_dim] != 1
+            ):
+                raise ValueError("AOT squeeze dimension is not singleton")
+            shape = value.shape[:normalized_dim] + value.shape[normalized_dim + 1 :]
+            attrs = {"dim": normalized_dim}
+        return self.helper("squeeze", (value,), attrs=attrs, shape=shape)  # type: ignore[return-value]
+
+    def cat(
+        self, values: tuple[_AotNativeSymbol, ...], dim: int, shape: Any
+    ) -> _AotNativeSymbol:
+        if not values:
+            raise ValueError("AOT cat requires at least one value")
+        return self.helper(
+            "cat", values, attrs={"dim": int(dim)}, shape=tuple(int(item) for item in shape)
+        )  # type: ignore[return-value]
+
+    def split(
+        self,
+        value: _AotNativeSymbol,
+        sizes: tuple[int, ...],
+        dim: int,
+        shapes: tuple[tuple[int, ...], ...],
+    ) -> _AotNativeTuple:
+        result = self.helper(
+            "split",
+            (value,),
+            attrs={"split_sizes": sizes, "dim": int(dim)},
+            shape=shapes[0] if shapes else value.shape,
+            outputs=len(shapes),
+        )
+        if not isinstance(result, _AotNativeTuple):
+            raise TypeError("AOT split did not produce multiple outputs")
+        for symbol, shape in zip(result.values, shapes):
+            symbol.shape = _AotShape(shape)
+        return result
 
     def sum(
         self, value: _AotNativeSymbol, dim: Any = None, keepdim: bool = False
@@ -3947,7 +5185,7 @@ def _aot_derivative_specs() -> dict[str, tuple[Any, dict[str, str]]]:
 
     from tools.codegen.model import parse_derivatives_yaml, parse_schema
 
-    yaml_path = Path(__file__).resolve().parents[2] / "config" / "derivatives.yaml"
+    yaml_path = Path(__file__).resolve().parents[4] / "config" / "derivatives.yaml"
     result: dict[str, tuple[Any, dict[str, str]]] = {}
     for definition in parse_derivatives_yaml(str(yaml_path)):
         parsed = parse_schema(definition["name"])
@@ -4020,6 +5258,8 @@ def _aot_formula_python(formula: str, tensor_params: set[str]) -> str:
             recv = emit(expr.receiver)
             args = ", ".join(emit(a) for a in expr.args)
             name = expr.name
+            if name in {"dtype", "scalar_type"}:
+                return "None"
             base = name[:-1] if name.endswith("_") and name[:-1] in TENSOR_METHODS else name
             if base in TENSOR_METHODS:
                 return f"{TENSOR_METHODS[base]}({recv}, {args})" if args \
@@ -4086,6 +5326,51 @@ def _build_aot_formula_env(
         batch_norm_cache[key] = value
         return value
 
+    def group_norm_backward(
+        grad, input_value, num_groups, weight=None, bias=None, eps=1e-5
+    ):
+        tensor_args = [grad, input_value]
+        has_weight = weight is not None
+        has_bias = bias is not None
+        if has_weight:
+            tensor_args.append(weight)
+        if has_bias:
+            tensor_args.append(bias)
+        channels = int(input_value.shape[1])
+        value = builder.helper(
+            "group_norm_backward",
+            tuple(tensor_args),
+            attrs={
+                "num_groups": int(num_groups),
+                "has_weight": has_weight,
+                "has_bias": has_bias,
+                "eps": float(eps),
+            },
+            shape=input_value.shape,
+            outputs=3,
+            output_shapes=(
+                tuple(input_value.shape),
+                (channels,),
+                (channels,),
+            ),
+        )
+        assert isinstance(value, _AotNativeTuple)
+        return value
+
+    def scaled_dot_product_attention_backward(
+        grad, query, key, value, is_causal=False, impl=0
+    ):
+        result = builder.helper(
+            "scaled_dot_product_attention_backward",
+            (grad, query, key, value),
+            attrs={"is_causal": bool(is_causal), "impl": int(impl)},
+            shape=query.shape,
+            outputs=3,
+            output_shapes=(query.shape, key.shape, value.shape),
+        )
+        assert isinstance(result, _AotNativeTuple)
+        return result
+
     def conv_grad(name: str):
         def invoke(grad, input_value, weight, stride, padding, dilation, groups):
             return builder.helper(
@@ -4109,8 +5394,11 @@ def _build_aot_formula_env(
         return invoke
 
     def max_pool_backward(grad, input_value, kernel_size, stride, padding, dilation, ceil_mode):
+        rank = len(tuple(kernel_size))
+        if rank not in (1, 2, 3):
+            raise TypeError("max_pool spatial parameters must have one to three entries")
         return builder.helper(
-            "max_pool2d_backward",
+            f"max_pool{rank}d_backward",
             (grad, input_value),
             attrs={
                 "kernel_size": tuple(kernel_size),
@@ -4123,8 +5411,89 @@ def _build_aot_formula_env(
         )
 
     def adaptive_avg_pool_backward(grad, input_value):
+        rank = len(tuple(input_value.shape)) - 2
+        if rank not in (1, 2, 3):
+            raise TypeError("adaptive_avg_pool input must have one to three spatial dimensions")
         return builder.helper(
-            "adaptive_avg_pool2d_backward", (grad, input_value), shape=input_value.shape
+            f"adaptive_avg_pool{rank}d_backward",
+            (grad, input_value),
+            shape=input_value.shape,
+        )
+
+    def avg_pool_pair(value: Any, default: tuple[int, int] | None = None) -> tuple[int, int]:
+        if value is None:
+            if default is None:
+                raise TypeError("avg_pool2d requires a spatial parameter")
+            return default
+        if isinstance(value, bool):
+            raise TypeError("avg_pool2d spatial parameters must be integers")
+        if isinstance(value, int):
+            item = int(value)
+            return (item, item)
+        if isinstance(value, (tuple, list)):
+            if len(value) == 1 and isinstance(value[0], int) and not isinstance(value[0], bool):
+                item = int(value[0])
+                return (item, item)
+            if len(value) == 2 and all(
+                isinstance(item, int) and not isinstance(item, bool) for item in value
+            ):
+                return (int(value[0]), int(value[1]))
+        raise TypeError("avg_pool2d spatial parameters must contain one or two integers")
+
+    def avg_pool2d_backward(
+        grad,
+        input_value,
+        kernel_size,
+        stride=None,
+        padding=0,
+        ceil_mode=False,
+        count_include_pad=True,
+        divisor_override=None,
+    ):
+        values = tuple(kernel_size) if isinstance(kernel_size, (tuple, list)) else (kernel_size,)
+        rank = len(values)
+        if rank not in (1, 2, 3):
+            raise TypeError("avg_pool spatial parameters must have one to three entries")
+
+        def spatial(value: Any, default: tuple[int, ...] | None = None) -> tuple[int, ...]:
+            if value is None:
+                if default is None:
+                    raise TypeError("avg_pool requires a spatial parameter")
+                return default
+            if isinstance(value, bool):
+                raise TypeError("avg_pool spatial parameters must be integers")
+            if isinstance(value, int):
+                return (int(value),) * rank
+            if isinstance(value, (tuple, list)):
+                if len(value) == 1 and isinstance(value[0], int) and not isinstance(value[0], bool):
+                    return (int(value[0]),) * rank
+                if len(value) == rank and all(
+                    isinstance(item, int) and not isinstance(item, bool) for item in value
+                ):
+                    return tuple(int(item) for item in value)
+            raise TypeError("avg_pool spatial parameters have the wrong rank")
+
+        kernel = spatial(kernel_size)
+        stride_values = spatial(stride, kernel)
+        padding_values = spatial(padding, (0,) * rank)
+        if not isinstance(ceil_mode, bool) or not isinstance(count_include_pad, bool):
+            raise TypeError("avg_pool2d boolean parameters must be bool")
+        attrs: dict[str, Any] = {
+            "kernel_size": kernel,
+            "stride": stride_values,
+            "padding": padding_values,
+            "ceil_mode": ceil_mode,
+            "count_include_pad": count_include_pad,
+        }
+        if divisor_override is not None:
+            if isinstance(divisor_override, bool) or not isinstance(divisor_override, int):
+                raise TypeError("avg_pool2d divisor_override must be an integer or None")
+            attrs["divisor_override"] = int(divisor_override)
+        return builder.helper(
+            f"avg_pool{rank}d_backward",
+            (grad, input_value),
+            attrs=attrs,
+            shape=input_value.shape,
         )
 
     def maybe_multiply(value: Any, factor: Any) -> Any:
@@ -4142,6 +5511,19 @@ def _build_aot_formula_env(
             return value
         return builder.binary("div", value, divisor)
 
+    def mul_tensor_backward(grad, other, *_args):
+        return builder.binary("mul", grad, other)
+
+    def div_tensor_self_backward(grad, other, *_args):
+        return builder.binary("div", grad, other)
+
+    def div_tensor_other_backward(grad, self_value, other, *_args):
+        numerator = builder.binary(
+            "mul", builder.unary("neg", grad), self_value
+        )
+        denominator = builder.binary("mul", other, other)
+        return builder.binary("div", numerator, denominator)
+
     def threshold_backward(grad, output, threshold):
         return builder.helper(
             "threshold_backward",
@@ -4149,6 +5531,38 @@ def _build_aot_formula_env(
             attrs={"threshold": threshold},
             shape=grad.shape,
         )
+
+    def index_select_backward(grad, self_value, dim, index):
+        return builder.helper(
+            "index_select_backward",
+            (grad, index),
+            attrs={
+                "self_sizes": tuple(int(item) for item in self_value.shape),
+                "dim": int(dim),
+            },
+            shape=self_value.shape,
+        )
+
+    def gather_backward(grad, self_value, dim, index, sparse_grad=False):
+        return builder.helper(
+            "gather_backward",
+            (grad, self_value, index),
+            attrs={"dim": int(dim), "sparse_grad": bool(sparse_grad)},
+            shape=self_value.shape,
+        )
+
+    def silu_backward(grad, input_value):
+        sigmoid = builder.unary("sigmoid", input_value)
+        correction = builder.binary(
+            "add",
+            1,
+            builder.binary(
+                "mul",
+                input_value,
+                builder.binary("sub", 1, sigmoid),
+            ),
+        )
+        return builder.binary("mul", grad, builder.binary("mul", sigmoid, correction))
 
     return {
         "add": binary("add"),
@@ -4161,17 +5575,44 @@ def _build_aot_formula_env(
         "pos": unary("pos"),
         "t": unary("t"),
         "reshape": builder.reshape,
+        "squeeze": builder.squeeze,
         "sum": builder.sum,
         "get_tuple": get_tuple,
         "maybe_multiply": maybe_multiply,
         "maybe_divide": maybe_divide,
+        "mul_tensor_backward": mul_tensor_backward,
+        "div_tensor_self_backward": div_tensor_self_backward,
+        "div_tensor_other_backward": div_tensor_other_backward,
         "batch_norm_backward": batch_norm_backward,
+        "group_norm_backward": group_norm_backward,
+        "scaled_dot_product_attention_backward": scaled_dot_product_attention_backward,
         "conv2d_grad_input": conv_grad("conv2d_grad_input"),
         "conv2d_grad_weight": conv_grad("conv2d_grad_weight"),
         "conv2d_grad_bias": conv_grad("conv2d_grad_bias"),
         "max_pool2d_backward": max_pool_backward,
+        "max_pool1d_backward": max_pool_backward,
+        "max_pool3d_backward": max_pool_backward,
         "adaptive_avg_pool2d_backward": adaptive_avg_pool_backward,
+        "adaptive_avg_pool1d_backward": adaptive_avg_pool_backward,
+        "adaptive_avg_pool3d_backward": adaptive_avg_pool_backward,
+        "avg_pool2d_backward": avg_pool2d_backward,
+        "avg_pool1d_backward": avg_pool2d_backward,
+        "avg_pool3d_backward": avg_pool2d_backward,
+        "conj": unary("conj"),
+        "sin": unary("sin"),
+        "cos": unary("cos"),
+        "exp": unary("exp"),
+        "log": unary("log"),
+        "sqrt": unary("sqrt"),
+        "rsqrt": unary("rsqrt"),
+        "sigmoid": unary("sigmoid"),
+        "tanh": unary("tanh"),
+        "abs": unary("abs"),
+        "sign": unary("sign"),
         "threshold_backward": threshold_backward,
+        "silu_backward": silu_backward,
+        "index_select_backward": index_select_backward,
+        "gather_backward": gather_backward,
     }
 
 
@@ -4247,6 +5688,11 @@ def _build_aot_backward(
         symbol = builder.input(runtime_inputs[index])
         external_symbols.append(symbol)
         forward_symbols[node] = symbol
+    # Literal tensors are lifted by native lowering after placeholders and
+    # module attributes.  They are immutable graph inputs and can therefore
+    # be shared by every derivative expression without saving activations.
+    for value in forward_lowering.constant_values:
+        builder.literal(value)
     saved_symbols: list[_AotNativeSymbol] = []
     for node in saved_nodes:
         actual = runtime_values.get(node)
@@ -4257,16 +5703,290 @@ def _build_aot_backward(
         forward_symbols[node] = symbol
     tangent = builder.input(runtime_values[public_node])
     adjoints: dict[Node, _AotNativeSymbol] = {public_node: tangent}
+    view_adjoints: dict[Node, dict[int, _AotNativeSymbol]] = {}
     batch_norm_cache: dict[tuple[int, ...], _AotNativeTuple] = {}
     formula_env = _build_aot_formula_env(builder, batch_norm_cache=batch_norm_cache)
+
+    def sum_to_shape(value: _AotNativeSymbol, target_shape: tuple[int, ...]) -> _AotNativeSymbol | None:
+        current_shape = tuple(int(item) for item in value.shape)
+        if len(current_shape) < len(target_shape):
+            return None
+        leading = len(current_shape) - len(target_shape)
+        reduce_dims = list(range(leading))
+        for index, target_dim in enumerate(target_shape):
+            current_index = leading + index
+            current_dim = current_shape[current_index]
+            if target_dim == 1 and current_dim != 1:
+                reduce_dims.append(current_index)
+            elif target_dim != current_dim:
+                return None
+        reduced = builder.sum(value, tuple(reduce_dims), keepdim=True) if reduce_dims else value
+        if tuple(reduced.shape) != tuple(target_shape):
+            reduced = builder.reshape(reduced, target_shape)
+        return reduced
+
+    def add_adjoint(target: Any, contribution: Any) -> bool:
+        if not isinstance(target, Node) or not isinstance(contribution, _AotNativeSymbol):
+            return contribution is None
+        target_symbol = forward_symbols.get(target)
+        target_value = runtime_values.get(target)
+        if target_symbol is not None:
+            target_shape = tuple(int(item) for item in target_symbol.shape)
+        elif target_value is not None and hasattr(target_value, "shape"):
+            target_shape = tuple(int(item) for item in target_value.shape)
+        else:
+            target_shape = None
+        if target_shape is not None:
+            contribution = sum_to_shape(contribution, target_shape)
+            if contribution is None:
+                return False
+        return _aot_add_adjoint(builder, adjoints, target, contribution)
 
     for node in reversed(graph_module.graph.nodes):
         if node.op in {"placeholder", "get_attr", "output"}:
             continue
         grad = adjoints.get(node)
-        if grad is None:
+        if grad is None and node not in view_adjoints:
             continue
         op_name = _target_name(node.target)
+        if op_name == "getitem":
+            if (
+                node.op == "call_function"
+                and len(node.args) == 2
+                and isinstance(node.args[0], Node)
+                and isinstance(node.args[1], tuple)
+                and len(node.args[1]) == 2
+                and isinstance(node.args[1][0], slice)
+                and node.args[1][0] == slice(None)
+                and node.args[1][1] is None
+                and grad is not None
+            ):
+                source = node.args[0]
+                source_symbol = forward_symbols.get(source)
+                if source_symbol is None or len(grad.shape) != len(source_symbol.shape) + 1:
+                    return None
+                # This form inserts one singleton axis after the leading
+                # slice.  Its reverse is an axis removal, not a broadcast
+                # reduction: the inserted axis may sit in the middle of the
+                # shape, so a generic leading-dimension reduction is wrong.
+                if tuple(grad.shape[0:1]) != tuple(source_symbol.shape[0:1]):
+                    return None
+                contribution = builder.squeeze(grad, dim=1)
+                if tuple(contribution.shape) != tuple(source_symbol.shape):
+                    return None
+                if not add_adjoint(source, contribution):
+                    return None
+                continue
+            if (
+                node.op != "call_function"
+                or len(node.args) != 2
+                or not isinstance(node.args[0], Node)
+                or not isinstance(node.args[1], int)
+                or node.args[0].op not in {
+                    "call_function",
+                    "call_method",
+                }
+                or _target_name(node.args[0].target)
+                not in {"chunk", "split", "split_with_sizes", "unbind"}
+                or grad is None
+            ):
+                return None
+            source = node.args[0]
+            sample = source.meta.get("val")
+            if not isinstance(sample, (tuple, list)):
+                return None
+            index = int(node.args[1])
+            if index < 0:
+                index += len(sample)
+            if index < 0 or index >= len(sample):
+                return None
+            slots = view_adjoints.setdefault(source, {})
+            previous = slots.get(index)
+            slots[index] = grad if previous is None else builder.binary(
+                "add", previous, grad
+            )
+            continue
+        if op_name in {"chunk", "split", "split_with_sizes", "unbind"}:
+            if not node.args or not isinstance(node.args[0], Node):
+                return None
+            source = node.args[0]
+            sample = node.meta.get("val")
+            slots = view_adjoints.pop(node, None)
+            if not isinstance(sample, (tuple, list)) or not slots:
+                return None
+            source_symbol = forward_symbols.get(source)
+            source_value = runtime_values.get(source)
+            if source_symbol is not None:
+                source_shape = tuple(int(item) for item in source_symbol.shape)
+            elif source_value is not None and hasattr(source_value, "shape"):
+                source_shape = tuple(int(item) for item in source_value.shape)
+            else:
+                return None
+            kwargs = dict(node.kwargs or {})
+            if op_name == "unbind":
+                if set(kwargs) - {"dim"} or len(node.args) > 2:
+                    return None
+                if len(node.args) > 1 and "dim" in kwargs:
+                    return None
+                dim_arg = node.args[1] if len(node.args) > 1 else kwargs.get("dim", 0)
+            else:
+                if set(kwargs) - {"dim"} or len(node.args) > 3:
+                    return None
+                if len(node.args) > 2 and "dim" in kwargs:
+                    return None
+                dim_arg = node.args[2] if len(node.args) > 2 else kwargs.get("dim", 0)
+            if isinstance(dim_arg, bool) or not isinstance(dim_arg, int):
+                return None
+            dim_arg = int(dim_arg)
+            rank = len(source_shape)
+            if dim_arg < 0:
+                dim_arg += rank
+            if dim_arg < 0 or dim_arg >= rank:
+                return None
+            parts: list[_AotNativeSymbol] = []
+            template = next(iter(slots.values()))
+            for index, output in enumerate(sample):
+                part = slots.get(index)
+                if part is None:
+                    part_shape = getattr(output, "shape", None)
+                    if part_shape is None:
+                        return None
+                    part = builder.zeros_like(template, part_shape)
+                if op_name == "unbind":
+                    part = builder.unsqueeze(part, dim_arg)
+                parts.append(part)
+            contribution = builder.cat(tuple(parts), dim_arg, source_shape)
+            if not add_adjoint(source, contribution):
+                return None
+            continue
+        if op_name == "cat":
+            if grad is None or not node.args or not isinstance(node.args[0], (tuple, list)):
+                return None
+            sources = tuple(node.args[0])
+            if not sources or any(not isinstance(item, Node) for item in sources):
+                return None
+            dim_arg = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+            if not isinstance(dim_arg, int):
+                return None
+            shapes: list[tuple[int, ...]] = []
+            sizes: list[int] = []
+            for source in sources:
+                source_symbol = forward_symbols.get(source)
+                source_value = runtime_values.get(source)
+                if source_symbol is not None:
+                    shape_tuple = tuple(int(item) for item in source_symbol.shape)
+                elif source_value is not None and hasattr(source_value, "shape"):
+                    shape_tuple = tuple(int(item) for item in source_value.shape)
+                else:
+                    return None
+                shapes.append(shape_tuple)
+                dim_index = dim_arg if dim_arg >= 0 else dim_arg + len(shape_tuple)
+                if dim_index < 0 or dim_index >= len(shape_tuple):
+                    return None
+                sizes.append(shape_tuple[dim_index])
+            parts = builder.split(grad, tuple(sizes), dim_arg, tuple(shapes))
+            for source, part in zip(sources, parts.values):
+                if not add_adjoint(source, part):
+                    return None
+            continue
+        if op_name == "index_select":
+            if grad is None:
+                return None
+            kwargs = dict(node.kwargs or {})
+            if node.op == "call_method":
+                if set(kwargs) - {"dim", "index"} or not node.args:
+                    return None
+                input_node = node.args[0]
+                positional = list(node.args[1:])
+                if len(positional) > 2:
+                    return None
+                if positional and "dim" in kwargs:
+                    return None
+                if len(positional) > 1 and "index" in kwargs:
+                    return None
+                dim = positional[0] if positional else kwargs.get("dim")
+                index_node = positional[1] if len(positional) > 1 else kwargs.get("index")
+                if dim is None or index_node is None:
+                    return None
+            else:
+                if len(node.args) > 3 or set(kwargs) - {"dim", "index"}:
+                    return None
+                input_node = node.args[0]
+                if len(node.args) > 1 and "dim" in kwargs:
+                    return None
+                if len(node.args) > 2 and "index" in kwargs:
+                    return None
+                dim = node.args[1] if len(node.args) > 1 else kwargs.get("dim")
+                index_node = node.args[2] if len(node.args) > 2 else kwargs.get("index")
+                if dim is None or index_node is None:
+                    return None
+            if (
+                not isinstance(input_node, Node)
+                or not isinstance(dim, int)
+                or isinstance(dim, bool)
+                or not isinstance(index_node, Node)
+            ):
+                return None
+            input_symbol = forward_symbols.get(input_node)
+            index_symbol = forward_symbols.get(index_node)
+            if input_symbol is None or index_symbol is None:
+                return None
+            contribution = formula_env["index_select_backward"](
+                grad, input_symbol, dim, index_symbol
+            )
+            if not add_adjoint(input_node, contribution):
+                return None
+            continue
+        if op_name == "gather":
+            if grad is None:
+                return None
+            kwargs = dict(node.kwargs or {})
+            if node.op == "call_method":
+                if set(kwargs) - {"dim", "index"} or not node.args:
+                    return None
+                input_node = node.args[0]
+                positional = list(node.args[1:])
+                if len(positional) > 2:
+                    return None
+                if positional and "dim" in kwargs:
+                    return None
+                if len(positional) > 1 and "index" in kwargs:
+                    return None
+                dim = positional[0] if positional else kwargs.get("dim")
+                index_node = positional[1] if len(positional) > 1 else kwargs.get("index")
+                if dim is None or index_node is None:
+                    return None
+            else:
+                if len(node.args) > 3 or set(kwargs) - {"dim", "index"}:
+                    return None
+                input_node = node.args[0]
+                if len(node.args) > 1 and "dim" in kwargs:
+                    return None
+                if len(node.args) > 2 and "index" in kwargs:
+                    return None
+                dim = node.args[1] if len(node.args) > 1 else kwargs.get("dim")
+                index_node = node.args[2] if len(node.args) > 2 else kwargs.get("index")
+                if dim is None or index_node is None:
+                    return None
+            if (
+                not isinstance(input_node, Node)
+                or not isinstance(dim, int)
+                or isinstance(dim, bool)
+                or not isinstance(index_node, Node)
+            ):
+                return None
+            input_symbol = forward_symbols.get(input_node)
+            index_symbol = forward_symbols.get(index_node)
+            if input_symbol is None or index_symbol is None:
+                return None
+            contribution = formula_env["gather_backward"](
+                grad, input_symbol, dim, index_symbol
+            )
+            if not add_adjoint(input_node, contribution):
+                return None
+            continue
+        if grad is None:
+            return None
         if op_name == "linear":
             if len(node.args) not in {2, 3} or not all(
                 isinstance(item, Node) for item in node.args[:2]
@@ -4278,24 +5998,43 @@ def _build_aot_backward(
                 return None
             input_value = forward_symbols[input_node]
             weight_value = forward_symbols[weight_node]
-            weight_t = builder.unary("t", weight_value, shape=weight_value.shape[::-1])
-            input_grad = builder.helper(
-                "matmul_backward_self", (grad, input_value, weight_t), shape=input_value.shape
+            backward = builder.helper(
+                "linear_backward",
+                (input_value, grad, weight_value),
+                attrs={"output_mask": (1, 1, 1)},
+                outputs=3,
+                output_shapes=(
+                    tuple(input_value.shape),
+                    tuple(weight_value.shape),
+                    (int(weight_value.shape[0]),),
+                ),
             )
-            weight_t_grad = builder.helper(
-                "matmul_backward_other", (grad, input_value, weight_t), shape=weight_t.shape
-            )
-            if not _aot_add_adjoint(builder, adjoints, input_node, input_grad):
+            if not isinstance(backward, _AotNativeTuple):
                 return None
-            if not _aot_add_adjoint(
-                builder, adjoints, weight_node, builder.unary("t", weight_t_grad, shape=weight_value.shape)
-            ):
+            input_grad, weight_grad, bias_grad = backward.values
+            if not add_adjoint(input_node, input_grad):
                 return None
-            if bias_node is not None:
-                dims = tuple(range(max(0, len(grad.shape) - 1)))
-                bias_grad = builder.sum(grad, dims, False) if dims else grad
-                if not _aot_add_adjoint(builder, adjoints, bias_node, bias_grad):
-                    return None
+            if not add_adjoint(weight_node, weight_grad):
+                return None
+            if bias_node is not None and not add_adjoint(bias_node, bias_grad):
+                return None
+            continue
+
+        if op_name in {"reshape", "view"}:
+            if not node.args or not isinstance(node.args[0], Node):
+                return None
+            input_node = node.args[0]
+            input_symbol = forward_symbols.get(input_node)
+            input_value = runtime_values.get(input_node)
+            if input_symbol is not None:
+                input_shape = tuple(int(item) for item in input_symbol.shape)
+            elif input_value is not None and hasattr(input_value, "shape"):
+                input_shape = tuple(int(item) for item in input_value.shape)
+            else:
+                return None
+            contribution = builder.reshape(grad, input_shape)
+            if not add_adjoint(input_node, contribution):
+                return None
             continue
 
         if op_name == "flatten":
@@ -4308,32 +6047,120 @@ def _build_aot_backward(
             # the saved-tensor list so the rebuilt graph can omit the pooled
             # activation while still producing the exact reshape backward.
             contribution = builder.reshape(grad, tuple(source_value.shape))
-            if not _aot_add_adjoint(builder, adjoints, node.args[0], contribution):
+            if not add_adjoint(node.args[0], contribution):
                 return None
             continue
 
-        if op_name == "max_pool2d":
+        if op_name in {"max_pool1d", "max_pool2d", "max_pool3d"}:
             # The captured op carries no indices value, so the derivative
             # formula for the with-indices overload cannot apply; the native
             # backward kernel recomputes the argmax instead.
             if len(node.args) != 7 or not isinstance(node.args[0], Node):
                 return None
+            if bool(node.args[6]):
+                return None
             input_node = node.args[0]
             if input_node not in forward_symbols:
                 return None
+            rank = int(op_name[-2])
+            kernel = _spatial_int_list(node.args[1], length=rank)
+            stride = _spatial_int_list(node.args[2], default=kernel, length=rank)
+            padding = _spatial_int_list(node.args[3], default=[0] * rank, length=rank)
+            dilation = _spatial_int_list(node.args[4], default=[1] * rank, length=rank)
+            if any(item is None for item in (kernel, stride, padding, dilation)):
+                return None
             contribution = builder.helper(
-                "max_pool2d_backward",
+                f"max_pool{rank}d_backward",
                 (grad, forward_symbols[input_node]),
                 attrs={
-                    "kernel_size": tuple(node.args[1]),
-                    "stride": tuple(node.args[2]),
-                    "padding": tuple(node.args[3]),
-                    "dilation": tuple(node.args[4]),
+                    "kernel_size": tuple(kernel),
+                    "stride": tuple(stride),
+                    "padding": tuple(padding),
+                    "dilation": tuple(dilation),
                     "ceil_mode": bool(node.args[5]),
                 },
                 shape=forward_symbols[input_node].shape,
             )
-            if not _aot_add_adjoint(builder, adjoints, input_node, contribution):
+            if not add_adjoint(input_node, contribution):
+                return None
+            continue
+
+        if op_name == "dropout":
+            if len(node.args) != 4 or not isinstance(node.args[0], Node):
+                return None
+            input_node, probability, training, _inplace = node.args
+            if not isinstance(probability, numbers.Real) or not isinstance(training, bool):
+                return None
+            if float(probability) == 0.0 or not training:
+                if not add_adjoint(input_node, grad):
+                    return None
+                continue
+            return None
+
+        if op_name == "interpolate":
+            if len(node.args) != 7 or not isinstance(node.args[0], Node):
+                return None
+            input_node, output_size, scale_factor, mode, align_corners, recompute, antialias = node.args
+            if (
+                scale_factor is not None
+                or mode != "nearest"
+                or align_corners is not None
+                or recompute is not None
+                or antialias is not False
+            ):
+                return None
+            input_symbol = forward_symbols.get(input_node)
+            input_value = runtime_values.get(input_node)
+            if input_symbol is not None:
+                input_shape = tuple(int(item) for item in input_symbol.shape)
+            elif input_value is not None and hasattr(input_value, "shape"):
+                input_shape = tuple(int(item) for item in input_value.shape)
+            else:
+                return None
+            output_size = tuple(int(item) for item in output_size)
+            spatial_rank = len(input_shape) - 2
+            if spatial_rank not in (1, 2, 3):
+                return None
+            contribution = builder.helper(
+                f"upsample_nearest{spatial_rank}d_backward",
+                (grad,),
+                attrs={
+                    "output_size": output_size,
+                    "input_size": input_shape,
+                },
+                shape=input_shape,
+            )
+            if not add_adjoint(input_node, contribution):
+                return None
+            continue
+
+        if op_name == "permute":
+            if len(node.args) < 2 or not isinstance(node.args[0], Node):
+                return None
+            source = forward_symbols.get(node.args[0])
+            if source is None:
+                return None
+            dims = node.args[1]
+            if len(node.args) > 2:
+                dims = tuple(node.args[1:])
+            else:
+                dims = tuple(int(item) for item in dims)
+            if any(isinstance(item, bool) or not isinstance(item, int) for item in dims):
+                return None
+            contribution = builder.helper(
+                "permute_backward",
+                (grad, source),
+                attrs={"dims": tuple(int(item) for item in dims)},
+                shape=source.shape,
+            )
+            if not add_adjoint(node.args[0], contribution):
+                return None
+            continue
+
+        if op_name == "float":
+            if len(node.args) != 1 or not isinstance(node.args[0], Node):
+                return None
+            if not add_adjoint(node.args[0], grad):
                 return None
             continue
 
@@ -4402,7 +6229,7 @@ def _build_aot_backward(
                     continue
                 translated = _aot_formula_python(formula, tensor_params)
                 contribution = eval(translated, {"__builtins__": {}}, env)
-                if not _aot_add_adjoint(builder, adjoints, target, contribution):
+                if not add_adjoint(target, contribution):
                     return None
         except (KeyError, NameError, NotImplementedError, TypeError, ValueError, RuntimeError):
             return None
@@ -4441,6 +6268,7 @@ class _AotNativeLowering:
         backward_graph: Any,
         attribute_targets: list[str],
         grad_positions: list[int],
+        constant_values: list[Any] | None = None,
         mutations: list[tuple[int, int]] | None = None,
     ) -> None:
         self.graph_module = graph_module
@@ -4448,6 +6276,7 @@ class _AotNativeLowering:
         self.backward_graph = backward_graph
         self.placeholders = graph_module.graph.placeholders
         self.attribute_targets = attribute_targets
+        self.constant_values = list(constant_values or [])
         self.grad_positions = list(grad_positions)
         self._mutations = list(mutations or [])
         self.input_count = len(self.placeholders) + len(self.attribute_targets)
@@ -4457,16 +6286,28 @@ class _AotNativeLowering:
         from ....autograd import Function
 
         class _AotAutogradFunction(Function):
+            _tensorplay_direct_backward = True
+
             @staticmethod
             def forward(ctx: Any, *inputs: Any) -> Any:
-                outputs = lowering.forward_graph.execute(list(inputs))
-                _copy_back_mutations(lowering, inputs, outputs)
-                # Buffer-update outputs trail the saved tensors; they are
-                # epilogue state, not backward inputs.
-                ctx.save_for_backward(
-                    *inputs,
-                    *outputs[1 : len(outputs) - len(lowering._mutations)],
-                )
+                # The custom function owns the only gradient edge for this
+                # region.  Keep native forward operators outside the eager
+                # autograd graph even when the fused apply path leaves grad
+                # recording enabled around the Python callback.
+                import tensorplay
+
+                with tensorplay.no_grad():
+                    outputs = lowering.forward_graph.execute(
+                        [*inputs, *lowering.constant_values]
+                    )
+                    _copy_back_mutations(lowering, inputs, outputs)
+                    # Buffer-update outputs trail the saved tensors; they are
+                    # epilogue state, not backward inputs.
+                    ctx.save_for_backward(
+                        *inputs,
+                        *lowering.constant_values,
+                        *outputs[1 : len(outputs) - len(lowering._mutations)],
+                    )
                 return outputs[0]
 
             @staticmethod
@@ -4498,7 +6339,7 @@ class _AotNativeLowering:
         if not tensorplay.is_grad_enabled() or not any(
             getattr(value, "requires_grad", False) for value in inputs
         ):
-            outputs = self.forward_graph.execute(inputs)
+            outputs = self.forward_graph.execute([*inputs, *self.constant_values])
             _copy_back_mutations(self, inputs, outputs)
             return outputs[0]
         return self._autograd_function.apply(*inputs)
@@ -4539,6 +6380,7 @@ def _lower_aot_native(
         node
         for node in graph_module.graph.nodes
         if node.op in {"call_function", "call_method"}
+        and not isinstance(node.meta.get("val"), (tuple, list))
     ]
     output_values = [
         value for output in graph_module.graph.outputs for value in _nodes(output.args)
@@ -4554,7 +6396,9 @@ def _lower_aot_native(
     )
     if forward_lowering is None:
         return None
-    if len(runtime_inputs) != len(forward_lowering.graph.inputs):
+    if len(runtime_inputs) + len(forward_lowering.constant_values) != len(
+        forward_lowering.graph.inputs
+    ):
         return None
 
     # Training BatchNorm updates running buffers during forward.  A compiler
@@ -4573,7 +6417,9 @@ def _lower_aot_native(
                 snapshots.append((value, value.detach().clone()))
                 seen_attributes.add(id(value))
         with tensorplay.no_grad():
-            forward_outputs = forward_lowering.graph.execute(runtime_inputs)
+            forward_outputs = forward_lowering.graph.execute(
+                [*runtime_inputs, *forward_lowering.constant_values]
+            )
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return None
     finally:
@@ -4631,6 +6477,7 @@ def _lower_aot_native(
         backward_graph,
         attribute_targets,
         grad_positions,
+        constant_values=forward_lowering.constant_values,
         mutations=forward_lowering._mutations,
     )
 
@@ -4827,13 +6674,18 @@ def _lower_stax_region(
             # what that form cannot express -- a reduction whose result
             # feeds elementwise work feeding another reduction (softmax,
             # normalization) -- so it claims the region last.
-            triton_graph = compile_triton_graph(
-                graph_module,
-                example_inputs,
-                max_autotune=max_autotune,
-                coordinate_descent_tuning=coordinate_descent_tuning,
-                strict_native=strict_native,
-            )
+            try:
+                triton_graph = compile_triton_graph(
+                    graph_module,
+                    example_inputs,
+                    max_autotune=max_autotune,
+                    coordinate_descent_tuning=coordinate_descent_tuning,
+                    strict_native=strict_native,
+                )
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                # Unsupported constants or shape forms belong on the native
+                # graph path and must not abort compilation.
+                triton_graph = None
             if triton_graph is not None:
                 graph_module._stax_codegen = "triton"
                 return triton_graph
@@ -4860,14 +6712,6 @@ def _lower_stax_region(
             raise RuntimeError(
                 "AOT backward graph for the captured training region"
             )
-    native_graph = (
-        _lower_native(graph_module, example_inputs, use_fusion=use_fusion)
-        if use_native
-        else None
-    )
-    if native_graph is not None:
-        graph_module._stax_native_graph = native_graph.graph
-        return native_graph
     if use_native and use_fusion:
         # Nothing claimed the region whole.  Its fusible runs are still worth
         # compiling: each becomes one kernel, and the operators between them
@@ -4881,6 +6725,14 @@ def _lower_stax_region(
         if segmented is not None:
             graph_module._stax_codegen = "stax-fused-cpu-segments"
             return segmented
+    native_graph = (
+        _lower_native(graph_module, example_inputs, use_fusion=use_fusion)
+        if use_native
+        else None
+    )
+    if native_graph is not None:
+        graph_module._stax_native_graph = native_graph.graph
+        return native_graph
     if strict_native:
         raise RuntimeError(
             "strict_native Stax lowering failed: captured graph has no native executable"
