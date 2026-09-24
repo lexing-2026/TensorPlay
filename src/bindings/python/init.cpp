@@ -17,6 +17,9 @@
 #ifdef USE_CUDA
 #include "CuFFTPlanCache.h"
 #include "CudaTunable.h"
+#include "CUDARuntime.h"
+#include <cuda_profiler_api.h>
+#include <cuda_runtime.h>
 #endif
 #include <cstdlib>
 #include <cstring>
@@ -503,6 +506,37 @@ PYBIND11_MODULE(_C, m) {
         return false;
 #endif
     });
+
+    // Thin bindings over the CUDA runtime for error reporting, profiler
+    // capture control and device memory queries.  Only the entry points the
+    // Python runtime layer needs; every call reports the raw cudaError_t so
+    // the caller decides how to surface failures.
+#ifdef USE_CUDA
+    py::module_ cudart = m.def_submodule(
+        "_cudart", "Bindings over selected CUDA runtime entry points.");
+    py::enum_<cudaError_t>(cudart, "cudaError")
+        .value("success", cudaSuccess);
+    cudart.def("cudaGetErrorString",
+               [](cudaError_t error) { return cudaGetErrorString(error); });
+    cudart.def("cudaProfilerStart", []() { return cudaProfilerStart(); });
+    cudart.def("cudaProfilerStop", []() { return cudaProfilerStop(); });
+    cudart.def(
+        "cudaMemGetInfo",
+        [](int64_t index) {
+            int device = static_cast<int>(index);
+            if (device < 0) {
+                tensorplay::cuda::checkCuda(
+                    cudaGetDevice(&device), "cudaGetDevice");
+            }
+            tensorplay::cuda::CUDAGuard guard(device);
+            size_t free_bytes = 0;
+            size_t total_bytes = 0;
+            tensorplay::cuda::checkCuda(
+                cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
+            return std::make_pair(free_bytes, total_bytes);
+        },
+        "device"_a = -1);
+#endif
 
     // --------------------------------------------------------------------
     // Scaled dot product attention utilities
