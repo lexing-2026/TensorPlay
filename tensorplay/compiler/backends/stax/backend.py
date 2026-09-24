@@ -3589,9 +3589,7 @@ class _ForwardPointwiseFuser:
         if not self._pending:
             return True
         groups: dict[int, tuple[_ForwardFusedProgram, list[int]]] = {}
-        for value in (*consumer.args, *consumer.kwargs.values()):
-            if not isinstance(value, Node):
-                continue
+        for value in _nodes((consumer.args, consumer.kwargs)):
             entry = self._pending.get(value)
             if entry is None:
                 continue
@@ -3615,8 +3613,8 @@ class _ForwardPointwiseFuser:
             return True
         wanted = [
             self._temps[value]
-            for value in (*consumer.args, *consumer.kwargs.values())
-            if isinstance(value, Node) and value in self._temps
+            for value in _nodes((consumer.args, consumer.kwargs))
+            if value in self._temps
         ]
         spec = _ForwardFusedProgram(tuple(self._ops), tuple(self._order))
         self._reset()
