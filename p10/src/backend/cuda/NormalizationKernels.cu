@@ -22,12 +22,16 @@
 namespace tensorplay {
 namespace cuda {
 
-static void check_normalization_cuda_launch(const char* operation) {
-    const cudaError_t error = cudaGetLastError();
+static void check_normalization_cuda_status(cudaError_t error,
+                                           const char* operation) {
     if (error != cudaSuccess) {
         TP_THROW(RuntimeError, std::string(operation) + ": " +
                                    cudaGetErrorString(error));
     }
+}
+
+static void check_normalization_cuda_launch(const char* operation) {
+    check_normalization_cuda_status(cudaGetLastError(), operation);
 }
 
 #ifdef USE_CUDNN
@@ -792,6 +796,10 @@ using layer_norm::kLNThreads;
 using layer_norm::ln_block_reduce2;
 using layer_norm::ln_rsqrt;
 
+inline unsigned group_norm_threads_for(int64_t work) {
+    return work < kLNThreads ? 32u : static_cast<unsigned>(kLNThreads);
+}
+
 template <typename T, typename ACC>
 __global__ void group_norm_forward_impl(int64_t inner, int64_t spatial,
                                         int64_t cpg, int64_t num_groups,
@@ -816,7 +824,7 @@ __global__ void group_norm_forward_impl(int64_t inner, int64_t spatial,
     }
     layer_norm::ln_block_reduce2(s, sq, smem0, smem1);
     const ACC mean = smem0[0] / static_cast<ACC>(inner);
-    const ACC var = sq / static_cast<ACC>(inner) - mean * mean;
+    const ACC var = smem1[0] / static_cast<ACC>(inner) - mean * mean;
     const ACC rstd = layer_norm::ln_rsqrt(var + eps);
     if (threadIdx.x == 0) {
         mean_out[row] = mean;
@@ -863,6 +871,32 @@ __global__ void group_norm_grad_input_impl(int64_t inner, int64_t spatial,
         dX[off + j] = static_cast<T>(
             r / static_cast<ACC>(inner) *
             (static_cast<ACC>(inner) * d - k - xhat * kx));
+    }
+}
+
+template <typename T, typename ACC>
+__global__ void group_norm_dx_apply_impl(int64_t inner, int64_t spatial,
+                                          int64_t cpg, int64_t num_groups,
+                                          const T* __restrict__ dY,
+                                          const T* __restrict__ X,
+                                          const ACC* __restrict__ rstd,
+                                          const T* __restrict__ gamma,
+                                          const ACC* __restrict__ c2,
+                                          const ACC* __restrict__ c3,
+                                          T* __restrict__ dX) {
+    const int64_t row = blockIdx.x;
+    const int64_t g = row % num_groups;
+    const ACC r = rstd[row];
+    const ACC a2 = c2[row];
+    const ACC a3 = c3[row];
+    const T* dy = dY + row * inner;
+    const T* x = X + row * inner;
+    T* dx = dX + row * inner;
+    for (int64_t j = threadIdx.x; j < inner; j += blockDim.x) {
+        const int64_t c_local = g * cpg + j / spatial;
+        const ACC c1 = r * (gamma ? static_cast<ACC>(gamma[c_local]) : ACC(1));
+        dx[j] = static_cast<T>(
+            c1 * static_cast<ACC>(dy[j]) + a2 * static_cast<ACC>(x[j]) + a3);
     }
 }
 
@@ -973,31 +1007,46 @@ __global__ void group_norm_moments_impl(int64_t inner, ACC eps,
 }
 
 template <typename T, typename ACC, int V>
-__global__ void group_norm_apply_vec_impl(int64_t inner, int64_t spatial,
-                                          int64_t cpg, int64_t num_groups,
-                                          const T* __restrict__ X,
-                                          const T* __restrict__ gamma,
-                                          const T* __restrict__ beta,
-                                          const ACC* __restrict__ mean_in,
-                                          const ACC* __restrict__ rstd_in,
-                                          T* __restrict__ Y) {
+__global__ void group_norm_forward_vec_impl(
+    int64_t inner, int64_t spatial, int64_t cpg, int64_t num_groups,
+    ACC eps, const T* __restrict__ X, const T* __restrict__ gamma,
+    const T* __restrict__ beta, T* __restrict__ Y,
+    ACC* __restrict__ mean_out, ACC* __restrict__ rstd_out) {
+    __shared__ ACC smem0[layer_norm::kLNThreads / 32];
+    __shared__ ACC smem1[layer_norm::kLNThreads / 32];
     const int64_t row = blockIdx.x;
     const int64_t g = row % num_groups;
-    const ACC mean = mean_in[row];
-    const ACC rstd = rstd_in[row];
     const GNVec<T, V>* xv = reinterpret_cast<const GNVec<T, V>*>(X + row * inner);
     GNVec<T, V>* yv = reinterpret_cast<GNVec<T, V>*>(Y + row * inner);
     const int64_t nv = inner / V;
+    ACC sum = ACC(0), sum_sq = ACC(0);
+    for (int64_t j = threadIdx.x; j < nv; j += blockDim.x) {
+        const GNVec<T, V> pack = xv[j];
+#pragma unroll
+        for (int k = 0; k < V; ++k) {
+            const ACC value = static_cast<ACC>(pack.v[k]);
+            sum += value;
+            sum_sq += value * value;
+        }
+    }
+    layer_norm::ln_block_reduce2(sum, sum_sq, smem0, smem1);
+    const ACC mean = smem0[0] / static_cast<ACC>(inner);
+    const ACC variance = smem1[0] / static_cast<ACC>(inner) - mean * mean;
+    const ACC rstd = layer_norm::ln_rsqrt(variance + eps);
+    if (threadIdx.x == 0) {
+        mean_out[row] = mean;
+        rstd_out[row] = rstd;
+    }
     for (int64_t j = threadIdx.x; j < nv; j += blockDim.x) {
         GNVec<T, V> pack = xv[j];
 #pragma unroll
         for (int k = 0; k < V; ++k) {
             const int64_t idx = j * V + k;
-            const int64_t c_local = g * cpg + idx / spatial;
-            const ACC w = gamma ? static_cast<ACC>(gamma[c_local]) : ACC(1);
-            const ACC b = beta ? static_cast<ACC>(beta[c_local]) : ACC(0);
+            const int64_t channel = g * cpg + idx / spatial;
+            const ACC weight = gamma ? static_cast<ACC>(gamma[channel]) : ACC(1);
+            const ACC bias = beta ? static_cast<ACC>(beta[channel]) : ACC(0);
             pack.v[k] = static_cast<T>(
-                (static_cast<ACC>(pack.v[k]) - mean) * rstd * w + b);
+                (static_cast<ACC>(pack.v[k]) - mean) * rstd * weight + bias);
         }
         yv[j] = pack;
     }
@@ -1027,6 +1076,62 @@ __global__ void group_norm_internal_grads_vec_impl(int64_t spatial,
             s1 += dy * static_cast<ACC>(x.v[k]);
             s2 += dy;
         }
+    }
+    layer_norm::ln_block_reduce2(s1, s2, smem0, smem1);
+    if (threadIdx.x == 0) {
+        ds_out[nc] = smem0[0];
+        db_out[nc] = smem1[0];
+    }
+}
+
+template <typename T, typename ACC, int V>
+__global__ void group_norm_internal_grads_tail_impl(int64_t spatial,
+                                                     const T* __restrict__ dY,
+                                                     const T* __restrict__ X,
+                                                     ACC* __restrict__ ds_out,
+                                                     ACC* __restrict__ db_out) {
+    __shared__ ACC smem0[layer_norm::kLNThreads / 32];
+    __shared__ ACC smem1[layer_norm::kLNThreads / 32];
+    const int64_t nc = blockIdx.x;
+    const T* dy = dY + nc * spatial;
+    const T* x = X + nc * spatial;
+    ACC s1 = ACC(0), s2 = ACC(0);
+    const int64_t step = static_cast<int64_t>(blockDim.x) * V;
+    for (int64_t base = static_cast<int64_t>(threadIdx.x) * V;
+         base < spatial; base += step) {
+#pragma unroll
+        for (int k = 0; k < V; ++k) {
+            const int64_t j = base + k;
+            if (j < spatial) {
+                const ACC d = static_cast<ACC>(dy[j]);
+                s1 += d * static_cast<ACC>(x[j]);
+                s2 += d;
+            }
+        }
+    }
+    layer_norm::ln_block_reduce2(s1, s2, smem0, smem1);
+    if (threadIdx.x == 0) {
+        ds_out[nc] = smem0[0];
+        db_out[nc] = smem1[0];
+    }
+}
+
+template <typename T, typename ACC>
+__global__ void group_norm_internal_grads_impl(int64_t spatial,
+                                                const T* __restrict__ dY,
+                                                const T* __restrict__ X,
+                                                ACC* __restrict__ ds_out,
+                                                ACC* __restrict__ db_out) {
+    __shared__ ACC smem0[layer_norm::kLNThreads / 32];
+    __shared__ ACC smem1[layer_norm::kLNThreads / 32];
+    const int64_t nc = blockIdx.x;
+    const T* dy = dY + nc * spatial;
+    const T* x = X + nc * spatial;
+    ACC s1 = ACC(0), s2 = ACC(0);
+    for (int64_t j = threadIdx.x; j < spatial; j += blockDim.x) {
+        const ACC d = static_cast<ACC>(dy[j]);
+        s1 += d * static_cast<ACC>(x[j]);
+        s2 += d;
     }
     layer_norm::ln_block_reduce2(s1, s2, smem0, smem1);
     if (threadIdx.x == 0) {
@@ -1110,6 +1215,52 @@ __global__ void group_norm_dx_apply_vec_impl(int64_t inner, int64_t spatial,
     }
 }
 
+template <typename T, typename ACC, int V>
+__global__ void group_norm_dx_fused_vec_impl(
+    int64_t inner, int64_t spatial, int64_t cpg, int64_t num_groups,
+    const T* __restrict__ dY, const T* __restrict__ X,
+    const ACC* __restrict__ mean, const ACC* __restrict__ rstd,
+    const T* __restrict__ gamma, const ACC* __restrict__ ds,
+    const ACC* __restrict__ db, T* __restrict__ dX) {
+    __shared__ ACC smem0[layer_norm::kLNThreads / 32];
+    __shared__ ACC smem1[layer_norm::kLNThreads / 32];
+    const int64_t row = blockIdx.x;
+    const int64_t g = row % num_groups;
+    ACC s1 = ACC(0), s2 = ACC(0);
+    for (int64_t i = threadIdx.x; i < cpg; i += blockDim.x) {
+        const int64_t c = g * cpg + i;
+        const ACC gv = gamma ? static_cast<ACC>(gamma[c]) : ACC(1);
+        s1 += ds[row * cpg + i] * gv;
+        s2 += db[row * cpg + i] * gv;
+    }
+    layer_norm::ln_block_reduce2(s1, s2, smem0, smem1);
+    const ACC mm = mean[row];
+    const ACC r = rstd[row];
+    const ACC scale = ACC(1) / static_cast<ACC>(inner);
+    const ACC a2 = (smem1[0] * mm - smem0[0]) * r * r * r * scale;
+    const ACC a3 = -a2 * mm - smem1[0] * r * scale;
+
+    const GNVec<T, V>* dyv = reinterpret_cast<const GNVec<T, V>*>(dY + row * inner);
+    const GNVec<T, V>* xv = reinterpret_cast<const GNVec<T, V>*>(X + row * inner);
+    GNVec<T, V>* dxv = reinterpret_cast<GNVec<T, V>*>(dX + row * inner);
+    const int64_t nv = inner / V;
+    for (int64_t j = threadIdx.x; j < nv; j += blockDim.x) {
+        const GNVec<T, V> d = dyv[j];
+        const GNVec<T, V> x = xv[j];
+        GNVec<T, V> o;
+#pragma unroll
+        for (int k = 0; k < V; ++k) {
+            const int64_t idx = j * V + k;
+            const int64_t c_local = g * cpg + idx / spatial;
+            const ACC c1 = r * (gamma ? static_cast<ACC>(gamma[c_local]) : ACC(1));
+            o.v[k] = static_cast<T>(
+                c1 * static_cast<ACC>(d.v[k]) + a2 * static_cast<ACC>(x.v[k]) +
+                a3);
+        }
+        dxv[j] = o;
+    }
+}
+
 // dgamma/dbeta from the per-channel sums; dY and X are not re-read.
 template <typename ACC>
 __global__ void group_norm_gamma_beta_sums_impl(int64_t N, int64_t C,
@@ -1165,10 +1316,10 @@ __global__ void instance_running_stats_impl(int64_t N, int64_t C, int64_t spatia
 namespace {
 
 template <typename T>
-Tensor group_norm_forward_dispatch(const Tensor& input, int64_t num_groups,
-                                   const std::optional<Tensor>& weight_opt,
-                                   const std::optional<Tensor>& bias_opt,
-                                   double eps) {
+std::tuple<Tensor, Tensor, Tensor> group_norm_forward_dispatch(
+    const Tensor& input, int64_t num_groups,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& bias_opt, double eps) {
     using ACC = typename std::conditional<std::is_same<T, float>::value,
                                           float, double>::type;
     const DType acc_dt =
@@ -1177,13 +1328,19 @@ Tensor group_norm_forward_dispatch(const Tensor& input, int64_t num_groups,
     const int64_t N = input.size(0);
     const int64_t C = input.size(1);
     const int64_t cpg = C / num_groups;
-    const int64_t spatial = input.numel() / (N * C);
+    int64_t spatial = 1;
+    for (int64_t dim = 2; dim < input.dim(); ++dim) {
+        spatial *= input.size(dim);
+    }
     const int64_t inner = cpg * spatial;
 
     Tensor out = Tensor::empty_like(input);
-    Tensor stats = Tensor::empty({N * num_groups * 2}, acc_dt, input.device());
-    ACC* mean_p = stats.data_ptr<ACC>();
-    ACC* rstd_p = mean_p + N * num_groups;
+    Tensor mean = Tensor::empty({N, num_groups}, acc_dt, input.device());
+    Tensor rstd = Tensor::empty({N, num_groups}, acc_dt, input.device());
+    ACC* mean_p = mean.data_ptr<ACC>();
+    ACC* rstd_p = rstd.data_ptr<ACC>();
+
+    if (N == 0) return {out, mean, rstd};
 
     const T* w = nullptr;
     const T* b = nullptr;
@@ -1192,6 +1349,7 @@ Tensor group_norm_forward_dispatch(const Tensor& input, int64_t num_groups,
 
     const auto stream = getCurrentCUDAStream().stream();
     constexpr int kVec = sizeof(T) <= 4 ? 4 : 2;
+    const unsigned threads = group_norm_threads_for(inner);
     const T* x_p = input.data_ptr<T>();
     T* y_p = out.data_ptr<T>();
     const bool vec_ok =
@@ -1199,22 +1357,19 @@ Tensor group_norm_forward_dispatch(const Tensor& input, int64_t num_groups,
         reinterpret_cast<uintptr_t>(x_p) % (sizeof(T) * kVec) == 0 &&
         reinterpret_cast<uintptr_t>(y_p) % (sizeof(T) * kVec) == 0;
     if (vec_ok) {
-        group_norm_moments_vec_impl<T, ACC, kVec>
-            <<<N * num_groups, layer_norm::kLNThreads, 0, stream>>>(
-            inner, static_cast<ACC>(eps), x_p, mean_p, rstd_p);
-        check_normalization_cuda_launch("group_norm forward moments");
-        group_norm_apply_vec_impl<T, ACC, kVec>
-            <<<N * num_groups, layer_norm::kLNThreads, 0, stream>>>(
-            inner, spatial, cpg, num_groups, x_p, w, b, mean_p, rstd_p, y_p);
-        check_normalization_cuda_launch("group_norm forward apply");
+        group_norm_forward_vec_impl<T, ACC, kVec>
+            <<<N * num_groups, threads, 0, stream>>>(
+                inner, spatial, cpg, num_groups, static_cast<ACC>(eps),
+                x_p, w, b, y_p, mean_p, rstd_p);
+        check_normalization_cuda_launch("group_norm forward");
     } else {
         group_norm_forward_impl<T, ACC>
-            <<<N * num_groups, layer_norm::kLNThreads, 0, stream>>>(
+            <<<N * num_groups, threads, 0, stream>>>(
             inner, spatial, cpg, num_groups, static_cast<ACC>(eps),
             x_p, w, b, y_p, mean_p, rstd_p);
         check_normalization_cuda_launch("group_norm forward");
     }
-    return out;
+    return {out, mean, rstd};
 }
 
 } // namespace
@@ -1226,123 +1381,281 @@ Tensor group_norm_cuda(const Tensor& input, int64_t num_groups,
         TP_THROW(RuntimeError, "group_norm requires at least 2 dims");
     }
     const int64_t C = input.size(1);
-    if (C % num_groups != 0) {
+    if (C <= 0 || num_groups <= 0 || C % num_groups != 0) {
         TP_THROW(RuntimeError,
                  "group_norm: num_channels must be divisible by num_groups");
+    }
+    for (int64_t dim = 2; dim < input.dim(); ++dim) {
+        if (input.size(dim) <= 0) {
+            TP_THROW(RuntimeError,
+                     "group_norm requires non-empty spatial dimensions");
+        }
     }
     Tensor x = input.contiguous();
 
     if (x.dtype() == DType::Float32) {
-        return group_norm_forward_dispatch<float>(x, num_groups, weight_opt,
-                                                  bias_opt, eps);
+        return std::get<0>(group_norm_forward_dispatch<float>(
+            x, num_groups, weight_opt, bias_opt, eps));
     }
     if (x.dtype() == DType::Float64) {
-        return group_norm_forward_dispatch<double>(x, num_groups, weight_opt,
-                                                   bias_opt, eps);
+        return std::get<0>(group_norm_forward_dispatch<double>(
+            x, num_groups, weight_opt, bias_opt, eps));
     }
     TP_THROW(NotImplementedError, "group_norm only supports Float32/Float64 on CUDA");
 }
 
-std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cuda(
+std::tuple<Tensor, Tensor, Tensor> native_group_norm_cuda(
+    const Tensor& input, const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& bias_opt, int64_t N, int64_t C,
+    int64_t HxW, int64_t num_groups, double eps) {
+    if (input.dim() < 2) {
+        TP_THROW(RuntimeError, "native_group_norm requires at least 2 dims");
+    }
+    int64_t actual_hxw = 1;
+    for (int64_t dim = 2; dim < input.dim(); ++dim) {
+        actual_hxw *= input.size(dim);
+    }
+    if (N != input.size(0) || C != input.size(1) || HxW != actual_hxw) {
+        TP_THROW(RuntimeError, "native_group_norm dimensions do not match input");
+    }
+    if (C <= 0 || HxW <= 0 || num_groups <= 0 || C % num_groups != 0) {
+        TP_THROW(RuntimeError, "native_group_norm has invalid group dimensions");
+    }
+    auto check_parameter = [C](const std::optional<Tensor>& param,
+                               const char* name) {
+        if (!param.has_value() || !param->defined()) return;
+        if (param->dim() != 1 || param->numel() != C) {
+            TP_THROW(RuntimeError, std::string("native_group_norm ") + name +
+                                     " must have one value per channel");
+        }
+    };
+    check_parameter(weight_opt, "weight");
+    check_parameter(bias_opt, "bias");
+
+    Tensor x = input.contiguous();
+    std::optional<Tensor> weight = weight_opt;
+    std::optional<Tensor> bias = bias_opt;
+    if (weight.has_value() && weight->defined() && !weight->is_contiguous()) {
+        weight = weight->contiguous();
+    }
+    if (bias.has_value() && bias->defined() && !bias->is_contiguous()) {
+        bias = bias->contiguous();
+    }
+    if (x.dtype() == DType::Float32) {
+        return group_norm_forward_dispatch<float>(x, num_groups, weight, bias,
+                                                  eps);
+    }
+    if (x.dtype() == DType::Float64) {
+        return group_norm_forward_dispatch<double>(x, num_groups, weight, bias,
+                                                   eps);
+    }
+    TP_THROW(NotImplementedError,
+             "native_group_norm only supports Float32/Float64 on CUDA");
+}
+
+static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cuda_impl(
     const Tensor& grad_output, const Tensor& input, int64_t num_groups,
-    const std::optional<Tensor>& weight_opt, const std::optional<Tensor>& bias_opt,
-    double eps) {
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& bias_opt, double eps,
+    const Tensor* mean_saved, const Tensor* rstd_saved,
+    const std::vector<bool>* output_mask) {
+    if (input.dim() < 2 || input.size(1) <= 0 || num_groups <= 0 ||
+        input.size(1) % num_groups != 0) {
+        TP_THROW(RuntimeError, "group_norm_backward has invalid group dimensions");
+    }
+    if (input.dtype() != grad_output.dtype() ||
+        (input.dtype() != DType::Float32 && input.dtype() != DType::Float64)) {
+        TP_THROW(NotImplementedError,
+                 "group_norm_backward only supports matching Float32/Float64 inputs");
+    }
+    if (grad_output.dim() != input.dim()) {
+        TP_THROW(RuntimeError,
+                 "group_norm_backward gradient shape does not match input");
+    }
+    for (int64_t dim = 0; dim < input.dim(); ++dim) {
+        if (grad_output.size(dim) != input.size(dim)) {
+            TP_THROW(RuntimeError,
+                     "group_norm_backward gradient shape does not match input");
+        }
+    }
     const int64_t N = input.size(0);
     const int64_t C = input.size(1);
     const int64_t cpg = C / num_groups;
-    const int64_t spatial = input.numel() / (N * C);
+    int64_t spatial = 1;
+    for (int64_t dim = 2; dim < input.dim(); ++dim) {
+        spatial *= input.size(dim);
+    }
+    if (spatial <= 0) {
+        TP_THROW(RuntimeError, "group_norm_backward requires non-empty spatial dimensions");
+    }
     const int64_t inner = cpg * spatial;
+    const bool need_dx = !output_mask ||
+        (!output_mask->empty() && (*output_mask)[0]);
+    const bool need_dw = output_mask
+        ? (output_mask->size() > 1 && (*output_mask)[1])
+        : (weight_opt.has_value() && weight_opt->defined());
+    const bool need_db = output_mask
+        ? (output_mask->size() > 2 && (*output_mask)[2])
+        : (bias_opt.has_value() && bias_opt->defined());
+
     Tensor grad_output_contig = grad_output.is_contiguous()
         ? grad_output : grad_output.contiguous();
     Tensor input_contig = input.is_contiguous() ? input : input.contiguous();
-
-    Tensor grad_input = Tensor::empty_like(input);
+    Tensor grad_input = need_dx ? Tensor::empty_like(input_contig) : Tensor();
     Tensor grad_weight, grad_bias;
-    if (weight_opt.has_value() && weight_opt->defined()) {
-        grad_weight = Tensor::zeros_like(*weight_opt);
+    if (need_dw) {
+        grad_weight = Tensor::empty({C}, input.dtype(), input.device());
     }
-    if (bias_opt.has_value() && bias_opt->defined()) {
-        grad_bias = Tensor::zeros_like(*bias_opt);
+    if (need_db) {
+        grad_bias = Tensor::empty({C}, input.dtype(), input.device());
+    }
+    std::optional<Tensor> weight_contig = weight_opt;
+    if (weight_contig.has_value() && weight_contig->defined() &&
+        !weight_contig->is_contiguous()) {
+        weight_contig = weight_contig->contiguous();
     }
 
     const auto stream = getCurrentCUDAStream().stream();
+    if (N == 0) {
+        const size_t element_bytes = input.dtype() == DType::Float64 ? 8 : 4;
+        if (grad_weight.defined()) {
+            check_normalization_cuda_status(
+                cudaMemsetAsync(grad_weight.data_ptr(), 0,
+                                C * element_bytes, stream),
+                "group_norm backward weight initialization");
+        }
+        if (grad_bias.defined()) {
+            check_normalization_cuda_status(
+                cudaMemsetAsync(grad_bias.data_ptr(), 0,
+                                C * element_bytes, stream),
+                "group_norm backward bias initialization");
+        }
+        return {grad_input, grad_weight, grad_bias};
+    }
+
+    Tensor mean_saved_contig;
+    Tensor rstd_saved_contig;
+    if (mean_saved && mean_saved->defined()) {
+        mean_saved_contig = mean_saved->is_contiguous()
+            ? *mean_saved : mean_saved->contiguous();
+    }
+    if (rstd_saved && rstd_saved->defined()) {
+        rstd_saved_contig = rstd_saved->is_contiguous()
+            ? *rstd_saved : rstd_saved->contiguous();
+    }
+    if (mean_saved_contig.defined() != rstd_saved_contig.defined()) {
+        TP_THROW(RuntimeError, "group_norm_backward requires both saved statistics");
+    }
+
     #define GN_BACKWARD_CASE(ctype, acc_t, acc_name)                            \
     {                                                                           \
         constexpr int kVec = sizeof(ctype) <= 4 ? 4 : 2;                        \
         const ctype* dy_p = grad_output_contig.data_ptr<ctype>();               \
         const ctype* x_p = input_contig.data_ptr<ctype>();                     \
-        ctype* dx_p = grad_input.data_ptr<ctype>();                             \
+        ctype* dx_p = grad_input.defined()                                      \
+            ? grad_input.data_ptr<ctype>() : nullptr;                           \
         const bool vec_ok =                                                     \
-            inner % kVec == 0 && spatial % kVec == 0 &&                         \
+            inner % kVec == 0 &&                                                \
             reinterpret_cast<uintptr_t>(dy_p) % (sizeof(ctype) * kVec) == 0 &&  \
             reinterpret_cast<uintptr_t>(x_p) % (sizeof(ctype) * kVec) == 0 &&   \
-            reinterpret_cast<uintptr_t>(dx_p) % (sizeof(ctype) * kVec) == 0;    \
-        Tensor stats = Tensor::empty({N * num_groups * 2}, DType::acc_name,     \
-                                     input.device());                           \
-        acc_t* mean_p = stats.data_ptr<acc_t>();                                \
-        acc_t* rstd_p = mean_p + N * num_groups;                                \
-        /* Live to the end of the op: the async kernels launched below keep */  \
-        /* reading these buffers, so they must outlive every launch.       */   \
+            (!need_dx || reinterpret_cast<uintptr_t>(dx_p) %                   \
+                (sizeof(ctype) * kVec) == 0);                                   \
+        const unsigned moments_threads = group_norm_threads_for(inner);         \
+        const unsigned internal_threads = group_norm_threads_for(spatial);      \
+        const unsigned fused_threads = group_norm_threads_for(cpg);            \
+        Tensor computed_stats;                                                 \
+        acc_t* mean_p = nullptr;                                                \
+        acc_t* rstd_p = nullptr;                                                \
+        if (mean_saved_contig.defined()) {                                      \
+            mean_p = mean_saved_contig.data_ptr<acc_t>();                      \
+            rstd_p = rstd_saved_contig.data_ptr<acc_t>();                      \
+        } else {                                                                \
+            computed_stats = Tensor::empty({N * num_groups * 2},                \
+                                            DType::acc_name, input.device());   \
+            mean_p = computed_stats.data_ptr<acc_t>();                         \
+            rstd_p = mean_p + N * num_groups;                                  \
+        }                                                                       \
         Tensor sums = Tensor::empty({N * C * 2}, DType::acc_name,               \
                                     input.device());                            \
         acc_t* ds_p = sums.data_ptr<acc_t>();                                   \
         acc_t* db_p = ds_p + N * C;                                             \
-        Tensor fused = Tensor::empty({N * num_groups * 2}, DType::acc_name,     \
-                                     input.device());                           \
-        acc_t* c2_p = fused.data_ptr<acc_t>();                                  \
-        acc_t* c3_p = c2_p + N * num_groups;                                    \
         if (vec_ok) {                                                           \
-            group_norm_moments_vec_impl<ctype, acc_t, kVec>                     \
-                <<<N * num_groups, layer_norm::kLNThreads, 0, stream>>>(        \
-                    inner, static_cast<acc_t>(eps), x_p, mean_p, rstd_p);       \
-            check_normalization_cuda_launch("group_norm backward moments");  \
-            group_norm_internal_grads_vec_impl<ctype, acc_t, kVec>              \
-                <<<N * C, layer_norm::kLNThreads, 0, stream>>>(                 \
-                    spatial, dy_p, x_p, ds_p, db_p);                            \
-            check_normalization_cuda_launch("group_norm backward sums");     \
-            const ctype* gw_p =                                                 \
-                weight_opt.has_value() && weight_opt->defined()                 \
-                    ? weight_opt->data_ptr<ctype>() : nullptr;                  \
-            group_norm_bwd_fused_params_impl<ctype, acc_t>                      \
-                <<<N * num_groups, layer_norm::kLNThreads, 0, stream>>>(        \
-                    cpg, inner, num_groups, mean_p, rstd_p, gw_p,               \
-                    ds_p, db_p, c2_p, c3_p);                                    \
-            check_normalization_cuda_launch("group_norm backward coefficients"); \
-            group_norm_dx_apply_vec_impl<ctype, acc_t, kVec>                    \
-                <<<N * num_groups, layer_norm::kLNThreads, 0, stream>>>(        \
-                    inner, spatial, cpg, num_groups, dy_p, x_p, rstd_p,         \
-                    gw_p, c2_p, c3_p, dx_p);                                    \
-            check_normalization_cuda_launch("group_norm backward input");    \
-            if (grad_weight.defined() || grad_bias.defined()) {                 \
-                acc_t* gwv_p = grad_weight.defined()                            \
-                    ? grad_weight.data_ptr<acc_t>() : nullptr;                  \
-                acc_t* gbv_p = grad_bias.defined()                              \
-                    ? grad_bias.data_ptr<acc_t>() : nullptr;                    \
+            if (!mean_saved_contig.defined()) {                                 \
+                group_norm_moments_vec_impl<ctype, acc_t, kVec>                 \
+                    <<<N * num_groups, moments_threads, 0, stream>>>(           \
+                        inner, static_cast<acc_t>(eps), x_p, mean_p, rstd_p);   \
+                check_normalization_cuda_launch("group_norm backward moments"); \
+            }                                                                   \
+            if (spatial % kVec == 0) {                                           \
+                group_norm_internal_grads_vec_impl<ctype, acc_t, kVec>          \
+                    <<<N * C, internal_threads, 0, stream>>>(                    \
+                        spatial, dy_p, x_p, ds_p, db_p);                        \
+            } else {                                                             \
+                group_norm_internal_grads_tail_impl<ctype, acc_t, kVec>         \
+                    <<<N * C, internal_threads, 0, stream>>>(                    \
+                        spatial, dy_p, x_p, ds_p, db_p);                        \
+            }                                                                    \
+            check_normalization_cuda_launch("group_norm backward sums");      \
+            if (need_dx) {                                                      \
+                const ctype* gw_p = weight_contig.has_value() &&               \
+                    weight_contig->defined()                                   \
+                    ? weight_contig->data_ptr<ctype>() : nullptr;              \
+                group_norm_dx_fused_vec_impl<ctype, acc_t, kVec>                 \
+                    <<<N * num_groups, moments_threads, 0, stream>>>(           \
+                        inner, spatial, cpg, num_groups, dy_p, x_p, mean_p,      \
+                        rstd_p, gw_p, ds_p, db_p, dx_p);                        \
+                check_normalization_cuda_launch("group_norm backward input"); \
+            }                                                                   \
+            if (need_dw || need_db) {                                           \
+                acc_t* gwv_p = need_dw ? grad_weight.data_ptr<acc_t>()         \
+                                       : nullptr;                               \
+                acc_t* gbv_p = need_db ? grad_bias.data_ptr<acc_t>()           \
+                                       : nullptr;                               \
                 group_norm_gamma_beta_sums_impl<acc_t>                          \
                     <<<(C + 255) / 256, 256, 0, stream>>>(                       \
-                        N, C, num_groups, cpg, mean_p, rstd_p,                  \
+                        N, C, num_groups, cpg, mean_p, rstd_p,                 \
                         ds_p, db_p, gwv_p, gbv_p);                              \
                 check_normalization_cuda_launch("group_norm backward parameters"); \
             }                                                                   \
         } else {                                                                \
-            group_norm_moments_impl<ctype, acc_t>                               \
-                <<<N * num_groups, layer_norm::kLNThreads, 0, stream>>>(        \
-                    inner, static_cast<acc_t>(eps), x_p, mean_p, rstd_p);       \
-            check_normalization_cuda_launch("group_norm backward moments");  \
-            group_norm_grad_input_impl<ctype, acc_t>                            \
-                <<<N * num_groups, layer_norm::kLNThreads, 0, stream>>>(        \
-                    inner, spatial, num_groups,                                 \
-                    dy_p, x_p, mean_p, rstd_p, dx_p);                           \
-            check_normalization_cuda_launch("group_norm backward input");    \
-            if (grad_weight.defined() || grad_bias.defined()) {                 \
-                group_norm_gamma_beta_impl<ctype, acc_t>                        \
-                    <<<C, layer_norm::kLNThreads, 0, stream>>>(                 \
-                        N, C, spatial, num_groups, cpg,                         \
-                        dy_p, x_p, mean_p, rstd_p,                              \
-                        grad_weight.defined()                                   \
-                            ? grad_weight.data_ptr<ctype>() : nullptr,          \
-                        grad_bias.defined()                                     \
-                            ? grad_bias.data_ptr<ctype>() : nullptr);           \
+            if (!mean_saved_contig.defined()) {                                 \
+                group_norm_moments_impl<ctype, acc_t>                           \
+                    <<<N * num_groups, moments_threads, 0, stream>>>(           \
+                        inner, static_cast<acc_t>(eps), x_p, mean_p, rstd_p);   \
+                check_normalization_cuda_launch("group_norm backward moments"); \
+            }                                                                   \
+            if (need_dx || need_dw || need_db) {                                \
+                group_norm_internal_grads_impl<ctype, acc_t>                     \
+                    <<<N * C, internal_threads, 0, stream>>>(                    \
+                        spatial, dy_p, x_p, ds_p, db_p);                         \
+                check_normalization_cuda_launch("group_norm backward sums");    \
+            }                                                                   \
+            if (need_dx) {                                                       \
+                Tensor fused = Tensor::empty({N * num_groups * 2},              \
+                                              DType::acc_name, input.device()); \
+                acc_t* c2_p = fused.data_ptr<acc_t>();                          \
+                acc_t* c3_p = c2_p + N * num_groups;                             \
+                const ctype* gw_p = weight_contig.has_value() &&               \
+                    weight_contig->defined()                                   \
+                    ? weight_contig->data_ptr<ctype>() : nullptr;               \
+                group_norm_bwd_fused_params_impl<ctype, acc_t>                  \
+                    <<<N * num_groups, fused_threads, 0, stream>>>(             \
+                        cpg, inner, num_groups, mean_p, rstd_p, gw_p,           \
+                        ds_p, db_p, c2_p, c3_p);                                \
+                check_normalization_cuda_launch("group_norm backward coefficients"); \
+                group_norm_dx_apply_impl<ctype, acc_t>                          \
+                    <<<N * num_groups, moments_threads, 0, stream>>>(            \
+                        inner, spatial, cpg, num_groups, dy_p, x_p, rstd_p,      \
+                        gw_p, c2_p, c3_p, dx_p);                                 \
+                check_normalization_cuda_launch("group_norm backward input");   \
+            }                                                                   \
+            if (need_dw || need_db) {                                           \
+                group_norm_gamma_beta_sums_impl<acc_t>                           \
+                    <<<(C + 255) / 256, 256, 0, stream>>>(                       \
+                        N, C, num_groups, cpg, mean_p, rstd_p,                  \
+                        ds_p, db_p,                                             \
+                        need_dw ? grad_weight.data_ptr<acc_t>() : nullptr,      \
+                        need_db ? grad_bias.data_ptr<acc_t>() : nullptr);       \
                 check_normalization_cuda_launch("group_norm backward parameters"); \
             }                                                                   \
         }                                                                       \
@@ -1359,7 +1672,43 @@ std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cuda(
     }
     #undef GN_BACKWARD_CASE
 
-    return std::make_tuple(grad_input, grad_weight, grad_bias);
+    return {grad_input, grad_weight, grad_bias};
+}
+
+std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cuda(
+    const Tensor& grad_output, const Tensor& input, int64_t num_groups,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& bias_opt, double eps) {
+    return group_norm_backward_cuda_impl(
+        grad_output, input, num_groups, weight_opt, bias_opt, eps, nullptr,
+        nullptr, nullptr);
+}
+
+std::tuple<Tensor, Tensor, Tensor> native_group_norm_backward_cuda(
+    const Tensor& grad_output, const Tensor& input, const Tensor& mean,
+    const Tensor& rstd, const std::optional<Tensor>& weight_opt, int64_t N,
+    int64_t C, int64_t HxW, int64_t num_groups,
+    const std::vector<bool>& output_mask) {
+    if (input.dim() < 2 || input.size(0) != N || input.size(1) != C) {
+        TP_THROW(RuntimeError,
+                 "native_group_norm_backward dimensions do not match input");
+    }
+    if (output_mask.size() != 3) {
+        TP_THROW(RuntimeError,
+                 "native_group_norm_backward output mask must have 3 values");
+    }
+    int64_t actual_hxw = 1;
+    for (int64_t dim = 2; dim < input.dim(); ++dim) {
+        actual_hxw *= input.size(dim);
+    }
+    if (HxW != actual_hxw || mean.numel() != N * num_groups ||
+        rstd.numel() != N * num_groups) {
+        TP_THROW(RuntimeError,
+                 "native_group_norm_backward statistics do not match input");
+    }
+    return group_norm_backward_cuda_impl(
+        grad_output, input, num_groups, weight_opt, std::nullopt, 0.0, &mean,
+        &rstd, &output_mask);
 }
 
 Tensor instance_norm_cuda(const Tensor& input, const std::optional<Tensor>& weight_opt,
@@ -1540,6 +1889,8 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, NormalizationKernels) {
     m.impl("layer_norm_backward", layer_norm_backward_cuda);
     m.impl("group_norm", group_norm_cuda);
     m.impl("group_norm_backward", group_norm_backward_cuda);
+    m.impl("native_group_norm", native_group_norm_cuda);
+    m.impl("native_group_norm_backward", native_group_norm_backward_cuda);
     m.impl("instance_norm", instance_norm_cuda);
     m.impl("instance_norm_backward", instance_norm_backward_cuda);
 }
