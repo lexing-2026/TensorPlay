@@ -102,9 +102,34 @@ struct ProgramState {
     const int64_t* output_sizes;
     const int64_t* output_strides;
     const uint8_t* input_flat;
+    int uniform_kind;
     int64_t input_count;
     int64_t instruction_count;
     int64_t rank;
+
+    // Loads one input element.  When every input shares one storage kind the
+    // kind is a single value, so the load compiles to one predictable branch
+    // over a directly typed read; only genuinely mixed programs pay the
+    // per-input kind lookup and switch.
+    __device__ compute_t load_input(int64_t ref, int64_t index) const {
+        const void* ptr = input_ptrs[ref];
+        switch (uniform_kind) {
+            case kOutF32:
+                return static_cast<compute_t>(
+                    static_cast<const float*>(ptr)[index]);
+            case kOutF64:
+                return static_cast<compute_t>(
+                    static_cast<const double*>(ptr)[index]);
+            case kOutF16:
+                return static_cast<compute_t>(
+                    static_cast<const tensorplay::Half*>(ptr)[index]);
+            case kOutBF16:
+                return static_cast<compute_t>(
+                    static_cast<const tensorplay::BFloat16*>(ptr)[index]);
+            default:
+                return load_typed(input_kinds[ref], ptr, index);
+        }
+    }
 
     __device__ compute_t load_typed(uint8_t kind, const void* ptr,
                                     int64_t index) const {
@@ -130,8 +155,7 @@ struct ProgramState {
         if (ref >= 0) {
             if (ref < input_count) {
                 if constexpr (Flat) {
-                    return load_typed(input_kinds[ref], input_ptrs[ref],
-                                      element);
+                    return load_input(ref, element);
                 } else {
                     int64_t offset = element;
                     if (!input_flat[ref]) {
@@ -147,8 +171,7 @@ struct ProgramState {
                             }
                         }
                     }
-                    return load_typed(input_kinds[ref], input_ptrs[ref],
-                                      offset);
+                    return load_input(ref, offset);
                 }
             }
             return local_temps[ref - input_count];
@@ -546,6 +569,11 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
         host_input_ptrs.push_back(input.data_ptr());
         host_input_kinds.push_back(encode_out_kind(input.dtype()));
     }
+    const int uniform_kind = std::all_of(
+        host_input_kinds.begin(), host_input_kinds.end(),
+        [&](uint8_t kind) { return kind == host_input_kinds.front(); })
+        ? static_cast<int>(host_input_kinds.front())
+        : -1;
     std::vector<int64_t> host_input_sizes;
     std::vector<int64_t> host_input_strides;
     std::vector<uint8_t> host_input_flat;
@@ -730,6 +758,7 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
         state.output_sizes = nullptr;
         state.output_strides = nullptr;
         state.input_flat = nullptr;
+        state.uniform_kind = uniform_kind;
         state.input_count = input_count;
         state.instruction_count = instruction_count;
         state.rank = 0;
@@ -757,6 +786,7 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
         state.output_strides = reinterpret_cast<const int64_t*>(
             metadata_ptr + output_stride_offset);
         state.input_flat = metadata_ptr + input_flat_offset;
+        state.uniform_kind = uniform_kind;
         state.input_count = input_count;
         state.instruction_count = instruction_count;
         state.rank = rank;
