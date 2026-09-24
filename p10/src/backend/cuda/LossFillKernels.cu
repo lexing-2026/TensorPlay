@@ -21,6 +21,7 @@
 
 #include <optional>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 #include "Atomic.cuh"
@@ -190,114 +191,262 @@ __global__ void bce_grad_kernel(int64_t n, const double* x, const double* t,
 
 // ---------------------------------------------------------------------------
 // nll forward / backward (row form and 2-D spatial form)
+//
+// Everything runs in the input's own dtype: the forward gathers one score
+// per row, so rewriting the whole matrix through a wider accumulator only
+// burns bandwidth, and the reduced scalar stays on the device so a training
+// step never waits on a host round trip.
 // ---------------------------------------------------------------------------
 
 // One thread per batch row gathers the target class score; optional
-// per-class weights multiply.  Writes per-row loss and per-row weight so the
-// host reduction can honour both reduction modes and ignore_index.
-__global__ void nll_row_kernel(int64_t n, int64_t C, const double* x,
-                               const int64_t* tgt, const double* w, bool has_w,
-                               int64_t ignore, double* loss, double* wout) {
+// per-class weights multiply.  Out-of-range targets contribute nothing,
+// which is the same guard the backward scatter applies.
+template <typename T>
+__global__ void nll_row_kernel(int64_t n, int64_t C, const T* x,
+                               const int64_t* tgt, const T* w, bool has_w,
+                               int64_t ignore, T* loss) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += st) {
         const int64_t t = tgt[i];
-        if (t == ignore) {
-            loss[i] = 0.0;
-            wout[i] = 0.0;
+        if (t == ignore || t < 0 || t >= C) {
+            loss[i] = T(0);
         } else {
-            const double wi = has_w ? w[t] : 1.0;
+            const T wi = has_w ? w[t] : T(1);
             loss[i] = -x[i * C + t] * wi;
-            wout[i] = wi;
         }
     }
 }
 
-// One thread per spatial position; input row (n*C+t)*HW + pos.
-__global__ void nll2d_row_kernel(int64_t rows, int64_t C, int64_t HW,
-                                 const double* x, const int64_t* tgt,
-                                 const double* w, bool has_w, int64_t ignore,
-                                 double* loss, double* wout) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < rows; i += st) {
+// Stage one of the reduced forward: each block folds a strided slice of
+// rows into a (loss, weight) pair with a fixed tree order, so repeated
+// calls land on the same value.
+template <typename T, typename A>
+__global__ void nll_partial_kernel(int64_t n, int64_t C, const T* x,
+                                   const int64_t* tgt, const T* w, bool has_w,
+                                   int64_t ignore, A* part_l, A* part_w) {
+    __shared__ A sh_l[kThreads];
+    __shared__ A sh_w[kThreads];
+    const int tid = static_cast<int>(threadIdx.x);
+    A sl = A(0), sw = A(0);
+    const int64_t st = static_cast<int64_t>(gridDim.x) * kThreads;
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * kThreads + tid;
+         i < n; i += st) {
         const int64_t t = tgt[i];
-        if (t == ignore) {
-            loss[i] = 0.0;
-            wout[i] = 0.0;
-        } else {
-            const int64_t n = i / HW;
-            const int64_t pos = i % HW;
-            const double wi = has_w ? w[t] : 1.0;
-            loss[i] = -x[(n * C + t) * HW + pos] * wi;
-            wout[i] = wi;
+        if (t != ignore && t >= 0 && t < C) {
+            const A wi = has_w ? static_cast<A>(w[t]) : A(1);
+            sl -= static_cast<A>(x[i * C + t]) * wi;
+            sw += wi;
         }
+    }
+    sh_l[tid] = sl;
+    sh_w[tid] = sw;
+    __syncthreads();
+#pragma unroll 1
+    for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sh_l[tid] += sh_l[tid + stride];
+            sh_w[tid] += sh_w[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        part_l[blockIdx.x] = sh_l[0];
+        part_w[blockIdx.x] = sh_w[0];
     }
 }
 
-// reduction == 0: gradient scatters -w * g_i to the target slot.
-__global__ void nll_grad_none_kernel(int64_t n, int64_t C, const double* g,
-                                     const int64_t* tgt, const double* w,
-                                     bool has_w, int64_t ignore, double* gi) {
+// Stage two: one block merges the per-block partials and writes the final
+// scalar pair.  A mean over zero contributing weight divides zero by zero,
+// which is the NaN the unreduced-empty case must produce.
+template <typename A, typename T>
+__global__ void nll_finalize_kernel(int blocks, const A* part_l,
+                                    const A* part_w, bool size_average,
+                                    T* out, T* total_w) {
+    __shared__ A sh_l[kThreads];
+    __shared__ A sh_w[kThreads];
+    const int tid = static_cast<int>(threadIdx.x);
+    A sl = A(0), sw = A(0);
+    for (int b = tid; b < blocks; b += kThreads) {
+        sl += part_l[b];
+        sw += part_w[b];
+    }
+    sh_l[tid] = sl;
+    sh_w[tid] = sw;
+    __syncthreads();
+#pragma unroll 1
+    for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sh_l[tid] += sh_l[tid + stride];
+            sh_w[tid] += sh_w[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        total_w[0] = static_cast<T>(sh_w[0]);
+        out[0] = static_cast<T>(size_average ? sh_l[0] / sh_w[0] : sh_l[0]);
+    }
+}
+
+// reduction == 0: per-row gradients; the caller zero-fills and this scatter
+// writes -w * g_i into each valid target slot.
+template <typename T>
+__global__ void nll_grad_none_kernel(int64_t n, int64_t C, const T* g,
+                                     const int64_t* tgt, const T* w,
+                                     bool has_w, int64_t ignore, T* gi) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += st) {
         const int64_t t = tgt[i];
         if (t == ignore || t < 0 || t >= C) continue;
-        const double wi = has_w ? w[t] : 1.0;
+        const T wi = has_w ? w[t] : T(1);
         gi[i * C + t] = -wi * g[i];
     }
 }
 
-__global__ void nll2d_grad_none_kernel(int64_t rows, int64_t C, int64_t HW,
-                                      const double* g, const int64_t* tgt,
-                                      const double* w, bool has_w,
-                                      int64_t ignore, double* gi) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < rows; i += st) {
-        const int64_t t = tgt[i];
-        if (t == ignore || t < 0 || t >= C) continue;
-        const int64_t n = i / HW;
-        const int64_t pos = i % HW;
-        const double wi = has_w ? w[t] : 1.0;
-        gi[(n * C + t) * HW + pos] = -wi * g[i];
-    }
-}
-
-// Scalar-output modes: every valid row contributes -w * g / tw.
-__global__ void nll_grad_scalar_kernel(int64_t n, int64_t C, const double* g,
-                                       const int64_t* tgt, const double* w,
+// Scalar-output modes: every valid row contributes -w * g (/ tw); both
+// scalars stay on the device, so no sync is needed to read them.
+template <typename T>
+__global__ void nll_grad_scalar_kernel(int64_t n, int64_t C, const T* g,
+                                       const int64_t* tgt, const T* w,
                                        bool has_w, int64_t ignore,
-                                       const double* tw, bool size_average,
-                                       double* gi) {
+                                       const T* tw, bool size_average,
+                                       T* gi) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    const double gg = size_average ? *g / *tw : *g;
+    const T gv = *g;
+    const T gg = size_average ? gv / *tw : gv;
     for (; i < n; i += st) {
         const int64_t t = tgt[i];
         if (t == ignore || t < 0 || t >= C) continue;
-        const double wi = has_w ? w[t] : 1.0;
+        const T wi = has_w ? w[t] : T(1);
         gi[i * C + t] = -wi * gg;
     }
 }
 
-__global__ void nll2d_grad_scalar_kernel(int64_t rows, int64_t C, int64_t HW,
-                                         const double* g, const int64_t* tgt,
-                                         const double* w, bool has_w,
-                                         int64_t ignore, const double* tw,
-                                         bool size_average, double* gi) {
+template <typename T>
+__global__ void nll2d_row_kernel_t(int64_t rows, int64_t C, int64_t HW,
+                                   const T* x, const int64_t* tgt,
+                                   const T* w, bool has_w, int64_t ignore,
+                                   T* loss) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    const double gg = size_average ? *g / *tw : *g;
+    for (; i < rows; i += st) {
+        const int64_t t = tgt[i];
+        if (t == ignore || t < 0 || t >= C) {
+            loss[i] = T(0);
+        } else {
+            const int64_t n = i / HW;
+            const int64_t pos = i % HW;
+            const T wi = has_w ? w[t] : T(1);
+            loss[i] = -x[(n * C + t) * HW + pos] * wi;
+        }
+    }
+}
+
+template <typename T, typename A>
+__global__ void nll2d_partial_kernel(int64_t rows, int64_t C, int64_t HW,
+                                     const T* x, const int64_t* tgt,
+                                     const T* w, bool has_w, int64_t ignore,
+                                     A* part_l, A* part_w) {
+    __shared__ A sh_l[kThreads];
+    __shared__ A sh_w[kThreads];
+    const int tid = static_cast<int>(threadIdx.x);
+    A sl = A(0), sw = A(0);
+    const int64_t st = static_cast<int64_t>(gridDim.x) * kThreads;
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * kThreads + tid;
+         i < rows; i += st) {
+        const int64_t t = tgt[i];
+        if (t != ignore && t >= 0 && t < C) {
+            const int64_t n = i / HW;
+            const int64_t pos = i % HW;
+            const A wi = has_w ? static_cast<A>(w[t]) : A(1);
+            sl -= static_cast<A>(x[(n * C + t) * HW + pos]) * wi;
+            sw += wi;
+        }
+    }
+    sh_l[tid] = sl;
+    sh_w[tid] = sw;
+    __syncthreads();
+#pragma unroll 1
+    for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sh_l[tid] += sh_l[tid + stride];
+            sh_w[tid] += sh_w[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        part_l[blockIdx.x] = sh_l[0];
+        part_w[blockIdx.x] = sh_w[0];
+    }
+}
+
+template <typename T>
+__global__ void nll2d_grad_none_kernel(int64_t rows, int64_t C, int64_t HW,
+                                       const T* g, const int64_t* tgt,
+                                       const T* w, bool has_w,
+                                       int64_t ignore, T* gi) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < rows; i += st) {
         const int64_t t = tgt[i];
         if (t == ignore || t < 0 || t >= C) continue;
         const int64_t n = i / HW;
         const int64_t pos = i % HW;
-        const double wi = has_w ? w[t] : 1.0;
+        const T wi = has_w ? w[t] : T(1);
+        gi[(n * C + t) * HW + pos] = -wi * g[i];
+    }
+}
+
+template <typename T>
+__global__ void nll2d_grad_scalar_kernel(int64_t rows, int64_t C, int64_t HW,
+                                         const T* g, const int64_t* tgt,
+                                         const T* w, bool has_w,
+                                         int64_t ignore, const T* tw,
+                                         bool size_average, T* gi) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    const T gv = *g;
+    const T gg = size_average ? gv / *tw : gv;
+    for (; i < rows; i += st) {
+        const int64_t t = tgt[i];
+        if (t == ignore || t < 0 || t >= C) continue;
+        const int64_t n = i / HW;
+        const int64_t pos = i % HW;
+        const T wi = has_w ? w[t] : T(1);
         gi[(n * C + t) * HW + pos] = -wi * gg;
     }
+}
+
+// Reduced forward driver: cap the partial grid so stage two's merge stays
+// tiny and its order fixed regardless of batch size.
+constexpr int64_t kNllMaxPartials = 1024;
+
+template <typename T, typename A>
+void nll_forward_reduced(int64_t rows, int64_t C, int64_t HW, const T* x,
+                         const int64_t* tgt, const T* w, bool has_w,
+                         int64_t ignore, bool size_average, T* out,
+                         T* total_w, cudaStream_t stream) {
+    const int64_t want = (rows + kThreads - 1) / kThreads;
+    const unsigned blocks =
+        static_cast<unsigned>(want < kNllMaxPartials ? want : kNllMaxPartials);
+    Tensor partials = Tensor::empty(
+        {2 * static_cast<int64_t>(blocks)},
+        std::is_same<A, double>::value ? DType::Float64 : DType::Float32,
+        Device(DeviceType::CUDA));
+    A* part_l = partials.data_ptr<A>();
+    A* part_w = part_l + blocks;
+    if (HW == 1) {
+        nll_partial_kernel<T, A><<<blocks, kThreads, 0, stream>>>(
+            rows, C, x, tgt, w, has_w, ignore, part_l, part_w);
+    } else {
+        nll2d_partial_kernel<T, A><<<blocks, kThreads, 0, stream>>>(
+            rows, C, HW, x, tgt, w, has_w, ignore, part_l, part_w);
+    }
+    nll_finalize_kernel<A, T><<<1, kThreads, 0, stream>>>(
+        static_cast<int>(blocks), part_l, part_w, size_average, out, total_w);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // Sum of a small device buffer (row weights) into a host scalar.
@@ -630,35 +779,120 @@ std::tuple<Tensor, Tensor> nll_loss_cuda(const Tensor& input,
     if (target.dtype() != DType::Int64) {
         TP_THROW(RuntimeError, "nll_loss: target must have dtype Int64");
     }
-    const Tensor x = f64_dev(input);
+    const Tensor x = input.is_contiguous() ? input : input.contiguous();
     const Tensor tgt = target.is_contiguous() ? target : target.contiguous();
     const bool has_w = weight_opt.has_value() && weight_opt->defined();
-    Tensor w = has_w ? f64_dev(*weight_opt) : Tensor();
-    Tensor loss_rows = Tensor::empty({N}, DType::Float64, input.device());
-    Tensor wrows = Tensor::empty({N}, DType::Float64, input.device());
-    if (N) {
-        nll_row_kernel<<<loss_grid(N), kThreads, 0,
-                         getCurrentCUDAStream().stream()>>>(
-            N, C, x.data_ptr<double>(), tgt.data_ptr<int64_t>(),
-            has_w ? w.data_ptr<double>() : nullptr, has_w, ignore_index,
-            loss_rows.data_ptr<double>(), wrows.data_ptr<double>());
-        CUDA_CHECK(cudaGetLastError());
-    }
-    const double wtotal = host_sum_f64(wrows, N);
+    // Weights meet only the gathered slots; keeping them in the input dtype
+    // lets the kernels run without a second copy of the class matrix.
+    const Tensor w = has_w ? weight_opt->contiguous().to(input.dtype())
+                           : Tensor();
+    const auto stream = getCurrentCUDAStream().stream();
+
     if (reduction == 0) {
         // Unreduced batched losses carry no normalizer.
-        return {loss_rows.to(input.dtype()),
+        Tensor loss_rows = Tensor::empty({N}, input.dtype(), input.device());
+        if (N) {
+            switch (input.dtype()) {
+                case DType::Float64:
+                    nll_row_kernel<double><<<loss_grid(N), kThreads, 0, stream>>>(
+                        N, C, x.data_ptr<double>(), tgt.data_ptr<int64_t>(),
+                        has_w ? w.data_ptr<double>() : nullptr, has_w,
+                        ignore_index, loss_rows.data_ptr<double>());
+                    break;
+                case DType::Float32:
+                    nll_row_kernel<float><<<loss_grid(N), kThreads, 0, stream>>>(
+                        N, C, x.data_ptr<float>(), tgt.data_ptr<int64_t>(),
+                        has_w ? w.data_ptr<float>() : nullptr, has_w,
+                        ignore_index, loss_rows.data_ptr<float>());
+                    break;
+                case DType::Float16:
+                    nll_row_kernel<Half><<<loss_grid(N), kThreads, 0, stream>>>(
+                        N, C, x.data_ptr<Half>(), tgt.data_ptr<int64_t>(),
+                        has_w ? w.data_ptr<Half>() : nullptr, has_w,
+                        ignore_index, loss_rows.data_ptr<Half>());
+                    break;
+                case DType::BFloat16:
+                    nll_row_kernel<BFloat16><<<loss_grid(N), kThreads, 0, stream>>>(
+                        N, C, x.data_ptr<BFloat16>(), tgt.data_ptr<int64_t>(),
+                        has_w ? w.data_ptr<BFloat16>() : nullptr, has_w,
+                        ignore_index, loss_rows.data_ptr<BFloat16>());
+                    break;
+                default:
+                    TP_THROW(NotImplementedError,
+                             "nll_loss CUDA supports floating dtypes only");
+            }
+            CUDA_CHECK(cudaGetLastError());
+        }
+        return {loss_rows,
                 Tensor::full({}, Scalar(0.0), input.dtype(), input.device())};
     }
-    Tensor total_weight =
-        Tensor::full({}, Scalar(wtotal), input.dtype(), input.device());
-    const double total = host_sum_f64(loss_rows, N);
-    // Every target ignored under mean reduction: 0 / 0 is NaN.
-    const double v = reduction == 1 ? total / wtotal : total;
-    return {Tensor::full({}, Scalar(v), out_scalar_dtype(input.dtype()),
-                         input.device())
-                .to(input.dtype()),
-            total_weight};
+
+    Tensor out = Tensor::empty({}, input.dtype(), input.device());
+    Tensor total_weight = Tensor::empty({}, input.dtype(), input.device());
+    if (N) {
+        switch (input.dtype()) {
+            case DType::Float64:
+                nll_forward_reduced<double, double>(
+                    N, C, 1, x.data_ptr<double>(), tgt.data_ptr<int64_t>(),
+                    has_w ? w.data_ptr<double>() : nullptr, has_w,
+                    ignore_index, reduction == 1, out.data_ptr<double>(),
+                    total_weight.data_ptr<double>(), stream);
+                break;
+            case DType::Float32:
+                nll_forward_reduced<float, float>(
+                    N, C, 1, x.data_ptr<float>(), tgt.data_ptr<int64_t>(),
+                    has_w ? w.data_ptr<float>() : nullptr, has_w,
+                    ignore_index, reduction == 1, out.data_ptr<float>(),
+                    total_weight.data_ptr<float>(), stream);
+                break;
+            case DType::Float16:
+                nll_forward_reduced<Half, float>(
+                    N, C, 1, x.data_ptr<Half>(), tgt.data_ptr<int64_t>(),
+                    has_w ? w.data_ptr<Half>() : nullptr, has_w,
+                    ignore_index, reduction == 1, out.data_ptr<Half>(),
+                    total_weight.data_ptr<Half>(), stream);
+                break;
+            case DType::BFloat16:
+                nll_forward_reduced<BFloat16, float>(
+                    N, C, 1, x.data_ptr<BFloat16>(), tgt.data_ptr<int64_t>(),
+                    has_w ? w.data_ptr<BFloat16>() : nullptr, has_w,
+                    ignore_index, reduction == 1, out.data_ptr<BFloat16>(),
+                    total_weight.data_ptr<BFloat16>(), stream);
+                break;
+            default:
+                TP_THROW(NotImplementedError,
+                         "nll_loss CUDA supports floating dtypes only");
+        }
+    } else {
+        // Empty batch: zero contributing weight; a mean becomes NaN.
+        switch (input.dtype()) {
+            case DType::Float64:
+                nll_finalize_kernel<double, double><<<1, kThreads, 0, stream>>>(
+                    0, nullptr, nullptr, reduction == 1,
+                    out.data_ptr<double>(), total_weight.data_ptr<double>());
+                break;
+            case DType::Float32:
+                nll_finalize_kernel<float, float><<<1, kThreads, 0, stream>>>(
+                    0, nullptr, nullptr, reduction == 1,
+                    out.data_ptr<float>(), total_weight.data_ptr<float>());
+                break;
+            case DType::Float16:
+                nll_finalize_kernel<float, Half><<<1, kThreads, 0, stream>>>(
+                    0, nullptr, nullptr, reduction == 1,
+                    out.data_ptr<Half>(), total_weight.data_ptr<Half>());
+                break;
+            case DType::BFloat16:
+                nll_finalize_kernel<float, BFloat16><<<1, kThreads, 0, stream>>>(
+                    0, nullptr, nullptr, reduction == 1,
+                    out.data_ptr<BFloat16>(), total_weight.data_ptr<BFloat16>());
+                break;
+            default:
+                TP_THROW(NotImplementedError,
+                         "nll_loss CUDA supports floating dtypes only");
+        }
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return {out, total_weight};
 }
 
 Tensor nll_loss_backward_cuda(const Tensor& grad_output, const Tensor& input,
@@ -668,36 +902,52 @@ Tensor nll_loss_backward_cuda(const Tensor& grad_output, const Tensor& input,
                               const Tensor& total_weight) {
     const int64_t N = input.size(0);
     const int64_t C = input.size(1);
-    const Tensor x = f64_dev(input);
+    TP_CHECK(grad_output.dtype() == input.dtype(),
+             "nll_loss_backward: grad_output dtype must match input dtype");
     const Tensor tgt = target.is_contiguous() ? target : target.contiguous();
     const bool has_w = weight_opt.has_value() && weight_opt->defined();
-    Tensor w = has_w ? f64_dev(*weight_opt) : Tensor();
-    Tensor grad_input = Tensor::zeros(
-        {N, C}, DType::Float64, input.device());
+    const Tensor w = has_w ? weight_opt->contiguous().to(input.dtype())
+                           : Tensor();
+    Tensor grad_input = Tensor::zeros({N, C}, input.dtype(), input.device());
     if (N) {
         const auto stream = getCurrentCUDAStream().stream();
-        if (reduction == 0) {
-            Tensor g = f64_dev(grad_output);
-            nll_grad_none_kernel<<<loss_grid(N), kThreads, 0, stream>>>(
-                N, C, g.data_ptr<double>(), tgt.data_ptr<int64_t>(),
-                has_w ? w.data_ptr<double>() : nullptr, has_w, ignore_index,
-                grad_input.data_ptr<double>());
-        } else {
-            TP_CHECK(grad_output.numel() == 1,
-                     "nll_loss_backward: expected grad_output to be a single element tensor");
-            TP_CHECK(total_weight.numel() == 1,
-                     "nll_loss_backward: expected total_weight to be a single element tensor");
-            const Tensor g = f64_dev(grad_output);
-            const Tensor tw = f64_dev(total_weight);
-            nll_grad_scalar_kernel<<<loss_grid(N), kThreads, 0, stream>>>(
-                N, C, g.data_ptr<double>(), tgt.data_ptr<int64_t>(),
-                has_w ? w.data_ptr<double>() : nullptr, has_w, ignore_index,
-                tw.data_ptr<double>(), reduction == 1,
-                grad_input.data_ptr<double>());
+        const Tensor g = grad_output.is_contiguous()
+            ? grad_output : grad_output.contiguous();
+        #define TP_NLL_BWD_LAUNCH(SCALAR_T)                                \
+            do {                                                           \
+                if (reduction == 0) {                                      \
+                    nll_grad_none_kernel<SCALAR_T><<<loss_grid(N), kThreads, 0, stream>>>( \
+                        N, C, g.data_ptr<SCALAR_T>(),                      \
+                        tgt.data_ptr<int64_t>(),                           \
+                        has_w ? w.data_ptr<SCALAR_T>() : nullptr, has_w,   \
+                        ignore_index, grad_input.data_ptr<SCALAR_T>());    \
+                } else {                                                   \
+                    TP_CHECK(grad_output.numel() == 1,                     \
+                             "nll_loss_backward: expected grad_output to be a single element tensor"); \
+                    TP_CHECK(total_weight.numel() == 1,                    \
+                             "nll_loss_backward: expected total_weight to be a single element tensor"); \
+                    nll_grad_scalar_kernel<SCALAR_T><<<loss_grid(N), kThreads, 0, stream>>>( \
+                        N, C, g.data_ptr<SCALAR_T>(),                      \
+                        tgt.data_ptr<int64_t>(),                           \
+                        has_w ? w.data_ptr<SCALAR_T>() : nullptr, has_w,   \
+                        ignore_index,                                      \
+                        total_weight.data_ptr<SCALAR_T>(), reduction == 1, \
+                        grad_input.data_ptr<SCALAR_T>());                  \
+                }                                                          \
+            } while (0)
+        switch (input.dtype()) {
+            case DType::Float64: TP_NLL_BWD_LAUNCH(double); break;
+            case DType::Float32: TP_NLL_BWD_LAUNCH(float); break;
+            case DType::Float16: TP_NLL_BWD_LAUNCH(Half); break;
+            case DType::BFloat16: TP_NLL_BWD_LAUNCH(BFloat16); break;
+            default:
+                TP_THROW(NotImplementedError,
+                         "nll_loss_backward CUDA supports floating dtypes only");
         }
+        #undef TP_NLL_BWD_LAUNCH
         CUDA_CHECK(cudaGetLastError());
     }
-    return grad_input.to(input.dtype());
+    return grad_input;
 }
 
 // ===========================================================================
@@ -726,36 +976,127 @@ std::tuple<Tensor, Tensor> nll_loss2d_cuda(const Tensor& input,
                  "nll_loss2d CUDA supports floating dtypes only");
     }
     const int64_t rows = N * H * W;
-    const Tensor x = f64_dev(input);
+    const Tensor x = input.is_contiguous() ? input : input.contiguous();
     const Tensor tgt = target.is_contiguous() ? target : target.contiguous();
     const bool has_w = weight_opt.has_value() && weight_opt->defined();
-    Tensor w = has_w ? f64_dev(*weight_opt) : Tensor();
-    Tensor loss_rows = Tensor::empty({rows}, DType::Float64, input.device());
-    Tensor wrows = Tensor::empty({rows}, DType::Float64, input.device());
-    if (rows) {
-        nll2d_row_kernel<<<loss_grid(rows), kThreads, 0,
-                           getCurrentCUDAStream().stream()>>>(
-            rows, C, H * W, x.data_ptr<double>(), tgt.data_ptr<int64_t>(),
-            has_w ? w.data_ptr<double>() : nullptr, has_w, ignore_index,
-            loss_rows.data_ptr<double>(), wrows.data_ptr<double>());
-        CUDA_CHECK(cudaGetLastError());
-    }
-    const double wtotal = host_sum_f64(wrows, rows);
+    const Tensor w = has_w ? weight_opt->contiguous().to(input.dtype())
+                           : Tensor();
+    const auto stream = getCurrentCUDAStream().stream();
+
     if (reduction == 0) {
         // Unreduced losses carry no normalizer: total_weight stays zero.
-        return {loss_rows.to(input.dtype())
-                    .reshape({N, H, W}),
+        Tensor loss_rows =
+            Tensor::empty({rows}, input.dtype(), input.device());
+        if (rows) {
+            switch (input.dtype()) {
+                case DType::Float64:
+                    nll2d_row_kernel_t<double><<<loss_grid(rows), kThreads, 0, stream>>>(
+                        rows, C, H * W, x.data_ptr<double>(),
+                        tgt.data_ptr<int64_t>(),
+                        has_w ? w.data_ptr<double>() : nullptr, has_w,
+                        ignore_index, loss_rows.data_ptr<double>());
+                    break;
+                case DType::Float32:
+                    nll2d_row_kernel_t<float><<<loss_grid(rows), kThreads, 0, stream>>>(
+                        rows, C, H * W, x.data_ptr<float>(),
+                        tgt.data_ptr<int64_t>(),
+                        has_w ? w.data_ptr<float>() : nullptr, has_w,
+                        ignore_index, loss_rows.data_ptr<float>());
+                    break;
+                case DType::Float16:
+                    nll2d_row_kernel_t<Half><<<loss_grid(rows), kThreads, 0, stream>>>(
+                        rows, C, H * W, x.data_ptr<Half>(),
+                        tgt.data_ptr<int64_t>(),
+                        has_w ? w.data_ptr<Half>() : nullptr, has_w,
+                        ignore_index, loss_rows.data_ptr<Half>());
+                    break;
+                case DType::BFloat16:
+                    nll2d_row_kernel_t<BFloat16><<<loss_grid(rows), kThreads, 0, stream>>>(
+                        rows, C, H * W, x.data_ptr<BFloat16>(),
+                        tgt.data_ptr<int64_t>(),
+                        has_w ? w.data_ptr<BFloat16>() : nullptr, has_w,
+                        ignore_index, loss_rows.data_ptr<BFloat16>());
+                    break;
+                default:
+                    TP_THROW(NotImplementedError,
+                             "nll_loss2d CUDA supports floating dtypes only");
+            }
+            CUDA_CHECK(cudaGetLastError());
+        }
+        return {loss_rows.reshape({N, H, W}),
                 Tensor::full({}, Scalar(0.0), input.dtype(), input.device())};
     }
-    Tensor total_weight =
-        Tensor::full({}, Scalar(wtotal), input.dtype(), input.device());
-    const double total = host_sum_f64(loss_rows, rows);
-    // Every target ignored under mean reduction: 0 / 0 is NaN.
-    const double v = reduction == 1 ? total / wtotal : total;
-    return {Tensor::full({}, Scalar(v), out_scalar_dtype(input.dtype()),
-                         input.device())
-                .to(input.dtype()),
-            total_weight};
+
+    Tensor out = Tensor::empty({}, input.dtype(), input.device());
+    Tensor total_weight = Tensor::empty({}, input.dtype(), input.device());
+    if (rows) {
+        switch (input.dtype()) {
+            case DType::Float64:
+                nll_forward_reduced<double, double>(
+                    rows, C, H * W, x.data_ptr<double>(),
+                    tgt.data_ptr<int64_t>(),
+                    has_w ? w.data_ptr<double>() : nullptr, has_w,
+                    ignore_index, reduction == 1, out.data_ptr<double>(),
+                    total_weight.data_ptr<double>(), stream);
+                break;
+            case DType::Float32:
+                nll_forward_reduced<float, float>(
+                    rows, C, H * W, x.data_ptr<float>(),
+                    tgt.data_ptr<int64_t>(),
+                    has_w ? w.data_ptr<float>() : nullptr, has_w,
+                    ignore_index, reduction == 1, out.data_ptr<float>(),
+                    total_weight.data_ptr<float>(), stream);
+                break;
+            case DType::Float16:
+                nll_forward_reduced<Half, float>(
+                    rows, C, H * W, x.data_ptr<Half>(),
+                    tgt.data_ptr<int64_t>(),
+                    has_w ? w.data_ptr<Half>() : nullptr, has_w,
+                    ignore_index, reduction == 1, out.data_ptr<Half>(),
+                    total_weight.data_ptr<Half>(), stream);
+                break;
+            case DType::BFloat16:
+                nll_forward_reduced<BFloat16, float>(
+                    rows, C, H * W, x.data_ptr<BFloat16>(),
+                    tgt.data_ptr<int64_t>(),
+                    has_w ? w.data_ptr<BFloat16>() : nullptr, has_w,
+                    ignore_index, reduction == 1, out.data_ptr<BFloat16>(),
+                    total_weight.data_ptr<BFloat16>(), stream);
+                break;
+            default:
+                TP_THROW(NotImplementedError,
+                         "nll_loss2d CUDA supports floating dtypes only");
+        }
+    } else {
+        // Empty spatial input: zero contributing weight; a mean is NaN.
+        switch (input.dtype()) {
+            case DType::Float64:
+                nll_finalize_kernel<double, double><<<1, kThreads, 0, stream>>>(
+                    0, nullptr, nullptr, reduction == 1,
+                    out.data_ptr<double>(), total_weight.data_ptr<double>());
+                break;
+            case DType::Float32:
+                nll_finalize_kernel<float, float><<<1, kThreads, 0, stream>>>(
+                    0, nullptr, nullptr, reduction == 1,
+                    out.data_ptr<float>(), total_weight.data_ptr<float>());
+                break;
+            case DType::Float16:
+                nll_finalize_kernel<float, Half><<<1, kThreads, 0, stream>>>(
+                    0, nullptr, nullptr, reduction == 1,
+                    out.data_ptr<Half>(), total_weight.data_ptr<Half>());
+                break;
+            case DType::BFloat16:
+                nll_finalize_kernel<float, BFloat16><<<1, kThreads, 0, stream>>>(
+                    0, nullptr, nullptr, reduction == 1,
+                    out.data_ptr<BFloat16>(), total_weight.data_ptr<BFloat16>());
+                break;
+            default:
+                TP_THROW(NotImplementedError,
+                         "nll_loss2d CUDA supports floating dtypes only");
+        }
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return {out, total_weight};
 }
 
 Tensor nll_loss2d_backward_cuda(const Tensor& grad_output, const Tensor& input,
@@ -766,36 +1107,53 @@ Tensor nll_loss2d_backward_cuda(const Tensor& grad_output, const Tensor& input,
     const int64_t N = input.size(0), C = input.size(1), H = input.size(2),
                   W = input.size(3);
     const int64_t rows = N * H * W;
-    const Tensor x = f64_dev(input);
+    TP_CHECK(grad_output.dtype() == input.dtype(),
+             "nll_loss2d_backward: grad_output dtype must match input dtype");
     const Tensor tgt = target.is_contiguous() ? target : target.contiguous();
     const bool has_w = weight_opt.has_value() && weight_opt->defined();
-    Tensor w = has_w ? f64_dev(*weight_opt) : Tensor();
+    const Tensor w = has_w ? weight_opt->contiguous().to(input.dtype())
+                           : Tensor();
     Tensor grad_input =
-        Tensor::zeros({N, C, H, W}, DType::Float64, input.device());
+        Tensor::zeros({N, C, H, W}, input.dtype(), input.device());
     if (rows) {
         const auto stream = getCurrentCUDAStream().stream();
-        if (reduction == 0) {
-            Tensor g = f64_dev(grad_output);
-            nll2d_grad_none_kernel<<<loss_grid(rows), kThreads, 0, stream>>>(
-                rows, C, H * W, g.data_ptr<double>(), tgt.data_ptr<int64_t>(),
-                has_w ? w.data_ptr<double>() : nullptr, has_w, ignore_index,
-                grad_input.data_ptr<double>());
-        } else {
-            TP_CHECK(grad_output.numel() == 1,
-                     "nll_loss2d_backward: expected grad_output to be a single element tensor");
-            TP_CHECK(total_weight.numel() == 1,
-                     "nll_loss2d_backward: expected total_weight to be a single element tensor");
-            const Tensor g = f64_dev(grad_output);
-            const Tensor tw = f64_dev(total_weight);
-            nll2d_grad_scalar_kernel<<<loss_grid(rows), kThreads, 0, stream>>>(
-                rows, C, H * W, g.data_ptr<double>(), tgt.data_ptr<int64_t>(),
-                has_w ? w.data_ptr<double>() : nullptr, has_w, ignore_index,
-                tw.data_ptr<double>(), reduction == 1,
-                grad_input.data_ptr<double>());
+        const Tensor g = grad_output.is_contiguous()
+            ? grad_output : grad_output.contiguous();
+        #define TP_NLL2D_BWD_LAUNCH(SCALAR_T)                                  \
+            do {                                                               \
+                if (reduction == 0) {                                          \
+                    nll2d_grad_none_kernel<SCALAR_T><<<loss_grid(rows), kThreads, 0, stream>>>( \
+                        rows, C, H * W, g.data_ptr<SCALAR_T>(),                \
+                        tgt.data_ptr<int64_t>(),                               \
+                        has_w ? w.data_ptr<SCALAR_T>() : nullptr, has_w,       \
+                        ignore_index, grad_input.data_ptr<SCALAR_T>());        \
+                } else {                                                       \
+                    TP_CHECK(grad_output.numel() == 1,                         \
+                             "nll_loss2d_backward: expected grad_output to be a single element tensor"); \
+                    TP_CHECK(total_weight.numel() == 1,                        \
+                             "nll_loss2d_backward: expected total_weight to be a single element tensor"); \
+                    nll2d_grad_scalar_kernel<SCALAR_T><<<loss_grid(rows), kThreads, 0, stream>>>( \
+                        rows, C, H * W, g.data_ptr<SCALAR_T>(),                \
+                        tgt.data_ptr<int64_t>(),                               \
+                        has_w ? w.data_ptr<SCALAR_T>() : nullptr, has_w,       \
+                        ignore_index,                                          \
+                        total_weight.data_ptr<SCALAR_T>(), reduction == 1,     \
+                        grad_input.data_ptr<SCALAR_T>());                      \
+                }                                                              \
+            } while (0)
+        switch (input.dtype()) {
+            case DType::Float64: TP_NLL2D_BWD_LAUNCH(double); break;
+            case DType::Float32: TP_NLL2D_BWD_LAUNCH(float); break;
+            case DType::Float16: TP_NLL2D_BWD_LAUNCH(Half); break;
+            case DType::BFloat16: TP_NLL2D_BWD_LAUNCH(BFloat16); break;
+            default:
+                TP_THROW(NotImplementedError,
+                         "nll_loss2d_backward CUDA supports floating dtypes only");
         }
+        #undef TP_NLL2D_BWD_LAUNCH
         CUDA_CHECK(cudaGetLastError());
     }
-    return grad_input.to(input.dtype());
+    return grad_input;
 }
 
 // ===========================================================================
