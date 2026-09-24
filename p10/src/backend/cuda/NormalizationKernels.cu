@@ -1006,7 +1006,7 @@ __global__ void group_norm_moments_impl(int64_t inner, ACC eps,
     }
 }
 
-template <typename T, typename ACC, int V>
+template <typename T, typename ACC, int V, bool ChannelPacked>
 __global__ void group_norm_forward_vec_impl(
     int64_t inner, int64_t spatial, int64_t cpg, int64_t num_groups,
     ACC eps, const T* __restrict__ X, const T* __restrict__ gamma,
@@ -1039,14 +1039,25 @@ __global__ void group_norm_forward_vec_impl(
     }
     for (int64_t j = threadIdx.x; j < nv; j += blockDim.x) {
         GNVec<T, V> pack = xv[j];
-#pragma unroll
-        for (int k = 0; k < V; ++k) {
-            const int64_t idx = j * V + k;
-            const int64_t channel = g * cpg + idx / spatial;
+        if constexpr (ChannelPacked) {
+            const int64_t channel = g * cpg + j / (spatial / V);
             const ACC weight = gamma ? static_cast<ACC>(gamma[channel]) : ACC(1);
             const ACC bias = beta ? static_cast<ACC>(beta[channel]) : ACC(0);
-            pack.v[k] = static_cast<T>(
-                (static_cast<ACC>(pack.v[k]) - mean) * rstd * weight + bias);
+#pragma unroll
+            for (int k = 0; k < V; ++k) {
+                pack.v[k] = static_cast<T>(
+                    (static_cast<ACC>(pack.v[k]) - mean) * rstd * weight + bias);
+            }
+        } else {
+#pragma unroll
+            for (int k = 0; k < V; ++k) {
+                const int64_t idx = j * V + k;
+                const int64_t channel = g * cpg + idx / spatial;
+                const ACC weight = gamma ? static_cast<ACC>(gamma[channel]) : ACC(1);
+                const ACC bias = beta ? static_cast<ACC>(beta[channel]) : ACC(0);
+                pack.v[k] = static_cast<T>(
+                    (static_cast<ACC>(pack.v[k]) - mean) * rstd * weight + bias);
+            }
         }
         yv[j] = pack;
     }
@@ -1215,7 +1226,7 @@ __global__ void group_norm_dx_apply_vec_impl(int64_t inner, int64_t spatial,
     }
 }
 
-template <typename T, typename ACC, int V>
+template <typename T, typename ACC, int V, bool ChannelPacked>
 __global__ void group_norm_dx_fused_vec_impl(
     int64_t inner, int64_t spatial, int64_t cpg, int64_t num_groups,
     const T* __restrict__ dY, const T* __restrict__ X,
@@ -1248,14 +1259,25 @@ __global__ void group_norm_dx_fused_vec_impl(
         const GNVec<T, V> d = dyv[j];
         const GNVec<T, V> x = xv[j];
         GNVec<T, V> o;
-#pragma unroll
-        for (int k = 0; k < V; ++k) {
-            const int64_t idx = j * V + k;
-            const int64_t c_local = g * cpg + idx / spatial;
+        if constexpr (ChannelPacked) {
+            const int64_t c_local = g * cpg + j / (spatial / V);
             const ACC c1 = r * (gamma ? static_cast<ACC>(gamma[c_local]) : ACC(1));
-            o.v[k] = static_cast<T>(
-                c1 * static_cast<ACC>(d.v[k]) + a2 * static_cast<ACC>(x.v[k]) +
-                a3);
+#pragma unroll
+            for (int k = 0; k < V; ++k) {
+                o.v[k] = static_cast<T>(
+                    c1 * static_cast<ACC>(d.v[k]) + a2 * static_cast<ACC>(x.v[k]) +
+                    a3);
+            }
+        } else {
+#pragma unroll
+            for (int k = 0; k < V; ++k) {
+                const int64_t idx = j * V + k;
+                const int64_t c_local = g * cpg + idx / spatial;
+                const ACC c1 = r * (gamma ? static_cast<ACC>(gamma[c_local]) : ACC(1));
+                o.v[k] = static_cast<T>(
+                    c1 * static_cast<ACC>(d.v[k]) + a2 * static_cast<ACC>(x.v[k]) +
+                    a3);
+            }
         }
         dxv[j] = o;
     }
@@ -1357,10 +1379,17 @@ std::tuple<Tensor, Tensor, Tensor> group_norm_forward_dispatch(
         reinterpret_cast<uintptr_t>(x_p) % (sizeof(T) * kVec) == 0 &&
         reinterpret_cast<uintptr_t>(y_p) % (sizeof(T) * kVec) == 0;
     if (vec_ok) {
-        group_norm_forward_vec_impl<T, ACC, kVec>
-            <<<N * num_groups, threads, 0, stream>>>(
-                inner, spatial, cpg, num_groups, static_cast<ACC>(eps),
-                x_p, w, b, y_p, mean_p, rstd_p);
+        if (spatial % kVec == 0) {
+            group_norm_forward_vec_impl<T, ACC, kVec, true>
+                <<<N * num_groups, threads, 0, stream>>>(
+                    inner, spatial, cpg, num_groups, static_cast<ACC>(eps),
+                    x_p, w, b, y_p, mean_p, rstd_p);
+        } else {
+            group_norm_forward_vec_impl<T, ACC, kVec, false>
+                <<<N * num_groups, threads, 0, stream>>>(
+                    inner, spatial, cpg, num_groups, static_cast<ACC>(eps),
+                    x_p, w, b, y_p, mean_p, rstd_p);
+        }
         check_normalization_cuda_launch("group_norm forward");
     } else {
         group_norm_forward_impl<T, ACC>
@@ -1600,10 +1629,17 @@ static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cuda_impl(
                 const ctype* gw_p = weight_contig.has_value() &&               \
                     weight_contig->defined()                                   \
                     ? weight_contig->data_ptr<ctype>() : nullptr;              \
-                group_norm_dx_fused_vec_impl<ctype, acc_t, kVec>                 \
-                    <<<N * num_groups, moments_threads, 0, stream>>>(           \
-                        inner, spatial, cpg, num_groups, dy_p, x_p, mean_p,      \
-                        rstd_p, gw_p, ds_p, db_p, dx_p);                        \
+                if (spatial % kVec == 0) {                                     \
+                    group_norm_dx_fused_vec_impl<ctype, acc_t, kVec, true>       \
+                        <<<N * num_groups, moments_threads, 0, stream>>>(       \
+                            inner, spatial, cpg, num_groups, dy_p, x_p, mean_p,  \
+                            rstd_p, gw_p, ds_p, db_p, dx_p);                    \
+                } else {                                                       \
+                    group_norm_dx_fused_vec_impl<ctype, acc_t, kVec, false>      \
+                        <<<N * num_groups, moments_threads, 0, stream>>>(       \
+                            inner, spatial, cpg, num_groups, dy_p, x_p, mean_p,  \
+                            rstd_p, gw_p, ds_p, db_p, dx_p);                    \
+                }                                                              \
                 check_normalization_cuda_launch("group_norm backward input"); \
             }                                                                   \
             if (need_dw || need_db) {                                           \
