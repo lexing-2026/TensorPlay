@@ -38,4 +38,23 @@ P10_API std::vector<Tensor> stax_fused_pointwise_cpu_multi(
     const std::vector<int64_t>& output_refs);
 
 } // namespace cpu
+
+namespace cuda {
+
+// Device-side counterpart of the CPU program runner: evaluates the same
+// instruction-triple program elementwise in one kernel launch.  Inputs must
+// share one contiguous shape; outputs inherit the input dtype.
+P10_API Tensor stax_fused_pointwise_cuda(
+    const std::vector<Tensor>& inputs,
+    const std::vector<int64_t>& program,
+    const std::vector<double>& constants);
+
+P10_API std::vector<Tensor> stax_fused_pointwise_cuda_multi(
+    const std::vector<Tensor>& inputs,
+    const std::vector<int64_t>& program,
+    const std::vector<double>& constants,
+    const std::vector<int64_t>& output_refs);
+
+} // namespace cuda
+
 } // namespace tensorplay

@@ -101,6 +101,11 @@ Tensor execute_fused_pointwise_cpu(
     }
     const auto* program_ptr = int_list_attr(node, "program");
     const auto* constants_ptr = float_list_attr(node, "constants");
+    // Route by operand device: the program semantics are identical on both
+    // sides; only the evaluator differs.
+    if (operands.front().device().is_cuda()) {
+        return cuda::stax_fused_pointwise_cuda(operands, *program_ptr, *constants_ptr);
+    }
     return cpu::stax_fused_pointwise_cpu(operands, *program_ptr, *constants_ptr);
 }
 
@@ -1440,6 +1445,36 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                 throw std::runtime_error("Stax float expects one input");
             }
             result = value(node.inputs[0]).to(DType::Float32);
+        } else if (node.op_type == "cast") {
+            if (node.inputs.size() != 1) {
+                throw std::runtime_error("Stax cast expects one input");
+            }
+            const auto dtype_it = node.attrs.find("dtype");
+            if (dtype_it == node.attrs.end() ||
+                !std::holds_alternative<std::string>(dtype_it->second)) {
+                throw std::runtime_error("Stax cast requires a dtype attribute");
+            }
+            const auto& name = std::get<std::string>(dtype_it->second);
+            DType target = DType::Undefined;
+            if (name == "float16" || name == "half") {
+                target = DType::Float16;
+            } else if (name == "bfloat16") {
+                target = DType::BFloat16;
+            } else if (name == "float32" || name == "float") {
+                target = DType::Float32;
+            } else if (name == "float64" || name == "double") {
+                target = DType::Float64;
+            } else if (name == "bool") {
+                target = DType::Bool;
+            } else if (name == "int64" || name == "long") {
+                target = DType::Int64;
+            } else if (name == "int32" || name == "int") {
+                target = DType::Int32;
+            }
+            if (target == DType::Undefined) {
+                throw std::runtime_error("Stax cast dtype is unsupported: " + name);
+            }
+            result = value(node.inputs[0]).to(target);
         } else if (node.op_type == "sum" || node.op_type == "mean") {
             if (node.inputs.size() != 1) {
                 throw std::runtime_error("Stax reduction expects one input");
@@ -1492,7 +1527,37 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
             for (const ValueNode* input : node.inputs) {
                 operands.push_back(value(input));
             }
-            result = execute_fused_pointwise_cpu(node, operands);
+            if (node.outputs.size() == 1) {
+                result = execute_fused_pointwise_cpu(node, operands);
+            } else {
+                // One node output per instruction result, in program order;
+                // the refs attribute addresses the temporary pool.
+                auto input_count_it = node.attrs.find("input_count");
+                if (input_count_it == node.attrs.end() ||
+                    !std::holds_alternative<int64_t>(input_count_it->second)) {
+                    throw std::runtime_error("Stax fused pointwise input_count is missing");
+                }
+                const int64_t input_count = std::get<int64_t>(input_count_it->second);
+                const auto* program_ptr = int_list_attr(node, "program");
+                const auto* constants_ptr = float_list_attr(node, "constants");
+                const auto* refs_ptr = &required_int_list_attr(node, "output_refs");
+                std::vector<Tensor> results;
+                if (operands.front().device().is_cuda()) {
+                    results = cuda::stax_fused_pointwise_cuda_multi(
+                        operands, *program_ptr, *constants_ptr, *refs_ptr);
+                } else {
+                    results = cpu::stax_fused_pointwise_cpu_multi(
+                        operands, *program_ptr, *constants_ptr, *refs_ptr);
+                }
+                if (results.size() != node.outputs.size()) {
+                    throw std::runtime_error(
+                        "Stax fused pointwise multi-output count mismatch");
+                }
+                for (size_t o = 0; o < node.outputs.size(); ++o) {
+                    env[node.outputs[o]->id] = results[o];
+                }
+                return;
+            }
         } else if (node.op_type == "fused_mul_add") {
             auto mul_scalar = scalar_attr(node, "mul_scalar_value");
             auto add_scalar = scalar_attr(node, "add_scalar_value");

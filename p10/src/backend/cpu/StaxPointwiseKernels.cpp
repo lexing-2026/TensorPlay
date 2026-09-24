@@ -495,25 +495,32 @@ Tensor stax_pointwise_kernel_impl(
     }
     const Tensor& first = inputs.front();
     if (!first.defined() || !first.device().is_cpu() ||
-        first.dtype() != DType::Float32 || !first.is_contiguous()) {
+        first.dtype() != DType::Float32) {
         throw std::runtime_error(
-            "Stax CPU fused pointwise requires contiguous float32 CPU tensors");
+            "Stax CPU fused pointwise requires float32 CPU tensors");
     }
     for (const Tensor& input : inputs) {
         if (!input.defined() || !input.device().is_cpu() ||
-            input.dtype() != DType::Float32 || !input.is_contiguous() ||
+            input.dtype() != DType::Float32 ||
             input.shape() != first.shape()) {
             throw std::runtime_error(
-                "Stax CPU fused pointwise inputs must have one contiguous shape");
+                "Stax CPU fused pointwise inputs must share one shape");
         }
     }
+    // The evaluators walk flat element offsets, so non-contiguous operands
+    // (broadcast views, slices) are compacted once up front.
+    std::vector<Tensor> dense;
+    dense.reserve(inputs.size());
+    for (const Tensor& input : inputs) {
+        dense.push_back(input.is_contiguous() ? input : input.contiguous());
+    }
 
-    const int64_t input_count = static_cast<int64_t>(inputs.size());
+    const int64_t input_count = static_cast<int64_t>(dense.size());
     const int64_t instruction_count = static_cast<int64_t>(program.size() / 3);
     if (instruction_count <= kStackProgramLimit) {
         ChainStep<Vec> chain_steps[kStackProgramLimit];
         if (build_chain_program<Vec>(program, constants, input_count, chain_steps)) {
-            return stax_chain_kernel_impl<Vec>(inputs, chain_steps, instruction_count);
+            return stax_chain_kernel_impl<Vec>(dense, chain_steps, instruction_count);
         }
     }
 
@@ -522,8 +529,8 @@ Tensor stax_pointwise_kernel_impl(
         DType::Float32,
         first.device());
     std::vector<const float*> input_ptrs;
-    input_ptrs.reserve(inputs.size());
-    for (const Tensor& input : inputs) {
+    input_ptrs.reserve(dense.size());
+    for (const Tensor& input : dense) {
         input_ptrs.push_back(input.data_ptr<float>());
     }
 
@@ -612,20 +619,27 @@ std::vector<Tensor> stax_pointwise_multi_kernel_impl(
     }
     const Tensor& first = inputs.front();
     if (!first.defined() || !first.device().is_cpu() ||
-        first.dtype() != DType::Float32 || !first.is_contiguous()) {
+        first.dtype() != DType::Float32) {
         throw std::runtime_error(
-            "Stax CPU multi-output pointwise requires contiguous float32 CPU tensors");
+            "Stax CPU multi-output pointwise requires float32 CPU tensors");
     }
     for (const Tensor& input : inputs) {
         if (!input.defined() || !input.device().is_cpu() ||
-            input.dtype() != DType::Float32 || !input.is_contiguous() ||
+            input.dtype() != DType::Float32 ||
             input.shape() != first.shape()) {
             throw std::runtime_error(
-                "Stax CPU multi-output pointwise inputs must have one contiguous shape");
+                "Stax CPU multi-output pointwise inputs must share one shape");
         }
     }
+    // Flat element addressing requires dense row-major storage; compact any
+    // non-contiguous operand (broadcast view, slice) once up front.
+    std::vector<Tensor> dense;
+    dense.reserve(inputs.size());
+    for (const Tensor& input : inputs) {
+        dense.push_back(input.is_contiguous() ? input : input.contiguous());
+    }
 
-    const int64_t input_count = static_cast<int64_t>(inputs.size());
+    const int64_t input_count = static_cast<int64_t>(dense.size());
     const int64_t instruction_count = static_cast<int64_t>(program.size() / 3);
     // A single output pinned to the final temporary is exactly the chain
     // kernel's contract; richer output patterns keep the interpreter.
@@ -633,7 +647,7 @@ std::vector<Tensor> stax_pointwise_multi_kernel_impl(
         output_refs[0] == input_count + instruction_count - 1) {
         ChainStep<Vec> chain_steps[kStackProgramLimit];
         if (build_chain_program<Vec>(program, constants, input_count, chain_steps)) {
-            return {stax_chain_kernel_impl<Vec>(inputs, chain_steps, instruction_count)};
+            return {stax_chain_kernel_impl<Vec>(dense, chain_steps, instruction_count)};
         }
     }
     StaxPointwiseInstruction stack_instructions[kStackProgramLimit];
@@ -669,8 +683,8 @@ std::vector<Tensor> stax_pointwise_multi_kernel_impl(
     }
 
     std::vector<const float*> input_ptrs;
-    input_ptrs.reserve(inputs.size());
-    for (const Tensor& input : inputs) {
+    input_ptrs.reserve(dense.size());
+    for (const Tensor& input : dense) {
         input_ptrs.push_back(input.data_ptr<float>());
     }
     std::vector<float*> output_ptrs;

@@ -780,6 +780,147 @@ class _CpuFusedPointwiseLowering(_NativeLowering):
         return self._execute_inputs(inputs)
 
 
+class _CudaFusedPointwiseLowering:
+    def __init__(
+        self,
+        graph_module: GraphModule,
+        runner: Any,
+        expected_dtype: Any,
+        expected_device: Any,
+        expected_layouts: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...],
+        strict_native: bool = False,
+    ) -> None:
+        self.graph_module = graph_module
+        self.placeholders = graph_module.graph.placeholders
+        self._runner = runner
+        self._expected_dtype = expected_dtype
+        self._expected_device = expected_device
+        self._expected_layouts = expected_layouts
+        self._strict_native = strict_native
+        self._route_fp: tuple[Any, ...] | None = None
+        self._route: str | None = None
+        self._fallback = None if strict_native else graph_module.recompile()
+        self._tensorplay_codegen = "stax-cuda"
+
+    def _resolve_route(self, inputs: list[Any]) -> str:
+        import tensorplay
+
+        if len(inputs) != len(self._expected_layouts):
+            return "fallback"
+        for value, (shape, stride) in zip(inputs, self._expected_layouts):
+            if (
+                not isinstance(value, tensorplay.Tensor)
+                or not value.device.is_cuda()
+                or value.dtype != self._expected_dtype
+                or value.device != self._expected_device
+                or tuple(int(item) for item in value.shape) != shape
+                or tuple(int(item) for item in value.stride()) != stride
+                or value.requires_grad
+            ):
+                return "fallback"
+        return "native"
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if not kwargs and len(args) == len(self.placeholders):
+            inputs = list(args)
+        else:
+            bound = self.graph_module.signature.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            inputs = [
+                bound.arguments[node.target if isinstance(node.target, str) else node.name]
+                for node in self.placeholders
+            ]
+        fingerprint = tuple(
+            _CpuFusedPointwiseLowering._input_route_fingerprint(value)
+            for value in inputs
+        )
+        if fingerprint != self._route_fp:
+            self._route = self._resolve_route(inputs)
+            self._route_fp = fingerprint
+        if self._route == "fallback":
+            if self._strict_native:
+                raise RuntimeError(
+                    "Stax native CUDA lowering received inputs outside its "
+                    "compiled specialization"
+                )
+            assert self._fallback is not None
+            return self._fallback(*args, **kwargs)
+        return self._runner(inputs)
+
+
+def _lower_cuda_fused_pointwise(
+    graph_module: GraphModule,
+    example_inputs: list[Any],
+    *,
+    strict_native: bool = False,
+    dynamic: bool = False,
+) -> _CudaFusedPointwiseLowering | None:
+    if dynamic:
+        return None
+    try:
+        import tensorplay
+
+        tensor_type = tensorplay.Tensor
+    except (AttributeError, ImportError):
+        return None
+    if not example_inputs or len(example_inputs) > 8:
+        return None
+    if any(not isinstance(value, tensor_type) for value in example_inputs):
+        return None
+    first = example_inputs[0]
+    if (
+        not first.device.is_cuda()
+        or first.dtype
+        not in (
+            tensorplay.float16,
+            tensorplay.bfloat16,
+            tensorplay.float32,
+            tensorplay.float64,
+        )
+        or any(value.requires_grad for value in example_inputs)
+    ):
+        return None
+    if any(
+        value.device != first.device or value.dtype != first.dtype
+        for value in example_inputs[1:]
+    ):
+        return None
+    pointwise = _build_pointwise_program(graph_module)
+    if pointwise is None:
+        return None
+    external_nodes, program, constants, _instructions, output_ref = pointwise
+    if len(external_nodes) != len(example_inputs):
+        return None
+    try:
+        from .codegen.cuda import compile_program
+
+        runner = compile_program(
+            program,
+            constants,
+            (output_ref,),
+            len(external_nodes),
+            example_inputs,
+        )
+        runner(example_inputs)
+    except (AssertionError, RuntimeError, TypeError, ValueError):
+        return None
+    layouts = tuple(
+        (
+            tuple(int(item) for item in value.shape),
+            tuple(int(item) for item in value.stride()),
+        )
+        for value in example_inputs
+    )
+    return _CudaFusedPointwiseLowering(
+        graph_module,
+        runner,
+        first.dtype,
+        first.device,
+        layouts,
+        strict_native,
+    )
+
+
 _ARITHMETIC_OPS = frozenset({"add", "sub", "mul", "div", "pow"})
 _COMPARISON_OPS = frozenset({"lt", "le", "gt", "ge", "eq", "ne"})
 _ORDER_OPS = frozenset({"minimum", "maximum", "clamp_min", "clamp_max"})
@@ -4866,12 +5007,13 @@ class _AotShape(tuple):
 class _AotNativeSymbol:
     """A symbolic Tensor value used while materializing an AOT backward graph."""
 
-    __slots__ = ("builder", "value", "shape")
+    __slots__ = ("builder", "value", "shape", "dtype")
 
-    def __init__(self, builder: "_AotNativeGraphBuilder", value: Any, shape: Any):
+    def __init__(self, builder: "_AotNativeGraphBuilder", value: Any, shape: Any, dtype: Any = None):
         self.builder = builder
         self.value = value
         self.shape = _AotShape(shape)
+        self.dtype = dtype
 
     def _binary(self, op_name: str, other: Any) -> "_AotNativeSymbol":
         return self.builder.binary(op_name, self, other)
@@ -4939,9 +5081,6 @@ class _AotNativeSymbol:
             result *= item
         return result
 
-    def dtype(self) -> Any:
-        return None
-
 
 class _AotNativeTuple:
     __slots__ = ("values",)
@@ -4950,13 +5089,71 @@ class _AotNativeTuple:
         self.values = values
 
 
+# Opcodes the elementwise program buffer can absorb, sharing the numeric
+# contract of the stax fused-pointwise evaluators (p10 CPU and CUDA).
+_FUSED_PROGRAM_OPCODES = {
+    "add": 1,
+    "sub": 2,
+    "mul": 3,
+    "div": 4,
+    "neg": 6,
+    "pos": 7,
+    "abs": 8,
+    "sin": 9,
+    "cos": 10,
+    "exp": 11,
+    "log": 12,
+    "sigmoid": 13,
+    "sqrt": 14,
+    "square": 15,
+    "tanh": 16,
+    "relu": 17,
+}
+
+# Ops whose capture-time dispatch narrows tensor inputs to a reduced element
+# type before the matrix product.  The reverse pass re-narrows operands of
+# these products to the same element type instead of letting every kernel
+# widen to the accumulation type.
+_AUTOCAST_GEMM_OPS = {
+    "conv1d",
+    "conv2d",
+    "conv3d",
+    "conv_transpose1d",
+    "conv_transpose2d",
+    "conv_transpose3d",
+    "linear",
+    "matmul",
+    "mm",
+    "bmm",
+    "addmm",
+    "addbmm",
+    "baddbmm",
+    "scaled_dot_product_attention",
+}
+
+
 class _AotNativeGraphBuilder:
-    """Small native-IR builder used by the source-derived reverse pass."""
+    """Small native-IR builder used by the source-derived reverse pass.
+
+    Elementwise work is not emitted one node at a time: binary/unary calls
+    accumulate into a program buffer that is emitted as a single fused
+    pointwise node whenever a non-elementwise op, an output, or an operand
+    outside the buffer needs materializing.  One fused node becomes one
+    kernel launch, so derivative-formula chains stop paying per-op
+    dispatch and memory round trips.
+    """
 
     def __init__(self, native_module: Any):
         self.native_module = native_module
         self.graph = native_module.Graph()
         self._literal_symbols: dict[int, _AotNativeSymbol] = {}
+        # Elementwise program buffer (empty when idle).
+        self._fused_ops: list[tuple[int, Any, Any]] = []
+        self._fused_temp_pos: dict[int, int] = {}
+        self._fused_temp_symbols: dict[int, _AotNativeSymbol] = {}
+        self._fused_shape: tuple[int, ...] | None = None
+        self._fused_dtype: Any = None
+        self._cast_memo: dict[tuple[int, Any], tuple[_AotNativeSymbol, _AotNativeSymbol]] = {}
 
     @staticmethod
     def _shape(value: Any) -> tuple[int, ...]:
@@ -4967,7 +5164,11 @@ class _AotNativeGraphBuilder:
         return value if isinstance(value, _AotNativeSymbol) else None
 
     def input(self, example_value: Any) -> _AotNativeSymbol:
-        return _AotNativeSymbol(self, self.graph.add_input(), self._shape(example_value))
+        symbol = _AotNativeSymbol(self, self.graph.add_input(), self._shape(example_value))
+        dtype = getattr(example_value, "dtype", None)
+        if dtype is not None:
+            symbol.dtype = dtype
+        return symbol
 
     def literal(self, value: Any) -> _AotNativeSymbol:
         """Lift a captured tensor constant into the backward graph inputs."""
@@ -4983,9 +5184,160 @@ class _AotNativeGraphBuilder:
         for value in args:
             if not isinstance(value, _AotNativeSymbol):
                 raise TypeError("AOT native op received a non-Tensor argument")
+            self._materialize(value)
             native_node.add_input(value.value)
             symbols.append(value)
         return symbols
+
+    # -- elementwise program buffer -----------------------------------------
+
+    def _materialize(self, symbol: _AotNativeSymbol) -> None:
+        """Give a buffered elementwise result a real graph value.
+
+        Escaping the buffer materializes the whole program.  Escaping an
+        intermediate (non-final) temporary materializes every temporary of
+        the program as a node output so no buffered symbol can dangle.
+        """
+        if symbol is None or symbol.value is not None:
+            return
+        index = self._fused_temp_pos.get(id(symbol))
+        if index is None:
+            raise RuntimeError("AOT elementwise buffer lost a temporary symbol")
+        # The whole program is materialized even when only its tail escapes:
+        # shared subexpression symbols (e.g. a sin/cos pair cached across
+        # derivative formulas) may be consumed by a later formula, and a
+        # pool-only temporary would dangle after the flush.
+        self._fused_flush(materialize_all=True)
+
+    def _fused_append(
+        self, opcode: int, lhs: tuple[str, Any], rhs: tuple[str, Any]
+    ) -> _AotNativeSymbol:
+        index = len(self._fused_ops)
+        self._fused_ops.append((opcode, lhs, rhs))
+        symbol = _AotNativeSymbol(self, None, self._fused_shape, self._fused_dtype)
+        self._fused_temp_pos[id(symbol)] = index
+        self._fused_temp_symbols[id(symbol)] = symbol
+        return symbol
+
+    def _fused_try_elementwise(
+        self,
+        op_name: str,
+        lhs_symbol: _AotNativeSymbol | None,
+        rhs_symbol: _AotNativeSymbol | None,
+        lhs_raw: Any,
+        rhs_raw: Any,
+        *,
+        unary: bool = False,
+    ) -> _AotNativeSymbol | None:
+        opcode = _FUSED_PROGRAM_OPCODES.get(op_name)
+        if opcode is None:
+            return None
+        if unary:
+            operands = (("sym", lhs_symbol), ("const", 0.0))
+            shape = tuple(lhs_symbol.shape)
+        elif lhs_symbol is not None and rhs_symbol is not None:
+            if lhs_symbol.shape != rhs_symbol.shape:
+                return None  # broadcast stays on the native broadcast path
+            operands = (("sym", lhs_symbol), ("sym", rhs_symbol))
+            shape = tuple(lhs_symbol.shape)
+        elif lhs_symbol is not None:
+            operands = (("sym", lhs_symbol), ("const", float(rhs_raw)))
+            shape = tuple(lhs_symbol.shape)
+        elif rhs_symbol is not None:
+            operands = (("const", float(lhs_raw)), ("sym", rhs_symbol))
+            shape = tuple(rhs_symbol.shape)
+        else:
+            return None
+        for kind, value in operands:
+            if kind == "sym" and value.value is None and id(value) not in self._fused_temp_pos:
+                return None  # operand of an already-flushed program: fall back
+        # The fused evaluators read one uniform input block: a symbol whose
+        # element type differs from the buffered program stays on the native
+        # path, which promotes per element type.
+        for kind, value in operands:
+            if kind == "sym" and value.dtype is not None:
+                if self._fused_dtype is None:
+                    self._fused_dtype = value.dtype
+                elif value.dtype != self._fused_dtype:
+                    return None
+        if self._fused_shape is None:
+            self._fused_shape = shape
+        elif shape != self._fused_shape:
+            self._fused_flush()
+            self._fused_shape = shape
+        return self._fused_append(opcode, operands[0], operands[1])
+
+    def _fused_flush(self, materialize_all: bool = True) -> None:
+        if not self._fused_ops:
+            return
+        ops = self._fused_ops
+        temp_pos = self._fused_temp_pos
+        temp_symbols = self._fused_temp_symbols
+        self._fused_ops = []
+        self._fused_temp_pos = {}
+        self._fused_temp_symbols = {}
+        shape = self._fused_shape
+        self._fused_shape = None
+        self._fused_dtype = None
+
+        input_symbols: list[_AotNativeSymbol] = []
+        input_pos: dict[int, int] = {}
+        constants: list[float] = []
+        const_pos: dict[float, int] = {}
+
+        def ref_for(operand: tuple[str, Any], input_count: int) -> int:
+            kind, value = operand
+            if kind == "sym":
+                temp_index = temp_pos.get(id(value))
+                if temp_index is not None:
+                    return input_count + temp_index
+                return input_pos[id(value)]
+            return -const_pos[float(value)] - 1
+
+        # Bind every operand before emitting refs: temporaries are addressed
+        # past the final input block, so a ref produced while the input list
+        # was still growing would alias a later input instead of the temp slot.
+        for _, lhs, rhs in ops:
+            for kind, value in (lhs, rhs):
+                if kind == "sym":
+                    if id(value) in temp_pos or id(value) in input_pos:
+                        continue
+                    input_pos[id(value)] = len(input_symbols)
+                    input_symbols.append(value)
+                    continue
+                number = float(value)
+                if number not in const_pos:
+                    const_pos[number] = len(constants)
+                    constants.append(number)
+        input_count = len(input_symbols)
+        program: list[int] = []
+        for opcode, lhs, rhs in ops:
+            program.extend(
+                (opcode, ref_for(lhs, input_count), ref_for(rhs, input_count))
+            )
+
+        node = self.graph.create_node(
+            "fused_pointwise", f"aot_fused_pointwise_{len(self.graph.nodes)}"
+        )
+        for symbol in input_symbols:
+            node.add_input(symbol.value)
+        node.set_int_attr("input_count", input_count)
+        node.set_ints_attr("program", program)
+        node.set_floats_attr("constants", constants)
+
+        emitted = list(range(len(ops))) if materialize_all else [len(ops) - 1]
+        outputs = [node.add_output() for _ in emitted]
+        node_to_output = dict(zip(emitted, outputs))
+        if not materialize_all:
+            node.set_ints_attr("output_refs", [input_count + emitted[0]])
+        else:
+            node.set_ints_attr(
+                "output_refs", [input_count + index for index in emitted]
+            )
+        for temp_id, position in temp_pos.items():
+            output = node_to_output.get(position)
+            if output is not None:
+                temp_symbols[temp_id].value = output
 
     @staticmethod
     def _broadcast_shape(lhs: tuple[int, ...], rhs: tuple[int, ...]) -> tuple[int, ...]:
@@ -5015,6 +5367,17 @@ class _AotNativeGraphBuilder:
             if op_name == "div":
                 return lhs / rhs
             raise NotImplementedError(f"AOT scalar operation is unsupported: {op_name}")
+        fused = self._fused_try_elementwise(
+            op_name, lhs_symbol, rhs_symbol, lhs, rhs
+        )
+        if fused is not None:
+            return fused
+        # Flush pending elementwise programs before the consumer node exists:
+        # a program flushed afterwards would execute after this node reads it.
+        if lhs_symbol is not None:
+            self._materialize(lhs_symbol)
+        if rhs_symbol is not None:
+            self._materialize(rhs_symbol)
         native_node = self.graph.create_node(op_name, f"aot_{op_name}_{len(self.graph.nodes)}")
         shape = lhs_symbol.shape if lhs_symbol is not None else rhs_symbol.shape
         if lhs_symbol is not None and rhs_symbol is not None:
@@ -5026,7 +5389,9 @@ class _AotNativeGraphBuilder:
             scalar = rhs if lhs_symbol is not None else lhs
             native_node.add_input(symbol.value)
             _set_scalar_attr(native_node, scalar, 1 if lhs_symbol is not None else 0)
-        return _AotNativeSymbol(self, native_node.add_output(), shape)
+        result = _AotNativeSymbol(self, native_node.add_output(), shape)
+        result.dtype = (lhs_symbol if lhs_symbol is not None else rhs_symbol).dtype
+        return result
 
     def unary(
         self,
@@ -5035,9 +5400,17 @@ class _AotNativeGraphBuilder:
         *,
         shape: tuple[int, ...] | None = None,
     ) -> _AotNativeSymbol:
+        fused = self._fused_try_elementwise(
+            op_name, value, None, None, None, unary=True
+        )
+        if fused is not None:
+            return fused
+        self._materialize(value)
         native_node = self.graph.create_node(op_name, f"aot_{op_name}_{len(self.graph.nodes)}")
         native_node.add_input(value.value)
-        return _AotNativeSymbol(self, native_node.add_output(), shape or value.shape)
+        result = _AotNativeSymbol(self, native_node.add_output(), shape or value.shape)
+        result.dtype = value.dtype
+        return result
 
     def helper(
         self,
@@ -5049,6 +5422,11 @@ class _AotNativeGraphBuilder:
         outputs: int = 1,
         output_shapes: tuple[tuple[int, ...], ...] | None = None,
     ) -> _AotNativeSymbol | _AotNativeTuple:
+        # Pending elementwise programs must become nodes before the consumer:
+        # the native executor walks creation order, so a program flushed after
+        # this node would still be undefined when this node reads it.
+        for value in args:
+            self._materialize(value)
         native_node = self.graph.create_node(op_name, f"aot_{op_name}_{len(self.graph.nodes)}")
         symbols = self._add_inputs(native_node, args)
         del symbols
@@ -5057,6 +5435,8 @@ class _AotNativeGraphBuilder:
                 native_node.set_int_attr(key, int(value))
             elif isinstance(value, numbers.Real):
                 native_node.set_float_attr(key, float(value))
+            elif isinstance(value, str):
+                native_node.set_str_attr(key, value)
             elif isinstance(value, (tuple, list)) and all(
                 isinstance(item, int) and not isinstance(item, bool) for item in value
             ):
@@ -5064,7 +5444,11 @@ class _AotNativeGraphBuilder:
             else:
                 raise TypeError(f"unsupported AOT native attribute: {key}={value!r}")
         if outputs == 1:
-            return _AotNativeSymbol(self, native_node.add_output(), shape or args[0].shape)
+            result = _AotNativeSymbol(
+                self, native_node.add_output(), shape or args[0].shape
+            )
+            result.dtype = args[0].dtype if args else None
+            return result
         return _AotNativeTuple(
             tuple(
                 _AotNativeSymbol(
@@ -5073,6 +5457,7 @@ class _AotNativeGraphBuilder:
                     output_shapes[index]
                     if output_shapes is not None and index < len(output_shapes)
                     else shape or args[0].shape,
+                    args[0].dtype if args else None,
                 )
                 for index in range(outputs)
             )
@@ -5081,6 +5466,30 @@ class _AotNativeGraphBuilder:
     def reshape(self, value: _AotNativeSymbol, shape: Any) -> _AotNativeSymbol:
         normalized = tuple(int(item) for item in shape)
         return self.helper("reshape", (value,), attrs={"shape": normalized}, shape=normalized)  # type: ignore[return-value]
+
+    def cast(self, value: _AotNativeSymbol, dtype: Any) -> _AotNativeSymbol:
+        """Convert a symbol to ``dtype`` (no-op when already in that type).
+
+        Conversions are memoized per (symbol, dtype): one captured value
+        feeding several consuming kernels (e.g. a convolution gradient split
+        into input/weight/bias contributions) is converted once and the
+        converted value is shared.
+        """
+        if dtype is None or value.dtype == dtype:
+            return value
+        memo_key = (id(value), dtype)
+        memo = self._cast_memo.get(memo_key)
+        if memo is not None:
+            return memo[1]
+        name = str(dtype).rsplit(".", 1)[-1]
+        result = self.helper("cast", (value,), attrs={"dtype": name}, shape=value.shape)
+        if isinstance(result, _AotNativeSymbol):
+            result.dtype = dtype
+            # The entry keeps the source symbol alive: the key is its id(),
+            # and ids are only stable while the object is referenced.
+            self._cast_memo[memo_key] = (value, result)
+            return result
+        return result
 
     def zeros_like(
         self, template: _AotNativeSymbol, shape: Any
@@ -5290,9 +5699,28 @@ def _build_aot_formula_env(
     builder: _AotNativeGraphBuilder,
     *,
     batch_norm_cache: dict[tuple[int, ...], _AotNativeTuple],
+    tuple_op_cache: dict[tuple[int, ...], _AotNativeTuple],
+    autocast_state: dict[str, Any],
 ) -> dict[str, Any]:
     def binary(name: str):
         return lambda lhs, rhs: builder.binary(name, lhs, rhs)
+
+    # Mixed-precision execution: the captured graph runs its matrix products
+    # in the reduced precision selected at dispatch time, while the derivative
+    # expressions receive gradients in the accumulation type.  Every matrix
+    # product of the reverse pass therefore narrows its operands back to the
+    # reduced element type before the kernel runs.
+    def _narrow(value: Any) -> Any:
+        dtype = autocast_state.get("dtype")
+        if not isinstance(value, _AotNativeSymbol):
+            return value
+        return builder.cast(value, dtype)
+
+    def matmul_binary(name: str):
+        def invoke(lhs: Any, rhs: Any) -> _AotNativeSymbol:
+            return builder.binary(name, _narrow(lhs), _narrow(rhs))
+
+        return invoke
 
     def unary(name: str):
         return lambda value: builder.unary(name, value)
@@ -5326,6 +5754,15 @@ def _build_aot_formula_env(
         batch_norm_cache[key] = value
         return value
 
+    def _shared_tuple_key(args: tuple[Any, ...]) -> tuple[int, ...]:
+        # One backward tuple must be shared by every gradient slot of the
+        # same forward node: the derivative formulas each re-derive the same
+        # call, and re-emitting it per slot triples the expensive work.
+        return tuple(
+            id(item) if isinstance(item, _AotNativeSymbol) else hash(repr(item))
+            for item in args
+        )
+
     def group_norm_backward(
         grad, input_value, num_groups, weight=None, bias=None, eps=1e-5
     ):
@@ -5337,6 +5774,10 @@ def _build_aot_formula_env(
         if has_bias:
             tensor_args.append(bias)
         channels = int(input_value.shape[1])
+        key = _shared_tuple_key((grad, input_value, num_groups, weight, bias, eps))
+        cached = tuple_op_cache.get(key)
+        if cached is not None:
+            return cached
         value = builder.helper(
             "group_norm_backward",
             tuple(tensor_args),
@@ -5355,11 +5796,20 @@ def _build_aot_formula_env(
             ),
         )
         assert isinstance(value, _AotNativeTuple)
+        tuple_op_cache[key] = value
         return value
 
     def scaled_dot_product_attention_backward(
         grad, query, key, value, is_causal=False, impl=0
     ):
+        grad = _narrow(grad)
+        query = _narrow(query)
+        key = _narrow(key)
+        value = _narrow(value)
+        key_tuple = _shared_tuple_key((grad, query, key, value, is_causal, impl))
+        cached = tuple_op_cache.get(key_tuple)
+        if cached is not None:
+            return cached
         result = builder.helper(
             "scaled_dot_product_attention_backward",
             (grad, query, key, value),
@@ -5369,13 +5819,14 @@ def _build_aot_formula_env(
             output_shapes=(query.shape, key.shape, value.shape),
         )
         assert isinstance(result, _AotNativeTuple)
+        tuple_op_cache[key_tuple] = result
         return result
 
     def conv_grad(name: str):
         def invoke(grad, input_value, weight, stride, padding, dilation, groups):
             return builder.helper(
                 name,
-                (grad, input_value, weight),
+                (_narrow(grad), _narrow(input_value), _narrow(weight)),
                 attrs={
                     "stride": tuple(stride),
                     "padding": tuple(padding),
@@ -5394,17 +5845,28 @@ def _build_aot_formula_env(
         return invoke
 
     def max_pool_backward(grad, input_value, kernel_size, stride, padding, dilation, ceil_mode):
-        rank = len(tuple(kernel_size))
+        values = tuple(kernel_size) if isinstance(kernel_size, (tuple, list)) else (kernel_size,)
+        # Spatial rank follows the pooling input: a scalar or single-entry
+        # parameter applies to every spatial dimension alike.
+        input_rank = len(tuple(input_value.shape)) - 2 if hasattr(input_value, "shape") else None
+        rank = input_rank if input_rank in (1, 2, 3) else len(values)
         if rank not in (1, 2, 3):
             raise TypeError("max_pool spatial parameters must have one to three entries")
+
+        def spatial_arg(value: Any) -> tuple[int, ...]:
+            items = tuple(value) if isinstance(value, (tuple, list)) else (value,)
+            if len(items) == 1 and rank > 1:
+                items = items * rank
+            return items
+
         return builder.helper(
             f"max_pool{rank}d_backward",
             (grad, input_value),
             attrs={
-                "kernel_size": tuple(kernel_size),
-                "stride": tuple(stride),
-                "padding": tuple(padding),
-                "dilation": tuple(dilation),
+                "kernel_size": spatial_arg(kernel_size),
+                "stride": spatial_arg(stride),
+                "padding": spatial_arg(padding),
+                "dilation": spatial_arg(dilation),
                 "ceil_mode": bool(ceil_mode),
             },
             shape=input_value.shape,
@@ -5451,7 +5913,11 @@ def _build_aot_formula_env(
         divisor_override=None,
     ):
         values = tuple(kernel_size) if isinstance(kernel_size, (tuple, list)) else (kernel_size,)
-        rank = len(values)
+        # Spatial rank follows the pooling input, not the kernel tuple: a
+        # scalar kernel_size widens across all spatial dimensions of the
+        # input, so a 4-D input with kernel_size=2 pools in 2-D.
+        input_rank = len(tuple(input_value.shape)) - 2 if hasattr(input_value, "shape") else None
+        rank = input_rank if input_rank in (1, 2, 3) else len(values)
         if rank not in (1, 2, 3):
             raise TypeError("avg_pool spatial parameters must have one to three entries")
 
@@ -5569,8 +6035,8 @@ def _build_aot_formula_env(
         "sub": binary("sub"),
         "mul": binary("mul"),
         "div": binary("div"),
-        "matmul": binary("matmul"),
-        "mm": binary("mm"),
+        "matmul": matmul_binary("matmul"),
+        "mm": matmul_binary("mm"),
         "neg": unary("neg"),
         "pos": unary("pos"),
         "t": unary("t"),
@@ -5705,7 +6171,14 @@ def _build_aot_backward(
     adjoints: dict[Node, _AotNativeSymbol] = {public_node: tangent}
     view_adjoints: dict[Node, dict[int, _AotNativeSymbol]] = {}
     batch_norm_cache: dict[tuple[int, ...], _AotNativeTuple] = {}
-    formula_env = _build_aot_formula_env(builder, batch_norm_cache=batch_norm_cache)
+    tuple_op_cache: dict[tuple[int, ...], _AotNativeTuple] = {}
+    autocast_state: dict[str, Any] = {"dtype": None}
+    formula_env = _build_aot_formula_env(
+        builder,
+        batch_norm_cache=batch_norm_cache,
+        tuple_op_cache=tuple_op_cache,
+        autocast_state=autocast_state,
+    )
 
     def sum_to_shape(value: _AotNativeSymbol, target_shape: tuple[int, ...]) -> _AotNativeSymbol | None:
         current_shape = tuple(int(item) for item in value.shape)
@@ -5740,6 +6213,30 @@ def _build_aot_backward(
             contribution = sum_to_shape(contribution, target_shape)
             if contribution is None:
                 return False
+        # Gradient edges carry the forward output's element type: a formula
+        # contribution computed in a promoted type is narrowed here so the
+        # consuming formulas see the same element widths the captured graph
+        # executed with.
+        target_dtype = None
+        if target_value is not None and hasattr(target_value, "dtype"):
+            target_dtype = target_value.dtype
+        elif target_symbol is not None:
+            target_dtype = target_symbol.dtype
+        else:
+            traced = _traced_value(graph_module, target)
+            target_dtype = getattr(traced, "dtype", None)
+            if target_dtype is None:
+                try:
+                    external_value = runtime_inputs[external_nodes.index(target)]
+                except ValueError:
+                    external_value = None
+                target_dtype = getattr(external_value, "dtype", None)
+        if (
+            target_dtype is not None
+            and contribution.dtype is not None
+            and contribution.dtype != target_dtype
+        ):
+            contribution = builder.cast(contribution, target_dtype)
         return _aot_add_adjoint(builder, adjoints, target, contribution)
 
     for node in reversed(graph_module.graph.nodes):
@@ -5749,6 +6246,14 @@ def _build_aot_backward(
         if grad is None and node not in view_adjoints:
             continue
         op_name = _target_name(node.target)
+        # Ops whose dispatch narrows their inputs to a reduced precision at
+        # capture time run their matrix products in that same element type;
+        # the derivative callables read this slot to narrow their operands.
+        if op_name in _AUTOCAST_GEMM_OPS:
+            sample = node.meta.get("val")
+            autocast_state["dtype"] = getattr(sample, "dtype", None)
+        else:
+            autocast_state["dtype"] = None
         if op_name == "getitem":
             if (
                 node.op == "call_function"
@@ -5998,9 +6503,16 @@ def _build_aot_backward(
                 return None
             input_value = forward_symbols[input_node]
             weight_value = forward_symbols[weight_node]
+            sample = node.meta.get("val")
+            ac_dtype = getattr(sample, "dtype", None)
+            narrow = builder.cast
             backward = builder.helper(
                 "linear_backward",
-                (input_value, grad, weight_value),
+                (
+                    narrow(input_value, ac_dtype),
+                    narrow(grad, ac_dtype),
+                    narrow(weight_value, ac_dtype),
+                ),
                 attrs={"output_mask": (1, 1, 1)},
                 outputs=3,
                 output_shapes=(
@@ -6242,6 +6754,7 @@ def _build_aot_backward(
         contribution = adjoints.get(node)
         if contribution is None:
             continue
+        builder._materialize(contribution)
         builder.graph.register_output(contribution.value)
         grad_positions.append(index)
     if not grad_positions:
@@ -6509,6 +7022,7 @@ _MODE_OPTIONS: dict[str, dict[str, bool]] = {
 _STAX_OPTIONS = (
     "stax.native",
     "stax.fusion",
+    "stax.cuda_codegen",
     "stax.triton",
     "stax.cudagraphs",
     "stax.max_autotune",
@@ -6572,6 +7086,7 @@ def stax(
         resolved.update(options)
     use_native = resolved.get("stax.native", True)
     use_fusion = resolved.get("stax.fusion", True)
+    use_cuda_codegen = resolved.get("stax.cuda_codegen", False)
     use_triton = resolved.get("stax.triton", True)
     max_autotune = resolved.get("stax.max_autotune", False)
     coordinate_descent_tuning = resolved.get(
@@ -6583,6 +7098,7 @@ def stax(
         example_inputs,
         use_native=use_native,
         use_fusion=use_fusion,
+        use_cuda_codegen=use_cuda_codegen,
         use_triton=use_triton,
         max_autotune=max_autotune,
         coordinate_descent_tuning=coordinate_descent_tuning,
@@ -6608,6 +7124,7 @@ def _lower_stax_region(
     *,
     use_native: bool,
     use_fusion: bool,
+    use_cuda_codegen: bool,
     use_triton: bool,
     max_autotune: bool,
     coordinate_descent_tuning: bool,
@@ -6655,6 +7172,16 @@ def _lower_stax_region(
         if row_fused_cpu is not None:
             graph_module._stax_codegen = "stax-fused-cpu-rowfuse"
             return row_fused_cpu
+    if use_native and use_fusion and use_cuda_codegen:
+        fused_cuda_graph = _lower_cuda_fused_pointwise(
+            graph_module,
+            example_inputs,
+            strict_native=strict_native,
+            dynamic=bool(dynamic is True),
+        )
+        if fused_cuda_graph is not None:
+            graph_module._stax_codegen = "stax-cuda"
+            return fused_cuda_graph
     if use_native and use_triton:
         # Keep Triton optional and lazy.  Importing tensorplay on a CPU-only
         # machine must not import Triton or its compiler toolchain.
@@ -6699,6 +7226,16 @@ def _lower_stax_region(
                 if row_fused_cuda is not None:
                     graph_module._stax_codegen = "stax-fused-cuda-rowfuse"
                     return row_fused_cuda
+    if use_native and use_fusion and not use_cuda_codegen:
+        fused_cuda_graph = _lower_cuda_fused_pointwise(
+            graph_module,
+            example_inputs,
+            strict_native=strict_native,
+            dynamic=bool(dynamic is True),
+        )
+        if fused_cuda_graph is not None:
+            graph_module._stax_codegen = "stax-cuda"
+            return fused_cuda_graph
     if use_native and getattr(graph_module.root, "training", False):
         aot_graph = _lower_aot_native(graph_module, example_inputs)
         if aot_graph is not None:

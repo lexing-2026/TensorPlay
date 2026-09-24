@@ -169,7 +169,12 @@ Tensor imag_cuda(const Tensor& self) {
 }
 
 Tensor conj_cuda(const Tensor& self) {
-    if (!is_cplx(self.dtype())) return self.clone();
+    // Real dtypes are self-conjugate: a strided view aliases the storage
+    // with no data movement, matching the CPU factory's contract.
+    if (!is_cplx(self.dtype())) {
+        return self.as_strided(static_cast<std::vector<int64_t>>(self.shape()),
+                               static_cast<std::vector<int64_t>>(self.strides()));
+    }
     Tensor out = Tensor::empty(shape_of(self), self.dtype(), self.device());
     switch (self.dtype()) {
         case DType::ComplexHalf:
