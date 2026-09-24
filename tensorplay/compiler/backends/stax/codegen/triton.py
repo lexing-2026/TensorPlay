@@ -492,6 +492,7 @@ class TritonProgramCodegen:
         value_dtype: str | None = None,
         epilogue: tuple[list[int], list[float], int] | None = None,
         reduction_outputs: tuple[str, ...] | None = None,
+        input_dtypes: tuple[str, ...] | None = None,
     ) -> None:
         if len(program) % 3:
             raise ValueError("Triton Stax program must contain triples")
@@ -499,6 +500,9 @@ class TritonProgramCodegen:
         self.constants = constants
         self.output_refs = output_refs
         self.input_count = input_count
+        if input_dtypes is not None and len(input_dtypes) != input_count:
+            raise ValueError("input_dtypes must match input_count")
+        self.input_dtypes = input_dtypes
         if epilogue is not None:
             eprogram, _, _ = epilogue
             if len(eprogram) % 3:
@@ -743,6 +747,14 @@ class TritonProgramCodegen:
             )
         return lines
 
+    # The program's value space is float32: half-storage inputs widen after
+    # the load so chained arithmetic keeps full-precision intermediates, the
+    # same envelope the fused interpreters and the eager kernels use.  Wide
+    # storage kinds compute natively and skip the convert.
+    _PROMOTE_SOURCES = frozenset(
+        {"tensorplay.float16", "tensorplay.bfloat16"}
+    )
+
     def _load_lines(self, use_mask: bool = True) -> list[str]:
         """Per-input load lines honouring broadcast offsets.
 
@@ -755,6 +767,15 @@ class TritonProgramCodegen:
         Broadcast/offset inputs and any predicated load keep the plain form.
         """
 
+        def load(index: int, address: str, suffix: str = "") -> str:
+            source = f"tl.load(in_ptr{index} + {address}{suffix})"
+            if (
+                self.input_dtypes is not None
+                and self.input_dtypes[index] in self._PROMOTE_SOURCES
+            ):
+                return f"({source}).to(tl.float32)"
+            return source
+
         lines: list[str] = []
         for index in range(self.input_count):
             offset = self._offset_expression(index)
@@ -763,23 +784,19 @@ class TritonProgramCodegen:
             elif offset is None:
                 if use_mask:
                     lines.append(
-                        f"in{index} = tl.load(in_ptr{index} + xindex, "
-                        "mask=xmask, other=0.0)"
+                        f"in{index} = {load(index, 'xindex', ', mask=xmask, other=0.0')}"
                     )
                 else:
-                    lines.append(
-                        f"in{index} = tl.load(in_ptr{index} + xindex, "
-                        "cache_modifier='.cg')"
-                    )
+                    skip_l1 = ", cache_modifier='.cg'"
+                    lines.append(f"in{index} = {load(index, 'xindex', skip_l1)}")
             else:
                 lines.append(f"off{index} = {offset}")
                 if use_mask:
                     lines.append(
-                        f"in{index} = tl.load(in_ptr{index} + off{index}, "
-                        "mask=xmask, other=0.0)"
+                        f"in{index} = {load(index, f'off{index}', ', mask=xmask, other=0.0')}"
                     )
                 else:
-                    lines.append(f"in{index} = tl.load(in_ptr{index} + off{index})")
+                    lines.append(f"in{index} = {load(index, f'off{index}')}")
         return lines
 
     def generate(
@@ -1949,6 +1966,7 @@ def _program_source(
     value_dtype: str | None = None,
     epilogue=None,
     reduction_outputs=None,
+    input_dtypes: tuple[str, ...] | None = None,
 ) -> tuple[str, str]:
     """Generate one candidate's kernel source without exec'ing it.
 
@@ -1978,6 +1996,7 @@ def _program_source(
         value_dtype=value_dtype,
         epilogue=epilogue,
         reduction_outputs=reduction_outputs,
+        input_dtypes=input_dtypes,
     ).generate(kernel_name, fixed_config=fixed_config)
     return source, f"<tensorplay-stax-triton-program-{digest}>"
 
@@ -2030,6 +2049,7 @@ def _compile_program(
     value_dtype: str | None = None,
     epilogue: tuple[list[int], list[float], int] | None = None,
     reduction_outputs: tuple[str, ...] | None = None,
+    input_dtypes: tuple[str, ...] | None = None,
 ):
     if not HAS_TRITON:
         raise RuntimeError("Triton is not installed")
@@ -2037,6 +2057,12 @@ def _compile_program(
         example_inputs, allow_grad=True, reference_shape=reference_shape
     ):
         raise NotImplementedError("Triton requires matching contiguous CUDA tensors")
+    if input_dtypes is None and reduction is None and epilogue is None:
+        # Pure pointwise programs chain arithmetic across loads, so half
+        # storage widens to the program's float value space before the
+        # first op; reductions own their accumulator typing and are left
+        # untouched.
+        input_dtypes = tuple(repr(value.dtype) for value in example_inputs)
     digest = _program_digest(
         program, constants, output_refs, example_inputs,
         reduction, epilogue, reduction_outputs,
@@ -2056,6 +2082,7 @@ def _compile_program(
         value_dtype=value_dtype,
         epilogue=epilogue,
         reduction_outputs=reduction_outputs,
+        input_dtypes=input_dtypes,
     )
     try:
         from ..codecache import default_cache

@@ -853,6 +853,63 @@ class _CudaFusedPointwiseLowering:
         return self._runner(inputs)
 
 
+# Generated Triton kernels expand every program instruction into straight-line
+# source, removing the interpreter's per-element dispatch/fetch round trip,
+# which is what limits deep fused chains to arithmetic latency.  Small
+# programs keep the interpreter: a single C launch beats a Python-side
+# dispatch, and their GPU time is negligible either way.
+_TRITON_POINTWISE_MIN_NUMEL = 1 << 14
+
+
+def _cuda_triton_pointwise_runner(
+    program: list[int],
+    constants: list[float],
+    output_ref: int,
+    example_inputs: list[Any],
+) -> Any | None:
+    """Lower one flat pointwise program to a generated Triton kernel.
+
+    Returns a runner honouring the interpreter's contract (input list in,
+    output tensor out), or None whenever Triton is unavailable, the sample
+    tensors disagree on shape, or generation/compilation fails -- every miss
+    stays on the interpreter route unchanged.
+    """
+    try:
+        from .codegen.triton import _compile_program, runtime_available
+    except ImportError:
+        return None
+    if not runtime_available():
+        return None
+    reference = tuple(int(item) for item in example_inputs[0].shape)
+    if any(
+        tuple(int(item) for item in value.shape) != reference
+        for value in example_inputs
+    ):
+        return None
+    numel = 1
+    for dim in reference:
+        numel *= dim
+    if numel < _TRITON_POINTWISE_MIN_NUMEL:
+        return None
+    # One 256-element row per warp at four warps; the packed width keeps the
+    # row-uniform mask contract whole (the element count must divide it).
+    config = (1024, 4, 4) if numel % 4 == 0 else (1024, 4)
+    try:
+        runner = _compile_program(
+            program,
+            constants,
+            (output_ref,),
+            example_inputs,
+            fixed_config=config,
+            reference_shape=reference,
+            input_dtypes=tuple(repr(value.dtype) for value in example_inputs),
+        )
+        runner(example_inputs)
+    except Exception:  # noqa: BLE001 - any miss keeps the interpreter route
+        return None
+    return runner
+
+
 def _lower_cuda_fused_pointwise(
     graph_module: GraphModule,
     example_inputs: list[Any],
@@ -896,19 +953,23 @@ def _lower_cuda_fused_pointwise(
     external_nodes, program, constants, _instructions, output_ref = pointwise
     if len(external_nodes) != len(example_inputs):
         return None
-    try:
-        from .codegen.cuda import compile_program
+    runner = _cuda_triton_pointwise_runner(
+        program, constants, output_ref, example_inputs
+    )
+    if runner is None:
+        try:
+            from .codegen.cuda import compile_program
 
-        runner = compile_program(
-            program,
-            constants,
-            (output_ref,),
-            len(external_nodes),
-            example_inputs,
-        )
-        runner(example_inputs)
-    except (AssertionError, RuntimeError, TypeError, ValueError):
-        return None
+            runner = compile_program(
+                program,
+                constants,
+                (output_ref,),
+                len(external_nodes),
+                example_inputs,
+            )
+            runner(example_inputs)
+        except (AssertionError, RuntimeError, TypeError, ValueError):
+            return None
     layouts = tuple(
         (
             tuple(int(item) for item in value.shape),
@@ -8424,9 +8485,11 @@ def _lower_stax_region(
                     coordinate_descent_tuning=coordinate_descent_tuning,
                     strict_native=strict_native,
                 )
-            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+            except Exception:
                 # Unsupported constants or shape forms belong on the native
-                # graph path and must not abort compilation.
+                # graph path and must not abort compilation; generated-kernel
+                # build failures (toolchain, unsupported op) degrade the same
+                # way.
                 triton_graph = None
             if triton_graph is not None:
                 graph_module._stax_codegen = "triton"
