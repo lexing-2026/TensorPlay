@@ -190,15 +190,19 @@ Tensor empty_like_kernel(const Tensor& self, DType dtype, std::optional<Device> 
         const int64_t c = shape[1];
         const int64_t h = shape[2];
         const int64_t w = shape[3];
-        return result.as_strided(shape, {c * h * w, 1, w * c, c});
+        Tensor out = result.as_strided(shape, {c * h * w, 1, w * c, c});
+        out.unsafeGetTensorImpl()->set_memory_format(MemoryFormat::ChannelsLast);
+        return out;
     }
     if (self.dim() == 5 && self.is_channels_last_3d()) {
         const int64_t c = shape[1];
         const int64_t d = shape[2];
         const int64_t h = shape[3];
         const int64_t w = shape[4];
-        return result.as_strided(
-            shape, {c * d * h * w, 1, w * c * d, h * c * d, d * c * h});
+        Tensor out = result.as_strided(
+            shape, {c * d * h * w, 1, h * w * c, w * c, c});
+        out.unsafeGetTensorImpl()->set_memory_format(MemoryFormat::ChannelsLast3d);
+        return out;
     }
     return result;
 }
