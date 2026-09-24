@@ -3,6 +3,7 @@
 #include "Macros.h"
 #include "Tensor.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -51,8 +52,14 @@ struct ProgramState {
     const Instruction* instructions;
     const compute_t* constants;
     const io_t* const* input_ptrs;
+    const int64_t* input_sizes;
+    const int64_t* input_strides;
+    const int64_t* output_sizes;
+    const int64_t* output_strides;
+    const uint8_t* input_flat;
     int64_t input_count;
     int64_t instruction_count;
+    int64_t rank;
 
     __device__ compute_t load_io(const io_t& v) const {
         return static_cast<compute_t>(v);
@@ -66,7 +73,21 @@ struct ProgramState {
                                  int64_t element) const {
         if (ref >= 0) {
             if (ref < input_count) {
-                return load_io(input_ptrs[ref][element]);
+                int64_t offset = element;
+                if (!input_flat[ref]) {
+                    offset = 0;
+                    for (int64_t dim = 0; dim < rank; ++dim) {
+                        const int64_t input_extent =
+                            input_sizes[ref * rank + dim];
+                        if (input_extent != 1) {
+                            const int64_t coordinate =
+                                (element / output_strides[dim]) % output_sizes[dim];
+                            offset += coordinate *
+                                input_strides[ref * rank + dim];
+                        }
+                    }
+                }
+                return load_io(input_ptrs[ref][offset]);
             }
             return local_temps[ref - input_count];
         }
@@ -248,6 +269,28 @@ void launch_program(
 }
 
 
+std::vector<int64_t> broadcast_shape(const std::vector<Tensor>& inputs) {
+    int64_t rank = 0;
+    for (const Tensor& input : inputs) {
+        rank = std::max(rank, input.dim());
+    }
+    std::vector<int64_t> shape(static_cast<size_t>(rank), 1);
+    for (const Tensor& input : inputs) {
+        const int64_t offset = rank - input.dim();
+        for (int64_t dim = 0; dim < input.dim(); ++dim) {
+            const int64_t extent = input.size(dim);
+            const size_t output_dim = static_cast<size_t>(offset + dim);
+            if (extent != 1 && shape[output_dim] != 1 &&
+                shape[output_dim] != extent) {
+                throw std::runtime_error(
+                    "Stax CUDA fused pointwise inputs cannot broadcast");
+            }
+            if (extent != 1) shape[output_dim] = extent;
+        }
+    }
+    return shape;
+}
+
 void check_program_shape(const std::vector<Tensor>& inputs,
                          const std::vector<int64_t>& program,
                          const std::vector<double>& constants,
@@ -269,30 +312,12 @@ void check_program_shape(const std::vector<Tensor>& inputs,
             throw std::runtime_error(
                 "Stax CUDA fused pointwise requires defined CUDA tensors");
         }
-        // Flat element addressing is only meaningful when every operand has
-        // the same extent and element width; a mismatch would reinterpret
-        // another operand's storage rather than broadcast it.
-        if (input.shape() != first.shape() || input.dtype() != first.dtype()) {
+        if (input.dtype() != first.dtype()) {
             throw std::runtime_error(
-                "Stax CUDA fused pointwise inputs must share one shape and dtype");
+                "Stax CUDA fused pointwise inputs must share one dtype");
         }
     }
-}
-
-// The evaluators address inputs with flat element offsets, which is only
-// valid for dense row-major storage.  A non-contiguous operand (a broadcast
-// view, a slice) is compacted once instead of failing the whole program.
-std::vector<Tensor> contiguous_operands(const std::vector<Tensor>& inputs) {
-    std::vector<Tensor> dense;
-    dense.reserve(inputs.size());
-    for (const Tensor& input : inputs) {
-        if (input.is_contiguous()) {
-            dense.push_back(input);
-        } else {
-            dense.push_back(input.contiguous());
-        }
-    }
-    return dense;
+    static_cast<void>(broadcast_shape(inputs));
 }
 
 Tensor byte_buffer(int64_t bytes, const Tensor& like) {
@@ -306,7 +331,10 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
                                 const std::vector<int64_t>* output_refs) {
     const int64_t input_count = static_cast<int64_t>(inputs.size());
     const int64_t instruction_count = static_cast<int64_t>(program.size() / 3);
-    const int64_t count = inputs.front().numel();
+    const std::vector<int64_t> output_shape = broadcast_shape(inputs);
+    int64_t count = 1;
+    for (int64_t extent : output_shape) count *= extent;
+    const int64_t rank = static_cast<int64_t>(output_shape.size());
 
     // Outputs: a ref pointing at an input aliases that input; refs into the
     // temporary pool allocate fresh storage and are written by the kernel.
@@ -336,7 +364,7 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
     }
     for (size_t i = 0; i < temp_refs.size(); ++i) {
         temp_tensors.push_back(Tensor::empty(
-            inputs.front().shape(), inputs.front().dtype(),
+            output_shape, inputs.front().dtype(),
             inputs.front().device()));
     }
     std::vector<Tensor> outs;
@@ -357,6 +385,32 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
     host_input_ptrs.reserve(inputs.size());
     for (const Tensor& input : inputs) {
         host_input_ptrs.push_back(input.data_ptr<io_t>());
+    }
+    std::vector<int64_t> host_input_sizes(
+        static_cast<size_t>(input_count * rank), 1);
+    std::vector<int64_t> host_input_strides(
+        static_cast<size_t>(input_count * rank), 0);
+    std::vector<uint8_t> host_input_flat(
+        static_cast<size_t>(input_count), 1);
+    for (int64_t input_index = 0; input_index < input_count; ++input_index) {
+        const Tensor& input = inputs[static_cast<size_t>(input_index)];
+        const int64_t offset = rank - input.dim();
+        if (input.shape() != output_shape || !input.is_contiguous()) {
+            host_input_flat[static_cast<size_t>(input_index)] = 0;
+        }
+        for (int64_t dim = 0; dim < input.dim(); ++dim) {
+            const size_t slot = static_cast<size_t>(
+                input_index * rank + offset + dim);
+            host_input_sizes[slot] = input.size(dim);
+            host_input_strides[slot] = input.stride(dim);
+        }
+    }
+    std::vector<int64_t> host_output_strides(
+        static_cast<size_t>(rank), 1);
+    int64_t inner = 1;
+    for (int64_t dim = rank - 1; dim >= 0; --dim) {
+        host_output_strides[static_cast<size_t>(dim)] = inner;
+        inner *= output_shape[static_cast<size_t>(dim)];
     }
     std::vector<io_t*> host_output_ptrs;
     host_output_ptrs.reserve(temp_tensors.size());
@@ -383,6 +437,21 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
     Tensor inptr_buf = byte_buffer(
         static_cast<int64_t>(sizeof(const io_t*) * input_count),
         inputs.front());
+    Tensor size_buf = byte_buffer(
+        static_cast<int64_t>(sizeof(int64_t) * host_input_sizes.size()),
+        inputs.front());
+    Tensor stride_buf = byte_buffer(
+        static_cast<int64_t>(sizeof(int64_t) * host_input_strides.size()),
+        inputs.front());
+    Tensor output_size_buf = byte_buffer(
+        static_cast<int64_t>(sizeof(int64_t) * output_shape.size()),
+        inputs.front());
+    Tensor output_stride_buf = byte_buffer(
+        static_cast<int64_t>(sizeof(int64_t) * host_output_strides.size()),
+        inputs.front());
+    Tensor input_flat_buf = byte_buffer(
+        static_cast<int64_t>(sizeof(uint8_t) * host_input_flat.size()),
+        inputs.front());
     checkCuda(cudaMemcpyAsync(instr_buf.data_ptr(), host_instructions.data(),
                                sizeof(Instruction) * instruction_count,
                                cudaMemcpyHostToDevice, stream),
@@ -397,13 +466,48 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
                                sizeof(const io_t*) * input_count,
                                cudaMemcpyHostToDevice, stream),
                "stax fused pointwise input pointer table upload");
+    if (!host_input_sizes.empty()) {
+        checkCuda(cudaMemcpyAsync(
+                      size_buf.data_ptr(), host_input_sizes.data(),
+                      sizeof(int64_t) * host_input_sizes.size(),
+                      cudaMemcpyHostToDevice, stream),
+                  "stax fused pointwise input size upload");
+        checkCuda(cudaMemcpyAsync(
+                      stride_buf.data_ptr(), host_input_strides.data(),
+                      sizeof(int64_t) * host_input_strides.size(),
+                      cudaMemcpyHostToDevice, stream),
+                  "stax fused pointwise input stride upload");
+    }
+    if (!output_shape.empty()) {
+        checkCuda(cudaMemcpyAsync(
+                      output_size_buf.data_ptr(), output_shape.data(),
+                      sizeof(int64_t) * output_shape.size(),
+                      cudaMemcpyHostToDevice, stream),
+                  "stax fused pointwise output size upload");
+        checkCuda(cudaMemcpyAsync(
+                      output_stride_buf.data_ptr(), host_output_strides.data(),
+                      sizeof(int64_t) * host_output_strides.size(),
+                      cudaMemcpyHostToDevice, stream),
+                  "stax fused pointwise output stride upload");
+    }
+    checkCuda(cudaMemcpyAsync(
+                  input_flat_buf.data_ptr(), host_input_flat.data(),
+                  sizeof(uint8_t) * host_input_flat.size(),
+                  cudaMemcpyHostToDevice, stream),
+              "stax fused pointwise input layout upload");
 
     ProgramState<io_t, compute_t> state;
     state.instructions = reinterpret_cast<const Instruction*>(instr_buf.data_ptr());
     state.constants = reinterpret_cast<const compute_t*>(const_buf.data_ptr());
     state.input_ptrs = reinterpret_cast<const io_t* const*>(inptr_buf.data_ptr());
+    state.input_sizes = reinterpret_cast<const int64_t*>(size_buf.data_ptr());
+    state.input_strides = reinterpret_cast<const int64_t*>(stride_buf.data_ptr());
+    state.output_sizes = reinterpret_cast<const int64_t*>(output_size_buf.data_ptr());
+    state.output_strides = reinterpret_cast<const int64_t*>(output_stride_buf.data_ptr());
+    state.input_flat = reinterpret_cast<const uint8_t*>(input_flat_buf.data_ptr());
     state.input_count = input_count;
     state.instruction_count = instruction_count;
+    state.rank = rank;
 
     if (output_refs == nullptr) {
         io_t* out_ptr = temp_tensors[0].data_ptr<io_t>();
@@ -471,19 +575,18 @@ Tensor stax_fused_pointwise_cuda(
     const std::vector<int64_t>& program,
     const std::vector<double>& constants) {
     check_program_shape(inputs, program, constants, 1);
-    const std::vector<Tensor> dense = contiguous_operands(inputs);
-    const DType dt = dense.front().dtype();
+    const DType dt = inputs.front().dtype();
     if (dt == DType::Float32) {
-        return run_program<float, float>(dense, program, constants, nullptr)[0];
+        return run_program<float, float>(inputs, program, constants, nullptr)[0];
     }
     if (dt == DType::Float64) {
-        return run_program<double, double>(dense, program, constants, nullptr)[0];
+        return run_program<double, double>(inputs, program, constants, nullptr)[0];
     }
     if (dt == DType::Float16) {
-        return run_program<tensorplay::Half, float>(dense, program, constants, nullptr)[0];
+        return run_program<tensorplay::Half, float>(inputs, program, constants, nullptr)[0];
     }
     if (dt == DType::BFloat16) {
-        return run_program<tensorplay::BFloat16, float>(dense, program, constants, nullptr)[0];
+        return run_program<tensorplay::BFloat16, float>(inputs, program, constants, nullptr)[0];
     }
     throw std::runtime_error(
         "Stax CUDA fused pointwise supports float16/bfloat16/float32/float64");
@@ -496,19 +599,18 @@ std::vector<Tensor> stax_fused_pointwise_cuda_multi(
     const std::vector<int64_t>& output_refs) {
     check_program_shape(inputs, program, constants,
                         static_cast<int64_t>(output_refs.size()));
-    const std::vector<Tensor> dense = contiguous_operands(inputs);
-    const DType dt = dense.front().dtype();
+    const DType dt = inputs.front().dtype();
     if (dt == DType::Float32) {
-        return run_program<float, float>(dense, program, constants, &output_refs);
+        return run_program<float, float>(inputs, program, constants, &output_refs);
     }
     if (dt == DType::Float64) {
-        return run_program<double, double>(dense, program, constants, &output_refs);
+        return run_program<double, double>(inputs, program, constants, &output_refs);
     }
     if (dt == DType::Float16) {
-        return run_program<tensorplay::Half, float>(dense, program, constants, &output_refs);
+        return run_program<tensorplay::Half, float>(inputs, program, constants, &output_refs);
     }
     if (dt == DType::BFloat16) {
-        return run_program<tensorplay::BFloat16, float>(dense, program, constants, &output_refs);
+        return run_program<tensorplay::BFloat16, float>(inputs, program, constants, &output_refs);
     }
     throw std::runtime_error(
         "Stax CUDA fused pointwise multi supports float16/bfloat16/float32/float64");

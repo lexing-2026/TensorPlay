@@ -3363,29 +3363,45 @@ def _native_fused_pointwise_plans(
             return None
         if len(output_refs) != len(exports) or len(output_refs) > 32:
             return None
-        if len(output_refs) == 1 and output_ref != len(externals) + instruction_count - 1:
-            if _register_stax_cuda_pointwise_op(
-                program, constants, output_refs, len(externals), []
-            ) is None:
-                return None
+        final_ref = len(externals) + instruction_count - 1
+        uniform_output_dtype = all(
+            value.dtype == output_dtype for value in external_values
+        )
         direct_examples = (
             external_values
             if all(
                 tuple(int(item) for item in value.shape) == output_shape
                 and value.dtype == output_dtype
+                and value.is_contiguous()
                 for value in external_values
             )
             else []
         )
-        op_name = _register_stax_cuda_pointwise_op(
-            program,
-            constants,
-            output_refs,
-            len(externals),
-            direct_examples,
-        )
-        if op_name is None and output_ref != len(externals) + instruction_count - 1:
-            return None
+        if not uniform_output_dtype:
+            # The native stride kernel has one storage dtype.  The generated
+            # CUDA function performs the required input promotion for mixed
+            # dtype plans and keeps broadcast addressing in its wrapper.
+            op_name = _register_stax_cuda_pointwise_op(
+                program, constants, output_refs, len(externals), []
+            )
+            if op_name is None:
+                return None
+        elif len(output_refs) == 1 and output_ref != final_ref:
+            op_name = _register_stax_cuda_pointwise_op(
+                program, constants, output_refs, len(externals), direct_examples
+            )
+            if op_name is None:
+                return None
+        elif direct_examples:
+            op_name = _register_stax_cuda_pointwise_op(
+                program,
+                constants,
+                output_refs,
+                len(externals),
+                direct_examples,
+            )
+        else:
+            op_name = None
         return (
             frozenset(nodes),
             tuple(externals),
@@ -3497,8 +3513,6 @@ class _ForwardPointwiseFuser:
     def _describe(self, sample: Any) -> tuple[tuple[int, ...], str, bool] | None:
         try:
             shape = tuple(int(item) for item in sample.shape)
-            if not sample.is_contiguous():
-                return None
             name = str(sample.dtype).rsplit(".", 1)[-1]
             is_cuda = bool(sample.device.is_cuda())
         except (AttributeError, RuntimeError, TypeError, ValueError):
@@ -3513,7 +3527,13 @@ class _ForwardPointwiseFuser:
             self._dtype = name
             self._is_cuda = is_cuda
             return True
-        return shape == self._shape and name == self._dtype and is_cuda == self._is_cuda
+        if name != self._dtype or is_cuda != self._is_cuda:
+            return False
+        merged = _broadcast_shape((self._shape, shape))
+        if merged is None:
+            return False
+        self._shape = merged
+        return True
 
     def _operand(self, value: Any) -> tuple[str, Any] | None:
         if isinstance(value, Node):
@@ -3649,6 +3669,7 @@ class _ForwardPointwiseFuser:
         mapping = {index: position for position, index in enumerate(sequence)}
 
         inputs: list[Any] = []
+        input_nodes: list[Node] = []
         input_samples: list[Any] = []
         input_pos: dict[int, int] = {}
         constants: list[float] = []
@@ -3669,7 +3690,49 @@ class _ForwardPointwiseFuser:
                         return False
                     input_pos[key] = len(inputs)
                     inputs.append(native)
+                    input_nodes.append(value)
                     input_samples.append(self._sample_of(value))
+        output_sample = self._sample_of(temps[indices[0]]) if indices else None
+        output_shape = None
+        output_dtype = None
+        if output_sample is not None:
+            try:
+                output_shape = tuple(int(item) for item in output_sample.shape)
+                output_dtype = output_sample.dtype
+            except (AttributeError, TypeError, ValueError):
+                return False
+        if output_shape is None:
+            return False
+        if len(indices) > 1:
+            output_shapes = []
+            for index in indices:
+                sample = self._sample_of(temps[index])
+                try:
+                    output_shapes.append(tuple(int(item) for item in sample.shape))
+                except (AttributeError, TypeError, ValueError):
+                    return False
+            if len(set(output_shapes)) > 1:
+                return all(self._emit(spec, (index,)) for index in indices)
+        anchor = next(
+            (
+                position
+                for position, sample in enumerate(input_samples)
+                if sample is not None
+                and tuple(int(item) for item in sample.shape) == output_shape
+                and sample.dtype == output_dtype
+            ),
+            None,
+        )
+        if anchor is None:
+            return False
+        if anchor:
+            anchor_input = inputs[anchor]
+            anchor_node = input_nodes[anchor]
+            anchor_sample = input_samples[anchor]
+            inputs = [anchor_input, *inputs[:anchor], *inputs[anchor + 1 :]]
+            input_nodes = [anchor_node, *input_nodes[:anchor], *input_nodes[anchor + 1 :]]
+            input_samples = [anchor_sample, *input_samples[:anchor], *input_samples[anchor + 1 :]]
+            input_pos = {id(value): position for position, value in enumerate(input_nodes)}
         input_count = len(inputs)
         program: list[int] = []
         for index in sequence:
@@ -3688,14 +3751,22 @@ class _ForwardPointwiseFuser:
             examples = (
                 input_samples
                 if all(
-                    value is not None and hasattr(value, "device")
+                    value is not None
+                    and hasattr(value, "device")
+                    and bool(value.device.is_cuda())
+                    and value.is_contiguous()
+                    and tuple(int(item) for item in value.shape) == output_shape
+                    and value.dtype == output_dtype
                     for value in input_samples
                 )
                 else []
             )
-            op_name = _register_stax_cuda_pointwise_op(
-                program, constants, tuple(output_refs), input_count, examples
-            )
+            if not examples:
+                op_name = None
+            else:
+                op_name = _register_stax_cuda_pointwise_op(
+                    program, constants, tuple(output_refs), input_count, examples
+                )
         node = self._graph.create_node(
             "custom_op" if op_name is not None else "fused_pointwise",
             f"fused_pw_{len(self._graph.nodes)}",
@@ -3996,18 +4067,19 @@ def _lower_native(
             continue
         if node.op not in {"call_function", "call_method"}:
             return None
-        try:
-            if not fuser.ensure_for(node):
+        if use_fusion:
+            try:
+                if not fuser.ensure_for(node):
+                    return None
+                if node not in emitted_fused_pointwise_nodes and fuser.absorb(node):
+                    continue
+                if not fuser.flush_for(node):
+                    return None
+            except (KeyError, RuntimeError, TypeError, ValueError):
                 return None
-            if node not in emitted_fused_pointwise_nodes and fuser.absorb(node):
+            if node in emitted_fused_pointwise_nodes:
                 continue
-            if not fuser.flush_for(node):
-                return None
-        except (KeyError, RuntimeError, TypeError, ValueError):
-            return None
-        if node in emitted_fused_pointwise_nodes:
-            continue
-        pointwise_plan = fused_pointwise_plans.get(node)
+        pointwise_plan = fused_pointwise_plans.get(node) if use_fusion else None
         if pointwise_plan is not None:
             (
                 plan_nodes,
@@ -5732,6 +5804,16 @@ _AUTOCAST_GEMM_OPS = {
 }
 
 
+class _AotFusedSpec:
+    """A frozen elementwise program kept until every spilled temp is read."""
+
+    __slots__ = ("ops", "temps")
+
+    def __init__(self, ops, temps):
+        self.ops = ops
+        self.temps = temps
+
+
 class _AotNativeGraphBuilder:
     """Small native-IR builder used by the source-derived reverse pass.
 
@@ -5753,6 +5835,7 @@ class _AotNativeGraphBuilder:
         self._fused_temp_symbols: dict[int, _AotNativeSymbol] = {}
         self._fused_shape: tuple[int, ...] | None = None
         self._fused_dtype: Any = None
+        self._fused_pending: dict[int, tuple[_AotFusedSpec, int]] = {}
         self._cuda_examples: dict[Any, Any] = {}
         self._cast_memo: dict[tuple[int, Any], tuple[_AotNativeSymbol, _AotNativeSymbol]] = {}
 
@@ -5798,22 +5881,28 @@ class _AotNativeGraphBuilder:
     # -- elementwise program buffer -----------------------------------------
 
     def _materialize(self, symbol: _AotNativeSymbol) -> None:
-        """Give a buffered elementwise result a real graph value.
+        """Give a buffered or spilled elementwise result a real graph value.
 
-        Escaping the buffer materializes the whole program.  Escaping an
-        intermediate (non-final) temporary materializes every temporary of
-        the program as a node output so no buffered symbol can dangle.
+        A temporary still in the buffer flushes the program with only that
+        result emitted; sibling intermediates spill and stay dormant until a
+        consumer pulls them.  A spilled temporary is re-emitted as its own
+        node, so a shared subexpression consumed by a later formula pays for
+        that single result instead of forcing every partial sum of the
+        program through memory.
         """
         if symbol is None or symbol.value is not None:
             return
         index = self._fused_temp_pos.get(id(symbol))
-        if index is None:
-            raise RuntimeError("AOT elementwise buffer lost a temporary symbol")
-        # The whole program is materialized even when only its tail escapes:
-        # shared subexpression symbols (e.g. a sin/cos pair cached across
-        # derivative formulas) may be consumed by a later formula, and a
-        # pool-only temporary would dangle after the flush.
-        self._fused_flush(materialize_all=True)
+        if index is not None:
+            self._fused_flush([index])
+            return
+        entry = self._fused_pending.get(id(symbol))
+        if entry is not None:
+            spec, index = entry
+            del self._fused_pending[id(symbol)]
+            self._emit_program(spec.ops, spec.temps, [index])
+            return
+        raise RuntimeError("AOT elementwise buffer lost a temporary symbol")
 
     def _fused_append(
         self, opcode: int, lhs: tuple[str, Any], rhs: tuple[str, Any]
@@ -5835,6 +5924,11 @@ class _AotNativeGraphBuilder:
         *,
         unary: bool = False,
     ) -> _AotNativeSymbol | None:
+        if op_name == "conj":
+            dtype = getattr(lhs_symbol, "dtype", None)
+            if dtype is None or "complex" in str(dtype):
+                return None
+            op_name = "pos"
         opcode = _FUSED_PROGRAM_OPCODES.get(op_name)
         if opcode is None:
             return None
@@ -5842,10 +5936,11 @@ class _AotNativeGraphBuilder:
             operands = (("sym", lhs_symbol), ("const", 0.0))
             shape = tuple(lhs_symbol.shape)
         elif lhs_symbol is not None and rhs_symbol is not None:
-            if lhs_symbol.shape != rhs_symbol.shape:
-                return None  # broadcast stays on the native broadcast path
+            try:
+                shape = self._broadcast_shape(lhs_symbol.shape, rhs_symbol.shape)
+            except ValueError:
+                return None
             operands = (("sym", lhs_symbol), ("sym", rhs_symbol))
-            shape = tuple(lhs_symbol.shape)
         elif lhs_symbol is not None:
             operands = (("sym", lhs_symbol), ("const", float(rhs_raw)))
             shape = tuple(lhs_symbol.shape)
@@ -5855,8 +5950,14 @@ class _AotNativeGraphBuilder:
         else:
             return None
         for kind, value in operands:
-            if kind == "sym" and value.value is None and id(value) not in self._fused_temp_pos:
-                return None  # operand of an already-flushed program: fall back
+            if kind == "sym" and value.value is None:
+                if id(value) in self._fused_temp_pos:
+                    continue
+                if id(value) not in self._fused_pending:
+                    return None  # operand of a dropped program: fall back
+                # A spilled temp can join this buffer once it is revived as
+                # a real input value.
+                self._materialize(value)
         # The fused evaluators read one uniform input block: a symbol whose
         # element type differs from the buffered program stays on the native
         # path, which promotes per element type.
@@ -5869,11 +5970,19 @@ class _AotNativeGraphBuilder:
         if self._fused_shape is None:
             self._fused_shape = shape
         elif shape != self._fused_shape:
-            self._fused_flush()
+            # Generation change: nothing here is emitted yet, so spill the
+            # whole generation and let consumers pull results on demand.
+            self._fused_flush([])
             self._fused_shape = shape
         return self._fused_append(opcode, operands[0], operands[1])
 
-    def _fused_flush(self, materialize_all: bool = True) -> None:
+    def _fused_flush(self, wanted: list[int] | None = None) -> None:
+        """Retire the buffer generation; emit only the requested results.
+
+        Results nobody asked for spill into the pending registry and stay
+        dormant until a consumer pulls them; results nobody ever pulls cost
+        nothing at all.
+        """
         if not self._fused_ops:
             return
         ops = self._fused_ops
@@ -5882,31 +5991,60 @@ class _AotNativeGraphBuilder:
         self._fused_ops = []
         self._fused_temp_pos = {}
         self._fused_temp_symbols = {}
-        shape = self._fused_shape
         self._fused_shape = None
         self._fused_dtype = None
+
+        temps = tuple(
+            temp_symbols[temp_id]
+            for temp_id, _ in sorted(temp_pos.items(), key=lambda kv: kv[1])
+        )
+        spec = _AotFusedSpec(tuple(ops), temps)
+        emitted = list(range(len(ops))) if wanted is None else list(wanted)
+        for index, symbol in enumerate(temps):
+            if index not in emitted:
+                self._fused_pending[id(symbol)] = (spec, index)
+        if emitted:
+            self._emit_program(spec.ops, temps, emitted)
+
+    def _emit_program(
+        self,
+        ops: tuple[tuple[int, Any, Any], ...],
+        temps: tuple[_AotNativeSymbol, ...],
+        wanted: list[int],
+    ) -> None:
+        temp_pos = {id(symbol): index for index, symbol in enumerate(temps)}
+        # Dependency closure of the requested results, in program order; the
+        # closure is the whole program only when every temp is wanted.  A
+        # single-result emit moves that result last because the one-output
+        # evaluator returns the final temp of the program.
+        closure: set[int] = set()
+        stack = list(wanted)
+        while stack:
+            index = stack.pop()
+            if index in closure:
+                continue
+            closure.add(index)
+            for kind, value in ops[index][1:]:
+                if kind == "sym":
+                    position = temp_pos.get(id(value))
+                    if position is not None:
+                        stack.append(position)
+        sequence = sorted(closure)
+        if len(wanted) == 1:
+            sequence.remove(wanted[0])
+            sequence.append(wanted[0])
+        mapping = {index: position for position, index in enumerate(sequence)}
 
         input_symbols: list[_AotNativeSymbol] = []
         input_pos: dict[int, int] = {}
         constants: list[float] = []
         const_pos: dict[float, int] = {}
-
-        def ref_for(operand: tuple[str, Any], input_count: int) -> int:
-            kind, value = operand
-            if kind == "sym":
-                temp_index = temp_pos.get(id(value))
-                if temp_index is not None:
-                    return input_count + temp_index
-                return input_pos[id(value)]
-            return -const_pos[float(value)] - 1
-
-        # Bind every operand before emitting refs: temporaries are addressed
-        # past the final input block, so a ref produced while the input list
-        # was still growing would alias a later input instead of the temp slot.
-        for _, lhs, rhs in ops:
-            for kind, value in (lhs, rhs):
+        for index in sequence:
+            for kind, value in ops[index][1:]:
                 if kind == "sym":
-                    if id(value) in temp_pos or id(value) in input_pos:
+                    if id(value) in temp_pos:
+                        continue  # program-internal temporary
+                    if id(value) in input_pos:
                         continue
                     input_pos[id(value)] = len(input_symbols)
                     input_symbols.append(value)
@@ -5917,13 +6055,19 @@ class _AotNativeGraphBuilder:
                     constants.append(number)
         input_count = len(input_symbols)
         program: list[int] = []
-        for opcode, lhs, rhs in ops:
-            program.extend(
-                (opcode, ref_for(lhs, input_count), ref_for(rhs, input_count))
-            )
+        for index in sequence:
+            opcode, lhs, rhs = ops[index]
+            program.append(opcode)
+            for kind, value in (lhs, rhs):
+                if kind == "const":
+                    program.append(-const_pos[value] - 1)
+                elif id(value) in temp_pos:
+                    program.append(input_count + mapping[temp_pos[id(value)]])
+                else:
+                    program.append(input_pos[id(value)])
 
-        emitted = list(range(len(ops))) if materialize_all else [len(ops) - 1]
-        output_refs = [input_count + index for index in emitted]
+        emitted = list(wanted)
+        output_refs = [input_count + mapping[index] for index in emitted]
         op_name = None
         if 1 <= input_count <= 32 and len(emitted) <= 32:
             first_shape = tuple(input_symbols[0].shape)
@@ -5971,10 +6115,8 @@ class _AotNativeGraphBuilder:
 
         outputs = [node.add_output() for _ in emitted]
         node_to_output = dict(zip(emitted, outputs))
-        for temp_id, position in temp_pos.items():
-            output = node_to_output.get(position)
-            if output is not None:
-                temp_symbols[temp_id].value = output
+        for position, output in node_to_output.items():
+            temps[position].value = output
 
     @staticmethod
     def _broadcast_shape(lhs: tuple[int, ...], rhs: tuple[int, ...]) -> tuple[int, ...]:
@@ -6015,6 +6157,7 @@ class _AotNativeGraphBuilder:
             self._materialize(lhs_symbol)
         if rhs_symbol is not None:
             self._materialize(rhs_symbol)
+        self._fused_flush([])
         native_node = self.graph.create_node(op_name, f"aot_{op_name}_{len(self.graph.nodes)}")
         shape = lhs_symbol.shape if lhs_symbol is not None else rhs_symbol.shape
         if lhs_symbol is not None and rhs_symbol is not None:
@@ -6043,6 +6186,7 @@ class _AotNativeGraphBuilder:
         if fused is not None:
             return fused
         self._materialize(value)
+        self._fused_flush([])
         native_node = self.graph.create_node(op_name, f"aot_{op_name}_{len(self.graph.nodes)}")
         native_node.add_input(value.value)
         result = _AotNativeSymbol(self, native_node.add_output(), shape or value.shape)
@@ -6064,6 +6208,7 @@ class _AotNativeGraphBuilder:
         # this node would still be undefined when this node reads it.
         for value in args:
             self._materialize(value)
+        self._fused_flush([])
         native_node = self.graph.create_node(op_name, f"aot_{op_name}_{len(self.graph.nodes)}")
         symbols = self._add_inputs(native_node, args)
         del symbols
@@ -7903,8 +8048,13 @@ def _lower_stax_region(
         if segmented is not None:
             graph_module._stax_codegen = "stax-fused-cpu-segments"
             return segmented
+    # Fused native pointwise nodes are forward execution primitives.  A
+    # training graph that reaches this fallback did not obtain an AOT reverse
+    # graph, so keep ordinary tensor operators here to preserve autograd
+    # recording for every parameter.
+    native_fusion = use_fusion and not getattr(graph_module.root, "training", False)
     native_graph = (
-        _lower_native(graph_module, example_inputs, use_fusion=use_fusion)
+        _lower_native(graph_module, example_inputs, use_fusion=native_fusion)
         if use_native
         else None
     )

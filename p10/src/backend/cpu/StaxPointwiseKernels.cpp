@@ -49,6 +49,28 @@ constexpr int64_t kMaxPointwiseInstructions = 65536;
 constexpr int64_t kMaxPointwiseConstants = 65536;
 constexpr int64_t kMaxPointwiseInputs = 64;
 
+std::vector<int64_t> broadcast_shape(const std::vector<Tensor>& inputs) {
+    int64_t rank = 0;
+    for (const Tensor& input : inputs) {
+        rank = std::max(rank, input.dim());
+    }
+    std::vector<int64_t> shape(static_cast<size_t>(rank), 1);
+    for (const Tensor& input : inputs) {
+        const int64_t offset = rank - input.dim();
+        for (int64_t dim = 0; dim < input.dim(); ++dim) {
+            const int64_t extent = input.size(dim);
+            const size_t output_dim = static_cast<size_t>(offset + dim);
+            if (extent != 1 && shape[output_dim] != 1 &&
+                shape[output_dim] != extent) {
+                throw std::runtime_error(
+                    "Stax CPU fused pointwise inputs cannot broadcast");
+            }
+            if (extent != 1) shape[output_dim] = extent;
+        }
+    }
+    return shape;
+}
+
 template <typename Vec>
 void prepare_program(
     const std::vector<int64_t>& program,
@@ -494,6 +516,7 @@ Tensor stax_pointwise_kernel_impl(
         throw std::runtime_error("Stax CPU fused pointwise program is malformed");
     }
     const Tensor& first = inputs.front();
+    const std::vector<int64_t> output_shape = broadcast_shape(inputs);
     if (!first.defined() || !first.device().is_cpu() ||
         first.dtype() != DType::Float32) {
         throw std::runtime_error(
@@ -501,18 +524,18 @@ Tensor stax_pointwise_kernel_impl(
     }
     for (const Tensor& input : inputs) {
         if (!input.defined() || !input.device().is_cpu() ||
-            input.dtype() != DType::Float32 ||
-            input.shape() != first.shape()) {
+            input.dtype() != DType::Float32) {
             throw std::runtime_error(
-                "Stax CPU fused pointwise inputs must share one shape");
+                "Stax CPU fused pointwise requires float32 CPU tensors");
         }
     }
-    // The evaluators walk flat element offsets, so non-contiguous operands
-    // (broadcast views, slices) are compacted once up front.
     std::vector<Tensor> dense;
     dense.reserve(inputs.size());
     for (const Tensor& input : inputs) {
-        dense.push_back(input.is_contiguous() ? input : input.contiguous());
+        dense.push_back(
+            input.shape() == output_shape && input.is_contiguous()
+                ? input
+                : input.expand(output_shape).contiguous());
     }
 
     const int64_t input_count = static_cast<int64_t>(dense.size());
@@ -525,7 +548,7 @@ Tensor stax_pointwise_kernel_impl(
     }
 
     Tensor result = Tensor::empty(
-        static_cast<std::vector<int64_t>>(first.shape()),
+        output_shape,
         DType::Float32,
         first.device());
     std::vector<const float*> input_ptrs;
@@ -549,7 +572,7 @@ Tensor stax_pointwise_kernel_impl(
         constant_values = heap_constant_values.data();
     }
     prepare_program(program, constants, instructions, constant_values);
-    const int64_t n = first.numel();
+    const int64_t n = dense.front().numel();
     float* output = result.data_ptr<float>();
     const int64_t width = Vec::size();
     const int64_t constant_count = static_cast<int64_t>(constants.size());
@@ -618,6 +641,7 @@ std::vector<Tensor> stax_pointwise_multi_kernel_impl(
         throw std::runtime_error("Stax CPU multi-output pointwise program is malformed");
     }
     const Tensor& first = inputs.front();
+    const std::vector<int64_t> output_shape = broadcast_shape(inputs);
     if (!first.defined() || !first.device().is_cpu() ||
         first.dtype() != DType::Float32) {
         throw std::runtime_error(
@@ -625,18 +649,18 @@ std::vector<Tensor> stax_pointwise_multi_kernel_impl(
     }
     for (const Tensor& input : inputs) {
         if (!input.defined() || !input.device().is_cpu() ||
-            input.dtype() != DType::Float32 ||
-            input.shape() != first.shape()) {
+            input.dtype() != DType::Float32) {
             throw std::runtime_error(
-                "Stax CPU multi-output pointwise inputs must share one shape");
+                "Stax CPU multi-output pointwise requires float32 CPU tensors");
         }
     }
-    // Flat element addressing requires dense row-major storage; compact any
-    // non-contiguous operand (broadcast view, slice) once up front.
     std::vector<Tensor> dense;
     dense.reserve(inputs.size());
     for (const Tensor& input : inputs) {
-        dense.push_back(input.is_contiguous() ? input : input.contiguous());
+        dense.push_back(
+            input.shape() == output_shape && input.is_contiguous()
+                ? input
+                : input.expand(output_shape).contiguous());
     }
 
     const int64_t input_count = static_cast<int64_t>(dense.size());
@@ -677,7 +701,7 @@ std::vector<Tensor> stax_pointwise_multi_kernel_impl(
     results.reserve(output_refs.size());
     for (size_t output = 0; output < output_refs.size(); ++output) {
         results.push_back(Tensor::empty(
-            static_cast<std::vector<int64_t>>(first.shape()),
+            output_shape,
             DType::Float32,
             first.device()));
     }
@@ -693,7 +717,7 @@ std::vector<Tensor> stax_pointwise_multi_kernel_impl(
         output_ptrs.push_back(result.data_ptr<float>());
     }
 
-    const int64_t n = first.numel();
+    const int64_t n = dense.front().numel();
     const int64_t width = Vec::size();
     const int64_t constant_count = static_cast<int64_t>(constants.size());
     parallel::parallel_for(0, n, parallel::GRAIN_SIZE, [&](int64_t begin, int64_t end) {
