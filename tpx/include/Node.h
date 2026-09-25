@@ -123,6 +123,13 @@ public:
     // engine reads them during backward while the graph is immutable).
     void add_pre_hook(PreHookFn hook) { pre_hooks_.push_back(std::move(hook)); }
     void add_post_hook(PostHookFn hook) { post_hooks_.push_back(std::move(hook)); }
+    // Hooks a tensor registered on the gradient this node receives; the
+    // engine runs them before the node's own pre-hooks.  A leaf's
+    // accumulator answers with the leaf's own hook list.
+    virtual std::vector<PreHookFn>& tensor_pre_hooks() { return tensor_pre_hooks_; }
+    void add_tensor_pre_hook(PreHookFn hook) {
+        tensor_pre_hooks().push_back(std::move(hook));
+    }
     const std::vector<PreHookFn>& pre_hooks() const { return pre_hooks_; }
     const std::vector<PostHookFn>& post_hooks() const { return post_hooks_; }
 
@@ -165,6 +172,7 @@ protected:
     uint64_t topological_nr_ = 0;
 
 private:
+    std::vector<PreHookFn> tensor_pre_hooks_;
     std::vector<PreHookFn> pre_hooks_;
     std::vector<PostHookFn> post_hooks_;
     std::unique_ptr<AnomalyMetadata> anomaly_metadata_ = nullptr;

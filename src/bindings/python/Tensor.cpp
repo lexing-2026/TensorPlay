@@ -1820,6 +1820,33 @@ void init_tensor(py::module_& m) {
             meta->set_grad_accumulator(acc);
             return acc;
         })
+        // Gradient hooks stored on the tensor rather than on a graph node: a
+        // leaf's accumulator is rebuilt whenever its weak cache expires, so
+        // hooks registered on the node itself would vanish with it.
+        .def("_add_tensor_pre_hook", [](const Tensor& self,
+                                        std::function<std::vector<Tensor>(
+                                            std::vector<Tensor>)> hook) {
+            auto* meta = tensorplay::tpx::impl::get_or_create_autograd_meta(self);
+            if (meta == nullptr) {
+                TP_THROW(RuntimeError, "cannot attach a gradient hook to this tensor");
+            }
+            // Hooks may fire on engine worker threads; the GIL is taken here.
+            meta->hooks().push_back([hook](std::vector<Tensor>&& grads) {
+                py::gil_scoped_acquire gil;
+                return hook(std::move(grads));
+            });
+        }, "hook"_a)
+        .def("_add_post_accumulate_grad_hook", [](const Tensor& self,
+                                                  std::function<void(Tensor)> hook) {
+            auto* meta = tensorplay::tpx::impl::get_or_create_autograd_meta(self);
+            if (meta == nullptr) {
+                TP_THROW(RuntimeError, "cannot attach a gradient hook to this tensor");
+            }
+            meta->post_acc_grad_hooks().push_back([hook](const Tensor& value) {
+                py::gil_scoped_acquire gil;
+                hook(value);
+            });
+        }, "hook"_a)
         .def("element_size", [](const Tensor& self) -> int64_t {
             return static_cast<int64_t>(self.itemsize());
         })

@@ -37,6 +37,24 @@ private:
     std::weak_ptr<Node> grad_accumulator_;
     uint32_t output_nr_ = 0;
 
+public:
+    // Gradient hooks registered on the tensor itself.  A leaf's accumulator
+    // is only weakly cached (above) and may be rebuilt between passes, so the
+    // hooks live on the tensor and the accumulator reads them when it runs:
+    // pre-hooks see (and may replace) the incoming gradient, post-accumulate
+    // hooks see the tensor after its ``grad`` has been updated.
+    using TensorPreHookFn = std::function<std::vector<tensorplay::Tensor>(
+        std::vector<tensorplay::Tensor>&&)>;
+    using PostAccumulateGradHookFn = std::function<void(const tensorplay::Tensor&)>;
+    std::vector<TensorPreHookFn>& hooks() { return hooks_; }
+    std::vector<PostAccumulateGradHookFn>& post_acc_grad_hooks() {
+        return post_acc_grad_hooks_;
+    }
+
+private:
+    std::vector<TensorPreHookFn> hooks_;
+    std::vector<PostAccumulateGradHookFn> post_acc_grad_hooks_;
+
     bool has_view_info_ = false;
     tensorplay::Tensor view_base_;
     std::vector<int64_t> view_sizes_;

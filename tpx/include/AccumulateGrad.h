@@ -20,6 +20,13 @@ struct AccumulateGrad : public Node {
 
     size_t num_inputs() const override { return 1; }
 
+    std::vector<PreHookFn>& tensor_pre_hooks() override {
+        if (auto* meta = impl::get_autograd_meta(value_)) {
+            return meta->hooks();
+        }
+        return Node::tensor_pre_hooks();
+    }
+
     variable_list apply(variable_list&& inputs) override {
         if (inputs.empty() || !inputs[0].defined()) return {};
 
@@ -97,6 +104,9 @@ struct AccumulateGrad : public Node {
                 grad = grad.contiguous();
             }
             meta->accum_grad(grad);
+            for (const auto& hook : meta->post_acc_grad_hooks()) {
+                hook(value_);
+            }
         }
         return {};
     }

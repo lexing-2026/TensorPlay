@@ -1,4 +1,5 @@
 from .module import Module
+from . import _functions  # noqa: F401  (module hooks reach it as an attribute)
 from .linear import Bilinear, Identity, Linear
 from .lazy import LazyLinear
 from .activation import (

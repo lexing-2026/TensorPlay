@@ -518,6 +518,7 @@ class Function(metaclass=FunctionMeta):
             ctx.needs_input_grad = needs
             if executable:
                 ctx.backward_fn = cls.backward
+                ctx._node_name = f"{cls.__name__}Backward"
                 if not bool(ctx.materialize_grads):
                     fn.set_materialize_grads(False)
                     ctx._engine_materializes = False
@@ -563,6 +564,7 @@ class Function(metaclass=FunctionMeta):
         if executable:
             ctx.requires_grad = True
             ctx.backward_fn = cls.backward
+            ctx._node_name = f"{cls.__name__}Backward"
 
         # Run forward with grad disabled (engine semantics).  The fused
         # Crossing the C++ autograd boundary disables gradient recording for

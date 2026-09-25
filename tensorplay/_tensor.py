@@ -162,17 +162,8 @@ def register_hook(self, hook):
                 grad = result
         return grad
 
-    if self.is_leaf or self.grad_fn is None:
-        node = self._accumulate_grad_node
-        if node is None:
-            raise RuntimeError(
-                "cannot register a hook on a tensor whose AccumulateGrad node "
-                "has not been created yet; run a backward pass first"
-            )
-        pos = 0
-    else:
-        node = self.grad_fn
-        pos = self._output_nr
+    leaf = self.is_leaf or self.grad_fn is None
+    pos = 0 if leaf else self._output_nr
 
     def pre_hook(grads):
         grad = grads[pos]
@@ -183,7 +174,13 @@ def register_hook(self, hook):
         out[pos] = new_grad
         return out
 
-    node.add_pre_hook(pre_hook)
+    if leaf:
+        # A leaf's gradient accumulator is rebuilt whenever its cache
+        # expires; the hook is kept on the tensor, which the accumulator
+        # consults every time it runs.
+        self._add_tensor_pre_hook(pre_hook)
+    else:
+        self.grad_fn.add_pre_hook(pre_hook)
 
     handle = RemovableHandle(hooks_dict)
     hooks_dict[handle.id] = hook
@@ -218,18 +215,11 @@ def register_post_accumulate_grad_hook(self, hook):
 
     hooks_dict = OrderedDict()
 
-    def post_hook(_inputs, outputs):
+    def post_hook(_tensor):
         for h in list(hooks_dict.values()):
             h(self)
-        return outputs
 
-    node = self._accumulate_grad_node
-    if node is None:
-        raise RuntimeError(
-            "cannot register a hook on a tensor whose AccumulateGrad node "
-            "has not been created yet; run a backward pass first"
-        )
-    node.add_post_hook(post_hook)
+    self._add_post_accumulate_grad_hook(post_hook)
 
     handle = RemovableHandle(hooks_dict)
     hooks_dict[handle.id] = hook

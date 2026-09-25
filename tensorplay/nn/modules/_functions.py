@@ -96,3 +96,22 @@ class CrossMapLRN2d(Function):
                 accum_ratio.add_(padded_ratio[c], alpha=-1)
 
         return grad_input, None, None, None, None
+
+
+class BackwardHookFunction(Function):
+    """Identity whose backward node marks where a module's outputs begin.
+
+    Module full-backward hooks wrap a module's inputs and outputs in this
+    function, so the gradients flowing through the wrapped tensors can be
+    observed at exactly the module boundary.  Inputs that do not require a
+    gradient pass through as non-differentiable outputs.
+    """
+
+    @staticmethod
+    def forward(ctx, *args):
+        ctx.mark_non_differentiable(*[arg for arg in args if not arg.requires_grad])
+        return args
+
+    @staticmethod
+    def backward(ctx, *args):
+        return args

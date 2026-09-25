@@ -30,7 +30,7 @@ class TestModuleRepr(TestCase):
 
         self.assertExpected(repr(leaf), "leaf")
         self.assertExpected(repr(value), "value")
-        self.assertEqual(value.grad_fn.name, "MulScalarBackward")
+        self.assertEqual(value.grad_fn.name(), "MulScalarBackward")
 
     def test_nested_blank_lines_are_not_indented(self):
         self.assertExpected(repr(_WrapperModule()))

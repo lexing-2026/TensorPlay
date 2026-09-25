@@ -1267,6 +1267,20 @@ public:
         return results;
     }
 
+    // A custom function's node is named after the function class
+    // (``<Function>Backward``), which the apply path records on the context.
+    std::string name() const override {
+        if (!tensorplay::python_c::interpreter_active()) {
+            return "PyNode";
+        }
+        py::gil_scoped_acquire gil;
+        py::object label = py::getattr(py_ctx_, "_node_name", py::none());
+        if (label.is_none()) {
+            return "PyNode";
+        }
+        return label.cast<std::string>();
+    }
+
     py::object py_ctx_;
 public:
     py::object ctx() const { return py_ctx_; }
@@ -1274,7 +1288,7 @@ public:
 
 void init_autograd(py::module_& m) {
     py::class_<tensorplay::tpx::Node, std::shared_ptr<tensorplay::tpx::Node>>(m, "Node")
-        .def_property_readonly("name", [](const tensorplay::tpx::Node& self) {
+        .def("name", [](const tensorplay::tpx::Node& self) {
             return self.name();
         })
         .def("_raw_ptr", [](const tensorplay::tpx::Node& self) -> int64_t {
