@@ -1356,7 +1356,11 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         memory::dims padding_r_dims = {pD_back, pH_bottom, pW_right};
         memory::dims dilates_dims = {dilation[0] - 1, dilation[1] - 1, dilation[2] - 1};
         
-        auto src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::ncdhw);
+        auto src_md = memory::desc(
+            src_dims, memory::data_type::f32,
+            input.is_contiguous(MemoryFormat::ChannelsLast3d)
+                ? memory::format_tag::ndhwc
+                : memory::format_tag::ncdhw);
         auto dst_tag = memory::format_tag::any;
         auto dst_md = memory::desc(dst_dims, memory::data_type::f32, dst_tag);
         
@@ -1375,7 +1379,11 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
             strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
         
         auto expected_dst_md = conv_pd.dst_desc();
-        auto user_dst_md = memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::ncdhw);
+        auto user_dst_md = memory::desc(
+            dst_dims, memory::data_type::f32,
+            output.is_contiguous(MemoryFormat::ChannelsLast3d)
+                ? memory::format_tag::ndhwc
+                : memory::format_tag::ncdhw);
         bool need_reorder_dst = (expected_dst_md != user_dst_md);
         
         memory dst_mem;
@@ -1398,7 +1406,11 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         //    read out of bounds (blocked formats are padded), corrupting the heap.
         memory src_mem;
         Storage src_storage_handle;
-        auto user_src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::ncdhw);
+        auto user_src_md = memory::desc(
+            src_dims, memory::data_type::f32,
+            input.is_contiguous(MemoryFormat::ChannelsLast3d)
+                ? memory::format_tag::ndhwc
+                : memory::format_tag::ncdhw);
         if (expected_src_md != user_src_md) {
              size_t req_size = expected_src_md.get_size();
              Allocator* allocator = getAllocator(input.device().type());
@@ -2656,7 +2668,10 @@ bool onednn_claims_conv2d(const Tensor& input, const Tensor& weight,
 // operand already carries it; the conv result adopts the same layout so
 // consecutive convolutions reuse it without repacking.
 static bool conv2d_use_channels_last(const Tensor& input, const Tensor& weight) {
+    // Double falls back to the slow reference kernels, which address buffers
+    // as row-major; a channels-last double operand would be misread there.
     return input.dim() == 4 && weight.dim() == 4 &&
+           input.dtype() != DType::Float64 && weight.dtype() != DType::Float64 &&
            (input.is_contiguous(MemoryFormat::ChannelsLast) ||
             weight.is_contiguous(MemoryFormat::ChannelsLast));
 }
@@ -2677,6 +2692,25 @@ static Tensor empty_channels_last(const std::vector<int64_t>& sizes, DType dt, c
 
 static Tensor zeros_channels_last(const std::vector<int64_t>& sizes, DType dt, const Device& dev) {
     Tensor out = Tensor::zeros(sizes, dt, dev);
+    return out.as_strided(sizes, get_channels_last_strides(sizes), 0);
+}
+
+// 5-D (NDHWC) counterparts of the helpers above.
+static bool conv3d_use_channels_last3d(const Tensor& input, const Tensor& weight) {
+    return input.dim() == 5 && weight.dim() == 5 &&
+           input.dtype() != DType::Float64 && weight.dtype() != DType::Float64 &&
+           (input.is_contiguous(MemoryFormat::ChannelsLast3d) ||
+            weight.is_contiguous(MemoryFormat::ChannelsLast3d));
+}
+
+static Tensor contiguous_in3d(const Tensor& t, bool channels_last3d) {
+    if (!channels_last3d) return t.contiguous();
+    if (t.is_contiguous(MemoryFormat::ChannelsLast3d)) return t;
+    return detail::contiguous_impl(t, static_cast<int64_t>(MemoryFormat::ChannelsLast3d));
+}
+
+static Tensor empty_channels_last3d(const std::vector<int64_t>& sizes, DType dt, const Device& dev) {
+    Tensor out = Tensor::empty(sizes, dt, dev);
     return out.as_strided(sizes, get_channels_last_strides(sizes), 0);
 }
 
@@ -2996,7 +3030,10 @@ Tensor conv1d_cpu(const Tensor& input, const Tensor& weight, const Tensor& bias,
 }
 
 Tensor conv3d_cpu(const Tensor& input_arg, const Tensor& weight_arg, const Tensor& bias, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups) {
-    Tensor input = input_arg.contiguous();
+    // A channels-last (NDHWC) operand is consumed in its own layout and the
+    // result adopts it, so consecutive convolutions reuse it without repacking.
+    const bool use_cl3d = conv3d_use_channels_last3d(input_arg, weight_arg);
+    Tensor input = contiguous_in3d(input_arg, use_cl3d);
     Tensor weight = weight_arg.contiguous();
 
     if (input.dim() != 5 || weight.dim() != 5) TP_THROW(RuntimeError, "conv3d: Expected 5D input and weight");
@@ -3039,15 +3076,28 @@ Tensor conv3d_cpu(const Tensor& input_arg, const Tensor& weight_arg, const Tenso
         return slow_conv3d_forward(input, weight, bias, stride, padding, dilation, groups);
     }
 
-    Tensor out = Tensor::empty({N, C_out, D_out, H_out, W_out}, input.dtype(), input.device());
-    
+    const std::vector<int64_t> out_sizes{N, C_out, D_out, H_out, W_out};
+    // The accelerated path honors a channels-last request; the buffer only
+    // stays in that layout when such a path actually claims the call.
+    Tensor out = use_cl3d ? empty_channels_last3d(out_sizes, input.dtype(), input.device())
+                          : Tensor::empty(out_sizes, input.dtype(), input.device());
+
     #ifdef USE_ONEDNN
     // Try oneDNN implementation first
     if (conv3d_onednn(input, weight, bias, stride, pD, pD, pH, pH, pW, pW, dilation, groups, out)) {
         return out;
     }
     #endif
-    
+
+    // Native paths below address activations and the output buffer as
+    // row-major; fall back to the canonical layout for them.
+    if (!out.is_contiguous()) {
+        out = Tensor::empty(out_sizes, input.dtype(), input.device());
+    }
+    if (!input.is_contiguous()) {
+        input = input.contiguous();
+    }
+
     if (input.dtype() == DType::Float32) {
         int64_t C_out_group = C_out / groups;
         int64_t col_size = C_in_group * kD * kH * kW;
@@ -3184,8 +3234,11 @@ static bool conv_transpose2d_onednn(const Tensor& input, const Tensor& weight, c
         auto& eng = OneDNNContext::get_engine();
         auto& s = OneDNNContext::get_stream();
 
-        // The nchw / strides-only weight views below assume contiguous storage.
-        Tensor input_c = input.unsafeGetTensorImpl()->has_onednn_md()
+        // The strides-only weight view below assumes contiguous storage; a
+        // channels-last activation passes through untouched so its nhwc user
+        // descriptor can be bound zero-copy.
+        Tensor input_c = (input.unsafeGetTensorImpl()->has_onednn_md() ||
+                          input.is_contiguous(MemoryFormat::ChannelsLast))
                              ? input : input.contiguous();
         Tensor weight_c = weight.contiguous();
         Tensor bias_c = (bias.defined() && bias.numel() > 0) ? bias.contiguous() : bias;
@@ -3285,6 +3338,8 @@ static bool conv_transpose2d_onednn(const Tensor& input, const Tensor& weight, c
         if (input_c.unsafeGetTensorImpl()->has_onednn_md()) {
             user_src_md = *std::static_pointer_cast<memory::desc>(
                 input_c.unsafeGetTensorImpl()->get_onednn_md());
+        } else if (input_c.is_contiguous(MemoryFormat::ChannelsLast)) {
+            user_src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::nhwc);
         } else {
             user_src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::nchw);
         }
@@ -3350,7 +3405,11 @@ static bool conv_transpose2d_onednn(const Tensor& input, const Tensor& weight, c
 
         // 3. Output
         memory dst_mem;
-        auto user_dst_md = memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::nchw);
+        auto user_dst_md = memory::desc(
+            dst_dims, memory::data_type::f32,
+            output.is_contiguous(MemoryFormat::ChannelsLast)
+                ? memory::format_tag::nhwc
+                : memory::format_tag::nchw);
         bool need_reorder_dst = (expected_dst_md != user_dst_md);
         Storage blocked_storage_handle;
         if (need_reorder_dst) {
@@ -3658,9 +3717,12 @@ Tensor conv_transpose2d_cpu(const Tensor& input_arg, const Tensor& weight_arg, c
     // Input: (N, C_in, H_in, W_in)
     // Weight: (C_in, C_out/groups, kH, kW) - NOTE: Inverted compared to conv2d!
     // Output: (N, C_out, H_out, W_out)
-    // The kernels below address activations as row-major; a channels-last
-    // operand is materialized in the canonical layout here.
-    const Tensor input = input_arg.contiguous();
+    // A channels-last operand is consumed in its own layout and the result
+    // adopts it when the deconvolution path claims the call; the kernels
+    // below address activations as row-major and fall back to the canonical
+    // layout instead.
+    const bool use_cl = conv2d_use_channels_last(input_arg, weight_arg);
+    Tensor input = contiguous_in(input_arg, use_cl);
     const Tensor weight = weight_arg.contiguous();
     if (conv_is_low_precision(input.dtype())) {
         return conv_transpose2d_cpu(input.to(DType::Float32), weight.to(DType::Float32),
@@ -3703,15 +3765,23 @@ Tensor conv_transpose2d_cpu(const Tensor& input_arg, const Tensor& weight_arg, c
     int64_t H_out = (H_in - 1) * sH - 2 * pH + dH * (kH - 1) + opH + 1;
     int64_t W_out = (W_in - 1) * sW - 2 * pW + dW * (kW - 1) + opW + 1;
 #ifdef USE_ONEDNN
-    
+
     if (input.dtype() == DType::Float32) {
-        Tensor out_dnn = Tensor::empty({N, C_out, H_out, W_out}, input.dtype(), input.device());
+        const std::vector<int64_t> out_sizes{N, C_out, H_out, W_out};
+        Tensor out_dnn = use_cl ? empty_channels_last(out_sizes, input.dtype(), input.device())
+                                : Tensor::empty(out_sizes, input.dtype(), input.device());
         if (conv_transpose2d_onednn(input, weight, bias, stride, padding, output_padding,
                                     dilation, groups, out_dnn)) {
             return out_dnn;
         }
     }
 #endif // USE_ONEDNN
+
+    // The kernels below address activations as row-major; fall back to the
+    // canonical layout for them.
+    if (!input.is_contiguous()) {
+        input = input.contiguous();
+    }
 
     Tensor out = Tensor::zeros({N, C_out, H_out, W_out}, input.dtype(), input.device()); // Initialize with zeros for accumulation
     
