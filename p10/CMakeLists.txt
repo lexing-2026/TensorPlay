@@ -300,7 +300,10 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/TensorAdvancedIndexingKernels.cu
         src/backend/cuda/SortingKernels.cu
         src/backend/cuda/TensorCompareKernels.cu
-        src/backend/cuda/OpsKernels.cu
+        src/backend/cuda/BinaryPointwiseKernels.cu
+        src/backend/cuda/CompareLogicalKernels.cu
+        src/backend/cuda/UnaryMathKernels.cu
+        src/backend/cuda/ClampKernels.cu
         src/backend/cuda/BitwiseKernels.cu
         src/backend/cuda/BincountKernels.cu
         src/backend/cuda/SearchsortedKernels.cu

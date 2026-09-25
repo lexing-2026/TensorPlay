@@ -1,3 +1,4 @@
+#include "OpsPointwiseCommon.cuh"
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "CUDARuntime.h"
@@ -504,6 +505,162 @@ Tensor silu_and_mul_cuda(const Tensor& input) {
 }
 
 
+
+// Activation operators carried over from the pointwise families:
+Tensor hardshrink_cuda(const Tensor& self, const Scalar& lambd) {
+    double l = lambd.toDouble();
+    // lambd.to<scalar_t>(), so float32 boundary values compare exactly.
+    return dtype_unary_cuda(self,
+                            HFn54{l},
+                            "hardshrink");
+}
+Tensor softshrink_cuda(const Tensor& self, const Scalar& lambd) {
+    double l = lambd.toDouble();
+    // (a < -l ? a+l : 0)); the v*0 middle branch keeps NaN propagating.
+    return dtype_unary_cuda(self,
+                            HFn55{l},
+                            "softshrink");
+}
+// hard/soft): grad passes through where self is outside the inclusive
+// [-lambd, lambd] band.
+Tensor hardshrink_backward_cuda(const Tensor& grad_out, const Tensor& self, const Scalar& lambd) {
+    double l = lambd.toDouble();
+    return binary_same_cuda(grad_out, self,
+                            HFn56{l},
+                            "hardshrink_backward");
+}
+Tensor softshrink_backward_cuda(const Tensor& grad_output, const Tensor& self, const Scalar& lambd) {
+    double l = lambd.toDouble();
+    return binary_same_cuda(grad_output, self,
+                            HFn57{l},
+                            "softshrink_backward");
+}
+Tensor sigmoid_backward_cuda(const Tensor& grad_output, const Tensor& output) {
+    return binary_same_cuda(grad_output, output,
+                            HFn58{},
+                            "sigmoid_backward");
+}
+Tensor tanh_backward_cuda(const Tensor& grad_output, const Tensor& output) {
+    return binary_same_cuda(grad_output, output,
+                            HFn59{},
+                            "tanh_backward");
+}
+// eps (eps<0) the gradient is dy/(x(1-x)) inside [0,1] and NaN outside; with
+// eps>=0 values outside [eps, 1-eps] (compared in the element dtype) are
+// masked to zero. Exact 0/1 fall through to the division (dy/0 -> inf).
+Tensor threshold_cuda(const Tensor& self, const Scalar& threshold, const Scalar& value) {
+    double t = threshold.toDouble(), val = value.toDouble();
+    return dtype_unary_cuda(self,
+                            HFn61{t, val},
+                            "threshold");
+}
+Tensor prelu_forward_common(const Tensor& self, const Tensor& weight) {
+    Tensor output = Tensor::empty(shape_of(self), self.dtype(), self.device());
+    if (output.numel() == 0) return output;
+
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(output)
+        .add_const_input(self)
+        .add_const_input(weight)
+        .build();
+#define TP_PRELU_FWD(ctype, name_)                                             \
+    case DType::name_:                                                         \
+        gpu_kernel(iter, [] __host__ __device__(ctype input, ctype slope) -> ctype {    \
+            using math_t = typename PReluMath<ctype>::type;                   \
+            const math_t x = static_cast<math_t>(input);                      \
+            const math_t w = static_cast<math_t>(slope);                      \
+            return static_cast<ctype>(x > math_t(0) ? x : w * x);              \
+        });                                                                    \
+        break;
+    switch (self.dtype()) {
+        TP_PRELU_FWD(float, Float32)
+        TP_PRELU_FWD(double, Float64)
+        TP_PRELU_FWD(Half, Float16)
+        TP_PRELU_FWD(BFloat16, BFloat16)
+        default: TP_THROW(TypeError, "prelu: unsupported dtype");
+    }
+#undef TP_PRELU_FWD
+    CUDA_CHECK(cudaGetLastError());
+    return output;
+}
+
+Tensor prelu_cuda(const Tensor& self, const Tensor& weight) {
+    TP_CHECK(self.dtype() == weight.dtype(),
+             "prelu: Type promoting not supported");
+    if (weight.numel() != 1) {
+        TP_CHECK(self.dim() > 0, "prelu: non-scalar input is required");
+        const int64_t channel_size = self.dim() > 1 ? self.size(1) : 1;
+        TP_CHECK(channel_size == weight.numel(),
+                 "prelu: weight numel does not match the input channel count");
+    }
+    TP_CHECK(weight.dim() <= 1,
+             "prelu: weight must be a scalar or a 1D tensor");
+
+    Tensor shaped_weight = weight;
+    if (self.dim() != weight.dim()) {
+        std::vector<int64_t> weight_shape(self.dim(), 1);
+        if (self.dim() > 1) weight_shape[1] = weight.numel();
+        shaped_weight = weight.reshape(weight_shape);
+    }
+    return prelu_forward_common(self, shaped_weight);
+}
+Tensor _prelu_kernel_cuda(const Tensor& self, const Tensor& weight) {
+    return prelu_forward_common(self, weight);
+}
+std::tuple<Tensor, Tensor> _prelu_kernel_backward_cuda(const Tensor& grad_output,
+                                                       const Tensor& self,
+                                                       const Tensor& weight) {
+    TP_CHECK(self.dtype() == weight.dtype() &&
+                 self.dtype() == grad_output.dtype(),
+             "_prelu_kernel_backward: input, weight and grad_output must share "
+             "one dtype");
+    const std::vector<int64_t> out_shape = broadcast_shapes(
+        shape_of(self), shape_of(weight), shape_of(grad_output));
+    Tensor grad_input = Tensor::empty(out_shape, self.dtype(), self.device());
+    Tensor grad_weight = Tensor::empty(out_shape, weight.dtype(), weight.device());
+    if (grad_input.numel() == 0) return {grad_input, grad_weight};
+
+    TensorIterator iter = TensorIteratorConfig()
+        .resize_outputs(false)
+        .check_all_same_dtype(true)
+        .add_output(grad_input)
+        .add_output(grad_weight)
+        .add_const_input(self)
+        .add_const_input(weight)
+        .add_const_input(grad_output)
+        .build();
+#define TP_PRELU_BWD(ctype, name_)                                             \
+    case DType::name_:                                                         \
+        gpu_kernel_multiple_outputs(                                          \
+            iter, [] __host__ __device__(ctype input, ctype slope, ctype grad)          \
+                -> std::tuple<ctype, ctype> {                                  \
+                using math_t = typename PReluMath<ctype>::type;               \
+                const math_t x = static_cast<math_t>(input);                  \
+                const math_t w = static_cast<math_t>(slope);                  \
+                const math_t g = static_cast<math_t>(grad);                   \
+                const bool positive = x > math_t(0);                         \
+                return {                                                        \
+                    static_cast<ctype>(positive ? g : w * g),                \
+                    static_cast<ctype>(positive ? math_t(0) : x * g)};        \
+            });                                                                 \
+        break;
+    switch (self.dtype()) {
+        TP_PRELU_BWD(float, Float32)
+        TP_PRELU_BWD(double, Float64)
+        TP_PRELU_BWD(Half, Float16)
+        TP_PRELU_BWD(BFloat16, BFloat16)
+        default:
+            TP_THROW(TypeError, "_prelu_kernel_backward: unsupported dtype");
+    }
+#undef TP_PRELU_BWD
+    return {grad_input, grad_weight};
+}
+
+// ===========================================================================
+// ===========================================================================
+
+// Cross-TU kernels reused by the composites below.
 TENSORPLAY_LIBRARY_IMPL(CUDA, ActivationKernels) {
 #if defined(USE_CUDNN) && !defined(USE_ROCM)
     m.impl("relu", relu_kernel_cudnn);
@@ -526,6 +683,16 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, ActivationKernels) {
     m.impl("silu_mul", silu_mul_cuda);
     m.impl("fused_swiglu", fused_swiglu_cuda);
     m.impl("silu_and_mul", silu_and_mul_cuda);
+    m.impl("hardshrink", hardshrink_cuda);
+    m.impl("hardshrink_backward", hardshrink_backward_cuda);
+    m.impl("softshrink", softshrink_cuda);
+    m.impl("softshrink_backward", softshrink_backward_cuda);
+    m.impl("sigmoid_backward", sigmoid_backward_cuda);
+    m.impl("tanh_backward", tanh_backward_cuda);
+    m.impl("threshold", threshold_cuda);
+    m.impl("prelu", prelu_cuda);
+    m.impl("_prelu_kernel", _prelu_kernel_cuda);
+    m.impl("_prelu_kernel_backward", _prelu_kernel_backward_cuda);
 }
 
 } // namespace cuda
