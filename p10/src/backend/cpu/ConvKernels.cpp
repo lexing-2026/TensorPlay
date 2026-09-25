@@ -1815,7 +1815,13 @@ static bool conv2d_grad_weight_nhwc(
         s.wait();
 
         Tensor grad_w_oihw = grad_w_hwio.permute({3, 2, 0, 1}).contiguous();
-        if (grad_weight.numel() == grad_w_oihw.numel()) {
+        if (grad_weight.is_contiguous(MemoryFormat::ChannelsLast)) {
+            // Channels-last grad storage is physically (O, H, W, I), which the
+            // HWIO result reaches with one transpose; copy it across directly.
+            Tensor grad_w_ohwi = grad_w_hwio.permute({3, 0, 1, 2}).contiguous();
+            std::memcpy(grad_weight.data_ptr<float>(), grad_w_ohwi.data_ptr<float>(),
+                        grad_weight.numel() * sizeof(float));
+        } else if (grad_weight.numel() == grad_w_oihw.numel()) {
             std::memcpy(grad_weight.data_ptr<float>(), grad_w_oihw.data_ptr<float>(),
                        grad_weight.numel() * sizeof(float));
         }
@@ -2392,10 +2398,15 @@ static bool conv2d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
 
         // Prepare Diff Weights (Grad Weight)
         memory diff_weights_mem;
-        
-        auto user_diff_weights_md = groups > 1 
+
+        // A channels-last grad buffer stores weights as (O, H, W, I); grouped
+        // weights keep the same physical order across the flattened out-channel.
+        auto user_diff_weights_md = grad_weight.is_contiguous(MemoryFormat::ChannelsLast)
+             ? memory::desc(weights_dims, memory::data_type::f32,
+                            groups > 1 ? memory::format_tag::gohwi : memory::format_tag::ohwi)
+             : (groups > 1
              ? memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::goihw)
-             : memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::oihw);
+             : memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::oihw));
 
         bool need_reorder_diff_weights = (expected_diff_weights_md != user_diff_weights_md);
         Storage blocked_storage_handle;
@@ -4169,14 +4180,18 @@ static Tensor conv2d_grad_weight_cpu_impl(const Tensor& grad_output, const Tenso
     int64_t H_out = grad_output_contig.size(2);
     int64_t W_out = grad_output_contig.size(3);
 
-    Tensor grad_weight = Tensor::zeros(static_cast<std::vector<int64_t>>(weight.shape()), weight.dtype(), weight.device());
-    
+    // The grad buffer follows the activation layout so parameter grads land
+    // in the same layout the forward chain keeps its weights in.
+    Tensor grad_weight = use_cl
+        ? zeros_channels_last(static_cast<std::vector<int64_t>>(weight.shape()), weight.dtype(), weight.device())
+        : Tensor::zeros(static_cast<std::vector<int64_t>>(weight.shape()), weight.dtype(), weight.device());
+
     // Optimization: 1x1 NCHW MatMul (User Request: MatMul Algorithm)
-    bool is_1x1_s1 = (groups == 1 && kH == 1 && kW == 1 && sH == 1 && sW == 1 && 
+    bool is_1x1_s1 = (groups == 1 && kH == 1 && kW == 1 && sH == 1 && sW == 1 &&
                       dH == 1 && dW == 1 && pH == 0 && pW == 0);
 
     if (is_1x1_s1 && input_contig.is_contiguous() && weight.is_contiguous() &&
-        grad_output_contig.is_contiguous() &&
+        grad_output_contig.is_contiguous() && grad_weight.is_contiguous() &&
         input_contig.dtype() == DType::Float32 && !input_contig.unsafeGetTensorImpl()->has_onednn_md()) {
          
          // GradWeight = GradOutput * Input^T
@@ -4236,6 +4251,9 @@ static Tensor conv2d_grad_weight_cpu_impl(const Tensor& grad_output, const Tenso
     }
     if (!input_contig.is_contiguous()) {
         input_contig = input_contig.contiguous();
+    }
+    if (!grad_weight.is_contiguous()) {
+        grad_weight = Tensor::zeros(static_cast<std::vector<int64_t>>(weight.shape()), weight.dtype(), weight.device());
     }
 
     if (input_contig.dtype() == DType::Float32) {
@@ -4314,6 +4332,11 @@ static Tensor conv2d_grad_weight_cpu_impl(const Tensor& grad_output, const Tenso
         TP_THROW(NotImplementedError, "conv2d_grad_weight only supports Float32");
     }
 
+    // The row-major fallback buffer returns to the activation layout so the
+    // parameter grad matches the rest of the channels-last chain.
+    if (use_cl && !grad_weight.is_contiguous(MemoryFormat::ChannelsLast)) {
+        return contiguous_in(grad_weight, true);
+    }
     return grad_weight;
 }
 

@@ -78,10 +78,22 @@ struct AccumulateGrad : public Node {
         }
 
         if (auto* meta = impl::get_autograd_meta(value_)) {
-            // Materialize strided gradients (e.g. a .t() view produced by a
-            // contiguous layout; downstream consumers (foreach optimizers,
-            // .numpy()) rely on dense storage.
-            if (!grad.is_contiguous()) {
+            // Gradient layout rule: a densely stored parameter stashes its
+            // grad in the parameter's own canonical layout, so a channels-last
+            // chain keeps grads repack-free end to end; every other parameter
+            // materializes the grad row-major (foreach optimizers, .numpy()
+            // and Reducer-style consumers rely on dense storage).
+            const bool param_cl = value_.is_contiguous(MemoryFormat::ChannelsLast);
+            const bool param_cl3d = value_.is_contiguous(MemoryFormat::ChannelsLast3d);
+            if (param_cl) {
+                if (!grad.is_contiguous(MemoryFormat::ChannelsLast)) {
+                    grad = detail::contiguous_impl(grad, static_cast<int64_t>(MemoryFormat::ChannelsLast));
+                }
+            } else if (param_cl3d) {
+                if (!grad.is_contiguous(MemoryFormat::ChannelsLast3d)) {
+                    grad = detail::contiguous_impl(grad, static_cast<int64_t>(MemoryFormat::ChannelsLast3d));
+                }
+            } else if (!grad.is_contiguous()) {
                 grad = grad.contiguous();
             }
             meta->accum_grad(grad);
