@@ -30,7 +30,17 @@ from .index_expr import (
     Symbol,
     Where,
 )
-from ..kernel_scheduler import RINDEX, XINDEX, FusedGroup, LoopNode, placement
+from ..kernel_scheduler import (
+    BODY as _BODY,
+    EPILOGUE as _EPILOGUE,
+    PROLOGUE as _PROLOGUE,
+    RINDEX,
+    XINDEX,
+    FusedGroup,
+    LoopNode,
+    emission_regions,
+    placement,
+)
 from ..loops import Buffer, Value, dtype_name
 
 try:  # pragma: no cover - availability is a runtime condition
@@ -236,11 +246,6 @@ def render_index(expr: Expr, xvar: str, rvar: str | None) -> str:
     raise PlanError(f"unrenderable index expression: {expr!r}")
 
 
-_PROLOGUE = 0
-_BODY = 1
-_EPILOGUE = 2
-
-
 class _Group:
     """Emits the source of one fused kernel."""
 
@@ -278,31 +283,29 @@ class _Group:
 
     # -- structure ---------------------------------------------------------
     def _classify(self) -> dict:
-        regions = {}
+        written = {}
         for node in self.group.nodes:
-            if node.is_reduction or self.placements[id(node)].full:
-                regions[id(node)] = _BODY
-                continue
-            needs_reduction = any(
-                load.args[0] in self.produced
-                and self.produced[load.args[0]].is_reduction
-                for load in node.body.loads
-            )
-            regions[id(node)] = _EPILOGUE if needs_reduction else _PROLOGUE
-        return regions
+            for buffer in node.buffers:
+                written[buffer.name] = (node, buffer)
+        return emission_regions(self.group.nodes, self.placements, written)
+
+    def _in_region(self, region: int) -> list:
+        """A region's nodes, in the order the scheduler made them legal."""
+
+        return sorted(
+            (node for node in self.group.nodes if self.regions[id(node)] == region),
+            key=lambda node: node.index,
+        )
 
     def run(self) -> None:
-        for node in self.group.nodes:
-            if self.regions[id(node)] == _PROLOGUE:
-                self.sink = self.prologue
-                self.emit_node(node, 1)
+        for node in self._in_region(_PROLOGUE):
+            self.sink = self.prologue
+            self.emit_node(node, 1)
         for node in self.group.nodes:
             if node.is_reduction:
                 self.sink = self.pre_loop
                 self.acc_init(node)
-        for node in self.group.nodes:
-            if self.regions[id(node)] != _BODY:
-                continue
+        for node in self._in_region(_BODY):
             self.sink = self.loop
             if node.is_reduction:
                 self.elem[id(node)] = self.value(node.body.root, node, 2)
@@ -313,10 +316,9 @@ class _Group:
             if node.is_reduction:
                 self.sink = self.post
                 self.acc_finish(node)
-        for node in self.group.nodes:
-            if self.regions[id(node)] == _EPILOGUE:
-                self.sink = self.epilogue
-                self.emit_node(node, 1)
+        for node in self._in_region(_EPILOGUE):
+            self.sink = self.epilogue
+            self.emit_node(node, 1)
 
     # -- emission helpers --------------------------------------------------
     def emit(self, line: str) -> None:
@@ -581,13 +583,18 @@ class _Group:
             self.emit(f"{state['name']} = tl.{kind}({state['name']}, {source})")
         else:
             self._welford_block(source, state)
+            block = state["block"]
             merged = self.tmp("cm"), self.tmp("cs"), self.tmp("cw")
             self.emit(
                 f"{merged[0]}, {merged[1]}, {merged[2]} = _tp_welford_combine("
                 f"{state['name']}, {state['m2']}, {state['weight']}, "
-                f"{state['block'][0]}, {state['block'][1]}, {state['block'][2]})"
+                f"{block[0]}, {block[1]}, {block[2]})"
             )
-            state["name"], state["m2"], state["weight"] = merged
+            # The accumulators live outside the loop, so the merge is written
+            # back into them: that is what carries the running statistics.
+            self.emit(f"{state['name']} = {merged[0]}")
+            self.emit(f"{state['m2']} = {merged[1]}")
+            self.emit(f"{state['weight']} = {merged[2]}")
 
     def _welford_block(self, source: str, state: dict) -> None:
         """Reduce one block's worth of elements to (mean, m2, weight)."""
@@ -671,14 +678,6 @@ def emit_group_source(group: FusedGroup, buffers: dict, stored: set, config: Lau
     xnumel = int(group.xnumel)
     rnumel = int(group.rnumel)
     has_r = rnumel > 1
-    digest = hashlib.sha1(
-        "|".join(
-            [str(v) for v in config.key()]
-            + [str(xnumel), str(rnumel)]
-            + sorted(g.ptr_order)
-        ).encode()
-    ).hexdigest()[:12]
-    kernel_name = f"stax_loop_{digest}"
     head = [
         "xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)",
         "xi = xindex[:, None]",
@@ -704,6 +703,15 @@ def emit_group_source(group: FusedGroup, buffers: dict, stored: set, config: Lau
             body += textwrap.indent("\n".join(g.loop), "    ").splitlines()
         body += g.post
     body += g.epilogue
+    # The kernel is named after its own body, so two groups that differ in any
+    # way get different names and a cached launcher is never handed to a group
+    # it was not generated for.
+    digest = hashlib.sha1(
+        "\n".join(body).encode()
+        + repr(tuple(config.key())).encode()
+        + repr(sorted(g.ptr_order)).encode()
+    ).hexdigest()[:12]
+    kernel_name = f"stax_loop_{digest}"
     signature = [f"p{position}" for position in range(len(g.ptr_order))] + ["xnumel"]
     if has_r:
         signature.append("rnumel")
@@ -799,11 +807,12 @@ def compile_group(
 
     if not HAS_TRITON:
         raise PlanError("Triton is not available")
-    key = (id(group), config.key())
-    hit = _launch_memo.get(key)
+    kernel_name, source, ptr_names = emit_group_source(group, buffers, stored, config)
+    # The name is a digest of the body, the config and the pointers, so a
+    # cached launcher can only ever be reused for an identical kernel.
+    hit = _launch_memo.get(kernel_name)
     if hit is not None:
         return hit
-    kernel_name, source, ptr_names = emit_group_source(group, buffers, stored, config)
     try:
         from ..codecache import default_cache
 
@@ -825,7 +834,7 @@ def compile_group(
     namespace: dict = {"__name__": "tensorplay_stax_loop", "triton": triton}
     exec(compile(source, fake_file, "exec"), namespace, namespace)
     result = (namespace["kernel_launch"], ptr_names)
-    _launch_memo[key] = result
+    _launch_memo[kernel_name] = result
     return result
 
 

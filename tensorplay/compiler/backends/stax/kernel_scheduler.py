@@ -220,6 +220,39 @@ def placement(node: LoopNode, xnumel: int, rnumel: int) -> NodePlacement | None:
 
 
 # ---------------------------------------------------------------------------
+# emission order inside one kernel
+# ---------------------------------------------------------------------------
+
+#: A kernel emits its parts in a fixed order: work that only walks the x index
+#: first, then the reduction loops, then the consumers of the row results.
+PROLOGUE = 0
+BODY = 1
+EPILOGUE = 2
+
+
+def emission_regions(nodes, placements, written) -> dict:
+    """Which part of a kernel each node's arithmetic belongs to."""
+
+    regions = {}
+    for node in nodes:
+        if node.is_reduction or placements[id(node)].full:
+            regions[id(node)] = BODY
+            continue
+        needs_row_result = any(
+            load.args[0] in written and written[load.args[0]][0].is_reduction
+            for load in node.body.loads
+        )
+        regions[id(node)] = EPILOGUE if needs_row_result else PROLOGUE
+    return regions
+
+
+def emission_order(regions: dict, node: LoopNode) -> tuple:
+    """Sort key matching the order the code generator emits nodes in."""
+
+    return (regions[id(node)], node.index)
+
+
+# ---------------------------------------------------------------------------
 # scheduler
 # ---------------------------------------------------------------------------
 
@@ -399,16 +432,19 @@ class KernelScheduler:
             if p is None:
                 return None
             placements[id(n)] = p
-        # no path first -> (outside) -> second
-        if self._reaches_through_outside(first, second, groups, group_of, gdeps):
+        # Merging must not close a loop: if either side depends on the other
+        # through a group that stays outside, the merged kernel would have to
+        # run both before and after that group.
+        if self._depends_through_outside(first, second, groups, group_of, gdeps):
             return None
-        if self._reaches_through_outside(second, first, groups, group_of, gdeps):
+        if self._depends_through_outside(second, first, groups, group_of, gdeps):
             return None
         # every in-kernel read must be thread- or row-local
         written = {}
         for n in nodes:
             for b in n.buffers:
                 written[b.name] = (n, b)
+        regions = emission_regions(nodes, placements, written)
         for n in nodes:
             p = placements[id(n)]
             for load in n.body.loads:
@@ -417,6 +453,11 @@ class KernelScheduler:
                     continue
                 producer, buffer = written[name]
                 if producer is n:
+                    return None
+                if emission_order(regions, producer) >= emission_order(regions, n):
+                    # The program emits whole regions in order, so a value the
+                    # consumer wants is only in a register once its producer
+                    # has been emitted.
                     return None
                 pp = placements[id(producer)]
                 store = pp.store_index(buffer)
@@ -429,36 +470,43 @@ class KernelScheduler:
                     # A nest that runs inside the reduction loops cannot read
                     # the row result: it only exists once the loops are done.
                     return None
-                if not producer.is_reduction and pp.full != p.full and p.full:
-                    # an x-only value read inside the loops: fine (broadcast)
-                    pass
                 if not producer.is_reduction and pp.full and not p.full:
                     return None
         ordered = sorted(nodes, key=lambda n: n.index)
         return FusedGroup(ordered, xnumel, rnumel)
 
-    def _reaches_through_outside(self, src, dst, groups, group_of, gdeps) -> bool:
-        """Does ``dst`` depend on ``src`` through some other group?"""
+    def _depends_through_outside(self, src, dst, groups, group_of, gdeps) -> bool:
+        """Does ``dst`` depend on ``src`` through some other group?
+
+        Such a dependency forbids the merge: ``src`` would move into the
+        merged kernel, while the group in between still needs ``src``'s
+        result and ``dst`` still needs that group's.
+        """
 
         src_id = None
-        for gid, g in groups.items():
-            if g is src:
+        for gid, group in groups.items():
+            if group is src:
                 src_id = gid
-        dst_deps = [d for d in gdeps(dst) if d != src_id]
-        seen = set()
-        stack = list(dst_deps)
+        if src_id is None:
+            return True
+        seen: set = set()
+        stack = [d for d in gdeps(dst) if d != src_id]
         while stack:
             gid = stack.pop()
+            if gid == src_id:
+                return True
             if gid in seen:
                 continue
             seen.add(gid)
-            if gid == src_id:
-                return True
-            g = groups.get(gid)
-            if g is None:
+            group = groups.get(gid)
+            if group is None:
                 continue
-            stack.extend(gdeps(g))
+            stack.extend(gdeps(group))
         return False
 
 
-__all__ = ["ExternNode", "FusedGroup", "KernelScheduler", "LoopNode", "NodePlacement", "RINDEX", "XINDEX", "placement"]
+__all__ = [
+    "BODY", "EPILOGUE", "PROLOGUE", "ExternNode", "FusedGroup", "KernelScheduler",
+    "LoopNode", "NodePlacement", "RINDEX", "XINDEX", "emission_order",
+    "emission_regions", "placement",
+]

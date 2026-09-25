@@ -41,7 +41,7 @@ class FusedStep(Step):
                 continue
             env[name] = tp.empty(
                 buffer.get_size(),
-                dtype=buffer.layout.dtype,
+                dtype=_dtype_of(buffer.layout.dtype),
                 device=buffer.layout.device,
             )
         self.launch([env[name] for name in self.ptr_names])
@@ -63,6 +63,19 @@ class ExternStep(Step):
         result = target(*args, **kwargs)
         for output in self.kernel.outputs:
             env[output.name] = _dig(result, output.path)
+
+
+def _dtype_of(layout_dtype: Any):
+    """The framework element type for a layout.
+
+    Lowerings name the element type either as a framework type or by its
+    name, and the loop algebra only ever looks at the name, so both spellings
+    reach allocation.
+    """
+
+    if isinstance(layout_dtype, str):
+        return getattr(tp, layout_dtype)
+    return layout_dtype
 
 
 def _resolve(value: Any, env: dict) -> Any:
