@@ -43,14 +43,21 @@ P10_API std::string get_parallel_info();
 
 namespace internal {
 
-// Initializes num_threads lazily at the first parallel call.
+// Initializes num_threads lazily on the first parallel call of each thread;
+// the OpenMP team-size ICV is per thread, so every joining thread must run
+// this before dispatching parallel work.
 inline void lazy_init_num_threads() {
-  static bool init = false;
+  static thread_local bool init = false;
   if (!init) {
     init_num_threads();
     init = true;
   }
 }
+
+// Team-size cap for OpenMP-backed GEMM kernels (oneDNN) on hybrid CPUs with
+// two frequency tiers; 0 when no cap applies (uniform-frequency parts).
+// Explicit thread counts (environment, set_num_threads) bypass it.
+P10_API int hybrid_thread_cap();
 
 P10_API void set_thread_num(int id);
 

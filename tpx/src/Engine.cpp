@@ -4,6 +4,7 @@
 #include "ManualNodes.h"
 #include "Exception.h"
 #include "LinearAlgebraNames.h"
+#include "Parallel.h"
 #include "Profiler.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #ifdef USE_CUDA
@@ -202,6 +203,10 @@ ReadyQueue* Engine::queue_for_device(int device_index) {
 }
 
 void Engine::worker_main(ReadyQueue& queue) {
+    // The OpenMP team-size ICV is per thread; kernels dispatched by nodes
+    // (oneDNN primitive creation, GEMM blocking) read the executing thread's
+    // team size, so seed the intra-op configuration before the first task.
+    tensorplay::parallel::init_num_threads();
     TP_ENGINE_TRACE("worker started");
     for (;;) {
         auto task = queue.pop_until([] { return false; });

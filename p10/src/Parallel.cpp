@@ -4,12 +4,14 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <mutex>
 #include <queue>
 #include <sstream>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -101,6 +103,18 @@ int intraop_default_num_threads() {
   }();
   return cached;
 }
+
+bool env_pins_thread_count() {
+  const char* env = std::getenv("OMP_NUM_THREADS");
+  if (env && std::atoi(env) > 0) {
+    return true;
+  }
+  env = std::getenv("MKL_NUM_THREADS");
+  return env && std::atoi(env) > 0;
+}
+
+// Team-size cap for OpenMP-backed GEMM kernels (oneDNN) on parts with two
+// CPU frequency tiers lives in parallel::internal (see hybrid_thread_cap).
 
 // Persistent pool of worker threads. The calling (master) thread participates
 // in the work itself, so the pool holds nthreads - 1 workers.
@@ -242,6 +256,7 @@ struct ParallelRegionGuard {
 
 void init_num_threads() {
   int nthreads = num_intraop_threads.load();
+  const bool user_pinned = nthreads > 0;
   if (nthreads <= 0) {
     nthreads = intraop_default_num_threads();
   }
@@ -249,7 +264,18 @@ void init_num_threads() {
 #ifdef _OPENMP
   // oneDNN is invoked outside TensorPlay's native elementwise pool.  Keep its
   // ParallelOpenMP.cpp; forcing one thread here serializes every convolution.
-  omp_set_num_threads(nthreads);
+  // The OpenMP team size also decides how oneDNN blocks its GEMM kernels at
+  // primitive creation, so it must stay stable for the life of the process:
+  // a cap re-applied after a primitive was built for a different team size
+  // leaves part of the team idle, and the reverse floods the slow tier.
+  int omp_threads = nthreads;
+  if (!user_pinned && !env_pins_thread_count()) {
+    const int cap = internal::hybrid_thread_cap();
+    if (cap > 0 && cap < omp_threads) {
+      omp_threads = cap;
+    }
+  }
+  omp_set_num_threads(omp_threads);
 #endif
 
 #ifdef USE_MKL
@@ -352,6 +378,44 @@ std::string get_parallel_info() {
 }
 
 namespace internal {
+
+// Team-size cap for OpenMP-backed GEMM kernels (oneDNN) on parts with two
+// CPU frequency tiers.  A team spanning every logical CPU spreads GEMM tiles
+// onto the slow tier, and the slowest core paces the whole team through the
+// kernel's internal barriers; the straggler effect then dominates the
+// compute itself.  Cap the team near the fast-tier size, never below half
+// the logical count.  Uniform-frequency parts keep the full team; explicit
+// thread counts (environment or set_num_threads) are never second-guessed.
+int hybrid_thread_cap() {
+  static const int cached = []() -> int {
+#ifdef __linux__
+    std::vector<int> max_freqs;
+    for (int cpu = 0; cpu < 512; ++cpu) {
+      std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
+                         "/cpufreq/cpuinfo_max_freq";
+      std::FILE* f = std::fopen(path.c_str(), "re");
+      if (!f) break;
+      int khz = 0;
+      if (std::fscanf(f, "%d", &khz) == 1 && khz > 0) {
+        max_freqs.push_back(khz);
+      }
+      std::fclose(f);
+    }
+    if (max_freqs.size() > 1) {
+      const int top = *std::max_element(max_freqs.begin(), max_freqs.end());
+      const int bottom = *std::min_element(max_freqs.begin(), max_freqs.end());
+      if (top > bottom) {  // two tiers -> hybrid
+        int fast = 0;
+        for (int f : max_freqs) fast += (f == top);
+        const int logical = static_cast<int>(max_freqs.size());
+        return std::max(fast, logical / 2);
+      }
+    }
+#endif
+    return 0;
+  }();
+  return cached;
+}
 
 void set_thread_num(int id) {
   thread_num_ = id;
