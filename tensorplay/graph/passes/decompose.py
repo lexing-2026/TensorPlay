@@ -747,11 +747,41 @@ def _rewrite(
     return PassResult(graph_module, True)
 
 
+#: Composites the capture pipeline leaves whole.  Each one is a single fused
+#: kernel on every device, and it carries its own gradient rule, so the
+#: primitive chain buys no coverage.  What it does cost is visible in a joint
+#: forward/backward capture: every intermediate the chain introduces stays
+#: materialized until the backward reads it, and the per-primitive gradients
+#: need the exponential output, the sum and the quotient alike where the fused
+#: gradient needs the input alone.  Only names the native graph spells as one
+#: node belong here; ``swish`` stays in the table because that vocabulary spells
+#: it as the sigmoid product.
+_FUSED_COMPOSITES = frozenset({"silu"})
+
+#: The table :class:`DecomposePass` rewrites with, resolved after every rule
+#: above has registered itself.
+_CAPTURE_METHODS: Dict[str, Callable[[Graph, Node], Node]] = {
+    name: rule
+    for name, rule in _DECOMP_METHODS.items()
+    if name not in _FUSED_COMPOSITES
+}
+
+
+def fused_composite_names() -> frozenset:
+    """Composite operator names :class:`DecomposePass` keeps fused."""
+    return _FUSED_COMPOSITES
+
+
 class DecomposePass(PassBase):
-    """Rewrite registered composite methods into derivative-covered primitives."""
+    """Rewrite registered composite methods into derivative-covered primitives.
+
+    Names in :func:`fused_composite_names` keep their fused form; their rules
+    stay registered for callers that expand a chain on purpose because the
+    expansion is about to be fused back into one kernel.
+    """
 
     def __call__(self, graph_module: GraphModule) -> PassResult:
-        return _rewrite(graph_module, _DECOMP_METHODS)
+        return _rewrite(graph_module, _CAPTURE_METHODS)
 
 
 class DecomposeRowNormalizations(PassBase):

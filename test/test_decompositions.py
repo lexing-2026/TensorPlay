@@ -6,7 +6,7 @@ import pytest
 
 import tensorplay as tp
 from tensorplay.graph import Tracer
-from tensorplay.graph.passes import DecomposePass
+from tensorplay.graph.passes import DecomposePass, fused_composite_names
 from tensorplay._stax import build_aot
 from tensorplay.nn import functional as F
 
@@ -157,7 +157,6 @@ def test_decomposed_op_compiles_to_native_graph(name):
 _DECOMP_GRAD_CASES = {
     "softplus": lambda x: tp.softplus(x),
     "mish": lambda x: tp.mish(x),
-    "silu": lambda x: tp.silu(x),
     "logit": lambda x: tp.logit(x),
     "sinh": lambda x: tp.sinh(x),
     "cosh": lambda x: tp.cosh(x),
@@ -188,11 +187,59 @@ def test_decomposed_grad_matches_eager(name):
     )
 
 
+def test_fused_composite_stays_whole_and_keeps_its_gradient():
+    """保留融合的复合算子不展开：原生图按单节点执行，梯度仍走它自己的求导式。"""
+    assert "silu" in fused_composite_names()
+
+    def loss(v):
+        return (tp.silu(v * v) * 2).sum()
+
+    xa = tp.tensor([0.7], requires_grad=True)
+    loss(xa).backward()
+    grad_eager = [float(g) for g in xa.grad.tolist()]
+
+    gm = Tracer().trace(loss, sample_inputs={"v": tp.tensor([0.7], requires_grad=True)})
+    res = DecomposePass()(gm)
+    assert res.modified is False
+    interpreted = gm.recompile()
+    xb = tp.tensor([0.7], requires_grad=True)
+    interpreted(xb).backward()
+    assert [float(g) for g in xb.grad.tolist()] == pytest.approx(
+        grad_eager, rel=1e-5
+    )
+
+
+def test_fused_composite_lowers_to_one_native_node():
+    from tensorplay.graph.passes import (
+        ConstFold,
+        DeadCodeElimination,
+        NormalizeOperators,
+        PassManager,
+    )
+    from tensorplay._stax.stax import stax
+
+    def fn(x):
+        return tp.silu(x) * 2
+
+    x = tp.tensor([0.7])
+    gm = _trace(fn, {"x": x})
+    PassManager(
+        [
+            NormalizeOperators(),
+            ConstFold(),
+            DecomposePass(),
+            DeadCodeElimination(),
+        ]
+    )(gm)
+    compiled = stax(gm, [x])
+    assert getattr(gm, "_stax_native_graph", None) is not None
+    assert abs(float(compiled(x)[0]) - float(fn(x)[0])) < 1e-5
+
+
 def test_lerp_and_addcmul_decompose():
     s = tp.tensor([1.0])
     e = tp.tensor([3.0])
     assert abs(float(tp.lerp(s, e, 0.25)[0]) - 1.5) < 1e-6
-
     inp = tp.tensor([10.0])
     t1 = tp.tensor([2.0])
     t2 = tp.tensor([5.0])

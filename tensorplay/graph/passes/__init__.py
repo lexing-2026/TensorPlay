@@ -6,6 +6,7 @@ from .dead_code_elimination import DeadCodeElimination
 from .decompose import (
     DecomposePass,
     DecomposeRowNormalizations,
+    fused_composite_names,
     row_normalization_names,
 )
 from .fusion_hint import POINTWISE_FUSED_OP_NAMES, PointwiseFusionHint
@@ -84,6 +85,7 @@ __all__ = [
     "DeadCodeElimination",
     "DecomposePass",
     "DecomposeRowNormalizations",
+    "fused_composite_names",
     "row_normalization_names",
     "GraphDrawer",
     "GraphAccFusionsFinder",
