@@ -195,7 +195,13 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/CopyKernels.cu
         src/backend/cuda/HalfGemmKernels.cu
         src/backend/cuda/Cross.cu
-        src/backend/cuda/SparseKernels.cu
+        src/backend/cuda/sparse/CopySparseKernels.cu
+        src/backend/cuda/sparse/SparseFactoriesKernels.cu
+        src/backend/cuda/sparse/SparseTensorMathKernels.cu
+        src/backend/cuda/sparse/SparseCsrTensorMathKernels.cu
+        src/backend/cuda/sparse/SparseBinaryOpIntersectionKernels.cu
+        src/backend/cuda/sparse/SparseMatMulKernels.cu
+        src/backend/cuda/EmbeddingSparseBackwardKernels.cu
         src/backend/cuda/SpdiagsKernels.cu
         src/backend/cuda/SemiStructuredKernels.cu
         src/backend/cuda/QuantKernels.cu
@@ -247,11 +253,11 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/CudaTunable.cpp
         src/backend/cuda/ActivationKernels.cu
         src/backend/cuda/SoftmaxKernels.cu
-        src/backend/cuda/LayerNormKernels.cu
-        src/backend/cuda/GroupNormKernels.cu
-        src/backend/cuda/BatchNormKernels.cu
-        src/backend/cuda/RMSNormKernels.cu
-        src/backend/cuda/InstanceNormKernels.cu
+        src/backend/cuda/norm/LayerNormKernels.cu
+        src/backend/cuda/norm/GroupNormKernels.cu
+        src/backend/cuda/norm/BatchNormKernels.cu
+        src/backend/cuda/norm/RMSNormKernels.cu
+        src/backend/cuda/norm/InstanceNormKernels.cu
         src/backend/cuda/LossFillKernels.cu
         src/backend/cuda/LossCTC.cu
         src/backend/cuda/ConvKernels.cu
@@ -287,9 +293,9 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/SamplingKernels.cu
         src/backend/cuda/TensorTopK.cu
         src/backend/cuda/SpecialAliasKernels.cu
-        src/backend/cuda/AttentionKernels.cu
-        src/backend/cuda/AttentionGemmKernels.cu
-        src/backend/cuda/AttentionRopeKernels.cu
+        src/backend/cuda/transformers/AttentionKernels.cu
+        src/backend/cuda/transformers/AttentionGemmKernels.cu
+        src/backend/cuda/transformers/AttentionRopeKernels.cu
         src/backend/cuda/GroupedGemmKernels.cu
         src/backend/cuda/IndexingKernels.cu
         src/backend/cuda/MaskedKernels.cu
@@ -871,9 +877,12 @@ if(USE_ROCM)
     target_include_directories(p10 SYSTEM PRIVATE ${TP_HIP_INCLUDE_DIRS})
 endif()
 # Backend-internal cross-directory includes (e.g. backend/vulkan/... from
-# cpu kernels) resolve against src/.
+# cpu kernels) resolve against src/.  The CUDA backend root is on the path as
+# well so a family kept in a subdirectory still reaches the headers that sit
+# beside the other families.
 target_include_directories(p10 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/cuda
 )
 # hand-written tpx headers (Autograd.h, Node.h).  Expose tpx/include so those
 # generated/native translation units resolve.
