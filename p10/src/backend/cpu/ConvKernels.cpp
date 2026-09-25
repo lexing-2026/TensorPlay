@@ -1120,6 +1120,8 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         if (input.unsafeGetTensorImpl()->has_onednn_md()) {
              auto stored_md = std::static_pointer_cast<memory::desc>(input.unsafeGetTensorImpl()->get_onednn_md());
              user_src_md = *stored_md;
+        } else if (input.is_contiguous(MemoryFormat::ChannelsLast)) {
+             user_src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::nhwc);
         } else {
              user_src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::nchw);
         }
@@ -1259,8 +1261,10 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         
         // 3. Output
         memory dst_mem;
-        auto user_dst_md = memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::nchw);
-        
+        auto user_dst_md = output.is_contiguous(MemoryFormat::ChannelsLast)
+            ? memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::nhwc)
+            : memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::nchw);
+
         // If expected layout is different from NCHW, we need a temporary buffer
         bool need_reorder_dst = (expected_dst_md != user_dst_md);
         Storage blocked_storage_handle; // Keep alive
@@ -1613,7 +1617,11 @@ static bool conv2d_grad_input_nhwc(
         auto& bwd = entry.prim;
         auto& bwd_pd = entry.pd;
 
-        Tensor grad_output_nhwc = grad_output.contiguous().permute({0, 2, 3, 1}).contiguous();
+        // grad_output arrives row-major or channels-last; a channels-last
+        // buffer is already in the NHWC order the primitive consumes.
+        Tensor grad_output_nhwc = grad_output.is_contiguous(MemoryFormat::ChannelsLast)
+            ? grad_output
+            : grad_output.permute({0, 2, 3, 1}).contiguous();
         Tensor weight_hwio = weight.contiguous().permute({2, 3, 1, 0}).contiguous();
 
         memory src_mem(src_md, eng, grad_output_nhwc.data_ptr<float>());
@@ -1633,10 +1641,17 @@ static bool conv2d_grad_input_nhwc(
         bwd.execute(s, args);
         s.wait();
 
-        Tensor grad_input_nchw = grad_input_nhwc.permute({0, 3, 1, 2}).contiguous();
-        if (grad_input.numel() == grad_input_nchw.numel()) {
-            std::memcpy(grad_input.data_ptr<float>(), grad_input_nchw.data_ptr<float>(),
-                       grad_input.numel() * sizeof(float));
+        if (grad_input.is_contiguous(MemoryFormat::ChannelsLast)) {
+            // The primitive's diff-src order already matches the output
+            // buffer's storage order; copy it across directly.
+            std::memcpy(grad_input.data_ptr<float>(), grad_input_nhwc.data_ptr<float>(),
+                        grad_input.numel() * sizeof(float));
+        } else {
+            Tensor grad_input_nchw = grad_input_nhwc.permute({0, 3, 1, 2}).contiguous();
+            if (grad_input.numel() == grad_input_nchw.numel()) {
+                std::memcpy(grad_input.data_ptr<float>(), grad_input_nchw.data_ptr<float>(),
+                           grad_input.numel() * sizeof(float));
+            }
         }
         return true;
     } catch (...) {
@@ -1773,8 +1788,14 @@ static bool conv2d_grad_weight_nhwc(
         auto& bwd_w = entry.prim;
         auto& bwd_w_pd = entry.pd;
 
-        Tensor input_nhwc = input.contiguous().permute({0, 2, 3, 1}).contiguous();
-        Tensor grad_output_nhwc = grad_output.contiguous().permute({0, 2, 3, 1}).contiguous();
+        // Row-major buffers need one permute-copy; channels-last buffers are
+        // already stored in the NHWC order the primitive consumes.
+        Tensor input_nhwc = input.is_contiguous(MemoryFormat::ChannelsLast)
+            ? input
+            : input.permute({0, 2, 3, 1}).contiguous();
+        Tensor grad_output_nhwc = grad_output.is_contiguous(MemoryFormat::ChannelsLast)
+            ? grad_output
+            : grad_output.permute({0, 2, 3, 1}).contiguous();
 
         memory src_mem(src_md, eng, input_nhwc.data_ptr<float>());
         memory diff_dst_mem(diff_dst_md, eng, grad_output_nhwc.data_ptr<float>());
@@ -1816,10 +1837,11 @@ static bool conv2d_grad_input_onednn(const Tensor& grad_output, const Tensor& in
     // std::cout << "DEBUG: conv2d_grad_input_onednn called" << std::endl;
     if (input.dtype() != DType::Float32) return false;
 
-    // Ensure contiguous or blocked
-    Tensor input_c = (input.is_contiguous() || input.unsafeGetTensorImpl()->has_onednn_md()) ? input : detail::contiguous_clone(input);
+    // Accept row-major, channels-last, or engine-tagged buffers as-is; the
+    // user-memory descriptors below are derived from each tensor's layout.
+    Tensor input_c = (input.is_contiguous() || input.is_contiguous(MemoryFormat::ChannelsLast) || input.unsafeGetTensorImpl()->has_onednn_md()) ? input : detail::contiguous_clone(input);
     Tensor weight_c = (weight.is_contiguous() || weight.unsafeGetTensorImpl()->has_onednn_md()) ? weight : detail::contiguous_clone(weight);
-    Tensor grad_output_c = (grad_output.is_contiguous() || grad_output.unsafeGetTensorImpl()->has_onednn_md()) ? grad_output : detail::contiguous_clone(grad_output);
+    Tensor grad_output_c = (grad_output.is_contiguous() || grad_output.is_contiguous(MemoryFormat::ChannelsLast) || grad_output.unsafeGetTensorImpl()->has_onednn_md()) ? grad_output : detail::contiguous_clone(grad_output);
 
     try {
         auto& eng = OneDNNContext::get_engine();
@@ -1971,7 +1993,9 @@ static bool conv2d_grad_input_onednn(const Tensor& grad_output, const Tensor& in
                      reorder(src, diff_dst_mem).execute(s, src, diff_dst_mem);
                  }
             } else {
-                 auto user_md = memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::nchw);
+                 auto user_tag = grad_output_c.is_contiguous(MemoryFormat::ChannelsLast)
+                     ? memory::format_tag::nhwc : memory::format_tag::nchw;
+                 auto user_md = memory::desc(dst_dims, memory::data_type::f32, user_tag);
                  auto user_mem = memory(user_md, eng, grad_output_c.data_ptr<float>());
                  if (user_md != expected_diff_dst_md) {
                      // std::cout << "DEBUG: Reordering grad_output (NCHW) in conv2d_grad_input_onednn" << std::endl;
@@ -2067,7 +2091,9 @@ static bool conv2d_grad_input_onednn(const Tensor& grad_output, const Tensor& in
 
         // Prepare Diff Src (grad_input)
         memory diff_src_mem;
-        auto user_diff_src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::nchw);
+        auto user_diff_src_tag = grad_input.is_contiguous(MemoryFormat::ChannelsLast)
+            ? memory::format_tag::nhwc : memory::format_tag::nchw;
+        auto user_diff_src_md = memory::desc(src_dims, memory::data_type::f32, user_diff_src_tag);
         bool need_reorder_diff_src = (expected_diff_src_md != user_diff_src_md);
         Storage blocked_storage_handle;
 
@@ -2120,9 +2146,10 @@ static bool conv2d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
     // std::cout << "DEBUG: conv2d_grad_weight_onednn called" << std::endl;
     if (input.dtype() != DType::Float32) return false;
 
-    // Ensure contiguous or blocked
-    Tensor input_c = (input.is_contiguous() || input.unsafeGetTensorImpl()->has_onednn_md()) ? input : detail::contiguous_clone(input);
-    Tensor grad_output_c = (grad_output.is_contiguous() || grad_output.unsafeGetTensorImpl()->has_onednn_md()) ? grad_output : detail::contiguous_clone(grad_output);
+    // Accept row-major, channels-last, or engine-tagged buffers as-is; the
+    // user-memory descriptors below are derived from each tensor's layout.
+    Tensor input_c = (input.is_contiguous() || input.is_contiguous(MemoryFormat::ChannelsLast) || input.unsafeGetTensorImpl()->has_onednn_md()) ? input : detail::contiguous_clone(input);
+    Tensor grad_output_c = (grad_output.is_contiguous() || grad_output.is_contiguous(MemoryFormat::ChannelsLast) || grad_output.unsafeGetTensorImpl()->has_onednn_md()) ? grad_output : detail::contiguous_clone(grad_output);
 
     try {
         auto& eng = OneDNNContext::get_engine();
@@ -2263,7 +2290,9 @@ static bool conv2d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
                  reorder(src, src_mem).execute(s, src, src_mem);
              }
         } else {
-             auto user_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::nchw);
+             auto user_tag = input_c.is_contiguous(MemoryFormat::ChannelsLast)
+                 ? memory::format_tag::nhwc : memory::format_tag::nchw;
+             auto user_md = memory::desc(src_dims, memory::data_type::f32, user_tag);
              auto user_mem = memory(user_md, eng, input_c.data_ptr<float>());
              if (user_md != expected_src_md) {
                  // std::cout << "DEBUG: Reordering input (NCHW) in conv2d_grad_weight_onednn" << std::endl;
@@ -2321,7 +2350,9 @@ static bool conv2d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
                       reorder(src, diff_dst_mem).execute(s, src, diff_dst_mem);
                   }
              } else {
-                  auto user_md = memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::nchw);
+                  auto user_tag = grad_output_c.is_contiguous(MemoryFormat::ChannelsLast)
+                      ? memory::format_tag::nhwc : memory::format_tag::nchw;
+                  auto user_md = memory::desc(dst_dims, memory::data_type::f32, user_tag);
                   auto user_mem = memory(user_md, eng, grad_output_c.data_ptr<float>());
                    if (user_md != expected_diff_dst_md) {
                       // DISABLED in-place storage swap: mutating the grad_output storage breaks
@@ -2610,8 +2641,37 @@ bool onednn_claims_conv2d(const Tensor& input, const Tensor& weight,
 } // namespace
 #endif // USE_ONEDNN
 
+// Gate for the channels-last fast path: the layout is honored when either
+// operand already carries it; the conv result adopts the same layout so
+// consecutive convolutions reuse it without repacking.
+static bool conv2d_use_channels_last(const Tensor& input, const Tensor& weight) {
+    return input.dim() == 4 && weight.dim() == 4 &&
+           (input.is_contiguous(MemoryFormat::ChannelsLast) ||
+            weight.is_contiguous(MemoryFormat::ChannelsLast));
+}
+
+// Materialize `t` in the requested activation layout. Tensors already stored
+// in that layout pass through without a copy.
+static Tensor contiguous_in(const Tensor& t, bool channels_last) {
+    if (!channels_last) return t.contiguous();
+    if (t.is_contiguous(MemoryFormat::ChannelsLast)) return t;
+    return detail::contiguous_impl(t, static_cast<int64_t>(MemoryFormat::ChannelsLast));
+}
+
+// Freshly allocated tensor with channels-last strides over a dense buffer.
+static Tensor empty_channels_last(const std::vector<int64_t>& sizes, DType dt, const Device& dev) {
+    Tensor out = Tensor::empty(sizes, dt, dev);
+    return out.as_strided(sizes, get_channels_last_strides(sizes), 0);
+}
+
+static Tensor zeros_channels_last(const std::vector<int64_t>& sizes, DType dt, const Device& dev) {
+    Tensor out = Tensor::zeros(sizes, dt, dev);
+    return out.as_strided(sizes, get_channels_last_strides(sizes), 0);
+}
+
 static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg, const Tensor& bias, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups, bool fused_relu) {
-    Tensor input = input_arg.contiguous();
+    const bool use_cl = conv2d_use_channels_last(input_arg, weight_arg);
+    Tensor input = contiguous_in(input_arg, use_cl);
     Tensor weight = weight_arg.contiguous();
     
     if (input.dim() != 4 || weight.dim() != 4) TP_THROW(RuntimeError, "conv2d: Expected 4D input and weight");
@@ -2667,7 +2727,11 @@ static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg,
         return full.slice(2, 0, H_out).slice(3, 0, W_out);
     }
 
-    Tensor out = Tensor::empty({N, C_out, H_out, W_out}, input.dtype(), input.device());
+    const std::vector<int64_t> out_sizes{N, C_out, H_out, W_out};
+    // The accelerated paths honor a channels-last request; the buffer only
+    // stays in that layout when such a path actually claims the call.
+    Tensor out = use_cl ? empty_channels_last(out_sizes, input.dtype(), input.device())
+                        : Tensor::empty(out_sizes, input.dtype(), input.device());
 
     bool handled = false;
 #ifdef USE_ONEDNN
@@ -2679,6 +2743,15 @@ static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg,
 #endif
     if (handled) {
         return out;
+    }
+
+    // Native paths below address activations and the output buffer as
+    // row-major; fall back to the canonical layout for them.
+    if (!out.is_contiguous()) {
+        out = Tensor::empty(out_sizes, input.dtype(), input.device());
+    }
+    if (!input.is_contiguous()) {
+        input = input.contiguous();
     }
 
 #ifdef USE_NNPACK
@@ -3570,10 +3643,14 @@ static bool conv_transpose3d_onednn(const Tensor& input, const Tensor& weight, c
 }
 #endif // USE_ONEDNN
 
-Tensor conv_transpose2d_cpu(const Tensor& input, const Tensor& weight, const Tensor& bias, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& output_padding_arg, int64_t groups, const std::vector<int64_t>& dilation_arg) {
+Tensor conv_transpose2d_cpu(const Tensor& input_arg, const Tensor& weight_arg, const Tensor& bias, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& output_padding_arg, int64_t groups, const std::vector<int64_t>& dilation_arg) {
     // Input: (N, C_in, H_in, W_in)
     // Weight: (C_in, C_out/groups, kH, kW) - NOTE: Inverted compared to conv2d!
     // Output: (N, C_out, H_out, W_out)
+    // The kernels below address activations as row-major; a channels-last
+    // operand is materialized in the canonical layout here.
+    const Tensor input = input_arg.contiguous();
+    const Tensor weight = weight_arg.contiguous();
     if (conv_is_low_precision(input.dtype())) {
         return conv_transpose2d_cpu(input.to(DType::Float32), weight.to(DType::Float32),
                                     (bias.defined() && bias.numel() > 0) ? bias.to(DType::Float32) : bias,
@@ -3923,15 +4000,21 @@ Tensor conv2d_grad_input_cpu(const Tensor& grad_output, const Tensor& input, con
     int64_t H_out = grad_output.size(2);
     int64_t W_out = grad_output.size(3);
 
-    Tensor grad_input = Tensor::zeros({N, C_in, H_in, W_in}, input.dtype(), input.device());
-    
-    Tensor grad_output_contig = grad_output.contiguous();
+    // Grad buffers follow the activation layout the forward chain produced,
+    // so the gradient keeps flowing without a repack at this boundary.
+    const bool use_cl = conv2d_use_channels_last(input, weight);
+    Tensor grad_input = use_cl
+        ? zeros_channels_last({N, C_in, H_in, W_in}, input.dtype(), input.device())
+        : Tensor::zeros({N, C_in, H_in, W_in}, input.dtype(), input.device());
+
+    Tensor grad_output_contig = contiguous_in(grad_output, use_cl);
 
     // Optimization: 1x1 NCHW MatMul (User Request: MatMul Algorithm)
-    bool is_1x1_s1 = (groups == 1 && kH == 1 && kW == 1 && sH == 1 && sW == 1 && 
+    bool is_1x1_s1 = (groups == 1 && kH == 1 && kW == 1 && sH == 1 && sW == 1 &&
                       dH == 1 && dW == 1 && pH == 0 && pW == 0);
 
-    if (is_1x1_s1 && input.is_contiguous() && weight.is_contiguous() && 
+    if (is_1x1_s1 && input.is_contiguous() && weight.is_contiguous() &&
+        grad_output_contig.is_contiguous() && grad_input.is_contiguous() &&
         input.dtype() == DType::Float32 && !input.unsafeGetTensorImpl()->has_onednn_md()) {
          
          // GradInput = Weight^T * GradOutput
@@ -3985,7 +4068,15 @@ Tensor conv2d_grad_input_cpu(const Tensor& grad_output, const Tensor& input, con
         return grad_input;
     }
     #endif
-    
+
+    // The col2im fallback addresses the grad buffer as row-major.
+    if (!grad_output_contig.is_contiguous()) {
+        grad_output_contig = grad_output_contig.contiguous();
+    }
+    if (!grad_input.is_contiguous()) {
+        grad_input = Tensor::zeros({N, C_in, H_in, W_in}, input.dtype(), input.device());
+    }
+
     if (input.dtype() == DType::Float32) {
         int64_t C_out_group = C_out / groups;
         int64_t col_size = C_in_group * kH * kW;
@@ -4048,8 +4139,11 @@ static Tensor conv2d_grad_weight_cpu_impl(const Tensor& grad_output, const Tenso
         auto dilation = expand_param(dilation_arg, 2, "dilation");
         return slow_conv2d_grad_weight(grad_output, input, weight, stride, padding, dilation, groups);
     }
-    Tensor grad_output_contig = grad_output.contiguous();
-    Tensor input_contig = input.contiguous();
+    // Feed the backward kernels in the activation layout the forward chain
+    // produced; already-matching buffers pass through without a copy.
+    const bool use_cl = conv2d_use_channels_last(input, weight);
+    Tensor grad_output_contig = contiguous_in(grad_output, use_cl);
+    Tensor input_contig = contiguous_in(input, use_cl);
     
     int64_t N = input_contig.size(0);
     int64_t C_in = input_contig.size(1);
@@ -4081,7 +4175,8 @@ static Tensor conv2d_grad_weight_cpu_impl(const Tensor& grad_output, const Tenso
     bool is_1x1_s1 = (groups == 1 && kH == 1 && kW == 1 && sH == 1 && sW == 1 && 
                       dH == 1 && dW == 1 && pH == 0 && pW == 0);
 
-    if (is_1x1_s1 && input_contig.is_contiguous() && weight.is_contiguous() && 
+    if (is_1x1_s1 && input_contig.is_contiguous() && weight.is_contiguous() &&
+        grad_output_contig.is_contiguous() &&
         input_contig.dtype() == DType::Float32 && !input_contig.unsafeGetTensorImpl()->has_onednn_md()) {
          
          // GradWeight = GradOutput * Input^T
@@ -4134,6 +4229,14 @@ static Tensor conv2d_grad_weight_cpu_impl(const Tensor& grad_output, const Tenso
         return grad_weight;
     }
     #endif
+
+    // The im2col fallback addresses the activation buffers as row-major.
+    if (!grad_output_contig.is_contiguous()) {
+        grad_output_contig = grad_output_contig.contiguous();
+    }
+    if (!input_contig.is_contiguous()) {
+        input_contig = input_contig.contiguous();
+    }
 
     if (input_contig.dtype() == DType::Float32) {
         int64_t C_out_group = C_out / groups;

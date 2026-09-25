@@ -115,6 +115,22 @@ inline void vec_run(vecunary::VOp op, const vecunary::VParams& prm,
 // tensors across all workers wins far more than the handoff costs.
 constexpr int64_t kUnaryGrain = 8192;
 
+// Elementwise compute is storage-order agnostic, so a channels-last input is
+// processed in its own physical order and the result keeps that layout
+// instead of being repacked row-major.
+static bool pointwise_keep_channels_last(const Tensor& t) {
+    return t.dim() == 4 && t.is_contiguous(MemoryFormat::ChannelsLast);
+}
+
+static Tensor empty_like_in_input_order(const Tensor& t, DType dt) {
+    const auto sizes = static_cast<std::vector<int64_t>>(t.shape());
+    Tensor result = Tensor::empty(sizes, dt, t.device());
+    if (pointwise_keep_channels_last(t)) {
+        result = result.as_strided(sizes, get_channels_last_strides(sizes), 0);
+    }
+    return result;
+}
+
 // Helper for operations that preserve dtype (e.g. abs, neg, square).
 // vec_op selects the AVX2 fast path (see cpu/VecUnary.h) for float/double;
 // the scalar lambda stays as the fallback for other dtypes and non-AVX2 hosts.
@@ -122,10 +138,11 @@ template<typename Func>
 Tensor unary_op_kernel(const Tensor& self, Func func,
                        vecunary::VOp vec_op = vecunary::VOp::None,
                        vecunary::VParams vec_prm = {}) {
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
+    const bool keep_cl = pointwise_keep_channels_last(self);
+    Tensor result = empty_like_in_input_order(self, self.dtype());
     int64_t n = self.numel();
 
-    Tensor self_contig = self.contiguous();
+    Tensor self_contig = keep_cl ? self : self.contiguous();
     // Vector fast paths exist only for f32/f64; other dtypes take the
     // scalar-lambda fallback and must never instantiate the vec calls.
     const bool vec_ok = vecunary::vec_ready() && vec_op != vecunary::VOp::None
@@ -168,10 +185,11 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func,
     if (isIntegralType(out_dtype)) {
         out_dtype = DType::Float32;
     }
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), out_dtype, self.device());
+    const bool keep_cl = pointwise_keep_channels_last(self);
+    Tensor result = empty_like_in_input_order(self, out_dtype);
     int64_t n = self.numel();
 
-    Tensor self_contig = self.contiguous();
+    Tensor self_contig = keep_cl ? self : self.contiguous();
     // Vector fast paths cover f32/f64 plus the widen-compute-narrow f16/bf16
     // kernels; integral inputs stay on the scalar-lambda fallback.
     const bool vec_ok = vecunary::vec_ready() && vec_op != vecunary::VOp::None
