@@ -198,6 +198,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/SparseKernels.cu
         src/backend/cuda/SemiStructuredKernels.cu
         src/backend/cuda/QuantKernels.cu
+        src/backend/cuda/FakeQuantKernels.cu
         src/backend/cuda/QuantIntComputeKernels.cu
         src/backend/cuda/QuantGemmKernels.cu
         src/backend/cuda/ForwardKernels.cu
