@@ -1418,13 +1418,18 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
                     ? memory::desc({key.oc}, memory::data_type::f32, memory::format_tag::x)
                     : memory::desc();
 
+                // Library-managed scratchpads are freshly mmapped on every
+                // execution; user mode lets the cached buffer below actually
+                // serve, keeping multi-hundred-MB im2col regions resident.
+                dnnl::primitive_attr sp_attr;
+                sp_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
                 // Stage 1: let the engine choose its blocked weights layout.
                 auto probe_pd = convolution_forward::primitive_desc(
                     eng, prop_kind::forward_inference, algorithm::convolution_auto,
                     memory::desc(src_dims_l, memory::data_type::f32, memory::format_tag::any),
                     weights_any, bias_md,
                     memory::desc(dst_dims_l, memory::data_type::f32, memory::format_tag::any),
-                    strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
+                    strides_dims, dilates_dims, padding_l_dims, padding_r_dims, sp_attr);
                 // Stage 2 (channels-last only): plain ndhwc activations +
                 // the chosen blocked weights run the fast brg kernel directly
                 // on the user's buffers with no per-call reorders.  A
@@ -1435,7 +1440,7 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
                         conv_pd = convolution_forward::primitive_desc(
                             eng, prop_kind::forward_inference, algorithm::convolution_auto,
                             user_src_md, probe_pd.weights_desc(), bias_md, user_dst_md,
-                            strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
+                            strides_dims, dilates_dims, padding_l_dims, padding_r_dims, sp_attr);
                     } catch (const dnnl::error&) {
                         conv_pd = probe_pd;
                     }
@@ -4710,20 +4715,25 @@ static bool conv3d_grad_input_onednn(const Tensor& grad_output, const Tensor& in
                 auto user_dst_md = memory::desc(dst_dims_l, memory::data_type::f32,
                                                 go_cl ? memory::format_tag::ndhwc
                                                       : memory::format_tag::ncdhw);
+                // Library-managed scratchpads are freshly mmapped on every
+                // execution; user mode lets the cached buffer below actually
+                // serve, keeping multi-hundred-MB im2col regions resident.
+                dnnl::primitive_attr sp_attr;
+                sp_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
                 auto probe_fwd = convolution_forward::primitive_desc(
                     eng, prop_kind::forward_inference, algorithm::convolution_auto,
                     memory::desc(src_dims_l, memory::data_type::f32, memory::format_tag::any),
                     memory::desc(weights_dims_l, memory::data_type::f32, memory::format_tag::any),
                     memory::desc(),
                     memory::desc(dst_dims_l, memory::data_type::f32, memory::format_tag::any),
-                    strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
+                    strides_dims, dilates_dims, padding_l_dims, padding_r_dims, sp_attr);
                 auto probe_pd = convolution_backward_data::primitive_desc(
                     eng, algorithm::convolution_auto,
                     memory::desc(src_dims_l, memory::data_type::f32, memory::format_tag::any),
                     memory::desc(weights_dims_l, memory::data_type::f32, memory::format_tag::any),
                     memory::desc(dst_dims_l, memory::data_type::f32, memory::format_tag::any),
                     strides_dims, dilates_dims, padding_l_dims, padding_r_dims,
-                    probe_fwd);
+                    probe_fwd, sp_attr);
                 // Stage 2 (channels-last only): plain ndhwc activations +
                 // blocked weights run the fast brg kernel on the user's
                 // buffers.  Row-major keeps the all-any primitive.
@@ -4732,12 +4742,12 @@ static bool conv3d_grad_input_onednn(const Tensor& grad_output, const Tensor& in
                         auto hint = convolution_forward::primitive_desc(
                             eng, prop_kind::forward_inference, algorithm::convolution_auto,
                             user_src_md, probe_pd.weights_desc(), memory::desc(), user_dst_md,
-                            strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
+                            strides_dims, dilates_dims, padding_l_dims, padding_r_dims, sp_attr);
                         pd = convolution_backward_data::primitive_desc(
                             eng, algorithm::convolution_auto,
                             user_src_md, probe_pd.weights_desc(), user_dst_md,
                             strides_dims, dilates_dims, padding_l_dims, padding_r_dims,
-                            hint);
+                            hint, sp_attr);
                     } catch (const dnnl::error&) {
                         pd = probe_pd;
                     }
@@ -4950,13 +4960,18 @@ static bool conv3d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
                 memory::dims padding_r_dims = {key.ph_t, key.ph_b, key.pd_f};
                 memory::dims dilates_dims = {key.dd - 1, key.dh - 1, key.dw - 1};
 
+                // Library-managed scratchpads are freshly mmapped on every
+                // execution; user mode lets the cached buffer below actually
+                // serve, keeping multi-hundred-MB im2col regions resident.
+                dnnl::primitive_attr sp_attr;
+                sp_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
                 auto probe_fwd = convolution_forward::primitive_desc(
                     eng, prop_kind::forward_inference, algorithm::convolution_auto,
                     memory::desc(src_dims_l, memory::data_type::f32, memory::format_tag::any),
                     memory::desc(weights_dims_l, memory::data_type::f32, memory::format_tag::any),
                     memory::desc(),
                     memory::desc(dst_dims_l, memory::data_type::f32, memory::format_tag::any),
-                    strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
+                    strides_dims, dilates_dims, padding_l_dims, padding_r_dims, sp_attr);
                 auto probe_pd = convolution_backward_weights::primitive_desc(
                     eng, algorithm::convolution_auto,
                     memory::desc(src_dims_l, memory::data_type::f32, memory::format_tag::any),
@@ -4964,7 +4979,7 @@ static bool conv3d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
                     memory::desc(),
                     memory::desc(dst_dims_l, memory::data_type::f32, memory::format_tag::any),
                     strides_dims, dilates_dims, padding_l_dims, padding_r_dims,
-                    probe_fwd);
+                    probe_fwd, sp_attr);
                 // Keep the all-any primitive: its engine-chosen kernel beats
                 // every fixed-tag combination for backward-weights (plain
                 // activations there drop to the reference implementation).
