@@ -39,6 +39,18 @@ using Tensor = tensorplay::Tensor;
 
 namespace {
 
+// A conversion that returns the tensor it was given (same element type,
+// device and layout, no copy requested) hands back the caller's Python
+// object, so identity checks such as ``x.to(x.dtype) is x`` hold.
+py::object converted_or_self(const py::object& self_obj, Tensor result) {
+    const Tensor& self = py::cast<const Tensor&>(self_obj);
+    if (result.defined() &&
+        result.unsafeGetTensorImpl() == self.unsafeGetTensorImpl()) {
+        return self_obj;
+    }
+    return py::cast(std::move(result));
+}
+
 std::string tensor_repr(const Tensor& self) {
     std::string result = self.toString();
     std::string suffix;
@@ -2154,28 +2166,89 @@ void init_tensor(py::module_& m) {
                         
                         
                         
-        // Manual overloads using lambdas
-        .def("to", [](const Tensor& self, DType dtype, bool non_blocking, bool copy) {
-            return tensorplay::tpx::to(self, dtype, non_blocking, copy);
-        }, "dtype"_a, "non_blocking"_a = false, "copy"_a = false)
-        // The module cast path spells to(None, ...) when only one of device
-        // or dtype moves; a None device keeps the tensor's current one.
-        .def("to", [](const Tensor& self, std::optional<Device> device, bool non_blocking, bool copy) {
-            if (!device.has_value()) return self;
-            return tensorplay::tpx::to(self, *device, non_blocking, copy);
-        }, "device"_a, "non_blocking"_a = false, "copy"_a = false)
-        .def("to", [](const Tensor& self, std::optional<Device> device, DType dtype, bool non_blocking, bool copy) {
-            if (!device.has_value()) {
-                return tensorplay::tpx::to(self, dtype, non_blocking, copy);
+        // Conversion surface: a device-and/or-dtype form, a dtype form and a
+        // tensor form, each taking the target memory format by keyword.  A
+        // conversion that leaves the tensor as it is hands back the same
+        // Python object.  Without a memory format the conversion goes
+        // through the autograd-tracked element/device cast; a requested
+        // memory format goes through the generated conversion operator,
+        // which lays the result out in that format.
+        .def("to", [](py::object self_obj,
+                      std::optional<Device> device,
+                      std::optional<DType> dtype,
+                      bool non_blocking,
+                      bool copy,
+                      std::optional<int64_t> memory_format) -> py::object {
+            const Tensor& self = py::cast<const Tensor&>(self_obj);
+            if (!device && !dtype && !copy && !memory_format) {
+                return self_obj;
             }
-            return tensorplay::tpx::to(self, *device, dtype, non_blocking, copy);
-        }, "device"_a, "dtype"_a, "non_blocking"_a = false, "copy"_a = false)
+            if (!memory_format && (device || dtype)) {
+                if (!device) {
+                    return converted_or_self(
+                        self_obj, tensorplay::tpx::to(self, *dtype, non_blocking, copy));
+                }
+                if (!dtype) {
+                    return converted_or_self(
+                        self_obj, tensorplay::tpx::to(self, *device, non_blocking, copy));
+                }
+                return converted_or_self(
+                    self_obj,
+                    tensorplay::tpx::to(self, *device, *dtype, non_blocking, copy));
+            }
+            return converted_or_self(
+                self_obj,
+                tensorplay::tpx::ops::to(self, dtype, std::nullopt, device,
+                                         std::nullopt, non_blocking, copy,
+                                         memory_format));
+        }, "device"_a = std::nullopt, "dtype"_a = std::nullopt,
+           "non_blocking"_a = false, "copy"_a = false, py::kw_only(),
+           "memory_format"_a = std::nullopt)
+        .def("to", [](py::object self_obj, DType dtype, bool non_blocking, bool copy,
+                      std::optional<int64_t> memory_format) -> py::object {
+            const Tensor& self = py::cast<const Tensor&>(self_obj);
+            if (!memory_format) {
+                return converted_or_self(
+                    self_obj, tensorplay::tpx::to(self, dtype, non_blocking, copy));
+            }
+            return converted_or_self(
+                self_obj, tensorplay::tpx::ops::to(self, dtype, non_blocking, copy,
+                                                   memory_format));
+        }, "dtype"_a, "non_blocking"_a = false, "copy"_a = false,
+           py::kw_only(), "memory_format"_a = std::nullopt)
         // Tensor-flavored target: dtype and device both come from the
-        // argument tensor, matching the reference spelling x.to(y).
-        .def("to", [](const Tensor& self, const Tensor& other, bool non_blocking, bool copy) {
-            return tensorplay::tpx::to(self, other.device(), other.dtype(),
-                                       non_blocking, copy);
-        }, "other"_a, "non_blocking"_a = false, "copy"_a = false)
+        // argument tensor, as in x.to(y).
+        .def("to", [](py::object self_obj, const Tensor& other, bool non_blocking,
+                      bool copy, std::optional<int64_t> memory_format) -> py::object {
+            const Tensor& self = py::cast<const Tensor&>(self_obj);
+            if (!memory_format) {
+                return converted_or_self(
+                    self_obj, tensorplay::tpx::to(self, other.device(), other.dtype(),
+                                                  non_blocking, copy));
+            }
+            return converted_or_self(
+                self_obj, tensorplay::tpx::ops::to(self, other, non_blocking, copy,
+                                                   memory_format));
+        }, "other"_a, "non_blocking"_a = false, "copy"_a = false,
+           py::kw_only(), "memory_format"_a = std::nullopt)
+        // Positional device followed by the non_blocking flag: a spelling
+        // existing callers use; it takes the same keyword memory format.
+        .def("to", [](py::object self_obj, std::optional<Device> device,
+                      bool non_blocking, bool copy,
+                      std::optional<int64_t> memory_format) -> py::object {
+            const Tensor& self = py::cast<const Tensor&>(self_obj);
+            if (!device && !copy && !memory_format) return self_obj;
+            if (!memory_format && device) {
+                return converted_or_self(
+                    self_obj, tensorplay::tpx::to(self, *device, non_blocking, copy));
+            }
+            return converted_or_self(
+                self_obj,
+                tensorplay::tpx::ops::to(self, std::nullopt, std::nullopt, device,
+                                         std::nullopt, non_blocking, copy,
+                                         memory_format));
+        }, "device"_a, "non_blocking"_a = false, "copy"_a = false,
+           py::kw_only(), "memory_format"_a = std::nullopt)
         // Full keyword form: layout/device/pin_memory/memory_format select
         // the target metadata; unspecified fields keep their current value.
         .def("to", [](const Tensor& self,
