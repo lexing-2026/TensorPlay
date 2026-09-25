@@ -75,6 +75,17 @@ py::object select_py_kernel(const std::string& op_name, const std::vector<Tensor
     return fn;
 }
 
+std::vector<Tensor> tensor_results_from_python(py::object result) {
+    if (!result) {
+        throw py::error_already_set();
+    }
+    // Single-output kernels may return a bare Tensor.
+    if (py::isinstance<Tensor>(result)) {
+        return {result.cast<Tensor>()};
+    }
+    return py::cast<std::vector<Tensor>>(result);
+}
+
 std::vector<Tensor> invoke_python_kernel_by_name(
     const std::string& op_name,
     const std::vector<Tensor>& inputs) {
@@ -85,14 +96,20 @@ std::vector<Tensor> invoke_python_kernel_by_name(
     py::tuple py_args = py::cast(inputs);
     py::object result = py::reinterpret_steal<py::object>(
         PyObject_Call(fn.ptr(), py_args.ptr(), nullptr));
-    if (!result) {
-        throw py::error_already_set();
+    return tensor_results_from_python(std::move(result));
+}
+
+py::object resolve_python_eager_call(const std::string& op_name) {
+    static auto* cache = new std::unordered_map<std::string, py::object>();
+    auto it = cache->find(op_name);
+    if (it != cache->end()) {
+        return it->second;
     }
-    // Single-output kernels may return a bare Tensor.
-    if (py::isinstance<Tensor>(result)) {
-        return {result.cast<Tensor>()};
-    }
-    return py::cast<std::vector<Tensor>>(result);
+    py::object lib = py::module_::import("tensorplay.library");
+    py::object op = lib.attr("get_op")(op_name);
+    py::object callable = op.attr("_eager_call");
+    auto inserted = cache->emplace(op_name, std::move(callable)).first;
+    return inserted->second;
 }
 
 std::vector<Tensor> python_op_trampoline(const std::vector<Tensor>& inputs) {
@@ -116,22 +133,28 @@ void ensure_stax_custom_op_executor() {
         [](const std::string& op_name,
            const std::vector<Tensor>& inputs) -> std::vector<Tensor> {
             py::gil_scoped_acquire acquire;
-            py::object lib = py::module_::import("tensorplay.library");
-            py::object entry = lib.attr("_native_invoke");
-            py::tuple py_args(inputs.size() + 1);
-            py_args[0] = py::cast(op_name);
-            for (size_t i = 0; i < inputs.size(); ++i) {
-                py_args[i + 1] = py::cast(inputs[i]);
+            py::object result;
+            if (op_name.rfind("tp_stax::pointwise_", 0) == 0) {
+                py::object kernel = select_py_kernel(op_name, inputs);
+                py::tuple py_args(inputs.size());
+                for (size_t i = 0; i < inputs.size(); ++i) {
+                    py_args[i] = py::cast(inputs[i]);
+                }
+                result = py::reinterpret_steal<py::object>(
+                    PyObject_Call(kernel.ptr(), py_args.ptr(), nullptr));
+            } else {
+                py::object callable = resolve_python_eager_call(op_name);
+                py::tuple tensor_args(inputs.size());
+                for (size_t i = 0; i < inputs.size(); ++i) {
+                    tensor_args[i] = py::cast(inputs[i]);
+                }
+                py::tuple call_args(2);
+                call_args[0] = std::move(tensor_args);
+                call_args[1] = py::dict();
+                result = py::reinterpret_steal<py::object>(
+                    PyObject_Call(callable.ptr(), call_args.ptr(), nullptr));
             }
-            py::object result = py::reinterpret_steal<py::object>(
-                PyObject_Call(entry.ptr(), py_args.ptr(), nullptr));
-            if (!result) {
-                throw py::error_already_set();
-            }
-            if (py::isinstance<Tensor>(result)) {
-                return {result.cast<Tensor>()};
-            }
-            return py::cast<std::vector<Tensor>>(result);
+            return tensor_results_from_python(std::move(result));
         });
     installed = true;
 }
