@@ -4,10 +4,56 @@
 #include "Parallel.h"
 #include <functional>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #if DNNL_CPU_RUNTIME == DNNL_RUNTIME_THREADPOOL
 #include "oneapi/dnnl/dnnl_threadpool.hpp"
 #endif
 #endif
+
+namespace {
+
+// Intel hybrid parts carry two frequency tiers (performance and efficiency
+// cores).  An OpenMP team spanning every logical CPU spreads GEMM tiles onto
+// the slow tier, and the slowest core paces the whole team through the
+// kernel's internal barriers; the resulting straggler effect dominates the
+// compute itself.  On such parts cap the team near the fast-tier size (but
+// never below half the logical count); uniform-frequency CPUs keep the full
+// team.  Returns 0 when no cap applies.
+int hybrid_thread_cap() {
+#ifdef __linux__
+    std::vector<int> max_freqs;
+    for (int cpu = 0; cpu < 512; ++cpu) {
+        std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
+                           "/cpufreq/cpuinfo_max_freq";
+        std::FILE* f = std::fopen(path.c_str(), "re");
+        if (!f) break;
+        int khz = 0;
+        if (std::fscanf(f, "%d", &khz) == 1 && khz > 0) {
+            max_freqs.push_back(khz);
+        }
+        std::fclose(f);
+    }
+    if (max_freqs.size() > 1) {
+        const int top = *std::max_element(max_freqs.begin(), max_freqs.end());
+        const int bottom = *std::min_element(max_freqs.begin(), max_freqs.end());
+        if (top > bottom) {  // two tiers -> hybrid
+            int fast = 0;
+            for (int f : max_freqs) fast += (f == top);
+            const int logical = static_cast<int>(max_freqs.size());
+            return std::max(fast, logical / 2);
+        }
+    }
+#endif
+    return 0;
+}
+
+} // namespace
 
 namespace tensorplay {
 
@@ -21,6 +67,21 @@ bool OneDNNContext::is_available() {
 
 dnnl::engine& OneDNNContext::get_engine() {
     static dnnl::engine* eng = new dnnl::engine(dnnl::engine::kind::cpu, 0);
+#ifdef _OPENMP
+    // OpenMP team size is a per-thread ICV, and kernel blocking is chosen
+    // from it at primitive creation.  Autograd drives backward on its own
+    // thread, so apply the hybrid cap on every thread that reaches oneDNN,
+    // once each, unless the user pinned the pool explicitly.
+    static const int thread_cap = std::getenv("OMP_NUM_THREADS")
+                                      ? 0 : hybrid_thread_cap();
+    static thread_local bool cap_applied = false;
+    if (!cap_applied) {
+        cap_applied = true;
+        if (thread_cap > 0 && thread_cap < omp_get_max_threads()) {
+            omp_set_num_threads(thread_cap);
+        }
+    }
+#endif
     return *eng;
 }
 

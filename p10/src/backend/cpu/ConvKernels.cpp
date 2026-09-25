@@ -1336,7 +1336,6 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
     if (!OneDNNContext::is_enabled()) return false;
     if (input.dtype() != DType::Float32) return false;
     if (std::getenv("TP_DISABLE_ONEDNN_CONV3D")) return false;
-    
     try {
         auto& eng = OneDNNContext::get_engine();
         auto& s = OneDNNContext::get_stream();
@@ -4665,18 +4664,27 @@ static bool conv3d_grad_input_onednn(const Tensor& grad_output, const Tensor& in
         struct CachedBwd3d {
             convolution_backward_data::primitive_desc pd;
             convolution_backward_data prim;
+            // Reused across calls: the scratchpad is written during execute()
+            // and re-allocating it (tens to hundreds of MB for backward
+            // kernels) would dominate steady-state steps with page faults.
+            dnnl::memory scratchpad;
+            bool has_scratchpad = false;
         };
         static std::unordered_map<ConvKey, CachedBwd3d> cache;
         static std::mutex mtx;
 
         convolution_backward_data::primitive_desc pd;
         convolution_backward_data bwd_d;
+        dnnl::memory entry_scratchpad;
+        bool has_entry_scratchpad = false;
         {
             std::lock_guard<std::mutex> lock(mtx);
             auto it = cache.find(key);
             if (it != cache.end()) {
                 pd = it->second.pd;
                 bwd_d = it->second.prim;
+                entry_scratchpad = it->second.scratchpad;
+                has_entry_scratchpad = it->second.has_scratchpad;
             } else {
                 memory::dims src_dims_l = {key.n, key.ic, key.ih, key.iw, key.id};
                 memory::dims dst_dims_l = {key.n, key.oc, key.oh, key.ow, key.od};
@@ -4736,8 +4744,13 @@ static bool conv3d_grad_input_onednn(const Tensor& grad_output, const Tensor& in
                 } else {
                     pd = probe_pd;
                 }
+                entry_scratchpad = dnnl::memory();
+                if (pd.scratchpad_desc().get_size() > 0) {
+                    entry_scratchpad = dnnl::memory(pd.scratchpad_desc(), eng);
+                    has_entry_scratchpad = true;
+                }
                 bwd_d = convolution_backward_data(pd);
-                cache.insert({key, {pd, bwd_d}});
+                cache.insert({key, {pd, bwd_d, entry_scratchpad, has_entry_scratchpad}});
             }
         }
         // Local logical dims for the user-memory descriptors below.
@@ -4843,8 +4856,8 @@ static bool conv3d_grad_input_onednn(const Tensor& grad_output, const Tensor& in
             {DNNL_ARG_WEIGHTS, weights_mem},
             {DNNL_ARG_DIFF_SRC, diff_src_mem}
         };
-        if (pd.scratchpad_desc().get_size() > 0) {
-            bwd_d_args.insert({DNNL_ARG_SCRATCHPAD, memory(pd.scratchpad_desc(), eng)});
+        if (has_entry_scratchpad) {
+            bwd_d_args.insert({DNNL_ARG_SCRATCHPAD, entry_scratchpad});
         }
         bwd_d.execute(s, bwd_d_args);
 
@@ -4901,18 +4914,28 @@ static bool conv3d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
         struct CachedBwdW3d {
             convolution_backward_weights::primitive_desc pd;
             convolution_backward_weights prim;
+            // Reused across calls (see the backward-data cache note): the
+            // im2col scratchpad for backward-weights reaches hundreds of MB
+            // on large shapes, and re-allocating it per call turns the step
+            // into a page-fault benchmark.
+            dnnl::memory scratchpad;
+            bool has_scratchpad = false;
         };
         static std::unordered_map<ConvKey, CachedBwdW3d> cache;
         static std::mutex mtx;
 
         convolution_backward_weights::primitive_desc pd;
         convolution_backward_weights bwd_w;
+        dnnl::memory entry_scratchpad;
+        bool has_entry_scratchpad = false;
         {
             std::lock_guard<std::mutex> lock(mtx);
             auto it = cache.find(key);
             if (it != cache.end()) {
                 pd = it->second.pd;
                 bwd_w = it->second.prim;
+                entry_scratchpad = it->second.scratchpad;
+                has_entry_scratchpad = it->second.has_scratchpad;
             } else {
                 memory::dims src_dims_l = {key.n, key.ic, key.ih, key.iw, key.id};
                 memory::dims dst_dims_l = {key.n, key.oc, key.oh, key.ow, key.od};
@@ -4927,17 +4950,6 @@ static bool conv3d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
                 memory::dims padding_r_dims = {key.ph_t, key.ph_b, key.pd_f};
                 memory::dims dilates_dims = {key.dd - 1, key.dh - 1, key.dw - 1};
 
-                // Plain activation tags; the diff-weights layout is the
-                // engine's blocked choice, reordered into the grad buffer's
-                // own layout (ODHWI/GODHWI for channels-last) afterwards.
-                auto in_cl = input_c.is_contiguous(MemoryFormat::ChannelsLast3d);
-                auto go_cl2 = grad_output_c.is_contiguous(MemoryFormat::ChannelsLast3d);
-                auto user_src_md = memory::desc(src_dims_l, memory::data_type::f32,
-                                                in_cl ? memory::format_tag::ndhwc
-                                                      : memory::format_tag::ncdhw);
-                auto user_dst_md = memory::desc(dst_dims_l, memory::data_type::f32,
-                                                go_cl2 ? memory::format_tag::ndhwc
-                                                       : memory::format_tag::ncdhw);
                 auto probe_fwd = convolution_forward::primitive_desc(
                     eng, prop_kind::forward_inference, algorithm::convolution_auto,
                     memory::desc(src_dims_l, memory::data_type::f32, memory::format_tag::any),
@@ -4953,27 +4965,16 @@ static bool conv3d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
                     memory::desc(dst_dims_l, memory::data_type::f32, memory::format_tag::any),
                     strides_dims, dilates_dims, padding_l_dims, padding_r_dims,
                     probe_fwd);
-                // Stage 2 (channels-last only), same rationale as
-                // backward-data; row-major keeps the all-any primitive.
-                if (in_cl || go_cl2) {
-                    try {
-                        auto hint = convolution_forward::primitive_desc(
-                            eng, prop_kind::forward_inference, algorithm::convolution_auto,
-                            user_src_md, probe_pd.diff_weights_desc(), memory::desc(), user_dst_md,
-                            strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
-                        pd = convolution_backward_weights::primitive_desc(
-                            eng, algorithm::convolution_auto,
-                            user_src_md, probe_pd.diff_weights_desc(), memory::desc(), user_dst_md,
-                            strides_dims, dilates_dims, padding_l_dims, padding_r_dims,
-                            hint);
-                    } catch (const dnnl::error&) {
-                        pd = probe_pd;
-                    }
-                } else {
-                    pd = probe_pd;
+                // Keep the all-any primitive: its engine-chosen kernel beats
+                // every fixed-tag combination for backward-weights (plain
+                // activations there drop to the reference implementation).
+                pd = probe_pd;
+                if (pd.scratchpad_desc().get_size() > 0) {
+                    entry_scratchpad = dnnl::memory(pd.scratchpad_desc(), eng);
+                    has_entry_scratchpad = true;
                 }
                 bwd_w = convolution_backward_weights(pd);
-                cache.insert({key, {pd, bwd_w}});
+                cache.insert({key, {pd, bwd_w, entry_scratchpad, has_entry_scratchpad}});
             }
         }
         // Local logical dims for the user-memory descriptors below.
@@ -5039,8 +5040,8 @@ static bool conv3d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
             {DNNL_ARG_DIFF_DST, diff_dst_mem},
             {DNNL_ARG_DIFF_WEIGHTS, diff_weights_mem}
         };
-        if (pd.scratchpad_desc().get_size() > 0) {
-            bwd_w_args.insert({DNNL_ARG_SCRATCHPAD, memory(pd.scratchpad_desc(), eng)});
+        if (has_entry_scratchpad) {
+            bwd_w_args.insert({DNNL_ARG_SCRATCHPAD, entry_scratchpad});
         }
         bwd_w.execute(s, bwd_w_args);
 
