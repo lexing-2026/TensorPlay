@@ -14,12 +14,14 @@
 #undef NDEBUG
 #endif
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <string>
 #include <type_traits>
 #include <vector>
 #include "Atomic.cuh"
+#include "GPUPrimitives.cuh"
 
 namespace tensorplay {
 namespace cuda {
@@ -528,6 +530,238 @@ void launch_embedding_backward(
 
 } // namespace
 
+namespace {
+
+constexpr int kEmbeddingWarpSize = 32;
+constexpr int kEmbeddingRenormThreads = 128;
+
+template <typename T>
+__device__ inline T embedding_warp_reduce_sum(T value) {
+#pragma unroll
+    for (int offset = kEmbeddingWarpSize / 2; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    return value;
+}
+
+template <typename T>
+__device__ inline T embedding_block_reduce_sum(T value, T* shared) {
+    const int lane = threadIdx.x % kEmbeddingWarpSize;
+    const int warp = threadIdx.x / kEmbeddingWarpSize;
+    const int warps = blockDim.x / kEmbeddingWarpSize;
+    value = embedding_warp_reduce_sum(value);
+    __syncthreads();
+    if (lane == 0) shared[warp] = value;
+    __syncthreads();
+    value = threadIdx.x < warps ? shared[lane] : T(0);
+    if (warp == 0) value = embedding_warp_reduce_sum(value);
+    return value;
+}
+
+__device__ inline float embedding_abs(float value) {
+    return fabsf(value);
+}
+
+__device__ inline double embedding_abs(double value) {
+    return fabs(value);
+}
+
+__device__ inline float embedding_pow(float value, float exponent) {
+    return powf(value, exponent);
+}
+
+__device__ inline double embedding_pow(double value, double exponent) {
+    return ::pow(value, exponent);
+}
+
+template <typename Scalar, typename Acc, typename Index>
+__global__ void embedding_renorm_kernel(
+        Scalar* weights,
+        const Index* indices,
+        Acc max_norm,
+        Acc norm_type,
+        int64_t dim,
+        int64_t num_weights,
+        int64_t weights_stride0,
+        int64_t weights_stride1,
+        const int32_t* num_unique_indices) {
+    if (static_cast<int64_t>(blockIdx.x) >= *num_unique_indices) return;
+
+    extern __shared__ unsigned char shared_bytes[];
+    Acc* shared = reinterpret_cast<Acc*>(shared_bytes);
+    const int64_t index = static_cast<int64_t>(indices[blockIdx.x]);
+    assert(index >= 0 && index < num_weights);
+    const int64_t base = index * weights_stride0;
+
+    Acc value = Acc(0);
+    for (int64_t i = threadIdx.x; i < dim; i += blockDim.x) {
+        const Acc x = static_cast<Acc>(weights[base + i * weights_stride1]);
+        if (norm_type == Acc(1)) {
+            value += embedding_abs(x);
+        } else if (norm_type == Acc(2)) {
+            value += x * x;
+        } else {
+            value += embedding_pow(x, norm_type);
+        }
+    }
+    value = embedding_block_reduce_sum(value, shared);
+    if (threadIdx.x == 0) {
+        shared[0] = embedding_pow(value, Acc(1) / norm_type);
+    }
+    __syncthreads();
+    if (shared[0] > max_norm) {
+        const Acc factor = max_norm / (shared[0] + Acc(1e-7));
+        for (int64_t i = threadIdx.x; i < dim; i += blockDim.x) {
+            weights[base + i * weights_stride1] = static_cast<Scalar>(
+                static_cast<Acc>(weights[base + i * weights_stride1]) * factor);
+        }
+    }
+}
+
+template <typename Index>
+__global__ void embedding_renorm_wrap_indices_kernel(
+        const Index* indices,
+        Index* wrapped_indices,
+        int64_t num_indices,
+        int64_t num_weights) {
+    const int64_t offset = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (offset >= num_indices) return;
+    int64_t index = static_cast<int64_t>(indices[offset]);
+    assert(index >= -num_weights && index < num_weights);
+    if (index < 0) index += num_weights;
+    wrapped_indices[offset] = static_cast<Index>(index);
+}
+
+template <typename Scalar, typename Acc, typename Index>
+void embedding_renorm_dtype(
+        Tensor& weight,
+        const Tensor& indices,
+        double max_norm,
+        double norm_type,
+        cudaStream_t stream) {
+    const int64_t num_indices = indices.numel();
+    if (num_indices == 0) return;
+    TP_CHECK(num_indices <= std::numeric_limits<int>::max(),
+             "embedding_renorm_: too many indices");
+    const int64_t num_weights = weight.size(0);
+    TP_CHECK(num_weights > 0, "embedding_renorm_: weight must have rows");
+    const int64_t dim = weight.stride(0);
+
+    Tensor wrapped = Tensor::empty(
+        {num_indices}, indices.dtype(), weight.device());
+    const int threads = kEmbeddingRenormThreads;
+    const int blocks = static_cast<int>((num_indices + threads - 1) / threads);
+    embedding_renorm_wrap_indices_kernel<<<blocks, threads, 0, stream>>>(
+        indices.data_ptr<Index>(), wrapped.data_ptr<Index>(),
+        num_indices, num_weights);
+    CUDA_CHECK(cudaGetLastError());
+
+    Tensor sorted = Tensor::empty(
+        {num_indices}, indices.dtype(), weight.device());
+    size_t sort_bytes = 0;
+    CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
+        nullptr, sort_bytes, wrapped.data_ptr<Index>(), sorted.data_ptr<Index>(),
+        static_cast<int>(num_indices), 0, sizeof(Index) * 8, stream));
+    Tensor sort_storage = Tensor::empty(
+        {static_cast<int64_t>(sort_bytes == 0 ? 1 : sort_bytes)},
+        DType::UInt8, weight.device());
+    CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
+        sort_storage.data_ptr(), sort_bytes,
+        wrapped.data_ptr<Index>(), sorted.data_ptr<Index>(),
+        static_cast<int>(num_indices), 0, sizeof(Index) * 8, stream));
+
+    Tensor unique = Tensor::empty(
+        {num_indices}, indices.dtype(), weight.device());
+    Tensor unique_count = Tensor::empty({}, DType::Int32, weight.device());
+    size_t unique_bytes = 0;
+    CUDA_CHECK(cub::DeviceSelect::Unique(
+        nullptr, unique_bytes, sorted.data_ptr<Index>(),
+        unique.data_ptr<Index>(), unique_count.data_ptr<int32_t>(),
+        static_cast<int>(num_indices), stream));
+    Tensor unique_storage = Tensor::empty(
+        {static_cast<int64_t>(unique_bytes == 0 ? 1 : unique_bytes)},
+        DType::UInt8, weight.device());
+    CUDA_CHECK(cub::DeviceSelect::Unique(
+        unique_storage.data_ptr(), unique_bytes,
+        sorted.data_ptr<Index>(), unique.data_ptr<Index>(),
+        unique_count.data_ptr<int32_t>(), static_cast<int>(num_indices), stream));
+
+    embedding_renorm_kernel<Scalar, Acc, Index>
+        <<<static_cast<unsigned int>(num_indices), threads,
+           threads * sizeof(Acc), stream>>>(
+            weight.data_ptr<Scalar>(), unique.data_ptr<Index>(),
+            static_cast<Acc>(max_norm), static_cast<Acc>(norm_type), dim,
+            num_weights, weight.stride(0), weight.stride(1),
+            unique_count.data_ptr<int32_t>());
+    CUDA_CHECK(cudaGetLastError());
+}
+
+}
+
+Tensor& embedding_renorm_cuda(
+        Tensor& weight, const Tensor& indices, double max_norm, double norm_type) {
+    if (weight.dim() != 2) {
+        TP_THROW(RuntimeError,
+                 "embedding_renorm_cuda: weight must be 2-D, got dim ",
+                 weight.dim(), " defined ", weight.defined());
+    }
+    if (indices.dtype() != DType::Int64 && indices.dtype() != DType::Int32) {
+        TP_THROW(TypeError, "embedding_renorm_: indices must be Int64 or Int32");
+    }
+    if (weight.device() != indices.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "embedding_renorm_: weight and indices must be on the same device");
+    }
+    Tensor indices_contig = indices.is_contiguous() ? indices : indices.contiguous();
+    cudaStream_t stream = getCurrentCUDAStream().stream();
+    if (indices.dtype() == DType::Int64) {
+        switch (weight.dtype()) {
+            case DType::Float32:
+                embedding_renorm_dtype<float, float, int64_t>(
+                    weight, indices_contig, max_norm, norm_type, stream);
+                break;
+            case DType::Float64:
+                embedding_renorm_dtype<double, double, int64_t>(
+                    weight, indices_contig, max_norm, norm_type, stream);
+                break;
+            case DType::Float16:
+                embedding_renorm_dtype<tensorplay::Half, float, int64_t>(
+                    weight, indices_contig, max_norm, norm_type, stream);
+                break;
+            case DType::BFloat16:
+                embedding_renorm_dtype<tensorplay::BFloat16, float, int64_t>(
+                    weight, indices_contig, max_norm, norm_type, stream);
+                break;
+            default:
+                TP_THROW(NotImplementedError,
+                         "embedding_renorm_cuda: unsupported weight dtype");
+        }
+    } else {
+        switch (weight.dtype()) {
+            case DType::Float32:
+                embedding_renorm_dtype<float, float, int32_t>(
+                    weight, indices_contig, max_norm, norm_type, stream);
+                break;
+            case DType::Float64:
+                embedding_renorm_dtype<double, double, int32_t>(
+                    weight, indices_contig, max_norm, norm_type, stream);
+                break;
+            case DType::Float16:
+                embedding_renorm_dtype<tensorplay::Half, float, int32_t>(
+                    weight, indices_contig, max_norm, norm_type, stream);
+                break;
+            case DType::BFloat16:
+                embedding_renorm_dtype<tensorplay::BFloat16, float, int32_t>(
+                    weight, indices_contig, max_norm, norm_type, stream);
+                break;
+            default:
+                TP_THROW(NotImplementedError,
+                         "embedding_renorm_cuda: unsupported weight dtype");
+        }
+    }
+    return weight;
+}
+
 Tensor embedding_cuda(
     const Tensor& weight,
     const Tensor& indices,
@@ -699,6 +933,7 @@ Tensor embedding_backward_cuda(const Tensor& grad_output, const Tensor& indices,
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, EmbeddingKernels) {
   m.impl("embedding", embedding_cuda);
+  m.impl("embedding_renorm_", embedding_renorm_cuda);
   m.impl("embedding_dense_backward", embedding_dense_backward_cuda);
   m.impl("embedding_sparse_backward", embedding_sparse_backward_cuda);
   m.impl("embedding_backward", embedding_backward_cuda);

@@ -416,39 +416,6 @@ Tensor interop_repeat_interleave_Tensor_cuda(
 }
 
 // ---------------------------------------------------------------------------
-// Renormalize referenced rows whose selected norm exceeds max_norm.
-// ---------------------------------------------------------------------------
-
-Tensor& interop_embedding_renorm__cuda(Tensor& weight, const Tensor& indices,
-                                       double max_norm, double norm_type) {
-    TP_CHECK(weight.dim() == 2,
-             "embedding_renorm_: weight must be 2-D");
-    TP_CHECK(indices.dtype() == DType::Int64 || indices.dtype() == DType::Int32,
-             "embedding_renorm_: indices must be Int64 or Int32");
-    TP_CHECK(weight.device() == indices.device(),
-             "embedding_renorm_: weight and indices must be on the same device");
-    TP_CHECK(max_norm > 0.0,
-             "embedding_renorm_: max_norm must be positive");
-    TP_CHECK(norm_type > 0.0,
-             "embedding_renorm_: norm_type must be positive");
-
-    const int64_t d = 1;
-    Tensor norms = ops::norm(weight, {d}, norm_type, true);
-    Tensor idx_flat = indices.reshape({-1}).to(DType::Int64);
-    Tensor row_norms = ops::index_select(norms, 0, idx_flat);
-    Tensor scale = ops::reciprocal(ops::add(row_norms, Scalar(1e-7)))
-                      .mul(Scalar(max_norm))
-                      .clamp_max(Scalar(1.0));
-    // Scale every selected row whose norm exceeds max_norm.
-    Tensor w_sel = ops::index_select(weight, 0, idx_flat);
-    Tensor scaled = ops::mul(w_sel, scale);
-    Tensor updated = ops::where(ops::gt(row_norms, Scalar(max_norm)), scaled,
-                                w_sel);
-    weight.index_copy_(0, idx_flat, updated);
-    return weight;
-}
-
-// ---------------------------------------------------------------------------
 // sspaddmm: sparse-only in the reference; tp has no sparse CUDA backend, so
 // the contract is an explicit rejection rather than a dense reinterpretation.
 // ---------------------------------------------------------------------------
@@ -504,67 +471,6 @@ Tensor interop_masked_softmax_backward_cuda(const Tensor& grad_output,
     Tensor dot = ops::sum(ops::mul(g, o), {d}, true);
     return ops::where(mask, ops::mul(o, ops::sub(g, dot)),
                       ops::zeros_like(grad_output));
-}
-
-// ---------------------------------------------------------------------------
-// _fused_rms_norm: x / sqrt(mean(x^2) + eps) * weight.  The second output is
-// the reciprocal standard deviation, saved for the backward pass.
-// ---------------------------------------------------------------------------
-
-std::vector<int64_t> norm_trailing_dims(const Tensor& input,
-                                        const std::vector<int64_t>& normalized_shape) {
-    std::vector<int64_t> dims;
-    for (int64_t i = static_cast<int64_t>(input.dim()) -
-                     static_cast<int64_t>(normalized_shape.size());
-         i < input.dim(); ++i) {
-        dims.push_back(i);
-    }
-    return dims;
-}
-
-std::tuple<Tensor, Tensor> interop_fused_rms_norm_cuda(
-        const Tensor& input, const std::vector<int64_t>& normalized_shape,
-        const std::optional<Tensor>& weight_opt,
-        std::optional<double> eps_opt) {
-    const double eps = eps_opt.value_or(1e-5);
-    Tensor weight = weight_opt.value_or(Tensor());
-    std::vector<int64_t> dims = norm_trailing_dims(input, normalized_shape);
-    Tensor ms = ops::mean(ops::pow(input, Scalar(2.0)), dims, true);
-    Tensor inv = ops::rsqrt(ops::add(ms, Scalar(eps)));
-    Tensor out = ops::mul(input, inv);
-    if (weight.defined()) out = ops::mul(out, weight);
-    return std::make_tuple(out, inv);
-}
-
-std::tuple<Tensor, Tensor> interop_fused_rms_norm_backward_cuda(
-        const Tensor& grad_out, const Tensor& input,
-        const std::vector<int64_t>& normalized_shape, const Tensor& rstd,
-        const std::optional<Tensor>& weight_opt,
-        const std::vector<bool>& output_mask) {
-    Tensor weight = weight_opt.value_or(Tensor());
-    std::vector<int64_t> dims = norm_trailing_dims(input, normalized_shape);
-    Tensor xhat = ops::mul(input, rstd);
-    // d/dx [x * inv * w] with inv treated as constant to first order:
-    // inv * (g_eff - xhat * mean(g_eff * xhat)) where g_eff folds in w.
-    Tensor gw = weight.defined() ? ops::mul(grad_out, weight) : grad_out;
-    Tensor dot = ops::mean(ops::mul(gw, xhat), dims, true);
-    Tensor grad_input;
-    if (output_mask.empty() || output_mask[0]) {
-        grad_input = ops::mul(rstd, ops::sub(gw, ops::mul(xhat, dot)));
-    } else {
-        grad_input = Tensor();
-    }
-    Tensor grad_weight;
-    if (output_mask.size() > 1 && output_mask[1] && weight.defined()) {
-        // Sum of g * xhat per normalized slice; the reduced axes collapse to
-        // the weight's own (possibly size-1) layout.
-        Tensor full = ops::sum(ops::mul(grad_out, xhat), dims, true);
-        grad_weight = full.reshape(
-            static_cast<std::vector<int64_t>>(weight.shape()));
-    } else {
-        grad_weight = Tensor();
-    }
-    return std::make_tuple(grad_input, grad_weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -921,160 +827,6 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> interop__batch_norm_no_update_cuda(
     Tensor save_var = Tensor::empty({0}, input.dtype(), input.device());
     Tensor reserve = Tensor::empty({0}, DType::UInt8, input.device());
     return std::make_tuple(std::get<0>(result), save_mean, save_var, reserve);
-}
-
-// batch_norm_stats: per-channel mean and reciprocal standard deviation.
-std::tuple<Tensor, Tensor> interop_batch_norm_stats_cuda(const Tensor& input,
-                                                         double eps) {
-    Tensor mean;
-    Tensor var;
-    std::tie(mean, var) = batch_norm_channel_stats(input);
-    return std::make_tuple(mean, ops::rsqrt(ops::add(var, Scalar(eps))));
-}
-
-// batch_norm_elemt: apply the affine transform with precomputed statistics.
-Tensor interop_batch_norm_elemt_cuda(const Tensor& input,
-                                     const std::optional<Tensor>& weight,
-                                     const std::optional<Tensor>& bias,
-                                     const Tensor& mean, const Tensor& invstd,
-                                     double eps) {
-    (void)eps;
-    Tensor x = ops::mul(ops::sub(input, expand_channel_param(mean, input)),
-                        expand_channel_param(invstd, input));
-    if (weight.has_value() && weight->defined()) {
-        x = ops::mul(x, expand_channel_param(*weight, input));
-    }
-    if (bias.has_value() && bias->defined()) {
-        x = ops::add(x, expand_channel_param(*bias, input));
-    }
-    return x;
-}
-
-Tensor& interop_batch_norm_elemt_out_cuda(const Tensor& input,
-                                          const std::optional<Tensor>& weight,
-                                          const std::optional<Tensor>& bias,
-                                          const Tensor& mean,
-                                          const Tensor& invstd, double eps,
-                                          Tensor& out) {
-    write_out(out, interop_batch_norm_elemt_cuda(input, weight, bias, mean, invstd, eps));
-    return out;
-}
-
-// batch_norm_backward_reduce: per-channel reduction sums consumed by the
-// elementwise backward.  The four slots are (sum_dy, sum_dy_xmu, mean,
-// count); tp's elementwise backward reads the count from the fourth slot.
-std::tuple<Tensor, Tensor, Tensor, Tensor>
-interop_batch_norm_backward_reduce_cuda(const Tensor& grad_out,
-                                        const Tensor& input,
-                                        const Tensor& mean,
-                                        const Tensor& /*invstd*/,
-                                        const std::optional<Tensor>& weight,
-                                        bool input_g, bool weight_g,
-                                        bool bias_g) {
-    (void)weight_g;
-    (void)bias_g;
-    const int64_t C = input.size(1);
-    std::vector<int64_t> reduce_dims;
-    for (int64_t d = 0; d < input.dim(); ++d) {
-        if (d != 1) reduce_dims.push_back(d);
-    }
-    Tensor sum_dy;
-    Tensor sum_dy_xmu;
-    if (input_g) {
-        sum_dy = ops::sum(grad_out, reduce_dims, true).reshape({C});
-        sum_dy_xmu = ops::sum(
-                         ops::mul(grad_out,
-                                  ops::sub(input, expand_channel_param(mean, input))),
-                         reduce_dims, true)
-                         .reshape({C});
-    } else {
-        sum_dy = Tensor();
-        sum_dy_xmu = Tensor();
-    }
-    (void)weight;
-    const int64_t per_channel = input.numel() / (C == 0 ? 1 : C);
-    Tensor count = ops::full({C}, Scalar(static_cast<double>(per_channel)),
-                             mean.dtype(), input.device());
-    return std::make_tuple(sum_dy, sum_dy_xmu, mean.reshape({C}), count);
-}
-
-// batch_norm_backward_elemt: gradient wrt the input given the reductions.
-Tensor interop_batch_norm_backward_elemt_cuda(
-        const Tensor& grad_out, const Tensor& input, const Tensor& mean,
-        const Tensor& invstd, const std::optional<Tensor>& weight,
-        const Tensor& sum_dy, const Tensor& sum_dy_xmu, const Tensor& count) {
-    Tensor mean_e = expand_channel_param(mean, input);
-    Tensor invstd_e = expand_channel_param(invstd, input);
-    Tensor sum_dy_e = expand_channel_param(sum_dy, input);
-    Tensor sum_dy_xmu_e = expand_channel_param(sum_dy_xmu, input);
-    Tensor count_e = expand_channel_param(count, input);
-    // dL/dx = invstd * (g - mean(g) - xhat * mean(g * xhat)) with
-    // xhat = (x - mean) * invstd and means over each channel's elements.
-    Tensor gd = grad_out;
-    if (weight.has_value() && weight->defined()) {
-        gd = ops::mul(gd, expand_channel_param(*weight, input));
-    }
-    Tensor m1 = ops::div(sum_dy_e, count_e);
-    Tensor m2 = ops::div(sum_dy_xmu_e, count_e);
-    Tensor xhat = ops::mul(ops::sub(input, mean_e), invstd_e);
-    return ops::mul(invstd_e, ops::sub(gd, ops::add(m1, ops::mul(xhat, m2))));
-}
-
-// batch_norm_gather_stats: fold per-batch statistics into the running
-// buffers with the unbiased correction, returning the updated buffers.
-std::tuple<Tensor, Tensor> interop_batch_norm_gather_stats_cuda(
-        const Tensor& /*input*/, const Tensor& mean, const Tensor& invstd,
-        const std::optional<Tensor>& running_mean,
-        const std::optional<Tensor>& running_var, double momentum, double eps,
-        int64_t count) {
-    Tensor save_mean = mean;
-    Tensor var = ops::sub(ops::reciprocal(ops::pow(invstd, Scalar(2.0))),
-                          Scalar(eps));
-    if (running_mean.has_value() && running_mean->defined() &&
-        running_var.has_value() && running_var->defined() && count > 1) {
-        const double n = static_cast<double>(count);
-        Tensor unbiased = ops::mul(var, Scalar(n / (n - 1.0)));
-        save_mean = ops::add(ops::mul(*running_mean, Scalar(1.0 - momentum)),
-                             ops::mul(mean, Scalar(momentum)));
-        Tensor save_var = ops::add(ops::mul(*running_var, Scalar(1.0 - momentum)),
-                                   ops::mul(unbiased, Scalar(momentum)));
-        return std::make_tuple(save_mean, save_var);
-    }
-    return std::make_tuple(save_mean, var);
-}
-
-std::tuple<Tensor, Tensor> interop_batch_norm_gather_stats_with_counts_cuda(
-        const Tensor& input, const Tensor& mean, const Tensor& invstd,
-        const std::optional<Tensor>& running_mean,
-        const std::optional<Tensor>& running_var, double momentum, double eps,
-        const Tensor& counts) {
-    const int64_t count =
-        static_cast<int64_t>(counts.sum().item().to<double>());
-    return interop_batch_norm_gather_stats_cuda(input, mean, invstd,
-                                                running_mean, running_var,
-                                                momentum, eps, count);
-}
-
-// batch_norm_update_stats: new running statistics from batch moments.
-std::tuple<Tensor, Tensor> interop_batch_norm_update_stats_cuda(
-        const Tensor& input, const std::optional<Tensor>& running_mean,
-        const std::optional<Tensor>& running_var, double momentum) {
-    Tensor mean;
-    Tensor var;
-    std::tie(mean, var) = batch_norm_channel_stats(input);
-    const int64_t n = input.numel() / input.size(1);
-    Tensor unbiased = n > 1 ? ops::mul(var, Scalar(static_cast<double>(n) /
-                                                   static_cast<double>(n - 1)))
-                            : var;
-    if (running_mean.has_value() && running_mean->defined()) {
-        mean = ops::add(ops::mul(*running_mean, Scalar(1.0 - momentum)),
-                        ops::mul(mean, Scalar(momentum)));
-    }
-    if (running_var.has_value() && running_var->defined()) {
-        unbiased = ops::add(ops::mul(*running_var, Scalar(1.0 - momentum)),
-                            ops::mul(unbiased, Scalar(momentum)));
-    }
-    return std::make_tuple(mean, unbiased);
 }
 
 // ---------------------------------------------------------------------------
@@ -1779,14 +1531,11 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, InteropAliasKernels) {
 
     // misc internal spellings
     m.impl("repeat_interleave.Tensor", interop_repeat_interleave_Tensor_cuda);
-    m.impl("embedding_renorm_", interop_embedding_renorm__cuda);
     m.impl("sspaddmm", interop_sspaddmm_cuda);
     m.impl("sspaddmm.out", interop_sspaddmm_out_cuda);
     m.impl("_masked_scale", interop_masked_scale_cuda);
     m.impl("_masked_softmax", interop_masked_softmax_cuda);
     m.impl("_masked_softmax_backward", interop_masked_softmax_backward_cuda);
-    m.impl("_fused_rms_norm", interop_fused_rms_norm_cuda);
-    m.impl("_fused_rms_norm_backward", interop_fused_rms_norm_backward_cuda);
     m.impl("_chunk_cat", interop_chunk_cat_cuda);
     m.impl("_chunk_cat.out", interop__chunk_cat_out_cuda);
     m.impl("_fused_dropout", interop__fused_dropout_cuda);
@@ -1815,15 +1564,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, InteropAliasKernels) {
     m.impl("_native_batch_norm_legit.no_stats_out", interop__native_batch_norm_legit_no_stats_out_cuda);
     m.impl("_batch_norm_with_update", interop__batch_norm_with_update_cuda);
     m.impl("_batch_norm_no_update", interop__batch_norm_no_update_cuda);
-    m.impl("batch_norm_stats", interop_batch_norm_stats_cuda);
-    m.impl("batch_norm_elemt", interop_batch_norm_elemt_cuda);
-    m.impl("batch_norm_elemt.out", interop_batch_norm_elemt_out_cuda);
-    m.impl("batch_norm_backward_reduce", interop_batch_norm_backward_reduce_cuda);
-    m.impl("batch_norm_backward_elemt", interop_batch_norm_backward_elemt_cuda);
-    m.impl("batch_norm_gather_stats", interop_batch_norm_gather_stats_cuda);
-    m.impl("batch_norm_gather_stats_with_counts", interop_batch_norm_gather_stats_with_counts_cuda);
-    m.impl("batch_norm_update_stats", interop_batch_norm_update_stats_cuda);
-
     // fft spellings
     m.impl("_fft_r2c", interop__fft_r2c_cuda);
     m.impl("_fft_r2c.out", interop__fft_r2c_out_cuda);
