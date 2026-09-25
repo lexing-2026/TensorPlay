@@ -273,6 +273,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/TensorCompareKernels.cu
         src/backend/cuda/OpsKernels.cu
         src/backend/cuda/BitwiseKernels.cu
+        src/backend/cuda/BincountKernels.cu
         src/backend/cuda/ReduceKernels.cu
         src/backend/cuda/RNNKernels.cu
         src/backend/cuda/Blas.cu
