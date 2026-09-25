@@ -60,6 +60,9 @@ class _AotNativeGraphBuilder:
         self._fused_out_dtypes: dict[int, Any] = {}
         self._cuda_examples: dict[Any, Any] = {}
         self._cast_memo: dict[tuple[int, Any], tuple[_AotNativeSymbol, _AotNativeSymbol]] = {}
+        # Conversions into the arithmetic width that only a program consumer
+        # can apply on load: symbol id -> (symbol, requested width).
+        self._deferred_casts: dict[int, tuple[_AotNativeSymbol, Any]] = {}
 
     @staticmethod
     def _shape(value: Any) -> tuple[int, ...]:
@@ -422,6 +425,10 @@ class _AotNativeGraphBuilder:
             self._materialize(lhs_symbol)
         if rhs_symbol is not None:
             self._materialize(rhs_symbol)
+        if lhs_symbol is not None:
+            lhs_symbol = self._force_cast(lhs_symbol)
+        if rhs_symbol is not None:
+            rhs_symbol = self._force_cast(rhs_symbol)
         self._fused_flush([])
         native_node = self.graph.create_node(op_name, f"aot_{op_name}_{len(self.graph.nodes)}")
         shape = lhs_symbol.shape if lhs_symbol is not None else rhs_symbol.shape
@@ -451,6 +458,7 @@ class _AotNativeGraphBuilder:
         if fused is not None:
             return fused
         self._materialize(value)
+        value = self._force_cast(value)
         self._fused_flush([])
         native_node = self.graph.create_node(op_name, f"aot_{op_name}_{len(self.graph.nodes)}")
         native_node.add_input(value.value)
@@ -473,6 +481,7 @@ class _AotNativeGraphBuilder:
         # this node would still be undefined when this node reads it.
         for value in args:
             self._materialize(value)
+        args = tuple(self._force_cast(value) for value in args)
         self._fused_flush([])
         native_node = self.graph.create_node(op_name, f"aot_{op_name}_{len(self.graph.nodes)}")
         symbols = self._add_inputs(native_node, args)
@@ -516,6 +525,45 @@ class _AotNativeGraphBuilder:
         normalized = tuple(int(item) for item in shape)
         return self.helper("reshape", (value,), attrs={"shape": normalized}, shape=normalized)  # type: ignore[return-value]
 
+    def _deferrable_widening(self, from_dtype: Any, to_dtype: Any) -> bool:
+        """Whether a conversion can ride the consumer's load-time promotion.
+
+        A program evaluates its operands at one arithmetic width and widens a
+        half-precision input after loading it, so asking such a consumer for
+        a wider value costs nothing: it is the same input, read through the
+        same buffer.  Only the two half-precision types fold into the
+        single-precision value space; every other pair is a real change of
+        storage, and a consumer that names a storage type instead of an
+        arithmetic width has no load step to fold it into.
+        """
+        if from_dtype is None or to_dtype is None:
+            return False
+        low = {"float16", "bfloat16"}
+        return (
+            str(from_dtype).rsplit(".", 1)[-1].lower() in low
+            and str(to_dtype).rsplit(".", 1)[-1].lower() == "float32"
+        )
+
+    def _force_cast(self, symbol: _AotNativeSymbol) -> _AotNativeSymbol:
+        """Give a load-widened value real storage of its declared width.
+
+        Native operators, graph outputs and saved values name a storage type
+        and read the descriptor as it stands, so a conversion left pending
+        for a program has to become a real node before they see it.
+        """
+        entry = self._deferred_casts.get(id(symbol))
+        if entry is None:
+            return symbol
+        del self._deferred_casts[id(symbol)]
+        _, dtype = entry
+        name = str(dtype).rsplit(".", 1)[-1]
+        result = self.helper(
+            "cast", (symbol,), attrs={"dtype": name}, shape=symbol.shape
+        )
+        if isinstance(result, _AotNativeSymbol):
+            result.dtype = dtype
+        return result
+
     def cast(self, value: _AotNativeSymbol, dtype: Any) -> _AotNativeSymbol:
         """Convert a symbol to ``dtype`` (no-op when already in that type).
 
@@ -552,6 +600,15 @@ class _AotNativeGraphBuilder:
             # A different width was already claimed for this result: fall
             # through to a standalone conversion after materializing.
             self._materialize(value)
+        if self._deferrable_widening(value.dtype, dtype):
+            # The value now has a graph value, so its storage type is fixed.
+            # A program consumer widens it on load anyway, so hand out a
+            # symbol that declares the requested width and let the consumers
+            # that name a storage type force the conversion instead.
+            widened = _AotNativeSymbol(self, value.value, value.shape, dtype)
+            self._deferred_casts[id(widened)] = (widened, dtype)
+            self._cast_memo[memo_key] = (value, widened)
+            return widened
         name = str(dtype).rsplit(".", 1)[-1]
         result = self.helper("cast", (value,), attrs={"dtype": name}, shape=value.shape)
         if isinstance(result, _AotNativeSymbol):
@@ -2262,7 +2319,7 @@ def _build_aot_backward(
         if contribution is None:
             continue
         builder._materialize(contribution)
-        builder.graph.register_output(contribution.value)
+        builder.graph.register_output(builder._force_cast(contribution).value)
         grad_positions.append(index)
     if not grad_positions:
         return None
