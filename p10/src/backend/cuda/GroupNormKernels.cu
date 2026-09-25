@@ -71,8 +71,8 @@ __global__ void group_norm_forward_impl(int64_t inner, int64_t spatial,
         sq += v * v;
     }
     layer_norm::ln_block_reduce2(s, sq, smem0, smem1);
-    const ACC mean = smem0[0] / static_cast<ACC>(inner);
-    const ACC var = smem1[0] / static_cast<ACC>(inner) - mean * mean;
+    const ACC mean = s / static_cast<ACC>(inner);
+    const ACC var = sq / static_cast<ACC>(inner) - mean * mean;
     const ACC rstd = layer_norm::ln_rsqrt(var + eps);
     if (threadIdx.x == 0) {
         mean_out[row] = mean;
@@ -115,8 +115,8 @@ __global__ void group_norm_forward_mixed_vec_impl(
         }
     }
     layer_norm::ln_block_reduce2(sum, sum_sq, smem0, smem1);
-    const ACC mean = smem0[0] / static_cast<ACC>(inner);
-    const ACC variance = smem1[0] / static_cast<ACC>(inner) - mean * mean;
+    const ACC mean = sum / static_cast<ACC>(inner);
+    const ACC variance = sum_sq / static_cast<ACC>(inner) - mean * mean;
     const ACC rstd = layer_norm::ln_rsqrt(variance + eps);
     if (threadIdx.x == 0) {
         mean_out[row] = mean;
@@ -169,8 +169,8 @@ __global__ void group_norm_forward_mixed_impl(
         sum_sq += value * value;
     }
     layer_norm::ln_block_reduce2(sum, sum_sq, smem0, smem1);
-    const ACC mean = smem0[0] / static_cast<ACC>(inner);
-    const ACC variance = smem1[0] / static_cast<ACC>(inner) - mean * mean;
+    const ACC mean = sum / static_cast<ACC>(inner);
+    const ACC variance = sum_sq / static_cast<ACC>(inner) - mean * mean;
     const ACC rstd = layer_norm::ln_rsqrt(variance + eps);
     if (threadIdx.x == 0) {
         mean_out[row] = mean;
@@ -208,8 +208,8 @@ __global__ void group_norm_grad_input_impl(int64_t inner, int64_t spatial,
         s_dy_xhat += d * (static_cast<ACC>(X[off + j]) - m) * r;
     }
     layer_norm::ln_block_reduce2(s_dy, s_dy_xhat, smem0, smem1);
-    const ACC k = smem0[0];
-    const ACC kx = smem1[0];
+    const ACC k = s_dy;
+    const ACC kx = s_dy_xhat;
 
     for (int64_t j = threadIdx.x; j < inner; j += blockDim.x) {
         const ACC d = static_cast<ACC>(dY[off + j]);
@@ -315,8 +315,8 @@ __global__ void group_norm_moments_vec_impl(int64_t inner, ACC eps,
     }
     layer_norm::ln_block_reduce2(s, sq, smem0, smem1);
     if (threadIdx.x == 0) {
-        const ACC mean = smem0[0] / static_cast<ACC>(inner);
-        const ACC var = smem1[0] / static_cast<ACC>(inner) - mean * mean;
+        const ACC mean = s / static_cast<ACC>(inner);
+        const ACC var = sq / static_cast<ACC>(inner) - mean * mean;
         mean_out[row] = mean;
         rstd_out[row] = layer_norm::ln_rsqrt(var + eps);
     }
@@ -340,8 +340,8 @@ __global__ void group_norm_moments_impl(int64_t inner, ACC eps,
     }
     layer_norm::ln_block_reduce2(s, sq, smem0, smem1);
     if (threadIdx.x == 0) {
-        const ACC mean = smem0[0] / static_cast<ACC>(inner);
-        const ACC var = smem1[0] / static_cast<ACC>(inner) - mean * mean;
+        const ACC mean = s / static_cast<ACC>(inner);
+        const ACC var = sq / static_cast<ACC>(inner) - mean * mean;
         mean_out[row] = mean;
         rstd_out[row] = layer_norm::ln_rsqrt(var + eps);
     }
@@ -371,8 +371,8 @@ __global__ void group_norm_forward_vec_impl(
         }
     }
     layer_norm::ln_block_reduce2(sum, sum_sq, smem0, smem1);
-    const ACC mean = smem0[0] / static_cast<ACC>(inner);
-    const ACC variance = smem1[0] / static_cast<ACC>(inner) - mean * mean;
+    const ACC mean = sum / static_cast<ACC>(inner);
+    const ACC variance = sum_sq / static_cast<ACC>(inner) - mean * mean;
     const ACC rstd = layer_norm::ln_rsqrt(variance + eps);
     if (threadIdx.x == 0) {
         mean_out[row] = mean;
@@ -431,8 +431,8 @@ __global__ void group_norm_internal_grads_vec_impl(int64_t spatial,
     }
     layer_norm::ln_block_reduce2(s1, s2, smem0, smem1);
     if (threadIdx.x == 0) {
-        ds_out[nc] = smem0[0];
-        db_out[nc] = smem1[0];
+        ds_out[nc] = s1;
+        db_out[nc] = s2;
     }
 }
 
@@ -463,8 +463,8 @@ __global__ void group_norm_internal_grads_tail_impl(int64_t spatial,
     }
     layer_norm::ln_block_reduce2(s1, s2, smem0, smem1);
     if (threadIdx.x == 0) {
-        ds_out[nc] = smem0[0];
-        db_out[nc] = smem1[0];
+        ds_out[nc] = s1;
+        db_out[nc] = s2;
     }
 }
 
@@ -487,8 +487,8 @@ __global__ void group_norm_internal_grads_impl(int64_t spatial,
     }
     layer_norm::ln_block_reduce2(s1, s2, smem0, smem1);
     if (threadIdx.x == 0) {
-        ds_out[nc] = smem0[0];
-        db_out[nc] = smem1[0];
+        ds_out[nc] = s1;
+        db_out[nc] = s2;
     }
 }
 
@@ -515,8 +515,8 @@ __global__ void group_norm_internal_grads_mixed_vec_impl(
     }
     layer_norm::ln_block_reduce2(s1, s2, smem0, smem1);
     if (threadIdx.x == 0) {
-        ds_out[nc] = smem0[0];
-        db_out[nc] = smem1[0];
+        ds_out[nc] = s1;
+        db_out[nc] = s2;
     }
 }
 
@@ -555,8 +555,8 @@ __global__ void group_norm_internal_grads_mixed_impl(
     }
     layer_norm::ln_block_reduce2(s1, s2, smem0, smem1);
     if (threadIdx.x == 0) {
-        ds_out[nc] = smem0[0];
-        db_out[nc] = smem1[0];
+        ds_out[nc] = s1;
+        db_out[nc] = s2;
     }
 }
 
@@ -588,8 +588,8 @@ __global__ void group_norm_bwd_fused_params_impl(int64_t cpg, int64_t inner,
     }
     layer_norm::ln_block_reduce2(s1, s2, smem0, smem1);
     if (threadIdx.x == 0) {
-        const ACC s1v = smem0[0];
-        const ACC s2v = smem1[0];
+        const ACC s1v = s1;
+        const ACC s2v = s2;
         const ACC mm = mean[row];
         const ACC r = rstd[row];
         const ACC sc = ACC(1) / static_cast<ACC>(inner);
@@ -657,8 +657,8 @@ __global__ void group_norm_dx_fused_vec_impl(
     const ACC mm = mean[row];
     const ACC r = rstd[row];
     const ACC scale = ACC(1) / static_cast<ACC>(inner);
-    const ACC a2 = (smem1[0] * mm - smem0[0]) * r * r * r * scale;
-    const ACC a3 = -a2 * mm - smem1[0] * r * scale;
+    const ACC a2 = (s2 * mm - s1) * r * r * r * scale;
+    const ACC a3 = -a2 * mm - s2 * r * scale;
 
     const GNVec<T, V>* dyv = reinterpret_cast<const GNVec<T, V>*>(dY + row * inner);
     const GNVec<T, V>* xv = reinterpret_cast<const GNVec<T, V>*>(X + row * inner);
@@ -714,8 +714,8 @@ __global__ void group_norm_dx_fused_mixed_vec_impl(
     const float m = mean[row];
     const float r = rstd[row];
     const float scale = 1.0f / static_cast<float>(inner);
-    const float a2 = (smem1[0] * m - smem0[0]) * r * r * r * scale;
-    const float a3 = -a2 * m - smem1[0] * r * scale;
+    const float a2 = (s2 * m - s1) * r * r * r * scale;
+    const float a3 = -a2 * m - s2 * r * scale;
     const GNVec<float, V>* dyv =
         reinterpret_cast<const GNVec<float, V>*>(dY + row * inner);
     const GNVec<T, V>* xv = reinterpret_cast<const GNVec<T, V>*>(X + row * inner);
@@ -769,8 +769,8 @@ __global__ void group_norm_dx_fused_mixed_impl(
     const float m = mean[row];
     const float r = rstd[row];
     const float scale = 1.0f / static_cast<float>(inner);
-    const float a2 = (smem1[0] * m - smem0[0]) * r * r * r * scale;
-    const float a3 = -a2 * m - smem1[0] * r * scale;
+    const float a2 = (s2 * m - s1) * r * r * r * scale;
+    const float a3 = -a2 * m - s2 * r * scale;
     const T* x = X + row * inner;
     T* dx = dX + row * inner;
     for (int64_t j = threadIdx.x; j < inner; j += blockDim.x) {

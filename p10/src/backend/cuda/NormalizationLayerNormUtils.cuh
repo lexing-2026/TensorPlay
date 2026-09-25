@@ -11,6 +11,10 @@ constexpr int kLNThreads = 256;
 __device__ inline float ln_rsqrt(float v) { return rsqrtf(v); }
 __device__ inline double ln_rsqrt(double v) { return 1.0 / ::sqrt(v); }
 
+// Two-sum block reduction for blocks of at most kLNThreads threads.  On
+// return ``v0``/``v1`` hold the block totals in every thread; ``smem0`` and
+// ``smem1`` hold only the per-warp partials and must not be read as totals.
+// One barrier: rotate buffers across consecutive reductions.
 template <typename ACC>
 __device__ inline void ln_block_reduce2(ACC& v0, ACC& v1, ACC* smem0, ACC* smem1) {
     const int lane = static_cast<int>(threadIdx.x) & 31;
