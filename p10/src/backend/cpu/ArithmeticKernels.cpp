@@ -442,6 +442,36 @@ ctype div_scalar_element(ctype a, const Scalar& other) {
     }
 }
 
+// Same-shape elementwise results keep a channels-last operand layout, so
+// residual chains around channels-last convolutions stay repack-free.
+static bool binary_keep_channels_last(const Tensor& a, const Tensor& b) {
+    return a.dim() == 4 && a.dim() == b.dim() &&
+           static_cast<std::vector<int64_t>>(a.shape()) ==
+               static_cast<std::vector<int64_t>>(b.shape()) &&
+           a.is_contiguous(MemoryFormat::ChannelsLast) &&
+           b.is_contiguous(MemoryFormat::ChannelsLast);
+}
+
+static Tensor empty_binary_result(const Tensor& a, const Tensor& b,
+                                  const std::vector<int64_t>& out_shape, DType dt) {
+    Tensor result = Tensor::empty(out_shape, dt, a.device());
+    if (binary_keep_channels_last(a, b)) {
+        result = result.as_strided(out_shape, get_channels_last_strides(out_shape), 0);
+    }
+    return result;
+}
+
+// A scalar operand carries no layout, so a channels-last tensor keeps its
+// layout through scalar arithmetic.
+static Tensor empty_scalar_result(const Tensor& self, DType dt) {
+    const auto sizes = static_cast<std::vector<int64_t>>(self.shape());
+    Tensor result = Tensor::empty(sizes, dt, self.device());
+    if (self.dim() == 4 && self.is_contiguous(MemoryFormat::ChannelsLast)) {
+        result = result.as_strided(sizes, get_channels_last_strides(sizes), 0);
+    }
+    return result;
+}
+
 template<typename Op, typename MklOp>
 Tensor binary_op_kernel_impl(const Tensor& self, const Tensor& other, Op op, MklOp mkl_op, bool use_mkl_op = false, bool force_float = false) {
     std::vector<int64_t> out_shape;
@@ -462,11 +492,11 @@ Tensor binary_op_kernel_impl(const Tensor& self, const Tensor& other, Op op, Mkl
         result_dtype = DType::Float32;
     }
 
-    Tensor result = Tensor::empty(out_shape, result_dtype, self.device());
-    
+    Tensor result = empty_binary_result(self, other, out_shape, result_dtype);
+
     bool optimized = false;
-    if (result_dtype == DType::Float32 && 
-        self.dtype() == DType::Float32 && 
+    if (result_dtype == DType::Float32 &&
+        self.dtype() == DType::Float32 &&
         other.dtype() == DType::Float32 &&
         self.is_contiguous() && other.is_contiguous() && result.is_contiguous() &&
         self.shape() == other.shape()) {
@@ -879,20 +909,26 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) 
     if (alpha.isFloatingPoint() && !isFloatingType(result_dtype)) {
         result_dtype = promoteTypes(result_dtype, DType::Float32);
     }
-    Tensor result = Tensor::empty(out_shape, result_dtype, self.device());
+    Tensor result = empty_binary_result(self, other, out_shape, result_dtype);
 
     bool optimized = false;
     // Optimization for same-shape tensors (handles contiguous and non-contiguous via temporary copies)
-    if (result_dtype == DType::Float32 && 
-        self.dtype() == DType::Float32 && 
+    if (result_dtype == DType::Float32 &&
+        self.dtype() == DType::Float32 &&
         other.dtype() == DType::Float32 &&
         self.shape() == other.shape()) {
-        
+
+        // Flat iteration needs one consistent storage order: channels-last
+        // operands are consumed in their own physical order, everything else
+        // normalizes to row-major.
+        const bool flat_cl = binary_keep_channels_last(self, other) &&
+                             result.is_contiguous(MemoryFormat::ChannelsLast);
         // Create contiguous accessors (might trigger copy)
-        Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
-        Tensor other_contig = other.is_contiguous() ? other : other.contiguous();
-        // Result is already contiguous if created via empty(), but check to be safe or if passed in
-        Tensor result_contig = result.is_contiguous() ? result : result.contiguous();
+        Tensor self_contig = (flat_cl || self.is_contiguous()) ? self : self.contiguous();
+        Tensor other_contig = (flat_cl || other.is_contiguous()) ? other : other.contiguous();
+        // Result matches the chosen order (allocated channels-last above when
+        // both operands are channels-last), but check to be safe or if passed in
+        Tensor result_contig = (flat_cl || result.is_contiguous()) ? result : result.contiguous();
 
         int64_t n = self_contig.numel();
         float alpha_val = alpha.to<float>();
@@ -1068,11 +1104,11 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) 
         self.numel() >= 4096) {
         const double a = alpha.toDouble();
         if (a == 1.0 || a == -1.0) {
-            Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
-            Tensor other_contig = other.is_contiguous() ? other : other.contiguous();
-            Tensor out = Tensor::empty(
-                static_cast<std::vector<int64_t>>(self.shape()), self.dtype(),
-                self.device());
+            const bool flat_cl = binary_keep_channels_last(self, other);
+            Tensor self_contig = (flat_cl || self.is_contiguous()) ? self : self.contiguous();
+            Tensor other_contig = (flat_cl || other.is_contiguous()) ? other : other.contiguous();
+            Tensor out = empty_binary_result(self, other,
+                static_cast<std::vector<int64_t>>(self.shape()), self.dtype());
             const veccomplex::Op vop =
                 a == 1.0 ? veccomplex::Op::Add : veccomplex::Op::Sub;
             if (veccomplex::try_binary(self_contig.data_ptr(),
@@ -1091,9 +1127,11 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) 
         self.dtype() == DType::Float64 &&
         other.dtype() == DType::Float64 &&
         self.shape() == other.shape()) {
-        Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
-        Tensor other_contig = other.is_contiguous() ? other : other.contiguous();
-        Tensor result_contig = result.is_contiguous() ? result : result.contiguous();
+        const bool flat_cl = binary_keep_channels_last(self, other) &&
+                             result.is_contiguous(MemoryFormat::ChannelsLast);
+        Tensor self_contig = (flat_cl || self.is_contiguous()) ? self : self.contiguous();
+        Tensor other_contig = (flat_cl || other.is_contiguous()) ? other : other.contiguous();
+        Tensor result_contig = (flat_cl || result.is_contiguous()) ? result : result.contiguous();
         int64_t n = self_contig.numel();
         const double alpha_val = alpha.toDouble();
         double* r_ptr = result_contig.data_ptr<double>();
@@ -2414,7 +2452,7 @@ Tensor add_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& 
     }
 #endif
 
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
+    Tensor result = empty_scalar_result(self, result_dtype);
     Tensor self_casted = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
 
     #define OP_CASE(ctype, name) \
@@ -2468,7 +2506,7 @@ Tensor sub_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& 
     }
 #endif
 
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
+    Tensor result = empty_scalar_result(self, result_dtype);
     Tensor self_casted = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
 
     #define OP_CASE(ctype, name) \
@@ -2530,7 +2568,7 @@ Tensor mul_scalar_kernel(const Tensor& self, const Scalar& other) {
     }
 #endif
 
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
+    Tensor result = empty_scalar_result(self, result_dtype);
     Tensor self_casted = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
 
     #define OP_CASE(ctype, name) \
@@ -2599,7 +2637,7 @@ Tensor div_scalar_kernel(const Tensor& self, const Scalar& other) {
     }
 #endif
 
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
+    Tensor result = empty_scalar_result(self, result_dtype);
     Tensor self_casted = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
 
     // Half/BFloat16 element types do not model a floating-point type, so the
