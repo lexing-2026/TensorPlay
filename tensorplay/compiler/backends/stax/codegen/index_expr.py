@@ -82,7 +82,7 @@ class Symbol(Expr):
         self.name = str(name)
 
     def _key(self) -> Any:
-        return self.name
+        return ("S", self.name)
 
 
 class Const(Expr):
@@ -94,7 +94,7 @@ class Const(Expr):
         self.value = int(value)
 
     def _key(self) -> Any:
-        return self.value
+        return ("C", self.value)
 
 
 _Zero = Const(0)
@@ -111,7 +111,10 @@ class Add(Expr):
         self.offset = offset
 
     def _key(self) -> Any:
+        # Keys are plain nested tuples of primitives, so sorting them never
+        # reaches an expression object (which has no ordering).
         return (
+            "A",
             tuple(sorted((t._key(), c) for t, c in self.terms.items())),
             self.offset,
         )
@@ -127,7 +130,7 @@ class Mul(Expr):
         self.operand = operand
 
     def _key(self) -> Any:
-        return (self.scalar, self.operand)
+        return ("M", self.scalar, self.operand._key())
 
 
 class FloorDiv(Expr):
@@ -140,7 +143,7 @@ class FloorDiv(Expr):
         self.divisor = divisor
 
     def _key(self) -> Any:
-        return (self.numerator, self.divisor)
+        return ("F", self.numerator._key(), self.divisor)
 
 
 class ModularIndexing(Expr):
@@ -154,7 +157,7 @@ class ModularIndexing(Expr):
         self.modulus = modulus
 
     def _key(self) -> Any:
-        return (self.base, self.divisor, self.modulus)
+        return ("MI", self.base._key(), self.divisor, self.modulus)
 
 
 class Where(Expr):
@@ -168,7 +171,7 @@ class Where(Expr):
         self.right = right
 
     def _key(self) -> Any:
-        return (self.condition, self.left, self.right)
+        return ("W", self.condition._key(), self.left._key(), self.right._key())
 
 
 def _lift(value: Any) -> Expr:
@@ -512,4 +515,156 @@ def render(expr: Expr) -> str:
             f"(({render(expr.condition)}) ? ({render(expr.left)})"
             f" : ({render(expr.right)}))"
         )
+    raise TypeError(f"unrenderable index expression: {expr!r}")
+
+
+# ---------------------------------------------------------------------------
+# Rewriting
+# ---------------------------------------------------------------------------
+
+
+def substitute(expr: Expr, mapping: dict[Symbol, Expr]) -> Expr:
+    """Replace symbols by expressions, re-canonicalizing on the way up."""
+    if isinstance(expr, Symbol):
+        return mapping.get(expr, expr)
+    if isinstance(expr, Const):
+        return expr
+    if isinstance(expr, Add):
+        acc: Expr = Const(expr.offset)
+        for term, coeff in expr.terms.items():
+            acc = _add(acc, _mul(Const(coeff), substitute(term, mapping)))
+        return acc
+    if isinstance(expr, Mul):
+        return _mul(Const(expr.scalar), substitute(expr.operand, mapping))
+    if isinstance(expr, FloorDiv):
+        return floordiv(substitute(expr.numerator, mapping), Const(expr.divisor))
+    if isinstance(expr, ModularIndexing):
+        return modular_indexing(
+            substitute(expr.base, mapping), expr.divisor, expr.modulus
+        )
+    if isinstance(expr, Where):
+        return Where(
+            substitute(expr.condition, mapping),
+            substitute(expr.left, mapping),
+            substitute(expr.right, mapping),
+        )
+    raise TypeError(f"cannot substitute into {expr!r}")
+
+
+def _terms(expr: Expr) -> tuple[dict[Expr, int], int]:
+    """``expr`` as (term -> coefficient, constant offset)."""
+    if isinstance(expr, Const):
+        return {}, expr.value
+    if isinstance(expr, Add):
+        return dict(expr.terms), expr.offset
+    if isinstance(expr, Mul):
+        return {expr.operand: expr.scalar}, 0
+    return {expr: 1}, 0
+
+
+def _from_terms(terms: dict[Expr, int], offset: int) -> Expr:
+    acc: Expr = Const(offset)
+    for term, coeff in terms.items():
+        acc = _add(acc, _mul(Const(coeff), term))
+    return acc
+
+
+def _split_multiples(expr: Expr, divisor: int) -> tuple[Expr, Expr]:
+    """``expr == divisor * quotient + rest`` over whole coefficients."""
+    terms, offset = _terms(expr)
+    quotient: dict[Expr, int] = {}
+    rest: dict[Expr, int] = {}
+    for term, coeff in terms.items():
+        if coeff % divisor == 0:
+            quotient[term] = coeff // divisor
+        else:
+            rest[term] = coeff
+    return (
+        _from_terms(quotient, offset // divisor),
+        _from_terms(rest, offset % divisor),
+    )
+
+
+def _within(expr: Expr, ranges: dict[Symbol, ValueRange], lo: int, hi: int) -> bool:
+    r = value_range(expr, ranges)
+    return r.lo is not None and r.hi is not None and r.lo >= lo and r.hi <= hi
+
+
+def simplify(expr: Expr, ranges: dict[Symbol, ValueRange]) -> Expr:
+    """Fold divisions the operands' value ranges make exact.
+
+    ``(d*q + r) // d`` is ``q`` and ``((d*q + r) // d) % m`` is ``q`` when
+    ``0 <= r < d`` and ``0 <= q < m``; a base already below ``d`` divides
+    to zero, and multiples of ``d*m`` vanish under the modulus.
+    """
+    if isinstance(expr, (Symbol, Const)):
+        return expr
+    if isinstance(expr, Add):
+        acc: Expr = Const(expr.offset)
+        for term, coeff in expr.terms.items():
+            acc = _add(acc, _mul(Const(coeff), simplify(term, ranges)))
+        return acc
+    if isinstance(expr, Mul):
+        return _mul(Const(expr.scalar), simplify(expr.operand, ranges))
+    if isinstance(expr, FloorDiv):
+        base = simplify(expr.numerator, ranges)
+        d = expr.divisor
+        if isinstance(base, FloorDiv):
+            # floor(floor(a / d1) / d2) == floor(a / (d1 * d2))
+            base, d = base.numerator, base.divisor * d
+        # floor((d*q + r) / d) == q + floor(r / d) for integer q.
+        quotient, rest = _split_multiples(base, d)
+        if _within(rest, ranges, 0, d - 1):
+            return quotient
+        return _add(quotient, floordiv(rest, Const(d)))
+    if isinstance(expr, ModularIndexing):
+        base = simplify(expr.base, ranges)
+        d, m = expr.divisor, expr.modulus
+        # multiples of d*m vanish under the modulus
+        _, base = _split_multiples(base, d * m)
+        if _within(base, ranges, 0, d * m - 1):
+            return simplify(floordiv(base, Const(d)), ranges)
+        quotient, rest = _split_multiples(base, d)
+        if _within(rest, ranges, 0, d - 1):
+            if _within(quotient, ranges, 0, m - 1):
+                return quotient
+            return modular_indexing(quotient, 1, m)
+        return modular_indexing(base, d, m)
+    if isinstance(expr, Where):
+        return Where(
+            simplify(expr.condition, ranges),
+            simplify(expr.left, ranges),
+            simplify(expr.right, ranges),
+        )
+    return expr
+
+
+def render_python(expr: Expr) -> str:
+    """Rendering for non-negative index arithmetic in Python-syntax kernels."""
+    if isinstance(expr, Const):
+        return str(expr.value)
+    if isinstance(expr, Symbol):
+        return expr.name
+    if isinstance(expr, Add):
+        parts = []
+        for term, coeff in expr.terms.items():
+            rendered = render_python(term)
+            if coeff == 1:
+                parts.append(rendered)
+            elif coeff == -1:
+                parts.append(f"-({rendered})")
+            else:
+                parts.append(f"{coeff}*({rendered})")
+        if expr.offset:
+            parts.append(str(expr.offset))
+        return "(" + " + ".join(parts) + ")" if parts else "0"
+    if isinstance(expr, Mul):
+        return f"{expr.scalar}*({render_python(expr.operand)})"
+    if isinstance(expr, FloorDiv):
+        return f"(({render_python(expr.numerator)}) // {expr.divisor})"
+    if isinstance(expr, ModularIndexing):
+        base = render_python(expr.base)
+        if expr.divisor != 1:
+            base = f"(({base}) // {expr.divisor})"
+        return f"(({base}) % {expr.modulus})"
     raise TypeError(f"unrenderable index expression: {expr!r}")
