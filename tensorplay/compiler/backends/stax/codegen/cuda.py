@@ -4,7 +4,7 @@ import math
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from ..backend import _TRITON_OPCODES
+from ..pointwise import _TRITON_OPCODES
 
 
 _MAX_INPUTS = 32

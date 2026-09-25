@@ -47,16 +47,18 @@ from ..scheduler import segment_graph
 # load cache annotations, new fused opcodes) so stale generated sources
 # cannot be replayed against a new compiler.
 _CODEGEN_VERSION = "m10-2026-09-21-variance-moments"
-from ..backend import (
+from ..ir import (
+    _nodes,
+    _normalize_pointwise_grad_output,
+    _target_name,
+)
+from ..pointwise import (
     _CPU_FUSED_AUTOGRAD_OPS,
     _CPU_FUSED_OPS,
     _CAST_DTYPE_IDS,
     _TRITON_OPCODES,
     _build_fused_gradient_graphs,
     _build_pointwise_program,
-    _nodes,
-    _normalize_pointwise_grad_output,
-    _target_name,
 )
 from ..runtime.stax_autotune import disabled as disabled_autotune
 
