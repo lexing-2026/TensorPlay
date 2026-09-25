@@ -6,6 +6,9 @@
 #include "LinearAlgebraNames.h"
 #include "Profiler.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
+#ifdef USE_CUDA
+#include "CUDARuntime.h"
+#endif
 #include <limits>
 #include <algorithm>
 #include <utility>
@@ -48,6 +51,18 @@ inline bool engine_trace_enabled() {
     return on;
 }
 #define TP_ENGINE_TRACE(msg) do { if (engine_trace_enabled()) fprintf(stderr, "[tp-engine] %s\n", (msg)); } while (0)
+
+inline bool current_cuda_stream_is_capturing() {
+#ifdef USE_CUDA
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    const cudaError_t error = cudaStreamIsCapturing(
+        tensorplay::cuda::getCurrentCUDAStream().stream(), &status);
+    return error == cudaSuccess &&
+           status == cudaStreamCaptureStatusActive;
+#else
+    return false;
+#endif
+}
 
 // ---------------------------------------------------------------------------
 // Structured backward-graph tracing (TP_ENGINE_TRACE).
@@ -711,7 +726,8 @@ variable_list Engine::execute(const edge_list& root_edges, const variable_list& 
     // (device worker or the initiating thread mid-drain): such a thread can no
     // longer service its own ready queue, so a task pushed there would never
     // run -- every task must stay on the local queue this call drains itself.
-    const bool nested = nested_depth() > 0 || current_graph_task != nullptr;
+    const bool nested = nested_depth() > 0 || current_graph_task != nullptr ||
+                        current_cuda_stream_is_capturing();
 
     // Queue the root. In nested mode every task stays on a local queue that
     // only this thread drains, so reentrant backward can never deadlock
