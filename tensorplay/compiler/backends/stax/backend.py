@@ -3548,14 +3548,15 @@ def _native_fused_pointwise_plans(
         )
         # Sample tensors describe the plan for the generated kernel: the
         # generator reads only their shape/dtype/device, never the values.
-        # Contiguous values go in as-is; others stand in for zero fill-ins
-        # of the same layout so broadcast operands and mixed input dtypes
-        # reach the Triton generator (which addresses them in place) instead
-        # of the wrapper that materializes them on every call.
+        # Contiguous values go in as-is; non-contiguous ones stand in as
+        # uninitialized buffers of the same layout -- allocating them without
+        # a fill keeps plan registration off the memory peak of a large
+        # compile, and the warm-up launches overwrite whatever the buffers
+        # hold.
         examples = [
             value
             if value.is_contiguous()
-            else tensorplay.zeros(
+            else tensorplay.empty(
                 tuple(int(item) for item in value.shape),
                 dtype=value.dtype,
                 device=value.device,
