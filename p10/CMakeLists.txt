@@ -200,6 +200,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/QuantKernels.cu
         src/backend/cuda/FakeQuantKernels.cu
         src/backend/cuda/DynamicQuantKernels.cu
+        src/backend/cuda/QuantizedTensorKernels.cu
         src/backend/cuda/QuantIntComputeKernels.cu
         src/backend/cuda/QuantGemmKernels.cu
         src/backend/cuda/ForwardKernels.cu
