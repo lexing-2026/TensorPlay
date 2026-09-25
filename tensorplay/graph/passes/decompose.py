@@ -611,6 +611,104 @@ def _log_softmax(graph: Graph, node: Node) -> Node:
     return _binop(graph, operator.sub, shifted, _unop(graph, "log", total))
 
 
+def _group_norm_arguments(node: Node) -> Any:
+    """Read ``(input, num_groups, weight, bias, eps)`` from a group_norm call.
+
+    The functional wrapper spells all five positionally; anything else
+    (keyword forms, non-integer group counts) stays with the native kernel.
+    """
+
+    if node.op != "call_function":
+        return None
+    rest = list(node.args)
+    if len(rest) != 5 or node.kwargs:
+        return None
+    input_node, num_groups, weight_node, bias_node, eps = rest
+    if (
+        not isinstance(input_node, Node)
+        or isinstance(num_groups, bool)
+        or not isinstance(num_groups, int)
+        or num_groups <= 0
+        or not isinstance(eps, (int, float))
+    ):
+        return None
+    return (input_node, int(num_groups), weight_node, bias_node, float(eps))
+
+
+@_row_norm("group_norm")
+def _group_norm(graph: Graph, node: Node) -> Node:
+    """group_norm(x, g, w, b, eps) -> (x-m)/sqrt(var+eps)*w + b per (n, g) row.
+
+    The per-row statistics are means over the group's element count: the
+    group spans ``C/g`` channels behind one spatial extent, flattened to a
+    single row axis, so the whole composite reduces to row ``sum``s and
+    pointwise arithmetic.
+    """
+
+    parsed = _group_norm_arguments(node)
+    if parsed is None:
+        return node
+    input_node, num_groups, weight_node, bias_node, eps = parsed
+
+    shape = input_node.meta.get("val")
+    shape = getattr(shape, "shape", None)
+    if shape is None:
+        return node
+    if len(shape) < 2 or shape[1] % num_groups:
+        return node
+    channels = int(shape[1])
+    inner = 1
+    for dim in shape[2:]:
+        inner *= int(dim)
+    if inner == 0:
+        return node
+    group_size = (channels // num_groups) * inner
+
+    # Each group's channels and its spatial extent fold into one row axis:
+    # flatten(1) yields (n, C*spatial), the unflatten views it as
+    # (n, g, C/g, spatial), and the rows reduce to their own moments.  The
+    # final flatten(2) collapses the trailing pair back into the group row
+    # so the per-channel affine broadcasts one (g, C/g, 1) view.
+    flat = graph.create_node(
+        "call_method", "flatten", (input_node, 1)
+    )
+    rows = graph.create_node(
+        "call_method", "unflatten",
+        (flat, 1, (num_groups, channels // num_groups, inner)),
+    )
+    total = graph.create_node("call_method", "sum", (rows, [2, 3], True))
+    mean = _binop(graph, operator.truediv, total, float(group_size))
+    centered = _binop(graph, operator.sub, rows, mean)
+    sq = _binop(graph, operator.mul, centered, centered)
+    sq_total = graph.create_node("call_method", "sum", (sq, [2, 3], True))
+    variance = _binop(graph, operator.truediv, sq_total, float(group_size))
+    scale = _unop(
+        graph, "rsqrt", _binop(graph, operator.add, variance, eps)
+    )
+    normalized = _binop(graph, operator.mul, centered, scale)
+    # (n, g, C/g, inner) rows merge back to per-channel layout: flatten
+    # folds the group and within-group channel axes into C, the per-channel
+    # affine broadcasts one (1, C, 1) view, and the final unflatten restores
+    # the trailing spatial extents.
+    out = graph.create_node(
+        "call_method", "flatten", (normalized, 1, 2)
+    )
+    if weight_node is not None and isinstance(weight_node, Node):
+        wide = graph.create_node(
+            "call_method", "reshape", (weight_node, (1, channels, 1))
+        )
+        out = _binop(graph, operator.mul, out, wide)
+    if bias_node is not None and isinstance(bias_node, Node):
+        wide = graph.create_node(
+            "call_method", "reshape", (bias_node, (1, channels, 1))
+        )
+        out = _binop(graph, operator.add, out, wide)
+    out = graph.create_node(
+        "call_method", "unflatten", (out, 2, shape[2:])
+    )
+    return out
+
+
 def _rewrite(
     graph_module: GraphModule, table: Dict[str, Callable[[Graph, Node], Node]]
 ) -> PassResult:
