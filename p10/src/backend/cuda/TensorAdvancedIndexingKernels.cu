@@ -614,5 +614,28 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, TensorAdvancedIndexingKernels) {
     m.impl("_index_put_impl_", index_put_impl_cuda);
 }
 
+extern Tensor sum_dim_kernel(const Tensor& self,
+                             const std::vector<int64_t>& dim,
+                             bool keepdim, DType dtype);
+
+// count_nonzero counts the nonzeros of a dense tensor, so it belongs with
+// the advanced-indexing scan helpers rather than the reduction kernels.
+namespace {
+
+Tensor count_nonzero_cuda2(const Tensor& self, const std::vector<int64_t>& dim) {
+    Tensor reduce = self.dtype() == DType::Bool
+        ? self
+        : self.ne(Scalar(0));
+    if (self.dim() == 0 && dim.empty()) return reduce.to(DType::Int64);
+    return sum_dim_kernel(reduce, dim, false, DType::Int64);
+}
+
+} // namespace
+
+TENSORPLAY_LIBRARY_IMPL(CUDA, TensorAdvancedIndexingKernelsCountNonzero) {
+    m.impl("count_nonzero", count_nonzero_cuda2);
+    m.impl("count_nonzero.dim_IntList", count_nonzero_cuda2);
+}
+
 } // namespace cuda
 } // namespace tensorplay

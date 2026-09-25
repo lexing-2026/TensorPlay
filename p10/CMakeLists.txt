@@ -314,7 +314,14 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/BincountKernels.cu
         src/backend/cuda/SearchsortedKernels.cu
         src/backend/cuda/ScanKernels.cu
-        src/backend/cuda/ReduceKernels.cu
+        src/backend/cuda/ReduceSumProdKernels.cu
+        src/backend/cuda/ReduceMaxValuesKernels.cu
+        src/backend/cuda/ReduceMinValuesKernels.cu
+        src/backend/cuda/ReduceAMinMaxKernels.cu
+        src/backend/cuda/ReduceMomentKernels.cu
+        src/backend/cuda/CumminmaxKernels.cu
+        src/backend/cuda/SummaryOpsKernels.cu
+        src/backend/cuda/RenormKernels.cu
         src/backend/cuda/RNNKernels.cu
         src/backend/cuda/Blas.cu
         src/backend/cuda/BatchLinearAlgebra.cu
