@@ -346,6 +346,79 @@ void init_ops(py::module_& m) {
               return result;
           }, "tensorlistlist"_a, "with_indices"_a = false);
 
+    // Fast-path restrictions of the fused multi-tensor kernels, checked in one
+    // native pass: every tensor in ``tensor_lists`` shares the device and
+    // element type of the first one, index-aligned tensors share one shape,
+    // and every tensor is dense, contiguous and not sparse.  Empty lists are
+    // allowed.  ``steps`` (may be empty) must hold one contiguous element per
+    // tensor, on the host when ``host_steps`` is set and on the tensors'
+    // device otherwise.
+    m.def("_foreach_fast_path_ready",
+          [](const py::sequence& tensor_lists, const py::sequence& steps,
+             bool host_steps) -> bool {
+              const size_t list_count = static_cast<size_t>(py::len(tensor_lists));
+              if (list_count == 0) {
+                  return false;
+              }
+              const py::sequence first_list =
+                  py::reinterpret_borrow<py::sequence>(tensor_lists[0]);
+              const size_t count = static_cast<size_t>(py::len(first_list));
+              if (count == 0) {
+                  return false;
+              }
+              const Tensor& reference = py::cast<const Tensor&>(first_list[0]);
+              const Device device = reference.device();
+              const DType dtype = reference.dtype();
+              std::vector<const Tensor*> anchors(count, nullptr);
+              for (size_t list_index = 0; list_index < list_count; ++list_index) {
+                  const py::sequence list =
+                      py::reinterpret_borrow<py::sequence>(tensor_lists[list_index]);
+                  const size_t size = static_cast<size_t>(py::len(list));
+                  if (size == 0) {
+                      continue;
+                  }
+                  if (size != count) {
+                      return false;
+                  }
+                  for (size_t index = 0; index < count; ++index) {
+                      const py::handle item = list[index];
+                      if (item.is_none() || !py::isinstance<Tensor>(item)) {
+                          return false;
+                      }
+                      const Tensor& tensor = py::cast<const Tensor&>(item);
+                      if (tensor.is_sparse() || tensor.device() != device ||
+                          tensor.dtype() != dtype || !tensor.is_contiguous()) {
+                          return false;
+                      }
+                      if (anchors[index] == nullptr) {
+                          anchors[index] = &tensor;
+                      } else if (anchors[index]->sizes() != tensor.sizes()) {
+                          return false;
+                      }
+                  }
+              }
+              const size_t step_count = static_cast<size_t>(py::len(steps));
+              if (step_count == 0) {
+                  return true;
+              }
+              if (step_count != count) {
+                  return false;
+              }
+              for (size_t index = 0; index < step_count; ++index) {
+                  const py::handle item = steps[index];
+                  if (item.is_none() || !py::isinstance<Tensor>(item)) {
+                      return false;
+                  }
+                  const Tensor& step = py::cast<const Tensor&>(item);
+                  const bool placed = host_steps ? step.device().is_cpu()
+                                                 : step.device() == device;
+                  if (!placed || step.numel() != 1 || !step.is_contiguous()) {
+                      return false;
+                  }
+              }
+              return true;
+          }, "tensor_lists"_a, "steps"_a, "host_steps"_a);
+
 
     // Ops submodule
     py::module_ ops = m.def_submodule("ops", "Operator registry");

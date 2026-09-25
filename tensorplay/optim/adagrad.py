@@ -62,9 +62,6 @@ class Adagrad(Optimizer):
             fused=fused,
         )
         super().__init__(params, defaults)
-        # Eager-only cache for the native layout probe.  The C++ fused
-        # dispatcher keeps the authoritative validation on every call.
-        self._tp_adagrad_layout_cache = {}
 
         if fused:
             if differentiable:
@@ -91,8 +88,6 @@ class Adagrad(Optimizer):
 
     def __setstate__(self, state):
         super().__setstate__(state)
-        if not hasattr(self, "_tp_adagrad_layout_cache"):
-            self._tp_adagrad_layout_cache = {}
         # define "fused" for the state migration below
         fused = None
         for group in self.param_groups:
@@ -199,9 +194,6 @@ class Adagrad(Optimizer):
                 fused=group["fused"],
                 grad_scale=getattr(self, "grad_scale", None),
                 found_inf=getattr(self, "found_inf", None),
-                layout_cache=self._tp_adagrad_layout_cache.setdefault(
-                    id(group), {}
-                ),
             )
         return loss
 
@@ -436,27 +428,13 @@ def _fused_adagrad(
             )
 
 
-def _adagrad_layout_cache_key(params, grads, state_sums, state_steps):
-    """Build a low-overhead fingerprint for the fused Adagrad layout probe."""
-    key = [len(params)]
-    for p, g, s in zip(params, grads, state_sums, strict=True):
-        key.append((
-            id(p), id(s), p.data_ptr(), s.data_ptr(),
-            p.numel(), g.numel(), s.numel(),
-            g.dtype, g.device,
-            p.is_contiguous(), g.is_contiguous(), s.is_contiguous(),
-            p.stride(), g.stride(), s.stride(),
-        ))
-    for step in state_steps:
-        key.append((
-            id(step), step.data_ptr(), step.numel(),
-            step.is_contiguous(), step.stride(),
-        ))
-    return tuple(key)
+def _adagrad_fused_layout_ready(params, grads, state_sums, state_steps):
+    """Check the layout accepted by the native fused Adagrad kernels.
 
-
-def _adagrad_fused_layout_ready(
-        params, grads, state_sums, state_steps, layout_cache=None):
+    Parameters, gradients and state sums must share one device and element
+    type, match in shape and be dense, contiguous and not sparse; the check
+    runs in a single native pass.
+    """
     if not params or len(params) != len(grads):
         return False
     if len(state_sums) != len(params) or len(state_steps) != len(params):
@@ -467,41 +445,13 @@ def _adagrad_fused_layout_ready(
         return False
     if first_dtype not in (tp.float16, tp.bfloat16, tp.float32, tp.float64):
         return False
-
-    cache_key = None
-    if layout_cache is not None:
-        cache_key = _adagrad_layout_cache_key(
-            params, grads, state_sums, state_steps,
-        )
-        if layout_cache.get("key") == cache_key:
-            return layout_cache["ready"]
-
-    ready = all(
-        p.device == first_device
-        and p.dtype == first_dtype
-        and p.is_contiguous()
-        and not g.is_sparse
-        and g.device == p.device
-        and g.dtype == p.dtype
-        and g.shape == p.shape
-        and g.is_contiguous()
-        and s.device == p.device
-        and s.dtype == p.dtype
-        and s.shape == p.shape
-        and s.is_contiguous()
-        for p, g, s in zip(params, grads, state_sums, strict=True)
-    )
-    if layout_cache is not None:
-        layout_cache["key"] = cache_key
-        layout_cache["ready"] = ready
-    return ready
+    return tp._C._foreach_fast_path_ready([params, grads, state_sums], [], False)
 
 
 def adagrad(
     params, grads, state_sums, state_steps, fused=None, grad_scale=None,
     found_inf=None, has_sparse_grad=False, foreach=None, differentiable=False,
     has_complex=False, *, lr, weight_decay, lr_decay, eps, maximize,
-    layout_cache=None,
 ):
     if not all(isinstance(value, tp.Tensor) for value in state_steps):
         raise RuntimeError(
@@ -520,9 +470,7 @@ def adagrad(
         and found_inf is None
         and bool(params)
         and params[0].device.type in ("cpu", "cuda")
-        and _adagrad_fused_layout_ready(
-            params, grads, state_sums, state_steps, layout_cache,
-        )
+        and _adagrad_fused_layout_ready(params, grads, state_sums, state_steps)
         # Both CPU and CUDA native bodies preserve the reduced-dtype foreach
         # cast boundary after every pointwise operation.
         and params[0].dtype in (

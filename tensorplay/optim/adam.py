@@ -67,9 +67,6 @@ class Adam(Optimizer):
                         fused=fused,
                         decoupled_weight_decay=decoupled_weight_decay)
         super(Adam, self).__init__(params, defaults)
-        # Eager-only dispatch cache; it is intentionally not part of the
-        # serialized optimizer state.
-        self._tp_adam_layout_cache = {}
         if fused and differentiable:
             raise RuntimeError("`fused` does not support `differentiable`")
         if fused and foreach:
@@ -77,8 +74,6 @@ class Adam(Optimizer):
 
     def __setstate__(self, state):
         super().__setstate__(state)
-        if not hasattr(self, "_tp_adam_layout_cache"):
-            self._tp_adam_layout_cache = {}
         for group in self.param_groups:
             group.setdefault("amsgrad", False)
             group.setdefault("maximize", False)
@@ -195,53 +190,14 @@ class Adam(Optimizer):
                 grad_scale=getattr(self, "grad_scale", None),
                 found_inf=getattr(self, "found_inf", None),
                 decoupled_weight_decay=group["decoupled_weight_decay"],
-                layout_cache=self._tp_adam_layout_cache.setdefault(id(group), {}),
             )
 
         return loss
 
 
-def _adam_layout_cache_key(
-        params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps,
-        amsgrad, step_device):
-    """Build a cheap fingerprint for the fused-layout probe.
-
-    Materializing ``shape`` tuples for every tensor is costly for large
-    optimizer groups.  For the positive (contiguous) case, ``stride`` and
-    ``numel`` capture shape changes.  Parameter/state identities and data
-    pointers catch storage replacement; gradients intentionally use layout
-    metadata only so a newly allocated gradient from ``set_to_none=True``
-    does not invalidate an otherwise identical optimizer group.  The native
-    kernel still performs the authoritative full validation on every call.
-    """
-    key = [amsgrad, step_device, len(params)]
-    for p, g, m, v in zip(params, grads, exp_avgs, exp_avg_sqs, strict=True):
-        key.append((
-            id(p), id(m), id(v),
-            p.data_ptr(), m.data_ptr(), v.data_ptr(),
-            p.numel(), g.numel(), m.numel(), v.numel(),
-            g.dtype, g.device,
-            p.is_contiguous(), g.is_contiguous(),
-            m.is_contiguous(), v.is_contiguous(),
-            p.stride(), g.stride(), m.stride(), v.stride(),
-        ))
-    if amsgrad:
-        for p, max_v in zip(params, max_exp_avg_sqs, strict=True):
-            key.append((
-                id(p), id(max_v), max_v.data_ptr(), max_v.numel(),
-                max_v.is_contiguous(), max_v.stride(),
-            ))
-    for step in state_steps:
-        key.append((
-            id(step), step.data_ptr(), step.numel(),
-            step.is_contiguous(), step.stride(),
-        ))
-    return tuple(key)
-
-
 def _adam_fused_layout_ready(
     params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps,
-    amsgrad, step_device, layout_cache=None,
+    amsgrad, step_device,
 ):
     """Check the layout accepted by the native fused Adam kernels.
 
@@ -249,6 +205,9 @@ def _adam_fused_layout_ready(
     this check at the dispatch boundary is important: an explicit fused
     attempt must not turn an otherwise valid foreach/single call into a
     backend layout error, and a failed probe must not advance ``step`` twice.
+    The per-tensor restrictions (shared device and element type, matching
+    shapes, dense contiguous storage, one-element steps on the expected
+    device) are checked in a single native pass.
     """
     if not params or len(params) != len(grads):
         return False
@@ -270,64 +229,19 @@ def _adam_fused_layout_ready(
         return False
     if not amsgrad and max_exp_avg_sqs:
         return False
-
-    cache_key = None
-    if layout_cache is not None:
-        cache_key = _adam_layout_cache_key(
-            params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs,
-            state_steps, amsgrad, step_device,
-        )
-        if layout_cache.get("key") == cache_key:
-            return layout_cache["ready"]
-
-    ready = True
-    for p, g, m, v in zip(params, grads, exp_avgs, exp_avg_sqs, strict=True):
-        if (
-            p.device != first_device or p.dtype != first_dtype
-            or not p.is_contiguous()
-            or g.is_sparse or g.device != first_device
-            or g.dtype != first_dtype or g.shape != p.shape
-            or not g.is_contiguous()
-            or m.device != first_device or m.dtype != first_dtype
-            or m.shape != p.shape or not m.is_contiguous()
-            or v.device != first_device or v.dtype != first_dtype
-            or v.shape != p.shape or not v.is_contiguous()
-        ):
-            ready = False
-            break
-    if ready and amsgrad:
-        for p, max_v in zip(params, max_exp_avg_sqs, strict=True):
-            if (
-                max_v.device != first_device or max_v.dtype != first_dtype
-                or max_v.shape != p.shape or not max_v.is_contiguous()
-            ):
-                ready = False
-                break
-    if ready and step_device == "cpu":
-        ready = all(
-            step.device.type == "cpu"
-            and step.numel() == 1
-            and step.is_contiguous()
-            for step in state_steps
-        )
-    elif ready:
-        ready = all(
-            step.device == first_device
-            and step.numel() == 1
-            and step.is_contiguous()
-            for step in state_steps
-        )
-    if layout_cache is not None:
-        layout_cache["key"] = cache_key
-        layout_cache["ready"] = ready
-    return ready
+    tensor_lists = [params, grads, exp_avgs, exp_avg_sqs]
+    if amsgrad:
+        tensor_lists.append(max_exp_avg_sqs)
+    return tp._C._foreach_fast_path_ready(
+        tensor_lists, state_steps, step_device == "cpu"
+    )
 
 
 def _single_tensor_adam(
         params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps,
         grad_scale, found_inf, *, amsgrad, has_complex, beta1, beta2, lr,
         weight_decay, eps, maximize, capturable, differentiable,
-        decoupled_weight_decay, layout_cache=None):
+        decoupled_weight_decay):
     if grad_scale is not None or found_inf is not None:
         raise AssertionError("Expected grad_scale and found_inf to be None")
 
@@ -347,7 +261,6 @@ def _single_tensor_adam(
             and _adam_fused_layout_ready(
                 params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs,
                 state_steps, amsgrad, "cpu",
-                layout_cache if not has_complex else None,
             )
         )
         if fused_ready:
@@ -480,7 +393,7 @@ def _multi_tensor_adam(
         params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps,
         grad_scale, found_inf, *, amsgrad, has_complex, beta1, beta2, lr,
         weight_decay, eps, maximize, capturable, differentiable,
-        decoupled_weight_decay, layout_cache=None):
+        decoupled_weight_decay):
     if not params:
         return
     if grad_scale is not None or found_inf is not None:
@@ -543,7 +456,6 @@ def _multi_tensor_adam(
         and _adam_fused_layout_ready(
             device_params, device_grads, device_exp_avgs, device_exp_avg_sqs,
             device_max_exp_avg_sqs, device_state_steps, amsgrad, "cpu",
-            layout_cache if not has_complex else None,
         )
     )
     if not native_host_steps:
@@ -590,7 +502,6 @@ def _multi_tensor_adam(
         and _adam_fused_layout_ready(
             device_params, device_grads, device_exp_avgs, device_exp_avg_sqs,
             device_max_exp_avg_sqs, device_state_steps, amsgrad, "device",
-            layout_cache if not has_complex else None,
         )
     ):
         # Native fused kernels read state_steps on-device (no per-parameter
@@ -690,7 +601,7 @@ def _fused_adam(
         params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps,
         grad_scale, found_inf, *, amsgrad, has_complex, beta1, beta2, lr,
         weight_decay, eps, maximize, capturable, differentiable,
-        decoupled_weight_decay, layout_cache=None):
+        decoupled_weight_decay):
     if not params:
         return
     if differentiable:
@@ -784,7 +695,7 @@ def adam(
         foreach=None, capturable=False, differentiable=False, fused=None,
         grad_scale=None, found_inf=None, has_complex=False,
         decoupled_weight_decay=False, *, amsgrad, beta1, beta2, lr,
-        weight_decay, eps, maximize, layout_cache=None):
+        weight_decay, eps, maximize):
     """Functional API that performs the Adam algorithm computation."""
     # TensorPlay has a native CPU fused body with the same state/update
     # contract; select it only for the ordinary homogeneous eager layout so
@@ -806,7 +717,7 @@ def adam(
             and not isinstance(eps, tp.Tensor)
             and _adam_fused_layout_ready(
                 params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs,
-                state_steps, amsgrad, "cpu", layout_cache,
+                state_steps, amsgrad, "cpu",
             )
         )
         if cpu_native_ready:
@@ -854,5 +765,4 @@ def adam(
         capturable=capturable,
         differentiable=differentiable,
         decoupled_weight_decay=decoupled_weight_decay,
-        layout_cache=layout_cache,
     )
