@@ -151,6 +151,16 @@ endif()
 # Build-tree only: the static archive is linked into p10, nothing is installed.
 set_target_properties(dnnl PROPERTIES EXCLUDE_FROM_ALL ON)
 
+# Route the sgemm dispatch through the CBLAS interface of the MKL the build
+# already links.  Without it the optimized sgemm copy-kernel path stays
+# dormant and convolution backward-weights GEMMs execute on the portable
+# reference loop.
+if(MKL_LIBRARIES AND MKL_INCLUDE_DIRS)
+    target_compile_definitions(dnnl PRIVATE USE_MKL USE_CBLAS)
+    target_include_directories(dnnl PRIVATE ${MKL_INCLUDE_DIRS})
+    target_link_libraries(dnnl INTERFACE ${MKL_LIBRARIES})
+endif()
+
 # GCC emits a handful of known warnings inside oneDNN; keep the build log clean.
 if(NOT APPLE AND CMAKE_COMPILER_IS_GNUCC)
     target_compile_options(dnnl PRIVATE -Wno-maybe-uninitialized)
