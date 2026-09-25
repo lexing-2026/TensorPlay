@@ -785,7 +785,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ViewKernels) {
 // A sparse self derives the sparse dispatch key, so sparse layout cloning
 // needs its own slot; clone_impl copies the sparse metadata alongside the
 // values buffer.
-TENSORPLAY_LIBRARY_IMPL(Sparse, ViewSparseKernels) {
+TENSORPLAY_LIBRARY_IMPL(SparseCPU, ViewSparseKernels) {
     m.impl("clone", clone_kernel);
 }
 

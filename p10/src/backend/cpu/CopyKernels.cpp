@@ -949,7 +949,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, CopyKernels) {
     m.impl("embedding_backward", embedding_backward_cpu);
 }
 
-TENSORPLAY_LIBRARY_IMPL(Sparse, CopySparseKernels) {
+TENSORPLAY_LIBRARY_IMPL(SparseCPU, CopySparseKernels) {
     m.impl("sparse_mask", sparse_mask_cpu);
     m.impl("to_dense", to_dense_sparse_cpu);
     m.impl("_nnz", sparse_nnz_cpu);

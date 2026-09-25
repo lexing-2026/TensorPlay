@@ -1947,7 +1947,10 @@ struct BatchRulePlumbing<Function, Random, Return (*)(Args...)> {
     static Return call(Args... args) {
         auto excluded = DispatchKeySet::make(DispatchKey::VmapCPU) |
             DispatchKeySet::make(DispatchKey::VmapCUDA) |
-            DispatchKeySet::make(DispatchKey::VmapVulkan);
+            DispatchKeySet::make(DispatchKey::VmapVulkan) |
+            DispatchKeySet::make(DispatchKey::VmapSparseCPU) |
+            DispatchKeySet::make(DispatchKey::VmapSparseCUDA) |
+            DispatchKeySet::make(DispatchKey::VmapSparse);
         if constexpr (Random) excluded.add(DispatchKey::VmapMode);
         impl::ExcludeDispatchKeyGuard guard(excluded);
         const Layer layer = current_vmap_layer();

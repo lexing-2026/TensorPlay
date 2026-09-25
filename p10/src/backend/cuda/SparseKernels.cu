@@ -1894,5 +1894,10 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, MetaViewOps) {
     m.impl("_coalesce", coalesce_sparse_cuda);
 }
 
+TENSORPLAY_LIBRARY_IMPL(SparseCUDA, MetaViewSparseOps) {
+    m.impl("coalesce", coalesce_sparse_cuda);
+    m.impl("_coalesce", coalesce_sparse_cuda);
+}
+
 } // namespace cuda
 } // namespace tensorplay

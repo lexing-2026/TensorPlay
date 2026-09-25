@@ -3146,7 +3146,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ArithmeticKernels) {
 // from the arguments, so in-place accumulation of a sparse tensor into a
 // dense destination registers under the sparse backend; the kernel itself
 // keeps branching on whether the trailing operand is sparse.
-TENSORPLAY_LIBRARY_IMPL(Sparse, ArithSparseInplace) {
+TENSORPLAY_LIBRARY_IMPL(SparseCPU, ArithSparseInplace) {
     m.impl("add_.Tensor", add_inplace_kernel);
 }
 

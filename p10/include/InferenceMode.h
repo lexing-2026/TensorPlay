@@ -26,6 +26,8 @@ inline bool autograd_dispatch_excluded() {
     return excluded.has(DispatchKey::AutogradCPU) ||
            excluded.has(DispatchKey::AutogradCUDA) ||
            excluded.has(DispatchKey::AutogradVulkan) ||
+           excluded.has(DispatchKey::AutogradSparseCPU) ||
+           excluded.has(DispatchKey::AutogradSparseCUDA) ||
            excluded.has(DispatchKey::AutogradSparse);
 }
 

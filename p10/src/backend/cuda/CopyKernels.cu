@@ -897,5 +897,17 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, CopyKernels) {
     m.impl("spdiags", spdiags_cuda);
 }
 
+TENSORPLAY_LIBRARY_IMPL(SparseCUDA, CopySparseKernels) {
+    m.impl("sparse_mask", sparse_mask_cuda);
+    m.impl("to_dense", to_dense_sparse_cuda);
+    m.impl("to_sparse", to_sparse_coo_cuda);
+    m.impl("to_sparse_csr", to_sparse_csr_cuda);
+    m.impl("_nnz", sparse_nnz_cuda);
+    m.impl("sparse_mm", sparse_mm_cuda);
+    m.impl("sparse_sum", sparse_sum_cuda);
+    m.impl("sparse_add", sparse_add_cuda);
+    m.impl("sparse_mul", sparse_mul_cuda);
+}
+
 } // namespace cuda
 } // namespace tensorplay

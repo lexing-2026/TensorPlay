@@ -56,6 +56,11 @@ inline constexpr DeviceType get_device_type_from_autocast_key(DispatchKey key) {
             return DeviceType::CUDA;
         case DispatchKey::AutocastVulkan:
             return DeviceType::Vulkan;
+        case DispatchKey::AutocastSparseCPU:
+        case DispatchKey::AutocastSparse:
+            return DeviceType::CPU;
+        case DispatchKey::AutocastSparseCUDA:
+            return DeviceType::CUDA;
         case DispatchKey::AutocastMeta:
             // The meta device owns no data, so autocast is never enabled
             // for it; the key still maps so state queries stay total.

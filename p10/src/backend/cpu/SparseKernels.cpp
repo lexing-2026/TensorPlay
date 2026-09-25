@@ -1805,7 +1805,7 @@ Tensor norm_sparse_dim_cpu(const Tensor& self,
     return native_norm_dim_cpu(self, Scalar(p), dim, keepdim, std::nullopt);
 }
 
-TENSORPLAY_LIBRARY_IMPL(Sparse, SparseNormKernels) {
+TENSORPLAY_LIBRARY_IMPL(SparseCPU, SparseNormKernels) {
     m.impl("norm", norm_sparse_cpu);
     m.impl("norm.dim", norm_sparse_dim_cpu);
 }

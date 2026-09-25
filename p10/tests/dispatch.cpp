@@ -34,6 +34,14 @@ TEST(DispatchTest, CompositeFallsBackToCompositeKey) {
     }
 }
 
+TEST(DispatchTest, SparseDeviceKeysRoundTripThroughLayers) {
+    EXPECT_EQ(toBackendKey(DispatchKey::AutogradSparseCPU),
+              DispatchKey::SparseCPU);
+    EXPECT_EQ(toBackendKey(DispatchKey::AutocastSparseCUDA),
+              DispatchKey::SparseCUDA);
+    EXPECT_EQ(toBackendKey(DispatchKey::VmapSparse), DispatchKey::Sparse);
+}
+
 TEST(DispatchTest, MissingKernelThrowsWithDiagnostic) {
     // Calling an op with no kernel on any key raises with an actionable
     // message naming the op and the backend.

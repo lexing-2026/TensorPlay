@@ -15,69 +15,46 @@ namespace tensorplay {
 // backend component: a tensor whose storage is sparse metadata carries the
 // Sparse key instead of the dense backend key of its device.
 enum class DispatchKey : uint8_t {
-    // Backend component keys (dense backends plus the sparse layout family).
     CPU = 0,
     CUDA = 1,
     Vulkan = 2,
-    Sparse = 3,
-    // Shape-only backend. Its kernels compute sizes, dtypes and strides but
-    // never touch storage: a meta storage hands out a null data pointer while
-    // still reporting the true nbytes, so shape queries stay honest.
-    Meta = 4,
-
-    // Python dispatch modes.  Included in the thread-local key set while a
-    // dispatch mode is active: every operator that reaches its backend --
-    // including the ones autograd runs during backward -- is handed to the
-    // innermost mode first.  Every key above it is excluded while a mode
-    // handler runs, so re-entering an operator from the handler neither
-    // records autograd history nor re-applies autocast or batching.
-    Python = 5,
-
-    // Autograd keys related to backends by a fixed offset.
-    DynamicLayerBackMode = 6,
-    AutogradCPU = 7,
-    AutogradCUDA = 8,
-    AutogradVulkan = 9,
-    AutogradSparse = 10,
-    AutogradMeta = 11,
-
-    // Autocast keys related to backends by a fixed offset.  They sit above
-    // the autograd keys so casts happen before autograd history recording.
-    // The Meta member is never enabled -- there is no data to cast -- but it
-    // keeps the offset arithmetic uniform across backends.
-    AutocastCPU = 12,
-    AutocastCUDA = 13,
-    AutocastVulkan = 14,
-    AutocastSparse = 15,
-    AutocastMeta = 16,
-
-    // Backend-neutral composite key. One registration serves every backend
-    // until a backend registers its own kernel. Lookups never walk this key
-    // from a tensor key set; the dispatcher consults it only when a backend
-    // slot is empty.
-    Composite = 22,
-
-    // Per-backend batching keys. These must outrank autograd and backend
-    // keys so a transform can unwrap its operands before ordinary kernels
-    // and autograd nodes observe them.
-    VmapCPU = 17,
-    VmapCUDA = 18,
-    VmapVulkan = 19,
-    VmapSparse = 20,
-    VmapMeta = 21,
-    VmapMode = 23,
-    DynamicLayerFrontMode = 24,
-
-    // One past every real key; the sentinel value must stay above all of
-    // them, so it is spelled out rather than derived from the previous
-    // entry.
-    EndOfKeys = 25 // Sentinel
+    SparseCPU = 3,
+    SparseCUDA = 4,
+    Sparse = 5,
+    Meta = 6,
+    Python = 7,
+    DynamicLayerBackMode = 8,
+    AutogradCPU = 9,
+    AutogradCUDA = 10,
+    AutogradVulkan = 11,
+    AutogradSparseCPU = 12,
+    AutogradSparseCUDA = 13,
+    AutogradSparse = 14,
+    AutogradMeta = 15,
+    AutocastCPU = 16,
+    AutocastCUDA = 17,
+    AutocastVulkan = 18,
+    AutocastSparseCPU = 19,
+    AutocastSparseCUDA = 20,
+    AutocastSparse = 21,
+    AutocastMeta = 22,
+    VmapCPU = 23,
+    VmapCUDA = 24,
+    VmapVulkan = 25,
+    VmapSparseCPU = 26,
+    VmapSparseCUDA = 27,
+    VmapSparse = 28,
+    VmapMeta = 29,
+    Composite = 30,
+    VmapMode = 31,
+    DynamicLayerFrontMode = 32,
+    EndOfKeys = 33
 };
 
-constexpr size_t kBackendKeyCount = 5;           // CPU, CUDA, Vulkan, Sparse, Meta
-constexpr size_t kAutogradKeyOffset = 7;         // AutogradCPU - CPU
-constexpr size_t kAutocastKeyOffset = 12;        // AutocastCPU - CPU
-constexpr size_t kVmapKeyOffset = 17;             // VmapCPU - CPU
+constexpr size_t kBackendKeyCount = 7;
+constexpr size_t kAutogradKeyOffset = 9;
+constexpr size_t kAutocastKeyOffset = 16;
+constexpr size_t kVmapKeyOffset = 23;
 
 static_assert(static_cast<size_t>(DispatchKey::AutogradCPU) ==
                   static_cast<size_t>(DispatchKey::CPU) + kAutogradKeyOffset,
@@ -126,7 +103,8 @@ inline constexpr bool is_vmap_key(DispatchKey key) {
 // layout family).
 inline constexpr bool is_backend_key(DispatchKey key) {
     return key == DispatchKey::CPU || key == DispatchKey::CUDA ||
-           key == DispatchKey::Vulkan || key == DispatchKey::Sparse ||
+           key == DispatchKey::Vulkan || key == DispatchKey::SparseCPU ||
+           key == DispatchKey::SparseCUDA || key == DispatchKey::Sparse ||
            key == DispatchKey::Meta;
 }
 
@@ -146,21 +124,29 @@ inline std::string toString(DispatchKey key) {
         case DispatchKey::CPU: return "CPU";
         case DispatchKey::CUDA: return "CUDA";
         case DispatchKey::Vulkan: return "Vulkan";
+        case DispatchKey::SparseCPU: return "SparseCPU";
+        case DispatchKey::SparseCUDA: return "SparseCUDA";
         case DispatchKey::Sparse: return "Sparse";
         case DispatchKey::Meta: return "Meta";
         case DispatchKey::AutocastCPU: return "AutocastCPU";
         case DispatchKey::AutocastCUDA: return "AutocastCUDA";
         case DispatchKey::AutocastVulkan: return "AutocastVulkan";
+        case DispatchKey::AutocastSparseCPU: return "AutocastSparseCPU";
+        case DispatchKey::AutocastSparseCUDA: return "AutocastSparseCUDA";
         case DispatchKey::AutocastSparse: return "AutocastSparse";
         case DispatchKey::AutocastMeta: return "AutocastMeta";
         case DispatchKey::AutogradCPU: return "AutogradCPU";
         case DispatchKey::AutogradCUDA: return "AutogradCUDA";
         case DispatchKey::AutogradVulkan: return "AutogradVulkan";
+        case DispatchKey::AutogradSparseCPU: return "AutogradSparseCPU";
+        case DispatchKey::AutogradSparseCUDA: return "AutogradSparseCUDA";
         case DispatchKey::AutogradSparse: return "AutogradSparse";
         case DispatchKey::AutogradMeta: return "AutogradMeta";
         case DispatchKey::VmapCPU: return "VmapCPU";
         case DispatchKey::VmapCUDA: return "VmapCUDA";
         case DispatchKey::VmapVulkan: return "VmapVulkan";
+        case DispatchKey::VmapSparseCPU: return "VmapSparseCPU";
+        case DispatchKey::VmapSparseCUDA: return "VmapSparseCUDA";
         case DispatchKey::VmapSparse: return "VmapSparse";
         case DispatchKey::VmapMeta: return "VmapMeta";
         case DispatchKey::Composite: return "Composite";
@@ -177,7 +163,7 @@ inline std::string toString(DispatchKey key) {
 // (autograd) to lowest (backend) bit.
 class DispatchKeySet {
 public:
-    using raw_t = uint32_t;
+    using raw_t = uint64_t;
 
     constexpr DispatchKeySet() noexcept : mask_(0) {}
     explicit constexpr DispatchKeySet(raw_t mask) noexcept : mask_(mask) {}

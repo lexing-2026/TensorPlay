@@ -175,8 +175,11 @@ public:
     // dense backend, so sparse registrations are selected ahead of the
     // dense kernels a plain device lookup would find.
     DispatchKeySet key_set() const {
-        const DispatchKey backend =
-            sparse_state_ ? DispatchKey::Sparse : computeDispatchKey(device_);
+        const DispatchKey backend = sparse_state_
+            ? (device_.is_cuda() ? DispatchKey::SparseCUDA
+               : device_.is_cpu() ? DispatchKey::SparseCPU
+                   : DispatchKey::Sparse)
+            : computeDispatchKey(device_);
         DispatchKeySet ks;
         ks.add(backend);
         if (is_batched()) {

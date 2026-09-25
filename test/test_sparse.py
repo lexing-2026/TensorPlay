@@ -44,8 +44,17 @@ class TestSparseConversions(unittest.TestCase):
     def test_to_dense(self):
         indices = tp.tensor([[0, 1], [1, 0]], dtype=tp.int64)
         s = sparse.sparse_coo_tensor(indices, tp.tensor([5.0, 6.0]), [2, 2])
-        d = sparse.to_dense(s)
-        self.assertTrue(tp.allclose(d, tp.tensor([[0.0, 5.0], [6.0, 0.0]])))
+        self.assertTrue(tp.allclose(dense_from_coo(s), tp.tensor([[0.0, 5.0], [6.0, 0.0]])))
+
+    @unittest.skipUnless(tp.cuda.is_available(), "requires CUDA")
+    def test_cuda_to_dense_dispatch(self):
+        indices = tp.tensor([[0, 1], [0, 1]], dtype=tp.int64, device="cuda")
+        values = tp.tensor([1.0, 2.0], device="cuda")
+        s = sparse.sparse_coo_tensor(indices, values, [2, 2])
+        dense = sparse.to_dense(s)
+        self.assertTrue(dense.device.is_cuda)
+        self.assertTrue(tp.equal(dense, tp.tensor([[1.0, 0.0], [0.0, 2.0]], device="cuda")))
+
 
     def test_to_sparse_roundtrip(self):
         d = tp.tensor([[0.0, 2.0], [0.0, 0.0]])
