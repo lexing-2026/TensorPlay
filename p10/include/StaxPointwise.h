@@ -72,6 +72,7 @@ P10_API bool launch_generated_pointwise(
     const std::vector<int64_t>& temp_refs,
     const std::vector<Tensor>& temp_tensors,
     const std::vector<DType>& out_dtypes,
+    const std::vector<int64_t>& output_shape,
     int64_t count);
 
 } // namespace cuda

@@ -880,12 +880,21 @@ def _cuda_triton_pointwise_runner(
         return None
     if not runtime_available():
         return None
-    reference = tuple(int(item) for item in example_inputs[0].shape)
-    if any(
-        tuple(int(item) for item in value.shape) != reference
-        for value in example_inputs
-    ):
-        return None
+    shapes = tuple(
+        tuple(int(item) for item in value.shape) for value in example_inputs
+    )
+    # The program's output spans the aligned broadcast of the operands, so
+    # the reference shape is their elementwise maximum, not necessarily the
+    # first operand's shape (a per-channel bias may lead the feed order).
+    rank = max(len(shape) for shape in shapes)
+    reference = tuple(
+        max(
+            (1,) * (rank - len(shape)) + shape
+            for shape in shapes
+        )[dim]
+        for dim in range(rank)
+    )
+    broadcast = any(shape != reference for shape in shapes)
     numel = 1
     for dim in reference:
         numel *= dim
@@ -902,6 +911,7 @@ def _cuda_triton_pointwise_runner(
             example_inputs,
             fixed_config=config,
             reference_shape=reference,
+            input_shapes=shapes if broadcast else None,
             input_dtypes=tuple(repr(value.dtype) for value in example_inputs),
         )
         runner(example_inputs)
@@ -3312,6 +3322,31 @@ def _register_stax_cuda_pointwise_op(
     cached = _STAX_CUDA_OP_CACHE.get(key)
     if cached is not None:
         return cached
+    # Single-output plans compile through the Triton program generator when
+    # the examples describe them: the kernel reads broadcast operands in
+    # place and skips the launch-time materialization the generic jiterator
+    # wrapper pays per call.  Multi-output and example-less registrations
+    # keep the jiterator route.
+    if len(output_refs) == 1 and example_values:
+        runner = _cuda_triton_pointwise_runner(
+            program, constants, output_refs[0], example_values
+        )
+        if runner is not None:
+            try:
+                from ....library import _define_or_get
+
+                name = f"tp_stax::pointwise_{_STAX_CUDA_OP_COUNTER}"
+                _STAX_CUDA_OP_COUNTER += 1
+                op = _define_or_get(name, None)
+
+                def kernel(*inputs: Any, _runner: Any = runner) -> Any:
+                    return _runner(list(inputs))
+
+                op.register_kernel("cuda")(kernel)
+                _STAX_CUDA_OP_CACHE[key] = name
+                return name
+            except (AssertionError, RuntimeError, TypeError, ValueError):
+                pass
     try:
         from .codegen.cuda import compile_program
         from ....library import _define_or_get

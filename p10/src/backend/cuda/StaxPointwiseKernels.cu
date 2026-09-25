@@ -934,8 +934,11 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
     // Generated straight-line kernels replace the interpreter whenever the
     // program compiles: NVRTC cost is paid once per program content, and the
     // emitted body drops the per-element fetch/dispatch round trip the
-    // interpreter pays on every step of the dependency chain.
-    if (flat_inputs && count >= 1024) {
+    // interpreter pays on every step of the dependency chain.  Broadcast and
+    // strided inputs participate too: the address plan folds each input's
+    // layout into the generated addressing, so only genuinely unsupported
+    // forms fall back to the interpreter.
+    if (count >= 1024) {
         std::vector<DType> generated_out_dtypes;
         generated_out_dtypes.reserve(temp_refs.size());
         for (size_t i = 0; i < temp_refs.size(); ++i) {
@@ -943,7 +946,7 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
         }
         if (launch_generated_pointwise(inputs, program, constants, temp_refs,
                                        temp_tensors, generated_out_dtypes,
-                                       count)) {
+                                       output_shape, count)) {
             return outs;
         }
     }

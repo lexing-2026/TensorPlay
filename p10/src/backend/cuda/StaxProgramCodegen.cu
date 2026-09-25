@@ -117,11 +117,17 @@ std::string literal(double value) {
 // instruction expands into a scalar expression over named temporaries, and
 // every requested output stores its value.  `idx` names the element index
 // variable and `suffix` disambiguates the temporaries of sibling elements
-// handled by the same thread.
+// handled by the same thread.  Inputs address through `terms`: a flat index
+// when the input covers the output densely, a scalar when it broadcasts
+// everywhere, and a divisor/size/stride sum otherwise (one div+mod per
+// non-trivial dimension, so a per-channel bias broadcast costs one).
 std::string emit_element_body(
     const std::vector<int64_t>& program,
     const std::vector<double>& constants,
     const std::vector<DType>& input_dtypes,
+    const std::vector<std::vector<std::tuple<int64_t, int64_t, int64_t>>>&
+        input_terms,
+    const std::vector<bool>& input_dense,
     const std::vector<int64_t>& out_temp_refs,
     const std::vector<DType>& out_dtypes,
     const std::string& idx,
@@ -129,6 +135,24 @@ std::string emit_element_body(
     const int64_t input_count = static_cast<int64_t>(input_dtypes.size());
     const int64_t instruction_count =
         static_cast<int64_t>(program.size() / 3);
+
+    auto address_of = [&](int64_t input, const std::string& index) {
+        if (input_dense[static_cast<size_t>(input)]) {
+            return index;
+        }
+        const auto& terms = input_terms[static_cast<size_t>(input)];
+        if (terms.empty()) {
+            return std::string("0");
+        }
+        std::string address;
+        for (const auto& [divisor, size, stride] : terms) {
+            if (!address.empty()) address += " + ";
+            address += "(((" + index + " / " + std::to_string(divisor) +
+                       "LL) % " + std::to_string(size) + "LL) * " +
+                       std::to_string(stride) + "LL)";
+        }
+        return address;
+    };
 
     auto resolve = [&](int64_t ref, int64_t current) -> std::string {
         if (ref < 0) {
@@ -153,7 +177,9 @@ std::string emit_element_body(
     std::ostringstream body;
     for (int64_t i = 0; i < input_count; ++i) {
         body << "      const T x" << i << suffix << " = "
-             << load_expr(input_dtypes[i], "in" + std::to_string(i), idx)
+             << load_expr(input_dtypes[i],
+                          "in" + std::to_string(i),
+                          address_of(i, idx))
              << ";\n";
     }
 
@@ -337,11 +363,60 @@ std::string emit_kernel_source(
     const std::vector<int64_t>& program,
     const std::vector<double>& constants,
     bool wide,
+    const std::vector<Tensor>& inputs,
     const std::vector<DType>& input_dtypes,
+    const std::vector<int64_t>& output_shape,
     const std::vector<int64_t>& out_temp_refs,
     const std::vector<DType>& out_dtypes,
     int elements_per_thread,
     const std::string& name) {
+    const int64_t rank = static_cast<int64_t>(output_shape.size());
+    // Address plan per input, in output-rank space: right-aligned sizes and
+    // strides with broadcast dimensions carrying size 1 stride 0.  A dense
+    // input (own shape equals the output, contiguous strides) indexes flat;
+    // anything else sums one div+mod term per non-trivial dimension.
+    std::vector<std::vector<std::tuple<int64_t, int64_t, int64_t>>> input_terms;
+    std::vector<bool> input_dense;
+    input_terms.reserve(inputs.size());
+    input_dense.reserve(inputs.size());
+    for (const Tensor& input : inputs) {
+        std::vector<int64_t> sizes(static_cast<size_t>(rank), 1);
+        std::vector<int64_t> strides(static_cast<size_t>(rank), 0);
+        const int64_t offset = rank - input.dim();
+        for (int64_t dim = 0; dim < input.dim(); ++dim) {
+            const size_t slot = static_cast<size_t>(offset + dim);
+            sizes[slot] = input.size(dim);
+            strides[slot] = input.stride(dim);
+        }
+        bool dense = input.dim() == rank && input.is_contiguous();
+        if (dense) {
+            for (int64_t dim = 0; dim < rank; ++dim) {
+                if (sizes[static_cast<size_t>(dim)] !=
+                    output_shape[static_cast<size_t>(dim)]) {
+                    // A rank-padded shape still reads flat only when every
+                    // dimension really spans the output's extent.
+                    dense = false;
+                    break;
+                }
+            }
+        }
+        std::vector<std::tuple<int64_t, int64_t, int64_t>> terms;
+        if (!dense) {
+            for (int64_t dim = rank - 1; dim >= 0; --dim) {
+                const int64_t size = sizes[static_cast<size_t>(dim)];
+                const int64_t stride = strides[static_cast<size_t>(dim)];
+                if (stride == 0 || size == 1) continue;
+                int64_t divisor = 1;
+                for (int64_t tail = dim + 1; tail < rank; ++tail) {
+                    divisor *= output_shape[static_cast<size_t>(tail)];
+                }
+                terms.emplace_back(divisor, size, stride);
+            }
+        }
+        input_terms.push_back(std::move(terms));
+        input_dense.push_back(dense);
+    }
+
     std::ostringstream source;
     source << "#include <cuda_fp16.h>\n#include <cuda_bf16.h>\n\n";
     source << "typedef " << (wide ? "double" : "float") << " T;\n\n";
@@ -367,7 +442,8 @@ std::string emit_kernel_source(
                << "LL * (long long)blockDim.x;\n";
         source << "    if (" << idx << " < n) {\n";
         source << emit_element_body(program, constants, input_dtypes,
-                                    out_temp_refs, out_dtypes, idx, suffix);
+                                    input_terms, input_dense, out_temp_refs,
+                                    out_dtypes, idx, suffix);
         source << "    }\n";
         source << "  }\n";
     }
@@ -409,6 +485,7 @@ bool launch_generated_pointwise(
     const std::vector<int64_t>& temp_refs,
     const std::vector<Tensor>& temp_tensors,
     const std::vector<DType>& out_dtypes,
+    const std::vector<int64_t>& output_shape,
     int64_t count) {
     static std::mutex cache_lock;
     static std::unordered_map<std::string, jit::NvrtcFunction> cache;
@@ -429,7 +506,8 @@ bool launch_generated_pointwise(
     }
 
     std::ostringstream key;
-    key << program.size() << ':' << inputs.size() << ':' << out_dtypes.size();
+    key << program.size() << ':' << inputs.size() << ':' << out_dtypes.size()
+        << ':' << count;
     for (int64_t op : program) key << op << ',';
     for (double value : constants) {
         try {
@@ -441,7 +519,15 @@ bool launch_generated_pointwise(
     for (int64_t ref : temp_refs) key << ref << ',';
     for (const Tensor& input : inputs) {
         key << static_cast<int>(input.dtype()) << ',';
+        // The address plan bakes each input's layout in as literals, so the
+        // shape and stride signature is part of the compiled identity.
+        key << input.dim() << ':';
+        for (int64_t dim = 0; dim < input.dim(); ++dim) {
+            key << input.size(dim) << 'x' << input.stride(dim) << ',';
+        }
+        key << (input.is_contiguous() ? 'c' : 's');
     }
+    for (int64_t dim : output_shape) key << dim << ',';
     for (DType dt : out_dtypes) key << static_cast<int>(dt) << ',';
     const std::string cache_key = key.str();
 
@@ -472,8 +558,8 @@ bool launch_generated_pointwise(
         const std::string name(name_buffer);
 
         const std::string source = emit_kernel_source(
-            program, constants, wide_family(inputs), input_dtypes, temp_refs,
-            out_dtypes, elements_per_thread, name);
+            program, constants, wide_family(inputs), inputs, input_dtypes,
+            output_shape, temp_refs, out_dtypes, elements_per_thread, name);
 
         jit::NvrtcFunction fn;
         {
@@ -542,6 +628,7 @@ bool launch_generated_pointwise(
     const std::vector<int64_t>&,
     const std::vector<Tensor>&,
     const std::vector<DType>&,
+    const std::vector<int64_t>&,
     int64_t) {
     return false;
 }
