@@ -1087,6 +1087,44 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                 weight,
                 bias,
                 required_float_attr(node, "eps"));
+        } else if (node.op_type == "native_group_norm") {
+            // The native spelling reports the per-group mean and reciprocal
+            // standard deviation next to its result, so a gradient that needs
+            // those statistics reads them instead of reducing the input again.
+            if (node.inputs.empty() || node.inputs.size() > 3 || node.outputs.size() != 3) {
+                throw std::runtime_error("Stax native_group_norm has invalid arity");
+            }
+            size_t input_index = 1;
+            std::optional<Tensor> weight;
+            std::optional<Tensor> bias;
+            if (required_int_attr(node, "has_weight") != 0) {
+                if (input_index >= node.inputs.size()) {
+                    throw std::runtime_error("Stax native_group_norm weight is missing");
+                }
+                weight = value(node.inputs[input_index++]);
+            }
+            if (required_int_attr(node, "has_bias") != 0) {
+                if (input_index >= node.inputs.size()) {
+                    throw std::runtime_error("Stax native_group_norm bias is missing");
+                }
+                bias = value(node.inputs[input_index++]);
+            }
+            if (input_index != node.inputs.size()) {
+                throw std::runtime_error("Stax native_group_norm has unexpected inputs");
+            }
+            auto fused = tpx::ops::native_group_norm(
+                value(node.inputs[0]),
+                weight,
+                bias,
+                required_int_attr(node, "N"),
+                required_int_attr(node, "C"),
+                required_int_attr(node, "HxW"),
+                required_int_attr(node, "group"),
+                required_float_attr(node, "eps"));
+            env[node.outputs[0]->id] = std::get<0>(fused);
+            env[node.outputs[1]->id] = std::get<1>(fused);
+            env[node.outputs[2]->id] = std::get<2>(fused);
+            return;
         } else if (node.op_type == "dropout") {
             if (node.inputs.size() != 1) {
                 throw std::runtime_error("Stax dropout expects one input");
@@ -1106,6 +1144,24 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                 value(node.inputs[2]),
                 required_int_attr(node, "is_causal") != 0,
                 required_int_attr(node, "impl"));
+        } else if (node.op_type == "_scaled_dot_product_attention_with_lse") {
+            // The fused forward also hands back the softmax normalizer, so a
+            // gradient that needs it does not have to rebuild the score
+            // matrix.  The node keeps both results; the caller registers the
+            // normalizer as a saved value when a gradient reads it.
+            if (node.inputs.size() != 3 || node.outputs.size() != 2) {
+                throw std::runtime_error(
+                    "Stax _scaled_dot_product_attention_with_lse has invalid arity");
+            }
+            auto fused = tpx::ops::_scaled_dot_product_attention_with_lse(
+                value(node.inputs[0]),
+                value(node.inputs[1]),
+                value(node.inputs[2]),
+                required_int_attr(node, "is_causal") != 0,
+                required_int_attr(node, "impl"));
+            env[node.outputs[0]->id] = std::get<0>(fused);
+            env[node.outputs[1]->id] = std::get<1>(fused);
+            return;
         } else if (node.op_type == "threshold_backward") {
             if (node.inputs.size() != 2) {
                 throw std::runtime_error("Stax threshold_backward expects grad and output");
@@ -1339,6 +1395,79 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
             env[node.outputs[0]->id] = std::get<0>(backward);
             env[node.outputs[1]->id] = std::get<1>(backward);
             env[node.outputs[2]->id] = std::get<2>(backward);
+            return;
+        } else if (node.op_type == "_scaled_dot_product_attention_backward_with_lse") {
+            // Reading the softmax normalizer the fused forward produced lets
+            // the gradient reuse the score statistics instead of rebuilding
+            // the whole score matrix in a separate pass.
+            if (node.inputs.size() != 6 || node.outputs.size() != 3) {
+                throw std::runtime_error(
+                    "Stax _scaled_dot_product_attention_backward_with_lse has invalid arity");
+            }
+            auto backward =
+                tpx::ops::_scaled_dot_product_attention_backward_with_lse(
+                    value(node.inputs[0]),
+                    value(node.inputs[1]),
+                    value(node.inputs[2]),
+                    value(node.inputs[3]),
+                    value(node.inputs[4]),
+                    value(node.inputs[5]),
+                    required_int_attr(node, "is_causal") != 0,
+                    required_int_attr(node, "impl"));
+            env[node.outputs[0]->id] = std::get<0>(backward);
+            env[node.outputs[1]->id] = std::get<1>(backward);
+            env[node.outputs[2]->id] = std::get<2>(backward);
+            return;
+        } else if (node.op_type == "native_group_norm_backward") {
+            if (node.inputs.size() != 5 || node.outputs.size() != 3) {
+                throw std::runtime_error(
+                    "Stax native_group_norm_backward has invalid arity");
+            }
+            const auto mask_it = node.attrs.find("output_mask");
+            if (mask_it == node.attrs.end() ||
+                !std::holds_alternative<std::vector<int64_t>>(mask_it->second)) {
+                throw std::runtime_error(
+                    "Stax native_group_norm_backward is missing output_mask");
+            }
+            const auto& mask = std::get<std::vector<int64_t>>(mask_it->second);
+            if (mask.size() != 3) {
+                throw std::runtime_error(
+                    "Stax native_group_norm_backward output_mask has three entries");
+            }
+            size_t input_index = 4;
+            std::optional<Tensor> weight;
+            if (mask[1] != 0) {
+                if (input_index < node.inputs.size()) {
+                    weight = value(node.inputs[input_index++]);
+                }
+            }
+            if (input_index != node.inputs.size()) {
+                throw std::runtime_error(
+                    "Stax native_group_norm_backward has unexpected inputs");
+            }
+            auto backward = tpx::ops::native_group_norm_backward(
+                value(node.inputs[0]),
+                value(node.inputs[1]),
+                value(node.inputs[2]),
+                value(node.inputs[3]),
+                weight,
+                required_int_attr(node, "N"),
+                required_int_attr(node, "C"),
+                required_int_attr(node, "HxW"),
+                required_int_attr(node, "group"),
+                {mask[0] != 0, mask[1] != 0, mask[2] != 0});
+            for (size_t index = 0; index < 3; ++index) {
+                if (mask[index] == 0) {
+                    continue;
+                }
+                if (index == 0) {
+                    env[node.outputs[0]->id] = std::get<0>(backward);
+                } else if (index == 1) {
+                    env[node.outputs[1]->id] = std::get<1>(backward);
+                } else {
+                    env[node.outputs[2]->id] = std::get<2>(backward);
+                }
+            }
             return;
         } else if (node.op_type == "batch_norm_backward") {
             if (node.inputs.size() < 2) {

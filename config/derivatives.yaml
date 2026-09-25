@@ -527,6 +527,9 @@
   weight: std::get<1>(native_layer_norm_backward(grad, input, normalized_shape, ret1, ret2, weight, bias, grad_input_mask))
   bias: std::get<2>(native_layer_norm_backward(grad, input, normalized_shape, ret1, ret2, weight, bias, grad_input_mask))
 
+# The composite spelling is the same computation with the extents folded into
+# the argument list; the native form is what a captured training region lowers
+# to, because its reverse pass reads the row statistics it reports.
 - name: group_norm(Tensor input, int num_groups, Tensor? weight=None, Tensor? bias=None, float eps=1e-5) -> Tensor
   input: std::get<0>(group_norm_backward(grad, input, num_groups, weight, bias, eps))
   weight: std::get<1>(group_norm_backward(grad, input, num_groups, weight, bias, eps))
