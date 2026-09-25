@@ -1340,55 +1340,130 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
     try {
         auto& eng = OneDNNContext::get_engine();
         auto& s = OneDNNContext::get_stream();
-        
+
+        const bool src_cl = input.is_contiguous(MemoryFormat::ChannelsLast3d);
+        const bool dst_cl = output.is_contiguous(MemoryFormat::ChannelsLast3d);
+
         memory::dims src_dims = {input.size(0), input.size(1), input.size(2), input.size(3), input.size(4)};
         memory::dims dst_dims = {output.size(0), output.size(1), output.size(2), output.size(3), output.size(4)};
-        
+
         memory::dims weights_dims;
         if (groups > 1) {
             weights_dims = {groups, weight.size(0)/groups, weight.size(1), weight.size(2), weight.size(3), weight.size(4)};
         } else {
             weights_dims = {weight.size(0), weight.size(1), weight.size(2), weight.size(3), weight.size(4)};
         }
-        
-        memory::dims strides_dims = {stride[0], stride[1], stride[2]};
-        memory::dims padding_l_dims = {pD_front, pH_top, pW_left};
-        memory::dims padding_r_dims = {pD_back, pH_bottom, pW_right};
-        memory::dims dilates_dims = {dilation[0] - 1, dilation[1] - 1, dilation[2] - 1};
-        
-        auto src_md = memory::desc(
-            src_dims, memory::data_type::f32,
-            input.is_contiguous(MemoryFormat::ChannelsLast3d)
-                ? memory::format_tag::ndhwc
-                : memory::format_tag::ncdhw);
-        auto dst_tag = memory::format_tag::any;
-        auto dst_md = memory::desc(dst_dims, memory::data_type::f32, dst_tag);
-        
-        auto weights_md = groups > 1 
-            ? memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::goidhw)
-            : memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::oidhw);
-            
-        auto bias_md = (bias.defined() && bias.numel() > 0)
-            ? memory::desc({bias.size(0)}, memory::data_type::f32, memory::format_tag::x)
-            : memory::desc();
-            
-        auto conv_pd = convolution_forward::primitive_desc(
-            eng,
-            prop_kind::forward_inference, algorithm::convolution_auto,
-            src_md, weights_md, bias_md, dst_md,
-            strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
-        
+
+        // Cached primitive: steady-state inference/training hits the same
+        // shape every step, so the primitive descriptor and its scratchpad
+        // are built once.
+        ConvKey key;
+        key.n = input.size(0); key.ic = input.size(1);
+        key.ih = input.size(2); key.iw = input.size(3); key.id = input.size(4);
+        key.oc = output.size(1);
+        key.oh = output.size(2); key.ow = output.size(3); key.od = output.size(4);
+        key.kh = weight.size(2); key.kw = weight.size(3); key.kd = weight.size(4);
+        key.sh = stride[0]; key.sw = stride[1]; key.sd = stride[2];
+        key.ph_t = pD_front; key.ph_b = pD_back; key.pw_l = pH_top; key.pw_r = pH_bottom;
+        key.pd_f = pW_left; key.pd_k = pW_right;
+        key.dh = dilation[0]; key.dw = dilation[1]; key.dd = dilation[2];
+        key.groups = groups;
+        key.has_bias = (bias.defined() && bias.numel() > 0);
+        key.type = 10; // conv3d forward
+
+        struct CachedConv3d {
+            convolution_forward::primitive_desc pd;
+            convolution_forward prim;
+            dnnl::memory scratchpad;
+            bool has_scratchpad = false;
+        };
+        static std::unordered_map<ConvKey, CachedConv3d> cache;
+        static std::mutex mtx;
+
+        convolution_forward::primitive_desc conv_pd;
+        convolution_forward conv;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            auto it = cache.find(key);
+            if (it != cache.end()) {
+                conv_pd = it->second.pd;
+                conv = it->second.prim;
+            } else {
+                memory::dims src_dims_l = {key.n, key.ic, key.ih, key.iw, key.id};
+                memory::dims dst_dims_l = {key.n, key.oc, key.oh, key.ow, key.od};
+                memory::dims weights_dims_l;
+                if (groups > 1) {
+                    weights_dims_l = {groups, key.oc / groups, key.ic / groups, key.kd, key.kh, key.kw};
+                } else {
+                    weights_dims_l = {key.oc, key.ic, key.kd, key.kh, key.kw};
+                }
+                memory::dims strides_dims = {key.sd, key.sh, key.sw};
+                memory::dims padding_l_dims = {key.ph_t, key.pw_l, key.pd_f};
+                memory::dims padding_r_dims = {key.ph_b, key.pw_r, key.pd_k};
+                memory::dims dilates_dims = {key.dd - 1, key.dh - 1, key.dw - 1};
+
+                auto user_src_md = memory::desc(src_dims_l, memory::data_type::f32,
+                                                src_cl ? memory::format_tag::ndhwc
+                                                       : memory::format_tag::ncdhw);
+                auto user_dst_md = memory::desc(dst_dims_l, memory::data_type::f32,
+                                                dst_cl ? memory::format_tag::ndhwc
+                                                       : memory::format_tag::ncdhw);
+                // Grouped convolutions require the weights in grouped
+                // channels-last order for an ndhwc primitive to exist; any
+                // other combination is rejected by the engine.
+                memory::desc weights_any = memory::desc(weights_dims_l, memory::data_type::f32, memory::format_tag::any);
+                if (groups > 1 && (src_cl || dst_cl)) {
+                    weights_any = memory::desc(weights_dims_l, memory::data_type::f32, memory::format_tag::godhwi);
+                }
+                auto bias_md = key.has_bias
+                    ? memory::desc({key.oc}, memory::data_type::f32, memory::format_tag::x)
+                    : memory::desc();
+
+                // Stage 1: let the engine choose its blocked weights layout.
+                auto probe_pd = convolution_forward::primitive_desc(
+                    eng, prop_kind::forward_inference, algorithm::convolution_auto,
+                    memory::desc(src_dims_l, memory::data_type::f32, memory::format_tag::any),
+                    weights_any, bias_md,
+                    memory::desc(dst_dims_l, memory::data_type::f32, memory::format_tag::any),
+                    strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
+                // Stage 2 (channels-last only): plain ndhwc activations +
+                // the chosen blocked weights run the fast brg kernel directly
+                // on the user's buffers with no per-call reorders.  A
+                // row-major request keeps the all-any primitive instead: on
+                // plain tags the engine drops to its reference kernel.
+                if (src_cl || dst_cl) {
+                    try {
+                        conv_pd = convolution_forward::primitive_desc(
+                            eng, prop_kind::forward_inference, algorithm::convolution_auto,
+                            user_src_md, probe_pd.weights_desc(), bias_md, user_dst_md,
+                            strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
+                    } catch (const dnnl::error&) {
+                        conv_pd = probe_pd;
+                    }
+                } else {
+                    conv_pd = probe_pd;
+                }
+                conv = convolution_forward(conv_pd);
+
+                CachedConv3d entry{conv_pd, conv, dnnl::memory(), false};
+                if (conv_pd.scratchpad_desc().get_size() > 0) {
+                    entry.scratchpad = dnnl::memory(conv_pd.scratchpad_desc(), eng);
+                    entry.has_scratchpad = true;
+                }
+                cache.insert({key, entry});
+            }
+        }
+
         auto expected_dst_md = conv_pd.dst_desc();
         auto user_dst_md = memory::desc(
             dst_dims, memory::data_type::f32,
-            output.is_contiguous(MemoryFormat::ChannelsLast3d)
-                ? memory::format_tag::ndhwc
-                : memory::format_tag::ncdhw);
+            dst_cl ? memory::format_tag::ndhwc
+                   : memory::format_tag::ncdhw);
         bool need_reorder_dst = (expected_dst_md != user_dst_md);
-        
+
         memory dst_mem;
         Storage blocked_storage_handle;
-        
+
         if (need_reorder_dst) {
              size_t required_size = expected_dst_md.get_size();
              Allocator* allocator = getAllocator(output.device().type());
@@ -1401,16 +1476,14 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         auto expected_src_md = conv_pd.src_desc();
         auto expected_weights_md = conv_pd.weights_desc();
 
-        // 1. Input reorder: the primitive descriptor may pick a blocked/padded src
-        //    layout. Feeding it the user's plain ncdhw buffer directly makes oneDNN
-        //    read out of bounds (blocked formats are padded), corrupting the heap.
+        // 1. Input: with the ndhwc tag above the primitive accepts the
+        //    user's buffer directly; otherwise bridge the blocked layout.
         memory src_mem;
         Storage src_storage_handle;
         auto user_src_md = memory::desc(
             src_dims, memory::data_type::f32,
-            input.is_contiguous(MemoryFormat::ChannelsLast3d)
-                ? memory::format_tag::ndhwc
-                : memory::format_tag::ncdhw);
+            src_cl ? memory::format_tag::ndhwc
+                   : memory::format_tag::ncdhw);
         if (expected_src_md != user_src_md) {
              size_t req_size = expected_src_md.get_size();
              Allocator* allocator = getAllocator(input.device().type());
@@ -1422,22 +1495,68 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
              src_mem = memory(user_src_md, eng, input.data_ptr<float>());
         }
 
-        // 2. Weights reorder: same reasoning as src.
+        // 2. Weights reorder: the blocked copy is cached per parameter
+        //    (buffer, version, layout) so steady state pays it once.
         memory weights_mem;
         Storage weights_storage_handle;
-        if (expected_weights_md != weights_md) {
-             size_t req_size = expected_weights_md.get_size();
-             Allocator* allocator = getAllocator(weight.device().type());
-             weights_storage_handle = Storage(req_size, allocator);
-             weights_mem = memory(expected_weights_md, eng, weights_storage_handle.data());
-             auto user_weights_mem = memory(weights_md, eng, weight.data_ptr<float>());
-             reorder(user_weights_mem, weights_mem).execute(s, user_weights_mem, weights_mem);
-        } else {
-             weights_mem = memory(weights_md, eng, weight.data_ptr<float>());
+        {
+            memory::desc user_weights_md = weight.is_contiguous(MemoryFormat::ChannelsLast3d)
+                ? memory::desc(weights_dims, memory::data_type::f32,
+                               groups > 1 ? memory::format_tag::godhwi : memory::format_tag::odhwi)
+                : memory::desc(weights_dims, memory::data_type::f32,
+                               groups > 1 ? memory::format_tag::goidhw : memory::format_tag::oidhw);
+            if (expected_weights_md != user_weights_md) {
+                struct CachedReorder {
+                    const void* data;
+                    uint32_t version;
+                    memory::desc user_md;
+                    memory mem;
+                };
+                static std::mutex wr_mtx;
+                static std::unordered_map<const TensorImpl*, std::vector<CachedReorder>> wr_cache;
+                const TensorImpl* w_impl = weight.unsafeGetTensorImpl().get();
+                void* w_mutable = weight.data_ptr<float>();
+                const void* w_data = w_mutable;
+                const uint32_t w_version = w_impl->version();
+
+                bool hit = false;
+                {
+                    std::lock_guard<std::mutex> lock(wr_mtx);
+                    auto wit = wr_cache.find(w_impl);
+                    if (wit != wr_cache.end()) {
+                        for (const auto& c : wit->second) {
+                            if (c.data == w_data && c.version == w_version &&
+                                c.user_md == user_weights_md &&
+                                c.mem.get_desc() == expected_weights_md) {
+                                weights_mem = c.mem;
+                                hit = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!hit) {
+                    size_t req_size = expected_weights_md.get_size();
+                    Allocator* allocator = getAllocator(weight.device().type());
+                    weights_storage_handle = Storage(req_size, allocator);
+                    weights_mem = memory(expected_weights_md, eng, weights_storage_handle.data());
+                    auto user_weights_mem = memory(user_weights_md, eng, w_mutable);
+                    reorder(user_weights_mem, weights_mem).execute(s, user_weights_mem, weights_mem);
+                    std::lock_guard<std::mutex> lock(wr_mtx);
+                    auto& entries = wr_cache[w_impl];
+                    entries.erase(std::remove_if(entries.begin(), entries.end(),
+                                                 [&](const CachedReorder& c) {
+                                                     return c.user_md == user_weights_md &&
+                                                            c.mem.get_desc() == expected_weights_md;
+                                                 }),
+                                  entries.end());
+                    entries.push_back({w_data, w_version, user_weights_md, weights_mem});
+                }
+            } else {
+                weights_mem = memory(user_weights_md, eng, weight.data_ptr<float>());
+            }
         }
-        
-        convolution_forward conv(conv_pd);
-        
+
         std::unordered_map<int, memory> args;
         args.insert({DNNL_ARG_SRC, src_mem});
         args.insert({DNNL_ARG_WEIGHTS, weights_mem});
@@ -1461,16 +1580,14 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
             args.insert({DNNL_ARG_BIAS, bias_mem});
         }
 
-        // The scratchpad is written by the primitive: the storage must stay
-        // alive for the execute() call.  conv3d always runs this uncached
-        // path, and oneDNN's convolution_auto kernels routinely need one --
-        // the missing arg is what corrupted the heap (exit 139).
-        Storage scratch_storage_handle;
-        if (conv_pd.scratchpad_desc().get_size() > 0) {
-            scratch_storage_handle = Storage(conv_pd.scratchpad_desc().get_size(),
-                                             getAllocator(output.device().type()));
-            args.insert({DNNL_ARG_SCRATCHPAD,
-                         memory(conv_pd.scratchpad_desc(), eng, scratch_storage_handle.data())});
+        // The cached scratchpad is written by the primitive during execute();
+        // it is private to this primitive entry so reuse across calls is safe.
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            auto it = cache.find(key);
+            if (it != cache.end() && it->second.has_scratchpad) {
+                args.insert({DNNL_ARG_SCRATCHPAD, it->second.scratchpad});
+            }
         }
 
         conv.execute(s, args);
@@ -1488,6 +1605,8 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         
         return true;
     } catch (dnnl::error& e) {
+        if (std::getenv("TP_DBG_CONV3D"))
+            std::cerr << "[conv3d] dnnl error: " << e.what() << std::endl;
         return false;
     }
     catch (...) {
@@ -4527,38 +4646,110 @@ static bool conv3d_grad_input_onednn(const Tensor& grad_output, const Tensor& in
         auto& eng = OneDNNContext::get_engine();
         auto& s = OneDNNContext::get_stream();
 
-        memory::dims src_dims = {input_c.size(0), input_c.size(1), input_c.size(2), input_c.size(3), input_c.size(4)};
-        memory::dims dst_dims = {grad_output_c.size(0), grad_output_c.size(1), grad_output_c.size(2), grad_output_c.size(3), grad_output_c.size(4)};
-        memory::dims weights_dims;
-        if (groups > 1) {
-            weights_dims = {groups, weight_c.size(0) / groups, weight_c.size(1), weight_c.size(2), weight_c.size(3), weight_c.size(4)};
-        } else {
-            weights_dims = {weight_c.size(0), weight_c.size(1), weight_c.size(2), weight_c.size(3), weight_c.size(4)};
+        // Cached primitive: steady-state training hits the same shape every
+        // step, so the primitive descriptors are built once.
+        ConvKey key;
+        key.n = input_c.size(0); key.ic = input_c.size(1);
+        key.ih = input_c.size(2); key.iw = input_c.size(3); key.id = input_c.size(4);
+        key.oc = grad_output_c.size(1);
+        key.oh = grad_output_c.size(2); key.ow = grad_output_c.size(3); key.od = grad_output_c.size(4);
+        key.kh = weight_c.size(2); key.kw = weight_c.size(3); key.kd = weight_c.size(4);
+        key.sh = stride[0]; key.sw = stride[1]; key.sd = stride[2];
+        key.ph_t = pD; key.ph_b = pD; key.pw_l = pH; key.pw_r = pH;
+        key.pd_f = pW; key.pd_k = pW;
+        key.dh = dilation[0]; key.dw = dilation[1]; key.dd = dilation[2];
+        key.groups = groups;
+        key.has_bias = false;
+        key.type = 8; // conv3d bwd_data
+
+        struct CachedBwd3d {
+            convolution_backward_data::primitive_desc pd;
+            convolution_backward_data prim;
+        };
+        static std::unordered_map<ConvKey, CachedBwd3d> cache;
+        static std::mutex mtx;
+
+        convolution_backward_data::primitive_desc pd;
+        convolution_backward_data bwd_d;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            auto it = cache.find(key);
+            if (it != cache.end()) {
+                pd = it->second.pd;
+                bwd_d = it->second.prim;
+            } else {
+                memory::dims src_dims_l = {key.n, key.ic, key.ih, key.iw, key.id};
+                memory::dims dst_dims_l = {key.n, key.oc, key.oh, key.ow, key.od};
+                memory::dims weights_dims_l;
+                if (groups > 1) {
+                    weights_dims_l = {groups, key.oc / groups, key.ic / groups, key.kd, key.kh, key.kw};
+                } else {
+                    weights_dims_l = {key.oc, key.ic, key.kd, key.kh, key.kw};
+                }
+                memory::dims strides_dims = {key.sd, key.sh, key.sw};
+                memory::dims padding_l_dims = {key.ph_t, key.ph_b, key.pd_f};
+                memory::dims padding_r_dims = {key.ph_t, key.ph_b, key.pd_f};
+                memory::dims dilates_dims = {key.dd - 1, key.dh - 1, key.dw - 1};
+
+                // Plain activation tags let the primitive consume the
+                // buffers the forward chain produced with no per-call
+                // reorders; the weights stay blocked as the engine chooses.
+                auto go_cl = grad_output_c.is_contiguous(MemoryFormat::ChannelsLast3d);
+                auto gi_cl = grad_input.is_contiguous(MemoryFormat::ChannelsLast3d);
+                auto user_src_md = memory::desc(src_dims_l, memory::data_type::f32,
+                                                gi_cl ? memory::format_tag::ndhwc
+                                                      : memory::format_tag::ncdhw);
+                auto user_dst_md = memory::desc(dst_dims_l, memory::data_type::f32,
+                                                go_cl ? memory::format_tag::ndhwc
+                                                      : memory::format_tag::ncdhw);
+                auto probe_fwd = convolution_forward::primitive_desc(
+                    eng, prop_kind::forward_inference, algorithm::convolution_auto,
+                    memory::desc(src_dims_l, memory::data_type::f32, memory::format_tag::any),
+                    memory::desc(weights_dims_l, memory::data_type::f32, memory::format_tag::any),
+                    memory::desc(),
+                    memory::desc(dst_dims_l, memory::data_type::f32, memory::format_tag::any),
+                    strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
+                auto probe_pd = convolution_backward_data::primitive_desc(
+                    eng, algorithm::convolution_auto,
+                    memory::desc(src_dims_l, memory::data_type::f32, memory::format_tag::any),
+                    memory::desc(weights_dims_l, memory::data_type::f32, memory::format_tag::any),
+                    memory::desc(dst_dims_l, memory::data_type::f32, memory::format_tag::any),
+                    strides_dims, dilates_dims, padding_l_dims, padding_r_dims,
+                    probe_fwd);
+                // Stage 2 (channels-last only): plain ndhwc activations +
+                // blocked weights run the fast brg kernel on the user's
+                // buffers.  Row-major keeps the all-any primitive.
+                if (gi_cl || go_cl) {
+                    try {
+                        auto hint = convolution_forward::primitive_desc(
+                            eng, prop_kind::forward_inference, algorithm::convolution_auto,
+                            user_src_md, probe_pd.weights_desc(), memory::desc(), user_dst_md,
+                            strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
+                        pd = convolution_backward_data::primitive_desc(
+                            eng, algorithm::convolution_auto,
+                            user_src_md, probe_pd.weights_desc(), user_dst_md,
+                            strides_dims, dilates_dims, padding_l_dims, padding_r_dims,
+                            hint);
+                    } catch (const dnnl::error&) {
+                        pd = probe_pd;
+                    }
+                } else {
+                    pd = probe_pd;
+                }
+                bwd_d = convolution_backward_data(pd);
+                cache.insert({key, {pd, bwd_d}});
+            }
         }
+        // Local logical dims for the user-memory descriptors below.
+        const memory::dims src_dims = {key.n, key.ic, key.ih, key.iw, key.id};
+        const memory::dims dst_dims = {key.n, key.oc, key.oh, key.ow, key.od};
+        const memory::dims weights_dims = groups > 1
+            ? memory::dims{groups, key.oc / groups, key.ic / groups, key.kd, key.kh, key.kw}
+            : memory::dims{key.oc, key.ic, key.kd, key.kh, key.kw};
 
-        memory::dims strides_dims = {stride[0], stride[1], stride[2]};
-        memory::dims padding_l_dims = {pD, pH, pW};
-        memory::dims padding_r_dims = {pD, pH, pW};
-        memory::dims dilates_dims = {dilation[0] - 1, dilation[1] - 1, dilation[2] - 1};
-
-        auto src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::any);
-        auto dst_md = memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::any);
-        auto weights_md = memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::any);
-
-        auto fwd_pd = convolution_forward::primitive_desc(
-            eng, prop_kind::forward_inference, algorithm::convolution_auto,
-            src_md, weights_md, memory::desc(), dst_md,
-            strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
-        auto bwd_d_pd = convolution_backward_data::primitive_desc(
-            eng, algorithm::convolution_auto,
-            src_md, weights_md, dst_md,
-            strides_dims, dilates_dims, padding_l_dims, padding_r_dims,
-            fwd_pd);
-        convolution_backward_data bwd_d(bwd_d_pd);
-
-        auto expected_diff_src_md = bwd_d_pd.diff_src_desc();
-        auto expected_weights_md = bwd_d_pd.weights_desc();
-        auto expected_diff_dst_md = bwd_d_pd.diff_dst_desc();
+        auto expected_diff_src_md = pd.diff_src_desc();
+        auto expected_weights_md = pd.weights_desc();
+        auto expected_diff_dst_md = pd.diff_dst_desc();
 
         // Diff Dst (grad_output)
         memory diff_dst_mem;
@@ -4575,7 +4766,8 @@ static bool conv3d_grad_input_onednn(const Tensor& grad_output, const Tensor& in
             }
         }
 
-        // Weights
+        // Weights: the blocked copy is cached per parameter (buffer, version,
+        // layout) so steady-state steps reuse it until the optimizer updates.
         memory weights_mem;
         {
             memory::desc user_md = weight_c.is_contiguous(MemoryFormat::ChannelsLast3d)
@@ -4585,8 +4777,47 @@ static bool conv3d_grad_input_onednn(const Tensor& grad_output, const Tensor& in
                                groups > 1 ? memory::format_tag::goidhw : memory::format_tag::oidhw);
             auto user_mem = memory(user_md, eng, weight_c.data_ptr<float>());
             if (user_md != expected_weights_md) {
-                weights_mem = memory(expected_weights_md, eng);
-                reorder(user_mem, weights_mem).execute(s, user_mem, weights_mem);
+                struct CachedReorder {
+                    const void* data;
+                    uint32_t version;
+                    memory::desc user_md;
+                    memory mem;
+                };
+                static std::mutex wr_mtx;
+                static std::unordered_map<const TensorImpl*, std::vector<CachedReorder>> wr_cache;
+                const TensorImpl* w_impl = weight_c.unsafeGetTensorImpl().get();
+                void* w_data = weight_c.data_ptr<float>();
+                const uint32_t w_version = w_impl->version();
+
+                bool hit = false;
+                {
+                    std::lock_guard<std::mutex> lock(wr_mtx);
+                    auto wit = wr_cache.find(w_impl);
+                    if (wit != wr_cache.end()) {
+                        for (const auto& c : wit->second) {
+                            if (c.data == w_data && c.version == w_version &&
+                                c.user_md == user_md &&
+                                c.mem.get_desc() == expected_weights_md) {
+                                weights_mem = c.mem;
+                                hit = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!hit) {
+                    weights_mem = memory(expected_weights_md, eng);
+                    reorder(user_mem, weights_mem).execute(s, user_mem, weights_mem);
+                    std::lock_guard<std::mutex> lock(wr_mtx);
+                    auto& entries = wr_cache[w_impl];
+                    entries.erase(std::remove_if(entries.begin(), entries.end(),
+                                                 [&](const CachedReorder& c) {
+                                                     return c.user_md == user_md &&
+                                                            c.mem.get_desc() == expected_weights_md;
+                                                 }),
+                                  entries.end());
+                    entries.push_back({w_data, w_version, user_md, weights_mem});
+                }
             } else {
                 weights_mem = user_mem;
             }
@@ -4612,8 +4843,8 @@ static bool conv3d_grad_input_onednn(const Tensor& grad_output, const Tensor& in
             {DNNL_ARG_WEIGHTS, weights_mem},
             {DNNL_ARG_DIFF_SRC, diff_src_mem}
         };
-        if (bwd_d_pd.scratchpad_desc().get_size() > 0) {
-            bwd_d_args.insert({DNNL_ARG_SCRATCHPAD, memory(bwd_d_pd.scratchpad_desc(), eng)});
+        if (pd.scratchpad_desc().get_size() > 0) {
+            bwd_d_args.insert({DNNL_ARG_SCRATCHPAD, memory(pd.scratchpad_desc(), eng)});
         }
         bwd_d.execute(s, bwd_d_args);
 
@@ -4622,6 +4853,7 @@ static bool conv3d_grad_input_onednn(const Tensor& grad_output, const Tensor& in
             reorder(diff_src_mem, user_mem).execute(s, diff_src_mem, user_mem);
         }
         s.wait();
+        if (std::getenv("TP_DBG_CONV3D")) std::cerr << "[conv3d] bwd_data onednn claimed" << std::endl;
         return true;
     } catch (...) {
         return false;
@@ -4651,38 +4883,109 @@ static bool conv3d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
         auto& eng = OneDNNContext::get_engine();
         auto& s = OneDNNContext::get_stream();
 
-        memory::dims src_dims = {input_c.size(0), input_c.size(1), input_c.size(2), input_c.size(3), input_c.size(4)};
-        memory::dims dst_dims = {grad_output_c.size(0), grad_output_c.size(1), grad_output_c.size(2), grad_output_c.size(3), grad_output_c.size(4)};
-        memory::dims weights_dims;
-        if (groups > 1) {
-            weights_dims = {groups, weight.size(0) / groups, weight.size(1), weight.size(2), weight.size(3), weight.size(4)};
-        } else {
-            weights_dims = {weight.size(0), weight.size(1), weight.size(2), weight.size(3), weight.size(4)};
+        // Cached primitive, same rationale as backward-data.
+        ConvKey key;
+        key.n = input_c.size(0); key.ic = input_c.size(1);
+        key.ih = input_c.size(2); key.iw = input_c.size(3); key.id = input_c.size(4);
+        key.oc = grad_output_c.size(1);
+        key.oh = grad_output_c.size(2); key.ow = grad_output_c.size(3); key.od = grad_output_c.size(4);
+        key.kh = weight.size(2); key.kw = weight.size(3); key.kd = weight.size(4);
+        key.sh = stride[0]; key.sw = stride[1]; key.sd = stride[2];
+        key.ph_t = pD; key.ph_b = pD; key.pw_l = pH; key.pw_r = pH;
+        key.pd_f = pW; key.pd_k = pW;
+        key.dh = dilation[0]; key.dw = dilation[1]; key.dd = dilation[2];
+        key.groups = groups;
+        key.has_bias = false;
+        key.type = 9; // conv3d bwd_weights
+
+        struct CachedBwdW3d {
+            convolution_backward_weights::primitive_desc pd;
+            convolution_backward_weights prim;
+        };
+        static std::unordered_map<ConvKey, CachedBwdW3d> cache;
+        static std::mutex mtx;
+
+        convolution_backward_weights::primitive_desc pd;
+        convolution_backward_weights bwd_w;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            auto it = cache.find(key);
+            if (it != cache.end()) {
+                pd = it->second.pd;
+                bwd_w = it->second.prim;
+            } else {
+                memory::dims src_dims_l = {key.n, key.ic, key.ih, key.iw, key.id};
+                memory::dims dst_dims_l = {key.n, key.oc, key.oh, key.ow, key.od};
+                memory::dims weights_dims_l;
+                if (groups > 1) {
+                    weights_dims_l = {groups, key.oc / groups, key.ic / groups, key.kd, key.kh, key.kw};
+                } else {
+                    weights_dims_l = {key.oc, key.ic, key.kd, key.kh, key.kw};
+                }
+                memory::dims strides_dims = {key.sd, key.sh, key.sw};
+                memory::dims padding_l_dims = {key.ph_t, key.ph_b, key.pd_f};
+                memory::dims padding_r_dims = {key.ph_t, key.ph_b, key.pd_f};
+                memory::dims dilates_dims = {key.dd - 1, key.dh - 1, key.dw - 1};
+
+                // Plain activation tags; the diff-weights layout is the
+                // engine's blocked choice, reordered into the grad buffer's
+                // own layout (ODHWI/GODHWI for channels-last) afterwards.
+                auto in_cl = input_c.is_contiguous(MemoryFormat::ChannelsLast3d);
+                auto go_cl2 = grad_output_c.is_contiguous(MemoryFormat::ChannelsLast3d);
+                auto user_src_md = memory::desc(src_dims_l, memory::data_type::f32,
+                                                in_cl ? memory::format_tag::ndhwc
+                                                      : memory::format_tag::ncdhw);
+                auto user_dst_md = memory::desc(dst_dims_l, memory::data_type::f32,
+                                                go_cl2 ? memory::format_tag::ndhwc
+                                                       : memory::format_tag::ncdhw);
+                auto probe_fwd = convolution_forward::primitive_desc(
+                    eng, prop_kind::forward_inference, algorithm::convolution_auto,
+                    memory::desc(src_dims_l, memory::data_type::f32, memory::format_tag::any),
+                    memory::desc(weights_dims_l, memory::data_type::f32, memory::format_tag::any),
+                    memory::desc(),
+                    memory::desc(dst_dims_l, memory::data_type::f32, memory::format_tag::any),
+                    strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
+                auto probe_pd = convolution_backward_weights::primitive_desc(
+                    eng, algorithm::convolution_auto,
+                    memory::desc(src_dims_l, memory::data_type::f32, memory::format_tag::any),
+                    memory::desc(weights_dims_l, memory::data_type::f32, memory::format_tag::any),
+                    memory::desc(),
+                    memory::desc(dst_dims_l, memory::data_type::f32, memory::format_tag::any),
+                    strides_dims, dilates_dims, padding_l_dims, padding_r_dims,
+                    probe_fwd);
+                // Stage 2 (channels-last only), same rationale as
+                // backward-data; row-major keeps the all-any primitive.
+                if (in_cl || go_cl2) {
+                    try {
+                        auto hint = convolution_forward::primitive_desc(
+                            eng, prop_kind::forward_inference, algorithm::convolution_auto,
+                            user_src_md, probe_pd.diff_weights_desc(), memory::desc(), user_dst_md,
+                            strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
+                        pd = convolution_backward_weights::primitive_desc(
+                            eng, algorithm::convolution_auto,
+                            user_src_md, probe_pd.diff_weights_desc(), memory::desc(), user_dst_md,
+                            strides_dims, dilates_dims, padding_l_dims, padding_r_dims,
+                            hint);
+                    } catch (const dnnl::error&) {
+                        pd = probe_pd;
+                    }
+                } else {
+                    pd = probe_pd;
+                }
+                bwd_w = convolution_backward_weights(pd);
+                cache.insert({key, {pd, bwd_w}});
+            }
         }
+        // Local logical dims for the user-memory descriptors below.
+        const memory::dims src_dims = {key.n, key.ic, key.ih, key.iw, key.id};
+        const memory::dims dst_dims = {key.n, key.oc, key.oh, key.ow, key.od};
+        const memory::dims weights_dims = groups > 1
+            ? memory::dims{groups, key.oc / groups, key.ic / groups, key.kd, key.kh, key.kw}
+            : memory::dims{key.oc, key.ic, key.kd, key.kh, key.kw};
 
-        memory::dims strides_dims = {stride[0], stride[1], stride[2]};
-        memory::dims padding_l_dims = {pD, pH, pW};
-        memory::dims padding_r_dims = {pD, pH, pW};
-        memory::dims dilates_dims = {dilation[0] - 1, dilation[1] - 1, dilation[2] - 1};
-
-        auto src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::any);
-        auto dst_md = memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::any);
-        auto weights_md = memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::any);
-
-        auto fwd_pd = convolution_forward::primitive_desc(
-            eng, prop_kind::forward_inference, algorithm::convolution_auto,
-            src_md, weights_md, memory::desc(), dst_md,
-            strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
-        auto bwd_w_pd = convolution_backward_weights::primitive_desc(
-            eng, algorithm::convolution_auto,
-            src_md, weights_md, memory::desc(), dst_md,
-            strides_dims, dilates_dims, padding_l_dims, padding_r_dims,
-            fwd_pd);
-        convolution_backward_weights bwd_w(bwd_w_pd);
-
-        auto expected_src_md = bwd_w_pd.src_desc();
-        auto expected_diff_dst_md = bwd_w_pd.diff_dst_desc();
-        auto expected_diff_weights_md = bwd_w_pd.diff_weights_desc();
+        auto expected_src_md = pd.src_desc();
+        auto expected_diff_dst_md = pd.diff_dst_desc();
+        auto expected_diff_weights_md = pd.diff_weights_desc();
 
         // Src (input)
         memory src_mem;
@@ -4736,8 +5039,8 @@ static bool conv3d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
             {DNNL_ARG_DIFF_DST, diff_dst_mem},
             {DNNL_ARG_DIFF_WEIGHTS, diff_weights_mem}
         };
-        if (bwd_w_pd.scratchpad_desc().get_size() > 0) {
-            bwd_w_args.insert({DNNL_ARG_SCRATCHPAD, memory(bwd_w_pd.scratchpad_desc(), eng)});
+        if (pd.scratchpad_desc().get_size() > 0) {
+            bwd_w_args.insert({DNNL_ARG_SCRATCHPAD, memory(pd.scratchpad_desc(), eng)});
         }
         bwd_w.execute(s, bwd_w_args);
 
@@ -4746,6 +5049,7 @@ static bool conv3d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
             reorder(diff_weights_mem, user_mem).execute(s, diff_weights_mem, user_mem);
         }
         s.wait();
+        if (std::getenv("TP_DBG_CONV3D")) std::cerr << "[conv3d] bwd_weights onednn claimed" << std::endl;
         return true;
     } catch (...) {
         return false;

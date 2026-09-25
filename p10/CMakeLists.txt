@@ -211,6 +211,12 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/BinaryMathPointwiseKernels.cu
         src/backend/cuda/UnaryOps.cu
         src/backend/cuda/Pooling.cu
+        src/backend/cuda/AdaptiveAveragePool2dKernels.cu
+        src/backend/cuda/AveragePool2dKernels.cu
+        src/backend/cuda/AdaptiveMaxPool2dKernels.cu
+        src/backend/cuda/AdaptiveMaxPool3dKernels.cu
+        src/backend/cuda/MaxPool2dKernels.cu
+        src/backend/cuda/MaxPool3dKernels.cu
         src/backend/cuda/MaxPooling.cu
         src/backend/cuda/AveragePool3d.cu
         src/backend/cuda/AdaptiveAveragePooling3d.cu
@@ -230,10 +236,18 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/CudaTunable.cpp
         src/backend/cuda/ActivationKernels.cu
         src/backend/cuda/SoftmaxKernels.cu
-        src/backend/cuda/NormalizationKernels.cu
+        src/backend/cuda/LayerNormKernels.cu
+        src/backend/cuda/GroupNormKernels.cu
+        src/backend/cuda/BatchNormKernels.cu
+        src/backend/cuda/RMSNormKernels.cu
+        src/backend/cuda/InstanceNormKernels.cu
         src/backend/cuda/LossFillKernels.cu
         src/backend/cuda/LossCTC.cu
         src/backend/cuda/ConvKernels.cu
+        src/backend/cuda/ConvTransposeKernels.cu
+        src/backend/cuda/Conv1dKernels.cu
+        src/backend/cuda/Conv3dKernels.cu
+        src/backend/cuda/Im2ColKernels.cu
         src/backend/cuda/ConvFp64Kernels.cu
         src/backend/cuda/Convolution.cu
         src/backend/cuda/DeformConvKernels.cu
@@ -250,6 +264,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/RandomKernels.cu
         src/backend/cuda/RandomSpecialKernels.cu
         src/backend/cuda/ReductionKernels.cu
+        src/backend/cuda/MedianKernels.cu
         src/backend/cuda/DistanceKernels.cu
         src/backend/cuda/ViewKernels.cu
         src/backend/cuda/ShapeAlignKernels.cu
@@ -262,9 +277,12 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/TensorTopK.cu
         src/backend/cuda/SpecialAliasKernels.cu
         src/backend/cuda/AttentionKernels.cu
+        src/backend/cuda/AttentionGemmKernels.cu
         src/backend/cuda/AttentionRopeKernels.cu
         src/backend/cuda/GroupedGemmKernels.cu
         src/backend/cuda/IndexingKernels.cu
+        src/backend/cuda/MaskedKernels.cu
+        src/backend/cuda/GatherScatterKernels.cu
         src/backend/cuda/ScatterReduceKernels.cu
         src/backend/cuda/InteropAliasKernels.cu
         src/backend/cuda/ShapeOpsKernels.cu
