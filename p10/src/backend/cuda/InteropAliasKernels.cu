@@ -1078,53 +1078,6 @@ std::tuple<Tensor, Tensor> interop_batch_norm_update_stats_cuda(
 }
 
 // ---------------------------------------------------------------------------
-// native_layer_norm: layer_norm output plus the per-row mean and reciprocal
-// standard deviation saved for the backward pass.
-// ---------------------------------------------------------------------------
-
-std::tuple<Tensor, Tensor, Tensor> interop_native_layer_norm_cuda(
-        const Tensor& input, const std::vector<int64_t>& normalized_shape,
-        const std::optional<Tensor>& weight, const std::optional<Tensor>& bias,
-        double eps) {
-    Tensor out = dispatch_cuda<Tensor>("layer_norm", input, normalized_shape,
-                                       weight, bias, eps);
-    std::vector<int64_t> dims = norm_trailing_dims(input, normalized_shape);
-    // Rows are the leading (outer) dims collapsed into one axis.
-    std::vector<int64_t> outer_sizes;
-    for (int64_t i = 0;
-         i < static_cast<int64_t>(input.dim()) -
-             static_cast<int64_t>(normalized_shape.size());
-         ++i) {
-        outer_sizes.push_back(input.size(i));
-    }
-    if (outer_sizes.empty()) outer_sizes.push_back(1);
-    Tensor mean = ops::mean(input, dims, true).reshape(outer_sizes);
-    Tensor var = ops::var(input, dims, 0, true).reshape(outer_sizes);
-    Tensor rstd = ops::rsqrt(ops::add(var, Scalar(eps)));
-    return std::make_tuple(out, mean, rstd);
-}
-
-std::tuple<Tensor, Tensor, Tensor> interop_native_layer_norm_backward_cuda(
-        const Tensor& grad_out, const Tensor& input,
-        const std::vector<int64_t>& normalized_shape, const Tensor& /*mean*/,
-        const Tensor& /*rstd*/, const std::optional<Tensor>& weight,
-        const std::optional<Tensor>& bias,
-        const std::vector<bool>& output_mask) {
-    // tp's layer_norm_backward recomputes the row statistics internally; the
-    // saved mean/rstd are accepted to honor the spelling's contract.
-    auto grads = dispatch_cuda<std::tuple<Tensor, Tensor, Tensor>>(
-        "layer_norm_backward", grad_out, input, normalized_shape, weight, bias,
-        0.0);
-    Tensor gi = output_mask.size() > 0 && output_mask[0] ? std::get<0>(grads)
-                                                        : Tensor();
-    Tensor gw = output_mask.size() > 1 && output_mask[1] ? std::get<1>(grads)
-                                                        : Tensor();
-    Tensor gb = output_mask.size() > 2 && output_mask[2] ? std::get<2>(grads)
-                                                        : Tensor();
-    return std::make_tuple(gi, gw, gb);
-}
-
-// ---------------------------------------------------------------------------
 // _fft_r2c / _fft_c2r / _fft_c2c: single-dimension transform spellings of
 // the public fft kernels, which always transform the last dimension, so the
 // requested dimension is permuted there first and restored afterwards.
@@ -1870,10 +1823,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, InteropAliasKernels) {
     m.impl("batch_norm_gather_stats", interop_batch_norm_gather_stats_cuda);
     m.impl("batch_norm_gather_stats_with_counts", interop_batch_norm_gather_stats_with_counts_cuda);
     m.impl("batch_norm_update_stats", interop_batch_norm_update_stats_cuda);
-
-    // layer / group normalization
-    m.impl("native_layer_norm", interop_native_layer_norm_cuda);
-    m.impl("native_layer_norm_backward", interop_native_layer_norm_backward_cuda);
 
     // fft spellings
     m.impl("_fft_r2c", interop__fft_r2c_cuda);

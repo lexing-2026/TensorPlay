@@ -1,9 +1,9 @@
 #include "Tensor.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "Parallel.h"
 #include "NormRowHelpers.h"
-#include "tensorplay/ops/TPXOpsGenerated.h"
 
 namespace tensorplay {
 namespace cpu {
@@ -519,11 +519,14 @@ static Tensor layer_norm_cpu_impl(
     return out;
 }
 
+// The public spelling composes over the stats-producing native op so the
+// autograd node saves the per-row moments for the backward pass.  The call
+// goes through the generated ops wrapper, which records that node.
 Tensor layer_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalized_shape,
                       const std::optional<Tensor>& weight_opt,
                       const std::optional<Tensor>& bias_opt, double eps) {
-    return layer_norm_cpu_impl(input, normalized_shape, weight_opt, bias_opt,
-                               eps, nullptr, nullptr);
+    return std::get<0>(tensorplay::tpx::ops::native_layer_norm(
+        input, normalized_shape, weight_opt, bias_opt, eps));
 }
 
 // ============================================================================

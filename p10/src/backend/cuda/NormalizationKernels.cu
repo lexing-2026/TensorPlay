@@ -4,6 +4,7 @@
 #include "CUDAContext.h"
 #include "Exception.h"
 #include "CUDNNUtils.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <cuda_runtime.h>
 #ifdef USE_CUDNN
@@ -465,14 +466,18 @@ __device__ inline void ln_block_reduce2(ACC& v0, ACC& v1, ACC* smem0, ACC* smem1
 }
 
 // Fused forward: one block per row, Welford stats + normalize in one launch.
-// VEC > 1 requires N % VEC == 0 and 16B-aligned row pointers.
+// The per-row mean and reciprocal std land in the caller's buffers so the
+// backward pass can consume them instead of recomputing.  VEC > 1 requires
+// N % VEC == 0 and 16B-aligned row pointers.
 template <typename T, typename ACC, int VEC>
 __global__ void layer_norm_forward_kernel(
     int64_t N, ACC eps,
     const T* __restrict__ X,
     const T* __restrict__ gamma,
     const T* __restrict__ beta,
-    T* __restrict__ Y) {
+    T* __restrict__ Y,
+    ACC* __restrict__ mean_out,
+    ACC* __restrict__ rstd_out) {
     __shared__ LNWelford<ACC> smem[kLNThreads / 32];
     const int64_t row = blockIdx.x;
     const T* x_row = X + row * N;
@@ -496,6 +501,10 @@ __global__ void layer_norm_forward_kernel(
     wd = ln_block_reduce(wd, smem);
     const ACC mean = smem[0].mean;
     const ACC rstd = ln_rsqrt(smem[0].m2 / static_cast<ACC>(N) + eps);
+    if (mean_out != nullptr && threadIdx.x == 0) {
+        mean_out[row] = mean;
+        rstd_out[row] = rstd;
+    }
 
     if (VEC > 1) {
         using vec_t = LNAlignedVec<T, VEC>;
@@ -1025,16 +1034,17 @@ inline bool ln_ptr_aligned(const void* p) {
 template <typename T, typename ACC>
 void launch_layer_norm_forward(
     int64_t M, int64_t N, double eps,
-    const T* X, const T* gamma, const T* beta, T* Y) {
+    const T* X, const T* gamma, const T* beta, T* Y,
+    ACC* mean_out, ACC* rstd_out) {
     const bool vec_ok = (N % 4 == 0) && ln_ptr_aligned(X) && ln_ptr_aligned(Y) &&
         (!gamma || ln_ptr_aligned(gamma)) && (!beta || ln_ptr_aligned(beta));
     const auto stream = getCurrentCUDAStream().stream();
     if (vec_ok) {
         layer_norm_forward_kernel<T, ACC, 4><<<static_cast<unsigned>(M), ln_threads_for(N), 0, stream>>>(
-            N, static_cast<ACC>(eps), X, gamma, beta, Y);
+            N, static_cast<ACC>(eps), X, gamma, beta, Y, mean_out, rstd_out);
     } else {
         layer_norm_forward_kernel<T, ACC, 1><<<static_cast<unsigned>(M), ln_threads_for(N), 0, stream>>>(
-            N, static_cast<ACC>(eps), X, gamma, beta, Y);
+            N, static_cast<ACC>(eps), X, gamma, beta, Y, mean_out, rstd_out);
     }
 }
 
@@ -1202,13 +1212,356 @@ void launch_layer_norm_backward(
     }
 }
 
+
+// Stats-dtype helper shared by the native entry points.
+inline DType ln_stats_dtype(DType t) {
+    return t == DType::Float64 ? DType::Float64 : DType::Float32;
+}
+
+// Fused backward over saved moments: the forward's mean/rstd remove both
+// statistics passes, so each row needs a single dual reduction of
+// sum(dy*gamma) and the un-scaled sum(dy*gamma*(x-mean)), scaled by rstd
+// once afterwards.  The row stays in registers and dX is written straight
+// from them; column gradients accumulate in per-thread registers and land
+// in one partials row for the follow-up fold.  Buffer pairs alternate by
+// alternating rows, which also spaces consecutive uses of the same shared memory.
+// Traversal order is fixed and no atomics are used, so results are
+// deterministic.
+template <typename T, typename ACC, int UNROLL>
+__global__ void layer_norm_bwd_fused_stats_kernel(
+    int64_t M, int64_t N, int64_t rows_per_block,
+    const T* __restrict__ dY,
+    const T* __restrict__ X,
+    const T* __restrict__ gamma,
+    const ACC* __restrict__ mean,
+    const ACC* __restrict__ rstd,
+    T* __restrict__ dX,
+    ACC* __restrict__ part_dg,
+    ACC* __restrict__ part_db) {
+    constexpr int VEC = 4;
+    constexpr int SLOTS = UNROLL * VEC;
+    using vec_t = LNAlignedVec<T, VEC>;
+    using acc_vec_t = LNAlignedVec<ACC, VEC>;
+    __shared__ ACC smem[kLNThreads / 32];
+    __shared__ ACC smem0[kLNThreads / 32];
+    __shared__ ACC smem1[kLNThreads / 32];
+    __shared__ ACC smem2[kLNThreads / 32];
+
+    const int64_t r0 = static_cast<int64_t>(blockIdx.x) * rows_per_block;
+    int64_t r1 = r0 + rows_per_block;
+    if (r1 > M) r1 = M;
+    const int64_t nvec = N / VEC;
+    const vec_t* dyv = reinterpret_cast<const vec_t*>(dY);
+    const vec_t* xv = reinterpret_cast<const vec_t*>(X);
+    const vec_t* gv = gamma ? reinterpret_cast<const vec_t*>(gamma) : nullptr;
+    vec_t* dxv = reinterpret_cast<vec_t*>(dX);
+    const ACC inv_N = ACC(1) / static_cast<ACC>(N);
+
+    ACC dg_acc[SLOTS], db_acc[SLOTS];
+#pragma unroll
+    for (int s = 0; s < SLOTS; ++s) {
+        dg_acc[s] = ACC(0);
+        db_acc[s] = ACC(0);
+    }
+
+    for (int64_t r = r0; r < r1; ++r) {
+        const int64_t off = r * nvec;
+        const ACC m = mean[r];
+        const ACC rd = rstd[r];
+        vec_t dy_r[UNROLL], x_r[UNROLL];
+        bool has[UNROLL];
+#pragma unroll
+        for (int k = 0; k < UNROLL; ++k) {
+            const int64_t j = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+            has[k] = j < nvec;
+            if (has[k]) {
+                dy_r[k] = dyv[off + j];
+                x_r[k] = xv[off + j];
+            }
+        }
+
+        ACC s_dy = ACC(0), sdyx = ACC(0);
+        ACC wg_r[SLOTS];
+#pragma unroll
+        for (int k = 0; k < UNROLL; ++k) {
+            const int64_t j = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+            if (has[k]) {
+#pragma unroll
+                for (int e = 0; e < VEC; ++e) {
+                    const ACC g =
+                        gv ? static_cast<ACC>(gv[j].val[e]) : ACC(1);
+                    const ACC wg =
+                        static_cast<ACC>(dy_r[k].val[e]) * g;
+                    wg_r[k * VEC + e] = wg;
+                    s_dy += wg;
+                    sdyx += wg * (static_cast<ACC>(x_r[k].val[e]) - m);
+                }
+            }
+        }
+        ACC* buf_a = (r & 1) ? smem1 : smem;
+        ACC* buf_b = (r & 1) ? smem2 : smem0;
+        ln_block_reduce2(s_dy, sdyx, buf_a, buf_b);
+        const ACC s_dy_xhat = sdyx * rd;
+
+        const ACC term1 = rd * inv_N;
+        const ACC fH = static_cast<ACC>(N);
+#pragma unroll
+        for (int k = 0; k < UNROLL; ++k) {
+            const int64_t j = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+            if (has[k]) {
+                vec_t out;
+#pragma unroll
+                for (int e = 0; e < VEC; ++e) {
+                    const ACC dy_s = static_cast<ACC>(dy_r[k].val[e]);
+                    const ACC xh =
+                        (static_cast<ACC>(x_r[k].val[e]) - m) * rd;
+                    dg_acc[k * VEC + e] += dy_s * xh;
+                    db_acc[k * VEC + e] += dy_s;
+                    out.val[e] = static_cast<T>(
+                        term1 * (fH * wg_r[k * VEC + e] - s_dy - xh * s_dy_xhat));
+                }
+                ln_stream_store(&dxv[off + j], out);
+            }
+        }
+    }
+
+    if (part_dg != nullptr) {
+        acc_vec_t* dgv = reinterpret_cast<acc_vec_t*>(part_dg) +
+                         static_cast<int64_t>(blockIdx.x) * nvec;
+        acc_vec_t* dbv = reinterpret_cast<acc_vec_t*>(part_db) +
+                         static_cast<int64_t>(blockIdx.x) * nvec;
+#pragma unroll
+        for (int k = 0; k < UNROLL; ++k) {
+            const int64_t j = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+            if (j < nvec) {
+                acc_vec_t pd, pb;
+#pragma unroll
+                for (int e = 0; e < VEC; ++e) {
+                    pd.val[e] = dg_acc[k * VEC + e];
+                    pb.val[e] = db_acc[k * VEC + e];
+                }
+                dgv[j] = pd;
+                dbv[j] = pb;
+            }
+        }
+    }
+}
+
+// grad_input over saved moments: one block per row, row in registers, one
+// dual reduction for sum(dy*gamma) and sum(dy*gamma*(x-mean)).  The same
+// mean/rstd feed the column kernel when it follows.
+template <typename T, typename ACC, int UNROLL>
+__global__ void layer_norm_grad_input_reg_stats_kernel(
+    int64_t N,
+    const T* __restrict__ dY,
+    const T* __restrict__ X,
+    const T* __restrict__ gamma,
+    const ACC* __restrict__ mean,
+    const ACC* __restrict__ rstd,
+    T* __restrict__ dX) {
+    constexpr int VEC = 4;
+    constexpr int SLOTS = UNROLL * VEC;
+    using vec_t = LNAlignedVec<T, VEC>;
+    __shared__ ACC smem[kLNThreads / 32];
+    __shared__ ACC smem0[kLNThreads / 32];
+    const int64_t row = blockIdx.x;
+    const int64_t off = row * N;
+    const int64_t nvec = N / VEC;
+    const vec_t* dyv = reinterpret_cast<const vec_t*>(dY + off);
+    const vec_t* xv = reinterpret_cast<const vec_t*>(X + off);
+    const vec_t* gv = gamma ? reinterpret_cast<const vec_t*>(gamma) : nullptr;
+    vec_t* dxv = reinterpret_cast<vec_t*>(dX + off);
+    const ACC m = mean[row];
+    const ACC rd = rstd[row];
+
+    vec_t dy_r[UNROLL], x_r[UNROLL];
+    bool has[UNROLL];
+#pragma unroll
+    for (int k = 0; k < UNROLL; ++k) {
+        const int64_t j = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+        has[k] = j < nvec;
+        if (has[k]) {
+            dy_r[k] = dyv[j];
+            x_r[k] = xv[j];
+        }
+    }
+
+    ACC s_dy = ACC(0), sdyx = ACC(0);
+    ACC wg_r[SLOTS];
+#pragma unroll
+    for (int k = 0; k < UNROLL; ++k) {
+        const int64_t j = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+        if (has[k]) {
+#pragma unroll
+            for (int e = 0; e < VEC; ++e) {
+                const ACC g = gv ? static_cast<ACC>(gv[j].val[e]) : ACC(1);
+                const ACC wg = static_cast<ACC>(dy_r[k].val[e]) * g;
+                wg_r[k * VEC + e] = wg;
+                s_dy += wg;
+                sdyx += wg * (static_cast<ACC>(x_r[k].val[e]) - m);
+            }
+        }
+    }
+    ln_block_reduce2(s_dy, sdyx, smem, smem0);
+    const ACC s_dy_xhat = sdyx * rd;
+
+    const ACC inv_N = ACC(1) / static_cast<ACC>(N);
+    const ACC term1 = rd * inv_N;
+    const ACC fH = static_cast<ACC>(N);
+#pragma unroll
+    for (int k = 0; k < UNROLL; ++k) {
+        const int64_t j = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+        if (has[k]) {
+            vec_t out;
+#pragma unroll
+            for (int e = 0; e < VEC; ++e) {
+                const ACC dy_s = static_cast<ACC>(dy_r[k].val[e]);
+                const ACC xh =
+                    (static_cast<ACC>(x_r[k].val[e]) - m) * rd;
+                out.val[e] = static_cast<T>(
+                    term1 * (fH * wg_r[k * VEC + e] - s_dy - xh * s_dy_xhat));
+            }
+            ln_stream_store(&dxv[j], out);
+        }
+    }
+}
+
+// Backward driven by the forward's saved moments.  dX runs through the same
+// fused / row-register / generic ladder as the recomputing launcher minus
+// the statistics passes; column gradients reuse the saved mean/rstd so the
+// column kernel never recomputes them either.
+template <typename T, typename ACC>
+void launch_layer_norm_backward_stats(
+    int64_t M, int64_t N,
+    const T* dY, const T* X, const T* gamma,
+    const ACC* mean_p, const ACC* rstd_p,
+    T* dX, T* dGamma, T* dBeta) {
+    const auto stream = getCurrentCUDAStream().stream();
+
+    bool fused = false;
+    bool dx_done = false;
+    const bool vec_ok = (N % 4 == 0) && ln_ptr_aligned(dY) && ln_ptr_aligned(X) &&
+        (!dX || ln_ptr_aligned(dX)) && (!gamma || ln_ptr_aligned(gamma));
+    if (dX != nullptr && vec_ok) {
+        const unsigned threads = ln_bwd_threads_for(N);
+        const int64_t slots =
+            (N / 4 + static_cast<int64_t>(threads) - 1) / static_cast<int64_t>(threads);
+        if (slots <= 4) {
+            dx_done = true;
+            if (N >= 1024 && M >= 512) {
+                fused = true;
+                int64_t rpb = (M + 1023) / 1024;
+                const int64_t by_volume =
+                    (M * N + ((1 << 21) - 1)) / (1 << 21);
+                if (by_volume > rpb) rpb = by_volume;
+                if (rpb < 4) rpb = 4;
+                const int64_t grid = (M + rpb - 1) / rpb;
+                ACC* part = nullptr;
+                Tensor partials;
+                if (dGamma != nullptr || dBeta != nullptr) {
+                    partials = Tensor::empty(
+                        std::vector<int64_t>{2 * grid * N},
+                        (std::is_same<ACC, double>::value ? DType::Float64
+                                                          : DType::Float32),
+                        Device(DeviceType::CUDA));
+                    part = partials.data_ptr<ACC>();
+                }
+#define LN_BWD_SFUSED_LAUNCH(U)                                                \
+                layer_norm_bwd_fused_stats_kernel<T, ACC, U>                   \
+                    <<<static_cast<unsigned>(grid), threads, 0, stream>>>(     \
+                        M, N, rpb, dY, X, gamma, mean_p, rstd_p, dX, part,     \
+                        part != nullptr ? part + grid * N : nullptr)
+                if (slots <= 1) {
+                    LN_BWD_SFUSED_LAUNCH(1);
+                } else if (slots <= 2) {
+                    LN_BWD_SFUSED_LAUNCH(2);
+                } else {
+                    LN_BWD_SFUSED_LAUNCH(4);
+                }
+#undef LN_BWD_SFUSED_LAUNCH
+                if (part != nullptr) {
+                    layer_norm_grad_cols_finalize_kernel<T, ACC>
+                        <<<static_cast<unsigned>((N + 31) / 32), 256, 0,
+                           stream>>>(N, grid, part, dGamma, dBeta);
+                }
+            } else {
+#define LN_BWD_SREG_LAUNCH(U)                                                  \
+            layer_norm_grad_input_reg_stats_kernel<T, ACC, U>                  \
+                <<<static_cast<unsigned>(M), threads, 0, stream>>>(            \
+                    N, dY, X, gamma, mean_p, rstd_p, dX)
+                if (slots <= 1) {
+                    LN_BWD_SREG_LAUNCH(1);
+                } else if (slots <= 2) {
+                    LN_BWD_SREG_LAUNCH(2);
+                } else {
+                    LN_BWD_SREG_LAUNCH(4);
+                }
+#undef LN_BWD_SREG_LAUNCH
+            }
+        }
+    }
+    if (dX != nullptr && !dx_done) {
+        // Generic path: the streaming grad-input kernel over saved moments.
+        layer_norm_grad_input_kernel<T, ACC>
+            <<<static_cast<unsigned>(M), kLNThreads, 0, stream>>>(
+                N, dY, X, mean_p, rstd_p, gamma, dX);
+    }
+
+    if ((dGamma != nullptr || dBeta != nullptr) && !fused) {
+        const unsigned bx = static_cast<unsigned>((N + 31) / 32);
+        int dev = 0;
+        cudaGetDevice(&dev);
+        int sm_count = 0;
+        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev);
+        int64_t gy = 1;
+        if (M >= 256) {
+            const int64_t want =
+                (static_cast<int64_t>(sm_count) * 2 + bx - 1) / bx;
+            gy = std::min<int64_t>(
+                std::min<int64_t>((M + 255) / 256, 2048),
+                std::max<int64_t>(1, want));
+        }
+        if (gy > 1) {
+            Tensor partials = Tensor::empty(
+                std::vector<int64_t>{2 * gy * N},
+                (std::is_same<ACC, double>::value ? DType::Float64
+                                                  : DType::Float32),
+                Device(DeviceType::CUDA));
+            ACC* part = partials.data_ptr<ACC>();
+            layer_norm_grad_cols_kernel<T, ACC, 32>
+                <<<dim3(bx, static_cast<unsigned>(gy)), dim3(32, 32), 0, stream>>>(
+                    M, N, dY, X, mean_p, rstd_p, nullptr, nullptr,
+                    part, part + gy * N);
+            layer_norm_grad_cols_finalize_kernel<T, ACC>
+                <<<static_cast<unsigned>((N + 31) / 32), 256, 0, stream>>>(
+                    N, gy, part, dGamma, dBeta);
+        } else {
+            const int bdy = M < 64 ? 1 : (M < 128 ? 8 : 32);
+            dim3 threads(32, static_cast<unsigned>(bdy));
+#define LN_BWD_SCOLS_LAUNCH(B)                                                 \
+            layer_norm_grad_cols_kernel<T, ACC, B>                             \
+                <<<bx, threads, 0, stream>>>(                                  \
+                    M, N, dY, X, mean_p, rstd_p, dGamma, dBeta, nullptr, nullptr)
+            if (bdy == 1) {
+                LN_BWD_SCOLS_LAUNCH(1);
+            } else if (bdy == 8) {
+                LN_BWD_SCOLS_LAUNCH(8);
+            } else {
+                LN_BWD_SCOLS_LAUNCH(32);
+            }
+#undef LN_BWD_SCOLS_LAUNCH
+        }
+    }
+}
+
 } // namespace layer_norm
 
-Tensor layer_norm_cuda(const Tensor& input,
-                       const std::vector<int64_t>& normalized_shape,
-                       const std::optional<Tensor>& weight_opt,
-                       const std::optional<Tensor>& bias_opt,
-                       double eps) {
+std::tuple<Tensor, Tensor, Tensor> native_layer_norm_cuda(
+        const Tensor& input,
+        const std::vector<int64_t>& normalized_shape,
+        const std::optional<Tensor>& weight_opt,
+        const std::optional<Tensor>& bias_opt,
+        double eps) {
     const int64_t norm_ndim = static_cast<int64_t>(normalized_shape.size());
     const int64_t input_ndim = input.dim();
     if (norm_ndim > input_ndim)
@@ -1232,7 +1585,12 @@ Tensor layer_norm_cuda(const Tensor& input,
 
     Tensor out = Tensor::empty(static_cast<std::vector<int64_t>>(in_contig.shape()),
                                in_contig.dtype(), in_contig.device());
-    if (in_contig.numel() == 0 || M == 0 || N == 0) return out;
+    const DType stats_dt = layer_norm::ln_stats_dtype(in_contig.dtype());
+    Tensor mean = Tensor::empty(std::vector<int64_t>{M}, stats_dt, in_contig.device());
+    Tensor rstd = Tensor::empty(std::vector<int64_t>{M}, stats_dt, in_contig.device());
+    if (in_contig.numel() == 0 || M == 0 || N == 0) {
+        return std::make_tuple(out, mean, rstd);
+    }
 
     switch (in_contig.dtype()) {
 #define LN_FORWARD_CASE(ctype, name, acc_t)                                   \
@@ -1242,7 +1600,8 @@ Tensor layer_norm_cuda(const Tensor& input,
                 in_contig.data_ptr<ctype>(),                                  \
                 has_weight ? weight.data_ptr<ctype>() : nullptr,              \
                 has_bias ? bias.data_ptr<ctype>() : nullptr,                  \
-                out.data_ptr<ctype>());                                       \
+                out.data_ptr<ctype>(),                                        \
+                mean.data_ptr<acc_t>(), rstd.data_ptr<acc_t>());              \
             break;
         LN_FORWARD_CASE(float, Float32, float)
         LN_FORWARD_CASE(double, Float64, double)
@@ -1256,10 +1615,21 @@ Tensor layer_norm_cuda(const Tensor& input,
     {
         const cudaError_t error = cudaGetLastError();
         if (error != cudaSuccess) {
-            TP_THROW(RuntimeError, std::string("layer_norm_cuda: ") + cudaGetErrorString(error));
+            TP_THROW(RuntimeError, std::string("native_layer_norm: ") + cudaGetErrorString(error));
         }
     }
-    return out;
+    return std::make_tuple(out, mean, rstd);
+}
+
+// The public spelling is a thin composition over the stats-producing native
+// op so the autograd node saves the per-row moments for the backward pass.
+Tensor layer_norm_cuda(const Tensor& input,
+                       const std::vector<int64_t>& normalized_shape,
+                       const std::optional<Tensor>& weight_opt,
+                       const std::optional<Tensor>& bias_opt,
+                       double eps) {
+    return std::get<0>(tensorplay::tpx::ops::native_layer_norm(
+        input, normalized_shape, weight_opt, bias_opt, eps));
 }
 
 std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cuda(
@@ -1333,6 +1703,97 @@ std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cuda(
         const cudaError_t error = cudaGetLastError();
         if (error != cudaSuccess) {
             TP_THROW(RuntimeError, std::string("layer_norm_backward_cuda: ") + cudaGetErrorString(error));
+        }
+    }
+    return std::make_tuple(grad_input, grad_weight, grad_bias);
+}
+
+// Backward consuming the forward's saved per-row moments; output_mask picks
+// which gradients are produced (undefined tensors for the skipped ones).
+std::tuple<Tensor, Tensor, Tensor> native_layer_norm_backward_cuda(
+        const Tensor& grad_output,
+        const Tensor& input,
+        const std::vector<int64_t>& normalized_shape,
+        const Tensor& mean,
+        const Tensor& rstd,
+        const std::optional<Tensor>& weight_opt,
+        const std::optional<Tensor>& bias_opt,
+        const std::vector<bool>& output_mask) {
+    const int64_t norm_ndim = static_cast<int64_t>(normalized_shape.size());
+    const int64_t input_ndim = input.dim();
+    if (norm_ndim > input_ndim)
+        TP_THROW(RuntimeError, "native_layer_norm_backward: normalized_shape dim larger than input dim");
+    if (grad_output.dtype() != input.dtype())
+        TP_THROW(RuntimeError, "native_layer_norm_backward: grad_output dtype must match input dtype");
+
+    const int64_t outer_dims = input_ndim - norm_ndim;
+    int64_t N = 1;
+    for (int64_t i = 0; i < norm_ndim; ++i) {
+        if (input.size(outer_dims + i) != normalized_shape[i])
+            TP_THROW(RuntimeError, "native_layer_norm_backward: Input shape mismatch with normalized_shape");
+        N *= normalized_shape[i];
+    }
+    const int64_t M = input.numel() / (N == 0 ? 1 : N);
+    if (mean.numel() != M || rstd.numel() != M)
+        TP_THROW(RuntimeError, "native_layer_norm_backward: saved moments do not match the row count");
+
+    const bool need_dx = output_mask.empty() || output_mask[0];
+    const bool has_weight = weight_opt.has_value() && weight_opt->defined();
+    const bool has_bias = bias_opt.has_value() && bias_opt->defined();
+    const bool need_dw = output_mask.size() > 1 && output_mask[1] && has_weight;
+    const bool need_db = output_mask.size() > 2 && output_mask[2] && has_bias;
+
+    Tensor grad_out_contig = grad_output.contiguous();
+    Tensor in_contig = input.contiguous();
+    Tensor weight = has_weight ? weight_opt->contiguous() : Tensor();
+    Tensor mean_c = mean.contiguous();
+    Tensor rstd_c = rstd.contiguous();
+
+    Tensor grad_input = Tensor();
+    if (need_dx) {
+        grad_input = Tensor::empty(static_cast<std::vector<int64_t>>(in_contig.shape()),
+                                   in_contig.dtype(), in_contig.device());
+    }
+    Tensor grad_weight = Tensor();
+    if (need_dw) {
+        grad_weight = Tensor::empty(static_cast<std::vector<int64_t>>(weight.shape()),
+                                    weight.dtype(), weight.device());
+    }
+    Tensor grad_bias = Tensor();
+    if (need_db) {
+        const Tensor& like = has_weight ? weight : *bias_opt;
+        grad_bias = Tensor::empty(static_cast<std::vector<int64_t>>(like.shape()),
+                                  like.dtype(), like.device());
+    }
+    if (in_contig.numel() == 0 || M == 0 || N == 0)
+        return std::make_tuple(grad_input, grad_weight, grad_bias);
+
+    switch (in_contig.dtype()) {
+#define LN_BACKWARD_STATS_CASE(ctype, name, acc_t)                            \
+        case DType::name:                                                     \
+            layer_norm::launch_layer_norm_backward_stats<ctype, acc_t>(       \
+                M, N,                                                         \
+                grad_out_contig.data_ptr<ctype>(),                            \
+                in_contig.data_ptr<ctype>(),                                  \
+                has_weight ? weight.data_ptr<ctype>() : nullptr,              \
+                mean_c.data_ptr<acc_t>(), rstd_c.data_ptr<acc_t>(),           \
+                need_dx ? grad_input.data_ptr<ctype>() : nullptr,             \
+                need_dw ? grad_weight.data_ptr<ctype>() : nullptr,            \
+                need_db ? grad_bias.data_ptr<ctype>() : nullptr);             \
+            break;
+        LN_BACKWARD_STATS_CASE(float, Float32, float)
+        LN_BACKWARD_STATS_CASE(double, Float64, double)
+        LN_BACKWARD_STATS_CASE(Half, Float16, float)
+        LN_BACKWARD_STATS_CASE(BFloat16, BFloat16, float)
+#undef LN_BACKWARD_STATS_CASE
+        default:
+            TP_THROW(NotImplementedError,
+                     "native_layer_norm_backward CUDA supports Float32/Float64/Float16/BFloat16 only");
+    }
+    {
+        const cudaError_t error = cudaGetLastError();
+        if (error != cudaSuccess) {
+            TP_THROW(RuntimeError, std::string("native_layer_norm_backward: ") + cudaGetErrorString(error));
         }
     }
     return std::make_tuple(grad_input, grad_weight, grad_bias);
@@ -3040,6 +3501,8 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, NormalizationKernels) {
     m.impl("batch_norm", batch_norm_cuda);
     m.impl("batch_norm_backward", batch_norm_backward_cuda);
     m.impl("layer_norm", layer_norm_cuda);
+    m.impl("native_layer_norm", native_layer_norm_cuda);
+    m.impl("native_layer_norm_backward", native_layer_norm_backward_cuda);
     m.impl("rms_norm", rms_norm_cuda);
     m.impl("layer_norm_backward", layer_norm_backward_cuda);
     m.impl("group_norm", group_norm_cuda);

@@ -3,6 +3,9 @@
 #include "Blocks.h"
 #include "Common.h"
 #include "Convert.h"
+#include "Dispatcher.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
+#include "Scalar.h"
 
 #include <optional>
 #include <string>
@@ -158,13 +161,53 @@ Tensor layer_norm_impl(
 
 } // namespace
 
+// The public spelling composes over the stats-producing native op so the
+// autograd node saves the per-row moments for the backward pass; the call
+// goes through the generated ops wrapper, which records that node.
 Tensor layer_norm_kernel(
     const Tensor& input,
     const std::vector<int64_t>& normalized_shape,
     const std::optional<Tensor>& weight_opt,
     const std::optional<Tensor>& bias_opt,
     double eps) {
-  return layer_norm_impl(input, normalized_shape, weight_opt, bias_opt, eps);
+  return std::get<0>(tensorplay::tpx::ops::native_layer_norm(
+      input, normalized_shape, weight_opt, bias_opt, eps));
+}
+
+template <typename Return, typename... Args>
+Return dispatch_vk(const char* op, Args... args) {
+  return DispatchStub<Return, Args...>::call(
+      std::string(op), DispatchKey::Vulkan, std::forward<Args>(args)...);
+}
+
+// Native spelling producing the per-row moments the backward pass consumes.
+// Statistics come from the dimension reductions; the transform reuses the
+// fused layer_norm shader.
+std::tuple<Tensor, Tensor, Tensor> native_layer_norm_kernel(
+    const Tensor& input,
+    const std::vector<int64_t>& normalized_shape,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& bias_opt,
+    double eps) {
+  Tensor out = layer_norm_impl(input, normalized_shape, weight_opt, bias_opt, eps);
+
+  const int64_t norm_ndim = static_cast<int64_t>(normalized_shape.size());
+  std::vector<int64_t> dims;
+  for (int64_t i = input.dim() - norm_ndim; i < input.dim(); ++i) {
+    dims.push_back(i);
+  }
+  std::vector<int64_t> outer;
+  for (int64_t i = 0; i < input.dim() - norm_ndim; ++i) {
+    outer.push_back(input.size(i));
+  }
+  if (outer.empty()) outer.push_back(1);
+
+  Tensor mean = dispatch_vk<Tensor>("mean.dim", input, dims, true).reshape(outer);
+  Tensor var =
+      dispatch_vk<Tensor>("var.dim", input, dims, 0, true).reshape(outer);
+  Tensor rstd = dispatch_vk<Tensor>(
+      "rsqrt", dispatch_vk<Tensor>("add.Scalar", var, Scalar(eps)));
+  return std::make_tuple(out, mean, rstd);
 }
 
 Tensor batch_norm_kernel(
@@ -270,6 +313,7 @@ Tensor batch_norm_kernel(
 
 TENSORPLAY_LIBRARY_IMPL(Vulkan, NormalizationKernels) {
   m.impl("layer_norm", &tensorplay::vulkan::ops::layer_norm_kernel);
+  m.impl("native_layer_norm", &tensorplay::vulkan::ops::native_layer_norm_kernel);
   m.impl("batch_norm", &tensorplay::vulkan::ops::batch_norm_kernel);
 }
 

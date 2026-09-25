@@ -521,10 +521,11 @@
   weight: std::get<1>(batch_norm_backward(grad, input, weight, running_mean, running_var, training, eps))
   bias: std::get<2>(batch_norm_backward(grad, input, weight, running_mean, running_var, training, eps))
 
-- name: layer_norm(Tensor input, int[] normalized_shape, Tensor? weight=None, Tensor? bias=None, float eps=1e-5) -> Tensor
-  input: std::get<0>(layer_norm_backward(grad, input, normalized_shape, weight, bias, eps))
-  weight: std::get<1>(layer_norm_backward(grad, input, normalized_shape, weight, bias, eps))
-  bias: std::get<2>(layer_norm_backward(grad, input, normalized_shape, weight, bias, eps))
+- name: native_layer_norm(Tensor input, SymInt[] normalized_shape, Tensor? weight, Tensor? bias, float eps) -> (Tensor, Tensor, Tensor)
+  output_differentiability: [True, False, False]
+  input: std::get<0>(native_layer_norm_backward(grad, input, normalized_shape, ret1, ret2, weight, bias, grad_input_mask))
+  weight: std::get<1>(native_layer_norm_backward(grad, input, normalized_shape, ret1, ret2, weight, bias, grad_input_mask))
+  bias: std::get<2>(native_layer_norm_backward(grad, input, normalized_shape, ret1, ret2, weight, bias, grad_input_mask))
 
 - name: group_norm(Tensor input, int num_groups, Tensor? weight=None, Tensor? bias=None, float eps=1e-5) -> Tensor
   input: std::get<0>(group_norm_backward(grad, input, num_groups, weight, bias, eps))
