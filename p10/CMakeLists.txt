@@ -230,7 +230,13 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/TensorFactories.cu
         src/backend/cuda/Itertools.cu
         src/backend/cuda/MiscKernels.cu
-        src/backend/cuda/UpsampleKernels.cu
+        src/backend/cuda/UpsampleNearest1dKernels.cu
+        src/backend/cuda/UpsampleNearest2dKernels.cu
+        src/backend/cuda/UpsampleNearest3dKernels.cu
+        src/backend/cuda/UpsampleLinear1dKernels.cu
+        src/backend/cuda/UpsampleBilinear2dKernels.cu
+        src/backend/cuda/UpsampleBicubic2dKernels.cu
+        src/backend/cuda/UpsampleTrilinear3dKernels.cu
         src/backend/cuda/LinearAlgebraKernels.cu
         src/backend/cuda/LinalgKernels.cu
         src/backend/cuda/LuUnpack.cu
