@@ -279,6 +279,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/BatchLinearAlgebra.cu
         src/backend/cuda/ComplexFactories.cu
         src/backend/cuda/StaxPointwiseKernels.cu
+        src/backend/cuda/StaxProgramCodegen.cu
         src/backend/cuda/LossKernels.cu
         src/backend/cuda/SpecialUnaryKernels.cu
         src/backend/cuda/SpecialBinaryKernels.cu

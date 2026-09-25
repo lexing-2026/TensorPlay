@@ -931,6 +931,23 @@ std::vector<Tensor> run_program(const std::vector<Tensor>& inputs,
     }
     if (count == 0) return outs;
 
+    // Generated straight-line kernels replace the interpreter whenever the
+    // program compiles: NVRTC cost is paid once per program content, and the
+    // emitted body drops the per-element fetch/dispatch round trip the
+    // interpreter pays on every step of the dependency chain.
+    if (flat_inputs && count >= 1024) {
+        std::vector<DType> generated_out_dtypes;
+        generated_out_dtypes.reserve(temp_refs.size());
+        for (size_t i = 0; i < temp_refs.size(); ++i) {
+            generated_out_dtypes.push_back(out_dtype_at(i));
+        }
+        if (launch_generated_pointwise(inputs, program, constants, temp_refs,
+                                       temp_tensors, generated_out_dtypes,
+                                       count)) {
+            return outs;
+        }
+    }
+
     // Device staging: pointer tables and program metadata are tiny; tensor
     // data itself is never copied.
     std::vector<const void*> host_input_ptrs;

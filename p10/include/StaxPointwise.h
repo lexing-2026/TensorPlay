@@ -57,6 +57,23 @@ P10_API std::vector<Tensor> stax_fused_pointwise_cuda_multi(
     const std::vector<int64_t>& output_refs,
     const std::vector<int64_t>& out_dtypes = {});
 
+// Straight-line codegen executor for one flat pointwise program: the
+// instruction triples expand into a scalar expression chain that NVRTC
+// compiles once per program content, removing the interpreter's per-element
+// fetch/dispatch round trip.  `temp_refs` names the program temporaries that
+// back `temp_tensors` (fresh storage only; aliased outputs stay on the
+// interpreter), `out_dtypes` gives each output's element type in the same
+// order.  Returns false when the form or toolchain is unsupported, leaving
+// the launch to the caller's existing path.
+P10_API bool launch_generated_pointwise(
+    const std::vector<Tensor>& inputs,
+    const std::vector<int64_t>& program,
+    const std::vector<double>& constants,
+    const std::vector<int64_t>& temp_refs,
+    const std::vector<Tensor>& temp_tensors,
+    const std::vector<DType>& out_dtypes,
+    int64_t count);
+
 } // namespace cuda
 
 } // namespace tensorplay
