@@ -29,6 +29,7 @@ from .index_expr import (
     Mul,
     Symbol,
     Where,
+    free_symbols,
 )
 from ..kernel_scheduler import (
     BODY as _BODY,
@@ -65,17 +66,6 @@ _TL_DTYPES = {
     "bool": "tl.int1",
 }
 
-#: Floating reductions accumulate here; the store rounds back to storage.
-_ACC_DTYPE = "tl.float32"
-
-#: A row this long still fits one block when the reduced axis is contiguous.
-_PERSISTENT_INNER = 1024
-#: ... and this long otherwise, where a persistent block would idle its lanes.
-_PERSISTENT_OUTER = 64
-
-#: Welford's pairwise combine, inlined so a cached kernel needs no extra
-#: import.  A per-element weight of zero drops a masked lane from both the
-#: weight and the sum of squares, which is what makes a partial block exact.
 _WELFORD_HELPERS = '''
 
 @triton.jit
@@ -96,6 +86,12 @@ def _tp_welford(value, m2, weight, dim: tl.constexpr):
 '''
 
 
+
+
+#: Floating reductions accumulate here; the store rounds back to storage.
+_ACC_DTYPE = "tl.float32"
+
+
 class PlanError(Exception):
     """A group cannot be expressed as a single kernel."""
 
@@ -113,17 +109,156 @@ class LaunchConfig(NamedTuple):
         return tuple(self)
 
 
+#: Reduction sizes that fit one block, split by whether the reduced axis is
+#: the contiguous one.  A persistent reduction forces the r block to span the
+#: whole row, so a long inner row tiles differently than a short outer one.
+_PERSISTENT_INNER = 1024
+_PERSISTENT_OUTER = 64
+
+#: A persistent reduction keeps the whole row in one block, so its r block is
+#: the row length; these bound how many rows may share the block.
+_PERSISTENT_XBLOCKS = (1, 8, 32, 128)
+_PERSISTENT_TILE_NUMEL = 4096
+
+#: A long inner row is walked in steps, with a narrow x block: the reduced
+#: elements are already contiguous, so width buys coalescing on the x axis
+#: while depth buys the per-thread element count the row needs.
+_INNER_XBLOCK_NUMEL = 1024
+_INNER_MAX_XBLOCK = 8
+
+#: Elements one warp is given before the warp count grows.
+_ELEMENTS_PER_WARP = 128
+#: A block is never given fewer warps than this once it holds this many
+#: elements, whatever the element count asks for.
+_MIN_WARPS = 4
+_WARP_SIZE = 32
+
+#: Pointwise candidates: block width, tried in this order.
+_XBLOCK_CANDIDATES = (256, 512, 1024, 128, 2048)
+
+
 def next_power_of_two(value: int) -> int:
     value = max(int(value), 1)
     return 1 << (value - 1).bit_length()
 
 
-def _warps_for(block: int) -> int:
-    if block <= 256:
-        return 4
-    if block <= 1024:
-        return 8
-    return 16
+def _num_warps(requested: int, max_num_warps: int, *, register_intensive: bool = False) -> int:
+    """Round a requested warp count to a power of two within bounds.
+
+    A persistent reduction is register intensive -- it holds the row's running
+    statistics -- so it gets half the warp budget, which trades threads for
+    registers per thread.
+    """
+
+    if register_intensive:
+        max_num_warps = max(max_num_warps // 2, 1)
+    return next_power_of_two(min(max(requested, 1), max_num_warps))
+
+
+def _reduction_warps(rnumel: int, total: int, inner: bool, register_intensive: bool) -> int:
+    """Warps for a reduction tile.
+
+    An inner row is contiguous, so each thread is given at least eight
+    elements; otherwise the count follows the whole tile.
+    """
+
+    requested = rnumel // _ELEMENTS_PER_WARP if inner else total // _ELEMENTS_PER_WARP
+    ceiling = 16 if rnumel <= 8192 else 32
+    warps = _num_warps(requested, ceiling, register_intensive=register_intensive)
+    if total >= 128:
+        warps = max(warps, _MIN_WARPS)
+    return warps
+
+
+def _persistent_configs(xnumel: int, rnumel: int, inner: bool) -> list:
+    """Configs for a row that one block spans.
+
+    The r block is the row, so the x block may only be as wide as the tile
+    budget allows -- except at one row per block, which is always legal.
+    """
+
+    out = []
+    for xblock in _PERSISTENT_XBLOCKS:
+        if xblock != 1 and (rnumel * xblock > _PERSISTENT_TILE_NUMEL or xblock > xnumel):
+            continue
+        warps = _reduction_warps(
+            rnumel, xblock * rnumel, inner, register_intensive=True
+        )
+        out.append(
+            LaunchConfig(xblock, next_power_of_two(rnumel), warps, persistent=True)
+        )
+    return out
+
+
+def _outer_config(xnumel: int, rnumel: int, load_factor: int) -> tuple:
+    """Block shape for a reduction over the outer axis.
+
+    With few rows the x block stays narrow and the row is walked in small
+    steps; with many rows the width grows first, and a wide block only pairs
+    with a short step when the body is light.
+    """
+
+    if xnumel <= 1024:
+        return max(min(xnumel // 128, 8), 2), min(rnumel, 64), None
+    if xnumel // 4096 <= 8:
+        return 16, 512 // 16, None
+    xblock = max(min(256, next_power_of_two(xnumel // 4096)), 64)
+    if load_factor < 4 or rnumel <= 128:
+        return xblock, max(512 // xblock, 1), None
+    if rnumel >= 2048:
+        rblock = 64
+    else:
+        rblock = 32
+    return min(xblock, 32), rblock, _MIN_WARPS
+
+
+def _inner_config(xnumel: int, rnumel: int) -> tuple:
+    """Block shape for a reduction over the contiguous axis."""
+
+    return max(min(_INNER_XBLOCK_NUMEL // rnumel, _INNER_MAX_XBLOCK), 1), rnumel, 1
+
+
+def config_candidates(group: FusedGroup, buffers: dict) -> list:
+    """Launch configs worth trying, best guess first.
+
+    Pointwise work only needs a block width.  A reduction picks between
+    keeping the row in one block and walking it, and in both cases the x
+    block is never wider than the rows it has to fill.
+    """
+
+    xnumel = max(int(group.xnumel), 1)
+    rnumel = int(group.rnumel)
+    if rnumel <= 1:
+        out = []
+        for xblock in _XBLOCK_CANDIDATES:
+            warps = _num_warps(xblock // _ELEMENTS_PER_WARP, 16)
+            if xblock >= 128:
+                warps = max(warps, _MIN_WARPS)
+            out.append(LaunchConfig(xblock, 1, warps))
+        return out
+    inner = any(
+        _is_inner_reduction(node, buffers) for node in group.nodes if node.is_reduction
+    )
+    span = next_power_of_two(rnumel)
+    if rnumel <= (_PERSISTENT_INNER if inner else _PERSISTENT_OUTER):
+        configs = _persistent_configs(xnumel, rnumel, inner)
+        if configs:
+            return configs
+    load_factor = sum(len(node.body.loads) for node in group.nodes)
+    if inner and span >= 256:
+        # A contiguous row only pays for a persistent block while the rows
+        # are numerous; otherwise the row is walked with a narrow x block.
+        if span <= 1024 and xnumel // 8 >= 128:
+            xblock, rblock, warps = _inner_config(xnumel, rnumel)
+        else:
+            xblock, rblock, warps = 1, min(span, 1024), None
+    else:
+        xblock, rblock, warps = _outer_config(xnumel, rnumel, load_factor)
+    xblock = max(1, min(xblock, xnumel))
+    rblock = max(1, min(rblock, span))
+    if warps is None:
+        warps = _reduction_warps(rblock, xblock * rblock, inner, register_intensive=False)
+    return [LaunchConfig(xblock, rblock, warps)]
 
 
 def _is_float(name: str) -> bool:
@@ -143,38 +278,6 @@ def _zero(name: str) -> str:
     if name == "bool":
         return "False"
     return "0"
-
-
-def config_candidates(group: FusedGroup, buffers: dict) -> list:
-    """Launch configs worth trying, best guess first.
-
-    A reduction stays persistent while one block spans its row; past that the
-    row is walked in ``RBLOCK`` steps and the x block is as wide as
-    coalescing allows.
-    """
-
-    xnumel = max(int(group.xnumel), 1)
-    rnumel = int(group.rnumel)
-    if rnumel <= 1:
-        block = 256
-        return [LaunchConfig(block, 1, _warps_for(block))]
-    inner = any(
-        _is_inner_reduction(node, buffers) for node in group.nodes if node.is_reduction
-    )
-    limit = _PERSISTENT_INNER if inner else _PERSISTENT_OUTER
-    if rnumel <= limit:
-        return [
-            LaunchConfig(256, next_power_of_two(rnumel), 4, persistent=True)
-        ]
-    out = []
-    for rblock in (64, 128, 256, 32):
-        if rblock > rnumel:
-            continue
-        for xblock in (256, 512, 128, 1024):
-            out.append(LaunchConfig(xblock, rblock, _warps_for(xblock)))
-    if not out:
-        out.append(LaunchConfig(256, next_power_of_two(rnumel), _warps_for(256)))
-    return out
 
 
 def _is_inner_reduction(node: LoopNode, buffers: dict) -> bool:
@@ -335,7 +438,14 @@ class _Group:
 
     def index(self, node: LoopNode, expr: Expr, dim: int) -> str:
         placed = self.placements[id(node)].to_kernel(expr)
-        return render_index(placed, "xindex" if dim == 1 else "xi", "ri" if dim == 2 else None)
+        rendered = render_index(
+            placed, "xindex" if dim == 1 else "xi", "ri" if dim == 2 else None
+        )
+        if not free_symbols(placed):
+            # The whole group addresses one spot, so the address folded to a
+            # constant while the mask is still a block: widen it to match.
+            return f"({rendered} + tl.zeros({self.block_shape(dim)}, tl.int32))"
+        return rendered
 
     def cond(self, dim: int) -> str | None:
         parts = []
@@ -349,9 +459,8 @@ class _Group:
     def persistent(self) -> bool:
         return self.config.persistent
 
-    @property
-    def block_shape(self) -> str:
-        return "[XBLOCK, RBLOCK]"
+    def block_shape(self, dim: int = 2) -> str:
+        return "[XBLOCK, RBLOCK]" if dim == 2 else "[XBLOCK]"
 
     @property
     def needs_xmask(self) -> bool:
@@ -537,7 +646,7 @@ class _Group:
         acc = _ACC_DTYPE if _is_float(element) else _tl_dtype(element)
         # A looped reduction accumulates a whole block at a time and reduces
         # once the row is walked, so its accumulator is block shaped.
-        shape = self.block_shape if not self.persistent else "[XBLOCK]"
+        shape = self.block_shape(2) if not self.persistent else "[XBLOCK]"
         state = {"kind": kind, "acc": acc, "name": self.tmp("acc"), "shape": shape}
         if kind == "sum":
             if not self.persistent:
@@ -618,7 +727,7 @@ class _Group:
         cond = self.cond(dim)
         if cond is None:
             return f"({source} * 0.0 + 1.0)"
-        return f"tl.where({cond}, 1.0, 0.0) + tl.zeros({self.block_shape}, tl.float32)"
+        return f"tl.where({cond}, 1.0, 0.0) + tl.zeros({self.block_shape(dim)}, tl.float32)"
 
     def acc_finish(self, node: LoopNode) -> None:
         """Reduce the last step and store every result that outlives the group."""
