@@ -34,6 +34,20 @@ CANDIDATE_CONFIGS: Tuple[Tuple[int, int], ...] = (
     (2048, 4),
 )
 
+# Packed pointwise geometries: each lane owns VEC consecutive elements (a
+# two-dimensional [XBLOCK, VEC] iteration space), so every load/store moves
+# one contiguous VEC-wide segment.  Shallow programs win on wider
+# transactions; deep multi-output programs spill registers at these widths
+# and the tuner discards them.  Carried as (XBLOCK, num_warps, VEC) triples
+# alongside the baseline table -- the decision cache keys the whole table,
+# so extending it re-benches once and never reads a stale record.
+PACKED_POINTWISE_CONFIGS: Tuple[Tuple[int, int, int], ...] = (
+    (256, 4, 4),
+    (512, 4, 4),
+    (1024, 4, 4),
+    (2048, 8, 4),
+)
+
 # Exhaustive tier selected by the max-autotune mode: the full
 # (XBLOCK, num_warps) cross product over the geometry points of the
 # baseline table, including the 8-warp columns of the two smallest XBLOCKs

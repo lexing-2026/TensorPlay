@@ -855,27 +855,33 @@ class _CudaFusedPointwiseLowering:
 
 # Generated Triton kernels expand every program instruction into straight-line
 # source, removing the interpreter's per-element dispatch/fetch round trip,
-# which is what limits deep fused chains to arithmetic latency.  Small
-# programs keep the interpreter: a single C launch beats a Python-side
-# dispatch, and their GPU time is negligible either way.
-_TRITON_POINTWISE_MIN_NUMEL = 1 << 14
+# which is what limits deep fused chains to arithmetic latency.  Below ~1k
+# elements the balance flips: a single C launch beats the Python-side
+# dispatch, and the GPU time is negligible either way.  Everything larger
+# goes to the generated kernel even when tiny -- the jiterator wrapper pays a
+# fixed per-call broadcast materialization that dwarfs both launch styles.
+_TRITON_POINTWISE_MIN_NUMEL = 1 << 10
 
 
 def _cuda_triton_pointwise_runner(
     program: list[int],
     constants: list[float],
-    output_ref: int,
+    output_refs: tuple[int, ...],
     example_inputs: list[Any],
+    output_dtypes: tuple[str, ...] | None = None,
 ) -> Any | None:
     """Lower one flat pointwise program to a generated Triton kernel.
 
     Returns a runner honouring the interpreter's contract (input list in,
-    output tensor out), or None whenever Triton is unavailable, the sample
+    output tensor(s) out), or None whenever Triton is unavailable, the sample
     tensors disagree on shape, or generation/compilation fails -- every miss
-    stays on the interpreter route unchanged.
+    stays on the interpreter route unchanged.  ``output_dtypes`` opts the
+    plan into per-input dtype freedom: loads promote through each input's
+    own dtype and stores narrow to the named output dtype, instead of the
+    single shared dtype the historic contract assumes.
     """
     try:
-        from .codegen.triton import _compile_program, runtime_available
+        from .codegen.triton import runtime_available
     except ImportError:
         return None
     if not runtime_available():
@@ -900,19 +906,19 @@ def _cuda_triton_pointwise_runner(
         numel *= dim
     if numel < _TRITON_POINTWISE_MIN_NUMEL:
         return None
-    # One 256-element row per warp at four warps; the packed width keeps the
-    # row-uniform mask contract whole (the element count must divide it).
-    config = (1024, 4, 4) if numel % 4 == 0 else (1024, 4)
     try:
-        runner = _compile_program(
+        from .codegen.triton import _autotune_launch
+
+        runner = _autotune_launch(
+            "pw-plan",
             program,
             constants,
-            (output_ref,),
+            tuple(output_refs),
             example_inputs,
-            fixed_config=config,
-            reference_shape=reference,
             input_shapes=shapes if broadcast else None,
-            input_dtypes=tuple(repr(value.dtype) for value in example_inputs),
+            reference_shape=reference,
+            bucket_numel=numel,
+            output_dtypes=output_dtypes,
         )
         runner(example_inputs)
     except Exception:  # noqa: BLE001 - any miss keeps the interpreter route
@@ -964,7 +970,7 @@ def _lower_cuda_fused_pointwise(
     if len(external_nodes) != len(example_inputs):
         return None
     runner = _cuda_triton_pointwise_runner(
-        program, constants, output_ref, example_inputs
+        program, constants, (output_ref,), example_inputs
     )
     if runner is None:
         try:
@@ -3303,6 +3309,7 @@ def _register_stax_cuda_pointwise_op(
     output_refs: tuple[int, ...],
     input_count: int,
     example_values: list[Any],
+    output_dtypes: tuple[str, ...] | None = None,
 ) -> str | None:
     global _STAX_CUDA_OP_COUNTER
     key = (
@@ -3310,6 +3317,7 @@ def _register_stax_cuda_pointwise_op(
         tuple(constants),
         output_refs,
         input_count,
+        output_dtypes,
         tuple(
             (
                 tuple(int(item) for item in value.shape),
@@ -3322,31 +3330,104 @@ def _register_stax_cuda_pointwise_op(
     cached = _STAX_CUDA_OP_CACHE.get(key)
     if cached is not None:
         return cached
-    # Single-output plans compile through the Triton program generator when
-    # the examples describe them: the kernel reads broadcast operands in
-    # place and skips the launch-time materialization the generic jiterator
-    # wrapper pays per call.  Multi-output and example-less registrations
-    # keep the jiterator route.
-    if len(output_refs) == 1 and example_values:
-        runner = _cuda_triton_pointwise_runner(
-            program, constants, output_refs[0], example_values
-        )
-        if runner is not None:
-            try:
-                from ....library import _define_or_get
+    # Plans with sample tensors compile through the Triton program generator:
+    # the kernel reads broadcast operands in place and skips the launch-time
+    # materialization the generic jiterator wrapper pays per call.  Sample
+    # outputs name one output dtype per output port, which also unlocks plans
+    # whose inputs do not all share that dtype.  Example-less registrations
+    # keep the jiterator route -- with no sample shapes there is nothing to
+    # compile a reference geometry from.
+    fallback = None
+    if example_values and output_dtypes and len(output_dtypes) == len(
+        output_refs
+    ):
+        try:
+            from .codegen.triton import _supports_runtime_inputs
 
-                name = f"tp_stax::pointwise_{_STAX_CUDA_OP_COUNTER}"
-                _STAX_CUDA_OP_COUNTER += 1
-                op = _define_or_get(name, None)
+            rank = max(
+                len(tuple(int(item) for item in value.shape))
+                for value in example_values
+            )
+            reference_shape = tuple(
+                max(
+                    (1,) * (rank - len(tuple(int(item) for item in value.shape)))
+                    + tuple(int(item) for item in value.shape)
+                    for value in example_values
+                )[dim]
+                for dim in range(rank)
+            )
+            runner = _cuda_triton_pointwise_runner(
+                program, constants, output_refs, example_values, output_dtypes
+            )
+            if runner is not None:
+                mixed_inputs = any(
+                    value.dtype != example_values[0].dtype
+                    for value in example_values[1:]
+                )
+                try:
+                    from .codegen.cuda import compile_program as _jit_compile
 
-                def kernel(*inputs: Any, _runner: Any = runner) -> Any:
-                    return _runner(list(inputs))
+                    fallback = _jit_compile(
+                        program,
+                        constants,
+                        output_refs,
+                        input_count,
+                        example_values,
+                    )
+                    if example_values:
+                        fallback(example_values)
+                except (AssertionError, RuntimeError, TypeError, ValueError):
+                    return None
+                try:
+                    from ....library import _define_or_get
 
-                op.register_kernel("cuda")(kernel)
-                _STAX_CUDA_OP_CACHE[key] = name
-                return name
-            except (AssertionError, RuntimeError, TypeError, ValueError):
-                pass
+                    name = f"tp_stax::pointwise_{_STAX_CUDA_OP_COUNTER}"
+                    _STAX_CUDA_OP_COUNTER += 1
+                    op = _define_or_get(name, None)
+
+                    def kernel(
+                        *inputs: Any,
+                        _runner: Any = runner,
+                        _fallback: Any = fallback,
+                        _reference: tuple[int, ...] = reference_shape,
+                        _mixed: bool = mixed_inputs,
+                    ) -> Any:
+                        # The generated kernel addresses every input as
+                        # contiguous.  A strided operand (an expanded
+                        # per-channel view, for example) is materialized here
+                        # -- a tiny copy next to the wrapper the fallback
+                        # runs, which re-materializes the whole broadcast.
+                        values = [
+                            value
+                            if value.is_contiguous()
+                            else value.contiguous()
+                            for value in inputs
+                        ]
+                        # allow_grad: this op runs inside the native graph
+                        # whose reverse pass is a separately compiled
+                        # program, so parameter inputs carrying
+                        # requires_grad need no autograd node here --
+                        # rejecting them would drop every plan that reads a
+                        # parameter onto the materializing fallback.
+                        if not _supports_runtime_inputs(
+                            values,
+                            allow_grad=True,
+                            reference_shape=_reference,
+                            allow_mixed_dtypes=_mixed,
+                        ):
+                            return _fallback(values)
+                        result = _runner(values)
+                        if isinstance(result, list):
+                            return tuple(result)
+                        return result
+
+                    op.register_kernel("cuda")(kernel)
+                    _STAX_CUDA_OP_CACHE[key] = name
+                    return name
+                except (AssertionError, RuntimeError, TypeError, ValueError):
+                    pass
+        except Exception:  # noqa: BLE001 - registration misses fall through
+            pass
     try:
         from .codegen.cuda import compile_program
         from ....library import _define_or_get
@@ -3465,41 +3546,42 @@ def _native_fused_pointwise_plans(
         uniform_output_dtype = all(
             value.dtype == output_dtype for value in external_values
         )
-        direct_examples = (
-            external_values
-            if all(
-                tuple(int(item) for item in value.shape) == output_shape
-                and value.dtype == output_dtype
-                and value.is_contiguous()
-                for value in external_values
+        # Sample tensors describe the plan for the generated kernel: the
+        # generator reads only their shape/dtype/device, never the values.
+        # Contiguous values go in as-is; others stand in for zero fill-ins
+        # of the same layout so broadcast operands and mixed input dtypes
+        # reach the Triton generator (which addresses them in place) instead
+        # of the wrapper that materializes them on every call.
+        examples = [
+            value
+            if value.is_contiguous()
+            else tensorplay.zeros(
+                tuple(int(item) for item in value.shape),
+                dtype=value.dtype,
+                device=value.device,
             )
-            else []
+            for value in external_values
+        ]
+        output_dtype_names = tuple(
+            repr(output_dtype) for _ in range(len(output_refs))
         )
-        if not uniform_output_dtype:
-            # The native stride kernel has one storage dtype.  The generated
-            # CUDA function performs the required input promotion for mixed
-            # dtype plans and keeps broadcast addressing in its wrapper.
-            op_name = _register_stax_cuda_pointwise_op(
-                program, constants, output_refs, len(externals), []
-            )
-            if op_name is None:
-                return None
-        elif len(output_refs) == 1 and output_ref != final_ref:
-            op_name = _register_stax_cuda_pointwise_op(
-                program, constants, output_refs, len(externals), direct_examples
-            )
-            if op_name is None:
-                return None
-        elif direct_examples:
-            op_name = _register_stax_cuda_pointwise_op(
-                program,
-                constants,
-                output_refs,
-                len(externals),
-                direct_examples,
-            )
-        else:
-            op_name = None
+        op_name = _register_stax_cuda_pointwise_op(
+            program,
+            constants,
+            output_refs,
+            len(externals),
+            examples,
+            output_dtype_names,
+        )
+        if op_name is None and (
+            not uniform_output_dtype
+            or (len(output_refs) == 1 and output_ref != final_ref)
+        ):
+            # These plans have no execution route without a registered op:
+            # the native stride kernel carries one storage dtype, and a
+            # single output that is not the program's tail node needs the op
+            # to surface it.
+            return None
         return (
             frozenset(nodes),
             tuple(externals),
@@ -3871,7 +3953,12 @@ class _ForwardPointwiseFuser:
                 op_name = None
             else:
                 op_name = _register_stax_cuda_pointwise_op(
-                    program, constants, tuple(output_refs), input_count, examples
+                    program,
+                    constants,
+                    tuple(output_refs),
+                    input_count,
+                    examples,
+                    (repr(output_dtype),) * len(output_refs),
                 )
         node = self._graph.create_node(
             "custom_op" if op_name is not None else "fused_pointwise",
@@ -6320,6 +6407,7 @@ class _AotNativeGraphBuilder:
                         tuple(output_refs),
                         input_count,
                         [example] * input_count,
+                        (repr(first_dtype),) * len(output_refs),
                     )
                 else:
                     op_name = _register_stax_cuda_pointwise_op(

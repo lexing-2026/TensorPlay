@@ -64,6 +64,17 @@ from ..runtime.stax_autotune import disabled as disabled_autotune
 # "<digest>:<fixed_config>".
 _launch_memo: dict[str, Any] = {}
 
+# Output-side typing: a program's value space is float32/float64, while the
+# materialized result can be any of the float widths.  The kernel stores each
+# output through an explicit downcast to its own dtype, independent of what
+# the inputs happen to carry.
+_TRITON_DTYPE_NAMES = {
+    "tensorplay.float16": "tl.float16",
+    "tensorplay.bfloat16": "tl.bfloat16",
+    "tensorplay.float32": "tl.float32",
+    "tensorplay.float64": "tl.float64",
+}
+
 
 def _is_scalar(value: Any) -> bool:
     return isinstance(value, (bool, int, float))
@@ -424,6 +435,7 @@ def _supports_runtime_inputs(
     *,
     allow_grad: bool = False,
     reference_shape: tuple[int, ...] | None = None,
+    allow_mixed_dtypes: bool = False,
 ) -> bool:
     # Per-call dispatch guard on the compiled wrapper: must stay cheap.
     if not example_inputs:
@@ -461,9 +473,15 @@ def _supports_runtime_inputs(
     else:
         if _broadcast_reference_shape(shapes) != tuple(reference_shape):
             return False
+    devices_ok = all(
+        value.device == first.device for value in example_inputs[1:]
+    )
+    if not devices_ok:
+        return False
+    if allow_mixed_dtypes:
+        return True
     return all(
-        value.dtype == first.dtype and value.device == first.device
-        for value in example_inputs[1:]
+        value.dtype == first.dtype for value in example_inputs[1:]
     )
 
 
@@ -493,6 +511,7 @@ class TritonProgramCodegen:
         epilogue: tuple[list[int], list[float], int] | None = None,
         reduction_outputs: tuple[str, ...] | None = None,
         input_dtypes: tuple[str, ...] | None = None,
+        output_dtypes: tuple[str, ...] | None = None,
     ) -> None:
         if len(program) % 3:
             raise ValueError("Triton Stax program must contain triples")
@@ -503,6 +522,17 @@ class TritonProgramCodegen:
         if input_dtypes is not None and len(input_dtypes) != input_count:
             raise ValueError("input_dtypes must match input_count")
         self.input_dtypes = input_dtypes
+        if output_dtypes is not None and len(output_dtypes) != len(
+            output_refs
+        ):
+            raise ValueError("output_dtypes must match output_refs")
+        if output_dtypes is not None and any(
+            dtype not in _TRITON_DTYPE_NAMES for dtype in output_dtypes
+        ):
+            raise ValueError(
+                "output_dtypes must name float16/bfloat16/float32/float64"
+            )
+        self.output_dtypes = output_dtypes
         if epilogue is not None:
             eprogram, _, _ = epilogue
             if len(eprogram) % 3:
@@ -1420,15 +1450,23 @@ class TritonProgramCodegen:
                 ]
         elif not dims_reduction:
             for output_index, output_ref in enumerate(self.output_refs):
+                value_source = self._ref(output_ref)
+                if self.output_dtypes is not None:
+                    # Values live in the program's float space; each output
+                    # narrows to its own storage dtype at the store.
+                    value_source = (
+                        f"{value_source}.to("
+                        f"{_TRITON_DTYPE_NAMES[self.output_dtypes[output_index]]})"
+                    )
                 if use_xmask:
                     body.append(
                         f"tl.store(out_ptr{output_index} + xindex, "
-                        f"{self._ref(output_ref)}, mask=xmask)"
+                        f"{value_source}, mask=xmask)"
                     )
                 else:
                     body.append(
                         f"tl.store(out_ptr{output_index} + xindex, "
-                        f"{self._ref(output_ref)})"
+                        f"{value_source})"
                     )
             signature = [
                 *(f"in_ptr{index}" for index in range(self.input_count)),
@@ -1766,7 +1804,18 @@ class TritonProgramCodegen:
                 # empty_like(inputs[0]) can pick up a broadcast operand's
                 # shape and silently truncate the result.
                 out_shape = repr(tuple(int(d) for d in self.reference_shape))
-                if len(self.output_refs) == 1:
+                if self.output_dtypes is not None:
+                    dtype_sources = [
+                        "tp." + name.split(".", 1)[1]
+                        for name in self.output_dtypes
+                    ]
+                    allocation = ", ".join(
+                        f"tp.empty({out_shape}, dtype={dtype_source}, "
+                        "device=inputs[0].device)"
+                        for dtype_source in dtype_sources
+                    )
+                    source += f"    outputs = [{allocation}]\n"
+                elif len(self.output_refs) == 1:
                     source += (
                         f"    outputs = [tp.empty({out_shape}, "
                         "dtype=inputs[0].dtype, device=inputs[0].device)]\n"
@@ -1922,27 +1971,31 @@ def _program_digest(
     reduction,
     epilogue,
     reduction_outputs,
+    output_dtypes: tuple[str, ...] | None = None,
 ) -> str:
     """Content hash of a program specialization.
 
     Covers the emitter generation, the program, the reduction/epilogue
-    payload and the example inputs' shapes/dtypes/devices -- the last
-    because the kernel name and the baked geometry follow from them.
+    payload, the per-output storage dtypes when narrowed, and the example
+    inputs' shapes/dtypes/devices -- the last because the kernel name and the
+    baked geometry follow from them.  Unset output dtypes leave the payload
+    unchanged, so pre-existing cache keys stay stable.
     """
 
+    payload = (
+        _CODEGEN_VERSION,
+        program,
+        constants,
+        output_refs,
+        reduction,
+        epilogue,
+        reduction_outputs,
+    )
+    if output_dtypes is not None:
+        payload += (output_dtypes,)
     return hashlib.sha256(
         (
-            repr(
-                (
-                    _CODEGEN_VERSION,
-                    program,
-                    constants,
-                    output_refs,
-                    reduction,
-                    epilogue,
-                    reduction_outputs,
-                )
-            )
+            repr(payload)
             + repr(
                 [
                     (tuple(value.shape), repr(value.dtype), repr(value.device))
@@ -1967,6 +2020,7 @@ def _program_source(
     epilogue=None,
     reduction_outputs=None,
     input_dtypes: tuple[str, ...] | None = None,
+    output_dtypes: tuple[str, ...] | None = None,
 ) -> tuple[str, str]:
     """Generate one candidate's kernel source without exec'ing it.
 
@@ -1986,6 +2040,7 @@ def _program_source(
         reduction,
         epilogue,
         reduction_outputs,
+        output_dtypes,
     )
     kernel_name = f"stax_triton_program_{digest}"
     source = TritonProgramCodegen(
@@ -1997,6 +2052,7 @@ def _program_source(
         epilogue=epilogue,
         reduction_outputs=reduction_outputs,
         input_dtypes=input_dtypes,
+        output_dtypes=output_dtypes,
     ).generate(kernel_name, fixed_config=fixed_config)
     return source, f"<tensorplay-stax-triton-program-{digest}>"
 
@@ -2050,11 +2106,15 @@ def _compile_program(
     epilogue: tuple[list[int], list[float], int] | None = None,
     reduction_outputs: tuple[str, ...] | None = None,
     input_dtypes: tuple[str, ...] | None = None,
+    output_dtypes: tuple[str, ...] | None = None,
 ):
     if not HAS_TRITON:
         raise RuntimeError("Triton is not installed")
     if not _supports_runtime_inputs(
-        example_inputs, allow_grad=True, reference_shape=reference_shape
+        example_inputs,
+        allow_grad=True,
+        reference_shape=reference_shape,
+        allow_mixed_dtypes=output_dtypes is not None,
     ):
         raise NotImplementedError("Triton requires matching contiguous CUDA tensors")
     if input_dtypes is None and reduction is None and epilogue is None:
@@ -2065,7 +2125,7 @@ def _compile_program(
         input_dtypes = tuple(repr(value.dtype) for value in example_inputs)
     digest = _program_digest(
         program, constants, output_refs, example_inputs,
-        reduction, epilogue, reduction_outputs,
+        reduction, epilogue, reduction_outputs, output_dtypes,
     )
     # is content-addressed and persisted; a process-level memo keeps the
     # exec'd launch callable so repeated compile() calls skip regeneration.
@@ -2083,6 +2143,7 @@ def _compile_program(
         epilogue=epilogue,
         reduction_outputs=reduction_outputs,
         input_dtypes=input_dtypes,
+        output_dtypes=output_dtypes,
     )
     try:
         from ..codecache import default_cache
@@ -2496,6 +2557,7 @@ def _autotune_launch(
     value_dtype: str | None = None,
     epilogue: tuple[list[int], list[float], int] | None = None,
     reduction_outputs: tuple[str, ...] | None = None,
+    output_dtypes: tuple[str, ...] | None = None,
     max_autotune: bool = False,
     coordinate_descent_tuning: bool = False,
 ):
@@ -2524,6 +2586,7 @@ def _autotune_launch(
             value_dtype=value_dtype,
             epilogue=epilogue,
             reduction_outputs=reduction_outputs,
+            output_dtypes=output_dtypes,
         )
 
     spec = (
@@ -2577,11 +2640,19 @@ def _autotune_launch(
             reduction=reduction,
             input_shapes=input_shapes,
             reference_shape=reference_shape,
+            output_dtypes=output_dtypes,
         )
     try:
         from ..runtime import coordinate_descent, stax_autotune
 
         digest = stax_autotune.program_digest(program, constants, output_refs)
+        if output_dtypes is not None:
+            # The tuning decision must not leak across output typings: the
+            # same program stores through different widths under different
+            # overrides, and the best geometry follows the register load.
+            digest = hashlib.sha256(
+                (digest + "|" + repr(output_dtypes)).encode()
+            ).hexdigest()[:16]
         if bucket_numel is not None:
             xnumel = bucket_numel
         else:
@@ -2591,10 +2662,9 @@ def _autotune_launch(
         def build_fixed(config: tuple[int, int]):
             return build(config)
 
-        pointwise_candidates = (
-            stax_autotune.EXHAUSTIVE_CANDIDATE_CONFIGS
-            if max_autotune
-            else None
+        pointwise_candidates: tuple[tuple[int, int] | tuple[int, int, int], ...] | None = (
+            tuple(stax_autotune.CANDIDATE_CONFIGS)
+            + stax_autotune.PACKED_POINTWISE_CONFIGS
         )
         if max_autotune:
             from . import loop_pass
@@ -2605,10 +2675,11 @@ def _autotune_launch(
             pointwise_candidates = loop_pass.pointwise_loop_candidates(
                 xnumel,
                 itemsize,
-                stax_autotune.EXHAUSTIVE_CANDIDATE_CONFIGS,
+                stax_autotune.EXHAUSTIVE_CANDIDATE_CONFIGS
+                + stax_autotune.PACKED_POINTWISE_CONFIGS,
             )
         _warm_compile_candidates(
-            pointwise_candidates or stax_autotune.CANDIDATE_CONFIGS,
+            pointwise_candidates,
             example_inputs,
             lambda config: _program_source(
                 program, constants, output_refs, example_inputs,
@@ -2619,6 +2690,7 @@ def _autotune_launch(
                 value_dtype=value_dtype,
                 epilogue=epilogue,
                 reduction_outputs=reduction_outputs,
+                output_dtypes=output_dtypes,
             ),
         )
 
