@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 #include <vector>
 #include "tensorplay/ops/TensorRedispatchGenerated.h"
+#include "CudaDispatchHelpers.cuh"
 
 namespace tensorplay {
 namespace cuda {
@@ -571,6 +572,174 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, RnnSequence) {
     m.impl("gru", gru_cuda);
     m.impl("rnn_relu", rnn_relu_cuda);
     m.impl("rnn_tanh", rnn_tanh_cuda);
+}
+
+namespace {
+
+
+Tensor gate_slice(const Tensor& gates, int64_t idx, int64_t total_gates) {
+    const int64_t span = gates.size(-1) / total_gates;
+    return gates.narrow(-1, idx * span, span);
+}
+
+
+std::tuple<Tensor, Tensor> interop__thnn_fused_gru_cell_cuda(
+        const Tensor& input_gates, const Tensor& hidden_gates,
+        const Tensor& hx, const std::optional<Tensor>& input_bias,
+        const std::optional<Tensor>& hidden_bias) {
+    Tensor gi = input_gates;
+    Tensor gh = hidden_gates;
+    if (input_bias.has_value() && input_bias->defined()) {
+        gi = ops::add(gi, *input_bias);
+    }
+    if (hidden_bias.has_value() && hidden_bias->defined()) {
+        gh = ops::add(gh, *hidden_bias);
+    }
+    Tensor r = ops::sigmoid(ops::add(gate_slice(gi, 0, 3), gate_slice(gh, 0, 3)));
+    Tensor z = ops::sigmoid(ops::add(gate_slice(gi, 1, 3), gate_slice(gh, 1, 3)));
+    Tensor n = ops::tanh(ops::add(gate_slice(gi, 2, 3),
+                                  ops::mul(r, gate_slice(gh, 2, 3))));
+    Tensor hy = ops::add(n, ops::mul(z, ops::sub(hx, n)));
+    // Workspace layout: [r, z, n, hx, gh_n + b_n].
+    Tensor workspace = ops::cat(
+        {r, z, n, hx, gate_slice(gh, 2, 3)}, -1);
+    return std::make_tuple(hy, workspace);
+}
+
+
+// ---------------------------------------------------------------------------
+// _thnn_fused_lstm_cell: gates run along the last dimension in
+// [input, forget, cell, output] order.
+//
+// cy = f * cx + i * c, hy = o * tanh(cy).  The workspace saves [i, f, c, o].
+// ---------------------------------------------------------------------------
+
+std::tuple<Tensor, Tensor, Tensor> interop__thnn_fused_lstm_cell_cuda(
+        const Tensor& input_gates, const Tensor& hidden_gates,
+        const Tensor& cx, const std::optional<Tensor>& input_bias,
+        const std::optional<Tensor>& hidden_bias) {
+    Tensor gi = input_gates;
+    Tensor gh = hidden_gates;
+    if (input_bias.has_value() && input_bias->defined()) {
+        gi = ops::add(gi, *input_bias);
+    }
+    if (hidden_bias.has_value() && hidden_bias->defined()) {
+        gh = ops::add(gh, *hidden_bias);
+    }
+    Tensor i = ops::sigmoid(ops::add(gate_slice(gi, 0, 4), gate_slice(gh, 0, 4)));
+    Tensor f = ops::sigmoid(ops::add(gate_slice(gi, 1, 4), gate_slice(gh, 1, 4)));
+    Tensor c = ops::tanh(ops::add(gate_slice(gi, 2, 4), gate_slice(gh, 2, 4)));
+    Tensor o = ops::sigmoid(ops::add(gate_slice(gi, 3, 4), gate_slice(gh, 3, 4)));
+    Tensor cy = ops::add(ops::mul(f, cx), ops::mul(i, c));
+    Tensor hy = ops::mul(o, ops::tanh(cy));
+    Tensor workspace = ops::cat({i, f, c, o}, -1);
+    return std::make_tuple(hy, cy, workspace);
+}
+
+
+std::tuple<Tensor, Tensor, Tensor> interop__thnn_fused_lstm_cell_backward_impl_cuda(
+        const std::optional<Tensor>& grad_hy,
+        const std::optional<Tensor>& grad_cy, const Tensor& cx,
+        const Tensor& cy, const Tensor& workspace, bool has_bias) {
+    const bool has_ghy = grad_hy.has_value() && grad_hy->defined();
+    const bool has_gcy = grad_cy.has_value() && grad_cy->defined();
+    if (!has_ghy && !has_gcy) {
+        return std::tuple<Tensor, Tensor, Tensor>();
+    }
+    Tensor i = gate_slice(workspace, 0, 4);
+    Tensor f = gate_slice(workspace, 1, 4);
+    Tensor c = gate_slice(workspace, 2, 4);
+    Tensor o = gate_slice(workspace, 3, 4);
+    Tensor tanh_cy = ops::tanh(cy);
+    Tensor go = has_ghy ? *grad_hy : Tensor();
+    Tensor goc = has_gcy ? *grad_cy : Tensor();
+    // hy = o * tanh(cy); cy = f * cx + i * c.
+    Tensor gog = has_ghy ? ops::mul(go, tanh_cy) : Tensor();
+    // gcx accumulates the total cell gradient before the forget gate.
+    Tensor gcx;
+    if (has_ghy) {
+        Tensor tanh_cy_sq = ops::mul(tanh_cy, tanh_cy);
+        gcx = ops::add(ops::mul(go, ops::mul(o,
+                                  ops::sub(ops::ones_like(tanh_cy_sq),
+                                           tanh_cy_sq))),
+                       has_gcy ? goc : ops::zeros_like(cy));
+    } else {
+        gcx = goc;
+    }
+    Tensor gig = ops::mul(gcx, c);
+    Tensor gfg = ops::mul(gcx, cx);
+    Tensor gcg = ops::mul(gcx, i);
+    Tensor grad_cx = ops::mul(gcx, f);
+    gig = ops::mul(gig, ops::mul(ops::sub(ops::ones_like(i), i), i));
+    gfg = ops::mul(gfg, ops::mul(ops::sub(ops::ones_like(f), f), f));
+    gcg = ops::mul(gcg, ops::sub(ops::ones_like(ops::mul(c, c)), ops::mul(c, c)));
+    if (has_ghy) {
+        gog = ops::mul(gog, ops::mul(ops::sub(ops::ones_like(o), o), o));
+    } else {
+        gog = ops::zeros_like(o);
+    }
+    Tensor grad_gates = ops::cat({gig, gfg, gcg, gog}, -1);
+    Tensor grad_bias;
+    if (has_bias) {
+        std::vector<int64_t> reduce_dims;
+        for (int64_t d = 0; d < grad_gates.dim() - 1; ++d) {
+            reduce_dims.push_back(d);
+        }
+        grad_bias = ops::sum(grad_gates, reduce_dims, false);
+    }
+    return std::make_tuple(grad_gates, grad_cx, grad_bias);
+}
+
+
+std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor>
+interop__thnn_fused_gru_cell_backward_cuda(const Tensor& grad_hy,
+                                           const Tensor& workspace,
+                                           bool has_bias) {
+    // Workspace slices (per hidden unit): r, z, n, hx, hgn.
+    Tensor r = gate_slice(workspace, 0, 5);
+    Tensor z = gate_slice(workspace, 1, 5);
+    Tensor n = gate_slice(workspace, 2, 5);
+    Tensor hx = gate_slice(workspace, 3, 5);
+    Tensor hgn = gate_slice(workspace, 4, 5);
+    Tensor go = grad_hy;
+    // hy = n + z * (hx - n):
+    //   dz = go * (hx - n) * z * (1 - z)
+    //   dn = go * (1 - z) * (1 - n^2)
+    //   dhx = go * z
+    //   dr = dn * hgn * r * (1 - r)
+    // gate grads: input [dr, dz, dn]; hidden [dr, dz, r * dn].
+    Tensor sig_z = ops::mul(z, ops::sub(ops::ones_like(z), z));
+    Tensor sig_r = ops::mul(r, ops::sub(ops::ones_like(r), r));
+    Tensor gz = ops::mul(ops::mul(go, ops::sub(hx, n)), sig_z);
+    Tensor gn = ops::mul(ops::mul(go, ops::sub(ops::ones_like(z), z)),
+                         ops::sub(ops::ones_like(ops::mul(n, n)), ops::mul(n, n)));
+    Tensor gr = ops::mul(ops::mul(gn, hgn), sig_r);
+    Tensor grad_hx = ops::mul(go, z);
+    Tensor grad_input_gates = ops::cat({gr, gz, gn}, -1);
+    Tensor grad_hidden_gates = ops::cat({gr, gz, ops::mul(r, gn)}, -1);
+    Tensor grad_input_bias;
+    Tensor grad_hidden_bias;
+    if (has_bias) {
+        // Bias gradients sum over every batch axis.
+        std::vector<int64_t> reduce_dims;
+        for (int64_t d = 0; d < grad_input_gates.dim() - 1; ++d) {
+            reduce_dims.push_back(d);
+        }
+        grad_input_bias = ops::sum(grad_input_gates, reduce_dims, false);
+        grad_hidden_bias = ops::sum(grad_hidden_gates, reduce_dims, false);
+    }
+    return std::make_tuple(grad_input_gates, grad_hidden_gates, grad_hx,
+                           grad_input_bias, grad_hidden_bias);
+}
+
+} // namespace
+
+TENSORPLAY_LIBRARY_IMPL(CUDA, RnnInterop) {
+    // fused rnn cells
+    m.impl("_thnn_fused_gru_cell", interop__thnn_fused_gru_cell_cuda);
+    m.impl("_thnn_fused_gru_cell_backward", interop__thnn_fused_gru_cell_backward_cuda);
+    m.impl("_thnn_fused_lstm_cell", interop__thnn_fused_lstm_cell_cuda);
+    m.impl("_thnn_fused_lstm_cell_backward_impl", interop__thnn_fused_lstm_cell_backward_impl_cuda);
 }
 
 }  // namespace cuda

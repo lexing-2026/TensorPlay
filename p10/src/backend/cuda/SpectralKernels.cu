@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <string>
 #include "Atomic.cuh"
+#include "CudaDispatchHelpers.cuh"
 
 namespace tensorplay {
 namespace cuda {
@@ -1411,6 +1412,141 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, SpectralKernels) {
     m.impl("stft", stft_cuda);
     m.impl("istft", istft_cuda);
     m.impl("stft_backward", stft_backward_cuda);
+}
+
+namespace {
+
+
+Tensor fft_move_dim_last(const Tensor& self, int64_t dim) {
+    const int64_t nd = self.dim();
+    dim = (dim % nd + nd) % nd;
+    std::vector<int64_t> perm;
+    perm.reserve(static_cast<size_t>(nd));
+    for (int64_t d = 0; d < nd; ++d) {
+        if (d != dim) perm.push_back(d);
+    }
+    perm.push_back(dim);
+    return self.permute(perm).contiguous();
+}
+
+
+Tensor fft_move_dim_back(const Tensor& out, int64_t orig_dim, int64_t nd) {
+    orig_dim = (orig_dim % nd + nd) % nd;
+    // Undo "move to last": the transformed axis sits at the end and returns
+    // to its original position; every axis after it shifts up one slot.
+    std::vector<int64_t> perm;
+    perm.reserve(static_cast<size_t>(nd));
+    for (int64_t a = 0; a < nd; ++a) {
+        if (a < orig_dim) {
+            perm.push_back(a);
+        } else if (a == orig_dim) {
+            perm.push_back(nd - 1);
+        } else {
+            perm.push_back(a - 1);
+        }
+    }
+    return out.permute(perm).contiguous();
+}
+
+
+const char* fft_norm_name(int64_t normalization) {
+    // 0 = backward (no scaling), 1 = forward (1/n), 2 = ortho (1/sqrt(n)).
+    return normalization == 1 ? "forward" : normalization == 2 ? "ortho"
+                                                               : "backward";
+}
+
+
+Tensor interop__fft_r2c_cuda(const Tensor& self,
+                            const std::vector<int64_t>& dim,
+                            int64_t normalization, bool onesided) {
+    TP_CHECK(dim.size() == 1,
+             "_fft_r2c transforms exactly one dimension, got ", dim.size());
+    const int64_t d = dim[0];
+    Tensor moved = fft_move_dim_last(self, d);
+    const char* norm = fft_norm_name(normalization);
+    Tensor out;
+    if (onesided) {
+        out = dispatch_cuda<Tensor>("fft_rfft", moved, int64_t(-1),
+                                    moved.dim() - 1, std::string(norm));
+    } else {
+        // A real input's full spectrum is the plain c2c transform.
+        out = dispatch_cuda<Tensor>("fft_fft", moved, int64_t(-1),
+                                    moved.dim() - 1, std::string(norm));
+    }
+    return fft_move_dim_back(out, d, self.dim());
+}
+
+
+Tensor& interop__fft_r2c_out_cuda(const Tensor& self,
+                                 const std::vector<int64_t>& dim,
+                                 int64_t normalization, bool onesided,
+                                 Tensor& out) {
+    write_out(out, interop__fft_r2c_cuda(self, dim, normalization, onesided));
+    return out;
+}
+
+
+Tensor interop__fft_c2r_cuda(const Tensor& self,
+                            const std::vector<int64_t>& dim,
+                            int64_t normalization, int64_t last_dim_size) {
+    TP_CHECK(dim.size() == 1,
+             "_fft_c2r transforms exactly one dimension, got ", dim.size());
+    const int64_t d = dim[0];
+    Tensor moved = fft_move_dim_last(self, d);
+    const char* norm = fft_norm_name(normalization);
+    Tensor out = dispatch_cuda<Tensor>("fft_irfft", moved, last_dim_size,
+                                       moved.dim() - 1, std::string(norm));
+    return fft_move_dim_back(out, d, self.dim());
+}
+
+
+Tensor& interop__fft_c2r_out_cuda(const Tensor& self,
+                                 const std::vector<int64_t>& dim,
+                                 int64_t normalization, int64_t last_dim_size,
+                                 Tensor& out) {
+    write_out(out, interop__fft_c2r_cuda(self, dim, normalization, last_dim_size));
+    return out;
+}
+
+
+Tensor interop__fft_c2c_cuda(const Tensor& self,
+                            const std::vector<int64_t>& dim,
+                            int64_t normalization, bool forward) {
+    TP_CHECK(dim.size() == 1,
+             "_fft_c2c transforms exactly one dimension, got ", dim.size());
+    const int64_t d = dim[0];
+    Tensor moved = fft_move_dim_last(self, d);
+    const char* norm = fft_norm_name(normalization);
+    Tensor out;
+    if (forward) {
+        out = dispatch_cuda<Tensor>("fft_fft", moved, int64_t(-1),
+                                    moved.dim() - 1, std::string(norm));
+    } else {
+        out = dispatch_cuda<Tensor>("fft_ifft", moved, int64_t(-1),
+                                    moved.dim() - 1, std::string(norm));
+    }
+    return fft_move_dim_back(out, d, self.dim());
+}
+
+
+Tensor& interop__fft_c2c_out_cuda(const Tensor& self,
+                                 const std::vector<int64_t>& dim,
+                                 int64_t normalization, bool forward,
+                                 Tensor& out) {
+    write_out(out, interop__fft_c2c_cuda(self, dim, normalization, forward));
+    return out;
+}
+
+} // namespace
+
+TENSORPLAY_LIBRARY_IMPL(CUDA, SpectralInterop) {
+    // fft spellings
+    m.impl("_fft_r2c", interop__fft_r2c_cuda);
+    m.impl("_fft_r2c.out", interop__fft_r2c_out_cuda);
+    m.impl("_fft_c2r", interop__fft_c2r_cuda);
+    m.impl("_fft_c2r.out", interop__fft_c2r_out_cuda);
+    m.impl("_fft_c2c", interop__fft_c2c_cuda);
+    m.impl("_fft_c2c.out", interop__fft_c2c_out_cuda);
 }
 
 }  // namespace cuda

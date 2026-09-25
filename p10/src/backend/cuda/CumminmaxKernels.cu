@@ -1,4 +1,5 @@
 #include "ReduceKernels.cuh"
+#include "CudaDispatchHelpers.cuh"
 
 namespace tensorplay {
 namespace cuda {
@@ -265,6 +266,32 @@ std::tuple<Tensor, Tensor> cummin_cuda(const Tensor& self, int64_t dim) {
 TENSORPLAY_LIBRARY_IMPL(CUDA, CumminmaxKernels) {
     m.impl("cummax", cummax_cuda);
     m.impl("cummin", cummin_cuda);
+}
+
+namespace {
+
+
+void interop__cummax_helper_cuda(const Tensor& self, Tensor& values,
+                                 Tensor& indices, int64_t dim) {
+    auto result = dispatch_cuda<std::tuple<Tensor, Tensor>>("cummax", self, dim);
+    write_out(values, std::get<0>(result));
+    write_out(indices, std::get<1>(result));
+}
+
+
+void interop__cummin_helper_cuda(const Tensor& self, Tensor& values,
+                                 Tensor& indices, int64_t dim) {
+    auto result = dispatch_cuda<std::tuple<Tensor, Tensor>>("cummin", self, dim);
+    write_out(values, std::get<0>(result));
+    write_out(indices, std::get<1>(result));
+}
+
+} // namespace
+
+TENSORPLAY_LIBRARY_IMPL(CUDA, CumminmaxInterop) {
+    // cummax/cummin out-style helpers
+    m.impl("_cummax_helper", interop__cummax_helper_cuda);
+    m.impl("_cummin_helper", interop__cummin_helper_cuda);
 }
 
 } // namespace cuda

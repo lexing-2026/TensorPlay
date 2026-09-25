@@ -10,6 +10,7 @@
 #include <type_traits>
 #include <utility>
 #include "Atomic.cuh"
+#include "CudaDispatchHelpers.cuh"
 
 namespace tensorplay {
 namespace cuda {
@@ -166,6 +167,37 @@ Tensor sparse_mm_cuda(const Tensor& self, const Tensor& dense) {
         checkCuda(cudaGetLastError(), "CUDA sparse_mm kernel");
     }
     return out;
+}
+
+namespace {
+
+
+// ---------------------------------------------------------------------------
+// sspaddmm: sparse-only in the reference; tp has no sparse CUDA backend, so
+// the contract is an explicit rejection rather than a dense reinterpretation.
+// ---------------------------------------------------------------------------
+
+Tensor interop_sspaddmm_cuda(const Tensor& /*self*/, const Tensor& mat1,
+                             const Tensor& /*mat2*/, const Scalar& /*beta*/,
+                             const Scalar& /*alpha*/) {
+    TP_THROW(NotImplementedError,
+             "sspaddmm requires a sparse CUDA backend; mat1 is dense with dtype ",
+             toString(mat1.dtype()));
+}
+
+
+Tensor& interop_sspaddmm_out_cuda(const Tensor& self, const Tensor& mat1,
+                                  const Tensor& mat2, const Scalar& beta, const Scalar& alpha,
+                                  Tensor& out) {
+    write_out(out, interop_sspaddmm_cuda(self, mat1, mat2, beta, alpha));
+    return out;
+}
+
+} // namespace
+
+TENSORPLAY_LIBRARY_IMPL(CUDA, SparseMatMulInterop) {
+    m.impl("sspaddmm", interop_sspaddmm_cuda);
+    m.impl("sspaddmm.out", interop_sspaddmm_out_cuda);
 }
 
 } // namespace cuda

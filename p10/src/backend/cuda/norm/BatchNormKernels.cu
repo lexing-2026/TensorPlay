@@ -22,6 +22,7 @@
 #include <tuple>
 #include <type_traits>
 #include <vector>
+#include "CudaDispatchHelpers.cuh"
 
 namespace tensorplay {
 namespace cuda {
@@ -1329,6 +1330,190 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, BatchNormKernels) {
            batch_norm::batch_norm_backward_reduce_cuda);
     m.impl("batch_norm_backward_elemt",
            batch_norm::batch_norm_backward_elemt_cuda);
+}
+
+namespace {
+
+
+// Channel statistics for batch normalization: mean/variance over every
+// dimension except the channel axis, collapsed to one value per channel.
+std::tuple<Tensor, Tensor> batch_norm_channel_stats(const Tensor& input) {
+    const int64_t C = input.size(1);
+    std::vector<int64_t> reduce_dims;
+    for (int64_t d = 0; d < input.dim(); ++d) {
+        if (d != 1) reduce_dims.push_back(d);
+    }
+    Tensor mean = ops::mean(input, reduce_dims, true).reshape({C});
+    Tensor var = ops::var(input, reduce_dims, 0, true).reshape({C});
+    return std::make_tuple(mean, var);
+}
+
+
+// Broadcast a per-channel (C,) parameter into input's layout: channel values
+// line up with dim 1, remaining dims broadcast.
+Tensor expand_channel_param(const Tensor& param, const Tensor& like) {
+    std::vector<int64_t> sizes(static_cast<size_t>(like.dim()), 1);
+    sizes[1] = like.size(1);
+    return param.reshape(sizes);
+}
+
+
+// Forward pass shared by the native_batch_norm spellings.  The public
+// batch_norm kernel updates the caller's running buffers in place during
+// training; when no buffers are supplied it works on internal scratch and
+// leaves the (optional) statistics untouched.
+std::tuple<Tensor, Tensor, Tensor> batch_norm_forward_impl(
+        const Tensor& input, const std::optional<Tensor>& weight,
+        const std::optional<Tensor>& bias,
+        const std::optional<Tensor>& running_mean,
+        const std::optional<Tensor>& running_var, bool training,
+        double momentum, double eps) {
+    Tensor out = ops::batch_norm(input, weight, bias, running_mean,
+                                 running_var, training, momentum, eps);
+    if (!training) {
+        // Eval mode has no batch statistics to save.
+        return std::make_tuple(out, Tensor(), Tensor());
+    }
+    Tensor mean;
+    Tensor var;
+    std::tie(mean, var) = batch_norm_channel_stats(input);
+    Tensor invstd = ops::rsqrt(var + Scalar(eps));
+    return std::make_tuple(out, mean, invstd);
+}
+
+
+// ---------------------------------------------------------------------------
+// native_batch_norm family: the public batch_norm kernel plus the saved
+// batch statistics (mean, reciprocal standard deviation) for training mode.
+// ---------------------------------------------------------------------------
+
+std::tuple<Tensor, Tensor, Tensor> interop_native_batch_norm_cuda(
+        const Tensor& input, const std::optional<Tensor>& weight,
+        const std::optional<Tensor>& bias,
+        const std::optional<Tensor>& running_mean,
+        const std::optional<Tensor>& running_var, bool training,
+        double momentum, double eps) {
+    return batch_norm_forward_impl(input, weight, bias, running_mean,
+                                   running_var, training, momentum, eps);
+}
+
+
+std::tuple<Tensor, Tensor, Tensor> interop_native_batch_norm_out_cuda(
+        const Tensor& input, const std::optional<Tensor>& weight,
+        const std::optional<Tensor>& bias,
+        const std::optional<Tensor>& running_mean,
+        const std::optional<Tensor>& running_var, bool training,
+        double momentum, double eps, Tensor& out, Tensor& save_mean,
+        Tensor& save_invstd) {
+    {
+        auto __tp_result = batch_norm_forward_impl(
+        input, weight, bias, running_mean, running_var, training, momentum,
+        eps);
+        write_out(out, std::get<0>(__tp_result));
+        write_out(save_mean, std::get<1>(__tp_result));
+        write_out(save_invstd, std::get<2>(__tp_result));
+    }
+    return std::make_tuple(out, save_mean, save_invstd);
+}
+
+
+std::tuple<Tensor, Tensor, Tensor> interop__native_batch_norm_legit_cuda(
+        const Tensor& input, const std::optional<Tensor>& weight,
+        const std::optional<Tensor>& bias, Tensor& running_mean,
+        Tensor& running_var, bool training, double momentum, double eps) {
+    return batch_norm_forward_impl(input, weight, bias, running_mean,
+                                   running_var, training, momentum, eps);
+}
+
+
+std::tuple<Tensor, Tensor, Tensor> interop__native_batch_norm_legit_out_cuda(
+        const Tensor& input, const std::optional<Tensor>& weight,
+        const std::optional<Tensor>& bias, Tensor& running_mean,
+        Tensor& running_var, bool training, double momentum, double eps,
+        Tensor& out, Tensor& save_mean, Tensor& save_invstd) {
+    {
+        auto __tp_result = batch_norm_forward_impl(
+        input, weight, bias, running_mean, running_var, training, momentum,
+        eps);
+        write_out(out, std::get<0>(__tp_result));
+        write_out(save_mean, std::get<1>(__tp_result));
+        write_out(save_invstd, std::get<2>(__tp_result));
+    }
+    return std::make_tuple(out, save_mean, save_invstd);
+}
+
+
+std::tuple<Tensor, Tensor, Tensor>
+interop__native_batch_norm_legit_no_stats_cuda(
+        const Tensor& input, const std::optional<Tensor>& weight,
+        const std::optional<Tensor>& bias, bool training, double momentum,
+        double eps) {
+    // No running statistics to maintain: the kernel runs on internal scratch.
+    return batch_norm_forward_impl(input, weight, bias, std::nullopt,
+                                   std::nullopt, training, momentum, eps);
+}
+
+
+std::tuple<Tensor, Tensor, Tensor>
+interop__native_batch_norm_legit_no_stats_out_cuda(
+        const Tensor& input, const std::optional<Tensor>& weight,
+        const std::optional<Tensor>& bias, bool training, double momentum,
+        double eps, Tensor& out, Tensor& save_mean, Tensor& save_invstd) {
+    std::tie(out, save_mean, save_invstd) = batch_norm_forward_impl(
+        input, weight, bias, std::nullopt, std::nullopt, training, momentum,
+        eps);
+    return std::make_tuple(out, save_mean, save_invstd);
+}
+
+
+std::tuple<Tensor, Tensor, Tensor, Tensor> interop__batch_norm_with_update_cuda(
+        const Tensor& input, const std::optional<Tensor>& weight,
+        const std::optional<Tensor>& bias, Tensor& running_mean,
+        Tensor& running_var, double momentum, double eps) {
+    Tensor out;
+    Tensor save_mean;
+    Tensor save_invstd;
+    std::tie(out, save_mean, save_invstd) = batch_norm_forward_impl(
+        input, weight, bias, running_mean, running_var, true, momentum, eps);
+    // The fourth slot is an opaque reserve buffer nothing consumes here.
+    Tensor reserve;
+    return std::make_tuple(out, save_mean, save_invstd, reserve);
+}
+
+
+std::tuple<Tensor, Tensor, Tensor, Tensor> interop__batch_norm_no_update_cuda(
+        const Tensor& input, const std::optional<Tensor>& weight,
+        const std::optional<Tensor>& bias,
+        const std::optional<Tensor>& running_mean,
+        const std::optional<Tensor>& running_var, double momentum,
+        double eps) {
+    // Evaluation-style normalization with the running statistics, which are
+    // read but never updated; the fourth output is the (empty) reserve.
+    TP_CHECK(running_mean.has_value() && running_mean->defined(),
+             "running_mean must be defined in evaluation mode");
+    TP_CHECK(running_var.has_value() && running_var->defined(),
+             "running_var must be defined in evaluation mode");
+    auto result = batch_norm_forward_impl(input, weight, bias, running_mean,
+                                          running_var, false, momentum, eps);
+    // Evaluation keeps no batch statistics: the saved values are empty.
+    Tensor save_mean = Tensor::empty({0}, input.dtype(), input.device());
+    Tensor save_var = Tensor::empty({0}, input.dtype(), input.device());
+    Tensor reserve = Tensor::empty({0}, DType::UInt8, input.device());
+    return std::make_tuple(std::get<0>(result), save_mean, save_var, reserve);
+}
+
+} // namespace
+
+TENSORPLAY_LIBRARY_IMPL(CUDA, BatchNormInterop) {
+    // batch normalization family
+    m.impl("native_batch_norm", interop_native_batch_norm_cuda);
+    m.impl("native_batch_norm.out", interop_native_batch_norm_out_cuda);
+    m.impl("_native_batch_norm_legit", interop__native_batch_norm_legit_cuda);
+    m.impl("_native_batch_norm_legit.out", interop__native_batch_norm_legit_out_cuda);
+    m.impl("_native_batch_norm_legit.no_stats", interop__native_batch_norm_legit_no_stats_cuda);
+    m.impl("_native_batch_norm_legit.no_stats_out", interop__native_batch_norm_legit_no_stats_out_cuda);
+    m.impl("_batch_norm_with_update", interop__batch_norm_with_update_cuda);
+    m.impl("_batch_norm_no_update", interop__batch_norm_no_update_cuda);
 }
 
 }

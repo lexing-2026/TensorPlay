@@ -301,7 +301,21 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/MaskedKernels.cu
         src/backend/cuda/GatherScatterKernels.cu
         src/backend/cuda/ScatterReduceKernels.cu
-        src/backend/cuda/InteropAliasKernels.cu
+        src/backend/cuda/RepeatKernels.cu
+        src/backend/cuda/TensorFactoriesKernels.cu
+        src/backend/cuda/UniqueKernels.cu
+        src/backend/cuda/NonzeroKernels.cu
+        src/backend/cuda/DropoutKernels.cu
+        src/backend/cuda/TensorShapeKernels.cu
+        src/backend/cuda/CUDAScalarKernels.cu
+        src/backend/cuda/DepthwiseConv2dKernels.cu
+        src/backend/cuda/DepthwiseConv3dKernels.cu
+        src/backend/cuda/ConvolutionMM2dKernels.cu
+        src/backend/cuda/NaiveDilatedConvolutionKernels.cu
+        src/backend/cuda/NaiveConvolutionTranspose2dKernels.cu
+        src/backend/cuda/NaiveConvolutionTranspose3dKernels.cu
+        src/backend/cuda/AdaptiveAveragePoolingKernels.cu
+        src/backend/cuda/AdaptiveAveragePooling3dKernels.cu
         src/backend/cuda/ShapeOpsKernels.cu
         src/backend/cuda/TensorAdvancedIndexingKernels.cu
         src/backend/cuda/SortingKernels.cu

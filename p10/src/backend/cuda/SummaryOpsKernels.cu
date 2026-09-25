@@ -1,4 +1,5 @@
 #include "ReduceKernels.cuh"
+#include "CudaDispatchHelpers.cuh"
 
 namespace tensorplay {
 namespace cuda {
@@ -729,6 +730,172 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, SummaryOpsKernels) {
     m.impl("kthvalue.values", interop_kthvalue_values_cuda);
     m.impl("median.dim", median_dim_cuda);
     m.impl("median.dim_values", interop_median_dim_values_cuda);
+}
+
+namespace {
+
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+void histc_expand_constant_range(DType dtype, double& lo, double& hi) {
+    switch (dtype) {
+        case DType::Float64:
+            lo = std::min(
+                std::nexttoward(lo, std::numeric_limits<double>::lowest()),
+                lo - 1.0);
+            hi = std::max(
+                std::nexttoward(hi, std::numeric_limits<double>::max()),
+                hi + 1.0);
+            break;
+        case DType::Float32:
+            lo = std::min(
+                static_cast<double>(std::nexttoward(
+                    static_cast<float>(lo),
+                    std::numeric_limits<float>::lowest())),
+                lo - 1.0);
+            hi = std::max(
+                static_cast<double>(std::nexttoward(
+                    static_cast<float>(hi),
+                    std::numeric_limits<float>::max())),
+                hi + 1.0);
+            break;
+        default:
+            lo -= 1.0;
+            hi += 1.0;
+            break;
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// histc: bin edges are equally spaced over [min, max]; values outside the
+// range are dropped, the rightmost edge is inclusive.
+// ---------------------------------------------------------------------------
+
+// One pass over the flattened input: out-of-range values drop and in-range
+// values vote for their equally-spaced bin with an atomic increment.  Bin
+// edges span [lo, hi] and the rightmost edge is inclusive, so a value at hi
+// maps to the last bin.  NaN fails both bounds and drops.
+template <typename InT>
+__global__ void histc_count_kernel(const InT* input, int64_t n, double lo,
+                                   double hi, double bins_over_width, int bins,
+                                   unsigned long long* counts) {
+    const int64_t stride = int64_t(gridDim.x) * blockDim.x;
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += stride) {
+        const double v = static_cast<double>(input[i]);
+        if (!(v >= lo) || !(v <= hi)) continue;
+        int b = static_cast<int>((v - lo) * bins_over_width);
+        b = b < 0 ? 0 : (b >= bins ? bins - 1 : b);
+        atomicAdd(counts + b, 1ull);
+    }
+}
+
+
+Tensor interop_histc_cuda(const Tensor& self, int64_t bins, const Scalar& min, const Scalar& max) {
+    if (bins <= 0) TP_THROW(RuntimeError, "histc(): bins must be positive");
+    // Integer inputs compute in double precision and report counts in the
+    // input dtype; that keeps the CUDA contract wider than the CPU one.
+    const bool promote_to_f64 = !isFloatingType(self.dtype());
+    if (promote_to_f64 && !isIntegralType(self.dtype(), /*includeBool=*/false)) {
+        TP_THROW(TypeError, "histc(): expected a floating-point tensor, got ",
+                 toString(self.dtype()));
+    }
+    double lo = min.toDouble();
+    double hi = max.toDouble();
+    if (lo == hi && self.numel() > 0) {
+        auto extrema = ops::aminmax(self);
+        lo = std::get<0>(extrema).item().toDouble();
+        hi = std::get<1>(extrema).item().toDouble();
+    }
+    if (lo == hi) {
+        histc_expand_constant_range(self.dtype(), lo, hi);
+        histc_expand_constant_range(self.dtype(), lo, hi);
+    }
+    if (!std::isfinite(lo) || !std::isfinite(hi)) {
+        TP_THROW(RuntimeError, "histc: range of [", lo, ", ", hi,
+                 "] is not finite");
+    }
+    if (!(lo < hi)) TP_THROW(RuntimeError, "histc: max must be larger than min");
+
+    Tensor counts = Tensor::empty({bins}, DType::Int64, self.device());
+    cudaStream_t stream = getCurrentCUDAStream().stream();
+    const cudaError_t hist_memset = cudaMemsetAsync(
+        counts.data_ptr(), 0, sizeof(int64_t) * static_cast<size_t>(bins),
+        stream);
+    if (hist_memset != cudaSuccess) {
+        TP_THROW(RuntimeError,
+                 std::string("CUDA Error: ") + cudaGetErrorString(hist_memset));
+    }
+    const Tensor flat = self.reshape({-1});
+    const int64_t n = flat.numel();
+    if (n > 0) {
+        const int blocks = static_cast<int>(
+            std::min<int64_t>((n + 255) / 256, 4096));
+        const double bins_over_width =
+            static_cast<double>(bins) / (hi - lo);
+        unsigned long long* counts_ptr =
+            static_cast<unsigned long long*>(counts.data_ptr());
+        const void* in_ptr = flat.data_ptr();
+#define TP_HISTC_CASE(ctype, name)                                       \
+    case DType::name:                                                    \
+        histc_count_kernel<ctype><<<blocks, 256, 0, stream>>>(           \
+            static_cast<const ctype*>(in_ptr), n, lo, hi,                \
+            bins_over_width, static_cast<int>(bins), counts_ptr);        \
+        break;
+        switch (self.dtype()) {
+            TP_HISTC_CASE(double, Float64)
+            TP_HISTC_CASE(float, Float32)
+            TP_HISTC_CASE(tensorplay::Half, Float16)
+            TP_HISTC_CASE(tensorplay::BFloat16, BFloat16)
+            TP_HISTC_CASE(int64_t, Int64)
+            TP_HISTC_CASE(int32_t, Int32)
+            TP_HISTC_CASE(int16_t, Int16)
+            TP_HISTC_CASE(int8_t, Int8)
+            TP_HISTC_CASE(uint8_t, UInt8)
+            TP_HISTC_CASE(uint16_t, UInt16)
+            TP_HISTC_CASE(uint32_t, UInt32)
+            TP_HISTC_CASE(uint64_t, UInt64)
+            default:
+                TP_THROW(NotImplementedError,
+                         "histc(): unsupported dtype '" +
+                             std::string(toString(self.dtype())) + "'");
+        }
+#undef TP_HISTC_CASE
+        const cudaError_t hist_err = cudaGetLastError();
+        if (hist_err != cudaSuccess) {
+            TP_THROW(RuntimeError,
+                     std::string("CUDA Error: ") + cudaGetErrorString(hist_err));
+        }
+    }
+    return counts.to(self.dtype());
+}
+
+
+Tensor& interop_histc_out_cuda(const Tensor& self, int64_t bins, const Scalar& min,
+                               const Scalar& max, Tensor& out) {
+    if (out.dtype() != self.dtype()) {
+        TP_THROW(TypeError,
+                 "histc(): out tensor must have the same dtype as the input");
+    }
+    if (out.device() != self.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "histc(): out tensor must be on the same device as the input");
+    }
+    Tensor r = interop_histc_cuda(self, bins, min, max);
+    out.resize_(static_cast<std::vector<int64_t>>(r.shape()));
+    out.copy_(r);
+    return out;
+}
+
+} // namespace
+
+TENSORPLAY_LIBRARY_IMPL(CUDA, SummaryOpsHistc) {
+    // histogram / diagonal index builders
+    m.impl("histc", interop_histc_cuda);
+    m.impl("histc.out", interop_histc_out_cuda);
 }
 
 } // namespace cuda

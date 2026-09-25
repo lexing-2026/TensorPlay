@@ -20,6 +20,7 @@
 #include <numeric>
 #include <string>
 #include <vector>
+#include "CudaDispatchHelpers.cuh"
 
 namespace tensorplay {
 namespace cuda {
@@ -1490,6 +1491,25 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, LinalgKernels) {
     m.impl("linalg_householder_product", linalg_householder_product_kernel_cuda);
     m.impl("linalg_householder_product.out", linalg_householder_product_out_kernel_cuda);
     m.impl("linalg_diagonal", linalg_diagonal_kernel_cuda);
+}
+
+namespace {
+
+
+// ---------------------------------------------------------------------------
+// _cholesky_solve_helper: the dispatch-level spelling of cholesky_solve.
+// ---------------------------------------------------------------------------
+
+Tensor interop__cholesky_solve_helper_cuda(const Tensor& self, const Tensor& A,
+                                           bool upper) {
+    return dispatch_cuda<Tensor>("cholesky_solve", self, A, upper);
+}
+
+} // namespace
+
+TENSORPLAY_LIBRARY_IMPL(CUDA, LinalgInterop) {
+    // linear algebra helper spellings
+    m.impl("_cholesky_solve_helper", interop__cholesky_solve_helper_cuda);
 }
 
 }  // namespace cuda
