@@ -2714,6 +2714,11 @@ static Tensor empty_channels_last3d(const std::vector<int64_t>& sizes, DType dt,
     return out.as_strided(sizes, get_channels_last_strides(sizes), 0);
 }
 
+static Tensor zeros_channels_last3d(const std::vector<int64_t>& sizes, DType dt, const Device& dev) {
+    Tensor out = Tensor::zeros(sizes, dt, dev);
+    return out.as_strided(sizes, get_channels_last_strides(sizes), 0);
+}
+
 static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg, const Tensor& bias, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups, bool fused_relu) {
     const bool use_cl = conv2d_use_channels_last(input_arg, weight_arg);
     Tensor input = contiguous_in(input_arg, use_cl);
@@ -4494,6 +4499,260 @@ Tensor conv1d_grad_bias_cpu(const Tensor& grad_output, const Tensor& input, cons
 }
 
 // Conv3d Backward
+#ifdef USE_ONEDNN
+// oneDNN backward-data for conv3d.  Activations and gradients may arrive in
+// either row-major or channels-last (NDHWC) storage; each user-memory
+// descriptor is derived from the buffer it binds, and the blocked layout the
+// primitive picks is bridged with reorders.
+static bool conv3d_grad_input_onednn(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                                     const std::vector<int64_t>& stride,
+                                     int64_t pD, int64_t pH, int64_t pW,
+                                     const std::vector<int64_t>& dilation, int64_t groups,
+                                     Tensor& grad_input) {
+    if (!OneDNNContext::is_enabled()) return false;
+    if (input.dtype() != DType::Float32) return false;
+    if (std::getenv("TP_DISABLE_ONEDNN_CONV3D")) return false;
+
+    // Bind each operand as-is when its storage is one of the supported user
+    // layouts; anything else is materialized row-major first.
+    auto bindable = [](const Tensor& t) {
+        return (t.is_contiguous() || t.is_contiguous(MemoryFormat::ChannelsLast3d))
+                   ? t : detail::contiguous_clone(t);
+    };
+    Tensor grad_output_c = bindable(grad_output);
+    Tensor input_c = bindable(input);
+    Tensor weight_c = weight.is_contiguous() ? weight : detail::contiguous_clone(weight);
+
+    try {
+        auto& eng = OneDNNContext::get_engine();
+        auto& s = OneDNNContext::get_stream();
+
+        memory::dims src_dims = {input_c.size(0), input_c.size(1), input_c.size(2), input_c.size(3), input_c.size(4)};
+        memory::dims dst_dims = {grad_output_c.size(0), grad_output_c.size(1), grad_output_c.size(2), grad_output_c.size(3), grad_output_c.size(4)};
+        memory::dims weights_dims;
+        if (groups > 1) {
+            weights_dims = {groups, weight_c.size(0) / groups, weight_c.size(1), weight_c.size(2), weight_c.size(3), weight_c.size(4)};
+        } else {
+            weights_dims = {weight_c.size(0), weight_c.size(1), weight_c.size(2), weight_c.size(3), weight_c.size(4)};
+        }
+
+        memory::dims strides_dims = {stride[0], stride[1], stride[2]};
+        memory::dims padding_l_dims = {pD, pH, pW};
+        memory::dims padding_r_dims = {pD, pH, pW};
+        memory::dims dilates_dims = {dilation[0] - 1, dilation[1] - 1, dilation[2] - 1};
+
+        auto src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::any);
+        auto dst_md = memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::any);
+        auto weights_md = memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::any);
+
+        auto fwd_pd = convolution_forward::primitive_desc(
+            eng, prop_kind::forward_inference, algorithm::convolution_auto,
+            src_md, weights_md, memory::desc(), dst_md,
+            strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
+        auto bwd_d_pd = convolution_backward_data::primitive_desc(
+            eng, algorithm::convolution_auto,
+            src_md, weights_md, dst_md,
+            strides_dims, dilates_dims, padding_l_dims, padding_r_dims,
+            fwd_pd);
+        convolution_backward_data bwd_d(bwd_d_pd);
+
+        auto expected_diff_src_md = bwd_d_pd.diff_src_desc();
+        auto expected_weights_md = bwd_d_pd.weights_desc();
+        auto expected_diff_dst_md = bwd_d_pd.diff_dst_desc();
+
+        // Diff Dst (grad_output)
+        memory diff_dst_mem;
+        {
+            auto user_md = grad_output_c.is_contiguous(MemoryFormat::ChannelsLast3d)
+                ? memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::ndhwc)
+                : memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::ncdhw);
+            auto user_mem = memory(user_md, eng, grad_output_c.data_ptr<float>());
+            if (user_md != expected_diff_dst_md) {
+                diff_dst_mem = memory(expected_diff_dst_md, eng);
+                reorder(user_mem, diff_dst_mem).execute(s, user_mem, diff_dst_mem);
+            } else {
+                diff_dst_mem = user_mem;
+            }
+        }
+
+        // Weights
+        memory weights_mem;
+        {
+            memory::desc user_md = weight_c.is_contiguous(MemoryFormat::ChannelsLast3d)
+                ? memory::desc(weights_dims, memory::data_type::f32,
+                               groups > 1 ? memory::format_tag::godhwi : memory::format_tag::odhwi)
+                : memory::desc(weights_dims, memory::data_type::f32,
+                               groups > 1 ? memory::format_tag::goidhw : memory::format_tag::oidhw);
+            auto user_mem = memory(user_md, eng, weight_c.data_ptr<float>());
+            if (user_md != expected_weights_md) {
+                weights_mem = memory(expected_weights_md, eng);
+                reorder(user_mem, weights_mem).execute(s, user_mem, weights_mem);
+            } else {
+                weights_mem = user_mem;
+            }
+        }
+
+        // Diff Src (grad_input)
+        memory diff_src_mem;
+        auto user_diff_src_md = grad_input.is_contiguous(MemoryFormat::ChannelsLast3d)
+            ? memory::desc(src_dims, memory::data_type::f32, memory::format_tag::ndhwc)
+            : memory::desc(src_dims, memory::data_type::f32, memory::format_tag::ncdhw);
+        bool need_reorder_diff_src = (expected_diff_src_md != user_diff_src_md);
+        Storage blocked_storage_handle;
+        if (need_reorder_diff_src) {
+            blocked_storage_handle = Storage(expected_diff_src_md.get_size(),
+                                             getAllocator(grad_input.device().type()));
+            diff_src_mem = memory(expected_diff_src_md, eng, blocked_storage_handle.data());
+        } else {
+            diff_src_mem = memory(expected_diff_src_md, eng, grad_input.data_ptr<float>());
+        }
+
+        std::unordered_map<int, memory> bwd_d_args = {
+            {DNNL_ARG_DIFF_DST, diff_dst_mem},
+            {DNNL_ARG_WEIGHTS, weights_mem},
+            {DNNL_ARG_DIFF_SRC, diff_src_mem}
+        };
+        if (bwd_d_pd.scratchpad_desc().get_size() > 0) {
+            bwd_d_args.insert({DNNL_ARG_SCRATCHPAD, memory(bwd_d_pd.scratchpad_desc(), eng)});
+        }
+        bwd_d.execute(s, bwd_d_args);
+
+        if (need_reorder_diff_src) {
+            auto user_mem = memory(user_diff_src_md, eng, grad_input.data_ptr<float>());
+            reorder(diff_src_mem, user_mem).execute(s, diff_src_mem, user_mem);
+        }
+        s.wait();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// oneDNN backward-weights for conv3d.  The diff-weights user descriptor
+// follows the grad buffer's layout, so a channels-last weight gradient is
+// produced in place without a trailing conversion.
+static bool conv3d_grad_weight_onednn(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                                      const std::vector<int64_t>& stride,
+                                      int64_t pD, int64_t pH, int64_t pW,
+                                      const std::vector<int64_t>& dilation, int64_t groups,
+                                      Tensor& grad_weight) {
+    if (!OneDNNContext::is_enabled()) return false;
+    if (input.dtype() != DType::Float32) return false;
+    if (std::getenv("TP_DISABLE_ONEDNN_CONV3D")) return false;
+
+    auto bindable = [](const Tensor& t) {
+        return (t.is_contiguous() || t.is_contiguous(MemoryFormat::ChannelsLast3d))
+                   ? t : detail::contiguous_clone(t);
+    };
+    Tensor grad_output_c = bindable(grad_output);
+    Tensor input_c = bindable(input);
+
+    try {
+        auto& eng = OneDNNContext::get_engine();
+        auto& s = OneDNNContext::get_stream();
+
+        memory::dims src_dims = {input_c.size(0), input_c.size(1), input_c.size(2), input_c.size(3), input_c.size(4)};
+        memory::dims dst_dims = {grad_output_c.size(0), grad_output_c.size(1), grad_output_c.size(2), grad_output_c.size(3), grad_output_c.size(4)};
+        memory::dims weights_dims;
+        if (groups > 1) {
+            weights_dims = {groups, weight.size(0) / groups, weight.size(1), weight.size(2), weight.size(3), weight.size(4)};
+        } else {
+            weights_dims = {weight.size(0), weight.size(1), weight.size(2), weight.size(3), weight.size(4)};
+        }
+
+        memory::dims strides_dims = {stride[0], stride[1], stride[2]};
+        memory::dims padding_l_dims = {pD, pH, pW};
+        memory::dims padding_r_dims = {pD, pH, pW};
+        memory::dims dilates_dims = {dilation[0] - 1, dilation[1] - 1, dilation[2] - 1};
+
+        auto src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::any);
+        auto dst_md = memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::any);
+        auto weights_md = memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::any);
+
+        auto fwd_pd = convolution_forward::primitive_desc(
+            eng, prop_kind::forward_inference, algorithm::convolution_auto,
+            src_md, weights_md, memory::desc(), dst_md,
+            strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
+        auto bwd_w_pd = convolution_backward_weights::primitive_desc(
+            eng, algorithm::convolution_auto,
+            src_md, weights_md, memory::desc(), dst_md,
+            strides_dims, dilates_dims, padding_l_dims, padding_r_dims,
+            fwd_pd);
+        convolution_backward_weights bwd_w(bwd_w_pd);
+
+        auto expected_src_md = bwd_w_pd.src_desc();
+        auto expected_diff_dst_md = bwd_w_pd.diff_dst_desc();
+        auto expected_diff_weights_md = bwd_w_pd.diff_weights_desc();
+
+        // Src (input)
+        memory src_mem;
+        {
+            auto user_md = input_c.is_contiguous(MemoryFormat::ChannelsLast3d)
+                ? memory::desc(src_dims, memory::data_type::f32, memory::format_tag::ndhwc)
+                : memory::desc(src_dims, memory::data_type::f32, memory::format_tag::ncdhw);
+            auto user_mem = memory(user_md, eng, input_c.data_ptr<float>());
+            if (user_md != expected_src_md) {
+                src_mem = memory(expected_src_md, eng);
+                reorder(user_mem, src_mem).execute(s, user_mem, src_mem);
+            } else {
+                src_mem = user_mem;
+            }
+        }
+
+        // Diff Dst (grad_output)
+        memory diff_dst_mem;
+        {
+            auto user_md = grad_output_c.is_contiguous(MemoryFormat::ChannelsLast3d)
+                ? memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::ndhwc)
+                : memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::ncdhw);
+            auto user_mem = memory(user_md, eng, grad_output_c.data_ptr<float>());
+            if (user_md != expected_diff_dst_md) {
+                diff_dst_mem = memory(expected_diff_dst_md, eng);
+                reorder(user_mem, diff_dst_mem).execute(s, user_mem, diff_dst_mem);
+            } else {
+                diff_dst_mem = user_mem;
+            }
+        }
+
+        // Diff Weights (grad_weight)
+        memory diff_weights_mem;
+        memory::desc user_diff_weights_md = grad_weight.is_contiguous(MemoryFormat::ChannelsLast3d)
+            ? memory::desc(weights_dims, memory::data_type::f32,
+                           groups > 1 ? memory::format_tag::godhwi : memory::format_tag::odhwi)
+            : memory::desc(weights_dims, memory::data_type::f32,
+                           groups > 1 ? memory::format_tag::goidhw : memory::format_tag::oidhw);
+        bool need_reorder_diff_weights = (expected_diff_weights_md != user_diff_weights_md);
+        Storage blocked_storage_handle;
+        if (need_reorder_diff_weights) {
+            blocked_storage_handle = Storage(expected_diff_weights_md.get_size(),
+                                             getAllocator(grad_weight.device().type()));
+            diff_weights_mem = memory(expected_diff_weights_md, eng, blocked_storage_handle.data());
+        } else {
+            diff_weights_mem = memory(expected_diff_weights_md, eng, grad_weight.data_ptr<float>());
+        }
+
+        std::unordered_map<int, memory> bwd_w_args = {
+            {DNNL_ARG_SRC, src_mem},
+            {DNNL_ARG_DIFF_DST, diff_dst_mem},
+            {DNNL_ARG_DIFF_WEIGHTS, diff_weights_mem}
+        };
+        if (bwd_w_pd.scratchpad_desc().get_size() > 0) {
+            bwd_w_args.insert({DNNL_ARG_SCRATCHPAD, memory(bwd_w_pd.scratchpad_desc(), eng)});
+        }
+        bwd_w.execute(s, bwd_w_args);
+
+        if (need_reorder_diff_weights) {
+            auto user_mem = memory(user_diff_weights_md, eng, grad_weight.data_ptr<float>());
+            reorder(diff_weights_mem, user_mem).execute(s, diff_weights_mem, user_mem);
+        }
+        s.wait();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+#endif // USE_ONEDNN
+
 Tensor conv3d_grad_input_cpu(const Tensor& grad_output, const Tensor& input, const Tensor& weight, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups) {
     if (conv_is_low_precision(grad_output.dtype())) {
         return conv3d_grad_input_cpu(grad_output.to(DType::Float32), input.to(DType::Float32),
@@ -4530,16 +4789,36 @@ Tensor conv3d_grad_input_cpu(const Tensor& grad_output, const Tensor& input, con
     int64_t H_out = grad_output.size(3);
     int64_t W_out = grad_output.size(4);
     
-    Tensor grad_input = Tensor::zeros({N, C_in, D_in, H_in, W_in}, input.dtype(), input.device());
-    
+    // Grad buffers follow the activation layout the forward chain produced,
+    // so the gradient keeps flowing without a repack at this boundary.
+    const bool use_cl3d = conv3d_use_channels_last3d(input, weight);
+    Tensor grad_input = use_cl3d
+        ? zeros_channels_last3d({N, C_in, D_in, H_in, W_in}, input.dtype(), input.device())
+        : Tensor::zeros({N, C_in, D_in, H_in, W_in}, input.dtype(), input.device());
+
+    Tensor grad_output_contig = contiguous_in3d(grad_output, use_cl3d);
+
+#ifdef USE_ONEDNN
+    if (conv3d_grad_input_onednn(grad_output_contig, input, weight, stride, pD, pH, pW, dilation, groups, grad_input)) {
+        return grad_input;
+    }
+#endif
+
     if (input.dtype() == DType::Float32) {
         int64_t C_out_group = C_out / groups;
         int64_t col_size = C_in_group * kD * kH * kW;
         int64_t out_spatial = D_out * H_out * W_out;
-        
-        Tensor grad_output_contig = grad_output.contiguous();
+
+        // The col2im fallback addresses the grad buffer as row-major.
+        if (!grad_output_contig.is_contiguous()) {
+            grad_output_contig = grad_output_contig.contiguous();
+        }
+        if (!grad_input.is_contiguous()) {
+            grad_input = Tensor::zeros({N, C_in, D_in, H_in, W_in}, input.dtype(), input.device());
+        }
+        Tensor weight_nchw = weight.is_contiguous() ? weight : weight.contiguous();
         const float* grad_out_ptr = grad_output_contig.data_ptr<float>();
-        const float* w_ptr = weight.data_ptr<float>();
+        const float* w_ptr = weight_nchw.data_ptr<float>();
         
         // Buffer for col result
         std::vector<float> grad_col_vec(col_size * out_spatial);
@@ -4583,8 +4862,11 @@ Tensor conv3d_grad_weight_cpu(const Tensor& grad_output, const Tensor& input, co
         auto dilation = expand_param(dilation_arg, 3, "dilation");
         return slow_conv3d_grad_weight(grad_output, input, weight, stride, padding, dilation, groups);
     }
-    Tensor grad_output_contig = grad_output.contiguous();
-    Tensor input_contig = input.contiguous();
+    // Feed the backward kernels in the activation layout the forward chain
+    // produced; already-matching buffers pass through without a copy.
+    const bool use_cl3d = conv3d_use_channels_last3d(input, weight);
+    Tensor grad_output_contig = contiguous_in3d(grad_output, use_cl3d);
+    Tensor input_contig = contiguous_in3d(input, use_cl3d);
     
     int64_t N = input_contig.size(0);
     int64_t C_in = input_contig.size(1);
@@ -4610,13 +4892,33 @@ Tensor conv3d_grad_weight_cpu(const Tensor& grad_output, const Tensor& input, co
     int64_t H_out = grad_output_contig.size(3);
     int64_t W_out = grad_output_contig.size(4);
     
-    Tensor grad_weight = Tensor::zeros(static_cast<std::vector<int64_t>>(weight.shape()), weight.dtype(), weight.device());
-    
+    // The grad buffer follows the activation layout so parameter grads land
+    // in the same layout the forward chain keeps its weights in.
+    Tensor grad_weight = use_cl3d
+        ? zeros_channels_last3d(static_cast<std::vector<int64_t>>(weight.shape()), weight.dtype(), weight.device())
+        : Tensor::zeros(static_cast<std::vector<int64_t>>(weight.shape()), weight.dtype(), weight.device());
+
+#ifdef USE_ONEDNN
+    if (conv3d_grad_weight_onednn(grad_output_contig, input_contig, weight, stride, pD, pH, pW, dilation, groups, grad_weight)) {
+        return grad_weight;
+    }
+#endif
+
     if (input_contig.dtype() == DType::Float32) {
         int64_t C_out_group = C_out / groups;
         int64_t col_size = C_in_group * kD * kH * kW;
         int64_t out_spatial = D_out * H_out * W_out;
-        
+
+        // The im2col fallback addresses the activation buffers as row-major.
+        if (!grad_output_contig.is_contiguous()) {
+            grad_output_contig = grad_output_contig.contiguous();
+        }
+        if (!input_contig.is_contiguous()) {
+            input_contig = input_contig.contiguous();
+        }
+        if (!grad_weight.is_contiguous()) {
+            grad_weight = Tensor::zeros(static_cast<std::vector<int64_t>>(weight.shape()), weight.dtype(), weight.device());
+        }
         float* grad_weight_ptr = grad_weight.data_ptr<float>();
         
         // Buffer
@@ -4645,7 +4947,12 @@ Tensor conv3d_grad_weight_cpu(const Tensor& grad_output, const Tensor& input, co
     } else {
         TP_THROW(NotImplementedError, "conv3d_grad_weight only supports Float32");
     }
-    
+
+    // No layout-aware path claimed the call; hand the parameter grad back in
+    // the layout the forward chain keeps its weights in.
+    if (use_cl3d && !grad_weight.is_contiguous(MemoryFormat::ChannelsLast3d)) {
+        return contiguous_in3d(grad_weight, true);
+    }
     return grad_weight;
 }
 
