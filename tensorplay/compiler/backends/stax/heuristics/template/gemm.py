@@ -24,6 +24,7 @@ from ...templates.mm import (
 )
 from ...templates.triton import CHOICES, dtype_size
 from ...codegen.triton_gemm import _matmul_allow_tf32
+from ...utils import get_num_sms
 from ..registry import register_template_heuristic
 from .base import TemplateConfigHeuristics
 
@@ -45,9 +46,6 @@ class GemmMaxAutotuneTemplateConfigHeuristics(TemplateConfigHeuristics):
 
 
 @register_template_heuristic(GEMM.uid, "cuda")
-@register_template_heuristic(GEMM_PERSISTENT.uid, "cuda")
-@register_template_heuristic(GEMM_PERSISTENT_TMA.uid, "cuda")
-@register_template_heuristic(BLACKWELL_WS_PERSISTENT_TMA.uid, "cuda")
 class CudaGemmTemplateConfigHeuristics(GemmMaxAutotuneTemplateConfigHeuristics):
     """The tilings a discrete accelerator is measured with, for a product.
 
@@ -77,6 +75,13 @@ class CudaGemmTemplateConfigHeuristics(GemmMaxAutotuneTemplateConfigHeuristics):
             return "tl.float32"
         return f"tl.{name}"
 
+    #: How many tiles of one axis are walked before moving along the other.
+    #: The tiles are reordered so that the ones sharing an input tile are
+    #: launched together, which is what keeps that input in the cache while it
+    #: is used; how many is worth this is a property of the device, so it is
+    #: set here rather than inside the body, which would then have to know it.
+    group_m: int = 8
+
     def _get_template_configs_impl(self, kernel_inputs, op_name):
         rows, cols, inner = kernel_inputs.mnk_symbolic()
         for config in CHOICES.get_mm_configs(kernel_inputs.device_type)(
@@ -100,7 +105,32 @@ class CudaGemmTemplateConfigHeuristics(GemmMaxAutotuneTemplateConfigHeuristics):
                 # arrives with the configuration instead of being read inside
                 # the loop where it would be the same answer every time.
                 "USE_FAST_ACCUM": True,
+                "GROUP_M": self.group_m,
             }
+
+
+@register_template_heuristic(GEMM_PERSISTENT.uid, "cuda")
+@register_template_heuristic(GEMM_PERSISTENT_TMA.uid, "cuda")
+@register_template_heuristic(BLACKWELL_WS_PERSISTENT_TMA.uid, "cuda")
+class CudaPersistentGemmTemplateConfigHeuristics(
+    CudaGemmTemplateConfigHeuristics
+):
+    """The tilings a discrete accelerator is measured with, for a product
+    whose programs stay resident.
+
+    The tilings are the same as for the ordinary product; what differs is how
+    many programs there are.  A kernel that keeps a fixed number resident
+    launches as many as the device can hold at once and gives each a share of
+    the tiles, so the count is part of what is being chosen rather than a
+    detail of the launch -- and it is a property of the device, not of the
+    call, so it arrives with the configuration.
+    """
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        for template_kwargs in super()._get_template_configs_impl(
+            kernel_inputs, op_name
+        ):
+            yield {**template_kwargs, "NUM_SMS": get_num_sms()}
 
 
 @register_template_heuristic(mm_contiguous_subgraph_template.uid, None, op_name="mm")

@@ -243,6 +243,12 @@ def tma_gemm_launch(
             *(int(v) for v in a.stride()),
             *(int(v) for v in b.stride()), 1,
             *(int(v) for v in out.stride()),
+            NUM_SMS=int(num_sms), GROUP_M=int(group_m),
+            BLOCK_M=int(block_m), BLOCK_N=int(block_n), BLOCK_K=int(block_k),
+            A_ROW_MAJOR=bool(a_row_major), B_ROW_MAJOR=bool(b_row_major),
+            HAS_WORKSPACE=bool(has_workspace), ALLOW_TF32=bool(allow_tf32),
+            FAST_ACCUM=bool(fast_accum), TMA_SIZE=int(TMA_SIZE),
+            MAPPING_BASE=int(mapping_base), INDEX_DTYPE=tl.int64,
             num_warps=num_warps, num_stages=num_stages,
         )
         return out

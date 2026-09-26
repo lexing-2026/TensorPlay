@@ -387,6 +387,8 @@ def scaled_gemm_launch(
         }
         kernel[grid](
             *args, *extents, *strides,
+            **{name: values[name] for name in _SITES[site][3]},
+            INDEX_DTYPE=tl.int64,
             num_warps=int(config["num_warps"]), num_stages=int(config["num_stages"]),
         )
         return out

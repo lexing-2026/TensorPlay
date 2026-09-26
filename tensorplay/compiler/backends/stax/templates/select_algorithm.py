@@ -281,6 +281,27 @@ class ExternKernelCaller(ChoiceCaller):
         self.gm = choice.gm
         self._callable = choice.to_callable()
 
+    def benchmark(self, *args: Any, out: Any = None) -> float:
+        """How long one run of the operation takes.
+
+        Where the operation writes into a buffer the caller supplied, that
+        buffer is named rather than appended: the operation's own signature
+        says which of its arguments it is, and appending it would be a
+        statement about the order rather than the name.  An operation that
+        returns its result is simply called.
+        """
+
+        from ..runtime.stax_autotune import bench_launch
+
+        algo = self.to_callable()
+        if self.has_out_variant and out is not None:
+            def launch(_operands, _algo=algo, _args=args, _out=out):
+                return _algo(*_args, out=_out)
+        else:
+            def launch(_operands, _algo=algo, _args=args):
+                return _algo(*_args)
+        return bench_launch(launch, [])
+
     def __str__(self) -> str:
         return f"ExternKernelCaller({self.choice.call_name()})"
 
@@ -290,7 +311,7 @@ class ExternKernelCaller(ChoiceCaller):
         return self.choice.call_name()
 
     def to_callable(self):
-        return self._callable
+        return self.choice.to_callable()
 
     def hash_key(self) -> str:
         """What identifies this call: the operation, and the arguments beside it.
@@ -428,6 +449,19 @@ class ExternKernelChoice:
         return cls._registry.get(name)
 
     def to_callable(self) -> Callable[..., Any]:
+        """The operation as it is run when the result goes somewhere named.
+
+        The name under which the operation is registered is the function a
+        caller would reach for, which for an operation that can write into a
+        buffer the caller supplied is not the same as the form of it that
+        takes that buffer: the first returns its result and the second is
+        handed where to put it.  A measurement hands it a buffer, so what it is
+        given is the form that takes one -- and an operation with no such form
+        is the function itself.
+        """
+
+        if self.op_overload is not None:
+            return self.op_overload
         return getattr(extern_kernels, self.name)
 
     def call_name(self) -> str:
@@ -523,10 +557,18 @@ class TritonChoiceCaller(ChoiceCaller):
     """
 
     def __init__(self, name, input_nodes=(), layout=None, description="",
-                 source: str = "", src_hash: str | None = None):
+                 source: str = "", src_hash: str | None = None,
+                 launcher_args: tuple | None = None):
         super().__init__(name, input_nodes, layout, description)
         self.source = source
         self._src_hash = src_hash
+        #: What a launcher written from this kernel is handed, in the order it
+        #: declares: the operands of the call, then the extents and strides the
+        #: kernel was written to be given, then the stream.  A measurement is
+        #: handed the operands and has to say the rest, and it can only say the
+        #: rest if the caller settled it when the launcher was written -- which
+        #: is the one place that knows the signature.
+        self.launcher_args = launcher_args
 
     def hash_key(self) -> str:
         parts = [self.name, self.description]
@@ -538,6 +580,28 @@ class TritonChoiceCaller(ChoiceCaller):
         if digest is not None:
             parts.append(digest)
         return ":".join(parts)
+
+    def benchmark(self, *args: Any, out: Any = None) -> float:
+        """How long one run of this choice takes.
+
+        A measurement is handed the operands of the call and nothing else: the
+        extents and strides the kernel was written to be given, and the stream
+        it is launched on, are settled when the launcher is written, and are
+        carried alongside it.  What is measured is therefore a launch made the
+        way a real one is made.
+        """
+
+        from ..runtime.stax_autotune import bench_launch
+
+        algo = self.to_callable()
+        # The result is written into a buffer the caller named, and in the
+        # signature that buffer is among the pointers -- so it goes with the
+        # operands rather than at the end.  What follows the operands is what
+        # the kernel was written to be given and the stream it runs on, in the
+        # order it declares them.
+        operands = [*args, *([out] if out is not None else []),
+                    *(self.launcher_args or ())]
+        return bench_launch(algo, operands)
 
     def autoheuristic_id(self) -> str:
         return "triton_template"
@@ -615,8 +679,17 @@ class TritonTemplateKernel:
         return f"TritonTemplateKernel({self.kernel_name})"
 
 
-def _compile_rendered(template, source: str, num_warps: int, num_stages: int):
-    """The rendered text, compiled, or nothing when it will not compile.
+def _compile_rendered(template, source: str, config: dict, constants: dict,
+                      inductor_meta: dict):
+    """The rendered text, compiled the way a configuration is compiled.
+
+    Two things are handed to the runtime: the signature, which is the name and
+    type of every argument, and the constants, which are the values of the
+    arguments that are not read because they were fixed before the kernel ran.
+    The signature is worked out from the operands the kernel was written
+    against -- a pointer's type is the operand's type, an extent's type is
+    however wide it has to be -- and anything the kernel declares as a constant
+    goes among the constants rather than among the types.
 
     A configuration that will not compile is a configuration that cannot be
     measured rather than a failure of the whole table: the other candidates are
@@ -625,22 +698,187 @@ def _compile_rendered(template, source: str, num_warps: int, num_stages: int):
     """
 
     from ..codegen.triton_conv import _build
+    from ..runtime.hints import DeviceProperties
+    from ..runtime.triton_compat import Config
+    from ..runtime.triton_heuristics import CachingAutotuner
 
     try:
         fn = _build(
             source, f"<tensorplay-stax-{template.name}>", template.symbol
         )
-        compiled = fn.warmup(
-            *[None] * len(fn.arg_names),
-            grid=(1,),
-            num_warps=num_warps,
-            num_stages=num_stages,
+        # What the kernel takes is what its own signature says.  A value
+        # chosen when the text was written is an argument the compiler folds,
+        # so it is in the signature as a constant and its value is among the
+        # constants -- the two halves of saying the same thing.
+        signature = _signature_of(fn.arg_names, template.operands)
+        # A constant is a value, not a spelling of one.  Several of the values
+        # a configuration carries are named in the language the kernel is
+        # written in -- the index type, the type a sum is accumulated in -- and
+        # the compiler wants the thing itself rather than the name of it.
+        all_constants = {
+            name: _language_type(value) if _is_language_name(value) else value
+            for name, value in constants.items()
+        }
+        all_constants.setdefault("INDEX_DTYPE", _language_type(template.index_dtype))
+        triton_meta = {
+            "device": DeviceProperties.create(inductor_meta["device"]),
+            "signature": signature,
+            "constants": {
+                name: value
+                for name, value in all_constants.items()
+                if name in signature
+            },
+        }
+        tuner = CachingAutotuner(
+            fn,
+            triton_meta,
+            [
+                Config(
+                    {
+                        k: v
+                        for k, v in config.items()
+                        if k not in signature
+                    },
+                    num_warps=int(config.get("num_warps", 4)),
+                    num_stages=int(config.get("num_stages", 2)),
+                )
+            ],
+            save_cache_hook=None,
+            mutated_arg_names=[],
+            optimize_mem=False,
+            heuristic_type=None,
+            inductor_meta=inductor_meta,
         )
-        compiled._init_handles()
+        return tuner._precompile_config(tuner.configs[0])
     except Exception:
-        log.info("Could not compile %s at this configuration", template.name)
+        log.info(
+            "could not compile %s at this configuration",
+            template.name, exc_info=True,
+        )
         return None
-    return compiled
+
+
+def _launcher_tail(layout, input_nodes, arg_names) -> tuple:
+    """What a launcher is handed after the operands, in the signature's order.
+
+    The signature names the extents and the strides, and the order it names
+    them in is the order they are given in -- the launcher has no way to work
+    that out for itself, since it is a call written before the values were
+    known.  So the values are lined up here against the names, and the stream
+    the launch runs on is the last of them.
+    """
+
+    import tensorplay as tp
+
+    sizes: list = []
+    strides: list = []
+    for node in input_nodes:
+        if hasattr(node, "get_size"):
+            sizes += [int(v) for v in node.get_size()]
+        if hasattr(node, "get_stride"):
+            strides += [int(v) for v in node.get_stride()]
+    if layout is not None:
+        sizes += [int(v) for v in layout.size]
+        strides += [int(v) for v in layout.stride]
+
+    tail: list = []
+    for name in arg_names:
+        if name.startswith("size_"):
+            tail.append(sizes[len([n for n in arg_names[:arg_names.index(name)]
+                                    if n.startswith("size_")])])
+        elif name.startswith("stride_"):
+            tail.append(strides[len([n for n in arg_names[:arg_names.index(name)]
+                                     if n.startswith("stride_")])])
+    stream = None
+    device = getattr(layout, "device", None)
+    if device is not None and getattr(device, "type", "cpu") != "cpu":
+        try:
+            stream = tp.cuda.current_stream(device).cuda_stream
+        except Exception:
+            stream = None
+    tail.append(stream)
+    return tuple(tail)
+
+
+def _cdiv(a, b):
+    """The number of whole steps of ``b`` that cover ``a``."""
+
+    return -(-a // b)
+
+
+def _call_sizes(layout, input_nodes, constexprs):
+    """The extents a grid is a function of, in the order it declares them.
+
+    A grid is a function of what is being computed, so the extents come from
+    the result's layout and from the operands' -- and the tile comes from the
+    configuration, which the caller passes alongside.
+    """
+
+    sizes: list = []
+    for index in (0, 1):
+        node = input_nodes[index] if len(input_nodes) > index else None
+        sizes.append(
+            int(node.get_size()[0])
+            if node is not None and hasattr(node, "get_size")
+            else int(layout.size[0])
+        )
+    return tuple(sizes)
+
+
+def _is_language_name(value) -> bool:
+    """Whether this value is written as a name in the kernel-writing language.
+
+    A type the body is told about -- the width an index is narrowed to, the
+    type a sum is accumulated in -- travels through the configuration as the
+    name the body knows it by, because that is the only spelling a template
+    can carry.  The compiler wants the type itself, so such a name is
+    recognised here rather than by every value being looked up.
+    """
+
+    return isinstance(value, str) and value.startswith("tl.")
+
+
+def _language_type(name: str):
+    """A type as the kernel-writing language spells it, not as text.
+
+    A constant handed to the compiler is a value, not a spelling of one: the
+    text "tl.int64" is a name to look up, and the type it names is what a
+    kernel narrows an index to.
+    """
+
+    from ..runtime.triton_compat import tl
+
+    return getattr(tl, str(name).split(".")[-1], None)
+
+
+def _signature_of(arg_names, operands: dict) -> dict:
+    """What the runtime is told about each argument of a rendered kernel.
+
+    An argument is one of three things, and the three are said differently: a
+    pointer says the type of what it points at, an extent or a stride says how
+    wide it has to be to hold any value the computation can produce, and a
+    constant says nothing at all -- its value is among the constants, and its
+    type is that it is not read.
+    """
+
+    from ..utils import _type_of
+
+    signature: dict = {}
+    for name in arg_names:
+        if name.endswith("_ptr"):
+            operand = name[:-4]
+            dtype = (operands.get(operand) or {}).get("dtype")
+            # An operand whose type is not known is said as a byte pointer
+            # rather than guessed at: the type decides how the kernel reads
+            # what it points at, and a wrong one is a wrong answer rather than
+            # a refused compile.
+            resolved = getattr(tp, dtype, None) if dtype else None
+            signature[name] = _type_of(resolved) if resolved is not None else "*i8"
+        elif name.startswith(("size_", "stride_")):
+            signature[name] = "i64"
+        else:
+            signature[name] = "constexpr"
+    return signature
 
 
 class TritonTemplate(KernelTemplate):
@@ -770,6 +1008,14 @@ class TritonTemplate(KernelTemplate):
         )
         self.prologue_loads_all_inputs = prologue_loads_all_inputs
         self.always_freeze_layout = always_freeze_layout
+        #: The operands the last rendering was written against, by name, with
+        #: the geometry and the type of each.  Filled in when a rendering
+        #: happens and read when that rendering is compiled.
+        self.operands: dict = {}
+        #: The width an index is narrowed to, as the language spells it.  It is
+        #: a property of the launch rather than of the text, and the compiled
+        #: form has to be given it as well as the text.
+        self.index_dtype: str = "tl.int64"
         existing = self.all_templates.get(name)
         if existing is not None and existing.src_hash != self.src_hash:
             raise AssertionError(
@@ -836,7 +1082,22 @@ class TritonTemplate(KernelTemplate):
                 "C": {
                     "shape": tuple(int(s) for s in layout.size),
                     "stride": tuple(int(s) for s in layout.stride),
-                    "dtype": str(dtype_name(layout.dtype)),
+                    # The result's own type, and the type of what it is read
+                    # from: a product reads two operands and writes their type.
+                    "dtype": str(
+                        dtype_name(
+                            layout.dtype
+                            if layout.dtype is not None
+                            else next(
+                                (
+                                    node.get_dtype()
+                                    for node in input_nodes
+                                    if hasattr(node, "get_dtype")
+                                ),
+                                None,
+                            )
+                        )
+                    ),
                 }
             }
             meta.update(kwargs)
@@ -859,6 +1120,10 @@ class TritonTemplate(KernelTemplate):
                 k: v for k, v in kwargs.items()
                 if k not in ("layout", "input_nodes", "out_size")
             }
+            # Kept on the template for the compile that follows: what each
+            # operand is decides the type of the argument the kernel takes for
+            # it, and the operands are settled here rather than asked again.
+            self.operands = {**operands, **outputs}
             rendered = self.render_with(
                 KernelArgs(operands, outputs, constexprs), **meta
             )
@@ -873,50 +1138,62 @@ class TritonTemplate(KernelTemplate):
         # declares, and the stream passed along.  So the launch is written out
         # from the compiled form together with what it was compiled for, and
         # that is what the choice is bound to.
-        from ..runtime.triton_heuristics import (
-            InductorConfig,
-            TritonCompileResult,
-        )
-        from ..runtime.triton_compat import Config
-
-        config_kwargs = {
-            k: v
-            for k, v in kwargs.items()
-            if k not in ("layout", "input_nodes")
-        }
-        num_warps = int(config_kwargs.get("num_warps", 4))
-        num_stages = int(config_kwargs.get("num_stages", 2))
-        compiled = _compile_rendered(
-            self, rendered, num_warps=num_warps, num_stages=num_stages
-        )
-        if compiled is None:
-            return None
-        call_args, def_args, _none = compiled._get_arg_lists(
-            compiled.kernel.src.fn.arg_names,
-            get_constexprs(compiled.kernel.src.fn),
-        )
-        result = TritonCompileResult(
-            kernel=compiled.kernel,
-            config=InductorConfig(
-                {
-                    **config_kwargs,
-                    "num_warps": num_warps,
-                    "num_stages": num_stages,
-                }
-                if not isinstance(config_kwargs, dict)
-                else InductorConfig(config_kwargs).kwargs
-            ),
-            compile_meta={
-                "constants": {"num_warps": num_warps, "num_stages": num_stages},
-                "signature": {},
+        # How many programs to start is a function of the extents being
+        # computed and of the tile they are split into, so it is worked out
+        # here, once, rather than asked of the kernel at every launch.  The
+        # kernel takes operands; how many programs to start is not something an
+        # operand can say.
+        # The configuration as the grid function takes it: the values chosen
+        # for this call, and nothing about the call itself -- a grid is a
+        # function of what is being computed and of the tile it is split into,
+        # and where the result lands is neither.
+        extents = self.grid(
+            *_call_sizes(layout, input_nodes, constexprs),
+            {
+                k: v
+                for k, v in constexprs.items()
+                if k not in ("layout", "input_nodes", "out_size")
             },
+        )
+        result = _compile_rendered(
+            self,
+            rendered,
+            config={
+                k: v for k, v in kwargs.items()
+                if k not in ("layout", "input_nodes", "out_size")
+            },
+            constants=dict(constexprs),
             inductor_meta={
+                "kernel_name": self.uid,
+                "device": layout.device if layout is not None else "cuda",
                 "grid_type": "FixedGrid",
-                "fixed_grid": (1, 1, 1),
+                "fixed_grid": tuple(int(v) for v in extents),
             },
         )
-        launcher = result.make_launcher()
+        if result is None:
+            return None
+        try:
+            # Loading the binary is where a kernel that does not fit the device
+            # says so -- a tile whose working set is larger than the shared
+            # memory there is, or a register count the device cannot hold.  A
+            # configuration that does not fit is one that cannot be measured,
+            # not a failure of the table: the other candidates are still
+            # answers, so it is dropped and the caller moves on.
+            result.kernel._init_handles()
+            launcher = result.make_launcher()
+        except Exception:
+            log.info(
+                "could not load %s at this configuration", self.uid, exc_info=True
+            )
+            return None
         launcher.__name__ = self.uid
+        # What a launcher written from this kernel is handed after the
+        # operands: the extents and strides it declares, in that order, and the
+        # stream it is launched on.  Written once here, where the signature is
+        # known, rather than at each measurement.
+        launcher_args = _launcher_tail(
+                layout, input_nodes, result.kernel.src.fn.arg_names
+            )
         caller = TritonChoiceCaller(
             name=self.uid,
             input_nodes=input_nodes,
@@ -924,6 +1201,7 @@ class TritonTemplate(KernelTemplate):
             description=repr(sorted((k, repr(v)) for k, v in kwargs.items())),
             source=self.source,
             src_hash=self.src_hash,
+            launcher_args=launcher_args,
         )
         # A grid is a function of the extents being computed and of the tile
         # they were split into, so both are computed once here rather than
@@ -1068,12 +1346,7 @@ class KernelArgs:
 
         symbol = symbol or self.symbol or "_kernel"
         parts = list(names) + list(outputs)
-        # Written before the decorator so the body reads them as module
-        # constants: the value is fixed at compile time, and the kernel is
-        # compiled once for the configuration these came from.
-        self.defines = "".join(
-            f"{n} = tl.constexpr({v!r})\n" for n, v in self.constexprs.items()
-        ) + f"INDEX_DTYPE = {self.index_dtype}\n"
+
         for name in parts:
             self._operand(name)
         params = ", ".join(f"{n}_ptr" for n in parts)
@@ -1086,17 +1359,31 @@ class KernelArgs:
             rank = len(self._operand(name)["shape"])
             sizes += [f"size_{name.lower()}{d}" for d in range(rank)]
         # A value chosen when the text was written -- a tile, an accumulation
-        # type, a warp count -- is a constant of the module the kernel is
-        # defined in, not an argument of the kernel.  The kernel is compiled
-        # once per configuration, so a value that cannot change while it runs
-        # has no reason to be passed in on every launch; and a constant can be
-        # read by name anywhere in the body, which an argument cannot.
+        # type, a bound -- cannot change while the kernel runs, and the kernel
+        # is compiled once for the configuration it came from.  So it is a
+        # parameter the compiler may fold rather than one passed on every
+        # launch, and it is annotated as such where the compiler reads that.
+        # It has to be a parameter rather than something the body reads from
+        # the module it is defined in: a global is not a value the body can
+        # fold, and the arithmetic on a tile would be worked out at every step
+        # instead of once.
         names = [*names, *outputs]
-        all_params = [f"{n}_ptr" for n in names] + sizes + strides
+        # The index type travels with the operands rather than with the body: it
+        # is a property of the launch, and a body that narrows an index has to
+        # name the type it narrows to.  It is a parameter for the same reason
+        # the rest are -- the compiler folds it, and the body reads it by name.
+        tail = [f"{n}: tl.constexpr" for n in self.constexprs]
+        tail.append("INDEX_DTYPE: tl.constexpr")
+        all_params = [f"{n}_ptr" for n in names] + sizes + strides + tail
+        # The body refers to an operand by its own name rather than by the name
+        # of the parameter that carries it, so the two are tied together at the
+        # top of the body.  A body that names an operand nobody declared fails
+        # here, at the point of the binding, rather than later inside a loop.
+        binds = "".join(f"    {n} = {n}_ptr\n" for n in names)
         return (
-            f"{self.defines}"
             "@triton.jit\n"
-            f"def {symbol}({', '.join(all_params)}):"
+            f"def {symbol}({', '.join(all_params)}):\n"
+            f"{binds}"
         )
 
 
