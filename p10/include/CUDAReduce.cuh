@@ -633,9 +633,12 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
     // stays busy while each thread still reduces a useful number of elements.
     // This branch is restricted to one output per block so the partial buffer
     // has a simple layout.
-    if (reduction_on_fastest_dimension &&
-        config.output_mult[0] == 0 && config.output_mult[1] == 0 &&
-        config.num_outputs > 0) {
+    // A block owns one contiguous output range when only one of its two
+    // extents carries the output split; when both do, the owned outputs are a
+    // two-dimensional set and the single-range fold below cannot address them.
+    const bool outputs_form_one_range =
+        config.output_mult[0] == 0 || config.output_mult[1] == 0;
+    if (outputs_form_one_range && config.num_outputs > 0) {
         // Elements still to be consumed per thread after the lane and warp
         // splits: num_inputs spread over step_input units of InputVecSize
         // elements each.
@@ -963,11 +966,37 @@ struct ReduceOp {
         // gated on it. Without the gate, small reductions dereference null
         // staging pointers (illegal address on the first max/sum of a tiny
         // tensor).
+        auto store_out = [&](int64_t out, const AccT& value) {
+            const int64_t off = config.output_offset(out);
+            output[off] = ops.project(value);
+            if (output2 != nullptr) {
+                if constexpr (has_second_project<Ops>::value) {
+                    output2[off] = ops.project_second(value);
+                }
+            }
+        };
         if (config.global_reduce) {
-            const int64_t slot_base = output_index * config.ctas_per_output;
-            if (block_leader && output_index < config.num_outputs) {
-                partials[slot_base + static_cast<int64_t>(blockIdx.y)] = value;
-                __threadfence();  // partial globally visible before the count
+            // The block owns the contiguous output range [out_begin, out_end):
+            // either a single output, or one per lane of whichever extent
+            // carries the output split.  A lane owns a distinct output unless
+            // both extents split the output, which the host rules out.
+            const int64_t out_begin =
+                static_cast<int64_t>(blockIdx.x) * config.step_output;
+            const int64_t out_end =
+                min(out_begin + config.step_output, config.num_outputs);
+            const bool lane_owns_output =
+                (config.output_mult[0] != 0 || config.output_mult[1] != 0)
+                    ? (threadIdx.y == 0)
+                    : (threadIdx.x == 0 && threadIdx.y == 0);
+            if (lane_owns_output && output_index < config.num_outputs) {
+                partials[output_index * config.ctas_per_output +
+                         static_cast<int64_t>(blockIdx.y)] = value;
+            }
+            // Every writer publishes before the counter moves; the leader's
+            // fence alone would only order its own store.
+            __threadfence();
+            __syncthreads();
+            if (block_leader) {
                 // Wait until this launch's counter is initialized (CTA y==0
                 // does it once, near kernel start; the unique per-launch tag
                 // makes stale flag content from previous launches
@@ -982,56 +1011,77 @@ struct ReduceOp {
                                           config.ctas_per_output - 1);
             }
             __syncthreads();
-            if (is_last_block && output_index < config.num_outputs) {
-                __threadfence();  // acquire: peer partials are visible
+            if (is_last_block && out_end > out_begin) {
                 const int tid = threadIdx.x + threadIdx.y * blockDim.x;
                 const int tcount = blockDim.x * blockDim.y;
-                // The fold is latency-bound: one small L2 load per CTA
-                // partial. Keep several independent accumulators in flight
-                // per thread to hide L2 latency.
-                constexpr int kFoldAcc = 8;
-                AccT accs[kFoldAcc];
-                #pragma unroll
-                for (int k = 0; k < kFoldAcc; ++k) accs[k] = identity;
-                int64_t i = tid;
-                for (; i + static_cast<int64_t>(kFoldAcc - 1) * tcount <
-                       config.ctas_per_output;
-                     i += static_cast<int64_t>(kFoldAcc) * tcount) {
-                    #pragma unroll
-                    for (int k = 0; k < kFoldAcc; ++k) {
-                        accs[k] = ops.combine(accs[k],
-                            partials[slot_base + i +
-                                     static_cast<int64_t>(k) * tcount]);
-                    }
-                }
-                for (; i < config.ctas_per_output; i += tcount) {
-                    accs[0] = ops.combine(accs[0], partials[slot_base + i]);
-                }
-                #pragma unroll
-                for (int k = 1; k < kFoldAcc; ++k) {
-                    accs[0] = ops.combine(accs[0], accs[k]);
-                }
-                AccT final_value = accs[0];
-                final_value = block_y_reduce(final_value, config, ops, shared);
-                final_value = block_x_reduce(final_value, identity, config, ops, shared);
-                if (block_leader) {
-                    const int64_t off = config.output_offset(output_index);
-                    output[off] = ops.project(final_value);
-                    if (output2 != nullptr) {
-                        if constexpr (has_second_project<Ops>::value) {
-                            output2[off] = ops.project_second(final_value);
+                // The fold may only combine along the block extent that does
+                // NOT carry the output split: when the outputs run along x,
+                // folding across x would merge different outputs into one.
+                // The single-output form owns both extents and folds over the
+                // whole block.
+                const bool split_x = config.output_mult[0] != 0;
+                const bool split_y = config.output_mult[1] != 0;
+                for (int64_t out = out_begin; out < out_end; ++out) {
+                    __threadfence();  // acquire: peer partials are visible
+                    const int64_t slot_base = out * config.ctas_per_output;
+                    if (!split_x && !split_y) {
+                        // The fold is latency-bound: one small L2 load per CTA
+                        // partial. Keep several independent accumulators in
+                        // flight per thread to hide L2 latency.
+                        constexpr int kFoldAcc = 8;
+                        AccT accs[kFoldAcc];
+                        #pragma unroll
+                        for (int k = 0; k < kFoldAcc; ++k) accs[k] = identity;
+                        int64_t i = tid;
+                        for (; i + static_cast<int64_t>(kFoldAcc - 1) * tcount <
+                               config.ctas_per_output;
+                             i += static_cast<int64_t>(kFoldAcc) * tcount) {
+                            #pragma unroll
+                            for (int k = 0; k < kFoldAcc; ++k) {
+                                accs[k] = ops.combine(accs[k],
+                                    partials[slot_base + i +
+                                             static_cast<int64_t>(k) * tcount]);
+                            }
                         }
+                        for (; i < config.ctas_per_output; i += tcount) {
+                            accs[0] = ops.combine(accs[0], partials[slot_base + i]);
+                        }
+                        #pragma unroll
+                        for (int k = 1; k < kFoldAcc; ++k) {
+                            accs[0] = ops.combine(accs[0], accs[k]);
+                        }
+                        AccT final_value = accs[0];
+                        final_value = block_y_reduce(final_value, config, ops, shared);
+                        final_value = block_x_reduce(final_value, identity, config, ops, shared);
+                        if (block_leader) store_out(out, final_value);
+                    } else {
+                        // One output per lane of the split extent: the fold
+                        // walks the CTA partials with the other extent's
+                        // threads and finishes with that extent's reduction.
+                        const int fold_stride = split_x ? blockDim.y : blockDim.x;
+                        const int fold_start = split_x ? threadIdx.y : threadIdx.x;
+                        AccT acc = identity;
+                        for (int64_t i = fold_start; i < config.ctas_per_output;
+                             i += fold_stride) {
+                            acc = ops.combine(acc, partials[slot_base + i]);
+                        }
+                        AccT final_value = split_x
+                            ? block_y_reduce(acc, config, ops, shared)
+                            : block_x_reduce(acc, identity, config, ops, shared);
+                        const int owner = split_x
+                            ? static_cast<int>((out - out_begin) / config.output_mult[0])
+                            : static_cast<int>((out - out_begin) / config.output_mult[1]);
+                        const bool owns = split_x
+                            ? (threadIdx.x == owner && threadIdx.y == 0)
+                            : (threadIdx.x == 0 && threadIdx.y == owner);
+                        if (owns) store_out(out, final_value);
                     }
+                    // The next output reuses the reduction scratch.
+                    __syncthreads();
                 }
             }
         } else if (config.should_store(output_index)) {
-            const int64_t off = config.output_offset(output_index);
-            output[off] = ops.project(value);
-            if (output2 != nullptr) {
-                if constexpr (has_second_project<Ops>::value) {
-                    output2[off] = ops.project_second(value);
-                }
-            }
+            store_out(output_index, value);
         }
     }
 };
