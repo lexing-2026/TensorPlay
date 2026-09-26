@@ -16,12 +16,32 @@
 #include "CUDAGenerator.h"
 #include <cuda_runtime.h>
 
+// What a device is asked about is not a fixed list of five numbers.  A tile
+// kernel is bounded by the registers a thread has and by the shared memory a
+// block may ask for; a persistent launch is capped by how many
+// multiprocessors there are; a group of tiles is chosen so that programs
+// running together share an operand, which depends on the second-level cache.
+// Every consumer that needs one of those and cannot read it has to invent a
+// number, and an invented number is how a constraint stops constraining
+// anything.  So the figures are read once, here, and every consumer reads the
+// same ones.
 struct CudaDeviceProperties {
     std::string name;
     int major;
     int minor;
     size_t total_memory;
     int multi_processor_count;
+    int warp_size;
+    int max_threads_per_multi_processor;
+    int max_threads_per_block;
+    int regs_per_multiprocessor;
+    int shared_memory_per_block;
+    int shared_memory_per_block_optin;
+    int shared_memory_per_multiprocessor;
+    int memory_bus_width;
+    int memory_clock_rate;
+    int clock_rate;
+    size_t L2_cache_size;
 };
 #endif
 
@@ -148,8 +168,19 @@ void init_device(py::module_& m) {
         .def_readonly("minor", &CudaDeviceProperties::minor)
         .def_readonly("total_memory", &CudaDeviceProperties::total_memory)
         .def_readonly("multi_processor_count", &CudaDeviceProperties::multi_processor_count)
+        .def_readonly("warp_size", &CudaDeviceProperties::warp_size)
+        .def_readonly("max_threads_per_multi_processor", &CudaDeviceProperties::max_threads_per_multi_processor)
+        .def_readonly("max_threads_per_block", &CudaDeviceProperties::max_threads_per_block)
+        .def_readonly("regs_per_multiprocessor", &CudaDeviceProperties::regs_per_multiprocessor)
+        .def_readonly("shared_memory_per_block", &CudaDeviceProperties::shared_memory_per_block)
+        .def_readonly("shared_memory_per_block_optin", &CudaDeviceProperties::shared_memory_per_block_optin)
+        .def_readonly("shared_memory_per_multiprocessor", &CudaDeviceProperties::shared_memory_per_multiprocessor)
+        .def_readonly("memory_bus_width", &CudaDeviceProperties::memory_bus_width)
+        .def_readonly("memory_clock_rate", &CudaDeviceProperties::memory_clock_rate)
+        .def_readonly("clock_rate", &CudaDeviceProperties::clock_rate)
+        .def_readonly("L2_cache_size", &CudaDeviceProperties::L2_cache_size)
         .def("__repr__", [](const CudaDeviceProperties& p) {
-            return "_CudaDeviceProperties(name='" + p.name + "', major=" + std::to_string(p.major) + ", minor=" + std::to_string(p.minor) + ", total_memory=" + std::to_string(p.total_memory) + ", multi_processor_count=" + std::to_string(p.multi_processor_count) + ")";
+            return "_CudaDeviceProperties(name='" + p.name + "', major=" + std::to_string(p.major) + ", minor=" + std::to_string(p.minor) + ", total_memory=" + std::to_string(p.total_memory) + ", multi_processor_count=" + std::to_string(p.multi_processor_count) + ", warp_size=" + std::to_string(p.warp_size) + ", regs_per_multiprocessor=" + std::to_string(p.regs_per_multiprocessor) + ", shared_memory_per_block_optin=" + std::to_string(p.shared_memory_per_block_optin) + ", L2_cache_size=" + std::to_string(p.L2_cache_size) + ")";
         });
 
     py::class_<tensorplay::cuda::CUDAEvent>(cuda, "_CudaEvent")
@@ -345,6 +376,23 @@ void init_device(py::module_& m) {
         p.minor = prop.minor;
         p.total_memory = prop.totalGlobalMem;
         p.multi_processor_count = prop.multiProcessorCount;
+        p.warp_size = prop.warpSize;
+        p.max_threads_per_multi_processor = prop.maxThreadsPerMultiProcessor;
+        p.max_threads_per_block = prop.maxThreadsPerBlock;
+        p.regs_per_multiprocessor = prop.regsPerMultiprocessor;
+        p.shared_memory_per_block = prop.sharedMemPerBlock;
+        p.shared_memory_per_block_optin = prop.sharedMemPerBlockOptin;
+        p.shared_memory_per_multiprocessor = prop.sharedMemPerMultiprocessor;
+        p.memory_bus_width = prop.memoryBusWidth;
+        // Clock fields moved out of cudaDeviceProp in CUDA 12; read them
+        // through the device attribute interface instead.
+        int memory_clock_khz = 0;
+        int clock_khz = 0;
+        cudaDeviceGetAttribute(&memory_clock_khz, cudaDevAttrMemoryClockRate, device);
+        cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, device);
+        p.memory_clock_rate = memory_clock_khz * 1000;
+        p.clock_rate = clock_khz * 1000;
+        p.L2_cache_size = prop.l2CacheSize;
         return p;
 #else
         throw std::runtime_error("CUDA is not available");
