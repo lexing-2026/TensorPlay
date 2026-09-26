@@ -995,13 +995,17 @@ def emit_group_source(group: FusedGroup, buffers: dict, stored: set, config: Lau
             body += textwrap.indent("\n".join(g.loop), "    ").splitlines()
         body += g.post
     body += g.epilogue
-    # The kernel is named after its own body, so two groups that differ in any
-    # way get different names and a cached launcher is never handed to a group
-    # it was not generated for.
+    # The kernel is named after everything the launcher it produces is built
+    # from, so that two groups differing in any of it get different names and a
+    # cached launcher is never handed to a group it was not generated for.  The
+    # extents belong in that as much as the body does: the launcher pins them,
+    # so a launcher named for one pair of extents is not the launcher for
+    # another even when the body is the same text.
     digest = hashlib.sha1(
         "\n".join(body).encode()
         + repr(tuple(config.key())).encode()
         + repr(sorted(g.ptr_order)).encode()
+        + repr((xnumel, rnumel)).encode()
     ).hexdigest()[:12]
     kernel_name = f"stax_loop_{digest}"
     signature = [f"p{position}" for position in range(len(g.ptr_order))] + ["xnumel"]

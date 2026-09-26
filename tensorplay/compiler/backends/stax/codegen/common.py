@@ -792,6 +792,164 @@ class OpOverrides(BasicMathOpsMixin, OpDecompositions, OpsHandler):
                 setattr(cls, funcname, staticmethod(impl))
 
     @staticmethod
+    def logical_not(a: str) -> str:
+        return f"{OpOverrides.paren(a)} == 0"
+
+    @staticmethod
+    def bitwise_and(x: str, y: str) -> str:
+        return f"{OpOverrides.paren(x)} & {OpOverrides.paren(y)}"
+
+    @staticmethod
+    def bitwise_or(x: str, y: str) -> str:
+        return f"{OpOverrides.paren(x)} | {OpOverrides.paren(y)}"
+
+    @staticmethod
+    def bitwise_xor(x: str, y: str) -> str:
+        return f"{OpOverrides.paren(x)} ^ {OpOverrides.paren(y)}"
+
+    @staticmethod
+    def bitwise_not(x: str) -> str:
+        return f"~{OpOverrides.paren(x)}"
+
+    @staticmethod
+    def bitwise_left_shift(x: str, y: str) -> str:
+        return f"{OpOverrides.paren(x)} << {OpOverrides.paren(y)}"
+
+    @staticmethod
+    def bitwise_right_shift(x: str, y: str) -> str:
+        return f"{OpOverrides.paren(x)} >> {OpOverrides.paren(y)}"
+
+    @staticmethod
+    def int_truediv(a: str, b: str) -> str:
+        from ..loops import ops
+
+        # A whole number divided by a whole number is not the same as the
+        # quotient of the division, and the caller asked for the former.
+        return ops.truediv(a, b)
+
+    @staticmethod
+    def load_seed(name: str, offset) -> str:
+        from ..loops import ops
+
+        return ops.load(name, sympy.Integer(offset))
+
+    def indirect_indexing(
+        self,
+        var: str,
+        size,
+        check: bool = True,
+        wrap_neg: bool = True,
+    ):
+        from ..utils import sympy_index_symbol
+
+        return sympy_index_symbol(str(var))
+
+    def check_bounds(self, expr, size, lower: bool, upper: bool) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__}: check_bounds should be handled by CSEProxy"
+        )
+
+    def load(self, name: str, index) -> str:
+        raise NotImplementedError(
+            f"{type(self).__name__}: load should be handled by CSEProxy"
+        )
+
+    def store(self, name: str, index, value: str, mode=None) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__}: store should be handled by CSEProxy"
+        )
+
+    def store_reduction(self, name: str, index, value: str) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__}: store_reduction should be handled by CSEProxy"
+        )
+
+    def reduction(
+        self,
+        dtype,
+        src_dtype,
+        reduction_type,
+        value,
+    ):
+        raise NotImplementedError(
+            f"{type(self).__name__}: reduction should be handled by CSEProxy"
+        )
+
+    def scan(
+        self,
+        dtypes,
+        combine_fn,
+        values,
+    ):
+        raise NotImplementedError(
+            f"{type(self).__name__}: scan should be handled by CSEProxy"
+        )
+
+    def sort(
+        self,
+        dtypes,
+        values,
+        stable: bool,
+        descending: bool,
+    ):
+        raise NotImplementedError(
+            f"{type(self).__name__}: sort should be handled by CSEProxy"
+        )
+
+    def bucketize(
+        self,
+        values: str,
+        boundaries,
+        boundary_indices: str,
+        indexing_dtype,
+        right: bool,
+        sorter=None,
+        sorter_indices=None,
+    ) -> str:
+        raise NotImplementedError(
+            f"{type(self).__name__}: bucketize should be handled by CSEProxy"
+        )
+
+    def device_assert_async(self, cond, msg: str) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__}: device_assert_async should be handled by CSEProxy"
+        )
+
+    def halide_clamp(self, value: str, size, check: bool) -> str:
+        raise NotImplementedError(
+            f"{type(self).__name__}: halide_clamp only implemented for Halide backend"
+        )
+
+    def dot(self, x: str, y: str) -> str:
+        raise NotImplementedError(
+            f"{type(self).__name__}: dot only implemented for Triton backend"
+        )
+
+    def inline_asm_elementwise(
+        self,
+        *inputs: str,
+        asm: str,
+        constraints: str | None = None,
+        dtype=None,
+        is_pure: bool = True,
+        pack: int = 1,
+        input_dtypes=None,
+    ) -> str:
+        raise NotImplementedError(
+            f"{type(self).__name__}: inline_asm_elementwise only implemented for Triton backend"
+        )
+
+    def output(self, *args: str) -> None:
+        raise AssertionError(
+            f"{type(self).__name__}: ops.output should not appear at codegen time"
+        )
+
+    def placeholder(self, index: int) -> str:
+        raise AssertionError(
+            f"{type(self).__name__}: ops.placeholder should not appear at codegen time"
+        )
+
+    @staticmethod
     def method_name(op: str) -> str:
         return re.sub(r"\W", "_", op)
 
