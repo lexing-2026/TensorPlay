@@ -572,8 +572,13 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
     // lanes.  Clamped to [2, one warp]: a row spans at least two lanes and
     // never more than a warp.  The thresholds come from a measured sweep over
     // row lengths 4..8192 (see the commit message for the numbers).
+    //
+    // The width lands on a power of two: both cross-lane folds walk their
+    // offset from half the width down to one, and that walk only reaches every
+    // lane when the width divides the warp evenly, so a width like 7 or 12
+    // would drop contributions (a 56-element row summed to 8.5x its value).
     constexpr int kElemsPerLane = 8;
-    const int want_width = static_cast<int>(std::max<int64_t>(
+    const int want_width = reduction_last_pow2(std::max<int64_t>(
         2, std::min<int64_t>(kWarpSize, config.num_inputs / kElemsPerLane)));
     const int dim0_pow2 =
         std::min(want_width, reduction_last_pow2(config.num_inputs));
