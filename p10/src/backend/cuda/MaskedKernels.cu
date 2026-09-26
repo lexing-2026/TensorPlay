@@ -49,53 +49,89 @@ inline std::vector<int64_t> broadcast_shapes(const std::vector<int64_t>& a,
     return out;
 }
 
-// One block per (batch, row) and one thread per column: the mask only depends
-// on the column, so the row can stay block-wide and the whole grid runs at
-// element granularity.  A thread per row instead would leave the machine idle
-// on all but as many blocks as there are rows, and every column a serial
-// per-thread loop.
-template <typename T, bool Lower>
-__global__ void triangular_mask_kernel(int64_t batch_rows, int64_t rows, int64_t cols,
-                                       const T* in, T* out, int64_t diagonal) {
-    const int64_t br = static_cast<int64_t>(blockIdx.x);
-    const int64_t bi = br / rows;
-    const int64_t row = br - bi * rows;
-    const int64_t base = bi * rows * cols + row * cols;
-    const int64_t limit = row + diagonal;
-    const int64_t step = static_cast<int64_t>(gridDim.y) * blockDim.x;
-    for (int64_t c = static_cast<int64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
-         c < cols; c += step) {
-        // A masked-out element is a pure store: branching keeps the load out
-        // of the fully masked half of the matrix, which is half the traffic.
-        if (Lower ? (c > limit) : (c < limit)) {
-            out[base + c] = static_cast<T>(0);
-        } else {
-            out[base + c] = in[base + c];
-        }
+// Shape and strides of one operand, carried in the parameter block: the kernel
+// walks a flat index and needs both to turn it into an offset.
+struct TriTensorInfo {
+    static constexpr int kMaxDims = 12;
+    int ndim = 0;
+    int64_t sizes[kMaxDims]{};
+    int64_t strides[kMaxDims]{};
+};
+
+TriTensorInfo make_tri_info(const Tensor& tensor) {
+    TriTensorInfo info;
+    info.ndim = static_cast<int>(tensor.dim());
+    if (info.ndim > TriTensorInfo::kMaxDims) {
+        TP_THROW(RuntimeError, "tril/triu: tensor rank exceeds ",
+                 TriTensorInfo::kMaxDims, " dimensions on CUDA");
     }
+    for (int d = 0; d < info.ndim; ++d) {
+        info.sizes[d] = tensor.size(d);
+        info.strides[d] = tensor.stride(d);
+    }
+    return info;
 }
 
-// Short rows: one thread per row walking its few columns.  Handing a whole row
-// to a block would leave most of its threads idle when the row is narrower than
-// the block, and the parallelism is already there in the row count.
-template <typename T, bool Lower>
-__global__ void triangular_mask_rows_kernel(int64_t batch_rows, int64_t rows,
-                                            int64_t cols, const T* in, T* out,
-                                            int64_t diagonal) {
-    int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; t < batch_rows; t += stride) {
-        const int64_t bi = t / rows;
-        const int64_t row = t - bi * rows;
-        const int64_t base = bi * rows * cols + row * cols;
-        const int64_t limit = row + diagonal;
-        for (int64_t c = 0; c < cols; ++c) {
-            if (Lower ? (c > limit) : (c < limit)) {
-                out[base + c] = static_cast<T>(0);
-            } else {
-                out[base + c] = in[base + c];
-            }
+constexpr int kTriBlockSize = 128;
+
+// The grid walks the tensor as one flat run.  A thread takes a group of
+// consecutive elements along the last axis, so one round of index arithmetic
+// covers the whole group, and a group that falls entirely on one side of the
+// diagonal is filled without ever touching the input.
+template <typename T, typename IndexT, bool Upper, int ElementsPerThread>
+__global__ void __launch_bounds__(kTriBlockSize) triangular_mask_kernel(
+    TriTensorInfo result_info, const TriTensorInfo self_info, const T* self_data,
+    T* result_data, const int64_t k, const int64_t N_padded,
+    const IndexT last_dim_padded) {
+    const int64_t dims = self_info.ndim;
+    int64_t linear_idx =
+        (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) *
+        ElementsPerThread;
+    if (linear_idx >= N_padded) return;
+
+    // Column and row of the group's first element.
+    IndexT col = static_cast<IndexT>(linear_idx % last_dim_padded);
+    linear_idx /= last_dim_padded;
+    IndexT row = static_cast<IndexT>(linear_idx % self_info.sizes[dims - 2]);
+
+    int64_t self_offset = 0, result_offset = 0;
+    self_offset += self_info.strides[dims - 1] * col;
+    result_offset += result_info.strides[dims - 1] * col;
+    linear_idx /= self_info.sizes[dims - 2];
+    self_offset += self_info.strides[dims - 2] * row;
+    result_offset += result_info.strides[dims - 2] * row;
+
+    IndexT running_index;
+#pragma unroll
+    for (IndexT i = dims - 3; i >= 0; --i) {
+        running_index = static_cast<IndexT>(linear_idx % self_info.sizes[i]);
+        linear_idx /= self_info.sizes[i];
+        self_offset += running_index * self_info.strides[i];
+        result_offset += running_index * result_info.strides[i];
+    }
+
+    const int64_t last = self_info.sizes[dims - 1];
+    T frag[ElementsPerThread] = {};
+    // True when at least one element of the group survives the mask, which is
+    // when the input has to be read at all.
+    const bool has_mask =
+        (Upper && col + ElementsPerThread - row >= k) ||
+        (!Upper && col - row <= k);
+    if (has_mask) {
+#pragma unroll
+        for (int i = 0; i < ElementsPerThread && col + i < last; ++i) {
+            frag[i] = self_data[self_offset + i * self_info.strides[dims - 1]];
         }
+#pragma unroll
+        for (int i = 0; i < ElementsPerThread; ++i) {
+            const bool mask =
+                Upper ? (col + i - row >= k) : (col + i - row <= k);
+            frag[i] = mask ? frag[i] : static_cast<T>(0);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < ElementsPerThread && col + i < last; ++i) {
+        result_data[result_offset + i * result_info.strides[dims - 1]] = frag[i];
     }
 }
 
@@ -158,49 +194,47 @@ __global__ void masked_scatter_size_check(
 
 template <bool Lower>
 Tensor triangular_mask_entry(const Tensor& self, int64_t diagonal) {
-    int64_t ndim = self.dim();
-    if (ndim < 2) TP_THROW(RuntimeError, "tril/triu requires tensor with at least 2 dimensions");
-    Tensor self_c = self.contiguous();
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
-    int64_t rows = self.size(ndim - 2);
-    int64_t cols = self.size(ndim - 1);
-    int64_t batch = self.numel() / (rows * cols);
-    if (batch == 0 || rows == 0 || cols == 0) return result;
-    auto stream = getCurrentCUDAStream().stream();
-    int64_t work = batch * rows;
-    // A row narrower than a wave is cheaper with one thread per row; wider rows
-    // hand the columns to the threads of a block so every element gets its own
-    // lane.
-    // A row narrower than a wave cannot keep a block busy anyway; past that
-    // the block-per-row shape pays off and stays the better mapping.
-    constexpr int64_t kRowPerThreadMax = 32;
-    if (cols <= kRowPerThreadMax) {
-        const dim3 grid(static_cast<unsigned>((work + kThreads - 1) / kThreads));
-#define TP_TRI_ROW_CASE(ctype, name) \
-        case DType::name: \
-            triangular_mask_rows_kernel<ctype, Lower><<<grid, kThreads, 0, stream>>>( \
-                work, rows, cols, self_c.data_ptr<ctype>(), result.data_ptr<ctype>(), \
-                diagonal); \
-            break;
-        switch (self.dtype()) {
-            TENSORPLAY_FORALL_SCALAR_TYPES(TP_TRI_ROW_CASE)
-            default: TP_THROW(TypeError, "tril/triu: unsupported dtype");
-        }
-#undef TP_TRI_ROW_CASE
-        CUDA_CHECK(cudaGetLastError());
-        return result;
+    const int64_t ndim = self.dim();
+    if (ndim < 2) {
+        TP_THROW(RuntimeError, "tril/triu requires tensor with at least 2 dimensions");
     }
-    // Rows across grid.x, column tiles across grid.y (the y extent is the
-    // smaller hardware limit, and a wide row simply loops).
-    const unsigned column_tiles = static_cast<unsigned>(std::min<int64_t>(
-        (cols + kThreads - 1) / kThreads, 65535));
-    const dim3 grid(static_cast<unsigned>(work), column_tiles);
-    const dim3 block(kThreads);
-#define TP_TRI_CASE(ctype, name) \
-    case DType::name: \
-        triangular_mask_kernel<ctype, Lower><<<grid, block, 0, stream>>>( \
-            work, rows, cols, self_c.data_ptr<ctype>(), result.data_ptr<ctype>(), diagonal); \
-        break;
+    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
+                                  self.dtype(), self.device());
+    const int64_t numel = self.numel();
+    if (numel == 0) return result;
+    const TriTensorInfo self_info = make_tri_info(self);
+    const TriTensorInfo result_info = make_tri_info(result);
+    // A group of consecutive elements can reach past the end of a row, so the
+    // row length is rounded up to a whole number of groups and the grid covers
+    // that padded extent; the tail beyond the row is never written.
+    constexpr int64_t kGroupBytes = 8;
+    auto stream = getCurrentCUDAStream().stream();
+    const dim3 block(kTriBlockSize);
+#define TP_TRI_CASE(ctype, name)                                                  \
+    case DType::name: {                                                            \
+        constexpr int kEpt =                                                       \
+            sizeof(ctype) < kGroupBytes ? kGroupBytes / sizeof(ctype) : 1;         \
+        const int64_t last_dim_padded =                                             \
+            ((self.size(ndim - 1) + kEpt - 1) / kEpt) * kEpt;                     \
+        const int64_t n_padded = (numel / self.size(ndim - 1)) * last_dim_padded;   \
+        const dim3 grid(static_cast<unsigned>(                                      \
+            (n_padded / kEpt + block.x - 1) / block.x));                           \
+        if (numel <= static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {   \
+            triangular_mask_kernel<ctype, int32_t, !Lower, kEpt>                    \
+                <<<grid, block, 0, stream>>>(result_info, self_info,                 \
+                                              self.data_ptr<ctype>(),               \
+                                              result.data_ptr<ctype>(), diagonal,   \
+                                              n_padded,                             \
+                                              static_cast<int32_t>(last_dim_padded));\
+        } else {                                                                    \
+            triangular_mask_kernel<ctype, int64_t, !Lower, kEpt>                    \
+                <<<grid, block, 0, stream>>>(result_info, self_info,                 \
+                                              self.data_ptr<ctype>(),               \
+                                              result.data_ptr<ctype>(), diagonal,   \
+                                              n_padded, last_dim_padded);            \
+        }                                                                           \
+        break;                                                                      \
+    }
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_TRI_CASE)
         default: TP_THROW(TypeError, "tril/triu: unsupported dtype");
