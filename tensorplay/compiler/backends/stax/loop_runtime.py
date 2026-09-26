@@ -91,13 +91,14 @@ class ExternStep(Step):
             # it is handed -- so the measurement pins nothing.
             self._baked = self._bake(feed, args, kwargs)
             launch = self._baked
-        if launch is not None:
-            result = launch(feed)
-        else:
-            # No template claimed this operator, so the call runs the operator
-            # as the framework runs it, on the operands of this call.  Holding
-            # a launcher here instead would pin one call's operands on the
-            # step, and the program reuses that step for every call it runs.
+        result = launch(feed) if launch is not None else None
+        if result is None:
+            # Either no template claimed this operator, or the one that did
+            # declined this call -- a launcher built from a probe answers None
+            # when it cannot account for an argument.  The call then runs the
+            # operator as the framework runs it, on the operands of this call.
+            # Holding a launcher over those operands instead would pin them on
+            # the step, and the program reuses the step for every call.
             result = self._call_target(args, kwargs)
         for output in self.kernel.outputs:
             env[output.name] = _dig(result, output.path)
@@ -152,14 +153,24 @@ class ExternStep(Step):
             target = target.default
 
         def launch(values):
-            operands = iter(values)
-            args = [
-                next(operands) if index in positions else literal
-                for index, literal in enumerate(literals)
-            ]
-            if len(operands) < len(positions):
+            values = list(values)
+            if len(values) < len(positions):
+                # The launcher is handed the operands the template reads, and
+                # a feed that does not carry all of them is not this operator.
                 return None
-            return target(*args)
+            operands = iter(values)
+            try:
+                args = [
+                    next(operands) if index in positions else literal
+                    for index, literal in enumerate(literals)
+                ]
+                return target(*args)
+            except (TypeError, ValueError, IndexError, StopIteration):
+                # An argument the probe cannot account for -- a tensor that is
+                # neither a template literal nor one of the read operands --
+                # leaves the call unreconstructable.  A probe declines, and the
+                # operator runs on this call's own operands.
+                return None
 
         return launch
 
