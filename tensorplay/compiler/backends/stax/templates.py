@@ -975,8 +975,15 @@ class LoopTemplate(KernelTemplate):
         inputs = self.heuristics.adjust_kernel_inputs(self.inputs_for(meta), self.name)
         return self.heuristics.get_template_configs(inputs, self.name)
 
-    def generate_for(self, params: KernelTemplateParams, out_specs: tuple, meta: dict):
-        """The launcher for one configuration, or ``None`` when it does not fit."""
+    def generate_for(self, params: KernelTemplateParams, out_specs: tuple, meta: dict,
+                     plain_launch=None):
+        """The choice for one configuration, or ``None`` when it does not fit.
+
+        ``plain_launch`` is what the region would run with no template at all.
+        It is handed in rather than reached for because for one configuration
+        it *is* the answer: the operation is a candidate like any other, and
+        the only way it can be is by being given the thing it replaces.
+        """
 
         raise NotImplementedError
 
@@ -1121,7 +1128,10 @@ class KernelTemplateChoice:
             self._resolved = True
             try:
                 self._choice = self.template.generate_for(
-                    self.params, (self.layout,) if self.layout else (), self.inputs.extra
+                    self.params,
+                    (self.layout,) if self.layout else (),
+                    self.inputs.extra,
+                    plain_launch,
                 )
             except NotImplementedError:
                 self._choice = None
@@ -1254,13 +1264,21 @@ class GemmTemplate(LoopTemplate):
             return None
         return _probe_feed(m, inner, n, layout.dtype, meta.get("device"), bias=False)
 
-    def generate_for(self, params: KernelTemplateParams, out_specs: tuple, meta: dict):
-        """The launcher for one configuration, or ``None`` when it does not fit."""
+    def generate_for(self, params: KernelTemplateParams, out_specs: tuple, meta: dict,
+                     plain_launch=None):
+        """The choice for one configuration, or ``None`` when it does not fit."""
 
         kwargs = params.to_kwargs()
-        if kwargs.get("choice") == "operator":
-            return None
         layout = out_specs[0] if out_specs else None
+        if kwargs.get("choice") == "operator":
+            if plain_launch is None:
+                return None
+            return ExternChoiceCaller(
+                name="framework_product",
+                layout=layout,
+                description="the operation itself",
+                launcher=plain_launch,
+            )
         if layout is None or len(layout.size) != 2 or meta.get("transposed"):
             return None
         if meta.get("operand_dtype") != "float32":
@@ -1431,11 +1449,19 @@ class ConvTemplate(LoopTemplate):
         dilation = tuple(int(d) for d in meta.get("dilation") or ())
         return all(d == 1 for d in dilation)
 
-    def generate_for(self, params: KernelTemplateParams, out_specs: tuple, meta: dict):
-        """The launcher for one configuration, or ``None`` when it does not fit."""
+    def generate_for(self, params: KernelTemplateParams, out_specs: tuple, meta: dict,
+                     plain_launch=None):
+        """The choice for one configuration, or ``None`` when it does not fit."""
 
         if params.to_kwargs().get("choice") == "operator":
-            return None
+            if plain_launch is None:
+                return None
+            return ExternChoiceCaller(
+                name="framework_convolution",
+                layout=out_specs[0] if out_specs else None,
+                description="the operation itself",
+                launcher=plain_launch,
+            )
         if not self.is_one_by_one(meta):
             return None
         # The product case is measured by the product template, which owns that
