@@ -427,3 +427,33 @@ def test_compile_out_call_writes_destination_on_every_call(backend):
     result = compiled(tp.full((2,), 2.0), out)
     assert out.tolist() == [10.0, 10.0]
     assert result.tolist() == [10.0, 10.0]
+
+
+def test_operator_coverage_table_is_honest():
+    """The coverage table may not claim a capability that is not there.
+
+    Coverage is only worth reading if it is checked, so the names the table
+    declares as lowered or templated have to be in the live tables, and a name
+    in no table has to be reported as not covered -- an unnamed operator has
+    no capability behind it, whatever a caller might hope for.
+    """
+
+    from tensorplay.compiler.backends.stax import operator_coverage as coverage
+
+    lowerings, templates, _ = coverage._tables()
+    assert lowerings, "the lowering table should not be empty"
+    for name in coverage.declared_coverage():
+        assert name not in lowerings or coverage.coverage_of(name) in (
+            coverage.Coverage.LOWERED,
+            coverage.Coverage.TEMPLATE,
+        )
+
+    # An operator nobody has named is not covered, and saying so is the point.
+    assert not coverage.is_covered("no_such_operator.default")
+    assert coverage.coverage_of("conv2d.default") is coverage.Coverage.TEMPLATE
+    assert coverage.coverage_of("avg_pool2d_backward.default") is (
+        coverage.Coverage.NOT_COVERED
+    )
+    assert coverage.summary(["conv2d.default", "add.default"]).get("not_covered", 0) >= 1
+    names = [name for name, _ in coverage.work_list()]
+    assert names, "the work list should not be empty"
