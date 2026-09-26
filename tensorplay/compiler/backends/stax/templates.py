@@ -60,7 +60,11 @@ __all__ = [
     "GEMM",
     "GemmConfig",
     "GemmTemplate",
+    "ConvKernelInputs",
     "KernelInputs",
+    "MMKernelInputs",
+    "SymbolicGridFn",
+    "assert_uids_unique",
     "KernelTemplate",
     "KernelTemplateChoice",
     "KernelTemplateParams",
@@ -1055,10 +1059,14 @@ class LoopTemplate(KernelTemplate):
         raise NotImplementedError
 
     # configurations ------------------------------------------------------
+    #: Which inputs class describes this template's operands.
+    inputs_class: type = KernelInputs
+
     def inputs_for(self, meta: dict) -> KernelInputs:
-        return KernelInputs(
-            shapes=tuple(meta.get("operand_sizes") or ()),
-            dtypes=tuple([meta.get("operand_dtype")] * len(meta.get("operand_sizes") or ())),
+        sizes = tuple(meta.get("operand_sizes") or ())
+        return self.inputs_class(
+            shapes=sizes,
+            dtypes=tuple([meta.get("operand_dtype")] * len(sizes)),
             device=meta.get("device"),
             operands=tuple(meta.get("operand_specs") or ()),
             feed=tuple(meta.get("feed") or ()),
@@ -1284,16 +1292,11 @@ class GemmConfigHeuristics(TemplateConfigHeuristics):
         self.device_type = device_type
 
     def should_run(self, inputs: KernelInputs) -> bool:
-        if len(inputs.shapes) < 2:
-            return False
-        rows, inner = inputs.shapes[0]
-        inner2, cols = inputs.shapes[1]
-        return len((rows, inner, cols)) == 3 and inner == inner2
+        return isinstance(inputs, MMKernelInputs)
 
     def _get_template_configs_impl(self, kernel_inputs, op_name):
         yield {"choice": "operator"}
-        rows, inner = kernel_inputs.shapes[0]
-        _inner2, cols = kernel_inputs.shapes[1]
+        rows, cols, inner = kernel_inputs.mnk_symbolic()
         generator = CHOICES.get_mm_configs(self.device_type)
         for config in generator(rows, cols, inner):
             yield {"choice": "triton", **config.as_kwargs()}
@@ -1306,6 +1309,8 @@ class GemmTemplate(LoopTemplate):
     call -- not two-dimensional, not the element type the tiles accumulate in,
     not this device -- is refused here rather than by whoever is asking.
     """
+
+    inputs_class = MMKernelInputs
 
     def __init__(self):
         super().__init__("gemm")
@@ -1480,18 +1485,22 @@ class ConvConfigHeuristics(TemplateConfigHeuristics):
         self.device_type = device_type
 
     def should_run(self, inputs: KernelInputs) -> bool:
-        return len(inputs.shapes) >= 2
+        return isinstance(inputs, ConvKernelInputs) and not inputs.is_depthwise
 
     def _get_template_configs_impl(self, kernel_inputs, op_name):
         yield {"choice": "operator"}
-        extra = kernel_inputs.extra
-        generator = CHOICES.get_conv_configs(self.device_type)
-        rows = extra.get("conv_rows")
-        cols = extra.get("out_channels")
-        inner = extra.get("in_channels_per_group")
-        if not rows or not cols or not inner:
+        try:
+            rows, cols, inner = kernel_inputs.mnk_symbolic()
+        except NotImplementedError:
             return
-        for config in generator(rows, cols, inner):
+        for config in CHOICES.get_conv_configs(self.device_type)(rows, cols, inner):
+            yield {"choice": "triton", **config.as_kwargs()}
+
+    def get_depthwise_configs_impl(self, kernel_inputs):
+        """The depthwise tilings, which are not products and so are not fitted."""
+
+        yield {"choice": "operator"}
+        for config in CHOICES.get_depthwise_conv_configs(self.device_type):
             yield {"choice": "triton", **config.as_kwargs()}
 
 
@@ -1506,6 +1515,8 @@ class ConvTemplate(LoopTemplate):
     Wider kernels keep the operator, which is the floor a measurement can never
     lose against, until there is a tiled kernel for them to choose between.
     """
+
+    inputs_class = ConvKernelInputs
 
     def __init__(self):
         super().__init__("conv")
@@ -1677,6 +1688,30 @@ TEMPLATES: dict[str, KernelTemplate] = {GEMM.name: GEMM, CONV.name: CONV}
 
 def template_for(name: str) -> KernelTemplate | None:
     return TEMPLATES.get(name)
+
+
+def assert_uids_unique() -> None:
+    """No two choices may answer to the same identity.
+
+    A stored decision names a choice by its identity, so two choices sharing
+    one would make every stored decision ambiguous: the one that was measured
+    could not be told from the one that was not.  This is cheap enough to
+    check whenever the table is built, which is the only moment at which a
+    collision can be introduced.
+    """
+
+    seen: dict[str, str] = {}
+    for choice in (*TEMPLATES.values(), *ExternKernelChoice._registry.values()):
+        identity = choice.uid
+        owner = seen.get(identity)
+        if owner is not None and owner != choice.name:
+            raise AssertionError(
+                f"two choices share the identity {identity!r}: {owner} and {choice.name}"
+            )
+        seen[identity] = choice.name
+
+
+assert_uids_unique()
 
 
 #: Imported for the names callers expect to find here.
