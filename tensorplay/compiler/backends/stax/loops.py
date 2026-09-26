@@ -563,7 +563,7 @@ def _merge_group(body: LoopBody, reduction: bool) -> LoopBody:
         # drop unit dims first: they index nothing
         for k, extent in enumerate(sizes):
             if extent == 1 and len(sizes) > 1:
-                zero = {vars_[k]: Const(0)}
+                zero = {vars_[k]: sympy.Integer(0)}
                 body = _rewrite_body(body, zero)
                 new_vars = vars_[:k] + vars_[k + 1 :]
                 new_sizes = sizes[:k] + sizes[k + 1 :]
@@ -584,9 +584,9 @@ def _merge_group(body: LoopBody, reduction: bool) -> LoopBody:
                     break
             if not ok:
                 continue
-            fused = Symbol(f"{a.name}m")
+            fused = sympy.Symbol(f"{a.name}m")
             # affine in both: e = rest + cb*(a*inner + b) = rest + cb*fused
-            mapping_rest = {a: Const(0), b: Const(0)}
+            mapping_rest = {a: sympy.Integer(0), b: sympy.Integer(0)}
             new_body = _rewrite_affine(body, a, b, inner, fused)
             new_vars = vars_[:k] + [fused] + vars_[k + 2 :]
             new_sizes = sizes[:k] + [sizes[k] * inner] + sizes[k + 2 :]
@@ -605,7 +605,7 @@ def _rewrite_affine(body: LoopBody, a, b, inner: int, fused) -> LoopBody:
         cb = affine_coeff(expr, b)
         if cb is None:
             return expr
-        rest = substitute(expr, {a: Const(0), b: Const(0)})
+        rest = substitute(expr, {a: sympy.Integer(0), b: sympy.Integer(0)})
         return rest + fused * cb if cb else rest
 
     memo: dict[int, Value] = {}

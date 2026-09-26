@@ -6175,19 +6175,22 @@ class Scheduler:
 
         from .codegen.wrapper import PythonWrapperCodegen
 
-        with set_wrapper_code(self):
-            self.wrapper_code = PythonWrapperCodegen()
+        with V.graph.set_current_wrapper_code():
+            V.graph.init_wrapper_code()
+            V.graph.wrapper_code = PythonWrapperCodegen()
+            self.wrapper_code = V.graph.wrapper_code
             self.codegen_helpers()
             for node in self.nodes:
                 self.codegen_node(node)
             self.free_buffers()
-            self.wrapper_code.finalize()
+            V.graph.wrapper_code.finalize()
 
     def codegen_helpers(self) -> None:
         """Write out whatever the code needs before any kernel is written."""
 
         self.current_node = None
-        V.graph.wrapper_code = self.wrapper_code
+        # the place being written into was published by the caller, which set it
+        # before this ran and puts it back afterwards
         self.wrapper_code.start_writing(final=False)
 
     def codegen_node(self, node) -> None:

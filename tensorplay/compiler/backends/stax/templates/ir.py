@@ -148,12 +148,6 @@ class CutedslChoiceCaller(ChoiceCaller):
         return "cutedsl_template"
 
 
-def caller_for(backend: str):
-    """The caller kind that identifies a kernel emitted for this backend."""
-
-    return BACKEND_CALLERS.get(backend, TritonChoiceCaller)
-
-
 class ExternKernelAlloc:
     """A choice whose kernel is the framework's own, writing into a fresh buffer.
 

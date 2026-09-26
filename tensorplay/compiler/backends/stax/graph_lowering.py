@@ -1520,6 +1520,23 @@ class GraphLowering:
             name = f"{base_name}_{counter}"
         return name
 
+    @contextlib.contextmanager
+    def set_current_wrapper_code(self):
+        """Write into a different place for a while, and go back to the old one.
+
+        A piece compiled on its own is written into a function of its own, and
+        whatever is written while that happens is not part of the code around it.
+        So the place being written into is saved and put back, which is what lets
+        one region be written out while another is still open without the two
+        writing into each other.
+        """
+
+        old = self.wrapper_code
+        try:
+            yield
+        finally:
+            self.wrapper_code = old
+
     def init_wrapper_code(
         self,
         is_subgraph: bool = False,
