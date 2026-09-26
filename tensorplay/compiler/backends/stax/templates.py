@@ -1683,6 +1683,19 @@ CONV_TEMPLATES: dict[str, dict[str, Any]] = {
 }
 
 
+
+
+CONV = ConvTemplate()
+
+
+#: Templates by the name their operators are declared under.
+TEMPLATES: dict[str, KernelTemplate] = {GEMM.name: GEMM, CONV.name: CONV}
+
+
+def template_for(name: str) -> KernelTemplate | None:
+    return TEMPLATES.get(name)
+
+
 # ---------------------------------------------------------------------------
 # reductions
 # ---------------------------------------------------------------------------
@@ -1767,11 +1780,13 @@ class ReductionTemplate(LoopTemplate):
         size = tuple(meta.get("operand_sizes") or ())
         if len(size) != 1 or not size[0]:
             return None
-        from .codegen.triton import _reduction_probe_feed
+        import tensorplay as tp
 
-        return _reduction_probe_feed(
-            size[0], meta.get("operand_dtype"), meta.get("device")
-        )
+        # A ramp rather than noise: a reduction's answer must not depend on
+        # which lanes happened to run first, and a ramp makes an ordering
+        # mistake visible instead of averaging it away.
+        numel = int(size[0])
+        return (tp.linspace(-1.0, 1.0, numel, device=meta.get("device")),)
 
     def generate_for(self, params: KernelTemplateParams, out_specs: tuple, meta: dict,
                      plain_launch=None):
@@ -1804,14 +1819,6 @@ REDUCTION = ReductionTemplate()
 
 
 TEMPLATES[REDUCTION.name] = REDUCTION
-
-
-#: Templates by the name their operators are declared under.
-TEMPLATES: dict[str, KernelTemplate] = {GEMM.name: GEMM, CONV.name: CONV}
-
-
-def template_for(name: str) -> KernelTemplate | None:
-    return TEMPLATES.get(name)
 
 
 def assert_uids_unique() -> None:
