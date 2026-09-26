@@ -187,6 +187,38 @@ def _conv_tile_kernel(
 '''
 
 
+#: The smallest contraction a tiled product can have.  A block-per-lane
+#: multiply-accumulate is defined from sixteen lanes up; below that there is no
+#: tile to speak of, and the only honest answer is to decline the call.
+MIN_CONTRACTION = 16
+
+
+def _build(source: str, fake_file: str, symbol: str):
+    """Define a kernel from generated source, once.
+
+    A jit-decorated function reads its own source back through the linecache
+    when it is compiled, and a function that calls another jit function reads
+    *that* one's source through the module the caller was defined in.  So the
+    text is registered under the name it will be compiled as, and a real
+    module is registered to own it -- otherwise the inner function resolves
+    against no module at all and fails on the first call rather than on the
+    first compile, which is a much worse place to find out.
+    """
+
+    import sys
+    import types
+
+    linecache.cache[fake_file] = (
+        len(source), None, source.splitlines(True), fake_file,
+    )
+    module = types.ModuleType(fake_file.strip("<>"))
+    module.__file__ = fake_file
+    module.__dict__["__name__"] = module.__name__
+    sys.modules[module.__name__] = module
+    exec(compile(source, fake_file, "exec"), module.__dict__)
+    return module.__dict__[symbol]
+
+
 def conv_kernel(block_m: int, block_n: int, block_k: int, kernel_h: int,
                 kernel_w: int, unroll: bool):
     """The tile kernel for one geometry, built once and remembered.
@@ -204,17 +236,7 @@ def conv_kernel(block_m: int, block_n: int, block_k: int, kernel_h: int,
     cached = _KERNEL_MEMO.get(key)
     if cached is not None:
         return cached
-    source = _KERNEL_SOURCE
-    fake_file = f"<tensorplay-stax-conv-{key}>"
-    # The jit decorator reads the decorated function's source through the
-    # linecache, so the text has to be registered under the name the exec
-    # below will compile it as.
-    linecache.cache[fake_file] = (
-        len(source), None, source.splitlines(True), fake_file,
-    )
-    namespace: dict[str, Any] = {"triton": triton, "tl": tl}
-    exec(compile(source, fake_file, "exec"), namespace, namespace)
-    kernel = namespace["_conv_tile_kernel"]
+    kernel = _build(_KERNEL_SOURCE, f"<tensorplay-stax-conv-{key}>", "_conv_tile_kernel")
     _KERNEL_MEMO[key] = kernel
     return kernel
 
@@ -266,6 +288,8 @@ def conv_launch(
     # would notice, the launcher hands those calls to the operator, which is in
     # the candidate list anyway.
     if tuple(int(v) for v in geometry["stride"]) != (1,) * len(geometry["kernel"]):
+        return base_launch
+    if int(geometry.get("min_contraction", 1)) < MIN_CONTRACTION:
         return base_launch
 
     block_m = int(config["BLOCK_M"])
@@ -428,14 +452,9 @@ def depthwise_kernel(block_n: int, block_l: int, block_c: int):
     cached = _KERNEL_MEMO.get(key)
     if cached is not None:
         return cached
-    source = _DEPTHWISE_SOURCE
-    fake_file = f"<tensorplay-stax-depthwise-{key}>"
-    linecache.cache[fake_file] = (
-        len(source), None, source.splitlines(True), fake_file,
+    kernel = _build(
+        _DEPTHWISE_SOURCE, f"<tensorplay-stax-depthwise-{key}>", "_depthwise_conv1d_kernel"
     )
-    namespace: dict[str, Any] = {"triton": triton, "tl": tl}
-    exec(compile(source, fake_file, "exec"), namespace, namespace)
-    kernel = namespace["_depthwise_conv1d_kernel"]
     _KERNEL_MEMO[key] = kernel
     return kernel
 
@@ -697,16 +716,10 @@ def bwd_kernel(kind: str, block_m: int, block_n: int, block_k: int):
     cached = _KERNEL_MEMO.get(key)
     if cached is not None:
         return cached
-    source = _BWD_SOURCE
-    fake_file = f"<tensorplay-stax-convbwd-{key}>"
-    linecache.cache[fake_file] = (
-        len(source), None, source.splitlines(True), fake_file,
-    )
-    namespace: dict[str, Any] = {"triton": triton, "tl": tl}
-    exec(compile(source, fake_file, "exec"), namespace, namespace)
-    kernel = namespace[
+    symbol = (
         "_conv2d_bwd_input_kernel" if kind == "input" else "_conv2d_bwd_weight_kernel"
-    ]
+    )
+    kernel = _build(_BWD_SOURCE, f"<tensorplay-stax-convbwd-{key}>", symbol)
     _KERNEL_MEMO[key] = kernel
     return kernel
 
@@ -725,6 +738,9 @@ def _grad_geometry(meta_geometry: dict, in_size, out_c: int, in_c: int):
         "dilation": dilation, "groups": groups,
         "in_size": (in_h, in_w), "out_size": (out_h, out_w),
         "out_channels": out_c, "in_channels": in_c,
+        # Each gradient contracts over the other axis, and a group narrower
+        # than a block is not a tile, so the call goes to the operator.
+        "min_contraction": min(out_c, in_c) // groups if groups else 0,
     }
 
 
@@ -732,6 +748,8 @@ def conv_bwd_input_launch(dy_spec, w_spec, config, geometry, base_launch):
     """Build a launcher for the input's gradient."""
 
     if tuple(int(v) for v in geometry["stride"]) != (1,) * len(geometry["kernel"]):
+        return base_launch
+    if int(geometry.get("min_contraction", 1)) < MIN_CONTRACTION:
         return base_launch
     block_m, block_n = int(config["BLOCK_M"]), int(config["BLOCK_N"])
     block_k = int(config["BLOCK_K"])
@@ -786,6 +804,8 @@ def conv_bwd_weight_launch(dy_spec, x_spec, config, geometry, base_launch):
     """Build a launcher for the weight's gradient."""
 
     if tuple(int(v) for v in geometry["stride"]) != (1,) * len(geometry["kernel"]):
+        return base_launch
+    if int(geometry.get("min_contraction", 1)) < MIN_CONTRACTION:
         return base_launch
     block_m, block_n = int(config["BLOCK_M"]), int(config["BLOCK_N"])
     block_k = int(config["BLOCK_K"])
