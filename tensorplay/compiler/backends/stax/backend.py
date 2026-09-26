@@ -1,9 +1,8 @@
 """Compiler entry for the Stax backend.
 
-The layers below hold the work: :mod:`ir` for values and node
-attributes, :mod:`pointwise` for the planners and fusers,
-:mod:`lowering` for the captured-graph walk, and
-:mod:`aot_autograd` for the reverse pass.  This module drives them
+The layers below hold the work: :mod:`loops` for the IR every device is
+lowered to, :mod:`graph_lowering` for the captured-graph walk, and
+:mod:`loop_compile` for scheduling and printing.  This module drives them
 and re-exports their names, so ``backend`` stays the single import
 surface for the code generators and the tests.
 """
@@ -15,23 +14,6 @@ import sys
 from typing import Any
 
 from ....graph import GraphModule
-from .aot_autograd import *  # noqa: F401,F403 - reverse pass
-from . import ir as _ir
-from . import pointwise as _pointwise
-from . import lowering as _lowering
-from . import aot_autograd as _aot
-from .ir import *  # noqa: F401,F403 - shared surface
-from .lowering import *  # noqa: F401,F403 - captured-graph walk
-from .pointwise import *  # noqa: F401,F403 - planner surface
-from .pointwise import (
-    _lower_cpu_fused_pointwise,
-    _lower_cpu_fused_reduction,
-    _lower_cpu_row_fusion,
-    _lower_cuda_fused_pointwise,
-    _lower_cuda_row_fusion,
-)
-
-
 # Option patch each compile ``mode`` selects, keyed by the backend option
 # namespace.  ``default`` leaves every knob at its built-in value;
 # ``reduce-overhead`` replays the artifact through CUDA graphs;
@@ -301,10 +283,6 @@ def _lower_stax_region(
 #: code generators, the lazy ``_stax`` proxy, and the tests keep
 #: importing from ``backend``.
 __all__ = [
-    *_ir.__all__,
-    *_pointwise.__all__,
-    *_lowering.__all__,
-    *_aot.__all__,
     "list_mode_options",
     "stax",
 ]

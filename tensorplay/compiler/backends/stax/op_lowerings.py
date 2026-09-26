@@ -897,3 +897,182 @@ def _pool_with_masked_divisor(node, total, prefix, spatial_out, kernel, stride,
         total,
         counted,
     )
+
+
+# ---------------------------------------------------------------------------
+# Scattering into a tensor along one axis
+# ---------------------------------------------------------------------------
+
+
+@register("index_add.default")
+def lower_index_add(node, base, dim, index_box, addend, alpha=None, **kwargs):
+    """Accumulating along one axis, as the sum over that axis of what lands.
+
+    A scattered position is a sum of the contributions that name it, so the
+    scatter is a reduction over the axis being scattered: each contribution
+    asks the index where it belongs and contributes to that one destination,
+    and to no other.  Nothing needs to be written twice and nothing needs a
+    lock, because each destination is written by exactly one loop iteration.
+    """
+
+    dim = normalize_dim(int(dim), base.get_rank())
+    _, dtype, device = val_info(node_val(node))
+    out_size = [int(s) for s in base.get_size()]
+    addend_size = [int(s) for s in addend.get_size()]
+    if addend_size[dim] != int(index_box.get_size()[0]):
+        raise NotImplementedError("an index that does not match its addend")
+    index_loader = index_box.make_loader()
+    addend_loader = addend.make_loader()
+    f32 = "float32"
+    scale = 1.0 if alpha is None else float(alpha)
+
+    def inner(index, rindex):
+        destination = index_loader([ops.index_expr(rindex[dim], "int64")])
+        here = ops.eq(destination, ops.index_expr(index[dim], "int64"))
+        for axis in range(len(out_size)):
+            if axis != dim:
+                here = ops.and_(
+                    here, ops.eq(rindex[axis], ops.index_expr(index[axis], "int64"))
+                )
+        value = addend_loader(list(rindex))
+        if scale != 1.0:
+            value = ops.mul(value, ops.constant(scale, f32))
+        return ops.masked(here, lambda: value, ops.constant(0.0, f32))
+
+    landed = TensorBox(
+        Reduction(device, dtype, inner, tuple(out_size), tuple(addend_size), "sum")
+    )
+    landed.realize()
+    if all(int(s) == 0 for s in out_size) or not any(addend_size):
+        return landed
+    # The scatter is a sum over what arrives, so the tensor it starts from is
+    # added once, afterwards, rather than folded into every contribution.
+    return pointwise(node, lambda a, b: ops.add(a, b), base, landed)
+
+
+# ---------------------------------------------------------------------------
+# Pooling backwards
+# ---------------------------------------------------------------------------
+
+
+def _window_covers(index, rindex, prefix, stride, padding, kernel, f32):
+    """Does the output window at ``rindex`` include the input at ``index``?
+
+    A window reaching from ``o * stride - padding`` for ``kernel`` positions
+    covers the input position when that position is within reach, which is two
+    comparisons on where the window starts.
+    """
+
+    inside = None
+    for axis in range(len(kernel)):
+        # The reduced index counts the windows, so it is local to them; the
+        # output index counts the input positions and carries the prefix.
+        at = len(prefix) + axis
+        start = ops.mul(
+            ops.index_expr(rindex[axis], "int64"), ops.constant(int(stride[axis]), "int64")
+        )
+        # start <= index + padding, and start > index + padding - kernel
+        low = ops.le(
+            start,
+            ops.add(ops.index_expr(index[at], "int64"),
+                    ops.constant(int(padding[axis]), "int64")),
+        )
+        high = ops.gt(
+            start,
+            ops.sub(ops.add(ops.index_expr(index[at], "int64"),
+                            ops.constant(int(padding[axis]), "int64")),
+                    ops.constant(int(kernel[axis]), "int64")),
+        )
+        term = ops.and_(low, high)
+        inside = term if inside is None else ops.and_(inside, term)
+    return inside
+
+
+@register("avg_pool2d_backward.default", "avg_pool3d_backward.default")
+def lower_avg_poolnd_backward(node, grad, _input, kernel_size, stride=(), padding=0,
+                              ceil_mode=False, count_include_pad=True,
+                              divisor_override=None, **kwargs):
+    """The input's gradient as the sum of the windows that covered it.
+
+    Pooling reads the input once per window, so the input's gradient is the
+    sum of the output's gradient over every window that read that position --
+    the same sum the forward did, read the other way round.  The divisor is
+    the same one the forward divided by, so the pair stays a pair.
+    """
+
+    _, dtype, device = val_info(node_val(node))
+    ndim = 3 if "3d" in target_name(node.target) else 2
+    kernel = _pair(kernel_size, ndim)
+    stride = _pair(stride, ndim) if stride else list(kernel)
+    padding = _pair(padding, ndim) if padding else [0] * ndim
+    grad_size = [int(s) for s in grad.get_size()]
+    spatial_in = grad_size[grad_size.__len__() - ndim:]
+    spatial_out = [
+        _pool_output_size(extent, k, s, p, bool(ceil_mode))
+        for extent, k, s, p in zip(spatial_in, kernel, stride, padding)
+    ]
+    prefix = grad_size[: len(grad_size) - ndim]
+    loader = grad.make_loader()
+    f32 = "float32"
+
+    def summed(index, rindex):
+        full = list(index[: len(prefix)]) + [
+            rindex[axis] for axis in range(ndim)
+        ]
+        inside = _window_covers(
+            index, rindex, prefix, stride, padding, kernel, f32
+        )
+        return ops.masked(inside, lambda: loader(full), ops.constant(0.0, f32))
+
+    total = TensorBox(
+        Reduction(
+            device, f32, summed, (*prefix, *spatial_in), tuple(spatial_out), "sum"
+        )
+    )
+    total.realize()
+    if divisor_override is not None:
+        divisor = float(divisor_override)
+    elif count_include_pad or not any(padding):
+        divisor = float(_prod_ints(kernel))
+    else:
+        return _pool_backward_with_masked_divisor(
+            node, total, prefix, spatial_in, spatial_out, kernel, stride, padding, f32,
+            device,
+        )
+    return pointwise(
+        node,
+        lambda value: ops.truediv(value, ops.constant(divisor, f32)),
+        total,
+    )
+
+
+def _prod_ints(values) -> int:
+    out = 1
+    for value in values:
+        out *= int(value)
+    return out
+
+
+def _pool_backward_with_masked_divisor(node, total, prefix, spatial_in, spatial_out,
+                                       kernel, stride, padding, f32, device):
+    """Pooling backwards whose divisor counts only the positions inside."""
+
+    def counted(index, rindex):
+        inside = _window_covers(
+            index, rindex, prefix, stride, padding, kernel, f32
+        )
+        return ops.masked(inside, lambda: ops.constant(1.0, f32),
+                          ops.constant(0.0, f32))
+
+    count = TensorBox(
+        Reduction(
+            device, f32, counted, (*prefix, *spatial_in), tuple(spatial_out), "sum"
+        )
+    )
+    count.realize()
+    return pointwise(
+        node,
+        lambda value, seen: ops.truediv(value, seen),
+        total,
+        count,
+    )

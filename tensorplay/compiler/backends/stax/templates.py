@@ -45,6 +45,10 @@ from typing import Any, Callable, Iterator, Sequence
 __all__ = [
     "BaseConfig",
     "CONV_TEMPLATES",
+    "REDUCTION",
+    "ReductionConfigHeuristics",
+    "ReductionKernelInputs",
+    "ReductionTemplate",
     "conv1x1_via_mm",
     "conv1x1_via_product",
     "framework_convolution",
@@ -1679,7 +1683,127 @@ CONV_TEMPLATES: dict[str, dict[str, Any]] = {
 }
 
 
-CONV = ConvTemplate()
+# ---------------------------------------------------------------------------
+# reductions
+# ---------------------------------------------------------------------------
+
+
+class ReductionConfigHeuristics(TemplateConfigHeuristics):
+    """The candidates for a reduction.
+
+    A reduction's configuration is not a tile shape but a *kind*: a plain sum
+    of values, a value stream beside an index stream that yields the position
+    rather than the value, a value and an index written out together, or two
+    accumulators that produce a mean and a spread in one pass.  Which kinds
+    exist for an operation is fixed; which of them apply to a call is not, and
+    that is what this decides.
+    """
+
+    def should_run(self, inputs: KernelInputs) -> bool:
+        return isinstance(inputs, ReductionKernelInputs)
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        yield {"choice": "operator"}
+        for kind in kernel_inputs.kinds():
+            yield {"choice": "triton", "kind": kind}
+
+
+@dataclass(frozen=True)
+class ReductionKernelInputs(KernelInputs):
+    """The operands of a reduction: one value stream, and what is kept of it.
+
+    Which kinds of reduction are available depends on what the call keeps. An
+    index reduction needs an extent to reduce over and an element type it can
+    order; a pair writes two results, so the caller has to have somewhere to
+    put both; a pair of accumulators needs at least two elements to mean
+    anything, and a single one divides by zero on the way to its own answer.
+    """
+
+    extra: dict = field(default_factory=dict)
+
+    def kinds(self) -> tuple:
+        """The reduction kinds that apply here, as kernel-side names."""
+
+        available = []
+        for kind in self.extra.get("kinds") or ("value",):
+            available.append(kind)
+        return tuple(available)
+
+
+class ReductionTemplate(LoopTemplate):
+    """Reductions, measured over the forms their kernel can carry.
+
+    The kernel is the same program for every kind; what differs is how many
+    streams it carries alongside the values and which of them it stores. So the
+    kind is the whole of the choice, and the geometry around it is not a
+    choice at all -- it is the reduction's own extents, which the caller
+    already knows.
+    """
+
+    inputs_class = ReductionKernelInputs
+
+    def __init__(self):
+        super().__init__("reduction")
+        self.heuristics = ReductionConfigHeuristics()
+
+    def emitter(self) -> str:
+        return "reduction:operator+value/index/pair/moments"
+
+    def out_specs(self, meta: dict) -> tuple:
+        size = tuple(meta.get("out_size") or ())
+        if not size:
+            raise NotImplementedError("a reduction without a result shape")
+        count = int(meta.get("result_count", 1) or 1)
+        device, dtype = meta.get("device"), meta.get("out_dtype")
+        return tuple(
+            Layout(device, dtype if i == 0 else meta.get("index_dtype", "int64"),
+                   size, contiguous_stride(size))
+            for i in range(count)
+        )
+
+    def probe(self, meta: dict):
+        """A deterministic operand set for measuring a reduction's candidates."""
+
+        size = tuple(meta.get("operand_sizes") or ())
+        if len(size) != 1 or not size[0]:
+            return None
+        from .codegen.triton import _reduction_probe_feed
+
+        return _reduction_probe_feed(
+            size[0], meta.get("operand_dtype"), meta.get("device")
+        )
+
+    def generate_for(self, params: KernelTemplateParams, out_specs: tuple, meta: dict,
+                     plain_launch=None):
+        """The choice for one configuration, or ``None`` when it does not fit."""
+
+        kind = params.to_kwargs().get("kind")
+        if kind is None:
+            if plain_launch is None:
+                return None
+            return ExternChoiceCaller(
+                name="framework_reduction",
+                layout=out_specs[0] if out_specs else None,
+                description="the operation itself",
+                launcher=plain_launch,
+            )
+        if kind not in tuple(meta.get("kinds") or ()):
+            return None
+        caller = TritonChoiceCaller(
+            name=f"reduction-{kind}",
+            layout=out_specs[0] if out_specs else None,
+            description=f"{kind} reduction",
+        )
+        launcher = meta.get("reduction_launch")
+        if launcher is None:
+            return None
+        return caller.bind(launcher)
+
+
+REDUCTION = ReductionTemplate()
+
+
+TEMPLATES[REDUCTION.name] = REDUCTION
 
 
 #: Templates by the name their operators are declared under.
