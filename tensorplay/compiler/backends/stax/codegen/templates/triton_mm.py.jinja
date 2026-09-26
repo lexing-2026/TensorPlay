@@ -1,64 +1,126 @@
 {#-
-  The product with its epilogue folded in, so the accumulator never leaves
-  registers between the last multiply and the store.
+  A product of two matrices: the plainest thing a device is asked to do, and
+  the one the whole family of product kernels is measured against.
 
-  Rendered, not written out per configuration: what varies between two
-  configurations is which of the two multiply precisions is wanted, whether a
-  bias column exists, and what the store should apply -- three facts, all of
-  which are decisions rather than code.  An undefined one is an error rather
-  than a blank, because a kernel silently missing its bias store is a wrong
-  answer that measures fine.
+  One program per tile.  That launches more programs than the device can hold
+  at once, so most of them wait -- which is what the swept form is for, and why
+  this one is the one every other product kernel has to beat rather than the
+  one that is fastest.
+
+  The tile order is chosen so that the programs running at the same moment read
+  the same columns of the right operand and adjacent rows of the left: the flat
+  index is decoded by group of rows before it advances a column, and the group
+  is what makes the sharing happen.  Decoding it plainly would have every
+  program on the device reading a different part of both operands at once.
+
+  A row the last tile only partly covers is wrapped round to the start rather
+  than masked off, so the loads carry no mask; the write is masked instead,
+  because a wrapped write would land on a row that belongs to another tile.
+  Whether the contraction divides by the block is a property of the call, so it
+  arrives as a flag rather than as a test inside the loop.
 -#}
 import triton
 import triton.language as tl
 
+{#- The index type travels with the launch rather than with the body: it is a
+    property of the call, and a body that narrows an index has to name the type
+    it narrows to. #}
+INDEX_DTYPE = {{ index_dtype }}
+{#- What the accumulation happens in.  Named here because the body uses it in
+    every step of the loop and a type that differs between launches would make
+    the same source mean two different sums. #}
+ACC_TYPE = {{ acc_dtype }}
 
-@triton.jit
-def _gemm_epi_kernel(
-    a_ptr, b_ptr, bias_ptr, c_ptr,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-    EVEN_K: tl.constexpr, ALLOW_TF32: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-):
-    """Bias-and-epilogue fused C = chain(A @ B) with fp32 accumulation.
 
-    TF32 shortens the multiplier datapath when ``ALLOW_TF32`` is set (the
-    caller's global matmul switch); the accumulated sum stays fp32 either
-    way.  Output rows/cols wrap with ``% M``/``% N`` so the store needs no
-    separate bounds mask (wrapped lanes recompute identical values); loads
-    guard the k tail unless ``EVEN_K``.  ``HAS_BIAS`` adds the length-N
-    column bias to every row of the accumulator tile.
-    """
+{{ def_kernel("A", "B", outputs=("C",)) }}
+    M = {{ size("A", 0) }}
+    N = {{ size("B", 1) }}
+    K = {{ size("A", 1) }}
+    if M * N == 0:
+        # Nothing to produce.  A grid built from zero extents has no tiles, and a
+        # program that found itself here would be dividing by a width of zero a
+        # few lines down.
+        return
 
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    off_m = (pid_m * BM + tl.arange(0, BM)) % M
-    off_n = (pid_n * BN + tl.arange(0, BN)) % N
-    off_k = tl.arange(0, BK)
-    a_ptrs = a_ptr + off_m[:, None] * stride_am + off_k[None, :] * stride_ak
-    b_ptrs = b_ptr + off_k[:, None] * stride_bk + off_n[None, :] * stride_bn
-    acc = tl.zeros((BM, BN), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BK)):
-        if EVEN_K:
-            a = tl.load(a_ptrs)
-            b = tl.load(b_ptrs)
+    stride_am = {{ stride("A", 0) }}
+    stride_ak = {{ stride("A", 1) }}
+    stride_bk = {{ stride("B", 0) }}
+    stride_bn = {{ stride("B", 1) }}
+    stride_cm = {{ stride("C", 0) }}
+    stride_cn = {{ stride("C", 1) }}
+
+    pid = tl.program_id(0).to(INDEX_DTYPE)
+    grid_m = (M + BLOCK_M - 1) // BLOCK_M
+    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+
+    # Decode the flat index by group of rows before advancing a column, so that
+    # the programs running together share columns of the right operand and
+    # adjacent rows of the left.
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + (pid % group_size)
+    pid_n = (pid % width) // group_size
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(INDEX_DTYPE)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(INDEX_DTYPE)
+    # Where the left operand's rows for this tile land.  When the operand is
+    # contiguous in the way that makes the tile land on a whole number of rows,
+    # the compiler is told so and can widen the loads; otherwise the position is
+    # wrapped and the wrap is what keeps the loads in range.
+    if (stride_am == 1 and stride_ak == M) or (stride_am == K and stride_ak == 1):
+        if M >= BLOCK_M and K > 1:
+            offs_a_m = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
         else:
-            k_tail = K - k * BK
-            a = tl.load(a_ptrs, mask=off_k[None, :] < k_tail, other=0.0)
-            b = tl.load(b_ptrs, mask=off_k[:, None] < k_tail, other=0.0)
-{% if allow_tf32 %}
-        acc = tl.dot(a, b, acc, input_precision="tf32")
-{% else %}
-        acc = tl.dot(a, b, acc, input_precision="ieee")
-{% endif %}
-        a_ptrs += BK * stride_ak
-        b_ptrs += BK * stride_bk
-{% if has_bias %}
-    acc = acc + tl.load(bias_ptr + off_n)[None, :]
-{% endif %}
-    c_ptrs = c_ptr + off_m[:, None] * stride_cm + off_n[None, :] * stride_cn
-    tl.store(c_ptrs, {{ store_source }})
+            offs_a_m = rm % M
+    else:
+        offs_a_m = rm % M
+    if (stride_bk == 1 and stride_bn == K) or (stride_bk == N and stride_bn == 1):
+        if N >= BLOCK_N and K > 1:
+            offs_b_n = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+        else:
+            offs_b_n = rn % N
+    else:
+        offs_b_n = rn % N
+
+    offs_k = tl.arange(0, BLOCK_K).to(INDEX_DTYPE)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+
+    for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+        {% if not EVEN_K %}
+        # The contraction does not divide by the block, so the last step of the
+        # loop runs past the end and has to be masked.
+        a_mask = offs_k[None, :] < (K - k_idx * BLOCK_K)
+        b_mask = offs_k[:, None] < (K - k_idx * BLOCK_K)
+        {% endif %}
+        a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
+
+        a_ptrs = A + (offs_a_m[:, None] * stride_am + a_k_idx_vals * stride_ak)
+        {% if not EVEN_K %}
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        {% else %}
+        a = tl.load(a_ptrs)
+        {% endif %}
+        b_ptrs = B + (b_k_idx_vals * stride_bk + offs_b_n[None, :] * stride_bn)
+        {% if not EVEN_K %}
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        {% else %}
+        b = tl.load(b_ptrs)
+        {% endif %}
+
+        acc = tl.dot(a, b, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+
+    # The row and column positions are built again rather than kept: the loop
+    # above was over the contraction, and the two positions are two more vectors
+    # the device would otherwise be holding registers for the whole loop.
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(INDEX_DTYPE)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(INDEX_DTYPE)
+    idx_m = rm[:, None]
+    idx_n = rn[None, :]
+    mask = (idx_m < M) & (idx_n < N)
+
+    c_ptrs = C + idx_m * stride_cm + idx_n * stride_cn
+    tl.store(c_ptrs, acc, mask=mask)
