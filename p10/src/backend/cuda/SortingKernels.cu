@@ -8,6 +8,8 @@
 #include "SortUtils.cuh"
 #include "CUDALoops.cuh"
 
+#include <thrust/iterator/counting_iterator.h>
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -414,38 +416,69 @@ void sort_radix_impl(const Tensor& self_c, Tensor& values, Tensor& indices,
     Tensor offsets = Tensor::empty({slices + 1}, DType::Int32, device);
     auto stream = getCurrentCUDAStream().stream();
     const int blocks = static_cast<int>((n + kThreads - 1) / kThreads);
-    const int off_blocks = static_cast<int>((slices + 1 + kThreads - 1) / kThreads);
     sort_radix_pack_kernel<T><<<blocks, kThreads, 0, stream>>>(
         n, d_size, inner, static_cast<const T*>(self_c.data_ptr()),
         keys_a.data_ptr<Key>(), pos_a.data_ptr<int64_t>());
-    sort_radix_fill_offsets_kernel<<<off_blocks, kThreads, 0, stream>>>(
-        static_cast<int>(slices) + 1, d_size, offsets.data_ptr<int32_t>());
+    const int n_items = static_cast<int>(n);
+    if (slices != 1) {
+        // Several independent runs need their segment bounds; a single run
+        // sorts globally and never reads them.
+        const int off_blocks =
+            static_cast<int>((slices + 1 + kThreads - 1) / kThreads);
+        sort_radix_fill_offsets_kernel<<<off_blocks, kThreads, 0, stream>>>(
+            static_cast<int>(slices) + 1, d_size, offsets.data_ptr<int32_t>());
+    }
     cub::DoubleBuffer<Key> key_buf(keys_a.data_ptr<Key>(), keys_b.data_ptr<Key>());
     cub::DoubleBuffer<int64_t> pos_buf(pos_a.data_ptr<int64_t>(), pos_b.data_ptr<int64_t>());
-    const int* begin_offsets = offsets.data_ptr<int32_t>();
-    const int* end_offsets = begin_offsets + 1;
-    const int n_items = static_cast<int>(n);
-    const int n_segments = static_cast<int>(slices);
     const int bits = SortRadixTraits<T>::bit_count;
     size_t tmp_bytes = 0;
-    cudaError_t err = descending
-        ? cub::DeviceSegmentedRadixSort::SortPairsDescending(
-              nullptr, tmp_bytes, key_buf, pos_buf, n_items, n_segments,
-              begin_offsets, end_offsets, 0, bits, stream)
-        : cub::DeviceSegmentedRadixSort::SortPairs(
-              nullptr, tmp_bytes, key_buf, pos_buf, n_items, n_segments,
-              begin_offsets, end_offsets, 0, bits, stream);
-    CUDA_CHECK(err);
-    Tensor tmp = Tensor::empty({static_cast<int64_t>(std::max<size_t>(tmp_bytes, 1))},
-                               DType::UInt8, device);
-    err = descending
-        ? cub::DeviceSegmentedRadixSort::SortPairsDescending(
-              tmp.data_ptr(), tmp_bytes, key_buf, pos_buf, n_items, n_segments,
-              begin_offsets, end_offsets, 0, bits, stream)
-        : cub::DeviceSegmentedRadixSort::SortPairs(
-              tmp.data_ptr(), tmp_bytes, key_buf, pos_buf, n_items, n_segments,
-              begin_offsets, end_offsets, 0, bits, stream);
-    CUDA_CHECK(err);
+    cudaError_t err;
+    if (slices == 1) {
+        // A single run needs no segment bookkeeping, and one global sort
+        // produces the same order.  The segmented kernel carries per-segment
+        // state that dominates when there is only one segment to amortize it
+        // over -- a 1-D sort is exactly that case.
+        err = descending
+            ? cub::DeviceRadixSort::SortPairsDescending(
+                  nullptr, tmp_bytes, key_buf, pos_buf, n_items, 0, bits, stream)
+            : cub::DeviceRadixSort::SortPairs(
+                  nullptr, tmp_bytes, key_buf, pos_buf, n_items, 0, bits, stream);
+        CUDA_CHECK(err);
+        Tensor tmp = Tensor::empty(
+            {static_cast<int64_t>(std::max<size_t>(tmp_bytes, 1))}, DType::UInt8,
+            device);
+        err = descending
+            ? cub::DeviceRadixSort::SortPairsDescending(
+                  tmp.data_ptr(), tmp_bytes, key_buf, pos_buf, n_items, 0, bits,
+                  stream)
+            : cub::DeviceRadixSort::SortPairs(
+                  tmp.data_ptr(), tmp_bytes, key_buf, pos_buf, n_items, 0, bits,
+                  stream);
+        CUDA_CHECK(err);
+    } else {
+        const int* begin_offsets = offsets.data_ptr<int32_t>();
+        const int* end_offsets = begin_offsets + 1;
+        const int n_segments = static_cast<int>(slices);
+        err = descending
+            ? cub::DeviceSegmentedRadixSort::SortPairsDescending(
+                  nullptr, tmp_bytes, key_buf, pos_buf, n_items, n_segments,
+                  begin_offsets, end_offsets, 0, bits, stream)
+            : cub::DeviceSegmentedRadixSort::SortPairs(
+                  nullptr, tmp_bytes, key_buf, pos_buf, n_items, n_segments,
+                  begin_offsets, end_offsets, 0, bits, stream);
+        CUDA_CHECK(err);
+        Tensor tmp = Tensor::empty(
+            {static_cast<int64_t>(std::max<size_t>(tmp_bytes, 1))}, DType::UInt8,
+            device);
+        err = descending
+            ? cub::DeviceSegmentedRadixSort::SortPairsDescending(
+                  tmp.data_ptr(), tmp_bytes, key_buf, pos_buf, n_items,
+                  n_segments, begin_offsets, end_offsets, 0, bits, stream)
+            : cub::DeviceSegmentedRadixSort::SortPairs(
+                  tmp.data_ptr(), tmp_bytes, key_buf, pos_buf, n_items,
+                  n_segments, begin_offsets, end_offsets, 0, bits, stream);
+        CUDA_CHECK(err);
+    }
     sort_radix_unpack_kernel<T><<<blocks, kThreads, 0, stream>>>(
         n, d_size, inner, key_buf.Current(), pos_buf.Current(),
         static_cast<T*>(values.data_ptr()), indices.data_ptr<int64_t>());
@@ -465,24 +498,27 @@ void radix_sort_impl(const Tensor& self_c, Tensor& values, Tensor& indices,
 #undef TP_RADIX_CASE
 }
 
+// Maps every position of the sorted order back to its run: the run of a
+// position is the last one whose start is at or before it.  Locating it by
+// search costs a few dependent loads, which is cheaper than materialising a
+// per-position group id for the whole input just to read it back here.
 __global__ void unique_inverse_kernel(int64_t n, const int64_t* __restrict__ order,
-                                      const int64_t* __restrict__ gid,
+                                      const int64_t* __restrict__ run_starts,
+                                      int64_t num_runs,
                                       int64_t* __restrict__ inverse) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < n) inverse[order[i]] = gid[i] - 1;
-}
-
-template <typename T>
-__global__ void unique_emit_kernel(int64_t n, const T* __restrict__ sorted,
-                                   const int64_t* __restrict__ flags,
-                                   const int64_t* __restrict__ gid_inclusive,
-                                   T* __restrict__ values,
-                                   int64_t* __restrict__ starts) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= n || !flags[i]) return;
-    const int64_t g = gid_inclusive[i] - 1;
-    values[g] = sorted[i];
-    if (starts != nullptr) starts[g] = i;
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int64_t low = 0;
+    int64_t high = num_runs - 1;
+    while (low < high) {
+        const int64_t mid = (low + high + 1) >> 1;
+        if (run_starts[mid] <= i) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    inverse[order[i]] = low;
 }
 
 template <typename T>
@@ -597,6 +633,7 @@ Tensor argsort_cuda(const Tensor& self, int64_t dim, bool descending) {
 std::tuple<Tensor, Tensor, Tensor> unique_cuda(const Tensor& self, bool sorted,
                                                bool return_inverse,
                                                bool return_counts) {
+    (void)sorted;
     Tensor flat = self.contiguous().reshape({self.numel()});
     const int64_t n = flat.numel();
     Tensor values = Tensor::empty({0}, self.dtype(), self.device());
@@ -608,86 +645,90 @@ std::tuple<Tensor, Tensor, Tensor> unique_cuda(const Tensor& self, bool sorted,
     Tensor counts = return_counts ? Tensor::empty({0}, DType::Int64, self.device())
                                   : Tensor();
     if (n == 0) return std::make_tuple(values, inverse, counts);
+
     auto [sorted_vals, order] = sort_cuda(flat, 0, false);
+
+    // One pass over the sorted values yields everything the rest needs: the
+    // distinct values themselves, where each run starts, and how many runs
+    // there are.  Deriving the run boundaries this way keeps the flags and the
+    // prefix sum over the whole input out of the picture -- both are as large
+    // as the input, while the run table is as small as the output.
+    Tensor values_buffer = Tensor::empty({n}, self.dtype(), self.device());
+    Tensor run_starts = Tensor::empty({n}, DType::Int64, self.device());
+    Tensor num_selected = Tensor::empty({}, DType::Int64, self.device());
+    const auto stream = getCurrentCUDAStream().stream();
+    thrust::counting_iterator<int64_t> positions(0);
+    size_t temp_bytes = 0;
+    bool launched = false;
+#define TP_UNIQUE_SPLIT_CASE(ctype, name)                                     \
+    case DType::name: {                                                       \
+        ctype* sorted_ptr = sorted_vals.data_ptr<ctype>();                    \
+        size_t bytes = 0;                                                     \
+        CUDA_CHECK(cub::DeviceSelect::UniqueByKey(                            \
+            nullptr, bytes, sorted_ptr, positions,                            \
+            values_buffer.data_ptr<ctype>(), run_starts.data_ptr<int64_t>(),   \
+            num_selected.data_ptr<int64_t>(), static_cast<int>(n), stream));  \
+        Tensor temp = Tensor::empty(                                          \
+            {static_cast<int64_t>(std::max<size_t>(bytes, 1))},               \
+            DType::UInt8, self.device());                                     \
+        CUDA_CHECK(cub::DeviceSelect::UniqueByKey(                            \
+            temp.data_ptr(), bytes, sorted_ptr, positions,                    \
+            values_buffer.data_ptr<ctype>(), run_starts.data_ptr<int64_t>(),   \
+            num_selected.data_ptr<int64_t>(), static_cast<int>(n), stream));  \
+        temp_bytes = bytes;                                                   \
+        launched = true;                                                      \
+        break;                                                                \
+    }
+    switch (self.dtype()) {
+        TP_UNIQUE_SPLIT_CASE(float, Float32)
+        TP_UNIQUE_SPLIT_CASE(double, Float64)
+        TP_UNIQUE_SPLIT_CASE(int64_t, Int64)
+        TP_UNIQUE_SPLIT_CASE(int32_t, Int32)
+        TP_UNIQUE_SPLIT_CASE(int16_t, Int16)
+        TP_UNIQUE_SPLIT_CASE(int8_t, Int8)
+        TP_UNIQUE_SPLIT_CASE(uint8_t, UInt8)
+        TP_UNIQUE_SPLIT_CASE(uint16_t, UInt16)
+        TP_UNIQUE_SPLIT_CASE(uint32_t, UInt32)
+        TP_UNIQUE_SPLIT_CASE(uint64_t, UInt64)
+        TP_UNIQUE_SPLIT_CASE(Half, Float16)
+        TP_UNIQUE_SPLIT_CASE(BFloat16, BFloat16)
+        TP_UNIQUE_SPLIT_CASE(bool, Bool)
+        default:
+            TP_THROW(NotImplementedError, "unique: unsupported dtype on CUDA");
+    }
+#undef TP_UNIQUE_SPLIT_CASE
+    (void)temp_bytes;
+    (void)launched;
+
+    // The output shape is only known on the device, so one element crosses the
+    // bus; copying the whole run table back to read its last entry would cost
+    // more than every kernel above put together.
+    int64_t num_groups = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&num_groups, num_selected.data_ptr<int64_t>(),
+                              sizeof(num_groups), cudaMemcpyDeviceToHost,
+                              stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    values = values_buffer.slice(0, 0, num_groups);
+
     const int threads = 256;
     const int blocks = static_cast<int>((n + threads - 1) / threads);
-    Tensor flags = Tensor::zeros({n}, DType::Int64, self.device());
-#define UNIQUE_FLAGS_CASE(ctype, name) \
-    case DType::name: { \
-        const ctype* sorted = sorted_vals.data_ptr<ctype>(); \
-        gpu_kernel_with_index(flags, [=] GPU_LAMBDA(int64_t i) -> int64_t { \
-            return (i == 0 || sorted[i] != sorted[i - 1]) ? 1 : 0; \
-        }); \
-        break; \
-    }
-    switch (self.dtype()) {
-        UNIQUE_FLAGS_CASE(float, Float32)
-        UNIQUE_FLAGS_CASE(double, Float64)
-        UNIQUE_FLAGS_CASE(int64_t, Int64)
-        UNIQUE_FLAGS_CASE(int32_t, Int32)
-        UNIQUE_FLAGS_CASE(int16_t, Int16)
-        UNIQUE_FLAGS_CASE(int8_t, Int8)
-        UNIQUE_FLAGS_CASE(uint8_t, UInt8)
-        UNIQUE_FLAGS_CASE(uint16_t, UInt16)
-        UNIQUE_FLAGS_CASE(uint32_t, UInt32)
-        UNIQUE_FLAGS_CASE(uint64_t, UInt64)
-        UNIQUE_FLAGS_CASE(Half, Float16)
-        UNIQUE_FLAGS_CASE(BFloat16, BFloat16)
-        UNIQUE_FLAGS_CASE(bool, Bool)
-        default:
-            TP_THROW(NotImplementedError, "unique: unsupported dtype on CUDA");
-    }
-#undef UNIQUE_FLAGS_CASE
-    Tensor gid = flags.cumsum(0);
-    const int64_t num_groups =
-        gid.to(Device(DeviceType::CPU)).data_ptr<int64_t>()[n - 1];
-    values = Tensor::empty({num_groups}, self.dtype(), self.device());
     if (return_inverse) {
-        inverse = Tensor::empty({n}, DType::Int64, self.device());
-        unique_inverse_kernel<<<blocks, threads>>>(
-            n, order.data_ptr<int64_t>(), gid.data_ptr<int64_t>(),
-            inverse.data_ptr<int64_t>());
+        unique_inverse_kernel<<<blocks, threads, 0, stream>>>(
+            n, order.data_ptr<int64_t>(), run_starts.data_ptr<int64_t>(),
+            num_groups, inverse.data_ptr<int64_t>());
     }
-    Tensor starts;
-    int64_t* starts_ptr = nullptr;
     if (return_counts) {
-        counts = Tensor::zeros({num_groups}, DType::Int64, self.device());
-        starts = Tensor::full({num_groups}, int64_t(-1), DType::Int64,
-                              self.device());
-        starts_ptr = starts.data_ptr<int64_t>();
-    }
-#define UNIQUE_EMIT_CASE(ctype, name) \
-    case DType::name: \
-        unique_emit_kernel<ctype><<<blocks, threads>>>( \
-            n, sorted_vals.data_ptr<ctype>(), flags.data_ptr<int64_t>(), \
-            gid.data_ptr<int64_t>(), values.data_ptr<ctype>(), starts_ptr); \
-        break;
-    switch (self.dtype()) {
-        UNIQUE_EMIT_CASE(float, Float32)
-        UNIQUE_EMIT_CASE(double, Float64)
-        UNIQUE_EMIT_CASE(int64_t, Int64)
-        UNIQUE_EMIT_CASE(int32_t, Int32)
-        UNIQUE_EMIT_CASE(int16_t, Int16)
-        UNIQUE_EMIT_CASE(int8_t, Int8)
-        UNIQUE_EMIT_CASE(uint8_t, UInt8)
-        UNIQUE_EMIT_CASE(uint16_t, UInt16)
-        UNIQUE_EMIT_CASE(uint32_t, UInt32)
-        UNIQUE_EMIT_CASE(uint64_t, UInt64)
-        UNIQUE_EMIT_CASE(Half, Float16)
-        UNIQUE_EMIT_CASE(BFloat16, BFloat16)
-        UNIQUE_EMIT_CASE(bool, Bool)
-        default:
-            TP_THROW(NotImplementedError, "unique: unsupported dtype on CUDA");
-    }
-#undef UNIQUE_EMIT_CASE
-    CUDA_CHECK(cudaGetLastError());
-    if (return_counts) {
+        // A run's length is the gap to the next start; the last run ends at the
+        // end of the input.
+        counts = Tensor::empty({num_groups}, DType::Int64, self.device());
+        const int64_t* starts = run_starts.data_ptr<int64_t>();
         gpu_kernel_with_index(
             counts, [=] GPU_LAMBDA(int64_t g) -> int64_t {
-                const int64_t end = (g + 1 < num_groups) ? starts_ptr[g + 1] : n;
-                return end - starts_ptr[g];
+                const int64_t end = (g + 1 < num_groups) ? starts[g + 1] : n;
+                return end - starts[g];
             });
     }
+    CUDA_CHECK(cudaGetLastError());
     return std::make_tuple(values, inverse, counts);
 }
 
