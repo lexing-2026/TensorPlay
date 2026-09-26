@@ -560,11 +560,17 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
     }
 
     const int max_threads = sizeof(AccT) > 4 ? 256 : kMaxReduceThreads;
-    const int max_height = std::max(1, max_threads / kWarpSize);
-    // Keeping block.x at a full warp makes the CUDA warp layout independent of
-    // block.y. Threads beyond a short reduction simply carry the identity.
-    config.block_width = kWarpSize;
-    int desired_height = static_cast<int>(reduction_last_pow2(dim1));
+    // Block shape from the two iterator extents: block.x covers the reducing
+    // extent, so a short row packs several outputs into one warp instead of
+    // leaving most lanes carrying the identity; block.y then takes as many
+    // outputs as the thread budget allows.  reduction_last_pow2 already clamps
+    // both to kMaxReduceThreads.
+    const int dim0_pow2 = reduction_last_pow2(dim0);
+    const int dim1_pow2 = reduction_last_pow2(dim1);
+    config.block_width = std::min(dim0_pow2, kWarpSize);
+    const int max_height =
+        std::max(1, max_threads / std::max(1, config.block_width));
+    int desired_height = std::min(dim1_pow2, max_height);
     // Global-reduce prediction: a single-output (dim1 == 1) reduction large
     // enough to trigger the multi-CTA branch below runs with a taller block —
     // 8 warps share one CTA's completion-counter slot and staging partial,
@@ -574,8 +580,11 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
     if (reduction_on_fastest_dimension && dim1 == 1 && config.num_inputs >= 16384) {
         desired_height = std::min(8, max_height);
     }
-    config.block_height = std::min(desired_height, max_height);
-    config.block_height = std::max(1, config.block_height);
+    config.block_height = std::max(1, std::min(desired_height, max_height));
+    // A tall block can squeeze block.x below the extent-derived width; keep
+    // the row's lanes a power of two no wider than that width.
+    config.block_width = std::max(
+        1, std::min(dim0_pow2, max_threads / config.block_height));
     config.num_threads = config.block_width * config.block_height;
 
     if (reduction_on_fastest_dimension || config.ndim == 0) {
@@ -671,9 +680,13 @@ __device__ __forceinline__ AccT block_x_reduce(
         value = lane < kWarpSize ? shared[row_base + lane] : identity;
     }
 
-    // block.x is always a full warp in this implementation, so every shuffle
-    // operates within one logical reduction row.
-    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+    // Shuffles must stay inside one reduction row: with block.x narrower than
+    // a warp a row owns only the leading lanes of each group, so the walk
+    // starts at the row width.  Wider blocks were folded down to a full warp
+    // by the shared-memory phase above.
+    const int row_width =
+        config.block_width > kWarpSize ? kWarpSize : config.block_width;
+    for (int offset = row_width / 2; offset > 0; offset >>= 1) {
         value = ops.combine(value,
             reduce_warp_shuffle_down(value, 0xffffffffu, offset));
     }
