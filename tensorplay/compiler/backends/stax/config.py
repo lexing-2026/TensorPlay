@@ -1185,5 +1185,10 @@ class _EagerNumerics:
     #: A denormal is written as a zero instead of being kept.
     disable_ftz = False
 
+    #: Take a float64 operation from the device library rather than from
+    #: arithmetic.  Off because the arithmetic is faster where it exists, and
+    #: the two are not always the same answer.
+    use_device_libdevice = False
+
 
 eager_numerics = _EagerNumerics()

@@ -18,8 +18,10 @@ twice.
 from __future__ import annotations
 
 import collections
+import functools
 import dataclasses
 import itertools
+import math
 import re
 import sympy
 from typing import Any
@@ -34,8 +36,13 @@ from .....graph.experimental.sympy_functions import (
 )
 from .. import config
 from ..shape_propagation import get_broadcasted_shape
-from .common import CSE, CSEVariable
-from ..utils import IndentedBuffer
+from .common import CSE, CSEVariable, OpOverrides, PythonPrinter
+from ..utils import (
+    dtype_to_type,
+    IndentedBuffer,
+    Number,
+    op_requires_libdevice_fp64,
+)
 
 
 try:  # The shared kernel machinery this builds on.
@@ -782,3 +789,1640 @@ class TritonCSE(CSE):
         if mask := getattr(V.kernel, "_load_mask", None):
             return (cache_key, mask.name)
         return cache_key
+
+
+class TritonPrinter(PythonPrinter):  # noqa: docstring_linter
+    def _print_TruncToInt(self, expr: sympy.Expr) -> str:
+        if len(expr.args) != 1:
+            raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
+        return (
+            # pyrefly: ignore [missing-attribute]
+            f"libdevice.trunc({self._print(expr.args[0])}).to({V.kernel.index_dtype})"
+        )
+
+    def _print_TruncToFloat(self, expr: sympy.Expr) -> str:
+        if len(expr.args) != 1:
+            raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
+        # pyrefly: ignore [missing-attribute]
+        value = self._print(expr.args[0])
+        # Adding +0.0 preserves large floating results while canonicalizing
+        # libdevice.trunc(-0.0) back to Python's +0.0 materialization behavior.
+        # pyrefly: ignore [missing-attribute]
+        return f"(libdevice.trunc({value}) + tl.zeros_like({value}))"
+
+    @staticmethod
+    def _get_scalar_float_type() -> str:
+        """Return the Triton float type for scalar shape math.
+
+        Uses tl.float64 by default but falls back to tl.float32 on devices
+        that lack fp64 support (e.g. Intel Arc consumer GPUs).
+        """
+        if not device_supports_fp64(V.graph.current_device):
+            return "tl.float32"
+        return "tl.float64"
+
+    def _print_Float(self, expr: sympy.Expr) -> str:
+        if expr.is_integer:
+            # sympy considers 0.0 to be integer, but triton doesn't.
+            # this workaround prints the float as an integer
+            # xref: https://github.com/sympy/sympy/issues/26620
+            ret = str(int(expr))
+        elif config.is_fbcode() and tp.version.hip:
+            ret = f"{expr}"
+        else:
+            float_type = self._get_scalar_float_type()
+            ret = f"tl.full([], {expr}, {float_type})"
+        return ret
+
+    def _print_ToFloat(self, expr: sympy.Expr) -> str:
+        if len(expr.args) != 1:
+            raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
+        # pyrefly: ignore [bad-argument-type]
+        s = self.parenthesize(expr.args[0], PRECEDENCE["Atom"] - 0.5)
+        float_type = self._get_scalar_float_type()
+        return f"{s}.to({float_type})"
+
+    def _print_PythonMod(self, expr: sympy.Expr) -> str:
+        quot, div = expr.args
+        if quot.is_nonnegative and div.is_nonnegative:
+            return self.stringify(expr.args, " % ", PRECEDENCE["Atom"] - 0.5)
+        # pyrefly: ignore [missing-attribute]
+        quot_s = self._print(quot)
+        # pyrefly: ignore [missing-attribute]
+        div_s = self._print(div)
+        return f"triton_helpers.remainder_integer({quot_s}, {div_s})"
+
+    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        if not expr.is_integer:
+            raise AssertionError("expr must be integer")
+        quot, div = expr.args
+        if quot.is_nonnegative and div.is_nonnegative:
+            return self.stringify(expr.args, " // ", PRECEDENCE["Atom"] - 0.5)
+        # pyrefly: ignore [missing-attribute]
+        quot_s = self._print(quot)
+        # pyrefly: ignore [missing-attribute]
+        div_s = self._print(div)
+        return f"triton_helpers.div_floor_integer({quot_s},  {div_s})"
+
+    # TODO: This is wrong, when lhs, rhs > 2**53, Python does a higher
+    # precision algorithm, which we would need to replicate here
+    def _print_IntTrueDiv(self, expr: sympy.Expr) -> str:
+        return self.stringify(expr.args, " / ", PRECEDENCE["Atom"] - 0.5)
+
+    # NB: sympy.floor/ceiling produce integers, so we have to do the
+    # conversion to index dtype
+    def _print_floor(self, expr: sympy.Expr) -> str:
+        if len(expr.args) != 1:
+            raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
+        return (
+            # pyrefly: ignore [missing-attribute]
+            f"libdevice.floor({self._print(expr.args[0])}).to({V.kernel.index_dtype})"
+        )
+
+    def _print_FloorToInt(self, expr: sympy.Expr) -> str:
+        if len(expr.args) != 1:
+            raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
+        return (
+            # pyrefly: ignore [missing-attribute]
+            f"libdevice.floor({self._print(expr.args[0])}).to({V.kernel.index_dtype})"
+        )
+
+    def _print_ceiling(self, expr: sympy.Expr) -> str:
+        if len(expr.args) != 1:
+            raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
+        # pyrefly: ignore [missing-attribute]
+        return f"libdevice.ceil({self._print(expr.args[0])}).to({V.kernel.index_dtype})"
+
+    def _print_CeilToInt(self, expr: sympy.Expr) -> str:
+        if len(expr.args) != 1:
+            raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
+        # pyrefly: ignore [missing-attribute]
+        return f"libdevice.ceil({self._print(expr.args[0])}).to({V.kernel.index_dtype})"
+
+    def _helper_sqrt(self, expr: sympy.Expr) -> str:
+        # pyrefly: ignore [missing-attribute]
+        return f"tl.sqrt_rn(({self._print(expr)}).to(tl.float32))"
+
+    def _print_FloatPow(self, expr: sympy.Expr) -> str:
+        # pyrefly: ignore [missing-attribute]
+        base = self._print(expr.args[0])
+        # pyrefly: ignore [missing-attribute]
+        exp = self._print(expr.args[1])
+        # libdevice.pow requires both arguments to have the same type.
+        # Cast to float64 for precision. Falls back to float32 on devices
+        # without fp64 support. This is scalar shape math, not tensor ops.
+        float_type = self._get_scalar_float_type()
+        return f"libdevice.pow(({base}).to({float_type}), ({exp}).to({float_type}))"
+
+    def _print_PowByNatural(self, expr: sympy.Expr) -> str:
+        float_type = self._get_scalar_float_type()
+        if expr.args[0].is_Integer:
+            base = f"tl.full([], {float(expr.args[0])}, {float_type})"
+        else:
+            # pyrefly: ignore [missing-attribute]
+            base = f"({self._print(expr.args[0])}).to({float_type})"
+        exp_val = expr.args[1]
+        if exp_val.is_Integer:
+            exp = f"tl.full([], {float(exp_val)}, {float_type})"
+        else:
+            # pyrefly: ignore [missing-attribute]
+            exp = f"({self._print(exp_val)}).to({float_type})"
+        # libdevice.pow requires both arguments to have the same type.
+        # Cast to float64 for precision. Falls back to float32 on devices
+        # without fp64 support. This is scalar shape math, not tensor ops.
+        return f"libdevice.pow({base}, {exp})"
+
+    def _print_Where(self, expr: sympy.Expr) -> str:
+        c = self.doprint(expr.args[0])
+        p = self.doprint(expr.args[1])
+        q = self.doprint(expr.args[2])
+        return f"tl.where({c}, {p}, {q})"
+
+    def _print_min_max_helper(self, expr: sympy.Expr, cmp: str) -> str:
+        """
+        Helper for max/min code generation.
+        cmp: > or <
+        """
+        if len(expr.args) == 1:
+            # pyrefly: ignore [missing-attribute]
+            return self._print(expr.args[0])
+
+        mid = len(expr.args) // 2
+        cls = type(expr)
+        # pyrefly: ignore [missing-attribute]
+        a = self._print(cls(*expr.args[:mid]))
+        # pyrefly: ignore [missing-attribute]
+        b = self._print(cls(*expr.args[mid:]))
+
+        # Use a macro so we can propagate constexprs.
+        # https://github.com/triton-lang/triton/issues/3815
+        a, b = tuple(f"({x})" for x in (a, b))
+        if cmp not in (">", "<"):
+            raise AssertionError(f"Unexpected comparator: '{cmp}'")
+        return f"({a} * ({a} {cmp}= {b}) + {b} * ({b} {cmp} {a}))"
+
+    def _print_Min(self, expr: sympy.Expr) -> str:
+        return self._print_min_max_helper(expr, "<")
+
+    def _print_Max(self, expr: sympy.Expr) -> str:
+        return self._print_min_max_helper(expr, ">")
+
+    def _print_Abs(self, expr: sympy.Expr) -> str:
+        if len(expr.args) != 1:
+            raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
+        # pyrefly: ignore [missing-attribute]
+        return f"tl_math.abs({self._print(expr.args[0])})"
+
+    def _print_OpaqueUnaryFn_cos(self, expr: sympy.Expr) -> str:
+        if len(expr.args) != 1:
+            raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
+        # pyrefly: ignore [missing-attribute]
+        return f"libdevice.cos(({self._print(expr.args[0])}).to(tl.float32))"
+
+    def _print_OpaqueUnaryFn_cosh(self, expr: sympy.Expr) -> str:
+        if len(expr.args) != 1:
+            raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
+        # pyrefly: ignore [missing-attribute]
+        return f"libdevice.cosh(({self._print(expr.args[0])}).to(tl.float32))"
+
+    def _print_OpaqueUnaryFn_acos(self, expr: sympy.Expr) -> str:
+        if len(expr.args) != 1:
+            raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
+        # pyrefly: ignore [missing-attribute]
+        return f"libdevice.acos(({self._print(expr.args[0])}).to(tl.float32))"
+
+    def _print_OpaqueUnaryFn_sin(self, expr: sympy.Expr) -> str:
+        if len(expr.args) != 1:
+            raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
+        # pyrefly: ignore [missing-attribute]
+        return f"libdevice.sin(({self._print(expr.args[0])}).to(tl.float32))"
+
+    def _print_OpaqueUnaryFn_sinh(self, expr: sympy.Expr) -> str:
+        if len(expr.args) != 1:
+            raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
+        # pyrefly: ignore [missing-attribute]
+        return f"libdevice.sinh(({self._print(expr.args[0])}).to(tl.float32))"
+
+    def _print_OpaqueUnaryFn_asin(self, expr: sympy.Expr) -> str:
+        if len(expr.args) != 1:
+            raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
+        # pyrefly: ignore [missing-attribute]
+        return f"libdevice.asin(({self._print(expr.args[0])}).to(tl.float32))"
+
+    def _print_OpaqueUnaryFn_tan(self, expr: sympy.Expr) -> str:
+        if len(expr.args) != 1:
+            raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
+        # pyrefly: ignore [missing-attribute]
+        return f"libdevice.tan(({self._print(expr.args[0])}).to(tl.float32))"
+
+    def _print_OpaqueUnaryFn_tanh(self, expr: sympy.Expr) -> str:
+        if len(expr.args) != 1:
+            raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
+        # pyrefly: ignore [missing-attribute]
+        return f"libdevice.tanh(({self._print(expr.args[0])}).to(tl.float32))"
+
+    def _print_OpaqueUnaryFn_atan(self, expr: sympy.Expr) -> str:
+        if len(expr.args) != 1:
+            raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
+        # pyrefly: ignore [missing-attribute]
+        return f"libdevice.atan(({self._print(expr.args[0])}).to(tl.float32))"
+
+    def _print_OpaqueUnaryFn_log2(self, expr: sympy.Expr) -> str:
+        if len(expr.args) != 1:
+            raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
+        # pyrefly: ignore [missing-attribute]
+        return f"libdevice.log2(({self._print(expr.args[0])}).to(tl.float32))"
+
+    def _print_RoundToInt(self, expr: sympy.Expr) -> str:
+        if len(expr.args) != 1:
+            raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
+        return (
+            # pyrefly: ignore [missing-attribute]
+            f"libdevice.llrint({self._print(expr.args[0])}).to({V.kernel.index_dtype})"
+        )
+
+    def _print_RoundDecimal(self, expr: sympy.Expr) -> str:
+        if len(expr.args) != 2:
+            raise AssertionError(f"expected 2 args, got {len(expr.args)}")
+        number, ndigits = expr.args
+        if number.is_integer:
+            # ndigits < 0 should have been filtered by the sympy function
+            if ndigits >= 0:
+                raise AssertionError(f"expected ndigits < 0, got {ndigits}")
+            raise ValueError(
+                f"For integer inputs, only non-negative ndigits are currently supported, but got {ndigits}."
+            )
+
+        number_str = self.parenthesize(number, PRECEDENCE["Mul"])
+        return f"libdevice.nearbyint(1e{ndigits} * {number_str}) * 1e{-ndigits}"
+
+
+texpr = TritonPrinter().doprint
+
+
+def maybe_upcast_float32(convert_output: bool = True) -> Callable[[_T], _T]:
+    """
+    Codegen helper to upcast arguments to float32, depending on the config and dtype.
+    This decorates tl.math/libdevice codegen functions.
+    """
+
+    def maybe_upcast_arg(var) -> str:
+        upcast_string = ".to(tl.float32)" if needs_upcast_to_float32(var) else ""
+        return f"{var}{upcast_string}"
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        # Record that this function only supports float32 and float64.
+        OpDtypeSupport.register_upcast(func, convert_output)
+
+        def wrapped(*args, **kwargs) -> str:
+            # Optionally upcast args to float32.
+            upcast_args = [maybe_upcast_arg(arg) for arg in args]
+            upcast_kwargs = {key: maybe_upcast_arg(val) for key, val in kwargs.items()}
+
+            # Call the decorated function, optionally downcasting the result.
+            result = func(*upcast_args, **upcast_kwargs)
+            any_needs_upcast = convert_output and any(
+                needs_upcast_to_float32(var)
+                for var in itertools.chain(args, kwargs.values())
+            )
+            result_dtype = (
+                None
+                if not any_needs_upcast
+                else getattr(get_dtype_handler(), func.__name__)(*args, **kwargs)
+            )
+            needs_downcast = result_dtype not in (tp.float32, None)
+            downcast_string = (
+                f".to({triton_type(result_dtype)})"
+                if needs_downcast and result_dtype is not None
+                else ""
+            )
+            return f"{result}{downcast_string}"
+
+        return wrapped
+
+    return decorator  # type: ignore[return-value]
+
+
+class OpDtypeSupport:
+    """Which operations compute in a wider type than they are stored in.
+
+    A transcendental is computed in float32 whatever it is stored in, because
+    a float16 exponential computed in float16 is not the exponential. So an
+    operation that has to be widened says so here, and the emitter widens the
+    argument and narrows the result rather than writing the operation at the
+    stored width and getting a different answer.
+    """
+
+    upcast_ops: dict = {}
+
+    @staticmethod
+    def register_upcast(func, is_upcast: bool) -> None:
+        """Record that an operation computes in a wider type than it stores."""
+
+        OpDtypeSupport.upcast_ops[func] = is_upcast
+
+    @staticmethod
+    def is_upcast(op) -> bool:
+        """Whether an operation computes in a wider type than it stores."""
+
+        return OpDtypeSupport.upcast_ops.get(op, False)
+
+
+class TritonOverrides(OpOverrides):
+    """Map element-wise ops to Triton e.g., ops.to_dtype(x,...) -> x.to(...)"""
+
+    _LOG_2_E = math.log2(math.e)
+
+    @staticmethod
+    def to_dtype(
+        x,
+        dtype: tp.dtype,
+        src_dtype: tp.dtype | None = None,
+        use_compute_types=True,
+    ):
+        fp8_dtypes = (
+            tp.float8_e4m3fn,
+            tp.float8_e5m2,
+        )
+
+        def _get_min_elements_per_thread(
+            src_dtype: tp.dtype, dst_dtype: tp.dtype
+        ) -> int:
+            if src_dtype == dst_dtype:
+                # No data type conversion is needed. No requirements on min_elem_per_thread.
+                return 0
+
+            # fp8 data type conversions has min_elem_per_thread requirements.
+            # Refer to Triton implementations here:
+            # https://github.com/triton-lang/triton/blob/10f59d8ce04052521c1bc0cb3a3f8b98918fc7e3/lib/Conversion/TritonGPUToLLVM/ElementwiseOpToLLVM.cpp#L10.
+            # Triton doesn't support type conversions between fp8_e4m3 and fp8_e5m2.
+            if (
+                src_dtype in fp8_dtypes
+                and dst_dtype in fp8_dtypes
+                and src_dtype != dst_dtype
+            ):
+                raise AssertionError(
+                    "Conversions between float8_e5m2 and float8_e4m3fn is not supported!"
+                )
+            if src_dtype == tp.float8_e5m2 or dst_dtype == tp.float8_e5m2:
+                return 4
+            if src_dtype == tp.float8_e4m3fn or dst_dtype == tp.float8_e4m3fn:
+                return 2
+            # No requirements on min_elem_per_thread.
+            return 0
+
+        if src_dtype is not None:
+            # Both dtype and src_dtype are set. This is used by torch to(dtype=dtype).
+            # It takes the maximum min_elem_per_thread if there are multiple fp8 conversions
+            # in the same kernel.
+            V.kernel.min_elem_per_thread = max(
+                _get_min_elements_per_thread(src_dtype, dtype),
+                V.kernel.min_elem_per_thread,
+            )
+
+        if src_dtype is not None and use_uint8_triton_storage_for_cuda_float8_e4m3fn(
+            src_dtype
+        ):
+            x = f"triton_helpers.fp8e4m3fn_to_float32({x})"
+            src_dtype = tp.float32
+
+        if dtype == tp.bool:
+            return f"({x} != 0)"
+        elif dtype == tp.uint8 and (
+            src_dtype is not None and src_dtype.is_floating_point or src_dtype is None
+        ):
+            # to work around llvm uint conversion semantics that produces 0's for negative
+            # values when converting from floating types.
+            # optimization - if source type is known and it's not a floating type, then
+            # do not apply conversion to the intermediate type.
+            return f"{x}.to(tl.int16).to(tl.uint8)"
+
+        if use_compute_types:
+            out_dtype = triton_compute_type(dtype)
+        else:
+            out_dtype = triton_store_type(dtype)
+
+        if (
+            src_dtype is not None
+            and dtype in fp8_dtypes
+            and (src_dtype == tp.bool or is_integer_dtype(src_dtype))
+        ):
+            return f"{x}.to(tl.float32).to({out_dtype})"
+
+        return f"{x}.to({out_dtype})"
+
+    @staticmethod
+    def to_dtype_bitcast(x, dtype: tp.dtype, src_dtype: tp.dtype):
+        if src_dtype.itemsize != dtype.itemsize:
+            raise AssertionError(
+                f"itemsize mismatch: {src_dtype.itemsize} != {dtype.itemsize}"
+            )
+        # We may promote float16 or bfloat16 to float32 and cause the
+        # bitwidth of dtype to be different from the input tensor (i.e. float32).
+        # In such as case, we will have to convert the input tensor to
+        # its src_type, perform bitcast, and then convert the bit-casted
+        # tensor back to float to ensure we use values with the right precision.
+        if x.dtype != src_dtype:
+            x = f"{x}.to({triton_type(src_dtype)})"
+
+        out = f"{x}.to({triton_type(dtype)}, bitcast=True)"
+        if upcast_compute_type(dtype) != dtype:
+            out = f"{out}.to({triton_type(upcast_compute_type(dtype))})"
+
+        return out
+
+    @staticmethod
+    def _shaped_constant(value, dtype, shape):
+        type_ = dtype_to_type(dtype)
+        triton_val = constant_repr(type_(value))
+        triton_type = triton_compute_type(dtype)
+
+        # Triton's scalar_constant() treats -0.0 as 0 (since -0.0 == 0 in Python),
+        # Work around by encoding -0.0 as its IEEE 754 hex in uint and bitcasting.
+        if value == 0 and math.copysign(1.0, value) < 0:
+            if triton_type == "tl.float32":
+                return f"tl.full({shape}, 0x80000000, tl.uint32).to({triton_type}, bitcast=True)"
+            elif triton_type == "tl.float64":
+                return f"tl.full({shape}, 0x8000000000000000, tl.uint64).to({triton_type}, bitcast=True)"
+
+        # NOTE: We use tl.full here to get the expected type.
+        # Otherwise, subnormal float32 values are treated as fp64
+        # causing fp32 * fp64 promotion and different numerical results.
+        if value < 0 and not dtype.is_signed:
+            triton_signed_type = f"tl.{triton_type[4:]}"
+            return f"tl.full({shape}, {triton_val}, {triton_signed_type}).to({triton_type})"
+        else:
+            return f"tl.full({shape}, {triton_val}, {triton_type})"
+
+    @classmethod
+    def constant(cls, value, dtype):
+        return cls._shaped_constant(value, dtype, shape=[])
+
+    @staticmethod
+    def sub(x, y):
+        if (
+            isinstance(x, CSEVariable)
+            and x == y
+            and x.dtype is not None
+            and x.dtype.is_floating_point
+        ):
+            # Avoid giving LLVM a tmp - tmp pattern that it can reassociate
+            # through tmp's producer. A plain 0.0 is only valid for finite
+            # inputs; nan/inf inputs should still produce nan like x - x.
+            non_finite = f"({TritonOverrides.isnan(x)} | {TritonOverrides.isinf(x)})"
+            return f"tl.where({non_finite}, {x} * 0.0, 0.0)"
+        return f"{x} - {y}"
+
+    @classmethod
+    def _cast_libdevice_arg(cls, arg, dtype: tp.dtype) -> str:
+        if isinstance(arg, Number):
+            return cls.constant(arg, dtype)
+        if triton_arg_dtype(arg) == dtype:
+            return f"{arg}"
+        return f"({arg}).to({triton_type(dtype)})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def abs(x):
+        return f"tl_math.abs({x})"
+
+    # TODO - register these ops as having divergent dtype
+    # output if doing graph pass to remove consecutive casts
+
+    @staticmethod
+    def truediv(x, y):
+        x_dtype = getattr(x, "dtype", None)
+        y_dtype = getattr(y, "dtype", None)
+
+        if (
+            x_dtype == tp.float32
+            and y_dtype == tp.float32
+            and config.eager_numerics.division_rounding
+        ):
+            # x / y in Triton is lowered to div.full which is approx
+            # we want div_rn to adhere with eager
+            out = f"triton.language.div_rn({x}, {y})"
+        else:
+            out = f"({x} / {y})"
+
+        if low_precision_fp_var(x) or low_precision_fp_var(y):
+            out_dtype = get_dtype_handler().truediv(x, y)
+            if out_dtype in (tp.float16, tp.float32):
+                out = f"{out}.to({triton_type(out_dtype)})"
+
+        return out
+
+    @staticmethod
+    def div_rn(x, y):
+        """
+        Division with round-to-nearest rounding mode.
+        Always uses triton.language.div_rn for float32 inputs to match eager CUDA behavior.
+        """
+        x_dtype = getattr(x, "dtype", None)
+        y_dtype = getattr(y, "dtype", None)
+
+        if x_dtype == tp.float32 and y_dtype == tp.float32:
+            out = f"triton.language.div_rn({x}, {y})"
+        else:
+            # Fall back to regular division for non-float32 types
+            out = f"({x} / {y})"
+
+        if low_precision_fp_var(x) or low_precision_fp_var(y):
+            out_dtype = get_dtype_handler().truediv(x, y)
+            if out_dtype in (tp.float16, tp.float32):
+                out = f"{out}.to({triton_type(out_dtype)})"
+
+        return out
+
+    @staticmethod
+    def mod(x, y):
+        out = f"({x} % {y})"
+        if low_precision_fp_var(x) or low_precision_fp_var(y):
+            out_dtype = get_dtype_handler().mod(x, y)
+            if out_dtype in (tp.float16, tp.float32):
+                out = f"{out}.to({triton_type(out_dtype)})"
+        return out
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def exp(x):
+        """
+        When use_fast_math, use the ftz (flushing to zero) variant
+        of exponent computation.
+
+        Check https://github.com/triton-lang/triton/issues/5735 for
+        more details.
+        """
+        if config.use_fast_math:
+            return f"tl_math.exp({x})"
+        else:
+            return f"libdevice.exp({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    def exp2(x):
+        return f"libdevice.exp2({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    def expm1(x):
+        return f"libdevice.expm1({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def sqrt(x):
+        return f"tl.sqrt_rn({x})"
+
+    @staticmethod
+    def relu(x):
+        bug = config.triton.inject_relu_bug_TESTING_ONLY
+        if bug == "compile_error":
+            return "compile error!"
+        elif bug == "runtime_error":
+            # NB: this only triggers runtime error as long as input
+            # is not all zero
+            return f'triton_helpers.device_assert_then({x} == 0, "injected assert fail", {x})'
+        elif bug == "accuracy":
+            return f"{x} + 1"
+        elif bug is None:
+            return ops.maximum(ops.constant(0, tp.int32), x)
+        else:
+            raise AssertionError(
+                f"unrecognized config triton.inject_relu_bug_TESTING_ONLY = {bug!r}"
+            )
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def minimum(a, b):
+        return f"tl.minimum({a}, {b}, tl.PropagateNan.ALL)"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def maximum(a, b):
+        return f"tl.maximum({a}, {b}, tl.PropagateNan.ALL)"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def fmaximum(a, b):
+        return f"tl.maximum({a}, {b})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def where(a, b, c):
+        return f"tl.where({a}, {b}, {c})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def dot(a, b):
+        """
+        Triton code generation for lowering ops.dot to tl.dot.
+
+        The logic is as follows:
+
+        1. Downcasting for performance
+           If the data was previously upcasted to fp32, we downcast back to the
+           original dtype (e.g., fp16 or bf16) for better performance. While
+           surrounding operations may run in fp32, matmul itself is executed at the
+           original precision to optimize throughput.
+
+        2. Handling non-constant reduction masks
+           If the reduction mask is not constant and there was any operation between
+           tl.load and tl.dot, we zero out regions outside the mask using
+           tl.where(r0_mask, val, 0).
+           This ensures that values outside the mask do not contribute to the dot
+           product, preventing incorrect results.
+
+        3. Shape alignment for tl.dot
+           We massage shapes to match the tl.dot requirement of (Y, R) x (R, X).
+           Current codegen eagerly broadcasts tl.arange to create unique axes. We
+           reshape, transpose, or broadcast to align with the (Y, R) x (R, X) shape.
+           We avoid using 3D dot ((Z, Y, R) x (Z, R, X)) because 3D tl.dot has
+           poor performance. During batched matmul (bmm), we keep ZBLOCK=1 and call
+           the 2D dot kernel instead.
+        """
+        if not V.kernel.is_native_matmul:
+            raise AssertionError("expected native matmul kernel")
+        orig_a, orig_b = a, b
+
+        def is_where_needed(var):
+            # Skip if the variable doesn't have a reduction mask
+            if not any(map(prefix_is_reduction, var.mask_vars)):
+                return False
+
+            reduction_range = V.kernel.range_trees[-1]
+            if not reduction_range.is_reduction:
+                raise AssertionError("reduction_range must be a reduction")
+
+            # Skip if reduction mask was already constant
+            if V.kernel._has_constant_mask(reduction_range):
+                return False
+
+            # Skip if the variable is already zeroed outside the mask
+            # (e.g., from tl.load(..., other=0.0))
+            # TODO : track the value of outside of mask region with cse
+            for k, v in V.kernel.cse._cache.items():
+                if v == var and "tl.load" in k and "other=0.0" in k:
+                    return False
+
+            return True
+
+        def where_cond(var):
+            default = ir.Reduction.default_value("dot", var.dtype)
+            reduction_mask = [
+                tree.mask_name() for tree in V.kernel.range_trees if tree.is_reduction
+            ]
+
+            if len(reduction_mask) != 1:
+                raise AssertionError("don't tile reduction when native matmul")
+
+            where_var = TritonKernelOverrides.where(reduction_mask[0], var, default)
+            return V.kernel.cse.generate(
+                V.kernel.compute, where_var, dtype=var.dtype, shape=var.shape
+            )
+
+        # When computing expressions like ((A+1) @ (B+2)),
+        # native codegen will do
+        #
+        # a = tl.load(..., r0_mask, other=0.0)
+        # b = tl.load(..., r0_mask, other=0.0)
+        # tmp0 = a+1
+        # tmp1 = b+2
+        # tmp2 = tl.dot(tmp0, tmp1)
+        #
+        # This produces incorrect results because outside of r0_mask is not zero.
+        # So before calling tl.dot, apply tl.where to zero out values properly.
+        # TODO: Optimize - We don't need both operands to be zeroed except NaN * 0
+        if is_where_needed(orig_a):
+            a = where_cond(a)
+        if is_where_needed(orig_b):
+            b = where_cond(b)
+
+        def reshape_transpose_broadcast_for_dot(
+            value,
+            initial_shape: Sequence[sympy.Expr],
+            final_shape: Sequence[sympy.Expr],
+        ) -> str:
+            """
+            Generate a reshape, transpose, and broadcast for the tl.dot.
+            tl.dot requires specific shape requirement : (Y,R) x (R,X)
+            but the current triton codegen eagerly broadcast the tl.arange so
+            it needs to be reshaped to meet the requirement.
+
+            This is done by three steps.
+            1. remove the empty dimension (dim with size 1) and make it 2d with tl.reshape
+            2. permute the dimension if needed (e.g., (X,R) -> (R,X)) with tl.trans
+            3. broadcast if needed with broadcast_to.
+                - This shows up when matmul operand is broadcasted with torch.expand/repeat.
+                - e.g., tp.rand((16,)).expand(16,16) @ B
+
+            e.g., (Y,1,R), (Y,R) -> tl.reshape(var, (Y,R))
+            e.g., (1,X,R), (R,X) -> tl.trans(tl.reshape(var, (X,R)))
+            e.g., (1,X,1), (R,X) -> tl.broadcast_to(tl.trans(tl.reshape(var, (X,1))), (R,X))
+
+            TODO : eventually we want to remove this function when lazy broadcasting arrives
+            """
+
+            # Triton 3d dot is slower than 2d dot, so we want to keep block shape in 2d
+            # by fixing ZBLOCK=1 in the autotune config
+            if ZBLOCK in initial_shape:
+                initial_shape = ["1" if dim == ZBLOCK else dim for dim in initial_shape]
+
+            if final_shape == [YBLOCK, RBLOCK]:
+                if XBLOCK in initial_shape:
+                    raise AssertionError("left tl.dot operand cannot depend on x")
+
+                shape_2d = ["1", "1"]
+                if YBLOCK in initial_shape:
+                    shape_2d[0] = YBLOCK
+                if RBLOCK in initial_shape:
+                    shape_2d[1] = RBLOCK
+
+                # reshape it into 2d
+                value = triton_reshape(value, initial_shape, shape_2d)
+
+                # broadcast if needed
+                broadcast_needed = shape_2d != [YBLOCK, RBLOCK]
+                if broadcast_needed:
+                    value = f"tl.broadcast_to({value}, ({YBLOCK}, {RBLOCK}))"
+
+            elif final_shape == [RBLOCK, XBLOCK]:
+                if YBLOCK in initial_shape:
+                    raise AssertionError("right tl.dot operand cannot depend on y")
+
+                shape_2d = ["1", "1"]
+                if XBLOCK in initial_shape:
+                    shape_2d[0] = XBLOCK
+                if RBLOCK in initial_shape:
+                    shape_2d[1] = RBLOCK
+
+                # reshape it into 2d (X,R)
+                value = triton_reshape(value, initial_shape, shape_2d)
+
+                # transpose to (R,X)
+                value = f"tl.trans({value})"
+
+                # broadcast if needed
+                broadcast_needed = shape_2d != [XBLOCK, RBLOCK]
+                if broadcast_needed:
+                    value = f"tl.broadcast_to({value}, ({RBLOCK}, {XBLOCK}))"
+            else:
+                raise NotImplementedError
+
+            return value
+
+        if len(V.kernel.dense_size_list()) < 3:
+            raise AssertionError("tl.dot can only do mm and bmm")
+
+        XBLOCK = str(TritonSymbols.block_sizes[SymT.XBLOCK])
+        YBLOCK = str(TritonSymbols.block_sizes[SymT.YBLOCK])
+        ZBLOCK = str(TritonSymbols.block_sizes[SymT.ZBLOCK])
+        RBLOCK = str(TritonSymbols.block_sizes[SymT.R0_INDEX])
+
+        a = V.kernel.cse.generate(
+            V.kernel.compute,
+            reshape_transpose_broadcast_for_dot(a, list(a.shape), [YBLOCK, RBLOCK]),
+            dtype=a.dtype,
+            shape=(YBLOCK, RBLOCK),
+        )
+
+        b = V.kernel.cse.generate(
+            V.kernel.compute,
+            reshape_transpose_broadcast_for_dot(b, list(b.shape), [RBLOCK, XBLOCK]),
+            dtype=b.dtype,
+            shape=(RBLOCK, XBLOCK),
+        )
+
+        if torch.backends.cuda.matmul.fp32_precision == "tf32":
+            input_precision = "tf32"
+        else:
+            input_precision = "ieee"
+
+        return f'tl.dot({a}, {b}, input_precision="{input_precision}")'
+
+    @staticmethod
+    def inline_asm_elementwise(
+        *inputs,
+        asm,
+        constraints=None,
+        dtype=tp.float32,
+        is_pure=True,
+        pack=1,
+        input_dtypes=None,
+    ):
+        # Use the actual dtype, not the compute type — the asm operates on
+        # specific register types and Triton needs to know the real output type.
+        asm_triton_type = triton_type(dtype)
+        if constraints is None:
+            constraints = ", ".join(["=r"] + ["r" for _ in inputs])
+
+        # Inductor computes bf16/fp16 in fp32. For "h" (16-bit register)
+        # constraints, cast back to the original dtype so the asm sees the
+        # right register type.
+        constraint_parts = [p.strip() for p in constraints.split(",")]
+        input_constraints = [p for p in constraint_parts if not p.startswith("=")]
+        cast_inputs = []
+        for i, (inp, c) in enumerate(zip(inputs, input_constraints[: len(inputs)])):
+            if (
+                c == "h"
+                and input_dtypes is not None
+                and isinstance(inp, CSEVariable)
+                and inp.dtype != input_dtypes[i]
+            ):
+                cast_inputs.append(f"{inp}.to({triton_type(input_dtypes[i])})")
+            else:
+                cast_inputs.append(str(inp))
+
+        # Asm strings may contain real newlines (AMDGCN instructions are
+        # newline-separated; multi-line PTX blocks with .reg declarations
+        # too).  The generated code is nested inside two Python string layers:
+        #   Layer 1 : the cached wrapper .py file
+        #   Layer 2 : the Triton kernel source (a triple-quoted string
+        #             inside that wrapper, exec'd / JIT-compiled)
+        # repr() escapes \n -> \\n, then we double the backslashes so
+        # they survive both layers: \\\\n -> (L1 parse) \\n -> (L2 parse) \n.
+        asm_literal = repr(asm).replace("\\", "\\\\")
+        constraints_literal = repr(constraints).replace("\\", "\\\\")
+
+        def asm_call(args):
+            return (
+                f"tl.inline_asm_elementwise({asm_literal}, {constraints_literal}, "
+                f"[{args}], dtype={asm_triton_type}, is_pure={is_pure}, pack={pack})"
+            )
+
+        if pack <= 1:
+            return asm_call(", ".join(cast_inputs))
+
+        first_input = inputs[0]
+        compute = V.kernel.compute
+        cse = V.kernel.cse
+        result = cse.newvar(dtype=dtype, shape=first_input.shape)
+        packed_args = ", ".join(
+            f"triton_helpers.inline_asm_pack({inp}, {pack})" for inp in cast_inputs
+        )
+        compute.writeline(f"{result} = {asm_call(packed_args)}")
+        compute.writeline(
+            f"{result} = triton_helpers.inline_asm_unpack({result}, {first_input}, {pack})"
+        )
+        return result
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def cos(x):
+        return f"tl_math.cos({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def sin(x):
+        return f"tl_math.sin({x})"
+
+    @classmethod
+    def index_expr(cls, expr, dtype):
+        raise NotImplementedError("ops.index_expr not implemented outside a kernel")
+
+    @classmethod
+    def value_expr(cls, expr, dtype):
+        raise NotImplementedError("ops.value_expr not implemented outside a kernel")
+
+    @staticmethod
+    def masked(mask, body, other):
+        raise NotImplementedError("ops.masked not implemented outside a kernel")
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def lgamma(x):
+        return f"libdevice.lgamma({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def erf(x):
+        return f"libdevice.erf({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def cosh(x):
+        return f"libdevice.cosh({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def sinh(x):
+        return f"libdevice.sinh({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def acos(x):
+        return f"libdevice.acos({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def acosh(x):
+        return f"libdevice.acosh({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def asin(x):
+        return f"libdevice.asin({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def asinh(x):
+        return f"libdevice.asinh({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def atan2(x, y):
+        return f"libdevice.atan2({x}, {y})"
+
+    @staticmethod
+    def _f32_const_from_bits(bits: int) -> str:
+        return f"tl.full([], 0x{bits:08X}, tl.uint32).to(tl.float32, bitcast=True)"
+
+    @staticmethod
+    def _inline_asm_f32(asm: str, args: Sequence[Any], shape: BlockShapeType) -> Any:
+        constraints = ", ".join(["=f"] + ["f"] * len(args))
+        args_str = ", ".join(map(str, args))
+        return V.kernel.cse.generate(
+            V.kernel.compute,
+            f"tl.inline_asm_elementwise('{asm}', '{constraints}', "
+            f"[{args_str}], dtype=tl.float32, is_pure=True, pack=1)",
+            dtype=tp.float32,
+            shape=shape,
+        )
+
+    @staticmethod
+    def _cuda_atanf(x: CSEVariable) -> CSEVariable:
+        # A device's own atan for a single-precision argument, written out: a
+        # range reduction against the reciprocal of the absolute value, then a
+        # Horner polynomial in exact single-precision hex constants evaluated
+        # with a fused multiply-add, and the result brought back by pi/2
+        # reconstruction for |x| > 1, sign-bit restoration, and NaN handling.
+        # Triton's bundled libdevice uses a different approximation, and a
+        # 1 ULP atan difference can be amplified by steep consumers such as
+        # digamma near zero.
+        shape = x.shape
+
+        def gen(expr: str, dtype: tp.dtype = tp.float32) -> TritonCSEVariable:
+            return V.kernel.cse.generate(
+                V.kernel.compute, expr, dtype=dtype, shape=shape
+            )
+
+        def fma(a: Any, b: Any, c: Any) -> Any:
+            return TritonOverrides._inline_asm_f32(
+                "fma.rn.f32 $0, $1, $2, $3;", [a, b, c], shape
+            )
+
+        c = TritonOverrides._f32_const_from_bits
+        one = c(0x3F800000)
+        inf = c(0x7F800000)
+
+        abs_x = gen(f"tl_math.abs({x})")
+        large = gen(f"{abs_x} > {one}", tp.bool)
+        rcp = TritonOverrides._inline_asm_f32(
+            "rcp.approx.ftz.f32 $0, $1;", [abs_x], shape
+        )
+        z = gen(f"tl.where({large}, {rcp}, {abs_x})")
+        z2 = gen(f"{z} * {z}")
+
+        poly = fma(c(0x3B2090AA), z2, c(0xBC6BE14F))
+        poly = fma(poly, z2, c(0x3D23397E))
+        poly = fma(poly, z2, c(0xBD948A7A))
+        poly = fma(poly, z2, c(0x3DD76B21))
+        poly = fma(poly, z2, c(0xBE111E88))
+        poly = fma(poly, z2, c(0x3E4CAF60))
+        poly = fma(poly, z2, c(0xBEAAAA27))
+
+        correction = gen(f"{z2} * {poly}")
+        result = fma(correction, z, z)
+        neg_result = gen(f"-{result}")
+        pi_over_two_minus_result = fma(c(0x3F6EE581), c(0x3FD774EB), neg_result)
+        result = gen(f"tl.where({large}, {pi_over_two_minus_result}, {result})")
+
+        sign_mask = "tl.full([], 0x80000000, tl.uint32)"
+        sign = gen(f"{x}.to(tl.uint32, bitcast=True) & {sign_mask}", tp.uint32)
+        result_bits = gen(f"{result}.to(tl.uint32, bitcast=True)", tp.uint32)
+        signed_bits = gen(f"{sign} | {result_bits}", tp.uint32)
+        signed_result = gen(f"{signed_bits}.to(tl.float32, bitcast=True)")
+        not_nan = gen(f"{abs_x} <= {inf}", tp.bool)
+        return gen(f"tl.where({not_nan}, {signed_result}, {result})")
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def atan(x):
+        dtype = triton_arg_dtype(x)
+        needs_upcast = needs_upcast_to_float32(x)
+        if (
+            not tp.version.hip
+            and V.graph.get_current_device_or_throw().type == "cuda"
+            and isinstance(x, CSEVariable)
+            and (dtype == tp.float32 or needs_upcast)
+        ):
+            result_dtype = None
+            if needs_upcast:
+                result_dtype = dtype
+                x = V.kernel.cse.generate(
+                    V.kernel.compute,
+                    f"{x}.to(tl.float32)",
+                    dtype=tp.float32,
+                    shape=x.shape,
+                )
+            result = TritonOverrides._cuda_atanf(x)
+            if result_dtype is not None and result_dtype != tp.float32:
+                return f"{result}.to({triton_type(result_dtype)})"
+            return result
+
+        upcast = ".to(tl.float32)" if needs_upcast else ""
+        result = f"libdevice.atan({x}{upcast})"
+        if needs_upcast and dtype is not None and dtype != tp.float32:
+            return f"{result}.to({triton_type(dtype)})"
+        return result
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def atanh(x):
+        return f"libdevice.atanh({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def copysign(x, y):
+        return f"libdevice.copysign({x}, {y})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    def erfc(x):
+        return f"libdevice.erfc({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def erfinv(x):
+        return f"libdevice.erfinv({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def hypot(x, y):
+        return f"libdevice.hypot({x}, {y})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    def log10(x):
+        return f"libdevice.log10({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    def log2(x):
+        return f"libdevice.log2({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def ldexp(x, n):
+        return f"libdevice.ldexp({x}, {n}.to(tl.int32))"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def nextafter(x, y):
+        return f"libdevice.nextafter({x}, {y})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def logical_and(a, b):
+        return f"{a} & {b}"
+
+    @staticmethod
+    def logical_not(a):
+        return f"{a} == 0"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def logical_or(a, b):
+        return f"{a} | {b}"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def logical_xor(a, b):
+        return f"({a} ^ {b})"
+
+    @staticmethod
+    def bitwise_and(a, b):
+        return f"{a} & {b}"
+
+    @staticmethod
+    def bitwise_not(a):
+        return f"~{a}"
+
+    @staticmethod
+    def bitwise_or(a, b):
+        return f"{a} | {b}"
+
+    @staticmethod
+    def bitwise_xor(a, b):
+        return f"{a} ^ {b}"
+
+    @staticmethod
+    def bitwise_left_shift(a, b):
+        return f"{a} << {b}"
+
+    @staticmethod
+    def bitwise_right_shift(a, b):
+        return f"{a} >> {b}"
+
+    @staticmethod
+    def rand(seed, offset):
+        offset = f"({offset}).to(tl.uint32)"
+        if TritonOverrides._can_use_4x_random():
+            (block,) = V.kernel.dense_size_list()
+            return f"triton_helpers.rand4x({seed}, {offset}, {block})"
+        return f"tl.rand({seed}, {offset})"
+
+    @staticmethod
+    def _can_use_4x_random():
+        # Imported here rather than at the top: the template machinery imports
+        # this module, so a module-level import of it would be a cycle.
+        from ..templates.select_algorithm import TritonTemplateKernel
+
+        return (
+            isinstance(V.kernel, TritonKernel)
+            and not isinstance(
+                V.kernel, TritonTemplateKernel
+            )
+            and V.graph.get_current_device_or_throw().type == "cuda"
+            and V.kernel.triton_tensor_ndim() == 1
+            and not config.align_random_eager
+        )
+
+    @staticmethod
+    def rand_eager(seed, base_offset, threads_per_round, tid, vec):
+        # vec: 4 for fp32, 8 for fp16/bf16
+        tid_u32 = f"({tid}).to(tl.uint32)"
+        denom = f"(({vec})*({threads_per_round}))"
+        r = f"(({tid_u32})//({denom})*({vec}//4))"
+        tid_trunc = f"(({tid_u32})%({denom}))"
+
+        return f"triton_helpers.rand_eager_kernel({seed}, {base_offset}+{r}, {tid_trunc}, VEC={vec})"
+
+    @staticmethod
+    def randn(seed, offset):
+        offset = f"({offset}).to(tl.uint32)"
+        if TritonOverrides._can_use_4x_random():
+            (block,) = V.kernel.dense_size_list()
+            return f"triton_helpers.randn4x({seed}, {offset}, {block})"
+        return f"tl.randn({seed}, {offset})"
+
+    @staticmethod
+    def randint64(seed, offset, low, high):
+        offset = f"({offset}).to(tl.uint32)"
+        return f"triton_helpers.randint64({seed}, {offset}, {low}, {high})"
+
+    @staticmethod
+    def load_seed(name, offset):
+        raise NotImplementedError("ops.load_seed not implemented outside a kernel")
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def rsqrt(x):
+        if tp.version.hip:
+            return f"tl.rsqrt({x})"
+        else:
+            return f"libdevice.rsqrt({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    def log1p(x):
+        return f"libdevice.log1p({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def tan(x):
+        return f"libdevice.tan({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def tanh(x):
+        cse_var = V.kernel.cse.varname_map.get(x)
+        if cse_var and hasattr(cse_var, "dtype"):
+            dtype = cse_var.dtype
+        else:
+            dtype = None
+        if (
+            config.use_fast_math
+            and tp.version.hip
+            and get_triton_version() > (3, 5)
+            and dtype != tp.float64
+            and dtype is not None
+        ):
+            # Requires upstream Triton 3.6+ for latest fast_tanhf support
+            # https://github.com/triton-lang/triton/pull/8551
+            return f"libdevice.fast_tanhf({x})"
+        else:
+            return f"libdevice.tanh({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    def sigmoid(x):
+        return f"tl.sigmoid({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def signbit(x):
+        # x < 0 is wrong for -0.0 in floating point, so use libdevice for supported floating
+        # dtypes on CUDA. On XPU, libdevice.signbit has a wrong float64 signature
+        # (https://github.com/intel/intel-xpu-backend-for-triton/issues/7345); use a bitcast-based
+        # sign-bit extraction as a workaround until the triton updates.
+        if V.graph.get_current_device_or_throw().type == "xpu":
+            return (
+                f"({x}).to(tl.int64, bitcast=True) < 0 "
+                f"if ({x}).dtype is tl.float64 "
+                f"else (libdevice.signbit({x}) != 0) "
+                f"if ({x}).dtype is tl.float32 "
+                f"else {x} < 0"
+            )
+        return (
+            f"(libdevice.signbit({x}) != 0) "
+            f"if ({x}).dtype is tl.float32 or ({x}).dtype is tl.float64 "
+            f"else {x} < 0"
+        )
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def fmod(a, b):
+        return f"libdevice.fmod({a}, {b})"
+
+    @classmethod
+    def pow(cls, a, b):
+        result_dtype = get_dtype_handler().pow(a, b)
+        if result_dtype is not None and is_integer_dtype(result_dtype):
+            base = cls._cast_libdevice_arg(a, result_dtype)
+            exponent = (
+                cls.constant(b, tp.int64)
+                if isinstance(b, Number)
+                else f"{b}"
+            )
+            return f"triton_helpers.pow_integer({base}, {exponent})"
+
+        any_needs_upcast = needs_upcast_to_float32(a) or needs_upcast_to_float32(b)
+        pow_dtype = result_dtype
+        if pow_dtype not in (tp.float32, tp.float64):
+            # libdevice.pow only accepts fp32/fp64. Keep low-precision floating
+            # cases on the existing fp32 path, and otherwise fall back to fp64
+            # for symbolic integer scalar pow expressions like 2 ** ks0.
+            pow_dtype = (
+                tp.float32
+                if low_precision_fp(result_dtype) or any_needs_upcast
+                else tp.float64
+            )
+        if pow_dtype == tp.float64 and not device_supports_fp64(
+            V.graph.current_device
+        ):
+            pow_dtype = tp.float32
+            if result_dtype == tp.float64:
+                result_dtype = tp.float32
+
+        cast_a = cls._cast_libdevice_arg(a, pow_dtype)
+        cast_b = cls._cast_libdevice_arg(b, pow_dtype)
+        result = f"libdevice.pow({cast_a}, {cast_b})"
+        if result_dtype is not None and result_dtype != pow_dtype:
+            if low_precision_fp(result_dtype):
+                if any_needs_upcast:
+                    result = f"{result}.to({triton_type(result_dtype)})"
+            else:
+                result = f"{result}.to({triton_type(result_dtype)})"
+        return result
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def log(x):
+        if config.eager_numerics.use_device_libdevice:
+            # Strict numerics should use the backend math library entry point.
+            # On ROCm this maps to OCML and avoids Triton's generic log lowering.
+            return f"libdevice.log({x})"
+        return f"tl_math.log({x})"
+
+    @staticmethod
+    @maybe_upcast_float32(convert_output=False)
+    # pyrefly: ignore [bad-override]
+    def isinf(x):
+        return f"libdevice.isinf({x}).to(tl.int1)"
+
+    @staticmethod
+    @maybe_upcast_float32(convert_output=False)
+    # pyrefly: ignore [bad-override]
+    def isnan(x):
+        return f"libdevice.isnan({x}).to(tl.int1)"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def round(x):
+        return f"libdevice.nearbyint({x})"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def floor(x):
+        return f"libdevice.floor({x})"
+
+    @staticmethod
+    def floordiv(a, b):
+        # See the comment in lowering.div_mode. a and b are integer type.
+        # Notice that // in triton behaves as truncdiv instead of floordiv.
+        #
+        # We avoid feeding negative values into Triton's // operator because
+        # Triton's AxisInfo analysis incorrectly deduplicates signed division
+        # results for contiguous inputs (triton-lang/triton#XXXX). Instead we
+        # use bitwise complement (~) to make the dividend non-negative:
+        #   floor_div(a, b) = ~(~a // b) when a < 0, a // b when a >= 0
+        # For negative b we negate both operands first.
+        zero = ops.constant(0, tp.int32)
+        one = ops.constant(1, tp.int32)
+        # Guard against integer division by zero before the division to
+        # avoid undefined behavior (LLVM may optimize away a post-division
+        # check assuming UB doesn't happen). Replace b with 1 when b is 0
+        # so the division is safe, then select 0 as the final result.
+        b_zero = ops.eq(b, zero)
+        b = ops.where(b_zero, one, b)
+        b_neg = ops.lt(b, zero)
+        a = ops.where(b_neg, ops.sub(zero, a), a)
+        b = ops.where(b_neg, ops.sub(zero, b), b)
+        a_neg = ops.lt(a, zero)
+        a = ops.where(a_neg, ops.bitwise_not(a), a)
+        quot = ops.truncdiv(a, b)
+        quot = ops.where(a_neg, ops.bitwise_not(quot), quot)
+        return ops.where(b_zero, zero, quot)
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def sign(x):
+        z = ops.constant(0, tp.int32)
+        left = ops.to_dtype((ops.lt(z, x)), tp.int8)
+        right = ops.to_dtype((ops.lt(x, z)), tp.int8)
+        sub = ops.sub(left, right)
+        return f"{sub}.to({x}.dtype)"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def trunc(x):
+        return f"libdevice.trunc({x})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def truncdiv(a, b):
+        # See the comment in lowering.div_mode. a and b are integer type.
+        # Notice that // in triton behaves as truncdiv instead of floordiv
+        return f"{a} // {b}"
+
+    @staticmethod
+    @maybe_upcast_float32()
+    # pyrefly: ignore [bad-override]
+    def ceil(x):
+        return f"libdevice.ceil({x})"
+
+
+# Register the custom pow override after class creation so type checkers see
+# a plain callable instead of the class-body staticmethod descriptor.
+class TritonKernelOverrides(TritonOverrides):
+    """Map element-wise ops to Triton within a TritonKernel
+
+    Unlike TritonOverrides, these assume the code is going to be inserted into
+    the body of the main triton kernel and so it may use indexing and mask
+    variables which are assumed to already be defined in the current scope.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # happens in __init__ unlike _initialize_pointwise_overrides
+        # because the libdevice registrations are populated during lowerings
+        self._setup_libdevice_routing()
+
+    @classmethod
+    @functools.cache
+    def _setup_libdevice_routing(cls):
+        """Set up routing to libdevice implementations for fp64 inputs."""
+
+        from common import OpDecompositions
+
+        for fn_name in op_requires_libdevice_fp64:
+            if not hasattr(cls, fn_name):
+                raise AssertionError(f"missing method {fn_name} on {cls}")
+            original_impl = getattr(cls, fn_name)
+
+            def decomposition_router(x, _original_impl, _fn_name):
+                if x.dtype != tp.float64:
+                    return _original_impl(x)
+                else:
+                    return getattr(OpDecompositions, _fn_name)(x).value
+
+            if fn_name == "sigmoid":
+                if not hasattr(OpDecompositions, "sigmoid"):
+                    raise AssertionError("OpDecompositions must define sigmoid")
+                fn = functools.partial(
+                    decomposition_router, _original_impl=original_impl, _fn_name=fn_name
+                )
+                fn.__name__ = fn_name  # type: ignore[attr-defined]
+                setattr(cls, fn_name, staticmethod(fn))
+                continue
+
+            def dtype_router(x, _original_impl, _fn_name):
+                if x.dtype == tp.float64:
+                    return f"libdevice.{_fn_name}({x})"
+                else:
+                    return _original_impl(x)
+
+            fn = functools.partial(
+                dtype_router, _original_impl=original_impl, _fn_name=fn_name
+            )
+            fn.__name__ = fn_name  # type: ignore[attr-defined]
+            setattr(cls, fn_name, staticmethod(fn))
+
+    @classmethod
+    def constant(cls, value, dtype):
+        # NOTE: Cannot use shape=[] as it's not supported by triton-rocm
+        # We could use shape=[1] instead but starting with the correct
+        # ndim avoids extra `tt.expand_dim` ops appearing in the triton IR.
+        ndim = V.kernel.triton_tensor_ndim()
+        shape = [1] * ndim
+        return cls._shaped_constant(value, dtype, shape=shape)
+
+    @classmethod
+    def index_expr(cls, expr, dtype):
+        expr = _materialize_trunc_to_float_expr(expr, dtype)
+        indexing = V.kernel.indexing(
+            expr, block_ptr=False, tma_compatibility_checker=None
+        )
+        if not isinstance(indexing, IndexingOptions):
+            raise AssertionError(f"expected IndexingOptions, got {type(indexing)}")
+
+        shape: BlockShapeType
+        if indexing.expand_shape:
+            shape = indexing.expand_shape
+        else:
+            shape = TritonSymbols.get_block_shape(indexing.index)
+
+        # Our sympy expr printing casts to the current kernel index dtype.
+        # We only respect non-int32/int64 dtypes and otherwise use the current
+        # kernel indexing dtype. Value-producing uses that need to preserve an
+        # explicit int dtype are rewritten to value_expr.
+        index_dtype = V.kernel.get_index_dtype_as_torch_dtype()
+        if dtype in (tp.int32, tp.int64):
+            cast_dtype = index_dtype
+        else:
+            cast_dtype = dtype
+        # to_dtype(..., use_compute_types=True) emits the Triton compute type
+        # for cast_dtype, so the CSE metadata must be derived from that same
+        # dtype.  For example, float16 requests emit tl.float32 when compute
+        # upcasting is enabled, and should be recorded as tp.float32.
+        output_dtype = upcast_compute_type(cast_dtype)
+        var = V.kernel.cse.generate(
+            V.kernel.compute,
+            cls.to_dtype(f"({indexing.index_str})", cast_dtype),
+            dtype=output_dtype,
+            bounds=get_bounds_index_expr(expr),
+            shape=shape,
+        )
+
+        var.mask_vars = indexing.mask_vars
+        return var
+
+    @classmethod
+    def value_expr(cls, expr, dtype):
+        """
+        Like :meth:`index_expr`, but honors ``dtype`` by setting the kernel
+        index dtype before emitting, and casting the result if needed.
+        """
+        real_index_dtype = V.kernel._index_dtype
+        V.kernel._index_dtype = (
+            dtype if dtype in (tp.int32, tp.int64) else tp.int64
+        )
+        try:
+            var = cls.index_expr(expr, dtype)
+        finally:
+            V.kernel._index_dtype = real_index_dtype
+        if real_index_dtype != dtype or var.dtype != dtype:
+            var = V.kernel.cse.generate(
+                V.kernel.compute,
+                f"({var}).to({triton_type(dtype)})",
+                dtype=dtype,
+                shape=var.shape,
+            )
+        return var
+
+    @staticmethod
+    def masked(mask, body, other):
+        if mask is not None and tp.version.hip is not None:
+            mask = V.kernel.cse.generate(
+                V.kernel.compute,
+                f"{mask}.to(tl.int1)",
+                dtype=tp.bool,
+                shape=mask.shape,
+            )
+
+        nodes = body.graph.find_nodes(op="output")
+        if not nodes:
+            raise AssertionError("graph for body does not contain an output")
+
+        need_where = False
+        # If we have a tl.load with a masking operator and no other value
+        # we can add the mask here and the other value to the tl.load
+        # operator to save the branching cost.
+        for node in nodes:
+            for arg in node.args:
+                if (
+                    arg.target != "load"
+                    or should_unwrap_unspec_arg(arg.args[1])
+                    # A load whose producer is fused into this kernel is
+                    # served from the CSE store cache and emits no tl.load,
+                    # so the masked-load `other` would be silently dropped;
+                    # fall back to an explicit tl.where.
+                    or arg.args[1] in V.kernel.cse.store_cache
+                ):
+                    need_where = True
+                    break
+
+        value = None if need_where else other
+
+        with V.kernel.mask_loads(mask, value=value) as new_mask:
+            result = body()
+
+        if need_where:
+            # Remove once CSEVariables track the dtype
+            if result.bounds.is_bool:
+                other = bool(other)
+            # Take dtype from result to prevent accidental promotion
+            other = V.kernel.cse.generate(
+                V.kernel.compute,
+                f"tl.full({result}.shape, {constant_repr(other)}, {result}.dtype)",
+                bounds=ValueRanges.wrap(other),
+                dtype=result.dtype,
+                shape=result.shape,
+            )
+            ret = ops.where(new_mask, result, other)
+        else:
+            ret = result
+
+        ret.mask_vars.discard(new_mask)
+        return ret
+
+    @staticmethod
+    def load_seed(name, offset):
+        var = V.kernel.args.input(name)
+        return (
+            f"tl.load({var} + {V.kernel.args.seed_offset('load_seed_offset', offset)})"
+        )
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def frexp(x):
+        cache_key = f"frexp({x})"
+        if cse_val := V.kernel.cse.try_get(cache_key):
+            return cse_val
+
+        mantissa = V.kernel.cse.newvar(dtype=x.dtype, shape=x.shape)
+        exponent = V.kernel.cse.newvar(dtype=tp.int32, shape=x.shape)
+        V.kernel.compute.writeline(
+            f"{mantissa}, {exponent} = triton_helpers.frexp({x})"
+        )
+        V.kernel.cse.put(cache_key, (mantissa, exponent))
+        return (mantissa, exponent)
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def partial_accumulate(
+        name: str,
+        reduction_type: str,
+        value: CSEVariable,
+        extra_meta: dict[str, Any],
+    ) -> None:
+        raise NotImplementedError
+
+
+OpDtypeSupport.register_upcast(TritonOverrides.atan, True)
+OpDtypeSupport.register_upcast(TritonOverrides.pow, True)
+
+# The pointwise table that decides which of these spellings each operation
+# takes is shared with the other emitters, and is registered by whoever brings
+# that table over. Registering it here as well would set every operation twice,
+# so it is left to arrive with the table.
+
+

@@ -1987,3 +1987,54 @@ def snode_args_kwargs(snode) -> tuple[list[Any], dict[str, Any]]:
         for value in flat_args
     ]
     return pytree.tree_unflatten(flat_args, spec)
+
+
+#: The operations whose float64 form has to come from the device library rather
+#: than from arithmetic.  A float64 transcendental is not something the
+#: hardware computes, so an operation listed here is written as a call into the
+#: library when its argument is float64 and as arithmetic otherwise -- which is
+#: why the list is consulted per operation rather than baked into the emitter.
+op_requires_libdevice_fp64: OrderedSet = OrderedSet()
+
+
+def register_op_requires_libdevice_fp64(name: str) -> None:
+    """Record that an operation's float64 form comes from the device library."""
+
+    op_requires_libdevice_fp64.add(name)
+
+
+#: Everything that stands for a number: the plain Python kinds, and the symbolic
+#: kinds, which stand for a number not yet known.  A test for "is this a number"
+#: has to accept both, or it rejects a size before the size is known.
+Number = (bool, int, float, complex, tp.SymInt, tp.SymFloat, tp.SymBool)
+
+_INTEGER_DTYPES = frozenset(
+    {tp.uint8, tp.int8, tp.int16, tp.int32, tp.int64,
+     tp.uint16, tp.uint32, tp.uint64}
+)
+_COMPLEX_DTYPES = frozenset({tp.complex32, tp.complex64, tp.complex128,
+                             tp.bcomplex32})
+
+
+def dtype_to_type(dtype) -> type:
+    """The kind of plain value a number of this type is written as.
+
+    A number read out of a tensor of a given type is a plain Python value of
+    one kind, whatever width the tensor was: a count is an int and a
+    measurement is a float, not "an int8" or "a float16".  Which kind follows
+    from whether the type counts, measures, or is neither.
+    """
+
+    if not isinstance(dtype, tp.dtype):
+        raise AssertionError(f"expected an element type, got {type(dtype)}")
+
+    if dtype is tp.bool:
+        return bool
+    if dtype in _INTEGER_DTYPES:
+        return int
+    if dtype.is_floating_point:
+        return float
+    if dtype in _COMPLEX_DTYPES:
+        return complex
+
+    raise ValueError("not a type a number can be held in")
