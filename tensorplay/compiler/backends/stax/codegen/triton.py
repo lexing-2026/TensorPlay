@@ -17,6 +17,7 @@ twice.
 
 from __future__ import annotations
 
+import dataclasses
 import re
 import sympy
 from typing import Any
@@ -178,6 +179,77 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
             )
 
         return inductor_meta
+
+    def triton_tensor_ndim(self) -> int:
+        """How many dimensions a launch's value has.
+
+        A launch may compute over more ranges than its value has dimensions --
+        a reduction ranges over something the result does not -- so the count
+        is of the ranges that landed on a dimension of the value, not of the
+        ranges.
+        """
+
+        return sum(int(tree.tensor_dim is not None) for tree in self.range_trees)
+
+    def indexing_size_str(self, i: int) -> str:
+        """A subscript that selects one dimension and leaves the rest whole.
+
+        Written with one ``None`` per dimension and a ``:`` in the one wanted,
+        which is how a subscript says "all of this one" without having to say
+        how much, and therefore without the result depending on the block size
+        the launch happens to be using.
+        """
+
+        sizes = ["None"] * self.triton_tensor_ndim()
+        sizes[i] = ":"
+        return f"[{', '.join(sizes)}]"
+
+    def dense_size_list(self) -> list:
+        """The size of the value, one entry per dimension.
+
+        A dimension is one block wide however large the range behind it is,
+        because that is how much of it a launch holds at once.  A dimension no
+        range landed on is one element wide, which is what a length of one
+        says.
+        """
+
+        sizes = ["1"] * self.triton_tensor_ndim()
+        for tree in self.active_range_trees():
+            if tree.tensor_dim is not None:
+                sizes[tree.tensor_dim] = tree.block_size_str()
+        return sizes
+
+    def dense_size_str(self) -> str:
+        return f"[{', '.join(self.dense_size_list())}]"
+
+    def create_constant_mask(self, entry) -> str:
+        """A guard that is true everywhere, for a range that needs no guard.
+
+        A range that covers its whole output has nothing to hold back, so every
+        position in it is in range.  The guard is still written, because the
+        reads underneath it are written under a guard whether or not this one
+        does any work, and writing the reads differently when the guard is
+        known to be all-true would mean two spellings of every read.
+
+        When the range does not land on a dimension of the value there is
+        nothing to select, so the guard is the value itself; otherwise the
+        value is indexed down to the one dimension the range covers, since a
+        wider guard would be a guard over dimensions the range says nothing
+        about.
+        """
+
+        if entry.tensor_dim is None:
+            return (
+                f"{entry.mask_name()} = "
+                f"tl.full({self.dense_size_str()}, True, tl.int1)"
+            )
+        sizes = ["None"] * self.triton_tensor_ndim()
+        sizes[entry.tensor_dim] = ":"
+        suffix = ", ".join(sizes)
+        return (
+            f"{entry.mask_name()} = "
+            f"tl.full([{entry.block_size_str()}], True, tl.int1)[{suffix}]"
+        )
 
 
 #: Types the language spells under a different name than the dtype does, and
@@ -398,3 +470,167 @@ class TritonCSEVariable(CSEVariable):
                     mask_name := TritonSymbols.mask_name_for_symbol(V.kernel, arg)
                 ) is not None:
                     self.mask_vars.add(mask_name)
+
+
+@dataclasses.dataclass
+class BlockParameters:
+    """One read or write, as the block it moves.
+
+    A launch moves a block at a time rather than an element at a time, so what
+    a read is given is not a position but a rectangular run of positions: where
+    the run starts in each dimension, how wide it is, how the buffer is laid
+    out, and how the dimensions are ordered.  Those are kept together here
+    because they are only meaningful together -- a block of a shape that does
+    not fit the buffer it is read from is not a narrower read, it is a wrong
+    one -- and because the ways of spelling a block all need the same four.
+    """
+
+    shape: list = dataclasses.field(default_factory=list)
+    block_shape: list = dataclasses.field(default_factory=list)
+    strides: list = dataclasses.field(default_factory=list)
+    offsets: list = dataclasses.field(default_factory=list)
+
+    @dataclasses.dataclass
+    class StrideSorter:
+        """Which order the dimensions were read in, kept across a reordering.
+
+        A block may be described in one order and moved in another: the
+        description follows the layout of the buffer, the move follows the
+        order the launch computes in.  The two are reconciled at run time by
+        transposing the block, and that transposition is only possible if the
+        order it started in is recorded rather than assumed.
+        """
+
+        original_strides: list = dataclasses.field(default_factory=list)
+        sorted_indices: list = dataclasses.field(default_factory=list)
+
+        def unsort(self, x: list) -> list:
+            """Put a list that was reordered by the sort back where it was."""
+
+            if len(self.sorted_indices) == 0:
+                return x
+            assert len(x) == len(self.sorted_indices)
+            unsorted = [None] * len(x)
+            for i, j in enumerate(self.sorted_indices):
+                unsorted[j] = x[i]
+            return unsorted
+
+    stride_sorter: "BlockParameters.StrideSorter | None" = None
+
+
+@dataclasses.dataclass
+class BlockDescriptorOptions:
+    """What a read or write is, and the two ways a launch can spell it.
+
+    The same block can be handed to the runtime as a pointer into the buffer
+    together with the shape and strides to walk it, or as a descriptor the
+    runtime builds once and reuses.  Both need the same description, so it is
+    held once here and each way of spelling it is a subclass that only knows
+    how to print the call.
+    """
+
+    params: BlockParameters
+    constant_offset: sympy.Expr
+    order: list
+    mask_vars: OrderedSet
+    broadcast_shape: list
+    broadcasting_dims: list
+    final_shape: list
+
+    def format(self, name: str, roffset: bool = True) -> str:
+        raise NotImplementedError
+
+
+@dataclasses.dataclass
+class TensorDescriptorOptions(BlockDescriptorOptions):
+    """The block spelled as a descriptor the runtime builds once.
+
+    A descriptor carries the shape, the strides and the block shape, so the
+    runtime does not walk them per access.  That is worth it for a block read
+    many times and not worth the setup for one read once, which is why this is
+    one spelling of the block rather than the spelling.
+    """
+
+    def format(self, name: str, roffset: bool = True) -> str:
+        from ..loops import V
+
+        f = V.kernel.index_to_str
+        args = [
+            (
+                f"{name} + ({f(self.constant_offset)})"
+                if self.constant_offset != 0
+                else name
+            ),
+            f"shape={f(self.params.shape)}",
+            f"strides={f(self.params.strides)}",
+            f"block_shape={f(self.params.block_shape)}",
+        ]
+
+        return f"tl.make_tensor_descriptor({', '.join(args)})"
+
+
+@dataclasses.dataclass
+class BlockPtrOptions(BlockDescriptorOptions):
+    """The block spelled as a pointer plus the shape and strides to walk it.
+
+    No setup and no descriptor: the call takes the buffer's address and the
+    four things needed to walk it.  What the call costs per access is why the
+    descriptor spelling exists, so which of the two is worth it is decided by
+    how many times the block is moved rather than here.
+    """
+
+    def replace_offset(self, expr: sympy.Expr, replacement: sympy.Expr, symt) -> sympy.Expr:
+        """Put a different start in place of one dimension's offset."""
+
+        roffset = TritonSymbols.block_offsets[symt]
+        return sympy_subs(expr, {roffset: replacement})
+
+    def remove_roffsets(self, expr: sympy.Expr) -> sympy.Expr:
+        """Drop the reduction offsets, leaving a pointer that does not move.
+
+        A read that is not advanced between uses needs no offset to advance
+        from, and writing an offset that is always zero would say the read
+        moves when it does not.
+        """
+
+        for symt in TritonSymbols.reduction_types:
+            expr = self.replace_offset(expr, sympy.Integer(0), symt)
+        return expr
+
+    def format(self, name: str, roffset: bool = True) -> str:
+        from ..loops import V
+
+        f = V.kernel.index_to_str
+        offsets = [*self.params.offsets]
+        if not roffset:
+            offsets = [self.remove_roffsets(offset) for offset in offsets]
+        args = [
+            (
+                f"{name} + ({f(self.constant_offset)})"
+                if self.constant_offset != 0
+                else name
+            ),
+            f"shape={f(self.params.shape)}",
+            f"strides={f(self.params.strides)}",
+            f"block_shape={f(self.params.block_shape)}",
+            f"order={f(self.order)}",
+            f"offsets={f(offsets)}",
+        ]
+        return f"tl.make_block_ptr({', '.join(args)})"
+
+    def advance_roffset(self, symt) -> list:
+        """How far each offset moves between one use and the next.
+
+        The movement is one block along the dimension being reduced, because
+        that is the step the loop takes: the first use starts at the beginning
+        and the next starts one block later.  So the movement is the block size
+        of that dimension, which is the difference between the offset written
+        with that block size and the same offset written with zero.
+        """
+
+        rblock = TritonSymbols.block_sizes[symt]
+        return [
+            self.replace_offset(offset, rblock, symt)
+            - self.replace_offset(offset, sympy.S.Zero, symt)
+            for offset in self.params.offsets
+        ]
