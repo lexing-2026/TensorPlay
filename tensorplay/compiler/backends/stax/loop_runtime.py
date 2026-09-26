@@ -17,6 +17,7 @@ import tensorplay as tp
 
 from .ir import Buffer, ComputedBuffer, ConstantBuffer, StorageBox, TensorBox
 from .ir import ReinterpretView
+from .ir import ExternKernelAlloc, ExternKernelOut
 from .ir import FallbackKernel as IrFallbackKernel
 
 
@@ -91,7 +92,7 @@ class ExternStep(Step):
         if getattr(self.kernel, "template", None) is not None:
             self._run_template(described, env)
             return
-        self._record(self._call_target(described), env)
+        self._record(self._call_target(described, env), env)
 
     def _record(self, result, env) -> None:
         """Put what the call returned under the name of each result it has."""
@@ -99,16 +100,20 @@ class ExternStep(Step):
         for out in self.kernel.get_outputs():
             env[out.get_name()] = _dig(result, getattr(out, "indices", ()))
 
-    def _call_target(self, described) -> Any:
+    def _call_target(self, described, env) -> Any:
         """Run the call as it was written, on the operands it is given.
 
-        A description says what the call takes and what it gives back, not
-        what the result is: putting the arguments back together and then making
-        the call are two steps, and only the second one produces a value.
+        There are two ways an operation is called here, and they are called
+        differently.  One was described rather than wrapped: its arguments were
+        flattened to be checked, so they are put back together first and the
+        keywords they were written with are restored.  The other is an ordinary
+        call whose result is named -- written into a buffer this graph already
+        holds, or into one the operation allocates -- and it is given its
+        arguments in order, with the result's memory named alongside.
         """
 
-        args, kwargs = self.kernel.unflatten_args(*described)
-        target = self.kernel.op_overload
+        kernel = self.kernel
+        target = kernel.op_overload
         if not callable(target):
             # A call named by a string rather than by something callable is a
             # method call, and a method call is not described as a call to an
@@ -117,7 +122,25 @@ class ExternStep(Step):
                 f"{target!r} is not callable, so the call describing it cannot "
                 f"be made"
             )
-        return target(*args, **kwargs)
+        if isinstance(kernel, IrFallbackKernel):
+            args, kwargs = kernel.unflatten_args(*described)
+            return target(*args, **kwargs)
+        inputs, constants = described
+        operands = [*inputs, *constants, *kernel.kwargs.values()]
+        if isinstance(kernel, ExternKernelOut):
+            # The result is written into memory this graph already holds, so
+            # that memory is made here if nobody has made it: an operation that
+            # fills a buffer it is handed is not one that returns its result.
+            name = kernel.get_name()
+            if name not in env:
+                env[name] = tp.empty_strided(
+                    kernel.get_size(),
+                    kernel.get_stride(),
+                    dtype=_dtype_of(kernel.layout.dtype),
+                    device=kernel.layout.device,
+                )
+            return target(*operands, out=env[name])
+        return target(*operands)
 
     def _run_template(self, described, env) -> None:
         """Run a templated operator through the launcher its template chose.
@@ -148,7 +171,7 @@ class ExternStep(Step):
             # operator as the framework runs it, on the operands of this call.
             # Holding a launcher over those operands instead would pin them on
             # the step, and the program reuses the step for every call.
-            result = self._call_target(described)
+            result = self._call_target(described, env)
         self._record(result, env)
 
     def _bake(self, feed, described):

@@ -230,8 +230,11 @@ def tma_gemm_launch(
                                dtype=tp.float32, device=a.device)
         grid = (min(num_sms, -(-m // block_m) * -(-n // block_n)), 1, 1)
         # The order is the signature's: the operands, then their extents, then
-        # their strides, then the block extents.  The scratch's own extent and
-        # stride are one and one because the body computes a slot's offset
+        # their strides.  Everything chosen when the text was written -- the
+        # tile, the warp count, the descriptor's shape -- is a constant of the
+        # module the kernel is defined in, so there is nothing to pass for it
+        # and nothing to keep in step with the text.  The scratch's own extent
+        # and stride are one and one because the body computes a slot's offset
         # rather than reading them.
         kernel[grid](
             a, b, scratch, out,
@@ -240,9 +243,6 @@ def tma_gemm_launch(
             *(int(v) for v in a.stride()),
             *(int(v) for v in b.stride()), 1,
             *(int(v) for v in out.stride()),
-            num_sms, group_m, block_m, block_n, block_k,
-            a_row_major, b_row_major, has_workspace, allow_tf32, fast_accum,
-            TMA_SIZE, mapping_base,
             num_warps=num_warps, num_stages=num_stages,
         )
         return out

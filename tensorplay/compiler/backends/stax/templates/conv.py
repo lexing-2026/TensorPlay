@@ -33,10 +33,10 @@ from ..ir import (
     convert_shape_to_inductor,
 )
 from ..kernel_inputs import ConvKernelInputs, KernelInputs
-from .select_algorithm import ExternChoiceCaller, TritonChoiceCaller
+from .select_algorithm import call_operation, TritonChoiceCaller
 
 from .. import config
-from ..op_lowerings import register_lowering
+from ..op_lowerings import register, register_lowering
 from .mm import GEMM, tuned_addmm, tuned_mm
 from .mm_common import load_kernel_template, use_triton_template
 
@@ -268,11 +268,10 @@ class DepthwiseConvTemplate(KernelTemplate):
         if params.to_kwargs().get("choice") == "operator":
             if plain_launch is None:
                 return None
-            return ExternChoiceCaller(
-                name="framework_depthwise",
-                layout=out_specs[0] if out_specs else None,
-                description="the operation itself",
-                launcher=plain_launch,
+            return call_operation(
+                "framework_depthwise",
+                plain_launch,
+                out_specs[0] if out_specs else None,
             )
         kwargs = params.to_kwargs()
         if "BLOCK_N" not in kwargs or meta.get("transposed"):
@@ -460,11 +459,10 @@ class ConvTemplate(KernelTemplate):
         if params.to_kwargs().get("choice") == "operator":
             if plain_launch is None:
                 return None
-            return ExternChoiceCaller(
-                name="framework_convolution",
-                layout=out_specs[0] if out_specs else None,
-                description="the operation itself",
-                launcher=plain_launch,
+            return call_operation(
+                "framework_convolution",
+                plain_launch,
+                out_specs[0] if out_specs else None,
             )
         if params.to_kwargs().get("choice") == "one_by_one_product":
             return self._one_by_one_choice(out_specs, meta, plain_launch)
@@ -499,15 +497,10 @@ class ConvTemplate(KernelTemplate):
         the caller should have to arrange.
         """
 
-        return ExternChoiceCaller(
-            name="conv1x1_via_product",
-            layout=out_specs[0] if out_specs else None,
-            description=(
-                "a one-by-one convolution as the product it is: the weight's "
-                "trailing extents are squeezed, the input is read channels-"
-                "last, and the result arrives permuted"
-            ),
-            launcher=conv1x1_launch,
+        return call_operation(
+            "conv1x1_via_product",
+            conv1x1_launch,
+            out_specs[0] if out_specs else None,
         )
 
     def _product_layout(self, gemm_meta: dict, meta: dict):
@@ -746,11 +739,10 @@ class ConvBwdInputTemplate(_ConvGradientTemplate):
         if params.to_kwargs().get("choice") == "operator":
             if plain_launch is None:
                 return None
-            return ExternChoiceCaller(
-                name="framework_convolution_bwd",
-                layout=out_specs[0] if out_specs else None,
-                description="the operation itself",
-                launcher=plain_launch,
+            return call_operation(
+                "framework_convolution_bwd",
+                plain_launch,
+                out_specs[0] if out_specs else None,
             )
         if plain_launch is None:
             return None
@@ -787,11 +779,10 @@ class ConvBwdWeightTemplate(_ConvGradientTemplate):
         if params.to_kwargs().get("choice") == "operator":
             if plain_launch is None:
                 return None
-            return ExternChoiceCaller(
-                name="framework_convolution_bwd",
-                layout=out_specs[0] if out_specs else None,
-                description="the operation itself",
-                launcher=plain_launch,
+            return call_operation(
+                "framework_convolution_bwd",
+                plain_launch,
+                out_specs[0] if out_specs else None,
             )
         if plain_launch is None:
             return None
@@ -853,7 +844,9 @@ CONV_BWD_INPUT = ConvBwdInputTemplate()
 CONV_BWD_WEIGHT = ConvBwdWeightTemplate()
 
 framework_convolution = ExternKernelChoice(
-    None, "convolution", has_out_variant=False
+    tp.ops.tp.convolution, "convolution",
+    has_out_variant=False,
+    op_overload=tp.ops.tp.convolution.default,
 )
 
 def conv1x1_launch(feed: list):
@@ -1270,6 +1263,38 @@ def _tf32_allowed() -> bool:
     return bool(tp.backends.cudnn.allow_tf32)
 
 
+@register("conv2d.default", "conv2d.padding")
+def conv2d(
+    x,
+    weight,
+    bias,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    groups: int,
+):
+    """A two-dimensional call, which is the general call with nothing extended.
+
+    The general form carries a flag for a transposed call and a padding to add
+    past the edge; a call that is neither does not have those to say, so it is
+    answered by the general call rather than being a second way of computing the
+    same thing.  What the call is stays fixed here -- only the way of computing
+    it is chosen.
+    """
+
+    return convolution(
+        x,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        False,
+        (0, 0),
+        groups,
+    )
+
+
 @register_lowering(framework.convolution)
 def convolution(
     x,
@@ -1476,16 +1501,18 @@ def convolution(
 #: its own because the weight is a placeholder in it -- the operation reads the
 #: weight for the gradient's shape and never uses its values -- which is a
 #: different call from the one that reads a real weight.
-framework_dw = ExternKernelChoice(None, "dw")
+framework_dw = ExternKernelChoice(call_framework_dw, None, name="dw")
 
 #: An input gradient, likewise: the input is the placeholder here.
-framework_dx = ExternKernelChoice(None, "dx")
+framework_dx = ExternKernelChoice(call_framework_dx, None, name="dx")
 
 #: Both gradients at once, as the operation computes them.  The floor for a call
 #: that asked for two gradients, and the only candidate for one whose shape no
 #: template here is written for.
 framework_convolution_backward = ExternKernelChoice(
-    None, "convolution_backward", has_out_variant=False
+    tp.ops.tp.convolution_backward, "convolution_backward",
+    has_out_variant=False,
+    op_overload=tp.ops.tp.convolution_backward.default,
 )
 
 

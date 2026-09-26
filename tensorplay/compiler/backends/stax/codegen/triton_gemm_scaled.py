@@ -385,9 +385,8 @@ def scaled_gemm_launch(
             "GROUP_M": group_m, "NUM_SMS": num_sms, "TMA_SIZE": TMA_SIZE,
             **fetch,
         }
-        tail = [values[name] for name in _SITES[site][3]]
         kernel[grid](
-            *args, *extents, *strides, *tail,
+            *args, *extents, *strides,
             num_warps=int(config["num_warps"]), num_stages=int(config["num_stages"]),
         )
         return out

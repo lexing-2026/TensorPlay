@@ -19,7 +19,7 @@ from typing import Any
 from .triton import CHOICES
 from .select_algorithm import (
     ChoiceCaller,
-    ExternChoiceCaller,
+    call_operation,
     ExternKernelChoice,
     KernelArgs,
     TritonChoiceCaller,
@@ -146,11 +146,8 @@ class MmPlusMmTemplate(TritonTemplate):
         if kwargs.get("choice") == "operator":
             if plain_launch is None:
                 return None
-            return ExternChoiceCaller(
-                name="framework_two_products",
-                layout=layout,
-                description="the operation itself",
-                launcher=plain_launch,
+            return call_operation(
+                "framework_two_products", plain_launch, layout
             )
         if layout is None or len(layout.size) != 2:
             return None
@@ -224,7 +221,41 @@ framework = tp.ops.tp
 #: it is one call to the framework and not two: a caller who asked for
 #: the sum of two products did not ask to have them summed afterwards, and
 #: a kernel for it can keep the second product in registers.
-framework_mm_plus_mm = ExternKernelChoice(None, "mm_plus_mm")
+#: The sum of two products, as the framework does it.  The operation is
+#: defined here rather than reached for because it is a pair of ordinary
+#: products added together, which is a shape the framework has no single call
+#: for: a tuned kernel that walks both in one pass is measured against this.
+@tp.library.custom_op(
+      "stax::_mm_plus_mm", mutates_args=(), schema="(a, b, c, d) -> Tensor"
+)
+def _mm_plus_mm(a, b, c, d):
+    return tp.mm(a, b) + tp.mm(c, d)
+
+
+@_mm_plus_mm.register_fake
+def _(a, b, c, d):
+    return tp.make_tensor_with_sizes(
+        a.shape[:-1] + b.shape[-1:], dtype=a.dtype, device=a.device
+    )
+
+
+@tp.library.custom_op(
+      "stax::_mm_plus_mm_out",
+    mutates_args=(),
+    schema="(a, b, c, d, out) -> ()",
+)
+def _mm_plus_mm_out(a, b, c, d, out):
+    return tp.mm(a, b, out=out) + tp.mm(c, d, out=out)
+
+
+@_mm_plus_mm_out.register_fake
+def _(a, b, c, d, out):
+    return None
+
+
+framework_mm_plus_mm = ExternKernelChoice(
+    tp.ops.stax._mm_plus_mm, "mm_plus_mm"
+)
 
 MM_PLUS_MM_TEMPLATES = (
     MM_PLUS_MM,

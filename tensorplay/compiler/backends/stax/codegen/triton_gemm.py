@@ -743,8 +743,6 @@ def persistent_matmul_launch(
             *(int(v) for v in a.stride()),
             *(int(v) for v in b.stride()),
             *(int(v) for v in out.stride()),
-            int(num_sms), int(group_m), block_m, block_n, block_k,
-            k % block_k == 0,
             num_warps=num_warps, num_stages=num_stages,
         )
         return out
@@ -813,7 +811,6 @@ def _batched_product_launch(
             a, b, out,
             *shape_a, *shape_b, *out_size,
             *stride_a, *stride_b, *tuple(int(s) for s in out.stride()),
-            *(value for _name, value in block),
             num_warps=int(num_warps), num_stages=int(num_stages),
         )
         return out
@@ -952,7 +949,6 @@ def mm_plus_mm_launch(
             first, second, third, fourth, out,
             *shape_a, *shape_b, *shape_c, *shape_d, m, n,
             *strides[0], *strides[1], *strides[2], *strides[3], *out_stride,
-            *(value for _name, value in block),
             num_warps=int(num_warps), num_stages=int(num_stages),
         )
         return out
@@ -1102,7 +1098,6 @@ def grouped_matmul_launch(
             *size,
             *(int(v) for tensor in values for v in tensor.stride()),
             *(int(v) for v in out.stride()),
-            *(value for _name, value in block),
             num_warps=int(num_warps), num_stages=int(num_stages),
         )
         return out

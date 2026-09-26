@@ -22,6 +22,80 @@ from .triton_compat import libdevice, math, triton
 from .triton_compat import JITFunction
 
 
+def set_driver_to_cpu():
+    """Make the host backend the one launches are made through.
+
+    A host backend may not be installed at all, which is not fatal here: a
+    kernel that cannot be launched is still worth writing, and refusing to
+    write it would turn a missing optional piece into a failure to compile.
+    """
+
+    import warnings
+
+    import triton.backends
+    import triton.runtime.driver
+
+    driver = triton.runtime.driver
+    backend = triton.backends.backends.get("cpu", None)
+    if backend is None:
+        warnings.warn(
+            "could not find an active host backend; generated kernels will not "
+            "be executable"
+        )
+        return
+    if isinstance(driver.active, backend.driver):
+        return
+    driver.set_active(backend.driver())
+
+
+def _is_backend_active(name, backend):
+    """Whether this backend is the one the machine can run.
+
+    The backend knows whether it has a device, but it can be wrong about it
+    when the check runs in a subprocess where the device is not visible to
+    the library that would find it.  So where the answer would be surprising,
+    the device is asked directly instead.
+    """
+
+    if backend.driver.is_active():
+        return True
+    if name == "nvidia":
+        return tp.cuda.is_available() and tp.version.hip is None
+    if name == "amd":
+        return tp.cuda.is_available() and tp.version.hip is not None
+    return False
+
+
+def set_driver_to_gpu():
+    """Make the device backend the one launches are made through.
+
+    Compiling and launching name a target, and the runtime has to be holding
+    the matching driver before it will.  Which backend that is depends on the
+    machine, so it is asked for rather than assumed -- and a backend already
+    active is left alone, because setting one up again is not free.
+    """
+
+    import triton
+    import triton.backends
+    import triton.runtime.driver
+
+    driver = triton.runtime.driver
+    for name, backend in triton.backends.backends.items():
+        if name == "cpu" or not _is_backend_active(name, backend):
+            continue
+        # The active driver may be a lazy proxy, in which case the object it
+        # stands for is what tells whether it is already this backend's.
+        active = driver.active
+        if isinstance(active, backend.driver) or (
+            hasattr(active, "_obj")
+            and isinstance(active._obj, backend.driver)
+        ):
+            return
+        driver.set_active(backend.driver())
+        return
+    raise RuntimeError("could not find an active device backend")
+
+
 def get_backend_options_for_target(target, options=None):
     """Every option name the backend for ``target`` recognizes."""
 

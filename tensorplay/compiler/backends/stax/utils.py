@@ -1719,6 +1719,43 @@ def get_triton_attrs_descriptor_version() -> TritonAttrsDescriptorVersion:
         return TritonAttrsDescriptorVersion.V4_DICT
 
 
+def tlx_only_cuda_options() -> list[str]:
+    """Compile options that only exist in a runtime that has them.
+
+    A fork of the runtime registers its own option names, and they are only
+    known when it is installed.  A runtime without it has none of them, and
+    asking it for a name it does not have would be asking it to fail.
+    """
+
+    try:
+        from triton.language.extra.tlx.inductor.registry import (
+            tlx_only_cuda_options,
+        )
+
+        return tlx_only_cuda_options
+    except ImportError:
+        return []
+
+
+def get_triton_version(fallback: tuple[int, int] = (0, 0)) -> tuple[int, int]:
+    """The version of the runtime that will launch, as a pair of numbers.
+
+    Several decisions turn on it -- which spelling of a signature the runtime
+    understands, which options it will accept -- and comparing versions as
+    text gets "3.10" and "3.9" the wrong way round.  A runtime that is not
+    there at all leaves the decision to the caller, which is what the fallback
+    is for.
+    """
+
+    try:
+        import triton
+
+        major, minor = (int(v) for v in triton.__version__.split(".")[:2])
+        return (major, minor)
+    except ImportError:
+        return fallback
+
+
 def triton_version_uses_attrs_dict() -> bool:
     return get_triton_attrs_descriptor_version() == TritonAttrsDescriptorVersion.V4_DICT
 

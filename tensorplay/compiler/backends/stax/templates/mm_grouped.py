@@ -39,7 +39,7 @@ from .mm_common import (
 from .select_algorithm import (
     ChoiceCaller,
     realize_inputs,
-    ExternChoiceCaller,
+    call_operation,
     ExternKernelChoice,
     KernelArgs,
     TritonChoiceCaller,
@@ -70,9 +70,15 @@ from .mm_common import (
 #: A grouped product, and the same with a scale, as candidates in their own
 #: right: each is a computation the framework does in one call, and a caller
 #: who asked for it is asking for that call rather than for a product.
-framework__grouped_mm = ExternKernelChoice(None, "_grouped_mm")
+framework__grouped_mm = ExternKernelChoice(
+    tp.ops.tp._grouped_mm, "_grouped_mm",
+    has_out_variant=False,
+    op_overload=tp.ops.tp._grouped_mm.default,
+)
 framework__scaled_grouped_mm = ExternKernelChoice(
-    None, "_scaled_grouped_mm"
+    tp.ops.tp._scaled_grouped_mm, "_scaled_grouped_mm",
+    has_out_variant=False,
+    op_overload=tp.ops.tp._scaled_grouped_mm.default,
 )
 
 def grouped_mm_grid(*args):
@@ -477,11 +483,8 @@ class GroupedMmTemplate(TritonTemplate):
         if kwargs.get("choice") == "operator":
             if plain_launch is None:
                 return None
-            return ExternChoiceCaller(
-                name="framework_grouped_product",
-                layout=layout,
-                description="the operation itself",
-                launcher=plain_launch,
+            return call_operation(
+                "framework_grouped_product", plain_launch, layout
             )
         if layout is None or plain_launch is None:
             return None

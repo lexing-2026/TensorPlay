@@ -33,7 +33,7 @@ from .triton import CHOICES
 from ..op_lowerings import register_lowering
 from .select_algorithm import (
     ChoiceCaller,
-    ExternChoiceCaller,
+    call_operation,
     ExternKernelChoice,
     KernelArgs,
     TritonChoiceCaller,
@@ -50,7 +50,13 @@ import itertools
 from .ir import contiguous_stride, next_power_of_2
 
 from .mm_common import mm_grid
-from .mm import MMKernelInputs, contiguous_stride
+from .mm import (
+    MMKernelInputs,
+    contiguous_stride,
+    framework_addmm,
+    framework_mm,
+    framework_mm_dtype,
+)
 from .select_algorithm import ExternKernelChoice, TritonTemplate
 
 @SymbolicGridFn
@@ -94,16 +100,17 @@ BMM = TritonTemplate(
 #: whatever name this project's operations are registered under.
 framework = tp.ops.tp
 
-framework_mm = ExternKernelChoice(None, "mm")
-
-framework_mm_dtype = ExternKernelChoice(None, "mm_dtype")
-
-framework_addmm = ExternKernelChoice(None, "addmm")
-
-framework_int_mm = ExternKernelChoice(None, "int_mm")
+framework_int_mm = ExternKernelChoice(
+    tp.ops.tp._int_mm, "int_mm_out", name="int_mm",
+    op_overload=tp.ops.tp._int_mm.out,
+)
 
 framework_sparse_semi_structured_mm = ExternKernelChoice(
-    None, "sparse_semi_structured_mm", has_out_variant=False
+    tp.ops.tp._sparse_semi_structured_mm,
+    "sparse_semi_structured_mm",
+    name="sparse_semi_structured_mm",
+    has_out_variant=False,
+    op_overload=tp.ops.tp._sparse_semi_structured_mm.default,
 )
 
 @SymbolicGridFn

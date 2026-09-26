@@ -68,7 +68,7 @@ from .select_algorithm import (
 )
 from .select_algorithm import (
     ChoiceCaller,
-    ExternChoiceCaller,
+    call_operation,
     ExternKernelChoice,
     KernelArgs,
     TritonChoiceCaller,
@@ -153,9 +153,14 @@ GEMM_PERSISTENT = TritonTemplate(
 
 
 
-framework_scaled_mm = ExternKernelChoice(None, "scaled_mm")
+framework_scaled_mm = ExternKernelChoice(
+    tp.ops.tp._scaled_mm, "scaled_mm_out", op_overload=tp.ops.tp._scaled_mm.out
+)
 
-framework_fp8_mm = ExternKernelChoice(None, "fp8_mm")
+framework_fp8_mm = ExternKernelChoice(
+    tp.ops.tp._scaled_mm, "fp8_mm_out", name="fp8_mm",
+    op_overload=tp.ops.tp._scaled_mm.out,
+)
 
 #: The operation namespace, under a name of this project's own.  A product that
 #: defers to the framework's own multiply is measured against it, so the
@@ -516,31 +521,38 @@ blackwell_ws_persistent_device_tma_mm_template = BLACKWELL_WS_PERSISTENT_TMA
 #: A product of whole-number tiles, measured against the framework's own.  The
 #: integer kernels accumulate in a wider type on purpose, so this is a product
 #: with its own way of being done rather than the same way done faster.
-framework_mm = ExternKernelChoice(None, "mm")
+framework_mm = ExternKernelChoice(
+    tp.mm, "mm_out", op_overload=tp.ops.tp.mm.out
+)
 
 #: A product whose result is asked for in a type of its own.
-framework_mm_dtype = ExternKernelChoice(None, "mm_dtype")
+framework_mm_dtype = ExternKernelChoice(
+    tp.mm, "mm_dtype_out", name="mm_dtype", op_overload=tp.ops.tp.mm.dtype_out
+)
 
 #: A product with a bias added to it.
-framework_addmm = ExternKernelChoice(None, "addmm")
+framework_addmm = ExternKernelChoice(
+    tp.addmm, "addmm_out", op_overload=tp.ops.tp.addmm.out
+)
 
 #: A product with a bias that may be one value rather than a row of them, which
 #: is why it is a choice of its own: the shape decides which kernel the framework
 #: would reach for, and the shape is not known until the call is.
-framework_bias_addmm = ExternKernelChoice(bias_addmm, "bias_addmm")
+framework_bias_addmm = ExternKernelChoice(bias_addmm, None, name="bias_addmm")
 
 #: A product of whole-number tiles into a whole-number result, which cannot be
 #: written as an out-variant because the result's type is fixed by its inputs.
 framework__int_mm = ExternKernelChoice(
-    None, "_int_mm", has_out_variant=False
+    tp.ops.tp._int_mm, "int_mm_out", op_overload=tp.ops.tp._int_mm.out
 )
 
 #: A product of two sparse tiles that are mostly not there, whose result is
 #: sparse and so has no out-variant to be written into.
 framework__sparse_semi_structured_mm = ExternKernelChoice(
-    None,
+    tp.ops.tp._sparse_semi_structured_mm,
     "_sparse_semi_structured_mm",
     has_out_variant=False,
+    op_overload=tp.ops.tp._sparse_semi_structured_mm.default,
 )
 
 

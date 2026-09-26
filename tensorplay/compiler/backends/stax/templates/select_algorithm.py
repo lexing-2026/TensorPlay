@@ -26,6 +26,7 @@ from ..loops import V
 from .ir import ChoiceCaller, CutedslChoiceCaller
 from ..loops import contiguous_strides, dtype_name
 from ..heuristics.template.params import DictKernelTemplateParams, KernelTemplateParams
+from ..runtime.triton_helpers import get_constexprs
 from ..heuristics.registry import (
     get_template_heuristic as registry_get_template_heuristic,
 )
@@ -218,28 +219,97 @@ def make_ktc_generator(
             layout=layout,
             inputs=inputs,
         )
-class ExternChoiceCaller(ChoiceCaller):
-    """The choice that runs the operation as one library call.
+class KernelNamespace:
+    """A place to hang the operations a generated wrapper calls by name.
 
-    There is no source to hash and no region to carry: the kernel is a name
-    the runtime already knows how to launch, which is the whole reason this
-    choice is in the list.
+    The names have to survive into generated text, so they are held on an
+    object rather than only in the table that made them: what codegen writes
+    is a reference to this, and what it resolves to at run time is whatever was
+    registered under that name.
     """
 
-    def __init__(self, name, input_nodes=(), layout=None, description="",
-                 launcher=None, has_out_variant=True, op_overload=None,
-                 kwargs=None):
-        super().__init__(name, input_nodes, layout, description)
-        self.launcher = launcher
-        self.launcher_name = getattr(launcher, "__name__", None)
-        # Whether the call writes into memory the caller named or memory it
-        # allocates is a property of the operation, and it decides what kind of
-        # node describing this call turns out to be.
-        self.has_out_variant = has_out_variant
-        self.op_overload = op_overload
+
+#: The operations a generated wrapper reaches by name.
+extern_kernels = KernelNamespace()
+
+
+def call_operation(name, kernel, layout, kwargs=None, has_out_variant=True):
+    """One call of an operation, registering the operation if it is new.
+
+    A launcher the compiler was handed is an operation like any other: it just
+    happens to have arrived already built rather than named.  It is registered
+    the same way, so that everything downstream -- the trace, the generated
+    call, the identity a cache keys on -- sees one kind of thing.
+    """
+
+    if kernel is None:
+        return None
+    choice = ExternKernelChoice.lookup(name)
+    if choice is None or choice.kernel is not kernel:
+        choice = ExternKernelChoice(
+            kernel, name=name, has_out_variant=has_out_variant
+        )
+    return choice.bind(input_nodes=(), layout=layout, **(kwargs or {}))
+
+
+class ExternKernelCaller(ChoiceCaller):
+    """A call to an operation that already exists, built and ready to measure.
+
+    The choice it was made from is kept rather than copied apart, because
+    everything still needed after the call is built -- which overload the
+    operation is, whether it writes into a buffer the caller supplied or one it
+    allocates, the name a trace shows it under -- is a property of the
+    operation, and is the same however many times it is called.
+    """
+
+    def __init__(
+        self,
+        choice,
+        input_nodes=(),
+        layout=None,
+        kwargs=None,
+        *,
+        has_out_variant=True,
+    ):
+        super().__init__(choice.name, input_nodes, layout, description="")
+        self.choice = choice
         self.kwargs = kwargs or {}
-        if launcher is not None:
-            self.bind(launcher)
+        #: Whether the operation writes into memory the caller named or memory
+        #: it allocates is a property of the operation, and it decides what kind
+        #: of node describing this call turns out to be.
+        self.has_out_variant = has_out_variant
+        self.gm = choice.gm
+        self._callable = choice.to_callable()
+
+    def __str__(self) -> str:
+        return f"ExternKernelCaller({self.choice.call_name()})"
+
+    def call_name(self) -> str:
+        """The name a trace shows this call under."""
+
+        return self.choice.call_name()
+
+    def to_callable(self):
+        return self._callable
+
+    def hash_key(self) -> str:
+        """What identifies this call: the operation, and the arguments beside it.
+
+        Two calls of one operation with the same arguments are the same call,
+        so the key is the operation's own identity followed by the arguments
+        written out in a fixed order.
+        """
+
+        return "-".join(
+            [
+                self.choice.name,
+                *[
+                    f"{kwarg}={self.kwargs[kwarg]!r}"
+                    for kwarg in sorted(self.kwargs.keys())
+                ],
+                self.choice.hash_key(),
+            ]
+        )
 
     def output_node(self):
         """The result of making this choice, as a value the rest can read.
@@ -254,47 +324,50 @@ class ExternChoiceCaller(ChoiceCaller):
 
         from .. import ir
 
-        if self.launcher is not None and not isinstance(
-            self.launcher, str
-        ) and getattr(self.launcher, "produces_ir", False):
-            inner = self.launcher(*self.input_nodes)
+        if self.choice.use_fallback_kernel:
+            # The operation is one that was described rather than wrapped, so
+            # what the call needs to be described comes from the overload
+            # itself.  A description that names no overload names nothing.
+            if self.choice.op_overload is None:
+                raise AssertionError(
+                    "a call described as a fallback has to say which overload "
+                    "it is, or there is nothing to call"
+                )
+            inner = ir.FallbackKernel.create(
+                self.choice.op_overload, *self.input_nodes, **self.kwargs
+            )
+        elif self.choice.kernel_creator is not None:
+            inner = self.choice.kernel_creator(*self.input_nodes, **self.kwargs)
         else:
             cls = ir.ExternKernelOut if self.has_out_variant else ir.ExternKernelAlloc
             inner = cls(
                 layout=self.layout,
                 inputs=self.input_nodes,
-                python_kernel_name=self.call_name(),
-                kwargs=getattr(self, "kwargs", None),
-                op_overload=getattr(self, "op_overload", None),
+                python_kernel_name=self.choice.call_name(),
+                cpp_kernel_name=self.choice.cpp_kernel_name,
+                ordered_kwargs_for_cpp_kernel=(
+                    self.choice.ordered_kwargs_for_cpp_kernel
+                ),
+                op_overload=self.choice.op_overload,
+                kwargs=self.kwargs,
             )
         if "ktc" in self.annotations:
             inner.annotations["ktc"] = self.annotations["ktc"]
         return ir.TensorBox.create(inner)
 
-    def call_name(self) -> str:
-        """What a log line should call this, which is the library's own name.
+    def info_dict(self) -> dict:
+        """What is worth writing down about this choice."""
 
-        A trace is read by people looking for the operation they asked for, so
-        the name here is the one the library uses rather than one invented here.
-        """
-
-        return self.launcher_name or self.name
-
-    def hash_key(self) -> str:
-        """What identifies this choice: the library name and nothing else.
-
-        There is no source and no geometry to hash -- the library is the
-        kernel -- so the key is the name of the thing being called.  Two calls
-        with the same one are the same choice.
-        """
-
-        return self.call_name()
+        return {
+            "backend": "extern",
+            "kernel_call_name": self.choice.call_name(),
+        }
 
     def autoheuristic_id(self) -> str:
-        return "extern"
+        return f"extern_{self.choice.name}"
 
 
-class ExternKernelChoice(ExternChoiceCaller):
+class ExternKernelChoice:
     """An operation that can hold its own against a kernel, as a choice.
 
     The operation every template is measured against is not a fallback taken
@@ -315,97 +388,126 @@ class ExternKernelChoice(ExternChoiceCaller):
     def __init__(
         self,
         kernel: Callable[..., Any],
-        name: str | None = None,
+        cpp_kernel: str | None = None,
         *,
+        name: str | None = None,
         has_out_variant: bool = True,
         op_overload: Any = None,
         use_fallback_kernel: bool = False,
         kernel_creator: Callable[..., Any] | None = None,
-        cpp_kernel_name: str | None = None,
-        gm: Any = None,
     ):
-        name = name or getattr(kernel, "__name__", None) or "extern"
-        if kernel is not None and not callable(kernel):
-            raise AssertionError("an extern choice must wrap something callable")
-        # ``None`` means the kernel is the framework's own and is resolved by
-        # whatever launches it, which is the case for an operation the compiler
-        # calls by name rather than by function.  The name is still the identity
-        # that matters here, so the collision check below stands either way.
-        existing = ExternKernelChoice._registry.get(name)
-        if existing is not None and existing.kernel is not kernel:
-            raise AssertionError(f"duplicate extern choice: {name}")
-        # A registered choice is already the built thing, so it is a caller from
-        # the moment it exists: there is no source to write and no grid to
-        # compute, because the library call is the kernel.  Finishing it here
-        # rather than later is what lets a list hold extern choices and
-        # unbuilt templates side by side without either being special-cased.
-        super().__init__(
-            name=name,
-            description=f"the {name} operation itself",
-            launcher=kernel,
-        )
+        name = name or getattr(kernel, "__name__", None)
+        if not callable(kernel):
+            raise AssertionError("an extern choice has to wrap something callable")
+        existing = getattr(extern_kernels, name, None)
+        if existing is not None and existing is not kernel:
+            raise AssertionError(f"duplicate extern kernel: {name}")
         self.kernel = kernel
-        self.has_out_variant = has_out_variant
-        # The registered choice is already the built thing: there is no source
-        # to write and no grid to compute, because the library call is the
-        # kernel.  So the caller half of this is filled in here rather than
-        # built later -- a choice that had to be finished before it could be
-        # measured would be a choice nobody could put in a list.
-
-        self.op_overload = op_overload
-        self.use_fallback_kernel = use_fallback_kernel
-        self.kernel_creator = kernel_creator
+        self.name = name
         #: The name the same operation goes by when it is emitted as C++, and
         #: the graph it stands for when the choice is a whole region.  Both are
         #: absent for an ordinary library call, and both are recorded rather
         #: than inferred: a name that had to be guessed would be a name that
         #: could be guessed wrong.
-        self.cpp_kernel_name = cpp_kernel_name
-        self.gm = gm
+        self.cpp_kernel_name = cpp_kernel
+        self.has_out_variant = has_out_variant
+        setattr(extern_kernels, name, kernel)
+        self.op_overload = op_overload
+        self.use_fallback_kernel = use_fallback_kernel
+        self.kernel_creator = kernel_creator
+        self.ordered_kwargs_for_cpp_kernel: tuple = ()
+        #: There is no source for an operation that is not written out here, so
+        #: there is nothing to hash: the operation is the kernel, and the name
+        #: is the whole of its identity.
+        self.src_hash: str | None = None
+        self.gm: Any = None
         ExternKernelChoice._registry[name] = self
 
-    # -- the part that makes it usable wherever a template is ------------
+    @classmethod
+    def lookup(cls, name: str) -> "ExternKernelChoice | None":
+        return cls._registry.get(name)
+
+    def to_callable(self) -> Callable[..., Any]:
+        return getattr(extern_kernels, self.name)
+
+    def call_name(self) -> str:
+        """The name a trace shows this operation under."""
+
+        return f"extern_kernels.{self.name}"
+
+    def hash_key(self) -> str:
+        """What identifies the operation itself.
+
+        The name is the identity, but two operations can share one across
+        different builds of the library, so the function behind the name and
+        its source are hashed as well where the source can be read at all.
+        """
+
+        import inspect
+
+        from ..codecache import code_hash
+
+        fn = self.to_callable()
+        parts = [
+            self.name,
+            getattr(fn, "__name__", ""),
+            getattr(fn, "__module__", ""),
+        ]
+        try:
+            parts.append(inspect.getsource(fn))
+        except Exception:
+            pass
+        return code_hash("-".join(parts))
+
+    def bind(self, input_nodes, layout, ordered_kwargs_for_cpp_kernel=(), **kwargs):
+        """This operation, as one particular call of it."""
+
+        self.ordered_kwargs_for_cpp_kernel = ordered_kwargs_for_cpp_kernel
+        return ExternKernelCaller(
+            self,
+            input_nodes,
+            layout,
+            kwargs,
+            has_out_variant=self.has_out_variant,
+        )
+
     @property
     def uid(self) -> str:
         """Namespaced by kind, so two kinds may share a name."""
 
         return f"framework::{self.name}"
 
-    @property
-    def src_hash(self) -> str | None:
-        return None
-
     def choice_or_none(self, **kwargs: Any) -> ChoiceCaller | None:
         """The operation itself, as the choice it always is.
 
         Carries across what the call needs in order to be described rather than
-        merely named: the values it is handed, and whether the framework writes
-        into a buffer the caller supplied or one it allocates.  The second is a
-        property of the operation rather than of this call, and it decides what
-        kind of node the call becomes.
+        merely named: the values it is handed, and whether it writes into a
+        buffer the caller supplied or one it allocates.
         """
 
-        return ExternChoiceCaller(
-            name=self.name,
-            input_nodes=kwargs.get("input_nodes", ()),
-            layout=kwargs.get("layout"),
-            description="the operation itself",
-            launcher=self.kernel,
-            has_out_variant=self.has_out_variant,
-            op_overload=self.op_overload,
-            kwargs=kwargs,
-        )
+        temp_choices: list[Any] = []
+        result = self.maybe_append_choice(temp_choices, **kwargs)
+        if result is None and len(temp_choices) == 1:
+            return temp_choices[0]
+        return None
 
     def maybe_append_choice(self, choices: list, **kwargs: Any):
-        choices.append(self.choice_or_none(**kwargs))
+        # Convenience function to match the template interface, so that
+        # templates and operations can be treated the same when generating
+        # choice callers.
+        if "input_nodes" not in kwargs:
+            raise AssertionError("input_nodes argument required")
+        if "layout" not in kwargs:
+            raise AssertionError("layout argument required")
+        input_nodes = kwargs.pop("input_nodes")
+        layout = kwargs.pop("layout")
+        choices.append(
+            self.bind(input_nodes=input_nodes, layout=layout, **kwargs)
+        )
         return None
 
     def generate(self, **kwargs: Any) -> ChoiceCaller:
         return self.choice_or_none(**kwargs)
-
-    @classmethod
-    def lookup(cls, name: str) -> "ExternKernelChoice | None":
-        return cls._registry.get(name)
 
     def __repr__(self) -> str:
         return f"ExternKernelChoice({self.name})"
@@ -511,6 +613,34 @@ class TritonTemplateKernel:
 
     def __repr__(self) -> str:
         return f"TritonTemplateKernel({self.kernel_name})"
+
+
+def _compile_rendered(template, source: str, num_warps: int, num_stages: int):
+    """The rendered text, compiled, or nothing when it will not compile.
+
+    A configuration that will not compile is a configuration that cannot be
+    measured rather than a failure of the whole table: the other candidates are
+    still answers, and this one is not one of them.  So a refusal is answered
+    with nothing and the caller moves on.
+    """
+
+    from ..codegen.triton_conv import _build
+
+    try:
+        fn = _build(
+            source, f"<tensorplay-stax-{template.name}>", template.symbol
+        )
+        compiled = fn.warmup(
+            *[None] * len(fn.arg_names),
+            grid=(1,),
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        compiled._init_handles()
+    except Exception:
+        log.info("Could not compile %s at this configuration", template.name)
+        return None
+    return compiled
 
 
 class TritonTemplate(KernelTemplate):
@@ -710,16 +840,83 @@ class TritonTemplate(KernelTemplate):
                 }
             }
             meta.update(kwargs)
+            # What the kernel is written against and what the launch is written
+            # against are two different lists.  A body names a tile, an
+            # accumulation type, a bound: values chosen when the text was
+            # written, which are parameters of the kernel because they cannot
+            # change while it runs.  Everything else -- how the result is laid
+            # out, what it is called, how many programs to start -- describes
+            # the launch and is handed to the launch instead, because putting
+            # it in the signature would make the kernel take an argument it
+            # never reads, and a launch option the runtime also wants would be
+            # asked for twice under the same name.
+            # A configuration is what the kernel was written for; what the call
+            # is about -- where its result goes, which values it was handed --
+            # is what the launch is for.  The first is a constant of the module
+            # the kernel is defined in; the second is the launch's own business
+            # and would be a name the body could read but has no meaning for.
+            constexprs = {
+                k: v for k, v in kwargs.items()
+                if k not in ("layout", "input_nodes", "out_size")
+            }
             rendered = self.render_with(
-                KernelArgs(operands, outputs, meta), **meta
+                KernelArgs(operands, outputs, constexprs), **meta
             )
         else:
             meta = {k: v for k, v in kwargs.items()
                     if k not in ("layout", "input_nodes")}
             rendered = self.render(**meta)
-        kernel = self.template.__class__(
-            kernel_name=self.name, source=rendered, symbol=self.symbol,
+        # The rendered text has to be compiled before it can be launched, and
+        # the compiled form cannot be called directly: what the runtime hands
+        # back is only callable from inside a launch it has set up itself, with
+        # the grid worked out, the arguments put in the order its signature
+        # declares, and the stream passed along.  So the launch is written out
+        # from the compiled form together with what it was compiled for, and
+        # that is what the choice is bound to.
+        from ..runtime.triton_heuristics import (
+            InductorConfig,
+            TritonCompileResult,
         )
+        from ..runtime.triton_compat import Config
+
+        config_kwargs = {
+            k: v
+            for k, v in kwargs.items()
+            if k not in ("layout", "input_nodes")
+        }
+        num_warps = int(config_kwargs.get("num_warps", 4))
+        num_stages = int(config_kwargs.get("num_stages", 2))
+        compiled = _compile_rendered(
+            self, rendered, num_warps=num_warps, num_stages=num_stages
+        )
+        if compiled is None:
+            return None
+        call_args, def_args, _none = compiled._get_arg_lists(
+            compiled.kernel.src.fn.arg_names,
+            get_constexprs(compiled.kernel.src.fn),
+        )
+        result = TritonCompileResult(
+            kernel=compiled.kernel,
+            config=InductorConfig(
+                {
+                    **config_kwargs,
+                    "num_warps": num_warps,
+                    "num_stages": num_stages,
+                }
+                if not isinstance(config_kwargs, dict)
+                else InductorConfig(config_kwargs).kwargs
+            ),
+            compile_meta={
+                "constants": {"num_warps": num_warps, "num_stages": num_stages},
+                "signature": {},
+            },
+            inductor_meta={
+                "grid_type": "FixedGrid",
+                "fixed_grid": (1, 1, 1),
+            },
+        )
+        launcher = result.make_launcher()
+        launcher.__name__ = self.uid
         caller = TritonChoiceCaller(
             name=self.uid,
             input_nodes=input_nodes,
@@ -732,7 +929,7 @@ class TritonTemplate(KernelTemplate):
         # they were split into, so both are computed once here rather than
         # asked of the kernel at every launch: the kernel takes operands, and
         # how many programs to start is not something an operand can say.
-        return caller.bind(kernel)
+        return caller.bind(launcher)
 
     def choice_or_none(self, **kwargs: Any):
         """This template's choice for one configuration, or nothing if it does not fit.
@@ -804,6 +1001,9 @@ class KernelArgs:
         self.outputs = {k: dict(v) for k, v in outputs.items()}
         self.constexprs = dict(constexprs or {})
         self.index_dtype = index_dtype
+        #: The constants the body reads by name, written into the text the
+        #: first time a signature is asked for.
+        self.defines = ""
         #: The entry point's name, supplied by whatever renders this.
         self.symbol = ""
 
@@ -868,6 +1068,12 @@ class KernelArgs:
 
         symbol = symbol or self.symbol or "_kernel"
         parts = list(names) + list(outputs)
+        # Written before the decorator so the body reads them as module
+        # constants: the value is fixed at compile time, and the kernel is
+        # compiled once for the configuration these came from.
+        self.defines = "".join(
+            f"{n} = tl.constexpr({v!r})\n" for n, v in self.constexprs.items()
+        ) + f"INDEX_DTYPE = {self.index_dtype}\n"
         for name in parts:
             self._operand(name)
         params = ", ".join(f"{n}_ptr" for n in parts)
@@ -879,14 +1085,16 @@ class KernelArgs:
         for name in parts:
             rank = len(self._operand(name)["shape"])
             sizes += [f"size_{name.lower()}{d}" for d in range(rank)]
-        # A compile-time value is a parameter, not a body statement: it is
-        # chosen when the kernel is rendered and cannot change while it runs,
-        # which is exactly what a parameter the compiler may fold says.  So it
-        # is annotated in the signature, where the compiler reads that.
+        # A value chosen when the text was written -- a tile, an accumulation
+        # type, a warp count -- is a constant of the module the kernel is
+        # defined in, not an argument of the kernel.  The kernel is compiled
+        # once per configuration, so a value that cannot change while it runs
+        # has no reason to be passed in on every launch; and a constant can be
+        # read by name anywhere in the body, which an argument cannot.
         names = [*names, *outputs]
-        tail = [f"{n}: tl.constexpr" for n in self.constexprs]
-        all_params = [f"{n}_ptr" for n in names] + sizes + strides + tail
+        all_params = [f"{n}_ptr" for n in names] + sizes + strides
         return (
+            f"{self.defines}"
             "@triton.jit\n"
             f"def {symbol}({', '.join(all_params)}):"
         )
@@ -1094,7 +1302,7 @@ class AlgorithmSelectorCache:
         if len(choices) < 2:
             raise AssertionError(f"expected at least 2 choices, got {len(choices)}")
         externs = [
-            choice for choice in choices if isinstance(choice, ExternChoiceCaller)
+            choice for choice in choices if isinstance(choice, ExternKernelCaller)
         ]
         if len(externs) > 0:
             return externs[0]
@@ -1110,7 +1318,7 @@ class AlgorithmSelectorCache:
         same would spend the difference on nothing.
         """
 
-        return isinstance(choice, (ExternChoiceCaller, SubgraphChoiceCaller))
+        return isinstance(choice, (ExternKernelCaller, SubgraphChoiceCaller))
 
     @staticmethod
     def key_of(node):
@@ -1455,10 +1663,22 @@ class AlgorithmSelectorCache:
             )
 
         out_extern = tp.as_strided(out_base, out.size(), out.stride(), out_offset)
+        # What the answer is checked against, when it is going to be checked.
+        # Produced by running a candidate rather than by trusting one, so it is
+        # only produced when there is a candidate that can be run: the list
+        # holds an operation the framework already has, whose kernel is a name
+        # rather than something to call, and asking that for a result is asking
+        # it to do the one thing it does not do.  Left as nothing, the check
+        # simply does not happen rather than happening against a wrong answer.
         expected = None
         if VERIFY and choices:
-            choices[0].benchmark(*example_inputs, out=out)
-            expected = out.clone()
+            for candidate in choices:
+                try:
+                    candidate.benchmark(*example_inputs, out=out)
+                except NotImplementedError:
+                    continue
+                expected = out.clone()
+                break
         return AutotuneArgs.from_choice_args(
             example_inputs, example_inputs_extern, out, out_extern, expected
         )
@@ -1795,7 +2015,7 @@ def _need_to_fix_layout(adjusted_choices: list, op_name: str) -> bool:
     # a measured candidate is a built kernel, and a built kernel's geometry is
     # part of what it was built for
     return any(
-        (not isinstance(ktc.template, ExternChoiceCaller) for ktc in adjusted_choices)
+        (not isinstance(ktc.template, ExternKernelCaller) for ktc in adjusted_choices)
     )
 
 
