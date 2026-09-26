@@ -7570,7 +7570,7 @@ class TritonOverrides(OpOverrides):
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def log(x):
-        if config.eager_numerics.use_device_libdevice:
+        if config.eager_numerics.use_pytorch_libdevice:
             # Strict numerics should use the backend math library entry point.
             # On ROCm this maps to OCML and avoids Triton's generic log lowering.
             return f"libdevice.log({x})"
@@ -7877,10 +7877,6 @@ class TritonKernelOverrides(TritonOverrides):
 
 OpDtypeSupport.register_upcast(TritonOverrides.atan, True)
 OpDtypeSupport.register_upcast(TritonOverrides.pow, True)
-
-# The pointwise table that decides which of these spellings each operation
-# takes is shared with the other emitters, and is registered by whoever brings
-# that table over. Registering it here as well would set every operation twice,
-# so it is left to arrive with the table.
+TritonOverrides._initialize_pointwise_overrides("triton")
 
 

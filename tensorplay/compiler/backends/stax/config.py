@@ -397,12 +397,12 @@ max_autotune_gemm = os.environ.get("TP_MAX_AUTOTUNE_GEMM", "0") == "1"
 # measured against a set of tiles are two different questions, and which one is
 # being asked is said here rather than inferred from which switches are on.
 max_autotune_gemm_backends = os.environ.get(
-    "TP_MAX_AUTOTUNE_GEMM_BACKENDS", "ATEN,TRITON,CPP"
+    "TP_MAX_AUTOTUNE_GEMM_BACKENDS", "FRAMEWORK,TRITON,CPP"
 ).upper()
 
 # Which backends a measured convolution may be chosen from, for the same reason.
 max_autotune_conv_backends = os.environ.get(
-    "TP_MAX_AUTOTUNE_CONV_BACKENDS", "ATEN,TRITON,CPP"
+    "TP_MAX_AUTOTUNE_CONV_BACKENDS", "FRAMEWORK,TRITON,CPP"
 ).upper()
 
 # Whether a product is compiled as soon as it is chosen, so that the measuring
@@ -1188,7 +1188,7 @@ class _EagerNumerics:
     #: Take a float64 operation from the device library rather than from
     #: arithmetic.  Off because the arithmetic is faster where it exists, and
     #: the two are not always the same answer.
-    use_device_libdevice = False
+    use_pytorch_libdevice = False
 
 
 eager_numerics = _EagerNumerics()
