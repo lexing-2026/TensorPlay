@@ -5063,9 +5063,6 @@ class Reduction(Loops):
             )
             results.append(res)
 
-        def second_step_wrapper(idx, r_idx):
-            return wrapper_fn(idx, r_idx)
-
         # The second layer reduces the partial results among themselves.  It
         # reads them out of the first layer's output, so the first layer has
         # to be written out before this can be read.
@@ -5918,30 +5915,6 @@ class ConcatKernel(NopKernel):
 
     def should_allocate(self) -> bool:
         return True
-
-
-@dataclasses.dataclass
-class ArgProperty:
-    """What is known about one argument of an external call.
-
-    The name is what the argument is called in the call, the type is what it
-    holds, and the default is what it takes when it is left out.  All three
-    come from how the operation was declared rather than from being reflected
-    off a registry, because that is where they are written down and a registry
-    would only report them back.
-    """
-
-    name: str
-    type: Any = None
-    default_value: Any = None
-    kwarg_only: bool = False
-
-    def as_dict(self) -> dict:
-        return {
-            "name": self.name,
-            "type": self.type,
-            "default_value": self.default_value,
-        }
 
 
 @dataclasses.dataclass

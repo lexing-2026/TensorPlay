@@ -1413,27 +1413,6 @@ def _prune_redundant_deps(node, name_to_fused_node, name_to_buf) -> None:
 
 
 
-def topo_sort_snode(snode) -> None:
-    """Put the pieces of a group in the order they have to run.
-
-    What each piece reads has to have been written, so the order follows the
-    dependencies between the pieces rather than the order they were made in.
-    """
-
-    order = list(snode.get_nodes())
-    while True:
-        changed = False
-        for i, node in enumerate(order):
-            for dep in node.unmet_dependencies:
-                for j in range(len(order)):
-                    if order[j].get_first_name() == dep.name and i > j:
-                        order[i], order[j] = order[j], order[i]
-                        changed = True
-        if not changed:
-            break
-    snode.snodes = order
-
-
 def _cmp(left, right) -> int:
     """Three-way comparison of two values, as a sorting key needs it."""
 
@@ -2212,12 +2191,6 @@ def _clear_candidate_tilings() -> None:
     """
 
     return None
-
-
-def _wrap_calls(fn):
-    """Kept so the module's own use of decorators is in one place."""
-
-    return fn
 
 
 class FusedSchedulerNode(BaseSchedulerNode):
@@ -5726,9 +5699,6 @@ class Scheduler:
 
     def get_buffer(self, name: str) -> Optional:
         return self.name_to_buf.get(name)
-
-    def get_node_by_name(self, name: str) -> Optional:
-        return self.name_to_node.get(name)
 
     def can_free(self, name: str) -> bool:
         """Whether this value's memory may be given back."""
