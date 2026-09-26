@@ -490,6 +490,12 @@ class _Group:
         return f"{source}.to({_tl_dtype(want)})"
 
     def value(self, value: Value, node: LoopNode, dim: int) -> str:
+        if not isinstance(value, Value):
+            # A lowering that produced no expression for this nest; the region
+            # falls back rather than emitting a kernel that reads nothing.
+            raise PlanError(
+                f"loop body holds {type(value).__name__} instead of a value"
+            )
         op = value.op
         args = value.args
         if op == "load":

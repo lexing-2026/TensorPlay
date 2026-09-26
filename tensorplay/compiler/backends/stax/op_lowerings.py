@@ -444,6 +444,13 @@ def lower_cat(node, tensors, dim=0):
     size, dtype, device = val_info(node_val(node))
     dim = normalize_dim(dim, len(size))
     inputs = [t for t in tensors if is_tensor_box(t) and t.get_size()[dim] > 0]
+    if not inputs:
+        # Every operand was a constant or empty, so there is no source to read
+        # per index.  Say so instead of emitting a body that yields nothing.
+        raise NotImplementedError(
+            "cat with no tensor operand to read per index"
+            f" (operands={len(tensors)}, dim={dim})"
+        )
     starts = []
     start = 0
     for t in inputs:
