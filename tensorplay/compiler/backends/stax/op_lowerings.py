@@ -50,6 +50,7 @@ from .ir import (
     TensorBox,
     View,
     has_free_unbacked_symbols,
+    validate_ir,
 )
 from .loops import (
     V,
@@ -347,7 +348,11 @@ def _register_lowering(
         if unpacked:
             args = [args]
 
-        return decomp_fn(*args, **kwargs)
+        out = decomp_fn(*args, **kwargs)
+        # What came back is about to be held as a graph value, so it is checked
+        # while the lowering that produced it is still the thing being read.
+        validate_ir(out)
+        return out
 
     lowering_dict.update(dict.fromkeys(get_overloads(op), wrapped))
     return wrapped

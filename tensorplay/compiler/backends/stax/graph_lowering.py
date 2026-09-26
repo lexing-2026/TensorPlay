@@ -41,6 +41,7 @@ from .ir import (
     FallbackKernel as IrFallbackKernel,
     MultiOutput,
     MultiOutputLayout,
+    assign_origin_node,
     InputBuffer,
     IRNode,
     NonTensorObj,
@@ -1031,6 +1032,9 @@ class GraphLowering:
                 storage = storage.data
             if isinstance(storage, StorageBox):
                 storage.mark_reuse(len(value.users))
+        # Which node of the graph this value was made by, so that a report
+        # about it can name where it came from.
+        assign_origin_node(result, value)
         self.produced[key] = result
         return result
 

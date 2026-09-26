@@ -633,7 +633,6 @@ class IRNode:
         )
 
     def wrap_for_lowering(self) -> "IRNode":
-        from .loops import TensorBox
 
         return TensorBox.create(self)
 
@@ -8422,7 +8421,7 @@ class ChoiceCaller:
     def benchmark(self, *args, out):
         """How long this way takes, measured the same way as every other."""
 
-        from . import benchmarker
+        from .runtime.benchmarking import benchmarker
 
         algo = self.to_callable()
         return benchmarker.benchmark(algo, args, {"out": out}, device=None)
@@ -11727,3 +11726,70 @@ class SliceView(View):
             return ReinterpretView(data=storage, layout=new_layout)
 
         return cls.create_with_size(x, dim, start, new_size[dim], step)
+
+
+def validate_ir(node_or_nodes: Any) -> None:
+    """Check that what a lowering handed back is something the rest can hold.
+
+    A lowering's result becomes a graph value, and a graph value is read by
+    something that has to know how to reach its elements or how to call it.
+    A node that is neither is not wrong so much as unaccounted for, and the
+    place that finds out is a long way from the lowering that produced it, so
+    it is worth refusing here where the lowering is still named.
+    """
+
+    def check(nodes: Any) -> None:
+        if nodes is None:
+            return
+        if isinstance(nodes, (list, tuple)):
+            for node in nodes:
+                check(node)
+        elif isinstance(nodes, dict):
+            for node in nodes.values():
+                check(node)
+        elif not isinstance(
+            nodes,
+            (
+                ExpandView,
+                DynamicScalar,
+                AssertScalar,
+                TensorBox,
+                sympy.logic.boolalg.Boolean,
+                Expr,
+                int,
+                EffectfulKernel,
+                ShapeAsConstantBuffer,
+                OpaqueMultiOutput,
+            ),
+        ):
+            raise AssertionError(
+                f"Found {type(nodes)}, which is not a supported top level IR node."
+            )
+
+    check(node_or_nodes)
+
+
+def assign_origin_node(result: Any, n: Any) -> None:
+    """Say which node of the graph a value was made by.
+
+    Which node is a best-effort answer rather than a required one: what it is
+    used for is saying where a piece of the graph came from when a report about
+    it is read, and a value whose origin cannot be pinned down is better left
+    unpinned than guessed at.  The descent relies on a box holding storage
+    directly meaning the value is not a view onto someone else's memory; a view
+    is not descended into, because what a view was made by is its source's
+    business rather than its own.
+    """
+
+    if isinstance(result, TensorBox) and isinstance(result.data, StorageBox):
+        if isinstance(result.data.data, Loops):
+            result.data.data._post_init_setattr("origin_node", n)
+        elif isinstance(result.data.data, Buffer):
+            result.data.data._post_init_setattr("origin_node", n)
+            if isinstance(result.data.data, ComputedBuffer) and isinstance(
+                result.data.data.data, Loops
+            ):
+                result.data.data.data._post_init_setattr("origin_node", n)
+            elif isinstance(result.data.data, MultiOutput) and not result.data.data.indices:
+                if isinstance(result.data.data.inputs[0], Buffer):
+                    result.data.data.inputs[0]._post_init_setattr("origin_node", n)
