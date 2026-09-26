@@ -199,7 +199,7 @@ force_stride_order = make_prim(
 )
 _unsafe_index_put_ = make_prim(
     "_unsafe_index_put_(Tensor(a!) self, Tensor?[] indices, Tensor values, bool accumulate=False) -> Tensor(a!)",
-    lambda self, indices, values, accumulate=False: tp.ops.aten.index_put_(
+    lambda self, indices, values, accumulate=False: tp.ops.index_put_(
         self, indices, values, accumulate
     ),
     doc="Unsafe index_put_ (doesn't issue device asserts)",
@@ -303,11 +303,11 @@ def _low_memory_max_pool_with_offsets_aten(
 ):
     dim = len(kernel_size)
     if dim == 2:
-        vals, indices = tp.ops.aten.max_pool2d_with_indices(
+        vals, indices = tp.ops.max_pool2d_with_indices(
             self, kernel_size, stride, padding, dilation, ceil_mode
         )
     else:
-        vals, indices = tp.ops.aten.max_pool3d_with_indices(
+        vals, indices = tp.ops.max_pool3d_with_indices(
             self, kernel_size, stride, padding, dilation, ceil_mode
         )
 

@@ -1653,7 +1653,7 @@ class PythonWrapperCodegen(CodeGen):
         )
         self.header.splice(
             """
-                aten = tp.ops.aten
+                operator_set = tp.ops
                 inductor_ops = tp.ops.inductor
             """,
             strip=True,
@@ -2445,7 +2445,7 @@ class PythonWrapperCodegen(CodeGen):
                 python_kernel_name, self.next_kernel_suffix()
             )
         line = f"{python_kernel_name}({','.join(map(str, inputs))}"
-        if orig_python_kernel_name.startswith("aten.scatter_reduce"):
+        if orig_python_kernel_name.startswith("scatter_reduce"):
             line += ", ".join([""] + kwargs)
         elif reduce:
             line += f", reduce={repr(reduce)}"
@@ -3107,7 +3107,7 @@ class PythonWrapperCodegen(CodeGen):
             off = self.codegen_sizevar(tgt_offset)
             expr = f"reinterpret_tensor({name}, {s}, {st}, {off})"
             if cast_dtype is not None and cast_dtype != base_dtype:
-                return f"aten.view.dtype({expr}, {cast_dtype})"
+                return f"view.dtype({expr}, {cast_dtype})"
             return expr
 
         name = data.get_name()
@@ -3125,7 +3125,7 @@ class PythonWrapperCodegen(CodeGen):
 
         if same_layout:
             if dtype is not None and dtype != base_dtype:
-                return f"aten.view.dtype({name}, {dtype})"
+                return f"view.dtype({name}, {dtype})"
             return f"{name}"
 
         return apply_reinterpret(name, size, stride, offset, dtype, base_dtype)

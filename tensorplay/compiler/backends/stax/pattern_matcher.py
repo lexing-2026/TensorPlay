@@ -81,7 +81,7 @@ from .op_lowerings import select_decomp_table
 
 
 log = logging.getLogger(__name__)
-operator_set = tp.ops.aten
+operator_set = tp.ops
 prims = tp.ops.prims
 
 Constant = Any
@@ -1327,9 +1327,9 @@ class PatternPrettyPrinter:
 
     def memoize(self, obj: _TargetArgsExpr) -> str:
         obj_str = obj.pretty_print(self)
+        # A name here is either this project's own spelling of a function or a
+        # list of them, and neither carries a namespace to take off.
         obj_name = obj.fns_repr()
-        for prefix in ("aten.", "torch.", "prims."):
-            obj_name = obj_name.replace(prefix, "")
 
         tmp_name = self.namespace.create_name(obj_name, None)
         self.memoized_objs_names[obj] = tmp_name
@@ -2118,7 +2118,7 @@ def _serialize_pattern(
             import operator
             import tensorplay
 
-            operator_set = tp.ops.aten
+            operator_set = tp.ops
             prims = tp.ops.prims
 
             """

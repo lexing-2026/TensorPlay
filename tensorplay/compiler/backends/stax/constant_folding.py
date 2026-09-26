@@ -13,7 +13,7 @@ from tensorplay.graph.experimental.sympy_functions import OrderedSet
 
 #: The operator set, under a name that says what it is rather than where
 #: it came from.
-operator_set = tp.ops.aten
+operator_set = tp.ops
 
 # We would like to split modules into two subgraphs for runtime weight updates to work correctly.
 # The use case and more information could be found at:
@@ -138,7 +138,7 @@ class ConstantFolder(Any):
         if (
             is_woq_int8_pattern(node)
             or (
-                node.target is tp.ops.aten.permute.default
+                node.target is tp.ops.permute.default
                 and len(node.users) == 1
                 and is_woq_int8_pattern(next(iter(node.users)))
             )
