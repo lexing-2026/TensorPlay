@@ -62,7 +62,6 @@ FloatLikeType: TypeAlias = float # Union[float, SymFloat]
 # bool or SymBool
 BoolLikeType: TypeAlias = bool # Union[bool, SymBool]
 
-# py_sym_types = (SymInt, SymFloat, SymBool)  # left un-annotated intentionally
 # PySymType: TypeAlias = Union[SymInt, SymFloat, SymBool]
 
 # Meta-type for "numeric" things; matches our docs
@@ -133,3 +132,27 @@ class Storage:
         element_size: int,
     ) -> Self:
         raise NotImplementedError
+
+
+#: The three kinds of value that stand for a number not yet known, as one
+#: collection so that a caller can ask "is this one of them" without naming
+#: three.  Left unannotated on purpose: the point is the collection, and an
+#: annotation over the three would say the same thing three times.
+
+
+def _sym_types() -> tuple:
+    """The three kinds of value that stand for a number not yet known.
+
+    Resolved on each call rather than bound at import, because the classes are
+    re-exported from the package's own namespace and are not bound here.
+    """
+
+    import tensorplay as _tp
+
+    return (_tp.SymInt, _tp.SymFloat, _tp.SymBool)
+
+
+#: The three as one collection, so a caller can ask whether a value is one of
+#: them without naming three.  Left unannotated on purpose: the point is the
+#: collection, and an annotation over the three would say it three times.
+py_sym_types = _sym_types()
