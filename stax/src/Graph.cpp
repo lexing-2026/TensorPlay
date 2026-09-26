@@ -1,6 +1,5 @@
 
 #include "Graph.h"
-#include "StaxPointwise.h"
 #include "GradMode.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include <algorithm>
@@ -85,68 +84,6 @@ double required_float_attr(const OpNode& node, const std::string& key) {
         throw std::runtime_error("Stax native node float attribute is missing: " + key);
     }
     return std::get<double>(it->second);
-}
-
-Tensor execute_fused_pointwise_cpu(
-    const OpNode& node,
-    const std::vector<Tensor>& operands) {
-    auto input_count_it = node.attrs.find("input_count");
-    if (input_count_it == node.attrs.end() ||
-        !std::holds_alternative<int64_t>(input_count_it->second)) {
-        throw std::runtime_error("Stax fused pointwise input_count is missing");
-    }
-    const int64_t input_count = std::get<int64_t>(input_count_it->second);
-    if (input_count < 1 || static_cast<size_t>(input_count) != operands.size()) {
-        throw std::runtime_error("Stax fused pointwise input count mismatch");
-    }
-    const auto* program_ptr = int_list_attr(node, "program");
-    const auto* constants_ptr = float_list_attr(node, "constants");
-    // An entry overrides the element type this output is stored as; -1 keeps
-    // the input storage type.  The evaluator writes the converted value
-    // directly, so a narrowing/widening edge costs no separate pass.
-    int64_t out_dtype = -1;
-    auto dtype_it = node.attrs.find("output_dtypes");
-    if (dtype_it != node.attrs.end()) {
-        if (!std::holds_alternative<std::vector<int64_t>>(dtype_it->second)) {
-            throw std::runtime_error(
-                "Stax fused pointwise output_dtypes has an invalid type");
-        }
-        const auto& dtypes = std::get<std::vector<int64_t>>(dtype_it->second);
-        if (!dtypes.empty()) {
-            out_dtype = dtypes.front();
-        }
-    }
-    // Route by operand device: the program semantics are identical on both
-    // sides; only the evaluator differs.  The CUDA evaluator loads each
-    // input at its own element width and stores the converted value inside
-    // the kernel; the CPU evaluator is float-only, so operands narrower or
-    // wider than float32 are widened once up front and a requested output
-    // override converts after the run.
-    if (operands.front().device().is_cuda()) {
-        return cuda::stax_fused_pointwise_cuda(operands, *program_ptr,
-                                               *constants_ptr, out_dtype);
-    }
-    std::vector<Tensor> float_operands;
-    const std::vector<Tensor>* evaluator_operands = &operands;
-    for (const Tensor& operand : operands) {
-        if (operand.dtype() != DType::Float32) {
-            float_operands.reserve(operands.size());
-            for (const Tensor& item : operands) {
-                float_operands.push_back(
-                    item.dtype() == DType::Float32
-                        ? item
-                        : item.to(DType::Float32));
-            }
-            evaluator_operands = &float_operands;
-            break;
-        }
-    }
-    Tensor out = cpu::stax_fused_pointwise_cpu(*evaluator_operands,
-                                               *program_ptr, *constants_ptr);
-    if (out_dtype >= 0 && static_cast<DType>(out_dtype) != DType::Float32) {
-        out = out.to(static_cast<DType>(out_dtype));
-    }
-    return out;
 }
 
 } // namespace
@@ -1717,88 +1654,6 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                 shape.push_back(input.size(dim));
             }
             result = tpx::ops::reshape(input, shape);
-        } else if (node.op_type == "fused_pointwise") {
-            std::vector<Tensor> operands;
-            operands.reserve(node.inputs.size());
-            for (const ValueNode* input : node.inputs) {
-                operands.push_back(value(input));
-            }
-            if (node.outputs.size() == 1) {
-                result = execute_fused_pointwise_cpu(node, operands);
-            } else {
-                // One node output per instruction result, in program order;
-                // the refs attribute addresses the temporary pool.
-                auto input_count_it = node.attrs.find("input_count");
-                if (input_count_it == node.attrs.end() ||
-                    !std::holds_alternative<int64_t>(input_count_it->second)) {
-                    throw std::runtime_error("Stax fused pointwise input_count is missing");
-                }
-                const int64_t input_count = std::get<int64_t>(input_count_it->second);
-                const auto* program_ptr = int_list_attr(node, "program");
-                const auto* constants_ptr = float_list_attr(node, "constants");
-                const auto* refs_ptr = &required_int_list_attr(node, "output_refs");
-                const std::vector<int64_t> empty_dtypes;
-                const std::vector<int64_t>* dtypes_ptr = nullptr;
-                auto dtype_it = node.attrs.find("output_dtypes");
-                if (dtype_it != node.attrs.end()) {
-                    if (!std::holds_alternative<std::vector<int64_t>>(dtype_it->second)) {
-                        throw std::runtime_error(
-                            "Stax fused pointwise output_dtypes has an invalid type");
-                    }
-                    dtypes_ptr = &std::get<std::vector<int64_t>>(dtype_it->second);
-                }
-                if (dtypes_ptr != nullptr && dtypes_ptr->size() != node.outputs.size()) {
-                    throw std::runtime_error(
-                        "Stax fused pointwise output dtype count mismatch");
-                }
-                std::vector<Tensor> results;
-                if (operands.front().device().is_cuda()) {
-                    results = cuda::stax_fused_pointwise_cuda_multi(
-                        operands, *program_ptr, *constants_ptr, *refs_ptr,
-                        dtypes_ptr == nullptr ? empty_dtypes : *dtypes_ptr);
-                } else {
-                    // The CPU evaluator is float-only: widen mixed-width
-                    // operands up front and apply any requested output dtype
-                    // after the run so both devices agree on the element
-                    // type of every result.
-                    std::vector<Tensor> float_operands;
-                    const std::vector<Tensor>* evaluator_operands = &operands;
-                    for (const Tensor& operand : operands) {
-                        if (operand.dtype() != DType::Float32) {
-                            float_operands.reserve(operands.size());
-                            for (const Tensor& item : operands) {
-                                float_operands.push_back(
-                                    item.dtype() == DType::Float32
-                                        ? item
-                                        : item.to(DType::Float32));
-                            }
-                            evaluator_operands = &float_operands;
-                            break;
-                        }
-                    }
-                    results = cpu::stax_fused_pointwise_cpu_multi(
-                        *evaluator_operands, *program_ptr, *constants_ptr,
-                        *refs_ptr);
-                    if (dtypes_ptr != nullptr) {
-                        for (size_t o = 0; o < results.size(); ++o) {
-                            const int64_t code = (*dtypes_ptr)[o];
-                            if (code >= 0 &&
-                                static_cast<DType>(code) != DType::Float32) {
-                                results[o] =
-                                    results[o].to(static_cast<DType>(code));
-                            }
-                        }
-                    }
-                }
-                if (results.size() != node.outputs.size()) {
-                    throw std::runtime_error(
-                        "Stax fused pointwise multi-output count mismatch");
-                }
-                for (size_t o = 0; o < node.outputs.size(); ++o) {
-                    env[node.outputs[o]->id] = results[o];
-                }
-                return;
-            }
         } else if (node.op_type == "fused_mul_add") {
             auto mul_scalar = scalar_attr(node, "mul_scalar_value");
             auto add_scalar = scalar_attr(node, "add_scalar_value");

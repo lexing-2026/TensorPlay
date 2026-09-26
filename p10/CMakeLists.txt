@@ -25,7 +25,6 @@ set(P10_SOURCES
     src/Unicode.cpp
     src/BatchingKernels.cpp
     src/OneDNNContext.cpp
-    src/StaxPointwise.cpp
     src/autocast_mode.cpp
     # src/AutogradMetaInterface.cpp (Moved to TPX)
     src/Tensor.cpp
@@ -340,8 +339,6 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/Blas.cu
         src/backend/cuda/BatchLinearAlgebra.cu
         src/backend/cuda/ComplexFactories.cu
-        src/backend/cuda/StaxPointwiseKernels.cu
-        src/backend/cuda/StaxProgramCodegen.cu
         src/backend/cuda/LossKernels.cu
         src/backend/cuda/SpecialUnaryKernels.cu
         src/backend/cuda/SpecialBinaryKernels.cu
@@ -479,7 +476,6 @@ set(TP_CPU_KERNEL_SRCS
     src/backend/cpu/ReductionKernelsImpl.cpp
     src/backend/cpu/EmbeddingBagKernelsImpl.cpp
     src/backend/cpu/ActivationUnaryKernels.cpp
-    src/backend/cpu/StaxPointwiseKernels.cpp
     src/backend/cpu/ComplexKernels.cpp
 )
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")

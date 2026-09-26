@@ -1,7 +1,6 @@
 #include "python_bindings.h"
 #include "Graph.h"
 #include "Fusion.h"
-#include "StaxPointwise.h"
 #include <sstream>
 #include <vector>
 
@@ -555,22 +554,6 @@ void init_stax(py::module_& m) {
              py::arg("op_type"), py::arg("inputs"), py::arg("out_shape")=std::vector<int64_t>{}, py::arg("name")="")
         .def("mark_output", &IRBuilder::markOutput);
 
-    stax_m.def(
-        "execute_fused_pointwise_multi",
-        [](const std::vector<tensorplay::Tensor>& inputs,
-           const std::vector<int64_t>& program,
-           const std::vector<double>& constants,
-           const std::vector<int64_t>& output_refs) {
-            return tensorplay::cpu::stax_fused_pointwise_cpu_multi(
-                inputs,
-                program,
-                constants,
-                output_refs);
-        },
-        py::arg("inputs"),
-        py::arg("program"),
-        py::arg("constants"),
-        py::arg("output_refs"));
     // Compiled-call trampoline installer: see the CallTrampolineState block
     // above for the fast-path/divert contract.  ``direct_addr`` is the
     // address of a kernel module's ``tp_direct`` entry (ctypes round-trips
