@@ -380,12 +380,30 @@ realize_opusers_threshold = 5
 # worth of traffic, which is why the two have answers of their own.
 realize_cpu_opcount_threshold = 50
 
+#: Whether a tile shape is narrowed by walking the shape down rather than only
+#: by measuring whole candidates.
+coordinate_descent_tuning = os.environ.get("TP_COORDINATE_DESCENT_TUNING") == "1"
+
 max_autotune = os.environ.get("TP_MAX_AUTOTUNE", "0") == "1"
 
 # Whether products are measured even when the rest is not.  Separate because a
 # product is the one call worth spending a measurement on: it runs inside every
 # layer, so what it costs is paid by the whole model rather than by one line.
 max_autotune_gemm = os.environ.get("TP_MAX_AUTOTUNE_GEMM", "0") == "1"
+
+# Which backends a measured product may be chosen from, as a list to add to or
+# take from rather than a switch.  Naming them is what makes a measurement
+# answerable: a product measured against the library's own kernel and a product
+# measured against a set of tiles are two different questions, and which one is
+# being asked is said here rather than inferred from which switches are on.
+max_autotune_gemm_backends = os.environ.get(
+    "TP_MAX_AUTOTUNE_GEMM_BACKENDS", "ATEN,TRITON,CPP"
+).upper()
+
+# Which backends a measured convolution may be chosen from, for the same reason.
+max_autotune_conv_backends = os.environ.get(
+    "TP_MAX_AUTOTUNE_CONV_BACKENDS", "ATEN,TRITON,CPP"
+).upper()
 
 # Whether a product is compiled as soon as it is chosen, so that the measuring
 # of the candidates overlaps with the measuring of the next thing.  Off because
@@ -559,6 +577,15 @@ combo_kernel_per_subkernel_blocks = (
 combo_kernel_compile_time_autotune = (
     os.environ.get("TP_COMBO_KERNEL_COMPILE_TIME_AUTOTUNE", "0") == "1"
 )
+
+#: How many differently shaped blocks may share one kernel.  Mixing shapes lets
+#: a group with one awkward member still be launched as one kernel, at the cost
+#: of the shapes not being uniform.
+combo_kernel_allow_mixed_sizes = 1
+
+#: Say a warning when a generated kernel reads two layouts at once, which is
+#: worth knowing when a kernel is slower than it looks.
+warn_mix_layout = os.environ.get("TP_WARN_MIX_LAYOUT") == "1"
 
 # How many pieces one launch of independent work may hold.  Each one is a
 # launch of its own otherwise, and beyond a point the gain is smaller than the
@@ -796,6 +823,43 @@ class _TritonConfig:
     #: Where a mix-order reduction is split, when it is split at a fixed size
     #: rather than at a size chosen by measurement.  Left unset, it is not.
     mix_order_reduction_split_size: int | None = None
+
+    #: Whether a mix-order reduction may be measured with more than one stage.
+    mix_order_reduction_autotune_split_size: bool = (
+        os.environ.get("TP_MIX_ORDER_REDUCTION_AUTOTUNE_SPLIT_SIZE", "0") == "1"
+    )
+
+    #: How many blocks a kernel may be split into.  None means as many as the
+    #: tile calls for; one is a single block, two is one dimension of tiling,
+    #: and three is experimental.
+    max_tiles: int | None = None
+
+    #: Prefer a tile with more dimensions, which makes an indexing expression
+    #: simpler to write and therefore easier to recognise as one that could be
+    #: a block pointer.
+    prefer_nd_tiling: bool = False
+
+    #: Look at which loads of a kernel sit next to each other in memory before
+    #: choosing a tile, rather than choosing a tile and then seeing what the
+    #: loads cost.
+    coalesce_tiling_analysis: bool = (
+        os.environ.get("TP_COALESCE_TILING_ANALYSIS", "1") == "1"
+    )
+
+    #: Put a reduction inside the tile rather than beside it, which is what lets
+    #: a tile carry a partial result across its own blocks.
+    tile_reductions: bool = False
+
+    #: Write a matrix product out as loops rather than calling a prepared one.
+    native_matmul: bool = os.environ.get("TP_NATIVE_MATMUL", "0") == "1"
+
+    #: Let a tile hold one reduction inside another.
+    nested_reduction: bool = os.environ.get("TP_NESTED_REDUCTION", "0") == "1"
+
+    #: End a fusion where a wider tile would let the two sides be tiled
+    #: together, rather than fusing them and giving both a narrower tile.
+    tiling_prevents_pointwise_fusion: bool = True
+    tiling_prevents_reduction_fusion: bool = True
 
     #: Allow a mix-order reduction to use more than one stage, which shares
     #: memory between the stages and so can run out of it.
