@@ -965,6 +965,41 @@ def compile_group(
     return result
 
 
+
+# Reductions whose entire space fits one tile skip the r-loop entirely
+# (persistent-reduction shape): no loop-carried acc, one reduce.
+_PERSISTENT_RNUMEL_MAX = 512
+
+
+def emit_tile_epilogue_lines(
+    program: list[int], constants: list[float], esrc: int, source_reg: str
+) -> tuple[list[str], str]:
+    """Emit a pointwise chain applied to one tile register.
+
+    The store-time epilogue renderer shared by reduction tails and the GEMM
+    tile: ``esrc`` names the chain's single tensor input (mapped onto
+    ``source_reg``, the register already holding the pre-epilogue value);
+    negatives index epilogue constants; other positive refs are temporaries
+    numbered from 1.  Returns the source lines and the final register
+    holding the chain result.
+    """
+
+    if len(program) % 3:
+        raise ValueError("epilogue program must contain triples")
+    # The instance only carries the payload the shared instruction renderer
+    # reads (``_epilogue_lines`` touches nothing else); no kernel is
+    # generated from it.
+    emitter = object.__new__(TritonProgramCodegen)
+    emitter.epilogue = (program, constants, esrc)
+    return emitter._epilogue_lines(source_reg)
+
+
+#: The accelerator's own spelling of the helper the tile pass shares.
+def _next_power_of_two(value: int) -> int:
+    if value <= 1:
+        return 1
+    return 1 << (int(value) - 1).bit_length()
+
 __all__ = [
     "LaunchConfig",
     "PlanError",

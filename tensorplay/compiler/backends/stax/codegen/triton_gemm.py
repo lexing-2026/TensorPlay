@@ -291,7 +291,7 @@ def _fused_gemm_kernel(
     if epilogue is None:
         lines, store_source = [], "acc"
     else:
-        from .triton import emit_tile_epilogue_lines
+        from .loop_triton import emit_tile_epilogue_lines
 
         lines, store_source = emit_tile_epilogue_lines(
             list(epilogue[0]), list(epilogue[1]), epilogue[2], "acc"

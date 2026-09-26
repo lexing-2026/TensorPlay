@@ -118,7 +118,7 @@ def dims_loop_candidates(
     tiling) are pruned so the tuner never benches them.
     """
 
-    from .triton import _PERSISTENT_RNUMEL_MAX, _next_power_of_two
+    from .loop_triton import _PERSISTENT_RNUMEL_MAX, _next_power_of_two
 
     derived_rblock = min(
         _next_power_of_two(max(rnumel, 1)), _PERSISTENT_RNUMEL_MAX
