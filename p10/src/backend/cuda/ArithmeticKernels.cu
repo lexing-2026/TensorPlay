@@ -698,6 +698,104 @@ inline bool try_binary_vectorized(
     }
 }
 
+// --- Three-operand (addc) fast path ---
+//
+// The addc family reads three inputs and writes one output, so the two-operand
+// vectorized kernel does not apply.  When every operand is contiguous with the
+// full output extent, the broadcast offset is the identity and the same packed
+// access pattern works with one more load; the general broadcast kernel stays
+// for the shapes that actually stretch a dimension.
+
+template <typename T, bool Divide, int VecSize>
+__global__ void addc_same_shape_vectorized_kernel(
+    int64_t n, const T* __restrict__ a, const T* __restrict__ b,
+    const T* __restrict__ c, T* __restrict__ y,
+    typename BinaryOpMath<T>::type alpha) {
+    using M = typename BinaryOpMath<T>::type;
+    const int64_t vec_n = n / VecSize;
+    const int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (int64_t i = tid; i < vec_n; i += stride) {
+        TPVecPack<T, VecSize> pa = *reinterpret_cast<const TPVecPack<T, VecSize>*>(a + i * VecSize);
+        TPVecPack<T, VecSize> pb = *reinterpret_cast<const TPVecPack<T, VecSize>*>(b + i * VecSize);
+        TPVecPack<T, VecSize> pc = *reinterpret_cast<const TPVecPack<T, VecSize>*>(c + i * VecSize);
+        TPVecPack<T, VecSize> po;
+#pragma unroll
+        for (int v = 0; v < VecSize; ++v) {
+            const M x = static_cast<M>(pa.v[v]);
+            const M u = static_cast<M>(pb.v[v]);
+            const M v2 = static_cast<M>(pc.v[v]);
+            po.v[v] = static_cast<T>(Divide ? (x + static_cast<M>(alpha) * (u / v2))
+                                            : (x + static_cast<M>(alpha) * (u * v2)));
+        }
+        *reinterpret_cast<TPVecPack<T, VecSize>*>(y + i * VecSize) = po;
+    }
+    // Tail elements past the last full vector, one per thread.
+    for (int64_t j = vec_n * VecSize + tid; j < n; j += stride) {
+        const M x = static_cast<M>(a[j]);
+        const M u = static_cast<M>(b[j]);
+        const M v2 = static_cast<M>(c[j]);
+        y[j] = static_cast<T>(Divide ? (x + static_cast<M>(alpha) * (u / v2))
+                                     : (x + static_cast<M>(alpha) * (u * v2)));
+    }
+}
+
+template <typename T, bool Divide>
+inline bool launch_addc_vec(
+    int64_t n, const Tensor& a, const Tensor& b, const Tensor& c, Tensor& y,
+    typename BinaryOpMath<T>::type alpha, cudaStream_t stream) {
+    // Four streams are in flight per thread here, so a 4-wide pack keeps the
+    // per-thread footprint at one sector group per operand.
+    constexpr int kVec = 4;
+    const T* pa = a.data_ptr<T>();
+    const T* pb = b.data_ptr<T>();
+    const T* pc = c.data_ptr<T>();
+    T* py = y.data_ptr<T>();
+    const uintptr_t align_mask = sizeof(T) * kVec - 1;
+    if ((reinterpret_cast<uintptr_t>(pa) | reinterpret_cast<uintptr_t>(pb) |
+         reinterpret_cast<uintptr_t>(pc) | reinterpret_cast<uintptr_t>(py)) & align_mask)
+        return false;
+
+    dim3 block(256);
+    const int64_t vec_n = n / kVec;
+    const int64_t want = (vec_n + block.x - 1) / block.x;
+    dim3 grid(static_cast<unsigned>(want < 1 ? 1 : want));
+    addc_same_shape_vectorized_kernel<T, Divide, kVec><<<grid, block, 0, stream>>>(
+        n, pa, pb, pc, py, alpha);
+    return true;
+}
+
+// Returns true when the packed kernel was launched; same guards as
+// try_binary_vectorized, with a third operand.
+template <bool Divide>
+inline bool try_addc_vectorized(
+    int64_t n, const Tensor& a, const Tensor& b, const Tensor& c, Tensor& y,
+    const Scalar& alpha) {
+    constexpr int64_t kMinElems = 4096;
+    if (n < kMinElems || n % 4 != 0) return false;
+    if (!a.is_contiguous() || !b.is_contiguous() || !c.is_contiguous() ||
+        !y.is_contiguous())
+        return false;
+    if (a.numel() != n || b.numel() != n || c.numel() != n) return false;
+
+    const auto stream = getCurrentCUDAStream().stream();
+    switch (y.dtype()) {
+        case DType::Float32:
+            return launch_addc_vec<float, Divide>(n, a, b, c, y, alpha.to<float>(), stream);
+        case DType::Float64:
+            return launch_addc_vec<double, Divide>(n, a, b, c, y, alpha.to<double>(), stream);
+        case DType::Float16:
+            return launch_addc_vec<tensorplay::Half, Divide>(n, a, b, c, y, alpha.to<float>(), stream);
+        case DType::BFloat16:
+            return launch_addc_vec<tensorplay::BFloat16, Divide>(n, a, b, c, y, alpha.to<float>(), stream);
+        case DType::Int32:
+            return launch_addc_vec<int, Divide>(n, a, b, c, y, alpha.to<int>(), stream);
+        case DType::Int64:
+            return launch_addc_vec<int64_t, Divide>(n, a, b, c, y, alpha.to<int64_t>(), stream);
+        default: return false;
+    }
+}
+
 // --- Row-segment broadcast fast path ---
 //
 // Tensor broadcasting only ever stretches size-1 dimensions, so inside any
@@ -2025,6 +2123,7 @@ Tensor addc_cuda_impl(const Tensor& self, const Tensor& tensor1,
     Tensor a = self.dtype() == result_dtype ? self : self.to(result_dtype);
     Tensor b = tensor1.dtype() == result_dtype ? tensor1 : tensor1.to(result_dtype);
     Tensor c = tensor2.dtype() == result_dtype ? tensor2 : tensor2.to(result_dtype);
+    if (try_addc_vectorized<Divide>(n, a, b, c, result, value)) return result;
     TensorDesc a_desc = make_desc(a, out_shape.size());
     TensorDesc b_desc = make_desc(b, out_shape.size());
     TensorDesc c_desc = make_desc(c, out_shape.size());
@@ -2073,6 +2172,7 @@ Tensor& addc_cuda_inplace_impl(Tensor& self, const Tensor& tensor1,
 
     Tensor b = tensor1.dtype() == self.dtype() ? tensor1 : tensor1.to(self.dtype());
     Tensor c = tensor2.dtype() == self.dtype() ? tensor2 : tensor2.to(self.dtype());
+    if (try_addc_vectorized<Divide>(n, self, b, c, self, value)) return self;
     TensorDesc a_desc = make_desc(self, out_shape.size());
     TensorDesc b_desc = make_desc(b, out_shape.size());
     TensorDesc c_desc = make_desc(c, out_shape.size());

@@ -155,11 +155,18 @@ set_target_properties(dnnl PROPERTIES EXCLUDE_FROM_ALL ON)
 # already links.  Without it the optimized sgemm copy-kernel path stays
 # dormant and convolution backward-weights GEMMs execute on the portable
 # reference loop.
-if(MKL_LIBRARIES AND MKL_INCLUDE_DIRS)
-    target_compile_definitions(dnnl PRIVATE USE_MKL USE_CBLAS)
-    target_include_directories(dnnl PRIVATE ${MKL_INCLUDE_DIRS})
-    target_link_libraries(dnnl INTERFACE ${MKL_LIBRARIES})
-endif()
+# Route the sgemm dispatch through the CBLAS interface of the MKL the build
+# already links.  Without it the optimized sgemm copy-kernel path stays
+# dormant and convolution backward-weights GEMMs execute on the portable
+# reference loop.  The compile objects live on the per-engine targets; the
+# published dnnl name is an aggregate wrapper.
+foreach(_tp_dnnl_tgt dnnl_cpu dnnl_graph_cpu)
+    if(TARGET ${_tp_dnnl_tgt})
+        target_compile_definitions(${_tp_dnnl_tgt} PRIVATE USE_MKL USE_CBLAS)
+        target_include_directories(${_tp_dnnl_tgt} PRIVATE ${MKL_INCLUDE_DIRS})
+        target_link_libraries(${_tp_dnnl_tgt} PRIVATE ${MKL_LIBRARIES})
+    endif()
+endforeach()
 
 # GCC emits a handful of known warnings inside oneDNN; keep the build log clean.
 if(NOT APPLE AND CMAKE_COMPILER_IS_GNUCC)
