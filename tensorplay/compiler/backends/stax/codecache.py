@@ -14,8 +14,11 @@ new one, never half of either.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import logging
 import os
+import pickle
 from functools import lru_cache
 
 import functools
@@ -29,20 +32,221 @@ import tempfile
 import threading
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 import tensorplay as tp
 
+if TYPE_CHECKING:
+    from .runtime.remote_cache import JsonDataTy, RemoteCache
+
 from .cache_key import CODE_CACHE_KEY_STRATEGY, SYSTEM_CACHE_KEY_STRATEGY
 from .compile_log import timed_block
+from .runtime.cache_artifacts import CacheArtifact, CacheArtifactFactory
 from .runtime.cache_dir_utils import cache_dir
 from .runtime.device_compiler import compiler_module
 from .utils import clear_on_fresh_cache
+from tensorplay.graph.experimental.symbolic_shapes import has_guarding_hint
+
+#: What a guarded cache holds: an entry of its own kind, opaque here.
+_T = TypeVar("_T")
+T = _T
+
+log = logging.getLogger(__name__)
 
 #: Whether a path built here is being written on a platform where a rename
 #: onto an existing file fails.  There the write is a copy and a remove, which
 #: is not atomic and so is done only where there is no alternative.
 _IS_WINDOWS = sys.platform == "win32"
+
+
+class GuardedCache(Generic[T]):
+    """A cache whose entries each carry the conditions they hold under.
+
+    An entry here is only right for the shapes it was recorded for, so looking
+    one up is two questions: which entries are there, and which of them holds
+    here.  The first is answered by listing a directory; the second by asking
+    the entry's own guard, against the values this call actually has rather
+    than against the symbols it came in as -- asking with symbols would let a
+    lookup that misses leave new conditions behind, and a miss that changed what
+    the next compile believes costs more than the one it saved.
+    """
+
+    @classmethod
+    def _get_tmp_dir_for_key(cls, _key: str) -> str:
+        raise NotImplementedError(
+            "the cache this is mixed into has to say where its entries live"
+        )
+
+    @classmethod
+    def _record_result(
+        cls,
+        key: str,
+        local_hit: bool,
+        local_miss: bool,
+        remote_hit: bool,
+        remote_miss: bool,
+    ) -> None:
+        raise NotImplementedError(
+            "the cache this is mixed into has to say what to record about a "
+            "lookup"
+        )
+
+    @classmethod
+    def iterate_over_candidates(
+        cls,
+        local: bool,
+        remote_cache: "RemoteCache[JsonDataTy] | None",
+        key: str,
+    ) -> "Generator[tuple[T, bytes, bool], None, None]":
+        """Every entry stored under this key, and where each one was found.
+
+        An entry that cannot be read is passed over rather than raised from:
+        one unreadable file in a directory is a rebuild, while refusing the
+        whole directory is a failure.  An entry whose name begins with a dot is
+        the temporary file of a write that has not finished, and is not an
+        entry at all.
+        """
+
+        if local:
+            subdir = cls._get_tmp_dir_for_key(key)
+            if os.path.exists(subdir):
+                for path in sorted(os.listdir(subdir)):
+                    if path.startswith("."):
+                        continue
+                    try:
+                        with open(os.path.join(subdir, path), "rb") as f:
+                            content = f.read()
+                            yield pickle.loads(content), content, True
+                    except Exception:
+                        log.warning("cache unable to load an entry", exc_info=True)
+
+        if remote_cache:
+            try:
+                if (cache_data := remote_cache.get(key)) is not None:
+                    if not isinstance(cache_data, dict):
+                        raise AssertionError(
+                            f"expected a mapping from the remote cache, got "
+                            f"{type(cache_data)}"
+                        )
+                    data = cache_data["data"]
+                    if not isinstance(data, (str, bytes)):
+                        raise AssertionError(
+                            f"expected the cache data as text or bytes, got "
+                            f"{type(data)}"
+                        )
+                    content = base64.b64decode(data)
+                    yield pickle.loads(content), content, False
+            except Exception:
+                log.warning(
+                    "%s unable to load an entry", cls.__name__, exc_info=True
+                )
+
+    @classmethod
+    def find_guarded_entry(
+        cls,
+        key: str,
+        local: bool,
+        remote_cache: "RemoteCache[JsonDataTy] | None",
+        evaluate_guards: Callable[[str, list], bool],
+        hints: list,
+    ) -> tuple[T | None, bytes | None, dict]:
+        """The first entry under this key whose guard holds here.
+
+        An entry with no guard holds anywhere, so it is taken as soon as it is
+        read.  Otherwise each entry in turn is asked, and the first that holds
+        is the answer: an entry that holds is as good as another that holds,
+        and there is no reason to prefer one over the other.
+
+        What happened is reported alongside, because a miss that names the
+        guard that missed is worth having and a bare miss is not.
+        """
+
+        graph = None
+        pickled_content = None
+        result_status = "full_miss"
+        sample_guards_expr = None
+        in_local = False
+
+        for candidate, content, in_local in cls.iterate_over_candidates(
+            local, remote_cache, key
+        ):
+            if not hasattr(candidate, "guards_expr"):
+                raise AssertionError(
+                    f"a cache entry of type {type(candidate)} has no guard to "
+                    f"check"
+                )
+            if not candidate.guards_expr:
+                graph = candidate
+                pickled_content = content
+                result_status = "hit"
+                break
+
+            hit = bool(evaluate_guards(candidate.guards_expr, hints))
+            if hit:
+                graph = candidate
+                pickled_content = content
+                result_status = "hit"
+                sample_guards_expr = candidate.guards_expr
+                break
+            result_status = "guard_miss"
+            sample_guards_expr = candidate.guards_expr
+
+        info: dict = {"cache_status_detailed": result_status}
+        if sample_guards_expr is not None:
+            info["cache_status_guard_expr"] = sample_guards_expr
+
+        # A hit on the far side implies a miss on this one when the local cache
+        # is in use, so the two are not counted independently.
+        local_hit = graph is not None and in_local
+        remote_hit = graph is not None and not in_local
+        local_miss = (graph is None or remote_hit) and local
+        remote_miss = graph is None and remote_cache is not None
+        cls._record_result(
+            key,
+            local_hit=local_hit,
+            local_miss=local_miss,
+            remote_hit=remote_hit,
+            remote_miss=remote_miss,
+        )
+
+        return graph, pickled_content, info
+
+    @classmethod
+    def _filter_backed_symints(cls, inputs: Sequence) -> list:
+        """The inputs whose values came from somewhere, rather than being free.
+
+        A guard can only be about a value that has one: an input still free at
+        trace time has no value yet, so nothing about it can be recorded, and
+        recording about it would be recording about a number chosen later.
+        """
+
+        return [
+            s
+            for s in inputs
+            if isinstance(s, tp.SymInt) and has_guarding_hint(s)
+        ]
+
+    @classmethod
+    def _get_shape_env(cls):
+        """The environment the shapes are being worked out in, if there is one."""
+
+        tracing = getattr(tp._guards, "TracingContext", None)
+        ctx = tracing.try_get() if tracing is not None else None
+        if not ctx or not ctx.fake_mode:
+            return None
+        return ctx.fake_mode.shape_env
+
+
+@CacheArtifactFactory.register
+class InductorCacheArtifact(CacheArtifact):
+    """One compiled graph, to be put back in the local cache when read."""
+
+    def populate_cache(self) -> None:
+        FxGraphCache._write_to_local_cache(self.key, self.content)
+
+    @staticmethod
+    def type() -> str:
+        return "inductor"
 
 
 def triton_key() -> str | None:
@@ -506,8 +710,12 @@ def load_by_key_path(
 
 
 @lru_cache(maxsize=1)
-def package_key() -> str:
+def package_key() -> bytes:
     """A key that changes whenever anything that generates code changes.
+
+    Returned as bytes rather than as text because it travels to a worker
+    process as a command-line argument, where bytes have to be encoded and
+    text does not.
 
     A compiled kernel is cached against the source it was generated from.  If
     the generator is edited and an old entry is reused, the entry is a kernel
@@ -530,7 +738,7 @@ def package_key() -> str:
             continue
         hasher.update(str(path.relative_to(root)).encode("utf-8"))
         hasher.update(path.read_bytes())
-    return hasher.hexdigest()
+    return hasher.digest()
 
 
 def find_compile_subproc_binary() -> str | None:
