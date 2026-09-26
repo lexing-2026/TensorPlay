@@ -56,7 +56,7 @@ class MissingOperatorWithDecomp(OperatorIssue):
                 f"""
 
                 There is a decomposition available for {target} in
-                tp._decomp.get_decompositions().  Please add this operator to the
+                tensorplay._decomp.get_decompositions().  Please add this operator to the
                 `decompositions` list the compiler consults
                 """
             )

@@ -114,7 +114,7 @@ def coor_benchmark_device_idx(device_idx: int) -> tuple[str | None, int | str]:
     if not _coor_enabled():
         return None, device_idx
 
-    from tp._inductor.virtualized import V
+    from .loops import V
 
     expr = V.graph.device_ops.current_device_idx_expr()
     return f"{COOR_DEVICE_IDX_VAR} = {expr}", COOR_DEVICE_IDX_VAR

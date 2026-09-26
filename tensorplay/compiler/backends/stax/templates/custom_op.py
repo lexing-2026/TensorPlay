@@ -11,6 +11,7 @@ from typing import Any, NotRequired, Optional, Protocol, TypedDict, cast
 import sympy
 
 import tensorplay as tp
+from tensorplay.library import CustomOpDef
 
 from .. import config
 from ..ir import (
@@ -712,7 +713,7 @@ def _create_autotuning_lowering(processed_configs: list[CustomOpConfig], default
         return _range_based_lowering_fn(processed_configs=processed_configs, default_impl=default_impl, name=name, op_overload=op_overload, input_gen_fns=input_gen_fns, tensor_name=tensor_name, dim_index=dim_index, ranges=ranges, tensor_inputs=tensor_inputs, runtime_kwargs=runtime_kwargs, range_upper_bound=range_upper_bound, config_generator=config_generator, min_speedup_threshold=min_speedup_threshold, benchmark_with_cudagraphs=benchmark_with_cudagraphs)
     return range_based_lowering_wrapper
 
-def register_custom_op_autotuning(custom_op: tp._library.custom_ops.CustomOpDef | Any, configs: list[CustomOpConfig] | list[Callable[..., Any]] | None=None, config_generator: Callable[[dict[str, Any]], list[CustomOpConfig]] | None=None, name: str | None=None, input_gen_fns: dict[str, Callable[[Any], Any]] | None=None, dispatch_on: DispatchOnConfig | None=None, split_points: list[int] | None=None, min_speedup_threshold: float=1.0, benchmark_with_cudagraphs: bool=False) -> None:
+def register_custom_op_autotuning(custom_op: CustomOpDef | Any, configs: list[CustomOpConfig] | list[Callable[..., Any]] | None=None, config_generator: Callable[[dict[str, Any]], list[CustomOpConfig]] | None=None, name: str | None=None, input_gen_fns: dict[str, Callable[[Any], Any]] | None=None, dispatch_on: DispatchOnConfig | None=None, split_points: list[int] | None=None, min_speedup_threshold: float=1.0, benchmark_with_cudagraphs: bool=False) -> None:
     """Register custom op for autotuning with custom_op configs where each config
     specifies a decomposition implementation function with its parameter values.
     It also supports Range-based autotuning to benchmark per range and generate

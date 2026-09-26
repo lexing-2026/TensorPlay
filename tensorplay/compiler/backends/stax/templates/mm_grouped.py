@@ -860,9 +860,6 @@ def _tuned_grouped_mm_common(operator_name: str, algorithm_name: str, extern_ker
         for config in get_groupgemm_configs():
             kwargs = dict(ACC_DTYPE='cutlass.Float32')
             cutedsl_grouped_mm_template.maybe_append_choice(choices, input_nodes=input_nodes, layout=layout, **kwargs, **asdict(config))
-    if is_nonzero and a_is_2d and (not b_is_2d) and (offs is not None) and use_nv_universal_gemm_template(layout, m, n, k, mat_a, mat_b, offs, g):
-        from tp._inductor.codegen.nv_universal_gemm.nv_universal_gemm import add_nv_universal_grouped_gemm_choices
-        add_nv_universal_grouped_gemm_choices(choices, layout, input_nodes, accumulator_type=tp.float32)
     input_gen_fns = {}
     if offs is not None:
         input_offs_idx = 2 if scale_a is None else 4

@@ -4589,7 +4589,11 @@ class SIMDScheduling(BaseScheduling):
                             configs, probe_kernel = self._probe_subkernel_heuristic(
                                 node_schedule_map[pn]
                             )
-                            if tensorplay.version.hip or tp.xpu.is_available():
+                            # On a backend whose probes are taken at face
+                            # value, the first configuration is enough; on one
+                            # where they are not, only a choice with little to
+                            # choose between is worth fusing on.
+                            if tensorplay.version.hip:
                                 fuse_ok = configs and not probe_kernel.autotune_hints
                             else:
                                 fuse_ok = configs and len(configs) <= 2

@@ -4334,7 +4334,7 @@ class NestedReduction:
         cls, outer_node: BaseSchedulerNode, grouped_reduction: SchedulerNode
     ) -> GroupedAxis | None:
         """Use LoopBody iter/reduce vars to disambiguate equal-size axes."""
-        from torch._inductor.loop_body import MemoryUsageType
+        from .loop_body import MemoryUsageType
 
         outer_reductions = [sn for sn in outer_node.get_nodes() if sn.is_reduction()]
         if len(outer_reductions) != 1:
