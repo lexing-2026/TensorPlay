@@ -15,6 +15,7 @@ new one, never half of either.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hashlib
 import logging
 import os
@@ -41,6 +42,11 @@ if TYPE_CHECKING:
 
 from .cache_key import CODE_CACHE_KEY_STRATEGY, SYSTEM_CACHE_KEY_STRATEGY
 from .compile_log import timed_block
+from tensorplay._subclasses.fake_tensor import (
+    extract_tensor_metadata,
+    TensorMetadata,
+)
+
 from .runtime.cache_artifacts import CacheArtifact, CacheArtifactFactory
 from .runtime.cache_dir_utils import cache_dir
 from .runtime.device_compiler import compiler_module
@@ -57,6 +63,38 @@ log = logging.getLogger(__name__)
 #: onto an existing file fails.  There the write is a copy and a remove, which
 #: is not atomic and so is done only where there is no alternative.
 _IS_WINDOWS = sys.platform == "win32"
+
+
+@dataclasses.dataclass
+class TensorMetadataAndValues:
+    """A tensor's metadata beside the values themselves.
+
+    Used where a constant is inlined into a graph: the geometry says what the
+    computation is, and the values say what it computes, and a name that
+    covers only the first would collide two graphs that differ in the second.
+    """
+
+    tensor_metadata: TensorMetadata
+    values: list
+
+
+def _ident(x):
+    return x
+
+
+def extract_tensor_metadata_for_cache_key(t) -> TensorMetadata:
+    """A tensor's metadata, with what does not belong in a name removed.
+
+    Where the storage happens to begin is a fact about this run rather than
+    about the computation, so it is dropped -- unless the tensor is one the
+    compiler produced and therefore placed itself, in which case the offset is
+    part of what was built and has to stay.
+    """
+
+    meta = extract_tensor_metadata(t)
+    if not getattr(t, "_is_inductor_static", False):
+        meta = dataclasses.replace(meta, storage_offset=0, storage_bytes=None)
+    return meta
 
 
 class GuardedCache(Generic[T]):
