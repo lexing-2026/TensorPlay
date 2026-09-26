@@ -1127,7 +1127,9 @@ PYBIND11_MODULE(_C, m) {
     // Returns (op_events, gpu_activities, mem_events).
     //   op_events: (name, kind, start_ns, end_ns, tid, shapes|None,
     //     dtypes|None, site_str|None, gpu_ms, out_bytes, stack|None,
-    //     kernel_count) tuples ordered by start.
+    //     kernel_count, flops, slot_id) tuples ordered by start.  slot_id is
+    //     what a gpu_activity names in external_id when it says which operation
+    //     launched it, so the two lists join on it without a timestamp.
     //   gpu_activities: (name, kind, start_ns, end_ns, device, stream,
     //     correlation, external_id, tid, cbid, bytes, copy_kind, value).
     //   mem_events: (ts_ns, ptr, bytes, is_alloc, is_cuda, device, stream,
@@ -1473,7 +1475,7 @@ PYBIND11_MODULE(_C, m) {
                 std::string(e.name), char(e.kind), e.start_ns, e.end_ns,
                 e.tid, std::move(shapes), std::move(dtypes),
                 std::move(site), e.gpu_ms, e.out_bytes,
-                std::move(stack), e.kernel_count, flops));
+                std::move(stack), e.kernel_count, flops, e.slot_id));
         }
         py::list out_gpu;
         for (const auto& a : gpu_acts) {

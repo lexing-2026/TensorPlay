@@ -310,6 +310,138 @@ class CPUDeviceBenchmarkMixin:
         return run_times[len(run_times) // 2]
 
 
+class GPUDeviceBenchmarkMixin:
+    """How a candidate is timed when it runs on an accelerator.
+
+    Timed on the device it will run on, and not moved there first: a candidate
+    measured on one device and used on another was measured as something else.
+    The device is taken from the values rather than asked for, because the values
+    are what the candidate will actually be handed.
+    """
+
+    def do_bench(
+        self,
+        fn,
+        *input_tensors,
+        out=None,
+    ) -> float:
+        import tensorplay as tp
+
+        from .benchmarking import benchmarker, get_interface_for_device
+
+        # One device, or the measurement is of nothing: a candidate that reads
+        # from two devices is two candidates, and timing them together times the
+        # transfer as much as the work.
+        indices = {
+            tensor.device.index
+            for tensor in [*input_tensors, out]
+            if isinstance(tensor, tp.Tensor) and _is_gpu_device(tensor.device)
+            and tensor.device.index is not None
+        }
+        if len(indices) > 1:
+            raise AssertionError(f"Can not mix devices {sorted(indices)}")
+        device_type = next(
+            (
+                tensor.device.type
+                for tensor in input_tensors
+                if _is_gpu_device(tensor.device)
+            ),
+            "cuda",
+        )
+        device_interface = get_interface_for_device(device_type)
+        device_idx = (
+            next(iter(indices))
+            if len(indices) == 1
+            else device_interface.current_device()
+        )
+        with device_interface.device(device_idx):
+            result = benchmarker.benchmark(fn, device=device_type)
+            # Waiting here rather than at the end of the measurement turns a
+            # failure inside the candidate into a failure here, where the
+            # candidate is still known, instead of into one several measurements
+            # later attributed to whichever candidate ran next.
+            device_interface.synchronize()
+        return result
+
+
+def _is_gpu_device(device) -> bool:
+    """Whether a device is one whose work is timed rather than waited for."""
+
+    return getattr(device, "type", None) in {"cuda", "xpu", "mtia"}
+
+
+class SubgraphBenchmarkRequest(BenchmarkRequest):
+    """A candidate that is a whole subgraph, already built in this process.
+
+    A subgraph is compiled here rather than where it is measured, because
+    compiling it is most of what it costs and the measurement is meant to be of
+    running it.  So what travels is not the subgraph but where it was written and
+    the key it was written under, which is enough to load the same one and
+    nothing else.
+    """
+
+    def __init__(
+        self,
+        kernel_name: str,
+        input_tensor_meta,
+        output_tensor_meta,
+        extra_args,
+        module_path: str,
+        module_cache_key: str,
+        sym_input_values: list[int],
+    ) -> None:
+        super().__init__(kernel_name, input_tensor_meta, output_tensor_meta, extra_args)
+        self.module_path = module_path
+        self.module_cache_key = module_cache_key
+        self.sym_input_values = list(sym_input_values)
+
+    def make_run_fn(self, *input_tensors, out=None):
+        """A closure that runs the subgraph on the values it was handed.
+
+        The sizes that were only known when it was built come first, because a
+        built subgraph is entered by position and those sizes are its arguments
+        as much as the values are.
+        """
+
+        from ..codecache import load_by_key_path
+
+        module = load_by_key_path(
+            self.module_cache_key, self.module_path, set_sys_modules=False
+        )
+        sym_values = self.sym_input_values
+        # A fresh list each time: the call consumes the list it is given, so a
+        # shared one would be empty the second time round.
+        return lambda: module.call([*sym_values, *input_tensors])
+
+    def precompile(self) -> None:
+        """Load the built subgraph now, so that loading is not timed.
+
+        Nothing is built here -- it was built in the process that chose it -- but
+        loading maps a file, and a measurement that included a mapping would be
+        measuring the file system.
+        """
+
+        from ..codecache import load_by_key_path
+
+        load_by_key_path(
+            self.module_cache_key, self.module_path, set_sys_modules=False
+        )
+
+    def __str__(self) -> str:
+        return (
+            f"SubgraphBenchmarkRequest({self.kernel_name}, {self.module_path})"
+        )
+
+
+class SubgraphGPUBenchmarkRequest(GPUDeviceBenchmarkMixin, SubgraphBenchmarkRequest):
+    """A built subgraph, measured on an accelerator."""
+
+
+class SubgraphCPUBenchmarkRequest(CPUDeviceBenchmarkMixin, SubgraphBenchmarkRequest):
+    """A built subgraph, measured on the processor."""
+
+
+
 class CppBenchmarkRequest(CPUDeviceBenchmarkMixin, BenchmarkRequest):
     """A candidate whose body is source text compiled on the measuring host.
 

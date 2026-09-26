@@ -5,7 +5,13 @@ from __future__ import annotations
 import collections
 from dataclasses import dataclass
 
-from ._utils import event_gpu_us, self_cuda_us, self_times
+from ._utils import (
+    event_gpu_us,
+    nested_cuda_us,
+    nested_spans,
+    self_cuda_us,
+    self_times,
+)
 
 
 @dataclass(frozen=True)
@@ -94,7 +100,7 @@ class FunctionEventAvg:
 
     @property
     def device_time_total(self):
-        return self.cuda_us
+        return self.cuda_time_total
 
     @property
     def self_device_time_total(self):
@@ -296,8 +302,8 @@ class _FunctionsTable:
 class FunctionEvent:
     """Read-only object view over one collected event tuple."""
 
-    def __init__(self, event, self_ns=0, self_cuda_us=0.0):
-        values = list(event) + [None] * max(0, 13 - len(event))
+    def __init__(self, event, self_ns=0, self_cuda_us=0.0, children=(), device_us=None):
+        values = list(event) + [None] * max(0, 14 - len(event))
         (
             self.name,
             self.kind,
@@ -312,12 +318,26 @@ class FunctionEvent:
             self.stack,
             self.kernel_count,
             self.flops,
-        ) = values[:13]
+            self.slot_id,
+        ) = values[:14]
         self.flops = self.flops or 0
+        self.id = self.slot_id
+        # What this span dispatched, in dispatch order.  A span is timed on the
+        # device by adding up the device work of everything under it, and adding
+        # that up needs to know what is under it rather than what merely overlaps
+        # it: two spans on one thread overlap whenever one waits, and a wait is
+        # not a use of the device.
+        self.cpu_children = list(children)
+        # The device time of the work dispatched inside this span, which for a
+        # span that dispatches work of its own is its own and for a span that
+        # only encloses work is the whole of what was asked about.  Left unset
+        # rather than zero when no device activity was collected, so that "no
+        # activity" is not read as "no device work".
+        self.device_us = device_us
         self.thread = self.tid
         self.input_shapes = self.shapes
         self.input_dtypes = self.dtypes
-        self.device_type = "cpu"
+        self.device_type = _device_type("cpu")
         self.is_async = False
         self.scope = {"o": 0, "u": 0, "b": 1}.get(self.kind, 0)
         self.cpu_interval = Interval(self.start_ns / 1e3, self.end_ns / 1e3)
@@ -350,6 +370,18 @@ class FunctionEvent:
 
     @property
     def device_time_total(self):
+        """Device time for this span and for the work dispatched inside it.
+
+        The span's own device time when it dispatched any, and otherwise the sum
+        over what it encloses; a span that did both is both, because a caller
+        asking what a region cost is asking about the region and not about the
+        one call inside it that happened to be the timed one.  An annotation
+        around a piece of work dispatches nothing itself, so for the span whose
+        time is actually wanted this is the whole answer rather than zero.
+        """
+
+        if self.device_us is not None:
+            return self.device_us
         return self.cuda_time_total
 
     @property
@@ -358,6 +390,157 @@ class FunctionEvent:
 
     def __repr__(self):
         return f"<FunctionEvent {self.name} {self.cpu_time:.2f}us>"
+
+
+def _device_type(name):
+    """A device kind as the value a reader compares against.
+
+    Compared by identity of the kind rather than by the spelling of the device,
+    so that a record saying which kind it is on and a caller saying which kind it
+    expected are talking about the same thing rather than about two strings that
+    happen to look alike.
+    """
+
+    import tensorplay as tp
+
+    kind = getattr(tp.DeviceType, str(name).upper(), None)
+    return name if kind is None else kind
+
+
+class DeviceActivity:
+    """One piece of work the device did, as the collector recorded it.
+
+    Read through methods rather than fields because a caller asking which
+    operation a piece of device work belongs to should not have to know that
+    the join runs through the correlation id the launch record shares with it,
+    and should not have to know which of the two ends of that id is the one
+    naming the operation.
+    """
+
+    #: A record the collector gathered with no operation being dispatched, which
+    #: is every record whose launch could not be tied to one.
+    NO_EXTERNAL_ID = 0xFFFFFFFFFFFFFFFF
+
+    def __init__(self, activity, launch_to_slot=None, device_name="cuda"):
+        values = list(activity) + [None] * max(0, 13 - len(activity))
+        (
+            self._name,
+            self._kind,
+            self._start_ns,
+            self._end_ns,
+            self._device,
+            self._stream,
+            self._correlation,
+            self._external_id,
+            self._thread_id,
+            self._cbid,
+            self._bytes,
+            self._copy_kind,
+            self._value,
+        ) = values[:13]
+        self._launch_to_slot = launch_to_slot or {}
+        # The kind of device, which the index alone does not say: index 0 is the
+        # first device of whichever kind this is.
+        self._device_name = device_name
+
+    def name(self):
+        return self._name
+
+    def correlation_id(self):
+        """The id shared with the launch record for this same piece of work."""
+        return self._correlation
+
+    def linked_correlation_id(self):
+        """The launch this work belongs to, or zero when it belongs to none.
+
+        Zero rather than a sentinel of this code's own, and zero rather than the
+        operation, because a caller that cannot find this id among the launches it
+        cares about needs to be able to say so, and a value that could also be a
+        real one would let it mistake a coincidence for an answer.  Zero is used
+        because it is not a launch: the collector numbers launches from one, so
+        zero names none of them.
+
+        To ask which *operation* the work belongs to, ask :meth:`op_slot`, which
+        resolves the launch rather than reporting it.
+        """
+
+        if self._external_id != self.NO_EXTERNAL_ID:
+            return self._external_id
+        return self._launch_to_slot.get(self._correlation, 0)
+
+    def op_slot(self):
+        """The operation that asked for this work, or None when none did.
+
+        A kernel record names the launch that issued it, not the operation that
+        asked for the launch, so the operation is reached through the launch:
+        either this record carries it, or the record sharing this correlation
+        does.  Which one is available depends on whether the collector saw the
+        launch, so both are asked.
+        """
+
+        if self._external_id != self.NO_EXTERNAL_ID:
+            return self._external_id
+        return self._launch_to_slot.get(self._correlation)
+
+    def activity_type(self):
+        """What kind of record this is, in the spelling a reader expects.
+
+        The device's own annotations are excluded by a caller that wants only the
+        device's work, and they arrive here indistinguishable from a launch, so
+        the distinction is made here where the kinds are known.
+        """
+
+        if self._kind == "k":
+            return "gpu_kernel"
+        if self._kind in ("m", "s"):
+            return "gpu_memcpy"
+        if self._kind == "r":
+            return "cuda_runtime"
+        if self._kind == "d":
+            return "cuda_driver"
+        return "gpu_user_annotation"
+
+    def device_type(self):
+        """Which kind of device this record is work on.
+
+        A launch or a driver call is work the processor did while setting the
+        device up, and its duration is not device time however much of it
+        happened to be issued from a device queue; a kernel, a copy or a fill is
+        the device's own work and its duration is.  The two are told apart here
+        so that a reader adding up device time does not add up the launching.
+        """
+
+        if self._kind in ("k", "m", "s"):
+            return _device_type(self._device_name or "cuda")
+        return _device_type("cpu")
+
+    def start_ns(self):
+        return self._start_ns
+
+    def end_ns(self):
+        return self._end_ns
+
+    def duration_us(self):
+        return (self._end_ns - self._start_ns) / 1000.0
+
+    def __repr__(self):
+        return f"<DeviceActivity {self._kind} {str(self._name)[:32]}>"
+
+
+def device_activities(gpu_activities, device_name="cuda"):
+    """The device's work as records a reader can ask questions of.
+
+    The correlation-to-operation map is built once here and shared by every
+    record, because answering "which operation is this" for one record means
+    looking through all of them, and doing that per record would make asking
+    about a session cost a pass over the session per record.
+    """
+
+    launch_to_slot: dict[int, int] = {}
+    for activity in gpu_activities:
+        if len(activity) > 7 and activity[7] != DeviceActivity.NO_EXTERNAL_ID:
+            launch_to_slot.setdefault(activity[6], activity[7])
+    return [DeviceActivity(a, launch_to_slot, device_name) for a in gpu_activities]
 
 
 class EventList(list):
@@ -380,6 +563,7 @@ class EventList(list):
         self.with_stack = with_stack
         self.with_flops = False
         self._function_events = None
+        self._device_time = None
 
     def _invalidate(self):
         self._function_events = None
@@ -408,10 +592,34 @@ class EventList(list):
         if self._function_events is None:
             own_ns = self_times(self)
             own_cuda_us = self_cuda_us(self)
-            self._function_events = [
-                FunctionEvent(event, cpu_ns, cuda_us) for event, cpu_ns, cuda_us in zip(self, own_ns, own_cuda_us)
+            children = nested_spans(self)
+            device_us = nested_cuda_us(self, self.gpu_activities)
+            # Every event is built before any is given its children, because a
+            # child is an event and an event is what a list of children holds.
+            built = [
+                FunctionEvent(event, cpu_ns, cuda_us, (), dev)
+                for event, cpu_ns, cuda_us, dev in zip(
+                    self, own_ns, own_cuda_us, device_us
+                )
             ]
+            for index, kids in enumerate(children):
+                built[index].cpu_children = [built[c] for c in kids]
+            self._function_events = built
         return self._function_events
+
+    @property
+    def device_time_by_span(self):
+        """For each collected span, the device time of the work inside it.
+
+        Kept alongside the events because the two answer different questions: a
+        span's own event says how long the span took on the host, and this says
+        how long the device was busy for it, which for a span that only encloses
+        work is the whole of what was being asked.
+        """
+
+        if self._device_time is None:
+            self._device_time = nested_cuda_us(self, self.gpu_activities)
+        return self._device_time
 
     def key_averages(
         self,

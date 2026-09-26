@@ -98,12 +98,13 @@ def compile_graph(graph_module, example_inputs, *, scheduler: KernelScheduler | 
 
 
 def host_launches(graph, plan=None, groups=None):
-    """One built launcher per fused group of a lowered region, in run order.
+    """One entry per fused group of a lowered region, in run order.
 
-    The printing is shared by every way of asking for a built form of a region,
-    so that what a caller gets back does not depend on which of them it asked:
-    a group is grouped the same way, laid out the same way, and printed the same
-    way whichever way it was asked for.
+    An entry is the group's built launcher, or nothing where the group is a call
+    that is run rather than printed.  The printing is shared by every way of
+    asking for a built form of a region, so that what a caller gets back does
+    not depend on which of them it asked: a group is grouped the same way, laid
+    out the same way, and printed the same way whichever way it was asked for.
     """
 
     from .codegen import loop_cpp
@@ -118,7 +119,11 @@ def host_launches(graph, plan=None, groups=None):
     launches = []
     for group in groups:
         if isinstance(group, ExternNode):
-            # A call that is run rather than printed has nothing built to launch.
+            # A call that is run rather than printed has nothing built to launch,
+            # but it still takes its place in the run order, so the position is
+            # kept rather than dropped: a caller that walks the groups alongside
+            # this list is then walking them in the order they run in.
+            launches.append(None)
             continue
         stored = stored_names(plan, group)
         try:
@@ -130,13 +135,7 @@ def host_launches(graph, plan=None, groups=None):
             buffer = graph.name_to_buffer[name]
             shapes.append(tuple(int(s) for s in buffer.get_size()))
             strides.append(tuple(int(s) for s in buffer.layout.stride))
-        # What the group writes can cover a different number of elements than
-        # it reads -- a window onto its input is one -- and a kernel that walks
-        # its operands in step cannot produce that, so the result's extents
-        # travel with the program and the emitter decides whether it can.
         result = graph.name_to_buffer[_stored_name(stored)]
-        # The layouts pin the specialization, so a call whose operands do not
-        # match them is not this kernel.
         launch = build_cpu_native_kernel(
             program["instructions"], program["constants"],
             program["input_count"], program["output_ref"],
@@ -167,14 +166,15 @@ def compile_half_host(graph_module, example_inputs, **options):
     # settles it, so asking twice would be asking about a region that has already
     # been through it.
     groups = plan.fuse()
-    steps = [
-        ExternStep(group.kernel) for group in groups
-        if isinstance(group, ExternNode)
-    ]
-    steps.extend(
-        HostStep(launch, inputs, output)
-        for launch, inputs, output in host_launches(graph, plan, groups)
-    )
+    # One step per group, taken in the order the groups run in, so that what
+    # produces a value is never behind what reads it.
+    steps = []
+    for group, launch in zip(groups, host_launches(graph, plan, groups)):
+        if launch is None:
+            steps.append(ExternStep(group.kernel))
+        else:
+            built, inputs, output = launch
+            steps.append(HostStep(built, inputs, output))
     program = LoopProgram(graph, steps)
     program._tensorplay_codegen = "cpp"  # type: ignore[attr-defined]
     program._tensorplay_backward_codegen = "cpp"  # type: ignore[attr-defined]
@@ -220,3 +220,45 @@ def _traced_value_of(joint, name: str):
             if value is not None:
                 return value
     raise KeyError(f"no traced value for saved node {name!r}")
+
+
+def record_original_output_strides(gm) -> None:
+    """Note the strides each of a graph's outputs had when the graph was traced.
+
+    Recorded once and then left alone, because a pass over the graph may pad a
+    result to make it easier to compute, and a later reader asking what the graph
+    produces is asking what the program asked for rather than what the pass made
+    of it.  Overwriting on a second call would replace the answer to that question
+    with the intermediate one.
+    """
+
+    import tensorplay as tp
+
+    output_node = gm.graph.find_nodes(op="output")[0]
+    if "original_output_strides" in output_node.meta:
+        return
+
+    # The output node wraps what it yields, so a graph yielding one value still
+    # holds it in a one-element sequence, and a graph yielding several holds them
+    # bare.
+    outputs = output_node.args[0]
+    if not _is_fx_node(outputs):
+        outputs = (outputs,)
+
+    strides = []
+    for output in outputs:
+        val = output.meta.get("val") if _is_fx_node(output) else None
+        strides.append(
+            tuple(int(x) for x in val.stride())
+            if val is not None and isinstance(val, tp.Tensor)
+            else None
+        )
+    output_node.meta["original_output_strides"] = strides
+
+
+def _is_fx_node(value) -> bool:
+    """Whether a value is a graph node rather than what a node stands for."""
+
+    return hasattr(value, "op") and hasattr(value, "users")
+
+

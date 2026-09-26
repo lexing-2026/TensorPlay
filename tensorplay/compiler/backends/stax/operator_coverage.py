@@ -88,11 +88,14 @@ LIBRARY_CALLS: dict[str, str] = {
 #: laid over it, and the output needs the input's pixels scattered back -- and
 #: writing one means writing the other, so they are listed as a set.
 NOT_COVERED: dict[str, str] = {
+    "avg_pool2d_backward.default": "reduction over the input, driven by the output's windows",
+    "avg_pool3d_backward.default": "reduction over the input, driven by the output's windows",
     "max_pool2d_backward.default": "scatter to the input, driven by the saved indices",
     "max_pool3d_backward.default": "scatter to the input, driven by the saved indices",
     "upsample_nearest2d_backward.default": "scatter to the input, driven by the source map",
     "upsample_nearest3d_backward.default": "scatter to the input, driven by the source map",
     "upsample_bilinear2d_backward.default": "scatter to the input, driven by the source map",
+    "index_add.default": "the decompositions' scatter, which this route cannot write",
     "index_copy.default": "the decompositions' scatter, which this route cannot write",
     "scatter_add.default": "the decompositions' scatter, which this route cannot write",
 }

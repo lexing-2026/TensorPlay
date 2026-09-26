@@ -146,20 +146,21 @@ GpuTimerPair::~GpuTimerPair() {
 
 void GpuTimerPair::arm(const Device& device) {
     if (!rec_.live_ || !device.is_cuda()) return;
-    // Two attribution regimes coexist.  Warmup ops (and every op when the
-    // record timebase failed the start-time consistency check) push their
-    // OpRecord slot as an external correlation id, which pins the join
-    // exactly.  Bulk ops push nothing: their kernels resolve after the
-    // session from launch-time containment, keeping the steady-state
-    // dispatch path free of library calls.
+    // Every op pushes its OpRecord slot as an external correlation id while a
+    // device-activity session runs, which is what pins the join between a kernel
+    // record and the op that launched it exactly.  The two library calls are
+    // spent only inside such a session, so the dispatch path of a program that
+    // is not being traced is untouched; a session that only wants per-op
+    // durations does not ask for device activity and pays nothing either way.
+    //
+    // The first kExtWarmupOps additionally exist to calibrate the constant
+    // offset between the record timebase and the host clock the op spans use,
+    // which lazy device-activity setup can rebase early in a session; their
+    // pinned launch records are what that offset is fitted from.
     if (g_gpu_trace.load(std::memory_order_acquire)) {
-        const bool warmup =
-            g_ext_warmup.fetch_add(1, std::memory_order_relaxed) <
-            kExtWarmupOps;
-        if (warmup || g_ext_corr_mode.load(std::memory_order_acquire)) {
-            rec_.trace_pushed_ =
-                cupti_push_ext(static_cast<uint64_t>(rec_.slot_));
-        }
+        g_ext_warmup.fetch_add(1, std::memory_order_relaxed);
+        rec_.trace_pushed_ =
+            cupti_push_ext(static_cast<uint64_t>(rec_.slot_));
     }
     if (!g_gpu_timing.load(std::memory_order_acquire)) return;
     const auto stream = cuda::getCurrentCUDAStream();

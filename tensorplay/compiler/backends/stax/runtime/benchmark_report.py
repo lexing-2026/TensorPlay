@@ -113,8 +113,45 @@ def compiled_module_main() -> Callable[..., None]:
     return main
 
 
+#: The kinds of kernel a generated file can hold, by the decorator it is
+#: written under.  A file's kind is what its metadata means, so it is read off
+#: the decorator rather than worked out from the body.
+_KERNEL_CATEGORIES = (
+    "foreach",
+    "persistent_reduction",
+    "pointwise",
+    "reduction",
+    "split_scan",
+    "template",
+)
+
+
+def get_kernel_category_by_source_code(src_code: str) -> str:
+    """What kind of kernel a generated file holds, read off its decorators.
+
+    Read from the source rather than from a compiled module, because a file is
+    often classified before anything has been compiled from it -- the metadata
+    a build is about to make is wanted while the build is still deciding.
+
+    A file that says nothing, or that says two different things, is
+    ``"unknown"``: the callers of this treat a category as a filter over what
+    they report, and a filter that guessed would drop a kernel from a report
+    rather than mislabel it.
+    """
+
+    choices = [
+        category
+        for category in _KERNEL_CATEGORIES
+        if f"@triton_heuristics.{category}" in src_code
+    ]
+    if len(choices) == 1:
+        return choices[0]
+    return "unknown"
+
+
 __all__ = [
     "compiled_module_main",
+    "get_kernel_category_by_source_code",
     "print_performance",
     "time_and_count",
 ]

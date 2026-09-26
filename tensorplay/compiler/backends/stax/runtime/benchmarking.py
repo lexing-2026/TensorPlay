@@ -13,13 +13,77 @@ from typing_extensions import ParamSpec, Self, TypeVar
 import tensorplay as tp
 
 from .. import config as inductor_config
+from ..utils import counters
+from tensorplay.utils import _pytree as pytree
 
 logger = logging.getLogger(__name__)
+#: The kind of device an event was recorded on, named as the events themselves
+#: name it so that a comparison against an event's own kind needs no translation.
+DeviceType = tp.DeviceType
+
+
+def get_gpu_type() -> str:
+    """The kind of device a measurement is being taken on unless told otherwise.
+
+    Taken from what is actually there rather than assumed, because a measurement
+    on a machine with no accelerator is a measurement on the processor and
+    treating that as a measurement on an accelerator produces a number with no
+    device behind it.
+    """
+
+    return _get_default_gpu_device_type()
+
+
+def get_interface_for_device(device_type: str | tp.device | None = None) -> Any:
+    """The module that talks to a device.
+
+    Which module that is depends on the kind of device, and the few operations
+    every measurement needs from it -- waiting for it, an event that can be
+    timed, a buffer on it -- are the same set under a different name on each, so
+    asking for the module once and using it for all of them is what keeps a
+    measurement from having to know which device it is on.
+    """
+
+    if device_type is None:
+        device_type = get_gpu_type()
+    elif isinstance(device_type, tp.device):
+        device_type = device_type.type
+    return tp.get_device_module(device_type)
+
+
 GPU_BENCHMARK_DEVICE_TYPES = ("cuda", "xpu", "mtia")
 _CALLABLE_PROFILE_EVENT_NAME = "_CALLABLE"
 
 
 MILLISECONDS_PER_SECOND = 1000
+
+#: Whether a measurement is in progress.  Set while one is, because a measurement
+#: runs a candidate many times and each run may log the kernels it launched, and a
+#: candidate that launches a thousand kernels then produces a thousand lines that
+#: are all the same line.  Read by the places that would log a launch, so that a
+#: launch during a measurement is counted rather than described.
+_IN_INDUCTOR_BENCHMARK = False
+
+
+@contextlib.contextmanager
+def _benchmarking_inductor() -> Iterator[None]:
+    """Mark the enclosed work as a measurement, so launches are not described.
+
+    A measurement is not a program run: it is the same work run over and over to
+    be timed, and what it does is already known, which is what makes a line per
+    launch during one worth not printing.  The flag is restored afterwards rather
+    than cleared, so a measurement inside a measurement inside real work does not
+    leave the outer one un-marked.
+    """
+
+    global _IN_INDUCTOR_BENCHMARK
+    previous = _IN_INDUCTOR_BENCHMARK
+    _IN_INDUCTOR_BENCHMARK = True
+    try:
+        yield
+    finally:
+        _IN_INDUCTOR_BENCHMARK = previous
+
 
 P = ParamSpec("P")
 T = TypeVar("T")
@@ -29,7 +93,8 @@ def _get_default_gpu_device_type() -> str:
     avail_gpus = [
         device_type
         for device_type in GPU_BENCHMARK_DEVICE_TYPES
-        if getattr(torch, device_type).is_available()
+        if getattr(tp, device_type, None) is not None
+        and getattr(tp, device_type).is_available()
     ]
     if len(avail_gpus) > 1:
         raise AssertionError(
@@ -294,7 +359,7 @@ class Benchmarker:
         rep = kwargs.pop("rep", inductor_config.inductor_default_autotune_rep)
 
         # Surfacing all kernels during autotuning is super noisy; filtering these out.
-        with DebugMode._benchmarking_inductor():
+        with _benchmarking_inductor():
             # First, try a registered device-specific benchmarker
             benchmark_fn: Callable[..., Any] | None = _BENCHMARK_DISPATCH.get(
                 inferred_device.type

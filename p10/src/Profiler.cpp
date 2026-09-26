@@ -329,8 +329,13 @@ void OpRecord::begin(const char* static_name, const std::string* owned_name,
         nvtx_open_ = nvtx_on;
         itt_open_ = itt_on;
     }
+    // The slot is known before the event is stored -- it is where the event is
+    // about to land -- so the event carries it, and a device record naming this
+    // op as the one that launched it can be joined to it by that name rather
+    // than by guessing which span a timestamp falls in.
+    slot_ = g_events->size();
+    e.slot_id = static_cast<uint64_t>(slot_);
     g_events->push_back(e);
-    slot_ = g_events->size() - 1;
     start_ns_ = start;
     live_ = true;
 }
@@ -405,8 +410,13 @@ void user_span_begin(const std::string& name) {
         e.stack_id = t_pending_site.stack_id;
         t_pending_site.valid = false;
     }
+    // The slot is where the event lands, so it is known before the event is
+    // stored and travels with it: a device record names this span by it when the
+    // span is the one that dispatched the work.
+    const size_t slot = g_events->size();
+    e.slot_id = static_cast<uint64_t>(slot);
     g_events->push_back(e);
-    t_user_stack.push_back(g_events->size() - 1);
+    t_user_stack.push_back(slot);
     tensorplay::prof::nvtx_span_begin(e.name);
 }
 

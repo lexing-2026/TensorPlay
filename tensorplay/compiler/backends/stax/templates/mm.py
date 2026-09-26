@@ -23,7 +23,7 @@ from .triton import CHOICES, dtype_size
 
 from ..codegen.common import KernelTemplate
 from .base import SymbolicGridFn, TemplateConfigHeuristics
-from .subgraph import SubgraphTemplate
+from ..codegen.subgraph import SubgraphTemplate
 from tensorplay.graph.experimental.proxy_tensor import make_graph
 
 from .ir import contiguous_stride, next_power_of_2

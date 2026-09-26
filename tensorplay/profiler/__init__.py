@@ -5,6 +5,7 @@ from ._schedule import ProfilerAction, schedule
 from .profiler import (
     DeviceType,
     ProfilerActivity,
+    device_activity_ready,
     emit_itt,
     emit_nvtx,
     profile,
@@ -12,7 +13,14 @@ from .profiler import (
     supported_activities,
     tensorboard_trace_handler,
 )
-from .profiler_util import EventList, FunctionEvent, FunctionEventAvg, Interval
+from .profiler_util import (
+    DeviceActivity,
+    EventList,
+    FunctionEvent,
+    FunctionEventAvg,
+    Interval,
+    device_activities,
+)
 
 from . import itt
 

@@ -7146,6 +7146,18 @@ def build_cpu_native_kernel(
         ctypes.c_void_p,
     ]
 
+    # What was built is also worth being able to name, so the artifact carries
+    # the key it was built under and the file it was written to.  A caller that
+    # wants this kernel again -- in this process or another -- reaches it by
+    # those two, and without them the only way back is to rebuild it and hope the
+    # rebuild produced the same thing.
+    from ..codecache import LoadedKernel
+
+    try:
+        by_key = LoadedKernel(output_path, key, _native_entry_name())
+    except OSError:
+        by_key = None
+
     def run(inputs):
         if out_shape is None:
             # No shape was stated, so the extent is whatever the tensors the
@@ -7165,4 +7177,10 @@ def build_cpu_native_kernel(
         )
         return result
 
+    if by_key is not None:
+        # ``run`` takes the values and works out the result; ``call`` takes the
+        # flat list a call site has and is the form a loaded artifact is used in.
+        run.call = by_key.call
+        run.__file__ = by_key.__file__
+        run.key = key
     return run

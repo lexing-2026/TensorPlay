@@ -17,7 +17,7 @@ from ._memory_profiler import (
 )
 from ._schedule import ProfilerAction, schedule
 from ._utils import rank_world
-from .profiler_util import EventList
+from .profiler_util import EventList, device_activities
 from .python_tracer import PySampler
 
 
@@ -111,6 +111,32 @@ def _module_span_call(module_self, *args, **kwargs):
         _C._profiler_user_end()
 
 
+#: Whether any device activity record has ever been collected in this process.
+#: The collector allocates its record buffers when it is first asked for them and
+#: does not record what happens while it does, so the first session in a process
+#: reports nothing; a caller that needs device records has to know whether the
+#: session it just ran was that one.
+_device_records_seen = False
+
+
+def device_activity_ready() -> bool:
+    """Whether a device-activity session started now would report records.
+
+    False in a process that has not yet run one, and false only for the first
+    session: the collector is ready from the second onwards.
+    """
+
+    return _device_records_seen
+
+
+def _note_device_records(count: int) -> None:
+    """Record that a session received this many device records."""
+
+    global _device_records_seen
+    if count:
+        _device_records_seen = True
+
+
 class profile:
     """Context manager that records dispatched operations and annotations."""
 
@@ -177,6 +203,7 @@ class profile:
         self.stop_ms = 0.0
         self.gpu_timed_events = 0
         self.gpu_resolved_events = 0
+        self._device_results = None
 
     def _ensure_events(self):
         if self.events is None:
@@ -248,6 +275,7 @@ class profile:
             events.extend(raw_ops)
             if raw_gpu:
                 self.gpu_activities.extend(raw_gpu)
+            _note_device_records(len(raw_gpu))
             if raw_mem:
                 self.mem_events.extend(raw_mem)
         finally:
@@ -290,6 +318,31 @@ class profile:
             self._ensure_events()
             self._entered = False
         return False
+
+    def kineto_results(self):
+        """The device's own record of what it did, in a form meant to be read.
+
+        Named for what it is rather than for how it was collected: a caller
+        wants the device's work, wants to know which piece of it belongs to which
+        operation, and wants the two joined by something exact.  What the
+        collector gathered is exactly that, so it is handed over as records that
+        answer those questions, and the join is already made rather than left to
+        the caller to reconstruct.
+        """
+
+        if self._device_results is None:
+            self._device_results = device_activities(self.gpu_activities)
+        return self._device_results
+
+    @property
+    def device_time_by_span(self):
+        """For each collected span, the device time of the work inside it.
+
+        The per-span answer, for a caller that has a span and wants what it cost
+        on the device rather than what it cost to ask for.
+        """
+
+        return self._ensure_events().device_time_by_span
 
     def key_averages(
         self,

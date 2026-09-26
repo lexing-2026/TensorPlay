@@ -81,12 +81,20 @@ struct Event {
                             // the kernels correlated to this op
     // Number of GPU activities correlated to this op in gpu_trace mode.
     int32_t kernel_count = 0;
+    // The dispatch record's slot, which is the id a kernel activity carries as
+    // its external correlation id and therefore what a device record names when
+    // it says which operation launched it.  Carried on the event so the join can
+    // be made from the event stream rather than by inferring it from timestamps:
+    // an op that launches nothing is indistinguishable from one whose kernels ran
+    // before another op's span opened, and only the id tells them apart.
+    uint64_t slot_id = kNoSlot;
     // Output allocation volume for Tensor-returning ops (numel x itemsize),
     // recorded when capture-shapes is on; basis of the memory snapshot view
     // (allocator-level accounting lives in MemEvent below).
     int64_t out_bytes = -1;
 
     static constexpr uint32_t kNoSite = 0xffffffffu;
+    static constexpr uint64_t kNoSlot = 0xffffffffffffffffull;
 };
 
     // Allocator-level memory event (profile_memory sessions). One per user

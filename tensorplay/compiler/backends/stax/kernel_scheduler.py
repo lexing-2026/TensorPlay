@@ -1687,7 +1687,6 @@ class SchedulerNode(BaseSchedulerNode):
         self.pointwise_read_writes.clear_cache(self)
 
         if need_clear_tiling_cache:
-            from .tiling_utils import _clear_candidate_tilings
 
             _clear_candidate_tilings()
 

@@ -87,7 +87,11 @@ from .params import (
     KernelTemplateParams,
 )
 from .select_algorithm import ExternKernelChoice
-from .subgraph import SubgraphChoiceCaller, SubgraphTemplate, subgraph_template
+from ..codegen.subgraph import (
+    SubgraphChoiceCaller,
+    SubgraphTemplate,
+    subgraph_template,
+)
 
 #: Templates by the name their operators are declared under.
 TEMPLATES: dict[str, KernelTemplate] = {

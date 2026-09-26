@@ -25,7 +25,7 @@ from ..loops import V
 from ..op_lowerings import register_lowering, select_decomp_table, user_lowerings
 from ..utils import counters, is_collective_op
 from .select_algorithm import ExternKernelChoice, autotune_select_algorithm
-from .subgraph import SubgraphTemplate
+from ..codegen.subgraph import SubgraphTemplate
 
 log = logging.getLogger(__name__)
 

@@ -438,6 +438,7 @@ void disable_kinds_locked() {
         CUPTI_ACTIVITY_KIND_MEMCPY,
         CUPTI_ACTIVITY_KIND_MEMSET,
         CUPTI_ACTIVITY_KIND_RUNTIME,
+        CUPTI_ACTIVITY_KIND_DRIVER,
         CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL,
         CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION,
     };
@@ -619,10 +620,14 @@ TENSORPLAY_API bool cupti_start() {
         CUPTI_ACTIVITY_KIND_MEMCPY,
         CUPTI_ACTIVITY_KIND_MEMSET,
         CUPTI_ACTIVITY_KIND_RUNTIME,
+        // Driver-API launches are recorded as well as runtime-API ones.  A
+        // kernel is linked to the operation that asked for it through the launch
+        // record sharing its correlation id, so a launch with no record is a
+        // kernel that cannot be attributed to anything -- and the libraries that
+        // issue the largest kernels reach for the driver API rather than the
+        // runtime one, so leaving it out loses exactly the work worth measuring.
+        CUPTI_ACTIVITY_KIND_DRIVER,
         CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL,
-        // Warmup and degraded-timebase sessions pin ops with external
-        // correlation ids; enabling the kind costs nothing when no id is
-        // pushed (steady-state bulk ops push none).
         CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION,
     };
     CUptiResult rc = CUPTI_SUCCESS;
@@ -705,7 +710,19 @@ TENSORPLAY_API void cupti_stop_and_collect(std::vector<GpuActivity>& out) {
         if (g_acts) acts.swap(*g_acts);
         if (g_api_acts) api_acts.swap(*g_api_acts);
         if (g_corr2ext) {
+            // Both lists are stamped: the launch records because they are what a
+            // kernel record is joined through, and the device records because a
+            // kernel whose launch was not recorded still says which operation
+            // was being dispatched when it was issued.  Stamping only the
+            // device records would leave every kernel issued through an
+            // unrecorded launch unattributable, which is the case that matters
+            // most: the libraries that issue the largest kernels are the ones
+            // whose launches go through the driver API.
             for (auto& a : acts) {
+                auto it = g_corr2ext->find(a.correlation);
+                if (it != g_corr2ext->end()) a.external_id = it->second;
+            }
+            for (auto& a : api_acts) {
                 auto it = g_corr2ext->find(a.correlation);
                 if (it != g_corr2ext->end()) a.external_id = it->second;
             }

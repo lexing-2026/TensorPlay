@@ -45,6 +45,7 @@ from .mm import (
     _gemm_source_identity,
     contiguous_stride,
 )
+from ..utils import counters
 from .mm_common import (
     mm_grid,
     descriptor_extents_fit,

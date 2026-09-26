@@ -800,6 +800,48 @@ class WrapperHandler(DefaultHandler):
         return getattr(self._inner, name)(*args, **kwargs)
 
 
+class SimpleCSEHandler(WrapperHandler):
+    """A pass that computes each distinct computation once while tracing.
+
+    Simplified compared to the pass that runs while code is being printed,
+    because this one runs while a subgraph is being traced and there is nothing
+    being stored: a body that only reads has nothing to invalidate, so caching on
+    what was asked for is the whole of what can be shared.
+    """
+
+    def __init__(self, inner: OpsHandler):
+        super().__init__(inner)
+        self.cse_cache: dict = {}
+        self.mock = MockHandler()
+
+    def indirect_indexing(self, *args, **kwargs):
+        return super().indirect_indexing(*args, **kwargs)
+
+    def store(self, *args, **kwargs) -> None:
+        raise NotImplementedError("store not implemented")
+
+    def store_reduction(self, *args, **kwargs) -> None:
+        raise NotImplementedError("store not implemented")
+
+    def _default(self, name: str, args: tuple, kwargs: dict):
+        # The key is what the computation is rather than how it was written, so
+        # that two ways of asking for the same thing are recognised as one.
+        key = getattr(self.mock, name)(*args, **kwargs)
+        found = self.cse_cache.get(key)
+        if found is not None:
+            return found
+
+        value = getattr(self._inner, name)(*args, **kwargs)
+        self.cse_cache[key] = value
+        return value
+
+    def device_assert_async(self, *args, **kwargs) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__}: device_assert_async should be handled by "
+            f"CSEProxy"
+        )
+
+
 class OpCountResult(NamedTuple):
     """What a body does, in enough detail to decide whether to realize it.
 

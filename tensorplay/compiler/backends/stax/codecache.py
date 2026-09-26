@@ -195,7 +195,7 @@ def write_atomic(
     # Avoid using a named temporary file, as those have restricted permissions
     if not isinstance(content, (str, bytes)):
         raise AssertionError("Only strings and byte arrays can be saved in the cache")
-    path = Path(path_)
+    path = pathlib.Path(path_)
     if make_dirs:
         path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.parent / f".{os.getpid()}.{threading.get_ident()}.tmp"
@@ -235,3 +235,158 @@ class LambdaFuture(CodeCacheFuture):
             # future without blocking further.
             self.future.result(timeout=timeout)
         return self.result_fn()
+
+
+#: The name a built kernel is entered through.  One name for every kernel, so
+#: that a loader needs to know the calling convention but not which kernel it is
+#: loading, and so that a kernel built by one thing is entered the same way as
+#: one built by another.
+NATIVE_ENTRY_NAME = "tp_cpu_native_entry"
+
+
+class LoadedKernel:
+    """A built kernel, loaded and ready to be called.
+
+    Loaded by what it is rather than by what it was called: the content key says
+    what it was built from, and the path says where that content was written.
+    Both are needed, because the key decides whether this is the kernel wanted
+    and the path is the only way to reach it.
+    """
+
+    def __init__(self, path: str, key: str, entry_name: str = NATIVE_ENTRY_NAME) -> None:
+        import ctypes
+
+        self.__file__ = os.path.abspath(path)
+        self.key = key
+        self.entry_name = entry_name
+        self._ctypes = ctypes
+        # Loading the library resolves every symbol in it, so a second load of
+        # the same file is a second mapping of the same code rather than a
+        # second copy of it, and asking for the same kernel twice costs one
+        # mapping rather than two.
+        self._library = ctypes.CDLL(self.__file__)
+        self._entry = getattr(self._library, entry_name)
+        self._entry.restype = None
+        self._entry.argtypes = [
+            ctypes.c_long,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_void_p,
+        ]
+
+    def call(self, args: list) -> Any:
+        """Run the kernel over a flat argument list, and hand back its result.
+
+        The list is whatever the call site had: sizes that are only known when
+        the kernel runs come first, then the values.  A value is told from a size
+        by having somewhere to point -- which is the only difference between
+        them that matters here, since a size is a number and a value is memory.
+        """
+
+        import tensorplay as tp
+
+        ctypes = self._ctypes
+        values = [a for a in args if hasattr(a, "data_ptr")]
+        if not values:
+            raise ValueError(
+                "a kernel was called with no values to read or write"
+            )
+        handles = (ctypes.c_void_p * len(values))()
+        for position, value in enumerate(values):
+            handles[position] = ctypes.c_void_p(value.data_ptr())
+        shape = tuple(int(s) for s in values[0].shape)
+        count = 1
+        for extent in shape:
+            count *= extent
+        result = tp.empty(shape, dtype=values[0].dtype, device=values[0].device)
+        self._entry(
+            ctypes.c_long(count),
+            ctypes.cast(handles, ctypes.POINTER(ctypes.c_void_p)),
+            ctypes.c_void_p(result.data_ptr()),
+        )
+        return result
+
+    def __call__(self, args: list) -> Any:
+        return self.call(args)
+
+    def __repr__(self) -> str:
+        return f"<LoadedKernel {self.key[:12]} {os.path.basename(self.__file__)}>"
+
+
+#: What has already been loaded, by path.  A load is a mapping of a file into this
+#: process, and doing it twice for one file maps it twice, so what has been
+#: loaded is remembered rather than repeated.
+_LOADED: dict[str, LoadedKernel] = {}
+_LOADED_LOCK = threading.Lock()
+
+
+def load_from_code_cache(
+    cache, key: str, *, ext: str = "so", entry_name: str = NATIVE_ENTRY_NAME
+) -> LoadedKernel:
+    """The kernel a code cache holds under ``key``, loaded to be called.
+
+    The counterpart of building through a cache and then loading by key: a
+    caller that knows the key and the cache the key belongs to needs neither the
+    path nor a record of what was built, because the cache is what remembers
+    where it went.
+    """
+
+    path = cache.path_for(key, ext)
+    return load_by_key_path(key, path, entry_name=entry_name)
+
+
+def load_by_key_path(
+    key: str,
+    path: str,
+    *,
+    entry_name: str = NATIVE_ENTRY_NAME,
+    set_sys_modules: bool | None = None,
+) -> LoadedKernel:
+    """The kernel built from ``key`` and written to ``path``, loaded to be called.
+
+    Returns the already-loaded kernel when this path has been loaded before, so
+    that a caller may ask as often as it likes and pay for the mapping once.  The
+    key is not consulted to decide whether the file is the right one -- the caller
+    that computed it is the one that knows -- but it travels with the result so
+    that a caller holding a kernel can say what it was built from.
+
+    ``set_sys_modules`` registers the result under its own name in the module
+    table, which is what makes a kernel reachable by name from another process
+    that loads this one.  Left unset, registration follows whether this is the
+    process's own top level, since that is the case in which nothing else will
+    register it.
+    """
+
+    resolved = os.path.abspath(path)
+    kernel = _LOADED.get(resolved)
+    if kernel is None:
+        with _LOADED_LOCK:
+            kernel = _LOADED.get(resolved)
+            if kernel is None:
+                if not os.path.exists(resolved):
+                    raise FileNotFoundError(
+                        f"no artifact was built for {key[:12]} at {resolved}"
+                    )
+                kernel = LoadedKernel(resolved, key, entry_name)
+                _LOADED[resolved] = kernel
+
+    if set_sys_modules is None:
+        set_sys_modules = threading.current_thread() is threading.main_thread()
+    if set_sys_modules:
+        import sys
+
+        sys.modules.setdefault(kernel.entry_name, kernel)  # type: ignore[arg-type]
+    return kernel
+
+
+def clear_loaded() -> None:
+    """Forget every loaded kernel, so the next load maps the files again.
+
+    For tests, and for a process that has changed what it can run -- a different
+    device, say -- where holding a mapping made before the change would be
+    holding a mapping of something that no longer applies.
+    """
+
+    with _LOADED_LOCK:
+        _LOADED.clear()
+
+
