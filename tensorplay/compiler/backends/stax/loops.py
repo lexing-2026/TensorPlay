@@ -23,6 +23,7 @@ import functools
 import itertools
 import math
 import threading
+from enum import Enum, auto
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
@@ -146,6 +147,101 @@ def compute_dtype(*names: str) -> str:
         if name == "float64":
             best = "float64"
     return best
+
+
+class BackendFeature(Enum):
+    """What a program emitter can express.
+
+    A value in this vocabulary is a property of an emitter, not of a region:
+    the emitters differ in what a program may ask of them, so the difference
+    is declared once here and read by the lowering that picks one.
+    """
+
+    #: Reads an input through an arbitrary stride, so a view needs no copy.
+    STRIDED_INPUTS = auto()
+    #: Accepts inputs whose element types differ from one another.
+    MIXED_INPUT_DTYPES = auto()
+    #: Reads inputs whose element type is narrower than the arithmetic width.
+    PROMOTED_INPUTS = auto()
+    #: Carries a reduction inside the program instead of beside it.
+    IN_PROGRAM_REDUCTION = auto()
+    #: Emits more than one result from one program.
+    MULTI_OUTPUT = auto()
+    #: Picks its launch tile from measured candidates instead of a constant.
+    AUTOTUNED_TILE = auto()
+    #: Accepts an input that carries a gradient.
+    GRAD_INPUTS = auto()
+    #: A tail predicate covers the partial tile, so one guarded access serves
+    #: every element a thread owns.
+    TILE_MASKED_ACCESS = auto()
+
+
+#: What each emitter declares.  Order is the preference order: the first
+#: emitter whose declared set covers what the program needs is the one that
+#: runs, and a program no emitter covers is a lowering miss rather than a
+#: silent hop to a weaker emitter.
+BACKEND_FEATURES: dict[str, frozenset] = {
+    "triton": frozenset({
+        BackendFeature.STRIDED_INPUTS,
+        BackendFeature.MIXED_INPUT_DTYPES,
+        BackendFeature.PROMOTED_INPUTS,
+        BackendFeature.IN_PROGRAM_REDUCTION,
+        BackendFeature.MULTI_OUTPUT,
+        BackendFeature.AUTOTUNED_TILE,
+        BackendFeature.GRAD_INPUTS,
+        BackendFeature.TILE_MASKED_ACCESS,
+    }),
+    "nvrtc": frozenset({
+        BackendFeature.MIXED_INPUT_DTYPES,
+        BackendFeature.PROMOTED_INPUTS,
+        BackendFeature.MULTI_OUTPUT,
+        BackendFeature.GRAD_INPUTS,
+    }),
+    "interpreter": frozenset({
+        BackendFeature.MULTI_OUTPUT,
+    }),
+}
+
+#: Preference order among the emitters.
+BACKEND_ORDER: tuple[str, ...] = ("triton", "nvrtc", "interpreter")
+
+
+def required_features(
+    *,
+    strided_inputs: bool = False,
+    mixed_dtypes: bool = False,
+    promoted_inputs: bool = False,
+    reduction: bool = False,
+    outputs: int = 1,
+    grad_inputs: bool = False,
+) -> frozenset:
+    """What one program needs from an emitter, read off its own properties."""
+    needed = set()
+    if strided_inputs:
+        needed.add(BackendFeature.STRIDED_INPUTS)
+    if mixed_dtypes:
+        needed.add(BackendFeature.MIXED_INPUT_DTYPES)
+    if promoted_inputs:
+        needed.add(BackendFeature.PROMOTED_INPUTS)
+    if reduction:
+        needed.add(BackendFeature.IN_PROGRAM_REDUCTION)
+    if outputs > 1:
+        needed.add(BackendFeature.MULTI_OUTPUT)
+    if grad_inputs:
+        needed.add(BackendFeature.GRAD_INPUTS)
+    return frozenset(needed)
+
+
+def select_backend(needed: frozenset) -> str | None:
+    """The first emitter that declares everything the program needs."""
+    for name in BACKEND_ORDER:
+        if needed <= BACKEND_FEATURES[name]:
+            return name
+    return None
+
+
+def backend_supports(name: str, needed: frozenset) -> bool:
+    return needed <= BACKEND_FEATURES.get(name, frozenset())
 
 
 #: Storage types whose value the arithmetic width lifts on load.  A consumer
@@ -697,7 +793,8 @@ def iter_values(root) -> list[Value]:
 
 
 __all__ = [
-    "Buffer", "ComputedBuffer", "Const", "ConstantBuffer", "DeferredOps", "Expr",
+    "BACKEND_FEATURES", "BACKEND_ORDER", "BackendFeature", "Buffer", "ComputedBuffer",
+    "Const", "ConstantBuffer", "DeferredOps", "Expr",
     "ExternKernel", "ExternOutput", "InputBuffer", "IRNode", "Layout",
     "LoopBody", "Loops", "Pointwise", "Reduction", "ReinterpretView", "Symbol",
     "TensorBox", "V", "Value", "View", "affine_coeff", "as_index",
@@ -705,5 +802,6 @@ __all__ = [
     "floordiv", "promotes_on_load",
     "free_symbols", "fresh_symbols", "iter_values", "modular_indexing", "ops",
     "pexpr", "prod", "record_body", "set_graph", "set_ops_handler",
+    "backend_supports", "required_features", "select_backend",
     "simplify_index", "simplify_loops", "substitute",
 ]
