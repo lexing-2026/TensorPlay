@@ -14,6 +14,10 @@ new one, never half of either.
 
 from __future__ import annotations
 
+import hashlib
+import os
+from functools import lru_cache
+
 import functools
 import hashlib
 import json
@@ -499,3 +503,41 @@ def load_by_key_path(
 
 
 
+
+
+@lru_cache(maxsize=1)
+def package_key() -> str:
+    """A key that changes whenever anything that generates code changes.
+
+    A compiled kernel is cached against the source it was generated from.  If
+    the generator is edited and an old entry is reused, the entry is a kernel
+    this compiler would no longer produce, and the mismatch shows up as a
+    wrong answer rather than as a stale cache, so the key has to cover the
+    generator and not only the code it was handed.
+
+    So the key covers two things: the version this package reports, which
+    changes when the source is committed or the build differs, and the
+    contents of the compiler's own source tree, which also catches an edit
+    that has not been committed.  The tree is walked once per process and the
+    answer kept, because walking it for every cache lookup would cost more
+    than the lookup.
+    """
+    hasher = hashlib.sha256()
+    hasher.update(str(tp.__version__).encode("utf-8"))
+    root = Path(__file__).resolve().parent
+    for path in sorted(root.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        hasher.update(str(path.relative_to(root)).encode("utf-8"))
+        hasher.update(path.read_bytes())
+    return hasher.hexdigest()
+
+
+def find_compile_subproc_binary() -> str | None:
+    """Which binary a worker process is started as, if not the running one.
+
+    Answered with nothing, so a worker is started as the interpreter that
+    started it.  A build that wants a different interpreter names it in the
+    environment, and that is read where the environment is built.
+    """
+    return os.environ.get("TP_COMPILE_SUBPROC_BINARY") or None

@@ -17,7 +17,9 @@ import importlib.util
 import hashlib
 import math
 import operator
+import os
 import sys
+import sysconfig
 import textwrap
 import logging
 
@@ -1402,6 +1404,40 @@ def get_benchmark_name() -> str | None:
     return None
 
 
+def is_dynamic(*args) -> bool:
+    """Whether any of these values has a shape or a stride not yet settled.
+
+    A value whose extents still contain something undecided cannot be laid out,
+    cannot be measured against, and cannot be written out as a kernel: every one
+    of those needs to know how big the value is.  A value that is not one of the
+    kinds that carries a shape is passed over rather than refused, because the
+    caller is asking about a list it built and the things in it are not all
+    values -- a number in that list says nothing about shapes either way.
+
+    A value of a kind that should carry a shape but does not is refused instead
+    of passed over: it means something is being handed over that was never a
+    value, and answering "not dynamic" about it would be answering about the
+    wrong thing.
+    """
+
+    from . import ir
+
+    for t in args:
+        if isinstance(
+            t, (ir.TensorBox, ir.StorageBox, ir.BaseView, ir.ComputedBuffer, ir.Buffer)
+        ):
+            if has_free_symbols(t.maybe_get_size() or ()) or has_free_symbols(
+                t.maybe_get_stride() or ()
+            ):
+                return True
+        elif not isinstance(t, ir.IRNode):
+            continue
+        else:
+            raise TypeError(f"unexpected type for is_dynamic {type(t)}")
+
+    return False
+
+
 def get_bounds_index_expr(index):
     """How far an index can reach, or that nothing is known about it.
 
@@ -2346,3 +2382,41 @@ class StorageWeakRef:
         if id(self) == id(other):
             return True
         return self.cdata == other.cdata
+
+
+def get_ld_library_path() -> str:
+    """Where the shared libraries the runtime loads from are searched for.
+
+    A worker process is told this so that a library it loads is the same one
+    the process that started it loaded, rather than whichever one happens to
+    be found first on its own path.
+    """
+    path = os.environ.get("LD_LIBRARY_PATH", "")
+    if config.is_fbcode():
+        from libfb.py.parutil import get_runtime_path
+
+        runtime_path = get_runtime_path()
+        if runtime_path:
+            lib_path = os.path.join(runtime_path, "runtime", "lib")
+            path = os.pathsep.join([lib_path, path]) if path else lib_path
+    return path
+
+
+def python_subprocess_env() -> dict[str, str]:
+    """The environment a worker process is started with.
+
+    The worker's own environment, plus what it needs in order to import this
+    package: the directory this package lives in, and everything else
+    that was on the path, because a worker started without them can import
+    nothing and says so by dying.
+    """
+    package_root = os.path.dirname(os.path.dirname(os.path.abspath(tp.__file__)))
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.environ.get(
+            "TP_CUSTOM_PYTHONPATH", os.pathsep.join((package_root, *sys.path))
+        ),
+    }
+    if config.is_fbcode():
+        env["PYTHONHOME"] = sysconfig.get_path("data")
+    return env
