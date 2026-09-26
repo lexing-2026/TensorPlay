@@ -15,6 +15,7 @@ import tensorplay as tp
 from .. import config as inductor_config
 from ..utils import counters
 from tensorplay.utils import _pytree as pytree
+from .....graph.experimental.sympy_functions import OrderedSet
 
 logger = logging.getLogger(__name__)
 #: The kind of device an event was recorded on, named as the events themselves

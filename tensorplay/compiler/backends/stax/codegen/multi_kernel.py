@@ -15,6 +15,7 @@ from ..runtime.benchmarking import benchmarker
 from ..utils import cache_on_self, IndentedBuffer
 from ..loops import V
 from .common import TensorArg, WorkspaceArg
+from .....graph.experimental.sympy_functions import OrderedSet
 
 
 log = logging.getLogger(__name__)

@@ -20,6 +20,8 @@ import tensorplay as tp
 from .triton import CHOICES, dtype_size
 
 from ..codegen.common import KernelTemplate
+from ..utils import sympy_product
+from ..virtualized import V
 from ..heuristics.template.base import SymbolicGridFn, TemplateConfigHeuristics
 
 from .ir import contiguous_stride
@@ -40,7 +42,7 @@ from .mm_common import load_kernel_template, use_triton_template
 
 from ..heuristics.template.params import DictKernelTemplateParams, KernelTemplateParams
 
-from .select_algorithm import ExternKernelChoice
+from .select_algorithm import ExternKernelChoice, autotune_select_algorithm
 
 def _pair(value, count: int) -> list:
     if isinstance(value, int):

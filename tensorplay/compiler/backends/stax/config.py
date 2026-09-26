@@ -443,6 +443,15 @@ max_autotune_gemm_search_space = os.environ.get(
     "TP_MAX_AUTOTUNE_GEMM_SEARCH_SPACE", "DEFAULT"
 )
 
+# Whether the kernels written in the device dialect are measured at all.  They
+# are off by default because a configuration that will not launch is not one
+# that measured badly, and a search wide enough to include those spends its time
+# finding that out; so a program that has not asked for measuring is given a
+# single known-good configuration rather than a search.
+cutedsl_enable_autotuning = os.environ.get(
+    "TP_CUTEDSL_ENABLE_AUTOTUNING", "0"
+) == "1"
+
 # How long a candidate may spend being prepared before it is given up on.  A
 # candidate that takes longer than this is one whose result would not be worth
 # waiting for, since it would be paid on every run.

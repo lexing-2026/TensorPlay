@@ -33,6 +33,7 @@ from tensorplay.primitives.common import ELEMENTWISE_TYPE_PROMOTION_KIND
 from .dtype_propagation import get_promoted_dtype
 from tensorplay.utils._pytree import tree_map
 
+from . import ir
 from .ir import (
     Buffer,
     Constant,
@@ -47,6 +48,7 @@ from .ir import (
     Reduction,
     ReinterpretView,
     SliceView,
+    SqueezeView,
     StorageBox,
     TensorBox,
     View,
@@ -287,8 +289,8 @@ def transform_args(
         def promote(arg: Any) -> Any:
             if isinstance(arg, TensorBox):
                 return cast_to(arg, dtype)
-            elif isinstance(arg, ir_Constant):
-                return ir_Constant(value=arg.value, dtype=dtype, device=device)
+            elif isinstance(arg, ir.Constant):
+                return ir.Constant(value=arg.value, dtype=dtype, device=device)
             else:
                 return arg
 
@@ -308,10 +310,10 @@ def transform_args(
         for k, x in zip(kwargs_indices, broadcasted[len(args_indices) :]):
             kwargs[k] = x
         for i in range(len(args)):
-            if isinstance(args[i], ir_Constant):
+            if isinstance(args[i], ir.Constant):
                 args[i] = ExpandView.create(args[i], size)
         for k in kwargs:
-            if isinstance(kwargs[k], ir_Constant):
+            if isinstance(kwargs[k], ir.Constant):
                 kwargs[k] = ExpandView.create(kwargs[k], size)
     return (args, kwargs)
 

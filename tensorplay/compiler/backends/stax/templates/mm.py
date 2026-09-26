@@ -1479,6 +1479,8 @@ def tuned_sparse_semi_structured_mm(
     m = V.graph.sizevars.check_equals_and_simplify(m1, m2)
     k = V.graph.sizevars.check_equals_and_simplify(2 * k1, k2)
     if layout is None:
+        from ..ir import FixedLayout
+
         layout = FixedLayout(
             mat2.get_device(),
             out_dtype if out_dtype else mat2.get_dtype(),

@@ -23,12 +23,14 @@ log = logging.getLogger(__name__)
 #: whatever name this project's operations are registered under.
 framework = tp.ops.tp
 
+from dataclasses import asdict
 from typing import Any
 
 from ..op_lowerings import register_lowering
 from ..codegen.cutedsl.cutedsl_template import CuteDSLTemplate
 from ..kernel_inputs import KernelInputs, MMKernelInputs
 from ..ir import Layout
+from .mm_common import check_supported_striding
 from .select_algorithm import (
     ChoiceCaller,
     ExternChoiceCaller,
@@ -36,8 +38,12 @@ from .select_algorithm import (
     KernelArgs,
     TritonChoiceCaller,
     TritonTemplate,
+    autotune_select_algorithm,
 )
 from .triton import CHOICES, dtype_size
+from ..heuristics.template.cutedsl import get_groupgemm_configs
+from ..utils import get_gpu_shared_memory, get_max_num_sms, get_num_sms, has_free_symbols
+from ..virtualized import V
 from .mm import (
     GemmConfigHeuristics,
     GemmTemplate,
@@ -869,11 +875,11 @@ def _tuned_grouped_mm_common(operator_name: str, algorithm_name: str, extern_ker
 @register_lowering(framework._grouped_mm, type_promotion_kind=None)
 def tuned_grouped_mm(mat_a: TensorBox, mat_b: TensorBox, offs: TensorBox | None=None, bias: TensorBox | None=None, out_dtype: tp.dtype | None=None, layout: Layout | None=None) -> TensorBox:
     """Auto-tuning for _grouped_mm() operator."""
-    return _tuned_grouped_mm_common('framework._grouped_mm.default', 'grouped_mm', aten__grouped_mm, triton_grouped_mm_template, mat_a, mat_b, None, None, offs, bias, None, out_dtype, None, layout)
+    return _tuned_grouped_mm_common('framework._grouped_mm.default', 'grouped_mm', framework__grouped_mm, triton_grouped_mm_template, mat_a, mat_b, None, None, offs, bias, None, out_dtype, None, layout)
 
 
 @register_lowering(framework._scaled_grouped_mm, type_promotion_kind=None)
 def tuned_scaled_grouped_mm(mat_a: TensorBox, mat_b: TensorBox, scale_a: TensorBox, scale_b: TensorBox, offs: TensorBox | None=None, bias: TensorBox | None=None, scale_result: TensorBox | None=None, out_dtype: tp.dtype | None=None, use_fast_accum: bool=False, layout: Layout | None=None) -> TensorBox:
     """Auto-tuning for _scaled_grouped_mm() operator."""
     out_dtype = out_dtype or tp.bfloat16
-    return _tuned_grouped_mm_common('framework._scaled_grouped_mm.default', 'scaled_grouped_mm', aten__scaled_grouped_mm, triton_scaled_grouped_mm_template, mat_a, mat_b, scale_a, scale_b, offs, bias, scale_result, out_dtype, use_fast_accum, layout)
+    return _tuned_grouped_mm_common('framework._scaled_grouped_mm.default', 'scaled_grouped_mm', framework__scaled_grouped_mm, triton_scaled_grouped_mm_template, mat_a, mat_b, scale_a, scale_b, offs, bias, scale_result, out_dtype, use_fast_accum, layout)
