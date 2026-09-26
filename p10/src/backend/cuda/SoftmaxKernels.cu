@@ -134,6 +134,11 @@ __global__ void softmax_dim_kernel(
     __syncthreads();
   }
   const compute_t row_max = tile[0];
+  // Every thread has to read the reduced max out of the tile before the sum
+  // pass writes over it; without this barrier a thread that is still waiting on
+  // its loads picks up another thread's partial sum in place of the max, which
+  // silently rescales the whole row.
+  __syncthreads();
 
   compute_t thread_sum = compute_t(0);
   for (int64_t j = tid; j < softmax_size; j += blockDim.x) {
@@ -172,6 +177,11 @@ inline int softmax_log2_ceil(int value) {
   while ((1 << log2_value) < value) ++log2_value;
   return log2_value;
 }
+
+// Row length the wave kernel is built around: one lane per wave slot, at most
+// this many elements per lane.
+constexpr int kWaveLanes = 32;
+constexpr int kWaveElemsPerLane = 16;
 
 inline int softmax_wave_size() {
   static int wave = []() {
@@ -334,13 +344,19 @@ void launch_wave_softmax(scalar_t* dst, const scalar_t* src, int64_t batch_count
 // The wave kernel covers rows laid out along the fastest dimension with a
 // bounded row length; anything else (strided rows, very long rows, huge
 // batches) stays on the block kernel below.
+//
+// The row length is capped by what one lane has to hold: at sixteen elements
+// per lane the register-resident variants stay near forty registers and the
+// machine stays fully occupied, while longer rows spill into triple-digit
+// register counts and cost more in lost occupancy than they gain in reduced
+// block-reduce work.  Rows past the cap go to the block-per-row kernel, which
+// spreads the same row over more threads and keeps the whole slice in
+// registers at a fraction of the pressure.
 template <typename scalar_t, typename acc_t, bool LOG_MODE>
 bool try_wave_softmax(const Tensor& self, Tensor& result, int64_t softmax_size,
                       int64_t rows) {
-  constexpr int64_t kMaxRowBytes = 8192;
-  if (softmax_size <= 0 || softmax_size > 2048) return false;
-  if (softmax_size * static_cast<int64_t>(sizeof(scalar_t)) > kMaxRowBytes)
-    return false;
+  constexpr int64_t kMaxRowLength = kWaveLanes * kWaveElemsPerLane;
+  if (softmax_size <= 0 || softmax_size > kMaxRowLength) return false;
   if (rows * softmax_size > static_cast<int64_t>(INT32_MAX)) return false;
   if (!self.is_contiguous() || !result.is_contiguous()) return false;
   launch_wave_softmax<scalar_t, acc_t, LOG_MODE>(
@@ -508,12 +524,18 @@ __global__ void softmax_reg_packed_kernel(scalar_t* __restrict__ out,
       thread_max = x > thread_max ? x : thread_max;
     }
   }
+  // A thread whose slots all landed past the row end keeps the -inf fill, and
+  // exp(-inf - -inf) is NaN; such a thread contributes no exponentials, which
+  // leaves an all--inf row with a zero sum exactly as a row of real values
+  // would report a NaN output.
   compute_t thread_sum = compute_t(0);
+  if (thread_max > -std::numeric_limits<compute_t>::infinity()) {
 #pragma unroll
-  for (int i = 0; i < PACKS; ++i) {
+    for (int i = 0; i < PACKS; ++i) {
 #pragma unroll
-    for (int k = 0; k < kPack; ++k) {
-      thread_sum += std::exp(static_cast<compute_t>(v[i].v[k]) - thread_max);
+      for (int k = 0; k < kPack; ++k) {
+        thread_sum += std::exp(static_cast<compute_t>(v[i].v[k]) - thread_max);
+      }
     }
   }
   const SoftmaxMS<compute_t> ms =
@@ -566,10 +588,14 @@ __global__ void softmax_reg_scalar_kernel(scalar_t* __restrict__ out,
   }
   thread_max = softmax_block_reduce<compute_t, true>(thread_max, reduce_max);
 
+  // See the packed kernel: an all--inf thread would turn the exponentials
+  // into NaN, so it contributes none.
   compute_t thread_sum = compute_t(0);
+  if (thread_max > -std::numeric_limits<compute_t>::infinity()) {
 #pragma unroll
-  for (int i = 0; i < REG; ++i) {
-    thread_sum += std::exp(static_cast<compute_t>(v[i]) - thread_max);
+    for (int i = 0; i < REG; ++i) {
+      thread_sum += std::exp(static_cast<compute_t>(v[i]) - thread_max);
+    }
   }
   thread_sum = softmax_block_reduce<compute_t, false>(thread_sum, reduce_sum);
   const compute_t norm =
@@ -601,7 +627,8 @@ template <typename scalar_t, typename compute_t, bool LOG_MODE>
 bool try_reg_softmax(const Tensor& self, Tensor& result,
                      int64_t softmax_size, int64_t rows) {
   constexpr int kPack = 16 / static_cast<int>(sizeof(scalar_t));
-  if (softmax_size < 2049 || rows > INT32_MAX) return false;
+  if (softmax_size <= kWaveLanes * kWaveElemsPerLane || rows > INT32_MAX)
+    return false;
   if (!self.is_contiguous() || !result.is_contiguous()) return false;
   const scalar_t* in = self.data_ptr<scalar_t>();
   scalar_t* out = result.data_ptr<scalar_t>();
