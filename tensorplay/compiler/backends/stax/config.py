@@ -1251,3 +1251,9 @@ class _CudaConfig:
 
 cuda = _CudaConfig()
 
+
+#: Where a worker's output is written.  Empty sends it to the worker's own
+#: stdout, which the parent then has to read and disentangle from its own; a
+#: path sends each worker's output to its own file, which is what makes the
+#: output of a failing worker readable at all.
+worker_logpath: str = os.environ.get("TP_WORKER_LOGPATH", "")
