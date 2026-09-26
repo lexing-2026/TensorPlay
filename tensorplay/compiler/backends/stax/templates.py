@@ -396,6 +396,7 @@ class GemmTemplate(KernelTemplate):
 
 GEMM = GemmTemplate()
 
+#: Templates by the name their operators are declared under.
 TEMPLATES: dict[str, KernelTemplate] = {GEMM.name: GEMM}
 
 
@@ -416,3 +417,101 @@ __all__ = [
     "contiguous_stride",
     "template_for",
 ]
+
+
+# ---------------------------------------------------------------------------
+# convolution
+# ---------------------------------------------------------------------------
+
+
+def _conv_output_size(in_size, kernel, stride, padding, dilation, groups,
+                      in_channels):
+    """The spatial extent a forward convolution produces, per axis."""
+
+    out = []
+    for extent, k, s, p, d in zip(in_size, kernel, stride, padding, dilation):
+        out.append((extent + 2 * p - d * (k - 1) - 1) // s + 1)
+    return out
+
+
+class ConvTemplate(KernelTemplate):
+    """Convolutions, with the 1x1 case expressed as the product it is.
+
+    A one-by-one convolution with unit stride, no padding and one group is a
+    matrix product, so it is measured as one -- the gemm template's tile set
+    applies to it directly, and there is nothing to be gained from a second
+    set of candidates for the same arithmetic.
+
+    Wider kernels keep the operator, which is the floor a measurement can
+    never lose against.
+    """
+
+    def __init__(self):
+        super().__init__("conv")
+
+    def emitter(self) -> str:
+        return "conv:operator+gemm-1x1"
+
+    def out_specs(self, meta: dict) -> tuple:
+        size = meta.get("out_size")
+        if not size:
+            raise NotImplementedError("a convolution without a result shape")
+        return (
+            OutSpec(
+                meta.get("out_dtype"),
+                size,
+                stride=contiguous_stride(size),
+                device=meta.get("device"),
+                requires_grad=bool(meta.get("requires_grad", False)),
+            ),
+        )
+
+    def is_one_by_one(self, meta: dict) -> bool:
+        """Is this the product-shaped case: 1x1 kernel, unit stride, one group?"""
+
+        kernel = tuple(int(k) for k in meta.get("kernel_size") or ())
+        stride = tuple(int(s) for s in meta.get("stride") or ())
+        padding = tuple(int(p) for p in meta.get("padding") or ())
+        if not kernel or any(k != 1 for k in kernel):
+            return False
+        if any(s != 1 for s in stride) or any(p != 0 for p in padding):
+            return False
+        if int(meta.get("groups", 1)) != 1:
+            return False
+        if meta.get("transposed"):
+            return False
+        dilation = tuple(int(d) for d in meta.get("dilation") or ())
+        return all(d == 1 for d in dilation)
+
+    def configurations(self, out_specs: tuple, meta: dict):
+        yield DictParams({"choice": "operator"})
+        if self.is_one_by_one(meta):
+            yield DictParams({"choice": "gemm-1x1"})
+
+    def choice_or_none(self, params, out_specs, meta, plain_launch):
+        choice = params.to_kwargs().get("choice")
+        if choice == "operator":
+            return plain_launch
+        # The product case is measured by the gemm template, which owns that
+        # tile space; this template only decides that the case applies.
+        gemm_meta = {
+            "out_size": tuple(out_specs[0].size),
+            "out_dtype": out_specs[0].dtype,
+            "device": out_specs[0].device,
+            "requires_grad": out_specs[0].requires_grad,
+            "operand_dtype": meta.get("operand_dtype"),
+            "operand_sizes": meta.get("operand_sizes"),
+            "operand_specs": meta.get("operand_specs"),
+            "bias_spec": meta.get("bias_spec"),
+            "qualifies": True,
+            "probe_feed": meta.get("probe_feed"),
+            "feed": meta.get("feed"),
+        }
+        return GEMM.select(gemm_meta, lambda c, plain: c.resolve(plain or plain_launch))
+
+
+CONV = ConvTemplate()
+
+TEMPLATES[CONV.name] = CONV
+
+__all__ += ["CONV", "ConvTemplate", "_conv_output_size"]

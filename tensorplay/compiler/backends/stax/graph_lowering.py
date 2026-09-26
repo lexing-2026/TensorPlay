@@ -53,6 +53,10 @@ REALIZE_OPCOUNT_THRESHOLD = 30
 
 #: Operators a template owns, keyed by the name the graph gives them.
 _TEMPLATE_OPERATORS = {
+    "conv1d.default": "conv",
+    "conv2d.default": "conv",
+    "conv3d.default": "conv",
+    "convolution.default": "conv",
     "mm.default": "gemm",
     "addmm.default": "gemm",
     "bmm.default": "gemm",
@@ -197,7 +201,7 @@ class GraphLowering:
             return None
         return template_for(_TEMPLATE_OPERATORS[name])
 
-    def _template_meta(self, node, realized_args):
+    def _template_meta(self, node, realized_args, kwargs, template_name):
         """What the template needs to know about this call.
 
         The template owns its result and its validity, so what is recorded here
@@ -239,6 +243,17 @@ class GraphLowering:
         meta["operand_specs"] = tuple(
             (position, None) for position in range(len(operands))
         )
+        if template_name == "conv":
+            # A convolution's result depends on its geometry, so the template
+            # is told the geometry rather than left to infer the extent.
+            meta["stride"] = _ints(kwargs.get("stride"))
+            meta["padding"] = _ints(kwargs.get("padding"))
+            meta["dilation"] = _ints(kwargs.get("dilation"))
+            meta["groups"] = int(kwargs.get("groups", 1))
+            meta["transposed"] = bool(kwargs.get("transposed", False))
+            weight = operands[1] if len(operands) > 1 else None
+            if weight is not None:
+                meta["kernel_size"] = tuple(int(k) for k in weight.get_size()[2:])
         if name == _LINEAR_OPERATOR:
             meta["b_transposed"] = True
         if len(operands) > 2:
@@ -270,7 +285,9 @@ class GraphLowering:
                 node.meta.get("val"),
                 call_method=node.op == "call_method",
             )
-            kernel.template_meta = self._template_meta(node, realized_args)
+            kernel.template_meta = self._template_meta(
+                node, realized_args, realize_args(kwargs), template.name
+            )
         else:
             kernel = ExternKernel(
                 self.new_name("extern"),
@@ -409,6 +426,16 @@ class GraphLowering:
                         self.graph_outputs.append(value)
                 continue
         return self
+
+
+def _ints(value) -> tuple:
+    """An operator argument that may be one int or a sequence of them."""
+
+    if value is None:
+        return ()
+    if isinstance(value, int):
+        return (int(value),)
+    return tuple(int(v) for v in value)
 
 
 def _is_tensor(value) -> bool:
