@@ -121,16 +121,6 @@ def last_power_of_2(n: int) -> int:
     return 1 << ((n - 1).bit_length() - 1)
 
 
-def _describe(value: Any) -> str:
-    """Enough about a value to tell two apart in a message."""
-
-    shape = getattr(value, "shape", None)
-    if shape is None:
-        return f"a value of type {type(value).__name__}"
-    return (
-        f"a value of shape {tuple(int(s) for s in shape())} "
-        f"and stride {tuple(int(s) for s in value.stride())}"
-    )
 
 
 def assert_size_stride(

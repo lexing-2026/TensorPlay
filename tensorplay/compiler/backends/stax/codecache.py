@@ -451,19 +451,6 @@ _LOADED: dict[str, LoadedKernel] = {}
 _LOADED_LOCK = threading.Lock()
 
 
-def load_from_code_cache(
-    cache, key: str, *, ext: str = "so", entry_name: str = NATIVE_ENTRY_NAME
-) -> LoadedKernel:
-    """The kernel a code cache holds under ``key``, loaded to be called.
-
-    The counterpart of building through a cache and then loading by key: a
-    caller that knows the key and the cache the key belongs to needs neither the
-    path nor a record of what was built, because the cache is what remembers
-    where it went.
-    """
-
-    path = cache.path_for(key, ext)
-    return load_by_key_path(key, path, entry_name=entry_name)
 
 
 def load_by_key_path(
@@ -510,15 +497,5 @@ def load_by_key_path(
     return kernel
 
 
-def clear_loaded() -> None:
-    """Forget every loaded kernel, so the next load maps the files again.
-
-    For tests, and for a process that has changed what it can run -- a different
-    device, say -- where holding a mapping made before the change would be
-    holding a mapping of something that no longer applies.
-    """
-
-    with _LOADED_LOCK:
-        _LOADED.clear()
 
 
