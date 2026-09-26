@@ -216,6 +216,12 @@ class GraphLowering:
             "operand_positions": tuple(
                 i for i, a in enumerate(realized_args) if isinstance(a, Buffer)
             ),
+            # The arguments that are not tensors, so a probe can be run
+            # through the same operator with a different operand feed.
+            "arg_templates": tuple(
+                a for a in realized_args if not isinstance(a, Buffer)
+            ),
+            "call_method": node.op == "call_method",
         }
         operands = [
             realized_args[i]

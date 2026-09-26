@@ -214,13 +214,79 @@ class KernelTemplate:
     def choices(self, meta: dict) -> list:
         """Every configuration that applies to this call, best guess first."""
 
+        return self.collect(meta, lambda choice, plain: choice.resolve(plain))
+
+    def collect(self, meta: dict, build) -> list:
+        """Build the applicable choices, keeping the ones that do not apply out.
+
+        A configuration that does not fit this call is refused by raising, and
+        refusing it is the answer -- so the list holds exactly the choices that
+        could run here.
+        """
+
         specs = self.out_specs(meta)
         out = []
         for params in self.configurations(specs, meta):
             choice = TemplateChoice(self, params, specs, meta)
-            if choice.resolve(None) is not None:
-                out.append(choice)
+            self.maybe_append_choice(out, choice, build)
         return out
+
+    def maybe_append_choice(self, choices: list, choice: "TemplateChoice",
+                            build) -> Any:
+        """Add one choice, or report why it does not apply."""
+
+        try:
+            if build(choice, None) is None:
+                raise NotImplementedError(
+                    f"{self.name} configuration {choice.params!r} does not fit"
+                )
+        except NotImplementedError as exc:
+            return exc
+        choices.append(choice)
+        return None
+
+    def select(self, meta: dict, build) -> tuple:
+        """Choose among this call's configurations and return the winner.
+
+        The choice is made while the region is compiled, so the kernel a
+        region runs is settled before it ever runs.  The operator itself is
+        always among the candidates, which is what makes measuring safe: the
+        worst a measurement can conclude is that the operator was already the
+        best of them.
+        """
+
+        choices = self.collect(meta, build)
+        if not choices:
+            return None, None
+        if len(choices) == 1 or not meta.get("bench", True):
+            winner = choices[0]
+            return build(winner, None), winner.params
+        from .runtime.stax_autotune import bench_candidates
+
+        built = {}
+
+        def make(candidate):
+            def build_for(choice, plain):
+                if choice not in built:
+                    built[choice] = build(choice, plain)
+                return built[choice]
+
+            return build_for
+
+        def materialise(candidate, plain):
+            launcher = build(candidate, plain)
+            built[candidate] = launcher
+            return launcher
+
+        feed = meta.get("probe_feed")
+        if feed is None:
+            return build(choices[0], None), choices[0].params
+        best, _launch, _time = bench_candidates(
+            materialise, choices, feed, rounds=meta.get("rounds", 2)
+        )
+        if best is None:
+            best = choices[0]
+        return built.get(best) or build(best, None), best.params
 
 
 class GemmTemplate(KernelTemplate):
@@ -277,6 +343,33 @@ class GemmTemplate(KernelTemplate):
                 }
             )
 
+    def probe(self, meta: dict):
+        """A deterministic operand set for measuring this call's candidates.
+
+        The template owns its result, so it also knows the extents a product
+        has and can build the feed that exercises every lane of a candidate
+        without being handed the region's real tensors.
+        """
+
+        from .codegen.triton_gemm import _probe_feed
+
+        if meta.get("b_transposed") or len(meta.get("operand_specs", ())) != 2:
+            return None
+        spec = self.out_specs(meta)[0]
+        if len(spec.size) != 2:
+            return None
+        m, n = spec.size
+        sizes = meta.get("operand_sizes") or ()
+        if len(sizes) != 2:
+            return None
+        (rows, k), (k2, cols) = sizes
+        if rows != m or cols != n or k != k2:
+            return None
+        dtype = meta.get("out_dtype")
+        if dtype is None:
+            return None
+        return _probe_feed(m, k, n, dtype, meta.get("device"), bias=False)
+
     def choice_or_none(self, params, out_specs, meta, plain_launch):
         from .codegen.triton_gemm import tuned_matmul_launch
 
@@ -293,7 +386,7 @@ class GemmTemplate(KernelTemplate):
             return None
         return tuned_matmul_launch(
             plain_launch,
-            meta.get("feed", ()),
+            meta.get("probe_feed") or meta.get("feed") or (),
             meta["operand_specs"],
             spec.size,
             bias_spec=meta.get("bias_spec"),

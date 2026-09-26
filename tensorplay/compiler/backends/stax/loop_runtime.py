@@ -103,29 +103,65 @@ class ExternStep(Step):
             env[output.name] = _dig(result, output.path)
 
     def _bake(self, feed, args, kwargs):
-        """Ask the template which of its configurations fits this call."""
+        """Ask the template which of its configurations fits this call.
+
+        The template owns its result, so it can build the probe its
+        configurations are measured on, and the measurement is made without
+        this call's tensors.  What comes back is a launcher over whatever
+        operands it is handed, so the step stays reusable.
+        """
 
         template = self.kernel.template
         meta = dict(self.kernel.template_meta)
         meta["feed"] = list(feed)
         meta.setdefault("qualifies", True)
-        # The floor a template is measured against: it replays the call being
-        # measured, because that is the only call whose result is known to be
-        # right.  It is transient -- the measurement keeps the winner, not this.
-        plain = lambda values: self._call_target(args, kwargs)
         try:
-            specs = template.out_specs(meta)
-            for params in template.configurations(specs, meta):
-                from .templates import TemplateChoice
-
-                choice = TemplateChoice(template, params, specs, meta)
-                launch = choice.resolve(plain)
-                if launch is not None:
-                    self.kernel.config = params
-                    return launch
+            probe = template.probe(meta)
+            meta["probe_feed"] = probe
+            # The floor a template is measured against.  With a probe it is
+            # the operator run on the probe, so no call's real tensors are
+            # pinned by the measurement; without one it replays the call being
+            # measured, which is transient either way.
+            plain = (
+                self._probe_launcher() if probe is not None
+                else (lambda values: self._call_target(args, kwargs))
+            )
+            launch, params = template.select(
+                meta, lambda choice, fallback: choice.resolve(
+                    fallback if fallback is not None else plain
+                )
+            )
+            self.kernel.config = params
+            return launch
         except Exception:  # noqa: BLE001 - a template never breaks the region
             return None
-        return None
+
+    def _probe_launcher(self):
+        """The operator run on a probe feed instead of this call's tensors."""
+
+        meta = self.kernel.template_meta
+        literals = list(meta.get("arg_templates") or ())
+        positions = list(meta.get("operand_positions") or ())
+        if not positions:
+            return None
+        target = self.kernel.target
+        if meta.get("call_method"):
+            receiver, *rest = literals
+            return lambda values: getattr(receiver, target)(*rest)
+        if not callable(target) and hasattr(target, "default"):
+            target = target.default
+
+        def launch(values):
+            operands = iter(values)
+            args = [
+                next(operands) if index in positions else literal
+                for index, literal in enumerate(literals)
+            ]
+            if len(operands) < len(positions):
+                return None
+            return target(*args)
+
+        return launch
 
     def _call_target(self, args, kwargs):
         if self.kernel.call_method:
@@ -191,15 +227,26 @@ class LoopProgram:
         self._plan_releases()
 
     def _plan_releases(self) -> None:
-        last = {}
+        """Free each buffer in the step that reads it for the last time.
+
+        A buffer produced by one kernel and consumed by a later one is dead
+        once that last consumer has run, not once its producer has: holding it
+        until the program ends keeps every intermediate of the whole region
+        alive at once, which is what decides whether a region fits in memory.
+        A buffer whose last reader is its own producer is dead the moment that
+        step ends, and one nothing reads is dead where it is written.
+        """
+        last_read = {}
         for position, step in enumerate(self.steps):
             for name in step.reads:
-                last[name] = position
+                last_read[name] = position
         for position, step in enumerate(self.steps):
             step.frees = [
                 name
-                for name in sorted(step.writes)
-                if name not in self.keep and last.get(name, -1) == position
+                for name in sorted(step.writes | step.reads)
+                if name not in self.keep
+                and name not in self.graph.constants
+                and last_read.get(name, -1) <= position
             ]
 
     def __call__(self, *args):
