@@ -21,43 +21,45 @@ __device__ inline T reduce_empty_value() {
 }
 
 
-template <typename T>
+// The selection kernels take their index type as a parameter: a radix pass
+// carries counters, ballots and offsets in it, and the 64-bit form of all three
+// is markedly more expensive than the 32-bit one.
+template <typename T, typename index_t>
 __global__ void nanmedian_select_flat_kernel(
-        int64_t n, const T* input, T* result) {
-    __shared__ uint64_t radix_smem[32];
-    __shared__ unsigned long long nan_count;
+        index_t n, const T* input, T* result) {
+    __shared__ index_t radix_smem[32];
+    __shared__ index_t nan_count;
     if (threadIdx.x == 0) nan_count = 0;
     __syncthreads();
 
-    unsigned long long local_nan_count = 0;
-    for (uint64_t i = static_cast<uint64_t>(threadIdx.x);
-         i < static_cast<uint64_t>(n);
-         i += static_cast<uint64_t>(blockDim.x)) {
+    index_t local_nan_count = 0;
+    for (index_t i = static_cast<index_t>(threadIdx.x); i < n;
+         i += static_cast<index_t>(blockDim.x)) {
         local_nan_count += reduce_value_is_nan(input[i]) ? 1 : 0;
     }
     if (local_nan_count != 0) atomicAdd(&nan_count, local_nan_count);
     __syncthreads();
 
-    const uint64_t valid = static_cast<uint64_t>(n) - nan_count;
+    const index_t valid = n - static_cast<index_t>(nan_count);
     if (valid == 0) {
         if (threadIdx.x == 0) result[0] = reduce_empty_value<T>();
         return;
     }
-    const uint64_t k = (valid - 1) / 2 + 1;
+    const index_t k = (valid - 1) / 2 + 1;
     T median = static_cast<T>(0);
-    topk_detail::topk_radix_select<T, uint64_t>(
-        input, k, false, static_cast<uint64_t>(n), 1, radix_smem, &median);
+    topk_detail::topk_radix_select<T, index_t>(
+        input, k, false, n, static_cast<index_t>(1), radix_smem, &median);
     if (threadIdx.x == 0) result[0] = median;
 }
 
 
-template <typename T>
+template <typename T, typename index_t>
 __global__ void median_select_dim_kernel(
-        int64_t n_slices, int64_t d_size, int64_t inner, const T* input,
+        index_t n_slices, index_t d_size, index_t inner, const T* input,
         T* values, int64_t* indices, bool ignore_nan) {
-    const int64_t si = static_cast<int64_t>(blockIdx.x);
+    const index_t si = static_cast<index_t>(blockIdx.x);
     if (si >= n_slices) return;
-    __shared__ uint64_t radix_smem[32];
+    __shared__ index_t radix_smem[32];
     __shared__ unsigned long long nan_count;
     __shared__ unsigned long long selected_index;
     if (threadIdx.x == 0) {
@@ -66,19 +68,18 @@ __global__ void median_select_dim_kernel(
     }
     __syncthreads();
 
-    const int64_t outer_index = si / inner;
-    const int64_t inner_index = si % inner;
+    const index_t outer_index = si / inner;
+    const index_t inner_index = si % inner;
     const T* slice_input = input + outer_index * d_size * inner + inner_index;
-    unsigned long long local_nan_count = 0;
-    for (uint64_t i = static_cast<uint64_t>(threadIdx.x);
-         i < static_cast<uint64_t>(d_size);
-         i += static_cast<uint64_t>(blockDim.x)) {
+    index_t local_nan_count = 0;
+    for (index_t i = static_cast<index_t>(threadIdx.x); i < d_size;
+         i += static_cast<index_t>(blockDim.x)) {
         local_nan_count += reduce_value_is_nan(slice_input[i * inner]) ? 1 : 0;
     }
     if (local_nan_count != 0) atomicAdd(&nan_count, local_nan_count);
     __syncthreads();
 
-    const uint64_t valid = static_cast<uint64_t>(d_size) - nan_count;
+    const index_t valid = d_size - static_cast<index_t>(nan_count);
     if (ignore_nan && valid == 0) {
         if (threadIdx.x == 0) {
             values[si] = reduce_empty_value<T>();
@@ -86,16 +87,14 @@ __global__ void median_select_dim_kernel(
         }
         return;
     }
-    const uint64_t k = !ignore_nan && nan_count != 0
-        ? static_cast<uint64_t>(d_size)
+    const index_t k = !ignore_nan && nan_count != 0
+        ? d_size
         : (valid - 1) / 2 + 1;
     T median = static_cast<T>(0);
-    topk_detail::topk_radix_select<T, uint64_t>(
-        slice_input, k, false, static_cast<uint64_t>(d_size),
-        static_cast<uint64_t>(inner), radix_smem, &median);
-    for (uint64_t i = static_cast<uint64_t>(threadIdx.x);
-         i < static_cast<uint64_t>(d_size);
-         i += static_cast<uint64_t>(blockDim.x)) {
+    topk_detail::topk_radix_select<T, index_t>(
+        slice_input, k, false, d_size, inner, radix_smem, &median);
+    for (index_t i = static_cast<index_t>(threadIdx.x); i < d_size;
+         i += static_cast<index_t>(blockDim.x)) {
         const T value = slice_input[i * inner];
         if (value == median ||
             (reduce_value_is_nan(value) && reduce_value_is_nan(median))) {
@@ -110,30 +109,27 @@ __global__ void median_select_dim_kernel(
 }
 
 
-template <typename T>
+template <typename T, typename index_t>
 __global__ void kthvalue_select_kernel(
-        int64_t n_slices, int64_t d_size, int64_t inner, int64_t k,
+        index_t n_slices, index_t d_size, index_t inner, index_t k,
         const T* input, T* values, int64_t* indices) {
-    const int64_t si = static_cast<int64_t>(blockIdx.x);
+    const index_t si = static_cast<index_t>(blockIdx.x);
     if (si >= n_slices) return;
-    __shared__ uint64_t radix_smem[32];
+    __shared__ index_t radix_smem[32];
     __shared__ unsigned long long selected_index;
     if (threadIdx.x == 0) {
         selected_index = static_cast<unsigned long long>(d_size);
     }
     __syncthreads();
 
-    const int64_t outer_index = si / inner;
-    const int64_t inner_index = si % inner;
+    const index_t outer_index = si / inner;
+    const index_t inner_index = si % inner;
     const T* slice_input = input + outer_index * d_size * inner + inner_index;
     T selected = static_cast<T>(0);
-    topk_detail::topk_radix_select<T, uint64_t>(
-        slice_input, static_cast<uint64_t>(k), false,
-        static_cast<uint64_t>(d_size), static_cast<uint64_t>(inner),
-        radix_smem, &selected);
-    for (uint64_t i = static_cast<uint64_t>(threadIdx.x);
-         i < static_cast<uint64_t>(d_size);
-         i += static_cast<uint64_t>(blockDim.x)) {
+    topk_detail::topk_radix_select<T, index_t>(
+        slice_input, k, false, d_size, inner, radix_smem, &selected);
+    for (index_t i = static_cast<index_t>(threadIdx.x); i < d_size;
+         i += static_cast<index_t>(blockDim.x)) {
         const T value = slice_input[i * inner];
         if (value == selected ||
             (reduce_value_is_nan(value) && reduce_value_is_nan(selected))) {
@@ -395,9 +391,17 @@ Tensor nanmedian_cuda(const Tensor& self) {
     Tensor input = self.to(work_dt).contiguous().reshape({self.numel()});
     Tensor result = Tensor::empty({}, work_dt, self.device());
     auto stream = getCurrentCUDAStream().stream();
+    const bool flat32 =
+        input.numel() <= static_cast<int64_t>(std::numeric_limits<int32_t>::max());
 #define TP_NANMEDIAN_FLAT_CASE(ctype, name_) \
     case DType::name_: \
-        nanmedian_select_flat_kernel<ctype><<<1, selection_threads(input.numel()), 0, stream>>>( \
+        if (flat32) \
+            nanmedian_select_flat_kernel<ctype, int32_t><<< \
+                1, selection_threads(input.numel()), 0, stream>>>( \
+                    static_cast<int32_t>(input.numel()), input.data_ptr<ctype>(), \
+                    result.data_ptr<ctype>()); \
+        else \
+            nanmedian_select_flat_kernel<ctype, int64_t><<<1, selection_threads(input.numel()), 0, stream>>>( \
             input.numel(), input.data_ptr<ctype>(), result.data_ptr<ctype>()); \
         break;
     switch (work_dt) {
@@ -440,9 +444,19 @@ std::tuple<Tensor, Tensor> nanmedian_dim_cuda(const Tensor& self, int64_t dim,
     const int64_t slices = outer * inner;
     if (slices == 0) return {values, indices};
     auto stream = getCurrentCUDAStream().stream();
+    const bool sel32 = input.numel() <=
+        static_cast<int64_t>(std::numeric_limits<int32_t>::max());
 #define TP_NANMEDIAN_DIM_CASE(ctype, name_) \
     case DType::name_: \
-        median_select_dim_kernel<ctype><<< \
+        if (sel32) \
+            median_select_dim_kernel<ctype, int32_t><<< \
+                dim3(static_cast<unsigned>(slices)), selection_threads(d_size), \
+                0, stream>>>( \
+                static_cast<int32_t>(slices), static_cast<int32_t>(d_size), \
+                static_cast<int32_t>(inner), input.data_ptr<ctype>(), \
+                values.data_ptr<ctype>(), indices.data_ptr<int64_t>(), true); \
+        else \
+            median_select_dim_kernel<ctype, int64_t><<< \
             dim3(static_cast<unsigned>(slices)), selection_threads(d_size), 0, stream>>>( \
             slices, d_size, inner, input.data_ptr<ctype>(), values.data_ptr<ctype>(), \
             indices.data_ptr<int64_t>(), true); \
@@ -514,6 +528,8 @@ std::tuple<Tensor, Tensor> mode_cuda(const Tensor& self, int64_t dim, bool keepd
     Tensor sorted = std::get<0>(sorted_result);
     Tensor sorted_indices = std::get<1>(sorted_result);
     auto stream = getCurrentCUDAStream().stream();
+    const bool sel32 = input.numel() <=
+        static_cast<int64_t>(std::numeric_limits<int32_t>::max());
 #define TP_MODE_DEVICE_CASE(ctype, name_) \
     case DType::name_: \
         mode_from_sorted_kernel<ctype><<<make_grid(slices), kThreads, 0, stream>>>( \
@@ -578,9 +594,20 @@ std::tuple<Tensor, Tensor> kthvalue_cuda(const Tensor& self, int64_t k, int64_t 
     outer_inner(shape_of(input), dim, outer, inner);
     const int64_t slices = outer * inner;
     auto stream = getCurrentCUDAStream().stream();
+    const bool sel32 = input.numel() <=
+        static_cast<int64_t>(std::numeric_limits<int32_t>::max());
 #define TP_KTHVALUE_SELECT_CASE(ctype, name_) \
     case DType::name_: \
-        kthvalue_select_kernel<ctype><<< \
+        if (sel32) \
+            kthvalue_select_kernel<ctype, int32_t><<< \
+                dim3(static_cast<unsigned>(slices)), selection_threads(d_size), \
+                0, stream>>>( \
+                static_cast<int32_t>(slices), static_cast<int32_t>(d_size), \
+                static_cast<int32_t>(inner), static_cast<int32_t>(k), \
+                input.data_ptr<ctype>(), values_out.data_ptr<ctype>(), \
+                indices_out.data_ptr<int64_t>()); \
+        else \
+            kthvalue_select_kernel<ctype, int64_t><<< \
             dim3(static_cast<unsigned>(slices)), selection_threads(d_size), 0, stream>>>( \
             slices, d_size, inner, k, input.data_ptr<ctype>(), \
             values_out.data_ptr<ctype>(), indices_out.data_ptr<int64_t>()); \
@@ -633,9 +660,20 @@ std::tuple<Tensor, Tensor> median_dim_cuda(const Tensor& self, int64_t dim,
     outer_inner(shape_of(input), dim, outer, inner);
     const int64_t slices = outer * inner;
     auto stream = getCurrentCUDAStream().stream();
+    const bool sel32 = input.numel() <=
+        static_cast<int64_t>(std::numeric_limits<int32_t>::max());
 #define TP_MEDIAN_DIM_CASE(ctype, name_) \
     case DType::name_: \
-        median_select_dim_kernel<ctype><<< \
+        if (sel32) \
+            median_select_dim_kernel<ctype, int32_t><<< \
+                dim3(static_cast<unsigned>(slices)), selection_threads(d_size), \
+                0, stream>>>( \
+                static_cast<int32_t>(slices), static_cast<int32_t>(d_size), \
+                static_cast<int32_t>(inner), input.data_ptr<ctype>(), \
+                values.data_ptr<ctype>(), \
+                indices.data_ptr<int64_t>(), false); \
+        else \
+            median_select_dim_kernel<ctype, int64_t><<< \
             dim3(static_cast<unsigned>(slices)), selection_threads(d_size), 0, stream>>>( \
             slices, d_size, inner, input.data_ptr<ctype>(), values.data_ptr<ctype>(), \
             indices.data_ptr<int64_t>(), false); \
