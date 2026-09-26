@@ -123,10 +123,15 @@ class ExternStep(Step):
             # the operator run on the probe, so no call's real tensors are
             # pinned by the measurement; without one it replays the call being
             # measured, which is transient either way.
-            plain = (
-                self._probe_launcher() if probe is not None
-                else (lambda values: self._call_target(args, kwargs))
-            )
+            if probe is None:
+                # Nothing to measure on that would leave this call's operands
+                # behind: a launcher built here is kept by the step, and the
+                # step is reused for every call the program makes, so a
+                # measurement that can only run on this call's tensors would
+                # pin all of them for the life of the program.  Without a probe
+                # the operator runs as the framework runs it.
+                return None
+            plain = self._probe_launcher()
             launch, params = template.select(
                 meta, lambda choice, fallback: choice.resolve(
                     fallback if fallback is not None else plain

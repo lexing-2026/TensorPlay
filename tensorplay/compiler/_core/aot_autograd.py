@@ -228,6 +228,17 @@ def _call(compiled: Callable[..., Any], args: Sequence[Any]) -> tuple[Any, ...]:
     return (result,)
 
 
+def _restore_saved(ctx, names) -> list:
+    """The saved pairs, in the order the forward listed them."""
+
+    held = iter(ctx.saved_tensors)
+    plain = iter(ctx.saved_plain)
+    return [
+        (name, next(held) if is_tensor else next(plain))
+        for name, is_tensor in zip(names, ctx.saved_is_tensor)
+    ]
+
+
 def _bind_backward_inputs(bw_module, input_kinds, input_keys, saved, grad_outputs, primals, primal_names):
     saved_by_name = dict(saved)
     primal_by_name = dict(zip(primal_names, primals))
@@ -333,7 +344,16 @@ def aot_function(
             outputs = _call(compiled_fw, [run_primals[i] for i in fw_input_order])
             user = outputs[:num_fwd]
             saved = list(zip(saved_names, outputs[num_fwd:]))
-            ctx.saved_pairs = saved
+            # Saved through the context, so the engine releases them when it
+            # releases the graph.  A list hung on the context is invisible to
+            # it: the values outlive every backward pass, and a step's saved
+            # activations are most of a region's memory.
+            held = [value for _, value in saved if _is_tensor(value)]
+            ctx.save_for_backward(*held)
+            ctx.saved_is_tensor = tuple(_is_tensor(value) for _, value in saved)
+            ctx.saved_plain = tuple(
+                value for _, value in saved if not _is_tensor(value)
+            )
             ctx.run_primals = run_primals
             ctx.run_outputs = user
             non_diff = [
@@ -351,11 +371,29 @@ def aot_function(
                 if diff
             ]
             named = list(zip(tangent_names, diff_grads))
-            inputs = bw_example_inputs(ctx.saved_pairs, named, ctx.run_primals)
+            inputs = bw_example_inputs(
+                _restore_saved(ctx, saved_names), named, ctx.run_primals
+            )
             if not compiled_bw_box:
                 compiled_bw_box.append(bw_compiler(bw_module, inputs))
             grads = iter(_call(compiled_bw_box[0], inputs))
-            return tuple(next(grads) if needed else None for needed in grad_mask)
+            out = tuple(next(grads) if needed else None for needed in grad_mask)
+            # A saved forward value is the bulk of a region's memory and the
+            # backward pass is its last reader.  Nothing on this side of the
+            # boundary releases what the context holds once the pass is done,
+            # so the pass drops what it has just bound: the backward program
+            # has taken what it needs by now, and a step's saved activations
+            # are most of what a region needs to fit in memory.
+            # The saved values live in the context's own storage, which is
+            # what ``saved_tensors`` reads; emptying it there is what actually
+            # lets go of them.
+            for name in ("_saved_tensors", "_saved_versions"):
+                stored = getattr(ctx, name, None)
+                if isinstance(stored, tuple):
+                    setattr(ctx, name, ())
+            ctx.saved_plain = ()
+            ctx.run_primals = None
+            return out
 
     def run_training(*args: Any) -> Any:
         if not tensorplay.is_grad_enabled():
