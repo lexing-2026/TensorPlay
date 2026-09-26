@@ -275,7 +275,6 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
                 h = h * 1000003 ^ std::hash<int64_t>{}(v);
             h = h * 1000003 ^ std::hash<int>{}((int)k.dtype);
             h = h * 1000003 ^ std::hash<int>{}(k.device);
-            h = h * 1000003 ^ std::hash<int>{}((int)k.has_bias);
             h = h * 1000003 ^ std::hash<int>{}((int)k.fused_relu);
             h = h * 1000003 ^ std::hash<int>{}((int)k.autotune);
             for (auto v : k.x_stride) h = h * 1000003 ^ std::hash<int64_t>{}(v);
@@ -687,6 +686,241 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
 #endif
 #else
     TP_THROW(NotImplementedError, "conv2d_cuda requires cuDNN");
+#endif
+}
+
+// Transposed convolution as a backward-data graph.  The engine list this
+// formulation reaches holds transforms that the algorithm-enumeration surface
+// never offers for the transposed shape, and among them the fastest choice is
+// routinely a tiled-transform engine rather than the implicit gemm the
+// enumeration ranks first.  Returns an undefined tensor when the case is not
+// representable here, so the caller can fall back.
+Tensor conv_transpose2d_cudnn_v8(const Tensor& input, const Tensor& weight,
+                                 const Tensor& bias,
+                                 const std::vector<int64_t>& stride,
+                                 const std::vector<int64_t>& padding,
+                                 const std::vector<int64_t>& output_padding,
+                                 int64_t groups,
+                                 const std::vector<int64_t>& dilation) {
+#if defined(TP_HAS_CUDNN_FRONTEND)
+    if (input.dim() != 4 || weight.dim() != 4) return Tensor();
+    if (input.dtype() != DType::Float32 && input.dtype() != DType::Float16 &&
+        input.dtype() != DType::BFloat16) {
+        return Tensor();
+    }
+    if (bias.defined() && bias.numel() != 0 && bias.dtype() != input.dtype())
+        return Tensor();
+    // The conv descriptor of this frontend build carries no group count, so a
+    // grouped transposed convolution has no graph form here.
+    if (groups != 1) return Tensor();
+
+    const int64_t N = input.size(0), C = input.size(1), H = input.size(2), W = input.size(3);
+    const int64_t K = weight.size(1) * groups;
+    const int64_t R = weight.size(2), S = weight.size(3);
+    // The output size carries the extra rows and columns that output_padding
+    // asks for; the transform writes the whole extent, and those positions
+    // receive the same contributions as any other border position.
+    const int64_t OH = (H - 1) * stride[0] - 2 * padding[0] +
+                       dilation[0] * (R - 1) + output_padding[0] + 1;
+    const int64_t OW = (W - 1) * stride[1] - 2 * padding[1] +
+                       dilation[1] * (S - 1) + output_padding[1] + 1;
+    if (OH <= 0 || OW <= 0) return Tensor();
+
+    cudnnDataType_t dtype;
+    if (input.dtype() == DType::Float32) dtype = CUDNN_DATA_FLOAT;
+    else if (input.dtype() == DType::Float16) dtype = CUDNN_DATA_HALF;
+    else dtype = CUDNN_DATA_BFLOAT16;
+    const cudnnDataType_t compute = CUDNN_DATA_FLOAT;
+
+    auto alignment_of = [](const void* ptr) -> int64_t {
+        int64_t alignment = 1;
+        auto address = reinterpret_cast<uintptr_t>(ptr);
+        for (; alignment < 32; alignment *= 2) {
+            if (address % static_cast<uintptr_t>(alignment * 2)) return alignment;
+        }
+        return alignment;
+    };
+
+    const std::array<int64_t, 4> dy_stride{
+        input.stride(0), input.stride(1), input.stride(2), input.stride(3)};
+    const std::array<int64_t, 4> w_stride{
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3)};
+    const std::array<int64_t, 4> dx_stride{K * OH * OW, OH * OW, OW, 1};
+    Tensor out = Tensor::empty({N, K, OH, OW}, input.dtype(), input.device());
+
+    struct TKey {
+        cudnnDataType_t dtype;
+        int64_t N, C, H, W, K, R, S, groups;
+        int64_t ph, pw, sh, sw, dh, dw;
+        int device;
+        bool allow_tf32;
+        std::array<int64_t, 4> dy_stride, w_stride, dx_stride;
+        bool operator==(const TKey& o) const {
+            return dtype == o.dtype && N == o.N && C == o.C && H == o.H && W == o.W &&
+                   K == o.K && R == o.R && S == o.S && groups == o.groups &&
+                   ph == o.ph && pw == o.pw && sh == o.sh && sw == o.sw &&
+                   dh == o.dh && dw == o.dw && device == o.device &&
+                   allow_tf32 == o.allow_tf32 && dy_stride == o.dy_stride &&
+                   w_stride == o.w_stride &&
+                   dx_stride == o.dx_stride;
+        }
+    };
+    struct TKeyHash {
+        size_t operator()(const TKey& k) const {
+            size_t h = std::hash<int64_t>{}(k.N);
+            for (auto v : {k.C, k.H, k.W, k.K, k.R, k.S, k.groups, k.ph, k.pw,
+                           k.sh, k.sw, k.dh, k.dw})
+                h = h * 1000003 ^ std::hash<int64_t>{}(v);
+            h = h * 1000003 ^ std::hash<int>{}((int)k.dtype);
+            h = h * 1000003 ^ std::hash<int>{}(k.device);
+            h = h * 1000003 ^ std::hash<int>{}((int)k.allow_tf32);
+            for (auto v : k.dy_stride) h = h * 1000003 ^ std::hash<int64_t>{}(v);
+            for (auto v : k.w_stride) h = h * 1000003 ^ std::hash<int64_t>{}(v);
+            for (auto v : k.dx_stride) h = h * 1000003 ^ std::hash<int64_t>{}(v);
+            return h;
+        }
+    };
+    static std::unordered_map<TKey, std::shared_ptr<fe::ExecutionPlan>, TKeyHash> g_t_cache;
+    static std::mutex g_t_mutex;
+
+    const bool allow_tf32 = tensorplay::globalContext().allowTF32CuDNN();
+    const bool deterministic = tensorplay::globalContext().deterministicAlgorithms();
+    Tensor bias_c;
+    if (bias.defined() && bias.numel() != 0) {
+        bias_c = bias.is_contiguous() ? bias : bias.contiguous();
+        if (bias_c.numel() != K) return Tensor();
+        bias_c = bias_c.reshape({1, K, 1, 1});
+    }
+    TKey key{dtype, N, C, H, W, K, R, S, groups,
+             padding[0], padding[1], stride[0], stride[1], dilation[0], dilation[1],
+             static_cast<int>(input.device().index()), allow_tf32,
+             dy_stride, w_stride, dx_stride};
+    cudnnHandle_t handle = CUDAContext::getCudnnHandle();
+
+    std::shared_ptr<fe::ExecutionPlan> plan;
+    {
+        std::lock_guard<std::mutex> guard(g_t_mutex);
+        auto it = g_t_cache.find(key);
+        if (it != g_t_cache.end()) {
+            plan = it->second;
+        } else try {
+            const int64_t dy_align = alignment_of(input.data_ptr());
+            const int64_t w_align = alignment_of(weight.data_ptr());
+            const int64_t dx_align = alignment_of(out.data_ptr());
+            auto dy_desc = fe::TensorBuilder()
+                               .setDim(4, std::array<int64_t, 4>{N, C, H, W}.data())
+                               .setStrides(4, dy_stride.data())
+                               .setId('x')
+                               .setAlignment(dy_align)
+                               .setDataType(dtype)
+                               .build();
+            // Backward-data filters are laid out (C, K / groups, R, S), which
+            // is exactly the transposed-convolution weight layout.
+            auto w_desc = fe::TensorBuilder()
+                               .setDim(4, std::array<int64_t, 4>{C, K, R, S}.data())
+                               .setStrides(4, w_stride.data())
+                               .setId('w')
+                               .setAlignment(w_align)
+                               .setDataType(dtype)
+                               .build();
+            auto dx_desc = fe::TensorBuilder()
+                               .setDim(4, std::array<int64_t, 4>{N, K, OH, OW}.data())
+                               .setStrides(4, dx_stride.data())
+                               .setId('y')
+                               .setAlignment(dx_align)
+                               .setDataType(dtype)
+                               .build();
+            int64_t pad[2] = {padding[0], padding[1]};
+            int64_t strd[2] = {stride[0], stride[1]};
+            int64_t dil[2] = {dilation[0], dilation[1]};
+            auto conv_desc = fe::ConvDescBuilder()
+                                 .setComputeType(compute)
+                                 .setMathMode(CUDNN_CROSS_CORRELATION)
+                                 .setSpatialDimCount(2)
+                                 .setSpatialStride(2, strd)
+                                 .setPrePadding(2, pad)
+                                 .setPostPadding(2, pad)
+                                 .setDilation(2, dil)
+                                 .build();
+            // The bias is applied after the transform rather than inside the
+            // graph: a second operation in the graph costs far more than the
+            // single pass that adds the vector afterwards.
+            auto bwd_op = fe::OperationBuilder(
+                              CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR)
+                              .setwDesc(w_desc)
+                              .setdyDesc(dy_desc)
+                              .setdxDesc(dx_desc)
+                              .setcDesc(conv_desc)
+                              .build();
+            std::array<fe::Operation const*, 1> ops = {&bwd_op};
+            auto op_graph = fe::OperationGraphBuilder()
+                                .setHandle(handle)
+                                .setOperationGraph(ops.size(), ops.data())
+                                .build();
+            auto heuristics = fe::EngineHeuristicsBuilder()
+                                  .setOperationGraph(op_graph)
+                                  .setHeurMode(CUDNN_HEUR_MODE_INSTANT)
+                                  .build();
+            auto engine_configs = heuristics.getEngineConfig(heuristics.getEngineConfigCount());
+            auto drop = [=](cudnnBackendDescriptor_t c) {
+                if (deterministic &&
+                    fe::hasNumericalNote<CUDNN_NUMERICAL_NOTE_NONDETERMINISTIC>(c)) {
+                    return true;
+                }
+                if (fe::hasNumericalNote<CUDNN_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS>(c)) {
+                    return true;
+                }
+                if (dtype == CUDNN_DATA_FLOAT && !allow_tf32 &&
+                    fe::hasNumericalNote<CUDNN_NUMERICAL_NOTE_TENSOR_CORE>(c)) {
+                    return true;
+                }
+                return false;
+            };
+            fe::EngineConfigList kept;
+            fe::filter(engine_configs, kept, drop);
+            if (kept.empty()) kept = engine_configs;
+            for (auto& ec : kept) {
+                try {
+                    plan = std::make_shared<fe::ExecutionPlan>(
+                        fe::ExecutionPlanBuilder().setHandle(handle).setEngineConfig(ec).build());
+                    break;
+                } catch (...) {
+                }
+            }
+            if (!plan) return Tensor();
+            g_t_cache.emplace(key, plan);
+        } catch (...) {
+            // A formulation this library version refuses must not fail the
+            // call; the caller has a second implementation to fall back on.
+            return Tensor();
+        }
+    }
+
+    const size_t workspace_size = plan->getWorkspaceSize();
+    auto workspace = getAllocator(DeviceType::CUDA)->allocate(workspace_size ? workspace_size : 1);
+    void* data_ptrs[3] = {input.data_ptr(), weight.data_ptr(), out.data_ptr()};
+    int64_t uids[3] = {'x', 'w', 'y'};
+    auto variant_pack = fe::VariantPackBuilder()
+                            .setWorkspacePointer(workspace_size ? workspace.get() : nullptr)
+                            .setDataPointers(3, data_ptrs)
+                            .setUids(3, uids)
+                            .build();
+    try {
+        CUDNN_CHECK(cudnnBackendExecute(handle, plan->get_raw_desc(),
+                                       variant_pack.get_raw_desc()));
+    } catch (...) {
+        return Tensor();
+    }
+    if (bias_c.defined() && !add_channel_broadcast_inplace_cuda(out, bias_c)) {
+        auto bias_desc = get_cached_tensor_desc(bias_c);
+        auto out_desc = get_cached_tensor_desc(out);
+        float one = 1.0f;
+        CUDNN_CHECK(cudnnAddTensor(handle, &one, *bias_desc, bias_c.data_ptr(),
+                                   &one, *out_desc, out.data_ptr()));
+    }
+    return out;
+#else
+    return Tensor();
 #endif
 }
 

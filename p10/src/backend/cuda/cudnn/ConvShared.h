@@ -221,6 +221,15 @@ Tensor conv2d_relu_cudnn(const Tensor& input, const Tensor& weight,
                          const std::vector<int64_t>& padding,
                          const std::vector<int64_t>& dilation, int64_t groups);
 
+// Undefined tensor when the case is not representable on the graph path.
+Tensor conv_transpose2d_cudnn_v8(const Tensor& input, const Tensor& weight,
+                                 const Tensor& bias,
+                                 const std::vector<int64_t>& stride,
+                                 const std::vector<int64_t>& padding,
+                                 const std::vector<int64_t>& output_padding,
+                                 int64_t groups,
+                                 const std::vector<int64_t>& dilation);
+
 Tensor conv2d_cudnn_legacy(const Tensor& input, const Tensor& weight,
                             const Tensor& bias, const std::vector<int64_t>& stride,
                             const std::vector<int64_t>& padding,

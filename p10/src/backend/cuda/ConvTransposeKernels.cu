@@ -21,6 +21,20 @@
 namespace tensorplay {
 namespace cuda {
 
+#ifdef USE_CUDNN
+// Declared here rather than pulled in from the cuDNN shared header: that header
+// also declares a parameter-expansion helper whose name this file defines
+// locally, and including both makes every call ambiguous.  Undefined tensor
+// when the graph path does not cover the case.
+Tensor conv_transpose2d_cudnn_v8(const Tensor& input, const Tensor& weight,
+                                 const Tensor& bias,
+                                 const std::vector<int64_t>& stride,
+                                 const std::vector<int64_t>& padding,
+                                 const std::vector<int64_t>& output_padding,
+                                 int64_t groups,
+                                 const std::vector<int64_t>& dilation);
+#endif
+
 Tensor conv2d_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias,
                    const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                    const std::vector<int64_t>& dilation, int64_t groups);
@@ -285,6 +299,15 @@ Tensor conv_transpose2d_cuda(const Tensor& input, const Tensor& weight, const Te
 
     Tensor input_c = input.is_contiguous() ? input : input.contiguous();
     Tensor weight_c = weight.is_contiguous() ? weight : weight.contiguous();
+
+#if defined(USE_CUDNN)
+    {
+        Tensor graph = conv_transpose2d_cudnn_v8(input_c, weight_c, bias, stride,
+                                                padding, output_padding, groups,
+                                                dilation);
+        if (graph.defined()) return graph;
+    }
+#endif
 
     const int64_t H_in = input_c.size(2), W_in = input_c.size(3);
     const int64_t kH = weight_c.size(2), kW = weight_c.size(3);
