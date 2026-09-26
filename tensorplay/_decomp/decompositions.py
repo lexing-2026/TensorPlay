@@ -10,7 +10,9 @@ registry, which writes the result into the destination.
 from __future__ import annotations
 
 import math
+import operator
 from collections.abc import Callable
+from functools import reduce
 from typing import Any
 
 import tensorplay as tp
@@ -383,6 +385,162 @@ def _dot_check(self, other):
             f"inconsistent tensor size, expected tensor [{self.numel()}] and src [{other.numel()}] to have the "
             f"same number of elements, but got {self.numel()} and {other.numel()} elements respectively"
         )
+
+
+# ---------------------------------------------------------------------------
+# matrix products
+# ---------------------------------------------------------------------------
+
+
+def should_fold(tensor1, tensor2, is_out: bool) -> bool:
+    """Whether a product of a matrix by a stack of them is one product.
+
+    A product of an ``n``-by-``m`` by an ``m``-by-``p`` is a product; a product of
+    a stack of them by a matrix is a stack of products, and can be computed as
+    one product by folding the stack into the first matrix's rows.  Whether that
+    is worth doing is the question here, because folding copies when the stack is
+    not one run of memory, and a copy is more than the saving.
+
+    Folding is refused when it would read a stride the eager path would not have
+    read, and accepted when it would: a matrix whose rows are not contiguous is
+    the case where folding would gather, and gathering to save a loop is a loss.
+    A stack that needs its gradient is folded regardless, because the gradient of
+    a fold is a different shape and a caller asking for one is asking for the
+    fold to have been possible.
+    """
+
+    from tensorplay.graph.experimental.symbolic_shapes import guard_or_false
+
+    # The one with more dimensions decides, since folding is only ever from a
+    # stack to something without a stack.
+    t1, t2 = (tensor1, tensor2) if tensor1.ndim >= tensor2.ndim else (tensor2, tensor1)
+
+    if not (t1.ndim >= 3 and t2.ndim <= 2):
+        return False
+    if t2.requires_grad and not is_out:
+        return True
+    if tensor1.ndim == 2:
+        return False
+    from tensorplay.functional import sym_numel
+
+    if guard_or_false(sym_numel(t1) == 0):
+        return True
+
+    t1_shape = t1.shape
+    t1_stride = t1.stride()
+
+    # Contiguous apart from any axis of extent one, which addresses as many
+    # elements as it skips and so makes no difference to whether the rows follow
+    # one another.
+    expected_stride = [1]
+    for size in reversed(t1_shape[1:]):
+        expected_stride.append(size * expected_stride[-1])
+    return all(
+        guard_or_false(size == 1) or guard_or_false(left == right)
+        for left, right, size in zip(
+            t1_stride, list(reversed(expected_stride)), t1_shape
+        )
+    )
+
+
+@register_decomposition([ops.matmul.default, ops.matmul.out])
+def matmul(tensor1, tensor2, *, is_out=False):
+    """A product of whatever shapes were given, as the products it is made of.
+
+    One operation covers a vector by a vector, a matrix by a vector, a stack of
+    matrices by a vector, and a stack by a stack, and which of those it is can
+    only be told from the shapes.  So it is taken apart here into the products
+    that do have one meaning each, and everything downstream of here sees one of
+    those rather than a case.
+    """
+
+    from tensorplay.graph.experimental.symbolic_shapes import guard_or_true
+
+    dim_tensor1 = tensor1.dim()
+    dim_tensor2 = tensor2.dim()
+    if dim_tensor1 == 0 or dim_tensor2 == 0:
+        raise AssertionError(
+            f"matmul does not support 0-dimensional tensors, got dims: "
+            f"{dim_tensor1} and {dim_tensor2}"
+        )
+    if dim_tensor1 == 1 and dim_tensor2 == 1:
+        return tp.dot(tensor1, tensor2)
+    elif dim_tensor1 == 2 and dim_tensor2 == 1:
+        return tp.mv(tensor1, tensor2)
+    elif dim_tensor1 == 1 and dim_tensor2 == 2:
+        return tp.squeeze(tp.mm(tp.unsqueeze(tensor1, 0), tensor2), 0)
+    elif dim_tensor1 == 2 and dim_tensor2 == 2:
+        return tp.mm(tensor1, tensor2)
+    elif should_fold(tensor1, tensor2, is_out):
+        # dim_tensor1 >= 3 and the other has at most two dimensions, and the
+        # strides allow it: the stack of matrices becomes one matrix by having
+        # its stack axis folded into its rows, so the product is one product.
+        transpose = dim_tensor2 > dim_tensor1
+        t1 = tensor2.mT if transpose else tensor1
+        t2 = tensor2 if not transpose else (tensor1.t() if dim_tensor1 == 2 else tensor1)
+
+        sizes_1 = t1.shape
+        output_shape = list(sizes_1[:-1])
+        folded_dim1 = reduce(operator.mul, output_shape)
+
+        t2_is_matrix = t2.dim() == 2
+        if t2_is_matrix:
+            output_shape.append(t2.shape[1])
+
+        # A reshape rather than a view because the last extent may be zero, and
+        # a view cannot say which extent a -1 stands for when one of them is.
+        t1_folded = t1.reshape(folded_dim1, sizes_1[-1])
+        if t2_is_matrix:
+            output = tp.ops.tp._unsafe_view(t1_folded.mm(t2), output_shape)
+            return output.mT.contiguous() if transpose else output
+        return tp.ops.tp._unsafe_view(t1_folded.mv(t2), output_shape)
+
+    elif dim_tensor1 >= 1 and dim_tensor2 >= 1:
+        # A stack by a stack.  The two stacks need not agree: one may have a
+        # single entry where the other has many, which is a broadcast rather than
+        # a product of equals.
+        n = tensor1.size(-2) if dim_tensor1 > 1 else 1
+        m1 = tensor1.size(-1)
+        batch_tensor1 = tensor1.shape[:-2]
+        m2 = tensor2.size(-2) if dim_tensor2 > 1 else tensor2.size(-1)
+        p = tensor2.size(-1) if dim_tensor2 > 1 else 1
+
+        batch_tensor2: list = []
+        for i in range(dim_tensor2 - 2):
+            batch_tensor2.append(tensor2.size(i))
+
+        # The same folding as above, decided by the stack axes disagreeing: a
+        # stack of one against a stack of many can drop the stack of one, which
+        # is only a rewrite of the shape rather than a gather.
+        if (
+            dim_tensor1 == 3
+            and dim_tensor2 == 3
+            and guard_or_true(batch_tensor1[0] != batch_tensor2[0])
+        ):
+            if guard_or_false(batch_tensor1[0] == 1) and tensor1.requires_grad:
+                return matmul(tensor1.squeeze(0), tensor2)
+            if guard_or_false(batch_tensor2[0] == 1) and tensor2.requires_grad:
+                return matmul(tensor1, tensor2.squeeze(0))
+
+        expand_batch_portion = list(
+            tp.broadcast_shapes(tuple(batch_tensor1), tuple(batch_tensor2))
+        )
+        tensor1_expand_size = expand_batch_portion + [n, m1]
+        expand_batch_product = reduce(operator.mul, expand_batch_portion)
+
+        tensor1_expanded = tensor1.broadcast_to(tensor1_expand_size) \
+            if expand_batch_product > 1 else tensor1
+        tensor2_expanded = tensor2.broadcast_to(expand_batch_portion + [m2, p]) \
+            if expand_batch_product > 1 else tensor2
+
+        return (tensor1_expanded.reshape(expand_batch_product, n, m1)
+                @ tensor2_expanded.reshape(expand_batch_product, m2, p)
+               ).reshape(expand_batch_portion + [n, p])
+
+    raise RuntimeError(
+        f"matmul: unable to compute the product of {dim_tensor1}-dimensional "
+        f"and {dim_tensor2}-dimensional values"
+    )
 
 
 @register_decomposition(ops.dot.default)
@@ -857,8 +1015,12 @@ def _triangle_mask(self, diagonal, lower):
         name = "tril" if lower else "triu"
         raise RuntimeError(f"{name}: input tensor must have at least 2 dimensions")
     rows, cols = int(self.shape[-2]), int(self.shape[-1])
-    row = tp.arange(rows, device=self.device).unsqueeze(-1)
-    col = tp.arange(cols, device=self.device)
+    # Both operands are given the output's extents rather than left to be
+    # matched up while the expression is written: a reader of a value is handed
+    # one index for the whole output, so an operand of fewer extents would have
+    # to be widened before it is read at all.
+    row = tp.arange(rows, device=self.device).unsqueeze(-1).expand(rows, cols)
+    col = tp.arange(cols, device=self.device).expand(rows, cols)
     offset = col - row
     return offset <= diagonal if lower else offset >= diagonal
 

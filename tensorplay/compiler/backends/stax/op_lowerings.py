@@ -35,7 +35,8 @@ from tensorplay.utils._pytree import tree_map
 
 from .ir import (
     Buffer,
-    Constant as ir_Constant,
+    Constant,
+    IndexingConstant,
     DeviceCopy,
     ExpandView,
     FixedLayout,
@@ -50,6 +51,7 @@ from .ir import (
     TensorBox,
     View,
     has_free_unbacked_symbols,
+    ops_wrapper,
     validate_ir,
 )
 from .loops import (
@@ -99,6 +101,13 @@ def select_decomp_table() -> dict:
     with the capture.
     """
 
+    # The module is imported for what importing it does rather than for
+    # anything in it: each decomposition registers itself as it is defined, so a
+    # table read before the module has been read is a table of nothing.  The
+    # import is here, at the one place the table is read, rather than at the top
+    # of this file because a table of decompositions is only wanted by a capture
+    # and a program that never captures should not pay for reading them.
+    import tensorplay._decomp.decompositions  # noqa: F401
     from tensorplay._decomp import decomposition_table
 
     return dict(decomposition_table)
@@ -492,7 +501,18 @@ def target_name(target) -> str:
 # ---------------------------------------------------------------------------
 
 
-def node_val(node, index: int | None = None):
+def node_val(node=None, index: int | None = None):
+    """The value the node being lowered stands for.
+
+    Asked for without saying which node by the parts of a lowering that are
+    about the result rather than the operation -- how big it is, what it is
+    made of, where it lives -- which is the same node for the whole of the
+    call and is published for its duration rather than passed down through
+    every helper that might want to ask.
+    """
+
+    if node is None:
+        node = V.current_node
     val = node.meta.get("val")
     if index is not None and isinstance(val, (tuple, list)):
         val = val[index]
@@ -511,36 +531,28 @@ def is_tensor_box(x) -> bool:
     return isinstance(x, TensorBox)
 
 
-def broadcast_loader(x, out_size):
-    """Loader of ``x`` indexed in the broadcast output space."""
+def as_value_node(x, dtype, device):
+    """``x`` as a node a loader can be asked of.
 
-    if not is_tensor_box(x):
-        value = x
+    A value that is already a node is one.  One that is not is a number, and a
+    number is read the same way whatever the output's extents are: as itself.
+    A number that came from a shape is an expression over the loop variables
+    rather than a number, so reading it produces an index instead.
+    """
 
-        def const(index):
-            if isinstance(value, bool):
-                return ops.constant(value, "bool")
-            if isinstance(value, int):
-                return ops.constant(value, "int64")
-            return ops.constant(float(value), "float32")
-
-        return const
-    size = x.get_size()
-    loader = x.make_loader()
-    offset = len(out_size) - len(size)
-
-    def load(index):
-        return loader(
-            [sympy.Integer(0) if int(size[k]) == 1 else index[k + offset] for k in range(len(size))]
-        )
-
-    return load
+    if isinstance(x, (TensorBox, IRNode)):
+        return x
+    if isinstance(x, sympy.Expr):
+        return IndexingConstant(index=x, dtype=dtype, device=device)
+    return Constant(value=x, dtype=dtype, device=device)
 
 
-def pointwise(node, fn, *inputs, val=None):
-    val = node_val(node) if val is None else val
+def pointwise(fn, *inputs, val=None):
+    val = node_val() if val is None else val
     size, dtype, device = val_info(val)
-    loaders = [broadcast_loader(x, size) for x in inputs]
+    loaders = [
+        as_value_node(x, dtype, device).make_loader() for x in inputs
+    ]
 
     def inner(index):
         return fn(*[load(index) for load in loaders])
@@ -568,39 +580,45 @@ def _alpha(args, kwargs, position):
 
 
 @register("add.Tensor", "add.Scalar")
-def lower_add(node, a, b, *rest, **kwargs):
+def lower_add(a, b, *rest, **kwargs):
     alpha = _alpha((a, b, *rest), kwargs, 2)
     if alpha == 1:
-        return pointwise(node, ops.add, a, b)
-    return pointwise(node, lambda x, y: ops.add(x, ops.mul(y, ops.constant(float(alpha), "float32"))), a, b)
+        return pointwise(ops.add, a, b)
+    return pointwise(lambda x, y: ops.add(x, ops.mul(y, ops.constant(float(alpha), "float32"))), a, b)
 
 
 @register("sub.Tensor", "sub.Scalar")
-def lower_sub(node, a, b, *rest, **kwargs):
+def lower_sub(a, b, *rest, **kwargs):
     alpha = _alpha((a, b, *rest), kwargs, 2)
     if alpha == 1:
-        return pointwise(node, ops.sub, a, b)
-    return pointwise(node, lambda x, y: ops.sub(x, ops.mul(y, ops.constant(float(alpha), "float32"))), a, b)
+        return pointwise(ops.sub, a, b)
+    return pointwise(lambda x, y: ops.sub(x, ops.mul(y, ops.constant(float(alpha), "float32"))), a, b)
 
 
 @register("rsub.Scalar", "rsub.Tensor")
-def lower_rsub(node, a, b, *rest, **kwargs):
-    return pointwise(node, lambda x, y: ops.sub(y, x), a, b)
+def lower_rsub(a, b, *rest, **kwargs):
+    return pointwise(lambda x, y: ops.sub(y, x), a, b)
 
 
 @register("mul.Tensor", "mul.Scalar")
-def lower_mul(node, a, b):
-    return pointwise(node, ops.mul, a, b)
+def lower_mul(a, b):
+    return pointwise(ops.mul, a, b)
 
 
 @register("div.Tensor", "div.Scalar")
-def lower_div(node, a, b):
-    return pointwise(node, ops.truediv, a, b)
+def lower_div(a, b):
+    return pointwise(ops.truediv, a, b)
 
 
 def _unary(op_name):
-    def lower(node, x):
-        return pointwise(node, getattr(ops, op_name), x)
+    # Named rather than reached for now: which handler is active is not known
+    # until a region is being lowered, and a unary op is written down when the
+    # module is read rather than when a region is walked.  Resolving the name
+    # here would capture whatever was active at import, which is nothing.
+    fn = ops_wrapper(op_name)
+
+    def lower(x):
+        return pointwise(fn, x)
 
     return lower
 
@@ -615,33 +633,33 @@ for _name, _op in {
 
 
 @register("silu.default")
-def lower_silu(node, x):
+def lower_silu(x):
     # silu(x) = x * sigmoid(x)
-    return pointwise(node, lambda v: ops.mul(v, ops.sigmoid(v)), x)
+    return pointwise(lambda v: ops.mul(v, ops.sigmoid(v)), x)
 
 
 @register("silu_backward.default")
-def lower_silu_backward(node, grad, x):
+def lower_silu_backward(grad, x):
     # grad * s * (1 + x * (1 - s)),  s = sigmoid(x)
     def fn(g, v):
         s = ops.sigmoid(v)
         one = ops.constant(1.0, "float32")
         return ops.mul(ops.mul(g, s), ops.add(one, ops.mul(v, ops.sub(one, s))))
 
-    return pointwise(node, fn, grad, x)
+    return pointwise(fn, grad, x)
 
 
 @register("to.dtype", "to.device", "to.dtype_layout", "_to_copy.default")
-def lower_to(node, x, *args, **kwargs):
-    size, dtype, _ = val_info(node_val(node))
+def lower_to(x, *args, **kwargs):
+    size, dtype, _ = val_info(node_val())
     if is_tensor_box(x) and dtype_name(x.get_dtype()) == dtype_name(dtype) and not kwargs.get("copy", False):
         return x
-    return pointwise(node, lambda v: cast_to(v, dtype), x)
+    return pointwise(lambda v: cast_to(v, dtype), x)
 
 
 @register("clone.default", "contiguous.default")
-def lower_clone(node, x, *args, **kwargs):
-    return pointwise(node, lambda v: v, x)
+def lower_clone(x, *args, **kwargs):
+    return pointwise(lambda v: v, x)
 
 
 # ---------------------------------------------------------------------------
@@ -736,12 +754,12 @@ def _resolve_size(size, numel):
 
 
 @register("view.default", "reshape.default", "_unsafe_view.default", "view.dtype_unused")
-def lower_view(node, x, size):
+def lower_view(x, size):
     return reshape(x, _resolve_size(size, x.get_numel()))
 
 
 @register("permute.default")
-def lower_permute(node, x, dims):
+def lower_permute(x, dims):
     # A permutation is which axis each position is read along, so the view that
     # says so is told the order and works out the addressing from it.
     rank = len(x.get_size())
@@ -750,7 +768,7 @@ def lower_permute(node, x, dims):
 
 
 @register("permute_backward.default")
-def lower_permute_backward(node, grad, _input, dims):
+def lower_permute_backward(grad, _input, dims):
     rank = len(grad.get_size())
     dims = [normalize_dim(d, rank) for d in dims]
     inverse = [0] * rank
@@ -760,7 +778,7 @@ def lower_permute_backward(node, grad, _input, dims):
 
 
 @register("transpose.default", "transpose.int")
-def lower_transpose(node, x, d0, d1):
+def lower_transpose(x, d0, d1):
     rank = len(x.get_size())
     dims = list(range(rank))
     a, b = normalize_dim(d0, rank), normalize_dim(d1, rank)
@@ -769,12 +787,12 @@ def lower_transpose(node, x, d0, d1):
 
 
 @register("t.default")
-def lower_t(node, x):
+def lower_t(x):
     return lower_permute(node, x, list(reversed(range(len(x.get_size())))))
 
 
 @register("unsqueeze.default")
-def lower_unsqueeze(node, x, dim):
+def lower_unsqueeze(x, dim):
     # A dimension of extent one holds one element, so adding one names no
     # memory that was not already there.
     size = list(x.get_size())
@@ -784,7 +802,7 @@ def lower_unsqueeze(node, x, dim):
 
 
 @register("squeeze.dim", "squeeze.dims", "squeeze.default")
-def lower_squeeze(node, x, dim=None):
+def lower_squeeze(x, dim=None):
     size = list(x.get_size())
     rank = len(size)
     if dim is None:
@@ -803,7 +821,7 @@ def lower_squeeze(node, x, dim=None):
 
 
 @register("expand.default")
-def lower_expand(node, x, size, *args, **kwargs):
+def lower_expand(x, size, *args, **kwargs):
     # A dimension of extent one reads the same element everywhere, so growing
     # one needs no memory and no copy.  The view that says so has to be the one
     # that knows how a shorter shape lines up with a longer one, since a value
@@ -834,12 +852,12 @@ def _slice(x, dim, start, end, step):
 
 
 @register("slice.Tensor")
-def lower_slice(node, x, dim=0, start=None, end=None, step=1):
+def lower_slice(x, dim=0, start=None, end=None, step=1):
     return _slice(x, dim, start, end, step)
 
 
 @register("chunk.default")
-def lower_chunk(node, x, chunks, dim=0):
+def lower_chunk(x, chunks, dim=0):
     size = list(x.get_size())
     dim = normalize_dim(dim, len(size))
     piece = (size[dim] + chunks - 1) // chunks
@@ -852,7 +870,7 @@ def lower_chunk(node, x, chunks, dim=0):
 
 
 @register("split.Tensor")
-def lower_split(node, x, split_size, dim=0):
+def lower_split(x, split_size, dim=0):
     size = list(x.get_size())
     dim = normalize_dim(dim, len(size))
     out = []
@@ -864,7 +882,7 @@ def lower_split(node, x, split_size, dim=0):
 
 
 @register("split_with_sizes.default")
-def lower_split_with_sizes(node, x, sizes, dim=0):
+def lower_split_with_sizes(x, sizes, dim=0):
     size = list(x.get_size())
     dim = normalize_dim(dim, len(size))
     out = []
@@ -876,10 +894,10 @@ def lower_split_with_sizes(node, x, sizes, dim=0):
 
 
 @register("cat.default")
-def lower_cat(node, tensors, dim=0):
+def lower_cat(tensors, dim=0):
     """Concatenation as one pointwise loop selecting its source per index."""
 
-    size, dtype, device = val_info(node_val(node))
+    size, dtype, device = val_info(node_val())
     dim = normalize_dim(dim, len(size))
     inputs = [t for t in tensors if is_tensor_box(t) and t.get_size()[dim] > 0]
     if not inputs:
@@ -973,42 +991,42 @@ def make_reduction(x: TensorBox, dims, keepdim, dtype, device, rtype="sum", prol
 
 
 @register("sum.dim_IntList", "sum.default")
-def lower_sum(node, x, dims=None, keepdim=False, **kwargs):
-    size, dtype, device = val_info(node_val(node))
+def lower_sum(x, dims=None, keepdim=False, **kwargs):
+    size, dtype, device = val_info(node_val())
     if not dims:
         dims = list(range(len(x.get_size())))
     return make_reduction(x, dims, keepdim, dtype, device, "sum")
 
 
 @register("mean.dim")
-def lower_mean(node, x, dims, keepdim=False, **kwargs):
-    size, dtype, device = val_info(node_val(node))
+def lower_mean(x, dims, keepdim=False, **kwargs):
+    size, dtype, device = val_info(node_val())
     count = prod(x.get_size()[normalize_dim(d, len(x.get_size()))] for d in dims)
     total = make_reduction(x, dims, keepdim, dtype, device, "sum")
-    return pointwise(node, lambda v: ops.truediv(v, ops.constant(float(count), "float32")), total)
+    return pointwise(lambda v: ops.truediv(v, ops.constant(float(count), "float32")), total)
 
 
 @register("amax.default")
-def lower_amax(node, x, dims=None, keepdim=False, **kwargs):
-    size, dtype, device = val_info(node_val(node))
+def lower_amax(x, dims=None, keepdim=False, **kwargs):
+    size, dtype, device = val_info(node_val())
     if not dims:
         dims = list(range(len(x.get_size())))
     return make_reduction(x, dims, keepdim, dtype, device, "max")
 
 
 @register("amin.default")
-def lower_amin(node, x, dims=None, keepdim=False, **kwargs):
-    size, dtype, device = val_info(node_val(node))
+def lower_amin(x, dims=None, keepdim=False, **kwargs):
+    size, dtype, device = val_info(node_val())
     if not dims:
         dims = list(range(len(x.get_size())))
     return make_reduction(x, dims, keepdim, dtype, device, "min")
 
 
 @register("conv2d_grad_bias.default", "conv_grad_bias.default")
-def lower_conv_grad_bias(node, grad_out, *args):
+def lower_conv_grad_bias(grad_out, *args):
     """The bias gradient is the output gradient summed over all but channels."""
 
-    size, dtype, device = val_info(node_val(node))
+    size, dtype, device = val_info(node_val())
     rank = len(grad_out.get_size())
     return make_reduction(grad_out, [0] + list(range(2, rank)), False, dtype, device, "sum")
 
@@ -1025,8 +1043,8 @@ def _group_view(x: TensorBox, n, groups, row):
 
 
 @register("native_group_norm.default")
-def lower_native_group_norm(node, x, weight, bias, n, c, hxw, groups, eps):
-    out_val, mean_val, rstd_val = node_val(node)
+def lower_native_group_norm(x, weight, bias, n, c, hxw, groups, eps):
+    out_val, mean_val, rstd_val = node_val()
     out_size, out_dtype, device = val_info(out_val)
     stat_dtype = mean_val.dtype
     cpg = c // groups
@@ -1083,8 +1101,8 @@ def lower_native_group_norm(node, x, weight, bias, n, c, hxw, groups, eps):
 
 
 @register("native_group_norm_backward.default")
-def lower_native_group_norm_backward(node, grad_out, x, mean, rstd, gamma, n, c, hxw, groups, output_mask):
-    vals = node_val(node)
+def lower_native_group_norm_backward(grad_out, x, mean, rstd, gamma, n, c, hxw, groups, output_mask):
+    vals = node_val()
     cpg = c // groups
     device = grad_out.get_device()
     rank = len(x.get_size())
@@ -1243,7 +1261,6 @@ __all__ = [
     "user_lowerings",
     "select_decomp_table",
     "LOWERINGS",
-    "broadcast_loader",
     "fallback_handler",
     "make_reduction",
     "pointwise",
@@ -1280,7 +1297,7 @@ def _pool_output_size(extent: int, kernel: int, stride: int, padding: int,
 
 @register("upsample_nearest2d.default", "_upsample_nearest_exact2d.default",
           "upsample_nearest3d.default", "_upsample_nearest_exact3d.default")
-def lower_upsample_nearestnd(node, x, output_size, scales_h=None, scales_w=None,
+def lower_upsample_nearestnd(x, output_size, scales_h=None, scales_w=None,
                              **kwargs):
     """Nearest upsampling as an index remap of the source.
 
@@ -1289,7 +1306,7 @@ def lower_upsample_nearestnd(node, x, output_size, scales_h=None, scales_w=None,
     with whatever consumes it instead of standing on its own.
     """
 
-    size, dtype, device = val_info(node_val(node))
+    size, dtype, device = val_info(node_val())
     in_size = list(x.get_size())
     ndim = 3 if "3d" in target_name(node.target) else 2
     out_spatial = [int(s) for s in output_size][-ndim:]
@@ -1312,7 +1329,7 @@ def lower_upsample_nearestnd(node, x, output_size, scales_h=None, scales_w=None,
 
 
 @register("avg_pool2d.default", "avg_pool3d.default")
-def lower_avg_poolnd(node, x, kernel_size, stride=(), padding=0, ceil_mode=False,
+def lower_avg_poolnd(x, kernel_size, stride=(), padding=0, ceil_mode=False,
                      count_include_pad=True, divisor_override=None, **kwargs):
     """Average pooling as a window sum followed by the window's divisor.
 
@@ -1321,7 +1338,7 @@ def lower_avg_poolnd(node, x, kernel_size, stride=(), padding=0, ceil_mode=False
     the windows overlap heavily.
     """
 
-    size, dtype, device = val_info(node_val(node))
+    size, dtype, device = val_info(node_val())
     in_size = list(x.get_size())
     ndim = 3 if "3d" in target_name(node.target) else 2
     kernel = _pair(kernel_size, ndim)
@@ -1438,7 +1455,7 @@ def _pool_with_masked_divisor(node, total, prefix, spatial_out, kernel, stride,
 
 
 @register("index_add.default")
-def lower_index_add(node, base, dim, index_box, addend, alpha=None, **kwargs):
+def lower_index_add(base, dim, index_box, addend, alpha=None, **kwargs):
     """Accumulating along one axis, as the sum over that axis of what lands.
 
     A scattered position is a sum of the contributions that name it, so the
@@ -1449,7 +1466,7 @@ def lower_index_add(node, base, dim, index_box, addend, alpha=None, **kwargs):
     """
 
     dim = normalize_dim(int(dim), base.get_rank())
-    _, dtype, device = val_info(node_val(node))
+    _, dtype, device = val_info(node_val())
     out_size = [int(s) for s in base.get_size()]
     addend_size = [int(s) for s in addend.get_size()]
     if addend_size[dim] != int(index_box.get_size()[0]):
@@ -1486,7 +1503,7 @@ def lower_index_add(node, base, dim, index_box, addend, alpha=None, **kwargs):
         return landed
     # The scatter is a sum over what arrives, so the tensor it starts from is
     # added once, afterwards, rather than folded into every contribution.
-    return pointwise(node, lambda a, b: ops.add(a, b), base, landed)
+    return pointwise(lambda a, b: ops.add(a, b), base, landed)
 
 
 # ---------------------------------------------------------------------------
@@ -1528,7 +1545,7 @@ def _window_covers(index, rindex, prefix, stride, padding, kernel, f32):
 
 
 @register("avg_pool2d_backward.default", "avg_pool3d_backward.default")
-def lower_avg_poolnd_backward(node, grad, _input, kernel_size, stride=(), padding=0,
+def lower_avg_poolnd_backward(grad, _input, kernel_size, stride=(), padding=0,
                               ceil_mode=False, count_include_pad=True,
                               divisor_override=None, **kwargs):
     """The input's gradient as the sum of the windows that covered it.
@@ -1539,7 +1556,7 @@ def lower_avg_poolnd_backward(node, grad, _input, kernel_size, stride=(), paddin
     the same one the forward divided by, so the pair stays a pair.
     """
 
-    _, dtype, device = val_info(node_val(node))
+    _, dtype, device = val_info(node_val())
     ndim = 3 if "3d" in target_name(node.target) else 2
     kernel = _pair(kernel_size, ndim)
     stride = _pair(stride, ndim) if stride else list(kernel)
