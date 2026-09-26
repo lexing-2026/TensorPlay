@@ -47,6 +47,19 @@ class FusedStep(Step):
         self.launch([env[name] for name in self.ptr_names])
 
 
+class HostStep(Step):
+    """One group printed for the host: the runner allocates its own result."""
+
+    def __init__(self, launch, inputs: list[str], output: str):
+        super().__init__(set(inputs), {output})
+        self.launch = launch
+        self.inputs = list(inputs)
+        self.output = output
+
+    def run(self, env: dict) -> None:
+        env[self.output] = self.launch([env[name] for name in self.inputs])
+
+
 class ExternStep(Step):
     def __init__(self, kernel: ExternKernel):
         super().__init__(
@@ -309,4 +322,4 @@ def _output_tensor(out: Any, env: dict):
     return out
 
 
-__all__ = ["ExternStep", "FusedStep", "LoopProgram", "Step"]
+__all__ = ["ExternStep", "FusedStep", "HostStep", "LoopProgram", "Step"]

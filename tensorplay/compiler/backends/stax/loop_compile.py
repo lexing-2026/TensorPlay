@@ -84,7 +84,59 @@ def compile_graph(graph_module, example_inputs, *, scheduler: KernelScheduler | 
     return program
 
 
-__all__ = ["compile_graph", "compile_half", "stored_names"]
+def compile_half_host(graph_module, example_inputs, **options):
+    """Compile one graph half for the host, from the same IR.
+
+    The host prints a scheduled group with its own emitter and runs the result
+    through the same runtime the accelerator's kernels run through, so what a
+    region does is decided in one place and only the printing differs.
+    """
+
+    del options
+    from .codegen import loop_cpp
+    from .codegen.cpp import build_cpu_native_kernel
+    from .loop_runtime import ExternStep, HostStep, LoopProgram
+
+    graph = GraphLowering(graph_module, list(example_inputs)).run()
+    plan = KernelScheduler(graph)
+    graph.scheduler = plan
+    steps = []
+    for group in plan.fuse():
+        if not hasattr(group, "data"):
+            steps.append(ExternStep(group))
+            continue
+        stored = stored_names(plan, group)
+        try:
+            program = loop_cpp.flatten(group, graph.buffers, stored, graph)
+        except loop_cpp.HostPlanError as exc:
+            raise PlanError(str(exc)) from exc
+        shapes, strides = [], []
+        for name in program["inputs"]:
+            buffer = graph.buffers[name]
+            shapes.append(tuple(int(s) for s in buffer.get_size()))
+            strides.append(tuple(int(s) for s in buffer.layout.stride))
+        launch = build_cpu_native_kernel(
+            program["instructions"], program["constants"],
+            program["input_count"], program["output_ref"],
+            input_shapes=tuple(shapes), input_strides=tuple(strides),
+        )
+        if launch is None:
+            raise PlanError("the host emitter declined a group")
+        steps.append(HostStep(launch, program["inputs"], _stored_name(stored)))
+    program = LoopProgram(graph, steps)
+    program._tensorplay_codegen = "cpp"  # type: ignore[attr-defined]
+    program._tensorplay_backward_codegen = "cpp"  # type: ignore[attr-defined]
+    return program
+
+
+def _stored_name(stored) -> str:
+    names = sorted(stored)
+    if len(names) != 1:
+        raise PlanError("only a single-result group is printed on the host")
+    return names[0]
+
+
+__all__ = ["compile_graph", "compile_half", "compile_half_host", "stored_names"]
 
 
 

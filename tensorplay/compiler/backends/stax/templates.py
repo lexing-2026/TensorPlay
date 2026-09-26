@@ -36,6 +36,7 @@ them.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -211,6 +212,32 @@ class Layout:
         return f"Layout({self.dtype}, {self.size}, stride={self.stride})"
 
 
+class SymbolicGridFn:
+    """A grid function whose extents are symbolic rather than concrete.
+
+    A grid is asked for its shape before the shapes it depends on are known --
+    a tile that will be measured against several problems has to be able to say
+    how many programs it would take for each of them.  So the extents arrive
+    as expressions, and the function returns expressions; the caller
+    substitutes numbers when it finally launches.
+
+    The decoration is what records that a grid was written this way, so that
+    code which needs the distinction can see it without inferring it from the
+    body.
+    """
+
+    def __init__(self, fn):
+        self.fn = fn
+        self.symbolic = True
+        functools.update_wrapper(self, fn)
+
+    def __call__(self, *args, **kwargs):
+        return self.fn(*args, **kwargs)
+
+    def __get__(self, instance, owner=None):
+        return self
+
+
 @dataclass(frozen=True)
 class KernelInputs:
     """What a template is being asked to run.
@@ -231,6 +258,76 @@ class KernelInputs:
     @property
     def rank(self) -> int:
         return max((len(s) for s in self.shapes), default=0)
+
+    def mnk(self) -> tuple:
+        """The extents a product of these operands has."""
+
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class MMKernelInputs(KernelInputs):
+    """The operands of a product: two matrices, the second contracting with the
+    first.
+
+    The three extents are asked for by name because a heuristic sizing itself
+    to a product should not have to know which operand an extent came from, and
+    a caller writing a configuration should not have to repeat the order.
+    """
+
+    def mnk(self) -> tuple:
+        (m, k), (k2, n) = self.shapes[0], self.shapes[1]
+        if k != k2:
+            raise NotImplementedError("operands that do not share a contraction")
+        return m, n, k
+
+    def mnk_symbolic(self) -> tuple:
+        """The extents as written, for a grid that is sized before it is run."""
+
+        return self.mnk()
+
+    def is_contiguous(self) -> bool:
+        return bool(self.extra.get("qualifies", False))
+
+
+@dataclass(frozen=True)
+class ConvKernelInputs(KernelInputs):
+    """The operands of a convolution: an activation and a weight.
+
+    A convolution's product is over the input channels, but what it produces
+    is positions, so the extents a configuration is sized against are counted
+    differently from a product's: the positions of every image in the batch
+    together, because a tile does not care which image a position came from.
+    """
+
+    def mnk(self) -> tuple:
+        extra = self.extra
+        rows = extra.get("conv_rows")
+        cols = extra.get("out_channels")
+        inner = extra.get("in_channels_per_group")
+        if not (rows and cols and inner):
+            raise NotImplementedError("a convolution whose geometry is unknown")
+        return rows, cols, inner
+
+    def mnk_symbolic(self) -> tuple:
+        return self.mnk()
+
+    @property
+    def is_depthwise(self) -> bool:
+        """Each input channel reduced on its own: not a product at all."""
+
+        groups = int(self.extra.get("groups", 1) or 1)
+        return groups > 1 and self.extra.get("in_channels_per_group") == 1
+
+    def is_1x1(self) -> bool:
+        kernel = tuple(self.extra.get("kernel_size") or ())
+        stride = tuple(self.extra.get("stride") or ())
+        padding = tuple(self.extra.get("padding") or ())
+        return bool(kernel) and all(k == 1 for k in kernel) and all(
+            s == 1 for s in stride
+        ) and all(p == 0 for p in padding) and int(
+            self.extra.get("groups", 1) or 1
+        ) == 1 and not self.extra.get("transposed")
 
 
 # ---------------------------------------------------------------------------
