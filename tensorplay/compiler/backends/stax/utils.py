@@ -1862,6 +1862,17 @@ def get_sympy_Expr_dtype(val) -> Any:
     return tp.float64
 
 
+def prefix_is_reduction(prefix: str) -> bool:
+    """Whether a symbol's name marks it as one standing for a reduction axis.
+
+    A symbol says what it stands for in the letters its name begins with, and
+    a reduction axis is the one that begins with the letter for reductions, so
+    the question is a question about the name.
+    """
+
+    return prefix[0] == "r"
+
+
 def get_max_numwarps() -> int:
     """How many warps fit in one block on the device being compiled for.
 

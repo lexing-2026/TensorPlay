@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Generic, TypeVar
 
 import tensorplay as tp
@@ -169,6 +170,137 @@ def code_hash(code: str | bytes, extra: str | bytes = "") -> str:
     if extra:
         return CODE_CACHE_KEY_STRATEGY.key(code, extra)
     return CODE_CACHE_KEY_STRATEGY.key(code)
+
+
+def _load_python_module(key: str, path: str, set_sys_modules: bool = True):
+    """Build a module from a file of generated code.
+
+    The module is named after the key its code hashes to, so that the same code
+    always produces the same name, and the file it came from is recorded on it
+    so that clearing what was built can find it again.
+    """
+
+    with open(path) as f:
+        try:
+            code = compile(f.read(), path, "exec", dont_inherit=True)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to import {path}\n{type(e).__name__}: {e}"
+            ) from None
+        mod = ModuleType(f"{__name__}.{key}")
+        mod.__file__ = path
+        mod.key = key  # type: ignore[attr-defined]
+        exec(code, mod.__dict__, mod.__dict__)
+        if set_sys_modules:
+            sys.modules[mod.__name__] = mod
+        return mod
+
+
+class PyCodeCache:
+    """Generated Python modules, and where each came from.
+
+    A generated module is remembered by the code it was built from, so that
+    asking again for the same code gives back the module already built from it
+    rather than a second one.  Which modules are remembered is tracked here, so
+    that clearing what is remembered can also remove what was written to disk.
+    """
+
+    #: Every module handed out, in the order they were first asked for.
+    modules: list = []
+
+    #: Those asked for without anything attached to them; asking again for one
+    #: of these gives the same module back rather than building it twice.
+    modules_no_attr: dict = {}
+
+    #: Where each line of a module came from, so that a report about a line can
+    #: name what generated it.
+    linemaps: dict = {}
+
+    @classmethod
+    def write(cls, source_code: str, extra: str = "") -> tuple[str, str]:
+        return write(source_code, "py", extra=extra)
+
+    @classmethod
+    def load(
+        cls,
+        source_code: str,
+        extra: str = "",
+        *,
+        set_sys_modules: bool | None = None,
+    ):
+        """The module for this code, building it only if it is not already here.
+
+        What is remembered is the module, keyed by where it was written, so
+        that a second ask for the same code costs a dictionary lookup.
+        """
+
+        key, path = write(source_code, "py", extra=extra)
+        if path in cls.modules_no_attr:
+            mod = cls.modules_no_attr[path]
+            if set_sys_modules:
+                sys.modules.setdefault(mod.__name__, mod)
+            return mod
+        mod = _load_python_module(key, path)
+        if set_sys_modules:
+            sys.modules.setdefault(mod.__name__, mod)
+        cls.modules_no_attr[path] = mod
+        cls.modules.append(mod)
+        return mod
+
+    @classmethod
+    def cache_clear(cls, purge: bool = False) -> None:
+        """Forget the modules remembered here, and optionally what was written.
+
+        Purging removes what was written to disk, which is for the case where
+        the cache itself is being discarded rather than merely not trusted.
+        """
+
+        if purge:
+            for mod in cls.modules:
+                try:
+                    if not mod.__file__:
+                        raise AssertionError(f"Module {mod} has no __file__ attribute")
+                    os.remove(mod.__file__)
+                except FileNotFoundError:
+                    pass
+        cls.modules.clear()
+        cls.modules_no_attr.clear()
+        cls.linemaps.clear()
+
+
+def get_hash(content, extra: str = "", hash_type: str = "code") -> str:
+    """The name a piece of generated code is remembered under.
+
+    The content is stripped first, so that two pieces of code differing only in
+    surrounding whitespace are one piece of code and not two.
+    """
+
+    if hash_type == "code":
+        return code_hash(content, extra)
+    raise NotImplementedError(f"unknown hash type {hash_type}")
+
+
+def write(
+    content,
+    extension: str,
+    extra: str = "",
+    hash_type: str = "code",
+    specified_dir: str = "",
+    key: str | None = None,
+) -> tuple[str, str]:
+    """Put generated code where it can be found again, and say where.
+
+    What is written is only written when nothing is there already, so that a
+    second process asking for the same code finds the first one's copy rather
+    than replacing it.
+    """
+
+    if key is None:
+        key = get_hash(content.strip(), extra, hash_type)
+    basename, _subdir, path = get_path(key, extension, specified_dir)
+    if not os.path.exists(path):
+        write_atomic(path, content, make_dirs=True)
+    return basename, path
 
 
 def get_path(

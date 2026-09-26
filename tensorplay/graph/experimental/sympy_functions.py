@@ -2250,7 +2250,8 @@ class SymT(Enum):
     HALIDE = auto()
 
 
-_PREFIX_STR = {
+#: The letters a symbol's name begins with, one per kind of symbol.
+prefix_str = _PREFIX_STR = {
     SymT.SIZE: "s",
     SymT.UNBACKED_INT: "u",
     # The z is here so that a float prefix cannot be confused with a size one.
