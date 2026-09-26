@@ -366,6 +366,10 @@ _realize_opcount_threshold_default = 30
 realize_opcount_threshold: "int | None" = None
 realize_reads_threshold = 4
 realize_opusers_threshold = 5
+# A body written for a processor tolerates being larger than one written for an
+# accelerator, and putting a moderate expression in memory costs a whole buffer's
+# worth of traffic, which is why the two have answers of their own.
+realize_cpu_opcount_threshold = 50
 
 max_autotune = os.environ.get("TP_MAX_AUTOTUNE", "0") == "1"
 
