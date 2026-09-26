@@ -41,6 +41,7 @@ from .ir import (
     FixedLayout,
     FallbackKernel,
     IRNode,
+    PermuteView,
     Pointwise,
     Reduction,
     ReinterpretView,
@@ -654,16 +655,15 @@ def _underlying(box):
     """The node a box holds, with the boxes themselves peeled off.
 
     A box says what may still be written into a value; what is inside it is
-    the value.  A question about the value is a question about the node, so
-    the boxes are walked through rather than answered from.
+    the value.  Only boxes are peeled: a view is a value in its own right, and
+    reading past one would answer a question about a different shape than the
+    one asked about.
     """
 
-    from .ir import BaseView, MutableBox, StorageBox
+    from .ir import MutableBox
 
-    node = box.data if isinstance(box, TensorBox) else box
-    while not isinstance(node, StorageBox) and isinstance(node, (BaseView, MutableBox)):
-        node = node.data
-    if isinstance(node, StorageBox):
+    node = box
+    while isinstance(node, MutableBox):
         node = node.data
     return node
 
@@ -718,7 +718,7 @@ def reshape(x: TensorBox, new_size) -> TensorBox:
                 ),
             )
         )
-    return View.create(x, new_size)
+    return TensorBox(View.create(_underlying(x), new_size))
 
 
 def _resolve_size(size, numel):
@@ -736,17 +736,11 @@ def lower_view(node, x, size):
 
 @register("permute.default")
 def lower_permute(node, x, dims):
+    # A permutation is which axis each position is read along, so the view that
+    # says so is told the order and works out the addressing from it.
     rank = len(x.get_size())
     dims = [normalize_dim(d, rank) for d in dims]
-    size = [x.get_size()[d] for d in dims]
-    inverse = [0] * rank
-    for position, d in enumerate(dims):
-        inverse[d] = position
-
-    def reindex(index):
-        return [index[inverse[d]] for d in range(rank)]
-
-    return make_view(x, size, reindex)
+    return PermuteView.create(_underlying(x), tuple(dims))
 
 
 @register("permute_backward.default")
@@ -775,14 +769,12 @@ def lower_t(node, x):
 
 @register("unsqueeze.default")
 def lower_unsqueeze(node, x, dim):
+    # A dimension of extent one holds one element, so adding one names no
+    # memory that was not already there.
     size = list(x.get_size())
     dim = normalize_dim(dim, len(size) + 1)
     new_size = size[:dim] + [1] + size[dim:]
-
-    def reindex(index):
-        return list(index[:dim]) + list(index[dim + 1 :])
-
-    return make_view(x, new_size, reindex)
+    return View.create(_underlying(x), new_size)
 
 
 @register("squeeze.dim", "squeeze.dims", "squeeze.default")
@@ -798,26 +790,19 @@ def lower_squeeze(node, x, dim=None):
         dims = [d] if size[d] == 1 else []
     if not dims:
         return x
+    if dim is None:
+        return SqueezeView.create(_underlying(x))
     new_size = [s for d, s in enumerate(size) if d not in dims]
-
-    def reindex(index):
-        it = iter(index)
-        return [sympy.Integer(0) if d in dims else next(it) for d in range(rank)]
-
-    return make_view(x, new_size, reindex)
+    return View.create(_underlying(x), new_size)
 
 
 @register("expand.default")
 def lower_expand(node, x, size, *args, **kwargs):
-    size = [int(s) for s in size]
-    old = list(x.get_size())
-    offset = len(size) - len(old)
-    size = [old[d - offset] if s == -1 else s for d, s in enumerate(size)]
-
-    def reindex(index):
-        return [sympy.Integer(0) if old[k] == 1 else index[k + offset] for k in range(len(old))]
-
-    return make_view(x, size, reindex)
+    # A dimension of extent one reads the same element everywhere, so growing
+    # one needs no memory and no copy.  The view that says so has to be the one
+    # that knows how a shorter shape lines up with a longer one, since a value
+    # of fewer dimensions is lined up by its innermost axes.
+    return ExpandView.create(x, [int(s) for s in size])
 
 
 def _slice(x, dim, start, end, step):
@@ -837,13 +822,9 @@ def _slice(x, dim, start, end, step):
     new_size[dim] = (end - start + step - 1) // step
     if start == 0 and step == 1 and end == extent:
         return x
-
-    def reindex(index):
-        out = list(index)
-        out[dim] = index[dim] * step + start
-        return out
-
-    return make_view(x, new_size, reindex)
+    return SliceView.create(
+        _underlying(x), dim, start, end, step, clamp=True
+    )
 
 
 @register("slice.Tensor")
@@ -939,12 +920,21 @@ def lower_cat(node, tensors, dim=0):
 
 
 def make_reduction(x: TensorBox, dims, keepdim, dtype, device, rtype="sum", prologue=None) -> TensorBox:
+    # A lowering is handed a value, not a node: what may still be written into
+    # it is part of what it is, and realizing below is a question about the
+    # value rather than about whatever happens to be holding it.
+    if not isinstance(x, TensorBox):
+        x = TensorBox.create(x)
     src_dtype = x.get_dtype()
     size = list(x.get_size())
     rank = len(size)
     dims = sorted({normalize_dim(d, rank) for d in dims})
     out_ranges = [size[d] for d in range(rank) if d not in dims]
     red_ranges = [size[d] for d in dims]
+    # A body is only ever recorded over a value that is settled: the loader
+    # reads memory through the value's layout, and a layout that may still
+    # change is not one to read through.  Realizing settles it.
+    x.realize()
     loader = x.make_loader()
 
     def inner(index, rindex):

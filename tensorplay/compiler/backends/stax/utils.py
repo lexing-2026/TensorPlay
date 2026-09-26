@@ -18,7 +18,12 @@ import math
 import operator
 import sys
 import textwrap
+import logging
+
 import tensorplay as tp
+
+
+log = logging.getLogger(__name__)
 from dataclasses import dataclass
 from io import StringIO
 from typing import NamedTuple
@@ -1547,4 +1552,205 @@ class Counters:
 
 counters = Counters()
 counters["inductor"]
+
+
+#: The name a measured call is recorded under, so that the device work belonging
+#: to one repetition can be told from the device work belonging to the cache
+#: clearing around it.  A name rather than a time window because the two are
+#: recorded on different sides of the device and are matched by what was running,
+#: not by when.
+_DO_BENCH_PROFILE_EVENT_NAME = "inductor_do_bench_using_profiling"
+
+
+def _gpu_device_module() -> Any:
+    """The module that talks to the device being measured on.
+
+    Which module that is depends on the device, and the operations needed here --
+    waiting for the device, an event that can be timed, whether the device is
+    there at all -- are the same set on each of them under a different name.
+    """
+
+    from .runtime.benchmarking import _get_default_gpu_device_type
+
+    return getattr(tp, _get_default_gpu_device_type())
+
+
+def do_bench_using_profiling(
+    fn: Callable[[], Any],
+    warmup: int = 25,
+    rep: int = 100,
+    is_vetted_benchmarking: bool = False,
+) -> float:
+    """How long a call takes on the device, read off a profiler trace.
+
+    A clock around a call says how long the call took to be asked for and
+    answered, which for a call that waits is mostly the waiting.  A trace says
+    how long the device was busy, which is the part that a faster kernel would
+    actually save.  Which of the two is wanted depends on what the number is for,
+    so both are available and this one is asked for by name.
+
+    The benchmarking lock and the distortion guard are applied here rather than
+    around the call site, because a second measurement running at the same time
+    makes this one wrong in a way no caller can detect from its own result.
+    """
+
+    from .runtime.benchmarking import (
+        gpu_benchmark_lock,
+        may_distort_benchmarking_result,
+    )
+
+    locked_bench = gpu_benchmark_lock(_do_bench_using_profiling)
+    return may_distort_benchmarking_result(locked_bench)(
+        fn, warmup, rep, is_vetted_benchmarking
+    )
+
+
+def _get_do_bench_profile_result(
+    kineto_events: Iterable[Any],
+    profiler_events: Iterable[Any],
+    n_repeat: int,
+    expected_device_type: Any,
+) -> float:
+    """The device time of the measured calls, in milliseconds.
+
+    Two sets of events have to be brought together.  The first says what the
+    device did and when; the second says what each of those pieces of work was
+    asked for by.  A piece of device work counts towards this measurement when
+    the call that asked for it is one of the measured calls, which is what the
+    correlation between the two sets says -- so the measured calls are marked,
+    their own children are marked with them since a call that waits has work
+    under it, and then the device work is added up over the marks.
+    """
+
+    benchmark_event_ids: set = set()
+
+    def collect_cpu_event_ids(event: Any) -> None:
+        if event.device_type != tp.DeviceType.CPU:
+            return
+        benchmark_event_ids.add(event.id)
+        for child in event.cpu_children:
+            collect_cpu_event_ids(child)
+
+    benchmark_events = [
+        event
+        for event in profiler_events
+        if event.name == _DO_BENCH_PROFILE_EVENT_NAME
+        and event.device_type == tp.DeviceType.CPU
+    ]
+    if len(benchmark_events) != n_repeat:
+        raise RuntimeError(
+            f"Expected {n_repeat} {_DO_BENCH_PROFILE_EVENT_NAME} profiling "
+            f"events. Found {len(benchmark_events)} events."
+        )
+
+    for event in benchmark_events:
+        collect_cpu_event_ids(event)
+
+    device_time_us = 0.0
+    for event in kineto_events:
+        linked_correlation_id = event.linked_correlation_id()
+        correlation_id = event.correlation_id()
+        activity_type = event.activity_type()
+        if (
+            event.device_type() == expected_device_type
+            and activity_type != "gpu_user_annotation"
+            and (
+                linked_correlation_id in benchmark_event_ids
+                or (
+                    linked_correlation_id == 0
+                    and correlation_id in benchmark_event_ids
+                )
+            )
+            and event.name() != "Context Sync"
+        ):
+            device_time_us += (event.end_ns() - event.start_ns()) / 1000.0
+
+    if device_time_us <= 0:
+        raise RuntimeError(
+            f"Failed to capture device events for "
+            f"{_DO_BENCH_PROFILE_EVENT_NAME}."
+        )
+
+    return device_time_us / 1000.0 / n_repeat
+
+
+def _do_bench_using_profiling(
+    fn: Callable[[], Any],
+    warmup: int = 25,
+    rep: int = 100,
+    is_vetted_benchmarking: bool = False,
+) -> float:
+    """How long a call takes on the device, in milliseconds.
+
+    The call is run once to see whether it works at all, then five more times to
+    find out roughly how long it takes, and the number of repetitions in each of
+    the warmup and the measured parts is then chosen to fill the requested time
+    rather than taken as given: a call that takes a millisecond and a call that
+    takes a second are both worth measuring, and a fixed repetition count
+    measures the first for a second and the second for a millisecond.
+
+    The cache is cleared before each repetition, because a repetition that reads
+    what the one before it wrote measures the memory system rather than the call.
+    """
+
+    from .runtime.benchmarking import may_ban_benchmarking
+
+    if not is_vetted_benchmarking:
+        may_ban_benchmarking()
+
+    device_module = _gpu_device_module()
+    device_type = device_module.__name__.rsplit(".", 1)[-1]
+    device_type_upper = device_type.upper()
+    fn()
+    device_module.synchronize()
+    cache = tp.empty(int(256e6 // 4), dtype=tp.int32, device=device_type)
+
+    # Roughly how long one call takes, which is what the repetition counts are
+    # derived from.
+    start_event = device_module.Event(enable_timing=True)
+    end_event = device_module.Event(enable_timing=True)
+    start_event.record()
+    for _ in range(5):
+        cache.zero_()
+        fn()
+    end_event.record()
+    device_module.synchronize()
+    estimate_ms = start_event.elapsed_time(end_event) / 5
+
+    n_warmup = max(1, int(warmup / estimate_ms))
+    n_repeat = max(1, int(rep / estimate_ms))
+
+    for _ in range(n_warmup):
+        fn()
+
+    device_module.synchronize()
+    profile_activity = getattr(tp.profiler.ProfilerActivity, device_type_upper)
+    with tp.profiler.profile(
+        activities=[tp.profiler.ProfilerActivity.CPU, profile_activity],
+    ) as profile:
+        for _ in range(n_repeat):
+            cache.zero_()
+            with tp.profiler.record_function(_DO_BENCH_PROFILE_EVENT_NAME):
+                fn()
+        device_module.synchronize()
+
+    log.debug("raw events")
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug(
+            profile.key_averages().table(
+                sort_by="self_device_time_total", row_limit=-1
+            )
+        )
+
+    result = _get_do_bench_profile_result(
+        profile.profiler.kineto_results.events(),
+        profile.events(),
+        n_repeat,
+        getattr(tp.DeviceType, device_type_upper),
+    )
+
+    log.debug("profiling time breakdown")
+    log.debug("profiling results: %s ms", result)
+    return result
+
 

@@ -239,6 +239,10 @@ def _resolve(value: Any, env: dict) -> Any:
         return tp.as_strided(base, layout.size, layout.stride, layout.offset)
     if isinstance(value, (Buffer, ExternOutput)):
         return env[value.name]
+    # A view's source is itself a value, and it is read by the name it was
+    # written under rather than by what it is.
+    if hasattr(value, "get_name") and value.get_name() in env:
+        return env[value.get_name()]
     if isinstance(value, (list, tuple)):
         return type(value)(_resolve(item, env) for item in value)
     if isinstance(value, dict):

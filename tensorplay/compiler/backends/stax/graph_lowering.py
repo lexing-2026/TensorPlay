@@ -776,7 +776,9 @@ class GraphLowering:
                 out = ExternOutput(None, layout, kernel, path)
                 self.register_buffer(out, set_name=True)
                 kernel.outputs.append(out)
-                return TensorBox(out)
+                # Boxed the way every value is, so that what holds this result
+                # is a place memory can be given rather than the result itself.
+                return TensorBox.create(out)
             if isinstance(val, (list, tuple)):
                 return tuple(wrap(v, path + (i,)) for i, v in enumerate(val))
             return val
@@ -787,6 +789,20 @@ class GraphLowering:
     def run(self):
         with set_ops_handler(DeferredOps()), set_graph(self):
             return self._run()
+
+    def finalize(self) -> None:
+        """Settle every buffer's layout, now that the region is all known.
+
+        A buffer's layout may still change while the region is being lowered,
+        because a later operation can still say what shape it wants.  Once the
+        region is complete nothing can, so each one is decided here: what the
+        shape is and in what order the elements lie.  Deciding it later, at the
+        point a kernel first reads the buffer, is what makes a layout change
+        visible to code that has already been written against the old one.
+        """
+
+        for buf in self.buffers:
+            buf.decide_layout()
 
     def _run(self):
         graph = self.graph_module.graph
@@ -820,7 +836,9 @@ class GraphLowering:
         # Starting from the returned values and producing what they name makes
         # the table advisory: a value nothing returns is never produced, and
         # a value that is produced is produced once.
-        return self._run_outputs(graph)
+        result = self._run_outputs(graph)
+        self.finalize()
+        return result
 
     def lower_node(self, value):
         """A value, or a node naming one, as the value it stands for.

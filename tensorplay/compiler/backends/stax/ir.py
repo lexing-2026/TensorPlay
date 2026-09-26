@@ -628,6 +628,9 @@ class IRNode:
                 InputBuffer,
                 ReinterpretView,
                 TemplateBuffer,
+                # A library call's result is written by the call itself, so it
+                # is somewhere to read from before anything asks it to compute.
+                ExternOutput,
             ),
         )
 
@@ -6262,7 +6265,14 @@ class ExternKernel(InputsKernel):
         # checks.
         _vars = index_args[0] if index_args else []
         range_vars = _vars[0] if _vars and isinstance(_vars[0], (list, tuple)) else _vars
-        index = sympy.expand(x.make_indexer()(range_vars))
+        try:
+            index = sympy.expand(x.make_indexer()(range_vars))
+        except (AssertionError, NotImplementedError, TypeError) as exc:
+            # The view has no indexer over these extents, so there is nothing
+            # to describe; the caller copies the value instead.
+            raise NotImplementedError(
+                f"the view's index could not be evaluated: {exc}"
+            ) from exc
         strides = []
         for var in range_vars:
             poly = sympy.Poly(index, var)
