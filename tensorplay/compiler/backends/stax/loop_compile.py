@@ -128,12 +128,18 @@ def compile_half_host(graph_module, example_inputs, **options):
             buffer = graph.name_to_buffer[name]
             shapes.append(tuple(int(s) for s in buffer.get_size()))
             strides.append(tuple(int(s) for s in buffer.layout.stride))
+        # What the group writes can cover a different number of elements than
+        # it reads -- a window onto its input is one -- and a kernel that walks
+        # its operands in step cannot produce that, so the result's extents
+        # travel with the program and the emitter decides whether it can.
+        result = graph.name_to_buffer[_stored_name(stored)]
         # The layouts pin the specialization, so a call whose operands do not
         # match them is not this kernel.
         launch = build_cpu_native_kernel(
             program["instructions"], program["constants"],
             program["input_count"], program["output_ref"],
             input_shapes=tuple(shapes), input_strides=tuple(strides),
+            shape=tuple(int(s) for s in result.get_size()),
         )
         if launch is None:
             raise PlanError("the host emitter declined a group")

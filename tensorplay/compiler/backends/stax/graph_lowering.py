@@ -606,6 +606,12 @@ class GraphLowering:
             # reads it is handed that buffer rather than the description of
             # which slot of the call's result it was.
             return self.get_buffer(node.name)
+        if isinstance(node, TensorBox):
+            # Still held in a box, so the box is what has to be given a buffer;
+            # a value walked into memory rather than read as a window arrives
+            # here, and a caller reading it wants the buffer it landed in.
+            node.realize()
+            return self.get_buffer(node.get_name())
         inner = node.data if isinstance(node, TensorBox) else node
         if isinstance(inner, StorageBox):
             inner.realize()

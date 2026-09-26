@@ -46,6 +46,7 @@ from ..kernel_scheduler import (
 from ..sizevars import stride_at_vec_range
 from ..utils import (
     cache_on_self,
+    counters,
     get_bounds_index_expr,
     get_fused_kernel_name,
     get_num_threads,
@@ -7058,6 +7059,15 @@ def build_cpu_native_kernel(
         # The inputs state extents that do not agree: a broadcast, which is
         # not one run of memory this prints.
         return None
+    if out_shape is not None and input_shapes:
+        # The phases read and write in lockstep, one element of the result per
+        # element of each operand.  A result covering a different number of
+        # elements -- a window onto an operand, say -- does not line up with
+        # them, and the element that belongs at a position is not the element
+        # that is there, so this is declined rather than printed wrongly.
+        operand_elements = {_elements(extent) for extent in input_shapes}
+        if len(operand_elements) != 1 or _elements(out_shape) not in operand_elements:
+            return None
     # A shape nobody stated is read off the tensors at run time, so the count
     # is only fixed here when one was stated.
     count = _elements(out_shape) if out_shape is not None else 0

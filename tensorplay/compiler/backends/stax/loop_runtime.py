@@ -15,7 +15,7 @@ from typing import Any
 
 import tensorplay as tp
 
-from .ir import Buffer, ComputedBuffer, ConstantBuffer
+from .ir import Buffer, ComputedBuffer, ConstantBuffer, StorageBox, TensorBox
 from .ir import ReinterpretView
 from .loops import ExternKernel, ExternOutput
 
@@ -342,6 +342,11 @@ def _output_tensor(out: Any, env: dict):
         )
     if isinstance(out, (Buffer, ExternOutput)):
         return env[out.name]
+    if isinstance(out, (TensorBox, StorageBox)):
+        # A value that is still held rather than materialized is read from
+        # where it was written; handing one back whole would give the caller
+        # the description of a value instead of the value.
+        return env[out.get_name()]
     return out
 
 
