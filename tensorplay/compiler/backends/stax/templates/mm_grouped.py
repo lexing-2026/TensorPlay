@@ -30,9 +30,14 @@ from ..op_lowerings import register_lowering
 from ..codegen.cutedsl.cutedsl_template import CuteDSLTemplate
 from ..kernel_inputs import KernelInputs, MMKernelInputs
 from ..ir import Layout
-from .mm_common import check_supported_striding
+from .mm_common import (
+    check_supported_striding,
+    use_aten_gemm_kernels,
+    use_triton_template,
+)
 from .select_algorithm import (
     ChoiceCaller,
+    realize_inputs,
     ExternChoiceCaller,
     ExternKernelChoice,
     KernelArgs,
@@ -42,6 +47,7 @@ from .select_algorithm import (
 )
 from .triton import CHOICES, dtype_size
 from ..heuristics.template.cutedsl import get_groupgemm_configs
+from ..runtime.triton_compat import tl
 from ..utils import get_gpu_shared_memory, get_max_num_sms, get_num_sms, has_free_symbols
 from ..virtualized import V
 from .mm import (

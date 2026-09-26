@@ -409,6 +409,21 @@ has_lapack = True
 has_spectral = True
 compiled_with_cxx11_abi = True
 
+def getArtifactLogger(name: str, artifact: str):
+    """A logger for one named artifact, separate from the module's own.
+
+    A piece of work that leaves something behind -- a trace, a set of choices,
+    a schedule -- is worth being able to look at on its own, without the rest of
+    what the module says.  So a logger is named for the artifact rather than for
+    the place, and can be turned on and off without turning anything else on or
+    off with it.
+    """
+
+    import logging
+
+    return logging.getLogger(f"{name}.{artifact}")
+
+
 __all__ = [
     "Tensor", "tensor", "from_dlpack", "Scalar", "SymInt", "SymBool", "SymFloat",
     "sym_float", "sym_int", "sym_not", "sym_min", "sym_max", "sym_ite", "sym_sum",
@@ -436,6 +451,7 @@ __all__ = [
     "get_rng_state", "set_rng_state", "fork_rng", "thread_safe_generator",
     "DeviceMismatchError",
     "cond", "while_loop",
+    "getArtifactLogger",
     "__config__",
 ]
 

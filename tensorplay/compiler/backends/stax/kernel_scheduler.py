@@ -24,6 +24,7 @@ import math
 import pprint
 import sys
 import textwrap
+import typing
 from collections.abc import Sequence
 from typing import Any, Callable, Optional, cast
 
@@ -50,7 +51,14 @@ from .ir import (
 from . import metrics
 from .loops import LoopBody, V
 from .sizevars import SimplifyIndexing
-from ....graph.experimental.sympy_functions import FloorDiv, Identity, SymT
+from .utils import sympy_index_symbol, sympy_subs
+from ....graph.experimental.sympy_functions import (
+    FloorDiv,
+    Identity,
+    SymT,
+    is_power_of_2,
+    symbol_is_type,
+)
 from .memory import (
     FreeableInputBuffer,
     MemoryPlanningInfoForBuffer,

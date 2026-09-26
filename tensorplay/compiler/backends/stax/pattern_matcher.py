@@ -63,6 +63,8 @@ from .utils import counters
 from tensorplay.primitives.common import is_integer_dtype
 from tensorplay._higher_order_ops._hop_base import (
     FakeTensorMode,
+    disable_functional_mode,
+    disable_proxy_modes_tracing,
     is_fake_tensor,
     maybe_get_fake_constant,
 )
@@ -642,7 +644,7 @@ def _constant_values_equal(a: Any, b: Any) -> bool:
         if a_constant is None or b_constant is None:
             return False
         try:
-            with unset_fake_temporarily():
+            with disable_functional_mode():
                 return _tensor_values_equal(a_constant, b_constant)
         except (RuntimeError, TypeError, ValueError):
             return False
@@ -688,7 +690,7 @@ def _tensor_constant_repr(value: Any) -> str:
         raise NotImplementedError("NYI: serializing tensor that requires grad")
     if not value.is_contiguous() or value.storage_offset() != 0:
         raise NotImplementedError("NYI: serializing non-contiguous get_attr tensor")
-    with unset_fake_temporarily():
+    with disable_functional_mode():
         if data_value.device.type != "cpu":
             cpu_value = data_value.detach().cpu()
         else:
@@ -2887,7 +2889,7 @@ def fwd_only(
     # TODO - look into using aot autograd, asserting no mutating ops here
     with (
         compiler_config.patch(compile_on_one_rank=False),
-        enable_python_dispatcher(),
+        disable_proxy_modes_tracing(),
         preserve_node_meta(),
     ):
         gm = make_fx(fn, get_decomp_fn(), tracing_mode="real")(*args)

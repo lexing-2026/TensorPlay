@@ -32,6 +32,22 @@ if triton is not None:
             continue
     HAS_WARP_SPEC = knobs is not None and hasattr(knobs, "warp_specialize")
 
+    def has_triton_block_ptr() -> bool:
+        """Whether the runtime can address a tile by a pointer into it.
+
+        A tile can be named either by computing each element's place or by
+        being pointed at, and the second is both faster and a different shape of
+        kernel. Which one is available is a property of the runtime that has
+        moved between versions, so it is asked for rather than assumed, and a
+        runtime that cannot say is taken not to have it.
+        """
+
+        try:
+            from triton.language import block_ptr
+        except ImportError:
+            return False
+        return block_ptr is not None
+
     try:
         from triton.runtime.cache import triton_key
     except ImportError:
@@ -99,6 +115,11 @@ else:  # pragma: no cover - the kernel-writing runtime is absent
     KernelInterface = None
     knobs = None
     HAS_WARP_SPEC = False
+
+    def has_triton_block_ptr() -> bool:
+        """No kernel-writing runtime, so no way to point at a tile."""
+
+        return False
     IntelGPUError = None
     libdevice = None
     math = None

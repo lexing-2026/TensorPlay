@@ -7,6 +7,7 @@ from collections.abc import Iterable, Iterator
 from typing import Any
 
 import tensorplay as tp
+from ....._higher_order_ops._hop_base import is_fake_tensor
 from tensorplay.graph import Graph, GraphModule, Node
 from ..utils import OPTIMUS_EXCLUDE_POST_GRAD, counters, is_node_meta_valid
 from ..compile_log import trace_structured
@@ -509,10 +510,10 @@ class BatchLinearLHSFusion(BatchFusion):
             # do provide the concatenation (e.g. a tensor subclass of a later version)
             # still get fused.
             weight_val = weight.meta.get("example_value", weight.meta.get("val"))
-            if weight_val is not None and type(weight_val) not in (
-                tp.Tensor,
-                FakeTensor,
-            ):
+            # a real value, and not a stand-in for one: what follows reads the
+            # value to see whether it can be concatenated at all, which is only
+            # worth asking about something that holds data
+            if weight_val is not None and tp.is_tensor(weight_val) and not is_fake_tensor(weight_val):
                 try:
                     _ = tp.cat([weight_val[:1], weight_val[:1]], dim=0)
                 except (RuntimeError, TypeError):

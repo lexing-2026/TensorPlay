@@ -13,6 +13,12 @@ written anywhere else would have to be told that.
 
 from __future__ import annotations
 
+import contextlib
+import logging
+import time
+
+log = logging.getLogger(__name__)
+
 import functools
 import operator
 from typing import Any, Hashable
@@ -140,6 +146,35 @@ def triton_hash_to_path_key(key: str) -> str:
             return _base32(key)
         except Exception:
             return key
+
+
+@contextlib.contextmanager
+def timed_block(name: str, log_pt2_compile_event: bool = False):
+    """How long a named piece of work took, and where it was spent.
+
+    A pass that runs for a long time is worth knowing the name of, and a pass
+    that runs for a short time is worth knowing was not the one that ran for a
+    long time.  The name is therefore always recorded, and the elapsed time is
+    left to whoever reads the log rather than printed from here, so that a
+    caller can decide what a duration means for the work it asked about.
+
+    ``log_pt2_compile_event`` says the work is a compilation step whose length
+    is worth keeping even when nothing failed; without it the duration is
+    recorded at the level that a failure would show, so that a normal run is
+    not full of numbers nobody asked for.
+    """
+
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - start
+        log.log(
+            logging.DEBUG if not log_pt2_compile_event else logging.INFO,
+            "%s took %.3fs",
+            name,
+            elapsed,
+        )
 
 
 def get_max_y_grid() -> int:

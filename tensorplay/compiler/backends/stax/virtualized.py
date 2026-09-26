@@ -284,6 +284,30 @@ class OpsValue:
     def __init__(self, value):
         self.value = value
 
+    @staticmethod
+    def _unwrap(x):
+        """The value inside, however many are wrapped.
+
+        A sequence is taken apart rather than refused, because an operation is
+        handed whatever was written and a written expression may hold a tuple of
+        them; unwrapping only the outermost would leave the rest wrapped and the
+        arithmetic underneath would then be applied to the wrapper.
+        """
+
+        if isinstance(x, (list, tuple)):
+            return tuple(OpsValue._unwrap(v) for v in x)
+        if isinstance(x, OpsValue):
+            return x.value
+        return x
+
+    @staticmethod
+    def _wrap(x):
+        """The value wrapped, however many there are, for the same reason."""
+
+        if isinstance(x, (list, tuple)):
+            return tuple(OpsValue(v) for v in x)
+        return OpsValue(x)
+
     def __str__(self):
         return str(self.value)
 

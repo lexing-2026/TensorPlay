@@ -33,6 +33,7 @@ from tensorplay.graph.experimental.sympy_functions import (
 
 from ..utils import counters
 from .. import config, ir
+from ..virtualized import OpsValue
 from .. import kernel_scheduler as scheduler
 from ..analyze_preserves_zero_mask import prologue_preserves_zero_mask
 from ..codecache import code_hash, PyCodeCache
@@ -1272,14 +1273,14 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         raise NotImplementedError("NYI: call_kernel")
 
     @contextlib.contextmanager
-    def mask_loads(self, mask: str | OpsWrapper, value: int | float) -> Iterator[str]:
+    def mask_loads(self, mask: str | OpsValue, value: int | float) -> Iterator[str]:
         """Context manager to add an additional mask to tl.load/store"""
         prior = self._load_mask
         prior_val = self._load_other
         if prior:
             mask = ops.logical_and(mask, prior)
 
-        mask = OpsWrapper._unwrap(mask)
+        mask = OpsValue._unwrap(mask)
         self._load_mask = mask
         self._load_other = value
         try:
@@ -1474,14 +1475,14 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         dx = ops.sub(value, mean)
         dx2 = ops.mul(dx, dx)
         m2 = ops.reduction(dtype, dtype, "sum", dx2)
-        return OpsWrapper._unwrap((mean, m2, rnumel))
+        return OpsValue._unwrap((mean, m2, rnumel))
 
     def prepare_softmax_twopass_fallback(self, dtype, value):
         vmax = ops.reduction(dtype, dtype, "fmax", value)
         sub = ops.sub(value, vmax)
         exp = ops.exp(sub)
         vsum = ops.reduction(dtype, dtype, "sum", exp)
-        return OpsWrapper._unwrap((vmax, vsum))
+        return OpsValue._unwrap((vmax, vsum))
 
     def codegen_kernel(self):
         raise NotImplementedError

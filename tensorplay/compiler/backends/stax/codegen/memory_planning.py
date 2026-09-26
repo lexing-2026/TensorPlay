@@ -5,11 +5,17 @@ import collections
 import dataclasses
 import itertools
 import pprint
+
+import sympy
+
+import tensorplay as tp
 from typing import Any, Protocol, TYPE_CHECKING
 
 from tensorplay.graph.experimental.symbolic_shapes import free_unbacked_symbols
+from .....graph.experimental.sympy_functions import OrderedSet
 
 from .. import config
+from ..utils import sympy_index_symbol
 from ..utils import _align, align, cache_on_self, CachedMethod, IndentedBuffer
 from ..loops import V
 from .wrapper import (
@@ -322,7 +328,7 @@ class TemporalSplit(ClearCacheOnAllocateMixin, AllocationTreeNode):
     def get_symbolic_size(self) -> sympy.Expr:
         if not self.allocations:
             return 0  # type: ignore[return-value]
-        return Max(*[x.get_symbolic_size() for x in self.allocations])
+        return sympy.Max(*[x.get_symbolic_size() for x in self.allocations])
 
     def is_empty(self):
         return len(self.allocations) == 1 and self.allocations[0].is_empty()

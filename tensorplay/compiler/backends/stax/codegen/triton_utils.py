@@ -10,6 +10,9 @@ import tensorplay as tp
 
 from .. import config
 from ..runtime.hints import AttrsDescriptorWrapper, DeviceProperties
+from ..runtime.triton_compat import has_triton_block_ptr
+from .. import ir
+from .....graph.experimental.sympy_functions import SymT, symbol_is_type
 from ..utils import (
     _type_of,
     device_supports_fp64,
