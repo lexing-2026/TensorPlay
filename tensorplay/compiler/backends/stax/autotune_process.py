@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Measuring a candidate kernel, in a process of its own when it may crash.
 
 A candidate is measured by building the tensors its metadata describes,
@@ -13,13 +15,22 @@ the child allocates its own tensors from that geometry, so two measurements of
 the same candidate are of the same work even though the data differs.
 """
 
-from __future__ import annotations
+import tensorplay as tp
 
+
+from . import config
+from .compile_worker.timer import Timer
+from .utils import apply_subprocess_env, clear_caches
+import atexit
 import ctypes
 import functools
 import logging
+import multiprocessing as mp
+import os
+import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -513,3 +524,237 @@ class CppBenchmarkRequest(CPUDeviceBenchmarkMixin, BenchmarkRequest):
 
     def __str__(self) -> str:
         return f"{self.kernel_name=}"
+
+
+
+# ---------------------------------------------------------------------------
+# the pool that measures kernels
+# ---------------------------------------------------------------------------
+
+
+#: How long a pool may sit with nothing to do before it stops itself.
+#:
+#: Measured candidates are expensive and a burst of them is followed by a long
+#: quiet period, so a pool left over from a burst holds workers for nothing.
+#: Zero turns the stopping off, which is what a machine that should keep its
+#: workers between runs asks for.
+AUTOTUNE_POOL_INACTIVITY_TIMEOUT = int(
+    os.environ.get("TP_AUTOTUNE_POOL_INACTIVITY_TIMEOUT", "600")
+)
+
+autotuning_log = tp.getArtifactLogger(__name__, "autotuning")
+
+
+def _cache_env_for_subprocess() -> dict[str, str | None]:
+    env_vars = [
+        "TP_CACHE_DIR",
+        "TP_TRITON_CACHE_DIR",
+        "TP_FLYDSL_RUNTIME_CACHE_DIR",
+    ]
+    return {v: os.environ.get(v) for v in env_vars}
+
+
+# The environment last applied to this process, so that a change is applied
+# once rather than at every task.  Compared whole: applying it again would be
+# harmless, and emptying the caches again would not be.
+_last_applied_cache_env: dict[str, str | None] | None = None
+
+
+def _apply_subprocess_env_and_clear_caches(
+    extra_env: dict[str, str | None] | None,
+) -> None:
+    global _last_applied_cache_env
+
+    if extra_env is None:
+        return
+
+    if extra_env != _last_applied_cache_env:
+        clear_caches()
+        _last_applied_cache_env = extra_env.copy()
+    apply_subprocess_env(extra_env)
+
+
+def _init_autotune_subprocess(fp32_precision: Any) -> bool:
+    """What a worker does before it is given anything to measure.
+
+    Two things, both of which would otherwise be paid for by the first
+    measurement rather than before it.  The context for the device has to
+    exist, and creating it takes long enough to be worth doing while nothing
+    is being timed.  And the setting that says whether single-precision
+    matmul goes to the tensor cores has to be the one the parent measured
+    under, or the measurement is of different work than the one the choice
+    was about.
+    """
+    if tp.cuda.is_available():
+        tp.zeros(1, device="cuda")
+
+    tp.backends.cuda.matmul.allow_tf32 = bool(fp32_precision)
+
+    return True
+
+
+def _run_with_subprocess_env(
+    fn: Callable[..., Any],
+    extra_env: dict[str, str | None],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    _apply_subprocess_env_and_clear_caches(extra_env)
+    return fn(*args, **kwargs)
+
+
+class AutotuneProcessPool:
+    """
+    Singleton pool manager for running autotuning (precompilation + benchmarking)
+    in a separate process.
+    """
+
+    _instance: AutotuneProcessPool | None = None
+    _lock: threading.Lock = threading.Lock()
+    _shutdown_for_inactivity: bool = False
+
+    def __init__(self):
+        self._pool: ProcessPoolExecutor | None = self._init_pool()
+        self._warmup_future: Future[Any] | None = None
+        self._warmup_start_time: float | None = None
+        self._timer: Timer | None = self._init_timer()
+
+    @classmethod
+    def get_instance(cls):
+        """Get or create the singleton pool instance."""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    # num_workers=1 to avoid GPU contention during benchmarking
+                    cls._instance = cls()
+        return cls._instance
+
+    @property
+    def pool(self):
+        """Get the process pool."""
+        if not config.pipeline_max_autotune_gemm:
+            raise AssertionError(
+                "To use AutotuneProcessPool, pipeline_max_autotune_gemm must be enabled"
+            )
+        if self._pool is None:
+            self._pool = self._init_pool()
+            self._timer = self._init_timer()
+        return self._pool
+
+    def _init_timer(self) -> Timer | None:
+        if AUTOTUNE_POOL_INACTIVITY_TIMEOUT > 0:
+            return Timer(AUTOTUNE_POOL_INACTIVITY_TIMEOUT, self._on_inactivity_timeout)
+        return None
+
+    def _record_activity(self) -> None:
+        if self._timer is not None:
+            self._timer.record_call()
+
+    def _on_inactivity_timeout(self) -> None:
+        autotuning_log.info(
+            "AutotuneProcessPool shutting down due to inactivity (timeout=%ds)",
+            AUTOTUNE_POOL_INACTIVITY_TIMEOUT,
+        )
+
+        with self._lock:
+            if self._pool is not None:
+                self._pool.shutdown(wait=False)
+                self._pool = None
+            self._timer = None
+
+            # Mark that the pool was shut down for inactivity.
+            # This prevents the pool from being recreated on recompiles
+            # which likely do not require large amounts of autotuning.
+            AutotuneProcessPool._shutdown_for_inactivity = True
+
+    def _init_pool(self):
+        """
+        Get or create the process pool.
+
+        Uses ProcessPoolExecutor with 'spawn' context for CUDA safety.
+        ProcessPoolExecutor is lazily initialized - workers are not spawned
+        until the first submit() call, making this property non-blocking.
+        """
+        # Use 'spawn' context to avoid CUDA fork issues
+        # Workers are spawned lazily on first submit(), not here
+        ctx = mp.get_context("spawn")
+        pool = ProcessPoolExecutor(
+            max_workers=1,
+            mp_context=ctx,
+        )
+        atexit.register(self._shutdown)
+        autotuning_log.info("AutotuneProcessPool created (workers spawn lazily)")
+
+        return pool
+
+    def warm_up(self) -> Future[Any]:
+        """
+        Submit a warmup job to eagerly spawn workers and initialize CUDA.
+
+        This is optional - call it early to hide spawn latency.
+        Returns the warmup future which can be ignored or awaited.
+        """
+        if self._warmup_future is None:
+            with self._lock:
+                if self._warmup_future is None:
+                    self._warmup_start_time = time.perf_counter()
+                    self._warmup_future = self.submit(
+                        _init_autotune_subprocess,
+                        fp32_precision=tp.backends.cuda.matmul.allow_tf32,
+                    )
+                    self._warmup_future.add_done_callback(self._on_warmup_complete)
+                    autotuning_log.info("Warmup job submitted")
+        # pyrefly: ignore[bad-return]
+        return self._warmup_future
+
+    def _on_warmup_complete(self, future: Future[Any]) -> None:
+        """Callback invoked when the warmup job completes."""
+        warmup_elapsed_time = None
+        if self._warmup_start_time is not None:
+            warmup_elapsed_time = time.perf_counter() - self._warmup_start_time
+
+        try:
+            result = future.result()
+            autotuning_log.info(
+                "AutotuneProcessPool warmup completed successfully in %.4f seconds: %s",
+                warmup_elapsed_time,
+                result,
+            )
+            self._record_activity()
+        except Exception as e:
+            autotuning_log.error(
+                "AutotuneProcessPool warmup failed after %.4f seconds",
+                warmup_elapsed_time,
+            )
+            raise e
+
+    def submit(self, fn, *args, **kwargs) -> Future[Any]:
+        """Submit a job to the pool and return a Future."""
+        future = self.pool.submit(
+            _run_with_subprocess_env,
+            fn,
+            _cache_env_for_subprocess(),
+            *args,
+            **kwargs,
+        )
+        if self._timer is not None:
+            future.add_done_callback(lambda _: self._record_activity())
+        return future
+
+    def _shutdown(self):
+        """Shutdown the pool on exit."""
+        if self._timer is not None:
+            self._timer.quit()
+            self._timer = None
+        if self._pool is not None:
+            self._pool.shutdown(wait=False)
+            self._pool = None
+
+    @classmethod
+    def shutdown_instance(cls):
+        """Explicitly shutdown the singleton instance."""
+        if cls._instance is not None:
+            with cls._lock:
+                if cls._instance is not None:
+                    cls._instance._shutdown()
+                    cls._instance = None
