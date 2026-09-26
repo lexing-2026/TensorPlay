@@ -37,6 +37,8 @@ from tensorplay.graph.experimental.symbolic_shapes import (
 )
 from tensorplay.graph.experimental.sympy_functions import (
     CleanDiv,
+    Max,
+    Min,
     Mod,
     ModularIndexing,
     OrderedSet,

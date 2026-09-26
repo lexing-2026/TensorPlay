@@ -776,7 +776,7 @@ def lower_permute_backward(grad, _input, dims):
     inverse = [0] * rank
     for position, d in enumerate(dims):
         inverse[d] = position
-    return lower_permute(node, grad, inverse)
+    return lower_permute(grad, inverse)
 
 
 @register("transpose.default", "transpose.int")
@@ -785,12 +785,12 @@ def lower_transpose(x, d0, d1):
     dims = list(range(rank))
     a, b = normalize_dim(d0, rank), normalize_dim(d1, rank)
     dims[a], dims[b] = dims[b], dims[a]
-    return lower_permute(node, x, dims)
+    return lower_permute(x, dims)
 
 
 @register("t.default")
 def lower_t(x):
-    return lower_permute(node, x, list(reversed(range(len(x.get_size())))))
+    return lower_permute(x, list(reversed(range(len(x.get_size())))))
 
 
 @register("unsqueeze.default")
@@ -1288,6 +1288,19 @@ def _pair(value, count: int) -> list:
     return items
 
 
+def _spatial_ndim() -> int:
+    """How many trailing axes of the operation being lowered are spatial.
+
+    An operation comes in a two-dimensional and a three-dimensional form which
+    differ only in that, and which of the two is being lowered is a property of
+    the node rather than of the arguments -- both forms take the same arguments
+    and would be told apart by looking at nothing else.  The node is read the
+    same way the rest of a lowering reads it, as the one currently published.
+    """
+
+    return 3 if "3d" in target_name(V.current_node.target) else 2
+
+
 def _pool_output_size(extent: int, kernel: int, stride: int, padding: int,
                       ceil_mode: bool) -> int:
     """Output extent of one pooling axis."""
@@ -1297,20 +1310,19 @@ def _pool_output_size(extent: int, kernel: int, stride: int, padding: int,
     return (extent + 2 * padding - kernel) // stride + 1
 
 
-@register("upsample_nearest2d.default", "_upsample_nearest_exact2d.default",
-          "upsample_nearest3d.default", "_upsample_nearest_exact3d.default")
-def lower_upsample_nearestnd(x, output_size, scales_h=None, scales_w=None,
-                             **kwargs):
+def _upsample_nearestnd(x, output_size, ndim, **kwargs):
     """Nearest upsampling as an index remap of the source.
 
     Each output element reads the input element the scale maps it to, so the
     operator is a view with a remapped address rather than a call: it fuses
     with whatever consumes it instead of standing on its own.
+
+    ``ndim`` is how many trailing axes are spatial, which is what says how much
+    of the output size is a size rather than a leading extent.
     """
 
     size, dtype, device = val_info(node_val())
     in_size = list(x.get_size())
-    ndim = 3 if "3d" in target_name(node.target) else 2
     out_spatial = [int(s) for s in output_size][-ndim:]
     in_spatial = in_size[-ndim:]
     prefix = in_size[:-ndim]
@@ -1330,6 +1342,18 @@ def lower_upsample_nearestnd(x, output_size, scales_h=None, scales_w=None,
     return make_view(x, size, reindex)
 
 
+@register("upsample_nearest2d.default", "_upsample_nearest_exact2d.default")
+def lower_upsample_nearest2d(x, output_size, scales_h=None, scales_w=None,
+                            **kwargs):
+    return _upsample_nearestnd(x, output_size, 2, **kwargs)
+
+
+@register("upsample_nearest3d.default", "_upsample_nearest_exact3d.default")
+def lower_upsample_nearest3d(x, output_size, scales_d=None, scales_h=None,
+                            scales_w=None, **kwargs):
+    return _upsample_nearestnd(x, output_size, 3, **kwargs)
+
+
 @register("avg_pool2d.default", "avg_pool3d.default")
 def lower_avg_poolnd(x, kernel_size, stride=(), padding=0, ceil_mode=False,
                      count_include_pad=True, divisor_override=None, **kwargs):
@@ -1342,7 +1366,7 @@ def lower_avg_poolnd(x, kernel_size, stride=(), padding=0, ceil_mode=False,
 
     size, dtype, device = val_info(node_val())
     in_size = list(x.get_size())
-    ndim = 3 if "3d" in target_name(node.target) else 2
+    ndim = _spatial_ndim()
     kernel = _pair(kernel_size, ndim)
     stride = _pair(stride, ndim) if stride else list(kernel)
     padding = _pair(padding, ndim) if padding else [0] * ndim
@@ -1402,17 +1426,16 @@ def lower_avg_poolnd(x, kernel_size, stride=(), padding=0, ceil_mode=False,
         divisor = None
     if divisor is None:
         return _pool_with_masked_divisor(
-            node, total, prefix, spatial_out, kernel, stride, padding,
+            total, prefix, spatial_out, kernel, stride, padding,
             spatial_in, f32, device,
         )
     return pointwise(
-        node,
         lambda value: ops.truediv(value, ops.constant(divisor, f32)),
         total,
     )
 
 
-def _pool_with_masked_divisor(node, total, prefix, spatial_out, kernel, stride,
+def _pool_with_masked_divisor(total, prefix, spatial_out, kernel, stride,
                               padding, spatial_in, f32, device):
     """Average pooling whose divisor counts only the positions inside."""
 
@@ -1444,7 +1467,6 @@ def _pool_with_masked_divisor(node, total, prefix, spatial_out, kernel, stride,
     )
     counted.realize()
     return pointwise(
-        node,
         lambda value, count: ops.truediv(value, count),
         total,
         counted,
@@ -1494,7 +1516,7 @@ def lower_index_add(base, dim, index_box, addend, alpha=None, **kwargs):
     landed = Reduction.create(
         device=device,
         dst_dtype=dtype,
-        src_dtype=src_dtype,
+        src_dtype=addend.get_dtype(),
         inner_fn=inner,
         ranges=tuple(out_size),
         reduction_ranges=tuple(addend_size),
@@ -1559,7 +1581,7 @@ def lower_avg_poolnd_backward(grad, _input, kernel_size, stride=(), padding=0,
     """
 
     _, dtype, device = val_info(node_val())
-    ndim = 3 if "3d" in target_name(node.target) else 2
+    ndim = _spatial_ndim()
     kernel = _pair(kernel_size, ndim)
     stride = _pair(stride, ndim) if stride else list(kernel)
     padding = _pair(padding, ndim) if padding else [0] * ndim
@@ -1598,11 +1620,10 @@ def lower_avg_poolnd_backward(grad, _input, kernel_size, stride=(), padding=0,
         divisor = float(_prod_ints(kernel))
     else:
         return _pool_backward_with_masked_divisor(
-            node, total, prefix, spatial_in, spatial_out, kernel, stride, padding, f32,
+            total, prefix, spatial_in, spatial_out, kernel, stride, padding, f32,
             device,
         )
     return pointwise(
-        node,
         lambda value: ops.truediv(value, ops.constant(divisor, f32)),
         total,
     )
@@ -1615,7 +1636,7 @@ def _prod_ints(values) -> int:
     return out
 
 
-def _pool_backward_with_masked_divisor(node, total, prefix, spatial_in, spatial_out,
+def _pool_backward_with_masked_divisor(total, prefix, spatial_in, spatial_out,
                                        kernel, stride, padding, f32, device):
     """Pooling backwards whose divisor counts only the positions inside."""
 
@@ -1637,7 +1658,6 @@ def _pool_backward_with_masked_divisor(node, total, prefix, spatial_in, spatial_
     )
     count.realize()
     return pointwise(
-        node,
         lambda value, seen: ops.truediv(value, seen),
         total,
         count,

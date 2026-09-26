@@ -1936,6 +1936,47 @@ def native_layer_norm_backward(grad_out, input, normalized_shape, mean, rstd, we
     )
 
 
+@register_decomposition(ops.native_group_norm.default)
+def native_group_norm(input, weight, bias, N, C, HxW, group, eps):
+    """Each group of channels normalized by its own mean and spread.
+
+    The channels of a group and the spatial positions inside them are the axes
+    the statistics are taken over, so the group is made an axis of its own and
+    the two that follow it are reduced together.  The spread is the biased one
+    (dividing by the count rather than by one less than it) because the count is
+    the whole group, not a sample of it, and the inverse spread is taken after
+    the epsilon has been added so a constant group stays finite.
+
+    The two statistics come back with the reduced axes squeezed out, so each is
+    one value per group and broadcasts against the input again.
+    """
+    compute = _computation_dtype(input.dtype)
+    input_c = input.to(compute)
+
+    cpg = C // group
+    # [N, group, channels-per-group, spatial] so the group's own channels and
+    # the positions inside them are the last two axes.
+    grouped = input_c.reshape(N, group, cpg, HxW)
+    mean = grouped.mean(dim=[2, 3], keepdim=True)
+    var = grouped.var(dim=[2, 3], correction=0, keepdim=True)
+    rstd = (var + eps).rsqrt()
+
+    out = (grouped - mean) * rstd
+    out = out.reshape(input.shape)
+    # one coefficient per channel: the channel axis is kept, every other axis
+    # is a singleton, so each channel is scaled on its own.
+    per_channel = [1, C] + [1] * (input.dim() - 2)
+    if weight is not None:
+        out = out * weight.reshape(per_channel)
+    if bias is not None:
+        out = out + bias.reshape(per_channel)
+    return (
+        _cast(out, input.dtype),
+        _cast(mean.squeeze((2, 3)), input.dtype),
+        _cast(rstd.squeeze((2, 3)), input.dtype),
+    )
+
+
 @register_decomposition(ops.native_group_norm_backward.default)
 def native_group_norm_backward(grad_out, input, mean, rstd, weight, N, C, HxW, group, output_mask):
     compute = _computation_dtype(input.dtype)
