@@ -739,33 +739,33 @@ namespace {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-void histc_expand_constant_range(DType dtype, double& lo, double& hi) {
-    switch (dtype) {
-        case DType::Float64:
-            lo = std::min(
-                std::nexttoward(lo, std::numeric_limits<double>::lowest()),
-                lo - 1.0);
-            hi = std::max(
-                std::nexttoward(hi, std::numeric_limits<double>::max()),
-                hi + 1.0);
-            break;
-        case DType::Float32:
-            lo = std::min(
-                static_cast<double>(std::nexttoward(
-                    static_cast<float>(lo),
-                    std::numeric_limits<float>::lowest())),
-                lo - 1.0);
-            hi = std::max(
-                static_cast<double>(std::nexttoward(
-                    static_cast<float>(hi),
-                    std::numeric_limits<float>::max())),
-                hi + 1.0);
-            break;
-        default:
-            lo -= 1.0;
-            hi += 1.0;
-            break;
+int embedding_summary_multiprocessor_count() {
+    static thread_local int cached_device = -1;
+    static thread_local int cached_count = 1;
+    const int device = currentDevice();
+    if (device != cached_device) {
+        int value = 0;
+        if (cudaDeviceGetAttribute(&value, cudaDevAttrMultiProcessorCount,
+                                   device) != cudaSuccess) {
+            value = 1;
+        }
+        cached_count = value > 0 ? value : 1;
+        cached_device = device;
     }
+    return cached_count;
+}
+
+// A range that collapsed to a single value is widened by one in the compute
+// type the binning runs in, so the value still lands inside the histogram.
+// Widening in double instead would move the edges the binning never sees.
+void histc_expand_constant_range(DType dtype, double& lo, double& hi) {
+    if (dtype == DType::Float64) {
+        lo -= 1.0;
+        hi += 1.0;
+        return;
+    }
+    lo = static_cast<double>(static_cast<float>(lo) - 1.0f);
+    hi = static_cast<double>(static_cast<float>(hi) + 1.0f);
 }
 
 
@@ -774,22 +774,58 @@ void histc_expand_constant_range(DType dtype, double& lo, double& hi) {
 // range are dropped, the rightmost edge is inclusive.
 // ---------------------------------------------------------------------------
 
-// One pass over the flattened input: out-of-range values drop and in-range
-// values vote for their equally-spaced bin with an atomic increment.  Bin
-// edges span [lo, hi] and the rightmost edge is inclusive, so a value at hi
-// maps to the last bin.  NaN fails both bounds and drops.
-template <typename InT>
-__global__ void histc_count_kernel(const InT* input, int64_t n, double lo,
-                                   double hi, double bins_over_width, int bins,
+// Bin edges span [lo, hi] and the rightmost edge is inclusive, so a value at
+// hi maps to the last bin.  NaN fails both bounds and drops.  The edge test
+// runs in the input's own compute precision -- a double-precision edge test
+// would send values sitting on a boundary to a different bin than the same
+// input gets at single precision.
+template <typename ComputeT>
+__device__ __forceinline__ int histc_bin(ComputeT value, ComputeT lo,
+                                        ComputeT hi, int bins) {
+    if (!(value >= lo) || !(value <= hi)) return -1;
+    int b = static_cast<int>((value - lo) * bins / (hi - lo));
+    return b == bins ? bins - 1 : b;
+}
+
+// Staged histogram: every block keeps its own bin counters in shared memory and
+// publishes them once at the end.  Straight to global memory, the atomics of a
+// narrow histogram all land on the same handful of addresses and serialize --
+// the shared copy turns those into per-block races that resolve in shared
+// memory, and leaves one global atomic per bin per block.
+template <typename InT, typename ComputeT, typename CountT>
+__global__ void histc_shared_kernel(const InT* input, int64_t n, ComputeT lo,
+                                    ComputeT hi, int bins,
+                                    unsigned long long* counts) {
+    extern __shared__ unsigned char histc_smem[];
+    CountT* local = reinterpret_cast<CountT*>(histc_smem);
+    for (int i = threadIdx.x; i < bins; i += blockDim.x) local[i] = CountT(0);
+    __syncthreads();
+
+    const int64_t stride = int64_t(gridDim.x) * blockDim.x;
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += stride) {
+        const int b = histc_bin(static_cast<ComputeT>(input[i]), lo, hi, bins);
+        if (b >= 0) atomicAdd(local + b, CountT(1));
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < bins; i += blockDim.x) {
+        const CountT v = local[i];
+        if (v != CountT(0)) atomicAdd(counts + i, static_cast<unsigned long long>(v));
+    }
+}
+
+// Fallback for bin counts that do not fit in shared memory: one pass over the
+// input with every vote going straight to the output.
+template <typename InT, typename ComputeT>
+__global__ void histc_count_kernel(const InT* input, int64_t n, ComputeT lo,
+                                   ComputeT hi, int bins,
                                    unsigned long long* counts) {
     const int64_t stride = int64_t(gridDim.x) * blockDim.x;
     for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
          i += stride) {
-        const double v = static_cast<double>(input[i]);
-        if (!(v >= lo) || !(v <= hi)) continue;
-        int b = static_cast<int>((v - lo) * bins_over_width);
-        b = b < 0 ? 0 : (b >= bins ? bins - 1 : b);
-        atomicAdd(counts + b, 1ull);
+        const int b = histc_bin(static_cast<ComputeT>(input[i]), lo, hi, bins);
+        if (b >= 0) atomicAdd(counts + b, 1ull);
     }
 }
 
@@ -812,7 +848,6 @@ Tensor interop_histc_cuda(const Tensor& self, int64_t bins, const Scalar& min, c
     }
     if (lo == hi) {
         histc_expand_constant_range(self.dtype(), lo, hi);
-        histc_expand_constant_range(self.dtype(), lo, hi);
     }
     if (!std::isfinite(lo) || !std::isfinite(hi)) {
         TP_THROW(RuntimeError, "histc: range of [", lo, ", ", hi,
@@ -832,18 +867,68 @@ Tensor interop_histc_cuda(const Tensor& self, int64_t bins, const Scalar& min, c
     const Tensor flat = self.reshape({-1});
     const int64_t n = flat.numel();
     if (n > 0) {
-        const int blocks = static_cast<int>(
-            std::min<int64_t>((n + 255) / 256, 4096));
-        const double bins_over_width =
-            static_cast<double>(bins) / (hi - lo);
+
         unsigned long long* counts_ptr =
             static_cast<unsigned long long*>(counts.data_ptr());
         const void* in_ptr = flat.data_ptr();
-#define TP_HISTC_CASE(ctype, name)                                       \
-    case DType::name:                                                    \
-        histc_count_kernel<ctype><<<blocks, 256, 0, stream>>>(           \
-            static_cast<const ctype*>(in_ptr), n, lo, hi,                \
-            bins_over_width, static_cast<int>(bins), counts_ptr);        \
+        // Staging costs one bin counter per bin per block and one global atomic
+        // per bin per block at the end, so the grid is sized to keep that
+        // publishing traffic a small fraction of the shared-memory votes: aim
+        // for kHistcGlobalVoteRatio votes per published count, but never fewer
+        // blocks than there are multiprocessors, and never so many that a block
+        // runs dry before the next wave.
+        constexpr int64_t kHistcGlobalVoteRatio = 64;
+        constexpr int64_t kHistcMinBlocksPerSM = 4;
+        const int threads = 256;
+        const size_t shared_bytes = static_cast<size_t>(bins) * sizeof(unsigned int);
+        const size_t smem_limit = 32 * 1024;
+        const bool staged = shared_bytes <= smem_limit;
+        const int sms = embedding_summary_multiprocessor_count();
+        const int64_t ceiling_blocks = (n + threads - 1) / threads;
+        int64_t grid = ceiling_blocks;
+        if (staged) {
+            // Every block publishes one atomic per bin, so the block count is
+            // what decides how much of the traffic lands in global memory:
+            // hold it to a small fraction of the votes, and let the floor keep
+            // enough blocks resident to cover the machine.
+            const int64_t publish_bound =
+                n / (kHistcGlobalVoteRatio * static_cast<int64_t>(bins));
+            grid = std::max<int64_t>(publish_bound,
+                                     sms * kHistcMinBlocksPerSM);
+            grid = std::min<int64_t>(grid, ceiling_blocks);
+        } else {
+            grid = std::min<int64_t>(grid, 4096);
+        }
+        const int grid_i = static_cast<int>(std::max<int64_t>(grid, 1));
+        // Single-precision inputs bin in single precision, doubles in double.
+        const bool wide = self.dtype() == DType::Float64;
+        const float lo_f = static_cast<float>(lo);
+        const float hi_f = static_cast<float>(hi);
+#define TP_HISTC_CASE(ctype, name)                                            \
+    case DType::name:                                                         \
+        if (staged) {                                                         \
+            if (wide) {                                                       \
+                histc_shared_kernel<ctype, double, unsigned int>               \
+                    <<<grid_i, threads, shared_bytes, stream>>>(                 \
+                        static_cast<const ctype*>(in_ptr), n, lo, hi, bins,    \
+                        counts_ptr);                                          \
+            } else {                                                          \
+                histc_shared_kernel<ctype, float, unsigned int>                \
+                    <<<grid_i, threads, shared_bytes, stream>>>(                 \
+                        static_cast<const ctype*>(in_ptr), n, lo_f, hi_f,      \
+                        static_cast<int>(bins), counts_ptr);                  \
+            }                                                                  \
+        } else {                                                              \
+            if (wide) {                                                       \
+                histc_count_kernel<ctype, double><<<grid_i, threads, 0, stream>>>( \
+                    static_cast<const ctype*>(in_ptr), n, lo, hi, bins,        \
+                    counts_ptr);                                              \
+            } else {                                                          \
+                histc_count_kernel<ctype, float><<<grid_i, threads, 0, stream>>>(  \
+                    static_cast<const ctype*>(in_ptr), n, lo_f, hi_f,          \
+                    static_cast<int>(bins), counts_ptr);                      \
+            }                                                                  \
+        }                                                                      \
         break;
         switch (self.dtype()) {
             TP_HISTC_CASE(double, Float64)
