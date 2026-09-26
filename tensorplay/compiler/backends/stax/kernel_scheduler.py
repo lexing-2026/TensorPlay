@@ -14,6 +14,7 @@ memory, but only where nothing is waiting on something that has not run.
 from __future__ import annotations
 
 import collections
+import enum
 from collections import defaultdict
 import dataclasses
 import functools
@@ -24,7 +25,7 @@ import pprint
 import sys
 import textwrap
 from collections.abc import Sequence
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, cast
 
 import sympy
 
@@ -32,6 +33,8 @@ import tensorplay as tp
 from tensorplay.utils import _pytree as pytree
 
 from . import choices, config, dependencies, ir
+from .dependencies import MemoryDep
+from .runtime.hints import ReductionHint
 from .codegen.common import BackendFeature, IndentedBuffer, KernelArgs
 from .ir import (
     Buffer,
@@ -45,8 +48,9 @@ from .ir import (
     Reduction,
 )
 from . import metrics
-from .loops import V
+from .loops import LoopBody, V
 from .sizevars import SimplifyIndexing
+from ....graph.experimental.sympy_functions import FloorDiv, Identity, SymT
 from .memory import (
     FreeableInputBuffer,
     MemoryPlanningInfoForBuffer,
@@ -3480,6 +3484,919 @@ class SubParentEpilogueStage:
 
 
 @dataclasses.dataclass(frozen=True)
+class NestedReduction:
+    """
+    Detects when an outer reduction and a dependent grouped reduction can be
+    fused into one kernel. The outer reduction reduces over a large dimension
+    (e.g. D) producing per-row statistics; the grouped reduction performs a
+    small local reduction over the same logical elements. The grouped reduction
+    may re-read the outer reduction's large input, consume its full-resolution
+    output, or both.
+
+    This is deliberately limited to same-total-numel pairs:
+    both reductions must traverse the same number of logical elements.
+    General output-size-reducing nested reductions, including split reductions,
+    need different grid ownership and are rejected here.
+
+    Example:
+    - layernorm + block amax: amax over groups of G after layer_norm
+    """
+
+    MAX_INNER_R_GROUP_SIZE = 512
+    MAX_NON_INNER_GROUP_SIZE = 128
+
+    @staticmethod
+    def _is_dependent_reduction_pair(
+        outer_node: BaseSchedulerNode, grouped_node: BaseSchedulerNode
+    ) -> bool:
+        """Check that the grouped reduction is a consumer of the outer reduction."""
+        return (
+            outer_node.is_reduction()
+            and grouped_node.is_reduction()
+            and bool(outer_node.get_operation_names() & grouped_node.ancestors)
+        )
+
+    @staticmethod
+    def _is_enabled_for(
+        outer_node: BaseSchedulerNode, grouped_node: BaseSchedulerNode
+    ) -> bool:
+        return (
+            config.triton.nested_reduction
+            and _is_gpu_triton_backend(outer_node, grouped_node)
+            and not outer_node.has_strict_reduction()
+            and not grouped_node.has_strict_reduction()
+        )
+
+    @classmethod
+    def is_candidate(cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> bool:
+        """Cheap filter for dependent reductions with different reduction sizes."""
+        if not cls._is_enabled_for(
+            node1, node2
+        ) or not cls._is_dependent_reduction_pair(node1, node2):
+            return False
+        _, (_, rnumel1) = node1.group
+        _, (_, rnumel2) = node2.group
+        return not V.graph.sizevars.statically_known_equals(rnumel1, rnumel2)
+
+    class PointwiseDomain(enum.Enum):
+        """
+        Where a pointwise node runs in the nested pipeline.
+
+        The local reduction stage has three meaningful domains: its reduced
+        output, its input before reducing the local lane, and the outer
+        reduction's parent tile after broadcast-back.
+        """
+
+        # Local reduction output, e.g. [B, D // G].
+        REDUCED = enum.auto()
+        # Input domain before reducing the local group, e.g. [B, D // G, G].
+        LOCAL_REDUCTION_INPUT = enum.auto()
+        # Outer reduction tile after broadcast-back, e.g. [B, D].
+        PARENT_FULL = enum.auto()
+
+    class GroupedAxis(enum.Enum):
+        R = enum.auto()
+        X = enum.auto()
+
+    INTERLEAVED_SUB_PARENT_FACTOR = 2
+
+    class SubParentSourceLayout(enum.Enum):
+        # The parent grouped axis is split as child, lane, so parent_r =
+        # factor * child_r + lane. This covers NVFP4 even/odd packing.
+        INTERLEAVED = enum.auto()
+
+    @dataclasses.dataclass(frozen=True)
+    class PointwiseDomainContext:
+        grouped_reduction: SchedulerNode
+        grouped_numel: sympy.Expr
+        grouped_rnumel: sympy.Expr
+        local_reduction_domain: tuple[sympy.Expr, ...]
+        parent_full_domain: tuple[sympy.Expr, ...]
+
+    @classmethod
+    def sub_parent_epilogue_plan(
+        cls,
+        nodes: Sequence[BaseSchedulerNode],
+        numel: sympy.Expr,
+        rnumel: sympy.Expr,
+    ) -> StagedReductionPlan | None:
+        """Plan ``nodes`` as a reduction plus a sub-parent pointwise epilogue.
+
+        The epilogue runs over the parent's R tile divided into lanes. Returns
+        ``None`` when the candidate cannot be emitted safely. See Note
+        [Sub-parent reduction epilogues].
+        """
+        parent_rnumel = V.graph.sizevars.simplify(rnumel)
+        # TODO: No fundamental limitation; track aliases and mutation versions here.
+        if any(node.has_aliasing_or_mutation() for node in nodes):
+            return None
+        if not all(isinstance(node, SchedulerNode) for node in nodes):
+            return None
+        scheduler_nodes = typing.cast("Sequence[SchedulerNode]", nodes)
+
+        # TODO: Consider an alternative to rediscovering the reduction here.
+        has_reduction = False
+        parent_source_names: OrderedSet[str] = OrderedSet()
+        for node in scheduler_nodes:
+            if node.is_reduction():
+                has_reduction = True
+                for dep in node.read_writes.reads:
+                    if isinstance(dep, MemoryDep):
+                        parent_source_names.add(dep.name)
+        if not has_reduction:
+            return None
+
+        candidate = cls._sub_parent_epilogue_candidate_nodes(
+            scheduler_nodes,
+            numel,
+            rnumel,
+        )
+        if candidate is None:
+            return None
+        epilogue_nodes, sub_parent_factor = candidate
+        epilogue_node_set = OrderedSet(epilogue_nodes)
+        parent_nodes = tuple(
+            node for node in scheduler_nodes if node not in epilogue_node_set
+        )
+        source_layouts = cls._try_get_sub_parent_source_layouts(
+            parent_nodes,
+            epilogue_nodes,
+            numel,
+            parent_rnumel,
+            parent_source_names,
+            sub_parent_factor,
+        )
+        if not source_layouts:
+            return None
+        if not cls._sub_parent_epilogue_outputs_unread(
+            scheduler_nodes, epilogue_node_set
+        ):
+            return None
+        return StagedReductionPlan(
+            parent_nodes=parent_nodes,
+            parent_numel=numel,
+            parent_rnumel=parent_rnumel,
+            nested_stage=None,
+            sub_parent_stages=(
+                SubParentEpilogueStage(
+                    factor=sub_parent_factor,
+                    source_layouts=source_layouts,
+                    epilogue_nodes=tuple(epilogue_nodes),
+                ),
+            ),
+        )
+
+    @classmethod
+    def _sub_parent_epilogue_candidate_nodes(
+        cls,
+        nodes: Sequence[SchedulerNode],
+        numel: sympy.Expr,
+        rnumel: sympy.Expr,
+    ) -> tuple[tuple[SchedulerNode, ...], int] | None:
+        """Classify a candidate group and return its lane-resolution nodes.
+
+        Other members must fit the parent reduction, reduced-output, or
+        full-parent domain.
+        """
+        factor = cls.INTERLEAVED_SUB_PARENT_FACTOR
+        expected_groups = (numel, FloorDiv(rnumel, factor))
+        parent_full_numel = V.graph.sizevars.simplify(numel * rnumel)
+        candidates: list[SchedulerNode] = []
+        for node in nodes:
+            _, (node_numel, node_rnumel) = node.group
+            if node.is_reduction():
+                if not (
+                    V.graph.sizevars.statically_known_equals(node_numel, numel)
+                    and V.graph.sizevars.statically_known_equals(node_rnumel, rnumel)
+                ):
+                    return None
+                continue
+            if cls._pointwise_node_matches_domain(
+                node, sympy_product(expected_groups), expected_groups
+            ):
+                candidates.append(node)
+                continue
+            if cls._pointwise_node_matches_domain(node, numel, (numel,)):
+                continue
+            if cls._pointwise_node_matches_domain(
+                node, parent_full_numel, (numel, rnumel)
+            ):
+                continue
+            return None
+        if not candidates:
+            return None
+        return tuple(candidates), factor
+
+    @staticmethod
+    def _pointwise_node_matches_domain(
+        node: SchedulerNode,
+        expected_numel: sympy.Expr,
+        expected_groups: Sequence[sympy.Expr],
+    ) -> bool:
+        from .codegen.simd import SIMDKernel
+
+        _, (node_numel, node_rnumel) = node.group
+        return (
+            V.graph.sizevars.statically_known_equals(node_rnumel, 1)
+            and V.graph.sizevars.statically_known_equals(node_numel, expected_numel)
+            and SIMDKernel.is_compatible(expected_groups, node.get_ranges())
+        )
+
+    @staticmethod
+    def try_get_sub_parent_extent_subs(
+        parent_extent: sympy.Expr, factor: int
+    ) -> dict[sympy.Expr, sympy.Expr] | None:
+        """Return extent substitutions, or ``None`` if divisibility is unproven.
+
+        On success, the mapping may be empty if the extent is already normalized.
+        """
+        rounded_extent = V.graph.sizevars.simplify(
+            factor * FloorDiv(parent_extent, factor)
+        )
+        if not V.graph.sizevars.statically_known_equals(parent_extent, rounded_extent):
+            return None
+        return (
+            {parent_extent: rounded_extent} if parent_extent != rounded_extent else {}
+        )
+
+    @classmethod
+    def interleaved_sub_parent_lane(
+        cls,
+        index: sympy.Expr,
+        factor: int,
+        extent_subs: dict[sympy.Expr, sympy.Expr],
+        source_sizes: tuple[sympy.Expr, ...] = (),
+    ) -> sympy.Expr:
+        # Identity controls emitted index width but does not change the lane.
+        index = index.replace(Identity, lambda x: x)
+        extent_subs = dict(extent_subs)
+        expanded_sizes = [
+            V.graph.sizevars.simplify(floor_div.args[1] * floor_div)
+            for floor_div in index.atoms(FloorDiv)
+        ]
+        expanded_sizes.extend(
+            V.graph.sizevars.simplify(sympy_product(source_sizes[i:]))
+            for i in range(len(source_sizes))
+        )
+        for symbol in index.free_symbols:
+            if symbol_is_type(symbol, SymT.SIZE):
+                for expanded_size in expanded_sizes:
+                    if (
+                        symbol != expanded_size
+                        and V.graph.sizevars.statically_known_multiple_of(
+                            expanded_size, factor
+                        )
+                        and V.graph.sizevars.statically_known_equals(
+                            symbol, expanded_size
+                        )
+                    ):
+                        extent_subs[symbol] = expanded_size
+                        break
+                symbol_subs = cls.try_get_sub_parent_extent_subs(symbol, factor)
+                if symbol_subs is not None:
+                    extent_subs.update(symbol_subs)
+        return V.graph.sizevars.simplify(
+            sympy.Mod(sympy_subs(index, extent_subs), factor)
+        )
+
+    @classmethod
+    def _try_get_sub_parent_source_layouts(
+        cls,
+        parent_nodes: Sequence[SchedulerNode],
+        epilogue_nodes: Sequence[SchedulerNode],
+        parent_numel: sympy.Expr,
+        parent_rnumel: sympy.Expr,
+        parent_source_names: OrderedSet[str],
+        sub_parent_factor: int,
+    ) -> tuple[tuple[str, NestedReduction.SubParentSourceLayout], ...] | None:
+        """Find parent inputs reused by supported lane-resolution projections.
+
+        Independent epilogue inputs remain ordinary kernel dependencies. Shared
+        indexed parent inputs must have one normalized parent access, and every
+        indexed epilogue access must equal it under
+        ``parent_r = factor * child_r + lane``.
+        """
+        from .utils import sympy_index_symbol
+
+        # Normalize source reads into a common two-axis domain.
+        def normalized_source_read_indices(
+            nodes: Sequence[SchedulerNode],
+            source_names: OrderedSet[str],
+            var_names: tuple[sympy.Symbol, sympy.Symbol],
+            sizes: tuple[sympy.Expr, sympy.Expr],
+        ) -> dict[str, OrderedSet[sympy.Expr]] | None:
+            result: dict[str, OrderedSet[sympy.Expr]] = collections.defaultdict(
+                OrderedSet
+            )
+            for node in nodes:
+                for dep in node.read_writes.reads:
+                    if isinstance(dep, MemoryDep) and dep.name in source_names:
+                        normalized = dep.normalize_with_ranges(var_names, sizes)
+                        if normalized is None:
+                            return None
+                        index = normalized.index.replace(Identity, lambda x: x)
+                        result[dep.name].add(index)
+            return result
+
+        # Express epilogue reads in the derived child domain.
+        child_rnumel = FloorDiv(parent_rnumel, sub_parent_factor)
+        extent_subs = cls.try_get_sub_parent_extent_subs(
+            parent_rnumel, sub_parent_factor
+        )
+        if extent_subs is None:
+            return None
+        x = sympy_index_symbol("_sub_parent_x")
+        parent_r = sympy_index_symbol("_sub_parent_r")
+        child_r = sympy_index_symbol("_sub_parent_child_r")
+        child_indices = normalized_source_read_indices(
+            epilogue_nodes,
+            parent_source_names,
+            (x, child_r),
+            (parent_numel, child_rnumel),
+        )
+        if child_indices is None:
+            return None
+        # Express the corresponding source reads in the full parent domain.
+        parent_indices = normalized_source_read_indices(
+            parent_nodes,
+            OrderedSet(child_indices),
+            (x, parent_r),
+            (parent_numel, parent_rnumel),
+        )
+        if parent_indices is None:
+            return None
+
+        source_layouts: list[tuple[str, NestedReduction.SubParentSourceLayout]] = []
+        # Prove every child read is a lane projection of one parent read.
+        for name in parent_source_names:
+            source_child_indices = child_indices.get(name)
+            if not source_child_indices:
+                continue
+            # TODO: Extend #188180's structural load-index cache to support
+            # multiple parent accesses to one source buffer.
+            source_parent_indices = parent_indices.get(name)
+            if source_parent_indices is None or len(source_parent_indices) != 1:
+                return None
+            parent_index = sympy_subs(next(iter(source_parent_indices)), extent_subs)
+            for child_index in source_child_indices:
+                lane = cls.interleaved_sub_parent_lane(
+                    child_index,
+                    sub_parent_factor,
+                    extent_subs,
+                    (parent_numel, parent_rnumel),
+                )
+                if not any(
+                    V.graph.sizevars.statically_known_equals(lane, value)
+                    for value in range(sub_parent_factor)
+                ):
+                    return None
+                expected = parent_index.subs(
+                    parent_r, sub_parent_factor * child_r + lane
+                )
+                if not V.graph.sizevars.statically_known_equals(child_index, expected):
+                    return None
+            source_layouts.append((name, cls.SubParentSourceLayout.INTERLEAVED))
+        return tuple(source_layouts)
+
+    @staticmethod
+    def _sub_parent_epilogue_outputs_unread(
+        nodes: Sequence[BaseSchedulerNode],
+        epilogue_node_set: OrderedSet[SchedulerNode],
+    ) -> bool:
+        """Whether every epilogue output is a leaf within the group.
+
+        Epilogue outputs only exist at lane resolution, so a non-epilogue node
+        reading one would need a parent-resolution view that was never emitted.
+        TODO: Support consumers in a post-sub-parent stage.
+        """
+        epilogue_output_names = OrderedSet(
+            name for node in epilogue_node_set for name in node.get_buffer_names()
+        )
+        if not epilogue_output_names:
+            return True
+        for node in nodes:
+            if node in epilogue_node_set:
+                continue
+            for dep in node.read_writes.reads:
+                if dep.name in epilogue_output_names:
+                    return False
+        return True
+
+    @classmethod
+    def _get_grouped_reduction_and_size(
+        cls, grouped_node: BaseSchedulerNode, grouped_rnumel: sympy.Expr
+    ) -> tuple[SchedulerNode, sympy.Integer] | None:
+        """Validate the candidate as a single simple grouped reduction."""
+        if not grouped_node.is_reduction():
+            return None
+        reductions = [sn for sn in grouped_node.get_nodes() if sn.is_reduction()]
+        if len(reductions) != 1:
+            return None
+        reduction = reductions[0]
+        if not isinstance(reduction, SchedulerNode) or not isinstance(
+            reduction.node, ComputedBuffer
+        ):
+            return None
+        iter_ranges, reduce_ranges = reduction.get_ranges()
+        # The original tensor may be higher-rank, but scheduler ranges are
+        # already collapsed into loop trees. Nested codegen maps the grouped
+        # reduction as either [outer_x, r_groups, G] or [x_groups, outer_r, G].
+        # A singleton non-reduced tree may be squeezed out; additional trees
+        # need explicit axis provenance and are rejected here.
+        if len(iter_ranges) not in (1, 2) or len(reduce_ranges) != 1:
+            return None
+        # Single-value reductions are lowered by reshape + tl.<op>(..., axis).
+        # Tuple/stateful reductions such as argmax and Welford need the normal
+        # reduction lowering and are rejected before nested codegen.
+        if reduction.node.get_reduction_type() not in {
+            "any",
+            "max",
+            "min",
+            "prod",
+            "sum",
+            "xor_sum",
+        }:
+            return None
+
+        group_size = V.graph.sizevars.simplify(grouped_rnumel)
+        if not isinstance(group_size, (int, sympy.Integer)) or int(group_size) < 1:
+            return None
+        return reduction, sympy.Integer(group_size)
+
+    @classmethod
+    def _classify_nested_pointwise_nodes(
+        cls,
+        outer_node: BaseSchedulerNode,
+        grouped_node: BaseSchedulerNode,
+        domain_context: PointwiseDomainContext,
+    ) -> list[tuple[SchedulerNode, PointwiseDomain]] | None:
+        outer_pointwise_domains: list[
+            tuple[SchedulerNode, NestedReduction.PointwiseDomain]
+        ] = []
+        # Use ancestor names to find pointwise subnodes inside the outer fused
+        # node that consume an outer reduction result.
+        outer_reduction_names: OrderedSet[str] = OrderedSet()
+        for sn in outer_node.get_nodes():
+            if sn.is_reduction():
+                outer_reduction_names |= sn.get_operation_names()
+
+        # Full-resolution consumers already fused into the outer reduction feed
+        # the local reduction, so they run in that input domain.
+        for sn in outer_node.get_nodes():
+            if sn.is_reduction():
+                continue
+            if outer_reduction_names & sn.ancestors:
+                if not isinstance(sn, SchedulerNode):
+                    return None
+                outer_pointwise_domains.append(
+                    (sn, cls.PointwiseDomain.LOCAL_REDUCTION_INPUT)
+                )
+
+        grouped_pointwise_domains = cls._classify_grouped_pointwise_nodes(
+            domain_context,
+            grouped_node.get_nodes(),
+        )
+        if grouped_pointwise_domains is None:
+            return None
+        return [*outer_pointwise_domains, *grouped_pointwise_domains]
+
+    @classmethod
+    def _classify_grouped_pointwise_nodes(
+        cls,
+        domain_context: PointwiseDomainContext,
+        nodes: Sequence[BaseSchedulerNode],
+    ) -> list[tuple[SchedulerNode, PointwiseDomain]] | None:
+        """Classify pointwise nodes relative to the grouped reduction.
+
+        A node must be on exactly one side of the grouped reduction: either a
+        producer feeding its local-group body, or a consumer of its reduced
+        output. Its numel then determines whether it runs at reduced,
+        grouped-full, or parent-full resolution.
+        """
+        grouped_reduction = domain_context.grouped_reduction
+        reduction_names = grouped_reduction.get_operation_names()
+        reduction_buffer_names = grouped_reduction.get_buffer_names()
+        full_numel = V.graph.sizevars.simplify(
+            domain_context.grouped_numel * domain_context.grouped_rnumel
+        )
+        pointwise_domains: list[
+            tuple[SchedulerNode, NestedReduction.PointwiseDomain]
+        ] = []
+        for sn in nodes:
+            if sn.is_reduction():
+                continue
+            if not isinstance(sn, SchedulerNode):
+                return None
+
+            sn_names = sn.get_operation_names()
+            is_producer = bool(sn_names & grouped_reduction.ancestors)
+            is_consumer = bool(reduction_names & sn.ancestors) or any(
+                dep.name in reduction_buffer_names for dep in sn.read_writes.reads
+            )
+            if is_producer and is_consumer:
+                # Supportable by splitting/modeling a multi-stage pointwise,
+                # but not as one nested pipeline stage today.
+                return None
+            if not is_producer and not is_consumer:
+                # Supportable as a sidecar, but nested codegen does not yet
+                # model an insertion point for unrelated pointwise nodes.
+                return None
+
+            full_domain = (
+                cls.PointwiseDomain.LOCAL_REDUCTION_INPUT
+                if is_producer
+                else cls.PointwiseDomain.PARENT_FULL
+            )
+            _, (sn_numel, _) = sn.group
+            if V.graph.sizevars.statically_known_equals(
+                sn_numel, domain_context.grouped_numel
+            ):
+                domain = cls.PointwiseDomain.REDUCED
+            elif V.graph.sizevars.statically_known_equals(sn_numel, full_numel):
+                domain = full_domain
+            else:
+                return None
+            pointwise_domains.append((sn, domain))
+        return pointwise_domains
+
+    @classmethod
+    def _pointwise_domains_are_compatible(
+        cls,
+        domain_context: PointwiseDomainContext,
+        pointwise_domains: Sequence[tuple[SchedulerNode, PointwiseDomain]],
+    ) -> bool:
+        return all(
+            cls._pointwise_domain_is_compatible(sn, domain, domain_context)
+            for sn, domain in pointwise_domains
+        )
+
+    @classmethod
+    def _pointwise_domain_is_compatible(
+        cls,
+        sn: SchedulerNode,
+        domain: PointwiseDomain,
+        domain_context: PointwiseDomainContext,
+    ) -> bool:
+        iter_ranges, _ = domain_context.grouped_reduction.get_ranges()
+        if domain is cls.PointwiseDomain.REDUCED:
+            expected_numel = domain_context.grouped_numel
+            expected_groups: Sequence[sympy.Expr] = tuple(iter_ranges)
+        elif domain is cls.PointwiseDomain.LOCAL_REDUCTION_INPUT:
+            expected_numel = V.graph.sizevars.simplify(
+                domain_context.grouped_numel * domain_context.grouped_rnumel
+            )
+            expected_groups = domain_context.local_reduction_domain
+        else:
+            if domain is not cls.PointwiseDomain.PARENT_FULL:
+                raise AssertionError(f"expected PARENT_FULL domain, got {domain}")
+            expected_numel = V.graph.sizevars.simplify(
+                domain_context.grouped_numel * domain_context.grouped_rnumel
+            )
+            expected_groups = domain_context.parent_full_domain
+        return cls._pointwise_node_matches_domain(sn, expected_numel, expected_groups)
+
+    @classmethod
+    def _min_block_unprofitable_for_kernel(
+        cls,
+        outer_node: BaseSchedulerNode,
+        outer_numel: sympy.Expr,
+        outer_rnumel: sympy.Expr,
+        *,
+        grouped_axis: GroupedAxis,
+        group_size: int,
+    ) -> bool:
+        from .codegen.simd import SIMDScheduling
+
+        if not isinstance(outer_node, (SchedulerNode, FusedSchedulerNode)):
+            return True
+        coalesce_analysis = (
+            outer_node.get_coalesce_analysis()
+            if config.triton.coalesce_tiling_analysis
+            else None
+        )
+        node_schedule = list(outer_node.get_nodes())
+        tiling = SIMDScheduling.select_tiling(
+            node_schedule,
+            outer_numel,
+            outer_rnumel,
+            coalesce_analysis,
+        )
+        # TODO: fold richer profitability/coalescing policy into this guard.
+        # For now this is only a codegen capability check for the min block.
+        # The grouped reduction forces a minimum block on the split axis. Today
+        # that floor is only modeled for ordinary x/r0 kernels, where x is the
+        # outer pointwise axis and r0_ is the inner reduction axis.
+        if OrderedSet(tiling) != OrderedSet(("x", "r0_")):
+            return True
+        if not (
+            V.graph.sizevars.statically_known_equals(tiling["x"], outer_numel)
+            and V.graph.sizevars.statically_known_equals(tiling["r0_"], outer_rnumel)
+        ):
+            return True
+        return group_size > cls._max_min_block_group_size(node_schedule, grouped_axis)
+
+    @classmethod
+    def _max_min_block_group_size(
+        cls,
+        node_schedule: Sequence[BaseSchedulerNode],
+        grouped_axis: GroupedAxis,
+    ) -> int:
+        from .codegen.simd_kernel_features import SIMDKernelFeatures
+
+        reduction_hints = [
+            SIMDKernelFeatures.reduction_hint(sn)
+            for sn in node_schedule
+            if isinstance(sn, SchedulerNode)
+            and sn.is_reduction()
+            and isinstance(sn.node, ComputedBuffer)
+        ]
+        if (
+            grouped_axis is cls.GroupedAxis.R
+            and reduction_hints
+            and all(hint is ReductionHint.INNER for hint in reduction_hints)
+        ):
+            return cls.MAX_INNER_R_GROUP_SIZE
+        return cls.MAX_NON_INNER_GROUP_SIZE
+
+    @classmethod
+    def plan(
+        cls,
+        node1: BaseSchedulerNode,
+        node2: BaseSchedulerNode,
+    ) -> StagedReductionPlan | None:
+        """Plan a dependent cross-axis reduction pair for staged code generation."""
+        if not cls._is_enabled_for(node1, node2):
+            return None
+
+        if not cls._is_dependent_reduction_pair(node1, node2):
+            raise AssertionError(
+                "expected node1 and node2 to be a dependent reduction pair"
+            )
+
+        outer_node = node1
+        grouped_node = node2
+        outer_group: tuple[sympy.Expr, sympy.Expr]
+        grouped_group: tuple[sympy.Expr, sympy.Expr]
+        _, outer_group = outer_node.group  # pyrefly: ignore [bad-assignment]
+        _, grouped_group = grouped_node.group  # pyrefly: ignore [bad-assignment]
+        outer_numel, outer_rnumel = outer_group
+        grouped_numel, grouped_rnumel = grouped_group
+        if V.graph.sizevars.statically_known_equals(outer_rnumel, grouped_rnumel):
+            return None
+
+        # The grouped candidate must be one small block-local reduction.
+        # We specialize the grouped reduction on that block size, so it must
+        # simplify to an exact static int. Multiple reductions in the grouped
+        # candidate (e.g. amax AND sum from the same input) are not supported.
+        grouped_reduction_info = cls._get_grouped_reduction_and_size(
+            grouped_node, grouped_rnumel
+        )
+        if grouped_reduction_info is None:
+            return None
+
+        # Total-element equality also implies divisibility of the grouped
+        # parent extent by group_size (grouped_total factors through
+        # FloorDiv(extent, group_size) * group_size). No separate Mod check
+        # is needed. The sizevars divisible set records Mod(s, s//G) from
+        # the view op, not Mod(s, G), so statically_known_equals on
+        # Mod(extent, group_size) would fail with dynamic shapes.
+        # TODO: teach sizevars to infer Mod(s, G)==0 from Mod(s, s//G)==0
+        outer_total = V.graph.sizevars.simplify(outer_numel * outer_rnumel)
+        grouped_total = V.graph.sizevars.simplify(grouped_numel * grouped_rnumel)
+        if not V.graph.sizevars.statically_known_equals(outer_total, grouped_total):
+            return None
+
+        grouped_reduction, group_size = grouped_reduction_info
+
+        grouped_axis = cls.get_grouped_axis(
+            grouped_reduction,
+            outer_numel,
+            outer_rnumel,
+            group_size,
+            outer_node=outer_node,
+        )
+        if grouped_axis is None:
+            return None
+        parent_grouped_axis = (
+            outer_rnumel if grouped_axis is cls.GroupedAxis.R else outer_numel
+        )
+        iter_ranges, _ = grouped_reduction.get_ranges()
+        if len(iter_ranges) == 2:
+            grouped_axis_groups = (
+                iter_ranges[1] if grouped_axis is cls.GroupedAxis.R else iter_ranges[0]
+            )
+            if not V.graph.sizevars.statically_known_equals(
+                FloorDiv(parent_grouped_axis, group_size), grouped_axis_groups
+            ):
+                return None
+        elif not V.graph.sizevars.statically_known_equals(
+            sympy.Mod(parent_grouped_axis, group_size), 0
+        ):
+            return None
+        group_size_int = int(group_size)
+        if not (1 <= group_size_int and is_power_of_2(group_size_int)):
+            return None
+        if cls._min_block_unprofitable_for_kernel(
+            outer_node,
+            outer_numel,
+            outer_rnumel,
+            grouped_axis=grouped_axis,
+            group_size=group_size_int,
+        ):
+            return None
+
+        return cls.plan_from_topology(
+            outer_node,
+            grouped_node,
+            grouped_reduction,
+            group_size,
+            grouped_axis,
+        )
+
+    @classmethod
+    def plan_from_topology(
+        cls,
+        outer_node: BaseSchedulerNode,
+        grouped_node: BaseSchedulerNode,
+        grouped_reduction: SchedulerNode,
+        group_size: sympy.Integer,
+        grouped_axis: GroupedAxis,
+    ) -> StagedReductionPlan | None:
+        """Rebuild mutable domains for an approved nested topology.
+
+        ``merge_loops`` rewrites loop bodies after fusion, so grouped-axis
+        discovery can no longer recover every axis approved at fusion time.
+        The axis and group size remain stable; ranges and domains do not.
+        """
+        _, (outer_numel, outer_rnumel) = outer_node.group
+        _, (grouped_numel, grouped_rnumel) = grouped_node.group
+        iter_ranges, reduce_ranges = grouped_reduction.get_ranges()
+        # Use PointwiseDomainContext.create if one is added; direct construction
+        # must not bypass derived sub-parent domains.
+        domain_context = cls.PointwiseDomainContext(
+            grouped_reduction=grouped_reduction,
+            grouped_numel=grouped_numel,
+            grouped_rnumel=grouped_rnumel,
+            local_reduction_domain=(*iter_ranges, *reduce_ranges),
+            parent_full_domain=(outer_numel, outer_rnumel),
+        )
+        pointwise_domains = cls._classify_nested_pointwise_nodes(
+            outer_node,
+            grouped_node,
+            domain_context,
+        )
+        if pointwise_domains is None or not cls._pointwise_domains_are_compatible(
+            domain_context, pointwise_domains
+        ):
+            return None
+        local_reduction_input_nodes = OrderedSet(
+            node
+            for node, domain in pointwise_domains
+            if domain is cls.PointwiseDomain.LOCAL_REDUCTION_INPUT
+        )
+
+        return StagedReductionPlan(
+            parent_nodes=tuple(
+                sn
+                for sn in outer_node.get_nodes()
+                if sn not in local_reduction_input_nodes
+            ),
+            parent_numel=outer_numel,
+            parent_rnumel=outer_rnumel,
+            nested_stage=NestedReductionStage(
+                group_size=group_size,
+                grouped_axis=grouped_axis,
+                grouped_nodes=tuple(grouped_node.get_nodes()),
+                domain_context=domain_context,
+                pointwise_domains=tuple(pointwise_domains),
+            ),
+            sub_parent_stages=(),
+        )
+
+    @classmethod
+    def can_fuse(cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> bool:
+        return cls.plan(node1, node2) is not None
+
+    @classmethod
+    def get_grouped_axis(
+        cls,
+        grouped_reduction: SchedulerNode,
+        outer_numel: sympy.Expr,
+        outer_rnumel: sympy.Expr,
+        group_size: sympy.Expr,
+        *,
+        outer_node: BaseSchedulerNode | None = None,
+    ) -> GroupedAxis | None:
+        """Return which parent axis is split by the grouped local reduction."""
+        sizevars = V.graph.sizevars
+        iter_ranges, reduce_ranges = grouped_reduction.get_ranges()
+        if len(iter_ranges) != 2 or len(reduce_ranges) != 1:
+            if len(iter_ranges) == 1 and len(reduce_ranges) == 1:
+                if not sizevars.statically_known_equals(reduce_ranges[0], group_size):
+                    return None
+                # [R / G] reduce G: parent X is singleton, so the local group
+                # splits the parent R axis.
+                if sizevars.statically_known_equals(
+                    FloorDiv(outer_rnumel, group_size), iter_ranges[0]
+                ) and sizevars.statically_known_equals(outer_numel, 1):
+                    return cls.GroupedAxis.R
+                # [R] reduce G: parent X is exactly one local group and is
+                # reduced away, leaving the parent R axis as the only iterator.
+                if sizevars.statically_known_equals(
+                    FloorDiv(outer_numel, group_size), 1
+                ) and sizevars.statically_known_equals(iter_ranges[0], outer_rnumel):
+                    return cls.GroupedAxis.X
+            return None
+        if not sizevars.statically_known_equals(reduce_ranges[0], group_size):
+            return None
+        # 2D group-in-R form: [X, R / G] reduce G. Dynamic view guards often
+        # preserve the quotient dimension even when Mod(R, G) is not directly
+        # provable.
+        if sizevars.statically_known_equals(
+            iter_ranges[0], outer_numel
+        ) and sizevars.statically_known_equals(
+            FloorDiv(outer_rnumel, group_size), iter_ranges[1]
+        ):
+            return cls.GroupedAxis.R
+        # 2D group-in-X form: [X / G, R] reduce G.
+        if sizevars.statically_known_equals(
+            iter_ranges[1], outer_rnumel
+        ) and sizevars.statically_known_equals(
+            FloorDiv(outer_numel, group_size), iter_ranges[0]
+        ):
+            return cls.GroupedAxis.X
+        if outer_node is not None:
+            return cls._get_grouped_axis_from_loop_body(outer_node, grouped_reduction)
+        return None
+
+    @classmethod
+    def _get_grouped_axis_from_loop_body(
+        cls, outer_node: BaseSchedulerNode, grouped_reduction: SchedulerNode
+    ) -> GroupedAxis | None:
+        """Use LoopBody iter/reduce vars to disambiguate equal-size axes."""
+        from torch._inductor.loop_body import MemoryUsageType
+
+        outer_reductions = [sn for sn in outer_node.get_nodes() if sn.is_reduction()]
+        if len(outer_reductions) != 1:
+            return None
+        outer_reduction = typing.cast(SchedulerNode, outer_reductions[0])
+        outer_body = getattr(outer_reduction, "_body", None)
+        grouped_body = getattr(grouped_reduction, "_body", None)
+        if outer_body is None or grouped_body is None:
+            return None
+
+        outer_iter_ranges, outer_reduce_ranges = outer_reduction.get_ranges()
+        grouped_iter_ranges, grouped_reduce_ranges = grouped_reduction.get_ranges()
+        if len(outer_reduce_ranges) != 1 or len(grouped_reduce_ranges) != 1:
+            return None
+
+        def load_exprs_by_name(body: LoopBody) -> dict[str, list[sympy.Expr]]:
+            result: dict[str, list[sympy.Expr]] = defaultdict(list)
+            for entry in body.memory_usage.get(MemoryUsageType.LOAD, ()):
+                if entry.buffer_name is not None:
+                    result[entry.buffer_name].append(
+                        body.indexing_exprs[entry.index_name]
+                    )
+            return result
+
+        if len(outer_body.reduce_vars) != 1 or len(grouped_body.reduce_vars) != 1:
+            return None
+        if len(outer_body.iter_vars) != len(outer_iter_ranges) or len(
+            grouped_body.iter_vars
+        ) != len(grouped_iter_ranges):
+            return None
+
+        outer_reads_by_name = load_exprs_by_name(outer_body)
+        result: NestedReduction.GroupedAxis | None = None
+        grouped_reduce_var = grouped_body.reduce_vars[-1]
+        for name, grouped_read_exprs in load_exprs_by_name(grouped_body).items():
+            outer_read_exprs = outer_reads_by_name.get(name)
+            if not outer_read_exprs:
+                continue
+            for grouped_read_expr in grouped_read_exprs:
+                grouped_coeff = grouped_read_expr.coeff(grouped_reduce_var)
+                if grouped_coeff == 0:
+                    continue
+                for outer_read_expr in outer_read_exprs:
+                    outer_reduce_var = outer_body.reduce_vars[-1]
+                    outer_reduce_coeff = outer_read_expr.coeff(outer_reduce_var)
+                    matches_reduction = grouped_coeff == outer_reduce_coeff
+                    matches_iter = any(
+                        grouped_coeff == outer_read_expr.coeff(var)
+                        for var in outer_body.iter_vars
+                    )
+                    if matches_reduction == matches_iter:
+                        continue
+                    candidate = (
+                        cls.GroupedAxis.R if matches_reduction else cls.GroupedAxis.X
+                    )
+
+                    if result is not None and result != candidate:
+                        return None
+                    result = candidate
+        return result
+
+
 class StagedReductionPlan:
     """How a reduction is to be written out, where it was cut into stages.
 
