@@ -5894,43 +5894,6 @@ class ArgProperty:
         }
 
 
-class ExternKernelSchema:
-    """How one external operation is called, as far as this needs to know.
-
-    Only what the generated call has to reproduce is recorded: the order the
-    arguments are passed in, which of them are keyword-only, and what each
-    defaults to.  An operation that was declared with no schema is called with
-    its arguments in the order they were given and nothing is defaulted.
-    """
-
-    def __init__(
-        self,
-        name: str,
-        arguments: Sequence | None = None,
-        kwarg_only: Sequence | None = None,
-    ) -> None:
-        self.name = name
-        self.arguments = list(arguments) if arguments is not None else []
-        self.kwarg_only = list(kwarg_only) if kwarg_only is not None else []
-
-    @property
-    def positional(self) -> list:
-        return [a for a in self.arguments if not a.kwarg_only]
-
-    def properties_for(self, n_inputs: int) -> list:
-        """The properties of the first ``n_inputs`` arguments, or blanks.
-
-        An operation declared with no schema still has arguments, and a blank
-        for each of them keeps the two lists the same length, so a caller
-        indexing one by argument position does not have to know whether the
-        operation was declared.
-        """
-
-        if self.arguments:
-            return [a.as_dict() for a in self.arguments]
-        return [{} for _ in range(n_inputs)]
-
-
 @dataclasses.dataclass
 class ProcessKernelResult:
     """The arguments of an external call, sorted into what has to be done to them.
@@ -5971,8 +5934,6 @@ class ExternKernel(InputsKernel):
     kwarg_properties: dict | None = None
     unbacked_bindings: dict = dataclasses.field(default_factory=dict)
     mutation_outputs: list = dataclasses.field(default_factory=list)
-    #: The declaration of how this operation is called, when one was given.
-    schema: "ExternKernelSchema | None" = None
 
     def __init__(
         self,
@@ -5986,7 +5947,6 @@ class ExternKernel(InputsKernel):
         cpp_kernel_name: str | None = None,
         ordered_kwargs_for_cpp_kernel: Iterable = (),
         op_overload: Any = None,
-        schema: "ExternKernelSchema | None" = None,
     ) -> None:
         super().__init__(
             name=name,
@@ -5997,7 +5957,6 @@ class ExternKernel(InputsKernel):
         self.kwargs = kwargs if kwargs else {}
         self.output_view = output_view
         self.op_overload = op_overload
-        self.schema = schema
         self.set_cpp_kernel_name(cpp_kernel_name)
         self.set_python_kernel_name(python_kernel_name)
         self.ordered_kwargs_for_cpp_kernel = ordered_kwargs_for_cpp_kernel
@@ -6048,19 +6007,34 @@ class ExternKernel(InputsKernel):
         past the end of one of them.
         """
 
-        if self.schema is not None:
-            self.arg_properties = self.schema.properties_for(len(self.inputs))
+        # Where the operation was declared, that declaration is the source of
+        # what each argument is called and what it defaults to.  Where it was
+        # not, there is a blank for each argument, so that the two lists stay
+        # the same length and a caller indexing one of them by argument
+        # position is not reading past the end of a shorter one.
+        declared = isinstance(self.op_overload, OpOverload)
+        if declared:
+            self.arg_properties = [
+                {
+                    "name": x.name,
+                    "type": x.real_type,
+                    "default_value": x.default_value,
+                }
+                for x in self.op_overload._schema.arguments
+                if not x.kwarg_only
+            ]
             self.allarg_properties = {
-                a.name: a.as_dict() for a in self.schema.arguments
+                x.name: {"type": x.real_type, "default_value": x.default_value}
+                for x in self.op_overload._schema.arguments
             }
             if not self.ordered_kwargs_for_cpp_kernel:
                 self.ordered_kwargs_for_cpp_kernel = [
-                    a.name for a in self.schema.kwarg_only
+                    x.name for x in self.op_overload._schema.arguments if x.kwarg_only
                 ]
-            self.schema_kwargs = list(self.schema.kwarg_only)
+            self.schema_kwargs = [
+                x for x in self.op_overload._schema.arguments if x.kwarg_only
+            ]
         else:
-            # Not every operation is declared, and one that is not is called the
-            # way it is handed over.
             self.arg_properties = [{} for _ in range(len(self.inputs))]
             self.allarg_properties = {}
             self.schema_kwargs = []
@@ -6801,14 +6775,12 @@ class ExternKernel(InputsKernel):
         """One argument's value, whether it was given by name or by position."""
 
         if arg_name in kwargs:
-            return kwargs[arg_name]
-        if self.schema is None:
-            return None
-        try:
-            pos = [a.name for a in self.schema.positional].index(arg_name)
-        except ValueError:
-            return None
-        return self.constant_args[pos] if pos < len(self.constant_args) else None
+            return kwargs.get(arg_name)
+        if arg_name in self.kwargs:
+            return self.kwargs.get(arg_name)
+        if (arg := self.allarg_properties.get(arg_name)) is not None:
+            return arg.get("default_value")
+        raise AssertionError(f"{arg_name} not in self.allarg_properties")
 
     def codegen_const_args(self, names: list | None = None) -> list:
         """The arguments that are written as they stand, rather than as memory.
