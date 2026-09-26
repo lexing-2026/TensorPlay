@@ -1653,7 +1653,7 @@ class PythonWrapperCodegen(CodeGen):
         )
         self.header.splice(
             """
-                operator_set = tp.ops
+                operator_set = tp.ops.tp
                 inductor_ops = tp.ops.inductor
             """,
             strip=True,
@@ -3107,7 +3107,7 @@ class PythonWrapperCodegen(CodeGen):
             off = self.codegen_sizevar(tgt_offset)
             expr = f"reinterpret_tensor({name}, {s}, {st}, {off})"
             if cast_dtype is not None and cast_dtype != base_dtype:
-                return f"view.dtype({expr}, {cast_dtype})"
+                return f"operator_set.view.dtype({expr}, {cast_dtype})"
             return expr
 
         name = data.get_name()
@@ -3125,7 +3125,7 @@ class PythonWrapperCodegen(CodeGen):
 
         if same_layout:
             if dtype is not None and dtype != base_dtype:
-                return f"view.dtype({name}, {dtype})"
+                return f"operator_set.view.dtype({name}, {dtype})"
             return f"{name}"
 
         return apply_reinterpret(name, size, stride, offset, dtype, base_dtype)

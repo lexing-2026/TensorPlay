@@ -138,7 +138,7 @@ class ConstantFolder(Any):
         if (
             is_woq_int8_pattern(node)
             or (
-                node.target is tp.ops.permute.default
+                node.target is tp.ops.tp.permute.default
                 and len(node.users) == 1
                 and is_woq_int8_pattern(next(iter(node.users)))
             )

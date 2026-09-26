@@ -81,7 +81,7 @@ from .op_lowerings import select_decomp_table
 
 
 log = logging.getLogger(__name__)
-operator_set = tp.ops
+operator_set = tp.ops.tp
 prims = tp.ops.prims
 
 Constant = Any
@@ -2118,7 +2118,7 @@ def _serialize_pattern(
             import operator
             import tensorplay
 
-            operator_set = tp.ops
+            operator_set = tp.ops.tp
             prims = tp.ops.prims
 
             """
