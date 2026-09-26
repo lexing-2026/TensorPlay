@@ -31,8 +31,10 @@ from .mm_common import (
     _is_static_problem,
     _use_small_mm_pointwise,
     device_capability,
+    load_kernel_template,
     mm_args,
     mm_grid,
+    persistent_mm_grid,
     use_aten_gemm_kernels,
     use_decompose_k_choice,
     use_native_matmul,
@@ -92,33 +94,6 @@ def persistent_mm_grid(m, n, meta, *, cdiv, min):
     return (min(meta["NUM_SMS"], cdiv(m, meta["BLOCK_M"]) * cdiv(n, meta["BLOCK_N"])), 1, 1)
 
 
-class GemmConfigHeuristics(TemplateConfigHeuristics):
-
-    """The candidates for a product, fitted to the product's size.
-
-    The operator is always the first candidate: it is the floor a measurement
-    can never lose against, and having it in the list is what makes the rest
-    of the list safe to measure.
-    """
-
-    def __init__(self, op_name: str = "mm", device_type: str = "cuda"):
-        self.op_name = op_name
-        self.device_type = device_type
-
-    def should_run(self, inputs: KernelInputs) -> bool:
-        return isinstance(inputs, MMKernelInputs)
-
-    def _get_template_configs_impl(self, kernel_inputs, op_name):
-        yield {"choice": "operator"}
-        rows, cols, inner = kernel_inputs.mnk_symbolic()
-        generator = CHOICES.get_mm_configs(self.device_type)
-        # The element's width goes in because the estimate that prunes a tile
-        # is in bytes: without it the estimate is unknown, and a tile the
-        # device could not stage would be offered and only found out at launch.
-        for config in generator(
-            rows, cols, inner, dtype_size=dtype_size(kernel_inputs.dtype(0))
-        ):
-            yield {"choice": "triton", **config.as_kwargs()}
 
 
 def _gemm_source_identity() -> str:
@@ -133,118 +108,6 @@ def _gemm_source_identity() -> str:
     return f"{GEMM_TUNING_VERSION}:{_kernel_source_digest()}"
 
 
-class GemmTemplate(KernelTemplate):
-
-    """Products, measured against the framework's own.
-
-    Validity belongs to the template: a configuration that does not fit this
-    call -- not two-dimensional, not the element type the tiles accumulate in,
-    not this device -- is refused here rather than by whoever is asking.
-    """
-
-    inputs_class = MMKernelInputs
-
-    def __init__(self, name: str = "gemm", hash: str | None = None):
-        super().__init__(name, hash=hash or _gemm_source_identity())
-        self.heuristics = GemmConfigHeuristics()
-
-    grid = staticmethod(mm_grid)
-
-
-    def out_specs(self, meta: dict) -> tuple:
-        size = meta.get("out_size")
-        if size is None:
-            raise NotImplementedError("a product without a result shape")
-        return (
-            Layout(
-                meta.get("device"),
-                meta.get("out_dtype"),
-                tuple(size),
-                contiguous_stride(size),
-            ),
-        )
-
-    def probe(self, meta: dict):
-        """A deterministic operand set for measuring this call's candidates.
-
-        The template owns its result, so it also knows the extents a product
-        has and can build the feed that exercises every lane of a candidate
-        without being handed the region's real tensors.
-        """
-
-        from ..codegen.triton_gemm import _probe_feed
-
-        if meta.get("b_transposed") or len(meta.get("operand_specs", ())) != 2:
-            return None
-        layout = self.out_specs(meta)[0]
-        if len(layout.size) != 2:
-            return None
-        sizes = meta.get("operand_sizes") or ()
-        if len(sizes) != 2:
-            return None
-        (rows, inner), (inner2, cols) = sizes
-        m, n = layout.size
-        if rows != m or cols != n or inner != inner2:
-            return None
-        if meta.get("out_dtype") is None:
-            return None
-        return _probe_feed(m, inner, n, layout.dtype, meta.get("device"), bias=False)
-
-    def generate(self, params: KernelTemplateParams, out_specs: tuple, meta: dict,
-                     plain_launch=None):
-        """The choice for one configuration, or ``None`` when it does not fit."""
-
-        kwargs = params.to_kwargs()
-        layout = out_specs[0] if out_specs else None
-        if kwargs.get("choice") == "operator":
-            if plain_launch is None:
-                return None
-            return ExternChoiceCaller(
-                name="framework_product",
-                layout=layout,
-                description="the operation itself",
-                launcher=plain_launch,
-            )
-        if layout is None or len(layout.size) != 2 or meta.get("transposed"):
-            return None
-        if meta.get("operand_dtype") != "float32":
-            return None
-        if not meta.get("qualifies", False):
-            return None
-        caller = ChoiceCaller(
-            name=f"{self.name}-{kwargs.get('BLOCK_M')}x{kwargs.get('BLOCK_N')}"
-            f"x{kwargs.get('BLOCK_K')}",
-            layout=layout,
-            description=repr(sorted(kwargs.items())),
-        )
-        caller.config_patches = {
-            key: kwargs[key]
-            for key in ("BLOCK_M", "BLOCK_N", "BLOCK_K", "num_warps", "num_stages")
-            if key in kwargs
-        }
-        return caller.bind(self.launcher(kwargs, meta, layout, plain_launch))
-
-    def launcher(self, kwargs: dict, meta: dict, layout, plain_launch):
-        """The kernel this template runs for one configuration.
-
-        Split out from generation because the forms differ in *which kernel*
-        they run, not in whether they run: the swept form walks the tiles
-        itself, the descriptor-driven form fetches them, the scaled forms
-        multiply factors somewhere different.  All of them answer the same
-        question the same way, so only this differs.
-        """
-
-        from ..codegen.triton_gemm import tuned_matmul_launch
-
-        return tuned_matmul_launch(
-            plain_launch,
-            meta.get("probe_feed") or meta.get("feed") or (),
-            meta["operand_specs"],
-            layout.size,
-            bias_spec=meta.get("bias_spec"),
-            b_transposed=bool(meta.get("b_transposed", False)),
-            config=kwargs,
-        )
 
 
 
@@ -263,62 +126,23 @@ class GemmTemplate(KernelTemplate):
 
 
 
-class PersistentGemmTemplate(GemmTemplate):
 
-    """The product again, this time swept by a fixed number of programs.
+# Each template's body lives in a file named for the dialect it is written in,
+# and is loaded by that file's name.  The template's own name is a separate
+# fact: it is what the operation is called, and what the rule about this kernel
+# is filed under, so the two are given separately.
+GEMM = TritonTemplate(
+    name="mm",
+    grid=mm_grid,
+    source=load_kernel_template("triton_mm"),
+    cache_codegen_enabled_for_template=True,
+)
 
-    Same tile space, same arithmetic, same candidates as the plain product --
-    the difference is only in how many programs there are and how the work is
-    divided between them.  So it is a separate template rather than another
-    configuration of the first one: the geometry it wants is a property of the
-    launch, not of the tile, and a configuration that changed the launch's
-    shape would be claiming a choice the tile never had a say in.
-    """
-
-    grid = staticmethod(persistent_mm_grid)
-
-    def __init__(self, name: str = "mm_persistent", hash: str | None = None):
-        super().__init__(
-            name, hash=hash or f"persistent:{_gemm_source_identity()}"
-        )
-
-    def configurations(self, out_specs, meta):
-        """The same candidates, carrying the cap the grid is built from.
-
-        The cap is not a choice -- it is a property of the device -- so it rides
-        along with the configuration rather than being one, which is what lets
-        the grid be computed from a configuration alone.
-        """
-
-        for params in super().configurations(out_specs, meta):
-            kwargs = params.to_kwargs()
-            kwargs["NUM_SMS"] = num_sms(meta.get("device"))
-            yield DictKernelTemplateParams(kwargs)
-
-    def launcher(self, kwargs, meta, layout, plain_launch):
-        """The swept kernel, which is the whole difference from the plain one."""
-
-        from ..codegen.triton_gemm import persistent_matmul_launch
-
-        tiles = (
-            -(-int(layout.size[0]) // int(kwargs["BLOCK_M"]))
-            * -(-int(layout.size[1]) // int(kwargs["BLOCK_N"]))
-        )
-        num_sms = int(kwargs.get("NUM_SMS", 1))
-        return persistent_matmul_launch(
-            plain_launch,
-            meta["operand_specs"],
-            layout.size,
-            kwargs,
-            num_sms=num_sms,
-            group_m=int(kwargs.get("GROUP_M", 8)),
-            bias_spec=meta.get("bias_spec"),
-            b_transposed=bool(meta.get("b_transposed", False)),
-        )
-
-GEMM = GemmTemplate()
-
-GEMM_PERSISTENT = PersistentGemmTemplate()
+GEMM_PERSISTENT = TritonTemplate(
+    name="mm_persistent",
+    grid=persistent_mm_grid,
+    source=load_kernel_template("triton_persistent_mm"),
+)
 
 
 
@@ -485,231 +309,36 @@ def contiguous_addmm(inp, a, b):
     return tp.addmm(inp, a, b.contiguous())
 
 
-class _DescriptorDrivenTemplate(PersistentGemmTemplate):
 
-    """A product whose tiles are read through a descriptor.
 
-    The arithmetic and the tile space are the persistent product's; what
-    differs is how a tile is fetched.  A descriptor is built on the host from a
-    base pointer, a shape, strides and a block shape, and the kernel then asks
-    for tiles by coordinate rather than by address -- so the address arithmetic
-    that a persistent product would repeat per tile is stated once, on the
-    host, and the kernel spends its registers on the arithmetic instead.
 
-    The cost is a hardware requirement rather than a preference: a descriptor
-    is a feature of the memory system, and on a machine without it the kernel
-    cannot run at all.  So the template asks the device before it offers
-    anything, and a machine that cannot answer is a machine this template has
-    nothing to say about.
-    """
 
-    minimum_major = 9
 
-    maximum_major: int | None = None
 
-    def __init__(self, name: str, hash_suffix: str = ""):
-        super().__init__(
-            name, hash=f"{name}:{hash_suffix}:{_gemm_source_identity()}"
-        )
 
-    def supports_device(self, device=None) -> bool:
-        major, _minor = device_capability(device)
-        if major < self.minimum_major:
-            return False
-        if self.maximum_major is not None and major >= self.maximum_major:
-            return False
-        return True
+GEMM_PERSISTENT_TMA = TritonTemplate(
+    name="mm_persistent_tma",
+    grid=persistent_mm_grid,
+    source=load_kernel_template("triton_persistent_tma_mm"),
+)
 
-    def generate(self, params, out_specs, meta, plain_launch=None):
-        """The launcher, or ``None`` when the device cannot run this form.
+BLACKWELL_WS_PERSISTENT_TMA = TritonTemplate(
+    name="blackwell_ws_persistent_device_tma",
+    grid=persistent_mm_grid,
+    source=load_kernel_template("triton_blackwell_ws_persistent_device_tma_mm"),
+)
 
-        The check comes first and it is not a formality: the kernel's tiles are
-        fetched through a descriptor, which is a feature of the memory system,
-        so on a machine without one there is no kernel to return.  Returning
-        the persistent product's launcher instead would be worse than nothing
-        -- it would be a kernel that runs and is not the thing that was asked
-        for.
-        """
+GEMM_MAIN_LOOP_SCALING = TritonTemplate(
+    name="scaled_mm_device_tma_main_loop_scaling",
+    grid=persistent_mm_grid,
+    source=load_kernel_template("triton_main_loop_scaled_mm"),
+)
 
-        if not self.supports_device(meta.get("device")):
-            return None
-        if plain_launch is None:
-            return None
-        kwargs = params.to_kwargs()
-        if "BLOCK_M" not in kwargs:
-            return None
-        from ..codegen.triton_gemm_tma import tma_gemm_launch
-
-        specs = tuple(meta.get("operand_specs") or ())
-        sizes = tuple(meta.get("operand_sizes") or ())
-        if len(specs) < 2 or len(sizes) < 2:
-            return None
-
-        inputs = MMKernelInputs(
-            shapes=sizes,
-            dtypes=(meta.get("operand_dtype"),) * len(sizes),
-            device=meta.get("device"),
-            operands=specs,
-            out_dtype=meta.get("out_dtype"),
-            extra=meta,
-        )
-        try:
-            m, n, k = inputs.mnk()
-        except (NotImplementedError, AssertionError):
-            return None
-        geometry = {
-            "mnk": (m, n, k),
-            "num_sms": int(kwargs.get("NUM_SMS", 1)),
-            "a_shape": sizes[0],
-            "a_stride": tuple((meta.get("operand_strides") or ((0,) * len(sizes[0]),))[0]),
-            "b_shape": sizes[1],
-            "b_stride": tuple((meta.get("operand_strides") or ((0,) * len(sizes[0]), (0,) * len(sizes[1])))[1]),
-            "has_workspace": bool(getattr(self, "uses_workspace", False)),
-        }
-        layout = out_specs[0] if out_specs else None
-        return TritonChoiceCaller(
-            name=f"{self.name}-{kwargs['BLOCK_M']}x{kwargs['BLOCK_N']}x{kwargs['BLOCK_K']}",
-            layout=layout,
-            description=repr(sorted(kwargs.items())),
-            source=f"{self.name}:{sorted(kwargs.items())}",
-        ).bind(
-            tma_gemm_launch(
-                specs[0], specs[1], geometry, kwargs, plain_launch,
-                allow_tf32=bool(meta.get("allow_tf32", False)),
-            )
-        )
-
-class PersistentTmaGemmTemplate(_DescriptorDrivenTemplate):
-
-    """The persistent product, reading its tiles through descriptors."""
-
-    def __init__(self):
-        super().__init__("mm_persistent_tma", "descriptor")
-
-class BlackwellWorkspacePersistentTmaTemplate(_DescriptorDrivenTemplate):
-
-    """The persistent descriptor-driven product, as the later generation has it.
-
-    The form differs from its predecessor in what it carries between tiles
-    rather than in how it fetches them: a workspace sized by the device's own
-    limits is what lets a tile's partial result outlive the tile that produced
-    it, which is what the earlier persistent form has to keep in registers.
-    The workspace is a property of the device, so the template refuses the
-    machines whose limits it does not have.
-    """
-
-    #: What distinguishes this form from its predecessor: a tile's partial can
-    #: outlive the tile that produced it, which needs scratch space sized by
-    #: the device rather than registers.
-    uses_workspace = True
-
-    def __init__(self):
-        super().__init__("blackwell_ws_persistent_device_tma", "workspace-descriptor")
-        self.minimum_major = 10
-
-class ScaledGemmConfigHeuristics(GemmConfigHeuristics):
-
-    """The product's candidates, but only where the call carries factors.
-
-    A scaled product is a different arithmetic rather than a different
-    schedule, so it is not a candidate for an unscaled call: offering it there
-    would have the measurement compare two answers and report the faster one,
-    and the faster one would be whichever ignored the factors.
-    """
-
-    def should_run(self, inputs: KernelInputs) -> bool:
-        return super().should_run(inputs) and bool(
-            inputs.extra.get("has_scales")
-        )
-
-class ScaledGemmTemplate(PersistentGemmTemplate):
-
-    """A product whose operands carry their own factors.
-
-    Where the factors are applied is the whole difference between the two
-    forms, and it is not a tuning knob:
-
-      in the main loop   each tile of an operand is scaled as it arrives, so
-                         the accumulator only ever holds unscaled products and
-                         the factors are paid for once per tile rather than
-                         once per element of the result
-      in the epilogue    the accumulator is scaled once at the end, which is
-                         fewer operations and is wrong whenever the factors
-                         would have to be held at the accumulator's width
-
-    So the site of the scaling is what distinguishes them, and a call cannot be
-    offered both without asking which one it meant.
-    """
-
-    scale_site = "main_loop"
-
-    def __init__(self, name: str, scale_site: str = "main_loop"):
-        super().__init__(
-            name, hash=f"{name}:{scale_site}:{_gemm_source_identity()}"
-        )
-        self.scale_site = scale_site
-        self.heuristics = ScaledGemmConfigHeuristics()
-
-    def generate(self, **kwargs):
-        # A template that is only offered when the operands carry their own
-        # scales: without them there is nothing here that the unscaled kernel
-        # does not already do, and offering it would put a second candidate in
-        # a list that a measurement would then have to spend time on to reject.
-        if not kwargs.get("has_scales"):
-            return None
-        return super().generate(**kwargs)
-
-    def launcher(self, kwargs, meta, layout, plain_launch):
-        """The scaled kernel, for the site this form scales at.
-
-        The factors are operands, not constants: a call that has them names
-        where they are, and the kernel reads the part its tile needs.  So the
-        two forms differ only in the site, and a call cannot be offered both
-        without saying which one it meant.
-        """
-
-        from ..codegen.triton_gemm_scaled import scaled_gemm_launch
-
-        scale_specs = tuple(meta.get("scale_specs") or ())
-        if len(scale_specs) < 2:
-            return plain_launch
-        return scaled_gemm_launch(
-            meta["operand_specs"][0],
-            meta["operand_specs"][1],
-            scale_specs[0],
-            scale_specs[1],
-            {
-                "mnk": (int(layout.size[0]), int(layout.size[1]),
-                        int((meta.get("operand_sizes") or ((0, 0), (0, 0)))[0][1])),
-                "scale_site": self.scale_site,
-                "recipe_a": int(meta.get("recipe_a", 0)),
-                "recipe_b": int(meta.get("recipe_b", 0)),
-            },
-            kwargs,
-            plain_launch,
-        )
-
-class MainLoopScaledGemmTemplate(ScaledGemmTemplate):
-
-    """The scaled product, with each operand's factor applied as it arrives."""
-
-    def __init__(self):
-        super().__init__("mm_main_loop_scaling", scale_site="main_loop")
-
-class EpilogueScaledGemmTemplate(ScaledGemmTemplate):
-
-    """The scaled product, with the factors applied once to the accumulator."""
-
-    def __init__(self):
-        super().__init__("mm_epilogue_scaling", scale_site="epilogue")
-
-GEMM_PERSISTENT_TMA = PersistentTmaGemmTemplate()
-
-BLACKWELL_WS_PERSISTENT_TMA = BlackwellWorkspacePersistentTmaTemplate()
-
-GEMM_MAIN_LOOP_SCALING = MainLoopScaledGemmTemplate()
-
-GEMM_EPILOGUE_SCALING = EpilogueScaledGemmTemplate()
+GEMM_EPILOGUE_SCALING = TritonTemplate(
+    name="scaled_mm_device_tma_epilogue_scaling",
+    grid=persistent_mm_grid,
+    source=load_kernel_template("triton_epilogue_scaled_mm"),
+)
 
 #: The candidates this module offers.  A product's own module owns the ones that
 #: are its way of being done, so a template and the candidates it belongs with

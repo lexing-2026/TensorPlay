@@ -394,42 +394,6 @@ __all__ = ["ExternStep", "FusedStep", "HostStep", "LoopProgram", "Step"]
 # ---------------------------------------------------------------------------
 
 
-def inputs_for(template, meta: dict):
-    """The inputs a template is handed for one call.
-
-    The template says which kind of inputs its operands are; building the
-    record from a call is the runtime's job, because a call arrives as a
-    dictionary of extents and a template asks for something with names.
-    """
-
-    import inspect
-
-    inputs_class = getattr(template, "inputs_class", None)
-    if inputs_class is None:
-        raise NotImplementedError(f"{template.name} does not say what its operands are")
-    sizes = tuple(meta.get("operand_sizes") or ())
-    offered = {
-        "shapes": sizes,
-        "strides": tuple(meta.get("operand_strides") or ()),
-        "dtypes": tuple([meta.get("operand_dtype")] * len(sizes)),
-        "device": meta.get("device"),
-        "operands": tuple(meta.get("operand_specs") or ()),
-        "feed": tuple(meta.get("feed") or ()),
-        "probe_feed": tuple(meta.get("probe_feed") or ()),
-        "scalars": tuple(
-            (name, meta[name]) for name in sorted(meta) if name in _TEMPLATE_SCALARS
-        ),
-        "out_dtype": meta.get("out_dtype"),
-        "mat1_idx": meta.get("mat1_idx", -2),
-        "mat2_idx": meta.get("mat2_idx", -1),
-        "extra": meta,
-    }
-    # Not every kind of inputs says the same things: a product is told which
-    # operand is which, a convolution is not.  Passing what the record does not
-    # declare would make the record's shape a decision of the caller rather
-    # than of the template that asked for it.
-    declared = set(inspect.signature(inputs_class).parameters)
-    return inputs_class(**{k: v for k, v in offered.items() if k in declared})
 
 
 #: The names a call may carry that are numbers the template sizes itself by,
@@ -441,62 +405,13 @@ _TEMPLATE_SCALARS = frozenset({"alpha", "beta", "groups", "ceil_mode"})
 from .templates.select_algorithm import make_ktc_generator
 
 
-def _as_launcher(built):
-    """The thing to call, whether the template handed back a choice or a launcher.
-
-    A template's answer is a choice: it knows its kernel, its layout and how it
-    was built, and it is the right thing to keep.  A step wants something it
-    can call, and it keeps that for the life of the program.  So the unwrapping
-    happens here, once, where the two meet -- rather than in every place a
-    choice might be handed on.
-    """
-
-    if built is None:
-        return None
-    to_callable = getattr(built, "to_callable", None)
-    return built if to_callable is None else to_callable()
-
-
-def _configurations(template, out_specs, meta):
-    """The configurations worth considering, as the heuristic states them."""
-
-    inputs = template.heuristics.adjust_kernel_inputs(inputs_for(template, meta), template.name)
-    return template.heuristics.get_template_configs(inputs, template.name)
 
 
 
-def choices(template, meta: dict) -> list:
-    """Every configuration that applies to this call."""
-
-    return collect(template, meta, lambda choice, plain: choice.resolve(plain))
 
 
-def collect(template, meta: dict, build) -> list:
-    """Build the applicable choices, leaving out the ones that do not fit.
 
-    The configurations come from the heuristic, the overrides are what
-    this call imposes on all of them, and the pairing is the one the
-    deferred-choice generator owns -- so there is a single way for a
-    configuration to become a choice, whichever template asked for it.
-    """
 
-    specs = template.out_specs(meta)
-    inputs = template.heuristics.adjust_kernel_inputs(inputs_for(template, meta), template.name)
-    overrides = dict(template.heuristics.get_extra_kwargs(inputs, template.name))
-    if specs:
-        overrides.setdefault("out_size", tuple(specs[0].size))
-        overrides.setdefault("out_dtype", specs[0].dtype)
-    out = []
-    for choice in make_ktc_generator(
-        template,
-        _configurations(template, specs, meta),
-        {},
-        overrides,
-        specs[0] if specs else None,
-        inputs,
-    ):
-        maybe_append_choice(template, out, choice, build)
-    return out
 
 
 def maybe_append_choice(template, choices: list, choice, build) -> Any:
@@ -511,40 +426,3 @@ def maybe_append_choice(template, choices: list, choice, build) -> Any:
     return None
 
 
-def select(template, meta: dict, build) -> tuple:
-    """Choose among this call's configurations and return the winner.
-
-    The choice is made while the region is compiled, so the kernel a
-    region runs is settled before it ever runs.  The operator itself is
-    always among the candidates, which is what makes measuring safe: the
-    worst a measurement can conclude is that the operator was already the
-    best of them.
-    """
-
-    choices = collect(template, meta, build)
-    if not choices:
-        return None, None
-    if len(choices) == 1 or not meta.get("bench", True):
-        return _as_launcher(build(choices[0], None)), choices[0].params
-    from .runtime.stax_autotune import bench_candidates
-
-    built = {}
-
-    def materialise(candidate, plain):
-        # What is measured is the launcher, not the choice that holds it: the
-        # benchmark harness calls what it is given, and a choice is a record of
-        # a kernel rather than the kernel.  The choice is kept alongside so the
-        # winner can be named.
-        launcher = _as_launcher(build(candidate, plain))
-        built[candidate] = launcher
-        return launcher
-
-    feed = meta.get("probe_feed")
-    if feed is None:
-        return _as_launcher(build(choices[0], None)), choices[0].params
-    best, _launch, _time = bench_candidates(
-        materialise, choices, feed, rounds=meta.get("rounds", 2)
-    )
-    if best is None:
-        best = choices[0]
-    return _as_launcher(built.get(best) or build(best, None)), best.params

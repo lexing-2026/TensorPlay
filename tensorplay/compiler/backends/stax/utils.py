@@ -10,6 +10,8 @@ rewritten at each call site.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import contextlib
 import enum
 import functools
@@ -1576,6 +1578,40 @@ def can_use_tma(*matrices, output_layout=None, add_guards: bool = False) -> bool
     )
 
 
+def use_contiguous(m, n, k) -> bool:
+    """Whether to make the right operand contiguous before multiplying by it.
+
+    The rewrite copies that operand into a shape whose tiles can be addressed
+    directly, and the copy is only worth making when the kernel then reads it
+    fewer times than the copy costs -- which is a question about how much wider
+    the contraction is than the two extents being tiled, and only on the
+    hardware where that trade goes the other way.
+
+    Answered "no" wherever the threshold is unset rather than by a default
+    number: a program on hardware this was not measured for should not be
+    rewriting its operands because of a figure meant for another, and a run that
+    compiles ahead of time or emits a C++ wrapper has no launch to fold the copy
+    into anyway.
+    """
+
+    threshold = config.rocm.contiguous_threshold
+    if not tp.version.hip or threshold is None:
+        return False
+
+    from .loops import V
+
+    return bool(
+        V.graph.sizevars.statically_known_true(
+            sympy.And(
+                sympy.Ge(k, threshold * m),
+                sympy.Ge(k, threshold * n),
+            )
+        )
+        and not V.graph.aot_mode
+        and not V.graph.cpp_wrapper
+    )
+
+
 def is_dynamic(*args) -> bool:
     """Whether any of these values has a shape or a stride not yet settled.
 
@@ -2592,3 +2628,31 @@ def python_subprocess_env() -> dict[str, str]:
     if config.is_fbcode():
         env["PYTHONHOME"] = sysconfig.get_path("data")
     return env
+
+
+def clear_caches() -> None:
+    """Empty every cache that was registered to be emptied with the directory.
+
+    Registered rather than found, because a cache that is not found is a
+    cache that is not emptied, and the one that is not emptied is the one
+    that makes a fresh directory look like the old one.
+    """
+    for obj in _registered_caches:
+        obj.cache_clear()
+
+
+def apply_subprocess_env(extra_env: Mapping[str, str | None] | None) -> None:
+    """Apply the environment a parent sent to a worker that is already running.
+
+    A worker outlives the request that started it, so the environment it was
+    started with goes stale as the parent's changes.  A name mapped to nothing
+    is removed rather than set to an empty value: the parent does not have it,
+    so the worker should not either, and an empty value is a value.
+    """
+    if extra_env is None:
+        return
+    for key, value in extra_env.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value

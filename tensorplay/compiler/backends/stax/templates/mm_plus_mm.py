@@ -31,16 +31,15 @@ from .triton import CHOICES, dtype_size
 
 from .select_algorithm import TritonTemplate
 from .mm import (
-    GemmConfigHeuristics,
-    GemmTemplate,
     MMKernelInputs,
     _gemm_source_identity,
     contiguous_stride,
     mm_grid,
 )
+from ..heuristics.template.base import TemplateConfigHeuristics
 from .mm_common import descriptor_extents_fit, descriptor_offset_fits
 
-class MmPlusMmConfigHeuristics(GemmConfigHeuristics):
+class MmPlusMmConfigHeuristics(TemplateConfigHeuristics):
 
     """The candidates for two products measured as one.
 

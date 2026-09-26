@@ -80,9 +80,9 @@ INDEX_DTYPE = {{ index_dtype }}
                     other=tl.zeros((), dtype=B_ptr.dtype.element_ty),
                 )
 {%- if USE_FAST_ACCUM %}
-            acc = tl.dot(a, b, acc, input_precision="{{ precision }}")
+            acc = tl.dot(a, b, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
 {%- else %}
-            acc += tl.dot(a, b, input_precision="{{ precision }}")
+            acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
 {%- endif %}
             a_ptrs += BLOCK_K * stride_ak
             b_ptrs += BLOCK_K * stride_bk

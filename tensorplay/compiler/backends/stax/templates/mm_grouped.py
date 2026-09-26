@@ -30,6 +30,7 @@ from ..op_lowerings import register_lowering
 from ..codegen.cutedsl.cutedsl_template import CuteDSLTemplate
 from ..kernel_inputs import KernelInputs, MMKernelInputs
 from ..ir import Layout
+from ..heuristics.template.base import TemplateConfigHeuristics
 from .mm_common import (
     check_supported_striding,
     use_aten_gemm_kernels,
@@ -51,8 +52,6 @@ from ..runtime.triton_compat import tl
 from ..utils import get_gpu_shared_memory, get_max_num_sms, get_num_sms, has_free_symbols, use_blackwell_cutedsl_grouped_mm
 from ..virtualized import V
 from .mm import (
-    GemmConfigHeuristics,
-    GemmTemplate,
     MMKernelInputs,
     _gemm_source_identity,
     contiguous_stride,
@@ -189,7 +188,7 @@ def grouped_extents(shapes: tuple, scaled: bool):
         "shapes": (first, second),
     }
 
-class GroupedMmConfigHeuristics(GemmConfigHeuristics):
+class GroupedMmConfigHeuristics(TemplateConfigHeuristics):
 
     """The candidates for a number of products of the same extents.
 

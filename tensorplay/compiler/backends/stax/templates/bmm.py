@@ -50,10 +50,7 @@ import itertools
 from .ir import contiguous_stride, next_power_of_2
 
 from .mm_common import mm_grid
-from .mm import (
-    GemmConfigHeuristics, GemmTemplate, MMKernelInputs, _gemm_source_identity,
-    contiguous_stride,
-)
+from .mm import MMKernelInputs, contiguous_stride
 from .select_algorithm import ExternKernelChoice, TritonTemplate
 
 @SymbolicGridFn

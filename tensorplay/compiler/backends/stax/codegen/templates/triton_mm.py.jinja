@@ -26,10 +26,6 @@ import triton.language as tl
     property of the call, and a body that narrows an index has to name the type
     it narrows to. #}
 INDEX_DTYPE = {{ index_dtype }}
-{#- What the accumulation happens in.  Named here because the body uses it in
-    every step of the loop and a type that differs between launches would make
-    the same source mean two different sums. #}
-ACC_TYPE = {{ acc_dtype }}
 
 
 {{ def_kernel("A", "B", outputs=("C",)) }}
