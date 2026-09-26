@@ -259,15 +259,6 @@ def _lower_stax_region(
                 strict_native=strict, dynamic=dynamic_shapes,
             ),
         )
-    if use_native and use_fusion and use_cuda_codegen:
-        route(
-            "stax-cuda",
-            True,
-            lambda: _lower_cuda_fused_pointwise(
-                graph_module, example_inputs,
-                strict_native=strict, dynamic=dynamic_shapes,
-            ),
-        )
     if use_native and use_triton:
         # Keep Triton optional and lazy.  Importing tensorplay on a CPU-only
         # machine must not import Triton or its compiler toolchain.
@@ -307,41 +298,33 @@ def _lower_stax_region(
                     )
                 return None
 
+        # One lowering per device.  On an accelerator the loop IR is it: the
+        # boundary traces the region, splits it and hands each half to the
+        # compiler above.  The routes below are the host backend, chosen by
+        # the device the tensors live on rather than by which one answers
+        # first, so a form this device's lowering does not cover is a form the
+        # framework runs itself -- not a hop to a second emitter for the same
+        # device.
         route("stax-loops", on_cuda, build_loop_region, codegen="triton")
-        route(
-            "stax-fused-cuda-rowfuse",
-            use_fusion,
-            lambda: _lower_cuda_row_fusion(
-                graph_module, example_inputs,
-                strict_native=strict, dynamic=dynamic_shapes,
-            ),
-        )
-    if use_native and use_fusion and not use_cuda_codegen:
-        route(
-            "stax-cuda",
-            True,
-            lambda: _lower_cuda_fused_pointwise(
-                graph_module, example_inputs,
-                strict_native=strict, dynamic=dynamic_shapes,
-            ),
-        )
+
     # The AOT boundary is a property of the graph's gradient surface, not of
     # the callable's shape: bare functions carry no training flag, so a
     # grad-carrying input list must select the split forward/backward route
     # exactly as a training module does.  The builder re-checks grad mode and
-    # returns None for inference calls, leaving the other routes untouched.
+    # returns None for inference calls.
     route(
         "stax-aot-native",
-        use_native and training,
+        use_native and training and not on_cuda,
         lambda: _keep_native_graph(
             graph_module,
             _lower_aot_native(graph_module, example_inputs, use_fusion=use_fusion),
         ),
     )
-    if use_native and use_fusion:
-        # Nothing claimed the region whole.  Its fusible runs are still worth
-        # compiling: each becomes one kernel, and the operators between them
-        # run as captured instead of the region losing every compiled route.
+    if use_native and use_fusion and not on_cuda:
+        # Nothing claimed the region whole on the host.  Its fusible runs are
+        # still worth compiling: each becomes one kernel, and the operators
+        # between them run as captured instead of the region losing every
+        # compiled route.
         route(
             "stax-fused-cpu-segments",
             True,
@@ -357,7 +340,7 @@ def _lower_stax_region(
     native_fusion = use_fusion and not training
     route(
         "stax-native",
-        use_native,
+        use_native and not on_cuda,
         lambda: _keep_native_graph(
             graph_module,
             _lower_native(graph_module, example_inputs, use_fusion=native_fusion),
