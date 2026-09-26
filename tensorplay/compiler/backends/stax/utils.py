@@ -1719,6 +1719,30 @@ def get_triton_attrs_descriptor_version() -> TritonAttrsDescriptorVersion:
         return TritonAttrsDescriptorVersion.V4_DICT
 
 
+#: Which form of kernel the host backend takes, and so what a compiled kernel
+#: is called on disk.  The host backend is told which to produce through the
+#: environment, and the extension follows from the answer.
+#: Whether a rename onto an existing file works here.  Where it does not, a
+#: write that must be atomic is a copy and a remove, which is not atomic -- so
+#: there the name has to be one nobody else is looking for.
+_IS_WINDOWS = sys.platform == "win32"
+
+XPU_KERNEL_FORMAT = (
+    "spv" if _IS_WINDOWS else os.getenv("TP_XPU_KERNEL_FORMAT", "zebin")
+)
+
+#: What a compiled kernel is called, per device kind.  A device is handed the
+#: binary its own driver loads, and each driver names it its own way.
+GPU_KERNEL_BIN_EXTS = {
+    "cuda": ".cubin",
+    "hip": ".hsaco",
+    "xpu": f".{XPU_KERNEL_FORMAT}",
+}
+
+GPU_ALIGN_BYTES = 16
+ALIGNMENT = 16
+
+
 def tlx_only_cuda_options() -> list[str]:
     """Compile options that only exist in a runtime that has them.
 
@@ -2577,6 +2601,11 @@ OPTIMUS_EXCLUDE_POST_GRAD = [
 #: The device kinds a compiled region can be placed on and given a kernel for.
 GPU_TYPES = ["cuda", "mps", "xpu", "mtia"]
 
+#: The device kinds whose one-dimensional library takes its own layout and
+#: gains from having it, so that a region is laid out for them when it holds
+#: calls of the kind that library is used for.
+SUPPORTED_MKLDNN_DEVICES = ("cpu", "xpu")
+
 
 def get_gpu_type() -> str:
     """The one kind of device this process can actually run on.
@@ -2693,3 +2722,145 @@ def apply_subprocess_env(extra_env: Mapping[str, str | None] | None) -> None:
             os.environ.pop(key, None)
         else:
             os.environ[key] = value
+
+
+#: The operations that move data between ranks, by the name this project
+#: gives them.  Written out rather than derived, because which operations
+#: count as moving data between ranks is a fact about the program, not about
+#: what any of them is implemented with.
+COLLECTIVE_OPS = OrderedSet(
+    [
+        "tp.all_reduce.default",
+        "tp.all_reduce_.default",
+        "tp.all_gather_into_tensor.default",
+        "tp.reduce_scatter_tensor.default",
+        "tp.all_to_all_single.default",
+        "tp.isend.default",
+        "tp.irecv.default",
+        "tp.batch_p2p_ops.default",
+    ]
+)
+
+
+def is_collective_op(op_name: str) -> bool:
+    """Whether an operation, by name, moves data between ranks."""
+    return op_name in COLLECTIVE_OPS
+
+
+def is_wait(node: Any) -> bool:
+    """Whether a value is a wait: a thing to be waited on rather than done.
+
+    A wait is not a collective even though it is written like one and
+    happens next to one, which is why it is asked about separately.
+    """
+    from . import ir
+
+    return type(node) is ir._WaitKernel
+
+
+def is_collective(node: Any, op: Any = None) -> bool:
+    """Whether a value is a collective, optionally of one particular kind.
+
+    A collective is a kernel that moves data between ranks.  It is not any
+    value that mentions a group: a wait mentions one and moves nothing, and
+    a fallback that happens to have been given a collective's name is
+    decided by what it actually is rather than by what it is called.
+    """
+    if node is None:
+        return False
+    from . import ir
+
+    return (
+        isinstance(node, ir._CollectiveKernel)
+        and not isinstance(node, ir._WaitKernel)
+        and (op is None or node.op_overload is op)
+    )
+
+
+def contains_collective(snode: Any, filter_fn: Any = None) -> bool:
+    """Whether anything under a scheduled node is a collective.
+
+    A group stands for several nodes and is a collective if any of them is,
+    which is why the question is asked of a node rather than of an
+    operation: the same operation can be a collective in one group and not
+    in another, depending on what else is grouped with it.
+    """
+    from .scheduler import GroupedSchedulerNode
+
+    if isinstance(snode, GroupedSchedulerNode):
+        return any(contains_collective(x) for x in snode.snodes)
+    return is_collective(snode.node) and (filter_fn is None or filter_fn(snode))
+
+
+def contains_wait(snode: Any) -> bool:
+    """Whether anything under a scheduled node is a wait."""
+    from .scheduler import GroupedSchedulerNode
+
+    if isinstance(snode, GroupedSchedulerNode):
+        return any(contains_wait(x) for x in snode.snodes)
+    return is_wait(snode.node)
+
+
+def is_fallback_op(node: Any, op: Any) -> bool:
+    """Whether a value is a fallback kernel for one of the given operations.
+
+    Named by the operation rather than by how the kernel works, because that
+    is what a caller asking has: whether this particular operation was
+    carried out by a kernel generated ahead of time.
+    """
+    from tensorplay._ops import OpOverload
+
+    from . import ir
+
+    if isinstance(op, OpOverload):
+        op = [op]
+    return isinstance(node, ir.FallbackKernel) and node.op_overload in op
+
+
+def cmp(a: int, b: int) -> int:
+    """Which of two is larger, as a number: one, none, or minus one.
+
+    A number rather than a bool so that several can be added up, which is
+    what ordering several things by several keys comes to.
+    """
+    return int(a > b) - int(a < b)
+
+
+def is_gpu(device: str | None) -> bool:
+    """Whether a device is one that runs kernels rather than interpreting them."""
+    return device in GPU_TYPES
+
+
+def device_need_guard(device: str) -> bool:
+    """Whether work on a device has to be told apart from work elsewhere.
+
+    A guard is what keeps one device's work from being reordered against
+    another's.  A device that has no notion of a stream of its own cannot be
+    guarded against, so nothing is claimed for it: there is no stream to wait
+    on, so there is nothing that could have been moved across.
+    """
+    return device != "mps" and is_gpu(device)
+
+
+def get_op_names(op: Any) -> tuple[str, str]:
+    """An operation's name as the pair it is written as: the name and the form.
+
+    The pair rather than the joined name because the two are used apart: a
+    report wants to say "every form of this operation", and a cache wants to
+    key on the form alone.  Given a set of names rather than one, the name is
+    the set and the form is empty.
+    """
+    from tensorplay._ops import OpOverload
+
+    name = getattr(op, "name", None)
+    if not callable(name):
+        # A set of forms rather than one of them: the name is the set and
+        # there is no single form to report.
+        return (str(op), "")
+    joined = name()
+    packet, _, overload = joined.rpartition(".")
+    if not packet:
+        return (joined, "")
+    if isinstance(op, OpOverload):
+        return (packet, overload)
+    return (joined, "")

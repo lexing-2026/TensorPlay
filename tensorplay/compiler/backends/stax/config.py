@@ -52,6 +52,15 @@ pick_loop_orders = os.environ.get("TP_PICK_LOOP_ORDERS", "1") == "1"
 # it would defeat the layout it was given.
 pad_channels_last = False
 
+# Whether the layouts of a region containing convolutions may be chosen rather
+# than taken as they are given.  Off where the accelerator it targets does not
+# gain from the layout it would choose.
+layout_optimization = True
+
+# Whether that choice is made whatever the region looks like, for the case
+# where a measurement says it pays and the shape of the region would not say so.
+force_layout_optimization = os.environ.get("TP_FORCE_LAYOUT_OPT", "0") == "1"
+
 # Whether strides are padded when the extents they belong to are symbolic.
 pad_dynamic_shapes = False
 
@@ -1043,6 +1052,16 @@ emulate_precision_casts: bool = (
 
 #: Ignore every cache and compile afresh, which is what a measurement needs:
 #: a number read out of a cache is the number that was measured then.
+
+#: Whether compiled kernels should travel inside a cache entry.  Off by
+#: default: it makes an entry carry every kernel it needs, which is what a
+#: cache read on another machine requires and what a cache only ever read
+#: where it was written does not.  ``None`` means "decided by the bundler".
+bundle_triton_into_fx_graph_cache: bool | None = None
+
+#: Whether a compiled kernel can be launched from a binary already on disk,
+#: without going through the runtime's own compile step.
+use_static_triton_launcher: bool = False
 force_disable_caches: bool = False
 
 #: How many pairs of groups to try fusing before giving up on a round of
@@ -1202,7 +1221,7 @@ class _EagerNumerics:
     #: Take a float64 operation from the device library rather than from
     #: arithmetic.  Off because the arithmetic is faster where it exists, and
     #: the two are not always the same answer.
-    use_pytorch_libdevice = False
+    use_project_libdevice = False
 
 
 eager_numerics = _EagerNumerics()
@@ -1257,3 +1276,95 @@ cuda = _CudaConfig()
 #: path sends each worker's output to its own file, which is what makes the
 #: output of a failing worker readable at all.
 worker_logpath: str = os.environ.get("TP_WORKER_LOGPATH", "")
+
+#: Whether a worker's own output is dropped unless something went wrong.
+#:
+#: A worker that is told to be quiet still says so when it fails; what it
+#: stops doing is narrating a successful compile, which is the parent's job
+#: to summarise and which a pool of workers otherwise repeats once each.
+worker_suppress_logging: bool = os.environ.get("TP_WORKER_SUPPRESS_LOGGING", "1") == "1"
+
+
+class _RocmConfig:
+    """Settings that only mean anything on the other vendor's hardware.
+
+    Kept apart from the rest because a setting here is read on hardware that
+    most machines are not: a program that reads one of these on the wrong device
+    is reading a number that was never about it, so the values are gathered here
+    where it is visible that they only apply there.
+    """
+
+    #: How much wider than it is tall the contraction has to be before making
+    #: the right operand contiguous pays for the copy.  Nothing rather than one:
+    #: no threshold is a threshold nothing passes, and a program on this hardware
+    #: should not be rewriting its operands because of a number meant for another.
+    contiguous_threshold: int | None = None
+
+
+rocm = _RocmConfig()
+
+
+#: How often a worker reports a job that is still running after it started.
+#:
+#: A parent waiting on a worker reads nothing while it waits, so a worker that
+#: has stopped making progress looks the same as one that is being slow.  The
+#: worker therefore says so on this interval for as long as a job is still
+#: going, which leaves a record of which job was stuck rather than only that
+#: something was.  Zero turns the reporting off.
+compile_worker_watchdog_interval_seconds: int = int(
+    os.environ.get("TP_COMPILE_WORKER_WATCHDOG_INTERVAL", 60)
+)
+
+#: How long a pool waits with nothing to do before telling its workers to stop
+#: waiting for work.  A worker blocked reading its pipe forever holds memory
+#: for a parent that has gone; this is how long it takes to notice.
+quiesce_async_compile_time: int = 60
+
+
+def get_worker_log_path() -> str | None:
+    """Where a worker's output goes when no path was configured.
+
+    Answered with nothing outside an internal build, so a worker's output
+    goes to the worker's own stdout and the parent has to disentangle it from
+    its own.  An internal build knows which job and which rank it is, and
+    writes to the one place a job's workers are expected to write.
+    """
+    if not is_fbcode():
+        return None
+    job_name = os.environ.get("MAST_HPC_JOB_NAME")
+    if job_name is None:
+        return None
+    return f"/logs/dedicated_log_compile_worker_rank{os.environ.get('ROLE_RANK', '0')}"
+
+
+def decide_worker_start_method() -> str:
+    """How a worker process is started.
+
+    A worker generates code in a fresh interpreter, and there are three ways
+    to get one.  Forks are cheapest and inherit a process that has already
+    built things, which is both faster and the reason they are unsafe here.
+    Spawning starts clean and pays for it.  A separate subprocess sits
+    between them: a new interpreter, without paying to re-import.
+
+    A name outside those three is refused rather than fallen back from: a
+    start method that does not exist is a configuration that was meant to
+    say something and does not.
+    """
+    start_method = os.environ.get("TP_WORKER_START", "subprocess")
+    if start_method not in ("subprocess", "fork", "spawn"):
+        raise AssertionError(f"Invalid start method: {start_method}")
+    return start_method
+
+
+#: Which of those three a worker process is started by.
+worker_start_method: str = decide_worker_start_method()
+
+#: Whether the pool of workers is told to go quiet at the end of each
+#: compilation, rather than staying warm for the next one.
+#:
+#: A warm pool answers the next compilation faster; a quiet one holds no
+#: memory between them.  Which is worth more depends on how often something
+#: is compiled, so this is a choice rather than a fact.
+quiesce_async_compile_pool: bool = (
+    os.environ.get("TP_QUIESCE_ASYNC_COMPILE_POOL", "1") == "1"
+)

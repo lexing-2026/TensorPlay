@@ -58,13 +58,13 @@ def _set_triton_libdevice_path() -> None:
     """
     Use the CUDA toolkit's libdevice instead of Triton's bundled version.
     This ensures Triton's libdevice calls match CUDA eager numerics for bitwise
-    precision.  Gated by config.eager_numerics.use_pytorch_libdevice and by
+    precision.  Gated by config.eager_numerics.use_project_libdevice and by
     config.emulate_precision_casts, which also requests eager-like numerics.
     """
     from .. import config
 
     if not (
-        config.eager_numerics.use_pytorch_libdevice or config.emulate_precision_casts
+        config.eager_numerics.use_project_libdevice or config.emulate_precision_casts
     ):
         return
 
