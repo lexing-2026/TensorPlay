@@ -227,21 +227,57 @@ __global__ void topk_multiblock_digit_counts(
   (void)ranks;
 }
 
+// One block per row folds that row's per-block digit histograms into a running
+// total per digit.  Every block of the following pass needs this same total,
+// so computing it once here keeps that pass from re-reading the whole
+// histogram per block.
+template <typename T>
+__launch_bounds__(topk_multiblock_radix_size)
+__global__ void topk_multiblock_digit_cumsum(
+    const uint16_t* __restrict__ counts, uint32_t* __restrict__ digit_cum_sum,
+    uint32_t blocks_per_row) {
+  using Scan = cub::BlockScan<uint32_t, topk_multiblock_radix_size>;
+  __shared__ typename Scan::TempStorage scan_storage;
+  const uint32_t row = blockIdx.x;
+  uint32_t digit_count = 0;
+  if (threadIdx.x < topk_multiblock_radix_size) {
+    const uint16_t* cursor =
+        counts + static_cast<size_t>(row) * blocks_per_row *
+                     topk_multiblock_radix_size + threadIdx.x;
+    // Unrolled by four to keep several loads in flight per digit.
+    constexpr uint32_t kUnroll = 4;
+    const uint32_t rounds = blocks_per_row / kUnroll;
+    for (uint32_t i = 0; i < rounds; ++i) {
+      digit_count += cursor[0] +
+          cursor[topk_multiblock_radix_size] +
+          cursor[2 * topk_multiblock_radix_size] +
+          cursor[3 * topk_multiblock_radix_size];
+      cursor += kUnroll * topk_multiblock_radix_size;
+    }
+    for (uint32_t blk = rounds * kUnroll; blk < blocks_per_row; ++blk) {
+      digit_count += cursor[0];
+      cursor += topk_multiblock_radix_size;
+    }
+  }
+  uint32_t inclusive = 0;
+  Scan(scan_storage).InclusiveSum(digit_count, inclusive);
+  if (threadIdx.x < topk_multiblock_radix_size) {
+    digit_cum_sum[static_cast<size_t>(row) * topk_multiblock_radix_size +
+                  threadIdx.x] = inclusive;
+  }
+}
+
 template <typename T, typename Key>
 __launch_bounds__(topk_multiblock_radix_size)
 __global__ void topk_multiblock_within_k_counts(
     const uint16_t* __restrict__ counts,
+    const uint32_t* __restrict__ digit_cum_sum,
     const Key* __restrict__ desired_in, const uint32_t* __restrict__ ranks_in,
     Key* __restrict__ desired_out, uint32_t* __restrict__ ranks_out,
     uint32_t rows, uint32_t blocks_per_row, int digit_pos,
     bool largest, uint32_t* __restrict__ within_k_counts,
     T* __restrict__ kth_values) {
   using Traits = TopKRadixTraits<T>;
-  using Scan = cub::BlockScan<uint32_t, topk_multiblock_radix_size>;
-  __shared__ union {
-    uint32_t digit_count_cumsum[topk_multiblock_radix_size];
-    typename Scan::TempStorage scan_storage;
-  } temp_storage;
   __shared__ Key desired;
   const uint32_t block_index = topk_linear_block_id<uint32_t>();
   const uint32_t num_blocks = rows * blocks_per_row;
@@ -249,24 +285,14 @@ __global__ void topk_multiblock_within_k_counts(
   const uint32_t row = static_cast<uint32_t>(block_index / blocks_per_row);
   const uint32_t block_in_row = static_cast<uint32_t>(block_index % blocks_per_row);
   uint32_t rank = __ldg(ranks_in + row);
-  uint32_t digit_count = 0;
   if (threadIdx.x < topk_multiblock_radix_size) {
-    for (uint32_t block = 0; block < blocks_per_row; ++block) {
-      digit_count += __ldg(counts +
-          (row * blocks_per_row + block) * topk_multiblock_radix_size +
-          threadIdx.x);
-    }
-  }
-  uint32_t inclusive = 0;
-  Scan(temp_storage.scan_storage).InclusiveSum(digit_count, inclusive);
-  __syncthreads();
-  if (threadIdx.x < topk_multiblock_radix_size) {
-    temp_storage.digit_count_cumsum[threadIdx.x] = inclusive;
-  }
-  __syncthreads();
-  if (threadIdx.x < topk_multiblock_radix_size) {
+    const uint32_t inclusive = __ldg(
+        digit_cum_sum + static_cast<size_t>(row) * topk_multiblock_radix_size +
+        threadIdx.x);
     const uint32_t left = threadIdx.x == 0
-        ? 0 : temp_storage.digit_count_cumsum[threadIdx.x - 1];
+        ? 0 : __ldg(digit_cum_sum +
+                    static_cast<size_t>(row) * topk_multiblock_radix_size +
+                    threadIdx.x - 1);
     if (left < rank && rank <= inclusive) {
       const Key digit_mask = static_cast<Key>(
           topk_multiblock_radix_mask) << digit_pos;
@@ -500,6 +526,9 @@ void launch_multiblock_topk_impl(const Tensor& input, Tensor& values,
       {static_cast<int64_t>(block_count)}, DType::UInt32, input.device());
   Tensor kth_counts = Tensor::empty(
       {static_cast<int64_t>(block_count)}, DType::UInt32, input.device());
+  Tensor digit_cum_sum = Tensor::empty(
+      {static_cast<int64_t>(row_count) * topk_multiblock_radix_size},
+      DType::UInt32, input.device());
   TP_CUDA_CHECK(cudaMemsetAsync(
       within_k_counts.data_ptr<uint32_t>(), 0,
       static_cast<size_t>(block_count) * sizeof(uint32_t),
@@ -529,10 +558,17 @@ void launch_multiblock_topk_impl(const Tensor& input, Tensor& values,
             static_cast<IndexType>(inner),
             blocks_per_row, items_per_thread, digit_pos);
     TP_CUDA_CHECK(cudaGetLastError());
+    topk_multiblock_digit_cumsum<T>
+        <<<static_cast<unsigned>(row_count), topk_multiblock_radix_size, 0,
+           getCurrentCUDAStream().stream()>>>(
+            counts.data_ptr<uint16_t>(),
+            digit_cum_sum.data_ptr<uint32_t>(), blocks_per_row);
+    TP_CUDA_CHECK(cudaGetLastError());
     topk_multiblock_within_k_counts<T, Key>
         <<<block_grid, topk_multiblock_radix_size, 0,
            getCurrentCUDAStream().stream()>>>(
-            counts.data_ptr<uint16_t>(), desired_in, ranks_in, desired_out,
+            counts.data_ptr<uint16_t>(), digit_cum_sum.data_ptr<uint32_t>(),
+            desired_in, ranks_in, desired_out,
             ranks_out, row_count,
             blocks_per_row, digit_pos, largest,
             within_k_counts.data_ptr<uint32_t>(), kth_values.data_ptr<T>());
