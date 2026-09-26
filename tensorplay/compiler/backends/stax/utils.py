@@ -2987,3 +2987,31 @@ def _is_sparse(value: Any) -> bool:
     from ..cudagraphs import _is_tensor
 
     return _is_tensor(value) and bool(getattr(value, "is_sparse", False))
+
+
+def is_multi_outputs_template(layout: Any) -> bool:
+    """Whether a layout hands back several values at once.
+
+    A call that produces more than one thing cannot be the call's own result,
+    so the call is given no result of its own and the layout it is given is
+    what says so: a layout holding several outputs rather than one buffer's
+    worth.  A consumer wanting all of them reads that; a consumer wanting
+    one of them reads a path through it instead.
+    """
+    from . import ir
+
+    return isinstance(layout, ir.MultiOutputLayout)
+
+
+def is_output_of_multi_outputs_template(node: Any) -> bool:
+    """Whether a value is one of the several a multi-output call produced.
+
+    Such a value is not a thing that can be fused into: what it holds
+    depends on which output the consumer wanted, and fusing the reading of
+    it would fuse that choice into the arithmetic around it.
+    """
+    from . import ir
+
+    return isinstance(node, ir.MultiOutput) and is_multi_outputs_template(
+        getattr(node, "layout", None)
+    )
