@@ -1479,7 +1479,19 @@ class GraphModule:
         if self.signature is not None and not self._boxed_call:
             @functools.wraps(implementation)
             def checked_forward(*args: Any, **kwargs: Any) -> Any:
-                bound = self.signature.bind(*args, **kwargs)
+                try:
+                    bound = self.signature.bind(*args, **kwargs)
+                except TypeError:
+                    # The graph's own values arrive in placeholder order, and
+                    # that order can be wider than the public signature takes
+                    # positionally: a keyword-only parameter with a default is
+                    # still a placeholder, so it is still a positional value
+                    # here. The public signature cannot place it, so it is not
+                    # the one to place it -- hand the call to the generated
+                    # forward, which is written in placeholder order and is
+                    # the thing that says whether a call fits. A call that is
+                    # genuinely wrong still raises from there.
+                    return bound_implementation(*args, **kwargs)
                 bound.apply_defaults()
                 return bound_implementation(*bound.args, **bound.kwargs)
 
