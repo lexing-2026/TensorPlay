@@ -6726,6 +6726,15 @@
   variants: method
 - func: set_data(Tensor(a!) self, Tensor new_data) -> ()
   variants: method
+- func: shallow_copy_data(Tensor(a!) self, Tensor new_data) -> ()
+  variants: method
+  doc: |
+    Rebind `self` onto `new_data`'s storage, keeping `self`'s own shape.
+
+    Both names then describe the same memory. This differs from
+    :func:`set_data`, which takes the source's layout along with its storage
+    and so returns `self` reshaped; here only the memory is taken, and `self`
+    keeps describing the region it was describing.
 - func: data(Tensor self) -> Tensor
   variants: method
 - func: is_leaf(Tensor self) -> bool

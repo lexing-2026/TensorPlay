@@ -247,6 +247,29 @@ void set_data_native(Tensor& self, const Tensor& new_data) {
         make_intrusive<TensorImpl>(*new_data.unsafeGetTensorImpl()));
 }
 
+// shallow_copy_data rebinds self onto new_data's storage while keeping self's
+// own shape and strides.  set_data takes the source's layout along with its
+// storage, so a self of a different shape comes back reshaped; here only the
+// memory is taken, and self keeps describing the region it was describing.
+//
+// That difference is the whole point of having both.  A value that is being
+// pointed at another's memory is often a different view of it -- a transposed
+// one, a narrowed one -- and adopting the source's shape would quietly turn
+// that view into a copy of the source.  So the two are separate operations and
+// neither is written in terms of the other.
+//
+// The metadata copy carries no autograd history, so self comes back as a fresh
+// leaf regardless of the graphs on either side.
+void shallow_copy_data_native(Tensor& self, const Tensor& new_data) {
+    reject_active_transform(self, "shallow_copy_data");
+    TP_CHECK(new_data.defined(), "shallow_copy_data expected a defined tensor");
+    auto impl = make_intrusive<TensorImpl>(*new_data.unsafeGetTensorImpl());
+    impl->set_sizes_and_strides(std::vector<int64_t>(self.sizes()),
+                                std::vector<int64_t>(self.strides()));
+    impl->set_storage_offset(self.storage_offset());
+    self = Tensor(std::move(impl));
+}
+
 // Single-output materialization: this build does not number op outputs, so
 // every tensor reports position 0.
 int64_t output_nr_native(const Tensor& self) {
@@ -326,6 +349,7 @@ TENSORPLAY_LIBRARY_IMPL(Composite, BaseMetaComposites) {
     m.impl("row_indices_copy", row_indices_copy_native);
     m.impl("_coalesced_", _coalesced__native);
     m.impl("set_data", set_data_native);
+    m.impl("shallow_copy_data", shallow_copy_data_native);
     m.impl("output_nr", output_nr_native);
     m.impl("_is_zerotensor", _is_zerotensor_native);
     m.impl("_has_compatible_shallow_copy_type",

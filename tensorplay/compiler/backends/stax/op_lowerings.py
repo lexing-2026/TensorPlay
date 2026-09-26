@@ -1643,6 +1643,23 @@ def _pool_backward_with_masked_divisor(node, total, prefix, spatial_in, spatial_
         count,
     )
 
+
+@register("shallow_copy_data_.default")
+def lower_shallow_copy_data_(self_tensor, storage_tensor):
+    """Pointing one value at the memory of another, contents and all.
+
+    This is told apart from making one value refer to another because what it
+    does to the memory's shape is not the same: here the first value keeps
+    describing the region it was describing, and only the memory underneath it
+    is taken over.  A value that was a transposed or narrowed view of another's
+    memory therefore stays that view, and a result written through it lands in
+    the memory both names.
+    """
+    self_tensor.realize()
+    storage_tensor.realize()
+    return TensorBox.create(ir.ShallowCopyDataKernel(self_tensor, storage_tensor))
+
+
 # The pointwise operations, declared with the promotion each one applies.
 #
 # Registering a lowering and stating the promotion together is what keeps the
