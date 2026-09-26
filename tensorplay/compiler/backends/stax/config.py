@@ -1206,3 +1206,23 @@ class _EagerNumerics:
 
 
 eager_numerics = _EagerNumerics()
+
+
+#: Fall back to running a draw or a dropout eagerly.  Slow, and useful when a
+#: fused result is suspected of being wrong and the eager one is known good.
+fallback_random = False
+
+#: Run a draw or a dropout the way the framework does when it is not being
+#: compiled, while still letting the result be fused.  Faster, and differs
+#: from the eager result in how a value is arranged within a thread.
+align_random_eager = False
+
+#: Which of the joins and splits to apply, and with what settings, before the
+#: backward graph is built.  Empty applies none of them; the keys are the
+#: names the rules are registered under.
+pre_grad_fusion_options: dict[str, dict[str, Any]] = {}
+
+#: Which of the batches of work to apply, and with what settings, after the
+#: backward graph is built.  Empty applies none of them; the keys are the
+#: names the rules are registered under.
+post_grad_fusion_options: dict[str, dict[str, Any]] = {}
