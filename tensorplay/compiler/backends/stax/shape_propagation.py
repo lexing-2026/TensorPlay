@@ -104,7 +104,7 @@ def broadcast_shapes_for_args(args: Sequence) -> BlockShapeType:
         elif isinstance(arg, tp.dtype):
             continue
         else:
-            from .loops import Loops
+            from .ir import Loops
 
             if isinstance(arg, Loops):
                 # A region of the body rather than a value of it has no shape

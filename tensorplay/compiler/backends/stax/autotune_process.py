@@ -136,8 +136,8 @@ class TensorMeta:
             return result
 
         node = irnodes
-        from .ir import Layout
-        from .loops import Buffer, V
+        from .ir import Buffer, Layout
+        from .loops import V
 
         if isinstance(node, Layout):
             node = Buffer("fake", node)

@@ -482,6 +482,39 @@ class LoopBody:
             raise AssertionError("reduce_vars is None")
         return self.iter_vars, self.reduce_vars
 
+    def indexing_from_args(
+        self,
+        indices,
+        allow_same_symbol_in_index: bool = False,
+    ) -> dict:
+        """This body's index expressions, written in the variables it was given.
+
+        A body's positions are written in the body's own variables.  What reads
+        them wants them in the caller's, because the caller's variables are the
+        ones the enclosing nest iterates over.  Substituting one set for the
+        other is the whole of the translation.
+        """
+
+        index = [*itertools.chain.from_iterable(indices)]
+        if len(index) != len(self.var_ranges):
+            raise AssertionError(
+                f"index length mismatch: {len(index)} positions for "
+                f"{len(self.var_ranges)} variables"
+            )
+        if not allow_same_symbol_in_index and any(
+            variable in self.var_ranges for variable in index
+        ):
+            raise AssertionError(
+                f"a position is already one of this body's own variables, so "
+                f"substituting would leave it meaning two things: "
+                f"{self.var_ranges} and {indices}"
+            )
+        replacements = dict(zip(self.var_ranges.keys(), index))
+        return {
+            name: sympy_subs(expr, replacements)
+            for name, expr in self.indexing_exprs.items()
+        }
+
     @cache_on_self
     def get_nodes(self):
         all_graphs = itertools.chain(

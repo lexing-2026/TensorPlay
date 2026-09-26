@@ -250,7 +250,8 @@ def mm_args(
         k2 = k2 * 2
     k = k1 if k1 == k2 else min(k1, k2)
     if layout is None:
-        from ..ir import Layout, contiguous_strides
+        from ...loops import contiguous_strides
+        from ..ir import Layout
         from ..loops import V
 
         device = mat1.get_device() if hasattr(mat1, "get_device") else None
@@ -355,7 +356,7 @@ def check_supported_striding(mat_a, mat_b) -> None:
     wrongly -- it is refused, here, rather than read slowly.
     """
 
-    from .mm import _standard_2d
+    from ..codegen.triton_gemm import _standard_2d
 
     for mat in (mat_a, mat_b):
         shape = tuple(mat.get_size())

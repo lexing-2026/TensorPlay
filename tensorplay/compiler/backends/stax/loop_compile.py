@@ -97,26 +97,28 @@ def compile_graph(graph_module, example_inputs, *, scheduler: KernelScheduler | 
     return program
 
 
-def compile_half_host(graph_module, example_inputs, **options):
-    """Compile one graph half for the host, from the same IR.
+def host_launches(graph, plan=None, groups=None):
+    """One built launcher per fused group of a lowered region, in run order.
 
-    The host prints a scheduled group with its own emitter and runs the result
-    through the same runtime the accelerator's kernels run through, so what a
-    region does is decided in one place and only the printing differs.
+    The printing is shared by every way of asking for a built form of a region,
+    so that what a caller gets back does not depend on which of them it asked:
+    a group is grouped the same way, laid out the same way, and printed the same
+    way whichever way it was asked for.
     """
 
-    del options
     from .codegen import loop_cpp
     from .codegen.cpp import build_cpu_native_kernel
-    from .loop_runtime import ExternStep, HostStep, LoopProgram
-
-    graph = GraphLowering(graph_module, list(example_inputs)).run()
-    plan = KernelScheduler(graph)
-    graph.scheduler = plan
-    steps = []
-    for group in plan.fuse():
+    if plan is None:
+        plan = KernelScheduler(graph)
+        graph.scheduler = plan
+        groups = plan.fuse()
+    elif groups is None:
+        graph.scheduler = plan
+        groups = plan.fuse()
+    launches = []
+    for group in groups:
         if isinstance(group, ExternNode):
-            steps.append(ExternStep(group.kernel))
+            # A call that is run rather than printed has nothing built to launch.
             continue
         stored = stored_names(plan, group)
         try:
@@ -143,7 +145,36 @@ def compile_half_host(graph_module, example_inputs, **options):
         )
         if launch is None:
             raise PlanError("the host emitter declined a group")
-        steps.append(HostStep(launch, program["inputs"], _stored_name(stored)))
+        launches.append((launch, program["inputs"], _stored_name(stored)))
+    return launches
+
+
+def compile_half_host(graph_module, example_inputs, **options):
+    """Compile one graph half for the host, from the same IR.
+
+    The host prints a scheduled group with its own emitter and runs the result
+    through the same runtime the accelerator's kernels run through, so what a
+    region does is decided in one place and only the printing differs.
+    """
+
+    del options
+    from .loop_runtime import ExternStep, HostStep, LoopProgram
+
+    graph = GraphLowering(graph_module, list(example_inputs)).run()
+    plan = KernelScheduler(graph)
+    graph.scheduler = plan
+    # Fusing is asked once and the groups are kept: fusing walks the region and
+    # settles it, so asking twice would be asking about a region that has already
+    # been through it.
+    groups = plan.fuse()
+    steps = [
+        ExternStep(group.kernel) for group in groups
+        if isinstance(group, ExternNode)
+    ]
+    steps.extend(
+        HostStep(launch, inputs, output)
+        for launch, inputs, output in host_launches(graph, plan, groups)
+    )
     program = LoopProgram(graph, steps)
     program._tensorplay_codegen = "cpp"  # type: ignore[attr-defined]
     program._tensorplay_backward_codegen = "cpp"  # type: ignore[attr-defined]

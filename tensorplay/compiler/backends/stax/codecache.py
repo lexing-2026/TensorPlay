@@ -16,13 +16,48 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import json
 import os
 import pathlib
+import shutil
+import sys
 import tempfile
+import threading
+from pathlib import Path
 from typing import Any, Generic, TypeVar
 
-from .cache_key import CODE_CACHE_KEY_STRATEGY
+import tensorplay as tp
+
+from .cache_key import CODE_CACHE_KEY_STRATEGY, SYSTEM_CACHE_KEY_STRATEGY
+from .compile_log import dynamo_timed
+from .runtime.cache_dir_utils import cache_dir
+from .runtime.device_compiler import compiler_module
 from .utils import clear_on_fresh_cache
+
+#: Whether a path built here is being written on a platform where a rename
+#: onto an existing file fails.  There the write is a copy and a remove, which
+#: is not atomic and so is done only where there is no alternative.
+_IS_WINDOWS = sys.platform == "win32"
+
+
+def triton_key() -> str | None:
+    """Which device compiler build is loaded, as a cache-key component.
+
+    The compiler's own version string is not enough: it is not changed when the
+    compiler's source is, so two builds of the same source under different
+    code would share a key.  Its build identity covers that, and there is none
+    when the compiler is not here -- which is not a failure, since a run without
+    it produces no device code to key.
+    """
+
+    module = compiler_module()
+    if module is None:
+        return None
+    for attribute in ("__version__", "TRITON_VERSION"):
+        version = getattr(module, attribute, None)
+        if isinstance(version, str):
+            return version
+    return None
 
 T = TypeVar("T")
 
@@ -36,15 +71,15 @@ class CacheBase:
         try:
             device_info: SystemDeviceInfo = {"name": None}
             version_info: SystemVersionInfo = {"triton": triton_version}
-            device_properties = torch.cuda.get_device_properties(
-                torch.cuda.current_device()
+            device_properties = tp.cuda.get_device_properties(
+                tp.cuda.current_device()
             )
-            if torch.version.cuda is not None:
+            if tp.version.cuda is not None:
                 device_info["name"] = device_properties.name
-                version_info["cuda"] = torch.version.cuda
+                version_info["cuda"] = tp.version.cuda
             else:
                 device_info["name"] = device_properties.gcnArchName
-                version_info["hip"] = torch.version.hip
+                version_info["hip"] = tp.version.hip
             hash_input: dict[str, Any] = {
                 "device": device_info,
                 "version": version_info,
@@ -82,6 +117,52 @@ class CacheBase:
             json.dumps({"system": self.system, "cache": local_cache}, indent=4),
             make_dirs=True,
         )
+
+
+class LocalCache(CacheBase):
+    """A small key-value store that outlives the process that wrote it.
+
+    Used for what is worth keeping between compilations but is not an artifact:
+    a measured runtime, a choice that was picked, a decision that took a while.
+    Those are answers rather than build products, so they are kept in one file
+    keyed by what they are about, rather than in the artifact store keyed by
+    what built them.
+
+    The file is read and written whole, so this is for a handful of entries and
+    not for a cache of anything large.
+    """
+
+    def lookup(self, *keys: str) -> dict[str, Any] | None:
+        """The value filed under these keys, or nothing if any step is missing.
+
+        A miss part way down is a miss: a value filed under a key that is no
+        longer there was filed under a different question, and answering with it
+        would be answering a question that was not asked.
+        """
+
+        cache = self.get_local_cache()
+        found: Any = cache
+        for key in keys:
+            if not isinstance(found, dict) or key not in found:
+                return None
+            found = found[key]
+        return found
+
+    def set_value(self, *keys: str, value: Any) -> None:
+        """File a value under these keys, making the levels above it as needed."""
+
+        if not keys:
+            raise ValueError("a value has to be filed under at least one key")
+        cache = self.get_local_cache()
+        found = cache
+        for key in keys[:-1]:
+            nested = found.get(key)
+            if not isinstance(nested, dict):
+                nested = {}
+                found[key] = nested
+            found = nested
+        found[keys[-1]] = value
+        self.update_local_cache(cache)
 
 
 def code_hash(code: str | bytes, extra: str | bytes = "") -> str:

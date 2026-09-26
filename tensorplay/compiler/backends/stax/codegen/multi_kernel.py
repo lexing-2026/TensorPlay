@@ -58,7 +58,7 @@ class MultiKernelState:
             Each list element is a shape key, corresponding to the concrete input & output size hints each kernel was tuned for.
         """
         # Prevent circular import
-        from ..select_algorithm import TritonTemplateKernel
+        from ..templates.select_algorithm import TritonTemplateKernel
 
         kernel_names = tuple(k.kernel_name for k in kernels)
         if kernel_names in self.subkernel_to_kernel_name:
@@ -198,7 +198,7 @@ class MultiKernel:
         for the multi-kernel.
         """
         # Prevent circular import
-        from ..select_algorithm import TritonTemplateKernel
+        from ..templates.select_algorithm import TritonTemplateKernel
 
         if kernel_name != self.kernel_name:
             raise AssertionError(

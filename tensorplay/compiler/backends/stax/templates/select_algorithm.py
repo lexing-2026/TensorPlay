@@ -14,7 +14,7 @@ import logging
 import os
 from typing import NamedTuple
 
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import tensorplay as tp
 
@@ -26,7 +26,7 @@ from ..loops import V
 from .ir import ChoiceCaller, CutedslChoiceCaller
 from .params import DictKernelTemplateParams, KernelTemplateParams
 from .triton import CHOICES
-from .subgraph import SubgraphChoiceCaller
+from ..codegen.subgraph import SubgraphChoiceCaller
 
 #: Whether a candidate's result is checked against what the operation's own
 #: kernel produced.  On by default because a template that computes the wrong
@@ -1654,3 +1654,146 @@ def _need_to_fix_layout(adjusted_choices: list, op_name: str) -> bool:
         (not isinstance(ktc.template, ExternChoiceCaller) for ktc in adjusted_choices)
     )
 
+
+
+class PartialRender:
+    """Some of a template's parts are written last but belong at the start.
+
+    A template's shape -- what its kernel looks like, what it loads, what it
+    stores -- is settled by walking the region, and the region is walked after
+    the template's own text is laid out.  So a part that is not known when the
+    text is laid out is written into the text as a placeholder, and filled in
+    once the walk has said what it is.
+
+    Asking for the code before every placeholder has been filled in is an error
+    rather than a partially-built source: a caller that compiles what it gets
+    would compile a program with a placeholder in it, and the failure would be
+    the compiler's rather than here.
+    """
+
+    HookFn = Callable[[], str]
+
+    def __init__(self, code: str, replacement_hooks: dict) -> None:
+        super().__init__()
+        self._code: str = code
+        self.replacement_hooks: dict = dict(replacement_hooks)
+
+    @property
+    def code(self) -> str:
+        """The source, once every placeholder has been filled in.
+
+        Raises while any is still open, naming the ones that are: a caller
+        that has not finished cannot tell which part it is missing, and would
+        otherwise get source that looks complete.
+        """
+
+        remaining = [
+            key for key, fn in self.replacement_hooks.items() if fn is not None
+        ]
+        if remaining:
+            raise AssertionError(
+                f"these placeholders have not been filled in: {remaining}"
+            )
+        return self._code
+
+    def _replace_placeholder(self, hook_key: str, result: str) -> str:
+        """Put one filled-in part where its placeholder stands.
+
+        A placeholder on a line of its own and one in the middle of a line are
+        different problems.  On its own, the text replaces the line and takes
+        the line's indentation with it -- but only for a result written flush
+        left, because a result that carries its own indentation is saying
+        where it belongs and re-indenting it would put it somewhere it does not
+        compile.  In the middle of a line, the text goes in as it is, because
+        there is no line whose indentation it could take.
+
+        A result with nothing in it removes the line.  That is how a part that
+        turned out to be unnecessary says so: the piece was not needed, so
+        there is nothing to write and the line it was on should not be there
+        either.
+        """
+
+        if hook_key not in self._code:
+            return self._code
+
+        if not (result and result.strip()):
+            lines = self._code.split("\n")
+            return "\n".join(
+                line for line in lines if line.strip() != hook_key
+            )
+
+        lines = self._code.split("\n")
+        new_lines = []
+        for line in lines:
+            if line.strip() == hook_key:
+                indent = line[: len(line) - len(line.lstrip())]
+                result_lines = result.strip("\n").split("\n")
+                non_empty = [one for one in result_lines if one.strip()]
+                written_flush_left = bool(non_empty) and all(
+                    not one[0].isspace() for one in non_empty
+                )
+                if written_flush_left:
+                    new_lines.append(
+                        "\n".join(
+                            indent + one if one.strip() else one
+                            for one in result_lines
+                        ).rstrip()
+                    )
+                else:
+                    new_lines.append(line.replace(hook_key, result))
+            elif hook_key in line:
+                new_lines.append(line.replace(hook_key, result))
+            else:
+                new_lines.append(line)
+        return "\n".join(new_lines)
+
+    def finalize_hook(self, hook_key: str, strict: bool = True) -> None:
+        """Fill in one placeholder, by name.
+
+        A placeholder that was never registered is a mistake in the caller
+        rather than something to tolerate, unless it says otherwise: it means
+        the part it expected to write is one this render does not have.
+
+        A placeholder that has already been filled in cannot be filled in
+        again, because the text it stood for is gone; saying so is better than
+        writing the second answer into a source that no longer has the first
+        place to put it.
+        """
+
+        if hook_key not in self.replacement_hooks:
+            if strict:
+                raise RuntimeError(
+                    f"{hook_key} is not a placeholder in this render"
+                )
+            return
+
+        hook = self.replacement_hooks[hook_key]
+        if hook is None:
+            raise AssertionError(f"{hook_key} has already been filled in")
+        self._code = self._replace_placeholder(hook_key, hook())
+        self.replacement_hooks[hook_key] = None
+
+    def finalize_remaining(self) -> str:
+        """Fill in whatever is still open, and return the source.
+
+        For a caller that fills in one placeholder itself -- because it is the
+        one that knows what that part is -- and wants the rest done for it.
+        Unlike filling them all in, this skips the ones already done.
+        """
+
+        for key, fn in list(self.replacement_hooks.items()):
+            if fn is not None:
+                self.finalize_hook(key)
+        return self.code
+
+    def finalize_all(self) -> str:
+        """Fill in every placeholder that has not been filled in yet.
+
+        Unlike filling in the remaining ones, this is an error if one has
+        already been done: a caller that has filled one in itself and then says
+        "fill in the rest" means the rest, not all of them.
+        """
+
+        for key in self.replacement_hooks:
+            self.finalize_hook(key)
+        return self.code
