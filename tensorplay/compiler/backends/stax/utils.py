@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import enum
 import functools
+import importlib.util
 import hashlib
 import math
 import operator
@@ -1271,6 +1272,72 @@ def cache_property_on_self(
     return cache_on_self(fn)
 
 
+class DualIndentedBuffer(IndentedBuffer):
+    """A buffer that keeps both what is written as it goes and what is built ahead.
+
+    A launch can be run as it is written or compiled ahead of time, and the two
+    want different things in the same place: one wants the code the writer
+    produced, the other wants it without the parts that only make sense while
+    it is being written. So both are kept -- what was written here, and what was
+    set aside for the ahead-of-time form -- and a caller that means one of them
+    says which.
+
+    Writing goes to both by default, because most lines belong to both. A line
+    that belongs to only one is written through the call that names which, and
+    using the general write for it would put a line in the other form that
+    should not be there.
+    """
+
+    def __init__(self, initial_indent: int = 0) -> None:
+        super().__init__(initial_indent)
+        #: What is set aside for the ahead-of-time form.
+        self.aot = IndentedBuffer(initial_indent)
+
+    @property
+    def jit(self) -> IndentedBuffer:
+        """The written form, for reading and for splicing from.
+
+        Reading only. Writing through this would go to both, because writing is
+        overridden to; a line meant for one form is written through the call
+        that names it.
+        """
+
+        return self
+
+    def writeline_jit(self, line) -> None:
+        self.writeline(line)
+
+    def writeline_aot(self, line) -> None:
+        self.aot.writeline(line)
+
+    def splice_jit(self, other_code, strip: bool = False) -> None:
+        self.splice(other_code, strip=strip)
+
+    def splice_aot(self, other_code, strip: bool = False) -> None:
+        self.aot.splice(other_code, strip=strip)
+
+
+class AotOnlyBuffer(IndentedBuffer):
+    """A buffer for a launch that is only ever compiled ahead of time.
+
+    The mirror of the general defaults: the ahead-of-time writes land here and
+    the written-as-you-go ones do not, which is what lets a caller name which
+    form a line belongs to without asking what kind of launch this is.
+    """
+
+    def writeline_jit(self, line) -> None:
+        pass
+
+    def writeline_aot(self, line) -> None:
+        self.writeline(line)
+
+    def splice_jit(self, other_code, strip: bool = False) -> None:
+        pass
+
+    def splice_aot(self, other_code, strip: bool = False) -> None:
+        self.splice(other_code, strip=strip)
+
+
 def make_codegen_buffer() -> IndentedBuffer:
     """Construct the IndentedBuffer subclass matching the current codegen mode.
 
@@ -1333,6 +1400,79 @@ def get_benchmark_name() -> str | None:
             return arg[len("--only=") :]
 
     return None
+
+
+def get_bounds_index_expr(index):
+    """How far an index can reach, or that nothing is known about it.
+
+    An index built out of loop variables has bounds that follow from how far
+    those loops run, and working them out is what lets a later step decide an
+    index is inside the memory it addresses. But an index that was written as
+    one value in the program has no bounds to work out here -- it is whatever
+    that value was -- so the question is asked only of an index that came from
+    arithmetic rather than from a node, and the rest is answered "not known"
+    rather than with a guess.
+    """
+
+    from .loops import V
+
+    if (
+        config.compute_all_bounds
+        and (fx_node := getattr(V.interpreter, "current_node", None))
+        and fx_node.target != "index_expr"
+    ):
+        return bound_sympy(index)
+    else:
+        return ValueRanges.unknown()
+
+
+class TritonAttrsDescriptorVersion(enum.Enum):
+    """Where the description of a kernel's arguments lives, and in what shape.
+
+    The description says which arguments are worth specialising on. The runtime
+    has spelled it in four ways -- not at all, in one module, in another, and
+    finally as a plain mapping -- and a caller that guessed wrong would read a
+    description that is not there or build one in a shape the runtime will not
+    accept. So the shape is looked up and named rather than assumed.
+    """
+
+    V0_NO_TRITON = 0
+    #: In the compiler's own module.
+    V1_COMPILER = 1
+    #: Moved to the backends' module, and changed with it.
+    V2_BACKENDS = 2
+    #: The same place, with tuples spelled as tuples.
+    V3_BACKENDS_TUPLE = 3
+    #: No wrapper at all: the description is the mapping.
+    V4_DICT = 4
+
+
+@functools.cache
+def get_triton_attrs_descriptor_version() -> TritonAttrsDescriptorVersion:
+    """Which shape the runtime's argument description is in.
+
+    Asked once and remembered: the answer is a property of the runtime that is
+    installed, so asking again would answer again the same, and the lookup is
+    not free.
+    """
+
+    if importlib.util.find_spec("triton") is None:
+        return TritonAttrsDescriptorVersion.V0_NO_TRITON
+
+    import triton.backends.compiler
+    import triton.compiler.compiler
+
+    if hasattr(triton.backends.compiler, "AttrsDescriptor"):
+        # The description moved to the backends' module, and changed with it.
+        # The shape that also spells tuples is not told apart here: nothing in
+        # this project writes one, so a caller that did would be new code that
+        # should say so.
+        return TritonAttrsDescriptorVersion.V2_BACKENDS
+    elif hasattr(triton.compiler.compiler, "AttrsDescriptor"):
+        return TritonAttrsDescriptorVersion.V1_COMPILER
+    else:
+        # The wrapper was removed and the description is the mapping itself.
+        return TritonAttrsDescriptorVersion.V4_DICT
 
 
 def triton_version_uses_attrs_dict() -> bool:
@@ -1885,6 +2025,14 @@ TMA_DESCRIPTOR_SIZE = 128
 #: width the widest vector load wants, and a wider one would rule out views that
 #: are perfectly addressable.
 GPU_ALIGN_BYTES = 16
+
+#: The width a run of bytes is rounded to when it has to be addressable by
+#: something that addresses in wider units.  A power of two, and checked to be
+#: one: the rounding below is a mask, and a width that is not a power of two
+#: would make that mask wrong in a way nothing downstream could notice.
+ALIGN_BYTES = 64
+if not ((ALIGN_BYTES & (ALIGN_BYTES - 1)) == 0 and ALIGN_BYTES >= 8):
+    raise AssertionError("must be power of 2")
 
 
 def get_sympy_Expr_dtype(val) -> Any:

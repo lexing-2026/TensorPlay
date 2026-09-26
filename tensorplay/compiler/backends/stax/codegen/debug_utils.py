@@ -8,6 +8,21 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 
+import tensorplay as tp
+
+def _symbolic_call_arg():
+    """The kind of argument a symbolic expression arrives as.
+
+    Reached where it is needed rather than at import: the module that writes
+    the code needs this one, so importing it here would leave the two
+    half-built whichever was reached first.
+    """
+
+    from .wrapper import SymbolicCallArg
+
+    return SymbolicCallArg
+
+
 from .. import config
 from ..loops import V
 from .multi_kernel import MultiKernel
@@ -201,7 +216,7 @@ class DebugPrinterManager:
     ) -> None:
         for i, arg in enumerate(args_to_save):
             if arg_signatures is not None and not isinstance(
-                arg_signatures[i], torch_dtype
+                arg_signatures[i], tp.dtype
             ):
                 # infer from the arg data type (has tp.dtype) to see if it is a tensor type
                 continue
@@ -262,7 +277,7 @@ class DebugPrinterManager:
                 continue
             if V.graph.cpp_wrapper:
                 if arg_signatures is not None and isinstance(
-                    arg_signatures[i], torch_dtype
+                    arg_signatures[i], tp.dtype
                 ):
                     # infer from the arg data type (has tp.dtype) to see if it is a tensor type
                     V.graph.wrapper_code.writeline(
@@ -271,7 +286,7 @@ class DebugPrinterManager:
                 elif arg_signatures is not None and isinstance(
                     arg_signatures[i],
                     (
-                        type(codegen.wrapper.SymbolicCallArg),
+                        _symbolic_call_arg(),
                         type(int),
                         type(float),
                         type(bool),

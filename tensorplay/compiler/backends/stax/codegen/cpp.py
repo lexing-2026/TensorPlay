@@ -31,6 +31,7 @@ from tensorplay.graph.experimental.sympy_functions import (
 from tensorplay.primitives.common import is_float_dtype, is_integer_dtype
 
 from .. import config, cpp_builder, cpu_vec_isa, dependencies, ir, metrics
+from ..debug import set_kernel_post_grad_provenance_tracing
 from ..loops import ops, V
 from ..ops_handler import NullKernelHandler, OpsValue
 from ..loop_body import LoopBody
