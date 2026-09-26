@@ -758,37 +758,133 @@ def _compile_rendered(template, source: str, config: dict, constants: dict,
         return None
 
 
+def _param_name(name: str) -> str:
+    """The name the parameter carrying an operand goes by.
+
+    A body refers to an operand by one name; the parameter that carries it is
+    named after that, with a pointer's suffix when the body did not already
+    use one.  One spelling, used by the signature, by the extents and strides
+    it carries, and by anything asking about them, so that nothing has to
+    translate between them.
+    """
+
+    return name if name.endswith("_ptr") else f"{name}_ptr"
+
+
 def _launcher_tail(layout, input_nodes, arg_names) -> tuple:
     """What a launcher is handed after the operands, in the signature's order.
 
     The signature names the extents and the strides, and the order it names
-    them in is the order they are given in -- the launcher has no way to work
-    that out for itself, since it is a call written before the values were
-    known.  So the values are lined up here against the names, and the stream
+    them in is the order they are given in -- a launcher is a call written
+    before the values were known, so it cannot work that out for itself.  The
+    names say which operand each belongs to, so each is looked up in that
+    operand's own extents rather than counted off in sequence, and the stream
     the launch runs on is the last of them.
     """
 
     import tensorplay as tp
 
-    sizes: list = []
-    strides: list = []
-    for node in input_nodes:
+    def extents_of(node):
+        """An operand's extents and strides, whichever kind of thing it is.
+
+        A value the compiler has lowered knows its own extents and strides; one
+        handed over from outside knows only its shape, and a value that knows
+        neither is recorded as knowing nothing, so that asking about it fails
+        here rather than at a launch.
+        """
+
         if hasattr(node, "get_size"):
-            sizes += [int(v) for v in node.get_size()]
-        if hasattr(node, "get_stride"):
-            strides += [int(v) for v in node.get_stride()]
-    if layout is not None:
-        sizes += [int(v) for v in layout.size]
-        strides += [int(v) for v in layout.stride]
+            return [int(v) for v in node.get_size()], [
+                int(v) for v in node.get_stride()
+            ]
+        def read(name):
+            """A value that may be spelled as an attribute or as a method.
+
+            One describes itself by its shape and its strides; the other is
+            asked.  Both spellings mean the same thing, so which one a value
+            uses is not something the caller has to know.
+            """
+
+            value = getattr(node, name, None)
+            if value is None:
+                return None
+            return value() if callable(value) else value
+
+        shape = read("shape")
+        if shape is None:
+            shape = read("size")
+        if shape is not None:
+            shape = [int(v) for v in shape]
+            known = read("stride")
+            if known is not None:
+                return shape, [int(v) for v in known]
+            strides: list[int] = []
+            running = 1
+            for extent in reversed(shape):
+                strides.append(running)
+                running *= max(extent, 1)
+            return shape, list(reversed(strides))
+        raise AssertionError(
+            f"an operand of this launch knows neither its shape nor its "
+            f"extents: {node!r}"
+        )
+
+    by_name: dict = {}
+    for index, node in enumerate(input_nodes):
+        letter = chr(ord("A") + index)
+        by_name[letter] = node
+    by_name["C"] = layout
+    sizes_of: dict = {}
+    strides_of: dict = {}
+    for letter, node in by_name.items():
+        sizes_of[letter], strides_of[letter] = extents_of(node)
 
     tail: list = []
+    size_seen: dict = {}
+    stride_seen: dict = {}
     for name in arg_names:
         if name.startswith("size_"):
-            tail.append(sizes[len([n for n in arg_names[:arg_names.index(name)]
-                                    if n.startswith("size_")])])
+            # The name says which operand and which of its extents: the operand
+            # is the letters up to the last digit, and the extent is which
+            # digit it ends with.  The operand is named by the parameter, so
+            # whichever spelling the operands were declared under is the one
+            # looked for.
+            stem = name[len("size_"):-1]
+            operand = next(
+                (
+                    letter
+                    for letter in by_name
+                    if letter.lower() == stem.lower() or letter.lower() + "_ptr" == stem.lower()
+                ),
+                None,
+            )
+            if operand is None:
+                raise AssertionError(
+                    f"the signature names an extent of {stem!r}, which is not "
+                    f"one of this kernel's operands: {sorted(by_name)}"
+                )
+            rank = size_seen.get(operand, 0)
+            size_seen[operand] = rank + 1
+            tail.append(sizes_of[operand][rank])
         elif name.startswith("stride_"):
-            tail.append(strides[len([n for n in arg_names[:arg_names.index(name)]
-                                     if n.startswith("stride_")])])
+            stem = name[len("stride_"):-1]
+            operand = next(
+                (
+                    letter
+                    for letter in by_name
+                    if letter.lower() == stem.lower() or letter.lower() + "_ptr" == stem.lower()
+                ),
+                None,
+            )
+            if operand is None:
+                raise AssertionError(
+                    f"the signature names a stride of {stem!r}, which is not "
+                    f"one of this kernel's operands: {sorted(by_name)}"
+                )
+            rank = stride_seen.get(operand, 0)
+            stride_seen[operand] = rank + 1
+            tail.append(strides_of[operand][rank])
+
     stream = None
     device = getattr(layout, "device", None)
     if device is not None and getattr(device, "type", "cpu") != "cpu":
@@ -866,7 +962,11 @@ def _signature_of(arg_names, operands: dict) -> dict:
     signature: dict = {}
     for name in arg_names:
         if name.endswith("_ptr"):
-            operand = name[:-4]
+            # The parameter is named after the operand, which may or may not
+            # already carry the suffix itself; the operand is whichever of the
+            # two spellings was declared.
+            stem = name[:-4]
+            operand = stem if stem in operands else name
             dtype = (operands.get(operand) or {}).get("dtype")
             # An operand whose type is not known is said as a byte pointer
             # rather than guessed at: the type decides how the kernel reads
@@ -1043,6 +1143,25 @@ class TritonTemplate(KernelTemplate):
 
         return self.kernel_type.get(self.name, self.source, self.symbol, self.grid)
 
+    def argnames(self) -> list[str]:
+        """The operand names the body asked for, in the order it asked for them.
+
+        A body names its operands in the kernel it writes, and those names are
+        what the rest of the template has to call them by: a body that asks for
+        a name no operand was given fails here rather than producing a kernel
+        that reads the wrong buffer.  Read out of the source rather than
+        declared beside it, because a name written in the body and a name
+        recorded elsewhere can disagree and then the disagreement is invisible.
+        """
+
+        import re
+
+        found = re.search(r"def_kernel\(([^)]*)\)", self.source)
+        if found is None:
+            return ["A"]
+        names = re.findall(r"[A-Za-z_][A-Za-z_0-9]*", found.group(1))
+        return names or ["A"]
+
     def generate(self, **kwargs: Any):
         """The choice this template makes for one set of arguments.
 
@@ -1060,7 +1179,7 @@ class TritonTemplate(KernelTemplate):
             meta = {k: v for k, v in kwargs.items()
                     if k not in ("layout", "input_nodes")}
             meta.setdefault("out_size", tuple(int(s) for s in layout.size))
-            names = ["A", "B"][:len(input_nodes)] or ["A"]
+            names = self.argnames()[:len(input_nodes)] or list(self.argnames())[:1]
             operands = {}
             for name, node in zip(names, input_nodes):
                 # A lowered value knows its own extents and strides; something
@@ -1301,39 +1420,54 @@ class KernelArgs:
         return tuple(spec["shape"] for name, spec in self.outputs.items()), meta
 
     def _operand(self, name: str) -> dict:
-        if name in self.inputs:
-            return self.inputs[name]
-        if name in self.outputs:
-            return self.outputs[name]
+        # An operand is declared under one name and a body may ask about it
+        # under either that name or the name its value is read by; both mean
+        # the same operand, so both are looked for before either is refused.
+        for candidate in (name, name.removesuffix("_ptr"), f"{name}_ptr"):
+            if candidate in self.inputs:
+                return self.inputs[candidate]
+            if candidate in self.outputs:
+                return self.outputs[candidate]
         raise KeyError(
             f"{name} is not one of this kernel's operands: "
             f"{sorted(self.inputs) + sorted(self.outputs)}"
         )
 
-    def size(self, name: str, dim: int) -> str:
+    def size(self, name, dim: int) -> str:
         """One extent of one operand, as the kernel's index type.
 
         Negative dimensions count from the end, which is what lets one body ask
-        for ``-1`` and mean the contiguous axis whatever the rank is.
+        for ``-1`` and mean the contiguous axis whatever the rank is.  Naming
+        nothing asks about the result rather than an input, which is what a body
+        wants when it is working out the shape of what it is producing.
         """
 
-        shape = self._operand(name)["shape"]
+        if name is None:
+            name, spec = next(iter(self.outputs.items()))
+            shape = spec["shape"]
+        else:
+            shape = self._operand(name)["shape"]
         index = dim if dim >= 0 else len(shape) + dim
         if not 0 <= index < len(shape):
             raise IndexError(
                 f"{name} has {len(shape)} dimensions; {dim} is not one of them"
             )
-        return f"size_{name.lower()}{index}"
+        return f"size_{_param_name(name)}{index}"
 
-    def stride(self, name: str, dim: int) -> str:
+    def stride(self, name, dim: int) -> str:
         """One stride of one operand, by name rather than by position.
 
         Strides are passed as arguments rather than baked in, so a body that
         asks for one does not have to be re-rendered per layout: the kernel is
         told the layout at launch, and the same text serves every layout.
+
+        Naming nothing asks about the result rather than an input, which is what
+        a body wants when it is working out how its own result is addressed.
         """
 
-        return f"stride_{name.lower()}{dim}"
+        if name is None:
+            name = next(iter(self.outputs))
+        return f"stride_{_param_name(name)}{dim}"
 
     def def_kernel(self, *names: str, symbol: str | None = None, outputs: tuple = ()) -> str:
         """The decorator and the signature, written from the operand names.
@@ -1349,15 +1483,18 @@ class KernelArgs:
 
         for name in parts:
             self._operand(name)
-        params = ", ".join(f"{n}_ptr" for n in parts)
+        # One spelling per name, used everywhere: the parameter that carries an
+        # operand, the extents it has, and the strides it is laid out with are
+        # all named after it, so a body that asks for one of them is asking
+        # about the operand and nothing has to translate between spellings.
         strides = []
         for name in parts:
             rank = len(self._operand(name)["shape"])
-            strides += [f"stride_{name.lower()}{d}" for d in range(rank)]
+            strides += [f"stride_{_param_name(name)}{d}" for d in range(rank)]
         sizes = []
         for name in parts:
             rank = len(self._operand(name)["shape"])
-            sizes += [f"size_{name.lower()}{d}" for d in range(rank)]
+            sizes += [f"size_{_param_name(name)}{d}" for d in range(rank)]
         # A value chosen when the text was written -- a tile, an accumulation
         # type, a bound -- cannot change while the kernel runs, and the kernel
         # is compiled once for the configuration it came from.  So it is a
@@ -1374,12 +1511,18 @@ class KernelArgs:
         # the rest are -- the compiler folds it, and the body reads it by name.
         tail = [f"{n}: tl.constexpr" for n in self.constexprs]
         tail.append("INDEX_DTYPE: tl.constexpr")
-        all_params = [f"{n}_ptr" for n in names] + sizes + strides + tail
-        # The body refers to an operand by its own name rather than by the name
-        # of the parameter that carries it, so the two are tied together at the
-        # top of the body.  A body that names an operand nobody declared fails
-        # here, at the point of the binding, rather than later inside a loop.
-        binds = "".join(f"    {n} = {n}_ptr\n" for n in names)
+        # An operand is declared under one name and referred to by it.  A body
+        # that says "A" means the parameter named A, so that is the name given
+        # -- a short name is spelled the way the body spells it, and one the
+        # body spells with its pointer suffix keeps it.  A body that goes on to
+        # assign a name it was not given is therefore assigning a name of its
+        # own, which is what it meant to do.
+        all_params = [_param_name(n) for n in names] + sizes + strides + tail
+        binds = "".join(
+            f"    {n} = {_param_name(n)}\n"
+            for n in names
+            if not n.endswith("_ptr")
+        )
         return (
             "@triton.jit\n"
             f"def {symbol}({', '.join(all_params)}):\n"

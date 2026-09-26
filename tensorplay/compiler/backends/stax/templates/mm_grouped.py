@@ -538,11 +538,15 @@ class GroupedMmTemplate(TritonTemplate):
         that takes more says so here and nowhere else.
         """
 
+        # A name the body declares for itself is not a name it is given: the
+        # factors are declared under their pointer's name and the body assigns
+        # them a value to read from, and a binding here would shadow that
+        # assignment with a pointer.
         names = ["A", "B"]
         if scaled:
-            names.extend(("scale_a", "scale_b"))
+            names.extend(("scale_a_ptr", "scale_b_ptr"))
         if extents["A_IS_2D"] or extents["B_IS_2D"]:
-            names.append("offsets")
+            names.append("offsets_ptr")
         return tuple(names)
 
     def kernel_for(self, block: tuple, extents: dict, layout, inputs, scaled,
@@ -570,10 +574,16 @@ class GroupedMmTemplate(TritonTemplate):
                 (extents["n_total"],) if extents["B_IS_2D"]
                 else (extents["groups"], extents["n"])
             )
-        if "offsets" in inputs:
+        if "offsets_ptr" in inputs:
             shapes["offsets"] = (extents["groups"],)
+        # An operand is declared under the name its body reads it by, which for
+        # the factors and the boundaries is the pointer's name; the geometry is
+        # recorded under the name the shape is known by.
         operands = {
-            name: {"shape": shapes[name], "stride": contiguous_stride(shapes[name])}
+            name: {
+                "shape": shapes[name.removesuffix("_ptr")],
+                "stride": contiguous_stride(shapes[name.removesuffix("_ptr")]),
+            }
             for name in inputs
         }
         out_size = tuple(int(v) for v in layout.size)
