@@ -9,7 +9,9 @@ from .freezing_utils import maybe_set_is_frozen_param
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
 
 
-aten = tp.ops.aten
+#: The operator set, under a name that says what it is rather than where
+#: it came from.
+operator_set = tp.ops.aten
 
 # We would like to split modules into two subgraphs for runtime weight updates to work correctly.
 # The use case and more information could be found at:
@@ -217,7 +219,7 @@ class ConstantFolder(Any):
         # TODO - fix errors with this
         if (
             node.op == "call_function"
-            and node.target is aten._efficientzerotensor.default
+            and node.target is operator_set._efficientzerotensor.default
         ):
             return self.unknown_value
 

@@ -4746,7 +4746,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
             """
             from ..runtime.example_values import rand_strided
             {}
-            import torch
+            import tensorplay as tp
             """
         ).format(V.graph.device_ops.import_get_raw_stream_as("get_raw_stream"))
 
@@ -5643,7 +5643,7 @@ def triton_store_type(dtype) -> str:
             """
             from ..runtime.example_values import rand_strided
             {}
-            import torch
+            import tensorplay as tp
             """
         ).format(V.graph.device_ops.import_get_raw_stream_as("get_raw_stream"))
 
@@ -6627,7 +6627,8 @@ class TritonOverrides(OpOverrides):
             return 0
 
         if src_dtype is not None:
-            # Both dtype and src_dtype are set. This is used by torch to(dtype=dtype).
+            # Both dtype and src_dtype are set, which is what a narrowing
+            # conversion is written from.
             # It takes the maximum min_elem_per_thread if there are multiple fp8 conversions
             # in the same kernel.
             V.kernel.min_elem_per_thread = max(

@@ -168,7 +168,7 @@ class AutoHeuristic:
 
         # TODO(AlnisM): just using the device name for now, but the same GPU model can have different names
         if tp.cuda.is_available():
-            device_name = torch.cuda.get_device_name().replace(" ", "_")
+            device_name = tp.cuda.get_device_name().replace(" ", "_")
             return device_name
         return "non_cuda_device"
 
@@ -276,7 +276,7 @@ class AutoHeuristicSelectAlgorithm(AutoHeuristic):
         Registers a callback in select_algorithm, which is called with the timing of each choice.
         """
 
-        from torch._inductor.select_algorithm import (
+        from ..templates.select_algorithm import (
             add_feedback_saver,
             create_inputs_key,
             create_precompile_key,

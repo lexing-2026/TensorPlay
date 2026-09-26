@@ -42,7 +42,7 @@ class TileHint(enum.Enum):
 
 
 class DeviceProperties(typing.NamedTuple):
-    """Copy device properties into a data structure not requiring torch to be imported"""
+    """Device properties, held so that reading them needs no device module."""
 
     type: str  # type: ignore[assignment]
     index: int  # type: ignore[assignment]
