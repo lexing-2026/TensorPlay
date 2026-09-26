@@ -53,7 +53,13 @@ from .memory import (
     MemoryPlanningInfoForNode,
 )
 from .ir import is_gpu
-from .utils import cache_on_self, cache_on_self_and_args, get_dtype_size, sympy_product
+from .utils import (
+    cache_on_self,
+    cache_on_self_and_args,
+    get_current_backend,
+    get_dtype_size,
+    sympy_product,
+)
 
 log = logging.getLogger(__name__)
 
@@ -3282,7 +3288,7 @@ class MixOrderReduction:
     def can_fuse(cls, node1, node2) -> bool:
         """Whether two reductions that walk different axes may run as one."""
 
-        if not config.triton_mix_order_reduction:
+        if not config.triton.mix_order_reduction:
             return False
 
         # The two orders share a read only where the code is compiled rather
@@ -3322,7 +3328,7 @@ class MixOrderReduction:
         nrow, ncol = g1
 
         # Where it is allowed to be approximate, the checks below are skipped.
-        if not config.triton_mix_order_reduction_non_strict_mode:
+        if not config.triton.mix_order_reduction_non_strict_mode:
             # Below a certain size the whole thing is held in cache anyway, and
             # reading it twice costs less than the trouble of sharing one read.
             size_thres = 5 * 2**20
@@ -3564,7 +3570,7 @@ class FusedMixOrderReductions(FusedSchedulerNode):
             return False
         # Too many loads in one loop body spills what is held in hand, so where
         # there is a limit on how many a joined pair may read, it is applied.
-        max_reads = config.triton_mix_order_reduction_max_reads
+        max_reads = config.triton.mix_order_reduction_max_reads
         if max_reads > 0:
             all_reads: OrderedSet = OrderedSet()
             for sn in itertools.chain(self.get_nodes(), other.get_nodes()):
@@ -3833,11 +3839,10 @@ def _kernel_features():
 def _is_gpu_triton_backend(node1, node2) -> bool:
     """Whether these two pieces run on a machine where sharing one read is possible."""
 
-    if config.triton_backend not in ("inductor", "cudagraphs"):
+    if not node1.is_gpu() or not node2.is_gpu():
         return False
-    if config.accelerator == "autotune":
-        return False
-    return node1.is_gpu() and node2.is_gpu()
+    device_type = node1.get_device().type
+    return device_type in ("cuda", "xpu") and get_current_backend(device_type) == "triton"
 
 
 
@@ -5912,8 +5917,7 @@ class Scheduler:
             if node.has_strict_reduction() and (
                 node1.is_reduction() or node2.is_reduction()
             ):
-                if not config.strict_fusion:
-                    return False
+                return False
 
         if node1.is_reduction() != node2.is_reduction():
             consumer_fusion = True

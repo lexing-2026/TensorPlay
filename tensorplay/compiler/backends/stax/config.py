@@ -14,7 +14,9 @@ any one kernel.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import sys
 
 # Whether a loop nest's strides are padded so that every access is aligned to
 # the width of a memory transaction.  Off for a region whose extents are not
@@ -215,6 +217,13 @@ codegen_upcast_to_fp32 = True
 
 
 class _CppConfig:
+    #: Write a wrong answer on purpose, to check that a test would notice.
+    #: The value names the mistake: a relu that can return a negative number,
+    #: or a logarithm that can return something other than its input's
+    #: logarithm.  Left unset, which is the only way to ship.
+    inject_relu_bug_TESTING_ONLY: str | None = None
+    inject_log1p_bug_TESTING_ONLY: str | None = None
+
     """The knobs the host emitter reads while emitting.
 
     These are the settings where more than one answer is defensible: whether
@@ -676,8 +685,128 @@ class _AotIConfigs:
     #: is the failure this exists to catch.
     runtime_asserts = True
 
+    #: Read the graph's own memory rather than passing what it allocated on to
+    #: the runtime's allocator.  Off because a graph that outlives the
+    #: allocator it was built against is the failure this avoids.
+    allow_stack_allocation: bool = False
+
+    #: Give each kernel its own allocation while it is being tuned, rather than
+    #: sharing one across every kernel of a launch.  Costs memory, and keeps one
+    #: kernel's tuning from being decided by another's footprint.
+    autotune_per_kernel_alloc: bool = False
+
+    #: Which kernels a listing may name.  Left unset, every kernel is named.
+    filtered_kernel_names = os.environ.get("TP_FILTERED_KERNELS_TO_PRINT", None)
+
+    #: Fold the constants a graph computes at run time, rather than computing
+    #: them once when it is built.  Off because a graph run many times is
+    #: cheaper to fold once, and a graph run once is not.
+    use_runtime_constant_folding: bool = False
+
 
 aot_inductor = _AotIConfigs()
+
+
+class _TritonConfig:
+    """The switches that only mean anything to the kernel-writing runtime.
+
+    Everything here is read by code that hands a kernel to that runtime rather
+    than by code that runs here, so each is either about what to write into the
+    generated module or about where the runtime should put what it produces.
+    """
+
+    #: Give a user's kernel a name of its own rather than the name it was
+    #: written under, so that two kernels written under one name do not collide
+    #: in the runtime's cache.
+    unique_user_kernel_names = (
+        os.environ.get("TP_UNIQUE_USER_KERNEL_NAMES", "0") == "1"
+    )
+
+    #: Keep the machine code the runtime produced beside the cache entry, which
+    #: is what a reader needs when the entry itself will not load.
+    store_cubin = False
+
+    #: Write down a trace of each launch as it runs.
+    proton_profiling: bool = (
+        os.environ.get("TP_TRITON_PROTON_PROFILING", "0") == "1"
+    )
+    #: Where the trace is written.  Left unset, it goes beside the cache.
+    proton_output_dir: str | None = os.environ.get("TP_TRITON_PROTON_OUTPUT_DIR")
+    #: Put the work groups of a trace in the order the machine ran them,
+    #: rather than one after another, which is what makes a trace readable
+    #: against the machine.
+    proton_group_by_sm: bool = (
+        os.environ.get("TP_TRITON_PROTON_GROUP_BY_SM", "1") == "1"
+    )
+    #: Start a trace file per launch, rather than one file for the whole run.
+    proton_split_invocations: bool = (
+        os.environ.get("TP_TRITON_PROTON_SPLIT_INVOCATIONS", "1") == "1"
+    )
+    #: Fold the tracks of the warps of a work group into one track for the
+    #: group, so a trace shows what the group did rather than what each of its
+    #: warps did.
+    proton_per_cta_occupancy: bool = (
+        os.environ.get("TP_TRITON_PROTON_PER_CTA_OCCUPANCY", "1") == "1"
+    )
+
+    #: How many kernels one launch may hold.  Above one, several kernels share
+    #: a launch and are told apart inside it, which is worth doing when a
+    #: launch's fixed cost is a large part of what it costs.
+    multi_kernel: int = int(os.environ.get("TP_MULTI_KERNEL", "0"))
+
+    #: Write the graph down as it is lowered, which is how a shape that came
+    #: out wrong is traced back to the node that made it wrong.
+    debug_sync_graph = False
+
+    #: Launch a captured graph rather than calling into it, so the launches
+    #: themselves are what a profiler sees.
+    cudagraphs = os.environ.get("TP_CUDAGRAPHS") == "1"
+
+    #: Round an extent that is a multiple of sixteen up to a multiple of
+    #: sixteen, which is what lets a wide load stay aligned.  On because a wide
+    #: load that is not aligned is the slower of the two.
+    divisible_by_16 = os.environ.get("TP_DIVISIBLE_BY_16", "1") == "1"
+
+    #: Read through a block pointer rather than through a row of offsets.
+    use_block_ptr = False
+
+    #: Compute a narrower-than-float value in float and narrow it at the end,
+    #: rather than computing it in its own type throughout.
+    codegen_upcast_to_fp32 = True
+
+    #: Let the warps of a launch cooperate on one reduction rather than each
+    #: reducing a part of it and a later step combining the parts.
+    cooperative_reductions = (
+        os.environ.get("TP_COOPERATIVE_REDUCTIONS", "0") == "1"
+    )
+
+    #: Choose among the tunings while the graph is being built, rather than at
+    #: the first launch.  Left unset, the choice is made at the first launch.
+    autotune_at_compile_time: bool | None = (
+        None
+        if "TP_AUTOTUNE_AT_COMPILE_TIME" not in os.environ
+        else os.environ["TP_AUTOTUNE_AT_COMPILE_TIME"] == "1"
+    )
+
+    #: Fuse two reductions that run over different axes into one launch.  On by
+    #: default: the fused launch reads each element once, which neither of the
+    #: two does alone.
+    mix_order_reduction = os.environ.get("TP_MIX_ORDER_REDUCTION", "1") == "1"
+
+    #: Where a mix-order reduction is split, when it is split at a fixed size
+    #: rather than at a size chosen by measurement.  Left unset, it is not.
+    mix_order_reduction_split_size: int | None = None
+
+    #: Allow a mix-order reduction to use more than one stage, which shares
+    #: memory between the stages and so can run out of it.
+    mix_order_reduction_non_strict_mode = False
+
+    #: How many separate reads a mix-order reduction may make.  Zero says not
+    #: to check, which leaves the number of reads unbounded.
+    mix_order_reduction_max_reads = 10
+
+
+triton = _TritonConfig()
 
 
 class _TraceConfig:
@@ -694,5 +823,141 @@ class _TraceConfig:
     #: Where the trace is written.  Left unset, nothing is written.
     output_dir = None
 
+    #: Put the record of where each value came from on the trace's timeline,
+    #: beside the launches, rather than in the graph's own listing.
+    provenance_tracking_to_timeline = (
+        os.environ.get("TP_COMPILE_DEBUG_EXTEND", "0") == "1"
+    )
+
 
 trace = _TraceConfig()
+
+
+# ---------------------------------------------------------------------------
+# How wide a read may be assumed to be, and how a build is spread over threads
+# ---------------------------------------------------------------------------
+
+#: The number of reads past which a value's loads are written out one by one
+#: rather than left to be coalesced, when nothing overrides it.  A value read
+#: this many times is read often enough that writing the reads out is worth the
+#: code it costs.
+_realize_acc_reads_threshold_default = 8
+
+#: Where the reads of a value are written out one by one, overriding the
+#: default above.  Left unset, the default is used.
+realize_acc_reads_threshold: int | None = None
+
+#: The same threshold for a value on the host, where a read is a plain load and
+#: there is no coalescing to hand it to, so the bar for writing reads out is
+#: higher.
+realize_cpu_acc_reads_threshold = 12
+
+#: Where the reads are also written out once the value is read this many
+#: elements, however few times it is read.  Left unset, size is not considered.
+realize_acc_reads_size_threshold: int | None = None
+
+#: How many builds run at once.  Resolved from the environment first, then from
+#: the machine: one thread means every build stays on the calling thread, which
+#: is what keeps stepping through a build possible.
+if "TP_COMPILE_THREADS" in os.environ:
+    compile_threads = int(os.environ["TP_COMPILE_THREADS"])
+elif sys.platform == "win32":
+    # Starting a thread per build is unreliable here, so a build is run on the
+    # calling thread instead.
+    compile_threads = 1
+else:
+    compile_threads = max(1, (os.cpu_count() or 1))
+
+
+# ---------------------------------------------------------------------------
+# What a fused program is allowed to assume
+# ---------------------------------------------------------------------------
+
+#: Assume every index fits in 32 bits, which lets a generated kernel use
+#: narrower arithmetic throughout.  A program with an index that does not fit
+#: is then wrong rather than slow, so this is off unless a caller knows the
+#: extents are small.
+assume_32bit_indexing: bool = False
+
+#: Take a fusion only where the two pieces are independent enough that the
+#: result does not depend on the order they run in.
+combo_kernels = False
+
+#: Write into a buffer that is still being read, rather than into one of its
+#: own.  On because a program that cannot do this allocates twice as much.
+inplace_buffers = True
+
+#: Write down which node of the graph each line of generated code came from.
+comment_origin = False
+
+#: Say what the compiler is doing while it does it.
+debug = False
+
+#: A conversion to a narrower type is written as the rounding it performs,
+#: rather than as the conversion the hardware does.  The two disagree on values
+#: the hardware cannot represent, and writing the rounding makes that visible.
+emulate_precision_casts: bool = (
+    os.environ.get("TP_EMULATE_PRECISION_CASTS", "0") == "1"
+)
+
+#: Ignore every cache and compile afresh, which is what a measurement needs:
+#: a number read out of a cache is the number that was measured then.
+force_disable_caches: bool = False
+
+#: How many pairs of groups to try fusing before giving up on a round of
+#: grouping, which bounds the work one round can take when there are many
+#: groups.
+max_fusion_buffer_group_pairwise_attempts = 64
+
+#: Take a runtime estimate for a matrix multiply from a measurement of it,
+#: rather than from a formula, which is slower and more accurate.
+runtime_estimations_mms_benchmark: bool = False
+
+
+@contextlib.contextmanager
+def patch(*args, **kwargs):
+    """Set settings for the length of a block, then put them back.
+
+    A setting that has to differ for one piece of work and not for the rest is
+    changed around that piece rather than around the whole run, so what the
+    setting is outside the block is whatever the caller had it.  A name that
+    does not exist is an error rather than a new setting: a setting nobody
+    reads is a setting that was meant for something else.
+
+    The settings are given as a mapping, as alternating names and values, or as
+    keyword arguments naming the settings directly.  A name may be written the
+    way it is reached, so a setting in a namespace is patched as
+    ``"triton.proton_profiling"`` or as ``triton.proton_profiling=False``.
+    """
+
+    if args and isinstance(args[0], dict):
+        if len(args) > 1 or kwargs:
+            raise TypeError(
+                "settings are given as a mapping, or as names and values, not both"
+            )
+        pairs = list(args[0].items())
+    else:
+        if len(args) % 2 != 0:
+            raise TypeError(
+                "settings given by name must come in name-and-value pairs"
+            )
+        pairs = list(zip(args[::2], args[1::2])) + list(kwargs.items())
+
+    saved = []
+    try:
+        for name, value in pairs:
+            parts = name.split(".")
+            target = sys.modules[__name__]
+            for part in parts[:-1]:
+                target = getattr(target, part)
+            leaf = parts[-1]
+            if not hasattr(target, leaf):
+                raise AttributeError(f"there is no setting named {name!r}")
+            saved.append((target, leaf, getattr(target, leaf)))
+            setattr(target, leaf, value)
+        yield
+    finally:
+        # Put back in the reverse order the settings were applied, so that two
+        # patches of the same setting nest the way they were written.
+        for target, leaf, value in reversed(saved):
+            setattr(target, leaf, value)
