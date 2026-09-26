@@ -179,7 +179,9 @@ class BackendFeature(Enum):
 #: What each emitter declares.  Order is the preference order: the first
 #: emitter whose declared set covers what the program needs is the one that
 #: runs, and a program no emitter covers is a lowering miss rather than a
-#: silent hop to a weaker emitter.
+#: silent hop to a weaker emitter.  Elementwise work has one emitter; a
+#: program it cannot express is a miss to report, not a second codegen path
+#: with different semantics to fall into.
 BACKEND_FEATURES: dict[str, frozenset] = {
     "triton": frozenset({
         BackendFeature.STRIDED_INPUTS,
@@ -191,19 +193,13 @@ BACKEND_FEATURES: dict[str, frozenset] = {
         BackendFeature.GRAD_INPUTS,
         BackendFeature.TILE_MASKED_ACCESS,
     }),
-    "nvrtc": frozenset({
-        BackendFeature.MIXED_INPUT_DTYPES,
-        BackendFeature.PROMOTED_INPUTS,
-        BackendFeature.MULTI_OUTPUT,
-        BackendFeature.GRAD_INPUTS,
-    }),
     "interpreter": frozenset({
         BackendFeature.MULTI_OUTPUT,
     }),
 }
 
 #: Preference order among the emitters.
-BACKEND_ORDER: tuple[str, ...] = ("triton", "nvrtc", "interpreter")
+BACKEND_ORDER: tuple[str, ...] = ("triton", "interpreter")
 
 
 def required_features(

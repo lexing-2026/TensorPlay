@@ -455,9 +455,11 @@ def _supports_runtime_inputs(
     for value in example_inputs:
         if not isinstance(value, tensor_type):
             return False
+        # Geometry and device only: what the emitter can express is declared
+        # in the capability table, and a strided operand is one of the
+        # declared features rather than a reason to refuse the program.
         if (
             not value.device.is_cuda()
-            or not value.is_contiguous()
             or (value.requires_grad and not allow_grad)
         ):
             return False

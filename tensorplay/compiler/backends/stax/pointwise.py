@@ -2737,17 +2737,10 @@ def _register_stax_cuda_pointwise_op(
                         _reference: tuple[int, ...] = reference_shape,
                         _mixed: bool = mixed_inputs,
                     ) -> Any:
-                        # The generated kernel addresses every input as
-                        # contiguous.  A strided operand (an expanded
-                        # per-channel view, for example) is materialized here
-                        # -- a tiny copy next to the wrapper the fallback
-                        # runs, which re-materializes the whole broadcast.
-                        values = [
-                            value
-                            if value.is_contiguous()
-                            else value.contiguous()
-                            for value in inputs
-                        ]
+                        # The emitter declares that it reads an input through
+                        # its stride, so a strided operand needs no copy: it is
+                        # handed over as it is.
+                        values = list(inputs)
                         # allow_grad: this op runs inside the native graph
                         # whose reverse pass is a separately compiled
                         # program, so parameter inputs carrying
