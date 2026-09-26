@@ -557,6 +557,210 @@ bool try_cat2_nchw_promoted_float(const std::vector<Tensor>& tensors, int64_t di
 // copies are delegated to copy_ so they inherit the stream-aware CUDA allocator
 // and non-blocking copy semantics; this keeps the implementation correct for
 // non-contiguous inputs while avoiding a second bespoke concatenation kernel.
+// Concatenation as one launch: blockIdx.y selects which input to copy, and the
+// per-input metadata rides in the parameter block.  Copying the inputs one
+// after another instead costs a dispatch and a kernel per input, which for
+// small inputs is most of the work.
+constexpr int kCatArrayBatchSize = 128;
+constexpr int kCatArrayMaxInputDims = 4;
+
+// Turn a position in the output into a position in one input.  The axis being
+// concatenated is replaced by that input's extent, so the position walks the
+// output's remaining axes.
+template <typename IndexType, int Dims>
+struct CatArrIndexToOffset {
+    static __device__ __forceinline__ IndexType compute(
+        const IndexType tensorSize[Dims], const IndexType tensorStride[Dims],
+        const IndexType dimSize, const unsigned int concatDim,
+        IndexType linearIndex) {
+        IndexType offset = 0;
+#pragma unroll
+        for (int i = Dims - 1; i >= 1; --i) {
+            const IndexType curDimSize = i == concatDim ? dimSize : tensorSize[i];
+            const IndexType nextDimIndex = linearIndex / curDimSize;
+            const IndexType curDimIndex = linearIndex - curDimSize * nextDimIndex;
+            offset += curDimIndex * tensorStride[i];
+            linearIndex = nextDimIndex;
+        }
+        return offset + linearIndex * tensorStride[0];
+    }
+};
+
+template <typename IndexType, unsigned int MaxDims>
+struct TensorSizeStride {
+    IndexType tensorSize[MaxDims];
+    IndexType tensorStride[MaxDims];
+};
+
+// The inputs' addresses and shapes.  Contiguous inputs need no per-input
+// strides, so one slot is enough and a whole batch of inputs fits; otherwise
+// every input carries its own and the batch is halved to keep the parameter
+// block small.
+template <typename T, typename IndexType, int n, int stride_size>
+struct CatArrInputTensorMetadata {
+    const T* input[n];
+    IndexType offset[n];
+    IndexType dimSize[n];
+    IndexType nElements[n];
+    bool isContiguous[n];
+    TensorSizeStride<IndexType, kCatArrayMaxInputDims> tensorStride[stride_size];
+};
+
+template <typename T, typename IndexType, int Dims, int batch_size, int stride_size>
+__global__ void CatArrayBatchedCopy(
+    T* output, CatArrInputTensorMetadata<T, IndexType, batch_size, stride_size> inputs,
+    TensorSizeStride<IndexType, kCatArrayMaxInputDims> os, const int concatDim,
+    IndexType dimStride) {
+    IndexType tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const IndexType nElements = inputs.nElements[blockIdx.y];
+    const TensorSizeStride<IndexType, kCatArrayMaxInputDims> ins =
+        stride_size > 1 ? inputs.tensorStride[blockIdx.y] : inputs.tensorStride[0];
+    const bool isContig = inputs.isContiguous[blockIdx.y];
+    if (tid >= nElements) return;
+    const T* data = inputs.input[blockIdx.y];
+    const IndexType offset = inputs.offset[blockIdx.y];
+    const IndexType dimSize = inputs.dimSize[blockIdx.y];
+    const IndexType dataOffset = offset * dimStride;
+    const IndexType stride = gridDim.x * blockDim.x;
+    while (tid < nElements) {
+        const IndexType elementOffset = CatArrIndexToOffset<IndexType, Dims>::compute(
+            os.tensorSize, os.tensorStride, dimSize, concatDim, tid);
+        if (isContig) {
+            output[dataOffset + elementOffset] = data[tid];
+        } else {
+            const IndexType inElementOffset =
+                CatArrIndexToOffset<IndexType, Dims>::compute(
+                    ins.tensorSize, ins.tensorStride, dimSize, concatDim, tid);
+            output[dataOffset + elementOffset] = data[inElementOffset];
+        }
+        tid += stride;
+    }
+}
+
+template <typename T, typename IndexType, int Dims, int batch_size, int stride_size>
+__global__ void CatArrayBatchedCopy_contig(
+    T* output, CatArrInputTensorMetadata<T, IndexType, batch_size, stride_size> inputs,
+    TensorSizeStride<IndexType, kCatArrayMaxInputDims> os, const int concatDim,
+    IndexType dimStride) {
+    IndexType tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const IndexType nElements = inputs.nElements[blockIdx.y];
+    if (tid >= nElements) return;
+    const T* data = inputs.input[blockIdx.y];
+    const IndexType offset = inputs.offset[blockIdx.y];
+    const IndexType dimSize = inputs.dimSize[blockIdx.y];
+    const IndexType dataOffset = offset * dimStride;
+    const IndexType stride = gridDim.x * blockDim.x;
+    while (tid < nElements) {
+        const IndexType elementOffset = CatArrIndexToOffset<IndexType, Dims>::compute(
+            os.tensorSize, os.tensorStride, dimSize, concatDim, tid);
+        output[dataOffset + elementOffset] = data[tid];
+        tid += stride;
+    }
+}
+
+// A batch of contiguous inputs: one thread per element, with the grid sized
+// from the largest input so the per-input metadata is not re-read by a huge
+// grid over a tiny input.
+template <typename T>
+std::tuple<dim3, dim3> cat_grid_contig(uint32_t max_elements_per_tensor, ptrdiff_t nTensors) {
+    constexpr uint32_t kThreadsPerBlock = 128;
+    constexpr uint32_t kMaxBlocksPerSm = 32;
+    uint32_t thread_blocks =
+        (max_elements_per_tensor + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    static int num_sm = [] {
+        int device = 0;
+        checkCuda(cudaGetDevice(&device), "cat: query device");
+        int value = 0;
+        checkCuda(cudaDeviceGetAttribute(&value, cudaDevAttrMultiProcessorCount, device),
+                  "cat: query multiprocessor count");
+        return value;
+    }();
+    thread_blocks = std::min(static_cast<uint32_t>(num_sm * kMaxBlocksPerSm), thread_blocks);
+    return std::make_tuple(dim3(thread_blocks, static_cast<unsigned>(nTensors)),
+                           dim3(kThreadsPerBlock));
+}
+
+dim3 cat_grid(ptrdiff_t nTensors) {
+    static int num_sm = [] {
+        int device = 0;
+        checkCuda(cudaGetDevice(&device), "cat: query device");
+        int value = 0;
+        checkCuda(cudaDeviceGetAttribute(&value, cudaDevAttrMultiProcessorCount, device),
+                  "cat: query multiprocessor count");
+        return value;
+    }();
+    // The x extent cooperates on a single input, so a share of the machine is
+    // enough to fill it, and small inputs do not pay for a wide grid.
+    return dim3(static_cast<unsigned>(2 * num_sm), static_cast<unsigned>(nTensors));
+}
+
+template <typename T, int batch_size, int stride_size>
+void parallel_cat(const Tensor& out, const std::vector<const Tensor*>& inputs,
+                  int64_t dimension, int nDims) {
+    auto stream = getCurrentCUDAStream().stream();
+    T* data = out.data_ptr<T>();
+    CatArrInputTensorMetadata<T, uint32_t, batch_size, stride_size> meta{};
+    TensorSizeStride<uint32_t, kCatArrayMaxInputDims> outputParam{};
+    constexpr bool isContig = stride_size == 1;
+    uint32_t stride0 = 1;
+    for (int i = nDims - 1; i >= 0; --i) {
+        outputParam.tensorSize[i] = static_cast<uint32_t>(out.size(i));
+        outputParam.tensorStride[i] = isContig
+            ? static_cast<uint32_t>(stride0)
+            : static_cast<uint32_t>(out.stride(i));
+        stride0 *= out.size(i);
+    }
+    uint32_t max_elements_per_tensor = 0;
+    int64_t offset = 0;
+    const dim3 block(128);
+    for (size_t base = 0; base < inputs.size(); base += batch_size) {
+        int batch = 0;
+        for (; batch < batch_size && base + batch < inputs.size(); ++batch) {
+            const Tensor& t = *inputs[base + batch];
+            const int64_t dimSize = t.numel() > 0 ? t.size(dimension) : 0;
+            meta.input[batch] = t.data_ptr<T>();
+            meta.offset[batch] = static_cast<uint32_t>(offset);
+            meta.dimSize[batch] = static_cast<uint32_t>(dimSize);
+            meta.nElements[batch] = static_cast<uint32_t>(t.numel());
+            if (stride_size > 1) {
+                for (int j = 0; j < nDims; ++j) {
+                    meta.tensorStride[batch].tensorSize[j] = static_cast<uint32_t>(t.size(j));
+                    meta.tensorStride[batch].tensorStride[j] = static_cast<uint32_t>(t.stride(j));
+                }
+                meta.isContiguous[batch] = false;
+            } else {
+                meta.isContiguous[batch] = true;
+            }
+            offset += dimSize;
+            max_elements_per_tensor = std::max(
+                max_elements_per_tensor, meta.nElements[batch]);
+        }
+        if (max_elements_per_tensor == 0) continue;
+        const auto grids = cat_grid_contig<T>(max_elements_per_tensor, batch);
+        const dim3 grid = isContig ? std::get<0>(grids) : cat_grid(batch);
+        const int cat_dim = static_cast<int>(dimension);
+#define TP_CAT_HANDLE_CASE(DIMS)                                                 \
+    if (isContig) {                                                              \
+        CatArrayBatchedCopy_contig<T, uint32_t, DIMS, batch_size, stride_size>   \
+            <<<grid, block, 0, stream>>>(data, meta, outputParam, cat_dim,       \
+                                         outputParam.tensorStride[cat_dim]);      \
+    } else {                                                                     \
+        CatArrayBatchedCopy<T, uint32_t, DIMS, batch_size, stride_size>          \
+            <<<grid, block, 0, stream>>>(data, meta, outputParam, cat_dim,       \
+                                         outputParam.tensorStride[cat_dim]);      \
+    }
+        switch (nDims) {
+            case 1: TP_CAT_HANDLE_CASE(1); break;
+            case 2: TP_CAT_HANDLE_CASE(2); break;
+            case 3: TP_CAT_HANDLE_CASE(3); break;
+            case 4: TP_CAT_HANDLE_CASE(4); break;
+            default: break;
+        }
+#undef TP_CAT_HANDLE_CASE
+        checkCuda(cudaGetLastError(), "cat: batched copy");
+    }
+}
+
 Tensor cat_kernel_cuda(const std::vector<Tensor>& tensors, int64_t dim) {
     // check_cat_no_zero_dim -> legacy_cat_wrap_dim -> non-empty check ->
     // first-valid-tensor selection -> shape checks -> result_type promotion.
@@ -639,6 +843,46 @@ Tensor cat_kernel_cuda(const std::vector<Tensor>& tensors, int64_t dim) {
             break;
     }
 
+    // The batched path covers one launch for any number of inputs: it needs the
+    // rank to be small, every offset to fit in 32 bits, one dtype, and it only
+    // takes the inputs that carry data.  Anything else falls back to copying the
+    // inputs one after another.
+    std::vector<const Tensor*> present;
+    bool all_contiguous = true;
+    bool indexable = out.numel() <= static_cast<int64_t>(std::numeric_limits<int32_t>::max());
+    for (const auto& t : tensors) {
+        if (join_detail::should_skip(t)) continue;
+        present.push_back(&t);
+        all_contiguous = all_contiguous && t.is_contiguous();
+        indexable = indexable &&
+            t.numel() <= static_cast<int64_t>(std::numeric_limits<int32_t>::max());
+    }
+    if (present.size() > 1 && out.dim() <= kCatArrayMaxInputDims && indexable) {
+        bool same_dtype = true;
+        for (const auto* t : present) {
+            same_dtype = same_dtype && t->dtype() == out.dtype();
+        }
+        if (same_dtype) {
+            const int nDims = static_cast<int>(out.dim());
+            const bool done = [&] {
+                switch (out.dtype()) {
+#define TP_CAT_DISPATCH(ctype, name)                                          \
+    case DType::name:                                                         \
+        if (all_contiguous) {                                                 \
+            parallel_cat<ctype, kCatArrayBatchSize, 1>(out, present, dim, nDims); \
+        } else {                                                              \
+            parallel_cat<ctype, kCatArrayBatchSize / 2, kCatArrayBatchSize / 2>( \
+                out, present, dim, nDims);                                    \
+        }                                                                     \
+        return true;
+                    TENSORPLAY_FORALL_SCALAR_TYPES(TP_CAT_DISPATCH)
+                    default: return false;
+#undef TP_CAT_DISPATCH
+                }
+            }();
+            if (done) return out;
+        }
+    }
     int64_t offset = 0;
     for (const auto& t : tensors) {
         if (join_detail::should_skip(t)) continue;
