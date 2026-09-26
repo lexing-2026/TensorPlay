@@ -43,7 +43,10 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Sequence
 
 __all__ = [
+    "BACKEND_CALLERS",
     "BaseConfig",
+    "CutedslChoiceCaller",
+    "caller_for",
     "CONV_TEMPLATES",
     "REDUCTION",
     "ReductionConfigHeuristics",
@@ -57,6 +60,9 @@ __all__ = [
     "ChoiceCaller",
     "ConvConfig",
     "ConvTemplate",
+    "DEPTHWISE_CONV",
+    "DepthwiseConvConfigHeuristics",
+    "DepthwiseConvTemplate",
     "DepthwiseConvConfig",
     "DictKernelTemplateParams",
     "ExternChoiceCaller",
@@ -847,6 +853,51 @@ class TritonChoiceCaller(ChoiceCaller):
         return "triton_template"
 
 
+class CutedslChoiceCaller(ChoiceCaller):
+    """A choice whose kernel is emitted for the device-side dialect.
+
+    It is a separate kind for the same reason the other two are: the kernel is
+    written in a different language, so the source that identifies it in a
+    cache is not interchangeable with the streaming dialect's, and a change to
+    one emitter must not look like a change to the other.
+    """
+
+    def __init__(self, name, input_nodes=(), layout=None, description="",
+                 source: str = "", src_hash: str | None = None):
+        super().__init__(name, input_nodes, layout, description)
+        self.source = source
+        self._src_hash = src_hash
+
+    def hash_key(self) -> str:
+        parts = [self.name, self.description]
+        if self.layout is not None:
+            parts.append(repr(self.layout))
+        digest = self._src_hash
+        if digest is None and self.source:
+            digest = hashlib.sha1(self.source.encode()).hexdigest()[:16]
+        if digest is not None:
+            parts.append(digest)
+        return ":".join(parts)
+
+    def autoheuristic_id(self) -> str:
+        return "cutedsl_template"
+
+
+#: The dialects a kernel can be emitted for, by the caller that identifies it.
+#: A template picks one by the device it is running on, so a new device brings
+#: a new emitter rather than a reinterpretation of an existing one.
+BACKEND_CALLERS: dict[str, type] = {
+    "triton": TritonChoiceCaller,
+    "cutedsl": CutedslChoiceCaller,
+}
+
+
+def caller_for(backend: str):
+    """The caller kind that identifies a kernel emitted for this backend."""
+
+    return BACKEND_CALLERS.get(backend, TritonChoiceCaller)
+
+
 class SubgraphChoiceCaller(ChoiceCaller):
     """A choice whose kernel is a whole region, emitted and kept as one.
 
@@ -1508,6 +1559,113 @@ class ConvConfigHeuristics(TemplateConfigHeuristics):
             yield {"choice": "triton", **config.as_kwargs()}
 
 
+class DepthwiseConvTemplate(LoopTemplate):
+    """The depthwise convolution, which is not a product and does not use one.
+
+    No output channel is a sum over input channels here, so there is no
+    contraction to tile and nothing for a matrix multiply to do.  The work
+    steps over images, positions along the axis and channels instead, and each
+    lane keeps its own accumulator -- so the three-dimensional tilings are the
+    only candidates, and the product table is not consulted at all.
+    """
+
+    inputs_class = ConvKernelInputs
+
+    def __init__(self):
+        super().__init__("depthwise_conv1d")
+        self.heuristics = DepthwiseConvConfigHeuristics()
+
+    def emitter(self) -> str:
+        return "depthwise:operator+block_n/l/c"
+
+    def out_specs(self, meta: dict) -> tuple:
+        size = meta.get("out_size")
+        if not size:
+            raise NotImplementedError("a depthwise convolution without a result")
+        return (
+            Layout(
+                meta.get("device"),
+                meta.get("out_dtype"),
+                tuple(size),
+                contiguous_stride(size),
+            ),
+        )
+
+    def geometry_for(self, meta: dict) -> dict:
+        kernel = tuple(int(k) for k in meta.get("kernel_size") or ())
+        if len(kernel) != 1:
+            raise NotImplementedError("a depthwise convolution that is not one-dimensional")
+        return {
+            "kernel": kernel,
+            "stride": tuple(int(v) for v in meta.get("stride") or (1,)),
+            "padding": tuple(int(v) for v in meta.get("padding") or (0,)),
+            "dilation": tuple(int(v) for v in meta.get("dilation") or (1,)),
+            "groups": int(meta.get("groups", 1) or 1),
+        }
+
+    def generate_for(self, params, out_specs, meta, plain_launch=None):
+        if params.to_kwargs().get("choice") == "operator":
+            if plain_launch is None:
+                return None
+            return ExternChoiceCaller(
+                name="framework_depthwise",
+                layout=out_specs[0] if out_specs else None,
+                description="the operation itself",
+                launcher=plain_launch,
+            )
+        kwargs = params.to_kwargs()
+        if "BLOCK_N" not in kwargs or meta.get("transposed"):
+            return None
+        if len(meta.get("operand_specs") or ()) < 2:
+            return None
+        try:
+            geometry = self.geometry_for(meta)
+        except NotImplementedError:
+            return None
+        from .codegen.triton_conv import depthwise_launch
+
+        layout = out_specs[0] if out_specs else None
+        caller = TritonChoiceCaller(
+            name=f"depthwise-{kwargs['BLOCK_N']}x{kwargs['BLOCK_L']}x{kwargs['BLOCK_C']}",
+            layout=layout,
+            description=repr(sorted(kwargs.items())),
+            source=repr(sorted(geometry.items())),
+        )
+        return caller.bind(
+            depthwise_launch(
+                meta["operand_specs"][0],
+                meta["operand_specs"][1],
+                meta.get("bias_spec"),
+                geometry,
+                kwargs,
+                plain_launch,
+            )
+        )
+
+
+class DepthwiseConvConfigHeuristics(TemplateConfigHeuristics):
+    """The depthwise tilings, which are not fitted because there is nothing
+    to fit them to.
+
+    A product's tile is fitted to the problem because a tile wider than the
+    problem is wasted lanes.  Here the innermost block is over channels and
+    the others over positions, and the table is already small and already
+    fixed, so narrowing it per call would buy nothing and hide which tilings
+    exist.
+    """
+
+    def __init__(self, device_type: str = "cuda"):
+        self.device_type = device_type
+
+    def should_run(self, inputs: KernelInputs) -> bool:
+        return isinstance(inputs, ConvKernelInputs) and inputs.is_depthwise
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        yield {"choice": "operator"}
+        for config in CHOICES.get_depthwise_conv_configs(self.device_type):
+            yield {"choice": "triton", **config.as_kwargs()}
+
+
 class ConvTemplate(LoopTemplate):
     """Convolutions, with the 1x1 case expressed as the product it is.
 
@@ -1561,6 +1719,35 @@ class ConvTemplate(LoopTemplate):
         dilation = tuple(int(d) for d in meta.get("dilation") or ())
         return all(d == 1 for d in dilation)
 
+    def geometry_for(self, meta: dict) -> dict:
+        """Everything about the call that is not a choice.
+
+        The kernel, its stride, padding and dilation, the groups, and the
+        result's spatial extents.  These are handed to every configuration
+        alike, which is what keeps them from being mistaken for part of the
+        choice -- and getting one of them wrong is not something a measurement
+        would catch, because a kernel that reads the wrong geometry is fast and
+        confidently incorrect.
+        """
+
+        kernel = tuple(int(k) for k in meta.get("kernel_size") or ())
+        if not kernel:
+            raise NotImplementedError("a convolution without a kernel")
+        stride = tuple(int(v) for v in meta.get("stride") or (1,) * len(kernel))
+        padding = tuple(int(v) for v in meta.get("padding") or (0,) * len(kernel))
+        dilation = tuple(int(v) for v in meta.get("dilation") or (1,) * len(kernel))
+        size = tuple(int(v) for v in (meta.get("out_size") or ()))
+        spatial_out = size[2:]
+        return {
+            "kernel": kernel,
+            "stride": stride,
+            "padding": padding,
+            "dilation": dilation,
+            "groups": int(meta.get("groups", 1) or 1),
+            "out_size": spatial_out,
+            "unroll": True,
+        }
+
     def generate_for(self, params: KernelTemplateParams, out_specs: tuple, meta: dict,
                      plain_launch=None):
         """The choice for one configuration, or ``None`` when it does not fit."""
@@ -1574,12 +1761,24 @@ class ConvTemplate(LoopTemplate):
                 description="the operation itself",
                 launcher=plain_launch,
             )
-        if not self.is_one_by_one(meta):
-            return None
-        # The product case is measured by the product template, which owns that
-        # tile space; this template only decides that the case applies.
+        if self.is_one_by_one(meta):
+            # The one-by-one case is a product, and the product template owns
+            # that tile space; this template only decides that the case
+            # applies.  The product's layouts are permuted to get there, so the
+            # caller is told which way round the result lands.
+            return self._one_by_one_choice(out_specs, meta, plain_launch)
+        return self._tiled_choice(params, out_specs, meta, plain_launch)
+
+    def _one_by_one_choice(self, out_specs, meta, plain_launch):
+        """The one-by-one case, measured as the product it is."""
+
+        kernel = tuple(meta.get("kernel_size") or ())
+        rank = len(kernel) + 2
+        weight = (meta.get("operand_sizes") or ((), ()))[1]
+        moved = tuple(range(0, rank - 1)) + (rank - 1,)
+        out_size = tuple(int(v) for v in (out_specs[0].size if out_specs else ()))
         gemm_meta = {
-            "out_size": tuple(out_specs[0].size) if out_specs else (),
+            "out_size": out_size,
             "out_dtype": out_specs[0].dtype if out_specs else None,
             "device": out_specs[0].device if out_specs else None,
             "operand_dtype": meta.get("operand_dtype"),
@@ -1593,12 +1792,52 @@ class ConvTemplate(LoopTemplate):
         launcher, _params = GEMM.select(gemm_meta, lambda choice, plain: choice.resolve(plain))
         if launcher is None:
             return None
-        caller = ChoiceCaller(
-            name="conv-1x1-product",
+        caller = ExternChoiceCaller(
+            name="conv1x1_via_product",
             layout=out_specs[0] if out_specs else None,
-            description="a 1x1 convolution measured as the product it is",
+            description=(
+                "a one-by-one convolution measured as the product it is; the "
+                f"result arrives in the order {moved}"
+            ),
+            launcher=launcher,
         )
-        return caller.bind(launcher)
+        return caller
+
+    def _tiled_choice(self, params, out_specs, meta, plain_launch):
+        """A wider kernel, measured over the tiles that fit it."""
+
+        from .codegen.triton_conv import conv_launch
+
+        kwargs = params.to_kwargs()
+        if "BLOCK_M" not in kwargs:
+            return None
+        if meta.get("operand_dtype") not in ("float32",):
+            return None
+        if meta.get("transposed"):
+            return None
+        if len(meta.get("operand_specs") or ()) < 2:
+            return None
+        try:
+            geometry = self.geometry_for(meta)
+        except NotImplementedError:
+            return None
+        layout = out_specs[0] if out_specs else None
+        caller = TritonChoiceCaller(
+            name=f"conv2d-{kwargs['BLOCK_M']}x{kwargs['BLOCK_N']}x{kwargs['BLOCK_K']}",
+            layout=layout,
+            description=repr(sorted(kwargs.items())),
+            source=repr(sorted(geometry.items())),
+        )
+        return caller.bind(
+            conv_launch(
+                meta["operand_specs"][0],
+                meta["operand_specs"][1],
+                meta.get("bias_spec"),
+                geometry,
+                kwargs,
+                plain_launch,
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1686,10 +1925,15 @@ CONV_TEMPLATES: dict[str, dict[str, Any]] = {
 
 
 CONV = ConvTemplate()
+DEPTHWISE_CONV = DepthwiseConvTemplate()
 
 
 #: Templates by the name their operators are declared under.
-TEMPLATES: dict[str, KernelTemplate] = {GEMM.name: GEMM, CONV.name: CONV}
+TEMPLATES: dict[str, KernelTemplate] = {
+    GEMM.name: GEMM,
+    CONV.name: CONV,
+    DEPTHWISE_CONV.name: DEPTHWISE_CONV,
+}
 
 
 def template_for(name: str) -> KernelTemplate | None:
@@ -1804,15 +2048,61 @@ class ReductionTemplate(LoopTemplate):
             )
         if kind not in tuple(meta.get("kinds") or ()):
             return None
+        try:
+            launcher = _reduction_launcher(kind, meta, out_specs)
+        except NotImplementedError:
+            return None
         caller = TritonChoiceCaller(
             name=f"reduction-{kind}",
             layout=out_specs[0] if out_specs else None,
             description=f"{kind} reduction",
+            source=repr(sorted((kind, meta.get("out_size"), meta.get("dims")))),
         )
-        launcher = meta.get("reduction_launch")
-        if launcher is None:
-            return None
         return caller.bind(launcher)
+
+
+def _reduction_launcher(kind: str, meta: dict, out_specs: tuple):
+    """A launcher for one reduction form, built from the reduction codegen.
+
+    The reduction codegen knows how a form is emitted; what it did not expose
+    was a way to be *asked* for one form's launcher.  So the geometry is
+    translated here into what that codegen already accepts, and the question
+    is answered by trying: a form whose geometry cannot be expressed is refused
+    rather than approximated, because a reduction that quietly computes
+    something else is worse than one that declines.
+    """
+
+    from .codegen.triton import ReductionSpec
+
+    op = {
+        "value": "sum",
+        "index": "argmax",
+        "pair": "max",
+        "moments": "var",
+    }.get(kind)
+    if op is None:
+        raise NotImplementedError(f"no reduction form named {kind!r}")
+    dims = tuple(int(d) for d in (meta.get("dims") or ()))
+    if op in ("argmax", "max") and not dims:
+        # An index or a pair needs an extent to reduce over: with none there is
+        # no position to report and nowhere to put the second result.
+        raise NotImplementedError("an index or pair reduction without an extent")
+    spec = ReductionSpec(op, dims, keepdim=bool(meta.get("keepdim", False)))
+    if spec.tracks_indices and not spec.dims:
+        raise NotImplementedError("an index reduction without an extent")
+    return _bind_reduction_codegen(spec, meta, out_specs)
+
+
+def _bind_reduction_codegen(spec, meta: dict, out_specs: tuple):
+    """The launch closure for one reduction form, over this call's operands."""
+
+    builder = meta.get("reduction_builder")
+    if builder is None:
+        raise NotImplementedError("no reduction launcher for this region")
+    launcher = builder(spec, meta, out_specs)
+    if launcher is None:
+        raise NotImplementedError("this region's reduction is not in that form")
+    return launcher
 
 
 REDUCTION = ReductionTemplate()
