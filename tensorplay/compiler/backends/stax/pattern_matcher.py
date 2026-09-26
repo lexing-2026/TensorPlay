@@ -810,7 +810,7 @@ class _TargetExpr(PatternExpr):
         fns = [fns] if callable(fns) or isinstance(fns, str) else list(fns)
         for fn in fns:
             if isinstance(fn, OpOverloadPacket):
-                fns.extend(fn.op_overloads())  # noqa: B909
+                fns.extend(fn._overloads[name] for name in fn.overloads())  # noqa: B909
 
         self.fns = fns
         self.fns_set = OrderedSet(fns)
@@ -3062,7 +3062,7 @@ def get_arg_value(
 def filter_nodes(nodes: Iterable[Any], fn: Any) -> list[Any]:
     fns = [fn]
     if isinstance(fn, OpOverloadPacket):
-        fns.extend(fn.op_overloads())
+        fns.extend(fn._overloads[name] for name in fn.overloads())
 
     return [node for node in nodes if node.target in fns]
 
