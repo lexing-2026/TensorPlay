@@ -47,7 +47,12 @@ __all__ = [
     "BaseConfig",
     "CutedslChoiceCaller",
     "caller_for",
+    "CONV_BWD_INPUT",
+    "CONV_BWD_WEIGHT",
     "CONV_TEMPLATES",
+    "ConvBwdInputTemplate",
+    "ConvBwdWeightTemplate",
+    "ConvGradientConfigHeuristics",
     "REDUCTION",
     "ReductionConfigHeuristics",
     "ReductionKernelInputs",
@@ -1840,6 +1845,203 @@ class ConvTemplate(LoopTemplate):
         )
 
 
+class _ConvGradientTemplate(LoopTemplate):
+    """What a convolution's two gradients share.
+
+    Both are the forward's product with the contraction moved -- the forward
+    contracts over input channels, the input's gradient over output channels,
+    and the weight's gradient over positions -- so both are sized by the same
+    table and differ only in what the extents mean.  The geometry is the
+    forward's geometry: a gradient is about the call that produced it, so the
+    kernel, stride, padding, dilation and groups are the same numbers.
+    """
+
+    inputs_class = ConvKernelInputs
+
+    def __init__(self, name: str, which: str):
+        super().__init__(name)
+        self.which = which
+        self.heuristics = ConvGradientConfigHeuristics(which)
+
+    def emitter(self) -> str:
+        return f"conv2d_bwd_{self.which}:operator+tiles"
+
+    def geometry_for(self, meta: dict) -> dict:
+        kernel = tuple(int(k) for k in meta.get("kernel_size") or ())
+        if len(kernel) != 2:
+            raise NotImplementedError("only a two-dimensional gradient is tiled")
+        from .codegen.triton_conv import _grad_geometry
+
+        sizes = tuple(meta.get("operand_sizes") or ())
+        if len(sizes) < 2:
+            raise NotImplementedError("a gradient without its operands' extents")
+        return _grad_geometry(
+            {
+                "kernel": kernel,
+                "stride": tuple(int(v) for v in meta.get("stride") or (1, 1)),
+                "padding": tuple(int(v) for v in meta.get("padding") or (0, 0)),
+                "dilation": tuple(int(v) for v in meta.get("dilation") or (1, 1)),
+                "groups": int(meta.get("groups", 1) or 1),
+            },
+            sizes[0][-2:],
+            sizes[1][0],
+            sizes[0][1],
+        )
+
+    def _launcher(self, params, meta, plain_launch):
+        kwargs = params.to_kwargs()
+        if "BLOCK_M" not in kwargs or meta.get("transposed"):
+            return None
+        if meta.get("operand_dtype") not in ("float32",):
+            return None
+        try:
+            geometry = self.geometry_for(meta)
+        except NotImplementedError:
+            return None
+        from .codegen.triton_conv import (
+            conv_bwd_input_launch,
+            conv_bwd_weight_launch,
+        )
+
+        specs = tuple(meta.get("operand_specs") or ())
+        if len(specs) < 2:
+            return None
+        if self.which == "input":
+            # The gradient and the weight: the forward's own operands.
+            launcher = conv_bwd_input_launch(
+                specs[0], specs[1], kwargs, geometry, plain_launch
+            )
+        else:
+            # The gradient and the input, in that order, because the weight's
+            # gradient needs the forward's *input* rather than its weight.
+            launcher = conv_bwd_weight_launch(
+                specs[0], specs[1], kwargs, geometry, plain_launch
+            )
+        return launcher
+
+    def _caller(self, params, out_specs, launcher):
+        kwargs = params.to_kwargs()
+        return TritonChoiceCaller(
+            name=f"{self.name}-{kwargs['BLOCK_M']}x{kwargs['BLOCK_N']}x{kwargs['BLOCK_K']}",
+            layout=out_specs[0] if out_specs else None,
+            description=repr(sorted(kwargs.items())),
+            source=f"{self.which}:{sorted(kwargs.items())}",
+        ).bind(launcher)
+
+
+class ConvGradientConfigHeuristics(TemplateConfigHeuristics):
+    """The tilings for one gradient, fitted to what that gradient contracts.
+
+    The input's gradient contracts over output channels once per tap, and the
+    weight's contracts over the output's positions; either way the table is
+    the convolution table, because both are the same product read backwards.
+    """
+
+    def __init__(self, which: str, device_type: str = "cuda"):
+        self.which = which
+        self.device_type = device_type
+
+    def should_run(self, inputs: KernelInputs) -> bool:
+        return isinstance(inputs, ConvKernelInputs) and not inputs.is_depthwise
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        yield {"choice": "operator"}
+        try:
+            rows, cols, inner = kernel_inputs.mnk_symbolic()
+        except NotImplementedError:
+            return
+        for config in CHOICES.get_conv_configs(self.device_type)(rows, cols, inner):
+            yield {"choice": "triton", **config.as_kwargs()}
+
+
+class ConvBwdInputTemplate(_ConvGradientTemplate):
+    """The input's gradient: the sum of the windows that read each position.
+
+    It is the forward's product with the contraction moved to the output
+    channels, which means the output position a row was read at has to be
+    solved for rather than stepped to.  The solve is the delicate part: a
+    distance that does not divide by the stride contributes nothing, and a
+    kernel that rounds instead of refusing is wrong only along the padded
+    border.
+    """
+
+    def __init__(self):
+        super().__init__("convolution2d_bwd_input", "input")
+
+    def out_specs(self, meta: dict) -> tuple:
+        size = meta.get("out_size")
+        if not size:
+            raise NotImplementedError("an input gradient without a result")
+        return (
+            Layout(
+                meta.get("device"),
+                meta.get("out_dtype"),
+                tuple(size),
+                contiguous_stride(size),
+            ),
+        )
+
+    def generate_for(self, params, out_specs, meta, plain_launch=None):
+        if params.to_kwargs().get("choice") == "operator":
+            if plain_launch is None:
+                return None
+            return ExternChoiceCaller(
+                name="framework_convolution_bwd",
+                layout=out_specs[0] if out_specs else None,
+                description="the operation itself",
+                launcher=plain_launch,
+            )
+        if plain_launch is None:
+            return None
+        launcher = self._launcher(params, meta, plain_launch)
+        return None if launcher is None else self._caller(params, out_specs, launcher)
+
+
+class ConvBwdWeightTemplate(_ConvGradientTemplate):
+    """The weight's gradient: one product per tap, over the output's positions.
+
+    The tap indexes the weight rather than the accumulation, so one
+    accumulator serves every tap and each is stored as it is finished: a
+    kernel-wide tile per tap would need a register per tap, and the number of
+    taps is the kernel's area.
+    """
+
+    def __init__(self):
+        super().__init__("convolution2d_bwd_weight", "weight")
+
+    def out_specs(self, meta: dict) -> tuple:
+        size = meta.get("out_size")
+        if not size:
+            raise NotImplementedError("a weight gradient without a result")
+        return (
+            Layout(
+                meta.get("device"),
+                meta.get("out_dtype"),
+                tuple(size),
+                contiguous_stride(size),
+            ),
+        )
+
+    def generate_for(self, params, out_specs, meta, plain_launch=None):
+        if params.to_kwargs().get("choice") == "operator":
+            if plain_launch is None:
+                return None
+            return ExternChoiceCaller(
+                name="framework_convolution_bwd",
+                layout=out_specs[0] if out_specs else None,
+                description="the operation itself",
+                launcher=plain_launch,
+            )
+        if plain_launch is None:
+            return None
+        launcher = self._launcher(params, meta, plain_launch)
+        return None if launcher is None else self._caller(params, out_specs, launcher)
+
+
+CONV_BWD_INPUT = ConvBwdInputTemplate()
+CONV_BWD_WEIGHT = ConvBwdWeightTemplate()
+
+
 # ---------------------------------------------------------------------------
 # the convolution family
 # ---------------------------------------------------------------------------
@@ -1933,6 +2135,8 @@ TEMPLATES: dict[str, KernelTemplate] = {
     GEMM.name: GEMM,
     CONV.name: CONV,
     DEPTHWISE_CONV.name: DEPTHWISE_CONV,
+    CONV_BWD_INPUT.name: CONV_BWD_INPUT,
+    CONV_BWD_WEIGHT.name: CONV_BWD_WEIGHT,
 }
 
 

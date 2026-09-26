@@ -492,3 +492,341 @@ def depthwise_launch(x_spec, w_spec, bias_spec, geometry: dict, config: dict,
         return out
 
     return launch
+
+
+# ---------------------------------------------------------------------------
+# the gradients
+# ---------------------------------------------------------------------------
+
+_BWD_SOURCE = '''
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _tap_origin(coord, offset, out_extent, stride):
+    """Where a tap lands in the output, and whether it lands at all.
+
+    A tap reaches an input position only when the distance back to the origin
+    divides by the stride exactly.  The distance is clamped before the
+    division rather than after, because a negative dividend and a truncating
+    division disagree about the sign, and a kernel that guesses there is wrong
+    only along the padded border -- which is exactly the part nobody checks.
+    """
+    distance = coord + offset
+    positive = distance >= 0
+    safe = tl.maximum(distance, 0)
+    origin = safe // stride
+    return origin, positive & (origin < out_extent) & ((safe % stride) == 0)
+
+
+@triton.jit
+def _conv2d_bwd_input_kernel(
+    dy_ptr, w_ptr, dx_ptr,
+    n, h, width, in_c, out_c, out_h, out_width,
+    stride_dyn, stride_dyc, stride_dyh, stride_dyw,
+    stride_wo, stride_wi, stride_wkh, stride_wkw,
+    stride_dxn, stride_dxc, stride_dxh, stride_dxw,
+    KERNEL_H: tl.constexpr, KERNEL_W: tl.constexpr,
+    STRIDE_H: tl.constexpr, STRIDE_W: tl.constexpr,
+    PADDING_H: tl.constexpr, PADDING_W: tl.constexpr,
+    DILATION_H: tl.constexpr, DILATION_W: tl.constexpr,
+    GROUPS: tl.constexpr, GROUP_IN_C: tl.constexpr, GROUP_OUT_C: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """The input's gradient: the sum of the windows that read each position.
+
+    Rows are input positions and columns are input channels, so this is the
+    forward's product with the contraction moved: the forward contracted over
+    input channels, and this contracts over output channels instead, once per
+    tap.  For a given tap the output position a row was read at is solved for
+    rather than stepped to, which is the whole difference between the two
+    directions -- one of them walks the window, the other has to invert it.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_g = tl.program_id(2)
+
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    spatial = h * width
+    idx_n = rows // spatial
+    within = rows % spatial
+    idx_h = within // width
+    idx_w = within % width
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    in_channel = pid_g * GROUP_IN_C + cols
+    mask_col = cols < GROUP_IN_C
+
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    for k in range(0, tl.cdiv(GROUP_OUT_C, BLOCK_K)):
+        lane = tl.arange(0, BLOCK_K)
+        out_channel = pid_g * GROUP_OUT_C + k * BLOCK_K + lane
+        mask_k = lane < GROUP_OUT_C - k * BLOCK_K
+        w_ptrs = (
+            w_ptr
+            + (lane * stride_wo)[:, None]
+            + (in_channel * stride_wi)[None, :]
+        )
+        mask_w = mask_k[:, None] & mask_col[None, :]
+        for ky in tl.static_range(KERNEL_H):
+            oh, ok_h = _tap_origin(
+                idx_h, PADDING_H - ky * DILATION_H, out_h, STRIDE_H
+            )
+            for kx in tl.static_range(KERNEL_W):
+                ow, ok_w = _tap_origin(
+                    idx_w, PADDING_W - kx * DILATION_W, out_width, STRIDE_W
+                )
+                matrix_w = tl.load(
+                    w_ptrs + ky * stride_wkh + kx * stride_wkw,
+                    mask=mask_w, other=0.0,
+                )
+                keep = (idx_n < n) & ok_h & ok_w
+                dy_ptrs = dy_ptr + (
+                    (idx_n * stride_dyn)[:, None]
+                    + (oh * stride_dyh)[:, None]
+                    + (ow * stride_dyw)[:, None]
+                    + (out_channel * stride_dyc)[None, :]
+                )
+                matrix_dy = tl.load(
+                    dy_ptrs, mask=keep[:, None] & mask_k[None, :], other=0.0
+                )
+                acc += tl.dot(matrix_dy, matrix_w)
+    tl.store(
+        dx_ptr + (
+            (idx_n * stride_dxn)[:, None]
+            + (idx_h * stride_dxh)[:, None]
+            + (idx_w * stride_dxw)[:, None]
+            + (in_channel * stride_dxc)[None, :]
+        ),
+        acc,
+        mask=(idx_n < n)[:, None] & mask_col[None, :],
+    )
+
+
+@triton.jit
+def _conv2d_bwd_weight_kernel(
+    dy_ptr, x_ptr, dw_ptr,
+    n, h, width, in_c, out_c, out_h, out_width,
+    stride_dyn, stride_dyc, stride_dyh, stride_dyw,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_dwon, stride_dwoc, stride_dwoi, stride_dwoh,
+    KERNEL_H: tl.constexpr, KERNEL_W: tl.constexpr,
+    STRIDE_H: tl.constexpr, STRIDE_W: tl.constexpr,
+    PADDING_H: tl.constexpr, PADDING_W: tl.constexpr,
+    DILATION_H: tl.constexpr, DILATION_W: tl.constexpr,
+    GROUPS: tl.constexpr, GROUP_IN_C: tl.constexpr, GROUP_OUT_C: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """The weight's gradient: one product per tap, over the output's positions.
+
+    Every tap is a separate product contracting the output's positions, and
+    they differ only in which input position each output position read -- which
+    is known here without inverting anything, because the forward's window is
+    walked forwards here.  So the tap indexes the weight rather than the
+    accumulation: one accumulator is reused per tap and stored per tap, because
+    a kernel-wide tile per tap would need a register per tap and the number of
+    taps is the kernel's area.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_g = tl.program_id(2)
+
+    lane_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    lane_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    out_channel = pid_g * GROUP_OUT_C + lane_m
+    in_channel = pid_g * GROUP_IN_C + lane_n
+    mask_m = lane_m < GROUP_OUT_C
+    mask_n = lane_n < GROUP_IN_C
+    positions = n * out_h * out_width
+
+    for ky in tl.static_range(KERNEL_H):
+        for kx in tl.static_range(KERNEL_W):
+            acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+            for k in range(0, tl.cdiv(positions, BLOCK_K)):
+                flat = k * BLOCK_K + tl.arange(0, BLOCK_K)
+                idx_n = flat // (out_h * out_width)
+                rest = flat % (out_h * out_width)
+                oh = rest // out_width
+                ow = rest % out_width
+                idx_h = oh * STRIDE_H - PADDING_H + ky * DILATION_H
+                idx_w = ow * STRIDE_W - PADDING_W + kx * DILATION_W
+                keep = (
+                    (flat < positions)
+                    & (idx_n < n)
+                    & (idx_h >= 0) & (idx_h < h)
+                    & (idx_w >= 0) & (idx_w < width)
+                )
+                dy_ptrs = dy_ptr + (
+                    (idx_n * stride_dyn)[:, None]
+                    + (oh * stride_dyh)[:, None]
+                    + (ow * stride_dyw)[:, None]
+                    + (out_channel * stride_dyc)[None, :]
+                )
+                matrix_dy = tl.load(
+                    dy_ptrs, mask=keep[:, None] & mask_m[None, :], other=0.0
+                )
+                x_ptrs = x_ptr + (
+                    (idx_n * stride_xn)[:, None]
+                    + (idx_h * stride_xh)[:, None]
+                    + (idx_w * stride_xw)[:, None]
+                    + (in_channel * stride_xc)[None, :]
+                )
+                matrix_x = tl.load(
+                    x_ptrs, mask=keep[:, None] & mask_n[None, :], other=0.0
+                )
+                acc += tl.dot(matrix_dy, tl.trans(matrix_x))
+            tl.store(
+                dw_ptr + (
+                    out_channel * stride_dwon
+                    + in_channel * stride_dwoc
+                    + ky * stride_dwoi
+                    + kx * stride_dwoh
+                ),
+                acc,
+                mask=mask_m & mask_n,
+            )
+'''
+
+
+def bwd_kernel(kind: str, block_m: int, block_n: int, block_k: int):
+    """One gradient kernel for one tiling, built once and remembered."""
+
+    key = hashlib.sha256(
+        f"{CONV_TUNING_VERSION}|{kind}|{block_m}|{block_n}|{block_k}".encode()
+    ).hexdigest()[:16]
+    cached = _KERNEL_MEMO.get(key)
+    if cached is not None:
+        return cached
+    source = _BWD_SOURCE
+    fake_file = f"<tensorplay-stax-convbwd-{key}>"
+    linecache.cache[fake_file] = (
+        len(source), None, source.splitlines(True), fake_file,
+    )
+    namespace: dict[str, Any] = {"triton": triton, "tl": tl}
+    exec(compile(source, fake_file, "exec"), namespace, namespace)
+    kernel = namespace[
+        "_conv2d_bwd_input_kernel" if kind == "input" else "_conv2d_bwd_weight_kernel"
+    ]
+    _KERNEL_MEMO[key] = kernel
+    return kernel
+
+
+def _grad_geometry(meta_geometry: dict, in_size, out_c: int, in_c: int):
+    kernel = meta_geometry["kernel"]
+    stride = meta_geometry["stride"]
+    padding = meta_geometry["padding"]
+    dilation = meta_geometry["dilation"]
+    groups = meta_geometry["groups"]
+    in_h, in_w = int(in_size[0]), int(in_size[1])
+    out_h = (in_h + 2 * padding[0] - dilation[0] * (kernel[0] - 1) - 1) // stride[0] + 1
+    out_w = (in_w + 2 * padding[1] - dilation[1] * (kernel[1] - 1) - 1) // stride[1] + 1
+    return {
+        "kernel": kernel, "stride": stride, "padding": padding,
+        "dilation": dilation, "groups": groups,
+        "in_size": (in_h, in_w), "out_size": (out_h, out_w),
+        "out_channels": out_c, "in_channels": in_c,
+    }
+
+
+def conv_bwd_input_launch(dy_spec, w_spec, config, geometry, base_launch):
+    """Build a launcher for the input's gradient."""
+
+    if tuple(int(v) for v in geometry["stride"]) != (1,) * len(geometry["kernel"]):
+        return base_launch
+    block_m, block_n = int(config["BLOCK_M"]), int(config["BLOCK_N"])
+    block_k = int(config["BLOCK_K"])
+    kernel_h, kernel_w = (int(v) for v in geometry["kernel"])
+    stride_h, stride_w = (int(v) for v in geometry["stride"])
+    pad_h, pad_w = (int(v) for v in geometry["padding"])
+    dil_h, dil_w = (int(v) for v in geometry["dilation"])
+    groups = int(geometry["groups"])
+    in_h, in_w = geometry["in_size"]
+    out_h, out_w = geometry["out_size"]
+    out_c, in_c = geometry["out_channels"], geometry["in_channels"]
+    kernel = bwd_kernel("input", block_m, block_n, block_k)
+
+    def operand(feed: list, spec) -> Any:
+        position, literal = spec
+        return feed[position] if position is not None else literal
+
+    def launch(feed: list) -> Any:
+        import tensorplay as tp
+
+        dy, w = operand(feed, dy_spec), operand(feed, w_spec)
+        batch = int(dy.shape[0])
+        if int(dy.shape[1]) != out_c or int(w.shape[0]) != out_c or int(w.shape[1]) * groups != in_c:
+            return base_launch(feed)
+        dx = tp.empty((batch, in_c, in_h, in_w), dtype=dy.dtype, device=dy.device)
+        group_in_c, group_out_c = in_c // groups, out_c // groups
+        grid = (
+            triton.cdiv(conv_rows(batch, in_h, in_w), block_m),
+            triton.cdiv(group_in_c, block_n),
+            groups,
+        )
+        kernel[grid](
+            dy, w, dx,
+            batch, in_h, in_w, in_c, out_c, out_h, out_w,
+            dy.stride(0), dy.stride(1), dy.stride(2), dy.stride(3),
+            w.stride(0), w.stride(1), w.stride(2), w.stride(3),
+            dx.stride(0), dx.stride(1), dx.stride(2), dx.stride(3),
+            KERNEL_H=kernel_h, KERNEL_W=kernel_w,
+            STRIDE_H=stride_h, STRIDE_W=stride_w,
+            PADDING_H=pad_h, PADDING_W=pad_w,
+            DILATION_H=dil_h, DILATION_W=dil_w,
+            GROUPS=groups, GROUP_IN_C=group_in_c, GROUP_OUT_C=group_out_c,
+            BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
+            num_warps=int(config["num_warps"]), num_stages=int(config["num_stages"]),
+        )
+        return dx
+
+    return launch
+
+
+def conv_bwd_weight_launch(dy_spec, x_spec, config, geometry, base_launch):
+    """Build a launcher for the weight's gradient."""
+
+    if tuple(int(v) for v in geometry["stride"]) != (1,) * len(geometry["kernel"]):
+        return base_launch
+    block_m, block_n = int(config["BLOCK_M"]), int(config["BLOCK_N"])
+    block_k = int(config["BLOCK_K"])
+    kernel_h, kernel_w = (int(v) for v in geometry["kernel"])
+    stride_h, stride_w = (int(v) for v in geometry["stride"])
+    pad_h, pad_w = (int(v) for v in geometry["padding"])
+    dil_h, dil_w = (int(v) for v in geometry["dilation"])
+    groups = int(geometry["groups"])
+    in_h, in_w = geometry["in_size"]
+    out_h, out_w = geometry["out_size"]
+    out_c, in_c = geometry["out_channels"], geometry["in_channels"]
+    kernel = bwd_kernel("weight", block_m, block_n, block_k)
+
+    def operand(feed: list, spec) -> Any:
+        position, literal = spec
+        return feed[position] if position is not None else literal
+
+    def launch(feed: list) -> Any:
+        import tensorplay as tp
+
+        dy, x = operand(feed, dy_spec), operand(feed, x_spec)
+        batch = int(dy.shape[0])
+        if int(x.shape[1]) != in_c or int(dy.shape[1]) != out_c:
+            return base_launch(feed)
+        dw = tp.empty((out_c, in_c // groups, kernel_h, kernel_w), dtype=dy.dtype, device=dy.device)
+        group_in_c, group_out_c = in_c // groups, out_c // groups
+        grid = (triton.cdiv(group_out_c, block_m), triton.cdiv(group_in_c, block_n), groups)
+        kernel[grid](
+            dy, x, dw,
+            batch, in_h, in_w, in_c, out_c, out_h, out_w,
+            dy.stride(0), dy.stride(1), dy.stride(2), dy.stride(3),
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            dw.stride(0), dw.stride(1), dw.stride(2), dw.stride(3),
+            KERNEL_H=kernel_h, KERNEL_W=kernel_w,
+            STRIDE_H=stride_h, STRIDE_W=stride_w,
+            PADDING_H=pad_h, PADDING_W=pad_w,
+            DILATION_H=dil_h, DILATION_W=dil_w,
+            GROUPS=groups, GROUP_IN_C=group_in_c, GROUP_OUT_C=group_out_c,
+            BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
+            num_warps=int(config["num_warps"]), num_stages=int(config["num_stages"]),
+        )
+        return dw
+
+    return launch

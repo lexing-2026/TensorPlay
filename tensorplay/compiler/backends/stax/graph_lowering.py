@@ -57,6 +57,7 @@ _TEMPLATE_OPERATORS = {
     "conv2d.default": "conv",
     "conv3d.default": "conv",
     "convolution.default": "conv",
+    "convolution_backward.default": "convolution2d_bwd_input",
     "mm.default": "gemm",
     "addmm.default": "gemm",
     "bmm.default": "gemm",
