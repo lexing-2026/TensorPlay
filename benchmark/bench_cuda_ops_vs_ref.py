@@ -90,12 +90,17 @@ def build_cases(dev, dtype):
     C.append(("topk.k64", lambda x=x: F.topk(T(x), 64, -1)[0],
               lambda x=x: torch.topk(x, 64, -1)[0]))
     # ---- 索引 / embedding ----
-    idx = torch.randint(0, 4096, (4096, 128), generator=g, device=dev)
-    go = r(4096, 128)
-    go3 = go.unsqueeze(-1).expand(4096, 128, 64).contiguous()
-    C.append(("embedding_dense_backward",
-              lambda: F.embedding_dense_backward(T(go3), T(idx), 4096, -1, False),
-              lambda: torch.ops.aten.embedding_dense_backward(go3, idx, 4096, -1, False)))
+    # 524288 lookups of 64 features spread over a varying number of rows: few
+    # rows mean long runs of equal indices, many rows mean nearly all distinct.
+    for num_weights in (8, 512, 1024, 4096, 65536):
+        idx = torch.randint(0, num_weights, (4096, 128), generator=g, device=dev)
+        go = r(4096, 128)
+        go3 = go.unsqueeze(-1).expand(4096, 128, 64).contiguous()
+        C.append((f"embedding_dense_backward.nw{num_weights}",
+                  lambda idx=idx, go3=go3, nw=num_weights:
+                      F.embedding_dense_backward(T(go3), T(idx), nw, -1, False),
+                  lambda idx=idx, go3=go3, nw=num_weights:
+                      torch.ops.aten.embedding_dense_backward(go3, idx, nw, -1, False)))
     # ---- 卷积 / 池化 ----
     x = r(32, 64, 56, 56)
     w = r(64, 64, 3, 3)
