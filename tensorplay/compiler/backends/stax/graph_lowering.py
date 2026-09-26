@@ -57,7 +57,6 @@ from .loops import (
     ExternOutput,
     DeferredOps,
     TemplateKernel,
-    LibraryKernel as ExternKernel,
     dtype_name,
     Value,
     V,

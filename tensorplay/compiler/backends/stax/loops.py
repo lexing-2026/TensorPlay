@@ -501,21 +501,24 @@ class DeferredOps:
 FLOAT_RANK = {"float16": 1, "bfloat16": 1, "float32": 2, "float64": 3}
 
 
-class LibraryKernel:
-    """A call to something written elsewhere, on values that are already in memory.
+class TemplateKernel:
+    """A call whose implementation is chosen from a space of candidates.
 
-    The operation is named once, here, and what it takes is the call as it was
-    written: the arguments in the order given, the keywords as they were named,
-    and the traced result of the call, which is what says what shape and type
-    comes back.  Nothing about the call is lowered; the job here is to know
-    which buffers it reads, so that it can be ordered against them.
+    The operation is named once in a template rather than at every call site:
+    the template owns the candidates and the choice between them, and the
+    compiled step records which one it settled on.  The call is still dispatched
+    as itself -- the template only decides how it is carried out.
 
-    This is the bridge to code that was not written for this compiler, and it
-    is deliberately thin: the more it decides, the more there is that could
-    disagree with the thing being called.
+    The call is described as it was written: the arguments in the order given,
+    the keywords as they were named, and the traced result of the call, which
+    is what says what shape and type comes back.  What it has to get right for
+    scheduling is which buffers it reads, so that it can be ordered against
+    them.
     """
 
-    def __init__(self, name, target, args, kwargs, meta_values, call_method=False):
+    def __init__(
+        self, name, target, template, args, kwargs, meta_values, call_method=False
+    ):
         self.name = name
         self.target = target
         self.args = args
@@ -527,6 +530,9 @@ class LibraryKernel:
         # is all that is known before it runs.
         self.meta_values = meta_values
         self.outputs: list = []
+        self.template = template
+        self.config = None
+        self.template_meta: dict = {}
 
     def input_buffers(self) -> list:
         """Every buffer this call reads, however deeply nested the arguments are.
@@ -557,24 +563,6 @@ class LibraryKernel:
         return found
 
 
-class TemplateKernel(LibraryKernel):
-    """A call whose implementation is chosen from a space of candidates.
-
-    The operation is named once in a template rather than at every call site:
-    the template owns the candidates and the choice between them, and the
-    compiled step records which one it settled on.  The call is still dispatched
-    as itself -- the template only decides how it is carried out.
-    """
-
-    def __init__(
-        self, name, target, template, args, kwargs, meta_values, call_method=False
-    ):
-        super().__init__(name, target, args, kwargs, meta_values, call_method=call_method)
-        self.template = template
-        self.config = None
-        self.template_meta: dict = {}
-
-
 class ExternOutput:
     """One value a library call produced, at a position inside what it returned.
 
@@ -583,7 +571,7 @@ class ExternOutput:
     value rather than a pair of brackets.
     """
 
-    def __init__(self, name, layout, kernel: LibraryKernel, path: tuple):
+    def __init__(self, name, layout, kernel: "TemplateKernel", path: tuple):
         self.name = name
         self.layout = layout
         self.kernel = kernel
@@ -730,10 +718,6 @@ class ReinterpretView:
 
     def is_input_buffer(self) -> bool:
         return self.buffer.is_input_buffer()
-
-
-#: The call this compiler makes to code it did not write.
-ExternKernel = LibraryKernel
 
 
 def _index_exprs(body: LoopBody) -> list:

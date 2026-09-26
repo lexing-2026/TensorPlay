@@ -18,7 +18,7 @@ import tensorplay as tp
 from .ir import Buffer, ComputedBuffer, ConstantBuffer, StorageBox, TensorBox
 from .ir import ReinterpretView
 from .ir import FallbackKernel as IrFallbackKernel
-from .loops import ExternKernel, ExternOutput
+from .loops import ExternOutput
 
 
 class Step:
