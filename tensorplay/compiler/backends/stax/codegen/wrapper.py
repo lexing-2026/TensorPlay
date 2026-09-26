@@ -115,7 +115,7 @@ from .triton_utils import config_of, should_unwrap_unspec_arg, signature_to_meta
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
 
-    from ..graph import GraphLowering
+    from ..graph_lowering import GraphLowering
     from ..ir import ExternKernel
     from ..kernel_scheduler import BaseSchedulerNode
 
@@ -3493,7 +3493,7 @@ class PythonWrapperCodegen(CodeGen):
         inductor_meta, extra_launcher_call_args)``; subsequent calls with the
         same ``cache_key`` reuse the previously assigned name.
         """
-        from .benchmarking import get_interface_for_device
+        from ..runtime.benchmarking import get_interface_for_device
 
         from ..runtime.triton_compat import GPUTarget
         from ..runtime.triton_helpers import try_filter_backend_options_for_target

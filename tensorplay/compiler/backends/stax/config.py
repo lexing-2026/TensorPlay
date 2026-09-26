@@ -40,6 +40,12 @@ loop_ordering_after_fusion = (
     os.environ.get("TP_LOOP_ORDERING_AFTER_FUSION", "0") == "1"
 )
 
+# Whether the order the loops are walked in is worked out at all, rather than
+# left as the order the body was written in.  On because walking a body in the
+# order memory is laid out is what makes each step read what the step before
+# left in hand; the order is a heuristic and has not been tuned.
+pick_loop_orders = os.environ.get("TP_PICK_LOOP_ORDERS", "1") == "1"
+
 # A tensor already laid out with its channels last keeps that layout: padding
 # it would defeat the layout it was given.
 pad_channels_last = False

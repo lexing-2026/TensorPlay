@@ -1409,74 +1409,83 @@ def topo_sort_snode(snode) -> None:
     snode.snodes = order
 
 
-def pick_loop_order(
-    stride0: Sequence,
-    keep_stride_amt: int,
-    ensure_contiguous: bool,
-    *,
-    allow_reorder: bool,
-) -> tuple:
-    """Which axes to walk in which order, given how the memory is arranged.
+def _cmp(left, right) -> int:
+    """Three-way comparison of two values, as a sorting key needs it."""
 
-    Walking in the order memory is laid out means each step reads what the step
-    before left in hand, which is why the order is worked out from the strides.
-    Which axes are worth reordering is decided by how many of them there are and
-    whether anything demands that they stay put.
+    return (left > right) - (left < right)
+
+
+def pick_loop_order(
+    stride_lengths: list[list[int]],
+    sizes: Sequence,
+    priority_idx: Sequence[int] = (),
+) -> list[int]:
+    """Which axis to walk at each step, given how the memory is laid out.
+
+    Walking in the order memory is arranged is what makes each step read what
+    the step before left in hand.  An axis of extent one is not worth walking
+    for its own sake -- it reads the same element every time -- so those go last
+    whatever their stride says.
+
+    The strides are compared as absolute values, because an axis walked
+    backwards still reads what the axis before it left in hand; without that, a
+    flipped axis looks more contiguous than a forward one and is preferred for
+    being so.
+
+    ``priority_idx`` names the axes a caller has already decided must come
+    first, and only those are considered: a caller's ordering is not something
+    the heuristic is entitled to overrule.
     """
 
-    from .utils import (
-        get_layout_symints,
-        maximize_bit_log,
-        next_power_of_2,
-        prev_power_of_2,
-    )
+    @functools.cmp_to_key
+    def index_cmp(a: int, b: int) -> int:
+        if sizes[a] == 1 or sizes[b] == 1:
+            # An axis of extent one does not matter where it goes, so it goes
+            # last; among two such axes the order is by index, so that the sort
+            # is stable however the extents compare.
+            return _cmp(sizes[a] == 1, sizes[b] == 1)
 
-    if isinstance(stride0, int):
-        stride0 = [stride0]
-    if len(stride0) == 0:
-        return [1], 1
+        stride_len_a = [abs(sl[a]) for sl in stride_lengths]
+        stride_len_b = [abs(sl[b]) for sl in stride_lengths]
 
-    # Make sure the last dimension is contiguous
-    if (
-        allow_reorder
-        and len(stride0) > 1
-        and stride0[-1] != 1
-        and all(s == 1 for s in stride0[-1:])
-    ):
-        stride0 = list(stride0)
-        stride0[-1], stride0[-2] = stride0[-2], stride0[-1]
+        # How many of the buffers each axis is the better-strided one in.  An
+        # axis whose stride is zero in some buffer is as good as the other in
+        # that buffer, because every element of it is the same element.
+        a_first = sum(
+            sl_b == 0 or sl_a < sl_b for sl_a, sl_b in zip(stride_len_a, stride_len_b)
+        )
+        b_first = sum(
+            sl_a == 0 or sl_b < sl_a for sl_a, sl_b in zip(stride_len_a, stride_len_b)
+        )
+        if a_first > b_first:
+            return -1
+        if b_first > a_first:
+            return 1
 
-    def has_reduction_loops(ranges) -> bool:
-        return len(ranges) >= 2 and len(ranges[1]) > 0
+        # Nothing separates them, so the one walked from the inside out comes
+        # first, which is the contiguous one.
+        return _cmp(b, a)
 
-    nargs = len(stride0)
-
-    def order(index):
-        perm = sorted(index, key=lambda i: stride0[i], reverse=True)
-        return list(perm)
-
-    # Compute the axes in which the loop is contiguous
-    if ensure_contiguous and nargs > 0:
-        new_order = list(range(nargs))
-        while len(new_order) > 1:
-            if stride0[new_order[-1]] != 1:
-                break
-            new_order.pop()
-        if len(new_order) != nargs:
-            new_order = order(new_order)
-        order_key = new_order
-    else:
-        order_key = order(range(nargs))
-
-    return order_key
+    order = list(reversed(range(len(stride_lengths[0]))))
+    if len(priority_idx) > 0:
+        # Only the axes the caller named are considered.
+        stride_lengths = [stride_lengths[pi] for pi in priority_idx]
+    if config.pick_loop_orders:
+        order.sort(key=index_cmp)
+    return order
 
 
-def get_layout_symints(buf, consumers) -> OrderedSet:
-    """The shapes of a buffer that whoever reads it has to know."""
+def get_layout_symints(buf, consumers=None) -> OrderedSet:
+    """The shapes a buffer's layout is written in terms of.
+
+    The consumers are not consulted: every reader of a value has to be given
+    the shapes that value's layout is written in terms of, so the answer is the
+    same whoever is asking.  The parameter is kept because the callers pass it.
+    """
 
     from .utils import get_layout_symints as _impl
 
-    return _impl(buf, consumers)
+    return _impl(buf)
 
 
 def get_scheduler_node_symbol_uses(snode, is_input: bool) -> OrderedSet:

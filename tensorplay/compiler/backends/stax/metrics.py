@@ -155,7 +155,7 @@ def log_kernel_metadata(
     It's fine to parse the generated kernel code here since the logging is
     disabled by default. It would hurt compilation time.
     """
-    from .wrapper_benchmark import get_kernel_category_by_source_code
+    from .runtime.benchmark_report import get_kernel_category_by_source_code
 
     kernel_category = get_kernel_category_by_source_code(kernel_module_code)
     reduction_hint = _parse_reduction_hint(kernel_category, kernel_module_code)

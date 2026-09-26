@@ -1754,3 +1754,70 @@ def _do_bench_using_profiling(
     return result
 
 
+
+
+def get_layout_symints(node) -> OrderedSet:
+    """The shapes a value's layout is written in terms of.
+
+    A layout says where an element is with an extent, a stride and an offset,
+    and each of those can be written in terms of a shape that is not yet
+    settled.  Whoever reads the value has to be handed those shapes, because a
+    kernel cannot be given a stride it cannot compute.
+
+    Accepts one value or several, so a caller with a list of them does not have
+    to fold it itself.
+    """
+
+    from . import ir as _ir
+
+    if isinstance(node, (list, tuple, set, frozenset)):
+        collected: OrderedSet = OrderedSet()
+        for one in node:
+            collected.update(get_layout_symints(one))
+        return collected
+
+    found: OrderedSet = OrderedSet()
+    layout = node.maybe_get_layout() if hasattr(node, "maybe_get_layout") else None
+    if layout is None:
+        return found
+    if not isinstance(layout, _ir.Layout):
+        raise AssertionError(
+            f"expected a layout or nothing, but the value's layout is {layout!r}"
+        )
+    found.update(get_free_symbols(layout.size, False))
+    found.update(get_free_symbols(layout.stride, False))
+    found.update(get_free_symbols(layout.offset, False))
+    if isinstance(layout, _ir.MutationLayoutSHOULDREMOVE):
+        # A layout that writes in place is expressed in terms of the layout it
+        # writes over, so the shapes that one is written in terms of are shapes
+        # this one is too.
+        found.update(get_layout_symints(layout.target))
+    return found
+
+
+def dominated_nodes(initial_queue, skip_filter=None) -> "OrderedSet":
+    """The values that depend on the ones named, and the ones named.
+
+    A value depends on another when reading it means reading the other, so the
+    set is everything reachable from the starting values by following readers.
+    Which is what a value-range analysis needs in order to be pessimistic about
+    a value without working the range out: a load's range is unknown, so
+    anything computed from a load is unknown too.
+
+    ``skip_filter`` leaves a reader out, for a reader whose value is not
+    computed from what it read.
+    """
+
+    from . import ir as _ir
+
+    queue = list(initial_queue)
+    dominated: "OrderedSet" = OrderedSet(queue)
+    while queue:
+        node = queue.pop()
+        for user in getattr(node, "users", ()):
+            if skip_filter is not None and skip_filter(user):
+                continue
+            if user not in dominated:
+                dominated.add(user)
+                queue.append(user)
+    return dominated
