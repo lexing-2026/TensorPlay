@@ -18,7 +18,6 @@ import tensorplay as tp
 from .ir import Buffer, ComputedBuffer, ConstantBuffer, StorageBox, TensorBox
 from .ir import ReinterpretView
 from .ir import FallbackKernel as IrFallbackKernel
-from .loops import ExternOutput
 
 
 class Step:
@@ -64,20 +63,14 @@ class HostStep(Step):
 
 
 class ExternStep(Step):
-    def __init__(self, kernel):
-        if isinstance(kernel, IrFallbackKernel):
-            # What a described call reads is what it depends on, and what it
-            # produces is either the call's own buffer or the buffers naming
-            # where each of several results sits.
-            super().__init__(
-                {d.name for d in kernel.get_reads()},
-                {o.get_name() for o in kernel.get_outputs()},
-            )
-        else:
-            super().__init__(
-                {b.name for b in kernel.input_buffers()},
-                {o.name for o in kernel.outputs},
-            )
+    def __init__(self, kernel: IrFallbackKernel):
+        # What a described call reads is what it depends on, and what it
+        # produces is either the call's own buffer or the buffers naming where
+        # each of several results sits.
+        super().__init__(
+            {d.name for d in kernel.get_reads()},
+            {o.get_name() for o in kernel.get_outputs()},
+        )
         self.kernel = kernel
         self._baked = None
 
@@ -94,31 +87,39 @@ class ExternStep(Step):
         )
 
     def run(self, env: dict) -> None:
-        if isinstance(self.kernel, IrFallbackKernel):
-            args, kwargs = self._described_args(env)
-            result = self.kernel.unflatten_args(*args)
-            for out in self.kernel.get_outputs():
-                env[out.get_name()] = _dig(result, getattr(out, "indices", ()))
-            return
-        args = _resolve(self.kernel.args, env)
-        kwargs = _resolve(self.kernel.kwargs, env)
+        described = self._described_args(env)
         if getattr(self.kernel, "template", None) is not None:
-            self._run_template(args, kwargs, env)
+            self._run_template(described, env)
             return
-        if self.kernel.call_method:
-            # A method call names the operation with a string and receives the
-            # object it is called on first.
-            receiver, *rest = args
-            result = getattr(receiver, self.kernel.target)(*rest, **kwargs)
-        else:
-            target = self.kernel.target
-            if not callable(target) and hasattr(target, "default"):
-                target = target.default
-            result = target(*args, **kwargs)
-        for output in self.kernel.outputs:
-            env[output.name] = _dig(result, output.path)
+        self._record(self._call_target(described), env)
 
-    def _run_template(self, args, kwargs, env) -> None:
+    def _record(self, result, env) -> None:
+        """Put what the call returned under the name of each result it has."""
+
+        for out in self.kernel.get_outputs():
+            env[out.get_name()] = _dig(result, getattr(out, "indices", ()))
+
+    def _call_target(self, described) -> Any:
+        """Run the call as it was written, on the operands it is given.
+
+        A description says what the call takes and what it gives back, not
+        what the result is: putting the arguments back together and then making
+        the call are two steps, and only the second one produces a value.
+        """
+
+        args, kwargs = self.kernel.unflatten_args(*described)
+        target = self.kernel.op_overload
+        if not callable(target):
+            # A call named by a string rather than by something callable is a
+            # method call, and a method call is not described as a call to an
+            # operation: there is no operation here to be given arguments.
+            raise AssertionError(
+                f"{target!r} is not callable, so the call describing it cannot "
+                f"be made"
+            )
+        return target(*args, **kwargs)
+
+    def _run_template(self, described, env) -> None:
         """Run a templated operator through the launcher its template chose.
 
         The choice needs the real operands, so it is made on the first call and
@@ -127,13 +128,13 @@ class ExternStep(Step):
         across processes.
         """
 
-        feed = _template_feed(self.kernel, args)
+        feed = _template_feed(self.kernel, described)
         launch = self._baked
         if launch is None and self.kernel.template is not None:
             # A template is measured once, on the operands of the call that
             # found it, and what it hands back is a launcher over the operands
             # it is handed -- so the measurement pins nothing.
-            self._baked = self._bake(feed, args, kwargs)
+            self._baked = self._bake(feed, described)
             launch = self._baked
         result = launch(feed) if launch is not None else None
         if result is None:
@@ -143,11 +144,10 @@ class ExternStep(Step):
             # operator as the framework runs it, on the operands of this call.
             # Holding a launcher over those operands instead would pin them on
             # the step, and the program reuses the step for every call.
-            result = self._call_target(args, kwargs)
-        for output in self.kernel.outputs:
-            env[output.name] = _dig(result, output.path)
+            result = self._call_target(described)
+        self._record(result, env)
 
-    def _bake(self, feed, args, kwargs):
+    def _bake(self, feed, described):
         """Ask the template which of its configurations fits this call.
 
         The template owns its result, so it can build the probe its
@@ -195,7 +195,7 @@ class ExternStep(Step):
         positions = list(meta.get("operand_positions") or ())
         if not positions:
             return None
-        target = self.kernel.target
+        target = self.kernel.op_overload
         if meta.get("call_method"):
             receiver, *rest = literals
             return lambda values: getattr(receiver, target)(*rest)
@@ -223,15 +223,6 @@ class ExternStep(Step):
                 return None
 
         return launch
-
-    def _call_target(self, args, kwargs):
-        if self.kernel.call_method:
-            receiver, *rest = args
-            return getattr(receiver, self.kernel.target)(*rest, **kwargs)
-        target = self.kernel.target
-        if not callable(target) and hasattr(target, "default"):
-            target = target.default
-        return target(*args, **kwargs)
 
 
 def _dtype_of(layout_dtype: Any):
@@ -266,7 +257,7 @@ def _resolve(value: Any, env: dict) -> Any:
         base = _resolve(value.data, env)
         layout = value.get_layout()
         return tp.as_strided(base, layout.size, layout.stride, layout.offset)
-    if isinstance(value, (Buffer, ExternOutput)):
+    if isinstance(value, Buffer):
         return env[value.name]
     # A view's source is itself a value, and it is read by the name it was
     # written under rather than by what it is.
@@ -295,7 +286,7 @@ class LoopProgram:
         for out in graph.graph_outputs:
             if isinstance(out, ReinterpretView):
                 self.keep.add(out.data.get_name())
-            elif isinstance(out, (Buffer, ExternOutput)):
+            elif isinstance(out, Buffer):
                 # A graph output is handed to the caller, so it has to outlive
                 # the last step that writes it.
                 self.keep.add(out.name)
@@ -380,7 +371,7 @@ def _output_tensor(out: Any, env: dict):
             [int(step) for step in layout.stride],
             int(layout.offset),
         )
-    if isinstance(out, (Buffer, ExternOutput)):
+    if isinstance(out, Buffer):
         return env[out.name]
     if isinstance(out, (TensorBox, StorageBox)):
         # A value that is still held rather than materialized is read from

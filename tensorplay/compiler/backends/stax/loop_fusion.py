@@ -37,8 +37,6 @@ from .loops import (
     floordiv,
     modular_indexing,
     substitute,
-    TemplateKernel,
-    ExternOutput,
     Value,
     dtype_name,
     free_symbols,
@@ -90,16 +88,14 @@ class LoopNode:
 @dataclass
 class ExternNode:
     index: int
-    kernel: TemplateKernel
+    kernel: IrFallbackKernel
     reads: set = field(default_factory=set)
     #: What this call produces, when the names do not come off the kernel.
     outputs: list | None = None
 
     @property
     def names(self):
-        if self.outputs is not None:
-            return self.outputs
-        return [o.name for o in self.kernel.outputs]
+        return self.outputs if self.outputs is not None else []
 
 
 @dataclass
@@ -306,8 +302,6 @@ class KernelScheduler:
                     {d.name for d in op.get_reads()},
                     [o.get_name() for o in op.get_outputs()],
                 )
-            elif isinstance(op, TemplateKernel):
-                node = ExternNode(position, op, {b.name for b in op.input_buffers()})
             else:
                 body = record_body(op.data)
                 data = op.data

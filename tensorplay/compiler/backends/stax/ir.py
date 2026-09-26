@@ -44,7 +44,7 @@ from tensorplay.graph.experimental.sympy_functions import (
 )
 
 from . import config
-from .loops import ExternOutput, get_current_node, metrics, ops, V
+from .loops import get_current_node, metrics, ops, V
 
 log = logging.getLogger(__name__)
 from . import dependencies
@@ -629,9 +629,6 @@ class IRNode:
                 InputBuffer,
                 ReinterpretView,
                 TemplateBuffer,
-                # A library call's result is written by the call itself, so it
-                # is somewhere to read from before anything asks it to compute.
-                ExternOutput,
             ),
         )
 
@@ -2734,6 +2731,25 @@ def _identity(x):
     """A size left as it is."""
 
     return x
+
+
+def gm_original_output_strides(gm) -> None:
+    """Record on a graph both what it yields and the strides each output had.
+
+    Which outputs a caller may read is settled here rather than left to whoever
+    looks at the graph later: a graph's output node wraps its results, and a
+    reader that walked the wrapper as if it were a result would count a structure
+    as one of the values the graph produces.
+    """
+
+    output_node = gm.graph.find_nodes(op="output")[0]
+    output_node.meta["user_visible_output_idxs"] = [
+        idx for idx, _ in enumerate(output_node.args)
+    ]
+
+    from .loop_compile import record_original_output_strides
+
+    record_original_output_strides(gm)
 
 
 def convert_shape_to_symint(lst):
@@ -6322,10 +6338,6 @@ class ExternKernel(InputsKernel):
                 # stride and an offset, so it has to be walked into memory
                 # instead of read as a window onto what is already there.
                 pass
-        if isinstance(x, ExternOutput):
-            # A library call's own result is already held in the buffer it was
-            # given, so there is nowhere else for it to be put.
-            return x
         if isinstance(x, StorageBox):
             x.realize()
             return x

@@ -54,9 +54,7 @@ from .ir import (
     View,
 )
 from .loops import (
-    ExternOutput,
     DeferredOps,
-    TemplateKernel,
     dtype_name,
     Value,
     V,
@@ -633,11 +631,6 @@ class GraphLowering:
         # A value that had nowhere to live is given a buffer, and what a
         # caller wants back is where it now lives rather than the box that
         # holds it: a library call and a graph output both read from memory.
-        if isinstance(node, ExternOutput):
-            # A library call's result is held in a buffer of its own, so what
-            # reads it is handed that buffer rather than the description of
-            # which slot of the call's result it was.
-            return self.get_buffer(node.name)
         if isinstance(node, TensorBox):
             # Still held in a box, so the box is what has to be given a buffer;
             # a value walked into memory rather than read as a window arrives
@@ -888,46 +881,16 @@ class GraphLowering:
         # from the template's candidates rather than at the call site.
         template = self._template_for(node, realized_args)
         kernel_name = self.qualify_name(f"kernel{len(self.operations)}")
+        kernel = self._make_fallback(node, kernel_name, realized_args, kwargs)
         if template is not None:
-            kernel = TemplateKernel(
-                kernel_name,
-                node.target,
-                template,
-                realized_args,
-                realize_args(kwargs),
-                node.meta.get("val"),
-                call_method=node.op == "call_method",
-            )
+            # How the call is carried out, as opposed to what it is: the
+            # template owns the candidates and the choice between them.
+            kernel.template = template
+            kernel.config = None
             kernel.template_meta = self._template_meta(
                 node, realized_args, realize_args(kwargs), template.name
             )
-        else:
-            kernel = self._make_fallback(node, kernel_name, realized_args, kwargs)
-            return self._wrap_fallback(node, kernel)
-        # Which graph node asked for this call, so that a result of it can say
-        # where it came from the way a computed value does.
-        kernel.origin_node = node
-        self.operations.append(kernel)
-
-        def wrap(val, path):
-            if _is_tensor(val):
-                layout = FixedLayout(
-                    val.device, val.dtype,
-                    tuple(int(s) for s in val.shape),
-                    tuple(int(s) for s in val.stride()),
-                    int(val.storage_offset()) if hasattr(val, "storage_offset") else 0,
-                )
-                out = ExternOutput(None, layout, kernel, path)
-                self.register_buffer(out, set_name=True)
-                kernel.outputs.append(out)
-                # Boxed the way every value is, so that what holds this result
-                # is a place memory can be given rather than the result itself.
-                return TensorBox.create(out)
-            if isinstance(val, (list, tuple)):
-                return tuple(wrap(v, path + (i,)) for i, v in enumerate(val))
-            return val
-
-        return wrap(node.meta.get("val"), ())
+        return self._wrap_fallback(node, kernel)
 
     # -- walk -------------------------------------------------------------
     def run(self):
