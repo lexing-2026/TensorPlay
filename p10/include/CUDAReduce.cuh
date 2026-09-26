@@ -560,13 +560,20 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
     }
 
     const int max_threads = sizeof(AccT) > 4 ? 256 : kMaxReduceThreads;
-    // Block shape from the two iterator extents: block.x covers the reducing
-    // extent, so a short row packs several outputs into one warp instead of
-    // leaving most lanes carrying the identity; block.y then takes as many
-    // outputs as the thread budget allows.  reduction_last_pow2 already clamps
-    // both to kMaxReduceThreads.
-    const int dim0_pow2 = reduction_last_pow2(dim0);
-    const int dim1_pow2 = reduction_last_pow2(dim1);
+    // Block shape in both mappings: block.x is sized from the per-output
+    // extent and block.y from the output count, so a block always covers whole
+    // rows.  block.x targets kElemsPerLane elements per lane - one or two per
+    // lane spends the block on scheduling and shuffle traffic rather than on
+    // loads, while devoting a full warp to a short row wastes most of its
+    // lanes.  Clamped to [2, one warp]: a row spans at least two lanes and
+    // never more than a warp.  The thresholds come from a measured sweep over
+    // row lengths 4..8192 (see the commit message for the numbers).
+    constexpr int kElemsPerLane = 8;
+    const int want_width = static_cast<int>(std::max<int64_t>(
+        2, std::min<int64_t>(kWarpSize, config.num_inputs / kElemsPerLane)));
+    const int dim0_pow2 =
+        std::min(want_width, reduction_last_pow2(config.num_inputs));
+    const int dim1_pow2 = reduction_last_pow2(config.num_outputs);
     config.block_width = std::min(dim0_pow2, kWarpSize);
     const int max_height =
         std::max(1, max_threads / std::max(1, config.block_width));
