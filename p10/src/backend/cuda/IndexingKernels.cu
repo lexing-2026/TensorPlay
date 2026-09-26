@@ -152,30 +152,175 @@ __global__ void index_fill_kernel(int64_t total, int64_t inner, int64_t row,
     }
 }
 
-template <typename T>
-inline void run_nonzero_mark_iter(TensorIteratorBase& iter) {
-    gpu_kernel(iter, [] __host__ __device__(T value) -> int64_t {
-        return static_cast<bool>(value != T(0)) ? int64_t(1) : int64_t(0);
-    });
-}
+#define TP_NZ_ITEMS(ctype) (sizeof(ctype) >= 8 ? 2 : 4)
+
+// nonzero: count the matches in one pass, then a single pass that scans each
+// block's tile and writes the matching positions.  Materializing a per-element
+// prefix array instead would move three times the input through memory before
+// the positions are known.
+// One vector load per thread over ITEMS adjacent elements.
+template <typename T, int N>
+struct NonZeroVec {
+    T val[N];
+};
 
 template <typename T>
-__global__ void nonzero_fill_kernel(int64_t n, int64_t ndim, const T* x,
-                                    const int64_t* sizes, const int64_t* positions,
-                                    int64_t* out) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) {
-        if (!(x[i] != T(0))) continue;
-        const int64_t slot = positions[i] - 1;
-        int64_t rem = i;
-        for (int64_t d2 = ndim - 1; d2 >= 0; --d2) {
-            out[slot * ndim + d2] = rem % sizes[d2];
-            rem /= sizes[d2];
+struct NonZeroPredicate {
+    __device__ __forceinline__ bool operator()(const T& value) const {
+        return value != T(0);
+    }
+};
+
+// Pass one counts the matches without writing a per-element flag: each block
+// reduces its own slice and publishes one value.
+template <typename T, int BLOCK, int ITEMS>
+__global__ void nonzero_count_kernel(int64_t n, const T* x, int32_t* total,
+                                     int32_t* per_block) {
+    int mine = 0;
+    const int64_t tile_span = static_cast<int64_t>(gridDim.x) * (BLOCK * ITEMS);
+    for (int64_t tile = static_cast<int64_t>(blockIdx.x) * (BLOCK * ITEMS);
+         tile < n; tile += tile_span) {
+        const int64_t base = tile + threadIdx.x;
+#pragma unroll
+        for (int i = 0; i < ITEMS; ++i) {
+            const int64_t at = base + static_cast<int64_t>(i) * BLOCK;
+            if (at < n && NonZeroPredicate<T>()(x[at])) ++mine;
         }
+    }
+    const int lane = threadIdx.x & 31;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        mine += __shfl_down_sync(0xffffffffu, mine, off);
+    }
+    __shared__ int warp_totals[BLOCK / 32];
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_totals[warp] = mine;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int sum = 0;
+#pragma unroll
+        for (int w = 0; w < BLOCK / 32; ++w) sum += warp_totals[w];
+        per_block[blockIdx.x] = static_cast<int32_t>(sum);
+        if (sum != 0) atomicAdd(total, static_cast<int32_t>(sum));
     }
 }
 
+// Turns the per-block counts into the base slot of each block, so the scan
+// pass can write straight into the final positions without a second pass over
+// the input.
+template <int BLOCK>
+__global__ void nonzero_block_offsets(int32_t blocks, int32_t* per_block) {
+    __shared__ int32_t carry;
+    __shared__ int32_t warp_sums[BLOCK / 32];
+    if (threadIdx.x == 0) carry = 0;
+    __syncthreads();
+    for (int32_t base = 0; base < blocks; base += BLOCK) {
+        const int32_t at = base + static_cast<int32_t>(threadIdx.x);
+        const int32_t v = at < blocks ? per_block[at] : 0;
+        int32_t incl = v;
+        const int lane = threadIdx.x & 31;
+#pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            const int32_t other = __shfl_up_sync(0xffffffffu, incl, off);
+            if (lane >= off) incl += other;
+        }
+        if (lane == 31) warp_sums[threadIdx.x >> 5] = incl;
+        __syncthreads();
+        int32_t prefix = 0;
+#pragma unroll
+        for (int w = 0; w < BLOCK / 32; ++w) {
+            if (w == (int)(threadIdx.x >> 5)) break;
+            prefix += warp_sums[w];
+        }
+        if (at < blocks) per_block[at] = carry + prefix + incl - v;
+        __syncthreads();
+        if (threadIdx.x == BLOCK - 1) carry += prefix + incl;
+        __syncthreads();
+    }
+}
+
+// BLOCK x ITEMS contiguous elements per block.  Each thread owns ITEMS
+// *consecutive* elements and loads them as one vector: consecutive lanes then
+// cover consecutive vectors, and — because a thread's items are adjacent — the
+// slots the block scan hands out are already in ascending order, so the
+// positions come out sorted without a second exchange pass.
+template <typename T, int BLOCK, int ITEMS>
+__global__ void nonzero_flag_kernel(int64_t n, const T* x, int64_t* flat,
+                                    const int32_t* block_base) {
+    using Vec = NonZeroVec<T, ITEMS>;
+    constexpr int kWarps = BLOCK / 32;
+    __shared__ int warp_totals[kWarps];
+    __shared__ int block_total;
+    const int64_t tile_span = static_cast<int64_t>(gridDim.x) * (BLOCK * ITEMS);
+    int64_t slot_base = block_base[blockIdx.x];
+    for (int64_t tile = static_cast<int64_t>(blockIdx.x) * (BLOCK * ITEMS);
+         tile < n; tile += tile_span) {
+    const int64_t at = tile + static_cast<int64_t>(threadIdx.x) * ITEMS;
+    int64_t idx[ITEMS];
+    bool nz[ITEMS];
+    int mine = 0;
+    if (at + ITEMS <= n) {
+        const Vec loaded = *reinterpret_cast<const Vec*>(x + at);
+#pragma unroll
+        for (int i = 0; i < ITEMS; ++i) {
+            idx[i] = at + i;
+            nz[i] = NonZeroPredicate<T>()(loaded.val[i]);
+            mine += nz[i] ? 1 : 0;
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < ITEMS; ++i) {
+            const int64_t pos = at + i;
+            idx[i] = pos;
+            nz[i] = pos < n && NonZeroPredicate<T>()(x[pos]);
+            mine += nz[i] ? 1 : 0;
+        }
+    }
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    int inclusive = mine;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        const int other = __shfl_up_sync(0xffffffffu, inclusive, off);
+        if (lane >= off) inclusive += other;
+    }
+    if (lane == 31) warp_totals[warp] = inclusive;
+    __syncthreads();
+    int warp_prefix = 0;
+#pragma unroll
+    for (int w = 0; w < kWarps; ++w) {
+        if (w == warp) break;
+        warp_prefix += warp_totals[w];
+    }
+    if (threadIdx.x == 0) {
+        block_total = warp_prefix + warp_totals[kWarps - 1];
+    }
+    __syncthreads();
+    int slot = slot_base + warp_prefix + inclusive - mine;
+#pragma unroll
+    for (int i = 0; i < ITEMS; ++i) {
+        if (nz[i]) flat[slot++] = idx[i];
+    }
+    __syncthreads();
+    slot_base += block_total;
+    }
+}
+
+__global__ void nonzero_write_indices(int64_t count, int64_t ndim,
+                                      const int64_t* sizes, const int64_t* flat,
+                                      int64_t* out) {
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (int64_t m = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         m < count; m += stride) {
+        int64_t rem = flat[m];
+        int64_t* row = out + m * ndim;
+        for (int64_t d = ndim - 1; d >= 0; --d) {
+            const int64_t size = sizes[d];
+            row[d] = rem % size;
+            rem /= size;
+        }
+    }
+}
 }
 
 // ---------------------------------------------------------------------------
@@ -317,113 +462,102 @@ Tensor& index_fill_tensor__cuda(Tensor& self, int64_t dim, const Tensor& index, 
 
 Tensor nonzero_cuda(const Tensor& self) {
     Tensor self_c = self.contiguous();
-    int64_t nd = self.dim();
-    int64_t n = self_c.numel();
+    const int64_t nd = self.dim();
+    const int64_t n = self_c.numel();
     // Empty input: no matches. Launching with a 0-block grid is a CUDA error,
     if (n == 0) {
         return Tensor::zeros({0, nd}, DType::Int64, self.device());
     }
-    TP_CHECK(n <= static_cast<int64_t>(std::numeric_limits<int>::max()),
-             "nonzero: input is too large for device scan");
-    Tensor flags = Tensor::empty({n}, DType::Int64, self.device());
-    Tensor self_flat = self_c.reshape({n});
-    TensorIterator flag_iter = TensorIteratorConfig()
-        .resize_outputs(false)
-        .check_all_same_dtype(false)
-        .add_output(flags)
-        .add_const_input(self_flat)
-        .build();
-#define TP_NZC_CASE(ctype, name) \
-    case DType::name: \
-        run_nonzero_mark_iter<ctype>(flag_iter); \
-        break;
+    const auto stream = getCurrentCUDAStream().stream();
+
+    // Pass one counts the matches straight off the input: no per-element flag
+    // array is written, so the input is read once and nothing else.
+    Tensor count_d = Tensor::zeros({1}, DType::Int32, self.device());
+    constexpr int kCountBlock = 256;
+    // One tile per block: the output stays in ascending order only when a
+    // block's elements are adjacent.  The 1-D grid reaches 2^31-1 blocks, so
+    // the launch limit never forces a block to straddle tiles.
+    constexpr int64_t kMaxBlocks = 2147483647;
+    Tensor block_counts;
+#define TP_NZC_COUNT(ctype, name)                                                 \
+    case DType::name:                                                            \
+        {                                                                    \
+        constexpr int kItems = TP_NZ_ITEMS(ctype);                            \
+        const int64_t tiles =                                                \
+            (n + kCountBlock * kItems - 1) / (kCountBlock * kItems);           \
+        const unsigned blocks = static_cast<unsigned>(                        \
+            std::min<int64_t>(tiles, kMaxBlocks));                            \
+        block_counts = Tensor::zeros({blocks}, DType::Int32, self.device());     \
+        nonzero_count_kernel<ctype, kCountBlock, kItems>                      \
+        <<<blocks, kCountBlock, 0, stream>>>(                                  \
+            n, self_c.data_ptr<ctype>(), count_d.data_ptr<int32_t>(),           \
+            block_counts.data_ptr<int32_t>());                                   \
+        nonzero_block_offsets<256><<<1, 256, 0, stream>>>(                      \
+            static_cast<int32_t>(blocks), block_counts.data_ptr<int32_t>());    \
+        break;                                                                   \
+    }
     switch (self_c.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_NZC_CASE)
-        TENSORPLAY_FORALL_FP8_TYPES(TP_NZC_CASE)
-        case DType::ComplexHalf:
-            run_nonzero_mark_iter<tensorplay::complex<Half>>(flag_iter);
-            break;
-        case DType::ComplexFloat:
-            run_nonzero_mark_iter<tensorplay::complex<float>>(flag_iter);
-            break;
-        case DType::ComplexDouble:
-            run_nonzero_mark_iter<tensorplay::complex<double>>(flag_iter);
-            break;
-        case DType::BComplex32:
-            run_nonzero_mark_iter<tensorplay::complex<BFloat16>>(flag_iter);
-            break;
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_NZC_COUNT)
+        TENSORPLAY_FORALL_FP8_TYPES(TP_NZC_COUNT)
+            TP_NZC_COUNT(tensorplay::complex<Half>, ComplexHalf)
+            TP_NZC_COUNT(tensorplay::complex<float>, ComplexFloat)
+            TP_NZC_COUNT(tensorplay::complex<double>, ComplexDouble)
+            TP_NZC_COUNT(tensorplay::complex<BFloat16>, BComplex32)
         default: TP_THROW(TypeError, "nonzero: unsupported dtype");
     }
-#undef TP_NZC_CASE
-    const cudaStream_t stream = getCurrentCUDAStream().stream();
-    Tensor positions = Tensor::empty({n}, DType::Int64, self.device());
-    size_t scan_bytes = 0;
-    CUDA_CHECK(cub::DeviceScan::InclusiveSum(
-        nullptr, scan_bytes, flags.data_ptr<int64_t>(),
-        positions.data_ptr<int64_t>(), static_cast<int>(n), stream));
-    Tensor scan_storage = Tensor::empty(
-        {static_cast<int64_t>(scan_bytes == 0 ? 1 : scan_bytes)},
-        DType::UInt8, self.device());
-    CUDA_CHECK(cub::DeviceScan::InclusiveSum(
-        scan_storage.data_ptr(), scan_bytes, flags.data_ptr<int64_t>(),
-        positions.data_ptr<int64_t>(), static_cast<int>(n), stream));
-    int64_t count_host = 0;
-    CUDA_CHECK(cudaMemcpyAsync(
-        &count_host, positions.data_ptr<int64_t>() + n - 1, sizeof(int64_t),
-        cudaMemcpyDeviceToHost, stream));
+#undef TP_NZC_COUNT
+    CUDA_CHECK(cudaGetLastError());
+    int32_t count_host = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&count_host, count_d.data_ptr<int32_t>(),
+                               sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     Tensor result = Tensor::zeros({count_host, nd}, DType::Int64, self.device());
     if (count_host == 0) return result;
-    // sizes live on the host; stage them on-device for the fill kernel
-    std::vector<int64_t> h_sizes(static_cast<std::vector<int64_t>>(self_c.shape()));
-    Tensor sizes_d = Tensor::empty({nd}, DType::Int64, self.device());
-    CUDA_CHECK(cudaMemcpy(sizes_d.data_ptr<int64_t>(), h_sizes.data(), nd * sizeof(int64_t),
-                          cudaMemcpyHostToDevice));
-#define TP_NZF_CASE(ctype, name) \
-    case DType::name: \
-        nonzero_fill_kernel<ctype><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            n, nd, self_c.data_ptr<ctype>(), sizes_d.data_ptr<int64_t>(), \
-            positions.data_ptr<int64_t>(), result.data_ptr<int64_t>()); \
-        break;
+
+    // Pass two scans each block's tile and writes the matching positions.
+    Tensor flat = Tensor::empty({count_host}, DType::Int64, self.device());
+    constexpr int kFlagBlock = 256;
+#define TP_NZC_FLAG(ctype, name)                                                  \
+    case DType::name:                                                            \
+        {                                                                    \
+        constexpr int kItems = TP_NZ_ITEMS(ctype);                            \
+        const int64_t tiles =                                                \
+            (n + kFlagBlock * kItems - 1) / (kFlagBlock * kItems);             \
+        const unsigned blocks = static_cast<unsigned>(                        \
+            std::min<int64_t>(tiles, kMaxBlocks));                            \
+        nonzero_flag_kernel<ctype, kFlagBlock, kItems>                        \
+        <<<blocks, kFlagBlock, 0, stream>>>(                                  \
+            n, self_c.data_ptr<ctype>(), flat.data_ptr<int64_t>(),                 \
+            block_counts.data_ptr<int32_t>());                               \
+        break;                                                             \
+    }
     switch (self_c.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_NZF_CASE)
-        TENSORPLAY_FORALL_FP8_TYPES(TP_NZF_CASE)
-        case DType::ComplexHalf:
-            nonzero_fill_kernel<tensorplay::complex<Half>><<<
-                (n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                n, nd, static_cast<const tensorplay::complex<Half>*>(self_c.data_ptr()),
-                sizes_d.data_ptr<int64_t>(), positions.data_ptr<int64_t>(),
-                result.data_ptr<int64_t>());
-            break;
-        case DType::ComplexFloat:
-            nonzero_fill_kernel<tensorplay::complex<float>><<<
-                (n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                n, nd, static_cast<const tensorplay::complex<float>*>(self_c.data_ptr()),
-                sizes_d.data_ptr<int64_t>(), positions.data_ptr<int64_t>(),
-                result.data_ptr<int64_t>());
-            break;
-        case DType::ComplexDouble:
-            nonzero_fill_kernel<tensorplay::complex<double>><<<
-                (n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                n, nd, static_cast<const tensorplay::complex<double>*>(self_c.data_ptr()),
-                sizes_d.data_ptr<int64_t>(), positions.data_ptr<int64_t>(),
-                result.data_ptr<int64_t>());
-            break;
-        case DType::BComplex32:
-            nonzero_fill_kernel<tensorplay::complex<BFloat16>><<<
-                (n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                n, nd, static_cast<const tensorplay::complex<BFloat16>*>(self_c.data_ptr()),
-                sizes_d.data_ptr<int64_t>(), positions.data_ptr<int64_t>(),
-                result.data_ptr<int64_t>());
-            break;
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_NZC_FLAG)
+        TENSORPLAY_FORALL_FP8_TYPES(TP_NZC_FLAG)
+            TP_NZC_FLAG(tensorplay::complex<Half>, ComplexHalf)
+            TP_NZC_FLAG(tensorplay::complex<float>, ComplexFloat)
+            TP_NZC_FLAG(tensorplay::complex<double>, ComplexDouble)
+            TP_NZC_FLAG(tensorplay::complex<BFloat16>, BComplex32)
         default: TP_THROW(TypeError, "nonzero: unsupported dtype");
     }
-#undef TP_NZF_CASE
+#undef TP_NZC_FLAG
+    CUDA_CHECK(cudaGetLastError());
+
+    // Pass three expands the positions into per-axis coordinates.
+    std::vector<int64_t> h_sizes(static_cast<std::vector<int64_t>>(self_c.shape()));
+    Tensor sizes_d = Tensor::empty({nd}, DType::Int64, self.device());
+    CUDA_CHECK(cudaMemcpyAsync(sizes_d.data_ptr<int64_t>(), h_sizes.data(),
+                               nd * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+    const int64_t expand_blocks = std::min<int64_t>(
+        (count_host + kThreads - 1) / kThreads, 65535);
+    nonzero_write_indices<<<static_cast<unsigned>(expand_blocks), kThreads, 0, stream>>>(
+        static_cast<int64_t>(count_host), nd, sizes_d.data_ptr<int64_t>(),
+        flat.data_ptr<int64_t>(), result.data_ptr<int64_t>());
     CUDA_CHECK(cudaGetLastError());
     return result;
 }
 
-// ---------------------------------------------------------------------------
+
 // take (reshape -> index_select -> reshape).
 // ---------------------------------------------------------------------------
 
@@ -463,6 +597,7 @@ Tensor index_reduce_backward_src_cuda(const Tensor& grad,
                                       const Tensor& source,
                                       const std::string& reduce,
                                       bool include_self);
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, IndexingKernels) {
     m.impl("index_select", index_select_cuda);
     m.impl("index_copy", index_copy_cuda);
