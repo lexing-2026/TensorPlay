@@ -131,14 +131,6 @@ def _affine_coeff(expr, var):
     return int(poly.coeff_monomial(var))
 
 
-def _body_stats(loops: Loops) -> tuple[int, int]:
-    body = record_body(loops)
-    from .loops import iter_values
-
-    values = iter_values(body.root)
-    return len(body.loads), len(values)
-
-
 #: What a graph yields before it has been asked, so that a graph which
 #: yields nothing is told apart from a graph that has not been run.
 _MISSING = object()
@@ -664,29 +656,6 @@ class GraphLowering:
 
         return [buf.get_name() for buf in self.graph_outputs]
 
-    def get_original_buffer_name(self, buf_name: str) -> str:
-        """The name this value had before anything was written over it."""
-
-        return self.scheduler.mutation_real_name.get(buf_name, buf_name)
-
-    def add_buffer_dependency(self, node: str, buf_name: str) -> None:
-        """Say that this piece has to come after that one, and nothing more.
-
-        Where the two touch the same memory this would be worked out; this is
-        for the cases where they do not and the order is still required.
-        """
-
-        self.additional_buffer_deps[node].append(buf_name)
-
-    def add_star_dependency(self, node: str, buf_name: str) -> None:
-        """Say that this piece has to come after everything that made that value.
-
-        Stronger than an order-only dependency: the value has to be there, not
-        merely have been made by then.
-        """
-
-        self.additional_star_deps[node].append(buf_name)
-
     def has_feature(self, device, feature) -> bool:
         """Whether this backend can do a particular thing on a device.
 
@@ -860,14 +829,6 @@ class GraphLowering:
         finally:
             self.device = previous
 
-    def register_computed(self, loops: Loops) -> ComputedBuffer:
-        size = tuple(loops.ranges)
-        layout = FixedLayout(loops.device, loops.dtype, size, contiguous_strides(size))
-        buffer = ComputedBuffer(name=None, layout=layout, data=loops)
-        self.register_buffer(buffer, set_name=True)
-        self.register_operation(buffer)
-        return buffer
-
     def register_welford(self, reduction: Reduction):
         """One welford loop nest, two stored results: mean and m2."""
 
@@ -914,38 +875,6 @@ class GraphLowering:
             inner.realize()
             return self.get_buffer(inner.get_name())
         return node
-
-    def _as_strided_view(self, view: View):
-        size = view.get_size()
-        index = fresh_symbols("v", len(size))
-        capture = _IndexCapture()
-        try:
-            with set_ops_handler(capture):
-                view.make_loader()(index)
-        except NotImplementedError:
-            return None
-        if len(capture.loads) != 1:
-            return None
-        name, expr = capture.loads[0]
-        strides = []
-        for var, extent in zip(index, size):
-            coeff = _affine_coeff(expr, var)
-            if coeff is None:
-                return None
-            strides.append(0 if extent == 1 else coeff)
-        remaining = substitute(expr, {var: sympy.Integer(0) for var in index})
-        if not getattr(remaining, "is_Integer", False):
-            return None
-        return ReinterpretView(
-            data=self.name_to_buffer[name],
-            layout=FixedLayout(
-                view.get_device(),
-                view.get_dtype(),
-                tuple(size),
-                tuple(strides),
-                int(remaining),
-            ),
-        )
 
     # -- library calls ----------------------------------------------------
     def _template_for(self, node, realized_args):

@@ -1140,13 +1140,6 @@ def compile_group(
 # (persistent-reduction shape): no loop-carried acc, one reduce.
 _PERSISTENT_RNUMEL_MAX = 512
 
-
-#: The accelerator's own spelling of the helper the tile pass shares.
-def _next_power_of_two(value: int) -> int:
-    if value <= 1:
-        return 1
-    return 1 << (int(value) - 1).bit_length()
-
 __all__ = [
     "LaunchConfig",
     "PlanError",
