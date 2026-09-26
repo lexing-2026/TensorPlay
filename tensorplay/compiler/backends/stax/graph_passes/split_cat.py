@@ -9,6 +9,7 @@ from typing import Any, TypeAlias
 
 import tensorplay as tp
 from tensorplay.graph import Graph, GraphModule, Node
+from .. import config
 from ..utils import counters
 from tensorplay.graph.experimental.symbolic_shapes import free_symbols, guard_or_false
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
@@ -578,7 +579,7 @@ class GraphSplit(CallFunction):
             if user.args[1] in seen_idxs:
                 return FailedMatch(f"duplicate getitem {user.args[1]}")
             if user.args[-1] < 0:  # type: ignore[operator]
-                # This shouldn't ideally happen as dynamo normalizes indexes to positive
+                # This shouldn't ideally happen: capture normalizes indexes to positive
                 return FailedMatch("negative index")
             seen_idxs.add(user.args[1])
         return m

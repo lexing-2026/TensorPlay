@@ -30,7 +30,7 @@ from typing import Any, Generic, TypeVar
 import tensorplay as tp
 
 from .cache_key import CODE_CACHE_KEY_STRATEGY, SYSTEM_CACHE_KEY_STRATEGY
-from .compile_log import dynamo_timed
+from .compile_log import timed_block
 from .runtime.cache_dir_utils import cache_dir
 from .runtime.device_compiler import compiler_module
 from .utils import clear_on_fresh_cache
@@ -66,7 +66,7 @@ class CacheBase:
     @staticmethod
     @functools.cache
     def get_system() -> SystemInfo:
-        with dynamo_timed("CacheBase.get_system.triton_key"):
+        with timed_block("CacheBase.get_system.triton_key"):
             triton_version = triton_key()
 
         try:

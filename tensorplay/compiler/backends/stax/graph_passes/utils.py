@@ -1,4 +1,6 @@
-from tensorplay.graph import Node
+from collections import defaultdict
+
+from tensorplay.graph import Graph, Node, map_arg
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
 
 
@@ -120,3 +122,134 @@ class BitsetAncestors:
             idx = (bits & -bits).bit_length() - 1
             yield idx_to_node[idx]
             bits &= bits - 1
+from collections import defaultdict
+
+
+# ---------------------------------------------------------------------------
+# ordering a span of a graph
+# ---------------------------------------------------------------------------
+
+
+def _get_flat_args(
+    node: Node, node_to_additional_deps: dict[Node, "OrderedSet[Node]"]
+) -> list[Node]:
+    """The nodes a node reads, including any read only for ordering."""
+    args: list[Node] = []
+    map_arg((node.args, node.kwargs), args.append)
+    if node in node_to_additional_deps:
+        args.extend(node_to_additional_deps[node])
+    return args
+
+
+def _get_flat_args_unique(
+    node: Node, node_to_additional_deps: dict[Node, "OrderedSet[Node]"]
+) -> "OrderedSet[Node]":
+    """The nodes a node reads, once each, including any read only for ordering."""
+    args: OrderedSet[Node] = OrderedSet()
+    map_arg((node.args, node.kwargs), args.add)
+    if node in node_to_additional_deps:
+        args.update(node_to_additional_deps[node])
+    return args
+
+
+def _get_flat_args(
+    node: Node, node_to_additional_deps: dict[Node, OrderedSet[Node]]
+) -> list[Node]:
+    args = list[Any]()
+    map_arg((node.args, node.kwargs), args.append)
+    if node in node_to_additional_deps:
+        args.extend(node_to_additional_deps[node])
+    return args
+
+
+def _get_flat_args_unique(
+    node: Node, node_to_additional_deps: dict[Node, OrderedSet[Node]]
+) -> OrderedSet[Node]:
+    args = OrderedSet[Node]()
+    map_arg((node.args, node.kwargs), args.add)
+    if node in node_to_additional_deps:
+        args.update(node_to_additional_deps[node])
+    return args
+
+
+def _stable_topological_sort_impl(
+    graph: Graph,
+    node_to_additional_deps: dict[Node, OrderedSet[Node]],
+    do_sort: bool = True,
+    region: OrderedSet[Node] | None = None,
+) -> bool:
+    # Nodes are in exactly one of these four collections:
+
+    # - Nodes in `pending` are waiting to be processed (in reverse order):
+    pending = list(reversed(region or graph.nodes))
+
+    # - Nodes in `ready` have been processed and are already in the correct
+    #   order.  When sorting a region, nodes outside the region are
+    #   implicitly ready (filtered out in the waiting_for check below).
+    ready: set[Node] = set()
+
+    # - `waiting` is a mapping from a dependency to nodes which depend on that
+    #   dependency.
+    waiting = defaultdict(list)
+
+    # - `outputs` are always at the end of the graph
+    outputs = OrderedSet[Node]()
+
+    has_additional_deps = bool(node_to_additional_deps)
+
+    # The cursor indicates the last processed node so we can add new nodes
+    # after it.
+    cursor = None
+    while pending:
+        node = pending.pop()
+
+        if node.op == "output":
+            outputs.add(node)
+            if node.users:
+                raise AssertionError("output nodes should have no users")
+            continue
+
+        # node._input_nodes is maintained by FX and already contains the
+        # unique set of input nodes — avoid rebuilding it via map_arg.
+        if has_additional_deps:
+            deps = _get_flat_args_unique(node, node_to_additional_deps)
+        else:
+            deps = node._input_nodes
+
+        last_unready = None
+        for x in deps:
+            if x not in ready and (region is None or x in region):
+                last_unready = x
+        if last_unready is not None:
+            # We have unprocessed input nodes. Wait for the last unready
+            # arg so an already sorted list will only recheck this node once.
+            waiting[last_unready].append(node)
+        else:
+            ready.add(node)
+            if cursor and cursor.next is not node and do_sort:
+                cursor.append(node)
+            cursor = node
+            # Mark the nodes that have been waiting for this node to finish as
+            # ready to check again.
+            pending.extend(reversed(waiting.pop(node, ())))
+
+    ready.update(outputs)
+    expected_len = len(region) if region is not None else len(graph.nodes)
+    return not waiting and len(ready) == expected_len
+
+
+def _stable_topological_sort_region(
+    graph: Graph,
+    region: OrderedSet[Node],
+) -> None:
+    if not _stable_topological_sort_impl(graph, {}, region=region):
+        raise AssertionError("stable topological sort of region failed")
+
+
+def _has_cycle(
+    graph: Graph,
+    node_to_additional_deps: dict[Node, OrderedSet[Node]],
+) -> bool:
+    return not _stable_topological_sort_impl(
+        graph, node_to_additional_deps, do_sort=False
+    )

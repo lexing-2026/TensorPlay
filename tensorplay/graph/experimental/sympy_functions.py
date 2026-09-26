@@ -219,7 +219,7 @@ class ValueRanges(Generic[_T]):
             raise AssertionError((lower, upper))
 
         # Warning: is_int/is_float is best effort.  We do pretty well in
-        # Dynamo, but in Inductor these attributes are often wrong because we
+        # during tracing, but in compiled code these attributes are often wrong because we
         # are not very rigorous in dtype analysis.  This is also why we need
         # the flexible analysis for is_int: sometimes a sympy.oo pops in for
         # an integer bound. I would /like/ for us not to do this, but it's
@@ -504,7 +504,7 @@ class PythonMod(sympy.Function):
 
     @classmethod
     def eval(cls, p: sympy.Expr, q: sympy.Expr) -> sympy.Expr | None:
-        # python test/dynamo/test_export.py -k ExportTests.test_trivial_constraint
+        # the export test named for a trivial constraint
         # assert p.is_integer, p
         # assert q.is_integer, q
 

@@ -68,7 +68,7 @@ from ..coor import (
 )
 from .. import debug as inductor_debug
 from ..compile_log import (
-    dynamo_timed,
+    timed_block,
     get_debug_dir,
     output_code_log,
     trace_structured,
@@ -2501,7 +2501,7 @@ class PythonWrapperCodegen(CodeGen):
         self.writeline(f"{buf_name} = {python_kernel_name}({', '.join(get_args())})")
 
     def generate(self, is_inference):
-        with dynamo_timed("PythonWrapperCodegen.generate"):
+        with timed_block("PythonWrapperCodegen.generate"):
             return self._generate(is_inference)
 
     def get_wrapper_call_indent(self) -> int:
@@ -3957,7 +3957,7 @@ class PythonWrapperCodegen(CodeGen):
     def prepare_triton_kernel_call(self, call_args):
         def wrap_arg(arg):
             if isinstance(arg, str):
-                # dynamo wraps unspec variable as 0d CPU tensor, need convert to scalar
+                # an unspecified-rank value arrives as a 0-d CPU tensor; convert to scalar
                 return arg + ".item()" if should_unwrap_unspec_arg(arg) else arg
             elif isinstance(arg, (int, float, bool, SymbolicCallArg)):
                 return str(arg)

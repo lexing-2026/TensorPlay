@@ -239,12 +239,12 @@ def time_and_count(
     fn: Callable[Concatenate[Any, P], T],
 ) -> Callable[Concatenate[Any, P], T]:
     """
-    Wraps `fn` to increment the appropriate dynamo counters. It is expected that `fn`
+    Wraps `fn` to increment the appropriate compile counters. It is expected that `fn`
     is a method of `Benchmarker` or one of its subclasses; typing limitations prevent
     us from declaring this directly.
 
-    NOTE: If you're tempted to add a dynamo_timed call here, this function can be
-    called enough that the dynamo_timed overhead is not negligible.
+    NOTE: If you're tempted to add a timed_block call here, this function can be
+    called enough that the timed_block overhead is not negligible.
     """
 
     @wraps(fn)

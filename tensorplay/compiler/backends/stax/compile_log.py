@@ -89,7 +89,7 @@ def debug_dir() -> Iterator[str]:
 
 
 @contextlib.contextmanager
-def dynamo_timed(key: str) -> Iterator[None]:
+def timed_block(key: str) -> Iterator[None]:
     """How long the block took, filed under ``key``.
 
     Reported whether or not the block raised, because a step that fails after
@@ -119,7 +119,7 @@ def timed(key: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(fn)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            with dynamo_timed(key):
+            with timed_block(key):
                 return fn(*args, **kwargs)
 
         return wrapper
@@ -162,7 +162,7 @@ def write_generated_source(path: str, source: str) -> str:
 __all__ = [
     "compile_time_log",
     "debug_dir",
-    "dynamo_timed",
+    "timed_block",
     "get_debug_dir",
     "output_code_log",
     "timed",
